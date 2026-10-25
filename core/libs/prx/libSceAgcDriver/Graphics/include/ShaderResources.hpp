@@ -240,6 +240,9 @@ public:
     // reconciles imports and refreshes mirrors, which needs the lock.
     ShaderResources(const Context& context, const CompiledShader& compute, std::span<const GuestMemorySnapshot> snapshots, bool deferred, std::uint64_t dispatchThreads = 0);
     void Complete();
+    // Whether an address-based stage A made without the lock is stale (the guest forgot memory or
+    // changed its allocations since): the dispatch then builds afresh under the lock.
+    bool StaleUnlockedAddress() const;
     // S1 (APS5_NO_SPLIT_DRAW_BUILD=1 off): the draw build in two stages, as for dispatches: the
     // constructor runs stage A only (no device lock; no guest bytes are read: host copies wait for
     // stage B), CompleteDraw() stage B under GuestMemory::GpuMutex. Address-based stages need
@@ -819,6 +822,11 @@ private:
     std::span<const GuestMemorySnapshot> deferredSnapshots;
     // The deferred build is address-based: everything runs in Complete().
     bool lockedBuild = false;
+    // A deferred dispatch build whose address-based stage A took the cached space without the lock
+    // (APS5_NO_BDA_DISPATCH_SPLIT=1 off), and the guest's forget serial and registry generation then.
+    bool unlockedAddress = false;
+    std::uint64_t addressStageForget = 0;
+    std::uint64_t addressStageGeneration = 0;
     // Stage A runs without the device lock (a deferred, non-address-based build).
     bool unlockedPrepare = false;
     bool deferredDraw = false;

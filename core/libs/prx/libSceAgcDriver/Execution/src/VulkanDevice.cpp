@@ -6345,6 +6345,9 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             if (arguments != 0) d.indirectHold.phaseCounts[PhaseResourcesInsert] += evicted.size();
         }
     };
+    // An address-based stage A that took the cached space without the mutex is dropped when the guest
+    // forgot memory or changed its allocations since (C31); the dispatch then builds as without one.
+    if (prepared != nullptr && prepared->resources != nullptr && prepared->resources->StaleUnlockedAddress()) prepared->resources.reset();
     if (prepared != nullptr && prepared->resources != nullptr) {
         // Stage A ran without the mutex (PrepareDispatch); stage B completes the build here.
         resources = std::move(prepared->resources);

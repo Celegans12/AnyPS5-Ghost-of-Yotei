@@ -2869,10 +2869,32 @@ ShaderResources::ShaderResources(const Context& context, const CompiledShader& c
     // device-lock work, so their whole build waits for Complete(). Without tables the call only
     // checks the bindings.
     lockedBuild = UsesAddressTables(compute);
+    // C31 (APS5_NO_BDA_DISPATCH_SPLIT=1 off, a runtime switch): when the cached address space can be
+    // taken without the lock (GuestBufferMemory::AcquireRegisteredCached: current, no mirrors to
+    // refresh), stage A runs here as for any other dispatch; otherwise Complete() builds it all.
+    if (lockedBuild && !RuntimeSwitches::Set(RuntimeSwitch::NoBdaDispatchSplit)) {
+        const auto forget = GuestMemory::ForgetSerial();
+        const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        if ((forget & 1u) == 0) {
+            try {
+                prepareAddressBindings(shaders, snapshots, true);
+                lockedBuild = false;
+                unlockedAddress = true;
+                addressStageForget = forget;
+                addressStageGeneration = generation;
+            } catch (const std::runtime_error&) {
+                // The space could not be taken without the lock (nothing was taken): Complete() builds.
+            }
+        }
+    }
     if (lockedBuild) return;
     unlockedPrepare = true;
-    prepareAddressBindings(shaders, snapshots);
+    if (!unlockedAddress) prepareAddressBindings(shaders, snapshots);
     buildPrepare(shaders, nullptr, 0, 0, 0);
+}
+
+bool ShaderResources::StaleUnlockedAddress() const {
+    return unlockedAddress && (GuestMemory::ForgetSerial() != addressStageForget || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != addressStageGeneration);
 }
 
 void ShaderResources::Complete() {
