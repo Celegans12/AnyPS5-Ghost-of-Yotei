@@ -4266,6 +4266,46 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     totals.snapshotsUs = 0;
 }
 
+std::array<std::atomic<std::uint64_t>, 7>& CachedAcquireOutcomes() {
+    static std::array<std::atomic<std::uint64_t>, 7> outcomes{};
+    return outcomes;
+}
+
+bool GuestBufferMemory::AcquireRegisteredCached() {
+    Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
+    // Outcomes (the [split] line): taken, cache off, no space, writable mirrors, heap mirrors, sparse
+    // mirrors, stale (device, generation or imports epoch).
+    auto& outcomes = CachedAcquireOutcomes();
+    const auto refuse = [&](std::size_t why) { outcomes[why].fetch_add(1, std::memory_order_relaxed); return false; };
+    if (!addressSpaceCacheEnabled()) return refuse(1);
+    ensurePinWaiter();
+    static const bool sortedLookup = std::getenv("APS5_NO_SORTED_SNAPSHOT_LOOKUP") == nullptr;
+    auto& spaces = Spaces();
+    // Read before the space is taken, as AcquireRegistered does: a mutation ending in between leaves
+    // the space stale by its generation, never newer than it.
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto current = spaces.current.load();
+    // Read-only mirrors need nothing per build (`mirrored` only counts the build and sweeps); the
+    // writable, heap and sparse ones are refreshed or compared per build, which needs the lock.
+    if (current == nullptr) return refuse(2);
+    if (!current->writableMirrors.empty()) return refuse(3);
+    if (!current->heapMirrors.empty()) return refuse(4);
+    if (!current->sparseMirrors.empty()) return refuse(5);
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (spaceMiss(context, current.get(), generation, state) != SpaceMiss::None) return refuse(6);
+        importFloor = state.useCounter + 1;
+        stampSpaceImports(*current, state);
+    }
+    spaces.hits.fetch_add(1, std::memory_order_relaxed);
+    outcomes[0].fetch_add(1, std::memory_order_relaxed);
+    space = std::move(current);
+    for (const auto& range : space->copied) addCopiedRange(range);
+    regionsSorted = sortedLookup;
+    return true;
+}
+
 void GuestBufferMemory::AcquireRegistered() {
     Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
     ensurePinWaiter();

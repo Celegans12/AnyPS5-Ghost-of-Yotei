@@ -2811,13 +2811,13 @@ ShaderResources::ShaderResources(const Context& context, std::span<const Compile
     build(shaders, &target, colorAttachments, indexAddress, indexBytes);
 }
 
-ShaderResources::ShaderResources(DeferredDrawBuild, const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) : context(context), guestMemory(context) {
+ShaderResources::ShaderResources(DeferredDrawBuild, const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, bool addressTables) : context(context), guestMemory(context) {
     drawBuild = true;
     deferredDraw = true;
     unlockedPrepare = true;
-    Require(!StagesUseAddressTables(shaders), "a deferred draw build cannot map address tables");
+    Require(addressTables || !StagesUseAddressTables(shaders), "a deferred draw build cannot map address tables");
     guestMemory.DeferHostCopies();
-    prepareAddressBindings(shaders, {});
+    prepareAddressBindings(shaders, addressTables ? snapshots : std::span<const GuestMemorySnapshot>{}, true);
     buildPrepare(shaders, &target, colorAttachments, indexAddress, indexBytes);
 }
 

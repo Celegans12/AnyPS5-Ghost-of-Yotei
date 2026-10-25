@@ -26,6 +26,9 @@ namespace AgcDriver::Graphics {
 
 void ShutdownGuestBufferWorkers();
 
+// AcquireRegisteredCached outcomes, cumulative (see there).
+std::array<std::atomic<std::uint64_t>, 7>& CachedAcquireOutcomes();
+
 struct GuestMemorySnapshot {
     std::uint64_t address;
     std::span<const std::byte> bytes;
@@ -327,6 +330,11 @@ public:
     explicit GuestBufferMemory(const Context& context);
     ~GuestBufferMemory();
     void AcquireRegistered();
+    // AcquireRegistered for a draw build's stage A off the device lock (the S1 preparer, an
+    // address-based draw): takes the cached address space only when it is current (device,
+    // registry generation, imports epoch) and has no mirrors to refresh, which needs the lock;
+    // false (nothing taken) otherwise. UploadFinish re-checks the imports epoch as for any build.
+    bool AcquireRegisteredCached();
     // APS5_PROFILE_DRAW: the parts of one address-based build ([address] line every 10 s): the
     // registry lease, the imports pass, the mirror preparation and the mirror compare (blocks and
     // copied blocks) are timed by AcquireRegistered on the calling thread; the caller adds the
