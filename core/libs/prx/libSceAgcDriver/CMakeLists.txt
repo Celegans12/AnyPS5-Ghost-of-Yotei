@@ -366,6 +366,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/OwnershipProbe.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/MemoryStats.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ProfileWindows.cpp
@@ -1024,6 +1025,7 @@ add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
         Execution/src/GuestMemory.cpp
         Graphics/src/RuntimeSwitches.cpp
+        Execution/src/OwnershipProbe.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
 target_include_directories(agc_write_tracking_tests PRIVATE ${LIBS_INCLUDE_DIR})
@@ -1054,7 +1056,9 @@ if(BUILD_TESTING)
         set_tests_properties(agc_compared_shared_generations PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
         add_test(NAME agc_write_tracking_rewatch_import_pages COMMAND agc_write_tracking_tests --rewatch-import-pages)
         set_tests_properties(agc_write_tracking_rewatch_import_pages PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 20)
-        set_tests_properties(agc_write_tracking agc_write_tracking_metadata_commit agc_resident_direct_remap agc_untracked_owned_proofs agc_mapping_owner agc_residency_reporting agc_access_guards agc_rewatched_direct_shared agc_import_alias_shared agc_compared_shared_generations agc_write_tracking_rewatch_import_pages PROPERTIES ENVIRONMENT_MODIFICATION
+        add_test(NAME agc_ownership_probe COMMAND agc_write_tracking_tests --ownership-probe)
+        set_tests_properties(agc_ownership_probe PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        set_tests_properties(agc_write_tracking agc_ownership_probe agc_write_tracking_metadata_commit agc_resident_direct_remap agc_untracked_owned_proofs agc_mapping_owner agc_residency_reporting agc_access_guards agc_rewatched_direct_shared agc_import_alias_shared agc_compared_shared_generations agc_write_tracking_rewatch_import_pages PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
