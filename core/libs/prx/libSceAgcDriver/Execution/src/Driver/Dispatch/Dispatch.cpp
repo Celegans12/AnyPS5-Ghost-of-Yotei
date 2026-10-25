@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
@@ -715,16 +716,62 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         const auto queueId = submission.queue;
         auto attachTo = keepVariant != nullptr ? keepVariant : attachVariant;
         missItemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, captured = std::move(captured), liveWords = std::move(liveWords), capture, shaderMemory, registeredShader, htileMask, htileClearCompletion, groups, address, queueId, dispatchThreads, attachTo = std::move(attachTo), keepVariant, dataHit, epoch] {
+        // The item's captured regions and their snapshots, shared by its preparation and its commit: a
+        // deferred build keeps a span of the snapshots until Complete(), so both use the same vector.
+        struct ItemInputs {
+            std::vector<ShaderRecompiler::MemoryRegion> captured;
+            std::vector<Graphics::GuestMemorySnapshot> snapshots;
+        };
+        const auto itemInputs = [&] {
+            auto inputs = std::make_shared<ItemInputs>();
+            inputs->captured = std::move(captured);
+            inputs->snapshots.reserve(inputs->captured.size());
+            for (const auto& region : inputs->captured) inputs->snapshots.push_back({region.guestAddress, region.bytes});
+            return std::shared_ptr<const ItemInputs>(std::move(inputs));
+        }();
+        // Prepared dispatch items (APS5_NO_PREPARED_DISPATCH_ITEMS=1 off, a runtime switch): the
+        // preparer thread runs PrepareDispatch (stage A, unlocked) ahead of the committer, as it
+        // prepares draws (DrawPipeline::Prepare). It runs ahead of earlier items still queued; the
+        // dispatch revalidates a cached build under the mutex and falls back to the locked wait for
+        // work noted after the pre-sync anyway, and a guest allocation change or forget in between
+        // makes the commit prepare again (the draw split's staleness rule).
+        struct PreparedItem {
+            std::shared_ptr<PreparedDispatch> prepared;
+            std::uint64_t forgetSerial = 0;
+            std::uint64_t registryGeneration = 0;
+        };
+        auto slot = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoPreparedDispatchItems) ? std::make_shared<DrawPipeline::PrepareSlot>() : nullptr;
+        DrawPipeline::Prepare prepare;
+        if (slot != nullptr) {
+            prepare = [slot, device = localDevice, result = compiledResult, itemInputs, dispatchThreads, address, epoch, queueId] {
+                if (!slot->Begin()) return;
+                auto item = std::make_shared<PreparedItem>();
+                try {
+                    DrawPipeline::FollowEpoch(epoch);
+                    GuestMemory::SetCurrentPacket(0x15, queueId);
+                    item->forgetSerial = GuestMemory::ForgetSerial();
+                    item->registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+                    if ((item->forgetSerial & 1u) == 0) item->prepared = device->PrepareDispatch(*result, itemInputs->snapshots, dispatchThreads, address);
+                } catch (...) {
+                    // The commit prepares again and reports a refusal in order.
+                    item->prepared = nullptr;
+                }
+                slot->Finish(std::move(item));
+            };
+        }
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, itemInputs, slot, liveWords = std::move(liveWords), capture, shaderMemory, registeredShader, htileMask, htileClearCompletion, groups, address, queueId, dispatchThreads, attachTo = std::move(attachTo), keepVariant, dataHit, epoch] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
-            std::vector<Graphics::GuestMemorySnapshot> commitSnapshots;
-            commitSnapshots.reserve(captured.size());
-            for (const auto& region : captured) commitSnapshots.push_back({region.guestAddress, region.bytes});
+            const auto& commitSnapshots = itemInputs->snapshots;
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
             try {
-                auto prepared = localDevice->PrepareDispatch(compiledCommit, commitSnapshots, dispatchThreads, address);
+                std::shared_ptr<PreparedDispatch> prepared;
+                if (slot != nullptr) {
+                    const auto item = std::static_pointer_cast<PreparedItem>(slot->Take());
+                    if (item != nullptr && item->prepared != nullptr && item->forgetSerial == GuestMemory::ForgetSerial() && item->registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix()) prepared = item->prepared;
+                }
+                if (prepared == nullptr) prepared = localDevice->PrepareDispatch(compiledCommit, commitSnapshots, dispatchThreads, address);
                 std::shared_ptr<const Recipe> builtRecipe;
                 {
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
@@ -751,7 +798,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                 std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
                 throw std::runtime_error(where + std::string(error.what()));
             }
-        }, std::move(itemWrites));
+        }, std::move(itemWrites), 0, {}, {}, std::move(prepare));
         if (DrainAfterDispatchItems()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         ReportDispatchItems(profile);
         return;
