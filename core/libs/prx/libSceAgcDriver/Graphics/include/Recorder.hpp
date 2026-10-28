@@ -380,7 +380,7 @@ public:
     // caller collected the range's CPU stores first); the entry stays as it is. Nothing when none is kept, the
     // registry moved, it is current, or a CPU store stamped a changed block.
     std::optional<std::optional<std::uint32_t>> GpuWrittenHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use) const;
-    // Diagnostic: the generation the kept highest index of the range was read at (0 when none is kept).
+    // The generation the kept highest index of the range was read at (0 when none is kept).
     std::uint64_t KeptHighestIndexGeneration(std::uint64_t address, std::size_t bytes, SnapshotUse use) const;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest);

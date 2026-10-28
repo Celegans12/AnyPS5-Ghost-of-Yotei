@@ -1974,9 +1974,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             // CPU once per frame (~1.4 ms, best434). APS5_NO_GPU_WRITTEN_INDEX_ESTIMATE=1 (runtime switch) scans.
             if (const auto zeroFrom = ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
                 const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
-                GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
-                if (const auto kept = context.recorder->GpuWrittenHighestIndex(draw.indexAddress, static_cast<std::size_t>(indexBytes), use); kept && *kept && **kept >= limit && **kept - limit >= ZeroFetchSlack) {
-                    highest = *kept;
+                // Collected (CPU stores become block stamps) only when an entry is kept: the scan below collects again.
+                const bool kept = context.recorder->KeptHighestIndexGeneration(draw.indexAddress, static_cast<std::size_t>(indexBytes), use) != 0;
+                if (kept) GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                if (const auto stale = kept ? context.recorder->GpuWrittenHighestIndex(draw.indexAddress, static_cast<std::size_t>(indexBytes), use) : std::nullopt; stale && *stale && **stale >= limit && **stale - limit >= ZeroFetchSlack) {
+                    highest = *stale;
                     estimated = true;
                     countIndexEstimate();
                 }
