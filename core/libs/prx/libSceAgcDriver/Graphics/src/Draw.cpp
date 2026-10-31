@@ -1712,6 +1712,7 @@ std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& s
     }
     prepared->indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
     if (std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr; })) return prepared;
+    PrebuildDrawPipeline(context, state, shaders);
     static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
     static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
@@ -3131,6 +3132,22 @@ std::shared_ptr<const AheadDraw> PrepareAheadDraw(const Context& context, const 
     if (!attributes.empty()) prepared->vertexInput = std::make_shared<const VertexInputLayout>(BuildVertexInputLayout(context, attributes));
     if (TrimmedDrawKey()) prepared->contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), 0, 0, false);
     return prepared;
+}
+
+void PrebuildDrawPipeline(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+    static const bool disabled = std::getenv("APS5_NO_PREBUILD_DRAW_PIPELINE") != nullptr || std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
+    if (disabled || context.descriptorCache == nullptr || shaders.empty()) return;
+    try {
+        bool memoized = false;
+        bool hit = false;
+        const auto fragmentOutputs = CachedFragmentOutputs(context, shaders, state, memoized, hit, false);
+        const auto masked = maskedState(state, fragmentOutputs);
+        const auto& attributes = shaders.front().program->vertexAttributes;
+        const auto vertexInput = attributes.empty() ? VertexInputLayout{} : BuildVertexInputLayout(context, attributes);
+        const auto described = DescribeSetLayouts(context, shaders);
+        static_cast<void>(CachedPipeline(context, masked.has_value() ? *masked : state, vertexInput, described.layouts, shaders, VK_IMAGE_LAYOUT_GENERAL, nullptr));
+    } catch (...) {
+    }
 }
 
 namespace {

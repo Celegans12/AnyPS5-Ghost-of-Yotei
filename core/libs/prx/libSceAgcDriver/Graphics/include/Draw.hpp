@@ -26,6 +26,7 @@ struct AheadDraw {
 std::uint64_t AheadDrawUses();
 const AheadDraw* AheadDrawFor(const AheadDraw* ahead, const Context& context);
 std::shared_ptr<const AheadDraw> PrepareAheadDraw(const Context& context, const State& state, std::span<const CompiledShader> shaders);
+void PrebuildDrawPipeline(const Context& context, const State& state, std::span<const CompiledShader> shaders);
 struct DrawTraceContext {
     std::uint64_t token = 0;
     std::uint64_t submission = 0;
