@@ -1253,6 +1253,39 @@ std::optional<std::uint32_t> largestDeviceLocalHeap(const VkPhysicalDeviceMemory
 
 std::atomic<std::uint64_t> budgetOverride{0};
 
+struct SnapshotScratch {
+    std::vector<std::byte> bytes;
+    bool busy = false;
+};
+
+class SnapshotBuffer {
+public:
+    explicit SnapshotBuffer(std::size_t size) {
+        constexpr std::size_t ScratchLimit = std::size_t(64) << 20u;
+        thread_local SnapshotScratch scratch;
+        if (!scratch.busy && size <= ScratchLimit && !RuntimeSwitches::Set(RuntimeSwitch::NoSnapshotScratch)) {
+            if (scratch.bytes.size() < size) scratch.bytes.resize(size);
+            scratch.busy = true;
+            held = &scratch;
+            view = std::span(scratch.bytes.data(), size);
+        } else {
+            own.resize(size);
+            view = own;
+        }
+    }
+    ~SnapshotBuffer() {
+        if (held != nullptr) held->busy = false;
+    }
+    SnapshotBuffer(const SnapshotBuffer&) = delete;
+    SnapshotBuffer& operator=(const SnapshotBuffer&) = delete;
+    std::span<std::byte> Bytes() const { return view; }
+
+private:
+    SnapshotScratch* held = nullptr;
+    std::vector<std::byte> own;
+    std::span<std::byte> view;
+};
+
 std::uint64_t forcedCacheBudget() {
     if (const auto overridden = budgetOverride.load(std::memory_order_relaxed); overridden != 0) return overridden;
     static const std::uint64_t forced = [] {
@@ -1995,7 +2028,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             static std::atomic<std::uint64_t> clearReuses{0};
             clearReuses.fetch_add(1, std::memory_order_relaxed);
         } else {
-        std::vector<std::byte> snapshot(bytes);
+        const SnapshotBuffer snapshotBuffer(bytes);
+        const auto snapshot = snapshotBuffer.Bytes();
         ReadTextureSurface(resource, *keys, snapshot);
         if (!pending) entry.untracked = untracked;
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
