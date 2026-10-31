@@ -3145,7 +3145,7 @@ void PrebuildDrawPipeline(const Context& context, const State& state, std::span<
         const auto& attributes = shaders.front().program->vertexAttributes;
         const auto vertexInput = attributes.empty() ? VertexInputLayout{} : BuildVertexInputLayout(context, attributes);
         const auto described = DescribeSetLayouts(context, shaders);
-        static_cast<void>(CachedPipeline(context, masked.has_value() ? *masked : state, vertexInput, described.layouts, shaders, VK_IMAGE_LAYOUT_GENERAL, nullptr));
+        static_cast<void>(CachedPipeline(context, masked.has_value() ? *masked : state, vertexInput, described.View(), shaders, VK_IMAGE_LAYOUT_GENERAL, nullptr));
     } catch (...) {
     }
 }
