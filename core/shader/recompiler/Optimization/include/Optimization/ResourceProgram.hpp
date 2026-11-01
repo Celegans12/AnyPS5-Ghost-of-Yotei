@@ -79,6 +79,9 @@ void BuildPreparedShaderKey(const RecompileRequest& request, std::vector<std::ui
 [[nodiscard]] bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& handle, std::span<const std::uint64_t> key);
 [[nodiscard]] const CompiledShaderArtifact& GetPreparedArtifact(const SourceHandle& handle);
 [[nodiscard]] std::shared_ptr<const RecompileResult> RegistrationResult(const RecompileRequest& request, const SourceHandle& handle);
+[[nodiscard]] bool ComputeRegistrationPrebuildable(const RecompileResult& result, std::uint32_t minWords);
+[[nodiscard]] bool ComputeRegistrationPrebuildable(const RecompileResult& result);
+[[nodiscard]] bool ComputeRegistrationActive();
 [[nodiscard]] std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest& request, const ResourceCapture& capture, const SourceHandle& handle);
 [[nodiscard]] std::shared_ptr<const SourceHandle> ResolveSource(const RecompileRequest& request);
 void ReleaseUndrawnResourcePlan(const SourceHandle& handle);

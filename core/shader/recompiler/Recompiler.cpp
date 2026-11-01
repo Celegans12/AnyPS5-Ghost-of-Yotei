@@ -629,10 +629,29 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
     }
 }
 
+bool ComputeRegistrationEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_COMPUTE_REGISTRATION");
+        return value != nullptr && std::string_view(value) == "1";
+    }();
+    return enabled;
+}
+
+std::uint32_t ComputeRegistrationMinWords() {
+    static const std::uint32_t words = [] {
+        const char* value = std::getenv("APS5_COMPUTE_REGISTRATION_MIN_WORDS");
+        if (value == nullptr || *value == 0) return 300000u;
+        char* end = nullptr;
+        const auto parsed = std::strtoul(value, &end, 10);
+        return *end == 0 ? static_cast<std::uint32_t>(parsed) : 300000u;
+    }();
+    return words;
+}
+
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program) {
     const auto inputInfo = RequestInputInfo(request);
     constexpr BindingAllocator bindingAllocator;
-    bool registration = request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment);
+    bool registration = request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment || (request.shader.stage == ShaderStage::Compute && ComputeRegistrationEnabled() && program.Info().images.empty() && program.Info().samplers.empty()));
     program.Metadata().bindingLayoutComplete = false;
     const bool stencilReplay = request.shader.stage == ShaderStage::Fragment && std::ranges::any_of(program.Info().outputs, [](const StageOutput& output) { return output.kind == StageOutputKind::StencilRef; }) && std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityStencilExportEXT)) == request.target.supportedCapabilities.end();
     auto bindings = bindingAllocator.Allocate(program, request.layout, registration, stencilReplay);
@@ -708,7 +727,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
         targetOptions.spannedWaves = false;
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
     }
-    if (registration && result.spirv.size() > request.target.registrationWordLimit) {
+    if (registration && (request.shader.stage == ShaderStage::Compute ? result.spirv.size() < ComputeRegistrationMinWords() : result.spirv.size() > request.target.registrationWordLimit)) {
         registration = false;
         program.Metadata().bindingLayoutComplete = false;
         bindings = bindingAllocator.Allocate(program, request.layout, false, stencilReplay);
@@ -2213,8 +2232,10 @@ const CompiledShaderArtifact& GetPreparedArtifact(const SourceHandle& handle) {
 std::shared_ptr<const RecompileResult> RegistrationResult(const RecompileRequest& request, const SourceHandle& handle) {
     if (handle.artifact == nullptr || !MatchesPreparedShader(request, handle)) throw std::runtime_error("ShaderRecompiler: prepared artifact does not match the static ABI");
     if (!request.target.registrationModules || !handle.artifact->artifact.registrationModule) return nullptr;
+    if (request.shader.stage == ShaderStage::Compute && !ComputeRegistrationEnabled()) return nullptr;
     const auto& info = handle.artifact->info.info;
-    if (std::ranges::any_of(info.buffers, [](const BufferResource& buffer) { return buffer.descriptorFormatted; }) || std::ranges::any_of(info.samplers, [](const SamplerResource& sampler) { return FoldsTexelOffsets(sampler); })) return nullptr;
+    if (request.shader.stage != ShaderStage::Compute && std::ranges::any_of(info.buffers, [](const BufferResource& buffer) { return buffer.descriptorFormatted; })) return nullptr;
+    if (std::ranges::any_of(info.samplers, [](const SamplerResource& sampler) { return FoldsTexelOffsets(sampler); })) return nullptr;
     ResourceSnapshot snapshot;
     snapshot.buffers.assign(info.buffers.size(), {{}, 4u});
     snapshot.images.assign(info.images.size(), {{}, 8u});
@@ -2222,6 +2243,18 @@ std::shared_ptr<const RecompileResult> RegistrationResult(const RecompileRequest
     snapshot.userData.assign(RuntimeAbi::UserDataCapacity, 0u);
     snapshot.flattenedSrt.assign(1u, 0u);
     return std::make_shared<RecompileResult>(materializeResult(*handle.artifact, request, snapshot, true));
+}
+
+bool ComputeRegistrationPrebuildable(const RecompileResult& result, std::uint32_t minWords) {
+    return result.registrationModule && result.spirv.size() >= minWords;
+}
+
+bool ComputeRegistrationPrebuildable(const RecompileResult& result) {
+    return ComputeRegistrationEnabled() && ComputeRegistrationPrebuildable(result, ComputeRegistrationMinWords());
+}
+
+bool ComputeRegistrationActive() {
+    return ComputeRegistrationEnabled();
 }
 
 std::shared_ptr<const RecompileResult> MaterializeShader(const RecompileRequest& request, const ResourceCapture& capture, const SourceHandle& handle) {
