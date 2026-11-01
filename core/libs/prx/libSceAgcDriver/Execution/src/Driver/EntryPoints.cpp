@@ -199,6 +199,12 @@ extern "C" std::uint64_t AgcDriverDispatchesAdoptedAhead_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().DispatchesAdoptedAhead();
 }
 
+extern "C" void AgcDriverMissAheadTotals_nid_postfix(std::uint64_t* started, std::uint64_t* used) {
+    const auto [builds, uses] = AgcDriver::DriverDetail::Driver::MissAheadTotals();
+    *started = builds;
+    *used = uses;
+}
+
 extern "C" std::uint64_t AgcDriverDispatchesRejectedAhead_nid_postfix() {
     return AgcDriver::DriverDetail::Driver::Get().DispatchesRejectedAhead();
 }
