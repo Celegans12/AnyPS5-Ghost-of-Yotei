@@ -59,6 +59,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCreationGate.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DemandPipelineCreations.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
@@ -3911,6 +3912,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
         state->queuePending = true;
         state->queueIndex = index;
         ++presentCounters.presents;
+        DriverDetail::ReleaseRegisteredComputePrebuilds();
         if (auto* frame = PerformanceContext::Current()) {
             frame->NoteBlit(batchesAtBlit, lastSubmittedAt, submittedAt);
             // The serials are cumulative: only their difference (the batches other queues put
@@ -6215,16 +6217,21 @@ VkPipeline VulkanDevice::splitComputePipeline(const Graphics::Context& context, 
 std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Graphics::Context& context, const ShaderRecompiler::RecompileResult& shader, VkDescriptorSetLayout setLayout, std::span<const std::uint32_t> layoutKey, VkShaderStageFlags pushStages, std::uint64_t programAddress) {
     const auto pipelineKey = ComputePipelineKey::Of(shader, pushStages != 0);
     std::promise<std::shared_ptr<ComputePipelineObjects>> building;
+    std::optional<Graphics::DemandPipelineCreations::Scope> demand;
     if (!pipelineKey.identity.Empty()) {
         std::shared_future<std::shared_ptr<ComputePipelineObjects>> other;
         {
             std::lock_guard pipelines(state->computePipelinesMutex);
             if (const auto found = state->computePipelines.find(pipelineKey); found != state->computePipelines.end()) return found->second;
+            demand.emplace();
             if (const auto pending = state->computePipelinesBuilding.find(pipelineKey); pending != state->computePipelinesBuilding.end()) other = pending->second;
             else state->computePipelinesBuilding.emplace(pipelineKey, building.get_future().share());
         }
         if (other.valid()) return other.get();
+    } else {
+        demand.emplace();
     }
+    if (!Graphics::DemandPipelineCreations::OnSpeculativeThread()) DriverDetail::PromoteRegisteredCompute(programAddress);
     const auto finish = [&](std::shared_ptr<ComputePipelineObjects> built, std::exception_ptr error) {
         if (pipelineKey.identity.Empty()) return built;
         {

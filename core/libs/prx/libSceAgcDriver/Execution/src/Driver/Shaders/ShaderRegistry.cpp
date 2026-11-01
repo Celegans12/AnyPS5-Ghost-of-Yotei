@@ -5,10 +5,13 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/RegistrationPrebuildQueue.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderMemoryCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ResultFootprint.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreationGate.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DemandPipelineCreations.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -1228,10 +1231,14 @@ std::vector<ShaderRecompiler::TableCallee> ReadTableCallees(const ShaderRecompil
     return callees;
 }
 
+bool CodeCallsSubroutines(std::span<const std::uint32_t> code) {
+    return std::any_of(code.begin(), code.end(), [](std::uint32_t word) { return (word & 0xff80ff00u) == 0xbe802100u; });
+}
+
 ShaderRecompiler::LinkedCalls LinkUserDataCallees(const ShaderRecompiler::RecompileRequest& request) {
     if (request.shader.stage != ShaderRecompiler::ShaderStage::Compute) return {};
     const auto code = request.shader.code;
-    if (std::none_of(code.begin(), code.end(), [](std::uint32_t word) { return (word & 0xff80ff00u) == 0xbe802100u; })) return {};
+    if (!CodeCallsSubroutines(code)) return {};
     const auto program = ShaderRecompiler::RdnaInstructionDecoder{}.Decode(code);
     const ShaderRecompiler::SwappcInfo swappc{false, request.context.userDataBaseRegister, static_cast<std::uint32_t>(request.context.userData.size()), request.context.waveSize};
     const auto calls = ShaderRecompiler::FindUserDataCalls(program, swappc);
@@ -1621,6 +1628,61 @@ void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Gra
 
 namespace {
 
+std::atomic<RegistrationPrebuildQueue*>& RegisteredComputeQueueSlot() {
+    static std::atomic<RegistrationPrebuildQueue*> slot{nullptr};
+    return slot;
+}
+
+RegistrationPrebuildQueue& RegisteredComputeQueue() {
+    static auto* queue = [] {
+        auto settings = RegistrationPrebuildQueue::SettingsFromEnvironment();
+        settings.budgetBytes = Graphics::PipelineCreationGate::Shared().Totals().budgetBytes;
+        auto* created = new RegistrationPrebuildQueue(settings, [](std::function<void()> task) { SubmitLibraryPrebuild(std::move(task)); }, [](std::size_t queued, const char* reason) {
+            if (queued == 0) return;
+            std::fprintf(stderr, "[regcompute] released %zu queued reason=%s\n", queued, reason);
+        }, RegistrationPrebuildQueue::Hooks{[] { return Graphics::DemandPipelineCreations::Active() != 0; }, [] { return Graphics::PipelineCreationGate::Shared().Totals().inFlightBytes; }, [](std::size_t queued, std::uint64_t demand, std::uint64_t memory) {
+            std::fprintf(stderr, "[regcompute] deferred starts: queued=%zu demand=%llu memory=%llu\n", queued, static_cast<unsigned long long>(demand), static_cast<unsigned long long>(memory));
+        }, [] { return Graphics::DemandPipelineCreations::IdleFor(); }});
+        RegisteredComputeQueueSlot().store(created);
+        Graphics::DemandPipelineCreations::SetIdleListener([] {
+            if (auto* queue = RegisteredComputeQueueSlot().load()) queue->Poke();
+        });
+        return created;
+    }();
+    return *queue;
+}
+
+void PrebuildRegisteredCompute(const std::shared_ptr<VulkanDevice>& device, const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle& handle) {
+    if (!ShaderRecompiler::ComputeRegistrationActive() || !ShaderRecompiler::GetPreparedArtifact(handle).registrationModule || CodeCallsSubroutines(request.shader.code)) return;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+    try {
+        result = ShaderRecompiler::RegistrationResult(request, handle);
+    } catch (const std::exception& error) {
+        APS5_LOG_OUT("compute registration prebuild skipped: %s", error.what());
+        return;
+    }
+    if (result == nullptr || !ShaderRecompiler::ComputeRegistrationPrebuildable(*result)) return;
+    const auto address = request.shader.codeAddress;
+    const auto cost = Graphics::PipelineCreationGate::Shared().EstimateBytes(result->spirv.size());
+    const std::uint64_t words = result->spirv.size();
+    RegisteredComputeQueue().Enqueue(address, cost, [device, result = std::move(result), address] {
+        const Graphics::DemandPipelineCreations::SpeculativeThread speculative;
+        const auto start = std::chrono::steady_clock::now();
+        std::fprintf(stderr, "[regcompute] start reason=idle program 0x%llx words %zu\n", static_cast<unsigned long long>(address), result->spirv.size());
+        const bool existing = device->HasComputePipeline(*result);
+        const char* outcome = "ok";
+        try {
+            device->PrebuildComputePipeline(*result, address);
+            if (existing) outcome = "existing";
+            else if (!device->HasComputePipeline(*result)) outcome = "fail";
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[regcompute] program 0x%llx failed: %s\n", static_cast<unsigned long long>(address), error.what());
+            outcome = "fail";
+        }
+        std::fprintf(stderr, "[regcompute] end program 0x%llx words %zu wall_ms=%.0f result=%s\n", static_cast<unsigned long long>(address), result->spirv.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), outcome);
+    }, words);
+}
+
 std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& plan) {
     auto& request = *plan.request;
     std::vector<PreparedShaders::Entry> entries;
@@ -1637,6 +1699,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
             APS5_LOG_OUT("shader library prebuild skipped: %s", error.what());
         }
     }
+    if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Compute && entries.front().handle != nullptr && !LibraryPrebuildDisabled()) PrebuildRegisteredCompute(plan.prebuildDevice, request, *entries.front().handle);
     if (request.context.compute) {
         request.context.compute->partialThreads = {1, 1, 1};
         append();
@@ -2028,7 +2091,20 @@ void AwaitLibraryPrebuilds() {
     if (auto* pool = RegistrationPreparePool::ExistingPrebuild()) pool->AwaitSubmitted();
 }
 
+void PromoteRegisteredCompute(std::uint64_t address) {
+    auto* queue = RegisteredComputeQueueSlot().load();
+    if (queue == nullptr || address == 0) return;
+    if (queue->Promote(address)) std::fprintf(stderr, "[regcompute] promoted program 0x%llx to the demand path, %zu still queued\n", static_cast<unsigned long long>(address), queue->Queued());
+}
+
+void ReleaseRegisteredComputePrebuilds() {
+    if (!ShaderRecompiler::ComputeRegistrationActive()) return;
+    RegisteredComputeQueue().Open("present");
+    if (RegisteredComputeQueue().Presented()) std::fprintf(stderr, "[regcompute] quiet hold lifted after a frame stall, %zu queued\n", RegisteredComputeQueue().Queued());
+}
+
 void CloseRegistrationPreparation() {
+    if (auto* queue = RegisteredComputeQueueSlot().load()) queue->Stop();
     RegistrationPreparePool::CloseAll();
 }
 
