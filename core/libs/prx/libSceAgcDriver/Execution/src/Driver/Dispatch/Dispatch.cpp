@@ -154,13 +154,24 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     const bool itemsOn = DispatchItemsEnabled();
     const bool missItemsOn = itemsOn && DispatchMissItemsEnabled();
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
-    if (SkippedShader(address)) return;
+    const bool preparingAhead = missAheadPlan() != nullptr;
+    if (SkippedShader(address)) {
+        if (preparingAhead) missAheadPlan()->Note(MissAheadPlan::Skip::Listed);
+        return;
+    }
     struct OriginScope {
-        explicit OriginScope(std::uint64_t program) { Graphics::Recorder::SetWriteOrigin(program); }
-        ~OriginScope() { Graphics::Recorder::SetWriteOrigin(0); }
-    } originScope(address);
+        bool active;
+        OriginScope(std::uint64_t program, bool active) : active(active) { if (active) Graphics::Recorder::SetWriteOrigin(program); }
+        ~OriginScope() { if (active) Graphics::Recorder::SetWriteOrigin(0); }
+    } originScope(address, !preparingAhead);
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
-    if (!registeredShader) registeredShader = ReadRawShader(address);
+    if (!registeredShader) {
+        if (preparingAhead) {
+            missAheadPlan()->Note(MissAheadPlan::Skip::Unregistered);
+            return;
+        }
+        registeredShader = ReadRawShader(address);
+    }
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
@@ -171,7 +182,10 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const bool resolving = resolvingAhead();
     if (SkipRefusedShaders() && SkipListedShader(address)) {
-        if (resolving) return;
+        if (resolving) {
+            if (preparingAhead) missAheadPlan()->Note(MissAheadPlan::Skip::Listed);
+            return;
+        }
         char where[96];
         std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
         throw ShaderRefusal(std::string(where) + "listed in the diagnostic skip list");
@@ -189,7 +203,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
     if (VulkanDevice::ExactSerialAllocating() && ProgramAllocates(snapshot, codeOffset)) VulkanDevice::NoteAllocatingProgram(address);
-    if (userData.size() >= 6 && Graphics::HtileMaskKernelCode(std::span(snapshot.code).subspan(codeOffset))) Graphics::Recorder::SetWriteOriginKernel(userData[5], userData[4]);
+    if (!preparingAhead && userData.size() >= 6 && Graphics::HtileMaskKernelCode(std::span(snapshot.code).subspan(codeOffset))) Graphics::Recorder::SetWriteOriginKernel(userData[5], userData[4]);
     static const bool profileWriters = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (profileWriters && Graphics::HtileWriterProgram(address)) {
         static std::atomic<int> dumped{0};
@@ -248,9 +262,14 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     } htileMask;
     std::optional<std::pair<std::uint64_t, std::size_t>> htileClearCompletion;
     if (resolving) {
-        if (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) return;
-        if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
-        if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
+        const auto code = std::span(snapshot.code).subspan(codeOffset);
+        const bool kernel = (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(code, userData, compute.numThreads))
+            || (!partialLastGroup && matchesFillKernel(code, userData, compute))
+            || (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(code, userData, compute) || MatchesStreamCopyKernel(code, userData, compute) || MatchesIndexedCopyKernel(code, userData, compute)));
+        if (kernel) {
+            if (preparingAhead) missAheadPlan()->Note(MissAheadPlan::Skip::Kernel);
+            return;
+        }
     } else {
         if (indirectArguments == 0 && Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
@@ -369,6 +388,15 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             mix(offset);
             mix(value);
         }
+    }
+    if (preparingAhead) {
+        missAheadPlan()->Reach();
+        prepareMissAhead(registeredShader, codeOffset, request, memory, key, localDevice, address);
+        return;
+    }
+    if (!resolving && missAheadProfiled() && missAheadLedger().Active()) {
+        missAheadLedger().Used(key);
+        reportMissAhead();
     }
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
 
@@ -529,6 +557,10 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             compiledResult = invocation.Materialize(*capture);
             CommandMix::NoteMaterialized(*compiledResult, *capture);
             timing.Mark("materialize");
+            if (!resolving && missAheadEnabled()) {
+                missAheadKnown().Insert(key);
+                if (!localDevice->HasComputePipeline(*compiledResult)) missAhead(submission, queue, currentPacketOffset());
+            }
             if (compiledResult->cacheHit) ++cacheHits;
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             static double totalMs = 0;
