@@ -23,7 +23,7 @@ public:
     struct Settings {
         bool waitForPresent = true;
         unsigned concurrency = 2;
-        std::chrono::milliseconds fallback{120000};
+        std::chrono::milliseconds fallback{0};
         std::uint64_t budgetBytes = 0;
         std::chrono::milliseconds summary{10000};
         std::chrono::milliseconds demandQuiet{0};
@@ -67,7 +67,7 @@ public:
             std::lock_guard lock(mutex);
             if (stopped) return;
             pending.push_back({key, cost, std::move(task), words});
-            if (!opened.load() && !timer.joinable()) timer = std::thread([this] { Fallback(); });
+            if (!opened.load() && settings.fallback.count() > 0 && !timer.joinable()) timer = std::thread([this] { Fallback(); });
         }
         Pump();
     }

@@ -136,6 +136,21 @@ void FallbackReleasesWithoutPresent() {
     Require(reason != nullptr && std::string(reason) == "fallback", "the fallback release was not reported as such");
 }
 
+void NoFallbackByDefault() {
+    Require(RegistrationPrebuildQueue::Settings{}.fallback.count() == 0, "the time fallback is on by default");
+    Workers workers;
+    Counters counters;
+    RegistrationPrebuildQueue::Settings settings;
+    settings.concurrency = 2;
+    RegistrationPrebuildQueue queue(settings, [&](std::function<void()> task) { workers.Run(std::move(task)); });
+    const JoinOnExit joiner{workers};
+    for (int index = 0; index < 3; ++index) queue.Enqueue(0, 0, [&] { counters.Task(); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    Require(workers.Submitted() == 0 && queue.Queued() == 3, "the queue opened without a present while the fallback was off");
+    queue.Open("present");
+    Require(WaitFor(counters.done, 3), "the queue did not run after the present with the fallback off");
+}
+
 void StopDropsQueued() {
     Workers workers;
     Counters counters;
@@ -395,6 +410,7 @@ int main() {
         NothingBeforePresentEverythingAfter();
         ImmediateStartsAtOnceWithinCap();
         FallbackReleasesWithoutPresent();
+        NoFallbackByDefault();
         StopDropsQueued();
         EnvironmentSettings();
         DemandHoldsBackNewStartsUntilIdle();
