@@ -88,6 +88,8 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_MOVED_IN_PLACE",
     "APS5_NO_GPU_WRITTEN_INDEX_ESTIMATE",
     "APS5_NEW_PATH_NO_C1",
+    "APS5_NO_LANE_OPEN_WAIT",
+    "APS5_NO_RESIDENT_RANGES",
 };
 
 struct Refusal {
