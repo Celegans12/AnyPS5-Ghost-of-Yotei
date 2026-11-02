@@ -133,6 +133,14 @@ std::uint64_t headerNumber(const std::string& header, std::string_view key) {
     return std::strtoull(header.c_str() + at + quoted.size(), nullptr, 10);
 }
 
+void validatePrologue(const std::string& header, bool strict) {
+    if (header.find("\"prologue_dropped\":") == std::string::npos) return;
+    const auto dropped = headerNumber(header, "prologue_dropped");
+    if (dropped == 0) return;
+    std::fprintf(stderr, "[frame-replay] capture dropped %llu unavailable prologue calls\n", static_cast<unsigned long long>(dropped));
+    if (strict) throw std::runtime_error("frame replay: strict replay refuses a capture with dropped prologue calls");
+}
+
 void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
     reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
 }
@@ -295,6 +303,32 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
     return skipped;
 }
 
+void restoreRewritten(const FrameCaptureReader& reader, std::span<const FrameMemoryChunk* const> rewritten, const Skipped& skipped) {
+    std::vector<const FrameMemoryChunk*> snapshot;
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind == FrameMemoryKind::Snapshot && !skipped.Overlaps(chunk)) snapshot.push_back(&chunk);
+    }
+    std::sort(snapshot.begin(), snapshot.end(), [](const auto* left, const auto* right) { return left->address < right->address; });
+    std::map<const FrameMemoryChunk*, std::vector<std::pair<std::uint64_t, std::uint64_t>>> pieces;
+    for (const auto* chunk : rewritten) {
+        if (skipped.Overlaps(*chunk)) continue;
+        const auto begin = chunk->address;
+        const auto end = chunk->address + chunk->bytes;
+        std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(begin)), 0, static_cast<std::size_t>(chunk->bytes));
+        auto at = std::upper_bound(snapshot.begin(), snapshot.end(), begin, [](std::uint64_t address, const auto* candidate) { return address < candidate->address; });
+        if (at != snapshot.begin()) --at;
+        for (; at != snapshot.end() && (*at)->address < end; ++at) {
+            const auto low = std::max(begin, (*at)->address);
+            const auto high = std::min(end, (*at)->address + (*at)->bytes);
+            if (low < high) pieces[*at].emplace_back(low, high);
+        }
+    }
+    for (const auto& [chunk, ranges] : pieces) {
+        const auto bytes = reader.Read(*chunk);
+        for (const auto& [low, high] : ranges) std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(low)), bytes.data() + (low - chunk->address), static_cast<std::size_t>(high - low));
+    }
+}
+
 std::pair<std::uint64_t, std::uint64_t> progress() {
     std::uint64_t accepted = 0;
     std::uint64_t completed = 0;
@@ -431,7 +465,7 @@ struct Replay {
             for (const auto* chunk : found->second) {
                 if (skipped.Overlaps(*chunk)) continue;
                 restore(reader, *chunk);
-                deltaBytes += chunk->bytes;
+                if (recording) deltaBytes += chunk->bytes;
             }
             return;
         }
@@ -717,6 +751,7 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
 int run(const Options& options) {
     const auto loadStart = Clock::now();
     const FrameCaptureReader reader(options.directory);
+    validatePrologue(reader.Header(), options.strict);
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
     auto skipped = restoreMemory(reader);
     const auto loaded = Clock::now();
@@ -727,7 +762,17 @@ int run(const Options& options) {
     }
     const auto& calls = reader.Calls();
     const auto frameStart = std::find_if(calls.begin(), calls.end(), [](const FrameCall& call) { return call.kind == FrameCallKind::FrameStart; });
-    for (auto call = calls.begin(); call != frameStart; ++call) replay.execute(*call);
+    std::vector<const FrameMemoryChunk*> rewritten;
+    const auto prologueStart = Clock::now();
+    for (auto call = calls.begin(); call != frameStart; ++call) {
+        if (call->kind == FrameCallKind::Memory) {
+            if (const auto found = replay.groups.find(call->values.at(0)); found != replay.groups.end()) rewritten.insert(rewritten.end(), found->second.begin(), found->second.end());
+        }
+        replay.execute(*call);
+    }
+    if (!rewritten.empty()) restoreRewritten(reader, rewritten, replay.skipped);
+    std::fprintf(stderr, "[frame-replay] prologue: %zu calls in %.1f s, %zu shader images rewritten and restored, %llu stale registrations\n", static_cast<std::size_t>(frameStart - calls.begin()),
+                 std::chrono::duration<double>(Clock::now() - prologueStart).count(), rewritten.size(), static_cast<unsigned long long>(replay.staleRegistrations.load()));
     replay.recording = true;
     replay.startedAt = Clock::now();
     if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
