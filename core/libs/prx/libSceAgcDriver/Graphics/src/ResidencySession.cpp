@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <iterator>
 #include <optional>
@@ -275,7 +276,12 @@ void NoteStagedRegions(std::span<const std::pair<std::uint64_t, std::uint64_t>> 
         (one ? session.onePageBytes : session.multiPageBytes) += bytes;
     }
     session.stagedWrites += writes.size();
-    PatchTable(session);
+    // Every recorded draw and dispatch notes its staged regions here; patching the device table now settled the
+    // resident pages (a walk over all of them) per command (NP-overhead: ~0.4 s per 10 s of committer and as much of
+    // queue 0 with nothing routed). The table's users refresh it before use (DevicePageTable::Stale), which patches
+    // the resident changes, so it is patched there. APS5_NEW_PATH_EAGER_TABLE_REFRESH=1 patches here as before.
+    static const bool eager = [] { const char* value = std::getenv("APS5_NEW_PATH_EAGER_TABLE_REFRESH"); return value != nullptr && value[0] != '\0' && value[0] != '0'; }();
+    if (eager) PatchTable(session);
 }
 
 std::string ResidencyReportLine() {
