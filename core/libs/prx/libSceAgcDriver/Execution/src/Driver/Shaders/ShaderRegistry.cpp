@@ -1652,23 +1652,27 @@ RegistrationPrebuildQueue& RegisteredComputeQueue() {
     return *queue;
 }
 
-void PrebuildRegisteredCompute(const std::shared_ptr<VulkanDevice>& device, const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle& handle) {
-    if (!ShaderRecompiler::ComputeRegistrationActive() || !ShaderRecompiler::GetPreparedArtifact(handle).registrationModule || CodeCallsSubroutines(request.shader.code)) return;
-    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
-    try {
-        result = ShaderRecompiler::RegistrationResult(request, handle);
-    } catch (const std::exception& error) {
-        APS5_LOG_OUT("compute registration prebuild skipped: %s", error.what());
-        return;
-    }
-    if (result == nullptr || !ShaderRecompiler::ComputeRegistrationPrebuildable(*result)) return;
+void PrebuildRegisteredCompute(const std::shared_ptr<VulkanDevice>& device, const ShaderRecompiler::RecompileRequest& request, const std::shared_ptr<const ShaderRecompiler::SourceHandle>& handle) {
+    if (!ShaderRecompiler::ComputeRegistrationActive() || !ShaderRecompiler::ComputeRegistrationCandidate(ShaderRecompiler::GetPreparedArtifact(*handle)) || CodeCallsSubroutines(request.shader.code)) return;
     const auto address = request.shader.codeAddress;
-    const auto cost = Graphics::PipelineCreationGate::Shared().EstimateBytes(result->spirv.size());
-    const std::uint64_t words = result->spirv.size();
-    RegisteredComputeQueue().Enqueue(address, cost, [device, result = std::move(result), address] {
+    const std::uint64_t words = ShaderRecompiler::GetPreparedArtifact(*handle).spirv.size();
+    const auto cost = Graphics::PipelineCreationGate::Shared().EstimateBytes(words);
+    RegisteredComputeQueue().Enqueue(address, cost, [device, request, handle, address] {
         const Graphics::DemandPipelineCreations::SpeculativeThread speculative;
         const auto start = std::chrono::steady_clock::now();
-        std::fprintf(stderr, "[regcompute] start reason=idle program 0x%llx words %zu\n", static_cast<unsigned long long>(address), result->spirv.size());
+        std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+        try {
+            result = ShaderRecompiler::RegistrationResult(request, *handle);
+        } catch (const std::exception& error) {
+            std::fprintf(stderr, "[regcompute] program 0x%llx skipped: %s\n", static_cast<unsigned long long>(address), error.what());
+            return;
+        }
+        const auto specialized = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        if (result == nullptr || !ShaderRecompiler::ComputeRegistrationPrebuildable(*result)) {
+            std::fprintf(stderr, "[regcompute] program 0x%llx not prebuilt: specialized module below the threshold, specialize_ms=%.0f\n", static_cast<unsigned long long>(address), specialized);
+            return;
+        }
+        std::fprintf(stderr, "[regcompute] start reason=idle program 0x%llx words %zu specialize_ms=%.0f\n", static_cast<unsigned long long>(address), result->spirv.size(), specialized);
         const bool existing = device->HasComputePipeline(*result);
         const char* outcome = "ok";
         try {
@@ -1699,7 +1703,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
             APS5_LOG_OUT("shader library prebuild skipped: %s", error.what());
         }
     }
-    if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Compute && entries.front().handle != nullptr && !LibraryPrebuildDisabled()) PrebuildRegisteredCompute(plan.prebuildDevice, request, *entries.front().handle);
+    if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Compute && entries.front().handle != nullptr && !LibraryPrebuildDisabled()) PrebuildRegisteredCompute(plan.prebuildDevice, request, entries.front().handle);
     if (request.context.compute) {
         request.context.compute->partialThreads = {1, 1, 1};
         append();
