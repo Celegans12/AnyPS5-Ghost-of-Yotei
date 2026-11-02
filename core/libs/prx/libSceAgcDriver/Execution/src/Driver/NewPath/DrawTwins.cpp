@@ -3,7 +3,9 @@
 #include "Recompiler.hpp"
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <iterator>
 
 namespace AgcDriver::NewPath {
 
@@ -103,6 +105,67 @@ ResolvedTwins& DrawStageTwins() {
     return *twins;
 }
 
+std::optional<CommandFacts> DrawFactsWithoutTable(const CommandFacts& decoded, std::span<const DrawStage> stages, const DrawShape& shape, const ResolvedTwins& twins) {
+    auto facts = decoded;
+    facts.classA = true;
+    facts.lean = true;
+    facts.shapeSupported = DrawShapeRefusal(stages, shape) == ShapeRefusal::None;
+    if (!facts.shapeSupported) return facts;
+    const auto found = DrawTwinsOf(stages, twins);
+    if (found.empty()) return std::nullopt;
+    for (const auto& twin : found) {
+        if (!WalkReplacesTables(*twin)) return std::nullopt;
+    }
+    facts.resolvedProgram = true;
+    facts.pushFits = DrawPushFits(stages);
+    facts.clothGuard = false;
+    facts.tableCovers = true;
+    facts.pipelineReady = true;
+    return facts;
+}
+
+namespace {
+
+struct DrawCost {
+    std::atomic<std::uint64_t> count{0}, drawNs{0}, buildNs{0}, slow{0};
+};
+std::array<DrawCost, DrawCostBuckets>& DrawCosts() {
+    static auto* costs = new std::array<DrawCost, DrawCostBuckets>;
+    return *costs;
+}
+
+}
+
+bool DrawCostProfiled() {
+    static const bool profiled = [] { const char* value = std::getenv("APS5_PROFILE_NEW_PATH"); return value != nullptr && value[0] != '\0' && std::strcmp(value, "0") != 0; }();
+    return profiled;
+}
+
+void NoteDrawCost(DrawCostBucket bucket, std::uint64_t drawNs, std::uint64_t buildNs) {
+    auto& cost = DrawCosts()[static_cast<std::size_t>(bucket)];
+    if (drawNs > 50'000'000ull) {
+        cost.slow.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    cost.count.fetch_add(1, std::memory_order_relaxed);
+    cost.drawNs.fetch_add(drawNs, std::memory_order_relaxed);
+    cost.buildNs.fetch_add(buildNs, std::memory_order_relaxed);
+}
+
+std::string FormatDrawCost(const char* window) {
+    static constexpr const char* names[] = {"new path (table deferred)", "new path (table built)", "new path (template hit)", "fallback class A", "other draws"};
+    static_assert(std::size(names) == DrawCostBuckets);
+    std::string line = std::string("[newpath-cost] window=") + window + " committer draws (cumulative, Graphics::Draw):";
+    for (std::size_t index = 0; index < DrawCostBuckets; ++index) {
+        const auto& cost = DrawCosts()[index];
+        const auto count = cost.count.load(std::memory_order_relaxed);
+        char text[192];
+        std::snprintf(text, sizeof(text), "%s %s %llu x %.1f us (build %.1f us), %llu over 50 ms left out", index == 0 ? "" : ";", names[index], static_cast<unsigned long long>(count), count != 0 ? static_cast<double>(cost.drawNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(count) : 0.0, count != 0 ? static_cast<double>(cost.buildNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(count) : 0.0, static_cast<unsigned long long>(cost.slow.load(std::memory_order_relaxed)));
+        line += text;
+    }
+    return line;
+}
+
 DrawEmitCounts& DrawCounts() {
     static auto* counts = new DrawEmitCounts;
     return *counts;
@@ -117,8 +180,8 @@ std::string FormatDrawEmit(const char* window, bool emitting) {
         if (counts.shapes[index].load(std::memory_order_relaxed) == 0) continue;
         shapes += std::string(shapes.empty() ? "" : ", ") + ShapeRefusalName(static_cast<ShapeRefusal>(index)) + " " + std::to_string(load(counts.shapes[index]));
     }
-    char facts[320];
-    std::snprintf(facts, sizeof(facts), "; class A by fact: draws %llu, lean %llu, shape ok %llu, twins %llu, push fits %llu, no cloth %llu, F4 covered %llu, all but the twin %llu", load(counts.classA), load(counts.lean), load(counts.shapeOk), load(counts.twinned), load(counts.pushFits), load(counts.noCloth), load(counts.covered), load(counts.eligible));
+    char facts[448];
+    std::snprintf(facts, sizeof(facts), "; class A by fact: draws %llu, lean %llu, shape ok %llu, twins %llu, push fits %llu, no cloth %llu, F4 covered %llu, all but the twin %llu; deferred-table templates: hits %llu, fell back to an own build %llu", load(counts.classA), load(counts.lean), load(counts.shapeOk), load(counts.twinned), load(counts.pushFits), load(counts.noCloth), load(counts.covered), load(counts.eligible), load(counts.templateHits), load(counts.templateFallbacks));
     char line[640];
     std::snprintf(line, sizeof(line), "[newpath-draw-emit] window=%s emit draws %s (cumulative): stage twins built %llu, failed %llu, mismatched %llu, reused %llu; shape refusals %s; twin pipelines requested %llu, not ready at a draw %llu, failed %llu, rebuilt after eviction %llu, uncached %llu; table compares covered %llu, missing %llu, other address %llu, narrower %llu; command records %llu, table uploads %llu", window, emitting ? "on" : "off", static_cast<unsigned long long>(twins[static_cast<std::size_t>(TwinOutcome::Built)]), static_cast<unsigned long long>(twins[static_cast<std::size_t>(TwinOutcome::Failed)]), static_cast<unsigned long long>(twins[static_cast<std::size_t>(TwinOutcome::Mismatch)]), static_cast<unsigned long long>(twins[static_cast<std::size_t>(TwinOutcome::Reused)]), shapes.empty() ? "none" : shapes.c_str(), load(counts.pipelineRequests), load(counts.pipelineNotReady), load(counts.pipelineFailed), load(counts.pipelineRebuilt), load(counts.uncachedPipelines), load(counts.covers[0]), load(counts.covers[1]), load(counts.covers[2]), load(counts.covers[3]), load(counts.records), load(counts.tableUploads));
     return std::string(line) + facts;
