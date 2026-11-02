@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DrawTwins.hpp"
+#include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
 #include "Recompiler.hpp"
 #include <algorithm>
