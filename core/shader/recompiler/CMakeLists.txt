@@ -284,6 +284,9 @@ function(add_shader_recompiler target runtimeTarget)
             ResultMemoTotals
             ResultHeapBytes
             RegistrationResult
+            ComputeRegistrationPrebuildable
+            ComputeRegistrationActive
+            ComputeRegistrationCandidate
             ResolveSource
             ResourceMaterializer::EvaluateNanoseconds
             ResourceMaterializer::FindBindlessInterface

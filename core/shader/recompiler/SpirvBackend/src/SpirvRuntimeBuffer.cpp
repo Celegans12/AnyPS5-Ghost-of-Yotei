@@ -166,7 +166,7 @@ DecodedDescriptor decode(SpirvValueEmitContext& context, const IrValue& instruct
     const bool runtimeShape = runtime || state.program.Resources().stage == IrShaderStage::Compute;
     auto word1 = runtimeShape ? context.Arg(handle, 1u) : state.module.SpecializationConstant(TypeU32(state), first, 0u);
     if (runtimeShape && GcnGuestShaders()) word1 = Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1, ConstantU32(state, GcnBufferWord1Mask));
-    const bool runtimeFormat = memory.gpuDescriptor || (state.registrationModules && !state.program.Info().buffers.at(memory.resource).descriptorFormatted);
+    const bool runtimeFormat = memory.gpuDescriptor || (state.registrationModules && (state.program.Resources().stage == IrShaderStage::Compute || !state.program.Info().buffers.at(memory.resource).descriptorFormatted));
     const bool selectsFormat = !runtimeFormat && !state.registrationModules && memory.kind == ResourceKind::Buffer && state.program.Resources().stage == IrShaderStage::Compute && state.program.Info().buffers.at(memory.resource).descriptorFormatted;
     const auto u32 = TypeU32(state);
     auto runtimeWord3 = (runtimeFormat || selectsFormat) ? context.Arg(handle, 3u) : 0u;
@@ -917,7 +917,7 @@ std::uint32_t formattedCall(SpirvValueEmitContext& context, const IrValue& instr
         const auto first = PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords;
         RuntimeDescriptor shared{};
         if (state.registrationModules) {
-            const auto word3 = state.program.Info().buffers.at(memory.resource).descriptorFormatted ? state.module.SpecializationConstant(u32, first + 1u, 0u) : parameters[6];
+            const auto word3 = state.program.Info().buffers.at(memory.resource).descriptorFormatted && state.program.Resources().stage != IrShaderStage::Compute ? state.module.SpecializationConstant(u32, first + 1u, 0u) : parameters[6];
             shared = {ConstantU32(state, 0u), parameters[3], parameters[5], word3, nonzero(state, parameters[7]), parameters[0], nonzero(state, parameters[8]), parameters[1], parameters[2]};
         } else if (state.program.Resources().stage == IrShaderStage::Compute) {
             const auto specialized = state.module.SpecializationConstant(u32, first + 1u, 0u);
