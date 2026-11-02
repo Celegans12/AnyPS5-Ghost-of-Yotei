@@ -161,9 +161,13 @@ void report(State& state) {
     if (lock.owns_lock() && ProfileWindows::ClockDue(state.lastReport)) print(state, "10 s");
 }
 
+// Every command's decode: residency is set up once. The device table is not refreshed here: each use (a routed
+// draw's or dispatch's F4, a C1 cover) refreshes it first, and a stale check settles the resident pages, a walk over
+// all of them under the residency lock (NP-overhead: ~17 us per draw packet, ~10 us per dispatch in ab-combo).
 void prepare(const VulkanDevice* device) {
     if (device == nullptr) return;
-    if (DeviceTable().Stale(device->Device())) static_cast<void>(DeviceTable().Refresh(device->graphicsContext()));
+    static const bool eagerTable = EnvSet("APS5_NEW_PATH_EAGER_TABLE_REFRESH");
+    if (eagerTable && DeviceTable().Stale(device->Device())) static_cast<void>(DeviceTable().Refresh(device->graphicsContext()));
     if (Graphics::CurrentResidencyConfig().residency && Graphics::Recorder::Active() != nullptr && !Graphics::ResidencyEnsured(device->Device())) Graphics::EnsureResidency(device->graphicsContext());
 }
 
@@ -229,7 +233,7 @@ std::shared_ptr<EmitCandidate> ClaimDispatch(const ShaderRecompiler::RecompileRe
     candidate->facts.twinSkipped = skipped;
     candidate->facts.c1 = !UsesAddressTables(compiled) && C1Shape(compiled);
     candidate->facts.c1Switch = candidate->facts.c1 && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NewPathNoC1);
-    if (candidate->facts.c1Switch) {
+    if (candidate->facts.c1Switch || candidate->facts.kindSwitchOff) {
         candidate->twin = nullptr;
         candidate->facts.resolvedProgram = false;
     }
