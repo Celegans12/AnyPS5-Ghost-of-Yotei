@@ -503,7 +503,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_WRITE_WATCH_IMPORTS` | string | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` |  | how host imports are write-tracked: `probe`, `watch` or `unwatch` |
 | `APS5_WRITTEN_SHADOW_MAX_KIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` | 2048 (8192 on a discrete GPU) | upper bound in KiB of the written staging window; a set value is used as given on both device types |
 | `APS5_WRITTEN_SHADOW_MIN_KIB` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` | 16 | lower bound in KiB of the written staging window |
-| `APS5_WRITTEN_SHADOW_VRAM_DENOMINATOR` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` | 2 | denominator of the device-local heap fraction at which the written shadow yields to the texture cache: a shadow is staged only while heap usage stays below that fraction |
+| `APS5_WRITTEN_SHADOW_VRAM_DENOMINATOR` | integer | `core/libs/prx/libSceAgcDriver/Graphics/src/GuestBufferMemory.cpp` | 2 | denominator of the device-local heap fraction at which the written shadow yields to the texture cache: a shadow is staged only while heap usage stays below one denominator; 0 falls back to the default |
 
 ### libSceAjm.native
 
