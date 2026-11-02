@@ -1700,7 +1700,8 @@ void reportSplits() {
     const auto skippedPipelines = take(c.pipelinesSkipped);
     const auto pipelineWaits = take(c.pipelineWaits);
     const auto pipelineWaitMs = static_cast<double>(take(c.pipelineWaitNs)) / 1e6;
-    std::fprintf(stderr, "[split] draws prepared (10 s): %llu (cache entry then %llu, address tables left to the lock %llu, address-based stage A %llu, forget serial in change %llu); stage A built %llu in %.1f ms (%llu refused); at the draw: %llu builds completed from stage A, %llu served by the cache instead, discarded as stale %llu (forget serial %llu, registry %llu, other %llu); %llu builds made under the lock; %llu keys reused; pipelines prebuilt %llu (%llu skipped at a full queue), commits waited for %llu (%.1f ms)\n", prepared, cached, address, addressStageA, inChange, stageA, stageAMs, failed, used, served, forget + registry + other, forget, registry, other, locked, keys, queuedPipelines, skippedPipelines, pipelineWaits, pipelineWaitMs);
+    const auto committerBuilds = TakeCommitterBuilds();
+    std::fprintf(stderr, "[split] draws prepared (10 s): %llu (cache entry then %llu, address tables left to the lock %llu, address-based stage A %llu, forget serial in change %llu); stage A built %llu in %.1f ms (%llu refused); at the draw: %llu builds completed from stage A, %llu served by the cache instead, discarded as stale %llu (forget serial %llu, registry %llu, other %llu); %llu builds made under the lock; %llu keys reused; pipelines prebuilt %llu (%llu skipped at a full queue), commits waited for %llu (%.1f ms); committer builds %llu (%.1f ms)\n", prepared, cached, address, addressStageA, inChange, stageA, stageAMs, failed, used, served, forget + registry + other, forget, registry, other, locked, keys, queuedPipelines, skippedPipelines, pipelineWaits, pipelineWaitMs, static_cast<unsigned long long>(committerBuilds.builds), static_cast<double>(committerBuilds.nanoseconds) / 1e6);
     {
         const auto& o = CachedAcquireOutcomes();
         std::fprintf(stderr, "[split] address-based stage A (cumulative): taken %llu, refused: cache off %llu, no space %llu, writable mirrors %llu, heap mirrors %llu, sparse mirrors %llu, stale %llu\n", static_cast<unsigned long long>(o[0].load()), static_cast<unsigned long long>(o[1].load()), static_cast<unsigned long long>(o[2].load()), static_cast<unsigned long long>(o[3].load()), static_cast<unsigned long long>(o[4].load()), static_cast<unsigned long long>(o[5].load()), static_cast<unsigned long long>(o[6].load()));
@@ -3176,6 +3177,7 @@ std::size_t PrebuildThreads() {
 }
 
 void runPrebuilds(PipelinePrebuilds& prebuilds) {
+    MarkBuildThread(BuildThread::Pool);
     for (;;) {
         std::packaged_task<void()> job;
         {
