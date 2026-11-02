@@ -105,6 +105,49 @@ ResolvedTwins& DrawStageTwins() {
     return *twins;
 }
 
+std::uint64_t DrawProgramKey(std::span<const DrawProgramStage> stages) {
+    std::uint64_t key = 0x2545f4914f6cdd1dull ^ (static_cast<std::uint64_t>(stages.size()) << 56u);
+    for (const auto& stage : stages) key = (key ^ (stage.codeAddress * 0x9e3779b97f4a7c15ull) ^ (static_cast<std::uint64_t>(stage.stage) << 3u)) * 0xc2b2ae3d27d4eb4full;
+    return key != 0 ? key : 1;
+}
+
+TwinRoutes& DrawRoutes() {
+    static auto* routes = [] {
+        const char* value = std::getenv("APS5_NEW_PATH_TWIN_ALWAYS");
+        return new TwinRoutes(value != nullptr && value[0] != '\0' && value[0] != '0');
+    }();
+    return *routes;
+}
+
+bool DrawTwinDecision(std::uint64_t submission, std::uint64_t packetOffset, std::uint64_t key) {
+    struct Last {
+        bool valid = false;
+        std::uint64_t submission = 0, packetOffset = 0, key = 0;
+        bool build = true;
+    };
+    thread_local Last last;
+    if (last.valid && last.submission == submission && last.packetOffset == packetOffset && last.key == key) return last.build;
+    last = {true, submission, packetOffset, key, DrawRoutes().ShouldBuild(key)};
+    return last.build;
+}
+
+void NoteDrawPrograms(EmitCandidate& candidate, std::span<const ShaderRecompiler::RecompileResult* const> programs) {
+    candidate.drawProgramCount = 0;
+    bool skipped = false;
+    for (const auto* program : programs) {
+        if (program == nullptr) continue;
+        std::uint64_t key = 0;
+        bool stageSkipped = false;
+        const auto twin = DrawStageTwins().Of(*program, &key, &stageSkipped);
+        skipped = skipped || stageSkipped;
+        if (twin == nullptr || key == 0 || candidate.drawProgramCount >= EmitCandidate::DrawProgramSlots) continue;
+        const auto begin = candidate.drawPrograms.begin();
+        if (std::find(begin, begin + candidate.drawProgramCount, key) != begin + candidate.drawProgramCount) continue;
+        candidate.drawPrograms[candidate.drawProgramCount++] = key;
+    }
+    candidate.facts.twinSkipped = skipped;
+}
+
 std::optional<CommandFacts> DrawFactsWithoutTable(const CommandFacts& decoded, std::span<const DrawStage> stages, const DrawShape& shape, const ResolvedTwins& twins) {
     auto facts = decoded;
     facts.classA = true;
@@ -184,7 +227,10 @@ std::string FormatDrawEmit(const char* window, bool emitting) {
     std::snprintf(facts, sizeof(facts), "; class A by fact: draws %llu, lean %llu, shape ok %llu, twins %llu, push fits %llu, no cloth %llu, F4 covered %llu, all but the twin %llu; deferred-table templates: hits %llu, fell back to an own build %llu", load(counts.classA), load(counts.lean), load(counts.shapeOk), load(counts.twinned), load(counts.pushFits), load(counts.noCloth), load(counts.covered), load(counts.eligible), load(counts.templateHits), load(counts.templateFallbacks));
     char line[640];
     std::snprintf(line, sizeof(line), "[newpath-draw-emit] window=%s emit draws %s (cumulative): stage twins built %llu, failed %llu, mismatched %llu, reused %llu; shape refusals %s; twin pipelines requested %llu, not ready at a draw %llu, failed %llu, rebuilt after eviction %llu, uncached %llu; table compares covered %llu, missing %llu, other address %llu, narrower %llu; command records %llu, table uploads %llu", window, emitting ? "on" : "off", static_cast<unsigned long long>(twins[static_cast<std::size_t>(TwinOutcome::Built)]), static_cast<unsigned long long>(twins[static_cast<std::size_t>(TwinOutcome::Failed)]), static_cast<unsigned long long>(twins[static_cast<std::size_t>(TwinOutcome::Mismatch)]), static_cast<unsigned long long>(twins[static_cast<std::size_t>(TwinOutcome::Reused)]), shapes.empty() ? "none" : shapes.c_str(), load(counts.pipelineRequests), load(counts.pipelineNotReady), load(counts.pipelineFailed), load(counts.pipelineRebuilt), load(counts.uncachedPipelines), load(counts.covers[0]), load(counts.covers[1]), load(counts.covers[2]), load(counts.covers[3]), load(counts.records), load(counts.tableUploads));
-    return std::string(line) + facts;
+    const auto routes = DrawRoutes().Take();
+    char routed[320];
+    std::snprintf(routed, sizeof(routed), "; stage twins skipped %llu; draw twin routes: programs %llu, packets building %llu, probes %llu, skipped %llu; routes noted new %llu, fallback %llu", static_cast<unsigned long long>(twins[static_cast<std::size_t>(TwinOutcome::Skipped)]), static_cast<unsigned long long>(routes.programs), static_cast<unsigned long long>(routes.built), static_cast<unsigned long long>(routes.probes), static_cast<unsigned long long>(routes.skipped), static_cast<unsigned long long>(routes.notedNew), static_cast<unsigned long long>(routes.notedFallback));
+    return std::string(line) + facts + routed;
 }
 
 }

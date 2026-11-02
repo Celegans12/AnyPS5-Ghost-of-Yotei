@@ -13,6 +13,7 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "ShaderDiskCache.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -150,11 +151,19 @@ std::shared_ptr<DispatchVariant> DrawStageVariant(const DrawProgram& program, co
 // The resolved twin of a draw stage (NewPath::DrawStageTwins), from the stage's own request with the target
 // flag set and a capture of its own over the memory the stage was captured from. Failures are counted and
 // leave the stage without a twin (its draws fall back as no-resolved-module).
-void Driver::buildDrawStageTwin(const DrawProgram& program, const ShaderRecompiler::RecompileRequest& request, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled) {
+void Driver::buildDrawStageTwin(const DrawProgram& program, const ShaderRecompiler::RecompileRequest& request, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled, const std::vector<DrawProgram>& programs, std::uint64_t submissionSerial, std::size_t packetOffset) {
     auto& twins = NewPath::DrawStageTwins();
     if (compiled == nullptr || twins.Known(*compiled)) return;
     if (compiled->newPathResolved || compiled->transferKernel.has_value()) {
         twins.Remember(compiled, nullptr, NewPath::TwinOutcome::NotAddressBased);
+        return;
+    }
+    std::array<NewPath::DrawProgramStage, 8> keyStages{};
+    const auto stageCount = std::min(programs.size(), keyStages.size());
+    for (std::size_t index = 0; index < stageCount; ++index) keyStages[index] = {static_cast<std::uint32_t>(programs[index].binary.stage), programs[index].binary.codeAddress};
+    const auto drawKey = NewPath::DrawProgramKey(std::span<const NewPath::DrawProgramStage>(keyStages.data(), stageCount));
+    if (!NewPath::DrawTwinDecision(submissionSerial, packetOffset, drawKey)) {
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Skipped, false, drawKey);
         return;
     }
     std::shared_ptr<const ShaderRecompiler::RecompileResult> twin;
@@ -171,16 +180,18 @@ void Driver::buildDrawStageTwin(const DrawProgram& program, const ShaderRecompil
     } catch (const std::exception& error) {
         static std::atomic<int> reported{0};
         if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] no resolved module for draw stage %u of shader 0x%llx: %.200s\n", static_cast<unsigned>(program.binary.stage), static_cast<unsigned long long>(program.binary.codeAddress), error.what());
-        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Failed);
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Failed, false, drawKey);
+        NewPath::DrawRoutes().Note(drawKey, false);
         return;
     }
     if (twin == nullptr || !NewPath::StageTwinCompatible(*compiled, *twin)) {
         static std::atomic<int> reported{0};
         if (twin != nullptr && reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[newpath] resolved module of draw stage %u of shader 0x%llx differs: %s\n", static_cast<unsigned>(program.binary.stage), static_cast<unsigned long long>(program.binary.codeAddress), NewPath::StageTwinDifference(*compiled, *twin).c_str());
-        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Mismatch);
+        twins.Remember(compiled, nullptr, NewPath::TwinOutcome::Mismatch, false, drawKey);
+        NewPath::DrawRoutes().Note(drawKey, false);
         return;
     }
-    twins.Remember(compiled, std::move(twin), NewPath::TwinOutcome::Built);
+    twins.Remember(compiled, std::move(twin), NewPath::TwinOutcome::Built, false, drawKey);
 }
 
 std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDrawStage(std::size_t i, std::uint32_t pushOffset, const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::uint64_t traceToken, const std::vector<DrawProgram>& programs, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, std::vector<ShaderRecompiler::MemoryRegion>& memory, const std::vector<ShaderRecompiler::LinkedProgram>& linked, const Pm4::DrawParameters& drawParameters, const std::shared_ptr<VulkanDevice>& localDevice, ShaderMemory& shaderMemory, std::vector<StageCapture>& stageCaptures, std::vector<bool>& recompiled, bool drawHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, const std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool profile, std::uint64_t dumpTarget, std::uint64_t dumpSlot1, std::uint64_t& captures, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, std::string& rejected, const std::optional<ShaderRecompiler::MeshBarycentricLayout>& meshBarycentrics) try {
@@ -286,7 +297,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         TraceMaterializationFailure(traceToken, submission, packetOffset, i, "capture-or-materialize", std::current_exception());
         throw named(error, request.context.memory);
     }
-    if (NewPath::EmitDraws() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NewPathNoGpuDraws)) buildDrawStageTwin(program, request, stageCapture.compiled);
+    if (NewPath::EmitDraws() && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NewPathNoGpuDraws)) buildDrawStageTwin(program, request, stageCapture.compiled, programs, submission.serial, packetOffset);
     timing.Mark("materialize");
     stageCapture.userDataMask = StageUserDataMask(*capture, *stageCapture.compiled, vertexInfos[i]);
     phaseTiming.Phase(DrawRowRecompile);

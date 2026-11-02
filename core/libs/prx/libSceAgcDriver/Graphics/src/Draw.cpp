@@ -2893,6 +2893,15 @@ bool WriteOnlyPasses() {
     return enabled;
 }
 
+// The draw program keys (NewPath::DrawRoutes) of the stages that have a twin, for the route the candidate notes when it ends.
+void noteDrawPrograms(NewPath::EmitCandidate& emit, std::span<const CompiledShader> shaders) {
+    if (emit.facts.kindSwitchOff) return;
+    std::array<const ShaderRecompiler::RecompileResult*, 8> programs{};
+    const auto count = std::min(shaders.size(), programs.size());
+    for (std::size_t index = 0; index < count; ++index) programs[index] = shaders[index].program;
+    NewPath::NoteDrawPrograms(emit, std::span<const ShaderRecompiler::RecompileResult* const>(programs.data(), count));
+}
+
 // The twins' pipeline of a class A draw, created by NewPath::DrawTwinPipelines' workers (never here with the
 // pipeline gate on: null until it is ready, and the draw falls back as no-pipeline). Once created it lives in
 // the pipeline store like any other; a ready key is served from there (rebuilt only if the store evicted it).
@@ -2931,6 +2940,7 @@ std::shared_ptr<Pipeline> drawTwinPipeline(const Context& context, const State& 
 // The new-path decision for a lean draw (router F1-F7 with the draw facts), made before anything is
 // recorded: on Route::NewPath the record carries the twins' pipeline and what the push needs.
 void routeLeanDraw(NewPath::EmitCandidate& emit, const Context& context, const State& state, const State& pipelineState, const VertexInputLayout& vertexInput, std::span<const CompiledShader> shaders, std::size_t kind, RecordedDraw& record) {
+    noteDrawPrograms(emit, shaders);
     auto facts = emit.facts;
     facts.classA = kind == KindBda || (kind == KindTemplateHit && record.resources->AddressTableDeferred());
     facts.lean = true;
@@ -3918,6 +3928,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     }
     leaveDeferredTable();
     if (auto* emit = NewPath::CurrentDrawEmit()) {
+        noteDrawPrograms(*emit, shaders);
         auto facts = emit->facts;
         facts.classA = outcome.kind == KindBda;
         facts.lean = false;

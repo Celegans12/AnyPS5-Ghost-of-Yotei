@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_SRC_DRIVER_NEWPATH_NEWPATH_HPP
 
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/Router.hpp"
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <memory>
@@ -52,6 +53,10 @@ struct EmitCandidate {
     FallbackReason reason = FallbackReason::NotRecorded;
     // TwinRoutes' key of the dispatch's program (0: none, e.g. a draw); its route is noted there when it had a twin.
     std::uint64_t program = 0;
+    // Draws: the draw program keys of the stages with a twin (DrawRoutes), noted with the route when the candidate ends.
+    static constexpr std::size_t DrawProgramSlots = 4;
+    std::array<std::uint64_t, DrawProgramSlots> drawPrograms{};
+    std::uint8_t drawProgramCount = 0;
     // S2-share C1: the twin reads the buffer V#s through the page table (RuntimeBufferTwin), or (a twin that still
     // binds guest buffers) any twin of a C1 program; F4 then covers the build's guest-buffer ranges, taken after
     // the build (NoteBufferRanges; null when the build could not give them).

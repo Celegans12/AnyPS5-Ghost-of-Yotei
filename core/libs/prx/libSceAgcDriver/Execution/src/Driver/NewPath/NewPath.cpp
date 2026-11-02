@@ -262,6 +262,9 @@ bool ProgramFallback(FallbackReason reason) {
 EmitCandidate::~EmitCandidate() {
     if (census.active && !census.committed) Census::NoteCommit(*this, false, 0, 0);
     if (program != 0 && twin != nullptr && (routed == Route::NewPath || ProgramFallback(reason))) Routes().Note(program, routed == Route::NewPath);
+    if (drawProgramCount != 0 && (routed == Route::NewPath || ProgramFallback(reason))) {
+        for (std::uint8_t index = 0; index < drawProgramCount; ++index) DrawRoutes().Note(drawPrograms[index], routed == Route::NewPath);
+    }
     if (noted.exchange(true, std::memory_order_relaxed)) return;
     auto& state = Get();
     auto facts = this->facts;

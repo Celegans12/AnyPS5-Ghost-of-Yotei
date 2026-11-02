@@ -259,6 +259,40 @@ void emitLine() {
 
 }
 
+// NP-overhead: draw stage twins are decided per draw program (its stages' code addresses), once per draw packet.
+void drawRoutes() {
+    const std::array<DrawProgramStage, 2> stages{{{0, 0x8000100000}, {4, 0x8000200000}}};
+    const std::array<DrawProgramStage, 2> swapped{{{0, 0x8000200000}, {4, 0x8000100000}}};
+    const std::array<DrawProgramStage, 1> vertexOnly{{{0, 0x8000100000}}};
+    const auto key = DrawProgramKey(stages);
+    Expect(key != 0 && key != DrawProgramKey(swapped) && key != DrawProgramKey(vertexOnly), "two draw programs share a key");
+    Expect(key == DrawProgramKey(std::span<const DrawProgramStage>(stages)), "a draw program's key is not stable");
+    auto& routes = DrawRoutes();
+    for (std::uint32_t packet = 0; packet < TwinRoutes::MinObserved; ++packet) {
+        Expect(DrawTwinDecision(1, packet, key), "a draw program without enough noted routes skipped its stage twins");
+        Expect(DrawTwinDecision(1, packet, key), "the second stage of a packet was decided apart from the first");
+        routes.Note(key, false);
+    }
+    const auto before = routes.Take();
+    Expect(!DrawTwinDecision(2, 0, key), "a draw program whose twinned draws all fell back built stage twins");
+    Expect(!DrawTwinDecision(2, 0, key), "the second stage of a skipped packet built its twin");
+    const auto after = routes.Take();
+    Expect(after.skipped == before.skipped + 1, "one packet's stages were counted as more than one decision");
+    std::uint32_t built = 0;
+    for (std::uint32_t packet = 1; packet <= TwinRoutes::ProbeEvery; ++packet) built += DrawTwinDecision(2, packet, key) ? 1u : 0u;
+    Expect(built == 1, "a skipped draw program probed " + std::to_string(built) + " times in one probe period (want 1)");
+    routes.Note(key, true);
+    Expect(DrawTwinDecision(3, 0, key), "a draw program with a new route skipped its stage twins");
+
+    CommandFacts skipped = ReadyDraw();
+    skipped.classA = true;
+    skipped.lean = true;
+    skipped.shapeSupported = true;
+    skipped.resolvedProgram = false;
+    skipped.twinSkipped = true;
+    Expect(Router(false, true).Decide(skipped).reason == FallbackReason::TwinSkipped, "a draw whose stage twins were skipped was not named twin-skipped");
+}
+
 int main() {
     routerDrawFacts();
     shapeRefusals();
@@ -267,6 +301,7 @@ int main() {
     emitLine();
     factsWithoutTable();
     costLine();
+    drawRoutes();
     if (failures != 0) {
         std::fprintf(stderr, "agc_newpath_draw_twins: %d failures\n", failures);
         return 1;

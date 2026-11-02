@@ -67,6 +67,25 @@ inline constexpr std::uint32_t DrawPrefixBytes = 24;
 // The graphics stages' twins (apart from the compute twins' Twins()).
 ResolvedTwins& DrawStageTwins();
 
+// Draw stage twins ahead of the route (D-combo's TwinRoutes for draws, lane NP-overhead). The front built a stage twin
+// for every fresh stage materialization, before the committer's router saw the draw (ab-combo: 3.12 M stage twins in A
+// phases for 152,626 emitted draws), most of them for draws that are not class A. DrawRoutes keeps, per draw program key
+// (the stages and their code addresses), the routes of its last twinned draws; one decision per draw packet covers all
+// its fresh stages (DrawTwinDecision), so a probe builds every stage's twin together. Skipping only sends the draw to
+// today's path (reason twin-skipped). APS5_NEW_PATH_TWIN_ALWAYS=1 builds every stage twin as before.
+struct DrawProgramStage {
+    std::uint32_t stage = 0;
+    std::uint64_t codeAddress = 0;
+};
+[[nodiscard]] std::uint64_t DrawProgramKey(std::span<const DrawProgramStage> stages);
+TwinRoutes& DrawRoutes();
+// Whether the fresh stages of the draw packet (submission serial, packet offset) build their twins: asked once per packet.
+[[nodiscard]] bool DrawTwinDecision(std::uint64_t submission, std::uint64_t packetOffset, std::uint64_t key);
+// The draw program keys of the stages that have a twin (at most EmitCandidate::DrawProgramSlots, distinct) and whether a
+// stage's twin was skipped; noted on the candidate, whose route is noted in DrawRoutes when it ends.
+struct EmitCandidate;
+void NoteDrawPrograms(EmitCandidate& candidate, std::span<const ShaderRecompiler::RecompileResult* const> programs);
+
 struct DrawEmitCounts {
     std::array<std::atomic<std::uint64_t>, ShapeRefusalCount> shapes{};
     std::atomic<std::uint64_t> pipelineRequests{0}, pipelineNotReady{0}, pipelineFailed{0}, pipelineRebuilt{0}, uncachedPipelines{0};
