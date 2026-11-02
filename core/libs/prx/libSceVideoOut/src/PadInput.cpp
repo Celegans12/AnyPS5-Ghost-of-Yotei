@@ -111,6 +111,7 @@ void PadInput::closeController(int slot) {
 }
 
 void PadInput::applyOutput() {
+    static const bool noVibration = std::getenv("APS5_NO_PAD_VIBRATION") != nullptr;
     for (int slot = 0; slot < PAD_MAX_CONTROLLERS; ++slot) {
         PadOutputState fetched;
         if (PadFetchOutputForPort_nid_postfix(slot, &slots[slot].outputSequence, &fetched)) {
@@ -123,10 +124,10 @@ void PadInput::applyOutput() {
         if (controller == nullptr) continue;
         const auto now = std::chrono::steady_clock::now();
         const bool isPs5 = SDL_GameControllerGetType(controller) == SDL_CONTROLLER_TYPE_PS5;
-        const auto large = std::max(slots[slot].outputState.vibrationLarge, slots[slot].outputState.audioVibrationLarge);
-        const auto small = std::max(slots[slot].outputState.vibrationSmall, slots[slot].outputState.audioVibrationSmall);
+        const auto large = noVibration ? 0 : std::max(slots[slot].outputState.vibrationLarge, slots[slot].outputState.audioVibrationLarge);
+        const auto small = noVibration ? 0 : std::max(slots[slot].outputState.vibrationSmall, slots[slot].outputState.audioVibrationSmall);
         const bool rumbling = large != 0 || small != 0;
-        const bool triggerRumble = slots[slot].outputState.trigger[0].fallback != 0 || slots[slot].outputState.trigger[1].fallback != 0;
+        const bool triggerRumble = !noVibration && (slots[slot].outputState.trigger[0].fallback != 0 || slots[slot].outputState.trigger[1].fallback != 0);
         if (SDL_GameControllerHasLED(controller) == SDL_TRUE) {
             struct PlayerLedColor { Uint8 r, g, b; };
             static constexpr PlayerLedColor defaultColors[4] = {
@@ -158,7 +159,7 @@ void PadInput::applyOutput() {
                 if (slots[slot].triggerEffect.NeedsSend(effect)) {
                     slots[slot].triggerEffect.Result(effect, SDL_GameControllerSendEffect(controller, effect.data(), static_cast<int>(effect.size())) == 0);
                 }
-            } else if (SDL_GameControllerHasRumbleTriggers(controller) == SDL_TRUE) {
+            } else if (!noVibration && SDL_GameControllerHasRumbleTriggers(controller) == SDL_TRUE) {
                 SDL_GameControllerRumbleTriggers(controller, static_cast<Uint16>(slots[slot].outputState.trigger[0].fallback * 257), static_cast<Uint16>(slots[slot].outputState.trigger[1].fallback * 257), triggerRumble ? rumbleMs : 0);
             }
         }

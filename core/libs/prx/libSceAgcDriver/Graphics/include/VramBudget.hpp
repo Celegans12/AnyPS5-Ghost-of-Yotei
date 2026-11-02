@@ -39,6 +39,7 @@ public:
     bool Enabled() const { return heap.has_value(); }
     void Refresh();
     VkDeviceSize Excess();
+    bool AtLeastFraction(VkDeviceSize numerator, VkDeviceSize denominator);
     void Released(VkDeviceSize bytes);
     VramReport Report() const;
 

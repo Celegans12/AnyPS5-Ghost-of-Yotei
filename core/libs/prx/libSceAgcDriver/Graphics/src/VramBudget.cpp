@@ -116,6 +116,14 @@ VkDeviceSize VramBudget::Excess() {
     return used > bound ? used - bound : 0;
 }
 
+bool VramBudget::AtLeastFraction(VkDeviceSize numerator, VkDeviceSize denominator) {
+    if (!heap || denominator == 0) return false;
+    const auto elapsed = std::chrono::steady_clock::duration(ticks() - readAt.load(std::memory_order_relaxed));
+    if (readAt.load(std::memory_order_relaxed) == 0 || elapsed >= refreshInterval) Refresh();
+    const auto reported = usage.load(std::memory_order_relaxed);
+    return reported * denominator >= heapBytes * numerator;
+}
+
 void VramBudget::Released(VkDeviceSize bytes) {
     if (heap) released.fetch_add(bytes, std::memory_order_relaxed);
 }
