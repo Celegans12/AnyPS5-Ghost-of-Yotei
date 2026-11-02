@@ -4079,6 +4079,10 @@ void ShaderResources::reportDescriptorCaches() const {
     AgcDriver::ProfilePrint_nid_no_patch("[descriptors] layouts %llu hits / %llu created, sets %llu from %llu pools and %llu dedicated pools, samplers %llu hits / %llu created\n", static_cast<unsigned long long>(descriptors.layoutHits), static_cast<unsigned long long>(descriptors.layoutMisses), static_cast<unsigned long long>(descriptors.sets), static_cast<unsigned long long>(descriptors.pools), static_cast<unsigned long long>(descriptors.dedicatedPools), static_cast<unsigned long long>(samplerHits), static_cast<unsigned long long>(samplerMisses));
 }
 
+// The word layout VisitContentKey writes; the churn profile and the key labels walk it.
+constexpr std::size_t ContentKeyHeaderWords = 7;
+constexpr std::size_t ContentKeyFlagGroups = 10;
+
 template<typename TVisitor>
 void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableBuffers, const TVisitor& visit) {
     Require(shader.program != nullptr, "missing compiled shader");
@@ -4240,10 +4244,10 @@ bool LabelShaderKey(std::span<const std::uint32_t> key, std::size_t at, std::siz
         std::fill(labels.begin() + static_cast<std::ptrdiff_t>(first), labels.begin() + static_cast<std::ptrdiff_t>(first + count), static_cast<std::uint8_t>(component));
         return true;
     };
-    if (!label(at, 5, Component::Layout)) return false;
-    const bool dataWords = key[at] != 0;
-    const auto bindings = key[at + 4];
-    at += 5;
+    if (!label(at, ContentKeyHeaderWords, Component::Layout)) return false;
+    const bool dataWords = key[at + 2] != 0;
+    const auto bindings = key[at + 6];
+    at += ContentKeyHeaderWords;
     for (std::uint32_t binding = 0; binding < bindings; ++binding) {
         if (!label(at, 8, Component::Layout)) return false;
         const auto role = static_cast<ShaderRecompiler::DescriptorRole>(key[at + 1]);
@@ -4260,7 +4264,7 @@ bool LabelShaderKey(std::span<const std::uint32_t> key, std::size_t at, std::siz
             labels[at + i] = static_cast<std::uint8_t>(component);
         }
         at += words;
-        for (int flags = 0; flags < 9; ++flags) {
+        for (std::size_t flags = 0; flags < ContentKeyFlagGroups; ++flags) {
             if (at >= end) return false;
             const auto count = 1 + (static_cast<std::size_t>(key[at]) + 31) / 32;
             if (!label(at, count, Component::Other)) return false;
@@ -5382,13 +5386,14 @@ ChurnProfile& Churn() {
 // Charges word `diff` of `key` to the binding of the ContentKey that starts at `at` (the layout of
 // ShaderResources::ContentKey), moving `at` past that key; false when `diff` lies beyond it.
 bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::size_t& at, std::size_t diff) {
-    if (at + 5 > key.size() || diff < at + 5) {
+    // Header (VisitContentKey): wrap guard, wrap enabled, data words, stage, variant lo/hi, binding count.
+    if (at + ContentKeyHeaderWords > key.size() || diff < at + ContentKeyHeaderWords) {
         ++profile.layout;
         return true;
     }
-    const bool dataWords = key[at] != 0;
-    const auto bindings = key[at + 4];
-    at += 5;
+    const bool dataWords = key[at + 2] != 0;
+    const auto bindings = key[at + 6];
+    at += ContentKeyHeaderWords;
     for (std::uint32_t binding = 0; binding < bindings; ++binding) {
         if (at + 8 > key.size() || diff < at + 8) {
             ++profile.layout;
@@ -5406,12 +5411,13 @@ bool chargeShaderKey(ChurnCounts& profile, const ResourceCache::Key& key, std::s
             return true;
         }
         at += descriptorWords;
-        for (int flags = 0; flags < 4; ++flags) {
+        // The flag bit sets, then the sampler indices and the image shapes (each a count and its words).
+        for (std::size_t group = 0; group < ContentKeyFlagGroups + 2; ++group) {
             if (at >= key.size()) {
                 ++profile.layout;
                 return true;
             }
-            const auto words = 1 + (static_cast<std::size_t>(key[at]) + 31) / 32;
+            const auto words = group < ContentKeyFlagGroups ? 1 + (static_cast<std::size_t>(key[at]) + 31) / 32 : 1 + static_cast<std::size_t>(key[at]);
             if (diff < at + words) {
                 ++profile.layout;
                 return true;
@@ -5523,12 +5529,13 @@ void ResourceCache::noteMiss(const Key& key) {
     std::uint64_t variants = 0;
     if (draw) {
         std::size_t at = 4;
-        for (std::uint32_t stage = 0; stage < key[3] && at + 4 < key.size(); ++stage) {
-            variants = variants * 1000003ull ^ (key[at + 3] | (static_cast<std::uint64_t>(key[at + 4]) << 32u));
+        // Each stage: its length, then its content key (variant id in header words 4-5).
+        for (std::uint32_t stage = 0; stage < key[3] && at + 6 < key.size(); ++stage) {
+            variants = variants * 1000003ull ^ (key[at + 5] | (static_cast<std::uint64_t>(key[at + 6]) << 32u));
             at += 1 + key[at];
         }
-    } else {
-        variants = key[2] | (static_cast<std::uint64_t>(key[3]) << 32u);
+    } else if (key.size() > 5) {
+        variants = key[4] | (static_cast<std::uint64_t>(key[5]) << 32u);
     }
     auto& churn = Churn();
     std::lock_guard lock(churn.mutex);
@@ -5639,7 +5646,15 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
         addressCapacity = parsed != 0 ? static_cast<std::size_t>(parsed) : 2048u;
     }
     noteUse(key);
-    while (entries.size() - addressEntries > capacity || addressEntries > addressCapacity) {
+    // APS5_RESOURCE_CACHE_LARGE (RuntimeSwitch, local): at least APS5_RESOURCE_CACHE_LARGE_ENTRIES (4,096) plain
+    // entries while set; turned off, the next inserts evict down to the normal capacity. Hits revalidate as before.
+    static const std::size_t largeEntries = [] {
+        const char* value = std::getenv("APS5_RESOURCE_CACHE_LARGE_ENTRIES");
+        const auto parsed = value ? std::strtoull(value, nullptr, 10) : 0ull;
+        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{4096};
+    }();
+    const auto limit = RuntimeSwitches::Set(RuntimeSwitch::ResourceCacheLarge) ? std::max(capacity, largeEntries) : capacity;
+    while (entries.size() - addressEntries > limit || addressEntries > addressCapacity) {
         const bool address = addressEntries > addressCapacity;
         auto victim = std::prev(entries.end());
         while (victim != entries.begin() && victim->second->ReusesAddressSpace() != address) --victim;

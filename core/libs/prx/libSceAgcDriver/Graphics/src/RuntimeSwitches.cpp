@@ -96,6 +96,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_WRITTEN_SHADOW_VRAM_GATE",
     "APS5_DEFER_LABEL_READBACK",
     "APS5_DISPATCH_CACHE_LARGE",
+    "APS5_RESOURCE_CACHE_LARGE",
 };
 
 struct Refusal {

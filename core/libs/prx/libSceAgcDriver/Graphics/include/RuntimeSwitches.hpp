@@ -97,6 +97,7 @@ enum class RuntimeSwitch : std::size_t {
     NoWrittenShadowVramGate,
     DeferLabelReadback,
     DispatchCacheLarge,
+    ResourceCacheLarge,
     Count,
 };
 
