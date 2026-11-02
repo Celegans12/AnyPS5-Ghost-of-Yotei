@@ -5052,6 +5052,8 @@ std::uint64_t writtenShadowVramDenominator() {
 }
 
 bool writtenShadowAffordable(const Context& context) {
+    // APS5_NO_WRITTEN_SHADOW_VRAM_GATE (a runtime switch, for an in-run A/B) stages as before the gate.
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoWrittenShadowVramGate)) return true;
     auto& vram = GetBufferPool(context)->Vram();
     return !vram.Enabled() || !vram.AtLeastFraction(1, writtenShadowVramDenominator());
 }

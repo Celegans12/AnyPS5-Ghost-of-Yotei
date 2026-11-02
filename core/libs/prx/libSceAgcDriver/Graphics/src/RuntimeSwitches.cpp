@@ -92,6 +92,8 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_PREPARED_DISPATCH_ITEMS",
     "APS5_NO_BDA_DRAW_SPLIT",
     "APS5_NO_BDA_DISPATCH_SPLIT",
+    "APS5_NO_DISPATCH_MISS_AHEAD",
+    "APS5_NO_WRITTEN_SHADOW_VRAM_GATE",
 };
 
 struct Refusal {

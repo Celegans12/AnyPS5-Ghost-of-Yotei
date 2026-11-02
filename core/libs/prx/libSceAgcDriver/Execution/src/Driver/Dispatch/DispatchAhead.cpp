@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
@@ -357,7 +358,8 @@ bool MissAheadEnabled() {
         const char* text = std::getenv("APS5_DISPATCH_MISS_AHEAD");
         return text == nullptr || std::strcmp(text, "0") != 0;
     }();
-    return enabled;
+    // APS5_NO_DISPATCH_MISS_AHEAD (a runtime switch, for an in-run A/B) turns it off as APS5_DISPATCH_MISS_AHEAD=0 does.
+    return enabled && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoDispatchMissAhead);
 }
 
 std::size_t MissAheadMax() {
