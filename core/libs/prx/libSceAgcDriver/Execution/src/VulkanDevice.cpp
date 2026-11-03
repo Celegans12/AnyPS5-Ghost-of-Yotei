@@ -5228,6 +5228,10 @@ struct RecordedDispatch {
     std::shared_ptr<Graphics::ShaderResources::DrawBindings> bindings{};
     std::array<std::uint32_t, 3> threadGroup{};
     std::array<std::uint32_t, 3> threadLimit{};
+    // APS5_INDIRECT_LABEL_ARGUMENTS: the argument dwords (one bit each) the GPU takes from the label table
+    // instead of from the import, where a pending label's value is only stored by the CPU at completion.
+    std::uint32_t labelledMask = 0;
+    std::array<std::uint32_t, 3> labelledValues{};
 };
 
 struct DispatchCompletion {
@@ -5601,6 +5605,32 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
         outcome.cpuReason = 8;
     } else if (labelPending() || state->CopiedWriterOverlaps(arguments, 12)) {
         outcome.cpuReason = 2;
+        // APS5_INDIRECT_LABEL_ARGUMENTS: arguments held only by pending labels stay on the GPU. The recorded
+        // dispatch copies them from the import in GPU order and overwrites the labelled dwords with the label
+        // table's values, so neither the labels' batches nor the newest lease are waited for. A label stored
+        // by the other lane orders this lane's next work after it, as a wait answered from the table does.
+        const auto labelledOnGpu = [&] {
+            std::uint32_t mask = 0;
+            std::array<std::uint32_t, 3> values{};
+            bool otherLane = false;
+            for (std::uint32_t index = 0; index < values.size(); ++index) {
+                const auto address = arguments + index * 4;
+                const auto hit = recorder.PendingLabel(address, 4, 0);
+                if (!hit.has_value()) continue;
+                if (hit->late && !GuestMemory::UnchangedSinceCollected(address, 4, hit->generation)) return false;
+                mask |= 1u << index;
+                values[index] = static_cast<std::uint32_t>(hit->value);
+                otherLane = otherLane || Graphics::Recorder::LaneOfQueue(hit->queue) != Graphics::Recorder::ThreadLane();
+            }
+            const auto* import = Graphics::HostImportFor(context, arguments, 12);
+            if (mask == 0 || import == nullptr) return false;
+            if (otherLane) Graphics::Recorder::NoteConsumedLabel(arguments, 12);
+            record.argumentImport = import;
+            record.labelledMask = mask;
+            record.labelledValues = values;
+            return true;
+        };
+        if (!threadDimensions && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::IndirectLabelArguments) && !state->CopiedWriterOverlaps(arguments, 12) && labelledOnGpu()) outcome.cpuReason = 0;
     } else if ((record.argumentImport = Graphics::HostImportFor(context, arguments, 12)) == nullptr || (threadDimensions && record.argumentImport->address == 0)) {
         record.argumentImport = nullptr;
         // Valid until the next refreshImports, which only runs under GuestMemory::GpuMutex (held
@@ -5872,18 +5902,36 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     VkBuffer indirectBuffer = argumentImport != nullptr ? argumentImport->buffer : VK_NULL_HANDLE;
     VkDeviceSize indirectOffset = argumentImport != nullptr ? Graphics::HostImportOffset(*argumentImport, arguments) : 0;
+    // APS5_INDIRECT_LABEL_ARGUMENTS: the import's argument dwords as all earlier work left them, with the
+    // labelled dwords replaced by the label table's values (decideIndirect).
+    std::shared_ptr<Graphics::Buffer> labelled;
+    if (argumentImport != nullptr && record.labelledMask != 0) {
+        labelled = std::make_shared<Graphics::Buffer>(context, 12, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const VkBufferCopy copy{indirectOffset, 0, 12};
+        context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer")(commands, argumentImport->buffer, labelled->Handle(), 1, &copy);
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        for (std::uint32_t index = 0; index < record.labelledValues.size(); ++index) {
+            if ((record.labelledMask & (1u << index)) == 0) continue;
+            context.Resolved(&Graphics::DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, labelled->Handle(), index * 4u, 4, &record.labelledValues[index]);
+        }
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+        indirectBuffer = labelled->Handle();
+        indirectOffset = 0;
+    }
     if (threadArguments != nullptr) {
         indirectBuffer = threadArguments->Handle();
         indirectOffset = 0;
         recorder.Keep(std::move(threadArguments));
     } else if (argumentImport != nullptr && argumentImport->address != 0) {
         auto checked = std::make_shared<Graphics::Buffer>(context, 12, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-        if (recorder.RecordDispatchArguments(commands, argumentImport->address + (arguments - argumentImport->base), checked->DeviceAddress())) {
+        if (recorder.RecordDispatchArguments(commands, labelled != nullptr ? labelled->DeviceAddress() : argumentImport->address + (arguments - argumentImport->base), checked->DeviceAddress())) {
             indirectBuffer = checked->Handle();
             indirectOffset = 0;
             recorder.Keep(std::move(checked));
         }
     }
+    if (labelled != nullptr) recorder.Keep(std::move(labelled));
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
     if (record.bindings != nullptr) Graphics::Require(record.bindings->allocation.set != VK_NULL_HANDLE, "dispatch overlay has no descriptor set");
     if (record.bindings != nullptr) context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, 0, 1, &record.bindings->allocation.set, 0, nullptr);
