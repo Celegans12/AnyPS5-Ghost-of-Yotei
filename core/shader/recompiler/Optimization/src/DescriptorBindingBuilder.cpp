@@ -1,6 +1,7 @@
 #include "Optimization/DescriptorBindingBuilder.hpp"
 #include "UnnormalizedWrap.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
+#include "DirectImageRefusal.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
@@ -12,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -37,6 +39,34 @@ struct BufferWrittenCounts {
     std::atomic<unsigned long long> readOnly{0};
 };
 BufferWrittenCounts bufferWrittenCounts;
+
+std::uint32_t ConstantImageComponents(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::size_t index, const ImageResource& mode) {
+    if (mode.resourceClass != ImageResourceClass::Sampled || mode.packed || mode.r128 || mode.depthCompare || mode.depthBits || mode.depthUnorm16 || mode.srgbDecode || (mode.emulatedCompare & EmulatedCompare::Enabled) != 0u || mode.byElements != 0u || mode.byComponents != 0u || mode.conversionFormat != IrBufferFormat::Invalid || mode.packedFormat != IrBufferFormat::Invalid) return 0u;
+    if (mode.numericClass != IrTextureNumericClass::Float && mode.numericClass != IrTextureNumericClass::Uint && mode.numericClass != IrTextureNumericClass::Sint) return 0u;
+    const auto& descriptor = snapshot.images.at(index);
+    if (descriptor.dwords[0] == 0u && (descriptor.dwords[1] & 0xffu) == 0u) return 0u;
+    using Component = PipelineSpecialization::ImageComponentConstant;
+    std::uint32_t components = 0u;
+    for (std::uint32_t component = 0u; component < 4u; ++component) {
+        const auto selector = (descriptor.dwords[3] >> (component * 3u)) & 7u;
+        const auto constant = selector == 0u ? Component::Zero : selector == 1u ? mode.numericClass == IrTextureNumericClass::Float ? Component::FloatOne : Component::IntegerOne : Component::None;
+        components |= static_cast<std::uint32_t>(constant) << (component * PipelineSpecialization::ImageComponentBits);
+    }
+    if (components == 0u) return 0u;
+    bool sampled = false;
+    constexpr std::uint32_t ClampLastTexel = 2u;
+    for (const auto& pair : info.sampledPairs) {
+        if (pair.image != index) continue;
+        sampled = true;
+        if (info.samplers.at(pair.sampler).table != NoTable) return 0u;
+        const auto sampler = snapshot.samplers.at(pair.sampler).dwords[0];
+        if ((sampler & (1u << 15u)) != 0u) return 0u;
+        for (std::uint32_t axis = 0u; axis < 3u; ++axis) {
+            if (((sampler >> (axis * 3u)) & 7u) > ClampLastTexel) return 0u;
+        }
+    }
+    return sampled ? components : 0u;
+}
 
 DescriptorKind PhysicalKindFor(DescriptorBindingKind kind) {
     if (kind == DescriptorBindingKind::Samplers || kind == DescriptorBindingKind::SamplerTable) {
@@ -177,15 +207,57 @@ const char* UnnormalizedUseReason(std::uint32_t uses) {
     }
 }
 
+std::array<std::uint32_t, 2> RelativeMinLod(std::span<const std::uint32_t> words) {
+    const auto minLod = (words[1] >> 8u) & 0xfffu;
+    const auto baseLevel = (words[3] >> 12u) & 0xfu;
+    const auto maxMip = (words[5] >> 4u) & 0xfu;
+    const auto lastLevel = std::max(baseLevel <= maxMip ? std::min((words[3] >> 16u) & 0xfu, maxMip) : (words[3] >> 16u) & 0xfu, baseLevel);
+    return {minLod > baseLevel * 256u ? std::min(minLod - baseLevel * 256u, (lastLevel - baseLevel) * 256u) : 0u, lastLevel - baseLevel};
+}
+
+void RequireShaderMinLod(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t image, const ImageResource& mode, std::uint32_t clamp) {
+    const auto prefix = "image " + std::to_string(image) + " applies its T#'s minimum LOD of " + std::to_string(clamp) + "/256 in the shader";
+    if ((mode.emulatedCompare & EmulatedCompare::Enabled) != 0u || mode.conversionFormat == IrBufferFormat::Format11_11_10UNorm) fail(prefix + " to an emulated depth-compare or 11:11:10 sample, which is not implemented");
+    for (const auto& pair : info.sampledPairs) {
+        if (pair.image != image) continue;
+        const auto& sampler = info.samplers.at(pair.sampler);
+        const auto name = "S# " + std::to_string(pair.sampler);
+        if (sampler.table != NoTable) fail(prefix + " and is sampled through " + name + " from a table, whose LOD range is unknown, which is not implemented");
+        if ((sampler.uses & SamplerUseQueryLod) != 0u) fail(prefix + " and " + name + " is used by image_get_lod, which is not implemented");
+        if ((sampler.uses & SamplerUseGather) != 0u && clamp >= 256u) fail(prefix + " and " + name + " is used by a gather, which reads below that level, which is not implemented");
+        const auto& words = snapshot.samplers.at(pair.sampler).dwords;
+        const bool unnormalized = (words[0] & ForceUnnormalizedBit) != 0u;
+        const bool mipmapped = !unnormalized && ((words[2] >> 26u) & 3u) != 0u;
+        const auto maxLod = mipmapped ? (words[1] >> 12u) & 0xfffu : 0u;
+        if (!unnormalized && maxLod == 0u) {
+            if (((words[2] >> 20u) & 3u) != ((words[2] >> 22u) & 3u)) fail(prefix + " and " + name + ", which holds the LOD at 0, has different magnification and minification filters, between which the clamp moves the choice, which is not implemented");
+            for (const auto& other : info.sampledPairs) {
+                if (other.sampler != pair.sampler || other.image == image) continue;
+                const auto otherName = "image " + std::to_string(other.image);
+                if (info.images.at(other.image).table != NoTable) fail(prefix + " and " + name + ", which holds the LOD at 0, also samples " + otherName + " from a table, which is not implemented");
+                const auto [otherClamp, otherLevels] = RelativeMinLod(snapshot.images.at(other.image).dwords);
+                if (otherClamp != clamp && otherLevels != 0u) fail(prefix + " and " + name + ", which holds the LOD at 0, also samples " + otherName + " with another minimum LOD, which is not implemented");
+            }
+            continue;
+        }
+        if ((sampler.uses & (SamplerUseExplicitLod | SamplerUseImplicitLod | SamplerUseGradient)) == 0u) continue;
+        if (maxLod < clamp) fail(prefix + " above the maximum LOD of " + std::to_string(maxLod) + "/256 of " + name + (mipmapped ? "" : unnormalized ? " (unnormalized)" : " (no mip filter)") + ", which is not implemented");
+        if ((((words[2] >> 20u) ^ (words[2] >> 22u)) & 1u) != 0u) fail(prefix + " and " + name + " has different magnification and minification filters, between which the clamp moves the choice, which is not implemented");
+        const auto bias = static_cast<std::int32_t>(((words[2] & 0x3fffu) ^ 0x2000u) - 0x2000u);
+        if (bias != 0 && (sampler.uses & SamplerUseExplicitLod) != 0u) fail(prefix + " to an explicit LOD that " + name + " biases by " + std::to_string(bias) + "/256, which is not implemented");
+    }
+}
+
 struct UnnormalizedProof {
     std::vector<bool> samplers;
     std::vector<bool> images;
     std::vector<bool> imagesAtBaseLevel;
     std::vector<bool> samplersIgnoreCoordinates;
+    std::vector<std::uint32_t> mirroredAxes;
 };
 
 UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapshot& snapshot) {
-    UnnormalizedProof proof{std::vector<bool>(info.samplers.size()), std::vector<bool>(info.images.size()), std::vector<bool>(info.images.size()), std::vector<bool>(info.samplers.size())};
+    UnnormalizedProof proof{std::vector<bool>(info.samplers.size()), std::vector<bool>(info.images.size()), std::vector<bool>(info.images.size()), std::vector<bool>(info.samplers.size()), std::vector<std::uint32_t>(info.samplers.size())};
     for (std::uint32_t r = 0; r < info.samplers.size(); r++) {
         if (snapshot.samplers.at(r).dwordCount != 4u) fail("sampler descriptor must contain four dwords");
         const auto& sampler = info.samplers[r];
@@ -241,6 +313,9 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
         }
         if (nullMismatch != nullptr) failUnnormalized(nullMismatch);
         proof.samplers[r] = true;
+        const auto clampX = snapshot.samplers[r].dwords[0] & 7u;
+        const auto clampY = (snapshot.samplers[r].dwords[0] >> 3u) & 7u;
+        proof.mirroredAxes[r] = (clampX == 1u || clampX == 3u ? 1u : 0u) | (clampY == 1u || clampY == 3u ? 2u : 0u);
     }
     for (std::uint32_t resource = 0; resource < info.images.size(); resource++) {
         bool exact = proof.images[resource];
@@ -319,7 +394,13 @@ BufferSubstitute SpecializedBufferFields(const BufferResource& buffer, IrShaderS
     return {stage == IrShaderStage::Compute ? 0u : fields.word1, word3, fields.misalignment, true};
 }
 
-DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings, bool registrationModules, bool fragmentDescriptorSet, std::span<const BufferSubstitute> substitutes) const {
+BufferSubstitute BufferSpecializationFields(const DescriptorValue& descriptor, std::span<const BufferSubstitute> substitutes, std::size_t index) {
+    const bool present = BufferDescriptorPresent(descriptor);
+    if (!present && !substitutes.empty()) return index < substitutes.size() && substitutes[index].known ? substitutes[index] : BufferSubstitute{};
+    return {descriptor.dwords[1] & 0xffff0000u, descriptor.dwords[3], present ? descriptor.dwords[0] & 3u : 0u, present};
+}
+
+DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings, bool registrationModules, bool fragmentDescriptorSet, std::span<const BufferSubstitute> substitutes, bool shaderImageMinLod) const {
     if (stage == IrShaderStage::Pixel && exportMappings.size() != 8u) fail("fragment runtime export mappings are missing");
     if (info.images.size() > ShaderInfo::MaxImages) fail("runtime image count exceeds the static capacity");
     DescriptorBindingPlan plan;
@@ -331,6 +412,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
             const bool sampled = std::any_of(info.sampledPairs.begin(), info.sampledPairs.end(), [&](const auto& pair) { return pair.sampler == index && unnormalized.images.at(pair.image); });
             plan.specialization.push_back({PipelineSpecialization::UnnormalizedWrapBase + index, UnnormalizedWrapEnabled() && sampled && unnormalized.samplers[index] ? UnnormalizedWrapAxes(std::span<const std::uint32_t>(snapshot.samplers[index].dwords).first(4u)) : 0u});
         }
+        if (MirrorsIfUnnormalized(info.samplers[index])) plan.specialization.push_back({PipelineSpecialization::MirrorUnnormalizedBase + index, unnormalized.mirroredAxes[index]});
     }
     std::vector<std::uint32_t> compareStates(info.images.size());
     for (std::uint32_t index = 0; index < info.images.size(); ++index) {
@@ -343,7 +425,10 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     }
     std::vector<std::uint32_t> imageModes(info.images.size());
     for (std::size_t index = 0; index < info.images.size(); ++index) {
-        if (info.images[index].table == NoTable) imageModes[index] = ResourceMaterializer::DirectImageMode(info, stage, static_cast<std::uint32_t>(index), snapshot.images.at(index), info.usesFaultBuffer);
+        if (info.images[index].table != NoTable) continue;
+        const auto& modes = info.runtimeImageModes.at(index);
+        imageModes[index] = ResourceMaterializer::DirectImageMode(info, stage, static_cast<std::uint32_t>(index), snapshot.images.at(index), info.usesFaultBuffer);
+        if (registrationModules && (modes.size() > 1u || (info.usesFaultBuffer && CanDeferDirectImage(info.images[index], stage)))) plan.specialization.push_back({PipelineSpecialization::ImageBase + static_cast<std::uint32_t>(index) * PipelineSpecialization::ImageWords, imageModes[index]});
     }
     for (std::uint32_t index = 0; index < info.buffers.size(); ++index) {
         const auto& descriptor = snapshot.buffers.at(index);
@@ -381,6 +466,12 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         const auto first = PipelineSpecialization::ImageBase + index * PipelineSpecialization::ImageWords;
         plan.specialization.push_back({first, imageModes[index]});
         for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({first + 1u + component, (snapshot.images.at(index).dwords[3] >> (component * 3u)) & 7u});
+        if (shaderImageMinLod) {
+            const auto& words = snapshot.images.at(index).dwords;
+            const auto clamp = RelativeMinLod(words)[0];
+            if (clamp != 0u) RequireShaderMinLod(info, snapshot, index, modes.at(imageModes[index]), clamp);
+            plan.specialization.push_back({PipelineSpecialization::MinLodBase + index, std::bit_cast<std::uint32_t>(static_cast<float>(clamp) / 256.0f)});
+        }
         const auto& image = info.images[index];
         if (image.resourceClass != ImageResourceClass::Storage || !image.written || image.atomic) continue;
         const auto code = (snapshot.images.at(index).dwords[1] >> 20u) & 0x1ffu;
@@ -422,6 +513,10 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         }
     }
     for (std::uint32_t index = 0; index < info.images.size(); ++index) {
+        if (info.images[index].table == NoTable) {
+            const auto& mode = info.runtimeImageModes.at(index).at(imageModes[index]);
+            plan.specialization.push_back({PipelineSpecialization::ImageComponentBase + index, ConstantImageComponents(info, snapshot, index, mode)});
+        }
         if (info.images[index].mipMode != ImageMipMode::DynamicStorage) continue;
         const auto word = snapshot.images.at(index).dwords[3];
         const auto first = (word >> 12u) & 0xfu;
@@ -544,12 +639,12 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         plan.runtimeState.assign(layout.runtimeStateDwords, 0u);
         for (std::uint32_t target = 0; target < exportMappings.size(); ++target) plan.runtimeState.at(RuntimeAbi::StateExportMappings + target / 4u) |= static_cast<std::uint32_t>(exportMappings[target]) << (target % 4u * 8u);
     }
-    std::vector<std::uint32_t> samplerMasks(info.samplers.size());
+    std::vector<std::uint64_t> samplerMasks(info.samplers.size());
     for (const auto& binding : plan.bindings) {
         if (binding.descriptor.role != DescriptorRole::GuestSamplers) continue;
-        if (binding.resources.size() > ShaderInfo::MaxSamplers) fail("prepared sampler mask capacity exceeded");
+        if (binding.resources.size() > std::numeric_limits<std::uint64_t>::digits) fail("prepared sampler mask capacity exceeded");
         for (std::uint32_t element = 0; element < binding.resources.size(); ++element) {
-            if (binding.inactive.empty() || !binding.inactive[element]) samplerMasks.at(binding.resources[element]) |= 1u << element;
+            if (binding.inactive.empty() || !binding.inactive[element]) samplerMasks.at(binding.resources[element]) |= std::uint64_t{1} << element;
         }
     }
     for (auto& binding : plan.bindings) {
@@ -647,9 +742,9 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
                 physical.imageWritten.push_back(selected && storage);
                 physical.imageAtomic.push_back(selected && storage && element.atomic);
                 physical.imageAtomic64.push_back(selected && storage && element.atomic64);
-                std::uint32_t samplers = 0;
+                std::uint64_t samplers = 0;
                 for (std::uint32_t sampler = 0; sampler < entry.tableSamplerMasks.size(); ++sampler) {
-                    if ((element.samplers & (1u << sampler)) != 0u) samplers |= entry.tableSamplerMasks[sampler];
+                    if (((element.samplers >> sampler) & 1u) != 0u) samplers |= entry.tableSamplerMasks[sampler];
                 }
                 physical.imageSamplers.push_back(samplers);
             }

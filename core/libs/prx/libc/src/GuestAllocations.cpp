@@ -47,6 +47,7 @@ struct Registry {
     std::shared_ptr<const Lease::Ranges> readableLease;
     std::shared_ptr<const Lease::Ranges> allLease;
     std::uint64_t backingSerials = 0;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> retiring;
 };
 
 Registry& registry() {
@@ -68,6 +69,13 @@ void renewBacking(std::uintptr_t address, std::size_t bytes) {
         renewed.backingSerial = freshBacking();
         it->second = std::make_shared<const Range>(renewed);
     }
+}
+
+bool isRetiring(const Range& range) {
+    for (const auto& [begin, end] : registry().retiring) {
+        if (range.address < end && begin < range.address + range.bytes) return true;
+    }
+    return false;
 }
 
 std::atomic<std::uint64_t> generation{1};
@@ -112,7 +120,7 @@ void publishChanges(MutationState& state) {
     state.changed.clear();
 }
 
-#if !defined(_WIN32) && !defined(__APPLE__)
+#if !defined(_WIN32) && !defined(__APPLE__) && !defined(__EMSCRIPTEN__)
 std::vector<std::pair<std::uintptr_t, std::size_t>> fileBackedWritableImage() {
     const auto image = std::filesystem::read_symlink("/proc/self/exe").string();
     std::ifstream maps("/proc/self/maps");
@@ -442,6 +450,20 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     auto* state = static_cast<MutationState*>(mutation);
     const auto deadline = std::chrono::steady_clock::now() + pinWait();
     int syncedRounds = 0;
+    bool marked = false;
+    const auto unmark = [&] {
+        if (!marked) return;
+        if (!state->lock.owns_lock()) state->lock.lock();
+        auto& retiring = registry().retiring;
+        retiring.erase(std::find(retiring.begin(), retiring.end(), std::pair<std::uintptr_t, std::uintptr_t>{address, end}));
+        registry().readableLease.reset();
+        registry().allLease.reset();
+        marked = false;
+    };
+    struct Unmark {
+        const decltype(unmark)& release;
+        ~Unmark() { release(); }
+    } unmarkOnExit{unmark};
     for (;;) {
         registry().readableLease.reset();
         registry().allLease.reset();
@@ -457,8 +479,13 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
             }
         }
         if (!pinned) {
+            unmark();
             if (state != nullptr && bytes != 0) state->unpinned.emplace_back(address, bytes);
             return;
+        }
+        if (!marked && state != nullptr && state->lock.owns_lock()) {
+            registry().retiring.emplace_back(address, end);
+            marked = true;
         }
         if (std::chrono::steady_clock::now() >= deadline) PinnedFailure(address, bytes, ("waited " + std::to_string(pinWait().count()) + " ms for the lease (APS5_PIN_WAIT_MS)").c_str());
         const auto waiter = pinWaiter.load(std::memory_order_acquire);
@@ -487,10 +514,6 @@ void GuestAllocationsRequireUnpinned_nid_postfix(void* mutation, const void* poi
     }
 }
 
-// The lowest registered range that can touch `address`: the one that starts at or
-// after it, or the one before it when that one reaches into the address. Starting a
-// scan at lower_bound alone misses a range the address falls inside, which is exactly
-// the overlap these queries have to report.
 decltype(registry().ranges)::iterator firstRangeTouching(std::uintptr_t address) {
     auto& ranges = registry().ranges;
     auto it = ranges.lower_bound(address);
@@ -658,7 +681,7 @@ struct RangePatch {
 };
 
 RangePatch replaceRange(const void* pointer, std::size_t bytes, bool remove, bool readable, bool writable, bool gpu) {
-    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    const std::uint64_t address = reinterpret_cast<std::uintptr_t>(pointer);
     require(bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address, "invalid guest protection or unmap range");
     require(!writable || readable, "writable guest allocation must be readable");
     const auto end = address + bytes;
@@ -769,9 +792,9 @@ Lease GuestAllocationsAcquire_nid_postfix() {
     auto ranges = std::make_shared<Lease::Ranges>();
     ranges->reserve(registry().ranges.size());
     for (const auto& [address, range] : registry().ranges) {
-        if (range->readable && range->bytes != 0) ranges->push_back(range);
+        if (range->readable && range->bytes != 0 && !isRetiring(*range)) ranges->push_back(range);
     }
-    registry().readableLease = ranges;
+    if (registry().retiring.empty()) registry().readableLease = ranges;
     return Lease(std::move(ranges));
 }
 
@@ -835,6 +858,19 @@ Lease GuestAllocationsAcquireMapped_nid_no_patch(const Mapped& mapped) {
     return Lease(std::move(ranges));
 }
 
+Lease GuestAllocationsAcquireRegistered_nid_postfix() {
+    std::lock_guard lock(registry().mutex);
+    if (registry().retiring.empty()) {
+        if (auto shared = registry().readableLease) return Lease(std::move(shared));
+    }
+    auto ranges = std::make_shared<Lease::Ranges>();
+    for (const auto& [address, range] : registry().ranges) {
+        if (range->readable && range->bytes != 0) ranges->push_back(range);
+    }
+    if (registry().retiring.empty()) registry().readableLease = ranges;
+    return Lease(std::move(ranges));
+}
+
 std::shared_ptr<const Range> GuestAllocationsLookup_nid_postfix(std::uintptr_t address, bool next) {
     std::lock_guard lock(registry().mutex);
     const auto& ranges = registry().ranges;
@@ -857,9 +893,9 @@ Lease GuestAllocationsAcquireAll_nid_postfix() {
     auto ranges = std::make_shared<Lease::Ranges>();
     ranges->reserve(registry().ranges.size());
     for (const auto& [address, range] : registry().ranges) {
-        if (range->bytes != 0) ranges->push_back(range);
+        if (range->bytes != 0 && !isRetiring(*range)) ranges->push_back(range);
     }
-    registry().allLease = ranges;
+    if (registry().retiring.empty()) registry().allLease = ranges;
     return Lease(std::move(ranges));
 }
 

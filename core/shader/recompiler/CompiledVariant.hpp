@@ -5,6 +5,7 @@
 #include "IntermediateRepresentation/IrMetadata/CompiledShaderInfo.hpp"
 #include "Optimization/include/Optimization/BindingAllocator.hpp"
 #include "Optimization/include/Optimization/DescriptorBindingBuilder.hpp"
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -18,7 +19,7 @@ class BufferSubstituteTable {
 public:
     using Persist = std::function<void(const std::vector<BufferSubstitute>&)>;
 
-    BufferSubstituteTable(std::vector<BufferSubstitute> slots, Persist persist) : slots(std::move(slots)), persist(std::move(persist)) {}
+    explicit BufferSubstituteTable(std::vector<BufferSubstitute> slots, Persist persist = {}) : slots(std::move(slots)), persist(std::move(persist)) {}
 
     [[nodiscard]] std::vector<BufferSubstitute> Slots() const {
         std::lock_guard lock(mutex);

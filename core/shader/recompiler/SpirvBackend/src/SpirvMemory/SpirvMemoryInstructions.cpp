@@ -940,6 +940,18 @@ std::uint32_t Atomic32(SpirvValueEmitContext& ctx, const IrValue& inst, const Me
 std::uint32_t BufferAtomic64(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     static_cast<void>(BufferMemory(ctx, inst));
+    if (state.requirements.bufferInt64AtomicsSplit) {
+        if (!IsSplittableBufferAtomic64(&inst)) ctx.Fail(inst, "64-bit buffer atomic needs shaderBufferInt64Atomics");
+        const auto data = Unary(state, spv::OpBitcast, TypeScalarU64(state), ctx.Arg(inst, inst.ArgumentCount() - 2u));
+        const auto low = Unary(state, spv::OpUConvert, TypeU32(state), data);
+        const auto high = Unary(state, spv::OpUConvert, TypeU32(state), Binary(state, spv::OpShiftRightLogical, TypeScalarU64(state), data, BdaConstant(state, 32u)));
+        std::uint32_t index = 0u;
+        EmitRuntimeBufferAtomicHalves(ctx, inst, ActiveArgument(ctx, inst), [&](std::uint32_t pointer) {
+            state.module.AddFunction(SpirvAtomicOpcode(inst.Opcode()), TypeU32(state), state.module.AllocateId(), pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), index++ == 0u ? low : high);
+        });
+        EmitDeviceAtomicMemoryBarrier(state);
+        return ConstantU64(state, 0u);
+    }
     return EmitRuntimeBufferAtomic(ctx, inst, 64u, ActiveArgument(ctx, inst), [&](std::uint32_t pointer) {
         const auto value = Unary(state, spv::OpBitcast, TypeScalarU64(state), ctx.Arg(inst, inst.ArgumentCount() - 2u));
         const auto old = state.module.AllocateId();
@@ -1570,7 +1582,15 @@ std::uint32_t EmitReadConst(SpirvValueEmitContext& ctx, const IrValue& inst) {
                 const auto stage = ConstantU32(state, static_cast<std::uint32_t>(resources.stage) << BdaAbi::SrtGuardStageShift);
                 // The first poisoned read keeps the word, as record_bda_fault keeps the first fault: an invocation that
                 // does not stop (wave operations) reads on through later guards.
-                state.module.AddFunction(spv::OpAtomicCompareExchange, u32, state.module.AllocateId(), BdaWord(state, state.faultBufferVariable, ConstantU32(state, BdaAbi::SrtGuardWord)), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, spv::MemorySemanticsMaskNone), Binary(state, spv::OpBitwiseOr, u32, record, stage), ConstantU32(state, 0u));
+                const auto word = BdaWord(state, state.faultBufferVariable, ConstantU32(state, BdaAbi::SrtGuardWord));
+                const auto scope = ConstantU32(state, spv::ScopeDevice);
+                const auto relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
+                const auto value = Binary(state, spv::OpBitwiseOr, u32, record, stage);
+                if (state.bdaStopsInvocations) {
+                    state.module.AddFunction(spv::OpAtomicStore, word, scope, relaxed, value);
+                } else {
+                    state.module.AddFunction(spv::OpAtomicCompareExchange, u32, state.module.AllocateId(), word, scope, relaxed, relaxed, value, ConstantU32(state, 0u));
+                }
             });
             StopBdaInvocationIf(state, poisoned);
         }

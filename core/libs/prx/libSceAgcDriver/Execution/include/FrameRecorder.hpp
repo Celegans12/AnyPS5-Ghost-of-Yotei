@@ -15,6 +15,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <span>
 #include <string>
 #include <unordered_map>
@@ -81,12 +82,14 @@ private:
     void record(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders = {}, const std::function<void()>& accept = {});
     void recordLocked(FrameCall call, bool prologueCall, std::span<const Shader* const> shaders);
     void emitDelta();
+    static void collectShaderPages(std::span<const Shader* const> shaders, std::set<std::uint64_t>& blocks, std::set<std::uint64_t>& hostPages);
     void emitShaderDelta(std::span<const Shader* const> shaders);
     void writeDelta(std::span<const Span> spans, std::span<const std::uint64_t> hostPages, std::span<const Range> added = {}, std::span<const std::pair<std::uint64_t, std::vector<std::byte>>> images = {});
     bool triggered();
     void start();
     void finish();
     void snapshot(const Range& range);
+    void readGuest(std::uint64_t address, std::span<std::byte> bytes, GuestRead read);
     void writeReferenceFrames();
     void writeFrameReference();
     void writeCheckpoint();
@@ -108,6 +111,7 @@ private:
     State state = State::Waiting;
     std::unique_ptr<FrameCaptureWriter> writer;
     std::vector<PrologueCall> prologue;
+    std::set<std::uint64_t> prologueHostPages;
     std::map<std::uint64_t, std::vector<std::byte>> headerImages;
     std::uint64_t prologueRewrites = 0;
     std::uint64_t prologueRewriteBytes = 0;
@@ -147,6 +151,7 @@ private:
     std::uint64_t recordedCalls = 0;
     std::uint64_t startAttempts = 0;
     std::uint64_t unreadableBytes = 0;
+    std::uint64_t hostOnlySampleBytes = 0;
     std::uint64_t allocationsGeneration = 0;
     std::uint64_t lateRanges = 0;
     std::vector<std::string> warnings;

@@ -44,8 +44,8 @@ bool precheckRejections() {
     return precheck;
 }
 
-template <typename TRestart, typename TReached>
-DrawPrecheckOutcome precheckState(const QueueState& queue, const Pm4::DrawParameters& drawParameters, std::string& rejected, std::optional<Graphics::ColorMetadataPass>& metadata, std::optional<Graphics::DepthCopyPass>& depthCopy, TRestart&& primitiveListRestart, TReached&& reached) {
+template <typename TRestart, typename TReached, typename TDepthControl>
+DrawPrecheckOutcome precheckState(const QueueState& queue, const Pm4::DrawParameters& drawParameters, std::string& rejected, std::optional<Graphics::ColorMetadataPass>& metadata, std::optional<Graphics::DepthCopyPass>& depthCopy, TRestart&& primitiveListRestart, TReached&& reached, TDepthControl&& depthControl) {
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawPrecheckOutcome::Nothing;
     if (auto pass = Graphics::DecodeColorMetadataPass(queue)) {
         require(!drawParameters.indirect, "indirect CB metadata passes are unsupported");
@@ -57,6 +57,7 @@ DrawPrecheckOutcome precheckState(const QueueState& queue, const Pm4::DrawParame
         depthCopy = std::move(copy);
         return DrawPrecheckOutcome::MetadataPass;
     }
+    if (const auto control = Graphics::DecodeDepthRenderControl(queue); control && ((control->control & 0x60u) != 0u || Graphics::DepthSurfaceAt(control->address))) depthControl(*control);
     if (Graphics::DepthResummarizeDrawsNothing(queue)) return DrawPrecheckOutcome::Nothing;
     rejected = Graphics::DepthMaintenanceRejection(queue);
     if (!rejected.empty()) return DrawPrecheckOutcome::Rejected;
@@ -106,7 +107,7 @@ bool TraceIndirectDraws() {
 DrawPrecheckOutcome PrecheckDrawState(const QueueState& queue, const Pm4::DrawParameters& drawParameters, bool primitiveListRestart, std::string& rejected) {
     std::optional<Graphics::ColorMetadataPass> metadata;
     std::optional<Graphics::DepthCopyPass> depthCopy;
-    return precheckState(queue, drawParameters, rejected, metadata, depthCopy, [&] { return primitiveListRestart; }, [] {});
+    return precheckState(queue, drawParameters, rejected, metadata, depthCopy, [&] { return primitiveListRestart; }, [] {}, [](const auto&) {});
 }
 
 std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
@@ -118,6 +119,9 @@ std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const S
     }, [&] {
         traceIndirect = TraceIndirectDraws();
         if (traceIndirect && drawParameters.indirect) std::fprintf(stderr, "[draw] indirect packet %s args 0x%llx count %u reached\n", Pm4::Name(packet[0]).c_str(), static_cast<unsigned long long>(drawParameters.indirect->arguments), drawParameters.indirect->count);
+    }, [&](const auto& control) {
+        if (DrawPipeline::Active()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, (packet[0] >> 8u) & 0xffu);
+        Graphics::NoteDepthRenderControl(control);
     });
     switch (outcome) {
         case DrawPrecheckOutcome::MetadataPass: {

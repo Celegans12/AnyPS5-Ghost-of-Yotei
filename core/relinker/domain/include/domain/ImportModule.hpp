@@ -77,13 +77,19 @@ inline std::string ImportModule(const std::string& symbol, const std::map<std::u
             throw RelinkerException("Invalid import " + kind + " name: " + name);
         if (ModuleSuffix(name).empty()) name += ".prx";
         if (std::find(dependencies.begin(), dependencies.end(), name) != dependencies.end()) return name;
-        std::string matched;
-        for (const auto& dependency : dependencies) {
-            if (ImportModuleName(dependency) != ImportModuleName(name)) continue;
-            if (!matched.empty() && matched != dependency) throw RelinkerException("Ambiguous import " + kind + " dependency: " + name);
-            matched = dependency;
-        }
-        return matched;
+        const auto normalized = ImportModuleName(name);
+        const auto lookup = normalized == "libmonosgen" ? std::string("libmonosgen-2_0") : normalized;
+        const auto findMatch = [&](const std::string& candidate) {
+            std::string matched;
+            for (const auto& dependency : dependencies) {
+                if (ImportModuleName(dependency) != candidate) continue;
+                if (!matched.empty() && matched != dependency) throw RelinkerException("Ambiguous import " + kind + " dependency: " + name);
+                matched = dependency;
+            }
+            return matched;
+        };
+        if (auto matched = findMatch(normalized); !matched.empty()) return matched;
+        return lookup == normalized ? std::string{} : findMatch(lookup);
     };
     auto matched = resolve(std::string_view(symbol).substr(second + 1), modules, "module");
     if (!matched.empty() || libraries.empty()) return matched;

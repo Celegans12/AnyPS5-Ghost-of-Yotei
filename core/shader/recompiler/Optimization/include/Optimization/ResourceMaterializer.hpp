@@ -21,7 +21,7 @@ struct ImageTableElement {
     RdnaImageDimension dimension = RdnaImageDimension::Unknown;
     bool depthCompare = false;
     DescriptorBindingKind kind = DescriptorBindingKind::Buffers;
-    std::uint32_t samplers = 0;
+    std::uint64_t samplers = 0;
     bool atomic = false;
     bool atomic64 = false;
 };
@@ -76,6 +76,11 @@ struct BindlessInterface {
 };
 
 class ConvertedSampleRequired : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
+
+class LayerRowSamplesRequired : public std::runtime_error {
 public:
     using std::runtime_error::runtime_error;
 };

@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "tests/TemporaryFile.hpp"
 #include "Recompiler.hpp"
 #include "ImageTableAbi.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
@@ -375,7 +376,7 @@ class StderrCapture {
 public:
     StderrCapture() {
         std::fflush(stderr);
-        file = std::tmpfile();
+        file = TemporaryFile::Open();
         Require(file != nullptr, "cannot open a temporary file for stderr");
 #ifdef _WIN32
         saved = _dup(_fileno(stderr));

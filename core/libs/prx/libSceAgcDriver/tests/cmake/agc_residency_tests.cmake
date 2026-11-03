@@ -1,0 +1,13 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_residency_tests tests/Residency.cpp Graphics/src/Residency.cpp)
+    target_include_directories(agc_residency_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_residency_tests PRIVATE libc)
+    set_target_properties(agc_residency_tests PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_residency_tests)
+    add_test(NAME agc_residency COMMAND agc_residency_tests)
+    set_tests_properties(agc_residency PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_residency PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

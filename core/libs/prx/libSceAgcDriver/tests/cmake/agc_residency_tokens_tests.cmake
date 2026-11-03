@@ -1,0 +1,12 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_residency_tokens_tests tests/ResidencyTokens.cpp Graphics/src/ResidencyTokens.cpp)
+    target_include_directories(agc_residency_tokens_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_residency_tokens_tests PRIVATE libc)
+    configure_windows_unwind(agc_residency_tokens_tests)
+    add_test(NAME agc_residency_tokens COMMAND agc_residency_tokens_tests)
+    set_tests_properties(agc_residency_tokens PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_residency_tokens PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

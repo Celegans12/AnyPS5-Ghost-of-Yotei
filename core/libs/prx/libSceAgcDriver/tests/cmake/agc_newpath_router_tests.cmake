@@ -1,0 +1,12 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_newpath_router_tests tests/NewPathRouter.cpp Execution/src/Driver/NewPath/Router.cpp)
+    target_include_directories(agc_newpath_router_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler)
+    target_link_libraries(agc_newpath_router_tests PRIVATE libc)
+    configure_windows_unwind(agc_newpath_router_tests)
+    add_test(NAME agc_newpath_router COMMAND agc_newpath_router_tests)
+    set_tests_properties(agc_newpath_router PROPERTIES TIMEOUT 20)
+    if(WIN32)
+        set_tests_properties(agc_newpath_router PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

@@ -3,10 +3,12 @@
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "ImageTableAbi.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderInfo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <bit>
 #include <cstdio>
@@ -16,36 +18,23 @@
 #include <list>
 #include <mutex>
 #include <iomanip>
+#include <span>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 
 namespace {
 
-// The page tables built per device, reused by a build whose ranges (guest ranges, device
-// addresses, permissions) equal one of them: consecutive address-based builds map the same registered
-// set through the same imports and mirrors, so the ~1200-entry table repeats. The shader only reads
-// the table (its lookup keeps its state in function variables), and a batch in flight keeps its
-// BdaResources, so sharing the buffer is safe. The cache holds the tables weakly: they never outlive
-// the builds that own them (a static owner would destroy the buffer after its device, at exit or on
-// device replacement, and would fail the tests' leak check), and with deferred lease release the
-// previous builds are still in flight when the next one asks, which is what makes the hit rate.
-// One table was enough while every build repeated the last one exactly; now the misaligned
-// descriptor sub-ranges the GPU copies out of imports sit in pool staging buffers whose device
-// addresses cycle through the few buffers the batches in flight leave free, and the three
-// address-based programs of one queue interleave with the lease draws, so a table differs from the
-// previous one and comes back a few builds later (69% misses in the wave-8 run, 4% before the GPU
-// copies). Hence several recent tables, most recently used first, matched by a word hash before
-// the byte compare. APS5_BDA_TABLE_CACHE_ENTRIES sets how many (default 8; 1 is the previous
-// behaviour); APS5_NO_BDA_TABLE_CACHE=1 builds every table.
-// A table built for (or found equal to) the cached address space's ranges carries the space's
-// serial: a build served by that space alone binds it by the serial, with no hash and no compare.
 struct TableEntry {
     std::uint64_t hash;
     // Shared with the address space's table map when the ranges came from it (no copy).
     std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> ranges;
     std::weak_ptr<Buffer> buffer;
-    std::uint64_t spaceSerial = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spaceKeys;
 };
 
 struct TableCache {
@@ -59,8 +48,6 @@ struct TableCache {
 
 bool sameRanges(const std::vector<ShaderRecompiler::BdaAbi::Range>& left, const std::vector<ShaderRecompiler::BdaAbi::Range>& right);
 
-// APS5_PROFILE_DRAW: why the most recently used entry did not serve this build (see
-// TableCacheStats). Under the cache mutex.
 void classifyFirstEntry(TableCache& cache, std::uint64_t hash, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (!profile) return;
@@ -195,21 +182,213 @@ void reportBdaBuildTimes() {
     std::fprintf(stderr, "[bda-build] (10 s): table build parts (ms): hash %.0f, candidate scan %.0f, index %.0f, buffer %.0f, copies %.0f, cache entry %.0f\n", ms(t.hashNs), ms(t.scanNs), ms(t.indexNs), ms(t.bufferNs), ms(t.copyNs), ms(t.entryNs));
 }
 
-BdaResources::BdaResources(const Context& context) : textureService(context.textureService) {
+struct BdaFaultChunk {
+    std::unique_ptr<Buffer> buffer;
+    std::vector<VkDeviceSize> free;
+    std::size_t slots = 0;
+    VkDeviceSize slotBytes = 0;
+};
+
+namespace {
+
+struct FaultArena {
+    std::vector<std::shared_ptr<BdaFaultChunk>> chunks;
+    std::unordered_set<BdaResources*> holders;
+    std::uint64_t finished = 0;
+    BdaResources::FaultSlotCounts counts;
+};
+
+struct FaultArenas {
+    std::mutex mutex;
+    std::unordered_map<VkDevice, FaultArena> devices;
+};
+
+FaultArenas& faultArenas() {
+    static auto* arenas = new FaultArenas();
+    return *arenas;
+}
+
+bool sharedFaultSlots() {
+    static const bool shared = std::getenv("APS5_NO_SHARED_FAULT_SLOTS") == nullptr;
+    return shared;
+}
+
+constexpr VkDeviceSize FaultChunkBytes = VkDeviceSize{512} * 1024;
+
+VkDeviceSize faultSlotBytes(bool reportOnly) {
+    return reportOnly ? sizeof(ShaderRecompiler::BdaAbi::Fault) : ShaderRecompiler::BdaAbi::FaultBufferBytes;
+}
+
+VkDeviceSize faultStride(const Context& context, VkDeviceSize bytes) {
+    const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, sizeof(std::uint32_t));
+    return (bytes + alignment - 1) / alignment * alignment;
+}
+
+bool faultSlotClean(std::span<const std::byte> bytes) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    if (bytes.size() < Abi::FaultBufferBytes) return std::all_of(bytes.begin(), bytes.end(), [](std::byte value) { return value == std::byte{0}; });
+    std::array<std::uint32_t, Abi::WrittenSlotsWord> head{};
+    std::memcpy(head.data(), bytes.data(), sizeof(head));
+    std::uint32_t guard = 0;
+    std::memcpy(&guard, bytes.data() + Abi::SrtGuardWord * sizeof(std::uint32_t), sizeof(guard));
+    return guard == 0 && std::all_of(head.begin(), head.end(), [](std::uint32_t word) { return word == 0; });
+}
+
+void clearFaultSlot(std::span<std::byte> bytes) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    if (bytes.size() < Abi::FaultBufferBytes) {
+        std::memset(bytes.data(), 0, bytes.size());
+        return;
+    }
+    std::memset(bytes.data(), 0, Abi::WrittenListWord * sizeof(std::uint32_t));
+    std::memset(bytes.data() + Abi::SrtGuardWord * sizeof(std::uint32_t), 0, sizeof(std::uint32_t));
+}
+
+void dropChunk(FaultArena& arena, const std::shared_ptr<BdaFaultChunk>& chunk, std::vector<std::shared_ptr<BdaFaultChunk>>& dropped) {
+    const auto found = std::find(arena.chunks.begin(), arena.chunks.end(), chunk);
+    if (found == arena.chunks.end()) return;
+    arena.counts.slots -= (*found)->slots;
+    --arena.counts.chunks;
+    dropped.push_back(std::move(*found));
+    arena.chunks.erase(found);
+}
+
+}
+
+BdaResources::BdaResources(const Context& context, bool reportOnly) : reportOnly(reportOnly), textureService(context.textureService) {
     static_assert(std::endian::native == std::endian::little);
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
-    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
     const auto faultStart = bdaBuildProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-    std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
-    std::memset(fault->Bytes().data() + ShaderRecompiler::BdaAbi::SrtGuardWord * sizeof(std::uint32_t), 0, sizeof(std::uint32_t));
+    TakeFaultSlot(context);
     if (bdaBuildProfiled()) {
         bdaBuildTimes().faults.fetch_add(1, std::memory_order_relaxed);
         bdaBuildTimes().faultNs.fetch_add(nsSince(faultStart), std::memory_order_relaxed);
     }
 }
 
-BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
+BdaResources::~BdaResources() {
+    std::vector<std::shared_ptr<BdaFaultChunk>> dropped;
+    auto& arenas = faultArenas();
+    std::lock_guard lock(arenas.mutex);
+    if (faultChunk == nullptr) return;
+    const auto bytes = faultBytes();
+    if (!faultSlotClean(bytes)) clearFaultSlot(bytes);
+    const auto chunk = faultChunk;
+    dropped.push_back(std::move(faultChunk));
+    const auto found = arenas.devices.find(faultDevice);
+    if (found == arenas.devices.end()) return;
+    auto& arena = found->second;
+    arena.holders.erase(this);
+    --arena.counts.held;
+    if (!sharedFaultSlots()) {
+        arena.counts.slots -= chunk->slots;
+        --arena.counts.chunks;
+    } else {
+        chunk->free.push_back(faultOffset);
+        if (chunk->free.size() == chunk->slots) dropChunk(arena, chunk, dropped);
+    }
+    if (arena.holders.empty()) {
+        while (!arena.chunks.empty()) dropChunk(arena, arena.chunks.back(), dropped);
+        arenas.devices.erase(found);
+    }
+}
+
+std::span<std::byte> BdaResources::faultBytes() const {
+    return faultChunk->buffer->Bytes().subspan(static_cast<std::size_t>(faultOffset), static_cast<std::size_t>(faultChunk->slotBytes));
+}
+
+void BdaResources::NoteUse(std::uint64_t serial) {
+    auto& arenas = faultArenas();
+    std::lock_guard lock(arenas.mutex);
+    lastUse = std::max(lastUse, serial);
+}
+
+void BdaResources::NoteFinished(VkDevice device, std::uint64_t serial) {
+    auto& arenas = faultArenas();
+    std::lock_guard lock(arenas.mutex);
+    const auto found = arenas.devices.find(device);
+    if (found != arenas.devices.end()) found->second.finished = serial;
+}
+
+BdaResources::FaultSlotCounts BdaResources::FaultSlots(VkDevice device) {
+    auto& arenas = faultArenas();
+    std::lock_guard lock(arenas.mutex);
+    const auto found = arenas.devices.find(device);
+    return found != arenas.devices.end() ? found->second.counts : FaultSlotCounts{};
+}
+
+bool BdaResources::TakeFaultSlot(const Context& context) {
+    if (faultChunk != nullptr) return false;
+    std::vector<std::shared_ptr<BdaFaultChunk>> dropped;
+    auto& arenas = faultArenas();
+    std::lock_guard lock(arenas.mutex);
+    auto& arena = arenas.devices[context.device];
+    const bool retake = faultDevice != VK_NULL_HANDLE;
+    if (!retake) lastUse = arena.finished + 1;
+    faultDevice = context.device;
+    const bool shared = sharedFaultSlots();
+    const auto slotBytes = shared ? faultSlotBytes(reportOnly) : VkDeviceSize{ShaderRecompiler::BdaAbi::FaultBufferBytes};
+    const auto withFree = [&] { return std::find_if(arena.chunks.rbegin(), arena.chunks.rend(), [&](const std::shared_ptr<BdaFaultChunk>& chunk) { return chunk->slotBytes == slotBytes && !chunk->free.empty(); }); };
+    auto source = shared ? withFree() : arena.chunks.rend();
+    bool reclaimed = false;
+    if (shared && source == arena.chunks.rend() && GuestMemory::GpuMutex().HeldByThisThread()) {
+        std::vector<BdaResources*> idle;
+        for (auto* holder : arena.holders) {
+            if (holder->faultChunk->slotBytes == slotBytes && holder->lastUse <= arena.finished && faultSlotClean(holder->faultBytes())) idle.push_back(holder);
+        }
+        if (!idle.empty()) {
+            const auto reclaim = (idle.size() + 1) / 2;
+            std::nth_element(idle.begin(), idle.begin() + static_cast<std::ptrdiff_t>(reclaim - 1), idle.end(), [](const BdaResources* left, const BdaResources* right) { return left->lastUse < right->lastUse; });
+            for (std::size_t index = 0; index < reclaim; ++index) {
+                auto& holder = *idle[index];
+                holder.faultChunk->free.push_back(holder.faultOffset);
+                holder.faultChunk.reset();
+                arena.holders.erase(&holder);
+                --arena.counts.held;
+                ++arena.counts.reclaimed;
+            }
+            reclaimed = true;
+            source = withFree();
+        }
+    }
+    std::shared_ptr<BdaFaultChunk> chunk;
+    if (source != arena.chunks.rend()) {
+        chunk = *source;
+    } else {
+        const auto stride = shared ? faultStride(context, slotBytes) : slotBytes;
+        const auto slots = shared ? std::max<VkDeviceSize>(1, FaultChunkBytes / stride) : 1;
+        chunk = std::make_shared<BdaFaultChunk>();
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
+        chunk->buffer = std::make_unique<Buffer>(context, static_cast<std::size_t>(stride * slots), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memset(chunk->buffer->Bytes().data(), 0, chunk->buffer->Bytes().size());
+        chunk->slots = static_cast<std::size_t>(slots);
+        chunk->slotBytes = slotBytes;
+        for (auto slot = slots; slot-- > 0;) chunk->free.push_back(slot * stride);
+        if (shared) arena.chunks.push_back(chunk);
+        arena.counts.slots += chunk->slots;
+        ++arena.counts.chunks;
+    }
+    faultOffset = chunk->free.back();
+    chunk->free.pop_back();
+    faultChunk = chunk;
+    arena.holders.insert(this);
+    ++arena.counts.held;
+    if (retake) ++arena.counts.retaken;
+    bool spare = false;
+    for (auto it = arena.chunks.begin(); reclaimed && it != arena.chunks.end();) {
+        if ((*it)->free.size() != (*it)->slots || !std::exchange(spare, true)) {
+            ++it;
+            continue;
+        }
+        arena.counts.slots -= (*it)->slots;
+        --arena.counts.chunks;
+        dropped.push_back(std::move(*it));
+        it = arena.chunks.erase(it);
+    }
+    return true;
+}
+
+BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly) : BdaResources(context, reportOnly) {
     const bool profiled = bdaBuildProfiled();
     // APS5_NO_LEAN_BDA_TABLES=1 (runtime switch): copy the ranges into the table cache and hash them in one
     // chain, as before (see hashRangesLanes and GuestBufferMemory's range-list pool).
@@ -238,13 +417,39 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             reportBdaBuildTimes();
         }
     } noteOutcome{profiled, outcome, tableStart};
-    const auto& ranges = cached.has_value() ? *cached->ranges : built;
+    const auto& addressRanges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
+    auto guardSerial = MultisampleTargetRangeGeneration();
+    if (tableCacheEnabled() && serial != 0) {
+        auto& cache = Tables();
+        std::lock_guard lock(cache.mutex);
+        if (cache.device != context.device) {
+            cache.entries.clear();
+            cache.device = context.device;
+        }
+        for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
+            const auto key = std::pair{serial, guardSerial};
+            if (std::find(it->spaceKeys.begin(), it->spaceKeys.end(), key) == it->spaceKeys.end()) continue;
+            if (auto shared = it->buffer.lock(); shared != nullptr) {
+                tableBytes = shared->Bytes().size();
+                ++cache.hits;
+                ++cache.classes.spaceTables;
+                outcome = 0;
+                table = std::move(shared);
+                cache.entries.splice(cache.entries.begin(), cache.entries, it);
+                return;
+            }
+            cache.entries.erase(it);
+            break;
+        }
+    }
+    auto filtered = ExcludeMultisampleTargetRanges(context.device, addressRanges, guardSerial);
+    const auto& ranges = filtered.has_value() ? *filtered : addressRanges;
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     // The range index (BdaAbi::IndexedTable) after the ranges; APS5_NO_BDA_INDEX=1 leaves it out.
     static const bool indexDisabled = std::getenv("APS5_NO_BDA_INDEX") != nullptr;
-    // [bda-build] index part: on this tree the index is built before the cache lookup (every build, not only misses).
+    // [bda-build] index part: the index is built before the hash lookup (every build the space-key lookup did not serve, not only misses).
     const auto indexStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto index = indexDisabled ? std::vector<std::uint32_t>{} : ShaderRecompiler::BdaAbi::BuildRangeIndex(ranges.data(), ranges.size());
     if (profiled) bdaBuildTimes().indexNs.fetch_add(nsSince(indexStart), std::memory_order_relaxed);
@@ -258,21 +463,6 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         if (cache.device != context.device) {
             cache.entries.clear();
             cache.device = context.device;
-        }
-        if (serial != 0) {
-            for (auto it = cache.entries.begin(); it != cache.entries.end(); ++it) {
-                if (it->spaceSerial != serial) continue;
-                if (auto shared = it->buffer.lock(); shared != nullptr) {
-                    ++cache.hits;
-                    ++cache.classes.spaceTables;
-                    outcome = 0;
-                    table = std::move(shared);
-                    cache.entries.splice(cache.entries.begin(), cache.entries, it);
-                    return;
-                }
-                cache.entries.erase(it);
-                break;
-            }
         }
         const auto hashStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         hash = lean ? hashRangesLanes(ranges) : hashRanges(ranges);
@@ -307,9 +497,13 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             if (sameRanges(*it->ranges, ranges)) {
                 ++cache.hits;
                 outcome = 1;
-                // An equal table of an earlier space (a rebuild that mapped the same ranges the
-                // same way): the next build of this space binds it by the serial.
-                if (serial != 0) it->spaceSerial = serial;
+                if (serial != 0) {
+                    const auto key = std::pair{serial, guardSerial};
+                    auto found = std::find(it->spaceKeys.begin(), it->spaceKeys.end(), key);
+                    if (found != it->spaceKeys.end()) it->spaceKeys.erase(found);
+                    it->spaceKeys.push_back(key);
+                    if (it->spaceKeys.size() > tableCacheEntries()) it->spaceKeys.erase(it->spaceKeys.begin());
+                }
                 table = std::move(shared);
                 cache.entries.splice(cache.entries.begin(), cache.entries, it);
                 return;
@@ -344,8 +538,9 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.entries.clear();
             cache.device = context.device;
         }
-        auto entryRanges = cached.has_value() && lean && cached->owner != nullptr ? cached->owner : std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(cached.has_value() ? ranges : std::move(built));
-        cache.entries.push_front({hash, std::move(entryRanges), table, serial});
+        auto entryRanges = filtered.has_value() ? std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(std::move(*filtered)) : cached.has_value() && lean && cached->owner != nullptr ? cached->owner : std::make_shared<const std::vector<ShaderRecompiler::BdaAbi::Range>>(cached.has_value() ? *cached->ranges : std::move(built));
+        cache.entries.push_front({hash, std::move(entryRanges), table, {}});
+        if (serial != 0) cache.entries.front().spaceKeys.emplace_back(serial, guardSerial);
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
     }
 }
@@ -366,7 +561,7 @@ VkDescriptorBufferInfo BdaResources::Table() const {
 }
 
 VkDescriptorBufferInfo BdaResources::Fault() const {
-    return {fault->Handle(), 0, ShaderRecompiler::BdaAbi::FaultBufferBytes};
+    return {faultChunk->buffer->Handle(), faultOffset, faultChunk->slotBytes};
 }
 
 namespace {
@@ -378,12 +573,13 @@ bool LoopGuardTripped() {
 }
 
 void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
-    markWrittenPages();
+    if (faultChunk == nullptr) return;
+    if (!reportOnly) markWrittenPages();
     ShaderRecompiler::BdaAbi::Fault report{};
-    std::memcpy(&report, fault->Bytes().data(), sizeof(report));
+    std::memcpy(&report, faultBytes().data(), sizeof(report));
     if (report.state == ShaderRecompiler::BdaAbi::FaultState::Empty) {
         Require(static_cast<std::uint32_t>(report.reason) == 0 && report.address == 0 && report.bytes == 0 && report.stage == 0 && report.instruction == 0 && report.otherFaults == 0, "BDA fault record has data without publication");
-        checkSrtGuard();
+        if (!reportOnly) checkSrtGuard();
         return;
     }
     Require(report.state == ShaderRecompiler::BdaAbi::FaultState::Ready && report.otherFaults <= 1, "incomplete or invalid BDA fault record");
@@ -392,7 +588,7 @@ void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
         // APS5_LOOP_GUARD: the shader left a loop that ran past the guard; the dispatch result is kept.
         loopGuardTripped.store(true, std::memory_order_relaxed);
         std::fprintf(stderr, "[gpu] loop guard: the loop exit at pc 0x%x of shader 0x%llx ran past %u evaluations\n", report.instruction, static_cast<unsigned long long>(report.address), report.bytes);
-        std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
+        std::memset(faultBytes().data(), 0, faultBytes().size());
         return;
     }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::UnnormalizedWrap) {
@@ -501,7 +697,7 @@ void BdaResources::SetSrtGuards(std::vector<SrtGuardFaults> guards) {
 void BdaResources::checkSrtGuard() const {
     namespace Abi = ShaderRecompiler::BdaAbi;
     std::uint32_t guard = 0;
-    std::memcpy(&guard, fault->Bytes().data() + Abi::SrtGuardWord * sizeof(std::uint32_t), sizeof(guard));
+    std::memcpy(&guard, faultBytes().data() + Abi::SrtGuardWord * sizeof(std::uint32_t), sizeof(guard));
     if (guard == 0) return;
     const auto stage = guard >> Abi::SrtGuardStageShift;
     const auto record = guard & ((1u << Abi::SrtGuardStageShift) - 1u);
@@ -517,7 +713,7 @@ void BdaResources::checkSrtGuard() const {
 
 void BdaResources::markWrittenPages() const {
     namespace Abi = ShaderRecompiler::BdaAbi;
-    auto* words = reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
+    auto* words = reinterpret_cast<std::uint32_t*>(faultBytes().data());
     Require(words[Abi::WrittenOverflowWord] == 0, "more than " + std::to_string(Abi::WrittenPageSlots) + " chunks of " + std::to_string(Abi::WrittenChunkPages) + " pages stored to through the BDA table in one use are not implemented");
     const auto count = words[Abi::WrittenCountWord];
     if (count == 0) return;

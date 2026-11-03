@@ -26,6 +26,9 @@ inline constexpr std::uint32_t DeferredDirectImageMode = 0xfffffff0u;
 inline constexpr bool IsDeferredDirectImageMode(std::uint32_t value) {
     return value == DeferredDirectImageMode;
 }
+inline constexpr std::uint32_t ImageComponentBase = 65536u;
+inline constexpr std::uint32_t ImageComponentBits = 2u;
+enum class ImageComponentConstant : std::uint32_t { None, Zero, IntegerOne, FloatOne };
 inline constexpr std::uint32_t VertexBase = 4096u;
 inline constexpr std::uint32_t VertexWords = 6u;
 inline constexpr std::uint32_t PushDataOffset = 8188u;
@@ -36,6 +39,8 @@ inline constexpr std::uint32_t RasterPrimitive = 8233u;
 inline constexpr std::uint32_t LayerExported = 8234u;
 inline constexpr std::uint32_t StencilReferenceOffset = 8235u;
 inline constexpr std::uint32_t ReversedBlend = 8236u;
+inline constexpr std::uint32_t MeshLayerBase = 8237u;
+inline constexpr std::uint32_t MeshLayerCount = 8238u;
 inline constexpr std::uint32_t DepthRemapBase = 8240u;
 inline constexpr std::uint32_t DepthRemapWords = 1u;
 inline constexpr std::uint32_t WorkgroupOffsetBase = 8241u;
@@ -51,7 +56,9 @@ inline constexpr std::uint32_t DescriptorIndexStride = 128u;
 inline constexpr std::uint32_t FoldOffsetBase = 57344u;
 inline constexpr std::uint32_t UnnormalizedBaseLevelBase = 57408u;
 inline constexpr std::uint32_t FmaskFormatBase = 57472u;
-inline constexpr std::uint32_t UnnormalizedWrapBase = 57536u;
+inline constexpr std::uint32_t MirrorUnnormalizedBase = 57536u;
+inline constexpr std::uint32_t MinLodBase = 57600u;
+inline constexpr std::uint32_t UnnormalizedWrapBase = 57664u;
 
 inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint32_t element) {
     return DescriptorIndexBase + binding * DescriptorIndexStride + element;

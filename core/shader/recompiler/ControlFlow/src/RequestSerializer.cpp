@@ -7,7 +7,7 @@ namespace ShaderRecompiler {
 
 namespace {
 
-constexpr std::uint32_t CurrentVersion = 50u;
+constexpr std::uint32_t CurrentVersion = 54u;
 constexpr std::uint32_t DrawParameterBlockTag = 0x31504447u;
 constexpr std::uint32_t LocalFeatures = 22u;
 constexpr std::uint32_t TargetBlendFlag = 0x10000u;
@@ -250,7 +250,7 @@ ConservativeZExport readConservativeZExport(Reader& reader) {
 
 ColorExportPacking readColorExportPacking(Reader& reader) {
     const auto value = reader.ReadU8();
-    if (value > static_cast<std::uint8_t>(ColorExportPacking::Uint)) {
+    if (value > static_cast<std::uint8_t>(ColorExportPacking::UintClamp16)) {
         throw std::runtime_error("RequestSerializer: invalid ColorExportPacking value");
     }
     return static_cast<ColorExportPacking>(value);
@@ -979,6 +979,9 @@ DeserializedRequest deserialize(std::string_view decoded, std::uint32_t version,
         result.request.target.pixelFunctionStorageDwords = reader.ReadU32();
     }
     if (version >= 48u) result.request.target.fragmentBarycentricBuiltins = reader.ReadBool();
+    if (version >= 51u) result.request.target.tessellationEvaluationSubgroups = reader.ReadBool();
+    if (version >= 52u) result.request.target.hostInterpolationFirst = reader.ReadBool();
+    if (version >= 53u) result.request.target.shaderImageMinLod = reader.ReadBool();
     if (localTail && result.request.context.compute.has_value()) {
         const bool singleWorkgroup = reader.ReadBool();
         result.request.context.compute->singleWorkgroup = singleWorkgroup;
@@ -1042,6 +1045,9 @@ std::string RequestSerializer::Serialize(const RecompileRequest& request) const 
     writer.WriteBool(request.target.largePixelFunctionLdsBuffer);
     writer.WriteU32(request.target.pixelFunctionStorageDwords);
     writer.WriteBool(request.target.fragmentBarycentricBuiltins);
+    writer.WriteBool(request.target.tessellationEvaluationSubgroups);
+    writer.WriteBool(request.target.hostInterpolationFirst);
+    writer.WriteBool(request.target.shaderImageMinLod);
     if (request.context.compute.has_value()) writer.WriteBool(request.context.compute->singleWorkgroup);
     // Optional trailing block (no version bump, so requests without it serialize as before): the
     // GPU-side indirect draw parameter SGPRs of a vertex stage.
@@ -1059,8 +1065,9 @@ DeserializedRequest RequestSerializer::Deserialize(std::string_view text) const 
     if (reader.ReadU32() != 0x41505335u) throw std::runtime_error("invalid recompile request signature");
     const auto version = reader.ReadU32();
     if (version < 1u || version > CurrentVersion) throw std::runtime_error("unsupported recompile request serialization version");
-    if (version >= CurrentVersion) return deserialize(decoded, 49u, LocalFeatures, true, false);
-    if (version == 48u || version == 49u) return deserialize(decoded, version, 0u, false, false);
+    if (version >= CurrentVersion) return deserialize(decoded, 53u, LocalFeatures, true, false);
+    if (version == 50u) return deserialize(decoded, 49u, LocalFeatures, true, false);
+    if (version >= 48u) return deserialize(decoded, version, 0u, false, false);
     if (version == 47u) {
         try {
             return deserialize(decoded, 46u, LocalFeatures, true, true);
