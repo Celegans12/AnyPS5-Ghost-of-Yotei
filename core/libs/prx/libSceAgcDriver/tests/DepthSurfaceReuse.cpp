@@ -517,7 +517,7 @@ void TestUntrackedHtileStencilScan(const Context& context) {
         target.htileStencil = true;
         clearedImages.clear();
         Require(view() >= 2, "an HTILE outside the write watch scanned without stencil must be read again for a lookup with stencil in the same collect epoch");
-        Require(std::ranges::find(clearedImages, image) != clearedImages.end(), "HTILE words 0x0000000f with stencil in the HTILE must clear the stencil after a scan without stencil in the same collect epoch");
+        Require(std::ranges::find(clearedImages, lastImage) != clearedImages.end(), "HTILE words 0x0000000f with stencil in the HTILE must clear the stencil after a scan without stencil in the same collect epoch");
     } catch (...) {
         AgcDriver::GuestMemory::SetFlushHook(nullptr);
         throw;

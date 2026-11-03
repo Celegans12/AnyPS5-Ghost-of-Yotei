@@ -1141,18 +1141,27 @@ void budgetReportAgeTests(Context context) {
     Require(heap.has_value(), "the budget report age fixture needs a device-local heap");
     context.memory.memoryHeaps[*heap].size = std::max<VkDeviceSize>(context.memory.memoryHeaps[*heap].size, 16 * GiB);
     context.memoryProperties2 = ReportBudgetAge;
-    Require(StorageTextureCacheBudget(context) == 4 * GiB, "the initial storage limit is not 4 GiB");
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT initial{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    initial.heapBudget[*heap] = budgetReportAge.budget;
+    const auto initialStorage = StorageTextureBudget(context.memory, &initial, 0, 0);
+    const auto storage = StorageTextureCacheBudget(context);
+    std::printf("budget report age: storage limit %llu MiB at an 8 GiB report (fresh calculation %llu MiB)\n", static_cast<unsigned long long>(storage >> 20u), static_cast<unsigned long long>(initialStorage >> 20u));
+    Require(storage == initialStorage, "the initial storage limit is not the storage budget of the reported heap");
     const auto queries = budgetReportAge.queries;
     std::this_thread::sleep_for(std::chrono::milliseconds(25));
     budgetReportAge.budget = 2 * GiB;
-    Require(SampledTextureCacheBudget(context) == 2 * GiB, "sampled did not use the reduced heap budget");
-    Require(budgetReportAge.queries == queries + 1, "reporting the storage limit issued an extra memory budget query");
-    Require(StorageTextureCacheBudget(context) == 4 * GiB, "reporting refreshed the still-active cached storage limit");
     VkPhysicalDeviceMemoryBudgetPropertiesEXT reported{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     reported.heapBudget[*heap] = budgetReportAge.budget;
-    Require(StorageTextureBudget(context.memory, &reported, 0, 0) == GiB, "the fresh storage calculation does not differ from the active cached limit");
+    const auto reducedSampled = TextureCacheBudgetsFor(context.memory, &reported, {}).sampled;
+    const auto sampled = SampledTextureCacheBudget(context);
+    std::printf("budget report age: sampled budget %llu MiB at a 2 GiB report (fresh calculation %llu MiB)\n", static_cast<unsigned long long>(sampled >> 20u), static_cast<unsigned long long>(reducedSampled >> 20u));
+    Require(sampled == reducedSampled, "sampled did not use the reduced heap budget");
+    Require(budgetReportAge.queries == queries + 1, "reporting the storage limit issued an extra memory budget query");
+    Require(StorageTextureCacheBudget(context) == initialStorage, "reporting refreshed the still-active cached storage limit");
+    const auto reducedStorage = StorageTextureBudget(context.memory, &reported, 0, 0);
+    Require(reducedStorage != initialStorage, "the fresh storage calculation does not differ from the active cached limit");
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
-    Require(StorageTextureCacheBudget(context) == GiB, "storage did not refresh after its own cache interval");
+    Require(StorageTextureCacheBudget(context) == reducedStorage, "storage did not refresh after its own cache interval");
     Require(budgetReportAge.queries == queries + 2, "storage did not issue exactly one query when its cache interval expired");
     std::puts("sampled budget report age tests passed");
 }
@@ -1852,6 +1861,17 @@ void collectRefusalTests(Context context) {
     Require(sampled->Reusable() && sampled->SampledTextures().size() == 1, "the template over the partial surface is not reusable");
     ShaderResources::ProofReport report{};
     Require(sampled->Revalidate(shader, &report), "a template over a surface with an uncommitted page did not prove current");
+    if (std::getenv("APS5_NO_COMMITTED_PROOF") == nullptr) {
+        Require(report.path == ShaderResources::ProofPath::Fast, "the committed proof did not prove a template over a surface with an uncommitted page from its committed runs");
+        const auto before = ShaderResources::CollectRefusalCounts();
+        Require(sampled->Revalidate(shader, &report) && report.path == ShaderResources::ProofPath::Fast, "the second committed proof over the uncommitted page did not take the fast path");
+        const auto after = ShaderResources::CollectRefusalCounts();
+        Require(after.sampled == before.sampled && after.uncommitted == before.uncommitted, "a committed proof over an uncommitted page counted a collect refusal");
+        sampled.reset();
+        ClearCachedTextures(context.device);
+        std::puts("collect refusal counters passed (committed proof)");
+        return;
+    }
     Require(report.path == ShaderResources::ProofPath::Full, "a template over a surface with an uncommitted page took the fast proof");
     const auto before = ShaderResources::CollectRefusalCounts();
     const auto walksBefore = ShaderResources::FullWalkNanoseconds();

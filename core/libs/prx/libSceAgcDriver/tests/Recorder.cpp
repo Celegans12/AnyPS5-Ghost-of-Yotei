@@ -4592,6 +4592,7 @@ bool readWrittenStagingTests(const Device& device, Recorder& recorder) {
 void stagingDiffTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     const bool diff = std::getenv("APS5_STAGING_DIFF") != nullptr && context.bufferDeviceAddress;
+    const bool changed = !diff && std::getenv("APS5_NO_CHANGED_COPY_BACK") == nullptr && context.bufferDeviceAddress;
     if (context.hostImportAlignment == 0) {
         std::cout << "host imports unavailable: staging copy-backs not tested\n";
         return;
@@ -4645,9 +4646,9 @@ void stagingDiffTests(const Device& device, Recorder& recorder) {
         auto expected = 0x11111111u;
         const auto at = index >= first ? index - first : bytes;
         if (at >= 64 && at < 80) expected = 0x22222222u;
-        else if (at == 200) expected = 0x55555555u;
-        else if (at >= 128 && at < 132) expected = diff ? 0x88888888u : 0x11111111u;
-        else if (at >= 4096 && at < 4112) expected = diff ? 0x33333333u : 0x11111111u;
+        else if (at == 200) expected = changed ? 0x44444444u : 0x55555555u;
+        else if (at >= 128 && at < 132) expected = diff || changed ? 0x88888888u : 0x11111111u;
+        else if (at >= 4096 && at < 4112) expected = diff || changed ? 0x33333333u : 0x11111111u;
         if (words[index] != expected && wrong++ < 8) std::cout << "staging copy-back dword " << index << " holds 0x" << std::hex << words[index] << ", expected 0x" << expected << std::dec << "\n";
     }
     Require(wrong == 0, "a staged copy-back left the wrong guest bytes");
@@ -4666,6 +4667,7 @@ void stagingDiffTests(const Device& device, Recorder& recorder) {
 void stagingDiffBdaTests(const Device& device, Recorder& recorder) {
     const auto& context = device.GetContext();
     const bool diff = std::getenv("APS5_STAGING_DIFF") != nullptr && context.bufferDeviceAddress;
+    const bool changed = !diff && std::getenv("APS5_NO_CHANGED_COPY_BACK") == nullptr && context.bufferDeviceAddress;
     if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress || !AddressSpaceCounters().enabled || std::getenv("APS5_NO_BDA_STAGING") != nullptr) {
         std::cout << "host imports, device addresses or the address space cache unavailable: BDA staging not tested\n";
         return;
@@ -4751,7 +4753,7 @@ void stagingDiffBdaTests(const Device& device, Recorder& recorder) {
             auto expected = 0x11111111u;
             const auto at = index >= first ? index - first : bytes;
             if (at >= 64 && at < 80) expected = 0x22222222u;
-            else if (at == 1000) expected = diff ? 0x33333333u : 0x11111111u;
+            else if (at == 1000) expected = diff || changed ? 0x33333333u : 0x11111111u;
             if (words[index] != expected && wrong++ < 8) std::cout << "BDA staging copy-back dword " << index << " holds 0x" << std::hex << words[index] << ", expected 0x" << expected << std::dec << "\n";
         }
         Require(wrong == 0, "a BDA-staged copy-back left the wrong guest bytes");
@@ -14242,25 +14244,6 @@ int pipelineCacheFileTests(const Device& device) {
         PipelineCache reloaded(context, properties);
         Require(holds(reloaded.Handle(), 1), "an invalid cache file was not replaced by the saving object's pipelines");
     }
-    std::filesystem::remove_all(directory);
-    {
-        PipelineCache busy(context, properties);
-        build(busy.Handle(), 0);
-        auto creating = busy.Synchronization().LockForPipelineUse();
-        auto periodic = std::async(std::launch::async, [&] { return busy.SaveUnlessCreating(); });
-        const bool waited = periodic.wait_for(std::chrono::seconds(5)) == std::future_status::timeout;
-        creating.unlock();
-        const bool saved = periodic.get();
-        Require(!waited, "a periodic pipeline cache save waited for a pipeline creation in progress (other creations would queue behind it)");
-        Require(!saved, "a periodic pipeline cache save ran during a pipeline creation");
-        Require(!std::filesystem::exists(directory) || std::filesystem::is_empty(directory), "a skipped periodic save wrote the cache file");
-        Require(busy.SaveUnlessCreating(), "a periodic pipeline cache save was skipped with no pipeline creation in progress");
-        cacheFile();
-    }
-    {
-        PipelineCache reloaded(context, properties);
-        Require(holds(reloaded.Handle(), 0), "the cache file lost the pipeline of a cache saved after a skipped periodic save");
-    }
     {
         PipelineCache restoring(context, properties);
         Require(holds(restoring.Handle(), 1), "the valid cache file lost a pipeline");
@@ -14294,6 +14277,25 @@ int pipelineCacheFileTests(const Device& device) {
 #else
         setenv("ANYPS5_NO_SHADER_CACHE", "0", 1);
 #endif
+    }
+    std::filesystem::remove_all(directory);
+    {
+        PipelineCache busy(context, properties);
+        build(busy.Handle(), 0);
+        auto creating = busy.Synchronization().LockForPipelineUse();
+        auto periodic = std::async(std::launch::async, [&] { return busy.SaveUnlessCreating(); });
+        const bool waited = periodic.wait_for(std::chrono::seconds(5)) == std::future_status::timeout;
+        creating.unlock();
+        const bool saved = periodic.get();
+        Require(!waited, "a periodic pipeline cache save waited for a pipeline creation in progress (other creations would queue behind it)");
+        Require(!saved, "a periodic pipeline cache save ran during a pipeline creation");
+        Require(!std::filesystem::exists(directory) || std::filesystem::is_empty(directory), "a skipped periodic save wrote the cache file");
+        Require(busy.SaveUnlessCreating(), "a periodic pipeline cache save was skipped with no pipeline creation in progress");
+        cacheFile();
+    }
+    {
+        PipelineCache reloaded(context, properties);
+        Require(holds(reloaded.Handle(), 0), "the cache file lost the pipeline of a cache saved after a skipped periodic save");
     }
     {
         PipelineCache busy(context, properties);

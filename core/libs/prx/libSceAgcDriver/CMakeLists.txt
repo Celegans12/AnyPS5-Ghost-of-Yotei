@@ -934,6 +934,7 @@ if(BUILD_TESTING)
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
+    set_property(TEST agc_driver_depth_plane_partial_store agc_driver_depth_plane_partial_store_unimported agc_driver_depth_plane_partial_store_buffer_copy APPEND PROPERTY ENVIRONMENT "APS5_LAYER_REFRESH=1")
     set_tests_properties(agc_driver_prepared_shaders
         agc_driver_prepared_shaders_indirect agc_driver_prepared_shaders_uncached
         agc_driver_prepared_shaders_debug agc_driver_prepared_shaders_debug_failure

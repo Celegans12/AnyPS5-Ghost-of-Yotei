@@ -572,7 +572,6 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         const auto guestBytes = geometry.guestBytes;
         Require(clear != nullptr ? snapshot.empty() : snapshot.size() == guestBytes, "texture snapshot size mismatch");
         Require(clear == nullptr || (!depthCompare && !srgbExpand && !IsRepackedTextureFormat(descriptor.format) && !IsBlockCompressed(descriptor.format)), "a cleared texture needs a plain color format");
-        Require(snapshot.size() == guestBytes, "texture snapshot size mismatch");
         if (geometry.imageLevels < descriptor.mipCount) {
             static std::atomic<int> reported{0};
             if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[texture] 0x%llx (%ux%u, %u layers) names %u mip levels, more than the %u its extent holds: levels %u-%u are not uploaded\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, arrayLayers, descriptor.mipCount, geometry.imageLevels, geometry.imageLevels, descriptor.mipCount - 1u);
