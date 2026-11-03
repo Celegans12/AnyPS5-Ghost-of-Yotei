@@ -5042,10 +5042,13 @@ std::uint64_t writtenShadowMax(bool discreteGpu) {
     return discreteGpu ? DiscreteWrittenShadowMax : std::uint64_t{2048} << 10u;
 }
 
+// Local: the gate is off unless APS5_WRITTEN_SHADOW_VRAM_DENOMINATOR is set (0 when unset). At PR #6's default of 2 it
+// fired on a 16 GB card at 1080p (usage ~11.7 GiB over half the heap) and cost ~17 % (adopt-ab, 2026-11-03).
 std::uint64_t writtenShadowVramDenominator() {
     static const std::uint64_t denominator = [] {
         const char* value = std::getenv("APS5_WRITTEN_SHADOW_VRAM_DENOMINATOR");
-        const auto parsed = value != nullptr ? std::strtoull(value, nullptr, 10) : 2ull;
+        if (value == nullptr) return std::uint64_t{0};
+        const auto parsed = std::strtoull(value, nullptr, 10);
         return parsed != 0 ? parsed : 2ull;
     }();
     return denominator;
@@ -5053,7 +5056,7 @@ std::uint64_t writtenShadowVramDenominator() {
 
 bool writtenShadowAffordable(const Context& context) {
     // APS5_NO_WRITTEN_SHADOW_VRAM_GATE (a runtime switch, for an in-run A/B) stages as before the gate.
-    if (RuntimeSwitches::Set(RuntimeSwitch::NoWrittenShadowVramGate)) return true;
+    if (writtenShadowVramDenominator() == 0 || RuntimeSwitches::Set(RuntimeSwitch::NoWrittenShadowVramGate)) return true;
     auto& vram = GetBufferPool(context)->Vram();
     return !vram.Enabled() || !vram.AtLeastFraction(1, writtenShadowVramDenominator());
 }
