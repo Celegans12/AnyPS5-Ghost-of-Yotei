@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <map>
 #include <mutex>
+#include <string>
 #include <unordered_set>
 #include <utility>
 #include "UnnormalizedWrap.hpp"
@@ -111,8 +112,26 @@ bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words) {
     forEachInstruction(words, [&](std::uint32_t opcode, std::span<const std::uint32_t> instruction) {
         if (instruction.size() > 2 && !definesNoPointerValue(opcode) && pointerTypes.contains(instruction[1])) pointers.insert(instruction[2]);
     });
-    bool stores = false;
+    // S4 cloth watch (counter build): the footprint table's stores (note_watch_access, SpirvTarget::watchedReads) are
+    // the driver's own bookkeeping, not guest stores through an address.
+    std::uint32_t footprintFunction = 0;
     forEachInstruction(words, [&](std::uint32_t opcode, std::span<const std::uint32_t> instruction) {
+        if (opcode != spv::OpName || instruction.size() < 3) return;
+        std::string name;
+        for (std::size_t word = 2; word < instruction.size(); ++word) {
+            for (std::uint32_t byte = 0; byte < 4u; ++byte) {
+                const auto character = static_cast<char>((instruction[word] >> (byte * 8u)) & 0xffu);
+                if (character == '\0') break;
+                name += character;
+            }
+        }
+        if (name == "note_watch_access") footprintFunction = instruction[1];
+    });
+    bool stores = false;
+    bool inFootprint = false;
+    forEachInstruction(words, [&](std::uint32_t opcode, std::span<const std::uint32_t> instruction) {
+        if (opcode == spv::OpFunction && instruction.size() > 2) inFootprint = footprintFunction != 0 && instruction[2] == footprintFunction;
+        if (inFootprint) return;
         const auto pointer = pointerOperandStored(opcode, instruction);
         const bool extendedWithPointer = opcode == spv::OpExtInst && std::any_of(instruction.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(5u, instruction.size())), instruction.end(), [&](std::uint32_t operand) { return pointers.contains(operand); });
         stores = stores || extendedWithPointer || (pointer != 0 && pointers.contains(pointer));
