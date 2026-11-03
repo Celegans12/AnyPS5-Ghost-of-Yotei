@@ -5865,7 +5865,7 @@ std::shared_ptr<Buffer> residentBuffer(const Context& context, std::uint64_t beg
         residents.ranges.erase(found);
     }
     if (++residents.heat[key] < ResidentPromoteAfter || residents.ranges.size() >= ResidentLimit) return nullptr;
-    auto buffer = stagingBuffer(context, static_cast<std::size_t>(end - begin), gpuCopyUsage(true) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    auto buffer = stagingBuffer(context, static_cast<std::size_t>(end - begin), gpuCopyUsage(context, true) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     if (buffer == nullptr) return nullptr;
     residents.ranges[key] = ResidentRange{buffer, 0, forget};
     ++residents.promoted;
