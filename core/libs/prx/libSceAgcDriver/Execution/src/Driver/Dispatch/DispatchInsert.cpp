@@ -3,6 +3,8 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "ImageTableAbi.hpp"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 
@@ -14,7 +16,7 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled) {
     });
 }
 
-void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, DispatchPhaseTiming& phaseTiming) {
+void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDispatchCache, bool profile, const std::shared_ptr<const ShaderSnapshot>& registeredShader, std::uint64_t forgetAtCapture, std::span<const ShaderRecompiler::MemoryRegion> memory, const std::shared_ptr<ShaderMemory>& shaderMemory, const std::vector<ShaderRecompiler::MemoryRegion>& captured, const std::shared_ptr<const ShaderRecompiler::ResourceCapture>& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, const std::shared_ptr<DispatchEntry>& missedEntry, bool missedDiffering, std::shared_ptr<DispatchVariant>& attachVariant, std::span<const std::uint32_t> userData, DispatchPhaseTiming& phaseTiming) {
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
@@ -30,15 +32,31 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             capturedWords += region.bytes.size() / sizeof(std::uint32_t);
         }
         const auto supplied = shaderMemory->SuppliedBlocks();
-        fresh->runs.reserve(srtRegions.size());
-        fresh->words.reserve(capturedWords);
-        for (const auto& region : srtRegions) {
-            fresh->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
-            const auto count = region.bytes.size() / sizeof(std::uint32_t);
-            const auto offset = fresh->words.size();
-            fresh->words.resize(offset + count);
-            std::memcpy(fresh->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
-            AppendSharedWords(fresh->shared, fresh->runs.size() - 1u, offset, region.bytes, supplied);
+        const bool freeKeys = freeDispatchKeys() && capture != nullptr;
+        std::uint64_t freeWords = 0;
+        if (freeKeys) {
+            auto use = capture->userDataUse;
+            use.asValue |= compiledResult->userDataRegisterReads;
+            fresh->words.reserve(capturedWords);
+            tagVariantRuns(*fresh, srtRegions, use, true, 0, supplied);
+            freeWords = FreeDispatchUserWords(capture->userDataUse, compiledResult->userDataRegisterReads, fresh->relocatableWords, userData.size());
+            fresh->relocatableWords &= freeWords;
+            fresh->userData.assign(userData.begin(), userData.end());
+            fresh->exactUserWords = ~freeWords;
+            static const bool trace = std::getenv("APS5_TRACE_DISPATCH_CACHE") != nullptr;
+            static std::atomic<int> traced{0};
+            if (trace && traced.fetch_add(1, std::memory_order_relaxed) < 400) std::fprintf(stderr, "[dispatch-cache] 0x%llx free words 0x%llx (moved with their reads 0x%llx) of %zu: as base 0x%llx, as value 0x%llx, read by the shader 0x%llx, %zu runs\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(freeWords), static_cast<unsigned long long>(fresh->relocatableWords), userData.size(), static_cast<unsigned long long>(capture->userDataUse.asBase), static_cast<unsigned long long>(capture->userDataUse.asValue), static_cast<unsigned long long>(compiledResult->userDataRegisterReads), fresh->runs.size());
+        } else {
+            fresh->runs.reserve(srtRegions.size());
+            fresh->words.reserve(capturedWords);
+            for (const auto& region : srtRegions) {
+                fresh->runs.emplace_back(region.guestAddress, region.guestAddress + region.bytes.size());
+                const auto count = region.bytes.size() / sizeof(std::uint32_t);
+                const auto offset = fresh->words.size();
+                fresh->words.resize(offset + count);
+                std::memcpy(fresh->words.data() + offset, region.bytes.data(), count * sizeof(std::uint32_t));
+                AppendSharedWords(fresh->shared, fresh->runs.size() - 1u, offset, region.bytes, supplied);
+            }
         }
 
         DataWordPositionCounts dataCounts;
@@ -78,6 +96,10 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
             stable = captureStable(srtRegions);
         }
         std::lock_guard cacheLock(dispatchCacheMutex);
+        if (freeKeys) {
+            learnDispatchFreeWords(address, registeredShader.get(), userData.size(), freeWords);
+            ++entryCounters.freeInserts;
+        }
         if (profile && missedEntry != nullptr && missedDiffering) classifyDiffering(address, key, *missedEntry->variants.front(), *fresh, capture.get(), entryCounters);
         if (stable) {
             ++entryCounters.inserts;
@@ -99,7 +121,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
                 dispatchOrder.push_front(key);
                 created->order = dispatchOrder.begin();
                 dispatchCache.emplace(key, std::move(created));
-            } else if (found->second != missedEntry && !found->second->variants.empty() && found->second->variants.front()->runs == fresh->runs && SameCapturedWords(found->second->variants.front()->words, found->second->variants.front()->shared, fresh->words, fresh->shared)) {
+            } else if (found->second != missedEntry && !found->second->variants.empty() && found->second->variants.front()->runs == fresh->runs && found->second->variants.front()->userData == fresh->userData && SameCapturedWords(found->second->variants.front()->words, found->second->variants.front()->shared, fresh->words, fresh->shared)) {
 
                 attachVariant = found->second->variants.front();
             } else {

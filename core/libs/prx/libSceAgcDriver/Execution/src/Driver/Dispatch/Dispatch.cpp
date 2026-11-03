@@ -374,7 +374,8 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     mix(packet[4] & 0x8000u);
     for (const auto threads : compute.partialThreads) mix(threads);
     mix(compute.singleWorkgroup ? 0x51u : 0u);
-    for (const auto word : userData) mix(word);
+    const std::uint64_t freeWords = freeDispatchKeys() && !noDispatchCache ? dispatchFreeWords(address, registeredShader.get(), userData.size()) : 0;
+    key = MixDispatchUserWords(key, userData, freeWords);
 
     static const bool keyHygiene = std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
     if (keyHygiene) {
@@ -411,6 +412,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     bool dataHit = false;
     bool cached = false;
     bool validated = false;
+    bool freeHit = false;
 
     std::shared_ptr<DispatchEntry> missedEntry;
     bool missedDiffering = false;
@@ -471,7 +473,22 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             std::lock_guard cacheLock(dispatchCacheMutex);
             if (const auto found = dispatchCache.find(key); found != dispatchCache.end()) {
                 entryFound = true;
-                for (const auto& variant : found->second->variants) appendEntryRegions(*variant, reads);
+                for (const auto& variant : found->second->variants) {
+                    if (freeWords == 0) {
+                        appendEntryRegions(*variant, reads);
+                        continue;
+                    }
+                    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+                    const auto match = MatchDispatchUserWords(*variant, userData, runs);
+                    if (match == UserWordsMatch::Same) appendEntryRegions(*variant, reads);
+                    if (match != UserWordsMatch::Moved) continue;
+                    std::size_t offset = 0;
+                    for (const auto& [begin, end] : runs) {
+                        const auto count = static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+                        reads.push_back({begin, std::as_bytes(std::span<const std::uint32_t>(variant->words).subspan(offset, count))});
+                        offset += count;
+                    }
+                }
             }
         }
         if (!entryFound && !noDispatchCache && !stampValidate() && missItemsOn) {
@@ -504,7 +521,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
         phaseTiming.Phase(PhaseLookup);
     } else {
-        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, userData, freeWords, freeHit, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
     }
     timing.Mark("lookup_cache");
     std::vector<DrawPipeline::Range> itemWrites;
@@ -590,7 +607,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         }
         recompileMs += phaseTiming.Elapsed();
         phaseTiming.Phase(PhaseRecompile);
-        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
+        insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, userData, phaseTiming);
     }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
@@ -620,7 +637,8 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         }
         return;
     }
-    if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
+    if (verifyDataHits() && dataHit && !freeHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
+    if (verifyFreeDispatchKeys() && freeHit) verifyFreeKeyHit(snapshot, codeOffset, request, memory, address, captured, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
         dispatchAttempt(queue, packet, submission, indirectArguments, forceFresh);

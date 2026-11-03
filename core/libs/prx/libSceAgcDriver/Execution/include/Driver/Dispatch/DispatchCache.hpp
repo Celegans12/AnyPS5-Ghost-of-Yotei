@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DISPATCHCACHE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_DRIVER_DISPATCHCACHE_HPP
 
+#include "UserDataUse.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include <algorithm>
@@ -46,6 +47,8 @@ struct DispatchVariant {
     std::uint64_t relocatableWords = 0;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::uint64_t userDataMask = ~std::uint64_t{0};
+    std::vector<std::uint32_t> userData;
+    std::uint64_t exactUserWords = ~std::uint64_t{0};
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
     std::shared_ptr<ShaderMemory> memory;
@@ -74,6 +77,8 @@ struct EntryCounters {
     std::array<std::uint64_t, MaxDispatchVariants> variantHitsByRank{};
     std::uint64_t variantsCompared = 0, variantsInserted = 0, variantsEvicted = 0;
 
+    std::uint64_t freeLookups = 0, freeHits = 0, freeHitsMoved = 0, freeVariantsDiffering = 0, freeVariantsMoved = 0, freeVerified = 0, freeInserts = 0, freeShapesNarrowed = 0;
+
     std::uint64_t dataHits = 0, dataWordsRefreshed = 0, dataVerified = 0, dataInserts = 0, dataPositionsInserted = 0, dataLeavesUnmapped = 0, dataLeavesMismatched = 0, dataLeavesAliased = 0;
     std::array<std::uint64_t, MaxDispatchVariants> dataHitsByRank{};
     std::set<std::size_t> differingPositions;
@@ -90,6 +95,12 @@ struct DataMask {
 enum class EntryOutcome { Equal, EqualData, Differing, Inaccessible, QueuedLabel, FlushingImage, PublishMoved, PendingMoved, ForgetMoved };
 
 bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled);
+
+enum class UserWordsMatch { Same, Moved, Differs };
+
+std::uint64_t FreeDispatchUserWords(const ShaderRecompiler::SrtUserDataUse& use, std::uint64_t registerReads, std::uint64_t relocatable, std::size_t userCount);
+std::uint64_t MixDispatchUserWords(std::uint64_t key, std::span<const std::uint32_t> userData, std::uint64_t freeWords);
+UserWordsMatch MatchDispatchUserWords(const DispatchVariant& variant, std::span<const std::uint32_t> userData, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs);
 
 }
 

@@ -82,6 +82,7 @@ void Driver::reportDispatchCache(EntryCounters& counters) {
         dataRanks += text;
     }
     AgcDriver::ProfilePrint_nid_no_patch("[dispatch-cache] data hits (10 s): %llu (%llu words refreshed; by rank 1..k %s; %llu data variants missed on pending runs), verified %llu; inserts with data positions %llu of %llu (%.1f positions each), leaves skipped: unmapped %llu, mismatched %llu, aliased %llu\n", count(counters.dataHits), count(counters.dataWordsRefreshed), dataRanks.c_str(), count(dataPendingMisses.exchange(0, std::memory_order_relaxed)), count(counters.dataVerified), count(counters.dataInserts), count(counters.inserts), counters.dataInserts != 0 ? static_cast<double>(counters.dataPositionsInserted) / static_cast<double>(counters.dataInserts) : 0.0, count(counters.dataLeavesUnmapped), count(counters.dataLeavesMismatched), count(counters.dataLeavesAliased));
+    if (counters.freeLookups != 0 || counters.freeInserts != 0) AgcDriver::ProfilePrint_nid_no_patch("[dispatch-cache] address-free keys (10 s): %llu lookups under a free key, %llu hits (%llu at moved addresses, %llu verified); %llu variants skipped on a differing user word, %llu validated at moved addresses; %llu inserts, %zu program shapes (%llu narrowed)\n", count(counters.freeLookups), count(counters.freeHits), count(counters.freeHitsMoved), count(counters.freeVerified), count(counters.freeVariantsDiffering), count(counters.freeVariantsMoved), count(counters.freeInserts), dispatchFreeShapes.size(), count(counters.freeShapesNarrowed));
     counters = EntryCounters{};
 }
 
