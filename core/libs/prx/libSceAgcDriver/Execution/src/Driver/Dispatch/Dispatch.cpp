@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <atomic>
@@ -153,13 +154,24 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     const bool itemsOn = DispatchItemsEnabled();
     const bool missItemsOn = itemsOn && DispatchMissItemsEnabled();
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
-    if (SkippedShader(address)) return;
+    const bool preparingAhead = missAheadPlan() != nullptr;
+    if (SkippedShader(address)) {
+        if (preparingAhead) missAheadPlan()->Note(MissAheadPlan::Skip::Listed);
+        return;
+    }
     struct OriginScope {
-        explicit OriginScope(std::uint64_t program) { Graphics::Recorder::SetWriteOrigin(program); }
-        ~OriginScope() { Graphics::Recorder::SetWriteOrigin(0); }
-    } originScope(address);
+        bool active;
+        OriginScope(std::uint64_t program, bool active) : active(active) { if (active) Graphics::Recorder::SetWriteOrigin(program); }
+        ~OriginScope() { if (active) Graphics::Recorder::SetWriteOrigin(0); }
+    } originScope(address, !preparingAhead);
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
-    if (!registeredShader) registeredShader = ReadRawShader(address);
+    if (!registeredShader) {
+        if (preparingAhead) {
+            missAheadPlan()->Note(MissAheadPlan::Skip::Unregistered);
+            return;
+        }
+        registeredShader = ReadRawShader(address);
+    }
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
     const auto userCount = (readRegister(queue.shader, 0x213) >> 1u) & 0x1fu;
@@ -170,7 +182,10 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const bool resolving = resolvingAhead();
     if (SkipRefusedShaders() && SkipListedShader(address)) {
-        if (resolving) return;
+        if (resolving) {
+            if (preparingAhead) missAheadPlan()->Note(MissAheadPlan::Skip::Listed);
+            return;
+        }
         char where[96];
         std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
         throw ShaderRefusal(std::string(where) + "listed in the diagnostic skip list");
@@ -188,7 +203,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     }
     const auto codeOffset = static_cast<std::size_t>((address - snapshot.codeAddress) / sizeof(std::uint32_t));
     if (VulkanDevice::ExactSerialAllocating() && ProgramAllocates(snapshot, codeOffset)) VulkanDevice::NoteAllocatingProgram(address);
-    if (userData.size() >= 6 && Graphics::HtileMaskKernelCode(std::span(snapshot.code).subspan(codeOffset))) Graphics::Recorder::SetWriteOriginKernel(userData[5], userData[4]);
+    if (!preparingAhead && userData.size() >= 6 && Graphics::HtileMaskKernelCode(std::span(snapshot.code).subspan(codeOffset))) Graphics::Recorder::SetWriteOriginKernel(userData[5], userData[4]);
     static const bool profileWriters = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     if (profileWriters && Graphics::HtileWriterProgram(address)) {
         static std::atomic<int> dumped{0};
@@ -242,10 +257,15 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     std::optional<std::pair<std::uint64_t, std::size_t>> htileClearCompletion;
     Graphics::HtileMaskClear htileMask;
     if (resolving) {
-        if (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) return;
-        if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
-        if (!partialLastGroup && indirectArguments == 0 && (MatchDwordPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchConstantDwordFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchClampedGlobalFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchMemoryValueBufferFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
-        if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
+        const auto code = std::span(snapshot.code).subspan(codeOffset);
+        const bool kernel = (indirectArguments == 0 && Graphics::MatchMultisampledSingleClear(code, userData, compute.numThreads))
+            || (!partialLastGroup && matchesFillKernel(code, userData, compute))
+            || (!partialLastGroup && indirectArguments == 0 && (MatchDwordPatternFill(packet, code, userData, compute) || MatchConstantDwordFill(packet, code, userData, compute) || MatchClampedGlobalFill(packet, code, userData, compute) || MatchMemoryValueBufferFill(packet, code, userData, compute)))
+            || (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(code, userData, compute) || MatchesStreamCopyKernel(code, userData, compute) || MatchesIndexedCopyKernel(code, userData, compute)));
+        if (kernel) {
+            if (preparingAhead) missAheadPlan()->Note(MissAheadPlan::Skip::Kernel);
+            return;
+        }
     } else {
         if (indirectArguments == 0 && Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
@@ -367,6 +387,15 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             mix(offset);
             mix(value);
         }
+    }
+    if (preparingAhead) {
+        missAheadPlan()->Reach();
+        prepareMissAhead(registeredShader, codeOffset, request, memory, key, localDevice, address);
+        return;
+    }
+    if (!resolving && missAheadProfiled() && missAheadLedger().Active()) {
+        missAheadLedger().Used(key);
+        reportMissAhead();
     }
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiledResult;
 
@@ -528,6 +557,10 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             compiledResult = invocation.Materialize(*capture);
             CommandMix::NoteMaterialized(*compiledResult, *capture);
             timing.Mark("materialize");
+            if (!resolving && missAheadEnabled()) {
+                missAheadKnown().Insert(key);
+                if (!localDevice->HasComputePipeline(*compiledResult)) missAhead(submission, queue, currentPacketOffset());
+            }
             if (profile && compiledResult->cacheHit) cacheHits.fetch_add(1, std::memory_order_relaxed);
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             static std::atomic<double> totalMs{0};
@@ -726,16 +759,62 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         const auto queueId = submission.queue;
         auto attachTo = keepVariant != nullptr ? keepVariant : attachVariant;
         missItemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, captured = std::move(captured), liveWords = std::move(liveWords), capture, shaderMemory, registeredShader, htileMask, htileClearCompletion, groups, address, queueId, dispatchThreads, attachTo = std::move(attachTo), keepVariant, dataHit, epoch] {
+        // The item's captured regions and their snapshots, shared by its preparation and its commit: a
+        // deferred build keeps a span of the snapshots until Complete(), so both use the same vector.
+        struct ItemInputs {
+            std::vector<ShaderRecompiler::MemoryRegion> captured;
+            std::vector<Graphics::GuestMemorySnapshot> snapshots;
+        };
+        const auto itemInputs = [&] {
+            auto inputs = std::make_shared<ItemInputs>();
+            inputs->captured = std::move(captured);
+            inputs->snapshots.reserve(inputs->captured.size());
+            for (const auto& region : inputs->captured) inputs->snapshots.push_back({region.guestAddress, region.bytes});
+            return std::shared_ptr<const ItemInputs>(std::move(inputs));
+        }();
+        // Prepared dispatch items (APS5_NO_PREPARED_DISPATCH_ITEMS=1 off, a runtime switch): the
+        // preparer thread runs PrepareDispatch (stage A, unlocked) ahead of the committer, as it
+        // prepares draws (DrawPipeline::Prepare). It runs ahead of earlier items still queued; the
+        // dispatch revalidates a cached build under the mutex and falls back to the locked wait for
+        // work noted after the pre-sync anyway, and a guest allocation change or forget in between
+        // makes the commit prepare again (the draw split's staleness rule).
+        struct PreparedItem {
+            std::shared_ptr<PreparedDispatch> prepared;
+            std::uint64_t forgetSerial = 0;
+            std::uint64_t registryGeneration = 0;
+        };
+        auto slot = !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoPreparedDispatchItems) ? std::make_shared<DrawPipeline::PrepareSlot>() : nullptr;
+        DrawPipeline::Prepare prepare;
+        if (slot != nullptr) {
+            prepare = [slot, device = localDevice, result = compiledResult, itemInputs, dispatchThreads, address, epoch, queueId] {
+                if (!slot->Begin()) return;
+                auto item = std::make_shared<PreparedItem>();
+                try {
+                    DrawPipeline::FollowEpoch(epoch);
+                    GuestMemory::SetCurrentPacket(0x15, queueId);
+                    item->forgetSerial = GuestMemory::ForgetSerial();
+                    item->registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+                    if ((item->forgetSerial & 1u) == 0) item->prepared = device->PrepareDispatch(*result, itemInputs->snapshots, dispatchThreads, address);
+                } catch (...) {
+                    // The commit prepares again and reports a refusal in order.
+                    item->prepared = nullptr;
+                }
+                slot->Finish(std::move(item));
+            };
+        }
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, itemInputs, slot, liveWords = std::move(liveWords), capture, shaderMemory, registeredShader, htileMask, htileClearCompletion, groups, address, queueId, dispatchThreads, attachTo = std::move(attachTo), keepVariant, dataHit, epoch] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
-            std::vector<Graphics::GuestMemorySnapshot> commitSnapshots;
-            commitSnapshots.reserve(captured.size());
-            for (const auto& region : captured) commitSnapshots.push_back({region.guestAddress, region.bytes});
+            const auto& commitSnapshots = itemInputs->snapshots;
             const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
             try {
-                auto prepared = localDevice->PrepareDispatch(compiledCommit, commitSnapshots, dispatchThreads, address);
+                std::shared_ptr<PreparedDispatch> prepared;
+                if (slot != nullptr) {
+                    const auto item = std::static_pointer_cast<PreparedItem>(slot->Take());
+                    if (item != nullptr && item->prepared != nullptr && item->forgetSerial == GuestMemory::ForgetSerial() && item->registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix()) prepared = item->prepared;
+                }
+                if (prepared == nullptr) prepared = localDevice->PrepareDispatch(compiledCommit, commitSnapshots, dispatchThreads, address);
                 std::shared_ptr<const Recipe> builtRecipe;
                 {
                     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Dispatch);
@@ -762,7 +841,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                 std::snprintf(where, sizeof(where), "compute shader 0x%llx: ", static_cast<unsigned long long>(address));
                 throw std::runtime_error(where + std::string(error.what()));
             }
-        }, std::move(itemWrites));
+        }, std::move(itemWrites), 0, {}, {}, std::move(prepare));
         if (DrainAfterDispatchItems()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
         ReportDispatchItems(profile);
         return;

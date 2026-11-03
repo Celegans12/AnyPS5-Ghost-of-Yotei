@@ -1279,6 +1279,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         auto preparedStages = prepareDraw ? stages : std::vector<Graphics::CompiledShader>{};
         auto prepareDevice = prepareDraw ? localDevice : nullptr;
         auto prepareDecode = prepareDraw ? decode : nullptr;
+        // The draw's snapshots for an address-based stage A (C29): spans into `memory`, which the commit
+        // owns and the preparation holds through it.
+        auto prepareSnapshots = prepareDraw && splitBuild ? snapshots : std::vector<Graphics::GuestMemorySnapshot>{};
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
         auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), ahead, drawKey, shape = shapeKey, trace = trace, commitQueue, commitPacket, epoch, programs = std::move(programs), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData), slot, program] {
             DrawPipeline::FollowEpoch(epoch);
@@ -1307,14 +1310,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         DrawPipeline::Prepare prepare;
         if (slot != nullptr) {
-            prepare = [held, slot, device = std::move(prepareDevice), decode = std::move(prepareDecode), stages = std::move(preparedStages), drawParameters, epoch, commitPacket, commitQueue, splitBuild] {
+            prepare = [held, slot, device = std::move(prepareDevice), decode = std::move(prepareDecode), stages = std::move(preparedStages), snapshots = std::move(prepareSnapshots), drawParameters, epoch, commitPacket, commitQueue, splitBuild] {
                 if (!slot->Begin()) return;
                 auto prepared = std::make_shared<PreparedCommit>();
                 try {
                     DrawPipeline::FollowEpoch(epoch);
                     GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
                     if (htilePresync && decode->state.depth.has_value()) prepared->presyncSerial = device->PresyncDrawDepth(decode->state);
-                    if (splitBuild) prepared->draw = device->PrepareDraw(decode->state, drawParameters, stages);
+                    if (splitBuild) prepared->draw = device->PrepareDraw(decode->state, drawParameters, stages, snapshots);
                 } catch (...) {
                     prepared->draw = nullptr;
                 }

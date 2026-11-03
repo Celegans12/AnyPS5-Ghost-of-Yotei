@@ -393,7 +393,7 @@ public:
     // caller collected the range's CPU stores first); the entry stays as it is. Nothing when none is kept, the
     // registry moved, it is current, or a CPU store stamped a changed block.
     std::optional<std::optional<std::uint32_t>> GpuWrittenHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use) const;
-    // Diagnostic: the generation the kept highest index of the range was read at (0 when none is kept).
+    // The generation the kept highest index of the range was read at (0 when none is kept).
     std::uint64_t KeptHighestIndexGeneration(std::uint64_t address, std::size_t bytes, SnapshotUse use) const;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest);
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest);
@@ -1279,6 +1279,14 @@ private:
     void takeOwedEdge();
     // Submits `lane`'s open batch (from any thread's lane).
     void submitLane(int lane);
+    // Before a blocking CPU wait for `awaited` (in flight, fence unsignaled): submits the other
+    // lane's open batch. The two rings run side by side on the hardware, so the awaited work may
+    // wait on the GPU for (spin on memory written by) the other ring's later work; left open, that
+    // work reaches the GPU only through a submit by this thread, which holds the GPU mutex every
+    // other driver thread queues on (the #675 lane-1 freeze: FinishWritersByLane -> finish on a
+    // lane-1 batch, lane 0 open). Async lane only (APS5_NO_LANE_OPEN_WAIT=1: as before).
+    void submitOtherLaneBeforeWait(const Batch& awaited);
+    void submitOtherLaneBeforeWait(int lane, std::uint64_t serial);
     // The edges this thread's consumed labels owe (NoteConsumedLabel), applied to the open batch.
     void applyConsumedLabels();
     // The newest in-flight batch of `lane`, or null.

@@ -262,7 +262,7 @@ bool SpirvFaultReportOnly(std::span<const std::uint32_t> words, std::uint32_t se
     return reportOnly;
 }
 
-void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
+void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool unlocked) {
     static const bool loopGuarded = std::getenv("APS5_LOOP_GUARD") != nullptr;
     for (const auto& shader : shaders) {
         Require(shader.program != nullptr, "missing compiled shader");
@@ -303,7 +303,9 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
     if (usesBda) {
         Require(context.bufferDeviceAddress, "buffer device address is not enabled");
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-        guestMemory.AcquireRegistered();
+        // A deferred draw's stage A (no device lock) takes only a cached space without mirrors.
+        if (!unlocked) guestMemory.AcquireRegistered();
+        else if (!guestMemory.AcquireRegisteredCached()) throw std::runtime_error("address space not cached: the draw builds under the device lock");
         const auto snapshotsStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         for (const auto& snapshot : snapshots) guestMemory.AddSnapshot(snapshot);
         if (profile) GuestBufferMemory::CountAddressBuild(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - snapshotsStart).count());

@@ -46,6 +46,7 @@ extern "C" std::vector<std::uint32_t> AgcDriverSaveQueueStates_nid_postfix();
 extern "C" void AgcDriverLoadQueueStates_nid_postfix(std::span<const std::uint32_t> words);
 extern "C" std::uint64_t AgcDriverDispatchesAdoptedAhead_nid_postfix();
 extern "C" std::uint64_t AgcDriverDispatchesRejectedAhead_nid_postfix();
+extern "C" void AgcDriverMissAheadTotals_nid_postfix(std::uint64_t* started, std::uint64_t* used);
 extern "C" void AgcDriverSetAheadAdoptHook_nid_postfix(void (*hook)());
 extern "C" void AgcDriverRegisterShader_nid_postfix(const Shader* shader);
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive);

@@ -1687,10 +1687,12 @@ bool LibraryPrebuildDisabled() {
     return disabled;
 }
 
+}
+
 void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Graphics::ShaderStages& stages, ShaderRecompiler::ShaderStage stage, std::shared_ptr<const ShaderRecompiler::RecompileResult> result, std::uint32_t pushOffset, std::uint64_t program) {
     if (LibraryPrebuildDisabled() || result == nullptr || (stage != ShaderRecompiler::ShaderStage::Vertex && stage != ShaderRecompiler::ShaderStage::Fragment)) return;
     SubmitLibraryPrebuild([device, stages, stage, result = std::move(result), pushOffset] {
-        const std::array<Graphics::CompiledShader, 1> shaders{{{stage, result.get(), pushOffset}}};
+        const std::array<Graphics::CompiledShader, 1> shaders{{{stage, result.get(), result->pushConstants.empty() ? 0u : pushOffset}}};
         try {
             static_cast<void>(device->PrebuildGraphicsLibraries(stages, shaders));
         } catch (const std::exception& error) {
@@ -1698,6 +1700,8 @@ void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Gra
         }
     }, program);
 }
+
+namespace {
 
 std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& plan) {
     auto& request = *plan.request;
