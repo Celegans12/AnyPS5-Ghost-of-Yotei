@@ -2650,7 +2650,8 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     const bool deferReadback = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeferLabelReadback) && !drainLabels && Graphics::Recorder::LaneOfQueue(queue) == 0 && state->recorder && !bytes.empty() && bytes.size() <= 65536 && address % 4 == 0 && bytes.size() % 4 == 0 &&
                                Graphics::HostImportFor(graphicsContext(), address, bytes.size()) != nullptr;
     const auto deferredBefore = deferReadback ? Graphics::StorageTexture::DeferredLabelReadbacks() : 0;
-    Graphics::StorageTexture::StoreReadbackBeforeLabel(deferReadback ? Graphics::StorageTexture::DeferredLabelReadbackReason : "readback before label");
+    const bool storedOnGpu = state->recorder && !bytes.empty() && bytes.size() <= 65536 && address % 4 == 0 && bytes.size() % 4 == 0 && Graphics::HostImportFor(graphicsContext(), address, bytes.size()) != nullptr;
+    Graphics::StorageTexture::StoreReadbackBeforeLabel(deferReadback ? Graphics::StorageTexture::DeferredLabelReadbackReason : storedOnGpu ? "readback before a GPU label" : "readback before label");
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
     auto& recorder = *state->recorder;
     // Batches that already finished are retired before the checks: their completions ran, so they
