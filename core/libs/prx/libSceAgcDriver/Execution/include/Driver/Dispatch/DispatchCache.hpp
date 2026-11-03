@@ -98,9 +98,12 @@ bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled);
 
 enum class UserWordsMatch { Same, Moved, Differs };
 
-std::uint64_t FreeDispatchUserWords(const ShaderRecompiler::SrtUserDataUse& use, std::uint64_t registerReads, std::uint64_t relocatable, std::size_t userCount);
+std::uint64_t PatchableUserWords(const ShaderRecompiler::RecompileResult& compiled);
+std::uint64_t FreeDispatchUserWords(const ShaderRecompiler::SrtUserDataUse& use, std::uint64_t registerReads, std::uint64_t patchable, std::uint64_t relocatable, std::size_t userCount);
 std::uint64_t MixDispatchUserWords(std::uint64_t key, std::span<const std::uint32_t> userData, std::uint64_t freeWords);
-UserWordsMatch MatchDispatchUserWords(const DispatchVariant& variant, std::span<const std::uint32_t> userData, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs);
+UserWordsMatch MatchDispatchUserWords(const DispatchVariant& variant, std::span<const std::uint32_t> userData, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs, std::uint64_t& moved);
+std::shared_ptr<const Recipe> MovedRecipe(const Recipe& recipe, const ShaderRecompiler::RecompileResult& compiled);
+std::shared_ptr<const ShaderRecompiler::RecompileResult> PatchDispatchUserWords(const ShaderRecompiler::RecompileResult& compiled, std::span<const std::uint32_t> userData, std::uint64_t moved, bool& pushes, bool& data);
 
 }
 

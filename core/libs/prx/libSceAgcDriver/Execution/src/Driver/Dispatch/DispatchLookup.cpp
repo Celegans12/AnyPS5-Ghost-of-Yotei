@@ -5,7 +5,7 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const std::uint32_t> userData, std::uint64_t freeWords, bool& freeHit, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
+void Driver::lookupDispatch(std::uint64_t address, const Submission& submission, std::uint64_t key, bool noDispatchCache, bool traceCache, bool profile, std::span<const ShaderRecompiler::MemoryRegion> memory, std::span<const std::uint32_t> userData, std::uint64_t freeWords, bool& freeHit, std::uint64_t& movedWords, DispatchPhaseTiming& phaseTiming, std::array<double, DriverPhaseCount>& phaseMs, std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiledResult, std::shared_ptr<DispatchVariant>& keepVariant, std::vector<ShaderRecompiler::MemoryRegion>& captured, std::vector<std::uint32_t>& liveWords, bool& dataHit, bool& cached, bool& validated, std::shared_ptr<DispatchEntry>& missedEntry, bool& missedDiffering) {
     if (!noDispatchCache) {
 
         static const bool validateUnlocked = std::getenv("APS5_NO_UNLOCKED_VALIDATE") == nullptr;
@@ -36,6 +36,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             std::vector<std::pair<std::uint64_t, std::uint64_t>> movedRuns;
             std::optional<DispatchVariant> moved;
             bool hitMoved = false;
+            std::uint64_t movedMask = 0, hitMask = 0;
 
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
@@ -48,8 +49,8 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                     regions.clear();
                     const DispatchVariant* checked = variants[i].get();
                     if (freeWords != 0) {
-                        const auto match = MatchDispatchUserWords(*variants[i], userData, movedRuns);
-                        if (match == UserWordsMatch::Differs) {
+                        const auto match = MatchDispatchUserWords(*variants[i], userData, movedRuns, movedMask);
+                        if (match == UserWordsMatch::Differs || (match == UserWordsMatch::Moved && resolvingAhead())) {
                             ++freeDiffering;
                             continue;
                         }
@@ -78,6 +79,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                         rank = i;
                         dataHit = result == EntryOutcome::EqualData;
                         hitMoved = moved && checked == &*moved;
+                        hitMask = hitMoved ? movedMask : 0;
                         break;
                     }
                 }
@@ -170,7 +172,13 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 if (freeWords != 0) {
                     freeHit = true;
                     ++counters.freeHits;
-                    if (hitMoved) ++counters.freeHitsMoved;
+                    if (hitMoved) {
+                        ++counters.freeHitsMoved;
+                        bool pushes = false, data = false;
+                        compiledResult = PatchDispatchUserWords(*compiledResult, userData, hitMask, pushes, data);
+                        movedWords = hitMask;
+                        dataHit = dataHit || data;
+                    }
                 }
                 ++dispatchCacheHits;
                 if (untouched) {

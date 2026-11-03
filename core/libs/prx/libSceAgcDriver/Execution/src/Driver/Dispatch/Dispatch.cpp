@@ -413,6 +413,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     bool cached = false;
     bool validated = false;
     bool freeHit = false;
+    std::uint64_t movedWords = 0;
 
     std::shared_ptr<DispatchEntry> missedEntry;
     bool missedDiffering = false;
@@ -479,7 +480,8 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                         continue;
                     }
                     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
-                    const auto match = MatchDispatchUserWords(*variant, userData, runs);
+                    std::uint64_t moved = 0;
+                    const auto match = MatchDispatchUserWords(*variant, userData, runs, moved);
                     if (match == UserWordsMatch::Same) appendEntryRegions(*variant, reads);
                     if (match != UserWordsMatch::Moved) continue;
                     std::size_t offset = 0;
@@ -521,14 +523,16 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         groupStats.ageMaxMs = std::max(groupStats.ageMaxMs, age);
         phaseTiming.Phase(PhaseLookup);
     } else {
-        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, userData, freeWords, freeHit, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
+        lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, userData, freeWords, freeHit, movedWords, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
     }
     timing.Mark("lookup_cache");
+    auto hitRecipe = cached && keepVariant != nullptr ? keepVariant->recipe.load(std::memory_order_acquire) : nullptr;
+    if (movedWords != 0 && hitRecipe != nullptr) hitRecipe = MovedRecipe(*hitRecipe, *compiledResult);
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
     bool missItem = false;
     if (readsClear) {
-        if (cached && keepVariant != nullptr && keepVariant->recipe.load(std::memory_order_acquire) != nullptr) {
+        if (cached && hitRecipe != nullptr) {
             bool bounded = false;
             itemWrites = DispatchWriteRanges(*compiledResult, bounded);
             pipelined = bounded && !NoDispatchItems();
@@ -703,11 +707,12 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     phaseTiming.Phase(PhaseSnapshots);
 
     if (pipelined) {
-        const auto recipe = keepVariant->recipe.load(std::memory_order_acquire);
+        const auto recipe = hitRecipe;
+        const bool moved = movedWords != 0;
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
-        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), captured = std::move(captured), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, epoch, htileClearCompletion, htileMask] {
+        DrawPipeline::Queue0().Enqueue([this, localDevice = std::move(localDevice), result = compiledResult, snapshots = std::move(snapshots), captured = std::move(captured), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, dataHit, moved, epoch, htileClearCompletion, htileMask] {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(0x15, queueId);
             const auto& compiledCommit = *result;
@@ -742,7 +747,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                     break;
                 }
                 if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, queueId, compiledCommit);
-                if (builtRecipe != nullptr) {
+                if (builtRecipe != nullptr && !moved) {
                     if (dataHit) {
                         auto own = std::make_shared<Recipe>(*builtRecipe);
                         own->dataWordsHash = Graphics::ShaderResources::DataWordsHash({ShaderRecompiler::ShaderStage::Compute, keepVariant->compiled.get(), 0});
@@ -764,7 +769,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     if (missItem) {
         const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
-        auto attachTo = keepVariant != nullptr ? keepVariant : attachVariant;
+        auto attachTo = movedWords != 0 ? nullptr : keepVariant != nullptr ? keepVariant : attachVariant;
         missItemCommits.fetch_add(1, std::memory_order_relaxed);
         // The item's captured regions and their snapshots, shared by its preparation and its commit: a
         // deferred build keeps a span of the snapshots until Complete(), so both use the same vector.
@@ -856,12 +861,12 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
 
     std::shared_ptr<RecipeHit> recipeHit;
     if (cached && keepVariant != nullptr && !stampValidate()) {
-        recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(keepVariant->recipe.load(std::memory_order_acquire), indirectArguments != 0);
+        recipeHit = htileClearCompletion.has_value() ? nullptr : localDevice->PrepareRecipe(hitRecipe, indirectArguments != 0);
         phaseTiming.Phase(PhaseRecipePrecheck);
     }
 
     std::shared_ptr<const Recipe> builtRecipe;
-    auto* const attachTo = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
+    auto* const attachTo = stampValidate() || movedWords != 0 ? nullptr : keepVariant != nullptr ? keepVariant.get() : attachVariant.get();
     bool writersNoted = false;
     const bool noteWrites = writeEvidenceEnabled() || traceCapSync();
     const auto keysFill = indirectArguments == 0 && !partialLastGroup ? MatchSgprPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) : std::nullopt;

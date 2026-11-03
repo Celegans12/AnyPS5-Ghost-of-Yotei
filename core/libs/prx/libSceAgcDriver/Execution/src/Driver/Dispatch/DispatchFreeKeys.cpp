@@ -1,7 +1,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include <algorithm>
+#include <array>
 #include <cstdlib>
+#include <cstring>
 
 namespace AgcDriver::DriverDetail {
 
@@ -15,11 +18,20 @@ std::uint64_t WordsBelow(std::size_t count) {
 
 }
 
-std::uint64_t FreeDispatchUserWords(const ShaderRecompiler::SrtUserDataUse& use, std::uint64_t registerReads, std::uint64_t relocatable, std::size_t userCount) {
+std::uint64_t PatchableUserWords(const ShaderRecompiler::RecompileResult& compiled) {
+    if (std::any_of(compiled.bindings.begin(), compiled.bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; })) return 0;
+    std::uint64_t words = 0;
+    for (const auto word : compiled.shaderDataUserWords) {
+        if (word < 64) words |= std::uint64_t{1} << word;
+    }
+    return words;
+}
+
+std::uint64_t FreeDispatchUserWords(const ShaderRecompiler::SrtUserDataUse& use, std::uint64_t registerReads, std::uint64_t patchable, std::uint64_t relocatable, std::size_t userCount) {
     const auto walked = use.asBase | use.asValue;
     if (walked == 0 || userCount > 64) return 0;
     const auto words = WordsBelow(userCount);
-    return (words & ~(walked | registerReads)) | (relocatable & ~registerReads & ~use.asValue & use.asBase & words);
+    return (words & ~(walked | registerReads)) | (relocatable & ~(registerReads & ~patchable) & ~use.asValue & use.asBase & words);
 }
 
 std::uint64_t MixDispatchUserWords(std::uint64_t key, std::span<const std::uint32_t> userData, std::uint64_t freeWords) {
@@ -39,9 +51,9 @@ std::uint64_t MixDispatchUserWords(std::uint64_t key, std::span<const std::uint3
     return key;
 }
 
-UserWordsMatch MatchDispatchUserWords(const DispatchVariant& variant, std::span<const std::uint32_t> userData, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs) {
+UserWordsMatch MatchDispatchUserWords(const DispatchVariant& variant, std::span<const std::uint32_t> userData, std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs, std::uint64_t& moved) {
+    moved = 0;
     if (variant.userData.size() != userData.size() || userData.size() > 64) return UserWordsMatch::Differs;
-    std::uint64_t moved = 0;
     for (std::size_t i = 0; i < userData.size(); ++i) {
         const auto from = variant.userData[i];
         const auto to = userData[i];
@@ -62,6 +74,40 @@ UserWordsMatch MatchDispatchUserWords(const DispatchVariant& variant, std::span<
         runs[run].second += delta;
     }
     return UserWordsMatch::Moved;
+}
+
+std::shared_ptr<const ShaderRecompiler::RecompileResult> PatchDispatchUserWords(const ShaderRecompiler::RecompileResult& compiled, std::span<const std::uint32_t> userData, std::uint64_t moved, bool& pushes, bool& data) {
+    pushes = false;
+    data = false;
+    auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(compiled);
+    const auto& forwarded = compiled.shaderDataUserWords;
+    for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
+        const auto word = forwarded[slot];
+        if (word >= 64 || word >= userData.size() || (moved >> word & 1u) == 0) continue;
+        const auto value = userData[word];
+        const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
+        if (at + sizeof(std::uint32_t) <= patched->pushConstants.size()) {
+            std::memcpy(patched->pushConstants.data() + at, &value, sizeof(value));
+            pushes = true;
+        }
+        for (auto& binding : patched->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::ShaderData || slot >= binding.guestDescriptor.size()) continue;
+            binding.guestDescriptor[slot] = value;
+            data = true;
+        }
+    }
+    return patched;
+}
+
+std::shared_ptr<const Recipe> MovedRecipe(const Recipe& recipe, const ShaderRecompiler::RecompileResult& compiled) {
+    auto moved = std::make_shared<Recipe>(recipe);
+    if (!recipe.pushes) return moved;
+    const auto resources = recipe.templateRef.lock();
+    if (resources == nullptr) return nullptr;
+    const std::array<Graphics::CompiledShader, 1> shaders{{{ShaderRecompiler::ShaderStage::Compute, &compiled, 0}}};
+    moved->pushBytes = Graphics::AssemblePushConstants(shaders);
+    resources->PatchPushConstants(moved->pushBytes);
+    return moved;
 }
 
 bool Driver::freeDispatchKeys() {

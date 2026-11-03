@@ -35,11 +35,12 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
         const bool freeKeys = freeDispatchKeys() && capture != nullptr;
         std::uint64_t freeWords = 0;
         if (freeKeys) {
+            const auto patchable = PatchableUserWords(*compiledResult);
             auto use = capture->userDataUse;
-            use.asValue |= compiledResult->userDataRegisterReads;
+            use.asValue |= compiledResult->userDataRegisterReads & ~patchable;
             fresh->words.reserve(capturedWords);
             tagVariantRuns(*fresh, srtRegions, use, true, 0, supplied);
-            freeWords = FreeDispatchUserWords(capture->userDataUse, compiledResult->userDataRegisterReads, fresh->relocatableWords, userData.size());
+            freeWords = FreeDispatchUserWords(capture->userDataUse, compiledResult->userDataRegisterReads, patchable, fresh->relocatableWords, userData.size());
             fresh->relocatableWords &= freeWords;
             fresh->userData.assign(userData.begin(), userData.end());
             fresh->exactUserWords = ~freeWords;

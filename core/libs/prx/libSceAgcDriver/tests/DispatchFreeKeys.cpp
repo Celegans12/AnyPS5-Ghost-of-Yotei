@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include <array>
 #include <cstdio>
+#include <cstring>
 #include <stdexcept>
 #include <vector>
 
@@ -9,6 +10,8 @@ using AgcDriver::DriverDetail::DispatchVariant;
 using AgcDriver::DriverDetail::FreeDispatchUserWords;
 using AgcDriver::DriverDetail::MatchDispatchUserWords;
 using AgcDriver::DriverDetail::MixDispatchUserWords;
+using AgcDriver::DriverDetail::PatchableUserWords;
+using AgcDriver::DriverDetail::PatchDispatchUserWords;
 using AgcDriver::DriverDetail::UserWordsMatch;
 using Runs = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
 
@@ -31,12 +34,39 @@ void testFreeWords() {
     ShaderRecompiler::SrtUserDataUse use;
     use.asBase = 0x1u;
     use.asValue = 0x6u;
-    check(FreeDispatchUserWords(use, 0x8u, 0x1u, 6) == 0x31u, "a base-only word and the words nothing reads are free");
-    check(FreeDispatchUserWords(use, 0x9u, 0x1u, 6) == 0x30u, "a base word the shader also reads stays in the key");
-    check(FreeDispatchUserWords(use, 0x8u, 0x0u, 6) == 0x30u, "a base word whose reads were not tagged stays in the key");
+    check(FreeDispatchUserWords(use, 0x8u, 0x8u, 0x1u, 6) == 0x31u, "a base-only word or a word nothing reads stayed in the key");
+    check(FreeDispatchUserWords(use, 0x9u, 0x8u, 0x1u, 6) == 0x30u, "a base word the shader reads without a shader-data slot was left out of the key");
+    check(FreeDispatchUserWords(use, 0x9u, 0x9u, 0x1u, 6) == 0x31u, "a base word the shader reads through a shader-data slot stayed in the key");
+    check(FreeDispatchUserWords(use, 0x8u, 0x8u, 0x0u, 6) == 0x30u, "a base word whose reads were not tagged stays in the key");
     use.asValue = 0x7u;
-    check(FreeDispatchUserWords(use, 0x8u, 0x1u, 6) == 0x30u, "a base word also used as a value stays in the key");
-    check(FreeDispatchUserWords({}, 0x0u, 0x0u, 6) == 0u, "a walk that recorded no user-data use frees no word");
+    check(FreeDispatchUserWords(use, 0x9u, 0x9u, 0x1u, 6) == 0x30u, "a base word also used as a value stays in the key");
+    check(FreeDispatchUserWords({}, 0x0u, 0x0u, 0x0u, 6) == 0u, "a walk that recorded no user-data use frees no word");
+}
+
+void testPatch() {
+    ShaderRecompiler::RecompileResult compiled;
+    compiled.shaderDataUserWords = {0u, 1u, 3u};
+    check(PatchableUserWords(compiled) == 0xbu, "the shader-data slots do not name their user words");
+    const std::array<std::uint32_t, 3> pushed{0x1000u, 0x55u, 0x77u};
+    compiled.pushConstants.resize(sizeof(pushed));
+    std::memcpy(compiled.pushConstants.data(), pushed.data(), sizeof(pushed));
+    bool pushes = false, data = false;
+    const std::vector<std::uint32_t> userData{0x1060u, 0x66u, 0x0u, 0x88u};
+    auto patched = PatchDispatchUserWords(compiled, userData, 0x1u, pushes, data);
+    std::array<std::uint32_t, 3> words{};
+    std::memcpy(words.data(), patched->pushConstants.data(), sizeof(words));
+    check(pushes && !data && words == std::array<std::uint32_t, 3>{0x1060u, 0x55u, 0x77u}, "only the moved word's push constant slot takes the new value");
+    compiled.pushConstants.clear();
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.role = ShaderRecompiler::DescriptorRole::ShaderData;
+    binding.guestDescriptor = {0x1000u, 0x55u, 0x77u};
+    compiled.bindings.push_back(binding);
+    patched = PatchDispatchUserWords(compiled, userData, 0x9u, pushes, data);
+    check(!pushes && data && patched->bindings.front().guestDescriptor == std::vector<std::uint32_t>{0x1060u, 0x55u, 0x88u}, "the moved words' shader-data slots were not patched");
+    check(compiled.bindings.front().guestDescriptor.front() == 0x1000u, "patching changed the cached result");
+    binding.role = ShaderRecompiler::DescriptorRole::BdaPagetable;
+    compiled.bindings.push_back(binding);
+    check(PatchableUserWords(compiled) == 0u, "a shader with a BDA page table may read a moved word as an address");
 }
 
 void testKeys() {
@@ -71,18 +101,19 @@ void testMatch() {
     check(variant.relocatableWords == 0x1u, "the base word was not tagged relocatable");
     const auto low = static_cast<std::uint32_t>(tableAddress);
     variant.userData = {low, 0x55u, 0x77u};
-    variant.exactUserWords = ~FreeDispatchUserWords(use, 0x0u, variant.relocatableWords, 3);
+    variant.exactUserWords = ~FreeDispatchUserWords(use, 0x0u, 0x0u, variant.relocatableWords, 3);
     Runs runs;
-    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low, 0x55u, 0x77u}, runs) == UserWordsMatch::Same, "equal words did not match");
-    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low, 0x55u, 0x99u}, runs) == UserWordsMatch::Same, "a word nothing reads decided the match");
-    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low, 0x56u, 0x77u}, runs) == UserWordsMatch::Differs, "a value word that changed matched");
-    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low, 0x55u}, runs) == UserWordsMatch::Differs, "another user-data count matched");
-    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low + 2u, 0x55u, 0x77u}, runs) == UserWordsMatch::Differs, "a base moved by a non-dword step matched");
-    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{0u, 0x55u, 0x77u}, runs) == UserWordsMatch::Differs, "a base that became 0 matched");
+    std::uint64_t moved = 0;
+    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low, 0x55u, 0x77u}, runs, moved) == UserWordsMatch::Same, "equal words did not match");
+    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low, 0x55u, 0x99u}, runs, moved) == UserWordsMatch::Same, "a word nothing reads decided the match");
+    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low, 0x56u, 0x77u}, runs, moved) == UserWordsMatch::Differs, "a value word that changed matched");
+    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low, 0x55u}, runs, moved) == UserWordsMatch::Differs, "another user-data count matched");
+    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low + 2u, 0x55u, 0x77u}, runs, moved) == UserWordsMatch::Differs, "a base moved by a non-dword step matched");
+    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{0u, 0x55u, 0x77u}, runs, moved) == UserWordsMatch::Differs, "a base that became 0 matched");
     for (const std::uint32_t step : {0x60u, 0xffffffa0u}) {
         runs.clear();
-        check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low + step, 0x55u, 0x77u}, runs) == UserWordsMatch::Moved, "a moved base did not match as moved");
-        check(runs.size() == variant.runs.size(), "the moved runs are not the variant's runs");
+        check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low + step, 0x55u, 0x77u}, runs, moved) == UserWordsMatch::Moved, "a moved base did not match as moved");
+        check(runs.size() == variant.runs.size() && moved == 0x1u, "the moved runs are not the variant's runs");
         const auto delta = static_cast<std::uint64_t>((low + step) & ~3u) - static_cast<std::uint64_t>(low & ~3u);
         std::size_t shifted = 0;
         for (std::size_t run = 0; run < runs.size(); ++run) {
@@ -94,7 +125,7 @@ void testMatch() {
         check(shifted == 1u, "the base's three words are not one moved run");
     }
     variant.userData.clear();
-    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low, 0x55u, 0x77u}, runs) == UserWordsMatch::Differs, "a variant without recorded user data matched under a free key");
+    check(MatchDispatchUserWords(variant, std::vector<std::uint32_t>{low, 0x55u, 0x77u}, runs, moved) == UserWordsMatch::Differs, "a variant without recorded user data matched under a free key");
 }
 
 }
@@ -102,6 +133,7 @@ void testMatch() {
 int main() {
     try {
         testFreeWords();
+        testPatch();
         testKeys();
         testMatch();
         std::puts("Dispatch free keys passed");
