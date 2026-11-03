@@ -3,17 +3,27 @@
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 #include <cstdint>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
 // Debug markers are custom NOP packets: PUSH carries the NUL-terminated text, POP has no payload.
 // Marker colors are only meaningful to capture tools and are not encoded.
+// APS5_NO_AGC_MARKERS=1 encodes no markers at all: Push, PushSpan and Pop allocate nothing and return the cursor.
+// Ghost of Yotei (PPSA26344) pops a marker from one thread through a command buffer copy whose cursor
+// another thread has already written past; the 2-word POP lands over the first words of that thread's
+// packet and the submission no longer parses (an early-boot "unsupported PM4 packet type").
 namespace {
 
 constexpr std::uint32_t OpcodeNop = 0x10;
 constexpr std::uint32_t CustomPushMarker = 0x0b;
 constexpr std::uint32_t CustomPopMarker = 0x0c;
+
+bool MarkersEncoded() {
+    static const bool encoded = std::getenv("APS5_NO_AGC_MARKERS") == nullptr;
+    return encoded;
+}
 
 }
 
@@ -21,6 +31,7 @@ namespace Agc::Marker {
 
 std::uint32_t* Push(CommandBuffer* buf, const char* str, const char* function) {
     Agc::Command::Require(buf != nullptr, function, "null command buffer");
+    if (!MarkersEncoded()) return buf->cursor_up;
     const char* text = str ? str : "";
     const std::size_t length = std::strlen(text);
     Agc::Command::Require(length < 0x10000u, function, "marker text too long");
@@ -30,6 +41,7 @@ std::uint32_t* Push(CommandBuffer* buf, const char* str, const char* function) {
 std::uint32_t* PushSpan(CommandBuffer* buf, const char* str, std::uint32_t length, const char* function) {
     Agc::Command::Require(buf != nullptr, function, "null command buffer");
     Agc::Command::Require(str != nullptr || length == 0, function, "null marker text");
+    if (!MarkersEncoded()) return buf->cursor_up;
     const std::size_t bytes = std::size_t{length} + 1;
     const auto payload = static_cast<std::uint32_t>((bytes + 3) / 4);
     Agc::Command::Require(payload <= 0x4000u, function, "marker text too long");
@@ -42,6 +54,7 @@ std::uint32_t* PushSpan(CommandBuffer* buf, const char* str, std::uint32_t lengt
 
 std::uint32_t* Pop(CommandBuffer* buf, const char* function) {
     Agc::Command::Require(buf != nullptr, function, "null command buffer");
+    if (!MarkersEncoded()) return buf->cursor_up;
     auto* packet = Agc::Command::Allocate(buf, 2, function);
     packet[0] = Agc::Command::Header(OpcodeNop, 2, CustomPopMarker << 2);
     packet[1] = 0;

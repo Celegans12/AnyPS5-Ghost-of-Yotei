@@ -77,8 +77,10 @@ if(BUILD_TESTING)
     set_target_properties(agc_command_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_initialization COMMAND agc_command_tests defaults)
     add_test(NAME agc_commands COMMAND agc_command_tests)
+    add_test(NAME agc_markers_off COMMAND agc_command_tests no-markers)
+    set_tests_properties(agc_markers_off PROPERTIES ENVIRONMENT "APS5_NO_AGC_MARKERS=1")
     if(WIN32)
-        set_tests_properties(agc_initialization agc_commands PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_initialization agc_commands agc_markers_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

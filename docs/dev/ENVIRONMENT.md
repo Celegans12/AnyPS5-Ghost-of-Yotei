@@ -66,6 +66,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 
 | Name | Kind | Source | Default | Description |
 |------|------|--------|---------|-------------|
+| `APS5_NO_AGC_MARKERS` | presence | `core/libs/prx/libSceAgc/DcbState/src/Marker.cpp` |  | encodes no debug markers: the push, push-span and pop marker functions (DCB and ACB) allocate nothing in the command buffer and return its cursor |
 | `APS5_TRACE_LABEL` | integer | `core/libs/prx/libSceAgc/Cb/src/Sync.cpp`, `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Synchronization/LabelHistory.cpp` | 0 | hex guest address; logs a matching RELEASE_MEM when recorded, and nearby RELEASE_MEM, WRITE_DATA, COPY_DATA, DMA_DATA and WAIT_REG_MEM packets when executed |
 
 ### libSceAgcDriver

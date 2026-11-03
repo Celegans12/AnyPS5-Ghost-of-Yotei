@@ -221,6 +221,23 @@ void testMarkerSpans() {
     expectFailure([&] { sceAgcDcbPushMarkerSpan(&dcb.buffer, nullptr, 4, 0); });
 }
 
+// Run as "no-markers" with APS5_NO_AGC_MARKERS=1 (the switch is read once per process).
+void testMarkersOff() {
+    Storage acb;
+    Storage dcb;
+    const auto before = acb.words;
+    check(sceAgcAcbPushMarker(&acb.buffer, "frame", 0) == acb.words.data() && sceAgcAcbPopMarker(&acb.buffer) == acb.words.data(), "a marker off returned something other than the cursor");
+    check(sceAgcAcbSetMarker(&acb.buffer, "frame", 0) == acb.words.data() && sceAgcDcbSetMarker(&dcb.buffer, "frame", 0) == dcb.words.data(), "a set marker off returned something other than the cursor");
+    sceAgcDcbPushMarker(&dcb.buffer, "frame", 0);
+    sceAgcDcbPopMarker(&dcb.buffer);
+    const char text[] = "frame";
+    check(sceAgcAcbPushMarkerSpan(&acb.buffer, text, 5, 0) == acb.words.data() && sceAgcDcbPushMarkerSpan(&dcb.buffer, text, 5, 0) == dcb.words.data(), "a marker span off returned something other than the cursor");
+    check(sceAgcAcbSetMarkerSpan(&acb.buffer, text, 5, 0) == acb.words.data() && sceAgcDcbSetMarkerSpan(&dcb.buffer, text, 5, 0) == dcb.words.data(), "a set marker span off returned something other than the cursor");
+    check(acb.buffer.cursor_up == acb.words.data() && dcb.buffer.cursor_up == dcb.words.data(), "a marker off advanced the cursor");
+    check(acb.words == before && dcb.words == before, "a marker off wrote packet memory");
+    expectFailure([] { sceAgcAcbPopMarker(nullptr); });
+}
+
 void testWorkloads() {
     Storage dcb;
     const std::uint32_t ids[2] = {3, 4};
@@ -810,6 +827,12 @@ int main(int argc, char** argv) {
             testDefaultsTypes();
             LibcRunShutdown_nid_postfix();
             std::puts("AGC initialization tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::strcmp(argv[1], "no-markers") == 0) {
+            testMarkersOff();
+            LibcRunShutdown_nid_postfix();
+            std::puts("AGC marker-off tests passed");
             return 0;
         }
         testPackets();
