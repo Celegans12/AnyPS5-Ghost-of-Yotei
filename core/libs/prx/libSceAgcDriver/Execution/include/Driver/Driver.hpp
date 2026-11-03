@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawAhead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchTiming.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/MissAhead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawTiming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/IndirectDispatch.hpp"
@@ -69,6 +70,7 @@ public:
     void WaitIdle();
     std::uint64_t DispatchesAdoptedAhead() const;
     std::uint64_t DispatchesRejectedAhead() const;
+    static std::pair<std::uint64_t, std::uint64_t> MissAheadTotals();
     void SetAheadAdoptHook(void (*hook)());
     void CheckFailure();
     void ReportFailure(std::exception_ptr error);
@@ -389,6 +391,14 @@ private:
     static bool& resolvingAhead();
     static bool& gateOpened();
     void resolveGroupAhead(const Submission& submission, const QueueState& live, std::size_t from);
+    static MissAheadPlan*& missAheadPlan();
+    static MissAheadLedger& missAheadLedger();
+    static MissAheadKnown& missAheadKnown();
+    static bool missAheadEnabled();
+    static bool missAheadProfiled();
+    static void reportMissAhead();
+    void missAhead(const Submission& submission, const QueueState& live, std::size_t from);
+    void prepareMissAhead(const std::shared_ptr<const ShaderSnapshot>& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t key, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t address);
     static void clearResolvedAhead();
     static void reportGroupCapture(std::uint32_t queue);
     static PollStats& pollStats();
@@ -466,6 +476,9 @@ private:
 
     std::uint64_t dispatchCacheVariants = 0;
     std::uint64_t dispatchCacheVariantBytes = 0;
+    std::unordered_set<std::uint64_t> dispatchGhostKeys;
+    std::deque<std::uint64_t> dispatchGhostOrder;
+    void noteDispatchEvicted(std::uint64_t key);
 
     EntryCounters entryCounters;
 

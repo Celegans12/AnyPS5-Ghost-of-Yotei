@@ -1643,6 +1643,7 @@ struct SplitCounters {
     std::atomic<std::uint64_t> prepared{0};
     std::atomic<std::uint64_t> cachedAtPrepare{0};
     std::atomic<std::uint64_t> addressTables{0};
+    std::atomic<std::uint64_t> addressStageA{0};
     std::atomic<std::uint64_t> forgetInChange{0};
     std::atomic<std::uint64_t> stageA{0};
     std::atomic<std::uint64_t> stageAFailed{0};
@@ -1671,6 +1672,7 @@ void reportSplits() {
     const auto prepared = take(c.prepared);
     const auto cached = take(c.cachedAtPrepare);
     const auto address = take(c.addressTables);
+    const auto addressStageA = take(c.addressStageA);
     const auto inChange = take(c.forgetInChange);
     const auto stageA = take(c.stageA);
     const auto failed = take(c.stageAFailed);
@@ -1682,7 +1684,11 @@ void reportSplits() {
     const auto other = take(c.staleOther);
     const auto locked = take(c.lockedBuilds);
     const auto keys = take(c.keyReused);
-    std::fprintf(stderr, "[split] draws prepared (10 s): %llu (cache entry then %llu, address tables %llu, forget serial in change %llu); stage A built %llu in %.1f ms (%llu refused); at the draw: %llu builds completed from stage A, %llu served by the cache instead, discarded as stale %llu (forget serial %llu, registry %llu, other %llu); %llu builds made under the lock; %llu keys reused\n", prepared, cached, address, inChange, stageA, stageAMs, failed, used, served, forget + registry + other, forget, registry, other, locked, keys);
+    std::fprintf(stderr, "[split] draws prepared (10 s): %llu (cache entry then %llu, address tables left to the lock %llu, address-based stage A %llu, forget serial in change %llu); stage A built %llu in %.1f ms (%llu refused); at the draw: %llu builds completed from stage A, %llu served by the cache instead, discarded as stale %llu (forget serial %llu, registry %llu, other %llu); %llu builds made under the lock; %llu keys reused\n", prepared, cached, address, addressStageA, inChange, stageA, stageAMs, failed, used, served, forget + registry + other, forget, registry, other, locked, keys);
+    {
+        const auto& o = CachedAcquireOutcomes();
+        std::fprintf(stderr, "[split] address-based stage A (cumulative): taken %llu, refused: cache off %llu, no space %llu, writable mirrors %llu, heap mirrors %llu, sparse mirrors %llu, stale %llu\n", static_cast<unsigned long long>(o[0].load()), static_cast<unsigned long long>(o[1].load()), static_cast<unsigned long long>(o[2].load()), static_cast<unsigned long long>(o[3].load()), static_cast<unsigned long long>(o[4].load()), static_cast<unsigned long long>(o[5].load()), static_cast<unsigned long long>(o[6].load()));
+    }
 }
 
 }
@@ -1691,7 +1697,7 @@ bool SplitDrawBuild() {
     return !RuntimeSwitches::Set(RuntimeSwitch::NoSplitDrawBuild);
 }
 
-std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots) {
     if (!SplitDrawBuild()) return nullptr;
     auto& counters = Splits();
     counters.prepared.fetch_add(1, std::memory_order_relaxed);
@@ -1723,14 +1729,19 @@ std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& s
             if (!buildCached) return prepared;
         }
     }
-    if (ShaderResources::StagesUseAddressTables(shaders)) {
+    // C29: an address-based draw's stage A runs here too unless APS5_NO_BDA_DRAW_SPLIT=1 (a runtime
+    // switch), taking the cached address space without the lock; the commit's staleness checks below
+    // (forget serial, registry generation) and UploadFinish's imports epoch check cover it as well.
+    const bool addressTables = ShaderResources::StagesUseAddressTables(shaders);
+    if (addressTables && RuntimeSwitches::Set(RuntimeSwitch::NoBdaDrawSplit)) {
         counters.addressTables.fetch_add(1, std::memory_order_relaxed);
         return prepared;
     }
     const auto start = std::chrono::steady_clock::now();
     try {
-        prepared->resources = std::make_shared<ShaderResources>(DeferredDrawBuild{}, context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(prepared->indexBytes));
+        prepared->resources = std::make_shared<ShaderResources>(DeferredDrawBuild{}, context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, static_cast<std::size_t>(prepared->indexBytes), snapshots, addressTables);
         counters.stageA.fetch_add(1, std::memory_order_relaxed);
+        if (addressTables) counters.addressStageA.fetch_add(1, std::memory_order_relaxed);
     } catch (...) {
         // The draw builds under the lock and reports the refusal in order.
         prepared->resources.reset();
@@ -1963,9 +1974,11 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             // CPU once per frame (~1.4 ms, best434). APS5_NO_GPU_WRITTEN_INDEX_ESTIMATE=1 (runtime switch) scans.
             if (const auto zeroFrom = ZeroFetchVertex(shaders.front().program->vertexAttributes)) {
                 const auto limit = *zeroFrom > draw.firstVertex ? *zeroFrom - draw.firstVertex : 0u;
-                GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
-                if (const auto kept = context.recorder->GpuWrittenHighestIndex(draw.indexAddress, static_cast<std::size_t>(indexBytes), use); kept && *kept && **kept >= limit && **kept - limit >= ZeroFetchSlack) {
-                    highest = *kept;
+                // Collected (CPU stores become block stamps) only when an entry is kept: the scan below collects again.
+                const bool kept = context.recorder->KeptHighestIndexGeneration(draw.indexAddress, static_cast<std::size_t>(indexBytes), use) != 0;
+                if (kept) GuestMemory::CollectWrites(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+                if (const auto stale = kept ? context.recorder->GpuWrittenHighestIndex(draw.indexAddress, static_cast<std::size_t>(indexBytes), use) : std::nullopt; stale && *stale && **stale >= limit && **stale - limit >= ZeroFetchSlack) {
+                    highest = *stale;
                     estimated = true;
                     countIndexEstimate();
                 }

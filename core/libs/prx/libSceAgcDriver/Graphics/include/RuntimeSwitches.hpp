@@ -89,6 +89,16 @@ enum class RuntimeSwitch : std::size_t {
     NoMovedInPlace,
     NoGpuWrittenIndexEstimate,
     NewPathNoC1,
+    NoLaneOpenWait,
+    NoResidentRanges,
+    NoPreparedDispatchItems,
+    NoBdaDrawSplit,
+    NoBdaDispatchSplit,
+    NoDispatchMissAhead,
+    NoWrittenShadowVramGate,
+    DeferLabelReadback,
+    DispatchCacheLarge,
+    ResourceCacheLarge,
     Count,
 };
 

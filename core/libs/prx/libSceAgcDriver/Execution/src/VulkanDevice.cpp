@@ -2656,7 +2656,11 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     static const bool storeAtLabel = Graphics::StorageTexture::StoreAtLabelRequested(std::getenv("APS5_STORE_AT_LABEL"));
     if (storeAtLabel) Graphics::StorageTexture::FlushAllPending("label");
     if (queue == 0) static_cast<void>(Graphics::StorageTexture::StoreDrawnLinear("label"));
-    Graphics::StorageTexture::StoreReadbackBeforeLabel("readback before label");
+    static const bool drainLabels = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
+    const bool deferReadback = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::DeferLabelReadback) && !drainLabels && Graphics::Recorder::LaneOfQueue(queue) == 0 && state->recorder && !bytes.empty() && bytes.size() <= 65536 && address % 4 == 0 && bytes.size() % 4 == 0 &&
+                               Graphics::HostImportFor(graphicsContext(), address, bytes.size()) != nullptr;
+    const auto deferredBefore = deferReadback ? Graphics::StorageTexture::DeferredLabelReadbacks() : 0;
+    Graphics::StorageTexture::StoreReadbackBeforeLabel(deferReadback ? Graphics::StorageTexture::DeferredLabelReadbackReason : "readback before label");
     if (!state->recorder || bytes.empty() || bytes.size() > 65536 || address % 4 != 0 || bytes.size() % 4 != 0) return 4;
     auto& recorder = *state->recorder;
     // Batches that already finished are retired before the checks: their completions ran, so they
@@ -2667,7 +2671,10 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // Debug aid: APS5_LABEL_REAP_ALL_QUEUES=1 reaps on every queue as before.
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
     if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
-    if (recorder.Idle()) return 1;
+    if (recorder.Idle()) {
+        if (deferReadback && Graphics::StorageTexture::DeferredLabelReadbacks() != deferredBefore) recorder.Sync();
+        return 1;
+    }
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
     const auto* import = Graphics::HostImportFor(context, address, bytes.size());
@@ -4663,7 +4670,16 @@ bool VulkanDevice::PrebuildGraphicsLibraries(const Graphics::ShaderStages& stage
         else group.push_back({ShaderRecompiler::ShaderStage::Fragment, fragmentStub.get(), Graphics::PipelinePushSlotBytes});
     }
     const auto layouts = Graphics::DescribeSetLayouts(context, group);
-    return Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
+    const bool built = Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
+    for (const auto& [depthFormat, stencilFormat] : Graphics::PipelineLibraryDepthFormats(context.device)) {
+        Graphics::DepthTarget depth{};
+        depth.format = depthFormat;
+        depth.extent = {1, 1};
+        depth.samples = 1;
+        state.depth = depth;
+        Graphics::Pipeline::Prebuild(context, state, Graphics::VertexInputLayout{}, layouts.View(), group);
+    }
+    return built;
 }
 
 std::shared_ptr<const Graphics::AheadDraw> VulkanDevice::PrepareAheadDraw(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const {
@@ -4686,12 +4702,12 @@ void VulkanDevice::Draw(const Graphics::State& graphics, const Pm4::DrawParamete
     if (traceDraws) APS5_LOG_CHARS_OUT("VulkanDevice::Draw complete");
 }
 
-std::shared_ptr<Graphics::PreparedDraw> VulkanDevice::PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) {
+std::shared_ptr<Graphics::PreparedDraw> VulkanDevice::PrepareDraw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots) {
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return nullptr;
         ShaderRecompiler::RuntimeAbi::RequireVersion(shader.program->runtimeAbiVersion);
     }
-    return Graphics::PrepareDraw(graphicsContext(), graphics, draw, shaders);
+    return Graphics::PrepareDraw(graphicsContext(), graphics, draw, shaders, snapshots);
 }
 
 namespace {
@@ -6898,6 +6914,9 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             if (arguments != 0) d.indirectHold.phaseCounts[PhaseResourcesInsert] += evicted.size();
         }
     };
+    // An address-based stage A that took the cached space without the mutex is dropped when the guest
+    // forgot memory or changed its allocations since (C31); the dispatch then builds as without one.
+    if (prepared != nullptr && prepared->resources != nullptr && prepared->resources->StaleUnlockedAddress()) prepared->resources.reset();
     if (prepared != nullptr && prepared->resources != nullptr) {
         // Stage A ran without the mutex (PrepareDispatch); stage B completes the build here.
         resources = std::move(prepared->resources);

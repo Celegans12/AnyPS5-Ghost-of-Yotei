@@ -243,12 +243,17 @@ public:
     void DeferAddressTable();
     bool AddressTableDeferred() const { return addressTableDeferred; }
     void EnsureAddressTable();
+    // Whether an address-based stage A made without the lock is stale (the guest forgot memory or
+    // changed its allocations since): the dispatch then builds afresh under the lock.
+    bool StaleUnlockedAddress() const;
     // S1 (APS5_NO_SPLIT_DRAW_BUILD=1 off): the draw build in two stages, as for dispatches: the
     // constructor runs stage A only (no device lock; no guest bytes are read: host copies wait for
-    // stage B), CompleteDraw() stage B under GuestMemory::GpuMutex. Address-based stages are refused
-    // (their lease and mirrors need the lock): callers check UsesAddressTables first. `shaders` must
-    // outlive CompleteDraw().
-    ShaderResources(DeferredDrawBuild, const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes);
+    // stage B), CompleteDraw() stage B under GuestMemory::GpuMutex. Address-based stages need
+    // `addressTables` (C29, APS5_NO_BDA_DRAW_SPLIT=1 off): stage A then takes the cached address space
+    // without the lock (GuestBufferMemory::AcquireRegisteredCached) and adds the draw's snapshots, and
+    // throws when the space cannot be taken that way (the caller builds under the lock). `shaders`
+    // must outlive CompleteDraw().
+    ShaderResources(DeferredDrawBuild, const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots = {}, bool addressTables = false);
     void CompleteDraw();
     static bool StagesUseAddressTables(std::span<const CompiledShader> shaders);
     bool Completed() const { return completed; }
@@ -633,7 +638,7 @@ private:
     void applyAnisoOverride();
     void forgetDeferredInputs();
     void release() noexcept;
-    void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots);
+    void prepareAddressBindings(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, bool unlocked = false);
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
     bool proveBuild(std::span<const CompiledShader> shaders, ProofReport* report);
@@ -837,6 +842,11 @@ private:
     std::span<const GuestMemorySnapshot> deferredSnapshots;
     // The deferred build is address-based: everything runs in Complete().
     bool lockedBuild = false;
+    // A deferred dispatch build whose address-based stage A took the cached space without the lock
+    // (APS5_NO_BDA_DISPATCH_SPLIT=1 off), and the guest's forget serial and registry generation then.
+    bool unlockedAddress = false;
+    std::uint64_t addressStageForget = 0;
+    std::uint64_t addressStageGeneration = 0;
     // Stage A runs without the device lock (a deferred, non-address-based build).
     bool unlockedPrepare = false;
     bool deferredDraw = false;

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
@@ -4285,6 +4286,46 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
     totals.snapshotsUs = 0;
 }
 
+std::array<std::atomic<std::uint64_t>, 7>& CachedAcquireOutcomes() {
+    static std::array<std::atomic<std::uint64_t>, 7> outcomes{};
+    return outcomes;
+}
+
+bool GuestBufferMemory::AcquireRegisteredCached() {
+    Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
+    // Outcomes (the [split] line): taken, cache off, no space, writable mirrors, heap mirrors, sparse
+    // mirrors, stale (device, generation or imports epoch).
+    auto& outcomes = CachedAcquireOutcomes();
+    const auto refuse = [&](std::size_t why) { outcomes[why].fetch_add(1, std::memory_order_relaxed); return false; };
+    if (!addressSpaceCacheEnabled()) return refuse(1);
+    ensurePinWaiter();
+    static const bool sortedLookup = std::getenv("APS5_NO_SORTED_SNAPSHOT_LOOKUP") == nullptr;
+    auto& spaces = Spaces();
+    // Read before the space is taken, as AcquireRegistered does: a mutation ending in between leaves
+    // the space stale by its generation, never newer than it.
+    const auto generation = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    auto current = spaces.current.load();
+    // Read-only mirrors need nothing per build (`mirrored` only counts the build and sweeps); the
+    // writable, heap and sparse ones are refreshed or compared per build, which needs the lock.
+    if (current == nullptr) return refuse(2);
+    if (!current->writableMirrors.empty()) return refuse(3);
+    if (!current->heapMirrors.empty()) return refuse(4);
+    if (!current->sparseMirrors.empty()) return refuse(5);
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        if (spaceMiss(context, current.get(), generation, state) != SpaceMiss::None) return refuse(6);
+        importFloor = state.useCounter + 1;
+        stampSpaceImports(*current, state);
+    }
+    spaces.hits.fetch_add(1, std::memory_order_relaxed);
+    outcomes[0].fetch_add(1, std::memory_order_relaxed);
+    space = std::move(current);
+    for (const auto& range : space->copied) addCopiedRange(range);
+    regionsSorted = sortedLookup;
+    return true;
+}
+
 void GuestBufferMemory::AcquireRegistered() {
     Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
     ensurePinWaiter();
@@ -5020,6 +5061,25 @@ std::uint64_t writtenShadowMax(bool discreteGpu) {
     return discreteGpu ? DiscreteWrittenShadowMax : std::uint64_t{2048} << 10u;
 }
 
+// Local: the gate is off unless APS5_WRITTEN_SHADOW_VRAM_DENOMINATOR is set (0 when unset). At PR #6's default of 2 it
+// fired on a 16 GB card at 1080p (usage ~11.7 GiB over half the heap) and cost ~17 % (adopt-ab, 2026-11-03).
+std::uint64_t writtenShadowVramDenominator() {
+    static const std::uint64_t denominator = [] {
+        const char* value = std::getenv("APS5_WRITTEN_SHADOW_VRAM_DENOMINATOR");
+        if (value == nullptr) return std::uint64_t{0};
+        const auto parsed = std::strtoull(value, nullptr, 10);
+        return parsed != 0 ? parsed : 2ull;
+    }();
+    return denominator;
+}
+
+bool writtenShadowAffordable(const Context& context) {
+    // APS5_NO_WRITTEN_SHADOW_VRAM_GATE (a runtime switch, for an in-run A/B) stages as before the gate.
+    if (writtenShadowVramDenominator() == 0 || RuntimeSwitches::Set(RuntimeSwitch::NoWrittenShadowVramGate)) return true;
+    auto& vram = GetBufferPool(context)->Vram();
+    return !vram.Enabled() || !vram.AtLeastFraction(1, writtenShadowVramDenominator());
+}
+
 std::uint64_t atomicStageMax() {
     static const std::uint64_t bytes = kibSetting("APS5_ATOMIC_STAGE_MAX_KIB", 1024);
     return bytes;
@@ -5087,6 +5147,116 @@ std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes,
         Copies().stagingRefused.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
+}
+
+// Resident ranges (APS5_NO_RESIDENT_RANGES=1 runtime switch: off). An exact staged range of the main
+// lane that keeps being copied in (the title menu: two 1 MiB ranges ~32 times a frame each, half of
+// ~17 GB of copy-ins per 10 s) gets one persistent device-local buffer, which fresh builds bind when
+// they prepare their upload. recordGpuCopies skips the copy-in while no stamp of any kind (a CPU store
+// collected, a copy-back, a write-back, a label) touched the range since the buffer last matched guest
+// memory: its own copy-in (the tracker generation then) or a build's copy-back (MarkDirectWrites, the
+// generation of its own marks, taken only when nothing else stamped the range in between).
+namespace {
+
+struct ResidentRange {
+    std::shared_ptr<Buffer> buffer;
+    // The generation at which the buffer last matched guest memory; 0: not since its creation.
+    std::uint64_t syncGeneration = 0;
+    std::uint64_t forgetSerial = 0;
+};
+
+struct ResidentRanges {
+    std::mutex mutex;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, ResidentRange> ranges;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> heat;
+    std::uint64_t promoted = 0, bound = 0, skipped = 0, skippedBytes = 0, copied = 0, invalidated = 0, otherLane = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+ResidentRanges& Residents() {
+    // Never destroyed (as GpuSources): a static destructor would release the resident buffers into the buffer
+    // pool after the device is gone at process exit (agc_frame_replay crashed there, Buffer::release ->
+    // BufferPool::Put).
+    static auto* ranges = new ResidentRanges;
+    return *ranges;
+}
+
+constexpr std::size_t ResidentLimit = 32;
+constexpr std::uint32_t ResidentPromoteAfter = 8;
+constexpr std::uint64_t ResidentMinBytes = 65536;
+
+void reportResidents(ResidentRanges& residents) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - residents.reported < std::chrono::seconds(10)) return;
+    residents.reported = now;
+    if (profile) std::fprintf(stderr, "[resident-ranges] (10 s) %zu resident, %llu promoted, %llu bound by builds, copy-ins %llu skipped (%.1f MiB) / %llu made, %llu invalidated by other stamps, %llu recorded on another lane\n", residents.ranges.size(), static_cast<unsigned long long>(residents.promoted), static_cast<unsigned long long>(residents.bound), static_cast<unsigned long long>(residents.skipped), residents.skippedBytes / 1048576.0, static_cast<unsigned long long>(residents.copied), static_cast<unsigned long long>(residents.invalidated), static_cast<unsigned long long>(residents.otherLane));
+    residents.promoted = residents.bound = residents.skipped = residents.skippedBytes = residents.copied = residents.invalidated = residents.otherLane = 0;
+    residents.heat.clear();
+}
+
+}
+
+// The resident buffer a fresh build of the main lane binds for the staged range [begin, end), made once
+// the range was copied in ResidentPromoteAfter times in a report window; nullptr otherwise.
+std::shared_ptr<Buffer> residentBuffer(const Context& context, std::uint64_t begin, std::uint64_t end) {
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoResidentRanges) || Recorder::ThreadLane() != 0 || end - begin < ResidentMinBytes) return nullptr;
+    auto& residents = Residents();
+    std::lock_guard lock(residents.mutex);
+    const auto forget = GuestMemory::ForgetSerial();
+    const std::pair key{begin, end};
+    if (const auto found = residents.ranges.find(key); found != residents.ranges.end()) {
+        if (found->second.forgetSerial == forget) {
+            ++residents.bound;
+            return found->second.buffer;
+        }
+        residents.ranges.erase(found);
+    }
+    if (++residents.heat[key] < ResidentPromoteAfter || residents.ranges.size() >= ResidentLimit) return nullptr;
+    auto buffer = stagingBuffer(context, static_cast<std::size_t>(end - begin), gpuCopyUsage(true) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    if (buffer == nullptr) return nullptr;
+    residents.ranges[key] = ResidentRange{buffer, 0, forget};
+    ++residents.promoted;
+    ++residents.bound;
+    return buffer;
+}
+
+// Whether a resident region's copy-in can be skipped: the entry still holds this buffer, the range is
+// on the main lane, and no stamp touched it since the buffer last matched guest memory.
+bool residentCurrent(std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer) {
+    // Switched off mid-run (APS5_AB): builds that bound the buffer before copy in as any staged region.
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoResidentRanges)) return false;
+    auto& residents = Residents();
+    std::lock_guard lock(residents.mutex);
+    reportResidents(residents);
+    const auto found = residents.ranges.find({begin, end});
+    if (found == residents.ranges.end() || found->second.buffer != buffer) return false;
+    if (Recorder::ThreadLane() != 0) {
+        ++residents.otherLane;
+        found->second.syncGeneration = 0;
+        return false;
+    }
+    if (found->second.syncGeneration == 0 || found->second.forgetSerial != GuestMemory::ForgetSerial()) return false;
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    static_cast<void>(GuestMemory::CollectWrites(begin, bytes));
+    if (!GuestMemory::UnchangedSince(begin, bytes, found->second.syncGeneration)) {
+        ++residents.invalidated;
+        found->second.syncGeneration = 0;
+        return false;
+    }
+    ++residents.skipped;
+    residents.skippedBytes += bytes;
+    return true;
+}
+
+// A resident region's copy-in was recorded: the buffer matches guest memory as of now.
+void residentCopied(std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer) {
+    auto& residents = Residents();
+    std::lock_guard lock(residents.mutex);
+    const auto found = residents.ranges.find({begin, end});
+    if (found == residents.ranges.end() || found->second.buffer != buffer) return;
+    ++residents.copied;
+    found->second.syncGeneration = Recorder::ThreadLane() == 0 ? GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin)) : 0;
 }
 
 // APS5_TRACE_STAGING=1: every distinct staged range once, with its size and whether an atomic
@@ -5164,7 +5334,7 @@ bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) 
     const auto bytes = region.end - region.begin;
     if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
-    return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(context.discreteGpu), context.discreteGpu ? DiscreteSweptShadowMax : SweptShadowMax) : writtenShadowMax(context.discreteGpu));
+    return writtenShadowEnabled() && writtenShadowAffordable(context) && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(context.discreteGpu), context.discreteGpu ? DiscreteSweptShadowMax : SweptShadowMax) : writtenShadowMax(context.discreteGpu));
 }
 
 bool GuestBufferMemory::overlayCandidate(const Region& inside, bool readOnly) const {
@@ -5382,7 +5552,9 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             const bool misaligned = !bindableInPlace(HostImportOffset(*entry, region.begin), addressable);
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
-                region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable) | (stagingDiffEnabled(context) ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
+                region.buffer = residentBuffer(context, region.begin, region.end);
+                region.resident = region.buffer != nullptr;
+                if (!region.resident) region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable) | (stagingDiffEnabled(context) ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
                 if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 if (region.buffer == nullptr) {
                     // No shadow to be had: in place when aligned, else the host copy below.
@@ -6240,7 +6412,15 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, address);
+        if (region->resident && region->deviceLocal && expected.empty() && residentCurrent(region->begin, region->end, region->buffer)) {
+            // The resident buffer already holds these bytes (see residentCurrent).
+            copiedBytes -= bytes;
+            recorder->Keep(region->buffer);
+            region->snapshot.clear();
+            continue;
+        }
         CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        if (region->resident) residentCopied(region->begin, region->end, region->buffer);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -6942,6 +7122,35 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {
+    // A resident region's copy-back leaves its buffer equal to guest memory when nothing else stamped the
+    // range since the buffer last matched it: its sync generation then moves to its own marks.
+    thread_local std::vector<std::pair<const Region*, bool>>* residentSlot = nullptr;
+    auto& resident = ShaderRecompiler::ThreadOwned(residentSlot);
+    resident.clear();
+    for (const auto& region : regions) {
+        if (!region.resident || !region.gpuCopy || !region.copiedBack) continue;
+        auto& residents = Residents();
+        std::lock_guard lock(residents.mutex);
+        const auto found = residents.ranges.find({region.begin, region.end});
+        if (found == residents.ranges.end() || found->second.buffer != region.buffer) continue;
+        resident.emplace_back(&region, found->second.syncGeneration != 0 && GuestMemory::UnchangedSince(region.begin, static_cast<std::size_t>(region.end - region.begin), found->second.syncGeneration));
+    }
+    const auto updateResidents = [&](std::uint64_t marked) {
+        if (resident.empty()) return;
+        auto& residents = Residents();
+        std::lock_guard lock(residents.mutex);
+        for (const auto& [region, current] : resident) {
+            const auto found = residents.ranges.find({region->begin, region->end});
+            if (found == residents.ranges.end() || found->second.buffer != region->buffer) continue;
+            if (!current) {
+                if (found->second.syncGeneration != 0) ++residents.invalidated;
+                found->second.syncGeneration = 0;
+            } else if (marked != 0) {
+                found->second.syncGeneration = std::max(found->second.syncGeneration, marked);
+            }
+        }
+    };
+    std::uint64_t marked = 0;
     std::vector<const Region*> sources;
     for (const auto& region : regions) {
         if (region.gpuSourceSince != 0 && region.gpuCopy && region.copiedBack && region.deviceLocal && region.buffer != nullptr) sources.push_back(&region);
@@ -6959,6 +7168,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
         const auto after = GuestMemory::MarkOwnWrites(marks, generations, checks);
         for (const auto generation : generations) {
             if (generation != 0) directWritesGeneration = std::max(directWritesGeneration, generation);
+            marked = std::max(marked, generation);
         }
         const bool registrable = after != 0 && Recorder::Active() != nullptr;
         const int lane = Recorder::ThreadLane();
@@ -6975,6 +7185,7 @@ void GuestBufferMemory::MarkDirectWrites() const {
             region->gpuSourceSince = 0;
             region->gpuSourceWords.clear();
         }
+        updateResidents(marked);
         return;
     }
     for (const auto& [begin, end] : writes) {
@@ -6984,8 +7195,10 @@ void GuestBufferMemory::MarkDirectWrites() const {
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) {
             const auto generation = GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin));
             if (generation != 0) directWritesGeneration = std::max(directWritesGeneration, generation);
+            marked = std::max(marked, generation);
         }
     }
+    updateResidents(marked);
 }
 
 namespace {
