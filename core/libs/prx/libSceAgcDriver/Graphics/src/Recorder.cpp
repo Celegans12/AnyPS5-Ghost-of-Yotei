@@ -2456,6 +2456,8 @@ void Recorder::ensureOpen() {
         }
         batch->waitOther = std::max(batch->waitOther, std::exchange(laneOwed[static_cast<std::size_t>(batch->lane)], 0));
         batch->openedAt = OpenSerial();
+        static std::atomic<std::uint64_t> identities{0};
+        batch->identity = identities.fetch_add(1, std::memory_order_relaxed) + 1u;
         NotePendingCommands(batch->commands, batch->lane);
         Checkpoint(batch->commands, CheckpointKind::BatchBegin, (static_cast<std::uint64_t>(batch->lane) << 48u) | batch->openedAt);
         if (countingSamples && !segmentMode()) beginSamples(*batch);

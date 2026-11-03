@@ -502,6 +502,8 @@ std::uint32_t BdaAnchorHolds(SpirvEmitterState& state, const SpirvEmitterState::
 void CollectBdaAnchors(SpirvEmitterState& state) {
     state.bdaAnchors.clear();
     if (!state.program.Info().usesDma || state.bdaProbeFunction == 0) return;
+    // SpirvTarget::watchedReads: anchored reads skip the lookup (and its watch check), so a watched module has none.
+    if (state.watchedReads) return;
     std::vector<std::pair<std::pair<std::uint32_t, std::uint32_t>, std::size_t>> bases;
     for (const IrValue* inst : BdaReadSites(state)) {
         const auto base = UserDataBase(state, *inst);

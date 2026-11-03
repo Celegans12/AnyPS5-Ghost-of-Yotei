@@ -128,6 +128,7 @@ struct SpirvEmitterState {
     bool fusedFma = false;
     // SpirvTarget::newPathResolved (see SpirvEmitter.hpp).
     bool newPathResolved = false;
+    bool watchedReads = false;
     // SpirvTarget::orderedWorkgroupWaves where it applies (OrderedWavesApply): a workgroup counter of returned
     // invocations, each console wave waiting at entry until every earlier wave has returned.
     bool orderedWorkgroupWaves = false;
@@ -189,6 +190,8 @@ struct SpirvEmitterState {
     std::uint32_t bdaWriteProbeFunction = 0;
     std::uint32_t bdaAtomicPointerFunction = 0;
     std::uint32_t bdaNoteWriteFunction = 0;
+    // SpirvTarget::watchedReads: note_watch_access (bound buffer footprint), 0 when absent.
+    std::uint32_t watchFootprintFunction = 0;
     std::array<std::uint32_t, 2> bdaByteWriteFunctions {};
     std::uint32_t bdaFaultFunction = 0;
     bool nativeF16ModesEmitted = false;

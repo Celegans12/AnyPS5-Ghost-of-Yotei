@@ -330,6 +330,7 @@ private:
         append(key, value.newPathResolved);
         append(key, value.bdaSegments);
         append(key, value.newPathRuntimeBuffers);
+        append(key, value.watchedReads);
         append(key, value.orderedWorkgroupWaves);
         append(key, value.fusedFma);
         append(key, value.robustBufferAccess2);

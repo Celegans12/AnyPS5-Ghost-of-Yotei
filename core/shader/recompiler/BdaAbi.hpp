@@ -179,6 +179,29 @@ inline constexpr std::uint32_t SrtGuardWord = WrittenListWord + WrittenPageSlots
 inline constexpr std::uint32_t SrtGuardStageShift = 24;
 inline constexpr std::size_t FaultBufferBytes = (SrtGuardWord + 1) * sizeof(std::uint32_t);
 static_assert((WrittenPageSlots & (WrittenPageSlots - 1)) == 0);
+// S4 cloth overlap watch list (SpirvTarget::watchedReads, old path only): after the fault buffer's words the driver
+// stores the count of watched ranges, the dispatch's own member index, two mask words the shader ORs the hit members'
+// bits into, and the ranges {begin, end, member} (WatchRangeWords each). The old path's fault buffers are
+// WatchFaultBufferBytes long; the new path's command records stay FaultBufferBytes.
+inline constexpr std::uint32_t WatchCountWord = SrtGuardWord + 1;
+inline constexpr std::uint32_t WatchSelfWord = WatchCountWord + 1;
+inline constexpr std::uint32_t WatchMaskWord = WatchSelfWord + 1;
+inline constexpr std::uint32_t WatchRangesWord = WatchMaskWord + 2;
+inline constexpr std::uint32_t WatchRangeWords = 6;
+inline constexpr std::uint32_t WatchMaxRanges = 512;
+inline constexpr std::uint32_t WatchMaxMembers = 64;
+// Bound-buffer footprint (counter build): the device address of the member's footprint table (0: off), an overflow
+// word, and the guest address of dword 0 of each buffer descriptor element. The table holds WatchFootprintSlots slots
+// {key, read mask, write mask}, key = ((element << 25) | (dword index >> 5)) + 1; a read is noted only when its dword
+// lies in another member's listed range.
+inline constexpr std::uint32_t WatchFootprintWord = WatchRangesWord + WatchMaxRanges * WatchRangeWords;
+inline constexpr std::uint32_t WatchFootprintOverflowWord = WatchFootprintWord + 2;
+inline constexpr std::uint32_t WatchBasesWord = WatchFootprintOverflowWord + 1;
+inline constexpr std::uint32_t WatchBufferElements = 128;
+inline constexpr std::uint32_t WatchFootprintSlots = 65536;
+inline constexpr std::uint32_t WatchFootprintProbes = 16;
+inline constexpr std::uint32_t WatchFootprintSlotWords = 3;
+inline constexpr std::size_t WatchFaultBufferBytes = (WatchBasesWord + 2 * WatchBufferElements) * sizeof(std::uint32_t);
 static_assert(WrittenChunkPages == 32);
 
 inline constexpr std::uint32_t WrittenChunkKey(std::uint64_t address) {

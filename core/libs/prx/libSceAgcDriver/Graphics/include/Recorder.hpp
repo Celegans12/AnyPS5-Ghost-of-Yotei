@@ -195,6 +195,10 @@ public:
     // the deferred barrier, wherever that is recorded. Only while a run is open.
     void AfterRun(std::function<void(Recorder&)> work);
     bool RunOpen() const { return open != nullptr && open->deferredDispatchQueue != 0; }
+    // S4 cloth watch (counter build): the calling thread's lane's open batch (0: none; never reused), and the queue key
+    // of its open dispatch run (0: none).
+    std::uint64_t OpenBatchIdentity() const { return open != nullptr ? open->identity : 0u; }
+    std::uint32_t OpenRunQueue() const { return open != nullptr ? open->deferredDispatchQueue : 0u; }
     // Batched staging (APS5_NO_BATCHED_STAGING=1 turns it off; an APS5_AB switch). NVIDIA drains the
     // GPU at every transfer and barrier recorded between two dispatches, so the staged copy-ins of
     // the dispatches that join a run go to a prelude command buffer submitted ahead of the run
@@ -981,6 +985,8 @@ private:
         // See DeferDispatchBarrier: the guest queue key of the dispatch whose trailing barrier is
         // still owed (0: none).
         std::uint32_t deferredDispatchQueue = 0;
+        // A number no other batch of this process had (OpenBatchIdentity).
+        std::uint64_t identity = 0;
         // The resources objects of the dispatches of the open run (see OverlapCommands).
         std::vector<const void*> deferredRun;
         // See AfterRun.

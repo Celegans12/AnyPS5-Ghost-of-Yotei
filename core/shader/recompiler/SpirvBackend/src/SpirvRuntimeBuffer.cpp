@@ -364,6 +364,27 @@ std::uint32_t directWordIndex(SpirvEmitterState& state, const MemoryResourceAcce
 
 std::uint32_t byteBuffers(SpirvEmitterState& state);
 
+// SpirvTarget::watchedReads: the bound buffer dword `index` (of the instruction's buffer element, u32 view) is read or
+// written when `condition` holds (0: always).
+void noteWatch(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t index, bool write, std::uint32_t condition) {
+    auto& state = context.state;
+    if (state.watchFootprintFunction == 0u) return;
+    const auto element = ResourceForDescriptor(state, DescriptorBindingKind::Buffers, context.Memory(instruction).resource);
+    const auto call = [&] {
+        state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVoid), state.module.AllocateId(), state.watchFootprintFunction, ConstantU32(state, element), index, ConstantU32(state, write ? 1u : 0u));
+    };
+    if (condition == 0u) call();
+    else EmitIfCondition(state, condition, call);
+}
+
+void noteWatchWide(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t wideIndex, bool write, std::uint32_t condition) {
+    auto& state = context.state;
+    if (state.watchFootprintFunction == 0u) return;
+    const auto low = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), wideIndex, ConstantU32(state, 1u));
+    noteWatch(context, instruction, low, write, condition);
+    noteWatch(context, instruction, EmitAddU32(state, low, ConstantU32(state, 1u)), write, condition);
+}
+
 std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits, std::uint32_t enable = 0u) {
     if (context.Memory(instruction).gpuDescriptor) return EmitBdaRead(context, instruction, address, bits);
     auto& state = context.state;
@@ -375,6 +396,10 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     const auto last = Select(state, TypeU32(state), unaligned, next, index);
     const auto bounds = EmitMemoryElementInBounds(state, access, last);
     const auto inBounds = enable != 0u ? both(state, enable, bounds) : bounds;
+    if (state.watchFootprintFunction != 0u) {
+        noteWatch(context, instruction, index, false, inBounds);
+        noteWatch(context, instruction, next, false, both(state, inBounds, unaligned));
+    }
     const auto load = [&](std::uint32_t word) {
         const auto value = state.module.AllocateId();
         const auto pointer = EmitMemoryElementPointer(state, access, word);
@@ -488,6 +513,11 @@ void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std
     const auto unaligned = nonzero(state, misalignment);
     const auto next = EmitAddU32(state, index, ConstantU32(state, 1u));
     const auto last = Select(state, u32, unaligned, next, index);
+    if (state.watchFootprintFunction != 0u) {
+        const auto written = EmitMemoryElementInBounds(state, access, last);
+        noteWatch(context, instruction, index, true, written);
+        noteWatch(context, instruction, next, true, both(state, written, unaligned));
+    }
     const auto bytes = bits != 32u ? byteBuffers(state) : 0u;
     if (bytes != 0u) {
         const auto element = ResourceForDescriptor(state, DescriptorBindingKind::Buffers, context.Memory(instruction).resource);
@@ -1250,6 +1280,7 @@ std::uint32_t EmitRuntimeBufferLoad(SpirvValueEmitContext& context, const IrValu
         const auto pair = coherentPair(context, instruction, resource, components);
         if (!pair) return readComponents();
         return EmitValueIfElse(state, pair->usable, type, [&] {
+            noteWatchWide(context, instruction, pair->index, false, 0u);
             const auto pointer = EmitStorageBufferElementPointer(state, pair->wide, pair->index, TypeStorageBufferU64ElementPointer(state));
             const auto value = state.module.AllocateId();
             state.module.AddFunction(spv::OpAtomicLoad, TypeScalarU64(state), value, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone));
@@ -1289,6 +1320,7 @@ void EmitRuntimeBufferStore(SpirvValueEmitContext& context, const IrValue& instr
             const auto u64 = TypeScalarU64(state);
             const auto high = Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, values[1]), BdaConstant(state, 32u));
             const auto value = Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, values[0]), high);
+            noteWatchWide(context, instruction, pair->index, true, 0u);
             const auto pointer = EmitStorageBufferElementPointer(state, pair->wide, pair->index, TypeStorageBufferU64ElementPointer(state));
             state.module.AddFunction(spv::OpAtomicStore, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), value);
         });
@@ -1428,6 +1460,8 @@ std::uint32_t EmitRuntimeBufferAtomic(SpirvValueEmitContext& context, const IrVa
                     valid = both(state, Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), valid);
                 }
                 return EmitValueOrDefaultIfCondition(state, valid, type, zero, [&] {
+                    if (bits == 64u) noteWatchWide(context, instruction, index, true, 0u);
+                    else noteWatch(context, instruction, index, true, 0u);
                     const auto pointer = EmitStorageBufferElementPointer(state, storage, index, bits == 64u ? TypeStorageBufferU64ElementPointer(state) : TypeStorageBufferElementPointer(state));
                     return operation(pointer);
                 });

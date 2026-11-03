@@ -45,6 +45,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BindlessResolvers.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
@@ -92,6 +93,7 @@
 #include <bit>
 #include <cstring>
 #include <map>
+#include <functional>
 #include <deque>
 #include <limits>
 #include <list>
@@ -4079,6 +4081,25 @@ namespace {
 // atomics between the two host subgroups (H2-5) and hangs on a cross-lane exchange inside per-lane control
 // flow (docs/dev/debt/shader.md, spanned wave64), with no uniformity check yet. The recompiler also refuses
 // it for programs with returning atomics or GDS operations (OneLaneGroupsEligible).
+// APS5_CLOTH_WATCH=1 (the cloth family) or =<hex program address>[,...] (S4 cloth overlap, counter build): the
+// compute programs recompiled with SpirvTarget::watchedReads (in the cache key) and tracked by ClothWatch below.
+bool ClothWatchListed(std::uint64_t programAddress) {
+    static const auto programs = [] {
+        std::vector<std::uint64_t> list;
+        const char* text = std::getenv("APS5_CLOTH_WATCH");
+        if (text != nullptr && std::string_view(text) == "1") return std::vector<std::uint64_t>{0x80001c0d00ull, 0x80001abb00ull, 0x800018b800ull, 0x8000196500ull};
+        for (const char* cursor = text; cursor != nullptr && *cursor != '\0';) {
+            char* end = nullptr;
+            const auto value = std::strtoull(cursor, &end, 16);
+            if (end == cursor) break;
+            list.push_back(value);
+            cursor = *end == ',' ? end + 1 : end;
+        }
+        return list;
+    }();
+    return std::find(programs.begin(), programs.end(), programAddress) != programs.end();
+}
+
 bool OneLaneListed(std::uint64_t programAddress) {
     static const auto programs = [] {
         std::vector<std::uint64_t> list;
@@ -4100,6 +4121,7 @@ bool OneLaneListed(std::uint64_t programAddress) {
 ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t waveSize, std::uint64_t programAddress) const {
     auto target = ComputeTarget(waveSize);
     target.singleLaneGroups = OneLaneListed(programAddress);
+    target.watchedReads = ClothWatchListed(programAddress);
     return target;
 }
 
@@ -5663,6 +5685,402 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
 
 namespace {
 
+// S4 cloth overlap, counter build (APS5_CLOTH_WATCH): the watched dispatches of one guest compute ring that are
+// recorded one after another into the same open batch of one lane, with no other dispatch of that ring between them,
+// form a candidate run (at most WatchMaxMembers, WatchMaxRanges written ranges). Each member's fault buffer holds the
+// run's bounded write ranges tagged with their member (BdaAbi::WatchCountWord on, rewritten as members join: the
+// batch is not submitted yet), so the module's every BDA read lookup sets the bit of each other member whose written
+// bytes it reads (SpirvTarget::watchedReads). Bound buffer accesses go into a per-member footprint table (written
+// dwords, and read dwords inside another member's listed range); once the run completed, the CPU intersects them:
+// read-write and write-write dwords shared by two members. The declared V# ranges are compared too, for reference.
+// Nothing is overlapped: the dispatches stay serial and their results are unchanged; once every
+// member completed, the run's conflict graph is printed ([cloth-watch]) with the splits a real run would make (the
+// title's ordering packets, other recorded work between two members). Positive control: every list starts with the
+// whole address space tagged member 63 (ControlMember; a run holds at most 63 members), so every member that reads
+// anything through a BDA lookup must come back with bit 63 set.
+namespace ClothWatch {
+
+inline constexpr std::uint32_t ControlMember = 63;
+
+using Range = std::pair<std::uint64_t, std::uint64_t>;
+
+bool Enabled() {
+    static const bool enabled = std::getenv("APS5_CLOTH_WATCH") != nullptr;
+    return enabled;
+}
+
+struct Member {
+    std::shared_ptr<Graphics::ShaderResources> resources;
+    std::shared_ptr<Graphics::Buffer> footprint;
+    std::uint32_t* words = nullptr;
+    std::uint64_t program = 0;
+    bool unordered = false;
+    bool clean = false;
+    bool copies = false;
+    std::vector<Range> writes;
+    std::vector<Range> reads;
+    std::vector<std::uint64_t> bases;
+    std::vector<std::uint64_t> readDwords;
+    std::vector<std::uint64_t> writeDwords;
+    std::uint64_t gpuMask = 0;
+    std::uint64_t cpuMask = 0;
+    std::uint64_t wawMask = 0;
+    std::uint64_t exactMask = 0;
+    std::uint64_t exactWawMask = 0;
+    bool overflow = false;
+    bool unmapped = false;
+    bool done = false;
+    bool tainted = false;
+};
+
+struct Run {
+    std::uint64_t id = 0;
+    std::uint64_t batch = 0;
+    int lane = 0;
+    std::uint32_t ring = 0;
+    std::vector<Member> members;
+    std::vector<std::pair<Range, std::uint32_t>> ranges;
+    std::size_t completed = 0;
+    bool evaluated = false;
+};
+
+struct Split {
+    std::uint64_t runs = 0, conflicting = 0, members = 0, freeMembers = 0;
+};
+
+struct Totals {
+    std::uint64_t watched = 0, runs = 0, singles = 0, members = 0, busy = 0, ineligible = 0, copies = 0, tainted = 0;
+    std::uint64_t gpuEdges = 0, raw = 0, war = 0, cpuEdges = 0, waw = 0;
+    std::uint64_t exactEdges = 0, exactRaw = 0, exactWar = 0, exactWaw = 0, overflow = 0, unmapped = 0, footprintWrites = 0, footprintReads = 0;
+    std::uint64_t controlMembers = 0, controlHits = 0;
+    Split declared, exact, exactUnordered, exactClean;
+};
+
+std::mutex mutex;
+std::array<std::shared_ptr<Run>, 2> open{};
+std::map<const void*, std::pair<std::shared_ptr<Run>, std::size_t>> pending;
+Totals totals;
+std::uint64_t nextRun = 0;
+
+bool Overlaps(const std::vector<Range>& left, const std::vector<Range>& right) {
+    for (const auto& [b0, e0] : left) {
+        for (const auto& [b1, e1] : right) {
+            if (b0 < e1 && b1 < e0) return true;
+        }
+    }
+    return false;
+}
+
+std::string Program(std::uint64_t program) {
+    char text[32];
+    std::snprintf(text, sizeof(text), "%llx", static_cast<unsigned long long>(program & 0xffffffffffull));
+    return text;
+}
+
+// Sub-runs split before every member whose join `keep` refuses; a sub-run of two or more members conflicts when a
+// member's `mask` names another member of it.
+void SplitRun(const Run& run, const std::function<bool(const Member&)>& keep, const std::function<std::uint64_t(const Member&)>& mask, Split& split) {
+    std::size_t first = 0;
+    const auto close = [&](std::size_t last) {
+        const auto count = last - first + 1u;
+        if (count < 2u) return;
+        std::uint64_t window = 0;
+        for (std::size_t index = first; index <= last; ++index) window |= std::uint64_t{1} << index;
+        bool conflict = false;
+        for (std::size_t index = first; index <= last; ++index) {
+            if ((mask(run.members[index]) & window) != 0u) conflict = true;
+        }
+        ++split.runs;
+        split.members += count;
+        if (conflict) ++split.conflicting;
+        else split.freeMembers += count;
+    };
+    for (std::size_t index = 1; index < run.members.size(); ++index) {
+        if (keep(run.members[index])) continue;
+        close(index - 1u);
+        first = index;
+    }
+    if (!run.members.empty()) close(run.members.size() - 1u);
+}
+
+std::string SplitText(const Split& split) {
+    char text[160];
+    std::snprintf(text, sizeof(text), "%llu sub-runs (%llu members), %llu conflicting, %llu conflict-free members", static_cast<unsigned long long>(split.runs), static_cast<unsigned long long>(split.members), static_cast<unsigned long long>(split.conflicting), static_cast<unsigned long long>(split.freeMembers));
+    return text;
+}
+
+// Under the mutex.
+void Evaluate(Run& run) {
+    if (run.evaluated) return;
+    run.evaluated = true;
+    const auto count = run.members.size();
+    for (auto& member : run.members) member.resources = nullptr;
+    if (count < 2u) {
+        ++totals.singles;
+        return;
+    }
+    ++totals.runs;
+    totals.members += count;
+    std::unordered_map<std::uint64_t, std::uint64_t> writers;
+    for (std::size_t index = 0; index < count; ++index) {
+        for (const auto dword : run.members[index].writeDwords) writers[dword] |= std::uint64_t{1} << index;
+    }
+    std::uint64_t exactWawDwords = 0;
+    for (const auto& [dword, mask] : writers) {
+        if (std::popcount(mask) < 2) continue;
+        ++exactWawDwords;
+        for (std::size_t index = 0; index < count; ++index) {
+            if ((mask >> index & 1u) != 0u) run.members[index].exactWawMask |= mask & ~(std::uint64_t{1} << index);
+        }
+    }
+    for (std::size_t index = 0; index < count; ++index) {
+        auto& member = run.members[index];
+        for (const auto dword : member.readDwords) {
+            if (const auto found = writers.find(dword); found != writers.end()) member.exactMask |= found->second & ~(std::uint64_t{1} << index);
+        }
+    }
+    std::uint64_t gpuEdges = 0, raw = 0, war = 0, cpuEdges = 0, waw = 0, exactRaw = 0, exactWar = 0, exactWaw = 0, tainted = 0, unordered = 0, clean = 0, copies = 0, overflow = 0, unmapped = 0;
+    std::map<std::uint64_t, int> programs;
+    std::string edges;
+    for (std::size_t reader = 0; reader < count; ++reader) {
+        const auto& member = run.members[reader];
+        ++programs[member.program];
+        if (member.tainted) ++tainted;
+        if (member.copies) ++copies;
+        if (member.overflow) ++overflow;
+        if (member.unmapped) ++unmapped;
+        if (reader > 0 && member.unordered) ++unordered;
+        if (reader > 0 && member.clean) ++clean;
+        for (std::size_t writer = 0; writer < count; ++writer) {
+            const auto bit = std::uint64_t{1} << writer;
+            if ((member.gpuMask & bit) != 0u) {
+                ++gpuEdges;
+                ++(writer < reader ? raw : war);
+            }
+            if ((member.exactMask & bit) != 0u) {
+                ++(writer < reader ? exactRaw : exactWar);
+                if (edges.size() < 160u) edges += " " + std::to_string(reader) + "<" + std::to_string(writer);
+            }
+            if ((member.cpuMask & bit) != 0u) ++cpuEdges;
+            if ((member.wawMask & bit) != 0u && writer < reader) ++waw;
+            if ((member.exactWawMask & bit) != 0u && writer < reader) ++exactWaw;
+        }
+    }
+    totals.gpuEdges += gpuEdges;
+    totals.raw += raw;
+    totals.war += war;
+    totals.cpuEdges += cpuEdges;
+    totals.waw += waw;
+    totals.exactEdges += exactRaw + exactWar;
+    totals.exactRaw += exactRaw;
+    totals.exactWar += exactWar;
+    totals.exactWaw += exactWaw;
+    totals.tainted += tainted;
+    totals.copies += copies;
+    totals.overflow += overflow;
+    totals.unmapped += unmapped;
+    const auto always = [](const Member&) { return true; };
+    const auto declaredMask = [](const Member& member) { return member.gpuMask | member.cpuMask | member.wawMask; };
+    // Exact: BDA reads against the others' declared writes (a superset of their writes), bound reads and writes against
+    // the others' written dwords; a member whose footprint is incomplete conflicts with every other member.
+    const auto exactMask = [](const Member& member) { return member.gpuMask | member.exactMask | member.exactWawMask | (member.overflow || member.unmapped || member.tainted ? ~std::uint64_t{0} : 0u); };
+    SplitRun(run, always, declaredMask, totals.declared);
+    SplitRun(run, always, exactMask, totals.exact);
+    SplitRun(run, [](const Member& member) { return member.unordered; }, exactMask, totals.exactUnordered);
+    SplitRun(run, [](const Member& member) { return member.unordered && member.clean; }, exactMask, totals.exactClean);
+    bool exactConflict = false;
+    for (const auto& member : run.members) exactConflict = exactConflict || exactMask(member) != 0u;
+    std::string mix;
+    for (const auto& [program, number] : programs) mix += (mix.empty() ? "" : ",") + Program(program) + "x" + std::to_string(number);
+    const std::string edgeText = edges.empty() ? std::string() : " [reader<writer:" + edges + "]";
+    std::fprintf(stderr, "[cloth-watch] run %llu lane %d ring 0x%x: %zu members (%s), joins unordered %llu clean %llu, staged %llu; exact conflict %s: BDA read edges %llu (RAW %llu WAR %llu), bound read edges %llu (RAW %llu WAR %llu)%s, WAW pairs %llu (%llu dwords); footprint overflow %llu unmapped %llu tainted %llu; declared V# ranges: read edges %llu, WAW pairs %llu\n", static_cast<unsigned long long>(run.id), run.lane, run.ring, count, mix.c_str(), static_cast<unsigned long long>(unordered), static_cast<unsigned long long>(clean), static_cast<unsigned long long>(copies), exactConflict ? "YES" : "no", static_cast<unsigned long long>(gpuEdges), static_cast<unsigned long long>(raw), static_cast<unsigned long long>(war), static_cast<unsigned long long>(exactRaw + exactWar), static_cast<unsigned long long>(exactRaw), static_cast<unsigned long long>(exactWar), edgeText.c_str(), static_cast<unsigned long long>(exactWaw), static_cast<unsigned long long>(exactWawDwords), static_cast<unsigned long long>(overflow), static_cast<unsigned long long>(unmapped), static_cast<unsigned long long>(tainted), static_cast<unsigned long long>(cpuEdges), static_cast<unsigned long long>(waw));
+    const auto& t = totals;
+    std::fprintf(stderr, "[cloth-watch] control: %llu of %llu completed members read through a BDA lookup (bit 63 set)\n", static_cast<unsigned long long>(t.controlHits), static_cast<unsigned long long>(t.controlMembers));
+    std::fprintf(stderr, "[cloth-watch] totals: %llu watched dispatches, %llu runs of >=2 (%llu members), singles %llu, busy %llu, ineligible %llu, staged %llu, tainted %llu; BDA read edges %llu (RAW %llu WAR %llu); bound footprint: %llu written and %llu watched-read dwords, read edges %llu (RAW %llu WAR %llu), WAW pairs %llu, overflow %llu, unmapped %llu; declared V# ranges: read edges %llu, WAW pairs %llu\n", static_cast<unsigned long long>(t.watched), static_cast<unsigned long long>(t.runs), static_cast<unsigned long long>(t.members), static_cast<unsigned long long>(t.singles), static_cast<unsigned long long>(t.busy), static_cast<unsigned long long>(t.ineligible), static_cast<unsigned long long>(t.copies), static_cast<unsigned long long>(t.tainted), static_cast<unsigned long long>(t.gpuEdges), static_cast<unsigned long long>(t.raw), static_cast<unsigned long long>(t.war), static_cast<unsigned long long>(t.footprintWrites), static_cast<unsigned long long>(t.footprintReads), static_cast<unsigned long long>(t.exactEdges), static_cast<unsigned long long>(t.exactRaw), static_cast<unsigned long long>(t.exactWar), static_cast<unsigned long long>(t.exactWaw), static_cast<unsigned long long>(t.overflow), static_cast<unsigned long long>(t.unmapped), static_cast<unsigned long long>(t.cpuEdges), static_cast<unsigned long long>(t.waw));
+    std::fprintf(stderr, "[cloth-watch] splits: declared ranges, whole runs: %s; exact, whole runs: %s; exact, split at title-ordered joins: %s; exact, split at ordered or unclean joins: %s\n", SplitText(t.declared).c_str(), SplitText(t.exact).c_str(), SplitText(t.exactUnordered).c_str(), SplitText(t.exactClean).c_str());
+}
+
+// Under the mutex: the lane's open run takes no more members.
+void Close(int lane) {
+    auto run = std::exchange(open[static_cast<std::size_t>(lane)], nullptr);
+    if (run != nullptr && run->completed == run->members.size()) Evaluate(*run);
+}
+
+void WriteRanges(std::uint32_t* words, std::size_t from, const std::vector<std::pair<Range, std::uint32_t>>& ranges) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    for (std::size_t index = from; index < ranges.size(); ++index) {
+        auto* entry = words + Abi::WatchRangesWord + index * Abi::WatchRangeWords;
+        const auto& [range, member] = ranges[index];
+        entry[0] = static_cast<std::uint32_t>(range.first);
+        entry[1] = static_cast<std::uint32_t>(range.first >> 32u);
+        entry[2] = static_cast<std::uint32_t>(range.second);
+        entry[3] = static_cast<std::uint32_t>(range.second >> 32u);
+        entry[4] = member;
+        entry[5] = 0u;
+    }
+}
+
+// Under the mutex, once the member's dispatch completed: its footprint table as guest dwords.
+void ReadFootprint(Member& member) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    member.overflow = member.words[Abi::WatchFootprintOverflowWord] != 0u;
+    member.words[Abi::WatchFootprintWord] = 0u;
+    member.words[Abi::WatchFootprintWord + 1] = 0u;
+    if (member.footprint == nullptr) return;
+    const auto* table = reinterpret_cast<const std::uint32_t*>(member.footprint->Bytes().data());
+    for (std::uint32_t slot = 0; slot < Abi::WatchFootprintSlots; ++slot) {
+        const auto* entry = table + slot * Abi::WatchFootprintSlotWords;
+        if (entry[0] == 0u) continue;
+        const auto key = entry[0] - 1u;
+        const auto element = key >> 25u;
+        const auto chunk = key & 0x1ffffffu;
+        if (element >= member.bases.size() || member.bases[element] == ~std::uint64_t{0}) {
+            member.unmapped = true;
+            continue;
+        }
+        for (std::uint32_t bit = 0; bit < 32u; ++bit) {
+            const auto dword = member.bases[element] + (static_cast<std::uint64_t>(chunk) * 32u + bit) * 4u;
+            if ((entry[1] >> bit & 1u) != 0u) member.readDwords.push_back(dword);
+            if ((entry[2] >> bit & 1u) != 0u) member.writeDwords.push_back(dword);
+        }
+    }
+    totals.footprintReads += member.readDwords.size();
+    totals.footprintWrites += member.writeDwords.size();
+    member.footprint = nullptr;
+}
+
+// A dispatch of a guest compute ring (`ring` = its queue key, 0: queue 0) recorded into the calling thread's lane's
+// open batch; `clean`: the ring's dispatch run was still open before this dispatch took its command buffer.
+void Note(const Graphics::Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Graphics::ShaderResources>& resources, std::uint64_t program, bool watched, std::uint32_t ring, bool unordered, bool clean) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    const int lane = Graphics::Recorder::ThreadLane() == 1 ? 1 : 0;
+    const auto batch = recorder.OpenBatchIdentity();
+    std::unique_lock lock(mutex);
+    auto& current = open[static_cast<std::size_t>(lane)];
+    if (!watched) {
+        if (current != nullptr && (current->ring == ring || current->batch != batch)) Close(lane);
+        return;
+    }
+    ++totals.watched;
+    auto* bda = resources != nullptr ? resources->Bda() : nullptr;
+    if (bda == nullptr || !resources->BdaReadOnly()) {
+        ++totals.ineligible;
+        Close(lane);
+        return;
+    }
+    if (const auto found = pending.find(bda); found != pending.end()) {
+        // The build's fault buffer still holds a list and a footprint table an earlier dispatch has not completed with:
+        // this dispatch reads that list and notes into that table too; the table lives until this batch completes.
+        ++totals.busy;
+        auto& earlier = found->second.first->members[found->second.second];
+        earlier.tainted = true;
+        auto footprint = earlier.footprint;
+        Close(lane);
+        lock.unlock();
+        if (footprint != nullptr) recorder.Keep(std::move(footprint));
+        return;
+    }
+    Member member;
+    member.resources = resources;
+    member.words = bda->WatchWords();
+    member.program = program;
+    member.unordered = unordered;
+    member.clean = clean;
+    member.copies = resources->HasGpuCopies();
+    std::vector<std::array<std::uint64_t, 3>> accesses;
+    resources->RunAccesses(accesses);
+    for (const auto& access : accesses) {
+        if ((access[2] & Graphics::Recorder::RunAccessImage) != 0u) continue;
+        if (access[0] == 0u && access[1] == std::numeric_limits<std::uint64_t>::max()) continue;
+        ((access[2] & Graphics::Recorder::RunAccessWritten) != 0u ? member.writes : member.reads).emplace_back(access[0], access[1]);
+    }
+    if (member.writes.size() > Abi::WatchMaxRanges - 1u) {
+        ++totals.ineligible;
+        Close(lane);
+        return;
+    }
+    const bool joins = current != nullptr && current->batch == batch && batch != 0 && current->ring == ring && ring != 0 && current->members.size() < ControlMember && current->ranges.size() + member.writes.size() <= Abi::WatchMaxRanges && std::none_of(current->members.begin(), current->members.end(), [&](const Member& other) { return other.words == member.words; });
+    if (!joins) {
+        Close(lane);
+        current = std::make_shared<Run>();
+        current->id = ++nextRun;
+        current->batch = batch;
+        current->lane = lane;
+        current->ring = ring;
+        current->ranges.push_back({{0u, std::numeric_limits<std::uint64_t>::max()}, ControlMember});
+    }
+    auto run = current;
+    const auto index = static_cast<std::uint32_t>(run->members.size());
+    static const bool dump = std::getenv("APS5_CLOTH_WATCH_DUMP") != nullptr;
+    if (dump) {
+        std::string text;
+        char item[96];
+        for (const auto& access : accesses) {
+            std::snprintf(item, sizeof(item), " %c%llx-%llx/%llx", (access[2] & Graphics::Recorder::RunAccessWritten) != 0u ? 'W' : 'R', static_cast<unsigned long long>(access[0]), static_cast<unsigned long long>(access[1]), static_cast<unsigned long long>(access[2]));
+            text += item;
+        }
+        std::fprintf(stderr, "[cloth-watch-dump] run %llu member %u program %llx unordered %d clean %d staged %d:%s\n", static_cast<unsigned long long>(run->id), index, static_cast<unsigned long long>(program), unordered ? 1 : 0, clean ? 1 : 0, member.copies ? 1 : 0, text.c_str());
+    }
+    for (std::uint32_t other = 0; other < index; ++other) {
+        auto& earlier = run->members[other];
+        const auto bit = std::uint64_t{1} << other;
+        const auto mine = std::uint64_t{1} << index;
+        if (Overlaps(member.writes, earlier.writes)) {
+            member.wawMask |= bit;
+            earlier.wawMask |= mine;
+        }
+        if (Overlaps(member.reads, earlier.writes)) member.cpuMask |= bit;
+        if (Overlaps(earlier.reads, member.writes)) earlier.cpuMask |= mine;
+    }
+    const auto before = run->ranges.size();
+    for (const auto& range : member.writes) run->ranges.emplace_back(range, index);
+    for (auto& earlier : run->members) {
+        WriteRanges(earlier.words, before, run->ranges);
+        earlier.words[Abi::WatchCountWord] = static_cast<std::uint32_t>(run->ranges.size());
+    }
+    WriteRanges(member.words, 0, run->ranges);
+    member.words[Abi::WatchSelfWord] = index;
+    member.words[Abi::WatchMaskWord] = 0u;
+    member.words[Abi::WatchMaskWord + 1] = 0u;
+    member.words[Abi::WatchCountWord] = static_cast<std::uint32_t>(run->ranges.size());
+    member.bases = resources->BufferElementBases();
+    member.footprint = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(Abi::WatchFootprintSlots) * Abi::WatchFootprintSlotWords * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    std::memset(member.footprint->Bytes().data(), 0, member.footprint->Bytes().size());
+    for (std::uint32_t element = 0; element < Abi::WatchBufferElements; ++element) {
+        const auto base = element < member.bases.size() ? member.bases[element] : ~std::uint64_t{0};
+        member.words[Abi::WatchBasesWord + 2u * element] = static_cast<std::uint32_t>(base);
+        member.words[Abi::WatchBasesWord + 2u * element + 1u] = static_cast<std::uint32_t>(base >> 32u);
+    }
+    const auto address = static_cast<std::uint64_t>(member.footprint->DeviceAddress());
+    member.words[Abi::WatchFootprintOverflowWord] = 0u;
+    member.words[Abi::WatchFootprintWord] = static_cast<std::uint32_t>(address);
+    member.words[Abi::WatchFootprintWord + 1] = static_cast<std::uint32_t>(address >> 32u);
+    pending[bda] = {run, index};
+    run->members.push_back(std::move(member));
+    lock.unlock();
+    recorder.OnComplete([run, index, bda] {
+        std::lock_guard lock(mutex);
+        auto& done = run->members[index];
+        done.gpuMask = done.words[Abi::WatchMaskWord] | (static_cast<std::uint64_t>(done.words[Abi::WatchMaskWord + 1]) << 32u);
+        done.done = true;
+        ++totals.controlMembers;
+        if ((done.gpuMask >> ControlMember & 1u) != 0u) ++totals.controlHits;
+        done.gpuMask &= ~(std::uint64_t{1} << ControlMember);
+        ReadFootprint(done);
+        if (const auto found = pending.find(bda); found != pending.end() && found->second.first == run && found->second.second == index) pending.erase(found);
+        ++run->completed;
+        if (run->completed != run->members.size()) return;
+        // Complete means submitted: the batch takes no more members.
+        for (auto& candidate : open) {
+            if (candidate == run) candidate = nullptr;
+        }
+        Evaluate(*run);
+    });
+}
+
+}
+
+
 bool CheckpointsInRuns() {
     static const bool allowed = std::getenv("APS5_CHECKPOINTS_IN_RUNS") != nullptr;
     return allowed;
@@ -5812,8 +6230,10 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     runAccesses.clear();
     if (overlapCapable) resources.RunAccesses(runAccesses);
     if (overlapCapable && record.shader->program->bindlessHeap) runAccesses.push_back({0, std::numeric_limits<std::uint64_t>::max(), Graphics::Recorder::RunAccessImage | Graphics::Recorder::RunAccessWritten});
+    const bool watchClean = ClothWatch::Enabled() && overlapQueue != 0 && recorder.OpenRunQueue() == overlapQueue;
     auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped, runAccesses) : recorder.Commands(&covered);
     const Graphics::Recorder::CommandInHand commandInHand;
+    if (ClothWatch::Enabled()) ClothWatch::Note(context, recorder, record.resources, record.programAddress, emitted == nullptr && ClothWatchListed(record.programAddress), overlapQueue, unordered, watchClean);
     if (timer.profile && overlapped) recorder.CheckRunConflicts(record.programAddress, runAccesses);
     if (timer.profile && overlapCapable && unordered && !overlapped) ++d.unorderedLost;
     // Batched staging (Recorder::SplitForRun): a run's first dispatch that copies buffers itself

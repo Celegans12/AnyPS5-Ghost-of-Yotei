@@ -197,12 +197,13 @@ void reportBdaBuildTimes() {
 
 BdaResources::BdaResources(const Context& context) : textureService(context.textureService) {
     static_assert(std::endian::native == std::endian::little);
-    Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
+    Require(ShaderRecompiler::BdaAbi::WatchFaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
     const auto faultStart = bdaBuildProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::WatchFaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
-    std::memset(fault->Bytes().data() + ShaderRecompiler::BdaAbi::SrtGuardWord * sizeof(std::uint32_t), 0, sizeof(std::uint32_t));
+    std::memset(fault->Bytes().data() + ShaderRecompiler::BdaAbi::SrtGuardWord * sizeof(std::uint32_t), 0, (ShaderRecompiler::BdaAbi::WatchRangesWord - ShaderRecompiler::BdaAbi::SrtGuardWord) * sizeof(std::uint32_t));
+    std::memset(fault->Bytes().data() + ShaderRecompiler::BdaAbi::WatchFootprintWord * sizeof(std::uint32_t), 0, (ShaderRecompiler::BdaAbi::WatchBasesWord - ShaderRecompiler::BdaAbi::WatchFootprintWord) * sizeof(std::uint32_t));
     if (bdaBuildProfiled()) {
         bdaBuildTimes().faults.fetch_add(1, std::memory_order_relaxed);
         bdaBuildTimes().faultNs.fetch_add(nsSince(faultStart), std::memory_order_relaxed);
@@ -386,7 +387,11 @@ std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> BdaResources
 }
 
 VkDescriptorBufferInfo BdaResources::Fault() const {
-    return {fault->Handle(), 0, ShaderRecompiler::BdaAbi::FaultBufferBytes};
+    return {fault->Handle(), 0, ShaderRecompiler::BdaAbi::WatchFaultBufferBytes};
+}
+
+std::uint32_t* BdaResources::WatchWords() const {
+    return reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
 }
 
 namespace {

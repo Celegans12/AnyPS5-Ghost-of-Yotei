@@ -7755,6 +7755,19 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return result;
 }
 
+std::vector<std::uint64_t> ShaderResources::BufferElementBases() const {
+    std::vector<std::uint64_t> bases;
+    for (const auto& binding : bindings) {
+        if (binding.layout.binding != static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Buffers) || binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || binding.set > 0) continue;
+        for (const auto index : binding.allocations) {
+            const auto& allocation = allocations[index];
+            bases.push_back(allocation.guest ? allocation.address - allocation.adjustment : ~std::uint64_t{0});
+        }
+        break;
+    }
+    return bases;
+}
+
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
     if (_set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
     if (fragment.set != VK_NULL_HANDLE) context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet, 1, &fragment.set, 0, nullptr);
