@@ -5048,8 +5048,8 @@ std::uint64_t writtenShadowVramDenominator() {
     static const std::uint64_t denominator = [] {
         const char* value = std::getenv("APS5_WRITTEN_SHADOW_VRAM_DENOMINATOR");
         if (value == nullptr) return std::uint64_t{0};
-        const auto parsed = std::strtoull(value, nullptr, 10);
-        return parsed != 0 ? parsed : 2ull;
+        const std::uint64_t parsed = std::strtoull(value, nullptr, 10);
+        return parsed != 0 ? parsed : std::uint64_t{2};
     }();
     return denominator;
 }
