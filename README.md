@@ -11,16 +11,16 @@
 > when a build renders our 60-frame title reference exactly and runs faster in the open world than the build before it.
 > Fixes that apply to `main` go upstream as separate PRs.
 
-## Where it stands (2026-10-30)
+## Where it stands (2026-11-03)
 
 | | |
 |---|---|
 | **Furthest point** | Open world, the Nupur river by the Ainu village, with HUD and quest |
 | **Time to the world** | about 5-7 minutes from a save near Teshio Ridge (warm shader cache) |
-| **Frame rate in the world** | about **0.87 fps** at 1080p with the [1080p patch](#run-it) (8.74 presents per 10 s at the river village with hritikutekar's resident staged ranges on, 8.07 with them off in the same run: **+8.4 %**). The 1080p patch itself was +9.9 % over 4K (8.46 against 7.76 / 7.64). This laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session |
+| **Frame rate in the world** | about **1.0 fps** at 1080p with the [1080p patch](#run-it). In three 1,500 s runs back to back on 11-03 (the build before, this build without the two new label/cache switches, the build before): 10.30 / **10.60** / 10.03 presents per 10 s at the river village, +4.3 %. The two switches added about another +5 % in an in-run A/B (9.80 against 9.28 over the whole run). This laptop's GPU clocks drift by ~14 % between sessions, so builds are compared back to back in one session |
 | **Stability** | with the second Vulkan queue on its own compute-only queue family, world runs are clean (our measured runs last 25-40 minutes in the world: 2,400 s on 10-26, three 1,500 s runs on 10-27); the one crash we saw on 10-25 (a second-queue label bug) is fixed since `5becc82a97`. The Linux/NVIDIA cutscene freeze with the second queue is fixed in this build (`cc5d69fca6`; Dextroid17: 2 of 2 lane-on runs clean to 3,600 s, after 6 of 6 froze before). One Linux tester (RTX 3080 Ti 12 GB, 3840x2160 guest) had a GPU hang right after the menu with video memory nearly full; not reproduced here yet |
 | **Tested on** | Windows 11, RTX 3080 Laptop GPU 16 GB (driver 610.62), 32 GB RAM, MinGW-w64 GCC 15.2.0, Release |
-| **Build** | `4ac2435c1b`: the 2026-10-30 build plus hritikutekar's resident device buffers for hot staged ranges (from #675). The 2026-10-30 build is `27171091f2`: `416ce3c368` plus the changes listed under [Updates](#updates) for 2026-10-30 (the Linux second-queue freeze fix, Pipodi's prebuild fix Celegans12/AnyPS5-Ghost-of-Yotei#3, hritikutekar's speedups, TheBlenDed's shader-preparation retry) and our new-GPU-path work, which is off unless `APS5_NEW_PATH` is set. `416ce3c368` is our tree (`d3e0db3032`, owned answers from per-block checks within a collect epoch, and everything listed under [What it carries](#what-it-carries-on-top-of-main-2026-10-26)) merged with `main` 2026-10-26 `88795ed448` (which now includes #9957, #9181, #9567 and #11120), plus Pipodi's absent runtime formats (Celegans12/AnyPS5-Ghost-of-Yotei#1) and two of hritikutekar's runtime-format reads from #675, + docs, shader-cache SourceVersion `22c401ea7ca3796f`, title reference T1 exact |
+| **Build** | `ba62bda306`: the 2026-10-30 evening build (`6e85d0c493`) plus three of hritikutekar's committer commits and his C68 index-range change from #675, TheBlenDed's written-shadow VRAM yield (Celegans12/AnyPS5-Ghost-of-Yotei#6, its VRAM gate off by default here), Pipodi's parallel pipeline builds on a dispatch miss (Celegans12/AnyPS5-Ghost-of-Yotei#4), and two switches of ours: label read-backs recorded behind their writer, and a larger resource cache. Details under [Updates](#updates). Shader-cache SourceVersion `22c401ea7ca3796f` (unchanged), title reference T1 exact at 4K and at 1080p |
 
 <table>
 <tr>
@@ -64,6 +64,8 @@
 | 10-27 | **7.9** (the build before: 7.75 between two runs of this one, same script) | merged with `main` 2026-10-26; same speed, newer `main` underneath |
 | 10-30 | **8.74** at 1080p (8.07 with them off in the same run: +8.4 %, GPU busy -170 ms per frame) | hritikutekar's resident device buffers for hot staged ranges: a staged range that's copied in again and again gets its own device buffer, and the copy-in is skipped while guest memory hasn't changed (copy-in 9,295 to 2,461 MiB per 10 s) |
 | 10-30 | **8.46** at 1080p (7.76 / 7.64 at 4K in the runs either side: +9.9 %) | the game's output and render size set to 1920x1080 with a relinker patch (shahulmubeen-a's, ported to v1.008); at 4K the code runs at the same speed as the build before (7.98 against 7.95 / 7.91) |
+| 11-03 | **10.60** at 1080p (10.30 / 10.03 for the build before in the runs either side: +4.3 %) | hritikutekar's preparer commits, Pipodi's miss-ahead builds and TheBlenDed's VRAM yield (gate off) |
+| 11-03 | +5 % in an in-run A/B (9.80 vs 9.28, 23 pairs, ~4.6 SE) | `APS5_DEFER_LABEL_READBACK=1` and `APS5_RESOURCE_CACHE_LARGE=1`: label read-backs recorded behind their writer instead of a CPU wait, and a resource cache of at least 4,096 entries |
 
 ## Run it
 
@@ -83,12 +85,14 @@ APS5_SPANNED_WAVE=1 APS5_BINDLESS_IMAGES=1 APS5_BINDLESS_LAZY=1 APS5_NO_RESULT_M
 APS5_STAGING_DIFF=1 APS5_PIPELINE_INDIRECT=1 APS5_NO_ADDRESS_DRAW_REUSE=1
 APS5_NO_PIPELINE_JOURNAL=1 APS5_RESOURCE_CACHE_ENTRIES=1024 APS5_ASYNC_LANE=51
 APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
+APS5_DEFER_LABEL_READBACK=1 APS5_RESOURCE_CACHE_LARGE=1
 ```
 
 - The shader-cache version is unchanged since 2026-10-27 (`22c401ea7ca3796f`), so a cache from the previous build stays warm. **From an empty cache the first run compiles cold**: about 54 minutes to the world on our machine (frame 90 at 3,218 s). The second run can still compile a few very large pipelines (about 3 minutes on the last loading screen for us, if the first run was stopped before the driver saved them); after that, runs start warm (frame 90 at about 400 s).
 - `APS5_ASYNC_LANE=51` runs the cloth compute ring on a second Vulkan queue. That queue now comes from a compute-only queue family by default; `APS5_LANE_GRAPHICS_FAMILY=1` goes back to a third queue of the graphics family, which faulted the GPU for us. Without `APS5_ASYNC_LANE`, everything runs on one queue as before.
 - `APS5_DEFER_REFRESH_FLUSH=1` lets a storage refresh record its GPU-direct write-backs behind the pending writer instead of waiting for it; hritikutekar's GPU slice copies for reflection probes need it.
 - `APS5_NO_DRAW_AHEAD=1` keeps mitul72's draw-ahead (#6188) off: worker threads that capture and compile upcoming draws ahead of queue 0. Leave it out to try it: in our A/B it was +4 % presents (not significant), and one of four title checks with it on stalled at boot and rendered wrong, which we haven't reproduced or explained yet.
+- `APS5_DEFER_LABEL_READBACK=1` records a label's read-back store behind the GPU work that writes it instead of making the CPU wait for it. `APS5_RESOURCE_CACHE_LARGE=1` raises the resource cache to at least 4,096 entries (it overrides `APS5_RESOURCE_CACHE_ENTRIES=1024`): with the small cache about 340 recipes per 10 s were rebuilt because their template had been evicted, with the large one about 35. Each one alone measured within noise; together they are about +5 %.
 - `APS5_NO_PIPELINE_JOURNAL=1` turns off `main`'s startup pipeline replay. `APS5_RESOURCE_CACHE_ENTRIES=1024` is the resource-cache size all our measurements used.
 - `main`'s paths that broke Yōtei on our tree are off here and can be turned back on:
   - `APS5_RESIDENT_LINEAR=1`: resident linear color targets. Wrong spawn, T-pose, camera under water or in the sky (#8152).
@@ -115,6 +119,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
   - `APS5_NO_OWNED_EPOCH=1`: owned proofs ask Windows for the written pages on every proof again instead of answering from the per-block check of the current collect epoch (`APS5_VERIFY_OWNED_EPOCH=<n>` also queries the first n epoch answers every 10 s and reports any disagreement).
   - `APS5_NO_ABSENT_RUNTIME_FORMAT=1` (Pipodi's absent runtime formats), `APS5_NO_COMPACT_FORMAT_CONVERT=1` and `APS5_NO_SINGLE_FORMAT_READ=1` (hritikutekar's runtime-format reads).
   - `APS5_NO_RESIDENT_RANGES=1`: hritikutekar's resident device buffers for hot staged ranges (copy-ins of unchanged staged ranges are skipped).
+  - `APS5_NO_PREPARED_DISPATCH_ITEMS=1`, `APS5_NO_BDA_DRAW_SPLIT=1`, `APS5_NO_BDA_DISPATCH_SPLIT=1`: hritikutekar's preparer commits (queue 0's dispatch items prepared ahead, stage A of address-based draws and dispatches built off the lock). `APS5_NO_DISPATCH_MISS_AHEAD=1`: Pipodi's parallel pipeline builds for the following dispatches on a dispatch miss (#4). `APS5_WRITTEN_SHADOW_VRAM_DENOMINATOR=<n>` turns on TheBlenDed's VRAM gate from #6 (written-shadow staging yields to the texture cache once usage passes 1/n of the heap); it's off here because on our 16 GB card it fired at ~11.7 GB and cost about 17 %.
   - `APS5_NO_HIT_ITEM_HTILE_NOTE=1`: a depth clear recorded as a cached dispatch item (`APS5_PIPELINE_DISPATCH`) no longer notes its HTILE mask, so the next depth draw waits for the whole GPU before its store-back again.
   - `APS5_NO_OVERLAP_RANGE_CHECK=1`: overlapped dispatches no longer need disjoint access ranges (the old rule).
   - `APS5_NO_DISPATCH_OVERLAP=1`, `APS5_NO_BATCHED_STAGING=1`, `APS5_NO_SPARSE_PAGE_STATES=1`.
@@ -138,10 +143,11 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
 - Once, during loading on a build of 10-21 or 10-22, the game stopped with `missing static shader ABI register 531`. It did not come back in any later run; if you see it, please post the log in #675.
 - A dispatch joins an overlapped run only when its access ranges are disjoint from the run's; address-based, BDA and bindless dispatches count as conflicting. That costs about 5 % GPU time per frame against the old rule. Frames are CPU-bound, so presents don't move.
 - One compute program (0x8000361f00) is still refused by the recompiler at registration (non-fatal so far).
-- About 0.6-0.8 fps is far from playable. What limits a frame now, and what's next, is in [discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675).
+- About 1 fps at 1080p is still far from playable. What limits a frame now, and what's next, is in [discussion #675](https://github.com/boykopovar/AnyPS5/discussions/675).
 
 ## What it carries on top of `main` 2026-10-26
 
+- New on 2026-11-03: hritikutekar's preparer commits and C68 index-range change from #675, TheBlenDed's written-shadow VRAM yield (Celegans12/AnyPS5-Ghost-of-Yotei#6, gate off by default), Pipodi's parallel pipeline builds on a dispatch miss (Celegans12/AnyPS5-Ghost-of-Yotei#4), deferred label read-backs and a resource-cache size switch.
 - New on 2026-10-30 (details under [Updates](#updates)): the recorder fix for the Linux second-queue freeze; Pipodi's prebuild fix (Celegans12/AnyPS5-Ghost-of-Yotei#3); hritikutekar's nine speedups and three diagnostics from #675, with TheBlenDed's cross-lane completion-label deferral and shader-preparation retry; the frame capture and replay tools (`agc_frame_replay`); and our new GPU path (device page table, GPU-resolved draws and dispatches), all of it off unless `APS5_NEW_PATH` is set.
 - Most of the upstream PRs this branch adopted earlier are part of `main` now, including #9957, #9181, #9567, #9558, #9600 and #11120. Still carried here because they're open upstream: mrfelek's #10228, SleglJan's #8887, AlxcBTW's #7514, mitul72's #6188 (off in the env) and our own PRs (#10382 and the dispatch-overlap and staging series).
 - Changes on `main` after 2026-10-26 (over 100 PRs, including #11365 per-draw GPU timing, #8896, #10837 and #10980) aren't in this build yet.
@@ -212,6 +218,7 @@ APS5_NO_DRAW_AHEAD=1 APS5_DEFER_REFRESH_FLUSH=1 APS5_PIPELINE_DISPATCH=1
   - Our new GPU path is in this build but off unless `APS5_NEW_PATH` is set. It isn't faster yet.
   - At 4K, three 1,500 s runs back to back (the build before, this build without #3, the build before): 7.95 / 7.98 / 7.91 presents per 10 s, so the same speed. Frames clean, no fatal.
 - 2026-10-30 (evening): hritikutekar's resident device buffers for hot staged ranges from #675 (`4ac2435c1b`, **same shader cache**, T1 exact at 4K and at 1080p). Staged ranges that the driver copied to the GPU again on every use now keep a device buffer of their own, and the copy-in is skipped while the guest memory behind them hasn't changed. In an in-run A/B in the world at 1080p (2,400 s, 19 pairs, `APS5_NO_RESIDENT_RANGES` as B): **+0.68 ± 0.14 presents per 10 s (+8.4 %)** with it on, 8.74 against 8.07; staged copy-in 2,461 against 9,295 MiB per 10 s; GPU busy 773 against 943 ms per frame. Frames identical in replays of four captured frames with it on and off. One fix on our side: the holder of the resident buffers released them after the GPU device was gone, which crashed our replay tool at exit. All 32 resident slots stay full the whole run, so a larger limit may help more; that's being measured. `APS5_NO_RESIDENT_RANGES=1` turns it off.
+- 2026-11-03: moved to `ba62bda306` (**same shader cache**, T1 exact at 4K and at 1080p). Adopted from #675 and this fork's PRs: three of hritikutekar's committer commits (queue 0's dispatch items prepared ahead, stage A of address-based draws and dispatches built off the lock) and his C68 index-range change, Pipodi's parallel pipeline builds on a dispatch miss (#4) and TheBlenDed's written-shadow VRAM yield (#6). On our card #6's VRAM gate cost about 17 % (in-run A/B, gate off +1.59 ± 0.06 presents per 10 s), so it is off unless `APS5_WRITTEN_SHADOW_VRAM_DENOMINATOR` is set. Three 1,500 s runs back to back at 1080p (the build before, this set, the build before): 10.30 / **10.60** / 10.03 presents per 10 s, **+4.3 %**. On top of that, two new env switches, `APS5_DEFER_LABEL_READBACK=1` and `APS5_RESOURCE_CACHE_LARGE=1`: in an in-run A/B on this build (3,000 s, 23 pairs), +0.46 ± 0.10 presents per 10 s with both on (about +5 %), and about 60 ms less GPU idle time per frame. Each one alone was within noise in two earlier A/Bs. Frames clean, no fatal. The combined gain over the build before is about +9 %, from two separate measurements rather than one run.
 
 ---
 
