@@ -209,6 +209,7 @@ public:
     [[nodiscard]] const std::vector<std::uint32_t>& Words() const { return words != nullptr ? *words : none(); }
     [[nodiscard]] const std::uint32_t* data() const { return Words().data(); }
     [[nodiscard]] std::size_t size() const { return Words().size(); }
+    [[nodiscard]] std::size_t capacity() const { return Words().capacity(); }
     [[nodiscard]] bool empty() const { return Words().empty(); }
     [[nodiscard]] const std::uint32_t* begin() const { return Words().data(); }
     [[nodiscard]] const std::uint32_t* end() const { return Words().data() + Words().size(); }

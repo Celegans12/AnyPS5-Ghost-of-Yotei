@@ -6105,6 +6105,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         pool = state->ScratchPoolFor(context, record.shader->program->Identity(), slotDwords, groups);
     }
     VkAccessFlags covered = 0;
+    bool overlapped = false;
     const std::array<const void*, 2> runOwners{record.resources.get(), record.resources != nullptr ? record.resources->MemoryOwner() : nullptr};
     thread_local std::vector<std::array<std::uint64_t, 3>>* runAccessesSlot = nullptr;
     auto& runAccesses = ShaderRecompiler::ThreadOwned(runAccessesSlot);
@@ -6522,6 +6523,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     objects->module = Graphics::CreateShaderModule(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule"), state->device, state->graphicsPipelineLibrary, shader.spirv.data(), shader.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule");
     objects->resourcesLayout = setLayout;
     const auto setLayouts = computeSetLayouts(context, shader, setLayout);
+    const bool scratchPool = shader.scratchPoolSlotDwords != 0;
     const bool resolvedModule = NewPath::ResolvedModule(shader);
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, NewPath::PushRangeBytes(resolvedModule)};
     Graphics::Require(!resolvedModule || state->properties.limits.maxPushConstantsSize >= push.size, "a new-path resolved module's push range exceeds the device limit");

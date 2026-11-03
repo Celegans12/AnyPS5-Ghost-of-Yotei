@@ -1025,8 +1025,6 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false);
 #endif
     auto module = std::make_shared<SpecializedModule>();
-    std::map<std::uint32_t, std::uint32_t> supplied;
-    for (const auto& constant : constants) supplied.emplace(constant.id, constant.value);
     std::map<std::uint32_t, std::uint32_t> bindingNumbers;
     std::set<std::uint32_t> otherSets;
     std::unordered_set<std::uint32_t> ldsBuffers;

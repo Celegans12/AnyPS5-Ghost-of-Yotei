@@ -193,7 +193,7 @@ void CheckSharedBlock() {
     if (!Watched(outside, unwatched.size())) Require(StoredOver(outside, unwatched.size(), TrackerGeneration()), "an unwatched range reads as not stored over");
 }
 
-void CheckRepeatedNeighbourStores() {
+void CheckRepeatedNeighbourStoresBlock() {
     void* memory = AllocateWatched(3 * Block);
     const auto base = reinterpret_cast<std::uint64_t>(memory);
     const auto boundary = base + 2 * Block - 0x9000;
@@ -3835,7 +3835,7 @@ int main(int argc, char** argv) {
         }
 #endif
         CheckSharedBlock();
-        CheckRepeatedNeighbourStores();
+        CheckRepeatedNeighbourStoresBlock();
         CheckStoredOverUsesPageEvidence();
         CheckRepeatedNeighbourStores();
         CheckStoredAllSince();

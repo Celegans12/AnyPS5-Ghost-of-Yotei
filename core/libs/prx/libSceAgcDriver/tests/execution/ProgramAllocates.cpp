@@ -15,7 +15,7 @@ constexpr std::uint32_t EndProgram = 0xbf810000u;
 bool allocates(std::initializer_list<std::uint32_t> words) {
     AgcDriver::DriverDetail::ShaderSnapshot snapshot{};
     snapshot.code.assign(words.begin(), words.end());
-    snapshot.code.push_back(EndProgram);
+    snapshot.code.Mutable().push_back(EndProgram);
     return AgcDriver::DriverDetail::ProgramAllocates(snapshot, 0);
 }
 

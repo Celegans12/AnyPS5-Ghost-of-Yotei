@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderPreparation.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
@@ -147,6 +148,12 @@ std::shared_ptr<const SourceHandle> PrepareShader(const RecompileRequest& reques
     return {};
 }
 
+}
+
+void AgcDriver::DriverDetail::ShaderPreparationTransaction::ContinueAfterRefusal() {}
+
+std::vector<std::uint32_t> AgcDriver::VulkanDevice::PlannedComputeLayoutKey(const ShaderRecompiler::RecompileResult&) {
+    return {};
 }
 
 int main(int argc, char** argv) {

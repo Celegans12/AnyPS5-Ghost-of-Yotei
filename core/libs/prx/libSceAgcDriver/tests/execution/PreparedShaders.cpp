@@ -149,9 +149,9 @@ void RegisteredMemoryCensus(const std::shared_ptr<const ShaderRecompiler::Source
     const auto mappedHandle = handleFor(mapped);
     auto first = std::make_shared<ShaderSnapshot>(ShaderSnapshot{1u, 11u, 0u, {1u, 2u}, {std::byte{1}}});
     auto second = std::make_shared<ShaderSnapshot>(ShaderSnapshot{1u, 12u, 0u, {1u, 2u}, {std::byte{2}}});
-    first->code.reserve(64u);
+    first->code.Mutable().reserve(64u);
     first->header.reserve(128u);
-    second->code.reserve(32u);
+    second->code.Mutable().reserve(32u);
     second->header.reserve(64u);
     first->prepared->entries = {{0u, rawHandle}, {0u, rawAlias}, {0u, mappedHandle}};
     second->prepared->entries = {{0u, rawHandle}, {0u, nullptr}};

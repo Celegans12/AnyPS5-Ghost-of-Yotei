@@ -89,11 +89,11 @@ void TestReport() {
     std::binary_semaphore release{0};
     std::exception_ptr failure;
     try {
-        pipeline.Enqueue([&] { release.acquire(); }, {}, 0, {}, {{0x1000, 0x1010}, {0x2000, 0x2010}}, true);
+        pipeline.Enqueue([&] { release.acquire(); }, {}, 0, {}, {{0x1000, 0x1010}, {0x2000, 0x2010}}, {}, true);
         Check(DrawPipeline::HeldReads(0x1000, 4), "queued read range was not held");
         for (unsigned i = 0; i < 3; ++i) pipeline.NoteDecodeDrain();
         std::this_thread::sleep_until(reportAfter);
-        pipeline.Enqueue([] {}, {}, 0, {}, {}, true);
+        pipeline.Enqueue([] {}, {}, 0, {}, {}, {}, true);
     } catch (...) {
         failure = std::current_exception();
     }

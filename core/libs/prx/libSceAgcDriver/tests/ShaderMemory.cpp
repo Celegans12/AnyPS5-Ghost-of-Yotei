@@ -11296,7 +11296,7 @@ void verifyRuntimeImageSwitchDeduplication() {
             program.Metadata().bindings.descriptors = {
                 {DescriptorBindingKind::FaultBuffer, {}},
                 {DescriptorBindingKind::ImageTableMap, {}},
-                {DescriptorBindingKind::ImageStorageTable, {}},
+                {DescriptorBindingKind::StorageImageTable, {}},
             };
         }
         program.Info().images.push_back(image);
