@@ -11,6 +11,9 @@ namespace AgcDriver::DriverDetail {
 namespace {
 
 constexpr std::size_t MaxFreeShapes = 65536;
+constexpr std::uint32_t TrialLookups = 64;
+constexpr std::uint32_t TrialHitShare = 16;
+constexpr std::uint32_t IdleKeys = 4096;
 
 std::uint64_t WordsBelow(std::size_t count) {
     return count >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << count) - 1u;
@@ -131,7 +134,13 @@ std::uint64_t Driver::freeShapeIdentity(std::uint64_t address, const ShaderSnaps
 std::uint64_t Driver::dispatchFreeWords(std::uint64_t address, const ShaderSnapshot* shader, std::size_t userCount) {
     std::lock_guard lock(dispatchCacheMutex);
     const auto found = dispatchFreeShapes.find(freeShapeIdentity(address, shader, userCount));
-    return found != dispatchFreeShapes.end() ? found->second : 0;
+    if (found == dispatchFreeShapes.end()) return 0;
+    if (found->second.idle != 0) {
+        --found->second.idle;
+        ++entryCounters.freeIdleKeys;
+        return 0;
+    }
+    return found->second.words;
 }
 
 void Driver::learnDispatchFreeWords(std::uint64_t address, const ShaderSnapshot* shader, std::size_t userCount, std::uint64_t freeWords) {
@@ -139,12 +148,28 @@ void Driver::learnDispatchFreeWords(std::uint64_t address, const ShaderSnapshot*
     const auto found = dispatchFreeShapes.find(identity);
     if (found == dispatchFreeShapes.end()) {
         if (dispatchFreeShapes.size() >= MaxFreeShapes) dispatchFreeShapes.clear();
-        dispatchFreeShapes.emplace(identity, freeWords);
+        dispatchFreeShapes.emplace(identity, FreeKeyShape{freeWords});
         return;
     }
-    if ((found->second & ~freeWords) == 0) return;
-    found->second &= freeWords;
+    if ((found->second.words & ~freeWords) == 0) return;
+    found->second.words &= freeWords;
     ++entryCounters.freeShapesNarrowed;
+}
+
+void Driver::noteFreeLookup(std::uint64_t address, const ShaderSnapshot* shader, std::size_t userCount, bool hit) {
+    std::lock_guard lock(dispatchCacheMutex);
+    const auto found = dispatchFreeShapes.find(freeShapeIdentity(address, shader, userCount));
+    if (found == dispatchFreeShapes.end()) return;
+    auto& shape = found->second;
+    ++shape.lookups;
+    if (hit) ++shape.hits;
+    if (shape.lookups < TrialLookups) return;
+    if (shape.hits * TrialHitShare < shape.lookups) {
+        shape.idle = IdleKeys;
+        ++entryCounters.freeShapesIdled;
+    }
+    shape.lookups = 0;
+    shape.hits = 0;
 }
 
 }

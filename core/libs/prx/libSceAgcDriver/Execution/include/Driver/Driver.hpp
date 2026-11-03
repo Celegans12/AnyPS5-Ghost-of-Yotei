@@ -215,6 +215,7 @@ private:
     static std::uint64_t freeShapeIdentity(std::uint64_t address, const ShaderSnapshot* shader, std::size_t userCount);
     std::uint64_t dispatchFreeWords(std::uint64_t address, const ShaderSnapshot* shader, std::size_t userCount);
     void learnDispatchFreeWords(std::uint64_t address, const ShaderSnapshot* shader, std::size_t userCount, std::uint64_t freeWords);
+    void noteFreeLookup(std::uint64_t address, const ShaderSnapshot* shader, std::size_t userCount, bool hit);
     static bool drawEntries();
     static bool drawDataHits();
     static bool verifyDrawDataHits();
@@ -481,7 +482,7 @@ private:
     std::unordered_set<std::uint64_t> dispatchGhostKeys;
     std::deque<std::uint64_t> dispatchGhostOrder;
     void noteDispatchEvicted(std::uint64_t key);
-    std::unordered_map<std::uint64_t, std::uint64_t> dispatchFreeShapes;
+    std::unordered_map<std::uint64_t, FreeKeyShape> dispatchFreeShapes;
 
     EntryCounters entryCounters;
 

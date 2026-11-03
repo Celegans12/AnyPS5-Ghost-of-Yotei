@@ -526,6 +526,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, userData, freeWords, freeHit, movedWords, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
     }
     timing.Mark("lookup_cache");
+    if (freeWords != 0 && !fromAhead) noteFreeLookup(address, registeredShader.get(), userData.size(), cached);
     auto hitRecipe = cached && keepVariant != nullptr ? keepVariant->recipe.load(std::memory_order_acquire) : nullptr;
     if (movedWords != 0 && hitRecipe != nullptr) hitRecipe = MovedRecipe(*hitRecipe, *compiledResult);
     std::vector<DrawPipeline::Range> itemWrites;

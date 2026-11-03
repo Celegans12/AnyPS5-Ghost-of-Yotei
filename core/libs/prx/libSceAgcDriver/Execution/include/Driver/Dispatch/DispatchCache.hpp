@@ -77,7 +77,7 @@ struct EntryCounters {
     std::array<std::uint64_t, MaxDispatchVariants> variantHitsByRank{};
     std::uint64_t variantsCompared = 0, variantsInserted = 0, variantsEvicted = 0;
 
-    std::uint64_t freeLookups = 0, freeHits = 0, freeHitsMoved = 0, freeVariantsDiffering = 0, freeVariantsMoved = 0, freeVerified = 0, freeInserts = 0, freeShapesNarrowed = 0;
+    std::uint64_t freeLookups = 0, freeHits = 0, freeHitsMoved = 0, freeVariantsDiffering = 0, freeVariantsMoved = 0, freeVerified = 0, freeInserts = 0, freeShapesNarrowed = 0, freeShapesIdled = 0, freeIdleKeys = 0;
 
     std::uint64_t dataHits = 0, dataWordsRefreshed = 0, dataVerified = 0, dataInserts = 0, dataPositionsInserted = 0, dataLeavesUnmapped = 0, dataLeavesMismatched = 0, dataLeavesAliased = 0;
     std::array<std::uint64_t, MaxDispatchVariants> dataHitsByRank{};
@@ -97,6 +97,11 @@ enum class EntryOutcome { Equal, EqualData, Differing, Inaccessible, QueuedLabel
 bool CacheableResult(const ShaderRecompiler::RecompileResult& compiled);
 
 enum class UserWordsMatch { Same, Moved, Differs };
+
+struct FreeKeyShape {
+    std::uint64_t words = 0;
+    std::uint32_t lookups = 0, hits = 0, idle = 0;
+};
 
 std::uint64_t PatchableUserWords(const ShaderRecompiler::RecompileResult& compiled);
 std::uint64_t FreeDispatchUserWords(const ShaderRecompiler::SrtUserDataUse& use, std::uint64_t registerReads, std::uint64_t patchable, std::uint64_t relocatable, std::size_t userCount);
