@@ -1143,7 +1143,7 @@ void budgetReportAgeTests(Context context) {
     context.memoryProperties2 = ReportBudgetAge;
     VkPhysicalDeviceMemoryBudgetPropertiesEXT initial{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
     initial.heapBudget[*heap] = budgetReportAge.budget;
-    const auto initialStorage = StorageTextureBudget(context.memory, &initial, 0, 0);
+    const auto initialStorage = TextureCacheBudgetsFor(context.memory, &initial, {}).storage;
     const auto storage = StorageTextureCacheBudget(context);
     std::printf("budget report age: storage limit %llu MiB at an 8 GiB report (fresh calculation %llu MiB)\n", static_cast<unsigned long long>(storage >> 20u), static_cast<unsigned long long>(initialStorage >> 20u));
     Require(storage == initialStorage, "the initial storage limit is not the storage budget of the reported heap");
@@ -1158,7 +1158,7 @@ void budgetReportAgeTests(Context context) {
     Require(sampled == reducedSampled, "sampled did not use the reduced heap budget");
     Require(budgetReportAge.queries == queries + 1, "reporting the storage limit issued an extra memory budget query");
     Require(StorageTextureCacheBudget(context) == initialStorage, "reporting refreshed the still-active cached storage limit");
-    const auto reducedStorage = StorageTextureBudget(context.memory, &reported, 0, 0);
+    const auto reducedStorage = TextureCacheBudgetsFor(context.memory, &reported, {}).storage;
     Require(reducedStorage != initialStorage, "the fresh storage calculation does not differ from the active cached limit");
     std::this_thread::sleep_for(std::chrono::milliseconds(1100));
     Require(StorageTextureCacheBudget(context) == reducedStorage, "storage did not refresh after its own cache interval");

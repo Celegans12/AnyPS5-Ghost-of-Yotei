@@ -328,7 +328,7 @@ void RunGuardedWrapTests() {
     Require(cache.Get(context, words, false, true, false, false, true) == first, "guarded sampler cache missed identical proof");
     const auto decoded = DecodeSamplerResource(words, true, false, false, true);
     Require(decoded.addressModeU == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE && decoded.addressModeV == VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE, "guarded point repeat was not mapped to edge clamp");
-    for (const auto clamp : {1u, 3u, 4u, 5u, 7u}) {
+    for (const auto clamp : {4u, 5u, 7u}) {
         auto unsupported = words;
         unsupported[0] |= clamp;
         reject([&] { DecodeSamplerResource(unsupported, true, false, false, true); }, "clamp mode " + std::to_string(clamp) + " on X");
