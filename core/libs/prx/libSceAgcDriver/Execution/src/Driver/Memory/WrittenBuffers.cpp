@@ -3,6 +3,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
@@ -54,11 +56,15 @@ void Driver::noteWrittenBuffers(std::uint64_t program, std::uint32_t queue, cons
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> DispatchWriteRanges(const ShaderRecompiler::RecompileResult& compiled, bool& bounded) {
-    bounded = compiled.bdaAbiVersion == 0;
+    // APS5_READ_ONLY_BDA_ITEMS: a module that stores through no address only reads guest memory through its
+    // page table, so its writes are the descriptor-bound ones listed below (the fault buffer is the driver's).
+    const bool readOnlyBda = compiled.bdaAbiVersion != 0 && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ReadOnlyBdaItems) && !Graphics::ShaderStoresThroughAddresses(compiled.spirv);
+    bounded = compiled.bdaAbiVersion == 0 || readOnlyBda;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     constexpr std::uint64_t UnknownImageBytes = 64ull * 1024 * 1024;
     for (const auto& binding : compiled.bindings) {
-        if (binding.role == ShaderRecompiler::DescriptorRole::Gds || binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer) bounded = false;
+        if (binding.role == ShaderRecompiler::DescriptorRole::Gds) bounded = false;
+        if (!readOnlyBda && (binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable || binding.role == ShaderRecompiler::DescriptorRole::FaultBuffer)) bounded = false;
         if (binding.kind == ShaderRecompiler::DescriptorKind::StorageImage && binding.role != ShaderRecompiler::DescriptorRole::GuestImages) bounded = false;
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestImages || binding.kind != ShaderRecompiler::DescriptorKind::StorageImage) continue;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
