@@ -11,8 +11,9 @@
 namespace AgcDriver::Graphics {
 
 // Driver switches that may change while the game runs (the in-run A/B, APS5_AB). Each is an APS5_*
-// (mostly APS5_NO_*; APS5_QUIET_PUBLISH, APS5_LANE_SERIALIZE, APS5_DEFER_REFRESH_FLUSH, APS5_DEFER_FLIP_STORE
-// and APS5_FLUSH_WAIT_WHOLE_RANGE are opt-in)
+// (mostly APS5_NO_*; APS5_QUIET_PUBLISH, APS5_LANE_SERIALIZE, APS5_DEFER_REFRESH_FLUSH, APS5_DEFER_FLIP_STORE,
+// APS5_FLUSH_WAIT_WHOLE_RANGE and the APS5_DEFER_UNWATCHED / APS5_DEFER_OVER_COMPLETIONS / APS5_DEFER_OVER_LANE
+// condition drops are opt-in)
 // variable whose presence selects one of two exact paths; it starts as set when the variable is set.
 // Every reader takes it once per operation (a build, a submission, a draw), so an operation never
 // sees both settings.
@@ -98,6 +99,11 @@ enum class RuntimeSwitch : std::size_t {
     DeferLabelReadback,
     DispatchCacheLarge,
     ResourceCacheLarge,
+    NoDeferStores,
+    DeferUnwatched,
+    DeferOverCompletions,
+    DeferOverLane,
+    NoDeferKeepWriter,
     Count,
 };
 

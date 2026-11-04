@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -23,12 +24,45 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace {
 
 using AgcDriver::Graphics::Require;
+using AgcDriver::Graphics::RuntimeSwitch;
+using AgcDriver::Graphics::StorageTexture;
 using ShaderRecompiler::ShaderStage;
+namespace RuntimeSwitches = AgcDriver::Graphics::RuntimeSwitches;
+
+// A FlushPending reason that waits for the writer, and one of the GPU-ordered reasons (Texture.cpp GpuOrderedReasons),
+// which record the write-back behind the writer instead unless APS5_NO_DEFER_STORES is set.
+constexpr const char* Waited = "test";
+constexpr const char* Ordered = "written buffer range";
+
+bool GpuOrdered(const char* reason) {
+    return reason == Ordered && !RuntimeSwitches::Set(RuntimeSwitch::NoDeferStores);
+}
+
+// The GPU-ordered write-back counters a flush added.
+class OrderCounts {
+public:
+    StorageTexture::GpuOrderCounts Added() const {
+        const auto now = StorageTexture::GpuOrderTotals();
+        StorageTexture::GpuOrderCounts added;
+        added.deferred = now.deferred - before.deferred;
+        added.unwatched = now.unwatched - before.unwatched;
+        added.completions = now.completions - before.completions;
+        added.lane = now.lane - before.lane;
+        added.leaseWaits = now.leaseWaits - before.leaseWaits;
+        added.leaseStamped = now.leaseStamped - before.leaseStamped;
+        added.keptForWriter = now.keptForWriter - before.keptForWriter;
+        return added;
+    }
+
+private:
+    StorageTexture::GpuOrderCounts before = StorageTexture::GpuOrderTotals();
+};
 
 constexpr std::size_t BlockBytes = 1u << 20u;
 constexpr std::uint32_t Width = 256;
@@ -150,32 +184,50 @@ void Fill(AgcDriver::VulkanDevice& device, std::uint64_t address, std::size_t by
     Require(OpenBatchWrites(address, bytes), what + "the fill is not a write of the open batch");
 }
 
-void RunWriterOutsideLayers(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
-    const std::string what = "storage flush ordering, writer outside the image's pending layers: ";
+void RunWriterOutsideLayers(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, const char* reason) {
+    const std::string what = std::string("storage flush ordering, writer outside the image's pending layers (") + reason + "): ";
     const auto* words = guest.Words() + offset / 4u;
     const auto image = StoreImage(device, guest, offset);
     const auto fill = image + ImageBytes + FillPast;
     Fill(device, fill, FillBytes, what);
-    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, static_cast<std::size_t>(fill + FillBytes - image), nullptr, "test"), what + "the image store left no results pending");
+    const OrderCounts counts;
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, static_cast<std::size_t>(fill + FillBytes - image), nullptr, reason), what + "the image store left no results pending");
     Require(OpenBatchWrites(fill, FillBytes), what + "the flush submitted and waited for a writer its stores cannot overwrite");
+    Require(counts.Added().deferred == (GpuOrdered(reason) ? 1u : 0u), what + "the flush was not GPU-ordered as its reason asks");
     device.WaitIdle();
     Require(words[FarDword] == Stored, what + "the pending image's texel was not stored");
     Require(words[(ImageBytes + FillPast) / 4u] == Filled, what + "the fill's bytes did not land");
 }
 
-void RunWriterInsideLayer(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset) {
-    const std::string what = "storage flush ordering, writer inside the image's pending layer: ";
+// `probe`: report the fill's word instead of requiring it (the --probe runs, with a condition switched off).
+void RunWriterInsideLayer(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, const char* reason, bool probe = false) {
+    const std::string what = std::string("storage flush ordering, writer inside the image's pending layer (") + reason + "): ";
     const auto* words = guest.Words() + offset / 4u;
     const auto image = StoreImage(device, guest, offset);
     const auto fill = image + OverwrittenDword * 4u;
     Fill(device, fill, 16u, what);
-    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "test"), what + "the image store left no results pending");
+    const OrderCounts counts;
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, reason), what + "the image store left no results pending");
+    const auto added = counts.Added();
+    if (GpuOrdered(reason)) {
+        // Recorded behind the fill, which is still in the open batch: the flush did not wait for it, and the block
+        // the fill wrote went to the fill without a compare of its unfinished bytes.
+        Require(added.deferred == 1u, what + "the flush was not GPU-ordered");
+        Require(OpenBatchWrites(fill, 16u), what + "the GPU-ordered flush waited for the fill");
+        Require(probe || added.keptForWriter >= 1u, what + "the block the unfinished fill writes was not left to the fill");
+    } else {
+        Require(added.deferred == 0u, what + "a flush that waits was GPU-ordered");
+    }
     device.WaitIdle();
+    if (probe) {
+        std::printf("%sword at the fill: 0x%08x (%s), %llu blocks left to the writer\n", what.c_str(), words[OverwrittenDword], words[OverwrittenDword] == Filled ? "the fill" : "older image texels over the fill", static_cast<unsigned long long>(added.keptForWriter));
+        return;
+    }
     Require(words[OverwrittenDword] == Filled, what + "the pending image's store put its older texels over a newer fill");
     Require(words[FarDword] == Stored, what + "the pending image's texel away from the newer fill was not stored");
 }
 
-void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, bool submit, const char* name) {
+void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t offset, bool submit, const char* name, const char* reason, bool probe = false) {
     const auto* words = guest.Words() + offset / 4u;
     const auto image = guest.Address() + offset;
     const auto target = device.Target();
@@ -191,28 +243,52 @@ void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t o
         }
         device.WaitRecorded(serial);
     }
-    const std::string what = std::string("storage flush ordering, ") + name + ": ";
+    const std::string what = std::string("storage flush ordering, ") + name + " (" + reason + "): ";
     Require(AddressBasedStorePending(image, !submit), what + "the address-based store was not pending in the expected batch at the flush");
-    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, "test"), what + "the image store left no results pending");
+    const OrderCounts counts;
+    Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, reason), what + "the image store left no results pending");
+    const auto added = counts.Added();
+    // A GPU-ordered flush still waits for an address-based lease over its stored layers, and that wait finds the
+    // address-based store stamped. One in flight whose batch already finished is retired by the flush's reap instead.
+    Require(added.deferred == (GpuOrdered(reason) ? 1u : 0u), what + "the flush was not GPU-ordered as its reason asks");
+    Require(submit || added.leaseWaits == (GpuOrdered(reason) ? 1u : 0u), what + "the GPU-ordered flush did not wait for the address-based lease");
+    Require(submit || !GpuOrdered(reason) || added.leaseStamped == 1u, what + "the lease wait did not see the address-based store stamp the stored blocks");
     device.WaitIdle();
+    if (probe) {
+        std::printf("%sword at the address-based store: 0x%08x (%s), %llu lease waits\n", what.c_str(), words[OverwrittenDword], words[OverwrittenDword] == Overwritten ? "the store" : "older image texels over the store", static_cast<unsigned long long>(added.leaseWaits));
+        return;
+    }
     Require(words[FarDword] == Stored, what + "the pending image's texel away from the newer write was not stored");
     Require(words[OverwrittenDword] == Overwritten, what + "the pending image's store put its older texels over a newer address-based store");
 }
 
 }
 
-int main() {
+// --probe: the GPU-ordered case once more with the condition it depends on switched off, reporting (not requiring)
+// the word it would otherwise protect: the keep-blocks rule (APS5_NO_DEFER_KEEP_WRITER) for the unfinished fill.
+int main(int argc, char** argv) {
     try {
+        const bool probe = argc > 1 && std::string_view(argv[1]) == "--probe";
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const bool watched = AgcDriver::GuestMemory::WriteWatched();
         GuestBlock guest(watched);
-        if (!watched) std::puts("guest memory has no write watch: the writer-in-flight case is skipped");
-        else if (!device->CanWaitUnlocked()) std::puts("the recorder cannot wait for the GPU without running completions: the writer-in-flight case is skipped");
-        else Run(*device, guest, 0, true, "writer in flight");
-        Run(*device, guest, BlockBytes / 2u, false, "writer in the open batch");
-        RunWriterOutsideLayers(*device, guest, BlockBytes / 4u);
-        RunWriterInsideLayer(*device, guest, 3u * BlockBytes / 4u);
+        GuestBlock ordered(watched);
+        if (probe) {
+            RuntimeSwitches::Assign(RuntimeSwitch::NoDeferKeepWriter, true);
+            RunWriterInsideLayer(*device, ordered, 3u * BlockBytes / 4u, Ordered, true);
+            RuntimeSwitches::Assign(RuntimeSwitch::NoDeferKeepWriter, false);
+            return 0;
+        }
+        for (const auto* reason : {Waited, Ordered}) {
+            const auto& block = reason == Waited ? guest : ordered;
+            if (!watched) std::puts("guest memory has no write watch: the writer-in-flight case is skipped");
+            else if (!device->CanWaitUnlocked()) std::puts("the recorder cannot wait for the GPU without running completions: the writer-in-flight case is skipped");
+            else Run(*device, block, 0, true, "writer in flight", reason);
+            Run(*device, block, BlockBytes / 2u, false, "writer in the open batch", reason);
+            RunWriterOutsideLayers(*device, block, BlockBytes / 4u, reason);
+            RunWriterInsideLayer(*device, block, 3u * BlockBytes / 4u, reason);
+        }
         std::puts("storage flush ordering tests passed");
         return 0;
     } catch (const std::exception& error) {

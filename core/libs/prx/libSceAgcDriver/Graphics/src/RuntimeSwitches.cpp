@@ -97,6 +97,11 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_DEFER_LABEL_READBACK",
     "APS5_DISPATCH_CACHE_LARGE",
     "APS5_RESOURCE_CACHE_LARGE",
+    "APS5_NO_DEFER_STORES",
+    "APS5_DEFER_UNWATCHED",
+    "APS5_DEFER_OVER_COMPLETIONS",
+    "APS5_DEFER_OVER_LANE",
+    "APS5_NO_DEFER_KEEP_WRITER",
 };
 
 struct Refusal {

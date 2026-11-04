@@ -4456,6 +4456,13 @@ std::uint64_t Recorder::PendingLeaseSerial(std::uint64_t address, std::size_t by
     return 0;
 }
 
+bool Recorder::LaneWriterOverlaps(int lane, std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    const auto end = address + bytes;
+    const auto writes = [&](const Batch& batch) { return batch.lane == lane && (overlaps(batch, address, end) || readOverlap(batch, address, end, ReadKind::AddressBased).has_value()); };
+    return anyOpen(writes) || std::any_of(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return writes(*batch); });
+}
+
 std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> exceptNotes) const {
     if (exceptNotes.empty()) return PendingWriterSerial(address, bytes);
     if (bytes == 0) return 0;
@@ -5343,18 +5350,18 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
     batchesLeftInFlight.fetch_add(inFlight.size(), std::memory_order_relaxed);
 }
 
-bool Recorder::writesOver(const Batch& batch, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd) {
+bool Recorder::writesOver(const Batch& batch, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd, bool leasesOnly) {
     if (leaseEnd > leaseBegin && readOverlap(batch, leaseBegin, leaseEnd, ReadKind::AddressBased).has_value()) return true;
     for (const auto& [begin, end] : ranges) {
-        if (end > begin && (overlaps(batch, begin, end) || readOverlap(batch, begin, end, ReadKind::AddressBased).has_value())) return true;
+        if (end > begin && ((!leasesOnly && overlaps(batch, begin, end)) || readOverlap(batch, begin, end, ReadKind::AddressBased).has_value())) return true;
     }
     return false;
 }
 
-Recorder::WriterWait Recorder::FinishWritersByLane(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd) {
+Recorder::WriterWait Recorder::FinishWritersByLane(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd, bool leasesOnly) {
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
-    const auto writes = [&](const Batch& batch) { return writesOver(batch, ranges, leaseBegin, leaseEnd); };
+    const auto writes = [&](const Batch& batch) { return writesOver(batch, ranges, leaseBegin, leaseEnd, leasesOnly); };
     WriterWait wait;
     for (int lane = 0; lane < 2; ++lane) {
         const auto& slot = lanes[static_cast<std::size_t>(lane)];
@@ -5381,8 +5388,8 @@ Recorder::WriterWait Recorder::FinishWritersByLane(std::span<const std::pair<std
     return wait;
 }
 
-bool Recorder::WritersPendingOver(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd) const {
-    const auto writes = [&](const Batch& batch) { return writesOver(batch, ranges, leaseBegin, leaseEnd); };
+bool Recorder::WritersPendingOver(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd, bool leasesOnly) const {
+    const auto writes = [&](const Batch& batch) { return writesOver(batch, ranges, leaseBegin, leaseEnd, leasesOnly); };
     if (anyOpen(writes)) return true;
     return std::any_of(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return writes(*batch); });
 }
