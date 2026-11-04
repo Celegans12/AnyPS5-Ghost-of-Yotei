@@ -31,6 +31,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <iterator>
 #include <limits>
@@ -73,6 +74,29 @@ struct WriteOriginRing {
 WriteOriginRing& writeOrigins() {
     static auto* ring = new WriteOriginRing();
     return *ring;
+}
+
+// APS5_TRACE_LABEL_CLOBBER (Recorder::NoteRecentLabel): the latest label dwords by address, oldest first in `order`
+// for eviction, and the ring of writes noted over one of them.
+struct RecentLabel {
+    std::uint32_t value = 0;
+    std::uint32_t queue = 0;
+    std::uint64_t serial = 0;
+    std::chrono::steady_clock::time_point at{};
+};
+struct LabelClobberState {
+    std::mutex mutex;
+    std::map<std::uint64_t, RecentLabel> labels;
+    std::deque<std::pair<std::uint64_t, std::uint64_t>> order;
+    std::uint64_t serial = 0;
+    std::array<Recorder::LabelClobber, 1024> clobbers{};
+    std::size_t next = 0;
+};
+constexpr std::size_t ClobbersPerWrite = 8;
+
+LabelClobberState& labelClobbers() {
+    static auto* state = new LabelClobberState();
+    return *state;
 }
 
 void noteWriteOrigin(std::uint64_t note, std::uint64_t begin, std::uint64_t end) {
@@ -4298,6 +4322,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
     noteWriteOrigin(writeNoteCount, address, end);
+    if (!ownLabel) NoteWriteOverLabels(address, end, writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     open->writeWords.push_back(word);
@@ -4328,6 +4353,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     noteWriteOrigin(writeNoteCount, address, address + bytes);
+    if (!ownLabel) NoteWriteOverLabels(address, address + bytes, writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
     batch.writeValues.push_back(-1);
     batch.writeWords.push_back(-1);
@@ -4454,6 +4480,13 @@ std::uint64_t Recorder::PendingLeaseSerial(std::uint64_t address, std::size_t by
         if (leases(**it)) return (*it)->serial;
     }
     return 0;
+}
+
+bool Recorder::LaneWriterOverlaps(int lane, std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    const auto end = address + bytes;
+    const auto writes = [&](const Batch& batch) { return batch.lane == lane && (overlaps(batch, address, end) || readOverlap(batch, address, end, ReadKind::AddressBased).has_value()); };
+    return anyOpen(writes) || std::any_of(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return writes(*batch); });
 }
 
 std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> exceptNotes) const {
@@ -4658,6 +4691,56 @@ void Recorder::SetWriteOrigin(std::uint64_t program) {
 
 std::uint64_t Recorder::CurrentWriteOrigin() {
     return threadWriteOrigin.program;
+}
+
+bool Recorder::LabelClobberTraced() {
+    static const bool traced = std::getenv("APS5_TRACE_LABEL_CLOBBER") != nullptr;
+    return traced;
+}
+
+void Recorder::NoteRecentLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint32_t queue) {
+    if (!LabelClobberTraced() || bytes.size() % 4 != 0) return;
+    auto& state = labelClobbers();
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(state.mutex);
+    for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {
+        RecentLabel label{0, queue, ++state.serial, now};
+        std::memcpy(&label.value, bytes.data() + offset, 4);
+        state.labels[address + offset] = label;
+        state.order.emplace_back(address + offset, label.serial);
+    }
+    while (state.order.size() > LabelClobberRecentLimit) {
+        const auto [dword, serial] = state.order.front();
+        state.order.pop_front();
+        if (const auto found = state.labels.find(dword); found != state.labels.end() && found->second.serial == serial) state.labels.erase(found);
+    }
+}
+
+void Recorder::NoteWriteOverLabels(std::uint64_t begin, std::uint64_t end, std::uint64_t note) {
+    if (!LabelClobberTraced() || end <= begin) return;
+    auto& state = labelClobbers();
+    const auto now = std::chrono::steady_clock::now();
+    const auto packet = GuestMemory::CurrentPacket();
+    std::lock_guard lock(state.mutex);
+    std::size_t noted = 0;
+    // A dword overlaps the range when it starts before the end and ends after the start.
+    for (auto it = state.labels.lower_bound(begin >= 3 ? begin - 3 : 0); it != state.labels.end() && it->first < end && noted < ClobbersPerWrite; ++it, ++noted) {
+        state.clobbers[state.next++ % state.clobbers.size()] = {it->first, it->second.value, it->second.queue, begin, end, note, threadWriteOrigin.program, packet.opcode, packet.queue,
+                                                                 StorageTexture::CurrentFlushReason(), std::chrono::duration<double, std::milli>(now - it->second.at).count()};
+    }
+}
+
+std::vector<Recorder::LabelClobber> Recorder::LabelClobbers(std::uint64_t address, std::size_t bytes) {
+    std::vector<LabelClobber> found;
+    if (!LabelClobberTraced() || bytes == 0) return found;
+    auto& state = labelClobbers();
+    std::lock_guard lock(state.mutex);
+    // Oldest first.
+    for (std::size_t i = 0; i < state.clobbers.size(); ++i) {
+        const auto& clobber = state.clobbers[(state.next + i) % state.clobbers.size()];
+        if (clobber.end != 0 && clobber.label < address + bytes && address < clobber.label + 4) found.push_back(clobber);
+    }
+    return found;
 }
 
 namespace {
@@ -5343,18 +5426,18 @@ void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUn
     batchesLeftInFlight.fetch_add(inFlight.size(), std::memory_order_relaxed);
 }
 
-bool Recorder::writesOver(const Batch& batch, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd) {
+bool Recorder::writesOver(const Batch& batch, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd, bool leasesOnly) {
     if (leaseEnd > leaseBegin && readOverlap(batch, leaseBegin, leaseEnd, ReadKind::AddressBased).has_value()) return true;
     for (const auto& [begin, end] : ranges) {
-        if (end > begin && (overlaps(batch, begin, end) || readOverlap(batch, begin, end, ReadKind::AddressBased).has_value())) return true;
+        if (end > begin && ((!leasesOnly && overlaps(batch, begin, end)) || readOverlap(batch, begin, end, ReadKind::AddressBased).has_value())) return true;
     }
     return false;
 }
 
-Recorder::WriterWait Recorder::FinishWritersByLane(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd) {
+Recorder::WriterWait Recorder::FinishWritersByLane(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd, bool leasesOnly) {
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
-    const auto writes = [&](const Batch& batch) { return writesOver(batch, ranges, leaseBegin, leaseEnd); };
+    const auto writes = [&](const Batch& batch) { return writesOver(batch, ranges, leaseBegin, leaseEnd, leasesOnly); };
     WriterWait wait;
     for (int lane = 0; lane < 2; ++lane) {
         const auto& slot = lanes[static_cast<std::size_t>(lane)];
@@ -5381,8 +5464,8 @@ Recorder::WriterWait Recorder::FinishWritersByLane(std::span<const std::pair<std
     return wait;
 }
 
-bool Recorder::WritersPendingOver(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd) const {
-    const auto writes = [&](const Batch& batch) { return writesOver(batch, ranges, leaseBegin, leaseEnd); };
+bool Recorder::WritersPendingOver(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd, bool leasesOnly) const {
+    const auto writes = [&](const Batch& batch) { return writesOver(batch, ranges, leaseBegin, leaseEnd, leasesOnly); };
     if (anyOpen(writes)) return true;
     return std::any_of(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return writes(*batch); });
 }

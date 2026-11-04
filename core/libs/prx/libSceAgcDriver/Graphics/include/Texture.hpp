@@ -300,6 +300,28 @@ public:
     static constexpr std::uint64_t SmallStoreBytes = 64 * 1024;
     static std::size_t StoreSmallPending(const char* reason);
     static void StoreReadbackBeforeLabel(const char* reason);
+    // GPU-ordered write-backs (Texture.cpp GpuOrderedReasons), cumulative: FlushPending calls that recorded their
+    // write-backs behind the pending writer, the ones a condition kept waiting (outside the write watch, over a
+    // copied writer or completion store, over an async-lane writer), deferred ones that still waited for an
+    // address-based lease (and of those, the waits whose completions stamped the stored blocks), and 64 KiB blocks a
+    // deferred write-back left to an unfinished writer.
+    struct GpuOrderCounts {
+        std::uint64_t deferred = 0;
+        std::uint64_t unwatched = 0;
+        std::uint64_t completions = 0;
+        std::uint64_t lane = 0;
+        std::uint64_t leaseWaits = 0;
+        std::uint64_t leaseStamped = 0;
+        std::uint64_t keptForWriter = 0;
+        // Flushes over a pending lease that skipped its wait, those the lease guard sampled (they wait), and whether
+        // a sampled wait stamped the stored blocks (then every later flush waits for leases).
+        std::uint64_t leaseSkipped = 0;
+        std::uint64_t leaseSampled = 0;
+        bool leaseGuardTripped = false;
+    };
+    static GpuOrderCounts GpuOrderTotals();
+    // The reason of the write-back this thread is storing ("readback before label", "storage refresh", ...), or null.
+    static const char* CurrentFlushReason();
     static constexpr const char* DeferredLabelReadbackReason = "readback before label, deferred";
     static std::uint64_t DeferredLabelReadbacks();
     static std::size_t StoreDrawnLinear(const char* reason);

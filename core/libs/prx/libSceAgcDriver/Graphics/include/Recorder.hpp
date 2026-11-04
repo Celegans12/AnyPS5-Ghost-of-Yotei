@@ -455,13 +455,18 @@ public:
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t PendingWriterSerial(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> exceptNotes) const;
     std::uint64_t PendingLeaseSerial(std::uint64_t address, std::size_t bytes) const;
+    // Whether a batch of `lane` (open or in flight) holds a writer PendingWriterSerial would find over the range: a
+    // noted write or an address-based lease. The GPU-ordered storage write-backs' lane condition (Texture.cpp).
+    bool LaneWriterOverlaps(int lane, std::uint64_t address, std::size_t bytes) const;
+    // A storage flush's writer wait (FinishWritersByLane): `leasesOnly` counts only address-based leases (the lease
+    // wait of a GPU-ordered write-back, Texture.cpp), not noted writes.
     struct WriterWait {
         std::array<std::uint64_t, 2> targets{};
         std::size_t leftInFlight = 0;
         std::size_t leftOpen = 0;
     };
-    WriterWait FinishWritersByLane(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd);
-    bool WritersPendingOver(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd) const;
+    WriterWait FinishWritersByLane(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd, bool leasesOnly = false);
+    bool WritersPendingOver(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd, bool leasesOnly = false) const;
     // What SyncThrough(address, bytes) would wait for, for the [hooksync] attribution: the newest
     // batch whose noted range overlaps the access (the open batch counts first, with the serial it
     // will get), whether that batch's fence has already signaled (its GPU work is done, so the
@@ -494,6 +499,30 @@ public:
     static void SetWriteOrigin(std::uint64_t program);
     static void SetWriteOriginKernel(std::uint32_t mask, std::uint32_t value);
     static std::uint64_t CurrentWriteOrigin();
+    // APS5_TRACE_LABEL_CLOBBER=1: the dwords of the latest 8192 label stores (NoteRecentLabel, every label path)
+    // and each later write over one of them (NoteWriteOverLabels: every noted non-label write and every storage
+    // write-back's stored ranges), with the write's origin, in a ring of 1024 that LabelClobbers reads back: a wait
+    // that times out on a label reading another value than was stored names the writes that landed over it.
+    struct LabelClobber {
+        std::uint64_t label = 0;
+        std::uint32_t labelValue = 0;
+        std::uint32_t labelQueue = 0;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        // The write note (0: a storage write-back's stored range), the recording program and packet, the
+        // write-back reason on the thread (StorageTexture::CurrentFlushReason), and how long after the label.
+        std::uint64_t note = 0;
+        std::uint64_t program = 0;
+        std::uint32_t opcode = 0;
+        std::uint32_t queue = 0;
+        const char* reason = nullptr;
+        double afterMs = 0;
+    };
+    static constexpr std::size_t LabelClobberRecentLimit = 8192;
+    static bool LabelClobberTraced();
+    static void NoteRecentLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint32_t queue);
+    static void NoteWriteOverLabels(std::uint64_t begin, std::uint64_t end, std::uint64_t note);
+    static std::vector<LabelClobber> LabelClobbers(std::uint64_t address, std::size_t bytes);
     enum class CheckpointKind : std::uint64_t { Draw = 0x1, CopyIn = 0xf1, CopyBack = 0xf2, DiffCopyBack = 0xf3, BindlessPublish = 0xf4, DmaCopy = 0xf5, GpuCopies = 0xf6, BatchBegin = 0xb0, BatchEnd = 0xb1, AsyncDispatch = 0xb2 };
     static void SetCheckpointFunction(PFN_vkCmdSetCheckpointNV function);
     static bool CheckpointsOn();
@@ -1156,7 +1185,7 @@ private:
     void removeLabels(Batch& batch);
     void release(Batch& batch) noexcept;
     static bool overlaps(const Batch& batch, std::uint64_t address, std::uint64_t end);
-    static bool writesOver(const Batch& batch, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd);
+    static bool writesOver(const Batch& batch, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t leaseBegin, std::uint64_t leaseEnd, bool leasesOnly);
     static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only = std::nullopt);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> notedReads(const Batch& batch);
     bool signaled(const Batch& batch) const;
