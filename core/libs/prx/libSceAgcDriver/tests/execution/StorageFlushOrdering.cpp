@@ -57,6 +57,9 @@ public:
         added.leaseWaits = now.leaseWaits - before.leaseWaits;
         added.leaseStamped = now.leaseStamped - before.leaseStamped;
         added.keptForWriter = now.keptForWriter - before.keptForWriter;
+        added.leaseSkipped = now.leaseSkipped - before.leaseSkipped;
+        added.leaseSampled = now.leaseSampled - before.leaseSampled;
+        added.leaseGuardTripped = now.leaseGuardTripped;
         return added;
     }
 
@@ -248,11 +251,12 @@ void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t o
     const OrderCounts counts;
     Require(AgcDriver::Graphics::StorageTexture::FlushPending(image, ImageBytes, nullptr, reason), what + "the image store left no results pending");
     const auto added = counts.Added();
-    // A GPU-ordered flush still waits for an address-based lease over its stored layers, and that wait finds the
-    // address-based store stamped. One in flight whose batch already finished is retired by the flush's reap instead.
+    // A GPU-ordered flush skips an address-based lease except for the lease guard's samples; the first lease-covered
+    // flush is a sample, and its wait finds the address-based store stamped, which turns lease waits back on. One in
+    // flight whose batch already finished is retired by the flush's reap instead.
     Require(added.deferred == (GpuOrdered(reason) ? 1u : 0u), what + "the flush was not GPU-ordered as its reason asks");
-    Require(submit || added.leaseWaits == (GpuOrdered(reason) ? 1u : 0u), what + "the GPU-ordered flush did not wait for the address-based lease");
-    Require(submit || !GpuOrdered(reason) || added.leaseStamped == 1u, what + "the lease wait did not see the address-based store stamp the stored blocks");
+    Require(probe || submit || added.leaseWaits == (GpuOrdered(reason) ? 1u : 0u), what + "the GPU-ordered flush did not wait for the address-based lease");
+    Require(probe || submit || !GpuOrdered(reason) || (added.leaseStamped == 1u && added.leaseGuardTripped), what + "the lease guard did not see the address-based store stamp the stored blocks");
     device.WaitIdle();
     if (probe) {
         std::printf("%sword at the address-based store: 0x%08x (%s), %llu lease waits\n", what.c_str(), words[OverwrittenDword], words[OverwrittenDword] == Overwritten ? "the store" : "older image texels over the store", static_cast<unsigned long long>(added.leaseWaits));
@@ -264,8 +268,9 @@ void Run(AgcDriver::VulkanDevice& device, const GuestBlock& guest, std::size_t o
 
 }
 
-// --probe: the GPU-ordered case once more with the condition it depends on switched off, reporting (not requiring)
-// the word it would otherwise protect: the keep-blocks rule (APS5_NO_DEFER_KEEP_WRITER) for the unfinished fill.
+// --probe: the GPU-ordered cases once more with the condition each depends on switched off, reporting (not
+// requiring) the words they would otherwise protect: the keep-blocks rule (APS5_NO_DEFER_KEEP_WRITER) for the
+// unfinished fill, the lease guard's sample wait (APS5_NO_LEASE_GUARD) for the address-based store.
 int main(int argc, char** argv) {
     try {
         const bool probe = argc > 1 && std::string_view(argv[1]) == "--probe";
@@ -278,6 +283,9 @@ int main(int argc, char** argv) {
             RuntimeSwitches::Assign(RuntimeSwitch::NoDeferKeepWriter, true);
             RunWriterInsideLayer(*device, ordered, 3u * BlockBytes / 4u, Ordered, true);
             RuntimeSwitches::Assign(RuntimeSwitch::NoDeferKeepWriter, false);
+            RuntimeSwitches::Assign(RuntimeSwitch::NoLeaseGuard, true);
+            Run(*device, ordered, BlockBytes / 2u, false, "writer in the open batch", Ordered, true);
+            RuntimeSwitches::Assign(RuntimeSwitch::NoLeaseGuard, false);
             return 0;
         }
         for (const auto* reason : {Waited, Ordered}) {

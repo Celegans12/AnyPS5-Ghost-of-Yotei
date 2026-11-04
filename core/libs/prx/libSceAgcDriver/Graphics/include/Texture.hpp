@@ -313,6 +313,11 @@ public:
         std::uint64_t leaseWaits = 0;
         std::uint64_t leaseStamped = 0;
         std::uint64_t keptForWriter = 0;
+        // Flushes over a pending lease that skipped its wait, those the lease guard sampled (they wait), and whether
+        // a sampled wait stamped the stored blocks (then every later flush waits for leases).
+        std::uint64_t leaseSkipped = 0;
+        std::uint64_t leaseSampled = 0;
+        bool leaseGuardTripped = false;
     };
     static GpuOrderCounts GpuOrderTotals();
     static constexpr const char* DeferredLabelReadbackReason = "readback before label, deferred";

@@ -102,6 +102,8 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_DEFER_OVER_COMPLETIONS",
     "APS5_DEFER_OVER_LANE",
     "APS5_NO_DEFER_KEEP_WRITER",
+    "APS5_NO_DEFER_OVER_LEASES",
+    "APS5_NO_LEASE_GUARD",
 };
 
 struct Refusal {
