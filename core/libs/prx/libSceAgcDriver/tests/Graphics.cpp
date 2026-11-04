@@ -7318,6 +7318,16 @@ void sampledTextureBudgetTests() {
     Require(TextureCacheBudgetsFor(memory, &reported, use).overflow == 4 * GiB, "16 GiB of system heap budget with 11 GiB used does not leave 4 GiB of overflow budget");
     reported.heapUsage[1] = 16 * GiB;
     Require(TextureCacheBudgetsFor(memory, &reported, use).overflow == 1, "a full system heap does not leave the overflow type the least budget");
+    {
+        using AgcDriver::Graphics::BorrowStorageShare;
+        const auto lent = BorrowStorageShare(shared, 2 * GiB);
+        expect(lent, 7232 * MiB, 4 * GiB, 10304 * MiB, "a storage cache holding 2 of its 4 GiB did not lend the other 2 GiB to the sampled ceiling");
+        Require(lent.share == lent.ceiling + (shared.share - shared.ceiling) && lent.ceiling + 2 * GiB + (shared.share - shared.ceiling) == shared.target, "the borrowed ceiling, the storage cache's bytes and the sampled images outside the cache do not add up to the share");
+        expect(BorrowStorageShare(shared, 4 * GiB), 5184 * MiB, 4 * GiB, 10304 * MiB, "a full storage cache lent bytes it holds");
+        expect(BorrowStorageShare(shared, 5 * GiB), 5184 * MiB, 4 * GiB, 10304 * MiB, "a storage cache over its budget took the sampled ceiling down below the unborrowed one");
+        const auto fixed = TextureCacheBudgetsFor(memory, nullptr, {});
+        expect(BorrowStorageShare(fixed, 0), 5 * GiB, 4 * GiB, 0, "the static budgets without VK_EXT_memory_budget borrowed a share they do not have");
+    }
     reported.heapBudget[1] = 100 * GiB;
     reported.heapUsage[1] = 0;
     reported.heapUsage[2] = 3 * GiB;

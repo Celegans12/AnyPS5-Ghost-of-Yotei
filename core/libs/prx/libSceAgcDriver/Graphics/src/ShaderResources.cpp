@@ -350,6 +350,33 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
     return cache.entries.end();
 }
 
+// Diagnostic (APS5_SAMPLED_TRACE=<file>): one 16-byte record per sampled-cache event (touch, insert,
+// snapshot made and not admitted, eviction, stale entry) for an offline replay of the cache's
+// policy at other budgets (research/speed/ccom/lru_sim.py). Nothing is traced while it is unset.
+enum class SampledTraceEvent : std::uint8_t { Touch, Insert, MadeUncached, Evict, Stale };
+
+void traceSampled(SampledTraceEvent event, const TextureKey& key, std::uint64_t bytes) {
+    static FILE* const file = [] {
+        const char* path = std::getenv("APS5_SAMPLED_TRACE");
+        return path != nullptr && *path != '\0' ? std::fopen(path, "wb") : nullptr;
+    }();
+    if (file == nullptr) return;
+    struct Record {
+        std::uint64_t key;
+        std::uint32_t kib;
+        std::uint32_t presentEvent;
+    };
+    static AgcDriver::Mutex mutex;
+    static std::vector<Record> pending;
+    const Record record{TextureKeyHash{}(key), static_cast<std::uint32_t>(std::min<std::uint64_t>((bytes + 1023u) >> 10u, 0xffffffffu)), static_cast<std::uint32_t>((Recorder::Presents() << 4u) | static_cast<std::uint32_t>(event))};
+    std::lock_guard lock(mutex);
+    pending.push_back(record);
+    if (pending.size() < 4096) return;
+    std::fwrite(pending.data(), sizeof(Record), pending.size(), file);
+    std::fflush(file);
+    pending.clear();
+}
+
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
     cache.bytes -= it->accounted;
     if (it->source == nullptr) {
@@ -416,6 +443,7 @@ std::uint64_t currentFrame(TextureCache& cache) {
 
 // Moves an entry to the front (most recently used); the recorded work about to bind it uses it.
 void touchTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
+    traceSampled(SampledTraceEvent::Touch, it->key, it->accounted);
     cache.entries.splice(cache.entries.begin(), cache.entries, it);
     it->present = currentFrame(cache);
     it->presentSeen = Recorder::Presents();
@@ -432,7 +460,11 @@ bool textureInUse(const CachedTexture& entry, std::uint64_t retired) {
 
 enum class EvictionPath : std::size_t { Admission, Share, Reclaim };
 
+void noteMadeEviction(const TextureKey& key);
+
 void countEvicted(TextureCache& cache, const CachedTexture& entry, EvictionPath path) {
+    noteMadeEviction(entry.key);
+    traceSampled(SampledTraceEvent::Evict, entry.key, entry.accounted);
     ++cache.counts.evicted;
     ++cache.totals.evicted;
     cache.counts.evictedBytes += entry.accounted;
@@ -1294,6 +1326,17 @@ TextureCacheBudgets currentBudgets(const Context& context) {
     return budgets;
 }
 
+// APS5_SAMPLED_BORROW=1 (runtime switch): the sampled cache's own admission and eviction count the
+// storage image cache's bytes instead of its whole budget, so the part of the storage share that
+// cache leaves unused holds sampled snapshots (BorrowStorageShare). Read at every lookup, so a
+// storage cache that grows into its share takes it back at the next admission. The budgets other
+// users read (CurrentTextureCacheBudgets: the bindless texture service) stay unborrowed.
+TextureCacheBudgets sampledCacheBudgets(const Context& context) {
+    auto budgets = currentBudgets(context);
+    if (forcedCacheBudget() == 0 && RuntimeSwitches::Set(RuntimeSwitch::SampledBorrow)) budgets = BorrowStorageShare(budgets, storageCacheBytes());
+    return budgets;
+}
+
 TextureCacheBudgets readBudgets(const Context& context, bool reread) {
     if (const auto forced = forcedCacheBudget(); forced != 0) return {forced, forced + forced / 4u, forced, 0, forced + forced / 4u, 0};
     if (context.memoryProperties2 == nullptr || context.physical == VK_NULL_HANDLE) return TextureCacheBudgetsFor(context.memory, nullptr, {});
@@ -1415,6 +1458,105 @@ void boundOverflow(const Context& context) {
     }
 }
 
+// APS5_PROFILE_DRAW: where a made sampled snapshot's time goes and why the cache had none, by
+// side (untagged threads = the draw committer, queue workers), printed as [made-snapshots] every 10 s.
+struct MadeSnapshotProfile {
+    enum Reason : std::size_t { New, NewKeyKnownSurface, Evicted, Stale, OneOffGone, OneOffChanged, Again, ReasonCount };
+    enum Step : std::size_t { Pre, LockWait, HitCheck, Read, Room, Create, Hash, Admit, StepCount };
+    enum Size : std::size_t { Under64K, Under1M, Under4M, Over4M, SizeCount };
+    AgcDriver::Mutex mutex;
+    std::array<std::array<std::uint64_t, ReasonCount>, 2> reasons{};
+    std::array<std::array<double, ReasonCount>, 2> reasonMs{};
+    std::array<std::array<double, StepCount>, 2> stepMs{};
+    std::array<std::array<std::uint64_t, SizeCount>, 2> sizes{};
+    std::array<std::array<double, SizeCount>, 2> sizeMs{};
+    std::array<std::uint64_t, 2> made{}, uncached{}, bytes{};
+    std::array<double, 2> ms{};
+    std::unordered_set<std::uint64_t> seen, evicted, surfaces;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+MadeSnapshotProfile& MadeSnapshots() {
+    static MadeSnapshotProfile profile;
+    return profile;
+}
+
+void noteMadeEviction(const TextureKey& key) {
+    if (!LookupOutcomes::Profiled()) return;
+    auto& profile = MadeSnapshots();
+    std::lock_guard lock(profile.mutex);
+    if (profile.evicted.size() < (1u << 20u)) profile.evicted.insert(TextureKeyHash{}(key));
+}
+
+struct MadeSnapshotTimer {
+    bool on = false;
+    std::chrono::steady_clock::time_point start{}, last{};
+    std::array<double, MadeSnapshotProfile::StepCount> ms{};
+    bool stale = false, oneOffGone = false, oneOffChanged = false;
+    void step(MadeSnapshotProfile::Step which) {
+        if (!on) return;
+        const auto now = std::chrono::steady_clock::now();
+        ms[which] += std::chrono::duration<double, std::milli>(now - last).count();
+        last = now;
+    }
+    void finish(const TextureKey& key, std::uint64_t address, std::uint64_t bytes, bool admitted) {
+        if (!on) return;
+        const auto total = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        const std::size_t side = GuestMemory::GpuLockThreadTag() == 0xffffffffu ? 0 : 1;
+        auto& profile = MadeSnapshots();
+        std::lock_guard lock(profile.mutex);
+        const auto hash = TextureKeyHash{}(key);
+        const bool seen = profile.seen.contains(hash);
+        const auto reason = stale ? MadeSnapshotProfile::Stale : oneOffChanged ? MadeSnapshotProfile::OneOffChanged : oneOffGone ? MadeSnapshotProfile::OneOffGone : profile.evicted.erase(hash) != 0 ? MadeSnapshotProfile::Evicted : seen ? MadeSnapshotProfile::Again : profile.surfaces.contains(address * 0x9e3779b97f4a7c15ull ^ bytes) ? MadeSnapshotProfile::NewKeyKnownSurface : MadeSnapshotProfile::New;
+        if (!seen && profile.seen.size() < (1u << 21u)) profile.seen.insert(hash);
+        if (profile.surfaces.size() < (1u << 21u)) profile.surfaces.insert(address * 0x9e3779b97f4a7c15ull ^ bytes);
+        ++profile.reasons[side][reason];
+        profile.reasonMs[side][reason] += total;
+        for (std::size_t i = 0; i < MadeSnapshotProfile::StepCount; ++i) profile.stepMs[side][i] += ms[i];
+        const auto size = bytes < (64u << 10u) ? MadeSnapshotProfile::Under64K : bytes < (1u << 20u) ? MadeSnapshotProfile::Under1M : bytes < (4u << 20u) ? MadeSnapshotProfile::Under4M : MadeSnapshotProfile::Over4M;
+        ++profile.sizes[side][size];
+        profile.sizeMs[side][size] += total;
+        ++profile.made[side];
+        profile.uncached[side] += admitted ? 0u : 1u;
+        profile.bytes[side] += bytes;
+        profile.ms[side] += total;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - profile.lastReport < std::chrono::seconds(10)) return;
+        profile.lastReport = now;
+        static constexpr const char* sides[2] = {"untagged threads (draw committer, presenter)", "queue workers"};
+        static constexpr const char* reasonNames[MadeSnapshotProfile::ReasonCount] = {"new surface", "new key of a known surface", "evicted before", "stale entry", "one-off released", "one-off changed", "made before, not evicted"};
+        static constexpr const char* stepNames[MadeSnapshotProfile::StepCount] = {"pre-lock", "lock wait", "hit check", "read", "room", "create", "hash", "admit"};
+        static constexpr const char* sizeNames[MadeSnapshotProfile::SizeCount] = {"<64K", "<1M", "<4M", ">=4M"};
+        for (std::size_t which = 0; which < 2; ++which) {
+            std::string report;
+            char text[128];
+            report += "; by reason (count x ms):";
+            for (std::size_t i = 0; i < MadeSnapshotProfile::ReasonCount; ++i) {
+                std::snprintf(text, sizeof(text), " %s %llux%.1f", reasonNames[i], static_cast<unsigned long long>(profile.reasons[which][i]), profile.reasonMs[which][i]);
+                report += text;
+            }
+            report += "; steps ms:";
+            for (std::size_t i = 0; i < MadeSnapshotProfile::StepCount; ++i) {
+                std::snprintf(text, sizeof(text), " %s %.1f", stepNames[i], profile.stepMs[which][i]);
+                report += text;
+            }
+            report += "; by size (count x ms):";
+            for (std::size_t i = 0; i < MadeSnapshotProfile::SizeCount; ++i) {
+                std::snprintf(text, sizeof(text), " %s %llux%.1f", sizeNames[i], static_cast<unsigned long long>(profile.sizes[which][i]), profile.sizeMs[which][i]);
+                report += text;
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[made-snapshots] (10 s) %s: %llu made in %.1f ms (%llu MiB, %llu not admitted)%s; keys seen %zu, evicted keys held %zu\n", sides[which], static_cast<unsigned long long>(profile.made[which]), profile.ms[which], static_cast<unsigned long long>(profile.bytes[which] >> 20u), static_cast<unsigned long long>(profile.uncached[which]), report.c_str(), profile.seen.size(), profile.evicted.size());
+            profile.reasons[which] = {};
+            profile.reasonMs[which] = {};
+            profile.stepMs[which] = {};
+            profile.sizes[which] = {};
+            profile.sizeMs[which] = {};
+            profile.made[which] = profile.uncached[which] = profile.bytes[which] = 0;
+            profile.ms[which] = 0;
+        }
+    }
+};
+
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
     const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     if (resource.baseAddress != requested.baseAddress) guestBytes = 0;
@@ -1482,6 +1624,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    MadeSnapshotTimer made;
+    made.on = profile;
+    made.start = made.last = start;
     std::optional<DccKeys> scanned;
     const auto scanKeys = [&] {
         if (scanned.has_value()) return *scanned;
@@ -1705,7 +1850,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
     const DropReleasedDependents dropAfterUnlock;
+    made.step(MadeSnapshotProfile::Pre);
     const SampledCacheLock lock(cache);
+    made.step(MadeSnapshotProfile::LockWait);
     dropUncachedViews(cache);
     // Diagnostic (APS5_TRACE_SAMPLED_ADDR=<hex surface address>): the lookup's decisions for one surface: the pending
     // image found, its filled keys, the keys read, whether the keys' fill overrides it, and the cache entry found.
@@ -1866,11 +2013,13 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 return it->texture;
             }
         }
+        made.stale = true;
+        traceSampled(SampledTraceEvent::Stale, it->key, it->accounted);
         eraseTexture(cache, it);
         ++cache.counts.stale;
     }
     if (sliceCopy) storeSlices("no current cached snapshot");
-    const auto budgets = currentBudgets(context);
+    const auto budgets = sampledCacheBudgets(context);
     const auto insert = [&](CachedTexture&& entry, const std::shared_ptr<Texture>& texture) {
         cache.bytes += entry.accounted;
         if (source == nullptr) {
@@ -1879,6 +2028,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         }
         entry.present = currentFrame(cache);
         entry.presentSeen = Recorder::Presents();
+        traceSampled(SampledTraceEvent::Insert, entry.key, entry.accounted);
         ++cache.counts.inserted;
         ++cache.totals.inserted;
         texture->SetSampledCacheState(Texture::CacheState::Cached);
@@ -1919,9 +2069,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return texture;
             }
+            (texture == nullptr ? made.oneOffGone : made.oneOffChanged) = true;
             eraseOneOff(cache, found);
         }
     }
+    bool madeSnapshot = false;
     CachedTexture entry{key, address, source != nullptr ? 0u : guestBytes, {}, nullptr, *keys, snapshotGeneration};
     entry.committed = std::move(committed);
     const auto createTexture = [&](auto&&... args) {
@@ -1995,8 +2147,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             static std::atomic<std::uint64_t> clearReuses{0};
             clearReuses.fetch_add(1, std::memory_order_relaxed);
         } else {
+        made.step(MadeSnapshotProfile::HitCheck);
+        madeSnapshot = true;
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
+        made.step(MadeSnapshotProfile::Read);
         if (!pending) entry.untracked = untracked;
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
@@ -2005,7 +2160,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, snapshot.size() / 64);
         }
         const bool spill = SpillEnabled() && !makeRoom(cache, bytes, budgets);
+        made.step(MadeSnapshotProfile::Room);
         entry.texture = createTexture(*context.detiler, resource, components, snapshot, depthCompare, spill);
+        made.step(MadeSnapshotProfile::Create);
         ++cache.counts.made;
         ++cache.totals.made;
         cache.madeSurfaces.insert(address * 0x9e3779b97f4a7c15ull ^ guestBytes);
@@ -2019,6 +2176,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             entry.hashes.resize(GuestMemory::HashBlockCount(address, bytes));
             GuestMemory::HashBlocksOf(address, snapshot, entry.hashes);
         }
+        made.step(MadeSnapshotProfile::Hash);
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
         if (clearReuse && !entry.texture->Spilled()) {
@@ -2035,6 +2193,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
         reportCacheCounts(cache, budgets);
         reportTextureCounters();
+        if (madeSnapshot) {
+            made.step(MadeSnapshotProfile::Admit);
+            made.finish(key, address, guestBytes, false);
+            traceSampled(SampledTraceEvent::MadeUncached, key, texture->AllocationBytes());
+        }
         if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
         return texture;
     }
@@ -2042,6 +2205,10 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     insert(std::move(entry), texture);
     reportCacheCounts(cache, budgets);
     reportTextureCounters();
+    if (madeSnapshot) {
+        made.step(MadeSnapshotProfile::Admit);
+        made.finish(key, address, guestBytes, true);
+    }
     if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
     return texture;
 }
@@ -2344,6 +2511,18 @@ TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryPropertie
         overflow = std::max<std::uint64_t>(systemBudget > reserve ? systemBudget - reserve : 0u, 1u);
     }
     return {ceiling - ceiling / 5u, ceiling, storage, target, ceiling + outside, overflow};
+}
+
+TextureCacheBudgets BorrowStorageShare(const TextureCacheBudgets& budgets, std::uint64_t storageCached) {
+    if (budgets.target == 0 || storageCached >= budgets.storage || budgets.share < budgets.ceiling) return budgets;
+    const auto outside = budgets.share - budgets.ceiling;
+    const auto taken = storageCached + outside;
+    const auto ceiling = std::max(budgets.ceiling, budgets.target > taken ? budgets.target - taken : 0u);
+    auto borrowed = budgets;
+    borrowed.ceiling = ceiling;
+    borrowed.sampled = ceiling - ceiling / 5u;
+    borrowed.share = ceiling + outside;
+    return borrowed;
 }
 
 bool SampledBudgetReportDue(std::uint64_t reported, std::uint64_t budget, std::chrono::steady_clock::duration sinceReport) {

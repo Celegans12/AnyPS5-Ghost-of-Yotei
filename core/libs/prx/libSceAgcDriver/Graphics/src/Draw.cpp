@@ -652,6 +652,12 @@ struct DrawOutcome {
     // in ownSyncUs: those wait by design and would otherwise count as nested hook waits.
     double hookWaitUs = 0;
     double ownSyncUs = 0;
+    // APS5_PROFILE_DRAW: the image lookups this draw made on its thread (sampled and storage rows)
+    // and the sampled snapshots among them, for the [draws-kind] line.
+    double imagesMs = 0;
+    double madeMs = 0;
+    std::uint64_t made = 0;
+    std::uint64_t imageLookups = 0;
 };
 
 // The resources of a draw: a recipe hit (reserved for the draw recipe step), a resource-cache
@@ -663,6 +669,9 @@ struct DrawProfile {
     AgcDriver::Mutex mutex;
     std::array<double, KindCount> kindUs{};
     std::array<std::uint64_t, KindCount> kindCounts{};
+    std::array<std::array<double, PhaseCount>, KindCount> kindPhaseUs{};
+    std::array<double, KindCount> kindImagesMs{}, kindMadeMs{};
+    std::array<std::uint64_t, KindCount> kindMade{}, kindImageLookups{};
     std::uint64_t fullScissorLookups = 0;
     std::uint64_t partialLookups = 0;
     std::uint64_t pagesWalked = 0;
@@ -791,6 +800,11 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     if (outcome.kind < KindCount) {
         ++profile.kindCounts[outcome.kind];
         profile.kindUs[outcome.kind] += drawUs;
+        for (std::size_t i = 0; i < PhaseCount; ++i) profile.kindPhaseUs[outcome.kind][i] += us[i];
+        profile.kindImagesMs[outcome.kind] += outcome.imagesMs;
+        profile.kindMadeMs[outcome.kind] += outcome.madeMs;
+        profile.kindMade[outcome.kind] += outcome.made;
+        profile.kindImageLookups[outcome.kind] += outcome.imageLookups;
     }
     if (outcome.validateMemoized) ++(outcome.validateHit ? profile.validateHits : profile.validateMisses);
     if (!ProfileWindows::ClockDue(profile.lastReport)) return;
@@ -883,6 +897,22 @@ void printDrawWindow(DrawProfile& profile, const char* window) {
     profile.slowLookupUs = 0;
     profile.fullScissorLookups = profile.partialLookups = profile.pagesWalked = 0;
     profile.lookupUs = 0;
+    for (std::size_t kind = 0; kind < KindCount; ++kind) {
+        if (profile.kindCounts[kind] == 0) continue;
+        std::string kindLine;
+        char text[96];
+        for (std::size_t i = 0; i < PhaseCount; ++i) {
+            if (profile.kindPhaseUs[kind][i] <= 0) continue;
+            std::snprintf(text, sizeof(text), " %s=%.1fms", DrawPhaseNames[i], profile.kindPhaseUs[kind][i] / 1000.0);
+            kindLine += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[draws-kind] (%s) %s %llu draws in %.1f ms:%s; image lookups %llu in %.1f ms, sampled snapshots made %llu in %.1f ms\n", window, DrawKindNames[kind], static_cast<unsigned long long>(profile.kindCounts[kind]), profile.kindUs[kind] / 1000.0, kindLine.c_str(), static_cast<unsigned long long>(profile.kindImageLookups[kind]), profile.kindImagesMs[kind], static_cast<unsigned long long>(profile.kindMade[kind]), profile.kindMadeMs[kind]);
+    }
+    for (auto& phases : profile.kindPhaseUs) phases.fill(0);
+    profile.kindImagesMs.fill(0);
+    profile.kindMadeMs.fill(0);
+    profile.kindMade.fill(0);
+    profile.kindImageLookups.fill(0);
     profile.kindUs.fill(0);
     profile.kindCounts.fill(0);
     profile.cacheHits = profile.cacheMisses = profile.cacheInvalidated = profile.uncacheable = 0;
@@ -1360,7 +1390,10 @@ struct DrawTimer {
     bool profile;
     std::chrono::steady_clock::time_point phaseStart;
     std::array<double, PhaseCount> us{};
-    explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {}
+    LookupOutcomes imagesBefore;
+    explicit DrawTimer(bool profile) : profile(profile), phaseStart(std::chrono::steady_clock::now()) {
+        if (profile) imagesBefore = ThreadLookupOutcomes();
+    }
     void phase(DrawPhase which) {
         if (!profile) return;
         const auto now = std::chrono::steady_clock::now();
@@ -1377,6 +1410,15 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     outcome.hookWaitUs = std::max(0.0, Recorder::ThreadWaitedMs() - waitedBefore - ownWaitedMs) * 1000.0;
     outcome.ownSyncUs = ownWaitedMs * 1000.0;
+    {
+        const auto& after = ThreadLookupOutcomes();
+        for (std::size_t kind = LookupOutcomes::SampledFast; kind <= LookupOutcomes::StorageMade; ++kind) {
+            if (after.ms[kind] >= timer.imagesBefore.ms[kind]) outcome.imagesMs += after.ms[kind] - timer.imagesBefore.ms[kind];
+            if (kind != LookupOutcomes::SampledFastMiss && after.counts[kind] >= timer.imagesBefore.counts[kind]) outcome.imageLookups += after.counts[kind] - timer.imagesBefore.counts[kind];
+        }
+        if (after.counts[LookupOutcomes::SampledMadeSnapshot] >= timer.imagesBefore.counts[LookupOutcomes::SampledMadeSnapshot]) outcome.made = after.counts[LookupOutcomes::SampledMadeSnapshot] - timer.imagesBefore.counts[LookupOutcomes::SampledMadeSnapshot];
+        if (after.ms[LookupOutcomes::SampledMadeSnapshot] >= timer.imagesBefore.ms[LookupOutcomes::SampledMadeSnapshot]) outcome.madeMs = after.ms[LookupOutcomes::SampledMadeSnapshot] - timer.imagesBefore.ms[LookupOutcomes::SampledMadeSnapshot];
+    }
     if (traceDraws) {
         char line[512];
         int n = std::snprintf(line, sizeof(line), "[draw] %ux%u %zu targets%s:", state.renderExtent.width, state.renderExtent.height, state.colors.size(), suffix);
