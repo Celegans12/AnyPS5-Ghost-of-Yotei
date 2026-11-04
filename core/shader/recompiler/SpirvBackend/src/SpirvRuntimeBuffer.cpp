@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvRuntimeBuffer.hpp"
+#include "P0sCeiling.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
@@ -906,7 +907,7 @@ std::uint32_t formattedCall(SpirvValueEmitContext& context, const IrValue& instr
         };
         state.module.BeginHelperFunction();
         const Restore restore{state, element, label, byteOffset};
-        state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlDontInlineMask, functionType);
+        state.module.AddFunction(spv::OpFunction, resultType, id, P0sHelperControl(), functionType);
         std::array<std::uint32_t, 10> parameters{};
         for (std::uint32_t index = 0; index < (store ? 10u : 9u); ++index) {
             parameters[index] = state.module.AllocateId();
@@ -976,7 +977,7 @@ std::uint32_t formattedGpuCall(SpirvValueEmitContext& context, const IrValue& in
         state.module.BeginHelperFunction();
         const Restore restore{state, state.currentLabel, state.bdaStopValue};
         state.module.AddName(id, std::string(store ? "store" : "load") + "_formatted_gpu_buffer_x" + std::to_string(components));
-        state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlDontInlineMask, functionType);
+        state.module.AddFunction(spv::OpFunction, resultType, id, P0sHelperControl(), functionType);
         const std::array<std::uint32_t, 11> types{u64, u32, u32, u32, boolean, u32, boolean, u32, u32, u32, valueType};
         std::array<std::uint32_t, 11> parameters{};
         for (std::uint32_t index = 0; index < (store ? 11u : 10u); ++index) {
@@ -1049,7 +1050,7 @@ std::uint32_t rawGpuCall(SpirvValueEmitContext& context, const IrValue& instruct
         state.module.BeginHelperFunction();
         const Restore restore{state, state.currentLabel, state.bdaStopValue};
         state.module.AddName(id, "load_raw_gpu_buffer_x" + std::to_string(components));
-        state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlDontInlineMask, functionType);
+        state.module.AddFunction(spv::OpFunction, resultType, id, P0sHelperControl(), functionType);
         std::array<std::uint32_t, 10> parameters{};
         for (std::uint32_t index = 0; index < parameters.size(); ++index) {
             parameters[index] = state.module.AllocateId();

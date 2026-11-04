@@ -25,6 +25,55 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
+// Lane P0-shader (PLAN v3 step 0) ceiling diagnostics, off by default:
+//   APS5_P0S_FLAT_BDA=1     append a flat page section to every indexed table (Header::reserved 3; the recompiler's
+//                           read lookups try it first under the same variable)
+//   APS5_P0S_TABLE_DEVICE=1 tables live in device-local host-visible memory instead of host memory
+// Flat section: u64 base, u32 pages, u32 shift, then per page the u64 `device - begin` of the range s that the full
+// lookup selects for every address of the page (the last range beginning at or below the page start, no range
+// beginning inside the page), when s covers the whole page, has read permission, a device address, no reserved word
+// and a device span that does not wrap; else 0 (take the full lookup).
+bool p0sFlatTables() {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_P0S_FLAT_BDA"); return text != nullptr && *text != '\0' && *text != '0'; }();
+    return enabled;
+}
+
+bool p0sDeviceTables() {
+    static const bool enabled = [] { const char* text = std::getenv("APS5_P0S_TABLE_DEVICE"); return text != nullptr && *text != '\0' && *text != '0'; }();
+    return enabled;
+}
+
+std::vector<std::uint32_t> p0sFlatSection(const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    if (ranges.empty()) return {};
+    constexpr std::uint64_t MaxPages = std::uint64_t{1} << 18u;
+    std::uint64_t last = 0;
+    for (const auto& range : ranges) last = std::max(last, range.end);
+    std::uint32_t shift = 16;
+    const auto first = ranges.front().begin;
+    while (shift < 40u && ((last - (first & ~((std::uint64_t{1} << shift) - 1u)) + (std::uint64_t{1} << shift) - 1u) >> shift) > MaxPages) ++shift;
+    const auto alignedBase = ranges.front().begin & ~((std::uint64_t{1} << shift) - 1u);
+    const auto pages = static_cast<std::uint32_t>((last - alignedBase + (std::uint64_t{1} << shift) - 1u) >> shift);
+    std::vector<std::uint32_t> words(4u + 2u * std::size_t{pages}, 0u);
+    std::memcpy(words.data(), &alignedBase, sizeof(alignedBase));
+    words[2] = pages;
+    words[3] = shift;
+    std::size_t following = 0;  // first range with begin > page start
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        const auto start = alignedBase + (std::uint64_t{page} << shift);
+        const auto stop = start + (std::uint64_t{1} << shift);
+        while (following < ranges.size() && ranges[following].begin <= start) ++following;
+        if (following == 0) continue;
+        const auto& range = ranges[following - 1u];
+        if (following < ranges.size() && ranges[following].begin < stop) continue;
+        if (range.reserved != 0u || range.begin >= range.end || range.end < stop || (range.permissions & Abi::Read) == 0u || range.deviceAddress == 0u) continue;
+        if (range.deviceAddress > std::numeric_limits<std::uint64_t>::max() - (range.end - range.begin)) continue;
+        const std::uint64_t delta = range.deviceAddress - range.begin;
+        std::memcpy(words.data() + 4u + 2u * std::size_t{page}, &delta, sizeof(delta));
+    }
+    return words;
+}
+
 // The page tables built per device, reused by a build whose ranges (guest ranges, device
 // addresses, permissions) equal one of them: consecutive address-based builds map the same registered
 // set through the same imports and mirrors, so the ~1200-entry table repeats. The shader only reads
@@ -417,7 +466,8 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     const auto indexStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto index = indexDisabled ? std::vector<std::uint32_t>{} : ShaderRecompiler::BdaAbi::BuildRangeIndex(ranges.data(), ranges.size());
     if (profiled) bdaBuildTimes().indexNs.fetch_add(nsSince(indexStart), std::memory_order_relaxed);
-    tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range) + index.size() * sizeof(std::uint32_t);
+    const auto flat = p0sFlatTables() && !index.empty() ? p0sFlatSection(ranges) : std::vector<std::uint32_t>{};
+    tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range) + index.size() * sizeof(std::uint32_t) + flat.size() * sizeof(std::uint32_t);
     Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
     auto& cache = Tables();
     std::uint64_t hash = 0;
@@ -491,16 +541,17 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA range ends past the addresses the written-page record can hold");
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
     const auto bufferStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, bdaBufferProperties());
+    table = p0sDeviceTables() ? std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) : std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, bdaBufferProperties());
     const auto copyStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (profiled) bdaBuildTimes().bufferNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(copyStart - bufferStart).count()), std::memory_order_relaxed);
-    const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), index.empty() ? 0u : ShaderRecompiler::BdaAbi::IndexedTable};
+    const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), index.empty() ? 0u : !flat.empty() ? 3u : ShaderRecompiler::BdaAbi::IndexedTable};
     std::memcpy(table->Bytes().data(), &header, sizeof(header));
     if (!ranges.empty() && (p0gCloneAllBudget() != 0 || p0dDrawClone)) {
         const auto moved = p0gRedirect(context, ranges);
         std::memcpy(table->Bytes().data() + sizeof(header), moved.data(), moved.size() * sizeof(moved.front()));
     } else if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
     if (!index.empty()) std::memcpy(table->Bytes().data() + sizeof(header) + ranges.size() * sizeof(ranges.front()), index.data(), index.size() * sizeof(index.front()));
+    if (!flat.empty()) std::memcpy(table->Bytes().data() + sizeof(header) + ranges.size() * sizeof(ranges.front()) + index.size() * sizeof(index.front()), flat.data(), flat.size() * sizeof(flat.front()));
     const auto entryStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (profiled) bdaBuildTimes().copyNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(entryStart - copyStart).count()), std::memory_order_relaxed);
     struct NoteEntry {
