@@ -4028,8 +4028,7 @@ bool residentPristineTests(const Device& device, Recorder& recorder) {
     // Write-watched (the guest arena): the copy-in skips need the tracker's generations.
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
-        std::cout << "no write watching: residentPristineTests skipped
-";
+        std::cout << "no write watching: residentPristineTests skipped\n";
         return false;
     }
     std::memset(block, 0x11, bytes);
@@ -4111,8 +4110,7 @@ bool ownShadowTests(const Device& device, Recorder& recorder) {
     // Write-watched (the guest arena): the copy-in skips need the tracker's generations.
     void* block = AllocateWatched(bytes, 65536);
     if (block == nullptr) {
-        std::cout << "no write watching: ownShadowTests skipped
-";
+        std::cout << "no write watching: ownShadowTests skipped\n";
         return false;
     }
     std::memset(block, 0x11, bytes);
@@ -4140,7 +4138,7 @@ bool ownShadowTests(const Device& device, Recorder& recorder) {
         if (use == 6) {
             words[first + 5000] = 0x77777777u;
             model[first + 5000] = 0x77777777u;
-            static_cast<void>(GuestMemory::MarkPossiblyWritten(element + 5000u * 4u, 4));
+            static_cast<void>(AgcDriver::GuestMemory::MarkPossiblyWritten(element + 5000u * 4u, 4));
         }
         if (use == 0) {
             memory.Upload(false);
