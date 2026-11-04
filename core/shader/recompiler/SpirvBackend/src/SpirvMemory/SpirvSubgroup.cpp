@@ -3,8 +3,10 @@
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include <spirv/unified1/GLSL.std.450.h>
 #include <spirv/unified1/spirv.hpp>
+#include <cstdlib>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <SpirvBackend/SpirvEmitterInstructions.hpp>
 #include <SpirvBackend/SpirvEmitterState.hpp>
 #include <SpirvBackend/SpirvMemory/SpirvConstants.hpp>
@@ -68,7 +70,33 @@ namespace ShaderRecompiler
             return state.spannedBallotParityVariable;
         }
 
+        bool SpannedBallotOneBarrier() {
+            static const bool enabled = [] {
+                const char* value = std::getenv("APS5_SPANNED_BALLOT_ONE_BARRIER");
+                return value != nullptr && std::string_view(value) != "0";
+            }();
+            return enabled;
+        }
+
+        void SpannedBallotThreeBarriers(SpirvEmitterState& state, std::uint32_t result, std::uint32_t predicate) {
+            const auto lane = SpannedLane(state);
+            SpannedBarrier(state);
+            state.module.AddFunction(spv::OpAtomicStore, SpannedSlot(state, EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 1u))), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, 0u));
+            SpannedBarrier(state);
+            const auto bit = Binary(state, spv::OpShiftLeftLogical, TypeU32(state), ConstantU32(state, 1u), EmitBinaryU32(state, spv::OpBitwiseAnd, lane, ConstantU32(state, 31u)));
+            const auto previous = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAtomicOr, TypeU32(state), previous, SpannedSlot(state, EmitBinaryU32(state, spv::OpShiftRightLogical, lane, ConstantU32(state, 5u))), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsMaskNone), Select(state, TypeU32(state), predicate, bit, ConstantU32(state, 0u)));
+            SpannedBarrier(state);
+            const auto low = SpannedLoad(state, ConstantU32(state, 0u));
+            const auto high = SpannedLoad(state, ConstantU32(state, 1u));
+            state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), result, low, high, ConstantU32(state, 0u), ConstantU32(state, 0u));
+        }
+
         void SpannedBallot(SpirvEmitterState& state, std::uint32_t result, std::uint32_t predicate) {
+            if (!SpannedBallotOneBarrier()) {
+                SpannedBallotThreeBarriers(state, result, predicate);
+                return;
+            }
             const auto lane = SpannedLane(state);
             const auto native = state.module.AllocateId();
             EmitHostSubgroupBallot(state, native, predicate);
