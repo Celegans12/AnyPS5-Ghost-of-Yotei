@@ -5533,7 +5533,10 @@ void verifyOwnShadow(const Context& context, Recorder& recorder, VkCommandBuffer
     recorder.Keep(buffer);
     const auto held = holdReadbacks(std::move(shadowCopy), std::move(importCopy));
     const auto publishSerial = ShadowPublishSerial();
-    recorder.OnComplete([held, begin, generation, publishSerial] {
+    const bool otherLanePending = recorder.PendingWriteOtherLane(begin, static_cast<std::size_t>(bytes));
+    const bool anyPending = recorder.PendingWriteOverlaps(begin, static_cast<std::size_t>(bytes));
+    const int lane = Recorder::ThreadLane();
+    recorder.OnComplete([held, begin, generation, publishSerial, otherLanePending, anyPending, lane] {
         const auto [shadowCopy, importCopy] = takeReadbacks(held);
         if (shadowCopy == nullptr) return;
         OwnShadows().checked.fetch_add(1, std::memory_order_relaxed);
@@ -5558,7 +5561,7 @@ void verifyOwnShadow(const Context& context, Recorder& recorder, VkCommandBuffer
             const bool stamped = !GuestMemory::UnchangedSince(begin, a.size(), generation);
             const bool cpuStored = !GuestMemory::UnchangedSinceCollected(begin, a.size(), generation);
             const bool published = ShadowPublishedSince(begin, a.size(), publishSerial);
-            if (mismatches <= 16) std::fprintf(stderr, "[own-shadow] VERIFY MISMATCH: a skipped copy-in's shadow differs from its import: 0x%llx+0x%zx, %zu dwords differ, first at +0x%zx (shadow %08x import %08x); range stamped since the skip: %s (a CPU store: %s), a unit shadow published over it since the check: %s\n", static_cast<unsigned long long>(begin), a.size(), differing, first, shadowWord, importWord, stamped ? "yes" : "no", cpuStored ? "yes" : "no", published ? "yes" : "no");
+            if (mismatches <= 16) std::fprintf(stderr, "[own-shadow] VERIFY MISMATCH: a skipped copy-in's shadow differs from its import: 0x%llx+0x%zx, %zu dwords differ, first at +0x%zx (shadow %08x import %08x); range stamped since the skip: %s (a CPU store: %s), a unit shadow published over it since the check: %s; at the check: lane %d, a write pending over it %s, on the other lane %s\n", static_cast<unsigned long long>(begin), a.size(), differing, first, shadowWord, importWord, stamped ? "yes" : "no", cpuStored ? "yes" : "no", published ? "yes" : "no", lane, anyPending ? "yes" : "no", otherLanePending ? "yes" : "no");
         }
     });
 }
