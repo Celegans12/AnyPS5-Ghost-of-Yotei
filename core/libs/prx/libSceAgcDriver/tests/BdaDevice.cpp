@@ -223,7 +223,8 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--device-selection-cpu") return 0;
         RunBdaContractTests();
         const bool importFailures = argc == 2 && std::strcmp(argv[1], "--host-import-failures") == 0;
-        if (argc == 2 && !importFailures) {
+        const bool p0sLookupBench = argc == 2 && std::strcmp(argv[1], "--p0s-lookup-bench") == 0;
+        if (argc == 2 && !importFailures && !p0sLookupBench) {
             const auto shader = MakeBdaTestShader(0x7fff12340000ULL, 32);
             std::ofstream file(argv[1], std::ios::binary);
             file.write(reinterpret_cast<const char*>(shader.data()), static_cast<std::streamsize>(shader.size() * sizeof(std::uint32_t)));
@@ -237,6 +238,10 @@ int main(int argc, char** argv) {
             if (!canSkipVulkanFailure(std::getenv("ANYPS5_GPU"), std::getenv("ANYPS5_REQUIRE_VULKAN"))) throw;
             std::cout << "skipped, no usable Vulkan device: " << error.what() << '\n';
             return 77;
+        }
+        if (p0sLookupBench) {
+            RunP0sLookupBench(device->GetContext());
+            return 0;
         }
         if (importFailures) {
             if (device->GetContext().hostImportAlignment == 0) {

@@ -39,5 +39,6 @@ std::vector<std::uint32_t> MakeBdaMemoReadTestShader(const std::vector<BdaMemoRe
 void RunBdaStoreExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaExecutionTests(const AgcDriver::Graphics::Context& context);
 void RunBdaContractTests();
+void RunP0sLookupBench(const AgcDriver::Graphics::Context& context);
 
 #endif
