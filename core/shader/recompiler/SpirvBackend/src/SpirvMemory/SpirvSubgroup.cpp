@@ -70,12 +70,29 @@ namespace ShaderRecompiler
             return state.spannedBallotParityVariable;
         }
 
-        bool SpannedBallotOneBarrier() {
-            static const bool enabled = [] {
+        std::uint32_t SpannedBallotMode() {
+            static const std::uint32_t mode = [] {
                 const char* value = std::getenv("APS5_SPANNED_BALLOT_ONE_BARRIER");
-                return value != nullptr && std::string_view(value) != "0";
+                if (value == nullptr || std::string_view(value) == "0") return 0u;
+                return std::string_view(value) == "2" ? 2u : 1u;
             }();
-            return enabled;
+            return mode;
+        }
+
+        void SpannedBallotTwoBarriers(SpirvEmitterState& state, std::uint32_t result, std::uint32_t predicate) {
+            const auto lane = SpannedLane(state);
+            const auto native = state.module.AllocateId();
+            EmitHostSubgroupBallot(state, native, predicate);
+            const auto half = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), half, native, 0u);
+            SpannedBarrier(state);
+            state.module.AddFunction(spv::OpAtomicStore, SpannedBallotSlot(state, EmitBinaryU32(state, spv::OpShiftRightLogical, lane, ConstantU32(state, 5u))), ConstantU32(state, spv::ScopeWorkgroup), ConstantU32(state, spv::MemorySemanticsMaskNone), half);
+            SpannedBarrier(state);
+            const auto low = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), low, SpannedBallotSlot(state, ConstantU32(state, 0u)));
+            const auto high = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), high, SpannedBallotSlot(state, ConstantU32(state, 1u)));
+            state.module.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4u), result, low, high, ConstantU32(state, 0u), ConstantU32(state, 0u));
         }
 
         void SpannedBallotThreeBarriers(SpirvEmitterState& state, std::uint32_t result, std::uint32_t predicate) {
@@ -93,8 +110,13 @@ namespace ShaderRecompiler
         }
 
         void SpannedBallot(SpirvEmitterState& state, std::uint32_t result, std::uint32_t predicate) {
-            if (!SpannedBallotOneBarrier()) {
+            const auto mode = SpannedBallotMode();
+            if (mode == 0u) {
                 SpannedBallotThreeBarriers(state, result, predicate);
+                return;
+            }
+            if (mode == 2u) {
+                SpannedBallotTwoBarriers(state, result, predicate);
                 return;
             }
             const auto lane = SpannedLane(state);
