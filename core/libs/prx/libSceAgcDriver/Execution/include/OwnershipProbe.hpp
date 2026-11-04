@@ -72,7 +72,7 @@ private:
 void CloseWindow(const char* window);
 bool SoftEnabled();
 void SoftGpuWrite(std::uint64_t begin, std::uint64_t end, std::uint8_t source);
-void SoftAccess(std::uint64_t address, std::size_t bytes, bool store);
+void SoftAccess(std::uint64_t address, std::size_t bytes, bool store, const void* caller = nullptr);
 void SoftTitleWrite(std::uint64_t address, std::size_t bytes);
 [[nodiscard]] bool LeaseMode();
 
