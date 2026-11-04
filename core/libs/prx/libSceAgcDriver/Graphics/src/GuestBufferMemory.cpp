@@ -5419,6 +5419,8 @@ struct OwnShadowCounts {
     // Candidates whose copy-in the submission-time check turned back on (stamped after the record-time check),
     // and candidates refused because they are recorded inside a dispatch run or prelude or are not addressable.
     std::atomic<std::uint64_t> forcedAtSubmit{0}, forcedAtSubmitBytes{0}, refusedShape{0}, forcedTotal{0};
+    // Candidates refused because another written region of the same build overlaps them.
+    std::atomic<std::uint64_t> sibling{0};
     std::atomic<std::int64_t> reported{0};
 };
 
@@ -5449,7 +5451,8 @@ void reportOwnShadows() {
     const auto forced = take(counts.forcedAtSubmit);
     const auto forcedBytes = take(counts.forcedAtSubmitBytes);
     const auto shape = take(counts.refusedShape);
-    AgcDriver::ProfilePrint_nid_no_patch("[own-shadow] (10 s, APS5_OWN_SHADOW_CURRENT %s) copy-ins skipped %llu (%.1f MiB) / made %llu (%.1f MiB); of the made: stamped since %llu, copy-back unconfirmed %llu, other lane %llu, in a run or not addressable %llu; turned back on at submission %llu (%.1f MiB); verify %llu checked, %llu mismatched\n", RuntimeSwitches::Set(RuntimeSwitch::OwnShadowCurrent) ? "set" : "unset", skipped, skippedBytes / 1048576.0, copied, copiedBytes / 1048576.0, stale, pending, otherLane, shape, forced, forcedBytes / 1048576.0, static_cast<unsigned long long>(counts.checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.mismatched.load(std::memory_order_relaxed)));
+    const auto sibling = take(counts.sibling);
+    AgcDriver::ProfilePrint_nid_no_patch("[own-shadow] (10 s, APS5_OWN_SHADOW_CURRENT %s) copy-ins skipped %llu (%.1f MiB) / made %llu (%.1f MiB); of the made: stamped since %llu, copy-back unconfirmed %llu, other lane %llu, in a run or not addressable %llu, overlapped by another written region of the build %llu; turned back on at submission %llu (%.1f MiB); verify %llu checked, %llu mismatched\n", RuntimeSwitches::Set(RuntimeSwitch::OwnShadowCurrent) ? "set" : "unset", skipped, skippedBytes / 1048576.0, copied, copiedBytes / 1048576.0, stale, pending, otherLane, shape, sibling, forced, forcedBytes / 1048576.0, static_cast<unsigned long long>(counts.checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.mismatched.load(std::memory_order_relaxed)));
 }
 
 std::uint64_t ownShadowSkippedCount() {
@@ -6877,7 +6880,12 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, address);
-        if (!region->resident && region->deviceLocal && expected.empty() && ownShadowCurrent(region->begin, region->end, region->ownSyncGeneration, region->ownForgetSerial, region->ownSyncPending, region->ownPublishSerial)) {
+        // Another written region of this build over the same bytes (a second V#, a direct in-place element) also
+        // writes the import in the same use, and its stores can win over this shadow's: then the shadow no longer
+        // equals the import although nothing outside the build stamped the range. Such a region copies in as before.
+        const bool ownSibling = !region->resident && region->deviceLocal && region->ownSyncGeneration != 0 && RuntimeSwitches::Set(RuntimeSwitch::OwnShadowCurrent) && std::any_of(regions.begin(), regions.end(), [&](const Region& other) { return &other != region && other.writable && other.begin < region->end && region->begin < other.end; });
+        if (ownSibling) OwnShadows().sibling.fetch_add(1, std::memory_order_relaxed);
+        if (!ownSibling && !region->resident && region->deviceLocal && expected.empty() && ownShadowCurrent(region->begin, region->end, region->ownSyncGeneration, region->ownForgetSerial, region->ownSyncPending, region->ownPublishSerial)) {
             // The build's own shadow held these bytes at this check (see ownShadowCurrent). The copy-in is still
             // recorded, as an indirect kernel whose group count the submission sets: a stamp between this check and
             // the batch's submission (a CPU store, or a writer whose marks come later) turns it back on, so the GPU
