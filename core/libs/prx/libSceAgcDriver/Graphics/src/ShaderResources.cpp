@@ -5073,6 +5073,11 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& texture) { return texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress); })) return false;
+    if (GuestMemory::P0cNoProofs()) {
+        // Ceiling ablation (inexact): the cached set is taken without its proof.
+        if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
+        return true;
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     for (const auto& region : directRegions) {

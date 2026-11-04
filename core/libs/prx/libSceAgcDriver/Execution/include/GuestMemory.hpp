@@ -155,6 +155,15 @@ OwnedBlockCounts TakeOwnedBlockCounts();
 // page tables and are reported with MarkWritten. Without write watching CollectWrites returns 0 and
 // UnchangedSince is always false, so callers fall back to comparing bytes.
 bool WriteWatched();
+// P0-cpu (C0) ceiling ablations, diagnostic only, default off, read once, never in measured game runs
+// (inexact by design; replay only). APS5_P0C_NO_PROOFS=1: CollectWrites returns the current
+// generation without walking the write watch, and a cached resource set's Revalidate full proof
+// (revalidateFull) accepts it without its checks: the cost of the pull proofs, as a ceiling for a
+// flag-based design. APS5_P0C_NO_HAZARDS=1: draws hand the recorder empty pass access lists (a
+// pass continues whenever its key matches) and dispatches record no leading or trailing barrier:
+// the CPU cost of per-command hazard tracking, as a ceiling for guest-sync barriers.
+bool P0cNoProofs();
+bool P0cNoHazards();
 void Unwatch(std::uint64_t address, std::size_t bytes);
 void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true, bool importMayWriteGuest = true);

@@ -652,7 +652,17 @@ struct DrawOutcome {
     // in ownSyncUs: those wait by design and would otherwise count as nested hook waits.
     double hookWaitUs = 0;
     double ownSyncUs = 0;
+    // P0-cpu (C0): the record phase of a recorded draw split by step (RecordSub), measured only under
+    // APS5_PROFILE_DRAW; their sum is the draw's record time up to LeaveRenderPassOpen.
+    std::array<double, 6> recordSubUs{};
 };
+
+// P0-cpu (C0): recordDraw's steps. stores: queued key/label store flushes; hazards: the pass access
+// lists (reads, writes, images, attachments) and the drawn-linear store check; bindings:
+// PrepareDrawBindings; pass: StartDrawPass (the hazard check, a pass end and its barrier); commands:
+// the vkCmd* recording (barriers before the pass, Begin, binds, push constants, draw calls);
+// leave: LeaveRenderPassOpen (the access lists added to the pass's hazard set).
+constexpr std::array<const char*, 6> RecordSubNames{"stores", "hazards", "bindings", "pass", "commands", "leave"};
 
 // The resources of a draw: a recipe hit (reserved for the draw recipe step), a resource-cache
 // template hit, a build, or an address-based (BDA) build.
@@ -675,6 +685,7 @@ struct DrawProfile {
     double hookWaitUs = 0;
     double maxHookWaitUs = 0;
     double ownSyncUs = 0;
+    std::array<double, 6> recordSubUs{};
     // The resources build's sub-phases (ShaderResources::Timing) of draws only; dispatches report
     // theirs in the [resources] line. `other` is the rest of the build (prepareAddressBindings:
     // the registry lease and snapshots of an address-based build, the BDA table, the layout
@@ -755,6 +766,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
     profile.hookWaitUs += outcome.hookWaitUs;
     profile.maxHookWaitUs = std::max(profile.maxHookWaitUs, outcome.hookWaitUs);
     profile.ownSyncUs += outcome.ownSyncUs;
+    for (std::size_t i = 0; i < profile.recordSubUs.size(); ++i) profile.recordSubUs[i] += outcome.recordSubUs[i];
     if (built != nullptr) {
         profile.bindingsUs += built->bindingsMs * 1000.0;
         profile.uploadUs += built->uploadMs * 1000.0;
@@ -802,7 +814,7 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
 void printDrawWindow(DrawProfile& profile, const char* window) {
     const auto synchronous = profile.draws - profile.recorded - profile.waited;
     const auto average = [](double total, std::uint64_t count) { return count != 0 ? total / static_cast<double>(count) : 0.0; };
-    char line[2048];
+    char line[4096];
     int n = std::snprintf(line, sizeof(line), "[draws] %llu draws over %s (%llu recorded avg %.0f us, of them %llu with completion; %llu recorded then waited avg %.0f us; %llu synchronous avg %.0f us; render passes %llu begun, %llu draws continued one; waited or synchronous because:", static_cast<unsigned long long>(profile.draws), window, static_cast<unsigned long long>(profile.recorded), average(profile.recordedUs, profile.recorded), static_cast<unsigned long long>(profile.completion), static_cast<unsigned long long>(profile.waited), average(profile.waitedUs, profile.waited), static_cast<unsigned long long>(synchronous), average(profile.synchronousUs, synchronous), static_cast<unsigned long long>(profile.passesBegun), static_cast<unsigned long long>(profile.passesContinued));
     const auto room = [&] { return n > 0 && static_cast<std::size_t>(n) < sizeof(line); };
     for (std::size_t i = SyncNone + 1; i < SyncCount && room(); ++i) {
@@ -813,6 +825,11 @@ void printDrawWindow(DrawProfile& profile, const char* window) {
         if (profile.totalsUs[i] <= 0) continue;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s=%.1fms", DrawPhaseNames[i], profile.totalsUs[i] / 1000.0);
         if (i == PhaseResources && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (bindings %.1f, upload %.1f, descriptors %.1f, other %.1f of which %.1f in %llu address-based builds)", profile.bindingsUs / 1000.0, profile.uploadUs / 1000.0, profile.descriptorsUs / 1000.0, profile.otherUs / 1000.0, profile.addressOtherUs / 1000.0, static_cast<unsigned long long>(profile.addressBuilds));
+        if (i == PhaseRecord && room()) {
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (");
+            for (std::size_t k = 0; k < profile.recordSubUs.size() && room(); ++k) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s%s %.1f", k == 0 ? "" : ", ", RecordSubNames[k], profile.recordSubUs[k] / 1000.0);
+            if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), ")");
+        }
         if (i == PhaseReadTarget && room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " (%llu resident lookups, %llu of them >= 1 ms = %.1f; target lookups: full-scissor %llu / partial %llu / pages walked %llu / %.0f us)", static_cast<unsigned long long>(profile.targetLookups), static_cast<unsigned long long>(profile.slowLookups), profile.slowLookupUs / 1000.0, static_cast<unsigned long long>(profile.fullScissorLookups), static_cast<unsigned long long>(profile.partialLookups), static_cast<unsigned long long>(profile.pagesWalked), profile.lookupUs);
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; per kind (avg us, count):");
@@ -871,6 +888,7 @@ void printDrawWindow(DrawProfile& profile, const char* window) {
     profile.reuseSeen = reuse;
     profile.leaseSeen = leases;
     profile.totalsUs.fill(0);
+    profile.recordSubUs.fill(0);
     profile.maxUs.fill(0);
     profile.maxDrawUs = profile.hookWaitUs = profile.maxHookWaitUs = profile.ownSyncUs = 0;
     profile.bindingsUs = profile.uploadUs = profile.descriptorsUs = profile.otherUs = profile.addressOtherUs = 0;
@@ -2838,6 +2856,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
     using CommandClass = Recorder::CommandClass;
     const auto countBarrier = [&](std::uint32_t count) { Recorder::CountBarriers(CommandClass::Draw, count); };
+    // P0-cpu (C0): the record phase by step (DrawOutcome::recordSubUs), only under APS5_PROFILE_DRAW.
+    auto subAt = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto sub = [&](std::size_t step) {
+        if (!timer.profile) return;
+        const auto now = std::chrono::steady_clock::now();
+        outcome.recordSubUs[step] += std::chrono::duration<double, std::micro>(now - subAt).count();
+        subAt = now;
+    };
     // The pass is named by its attachment views (stable while the kept targets live, so unique
     // within the open batch) and the extent. The previous draw's pass is continued only when this
     // draw neither reads its attachments (a barrier would be owed, which no pass allows) nor
@@ -2862,6 +2888,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recorder->FlushStores();
         outcome.storesFlushed = true;
     }
+    sub(0);
     const bool heap = serveBindlessTables(context, *recorder, shaders);
     const bool capture = CaptureInputsEnabled();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
@@ -2869,14 +2896,16 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* passReadsSlot = nullptr;
     auto& passReads = ShaderRecompiler::ThreadOwned(passReadsSlot);
     passReads.clear();
-    if (!addressBased) resources.DeviceReads(passReads);
+    // P0-cpu ceiling ablation (APS5_P0C_NO_HAZARDS, inexact, replay only): no pass access lists.
+    const bool noHazards = GuestMemory::P0cNoHazards();
+    if (!addressBased && !noHazards) resources.DeviceReads(passReads);
     const auto deviceReads = passReads.size();
-    if (gpuIndirect) {
+    if (gpuIndirect && !noHazards) {
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
-    passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
-    auto passImages = resources.StorageImages();
+    if (!noHazards) passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
+    auto passImages = noHazards ? decltype(resources.StorageImages()){} : resources.StorageImages();
     if (record.blended != nullptr) {
         for (const auto& image : record.blended->images) passImages.emplace_back(image->Image(), true);
     }
@@ -2888,7 +2917,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     for (const auto image : record.multisampleImages) passAttachments.emplace_back(image, true);
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
+    sub(1);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    sub(2);
     // C67: moved ranges the draw reads in place need the barrier behind earlier GPU writes as the base descriptors' do.
     if (drawBindings != nullptr) {
         for (const auto& snapshot : drawBindings->snapshots) {
@@ -2921,9 +2952,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passWrites = hazardWrites;
         passWriteOnly = writeOnly;
     }
-    const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
+    const PassAccess passAccess = noHazards ? PassAccess{} : PassAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
     const bool fenced = state.depth.has_value() || !record.proxies.empty() || record.blended != nullptr;
+    sub(1);
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || record.blended != nullptr || heap || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    sub(3);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -3043,7 +3076,9 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             }
         };
     }
+    sub(4);
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    sub(5);
     timer.phase(PhaseRecord);
     if (record.blended != nullptr) {
         recorder->Keep(record.blended);
