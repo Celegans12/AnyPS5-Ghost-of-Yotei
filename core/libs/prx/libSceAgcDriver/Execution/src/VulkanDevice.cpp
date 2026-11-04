@@ -5854,7 +5854,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             ++d.notRefresh;
         }
         ++d.overlapped;
-    } else if ((covered & shaderAccess) == shaderAccess && barrierElision) {
+    } else if (((covered & shaderAccess) == shaderAccess && barrierElision) || GuestMemory::P0cNoHazards()) {
+        // (APS5_P0C_NO_HAZARDS: the P0-cpu ceiling ablation, inexact, replay only: no leading barrier.)
         ++d.preBarriersSkipped;
         Graphics::Recorder::CountMerged(CommandClass::DispatchLeading);
     } else {
@@ -5969,6 +5970,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.DeferDispatchBarrier(overlapQueue, runOwners);
         recorder.NoteRunAccess(record.programAddress, runAccesses);
         ++d.trailingDeferred;
+    } else if (GuestMemory::P0cNoHazards()) {
+        // The P0-cpu ceiling ablation (inexact, replay only): no trailing barrier, nothing covered.
+        recorder.MarkCovered(0);
     } else {
         const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
         constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
