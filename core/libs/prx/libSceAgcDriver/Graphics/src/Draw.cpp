@@ -2015,7 +2015,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                     std::optional<std::uint32_t> highest;
                 };
                 static std::mutex memoMutex;
-                static std::deque<ClampMemo> memos;
+                // Never destroyed (as the resident ranges, efd24a7976): its memos keep pooled buffers, which a static
+                // destructor at process exit released into the pool after the device was gone (gcopy-r17/r17c: exit 139
+                // in Buffer::release -> the driver, from this deque's __tcf at DLL unload).
+                static auto& memos = *new std::deque<ClampMemo>;
                 const bool memoize = !RuntimeSwitches::Set(RuntimeSwitch::NoIndexClampMemo);
                 std::shared_ptr<Buffer> reused;
                 if (memoize && !Recorder::SnapshotWriteOverlaps(draw.indexAddress, static_cast<std::size_t>(indexBytes))) {
