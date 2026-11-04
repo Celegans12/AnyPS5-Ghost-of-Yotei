@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -2956,7 +2957,7 @@ bool copyThroughKernel(std::uint64_t address, std::span<std::byte> destination) 
 #endif
 }
 
-void flushBeforeAccess(std::uint64_t address, std::size_t bytes) {
+void flushBeforeAccess(std::uint64_t address, std::size_t bytes) { OwnershipProbe::SoftAccess(address, bytes, CurrentReadSite() == ReadSite::Store);
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
