@@ -187,6 +187,7 @@ struct BdaFaultChunk {
     std::vector<VkDeviceSize> free;
     std::size_t slots = 0;
     VkDeviceSize slotBytes = 0;
+    bool shared = false;
 };
 
 namespace {
@@ -209,8 +210,7 @@ FaultArenas& faultArenas() {
 }
 
 bool sharedFaultSlots() {
-    static const bool shared = std::getenv("APS5_NO_SHARED_FAULT_SLOTS") == nullptr;
-    return shared;
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoSharedFaultSlots);
 }
 
 constexpr VkDeviceSize FaultChunkBytes = VkDeviceSize{512} * 1024;
@@ -280,7 +280,7 @@ BdaResources::~BdaResources() {
     auto& arena = found->second;
     arena.holders.erase(this);
     --arena.counts.held;
-    if (!sharedFaultSlots()) {
+    if (!chunk->shared) {
         arena.counts.slots -= chunk->slots;
         --arena.counts.chunks;
     } else {
@@ -334,7 +334,7 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
     if (shared && source == arena.chunks.rend() && GuestMemory::GpuMutex().HeldByThisThread()) {
         std::vector<BdaResources*> idle;
         for (auto* holder : arena.holders) {
-            if (holder->faultChunk->slotBytes == slotBytes && holder->lastUse <= arena.finished && faultSlotClean(holder->faultBytes())) idle.push_back(holder);
+            if (holder->faultChunk->shared && holder->faultChunk->slotBytes == slotBytes && holder->lastUse <= arena.finished && faultSlotClean(holder->faultBytes())) idle.push_back(holder);
         }
         if (!idle.empty()) {
             const auto reclaim = (idle.size() + 1) / 2;
@@ -363,6 +363,7 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
         std::memset(chunk->buffer->Bytes().data(), 0, chunk->buffer->Bytes().size());
         chunk->slots = static_cast<std::size_t>(slots);
         chunk->slotBytes = slotBytes;
+        chunk->shared = shared;
         for (auto slot = slots; slot-- > 0;) chunk->free.push_back(slot * stride);
         if (shared) arena.chunks.push_back(chunk);
         arena.counts.slots += chunk->slots;

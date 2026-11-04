@@ -5616,12 +5616,11 @@ std::uint64_t gpuCopyLimit() {
 }
 
 bool changedCopyBacks(const Context& context) {
-    static const bool disabled = std::getenv("APS5_NO_CHANGED_COPY_BACK") != nullptr;
-    return !disabled && context.bufferDeviceAddress;
+    return !RuntimeSwitches::Set(RuntimeSwitch::NoChangedCopyBack) && context.bufferDeviceAddress;
 }
 
 VkBufferUsageFlags gpuCopyUsage(const Context& context, bool addressable) {
-    return VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | (addressable || changedCopyBacks(context) ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
+    return VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | (addressable || context.bufferDeviceAddress ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u);
 }
 
 // Device-local staging. A written V# element bound in place makes the shader store into host
@@ -5931,8 +5930,7 @@ public:
     }
 
     static bool Enabled() {
-        static const bool disabled = std::getenv("APS5_NO_ADAPTIVE_STAGING") != nullptr;
-        return !disabled;
+        return !RuntimeSwitches::Set(RuntimeSwitch::NoAdaptiveStaging);
     }
 
     bool InPlace(std::uint64_t begin, std::uint64_t end, bool use) {
