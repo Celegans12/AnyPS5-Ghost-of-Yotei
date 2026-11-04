@@ -388,11 +388,157 @@ SourceScope::~SourceScope() {
 }
 
 bool LeaseMode() {
-    static const bool on = Global() != nullptr && std::getenv("APS5_P0M_PROBE_LEASES") != nullptr;
+    static const bool on = std::getenv("APS5_P0M_PROBE_LEASES") != nullptr;
     return on;
 }
 
+namespace {
+
+struct SoftUnit {
+    std::uint64_t notedUs = 0;
+    std::uint8_t source = 0;
+};
+
+struct SoftSite {
+    std::uint64_t first = 0;
+    std::uint64_t early = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t calls = 0;
+};
+
+struct SoftState {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, SoftUnit> owned;
+    std::atomic<std::size_t> size{0};
+    std::map<std::string, SoftSite> sites;
+    std::array<std::array<std::uint64_t, 3>, 5> bySource{};
+    std::uint64_t unitWrites = 0;
+    std::uint64_t titleWrites = 0;
+    std::array<std::uint64_t, 7> latency{};
+};
+
+SoftState& Soft() {
+    static auto* state = new SoftState;
+    return *state;
+}
+
+std::uint64_t softNowUs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+std::size_t sourceIndex(std::uint8_t tag) {
+    return (tag & SourcePublish) != 0 ? 0 : (tag & SourceLease) != 0 ? 1 : (tag & SourceBdaReport) != 0 ? 2 : (tag & SourceStaged) != 0 ? 3 : 4;
+}
+
+}
+
+bool SoftEnabled() {
+    static const bool on = [] {
+        const bool value = std::getenv("APS5_P0M_READS") != nullptr;
+        if (value) std::fprintf(stderr, "[p0m-reads] census of CPU accesses through the flush hook to 64 KiB units the GPU wrote since their last CPU access (APS5_P0M_READS)\n");
+        return value;
+    }();
+    return on;
+}
+
+void SoftGpuWrite(std::uint64_t begin, std::uint64_t end, std::uint8_t source) {
+    if (!SoftEnabled() || end <= begin || end - begin > (std::uint64_t{64} << 30u)) return;
+    auto& state = Soft();
+    const auto now = softNowUs();
+    std::lock_guard lock(state.mutex);
+    for (auto unit = begin & ~(Unit - 1); unit < end; unit += Unit) {
+        state.owned[unit] = SoftUnit{now, source};
+        ++state.unitWrites;
+    }
+    state.size.store(state.owned.size(), std::memory_order_relaxed);
+}
+
+void SoftAccess(std::uint64_t address, std::size_t bytes, bool store) {
+    if (!SoftEnabled() || bytes == 0) return;
+    auto& state = Soft();
+    if (state.size.load(std::memory_order_relaxed) == 0) return;
+    void* frames[8] = {};
+    std::uint16_t captured = 0;
+#ifdef _WIN32
+    captured = CaptureStackBackTrace(1, 8, frames, nullptr);
+#endif
+    const auto now = softNowUs();
+    std::lock_guard lock(state.mutex);
+    std::uint64_t first = 0, early = 0;
+    for (auto unit = address & ~(Unit - 1); unit < address + bytes; unit += Unit) {
+        const auto found = state.owned.find(unit);
+        if (found == state.owned.end()) continue;
+        const auto age = now - found->second.notedUs;
+        ++first;
+        if (age < 64000) ++early;
+        auto& source = state.bySource[sourceIndex(found->second.source)];
+        ++source[store ? 1 : 0];
+        if (!store && age < 64000) ++source[2];
+        if (!store) {
+            constexpr std::array<std::uint64_t, 6> bounds{1000, 4000, 16000, 64000, 256000, 1000000};
+            std::size_t bucket = 0;
+            while (bucket < bounds.size() && age >= bounds[bucket]) ++bucket;
+            ++state.latency[bucket];
+        }
+        state.owned.erase(found);
+    }
+    state.size.store(state.owned.size(), std::memory_order_relaxed);
+    if (first == 0) return;
+    std::string key = std::string(store ? "store " : "read ") + GuestMemory::ReadSiteName(GuestMemory::CurrentReadSite());
+    for (std::uint16_t f = 1; f < captured && f < 7; ++f) key += " < " + SiteName(reinterpret_cast<std::uint64_t>(frames[f]));
+    auto& site = state.sites[key];
+    site.first += first;
+    site.early += early;
+    site.bytes += bytes;
+    ++site.calls;
+}
+
+void SoftTitleWrite(std::uint64_t address, std::size_t bytes) {
+    if (!SoftEnabled() || bytes == 0) return;
+    auto& state = Soft();
+    if (state.size.load(std::memory_order_relaxed) == 0) return;
+    std::lock_guard lock(state.mutex);
+    for (auto unit = address & ~(Unit - 1); unit < address + bytes; unit += Unit) state.titleWrites += state.owned.erase(unit);
+    state.size.store(state.owned.size(), std::memory_order_relaxed);
+}
+
+std::string SoftTake(const char* window) {
+    auto& state = Soft();
+    std::lock_guard lock(state.mutex);
+    static constexpr const char* sourceNames[] = {"publish", "lease", "bda-report", "bound", "other"};
+    std::uint64_t reads = 0, stores = 0;
+    for (const auto& s : state.bySource) {
+        reads += s[0];
+        stores += s[1];
+    }
+    char line[1024];
+    std::snprintf(line, sizeof(line), "[p0m-reads] window=%s GPU unit writes %llu; first CPU accesses of GPU-written units through the flush hook: reads %llu, stores %llu (title stores over owned units %llu); read age <1 ms %llu, <4 ms %llu, <16 ms %llu, <64 ms %llu, <256 ms %llu, <1 s %llu, >=1 s %llu; owned now %zu units; by source (read / store / read <64 ms):", window, static_cast<unsigned long long>(state.unitWrites), static_cast<unsigned long long>(reads), static_cast<unsigned long long>(stores), static_cast<unsigned long long>(state.titleWrites), static_cast<unsigned long long>(state.latency[0]), static_cast<unsigned long long>(state.latency[1]), static_cast<unsigned long long>(state.latency[2]), static_cast<unsigned long long>(state.latency[3]), static_cast<unsigned long long>(state.latency[4]), static_cast<unsigned long long>(state.latency[5]), static_cast<unsigned long long>(state.latency[6]), state.owned.size());
+    std::string report = line;
+    for (std::size_t k = 0; k < state.bySource.size(); ++k) {
+        char text[96];
+        std::snprintf(text, sizeof(text), " %s %llu/%llu/%llu", sourceNames[k], static_cast<unsigned long long>(state.bySource[k][0]), static_cast<unsigned long long>(state.bySource[k][1]), static_cast<unsigned long long>(state.bySource[k][2]));
+        report += text;
+    }
+    report += "\n";
+    std::vector<std::pair<std::string, SoftSite>> ranked(state.sites.begin(), state.sites.end());
+    std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+    for (std::size_t i = 0; i < ranked.size() && i < 16; ++i) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "[p0m-reads] window=%s site units %llu (<64 ms %llu) calls %llu bytes %llu: ", window, static_cast<unsigned long long>(ranked[i].second.first), static_cast<unsigned long long>(ranked[i].second.early), static_cast<unsigned long long>(ranked[i].second.calls), static_cast<unsigned long long>(ranked[i].second.bytes));
+        report += text + ranked[i].first + "\n";
+    }
+    state.sites.clear();
+    state.bySource = {};
+    state.latency = {};
+    state.unitWrites = state.titleWrites = 0;
+    return report;
+}
+
 void CloseWindow(const char* window) {
+    if (SoftEnabled()) {
+        const auto soft = SoftTake(window);
+        ProfilePrint_nid_no_patch("%s", soft.c_str());
+    }
     auto* sampler = Global();
     if (sampler == nullptr) return;
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
