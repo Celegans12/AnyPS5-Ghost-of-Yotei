@@ -3569,6 +3569,31 @@ bool Recorder::RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress resul
     return true;
 }
 
+bool Recorder::RecordStagingDiffIndirect(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, VkBuffer arguments, VkDeviceSize offset) {
+    constexpr std::uint32_t GroupSize = 64;
+    // Makes the pipeline on first use (records nothing for 0 dwords).
+    if (!RecordStagingDiff(commands, 0, 0, 0, 0, false)) return false;
+    if (dwords == 0 || (dwords + GroupSize - 1) / GroupSize > context.limits.maxComputeWorkGroupCount[0]) return false;
+    function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, stagingDiffPipeline);
+    struct {
+        VkDeviceAddress result;
+        VkDeviceAddress pristine;
+        VkDeviceAddress target;
+        VkDeviceAddress counter;
+        std::uint32_t count;
+        std::uint32_t keep;
+    } parameters{result, pristine, target, 0, dwords, 0u};
+    static_assert(sizeof(parameters) == 40);
+    function(cmdPushConstants, "vkCmdPushConstants")(commands, stagingDiffLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, 40, &parameters);
+    context.Function<PFN_vkCmdDispatchIndirect>("vkCmdDispatchIndirect")(commands, arguments, offset);
+    return true;
+}
+
+void Recorder::BeforeSubmit(std::function<void()> action) {
+    ensureOpen();
+    open->beforeSubmit.push_back(std::move(action));
+}
+
 std::uint64_t Recorder::StagingDiffStoredDwords() {
     // The kernel's 32-bit counter, widened here: read at most every 10 s, far less than 2^32 dwords
     // (16 GiB) apart. Racy against kernels in flight (statistics only).
@@ -5027,6 +5052,8 @@ void Recorder::Submit() {
         // it) fails UnchangedSince at the presenter's check (VulkanDevice RetirePresents).
         for (const auto& [begin, end] : notedReads(*open)) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, end - begin));
     }
+    // BeforeSubmit's actions see every stamp made up to this submission (APS5_OWN_SHADOW_CURRENT's decisions).
+    for (auto& action : std::exchange(open->beforeSubmit, {})) action();
     auto batch = std::move(open.slot());
     struct DiscardUnsubmitted {
         Recorder& recorder;

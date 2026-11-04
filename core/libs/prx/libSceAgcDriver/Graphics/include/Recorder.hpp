@@ -527,6 +527,14 @@ public:
     // stored count added to StagingDiffStoredDwords when `count`. False when the kernel is unavailable.
     // `keepPristine` (APS5_RESIDENT_PRISTINE): each stored dword is also stored into `pristine`.
     bool RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, bool count, bool keepPristine = false);
+    // The same kernel, its group count read from `arguments` (a VkDispatchIndirectCommand at `offset`) when the GPU
+    // runs it: APS5_OWN_SHADOW_CURRENT records a copy-in this way (result = the import, pristine = target = the
+    // shadow, so it stores every import dword the shadow lacks) and decides at submission whether it runs (see
+    // BeforeSubmit). `dwords` <= 64 * maxComputeWorkGroupCount[0]. False when the kernel is unavailable.
+    bool RecordStagingDiffIndirect(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, VkBuffer arguments, VkDeviceSize offset);
+    // Runs `action` (under the recorder's lock, with the GPU mutex held) right before the open batch's command buffer
+    // ends and is submitted, after everything of the batch is recorded.
+    void BeforeSubmit(std::function<void()> action);
     std::uint64_t StagingDiffStoredDwords();
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
@@ -876,6 +884,8 @@ private:
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
         std::vector<std::function<void()>> completions;
+        // BeforeSubmit's actions, run in order by Submit before the command buffer ends.
+        std::vector<std::function<void()>> beforeSubmit;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;

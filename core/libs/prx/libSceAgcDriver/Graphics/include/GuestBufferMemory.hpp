@@ -280,6 +280,8 @@ std::uint64_t ResidentPristineMismatches();
 // whose shadow differed from the import (APS5_VERIFY_OWN_SHADOW).
 std::uint64_t OwnShadowSkipped();
 std::uint64_t OwnShadowMismatches();
+// APS5_OWN_SHADOW_CURRENT (tests): skip candidates whose copy-in the submission turned back on (stamped after the check).
+std::uint64_t OwnShadowForcedAtSubmit();
 
 enum class AddressReuse : std::uint8_t { Reused, NotReusable, InUse, Snapshots, Space, Proof, Imports, Threw, Moved, Count };
 enum class SpaceResumeMiss : std::uint8_t { State, Replaced, Device, Generation, Epoch, Mirrors, Count };

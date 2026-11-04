@@ -5416,6 +5416,9 @@ void residentCopied(std::uint64_t begin, std::uint64_t end, const std::shared_pt
 // make a false one, a GPU writer cannot: it would have stamped the range).
 struct OwnShadowCounts {
     std::atomic<std::uint64_t> skipped{0}, skippedBytes{0}, copied{0}, copiedBytes{0}, stale{0}, pending{0}, otherLane{0}, checked{0}, mismatched{0}, skippedTotal{0};
+    // Candidates whose copy-in the submission-time check turned back on (stamped after the record-time check),
+    // and candidates refused because they are recorded inside a dispatch run or prelude or are not addressable.
+    std::atomic<std::uint64_t> forcedAtSubmit{0}, forcedAtSubmitBytes{0}, refusedShape{0}, forcedTotal{0};
     std::atomic<std::int64_t> reported{0};
 };
 
@@ -5443,11 +5446,18 @@ void reportOwnShadows() {
     const auto stale = take(counts.stale);
     const auto pending = take(counts.pending);
     const auto otherLane = take(counts.otherLane);
-    AgcDriver::ProfilePrint_nid_no_patch("[own-shadow] (10 s, APS5_OWN_SHADOW_CURRENT %s) copy-ins skipped %llu (%.1f MiB) / made %llu (%.1f MiB); of the made: stamped since %llu, copy-back unconfirmed %llu, other lane %llu; verify %llu checked, %llu mismatched\n", RuntimeSwitches::Set(RuntimeSwitch::OwnShadowCurrent) ? "set" : "unset", skipped, skippedBytes / 1048576.0, copied, copiedBytes / 1048576.0, stale, pending, otherLane, static_cast<unsigned long long>(counts.checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.mismatched.load(std::memory_order_relaxed)));
+    const auto forced = take(counts.forcedAtSubmit);
+    const auto forcedBytes = take(counts.forcedAtSubmitBytes);
+    const auto shape = take(counts.refusedShape);
+    AgcDriver::ProfilePrint_nid_no_patch("[own-shadow] (10 s, APS5_OWN_SHADOW_CURRENT %s) copy-ins skipped %llu (%.1f MiB) / made %llu (%.1f MiB); of the made: stamped since %llu, copy-back unconfirmed %llu, other lane %llu, in a run or not addressable %llu; turned back on at submission %llu (%.1f MiB); verify %llu checked, %llu mismatched\n", RuntimeSwitches::Set(RuntimeSwitch::OwnShadowCurrent) ? "set" : "unset", skipped, skippedBytes / 1048576.0, copied, copiedBytes / 1048576.0, stale, pending, otherLane, shape, forced, forcedBytes / 1048576.0, static_cast<unsigned long long>(counts.checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.mismatched.load(std::memory_order_relaxed)));
 }
 
 std::uint64_t ownShadowSkippedCount() {
     return OwnShadows().skippedTotal.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ownShadowForcedCount() {
+    return OwnShadows().forcedTotal.load(std::memory_order_relaxed);
 }
 
 std::uint64_t ownShadowMismatchesCount() {
@@ -6755,6 +6765,17 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     }
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
+    // APS5_OWN_SHADOW_CURRENT: the copy-ins decided at submission (the region, the import's device address of its
+    // first byte, and the copy source for APS5_VERIFY_OWN_SHADOW).
+    struct DeferredOwn {
+        Region* region;
+        VkDeviceAddress source;
+        VkBuffer copySource;
+        std::uint64_t copyOffset;
+    };
+    thread_local std::vector<DeferredOwn>* deferredOwnSlot = nullptr;
+    auto& deferredOwn = ShaderRecompiler::ThreadOwned(deferredOwnSlot);
+    deferredOwn.clear();
     const bool importSourced = ImportSourcedCopyIn();
     const bool sourcesOn = importSourced || GpuSourcedDrawBuffers();
     for (auto* region : copies) {
@@ -6854,21 +6875,24 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
         Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, address);
         if (!region->resident && region->deviceLocal && expected.empty() && ownShadowCurrent(region->begin, region->end, region->ownSyncGeneration, region->ownForgetSerial, region->ownSyncPending)) {
-            // The build's own shadow already holds these bytes (see ownShadowCurrent). This use's copy-back
-            // must be confirmed again before the next skip.
-            region->ownSyncPending = true;
-            copiedBytes -= bytes;
-            region->copyInSkipped = true;
-            OwnShadows().skipped.fetch_add(1, std::memory_order_relaxed);
-            OwnShadows().skippedTotal.fetch_add(1, std::memory_order_relaxed);
-            OwnShadows().skippedBytes.fetch_add(bytes, std::memory_order_relaxed);
-            noteStagingTop(region->begin, region->end, region->residentReason, 0, bytes, 0);
-            static const bool verifyOwn = std::getenv("APS5_VERIFY_OWN_SHADOW") != nullptr;
-            if (verifyOwn) verifyOwnShadow(context, *recorder, commands, region->buffer, copySource, copyOffset, bytes, region->begin, region->ownSyncGeneration);
-            recorder->Keep(region->buffer);
-            region->snapshot.clear();
-            reportOwnShadows();
-            continue;
+            // The build's own shadow held these bytes at this check (see ownShadowCurrent). The copy-in is still
+            // recorded, as an indirect kernel whose group count the submission sets: a stamp between this check and
+            // the batch's submission (a CPU store, or a writer whose marks come later) turns it back on, so the GPU
+            // never reads a shadow older than what the copy would have read (deferredOwn below). Inside a dispatch
+            // run or prelude, or without device addresses, the copy-in is recorded as before.
+            const auto sourceAddress = region->copySourceAddress != 0 ? region->copySourceAddress + (region->begin - region->copySourceBase) : VkDeviceAddress{0};
+            const bool shaped = !inRun && !prelude && sourceAddress != 0 && region->buffer->DeviceAddress() != 0 && sourceAddress % 4u == 0 && region->buffer->DeviceAddress() % 4u == 0 && bytes % 4u == 0 && (bytes / 4u + 63u) / 64u <= context.limits.maxComputeWorkGroupCount[0];
+            if (!shaped) {
+                OwnShadows().refusedShape.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                region->ownSyncPending = true;
+                copiedBytes -= bytes;
+                region->copyInSkipped = true;
+                deferredOwn.push_back({region, sourceAddress, copySource, copyOffset});
+                recorder->Keep(region->buffer);
+                region->snapshot.clear();
+                continue;
+            }
         }
         if (region->resident && region->deviceLocal && expected.empty() && residentCurrent(region->begin, region->end, region->buffer)) {
             // The resident buffer already holds these bytes (see residentCurrent).
@@ -6929,6 +6953,62 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
             }
         }
+    }
+    if (!deferredOwn.empty()) {
+        // The conditional copy-ins (APS5_OWN_SHADOW_CURRENT). The staging diff kernel run as a copy: result = the
+        // import, pristine = target = the shadow, so it stores every import dword the shadow does not hold. Its group
+        // count sits in a host-visible VkDispatchIndirectCommand that starts at 0 (no copy); at the batch's
+        // submission (Recorder::BeforeSubmit) a range stamped since the check made at record time gets the full
+        // count, so the kernel copies exactly what the copy-in would have read. Ordered like the copy-ins: after
+        // every earlier writer of the import or the shadow, before the pristine copies and the work.
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+        static const bool verifyOwn = std::getenv("APS5_VERIFY_OWN_SHADOW") != nullptr;
+        for (const auto& entry : deferredOwn) {
+            auto* region = entry.region;
+            const auto bytes = region->end - region->begin;
+            auto arguments = std::make_shared<Buffer>(context, sizeof(VkDispatchIndirectCommand), VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, copyBufferProperties(false));
+            const VkDispatchIndirectCommand none{0, 1, 1};
+            std::memcpy(arguments->Bytes().data(), &none, sizeof(none));
+            const auto dwords = static_cast<std::uint32_t>(bytes / 4u);
+            if (!recorder->RecordStagingDiffIndirect(commands, entry.source, region->buffer->DeviceAddress(), region->buffer->DeviceAddress(), dwords, arguments->Handle(), 0)) {
+                // No kernel: the copy-in as before.
+                CopyBuffer(context, commands, entry.copySource, entry.copyOffset, region->buffer->Handle(), 0, bytes);
+                region->copyInSkipped = false;
+                continue;
+            }
+            recorder->Keep(arguments);
+            recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+            const auto begin = region->begin;
+            const auto generation = region->ownSyncGeneration;
+            const auto groups = (dwords + 63u) / 64u;
+            recorder->BeforeSubmit([arguments, begin, bytes, generation, groups] {
+                static_cast<void>(GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes)));
+                if (GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(bytes), generation)) {
+                    OwnShadows().skipped.fetch_add(1, std::memory_order_relaxed);
+                    OwnShadows().skippedTotal.fetch_add(1, std::memory_order_relaxed);
+                    OwnShadows().skippedBytes.fetch_add(bytes, std::memory_order_relaxed);
+                    return;
+                }
+                const VkDispatchIndirectCommand all{groups, 1, 1};
+                std::memcpy(arguments->Bytes().data(), &all, sizeof(all));
+                OwnShadows().forcedAtSubmit.fetch_add(1, std::memory_order_relaxed);
+                OwnShadows().forcedAtSubmitBytes.fetch_add(bytes, std::memory_order_relaxed);
+                OwnShadows().forcedTotal.fetch_add(1, std::memory_order_relaxed);
+            });
+            noteStagingTop(region->begin, region->end, region->residentReason, 0, bytes, 0);
+        }
+        // The kernels' stores reach the pristine copies, the work and everything after, as the copy-ins' own.
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_UNIFORM_READ_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
+        // APS5_VERIFY_OWN_SHADOW: the shadow after the conditional copy against the import, both read here.
+        if (verifyOwn) {
+            for (const auto& entry : deferredOwn) {
+                if (!entry.region->copyInSkipped) continue;
+                verifyOwnShadow(context, *recorder, commands, entry.region->buffer, entry.copySource, entry.copyOffset, entry.region->end - entry.region->begin, entry.region->begin, entry.region->ownSyncGeneration);
+            }
+        }
+        reportOwnShadows();
     }
     if (stagingDiffEnabled(context)) {
         // The pristine copies of the staged shadows (APS5_STAGING_DIFF), after the copy-ins.
@@ -8270,5 +8350,6 @@ std::uint64_t ResidentPristineCopied() { return residentPristineCopiedCount(); }
 std::uint64_t ResidentPristineMismatches() { return residentPristineMismatchesCount(); }
 std::uint64_t OwnShadowSkipped() { return ownShadowSkippedCount(); }
 std::uint64_t OwnShadowMismatches() { return ownShadowMismatchesCount(); }
+std::uint64_t OwnShadowForcedAtSubmit() { return ownShadowForcedCount(); }
 
 }

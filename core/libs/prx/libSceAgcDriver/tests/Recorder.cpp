@@ -4130,6 +4130,7 @@ bool ownShadowTests(const Device& device, Recorder& recorder) {
     constexpr std::size_t first = 8192 / 4;
     std::vector<std::uint32_t> model(bytes / 4u, 0x11111111u);
     const auto skippedBefore = OwnShadowSkipped();
+    const auto forcedBefore = OwnShadowForcedAtSubmit();
     GuestBufferMemory memory(context);
     memory.AllowDeviceStaging();
     memory.AddWritable(element, elementBytes, false, true);
@@ -4145,6 +4146,13 @@ bool ownShadowTests(const Device& device, Recorder& recorder) {
             Require(memory.InPlaceReads().empty(), "a read and written 256 KiB element was not staged");
         } else {
             memory.RecordStagingCopies(recorder);
+        }
+        if (use == 10) {
+            // A store and its stamp after the copy-in was recorded (skipped at that check), before the batch is
+            // submitted: the old copy-in would read it, so the submission must turn the copy-in back on.
+            words[first + 6000] = 0x99999999u;
+            model[first + 6000] = 0x99999999u;
+            static_cast<void>(AgcDriver::GuestMemory::MarkPossiblyWritten(element + 6000u * 4u, 4));
         }
         std::uint32_t adjustment = 0;
         const auto view = memory.Descriptor(element, elementBytes, adjustment);
@@ -4174,7 +4182,9 @@ bool ownShadowTests(const Device& device, Recorder& recorder) {
     }
     const auto skipped = OwnShadowSkipped() - skippedBefore;
     std::cout << "own shadow: " << skipped << " copy-ins skipped, " << OwnShadowMismatches() << " verify mismatches\n";
-    if (std::getenv("APS5_OWN_SHADOW_CURRENT") != nullptr) Require(skipped != 0, "APS5_OWN_SHADOW_CURRENT: no copy-in of the reused build was skipped");
+    const auto forced = OwnShadowForcedAtSubmit() - forcedBefore;
+    std::cout << "own shadow: " << forced << " skipped copy-ins turned back on at submission\n";
+    if (std::getenv("APS5_OWN_SHADOW_CURRENT") != nullptr) Require(skipped != 0 && forced != 0, "APS5_OWN_SHADOW_CURRENT: no copy-in of the reused build was skipped, or the store after the check did not turn one back on");
     else Require(skipped == 0, "a copy-in was skipped with APS5_OWN_SHADOW_CURRENT unset");
     Require(OwnShadowMismatches() == 0, "APS5_VERIFY_OWN_SHADOW: a skipped copy-in's shadow differed from its import");
     {
