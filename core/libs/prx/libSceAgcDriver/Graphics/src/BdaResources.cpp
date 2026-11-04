@@ -534,7 +534,7 @@ void BdaResources::markWrittenPages() const {
         }
         GuestMemory::MarkPossiblyWritten(begin, bytes);
         P0Mem::NoteBdaReport(bytes);
-        if (OwnershipProbe::Enabled()) OwnershipProbe::Global()->NoteGpuWrite(begin, end, OwnershipProbe::SourceBdaReport);
+        if (OwnershipProbe::Enabled()) OwnershipProbe::Global()->NoteGpuWrite(begin, end, OwnershipProbe::SourceBdaReport); OwnershipProbe::SoftGpuWrite(begin, end, OwnershipProbe::SourceBdaReport);
     }), "invalid BDA written-page record");
     for (std::uint32_t claim = 0; claim < count; ++claim) {
         const auto slot = words[Abi::WrittenListWord + claim];

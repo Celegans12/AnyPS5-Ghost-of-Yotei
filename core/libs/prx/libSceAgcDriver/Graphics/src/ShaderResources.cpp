@@ -7790,7 +7790,7 @@ void ShaderResources::NoteResidentCensus() const {
     if (OwnershipProbe::LeaseMode() && usesBda && !bdaReadOnly) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
         guestMemory.WritableLease(writable);
-        for (const auto& [begin, end] : writable) OwnershipProbe::Global()->NoteGpuWrite(begin, end, OwnershipProbe::SourceLease);
+        for (const auto& [begin, end] : writable) { if (OwnershipProbe::Enabled()) OwnershipProbe::Global()->NoteGpuWrite(begin, end, OwnershipProbe::SourceLease); OwnershipProbe::SoftGpuWrite(begin, end, OwnershipProbe::SourceLease); }
     }
     if (P0Mem::CensusEnabled()) {
         guestMemory.NoteP0Census(usesBda && !bdaReadOnly);

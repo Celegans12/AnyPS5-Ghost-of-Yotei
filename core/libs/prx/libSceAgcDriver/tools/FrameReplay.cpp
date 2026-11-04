@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
 #include "prx/libSceAgcDriver/State/include/Configuration.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -743,7 +744,7 @@ struct Replay {
                 if (recording) {
                     deltaBytes += chunk->bytes;
                     AgcDriver::Graphics::ResidentCensus::NoteCpuWrite(chunk->address, chunk->bytes);
-                    AgcDriver::Graphics::P0Mem::NoteCpuWrite(chunk->address, chunk->bytes);
+                    AgcDriver::Graphics::P0Mem::NoteCpuWrite(chunk->address, chunk->bytes); AgcDriver::OwnershipProbe::SoftTitleWrite(chunk->address, chunk->bytes);
                 }
             }
             return;
