@@ -499,6 +499,30 @@ public:
     static void SetWriteOrigin(std::uint64_t program);
     static void SetWriteOriginKernel(std::uint32_t mask, std::uint32_t value);
     static std::uint64_t CurrentWriteOrigin();
+    // APS5_TRACE_LABEL_CLOBBER=1: the dwords of the latest 8192 label stores (NoteRecentLabel, every label path)
+    // and each later write over one of them (NoteWriteOverLabels: every noted non-label write and every storage
+    // write-back's stored ranges), with the write's origin, in a ring of 1024 that LabelClobbers reads back: a wait
+    // that times out on a label reading another value than was stored names the writes that landed over it.
+    struct LabelClobber {
+        std::uint64_t label = 0;
+        std::uint32_t labelValue = 0;
+        std::uint32_t labelQueue = 0;
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        // The write note (0: a storage write-back's stored range), the recording program and packet, the
+        // write-back reason on the thread (StorageTexture::CurrentFlushReason), and how long after the label.
+        std::uint64_t note = 0;
+        std::uint64_t program = 0;
+        std::uint32_t opcode = 0;
+        std::uint32_t queue = 0;
+        const char* reason = nullptr;
+        double afterMs = 0;
+    };
+    static constexpr std::size_t LabelClobberRecentLimit = 8192;
+    static bool LabelClobberTraced();
+    static void NoteRecentLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint32_t queue);
+    static void NoteWriteOverLabels(std::uint64_t begin, std::uint64_t end, std::uint64_t note);
+    static std::vector<LabelClobber> LabelClobbers(std::uint64_t address, std::size_t bytes);
     enum class CheckpointKind : std::uint64_t { Draw = 0x1, CopyIn = 0xf1, CopyBack = 0xf2, DiffCopyBack = 0xf3, BindlessPublish = 0xf4, DmaCopy = 0xf5, GpuCopies = 0xf6, BatchBegin = 0xb0, BatchEnd = 0xb1, AsyncDispatch = 0xb2 };
     static void SetCheckpointFunction(PFN_vkCmdSetCheckpointNV function);
     static bool CheckpointsOn();

@@ -5395,6 +5395,10 @@ StorageTexture::GpuOrderCounts StorageTexture::GpuOrderTotals() {
     return counts;
 }
 
+const char* StorageTexture::CurrentFlushReason() {
+    return flushReason;
+}
+
 std::uint64_t StorageTexture::DeferredLabelReadbacks() {
     return deferredLabelReadbacksTotal.load(std::memory_order_relaxed);
 }
@@ -6916,6 +6920,9 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     const auto& stores = drawn.rect ? spans : keep;
     const auto stampBegin = drawn.rect && !stores.empty() ? stores.front().first : firstStored;
     const auto stampEnd = drawn.rect && !stores.empty() ? stores.back().second : lastStored;
+    // APS5_TRACE_LABEL_CLOBBER: the stored ranges against the labels stored lately, so a wait that times out on
+    // one of them names this write-back (note 0).
+    for (const auto& [from, to] : stores) Recorder::NoteWriteOverLabels(from, to, 0);
     // Taken before this write-back stamps anything (see advanceAdjacent), with the 64 KiB block span
     // its stamps cover.
     const auto firstBlock = stampBegin / block;

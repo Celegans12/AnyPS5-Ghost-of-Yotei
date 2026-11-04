@@ -405,6 +405,14 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                              static_cast<unsigned long long>(Graphics::Recorder::PendingCompletionLabels()), static_cast<unsigned long long>(Graphics::Recorder::PendingWriteBackCompletions()), age,
                              static_cast<unsigned long long>(Graphics::Recorder::WriteGeneration()), static_cast<unsigned long long>(seenGeneration), queue0Dormant.load(std::memory_order_relaxed) ? 1 : 0, completionsPending() ? 1 : 0, labelFlushDue() ? 1 : 0);
             }
+            // A label stored before the wait was received that reads back another value was overwritten (or dropped):
+            // its stores, and (APS5_TRACE_LABEL_CLOBBER) the writes noted over it since.
+            describeLabelStores(address, awaitedBytes, received);
+            for (const auto& clobber : Graphics::Recorder::LabelClobbers(address, awaitedBytes)) {
+                std::fprintf(stderr, "[gpu]   label clobber: label 0x%llx = 0x%x (queue 0x%x) under a write 0x%llx+0x%llx %.1f ms later (note %llu, program 0x%llx, packet 0x%x queue 0x%x, write-back reason %s)\n",
+                             static_cast<unsigned long long>(clobber.label), clobber.labelValue, clobber.labelQueue, static_cast<unsigned long long>(clobber.begin), static_cast<unsigned long long>(clobber.end - clobber.begin), clobber.afterMs,
+                             static_cast<unsigned long long>(clobber.note), static_cast<unsigned long long>(clobber.program), clobber.opcode, clobber.queue, clobber.reason != nullptr ? clobber.reason : "none");
+            }
             context.Print(stderr, "[gpu]   preceding packet %s\n");
         }
     }

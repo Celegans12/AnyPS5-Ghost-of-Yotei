@@ -12671,8 +12671,35 @@ void Run(Context context) {
 }
 #endif
 
+// APS5_TRACE_LABEL_CLOBBER: a write over a recent label dword is listed with its range, note and label value; writes
+// elsewhere are not; a label evicted from the recent set (8192 dwords) is no longer watched.
+static void labelClobberTests() {
+    using AgcDriver::Graphics::Recorder;
+    Require(_putenv_s("APS5_TRACE_LABEL_CLOBBER", "1") == 0, "cannot set APS5_TRACE_LABEL_CLOBBER");
+    Require(Recorder::LabelClobberTraced(), "APS5_TRACE_LABEL_CLOBBER=1 did not turn the label clobber trace on");
+    const std::array<std::uint32_t, 2> label{1, 0};
+    Recorder::NoteRecentLabel(0x1000, std::as_bytes(std::span(label)), 0x38);
+    Recorder::NoteWriteOverLabels(0x0ff0, 0x1002, 42);
+    Recorder::NoteWriteOverLabels(0x2000, 0x3000, 43);
+    auto clobbers = Recorder::LabelClobbers(0x1000, 4);
+    Require(clobbers.size() == 1, "a write over a recent label was not listed once");
+    Require(clobbers[0].label == 0x1000 && clobbers[0].labelValue == 1 && clobbers[0].labelQueue == 0x38 && clobbers[0].note == 42 && clobbers[0].begin == 0x0ff0 && clobbers[0].end == 0x1002, "a listed label clobber has the wrong label or write");
+    Recorder::NoteWriteOverLabels(0x1004, 0x1008, 44);
+    Require(Recorder::LabelClobbers(0x1000, 8).size() == 2 && Recorder::LabelClobbers(0x1000, 4).size() == 1, "a write over the label's second dword was not listed for that dword alone");
+    std::vector<std::uint32_t> others(Recorder::LabelClobberRecentLimit, 7);
+    Recorder::NoteRecentLabel(0x100000, std::as_bytes(std::span(others)), 0);
+    Recorder::NoteWriteOverLabels(0x1000, 0x1004, 45);
+    clobbers = Recorder::LabelClobbers(0x1000, 4);
+    Require(clobbers.size() == 1 && clobbers[0].note == 42, "an evicted label was still watched");
+    std::cout << "label clobber trace tests passed\n";
+}
+
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--label-clobber-only") {
+            labelClobberTests();
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--collect-mapping-history-only") {
             if (!collectMappingHistoryTests()) return 77;
             std::cout << "collect mapping history tests passed\n";

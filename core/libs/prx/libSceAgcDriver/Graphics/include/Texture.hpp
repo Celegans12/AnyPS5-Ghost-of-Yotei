@@ -320,6 +320,8 @@ public:
         bool leaseGuardTripped = false;
     };
     static GpuOrderCounts GpuOrderTotals();
+    // The reason of the write-back this thread is storing ("readback before label", "storage refresh", ...), or null.
+    static const char* CurrentFlushReason();
     static constexpr const char* DeferredLabelReadbackReason = "readback before label, deferred";
     static std::uint64_t DeferredLabelReadbacks();
     static std::size_t StoreDrawnLinear(const char* reason);
