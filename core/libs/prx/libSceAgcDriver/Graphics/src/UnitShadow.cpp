@@ -258,8 +258,8 @@ struct SlabCopies {
 struct PublishLog {
     std::mutex mutex;
     std::uint64_t serial = 0;
-    // (serial, begin, end); entries older than `trimmed` were dropped.
-    std::deque<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>> entries;
+    // (serial, begin, end, immediate); entries older than `trimmed` were dropped.
+    std::deque<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t, bool>> entries;
     std::uint64_t trimmed = 0;
 };
 
@@ -268,11 +268,11 @@ PublishLog& Publishes() {
     return *log;
 }
 
-void logPublishes(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+void logPublishes(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, bool immediate) {
     auto& log = Publishes();
     std::lock_guard lock(log.mutex);
     const auto serial = ++log.serial;
-    for (const auto& [begin, end] : ranges) log.entries.emplace_back(serial, begin, end);
+    for (const auto& [begin, end] : ranges) log.entries.emplace_back(serial, begin, end, immediate);
     while (log.entries.size() > 65536) {
         log.trimmed = std::get<0>(log.entries.front());
         log.entries.pop_front();
@@ -311,7 +311,7 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     }
     const auto copyBuffer = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
     for (const auto& entry : copies) copyBuffer(commands, entry.slab->buffer, shadow.importBuffer, static_cast<std::uint32_t>(entry.regions.size()), entry.regions.data());
-    logPublishes(ranges);
+    logPublishes(ranges, recorder == nullptr);
     // The published bytes are visible to everything recorded after and to the host, as after a fill.
     constexpr VkAccessFlags publishedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, publishedAccess);
@@ -578,14 +578,14 @@ std::uint64_t ShadowPublishSerial() {
     return log.serial;
 }
 
-bool ShadowPublishedSince(std::uint64_t address, std::size_t bytes, std::uint64_t serial) {
+bool ShadowPublishedSince(std::uint64_t address, std::size_t bytes, std::uint64_t serial, bool immediateOnly) {
     auto& log = Publishes();
     std::lock_guard lock(log.mutex);
     if (log.serial <= serial) return false;
     if (log.trimmed > serial) return true;
     const auto end = address + bytes;
     for (auto it = log.entries.rbegin(); it != log.entries.rend() && std::get<0>(*it) > serial; ++it) {
-        if (std::get<1>(*it) < end && address < std::get<2>(*it)) return true;
+        if ((!immediateOnly || std::get<3>(*it)) && std::get<1>(*it) < end && address < std::get<2>(*it)) return true;
     }
     return false;
 }

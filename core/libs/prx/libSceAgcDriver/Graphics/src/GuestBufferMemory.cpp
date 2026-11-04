@@ -6992,7 +6992,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             const auto publishSerial = region->ownPublishSerial;
             recorder->BeforeSubmit([arguments, begin, bytes, decision, groups, publishSerial] {
                 static_cast<void>(GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes)));
-                if (!decision->stale.load(std::memory_order_relaxed) && GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(bytes), decision->generation.load(std::memory_order_relaxed)) && !ShadowPublishedSince(begin, static_cast<std::size_t>(bytes), publishSerial)) {
+                if (!decision->stale.load(std::memory_order_relaxed) && GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(bytes), decision->generation.load(std::memory_order_relaxed)) && !ShadowPublishedSince(begin, static_cast<std::size_t>(bytes), publishSerial, true)) {
                     OwnShadows().skipped.fetch_add(1, std::memory_order_relaxed);
                     OwnShadows().skippedTotal.fetch_add(1, std::memory_order_relaxed);
                     OwnShadows().skippedBytes.fetch_add(bytes, std::memory_order_relaxed);
