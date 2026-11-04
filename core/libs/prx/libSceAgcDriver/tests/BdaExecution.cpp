@@ -221,6 +221,116 @@ static void RunBdaDwordWriteTests(const Context& context) {
     write(guest + 0x7c, 2, 8, static_cast<Abi::FaultReason>(0), 64);
 }
 
+static void RunBdaRangeMemoTests(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    constexpr std::uint64_t guest = 0x7fff12340001ULL;
+    constexpr std::uint64_t highest = 0xffffffffffffff00ULL;
+    const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+    Buffer first(context, 3, usage);
+    Buffer second(context, 2, usage);
+    Buffer words(context, 16, usage);
+    Buffer shifted(context, 20, usage);
+    Buffer large(context, 1024, usage);
+    Buffer overlap(context, 0x200, usage);
+    Buffer above(context, 16, usage);
+    Buffer spread(context, 0x40 * 20, usage);
+    std::uint32_t seed = 0x17;
+    for (auto* buffer : {&first, &second, &words, &shifted, &large, &overlap, &above, &spread}) {
+        for (std::size_t index = 0; index < buffer->Bytes().size(); ++index) buffer->Bytes()[index] = std::byte(static_cast<std::uint8_t>(seed + index * 13u));
+        seed += 0x29;
+    }
+    std::vector<Abi::Range> mixed{{guest, guest + 3, first.DeviceAddress(), Abi::Read, 0},
+        {guest + 3, guest + 5, second.DeviceAddress(), Abi::Read, 0},
+        {guest + 0x100, guest + 0x110, words.DeviceAddress(), Abi::Read, 0},
+        {guest + 0x200, guest + 0x214, shifted.DeviceAddress() + 1u, Abi::Read, 0},
+        {guest + 0x300, guest + 0x310, words.DeviceAddress(), Abi::Write, 0},
+        {guest + 0x400, guest + 0x800, large.DeviceAddress(), Abi::Read, 0},
+        {guest + 0x700, guest + 0x900, overlap.DeviceAddress(), Abi::Read, 0},
+        {highest, highest + 0x10, above.DeviceAddress(), Abi::Read, 0}};
+    std::vector<Abi::Range> indexed;
+    for (std::uint64_t index = 0; index < 20u; ++index) indexed.push_back({guest + index * 0x80u, guest + index * 0x80u + 0x40u, spread.DeviceAddress() + index * 0x40u, Abi::Read, 0});
+    Require(Abi::RangesOrdered(mixed.data(), mixed.size()) && Abi::RangesOrdered(indexed.data(), indexed.size()), "the BDA range memo test tables do not ascend by begin");
+    const auto index = Abi::BuildRangeIndex(indexed.data(), indexed.size());
+    Require(!index.empty(), "the BDA range memo test's indexed table has no index");
+    Buffer mixedTable(context, sizeof(Abi::Header) + mixed.size() * sizeof(Abi::Range), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer indexedTable(context, sizeof(Abi::Header) + indexed.size() * sizeof(Abi::Range) + index.size() * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    Buffer fault(context, sizeof(Abi::Fault), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    const std::vector<BdaMemoRead> reads{{32, 1}, {32, 4}, {32, 1}, {8, 1}, {32, 2}, {32, 1}, {32, 4}, {16, 1}, {32, 1}, {32, 3}, {32, 1}, {8, 1}};
+    Buffer output(context, (BdaAnchoredReadInputWord + 2u + reads.size()) * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    struct Outcome {
+        Abi::Fault fault{};
+        std::vector<std::uint32_t> values;
+    };
+    const auto run = [&](Pipeline& pipeline, bool withIndex, std::uint64_t base, const std::vector<std::uint32_t>& offsets) {
+        const auto& ranges = withIndex ? indexed : mixed;
+        Buffer& table = withIndex ? indexedTable : mixedTable;
+        const Abi::Header header{Abi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(Abi::Range), withIndex ? Abi::IndexedTable : 0u};
+        std::memset(table.Bytes().data(), 0, table.Bytes().size());
+        std::memcpy(table.Bytes().data(), &header, sizeof(header));
+        std::memcpy(table.Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(Abi::Range));
+        if (withIndex) std::memcpy(table.Bytes().data() + sizeof(header) + ranges.size() * sizeof(Abi::Range), index.data(), index.size() * sizeof(std::uint32_t));
+        std::memset(fault.Bytes().data(), 0, fault.Bytes().size());
+        std::memset(output.Bytes().data(), 0xa5, BdaAnchoredReadInputWord * sizeof(std::uint32_t));
+        std::vector<std::uint32_t> inputs{static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u)};
+        inputs.insert(inputs.end(), offsets.begin(), offsets.end());
+        inputs.resize(2u + reads.size(), offsets.back());
+        std::memcpy(output.Bytes().data() + BdaAnchoredReadInputWord * sizeof(std::uint32_t), inputs.data(), inputs.size() * sizeof(std::uint32_t));
+        pipeline.Run(1);
+        Outcome outcome;
+        std::memcpy(&outcome.fault, fault.Bytes().data(), sizeof(outcome.fault));
+        outcome.values.resize(reads.size() * 4u);
+        std::memcpy(outcome.values.data(), output.Bytes().data(), outcome.values.size() * sizeof(std::uint32_t));
+        return outcome;
+    };
+    struct Scenario {
+        const char* name;
+        bool indexedTable;
+        std::uint64_t base;
+        std::vector<std::uint32_t> offsets;
+    };
+    const std::vector<Scenario> scenarios{
+        {"hits in one range", false, guest + 0x400, {0x0, 0x10, 0x4, 0xb, 0x100, 0x2fc, 0x2f0, 0x2fe, 0x8, 0x20, 0x2fc, 0x2ff}},
+        {"the bound before an overlapping range", false, guest + 0x400, {0x0, 0x2f0, 0x2fc, 0x2ff, 0x2f8, 0x300, 0x2f8, 0x304, 0x2fc, 0x4f4, 0x4fc, 0x4ff}},
+        {"range ends and holes", false, guest, {0x100, 0x10c, 0x110, 0x0, 0x3, 0x5, 0x104, 0x200, 0x10f, 0x20c, 0x10d, 0x213}},
+        {"crossing ranges after a hit", false, guest, {0x0, 0x0, 0x1, 0x2, 0x1, 0x2, 0x0, 0x2, 0x3, 0x2, 0x4, 0x5}},
+        {"a range without read permission", false, guest, {0x400, 0x300, 0x404, 0x30c, 0x100, 0x400, 0x104, 0x408, 0x300, 0x40c, 0x108, 0x303}},
+        {"alternating ranges", false, guest, {0x400, 0x100, 0x404, 0x104, 0x408, 0x200, 0x40c, 0x108, 0x700, 0x10, 0x104, 0x710}},
+        {"the top of the address space", false, highest, {0x0, 0x0, 0xc, 0xf, 0x8, 0x10, 0x4, 0xe, 0xfffffff0u, 0x4, 0xc, 0xff}},
+        {"an indexed table", true, guest, {0x80, 0x84, 0xc0, 0xbf, 0x100, 0x13c, 0x980, 0x9b0, 0x84, 0x9fc, 0x9c0, 0x0}},
+        {"an indexed table, misses", true, guest, {0x0, 0x40, 0x3c, 0x7c, 0x80, 0xa00, 0x3c, 0x980, 0x9bc, 0x9c0, 0x83, 0x1}},
+    };
+    const auto dword = [](Buffer& buffer, std::size_t offset) {
+        std::uint32_t value = 0;
+        std::memcpy(&value, buffer.Bytes().data() + offset, sizeof(value));
+        return value;
+    };
+    const auto buffers = [&](bool withIndex) { return std::array<Buffer*, 3>{withIndex ? &indexedTable : &mixedTable, &fault, &output}; };
+    for (const bool stops : {false, true}) {
+        const auto plainCode = MakeBdaMemoReadTestShader(reads, stops, 0u);
+        Pipeline plain(context, plainCode, buffers(false));
+        Pipeline plainIndexed(context, plainCode, buffers(true));
+        const auto clean = run(plain, false, guest + 0x400, scenarios[0].offsets);
+        const auto cleanIndexed = run(plainIndexed, true, guest, scenarios[7].offsets);
+        Require(clean.fault.state == Abi::FaultState::Empty && clean.values[0] == dword(large, 0) && cleanIndexed.values[0] == dword(spread, 0x40) && cleanIndexed.fault.reason == Abi::FaultReason::Unmapped && cleanIndexed.fault.address == guest + 0xc0, "the BDA range memo test's tables do not map its reads");
+        for (std::uint32_t entries = 1; entries <= 4u; ++entries) {
+            const auto code = MakeBdaMemoReadTestShader(reads, stops, entries);
+            Require(code != plainCode, "the BDA range memo did not change the module");
+            Pipeline memo(context, code, buffers(false));
+            Pipeline memoIndexed(context, code, buffers(true));
+            for (const auto& scenario : scenarios) {
+                const auto expected = run(scenario.indexedTable ? plainIndexed : plain, scenario.indexedTable, scenario.base, scenario.offsets);
+                const auto actual = run(scenario.indexedTable ? memoIndexed : memo, scenario.indexedTable, scenario.base, scenario.offsets);
+                Require(std::memcmp(&expected.fault, &actual.fault, sizeof(expected.fault)) == 0 && expected.values == actual.values, std::string("a read through the BDA range memo (") + std::to_string(entries) + " entries, " + (stops ? "stopping" : "continuing") + ") differs from the lookup: " + scenario.name);
+            }
+        }
+    }
+    Pipeline memo(context, MakeBdaMemoReadTestShader(reads, false, 2u), buffers(false));
+    const auto bounded = run(memo, false, guest + 0x400, {0x0, 0x2f0, 0x2fc, 0x2ff, 0x2f8, 0x300, 0x2f8, 0x304, 0x2fc, 0x4f4, 0x4fc, 0x4ff});
+    Require(bounded.fault.state == Abi::FaultState::Empty && bounded.values[0] == dword(large, 0) && bounded.values[8] == dword(large, 0x2fc) && bounded.values[16] == dword(large, 0x2f8) && bounded.values[17] == dword(large, 0x2fc) && bounded.values[20] == dword(overlap, 0) && bounded.values[24] == dword(large, 0x2f8) && bounded.values[27] == dword(large, 0x304) && bounded.values[28] == (dword(overlap, 4) & 0xffffu), "a read through the BDA range memo past the next range's begin did not take the next range: fault " + std::to_string(static_cast<std::uint32_t>(bounded.fault.state)) + " values " + Hex(bounded.values[0]) + " " + Hex(bounded.values[8]) + " " + Hex(bounded.values[16]) + " " + Hex(bounded.values[17]) + " " + Hex(bounded.values[20]) + " " + Hex(bounded.values[24]) + " " + Hex(bounded.values[27]) + " " + Hex(bounded.values[28]) + " want " + Hex(dword(large, 0)) + " " + Hex(dword(large, 0x2fc)) + " " + Hex(dword(large, 0x2f8)) + " " + Hex(dword(overlap, 0)) + " " + Hex(dword(large, 0x304)) + " " + Hex(dword(overlap, 4)));
+    const auto hole = run(memo, false, guest, {0x100, 0x10c, 0x110, 0x0, 0x3, 0x5, 0x104, 0x200, 0x10f, 0x20c, 0x10d, 0x213});
+    Require(hole.fault.state == Abi::FaultState::Ready && hole.fault.reason == Abi::FaultReason::Unmapped && hole.fault.address == guest + 0x110 && hole.fault.instruction == 0x1001u && hole.values[0] == dword(words, 0) && hole.values[4] == dword(words, 0xc), "a read through the BDA range memo into a hole after a hit did not fault");
+}
+
 static void RunBdaAnchorTests(const Context& context) {
     namespace Abi = ShaderRecompiler::BdaAbi;
     constexpr std::uint64_t guest = 0x7fff12340001ULL;
@@ -537,6 +647,7 @@ void RunBdaExecutionTests(const Context& context) {
     sequence({Abi::FaultReason::Unmapped, Abi::FaultReason::Unaligned}, Abi::FaultReason::Unmapped, 1);
     RunBdaDwordWriteTests(context);
     RunBdaAnchorTests(context);
+    RunBdaRangeMemoTests(context);
 }
 
 void RunBdaStoreExecutionTests(const Context& context) {
