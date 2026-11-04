@@ -3766,7 +3766,12 @@ void printGpuTiming(const char* window) {
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
     // The first field stays the program sum: the measure scripts match on it.
     AgcDriver::ProfilePrint_nid_no_patch("[gputime] %.0f ms of GPU time in %llu batches over %s (batch %.0f ms first to last command; classes %.0f ms, all ranges %.0f ms, untimed %.0f ms outside every range; %llu presents; %llu ranges dropped at the %u cap); by program:", timingProgramMs, static_cast<unsigned long long>(timingBatches), window, timingBatchMs, timingClassMs, timingUnionMs, timingBatchMs - timingUnionMs, static_cast<unsigned long long>(presents), static_cast<unsigned long long>(timingDropped.exchange(0, std::memory_order_relaxed)), MaxTimedRanges);
-    for (std::size_t i = 0; i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
+    // P0-shader diagnostic: APS5_P0S_GPUTIME_TOP=n lists n programs instead of 12, each to 0.1 ms.
+    static const std::size_t p0sTop = [] { const char* text = std::getenv("APS5_P0S_GPUTIME_TOP"); return text != nullptr ? static_cast<std::size_t>(std::strtoul(text, nullptr, 0)) : std::size_t{0}; }();
+    if (p0sTop != 0u) {
+        for (std::size_t i = 0; i < hot.size() && i < p0sTop; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.1fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
+    }
+    for (std::size_t i = 0; p0sTop == 0u && i < hot.size() && i < 12; ++i) AgcDriver::ProfilePrint_nid_no_patch(" 0x%llx x%llu %.0fms", static_cast<unsigned long long>(hot[i].first), static_cast<unsigned long long>(hot[i].second.count), hot[i].second.ms);
     AgcDriver::ProfilePrint_nid_no_patch("; by class:%s\n", classes.c_str());
     // Across batches and lanes: what the per-batch "all ranges" union cannot see.
     const auto ms = [](std::uint64_t ticks) { return static_cast<double>(ticks) * timingPeriodNs / 1e6; };

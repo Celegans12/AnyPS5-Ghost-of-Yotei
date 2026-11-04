@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvBda.hpp"
+#include "P0sCeiling.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <bit>
@@ -26,7 +27,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto rangeType = rangeResult ? state.module.Type(spv::OpTypeVector, u64, 3u) : 0u;
     const auto resultType = rangeResult ? rangeType : u64;
     const auto zero = rangeResult ? state.module.Constant(spv::OpConstantComposite, rangeType, BdaConstant(state, 0u), BdaConstant(state, 0u), BdaConstant(state, 0u)) : BdaConstant(state, 0u);
-    state.module.AddFunction(spv::OpFunction, resultType, function, rangeResult ? spv::FunctionControlMaskNone : spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, resultType, u64, u32, u32));
+    state.module.AddFunction(spv::OpFunction, resultType, function, rangeResult ? spv::FunctionControlMaskNone : P0sHelperControl(), state.module.Type(spv::OpTypeFunction, resultType, u64, u32, u32));
     const auto address = state.module.AllocateId();
     const auto bytes = state.module.AllocateId();
     const auto instruction = state.module.AllocateId();
@@ -94,6 +95,45 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         leave(binary(spv::OpIAdd, u64, address, delta));
         EmitLabel(state, next);
     }
+    // P0s ceiling (APS5_P0S_FLAT_BDA): a table whose Header::reserved is 3 (indexed + flat) carries after its index
+    // a flat page section: u64 base, u32 pages, u32 shift, then one u64 per page, `device - begin` of the one range
+    // that holds the whole page with read permission and no other range beginning inside it (0: take the full
+    // lookup). A read whose bytes stay inside one such page returns address + entry with one entry load; that is
+    // the full lookup's result (the same range is selected for every address of the page, and its checks pass).
+    if (P0s::FlatBda() && permission == BdaAbi::Read && !rangeResult) {
+        const auto flength = state.module.AllocateId();
+        state.module.AddFunction(spv::OpArrayLength, u32, flength, state.bdaPagetableVariable, 0u);
+        const auto lessEqual = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpULessThanEqual, boolean, left, right); };
+        const auto both = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpLogicalAnd, boolean, left, right); };
+        const auto isFlat = binary(spv::OpIEqual, boolean, BdaLoadWord(state, constant(3)), constant(3u));
+        const auto fcount = BdaLoadWord(state, constant(1));
+        const auto countOk = lessEqual(fcount, binary(spv::OpShiftRightLogical, u32, flength, constant(3)));
+        const auto fIndexAt = binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, Select(state, u32, countOk, fcount, constant(0)), constant(8)));
+        const auto ok1 = both(both(isFlat, countOk), lessEqual(binary(spv::OpIAdd, u32, fIndexAt, constant(5)), flength));
+        const auto safeIndexAt = Select(state, u32, ok1, fIndexAt, constant(0));
+        const auto fbuckets = BdaLoadWord(state, binary(spv::OpIAdd, u32, safeIndexAt, constant(2)));
+        const auto fFlatAt = binary(spv::OpIAdd, u32, binary(spv::OpIAdd, u32, safeIndexAt, constant(5)), fbuckets);
+        const auto ok2 = both(both(ok1, lessEqual(fbuckets, flength)), lessEqual(binary(spv::OpIAdd, u32, fFlatAt, constant(4)), flength));
+        const auto safeFlatAt = Select(state, u32, ok2, fFlatAt, constant(0));
+        const auto fbase = BdaLoadAddress(state, safeFlatAt);
+        const auto fpages = BdaLoadWord(state, binary(spv::OpIAdd, u32, safeFlatAt, constant(2)));
+        const auto fshift = Unary(state, spv::OpUConvert, u64, binary(spv::OpBitwiseAnd, u32, BdaLoadWord(state, binary(spv::OpIAdd, u32, safeFlatAt, constant(3))), constant(63)));
+        const auto fend = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
+        const auto page = binary(spv::OpShiftRightLogical, u64, binary(spv::OpISub, u64, address, fbase), fshift);
+        const auto lastPage = binary(spv::OpShiftRightLogical, u64, binary(spv::OpISub, u64, binary(spv::OpISub, u64, fend, BdaConstant(state, 1u)), fbase), fshift);
+        const auto inside = both(both(both(ok2, binary(spv::OpUGreaterThanEqual, boolean, address, fbase)), binary(spv::OpUGreaterThan, boolean, fend, address)), both(binary(spv::OpIEqual, boolean, page, lastPage), binary(spv::OpULessThan, boolean, page, Unary(state, spv::OpUConvert, u64, fpages))));
+        const auto entryAt = binary(spv::OpIAdd, u32, binary(spv::OpIAdd, u32, safeFlatAt, constant(4)), binary(spv::OpShiftLeftLogical, u32, Unary(state, spv::OpUConvert, u32, page), constant(1)));
+        const auto ok3 = both(inside, lessEqual(binary(spv::OpIAdd, u32, entryAt, constant(2)), flength));
+        const auto entryDelta = BdaLoadAddress(state, Select(state, u32, ok3, entryAt, constant(0)));
+        const auto flatHit = both(ok3, binary(spv::OpINotEqual, boolean, entryDelta, BdaConstant(state, 0u)));
+        const auto found = state.module.AllocateId();
+        const auto next = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, flatHit, found, next);
+        EmitLabel(state, found);
+        leave(binary(spv::OpIAdd, u64, address, entryDelta));
+        EmitLabel(state, next);
+    }
     const auto length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
     fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
@@ -104,7 +144,9 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     // header and `buckets + 1` start words after them. Every index word read here and below stays
     // inside the table whatever it holds (the reads of a table that fails a check go to word 0).
     const auto reserved = BdaLoadWord(state, constant(3));
-    const auto indexed = binary(spv::OpIEqual, boolean, reserved, constant(BdaAbi::IndexedTable));
+    const bool flatTables = P0s::FlatBda();
+    const auto flatTable = flatTables ? binary(spv::OpIEqual, boolean, reserved, constant(3u)) : 0u;
+    const auto indexed = flatTables ? binary(spv::OpLogicalOr, boolean, binary(spv::OpIEqual, boolean, reserved, constant(BdaAbi::IndexedTable)), flatTable) : binary(spv::OpIEqual, boolean, reserved, constant(BdaAbi::IndexedTable));
     const auto countFits = binary(spv::OpULessThanEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3)));
     const auto rangeWords = binary(spv::OpIMul, u32, Select(state, u32, countFits, count, constant(0)), constant(8));
     const auto indexWords = binary(spv::OpISub, u32, available, rangeWords);
@@ -115,7 +157,15 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto buckets = BdaLoadWord(state, binary(spv::OpIAdd, u32, indexAt, constant(2)));
     const auto shift = BdaLoadWord(state, binary(spv::OpIAdd, u32, indexAt, constant(3)));
     const auto plainBad = binary(spv::OpLogicalOr, boolean, binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)), binary(spv::OpINotEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3))));
-    const auto indexBad = binary(spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, headerFits), binary(spv::OpLogicalOr, boolean, binary(spv::OpINotEqual, boolean, binary(spv::OpISub, u32, indexWords, constant(indexHeaderWords + 1u)), buckets), binary(spv::OpLogicalOr, boolean, binary(spv::OpUGreaterThan, boolean, shift, constant(63)), binary(spv::OpIEqual, boolean, buckets, constant(0)))));
+    // With flat tables (P0s), a flat section of 4 + 2 * pages words follows the index.
+    auto flatWords = constant(0u);
+    if (flatTables) {
+        const auto flatAt = binary(spv::OpIAdd, u32, binary(spv::OpIAdd, u32, indexAt, constant(indexHeaderWords + 1u)), buckets);
+        const auto flatFits = binary(spv::OpLogicalAnd, boolean, binary(spv::OpLogicalAnd, boolean, headerFits, binary(spv::OpULessThanEqual, boolean, buckets, length)), binary(spv::OpULessThanEqual, boolean, binary(spv::OpIAdd, u32, flatAt, constant(4)), length));
+        const auto pages = BdaLoadWord(state, binary(spv::OpIAdd, u32, Select(state, u32, flatFits, flatAt, constant(0)), constant(2)));
+        flatWords = Select(state, u32, flatTable, Select(state, u32, flatFits, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpShiftLeftLogical, u32, pages, constant(1))), constant(0x80000000u)), constant(0u));
+    }
+    const auto indexBad = binary(spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, headerFits), binary(spv::OpLogicalOr, boolean, binary(spv::OpINotEqual, boolean, binary(spv::OpISub, u32, binary(spv::OpISub, u32, indexWords, flatWords), constant(indexHeaderWords + 1u)), buckets), binary(spv::OpLogicalOr, boolean, binary(spv::OpUGreaterThan, boolean, shift, constant(63)), binary(spv::OpIEqual, boolean, buckets, constant(0)))));
     failFirst({
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version)), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))), BdaAbi::FaultReason::InvalidTable},

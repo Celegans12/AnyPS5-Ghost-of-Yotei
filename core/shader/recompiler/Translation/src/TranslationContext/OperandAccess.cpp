@@ -1,5 +1,6 @@
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "Translation/TranslationContext.hpp"
+#include "P0sCeiling.hpp"
 #include <algorithm>
 #include <array>
 #include <stdexcept>
@@ -146,6 +147,7 @@ RdnaOperand TranslationContext::plainOperand(const RdnaOperand& operand) {
 }
 
 IrU32 TranslationContext::flushF32Denormal(IrU32 bits, std::uint32_t flushBit) {
+    if (P0s::NativeFloat()) return bits;
     if ((f32DenormalFlush & flushBit) == 0u) return bits;
     if (bits.Value().HasImmediate()) {
         const std::uint32_t value = bits.Value().ImmediateU32();
@@ -156,6 +158,7 @@ IrU32 TranslationContext::flushF32Denormal(IrU32 bits, std::uint32_t flushBit) {
 }
 
 IrF32 TranslationContext::flushTinyProduct(IrValue* lhs, IrValue* rhs, IrValue* product, IrValue* addend, bool afterRounding) {
+    if (P0s::NativeFloat()) return IrF32(*product);
     if ((f32DenormalFlush & 2u) == 0u || ((f32DenormalFlush & 1u) != 0u && (keepsProductOutOfTinyRange(*lhs) || keepsProductOutOfTinyRange(*rhs)))) return IrF32(*product);
     IrValue& lhsBits = ir.BitCastU32(*lhs);
     IrValue& rhsBits = ir.BitCastU32(*rhs);
@@ -342,6 +345,7 @@ IrU32 TranslationContext::quietNan32(IrU32 bits) {
 }
 
 IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct) {
+    if (P0s::NativeFloat()) return result;
     const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
     IrValue* bits = &ir.BitCastU32(*result);
     bits = &ir.Select(isNan(*bits), ir.Constant(0xffc00000u), *bits);

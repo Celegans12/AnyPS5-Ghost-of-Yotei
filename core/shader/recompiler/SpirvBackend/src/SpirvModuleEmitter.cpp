@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvImageEmitter.hpp"
+#include "P0sCeiling.hpp"
 #include "SpirvBackend/SpirvModuleEmitter.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
@@ -1616,6 +1617,11 @@ std::uint32_t EmitClassMaskF32(SpirvEmitterState& state, std::uint32_t value, st
 }
 
 std::uint32_t EmitMinMaxF32Value(SpirvEmitterState& state, std::uint32_t lhs, std::uint32_t rhs, bool maxValue) {
+    if (P0s::NativeFloat()) {
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpExtInst, TypeF32(state), result, GlslStd450(state), maxValue ? GLSLstd450NMax : GLSLstd450NMin, lhs, rhs);
+        return result;
+    }
     const auto lhsClass = EmitClassifyF32(state, lhs);
     const auto rhsClass = EmitClassifyF32(state, rhs);
 

@@ -1,4 +1,5 @@
 #include "PipelineSpecialization.hpp"
+#include "P0sCeiling.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvBufferAccess.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
@@ -222,6 +223,8 @@ std::uint32_t EmitMemoryElementIndex(SpirvEmitterState& state, const MemoryResou
 }
 
 std::uint32_t EmitMemoryElementInBounds(SpirvEmitterState& state, const MemoryResourceAccess& access, std::uint32_t index) {
+    // P0s ceiling (APS5_P0S_ROBUST): bound buffer accesses go unguarded; robustBufferAccess2 answers past the end.
+    if (P0s::RobustBuffers() && access.kind == ResourceKind::Buffer && state.robustBufferAccess2) return ConstantBool(state, true);
     const auto last = access.misalignment != 0u ? EmitAddU32(state, index, ConstantU32(state, 1u)) : index;
     const auto inBounds = state.module.AllocateId();
     state.module.AddFunction(spv::OpULessThan, TypeBool(state), inBounds, last, access.length);

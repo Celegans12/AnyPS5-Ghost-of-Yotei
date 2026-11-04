@@ -1,4 +1,5 @@
 #include "Recompiler.hpp"
+#include "P0sCeiling.hpp"
 #include "BdaAbi.hpp"
 #include "DirectImageRefusal.hpp"
 #include "UnnormalizedWrap.hpp"
@@ -696,6 +697,8 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
     targetOptions.spannedWaves = request.target.spannedWaves;
+    // P0s ceiling: pair (spanned) wave64 only for programs of at least APS5_P0S_PAIR_MIN_WORDS guest code words.
+    if (P0s::PairMinWords() != 0u && request.shader.code.size() < P0s::PairMinWords()) targetOptions.spannedWaves = false;
     targetOptions.bindlessImages = request.target.bindlessImages;
     targetOptions.fusedFma = request.target.fusedFma;
     targetOptions.singleWorkgroup = request.context.compute.has_value() && request.context.compute->singleWorkgroup;
