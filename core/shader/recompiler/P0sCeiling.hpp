@@ -39,8 +39,9 @@ inline bool ConstExec() {
     return value;
 }
 
-inline bool InlineHelpers() {
-    static const bool value = EnvNumber("APS5_P0S_INLINE") != 0u;
+// 1: every helper below; 2: the lookup and fault helpers only; 3: the span/dword and runtime-V# readers only.
+inline std::uint32_t InlineHelpers() {
+    static const std::uint32_t value = EnvNumber("APS5_P0S_INLINE");
     return value;
 }
 
@@ -56,9 +57,12 @@ inline bool FlatBda() {
 
 }
 
-// The function control of a BDA, fault or runtime-V# helper: DontInline as before, None with APS5_P0S_INLINE.
-inline spv::FunctionControlMask P0sHelperControl() {
-    return P0s::InlineHelpers() ? spv::FunctionControlMaskNone : spv::FunctionControlDontInlineMask;
+// The function control of a BDA, fault or runtime-V# helper: DontInline as before, None where APS5_P0S_INLINE selects
+// the helper's class (lookup = get/probe pointer and record_bda_fault; else a span/dword or runtime-V# reader).
+inline spv::FunctionControlMask P0sHelperControl(bool lookup = false) {
+    const auto level = P0s::InlineHelpers();
+    const bool inlined = level == 1u || (level == 2u && lookup) || (level == 3u && !lookup);
+    return inlined ? spv::FunctionControlMaskNone : spv::FunctionControlDontInlineMask;
 }
 
 }
