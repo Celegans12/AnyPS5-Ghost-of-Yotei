@@ -208,6 +208,8 @@ struct SpirvEmitterState {
     std::uint32_t bdaPcOverride = 0;
     // False for programs with workgroup barriers: faulting BDA accesses then continue (see BdaInvocationsMayStop).
     bool bdaStopsInvocations = true;
+    std::uint32_t bdaRangeMemoEntries = 0;
+    std::vector<std::array<std::uint32_t, 3>> bdaRangeMemo;
     bool continueTarget = false;
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across
     // host invocations (see WaveLdsScope); 0 when none are emitted.

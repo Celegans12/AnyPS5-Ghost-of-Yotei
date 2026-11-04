@@ -12,6 +12,8 @@
 
 namespace ShaderRecompiler {
 
+inline constexpr std::uint32_t BdaRangeMemoMaxEntries = 4;
+
 struct SpirvTargetOptions {
     std::uint32_t vulkanVersion;
     std::uint32_t spirvVersion;
@@ -46,6 +48,7 @@ struct SpirvTargetOptions {
     bool largePixelFunctionLdsBuffer = false;
     std::uint32_t pixelFunctionStorageDwords = 4096u;
     bool deviceScopeLdsMemoryBarriers = false;
+    std::uint32_t bdaRangeMemoEntries = 0;
 };
 
 struct SpirvEmitInfo {

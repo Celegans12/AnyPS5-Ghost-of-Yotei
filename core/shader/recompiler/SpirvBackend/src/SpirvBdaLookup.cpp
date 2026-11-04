@@ -6,6 +6,9 @@
 #include <iterator>
 #include <initializer_list>
 #include <vector>
+#include <array>
+#include <stdexcept>
+#include <string>
 
 namespace ShaderRecompiler {
 
@@ -64,6 +67,33 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         }
         leaveIf(binary(spv::OpINotEqual, boolean, reason, constant(0u)), reason);
     };
+    const bool memo = !state.bdaRangeMemo.empty() && permission == BdaAbi::Read && !rangeResult;
+    if (memo) {
+        const auto memoEnd = binary(spv::OpIAdd, u64, address, Unary(state, spv::OpUConvert, u64, bytes));
+        auto hit = ConstantBool(state, false);
+        auto delta = BdaConstant(state, 0u);
+        for (auto entry = state.bdaRangeMemo.rbegin(); entry != state.bdaRangeMemo.rend(); ++entry) {
+            const auto load = [&](std::uint32_t variable) {
+                const auto value = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLoad, u64, value, variable);
+                return value;
+            };
+            const auto entryBegin = load((*entry)[0]);
+            const auto entryEnd = load((*entry)[1]);
+            const auto entryDelta = load((*entry)[2]);
+            const auto inside = binary(spv::OpLogicalAnd, boolean, binary(spv::OpUGreaterThanEqual, boolean, address, entryBegin), binary(spv::OpULessThanEqual, boolean, memoEnd, entryEnd));
+            delta = Select(state, u64, inside, entryDelta, delta);
+            hit = binary(spv::OpLogicalOr, boolean, hit, inside);
+        }
+        hit = binary(spv::OpLogicalAnd, boolean, hit, binary(spv::OpUGreaterThan, boolean, memoEnd, address));
+        const auto found = state.module.AllocateId();
+        const auto next = state.module.AllocateId();
+        state.module.AddFunction(spv::OpSelectionMerge, next, spv::SelectionControlMaskNone);
+        state.module.AddFunction(spv::OpBranchConditional, hit, found, next);
+        EmitLabel(state, found);
+        leave(binary(spv::OpIAdd, u64, address, delta));
+        EmitLabel(state, next);
+    }
     const auto length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
     fail(binary(spv::OpULessThan, boolean, length, constant(4)), BdaAbi::FaultReason::InvalidTable);
@@ -160,6 +190,24 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         state.module.AddFunction(spv::OpCompositeConstruct, rangeType, range, begin, bound, base);
         leave(range);
     } else {
+        if (memo) {
+            const auto last = binary(spv::OpUGreaterThanEqual, boolean, index, count);
+            const auto following = BdaLoadAddress(state, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, Select(state, u32, last, binary(spv::OpISub, u32, index, constant(1)), index), constant(8))));
+            const auto bound = Select(state, u64, binary(spv::OpLogicalOr, boolean, last, binary(spv::OpULessThan, boolean, finish, following)), finish, following);
+            const auto boundDevice = binary(spv::OpIAdd, u64, base, binary(spv::OpISub, u64, bound, begin));
+            EmitIfCondition(state, binary(spv::OpUGreaterThanEqual, boolean, boundDevice, base), [&] {
+                for (std::size_t entry = state.bdaRangeMemo.size() - 1u; entry > 0u; --entry) {
+                    for (std::size_t part = 0; part < 3u; ++part) {
+                        const auto value = state.module.AllocateId();
+                        state.module.AddFunction(spv::OpLoad, u64, value, state.bdaRangeMemo[entry - 1u][part]);
+                        state.module.AddFunction(spv::OpStore, state.bdaRangeMemo[entry][part], value);
+                    }
+                }
+                state.module.AddFunction(spv::OpStore, state.bdaRangeMemo[0][0], begin);
+                state.module.AddFunction(spv::OpStore, state.bdaRangeMemo[0][1], bound);
+                state.module.AddFunction(spv::OpStore, state.bdaRangeMemo[0][2], binary(spv::OpISub, u64, base, begin));
+            });
+        }
         leave(result);
     }
     EmitLabel(state, outerContinue);
@@ -261,6 +309,13 @@ void DefineBdaAnchorFunction(SpirvEmitterState& state) {
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (state.faultBufferVariable != 0) DefineBdaFaultFunction(state);
     if (!state.program.Info().usesDma) return;
+    state.bdaRangeMemo.clear();
+    if (state.bdaRangeMemoEntries > BdaRangeMemoMaxEntries) throw std::runtime_error("the BDA range memo holds at most " + std::to_string(BdaRangeMemoMaxEntries) + " entries");
+    for (std::uint32_t entry = 0; entry < state.bdaRangeMemoEntries; ++entry) {
+        std::array<std::uint32_t, 3> variables{};
+        for (auto& variable : variables) variable = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeScalarU64(state)), spv::StorageClassPrivate, BdaConstant(state, 0u));
+        state.bdaRangeMemo.push_back(variables);
+    }
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
     DefineBdaDwordReadFunctions(state);
