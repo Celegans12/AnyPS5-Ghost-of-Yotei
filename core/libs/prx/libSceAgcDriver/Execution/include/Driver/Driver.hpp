@@ -62,6 +62,9 @@ class ShaderRefusal;
 class Driver {
 public:
     static Driver& Get();
+    // P0-cpu (C0): with frame windows (a frame replay) the [dispatch] driver phases lines close at each
+    // replayed frame's flip, named `label`, instead of every 10 s.
+    static void CloseDispatchPhasesWindow(const char* label);
     // APS5_MEM_STATS (see MemoryStats.hpp): registered shaders, the prepare pool and the dispatch/draw caches.
     static void AppendMemoryStats(std::string& line);
     static std::uint64_t GpuMapImportThreads();
@@ -259,6 +262,7 @@ private:
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
+    void printDriverPhases(const char* label);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();
     static PendingDrawPhases& pendingDrawPhases();

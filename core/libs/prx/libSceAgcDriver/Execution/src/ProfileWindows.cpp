@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/CommandMix.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -39,6 +41,8 @@ void Close(const char* label) {
     std::lock_guard lock(closing);
     Graphics::Recorder::CloseGpuTimingWindow(label);
     Graphics::CloseDrawProfileWindow(label);
+    DriverDetail::DrawPipeline::CloseProfileWindow(label);
+    DriverDetail::Driver::CloseDispatchPhasesWindow(label);
     CommandMix::Close(label);
     NewPath::Close(label);
     Graphics::ResidentCensus::Close(label);
