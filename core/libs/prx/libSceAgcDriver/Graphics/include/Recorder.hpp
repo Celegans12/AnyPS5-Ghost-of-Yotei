@@ -230,6 +230,13 @@ public:
     static std::vector<std::pair<std::string, std::uint64_t>> RunCloseSites(std::size_t limit, std::uint32_t ring = ~0u);
     // APS5_PROFILE_DRAW: unordered dispatches by guest queue: overlapped, and not (no open run, other).
     static std::string OverlapByRing();
+    // APS5_PROFILE_DRAW: the [barrier-census] tally. CensusDispatch is called by every dispatch of an
+    // overlap ring right after its OverlapCommands/Commands (notCapable: why it cannot defer, or null).
+    void CensusDispatch(std::uint32_t queueKey, const char* notCapable, bool unordered, bool overlapped);
+    static std::string BarrierCensusReport();
+    // APS5_PROFILE_DRAW with APS5_PROFILE_GPU off: the batch-stamp GPU spans read since the last call,
+    // as one [batch-busy] line (sum and union over both lanes).
+    static std::string BatchBusyReport(const char* window);
     // Staged dispatches in runs (APS5_NO_STAGED_OVERLAP=1 off; an APS5_AB switch): a dispatch with
     // buffers copied out of their imports joins and opens runs like any other.
     static bool StagedOverlapEnabled();
