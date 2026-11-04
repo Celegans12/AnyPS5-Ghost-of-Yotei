@@ -270,6 +270,16 @@ struct AddressSpaceStats {
     std::uint64_t waiterDrops = 0;
 };
 AddressSpaceStats AddressSpaceCounters();
+// APS5_RESIDENT_PRISTINE (tests): resident uses since start whose pristine copy was not made (the
+// persistent one was current), and those that made it into the persistent buffer.
+std::uint64_t ResidentPristineReused();
+std::uint64_t ResidentPristineCopied();
+// APS5_VERIFY_RESIDENT_PRISTINE: checked reuses whose persistent pristine copy differed from the buffer.
+std::uint64_t ResidentPristineMismatches();
+// APS5_OWN_SHADOW_CURRENT (tests): copy-ins of a build's own shadow skipped since start, and checked skips
+// whose shadow differed from the import (APS5_VERIFY_OWN_SHADOW).
+std::uint64_t OwnShadowSkipped();
+std::uint64_t OwnShadowMismatches();
 
 enum class AddressReuse : std::uint8_t { Reused, NotReusable, InUse, Snapshots, Space, Proof, Imports, Threw, Moved, Count };
 enum class SpaceResumeMiss : std::uint8_t { State, Replaced, Device, Generation, Epoch, Mirrors, Count };
@@ -585,6 +595,21 @@ private:
         // The gpuCopy buffer is a resident range's persistent buffer (see residentBuffer in
         // GuestBufferMemory.cpp): its copy-in is skipped while the buffer still matches guest memory.
         bool resident = false;
+        // APS5_PROFILE_STAGING_TOP (G-copy census): why the build did not bind a resident buffer
+        // (residentBuffer's StagingResidentReason, set when the shadow was made).
+        std::uint8_t residentReason = 0;
+        // APS5_RESIDENT_PRISTINE: this use diffs against its resident range's persistent pristine copy
+        // (taken at the copy-in, given back by the copy-back; see residentPristineTake), and the range's
+        // use serial it took it at. `copyInSkipped`: this use's copy-in was skipped (residentCurrent).
+        std::shared_ptr<Buffer> residentPristine {};
+        std::uint64_t residentPristineSerial = 0;
+        bool copyInSkipped = false;
+        // APS5_OWN_SHADOW_CURRENT (see ownShadowCurrent in GuestBufferMemory.cpp): the tracker generation at
+        // which this build's own (not resident) staging shadow last matched guest memory, 0 when unknown;
+        // `ownSyncPending` from the copy-in until MarkDirectWrites confirmed the use's copy-back.
+        mutable std::uint64_t ownSyncGeneration = 0;
+        mutable std::uint64_t ownForgetSerial = 0;
+        mutable bool ownSyncPending = false;
         // A written descriptor range of an address-based build that lies inside one of the space's
         // import regions, given a region of its own so it can be staged device-local (see
         // resolveOverlays); the BDA table sends its guest addresses to this region's buffer instead

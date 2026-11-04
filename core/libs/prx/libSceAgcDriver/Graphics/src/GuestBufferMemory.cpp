@@ -5144,6 +5144,16 @@ struct ResidentRange {
     // The generation at which the buffer last matched guest memory; 0: not since its creation.
     std::uint64_t syncGeneration = 0;
     std::uint64_t forgetSerial = 0;
+    // Promoted beyond the narrow limits while APS5_RESIDENT_RANGES_WIDE was set (see residentBuffer).
+    bool wide = false;
+    // APS5_RESIDENT_PRISTINE (see residentPristineTake): the persistent pristine copy, whether it equals the
+    // buffer as of the last recorded command on the buffer (`pristineValid`), whether a use holds it
+    // between its copy-in and its copy-back (`pristineTaken`), and the count of uses whose copy-ins were
+    // recorded on the buffer.
+    std::shared_ptr<Buffer> pristine;
+    bool pristineValid = false;
+    bool pristineTaken = false;
+    std::uint64_t useSerial = 0;
 };
 
 struct ResidentRanges {
@@ -5151,6 +5161,9 @@ struct ResidentRanges {
     std::map<std::pair<std::uint64_t, std::uint64_t>, ResidentRange> ranges;
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> heat;
     std::uint64_t promoted = 0, bound = 0, skipped = 0, skippedBytes = 0, copied = 0, invalidated = 0, otherLane = 0;
+    // Entries promoted under the narrow limits, and the wide entries' count and bytes.
+    std::size_t narrow = 0, wide = 0;
+    std::uint64_t wideBytes = 0;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
 
@@ -5166,37 +5179,183 @@ constexpr std::size_t ResidentLimit = 32;
 constexpr std::uint32_t ResidentPromoteAfter = 8;
 constexpr std::uint64_t ResidentMinBytes = 65536;
 
+// APS5_RESIDENT_RANGES_WIDE (a runtime switch, local, lane G-copy 11-04): a fresh build may also promote a
+// range once the narrow limit (ResidentLimit entries) is full, up to APS5_RESIDENT_RANGES_WIDE_COUNT entries
+// (default 512) and APS5_RESIDENT_RANGES_WIDE_MIB of their buffers (default 512), for ranges of at least
+// APS5_RESIDENT_RANGES_WIDE_MIN_KIB (default 64, as the narrow rule). A wide entry is the same resident range
+// as a narrow one (residentCurrent, residentCopied and MarkDirectWrites treat it alike); only the admission
+// limit differs. With the switch unset no fresh build binds a wide entry (the A arm of an in-run A/B sees
+// the narrow set alone) and none is promoted; builds that bound one before keep the same exact rule.
+std::uint64_t residentWideSetting(const char* name, std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    return value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 10) : fallback;
+}
+
+std::size_t residentWideLimit() {
+    static const auto limit = static_cast<std::size_t>(residentWideSetting("APS5_RESIDENT_RANGES_WIDE_COUNT", 512));
+    return limit;
+}
+
+std::uint64_t residentWideBytes() {
+    static const auto bytes = residentWideSetting("APS5_RESIDENT_RANGES_WIDE_MIB", 512) << 20u;
+    return bytes;
+}
+
+std::uint64_t residentWideMinBytes() {
+    static const auto bytes = residentWideSetting("APS5_RESIDENT_RANGES_WIDE_MIN_KIB", 64) << 10u;
+    return bytes;
+}
+
 void reportResidents(ResidentRanges& residents) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto now = std::chrono::steady_clock::now();
     if (now - residents.reported < std::chrono::seconds(10)) return;
     residents.reported = now;
-    if (profile) std::fprintf(stderr, "[resident-ranges] (10 s) %zu resident, %llu promoted, %llu bound by builds, copy-ins %llu skipped (%.1f MiB) / %llu made, %llu invalidated by other stamps, %llu recorded on another lane\n", residents.ranges.size(), static_cast<unsigned long long>(residents.promoted), static_cast<unsigned long long>(residents.bound), static_cast<unsigned long long>(residents.skipped), residents.skippedBytes / 1048576.0, static_cast<unsigned long long>(residents.copied), static_cast<unsigned long long>(residents.invalidated), static_cast<unsigned long long>(residents.otherLane));
+    if (profile) std::fprintf(stderr, "[resident-ranges] (10 s) %zu resident, %llu promoted, %llu bound by builds, copy-ins %llu skipped (%.1f MiB) / %llu made, %llu invalidated by other stamps, %llu recorded on another lane; wide %zu (%.1f MiB)\n", residents.ranges.size(), static_cast<unsigned long long>(residents.promoted), static_cast<unsigned long long>(residents.bound), static_cast<unsigned long long>(residents.skipped), residents.skippedBytes / 1048576.0, static_cast<unsigned long long>(residents.copied), static_cast<unsigned long long>(residents.invalidated), static_cast<unsigned long long>(residents.otherLane), residents.wide, residents.wideBytes / 1048576.0);
     residents.promoted = residents.bound = residents.skipped = residents.skippedBytes = residents.copied = residents.invalidated = residents.otherLane = 0;
     residents.heat.clear();
 }
 
 }
 
+// APS5_PROFILE_STAGING_TOP=1 (profile only, lane G-copy 11-04): every 10 s a [staging-top] line with the
+// device-local staged uses split by why their build has no resident buffer (StagingResidentReason, taken
+// when the build made its shadow), the bytes they copied in, skipped (resident) and copied back
+// (compared by the diff kernel), and the 12 staged ranges with the most bytes in + back.
+enum class StagingResidentReason : std::uint8_t { Unknown, Resident, SwitchedOff, Lane, Small, Cold, Cap, NoMemory, Count };
+constexpr std::array<const char*, static_cast<std::size_t>(StagingResidentReason::Count)> StagingResidentReasonNames{"unknown", "resident", "off", "lane", "small", "cold", "cap", "no-memory"};
+
+bool stagingTopEnabled() {
+    static const bool enabled = std::getenv("APS5_PROFILE_STAGING_TOP") != nullptr;
+    return enabled;
+}
+
+namespace {
+
+struct StagingTopRange {
+    std::uint64_t uses = 0, inBytes = 0, skippedBytes = 0, backBytes = 0, lane1 = 0;
+    std::uint8_t reason = 0;
+};
+
+struct StagingTop {
+    std::mutex mutex;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, StagingTopRange> ranges;
+    std::array<std::uint64_t, static_cast<std::size_t>(StagingResidentReason::Count)> uses{}, inBytes{}, skippedBytes{}, backBytes{};
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+StagingTop& StagingTops() {
+    static auto* top = new StagingTop;
+    return *top;
+}
+
+void reportStagingTop(StagingTop& top) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - top.reported < std::chrono::seconds(10)) return;
+    top.reported = now;
+    std::string line = "[staging-top] (10 s) by resident reason uses/MiB in/MiB skipped/MiB back:";
+    char text[256];
+    for (std::size_t k = 0; k < top.uses.size(); ++k) {
+        if (top.uses[k] == 0 && top.backBytes[k] == 0) continue;
+        std::snprintf(text, sizeof(text), " %s %llu/%.1f/%.1f/%.1f", StagingResidentReasonNames[k], static_cast<unsigned long long>(top.uses[k]), top.inBytes[k] / 1048576.0, top.skippedBytes[k] / 1048576.0, top.backBytes[k] / 1048576.0);
+        line += text;
+    }
+    std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, StagingTopRange>> sorted(top.ranges.begin(), top.ranges.end());
+    const auto weight = [](const StagingTopRange& range) { return range.inBytes + range.backBytes; };
+    const auto shown = std::min<std::size_t>(sorted.size(), 12);
+    std::partial_sort(sorted.begin(), sorted.begin() + static_cast<std::ptrdiff_t>(shown), sorted.end(), [&](const auto& a, const auto& b) { return weight(a.second) > weight(b.second); });
+    std::snprintf(text, sizeof(text), "; %zu ranges; top (range KiB uses MiB-in MiB-skipped MiB-back lane1-uses reason):", sorted.size());
+    line += text;
+    for (std::size_t k = 0; k < shown; ++k) {
+        const auto& [key, range] = sorted[k];
+        std::snprintf(text, sizeof(text), " 0x%llx+%.0f x%llu %.1f/%.1f/%.1f l1=%llu %s", static_cast<unsigned long long>(key.first), (key.second - key.first) / 1024.0, static_cast<unsigned long long>(range.uses), range.inBytes / 1048576.0, range.skippedBytes / 1048576.0, range.backBytes / 1048576.0, static_cast<unsigned long long>(range.lane1), StagingResidentReasonNames[range.reason < StagingResidentReasonNames.size() ? range.reason : 0]);
+        line += text;
+    }
+    line += '\n';
+    AgcDriver::ProfilePrint_nid_no_patch("%s", line.c_str());
+    top.ranges.clear();
+    top.uses.fill(0);
+    top.inBytes.fill(0);
+    top.skippedBytes.fill(0);
+    top.backBytes.fill(0);
+}
+
+}
+
+// One staged use's copy-in (inBytes, or skippedBytes for a resident buffer that stayed current) or
+// copy-back (backBytes) of the device-local region [begin, end).
+void noteStagingTop(std::uint64_t begin, std::uint64_t end, std::uint8_t reason, std::uint64_t inBytes, std::uint64_t skippedBytes, std::uint64_t backBytes) {
+    if (!stagingTopEnabled()) return;
+    auto& top = StagingTops();
+    std::lock_guard lock(top.mutex);
+    const auto k = static_cast<std::size_t>(reason < top.uses.size() ? reason : 0);
+    auto& range = top.ranges[{begin, end}];
+    range.reason = static_cast<std::uint8_t>(k);
+    if (backBytes == 0) {
+        ++range.uses;
+        ++top.uses[k];
+        if (Recorder::ThreadLane() != 0) ++range.lane1;
+    }
+    range.inBytes += inBytes;
+    range.skippedBytes += skippedBytes;
+    range.backBytes += backBytes;
+    top.inBytes[k] += inBytes;
+    top.skippedBytes[k] += skippedBytes;
+    top.backBytes[k] += backBytes;
+    reportStagingTop(top);
+}
+
 // The resident buffer a fresh build of the main lane binds for the staged range [begin, end), made once
 // the range was copied in ResidentPromoteAfter times in a report window; nullptr otherwise.
-std::shared_ptr<Buffer> residentBuffer(const Context& context, std::uint64_t begin, std::uint64_t end) {
-    if (RuntimeSwitches::Set(RuntimeSwitch::NoResidentRanges) || Recorder::ThreadLane() != 0 || end - begin < ResidentMinBytes) return nullptr;
+std::shared_ptr<Buffer> residentBuffer(const Context& context, std::uint64_t begin, std::uint64_t end, std::uint8_t* reason) {
+    const auto refuse = [reason](StagingResidentReason why) {
+        if (reason != nullptr) *reason = static_cast<std::uint8_t>(why);
+        return std::shared_ptr<Buffer>{};
+    };
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoResidentRanges)) return refuse(StagingResidentReason::SwitchedOff);
+    if (Recorder::ThreadLane() != 0) return refuse(StagingResidentReason::Lane);
+    const bool wide = RuntimeSwitches::Set(RuntimeSwitch::ResidentRangesWide);
+    const auto bytes = end - begin;
+    if (bytes < ResidentMinBytes && !(wide && bytes >= residentWideMinBytes())) return refuse(StagingResidentReason::Small);
     auto& residents = Residents();
     std::lock_guard lock(residents.mutex);
     const auto forget = GuestMemory::ForgetSerial();
     const std::pair key{begin, end};
-    if (const auto found = residents.ranges.find(key); found != residents.ranges.end()) {
-        if (found->second.forgetSerial == forget) {
-            ++residents.bound;
-            return found->second.buffer;
+    const auto drop = [&](std::map<std::pair<std::uint64_t, std::uint64_t>, ResidentRange>::iterator found) {
+        if (found->second.wide) {
+            --residents.wide;
+            residents.wideBytes -= found->first.second - found->first.first;
+        } else {
+            --residents.narrow;
         }
         residents.ranges.erase(found);
+    };
+    if (const auto found = residents.ranges.find(key); found != residents.ranges.end()) {
+        if (found->second.forgetSerial == forget) {
+            // A wide entry is bound only while the switch is set.
+            if (found->second.wide && !wide) return refuse(StagingResidentReason::Cap);
+            ++residents.bound;
+            if (reason != nullptr) *reason = static_cast<std::uint8_t>(StagingResidentReason::Resident);
+            return found->second.buffer;
+        }
+        drop(found);
     }
-    if (++residents.heat[key] < ResidentPromoteAfter || residents.ranges.size() >= ResidentLimit) return nullptr;
-    auto buffer = stagingBuffer(context, static_cast<std::size_t>(end - begin), gpuCopyUsage(true) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-    if (buffer == nullptr) return nullptr;
-    residents.ranges[key] = ResidentRange{buffer, 0, forget};
+    if (++residents.heat[key] < ResidentPromoteAfter) return refuse(StagingResidentReason::Cold);
+    bool asWide = false;
+    if (residents.narrow >= ResidentLimit || bytes < ResidentMinBytes) {
+        if (!wide || residents.wide >= residentWideLimit() || residents.wideBytes + bytes > residentWideBytes()) return refuse(StagingResidentReason::Cap);
+        asWide = true;
+    }
+    auto buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(true) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    if (buffer == nullptr) return refuse(StagingResidentReason::NoMemory);
+    if (reason != nullptr) *reason = static_cast<std::uint8_t>(StagingResidentReason::Resident);
+    residents.ranges[key] = ResidentRange{buffer, 0, forget, asWide};
+    if (asWide) {
+        ++residents.wide;
+        residents.wideBytes += bytes;
+    } else {
+        ++residents.narrow;
+    }
     ++residents.promoted;
     ++residents.bound;
     return buffer;
@@ -5238,6 +5397,245 @@ void residentCopied(std::uint64_t begin, std::uint64_t end, const std::shared_pt
     if (found == residents.ranges.end() || found->second.buffer != buffer) return;
     ++residents.copied;
     found->second.syncGeneration = Recorder::ThreadLane() == 0 ? GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin)) : 0;
+}
+
+// APS5_OWN_SHADOW_CURRENT (a runtime switch, local, lane G-copy 11-04): the resident ranges' copy-in skip for
+// a build's own staging shadow. A cached build keeps its regions, and a staged region's device-local shadow is
+// its own (stagingBuffer, never shared; resident regions are the shared exception and keep their own rule).
+// The shadow matches guest memory right after its copy-in (the tracker generation then), and again after the
+// use's copy-back when nothing else stamped the range in between (MarkDirectWrites moves the generation to the
+// use's own marks, as for a resident range: with nothing else stamped, the import still holds the copy-in
+// bytes wherever the diff kernel stored nothing, and the shadow's bytes wherever it stored). So the next use
+// of the same build may skip its copy-in while no stamp of any kind touched the range since: the shadow holds
+// exactly the bytes the copy would write. Main lane only, as the resident rule (a use on the other lane, or a
+// lane change, forgets the generation); the generation is taken only while the switch is set, so a phase
+// that turns it on starts with every shadow unknown; a use whose copy-back MarkDirectWrites did not confirm
+// (`ownSyncPending`) never skips; the guest-memory forget serial must not have moved.
+// APS5_VERIFY_OWN_SHADOW=1: every skipped copy-in reads back the shadow and the import range (where the copy
+// would have read) and compares them at completion ([own-shadow] mismatches; a CPU store racing the batch can
+// make a false one, a GPU writer cannot: it would have stamped the range).
+struct OwnShadowCounts {
+    std::atomic<std::uint64_t> skipped{0}, skippedBytes{0}, copied{0}, copiedBytes{0}, stale{0}, pending{0}, otherLane{0}, checked{0}, mismatched{0}, skippedTotal{0};
+    std::atomic<std::int64_t> reported{0};
+};
+
+OwnShadowCounts& OwnShadows() {
+    static OwnShadowCounts counts;
+    return counts;
+}
+
+void reportOwnShadows() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    auto& counts = OwnShadows();
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counts.reported.load(std::memory_order_relaxed);
+    if (last == 0) {
+        counts.reported.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !counts.reported.compare_exchange_strong(last, nowMs)) return;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto skipped = take(counts.skipped);
+    const auto skippedBytes = take(counts.skippedBytes);
+    const auto copied = take(counts.copied);
+    const auto copiedBytes = take(counts.copiedBytes);
+    const auto stale = take(counts.stale);
+    const auto pending = take(counts.pending);
+    const auto otherLane = take(counts.otherLane);
+    AgcDriver::ProfilePrint_nid_no_patch("[own-shadow] (10 s, APS5_OWN_SHADOW_CURRENT %s) copy-ins skipped %llu (%.1f MiB) / made %llu (%.1f MiB); of the made: stamped since %llu, copy-back unconfirmed %llu, other lane %llu; verify %llu checked, %llu mismatched\n", RuntimeSwitches::Set(RuntimeSwitch::OwnShadowCurrent) ? "set" : "unset", skipped, skippedBytes / 1048576.0, copied, copiedBytes / 1048576.0, stale, pending, otherLane, static_cast<unsigned long long>(counts.checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.mismatched.load(std::memory_order_relaxed)));
+}
+
+std::uint64_t OwnShadowSkipped() {
+    return OwnShadows().skippedTotal.load(std::memory_order_relaxed);
+}
+
+std::uint64_t OwnShadowMismatches() {
+    return OwnShadows().mismatched.load(std::memory_order_relaxed);
+}
+
+// Whether a non-resident staged region's copy-in can be skipped (see above). Called for every such copy-in
+// while the switch is set; a false answer leaves the generation for ownShadowCopied to retake.
+bool ownShadowCurrent(std::uint64_t begin, std::uint64_t end, std::uint64_t generation, std::uint64_t forget, bool pending) {
+    if (!RuntimeSwitches::Set(RuntimeSwitch::OwnShadowCurrent)) return false;
+    if (generation == 0) return false;
+    if (Recorder::ThreadLane() != 0) {
+        OwnShadows().otherLane.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (pending) {
+        OwnShadows().pending.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    if (forget != GuestMemory::ForgetSerial()) {
+        OwnShadows().stale.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    static_cast<void>(GuestMemory::CollectWrites(begin, bytes));
+    if (!GuestMemory::UnchangedSince(begin, bytes, generation)) {
+        OwnShadows().stale.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
+}
+
+void verifyOwnShadow(const Context& context, Recorder& recorder, VkCommandBuffer commands, const std::shared_ptr<Buffer>& buffer, VkBuffer source, std::uint64_t sourceOffset, std::uint64_t bytes) {
+    auto shadowCopy = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT, copyBufferProperties(false));
+    auto importCopy = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT, copyBufferProperties(false));
+    CopyBuffer(context, commands, buffer->Handle(), 0, shadowCopy->Handle(), 0, bytes);
+    CopyBuffer(context, commands, source, sourceOffset, importCopy->Handle(), 0, bytes);
+    recorder.Keep(buffer);
+    recorder.OnComplete([shadowCopy, importCopy] {
+        OwnShadows().checked.fetch_add(1, std::memory_order_relaxed);
+        if (std::memcmp(shadowCopy->Bytes().data(), importCopy->Bytes().data(), shadowCopy->Bytes().size()) != 0) {
+            const auto mismatches = OwnShadows().mismatched.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (mismatches <= 8) std::fprintf(stderr, "[own-shadow] VERIFY MISMATCH: a skipped copy-in's shadow differs from its import (%zu bytes)\n", shadowCopy->Bytes().size());
+        }
+    });
+}
+
+// APS5_RESIDENT_PRISTINE (a runtime switch, local, lane G-copy 11-04). With APS5_STAGING_DIFF every staged use
+// copies its shadow into a pristine buffer right after the copy-in (VRAM to VRAM, the whole range), and the
+// copy-back stores the dwords that differ from it. A resident range's buffer outlives its uses, so its pristine
+// copy can too: the copy-back's diff kernel also stores each dword it stores into the pristine buffer (`keep`),
+// which leaves pristine equal to the buffer over every written range, and outside them neither changed. When
+// the next use's copy-in is skipped (the buffer already matches guest memory), the buffer is unchanged since
+// then, so the pristine copy already holds exactly the bytes the per-use copy would write: it is not made.
+// Rules (all under the residents mutex, in recording order, which is GPU order on the main lane):
+//  - every use of the range counts `useSerial` at its copy-in;
+//  - a use takes the pristine buffer only when no other use holds it, outside dispatch runs and preludes
+//    (recordGpuCopies' inRun/prelude: there the copy-ins and copy-backs of several uses interleave), and with
+//    the diff kernel active for it; it copies the buffer into it unless its copy-in was skipped and the
+//    buffer was valid;
+//  - any use that does not take it marks it invalid (it may change the buffer without keeping it);
+//  - the taker's copy-back gives it back, valid only when no other use started since it took it (serial) and
+//    every written range of the use went through the kernel with `keep` (no unaligned edge, no whole copy).
+// A held pristine buffer is never written by another use, so a taker's diff kernel reads what its own copy-in
+// (or the previous taker's kernel, ordered by that copy-back's trailing barrier) left. Off: per-use copies.
+struct ResidentPristineCounts {
+    std::atomic<std::uint64_t> reused{0}, copied{0}, refusedHeld{0}, refusedRun{0}, refusedOther{0}, givenValid{0}, givenInvalid{0}, reusedBytes{0};
+    // Since start (the fields above are per report window).
+    std::atomic<std::uint64_t> reusedTotal{0}, copiedTotal{0};
+};
+
+ResidentPristineCounts& ResidentPristines() {
+    static ResidentPristineCounts counts;
+    return counts;
+}
+
+std::uint64_t ResidentPristineReused() {
+    return ResidentPristines().reusedTotal.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ResidentPristineCopied() {
+    return ResidentPristines().copiedTotal.load(std::memory_order_relaxed);
+}
+
+// APS5_VERIFY_RESIDENT_PRISTINE=1 (with APS5_RESIDENT_PRISTINE): every pristine copy that is not made is checked:
+// the buffer and the persistent pristine copy are both read back (after the copy-in phase's leading barrier,
+// where the per-use copy would read the buffer) and compared at completion; [resident-pristine] prints the
+// checks and mismatches (any mismatch is a bug).
+bool residentPristineVerify() {
+    static const bool verify = std::getenv("APS5_VERIFY_RESIDENT_PRISTINE") != nullptr;
+    return verify;
+}
+
+std::atomic<std::uint64_t> residentPristineChecked{0}, residentPristineMismatched{0};
+
+void verifyResidentPristine(const Context& context, Recorder& recorder, VkCommandBuffer commands, const std::shared_ptr<Buffer>& buffer, const std::shared_ptr<Buffer>& pristine, std::uint64_t bytes) {
+    auto shadowCopy = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT, copyBufferProperties(false));
+    auto pristineCopy = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT, copyBufferProperties(false));
+    CopyBuffer(context, commands, buffer->Handle(), 0, shadowCopy->Handle(), 0, bytes);
+    CopyBuffer(context, commands, pristine->Handle(), 0, pristineCopy->Handle(), 0, bytes);
+    recorder.Keep(buffer);
+    recorder.Keep(pristine);
+    recorder.OnComplete([shadowCopy, pristineCopy] {
+        residentPristineChecked.fetch_add(1, std::memory_order_relaxed);
+        if (std::memcmp(shadowCopy->Bytes().data(), pristineCopy->Bytes().data(), shadowCopy->Bytes().size()) != 0) {
+            const auto mismatches = residentPristineMismatched.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (mismatches <= 8) std::fprintf(stderr, "[resident-pristine] VERIFY MISMATCH: a persistent pristine copy differs from its resident buffer (%zu bytes)\n", shadowCopy->Bytes().size());
+        }
+    });
+}
+
+std::uint64_t ResidentPristineMismatches() {
+    return residentPristineMismatched.load(std::memory_order_relaxed);
+}
+
+// One use of a resident region at its copy-in. Returns the persistent pristine buffer when this use takes it
+// (`copy`: it must still copy the buffer into it), else nullptr (the use makes its own pristine copy, if any).
+std::shared_ptr<Buffer> residentPristineTake(const Context& context, std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer, bool want, bool skipped, bool& copy, std::uint64_t& serial) {
+    copy = true;
+    auto& residents = Residents();
+    std::lock_guard lock(residents.mutex);
+    const auto found = residents.ranges.find({begin, end});
+    if (found == residents.ranges.end() || found->second.buffer != buffer) return nullptr;
+    auto& range = found->second;
+    ++range.useSerial;
+    if (!want || range.pristineTaken) {
+        range.pristineValid = false;
+        if (want) ResidentPristines().refusedHeld.fetch_add(1, std::memory_order_relaxed);
+        return nullptr;
+    }
+    if (range.pristine == nullptr) {
+        // TRANSFER_SRC for APS5_VERIFY_RESIDENT_PRISTINE's read-back.
+        range.pristine = stagingBuffer(context, static_cast<std::size_t>(end - begin), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        if (range.pristine == nullptr || range.pristine->DeviceAddress() == 0) {
+            range.pristine.reset();
+            range.pristineValid = false;
+            ResidentPristines().refusedOther.fetch_add(1, std::memory_order_relaxed);
+            return nullptr;
+        }
+        range.pristineValid = false;
+    }
+    copy = !(skipped && range.pristineValid);
+    range.pristineValid = false;
+    range.pristineTaken = true;
+    serial = range.useSerial;
+    if (copy) {
+        ResidentPristines().copied.fetch_add(1, std::memory_order_relaxed);
+        ResidentPristines().copiedTotal.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        ResidentPristines().reused.fetch_add(1, std::memory_order_relaxed);
+        ResidentPristines().reusedTotal.fetch_add(1, std::memory_order_relaxed);
+        ResidentPristines().reusedBytes.fetch_add(end - begin, std::memory_order_relaxed);
+    }
+    return range.pristine;
+}
+
+// The taker's copy-back is recorded: the pristine buffer is given back, valid when `clean` (every written
+// range diffed with keep) and no other use of the range started since the take.
+void residentPristineGive(std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer, const std::shared_ptr<Buffer>& pristine, std::uint64_t serial, bool clean) {
+    auto& residents = Residents();
+    std::lock_guard lock(residents.mutex);
+    const auto found = residents.ranges.find({begin, end});
+    if (found == residents.ranges.end() || found->second.buffer != buffer || found->second.pristine != pristine) return;
+    auto& range = found->second;
+    range.pristineTaken = false;
+    range.pristineValid = clean && range.useSerial == serial;
+    (range.pristineValid ? ResidentPristines().givenValid : ResidentPristines().givenInvalid).fetch_add(1, std::memory_order_relaxed);
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    // The totals once more at exit (a replay may end before its first 10 s report).
+    static const bool atExit = profile && std::atexit([] {
+        std::fprintf(stderr, "[resident-pristine] at exit: pristine copies not made %llu, made into the persistent buffer %llu; verify %llu checked, %llu mismatched\n", static_cast<unsigned long long>(ResidentPristineReused()), static_cast<unsigned long long>(ResidentPristineCopied()), static_cast<unsigned long long>(residentPristineChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(ResidentPristineMismatches()));
+    }) == 0;
+    static_cast<void>(atExit);
+    static auto reported = std::chrono::steady_clock::now();
+    const auto now = std::chrono::steady_clock::now();
+    if (!profile || now - reported < std::chrono::seconds(10)) return;
+    reported = now;
+    auto& counts = ResidentPristines();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto reused = take(counts.reused);
+    const auto reusedBytes = take(counts.reusedBytes);
+    const auto copied = take(counts.copied);
+    const auto held = take(counts.refusedHeld);
+    const auto run = take(counts.refusedRun);
+    const auto other = take(counts.refusedOther);
+    const auto valid = take(counts.givenValid);
+    const auto invalid = take(counts.givenInvalid);
+    AgcDriver::ProfilePrint_nid_no_patch("[resident-pristine] (10 s, APS5_RESIDENT_PRISTINE %s) pristine copies not made %llu (%.1f MiB), made into the persistent buffer %llu; refused: held by another use %llu, in a run or prelude %llu, other %llu; given back valid %llu, invalid %llu; verify %llu checked, %llu mismatched\n", RuntimeSwitches::Set(RuntimeSwitch::ResidentPristine) ? "set" : "unset", reused, reusedBytes / 1048576.0, copied, held, run, other, valid, invalid, static_cast<unsigned long long>(residentPristineChecked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(residentPristineMismatched.load(std::memory_order_relaxed)));
 }
 
 // APS5_TRACE_STAGING=1: every distinct staged range once, with its size and whether an atomic
@@ -5533,7 +5931,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             const bool misaligned = !bindableInPlace(HostImportOffset(*entry, region.begin), addressable);
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
-                region.buffer = residentBuffer(context, region.begin, region.end);
+                region.buffer = residentBuffer(context, region.begin, region.end, &region.residentReason);
                 region.resident = region.buffer != nullptr;
                 if (!region.resident) region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable) | (stagingDiffEnabled(context) ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
                 if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
@@ -6307,10 +6705,17 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
         copiedBytes += bytes;
+        region->copyInSkipped = false;
+        if (region->residentPristine != nullptr) {
+            // The previous use never recorded its copy-back: the pristine buffer goes back invalid.
+            residentPristineGive(region->begin, region->end, region->buffer, region->residentPristine, region->residentPristineSerial, false);
+            region->residentPristine.reset();
+        }
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
             if (region->deviceLocal) region->buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(addressable) | (stagingDiffEnabled(context) ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
+            region->ownSyncGeneration = 0;
             if (region->buffer == nullptr) {
                 // Or no shadow to be had: a host copy serves the region instead, aligned or not.
                 region->deviceLocal = false;
@@ -6393,15 +6798,48 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, address);
+        if (!region->resident && region->deviceLocal && expected.empty() && ownShadowCurrent(region->begin, region->end, region->ownSyncGeneration, region->ownForgetSerial, region->ownSyncPending)) {
+            // The build's own shadow already holds these bytes (see ownShadowCurrent). This use's copy-back
+            // must be confirmed again before the next skip.
+            region->ownSyncPending = true;
+            copiedBytes -= bytes;
+            region->copyInSkipped = true;
+            OwnShadows().skipped.fetch_add(1, std::memory_order_relaxed);
+            OwnShadows().skippedTotal.fetch_add(1, std::memory_order_relaxed);
+            OwnShadows().skippedBytes.fetch_add(bytes, std::memory_order_relaxed);
+            noteStagingTop(region->begin, region->end, region->residentReason, 0, bytes, 0);
+            static const bool verifyOwn = std::getenv("APS5_VERIFY_OWN_SHADOW") != nullptr;
+            if (verifyOwn) verifyOwnShadow(context, *recorder, commands, region->buffer, copySource, copyOffset, bytes);
+            recorder->Keep(region->buffer);
+            region->snapshot.clear();
+            reportOwnShadows();
+            continue;
+        }
         if (region->resident && region->deviceLocal && expected.empty() && residentCurrent(region->begin, region->end, region->buffer)) {
             // The resident buffer already holds these bytes (see residentCurrent).
             copiedBytes -= bytes;
+            region->copyInSkipped = true;
+            noteStagingTop(region->begin, region->end, region->residentReason, 0, bytes, 0);
             recorder->Keep(region->buffer);
             region->snapshot.clear();
             continue;
         }
         CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
         if (region->resident) residentCopied(region->begin, region->end, region->buffer);
+        if (!region->resident && region->deviceLocal) {
+            // APS5_OWN_SHADOW_CURRENT: the shadow matches guest memory as of now (as residentCopied); unknown
+            // with the switch unset or on the other lane.
+            const bool own = RuntimeSwitches::Set(RuntimeSwitch::OwnShadowCurrent) && Recorder::ThreadLane() == 0;
+            region->ownSyncGeneration = own ? GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(bytes)) : 0;
+            region->ownForgetSerial = own ? GuestMemory::ForgetSerial() : 0;
+            region->ownSyncPending = true;
+            if (own) {
+                OwnShadows().copied.fetch_add(1, std::memory_order_relaxed);
+                OwnShadows().copiedBytes.fetch_add(bytes, std::memory_order_relaxed);
+                reportOwnShadows();
+            }
+        }
+        if (region->deviceLocal) noteStagingTop(region->begin, region->end, region->residentReason, bytes, 0, 0);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -6441,10 +6879,28 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         // The pristine copies of the staged shadows (APS5_STAGING_DIFF), after the copy-ins.
         std::vector<Region*> diffed;
         const bool active = stagingDiffActive();
+        const bool keepResident = RuntimeSwitches::Set(RuntimeSwitch::ResidentPristine);
         for (auto* region : copies) {
             region->diffUse = false;
+            const bool diffable = active && region->deviceLocal && region->buffer != nullptr && region->buffer->DeviceAddress() != 0 && region->copySourceAddress != 0;
+            if (region->resident && region->deviceLocal && region->buffer != nullptr) {
+                // Every use of a resident range counts, taker or not (see residentPristineTake).
+                const bool want = keepResident && diffable && !inRun && !prelude;
+                if (keepResident && diffable && (inRun || prelude)) ResidentPristines().refusedRun.fetch_add(1, std::memory_order_relaxed);
+                bool copy = true;
+                std::uint64_t serial = 0;
+                if (auto taken = residentPristineTake(context, region->begin, region->end, region->buffer, want, region->copyInSkipped, copy, serial)) {
+                    region->residentPristine = std::move(taken);
+                    region->residentPristineSerial = serial;
+                    region->diffUse = true;
+                    recorder->Keep(region->residentPristine);
+                    if (copy) diffed.push_back(region);
+                    else if (residentPristineVerify()) verifyResidentPristine(context, *recorder, commands, region->buffer, region->residentPristine, region->end - region->begin);
+                    continue;
+                }
+            }
             if (!active) continue;
-            if (!region->deviceLocal || region->buffer == nullptr || region->buffer->DeviceAddress() == 0 || region->copySourceAddress == 0) {
+            if (!diffable) {
                 region->pristine.reset();
                 continue;
             }
@@ -6467,8 +6923,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
             for (auto* region : diffed) {
-                CopyBuffer(context, commands, region->buffer->Handle(), 0, region->pristine->Handle(), 0, region->end - region->begin);
-                recorder->Keep(region->pristine);
+                // A taker's persistent pristine buffer (APS5_RESIDENT_PRISTINE) or the use's own.
+                const auto& target = region->residentPristine != nullptr ? region->residentPristine : region->pristine;
+                CopyBuffer(context, commands, region->buffer->Handle(), 0, target->Handle(), 0, region->end - region->begin);
+                recorder->Keep(target);
             }
         }
     }
@@ -6553,6 +7011,11 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     }
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
+        // APS5_RESIDENT_PRISTINE: the use diffs against its range's persistent pristine buffer, which it gives
+        // back valid only when every written range went through the kernel with keep (`kept`).
+        const auto& pristine = region.residentPristine != nullptr ? region.residentPristine : region.pristine;
+        const bool keep = region.residentPristine != nullptr;
+        bool kept = true;
         for (const auto& [begin, end] : merged) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
@@ -6589,14 +7052,16 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyBack, from);
             auto whole = from;
             auto wholeEnd = to;
-            if (diff && region.diffUse && region.deviceLocal && region.pristine != nullptr && region.copySourceAddress != 0 && region.buffer->DeviceAddress() != 0 && region.begin % 4u == 0 && region.copySourceBase % 4u == 0 && region.copySourceAddress % 4u == 0) {
+            if (diff && region.diffUse && region.deviceLocal && pristine != nullptr && region.copySourceAddress != 0 && region.buffer->DeviceAddress() != 0 && region.begin % 4u == 0 && region.copySourceBase % 4u == 0 && region.copySourceAddress % 4u == 0) {
                 const auto alignedFrom = (from + 3u) & ~std::uint64_t{3};
                 const auto alignedTo = to & ~std::uint64_t{3};
                 if (alignedFrom < alignedTo && (alignedTo - alignedFrom) / 4u <= std::numeric_limits<std::uint32_t>::max()) {
                     const auto at = alignedFrom - region.begin;
-                    if (recorder.RecordStagingDiff(commands, region.buffer->DeviceAddress() + at, region.pristine->DeviceAddress() + at, region.copySourceAddress + (alignedFrom - region.copySourceBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), profile)) {
+                    if (recorder.RecordStagingDiff(commands, region.buffer->DeviceAddress() + at, pristine->DeviceAddress() + at, region.copySourceAddress + (alignedFrom - region.copySourceBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), profile, keep)) {
                         diffed = true;
-                        recorder.Keep(region.pristine);
+                        recorder.Keep(pristine);
+                        // An unaligned edge is copied whole and not kept: the pristine buffer may differ there.
+                        if (from < alignedFrom || alignedTo < to) kept = false;
                         if (from < alignedFrom) CopyBuffer(context, commands, region.buffer->Handle(), from - region.begin, region.copySource, from - region.copySourceBase, alignedFrom - from);
                         if (alignedTo < to) CopyBuffer(context, commands, region.buffer->Handle(), alignedTo - region.begin, region.copySource, alignedTo - region.copySourceBase, to - alignedTo);
                         if (profile) {
@@ -6609,6 +7074,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 }
             }
             if (whole < wholeEnd) {
+                kept = false;
                 CopyBuffer(context, commands, region.buffer->Handle(), whole - region.begin, region.copySource, whole - region.copySourceBase, wholeEnd - whole);
                 if (diff && profile && region.deviceLocal) Copies().diffWholeBytes.fetch_add(wholeEnd - whole, std::memory_order_relaxed);
             }
@@ -6619,11 +7085,16 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 Copies().gpuCopyBackBytes.fetch_add(to - from, std::memory_order_relaxed);
                 if (region.deviceLocal) Copies().stagedOutBytes.fetch_add(to - from, std::memory_order_relaxed);
             }
+            if (region.deviceLocal) noteStagingTop(region.begin, region.end, region.residentReason, 0, 0, to - from);
         }
         // Only once its copies are recorded: a throw above leaves the region counted by
         // HasCopiedWrites, so the caller still registers the CPU write-back that stores the
         // staging bytes, instead of losing the shader's results.
         region.copiedBack = true;
+        if (region.residentPristine != nullptr) {
+            residentPristineGive(region.begin, region.end, region.buffer, region.residentPristine, region.residentPristineSerial, kept);
+            region.residentPristine.reset();
+        }
     }
     if (!recording || merging) return;
     if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -7116,7 +7587,24 @@ void GuestBufferMemory::MarkDirectWrites() const {
         if (found == residents.ranges.end() || found->second.buffer != region.buffer) continue;
         resident.emplace_back(&region, found->second.syncGeneration != 0 && GuestMemory::UnchangedSince(region.begin, static_cast<std::size_t>(region.end - region.begin), found->second.syncGeneration));
     }
+    // APS5_OWN_SHADOW_CURRENT: the same for a build's own shadows (see ownShadowCurrent), checked before this
+    // build's marks; the use's copy-back is confirmed either way (a stale one forgets the generation).
+    thread_local std::vector<std::pair<const Region*, bool>>* ownSlot = nullptr;
+    auto& own = ShaderRecompiler::ThreadOwned(ownSlot);
+    own.clear();
+    for (const auto& region : regions) {
+        if (region.resident || !region.gpuCopy || !region.copiedBack || !region.deviceLocal || !region.ownSyncPending) continue;
+        own.emplace_back(&region, region.ownSyncGeneration != 0 && Recorder::ThreadLane() == 0 && GuestMemory::UnchangedSince(region.begin, static_cast<std::size_t>(region.end - region.begin), region.ownSyncGeneration));
+    }
+    const auto updateOwn = [&](std::uint64_t marked) {
+        for (const auto& [region, current] : own) {
+            region->ownSyncPending = false;
+            if (!current) region->ownSyncGeneration = 0;
+            else if (marked != 0) region->ownSyncGeneration = std::max(region->ownSyncGeneration, marked);
+        }
+    };
     const auto updateResidents = [&](std::uint64_t marked) {
+        updateOwn(marked);
         if (resident.empty()) return;
         auto& residents = Residents();
         std::lock_guard lock(residents.mutex);

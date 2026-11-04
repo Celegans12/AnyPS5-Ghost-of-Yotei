@@ -525,7 +525,8 @@ public:
     // APS5_STAGING_DIFF=1 (GuestBufferMemory::RecordCopyBacks): stores into `target` the dwords of
     // `result` that differ from `pristine` (all three device addresses, `dwords` long), with the
     // stored count added to StagingDiffStoredDwords when `count`. False when the kernel is unavailable.
-    bool RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, bool count);
+    // `keepPristine` (APS5_RESIDENT_PRISTINE): each stored dword is also stored into `pristine`.
+    bool RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, bool count, bool keepPristine = false);
     std::uint64_t StagingDiffStoredDwords();
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);

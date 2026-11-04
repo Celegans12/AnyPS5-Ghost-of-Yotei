@@ -3505,7 +3505,7 @@ bool Recorder::RecordMeshArguments(VkCommandBuffer commands, VkDeviceAddress rec
     return true;
 }
 
-bool Recorder::RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, bool count) {
+bool Recorder::RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, bool count, bool keepPristine) {
     constexpr std::uint32_t PushBytes = 40;
     constexpr std::uint32_t GroupSize = 64;
     if (stagingDiffState == 0) {
@@ -3559,8 +3559,8 @@ bool Recorder::RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress resul
             VkDeviceAddress target;
             VkDeviceAddress counter;
             std::uint32_t count;
-            std::uint32_t unused;
-        } parameters{result + VkDeviceAddress{done} * 4u, pristine + VkDeviceAddress{done} * 4u, target + VkDeviceAddress{done} * 4u, counter, step, 0u};
+            std::uint32_t keep;
+        } parameters{result + VkDeviceAddress{done} * 4u, pristine + VkDeviceAddress{done} * 4u, target + VkDeviceAddress{done} * 4u, counter, step, keepPristine ? 1u : 0u};
         static_assert(sizeof(parameters) == PushBytes);
         function(cmdPushConstants, "vkCmdPushConstants")(commands, stagingDiffLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &parameters);
         function(cmdDispatch, "vkCmdDispatch")(commands, (step + GroupSize - 1) / GroupSize, 1, 1);

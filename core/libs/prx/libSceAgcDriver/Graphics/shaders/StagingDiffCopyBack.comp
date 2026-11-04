@@ -10,6 +10,8 @@
 // Every dword the shader changed reaches the import as before; a dword it left alone is not
 // rewritten, so the import keeps whatever it holds (the copy-in value, or a newer store).
 // `counter`, when set, counts the dwords stored (statistics only, one atomic per subgroup).
+// `keep` != 0 (APS5_RESIDENT_PRISTINE, a resident range's persistent pristine copy): every dword stored
+// into the import is also stored into `pristine`, which then equals `result` over the whole range.
 layout(local_size_x = 64) in;
 layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint words[]; };
 layout(push_constant) uniform Parameters {
@@ -18,7 +20,7 @@ layout(push_constant) uniform Parameters {
     Words target;
     Words counter;
     uint count;
-    uint unused;
+    uint keep;
 } parameters;
 
 void main() {
@@ -28,6 +30,7 @@ void main() {
         uint value = parameters.result.words[index];
         if (value != parameters.pristine.words[index]) {
             parameters.target.words[index] = value;
+            if (parameters.keep != 0u) parameters.pristine.words[index] = value;
             stored = 1u;
         }
     }

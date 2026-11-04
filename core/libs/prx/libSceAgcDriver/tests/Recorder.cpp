@@ -4012,6 +4012,183 @@ void stagingDiffTests(const Device& device, Recorder& recorder) {
     std::cout << "staging copy-back tests passed (" << (diff ? "diff" : "whole copies") << ")\n";
 }
 
+// APS5_RESIDENT_PRISTINE (with APS5_STAGING_DIFF=1): fresh builds of one 256 KiB written element, enough
+// to promote it to a resident range, each change one dword the previous uses changed, alternating between
+// a new value and the element's first value. A stale pristine copy (one that still held an older value of
+// that dword) would make the diff kernel skip a change back to the first value. After every use the guest
+// bytes must equal the model; with the switch, persistent pristine copies must have been reused, and with
+// APS5_VERIFY_RESIDENT_PRISTINE none may differ from its buffer.
+bool residentPristineTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress || std::getenv("APS5_STAGING_DIFF") == nullptr) {
+        std::cout << "host imports, device addresses or APS5_STAGING_DIFF unavailable: resident pristine copies not tested\n";
+        return false;
+    }
+    constexpr std::size_t bytes = 4u << 20u;
+    // Write-watched (the guest arena): the copy-in skips need the tracker's generations.
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: residentPristineTests skipped
+";
+        return false;
+    }
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: resident pristine copies not tested\n";
+        return false;
+    }
+    auto* words = static_cast<std::uint32_t*>(block);
+    const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+    const auto element = address + 65536;
+    constexpr std::size_t elementBytes = 256u << 10u;
+    constexpr std::size_t first = 65536 / 4;
+    std::vector<std::uint32_t> model(bytes / 4u, 0x11111111u);
+    const auto reusedBefore = ResidentPristineReused();
+    const auto copiedBefore = ResidentPristineCopied();
+    for (std::uint32_t use = 0; use < 40; ++use) {
+        GuestBufferMemory memory(context);
+        memory.AllowDeviceStaging();
+        memory.AddWritable(element, elementBytes, false, true);
+        memory.Upload(false);
+        Require(memory.InPlaceReads().empty(), "a read and written 256 KiB element was not staged");
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(element, elementBytes, adjustment);
+        const auto shadow = [&](std::size_t index) { return view.offset + adjustment + std::uint64_t{index} * 4u; };
+        // Dwords 100..102 in turn; each one takes a new value, then the first value again, then a new one.
+        const std::size_t at = 100 + use % 3u;
+        const std::uint32_t value = (use / 3u) % 2u == 0 ? 0x50000000u + use : 0x11111111u;
+        auto commands = recorder.Commands();
+        fill(commands, view.buffer, shadow(at), 4, value);
+        // A dword some uses rewrite with the value it already holds (not stored either way).
+        if (use % 5u == 0) fill(commands, view.buffer, shadow(7), 4, model[first + 7]);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        memory.RecordCopyBacks(recorder);
+        memory.MarkDirectWrites();
+        recorder.Sync();
+        model[first + at] = value;
+        std::size_t wrong = 0;
+        for (std::size_t index = 0; index < bytes / 4u; ++index) {
+            if (words[index] != model[index] && wrong++ < 8) std::cout << "resident pristine use " << use << ": dword " << index << " holds 0x" << std::hex << words[index] << ", expected 0x" << model[index] << std::dec << "\n";
+        }
+        Require(wrong == 0, "a resident range's copy-back left the wrong guest bytes");
+    }
+    const auto reused = ResidentPristineReused() - reusedBefore;
+    const auto copied = ResidentPristineCopied() - copiedBefore;
+    std::cout << "resident pristine: " << reused << " pristine copies reused, " << copied << " made into the persistent buffer, " << ResidentPristineMismatches() << " verify mismatches\n";
+    if (std::getenv("APS5_RESIDENT_PRISTINE") != nullptr) {
+        Require(reused != 0, "APS5_RESIDENT_PRISTINE: no persistent pristine copy was reused");
+    } else {
+        Require(reused == 0 && copied == 0, "a persistent pristine copy was used with APS5_RESIDENT_PRISTINE unset");
+    }
+    Require(ResidentPristineMismatches() == 0, "APS5_VERIFY_RESIDENT_PRISTINE: a persistent pristine copy differed from its buffer");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    ReleaseWatched(block, bytes);
+    std::cout << "resident pristine tests passed\n";
+    return true;
+}
+
+// APS5_OWN_SHADOW_CURRENT (with APS5_STAGING_DIFF=1): one build of a 256 KiB written element used 16 times
+// (RecordStagingCopies, the reused-build path). Each use changes one dword of the shadow; before use 6 the CPU
+// stores into the element and stamps it (MarkPossiblyWritten, as any writer of guest memory does). After every
+// use both the import and the shadow must equal the model: a copy-in skipped wrongly (after the stamp) leaves
+// the shadow without the CPU's store. With the switch, copy-ins must have been skipped.
+bool ownShadowTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress) {
+        std::cout << "host imports or device addresses unavailable: own shadow copy-ins not tested\n";
+        return false;
+    }
+    constexpr std::size_t bytes = 4u << 20u;
+    // Write-watched (the guest arena): the copy-in skips need the tracker's generations.
+    void* block = AllocateWatched(bytes, 65536);
+    if (block == nullptr) {
+        std::cout << "no write watching: ownShadowTests skipped
+";
+        return false;
+    }
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    if (HostImportFor(context, address, bytes) == nullptr) {
+        std::cout << "host import of the test block refused: own shadow copy-ins not tested\n";
+        return false;
+    }
+    auto* words = static_cast<std::uint32_t*>(block);
+    const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+    const auto element = address + 8192;
+    constexpr std::size_t elementBytes = 256u << 10u;
+    constexpr std::size_t first = 8192 / 4;
+    std::vector<std::uint32_t> model(bytes / 4u, 0x11111111u);
+    const auto skippedBefore = OwnShadowSkipped();
+    GuestBufferMemory memory(context);
+    memory.AllowDeviceStaging();
+    memory.AddWritable(element, elementBytes, false, true);
+    auto readback = std::make_shared<Buffer>(context, elementBytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    for (std::uint32_t use = 0; use < 16; ++use) {
+        if (use == 6) {
+            words[first + 5000] = 0x77777777u;
+            model[first + 5000] = 0x77777777u;
+            static_cast<void>(GuestMemory::MarkPossiblyWritten(element + 5000u * 4u, 4));
+        }
+        if (use == 0) {
+            memory.Upload(false);
+            Require(memory.InPlaceReads().empty(), "a read and written 256 KiB element was not staged");
+        } else {
+            memory.RecordStagingCopies(recorder);
+        }
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(element, elementBytes, adjustment);
+        const auto shadow = [&](std::size_t index) { return view.offset + adjustment + std::uint64_t{index} * 4u; };
+        const std::size_t at = 100 + use % 3u;
+        const std::uint32_t value = (use / 3u) % 2u == 0 ? 0x60000000u + use : 0x11111111u;
+        auto commands = recorder.Commands();
+        fill(commands, view.buffer, shadow(at), 4, value);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+        memory.RecordCopyBacks(recorder);
+        memory.MarkDirectWrites();
+        commands = recorder.Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        CopyBuffer(context, commands, view.buffer, shadow(0), readback->Handle(), 0, elementBytes);
+        recorder.Keep(readback);
+        recorder.Sync();
+        model[first + at] = value;
+        std::size_t wrong = 0;
+        for (std::size_t index = 0; index < bytes / 4u; ++index) {
+            if (words[index] != model[index] && wrong++ < 8) std::cout << "own shadow use " << use << ": guest dword " << index << " holds 0x" << std::hex << words[index] << ", expected 0x" << model[index] << std::dec << "\n";
+        }
+        const auto* shadowWords = reinterpret_cast<const std::uint32_t*>(readback->Bytes().data());
+        for (std::size_t index = 0; index < elementBytes / 4u; ++index) {
+            if (shadowWords[index] != model[first + index] && wrong++ < 8) std::cout << "own shadow use " << use << ": shadow dword " << index << " holds 0x" << std::hex << shadowWords[index] << ", expected 0x" << model[first + index] << std::dec << "\n";
+        }
+        Require(wrong == 0, "a reused build's staging shadow or its copy-back left the wrong bytes");
+    }
+    const auto skipped = OwnShadowSkipped() - skippedBefore;
+    std::cout << "own shadow: " << skipped << " copy-ins skipped, " << OwnShadowMismatches() << " verify mismatches\n";
+    if (std::getenv("APS5_OWN_SHADOW_CURRENT") != nullptr) Require(skipped != 0, "APS5_OWN_SHADOW_CURRENT: no copy-in of the reused build was skipped");
+    else Require(skipped == 0, "a copy-in was skipped with APS5_OWN_SHADOW_CURRENT unset");
+    Require(OwnShadowMismatches() == 0, "APS5_VERIFY_OWN_SHADOW: a skipped copy-in's shadow differed from its import");
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    ReleaseWatched(block, bytes);
+    std::cout << "own shadow tests passed\n";
+    return true;
+}
+
 // BDA overlays (GuestBufferMemory::resolveOverlays): a written element of an address-based build
 // inside an import of the cached address space is staged device-local, the BDA table sends its
 // addresses to the shadow (the import's entry cut around it), and the copy-back stores what the
@@ -12934,6 +13111,12 @@ int main(int argc, char** argv) {
             if (!writtenBufferOrderTests(device, recorder)) return 77;
             std::cout << "written buffer order tests passed\n";
             return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--own-shadow-only") {
+            return ownShadowTests(device, recorder) ? 0 : 77;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--resident-pristine-only") {
+            return residentPristineTests(device, recorder) ? 0 : 77;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--staging-diff-only") {
             stagingDiffTests(device, recorder);
