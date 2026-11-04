@@ -40,6 +40,45 @@ namespace {
 
 using TwinCapture = std::function<std::shared_ptr<const ShaderRecompiler::ResourceCapture>(const ShaderRecompiler::RecompileRequest&, ShaderRecompiler::PreparedShaderInvocation&)>;
 
+// What makes the instrumented module of a cloth program unusable with its plain module's resources ("" when nothing).
+std::string clothTwinDifference(const ShaderRecompiler::RecompileResult& plain, const ShaderRecompiler::RecompileResult& twin) {
+    if (plain.bindings.size() != twin.bindings.size()) return "binding count";
+    for (std::size_t index = 0; index < plain.bindings.size(); ++index) {
+        const auto& left = plain.bindings[index];
+        const auto& right = twin.bindings[index];
+        if (left.role != right.role || left.binding != right.binding || left.kind != right.kind || left.descriptorSet != right.descriptorSet || left.count != right.count || left.readOnly != right.readOnly || left.guestDescriptor != right.guestDescriptor) return "binding " + std::to_string(index);
+    }
+    if (plain.pushConstants != twin.pushConstants) return "push words";
+    if (plain.specialization != twin.specialization) return "specialization";
+    if (plain.workgroupMemoryDwords != twin.workgroupMemoryDwords || plain.hostSubgroupSize != twin.hostSubgroupSize) return "workgroup memory or subgroup size";
+    if (plain.shaderDataDwords != twin.shaderDataDwords || plain.memoryOffsetDword != twin.memoryOffsetDword || plain.imageMetadataDword != twin.imageMetadataDword) return "shader data layout";
+    if (plain.bindlessHeap != twin.bindlessHeap) return "bindless heap";
+    return {};
+}
+
+// S4 cloth checked overlap: the instrumented variant (SpirvTarget::watchedReads) of a cloth program, built once beside
+// its plain module; only members of a checked run bind it (VulkanDevice::ClothTwinOf).
+void buildClothTwin(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, const TwinCapture& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled) {
+    if (compiled == nullptr || VulkanDevice::ClothTwinOf(*compiled) != nullptr) return;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> twin;
+    try {
+        auto watchedRequest = request;
+        watchedRequest.target.watchedReads = true;
+        auto invocation = InvocationFor(snapshot, codeOffset, watchedRequest);
+        const auto watchedCapture = capture(watchedRequest, invocation);
+        if (watchedCapture != nullptr) twin = invocation.Materialize(*watchedCapture);
+    } catch (const std::exception& error) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[cloth-overlap] no instrumented module for compute shader 0x%llx: %.200s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
+    }
+    if (const auto difference = twin != nullptr ? clothTwinDifference(*compiled, *twin) : std::string(); !difference.empty()) {
+        static std::atomic<int> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[cloth-overlap] instrumented module of compute shader 0x%llx differs: %s\n", static_cast<unsigned long long>(request.shader.codeAddress), difference.c_str());
+        twin = nullptr;
+    }
+    VulkanDevice::RememberClothTwin(compiled, std::move(twin));
+}
+
 void buildResolvedTwin(const ShaderSnapshot& snapshot, std::size_t codeOffset, const ShaderRecompiler::RecompileRequest& request, const TwinCapture& capture, const std::shared_ptr<const ShaderRecompiler::RecompileResult>& compiled) {
     auto& twins = NewPath::Twins();
     if (compiled != nullptr && twins.Known(*compiled)) return;
@@ -599,6 +638,11 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                 ShaderMemory resolvedMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
                 const SampledReadScope sampling(evidenceReads);
                 return CaptureInvocation(resolvedMemory, snapshot, codeOffset, resolvedRequest, resolvedInvocation);
+            }, compiledResult);
+            if (indirectArguments == 0 && VulkanDevice::ClothTwinWanted(address)) buildClothTwin(snapshot, codeOffset, [&] { auto source = request; source.context.memory = memory; return source; }(), [&](const ShaderRecompiler::RecompileRequest& watchedRequest, ShaderRecompiler::PreparedShaderInvocation& watchedInvocation) {
+                ShaderMemory watchedMemory(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
+                const SampledReadScope sampling(evidenceReads);
+                return CaptureInvocation(watchedMemory, snapshot, codeOffset, watchedRequest, watchedInvocation);
             }, compiledResult);
             timing.Mark("materialize");
             if (!resolving && missAheadEnabled()) {

@@ -4132,7 +4132,6 @@ bool OneLaneListed(std::uint64_t programAddress) {
 ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t waveSize, std::uint64_t programAddress) const {
     auto target = ComputeTarget(waveSize);
     target.singleLaneGroups = OneLaneListed(programAddress);
-    target.watchedReads = ClothOverlapModules() && ClothFamily(programAddress);
     return target;
 }
 
@@ -5726,6 +5725,7 @@ using Interval = std::pair<std::uint64_t, std::uint64_t>;
 struct Diagnostics {
     bool force = false;
     bool order = false;
+    bool inlinePipelines = false;
 };
 
 const Diagnostics& Diag() {
@@ -5735,6 +5735,7 @@ const Diagnostics& Diag() {
         const std::string_view flags = text != nullptr ? text : "";
         value.force = flags.find("force") != std::string_view::npos;
         value.order = flags.find("order") != std::string_view::npos;
+        value.inlinePipelines = flags.find("inline") != std::string_view::npos;
         return value;
     }();
     return diag;
@@ -5861,7 +5862,7 @@ struct Run {
 
 struct Totals {
     std::uint64_t runs = 0, members = 0, singles = 0, conflicts = 0, forced = 0, noClaims = 0, slots = 0, redoMembers = 0;
-    std::uint64_t refusedModule = 0, refusedResources = 0, refusedFootprint = 0, refusedBusy = 0, refusedCopies = 0, recopied = 0;
+    std::uint64_t refusedModule = 0, pipelineAhead = 0, refusedResources = 0, refusedFootprint = 0, refusedBusy = 0, refusedCopies = 0, recopied = 0;
 };
 
 std::mutex mutex;
@@ -5875,7 +5876,7 @@ void Report(bool force) {
     if (!force && now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
     const auto& t = totals;
-    std::fprintf(stderr, "[cloth-overlap] (cumulative) checked runs %llu with %llu members (%.1f per run), single-member runs %llu; conflicts found %llu, forced %llu, runs without claims %llu, members redone %llu; claim slots %llu; refused: module %llu, resources %llu, footprint %llu, busy build %llu, copy-ins %llu; copy-ins recorded again %llu (APS5_CLOTH_OVERLAP_DIAG %s%s)\n", static_cast<unsigned long long>(t.runs), static_cast<unsigned long long>(t.members), t.runs != 0 ? static_cast<double>(t.members) / static_cast<double>(t.runs) : 0.0, static_cast<unsigned long long>(t.singles), static_cast<unsigned long long>(t.conflicts), static_cast<unsigned long long>(t.forced), static_cast<unsigned long long>(t.noClaims), static_cast<unsigned long long>(t.redoMembers), static_cast<unsigned long long>(t.slots), static_cast<unsigned long long>(t.refusedModule), static_cast<unsigned long long>(t.refusedResources), static_cast<unsigned long long>(t.refusedFootprint), static_cast<unsigned long long>(t.refusedBusy), static_cast<unsigned long long>(t.refusedCopies), static_cast<unsigned long long>(t.recopied), Diag().force ? "force" : "", Diag().order ? " order" : "");
+    std::fprintf(stderr, "[cloth-overlap] (cumulative) checked runs %llu with %llu members (%.1f per run), single-member runs %llu; conflicts found %llu, forced %llu, runs without claims %llu, members redone %llu; claim slots %llu; refused: no instrumented module %llu, its pipeline not ready yet %llu, resources %llu, footprint %llu, busy build %llu, copy-ins %llu; copy-ins recorded again %llu (APS5_CLOTH_OVERLAP_DIAG %s%s)\n", static_cast<unsigned long long>(t.runs), static_cast<unsigned long long>(t.members), t.runs != 0 ? static_cast<double>(t.members) / static_cast<double>(t.runs) : 0.0, static_cast<unsigned long long>(t.singles), static_cast<unsigned long long>(t.conflicts), static_cast<unsigned long long>(t.forced), static_cast<unsigned long long>(t.noClaims), static_cast<unsigned long long>(t.redoMembers), static_cast<unsigned long long>(t.slots), static_cast<unsigned long long>(t.refusedModule), static_cast<unsigned long long>(t.pipelineAhead), static_cast<unsigned long long>(t.refusedResources), static_cast<unsigned long long>(t.refusedFootprint), static_cast<unsigned long long>(t.refusedBusy), static_cast<unsigned long long>(t.refusedCopies), static_cast<unsigned long long>(t.recopied), Diag().force ? "force" : "", Diag().order ? " order" : "");
 }
 
 void CountRefusal(std::uint64_t Totals::*field) {
@@ -5884,8 +5885,8 @@ void CountRefusal(std::uint64_t Totals::*field) {
 }
 
 // A member candidate, or nullopt (the dispatch then runs as today).
-std::optional<Member> Prepare(const RecordedDispatch& record, Graphics::ShaderResources& resources) {
-    if (!NotesClaims(*record.shader->program)) {
+std::optional<Member> Prepare(const RecordedDispatch& record, Graphics::ShaderResources& resources, const ShaderRecompiler::RecompileResult& instrumented) {
+    if (!NotesClaims(instrumented)) {
         CountRefusal(&Totals::refusedModule);
         return std::nullopt;
     }
@@ -6225,6 +6226,37 @@ void Join(Graphics::Recorder& recorder, const Graphics::Context& context, Member
 
 }
 
+namespace {
+
+struct ClothTwin {
+    std::weak_ptr<const ShaderRecompiler::RecompileResult> plain;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> instrumented;
+};
+
+std::mutex clothTwinMutex;
+std::unordered_map<const void*, ClothTwin> clothTwins;
+
+}
+
+bool VulkanDevice::ClothTwinWanted(std::uint64_t programAddress) {
+    return ClothOverlapModules() && ClothFamily(programAddress);
+}
+
+void VulkanDevice::RememberClothTwin(const std::shared_ptr<const ShaderRecompiler::RecompileResult>& plain, std::shared_ptr<const ShaderRecompiler::RecompileResult> instrumented) {
+    if (plain == nullptr) return;
+    std::lock_guard lock(clothTwinMutex);
+    for (auto it = clothTwins.begin(); it != clothTwins.end();) it = it->second.plain.expired() ? clothTwins.erase(it) : std::next(it);
+    clothTwins[plain.get()] = {plain, std::move(instrumented)};
+}
+
+std::shared_ptr<const ShaderRecompiler::RecompileResult> VulkanDevice::ClothTwinOf(const ShaderRecompiler::RecompileResult& plain) {
+    std::lock_guard lock(clothTwinMutex);
+    const auto found = clothTwins.find(&plain);
+    if (found == clothTwins.end()) return nullptr;
+    const auto alive = found->second.plain.lock();
+    return alive.get() == &plain ? found->second.instrumented : nullptr;
+}
+
 void VulkanDevice::SetClothFamily(std::span<const std::uint64_t> programs) {
     std::lock_guard lock(clothFamilyMutex);
     clothFamily.assign(programs.begin(), programs.end());
@@ -6391,6 +6423,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // and they are recorded again.
     std::optional<ClothOverlap::Member> clothMember;
     std::shared_ptr<ClothOverlap::Arenas> clothArenas;
+    std::shared_ptr<ComputePipelineObjects> clothObjects;
     {
         const auto copies = Graphics::GuestBufferMemory::TakeClothCopies();
         if (overlapCapable && emitted == nullptr && ClothOverlap::Active()) {
@@ -6407,7 +6440,12 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             }
             clothArenas = std::static_pointer_cast<ClothOverlap::Arenas>(state->clothArenas);
             if (copies == Graphics::GuestBufferMemory::ClothCopiesRefused) ClothOverlap::CountRefusal(&ClothOverlap::Totals::refusedCopies);
-            else if (!clothArenas->failed) clothMember = ClothOverlap::Prepare(record, resources);
+            else if (!clothArenas->failed) {
+                const auto instrumented = ClothTwinOf(*record.shader->program);
+                if (instrumented != nullptr) clothObjects = ClothOverlap::Diag().inlinePipelines ? computePipeline(context, *instrumented, resources.SetLayouts().main, resources.SetLayouts().mainKey, record.pushStages, record.programAddress) : twinPipeline(context, *record.shader->program, instrumented, resources.SetLayouts().main, record.pushStages, record.programAddress);
+                if (clothObjects == nullptr) ClothOverlap::CountRefusal(instrumented == nullptr ? &ClothOverlap::Totals::refusedModule : &ClothOverlap::Totals::pipelineAhead);
+                else clothMember = ClothOverlap::Prepare(record, resources, *instrumented);
+            }
         }
         if (clothMember.has_value() && ClothOverlap::RunFull(recorder.CheckedRun(overlapQueue))) static_cast<void>(recorder.Commands());
         if (copies != 0 && copies != Graphics::GuestBufferMemory::ClothCopiesRefused && (!clothMember.has_value() || recorder.CheckedRun(overlapQueue) != copies)) {
@@ -6429,6 +6467,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // copy-ins of the dispatches joining the run can go to a prelude submitted ahead of this one.
     if (overlapCapable && !overlapped && ((resources.HasGpuCopies() && Graphics::Recorder::BatchedStagingEnabled()) || checked)) commands = recorder.SplitForRun();
     if (checked && !overlapped && !recorder.PreludeArmed()) checked = false;
+    if (!checked) clothObjects = nullptr;
     // The first dispatch of a run that may overlap records its leading barrier in full (bindless
     // heap writes included), whatever the previous command covered: it orders everything before the
     // run for every dispatch of it, bindless or not.
@@ -6436,7 +6475,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     if (emitted != nullptr) recorder.Keep(emitted);
-    const auto& boundObjects = emitted != nullptr ? *emitted : *record.objects;
+    if (clothObjects != nullptr) recorder.Keep(clothObjects);
+    const auto& boundObjects = emitted != nullptr ? *emitted : clothObjects != nullptr ? *clothObjects : *record.objects;
     if (record.resources != nullptr) record.resources->KeepStorageImageBytes(recorder);
     recorder.Keep(record.resources);
     if (record.resources != nullptr) recorder.KeepBytes(record.resources.get(), record.resources->CopiedBytes());
@@ -6678,8 +6718,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (checked) {
         auto& member = *clothMember;
         member.resources = record.resources;
-        member.pipeline = boundObjects.pipeline;
-        member.layout = boundObjects.layout;
+        member.pipeline = record.objects->pipeline;
+        member.layout = record.objects->layout;
         member.push = record.pushStages != 0;
         if (member.push) std::memcpy(member.pushBytes.data(), record.pushBytes->data(), member.pushBytes.size());
         ClothOverlap::Join(recorder, context, std::move(member), clothArenas, overlapQueue, clothJoined);
@@ -7004,7 +7044,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         ~ClothCandidate() {
             if (active) Graphics::Recorder::SetCheckedDispatch(false);
         }
-    } clothCandidate{ClothOverlap::Active() && ClothOverlap::NotesClaims(shader)};
+    } clothCandidate{ClothOverlap::Active() && ClothTwinOf(shader) != nullptr};
     if (clothCandidate.active) Graphics::Recorder::SetCheckedDispatch(true);
     startJournalReplay();
     for (const auto& binding : shader.bindings) {

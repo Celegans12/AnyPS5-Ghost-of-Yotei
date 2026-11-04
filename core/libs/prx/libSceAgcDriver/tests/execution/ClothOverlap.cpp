@@ -128,7 +128,7 @@ int main(int argc, char** argv) {
         const std::string name = argc > 1 ? argv[1] : "clean";
         mode = name == "off" ? Mode::Off : name == "force" ? Mode::Force : name == "conflict" ? Mode::Conflict : Mode::Clean;
         if (mode != Mode::Off) SetEnvironment("APS5_CLOTH_OVERLAP", "1");
-        if (mode == Mode::Force) SetEnvironment("APS5_CLOTH_OVERLAP_DIAG", "force");
+        SetEnvironment("APS5_CLOTH_OVERLAP_DIAG", mode == Mode::Force ? "force,inline" : "inline");
         {
             const auto probe = OpenVulkanTestDevice();
             if (!probe) return VulkanTestSkipped;

@@ -233,6 +233,11 @@ public:
     static std::array<std::uint64_t, 3> ClothOverlapCounts();
     // The programs (by code address) recompiled with the claim notes; the cloth family by default (tests name their own).
     static void SetClothFamily(std::span<const std::uint64_t> programs);
+    // The two module variants of a cloth program: the plain one every dispatch compiles (no claim notes), and the
+    // instrumented one (SpirvTarget::watchedReads) built beside it once, which only members of a checked run bind.
+    static bool ClothTwinWanted(std::uint64_t programAddress);
+    static void RememberClothTwin(const std::shared_ptr<const ShaderRecompiler::RecompileResult>& plain, std::shared_ptr<const ShaderRecompiler::RecompileResult> instrumented);
+    static std::shared_ptr<const ShaderRecompiler::RecompileResult> ClothTwinOf(const ShaderRecompiler::RecompileResult& plain);
     void ResolveMemory(std::uint64_t address, std::size_t bytes, bool writable);
     void* Window() const;
     void Resize(std::uint32_t width, std::uint32_t height);
