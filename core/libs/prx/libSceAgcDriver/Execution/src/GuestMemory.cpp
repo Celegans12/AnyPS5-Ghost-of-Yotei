@@ -1587,6 +1587,10 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
+    if (P0cNoProofs()) {
+        // Ceiling ablation (inexact): no write-watch walk once the tracker has a generation.
+        if (const auto generation = tracker.stable.load(std::memory_order_acquire); generation != 0) return generation;
+    }
     // Whole pages, so a page shared with the next range is collected with either.
     constexpr std::uint64_t page = 4096;
     auto first = address & ~(page - 1);
@@ -1974,6 +1978,16 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     }
     if (unwatchedFrom < stop) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(stop - unwatchedFrom));
     return true;
+}
+
+bool P0cNoProofs() {
+    static const bool on = std::getenv("APS5_P0C_NO_PROOFS") != nullptr;
+    return on;
+}
+
+bool P0cNoHazards() {
+    static const bool on = std::getenv("APS5_P0C_NO_HAZARDS") != nullptr;
+    return on;
 }
 
 bool WriteWatched() {
