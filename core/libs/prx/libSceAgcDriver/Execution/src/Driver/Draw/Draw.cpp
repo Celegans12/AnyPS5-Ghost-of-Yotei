@@ -1012,6 +1012,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             std::vector<Graphics::CompiledShader> stages;
             std::vector<Graphics::GuestMemorySnapshot> snapshots;
             std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> patched;
+            std::vector<std::shared_ptr<const std::vector<ShaderRecompiler::RegisteredImageView>>> views;
         };
         std::vector<ExpandedDraw> expanded;
         std::vector<DrawPipeline::Range> writes;
@@ -1075,9 +1076,13 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     return DrawVerdict::Rejected;
                 }
                 require(patchedResult->pushConstants.size() == pushBytes, "patched program changed its push constant layout");
+                auto views = stageCaptures[programIndex].registeredViews;
                 for (auto& stage : item.stages) {
-                    if (stage.program == programResults[programIndex]) stage.program = patchedResult.get();
+                    if (stage.program != programResults[programIndex]) continue;
+                    stage.program = patchedResult.get();
+                    stage.registeredImageViews = views.get();
                 }
+                item.views.push_back(std::move(views));
                 current[programIndex] = patchedResult.get();
                 item.patched.push_back(std::move(patchedResult));
             }
