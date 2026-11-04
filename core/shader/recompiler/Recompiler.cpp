@@ -1015,6 +1015,7 @@ struct SpecializedModuleEntry {
     std::once_flag ready;
     std::exception_ptr failure;
     std::shared_ptr<const SpecializedModule> module;
+    std::vector<std::uint64_t> key;
 };
 
 struct PreparedModuleEntry {
@@ -1178,7 +1179,23 @@ bool RuntimeFormatCompatible(const std::vector<std::uint64_t>& candidate, const 
     return true;
 }
 
-std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, const IrBindingLayout& layout, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
+std::vector<std::uint64_t> PinnedRuntimeFormatKey(std::span<const BufferSubstituteTable::Pin> pins, std::uint64_t variantId, const std::vector<std::uint64_t>& key) {
+    std::vector<std::uint64_t> best;
+    std::vector<std::uint64_t> candidate;
+    std::size_t fewest = 0;
+    for (const auto& pin : pins) {
+        candidate.assign(1u, variantId);
+        candidate.insert(candidate.end(), pin.begin(), pin.end());
+        if (!RuntimeFormatCompatible(candidate, key)) continue;
+        const auto absent = RuntimeFormatAbsentCount(candidate);
+        if (absent == 0u || (!best.empty() && absent >= fewest)) continue;
+        best = candidate;
+        fewest = absent;
+    }
+    return best;
+}
+
+std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderArtifact& artifact, const IrBindingLayout& layout, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target, BufferSubstituteTable* pins) {
     struct ModuleKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, ModuleKeyStorage>();
     key.clear();
@@ -1202,20 +1219,42 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
                 if (best != nullptr) entry = best->entry;
             }
         }
+        std::vector<std::uint64_t> pinned;
+        if (entry == nullptr && pins != nullptr && PipelineSpecialization::AbsentRuntimeFormat() && PipelineSpecialization::PinnedRuntimeFormat()) pinned = PinnedRuntimeFormatKey(pins->Pins(), artifact.variantId, key);
         std::unique_lock lock(mutex);
-        const auto found = modules.find(key);
-        entry = found != modules.end() ? found->second : entry != nullptr ? modules.emplace(key, entry).first->second : modules.emplace(key, std::make_shared<SpecializedModuleEntry>()).first->second;
+        if (const auto found = modules.find(key); found != modules.end()) {
+            entry = found->second;
+        } else if (entry != nullptr) {
+            entry = modules.emplace(key, entry).first->second;
+        } else if (!pinned.empty()) {
+            auto& built = modules[pinned];
+            if (built == nullptr) {
+                built = std::make_shared<SpecializedModuleEntry>();
+                built->key = pinned;
+            }
+            entry = modules.emplace(key, built).first->second;
+        } else {
+            auto created = std::make_shared<SpecializedModuleEntry>();
+            created->key = key;
+            entry = modules.emplace(key, std::move(created)).first->second;
+        }
     }
     std::call_once(entry->ready, [&] {
+        std::vector<PipelineSpecializationConstant> built;
+        built.reserve(entry->key.size());
+        for (std::size_t index = 1; index < entry->key.size(); ++index) built.push_back({static_cast<std::uint32_t>(entry->key[index] >> 32u), static_cast<std::uint32_t>(entry->key[index])});
         try {
-            entry->module = buildSpecializedModule(artifact, layout, classes, constants, target);
+            entry->module = buildSpecializedModule(artifact, layout, classes, built, target);
         } catch (...) {
             entry->failure = std::current_exception();
         }
         if (entry->failure == nullptr && PipelineSpecialization::AbsentRuntimeFormat()) {
-            if (const auto absent = RuntimeFormatAbsentCount(key); absent != 0u) {
-                std::unique_lock lock(mutex);
-                runtimeFormats[artifact.variantId].push_back({key, entry, absent});
+            if (const auto absent = RuntimeFormatAbsentCount(entry->key); absent != 0u) {
+                {
+                    std::unique_lock lock(mutex);
+                    runtimeFormats[artifact.variantId].push_back({entry->key, entry, absent});
+                }
+                if (pins != nullptr && PipelineSpecialization::PinnedRuntimeFormat()) pins->AddPin(std::span<const std::uint64_t>(entry->key).subspan(1u));
             }
         }
     });
@@ -1522,7 +1561,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
                 const auto declared = declaredSpecializationIds(artifact);
                 std::erase_if(constants, [&](const PipelineSpecializationConstant& constant) { return constant.id >= PipelineSpecialization::BufferBase && constant.id < PipelineSpecialization::ImageBase && !declared->contains(constant.id); });
             }
-            const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, variant.bindings.layout, vertexClasses, constants, request.target); }) : specializeModule(variant.artifact, variant.bindings.layout, vertexClasses, constants, request.target);
+            const auto module = artifact.registrationModule && plan->bindings.specialization.empty() ? registrationModule(artifact.variantId, moduleKey, [&] { return specializeModule(variant.artifact, variant.bindings.layout, vertexClasses, constants, request.target, variant.substitutes.get()); }) : specializeModule(variant.artifact, variant.bindings.layout, vertexClasses, constants, request.target, variant.substitutes.get());
             if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
             auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
             entry->bindings = std::move(selected);
