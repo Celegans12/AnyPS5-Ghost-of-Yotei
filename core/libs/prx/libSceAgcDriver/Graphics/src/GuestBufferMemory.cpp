@@ -5446,11 +5446,11 @@ void reportOwnShadows() {
     AgcDriver::ProfilePrint_nid_no_patch("[own-shadow] (10 s, APS5_OWN_SHADOW_CURRENT %s) copy-ins skipped %llu (%.1f MiB) / made %llu (%.1f MiB); of the made: stamped since %llu, copy-back unconfirmed %llu, other lane %llu; verify %llu checked, %llu mismatched\n", RuntimeSwitches::Set(RuntimeSwitch::OwnShadowCurrent) ? "set" : "unset", skipped, skippedBytes / 1048576.0, copied, copiedBytes / 1048576.0, stale, pending, otherLane, static_cast<unsigned long long>(counts.checked.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counts.mismatched.load(std::memory_order_relaxed)));
 }
 
-std::uint64_t OwnShadowSkipped() {
+std::uint64_t ownShadowSkippedCount() {
     return OwnShadows().skippedTotal.load(std::memory_order_relaxed);
 }
 
-std::uint64_t OwnShadowMismatches() {
+std::uint64_t ownShadowMismatchesCount() {
     return OwnShadows().mismatched.load(std::memory_order_relaxed);
 }
 
@@ -5524,11 +5524,11 @@ ResidentPristineCounts& ResidentPristines() {
     return counts;
 }
 
-std::uint64_t ResidentPristineReused() {
+std::uint64_t residentPristineReusedCount() {
     return ResidentPristines().reusedTotal.load(std::memory_order_relaxed);
 }
 
-std::uint64_t ResidentPristineCopied() {
+std::uint64_t residentPristineCopiedCount() {
     return ResidentPristines().copiedTotal.load(std::memory_order_relaxed);
 }
 
@@ -5559,7 +5559,7 @@ void verifyResidentPristine(const Context& context, Recorder& recorder, VkComman
     });
 }
 
-std::uint64_t ResidentPristineMismatches() {
+std::uint64_t residentPristineMismatchesCount() {
     return residentPristineMismatched.load(std::memory_order_relaxed);
 }
 
@@ -8208,5 +8208,12 @@ HostImportsProof HostImportsIdentity(const Context& context) {
     if (importsStale(context, state)) return {};
     return {state.device, state.epoch, state.refreshedGeneration};
 }
+
+// Test accessors (declared in GuestBufferMemory.hpp; the counters above live in the file's anonymous namespace).
+std::uint64_t ResidentPristineReused() { return residentPristineReusedCount(); }
+std::uint64_t ResidentPristineCopied() { return residentPristineCopiedCount(); }
+std::uint64_t ResidentPristineMismatches() { return residentPristineMismatchesCount(); }
+std::uint64_t OwnShadowSkipped() { return ownShadowSkippedCount(); }
+std::uint64_t OwnShadowMismatches() { return ownShadowMismatchesCount(); }
 
 }
