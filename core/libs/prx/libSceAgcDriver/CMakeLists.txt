@@ -3056,6 +3056,18 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_spanned_ballot_exec_masks_one_barrier PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    add_test(NAME agc_driver_spanned_ballot_sequence_two_barriers COMMAND agc_driver_spanned_ballot_sequence_tests)
+    set_tests_properties(agc_driver_spanned_ballot_sequence_two_barriers PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SPANNED_BALLOT_ONE_BARRIER=2" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_spanned_ballot_sequence_two_barriers PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+    add_test(NAME agc_driver_spanned_ballot_exec_masks_two_barriers COMMAND agc_driver_spanned_ballot_exec_masks_tests)
+    set_tests_properties(agc_driver_spanned_ballot_exec_masks_two_barriers PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SPANNED_BALLOT_ONE_BARRIER=2" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_driver_spanned_ballot_exec_masks_two_barriers PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
     add_test(NAME agc_driver_gpu_skinning_loop_spanned COMMAND agc_driver_gpu_skinning_loop_tests)
     set_tests_properties(agc_driver_gpu_skinning_loop_spanned PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_SPANNED_WAVE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}" TIMEOUT 60)
     add_test(NAME agc_formatted_buffer_once_spanned COMMAND agc_formatted_buffer_once_tests)
