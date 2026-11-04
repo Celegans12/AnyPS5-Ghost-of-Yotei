@@ -19,7 +19,7 @@ public:
     BdaResources(const Context& context, const GuestBufferMemory& memory);
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
-    // The fault buffer's words (host-visible, coherent), for the S4 cloth watch list (BdaAbi::WatchCountWord on).
+    // The fault buffer's words (host-visible, coherent), for the S4 cloth checked overlap's claim words (BdaAbi::ClaimArrayWord on).
     std::uint32_t* WatchWords() const;
     std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> Ranges() const;
     static std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> RangesOf(const GuestBufferMemory& memory);

@@ -379,6 +379,34 @@ public:
     // were confirmed unchanged): the previous use's copy-back left the shadow behind, and the next
     // RecordCopyBacks copies it back again. Nothing to do without staged regions.
     void RecordStagingCopies(Recorder& recorder);
+    // S4 cloth checked overlap (VulkanDevice.cpp ClothOverlap). ClothFootprint lists what a checked run's redo and its
+    // masked copy-backs need: every staged region (shadow and import device addresses, guest range, whether its copy-in
+    // read the import, its written sub-ranges) and every written range served in place by an import. False when a
+    // region is not a plain dword-aligned shadow of an import with device addresses, or a written range is neither
+    // staged nor in an import (the dispatch is then no checked member). ClothTakeCopyBacks marks the staged regions
+    // copied back without recording anything: the run records their copy-backs. TakeClothCopies: what the calling
+    // thread's last copy-ins under Recorder::SetCheckedDispatch did: 0 none or not in a checked run, the serial of the
+    // checked run whose prelude took them, or ClothCopiesRefused (a region failed the rules above; the copy-ins then
+    // closed the run).
+    struct ClothStaged {
+        VkDeviceAddress shadow;
+        VkDeviceAddress import;
+        std::uint64_t begin;
+        std::uint64_t end;
+        bool importCopy;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    };
+    struct ClothInPlace {
+        VkBuffer buffer;
+        VkDeviceSize offset;
+        VkDeviceAddress import;
+        std::uint64_t begin;
+        std::uint64_t end;
+    };
+    bool ClothFootprint(std::vector<ClothStaged>& staged, std::vector<ClothInPlace>& inPlace) const;
+    void ClothTakeCopyBacks();
+    static constexpr std::uint64_t ClothCopiesRefused = ~std::uint64_t{0};
+    static std::uint64_t TakeClothCopies();
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -531,6 +559,8 @@ private:
         std::size_t bytes;
         bool live;
     };
+    struct Region;
+    static bool clothRegionPlain(const Region& region, bool addressable);
     struct Region {
         std::uint64_t begin;
         std::uint64_t end;
@@ -576,6 +606,8 @@ private:
         // The import's device address (0 when it has none): APS5_STAGING_DIFF copy-backs store into it.
         VkDeviceAddress copySourceAddress = 0;
         bool copiedBack = false;
+        // This use's copy-in read the import itself (not a CPU snapshot or another GPU source).
+        bool importCopy = false;
         // APS5_STAGING_DIFF=1: a device-local copy of a staged shadow's bytes right after its copy-in,
         // so the copy-back stores only the dwords the work changed (RecordCopyBacks).
         std::shared_ptr<Buffer> pristine {};

@@ -115,6 +115,8 @@ bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<c
 bool AnyPendingCpuWrites(const Context& context);
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
 bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words);
+// Whether a module carries the S4 cloth checked overlap's claim notes (SpirvTarget::watchedReads).
+bool SpirvNotesClaims(std::span<const std::uint32_t> words);
 bool ShaderStoresThroughAddresses(const ShaderRecompiler::SharedSpirv& spirv);
 void LastRecordIndices(std::span<const void* const> logged, std::span<const void* const> objects, std::vector<std::size_t>& indices);
 
@@ -328,6 +330,14 @@ public:
     const void* MemoryOwner() const { return &guestMemory; }
     // Whether the build copies buffer regions on the GPU (staged shadows among them).
     bool HasGpuCopies() const { return guestMemory.HasGpuCopies(); }
+    // S4 cloth checked overlap (VulkanDevice.cpp ClothOverlap): see GuestBufferMemory::ClothFootprint; the guest buffer
+    // binding's elements as {view start, view bytes, written} (view start ~0: not guest memory); the copy-ins recorded
+    // again (the run their prelude joined closed before the dispatch); and MarkGpuWritesInRun for a checked member,
+    // whose copy-backs the run records.
+    bool ClothFootprint(std::vector<GuestBufferMemory::ClothStaged>& staged, std::vector<GuestBufferMemory::ClothInPlace>& inPlace) const { return guestMemory.ClothFootprint(staged, inPlace); }
+    std::vector<std::array<std::uint64_t, 3>> BufferElementViews() const;
+    void ClothCopiesAgain(Recorder& recorder) { guestMemory.RecordStagingCopies(recorder); }
+    void MarkGpuWritesChecked(Recorder& recorder, const std::shared_ptr<ShaderResources>& self);
     bool HasAddressOverlays() const { return guestMemory.HasOverlays(); }
     std::shared_ptr<const std::vector<ShaderRecompiler::BdaAbi::Range>> AddressTableRanges() const;
     struct DeferredTableView {
@@ -345,9 +355,6 @@ public:
     bool BdaReadOnly() const { return usesBda && bdaReadOnly; }
     bool UsesAddressTable() const { return usesBda; }
     BdaResources* Bda() const { return bda.get(); }
-    // S4 cloth watch (counter build): per element of the guest buffer binding, the guest address of the descriptor's
-    // first byte (~0: not guest memory).
-    std::vector<std::uint64_t> BufferElementBases() const;
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }
     bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.CopiedWritesOverlap(address, bytes); }

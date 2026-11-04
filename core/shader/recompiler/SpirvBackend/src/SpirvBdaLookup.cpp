@@ -282,57 +282,8 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
         }
         EmitIfCondition(state, hit, [&] { RecordBdaFaultReason(state, address, bytes, instruction, constant(static_cast<std::uint32_t>(BdaAbi::FaultReason::Watched))); });
     }
-    // SpirvTarget::watchedReads (S4 cloth overlap, counter build): the read's bytes [address, end) against the watch
-    // list the driver stored after the fault buffer's words (BdaAbi::WatchCountWord): each listed range of another member
-    // that the read reaches sets that member's bit in the watch mask. The read itself is unchanged.
-    if (state.watchedReads && (permission & BdaAbi::Read) != 0u && !rangeResult && state.faultBufferVariable != 0 && state.program.Info().usesDma) {
-        const auto faultWord = [&](std::uint32_t index) {
-            const auto value = state.module.AllocateId();
-            state.module.AddFunction(spv::OpLoad, u32, value, BdaWord(state, state.faultBufferVariable, index));
-            return value;
-        };
-        const auto faultAddress = [&](std::uint32_t index) {
-            const auto low = Unary(state, spv::OpUConvert, u64, faultWord(index));
-            const auto high = Unary(state, spv::OpUConvert, u64, faultWord(binary(spv::OpIAdd, u32, index, constant(1u))));
-            return binary(spv::OpBitwiseOr, u64, low, binary(spv::OpShiftLeftLogical, u64, high, BdaConstant(state, 32u)));
-        };
-        const auto count = faultWord(constant(BdaAbi::WatchCountWord));
-        const auto self = faultWord(constant(BdaAbi::WatchSelfWord));
-        const auto limit = Select(state, u32, binary(spv::OpULessThan, boolean, count, constant(BdaAbi::WatchMaxRanges)), count, constant(BdaAbi::WatchMaxRanges));
-        const auto watchHeader = state.module.AllocateId();
-        const auto watchBody = state.module.AllocateId();
-        const auto watchContinue = state.module.AllocateId();
-        const auto watchMerge = state.module.AllocateId();
-        const auto watchEntry = state.currentLabel;
-        const auto item = state.module.AllocateId();
-        const auto nextItem = state.module.AllocateId();
-        state.module.AddFunction(spv::OpBranch, watchHeader);
-        EmitLabel(state, watchHeader);
-        state.module.AddFunction(spv::OpPhi, u32, item, constant(0u), watchEntry, nextItem, watchContinue);
-        state.module.AddFunction(spv::OpLoopMerge, watchMerge, watchContinue, spv::LoopControlMaskNone);
-        state.module.AddFunction(spv::OpBranchConditional, binary(spv::OpULessThan, boolean, item, limit), watchBody, watchMerge);
-        EmitLabel(state, watchBody);
-        const auto at = binary(spv::OpIAdd, u32, constant(BdaAbi::WatchRangesWord), binary(spv::OpIMul, u32, item, constant(BdaAbi::WatchRangeWords)));
-        const auto watchBegin = faultAddress(at);
-        const auto watchEnd = faultAddress(binary(spv::OpIAdd, u32, at, constant(2u)));
-        const auto member = faultWord(binary(spv::OpIAdd, u32, at, constant(4u)));
-        auto hit = binary(spv::OpLogicalAnd, boolean, binary(spv::OpULessThan, boolean, address, watchEnd), binary(spv::OpUGreaterThan, boolean, end, watchBegin));
-        hit = binary(spv::OpLogicalAnd, boolean, hit, binary(spv::OpLogicalAnd, boolean, binary(spv::OpINotEqual, boolean, member, self), binary(spv::OpULessThan, boolean, member, constant(BdaAbi::WatchMaxMembers))));
-        EmitIfCondition(state, hit, [&] {
-            const auto maskWord = binary(spv::OpIAdd, u32, constant(BdaAbi::WatchMaskWord), binary(spv::OpShiftRightLogical, u32, member, constant(5u)));
-            const auto bit = binary(spv::OpShiftLeftLogical, u32, constant(1u), binary(spv::OpBitwiseAnd, u32, member, constant(31u)));
-            const auto seen = state.module.AllocateId();
-            state.module.AddFunction(spv::OpAtomicLoad, u32, seen, BdaWord(state, state.faultBufferVariable, maskWord), constant(spv::ScopeDevice), constant(spv::MemorySemanticsMaskNone));
-            EmitIfCondition(state, binary(spv::OpIEqual, boolean, binary(spv::OpBitwiseAnd, u32, seen, bit), constant(0u)), [&] {
-                state.module.AddFunction(spv::OpAtomicOr, u32, state.module.AllocateId(), BdaWord(state, state.faultBufferVariable, maskWord), constant(spv::ScopeDevice), constant(spv::MemorySemanticsMaskNone), bit);
-            });
-        });
-        state.module.AddFunction(spv::OpBranch, watchContinue);
-        EmitLabel(state, watchContinue);
-        state.module.AddFunction(spv::OpIAdd, u32, nextItem, item, constant(1u));
-        state.module.AddFunction(spv::OpBranch, watchHeader);
-        EmitLabel(state, watchMerge);
-    }
+    // SpirvTarget::watchedReads (S4 cloth checked overlap): the read's dwords go into the run's claim array.
+    if (state.claimReadFunction != 0u && (permission & BdaAbi::Read) != 0u && !rangeResult) state.module.AddFunction(spv::OpFunctionCall, state.module.Type(spv::OpTypeVoid), state.module.AllocateId(), state.claimReadFunction, address, bytes);
     if (rangeResult) {
         const auto last = binary(spv::OpUGreaterThanEqual, boolean, index, count);
         const auto next = BdaLoadAddress(state, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpIMul, u32, Select(state, u32, last, binary(spv::OpISub, u32, index, constant(1)), index), constant(8))));
@@ -429,138 +380,193 @@ static std::uint32_t DefineBdaNoteWrite(SpirvEmitterState& state) {
     return function;
 }
 
-// SpirvTarget::watchedReads (S4 cloth overlap, counter build): note_watch_access(element, dword index, write) puts a
-// bound buffer access into the member's footprint table (BdaAbi::WatchFootprintWord, a device address; 0: off). A read
-// is noted only when its dword lies in a listed range of another member (the run's declared writes); every write is.
-static std::uint32_t DefineWatchFootprint(SpirvEmitterState& state) {
-    const auto u32 = TypeU32(state);
-    const auto u64 = TypeScalarU64(state);
-    const auto boolean = TypeBool(state);
-    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
-    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
-    const auto voidType = state.module.Type(spv::OpTypeVoid);
-    const auto function = state.module.AllocateId();
-    state.module.AddName(function, "note_watch_access");
-    state.module.AddFunction(spv::OpFunction, voidType, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, voidType, u32, u32, u32));
-    const auto element = state.module.AllocateId();
-    const auto index = state.module.AllocateId();
-    const auto write = state.module.AllocateId();
-    state.module.AddFunction(spv::OpFunctionParameter, u32, element);
-    state.module.AddFunction(spv::OpFunctionParameter, u32, index);
-    state.module.AddFunction(spv::OpFunctionParameter, u32, write);
-    EmitLabel(state, state.module.AllocateId());
-    const auto wanted = state.module.AllocateId();
-    state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, boolean), wanted, spv::StorageClassFunction);
-    const auto done = state.module.AllocateId();
-    state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, boolean), done, spv::StorageClassFunction);
-    const auto counter = state.module.AllocateId();
-    state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, u32), counter, spv::StorageClassFunction);
-    const auto faultWord = [&](std::uint32_t at) {
+namespace {
+
+struct ClaimEmit {
+    SpirvEmitterState& state;
+    std::uint32_t u32 = TypeU32(state);
+    std::uint32_t u64 = TypeScalarU64(state);
+    std::uint32_t boolean = TypeBool(state);
+    std::uint32_t scope = ConstantU32(state, spv::ScopeDevice);
+    std::uint32_t relaxed = ConstantU32(state, spv::MemorySemanticsMaskNone);
+
+    std::uint32_t constant(std::uint32_t value) { return ConstantU32(state, value); }
+    std::uint32_t binary(std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); }
+    std::uint32_t both(std::uint32_t left, std::uint32_t right) { return binary(spv::OpLogicalAnd, boolean, left, right); }
+    std::uint32_t negate(std::uint32_t value) { return Unary(state, spv::OpLogicalNot, boolean, value); }
+    std::uint32_t widen(std::uint32_t value) { return Unary(state, spv::OpUConvert, u64, value); }
+    std::uint32_t faultWord(std::uint32_t at) {
         const auto value = state.module.AllocateId();
         state.module.AddFunction(spv::OpLoad, u32, value, BdaWord(state, state.faultBufferVariable, at));
         return value;
-    };
-    const auto faultAddress = [&](std::uint32_t at) {
-        const auto low = Unary(state, spv::OpUConvert, u64, faultWord(at));
-        const auto high = Unary(state, spv::OpUConvert, u64, faultWord(binary(spv::OpIAdd, u32, at, constant(1u))));
-        return binary(spv::OpBitwiseOr, u64, low, binary(spv::OpShiftLeftLogical, u64, high, BdaConstant(state, 32u)));
-    };
-    const auto table = faultAddress(constant(BdaAbi::WatchFootprintWord));
-    const auto isWrite = binary(spv::OpINotEqual, boolean, write, constant(0u));
-    state.module.AddFunction(spv::OpStore, wanted, isWrite);
-    const auto enabled = binary(spv::OpLogicalAnd, boolean, binary(spv::OpINotEqual, boolean, table, BdaConstant(state, 0u)), binary(spv::OpULessThan, boolean, element, constant(BdaAbi::WatchBufferElements)));
-    EmitIfCondition(state, binary(spv::OpLogicalAnd, boolean, enabled, Unary(state, spv::OpLogicalNot, boolean, isWrite)), [&] {
-        const auto base = faultAddress(binary(spv::OpIAdd, u32, constant(BdaAbi::WatchBasesWord), binary(spv::OpShiftLeftLogical, u32, element, constant(1u))));
-        const auto guest = binary(spv::OpIAdd, u64, base, binary(spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, index), BdaConstant(state, 2u)));
-        const auto guestEnd = binary(spv::OpIAdd, u64, guest, BdaConstant(state, 4u));
-        const auto count = faultWord(constant(BdaAbi::WatchCountWord));
-        const auto self = faultWord(constant(BdaAbi::WatchSelfWord));
-        const auto limit = Select(state, u32, binary(spv::OpULessThan, boolean, count, constant(BdaAbi::WatchMaxRanges)), count, constant(BdaAbi::WatchMaxRanges));
+    }
+    std::uint32_t faultAddress(std::uint32_t at) {
+        return binary(spv::OpBitwiseOr, u64, widen(faultWord(at)), binary(spv::OpShiftLeftLogical, u64, widen(faultWord(binary(spv::OpIAdd, u32, at, constant(1u)))), BdaConstant(state, 32u)));
+    }
+    std::uint32_t wordAt(std::uint32_t base, std::uint32_t word) {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, binary(spv::OpIAdd, u64, base, binary(spv::OpShiftLeftLogical, u64, widen(word), BdaConstant(state, 2u))));
+        return pointer;
+    }
+    std::uint32_t loadAt(std::uint32_t base, std::uint32_t word) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, value, wordAt(base, word), spv::MemoryAccessAlignedMask, 4u);
+        return value;
+    }
+    std::uint32_t loadAddressAt(std::uint32_t base, std::uint32_t word) {
+        return binary(spv::OpBitwiseOr, u64, widen(loadAt(base, word)), binary(spv::OpShiftLeftLogical, u64, widen(loadAt(base, binary(spv::OpIAdd, u32, word, constant(1u)))), BdaConstant(state, 32u)));
+    }
+    void conflict() {
+        state.module.AddFunction(spv::OpAtomicStore, wordAt(faultAddress(constant(BdaAbi::ClaimHeaderWord)), constant(BdaAbi::ClaimHeaderConflictWord)), scope, relaxed, constant(1u));
+    }
+    // One slot word (`reader` 0: the writer word, 1: the reader word): 0 becomes this member's id, another member's id
+    // becomes ClaimMulti.
+    void note(std::uint32_t array, std::uint32_t slot, std::uint32_t reader) {
+        const auto id = faultWord(constant(BdaAbi::ClaimMemberWord));
+        const auto pointer = wordAt(array, binary(spv::OpIAdd, u32, binary(spv::OpShiftLeftLogical, u32, slot, constant(1u)), reader));
+        const auto current = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAtomicLoad, u32, current, pointer, scope, relaxed);
+        const auto multi = constant(BdaAbi::ClaimMulti);
+        EmitIfCondition(state, both(binary(spv::OpINotEqual, boolean, current, id), binary(spv::OpINotEqual, boolean, current, multi)), [&] {
+            const auto empty = binary(spv::OpIEqual, boolean, current, constant(0u));
+            EmitIfCondition(state, empty, [&] {
+                const auto previous = state.module.AllocateId();
+                state.module.AddFunction(spv::OpAtomicCompareExchange, u32, previous, pointer, scope, relaxed, relaxed, id, constant(0u));
+                EmitIfCondition(state, both(binary(spv::OpINotEqual, boolean, previous, constant(0u)), binary(spv::OpINotEqual, boolean, previous, id)), [&] {
+                    state.module.AddFunction(spv::OpAtomicStore, pointer, scope, relaxed, multi);
+                });
+            });
+            EmitIfCondition(state, negate(empty), [&] { state.module.AddFunction(spv::OpAtomicStore, pointer, scope, relaxed, multi); });
+        });
+    }
+    template <typename TCondition, typename TBody>
+    void loop(TCondition&& condition, TBody&& body) {
         const auto header = state.module.AllocateId();
-        const auto body = state.module.AllocateId();
+        const auto block = state.module.AllocateId();
         const auto continuation = state.module.AllocateId();
         const auto merge = state.module.AllocateId();
-        const auto entry = state.currentLabel;
-        const auto item = state.module.AllocateId();
-        const auto nextItem = state.module.AllocateId();
         state.module.AddFunction(spv::OpBranch, header);
         EmitLabel(state, header);
-        state.module.AddFunction(spv::OpPhi, u32, item, constant(0u), entry, nextItem, continuation);
+        const auto going = condition();
         state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
-        state.module.AddFunction(spv::OpBranchConditional, binary(spv::OpULessThan, boolean, item, limit), body, merge);
-        EmitLabel(state, body);
-        const auto at = binary(spv::OpIAdd, u32, constant(BdaAbi::WatchRangesWord), binary(spv::OpIMul, u32, item, constant(BdaAbi::WatchRangeWords)));
-        const auto begin = faultAddress(at);
-        const auto end = faultAddress(binary(spv::OpIAdd, u32, at, constant(2u)));
-        const auto member = faultWord(binary(spv::OpIAdd, u32, at, constant(4u)));
-        auto hit = binary(spv::OpLogicalAnd, boolean, binary(spv::OpULessThan, boolean, guest, end), binary(spv::OpUGreaterThan, boolean, guestEnd, begin));
-        hit = binary(spv::OpLogicalAnd, boolean, hit, binary(spv::OpLogicalAnd, boolean, binary(spv::OpINotEqual, boolean, member, self), binary(spv::OpULessThan, boolean, member, constant(BdaAbi::WatchMaxMembers - 1u))));
-        EmitIfCondition(state, hit, [&] { state.module.AddFunction(spv::OpStore, wanted, ConstantBool(state, true)); });
+        state.module.AddFunction(spv::OpBranchConditional, going, block, merge);
+        EmitLabel(state, block);
+        body();
         state.module.AddFunction(spv::OpBranch, continuation);
         EmitLabel(state, continuation);
-        state.module.AddFunction(spv::OpIAdd, u32, nextItem, item, constant(1u));
         state.module.AddFunction(spv::OpBranch, header);
         EmitLabel(state, merge);
-    });
-    const auto want = state.module.AllocateId();
-    state.module.AddFunction(spv::OpLoad, boolean, want, wanted);
-    EmitIfCondition(state, binary(spv::OpLogicalAnd, boolean, enabled, want), [&] {
-        const auto key = binary(spv::OpIAdd, u32, binary(spv::OpBitwiseOr, u32, binary(spv::OpShiftLeftLogical, u32, element, constant(25u)), binary(spv::OpShiftRightLogical, u32, index, constant(5u))), constant(1u));
-        const auto bit = binary(spv::OpShiftLeftLogical, u32, constant(1u), binary(spv::OpBitwiseAnd, u32, index, constant(31u)));
-        const auto hash = binary(spv::OpShiftRightLogical, u32, binary(spv::OpIMul, u32, key, constant(0x9e3779b1u)), constant(32u - static_cast<std::uint32_t>(std::countr_zero(BdaAbi::WatchFootprintSlots))));
-        const auto scope = constant(spv::ScopeDevice);
-        const auto relaxed = constant(spv::MemorySemanticsMaskNone);
-        const auto pointerAt = [&](std::uint32_t slot, std::uint32_t word) {
-            const auto offset = binary(spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, binary(spv::OpIAdd, u32, binary(spv::OpIMul, u32, slot, constant(BdaAbi::WatchFootprintSlotWords)), word)), BdaConstant(state, 2u));
-            const auto pointer = state.module.AllocateId();
-            state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, binary(spv::OpIAdd, u64, table, offset));
-            return pointer;
-        };
-        state.module.AddFunction(spv::OpStore, done, ConstantBool(state, false));
-        state.module.AddFunction(spv::OpStore, counter, constant(0u));
-        const auto header = state.module.AllocateId();
-        const auto body = state.module.AllocateId();
-        const auto continuation = state.module.AllocateId();
-        const auto merge = state.module.AllocateId();
-        state.module.AddFunction(spv::OpBranch, header);
-        EmitLabel(state, header);
-        const auto probe = state.module.AllocateId();
-        state.module.AddFunction(spv::OpLoad, u32, probe, counter);
-        const auto found = state.module.AllocateId();
-        state.module.AddFunction(spv::OpLoad, boolean, found, done);
-        const auto searching = binary(spv::OpLogicalAnd, boolean, Unary(state, spv::OpLogicalNot, boolean, found), binary(spv::OpULessThan, boolean, probe, constant(BdaAbi::WatchFootprintProbes)));
-        state.module.AddFunction(spv::OpLoopMerge, merge, continuation, spv::LoopControlMaskNone);
-        state.module.AddFunction(spv::OpBranchConditional, searching, body, merge);
-        EmitLabel(state, body);
-        const auto slot = binary(spv::OpBitwiseAnd, u32, binary(spv::OpIAdd, u32, hash, probe), constant(BdaAbi::WatchFootprintSlots - 1u));
-        const auto current = state.module.AllocateId();
-        state.module.AddFunction(spv::OpAtomicLoad, u32, current, pointerAt(slot, constant(0u)), scope, relaxed);
-        const auto same = binary(spv::OpIEqual, boolean, current, key);
-        state.module.AddFunction(spv::OpStore, done, same);
-        EmitIfCondition(state, binary(spv::OpIEqual, boolean, current, constant(0u)), [&] {
-            const auto previous = state.module.AllocateId();
-            state.module.AddFunction(spv::OpAtomicCompareExchange, u32, previous, pointerAt(slot, constant(0u)), scope, relaxed, relaxed, key, constant(0u));
-            state.module.AddFunction(spv::OpStore, done, binary(spv::OpLogicalOr, boolean, binary(spv::OpIEqual, boolean, previous, constant(0u)), binary(spv::OpIEqual, boolean, previous, key)));
-        });
-        const auto holds = state.module.AllocateId();
-        state.module.AddFunction(spv::OpLoad, boolean, holds, done);
-        EmitIfCondition(state, holds, [&] {
-            const auto maskPointer = pointerAt(slot, Select(state, u32, isWrite, constant(2u), constant(1u)));
-            const auto mask = state.module.AllocateId();
-            state.module.AddFunction(spv::OpAtomicLoad, u32, mask, maskPointer, scope, relaxed);
-            EmitIfCondition(state, binary(spv::OpIEqual, boolean, binary(spv::OpBitwiseAnd, u32, mask, bit), constant(0u)), [&] {
-                state.module.AddFunction(spv::OpAtomicOr, u32, state.module.AllocateId(), pointerAt(slot, Select(state, u32, isWrite, constant(2u), constant(1u))), scope, relaxed, bit);
+    }
+};
+
+}
+
+// SpirvTarget::watchedReads (S4 cloth checked overlap): note_claim_access(element, dword index, write) notes a bound
+// buffer access in the checked run's claim array (BdaAbi::ClaimArrayWord; 0: not in a checked run). An element
+// outside the claim space (ClaimNone) is not noted; one the words cannot place sets the run's conflict word.
+static std::uint32_t DefineClaimAccess(SpirvEmitterState& state) {
+    ClaimEmit e{state};
+    const auto voidType = state.module.Type(spv::OpTypeVoid);
+    const auto function = state.module.AllocateId();
+    state.module.AddName(function, "note_claim_access");
+    state.module.AddFunction(spv::OpFunction, voidType, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, voidType, e.u32, e.u32, e.u32));
+    const auto element = state.module.AllocateId();
+    const auto index = state.module.AllocateId();
+    const auto write = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionParameter, e.u32, element);
+    state.module.AddFunction(spv::OpFunctionParameter, e.u32, index);
+    state.module.AddFunction(spv::OpFunctionParameter, e.u32, write);
+    EmitLabel(state, state.module.AllocateId());
+    const auto array = e.faultAddress(e.constant(BdaAbi::ClaimArrayWord));
+    EmitIfCondition(state, e.binary(spv::OpINotEqual, e.boolean, array, BdaConstant(state, 0u)), [&] {
+        const auto placed = e.binary(spv::OpULessThan, e.boolean, element, e.constant(BdaAbi::ClaimElements));
+        EmitIfCondition(state, e.negate(placed), [&] { e.conflict(); });
+        EmitIfCondition(state, placed, [&] {
+            const auto base = e.faultWord(e.binary(spv::OpIAdd, e.u32, e.constant(BdaAbi::ClaimBasesWord), element));
+            EmitIfCondition(state, e.binary(spv::OpINotEqual, e.boolean, base, e.constant(BdaAbi::ClaimNone)), [&] {
+                const auto slot = e.binary(spv::OpIAdd, e.u32, base, index);
+                const auto inside = e.both(e.binary(spv::OpULessThan, e.boolean, slot, e.faultWord(e.constant(BdaAbi::ClaimSlotsWord))), e.binary(spv::OpUGreaterThanEqual, e.boolean, slot, base));
+                EmitIfCondition(state, e.negate(inside), [&] { e.conflict(); });
+                EmitIfCondition(state, inside, [&] { e.note(array, slot, Select(state, e.u32, e.binary(spv::OpINotEqual, e.boolean, write, e.constant(0u)), e.constant(0u), e.constant(1u))); });
             });
         });
-        state.module.AddFunction(spv::OpBranch, continuation);
-        EmitLabel(state, continuation);
-        state.module.AddFunction(spv::OpStore, counter, binary(spv::OpIAdd, u32, probe, constant(1u)));
-        state.module.AddFunction(spv::OpBranch, header);
-        EmitLabel(state, merge);
-        const auto noted = state.module.AllocateId();
-        state.module.AddFunction(spv::OpLoad, boolean, noted, done);
-        EmitIfCondition(state, Unary(state, spv::OpLogicalNot, boolean, noted), [&] {
-            state.module.AddFunction(spv::OpAtomicStore, BdaWord(state, state.faultBufferVariable, constant(BdaAbi::WatchFootprintOverflowWord)), scope, relaxed, constant(1u));
+    });
+    state.module.AddFunction(spv::OpReturn);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    return function;
+}
+
+// SpirvTarget::watchedReads: note_claim_read(address, bytes) notes every dword of a BDA read [address, address + bytes)
+// that lies in an interval of the claim space (binary search over the claim header's intervals). A read over more
+// than ClaimMaxReadDwords dwords sets the run's conflict word.
+static std::uint32_t DefineClaimRead(SpirvEmitterState& state) {
+    ClaimEmit e{state};
+    const auto voidType = state.module.Type(spv::OpTypeVoid);
+    const auto function = state.module.AllocateId();
+    state.module.AddName(function, "note_claim_read");
+    state.module.AddFunction(spv::OpFunction, voidType, function, spv::FunctionControlDontInlineMask, state.module.Type(spv::OpTypeFunction, voidType, e.u64, e.u32));
+    const auto address = state.module.AllocateId();
+    const auto bytes = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionParameter, e.u64, address);
+    state.module.AddFunction(spv::OpFunctionParameter, e.u32, bytes);
+    EmitLabel(state, state.module.AllocateId());
+    const auto dwordVariable = state.module.AllocateId();
+    state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, e.u64), dwordVariable, spv::StorageClassFunction);
+    const auto lowVariable = state.module.AllocateId();
+    state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, e.u32), lowVariable, spv::StorageClassFunction);
+    const auto highVariable = state.module.AllocateId();
+    state.module.AddFunction(spv::OpVariable, TypePointer(state, spv::StorageClassFunction, e.u32), highVariable, spv::StorageClassFunction);
+    const auto array = e.faultAddress(e.constant(BdaAbi::ClaimArrayWord));
+    const auto enabled = e.both(e.binary(spv::OpINotEqual, e.boolean, array, BdaConstant(state, 0u)), e.binary(spv::OpINotEqual, e.boolean, bytes, e.constant(0u)));
+    EmitIfCondition(state, enabled, [&] {
+        const auto first = e.binary(spv::OpShiftRightLogical, e.u64, address, BdaConstant(state, 2u));
+        const auto last = e.binary(spv::OpShiftRightLogical, e.u64, e.binary(spv::OpISub, e.u64, e.binary(spv::OpIAdd, e.u64, address, e.widen(bytes)), BdaConstant(state, 1u)), BdaConstant(state, 2u));
+        const auto wide = e.binary(spv::OpUGreaterThanEqual, e.boolean, e.binary(spv::OpISub, e.u64, last, first), BdaConstant(state, BdaAbi::ClaimMaxReadDwords));
+        EmitIfCondition(state, wide, [&] { e.conflict(); });
+        EmitIfCondition(state, e.negate(wide), [&] {
+            const auto header = e.faultAddress(e.constant(BdaAbi::ClaimHeaderWord));
+            const auto intervals = e.faultWord(e.constant(BdaAbi::ClaimIntervalsWord));
+            const auto entry = [&](std::uint32_t at, std::uint32_t word) {
+                return e.binary(spv::OpIAdd, e.u32, e.binary(spv::OpIAdd, e.u32, e.constant(BdaAbi::ClaimHeaderIntervalsWord), e.binary(spv::OpIMul, e.u32, at, e.constant(BdaAbi::ClaimIntervalWords))), e.constant(word));
+            };
+            state.module.AddFunction(spv::OpStore, dwordVariable, first);
+            e.loop([&] {
+                const auto dword = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLoad, e.u64, dword, dwordVariable);
+                return e.binary(spv::OpULessThanEqual, e.boolean, dword, last);
+            }, [&] {
+                const auto dword = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLoad, e.u64, dword, dwordVariable);
+                state.module.AddFunction(spv::OpStore, lowVariable, e.constant(0u));
+                state.module.AddFunction(spv::OpStore, highVariable, intervals);
+                e.loop([&] {
+                    const auto low = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpLoad, e.u32, low, lowVariable);
+                    const auto high = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpLoad, e.u32, high, highVariable);
+                    return e.binary(spv::OpULessThan, e.boolean, low, high);
+                }, [&] {
+                    const auto low = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpLoad, e.u32, low, lowVariable);
+                    const auto high = state.module.AllocateId();
+                    state.module.AddFunction(spv::OpLoad, e.u32, high, highVariable);
+                    const auto middle = e.binary(spv::OpIAdd, e.u32, low, e.binary(spv::OpShiftRightLogical, e.u32, e.binary(spv::OpISub, e.u32, high, low), e.constant(1u)));
+                    const auto before = e.binary(spv::OpULessThan, e.boolean, dword, e.loadAddressAt(header, entry(middle, 0u)));
+                    state.module.AddFunction(spv::OpStore, lowVariable, Select(state, e.u32, before, low, e.binary(spv::OpIAdd, e.u32, middle, e.constant(1u))));
+                    state.module.AddFunction(spv::OpStore, highVariable, Select(state, e.u32, before, middle, high));
+                });
+                const auto found = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLoad, e.u32, found, lowVariable);
+                EmitIfCondition(state, e.binary(spv::OpINotEqual, e.boolean, found, e.constant(0u)), [&] {
+                    const auto at = e.binary(spv::OpISub, e.u32, found, e.constant(1u));
+                    const auto begin = e.loadAddressAt(header, entry(at, 0u));
+                    EmitIfCondition(state, e.binary(spv::OpULessThan, e.boolean, dword, e.loadAddressAt(header, entry(at, 2u))), [&] {
+                        const auto slot = e.binary(spv::OpIAdd, e.u32, e.loadAt(header, entry(at, 4u)), Unary(state, spv::OpUConvert, e.u32, e.binary(spv::OpISub, e.u64, dword, begin)));
+                        e.note(array, slot, e.constant(1u));
+                    });
+                });
+                state.module.AddFunction(spv::OpStore, dwordVariable, e.binary(spv::OpIAdd, e.u64, dword, BdaConstant(state, 1u)));
+            });
         });
     });
     state.module.AddFunction(spv::OpReturn);
@@ -575,7 +581,10 @@ void DefineBdaAnchorFunction(SpirvEmitterState& state) {
 void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (state.faultBufferVariable != 0) DefineBdaFaultFunction(state);
     if (!state.program.Info().usesDma) return;
-    if (state.watchedReads && state.faultBufferVariable != 0) state.watchFootprintFunction = DefineWatchFootprint(state);
+    if (state.watchedReads && state.faultBufferVariable != 0) {
+        state.watchFootprintFunction = DefineClaimAccess(state);
+        state.claimReadFunction = DefineClaimRead(state);
+    }
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false);
     DefineBdaDwordReadFunctions(state);

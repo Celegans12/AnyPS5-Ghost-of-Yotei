@@ -363,8 +363,8 @@ struct SpirvTarget {
     // device page table, so the module binds no guest buffers; the buffer sites (bounded ranges) are still recorded.
     // Only together with newPathResolved.
     bool newPathRuntimeBuffers = false;
-    // S4 cloth overlap (counter build): every BDA read lookup tests its bytes against the watch list the driver writes
-    // into the fault buffer (BdaAbi::WatchCountWord) and ORs the hit members' bits into the watch mask. Old path only.
+    // S4 cloth checked overlap: every bound buffer access and BDA read of the module is noted in the checked run's claim
+    // array the driver names in the fault buffer (BdaAbi::ClaimArrayWord; zero: nothing is noted). Old path only.
     bool watchedReads = false;
     // Exact replays (APS5_EXACT_SERIAL_ALLOCATING, allocating programs): the console waves of one workgroup run one
     // after another in wave order, so their returning atomics see the same order in every run. Compute only, and only

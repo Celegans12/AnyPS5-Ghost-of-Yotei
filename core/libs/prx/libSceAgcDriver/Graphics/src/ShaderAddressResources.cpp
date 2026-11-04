@@ -100,6 +100,31 @@ bool ShaderStoresThroughAddresses(const ShaderRecompiler::SharedSpirv& spirv) {
     return storesThroughAddressesCached(spirv);
 }
 
+namespace {
+
+std::unordered_set<std::uint32_t> ClaimNoteFunctions(std::span<const std::uint32_t> words) {
+    std::unordered_set<std::uint32_t> functions;
+    forEachInstruction(words, [&](std::uint32_t opcode, std::span<const std::uint32_t> instruction) {
+        if (opcode != spv::OpName || instruction.size() < 3) return;
+        std::string name;
+        for (std::size_t word = 2; word < instruction.size() && name.size() == (word - 2) * 4u; ++word) {
+            for (std::uint32_t byte = 0; byte < 4u; ++byte) {
+                const auto character = static_cast<char>((instruction[word] >> (byte * 8u)) & 0xffu);
+                if (character == '\0') break;
+                name += character;
+            }
+        }
+        if (name == "note_claim_access" || name == "note_claim_read") functions.insert(instruction[1]);
+    });
+    return functions;
+}
+
+}
+
+bool SpirvNotesClaims(std::span<const std::uint32_t> words) {
+    return !ClaimNoteFunctions(words).empty();
+}
+
 bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words) {
     if (words.size() < 5 || words[0] != spv::MagicNumber) return true;
     std::unordered_set<std::uint32_t> pointerTypes;
@@ -112,25 +137,13 @@ bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words) {
     forEachInstruction(words, [&](std::uint32_t opcode, std::span<const std::uint32_t> instruction) {
         if (instruction.size() > 2 && !definesNoPointerValue(opcode) && pointerTypes.contains(instruction[1])) pointers.insert(instruction[2]);
     });
-    // S4 cloth watch (counter build): the footprint table's stores (note_watch_access, SpirvTarget::watchedReads) are
-    // the driver's own bookkeeping, not guest stores through an address.
-    std::uint32_t footprintFunction = 0;
-    forEachInstruction(words, [&](std::uint32_t opcode, std::span<const std::uint32_t> instruction) {
-        if (opcode != spv::OpName || instruction.size() < 3) return;
-        std::string name;
-        for (std::size_t word = 2; word < instruction.size(); ++word) {
-            for (std::uint32_t byte = 0; byte < 4u; ++byte) {
-                const auto character = static_cast<char>((instruction[word] >> (byte * 8u)) & 0xffu);
-                if (character == '\0') break;
-                name += character;
-            }
-        }
-        if (name == "note_watch_access") footprintFunction = instruction[1];
-    });
+    // S4 cloth checked overlap: the claim array's stores (note_claim_*, SpirvTarget::watchedReads) are the driver's
+    // own bookkeeping, not guest stores through an address.
+    const auto claimFunctions = ClaimNoteFunctions(words);
     bool stores = false;
     bool inFootprint = false;
     forEachInstruction(words, [&](std::uint32_t opcode, std::span<const std::uint32_t> instruction) {
-        if (opcode == spv::OpFunction && instruction.size() > 2) inFootprint = footprintFunction != 0 && instruction[2] == footprintFunction;
+        if (opcode == spv::OpFunction && instruction.size() > 2) inFootprint = claimFunctions.contains(instruction[2]);
         if (inFootprint) return;
         const auto pointer = pointerOperandStored(opcode, instruction);
         const bool extendedWithPointer = opcode == spv::OpExtInst && std::any_of(instruction.begin() + static_cast<std::ptrdiff_t>(std::min<std::size_t>(5u, instruction.size())), instruction.end(), [&](std::uint32_t operand) { return pointers.contains(operand); });

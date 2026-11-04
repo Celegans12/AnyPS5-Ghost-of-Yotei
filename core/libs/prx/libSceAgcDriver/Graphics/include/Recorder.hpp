@@ -158,8 +158,8 @@ public:
     // data refresh would overwrite words an earlier dispatch of the run may still read).
     // `accesses`: the dispatch's guest ranges as GuestBufferMemory::RunAccesses gives them (see
     // RunAtomicConflict).
-    VkCommandBuffer OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped, std::span<const std::array<std::uint64_t, 3>> accesses = {});
-    void DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners);
+    VkCommandBuffer OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped, std::span<const std::array<std::uint64_t, 3>> accesses = {}, bool checked = false);
+    void DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners, bool checked = false);
     struct OverlapStatistics {
         std::uint64_t deferred, overlapped;
     };
@@ -195,10 +195,20 @@ public:
     // the deferred barrier, wherever that is recorded. Only while a run is open.
     void AfterRun(std::function<void(Recorder&)> work);
     bool RunOpen() const { return open != nullptr && open->deferredDispatchQueue != 0; }
-    // S4 cloth watch (counter build): the calling thread's lane's open batch (0: none; never reused), and the queue key
-    // of its open dispatch run (0: none).
-    std::uint64_t OpenBatchIdentity() const { return open != nullptr ? open->identity : 0u; }
-    std::uint32_t OpenRunQueue() const { return open != nullptr ? open->deferredDispatchQueue : 0u; }
+    // S4 cloth checked overlap (APS5_CLOTH_OVERLAP, see VulkanDevice.cpp ClothOverlap): a checked run is a dispatch run
+    // whose members joined without the range checks above; the GPU checks their accesses instead. A run is checked or
+    // not from its first dispatch on, and only dispatches of the same kind join it. SetCheckedDispatch marks the calling
+    // thread's next dispatch (its copy-ins included) as a checked candidate, until cleared. CheckedRun: the serial of the
+    // open checked run of `queueKey` (0: none). BeforeRunSeal: work recorded when the open run closes, before its prelude
+    // ends (PreludeCommands is still open then); only while a run is open.
+    static void SetCheckedDispatch(bool checked);
+    static bool CheckedDispatch();
+    std::uint64_t CheckedRun(std::uint32_t queueKey) const { return open != nullptr && open->checkedRun && open->deferredDispatchQueue == queueKey && queueKey != 0 ? open->runSerial : 0u; }
+    bool PreludeArmed() const { return open != nullptr && open->prelude.armed; }
+    void BeforeRunSeal(std::function<void(Recorder&)> work);
+    // The cloth checked overlap's kernels (Graphics/shaders/ClothOverlap.comp; `mode` as there), recorded into
+    // `commands` in chunks the device's group count limit allows. False when the pipeline cannot be made.
+    bool RecordClothKernel(VkCommandBuffer commands, std::uint32_t mode, VkDeviceAddress source, VkDeviceAddress target, VkDeviceAddress claims, VkDeviceAddress header, std::uint32_t count, std::uint32_t first, std::uint32_t member);
     // Batched staging (APS5_NO_BATCHED_STAGING=1 turns it off; an APS5_AB switch). NVIDIA drains the
     // GPU at every transfer and barrier recorded between two dispatches, so the staged copy-ins of
     // the dispatches that join a run go to a prelude command buffer submitted ahead of the run
@@ -985,8 +995,11 @@ private:
         // See DeferDispatchBarrier: the guest queue key of the dispatch whose trailing barrier is
         // still owed (0: none).
         std::uint32_t deferredDispatchQueue = 0;
-        // A number no other batch of this process had (OpenBatchIdentity).
-        std::uint64_t identity = 0;
+        // See CheckedRun: whether the open run is checked, and its serial (one per run of this process).
+        bool checkedRun = false;
+        std::uint64_t runSerial = 0;
+        // See BeforeRunSeal.
+        std::vector<std::function<void(Recorder&)>> beforeSeal;
         // The resources objects of the dispatches of the open run (see OverlapCommands).
         std::vector<const void*> deferredRun;
         // See AfterRun.
@@ -1101,6 +1114,9 @@ private:
     int stagingDiffState = 0;
     VkPipelineLayout stagingDiffLayout = VK_NULL_HANDLE;
     VkPipeline stagingDiffPipeline = VK_NULL_HANDLE;
+    int clothState = 0;
+    VkPipelineLayout clothLayout = VK_NULL_HANDLE;
+    VkPipeline clothPipeline = VK_NULL_HANDLE;
     std::unique_ptr<Buffer> stagingDiffCounter;
     std::uint64_t stagingDiffStored = 0;
     std::uint32_t stagingDiffSeen = 0;

@@ -1,0 +1,52 @@
+#version 450
+#extension GL_EXT_buffer_reference : require
+#extension GL_EXT_shader_explicit_arithmetic_types_int64 : require
+#extension GL_KHR_shader_subgroup_basic : require
+#extension GL_KHR_shader_subgroup_vote : require
+
+// The S4 cloth checked overlap's kernels (Recorder::RecordClothKernel). `header` is the run's claim header, whose
+// word 0 is the conflict word (set by the claim notes, or by mode 0 below). Modes:
+//   0: check: slot `index` of the claim array `claims` ({writer, reader} per slot) conflicts when two members wrote it
+//      (writer is ClaimMulti) or a member other than its writer read it; `count` slots; `member` != 0 forces a conflict.
+//   1: arm: `count` indirect dispatch triples in `target` take the triples in `source` when the run conflicts, else 0.
+//   2: copy `count` dwords from `source` to `target` when the run conflicts (the redo's restores, copy-ins, copy-backs).
+//   3: copy `count` dwords from `source` to `target` when the run is clean, each only where the claim slot
+//      `first + index` of `claims` names `member` (a member index + 1) as its writer (the clean run's copy-backs).
+layout(local_size_x = 64) in;
+layout(buffer_reference, std430, buffer_reference_align = 4) buffer Words { uint words[]; };
+layout(push_constant) uniform Parameters {
+    Words source;
+    Words target;
+    Words claims;
+    Words header;
+    uint count;
+    uint first;
+    uint member;
+    uint mode;
+} parameters;
+
+const uint ClaimMulti = 0xffffffffu;
+
+void main() {
+    uint index = gl_GlobalInvocationID.x;
+    if (parameters.mode == 0u) {
+        bool conflict = false;
+        if (index < parameters.count) {
+            uint writer = parameters.claims.words[2u * index];
+            uint reader = parameters.claims.words[2u * index + 1u];
+            conflict = writer == ClaimMulti || (writer != 0u && reader != 0u && reader != writer);
+        }
+        if (index == 0u && parameters.member != 0u) conflict = true;
+        if (subgroupAny(conflict) && subgroupElect()) atomicOr(parameters.header.words[0], 1u);
+        return;
+    }
+    if (index >= parameters.count) return;
+    bool conflicted = parameters.header.words[0] != 0u;
+    if (parameters.mode == 1u) {
+        parameters.target.words[index] = conflicted ? parameters.source.words[index] : 0u;
+    } else if (parameters.mode == 2u) {
+        if (conflicted) parameters.target.words[index] = parameters.source.words[index];
+    } else if (parameters.mode == 3u) {
+        if (!conflicted && parameters.claims.words[2u * (parameters.first + index)] == parameters.member) parameters.target.words[index] = parameters.source.words[index];
+    }
+}

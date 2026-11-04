@@ -116,6 +116,19 @@ add_custom_command(
         VERBATIM
 )
 
+set(agcClothOverlapShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/ClothOverlap.comp)
+set(agcClothOverlapShaderSpv ${agcTextureDetileGeneratedDir}/ClothOverlap.spv)
+set(agcClothOverlapShaderHeader ${agcTextureDetileGeneratedDir}/ClothOverlap_spv.h)
+add_custom_command(
+        OUTPUT "${agcClothOverlapShaderHeader}"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcClothOverlapShaderSpv}" "${agcClothOverlapShaderSource}"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcClothOverlapShaderSpv} -DOUTPUT=${agcClothOverlapShaderHeader}
+        -DSYMBOL=CLOTH_OVERLAP_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        DEPENDS "${agcClothOverlapShaderSource}" glslang-standalone
+        VERBATIM
+)
+
 set(agcFmaProbeShaderSource ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/FmaProbe.comp)
 set(agcFmaProbeShaderSpv ${agcTextureDetileGeneratedDir}/FmaProbe.spv)
 set(agcFmaProbeShaderHeader ${agcTextureDetileGeneratedDir}/FmaProbe_spv.h)
@@ -453,6 +466,7 @@ set(agcDriverSources
         ${agcExpandSingleShaderHeader}
         ${agcMeshArgumentsShaderHeader}
         ${agcStagingDiffShaderHeader}
+        ${agcClothOverlapShaderHeader}
         ${agcFmaProbeShaderHeader}
         ${agcTextureDetileImageShaderHeader}
         ${agcTextureRepackShaderHeader}
@@ -2625,6 +2639,14 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_address_passes_draw_transitions PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    foreach(agcClothOverlapMode IN ITEMS off force conflict)
+        add_test(NAME agc_driver_cloth_overlap_${agcClothOverlapMode} COMMAND agc_driver_cloth_overlap_tests ${agcClothOverlapMode})
+        set_tests_properties(agc_driver_cloth_overlap_${agcClothOverlapMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+        if(WIN32)
+            set_tests_properties(agc_driver_cloth_overlap_${agcClothOverlapMode} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     set_target_properties(agc_driver_rcp_hardware_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_driver_rcp_hardware_exact COMMAND agc_driver_rcp_hardware_tests)
     set_tests_properties(agc_driver_rcp_hardware_exact PROPERTIES ENVIRONMENT "APS5_EXACT_RCP=1;ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 60)

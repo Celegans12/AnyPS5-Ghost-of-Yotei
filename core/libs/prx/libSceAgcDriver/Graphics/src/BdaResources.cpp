@@ -202,8 +202,7 @@ BdaResources::BdaResources(const Context& context) : textureService(context.text
     const auto faultStart = bdaBuildProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::WatchFaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
-    std::memset(fault->Bytes().data() + ShaderRecompiler::BdaAbi::SrtGuardWord * sizeof(std::uint32_t), 0, (ShaderRecompiler::BdaAbi::WatchRangesWord - ShaderRecompiler::BdaAbi::SrtGuardWord) * sizeof(std::uint32_t));
-    std::memset(fault->Bytes().data() + ShaderRecompiler::BdaAbi::WatchFootprintWord * sizeof(std::uint32_t), 0, (ShaderRecompiler::BdaAbi::WatchBasesWord - ShaderRecompiler::BdaAbi::WatchFootprintWord) * sizeof(std::uint32_t));
+    std::memset(fault->Bytes().data() + ShaderRecompiler::BdaAbi::SrtGuardWord * sizeof(std::uint32_t), 0, ShaderRecompiler::BdaAbi::WatchFaultBufferBytes - ShaderRecompiler::BdaAbi::SrtGuardWord * sizeof(std::uint32_t));
     if (bdaBuildProfiled()) {
         bdaBuildTimes().faults.fetch_add(1, std::memory_order_relaxed);
         bdaBuildTimes().faultNs.fetch_add(nsSince(faultStart), std::memory_order_relaxed);
@@ -420,14 +419,14 @@ void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
     Require(report.reason != ShaderRecompiler::BdaAbi::FaultReason::InvalidRectangle, "rect-list requires finite nondegenerate axis-aligned positions with equal positive W");
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::Watched) {
         watchHits.fetch_add(1u + report.otherFaults, std::memory_order_relaxed);
-        std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
+        std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::FaultBufferBytes);
         return;
     }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::LoopLimit) {
         // APS5_LOOP_GUARD: the shader left a loop that ran past the guard; the dispatch result is kept.
         loopGuardTripped.store(true, std::memory_order_relaxed);
         std::fprintf(stderr, "[gpu] loop guard: the loop exit at pc 0x%x of shader 0x%llx ran past %u evaluations\n", report.instruction, static_cast<unsigned long long>(report.address), report.bytes);
-        std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
+        std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::FaultBufferBytes);
         return;
     }
     if (report.reason == ShaderRecompiler::BdaAbi::FaultReason::UnnormalizedWrap) {

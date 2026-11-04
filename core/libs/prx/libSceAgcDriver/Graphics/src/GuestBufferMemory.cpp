@@ -6274,6 +6274,78 @@ void GuestBufferMemory::ReportGpuSources() {
     AgcDriver::ProfilePrint_nid_no_patch("[gpu-sourced] last 10 s (APS5_GPU_SOURCED_DRAW_BUFFERS %s, APS5_IMPORT_SOURCED_COPY_IN %s): draw buffers %llu bound GPU-side (%.0f KiB not compared or copied), %llu taken by the CPU path (%.0f KiB, copied or reused, see [draw-snapshots]; misses: %s); copy-ins %llu from a GPU source (%.0f KiB not memcpy'd), %llu CPU snapshots (%.0f KiB; misses: %s); sources registered %llu, refused %llu stored since the copy-in, %llu writer pending on the other lane at the copy-in, %llu after a same-lane writer (APS5_NO_GPU_SOURCE_AFTER_WRITER %s), %llu backing off; owned words armed %llu, refused %llu; cross-lane orders %llu; %zu live; verify %llu checked, %llu differing\n", RuntimeSwitches::Set(RuntimeSwitch::GpuSourcedDrawBuffers) ? "set" : "unset", RuntimeSwitches::Set(RuntimeSwitch::ImportSourcedCopyIn) ? "set" : "unset", delta[DrawGpu], kib(delta[DrawGpuBytes]), delta[DrawCopied], kib(delta[DrawCopiedBytes]), draws.c_str(), delta[CopyGpu], kib(delta[CopyGpuBytes]), delta[CopyCpu], kib(delta[CopyCpuBytes]), copies.c_str(), delta[Registered], delta[RefusedStored], delta[RefusedPending], delta[AfterWriter], RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourceAfterWriter) ? "set" : "unset", delta[BackingOff], delta[Armed], delta[ArmRefused], delta[CrossLane], GpuSourceEntries(), delta[Verified], delta[Differing]);
 }
 
+namespace {
+
+thread_local std::uint64_t clothCopies = 0;
+
+}
+
+bool GuestBufferMemory::clothRegionPlain(const Region& region, bool addressable) {
+    if (region.mirror != nullptr || region.sparse || region.resident || region.residencySlot != nullptr || region.copySourceAddress == 0) return false;
+    if (region.begin % 4u != 0 || region.end % 4u != 0 || region.copySourceBase % 4u != 0 || region.copySourceAddress % 4u != 0) return false;
+    if (region.buffer == nullptr) return addressable;
+    try {
+        return region.buffer->DeviceAddress() != 0;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+std::uint64_t GuestBufferMemory::TakeClothCopies() {
+    return std::exchange(clothCopies, 0);
+}
+
+bool GuestBufferMemory::ClothFootprint(std::vector<ClothStaged>& staged, std::vector<ClothInPlace>& inPlace) const {
+    staged.clear();
+    inPlace.clear();
+    if (!uploaded || committed) return false;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    {
+        auto sorted = writes;
+        std::sort(sorted.begin(), sorted.end());
+        for (const auto& range : sorted) {
+            if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+            else merged.push_back(range);
+        }
+    }
+    for (const auto& region : regions) {
+        if (region.end <= region.begin || !region.gpuCopy) continue;
+        if (region.buffer == nullptr || !clothRegionPlain(region, false)) return false;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+        for (const auto& [begin, end] : merged) {
+            const auto from = std::max(begin, region.begin);
+            const auto to = std::min(end, region.end);
+            if (from < to) written.emplace_back(from & ~std::uint64_t{3}, (to + 3u) & ~std::uint64_t{3});
+        }
+        staged.push_back({region.buffer->DeviceAddress(), region.copySourceAddress + (region.begin - region.copySourceBase), region.begin, region.end, region.importCopy, std::move(written)});
+    }
+    // Every written range lies in one region: a staged one of this build (listed above), or one served in place by an
+    // import (this build's own or the shared address space's).
+    for (const auto& [begin, end] : merged) {
+        const auto* region = owner(begin, end);
+        if (region == nullptr || begin < region->begin || end > region->end) return false;
+        const bool own = region >= regions.data() && region < regions.data() + regions.size();
+        if (region->gpuCopy) {
+            if (!own) return false;
+            continue;
+        }
+        if (region->direct == nullptr || region->mirror != nullptr || region->sparse || region->direct->address == 0) return false;
+        const auto from = begin & ~std::uint64_t{3};
+        const auto to = (end + 3u) & ~std::uint64_t{3};
+        if (from < region->direct->base - region->direct->lead || to > region->direct->base + region->direct->bytes) return false;
+        const auto offset = HostImportOffset(*region->direct, from);
+        if ((region->direct->address + offset) % 4u != 0) return false;
+        inPlace.push_back({region->direct->buffer, offset, region->direct->address + offset, from, to});
+    }
+    return true;
+}
+
+void GuestBufferMemory::ClothTakeCopyBacks() {
+    for (auto& region : regions) {
+        if (region.gpuCopy) region.copiedBack = true;
+    }
+}
+
 void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool addressable) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool capture = std::getenv("APS5_CAPTURE_GPU_COPIES") != nullptr;
@@ -6297,7 +6369,12 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     auto& runAccesses = ShaderRecompiler::ThreadOwned(runAccessesSlot);
     runAccesses.clear();
     if (recorder->RunOpen()) RunAccesses(runAccesses);
+    if (Recorder::CheckedDispatch() && !std::all_of(copies.begin(), copies.end(), [&](const Region* region) { return clothRegionPlain(*region, addressable); })) {
+        Recorder::SetCheckedDispatch(false);
+        clothCopies = ClothCopiesRefused;
+    }
     auto commands = Recorder::DispatchOverlapEnabled() && Recorder::StagedOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun, &covered, runAccesses) : recorder->Commands(&covered);
+    if (Recorder::CheckedDispatch()) clothCopies = inRun ? recorder->CheckedRun(Recorder::PeekUnorderedDispatch()) : 0u;
     // Batched staging (Recorder::SplitForRun): a joining dispatch's copies go to the run's prelude,
     // submitted ahead of the run's dispatches, whose barriers it records once for the whole run.
     // Not with the capture's read-backs or the hazard validator (both work per copy).
@@ -6412,7 +6489,9 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, address);
+        region->importCopy = copySource == region->copySource && copyOffset == region->begin - region->copySourceBase;
         if (region->resident && region->deviceLocal && expected.empty() && residentCurrent(region->begin, region->end, region->buffer)) {
+            region->importCopy = false;
             // The resident buffer already holds these bytes (see residentCurrent).
             copiedBytes -= bytes;
             recorder->Keep(region->buffer);

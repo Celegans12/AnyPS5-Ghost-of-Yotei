@@ -228,6 +228,11 @@ public:
         std::uint64_t checked, exact, moved, refused, filtered, rebuilt, kept, served;
     };
     static DispatchMoveCount DispatchMoveCounts();
+    // S4 cloth checked overlap (APS5_CLOTH_OVERLAP), cumulative: completed checked runs, their members, and the runs whose
+    // check found a conflict (or were forced) and were redone.
+    static std::array<std::uint64_t, 3> ClothOverlapCounts();
+    // The programs (by code address) recompiled with the claim notes; the cloth family by default (tests name their own).
+    static void SetClothFamily(std::span<const std::uint64_t> programs);
     void ResolveMemory(std::uint64_t address, std::size_t bytes, bool writable);
     void* Window() const;
     void Resize(std::uint32_t width, std::uint32_t height);

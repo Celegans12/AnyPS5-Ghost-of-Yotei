@@ -572,6 +572,8 @@ struct VulkanDevice::State {
     std::unique_ptr<Graphics::GpuColorTransfer> colorTransfer;
     std::shared_ptr<Graphics::BufferPool> bufferPool;
     std::unique_ptr<Graphics::Buffer> emptyBuffer;
+    // S4 cloth checked overlap: ClothOverlap::Arenas, made on first use.
+    std::shared_ptr<void> clothArenas;
     std::unique_ptr<Graphics::PlaceholderImages> placeholderImages;
     std::unique_ptr<Graphics::TextureCache> textureCache;
     std::unique_ptr<Graphics::PipelineCache> pipelineCache;
@@ -4088,23 +4090,24 @@ namespace {
 // atomics between the two host subgroups (H2-5) and hangs on a cross-lane exchange inside per-lane control
 // flow (docs/dev/debt/shader.md, spanned wave64), with no uniformity check yet. The recompiler also refuses
 // it for programs with returning atomics or GDS operations (OneLaneGroupsEligible).
-// APS5_CLOTH_WATCH=1 (the cloth family) or =<hex program address>[,...] (S4 cloth overlap, counter build): the
-// compute programs recompiled with SpirvTarget::watchedReads (in the cache key) and tracked by ClothWatch below.
-bool ClothWatchListed(std::uint64_t programAddress) {
-    static const auto programs = [] {
-        std::vector<std::uint64_t> list;
-        const char* text = std::getenv("APS5_CLOTH_WATCH");
-        if (text != nullptr && std::string_view(text) == "1") return std::vector<std::uint64_t>{0x80001c0d00ull, 0x80001abb00ull, 0x800018b800ull, 0x8000196500ull};
-        for (const char* cursor = text; cursor != nullptr && *cursor != '\0';) {
-            char* end = nullptr;
-            const auto value = std::strtoull(cursor, &end, 16);
-            if (end == cursor) break;
-            list.push_back(value);
-            cursor = *end == ',' ? end + 1 : end;
-        }
-        return list;
+// S4 cloth checked overlap (ClothOverlap below): the cloth family is recompiled with SpirvTarget::watchedReads (in the
+// cache key) when APS5_CLOTH_OVERLAP is in the start environment or named by APS5_AB, so both A/B arms run the same
+// modules; the RuntimeSwitch alone decides whether a dispatch joins a checked run.
+bool ClothOverlapModules() {
+    static const bool modules = [] {
+        if (std::getenv("APS5_CLOTH_OVERLAP") != nullptr) return true;
+        const char* plan = std::getenv("APS5_AB");
+        return plan != nullptr && std::string_view(plan).find("APS5_CLOTH_OVERLAP") != std::string_view::npos;
     }();
-    return std::find(programs.begin(), programs.end(), programAddress) != programs.end();
+    return modules;
+}
+
+std::mutex clothFamilyMutex;
+std::vector<std::uint64_t> clothFamily{0x80001c0d00ull, 0x80001abb00ull, 0x800018b800ull, 0x8000196500ull};
+
+bool ClothFamily(std::uint64_t programAddress) {
+    std::lock_guard lock(clothFamilyMutex);
+    return std::find(clothFamily.begin(), clothFamily.end(), programAddress) != clothFamily.end();
 }
 
 bool OneLaneListed(std::uint64_t programAddress) {
@@ -4128,7 +4131,7 @@ bool OneLaneListed(std::uint64_t programAddress) {
 ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t waveSize, std::uint64_t programAddress) const {
     auto target = ComputeTarget(waveSize);
     target.singleLaneGroups = OneLaneListed(programAddress);
-    target.watchedReads = ClothWatchListed(programAddress);
+    target.watchedReads = ClothOverlapModules() && ClothFamily(programAddress);
     return target;
 }
 
@@ -5701,401 +5704,509 @@ void VulkanDevice::decideIndirect(RecordedDispatch& record, IndirectOutcome& out
 
 namespace {
 
-// S4 cloth overlap, counter build (APS5_CLOTH_WATCH): the watched dispatches of one guest compute ring that are
-// recorded one after another into the same open batch of one lane, with no other dispatch of that ring between them,
-// form a candidate run (at most WatchMaxMembers, WatchMaxRanges written ranges). Each member's fault buffer holds the
-// run's bounded write ranges tagged with their member (BdaAbi::WatchCountWord on, rewritten as members join: the
-// batch is not submitted yet), so the module's every BDA read lookup sets the bit of each other member whose written
-// bytes it reads (SpirvTarget::watchedReads). Bound buffer accesses go into a per-member footprint table (written
-// dwords, and read dwords inside another member's listed range); once the run completed, the CPU intersects them:
-// read-write and write-write dwords shared by two members. The declared V# ranges are compared too, for reference.
-// Nothing is overlapped: the dispatches stay serial and their results are unchanged; once every
-// member completed, the run's conflict graph is printed ([cloth-watch]) with the splits a real run would make (the
-// title's ordering packets, other recorded work between two members). Positive control: every list starts with the
-// whole address space tagged member 63 (ControlMember; a run holds at most 63 members), so every member that reads
-// anything through a BDA lookup must come back with bit 63 set.
-namespace ClothWatch {
+// S4 cloth checked overlap (APS5_CLOTH_OVERLAP, a RuntimeSwitch; reports/2026-11-04-S4-cloth.md 1). Dispatches of an
+// instrumented module (SpirvTarget::watchedReads: the cloth family, see ClothOverlapModules) that the title leaves
+// unordered on one guest compute ring join one checked run without the CPU range checks: the members bind the same
+// output V#s and write disjoint dwords. Each member notes its bound and BDA accesses in the run's claim array (a
+// writer and a reader word per guest dword of the run's claim space). When the run closes, its prelude zero-fills the
+// claims and backs up the members' in-place written ranges; after the run's trailing barrier a check kernel sets the
+// run's conflict word when two members wrote a dword or a member read a dword another member wrote. A clean run
+// copies each staged member's own written dwords back (masked by the claims). A conflicting run restores the in-place
+// ranges and runs every member again in recording order, as today's serial path does (copy-ins from the imports,
+// the dispatch, whole copy-backs): the redo kernels test the conflict word and the redo dispatches are indirect with
+// group counts the arm kernel zeroes when the run is clean. APS5_CLOTH_OVERLAP_DIAG=force makes every run conflict,
+// =order lets members join across the title's ordering packets (the positive control); never in measured runs.
+namespace ClothOverlap {
 
-inline constexpr std::uint32_t ControlMember = 63;
+namespace Abi = ShaderRecompiler::BdaAbi;
+using Graphics::GuestBufferMemory;
+using Interval = std::pair<std::uint64_t, std::uint64_t>;
 
-using Range = std::pair<std::uint64_t, std::uint64_t>;
+struct Diagnostics {
+    bool force = false;
+    bool order = false;
+};
 
-bool Enabled() {
-    static const bool enabled = std::getenv("APS5_CLOTH_WATCH") != nullptr;
-    return enabled;
+const Diagnostics& Diag() {
+    static const Diagnostics diag = [] {
+        Diagnostics value;
+        const char* text = std::getenv("APS5_CLOTH_OVERLAP_DIAG");
+        const std::string_view flags = text != nullptr ? text : "";
+        value.force = flags.find("force") != std::string_view::npos;
+        value.order = flags.find("order") != std::string_view::npos;
+        return value;
+    }();
+    return diag;
 }
+
+bool Active() {
+    return ClothOverlapModules() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ClothOverlap) && !NewPath::Enabled();
+}
+
+bool NotesClaims(const ShaderRecompiler::RecompileResult& program) {
+    static std::mutex mutex;
+    static std::unordered_map<const void*, std::pair<const void*, bool>> known;
+    const auto words = program.spirv.Words();
+    std::lock_guard lock(mutex);
+    if (const auto found = known.find(&program); found != known.end() && found->second.first == words.data()) return found->second.second;
+    const bool notes = Graphics::SpirvNotesClaims(words);
+    if (known.size() > 4096u) known.clear();
+    known[&program] = {words.data(), notes};
+    return notes;
+}
+
+// A ring of blocks in one buffer, reused only after the batch that took a block completed: a stale reader of a
+// member's claim words (a later dispatch of the same build) can only add notes to a block, never reach freed memory.
+class Arena {
+public:
+    Arena(const Graphics::Context& context, std::size_t bytes, VkMemoryPropertyFlags properties) : size(bytes) {
+        buffer = std::make_unique<Graphics::Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT, properties);
+    }
+    std::optional<std::uint64_t> Take(std::uint64_t bytes, std::uint64_t serial) {
+        bytes = (bytes + 255u) & ~std::uint64_t{255};
+        std::lock_guard lock(mutex);
+        if (bytes > size) return std::nullopt;
+        std::uint64_t at = head;
+        if (!blocks.empty()) {
+            const auto tail = blocks.front().offset;
+            if (head >= tail) {
+                if (head + bytes > size) {
+                    if (bytes > tail) return std::nullopt;
+                    at = 0;
+                }
+            } else if (head + bytes > tail) {
+                return std::nullopt;
+            }
+        } else {
+            at = 0;
+        }
+        blocks.push_back({at, bytes, serial, false});
+        head = at + bytes;
+        return at;
+    }
+    void Release(std::uint64_t serial) {
+        std::lock_guard lock(mutex);
+        for (auto& block : blocks) {
+            if (block.serial == serial) block.freed = true;
+        }
+        while (!blocks.empty() && blocks.front().freed) blocks.pop_front();
+        if (blocks.empty()) head = 0;
+    }
+    VkDeviceAddress Address(std::uint64_t offset) const { return buffer->DeviceAddress() + offset; }
+    VkBuffer Handle() const { return buffer->Handle(); }
+    std::byte* Bytes(std::uint64_t offset) { return buffer->Bytes().data() + offset; }
+
+private:
+    struct Block {
+        std::uint64_t offset;
+        std::uint64_t bytes;
+        std::uint64_t serial;
+        bool freed;
+    };
+    std::unique_ptr<Graphics::Buffer> buffer;
+    std::uint64_t size;
+    std::uint64_t head = 0;
+    std::deque<Block> blocks;
+    std::mutex mutex;
+};
+
+struct Arenas {
+    std::unique_ptr<Arena> claims;
+    std::unique_ptr<Arena> headers;
+    bool failed = false;
+};
 
 struct Member {
     std::shared_ptr<Graphics::ShaderResources> resources;
-    std::shared_ptr<Graphics::Buffer> footprint;
+    Graphics::BdaResources* bda = nullptr;
     std::uint32_t* words = nullptr;
     std::uint64_t program = 0;
-    bool unordered = false;
-    bool clean = false;
-    bool copies = false;
-    std::vector<Range> writes;
-    std::vector<Range> reads;
-    std::vector<std::uint64_t> bases;
-    std::vector<std::uint64_t> readDwords;
-    std::vector<std::uint64_t> writeDwords;
-    std::uint64_t gpuMask = 0;
-    std::uint64_t cpuMask = 0;
-    std::uint64_t wawMask = 0;
-    std::uint64_t exactMask = 0;
-    std::uint64_t exactWawMask = 0;
-    bool overflow = false;
-    bool unmapped = false;
-    bool done = false;
-    bool tainted = false;
+    std::vector<std::array<std::uint64_t, 3>> views;
+    std::vector<GuestBufferMemory::ClothStaged> staged;
+    std::vector<GuestBufferMemory::ClothInPlace> inPlace;
+    VkPipeline pipeline = VK_NULL_HANDLE;
+    VkPipelineLayout layout = VK_NULL_HANDLE;
+    bool push = false;
+    std::array<std::byte, Graphics::ComputePushConstantBytes> pushBytes{};
+    std::array<std::uint32_t, 3> groups{};
+    bool forced = false;
 };
 
 struct Run {
-    std::uint64_t id = 0;
-    std::uint64_t batch = 0;
+    std::uint64_t serial = 0;
+    std::uint32_t queue = 0;
     int lane = 0;
-    std::uint32_t ring = 0;
     std::vector<Member> members;
-    std::vector<std::pair<Range, std::uint32_t>> ranges;
-    std::size_t completed = 0;
-    bool evaluated = false;
-};
-
-struct Split {
-    std::uint64_t runs = 0, conflicting = 0, members = 0, freeMembers = 0;
+    bool force = false;
+    std::vector<Interval> intervals;
+    std::vector<std::uint32_t> slotBases;
+    std::uint64_t slots = 0;
+    std::optional<std::uint64_t> claimBlock;
+    std::optional<std::uint64_t> headerBlock;
+    std::shared_ptr<Graphics::Buffer> fallbackHeader;
+    VkDeviceAddress header = 0;
+    std::uint32_t* headerWords = nullptr;
+    std::shared_ptr<Graphics::Buffer> backup;
+    std::vector<VkDeviceSize> backupOffsets;
+    std::shared_ptr<Graphics::Buffer> arguments;
+    std::shared_ptr<Graphics::Buffer> groups;
+    std::shared_ptr<Arenas> arenas;
 };
 
 struct Totals {
-    std::uint64_t watched = 0, runs = 0, singles = 0, members = 0, busy = 0, ineligible = 0, copies = 0, tainted = 0;
-    std::uint64_t gpuEdges = 0, raw = 0, war = 0, cpuEdges = 0, waw = 0;
-    std::uint64_t exactEdges = 0, exactRaw = 0, exactWar = 0, exactWaw = 0, overflow = 0, unmapped = 0, footprintWrites = 0, footprintReads = 0;
-    std::uint64_t controlMembers = 0, controlHits = 0;
-    Split declared, exact, exactUnordered, exactClean;
+    std::uint64_t runs = 0, members = 0, singles = 0, conflicts = 0, forced = 0, noClaims = 0, slots = 0, redoMembers = 0;
+    std::uint64_t refusedModule = 0, refusedResources = 0, refusedFootprint = 0, refusedBusy = 0, refusedCopies = 0, recopied = 0;
 };
 
 std::mutex mutex;
-std::array<std::shared_ptr<Run>, 2> open{};
-std::map<const void*, std::pair<std::shared_ptr<Run>, std::size_t>> pending;
 Totals totals;
-std::uint64_t nextRun = 0;
+std::map<std::pair<int, std::uint64_t>, std::shared_ptr<Run>> open;
+std::unordered_map<const Graphics::BdaResources*, std::uint32_t> busy;
+std::chrono::steady_clock::time_point lastReport{};
 
-bool Overlaps(const std::vector<Range>& left, const std::vector<Range>& right) {
-    for (const auto& [b0, e0] : left) {
-        for (const auto& [b1, e1] : right) {
-            if (b0 < e1 && b1 < e0) return true;
-        }
-    }
-    return false;
-}
-
-std::string Program(std::uint64_t program) {
-    char text[32];
-    std::snprintf(text, sizeof(text), "%llx", static_cast<unsigned long long>(program & 0xffffffffffull));
-    return text;
-}
-
-// Sub-runs split before every member whose join `keep` refuses; a sub-run of two or more members conflicts when a
-// member's `mask` names another member of it.
-void SplitRun(const Run& run, const std::function<bool(const Member&)>& keep, const std::function<std::uint64_t(const Member&)>& mask, Split& split) {
-    std::size_t first = 0;
-    const auto close = [&](std::size_t last) {
-        const auto count = last - first + 1u;
-        if (count < 2u) return;
-        std::uint64_t window = 0;
-        for (std::size_t index = first; index <= last; ++index) window |= std::uint64_t{1} << index;
-        bool conflict = false;
-        for (std::size_t index = first; index <= last; ++index) {
-            if ((mask(run.members[index]) & window) != 0u) conflict = true;
-        }
-        ++split.runs;
-        split.members += count;
-        if (conflict) ++split.conflicting;
-        else split.freeMembers += count;
-    };
-    for (std::size_t index = 1; index < run.members.size(); ++index) {
-        if (keep(run.members[index])) continue;
-        close(index - 1u);
-        first = index;
-    }
-    if (!run.members.empty()) close(run.members.size() - 1u);
-}
-
-std::string SplitText(const Split& split) {
-    char text[160];
-    std::snprintf(text, sizeof(text), "%llu sub-runs (%llu members), %llu conflicting, %llu conflict-free members", static_cast<unsigned long long>(split.runs), static_cast<unsigned long long>(split.members), static_cast<unsigned long long>(split.conflicting), static_cast<unsigned long long>(split.freeMembers));
-    return text;
-}
-
-// Under the mutex.
-void Evaluate(Run& run) {
-    if (run.evaluated) return;
-    run.evaluated = true;
-    const auto count = run.members.size();
-    for (auto& member : run.members) member.resources = nullptr;
-    if (count < 2u) {
-        ++totals.singles;
-        return;
-    }
-    ++totals.runs;
-    totals.members += count;
-    std::unordered_map<std::uint64_t, std::uint64_t> writers;
-    for (std::size_t index = 0; index < count; ++index) {
-        for (const auto dword : run.members[index].writeDwords) writers[dword] |= std::uint64_t{1} << index;
-    }
-    std::uint64_t exactWawDwords = 0;
-    for (const auto& [dword, mask] : writers) {
-        if (std::popcount(mask) < 2) continue;
-        ++exactWawDwords;
-        for (std::size_t index = 0; index < count; ++index) {
-            if ((mask >> index & 1u) != 0u) run.members[index].exactWawMask |= mask & ~(std::uint64_t{1} << index);
-        }
-    }
-    for (std::size_t index = 0; index < count; ++index) {
-        auto& member = run.members[index];
-        for (const auto dword : member.readDwords) {
-            if (const auto found = writers.find(dword); found != writers.end()) member.exactMask |= found->second & ~(std::uint64_t{1} << index);
-        }
-    }
-    std::uint64_t gpuEdges = 0, raw = 0, war = 0, cpuEdges = 0, waw = 0, exactRaw = 0, exactWar = 0, exactWaw = 0, tainted = 0, unordered = 0, clean = 0, copies = 0, overflow = 0, unmapped = 0;
-    std::map<std::uint64_t, int> programs;
-    std::string edges;
-    for (std::size_t reader = 0; reader < count; ++reader) {
-        const auto& member = run.members[reader];
-        ++programs[member.program];
-        if (member.tainted) ++tainted;
-        if (member.copies) ++copies;
-        if (member.overflow) ++overflow;
-        if (member.unmapped) ++unmapped;
-        if (reader > 0 && member.unordered) ++unordered;
-        if (reader > 0 && member.clean) ++clean;
-        for (std::size_t writer = 0; writer < count; ++writer) {
-            const auto bit = std::uint64_t{1} << writer;
-            if ((member.gpuMask & bit) != 0u) {
-                ++gpuEdges;
-                ++(writer < reader ? raw : war);
-            }
-            if ((member.exactMask & bit) != 0u) {
-                ++(writer < reader ? exactRaw : exactWar);
-                if (edges.size() < 160u) edges += " " + std::to_string(reader) + "<" + std::to_string(writer);
-            }
-            if ((member.cpuMask & bit) != 0u) ++cpuEdges;
-            if ((member.wawMask & bit) != 0u && writer < reader) ++waw;
-            if ((member.exactWawMask & bit) != 0u && writer < reader) ++exactWaw;
-        }
-    }
-    totals.gpuEdges += gpuEdges;
-    totals.raw += raw;
-    totals.war += war;
-    totals.cpuEdges += cpuEdges;
-    totals.waw += waw;
-    totals.exactEdges += exactRaw + exactWar;
-    totals.exactRaw += exactRaw;
-    totals.exactWar += exactWar;
-    totals.exactWaw += exactWaw;
-    totals.tainted += tainted;
-    totals.copies += copies;
-    totals.overflow += overflow;
-    totals.unmapped += unmapped;
-    const auto always = [](const Member&) { return true; };
-    const auto declaredMask = [](const Member& member) { return member.gpuMask | member.cpuMask | member.wawMask; };
-    // Exact: BDA reads against the others' declared writes (a superset of their writes), bound reads and writes against
-    // the others' written dwords; a member whose footprint is incomplete conflicts with every other member.
-    const auto exactMask = [](const Member& member) { return member.gpuMask | member.exactMask | member.exactWawMask | (member.overflow || member.unmapped || member.tainted ? ~std::uint64_t{0} : 0u); };
-    SplitRun(run, always, declaredMask, totals.declared);
-    SplitRun(run, always, exactMask, totals.exact);
-    SplitRun(run, [](const Member& member) { return member.unordered; }, exactMask, totals.exactUnordered);
-    SplitRun(run, [](const Member& member) { return member.unordered && member.clean; }, exactMask, totals.exactClean);
-    bool exactConflict = false;
-    for (const auto& member : run.members) exactConflict = exactConflict || exactMask(member) != 0u;
-    std::string mix;
-    for (const auto& [program, number] : programs) mix += (mix.empty() ? "" : ",") + Program(program) + "x" + std::to_string(number);
-    const std::string edgeText = edges.empty() ? std::string() : " [reader<writer:" + edges + "]";
-    std::fprintf(stderr, "[cloth-watch] run %llu lane %d ring 0x%x: %zu members (%s), joins unordered %llu clean %llu, staged %llu; exact conflict %s: BDA read edges %llu (RAW %llu WAR %llu), bound read edges %llu (RAW %llu WAR %llu)%s, WAW pairs %llu (%llu dwords); footprint overflow %llu unmapped %llu tainted %llu; declared V# ranges: read edges %llu, WAW pairs %llu\n", static_cast<unsigned long long>(run.id), run.lane, run.ring, count, mix.c_str(), static_cast<unsigned long long>(unordered), static_cast<unsigned long long>(clean), static_cast<unsigned long long>(copies), exactConflict ? "YES" : "no", static_cast<unsigned long long>(gpuEdges), static_cast<unsigned long long>(raw), static_cast<unsigned long long>(war), static_cast<unsigned long long>(exactRaw + exactWar), static_cast<unsigned long long>(exactRaw), static_cast<unsigned long long>(exactWar), edgeText.c_str(), static_cast<unsigned long long>(exactWaw), static_cast<unsigned long long>(exactWawDwords), static_cast<unsigned long long>(overflow), static_cast<unsigned long long>(unmapped), static_cast<unsigned long long>(tainted), static_cast<unsigned long long>(cpuEdges), static_cast<unsigned long long>(waw));
+void Report(bool force) {
+    const auto now = std::chrono::steady_clock::now();
+    if (!force && now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
     const auto& t = totals;
-    std::fprintf(stderr, "[cloth-watch] control: %llu of %llu completed members read through a BDA lookup (bit 63 set)\n", static_cast<unsigned long long>(t.controlHits), static_cast<unsigned long long>(t.controlMembers));
-    std::fprintf(stderr, "[cloth-watch] totals: %llu watched dispatches, %llu runs of >=2 (%llu members), singles %llu, busy %llu, ineligible %llu, staged %llu, tainted %llu; BDA read edges %llu (RAW %llu WAR %llu); bound footprint: %llu written and %llu watched-read dwords, read edges %llu (RAW %llu WAR %llu), WAW pairs %llu, overflow %llu, unmapped %llu; declared V# ranges: read edges %llu, WAW pairs %llu\n", static_cast<unsigned long long>(t.watched), static_cast<unsigned long long>(t.runs), static_cast<unsigned long long>(t.members), static_cast<unsigned long long>(t.singles), static_cast<unsigned long long>(t.busy), static_cast<unsigned long long>(t.ineligible), static_cast<unsigned long long>(t.copies), static_cast<unsigned long long>(t.tainted), static_cast<unsigned long long>(t.gpuEdges), static_cast<unsigned long long>(t.raw), static_cast<unsigned long long>(t.war), static_cast<unsigned long long>(t.footprintWrites), static_cast<unsigned long long>(t.footprintReads), static_cast<unsigned long long>(t.exactEdges), static_cast<unsigned long long>(t.exactRaw), static_cast<unsigned long long>(t.exactWar), static_cast<unsigned long long>(t.exactWaw), static_cast<unsigned long long>(t.overflow), static_cast<unsigned long long>(t.unmapped), static_cast<unsigned long long>(t.cpuEdges), static_cast<unsigned long long>(t.waw));
-    std::fprintf(stderr, "[cloth-watch] splits: declared ranges, whole runs: %s; exact, whole runs: %s; exact, split at title-ordered joins: %s; exact, split at ordered or unclean joins: %s\n", SplitText(t.declared).c_str(), SplitText(t.exact).c_str(), SplitText(t.exactUnordered).c_str(), SplitText(t.exactClean).c_str());
+    std::fprintf(stderr, "[cloth-overlap] (cumulative) checked runs %llu with %llu members (%.1f per run), single-member runs %llu; conflicts found %llu, forced %llu, runs without claims %llu, members redone %llu; claim slots %llu; refused: module %llu, resources %llu, footprint %llu, busy build %llu, copy-ins %llu; copy-ins recorded again %llu (APS5_CLOTH_OVERLAP_DIAG %s%s)\n", static_cast<unsigned long long>(t.runs), static_cast<unsigned long long>(t.members), t.runs != 0 ? static_cast<double>(t.members) / static_cast<double>(t.runs) : 0.0, static_cast<unsigned long long>(t.singles), static_cast<unsigned long long>(t.conflicts), static_cast<unsigned long long>(t.forced), static_cast<unsigned long long>(t.noClaims), static_cast<unsigned long long>(t.redoMembers), static_cast<unsigned long long>(t.slots), static_cast<unsigned long long>(t.refusedModule), static_cast<unsigned long long>(t.refusedResources), static_cast<unsigned long long>(t.refusedFootprint), static_cast<unsigned long long>(t.refusedBusy), static_cast<unsigned long long>(t.refusedCopies), static_cast<unsigned long long>(t.recopied), Diag().force ? "force" : "", Diag().order ? " order" : "");
 }
 
-// Under the mutex: the lane's open run takes no more members.
-void Close(int lane) {
-    auto run = std::exchange(open[static_cast<std::size_t>(lane)], nullptr);
-    if (run != nullptr && run->completed == run->members.size()) Evaluate(*run);
+void CountRefusal(std::uint64_t Totals::*field) {
+    std::lock_guard lock(mutex);
+    ++(totals.*field);
 }
 
-void WriteRanges(std::uint32_t* words, std::size_t from, const std::vector<std::pair<Range, std::uint32_t>>& ranges) {
-    namespace Abi = ShaderRecompiler::BdaAbi;
-    for (std::size_t index = from; index < ranges.size(); ++index) {
-        auto* entry = words + Abi::WatchRangesWord + index * Abi::WatchRangeWords;
-        const auto& [range, member] = ranges[index];
-        entry[0] = static_cast<std::uint32_t>(range.first);
-        entry[1] = static_cast<std::uint32_t>(range.first >> 32u);
-        entry[2] = static_cast<std::uint32_t>(range.second);
-        entry[3] = static_cast<std::uint32_t>(range.second >> 32u);
-        entry[4] = member;
-        entry[5] = 0u;
+// A member candidate, or nullopt (the dispatch then runs as today).
+std::optional<Member> Prepare(const RecordedDispatch& record, Graphics::ShaderResources& resources) {
+    if (!NotesClaims(*record.shader->program)) {
+        CountRefusal(&Totals::refusedModule);
+        return std::nullopt;
     }
-}
-
-// Under the mutex, once the member's dispatch completed: its footprint table as guest dwords.
-void ReadFootprint(Member& member) {
-    namespace Abi = ShaderRecompiler::BdaAbi;
-    member.overflow = member.words[Abi::WatchFootprintOverflowWord] != 0u;
-    member.words[Abi::WatchFootprintWord] = 0u;
-    member.words[Abi::WatchFootprintWord + 1] = 0u;
-    if (member.footprint == nullptr) return;
-    const auto* table = reinterpret_cast<const std::uint32_t*>(member.footprint->Bytes().data());
-    for (std::uint32_t slot = 0; slot < Abi::WatchFootprintSlots; ++slot) {
-        const auto* entry = table + slot * Abi::WatchFootprintSlotWords;
-        if (entry[0] == 0u) continue;
-        const auto key = entry[0] - 1u;
-        const auto element = key >> 25u;
-        const auto chunk = key & 0x1ffffffu;
-        if (element >= member.bases.size() || member.bases[element] == ~std::uint64_t{0}) {
-            member.unmapped = true;
-            continue;
-        }
-        for (std::uint32_t bit = 0; bit < 32u; ++bit) {
-            const auto dword = member.bases[element] + (static_cast<std::uint64_t>(chunk) * 32u + bit) * 4u;
-            if ((entry[1] >> bit & 1u) != 0u) member.readDwords.push_back(dword);
-            if ((entry[2] >> bit & 1u) != 0u) member.writeDwords.push_back(dword);
-        }
-    }
-    totals.footprintReads += member.readDwords.size();
-    totals.footprintWrites += member.writeDwords.size();
-    member.footprint = nullptr;
-}
-
-// A dispatch of a guest compute ring (`ring` = its queue key, 0: queue 0) recorded into the calling thread's lane's
-// open batch; `clean`: the ring's dispatch run was still open before this dispatch took its command buffer.
-void Note(const Graphics::Context& context, Graphics::Recorder& recorder, const std::shared_ptr<Graphics::ShaderResources>& resources, std::uint64_t program, bool watched, std::uint32_t ring, bool unordered, bool clean) {
-    namespace Abi = ShaderRecompiler::BdaAbi;
-    const int lane = Graphics::Recorder::ThreadLane() == 1 ? 1 : 0;
-    const auto batch = recorder.OpenBatchIdentity();
-    std::unique_lock lock(mutex);
-    auto& current = open[static_cast<std::size_t>(lane)];
-    if (!watched) {
-        if (current != nullptr && (current->ring == ring || current->batch != batch)) Close(lane);
-        return;
-    }
-    ++totals.watched;
-    auto* bda = resources != nullptr ? resources->Bda() : nullptr;
-    if (bda == nullptr || !resources->BdaReadOnly()) {
-        ++totals.ineligible;
-        Close(lane);
-        return;
-    }
-    if (const auto found = pending.find(bda); found != pending.end()) {
-        // The build's fault buffer still holds a list and a footprint table an earlier dispatch has not completed with:
-        // this dispatch reads that list and notes into that table too; the table lives until this batch completes.
-        ++totals.busy;
-        auto& earlier = found->second.first->members[found->second.second];
-        earlier.tainted = true;
-        auto footprint = earlier.footprint;
-        Close(lane);
-        lock.unlock();
-        if (footprint != nullptr) recorder.Keep(std::move(footprint));
-        return;
+    auto* bda = resources.Bda();
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::GpuSourcedDrawBuffers) || Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ImportSourcedCopyIn) || bda == nullptr || !resources.BdaReadOnly() || record.bindings != nullptr || record.shader->program->bindlessHeap || !resources.SampledTextures().empty() || !resources.StorageImages().empty() || record.threadGroup != std::array<std::uint32_t, 3>{} || std::any_of(record.shader->program->bindings.begin(), record.shader->program->bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::Gds; })) {
+        CountRefusal(&Totals::refusedResources);
+        return std::nullopt;
     }
     Member member;
-    member.resources = resources;
+    member.views = resources.BufferElementViews();
+    bool aligned = member.views.size() <= Abi::ClaimElements;
+    for (const auto& view : member.views) aligned = aligned && (view[0] == ~std::uint64_t{0} || view[0] % 4u == 0);
+    if (!aligned || !resources.ClothFootprint(member.staged, member.inPlace)) {
+        CountRefusal(&Totals::refusedFootprint);
+        return std::nullopt;
+    }
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = busy.find(bda); found != busy.end() && found->second != 0) {
+            ++totals.refusedBusy;
+            return std::nullopt;
+        }
+    }
+    member.bda = bda;
     member.words = bda->WatchWords();
-    member.program = program;
-    member.unordered = unordered;
-    member.clean = clean;
-    member.copies = resources->HasGpuCopies();
-    std::vector<std::array<std::uint64_t, 3>> accesses;
-    resources->RunAccesses(accesses);
-    for (const auto& access : accesses) {
-        if ((access[2] & Graphics::Recorder::RunAccessImage) != 0u) continue;
-        if (access[0] == 0u && access[1] == std::numeric_limits<std::uint64_t>::max()) continue;
-        ((access[2] & Graphics::Recorder::RunAccessWritten) != 0u ? member.writes : member.reads).emplace_back(access[0], access[1]);
+    member.program = record.programAddress;
+    member.groups = {record.x, record.y, record.z};
+    member.forced = Diag().force;
+    return member;
+}
+
+// Under the run's batch, from Recorder::BeforeRunSeal: the claim space, the claim and header blocks, the members'
+// claim words, and the prelude's zero fill and backups.
+void Seal(Graphics::Recorder& recorder, const Graphics::Context& context, Run& run) {
+    std::vector<Interval> written;
+    std::vector<Interval> touched;
+    for (const auto& member : run.members) {
+        for (const auto& view : member.views) {
+            if (view[0] == ~std::uint64_t{0} || view[1] == 0) continue;
+            const Interval range{view[0] / 4u, (view[0] + view[1] + 3u) / 4u};
+            touched.push_back(range);
+            if (view[2] != 0) written.push_back(range);
+        }
+        for (const auto& staged : member.staged) {
+            for (const auto& [begin, end] : staged.written) written.push_back({begin / 4u, end / 4u});
+        }
+        for (const auto& range : member.inPlace) written.push_back({range.begin / 4u, range.end / 4u});
+        run.force = run.force || member.forced;
     }
-    if (member.writes.size() > Abi::WatchMaxRanges - 1u) {
-        ++totals.ineligible;
-        Close(lane);
-        return;
+    const auto mergeRanges = [](std::vector<Interval> ranges) {
+        std::sort(ranges.begin(), ranges.end());
+        std::vector<Interval> merged;
+        for (const auto& range : ranges) {
+            if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+            else merged.push_back(range);
+        }
+        return merged;
+    };
+    // Every bound element that touches the claim space joins it whole, until none is left half inside.
+    auto space = mergeRanges(written);
+    for (bool grown = true; grown;) {
+        grown = false;
+        for (const auto& range : touched) {
+            const auto found = std::upper_bound(space.begin(), space.end(), Interval{range.first, ~std::uint64_t{0}});
+            const bool inside = found != space.begin() && std::prev(found)->first <= range.first && range.second <= std::prev(found)->second;
+            const bool overlaps = (found != space.begin() && std::prev(found)->second > range.first) || (found != space.end() && found->first < range.second);
+            if (inside || !overlaps) continue;
+            space.push_back(range);
+            space = mergeRanges(std::move(space));
+            grown = true;
+            break;
+        }
     }
-    const bool joins = current != nullptr && current->batch == batch && batch != 0 && current->ring == ring && ring != 0 && current->members.size() < ControlMember && current->ranges.size() + member.writes.size() <= Abi::WatchMaxRanges && std::none_of(current->members.begin(), current->members.end(), [&](const Member& other) { return other.words == member.words; });
-    if (!joins) {
-        Close(lane);
-        current = std::make_shared<Run>();
-        current->id = ++nextRun;
-        current->batch = batch;
-        current->lane = lane;
-        current->ring = ring;
-        current->ranges.push_back({{0u, std::numeric_limits<std::uint64_t>::max()}, ControlMember});
+    run.intervals = std::move(space);
+    run.slots = 0;
+    for (const auto& [first, end] : run.intervals) {
+        run.slotBases.push_back(static_cast<std::uint32_t>(run.slots));
+        run.slots += end - first;
     }
-    auto run = current;
-    const auto index = static_cast<std::uint32_t>(run->members.size());
-    static const bool dump = std::getenv("APS5_CLOTH_WATCH_DUMP") != nullptr;
-    if (dump) {
+    auto& arenas = *run.arenas;
+    const auto headerBytes = static_cast<std::uint64_t>(Abi::ClaimHeaderIntervalsWord + Abi::ClaimIntervalWords * run.intervals.size()) * 4u;
+    run.headerBlock = arenas.headers->Take(headerBytes, run.serial);
+    const bool claimable = run.headerBlock.has_value() && !run.intervals.empty() && run.slots < (std::uint64_t{1} << 31u);
+    if (claimable) run.claimBlock = arenas.claims->Take(run.slots * 8u, run.serial);
+    const bool claims = claimable && run.claimBlock.has_value();
+    if (!claims) run.force = true;
+    if (run.headerBlock.has_value()) {
+        run.header = arenas.headers->Address(*run.headerBlock);
+        run.headerWords = reinterpret_cast<std::uint32_t*>(arenas.headers->Bytes(*run.headerBlock));
+    } else {
+        run.fallbackHeader = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(headerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        recorder.Keep(run.fallbackHeader);
+        run.header = run.fallbackHeader->DeviceAddress();
+        run.headerWords = reinterpret_cast<std::uint32_t*>(run.fallbackHeader->Bytes().data());
+    }
+    {
+        auto* header = run.headerWords;
+        std::memset(header, 0, headerBytes);
+        header[Abi::ClaimHeaderConflictWord] = run.force ? 1u : 0u;
+        for (std::size_t index = 0; index < run.intervals.size(); ++index) {
+            auto* entry = header + Abi::ClaimHeaderIntervalsWord + index * Abi::ClaimIntervalWords;
+            entry[0] = static_cast<std::uint32_t>(run.intervals[index].first);
+            entry[1] = static_cast<std::uint32_t>(run.intervals[index].first >> 32u);
+            entry[2] = static_cast<std::uint32_t>(run.intervals[index].second);
+            entry[3] = static_cast<std::uint32_t>(run.intervals[index].second >> 32u);
+            entry[4] = run.slotBases[index];
+            entry[5] = 0u;
+        }
+    }
+    const auto slotOf = [&](std::uint64_t dword) -> std::uint32_t {
+        const auto found = std::upper_bound(run.intervals.begin(), run.intervals.end(), Interval{dword, ~std::uint64_t{0}});
+        if (found == run.intervals.begin()) return Abi::ClaimNone;
+        const auto at = static_cast<std::size_t>(std::prev(found) - run.intervals.begin());
+        if (dword >= run.intervals[at].second) return Abi::ClaimNone;
+        return run.slotBases[at] + static_cast<std::uint32_t>(dword - run.intervals[at].first);
+    };
+    for (std::size_t index = 0; index < run.members.size(); ++index) {
+        auto& member = run.members[index];
+        auto* words = member.words;
+        std::memset(words + Abi::ClaimArrayWord, 0, (Abi::ClaimBasesWord + Abi::ClaimElements - Abi::ClaimArrayWord) * sizeof(std::uint32_t));
+        if (!claims) continue;
+        const auto array = arenas.claims->Address(*run.claimBlock);
+        const auto header = run.header;
+        words[Abi::ClaimArrayWord] = static_cast<std::uint32_t>(array);
+        words[Abi::ClaimArrayWord + 1] = static_cast<std::uint32_t>(array >> 32u);
+        words[Abi::ClaimSlotsWord] = static_cast<std::uint32_t>(run.slots);
+        words[Abi::ClaimMemberWord] = static_cast<std::uint32_t>(index + 1u);
+        words[Abi::ClaimHeaderWord] = static_cast<std::uint32_t>(header);
+        words[Abi::ClaimHeaderWord + 1] = static_cast<std::uint32_t>(header >> 32u);
+        words[Abi::ClaimIntervalsWord] = static_cast<std::uint32_t>(run.intervals.size());
+        for (std::uint32_t element = 0; element < Abi::ClaimElements; ++element) {
+            std::uint32_t base = Abi::ClaimNone;
+            if (element < member.views.size() && member.views[element][0] != ~std::uint64_t{0} && member.views[element][1] != 0) {
+                const auto first = member.views[element][0] / 4u;
+                const auto end = (member.views[element][0] + member.views[element][1] + 3u) / 4u;
+                const auto slot = slotOf(first);
+                if (slot != Abi::ClaimNone && slotOf(end - 1u) == slot + static_cast<std::uint32_t>(end - 1u - first)) base = slot;
+            }
+            words[Abi::ClaimBasesWord + element] = base;
+        }
+    }
+    const auto prelude = recorder.PreludeCommands();
+    Graphics::Require(prelude != VK_NULL_HANDLE, "a checked cloth run has no prelude");
+    if (claims) context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(prelude, arenas.claims->Handle(), *run.claimBlock, run.slots * 8u, 0u);
+    VkDeviceSize backupBytes = 0;
+    for (const auto& member : run.members) {
+        for (const auto& range : member.inPlace) {
+            run.backupOffsets.push_back(backupBytes);
+            backupBytes += range.end - range.begin;
+        }
+    }
+    if (backupBytes != 0) {
+        run.backup = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(backupBytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+        std::size_t at = 0;
+        for (const auto& member : run.members) {
+            for (const auto& range : member.inPlace) {
+                Graphics::CopyBuffer(context, prelude, range.buffer, range.offset, run.backup->Handle(), run.backupOffsets[at++], range.end - range.begin);
+            }
+        }
+        recorder.Keep(run.backup);
+    }
+    static std::atomic<int> described{0};
+    if (described.fetch_add(1, std::memory_order_relaxed) < 8) {
         std::string text;
-        char item[96];
-        for (const auto& access : accesses) {
-            std::snprintf(item, sizeof(item), " %c%llx-%llx/%llx", (access[2] & Graphics::Recorder::RunAccessWritten) != 0u ? 'W' : 'R', static_cast<unsigned long long>(access[0]), static_cast<unsigned long long>(access[1]), static_cast<unsigned long long>(access[2]));
+        for (const auto& member : run.members) {
+            char item[160];
+            std::size_t importCopies = 0;
+            std::size_t writtenRanges = 0;
+            for (const auto& staged : member.staged) {
+                importCopies += staged.importCopy ? 1u : 0u;
+                writtenRanges += staged.written.size();
+            }
+            std::snprintf(item, sizeof(item), " [%llx: %zu staged (%zu import copy-ins, %zu written ranges), %zu in place, groups %ux%ux%u%s]", static_cast<unsigned long long>(member.program), member.staged.size(), importCopies, writtenRanges, member.inPlace.size(), member.groups[0], member.groups[1], member.groups[2], member.forced ? " forced" : "");
             text += item;
         }
-        std::fprintf(stderr, "[cloth-watch-dump] run %llu member %u program %llx unordered %d clean %d staged %d:%s\n", static_cast<unsigned long long>(run->id), index, static_cast<unsigned long long>(program), unordered ? 1 : 0, clean ? 1 : 0, member.copies ? 1 : 0, text.c_str());
+        std::fprintf(stderr, "[cloth-overlap] run %llu ring 0x%x lane %d: %zu members, %zu claim intervals, %llu slots, backup %llu bytes, claims %s, force %d:%s\n", static_cast<unsigned long long>(run.serial), run.queue, run.lane, run.members.size(), run.intervals.size(), static_cast<unsigned long long>(run.slots), static_cast<unsigned long long>(backupBytes), claims ? "yes" : "no", run.force ? 1 : 0, text.c_str());
     }
-    for (std::uint32_t other = 0; other < index; ++other) {
-        auto& earlier = run->members[other];
-        const auto bit = std::uint64_t{1} << other;
-        const auto mine = std::uint64_t{1} << index;
-        if (Overlaps(member.writes, earlier.writes)) {
-            member.wawMask |= bit;
-            earlier.wawMask |= mine;
+    run.groups = std::make_shared<Graphics::Buffer>(context, run.members.size() * 12u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    run.arguments = std::make_shared<Graphics::Buffer>(context, run.members.size() * 12u, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    auto* groups = reinterpret_cast<std::uint32_t*>(run.groups->Bytes().data());
+    for (std::size_t index = 0; index < run.members.size(); ++index) std::memcpy(groups + 3u * index, run.members[index].groups.data(), 12u);
+    recorder.Keep(run.groups);
+    recorder.Keep(run.arguments);
+}
+
+// From the run's AfterRun work, right after its trailing barrier: the check, the clean copy-backs, the redo.
+void Close(Graphics::Recorder& recorder, const Graphics::Context& context, Run& run) {
+    auto commands = recorder.Commands();
+    auto& arenas = *run.arenas;
+    const auto header = run.header;
+    const auto claims = run.claimBlock.has_value() ? arenas.claims->Address(*run.claimBlock) : VkDeviceAddress{0};
+    Graphics::Require(header != 0, "a checked cloth run has no claim header");
+    const auto barrier = [&](VkPipelineStageFlags destination, VkAccessFlags access) {
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, destination, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, access);
+        Graphics::Recorder::CountBarriers(Graphics::Recorder::CommandClass::DispatchTrailing);
+    };
+    constexpr VkAccessFlags shaderAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+    const auto kernel = [&](std::uint32_t mode, VkDeviceAddress source, VkDeviceAddress target, std::uint64_t dwords, std::uint32_t first, std::uint32_t member) {
+        Graphics::Require(dwords <= std::numeric_limits<std::uint32_t>::max(), "a checked cloth run's copy is too large");
+        Graphics::Require(recorder.RecordClothKernel(commands, mode, source, target, claims, header, static_cast<std::uint32_t>(dwords), first, member), "the cloth overlap kernels are unavailable");
+    };
+    const auto slotOf = [&](std::uint64_t dword) {
+        const auto found = std::upper_bound(run.intervals.begin(), run.intervals.end(), Interval{dword, ~std::uint64_t{0}});
+        Graphics::Require(found != run.intervals.begin() && dword < std::prev(found)->second, "a checked cloth member's written range is outside the claim space");
+        const auto at = static_cast<std::size_t>(std::prev(found) - run.intervals.begin());
+        return run.slotBases[at] + static_cast<std::uint32_t>(dword - run.intervals[at].first);
+    };
+    if (claims != 0) {
+        kernel(0u, 0u, 0u, run.slots, 0u, 0u);
+        barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shaderAccess);
+    }
+    kernel(1u, run.groups->DeviceAddress(), run.arguments->DeviceAddress(), run.members.size() * 3u, 0u, 0u);
+    barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, shaderAccess | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    std::size_t backupAt = 0;
+    for (std::size_t index = 0; index < run.members.size(); ++index) {
+        const auto& member = run.members[index];
+        for (const auto& staged : member.staged) {
+            for (const auto& [begin, end] : staged.written) {
+                if (claims != 0) kernel(3u, staged.shadow + (begin - staged.begin), staged.import + (begin - staged.begin), (end - begin) / 4u, slotOf(begin / 4u), static_cast<std::uint32_t>(index + 1u));
+            }
         }
-        if (Overlaps(member.reads, earlier.writes)) member.cpuMask |= bit;
-        if (Overlaps(earlier.reads, member.writes)) earlier.cpuMask |= mine;
+        for (const auto& range : member.inPlace) kernel(2u, run.backup->DeviceAddress() + run.backupOffsets[backupAt++], range.import, (range.end - range.begin) / 4u, 0u, 0u);
     }
-    const auto before = run->ranges.size();
-    for (const auto& range : member.writes) run->ranges.emplace_back(range, index);
-    for (auto& earlier : run->members) {
-        WriteRanges(earlier.words, before, run->ranges);
-        earlier.words[Abi::WatchCountWord] = static_cast<std::uint32_t>(run->ranges.size());
+    barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shaderAccess);
+    const auto bindPipeline = context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline");
+    const auto pushConstants = context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants");
+    const auto dispatchIndirect = context.Resolved(&Graphics::DeviceFunctions::cmdDispatchIndirect, "vkCmdDispatchIndirect");
+    for (std::size_t index = 0; index < run.members.size(); ++index) {
+        const auto& member = run.members[index];
+        bool copied = false;
+        for (const auto& staged : member.staged) {
+            if (!staged.importCopy) continue;
+            kernel(2u, staged.import, staged.shadow, (staged.end - staged.begin) / 4u, 0u, 0u);
+            copied = true;
+        }
+        if (copied) barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shaderAccess);
+        bindPipeline(commands, VK_PIPELINE_BIND_POINT_COMPUTE, member.pipeline);
+        member.resources->Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, member.layout);
+        if (member.push) pushConstants(commands, member.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, member.pushBytes.data());
+        dispatchIndirect(commands, run.arguments->Handle(), index * 12u);
+        barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shaderAccess);
+        bool back = false;
+        for (const auto& staged : member.staged) {
+            for (const auto& [begin, end] : staged.written) {
+                kernel(2u, staged.shadow + (begin - staged.begin), staged.import + (begin - staged.begin), (end - begin) / 4u, 0u, 0u);
+                back = true;
+            }
+        }
+        if (back) barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shaderAccess);
     }
-    WriteRanges(member.words, 0, run->ranges);
-    member.words[Abi::WatchSelfWord] = index;
-    member.words[Abi::WatchMaskWord] = 0u;
-    member.words[Abi::WatchMaskWord + 1] = 0u;
-    member.words[Abi::WatchCountWord] = static_cast<std::uint32_t>(run->ranges.size());
-    member.bases = resources->BufferElementBases();
-    member.footprint = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(Abi::WatchFootprintSlots) * Abi::WatchFootprintSlotWords * sizeof(std::uint32_t), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
-    std::memset(member.footprint->Bytes().data(), 0, member.footprint->Bytes().size());
-    for (std::uint32_t element = 0; element < Abi::WatchBufferElements; ++element) {
-        const auto base = element < member.bases.size() ? member.bases[element] : ~std::uint64_t{0};
-        member.words[Abi::WatchBasesWord + 2u * element] = static_cast<std::uint32_t>(base);
-        member.words[Abi::WatchBasesWord + 2u * element + 1u] = static_cast<std::uint32_t>(base >> 32u);
-    }
-    const auto address = static_cast<std::uint64_t>(member.footprint->DeviceAddress());
-    member.words[Abi::WatchFootprintOverflowWord] = 0u;
-    member.words[Abi::WatchFootprintWord] = static_cast<std::uint32_t>(address);
-    member.words[Abi::WatchFootprintWord + 1] = static_cast<std::uint32_t>(address >> 32u);
-    pending[bda] = {run, index};
-    run->members.push_back(std::move(member));
-    lock.unlock();
-    recorder.OnComplete([run, index, bda] {
+    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, copiedAccess);
+    recorder.MarkCovered(copiedAccess);
+}
+
+// After the member's dispatch was recorded (recordDispatch): the member joins the open checked run of its ring (the
+// run's first member makes it and registers its seal and close).
+void Join(Graphics::Recorder& recorder, const Graphics::Context& context, Member member, std::shared_ptr<Arenas> arenas, std::uint32_t queue) {
+    const auto serial = recorder.CheckedRun(queue);
+    Graphics::Require(serial != 0, "a checked cloth member recorded outside a checked run");
+    const int lane = Graphics::Recorder::ThreadLane();
+    std::shared_ptr<Run> run;
+    {
         std::lock_guard lock(mutex);
-        auto& done = run->members[index];
-        done.gpuMask = done.words[Abi::WatchMaskWord] | (static_cast<std::uint64_t>(done.words[Abi::WatchMaskWord + 1]) << 32u);
-        done.done = true;
-        ++totals.controlMembers;
-        if ((done.gpuMask >> ControlMember & 1u) != 0u) ++totals.controlHits;
-        done.gpuMask &= ~(std::uint64_t{1} << ControlMember);
-        ReadFootprint(done);
-        if (const auto found = pending.find(bda); found != pending.end() && found->second.first == run && found->second.second == index) pending.erase(found);
-        ++run->completed;
-        if (run->completed != run->members.size()) return;
-        // Complete means submitted: the batch takes no more members.
-        for (auto& candidate : open) {
-            if (candidate == run) candidate = nullptr;
+        auto& slot = open[{lane, serial}];
+        if (slot == nullptr) {
+            slot = std::make_shared<Run>();
+            slot->serial = serial;
+            slot->queue = queue;
+            slot->lane = lane;
+            slot->arenas = std::move(arenas);
+            run = slot;
+        } else {
+            run = slot;
         }
-        Evaluate(*run);
+        ++busy[member.bda];
+        if (run->members.size() >= Abi::ClaimMaxMembers) member.forced = true;
+        run->members.push_back(std::move(member));
+    }
+    if (run->members.size() != 1u) return;
+    auto shared = std::make_shared<const Graphics::Context>(context);
+    recorder.BeforeRunSeal([run, shared](Graphics::Recorder& sealing) { Seal(sealing, *shared, *run); });
+    recorder.AfterRun([run, shared](Graphics::Recorder& closing) {
+        {
+            std::lock_guard lock(mutex);
+            open.erase({run->lane, run->serial});
+        }
+        Close(closing, *shared, *run);
+        closing.OnComplete([run] {
+            const bool conflict = run->headerWords[Abi::ClaimHeaderConflictWord] != 0u;
+            std::lock_guard lock(mutex);
+            for (const auto& member : run->members) {
+                std::memset(member.words + Abi::ClaimArrayWord, 0, (Abi::ClaimBasesWord + Abi::ClaimElements - Abi::ClaimArrayWord) * sizeof(std::uint32_t));
+                if (auto found = busy.find(member.bda); found != busy.end() && --found->second == 0) busy.erase(found);
+            }
+            if (run->members.size() < 2u) ++totals.singles;
+            ++totals.runs;
+            totals.members += run->members.size();
+            totals.slots += run->slots;
+            if (!run->claimBlock.has_value()) ++totals.noClaims;
+            if (run->force) ++totals.forced;
+            if (conflict) {
+                ++totals.conflicts;
+                totals.redoMembers += run->members.size();
+            }
+            if (run->claimBlock.has_value()) run->arenas->claims->Release(run->serial);
+            if (run->headerBlock.has_value()) run->arenas->headers->Release(run->serial);
+            Report(false);
+        });
     });
 }
 
 }
 
+}
+
+void VulkanDevice::SetClothFamily(std::span<const std::uint64_t> programs) {
+    std::lock_guard lock(clothFamilyMutex);
+    clothFamily.assign(programs.begin(), programs.end());
+}
+
+std::array<std::uint64_t, 3> VulkanDevice::ClothOverlapCounts() {
+    std::lock_guard lock(ClothOverlap::mutex);
+    return {ClothOverlap::totals.runs, ClothOverlap::totals.members, ClothOverlap::totals.conflicts};
+}
+
+namespace {
 
 bool CheckpointsInRuns() {
     static const bool allowed = std::getenv("APS5_CHECKPOINTS_IN_RUNS") != nullptr;
@@ -6246,16 +6357,47 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     runAccesses.clear();
     if (overlapCapable) resources.RunAccesses(runAccesses);
     if (overlapCapable && record.shader->program->bindlessHeap) runAccesses.push_back({0, std::numeric_limits<std::uint64_t>::max(), Graphics::Recorder::RunAccessImage | Graphics::Recorder::RunAccessWritten});
-    const bool watchClean = ClothWatch::Enabled() && overlapQueue != 0 && recorder.OpenRunQueue() == overlapQueue;
-    auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped, runAccesses) : recorder.Commands(&covered);
+    // S4 cloth checked overlap (ClothOverlap): whether this dispatch joins (or starts) a checked run. Copy-ins that went
+    // into the prelude of a checked run this dispatch does not join read memory from before that run: the run is closed
+    // and they are recorded again.
+    std::optional<ClothOverlap::Member> clothMember;
+    std::shared_ptr<ClothOverlap::Arenas> clothArenas;
+    {
+        const auto copies = Graphics::GuestBufferMemory::TakeClothCopies();
+        if (overlapCapable && emitted == nullptr && ClothOverlap::Active()) {
+            if (state->clothArenas == nullptr) {
+                auto arenas = std::make_shared<ClothOverlap::Arenas>();
+                try {
+                    arenas->claims = std::make_unique<ClothOverlap::Arena>(context, std::size_t{192} << 20u, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+                    arenas->headers = std::make_unique<ClothOverlap::Arena>(context, std::size_t{4} << 20u, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                } catch (const std::exception& error) {
+                    arenas->failed = true;
+                    std::fprintf(stderr, "[cloth-overlap] no claim arenas, no checked runs: %s\n", error.what());
+                }
+                state->clothArenas = arenas;
+            }
+            clothArenas = std::static_pointer_cast<ClothOverlap::Arenas>(state->clothArenas);
+            if (copies == Graphics::GuestBufferMemory::ClothCopiesRefused) ClothOverlap::CountRefusal(&ClothOverlap::Totals::refusedCopies);
+            else if (!clothArenas->failed) clothMember = ClothOverlap::Prepare(record, resources);
+        }
+        if (copies != 0 && copies != Graphics::GuestBufferMemory::ClothCopiesRefused && (!clothMember.has_value() || recorder.CheckedRun(overlapQueue) != copies)) {
+            static_cast<void>(recorder.Commands());
+            Graphics::Recorder::SetCheckedDispatch(false);
+            resources.ClothCopiesAgain(recorder);
+            ClothOverlap::CountRefusal(&ClothOverlap::Totals::recopied);
+        }
+    }
+    bool checked = clothMember.has_value();
+    const bool joinUnordered = unordered || (checked && ClothOverlap::Diag().order);
+    auto commands = overlapCapable && joinUnordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped, runAccesses, checked) : recorder.Commands(&covered);
     const Graphics::Recorder::CommandInHand commandInHand;
-    if (ClothWatch::Enabled()) ClothWatch::Note(context, recorder, record.resources, record.programAddress, emitted == nullptr && ClothWatchListed(record.programAddress), overlapQueue, unordered, watchClean);
     if (timer.profile && overlapped) recorder.CheckRunConflicts(record.programAddress, runAccesses);
     if (timer.profile && overlapCapable && unordered && !overlapped) ++d.unorderedLost;
     // Batched staging (Recorder::SplitForRun): a run's first dispatch that copies buffers itself
     // (so its ring's next dispatches likely do too) records into a new command buffer, so that the
     // copy-ins of the dispatches joining the run can go to a prelude submitted ahead of this one.
-    if (overlapCapable && !overlapped && resources.HasGpuCopies() && Graphics::Recorder::BatchedStagingEnabled()) commands = recorder.SplitForRun();
+    if (overlapCapable && !overlapped && ((resources.HasGpuCopies() && Graphics::Recorder::BatchedStagingEnabled()) || checked)) commands = recorder.SplitForRun();
+    if (checked && !overlapped && !recorder.PreludeArmed()) checked = false;
     // The first dispatch of a run that may overlap records its leading barrier in full (bindless
     // heap writes included), whatever the previous command covered: it orders everything before the
     // run for every dispatch of it, bindless or not.
@@ -6488,7 +6630,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     if (marker != 0) state->bufferMarker(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, state->markerBuffer, sizeof(std::uint32_t), marker);
     if (overlapCapable) {
         // Recorded by the next command that is not an unordered dispatch of this ring.
-        recorder.DeferDispatchBarrier(overlapQueue, runOwners);
+        recorder.DeferDispatchBarrier(overlapQueue, runOwners, checked);
         recorder.NoteRunAccess(record.programAddress, runAccesses);
         ++d.trailingDeferred;
     } else {
@@ -6501,8 +6643,20 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     }
     recordStep(PhaseRecordBind);
     if (record.htileClear.has_value()) Graphics::ArmHtileDepthClear(record.htileClear->first, record.htileClear->second);
-    if (overlapCapable) resources.MarkGpuWritesInRun(recorder, record.resources);
-    else resources.MarkGpuWrites(recorder);
+    if (checked) {
+        auto& member = *clothMember;
+        member.resources = record.resources;
+        member.pipeline = boundObjects.pipeline;
+        member.layout = boundObjects.layout;
+        member.push = record.pushStages != 0;
+        if (member.push) std::memcpy(member.pushBytes.data(), record.pushBytes->data(), member.pushBytes.size());
+        ClothOverlap::Join(recorder, context, std::move(member), clothArenas, overlapQueue);
+        resources.MarkGpuWritesChecked(recorder, record.resources);
+    } else if (overlapCapable) {
+        resources.MarkGpuWritesInRun(recorder, record.resources);
+    } else {
+        resources.MarkGpuWrites(recorder);
+    }
     if (record.htileClear.has_value()) {
         Graphics::QueueHtileDepthClear(record.htileClear->first, record.htileClear->second);
         recorder.NotePendingWrite(record.htileClear->first, record.htileClear->second);
@@ -6813,6 +6967,13 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::twinPipeline(const Graphic
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear) {
+    struct ClothCandidate {
+        bool active;
+        ~ClothCandidate() {
+            if (active) Graphics::Recorder::SetCheckedDispatch(false);
+        }
+    } clothCandidate{ClothOverlap::Active() && ClothOverlap::NotesClaims(shader)};
+    if (clothCandidate.active) Graphics::Recorder::SetCheckedDispatch(true);
     startJournalReplay();
     for (const auto& binding : shader.bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;

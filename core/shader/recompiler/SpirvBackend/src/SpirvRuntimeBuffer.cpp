@@ -453,6 +453,7 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     const auto needed = EmitAddU32(state, first, EmitAndConstant(state, address, 3u));
     auto tail = both(state, Unary(state, spv::OpLogicalNot, boolean, bounds), Binary(state, spv::OpULessThan, boolean, needed, length));
     if (enable != 0u) tail = both(state, enable, tail);
+    if (state.watchFootprintFunction != 0u) noteWatch(context, instruction, Binary(state, spv::OpShiftRightLogical, u32, needed, ConstantU32(state, 2u)), false, tail);
     // With robustBufferAccess2 the bytes load without a branch: a byte outside the read loads past the binding and reads 0.
     const bool selectable = LoadsSelectable(state, access);
     // The component's bytes from the one it starts at, each read through the 8-bit view; a byte past the guest dword

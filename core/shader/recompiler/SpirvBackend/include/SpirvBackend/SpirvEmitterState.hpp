@@ -190,8 +190,9 @@ struct SpirvEmitterState {
     std::uint32_t bdaWriteProbeFunction = 0;
     std::uint32_t bdaAtomicPointerFunction = 0;
     std::uint32_t bdaNoteWriteFunction = 0;
-    // SpirvTarget::watchedReads: note_watch_access (bound buffer footprint), 0 when absent.
+    // SpirvTarget::watchedReads: note_claim_access (bound buffer accesses) and note_claim_read (BDA reads), 0 when absent.
     std::uint32_t watchFootprintFunction = 0;
+    std::uint32_t claimReadFunction = 0;
     std::array<std::uint32_t, 2> bdaByteWriteFunctions {};
     std::uint32_t bdaFaultFunction = 0;
     bool nativeF16ModesEmitted = false;

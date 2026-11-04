@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/StagingDiffCopyBack_spv.h"
+#include "prx/libSceAgcDriver/Graphics/shaders/ClothOverlap_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -1275,6 +1276,8 @@ Recorder::~Recorder() {
     if (meshArgumentLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, meshArgumentLayout, nullptr);
     if (stagingDiffPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, stagingDiffPipeline, nullptr);
     if (stagingDiffLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, stagingDiffLayout, nullptr);
+    if (clothPipeline != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipeline>("vkDestroyPipeline")(context.device, clothPipeline, nullptr);
+    if (clothLayout != VK_NULL_HANDLE) context.Function<PFN_vkDestroyPipelineLayout>("vkDestroyPipelineLayout")(context.device, clothLayout, nullptr);
     if (sampleCounterState > 0) {
         samplesPassed.store(SamplesTotal(), std::memory_order_release);
         if (samplePools != nullptr) std::static_pointer_cast<SamplePoolCache>(samplePools)->close();
@@ -1836,6 +1839,8 @@ struct DispatchOrder {
 };
 
 thread_local DispatchOrder nextDispatchOrder;
+thread_local bool nextDispatchChecked = false;
+std::atomic<std::uint64_t> runSerials{0};
 
 std::array<std::atomic<std::uint64_t>, Recorder::DeferredFlushSites> deferredFlushes{};
 
@@ -2200,8 +2205,27 @@ std::uint32_t Recorder::TakeDispatchOrder(bool& unordered) {
     return order.queueKey;
 }
 
+void Recorder::SetCheckedDispatch(bool checked) {
+    nextDispatchChecked = checked;
+}
+
+bool Recorder::CheckedDispatch() {
+    return nextDispatchChecked;
+}
+
+void Recorder::BeforeRunSeal(std::function<void(Recorder&)> work) {
+    Require(RunOpen(), "work before a dispatch run's seal without an open run");
+    open->beforeSeal.push_back(std::move(work));
+}
+
 void Recorder::flushDeferredDispatch(std::size_t site, const std::source_location& where) {
     if (open == nullptr || open->deferredDispatchQueue == 0) return;
+    if (!open->beforeSeal.empty()) {
+        auto seal = std::move(open->beforeSeal);
+        open->beforeSeal.clear();
+        for (auto& work : seal) work(*this);
+    }
+    open->checkedRun = false;
     if (DrawOrGpuProfiled()) {
         std::string_view file = where.file_name();
         if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) file.remove_prefix(slash + 1);
@@ -2246,7 +2270,8 @@ void Recorder::flushDeferredDispatch(std::size_t site, const std::source_locatio
 }
 
 VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun, VkAccessFlags* coveredAccess, std::span<const std::array<std::uint64_t, 3>> accesses) {
-    inRun = queueKey != 0 && open != nullptr && open->edgeOwed == 0 && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) == open->deferredRun.end() && !RunAtomicConflict(accesses) && !RunRangeConflict(accesses);
+    const bool checked = nextDispatchChecked;
+    inRun = queueKey != 0 && open != nullptr && open->edgeOwed == 0 && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) == open->deferredRun.end() && open->checkedRun == checked && (checked || (!RunAtomicConflict(accesses) && !RunRangeConflict(accesses)));
     if (!inRun) return Commands(coveredAccess);
     GuestMemory::AssertGpuLockHeld("Recorder::RunCommands");
     if (coveredAccess != nullptr) *coveredAccess = 0;
@@ -2258,8 +2283,8 @@ void Recorder::AfterRun(std::function<void(Recorder&)> work) {
     open->afterRun.push_back(std::move(work));
 }
 
-VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped, std::span<const std::array<std::uint64_t, 3>> accesses) {
-    overlapped = queueKey != 0 && open != nullptr && open->edgeOwed == 0 && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::none_of(owners.begin(), owners.end(), [&](const void* owner) { return std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) != open->deferredRun.end(); }) && !RunAtomicConflict(accesses) && !RunRangeConflict(accesses);
+VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped, std::span<const std::array<std::uint64_t, 3>> accesses, bool checked) {
+    overlapped = queueKey != 0 && open != nullptr && open->edgeOwed == 0 && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::none_of(owners.begin(), owners.end(), [&](const void* owner) { return std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) != open->deferredRun.end(); }) && open->checkedRun == checked && (checked || (!RunAtomicConflict(accesses) && !RunRangeConflict(accesses)));
     if (queueKey != 0 && DrawOrGpuProfiled()) {
         std::lock_guard lock(runCloseMutex);
         ++overlapByRing[queueKey][overlapped ? 0 : open == nullptr || open->deferredDispatchQueue == 0 ? 1 : 2];
@@ -2281,13 +2306,15 @@ Recorder::OverlapStatistics Recorder::OverlapCounts() {
     return {runDeferredCount.load(std::memory_order_relaxed), runJoinedCount.load(std::memory_order_relaxed)};
 }
 
-void Recorder::DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners) {
+void Recorder::DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners, bool checked) {
     Require(open != nullptr && queueKey != 0, "a deferred dispatch barrier has no batch");
     runDeferredCount.fetch_add(1, std::memory_order_relaxed);
     if (open->deferredDispatchQueue == 0) {
         open->deferredRun.clear();
         open->runAccess.clear();
         open->runCopiedAtomic.clear();
+        open->checkedRun = checked;
+        open->runSerial = runSerials.fetch_add(1, std::memory_order_relaxed) + 1u;
     } else {
         runJoinedCount.fetch_add(1, std::memory_order_relaxed);
     }
@@ -2481,8 +2508,6 @@ void Recorder::ensureOpen() {
         }
         batch->waitOther = std::max(batch->waitOther, std::exchange(laneOwed[static_cast<std::size_t>(batch->lane)], 0));
         batch->openedAt = OpenSerial();
-        static std::atomic<std::uint64_t> identities{0};
-        batch->identity = identities.fetch_add(1, std::memory_order_relaxed) + 1u;
         NotePendingCommands(batch->commands, batch->lane);
         Checkpoint(batch->commands, CheckpointKind::BatchBegin, (static_cast<std::uint64_t>(batch->lane) << 48u) | batch->openedAt);
         if (countingSamples && !segmentMode()) beginSamples(*batch);
@@ -3580,6 +3605,65 @@ bool Recorder::RecordStagingDiff(VkCommandBuffer commands, VkDeviceAddress resul
         } parameters{result + VkDeviceAddress{done} * 4u, pristine + VkDeviceAddress{done} * 4u, target + VkDeviceAddress{done} * 4u, counter, step, 0u};
         static_assert(sizeof(parameters) == PushBytes);
         function(cmdPushConstants, "vkCmdPushConstants")(commands, stagingDiffLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &parameters);
+        function(cmdDispatch, "vkCmdDispatch")(commands, (step + GroupSize - 1) / GroupSize, 1, 1);
+        done += step;
+    }
+    return true;
+}
+
+bool Recorder::RecordClothKernel(VkCommandBuffer commands, std::uint32_t mode, VkDeviceAddress source, VkDeviceAddress target, VkDeviceAddress claims, VkDeviceAddress header, std::uint32_t count, std::uint32_t first, std::uint32_t member) {
+    constexpr std::uint32_t PushBytes = 48;
+    constexpr std::uint32_t GroupSize = 64;
+    if (clothState == 0) {
+        clothState = -1;
+        VkShaderModule module = VK_NULL_HANDLE;
+        try {
+            const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes};
+            VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+            layoutInfo.pushConstantRangeCount = 1;
+            layoutInfo.pPushConstantRanges = &push;
+            Check(context.Function<PFN_vkCreatePipelineLayout>("vkCreatePipelineLayout")(context.device, &layoutInfo, nullptr, &clothLayout), "vkCreatePipelineLayout cloth overlap");
+            VkShaderModuleCreateInfo moduleInfo{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+            moduleInfo.codeSize = sizeof(CLOTH_OVERLAP_SPV);
+            moduleInfo.pCode = CLOTH_OVERLAP_SPV;
+            Check(context.Function<PFN_vkCreateShaderModule>("vkCreateShaderModule")(context.device, &moduleInfo, nullptr, &module), "vkCreateShaderModule cloth overlap");
+            VkComputePipelineCreateInfo pipelineInfo{VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
+            pipelineInfo.stage = {VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+            pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
+            pipelineInfo.stage.module = module;
+            pipelineInfo.stage.pName = "main";
+            pipelineInfo.layout = clothLayout;
+            {
+                auto pipelineCacheLock = context.LockPipelineCacheForUse();
+                Check(context.Function<PFN_vkCreateComputePipelines>("vkCreateComputePipelines")(context.device, context.pipelineCache, 1, &pipelineInfo, nullptr, &clothPipeline), "vkCreateComputePipelines cloth overlap");
+            }
+            context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            module = VK_NULL_HANDLE;
+            clothState = 1;
+        } catch (const std::exception& error) {
+            if (module != VK_NULL_HANDLE) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
+            std::fprintf(stderr, "[cloth-overlap] kernels unavailable, no checked runs: %s\n", error.what());
+        }
+    }
+    if (clothState < 0) return false;
+    if (count == 0) return true;
+    function(cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, clothPipeline);
+    const auto perDispatch = static_cast<std::uint32_t>(std::min<std::uint64_t>(std::uint64_t{context.limits.maxComputeWorkGroupCount[0]} * GroupSize, std::uint64_t{1} << 30u));
+    for (std::uint32_t done = 0; done < count;) {
+        const auto step = std::min(count - done, perDispatch);
+        const VkDeviceAddress words = VkDeviceAddress{done} * 4u;
+        struct {
+            VkDeviceAddress source;
+            VkDeviceAddress target;
+            VkDeviceAddress claims;
+            VkDeviceAddress header;
+            std::uint32_t count;
+            std::uint32_t first;
+            std::uint32_t member;
+            std::uint32_t mode;
+        } parameters{mode == 0u ? 0u : source + words, mode == 0u ? 0u : target + words, mode == 0u ? claims + 2u * words : claims, header, step, mode == 3u ? first + done : first, done == 0 ? member : (mode == 0u ? 0u : member), mode};
+        static_assert(sizeof(parameters) == PushBytes);
+        function(cmdPushConstants, "vkCmdPushConstants")(commands, clothLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, PushBytes, &parameters);
         function(cmdDispatch, "vkCmdDispatch")(commands, (step + GroupSize - 1) / GroupSize, 1, 1);
         done += step;
     }

@@ -7792,17 +7792,18 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     return result;
 }
 
-std::vector<std::uint64_t> ShaderResources::BufferElementBases() const {
-    std::vector<std::uint64_t> bases;
+std::vector<std::array<std::uint64_t, 3>> ShaderResources::BufferElementViews() const {
+    std::vector<std::array<std::uint64_t, 3>> views;
     for (const auto& binding : bindings) {
         if (binding.layout.binding != static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Buffers) || binding.layout.descriptorType != VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || binding.set > 0) continue;
         for (const auto index : binding.allocations) {
             const auto& allocation = allocations[index];
-            bases.push_back(allocation.guest ? allocation.address - allocation.adjustment : ~std::uint64_t{0});
+            if (!allocation.guest) views.push_back({~std::uint64_t{0}, 0u, 0u});
+            else views.push_back({allocation.address - allocation.adjustment, GuestBufferMemory::ViewBytes(allocation.size, allocation.adjustment), allocation.written ? 1u : 0u});
         }
         break;
     }
-    return bases;
+    return views;
 }
 
 void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
@@ -7876,6 +7877,24 @@ void ShaderResources::MarkGpuWritesInRun(Recorder& recorder, const std::shared_p
     if (!recorder.RunOpen()) return;
     recorder.AfterRun([self](Recorder& after) {
         self->guestMemory.RecordCopyBacks(after);
+        self->guestMemory.MarkDirectWrites();
+    });
+}
+
+void ShaderResources::MarkGpuWritesChecked(Recorder& recorder, const std::shared_ptr<ShaderResources>& self) {
+    NoteResidentCensus();
+    const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : usesBda && bdaReadOnly && !RuntimeSwitches::Set(RuntimeSwitch::NoReadOnlyLeaseSkip) ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
+    if (auto split = guestMemory.SplitInPlaceReads()) {
+        recorder.NotePendingReadList(std::move(split->space), kind);
+        recorder.NotePendingReads(split->own, kind);
+    } else {
+        recorder.NotePendingReads(guestMemory.InPlaceReads(), kind);
+    }
+    if (SkipWriteBack()) return;
+    recorder.NotePendingWrites(guestMemory.Writes());
+    guestMemory.MarkDirectWrites();
+    recorder.AfterRun([self](Recorder&) {
+        self->guestMemory.ClothTakeCopyBacks();
         self->guestMemory.MarkDirectWrites();
     });
 }
