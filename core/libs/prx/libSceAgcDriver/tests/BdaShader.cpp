@@ -232,3 +232,64 @@ std::vector<std::uint32_t> MakeBdaAnchoredReadTestShader(const BdaAnchoredReadPr
     state.module.EmitEntryPoint(spv::ExecutionModelGLCompute, main, "main", interfaceVariables);
     return state.module.Finalize();
 }
+
+std::vector<std::uint32_t> MakeBdaMemoReadTestShader(const std::vector<BdaMemoRead>& reads, bool stops, std::uint32_t memoEntries) {
+    using namespace ShaderRecompiler;
+    IrProgram program;
+    program.Resources().stage = IrShaderStage::Compute;
+    program.Info().usesDma = true;
+    SpirvEmitterState state(program, {});
+    EmitBaseHeader(state.module, program);
+    const auto define = [&](std::uint32_t binding) {
+        const auto variable = state.module.DefineGlobalVariable(TypeStorageBufferPointer(state), spv::StorageClassStorageBuffer);
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, 0u);
+        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, binding);
+        return variable;
+    };
+    state.bdaPagetableVariable = define(0);
+    state.faultBufferVariable = define(1);
+    const auto output = define(2);
+    state.bdaStopsInvocations = stops;
+    state.bdaRangeMemoEntries = memoEntries;
+    DefineGetBdaPointer(state);
+    const auto main = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunction, TypeVoid(state), main, spv::FunctionControlMaskNone, TypeFunction(state));
+    EmitLabel(state, state.module.AllocateId());
+    SpirvValueEmitContext ctx(state);
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto input = [&](std::uint32_t word) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, value, BdaWord(state, output, ConstantU32(state, word)));
+        return value;
+    };
+    const auto base = Binary(state, spv::OpBitwiseOr, u64, Unary(state, spv::OpUConvert, u64, input(BdaAnchoredReadInputWord)), Binary(state, spv::OpShiftLeftLogical, u64, Unary(state, spv::OpUConvert, u64, input(BdaAnchoredReadInputWord + 1u)), BdaConstant(state, 32u)));
+    IrBuilder ir(program);
+    for (std::uint32_t index = 0; index < reads.size(); ++index) {
+        const auto& read = reads[index];
+        const auto opcode = read.bits == 8u ? IrOpcode::LoadAddressU8 : read.bits == 16u ? IrOpcode::LoadAddressU16 : read.dwords == 2u ? IrOpcode::LoadAddressU32x2 : read.dwords == 3u ? IrOpcode::LoadAddressU32x3 : read.dwords == 4u ? IrOpcode::LoadAddressU32x4 : IrOpcode::LoadAddressU32;
+        const auto type = read.bits != 32u || read.dwords == 1u ? IrType::U32 : read.dwords == 2u ? IrType::U32x2 : read.dwords == 3u ? IrType::U32x3 : IrType::U32x4;
+        auto& instruction = program.CreateValue(opcode, type);
+        MemoryFlags flags{};
+        flags.pc = 0x1000u + index;
+        instruction.SetFlags(flags);
+        if (read.bits == 32u && read.dwords > 1u) {
+            const auto extract = read.dwords == 2u ? IrOpcode::CompositeExtractU32x2 : read.dwords == 3u ? IrOpcode::CompositeExtractU32x3 : IrOpcode::CompositeExtractU32x4;
+            for (std::uint32_t dword = 0; dword < read.dwords; ++dword) {
+                auto& user = program.CreateValue(extract, IrType::U32);
+                user.AddArgument(&instruction);
+                user.AddArgument(&ir.Constant(dword));
+            }
+        }
+        const auto address = AddBdaAddress(ctx, instruction, base, Unary(state, spv::OpUConvert, u64, input(BdaAnchoredReadInputWord + 2u + index)), false);
+        const auto values = read.bits == 32u ? EmitBdaDwordReads(ctx, instruction, address, 0u, read.dwords) : std::array<std::uint32_t, 4>{EmitBdaRead(ctx, instruction, address, read.bits)};
+        for (std::uint32_t dword = 0; dword < (read.bits == 32u ? read.dwords : 1u); ++dword) {
+            state.module.AddFunction(spv::OpStore, BdaWord(state, output, ConstantU32(state, index * 4u + dword)), values[dword]);
+        }
+    }
+    state.module.AddFunction(spv::OpReturn);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    state.module.AddExecutionMode(main, spv::ExecutionModeLocalSize, 1u, 1u, 1u);
+    state.module.EmitEntryPoint(spv::ExecutionModelGLCompute, main, "main", {});
+    return state.module.Finalize();
+}
