@@ -3589,7 +3589,7 @@ bool Recorder::RecordStagingDiffIndirect(VkCommandBuffer commands, VkDeviceAddre
     return true;
 }
 
-void Recorder::BeforeSubmit(std::function<void()> action) {
+void Recorder::BeforeSubmit(std::function<void(bool)> action) {
     ensureOpen();
     open->beforeSubmit.push_back(std::move(action));
 }
@@ -5053,7 +5053,7 @@ void Recorder::Submit() {
         for (const auto& [begin, end] : notedReads(*open)) open->readGeneration = std::max(open->readGeneration, GuestMemory::CollectWrites(begin, end - begin));
     }
     // BeforeSubmit's actions see every stamp made up to this submission (APS5_OWN_SHADOW_CURRENT's decisions).
-    for (auto& action : std::exchange(open->beforeSubmit, {})) action();
+    for (auto& action : std::exchange(open->beforeSubmit, {})) action(open->waitOther != 0);
     auto batch = std::move(open.slot());
     struct DiscardUnsubmitted {
         Recorder& recorder;

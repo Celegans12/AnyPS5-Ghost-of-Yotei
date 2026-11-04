@@ -533,8 +533,9 @@ public:
     // BeforeSubmit). `dwords` <= 64 * maxComputeWorkGroupCount[0]. False when the kernel is unavailable.
     bool RecordStagingDiffIndirect(VkCommandBuffer commands, VkDeviceAddress result, VkDeviceAddress pristine, VkDeviceAddress target, std::uint32_t dwords, VkBuffer arguments, VkDeviceSize offset);
     // Runs `action` (under the recorder's lock, with the GPU mutex held) right before the open batch's command buffer
-    // ends and is submitted, after everything of the batch is recorded.
-    void BeforeSubmit(std::function<void()> action);
+    // ends and is submitted, after everything of the batch is recorded; its argument is whether the batch waits for
+    // work of the other lane (which then runs before all of it, including what was recorded first).
+    void BeforeSubmit(std::function<void(bool)> action);
     std::uint64_t StagingDiffStoredDwords();
     std::uint64_t SamplesTotal();
     bool DumpSamples(VkDeviceAddress target, std::uint64_t address = 0);
@@ -885,7 +886,7 @@ private:
         std::unordered_set<const void*> keptOwners;
         std::vector<std::function<void()>> completions;
         // BeforeSubmit's actions, run in order by Submit before the command buffer ends.
-        std::vector<std::function<void()>> beforeSubmit;
+        std::vector<std::function<void(bool)>> beforeSubmit;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;

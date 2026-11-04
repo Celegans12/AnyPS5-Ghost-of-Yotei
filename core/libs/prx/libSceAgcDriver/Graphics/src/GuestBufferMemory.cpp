@@ -5553,8 +5553,9 @@ void verifyOwnShadow(const Context& context, Recorder& recorder, VkCommandBuffer
                 std::memcpy(&importWord, b.data() + first, 4);
             }
             const bool stamped = !GuestMemory::UnchangedSince(begin, a.size(), generation);
+            const bool cpuStored = !GuestMemory::UnchangedSinceCollected(begin, a.size(), generation);
             const bool published = ShadowPublishedSince(begin, a.size(), publishSerial);
-            if (mismatches <= 16) std::fprintf(stderr, "[own-shadow] VERIFY MISMATCH: a skipped copy-in's shadow differs from its import: 0x%llx+0x%zx, %zu dwords differ, first at +0x%zx (shadow %08x import %08x); range stamped since the skip: %s, a unit shadow published over it since the check: %s\n", static_cast<unsigned long long>(begin), a.size(), differing, first, shadowWord, importWord, stamped ? "yes" : "no", published ? "yes" : "no");
+            if (mismatches <= 16) std::fprintf(stderr, "[own-shadow] VERIFY MISMATCH: a skipped copy-in's shadow differs from its import: 0x%llx+0x%zx, %zu dwords differ, first at +0x%zx (shadow %08x import %08x); range stamped since the skip: %s (a CPU store: %s), a unit shadow published over it since the check: %s\n", static_cast<unsigned long long>(begin), a.size(), differing, first, shadowWord, importWord, stamped ? "yes" : "no", cpuStored ? "yes" : "no", published ? "yes" : "no");
         }
     });
 }
@@ -6990,9 +6991,15 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             decision->generation.store(region->ownSyncGeneration, std::memory_order_relaxed);
             region->ownSkip = decision;
             const auto publishSerial = region->ownPublishSerial;
-            recorder->BeforeSubmit([arguments, begin, bytes, decision, groups, publishSerial] {
-                static_cast<void>(GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes)));
-                if (!decision->stale.load(std::memory_order_relaxed) && GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(bytes), decision->generation.load(std::memory_order_relaxed)) && !ShadowPublishedSince(begin, static_cast<std::size_t>(bytes), publishSerial, true)) {
+            recorder->BeforeSubmit([arguments, begin, bytes, decision, groups, publishSerial](bool waitsOtherLane) {
+                // CPU stores since the check (UnchangedSinceCollected collects the range first) and publishes submitted
+                // ahead of this batch always turn the copy-in on. The driver's marks of recorded GPU work count only when
+                // the batch waits for the other lane: work recorded on this lane after the copy-in runs after it, as it
+                // did for the old copy-in; the use's own marks moved the generation (MarkDirectWrites).
+                const auto range = static_cast<std::size_t>(bytes);
+                const auto since = decision->generation.load(std::memory_order_relaxed);
+                const bool unchanged = waitsOtherLane ? (static_cast<void>(GuestMemory::CollectWrites(begin, range)), GuestMemory::UnchangedSince(begin, range, since)) : GuestMemory::UnchangedSinceCollected(begin, range, since);
+                if (!decision->stale.load(std::memory_order_relaxed) && unchanged && !ShadowPublishedSince(begin, range, publishSerial, true)) {
                     OwnShadows().skipped.fetch_add(1, std::memory_order_relaxed);
                     OwnShadows().skippedTotal.fetch_add(1, std::memory_order_relaxed);
                     OwnShadows().skippedBytes.fetch_add(bytes, std::memory_order_relaxed);
