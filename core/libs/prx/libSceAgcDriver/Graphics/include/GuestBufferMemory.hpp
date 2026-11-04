@@ -479,6 +479,8 @@ public:
     // copied per build (staged) or served in place, an address-based build's leased heaps (its own
     // lease and its space's), and its written ranges; nothing before the upload or once committed.
     void NoteResidentCensus() const;
+    void NoteP0Census(bool unboundedWriter) const;
+    void WritableLease(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
     void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const;
     struct SplitReads {
         std::shared_ptr<const std::vector<std::pair<std::uint64_t, std::uint64_t>>> space;
@@ -585,6 +587,7 @@ private:
         // The gpuCopy buffer is a resident range's persistent buffer (see residentBuffer in
         // GuestBufferMemory.cpp): its copy-in is skipped while the buffer still matches guest memory.
         bool resident = false;
+        bool ceiling = false;
         // A written descriptor range of an address-based build that lies inside one of the space's
         // import regions, given a region of its own so it can be staged device-local (see
         // resolveOverlays); the BDA table sends its guest addresses to this region's buffer instead

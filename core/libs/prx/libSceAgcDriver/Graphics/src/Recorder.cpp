@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -4407,6 +4409,7 @@ void Recorder::OnComplete(std::function<void()> action) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
+    if (OwnershipProbe::Enabled()) OwnershipProbe::Global()->NoteGpuWrite(address, address + bytes, OwnershipProbe::CurrentSource());
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);

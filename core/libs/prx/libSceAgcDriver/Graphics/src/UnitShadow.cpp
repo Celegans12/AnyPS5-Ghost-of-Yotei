@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
@@ -296,6 +298,7 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     recorder->MarkCovered(publishedAccess);
     for (const auto& entry : copies) recorder->Keep(entry.slab);
     // CPU readers reach the import's bytes only after the hook's SyncThrough waits by this note.
+    const OwnershipProbe::SourceScope probeSource(OwnershipProbe::SourcePublish);
     recorder->NotePendingWrites(ranges);
 }
 
@@ -393,6 +396,13 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
     if (tracePublishesLeft.load(std::memory_order_relaxed) > 0 && tracePublishesLeft.fetch_sub(1, std::memory_order_relaxed) > 0) {
         const auto packet = GuestMemory::CurrentPacket();
         std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
+    }
+    if (P0Mem::CensusEnabled()) {
+        for (const auto& [begin, end] : ranges) P0Mem::NotePublish(begin, end, static_cast<std::uint8_t>(reason), ReasonNames[static_cast<std::size_t>(reason)]);
+    }
+    if (P0Mem::CeilingPublish() && reason != PublishReason::Evict && reason != PublishReason::Retire && reason != PublishReason::Teardown) {
+        P0Mem::CountCeiling(P0Mem::CeilingCount::PublishSkipped, bytes);
+        return units;
     }
     recordCopies(*shadow, copies, ranges, bytes);
     if (ShadowVerify()) verifyPublished(*shadow, copies);

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
 #include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -5241,6 +5242,37 @@ void residentCopied(std::uint64_t begin, std::uint64_t end, const std::shared_pt
     found->second.syncGeneration = Recorder::ThreadLane() == 0 ? GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin)) : 0;
 }
 
+struct CeilingShadow {
+    std::shared_ptr<Buffer> buffer;
+    bool filled = false;
+};
+
+struct CeilingShadows {
+    std::mutex mutex;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, CeilingShadow> ranges;
+};
+
+CeilingShadows& CeilingRanges() {
+    static auto* shadows = new CeilingShadows;
+    return *shadows;
+}
+
+std::shared_ptr<Buffer> ceilingBuffer(const Context& context, std::uint64_t begin, std::uint64_t end, VkBufferUsageFlags usage) {
+    auto& shadows = CeilingRanges();
+    std::lock_guard lock(shadows.mutex);
+    auto& entry = shadows.ranges[{begin, end}];
+    if (entry.buffer == nullptr) entry.buffer = stagingBuffer(context, static_cast<std::size_t>(end - begin), usage | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+    return entry.buffer;
+}
+
+bool ceilingFilled(std::uint64_t begin, std::uint64_t end, const std::shared_ptr<Buffer>& buffer) {
+    auto& shadows = CeilingRanges();
+    std::lock_guard lock(shadows.mutex);
+    const auto found = shadows.ranges.find({begin, end});
+    if (found == shadows.ranges.end() || found->second.buffer != buffer) return false;
+    return std::exchange(found->second.filled, true);
+}
+
 // APS5_TRACE_STAGING=1: every distinct staged range once, with its size and whether an atomic
 // element lies in it, to see which elements the staging window admits at a stage.
 void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
@@ -5534,9 +5566,16 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             const bool misaligned = !bindableInPlace(HostImportOffset(*entry, region.begin), addressable);
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
-                region.buffer = residentBuffer(context, region.begin, region.end);
-                region.resident = region.buffer != nullptr;
-                if (!region.resident) region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable) | (stagingDiffEnabled(context) ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
+                region.ceiling = false;
+                if (P0Mem::CeilingStaging()) {
+                    region.buffer = ceilingBuffer(context, region.begin, region.end, gpuCopyUsage(addressable));
+                    region.ceiling = region.buffer != nullptr;
+                    region.resident = false;
+                } else {
+                    region.buffer = residentBuffer(context, region.begin, region.end);
+                    region.resident = region.buffer != nullptr;
+                }
+                if (!region.resident && !region.ceiling) region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(addressable) | (stagingDiffEnabled(context) ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
                 if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 if (region.buffer == nullptr) {
                     // No shadow to be had: in place when aligned, else the host copy below.
@@ -6269,6 +6308,27 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->FlushStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
         GuestMemory::PublishGpuOwned(region->begin, static_cast<std::size_t>(region->end - region->begin));
     }
+    std::vector<Region*> ceilingKept;
+    if (P0Mem::CeilingStaging()) {
+        for (auto* region : copies) {
+            const auto bytes = region->end - region->begin;
+            if (region->ceiling && region->deviceLocal && region->buffer != nullptr) {
+                if (ceilingFilled(region->begin, region->end, region->buffer)) {
+                    recorder->Keep(region->buffer);
+                    region->snapshot.clear();
+                    region->diffUse = false;
+                    region->pristine.reset();
+                    P0Mem::CountCeiling(P0Mem::CeilingCount::CopyInSkipped, bytes);
+                    if (stagingDiffEnabled(context)) P0Mem::CountCeiling(P0Mem::CeilingCount::PristineSkipped, bytes);
+                    continue;
+                }
+                P0Mem::CountCeiling(P0Mem::CeilingCount::CopyInFirst, bytes);
+            }
+            ceilingKept.push_back(region);
+        }
+        if (ceilingKept.empty()) return;
+        copies = std::span<Region* const>(ceilingKept.data(), ceilingKept.size());
+    }
     // The copy-ins of an unordered dispatch joining an open run of its ring (dispatch overlap, see
     // Recorder::RunCommands) record no leading barrier: the run's first dispatch ordered everything
     // before the run for transfers too, and the run's dispatches the title leaves unordered with this
@@ -6446,6 +6506,11 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         for (auto* region : copies) {
             region->diffUse = false;
             if (!active) continue;
+            if (region->ceiling && region->deviceLocal && P0Mem::CeilingStaging()) {
+                region->pristine.reset();
+                P0Mem::CountCeiling(P0Mem::CeilingCount::PristineSkipped, region->end - region->begin);
+                continue;
+            }
             if (!region->deviceLocal || region->buffer == nullptr || region->buffer->DeviceAddress() == 0 || region->copySourceAddress == 0) {
                 region->pristine.reset();
                 continue;
@@ -6556,6 +6621,15 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     }
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
+        if (region.ceiling && region.deviceLocal && P0Mem::CeilingStaging()) {
+            for (const auto& [begin, end] : merged) {
+                const auto from = std::max(begin, region.begin);
+                const auto to = std::min(end, region.end);
+                if (from < to) P0Mem::CountCeiling(P0Mem::CeilingCount::CopyBackSkipped, to - from);
+            }
+            region.copiedBack = true;
+            continue;
+        }
         for (const auto& [begin, end] : merged) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
@@ -6616,7 +6690,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
                 if (diff && profile && region.deviceLocal) Copies().diffWholeBytes.fetch_add(wholeEnd - whole, std::memory_order_relaxed);
             }
             copiedBytes += to - from;
-            if (OwnershipProbe::Enabled()) OwnershipProbe::Global()->NoteGpuWrite(from, to);
+            if (OwnershipProbe::Enabled()) OwnershipProbe::Global()->NoteGpuWrite(from, to, OwnershipProbe::SourceStaged);
             recorder.Keep(region.buffer);
             if (profile) {
                 Copies().gpuCopyBacks.fetch_add(1, std::memory_order_relaxed);
@@ -7424,6 +7498,45 @@ void GuestBufferMemory::InPlaceReads(std::vector<std::pair<std::uint64_t, std::u
     for (const auto& region : regions) {
         if (region.direct != nullptr) result.emplace_back(region.begin, inPlaceEnd(region));
     }
+}
+
+void GuestBufferMemory::WritableLease(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const {
+    if (!uploaded || committed) return;
+    const auto add = [&](const GuestAllocations::Lease& held) {
+        for (const auto& range : held) {
+            if (range != nullptr && range->writable) out.emplace_back(range->address, range->address + range->bytes);
+        }
+    };
+    add(lease);
+    if (space != nullptr) add(space->lease);
+}
+
+void GuestBufferMemory::NoteP0Census(bool unboundedWriter) const {
+    if (!P0Mem::CensusEnabled() || !uploaded || committed) return;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    ranges.reserve(regions.size());
+    for (const auto& region : regions) {
+        if (region.end > region.begin) ranges.emplace_back(region.begin, region.end);
+    }
+    P0Mem::NoteGpuReads(P0Mem::Read::Bound, ranges);
+    ranges.clear();
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
+    const auto leased = [&](const GuestAllocations::Lease& held) {
+        for (const auto& range : held) {
+            if (range == nullptr) continue;
+            if (range->readable) ranges.emplace_back(range->address, range->address + range->bytes);
+            if (range->writable) writable.emplace_back(range->address, range->address + range->bytes);
+        }
+    };
+    leased(lease);
+    if (space != nullptr) leased(space->lease);
+    P0Mem::NoteGpuReads(P0Mem::Read::Reach, ranges);
+    std::uint64_t written = 0;
+    for (const auto& [begin, end] : writes) {
+        P0Mem::NoteGpuWrite(begin, end);
+        written += end - begin;
+    }
+    if (unboundedWriter) P0Mem::NoteUnboundedWriter(writable, written);
 }
 
 void GuestBufferMemory::NoteResidentCensus() const {

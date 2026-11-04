@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
@@ -742,6 +743,7 @@ struct Replay {
                 if (recording) {
                     deltaBytes += chunk->bytes;
                     AgcDriver::Graphics::ResidentCensus::NoteCpuWrite(chunk->address, chunk->bytes);
+                    AgcDriver::Graphics::P0Mem::NoteCpuWrite(chunk->address, chunk->bytes);
                 }
             }
             return;

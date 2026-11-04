@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
@@ -531,6 +533,8 @@ void BdaResources::markWrittenPages() const {
             }
         }
         GuestMemory::MarkPossiblyWritten(begin, bytes);
+        P0Mem::NoteBdaReport(bytes);
+        if (OwnershipProbe::Enabled()) OwnershipProbe::Global()->NoteGpuWrite(begin, end, OwnershipProbe::SourceBdaReport);
     }), "invalid BDA written-page record");
     for (std::uint32_t claim = 0; claim < count; ++claim) {
         const auto slot = words[Abi::WrittenListWord + claim];
