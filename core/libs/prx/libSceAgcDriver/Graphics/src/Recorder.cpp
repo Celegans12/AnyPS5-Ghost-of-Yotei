@@ -2986,6 +2986,11 @@ std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     return beginTiming(key);
 }
 
+std::uint32_t Recorder::BeginGpuTimingInRun(std::uint64_t key) {
+    if (!GpuTimingEnabled()) return NoTiming;
+    return beginTiming(key);
+}
+
 std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && BatchStampsEnabled())) return NoTiming;

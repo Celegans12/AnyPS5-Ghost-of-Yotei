@@ -205,9 +205,12 @@ public:
     static bool CheckedDispatch();
     std::uint64_t CheckedRun(std::uint32_t queueKey) const { return open != nullptr && open->checkedRun && open->deferredDispatchQueue == queueKey && queueKey != 0 ? open->runSerial : 0u; }
     bool PreludeArmed() const { return open != nullptr && open->prelude.armed; }
+    bool CheckedRunOpen() const { return open != nullptr && open->checkedRun && open->deferredDispatchQueue != 0; }
     void BeforeRunSeal(std::function<void(Recorder&)> work);
     // The cloth checked overlap's kernels (Graphics/shaders/ClothOverlap.comp; `mode` as there), recorded into
     // `commands` in chunks the device's group count limit allows. False when the pipeline cannot be made.
+    // BeginGpuTiming for a dispatch joining the open run: no Commands(), which would close the run under it.
+    std::uint32_t BeginGpuTimingInRun(std::uint64_t key);
     bool RecordClothKernel(VkCommandBuffer commands, std::uint32_t mode, VkDeviceAddress source, VkDeviceAddress target, VkDeviceAddress claims, VkDeviceAddress header, std::uint32_t count, std::uint32_t first, std::uint32_t member);
     // Batched staging (APS5_NO_BATCHED_STAGING=1 turns it off; an APS5_AB switch). NVIDIA drains the
     // GPU at every transfer and barrier recorded between two dispatches, so the staged copy-ins of

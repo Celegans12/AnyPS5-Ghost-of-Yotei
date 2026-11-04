@@ -6264,7 +6264,7 @@ bool ShaderResources::refreshData(VkCommandBuffer commands, const CompiledShader
         Require(allocation.buffer != nullptr && !allocation.guest && allocation.size == size && size <= MaxRefreshBytes, "template data buffer cannot take the dispatch's words");
         if (allocation.dataWords.size() == binding.guestDescriptor.size() && std::equal(allocation.dataWords.begin(), allocation.dataWords.end(), binding.guestDescriptor.begin())) continue;
         if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData) ValidateRuntimeResources(shader, binding.guestDescriptor);
-        if (recorder != nullptr && timing == Recorder::NoTiming) timing = recorder->BeginGpuTiming(Recorder::CommandClass::TemplateDataRefresh);
+        if (recorder != nullptr && timing == Recorder::NoTiming) timing = recorder->CheckedRunOpen() ? Recorder::NoTiming : recorder->BeginGpuTiming(Recorder::CommandClass::TemplateDataRefresh);
         writeDataWords(commands, held->allocations.front(), binding.guestDescriptor);
         allocation.dataWords.assign(binding.guestDescriptor.begin(), binding.guestDescriptor.end());
         refreshedBytes += size;

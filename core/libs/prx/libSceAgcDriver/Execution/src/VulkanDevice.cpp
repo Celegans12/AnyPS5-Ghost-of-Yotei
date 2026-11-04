@@ -988,6 +988,7 @@ struct VulkanDevice::State {
             descriptorCache.reset();
             vertexInputs.reset();
             emptyBuffer.reset();
+            clothArenas.reset();
             placeholderImages.reset();
             samplerCache.reset();
             textureCache.reset();
@@ -5847,7 +5848,12 @@ struct Run {
     VkDeviceAddress header = 0;
     std::uint32_t* headerWords = nullptr;
     std::shared_ptr<Graphics::Buffer> backup;
-    std::vector<VkDeviceSize> backupOffsets;
+    struct Restore {
+        VkDeviceAddress import;
+        VkDeviceSize backupOffset;
+        std::uint64_t bytes;
+    };
+    std::vector<Restore> restores;
     std::shared_ptr<Graphics::Buffer> arguments;
     std::shared_ptr<Graphics::Buffer> groups;
     std::shared_ptr<Arenas> arenas;
@@ -5860,7 +5866,7 @@ struct Totals {
 
 std::mutex mutex;
 Totals totals;
-std::map<std::pair<int, std::uint64_t>, std::shared_ptr<Run>> open;
+std::map<std::pair<int, std::uint64_t>, std::weak_ptr<Run>> open;
 std::unordered_map<const Graphics::BdaResources*, std::uint32_t> busy;
 std::chrono::steady_clock::time_point lastReport{};
 
@@ -6024,21 +6030,26 @@ void Seal(Graphics::Recorder& recorder, const Graphics::Context& context, Run& r
     const auto prelude = recorder.PreludeCommands();
     Graphics::Require(prelude != VK_NULL_HANDLE, "a checked cloth run has no prelude");
     if (claims) context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(prelude, arenas.claims->Handle(), *run.claimBlock, run.slots * 8u, 0u);
-    VkDeviceSize backupBytes = 0;
-    for (const auto& member : run.members) {
-        for (const auto& range : member.inPlace) {
-            run.backupOffsets.push_back(backupBytes);
-            backupBytes += range.end - range.begin;
+    // The members' in-place written ranges, merged per import (members bind the same output V#s).
+    std::vector<GuestBufferMemory::ClothInPlace> ranges;
+    for (const auto& member : run.members) ranges.insert(ranges.end(), member.inPlace.begin(), member.inPlace.end());
+    std::sort(ranges.begin(), ranges.end(), [](const auto& left, const auto& right) { return left.buffer != right.buffer ? left.buffer < right.buffer : left.begin < right.begin; });
+    std::vector<GuestBufferMemory::ClothInPlace> merged;
+    for (const auto& range : ranges) {
+        if (!merged.empty() && merged.back().buffer == range.buffer && range.begin <= merged.back().end) {
+            if (range.end > merged.back().end) merged.back().end = range.end;
+        } else {
+            merged.push_back(range);
         }
+    }
+    VkDeviceSize backupBytes = 0;
+    for (const auto& range : merged) {
+        run.restores.push_back({range.import, backupBytes, range.end - range.begin});
+        backupBytes += range.end - range.begin;
     }
     if (backupBytes != 0) {
         run.backup = std::make_shared<Graphics::Buffer>(context, static_cast<std::size_t>(backupBytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
-        std::size_t at = 0;
-        for (const auto& member : run.members) {
-            for (const auto& range : member.inPlace) {
-                Graphics::CopyBuffer(context, prelude, range.buffer, range.offset, run.backup->Handle(), run.backupOffsets[at++], range.end - range.begin);
-            }
-        }
+        for (std::size_t index = 0; index < merged.size(); ++index) Graphics::CopyBuffer(context, prelude, merged[index].buffer, merged[index].offset, run.backup->Handle(), run.restores[index].backupOffset, merged[index].end - merged[index].begin);
         recorder.Keep(run.backup);
     }
     static std::atomic<int> described{0};
@@ -6067,6 +6078,10 @@ void Seal(Graphics::Recorder& recorder, const Graphics::Context& context, Run& r
 
 // From the run's AfterRun work, right after its trailing barrier: the check, the clean copy-backs, the redo.
 void Close(Graphics::Recorder& recorder, const Graphics::Context& context, Run& run) {
+    Graphics::Require(run.groups != nullptr && run.arguments != nullptr && run.header != 0, "a checked cloth run closed before its seal");
+    static std::atomic<int> traced{0};
+    const bool trace = traced.fetch_add(1, std::memory_order_relaxed) < 8;
+    if (trace) std::fprintf(stderr, "[cloth-overlap] closing run %llu\n", static_cast<unsigned long long>(run.serial));
     auto commands = recorder.Commands();
     auto& arenas = *run.arenas;
     const auto header = run.header;
@@ -6093,7 +6108,10 @@ void Close(Graphics::Recorder& recorder, const Graphics::Context& context, Run& 
     }
     kernel(1u, run.groups->DeviceAddress(), run.arguments->DeviceAddress(), run.members.size() * 3u, 0u, 0u);
     barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, shaderAccess | VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
-    std::size_t backupAt = 0;
+    for (const auto& restore : run.restores) {
+        Graphics::Require(run.backup != nullptr, "a checked cloth run has no backup for an in-place range");
+        kernel(2u, run.backup->DeviceAddress() + restore.backupOffset, restore.import, restore.bytes / 4u, 0u, 0u);
+    }
     for (std::size_t index = 0; index < run.members.size(); ++index) {
         const auto& member = run.members[index];
         for (const auto& staged : member.staged) {
@@ -6101,7 +6119,6 @@ void Close(Graphics::Recorder& recorder, const Graphics::Context& context, Run& 
                 if (claims != 0) kernel(3u, staged.shadow + (begin - staged.begin), staged.import + (begin - staged.begin), (end - begin) / 4u, slotOf(begin / 4u), static_cast<std::uint32_t>(index + 1u));
             }
         }
-        for (const auto& range : member.inPlace) kernel(2u, run.backup->DeviceAddress() + run.backupOffsets[backupAt++], range.import, (range.end - range.begin) / 4u, 0u, 0u);
     }
     barrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, shaderAccess);
     const auto bindPipeline = context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline");
@@ -6133,33 +6150,45 @@ void Close(Graphics::Recorder& recorder, const Graphics::Context& context, Run& 
     constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
     barrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, copiedAccess);
     recorder.MarkCovered(copiedAccess);
+    if (trace) std::fprintf(stderr, "[cloth-overlap] closed run %llu\n", static_cast<unsigned long long>(run.serial));
+}
+
+// Whether the open checked run `serial` of the calling thread's lane takes no more members.
+bool RunFull(std::uint64_t serial) {
+    if (serial == 0) return false;
+    std::lock_guard lock(mutex);
+    const auto found = open.find({Graphics::Recorder::ThreadLane(), serial});
+    if (found == open.end()) return false;
+    const auto run = found->second.lock();
+    return run != nullptr && run->members.size() >= Abi::ClaimMaxMembers;
 }
 
 // After the member's dispatch was recorded (recordDispatch): the member joins the open checked run of its ring (the
 // run's first member makes it and registers its seal and close).
-void Join(Graphics::Recorder& recorder, const Graphics::Context& context, Member member, std::shared_ptr<Arenas> arenas, std::uint32_t queue) {
+void Join(Graphics::Recorder& recorder, const Graphics::Context& context, Member member, std::shared_ptr<Arenas> arenas, std::uint32_t queue, std::uint64_t joined) {
     const auto serial = recorder.CheckedRun(queue);
     Graphics::Require(serial != 0, "a checked cloth member recorded outside a checked run");
+    Graphics::Require(joined == 0 || joined == serial, "the checked cloth run a member joined closed while the member was recorded");
     const int lane = Graphics::Recorder::ThreadLane();
     std::shared_ptr<Run> run;
     {
         std::lock_guard lock(mutex);
         auto& slot = open[{lane, serial}];
-        if (slot == nullptr) {
-            slot = std::make_shared<Run>();
-            slot->serial = serial;
-            slot->queue = queue;
-            slot->lane = lane;
-            slot->arenas = std::move(arenas);
-            run = slot;
-        } else {
-            run = slot;
+        run = slot.lock();
+        if (run == nullptr) {
+            run = std::make_shared<Run>();
+            run->serial = serial;
+            run->queue = queue;
+            run->lane = lane;
+            run->arenas = std::move(arenas);
+            slot = run;
         }
         ++busy[member.bda];
-        if (run->members.size() >= Abi::ClaimMaxMembers) member.forced = true;
+        Graphics::Require(run->members.size() < Abi::ClaimMaxMembers, "a checked cloth run took more members than its claims can name");
         run->members.push_back(std::move(member));
     }
     if (run->members.size() != 1u) return;
+    Graphics::Require(recorder.PreludeArmed(), "a checked cloth run has no prelude at its first member");
     auto shared = std::make_shared<const Graphics::Context>(context);
     recorder.BeforeRunSeal([run, shared](Graphics::Recorder& sealing) { Seal(sealing, *shared, *run); });
     recorder.AfterRun([run, shared](Graphics::Recorder& closing) {
@@ -6380,6 +6409,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             if (copies == Graphics::GuestBufferMemory::ClothCopiesRefused) ClothOverlap::CountRefusal(&ClothOverlap::Totals::refusedCopies);
             else if (!clothArenas->failed) clothMember = ClothOverlap::Prepare(record, resources);
         }
+        if (clothMember.has_value() && ClothOverlap::RunFull(recorder.CheckedRun(overlapQueue))) static_cast<void>(recorder.Commands());
         if (copies != 0 && copies != Graphics::GuestBufferMemory::ClothCopiesRefused && (!clothMember.has_value() || recorder.CheckedRun(overlapQueue) != copies)) {
             static_cast<void>(recorder.Commands());
             Graphics::Recorder::SetCheckedDispatch(false);
@@ -6390,6 +6420,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     bool checked = clothMember.has_value();
     const bool joinUnordered = unordered || (checked && ClothOverlap::Diag().order);
     auto commands = overlapCapable && joinUnordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped, runAccesses, checked) : recorder.Commands(&covered);
+    const auto clothJoined = checked && overlapped ? recorder.CheckedRun(overlapQueue) : 0u;
     const Graphics::Recorder::CommandInHand commandInHand;
     if (timer.profile && overlapped) recorder.CheckRunConflicts(record.programAddress, runAccesses);
     if (timer.profile && overlapCapable && unordered && !overlapped) ++d.unorderedLost;
@@ -6576,7 +6607,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, boundObjects.layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
     }
     NewPath::CostLap(NewPath::CostStep::RecordPush);
-    const auto gpuTiming = recorder.BeginGpuTiming(record.programAddress != 0 ? record.programAddress : record.shader->program->variantId);
+    const auto timingKey = record.programAddress != 0 ? record.programAddress : record.shader->program->variantId;
+    const auto gpuTiming = clothJoined != 0 ? recorder.BeginGpuTimingInRun(timingKey) : recorder.BeginGpuTiming(timingKey);
     if (state->checkpointMarker != nullptr) state->checkpointMarker(commands, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(record.programAddress)));
     else if (Graphics::Recorder::ThreadLane() == 1) Graphics::Recorder::Checkpoint(commands, Graphics::Recorder::CheckpointKind::AsyncDispatch, record.programAddress);
     const auto marker = state->bufferMarker != nullptr ? state->markerLog.Next(record.programAddress) : 0u;
@@ -6650,7 +6682,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         member.layout = boundObjects.layout;
         member.push = record.pushStages != 0;
         if (member.push) std::memcpy(member.pushBytes.data(), record.pushBytes->data(), member.pushBytes.size());
-        ClothOverlap::Join(recorder, context, std::move(member), clothArenas, overlapQueue);
+        ClothOverlap::Join(recorder, context, std::move(member), clothArenas, overlapQueue, clothJoined);
         resources.MarkGpuWritesChecked(recorder, record.resources);
     } else if (overlapCapable) {
         resources.MarkGpuWritesInRun(recorder, record.resources);
