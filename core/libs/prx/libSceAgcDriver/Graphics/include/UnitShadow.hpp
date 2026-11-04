@@ -94,6 +94,12 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
 // No GpuMutex, no tracker: conservative (a unit with a generation and no publish counts), for
 // hook-free readers and a build's stage A.
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes);
+// A publish writes the import from the slab without a tracker stamp (the unit's write-back stamped earlier). For
+// readers that keep a device copy of import bytes (APS5_OWN_SHADOW_CURRENT): a serial taken with the copy, and
+// whether a publish recorded since that serial overlaps [address, address + bytes) (true when unknown: the log
+// keeps the newest 65536 publishes).
+std::uint64_t ShadowPublishSerial();
+bool ShadowPublishedSince(std::uint64_t address, std::size_t bytes, std::uint64_t serial);
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 
 // The sources of a storage upload's surface-relative runs: [begin, end) pieces of them, each read

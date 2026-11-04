@@ -8,6 +8,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <algorithm>
+#include <deque>
+#include <tuple>
 #include <optional>
 #include <array>
 #include <atomic>
@@ -252,6 +254,31 @@ struct SlabCopies {
     std::vector<VkBufferCopy> regions;
 };
 
+// ShadowPublishSerial / ShadowPublishedSince: the guest ranges of the recorded publishes, newest last.
+struct PublishLog {
+    std::mutex mutex;
+    std::uint64_t serial = 0;
+    // (serial, begin, end); entries older than `trimmed` were dropped.
+    std::deque<std::tuple<std::uint64_t, std::uint64_t, std::uint64_t>> entries;
+    std::uint64_t trimmed = 0;
+};
+
+PublishLog& Publishes() {
+    static auto* log = new PublishLog;
+    return *log;
+}
+
+void logPublishes(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    auto& log = Publishes();
+    std::lock_guard lock(log.mutex);
+    const auto serial = ++log.serial;
+    for (const auto& [begin, end] : ranges) log.entries.emplace_back(serial, begin, end);
+    while (log.entries.size() > 65536) {
+        log.trimmed = std::get<0>(log.entries.front());
+        log.entries.pop_front();
+    }
+}
+
 // Records the copies as one command group into the active recorder's open batch (a waited batch
 // without one). `ranges` are the guest ranges copied, for the note and the hazard tracker.
 void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes) {
@@ -284,6 +311,7 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     }
     const auto copyBuffer = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
     for (const auto& entry : copies) copyBuffer(commands, entry.slab->buffer, shadow.importBuffer, static_cast<std::uint32_t>(entry.regions.size()), entry.regions.data());
+    logPublishes(ranges);
     // The published bytes are visible to everything recorded after and to the host, as after a fill.
     constexpr VkAccessFlags publishedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, publishedAccess);
@@ -542,6 +570,24 @@ bool anyShadowedLocked(const Shadows& registry, std::uint64_t address, std::size
     });
 }
 
+}
+
+std::uint64_t ShadowPublishSerial() {
+    auto& log = Publishes();
+    std::lock_guard lock(log.mutex);
+    return log.serial;
+}
+
+bool ShadowPublishedSince(std::uint64_t address, std::size_t bytes, std::uint64_t serial) {
+    auto& log = Publishes();
+    std::lock_guard lock(log.mutex);
+    if (log.serial <= serial) return false;
+    if (log.trimmed > serial) return true;
+    const auto end = address + bytes;
+    for (auto it = log.entries.rbegin(); it != log.entries.rend() && std::get<0>(*it) > serial; ++it) {
+        if (std::get<1>(*it) < end && address < std::get<2>(*it)) return true;
+    }
+    return false;
 }
 
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {

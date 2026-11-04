@@ -612,6 +612,8 @@ private:
         mutable std::uint64_t ownSyncGeneration = 0;
         mutable std::uint64_t ownForgetSerial = 0;
         mutable bool ownSyncPending = false;
+        // ShadowPublishSerial at the copy-in that made the shadow match (a publish since then rewrote the import).
+        mutable std::uint64_t ownPublishSerial = 0;
         // The submission-time decision of this use's deferred copy-in (APS5_OWN_SHADOW_CURRENT): the generation the
         // range must be unchanged since (MarkDirectWrites moves it past the use's own marks), and whether anything
         // else stamped the range before those marks.

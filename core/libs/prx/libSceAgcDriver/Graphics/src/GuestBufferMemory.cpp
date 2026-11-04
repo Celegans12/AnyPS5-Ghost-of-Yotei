@@ -5466,7 +5466,7 @@ std::uint64_t ownShadowMismatchesCount() {
 
 // Whether a non-resident staged region's copy-in can be skipped (see above). Called for every such copy-in
 // while the switch is set; a false answer leaves the generation for ownShadowCopied to retake.
-bool ownShadowCurrent(std::uint64_t begin, std::uint64_t end, std::uint64_t generation, std::uint64_t forget, bool pending) {
+bool ownShadowCurrent(std::uint64_t begin, std::uint64_t end, std::uint64_t generation, std::uint64_t forget, bool pending, std::uint64_t publishSerial) {
     if (!RuntimeSwitches::Set(RuntimeSwitch::OwnShadowCurrent)) return false;
     if (generation == 0) return false;
     if (Recorder::ThreadLane() != 0) {
@@ -5483,7 +5483,7 @@ bool ownShadowCurrent(std::uint64_t begin, std::uint64_t end, std::uint64_t gene
         return false;
     }
     static_cast<void>(GuestMemory::CollectWrites(begin, bytes));
-    if (!GuestMemory::UnchangedSince(begin, bytes, generation)) {
+    if (!GuestMemory::UnchangedSince(begin, bytes, generation) || ShadowPublishedSince(begin, bytes, publishSerial)) {
         OwnShadows().stale.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
@@ -5529,7 +5529,8 @@ void verifyOwnShadow(const Context& context, Recorder& recorder, VkCommandBuffer
     CopyBuffer(context, commands, source, sourceOffset, importCopy->Handle(), 0, bytes);
     recorder.Keep(buffer);
     const auto held = holdReadbacks(std::move(shadowCopy), std::move(importCopy));
-    recorder.OnComplete([held, begin, generation] {
+    const auto publishSerial = ShadowPublishSerial();
+    recorder.OnComplete([held, begin, generation, publishSerial] {
         const auto [shadowCopy, importCopy] = takeReadbacks(held);
         if (shadowCopy == nullptr) return;
         OwnShadows().checked.fetch_add(1, std::memory_order_relaxed);
@@ -5552,7 +5553,8 @@ void verifyOwnShadow(const Context& context, Recorder& recorder, VkCommandBuffer
                 std::memcpy(&importWord, b.data() + first, 4);
             }
             const bool stamped = !GuestMemory::UnchangedSince(begin, a.size(), generation);
-            if (mismatches <= 16) std::fprintf(stderr, "[own-shadow] VERIFY MISMATCH: a skipped copy-in's shadow differs from its import: 0x%llx+0x%zx, %zu dwords differ, first at +0x%zx (shadow %08x import %08x); range stamped since the skip: %s\n", static_cast<unsigned long long>(begin), a.size(), differing, first, shadowWord, importWord, stamped ? "yes" : "no");
+            const bool published = ShadowPublishedSince(begin, a.size(), publishSerial);
+            if (mismatches <= 16) std::fprintf(stderr, "[own-shadow] VERIFY MISMATCH: a skipped copy-in's shadow differs from its import: 0x%llx+0x%zx, %zu dwords differ, first at +0x%zx (shadow %08x import %08x); range stamped since the skip: %s, a unit shadow published over it since the check: %s\n", static_cast<unsigned long long>(begin), a.size(), differing, first, shadowWord, importWord, stamped ? "yes" : "no", published ? "yes" : "no");
         }
     });
 }
@@ -6874,7 +6876,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, address);
-        if (!region->resident && region->deviceLocal && expected.empty() && ownShadowCurrent(region->begin, region->end, region->ownSyncGeneration, region->ownForgetSerial, region->ownSyncPending)) {
+        if (!region->resident && region->deviceLocal && expected.empty() && ownShadowCurrent(region->begin, region->end, region->ownSyncGeneration, region->ownForgetSerial, region->ownSyncPending, region->ownPublishSerial)) {
             // The build's own shadow held these bytes at this check (see ownShadowCurrent). The copy-in is still
             // recorded, as an indirect kernel whose group count the submission sets: a stamp between this check and
             // the batch's submission (a CPU store, or a writer whose marks come later) turns it back on, so the GPU
@@ -6911,6 +6913,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             const bool own = RuntimeSwitches::Set(RuntimeSwitch::OwnShadowCurrent) && Recorder::ThreadLane() == 0;
             region->ownSyncGeneration = own ? GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(bytes)) : 0;
             region->ownForgetSerial = own ? GuestMemory::ForgetSerial() : 0;
+            region->ownPublishSerial = own ? ShadowPublishSerial() : 0;
             region->ownSyncPending = true;
             if (own) {
                 OwnShadows().copied.fetch_add(1, std::memory_order_relaxed);
@@ -6986,9 +6989,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             auto decision = std::make_shared<Region::OwnSkip>();
             decision->generation.store(region->ownSyncGeneration, std::memory_order_relaxed);
             region->ownSkip = decision;
-            recorder->BeforeSubmit([arguments, begin, bytes, decision, groups] {
+            const auto publishSerial = region->ownPublishSerial;
+            recorder->BeforeSubmit([arguments, begin, bytes, decision, groups, publishSerial] {
                 static_cast<void>(GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes)));
-                if (!decision->stale.load(std::memory_order_relaxed) && GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(bytes), decision->generation.load(std::memory_order_relaxed))) {
+                if (!decision->stale.load(std::memory_order_relaxed) && GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(bytes), decision->generation.load(std::memory_order_relaxed)) && !ShadowPublishedSince(begin, static_cast<std::size_t>(bytes), publishSerial)) {
                     OwnShadows().skipped.fetch_add(1, std::memory_order_relaxed);
                     OwnShadows().skippedTotal.fetch_add(1, std::memory_order_relaxed);
                     OwnShadows().skippedBytes.fetch_add(bytes, std::memory_order_relaxed);
