@@ -2971,7 +2971,7 @@ bool copyThroughKernel(std::uint64_t address, std::span<std::byte> destination) 
 #endif
 }
 
-void flushBeforeAccess(std::uint64_t address, std::size_t bytes) { OwnershipProbe::SoftAccess(address, bytes, CurrentReadSite() == ReadSite::Store);
+void flushBeforeAccess(std::uint64_t address, std::size_t bytes, const void* caller = nullptr) { OwnershipProbe::SoftAccess(address, bytes, CurrentReadSite() == ReadSite::Store, caller);
     if (const auto hook = flushHook.load(std::memory_order_acquire)) hook(address, bytes);
 }
 
@@ -3000,7 +3000,7 @@ bool SpeculativeReader() {
 
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes) {
     requireNotSpeculative("access with a flush");
-    flushBeforeAccess(address, bytes);
+    flushBeforeAccess(address, bytes, __builtin_return_address(0));
     if (GpuMutex().HeldByThisThread()) PublishGpuOwned(address, bytes);
 }
 
@@ -3025,7 +3025,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
         if (!copyThroughKernel(address, destination)) throw SpeculativeReadRefused("AGC driver: a speculative guest read found the range unmapped");
         return;
     }
-    flushBeforeAccess(address, destination.size());
+    flushBeforeAccess(address, destination.size(), __builtin_return_address(0));
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     const auto* source = reinterpret_cast<const void*>(address);

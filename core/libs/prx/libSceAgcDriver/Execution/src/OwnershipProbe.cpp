@@ -453,7 +453,7 @@ void SoftGpuWrite(std::uint64_t begin, std::uint64_t end, std::uint8_t source) {
     state.size.store(state.owned.size(), std::memory_order_relaxed);
 }
 
-void SoftAccess(std::uint64_t address, std::size_t bytes, bool store) {
+void SoftAccess(std::uint64_t address, std::size_t bytes, bool store, const void* caller) {
     if (!SoftEnabled() || bytes == 0) return;
     auto& state = Soft();
     if (state.size.load(std::memory_order_relaxed) == 0) return;
@@ -484,7 +484,7 @@ void SoftAccess(std::uint64_t address, std::size_t bytes, bool store) {
     }
     state.size.store(state.owned.size(), std::memory_order_relaxed);
     if (first == 0) return;
-    std::string key = std::string(store ? "store " : "read ") + GuestMemory::ReadSiteName(GuestMemory::CurrentReadSite());
+    std::string key = std::string(store ? "store " : "read ") + GuestMemory::ReadSiteName(GuestMemory::CurrentReadSite()) + (caller != nullptr ? " @ " + SiteName(reinterpret_cast<std::uint64_t>(caller)) : std::string());
     for (std::uint16_t f = 1; f < captured && f < 7; ++f) key += " < " + SiteName(reinterpret_cast<std::uint64_t>(frames[f]));
     auto& site = state.sites[key];
     site.first += first;
