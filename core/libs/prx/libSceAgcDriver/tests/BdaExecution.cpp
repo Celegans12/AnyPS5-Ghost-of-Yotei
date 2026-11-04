@@ -3,6 +3,9 @@
 #include "IntermediateRepresentation/IrMetadata/ShaderStage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include <algorithm>
+#include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <array>
 #include <cstdio>
 #include <cstring>
@@ -719,5 +722,142 @@ void RunBdaStoreExecutionTests(const Context& context) {
         run("unmapped middle byte", guest, 32, coherent, {0xd4, 0xcd, 0xb2, 0xa1, 0xcd}, {guest, guest + 3}, Abi::FaultReason::Unmapped, guest + 1, 1);
         ranges = {{{guest + 3, guest + 5, first.DeviceAddress(), writable, 0}, {guest + 5, guest + 8, second.DeviceAddress(), writable, 0}}};
         run("split aligned dword", guest + 3, 32, coherent, {0xcd, 0xcd, 0xcd, 0xcd, 0xcd}, {}, Abi::FaultReason::Unmapped, guest + 3, 4);
+    }
+}
+
+// Lane P0-shader E3 (diagnostic, run only by `agc_driver_bda_device_tests --p0s-lookup-bench`): the BDA lookup schemes
+// in isolation. P0S_LOOKUP_SPV names the compiled research/speed/newpath/p0s/e3/lookup.comp; P0S_RANGES (5000),
+// P0S_GROUPS (4096 x 256 invocations), P0S_LOOKUPS (32 per invocation), P0S_SEED. One table buffer holds the range
+// table + index, the flat page section and the multi-level model; prints one line per mode x chain x table memory.
+void RunP0sLookupBench(const Context& context) {
+    namespace Abi = ShaderRecompiler::BdaAbi;
+    const auto env = [](const char* name, std::uint64_t fallback) { const char* text = std::getenv(name); return text != nullptr ? std::strtoull(text, nullptr, 0) : fallback; };
+    const char* spvPath = std::getenv("P0S_LOOKUP_SPV");
+    Require(spvPath != nullptr, "P0S_LOOKUP_SPV is not set");
+    std::FILE* file = std::fopen(spvPath, "rb");
+    Require(file != nullptr, "cannot open P0S_LOOKUP_SPV");
+    std::vector<std::uint32_t> code;
+    for (std::uint32_t word = 0; std::fread(&word, 4, 1, file) == 1;) code.push_back(word);
+    std::fclose(file);
+    const auto rangeCount = static_cast<std::size_t>(env("P0S_RANGES", 5000));
+    const auto groups = static_cast<std::uint32_t>(env("P0S_GROUPS", 4096));
+    const auto lookups = static_cast<std::uint32_t>(env("P0S_LOOKUPS", 32));
+    std::uint64_t seed = env("P0S_SEED", 1);
+    const auto next = [&] { seed ^= seed << 13; seed ^= seed >> 7; seed ^= seed << 17; return seed; };
+    const auto logUniform = [&](double low, double high) { const double u = static_cast<double>(next() % 1000000u) / 1e6; return static_cast<std::uint64_t>(low * std::pow(high / low, u)); };
+    // Disjoint ranges, sizes log-uniform 4 KiB - 16 MiB, gaps 0 (1 in 4) or log-uniform up to 1 MiB, 256-byte aligned.
+    std::vector<Abi::Range> ranges;
+    std::uint64_t cursor = 0x8000000000ull, device = 0x100000000ull;
+    for (std::size_t index = 0; index < rangeCount; ++index) {
+        if (next() % 4u != 0u) cursor += logUniform(256.0, 1048576.0) & ~std::uint64_t{255};
+        const auto size = std::max<std::uint64_t>(256u, logUniform(4096.0, 16777216.0) & ~std::uint64_t{255});
+        ranges.push_back({cursor, cursor + size, device, next() % 3u == 0u ? Abi::Read | Abi::Write : Abi::Read, 0u});
+        cursor += size;
+        device += size + 0x10000u;
+    }
+    const auto index = Abi::BuildRangeIndex(ranges.data(), ranges.size());
+    Require(!index.empty(), "the E3 table has no index");
+    std::vector<std::uint32_t> words(4u + 8u * ranges.size());
+    const Abi::Header header{Abi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(Abi::Range), Abi::IndexedTable};
+    std::memcpy(words.data(), &header, sizeof(header));
+    std::memcpy(words.data() + 4, ranges.data(), ranges.size() * sizeof(Abi::Range));
+    words.insert(words.end(), index.begin(), index.end());
+    // Flat section (BdaResources p0sFlatSection's rule, at most 2^18 pages).
+    const auto flatAt = static_cast<std::uint32_t>(words.size());
+    std::uint32_t shift = 16;
+    const auto first = ranges.front().begin, last = ranges.back().end;
+    while (((last - (first & ~((std::uint64_t{1} << shift) - 1u)) + (std::uint64_t{1} << shift) - 1u) >> shift) > (std::uint64_t{1} << 18u)) ++shift;
+    const auto flatBase = first & ~((std::uint64_t{1} << shift) - 1u);
+    const auto pages = static_cast<std::uint32_t>((last - flatBase + (std::uint64_t{1} << shift) - 1u) >> shift);
+    words.resize(words.size() + 4u + 2u * std::size_t{pages}, 0u);
+    std::memcpy(words.data() + flatAt, &flatBase, 8);
+    words[flatAt + 2] = pages;
+    words[flatAt + 3] = shift;
+    std::size_t following = 0, flatEntries = 0;
+    for (std::uint32_t page = 0; page < pages; ++page) {
+        const auto start = flatBase + (std::uint64_t{page} << shift), stop = start + (std::uint64_t{1} << shift);
+        while (following < ranges.size() && ranges[following].begin <= start) ++following;
+        if (following == 0 || (following < ranges.size() && ranges[following].begin < stop)) continue;
+        const auto& range = ranges[following - 1u];
+        if (range.end < stop || (range.permissions & Abi::Read) == 0u) continue;
+        const std::uint64_t delta = range.deviceAddress - range.begin;
+        std::memcpy(words.data() + flatAt + 4u + 2u * page, &delta, 8);
+        ++flatEntries;
+    }
+    // Multi-level model: root word per 4 GiB window (leaf word index, 0 = none), leaf = 65536 16-byte entries.
+    const auto rootFirst = static_cast<std::uint32_t>(first >> 32u), rootCount = static_cast<std::uint32_t>(((last - 1u) >> 32u) - rootFirst + 1u);
+    const auto rootAt = static_cast<std::uint32_t>(words.size());
+    words.resize(words.size() + rootCount, 0u);
+    std::size_t segments = 0;
+    for (std::uint32_t window = 0; window < rootCount; ++window) {
+        const auto leaf = static_cast<std::uint32_t>(words.size());
+        words[rootAt + window] = leaf;
+        words.resize(words.size() + 65536u * 4u, 0u);
+        const auto windowBase = std::uint64_t{rootFirst + window} << 32u;
+        auto cursorRange = std::upper_bound(ranges.begin(), ranges.end(), windowBase, [](std::uint64_t value, const Abi::Range& range) { return value < range.end; });
+        for (std::uint32_t page = 0; page < 65536u; ++page) {
+            const auto start = windowBase + (std::uint64_t{page} << 16u), stop = start + 0x10000u;
+            while (cursorRange != ranges.end() && cursorRange->end <= start) ++cursorRange;
+            if (cursorRange == ranges.end() || cursorRange->begin >= stop) continue;
+            const auto after = cursorRange + 1;
+            if (after != ranges.end() && after->begin < stop) continue;  // two ranges in the page: Split in the real table
+            if ((cursorRange->permissions & Abi::Read) == 0u) continue;
+            const auto lo = static_cast<std::uint32_t>(std::max(cursorRange->begin, start) - start), hi = static_cast<std::uint32_t>(std::min(cursorRange->end, stop) - start);
+            const std::uint64_t target = cursorRange->deviceAddress - cursorRange->begin;
+            const auto at = leaf + page * 4u;
+            std::memcpy(words.data() + at, &target, 8);
+            words[at + 2] = lo | (1u << 18u) | (1u << 30u);
+            words[at + 3] = hi;
+            ++segments;
+        }
+    }
+    // 65536 sample addresses: a uniformly chosen range, a uniform dword in it.
+    constexpr std::uint32_t Samples = 65536;
+    std::vector<std::uint64_t> samples(Samples);
+    std::size_t flatSampleHits = 0, levelSampleHits = 0;
+    for (auto& sample : samples) {
+        const auto& range = ranges[next() % ranges.size()];
+        sample = range.begin + ((next() % ((range.end - range.begin) / 4u)) * 4u);
+        const auto flatPage = (sample - flatBase) >> shift;
+        std::uint64_t delta = 0;
+        std::memcpy(&delta, words.data() + flatAt + 4u + 2u * flatPage, 8);
+        if (delta != 0u) ++flatSampleHits;
+        const auto leaf = words[rootAt + static_cast<std::uint32_t>(sample >> 32u) - rootFirst];
+        const auto at = leaf + static_cast<std::uint32_t>((sample >> 16u) & 0xffffu) * 4u;
+        const auto offset = static_cast<std::uint32_t>(sample & 0xffffu);
+        if ((words[at + 2] >> 30u) == 1u && offset >= (words[at + 2] & 0x1ffffu) && offset + 4u <= words[at + 3]) ++levelSampleHits;
+    }
+    std::printf("P0S-E3 table: %zu ranges over %.2f GiB, %u flat pages of %u KiB (%zu mapped), %u windows (%zu segment pages), %.1f MiB; sample hits flat %.1f %%, levels %.1f %%\n", ranges.size(), static_cast<double>(last - first) / 1073741824.0, pages, (1u << shift) >> 10u, flatEntries, rootCount, segments, static_cast<double>(words.size()) * 4.0 / 1048576.0, 100.0 * static_cast<double>(flatSampleHits) / Samples, 100.0 * static_cast<double>(levelSampleHits) / Samples);
+    const auto usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    const VkMemoryPropertyFlags deviceVisible = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    Buffer params(context, 64 + Samples * 8u, usage, deviceVisible);
+    const auto invocations = std::size_t{groups} * 256u;
+    Buffer output(context, invocations * 4u, usage, deviceVisible);
+    std::memcpy(params.Bytes().data() + 64, samples.data(), Samples * 8u);
+    for (const bool deviceTable : {false, true}) {
+        Buffer table(context, words.size() * 4u, usage, deviceTable ? deviceVisible : VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT});
+        std::memcpy(table.Bytes().data(), words.data(), words.size() * 4u);
+        Pipeline pipeline(context, code, {&table, &params, &output});
+        for (const std::uint32_t chain : {0u, 1u}) {
+            for (const std::uint32_t mode : {0u, 1u, 2u}) {
+                const std::array<std::uint32_t, 8> fields{mode, lookups, chain, Samples, flatAt, rootAt, rootFirst, rootCount};
+                std::memcpy(params.Bytes().data(), fields.data(), sizeof(fields));
+                pipeline.Run(groups);
+                double best = 1e30;
+                for (int round = 0; round < 7; ++round) {
+                    const auto started = std::chrono::steady_clock::now();
+                    pipeline.Run(groups);
+                    best = std::min(best, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count());
+                }
+                std::uint32_t checksum = 0;
+                for (std::size_t word = 0; word < invocations; ++word) {
+                    std::uint32_t value = 0;
+                    std::memcpy(&value, output.Bytes().data() + word * 4u, 4);
+                    checksum = checksum * 31u + value;
+                }
+                std::printf("P0S-E3 table=%s chain=%u mode=%s best_ms=%.3f ns_per_lookup=%.3f checksum=%08x\n", deviceTable ? "device" : "host", chain, mode == 0u ? "range" : mode == 1u ? "flat" : "levels", best, best * 1e6 / (static_cast<double>(invocations) * lookups), checksum);
+                std::fflush(stdout);
+            }
+        }
     }
 }

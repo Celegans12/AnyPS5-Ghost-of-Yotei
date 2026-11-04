@@ -158,14 +158,14 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     const auto shift = BdaLoadWord(state, binary(spv::OpIAdd, u32, indexAt, constant(3)));
     const auto plainBad = binary(spv::OpLogicalOr, boolean, binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, available, constant(7)), constant(0)), binary(spv::OpINotEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3))));
     // With flat tables (P0s), a flat section of 4 + 2 * pages words follows the index.
-    auto flatWords = constant(0u);
+    std::uint32_t flatWords = 0u;
     if (flatTables) {
         const auto flatAt = binary(spv::OpIAdd, u32, binary(spv::OpIAdd, u32, indexAt, constant(indexHeaderWords + 1u)), buckets);
         const auto flatFits = binary(spv::OpLogicalAnd, boolean, binary(spv::OpLogicalAnd, boolean, headerFits, binary(spv::OpULessThanEqual, boolean, buckets, length)), binary(spv::OpULessThanEqual, boolean, binary(spv::OpIAdd, u32, flatAt, constant(4)), length));
         const auto pages = BdaLoadWord(state, binary(spv::OpIAdd, u32, Select(state, u32, flatFits, flatAt, constant(0)), constant(2)));
         flatWords = Select(state, u32, flatTable, Select(state, u32, flatFits, binary(spv::OpIAdd, u32, constant(4), binary(spv::OpShiftLeftLogical, u32, pages, constant(1))), constant(0x80000000u)), constant(0u));
     }
-    const auto indexBad = binary(spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, headerFits), binary(spv::OpLogicalOr, boolean, binary(spv::OpINotEqual, boolean, binary(spv::OpISub, u32, binary(spv::OpISub, u32, indexWords, flatWords), constant(indexHeaderWords + 1u)), buckets), binary(spv::OpLogicalOr, boolean, binary(spv::OpUGreaterThan, boolean, shift, constant(63)), binary(spv::OpIEqual, boolean, buckets, constant(0)))));
+    const auto indexBad = binary(spv::OpLogicalOr, boolean, Unary(state, spv::OpLogicalNot, boolean, headerFits), binary(spv::OpLogicalOr, boolean, binary(spv::OpINotEqual, boolean, binary(spv::OpISub, u32, flatTables ? binary(spv::OpISub, u32, indexWords, flatWords) : indexWords, constant(indexHeaderWords + 1u)), buckets), binary(spv::OpLogicalOr, boolean, binary(spv::OpUGreaterThan, boolean, shift, constant(63)), binary(spv::OpIEqual, boolean, buckets, constant(0)))));
     failFirst({
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(0)), constant(BdaAbi::Version)), BdaAbi::FaultReason::InvalidTable},
         {binary(spv::OpINotEqual, boolean, BdaLoadWord(state, constant(2)), constant(sizeof(BdaAbi::Range))), BdaAbi::FaultReason::InvalidTable},
