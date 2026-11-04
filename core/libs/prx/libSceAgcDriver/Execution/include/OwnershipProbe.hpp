@@ -24,7 +24,7 @@ public:
     std::uint32_t Rate() const { return rate; }
     bool Sampled(std::uint64_t unit) const;
     // GPU work wrote [begin, end) (recorded now, run later).
-    void NoteGpuWrite(std::uint64_t begin, std::uint64_t end);
+    void NoteGpuWrite(std::uint64_t begin, std::uint64_t end, std::uint8_t source = 0);
     // An address-based build reads [begin, end) in place (its BDA table points into the import).
     void NoteAddressHeap(std::uint64_t begin, std::uint64_t end);
     // The report since the last take (two lines), and a new window.
@@ -51,6 +51,26 @@ inline bool Enabled() {
 }
 // Prints the global sampler's lines when 10 s have passed since the last ones.
 void Report();
+
+inline constexpr std::uint8_t SourcePublish = 2;
+inline constexpr std::uint8_t SourceLease = 4;
+inline constexpr std::uint8_t SourceBdaReport = 8;
+inline constexpr std::uint8_t SourceStaged = 16;
+
+std::uint8_t CurrentSource();
+class SourceScope {
+public:
+    explicit SourceScope(std::uint8_t source);
+    ~SourceScope();
+    SourceScope(const SourceScope&) = delete;
+    SourceScope& operator=(const SourceScope&) = delete;
+
+private:
+    std::uint8_t previous;
+};
+
+void CloseWindow(const char* window);
+[[nodiscard]] bool LeaseMode();
 
 }
 

@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -170,14 +171,14 @@ bool Sampler::inAddressHeap(std::uint64_t unit) const {
     return Inside(heaps, unit, unit + Unit) || Inside(previousHeaps, unit, unit + Unit);
 }
 
-void Sampler::NoteGpuWrite(std::uint64_t begin, std::uint64_t end) {
+void Sampler::NoteGpuWrite(std::uint64_t begin, std::uint64_t end, std::uint8_t source) {
     if (rate == 0 || end <= begin) return;
     std::lock_guard lock(mutex);
     for (auto unit = begin & ~(Unit - 1); unit < end; unit += Unit) {
         gpuUnits.insert(unit);
         ++unitWrites;
         if (!Sampled(unit)) continue;
-        if (GuestArena::GuestArenaProbeArm_nid_no_patch(static_cast<std::uintptr_t>(unit), inAddressHeap(unit) ? TagAddressHeap : 0)) ++armed;
+        if (GuestArena::GuestArenaProbeArm_nid_no_patch(static_cast<std::uintptr_t>(unit), static_cast<std::uint8_t>((inAddressHeap(unit) ? TagAddressHeap : 0) | source))) ++armed;
         else ++refused;
     }
 }
@@ -234,6 +235,8 @@ std::string Sampler::Take(double seconds) {
     std::array<std::uint64_t, bounds.size() + 1> histogram{};
     std::vector<std::uint64_t> readLatency;
     std::vector<std::uint64_t> writeLatency;
+    std::array<std::array<std::uint64_t, 4>, 5> bySource{};
+    std::array<std::array<std::uint64_t, 2>, 5> byModule{};
 #ifdef _WIN32
     const auto self = reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr));
     HMODULE owner = nullptr;
@@ -241,6 +244,10 @@ std::string Sampler::Take(double seconds) {
     for (const auto& event : events) {
         const bool write = event.touch != static_cast<std::uint8_t>(GuestArena::ProbeTouch::Read);
         const bool heap = (event.tag & TagAddressHeap) != 0;
+        const std::size_t source = (event.tag & SourcePublish) != 0 ? 0 : (event.tag & SourceLease) != 0 ? 1 : (event.tag & SourceBdaReport) != 0 ? 2 : (event.tag & SourceStaged) != 0 ? 3 : 4;
+        ++bySource[source][write ? 1 : 0];
+        if (!write && event.latencyUs < 64000) ++bySource[source][2];
+        if (!write && event.latencyUs < 4000) ++bySource[source][3];
         auto& site = sites[event.rip];
         (write ? site.writes : site.reads) += 1;
         site.thread = event.thread;
@@ -264,6 +271,7 @@ std::string Sampler::Take(double seconds) {
         ++callerModules[caller != 0 ? ModuleOf(caller) : std::string("unresolved")];
 #ifdef _WIN32
         if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(event.rip), &owner) && reinterpret_cast<std::uint64_t>(owner) == self) ++mainModule;
+        if (caller != 0 && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(caller), &owner)) ++byModule[source][reinterpret_cast<std::uint64_t>(owner) == self ? 1 : 0];
 #endif
         if (write) {
             if (writtenUnits.insert(event.block).second && heap) ++writtenHeap;
@@ -304,6 +312,16 @@ std::string Sampler::Take(double seconds) {
         static_cast<unsigned long long>(histogram[0]), static_cast<unsigned long long>(histogram[1]), static_cast<unsigned long long>(histogram[2]), static_cast<unsigned long long>(histogram[3]), static_cast<unsigned long long>(histogram[4]), static_cast<unsigned long long>(histogram[5]), static_cast<unsigned long long>(histogram[6]),
         static_cast<double>(readMedian) / 1000.0, static_cast<double>(writeMedian) / 1000.0);
     std::string report = line;
+    {
+        static constexpr const char* sourceNames[] = {"publish", "lease", "bda-report", "staged", "other"};
+        report += "[ownership] by source (first touches, x1 sampled; r <64ms, r <4ms; caller module: not main / main):";
+        for (std::size_t k = 0; k < bySource.size(); ++k) {
+            char text[160];
+            std::snprintf(text, sizeof(text), " %s r%llu w%llu r<64ms %llu r<4ms %llu (driver %llu, exe %llu);", sourceNames[k], static_cast<unsigned long long>(bySource[k][0]), static_cast<unsigned long long>(bySource[k][1]), static_cast<unsigned long long>(bySource[k][2]), static_cast<unsigned long long>(bySource[k][3]), static_cast<unsigned long long>(byModule[k][0]), static_cast<unsigned long long>(byModule[k][1]));
+            report += text;
+        }
+        report += "\n";
+    }
     std::vector<std::pair<std::uint64_t, Site>> ranked(sites.begin(), sites.end());
     std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second.reads + a.second.writes > b.second.reads + b.second.writes; });
     report += "[ownership] sites (top 8 of " + std::to_string(ranked.size()) + ", " + std::to_string(threads.size()) + " threads):";
@@ -352,9 +370,41 @@ Sampler* Global() {
 #endif
 }
 
+namespace {
+thread_local std::uint8_t currentSource = 0;
+std::atomic<std::int64_t> lastTake{-1};
+}
+
+std::uint8_t CurrentSource() {
+    return currentSource;
+}
+
+SourceScope::SourceScope(std::uint8_t source) : previous(currentSource) {
+    currentSource = source;
+}
+
+SourceScope::~SourceScope() {
+    currentSource = previous;
+}
+
+bool LeaseMode() {
+    static const bool on = Global() != nullptr && std::getenv("APS5_P0M_PROBE_LEASES") != nullptr;
+    return on;
+}
+
+void CloseWindow(const char* window) {
+    auto* sampler = Global();
+    if (sampler == nullptr) return;
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    const auto previous = lastTake.exchange(now);
+    const auto text = sampler->Take(previous < 0 ? 0.0 : static_cast<double>(now - previous) / 1000.0);
+    ProfilePrint_nid_no_patch("[ownership] window=%s\n%s", window, text.c_str());
+}
+
 void Report() {
     auto* sampler = Global();
     if (sampler == nullptr) return;
+    if (ProfileWindows::FrameWindows()) return;
     static std::atomic<std::int64_t> last{-1};
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto previous = last.load(std::memory_order_relaxed);
