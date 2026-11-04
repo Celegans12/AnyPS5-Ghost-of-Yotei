@@ -1,4 +1,5 @@
 #include "Translation/InstructionTranslator.hpp"
+#include "P0sCeiling.hpp"
 #include "Recompiler.hpp"
 #include "Translation/DispatchInstructions.hpp"
 #include "Translation/TranslationContext.hpp"
@@ -226,9 +227,18 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
         }
     }
     entryIr.SetExec(*initialExec);
+    // P0s ceiling (APS5_P0S_CONST_EXEC): a compute program whose every wave starts full (no partial groups, a
+    // workgroup that is a whole number of waves, EXEC not narrowed above) starts with all lanes set, so its initial
+    // mask is a constant instead of a ballot (three spanned barriers each).
+    const bool constantExec = P0s::ConstExec() && options.stage == ShaderStageKind::Compute && workgroup != nullptr && initialExec->HasImmediate() && initialExec->ImmediateBool() && options.waveSize != 0u && totalThreads % options.waveSize == 0u;
+    if (constantExec) {
+        entryIr.SetExecLo(entryIr.Constant(0xffffffffu));
+        entryIr.SetExecHi(entryIr.Constant(options.waveSize == 64u ? 0xffffffffu : 0u));
+    } else {
     IrValue& initialMask = entryIr.Emit(IrOpcode::Ballot, IrOpcodeType(IrOpcode::Ballot), {initialExec});
     entryIr.SetExecLo(entryIr.CompositeExtract(initialMask, 0u));
     entryIr.SetExecHi(options.waveSize == 64u ? entryIr.CompositeExtract(initialMask, 1u) : entryIr.Constant(0u));
+    }
 
     if (options.stage == ShaderStageKind::Compute) {
         const auto* cs = options.inputInfo.compute;
