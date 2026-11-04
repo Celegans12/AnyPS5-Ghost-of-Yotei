@@ -5480,13 +5480,48 @@ bool ownShadowCurrent(std::uint64_t begin, std::uint64_t end, std::uint64_t gene
     return true;
 }
 
+// The verify read-backs (APS5_VERIFY_OWN_SHADOW / APS5_VERIFY_RESIDENT_PRISTINE) wait here for their completion. Never
+// destroyed (as Residents): a completion still pending when the process exits leaves its pair behind instead of its
+// closure releasing pooled buffers after the device's teardown (gcopy-r17 exit 139, Buffer::release -> the driver).
+struct VerifyReadbacks {
+    std::mutex mutex;
+    std::uint64_t next = 0;
+    std::unordered_map<std::uint64_t, std::pair<std::shared_ptr<Buffer>, std::shared_ptr<Buffer>>> pending;
+};
+
+VerifyReadbacks& PendingReadbacks() {
+    static auto* readbacks = new VerifyReadbacks;
+    return *readbacks;
+}
+
+std::uint64_t holdReadbacks(std::shared_ptr<Buffer> first, std::shared_ptr<Buffer> second) {
+    auto& readbacks = PendingReadbacks();
+    std::lock_guard lock(readbacks.mutex);
+    const auto id = ++readbacks.next;
+    readbacks.pending.emplace(id, std::make_pair(std::move(first), std::move(second)));
+    return id;
+}
+
+std::pair<std::shared_ptr<Buffer>, std::shared_ptr<Buffer>> takeReadbacks(std::uint64_t id) {
+    auto& readbacks = PendingReadbacks();
+    std::lock_guard lock(readbacks.mutex);
+    const auto found = readbacks.pending.find(id);
+    if (found == readbacks.pending.end()) return {};
+    auto pair = std::move(found->second);
+    readbacks.pending.erase(found);
+    return pair;
+}
+
 void verifyOwnShadow(const Context& context, Recorder& recorder, VkCommandBuffer commands, const std::shared_ptr<Buffer>& buffer, VkBuffer source, std::uint64_t sourceOffset, std::uint64_t bytes, std::uint64_t begin, std::uint64_t generation) {
     auto shadowCopy = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT, copyBufferProperties(false));
     auto importCopy = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT, copyBufferProperties(false));
     CopyBuffer(context, commands, buffer->Handle(), 0, shadowCopy->Handle(), 0, bytes);
     CopyBuffer(context, commands, source, sourceOffset, importCopy->Handle(), 0, bytes);
     recorder.Keep(buffer);
-    recorder.OnComplete([shadowCopy, importCopy, begin, generation] {
+    const auto held = holdReadbacks(std::move(shadowCopy), std::move(importCopy));
+    recorder.OnComplete([held, begin, generation] {
+        const auto [shadowCopy, importCopy] = takeReadbacks(held);
+        if (shadowCopy == nullptr) return;
         OwnShadows().checked.fetch_add(1, std::memory_order_relaxed);
         const auto a = shadowCopy->Bytes();
         const auto b = importCopy->Bytes();
@@ -5567,7 +5602,10 @@ void verifyResidentPristine(const Context& context, Recorder& recorder, VkComman
     CopyBuffer(context, commands, pristine->Handle(), 0, pristineCopy->Handle(), 0, bytes);
     recorder.Keep(buffer);
     recorder.Keep(pristine);
-    recorder.OnComplete([shadowCopy, pristineCopy] {
+    const auto held = holdReadbacks(std::move(shadowCopy), std::move(pristineCopy));
+    recorder.OnComplete([held] {
+        const auto [shadowCopy, pristineCopy] = takeReadbacks(held);
+        if (shadowCopy == nullptr) return;
         residentPristineChecked.fetch_add(1, std::memory_order_relaxed);
         if (std::memcmp(shadowCopy->Bytes().data(), pristineCopy->Bytes().data(), shadowCopy->Bytes().size()) != 0) {
             const auto mismatches = residentPristineMismatched.fetch_add(1, std::memory_order_relaxed) + 1;
