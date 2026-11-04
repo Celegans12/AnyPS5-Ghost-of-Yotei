@@ -6980,11 +6980,15 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             recorder->Keep(arguments);
             recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
             const auto begin = region->begin;
-            const auto generation = region->ownSyncGeneration;
             const auto groups = (dwords + 63u) / 64u;
-            recorder->BeforeSubmit([arguments, begin, bytes, generation, groups] {
+            // The use's own marks (its copy-back, MarkDirectWrites) come before the submission and after the copy-in in
+            // GPU order: they move the generation instead of turning the copy-in on. Any other stamp does.
+            auto decision = std::make_shared<Region::OwnSkip>();
+            decision->generation.store(region->ownSyncGeneration, std::memory_order_relaxed);
+            region->ownSkip = decision;
+            recorder->BeforeSubmit([arguments, begin, bytes, decision, groups] {
                 static_cast<void>(GuestMemory::CollectWrites(begin, static_cast<std::size_t>(bytes)));
-                if (GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(bytes), generation)) {
+                if (!decision->stale.load(std::memory_order_relaxed) && GuestMemory::UnchangedSince(begin, static_cast<std::size_t>(bytes), decision->generation.load(std::memory_order_relaxed))) {
                     OwnShadows().skipped.fetch_add(1, std::memory_order_relaxed);
                     OwnShadows().skippedTotal.fetch_add(1, std::memory_order_relaxed);
                     OwnShadows().skippedBytes.fetch_add(bytes, std::memory_order_relaxed);
@@ -7736,6 +7740,10 @@ void GuestBufferMemory::MarkDirectWrites() const {
             region->ownSyncPending = false;
             if (!current) region->ownSyncGeneration = 0;
             else if (marked != 0) region->ownSyncGeneration = std::max(region->ownSyncGeneration, marked);
+            if (const auto decision = std::exchange(region->ownSkip, nullptr)) {
+                if (!current) decision->stale.store(true, std::memory_order_relaxed);
+                else decision->generation.store(region->ownSyncGeneration, std::memory_order_relaxed);
+            }
         }
     };
     const auto updateResidents = [&](std::uint64_t marked) {

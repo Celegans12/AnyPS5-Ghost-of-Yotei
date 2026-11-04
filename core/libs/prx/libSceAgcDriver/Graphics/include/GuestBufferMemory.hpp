@@ -612,6 +612,14 @@ private:
         mutable std::uint64_t ownSyncGeneration = 0;
         mutable std::uint64_t ownForgetSerial = 0;
         mutable bool ownSyncPending = false;
+        // The submission-time decision of this use's deferred copy-in (APS5_OWN_SHADOW_CURRENT): the generation the
+        // range must be unchanged since (MarkDirectWrites moves it past the use's own marks), and whether anything
+        // else stamped the range before those marks.
+        struct OwnSkip {
+            std::atomic<std::uint64_t> generation{0};
+            std::atomic<bool> stale{false};
+        };
+        mutable std::shared_ptr<OwnSkip> ownSkip {};
         // A written descriptor range of an address-based build that lies inside one of the space's
         // import regions, given a region of its own so it can be staged device-local (see
         // resolveOverlays); the BDA table sends its guest addresses to this region's buffer instead
