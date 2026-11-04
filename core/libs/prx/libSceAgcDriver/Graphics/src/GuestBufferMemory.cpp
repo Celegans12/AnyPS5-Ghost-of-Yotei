@@ -5480,17 +5480,34 @@ bool ownShadowCurrent(std::uint64_t begin, std::uint64_t end, std::uint64_t gene
     return true;
 }
 
-void verifyOwnShadow(const Context& context, Recorder& recorder, VkCommandBuffer commands, const std::shared_ptr<Buffer>& buffer, VkBuffer source, std::uint64_t sourceOffset, std::uint64_t bytes) {
+void verifyOwnShadow(const Context& context, Recorder& recorder, VkCommandBuffer commands, const std::shared_ptr<Buffer>& buffer, VkBuffer source, std::uint64_t sourceOffset, std::uint64_t bytes, std::uint64_t begin, std::uint64_t generation) {
     auto shadowCopy = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT, copyBufferProperties(false));
     auto importCopy = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT, copyBufferProperties(false));
     CopyBuffer(context, commands, buffer->Handle(), 0, shadowCopy->Handle(), 0, bytes);
     CopyBuffer(context, commands, source, sourceOffset, importCopy->Handle(), 0, bytes);
     recorder.Keep(buffer);
-    recorder.OnComplete([shadowCopy, importCopy] {
+    recorder.OnComplete([shadowCopy, importCopy, begin, generation] {
         OwnShadows().checked.fetch_add(1, std::memory_order_relaxed);
-        if (std::memcmp(shadowCopy->Bytes().data(), importCopy->Bytes().data(), shadowCopy->Bytes().size()) != 0) {
+        const auto a = shadowCopy->Bytes();
+        const auto b = importCopy->Bytes();
+        if (std::memcmp(a.data(), b.data(), a.size()) != 0) {
             const auto mismatches = OwnShadows().mismatched.fetch_add(1, std::memory_order_relaxed) + 1;
-            if (mismatches <= 8) std::fprintf(stderr, "[own-shadow] VERIFY MISMATCH: a skipped copy-in's shadow differs from its import (%zu bytes)\n", shadowCopy->Bytes().size());
+            // Diagnostics: where, how many dwords, and whether anything stamped the range between the skip and this
+            // completion (a writer recorded after the skip that the GPU ran first, or a CPU store racing the batch:
+            // the old copy-in could have read either). No stamp at all would be a real hole in the rule.
+            std::size_t first = a.size(), differing = 0;
+            for (std::size_t at = 0; at + 4 <= a.size(); at += 4) {
+                if (std::memcmp(a.data() + at, b.data() + at, 4) == 0) continue;
+                if (first == a.size()) first = at;
+                ++differing;
+            }
+            std::uint32_t shadowWord = 0, importWord = 0;
+            if (first + 4 <= a.size()) {
+                std::memcpy(&shadowWord, a.data() + first, 4);
+                std::memcpy(&importWord, b.data() + first, 4);
+            }
+            const bool stamped = !GuestMemory::UnchangedSince(begin, a.size(), generation);
+            if (mismatches <= 16) std::fprintf(stderr, "[own-shadow] VERIFY MISMATCH: a skipped copy-in's shadow differs from its import: 0x%llx+0x%zx, %zu dwords differ, first at +0x%zx (shadow %08x import %08x); range stamped since the skip: %s\n", static_cast<unsigned long long>(begin), a.size(), differing, first, shadowWord, importWord, stamped ? "yes" : "no");
         }
     });
 }
@@ -6809,7 +6826,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             OwnShadows().skippedBytes.fetch_add(bytes, std::memory_order_relaxed);
             noteStagingTop(region->begin, region->end, region->residentReason, 0, bytes, 0);
             static const bool verifyOwn = std::getenv("APS5_VERIFY_OWN_SHADOW") != nullptr;
-            if (verifyOwn) verifyOwnShadow(context, *recorder, commands, region->buffer, copySource, copyOffset, bytes);
+            if (verifyOwn) verifyOwnShadow(context, *recorder, commands, region->buffer, copySource, copyOffset, bytes, region->begin, region->ownSyncGeneration);
             recorder->Keep(region->buffer);
             region->snapshot.clear();
             reportOwnShadows();
