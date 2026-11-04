@@ -161,6 +161,50 @@ bool HardwareFloat32Flush(const RecompileRequest& request) {
     return request.target.float32FlushToZero && (!request.context.floatMode.has_value() || ((request.context.floatMode->floatMode >> 4u) & 3u) == 0u);
 }
 
+struct BdaRangeMemoConfig {
+    std::uint32_t entries = 0;
+    std::vector<std::uint64_t> programs;
+};
+
+const BdaRangeMemoConfig& BdaRangeMemo() {
+    static const BdaRangeMemoConfig config = [] {
+        BdaRangeMemoConfig parsed;
+        const char* value = std::getenv("APS5_BDA_RANGE_MEMO");
+        if (value == nullptr) return parsed;
+        const std::string text(value);
+        const auto colon = text.find(':');
+        const auto entries = text.substr(0, colon);
+        if (entries.size() != 1u || entries[0] < '1' || static_cast<std::uint32_t>(entries[0] - '0') > BdaRangeMemoMaxEntries) throw std::runtime_error("APS5_BDA_RANGE_MEMO must be <entries 1-" + std::to_string(BdaRangeMemoMaxEntries) + ">[:<hex program address>,...], not " + text);
+        parsed.entries = static_cast<std::uint32_t>(entries[0] - '0');
+        if (colon == std::string::npos) return parsed;
+        std::size_t at = colon + 1u;
+        while (true) {
+            const auto comma = text.find(',', at);
+            const auto item = text.substr(at, comma == std::string::npos ? std::string::npos : comma - at);
+            std::size_t used = 0;
+            std::uint64_t address = 0;
+            try {
+                address = std::stoull(item, &used, 16);
+            } catch (const std::exception&) {
+                used = 0;
+            }
+            if (item.empty() || used != item.size()) throw std::runtime_error("APS5_BDA_RANGE_MEMO has an invalid program address: " + item);
+            parsed.programs.push_back(address);
+            if (comma == std::string::npos) break;
+            at = comma + 1u;
+        }
+        return parsed;
+    }();
+    return config;
+}
+
+std::uint32_t BdaRangeMemoEntries(const RecompileRequest& request) {
+    const auto& config = BdaRangeMemo();
+    if (config.entries == 0u) return 0u;
+    if (!config.programs.empty() && std::find(config.programs.begin(), config.programs.end(), request.shader.codeAddress) == config.programs.end()) return 0u;
+    return config.entries;
+}
+
 std::atomic<std::uint64_t> frontEndBuilds{0};
 
 }
@@ -696,6 +740,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     }
     targetOptions.waveLdsMemoryBarriers = request.target.waveLdsMemoryBarriers;
     targetOptions.deviceScopeLdsMemoryBarriers = request.target.deviceScopeLdsMemoryBarriers;
+    targetOptions.bdaRangeMemoEntries = BdaRangeMemoEntries(request);
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
