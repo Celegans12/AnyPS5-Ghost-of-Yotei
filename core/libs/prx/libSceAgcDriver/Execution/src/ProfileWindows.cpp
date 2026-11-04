@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CommandMix.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
@@ -46,6 +48,8 @@ void Close(const char* label) {
     CommandMix::Close(label);
     NewPath::Close(label);
     Graphics::ResidentCensus::Close(label);
+    Graphics::P0Mem::Close(label);
+    OwnershipProbe::CloseWindow(label);
     MemoryStats::ReportNow(label);
     ProfileOutput_nid_no_patch().Flush();
 }

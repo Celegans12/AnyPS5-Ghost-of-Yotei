@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -7790,6 +7792,22 @@ void ShaderResources::WriteBack() {
 }
 
 void ShaderResources::NoteResidentCensus() const {
+    if (OwnershipProbe::LeaseMode() && usesBda && !bdaReadOnly) {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> writable;
+        guestMemory.WritableLease(writable);
+        for (const auto& [begin, end] : writable) OwnershipProbe::Global()->NoteGpuWrite(begin, end, OwnershipProbe::SourceLease);
+    }
+    if (P0Mem::CensusEnabled()) {
+        guestMemory.NoteP0Census(usesBda && !bdaReadOnly);
+        for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+            const auto& storage = storageTextures[index];
+            if (storage == nullptr) continue;
+            const auto address = storage->Descriptor().baseAddress;
+            const auto end = address + storage->GuestBytes();
+            if (index < storageWritten.size() && storageWritten[index]) P0Mem::NoteGpuWrite(address, end);
+            else P0Mem::NoteGpuRead(P0Mem::Read::Bound, address, end);
+        }
+    }
     if (!ResidentCensus::Enabled()) return;
     guestMemory.NoteResidentCensus();
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -7824,7 +7842,10 @@ void ShaderResources::MarkGpuWritesInRun(Recorder& recorder, const std::shared_p
     }
     // A storage store-back above may have recorded a command, which closed the run: then as MarkGpuWrites.
     if (!recorder.RunOpen()) guestMemory.RecordCopyBacks(recorder);
-    recorder.NotePendingWrites(guestMemory.Writes());
+    {
+        const OwnershipProbe::SourceScope probeSource(OwnershipProbe::SourceStaged);
+        recorder.NotePendingWrites(guestMemory.Writes());
+    }
     guestMemory.MarkDirectWrites();
     if (!recorder.RunOpen()) return;
     recorder.AfterRun([self](Recorder& after) {
@@ -7857,7 +7878,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     guestMemory.RecordCopyBacks(recorder);
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
-    recorder.NotePendingWrites(guestMemory.Writes());
+    {
+        const OwnershipProbe::SourceScope probeSource(OwnershipProbe::SourceStaged);
+        recorder.NotePendingWrites(guestMemory.Writes());
+    }
     guestMemory.MarkDirectWrites();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();

@@ -923,6 +923,7 @@ public:
     // fault of a block probed earlier but disarmed since is the probe's too: the system dropped that
     // page's guard, so the access goes on.
     bool HandleProbe(std::uintptr_t address, bool write, bool guard, const CONTEXT* context) {
+        if (mutex.HeldByCurrentThread()) return false;
         if (probeLive.load(std::memory_order_acquire) == 0 && !(guard && probeUsed.load(std::memory_order_acquire))) return false;
         std::lock_guard lock(mutex);
         const auto block = address & ~std::uintptr_t{ownedBlockBytes - 1};
