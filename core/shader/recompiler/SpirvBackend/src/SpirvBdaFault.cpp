@@ -37,7 +37,7 @@ void DefineBdaFaultFunction(SpirvEmitterState& state) {
     state.bdaFaultFunction = state.module.AllocateId();
     state.module.AddName(state.bdaFaultFunction, "record_bda_fault");
     const auto type = words ? state.module.Type(spv::OpTypeFunction, TypeVoid(state), u32, addressType, u32, u32, u32) : state.module.Type(spv::OpTypeFunction, TypeVoid(state), u32, addressType, u32, u32);
-    state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.bdaFaultFunction, P0sHelperControl(), type);
+    state.module.AddFunction(spv::OpFunction, TypeVoid(state), state.bdaFaultFunction, P0sHelperControl(true), type);
     const auto reason = state.module.AllocateId();
     const auto address = state.module.AllocateId();
     const auto addressHigh = words ? state.module.AllocateId() : 0u;
