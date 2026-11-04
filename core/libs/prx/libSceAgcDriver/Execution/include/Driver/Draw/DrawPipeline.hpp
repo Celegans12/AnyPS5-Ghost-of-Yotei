@@ -54,6 +54,9 @@ public:
     enum class Event : std::uint8_t { IndirectCommit, IndirectArgsDrain, SatisfiedWaitKept, Count };
 
     static DrawPipeline& Queue0();
+    // P0-cpu (C0): with frame windows (ProfileWindows, a frame replay) the [draw] pipelined line closes
+    // at each replayed frame's flip instead of every 10 s, named `label`.
+    static void CloseProfileWindow(const char* label);
     static std::size_t Depth();
     static std::size_t QueuedItems();
     static bool PipelineIndirect();
@@ -154,7 +157,7 @@ private:
     void retire(Item&& item);
     void reap();
     void rethrowFailure();
-    void report(std::chrono::steady_clock::time_point now);
+    void report(std::chrono::steady_clock::time_point now, const char* label = "10 s");
 
     std::mutex mutex;
     std::condition_variable wake;

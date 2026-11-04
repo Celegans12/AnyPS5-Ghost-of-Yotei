@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -449,7 +450,15 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (!profile && !stats) return;
     const auto now = std::chrono::steady_clock::now();
-    if (now - lastReport >= std::chrono::seconds(10)) report(now);
+    if (!ProfileWindows::FrameWindows() && now - lastReport >= std::chrono::seconds(10)) report(now);
+}
+
+void DrawPipeline::CloseProfileWindow(const char* label) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!profile) return;
+    auto& pipeline = Queue0();
+    std::lock_guard lock(pipeline.mutex);
+    pipeline.report(std::chrono::steady_clock::now(), label);
 }
 
 // APS5_PROFILE_DRAW: the pending-write scans (Overlaps, OverlapsAny, DrainIfOverlaps) walk every write range of
@@ -468,7 +477,7 @@ void DrawPipeline::noteWriteScan() {
     writeScanDistinct += static_cast<std::uint64_t>(std::unique(ranges.begin(), ranges.end()) - ranges.begin());
 }
 
-void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
+void DrawPipeline::report(std::chrono::steady_clock::time_point now, const char* label) {
     const auto windowNs = std::max<double>(1.0, static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lastReport).count()));
     lastReport = now;
     std::string drainText;
@@ -517,7 +526,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     std::snprintf(scans, sizeof(scans), "; write scans %llu over %.1f items, %.1f ranges, %.1f distinct", static_cast<unsigned long long>(writeScans), perSample(writeScanItems), perSample(writeScanRanges), perSample(writeScanDistinct));
     drainText += scans;
     writeScans = writeScanSamples = writeScanItems = writeScanRanges = writeScanDistinct = 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; indirect commits %llu, indirect drains (args overlap) %llu; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), drainText.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (%s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; indirect commits %llu, indirect drains (args overlap) %llu; drains:%s\n", label, Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     roomWaits = roomWakeNs = drainWaits = drainWakeNs = committerIdles = committerIdleNs = committerWakeNs = 0;
     drains = {};
