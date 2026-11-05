@@ -337,6 +337,7 @@ void FailuresSurfaceAtTheSubmit() {
     }
     Expect(threw, "Drain did not throw the failed queued call");
     endResult = VK_SUCCESS;
+    RecordWorker::ForTestsReset(&mockProc);
 }
 
 void ManyThreadsAcrossBlocks() {

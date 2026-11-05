@@ -846,7 +846,11 @@ void Close(const char* label) {
 }
 
 void ForTestsReset(PFN_vkGetDeviceProcAddr resolver) {
-    Drain();
+    if (state().started.load(std::memory_order_acquire)) {
+        auto& s = state();
+        std::lock_guard lock(s.producer);
+        drainTo(s.pushed);
+    }
 #define APS5_V3E_RECORD_CLEAR(name, kind) Real<Id_##name, PFN_##name>::function.store(nullptr, std::memory_order_relaxed);
     APS5_V3E_RECORD_CALLS(APS5_V3E_RECORD_CLEAR)
 #undef APS5_V3E_RECORD_CLEAR
