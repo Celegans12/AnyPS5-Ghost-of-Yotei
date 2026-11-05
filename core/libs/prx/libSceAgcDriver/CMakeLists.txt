@@ -3477,7 +3477,7 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_gated_dispatch_capture_short_timeout PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-    foreach(agcLandAheadTest IN ITEMS agc_driver_gated_dispatch_capture agc_driver_dispatch_ahead_adopt_check)
+    foreach(agcLandAheadTest IN ITEMS agc_driver_gated_dispatch_capture agc_driver_dispatch_ahead_adopt_check agc_driver_land_ahead_capture)
         add_test(NAME ${agcLandAheadTest}_land_ahead COMMAND ${agcLandAheadTest}_tests)
         set_tests_properties(${agcLandAheadTest}_land_ahead PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_V3_LAND_AHEAD=1;APS5_V3W_CENSUS=trace" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         if(WIN32)
