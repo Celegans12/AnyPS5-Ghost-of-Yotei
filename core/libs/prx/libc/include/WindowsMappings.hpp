@@ -22,6 +22,52 @@
 #include <string>
 #include <system_error>
 #include <utility>
+#include <chrono>
+#include <cstdlib>
+
+// P0-cpu (C0) diagnostic, APS5_P0C_COLLECT_STATS=1 (default off): where a write-watch collect's time goes
+// (mapping-mutex wait, time held, resident runs on the GetWriteWatch fast path or the per-page fresh path, shared
+// views visited, private regions queried), printed to stderr every 16384 collects. Measurement only.
+namespace P0cCollectStats {
+inline bool On() {
+    static const bool on = std::getenv("APS5_P0C_COLLECT_STATS") != nullptr;
+    return on;
+}
+struct Counters {
+    std::atomic<std::uint64_t> calls{0}, waitNs{0}, heldNs{0}, residentFast{0}, residentFastNs{0}, residentSlow{0}, residentSlowNs{0}, views{0}, privateQueries{0}, privateNs{0}, bytes{0};
+};
+inline Counters& Get() {
+    static Counters counters;
+    return counters;
+}
+inline std::uint64_t Now() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+inline void Report() {
+    auto& c = Get();
+    const auto n = c.calls.load();
+    const auto ms = [](std::uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+    std::fprintf(stderr, "[p0c-collect] %llu collects over %.0f MiB: mutex wait %.1f ms, held %.1f ms; resident fast %llu (%.1f ms), resident per-page %llu (%.1f ms), views %llu, private queries %llu (%.1f ms)\n",
+                 static_cast<unsigned long long>(n), static_cast<double>(c.bytes.load()) / 1048576.0, ms(c.waitNs.load()), ms(c.heldNs.load()), static_cast<unsigned long long>(c.residentFast.load()), ms(c.residentFastNs.load()), static_cast<unsigned long long>(c.residentSlow.load()), ms(c.residentSlowNs.load()),
+                 static_cast<unsigned long long>(c.views.load()), static_cast<unsigned long long>(c.privateQueries.load()), ms(c.privateNs.load()));
+}
+struct Scope {
+    std::uint64_t held = 0;
+    explicit Scope(std::uint64_t waitStart, std::size_t bytes) {
+        if (!On()) return;
+        held = Now();
+        auto& c = Get();
+        c.waitNs += held - waitStart;
+        c.bytes += bytes;
+    }
+    ~Scope() {
+        if (held == 0) return;
+        auto& c = Get();
+        c.heldNs += Now() - held;
+        if ((++c.calls & 16383u) == 0) Report();
+    }
+};
+}
 
 namespace GuestArena {
 
@@ -793,7 +839,9 @@ public:
     }
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
+        const auto p0cWait = P0cCollectStats::On() ? P0cCollectStats::Now() : 0;
         std::lock_guard lock(mutex);
+        const P0cCollectStats::Scope p0cScope(p0cWait, bytes);
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -837,10 +885,18 @@ public:
                 if (available == 0) return true;
                 const auto run = std::prev(residentRuns.upper_bound(cursor));
                 const auto stop = std::min({end, run->second.end, (cursor & ~std::uintptr_t{4095}) + available * 4096, nextClean == cleanRanges.end() ? end : nextClean->first});
+                const auto p0cAt = P0cCollectStats::On() ? P0cCollectStats::Now() : 0;
+                const bool p0cFast = run->second.fresh == 0 && collection != Collection::Fresh;
                 collectResident(run->first, run->second, cursor, stop, pages, count, clear, collection);
+                if (p0cAt != 0) {
+                    auto& p0c = P0cCollectStats::Get();
+                    (p0cFast ? p0c.residentFast : p0c.residentSlow) += 1;
+                    (p0cFast ? p0c.residentFastNs : p0c.residentSlowNs) += P0cCollectStats::Now() - p0cAt;
+                }
                 if (*count == capacity) return true;
                 cursor = stop;
             } else if (found != views.end()) {
+                if (P0cCollectStats::On()) P0cCollectStats::Get().views += 1;
                 auto& view = found->second;
                 auto stop = std::min(std::min(end, base + pageBytes), nextClean == cleanRanges.end() ? end : nextClean->first);
                 if (collection != Collection::All) {
@@ -927,7 +983,29 @@ public:
                     cursor = next == views.end() ? end : std::min(end, next->first);
                     continue;
                 }
+                // P0-cpu diagnostic (APS5_P0C_FAST_PRIVATE_COLLECT=1, default off, replay only, not proven exact: an
+                // uncommitted piece of the allocation counts as collected instead of refusing the walk): try the
+                // write-watch read over the rest of the range first and skip the VirtualQuery, whose cost grows with the
+                // size of the private region it describes (the replay restores guest memory into a few GB-sized regions).
+                static const bool p0cFastPrivate = std::getenv("APS5_P0C_FAST_PRIVATE_COLLECT") != nullptr;
+                if (p0cFastPrivate && capacity > *count) {
+                    const auto room = capacity - *count;
+                    ULONG_PTR available = room;
+                    DWORD granularity = 0;
+                    const ResetWindow window(ownedResets, clear);
+                    if (GetWriteWatch(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), end - cursor, pages + *count, &available, &granularity) == 0) {
+                        *count += watchTaken(pages + *count, available, room, cursor, end, clear);
+                        if (*count == capacity) return true;
+                        cursor = end;
+                        continue;
+                    }
+                }
+                const auto p0cAt = P0cCollectStats::On() ? P0cCollectStats::Now() : 0;
                 const auto memory = query(cursor);
+                if (p0cAt != 0) {
+                    P0cCollectStats::Get().privateQueries += 1;
+                    P0cCollectStats::Get().privateNs += P0cCollectStats::Now() - p0cAt;
+                }
                 if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                 const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
                 if (capacity == *count) return true;
