@@ -2383,7 +2383,7 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess, std::source_loc
     // for a caller whose ranges overlap a queued store: FlushStores).
     if (open->renderPass.open) endOpenRenderPass();
     if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
-    if (!open->homeSettles.empty() && !homeScopeActive()) settleHomesNow(0, 0, nullptr);
+    if (!open->homeSettles.empty() && !homeScopeActive() && !HomesCeiling()) settleHomesNow(0, 0, nullptr);
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
     return open->commands;
@@ -2398,7 +2398,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(1, where);
-    if (!open->homeSettles.empty() && !homeScopeActive()) settleHomesNow(0, 0, nullptr);
+    if (!open->homeSettles.empty() && !homeScopeActive() && !HomesCeiling()) settleHomesNow(0, 0, nullptr);
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         const auto commands = Commands();
@@ -2584,7 +2584,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(3, where);
-    if (!open->homeSettles.empty()) settleHomesNow(address, address + bytes.size(), nullptr);
+    if (!open->homeSettles.empty() && !HomesCeiling()) settleHomesNow(address, address + bytes.size(), nullptr);
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -6028,6 +6028,11 @@ bool homeScopeActive() {
 
 bool Recorder::HomesEnabled() {
     static const bool enabled = std::getenv("APS5_V3M_HOMES") != nullptr;
+    return enabled;
+}
+
+bool Recorder::HomesCeiling() {
+    static const bool enabled = HomesEnabled() && std::getenv("APS5_V3M_CEIL") != nullptr;
     return enabled;
 }
 

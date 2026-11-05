@@ -5740,7 +5740,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     runAccesses.clear();
     if (overlapCapable) resources.RunAccesses(runAccesses);
     if (overlapCapable && record.shader->program->bindlessHeap) runAccesses.push_back({0, std::numeric_limits<std::uint64_t>::max(), Graphics::Recorder::RunAccessImage | Graphics::Recorder::RunAccessWritten});
-    if (Graphics::Recorder::HomesEnabled()) {
+    if (Graphics::Recorder::HomesEnabled() && !Graphics::Recorder::HomesCeiling()) {
         if (resources.HoldsLease()) {
             recorder.SettleHomes();
         } else {

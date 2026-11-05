@@ -6285,7 +6285,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         GuestMemory::PublishGpuOwned(region->begin, static_cast<std::size_t>(region->end - region->begin));
     }
     const bool homes = Recorder::HomesEnabled();
-    if (homes) {
+    const bool ceiling = Recorder::HomesCeiling();
+    if (homes && !ceiling) {
         for (const auto* region : copies) {
             const bool ownCurrent = region->resident && region->deviceLocal && region->buffer != nullptr && recorder->HomeSettlePendingFor(region->buffer.get()) && residentPeek(region->begin, region->end, region->buffer);
             recorder->SettleHomes(region->begin, region->end, ownCurrent ? region->buffer.get() : nullptr);
@@ -6321,7 +6322,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->NoteAccess(Recorder::CommandClass::StagingIn, Recorder::Access{reads, {}, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     }
     constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
-    if (!inRun && !Recorder::ElideCovered(Recorder::CommandClass::StagingIn, leading, covered)) {
+    if (!inRun && !ceiling && !Recorder::ElideCovered(Recorder::CommandClass::StagingIn, leading, covered)) {
         RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
         Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
     }
@@ -6498,7 +6499,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 recorder->Keep(region->pristine);
             }
         } else if (!diffed.empty()) {
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            if (!ceiling) RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
             Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
             for (auto* region : diffed) {
                 CopyBuffer(context, commands, region->buffer->Handle(), 0, region->pristine->Handle(), 0, region->end - region->begin);
@@ -6511,7 +6512,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
     // tessellation shaders too (the batch's own barriers around dispatches are as wide). A
     // prelude's copies get the prelude's barrier at its end (Recorder::sealPrelude).
-    if (!prelude) {
+    if (!prelude && !ceiling) {
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
         recorder->MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);

@@ -522,6 +522,7 @@ public:
     bool HomeSettlePendingOver(std::uint64_t begin, std::uint64_t end, const void* except = nullptr) const;
     void SettleHomes(std::uint64_t begin = 0, std::uint64_t end = 0, const void* except = nullptr);
     static bool HomesEnabled();
+    static bool HomesCeiling();
     struct HomeScope {
         HomeScope();
         ~HomeScope();
