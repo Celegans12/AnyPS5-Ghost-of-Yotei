@@ -2529,6 +2529,7 @@ void Recorder::ensureOpen() {
     if (open == nullptr) {
         auto batch = std::make_unique<Batch>();
         batch->lane = currentLane();
+        if (HomeCensus::CpuEnabled()) batch->openedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         try {
             auto& spares = spare[static_cast<std::size_t>(currentLane())];
             if (!spares.empty()) {
@@ -5129,6 +5130,7 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     HomeCensus::BatchEnd(open->lane);
+    if (open->openedNs != 0) HomeCensus::AddCpu(HomeCensus::Cpu::BatchSpan, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() - open->openedNs));
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     flushDeferredDispatch(6);
     sealPrelude();

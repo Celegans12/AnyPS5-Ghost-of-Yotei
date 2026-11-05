@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
 #include <chrono>
 #include <cstdlib>
@@ -369,7 +370,37 @@ void BatchEnd(int lane) {
     if (ProfileWindows::ClockDue(state.lastReport)) print(state, "10 s");
 }
 
+namespace {
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Cpu::Count) + 1> cpuNs{};
+std::int64_t nowNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}
+
+bool CpuEnabled() {
+    static const bool enabled = std::getenv("APS5_V3M_CPU") != nullptr;
+    return enabled;
+}
+
+void AddCpu(Cpu kind, std::uint64_t nanoseconds) {
+    if (!CpuEnabled()) return;
+    cpuNs[static_cast<std::size_t>(kind)].fetch_add(nanoseconds, std::memory_order_relaxed);
+    if (kind == Cpu::BatchSpan) cpuNs[static_cast<std::size_t>(Cpu::Count)].fetch_add(1, std::memory_order_relaxed);
+}
+
+CpuScope::CpuScope(Cpu kind) : kind(kind), start(CpuEnabled() ? nowNs() : 0) {}
+
+CpuScope::~CpuScope() {
+    if (start != 0) AddCpu(kind, static_cast<std::uint64_t>(nowNs() - start));
+}
+
 void Close(const char* window) {
+    if (CpuEnabled()) {
+        const auto take = [](Cpu kind) { return cpuNs[static_cast<std::size_t>(kind)].exchange(0, std::memory_order_relaxed) / 1e6; };
+        const double ins = take(Cpu::CopyIns), backs = take(Cpu::CopyBacks), span = take(Cpu::BatchSpan);
+        const auto batches = cpuNs[static_cast<std::size_t>(Cpu::Count)].exchange(0, std::memory_order_relaxed);
+        AgcDriver::ProfilePrint_nid_no_patch("[v3m-cpu] window=%s batches %llu, open-to-submit %.1f ms (%.2f ms/batch), copy-in recording %.1f ms, copy-back recording %.1f ms\n", window, static_cast<unsigned long long>(batches), span, batches != 0 ? span / static_cast<double>(batches) : 0.0, ins, backs);
+    }
     if (!Enabled()) return;
     auto& state = Get();
     std::lock_guard lock(state.mutex);

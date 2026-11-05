@@ -1007,6 +1007,7 @@ private:
         // See AfterRun.
         std::vector<std::function<void(Recorder&)>> afterRun;
         std::vector<HomeSettle> homeSettles;
+        std::int64_t openedNs = 0;
         // See NoteRunAccess: {begin, end, flags, program} of the open run's dispatches, and the copied
         // regions with atomics among them (RunAtomicConflict).
         std::vector<std::array<std::uint64_t, 4>> runAccess;

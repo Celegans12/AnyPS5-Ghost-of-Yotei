@@ -3163,6 +3163,8 @@ thread_local double lastCpuUploadWaitMs = 0;
 }
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
+    static const bool residentCeiling = std::getenv("APS5_V3M_RESCEIL") != nullptr;
+    if (residentCeiling && version > 0) return;
     const bool profile = LookupOutcomes::Profiled();
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));

@@ -5184,7 +5184,22 @@ void reportResidents(ResidentRanges& residents) {
 
 // The resident buffer a fresh build of the main lane binds for the staged range [begin, end), made once
 // the range was copied in ResidentPromoteAfter times in a report window; nullptr otherwise.
+bool residentCeiling() {
+    static const bool enabled = std::getenv("APS5_V3M_RESCEIL") != nullptr;
+    return enabled;
+}
+
 std::shared_ptr<Buffer> residentBuffer(const Context& context, std::uint64_t begin, std::uint64_t end) {
+    if (residentCeiling()) {
+        auto& residents = Residents();
+        std::lock_guard lock(residents.mutex);
+        auto& entry = residents.ranges[{begin, end}];
+        if (entry.buffer == nullptr) {
+            entry.buffer = stagingBuffer(context, static_cast<std::size_t>(end - begin), gpuCopyUsage(true) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            entry.syncGeneration = 0;
+        }
+        return entry.buffer;
+    }
     const bool homes = Recorder::HomesEnabled();
     if (RuntimeSwitches::Set(RuntimeSwitch::NoResidentRanges) || Recorder::ThreadLane() != 0 || end - begin < (homes ? HomeMinBytes : ResidentMinBytes)) return nullptr;
     auto& residents = Residents();
@@ -6273,6 +6288,7 @@ void GuestBufferMemory::ReportGpuSources() {
 }
 
 void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool addressable) {
+    const HomeCensus::CpuScope cpuScope(HomeCensus::Cpu::CopyIns);
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool capture = std::getenv("APS5_CAPTURE_GPU_COPIES") != nullptr;
     Require(!capture || CaptureTrace::Enabled(), "GPU copy capture requires APS5_CAPTURE_TRACE");
@@ -6285,7 +6301,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         GuestMemory::PublishGpuOwned(region->begin, static_cast<std::size_t>(region->end - region->begin));
     }
     const bool homes = Recorder::HomesEnabled();
-    const bool ceiling = Recorder::HomesCeiling();
+    const bool ceiling = Recorder::HomesCeiling() || residentCeiling();
     if (homes && !ceiling) {
         for (const auto* region : copies) {
             const bool ownCurrent = region->resident && region->deviceLocal && region->buffer != nullptr && recorder->HomeSettlePendingFor(region->buffer.get()) && residentPeek(region->begin, region->end, region->buffer);
@@ -6419,7 +6435,14 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, address);
-        const bool residentSkip = region->resident && region->deviceLocal && expected.empty() && residentCurrent(region->begin, region->end, region->buffer);
+        bool ceilingSeeded = false;
+        if (residentCeiling() && region->resident && region->deviceLocal) {
+            auto& residents = Residents();
+            std::lock_guard lock(residents.mutex);
+            static std::set<const Buffer*> seeded;
+            ceilingSeeded = !seeded.insert(region->buffer.get()).second;
+        }
+        const bool residentSkip = ceilingSeeded || (region->resident && region->deviceLocal && expected.empty() && residentCurrent(region->begin, region->end, region->buffer));
         if (region->deviceLocal && HomeCensus::Enabled()) HomeCensus::Use(region->begin, region->end, writes, residentSkip);
         if (residentSkip) {
             copiedBytes -= bytes;
@@ -6478,7 +6501,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 continue;
             }
             region->diffUse = false;
-            if (!active) continue;
+            if (!active || residentCeiling()) continue;
             if (!region->deviceLocal || region->buffer == nullptr || region->buffer->DeviceAddress() == 0 || region->copySourceAddress == 0) {
                 region->pristine.reset();
                 continue;
@@ -6521,6 +6544,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
 }
 
 void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
+    const HomeCensus::CpuScope cpuScope(HomeCensus::Cpu::CopyBacks);
     if (!uploaded || committed) return;
     if (ResidencyActive()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
@@ -6589,6 +6613,11 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     const bool homes = Recorder::HomesEnabled();
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
+        if (residentCeiling() && region.deviceLocal) {
+            recorder.Keep(region.buffer);
+            region.copiedBack = true;
+            continue;
+        }
         if (homes && region.deviceLocal && diff && region.diffUse && region.pristine != nullptr && region.copySourceAddress != 0 && region.buffer != nullptr && region.buffer->DeviceAddress() != 0 && region.begin % 4u == 0 && region.copySourceBase % 4u == 0 && region.copySourceAddress % 4u == 0) {
             Recorder::HomeSettle settle;
             for (const auto& [begin, end] : merged) {

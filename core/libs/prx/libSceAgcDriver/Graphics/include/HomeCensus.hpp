@@ -21,6 +21,20 @@ void Read(int kind, std::uint64_t begin, std::uint64_t end);
 void ReadGroup(int kind, Ranges ranges);
 void BatchEnd(int lane);
 void Close(const char* window);
+enum class Cpu : int { CopyIns = 0, CopyBacks, BatchSpan, Count };
+bool CpuEnabled();
+void AddCpu(Cpu kind, std::uint64_t nanoseconds);
+class CpuScope {
+public:
+    explicit CpuScope(Cpu kind);
+    ~CpuScope();
+    CpuScope(const CpuScope&) = delete;
+    CpuScope& operator=(const CpuScope&) = delete;
+
+private:
+    Cpu kind;
+    std::int64_t start;
+};
 
 class NoteScope {
 public:
