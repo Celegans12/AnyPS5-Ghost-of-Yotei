@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/LandCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
@@ -615,7 +616,8 @@ void Driver::execute(const Submission& submission) {
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15 || opcode == 0x16) {
             packetCounters.CountDispatch();
-            landPendingWaits(submission.queue);
+            const bool landAhead = gateOpened() && !pendingWaits().empty() && Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3LandAhead);
+            if (!landAhead) landPendingWaits(submission.queue);
             currentPacketOffset() = cursor;
             if (gateOpened()) {
                 gateOpened() = false;
@@ -624,6 +626,11 @@ void Driver::execute(const Submission& submission) {
                     if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
                     timed(&WorkerProfile::dispatchMs, [&] { resolveGroupAhead(submission, queue, cursor); });
                 }
+            }
+            if (landAhead) {
+                landingAhead() = true;
+                landPendingWaits(submission.queue);
+                landingAhead() = false;
             }
             if (ringOverlap) Graphics::Recorder::SetDispatchOrder(submission.queue + 1u, ringOrder.afterDispatch);
             struct ClearOrder {
@@ -709,7 +716,9 @@ void Driver::execute(const Submission& submission) {
         } else if (opcode == 0x22) {
             landPendingWaits(submission.queue);
             recordQueuedLabelsBeforeRead(submission.queue);
+            const auto condProbe = LandCensus::BeforeCondition(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u));
             const auto condition = Pm4::ReadCondition(packet);
+            LandCensus::AfterCondition(submission.queue, condProbe, condition);
             if (condition == 0) {
                 nextCursor = submission.conditionalEnds.at(cursor);
                 if (ahead != nullptr) ahead->Skip(aheadSegment, nextCursor);

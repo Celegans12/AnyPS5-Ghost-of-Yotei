@@ -359,10 +359,13 @@ private:
         std::array<std::uint32_t, 8> words;
         std::size_t count;
         std::uint64_t received;
+        std::uint32_t writer = 0xffffffffu;
+        std::uint64_t generation = 0;
     };
     static std::vector<PendingWait>& pendingWaits();
-    static void notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received);
+    static void notePendingWait(std::span<const std::uint32_t> packet, std::uint32_t queue, std::uint64_t received, std::uint32_t writer = 0xffffffffu);
     void landPendingWaits(std::uint32_t queue);
+    static bool& landingAhead();
     struct ResolvedDispatch {
         std::uint64_t address = 0, key = 0, indirectArguments = 0;
         std::array<std::uint32_t, 5> packet{};

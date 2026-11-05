@@ -98,6 +98,8 @@ enum class RuntimeSwitch : std::size_t {
     DeferLabelReadback,
     DispatchCacheLarge,
     ResourceCacheLarge,
+    V3LandAhead,
+    V3wCeilNoLand,
     Count,
 };
 

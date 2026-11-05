@@ -356,6 +356,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/BindlessPriming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/DeferredLabels.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/LabelHistory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/LandCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/SynchronizationStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitStatistics.cpp
@@ -3476,6 +3477,13 @@ if(BUILD_TESTING)
         set_tests_properties(agc_driver_gated_dispatch_capture_short_timeout PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+    foreach(agcLandAheadTest IN ITEMS agc_driver_gated_dispatch_capture agc_driver_dispatch_ahead_adopt_check)
+        add_test(NAME ${agcLandAheadTest}_land_ahead COMMAND ${agcLandAheadTest}_tests)
+        set_tests_properties(${agcLandAheadTest}_land_ahead PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_V3_LAND_AHEAD=1;APS5_V3W_CENSUS=trace" SKIP_RETURN_CODE 77 TIMEOUT 60 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(${agcLandAheadTest}_land_ahead PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     set_tests_properties(agc_driver_provoking_vertex PROPERTIES TIMEOUT 30)
     set_tests_properties(agc_driver_direct_image_refusal PROPERTIES TIMEOUT 60)
     add_test(NAME agc_driver_image_sample_unnormalized_wrap COMMAND agc_driver_image_sample_unnormalized_tests)
