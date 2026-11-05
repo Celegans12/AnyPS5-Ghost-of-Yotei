@@ -62,6 +62,9 @@
 
 namespace AgcDriver::Graphics {
 
+void P0gImportCreated(VkDeviceAddress address, const void* host, std::uint64_t bytes);
+void P0gImportDestroyed(VkDeviceAddress address);
+
 // Image mirrors. The main guest image (the PE at 0x7ff6b...) is MEM_IMAGE memory, which
 // VK_EXT_external_memory_host refuses, and address-based shaders map every registered range, so each
 // of their builds copied the whole image (~55 MiB: ~40 MiB of read-only sections snapshotted and copied
@@ -408,6 +411,7 @@ void releaseSettleBatches(VkDevice device, ImportSettle& settle) {
 #endif
 
 void destroyImport(const Context& context, const HostImport& entry) {
+    P0gImportDestroyed(entry.address);
     context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer")(context.device, entry.buffer, nullptr);
     context.Function<PFN_vkFreeMemory>("vkFreeMemory")(context.device, entry.memory, nullptr);
 #ifdef _WIN32
@@ -427,6 +431,7 @@ struct RetiredImport {
     ~RetiredImport() {
         const auto& entry = node.mapped();
         destroyBuffer(device, entry.buffer, nullptr);
+        P0gImportDestroyed(entry.address);
         freeMemory(device, entry.memory, nullptr);
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);
@@ -591,7 +596,9 @@ const char* createHostPointerImport(const Context& context, HostImport& entry, V
     }
     const VkImportMemoryHostPointerInfoEXT import{VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT, nullptr, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host};
     bool allocated = false;
-    return bindImport(context, entry, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, &import, pointer.memoryTypeBits, allocated, failure);
+    const char* step = bindImport(context, entry, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, &import, pointer.memoryTypeBits, allocated, failure);
+    if (step == nullptr) P0gImportCreated(entry.address, host, entry.bytes);
+    return step;
 }
 
 #ifndef _WIN32
@@ -4998,6 +5005,16 @@ bool atomicStagingEnabled() {
     return !disabled;
 }
 
+std::uint64_t stageReadsMax() {
+    static const std::uint64_t bytes = [] {
+        const char* value = std::getenv("APS5_P0G_STAGE_READS");
+        if (value == nullptr || *value == '\0') return std::uint64_t{0};
+        const auto kib = std::strtoull(value, nullptr, 0);
+        return (kib == 0 ? std::uint64_t{256} << 10u : kib) << 10u;
+    }();
+    return bytes;
+}
+
 // APS5_STAGING_DIFF=1: a staged region's copy-back stores only the dwords its work changed. The
 // copy-in also copies the shadow into a device-local `pristine` buffer (VRAM to VRAM), and the
 // copy-back runs Recorder::RecordStagingDiff over each written range: a dword whose result equals
@@ -5313,13 +5330,13 @@ bool GuestBufferMemory::bindableInPlace(std::uint64_t offset, bool addressable) 
 bool GuestBufferMemory::stagingEligible(const Region& region, bool addressable) const {
     if (!stagingAllowed || (addressable && !region.overlay) || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
     const auto bytes = region.end - region.begin;
-    if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
+    if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return bytes <= stageReadsMax();
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
     return writtenShadowEnabled() && writtenShadowAffordable(context) && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(context.discreteGpu), context.discreteGpu ? DiscreteSweptShadowMax : SweptShadowMax) : writtenShadowMax(context.discreteGpu));
 }
 
 bool GuestBufferMemory::overlayCandidate(const Region& inside, bool readOnly) const {
-    return !readOnly && bdaStaging && stagingAllowed && addressStaging && gpuCopiesEnabled() && writtenShadowEnabled() && inside.direct != nullptr && inside.mirror == nullptr && !inside.sparse && Recorder::Active() != nullptr;
+    return (!readOnly || stageReadsMax() != 0) && bdaStaging && stagingAllowed && addressStaging && gpuCopiesEnabled() && writtenShadowEnabled() && inside.direct != nullptr && inside.mirror == nullptr && !inside.sparse && Recorder::Active() != nullptr;
 }
 
 // Device-local staging for address-based builds (BDA overlays). Such a build binds its written V#
@@ -5368,7 +5385,7 @@ void GuestBufferMemory::resolveOverlays() {
             // import's bytes where the cluster's shader stores into the shadow.
             const auto crosses = [&](std::uint64_t begin, std::uint64_t end) { return begin < clusterEnd && clusterBegin < end && (begin < clusterBegin || end > clusterEnd); };
             const Region* inside = nullptr;
-            const bool inWindow = (atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) || (bytes >= writtenShadowMin() && bytes <= (swept ? std::max(writtenShadowMax(context.discreteGpu), SweptShadowMax) : writtenShadowMax(context.discreteGpu)));
+            const bool inWindow = bytes <= stageReadsMax() || (atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) || (bytes >= writtenShadowMin() && bytes <= (swept ? std::max(writtenShadowMax(context.discreteGpu), SweptShadowMax) : writtenShadowMax(context.discreteGpu)));
             bool keep = true;
             if (baseOverlap(clusterBegin, clusterEnd, &inside) != BaseOverlap::Inside || inside == nullptr || inside->direct == nullptr || inside->mirror != nullptr) {
                 keep = false;
