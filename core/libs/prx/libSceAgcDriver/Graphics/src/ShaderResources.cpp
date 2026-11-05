@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -7819,7 +7820,10 @@ void ShaderResources::MarkGpuWritesInRun(Recorder& recorder, const std::shared_p
     }
     // A storage store-back above may have recorded a command, which closed the run: then as MarkGpuWrites.
     if (!recorder.RunOpen()) guestMemory.RecordCopyBacks(recorder);
-    recorder.NotePendingWrites(guestMemory.Writes());
+    {
+        const HomeCensus::NoteScope homeNotes(HomeCensus::Enabled() ? guestMemory.StagedWrites() : std::vector<std::pair<std::uint64_t, std::uint64_t>>{});
+        recorder.NotePendingWrites(guestMemory.Writes());
+    }
     guestMemory.MarkDirectWrites();
     if (!recorder.RunOpen()) return;
     recorder.AfterRun([self](Recorder& after) {
@@ -7852,7 +7856,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     guestMemory.RecordCopyBacks(recorder);
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
-    recorder.NotePendingWrites(guestMemory.Writes());
+    {
+        const HomeCensus::NoteScope homeNotes(HomeCensus::Enabled() ? guestMemory.StagedWrites() : std::vector<std::pair<std::uint64_t, std::uint64_t>>{});
+        recorder.NotePendingWrites(guestMemory.Writes());
+    }
     guestMemory.MarkDirectWrites();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();

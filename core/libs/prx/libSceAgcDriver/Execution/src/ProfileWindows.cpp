@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
 #include <atomic>
 #include <mutex>
 
@@ -42,6 +43,7 @@ void Close(const char* label) {
     CommandMix::Close(label);
     NewPath::Close(label);
     Graphics::ResidentCensus::Close(label);
+    Graphics::HomeCensus::Close(label);
     MemoryStats::ReportNow(label);
     ProfileOutput_nid_no_patch().Flush();
 }

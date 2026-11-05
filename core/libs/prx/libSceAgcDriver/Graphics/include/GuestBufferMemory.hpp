@@ -409,6 +409,7 @@ public:
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
     // RecordCopyBacks) to the write tracking now.
     void MarkDirectWrites() const;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> StagedWrites() const;
     // Records, into the recorder's open batch, the copy of every written sub-range of a region the
     // GPU copied out of a host import (see Region::gpuCopy) back into the import: what the shader
     // wrote lands in guest memory by the GPU, ordered after the recorded work, so the region needs

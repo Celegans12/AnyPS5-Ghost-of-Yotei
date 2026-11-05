@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
@@ -4293,6 +4294,7 @@ void Recorder::OnComplete(std::function<void()> action) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
+    HomeCensus::WriteNote(address, address + bytes);
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
@@ -4322,6 +4324,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
         std::atomic_thread_fence(std::memory_order_seq_cst);
         return;
     }
+    HomeCensus::WriteNote(address, address + bytes);
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
@@ -4536,6 +4539,7 @@ bool Recorder::ReadTracking() {
 
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
+    HomeCensus::Read(static_cast<int>(kind), address, address + bytes);
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
     open->reads.push_back({address, address + bytes, kind});
@@ -4543,6 +4547,7 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
+    HomeCensus::ReadGroup(static_cast<int>(kind), ranges);
     if (ranges.empty() || !ReadTrackingEnabled()) return;
     ensureOpen();
     for (const auto& [begin, end] : ranges) {
@@ -4561,8 +4566,10 @@ bool Recorder::ValidReadList(const ReadList& ranges) {
 }
 
 void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind) {
+    if (ranges != nullptr) HomeCensus::ReadGroup(static_cast<int>(kind), *ranges);
     if (ranges == nullptr || ranges->empty() || !ReadTrackingEnabled()) return;
     if (CaptureTrace::Enabled() || FlipReadCheck()) {
+        const HomeCensus::Mute mute;
         NotePendingReads(*ranges, kind);
         return;
     }
@@ -5000,6 +5007,7 @@ void Recorder::Submit() {
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     dropStaleHoldKept();
     if (open == nullptr) return;
+    HomeCensus::BatchEnd(open->lane);
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     flushDeferredDispatch(6);
     sealPrelude();

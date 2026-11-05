@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
@@ -6393,8 +6394,9 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         Recorder::Checkpoint(commands, Recorder::CheckpointKind::CopyIn, address);
-        if (region->resident && region->deviceLocal && expected.empty() && residentCurrent(region->begin, region->end, region->buffer)) {
-            // The resident buffer already holds these bytes (see residentCurrent).
+        const bool residentSkip = region->resident && region->deviceLocal && expected.empty() && residentCurrent(region->begin, region->end, region->buffer);
+        if (region->deviceLocal && HomeCensus::Enabled()) HomeCensus::Use(region->begin, region->end, writes, residentSkip);
+        if (residentSkip) {
             copiedBytes -= bytes;
             recorder->Keep(region->buffer);
             region->snapshot.clear();
@@ -6418,7 +6420,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 CaptureTrace::Log("copy-input-result batch=%llu address=%llx bytes=%zu changed=%zu", batch, static_cast<unsigned long long>(address), expected.size(), changed);
             });
         }
-        if (inputSnapshot == nullptr && !sourced) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+        if (inputSnapshot == nullptr && !sourced) {
+            const HomeCensus::OwnCopyScope own(region->deviceLocal);
+            recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+        }
         // Kept by the batch at record time, as every other recorded target is: the caller keeps
         // the resources only after descriptor and pipeline work that may throw, and a released
         // buffer would go back to the pool (reused or destroyed) under this copy command. The
@@ -6614,6 +6619,7 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             }
             copiedBytes += to - from;
             recorder.Keep(region.buffer);
+            if (region.deviceLocal) HomeCensus::CopyBack(to - from);
             if (profile) {
                 Copies().gpuCopyBacks.fetch_add(1, std::memory_order_relaxed);
                 Copies().gpuCopyBackBytes.fetch_add(to - from, std::memory_order_relaxed);
@@ -7102,7 +7108,22 @@ bool GuestBufferMemory::CopiedWritesOverlap(std::uint64_t address, std::size_t b
     return false;
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::StagedWrites() const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> result;
+    for (const auto& [begin, end] : writes) {
+        const auto* found = owner(begin, end);
+        if (found != nullptr && found->gpuCopy && found->deviceLocal) result.emplace_back(begin, end);
+    }
+    return result;
+}
+
 void GuestBufferMemory::MarkDirectWrites() const {
+    struct CensusMarks {
+        explicit CensusMarks(const GuestBufferMemory& memory) {
+            if (HomeCensus::Enabled()) HomeCensus::BeforeMarks(memory.StagedWrites());
+        }
+        ~CensusMarks() { HomeCensus::AfterMarks(); }
+    } censusMarks(*this);
     // A resident region's copy-back leaves its buffer equal to guest memory when nothing else stamped the
     // range since the buffer last matched it: its sync generation then moves to its own marks.
     thread_local std::vector<std::pair<const Region*, bool>>* residentSlot = nullptr;
