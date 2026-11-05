@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -3133,6 +3134,7 @@ void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> cur
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
     requireNotSpeculative("store");
     require(current.size() == original.size(), "write-back snapshot sizes differ");
+    Graphics::FaultCensus::DriverWrite(address, current.size());
     BreakProofs();
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
@@ -3370,6 +3372,7 @@ bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::sp
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {
     requireNotSpeculative("store");
     if (source.empty()) return;
+    Graphics::FaultCensus::DriverWrite(address, source.size());
     // A store, as in WriteChanged.
     const ReadSiteScope site(ReadSite::Store);
     FlushGpuWrites(address, source.size());

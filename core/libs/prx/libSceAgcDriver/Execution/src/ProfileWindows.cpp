@@ -44,6 +44,7 @@ void Close(const char* label) {
     NewPath::Close(label);
     Graphics::ResidentCensus::Close(label);
     Graphics::HomeCensus::Close(label);
+    Graphics::FaultCensus::Close(label);
     MemoryStats::ReportNow(label);
     ProfileOutput_nid_no_patch().Flush();
 }

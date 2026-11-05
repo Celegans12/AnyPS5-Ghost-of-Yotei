@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
@@ -211,6 +212,7 @@ void NoteGpuReadGroup(const void* key, Class which, std::span<const std::pair<st
 }
 
 void NoteCpuWrite(std::uint64_t address, std::uint64_t bytes) {
+    FaultCensus::CpuWrite(address, bytes);
     if (!Enabled() || bytes == 0) return;
     auto& state = Get();
     std::lock_guard lock(state.mutex);

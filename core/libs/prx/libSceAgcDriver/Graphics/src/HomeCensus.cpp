@@ -434,3 +434,101 @@ OwnCopyScope::~OwnCopyScope() {
 }
 
 }
+
+namespace AgcDriver::Graphics::FaultCensus {
+
+namespace {
+
+constexpr std::array<std::uint64_t, 2> PageBytes{4096, 65536};
+constexpr std::size_t KindCount = static_cast<std::size_t>(Kind::Count);
+constexpr std::uint64_t MaxBytes = std::uint64_t{1} << 30u;
+
+struct Granule {
+    std::unordered_map<std::uint64_t, std::uint8_t> armed;
+    std::array<std::uint64_t, KindCount> faults{};
+    std::array<std::uint64_t, KindCount> driverFaults{};
+    std::uint64_t arms = 0;
+    std::uint64_t written = 0;
+};
+
+struct State {
+    std::mutex mutex;
+    std::array<Granule, 2> granules;
+    std::uint64_t cpuBytes = 0;
+    std::uint64_t driverBytes = 0;
+    std::array<std::uint64_t, KindCount> armCalls{};
+};
+
+State& Get() {
+    static auto* state = new State;
+    return *state;
+}
+
+void write(std::uint64_t address, std::uint64_t bytes, bool driver) {
+    auto& state = Get();
+    std::lock_guard lock(state.mutex);
+    (driver ? state.driverBytes : state.cpuBytes) += bytes;
+    for (std::size_t g = 0; g < 2; ++g) {
+        auto& granule = state.granules[g];
+        const auto size = PageBytes[g];
+        for (auto page = address / size; page <= (address + bytes - 1u) / size; ++page) {
+            ++granule.written;
+            const auto found = granule.armed.find(page);
+            if (found == granule.armed.end()) continue;
+            const auto kind = static_cast<std::size_t>(found->second);
+            ++(driver ? granule.driverFaults : granule.faults)[kind];
+            granule.armed.erase(found);
+        }
+    }
+}
+
+}
+
+bool Enabled() {
+    static const bool enabled = std::getenv("APS5_V3M_FAULTS") != nullptr;
+    return enabled;
+}
+
+void Arm(Kind kind, std::uint64_t address, std::uint64_t bytes) {
+    if (!Enabled() || bytes == 0 || bytes > MaxBytes) return;
+    auto& state = Get();
+    std::lock_guard lock(state.mutex);
+    ++state.armCalls[static_cast<std::size_t>(kind)];
+    for (std::size_t g = 0; g < 2; ++g) {
+        auto& granule = state.granules[g];
+        const auto size = PageBytes[g];
+        for (auto page = address / size; page <= (address + bytes - 1u) / size; ++page) {
+            const auto [at, inserted] = granule.armed.try_emplace(page, static_cast<std::uint8_t>(kind));
+            if (inserted) ++granule.arms;
+            else if (static_cast<std::uint8_t>(kind) < at->second) at->second = static_cast<std::uint8_t>(kind);
+        }
+    }
+}
+
+void CpuWrite(std::uint64_t address, std::uint64_t bytes) {
+    if (!Enabled() || bytes == 0 || bytes > MaxBytes) return;
+    write(address, bytes, false);
+}
+
+void DriverWrite(std::uint64_t address, std::uint64_t bytes) {
+    if (!Enabled() || bytes == 0 || bytes > MaxBytes) return;
+    write(address, bytes, true);
+}
+
+void Close(const char* window) {
+    if (!Enabled()) return;
+    auto& state = Get();
+    std::lock_guard lock(state.mutex);
+    for (std::size_t g = 0; g < 2; ++g) {
+        auto& granule = state.granules[g];
+        AgcDriver::ProfilePrint_nid_no_patch("[v3m-faults] window=%s page %llu KiB: title-store faults texture %llu target %llu storage %llu; driver-store faults texture %llu target %llu storage %llu; pages armed (new) %llu, armed now %zu, pages written %llu; arm calls texture %llu target %llu storage %llu; cpu %.1f MiB, driver %.1f MiB\n", window, static_cast<unsigned long long>(PageBytes[g] / 1024), static_cast<unsigned long long>(granule.faults[0]), static_cast<unsigned long long>(granule.faults[1]), static_cast<unsigned long long>(granule.faults[2]), static_cast<unsigned long long>(granule.driverFaults[0]), static_cast<unsigned long long>(granule.driverFaults[1]), static_cast<unsigned long long>(granule.driverFaults[2]), static_cast<unsigned long long>(granule.arms), granule.armed.size(), static_cast<unsigned long long>(granule.written), static_cast<unsigned long long>(state.armCalls[0]), static_cast<unsigned long long>(state.armCalls[1]), static_cast<unsigned long long>(state.armCalls[2]), state.cpuBytes / 1048576.0, state.driverBytes / 1048576.0);
+        granule.faults = {};
+        granule.driverFaults = {};
+        granule.arms = 0;
+        granule.written = 0;
+    }
+    state.cpuBytes = state.driverBytes = 0;
+    state.armCalls = {};
+}
+
+}

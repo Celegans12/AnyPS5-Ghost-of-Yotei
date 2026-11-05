@@ -65,4 +65,15 @@ private:
 
 }
 
+namespace AgcDriver::Graphics::FaultCensus {
+
+enum class Kind : int { Texture = 0, Target, Storage, Count };
+[[nodiscard]] bool Enabled();
+void Arm(Kind kind, std::uint64_t address, std::uint64_t bytes);
+void CpuWrite(std::uint64_t address, std::uint64_t bytes);
+void DriverWrite(std::uint64_t address, std::uint64_t bytes);
+void Close(const char* window);
+
+}
+
 #endif
