@@ -565,6 +565,7 @@ void DrawPipeline::run() {
             }
             isDraw = items.front().draw;
         }
+        RecordWorker::FollowCommitterAffinity();
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
         bool failed = false;

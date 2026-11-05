@@ -3,6 +3,9 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VkCallProfile.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libc/include/CpuTopology.hpp"
+#include <bit>
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -97,27 +100,34 @@ constexpr std::array<const char*, CallCount> Names{{
 #undef APS5_V3E_RECORD_NAME
 }};
 
+struct Relaxed {
+    std::atomic<std::uint64_t> value{0};
+    void Add(std::uint64_t amount) { value.store(value.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed); }
+    std::uint64_t Load() const { return value.load(std::memory_order_relaxed); }
+};
+
 struct State {
-    std::mutex producer;
+    alignas(64) std::mutex producer;
     Block* write = nullptr;
     std::size_t writeOffset = 0;
     std::uint64_t pushed = 0;
-    std::atomic<std::uint64_t> published{0};
-    Block* read = nullptr;
+    Relaxed queued, queuedBytes, direct, drains, drainWaits, drainWaitNs;
+    alignas(64) std::atomic<std::uint64_t> published{0};
+    alignas(64) Block* read = nullptr;
     std::size_t readOffset = 0;
-    std::atomic<std::uint64_t> executed{0};
-    std::mutex freeMutex;
-    std::vector<Block*> freeBlocks;
-    std::mutex sleepMutex;
+    Relaxed workerNs, workerWakes;
+    alignas(64) std::atomic<std::uint64_t> executed{0};
+    alignas(64) std::atomic<bool> workerSleeping{false};
+    alignas(64) std::atomic<int> drainSleepers{0};
+    alignas(64) std::mutex sleepMutex;
     std::condition_variable workerWake;
     std::condition_variable drained;
-    std::atomic<bool> workerSleeping{false};
-    std::atomic<int> drainSleepers{0};
+    std::mutex freeMutex;
+    std::vector<Block*> freeBlocks;
     std::thread worker;
     std::atomic<bool> started{false};
     std::atomic<VkResult> failure{VK_SUCCESS};
     std::atomic<const char*> failedCall{nullptr};
-    std::atomic<std::uint64_t> queued{0}, queuedBytes{0}, direct{0}, drains{0}, drainWaits{0}, drainWaitNs{0}, workerNs{0}, workerWakes{0};
     std::array<std::uint64_t, 8> reported{};
 };
 
@@ -155,19 +165,44 @@ void recycle(Block* block) {
     s.freeBlocks.push_back(block);
 }
 
+std::uint64_t workerCores() {
+    static const std::uint64_t mask = [] {
+        const auto process = CpuTopology::Get().process;
+        if (std::popcount(process) <= 4) return std::uint64_t{0};
+        std::uint64_t picked = 0;
+        for (int cpu = 63; cpu >= 0 && std::popcount(picked) < 2; --cpu) {
+            if (((process >> cpu) & 1u) != 0) picked |= std::uint64_t{1} << cpu;
+        }
+        return picked;
+    }();
+    return mask;
+}
+
+void followPin(bool worker, int& applied) {
+    const bool pin = Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eWorkerPin) && workerCores() != 0;
+    const int wanted = pin ? 1 : 0;
+    if (wanted == applied) return;
+    applied = wanted;
+    const auto process = CpuTopology::Get().process;
+    if (process == 0) return;
+    CpuTopology::Pin(nullptr, pin ? (worker ? workerCores() : (process & ~workerCores())) : process);
+}
+
 void workerLoop() {
     onWorker = true;
     VkCallProfile::NameThread("record worker");
     auto& s = state();
     std::uint64_t done = s.executed.load(std::memory_order_relaxed);
+    int pinned = -1;
     for (;;) {
-        SpinUntil(HandoffSpinWindow(), [&] { return s.published.load(std::memory_order_acquire) != done; });
+        followPin(true, pinned);
+        if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eWorkerNoSpin)) SpinUntil(HandoffSpinWindow(), [&] { return s.published.load(std::memory_order_acquire) != done; });
         if (s.published.load(std::memory_order_acquire) == done) {
             std::unique_lock lock(s.sleepMutex);
             s.workerSleeping.store(true, std::memory_order_seq_cst);
             s.workerWake.wait(lock, [&] { return s.published.load(std::memory_order_seq_cst) != done; });
             s.workerSleeping.store(false, std::memory_order_relaxed);
-            s.workerWakes.fetch_add(1, std::memory_order_relaxed);
+            s.workerWakes.Add(1);
         }
         const auto start = std::chrono::steady_clock::now();
         for (;;) {
@@ -192,7 +227,7 @@ void workerLoop() {
                 }
             }
         }
-        s.workerNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        s.workerNs.Add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
     }
 }
 
@@ -209,10 +244,10 @@ void startLocked() {
 void drainTo(std::uint64_t target) {
     auto& s = state();
     if (onWorker) return;
-    s.drains.fetch_add(1, std::memory_order_relaxed);
+    s.drains.Add(1);
     if (s.executed.load(std::memory_order_acquire) >= target) return;
     const auto start = std::chrono::steady_clock::now();
-    s.drainWaits.fetch_add(1, std::memory_order_relaxed);
+    s.drainWaits.Add(1);
     SpinUntil(HandoffSpinWindow() * 2, [&] { return s.executed.load(std::memory_order_acquire) >= target; });
     if (s.executed.load(std::memory_order_acquire) < target) {
         std::unique_lock lock(s.sleepMutex);
@@ -220,7 +255,7 @@ void drainTo(std::uint64_t target) {
         s.drained.wait(lock, [&] { return s.executed.load(std::memory_order_seq_cst) >= target; });
         s.drainSleepers.fetch_sub(1, std::memory_order_seq_cst);
     }
-    s.drainWaitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+    s.drainWaitNs.Add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()));
 }
 
 template<typename TCall>
@@ -228,7 +263,7 @@ auto direct(TCall&& call) {
     auto& s = state();
     std::lock_guard lock(s.producer);
     drainTo(s.pushed);
-    s.direct.fetch_add(1, std::memory_order_relaxed);
+    s.direct.Add(1);
     return call();
 }
 
@@ -263,8 +298,8 @@ public:
         auto& s = state();
         if (std::uncaught_exceptions() != 0) header->run = &skip;
         ++s.pushed;
-        s.queued.fetch_add(1, std::memory_order_relaxed);
-        s.queuedBytes.fetch_add(capacity, std::memory_order_relaxed);
+        s.queued.Add(1);
+        s.queuedBytes.Add(capacity);
         s.published.store(s.pushed, std::memory_order_seq_cst);
         if (s.workerSleeping.load(std::memory_order_seq_cst)) {
             std::lock_guard sleep(s.sleepMutex);
@@ -812,6 +847,12 @@ PFN_vkGetDeviceProcAddr Wrap(PFN_vkGetDeviceProcAddr resolver) {
     return &resolve;
 }
 
+void FollowCommitterAffinity() {
+    if (!Enabled()) return;
+    thread_local int pinned = -1;
+    followPin(false, pinned);
+}
+
 void Drain() {
     if (!state().started.load(std::memory_order_acquire)) return;
     {
@@ -828,8 +869,7 @@ void Drain() {
 
 Counters Totals() {
     const auto& s = state();
-    constexpr auto relaxed = std::memory_order_relaxed;
-    return {s.queued.load(relaxed), s.queuedBytes.load(relaxed), s.direct.load(relaxed), s.drains.load(relaxed), s.drainWaits.load(relaxed), s.drainWaitNs.load(relaxed), s.workerNs.load(relaxed), s.workerWakes.load(relaxed)};
+    return {s.queued.Load(), s.queuedBytes.Load(), s.direct.Load(), s.drains.Load(), s.drainWaits.Load(), s.drainWaitNs.Load(), s.workerNs.Load(), s.workerWakes.Load()};
 }
 
 void Close(const char* label) {

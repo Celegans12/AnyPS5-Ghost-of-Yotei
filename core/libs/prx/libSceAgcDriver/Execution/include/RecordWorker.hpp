@@ -21,6 +21,10 @@ namespace AgcDriver::RecordWorker {
 bool Enabled();
 PFN_vkGetDeviceProcAddr Wrap(PFN_vkGetDeviceProcAddr resolver);
 void Drain();
+// The committer calls this once per item: with APS5_V3E_WORKER_PIN (RuntimeSwitch) set, the worker runs on the
+// process's two highest logical processors and the committer on the others; unset, both may run anywhere.
+// APS5_V3E_WORKER_NO_SPIN (RuntimeSwitch): the worker sleeps at once when the FIFO is empty instead of spinning.
+void FollowCommitterAffinity();
 
 struct Counters {
     std::uint64_t queued = 0;
