@@ -5,6 +5,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VkCallProfile.hpp"
+#include "prx/libSceAgcDriver/Execution/include/RecordWorker.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
@@ -47,6 +49,8 @@ void Close(const char* label) {
     NewPath::Close(label);
     Graphics::ResidentCensus::Close(label);
     MemoryStats::ReportNow(label);
+    VkCallProfile::Close(label);
+    RecordWorker::Close(label);
     ProfileOutput_nid_no_patch().Flush();
 }
 

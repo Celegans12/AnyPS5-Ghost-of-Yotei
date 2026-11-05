@@ -369,6 +369,8 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/MemoryStats.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ProfileWindows.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/VkCallProfile.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/RecordWorker.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/CommandMix.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -1559,6 +1561,20 @@ if(BUILD_TESTING)
     add_test(NAME agc_pipeline_request_precheck COMMAND agc_pipeline_request_precheck_tests)
     if(WIN32)
         set_tests_properties(agc_pipeline_request_precheck PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_record_worker_tests EXCLUDE_FROM_ALL tests/RecordWorker.cpp)
+target_include_directories(agc_record_worker_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_record_worker_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_record_worker_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_record_worker_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_record_worker_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_record_worker COMMAND agc_record_worker_tests)
+    if(WIN32)
+        set_tests_properties(agc_record_worker PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

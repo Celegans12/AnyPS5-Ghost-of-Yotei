@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/VkCallProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -79,6 +80,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
         pinned = true;
         PinWorkerThread("presenter");
         GuestMemory::MarkPresenterThread();
+        VkCallProfile::NameThread("presenter");
     }
     CheckFailure();
     require(gpuReady != nullptr && context != nullptr, "missing GPU completion callback");
