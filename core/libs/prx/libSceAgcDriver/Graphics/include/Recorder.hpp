@@ -871,6 +871,7 @@ private:
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
         VkFence fence = VK_NULL_HANDLE;
+        mutable bool fenceSignaled = false;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
@@ -1127,6 +1128,12 @@ private:
         return resolved != nullptr ? resolved : context.Function<TFunction>(name);
     }
     VkResult fenceStatus(VkFence fence) const { return function(getFenceStatus, "vkGetFenceStatus")(context.device, fence); }
+    bool observeSignaled(const Batch& batch) const {
+        if (batch.fenceSignaled) return true;
+        if (!batch.submitted || fenceStatus(batch.fence) != VK_SUCCESS) return false;
+        batch.fenceSignaled = true;
+        return true;
+    }
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/LandCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <chrono>
@@ -27,6 +28,8 @@ struct QueueStats {
 struct Census {
     std::mutex mutex;
     std::map<std::uint32_t, QueueStats> queues;
+    std::uint64_t blocks = 0, blockWords = 0;
+    std::map<std::uint32_t, std::uint64_t> blockPackets;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
 
@@ -62,6 +65,18 @@ void ReportLocked(Census& census) {
             static_cast<unsigned long long>(s.commands), static_cast<unsigned long long>(s.adopted), static_cast<unsigned long long>(s.changed), static_cast<unsigned long long>(s.changedAdopted), static_cast<unsigned long long>(s.changedRegions), static_cast<unsigned long long>(s.regions), static_cast<unsigned long long>(s.changedBytes),
             static_cast<unsigned long long>(s.conds), static_cast<unsigned long long>(s.condNoPending), static_cast<unsigned long long>(s.condLabelEqual), static_cast<unsigned long long>(s.condLabelDiffer), static_cast<unsigned long long>(s.condOther), static_cast<unsigned long long>(s.condWaits), s.condMs);
         s = QueueStats{};
+    }
+    if (census.blocks != 0) {
+        std::string packets;
+        for (const auto& [opcode, count] : census.blockPackets) {
+            char text[48];
+            std::snprintf(text, sizeof(text), " 0x%x:%llu", opcode, static_cast<unsigned long long>(count));
+            packets += text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[v3w-cond] COND_EXEC blocks (10 s): %llu, %llu dwords; packets by opcode:%s\n", static_cast<unsigned long long>(census.blocks), static_cast<unsigned long long>(census.blockWords), packets.c_str());
+        census.blocks = 0;
+        census.blockWords = 0;
+        census.blockPackets.clear();
     }
 }
 
@@ -140,6 +155,20 @@ void CheckCaptured(std::uint32_t queue, std::span<const ShaderRecompiler::Memory
         s.changedBytes += changedBytes;
     }
     ReportLocked(census);
+}
+
+void NoteConditionBlock(std::span<const std::uint32_t> block) {
+    if (!Enabled()) return;
+    auto& census = Get();
+    std::lock_guard lock(census.mutex);
+    ++census.blocks;
+    census.blockWords += block.size();
+    for (std::size_t cursor = 0; cursor < block.size();) {
+        const auto header = block[cursor];
+        const auto words = Pm4::PacketWords(header);
+        ++census.blockPackets[Pm4::FillerPacket(header) ? 0xffffu : ((header >> 8u) & 0xffu)];
+        cursor += words == 0 ? 1 : words;
+    }
 }
 
 CondProbe BeforeCondition(std::uint64_t address) {

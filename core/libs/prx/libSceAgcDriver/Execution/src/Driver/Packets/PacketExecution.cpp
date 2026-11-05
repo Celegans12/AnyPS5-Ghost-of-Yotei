@@ -719,6 +719,7 @@ void Driver::execute(const Submission& submission) {
             const auto condProbe = LandCensus::BeforeCondition(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u));
             const auto condition = Pm4::ReadCondition(packet);
             LandCensus::AfterCondition(submission.queue, condProbe, condition);
+            if (LandCensus::Enabled()) LandCensus::NoteConditionBlock(std::span<const std::uint32_t>(submission.commands).subspan(cursor + count, submission.conditionalEnds.at(cursor) - cursor - count));
             if (condition == 0) {
                 nextCursor = submission.conditionalEnds.at(cursor);
                 if (ahead != nullptr) ahead->Skip(aheadSegment, nextCursor);

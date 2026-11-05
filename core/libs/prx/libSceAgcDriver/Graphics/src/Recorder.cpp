@@ -4477,7 +4477,7 @@ std::uint64_t Recorder::PendingWriterSerial(std::uint64_t address, std::size_t b
 }
 
 bool Recorder::signaled(const Batch& batch) const {
-    return batch.submitted && fenceStatus(batch.fence) == VK_SUCCESS;
+    return observeSignaled(batch);
 }
 
 bool Recorder::PendingWriteSettled(std::uint64_t address, std::size_t bytes) const {
@@ -4725,7 +4725,7 @@ std::optional<Recorder::PendingWriteInfo> Recorder::DescribePendingWrite(std::ui
         const auto* range = firstOverlap(**it);
         if (range == nullptr) continue;
         // In flight means submitted, so the fence is live; signaled = the GPU already ran it.
-        const bool signaled = fenceStatus((*it)->fence) == VK_SUCCESS;
+        const bool signaled = observeSignaled(**it);
         if (syncAll) return PendingWriteInfo{submissions + (open != nullptr ? 1 : 0), open != nullptr, signaled, range->first, range->second, allBatches};
         return PendingWriteInfo{(*it)->serial, false, signaled, range->first, range->second, finished};
     }
@@ -4869,7 +4869,7 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
 
 bool Recorder::unsignaled(std::uint64_t serial) const {
     for (const auto& batch : inFlight) {
-        if (batch->serial == serial) return fenceStatus(batch->fence) != VK_SUCCESS;
+        if (batch->serial == serial) return !observeSignaled(*batch);
     }
     return false;
 }
@@ -5594,7 +5594,7 @@ bool Recorder::Reap() {
     std::uint64_t retired = 0;
     if (asyncTimeline == VK_NULL_HANDLE) {
         while (!inFlight.empty()) {
-            if (fenceStatus(inFlight.front()->fence) != VK_SUCCESS) break;
+            if (!observeSignaled(*inFlight.front())) break;
             auto batch = std::move(inFlight.front());
             inFlight.pop_front();
             finish(std::move(batch), false, 4);
@@ -5607,7 +5607,7 @@ bool Recorder::Reap() {
             progressed = false;
             for (int lane = 0; lane < 2; ++lane) {
                 const auto it = std::find_if(inFlight.begin(), inFlight.end(), [&](const auto& batch) { return batch->lane == lane; });
-                if (it == inFlight.end() || fenceStatus((*it)->fence) != VK_SUCCESS) continue;
+                if (it == inFlight.end() || !observeSignaled(**it)) continue;
                 const auto serial = (*it)->serial;
                 finishLaneThrough(lane, serial, true, 4);
                 progressed = true;
@@ -5684,9 +5684,42 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
                 }
             }
         } report{profile, source, waitStart, *this, signaledAtStart};
+        const bool knownSignaled = batch->fenceSignaled;
+        const bool skipKnown = knownSignaled && RuntimeSwitches::Set(RuntimeSwitch::V3FenceKnown);
+        const auto fenceStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        struct FenceCount {
+            bool profile, known, skipped, signaledAtStart;
+            std::chrono::steady_clock::time_point start;
+            ~FenceCount() {
+                if (!profile) return;
+                struct Totals {
+                    std::uint64_t waits = 0, known = 0, skipped = 0, signaledCalls = 0, realWaits = 0;
+                    double signaledUs = 0, realUs = 0, knownUs = 0;
+                    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+                };
+                static Totals totals;
+                const double us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+                ++totals.waits;
+                if (known) ++totals.known;
+                if (skipped) {
+                    ++totals.skipped;
+                } else if (signaledAtStart) {
+                    ++totals.signaledCalls;
+                    totals.signaledUs += us;
+                    if (known) totals.knownUs += us;
+                } else {
+                    ++totals.realWaits;
+                    totals.realUs += us;
+                }
+                if (std::chrono::steady_clock::now() - totals.reported > std::chrono::seconds(10)) {
+                    AgcDriver::ProfilePrint_nid_no_patch("[v3w-fence] finish waits under the GPU mutex (10 s): %llu, fence known signaled %llu (skipped %llu), calls on a signaled fence %llu in %.1f ms (of them known %.1f ms), real waits %llu in %.1f ms\n", static_cast<unsigned long long>(totals.waits), static_cast<unsigned long long>(totals.known), static_cast<unsigned long long>(totals.skipped), static_cast<unsigned long long>(totals.signaledCalls), totals.signaledUs / 1000, totals.knownUs / 1000, static_cast<unsigned long long>(totals.realWaits), totals.realUs / 1000);
+                    totals = Totals{};
+                }
+            }
+        } fenceCount{profile, knownSignaled, skipKnown, signaledAtStart, fenceStart};
         submitOtherLaneBeforeWait(*batch);
         const auto waitFences = function(waitForFences, "vkWaitForFences");
-        auto result = waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
+        auto result = skipKnown ? VK_SUCCESS : waitFences(context.device, 1, &batch->fence, VK_TRUE, 5'000'000'000ull);
         for (int waited = 5; result == VK_TIMEOUT; waited += 5) {
             // A batch still running after 5 s is reported (every 5 s) so a GPU-side hang is visible.
             std::fprintf(stderr, "[gpu] recorded batch still running on the GPU after %d s\n", waited);

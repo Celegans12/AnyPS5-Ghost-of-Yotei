@@ -99,6 +99,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_RESOURCE_CACHE_LARGE",
     "APS5_V3_LAND_AHEAD",
     "APS5_V3W_CEIL_NO_LAND",
+    "APS5_V3_FENCE_KNOWN",
 };
 
 struct Refusal {

@@ -31,6 +31,8 @@ CondProbe BeforeCondition(std::uint64_t address);
 
 void AfterCondition(std::uint32_t queue, const CondProbe& probe, std::uint32_t value);
 
+void NoteConditionBlock(std::span<const std::uint32_t> block);
+
 }
 
 #endif
