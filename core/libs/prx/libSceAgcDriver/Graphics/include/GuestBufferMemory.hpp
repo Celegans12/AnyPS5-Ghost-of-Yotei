@@ -354,6 +354,7 @@ public:
     // calls RecordCopyBacks (a dispatch), since a staged region's results reach guest memory by
     // that copy alone. Call before Upload.
     void AllowDeviceStaging() { stagingAllowed = true; }
+    bool StagingAllowed() const { return stagingAllowed; }
     // An address-based build whose dispatch is too small for its BDA overlays' copies to pay off
     // (see resolveOverlays): its written elements stay in the imports.
     void DisallowAddressStaging() { addressStaging = false; }

@@ -2289,7 +2289,7 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess, std::source_loc
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
-    if (open->renderPass.open) endOpenRenderPass();
+    if (open->renderPass.open) endOpenRenderPass(true, where);
     if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
@@ -2306,21 +2306,79 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     open->handedOut = true;
     flushDeferredDispatch(1, where);
     auto& pass = open->renderPass;
-    if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+    const std::uint32_t forcedMask = p0dForcedMask;
+    p0dForcedMask = 0;
+    // P0dPassLog reasons: 0 first pass of the batch, 1 not open (other work or a label ended the
+    // previous pass), 2 forced, 3 segment slot, 4 another pass key, 5 a hazard under the same key.
+    const auto note = [&](std::uint32_t reason, bool barrier) {
+        if (!P0dPassLog()) return;
+        auto& pending = open->p0dPending;
+        pending = {};
+        pending.reason = reason;
+        pending.forced = forced ? (forcedMask != 0 ? forcedMask : 0x80000000u) : 0u;
+        pending.between = open->p0dBetween;
+        pending.betweenPrograms = open->p0dBetweenPrograms;
+        pending.closer = open->p0dCloser;
+        pending.closerFile = open->p0dCloserFile;
+        pending.barrier = barrier;
+        pending.sameKey = open->p0dPassEnded && open->p0dLastKey == key;
+        pending.key = key;
+    };
+    // APS5_P0D_MERGE_PASSES=1 (lane P0b-draws ceiling, replay only, inexact): an open pass under the
+    // same key continues through forced breaks (except a draw that reads its own target, an
+    // indirect or mesh-indirect draw, which record outside the pass, a capture) and through
+    // hazards; nothing else changes.
+    // APS5_P0D_HEAP_CONTINUE=1 (lane P0b-draws, a candidate exact form): a bindless draw whose table serving recorded
+    // nothing (the pass is still open) is forced by nothing else, so it continues the pass if the hazard check allows.
+    const bool heapOnly = P0dHeapContinue() && pass.open && pass.key == key && forcedMask == P0dForcedHeap;
+    const bool forcedKept = forced && !heapOnly && !(P0dMergePasses() && pass.open && pass.key == key && (forcedMask & (P0dForcedReadsTarget | P0dForcedIndirect | P0dForcedMeshIndirect | P0dForcedCapture | P0dForcedBlended | P0dForcedLds)) == 0 && forcedMask != 0);
+    if (!pass.open || forcedKept || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
+        note(!pass.open ? (open->p0dPassEnded ? 1u : 0u) : forcedKept ? 2u : 3u, true);
         const auto commands = Commands();
         open->passHazards.Clear();
         open->passHazards.BeginPass();
         return {commands, false, true};
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
-    if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
+    if (pass.key == key && (hazard == PassHazard::None || P0dMergePasses())) return {open->commands, true, false};
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
+    note(pass.key != key ? 4u : 5u, !elide);
+    // (the forced column of a key or hazard break holds the hazard kind: PassHazard)
+    if (P0dPassLog()) open->p0dPending.forced = static_cast<std::uint32_t>(hazard);
     endOpenRenderPass(!merge);
     const auto commands = Commands();
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
     return {commands, false, !elide};
+}
+
+bool Recorder::P0dPassLog() {
+    static const bool on = std::getenv("APS5_P0D_PASS_LOG") != nullptr && GpuTimingEnabled();
+    return on;
+}
+
+bool Recorder::P0dHeapContinue() {
+    static const bool on = std::getenv("APS5_P0D_HEAP_CONTINUE") != nullptr;
+    return on;
+}
+
+bool Recorder::P0dMergePasses() {
+    static const bool on = std::getenv("APS5_P0D_MERGE_PASSES") != nullptr;
+    return on;
+}
+
+void Recorder::P0dNoteDraw(bool address, bool heap, bool indirect) {
+    if (!P0dPassLog() || open == nullptr || open->renderPass.p0dIndex >= open->p0dPasses.size()) return;
+    auto& pass = open->p0dPasses[open->renderPass.p0dIndex];
+    pass.addressDraws += address ? 1u : 0u;
+    pass.heapDraws += heap ? 1u : 0u;
+    pass.indirectDraws += indirect ? 1u : 0u;
+}
+
+void Recorder::P0dBeginWork() {
+    if (!P0dPassLog() || open == nullptr) return;
+    open->p0dPending.work = beginTiming(P0dWorkKey);
 }
 
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
@@ -2329,7 +2387,19 @@ void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool
     if (!pass.open) {
         pass.timing = timing;
         pass.afterPass = std::move(afterPass);
+        if (P0dPassLog()) {
+            auto entry = open->p0dPending;
+            open->p0dPending = {};
+            entry.range = timing;
+            pass.p0dIndex = static_cast<std::uint32_t>(open->p0dPasses.size());
+            open->p0dPasses.push_back(entry);
+            open->p0dBetween = 0;
+            open->p0dBetweenPrograms = 0;
+            open->p0dCloser = 0;
+            open->p0dCloserFile = nullptr;
+        }
     }
+    if (P0dPassLog() && pass.p0dIndex < open->p0dPasses.size()) ++open->p0dPasses[pass.p0dIndex].draws;
     pass.open = true;
     pass.key = key;
     pass.fenced = pass.fenced || fenced;
@@ -2345,9 +2415,16 @@ void Recorder::SealPassWriteOnly() {
     if (open != nullptr) open->passHazards.SealWriteOnly();
 }
 
-void Recorder::endOpenRenderPass(bool barrier) {
+void Recorder::endOpenRenderPass(bool barrier, std::source_location where) {
     auto& pass = open->renderPass;
     if (open->segmentActive) endSegment(*open);
+    if (P0dPassLog()) {
+        if (pass.p0dIndex < open->p0dPasses.size()) EndGpuTiming(open->p0dPasses[pass.p0dIndex].work);
+        open->p0dPassEnded = true;
+        open->p0dLastKey = pass.key;
+        open->p0dCloser = where.line();
+        open->p0dCloserFile = where.file_name();
+    }
     EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
     // host sees them at the batch's fence).
@@ -2708,7 +2785,8 @@ void Recorder::FlushStores(std::source_location where) {
 
 namespace {
 
-constexpr std::uint32_t MaxTimedRanges = 512;
+// 1024 with the lane P0b-draws pass log (APS5_P0D_PASS_LOG), which adds a work range per pass.
+const std::uint32_t MaxTimedRanges = std::getenv("APS5_P0D_PASS_LOG") != nullptr ? 1024u : 512u;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
 constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
@@ -2969,6 +3047,10 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
         return NoTiming;
     }
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
+    if (P0dPassLog() && key != P0dWorkKey && key != BatchTimingKey && !open->renderPass.open) {
+        if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) open->p0dBetween |= 1u << (key - ClassKey(CommandClass::DispatchLeading));
+        else ++open->p0dBetweenPrograms;
+    }
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
@@ -3706,6 +3788,7 @@ void Recorder::readGpuTiming(Batch& batch) {
             continue;
         }
         const auto key = batch.timedKeys[i];
+        if (key == P0dWorkKey && P0dPassLog()) continue;
         if (key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count)) PerformanceTrace::GpuRange(CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)], static_cast<double>(stamps[i * 2]) * period, static_cast<double>(stamps[i * 2 + 1]) * period, batch.traceId);
         auto& totals = timingByKey[key];
         ++totals.count;
@@ -3731,10 +3814,58 @@ void Recorder::readGpuTiming(Batch& batch) {
     timingUnionMs += static_cast<double>(coveredTicks) * period / 1e6;
     timingPeriodNs = period;
     ++timingBatches;
+    if (P0dPassLog() && !batch.p0dPasses.empty()) p0dWritePasses(batch, stamps, period);
     if (!ProfileWindows::ClockDue(lastReport)) return;
     printGpuTiming("10 s");
+    if (P0dPassLog()) p0dWindow("10 s");
     lock.unlock();
     reportBarriers();
+}
+
+namespace {
+
+std::FILE* p0dPassFile() {
+    static std::FILE* file = [] {
+        const char* path = std::getenv("APS5_P0D_PASS_LOG");
+        std::FILE* opened = path != nullptr && *path != '\0' ? std::fopen(path, "w") : nullptr;
+        if (opened != nullptr) std::fprintf(opened, "lane,batch,t0,t1,t2,t3,prev_end,draws,reason,forced,barrier,same_key,between,between_programs,closer,key,address_draws,heap_draws,indirect_draws\n");
+        return opened;
+    }();
+    return file;
+}
+
+}
+
+// One line per pass of the batch (under timingMutex): absolute stamps in ns of the pass range
+// (t0, t3) and of its work range (t1 after the pass begin, t2 before the pass end; 0 when the
+// work range was dropped), the end of the latest timed range recorded before the pass in the
+// batch, and the pass's notes (StartDrawPass).
+void Recorder::p0dWritePasses(const Batch& batch, const std::vector<std::uint64_t>& stamps, double period) {
+    auto* file = p0dPassFile();
+    if (file == nullptr) return;
+    static std::uint64_t batchSerial = 0;
+    ++batchSerial;
+    const auto ns = [&](std::uint64_t tick) { return static_cast<unsigned long long>(static_cast<double>(tick) * period); };
+    for (const auto& pass : batch.p0dPasses) {
+        if (pass.range == NoTiming || pass.range >= batch.timedKeys.size()) continue;
+        std::uint64_t prevEnd = 0;
+        for (std::uint32_t i = 0; i < pass.range; ++i) {
+            if (i == batch.batchTiming || batch.timedKeys[i] == P0dWorkKey) continue;
+            prevEnd = std::max(prevEnd, stamps[i * 2 + 1]);
+        }
+        const bool work = pass.work != NoTiming && pass.work < batch.timedKeys.size();
+        const char* file_name = pass.closerFile != nullptr ? pass.closerFile : "-";
+        if (const char* slash = std::strrchr(file_name, '/')) file_name = slash + 1;
+        if (const char* slash = std::strrchr(file_name, '\\')) file_name = slash + 1;
+        std::fprintf(file, "%d,%llu,%llu,%llu,%llu,%llu,%llu,%u,%u,0x%x,%d,%d,0x%x,%u,%s:%u,0x%llx,%u,%u,%u\n", batch.lane, static_cast<unsigned long long>(batchSerial), ns(stamps[pass.range * 2]), work ? ns(stamps[pass.work * 2]) : 0ull, work ? ns(stamps[pass.work * 2 + 1]) : 0ull, ns(stamps[pass.range * 2 + 1]), prevEnd != 0 ? ns(prevEnd) : 0ull, pass.draws, pass.reason, pass.forced, pass.barrier ? 1 : 0, pass.sameKey ? 1 : 0, pass.between, pass.betweenPrograms, file_name, pass.closer, static_cast<unsigned long long>(pass.key), pass.addressDraws, pass.heapDraws, pass.indirectDraws);
+    }
+}
+
+void Recorder::p0dWindow(const char* label) {
+    if (auto* file = p0dPassFile()) {
+        std::fprintf(file, "# window %s\n", label);
+        std::fflush(file);
+    }
 }
 
 void Recorder::CloseGpuTimingWindow(const char* label) {
@@ -3742,6 +3873,7 @@ void Recorder::CloseGpuTimingWindow(const char* label) {
     {
         std::lock_guard lock(timingMutex);
         printGpuTiming(label);
+        if (P0dPassLog()) p0dWindow(label);
     }
     reportBarriers();
 }
