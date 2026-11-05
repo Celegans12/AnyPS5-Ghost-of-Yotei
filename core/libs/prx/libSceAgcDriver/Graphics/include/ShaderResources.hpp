@@ -695,6 +695,8 @@ private:
     std::vector<std::uint64_t> multisampleSources;
     bool usesFaultBuffer = false;
     bool faultChecks = false;
+    std::uint64_t reachTag = 0;
+    void setReachTag(std::span<const CompiledShader> shaders);
     VkDescriptorSetLayout _layout = VK_NULL_HANDLE;
     // Whether the layout is this object's own (no cache) and destroyed with it.
     bool ownsLayout = false;

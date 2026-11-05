@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/P0Reach.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -179,6 +180,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     for (std::uint32_t i = 0; i < userCount; ++i) {
         userData.push_back(readUserData(queue.shader, 0x240 + i));
     }
+    Graphics::P0Reach::SetPendingDispatch(address, userData);
     auto compute = Graphics::DecodeComputeStageInfo(queue.shader, snapshot.header);
     const bool resolving = resolvingAhead();
     if (SkipRefusedShaders() && SkipListedShader(address)) {

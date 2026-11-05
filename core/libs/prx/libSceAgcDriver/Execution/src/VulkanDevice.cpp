@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/P0Reach.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
@@ -5997,9 +5998,11 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.
     const bool completionNeeded = resources.NeedsCompletion() || record.htileClear.has_value();
+    auto reachRoots = completionNeeded ? Graphics::P0Reach::TakePending(record.programAddress) : nullptr;
     if (completionNeeded && resources.Reusable()) {
         auto kept = record.resources;
-        recorder.OnComplete([kept, shaderAddress = record.programAddress, htileClear = record.htileClear] {
+        recorder.OnComplete([kept, shaderAddress = record.programAddress, htileClear = record.htileClear, reachRoots] {
+            const Graphics::P0Reach::CompletionScope reachScope(reachRoots);
             kept->CheckFaults(shaderAddress);
             if (htileClear.has_value()) Graphics::CompleteHtileDepthClear(htileClear->first, htileClear->second);
         });
@@ -6007,7 +6010,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         // Listed for DispatchIndirect until the write-back ran (a non-reusable object, so once).
         auto writers = state->copiedWriters;
         auto kept = record.resources;
-        recorder.OnComplete([kept, writers, shaderAddress = record.programAddress, htileClear = record.htileClear] {
+        recorder.OnComplete([kept, writers, shaderAddress = record.programAddress, htileClear = record.htileClear, reachRoots] {
+            const Graphics::P0Reach::CompletionScope reachScope(reachRoots);
             // Delisted before the write-back: one that fails must not keep indirect dispatches on the CPU.
             writers->erase(std::remove(writers->begin(), writers->end(), kept), writers->end());
             kept->WriteBackBuffers(shaderAddress);

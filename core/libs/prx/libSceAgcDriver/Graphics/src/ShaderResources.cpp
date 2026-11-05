@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/P0Reach.hpp"
 #include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
@@ -2809,12 +2810,14 @@ void ShaderResources::KeepStorageImageBytes(Recorder& recorder) const {
 
 ShaderResources::ShaderResources(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots) : context(context), guestMemory(context) {
     drawBuild = true;
+    setReachTag(shaders);
     prepareAddressBindings(shaders, snapshots);
     build(shaders, &target, colorAttachments, indexAddress, indexBytes);
 }
 
 ShaderResources::ShaderResources(DeferredDrawBuild, const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes, std::span<const GuestMemorySnapshot> snapshots, bool addressTables) : context(context), guestMemory(context) {
     drawBuild = true;
+    setReachTag(shaders);
     deferredDraw = true;
     unlockedPrepare = true;
     Require(addressTables || !StagesUseAddressTables(shaders), "a deferred draw build cannot map address tables");
@@ -2826,6 +2829,15 @@ ShaderResources::ShaderResources(DeferredDrawBuild, const Context& context, std:
 void ShaderResources::CompleteDraw() {
     Require(deferredDraw && !completed, "shader resources were not prepared for a deferred draw or were already completed");
     buildComplete();
+}
+
+void ShaderResources::setReachTag(std::span<const CompiledShader> shaders) {
+    if (!P0Reach::Enabled()) return;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr || std::none_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const auto& binding) { return binding.role == ShaderRecompiler::DescriptorRole::BdaPagetable; })) continue;
+        reachTag = (std::uint64_t{1} << 63u) | (static_cast<std::uint64_t>(shader.stage) << 56u) | (shader.program->variantId & ((std::uint64_t{1} << 56u) - 1u));
+        return;
+    }
 }
 
 bool ShaderResources::StagesUseAddressTables(std::span<const CompiledShader> shaders) {
@@ -3742,6 +3754,7 @@ void ShaderResources::buildComplete() {
         timing.uploadMs += phase(BuildPhase::Upload);
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
+        if (bda && reachTag != 0) bda->SetReachTag(reachTag);
         if (bda) bda->SetSrtGuards(std::move(srtGuardFaults));
         finishImageTables();
         phase(BuildPhase::Bda);

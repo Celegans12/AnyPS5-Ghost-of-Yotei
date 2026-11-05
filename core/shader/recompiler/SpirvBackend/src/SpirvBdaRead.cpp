@@ -11,6 +11,13 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <array>
+#include <cstdio>
+#include <mutex>
+#include <set>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
 
 namespace ShaderRecompiler {
 
@@ -495,7 +502,7 @@ std::uint32_t BdaAnchorHolds(SpirvEmitterState& state, const SpirvEmitterState::
 
 void CollectBdaAnchors(SpirvEmitterState& state) {
     state.bdaAnchors.clear();
-    if (!state.program.Info().usesDma || state.bdaProbeFunction == 0) return;
+    if (!state.program.Info().usesDma || state.bdaProbeFunction == 0 || BdaAbi::ReachCensusEnabled()) return;
     std::vector<std::pair<std::pair<std::uint32_t, std::uint32_t>, std::size_t>> bases;
     for (const IrValue* inst : BdaReadSites(state)) {
         const auto base = UserDataBase(state, *inst);
@@ -925,6 +932,154 @@ std::uint32_t EmitBdaSpanRead(SpirvValueEmitContext& ctx, const IrValue& inst, s
     const auto values = state.module.AllocateId();
     state.module.AddFunction(spv::OpCompositeExtract, TypeU32Vector(state, 4), values, read, 0u);
     return values;
+}
+
+}
+
+namespace ShaderRecompiler {
+
+namespace {
+
+thread_local std::uint64_t reachCensusShader = 0;
+
+struct ReachOrigin {
+    std::uint32_t depth = 0;
+    bool root = false;
+    bool lane = false;
+    bool data = false;
+    bool lds = false;
+    bool phi = false;
+    bool unknown = false;
+    void Join(const ReachOrigin& other) {
+        depth = std::max(depth, other.depth);
+        root = root || other.root;
+        lane = lane || other.lane;
+        data = data || other.data;
+        lds = lds || other.lds;
+        phi = phi || other.phi;
+        unknown = unknown || other.unknown;
+    }
+};
+
+class ReachClassifier {
+public:
+    ReachOrigin Of(const IrValue* value, std::uint32_t level = 0) {
+        if (value == nullptr) return {.unknown = true};
+        value = value->Resolve();
+        if (value == nullptr) return {.unknown = true};
+        if (value->HasImmediate()) return {};
+        if (level > 48u) return {.unknown = true};
+        if (const auto found = done.find(value); found != done.end()) return found->second;
+        if (active.contains(value)) return {.phi = true};
+        active.insert(value);
+        const std::string_view name = IrOpcodeName(value->Opcode());
+        ReachOrigin origin;
+        const auto joinArguments = [&] {
+            for (std::size_t index = 0; index < value->ArgumentCount(); ++index) origin.Join(Of(value->Argument(index), level + 1u));
+        };
+        if (name == "GetUserData") {
+            origin.root = true;
+        } else if (name == "GetBuiltin" || name == "LaneId" || name == "MeshArgument" || name == "DrawParameter" || name == "GetVectorRegister") {
+            origin.lane = true;
+            if (name == "GetVectorRegister") origin.unknown = true;
+        } else if (name.starts_with("LoadShared") || name.starts_with("SharedAtomic")) {
+            origin.lds = true;
+            origin.data = true;
+        } else if (name.starts_with("Load") || name.starts_with("ReadConst") || name.starts_with("Image") || name.find("Atomic") != std::string_view::npos || name.starts_with("Data")) {
+            joinArguments();
+            origin.depth += 1u;
+            origin.data = true;
+        } else if (name == "Phi") {
+            joinArguments();
+            origin.phi = true;
+        } else if (name == "ReadFirstLane" || name == "ReadLane") {
+            joinArguments();
+            origin.lane = false;
+        } else if (name.starts_with("GetScalarRegister") || name.starts_with("GetRegister")) {
+            origin.unknown = true;
+        } else {
+            joinArguments();
+        }
+        active.erase(value);
+        done.emplace(value, origin);
+        return origin;
+    }
+
+private:
+    std::unordered_map<const IrValue*, ReachOrigin> done;
+    std::unordered_set<const IrValue*> active;
+};
+
+}
+
+void SetReachCensusShader(std::uint64_t address) {
+    reachCensusShader = address;
+}
+
+void ReportBdaSiteClasses(const SpirvEmitterState& state) {
+    if (!BdaAbi::ReachCensusEnabled() || !state.program.Info().usesDma) return;
+    static std::mutex mutex;
+    static std::set<std::pair<std::uint64_t, std::uint32_t>> reported;
+    const auto stage = static_cast<std::uint32_t>(state.program.Resources().stage);
+    {
+        std::lock_guard lock(mutex);
+        if (!reported.insert({reachCensusShader, stage}).second) return;
+    }
+    enum Class { RootConst, RootLane, RootUniform, TableConst, TableLane, TableUniform, Chase, DataOffset, Loop, Lds, Unknown, Count };
+    static constexpr const char* names[Count] = {"root-const", "root-lane", "root-uniform", "table1-const", "table1-lane", "table1-uniform", "chase2+", "data-offset", "loop", "lds", "unknown"};
+    std::array<std::array<std::uint32_t, Count>, 2> counts{};
+    std::uint32_t maxDepth = 0;
+    std::uint32_t fullSites = 0;
+    ReachClassifier classifier;
+    const auto& memory = state.program.Resources().memoryInfo;
+    for (const IrBlock* block : state.program.BlockOrder()) {
+        for (const IrValue* inst : block->Instructions()) {
+            const auto info = AddressOpcodeInfoOf(inst->Opcode());
+            if (info.access == AddressAccess::None) continue;
+            const auto index = inst->Flags<MemoryFlags>().index;
+            if (index >= memory.size()) continue;
+            const auto& mem = memory[index];
+            if (mem.planningOnly) continue;
+            if (mem.kind != ResourceKind::ScalarAddress && mem.kind != ResourceKind::Flat && mem.kind != ResourceKind::Global) continue;
+            ReachOrigin base;
+            ReachOrigin offset;
+            if (mem.addressIsFull) {
+                ++fullSites;
+                if (inst->ArgumentCount() > 1u) base.Join(classifier.Of(inst->Argument(1)));
+                if (inst->ArgumentCount() > 2u) base.Join(classifier.Of(inst->Argument(2)));
+            } else {
+                const IrValue* handle = inst->ArgumentCount() > 0u && inst->Argument(0) != nullptr ? inst->Argument(0)->Resolve() : nullptr;
+                if (handle != nullptr && handle->Opcode() == IrOpcode::GetAddressResource) {
+                    for (std::size_t word = 0; word < handle->ArgumentCount(); ++word) base.Join(classifier.Of(handle->Argument(word)));
+                } else {
+                    base.unknown = true;
+                }
+                if (inst->ArgumentCount() > 1u) offset = classifier.Of(inst->Argument(1));
+            }
+            maxDepth = std::max(maxDepth, base.depth);
+            Class kind;
+            if (base.lds || offset.lds) kind = Lds;
+            else if (base.unknown || offset.unknown) kind = Unknown;
+            else if (base.phi && base.depth > 0u) kind = Loop;
+            else if (base.depth >= 2u) kind = Chase;
+            else if (offset.data) kind = DataOffset;
+            else if (base.depth == 0u) kind = offset.lane ? RootLane : offset.root ? RootUniform : RootConst;
+            else kind = offset.lane ? TableLane : offset.root ? TableUniform : TableConst;
+            if (mem.addressIsFull && base.lane && base.depth == 0u && !base.data) kind = RootLane;
+            counts[info.access == AddressAccess::Read ? 0 : 1][kind] += 1u;
+        }
+    }
+    std::string line;
+    for (std::size_t side = 0; side < 2; ++side) {
+        line += side == 0 ? " reads:" : " | writes:";
+        for (std::size_t kind = 0; kind < Count; ++kind) {
+            if (counts[side][kind] == 0u) continue;
+            line += " ";
+            line += names[kind];
+            line += "=" + std::to_string(counts[side][kind]);
+        }
+    }
+    std::fprintf(stderr, "[p0r-sites] prog=0x%llx stage=%u depth=%u full=%u%s\n", static_cast<unsigned long long>(reachCensusShader), stage, maxDepth, fullSites, line.c_str());
 }
 
 }

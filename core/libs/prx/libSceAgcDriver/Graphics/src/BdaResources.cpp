@@ -8,6 +8,7 @@
 #include "ImageTableAbi.hpp"
 #include "IntermediateRepresentation/IrMetadata/ShaderInfo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/P0Reach.hpp"
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -19,6 +20,8 @@
 #include <mutex>
 #include <iomanip>
 #include <sstream>
+
+namespace ReachAbi = ShaderRecompiler::BdaAbi;
 
 namespace AgcDriver::Graphics {
 
@@ -199,12 +202,13 @@ void reportBdaBuildTimes() {
 
 BdaResources::BdaResources(const Context& context) : textureService(context.textureService) {
     static_assert(std::endian::native == std::endian::little);
-    Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
+    Require(ReachAbi::FaultBufferAllocation() <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
     const auto faultStart = bdaBuildProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    fault = std::make_unique<Buffer>(context, ReachAbi::FaultBufferAllocation(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
     std::memset(fault->Bytes().data() + ShaderRecompiler::BdaAbi::SrtGuardWord * sizeof(std::uint32_t), 0, sizeof(std::uint32_t));
+    if (P0Reach::Enabled()) std::memset(fault->Bytes().data() + ShaderRecompiler::BdaAbi::CensusOverflowWord * sizeof(std::uint32_t), 0, (ShaderRecompiler::BdaAbi::CensusListWord - ShaderRecompiler::BdaAbi::CensusOverflowWord) * sizeof(std::uint32_t));
     if (bdaBuildProfiled()) {
         bdaBuildTimes().faults.fetch_add(1, std::memory_order_relaxed);
         bdaBuildTimes().faultNs.fetch_add(nsSince(faultStart), std::memory_order_relaxed);
@@ -242,6 +246,13 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     } noteOutcome{profiled, outcome, tableStart};
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
     const auto serial = cached.has_value() ? cached->serial : 0;
+    if (P0Reach::Enabled()) {
+        reachLease.ranges = static_cast<std::uint32_t>(ranges.size());
+        for (const auto& range : ranges) {
+            if ((range.permissions & ShaderRecompiler::BdaAbi::Read) != 0) reachLease.readable += range.end - range.begin;
+            if ((range.permissions & ShaderRecompiler::BdaAbi::Write) != 0) reachLease.writable += range.end - range.begin;
+        }
+    }
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     // The range index (BdaAbi::IndexedTable) after the ranges; APS5_NO_BDA_INDEX=1 leaves it out.
@@ -368,7 +379,7 @@ VkDescriptorBufferInfo BdaResources::Table() const {
 }
 
 VkDescriptorBufferInfo BdaResources::Fault() const {
-    return {fault->Handle(), 0, ShaderRecompiler::BdaAbi::FaultBufferBytes};
+    return {fault->Handle(), 0, ReachAbi::FaultBufferAllocation()};
 }
 
 namespace {
@@ -380,6 +391,12 @@ bool LoopGuardTripped() {
 }
 
 void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
+    if (P0Reach::Enabled()) {
+        auto* words = reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+        if (words[ShaderRecompiler::BdaAbi::WrittenOverflowWord] == 0) static_cast<void>(ReachAbi::ForEachWrittenRange(words, [&](std::uint64_t begin, std::size_t bytes) { written.emplace_back(begin, bytes); }));
+        P0Reach::NoteUse(shaderAddress != 0 ? shaderAddress : reachTag, words, written, reachLease);
+    }
     markWrittenPages();
     ShaderRecompiler::BdaAbi::Fault report{};
     std::memcpy(&report, fault->Bytes().data(), sizeof(report));

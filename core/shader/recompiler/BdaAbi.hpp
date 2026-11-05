@@ -4,6 +4,7 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <type_traits>
 #include <vector>
@@ -127,6 +128,23 @@ inline constexpr std::uint32_t SrtGuardStageShift = 24;
 inline constexpr std::size_t FaultBufferBytes = (SrtGuardWord + 1) * sizeof(std::uint32_t);
 static_assert((WrittenPageSlots & (WrittenPageSlots - 1)) == 0);
 static_assert(WrittenChunkPages == 32);
+
+inline bool ReachCensusEnabled() {
+    static const bool enabled = std::getenv("APS5_P0R_CENSUS") != nullptr;
+    return enabled;
+}
+inline constexpr std::uint32_t CensusSlots = 16384;
+inline constexpr std::uint32_t CensusProbes = 16;
+inline constexpr std::uint32_t CensusOverflowWord = SrtGuardWord + 1;
+inline constexpr std::uint32_t CensusCountWord = CensusOverflowWord + 1;
+inline constexpr std::uint32_t CensusWideWord = CensusCountWord + 1;
+inline constexpr std::uint32_t CensusSlotsWord = CensusWideWord + 2;
+inline constexpr std::uint32_t CensusListWord = CensusSlotsWord + 2 * CensusSlots;
+inline constexpr std::size_t CensusBufferBytes = (CensusListWord + CensusSlots) * sizeof(std::uint32_t);
+static_assert((CensusSlots & (CensusSlots - 1)) == 0);
+inline std::size_t FaultBufferAllocation() {
+    return ReachCensusEnabled() ? CensusBufferBytes : FaultBufferBytes;
+}
 
 inline constexpr std::uint32_t WrittenChunkKey(std::uint64_t address) {
     return static_cast<std::uint32_t>(address >> WrittenChunkShift) + 1u;

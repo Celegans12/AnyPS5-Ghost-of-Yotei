@@ -43,6 +43,8 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
 bool HasBdaSpanReads(const SpirvEmitterState& state, const IrValue& inst);
 std::uint32_t EmitBdaSpanRead(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t used);
 bool BdaByteReadsForced();
+void SetReachCensusShader(std::uint64_t address);
+void ReportBdaSiteClasses(const SpirvEmitterState& state);
 std::uint32_t AddBdaAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t address, std::uint32_t offset, bool subtract);
 bool RoutesApertures(const SpirvEmitterState& state, const MemoryInfo& mem);
 std::uint32_t UsedBdaDwords(const IrValue& inst, std::uint32_t dwords);

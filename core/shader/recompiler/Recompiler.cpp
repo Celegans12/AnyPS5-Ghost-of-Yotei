@@ -49,6 +49,7 @@
 #include "Optimization/include/Optimization/SsaBuilder.hpp"
 #include "Optimization/include/Optimization/TessellationLowering.hpp"
 #include "SpirvBackend/include/SpirvBackend/SpirvEmitter.hpp"
+#include "SpirvBackend/SpirvBda.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
@@ -700,7 +701,9 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
     result.variantId = nextVariantId();
+    if (BdaAbi::ReachCensusEnabled() && program.Info().usesDma) std::fprintf(stderr, "[p0r-variant] prog=0x%llx stage=%u variant=%llu\n", static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.shader.stage), static_cast<unsigned long long>(result.variantId));
     SpirvEmitInfo emitted;
+    SetReachCensusShader(request.shader.codeAddress);
     try {
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
     } catch (const SpannedWaveUnsupported& error) {

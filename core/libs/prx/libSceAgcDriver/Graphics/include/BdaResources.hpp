@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "Recompiler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/P0Reach.hpp"
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,6 +19,7 @@ public:
     VkDescriptorBufferInfo Table() const;
     VkDescriptorBufferInfo Fault() const;
     void CheckFault(std::uint64_t shaderAddress = 0) const;
+    void SetReachTag(std::uint64_t tag) { reachTag = tag; }
     struct ImageTableFaults {
         std::uint32_t stage = 0;
         std::uint64_t shader = 0;
@@ -61,6 +63,8 @@ private:
     std::shared_ptr<Buffer> table;
     std::unique_ptr<Buffer> fault;
     std::size_t tableBytes = 0;
+    P0Reach::Lease reachLease;
+    std::uint64_t reachTag = 0;
     std::vector<ImageTableFaults> imageTables;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
     const TextureService* textureService = nullptr;
