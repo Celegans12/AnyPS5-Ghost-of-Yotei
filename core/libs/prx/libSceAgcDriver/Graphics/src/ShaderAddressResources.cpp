@@ -209,6 +209,13 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         const bool tableFaultsOnly = std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap; });
         faultChecks = faultChecks || tables != 0 || (faults != 0 && (!tableFaultsOnly || shader.program->imageTableFaults != 0 || shader.program->poisonedSrtReads != 0 || shader.program->windowLaneGuards != 0 || loopGuarded || hasDeferredDirectImage || guardedWrap));
     }
+    if (usesBda && Reach::Enabled() && shaders.size() == 1 && shaders.front().stage == ShaderRecompiler::ShaderStage::Compute) {
+        Reach::CountCandidate(bdaReadOnly ? 0 : 1);
+        if (bdaReadOnly) {
+            const auto hash = shaders.front().program->spirv.ContentHash();
+            guestMemory.AllowReach((hash.low ^ (hash.high * 0x9e3779b97f4a7c15ull)) | 1u);
+        }
+    }
     if (usesBda) {
         Require(context.bufferDeviceAddress, "buffer device address is not enabled");
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

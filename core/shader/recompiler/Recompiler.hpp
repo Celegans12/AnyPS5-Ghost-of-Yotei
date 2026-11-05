@@ -360,6 +360,8 @@ struct SpirvTarget {
     bool largePixelFunctionLdsBuffer = false;
     std::uint32_t pixelFunctionStorageDwords = 4096u;
     bool deviceScopeLdsMemoryBarriers = false;
+    // APS5_REACH_RESIDENCY: BDA read lookups note their pages on uses whose table says so (BdaAbi::NoteReadsTable).
+    bool bdaReachNotes = false;
 };
 
 struct BindingLayout {

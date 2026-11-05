@@ -38,6 +38,10 @@ struct Range {
 // above. Below `base` the bound is 0, at or past bucket `buckets` it is `count`. Exact: the same
 // upper bound, so the same range or fault, as the search over the whole table.
 inline constexpr std::uint32_t IndexedTable = 1;
+// Header::reserved bit of a table whose use notes its reads (SpirvTarget::bdaReachNotes programs only, a
+// learning use of APS5_REACH_RESIDENCY): every successful read lookup notes its first and last 4 KiB page in
+// the reach-note hash after the fault buffer's words (ReachSlotsWord), and anchors are not used.
+inline constexpr std::uint32_t NoteReadsTable = 2;
 struct IndexHeader {
     std::uint64_t base;
     std::uint32_t buckets;
@@ -127,6 +131,33 @@ inline constexpr std::uint32_t SrtGuardStageShift = 24;
 inline constexpr std::size_t FaultBufferBytes = (SrtGuardWord + 1) * sizeof(std::uint32_t);
 static_assert((WrittenPageSlots & (WrittenPageSlots - 1)) == 0);
 static_assert(WrittenChunkPages == 32);
+
+// Reach notes (NoteReadsTable): ReachSlots slots of {chunk key, page mask} as the written-page record, a count
+// and a claim list, and an overflow counter; a learning use's fault buffer is ReachFaultBufferBytes long.
+inline constexpr std::uint32_t ReachSlots = 16384;
+inline constexpr std::uint32_t ReachProbes = 16;
+inline constexpr std::uint32_t ReachOverflowWord = SrtGuardWord + 1;
+inline constexpr std::uint32_t ReachCountWord = ReachOverflowWord + 1;
+inline constexpr std::uint32_t ReachSlotsWord = ReachCountWord + 2;
+inline constexpr std::uint32_t ReachListWord = ReachSlotsWord + 2 * ReachSlots;
+inline constexpr std::size_t ReachFaultBufferBytes = (ReachListWord + ReachSlots) * sizeof(std::uint32_t);
+static_assert((ReachSlots & (ReachSlots - 1)) == 0);
+
+template<typename Visit>
+bool ForEachReachPage(const std::uint32_t* words, Visit visit) {
+    const auto count = words[ReachCountWord];
+    if (count > ReachSlots) return false;
+    for (std::uint32_t claim = 0; claim < count; ++claim) {
+        const auto slot = words[ReachListWord + claim];
+        if (slot >= ReachSlots) return false;
+        const auto key = words[ReachSlotsWord + 2 * slot];
+        const auto mask = words[ReachSlotsWord + 2 * slot + 1];
+        if (key == 0) continue;
+        const auto chunk = static_cast<std::uint64_t>(key - 1u) << WrittenChunkShift;
+        for (auto bits = mask; bits != 0; bits &= bits - 1u) visit(chunk + (static_cast<std::uint64_t>(std::countr_zero(bits)) << WrittenPageShift));
+    }
+    return true;
+}
 
 inline constexpr std::uint32_t WrittenChunkKey(std::uint64_t address) {
     return static_cast<std::uint32_t>(address >> WrittenChunkShift) + 1u;

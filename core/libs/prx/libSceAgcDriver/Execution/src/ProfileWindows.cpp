@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ReachResidency.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CommandMix.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
@@ -42,6 +43,7 @@ void Close(const char* label) {
     CommandMix::Close(label);
     NewPath::Close(label);
     Graphics::ResidentCensus::Close(label);
+    Graphics::Reach::CloseWindow(label);
     MemoryStats::ReportNow(label);
     ProfileOutput_nid_no_patch().Flush();
 }

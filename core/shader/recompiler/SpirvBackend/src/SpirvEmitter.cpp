@@ -296,6 +296,7 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.float32DenormPreserve = target.float32DenormPreserve;
     state.fusedExactArithmetic = target.fusedExactArithmetic;
     state.deviceScopeLdsMemoryBarriers = target.deviceScopeLdsMemoryBarriers;
+    state.bdaReachNotes = target.bdaReachNotes;
     state.hostSubgroupSize = target.subgroupSize;
     state.bindlessImages = target.bindlessImages && ResourceMaterializer::UsesBindlessImages(program.Info(), program.Resources().stage);
     const auto supports = [&](spv::Capability capability) { return std::ranges::find(target.supportedCapabilities, static_cast<std::uint32_t>(capability)) != target.supportedCapabilities.end(); };

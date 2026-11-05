@@ -4004,7 +4004,8 @@ void ShaderResources::noteReusable() {
         }
     }
     if (addressBased) addressWrites = guestMemory.DirectWrites();
-    reusable = true;
+    // A learning build of APS5_REACH_RESIDENCY serves one use: the program's next dispatch builds anew and maps what it learned.
+    reusable = !guestMemory.ReachLearning();
     addressReuse = addressBased;
     bdaTemplate = templated;
     sharedUses = templated && addressWrites.empty() && guestMemory.Writes().empty() && !guestMemory.HasGpuCopies() && !guestMemory.HasCopiedWrites() && std::none_of(storageWritten.begin(), storageWritten.end(), [](bool written) { return written; });
@@ -7805,6 +7806,7 @@ void ShaderResources::MarkGpuWritesInRun(Recorder& recorder, const std::shared_p
     NoteResidentCensus();
     // As MarkGpuWrites, with the copy-backs (and the marks of the ranges they store) after the run.
     const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : usesBda && bdaReadOnly && !RuntimeSwitches::Set(RuntimeSwitch::NoReadOnlyLeaseSkip) ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
+    if (usesBda && !bdaReadOnly && bda != nullptr && Reach::Enabled()) bda->NoteWriterUse(Reach::WriterRecorded(Recorder::ThreadLane()));
     if (auto split = guestMemory.SplitInPlaceReads()) {
         recorder.NotePendingReadList(std::move(split->space), kind);
         recorder.NotePendingReads(split->own, kind);
@@ -7834,6 +7836,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     const auto kind = !guestMemory.HoldsLease() ? Recorder::ReadKind::DispatchElement : usesBda && bdaReadOnly && !RuntimeSwitches::Set(RuntimeSwitch::NoReadOnlyLeaseSkip) ? Recorder::ReadKind::AddressBasedReadOnly : Recorder::ReadKind::AddressBased;
+    if (usesBda && !bdaReadOnly && bda != nullptr && Reach::Enabled()) bda->NoteWriterUse(Reach::WriterRecorded(Recorder::ThreadLane()));
     if (auto split = guestMemory.SplitInPlaceReads()) {
         recorder.NotePendingReadList(std::move(split->space), kind);
         recorder.NotePendingReads(split->own, kind);

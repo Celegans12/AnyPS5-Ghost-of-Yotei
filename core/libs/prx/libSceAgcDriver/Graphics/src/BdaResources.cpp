@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ReachResidency.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureService.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -210,6 +211,18 @@ BdaResources::BdaResources(const Context& context) : textureService(context.text
 }
 
 BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory) : BdaResources(context) {
+    const bool learning = memory.ReachLearning();
+    if (learning) {
+        // A learning use of APS5_REACH_RESIDENCY: the reach notes follow the fault words, and the table is
+        // its own (the header flag), never shared through the table cache.
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
+        Require(ShaderRecompiler::BdaAbi::ReachFaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA reach note buffer exceeds storage buffer range limit");
+        fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::ReachFaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+        std::memset(fault->Bytes().data(), 0, fault->Bytes().size());
+        faultBytes = ShaderRecompiler::BdaAbi::ReachFaultBufferBytes;
+        reachProgram = memory.ReachProgram();
+        reachLearning = true;
+    }
     const bool profiled = bdaBuildProfiled();
     // APS5_NO_LEAN_BDA_TABLES=1 (runtime switch): copy the ranges into the table cache and hash them in one
     // chain, as before (see hashRangesLanes and GuestBufferMemory's range-list pool).
@@ -252,7 +265,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     Require(tableBytes <= context.limits.maxStorageBufferRange && ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA descriptors exceed storage buffer range limit");
     auto& cache = Tables();
     std::uint64_t hash = 0;
-    if (tableCacheEnabled()) {
+    if (tableCacheEnabled() && !learning) {
         std::lock_guard lock(cache.mutex);
         // Another device's tables are not this one's (their buffers are dead or foreign).
         if (cache.device != context.device) {
@@ -324,7 +337,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
     const auto copyStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (profiled) bdaBuildTimes().bufferNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(copyStart - bufferStart).count()), std::memory_order_relaxed);
-    const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), index.empty() ? 0u : ShaderRecompiler::BdaAbi::IndexedTable};
+    const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), (index.empty() ? 0u : ShaderRecompiler::BdaAbi::IndexedTable) | (learning ? ShaderRecompiler::BdaAbi::NoteReadsTable : 0u)};
     std::memcpy(table->Bytes().data(), &header, sizeof(header));
     if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
     if (!index.empty()) std::memcpy(table->Bytes().data() + sizeof(header) + ranges.size() * sizeof(ranges.front()), index.data(), index.size() * sizeof(index.front()));
@@ -337,7 +350,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             if (profiled) bdaBuildTimes().entryNs.fetch_add(nsSince(start), std::memory_order_relaxed);
         }
     } noteEntry{profiled, entryStart};
-    if (tableCacheEnabled()) {
+    if (tableCacheEnabled() && !learning) {
         std::lock_guard lock(cache.mutex);
         ++cache.misses;
         if (cache.device != context.device) {
@@ -366,7 +379,7 @@ VkDescriptorBufferInfo BdaResources::Table() const {
 }
 
 VkDescriptorBufferInfo BdaResources::Fault() const {
-    return {fault->Handle(), 0, ShaderRecompiler::BdaAbi::FaultBufferBytes};
+    return {fault->Handle(), 0, faultBytes};
 }
 
 namespace {
@@ -379,6 +392,22 @@ bool LoopGuardTripped() {
 
 void BdaResources::CheckFault(std::uint64_t shaderAddress) const {
     markWrittenPages();
+    if (!writerUses.empty()) {
+        Reach::WriterCompleted(writerUses.front());
+        writerUses.pop_front();
+    }
+    if (faultBytes == ShaderRecompiler::BdaAbi::ReachFaultBufferBytes) {
+        auto* words = reinterpret_cast<std::uint32_t*>(fault->Bytes().data());
+        if (words[ShaderRecompiler::BdaAbi::ReachCountWord] != 0) Reach::NoteLearned(reachProgram, words);
+        if (reachLearning && table != nullptr) {
+            // One learning use per build: later uses of a reused build read without notes.
+            std::uint32_t flags = 0;
+            std::memcpy(&flags, table->Bytes().data() + offsetof(ShaderRecompiler::BdaAbi::Header, reserved), sizeof(flags));
+            flags &= ~ShaderRecompiler::BdaAbi::NoteReadsTable;
+            std::memcpy(table->Bytes().data() + offsetof(ShaderRecompiler::BdaAbi::Header, reserved), &flags, sizeof(flags));
+            reachLearning = false;
+        }
+    }
     ShaderRecompiler::BdaAbi::Fault report{};
     std::memcpy(&report, fault->Bytes().data(), sizeof(report));
     if (report.state == ShaderRecompiler::BdaAbi::FaultState::Empty) {

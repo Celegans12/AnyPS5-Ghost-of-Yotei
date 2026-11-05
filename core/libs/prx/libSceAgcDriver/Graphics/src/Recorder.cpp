@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ReachResidency.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
@@ -2710,7 +2711,7 @@ namespace {
 
 constexpr std::uint32_t MaxTimedRanges = 512;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
-constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh"};
+constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "reach-fill"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
 // presenter's thread adds to without the GPU mutex (AddGpuTiming).
 std::atomic<std::uint64_t> classBarriers[CommandClasses]{};
@@ -4295,6 +4296,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     if (bytes == 0) return false;
     ensureOpen();
     const auto end = address + bytes;
+    Reach::NoteWrite(address, end);
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
     noteWriteOrigin(writeNoteCount, address, end);
@@ -4325,6 +4327,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
+    Reach::NoteWrite(address, address + bytes);
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     noteWriteOrigin(writeNoteCount, address, address + bytes);
@@ -4426,6 +4429,20 @@ bool Recorder::PendingWriteOtherLane(std::uint64_t address, std::size_t bytes) c
     }
     for (const auto& batch : inFlight) {
         if (batch->lane != lane && overlaps(*batch, address, end)) return true;
+    }
+    return false;
+}
+
+bool Recorder::PendingWriteOrLeaseOtherLane(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0) return false;
+    const auto end = address + bytes;
+    const int lane = currentLane();
+    const auto pending = [&](const Batch& batch) { return overlaps(batch, address, end) || readOverlap(batch, address, end, ReadKind::AddressBased).has_value(); };
+    for (std::size_t index = 0; index < lanes.size(); ++index) {
+        if (static_cast<int>(index) != lane && lanes[index] != nullptr && pending(*lanes[index])) return true;
+    }
+    for (const auto& batch : inFlight) {
+        if (batch->lane != lane && pending(*batch)) return true;
     }
     return false;
 }
@@ -5151,6 +5168,11 @@ std::uint64_t Recorder::SubmitAndEpoch() {
 
 std::uint64_t Recorder::OpenBatchSerial() {
     return open != nullptr ? submissions + 1 : 0;
+}
+
+std::uint64_t Recorder::OpenBatchIdentity() {
+    ensureOpen();
+    return open->openedAt;
 }
 
 namespace {

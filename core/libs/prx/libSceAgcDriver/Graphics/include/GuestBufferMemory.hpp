@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTBUFFERMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ReachResidency.hpp"
 #include "BdaAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
@@ -357,6 +358,16 @@ public:
     // An address-based build whose dispatch is too small for its BDA overlays' copies to pay off
     // (see resolveOverlays): its written elements stay in the imports.
     void DisallowAddressStaging() { addressStaging = false; }
+    // APS5_REACH_RESIDENCY: an address-based compute build of `program` whose shaders never store through
+    // BDA; UploadFinish maps its program's predicted units to reach copies (or makes it a learning build).
+    void AllowReach(std::uint64_t program) {
+        reachProgram = program;
+        reachAllowed = program != 0;
+    }
+    // A learning build, or one made before its program learned anything: it serves one use only.
+    bool ReachLearning() const { return reachLearning || reachPending; }
+    std::uint64_t ReachProgram() const { return reachProgram; }
+    std::size_t ReachUnits() const { return reachRanges.size(); }
     void AllowAdjustedRegions() { adjustedRegions = true; }
     // S1: UploadPrepare copies nothing from guest memory (a region it would copy waits for
     // UploadFinish), so a stage A made ahead of the draw reads no guest bytes.
@@ -652,6 +663,14 @@ private:
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
     void takeHeapReferences();
+    void prepareReach(bool addressable);
+    bool recordReachFills(const Reach::Mapping& mapping, std::vector<Reach::Fill>& fills);
+    std::uint64_t reachProgram = 0;
+    bool reachAllowed = false;
+    bool reachLearning = false;
+    bool reachPending = false;
+    std::vector<ShaderRecompiler::BdaAbi::Range> reachRanges;
+    std::shared_ptr<Reach::Mapping> reachMapping;
     Context context;
     bool stagingAllowed = false;
     bool addressStaging = true;

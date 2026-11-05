@@ -434,6 +434,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/SampleOrder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BarrierBatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/UnitShadow.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ReachResidency.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Sampler.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeviceImageKeys.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DescriptorHeap.cpp
@@ -1005,6 +1006,21 @@ if(BUILD_TESTING)
     set_tests_properties(agc_bda_page_table PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_bda_page_table PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_reach_residency_tests EXCLUDE_FROM_ALL tests/ReachResidency.cpp)
+target_include_directories(agc_reach_residency_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_reach_residency_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_reach_residency_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_reach_residency_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_reach_residency_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_reach_residency COMMAND agc_reach_residency_tests)
+    set_tests_properties(agc_reach_residency PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_reach_residency PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

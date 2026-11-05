@@ -696,6 +696,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     }
     targetOptions.waveLdsMemoryBarriers = request.target.waveLdsMemoryBarriers;
     targetOptions.deviceScopeLdsMemoryBarriers = request.target.deviceScopeLdsMemoryBarriers;
+    targetOptions.bdaReachNotes = request.target.bdaReachNotes;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;

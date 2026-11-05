@@ -335,6 +335,7 @@ private:
         append(key, value.largePixelFunctionLdsBuffer);
         append(key, value.pixelFunctionStorageDwords);
         append(key, value.deviceScopeLdsMemoryBarriers);
+        append(key, value.bdaReachNotes);
     }
 };
 

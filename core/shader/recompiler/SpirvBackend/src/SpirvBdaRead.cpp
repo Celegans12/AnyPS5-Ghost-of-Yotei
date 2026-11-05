@@ -537,6 +537,11 @@ void EmitBdaAnchorRange(SpirvEmitterState& state, SpirvEmitterState::BdaAnchor& 
     auto usable = Binary(state, spv::OpLogicalAnd, boolean, Binary(state, spv::OpINotEqual, boolean, anchor.device, BdaConstant(state, 0u)), Binary(state, spv::OpUGreaterThan, boolean, deviceEnd, anchor.device));
     usable = Binary(state, spv::OpLogicalAnd, boolean, usable, Binary(state, spv::OpULessThanEqual, boolean, end, BdaConstant(state, BdaAnchorAddressLimit)));
     usable = Binary(state, spv::OpLogicalAnd, boolean, usable, Binary(state, spv::OpULessThanEqual, boolean, span, BdaConstant(state, BdaAnchorSpanLimit)));
+    if (state.bdaReachNotes && !state.program.Info().bdaWrites) {
+        const auto u32 = TypeU32(state);
+        const auto learning = Binary(state, spv::OpINotEqual, boolean, Binary(state, spv::OpBitwiseAnd, u32, BdaLoadWord(state, ConstantU32(state, 3u)), ConstantU32(state, BdaAbi::NoteReadsTable)), ConstantU32(state, 0u));
+        usable = Binary(state, spv::OpLogicalAnd, boolean, usable, Unary(state, spv::OpLogicalNot, boolean, learning));
+    }
     anchor.size = Select(state, u64, usable, span, BdaConstant(state, 0u));
 }
 

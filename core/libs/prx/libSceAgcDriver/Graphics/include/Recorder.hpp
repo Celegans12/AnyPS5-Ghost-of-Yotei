@@ -395,6 +395,8 @@ public:
     // Whether a pending write over the range is in a batch of the other lane than the calling
     // thread's (open, or in flight): this lane's own pending writers run before what it records next.
     bool PendingWriteOtherLane(std::uint64_t address, std::size_t bytes) const;
+    // PendingWriteOtherLane, or a writer-capable address-based lease of the other lane over the range.
+    bool PendingWriteOrLeaseOtherLane(std::uint64_t address, std::size_t bytes) const;
     // Whether no unfinished batch writes the range any more: no open-batch overlap, and every
     // overlapping in-flight batch's fence has signaled (its in-place GPU stores are final in host
     // memory; its completion stores are the caller's business, see VulkanDevice::CopyBuffer).
@@ -506,6 +508,9 @@ public:
     // ever submitted); WaitSerial(serial) then covers all recorded work.
     std::uint64_t SubmitAndEpoch();
     std::uint64_t OpenBatchSerial();
+    // Opens a batch when none is: the opening serial of the calling thread's lane's open batch, the same
+    // for every call until it is submitted and different for every later batch of the lane.
+    std::uint64_t OpenBatchIdentity();
     bool HasTimeline() const { return timeline != VK_NULL_HANDLE; }
     bool RecordDispatchArguments(VkCommandBuffer commands, VkDeviceAddress source, VkDeviceAddress arguments, const std::array<std::uint32_t, 3>* threadGroup = nullptr);
     // Waits until every batch up to `serial` completed on the GPU. Called WITHOUT GuestMemory::GpuMutex:
@@ -797,7 +802,7 @@ public:
     // or APS5_PROFILE_GPU). A class range covers the command with its own barriers (a dispatch's
     // barriers are classes of their own, its program range stays keyed by the program), so the
     // union of every range of a batch and the batch span differ by what no class times ('untimed').
-    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, Count };
+    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, ReachFill, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);

@@ -148,6 +148,7 @@ struct SpirvEmitterState {
     std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint32_t> solvedBarycentrics;
     bool waveLdsMemoryBarriers = false;
     bool deviceScopeLdsMemoryBarriers = false;
+    bool bdaReachNotes = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
     std::uint32_t laneHalf = 0;
     std::uint32_t spirvVersion = 0x00010300u;

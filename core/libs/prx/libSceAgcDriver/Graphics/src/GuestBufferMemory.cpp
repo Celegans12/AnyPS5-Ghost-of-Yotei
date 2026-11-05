@@ -5815,6 +5815,7 @@ void GuestBufferMemory::UploadFinish(bool addressable) {
     }
     if (heapsEnd > heapsBegin) StorageTexture::PublishShadowsOnly(heapsBegin, static_cast<std::size_t>(heapsEnd - heapsBegin), PublishScope::Whole, "address-based heaps");
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
+    prepareReach(addressable);
     takeHeapReferences();
     ResidentBuffer::FlushChanged(context);
     if (!profile) return;
@@ -6793,6 +6794,7 @@ std::vector<ShaderRecompiler::BdaAbi::Range> GuestBufferMemory::AddressRanges() 
     for (const auto& region : regions) {
         if (region.overlay) overlays.push_back(addressRange(region));
     }
+    overlays.insert(overlays.end(), reachRanges.begin(), reachRanges.end());
     if (space != nullptr) {
         std::vector<ShaderRecompiler::BdaAbi::Range> own;
         own.reserve(regions.size());
@@ -6922,6 +6924,7 @@ void GuestBufferMemory::incrementalAddressRanges(std::vector<ShaderRecompiler::B
         const auto range = addressRange(region);
         edits.push_back({range.begin, range.end, region.overlay ? 1 : 0, range});
     }
+    for (const auto& range : reachRanges) edits.push_back({range.begin, range.end, 1, range});
     for (const auto& [begin, end] : writes) edits.push_back({begin, end, 2, {}});
     std::stable_sort(edits.begin(), edits.end(), [](const Edit& left, const Edit& right) { return left.begin < right.begin; });
     // Spans of edits that overlap or touch, then widened to the space ranges they overlap; spans whose
@@ -6995,10 +6998,10 @@ void GuestBufferMemory::incrementalAddressRanges(std::vector<ShaderRecompiler::B
 std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTable() const {
     if (space == nullptr) return std::nullopt;
     Require(uploaded && !committed, "guest GPU address ranges are not available");
-    if (writes.empty() && regions.empty()) return CachedTable{space->serial, &space->ranges, nullptr};
+    if (writes.empty() && regions.empty() && reachRanges.empty()) return CachedTable{space->serial, &space->ranges, nullptr};
     if (tableRanges != nullptr) return CachedTable{tableSerial, tableRanges.get(), tableRanges};
     const auto& spaceRanges = space->ranges;
-    const bool inWritable = regions.empty() && std::all_of(writes.begin(), writes.end(), [&](const auto& written) {
+    const bool inWritable = regions.empty() && reachRanges.empty() && std::all_of(writes.begin(), writes.end(), [&](const auto& written) {
         auto at = std::partition_point(spaceRanges.begin(), spaceRanges.end(), [&](const auto& range) { return range.end <= written.first; });
         for (; at != spaceRanges.end() && at->begin < written.second; ++at) {
             if ((at->permissions & ShaderRecompiler::BdaAbi::Write) == 0u) return false;
@@ -7013,6 +7016,7 @@ std::optional<GuestBufferMemory::CachedTable> GuestBufferMemory::CachedAddressTa
     std::vector<ShaderRecompiler::BdaAbi::Range> own;
     own.reserve(regions.size());
     for (const auto& region : regions) own.push_back(addressRange(region));
+    own.insert(own.end(), reachRanges.begin(), reachRanges.end());
     auto key = AddressTableKey(writes, own);
     addressTableTimes().keyWords.fetch_add(key.size(), std::memory_order_relaxed);
     static const bool verify = std::getenv("APS5_VERIFY_BDA_TABLES") != nullptr;
@@ -7623,9 +7627,144 @@ bool GuestBufferMemory::SpaceImportsCurrent() {
     return state.epoch == space->importsEpoch;
 }
 
+// APS5_REACH_RESIDENCY (see ReachResidency.hpp): the predicted units of an address-based read-only compute
+// build that lie wholly inside one direct import region and overlap nothing of the build's own (regions,
+// overlays, written ranges) are mapped to the lane's reach slots; the fills a slot needs to be current for
+// this use are recorded now, after every copy and flush of the upload.
+void GuestBufferMemory::prepareReach(bool addressable) {
+    reachRanges.clear();
+    reachMapping.reset();
+    reachLearning = false;
+    reachPending = false;
+    if (!reachAllowed || !Reach::Enabled()) return;
+    if (!stagingAllowed || !addressable || !HoldsLease()) {
+        Reach::CountCandidate(!stagingAllowed ? 2 : !addressable ? 3 : 4);
+        return;
+    }
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr) {
+        Reach::CountCandidate(5);
+        return;
+    }
+    reachLearning = Reach::LearnBuild(reachProgram);
+    reachPending = !reachLearning && Reach::LearningPending(reachProgram);
+    if (reachLearning || !Reach::CopiesActive()) {
+        Reach::CountBuild(reachLearning, 0, 0, 0);
+        return;
+    }
+    const auto predicted = Reach::Predicted(reachProgram);
+    std::vector<Reach::UnitSource> candidates;
+    std::size_t refused = 0;
+    const auto holderOf = [&](std::uint64_t unit) -> const Region* {
+        const auto end = unit + Reach::UnitBytes;
+        const auto search = [&](const std::vector<Region>& list, bool overlapping) -> const Region* {
+            auto found = std::upper_bound(list.begin(), list.end(), unit, [](std::uint64_t value, const Region& region) { return value < region.begin; });
+            while (found != list.begin()) {
+                --found;
+                if (found->direct != nullptr && found->mirror == nullptr && !found->sparse && !found->overlay && found->begin <= unit && end <= inPlaceEnd(*found)) return &*found;
+                if (!overlapping) break;
+            }
+            return nullptr;
+        };
+        return space != nullptr ? search(space->base, false) : search(regions, regionsOverlap);
+    };
+    for (const auto unit : predicted) {
+        const auto end = unit + Reach::UnitBytes;
+        const auto* holder = holderOf(unit);
+        bool usable = holder != nullptr && !WritesOverlap(unit, static_cast<std::size_t>(Reach::UnitBytes));
+        if (usable) {
+            for (const auto& region : regions) {
+                if (&region != holder && region.begin < end && unit < region.end) {
+                    usable = false;
+                    break;
+                }
+            }
+        }
+        if (!usable) {
+            ++refused;
+            continue;
+        }
+        candidates.push_back({unit, holder->direct->buffer, HostImportOffset(*holder->direct, unit)});
+    }
+    if (candidates.empty()) {
+        Reach::CountBuild(false, predicted.size(), 0, refused);
+        Reach::Report();
+        return;
+    }
+    for (const auto& unit : candidates) {
+        recorder->FlushKeyStoresOverlapping(unit.unit, static_cast<std::size_t>(Reach::UnitBytes));
+        recorder->FlushStoresOverlapping(unit.unit, static_cast<std::size_t>(Reach::UnitBytes));
+    }
+    const Reach::LaneView view{Recorder::ThreadLane(), recorder->OpenBatchIdentity(), [recorder](std::uint64_t begin, std::uint64_t end) { return recorder->PendingWriteOrLeaseOtherLane(begin, static_cast<std::size_t>(end - begin)); }};
+    auto mapping = std::make_shared<Reach::Mapping>();
+    std::vector<Reach::Fill> fills;
+    if (!Reach::Map(context, view, candidates, *mapping, fills) || !recordReachFills(*mapping, fills)) {
+        Reach::CountBuild(false, predicted.size(), 0, refused + candidates.size());
+        Reach::Report();
+        return;
+    }
+    recorder->Keep(mapping->pool);
+    const auto base = mapping->pool->DeviceAddress();
+    for (std::size_t index = 0; index < mapping->units.size(); ++index) {
+        const auto unit = mapping->units[index].unit;
+        const auto device = base + VkDeviceAddress{mapping->slots[index]} * Reach::UnitBytes;
+        if (!reachRanges.empty() && reachRanges.back().end == unit && reachRanges.back().deviceAddress + (reachRanges.back().end - reachRanges.back().begin) == device) {
+            reachRanges.back().end += Reach::UnitBytes;
+        } else {
+            reachRanges.push_back({unit, unit + Reach::UnitBytes, device, ShaderRecompiler::BdaAbi::Read, 0});
+        }
+    }
+    Reach::CountBuild(false, predicted.size(), mapping->units.size(), refused + candidates.size() - mapping->units.size());
+    reachMapping = std::move(mapping);
+    Reach::Report();
+}
+
+// Records the import -> slot copies, ordered after everything recorded before them and before the
+// reader's shaders, on the calling thread's lane. Opening the command buffer may submit the batch or
+// record writes (a dispatch run's copy-backs): the fills are asked for again under the view the copies
+// are recorded in.
+bool GuestBufferMemory::recordReachFills(const Reach::Mapping& mapping, std::vector<Reach::Fill>& fills) {
+    if (fills.empty()) return true;
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr) return false;
+    VkAccessFlags covered = 0;
+    const auto commands = recorder->Commands(&covered);
+    const Reach::LaneView view{Recorder::ThreadLane(), recorder->OpenBatchIdentity(), [recorder](std::uint64_t begin, std::uint64_t end) { return recorder->PendingWriteOrLeaseOtherLane(begin, static_cast<std::size_t>(end - begin)); }};
+    fills.clear();
+    if (!Reach::Refresh(view, mapping, fills, false)) return false;
+    if (fills.empty()) return true;
+    const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::ReachFill);
+    constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT};
+    if (!Recorder::ElideCovered(Recorder::CommandClass::ReachFill, leading, covered)) {
+        RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
+        Recorder::CountBarriers(Recorder::CommandClass::ReachFill);
+    }
+    for (const auto& fill : fills) {
+        CopyBuffer(context, commands, fill.import, fill.sourceOffset, mapping.pool->Handle(), fill.slotOffset, Reach::UnitBytes);
+        recorder->NotePendingRead(fill.unit, static_cast<std::size_t>(Reach::UnitBytes), Recorder::ReadKind::GpuCopy);
+    }
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    Recorder::CountBarriers(Recorder::CommandClass::ReachFill);
+    recorder->MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    recorder->EndGpuTiming(timing, fills.size() * Reach::UnitBytes);
+    Reach::Filled(view, fills);
+    return true;
+}
+
 void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     ResidentBuffer::FlushChanged(context);
     if (!uploaded || committed) return;
+    if (reachMapping != nullptr) {
+        // A reused build's table maps its units to their slots: each must be current for this use.
+        for (const auto& unit : reachMapping->units) {
+            recorder.FlushKeyStoresOverlapping(unit.unit, static_cast<std::size_t>(Reach::UnitBytes));
+            recorder.FlushStoresOverlapping(unit.unit, static_cast<std::size_t>(Reach::UnitBytes));
+        }
+        const Reach::LaneView view{Recorder::ThreadLane(), recorder.OpenBatchIdentity(), [&recorder](std::uint64_t begin, std::uint64_t end) { return recorder.PendingWriteOrLeaseOtherLane(begin, static_cast<std::size_t>(end - begin)); }};
+        std::vector<Reach::Fill> fills;
+        if (!Reach::Refresh(view, *reachMapping, fills) || !recordReachFills(*reachMapping, fills)) throw std::runtime_error("reach copies of a reused build lost their slots");
+        recorder.Keep(reachMapping->pool);
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::vector<Region*> copies;
     // A previous use in a dispatch run that is still open owes its copy-backs (Recorder::AfterRun):

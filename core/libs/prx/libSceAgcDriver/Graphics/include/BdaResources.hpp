@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "Recompiler.hpp"
+#include <deque>
 #include <string>
 #include <utility>
 #include <vector>
@@ -51,6 +52,8 @@ public:
         std::uint64_t firstEmpty = 0;
     };
     static TableCacheStats TableCacheCounters();
+    // APS5_REACH_RESIDENCY: a BDA writer use of this build was recorded (completed by its CheckFault).
+    void NoteWriterUse(std::uint64_t seq) const { if (seq != 0) writerUses.push_back(seq); }
 
 private:
     // The page table is read-only to the shader, so consecutive builds mapping the same ranges to the
@@ -65,6 +68,10 @@ private:
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
     const TextureService* textureService = nullptr;
     std::vector<SrtGuardFaults> srtGuards;
+    std::size_t faultBytes = ShaderRecompiler::BdaAbi::FaultBufferBytes;
+    std::uint64_t reachProgram = 0;
+    mutable bool reachLearning = false;
+    mutable std::deque<std::uint64_t> writerUses;
 };
 
 }
