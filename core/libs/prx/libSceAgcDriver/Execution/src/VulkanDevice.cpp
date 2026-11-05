@@ -5696,6 +5696,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             for (const auto& [site, count] : Graphics::Recorder::RunCloseSites(24, 0x51)) async += (async.empty() ? "" : "; ") + site + " " + std::to_string(count);
             AgcDriver::ProfilePrint_nid_no_patch("[run-close] runs closed by call site (cumulative, ring keys as guest queues): %s\n[run-close] of ring 0x51: %s\n[run-close] unordered dispatches by ring: %s\n", sites.c_str(), async.c_str(), Graphics::Recorder::OverlapByRing().c_str());
             AgcDriver::ProfilePrint_nid_no_patch("%s (APS5_NO_STAGED_OVERLAP %s)\n%s\n%s\n", Graphics::Recorder::RunConflictReport().c_str(), Graphics::Recorder::StagedOverlapEnabled() ? "unset" : "set", Graphics::Recorder::OwedCopyBackReport().c_str(), Graphics::Recorder::LaneOrderReport().c_str());
+            AgcDriver::ProfilePrint_nid_no_patch("%s\n", Graphics::Recorder::BarrierCensusReport().c_str());
         }
     }
     // The record phase split (APS5_PROFILE_DRAW, rows "record: ..." of the [dispatch] totals):
@@ -5756,6 +5757,13 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     const std::optional<Graphics::Recorder::HomeScope> homeScope = Graphics::Recorder::HomesEnabled() ? std::optional<Graphics::Recorder::HomeScope>(std::in_place) : std::nullopt;
     auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped, runAccesses) : recorder.Commands(&covered);
     const Graphics::Recorder::CommandInHand commandInHand;
+    if (timer.profile && overlapQueue != 0) {
+        const char* notCapable = nullptr;
+        if (!overlapCapable) {
+            notCapable = serialWorkgroups ? "serial workgroups" : !laneOverlap ? "lane overlap off" : !Graphics::Recorder::DispatchOverlapEnabled() ? "overlap off" : (arguments != 0 || argumentImport != nullptr) ? "indirect" : record.htileClear.has_value() ? "htile clear" : record.shader->program->workgroupMemoryDwords != 0 ? "device LDS" : !(state->checkpointMarker == nullptr || CheckpointsInRuns()) ? "checkpoint" : !(record.x <= groupLimit[0] && record.y <= groupLimit[1] && record.z <= groupLimit[2]) ? "split grid" : "staged, staged overlap off";
+        }
+        recorder.CensusDispatch(overlapQueue, notCapable, unordered, overlapped);
+    }
     if (timer.profile && overlapped) recorder.CheckRunConflicts(record.programAddress, runAccesses);
     if (timer.profile && overlapCapable && unordered && !overlapped) ++d.unorderedLost;
     // Batched staging (Recorder::SplitForRun): a run's first dispatch that copies buffers itself
