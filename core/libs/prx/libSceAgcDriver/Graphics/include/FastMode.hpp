@@ -8,9 +8,12 @@
 // Master switch: APS5_FAST_MODE. Static items read it once at startup (the environment); runtime items follow the
 // RuntimeSwitch of the same name, so APS5_AB=60:APS5_FAST_MODE flips them in-run. Each item has a sub-switch
 // APS5_FM_<ITEM>; unset = the item's default level, 0 = off, n = level n.
-//   PROOFS  (runtime, default 4)  proof walks and cached-set proofs only every n-th present; in between,
-//                                  CollectWrites returns the tracker's generation and Revalidate's full proof
-//                                  accepts (P0-cpu APS5_P0C_NO_PROOFS, staleness bounded to n presents)
+//   PROOFS  (runtime, default 4)  write-watch walks only every n-th present; in between CollectWrites returns the
+//                                  tracker's generation (P0-cpu APS5_P0C_NO_PROOFS, staleness bounded to n
+//                                  presents). In the game (fm-long) it costs ~+120 us/draw in the lookup phase
+//                                  (snapshot compares on 'stamped'): set APS5_FM_PROOFS=0. The cached-set proof
+//                                  skip is APS5_FM_PROOF_PARTS bit 2, not in the default (GPU hang in replay)
+//   CLONE: GPU hang in the cap-river13 frames row; STAGING=2 / PUBLISH=2: garbage frames. Off by default.
 //   QUIET   (runtime, default 1)  bindless publishes record nothing and a bindless draw continues the open pass
 //                                  (APS5_QUIET_PUBLISH + APS5_P0D_HEAP_CONTINUE)
 //   MERGE   (runtime, default 1)  an open pass of the same key continues through hazards and forced breaks
