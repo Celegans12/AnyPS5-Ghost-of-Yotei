@@ -261,8 +261,24 @@ public:
         VkCommandBuffer commands = VK_NULL_HANDLE;
         bool continued = false;
         bool barrier = true;
+        bool indirectRead = false;
     };
+    enum class IndirectJoin : std::uint8_t { None, InPlace, Rewrite };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::source_location where = std::source_location::current());
+    DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, bool hoist, IndirectJoin indirect, std::source_location where = std::source_location::current());
+    struct IndirectRewrite {
+        VkBuffer source = VK_NULL_HANDLE;
+        VkDeviceSize offset = 0;
+        VkBuffer scratch = VK_NULL_HANDLE;
+        VkDeviceSize bytes = 0;
+        std::vector<std::pair<VkDeviceSize, std::uint32_t>> words;
+    };
+    void HoistIndirectRewrite(IndirectRewrite rewrite);
+    bool PassPreludeArmed() const { return open != nullptr && open->passPrelude.armed; }
+    struct IndirectHoistStats {
+        std::uint64_t joinedInPlace, joinedRewrite, forcedNoChain, forcedNoPrelude, splits, splitsRefused, preludes, rewritesHoisted;
+    };
+    static IndirectHoistStats IndirectHoistCounts();
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     PassBinding& PassBound();
     void SealPassWriteOnly();
@@ -995,6 +1011,12 @@ private:
             };
             std::vector<Pristine> pristine;
         } prelude;
+        struct PassPrelude {
+            bool armed = false;
+            std::size_t index = 0;
+            std::vector<IndirectRewrite> rewrites;
+        } passPrelude;
+        bool indirectChain = false;
         // See AfterRunMerging: while the run's copy-backs record, the guest ranges they wrote since
         // the last barrier, and whether any wrote.
         bool afterRunMerging = false;
@@ -1289,6 +1311,11 @@ private:
     std::array<std::vector<VkCommandBuffer>, 2> spareChunks;
     VkCommandBuffer beginChunk();
     void sealPrelude();
+    void sealPassPrelude();
+    void splitForPass();
+    DrawPassStart beginDrawPass(std::uint64_t key, bool hoist, bool barrier);
+    std::array<std::uint64_t, 64> hoistKeys{};
+    std::size_t hoistKeyNext = 0;
     std::vector<VkQueryPool> sparePools;
     mutable AgcDriver::Mutex completedMutex;
     std::array<Completed, CompletedRingSize> completed;

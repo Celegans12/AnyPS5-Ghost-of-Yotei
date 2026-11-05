@@ -836,6 +836,9 @@ void printDrawWindow(DrawProfile& profile, const char* window) {
         }
         if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "), empty skipped before their stages %llu, argument reads %.1f ms", static_cast<unsigned long long>(profile.indirectEmpty), profile.indirectReadUs / 1000.0);
     }
+    if (const auto hoisted = Recorder::IndirectHoistCounts(); (hoisted.joinedInPlace != 0 || hoisted.joinedRewrite != 0 || hoisted.forcedNoChain != 0 || hoisted.forcedNoPrelude != 0 || hoisted.splits != 0) && room()) {
+        n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; indirect hoist: joined %llu in place %llu rewritten, forced in an open pass %llu no chain %llu no prelude, pass splits %llu (%llu refused), preludes %llu with %llu rewrites", static_cast<unsigned long long>(hoisted.joinedInPlace), static_cast<unsigned long long>(hoisted.joinedRewrite), static_cast<unsigned long long>(hoisted.forcedNoChain), static_cast<unsigned long long>(hoisted.forcedNoPrelude), static_cast<unsigned long long>(hoisted.splits), static_cast<unsigned long long>(hoisted.splitsRefused), static_cast<unsigned long long>(hoisted.preludes), static_cast<unsigned long long>(hoisted.rewritesHoisted));
+    }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "; skipped packets:");
     for (std::size_t i = 0; i < profile.skips.size() && room(); ++i) {
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), " %s %llu in %.1f ms", DrawSkipNames[i], static_cast<unsigned long long>(profile.skips[i]), profile.skipUs[i] / 1000.0);
@@ -2485,6 +2488,32 @@ bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, R
     return true;
 }
 
+bool hoistIndirectArguments(const Context& context, Recorder& recorder, const IndirectRecord& indirect, std::unique_ptr<DeviceBuffer>& scratch, VkBuffer& argumentBuffer, VkDeviceSize& argumentOffset) {
+    using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
+    const auto* args = indirect.args;
+    recorder.NotePendingRead(args->arguments, static_cast<std::size_t>(args->RangeBytes()), Recorder::ReadKind::Indirect);
+    if (args->countIndirect) recorder.NotePendingRead(args->countAddress, 4, Recorder::ReadKind::Indirect);
+    argumentBuffer = indirect.argumentImport->buffer;
+    argumentOffset = HostImportOffset(*indirect.argumentImport, args->arguments);
+    if (args->vertexRule != Rule::Constant && args->instanceRule != Rule::Constant) return false;
+    const auto bytes = static_cast<std::size_t>(args->RangeBytes());
+    {
+        const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::DrawScratch);
+        scratch = std::make_unique<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    }
+    Recorder::IndirectRewrite rewrite{argumentBuffer, argumentOffset, scratch->Handle(), bytes, {}};
+    rewrite.words.reserve(static_cast<std::size_t>(args->count) * 2u);
+    for (std::uint32_t record = 0; record < args->count; ++record) {
+        const VkDeviceSize base = static_cast<VkDeviceSize>(record) * args->stride;
+        if (args->vertexRule == Rule::Constant) rewrite.words.emplace_back(base + args->VertexDwordOffset(), args->vertexConstant);
+        if (args->instanceRule == Rule::Constant) rewrite.words.emplace_back(base + args->InstanceDwordOffset(), args->instanceConstant);
+    }
+    recorder.HoistIndirectRewrite(std::move(rewrite));
+    argumentBuffer = scratch->Handle();
+    argumentOffset = 0;
+    return true;
+}
+
 std::shared_ptr<Buffer> meshArgumentBuffer(const Context& context, std::span<const std::uint32_t> restartTable) {
     const auto tableBytes = restartTable.empty() ? 0u : sizeof(std::uint32_t) * (restartTable.size() + 1u);
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::DrawScratch);
@@ -2923,7 +2952,12 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
     const bool fenced = state.depth.has_value() || !record.proxies.empty() || record.blended != nullptr;
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || record.blended != nullptr || heap || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    const bool hoist = !RuntimeSwitches::Set(RuntimeSwitch::NoIndirectHoist);
+    const bool forcedOther = capture || readsTarget || meshIndirect || record.blended != nullptr || heap || PixelFunctionLdsSubgroup(shaders) != 0u;
+    using IndirectJoin = Recorder::IndirectJoin;
+    const auto rewriteRule = Pm4::DrawParameters::IndirectDraw::Rule::Constant;
+    const auto join = !gpuIndirect || forcedOther ? IndirectJoin::None : args->vertexRule == rewriteRule || args->instanceRule == rewriteRule ? IndirectJoin::Rewrite : IndirectJoin::InPlace;
+    const auto start = recorder->StartDrawPass(passKey, forcedOther || (gpuIndirect && !hoist), fenced, passAccess, hoist, hoist ? join : IndirectJoin::None);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
     outcome.passContinued = continued;
@@ -2958,14 +2992,18 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
         record.pipeline->Continue(commands, state, &recorder->PassBound());
+        if (gpuIndirect) rewritten = hoistIndirectArguments(context, *recorder, *record.indirect, scratch, argumentBuffer, argumentOffset);
     } else {
         for (const auto& proxy : record.proxies) {
             proxy->RecordAttachmentProxyLoad(commands, VK_IMAGE_LAYOUT_GENERAL);
             countBarrier(2);
         }
         if (start.barrier) {
-            const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT};
-            context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
+            const VkAccessFlags indirectSource = start.indirectRead ? VK_ACCESS_HOST_WRITE_BIT : 0u;
+            const VkAccessFlags indirectRead = start.indirectRead ? VK_ACCESS_INDIRECT_COMMAND_READ_BIT : 0u;
+            const VkMemoryBarrier before{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | indirectSource, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | indirectRead};
+            const VkPipelineStageFlags hostStage = start.indirectRead ? VK_PIPELINE_STAGE_HOST_BIT : 0u;
+            context.Resolved(&DeviceFunctions::cmdPipelineBarrier, "vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | hostStage, VK_PIPELINE_STAGE_ALL_GRAPHICS_BIT, 0, 1, &before, 0, nullptr, 0, nullptr);
             countBarrier(1);
         }
         APS5_LOG_CHARS_OUT_DEBUG("Upload barrier recorded");

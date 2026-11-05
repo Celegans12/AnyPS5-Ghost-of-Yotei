@@ -1845,6 +1845,10 @@ struct BatchedCounters {
     std::atomic<std::uint64_t> lostNoRun{0}, lostOtherQueue{0}, lostRenderPass{0}, lostStoreRun{0}, lostOwner{0};
 };
 BatchedCounters batchedCounters;
+struct IndirectHoistCounters {
+    std::atomic<std::uint64_t> joinedInPlace{0}, joinedRewrite{0}, forcedNoChain{0}, forcedNoPrelude{0}, splits{0}, splitsRefused{0}, preludes{0}, rewritesHoisted{0};
+};
+IndirectHoistCounters indirectHoistCounters;
 std::mutex runCloseMutex;
 std::map<std::tuple<std::string, std::size_t, std::uint32_t, std::uint32_t>, std::uint64_t> runCloses;
 std::map<std::uint32_t, std::array<std::uint64_t, 3>> overlapByRing;
@@ -2301,26 +2305,114 @@ void Recorder::MarkCovered(VkAccessFlags access) {
 }
 
 Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::source_location where) {
+    return StartDrawPass(key, forced, fenced, access, false, IndirectJoin::None, where);
+}
+
+Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, bool hoist, IndirectJoin indirect, std::source_location where) {
     ensureOpen();
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(1, where);
     auto& pass = open->renderPass;
+    if (indirect != IndirectJoin::None) {
+        const bool chained = hoist && pass.open && open->indirectChain;
+        const bool prelude = indirect == IndirectJoin::InPlace || open->passPrelude.armed;
+        if (!chained || !prelude) {
+            if (hoist && pass.open && pass.key == key) {
+                if (!chained) indirectHoistCounters.forcedNoChain.fetch_add(1, std::memory_order_relaxed);
+                else {
+                    indirectHoistCounters.forcedNoPrelude.fetch_add(1, std::memory_order_relaxed);
+                    if (std::find(hoistKeys.begin(), hoistKeys.end(), key) == hoistKeys.end()) {
+                        hoistKeys[hoistKeyNext] = key;
+                        hoistKeyNext = (hoistKeyNext + 1) % hoistKeys.size();
+                    }
+                }
+            }
+            forced = true;
+        }
+    }
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
-        const auto commands = Commands();
+        static_cast<void>(Commands());
         open->passHazards.Clear();
         open->passHazards.BeginPass();
-        return {commands, false, true};
+        return beginDrawPass(key, hoist, true);
     }
     const auto hazard = open->passHazards.Check(access, pass.key == key);
-    if (hazard == PassHazard::None && pass.key == key) return {open->commands, true, false};
+    if (hazard == PassHazard::None && pass.key == key) {
+        if (indirect == IndirectJoin::InPlace) indirectHoistCounters.joinedInPlace.fetch_add(1, std::memory_order_relaxed);
+        else if (indirect == IndirectJoin::Rewrite) indirectHoistCounters.joinedRewrite.fetch_add(1, std::memory_order_relaxed);
+        return {open->commands, true, false, false};
+    }
     const bool merge = MergeBarriers() && !fenced && !pass.fenced && !pass.afterPass;
     const bool elide = merge && hazard == PassHazard::None;
     endOpenRenderPass(!merge);
-    const auto commands = Commands();
+    static_cast<void>(Commands());
     if (!elide) open->passHazards.Clear();
     open->passHazards.BeginPass();
-    return {commands, false, !elide};
+    return beginDrawPass(key, hoist, !elide);
+}
+
+Recorder::DrawPassStart Recorder::beginDrawPass(std::uint64_t key, bool hoist, bool barrier) {
+    sealPassPrelude();
+    if (barrier) open->indirectChain = hoist;
+    if (hoist && open->indirectChain && key != 0 && std::find(hoistKeys.begin(), hoistKeys.end(), key) != hoistKeys.end()) splitForPass();
+    return {open->commands, false, barrier, barrier && hoist};
+}
+
+void Recorder::splitForPass() {
+    if (open->sampleActive || open->segmentActive || open->renderPass.open || open->run.open) {
+        indirectHoistCounters.splitsRefused.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    sealPrelude();
+    const auto next = beginChunk();
+    const auto ended = function(endCommandBuffer, "vkEndCommandBuffer")(open->commands);
+    if (ended != VK_SUCCESS) {
+        context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, poolOf(currentLane()), 1, &next);
+        Check(ended, "vkEndCommandBuffer recorder pass split");
+    }
+    open->chunks.push_back(open->commands);
+    open->commands = next;
+    open->passPrelude.armed = true;
+    open->passPrelude.index = open->chunks.size();
+    open->passPrelude.rewrites.clear();
+    indirectHoistCounters.splits.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Recorder::HoistIndirectRewrite(IndirectRewrite rewrite) {
+    Require(open != nullptr && open->passPrelude.armed, "a hoisted indirect argument rewrite has no pass prelude");
+    open->passPrelude.rewrites.push_back(std::move(rewrite));
+}
+
+void Recorder::sealPassPrelude() {
+    if (open == nullptr) return;
+    auto& prelude = open->passPrelude;
+    if (!prelude.armed) return;
+    prelude.armed = false;
+    auto rewrites = std::move(prelude.rewrites);
+    prelude.rewrites.clear();
+    if (rewrites.empty()) return;
+    Require(prelude.index <= open->chunks.size(), "a pass prelude lost its place among the batch's command buffers");
+    const auto commands = beginChunk();
+    open->chunks.insert(open->chunks.begin() + static_cast<std::ptrdiff_t>(prelude.index), commands);
+    recordBarrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    for (const auto& rewrite : rewrites) CopyBuffer(context, commands, rewrite.source, rewrite.offset, rewrite.scratch, 0, rewrite.bytes);
+    recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+    const auto update = context.Resolved(&DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer");
+    for (const auto& rewrite : rewrites) {
+        for (const auto& [offset, value] : rewrite.words) update(commands, rewrite.scratch, offset, 4, &value);
+    }
+    recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_INDIRECT_COMMAND_READ_BIT);
+    CountBarriers(CommandClass::Draw, 3);
+    Check(function(endCommandBuffer, "vkEndCommandBuffer")(commands), "vkEndCommandBuffer recorder pass prelude");
+    indirectHoistCounters.preludes.fetch_add(1, std::memory_order_relaxed);
+    indirectHoistCounters.rewritesHoisted.fetch_add(rewrites.size(), std::memory_order_relaxed);
+}
+
+Recorder::IndirectHoistStats Recorder::IndirectHoistCounts() {
+    const auto& c = indirectHoistCounters;
+    constexpr auto relaxed = std::memory_order_relaxed;
+    return {c.joinedInPlace.load(relaxed), c.joinedRewrite.load(relaxed), c.forcedNoChain.load(relaxed), c.forcedNoPrelude.load(relaxed), c.splits.load(relaxed), c.splitsRefused.load(relaxed), c.preludes.load(relaxed), c.rewritesHoisted.load(relaxed)};
 }
 
 void Recorder::LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass) {
@@ -2347,6 +2439,7 @@ void Recorder::SealPassWriteOnly() {
 
 void Recorder::endOpenRenderPass(bool barrier) {
     auto& pass = open->renderPass;
+    sealPassPrelude();
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
@@ -5003,6 +5096,7 @@ void Recorder::Submit() {
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     flushDeferredDispatch(6);
     sealPrelude();
+    sealPassPrelude();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();
@@ -5871,6 +5965,8 @@ void Recorder::release(Batch& batch) noexcept {
     }
     batch.chunks.clear();
     batch.prelude = {};
+    batch.passPrelude = {};
+    batch.indirectChain = false;
     // A completed (or never submitted) batch's objects are kept for reuse: the fence is signaled or
     // untouched, so resetting it cannot block, and the command buffer is no longer pending.
     if (batch.commands != VK_NULL_HANDLE && batch.fence != VK_NULL_HANDLE && spare[static_cast<std::size_t>(batch.lane)].size() < 64 && function(resetFences, "vkResetFences")(context.device, 1, &batch.fence) == VK_SUCCESS) {
