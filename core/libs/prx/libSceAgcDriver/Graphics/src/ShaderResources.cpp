@@ -4968,7 +4968,35 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
     };
     if ((context.copiedWriters != nullptr && overlaps(*context.copiedWriters)) || overlaps(*drawWriters) || (labels && recorder->PendingLabelIn(address, bytes))) {
         Recorder::CountSync(4);
-        recorder->SyncThrough(address, bytes);
+        const bool unlocked = RuntimeSwitches::Set(RuntimeSwitch::V3CpuWritesUnlocked);
+        static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        const bool outermost = GuestMemory::GpuMutex().DepthOnThisThread() == 1;
+        const auto started = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        recorder->SyncThrough(address, bytes, unlocked);
+        if (profile) {
+            struct Totals {
+                std::mutex mutex;
+                std::uint64_t syncs = 0, unlockedSyncs = 0, nested = 0;
+                double ms = 0, unlockedMs = 0;
+                std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+            };
+            static Totals totals;
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+            std::lock_guard lock(totals.mutex);
+            ++totals.syncs;
+            totals.ms += ms;
+            if (!outermost) ++totals.nested;
+            if (unlocked && outermost) {
+                ++totals.unlockedSyncs;
+                totals.unlockedMs += ms;
+            }
+            if (std::chrono::steady_clock::now() - totals.reported > std::chrono::seconds(10)) {
+                AgcDriver::ProfilePrint_nid_no_patch("[v3w-cpw] CompletePendingCpuWrites syncs (10 s): %llu in %.1f ms, of them asked to wait unlocked at the outermost hold %llu in %.1f ms, nested holds %llu\n", static_cast<unsigned long long>(totals.syncs), totals.ms, static_cast<unsigned long long>(totals.unlockedSyncs), totals.unlockedMs, static_cast<unsigned long long>(totals.nested));
+                totals.syncs = totals.unlockedSyncs = totals.nested = 0;
+                totals.ms = totals.unlockedMs = 0;
+                totals.reported = std::chrono::steady_clock::now();
+            }
+        }
         return true;
     }
     return false;

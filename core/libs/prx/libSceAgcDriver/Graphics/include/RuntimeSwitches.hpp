@@ -101,6 +101,7 @@ enum class RuntimeSwitch : std::size_t {
     V3LandAhead,
     V3wCeilNoLand,
     V3FenceKnown,
+    V3CpuWritesUnlocked,
     Count,
 };
 
