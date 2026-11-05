@@ -64,6 +64,7 @@ namespace AgcDriver::Graphics {
 
 void P0gImportCreated(VkDeviceAddress address, const void* host, std::uint64_t bytes);
 void P0gImportDestroyed(VkDeviceAddress address);
+VkBuffer P0dDrawClone(const Context& context, VkDeviceAddress importAddress, std::uint64_t offset, std::uint64_t bytes);
 
 // Image mirrors. The main guest image (the PE at 0x7ff6b...) is MEM_IMAGE memory, which
 // VK_EXT_external_memory_host refuses, and address-based shaders map every registered range, so each
@@ -6680,7 +6681,12 @@ VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std:
     }
     if (address - adjustment + range > end) Require(false, describe("rounded up to its view range exceeds"));
     Require(range <= context.limits.maxStorageBufferRange, "guest buffer view exceeds descriptor range limit");
-    const auto handle = region.direct != nullptr ? region.direct->buffer : region.mirror != nullptr ? mirrorHandle(*region.mirror) : region.buffer->Handle();
+    auto handle = region.direct != nullptr ? region.direct->buffer : region.mirror != nullptr ? mirrorHandle(*region.mirror) : region.buffer->Handle();
+    // APS5_P0D_CLONE_DRAWS (lane P0b-draws, replay only, inexact): a draw's in-place view of a host import reads a
+    // device-local clone of it (BdaResources.cpp).
+    if (region.direct != nullptr && !stagingAllowed && region.direct->lead == 0) {
+        if (const auto clone = P0dDrawClone(context, region.direct->address, offset - adjustment, range); clone != VK_NULL_HANDLE) handle = clone;
+    }
     return {handle, offset - adjustment, range};
 }
 

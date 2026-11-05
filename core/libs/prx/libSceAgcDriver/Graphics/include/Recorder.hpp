@@ -263,6 +263,20 @@ public:
         bool barrier = true;
     };
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access, std::source_location where = std::source_location::current());
+    // Lane P0b-draws diagnostics (default off). APS5_P0D_PASS_LOG=<file> (with APS5_PROFILE_GPU=1):
+    // one CSV line per timed draw pass (stamps of the pass range and of its draw work, draws, why
+    // the previous pass did not continue, what was recorded between). P0dForced names the forced
+    // reasons of the next StartDrawPass (bit mask, Draw.cpp); P0dBeginWork opens the work range
+    // after the pass begin. APS5_P0D_MERGE_PASSES=1 (replay only, inexact): see StartDrawPass.
+    static bool P0dPassLog();
+    static bool P0dMergePasses();
+    static bool P0dHeapContinue();
+    static constexpr std::uint64_t P0dWorkKey = 0x5;
+    static constexpr std::uint32_t P0dForcedReadsTarget = 1, P0dForcedIndirect = 2, P0dForcedMeshIndirect = 4, P0dForcedBlended = 8, P0dForcedHeap = 16, P0dForcedLds = 32, P0dForcedCapture = 64;
+    void P0dForced(std::uint32_t mask) { p0dForcedMask = mask; }
+    void P0dBeginWork();
+    // The draw just left in the open pass: an address-based build, a bindless (heap) draw, a GPU-indirect draw.
+    void P0dNoteDraw(bool address, bool heap, bool indirect);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(VkCommandBuffer)> afterPass = {});
     PassBinding& PassBound();
     void SealPassWriteOnly();
@@ -919,6 +933,33 @@ private:
         std::uint32_t segmentSlot = 0;
         bool segmentActive = false;
         std::uint32_t queuedDumps = 0;
+        // Lane P0b-draws pass log (P0dPassLog): the passes begun in this batch, and the state of
+        // the pass being started.
+        struct P0dPass {
+            std::uint32_t range = NoTiming;
+            std::uint32_t work = NoTiming;
+            std::uint32_t draws = 0;
+            std::uint32_t addressDraws = 0;
+            std::uint32_t heapDraws = 0;
+            std::uint32_t indirectDraws = 0;
+            std::uint32_t reason = 0;
+            std::uint32_t forced = 0;
+            std::uint32_t between = 0;
+            std::uint32_t betweenPrograms = 0;
+            std::uint32_t closer = 0;
+            const char* closerFile = nullptr;
+            bool barrier = false;
+            bool sameKey = false;
+            std::uint64_t key = 0;
+        };
+        std::vector<P0dPass> p0dPasses;
+        P0dPass p0dPending;
+        bool p0dPassEnded = false;
+        std::uint64_t p0dLastKey = 0;
+        std::uint32_t p0dBetween = 0;
+        std::uint32_t p0dBetweenPrograms = 0;
+        std::uint32_t p0dCloser = 0;
+        const char* p0dCloserFile = nullptr;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
@@ -1023,6 +1064,7 @@ private:
             std::uint32_t timing = NoTiming;
             PassBinding bound;
             std::function<void(VkCommandBuffer)> afterPass;
+            std::uint32_t p0dIndex = NoTiming;
         } renderPass;
         PassHazards passHazards;
         // A pass ended in this batch: Submit records the host-read barrier its draws left out.
@@ -1055,6 +1097,8 @@ private:
         bool behindCompletion = false;
     };
     void readGpuTiming(Batch& batch);
+    static void p0dWritePasses(const Batch& batch, const std::vector<std::uint64_t>& stamps, double period);
+    static void p0dWindow(const char* label);
     std::string runningRanges(const Batch& batch);
     std::string laneState(const Batch& batch) const;
     void beginSamples(Batch& batch);
@@ -1080,6 +1124,7 @@ private:
     };
     std::vector<SampleSegment> pendingSamples;
     bool countingSamples = false;
+    std::uint32_t p0dForcedMask = 0;
     int meshArgumentState = 0;
     VkPipelineLayout meshArgumentLayout = VK_NULL_HANDLE;
     VkPipeline meshArgumentPipeline = VK_NULL_HANDLE;
@@ -1141,7 +1186,7 @@ private:
     // form, toward the host only); returns whether the batch's host-read barrier was included.
     bool closeStoreRun(bool atSubmit = false);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
-    void endOpenRenderPass(bool barrier = true);
+    void endOpenRenderPass(bool barrier = true, std::source_location where = std::source_location::current());
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
     // labelling over one, not at Submit).
     void recordKeyStores(bool forWriter);

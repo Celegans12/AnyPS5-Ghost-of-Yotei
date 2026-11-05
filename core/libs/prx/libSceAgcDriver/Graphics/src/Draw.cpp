@@ -2955,6 +2955,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const PassAccess passAccess = noHazards ? PassAccess{} : PassAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
     const bool fenced = state.depth.has_value() || !record.proxies.empty() || record.blended != nullptr;
     sub(1);
+    if (Recorder::P0dPassLog() || Recorder::P0dMergePasses() || Recorder::P0dHeapContinue()) recorder->P0dForced((readsTarget ? Recorder::P0dForcedReadsTarget : 0u) | (gpuIndirect ? Recorder::P0dForcedIndirect : 0u) | (meshIndirect ? Recorder::P0dForcedMeshIndirect : 0u) | (record.blended != nullptr ? Recorder::P0dForcedBlended : 0u) | (heap ? Recorder::P0dForcedHeap : 0u) | (PixelFunctionLdsSubgroup(shaders) != 0u ? Recorder::P0dForcedLds : 0u) | (capture ? Recorder::P0dForcedCapture : 0u));
     const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || record.blended != nullptr || heap || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
     sub(3);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
@@ -3023,6 +3024,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         }
         APS5_LOG_OUT_DEBUG("Beginning pipeline renderExtent=%ux%u", state.renderExtent.width, state.renderExtent.height);
         record.pipeline->Begin(commands, *record.framebuffer, state.renderExtent, state, &recorder->PassBound());
+        recorder->P0dBeginWork();
     }
     APS5_LOG_CHARS_OUT_DEBUG("Pipeline Begin OK");
     if (drawBindings != nullptr) {
@@ -3078,6 +3080,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     sub(4);
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    if (Recorder::P0dPassLog()) recorder->P0dNoteDraw(addressBased, heap, gpuIndirect || meshIndirect);
     sub(5);
     timer.phase(PhaseRecord);
     if (record.blended != nullptr) {

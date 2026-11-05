@@ -219,41 +219,113 @@ std::map<VkDeviceAddress, P0gImport>& p0gImports() {
     return *imports;
 }
 
-std::uint64_t p0gCloneBudget() {
-    static const std::uint64_t bytes = [] {
-        const char* value = std::getenv("APS5_P0G_CLONE_IMPORTS");
-        return value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 0) << 20u : std::uint64_t{0};
-    }();
+std::uint64_t mibEnv(const char* name) {
+    const char* value = std::getenv(name);
+    return value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 0) << 20u : std::uint64_t{0};
+}
+
+std::uint64_t p0gCloneAllBudget() {
+    static const std::uint64_t bytes = mibEnv("APS5_P0G_CLONE_IMPORTS");
     return bytes;
+}
+
+// APS5_P0D_CLONE_DRAWS=<MiB> (lane P0b-draws diagnostic, replay only, inexact): the same clones, used only by
+// draw builds (their BDA tables and the in-place V# descriptors of GuestBufferMemory::Descriptor).
+std::uint64_t p0dCloneDrawsBudget() {
+    static const std::uint64_t bytes = mibEnv("APS5_P0D_CLONE_DRAWS");
+    return bytes;
+}
+
+std::uint64_t p0gCloneBudget() {
+    return std::max(p0gCloneAllBudget(), p0dCloneDrawsBudget());
+}
+
+// APS5_P0D_CLONE_VRAM=1 (with the clone budgets): the clone is DEVICE_LOCAL only (not ReBAR), filled from a host
+// staging buffer by copies on the settle queue (waited for). Without a settle queue the clone stays ReBAR.
+bool p0dCloneVram() {
+    static const bool on = std::getenv("APS5_P0D_CLONE_VRAM") != nullptr;
+    return on;
+}
+
+std::shared_ptr<Buffer> p0dVramClone(const Context& context, const void* host, std::uint64_t bytes, VkBufferUsageFlags usage) {
+    if (context.settleQueue == VK_NULL_HANDLE || context.settleQueueMutex == nullptr) return nullptr;
+    auto clone = std::make_shared<Buffer>(context, bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+    std::unique_lock queueLock(*context.settleQueueMutex);
+    static VkCommandPool pool = VK_NULL_HANDLE;
+    static VkCommandBuffer commands = VK_NULL_HANDLE;
+    static VkFence fence = VK_NULL_HANDLE;
+    if (pool == VK_NULL_HANDLE) {
+        VkCommandPoolCreateInfo info{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+        info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+        info.queueFamilyIndex = context.settleFamily;
+        Check(context.Function<PFN_vkCreateCommandPool>("vkCreateCommandPool")(context.device, &info, nullptr, &pool), "vkCreateCommandPool p0d clone");
+        VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+        allocate.commandPool = pool;
+        allocate.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+        allocate.commandBufferCount = 1;
+        Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocate, &commands), "vkAllocateCommandBuffers p0d clone");
+        const VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+        Check(context.Function<PFN_vkCreateFence>("vkCreateFence")(context.device, &fenceInfo, nullptr, &fence), "vkCreateFence p0d clone");
+    }
+    constexpr std::uint64_t Chunk = 64ull << 20u;
+    for (std::uint64_t at = 0; at < bytes; at += Chunk) {
+        const auto part = std::min(Chunk, bytes - at);
+        Buffer staging(context, static_cast<std::size_t>(part), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        std::memcpy(staging.Bytes().data(), static_cast<const std::byte*>(host) + at, static_cast<std::size_t>(part));
+        Check(context.Function<PFN_vkResetFences>("vkResetFences")(context.device, 1, &fence), "vkResetFences p0d clone");
+        Check(context.Function<PFN_vkResetCommandBuffer>("vkResetCommandBuffer")(commands, 0), "vkResetCommandBuffer p0d clone");
+        VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+        begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+        Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer p0d clone");
+        const VkBufferCopy region{0, at, part};
+        context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, staging.Handle(), clone->Handle(), 1, &region);
+        Check(context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands), "vkEndCommandBuffer p0d clone");
+        VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+        submit.commandBufferCount = 1;
+        submit.pCommandBuffers = &commands;
+        Check(context.Function<PFN_vkQueueSubmit>("vkQueueSubmit")(context.settleQueue, 1, &submit, fence), "vkQueueSubmit p0d clone");
+        Check(context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 30'000'000'000ull), "vkWaitForFences p0d clone");
+    }
+    return clone;
+}
+
+// The import holding [deviceAddress, deviceAddress + bytes) with its clone, made now if the budget allows
+// (under p0gMutex); nullptr when there is none.
+P0gImport* p0gCloneOf(const Context& context, VkDeviceAddress deviceAddress, std::uint64_t bytes) {
+    static std::uint64_t used = 0;
+    static std::uint64_t clones = 0, refused = 0;
+    auto& imports = p0gImports();
+    auto it = imports.upper_bound(deviceAddress);
+    if (it == imports.begin()) return nullptr;
+    --it;
+    auto& entry = it->second;
+    if (deviceAddress + bytes > entry.address + entry.bytes) return nullptr;
+    if (entry.clone == nullptr && !entry.refused) {
+        if (used + entry.bytes > p0gCloneBudget()) {
+            entry.refused = true;
+            ++refused;
+        } else {
+            constexpr VkBufferUsageFlags usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            if (p0dCloneVram()) entry.clone = p0dVramClone(context, entry.host, entry.bytes, usage);
+            if (entry.clone == nullptr) {
+                entry.clone = std::make_shared<Buffer>(context, entry.bytes, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                std::memcpy(entry.clone->Bytes().data(), entry.host, entry.bytes);
+            }
+            used += entry.bytes;
+            ++clones;
+            std::fprintf(stderr, "[p0g-clone] import 0x%llx (%llu MiB) cloned to device-local; %llu clones, %llu MiB, %llu refused%s", static_cast<unsigned long long>(entry.address), static_cast<unsigned long long>(entry.bytes >> 20u), static_cast<unsigned long long>(clones), static_cast<unsigned long long>(used >> 20u), static_cast<unsigned long long>(refused), "\n");
+        }
+    }
+    return entry.clone != nullptr ? &entry : nullptr;
 }
 
 std::vector<ShaderRecompiler::BdaAbi::Range> p0gRedirect(const Context& context, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
     std::vector<ShaderRecompiler::BdaAbi::Range> result(ranges);
-    static std::uint64_t used = 0;
-    static std::uint64_t redirected = 0, clones = 0, refused = 0;
     std::lock_guard lock(p0gMutex());
-    auto& imports = p0gImports();
     for (auto& range : result) {
-        auto it = imports.upper_bound(range.deviceAddress);
-        if (it == imports.begin()) continue;
-        --it;
-        auto& entry = it->second;
-        if (range.deviceAddress + (range.end - range.begin) > entry.address + entry.bytes) continue;
-        if (entry.clone == nullptr && !entry.refused) {
-            if (used + entry.bytes > p0gCloneBudget()) {
-                entry.refused = true;
-                ++refused;
-            } else {
-                entry.clone = std::make_shared<Buffer>(context, entry.bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-                std::memcpy(entry.clone->Bytes().data(), entry.host, entry.bytes);
-                used += entry.bytes;
-                ++clones;
-                std::fprintf(stderr, "[p0g-clone] import 0x%llx (%llu MiB) cloned to device-local; %llu clones, %llu MiB, %llu refused%s", static_cast<unsigned long long>(entry.address), static_cast<unsigned long long>(entry.bytes >> 20u), static_cast<unsigned long long>(clones), static_cast<unsigned long long>(used >> 20u), static_cast<unsigned long long>(refused), "\n");
-            }
-        }
-        if (entry.clone == nullptr) continue;
-        range.deviceAddress = entry.clone->DeviceAddress() + (range.deviceAddress - entry.address);
-        ++redirected;
+        auto* entry = p0gCloneOf(context, range.deviceAddress, range.end - range.begin);
+        if (entry == nullptr) continue;
+        range.deviceAddress = entry->clone->DeviceAddress() + (range.deviceAddress - entry->address);
     }
     return result;
 }
@@ -264,6 +336,13 @@ void P0gImportCreated(VkDeviceAddress address, const void* host, std::uint64_t b
     if (p0gCloneBudget() == 0) return;
     std::lock_guard lock(p0gMutex());
     p0gImports()[address] = P0gImport{address, host, bytes, nullptr, false};
+}
+
+VkBuffer P0dDrawClone(const Context& context, VkDeviceAddress importAddress, std::uint64_t offset, std::uint64_t bytes) {
+    if (p0dCloneDrawsBudget() == 0) return VK_NULL_HANDLE;
+    std::lock_guard lock(p0gMutex());
+    auto* entry = p0gCloneOf(context, importAddress + offset, bytes);
+    return entry != nullptr && entry->address == importAddress ? entry->clone->Handle() : VK_NULL_HANDLE;
 }
 
 void P0gImportDestroyed(VkDeviceAddress address) {
@@ -325,7 +404,9 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         }
     } noteOutcome{profiled, outcome, tableStart};
     const auto& ranges = cached.has_value() ? *cached->ranges : built;
-    const auto serial = cached.has_value() ? cached->serial : 0;
+    // P0b-draws clone (p0dCloneDrawsBudget): draw builds keep tables of their own.
+    const bool p0dDrawClone = p0dCloneDrawsBudget() != 0 && !memory.StagingAllowed();
+    const auto serial = cached.has_value() && !p0dDrawClone ? cached->serial : 0;
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     // The range index (BdaAbi::IndexedTable) after the ranges; APS5_NO_BDA_INDEX=1 leaves it out.
@@ -362,6 +443,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
         }
         const auto hashStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         hash = lean ? hashRangesLanes(ranges) : hashRanges(ranges);
+        if (p0dDrawClone) hash ^= 0x9e3779b97f4a7c15ull;
         classifyFirstEntry(cache, hash, ranges);
         const auto scanStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (profiled) bdaBuildTimes().hashNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(scanStart - hashStart).count()), std::memory_order_relaxed);
@@ -412,7 +494,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     if (profiled) bdaBuildTimes().bufferNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(copyStart - bufferStart).count()), std::memory_order_relaxed);
     const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), index.empty() ? 0u : ShaderRecompiler::BdaAbi::IndexedTable};
     std::memcpy(table->Bytes().data(), &header, sizeof(header));
-    if (!ranges.empty() && p0gCloneBudget() != 0) {
+    if (!ranges.empty() && (p0gCloneAllBudget() != 0 || p0dDrawClone)) {
         const auto moved = p0gRedirect(context, ranges);
         std::memcpy(table->Bytes().data() + sizeof(header), moved.data(), moved.size() * sizeof(moved.front()));
     } else if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
