@@ -502,7 +502,7 @@ std::uint32_t BdaAnchorHolds(SpirvEmitterState& state, const SpirvEmitterState::
 
 void CollectBdaAnchors(SpirvEmitterState& state) {
     state.bdaAnchors.clear();
-    if (!state.program.Info().usesDma || state.bdaProbeFunction == 0 || BdaAbi::ReachCensusEnabled()) return;
+    if (!state.program.Info().usesDma || state.bdaProbeFunction == 0 || (BdaAbi::ReachCensusEnabled() && !BdaAbi::ReachCensusKeepsAnchors())) return;
     std::vector<std::pair<std::pair<std::uint32_t, std::uint32_t>, std::size_t>> bases;
     for (const IrValue* inst : BdaReadSites(state)) {
         const auto base = UserDataBase(state, *inst);
@@ -1030,20 +1030,34 @@ void ReportBdaSiteClasses(const SpirvEmitterState& state) {
     std::array<std::array<std::uint32_t, Count>, 2> counts{};
     std::uint32_t maxDepth = 0;
     std::uint32_t fullSites = 0;
+    std::uint32_t descriptorSites = 0;
     ReachClassifier classifier;
     const auto& memory = state.program.Resources().memoryInfo;
     for (const IrBlock* block : state.program.BlockOrder()) {
         for (const IrValue* inst : block->Instructions()) {
             const auto info = AddressOpcodeInfoOf(inst->Opcode());
-            if (info.access == AddressAccess::None) continue;
+            const std::string_view opcodeName = IrOpcodeName(inst->Opcode());
+            const bool bufferOp = opcodeName.starts_with("LoadBuffer") || opcodeName.starts_with("StoreBuffer") || opcodeName.starts_with("BufferAtomic");
+            if (info.access == AddressAccess::None && !bufferOp) continue;
             const auto index = inst->Flags<MemoryFlags>().index;
             if (index >= memory.size()) continue;
             const auto& mem = memory[index];
             if (mem.planningOnly) continue;
-            if (mem.kind != ResourceKind::ScalarAddress && mem.kind != ResourceKind::Flat && mem.kind != ResourceKind::Global) continue;
+            const bool descriptorSite = bufferOp && mem.kind == ResourceKind::Buffer && mem.gpuDescriptor;
+            if (!descriptorSite && mem.kind != ResourceKind::ScalarAddress && mem.kind != ResourceKind::Flat && mem.kind != ResourceKind::Global) continue;
             ReachOrigin base;
             ReachOrigin offset;
-            if (mem.addressIsFull) {
+            if (descriptorSite) {
+                ++descriptorSites;
+                const IrValue* handle = inst->ArgumentCount() > 0u && inst->Argument(0) != nullptr ? inst->Argument(0)->Resolve() : nullptr;
+                if (handle != nullptr && handle->ArgumentCount() >= 2u) {
+                    base.Join(classifier.Of(handle->Argument(0)));
+                    base.Join(classifier.Of(handle->Argument(1)));
+                } else {
+                    base.unknown = true;
+                }
+                if (inst->ArgumentCount() > 1u) offset = classifier.Of(inst->Argument(1));
+            } else if (mem.addressIsFull) {
                 ++fullSites;
                 if (inst->ArgumentCount() > 1u) base.Join(classifier.Of(inst->Argument(1)));
                 if (inst->ArgumentCount() > 2u) base.Join(classifier.Of(inst->Argument(2)));
@@ -1066,7 +1080,8 @@ void ReportBdaSiteClasses(const SpirvEmitterState& state) {
             else if (base.depth == 0u) kind = offset.lane ? RootLane : offset.root ? RootUniform : RootConst;
             else kind = offset.lane ? TableLane : offset.root ? TableUniform : TableConst;
             if (mem.addressIsFull && base.lane && base.depth == 0u && !base.data) kind = RootLane;
-            counts[info.access == AddressAccess::Read ? 0 : 1][kind] += 1u;
+            const bool readSite = descriptorSite ? opcodeName.starts_with("LoadBuffer") : info.access == AddressAccess::Read;
+            counts[readSite ? 0 : 1][kind] += 1u;
         }
     }
     std::string line;
@@ -1079,7 +1094,7 @@ void ReportBdaSiteClasses(const SpirvEmitterState& state) {
             line += "=" + std::to_string(counts[side][kind]);
         }
     }
-    std::fprintf(stderr, "[p0r-sites] prog=0x%llx stage=%u depth=%u full=%u%s\n", static_cast<unsigned long long>(reachCensusShader), stage, maxDepth, fullSites, line.c_str());
+    std::fprintf(stderr, "[p0r-sites] prog=0x%llx stage=%u depth=%u full=%u desc=%u%s\n", static_cast<unsigned long long>(reachCensusShader), stage, maxDepth, fullSites, descriptorSites, line.c_str());
 }
 
 }

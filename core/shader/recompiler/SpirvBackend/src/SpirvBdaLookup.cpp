@@ -308,7 +308,7 @@ void DefineGetBdaPointer(SpirvEmitterState& state) {
     if (state.faultBufferVariable != 0) DefineBdaFaultFunction(state);
     if (!state.program.Info().usesDma) return;
     ReportBdaSiteClasses(state);
-    const auto noteRead = BdaAbi::ReachCensusEnabled() && state.faultBufferVariable != 0 ? DefineBdaNoteRead(state) : 0u;
+    const auto noteRead = BdaAbi::ReachCensusEnabled() && BdaAbi::ReachCensusNotes() && state.faultBufferVariable != 0 ? DefineBdaNoteRead(state) : 0u;
     state.bdaPointerFunction = DefineBdaLookup(state, "get_bda_pointer", true, BdaAbi::Read, false, noteRead);
     if (!BdaByteReadsForced()) state.bdaProbeFunction = DefineBdaLookup(state, "probe_bda_pointer", false, BdaAbi::Read, false, noteRead);
     DefineBdaDwordReadFunctions(state);

@@ -133,6 +133,14 @@ inline bool ReachCensusEnabled() {
     static const bool enabled = std::getenv("APS5_P0R_CENSUS") != nullptr;
     return enabled;
 }
+inline bool ReachCensusKeepsAnchors() {
+    static const bool kept = std::getenv("APS5_P0R_KEEP_ANCHORS") != nullptr;
+    return kept;
+}
+inline bool ReachCensusNotes() {
+    static const bool notes = std::getenv("APS5_P0R_NO_NOTES") == nullptr;
+    return notes;
+}
 inline constexpr std::uint32_t CensusSlots = 16384;
 inline constexpr std::uint32_t CensusProbes = 16;
 inline constexpr std::uint32_t CensusOverflowWord = SrtGuardWord + 1;

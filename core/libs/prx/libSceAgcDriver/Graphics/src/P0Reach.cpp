@@ -100,7 +100,8 @@ std::vector<std::uint64_t> walk(std::span<const std::uint32_t> userData, std::ui
         queue.pop_front();
         const std::size_t bytes = depth == 0 ? 4096u : 1024u;
         const auto begin = pointer & ~std::uint64_t{7};
-        GuestMemory::ReadCommittedUnsynced(begin, std::span(buffer).first(bytes));
+        std::memset(buffer.data(), 0, bytes);
+        for (const auto& [from, to] : GuestMemory::CommittedRanges(begin, bytes)) std::memcpy(buffer.data() + (from - begin), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(from)), static_cast<std::size_t>(to - from));
         bytesRead += bytes;
         for (std::size_t offset = 0; offset + 8 <= bytes; offset += 8) {
             std::uint64_t value = 0;
@@ -124,12 +125,13 @@ void SetPendingDispatch(std::uint64_t program, std::span<const std::uint32_t> us
 }
 
 std::shared_ptr<const Roots> TakePending(std::uint64_t program) {
+    static const bool walked = std::getenv("APS5_P0R_NOWALK") == nullptr;
     if (!Enabled() || pendingProgram != program || program == 0) return nullptr;
     auto roots = std::make_shared<Roots>();
     roots->program = program;
     roots->userData = pendingUserData;
     const auto start = std::chrono::steady_clock::now();
-    roots->pointers = walk(roots->userData, roots->walkBytes);
+    if (walked) roots->pointers = walk(roots->userData, roots->walkBytes);
     roots->walkMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
     pendingProgram = 0;
     return roots;
