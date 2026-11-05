@@ -9,6 +9,7 @@
 #include <array>
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <functional>
 #include <memory>
@@ -315,7 +316,15 @@ struct Context {
     std::uint32_t BufferMemoryType(std::uint32_t mask, VkMemoryPropertyFlags flags, VkDeviceSize bytes) const {
         constexpr VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
         auto type = MemoryType(mask, flags);
-        if (flags == coherent) {
+        static const bool rebar = std::getenv("APS5_P0G_REBAR_BUFFERS") != nullptr;
+        if (rebar && flags == coherent) {
+            for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
+                if ((mask & (1u << i)) != 0 && (memory.memoryTypes[i].propertyFlags & (coherent | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) == (coherent | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                    type = i;
+                    break;
+                }
+            }
+        } else if (flags == coherent) {
             for (std::uint32_t i = 0; i < memory.memoryTypeCount; ++i) {
                 if ((mask & (1u << i)) != 0 && (memory.memoryTypes[i].propertyFlags & (coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) == (coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) {
                     type = i;

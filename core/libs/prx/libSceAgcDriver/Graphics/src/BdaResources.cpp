@@ -14,6 +14,7 @@
 #include <cstring>
 #include <limits>
 #include <list>
+#include <map>
 #include <mutex>
 #include <iomanip>
 #include <sstream>
@@ -195,12 +196,97 @@ void reportBdaBuildTimes() {
     std::fprintf(stderr, "[bda-build] (10 s): table build parts (ms): hash %.0f, candidate scan %.0f, index %.0f, buffer %.0f, copies %.0f, cache entry %.0f\n", ms(t.hashNs), ms(t.scanNs), ms(t.indexNs), ms(t.bufferNs), ms(t.copyNs), ms(t.entryNs));
 }
 
+namespace {
+
+// APS5_P0G_CLONE_IMPORTS=<MiB> (lane P0-gpu diagnostic, replay only, inexact): BDA table entries that point into a
+// host import point instead into a device-local (ReBAR) copy of that import, made by the CPU at its first use and
+// never refreshed; stores through such entries land in the copy. Imports larger than the budget left stay in place.
+struct P0gImport {
+    VkDeviceAddress address;
+    const void* host;
+    std::uint64_t bytes;
+    std::shared_ptr<Buffer> clone;
+    bool refused = false;
+};
+
+std::mutex& p0gMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<VkDeviceAddress, P0gImport>& p0gImports() {
+    static auto* imports = new std::map<VkDeviceAddress, P0gImport>();
+    return *imports;
+}
+
+std::uint64_t p0gCloneBudget() {
+    static const std::uint64_t bytes = [] {
+        const char* value = std::getenv("APS5_P0G_CLONE_IMPORTS");
+        return value != nullptr && *value != '\0' ? std::strtoull(value, nullptr, 0) << 20u : std::uint64_t{0};
+    }();
+    return bytes;
+}
+
+std::vector<ShaderRecompiler::BdaAbi::Range> p0gRedirect(const Context& context, const std::vector<ShaderRecompiler::BdaAbi::Range>& ranges) {
+    std::vector<ShaderRecompiler::BdaAbi::Range> result(ranges);
+    static std::uint64_t used = 0;
+    static std::uint64_t redirected = 0, clones = 0, refused = 0;
+    std::lock_guard lock(p0gMutex());
+    auto& imports = p0gImports();
+    for (auto& range : result) {
+        auto it = imports.upper_bound(range.deviceAddress);
+        if (it == imports.begin()) continue;
+        --it;
+        auto& entry = it->second;
+        if (range.deviceAddress + (range.end - range.begin) > entry.address + entry.bytes) continue;
+        if (entry.clone == nullptr && !entry.refused) {
+            if (used + entry.bytes > p0gCloneBudget()) {
+                entry.refused = true;
+                ++refused;
+            } else {
+                entry.clone = std::make_shared<Buffer>(context, entry.bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                std::memcpy(entry.clone->Bytes().data(), entry.host, entry.bytes);
+                used += entry.bytes;
+                ++clones;
+                std::fprintf(stderr, "[p0g-clone] import 0x%llx (%llu MiB) cloned to device-local; %llu clones, %llu MiB, %llu refused%s", static_cast<unsigned long long>(entry.address), static_cast<unsigned long long>(entry.bytes >> 20u), static_cast<unsigned long long>(clones), static_cast<unsigned long long>(used >> 20u), static_cast<unsigned long long>(refused), "\n");
+            }
+        }
+        if (entry.clone == nullptr) continue;
+        range.deviceAddress = entry.clone->DeviceAddress() + (range.deviceAddress - entry.address);
+        ++redirected;
+    }
+    return result;
+}
+
+}
+
+void P0gImportCreated(VkDeviceAddress address, const void* host, std::uint64_t bytes) {
+    if (p0gCloneBudget() == 0) return;
+    std::lock_guard lock(p0gMutex());
+    p0gImports()[address] = P0gImport{address, host, bytes, nullptr, false};
+}
+
+void P0gImportDestroyed(VkDeviceAddress address) {
+    if (p0gCloneBudget() == 0) return;
+    std::lock_guard lock(p0gMutex());
+    p0gImports().erase(address);
+}
+
+namespace {
+
+VkMemoryPropertyFlags bdaBufferProperties() {
+    static const bool rebar = std::getenv("APS5_P0G_REBAR_BDA") != nullptr;
+    return rebar ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT | VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT : VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+}
+
+}
+
 BdaResources::BdaResources(const Context& context) : textureService(context.textureService) {
     static_assert(std::endian::native == std::endian::little);
     Require(ShaderRecompiler::BdaAbi::FaultBufferBytes <= context.limits.maxStorageBufferRange, "BDA fault buffer exceeds storage buffer range limit");
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
     const auto faultStart = bdaBuildProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    fault = std::make_unique<Buffer>(context, ShaderRecompiler::BdaAbi::FaultBufferBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, bdaBufferProperties());
     std::memset(fault->Bytes().data(), 0, ShaderRecompiler::BdaAbi::WrittenListWord * sizeof(std::uint32_t));
     std::memset(fault->Bytes().data() + ShaderRecompiler::BdaAbi::SrtGuardWord * sizeof(std::uint32_t), 0, sizeof(std::uint32_t));
     if (bdaBuildProfiled()) {
@@ -321,12 +407,15 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     for (const auto& range : ranges) Require((range.permissions & ShaderRecompiler::BdaAbi::Write) == 0 || range.end <= ShaderRecompiler::BdaAbi::WrittenAddressLimit, "a writable BDA range ends past the addresses the written-page record can hold");
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::Bda);
     const auto bufferStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+    table = std::make_shared<Buffer>(context, tableBytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, bdaBufferProperties());
     const auto copyStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (profiled) bdaBuildTimes().bufferNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(copyStart - bufferStart).count()), std::memory_order_relaxed);
     const ShaderRecompiler::BdaAbi::Header header{ShaderRecompiler::BdaAbi::Version, static_cast<std::uint32_t>(ranges.size()), sizeof(ShaderRecompiler::BdaAbi::Range), index.empty() ? 0u : ShaderRecompiler::BdaAbi::IndexedTable};
     std::memcpy(table->Bytes().data(), &header, sizeof(header));
-    if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
+    if (!ranges.empty() && p0gCloneBudget() != 0) {
+        const auto moved = p0gRedirect(context, ranges);
+        std::memcpy(table->Bytes().data() + sizeof(header), moved.data(), moved.size() * sizeof(moved.front()));
+    } else if (!ranges.empty()) std::memcpy(table->Bytes().data() + sizeof(header), ranges.data(), ranges.size() * sizeof(ranges.front()));
     if (!index.empty()) std::memcpy(table->Bytes().data() + sizeof(header) + ranges.size() * sizeof(ranges.front()), index.data(), index.size() * sizeof(index.front()));
     const auto entryStart = profiled ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (profiled) bdaBuildTimes().copyNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(entryStart - copyStart).count()), std::memory_order_relaxed);
