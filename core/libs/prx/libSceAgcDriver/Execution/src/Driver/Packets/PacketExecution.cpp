@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderMemoryCensus.hpp"
@@ -587,6 +588,7 @@ void Driver::execute(const Submission& submission) {
             }
             if (!flipInterruptDeferred) deliverFlipEopInterrupt(submission.queue);
             ++flipsCounted;
+            Graphics::FastMode::NotePresent(flipsCounted.load());
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
             if (Graphics::AbConfigured()) {
@@ -615,6 +617,7 @@ void Driver::execute(const Submission& submission) {
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15 || opcode == 0x16) {
             packetCounters.CountDispatch();
+            Graphics::FastMode::CountDispatch();
             landPendingWaits(submission.queue);
             currentPacketOffset() = cursor;
             if (gateOpened()) {
@@ -666,6 +669,7 @@ void Driver::execute(const Submission& submission) {
             if (ahead != nullptr) ahead->Progress(aheadSegment, cursor);
             landPendingWaits(submission.queue);
             packetCounters.CountDraw();
+            Graphics::FastMode::CountDraw();
             drawnSinceSeal() = true;
             bool drawn = false;
             timed(&WorkerProfile::drawMs, [&] {

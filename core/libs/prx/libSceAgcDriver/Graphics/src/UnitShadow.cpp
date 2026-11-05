@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastMode.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
@@ -63,6 +64,7 @@ struct Statistics {
     std::atomic<std::uint64_t> detiledShadow{0}, detiledShadowBytes{0}, detiledImport{0}, detiledImportBytes{0}, tailPublishes{0};
     std::array<std::atomic<std::uint64_t>, ReasonCount> published{}, publishedBytes{};
     std::atomic<std::uint64_t> staleDroppedCpu{0}, staleDroppedDriver{0}, skippedInCompletion{0}, evictions{0}, lostOnRetire{0}, droppedOnRetire{0}, slabLost{0}, verified{0}, mismatches{0};
+    std::atomic<std::uint64_t> fastSkipped{0};
 };
 
 Statistics& Stats() {
@@ -330,6 +332,10 @@ void verifyPublished(const UnitShadow& shadow, const std::vector<SlabCopies>& co
 
 // The publish of one shadow: `selected[k]` (k = unit - first) names the units the scope chose.
 std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_t first, std::uint64_t last, const std::vector<std::uint8_t>& selected, PublishReason reason) {
+    if (reason == PublishReason::Address && FastMode::On(FastMode::Item::Publish) == 1u) {
+        Stats().fastSkipped.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
     auto& registry = Registry();
     std::vector<SlabCopies> copies;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -909,6 +915,10 @@ std::string ShadowReport() {
     line += text;
     if (ShadowVerify()) {
         std::snprintf(text, sizeof(text), ", verified %llu, mismatches %llu", take(statistics.verified), take(statistics.mismatches));
+        line += text;
+    }
+    if (const auto skipped = take(statistics.fastSkipped); skipped != 0) {
+        std::snprintf(text, sizeof(text), ", fast-mode address publishes skipped %llu", skipped);
         line += text;
     }
     return line;

@@ -24,8 +24,9 @@ inline std::uint32_t EnvNumber(const char* name) {
     return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 0)) : 0u;
 }
 
+// APS5_FAST_MODE (driver fast mode, lane B) turns native float on too, unless APS5_FM_FLOAT=0.
 inline bool NativeFloat() {
-    static const bool value = EnvNumber("APS5_P0S_NATIVE_FLOAT") != 0u;
+    static const bool value = EnvNumber("APS5_P0S_NATIVE_FLOAT") != 0u || (std::getenv("APS5_FAST_MODE") != nullptr && (std::getenv("APS5_FM_FLOAT") == nullptr || EnvNumber("APS5_FM_FLOAT") != 0u));
     return value;
 }
 

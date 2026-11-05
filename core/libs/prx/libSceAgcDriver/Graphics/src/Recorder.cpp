@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastMode.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -2449,12 +2450,12 @@ bool Recorder::P0dPassLog() {
 
 bool Recorder::P0dHeapContinue() {
     static const bool on = std::getenv("APS5_P0D_HEAP_CONTINUE") != nullptr;
-    return on;
+    return on || FastMode::On(FastMode::Item::Quiet) != 0;
 }
 
 bool Recorder::P0dMergePasses() {
     static const bool on = std::getenv("APS5_P0D_MERGE_PASSES") != nullptr;
-    return on;
+    return on || FastMode::On(FastMode::Item::Merge) != 0;
 }
 
 void Recorder::P0dNoteDraw(bool address, bool heap, bool indirect) {

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastMode.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -276,7 +277,7 @@ std::uint64_t mibEnv(const char* name) {
 }
 
 std::uint64_t p0gCloneAllBudget() {
-    static const std::uint64_t bytes = mibEnv("APS5_P0G_CLONE_IMPORTS");
+    static const std::uint64_t bytes = std::max(mibEnv("APS5_P0G_CLONE_IMPORTS"), static_cast<std::uint64_t>(FastMode::On(FastMode::Item::Clone)) << 20u);
     return bytes;
 }
 

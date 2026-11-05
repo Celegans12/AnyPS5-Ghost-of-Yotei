@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -5075,7 +5076,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     if (std::any_of(storageTextures.begin(), storageTextures.end(), [](const auto& texture) { return texture != nullptr && DepthSurfaceAt(texture->Descriptor().baseAddress); })) return false;
-    if (GuestMemory::P0cNoProofs()) {
+    if (GuestMemory::P0cNoProofs() || FastMode::SkipProof(2u)) {
         // Ceiling ablation (inexact): the cached set is taken without its proof.
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
         return true;

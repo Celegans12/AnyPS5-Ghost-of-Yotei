@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/BindlessTable.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastMode.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -113,7 +114,7 @@ void BindlessTable::Publish(Recorder& recorder) {
     // dispatches the title leaves unordered overlap. Off by default: the one in-run A/B with it
     // (bs-ab2, 2026-10-19) lost the device 53 s into an on phase after a 40 s GPU stall, a failure
     // not seen without it, and showed no gain in its one finished pair.
-    const bool quiet = RuntimeSwitches::Set(RuntimeSwitch::QuietPublish);
+    const bool quiet = RuntimeSwitches::Set(RuntimeSwitch::QuietPublish) || FastMode::On(FastMode::Item::Quiet) != 0;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     if (quiet) recorder.OpenBatch();
     else commands = recorder.Commands();

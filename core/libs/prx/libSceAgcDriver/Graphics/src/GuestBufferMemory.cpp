@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/OwnershipProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -5171,6 +5172,7 @@ struct ResidentRanges {
     std::map<std::pair<std::uint64_t, std::uint64_t>, ResidentRange> ranges;
     std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> heat;
     std::uint64_t promoted = 0, bound = 0, skipped = 0, skippedBytes = 0, copied = 0, invalidated = 0, otherLane = 0;
+    std::uint64_t bytes = 0;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
 
@@ -5185,6 +5187,25 @@ ResidentRanges& Residents() {
 constexpr std::size_t ResidentLimit = 32;
 constexpr std::uint32_t ResidentPromoteAfter = 8;
 constexpr std::uint64_t ResidentMinBytes = 65536;
+
+// APS5_FAST_MODE item STAGING=1: the same resident ranges without the entry, use-count and size limits, held
+// under a byte budget instead (APS5_FM_RESIDENT_MIB, default 1024).
+struct ResidentLimits {
+    std::size_t entries;
+    std::uint32_t promoteAfter;
+    std::uint64_t minBytes;
+    std::uint64_t maxBytes;
+};
+
+const ResidentLimits& residentLimits() {
+    static const ResidentLimits exact{ResidentLimit, ResidentPromoteAfter, ResidentMinBytes, ~std::uint64_t{0}};
+    static const ResidentLimits fast = [] {
+        const char* text = std::getenv("APS5_FM_RESIDENT_MIB");
+        const std::uint64_t mib = text != nullptr && *text != '\0' ? std::strtoull(text, nullptr, 0) : 1024u;
+        return ResidentLimits{65536, 2, 4096, mib << 20u};
+    }();
+    return FastMode::On(FastMode::Item::Staging) == 1u ? fast : exact;
+}
 
 void reportResidents(ResidentRanges& residents) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -5201,7 +5222,8 @@ void reportResidents(ResidentRanges& residents) {
 // The resident buffer a fresh build of the main lane binds for the staged range [begin, end), made once
 // the range was copied in ResidentPromoteAfter times in a report window; nullptr otherwise.
 std::shared_ptr<Buffer> residentBuffer(const Context& context, std::uint64_t begin, std::uint64_t end) {
-    if (RuntimeSwitches::Set(RuntimeSwitch::NoResidentRanges) || Recorder::ThreadLane() != 0 || end - begin < ResidentMinBytes) return nullptr;
+    const auto& limits = residentLimits();
+    if (RuntimeSwitches::Set(RuntimeSwitch::NoResidentRanges) || Recorder::ThreadLane() != 0 || end - begin < limits.minBytes) return nullptr;
     auto& residents = Residents();
     std::lock_guard lock(residents.mutex);
     const auto forget = GuestMemory::ForgetSerial();
@@ -5211,12 +5233,14 @@ std::shared_ptr<Buffer> residentBuffer(const Context& context, std::uint64_t beg
             ++residents.bound;
             return found->second.buffer;
         }
+        residents.bytes -= found->first.second - found->first.first;
         residents.ranges.erase(found);
     }
-    if (++residents.heat[key] < ResidentPromoteAfter || residents.ranges.size() >= ResidentLimit) return nullptr;
+    if (++residents.heat[key] < limits.promoteAfter || residents.ranges.size() >= limits.entries || residents.bytes + (end - begin) > limits.maxBytes) return nullptr;
     auto buffer = stagingBuffer(context, static_cast<std::size_t>(end - begin), gpuCopyUsage(true) | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
     if (buffer == nullptr) return nullptr;
     residents.ranges[key] = ResidentRange{buffer, 0, forget};
+    residents.bytes += end - begin;
     ++residents.promoted;
     ++residents.bound;
     return buffer;

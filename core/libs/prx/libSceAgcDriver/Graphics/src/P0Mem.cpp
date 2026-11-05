@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/P0Mem.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastMode.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <algorithm>
 #include <array>
@@ -126,11 +127,13 @@ void retire(Census& census, const Published& entry, bool republished) {
 }
 
 bool CeilingStaging() {
-    return (ceilingMode() & 1u) != 0;
+    static const bool fast = FastMode::StaticLevel(FastMode::Item::Staging, 2u);
+    return (ceilingMode() & 1u) != 0 || fast;
 }
 
 bool CeilingPublish() {
-    return (ceilingMode() & 2u) != 0;
+    static const bool fast = FastMode::StaticLevel(FastMode::Item::Publish, 2u);
+    return (ceilingMode() & 2u) != 0 || fast;
 }
 
 void CountCeiling(CeilingCount which, std::uint64_t bytes) {
