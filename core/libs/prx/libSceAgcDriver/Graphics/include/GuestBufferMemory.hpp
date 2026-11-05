@@ -357,6 +357,7 @@ public:
     // An address-based build whose dispatch is too small for its BDA overlays' copies to pay off
     // (see resolveOverlays): its written elements stay in the imports.
     void DisallowAddressStaging() { addressStaging = false; }
+    void ForceAddressStaging() { addressStaging = true; }
     void AllowAdjustedRegions() { adjustedRegions = true; }
     // S1: UploadPrepare copies nothing from guest memory (a region it would copy waits for
     // UploadFinish), so a stage A made ahead of the draw reads no guest bytes.

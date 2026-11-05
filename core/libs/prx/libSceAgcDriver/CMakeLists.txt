@@ -402,6 +402,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidentCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/HomeCensus.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/WriterReach.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp

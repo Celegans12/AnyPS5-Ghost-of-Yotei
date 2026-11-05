@@ -1,4 +1,6 @@
+#include "prx/libSceAgcDriver/Graphics/include/WriterReach.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <chrono>
@@ -215,6 +217,16 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         // A deferred draw's stage A (no device lock) takes only a cached space without mirrors.
         if (!unlocked) guestMemory.AcquireRegistered();
         else if (!guestMemory.AcquireRegisteredCached()) throw std::runtime_error("address space not cached: the draw builds under the device lock");
+        if (WriterReach::Enabled() && shaders.size() == 1 && shaders.front().stage == ShaderRecompiler::ShaderStage::Compute) {
+            const auto* ranges = WriterReach::RangesFor(WriterReach::CurrentProgram());
+            WriterReach::CountBuild(ranges != nullptr, ranges != nullptr ? ranges->size() : 0);
+            if (ranges != nullptr) {
+                guestMemory.ForceAddressStaging();
+                for (const auto& [begin, end] : *ranges) {
+                    if (GuestMemory::DescribeCommitted(begin, static_cast<std::size_t>(end - begin), true).whole) guestMemory.AddWritable(begin, static_cast<std::size_t>(end - begin));
+                }
+            }
+        }
         const auto snapshotsStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         for (const auto& snapshot : snapshots) guestMemory.AddSnapshot(snapshot);
         if (profile) GuestBufferMemory::CountAddressBuild(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - snapshotsStart).count());

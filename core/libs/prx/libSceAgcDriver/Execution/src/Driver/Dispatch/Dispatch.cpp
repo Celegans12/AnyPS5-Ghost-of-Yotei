@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/WriterReach.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -164,6 +165,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         OriginScope(std::uint64_t program, bool active) : active(active) { if (active) Graphics::Recorder::SetWriteOrigin(program); }
         ~OriginScope() { if (active) Graphics::Recorder::SetWriteOrigin(0); }
     } originScope(address, !preparingAhead);
+    const Graphics::WriterReach::ProgramScope writerReachScope(address);
     auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
     if (!registeredShader) {
         if (preparingAhead) {
