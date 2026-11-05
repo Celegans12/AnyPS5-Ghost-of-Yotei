@@ -5739,6 +5739,21 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     runAccesses.clear();
     if (overlapCapable) resources.RunAccesses(runAccesses);
     if (overlapCapable && record.shader->program->bindlessHeap) runAccesses.push_back({0, std::numeric_limits<std::uint64_t>::max(), Graphics::Recorder::RunAccessImage | Graphics::Recorder::RunAccessWritten});
+    if (Graphics::Recorder::HomesEnabled()) {
+        if (resources.HoldsLease()) {
+            recorder.SettleHomes();
+        } else {
+            thread_local std::vector<std::array<std::uint64_t, 3>>* homeAccessesSlot = nullptr;
+            auto& homeAccesses = ShaderRecompiler::ThreadOwned(homeAccessesSlot);
+            homeAccesses.clear();
+            resources.RunAccesses(homeAccesses);
+            for (const auto& access : homeAccesses) {
+                if ((access[2] & (Graphics::Recorder::RunAccessCopied | Graphics::Recorder::RunAccessImage)) == 0u) recorder.SettleHomes(access[0], access[1]);
+            }
+            if (argumentImport != nullptr) recorder.SettleHomes(arguments, arguments + 12);
+        }
+    }
+    const std::optional<Graphics::Recorder::HomeScope> homeScope = Graphics::Recorder::HomesEnabled() ? std::optional<Graphics::Recorder::HomeScope>(std::in_place) : std::nullopt;
     auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped, runAccesses) : recorder.Commands(&covered);
     const Graphics::Recorder::CommandInHand commandInHand;
     if (timer.profile && overlapped) recorder.CheckRunConflicts(record.programAddress, runAccesses);

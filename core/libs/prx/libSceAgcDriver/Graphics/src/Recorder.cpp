@@ -48,6 +48,10 @@
 namespace AgcDriver::Graphics {
 
 namespace {
+bool homeScopeActive();
+}
+
+namespace {
 
 std::atomic<bool> laneOwnFamily{false};
 
@@ -2292,6 +2296,7 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess, std::source_loc
     // for a caller whose ranges overlap a queued store: FlushStores).
     if (open->renderPass.open) endOpenRenderPass();
     if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
+    if (!open->homeSettles.empty() && !homeScopeActive()) settleHomesNow(0, 0, nullptr);
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
     return open->commands;
@@ -2306,6 +2311,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(1, where);
+    if (!open->homeSettles.empty() && !homeScopeActive()) settleHomesNow(0, 0, nullptr);
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         const auto commands = Commands();
@@ -2491,6 +2497,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(3, where);
+    if (!open->homeSettles.empty()) settleHomesNow(address, address + bytes.size(), nullptr);
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -5011,6 +5018,7 @@ void Recorder::Submit() {
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     flushDeferredDispatch(6);
     sealPrelude();
+    if (!open->homeSettles.empty()) settleHomesNow(0, 0, nullptr);
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();
@@ -5893,4 +5901,94 @@ void Recorder::release(Batch& batch) noexcept {
     batch.fence = VK_NULL_HANDLE;
 }
 
+
+namespace {
+
+thread_local int homeScopeDepth = 0;
+
+bool homeScopeActive() {
+    return homeScopeDepth > 0;
+}
+
+}
+
+bool Recorder::HomesEnabled() {
+    static const bool enabled = std::getenv("APS5_V3M_HOMES") != nullptr;
+    return enabled;
+}
+
+Recorder::HomeScope::HomeScope() {
+    ++homeScopeDepth;
+}
+
+Recorder::HomeScope::~HomeScope() {
+    --homeScopeDepth;
+}
+
+void Recorder::DeferHomeSettle(HomeSettle settle) {
+    ensureOpen();
+    open->homeSettles.push_back(std::move(settle));
+}
+
+bool Recorder::HomeSettlePendingFor(const void* home) const {
+    if (open == nullptr) return false;
+    return std::any_of(open->homeSettles.begin(), open->homeSettles.end(), [&](const HomeSettle& settle) { return settle.home == home; });
+}
+
+bool Recorder::HomeSettleCovers(const void* home, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const {
+    if (open == nullptr) return false;
+    return std::all_of(ranges.begin(), ranges.end(), [&](const auto& range) {
+        return std::any_of(open->homeSettles.begin(), open->homeSettles.end(), [&](const HomeSettle& settle) {
+            return settle.home == home && std::any_of(settle.ranges.begin(), settle.ranges.end(), [&](const auto& held) { return held.first <= range.first && range.second <= held.second; });
+        });
+    });
+}
+
+bool Recorder::HomeSettlePendingOver(std::uint64_t begin, std::uint64_t end, const void* except) const {
+    if (open == nullptr) return false;
+    for (const auto& settle : open->homeSettles) {
+        if (except != nullptr && settle.home == except) continue;
+        for (const auto& [from, to] : settle.ranges) {
+            if (end == 0 || (from < end && begin < to)) return true;
+        }
+    }
+    return false;
+}
+
+void Recorder::SettleHomes(std::uint64_t begin, std::uint64_t end, const void* except) {
+    if (open == nullptr || open->homeSettles.empty()) return;
+    settleHomesNow(begin, end, except);
+}
+
+void Recorder::settleHomesNow(std::uint64_t begin, std::uint64_t end, const void* except) {
+    GuestMemory::AssertGpuLockHeld("Recorder::settleHomesNow");
+    if (open == nullptr || !HomeSettlePendingOver(begin, end, except)) return;
+    flushDeferredDispatch(0);
+    if (open == nullptr) return;
+    if (open->renderPass.open) endOpenRenderPass();
+    if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
+    std::vector<HomeSettle> chosen;
+    std::vector<HomeSettle> kept;
+    for (auto& settle : open->homeSettles) {
+        bool overlaps = except == nullptr || settle.home != except;
+        if (overlaps && end != 0) overlaps = std::any_of(settle.ranges.begin(), settle.ranges.end(), [&](const auto& range) { return range.first < end && begin < range.second; });
+        (overlaps ? chosen : kept).push_back(std::move(settle));
+    }
+    open->homeSettles = std::move(kept);
+    if (chosen.empty()) return;
+    const auto commands = open->commands;
+    std::uint64_t bytes = 0;
+    for (const auto& settle : chosen) {
+        for (const auto& [from, to] : settle.ranges) bytes += to - from;
+    }
+    const auto timing = BeginGpuTiming(CommandClass::StagingOut);
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+    CountBarriers(CommandClass::StagingOut);
+    for (const auto& settle : chosen) settle.record(commands);
+    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, copiedAccess);
+    CountBarriers(CommandClass::StagingOut);
+    MarkCovered(copiedAccess);
+    EndGpuTiming(timing, bytes);
+}
 }

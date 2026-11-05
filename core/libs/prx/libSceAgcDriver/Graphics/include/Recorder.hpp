@@ -499,6 +499,28 @@ public:
     static bool CheckpointsOn();
     static void Checkpoint(VkCommandBuffer commands, CheckpointKind kind, std::uint64_t value);
     static std::optional<WriteOrigin> OriginOfNote(std::uint64_t note);
+    // v3 mem Phase A (APS5_V3M_HOMES): a staged region's copy-back deferred to a settle point. `record`
+    // records it (no barriers) into the given command buffer; `home` names the shadow it reads.
+    // Settled at the batch's Submit, before any command recorded outside a HomeScope, and before a
+    // store over its ranges; SettleHomes settles the entries over [begin, end) (end 0: all) except
+    // those of `except`.
+    struct HomeSettle {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        const void* home = nullptr;
+        std::function<void(VkCommandBuffer)> record;
+    };
+    void DeferHomeSettle(HomeSettle settle);
+    bool HomeSettlePendingFor(const void* home) const;
+    bool HomeSettleCovers(const void* home, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
+    bool HomeSettlePendingOver(std::uint64_t begin, std::uint64_t end, const void* except = nullptr) const;
+    void SettleHomes(std::uint64_t begin = 0, std::uint64_t end = 0, const void* except = nullptr);
+    static bool HomesEnabled();
+    struct HomeScope {
+        HomeScope();
+        ~HomeScope();
+        HomeScope(const HomeScope&) = delete;
+        HomeScope& operator=(const HomeScope&) = delete;
+    };
     // Ends and submits the open batch without waiting.
     void Submit();
     void HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value);
@@ -976,6 +998,7 @@ private:
         std::vector<const void*> deferredRun;
         // See AfterRun.
         std::vector<std::function<void(Recorder&)>> afterRun;
+        std::vector<HomeSettle> homeSettles;
         // See NoteRunAccess: {begin, end, flags, program} of the open run's dispatches, and the copied
         // regions with atomics among them (RunAtomicConflict).
         std::vector<std::array<std::uint64_t, 4>> runAccess;
@@ -1140,6 +1163,7 @@ private:
     // Per-batch runs: records the queued stores with their barriers (`atSubmit`: the batch-end
     // form, toward the host only); returns whether the batch's host-read barrier was included.
     bool closeStoreRun(bool atSubmit = false);
+    void settleHomesNow(std::uint64_t begin, std::uint64_t end, const void* except);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
     void endOpenRenderPass(bool barrier = true);
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or
