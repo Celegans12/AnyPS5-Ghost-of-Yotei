@@ -93,6 +93,9 @@ public:
     // `hostMemory`: the image goes to system memory (SystemMemoryType; a linear-tiled image for one level and layer when the optimal-tiled one has no such type) when the device
     // has one for it (sampling it then reads over the bus); InHostMemory says where it went.
     Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare = false, bool hostMemory = false);
+    // The snapshot's `snapshotBytes` bytes are written by `fill` straight into the upload's staging buffer, which is
+    // host-cached memory when `cachedStaging` is set and the device has such a type (`fill` may read them back).
+    Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::size_t snapshotBytes, const std::function<void(std::span<std::byte>)>& fill, bool depthCompare = false, bool hostMemory = false, bool cachedStaging = false);
     Texture(const Context& context, const std::shared_ptr<ResidentColor>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.

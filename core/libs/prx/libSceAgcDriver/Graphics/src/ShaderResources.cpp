@@ -2028,18 +2028,32 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             static std::atomic<std::uint64_t> clearReuses{0};
             clearReuses.fetch_add(1, std::memory_order_relaxed);
         } else {
-        const SnapshotBuffer snapshotBuffer(bytes);
-        const auto snapshot = snapshotBuffer.Bytes();
-        ReadTextureSurface(resource, *keys, snapshot);
         if (!pending) entry.untracked = untracked;
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
-        if (traceTextures) {
-            std::size_t nonzero = 0;
-            for (std::size_t i = 0; i < snapshot.size(); i += 64) nonzero += snapshot[i] != std::byte{0};
-            std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, snapshot.size() / 64);
-        }
+        // Reads the surface, and hashes what it read, into the bytes the upload copies from: by default
+        // the upload's staging buffer itself (host-cached memory), so a snapshot is one copy of the
+        // surface instead of a read into a host buffer and a second copy into the staging buffer.
+        // APS5_NO_DIRECT_SNAPSHOT_STAGING (runtime switch) reads into the scratch buffer as before.
+        const auto readSnapshot = [&](std::span<std::byte> snapshot) {
+            ReadTextureSurface(resource, *keys, snapshot);
+            if (traceTextures) {
+                std::size_t nonzero = 0;
+                for (std::size_t i = 0; i < snapshot.size(); i += 64) nonzero += snapshot[i] != std::byte{0};
+                std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, snapshot.size() / 64);
+            }
+            if (*keys == DccKeys::Uncompressed) {
+                entry.hashes.resize(GuestMemory::HashBlockCount(address, bytes));
+                GuestMemory::HashBlocksOf(address, snapshot, entry.hashes);
+            }
+        };
         const bool spill = SpillEnabled() && !makeRoom(cache, bytes, budgets);
-        entry.texture = createTexture(*context.detiler, resource, components, snapshot, depthCompare, spill);
+        if (RuntimeSwitches::Set(RuntimeSwitch::NoDirectSnapshotStaging)) {
+            const SnapshotBuffer snapshotBuffer(bytes);
+            readSnapshot(snapshotBuffer.Bytes());
+            entry.texture = createTexture(*context.detiler, resource, components, std::span<const std::byte>(snapshotBuffer.Bytes()), depthCompare, spill);
+        } else {
+            entry.texture = createTexture(*context.detiler, resource, components, static_cast<std::size_t>(bytes), std::function<void(std::span<std::byte>)>(readSnapshot), depthCompare, spill, true);
+        }
         ++cache.counts.made;
         ++cache.totals.made;
         cache.madeSurfaces.insert(address * 0x9e3779b97f4a7c15ull ^ guestBytes);
@@ -2048,10 +2062,6 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             ++cache.totals.spilled;
             cache.counts.spilledBytes += entry.texture->AllocationBytes();
             cache.totals.spilledBytes += entry.texture->AllocationBytes();
-        }
-        if (*keys == DccKeys::Uncompressed) {
-            entry.hashes.resize(GuestMemory::HashBlockCount(address, bytes));
-            GuestMemory::HashBlocksOf(address, snapshot, entry.hashes);
         }
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
