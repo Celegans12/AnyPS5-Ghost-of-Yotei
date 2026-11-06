@@ -2035,13 +2035,21 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         // surface instead of a read into a host buffer and a second copy into the staging buffer.
         // APS5_NO_DIRECT_SNAPSHOT_STAGING (runtime switch) reads into the scratch buffer as before.
         const auto readSnapshot = [&](std::span<std::byte> snapshot) {
-            ReadTextureSurface(resource, *keys, snapshot);
+            // An uncompressed surface is hashed block by block as it is read (APS5_NO_FUSED_SNAPSHOT_HASH,
+            // a runtime switch, reads the whole surface first and hashes it afterwards).
+            const bool fused = *keys == DccKeys::Uncompressed && !RuntimeSwitches::Set(RuntimeSwitch::NoFusedSnapshotHash);
+            if (fused) {
+                entry.hashes.resize(GuestMemory::HashBlockCount(address, bytes));
+                ReadUncompressedSurfaceHashed(resource, snapshot, entry.hashes);
+            } else {
+                ReadTextureSurface(resource, *keys, snapshot);
+            }
             if (traceTextures) {
                 std::size_t nonzero = 0;
                 for (std::size_t i = 0; i < snapshot.size(); i += 64) nonzero += snapshot[i] != std::byte{0};
                 std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, snapshot.size() / 64);
             }
-            if (*keys == DccKeys::Uncompressed) {
+            if (!fused && *keys == DccKeys::Uncompressed) {
                 entry.hashes.resize(GuestMemory::HashBlockCount(address, bytes));
                 GuestMemory::HashBlocksOf(address, snapshot, entry.hashes);
             }

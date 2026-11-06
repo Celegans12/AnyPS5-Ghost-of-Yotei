@@ -1505,6 +1505,10 @@ void CheckContentHashes() {
     std::vector<Hash128> fromCopy(hashes.size());
     HashBlocksOf(address, copy, fromCopy);
     Require(fromCopy == hashes, "a host copy hashes unlike the guest bytes it copies");
+    std::vector<std::byte> hashedRead(bytes);
+    std::vector<Hash128> hashedReadHashes(hashes.size());
+    ReadCommittedHashed(address, hashedRead, hashedReadHashes);
+    Require(hashedRead == copy && hashedReadHashes == hashes, "a hashed read differs from a read and the hashes of what it read");
     Require(CommittedBlocksMatch(address, bytes, hashes), "unchanged bytes do not match their hashes");
     Require(CommittedBlocksMatch(blockBase + Block, Block, std::span<const Hash128>(hashes).subspan(1, 1)), "a whole block inside the range does not match its own hash");
     Require(!CommittedBlocksMatch(address, bytes, std::span<const Hash128>(hashes).first(3)), "a hash list of the wrong length matched");
@@ -1549,6 +1553,10 @@ void CheckContentHashes() {
     HashCommittedBlocks(sparse, sparseBytes, sparseHashes);
     HashBlocksOf(sparse, read, readHashes);
     Require(sparseHashes == readHashes && CommittedBlocksMatch(sparse, sparseBytes, readHashes), "uncommitted pages do not hash as the zeros ReadCommitted reads");
+    std::vector<std::byte> sparseHashedRead(sparseBytes);
+    std::vector<Hash128> sparseHashedReadHashes(sparseHashes.size());
+    ReadCommittedHashed(sparse, sparseHashedRead, sparseHashedReadHashes);
+    Require(sparseHashedRead == read && sparseHashedReadHashes == readHashes, "a hashed read over uncommitted pages differs from a read and the hashes of what it read");
     reserved[4096 + 5] = std::byte{0};
     Require(!CommittedBlocksMatch(sparse, sparseBytes, readHashes), "a changed committed byte next to uncommitted pages still matches");
     VirtualFree(reserved, 0, MEM_RELEASE);

@@ -3239,6 +3239,22 @@ void HashBlocksOf(std::uint64_t address, std::span<const std::byte> bytes, std::
     });
 }
 
+void ReadCommittedHashed(std::uint64_t address, std::span<std::byte> destination, std::span<ContentHash::Hash128> out) {
+    requireNotSpeculative("read of committed pages");
+    require(out.size() == HashBlockCount(address, destination.size()), "hash block count differs");
+    if (destination.empty()) return;
+    GuardRead(address, destination.size());
+    FlushGpuWrites(address, destination.size());
+    const TimedAccess timed(CounterRead, destination.size());
+    CountReadCaller(__builtin_return_address(0));
+    forEachHashBlock(address, destination.size(), [&](std::size_t index, std::uint64_t begin, std::size_t length) {
+        const auto block = destination.subspan(static_cast<std::size_t>(begin - address), length);
+        copyCommitted(begin, block);
+        out[index] = ContentHash::Of(block.data(), length);
+        return true;
+    });
+}
+
 bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected) {
     if (expected.size() != HashBlockCount(address, bytes)) return false;
     if (bytes == 0) return true;
