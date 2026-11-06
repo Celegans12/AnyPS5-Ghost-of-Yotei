@@ -141,9 +141,10 @@ void viewLost(std::uintptr_t address, std::size_t bytes) {
         auto* block = findBlock(blockBase);
         if (block == nullptr) continue;
         const auto mask = pageMask(blockBase, address & ~(PageBytes - 1), (end + PageBytes - 1) & ~(PageBytes - 1));
-        if ((block->viewed.load(std::memory_order_seq_cst) & mask) == 0) continue;
+        if ((tracked(*block) & mask) == 0) continue;
         block->dirty.store(clock.fetch_add(1, std::memory_order_seq_cst) + 1, std::memory_order_seq_cst);
         block->viewed.fetch_and(~mask, std::memory_order_seq_cst);
+        block->armed.fetch_and(~mask, std::memory_order_seq_cst);
         counters.viewLosses.fetch_add(1, std::memory_order_relaxed);
     }
 }
