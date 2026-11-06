@@ -1,3 +1,4 @@
+#include "V3tSwitches.hpp"
 #include "SpirvBackend/SpirvRuntimeBuffer.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
@@ -163,7 +164,7 @@ DecodedDescriptor decode(SpirvValueEmitContext& context, const IrValue& instruct
     const auto& memory = context.Memory(instruction);
     const bool runtime = memory.gpuDescriptor || state.registrationModules;
     const auto first = PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords;
-    const bool runtimeShape = runtime || state.program.Resources().stage == IrShaderStage::Compute;
+    const bool runtimeShape = runtime || (state.program.Resources().stage == IrShaderStage::Compute && !V3t::SpecShape());
     auto word1 = runtimeShape ? context.Arg(handle, 1u) : state.module.SpecializationConstant(TypeU32(state), first, 0u);
     if (runtimeShape && GcnGuestShaders()) word1 = Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1, ConstantU32(state, GcnBufferWord1Mask));
     const bool runtimeFormat = memory.gpuDescriptor || (state.registrationModules && !state.program.Info().buffers.at(memory.resource).descriptorFormatted);
@@ -400,7 +401,8 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     const auto lowIndex = GuardedElementIndex(state, access, inBounds, index);
     const auto highIndex = Select(state, TypeU32(state), both(state, inBounds, unaligned), next, lowIndex);
     const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), load(lowIndex), shift);
-    const auto high = EmitValueOrZero(state, unaligned, Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(highIndex), highShift));
+    const auto high = V3t::OneLoad() ? EmitValueOrZeroIfCondition(state, unaligned, [&] { return Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(highIndex), highShift); })
+                                     : EmitValueOrZero(state, unaligned, Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(highIndex), highShift));
     return EmitValueOrZero(state, inBounds, combine(low, high));
 }
 
@@ -484,6 +486,37 @@ void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std
                 const auto remaining = Binary(state, spv::OpISub, u32, ConstantU32(state, 32u), shift);
                 update(next, Binary(state, spv::OpShiftRightLogical, u32, mask, remaining), Binary(state, spv::OpShiftRightLogical, u32, masked, remaining));
             });
+        });
+    });
+}
+
+void writeBufferGuarded(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t value, std::uint32_t guard) {
+    auto& state = context.state;
+    const auto access = directAccess(context, instruction);
+    const auto u32 = TypeU32(state);
+    const auto index = directWordIndex(state, access, address);
+    const auto misalignment = baseMisalignment(context, instruction);
+    const auto unaligned = nonzero(state, misalignment);
+    const auto next = EmitAddU32(state, index, ConstantU32(state, 1u));
+    const auto last = Select(state, u32, unaligned, next, index);
+    const auto ok = both(state, guard, EmitMemoryElementInBounds(state, access, last));
+    EmitIfCondition(state, Unary(state, spv::OpLogicalNot, TypeBool(state), unaligned), [&] {
+        const auto pointer = EmitMemoryElementPointer(state, access, GuardedElementIndex(state, access, ok, index));
+        if (access.memoryAccess != 0u) state.module.AddFunction(spv::OpStore, pointer, value, access.memoryAccess);
+        else state.module.AddFunction(spv::OpStore, pointer, value);
+    });
+    EmitIfCondition(state, unaligned, [&] {
+        EmitIfCondition(state, ok, [&] {
+            const auto mask = ConstantU32(state, 0xffffffffu);
+            const auto update = [&](std::uint32_t word, std::uint32_t wordMask, std::uint32_t replacement) {
+                AtomicUpdate(state, EmitMemoryElementPointer(state, access, word), access.kind, [&](std::uint32_t old) {
+                    return EmitOrU32(state, Binary(state, spv::OpBitwiseAnd, u32, old, Unary(state, spv::OpNot, u32, wordMask)), replacement);
+                });
+            };
+            const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, misalignment, ConstantU32(state, 3u));
+            update(index, Binary(state, spv::OpShiftLeftLogical, u32, mask, shift), Binary(state, spv::OpShiftLeftLogical, u32, value, shift));
+            const auto remaining = Binary(state, spv::OpISub, u32, ConstantU32(state, 32u), shift);
+            update(next, Binary(state, spv::OpShiftRightLogical, u32, mask, remaining), Binary(state, spv::OpShiftRightLogical, u32, value, remaining));
         });
     });
 }
@@ -1181,6 +1214,15 @@ std::uint32_t EmitRuntimeBufferLoad(SpirvValueEmitContext& context, const IrValu
     const auto type = components == 1u ? TypeU32(state) : TypeU32Composite(state, components);
     const auto zero = components == 1u ? ConstantU32(state, 0u) : ConstantU32CompositeZero(state, components);
     const auto resource = memory.formatted && !inlineFormat(context, instruction) ? descriptor(context, instruction) : bounded(context, instruction);
+    if (V3t::BranchlessLoads() && !memory.formatted && !memory.gpuDescriptor && !(components == 2u && memory.coherent && memory.dataBits == 32u && state.storageBufferU64Variable != 0u)) {
+        const auto exec = context.Arg(instruction, instruction.ArgumentCount() - 1u);
+        std::array<std::uint32_t, 4> values{};
+        for (std::uint32_t component = 0; component < components; ++component) {
+            const auto access = address(context, instruction, resource, component * 4u, memory.dataBits / 8u);
+            values[component] = readBuffer(context, instruction, access.guest, memory.dataBits, both(state, exec, access.inBounds));
+        }
+        return composite(state, components, values);
+    }
     return EmitValueOrDefaultIfCondition(state, context.Arg(instruction, instruction.ArgumentCount() - 1u), type, zero, [&] {
         checkDescriptor(context, instruction, resource);
         if (memory.formatted) return EmitValueOrDefaultIfCondition(state, resource.valid, type, zero, [&] { return formattedDispatch(context, instruction, resource, components, false, 0u); });
@@ -1210,6 +1252,15 @@ void EmitRuntimeBufferStore(SpirvValueEmitContext& context, const IrValue& instr
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
     const auto resource = memory.formatted && !inlineFormat(context, instruction) ? descriptor(context, instruction) : bounded(context, instruction);
+    if (V3t::BranchlessStores() && state.robustBufferAccess2 && !memory.formatted && !memory.gpuDescriptor && memory.dataBits == 32u && memory.kind == ResourceKind::Buffer && !(components == 2u && memory.coherent && state.storageBufferU64Variable != 0u)) {
+        const auto exec = context.Arg(instruction, instruction.ArgumentCount() - 1u);
+        const auto values = storeValues(state, storeData(context, instruction), components);
+        for (std::uint32_t component = 0; component < components; ++component) {
+            const auto access = address(context, instruction, resource, component * 4u, 4u);
+            writeBufferGuarded(context, instruction, access.guest, values[component], both(state, exec, access.inBounds));
+        }
+        return;
+    }
     EmitIfCondition(state, context.Arg(instruction, instruction.ArgumentCount() - 1u), [&] {
         checkDescriptor(context, instruction, resource);
         if (memory.formatted) {
