@@ -633,11 +633,7 @@ static int ReadClock(int clockId, KernelTimespec* tp) {
 }
 
 static bool MeasuredInvalidClock(int clockId) {
-    return clockId == 3 || clockId == 6 || (clockId >= 22 && clockId < 32);
-}
-
-static bool MeasuredIoErrorClock(int clockId) {
-    return clockId >= 16 && clockId <= 19;
+    return clockId == 3 || clockId == 6 || clockId == 17 || clockId == 18 || clockId == 20 || (clockId >= 22 && clockId < 32);
 }
 
 int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
