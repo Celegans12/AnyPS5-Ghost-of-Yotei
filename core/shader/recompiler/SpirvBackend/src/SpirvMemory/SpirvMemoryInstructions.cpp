@@ -1557,12 +1557,33 @@ std::uint32_t EmitReadConst(SpirvValueEmitContext& ctx, const IrValue& inst) {
                 return value;
             };
             const auto guard = static_cast<std::uint32_t>(found - guarded.begin());
-            const auto flag = load(ConstantU32(state, resources.srtGuardOffset + guard));
-            const auto poisoned = Binary(state, spv::OpINotEqual, TypeBool(state), flag, ConstantU32(state, 0u));
             const auto records = resources.srtGuardOffset + static_cast<std::uint32_t>(guarded.size());
             if (records + 3u * guarded.size() >= (1u << BdaAbi::SrtGuardStageShift)) {
                 ctx.Fail(inst, "has more guarded SRT records than the fault buffer's guard word can name");
             }
+            const auto recordPoison = [&](std::uint32_t flag) {
+                const auto slotRecord = Binary(state, spv::OpIAdd, u32, ConstantU32(state, records), Binary(state, spv::OpIMul, u32, Binary(state, spv::OpISub, u32, flag, ConstantU32(state, 1u)), ConstantU32(state, 3u)));
+                const auto stage = ConstantU32(state, static_cast<std::uint32_t>(resources.stage) << BdaAbi::SrtGuardStageShift);
+                state.module.AddFunction(spv::OpAtomicCompareExchange, u32, state.module.AllocateId(), BdaWord(state, state.faultBufferVariable, ConstantU32(state, BdaAbi::SrtGuardWord)), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), ConstantU32(state, spv::MemorySemanticsMaskNone), Binary(state, spv::OpBitwiseOr, u32, slotRecord, stage), ConstantU32(state, 0u));
+            };
+            if (state.srtAnyPoisoned != 0u) {
+                const auto anyWord = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLoad, u32, anyWord, state.srtAnyPoisoned);
+                const auto poisoned = EmitValueIfElse(state, Binary(state, spv::OpINotEqual, TypeBool(state), anyWord, ConstantU32(state, 0u)), TypeBool(state), [&] {
+                    const auto flag = load(ConstantU32(state, resources.srtGuardOffset + guard));
+                    const auto hit = Binary(state, spv::OpINotEqual, TypeBool(state), flag, ConstantU32(state, 0u));
+                    EmitIfCondition(state, hit, [&] { recordPoison(flag); });
+                    return hit;
+                }, [&] { return ConstantBool(state, false); });
+                StopBdaInvocationIf(state, poisoned);
+                const auto pointer = state.module.AllocateId();
+                state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, state.flattenedSrtVariable, ConstantU32(state, 0u), ctx.Arg(inst, 1));
+                const auto value = state.module.AllocateId();
+                state.module.AddFunction(spv::OpLoad, TypeU32(state), value, pointer);
+                return value;
+            }
+            const auto flag = load(ConstantU32(state, resources.srtGuardOffset + guard));
+            const auto poisoned = Binary(state, spv::OpINotEqual, TypeBool(state), flag, ConstantU32(state, 0u));
             EmitIfCondition(state, poisoned, [&] {
                 const auto record = Binary(state, spv::OpIAdd, u32, ConstantU32(state, records), Binary(state, spv::OpIMul, u32, Binary(state, spv::OpISub, u32, flag, ConstantU32(state, 1u)), ConstantU32(state, 3u)));
                 const auto stage = ConstantU32(state, static_cast<std::uint32_t>(resources.stage) << BdaAbi::SrtGuardStageShift);

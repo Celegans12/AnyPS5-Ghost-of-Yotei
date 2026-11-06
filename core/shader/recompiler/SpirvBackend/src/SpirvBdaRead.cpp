@@ -1,5 +1,6 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "P0sCeiling.hpp"
+#include "V3tSwitches.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
@@ -24,6 +25,7 @@ void EmitBdaOverflowCheck(SpirvEmitterState& state, std::uint32_t address, std::
 }
 
 bool BdaCoherent(const SpirvEmitterState& state, const IrValue& inst) {
+    if (V3t::PlainCoherentReads() >= 3u && AddressOpcodeInfoOf(inst.Opcode()).access == AddressAccess::Read) return false;
     const auto index = inst.Flags<MemoryFlags>().index;
     const auto& memory = state.program.Resources().memoryInfo;
     return index < memory.size() && memory[index].coherent;
@@ -842,6 +844,152 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
     });
 }
 
+void EmitV3tPrologue(SpirvEmitterState& state) {
+    state.bdaFlat = {};
+    state.srtAnyPoisoned = 0;
+    const auto& resources = state.program.Resources();
+    const bool flat = V3t::FlatInline() && state.program.Info().usesDma && state.bdaProbeFunction != 0 && state.bdaPagetableVariable != 0;
+    const bool guards = V3t::SrtGuardHoist() && !resources.guardedSrtSlots.empty() && state.flattenedSrtVariable != 0 && state.faultBufferVariable != 0;
+    if (!flat && !guards) return;
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto constant = [&](std::uint32_t value) { return ConstantU32(state, value); };
+    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    if (flat) {
+        const auto u64 = TypeScalarU64(state);
+        const auto lessEqual = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpULessThanEqual, boolean, left, right); };
+        const auto both = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpLogicalAnd, boolean, left, right); };
+        const auto length = state.module.AllocateId();
+        state.module.AddFunction(spv::OpArrayLength, u32, length, state.bdaPagetableVariable, 0u);
+        const auto big = lessEqual(constant(8u), length);
+        const auto word = [&](std::uint32_t index) { return BdaLoadWord(state, Select(state, u32, big, index, constant(0u))); };
+        const auto headerOk = both(both(big, binary(spv::OpIEqual, boolean, word(constant(0u)), constant(BdaAbi::Version))), both(binary(spv::OpIEqual, boolean, word(constant(2u)), constant(sizeof(BdaAbi::Range))), binary(spv::OpIEqual, boolean, word(constant(3u)), constant(3u))));
+        const auto count = word(constant(1u));
+        const auto countOk = both(headerOk, lessEqual(count, binary(spv::OpShiftRightLogical, u32, length, constant(3u))));
+        const auto indexAt = binary(spv::OpIAdd, u32, constant(4u), binary(spv::OpIMul, u32, Select(state, u32, countOk, count, constant(0u)), constant(8u)));
+        const auto ok1 = both(countOk, lessEqual(binary(spv::OpIAdd, u32, indexAt, constant(5u)), length));
+        const auto safeIndexAt = Select(state, u32, ok1, indexAt, constant(0u));
+        const auto buckets = BdaLoadWord(state, binary(spv::OpIAdd, u32, safeIndexAt, constant(2u)));
+        const auto flatAt = binary(spv::OpIAdd, u32, binary(spv::OpIAdd, u32, safeIndexAt, constant(5u)), buckets);
+        const auto ok2 = both(both(ok1, lessEqual(buckets, length)), lessEqual(binary(spv::OpIAdd, u32, flatAt, constant(6u)), length));
+        const auto safeFlatAt = Select(state, u32, ok2, flatAt, constant(0u));
+        const auto slots = BdaLoadWord(state, binary(spv::OpIAdd, u32, safeFlatAt, constant(2u)));
+        const auto shifts = BdaLoadWord(state, binary(spv::OpIAdd, u32, safeFlatAt, constant(3u)));
+        const auto at = binary(spv::OpIAdd, u32, safeFlatAt, constant(4u));
+        const auto room = binary(spv::OpISub, u32, length, at);
+        const auto roots = BdaLoadWord(state, at);
+        const auto pageShift = binary(spv::OpBitwiseAnd, u32, shifts, constant(31u));
+        const auto chunkShift = binary(spv::OpBitwiseAnd, u32, binary(spv::OpShiftRightLogical, u32, shifts, constant(8u)), constant(63u));
+        auto ok3 = both(ok2, lessEqual(slots, binary(spv::OpShiftRightLogical, u32, room, constant(1u))));
+        ok3 = both(ok3, binary(spv::OpULessThan, boolean, roots, slots));
+        ok3 = both(ok3, both(lessEqual(pageShift, chunkShift), binary(spv::OpULessThan, boolean, binary(spv::OpISub, u32, chunkShift, pageShift), constant(24u))));
+        const auto store = [&](std::uint32_t type, std::uint32_t value) {
+            const auto variable = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, type), spv::StorageClassPrivate, type == u64 ? BdaConstant(state, 0u) : constant(0u));
+            state.module.AddFunction(spv::OpStore, variable, value);
+            return variable;
+        };
+        state.bdaFlat.enabled = true;
+        state.bdaFlat.base = store(u64, BdaLoadAddress(state, safeFlatAt));
+        state.bdaFlat.chunkShift = store(u64, Unary(state, spv::OpUConvert, u64, chunkShift));
+        state.bdaFlat.pageShift = store(u64, Unary(state, spv::OpUConvert, u64, pageShift));
+        state.bdaFlat.roots = store(u64, Unary(state, spv::OpUConvert, u64, Select(state, u32, ok3, roots, constant(0u))));
+        state.bdaFlat.slots = store(u32, Select(state, u32, ok3, slots, constant(0u)));
+        state.bdaFlat.at = store(u32, at);
+    }
+    if (guards) {
+        auto any = constant(0u);
+        for (std::size_t guard = 0; guard < resources.guardedSrtSlots.size(); ++guard) {
+            const auto pointer = state.module.AllocateId();
+            state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, state.flattenedSrtVariable, constant(0u), constant(resources.srtGuardOffset + static_cast<std::uint32_t>(guard)));
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, u32, value, pointer);
+            any = binary(spv::OpBitwiseOr, u32, any, value);
+        }
+        const auto variable = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u32), spv::StorageClassPrivate, constant(0u));
+        state.module.AddFunction(spv::OpStore, variable, any);
+        state.srtAnyPoisoned = variable;
+    }
+}
+
+namespace {
+
+std::uint32_t EmitV3tFlatSpanRead(SpirvEmitterState& state, const IrValue& inst, std::uint32_t address, std::uint32_t offset, std::uint32_t used, std::optional<std::uint32_t> knownUsed, const std::function<std::uint32_t()>& fallback) {
+    const auto u32 = TypeU32(state);
+    const auto u64 = TypeScalarU64(state);
+    const auto boolean = TypeBool(state);
+    const auto values = TypeU32Vector(state, 4);
+    const auto zero = ConstantU32(state, 0u);
+    const auto binary = [&](std::uint32_t op, std::uint32_t type, std::uint32_t left, std::uint32_t right) { return Binary(state, op, type, left, right); };
+    const auto both = [&](std::uint32_t left, std::uint32_t right) { return binary(spv::OpLogicalAnd, boolean, left, right); };
+    const auto first = EmitGlsl<GLSLstd450FindILsb, IrType::U32>(state, used);
+    const auto last = EmitGlsl<GLSLstd450FindUMsb, IrType::U32>(state, used);
+    const auto firstBytes = binary(spv::OpShiftLeftLogical, u32, first, ConstantU32(state, 2u));
+    const auto span = binary(spv::OpISub, u32, binary(spv::OpShiftLeftLogical, u32, binary(spv::OpIAdd, u32, last, ConstantU32(state, 1u)), ConstantU32(state, 2u)), firstBytes);
+    const auto signedOffset = binary(spv::OpIAdd, u32, offset, firstBytes);
+    const auto negative = binary(spv::OpSLessThan, boolean, signedOffset, zero);
+    const auto magnitude = Unary(state, spv::OpUConvert, u64, Select(state, u32, negative, binary(spv::OpISub, u32, zero, signedOffset), signedOffset));
+    const auto sum = binary(spv::OpIAdd, u64, address, magnitude);
+    const auto firstAddress = Select(state, u64, negative, binary(spv::OpISub, u64, address, magnitude), sum);
+    const auto overflow = Select(state, boolean, negative, binary(spv::OpUGreaterThan, boolean, magnitude, address), binary(spv::OpULessThan, boolean, sum, address));
+    const auto lastAddress = binary(spv::OpIAdd, u64, firstAddress, Unary(state, spv::OpUConvert, u64, binary(spv::OpISub, u32, span, ConstantU32(state, 1u))));
+    const auto& flat = state.bdaFlat;
+    const auto load = [&](std::uint32_t type, std::uint32_t variable) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, type, value, variable);
+        return value;
+    };
+    const auto base = load(u64, flat.base);
+    const auto chunkShift = load(u64, flat.chunkShift);
+    const auto pageShift = load(u64, flat.pageShift);
+    const auto roots = load(u64, flat.roots);
+    const auto slots = load(u32, flat.slots);
+    const auto at = load(u32, flat.at);
+    const auto relative = binary(spv::OpISub, u64, firstAddress, base);
+    const auto chunk = binary(spv::OpShiftRightLogical, u64, relative, chunkShift);
+    const auto page = binary(spv::OpShiftRightLogical, u64, relative, pageShift);
+    const auto lastPage = binary(spv::OpShiftRightLogical, u64, binary(spv::OpISub, u64, lastAddress, base), pageShift);
+    auto inside = both(Unary(state, spv::OpLogicalNot, boolean, overflow), binary(spv::OpUGreaterThanEqual, boolean, firstAddress, base));
+    inside = both(inside, binary(spv::OpUGreaterThanEqual, boolean, lastAddress, firstAddress));
+    inside = both(inside, both(binary(spv::OpIEqual, boolean, page, lastPage), binary(spv::OpULessThan, boolean, chunk, roots)));
+    const auto rootSlot = binary(spv::OpIAdd, u32, Unary(state, spv::OpUConvert, u32, chunk), ConstantU32(state, 1u));
+    const auto leaf = BdaLoadWord(state, Select(state, u32, inside, binary(spv::OpIAdd, u32, at, binary(spv::OpShiftLeftLogical, u32, rootSlot, ConstantU32(state, 1u))), zero));
+    const auto leafBits = Unary(state, spv::OpUConvert, u32, binary(spv::OpISub, u64, chunkShift, pageShift));
+    const auto leafMask = binary(spv::OpISub, u32, binary(spv::OpShiftLeftLogical, u32, ConstantU32(state, 1u), leafBits), ConstantU32(state, 1u));
+    const auto inLeaf = binary(spv::OpBitwiseAnd, u32, Unary(state, spv::OpUConvert, u32, page), leafMask);
+    const auto slot = binary(spv::OpIAdd, u32, binary(spv::OpIAdd, u32, ConstantU32(state, 1u), Unary(state, spv::OpUConvert, u32, roots)), binary(spv::OpIAdd, u32, binary(spv::OpShiftLeftLogical, u32, binary(spv::OpISub, u32, leaf, ConstantU32(state, 1u)), leafBits), inLeaf));
+    const auto slotOk = both(both(inside, binary(spv::OpINotEqual, boolean, leaf, zero)), binary(spv::OpULessThan, boolean, slot, slots));
+    const auto delta = BdaLoadAddress(state, Select(state, u32, slotOk, binary(spv::OpIAdd, u32, at, binary(spv::OpShiftLeftLogical, u32, slot, ConstantU32(state, 1u))), zero));
+    const auto physical = binary(spv::OpIAdd, u64, firstAddress, delta);
+    const auto hit = both(both(slotOk, binary(spv::OpINotEqual, boolean, delta, BdaConstant(state, 0u))), Unary(state, spv::OpLogicalNot, boolean, BdaAddressUnaligned(state, physical)));
+    const bool coherent = BdaCoherent(state, inst);
+    return EmitValueIfElse(state, hit, values, [&] {
+        if (V3t::FlatLevel() == 2u) return fallback();
+        std::array<std::uint32_t, 4> loaded{};
+        for (std::uint32_t dword = 0; dword < 4u; ++dword) {
+            const auto load = [&] {
+                const auto delta = Unary(state, spv::OpUConvert, u64, binary(spv::OpISub, u32, ConstantU32(state, dword * 4u), firstBytes));
+                const auto pointer = state.module.AllocateId();
+                state.module.AddFunction(spv::OpConvertUToPtr, TypePhysicalU32Pointer(state), pointer, binary(spv::OpIAdd, u64, physical, delta));
+                const auto value = state.module.AllocateId();
+                if (coherent) state.module.AddFunction(spv::OpAtomicLoad, u32, value, pointer, ConstantU32(state, spv::ScopeDevice), ConstantU32(state, 0u));
+                else state.module.AddFunction(spv::OpLoad, u32, value, pointer, BdaAccessMask(false), 4u);
+                return value;
+            };
+            if (knownUsed) {
+                loaded[dword] = (*knownUsed & (1u << dword)) != 0u ? load() : zero;
+            } else {
+                const auto isUsed = binary(spv::OpINotEqual, boolean, binary(spv::OpBitwiseAnd, u32, used, ConstantU32(state, 1u << dword)), zero);
+                loaded[dword] = EmitValueOrZeroIfCondition(state, isUsed, load);
+            }
+        }
+        const auto result = state.module.AllocateId();
+        state.module.AddFunction(spv::OpCompositeConstruct, values, result, loaded[0], loaded[1], loaded[2], loaded[3]);
+        return result;
+    }, fallback);
+}
+
+}
+
 // One probe of the span from the first to the last extracted dword replaces 4 lookups per dword (a
 // Bink DC pass spent ~450 dependent table levels per iteration on them). The span is loaded
 // dword-wise from the returned device address when it lies in one range and that address is
@@ -893,6 +1041,25 @@ std::array<std::uint32_t, 4> EmitBdaDwordReads(SpirvValueEmitContext& ctx, const
     }
     const auto function = state.bdaSpanReadFunctions[state.bdaStopsInvocations][BdaCoherent(state, inst)];
     if (function == 0) ctx.Fail(inst, "BDA span read function is missing");
+    if (state.bdaFlat.enabled) {
+        const auto read = EmitV3tFlatSpanRead(state, inst, address, ConstantU32(state, offset), ConstantU32(state, used), used, [&] {
+            const auto called = state.module.AllocateId();
+            state.module.AddFunction(spv::OpFunctionCall, BdaSpanReadResultType(state), called, function, address, ConstantU32(state, offset), ConstantU32(state, used), instruction);
+            if (!state.bdaStopsInvocations) return called;
+            const auto stopped = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), stopped, called, 1u);
+            StopBdaInvocationIf(state, Binary(state, spv::OpINotEqual, TypeBool(state), stopped, ConstantU32(state, 0u)));
+            const auto vector = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeU32Vector(state, 4), vector, called, 0u);
+            return vector;
+        });
+        for (std::uint32_t dword = first; dword <= last; ++dword) {
+            if (!isUsed(dword)) continue;
+            values[dword] = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), values[dword], read, dword);
+        }
+        return values;
+    }
     const auto read = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunctionCall, BdaSpanReadResultType(state), read, function, address, ConstantU32(state, offset), ConstantU32(state, used), instruction);
     if (state.bdaStopsInvocations) {
@@ -917,6 +1084,19 @@ std::uint32_t EmitBdaSpanRead(SpirvValueEmitContext& ctx, const IrValue& inst, s
     auto& state = ctx.state;
     const auto function = state.bdaSpanReadFunctions[state.bdaStopsInvocations][BdaCoherent(state, inst)];
     if (state.bdaProbeFunction == 0 || function == 0) ctx.Fail(inst, "BDA span read function is missing");
+    if (state.bdaFlat.enabled) {
+        return EmitV3tFlatSpanRead(state, inst, address, offset, used, std::nullopt, [&] {
+            const auto called = state.module.AllocateId();
+            state.module.AddFunction(spv::OpFunctionCall, BdaSpanReadResultType(state), called, function, address, offset, used, BdaInstructionPc(state, inst));
+            if (!state.bdaStopsInvocations) return called;
+            const auto stopped = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), stopped, called, 1u);
+            StopBdaInvocationIf(state, Binary(state, spv::OpINotEqual, TypeBool(state), stopped, ConstantU32(state, 0u)));
+            const auto vector = state.module.AllocateId();
+            state.module.AddFunction(spv::OpCompositeExtract, TypeU32Vector(state, 4), vector, called, 0u);
+            return vector;
+        });
+    }
     const auto read = state.module.AllocateId();
     state.module.AddFunction(spv::OpFunctionCall, BdaSpanReadResultType(state), read, function, address, offset, used, BdaInstructionPc(state, inst));
     if (!state.bdaStopsInvocations) return read;

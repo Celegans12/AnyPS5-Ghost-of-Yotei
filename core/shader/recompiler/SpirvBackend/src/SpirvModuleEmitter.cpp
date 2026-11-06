@@ -1813,6 +1813,7 @@ void EmitProgram(SpirvEmitterState& state) {
         if (written != 0u) state.module.AddFunction(spv::OpStore, written, ConstantU32(state, 0u));
     }
     EmitBdaAnchors(state);
+    EmitV3tPrologue(state);
     if (state.pointSizeVariable != 0u && state.inputInfo.vertex != nullptr && state.inputInfo.vertex->pointList) {
         const auto& vertex = *state.inputInfo.vertex;
         const bool fromVertex = (vertex.paClVsOutCntl & (1u << 16u)) != 0u;

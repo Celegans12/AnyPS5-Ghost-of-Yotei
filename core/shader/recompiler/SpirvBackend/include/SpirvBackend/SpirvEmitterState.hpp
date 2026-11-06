@@ -212,6 +212,17 @@ struct SpirvEmitterState {
     bool bdaStopsInvocations = true;
     std::uint32_t bdaRangeMemoEntries = 0;
     std::vector<std::array<std::uint32_t, 3>> bdaRangeMemo;
+    struct BdaFlat {
+        bool enabled = false;
+        std::uint32_t base = 0;
+        std::uint32_t chunkShift = 0;
+        std::uint32_t pageShift = 0;
+        std::uint32_t roots = 0;
+        std::uint32_t slots = 0;
+        std::uint32_t at = 0;
+    };
+    BdaFlat bdaFlat;
+    std::uint32_t srtAnyPoisoned = 0;
     bool continueTarget = false;
     // Execution scope of the barriers that keep one guest wave's LDS accesses in program order across
     // host invocations (see WaveLdsScope); 0 when none are emitted.

@@ -1,5 +1,6 @@
 #include "SpirvBackend/SpirvBda.hpp"
 #include "P0sCeiling.hpp"
+#include "V3tSwitches.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include <bit>
@@ -144,7 +145,7 @@ std::uint32_t DefineBdaLookup(SpirvEmitterState& state, const char* name, bool r
     // header and `buckets + 1` start words after them. Every index word read here and below stays
     // inside the table whatever it holds (the reads of a table that fails a check go to word 0).
     const auto reserved = BdaLoadWord(state, constant(3));
-    const bool flatTables = P0s::FlatBda();
+    const bool flatTables = P0s::FlatBda() || V3t::FlatInline();
     const auto flatTable = flatTables ? binary(spv::OpIEqual, boolean, reserved, constant(3u)) : 0u;
     const auto indexed = flatTables ? binary(spv::OpLogicalOr, boolean, binary(spv::OpIEqual, boolean, reserved, constant(BdaAbi::IndexedTable)), flatTable) : binary(spv::OpIEqual, boolean, reserved, constant(BdaAbi::IndexedTable));
     const auto countFits = binary(spv::OpULessThanEqual, boolean, count, binary(spv::OpShiftRightLogical, u32, available, constant(3)));

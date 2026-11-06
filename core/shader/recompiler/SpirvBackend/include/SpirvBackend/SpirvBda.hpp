@@ -50,6 +50,7 @@ std::vector<const IrValue*> BdaReadSites(const SpirvEmitterState& state);
 void CollectBdaAnchors(SpirvEmitterState& state);
 void DefineBdaAnchorFunction(SpirvEmitterState& state);
 void EmitBdaAnchors(SpirvEmitterState& state);
+void EmitV3tPrologue(SpirvEmitterState& state);
 void EmitBdaAnchorRange(SpirvEmitterState& state, SpirvEmitterState::BdaAnchor& anchor, std::uint32_t base);
 const SpirvEmitterState::BdaAnchor* FindBdaAnchor(const SpirvEmitterState& state, const IrValue& inst);
 std::array<std::uint32_t, 4> EmitAnchoredBdaRead(SpirvEmitterState& state, const IrValue& inst, const SpirvEmitterState::BdaAnchor& anchor, std::uint32_t low, std::int32_t immediate, std::uint32_t bits, std::uint32_t dwords, std::uint32_t usedDwords, const std::function<std::array<std::uint32_t, 4>()>& lookup);

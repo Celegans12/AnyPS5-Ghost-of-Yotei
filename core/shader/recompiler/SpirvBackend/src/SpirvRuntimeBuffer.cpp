@@ -1,3 +1,4 @@
+#include "V3tSwitches.hpp"
 #include "SpirvBackend/SpirvRuntimeBuffer.hpp"
 #include "P0sCeiling.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
@@ -323,7 +324,8 @@ MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue&
     const auto& memory = context.Memory(instruction);
     // A single-workgroup dispatch reads glc buffers through the plain, L1-cached binding (workgroup-scope
     // coherence, see ShaderComputeStageInfo::singleWorkgroup); its stores and atomics keep the coherent one.
-    const bool plain = plainLoad || (state.singleWorkgroup && BufferAccessOf(instruction.Opcode()) == BufferAccess::Read);
+    const bool v3tPlain = V3t::PlainCoherentReads() >= 2u && BufferAccessOf(instruction.Opcode()) == BufferAccess::Read;
+    const bool plain = plainLoad || v3tPlain || (state.singleWorkgroup && BufferAccessOf(instruction.Opcode()) == BufferAccess::Read);
     const auto variable = wide ? state.storageBufferU64Variable : plain || state.storageBufferCoherentVariable == 0u ? state.storageBufferVariable : state.storageBufferCoherentVariable;
     if (variable == 0u) context.Fail(instruction, "direct buffer descriptor array is missing");
     const auto element = ResourceForDescriptor(state, DescriptorBindingKind::Buffers, memory.resource);
@@ -332,7 +334,7 @@ MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue&
     access.objectPointer = state.module.AllocateId();
     state.module.AddFunction(spv::OpAccessChain, wide ? TypeStorageBufferU64Pointer(state) : TypeStorageBufferPointer(state), access.objectPointer, variable, ConstantU32(state, element));
     access.byteOffset = state.memoryByteOffsets.at(element);
-    access.memoryAccess = memory.coherent ? spv::MemoryAccessVolatileMask : 0u;
+    access.memoryAccess = memory.coherent && !v3tPlain ? spv::MemoryAccessVolatileMask : 0u;
     {
         const auto* descriptor = instruction.Argument(0u)->Resolve();
         std::array<const IrValue*, 4> key{};
