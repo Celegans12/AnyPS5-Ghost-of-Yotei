@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VkCallProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/RecordWorker.hpp"
+#include "prx/libSceAgcDriver/Execution/include/C3Log.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
@@ -51,6 +52,7 @@ void Close(const char* label) {
     MemoryStats::ReportNow(label);
     VkCallProfile::Close(label);
     RecordWorker::Close(label);
+    C3Log::Close(label);
     ProfileOutput_nid_no_patch().Flush();
 }
 

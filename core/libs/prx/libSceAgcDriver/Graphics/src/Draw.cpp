@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/C3Log.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -2292,6 +2293,16 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
     // caches. Push constants still come from this draw's stages. APS5_NO_DRAW_RESOURCE_CACHE=1
     // builds every draw's resources as before.
     static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
+    const bool c3Log = C3Log::Enabled();
+    if (c3Log) C3Log::MaybeReport();
+    std::vector<C3Log::Region> c3Copy;
+    const auto c3Regions = [&]() -> std::span<const C3Log::Region> {
+        if (c3Copy.empty() && !snapshots.empty()) {
+            c3Copy.reserve(snapshots.size());
+            for (const auto& snapshot : snapshots) c3Copy.emplace_back(snapshot.address, snapshot.bytes);
+        }
+        return c3Copy;
+    };
     static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     // The render target and index ranges stay out of the key (see DrawResourceKey); a hit repeats
     // the alias checks instead. Debug aid: APS5_NO_DRAW_KEY_TRIM=1 keys them as before.
@@ -2314,13 +2325,41 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         auto cached = SharedResourceCache().Find(resolved.contentKey);
         const bool inUse = cached != nullptr && cached->InUse() && !cached->SharesUses();
         if (inUse) CountAddressReuse(AddressReuse::InUse);
+        if (c3Log && cached == nullptr) C3Log::NoteSkipped(C3Log::Skip::NoEntry);
+        if (c3Log && inUse) C3Log::NoteSkipped(C3Log::Skip::InUse);
         if (cached != nullptr && !inUse) {
             const bool addressBased = cached->ReusesAddressSpace();
             const auto proofStart = addressBased && timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-            const bool valid = cached->Revalidate(shaders, nullptr, snapshots);
+            bool c3Same = false, c3Logged = false;
+            std::uint64_t c3Bytes = 0, c3CompareNs = 0;
+            if (c3Log) c3Same = C3Log::Same(resolved.contentKey, c3Regions(), c3Bytes, c3Logged, c3CompareNs);
+            const auto c3ProofStart = c3Log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            ShaderResources::ProofReport c3Report;
+            const bool valid = cached->Revalidate(shaders, c3Log ? &c3Report : nullptr, snapshots);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            if (c3Log) {
+                const auto proofNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - c3ProofStart).count());
+                if (!c3Logged) {
+                    C3Log::NoteSkipped(C3Log::Skip::NoLog);
+                } else {
+                    auto proof = C3Log::Proof::Other;
+                    if (moved.has_value()) proof = C3Log::Proof::Served;
+                    else if (valid) proof = C3Log::Proof::ValidMoved;
+                    else {
+                        switch (c3Report.failure) {
+                            case ShaderResources::ProofFailure::Imports: proof = C3Log::Proof::Imports; break;
+                            case ShaderResources::ProofFailure::Evicted: proof = C3Log::Proof::Evicted; break;
+                            case ShaderResources::ProofFailure::Pending: proof = C3Log::Proof::Pending; break;
+                            case ShaderResources::ProofFailure::Changed: proof = C3Log::Proof::Changed; break;
+                            case ShaderResources::ProofFailure::Keys: proof = C3Log::Proof::Keys; break;
+                            default: proof = C3Log::Proof::Other; break;
+                        }
+                    }
+                    C3Log::NoteCompared(c3Same, proof, proofNs, c3CompareNs, c3Bytes, snapshots.size());
+                }
+            }
             if (moved.has_value()) {
                 resolved.resources = std::move(cached);
                 resolved.use.resources = resolved.resources;
@@ -2340,6 +2379,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         }
     } else {
         countCache(&DrawProfile::uncacheable);
+        if (c3Log) C3Log::NoteSkipped(C3Log::Skip::Uncacheable);
     }
     if (ResourceKeyDiffEnabled() && recordable) NoteResourceKeyDiff(context, state, draw, shaders, indexBytes, trimKey, resolved.cacheable, resolved.resources != nullptr, resolved.contentKey);
     timer.phase(PhaseLookup);
@@ -2365,6 +2405,7 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         }
         resolved.use.resources = resolved.resources;
         resolved.built = &resolved.resources->Timing();
+        if (c3Log && resolved.cacheable) C3Log::Record(resolved.contentKey, c3Regions());
         outcome.addressBased = resolved.resources->HoldsLease();
         outcome.kind = outcome.addressBased ? KindBda : KindBuild;
         if (resolved.cacheable) countCache(&DrawProfile::cacheMisses);

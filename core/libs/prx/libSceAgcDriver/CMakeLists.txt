@@ -371,6 +371,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ProfileWindows.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/VkCallProfile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/RecordWorker.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/C3Log.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/CommandMix.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
