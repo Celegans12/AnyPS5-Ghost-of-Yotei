@@ -847,13 +847,22 @@ bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 }
 
 #ifdef _WIN32
+static bool importOpensTracker() {
+    static const bool off = std::getenv("APS5_V3M_NO_IMPORT_OPEN") != nullptr;
+    return !off;
+}
+
 bool GuestArenaBeginHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
+    if (importOpensTracker()) GuestDirtyBeginHostImport_nid_postfix(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     const HostChange change;
     openAccessGuardsForHost(reinterpret_cast<std::uintptr_t>(pointer), bytes);
-    return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
+    const bool opened = WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
+    if (!opened && importOpensTracker()) GuestDirtyEndProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    return opened;
 }
 
 void GuestArenaEndHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
+    if (importOpensTracker()) GuestDirtyEndProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     WindowsMappings::Get().EndHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, false);
 }
 #endif

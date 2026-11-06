@@ -18,6 +18,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libc/include/GuestDirty.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -2001,6 +2002,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         if (!pageReadOnly) readOnly = false;
         if (info.Type != MEM_MAPPED && !pageWritable && !pageReadOnly && refused.BaseAddress == nullptr) refused = info;
         if (!pageWritable) writable = false;
+        if (!pageWritable && GuestArena::GuestDirtyArmed_nid_postfix(static_cast<std::uintptr_t>(cursor))) GuestArena::GuestDirtyNoteImportArmed_nid_postfix(static_cast<std::uintptr_t>(cursor));
         cursor = reinterpret_cast<std::uint64_t>(info.BaseAddress) + info.RegionSize;
     }
     if (!writable && readOnly) return failedImport();

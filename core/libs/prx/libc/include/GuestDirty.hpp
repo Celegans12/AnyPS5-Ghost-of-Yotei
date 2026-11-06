@@ -21,7 +21,12 @@ struct GuestDirtyCounts {
     std::uint64_t viewArms = 0;
     std::uint64_t cleanQueries = 0;
     std::uint64_t cleanAnswers = 0;
+    std::uint64_t refusedBy[8] = {};
+    std::uint64_t importArmedPages = 0;
+    std::uint64_t importMarks = 0;
 };
+
+enum GuestDirtyRefusal : unsigned { RefusedEpoch, RefusedInFlight, RefusedGuards, RefusedBlock, RefusedUncommitted, RefusedPrivateNotWritable, RefusedOtherMemory, RefusedView };
 
 struct GuestDirtyQuery {
     std::uintptr_t address;
@@ -43,6 +48,8 @@ void GuestDirtyMappingChange_nid_postfix(std::uintptr_t address, std::size_t byt
 void GuestDirtyBeginProtection_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestDirtyBeginHostWrite_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestDirtyEndProtection_nid_postfix(std::uintptr_t address, std::size_t bytes);
+void GuestDirtyBeginHostImport_nid_postfix(std::uintptr_t address, std::size_t bytes);
+void GuestDirtyNoteImportArmed_nid_postfix(std::uintptr_t address);
 void GuestDirtyTakeCounts_nid_postfix(GuestDirtyCounts* counts);
 void GuestDirtyForceEnable_nid_no_patch(bool enabled);
 void GuestDirtyRunLocked_nid_no_patch(std::uintptr_t address, void (*body)(void*), void* argument);

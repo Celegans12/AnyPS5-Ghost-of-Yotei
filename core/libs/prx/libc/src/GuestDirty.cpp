@@ -45,7 +45,8 @@ std::atomic<std::uint64_t> mappingEpoch{1};
 std::atomic<int> forced{-1};
 
 struct Counters {
-    std::atomic<std::uint64_t> arms{0}, armedPages{0}, protectCalls{0}, armNs{0}, refused{0}, faults{0}, faultNs{0}, marks{0}, markedBlocks{0}, bumps{0}, viewLosses{0}, viewArms{0}, cleanQueries{0}, cleanAnswers{0};
+    std::atomic<std::uint64_t> arms{0}, armedPages{0}, protectCalls{0}, armNs{0}, refused{0}, faults{0}, faultNs{0}, marks{0}, markedBlocks{0}, bumps{0}, viewLosses{0}, viewArms{0}, cleanQueries{0}, cleanAnswers{0}, importArmedPages{0}, importMarks{0};
+    std::atomic<std::uint64_t> refusedBy[8]{};
 };
 Counters counters;
 
@@ -149,18 +150,18 @@ void viewLost(std::uintptr_t address, std::size_t bytes) {
     }
 }
 
-bool classify(std::uintptr_t begin, std::uintptr_t end, std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& privatePieces, std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& viewPieces) {
+unsigned classify(std::uintptr_t begin, std::uintptr_t end, std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& privatePieces, std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& viewPieces) {
     for (auto cursor = begin; cursor < end;) {
         MEMORY_BASIC_INFORMATION memory{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return false;
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return GuestArena::RefusedUncommitted + 1;
         const auto stop = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
-        if (memory.State != MEM_COMMIT) return false;
+        if (memory.State != MEM_COMMIT) return GuestArena::RefusedUncommitted + 1;
         if (memory.Type == MEM_PRIVATE && memory.Protect == PAGE_READWRITE) privatePieces.emplace_back(cursor, stop);
         else if (memory.Type == MEM_MAPPED && (memory.Protect == PAGE_READWRITE || memory.Protect == PAGE_READONLY || memory.Protect == PAGE_EXECUTE_READWRITE || memory.Protect == PAGE_EXECUTE_READ)) viewPieces.emplace_back(cursor, stop);
-        else return false;
+        else return (memory.Type == MEM_PRIVATE ? GuestArena::RefusedPrivateNotWritable : GuestArena::RefusedOtherMemory) + 1;
         cursor = stop;
     }
-    return true;
+    return 0;
 }
 
 
@@ -200,6 +201,7 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
         const auto* block = findBlock(blockBase);
         if (block != nullptr && block->refusedEpoch.load(std::memory_order_acquire) == epoch) {
             counters.refused.fetch_add(1, std::memory_order_relaxed);
+            counters.refusedBy[GuestArena::RefusedEpoch].fetch_add(1, std::memory_order_relaxed);
             counters.armNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
             return 0;
         }
@@ -215,12 +217,13 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
         return token;
     }
     std::lock_guard lock(armMutex);
-    const auto refuse = [&] {
+    const auto refuse = [&](unsigned reason) {
         counters.refused.fetch_add(1, std::memory_order_relaxed);
+        counters.refusedBy[reason & 7u].fetch_add(1, std::memory_order_relaxed);
         counters.armNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
         return std::uint64_t{0};
     };
-    if (overlapsFlight(begin, end)) return refuse();
+    if (overlapsFlight(begin, end)) return refuse(GuestArena::RefusedInFlight);
     struct Held {
         Block* block;
         std::uintptr_t base;
@@ -234,7 +237,7 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
         for (auto& entry : held) unlockBlock(*entry.block);
         held.clear();
     };
-    if (WindowsMappings::Get().AccessGuardsUsed()) return refuse();
+    if (WindowsMappings::Get().AccessGuardsUsed()) return refuse(GuestArena::RefusedGuards);
     for (auto blockBase = begin & ~(BlockBytes - 1); blockBase < end; blockBase += BlockBytes) {
         const auto want = pageMask(blockBase, begin, end);
         auto* existing = findBlock(blockBase);
@@ -242,7 +245,7 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
         auto* block = makeBlock(blockBase);
         if (block == nullptr) {
             release();
-            return refuse();
+            return refuse(GuestArena::RefusedBlock);
         }
         lockBlock(*block);
         const auto add = want & ~tracked(*block);
@@ -267,20 +270,20 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
     thread_local std::vector<std::pair<std::uintptr_t, std::uintptr_t>> viewPieces;
     privatePieces.clear();
     viewPieces.clear();
-    const auto refuseRange = [&](std::uintptr_t from, std::uintptr_t to) {
+    const auto refuseRange = [&](std::uintptr_t from, std::uintptr_t to, unsigned reason) {
         for (auto& entry : held) {
             if (entry.base + BlockBytes > from && entry.base < to) entry.block->refusedEpoch.store(epoch, std::memory_order_release);
         }
         release();
-        return refuse();
+        return refuse(reason);
     };
     for (const auto& [from, to] : runs) {
-        if (!classify(from, to, privatePieces, viewPieces)) return refuseRange(from, to);
+        if (const auto reason = classify(from, to, privatePieces, viewPieces); reason != 0) return refuseRange(from, to, reason - 1);
     }
     if (!viewPieces.empty()) {
         WindowsMappings::trackLostHook.store(&viewLost, std::memory_order_release);
         for (const auto& [from, to] : viewPieces) {
-            if (!WindowsMappings::Get().ArmTracked(from, to - from)) return refuseRange(from, to);
+            if (!WindowsMappings::Get().ArmTracked(from, to - from)) return refuseRange(from, to, GuestArena::RefusedView);
         }
     }
     std::uint64_t pages = 0;
@@ -442,6 +445,16 @@ void GuestDirtyEndProtection_nid_postfix(std::uintptr_t address, std::size_t byt
     if (found != inFlight.end()) inFlight.erase(found);
 }
 
+void GuestDirtyBeginHostImport_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    if (!enabled() || bytes == 0) return;
+    counters.importMarks.fetch_add(1, std::memory_order_relaxed);
+    GuestDirtyBeginHostWrite_nid_postfix(address, bytes);
+}
+
+void GuestDirtyNoteImportArmed_nid_postfix(std::uintptr_t) {
+    counters.importArmedPages.fetch_add(1, std::memory_order_relaxed);
+}
+
 void GuestDirtyRunLocked_nid_no_patch(std::uintptr_t address, void (*body)(void*), void* argument) {
     auto* block = makeBlock(address & ~(BlockBytes - 1));
     if (block == nullptr) return;
@@ -467,6 +480,9 @@ void GuestDirtyTakeCounts_nid_postfix(GuestDirtyCounts* out) {
     out->viewArms = take(counters.viewArms);
     out->cleanQueries = take(counters.cleanQueries);
     out->cleanAnswers = take(counters.cleanAnswers);
+    out->importArmedPages = take(counters.importArmedPages);
+    out->importMarks = take(counters.importMarks);
+    for (std::size_t i = 0; i < 8; ++i) out->refusedBy[i] = take(counters.refusedBy[i]);
 }
 
 }

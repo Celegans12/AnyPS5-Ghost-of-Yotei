@@ -253,6 +253,19 @@ void HostWriteOpensArmedPages() {
     Require(!GuestArena::GuestDirtyCleanSince_nid_postfix(memory.At(0), Block, token), "a host write left the block clean");
 }
 
+void HostImportOpensArmedPages() {
+    Memory memory;
+    const auto token = GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), Block);
+    Require(token != 0 && Protection(memory.At(Page)) == PAGE_READONLY, "the block was not armed");
+    {
+        const GuestArena::HostImportAccess open(memory.bytes, Block);
+        Require(Protection(memory.At(0)) == PAGE_READWRITE && Protection(memory.At(Block - Page)) == PAGE_READWRITE, "an armed page stayed read-only under a host import's check");
+        Require(GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), Block) == 0, "a block was armed while a host import was open");
+    }
+    Require(!GuestArena::GuestDirtyCleanSince_nid_postfix(memory.At(0), Block, token), "a host import left the block clean");
+    Require(GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), Block) != 0, "the block was not armable after the import closed");
+}
+
 }
 
 void ArmCost() {
@@ -294,6 +307,7 @@ int main() {
         {"GPU bump keeps protection", GpuBumpKeepsProtection},
         {"alias write dirties the other view", AliasWriteDirtiesOtherView},
         {"host write opens armed pages", HostWriteOpensArmedPages},
+        {"host import opens armed pages", HostImportOpensArmedPages},
         {"arm cost", ArmCost},
     };
     int failed = 0;
