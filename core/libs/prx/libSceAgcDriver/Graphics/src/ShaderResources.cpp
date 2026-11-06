@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/C3Log.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -154,6 +155,7 @@ struct CachedTexture {
     std::array<std::uint64_t, 2> blockGuard{};
     GuestMemory::Commitment blockLayout;
     OwnedProof owned;
+    std::uint64_t dirtyToken = 0;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -1856,7 +1858,25 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 storeSlices(*keys != DccKeys::Uncompressed ? "keys not uncompressed" : "cached snapshot stamped");
             }
             // A slice copy the texture cannot take stores the slices instead: the snapshot is stale then.
-            if ((sliceHit || (*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted()) && (!sliceCopy || takeSlices(*it->texture))) {
+            ImageFlags::MaybeReport();
+            const auto proofHolds = [&] { return sliceHit || (*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted(); };
+            bool holds = false;
+            if (ImageFlags::Enabled()) {
+                const bool eligible = !sliceCopy && *keys == DccKeys::Uncompressed && !committed.has_value() && !it->committed.has_value() && !Recorder::SnapshotWriteOverlaps(address, bytes);
+                const auto verdict = !eligible || it->dirtyToken == 0 ? ImageFlags::Verdict::NotArmed : ImageFlags::CleanSince(address, bytes, it->dirtyToken) ? ImageFlags::Verdict::Clean : ImageFlags::Verdict::Dirty;
+                if (verdict == ImageFlags::Verdict::Clean && !ImageFlags::Verify()) {
+                    holds = true;
+                    ImageFlags::Count(verdict, false, true);
+                } else {
+                    if (verdict != ImageFlags::Verdict::Clean) it->dirtyToken = eligible ? ImageFlags::Arm(address, bytes) : 0;
+                    holds = proofHolds();
+                    if (verdict == ImageFlags::Verdict::Clean && !holds) ImageFlags::ThrowDisagreement(address, bytes);
+                    ImageFlags::Count(verdict, true, holds);
+                }
+            } else {
+                holds = proofHolds();
+            }
+            if (holds && (!sliceCopy || takeSlices(*it->texture))) {
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 it->untracked = untracked;
@@ -1996,6 +2016,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             static std::atomic<std::uint64_t> clearReuses{0};
             clearReuses.fetch_add(1, std::memory_order_relaxed);
         } else {
+        if (ImageFlags::Enabled() && !pending && *keys == DccKeys::Uncompressed && !entry.committed.has_value()) entry.dirtyToken = ImageFlags::Arm(address, bytes);
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
         if (!pending) entry.untracked = untracked;
