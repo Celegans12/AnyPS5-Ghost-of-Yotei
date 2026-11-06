@@ -230,6 +230,13 @@ public:
     static std::vector<std::pair<std::string, std::uint64_t>> RunCloseSites(std::size_t limit, std::uint32_t ring = ~0u);
     // APS5_PROFILE_DRAW: unordered dispatches by guest queue: overlapped, and not (no open run, other).
     static std::string OverlapByRing();
+    // APS5_PROFILE_DRAW: the [barrier-census] tally. CensusDispatch is called by every dispatch of an
+    // overlap ring right after its OverlapCommands/Commands (notCapable: why it cannot defer, or null).
+    void CensusDispatch(std::uint32_t queueKey, const char* notCapable, bool unordered, bool overlapped);
+    static std::string BarrierCensusReport();
+    // APS5_PROFILE_DRAW with APS5_PROFILE_GPU off: the batch-stamp GPU spans read since the last call,
+    // as one [batch-busy] line (sum and union over both lanes).
+    static std::string BatchBusyReport(const char* window);
     // Staged dispatches in runs (APS5_NO_STAGED_OVERLAP=1 off; an APS5_AB switch): a dispatch with
     // buffers copied out of their imports joins and opens runs like any other.
     static bool StagedOverlapEnabled();
@@ -499,6 +506,29 @@ public:
     static bool CheckpointsOn();
     static void Checkpoint(VkCommandBuffer commands, CheckpointKind kind, std::uint64_t value);
     static std::optional<WriteOrigin> OriginOfNote(std::uint64_t note);
+    // v3 mem Phase A (APS5_V3M_HOMES): a staged region's copy-back deferred to a settle point. `record`
+    // records it (no barriers) into the given command buffer; `home` names the shadow it reads.
+    // Settled at the batch's Submit, before any command recorded outside a HomeScope, and before a
+    // store over its ranges; SettleHomes settles the entries over [begin, end) (end 0: all) except
+    // those of `except`.
+    struct HomeSettle {
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+        const void* home = nullptr;
+        std::function<void(VkCommandBuffer)> record;
+    };
+    void DeferHomeSettle(HomeSettle settle);
+    bool HomeSettlePendingFor(const void* home) const;
+    bool HomeSettleCovers(const void* home, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const;
+    bool HomeSettlePendingOver(std::uint64_t begin, std::uint64_t end, const void* except = nullptr) const;
+    void SettleHomes(std::uint64_t begin = 0, std::uint64_t end = 0, const void* except = nullptr);
+    static bool HomesEnabled();
+    static bool HomesCeiling();
+    struct HomeScope {
+        HomeScope();
+        ~HomeScope();
+        HomeScope(const HomeScope&) = delete;
+        HomeScope& operator=(const HomeScope&) = delete;
+    };
     // Ends and submits the open batch without waiting.
     void Submit();
     void HoldNextSubmit(VkSemaphore semaphore, std::uint64_t value);
@@ -976,6 +1006,8 @@ private:
         std::vector<const void*> deferredRun;
         // See AfterRun.
         std::vector<std::function<void(Recorder&)>> afterRun;
+        std::vector<HomeSettle> homeSettles;
+        std::int64_t openedNs = 0;
         // See NoteRunAccess: {begin, end, flags, program} of the open run's dispatches, and the copied
         // regions with atomics among them (RunAtomicConflict).
         std::vector<std::array<std::uint64_t, 4>> runAccess;
@@ -1140,6 +1172,7 @@ private:
     // Per-batch runs: records the queued stores with their barriers (`atSubmit`: the batch-end
     // form, toward the host only); returns whether the batch's host-read barrier was included.
     bool closeStoreRun(bool atSubmit = false);
+    void settleHomesNow(std::uint64_t begin, std::uint64_t end, const void* except);
     // Ends the render pass a draw left open (vkCmdEndRenderPass, the pass's trailing barrier).
     void endOpenRenderPass(bool barrier = true);
     // Records the queued key stores as one run (`forWriter`: before a command writing, reading or

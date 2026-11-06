@@ -1,4 +1,5 @@
 #ifdef _WIN32
+#include "prx/libc/include/GuestDirty.hpp"
 #include <windows.h>
 #include <tlhelp32.h>
 #include "prx/libc/include/CallTrace.hpp"
@@ -403,6 +404,7 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
 
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     const auto* fault = info->ExceptionRecord;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestDirtyHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;

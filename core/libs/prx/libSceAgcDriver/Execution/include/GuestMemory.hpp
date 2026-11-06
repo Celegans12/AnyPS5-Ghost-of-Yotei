@@ -154,6 +154,19 @@ OwnedBlockCounts TakeOwnedBlockCounts();
 // resources sharing pages see each other's writes. GPU writes into host-imported memory bypass the
 // page tables and are reported with MarkWritten. Without write watching CollectWrites returns 0 and
 // UnchangedSince is always false, so callers fall back to comparing bytes.
+bool DirtyEnabled();
+std::uint64_t DirtyArm(std::uint64_t address, std::size_t bytes);
+bool DirtyCleanSince(std::uint64_t address, std::size_t bytes, std::uint64_t token);
+struct DirtyQuery {
+    std::uint64_t address;
+    std::size_t bytes;
+    std::uint64_t token;
+};
+bool DirtyCleanSinceAll(std::span<const DirtyQuery> queries);
+void DirtyMark(std::uint64_t address, std::size_t bytes);
+bool DirtyVerifyEnabled();
+void DirtyVerifyUse(std::uint64_t address, std::size_t bytes);
+void ReportDirty(const char* window);
 bool WriteWatched();
 // P0-cpu (C0) ceiling ablations, diagnostic only, default off, read once, never in measured game runs
 // (inexact by design; replay only). APS5_P0C_NO_PROOFS=1: CollectWrites returns the current

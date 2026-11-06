@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -1439,6 +1440,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         Require(native != nullptr, "compressed FMASK sampling without a matching resident native target is not implemented");
         return native;
     }
+    if (guestBytes != 0) FaultCensus::Arm(FaultCensus::Kind::Texture, resource.baseAddress, guestBytes);
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
     RequireNoMultisampleTarget(resource.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a texture read");
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
@@ -7848,6 +7850,11 @@ void ShaderResources::WriteBack() {
 }
 
 void ShaderResources::NoteResidentCensus() const {
+    if (FaultCensus::Enabled()) {
+        for (const auto& storage : storageTextures) {
+            if (storage != nullptr) FaultCensus::Arm(FaultCensus::Kind::Storage, storage->Descriptor().baseAddress, storage->GuestBytes());
+        }
+    }
     if (!ResidentCensus::Enabled()) return;
     guestMemory.NoteResidentCensus();
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
@@ -7882,7 +7889,10 @@ void ShaderResources::MarkGpuWritesInRun(Recorder& recorder, const std::shared_p
     }
     // A storage store-back above may have recorded a command, which closed the run: then as MarkGpuWrites.
     if (!recorder.RunOpen()) guestMemory.RecordCopyBacks(recorder);
-    recorder.NotePendingWrites(guestMemory.Writes());
+    {
+        const HomeCensus::NoteScope homeNotes(HomeCensus::Enabled() ? guestMemory.StagedWrites() : std::vector<std::pair<std::uint64_t, std::uint64_t>>{});
+        recorder.NotePendingWrites(guestMemory.Writes());
+    }
     guestMemory.MarkDirectWrites();
     if (!recorder.RunOpen()) return;
     recorder.AfterRun([self](Recorder& after) {
@@ -7915,7 +7925,10 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     guestMemory.RecordCopyBacks(recorder);
     // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
     // nor marked as a direct write, so CPU reads of its memory never wait for this work.
-    recorder.NotePendingWrites(guestMemory.Writes());
+    {
+        const HomeCensus::NoteScope homeNotes(HomeCensus::Enabled() ? guestMemory.StagedWrites() : std::vector<std::pair<std::uint64_t, std::uint64_t>>{});
+        recorder.NotePendingWrites(guestMemory.Writes());
+    }
     guestMemory.MarkDirectWrites();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();

@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
@@ -45,6 +46,10 @@
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
 namespace AgcDriver::Graphics {
+
+namespace {
+bool homeScopeActive();
+}
 
 namespace {
 
@@ -1853,6 +1858,21 @@ std::uint64_t runJoinsChecked = 0, runJoinsConflicting = 0;
 std::map<std::tuple<std::uint64_t, std::uint64_t, int>, std::uint64_t> runConflictPairs;
 std::array<std::uint64_t, 3> owedCopyBacks{};
 std::atomic<std::uint64_t> atomicGuardRefusals{0}, owedRunsClosed{0}, stagedReadRefusals{0}, rangeRefusals{0}, rangeConflictsUnchecked{0}, runDeferredCount{0}, runJoinedCount{0};
+// [barrier-census] (APS5_PROFILE_DRAW): per guest compute ring, why each overlap-ring dispatch did or
+// did not join an open run. censusClose: the ring's last run close since its last dispatch (site,
+// path, the closing thread against the run's opener, a copy-in refusal); censusJoin: why the last
+// OverlapCommands refused a join; censusGuard: which guard refused (1 atomic, 2 staged read, 3 range).
+struct CensusClose { std::string label; };
+std::map<std::uint32_t, CensusClose> censusClose;
+std::map<std::uint32_t, std::uint32_t> censusOpener;
+std::map<std::pair<std::uint32_t, std::string>, std::uint64_t> censusBuckets;
+thread_local const char* censusRefusal = nullptr;
+thread_local const char* censusJoin = nullptr;
+thread_local int censusGuard = 0;
+thread_local std::string censusPrior;
+const char* GuardName(int guard) {
+    return guard == 1 ? "atomic guard" : guard == 2 ? "staged-read guard" : guard == 3 ? "range check" : "?";
+}
 bool DrawOrGpuProfiled();
 constexpr bool CopiedAtomic(std::uint64_t flags) {
     return (flags & (Recorder::RunAccessCopied | Recorder::RunAccessAtomic)) == (Recorder::RunAccessCopied | Recorder::RunAccessAtomic);
@@ -1909,6 +1929,7 @@ bool Recorder::RunAtomicConflict(std::span<const std::array<std::uint64_t, 3>> a
     }
     if (conflict) {
         atomicGuardRefusals.fetch_add(1, std::memory_order_relaxed);
+        censusGuard = 1;
         return true;
     }
     if (RuntimeSwitches::Set(RuntimeSwitch::NoRunStagedReadGuard)) return false;
@@ -1919,6 +1940,7 @@ bool Recorder::RunAtomicConflict(std::span<const std::array<std::uint64_t, 3>> a
             if ((member[2] & RunAccessWritten) == 0 || ((access[2] | member[2]) & RunAccessCopied) == 0) continue;
             if (!overlaps(access[0], access[1], member[0], member[1])) continue;
             stagedReadRefusals.fetch_add(1, std::memory_order_relaxed);
+            censusGuard = 2;
             return true;
         }
     }
@@ -1944,6 +1966,7 @@ bool Recorder::RunRangeConflict(std::span<const std::array<std::uint64_t, 3>> ac
         return false;
     }
     rangeRefusals.fetch_add(1, std::memory_order_relaxed);
+    censusGuard = 3;
     return true;
 }
 
@@ -2190,8 +2213,15 @@ void Recorder::flushDeferredDispatch(std::size_t site, const std::source_locatio
     if (DrawOrGpuProfiled()) {
         std::string_view file = where.file_name();
         if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) file.remove_prefix(slash + 1);
+        static constexpr std::array<const char*, DeferredFlushSites> paths{"commands", "draw pass", "key stores", "label store", "store run", "samples", "submit"};
         std::lock_guard lock(runCloseMutex);
-        ++runCloses[{std::string(file) + ":" + std::to_string(where.line()), site, open->deferredDispatchQueue, GuestMemory::GpuLockThreadTag()}];
+        const auto thread = GuestMemory::GpuLockThreadTag();
+        ++runCloses[{std::string(file) + ":" + std::to_string(where.line()), site, open->deferredDispatchQueue, thread}];
+        const auto opener = censusOpener.find(open->deferredDispatchQueue);
+        std::string label = std::string(file) + ":" + std::to_string(where.line()) + " " + (site < paths.size() ? paths[site] : "?");
+        label += opener != censusOpener.end() && opener->second != thread ? " (other thread)" : " (same thread)";
+        if (censusRefusal != nullptr) label += std::string(" / ") + censusRefusal;
+        censusClose[open->deferredDispatchQueue] = {std::move(label)};
     }
     open->deferredDispatchQueue = 0;
     open->deferredRun.clear();
@@ -2231,8 +2261,16 @@ void Recorder::flushDeferredDispatch(std::size_t site, const std::source_locatio
 }
 
 VkCommandBuffer Recorder::RunCommands(std::uint32_t queueKey, const void* owner, bool& inRun, VkAccessFlags* coveredAccess, std::span<const std::array<std::uint64_t, 3>> accesses) {
+    censusGuard = 0;
     inRun = queueKey != 0 && open != nullptr && open->edgeOwed == 0 && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) == open->deferredRun.end() && !RunAtomicConflict(accesses) && !RunRangeConflict(accesses);
-    if (!inRun) return Commands(coveredAccess);
+    if (!inRun) {
+        if (DrawOrGpuProfiled() && open != nullptr && open->deferredDispatchQueue != 0) {
+            censusRefusal = queueKey == 0 ? "copy-in of an ordered or non-ring dispatch" : open->edgeOwed != 0 ? "copy-in: lane edge owed" : open->deferredDispatchQueue != queueKey ? "copy-in: another ring's run" : open->renderPass.open ? "copy-in: render pass" : open->run.open ? "copy-in: store run" : censusGuard != 0 ? (censusGuard == 1 ? "copy-in: atomic guard" : censusGuard == 2 ? "copy-in: staged-read guard" : "copy-in: range check") : "copy-in: build already in the run";
+        }
+        const auto commands = Commands(coveredAccess);
+        censusRefusal = nullptr;
+        return commands;
+    }
     GuestMemory::AssertGpuLockHeld("Recorder::RunCommands");
     if (coveredAccess != nullptr) *coveredAccess = 0;
     return open->commands;
@@ -2244,7 +2282,18 @@ void Recorder::AfterRun(std::function<void(Recorder&)> work) {
 }
 
 VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, VkAccessFlags* coveredAccess, bool& overlapped, std::span<const std::array<std::uint64_t, 3>> accesses) {
+    censusGuard = 0;
+    if (DrawOrGpuProfiled()) {
+        std::lock_guard lock(runCloseMutex);
+        const auto prior = censusClose.find(queueKey);
+        censusPrior = prior != censusClose.end() ? std::move(prior->second.label) : std::string();
+        if (prior != censusClose.end()) censusClose.erase(prior);
+    }
     overlapped = queueKey != 0 && open != nullptr && open->edgeOwed == 0 && open->deferredDispatchQueue == queueKey && !open->renderPass.open && !open->run.open && std::none_of(owners.begin(), owners.end(), [&](const void* owner) { return std::find(open->deferredRun.begin(), open->deferredRun.end(), owner) != open->deferredRun.end(); }) && !RunAtomicConflict(accesses) && !RunRangeConflict(accesses);
+    censusJoin = nullptr;
+    if (!overlapped && DrawOrGpuProfiled()) {
+        censusJoin = open == nullptr || open->deferredDispatchQueue == 0 ? "no open run" : open->edgeOwed != 0 ? "join: lane edge owed" : open->deferredDispatchQueue != queueKey ? "join: another ring's run is open" : open->renderPass.open ? "join: render pass" : open->run.open ? "join: store run" : censusGuard != 0 ? (censusGuard == 1 ? "join: atomic guard" : censusGuard == 2 ? "join: staged-read guard" : "join: range check") : "join: build already in the run";
+    }
     if (queueKey != 0 && DrawOrGpuProfiled()) {
         std::lock_guard lock(runCloseMutex);
         ++overlapByRing[queueKey][overlapped ? 0 : open == nullptr || open->deferredDispatchQueue == 0 ? 1 : 2];
@@ -2262,6 +2311,45 @@ VkCommandBuffer Recorder::OverlapCommands(std::uint32_t queueKey, std::span<cons
     return open->commands;
 }
 
+void Recorder::CensusDispatch(std::uint32_t queueKey, const char* notCapable, bool unordered, bool overlapped) {
+    if (!DrawOrGpuProfiled() || queueKey == 0) return;
+    std::lock_guard lock(runCloseMutex);
+    const auto own = censusClose.find(queueKey);
+    std::string bucket;
+    if (notCapable != nullptr) {
+        bucket = std::string(unordered ? "unordered, " : "ordered, ") + "not overlap-capable: " + notCapable;
+    } else if (!unordered) {
+        bucket = "title-ordered";
+    } else if (overlapped) {
+        bucket = "joined";
+    } else if (censusJoin != nullptr && std::string_view(censusJoin) == "no open run") {
+        bucket = censusPrior.empty() ? std::string("no open run: the ring's previous dispatch left none open") : "closed by " + censusPrior;
+    } else {
+        bucket = censusJoin != nullptr ? censusJoin : "?";
+    }
+    if (own != censusClose.end()) censusClose.erase(own);
+    censusPrior.clear();
+    censusJoin = nullptr;
+    ++censusBuckets[{queueKey, std::move(bucket)}];
+}
+
+std::string Recorder::BarrierCensusReport() {
+    std::lock_guard lock(runCloseMutex);
+    std::map<std::uint32_t, std::vector<std::pair<std::uint64_t, std::string>>> rings;
+    for (const auto& [key, count] : censusBuckets) rings[key.first].emplace_back(count, key.second);
+    std::string text = "[barrier-census] (cumulative, overlap-ring dispatches by outcome)";
+    for (auto& [ring, rows] : rings) {
+        std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+        std::uint64_t total = 0;
+        for (const auto& row : rows) total += row.first;
+        char head[64];
+        std::snprintf(head, sizeof(head), "\n[barrier-census] ring 0x%x: %llu:", ring - 1u, static_cast<unsigned long long>(total));
+        text += head;
+        for (std::size_t index = 0; index < rows.size() && index < 24; ++index) text += " " + rows[index].second + " " + std::to_string(rows[index].first) + ";";
+    }
+    return text;
+}
+
 Recorder::OverlapStatistics Recorder::OverlapCounts() {
     return {runDeferredCount.load(std::memory_order_relaxed), runJoinedCount.load(std::memory_order_relaxed)};
 }
@@ -2269,6 +2357,10 @@ Recorder::OverlapStatistics Recorder::OverlapCounts() {
 void Recorder::DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners) {
     Require(open != nullptr && queueKey != 0, "a deferred dispatch barrier has no batch");
     runDeferredCount.fetch_add(1, std::memory_order_relaxed);
+    if (open->deferredDispatchQueue == 0 && DrawOrGpuProfiled()) {
+        std::lock_guard lock(runCloseMutex);
+        censusOpener[queueKey] = GuestMemory::GpuLockThreadTag();
+    }
     if (open->deferredDispatchQueue == 0) {
         open->deferredRun.clear();
         open->runAccess.clear();
@@ -2291,6 +2383,7 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess, std::source_loc
     // for a caller whose ranges overlap a queued store: FlushStores).
     if (open->renderPass.open) endOpenRenderPass();
     if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
+    if (!open->homeSettles.empty() && !homeScopeActive() && !HomesCeiling()) settleHomesNow(0, 0, nullptr);
     if (coveredAccess != nullptr) *coveredAccess = open->coveredAccess;
     open->coveredAccess = 0;
     return open->commands;
@@ -2305,6 +2398,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(1, where);
+    if (!open->homeSettles.empty() && !homeScopeActive() && !HomesCeiling()) settleHomesNow(0, 0, nullptr);
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         const auto commands = Commands();
@@ -2435,6 +2529,7 @@ void Recorder::ensureOpen() {
     if (open == nullptr) {
         auto batch = std::make_unique<Batch>();
         batch->lane = currentLane();
+        if (HomeCensus::CpuEnabled()) batch->openedNs = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
         try {
             auto& spares = spare[static_cast<std::size_t>(currentLane())];
             if (!spares.empty()) {
@@ -2490,6 +2585,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(3, where);
+    if (!open->homeSettles.empty() && !HomesCeiling()) settleHomesNow(address, address + bytes.size(), nullptr);
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -2751,6 +2847,8 @@ const std::unordered_map<std::uint64_t, std::size_t>& TimingFamilyIndex() {
 }
 std::vector<std::vector<GpuTimingUnion::Interval>> timingFamilyIntervals;
 double timingPeriodNs = 1.0;
+std::array<std::vector<GpuTimingUnion::Interval>, 2> batchSpanIntervals;
+std::uint64_t batchSpanCount = 0;
 
 bool DrawOrGpuProfiled() {
     static const bool profiled = std::getenv("APS5_PROFILE_DRAW") != nullptr || Recorder::GpuTimingEnabled();
@@ -3685,6 +3783,12 @@ void Recorder::readGpuTiming(Batch& batch) {
             batch.gpuStartNs = static_cast<double>(stamps[0]) * period;
             batch.gpuEndNs = static_cast<double>(stamps[1]) * period;
             PerformanceTrace::GpuRange("batch", batch.gpuStartNs, batch.gpuEndNs, batch.traceId);
+            if (DrawProfiled()) {
+                std::lock_guard lock(timingMutex);
+                timingPeriodNs = period;
+                batchSpanIntervals[batch.lane == 1 ? 1 : 0].emplace_back(stamps[0], stamps[1]);
+                ++batchSpanCount;
+            }
         }
         return;
     }
@@ -3737,13 +3841,32 @@ void Recorder::readGpuTiming(Batch& batch) {
     reportBarriers();
 }
 
+std::string Recorder::BatchBusyReport(const char* window) {
+    std::lock_guard lock(timingMutex);
+    const auto ms = [](std::uint64_t ticks) { return static_cast<double>(ticks) * timingPeriodNs / 1e6; };
+    std::uint64_t sum0 = 0, sum1 = 0;
+    for (const auto& [begin, end] : batchSpanIntervals[0]) sum0 += end > begin ? end - begin : 0;
+    for (const auto& [begin, end] : batchSpanIntervals[1]) sum1 += end > begin ? end - begin : 0;
+    auto both = batchSpanIntervals[0];
+    both.insert(both.end(), batchSpanIntervals[1].begin(), batchSpanIntervals[1].end());
+    char text[384];
+    std::snprintf(text, sizeof(text), "[batch-busy] over %s: %llu batches; span sum %.2f ms (lane 0 %.2f, lane 1 %.2f); union of both lanes %.2f ms (lane 0 %.2f, lane 1 %.2f)", window, static_cast<unsigned long long>(batchSpanCount), ms(sum0 + sum1), ms(sum0), ms(sum1), ms(GpuTimingUnion::UnionTicks(both)), ms(GpuTimingUnion::UnionTicks(batchSpanIntervals[0])), ms(GpuTimingUnion::UnionTicks(batchSpanIntervals[1])));
+    for (auto& lane : batchSpanIntervals) lane.clear();
+    batchSpanCount = 0;
+    return text;
+}
+
 void Recorder::CloseGpuTimingWindow(const char* label) {
-    if (!GpuTimingEnabled()) return;
+    if (!GpuTimingEnabled()) {
+        if (DrawProfiled()) AgcDriver::ProfilePrint_nid_no_patch("%s\n%s\n", BatchBusyReport(label).c_str(), BarrierCensusReport().c_str());
+        return;
+    }
     {
         std::lock_guard lock(timingMutex);
         printGpuTiming(label);
     }
     reportBarriers();
+    AgcDriver::ProfilePrint_nid_no_patch("%s\n", BarrierCensusReport().c_str());
 }
 
 namespace {
@@ -4293,6 +4416,7 @@ void Recorder::OnComplete(std::function<void()> action) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
+    HomeCensus::WriteNote(address, address + bytes);
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
@@ -4322,6 +4446,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
         std::atomic_thread_fence(std::memory_order_seq_cst);
         return;
     }
+    HomeCensus::WriteNote(address, address + bytes);
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
@@ -4536,6 +4661,7 @@ bool Recorder::ReadTracking() {
 
 void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKind kind) {
     CaptureTrace::Log("buffer-read batch=%llu address=%llx bytes=%zu kind=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, static_cast<int>(kind));
+    HomeCensus::Read(static_cast<int>(kind), address, address + bytes);
     if (bytes == 0 || !ReadTrackingEnabled()) return;
     ensureOpen();
     open->reads.push_back({address, address + bytes, kind});
@@ -4543,6 +4669,7 @@ void Recorder::NotePendingRead(std::uint64_t address, std::size_t bytes, ReadKin
 }
 
 void Recorder::NotePendingReads(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, ReadKind kind) {
+    HomeCensus::ReadGroup(static_cast<int>(kind), ranges);
     if (ranges.empty() || !ReadTrackingEnabled()) return;
     ensureOpen();
     for (const auto& [begin, end] : ranges) {
@@ -4561,8 +4688,10 @@ bool Recorder::ValidReadList(const ReadList& ranges) {
 }
 
 void Recorder::NotePendingReadList(std::shared_ptr<const ReadList> ranges, ReadKind kind) {
+    if (ranges != nullptr) HomeCensus::ReadGroup(static_cast<int>(kind), *ranges);
     if (ranges == nullptr || ranges->empty() || !ReadTrackingEnabled()) return;
     if (CaptureTrace::Enabled() || FlipReadCheck()) {
+        const HomeCensus::Mute mute;
         NotePendingReads(*ranges, kind);
         return;
     }
@@ -5000,9 +5129,12 @@ void Recorder::Submit() {
     if (activeRecorder == this) workSinceSubmit.store(0, std::memory_order_relaxed);
     dropStaleHoldKept();
     if (open == nullptr) return;
+    HomeCensus::BatchEnd(open->lane);
+    if (open->openedNs != 0) HomeCensus::AddCpu(HomeCensus::Cpu::BatchSpan, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count() - open->openedNs));
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     flushDeferredDispatch(6);
     sealPrelude();
+    if (!open->homeSettles.empty()) settleHomesNow(0, 0, nullptr);
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
     const bool segments = segmentMode();
@@ -5885,4 +6017,99 @@ void Recorder::release(Batch& batch) noexcept {
     batch.fence = VK_NULL_HANDLE;
 }
 
+
+namespace {
+
+thread_local int homeScopeDepth = 0;
+
+bool homeScopeActive() {
+    return homeScopeDepth > 0;
+}
+
+}
+
+bool Recorder::HomesEnabled() {
+    static const bool enabled = std::getenv("APS5_V3M_HOMES") != nullptr;
+    return enabled;
+}
+
+bool Recorder::HomesCeiling() {
+    static const bool enabled = HomesEnabled() && std::getenv("APS5_V3M_CEIL") != nullptr;
+    return enabled;
+}
+
+Recorder::HomeScope::HomeScope() {
+    ++homeScopeDepth;
+}
+
+Recorder::HomeScope::~HomeScope() {
+    --homeScopeDepth;
+}
+
+void Recorder::DeferHomeSettle(HomeSettle settle) {
+    ensureOpen();
+    open->homeSettles.push_back(std::move(settle));
+}
+
+bool Recorder::HomeSettlePendingFor(const void* home) const {
+    if (open == nullptr) return false;
+    return std::any_of(open->homeSettles.begin(), open->homeSettles.end(), [&](const HomeSettle& settle) { return settle.home == home; });
+}
+
+bool Recorder::HomeSettleCovers(const void* home, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) const {
+    if (open == nullptr) return false;
+    return std::all_of(ranges.begin(), ranges.end(), [&](const auto& range) {
+        return std::any_of(open->homeSettles.begin(), open->homeSettles.end(), [&](const HomeSettle& settle) {
+            return settle.home == home && std::any_of(settle.ranges.begin(), settle.ranges.end(), [&](const auto& held) { return held.first <= range.first && range.second <= held.second; });
+        });
+    });
+}
+
+bool Recorder::HomeSettlePendingOver(std::uint64_t begin, std::uint64_t end, const void* except) const {
+    if (open == nullptr) return false;
+    for (const auto& settle : open->homeSettles) {
+        if (except != nullptr && settle.home == except) continue;
+        for (const auto& [from, to] : settle.ranges) {
+            if (end == 0 || (from < end && begin < to)) return true;
+        }
+    }
+    return false;
+}
+
+void Recorder::SettleHomes(std::uint64_t begin, std::uint64_t end, const void* except) {
+    if (open == nullptr || open->homeSettles.empty()) return;
+    settleHomesNow(begin, end, except);
+}
+
+void Recorder::settleHomesNow(std::uint64_t begin, std::uint64_t end, const void* except) {
+    GuestMemory::AssertGpuLockHeld("Recorder::settleHomesNow");
+    if (open == nullptr || !HomeSettlePendingOver(begin, end, except)) return;
+    flushDeferredDispatch(0);
+    if (open == nullptr) return;
+    if (open->renderPass.open) endOpenRenderPass();
+    if (open->run.open && !LabelRunsPerBatch()) closeStoreRun();
+    std::vector<HomeSettle> chosen;
+    std::vector<HomeSettle> kept;
+    for (auto& settle : open->homeSettles) {
+        bool overlaps = except == nullptr || settle.home != except;
+        if (overlaps && end != 0) overlaps = std::any_of(settle.ranges.begin(), settle.ranges.end(), [&](const auto& range) { return range.first < end && begin < range.second; });
+        (overlaps ? chosen : kept).push_back(std::move(settle));
+    }
+    open->homeSettles = std::move(kept);
+    if (chosen.empty()) return;
+    const auto commands = open->commands;
+    std::uint64_t bytes = 0;
+    for (const auto& settle : chosen) {
+        for (const auto& [from, to] : settle.ranges) bytes += to - from;
+    }
+    const auto timing = BeginGpuTiming(CommandClass::StagingOut);
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+    CountBarriers(CommandClass::StagingOut);
+    for (const auto& settle : chosen) settle.record(commands);
+    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, copiedAccess);
+    CountBarriers(CommandClass::StagingOut);
+    MarkCovered(copiedAccess);
+    EndGpuTiming(timing, bytes);
+}
 }

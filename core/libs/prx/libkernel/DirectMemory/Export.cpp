@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestDirty.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libc/include/Api.hpp"
 #include <cstdint>
@@ -385,7 +386,7 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
  if (VirtualQuery(addr, &host, sizeof(host)) == 0 || host.State != MEM_COMMIT) return SCE_KERNEL_ERROR_EACCES;
  info->start = reinterpret_cast<uintptr_t>(host.BaseAddress);
  info->end = info->start + host.RegionSize;
- const bool writable = (host.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0;
+ const bool writable = (host.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0 || GuestArena::GuestDirtyArmed_nid_postfix(reinterpret_cast<std::uintptr_t>(addr));
  const bool executable = (host.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
  #else
  std::ifstream maps("/proc/self/maps");
