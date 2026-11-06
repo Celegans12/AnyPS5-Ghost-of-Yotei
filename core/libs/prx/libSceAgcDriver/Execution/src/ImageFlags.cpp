@@ -71,12 +71,10 @@ void reportExtraLocked(const char* label) {
     }
     const auto u = [&](std::size_t i) { return static_cast<unsigned long long>(d[i]); };
     if (BufferEnabled()) {
-        AgcDriver::ProfilePrint_nid_no_patch("[bufferflags] %s: bindings clean %llu / not clean %llu (armed %llu, gated %llu); inputs clean %llu / not clean %llu (armed %llu, gated %llu); memo drops %llu (%llu entries)%s
-", label, u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7), u(DropsAt), u(DropsAt + 1), BufferVerify() ? "; verify on" : "");
+        AgcDriver::ProfilePrint_nid_no_patch("[bufferflags] %s: bindings clean %llu / not clean %llu (armed %llu, gated %llu); inputs clean %llu / not clean %llu (armed %llu, gated %llu); memo drops %llu (%llu entries)%s\n", label, u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7), u(DropsAt), u(DropsAt + 1), BufferVerify() ? "; verify on" : "");
     }
     if (Enabled()) {
-        AgcDriver::ProfilePrint_nid_no_patch("[storageflags] %s: not flagged: scoped %llu, dcc %llu, keys %llu; no token after a full refresh: kept at unwatch %llu, imported %llu, view %llu, not writable %llu, other private %llu, arm refused %llu%s
-", label, u(SkipsAt), u(SkipsAt + 1), u(SkipsAt + 2), u(UnwatchedAt), u(UnwatchedAt + 1), u(UnwatchedAt + 2), u(UnwatchedAt + 3), u(UnwatchedAt + 4), u(UnwatchedAt + 5), TargetEnabled() ? "; target flags on" : StorageEnabled() ? "" : "; storage flags off");
+        AgcDriver::ProfilePrint_nid_no_patch("[storageflags] %s: not flagged: scoped %llu, dcc %llu, keys %llu; no token after a full refresh: kept at unwatch %llu, imported %llu, view %llu, not writable %llu, other private %llu, arm refused %llu%s\n", label, u(SkipsAt), u(SkipsAt + 1), u(SkipsAt + 2), u(UnwatchedAt), u(UnwatchedAt + 1), u(UnwatchedAt + 2), u(UnwatchedAt + 3), u(UnwatchedAt + 4), u(UnwatchedAt + 5), TargetEnabled() ? "; target flags on" : StorageEnabled() ? "" : "; storage flags off");
     }
 }
 std::mutex reportMutex;
