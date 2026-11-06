@@ -100,6 +100,10 @@ enum class RuntimeSwitch : std::size_t {
     ResourceCacheLarge,
     V3eWorkerNoSpin,
     V3eWorkerPin,
+    V3eImageFlags,
+    V3eBindingFlags,
+    V3eInputFlags,
+    V3eTextureRoom,
     Count,
 };
 

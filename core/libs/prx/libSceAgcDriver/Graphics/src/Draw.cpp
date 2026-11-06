@@ -1428,7 +1428,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     };
     if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
-        if (ImageFlags::BufferEnabled()) {
+        if (ImageFlags::InputEnabled()) {
             if (recorder->PendingWriteOverlaps(address, bytes) || PendingCpuWritesOverlap(context, address, bytes)) {
                 ImageFlags::CountBufferGate(ImageFlags::BufferUse::Input);
             } else {

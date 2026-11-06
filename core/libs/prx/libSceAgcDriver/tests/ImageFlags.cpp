@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
@@ -99,6 +100,27 @@ void TokenMemoKeepsAndBounds() {
     Expect(memo.Size() == 1, "a note over the entry bound did not drop the memo");
 }
 
+void TurningOnStartsAnEpoch() {
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    ImageFlags::UseBackend(&Fake);
+    Switches::Assign(RuntimeSwitch::V3eImageFlags, true);
+    Expect(ImageFlags::Enabled(), "the image flags did not follow their runtime switch");
+    const auto token = ImageFlags::Arm(0x60000, 0x1000);
+    Expect(token != 0 && ImageFlags::CleanSince(0x60000, 0x1000, token), "a token was not clean in its own epoch");
+    Switches::Assign(RuntimeSwitch::V3eImageFlags, false);
+    Expect(!ImageFlags::Enabled(), "the image flags stayed on after their switch went off");
+    Switches::Assign(RuntimeSwitch::V3eImageFlags, true);
+    Expect(ImageFlags::Enabled(), "the image flags did not turn on again");
+    Expect(!ImageFlags::CleanSince(0x60000, 0x1000, token), "a token from before the switch turned on again was clean");
+    const ImageFlags::DirtyQuery stale{0x60000, 0x1000, token};
+    Expect(!ImageFlags::CleanSinceAll(std::span(&stale, 1)), "a batch with a token from an earlier epoch was clean");
+    const auto fresh = ImageFlags::Arm(0x60000, 0x1000);
+    Expect(fresh != 0 && ImageFlags::CleanSince(0x60000, 0x1000, fresh), "a token armed after turning on was not clean");
+    Switches::Assign(RuntimeSwitch::V3eImageFlags, false);
+    ImageFlags::UseBackend(nullptr);
+}
+
 void BufferDisagreementThrows() {
     bool threw = false;
     try {
@@ -115,6 +137,7 @@ void BufferDisagreementThrows() {
 int main() {
     TokenMemoKeepsAndBounds();
     BufferDisagreementThrows();
+    TurningOnStartsAnEpoch();
     DefaultBackendIsNeverClean();
     TokensFollowTheBackend();
     DisagreementThrows();

@@ -54,6 +54,10 @@ void CountStorageGate(bool otherPending, bool cpuPending, bool unarmed);
 // remembered buffer while the tracker calls the range clean. APS5_V3E_BUFFER_FLAGS_VERIFY=1 runs today's path next
 // to every clean verdict, serves its result and throws when its bytes differ from the remembered buffer's.
 bool BufferEnabled();
+// Vertex/index input flags (APS5_V3E_INPUT_FLAGS); APS5_V3E_BUFFER_FLAGS covers the draw-binding snapshots only.
+// APS5_V3E_IMAGE_FLAGS, _BUFFER_FLAGS and _INPUT_FLAGS are runtime switches (APS5_AB); a token armed before the
+// switch last turned on is never clean.
+bool InputEnabled();
 bool BufferVerify();
 enum class BufferUse : std::uint8_t { Binding, Input, Count };
 void CountBuffer(BufferUse use, bool clean, bool armed);

@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 namespace AgcDriver::ImageFlags {
 
@@ -42,6 +44,22 @@ constexpr Backend Tracker{&trackerArm, &trackerClean, &trackerCleanAll, &tracker
 
 std::atomic<const Backend*> backend{&Tracker};
 
+// Runtime switches (APS5_AB): every turn-on starts a new epoch, carried in a token's top 16 bits, so a token armed in
+// an earlier "on" phase (whose cached object may have moved while the flags were off) is never clean again.
+constexpr unsigned EpochShift = 48;
+constexpr std::uint64_t TokenMask = (std::uint64_t{1} << EpochShift) - 1;
+std::atomic<std::uint64_t> epoch{1};
+std::uint64_t epochTag() { return (epoch.load(std::memory_order_acquire) & 0xffffu) << EpochShift; }
+bool follow(Graphics::RuntimeSwitch id, std::atomic<bool>& last) {
+    const bool on = Graphics::RuntimeSwitches::Set(id);
+    if (on) {
+        if (!last.load(std::memory_order_relaxed) && !last.exchange(true, std::memory_order_acq_rel)) epoch.fetch_add(1, std::memory_order_acq_rel);
+    } else if (last.load(std::memory_order_relaxed)) {
+        last.store(false, std::memory_order_relaxed);
+    }
+    return on;
+}
+
 struct Counts {
     std::array<std::atomic<std::uint64_t>, 3> verdicts{};
     std::atomic<std::uint64_t> proofs{0}, served{0}, arms{0}, armed{0}, early{0}, storageClean{0}, storageFull{0}, gateOther{0}, gateCpu{0}, gateUnarmed{0};
@@ -70,7 +88,7 @@ void reportExtraLocked(const char* label) {
         extraReported[i] = now;
     }
     const auto u = [&](std::size_t i) { return static_cast<unsigned long long>(d[i]); };
-    if (BufferEnabled()) {
+    if (BufferEnabled() || InputEnabled()) {
         AgcDriver::ProfilePrint_nid_no_patch("[bufferflags] %s: bindings clean %llu / not clean %llu (armed %llu, gated %llu); inputs clean %llu / not clean %llu (armed %llu, gated %llu); memo drops %llu (%llu entries)%s\n", label, u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7), u(DropsAt), u(DropsAt + 1), BufferVerify() ? "; verify on" : "");
     }
     if (Enabled()) {
@@ -93,8 +111,8 @@ void reportLocked(const char* label) {
 }
 
 bool Enabled() {
-    static const bool enabled = flag("APS5_V3E_IMAGE_FLAGS");
-    return enabled;
+    static std::atomic<bool> last{false};
+    return follow(Graphics::RuntimeSwitch::V3eImageFlags, last);
 }
 
 bool Verify() {
@@ -103,8 +121,13 @@ bool Verify() {
 }
 
 bool BufferEnabled() {
-    static const bool enabled = flag("APS5_V3E_BUFFER_FLAGS");
-    return enabled;
+    static std::atomic<bool> last{false};
+    return follow(Graphics::RuntimeSwitch::V3eBindingFlags, last);
+}
+
+bool InputEnabled() {
+    static std::atomic<bool> last{false};
+    return follow(Graphics::RuntimeSwitch::V3eInputFlags, last);
 }
 
 bool BufferVerify() {
@@ -113,13 +136,13 @@ bool BufferVerify() {
 }
 
 bool StorageEnabled() {
-    static const bool enabled = Enabled() && flag("APS5_V3E_STORAGE_FLAGS");
-    return enabled;
+    static const bool enabled = flag("APS5_V3E_STORAGE_FLAGS");
+    return enabled && Enabled();
 }
 
 bool TargetEnabled() {
-    static const bool enabled = StorageEnabled() && flag("APS5_V3E_TARGET_FLAGS");
-    return enabled;
+    static const bool enabled = flag("APS5_V3E_TARGET_FLAGS");
+    return enabled && StorageEnabled();
 }
 
 void CountBuffer(BufferUse use, bool clean, bool armed) {
@@ -162,18 +185,26 @@ void NoteServed(std::uint64_t address, std::size_t bytes) {
 std::uint64_t Arm(std::uint64_t address, std::size_t bytes) {
     const auto token = backend.load(std::memory_order_acquire)->arm(address, bytes);
     counts.arms.fetch_add(1, std::memory_order_relaxed);
-    if (token != 0) counts.armed.fetch_add(1, std::memory_order_relaxed);
-    return token;
+    if (token == 0 || token > TokenMask) return 0;
+    counts.armed.fetch_add(1, std::memory_order_relaxed);
+    return epochTag() | token;
 }
 
 bool CleanSince(std::uint64_t address, std::size_t bytes, std::uint64_t token) {
-    if (token == 0) return false;
-    return backend.load(std::memory_order_acquire)->cleanSince(address, bytes, token);
+    if (token == 0 || (token & ~TokenMask) != epochTag()) return false;
+    return backend.load(std::memory_order_acquire)->cleanSince(address, bytes, token & TokenMask);
 }
 
 bool CleanSinceAll(std::span<const DirtyQuery> queries) {
     if (queries.empty()) return false;
-    return backend.load(std::memory_order_acquire)->cleanSinceAll(queries);
+    const auto tag = epochTag();
+    thread_local std::vector<DirtyQuery> untagged;
+    untagged.clear();
+    for (const auto& query : queries) {
+        if (query.token == 0 || (query.token & ~TokenMask) != tag) return false;
+        untagged.push_back({query.address, query.bytes, query.token & TokenMask});
+    }
+    return backend.load(std::memory_order_acquire)->cleanSinceAll(untagged);
 }
 
 void CountStorageGate(bool otherPending, bool cpuPending, bool unarmed) {
@@ -203,14 +234,14 @@ void ThrowDisagreement(std::uint64_t address, std::size_t bytes) {
 }
 
 void Close(const char* label) {
-    if (!Enabled() && !BufferEnabled()) return;
+    if (!Enabled() && !BufferEnabled() && !InputEnabled()) return;
     std::lock_guard lock(reportMutex);
     if (Enabled()) reportLocked(label);
     reportExtraLocked(label);
 }
 
 void MaybeReport() {
-    if ((!Enabled() && !BufferEnabled()) || ProfileWindows::FrameWindows()) return;
+    if ((!Enabled() && !BufferEnabled() && !InputEnabled()) || ProfileWindows::FrameWindows()) return;
     std::unique_lock lock(reportMutex, std::try_to_lock);
     if (!lock.owns_lock() || !ProfileWindows::ClockDue(lastReport)) return;
     if (Enabled()) reportLocked("10s");

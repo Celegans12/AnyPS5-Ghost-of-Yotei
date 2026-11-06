@@ -2398,7 +2398,10 @@ TextureCacheBudgets TextureCacheBudgetsFor(const VkPhysicalDeviceMemoryPropertie
     if (previousTarget != 0 && (target > previousTarget ? target - previousTarget : previousTarget - target) <= std::max<std::uint64_t>(previousTarget / 64u, 64 * MiB)) target = previousTarget;
     const auto storage = std::min<std::uint64_t>(fixed, std::max<std::uint64_t>(target / 2u, 256 * MiB));
     const auto outside = use.sampled - std::min(use.sampled, use.sampledCached + use.overflow);
-    const auto taken = std::max<std::uint64_t>(storage, use.storageCached) + outside;
+    // APS5_V3E_TEXTURE_ROOM (runtime switch, v3 exec 11-07): the sampled ceiling leaves out only what the storage cache
+    // holds, not its whole budget (in-world the storage cache held ~2.4 GiB of a ~3.8 GiB budget while sampled
+    // snapshots were capacity-evicted and made again).
+    const auto taken = (RuntimeSwitches::Set(RuntimeSwitch::V3eTextureRoom) ? use.storageCached : std::max<std::uint64_t>(storage, use.storageCached)) + outside;
     const auto ceiling = std::max<std::uint64_t>(target > taken ? target - taken : 0u, std::min<std::uint64_t>(target / 8u, 128 * MiB));
     std::uint64_t overflow = 0;
     std::optional<std::uint32_t> system;

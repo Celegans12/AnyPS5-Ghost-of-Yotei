@@ -99,6 +99,10 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_RESOURCE_CACHE_LARGE",
     "APS5_V3E_WORKER_NO_SPIN",
     "APS5_V3E_WORKER_PIN",
+    "APS5_V3E_IMAGE_FLAGS",
+    "APS5_V3E_BUFFER_FLAGS",
+    "APS5_V3E_INPUT_FLAGS",
+    "APS5_V3E_TEXTURE_ROOM",
 };
 
 struct Refusal {
