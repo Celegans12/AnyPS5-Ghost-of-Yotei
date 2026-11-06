@@ -735,6 +735,7 @@ private:
     // Write generation `original` is known current at (the oldest of layerGeneration).
     std::uint64_t generation = 0;
     std::uint64_t dirtyToken = 0;
+    bool watchedAtRefresh = false;
     std::uint32_t trackedLayers = 1;
     std::uint64_t trackedLayerBytes = 0;
     std::vector<std::uint64_t> layerGeneration;

@@ -2484,14 +2484,14 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     const bool cpuPending = PendingCpuWritesOverlap(context, base, bytes);
     const bool blocked = otherPending || cpuPending;
     ImageFlags::CountStorageGate(otherPending, cpuPending, dirtyToken == 0);
-    const bool clean = !blocked && dirtyToken != 0 && ImageFlags::CleanSince(base, bytes, dirtyToken);
+    const bool clean = !blocked && watchedAtRefresh && dirtyToken != 0 && ImageFlags::CleanSince(base, bytes, dirtyToken);
     if (clean && !ImageFlags::Verify()) {
         ImageFlags::CountStorage(true);
         ImageFlags::NoteServed(base, bytes);
         NoteProved();
         return true;
     }
-    if (!clean) dirtyToken = blocked ? 0 : ImageFlags::Arm(base, bytes);
+    if (!clean) dirtyToken = blocked || !watchedAtRefresh ? 0 : ImageFlags::Arm(base, bytes);
     const bool current = refreshFull(firstLayer, lastLayer);
     if (clean && !current) ImageFlags::ThrowDisagreement(base, bytes);
     ImageFlags::CountStorage(clean);
@@ -2569,6 +2569,7 @@ bool StorageTexture::refreshFull(std::uint32_t firstLayer, std::uint32_t lastLay
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
     // since `generation` need no comparison.
     const auto current = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (!scoped) watchedAtRefresh = current != 0 && keptAtUnwatch.empty();
     const auto scopedCurrent = current != 0 || !scoped ? current : GuestMemory::CollectWrites(scopeBegin, scopeBytes);
     std::vector<std::uint64_t> collected;
     if (scopedCurrent == 0) {
