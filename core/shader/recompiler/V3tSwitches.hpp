@@ -1,0 +1,23 @@
+#ifndef CORE_SHADER_RECOMPILER_V3TSWITCHES_HPP
+#define CORE_SHADER_RECOMPILER_V3TSWITCHES_HPP
+
+#include <cstdint>
+#include <cstdlib>
+
+namespace ShaderRecompiler {
+namespace V3t {
+
+inline std::uint32_t EnvNumber(const char* name) {
+    const char* text = std::getenv(name);
+    return text != nullptr ? static_cast<std::uint32_t>(std::strtoul(text, nullptr, 0)) : 0u;
+}
+
+inline bool SrtGuardHoist() {
+    static const bool value = EnvNumber("APS5_V3T_SRT_GUARD") != 0u;
+    return value;
+}
+
+}
+}
+
+#endif
