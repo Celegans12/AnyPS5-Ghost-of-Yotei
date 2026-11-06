@@ -33,7 +33,12 @@ inline bool SpecShape() {
 }
 
 inline bool SpecShapeChecked() {
-    static const bool value = EnvNumber("APS5_V3T_SPEC_SHAPE") == 2u;
+    static const bool value = EnvNumber("APS5_V3T_SPEC_SHAPE") == 2u || EnvNumber("APS5_V3T_SPEC_SHAPE") == 4u;
+    return value;
+}
+
+inline bool SpecSwizzleOnly() {
+    static const bool value = EnvNumber("APS5_V3T_SPEC_SHAPE") >= 3u;
     return value;
 }
 

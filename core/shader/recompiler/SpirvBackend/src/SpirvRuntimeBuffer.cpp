@@ -168,11 +168,17 @@ DecodedDescriptor decode(SpirvValueEmitContext& context, const IrValue& instruct
     const bool runtimeShape = runtime || (state.program.Resources().stage == IrShaderStage::Compute && !V3t::SpecShape());
     auto word1 = runtimeShape ? context.Arg(handle, 1u) : state.module.SpecializationConstant(TypeU32(state), first, 0u);
     if (runtimeShape && GcnGuestShaders()) word1 = Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1, ConstantU32(state, GcnBufferWord1Mask));
+    const auto specWord1 = word1;
+    if (!runtimeShape && V3t::SpecSwizzleOnly() && state.program.Resources().stage == IrShaderStage::Compute) {
+        auto live = context.Arg(handle, 1u);
+        if (GcnGuestShaders()) live = Binary(state, spv::OpBitwiseAnd, TypeU32(state), live, ConstantU32(state, GcnBufferWord1Mask));
+        word1 = Binary(state, spv::OpBitwiseOr, TypeU32(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), live, ConstantU32(state, 0x7fffffffu)), Binary(state, spv::OpBitwiseAnd, TypeU32(state), specWord1, ConstantU32(state, 0x80000000u)));
+    }
     if (!runtimeShape && V3t::SpecShapeChecked() && state.program.Resources().stage == IrShaderStage::Compute && state.program.Info().usesDma && state.faultBufferVariable != 0u) {
         auto live = context.Arg(handle, 1u);
         if (GcnGuestShaders()) live = Binary(state, spv::OpBitwiseAnd, TypeU32(state), live, ConstantU32(state, GcnBufferWord1Mask));
-        const auto mask = ConstantU32(state, 0xffff0000u);
-        const auto differs = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), live, mask), Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1, mask));
+        const auto mask = ConstantU32(state, V3t::SpecSwizzleOnly() ? 0x80000000u : 0xffff0000u);
+        const auto differs = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), live, mask), Binary(state, spv::OpBitwiseAnd, TypeU32(state), specWord1, mask));
         faultIf(context, instruction, both(state, runtimePresent(context, handle), differs), BdaConstant(state, 0u), 0u, BdaAbi::FaultReason::InvalidDescriptor);
     }
     const bool runtimeFormat = memory.gpuDescriptor || (state.registrationModules && !state.program.Info().buffers.at(memory.resource).descriptorFormatted);
