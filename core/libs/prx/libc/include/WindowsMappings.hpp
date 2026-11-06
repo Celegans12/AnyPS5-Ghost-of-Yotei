@@ -321,6 +321,7 @@ public:
                 if (view.resident) continue;
                 if (!marked) view.unreported = allSubpages;
                 if (view.armed == 0) continue;
+                lost(*view.page, view.armed);
                 protectSubpages(alias, view.armed, view.protection, "stop arming a compared shared page", view.viewBytes);
                 view.armed = 0;
             }
@@ -412,6 +413,39 @@ public:
 
     void SetAccessGuardObserver(void (*callback)(std::uintptr_t address)) {
         accessGuardObserver.store(callback, std::memory_order_release);
+    }
+
+    static inline std::atomic<void (*)(std::uintptr_t, std::size_t)> trackLostHook{nullptr};
+
+    bool ArmTracked(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        if (protectionsInFlight != 0 || changesActive.load(std::memory_order_seq_cst) != 0 || guardsUsed.load(std::memory_order_seq_cst)) return false;
+        const auto end = address + bytes;
+        for (auto base = address & ~(pageBytes - 1); base < end; base += pageBytes) {
+            const auto found = views.find(base);
+            if (found == views.end()) return false;
+            const auto& view = found->second;
+            if (view.resident || view.page->pins != 0 || view.viewBytes != pageBytes) return false;
+            for (const auto alias : view.page->aliases) {
+                const auto other = views.find(alias);
+                if (other == views.end()) return false;
+                const auto& entry = other->second;
+                if (entry.resident || !writable(entry.protection) || entry.hostWrites != 0 || entry.hostImports != 0 || entry.viewBytes != pageBytes) return false;
+            }
+        }
+        for (auto base = address & ~(pageBytes - 1); base < end; base += pageBytes) {
+            auto& view = views.at(base);
+            const auto mask = subpagesOf(base, address, end);
+            for (const auto alias : view.page->aliases) {
+                auto& other = views.at(alias);
+                const auto arming = static_cast<std::uint8_t>(mask & ~other.armed);
+                if (arming == 0) continue;
+                const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+                protectSubpages(alias, arming, protection, "arm shared memory dirty tracking", other.viewBytes);
+                other.armed |= arming;
+            }
+        }
+        return true;
     }
 
     bool AccessGuardsUsed() const {
@@ -526,6 +560,7 @@ public:
             else if (view.resident) forgetClean(it->first, it->first + pageBytes);
             const auto opened = static_cast<std::uint8_t>((store || view.resident) ? view.armed & written : 0);
             if (opened == 0) continue;
+            if (!store) lost(*view.page, opened);
             protectSubpages(it->first, opened, view.protection, "open shared memory to a host write", view.viewBytes);
             view.armed &= static_cast<std::uint8_t>(~opened);
         }
@@ -1615,6 +1650,7 @@ private:
             view.aliasDemoted = alias;
             view.unreported = view.page->comparedWhenShared ? allSubpages : std::uint8_t{0};
             view.seen.fill(0);
+            lost(*view.page, allSubpages);
             view.armed = 0;
             view.collected = 0;
             for (std::size_t sub = 0; sub < subpages; ++sub) {
@@ -1715,6 +1751,17 @@ private:
             if ((mask & (1u << sub)) == 0) continue;
             ++page.generation[sub];
             for (const auto alias : page.aliases) forgetClean(alias + sub * subpageBytes, alias + (sub + 1) * subpageBytes);
+        }
+        lost(page, mask);
+    }
+
+    static void lost(const SharedPage& page, std::uint8_t mask) {
+        const auto hook = trackLostHook.load(std::memory_order_acquire);
+        if (hook == nullptr || mask == 0) return;
+        for (const auto alias : page.aliases) {
+            for (std::size_t sub = 0; sub < subpages; ++sub) {
+                if ((mask & (1u << sub)) != 0) hook(alias + sub * subpageBytes, subpageBytes);
+            }
         }
     }
 
