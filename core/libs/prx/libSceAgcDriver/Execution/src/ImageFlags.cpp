@@ -44,21 +44,21 @@ std::atomic<const Backend*> backend{&Tracker};
 
 struct Counts {
     std::array<std::atomic<std::uint64_t>, 3> verdicts{};
-    std::atomic<std::uint64_t> proofs{0}, served{0}, arms{0}, armed{0}, early{0};
+    std::atomic<std::uint64_t> proofs{0}, served{0}, arms{0}, armed{0}, early{0}, storageClean{0}, storageFull{0}, gateOther{0}, gateCpu{0}, gateUnarmed{0};
 };
 Counts counts;
-std::array<std::uint64_t, 8> reported{};
+std::array<std::uint64_t, 13> reported{};
 std::mutex reportMutex;
 std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 
 void reportLocked(const char* label) {
-    const std::array<std::uint64_t, 8> now{counts.verdicts[0].load(), counts.verdicts[1].load(), counts.verdicts[2].load(), counts.proofs.load(), counts.served.load(), counts.arms.load(), counts.armed.load(), counts.early.load()};
-    std::array<std::uint64_t, 8> d{};
+    const std::array<std::uint64_t, 13> now{counts.verdicts[0].load(), counts.verdicts[1].load(), counts.verdicts[2].load(), counts.proofs.load(), counts.served.load(), counts.arms.load(), counts.armed.load(), counts.early.load(), counts.storageClean.load(), counts.storageFull.load(), counts.gateOther.load(), counts.gateCpu.load(), counts.gateUnarmed.load()};
+    std::array<std::uint64_t, 13> d{};
     for (std::size_t i = 0; i < now.size(); ++i) {
         d[i] = now[i] - reported[i];
         reported[i] = now[i];
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[imageflags] %s: early clean hits %llu; snapshot hits checked %llu: not armed %llu, dirty %llu, clean %llu; proofs run %llu, served %llu; arms %llu (armed %llu)%s\n", label, static_cast<unsigned long long>(d[7]),static_cast<unsigned long long>(d[0] + d[1] + d[2]), static_cast<unsigned long long>(d[0]), static_cast<unsigned long long>(d[1]), static_cast<unsigned long long>(d[2]), static_cast<unsigned long long>(d[3]), static_cast<unsigned long long>(d[4]), static_cast<unsigned long long>(d[5]), static_cast<unsigned long long>(d[6]), Verify() ? "; verify on" : "");
+    AgcDriver::ProfilePrint_nid_no_patch("[imageflags] %s: storage refreshes clean %llu / full %llu (gates: other pending %llu, cpu pending %llu, no token %llu); early clean hits %llu; snapshot hits checked %llu: not armed %llu, dirty %llu, clean %llu; proofs run %llu, served %llu; arms %llu (armed %llu)%s\n", label, static_cast<unsigned long long>(d[8]), static_cast<unsigned long long>(d[9]), static_cast<unsigned long long>(d[10]), static_cast<unsigned long long>(d[11]), static_cast<unsigned long long>(d[12]), static_cast<unsigned long long>(d[7]),static_cast<unsigned long long>(d[0] + d[1] + d[2]), static_cast<unsigned long long>(d[0]), static_cast<unsigned long long>(d[1]), static_cast<unsigned long long>(d[2]), static_cast<unsigned long long>(d[3]), static_cast<unsigned long long>(d[4]), static_cast<unsigned long long>(d[5]), static_cast<unsigned long long>(d[6]), Verify() ? "; verify on" : "");
 }
 
 }
@@ -96,6 +96,16 @@ bool CleanSince(std::uint64_t address, std::size_t bytes, std::uint64_t token) {
 bool CleanSinceAll(std::span<const DirtyQuery> queries) {
     if (queries.empty()) return false;
     return backend.load(std::memory_order_acquire)->cleanSinceAll(queries);
+}
+
+void CountStorageGate(bool otherPending, bool cpuPending, bool unarmed) {
+    if (otherPending) counts.gateOther.fetch_add(1, std::memory_order_relaxed);
+    if (cpuPending) counts.gateCpu.fetch_add(1, std::memory_order_relaxed);
+    if (unarmed) counts.gateUnarmed.fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountStorage(bool served) {
+    (served ? counts.storageClean : counts.storageFull).fetch_add(1, std::memory_order_relaxed);
 }
 
 void CountEarly(bool served) {

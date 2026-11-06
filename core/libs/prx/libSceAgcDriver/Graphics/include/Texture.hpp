@@ -616,6 +616,7 @@ private:
     std::uint64_t layerBegin(std::uint32_t layer) const { return descriptor.baseAddress + static_cast<std::uint64_t>(layer) * trackedLayerBytes; }
     bool anyLayerPending() const;
     bool refresh(std::uint32_t firstLayer, std::uint32_t lastLayer);
+    bool refreshFull(std::uint32_t firstLayer, std::uint32_t lastLayer);
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
     void refreshGeneration();
     // `indexed`: the Refresh lookups answer from the pending index (APS5_NO_REFRESH_LOOKUP_CACHE
@@ -733,6 +734,7 @@ private:
     mutable std::uint32_t nextForeignKeyProof = 0;
     // Write generation `original` is known current at (the oldest of layerGeneration).
     std::uint64_t generation = 0;
+    std::uint64_t dirtyToken = 0;
     std::uint32_t trackedLayers = 1;
     std::uint64_t trackedLayerBytes = 0;
     std::vector<std::uint64_t> layerGeneration;

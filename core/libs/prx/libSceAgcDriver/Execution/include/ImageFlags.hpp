@@ -41,6 +41,8 @@ bool CleanSinceAll(std::span<const DirtyQuery> queries);
 enum class Verdict : std::uint8_t { NotArmed, Dirty, Clean };
 void Count(Verdict verdict, bool proofAsked, bool served);
 void CountEarly(bool served);
+void CountStorage(bool served);
+void CountStorageGate(bool otherPending, bool cpuPending, bool unarmed);
 [[noreturn]] void ThrowDisagreement(std::uint64_t address, std::size_t bytes);
 void Close(const char* label);
 void MaybeReport();

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -2475,6 +2476,29 @@ bool StorageTexture::RefreshLayers(std::uint32_t first, std::uint32_t count) {
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
+    const bool flags = ImageFlags::Enabled() && firstLayer == 0 && lastLayer == trackedLayers && descriptor.dccAddress == 0 && uploadedKeys == DccKeys::Uncompressed && guestBytes != 0;
+    if (!flags) return refreshFull(firstLayer, lastLayer);
+    const auto base = descriptor.baseAddress;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    const bool otherPending = otherPendingOverlaps(!RuntimeSwitches::Set(RuntimeSwitch::NoRefreshLookupCache));
+    const bool cpuPending = PendingCpuWritesOverlap(context, base, bytes);
+    const bool blocked = otherPending || cpuPending;
+    ImageFlags::CountStorageGate(otherPending, cpuPending, dirtyToken == 0);
+    const bool clean = !blocked && dirtyToken != 0 && ImageFlags::CleanSince(base, bytes, dirtyToken);
+    if (clean && !ImageFlags::Verify()) {
+        ImageFlags::CountStorage(true);
+        ImageFlags::NoteServed(base, bytes);
+        NoteProved();
+        return true;
+    }
+    if (!clean) dirtyToken = blocked ? 0 : ImageFlags::Arm(base, bytes);
+    const bool current = refreshFull(firstLayer, lastLayer);
+    if (clean && !current) ImageFlags::ThrowDisagreement(base, bytes);
+    ImageFlags::CountStorage(clean);
+    return current;
+}
+
+bool StorageTexture::refreshFull(std::uint32_t firstLayer, std::uint32_t lastLayer) {
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Read once per Refresh (a runtime switch): index, quick path and host-import cache together.
