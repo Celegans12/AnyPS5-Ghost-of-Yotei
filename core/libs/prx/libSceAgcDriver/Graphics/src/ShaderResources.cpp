@@ -1419,7 +1419,9 @@ void boundOverflow(const Context& context) {
     }
 }
 
-std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D) {
+std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
+
+std::shared_ptr<Texture> cachedTextureFull(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes, bool depthCompare, VkImageViewType multisampleViewType) {
     const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
     if (resource.baseAddress != requested.baseAddress) guestBytes = 0;
     if (resource.dimension == TextureDimension::k2DMsaa) {
@@ -1869,6 +1871,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 if (verdict == ImageFlags::Verdict::Clean && !ImageFlags::Verify()) {
                     holds = true;
                     ImageFlags::Count(verdict, false, true);
+                    ImageFlags::NoteServed(address, bytes);
                 } else {
                     if (verdict != ImageFlags::Verdict::Clean) it->dirtyToken = eligible ? ImageFlags::Arm(address, bytes) : 0;
                     holds = proofHolds();
@@ -2068,6 +2071,46 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     reportTextureCounters();
     if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
     return texture;
+}
+
+std::shared_ptr<Texture> flagsSnapshotHit(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes, bool depthCompare) {
+    static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if (!ImageFlags::Enabled() || depthCompare || disabled) return nullptr;
+    const auto resource = ArrayLayerWindow(requested, context.limits.maxImageArrayLayers);
+    if (resource.baseAddress != requested.baseAddress) guestBytes = 0;
+    if (resource.dimension == TextureDimension::k2DMsaa || resource.fmaskCmaskAddress != 0u || resource.dccAddress != 0u) return nullptr;
+    if (words.size() >= 4 && ShaderRecompiler::DepthBitsTextureWidth(words[1], words[3]) != 0u) return nullptr;
+    if (DepthSurfaceAt(resource.baseAddress)) return nullptr;
+    if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+    const auto address = resource.baseAddress;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    if (bytes == 0) return nullptr;
+    RequireNoMultisampleTarget(address, bytes, "a texture read");
+    if (!FlushDepthPlanes(address, bytes).empty()) return nullptr;
+    if (StorageTexture::FindPending(address, guestBytes) != nullptr || PendingStorageOverlaps(address, bytes, nullptr) || Recorder::SnapshotWriteOverlaps(address, bytes)) return nullptr;
+    auto& cache = Textures();
+    const auto key = MakeTextureKey(context.device, words, components, depthCompare);
+    const DropReleasedDependents dropAfterUnlock;
+    const SampledCacheLock lock(cache);
+    const auto it = findTexture(cache, key);
+    if (it == cache.entries.end() || it->source != nullptr || it->bytes != guestBytes || it->keys != DccKeys::Uncompressed || it->committed.has_value() || it->dirtyToken == 0) return nullptr;
+    if (!ImageFlags::CleanSince(address, bytes, it->dirtyToken)) return nullptr;
+    touchTexture(cache, it);
+    logLookup({it->texture.get(), resource, guestBytes, DccKeys::Uncompressed, it->generation, nullptr});
+    return it->texture;
+}
+
+std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& requested, VkComponentMapping components, std::uint64_t guestBytes, bool depthCompare, VkImageViewType multisampleViewType) {
+    auto fast = flagsSnapshotHit(context, words, requested, components, guestBytes, depthCompare);
+    if (fast != nullptr && !ImageFlags::Verify()) {
+        ImageFlags::CountEarly(true);
+        ImageFlags::NoteServed(requested.baseAddress, static_cast<std::size_t>(guestBytes != 0 ? guestBytes : DescribeSurface(requested).guestBytes));
+        return fast;
+    }
+    auto full = cachedTextureFull(context, words, requested, components, guestBytes, depthCompare, multisampleViewType);
+    if (fast != nullptr && full != fast) ImageFlags::ThrowDisagreement(requested.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (fast != nullptr) ImageFlags::CountEarly(true);
+    return full;
 }
 
 // Storage images stay on the GPU between dispatches: while guest memory still holds what an image was

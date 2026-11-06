@@ -12,8 +12,8 @@
 // clean verdict, takes the proof's verdict, and throws when the flags call clean what the proof calls changed.
 //
 // The tracker is the mem lane's GuestMemory::Dirty* API (DirtyArm / DirtyCleanSince / DirtyCleanSinceAll /
-// DirtyMark / DirtyEnabled). Until that lands this lane uses the backend below, whose default answers like an
-// unarmable tracker: token 0, never clean. Tests install their own backend.
+// DirtyMark / DirtyEnabled), the default backend; UseBackend(nullptr) installs an unarmable one (token 0, never
+// clean) and tests install their own.
 namespace AgcDriver::ImageFlags {
 
 struct DirtyQuery {
@@ -33,12 +33,14 @@ struct Backend {
 bool Enabled();
 bool Verify();
 void UseBackend(const Backend* backend);
+void NoteServed(std::uint64_t address, std::size_t bytes);
 std::uint64_t Arm(std::uint64_t address, std::size_t bytes);
 bool CleanSince(std::uint64_t address, std::size_t bytes, std::uint64_t token);
 bool CleanSinceAll(std::span<const DirtyQuery> queries);
 
 enum class Verdict : std::uint8_t { NotArmed, Dirty, Clean };
 void Count(Verdict verdict, bool proofAsked, bool served);
+void CountEarly(bool served);
 [[noreturn]] void ThrowDisagreement(std::uint64_t address, std::size_t bytes);
 void Close(const char* label);
 void MaybeReport();
