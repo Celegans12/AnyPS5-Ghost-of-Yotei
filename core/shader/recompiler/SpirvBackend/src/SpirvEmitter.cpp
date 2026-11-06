@@ -1,3 +1,8 @@
+#include "V3tSwitches.hpp"
+#include <array>
+#include <cstdio>
+#include <map>
+#include <string>
 #include "SpirvBackend/SpirvBda.hpp"
 #include "SpirvBackend/SpirvEmitter.hpp"
 #include "SpirvBackend/SpirvEmitterHelpers.hpp"
@@ -17,6 +22,10 @@
 #include <SpirvBackend/SpirvEmitterInstructions.hpp>
 
 namespace ShaderRecompiler {
+
+std::map<std::string, std::array<std::uint64_t, 3>>& V3tCensus();
+std::map<std::string, std::array<std::uint32_t, 3>>& V3tCensusSlots();
+
 
 namespace {
 
@@ -354,6 +363,27 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     if (info != nullptr) {
         info->fullSubgroups = state.spannedWave;
         info->functionLdsBuffer = state.pixelFunctionLdsBuffer;
+    }
+    if (V3t::Census()) {
+        auto& census = V3tCensus();
+        std::uint64_t ir = 0, ops = 0, labels = 0, functionOps = 0, functionLabels = 0;
+        const auto& words = state.module.FunctionWords();
+        for (std::size_t cursor = 0; cursor < words.size();) {
+            const auto count = words[cursor] >> 16u;
+            if (count == 0u) break;
+            ++functionOps;
+            if ((words[cursor] & 0xffffu) == spv::OpLabel) ++functionLabels;
+            cursor += count;
+        }
+        for (const auto& [name, entry] : census) {
+            ir += entry[0];
+            ops += entry[1];
+            labels += entry[2];
+            std::fprintf(stderr, "[v3t-census] op %s ir %llu spirv %llu labels %llu\n", name.c_str(), static_cast<unsigned long long>(entry[0]), static_cast<unsigned long long>(entry[1]), static_cast<unsigned long long>(entry[2]));
+        }
+        std::fprintf(stderr, "[v3t-census] total ir %llu spirv-in-ir %llu labels-in-ir %llu main-section spirv %llu labels %llu lanes %u\n", static_cast<unsigned long long>(ir), static_cast<unsigned long long>(ops), static_cast<unsigned long long>(labels), static_cast<unsigned long long>(functionOps), static_cast<unsigned long long>(functionLabels), state.laneCount);
+        census.clear();
+        V3tCensusSlots().clear();
     }
     return state.module.Finalize();
 }

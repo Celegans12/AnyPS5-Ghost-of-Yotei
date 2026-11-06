@@ -56,6 +56,7 @@ public:
     void AddMemoryModel(std::uint32_t addressingModel, std::uint32_t memoryModel);
     void AddName(std::uint32_t target, const std::string& name);
     void AddFunction(std::span<const std::uint32_t> words);
+    [[nodiscard]] const std::vector<std::uint32_t>& FunctionWords() const { return functionInstructions; }
     void AddSubgroupBallot(std::uint32_t type, std::uint32_t result, std::uint32_t scope, std::uint32_t predicate);
     void BeginHelperFunction();
     void EndHelperFunction();

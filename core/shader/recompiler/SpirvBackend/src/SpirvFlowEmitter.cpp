@@ -1,3 +1,7 @@
+#include "V3tSwitches.hpp"
+#include <array>
+#include <map>
+#include <string>
 #include "SpirvBackend/SpirvImageEmitter.hpp"
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
 #include "PipelineSpecialization.hpp"
@@ -14,6 +18,17 @@
 #include <utility>
 
 namespace ShaderRecompiler {
+
+std::map<std::string, std::array<std::uint64_t, 3>>& V3tCensus() {
+    static std::map<std::string, std::array<std::uint64_t, 3>> census;
+    return census;
+}
+
+std::map<std::string, std::array<std::uint32_t, 3>>& V3tCensusSlots() {
+    static std::map<std::string, std::array<std::uint32_t, 3>> slots;
+    return slots;
+}
+
 namespace {
 
 void EmitKillIfBoolFalse(SpirvEmitterState& state, std::uint32_t active) {
@@ -81,6 +96,17 @@ const BlockInfo* BlockInfoFor(const IrProgram& program, const IrBlock* block) {
     throw std::runtime_error("SPIR-V control flow block has no metadata");
 }
 
+void V3tCensusFlush(SpirvEmitterState& state) {
+    if (!V3t::Census() || state.faultBufferVariable == 0u) return;
+    for (const auto& [name, slot] : V3tCensusSlots()) {
+        for (std::uint32_t part = 0; part < 2u; ++part) {
+            const auto value = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeU32(state), value, slot[1 + part]);
+            state.module.AddFunction(spv::OpAtomicIAdd, TypeU32(state), state.module.AllocateId(), BdaWord(state, state.faultBufferVariable, ConstantU32(state, BdaAbi::WrittenListWord + 2u * slot[0] + part)), ConstantU32(state, spv::ScopeDevice), ConstantU32(state, spv::MemorySemanticsMaskNone), value);
+        }
+    }
+}
+
 void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
     auto& state = ctx.state;
     if (state.loopGuardLimit != 0 && state.faultBufferVariable != 0) {
@@ -110,6 +136,7 @@ void EmitReturnTerminator(SpirvValueEmitContext& ctx) {
         state.module.AddFunction(spv::OpLoad, TypeU32(state), expected, pointer);
         EmitKillIfBoolFalse(state, Binary(state, spv::OpIEqual, TypeBool(state), masked, expected));
     }
+    V3tCensusFlush(state);
     state.module.AddFunction(spv::OpReturn);
 }
 
@@ -750,6 +777,43 @@ void EmitStructuredInstruction(SpirvValueEmitContext& ctx, StructuredFunctionSta
     EmitDirectInstruction(ctx, inst);
 }
 
+void V3tCensusAdd(SpirvEmitterState& state, const std::string& name, std::size_t start, bool firstLane) {
+    auto& entry = V3tCensus()[name];
+    const auto& words = state.module.FunctionWords();
+    if (start > words.size()) return;
+    if (firstLane) ++entry[0];
+    std::uint32_t ops = 0;
+    for (std::size_t cursor = start; cursor < words.size();) {
+        const auto count = words[cursor] >> 16u;
+        if (count == 0u) break;
+        ++entry[1];
+        ++ops;
+        if ((words[cursor] & 0xffffu) == spv::OpLabel) ++entry[2];
+        cursor += count;
+    }
+    if (state.faultBufferVariable == 0u) return;
+    auto& slots = V3tCensusSlots();
+    auto found = slots.find(name);
+    if (found == slots.end()) {
+        if (slots.size() >= 120u) return;
+        const auto u32 = TypeU32(state);
+        const auto index = static_cast<std::uint32_t>(slots.size());
+        std::array<std::uint32_t, 3> slot{index, 0u, 0u};
+        slot[1] = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u32), spv::StorageClassPrivate, ConstantU32(state, 0u));
+        slot[2] = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u32), spv::StorageClassPrivate, ConstantU32(state, 0u));
+        found = slots.emplace(name, slot).first;
+        std::fprintf(stderr, "[v3t-census] slot %u %s\n", index, name.c_str());
+    }
+    const auto bump = [&](std::uint32_t variable, std::uint32_t amount) {
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, TypeU32(state), value, variable);
+        state.module.AddFunction(spv::OpStore, variable, Binary(state, spv::OpIAdd, TypeU32(state), value, ConstantU32(state, amount)));
+    };
+    bump(found->second[1], 1u);
+    bump(found->second[2], ops);
+}
+
+
 void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrBlock* block) {
     auto& state = ctx.state;
     state.currentBlock = block;
@@ -801,7 +865,9 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             state.laneHalf = half;
             if (half == 0 || (inst->Opcode() != IrOpcode::Barrier && inst->Opcode() != IrOpcode::MeshAllocate)) {
                 state.runtimeBufferLabel = state.currentLabel;
+                const auto censusStart = V3t::Census() ? state.module.FunctionWords().size() : 0u;
                 EmitStructuredInstruction(lane, functionState, *inst);
+                if (V3t::Census()) V3tCensusAdd(state, std::string(IrOpcodeName(inst->Opcode())), censusStart, half == 0);
                 state.runtimeBufferLabel = 0;
             }
         }

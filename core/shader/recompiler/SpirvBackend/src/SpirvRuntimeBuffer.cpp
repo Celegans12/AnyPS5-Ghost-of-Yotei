@@ -165,9 +165,16 @@ DecodedDescriptor decode(SpirvValueEmitContext& context, const IrValue& instruct
     const auto& memory = context.Memory(instruction);
     const bool runtime = memory.gpuDescriptor || state.registrationModules;
     const auto first = PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords;
-    const bool runtimeShape = runtime || state.program.Resources().stage == IrShaderStage::Compute;
+    const bool runtimeShape = runtime || (state.program.Resources().stage == IrShaderStage::Compute && !V3t::SpecShape());
     auto word1 = runtimeShape ? context.Arg(handle, 1u) : state.module.SpecializationConstant(TypeU32(state), first, 0u);
     if (runtimeShape && GcnGuestShaders()) word1 = Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1, ConstantU32(state, GcnBufferWord1Mask));
+    if (!runtimeShape && V3t::SpecShapeChecked() && state.program.Resources().stage == IrShaderStage::Compute && state.program.Info().usesDma && state.faultBufferVariable != 0u) {
+        auto live = context.Arg(handle, 1u);
+        if (GcnGuestShaders()) live = Binary(state, spv::OpBitwiseAnd, TypeU32(state), live, ConstantU32(state, GcnBufferWord1Mask));
+        const auto mask = ConstantU32(state, 0xffff0000u);
+        const auto differs = Binary(state, spv::OpINotEqual, TypeBool(state), Binary(state, spv::OpBitwiseAnd, TypeU32(state), live, mask), Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1, mask));
+        faultIf(context, instruction, both(state, runtimePresent(context, handle), differs), BdaConstant(state, 0u), 0u, BdaAbi::FaultReason::InvalidDescriptor);
+    }
     const bool runtimeFormat = memory.gpuDescriptor || (state.registrationModules && !state.program.Info().buffers.at(memory.resource).descriptorFormatted);
     const bool selectsFormat = !runtimeFormat && !state.registrationModules && memory.kind == ResourceKind::Buffer && state.program.Resources().stage == IrShaderStage::Compute && state.program.Info().buffers.at(memory.resource).descriptorFormatted;
     const auto u32 = TypeU32(state);
@@ -403,7 +410,8 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     const auto lowIndex = GuardedElementIndex(state, access, inBounds, index);
     const auto highIndex = Select(state, TypeU32(state), both(state, inBounds, unaligned), next, lowIndex);
     const auto low = Binary(state, spv::OpShiftRightLogical, TypeU32(state), load(lowIndex), shift);
-    const auto high = EmitValueOrZero(state, unaligned, Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(highIndex), highShift));
+    const auto high = V3t::OneLoad() ? EmitValueOrZeroIfCondition(state, unaligned, [&] { return Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(highIndex), highShift); })
+                                     : EmitValueOrZero(state, unaligned, Binary(state, spv::OpShiftLeftLogical, TypeU32(state), load(highIndex), highShift));
     return EmitValueOrZero(state, inBounds, combine(low, high));
 }
 
@@ -1184,6 +1192,15 @@ std::uint32_t EmitRuntimeBufferLoad(SpirvValueEmitContext& context, const IrValu
     const auto type = components == 1u ? TypeU32(state) : TypeU32Composite(state, components);
     const auto zero = components == 1u ? ConstantU32(state, 0u) : ConstantU32CompositeZero(state, components);
     const auto resource = memory.formatted && !inlineFormat(context, instruction) ? descriptor(context, instruction) : bounded(context, instruction);
+    if (V3t::BranchlessLoads() && !memory.formatted && !memory.gpuDescriptor && !(components == 2u && memory.coherent && memory.dataBits == 32u && state.storageBufferU64Variable != 0u)) {
+        const auto exec = context.Arg(instruction, instruction.ArgumentCount() - 1u);
+        std::array<std::uint32_t, 4> values{};
+        for (std::uint32_t component = 0; component < components; ++component) {
+            const auto access = address(context, instruction, resource, component * 4u, memory.dataBits / 8u);
+            values[component] = readBuffer(context, instruction, access.guest, memory.dataBits, both(state, exec, access.inBounds));
+        }
+        return composite(state, components, values);
+    }
     return EmitValueOrDefaultIfCondition(state, context.Arg(instruction, instruction.ArgumentCount() - 1u), type, zero, [&] {
         checkDescriptor(context, instruction, resource);
         if (memory.formatted) return EmitValueOrDefaultIfCondition(state, resource.valid, type, zero, [&] { return formattedDispatch(context, instruction, resource, components, false, 0u); });

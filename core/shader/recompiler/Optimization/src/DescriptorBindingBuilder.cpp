@@ -1,4 +1,5 @@
 #include "Optimization/DescriptorBindingBuilder.hpp"
+#include "V3tSwitches.hpp"
 #include "UnnormalizedWrap.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -316,7 +317,7 @@ BufferSubstitute SpecializedBufferFields(const BufferResource& buffer, IrShaderS
     constexpr std::uint32_t shapeBits = 0xf0e00000u;
     constexpr std::uint32_t formatPresent = 1u << 12u;
     const auto word3 = !fields.known ? formatPresent : (fields.word3 & shapeBits) | (((fields.word3 >> 12u) & 0x7fu) != 0u ? formatPresent : 0u);
-    return {stage == IrShaderStage::Compute ? 0u : fields.word1, word3, fields.misalignment, true};
+    return {stage == IrShaderStage::Compute && !V3t::SpecShape() ? 0u : fields.word1, word3, fields.misalignment, true};
 }
 
 DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& layout, const ShaderInfo& info, IrShaderStage stage, const ResourceSnapshot& snapshot, std::span<const std::uint8_t> exportMappings, bool registrationModules, bool fragmentDescriptorSet, std::span<const BufferSubstitute> substitutes) const {
@@ -361,7 +362,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         if (registrationModules) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 3u, misalignment});
         if (!registrationModules) {
             const auto first = PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords;
-            if (stage != IrShaderStage::Compute) plan.specialization.push_back({first, fields.word1});
+            if (stage != IrShaderStage::Compute || V3t::SpecShape()) plan.specialization.push_back({first, fields.word1});
             plan.specialization.push_back({first + 1u, fields.word3});
             if (stage == IrShaderStage::Compute && buffer.descriptorFormatted) plan.specialization.push_back({first + PipelineSpecialization::BufferRuntimeFormatWord, !fields.known && PipelineSpecialization::AbsentRuntimeFormat() ? 1u : 0u});
             plan.specialization.push_back({first + 3u, misalignment});

@@ -27,6 +27,31 @@ inline bool SrtGuardHoist() {
     return value;
 }
 
+inline bool SpecShape() {
+    static const bool value = EnvNumber("APS5_V3T_SPEC_SHAPE") != 0u;
+    return value;
+}
+
+inline bool SpecShapeChecked() {
+    static const bool value = EnvNumber("APS5_V3T_SPEC_SHAPE") == 2u;
+    return value;
+}
+
+inline bool OneLoad() {
+    static const bool value = EnvNumber("APS5_V3T_ONE_LOAD") != 0u;
+    return value;
+}
+
+inline bool BranchlessLoads() {
+    static const bool value = EnvNumber("APS5_V3T_BRANCHLESS") != 0u;
+    return value;
+}
+
+inline bool Census() {
+    static const bool value = EnvNumber("APS5_V3T_CENSUS") != 0u;
+    return value;
+}
+
 inline std::uint32_t PlainCoherentReads() {
     static const std::uint32_t value = EnvNumber("APS5_V3T_NOVOL");
     return value;
