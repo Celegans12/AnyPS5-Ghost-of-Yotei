@@ -2476,7 +2476,7 @@ bool StorageTexture::RefreshLayers(std::uint32_t first, std::uint32_t count) {
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
-    if (!ImageFlags::Enabled()) return refreshFull(firstLayer, lastLayer);
+    if (!ImageFlags::StorageEnabled()) return refreshFull(firstLayer, lastLayer);
     const bool whole = firstLayer == 0 && lastLayer == trackedLayers && guestBytes != 0;
     const bool dcc = descriptor.dccAddress != 0;
     const bool flags = whole && (!dcc || ImageFlags::TargetEnabled()) && uploadedKeys == DccKeys::Uncompressed;

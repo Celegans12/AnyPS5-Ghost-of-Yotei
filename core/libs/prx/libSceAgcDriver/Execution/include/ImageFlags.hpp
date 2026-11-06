@@ -63,6 +63,10 @@ void CountBufferDrop(std::size_t entries);
 // Target flags (APS5_V3E_TARGET_FLAGS=1, start-time, needs APS5_V3E_IMAGE_FLAGS): the storage-image flags also take
 // images with DCC (render targets): the key range is armed and checked with the image's range.
 bool TargetEnabled();
+// Storage-image flags (APS5_V3E_STORAGE_FLAGS=1, start-time, needs APS5_V3E_IMAGE_FLAGS): StorageTexture::refresh arms
+// and serves storage images by token. Off by default since 11-06: with the tracker on, its arms of storage-image memory
+// made the B arm ~3x slower from the title screen on (round 8, §9).
+bool StorageEnabled();
 // Why a whole-image storage refresh does not use the flags (counted while APS5_V3E_IMAGE_FLAGS is on).
 enum class StorageSkip : std::uint8_t { Scoped, Dcc, Keys, Count };
 void CountStorageSkip(StorageSkip skip);

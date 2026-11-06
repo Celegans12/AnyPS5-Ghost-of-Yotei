@@ -76,7 +76,7 @@ void reportExtraLocked(const char* label) {
     }
     if (Enabled()) {
         AgcDriver::ProfilePrint_nid_no_patch("[storageflags] %s: not flagged: scoped %llu, dcc %llu, keys %llu; no token after a full refresh: kept at unwatch %llu, imported %llu, view %llu, not writable %llu, other private %llu, arm refused %llu%s
-", label, u(SkipsAt), u(SkipsAt + 1), u(SkipsAt + 2), u(UnwatchedAt), u(UnwatchedAt + 1), u(UnwatchedAt + 2), u(UnwatchedAt + 3), u(UnwatchedAt + 4), u(UnwatchedAt + 5), TargetEnabled() ? "; target flags on" : "");
+", label, u(SkipsAt), u(SkipsAt + 1), u(SkipsAt + 2), u(UnwatchedAt), u(UnwatchedAt + 1), u(UnwatchedAt + 2), u(UnwatchedAt + 3), u(UnwatchedAt + 4), u(UnwatchedAt + 5), TargetEnabled() ? "; target flags on" : StorageEnabled() ? "" : "; storage flags off");
     }
 }
 std::mutex reportMutex;
@@ -114,8 +114,13 @@ bool BufferVerify() {
     return verify;
 }
 
+bool StorageEnabled() {
+    static const bool enabled = Enabled() && flag("APS5_V3E_STORAGE_FLAGS");
+    return enabled;
+}
+
 bool TargetEnabled() {
-    static const bool enabled = Enabled() && flag("APS5_V3E_TARGET_FLAGS");
+    static const bool enabled = StorageEnabled() && flag("APS5_V3E_TARGET_FLAGS");
     return enabled;
 }
 
