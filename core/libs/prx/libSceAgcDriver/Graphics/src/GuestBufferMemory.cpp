@@ -907,6 +907,7 @@ const char* createBackingImport(const Context& context, HostImport& entry, Backi
 #endif
 
 const char* createImport(const Context& context, HostImport& entry, VkResult& failure) {
+    GuestMemory::DirtyMark(entry.base, static_cast<std::size_t>(entry.bytes));
     const char* step = createHostPointerImport(context, entry, failure);
 #ifndef _WIN32
     BackingFile backing;

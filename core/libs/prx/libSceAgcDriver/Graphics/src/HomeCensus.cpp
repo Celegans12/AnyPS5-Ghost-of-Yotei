@@ -490,6 +490,17 @@ bool Enabled() {
 }
 
 void Arm(Kind kind, std::uint64_t address, std::uint64_t bytes) {
+    if (Enabled() || GuestMemory::DirtyEnabled()) {
+        static std::mutex clockMutex;
+        static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        bool due = false;
+        {
+            std::lock_guard lock(clockMutex);
+            due = ProfileWindows::ClockDue(last);
+        }
+        if (due) Close("10 s");
+    }
+    if (bytes != 0 && bytes <= MaxBytes && GuestMemory::DirtyVerifyEnabled()) GuestMemory::DirtyVerifyUse(address, static_cast<std::size_t>(bytes));
     if (!Enabled() || bytes == 0 || bytes > MaxBytes) return;
     auto& state = Get();
     std::lock_guard lock(state.mutex);
@@ -516,6 +527,7 @@ void DriverWrite(std::uint64_t address, std::uint64_t bytes) {
 }
 
 void Close(const char* window) {
+    GuestMemory::ReportDirty(window);
     if (!Enabled()) return;
     auto& state = Get();
     std::lock_guard lock(state.mutex);

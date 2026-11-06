@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestDirty.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libc/include/Api.hpp"
 #ifdef _WIN32
@@ -1560,7 +1561,7 @@ static bool GuestPagesAllow(std::uintptr_t start, std::size_t bytes, DWORD allow
     for (auto address = start; address < end;) {
         MEMORY_BASIC_INFORMATION memory{};
         if (VirtualQuery(reinterpret_cast<LPCVOID>(address), &memory, sizeof(memory)) != sizeof(memory)) return false;
-        if (memory.State != MEM_COMMIT || (memory.Protect & PAGE_GUARD) != 0 || (memory.Protect & allowed) == 0) return false;
+        if (memory.State != MEM_COMMIT || (memory.Protect & PAGE_GUARD) != 0 || ((memory.Protect & allowed) == 0 && !GuestArena::GuestDirtyArmed_nid_postfix(address))) return false;
         address = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
     }
     return true;

@@ -1,3 +1,4 @@
+#include "prx/libc/include/GuestDirty.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
@@ -48,6 +49,7 @@ class MappingChange {
 public:
     MappingChange(std::uintptr_t address, std::size_t bytes, bool releasing) {
 #ifdef _WIN32
+        GuestDirtyMark_nid_postfix(address, bytes);
         auto& mappings = WindowsMappings::Get();
         mappings.ChangeBegin();
         counted = true;
@@ -478,6 +480,7 @@ std::invalid_argument OutsideArena(const char* operation, const void* pointer, s
 
 #ifdef _WIN32
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
+    GuestDirtyBeginProtection_nid_postfix(address, bytes);
     const MappingChange change(address, bytes, false);
     WindowsMappings::Get().SetProtection(address, bytes, protection);
     noteAccess(reinterpret_cast<const void*>(address), bytes);
@@ -503,6 +506,10 @@ void GuestArenaUnpinWritable_nid_postfix(const void* pointer, std::size_t bytes)
 }
 
 bool GuestArenaProtection_nid_postfix(std::uintptr_t address, std::uint32_t* protection) {
+    if (GuestDirtyArmed_nid_postfix(address)) {
+        *protection = PAGE_READWRITE;
+        return true;
+    }
     return WindowsMappings::Get().Protection(address, protection);
 }
 
@@ -717,7 +724,8 @@ void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t c
     for (std::size_t i = 0; i < count && i < values.size(); ++i) counts[i] = values[i];
 }
 
-void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {
+void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    GuestDirtyEndProtection_nid_postfix(address, bytes);
     WindowsMappings::Get().EndSetProtection();
 }
 
@@ -824,11 +832,14 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
 }
 
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
+    GuestDirtyBeginProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     const HostChange change;
     openAccessGuardsForHost(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (const auto hook = hostWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #ifdef _WIN32
-    return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    const bool opened = WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    if (!opened) GuestDirtyEndProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    return opened;
 #else
     GuestWriteWatch::GuestWriteWatchBeginHostWrite_nid_postfix(pointer, bytes);
     return true;
@@ -848,6 +859,7 @@ void GuestArenaEndHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
 #endif
 
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
+    GuestDirtyEndProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #ifdef _WIN32
     WindowsMappings::Get().EndHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #else

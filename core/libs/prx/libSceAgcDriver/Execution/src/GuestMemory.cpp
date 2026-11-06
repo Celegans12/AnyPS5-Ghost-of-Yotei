@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
+#include "prx/libc/include/GuestDirty.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -2038,6 +2039,7 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 }
 
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
+    DirtyMark(address, bytes);
     if (bytes == 0) return 0;
     BreakProofs();
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
@@ -2121,6 +2123,7 @@ static std::uint64_t markWrittenHeld(WriteTracker& tracker, TrackerLock& lock, s
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete) {
+    DirtyMark(address, bytes);
     BreakProofs();
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
@@ -3135,6 +3138,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
     requireNotSpeculative("store");
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     Graphics::FaultCensus::DriverWrite(address, current.size());
+    DirtyMark(address, current.size());
     BreakProofs();
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
@@ -3373,6 +3377,7 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     requireNotSpeculative("store");
     if (source.empty()) return;
     Graphics::FaultCensus::DriverWrite(address, source.size());
+    DirtyMark(address, source.size());
     // A store, as in WriteChanged.
     const ReadSiteScope site(ReadSite::Store);
     FlushGpuWrites(address, source.size());
@@ -3396,4 +3401,108 @@ extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std
     AgcDriver::GuestMemory::StoreOwnBytes(reinterpret_cast<std::uintptr_t>(pointer), sizeof(*pointer), [&] {
         std::atomic_ref(*pointer).store(value, std::memory_order_release);
     });
+}
+
+namespace AgcDriver::GuestMemory {
+
+namespace {
+
+struct DirtyVerifyEntry {
+    std::uint64_t token = 0;
+    std::uint64_t generation = 0;
+};
+
+struct DirtyVerifyState {
+    std::mutex mutex;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, DirtyVerifyEntry> entries;
+    std::uint64_t uses = 0, agreeClean = 0, agreeDirty = 0, falseDirty = 0, violations = 0, unarmable = 0;
+};
+
+DirtyVerifyState& dirtyVerify() {
+    static auto* state = new DirtyVerifyState;
+    return *state;
+}
+
+int dirtyVerifyMode() {
+    static const int mode = [] {
+        const char* value = std::getenv("APS5_V3M_DIRTY_VERIFY");
+        if (value == nullptr) return 0;
+        return std::string_view(value) == "throw" ? 2 : 1;
+    }();
+    return mode;
+}
+
+}
+
+bool DirtyEnabled() {
+    return GuestArena::GuestDirtyEnabled_nid_postfix();
+}
+
+std::uint64_t DirtyArm(std::uint64_t address, std::size_t bytes) {
+    return GuestArena::GuestDirtyArm_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+}
+
+bool DirtyCleanSince(std::uint64_t address, std::size_t bytes, std::uint64_t token) {
+    return GuestArena::GuestDirtyCleanSince_nid_postfix(static_cast<std::uintptr_t>(address), bytes, token);
+}
+
+bool DirtyCleanSinceAll(std::span<const DirtyQuery> queries) {
+    static_assert(sizeof(DirtyQuery) == sizeof(GuestArena::GuestDirtyQuery));
+    return GuestArena::GuestDirtyCleanSinceAll_nid_postfix(reinterpret_cast<const GuestArena::GuestDirtyQuery*>(queries.data()), queries.size());
+}
+
+void DirtyMark(std::uint64_t address, std::size_t bytes) {
+    GuestArena::GuestDirtyMark_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+}
+
+bool DirtyVerifyEnabled() {
+    return dirtyVerifyMode() != 0 && DirtyEnabled();
+}
+
+void DirtyVerifyUse(std::uint64_t address, std::size_t bytes) {
+    if (!DirtyVerifyEnabled() || bytes == 0) return;
+    const auto begin = address & ~std::uint64_t{0xffff};
+    const auto end = (address + bytes + 0xffff) & ~std::uint64_t{0xffff};
+    const auto size = static_cast<std::size_t>(end - begin);
+    auto& state = dirtyVerify();
+    std::lock_guard lock(state.mutex);
+    ++state.uses;
+    auto& entry = state.entries[{begin, end}];
+    if (entry.token != 0) {
+        const bool clean = DirtyCleanSince(begin, size, entry.token);
+        static_cast<void>(CollectWrites(begin, size));
+        const bool proof = UnchangedSince(begin, size, entry.generation);
+        if (clean && proof) ++state.agreeClean;
+        else if (!clean && !proof) ++state.agreeDirty;
+        else if (!clean) ++state.falseDirty;
+        else {
+            ++state.violations;
+            if (state.violations <= 16) std::fprintf(stderr, "[v3m-dirty] verify: 0x%llx+0x%zx clean by the tracker but changed by the write tracker (token %llu, generation %llu)\n", static_cast<unsigned long long>(begin), size, static_cast<unsigned long long>(entry.token), static_cast<unsigned long long>(entry.generation));
+            if (dirtyVerifyMode() == 2) throw std::runtime_error("APS5_V3M_DIRTY_VERIFY: a range the dirty tracker calls clean was written");
+        }
+        if (clean && proof) return;
+    }
+    entry.token = DirtyArm(begin, size);
+    if (entry.token == 0) ++state.unarmable;
+    entry.generation = CollectWrites(begin, size);
+}
+
+void ReportDirty(const char* window) {
+    if (!DirtyEnabled()) return;
+    GuestArena::GuestDirtyCounts counts;
+    GuestArena::GuestDirtyTakeCounts_nid_postfix(&counts);
+    std::uint64_t uses = 0, agreeClean = 0, agreeDirty = 0, falseDirty = 0, violations = 0, unarmable = 0;
+    {
+        auto& state = dirtyVerify();
+        std::lock_guard lock(state.mutex);
+        uses = std::exchange(state.uses, 0);
+        agreeClean = std::exchange(state.agreeClean, 0);
+        agreeDirty = std::exchange(state.agreeDirty, 0);
+        falseDirty = std::exchange(state.falseDirty, 0);
+        violations = std::exchange(state.violations, 0);
+        unarmable = std::exchange(state.unarmable, 0);
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[v3m-dirty] window=%s arms %llu (%llu pages newly armed, %llu protect calls, %.2f ms), refused %llu; faults %llu (%.2f ms); marks %llu (%llu armed blocks disarmed); clean queries %llu, clean %llu; verify uses %llu: agree clean %llu, agree dirty %llu, tracker-dirty-only %llu, VIOLATIONS %llu, unarmable %llu\n", window, static_cast<unsigned long long>(counts.arms), static_cast<unsigned long long>(counts.armedPages), static_cast<unsigned long long>(counts.protectCalls), counts.armNs / 1e6, static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.faults), counts.faultNs / 1e6, static_cast<unsigned long long>(counts.marks), static_cast<unsigned long long>(counts.markedBlocks), static_cast<unsigned long long>(counts.cleanQueries), static_cast<unsigned long long>(counts.cleanAnswers), static_cast<unsigned long long>(uses), static_cast<unsigned long long>(agreeClean), static_cast<unsigned long long>(agreeDirty), static_cast<unsigned long long>(falseDirty), static_cast<unsigned long long>(violations), static_cast<unsigned long long>(unarmable));
+}
+
 }
