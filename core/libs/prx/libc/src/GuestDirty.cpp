@@ -23,8 +23,9 @@ constexpr unsigned LeafShift = 30;
 constexpr std::uintptr_t BlocksPerLeaf = (std::uintptr_t{1} << LeafShift) / BlockBytes;
 constexpr std::uintptr_t LeafCount = std::uintptr_t{1} << (47 - LeafShift);
 
-struct alignas(16) Block {
+struct alignas(32) Block {
     std::atomic<std::uint64_t> dirty{0};
+    std::atomic<std::uint64_t> refusedEpoch{0};
     std::atomic<std::uint32_t> armed{0};
     std::atomic<std::uint32_t> lock{0};
 };
@@ -35,10 +36,11 @@ struct Leaf {
 
 std::atomic<Leaf*> leaves[LeafCount];
 std::atomic<std::uint64_t> clock{1};
+std::atomic<std::uint64_t> mappingEpoch{1};
 std::atomic<int> forced{-1};
 
 struct Counters {
-    std::atomic<std::uint64_t> arms{0}, armedPages{0}, protectCalls{0}, armNs{0}, refused{0}, faults{0}, faultNs{0}, marks{0}, markedBlocks{0}, cleanQueries{0}, cleanAnswers{0};
+    std::atomic<std::uint64_t> arms{0}, armedPages{0}, protectCalls{0}, armNs{0}, refused{0}, faults{0}, faultNs{0}, marks{0}, markedBlocks{0}, bumps{0}, cleanQueries{0}, cleanAnswers{0};
 };
 Counters counters;
 
@@ -137,20 +139,6 @@ bool eligibleRun(std::uintptr_t begin, std::uintptr_t end) {
     return true;
 }
 
-bool eligibleMask(std::uintptr_t blockBase, std::uint32_t mask) {
-    std::uint32_t protection = 0;
-    if (WindowsMappings::Get().Protection(blockBase, &protection)) return false;
-    std::uintptr_t start = 0, stop = 0;
-    if (WindowsMappings::Get().ResidentSpan(blockBase, BlockBytes, &start, &stop)) return false;
-    while (mask != 0) {
-        const auto first = static_cast<unsigned>(__builtin_ctz(mask));
-        auto last = first;
-        while (last + 1 < PagesPerBlock && (mask & (1u << (last + 1))) != 0) ++last;
-        if (!eligibleRun(blockBase + first * PageBytes, blockBase + (last + 1) * PageBytes)) return false;
-        mask &= ~static_cast<std::uint32_t>(((std::uint64_t{1} << (last + 1)) - 1) & ~((std::uint64_t{1} << first) - 1));
-    }
-    return true;
-}
 #endif
 
 bool overlapsFlight(std::uintptr_t begin, std::uintptr_t end) {
@@ -181,6 +169,26 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
     const auto begin = address & ~(PageBytes - 1);
     const auto end = (address + bytes + PageBytes - 1) & ~(PageBytes - 1);
     counters.arms.fetch_add(1, std::memory_order_relaxed);
+    const auto epoch = mappingEpoch.load(std::memory_order_acquire);
+    bool allArmed = true;
+    for (auto blockBase = begin & ~(BlockBytes - 1); blockBase < end; blockBase += BlockBytes) {
+        const auto* block = findBlock(blockBase);
+        if (block != nullptr && block->refusedEpoch.load(std::memory_order_acquire) == epoch) {
+            counters.refused.fetch_add(1, std::memory_order_relaxed);
+            counters.armNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
+            return 0;
+        }
+        const auto want = pageMask(blockBase, begin, end);
+        if (block == nullptr || (block->armed.load(std::memory_order_acquire) & want) != want) {
+            allArmed = false;
+            break;
+        }
+    }
+    if (allArmed && !overlapsFlight(begin, end)) {
+        const auto token = clock.fetch_add(1, std::memory_order_seq_cst) + 1;
+        counters.armNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
+        return token;
+    }
     std::lock_guard lock(armMutex);
     const auto refuse = [&] {
         counters.refused.fetch_add(1, std::memory_order_relaxed);
@@ -188,20 +196,69 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
         return std::uint64_t{0};
     };
     if (overlapsFlight(begin, end)) return refuse();
+    struct Held {
+        Block* block;
+        std::uintptr_t base;
+        std::uint32_t add;
+    };
+    thread_local std::vector<Held> held;
+    thread_local std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+    held.clear();
+    runs.clear();
+    const auto release = [&] {
+        for (auto& entry : held) unlockBlock(*entry.block);
+        held.clear();
+    };
+    if (WindowsMappings::Get().AccessGuardsUsed()) return refuse();
     for (auto blockBase = begin & ~(BlockBytes - 1); blockBase < end; blockBase += BlockBytes) {
         const auto want = pageMask(blockBase, begin, end);
         auto* existing = findBlock(blockBase);
         if (existing != nullptr && (existing->armed.load(std::memory_order_acquire) & want) == want) continue;
         auto* block = makeBlock(blockBase);
-        if (block == nullptr) return refuse();
-        if (!eligibleMask(blockBase, want & ~block->armed.load(std::memory_order_acquire))) return refuse();
+        if (block == nullptr) {
+            release();
+            return refuse();
+        }
         lockBlock(*block);
         const auto add = want & ~block->armed.load(std::memory_order_acquire);
-        block->armed.fetch_or(add, std::memory_order_seq_cst);
-        protectMask(blockBase, add, PAGE_READONLY);
-        unlockBlock(*block);
-        counters.armedPages.fetch_add(static_cast<std::uint64_t>(__builtin_popcount(add)), std::memory_order_relaxed);
+        if (add == 0) {
+            unlockBlock(*block);
+            continue;
+        }
+        held.push_back({block, blockBase, add});
+        auto mask = add;
+        while (mask != 0) {
+            const auto first = static_cast<unsigned>(__builtin_ctz(mask));
+            auto last = first;
+            while (last + 1 < PagesPerBlock && (mask & (1u << (last + 1))) != 0) ++last;
+            const auto from = blockBase + first * PageBytes;
+            const auto to = blockBase + (last + 1) * PageBytes;
+            if (!runs.empty() && runs.back().second == from) runs.back().second = to;
+            else runs.emplace_back(from, to);
+            mask &= ~static_cast<std::uint32_t>(((std::uint64_t{1} << (last + 1)) - 1) & ~((std::uint64_t{1} << first) - 1));
+        }
     }
+    for (const auto& [from, to] : runs) {
+        if (!eligibleRun(from, to)) {
+            for (auto& entry : held) {
+                if (entry.base + BlockBytes > from && entry.base < to) entry.block->refusedEpoch.store(epoch, std::memory_order_release);
+            }
+            release();
+            return refuse();
+        }
+    }
+    std::uint64_t pages = 0;
+    for (auto& entry : held) {
+        entry.block->armed.fetch_or(entry.add, std::memory_order_seq_cst);
+        pages += static_cast<std::uint64_t>(__builtin_popcount(entry.add));
+    }
+    for (const auto& [from, to] : runs) {
+        DWORD previous = 0;
+        VirtualProtect(reinterpret_cast<void*>(from), to - from, PAGE_READONLY, &previous);
+        counters.protectCalls.fetch_add(1, std::memory_order_relaxed);
+    }
+    release();
+    counters.armedPages.fetch_add(pages, std::memory_order_relaxed);
     const auto token = clock.fetch_add(1, std::memory_order_seq_cst) + 1;
     counters.armNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
     return token;
@@ -260,6 +317,22 @@ void GuestDirtyMark_nid_postfix(std::uintptr_t address, std::size_t bytes) {
 #endif
 }
 
+void GuestDirtyBump_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    if (bytes == 0 || !enabled()) return;
+    const auto begin = address & ~(PageBytes - 1);
+    const auto end = (address + bytes + PageBytes - 1) & ~(PageBytes - 1);
+    for (auto blockBase = begin & ~(BlockBytes - 1); blockBase < end; blockBase += BlockBytes) {
+        auto* block = findBlock(blockBase);
+        if (block == nullptr) {
+            blockBase = (((blockBase >> LeafShift) + 1) << LeafShift) - BlockBytes;
+            continue;
+        }
+        if (block->armed.load(std::memory_order_acquire) == 0) continue;
+        block->dirty.store(clock.fetch_add(1, std::memory_order_seq_cst) + 1, std::memory_order_seq_cst);
+        counters.bumps.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 bool GuestDirtyHandleWrite_nid_postfix(std::uintptr_t address) {
 #ifdef _WIN32
     if (!enabled()) return false;
@@ -292,8 +365,15 @@ bool GuestDirtyArmed_nid_postfix(std::uintptr_t address) {
     return block != nullptr && (block->armed.load(std::memory_order_acquire) & (1u << ((address - blockBase) / PageBytes))) != 0;
 }
 
+void GuestDirtyMappingChange_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+    if (!enabled() || bytes == 0) return;
+    mappingEpoch.fetch_add(1, std::memory_order_acq_rel);
+    GuestDirtyMark_nid_postfix(address, bytes);
+}
+
 void GuestDirtyBeginProtection_nid_postfix(std::uintptr_t address, std::size_t bytes) {
     if (!enabled() || bytes == 0) return;
+    mappingEpoch.fetch_add(1, std::memory_order_acq_rel);
     {
         std::lock_guard lock(flightMutex);
         inFlight.emplace_back(address, address + bytes);
@@ -328,6 +408,7 @@ void GuestDirtyTakeCounts_nid_postfix(GuestDirtyCounts* out) {
     out->faultNs = take(counters.faultNs);
     out->marks = take(counters.marks);
     out->markedBlocks = take(counters.markedBlocks);
+    out->bumps = take(counters.bumps);
     out->cleanQueries = take(counters.cleanQueries);
     out->cleanAnswers = take(counters.cleanAnswers);
 }

@@ -49,7 +49,7 @@ class MappingChange {
 public:
     MappingChange(std::uintptr_t address, std::size_t bytes, bool releasing) {
 #ifdef _WIN32
-        GuestDirtyMark_nid_postfix(address, bytes);
+        GuestDirtyMappingChange_nid_postfix(address, bytes);
         auto& mappings = WindowsMappings::Get();
         mappings.ChangeBegin();
         counted = true;

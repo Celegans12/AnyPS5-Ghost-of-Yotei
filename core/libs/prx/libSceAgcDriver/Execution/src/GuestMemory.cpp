@@ -2123,7 +2123,7 @@ static std::uint64_t markWrittenHeld(WriteTracker& tracker, TrackerLock& lock, s
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete) {
-    DirtyMark(address, bytes);
+    GuestArena::GuestDirtyBump_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
     BreakProofs();
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
@@ -3415,7 +3415,7 @@ struct DirtyVerifyEntry {
 struct DirtyVerifyState {
     std::mutex mutex;
     std::map<std::pair<std::uint64_t, std::uint64_t>, DirtyVerifyEntry> entries;
-    std::uint64_t uses = 0, agreeClean = 0, agreeDirty = 0, falseDirty = 0, violations = 0, unarmable = 0;
+    std::uint64_t uses = 0, agreeClean = 0, agreeDirty = 0, falseDirty = 0, violations = 0, unarmable = 0, unverifiable = 0;
 };
 
 DirtyVerifyState& dirtyVerify() {
@@ -3468,7 +3468,9 @@ void DirtyVerifyUse(std::uint64_t address, std::size_t bytes) {
     std::lock_guard lock(state.mutex);
     ++state.uses;
     auto& entry = state.entries[{begin, end}];
-    if (entry.token != 0) {
+    if (entry.token != 0 && entry.generation == 0) {
+        ++state.unverifiable;
+    } else if (entry.token != 0) {
         const bool clean = DirtyCleanSince(begin, size, entry.token);
         static_cast<void>(CollectWrites(begin, size));
         const bool proof = UnchangedSince(begin, size, entry.generation);
@@ -3491,7 +3493,7 @@ void ReportDirty(const char* window) {
     if (!DirtyEnabled()) return;
     GuestArena::GuestDirtyCounts counts;
     GuestArena::GuestDirtyTakeCounts_nid_postfix(&counts);
-    std::uint64_t uses = 0, agreeClean = 0, agreeDirty = 0, falseDirty = 0, violations = 0, unarmable = 0;
+    std::uint64_t uses = 0, agreeClean = 0, agreeDirty = 0, falseDirty = 0, violations = 0, unarmable = 0, unverifiable = 0;
     {
         auto& state = dirtyVerify();
         std::lock_guard lock(state.mutex);
@@ -3501,8 +3503,9 @@ void ReportDirty(const char* window) {
         falseDirty = std::exchange(state.falseDirty, 0);
         violations = std::exchange(state.violations, 0);
         unarmable = std::exchange(state.unarmable, 0);
+        unverifiable = std::exchange(state.unverifiable, 0);
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[v3m-dirty] window=%s arms %llu (%llu pages newly armed, %llu protect calls, %.2f ms), refused %llu; faults %llu (%.2f ms); marks %llu (%llu armed blocks disarmed); clean queries %llu, clean %llu; verify uses %llu: agree clean %llu, agree dirty %llu, tracker-dirty-only %llu, VIOLATIONS %llu, unarmable %llu\n", window, static_cast<unsigned long long>(counts.arms), static_cast<unsigned long long>(counts.armedPages), static_cast<unsigned long long>(counts.protectCalls), counts.armNs / 1e6, static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.faults), counts.faultNs / 1e6, static_cast<unsigned long long>(counts.marks), static_cast<unsigned long long>(counts.markedBlocks), static_cast<unsigned long long>(counts.cleanQueries), static_cast<unsigned long long>(counts.cleanAnswers), static_cast<unsigned long long>(uses), static_cast<unsigned long long>(agreeClean), static_cast<unsigned long long>(agreeDirty), static_cast<unsigned long long>(falseDirty), static_cast<unsigned long long>(violations), static_cast<unsigned long long>(unarmable));
+    AgcDriver::ProfilePrint_nid_no_patch("[v3m-dirty] window=%s arms %llu (%llu pages newly armed, %llu protect calls, %.2f ms), refused %llu; faults %llu (%.2f ms); marks %llu (%llu armed blocks disarmed), GPU bumps %llu; clean queries %llu, clean %llu; verify uses %llu: agree clean %llu, agree dirty %llu, tracker-dirty-only %llu, VIOLATIONS %llu, unarmable %llu, unverifiable (not write-watched) %llu\n", window, static_cast<unsigned long long>(counts.arms), static_cast<unsigned long long>(counts.armedPages), static_cast<unsigned long long>(counts.protectCalls), counts.armNs / 1e6, static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.faults), counts.faultNs / 1e6, static_cast<unsigned long long>(counts.marks), static_cast<unsigned long long>(counts.markedBlocks), static_cast<unsigned long long>(counts.bumps), static_cast<unsigned long long>(counts.cleanQueries), static_cast<unsigned long long>(counts.cleanAnswers), static_cast<unsigned long long>(uses), static_cast<unsigned long long>(agreeClean), static_cast<unsigned long long>(agreeDirty), static_cast<unsigned long long>(falseDirty), static_cast<unsigned long long>(violations), static_cast<unsigned long long>(unarmable), static_cast<unsigned long long>(unverifiable));
 }
 
 }

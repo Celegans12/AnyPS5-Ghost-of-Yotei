@@ -3,6 +3,7 @@
 #include "prx/libc/include/GuestDirty.hpp"
 #include <windows.h>
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <cstdio>
 #include <iostream>
@@ -100,6 +101,10 @@ void RefusesWhatItCannotOwn() {
     DWORD previous = 0;
     Require(VirtualProtect(memory.bytes + Block, Page, PAGE_READONLY, &previous) != 0, "cannot make a read-only page");
     Require(GuestArena::GuestDirtyArm_nid_postfix(memory.At(Block), Page) == 0, "a page the guest made read-only was armed");
+    Require(GuestArena::GuestDirtyArm_nid_postfix(memory.At(Block), Page) == 0, "a refused page was armed on the second try");
+    Require(VirtualProtect(memory.bytes + Block, Page, PAGE_READWRITE, &previous) != 0, "cannot make the page writable again");
+    GuestArena::GuestDirtyMappingChange_nid_postfix(memory.At(Block), Page);
+    Require(GuestArena::GuestDirtyArm_nid_postfix(memory.At(Block), Page) != 0, "a page made writable again after a mapping change was not armed");
     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, static_cast<DWORD>(Block), nullptr);
     Require(section != nullptr, "cannot create a section");
     auto* view = static_cast<unsigned char*>(MapViewOfFile(section, FILE_MAP_WRITE, 0, 0, Block));
@@ -149,6 +154,24 @@ void StoreUnderOwnBlockLock() {
     Require(!GuestArena::GuestDirtyCleanSince_nid_postfix(memory.At(0), Block, token), "the block written under its own lock is clean");
 }
 
+void GpuBumpKeepsProtection() {
+    Memory memory;
+    const auto token = GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), Block);
+    Require(token != 0, "the block was not armed");
+    GuestArena::GuestDirtyBump_nid_postfix(memory.At(Page), 4);
+    Require(!GuestArena::GuestDirtyCleanSince_nid_postfix(memory.At(0), Block, token), "a GPU-written block is clean for the old token");
+    Require(Protection(memory.At(0)) == PAGE_READONLY && GuestArena::GuestDirtyArmed_nid_postfix(memory.At(0)), "a GPU write opened the block");
+    GuestArena::GuestDirtyCounts counts;
+    GuestArena::GuestDirtyTakeCounts_nid_postfix(&counts);
+    const auto again = GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), Block);
+    GuestArena::GuestDirtyTakeCounts_nid_postfix(&counts);
+    Require(again > token && GuestArena::GuestDirtyCleanSince_nid_postfix(memory.At(0), Block, again), "re-arming after a GPU write is not clean");
+    Require(counts.protectCalls == 0, "re-arming a still-armed block changed a protection");
+    const auto before = handled.load();
+    static_cast<volatile unsigned char*>(memory.bytes)[2 * Page] = 4;
+    Require(handled.load() == before + 1, "a CPU store after a GPU write did not fault");
+}
+
 void BatchedQueries() {
     Memory memory;
     const auto token = GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), 2 * Block);
@@ -196,6 +219,28 @@ void HostWriteOpensArmedPages() {
 
 }
 
+void ArmCost() {
+    constexpr std::size_t Bytes = std::size_t{64} << 20;
+    auto* bytes = static_cast<unsigned char*>(VirtualAlloc(nullptr, Bytes, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE));
+    Require(bytes != nullptr, "cannot allocate the cost buffer");
+    for (std::size_t offset = 0; offset < Bytes; offset += Page) bytes[offset] = 1;
+    const auto time = [](auto&& body) {
+        const auto start = std::chrono::steady_clock::now();
+        body();
+        return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - start).count();
+    };
+    DWORD previous = 0;
+    const auto rawWhole = time([&] { VirtualProtect(bytes, Bytes, PAGE_READONLY, &previous); });
+    const auto rawBack = time([&] { VirtualProtect(bytes, Bytes, PAGE_READWRITE, &previous); });
+    const auto rawPages = time([&] { for (std::size_t offset = 0; offset < Bytes; offset += Block) VirtualProtect(bytes + offset, Block, PAGE_READONLY, &previous); });
+    VirtualProtect(bytes, Bytes, PAGE_READWRITE, &previous);
+    const auto arm = time([&] { Require(GuestArena::GuestDirtyArm_nid_postfix(reinterpret_cast<std::uintptr_t>(bytes), Bytes) != 0, "the cost buffer was not armed"); });
+    const auto rearm = time([&] { Require(GuestArena::GuestDirtyArm_nid_postfix(reinterpret_cast<std::uintptr_t>(bytes), Bytes) != 0, "the cost buffer was not re-armed"); });
+    const auto mark = time([&] { GuestArena::GuestDirtyMark_nid_postfix(reinterpret_cast<std::uintptr_t>(bytes), Bytes); });
+    std::printf("COST 64 MiB (16384 pages): VirtualProtect whole RO %.0f us, back %.0f us, per 64 KiB %.0f us (%.2f us/call); Arm %.0f us (%.2f us/page), re-Arm (all armed) %.0f us, Mark %.0f us\n", rawWhole, rawBack, rawPages, rawPages / (Bytes / Block), arm, arm / (Bytes / Page), rearm, mark);
+    VirtualFree(bytes, 0, MEM_RELEASE);
+}
+
 int main() {
     GuestArena::GuestDirtyForceEnable_nid_no_patch(true);
     void* handler = AddVectoredExceptionHandler(1, HandleWrite);
@@ -210,7 +255,9 @@ int main() {
         {"write watch sees faulted stores", WriteWatchSeesFaultedStores},
         {"store under the block's own lock", StoreUnderOwnBlockLock},
         {"batched queries", BatchedQueries},
+        {"GPU bump keeps protection", GpuBumpKeepsProtection},
         {"host write opens armed pages", HostWriteOpensArmedPages},
+        {"arm cost", ArmCost},
     };
     int failed = 0;
     for (const auto& [name, test] : tests) {

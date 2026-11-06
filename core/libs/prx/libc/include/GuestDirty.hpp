@@ -16,6 +16,7 @@ struct GuestDirtyCounts {
     std::uint64_t faultNs = 0;
     std::uint64_t marks = 0;
     std::uint64_t markedBlocks = 0;
+    std::uint64_t bumps = 0;
     std::uint64_t cleanQueries = 0;
     std::uint64_t cleanAnswers = 0;
 };
@@ -33,8 +34,10 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
 bool GuestDirtyCleanSince_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint64_t token);
 bool GuestDirtyCleanSinceAll_nid_postfix(const GuestDirtyQuery* queries, std::size_t count);
 void GuestDirtyMark_nid_postfix(std::uintptr_t address, std::size_t bytes);
+void GuestDirtyBump_nid_postfix(std::uintptr_t address, std::size_t bytes);
 bool GuestDirtyHandleWrite_nid_postfix(std::uintptr_t address);
 bool GuestDirtyArmed_nid_postfix(std::uintptr_t address);
+void GuestDirtyMappingChange_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestDirtyBeginProtection_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestDirtyEndProtection_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestDirtyTakeCounts_nid_postfix(GuestDirtyCounts* counts);
