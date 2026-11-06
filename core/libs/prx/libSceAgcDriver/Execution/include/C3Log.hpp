@@ -30,6 +30,10 @@ void NoteSkipped(Skip reason);
 enum class Step : std::uint8_t { None, NotReusable, InUse, Snapshots, Space, Served, Prove, Imports, Threw, Count };
 struct Split {
     std::uint64_t keyNs = 0, findNs = 0, snapshotsNs = 0, spaceNs = 0, proveNs = 0, importsNs = 0, movedNs = 0;
+    // Inside prove (revalidateFull): the pending-write completion over the set's regions, ranges and storage images;
+    // the texture/storage proof (stamps or walk); the imported-region tail. Why the epoch memo did not serve it.
+    std::uint64_t completeNs = 0, imagesNs = 0, regionsNs = 0;
+    bool epochMoved = false, proofMoved = false, pendingMoved = false;
     Step refused = Step::None;
     bool epochReused = false;
     bool keyBuilt = false;

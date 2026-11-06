@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/IndexClamp_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
@@ -1414,8 +1415,39 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     DrawInputCopy copy;
+    const Recorder::FlagMemo* flagged = nullptr;
+    // v3 C4-buffers for vertex/index inputs (see PrepareDrawBindings): after the GPU writes are flushed, a range with
+    // no recorded GPU write or pending CPU store over it, clean since its remembered copy's token, takes that copy.
+    const auto checkFlagged = [&](const DrawInputCopy& result, bool derivedKnown) {
+        if (flagged == nullptr) return;
+        const auto served = result.buffer != nullptr ? result.buffer->Bytes() : std::span<std::byte>{};
+        const auto remembered = flagged->buffer->Bytes();
+        if (served.size() < bytes || remembered.size() < bytes || std::memcmp(served.data(), remembered.data(), bytes) != 0) ImageFlags::ThrowBufferDisagreement(address, bytes, "other input bytes");
+        if (derivedKnown && result.derived != flagged->derived) ImageFlags::ThrowBufferDisagreement(address, bytes, "another derived value");
+        ImageFlags::NoteServed(address, bytes);
+    };
     if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
+        if (ImageFlags::BufferEnabled()) {
+            if (recorder->PendingWriteOverlaps(address, bytes) || PendingCpuWritesOverlap(context, address, bytes)) {
+                ImageFlags::CountBufferGate(ImageFlags::BufferUse::Input);
+            } else {
+                flagged = recorder->FlaggedSnapshot(address, bytes, use);
+                const bool clean = flagged != nullptr && ImageFlags::CleanSince(address, bytes, flagged->token);
+                if (!clean) {
+                    flagged = nullptr;
+                    copy.flagToken = ImageFlags::Arm(address, bytes);
+                }
+                ImageFlags::CountBuffer(ImageFlags::BufferUse::Input, clean, copy.flagToken != 0);
+                if (clean && !ImageFlags::BufferVerify()) {
+                    ImageFlags::NoteServed(address, bytes);
+                    copy.buffer = flagged->buffer;
+                    copy.derived = flagged->derived;
+                    copy.reused = true;
+                    return copy;
+                }
+            }
+        }
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
         const bool owned = copy.generation == 0 && !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedVertexInputs) && !recorder->PendingWriteOverlaps(address, bytes);
@@ -1425,6 +1457,8 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         if (copy.buffer != nullptr) {
             copy.reused = true;
             ShaderResources::CountDrawInputPath(owned ? ShaderResources::DrawInputPath::OwnedHit : ShaderResources::DrawInputPath::TrackedHit, bytes, static_cast<std::uint8_t>(miss), false, false);
+            checkFlagged(copy, true);
+            if (flagged == nullptr && copy.flagToken != 0) recorder->NoteFlaggedSnapshot(address, bytes, use, {copy.buffer, 0, copy.flagToken, copy.derived});
             return copy;
         }
         if (owned && copy.ownedArm) {
@@ -1441,6 +1475,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::DrawSnapshot);
     copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     GuestMemory::Read(address, copy.buffer->Bytes(), alignment);
+    checkFlagged(copy, false);
     return copy;
 }
 
@@ -1464,6 +1499,7 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
 
 void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCopy& copy, Recorder::SnapshotUse use, std::uint32_t derived) {
     if (recorder == nullptr || copy.reused || copy.buffer == nullptr) return;
+    if (copy.flagToken != 0) recorder->NoteFlaggedSnapshot(address, copy.buffer->Bytes().size(), use, {copy.buffer, 0, copy.flagToken, derived});
     if (copy.generation == 0) {
         if (!copy.ownedWords.empty()) recorder->KeepOwnedDrawSnapshot(address, copy.buffer->Bytes().size(), copy.ownedWords, copy.ownedSince, copy.registryGeneration, copy.ownedForget, copy.buffer, use, derived);
         else if (copy.ownedArm) recorder->RefuseOwnedDrawSnapshot(address, copy.buffer->Bytes().size(), use);

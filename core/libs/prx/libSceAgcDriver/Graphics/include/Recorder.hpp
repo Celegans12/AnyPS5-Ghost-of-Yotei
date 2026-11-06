@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RECORDER_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PendingWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
@@ -345,6 +346,20 @@ public:
     static constexpr std::size_t DrawInputEntries = 16384;
     std::shared_ptr<Buffer> UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset = nullptr);
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset = 0);
+    // v3 C4-buffers (ImageFlags::BufferEnabled): buffers served by a dirty-tracker token, keyed by range and use.
+    // Bounded by entries and by the distinct buffers held (a draw upload slice holds its whole chunk); over either
+    // bound the memo is dropped whole.
+    struct FlagMemo {
+        std::shared_ptr<Buffer> buffer;
+        VkDeviceSize offset = 0;
+        std::uint64_t token = 0;
+        std::uint32_t derived = 0;
+    };
+    static constexpr std::size_t FlagMemoEntries = 16384;
+    static constexpr std::size_t FlagMemoHeldBytes = std::size_t{512} << 20u;
+    // The entry's value, or null; its `token` is the one the value was read under.
+    const FlagMemo* FlaggedSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use) const;
+    void NoteFlaggedSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, FlagMemo memo);
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr);
     static constexpr std::size_t ContainingSnapshotProbes = 16;
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0);
@@ -1346,6 +1361,7 @@ private:
         VkDeviceSize offset = 0;
     };
     std::unordered_map<std::uint64_t, UnwrittenSnapshot> unwrittenSnapshots;
+    ImageFlags::TokenMemo<FlagMemo, SnapshotUse> flaggedSnapshots{FlagMemoEntries, FlagMemoHeldBytes};
     using OwnedSnapshotKey = std::tuple<std::uint64_t, std::size_t, SnapshotUse>;
     struct OwnedSnapshot {
         std::vector<std::uint64_t> words;

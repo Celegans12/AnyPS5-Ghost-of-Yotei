@@ -2476,25 +2476,58 @@ bool StorageTexture::RefreshLayers(std::uint32_t first, std::uint32_t count) {
 }
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
-    const bool flags = ImageFlags::Enabled() && firstLayer == 0 && lastLayer == trackedLayers && descriptor.dccAddress == 0 && uploadedKeys == DccKeys::Uncompressed && guestBytes != 0;
-    if (!flags) return refreshFull(firstLayer, lastLayer);
+    if (!ImageFlags::Enabled()) return refreshFull(firstLayer, lastLayer);
+    const bool whole = firstLayer == 0 && lastLayer == trackedLayers && guestBytes != 0;
+    const bool dcc = descriptor.dccAddress != 0;
+    const bool flags = whole && (!dcc || ImageFlags::TargetEnabled()) && uploadedKeys == DccKeys::Uncompressed;
+    if (!flags) {
+        ImageFlags::CountStorageSkip(!whole ? ImageFlags::StorageSkip::Scoped : dcc && !ImageFlags::TargetEnabled() ? ImageFlags::StorageSkip::Dcc : ImageFlags::StorageSkip::Keys);
+        return refreshFull(firstLayer, lastLayer);
+    }
     const auto base = descriptor.baseAddress;
     const auto bytes = static_cast<std::size_t>(guestBytes);
+    const auto keyBytes = dcc ? DccKeyBytes(guestBytes) : 0;
     const bool otherPending = otherPendingOverlaps(!RuntimeSwitches::Set(RuntimeSwitch::NoRefreshLookupCache));
-    const bool cpuPending = PendingCpuWritesOverlap(context, base, bytes);
+    const bool cpuPending = PendingCpuWritesOverlap(context, base, bytes) || (dcc && PendingCpuWritesOverlap(context, descriptor.dccAddress, keyBytes));
     const bool blocked = otherPending || cpuPending;
-    ImageFlags::CountStorageGate(otherPending, cpuPending, dirtyToken == 0);
-    const bool clean = !blocked && watchedAtRefresh && dirtyToken != 0 && ImageFlags::CleanSince(base, bytes, dirtyToken);
+    ImageFlags::CountStorageGate(otherPending, cpuPending, dirtyToken == 0 || (dcc && keyToken == 0));
+    bool clean = !blocked && watchedAtRefresh && dirtyToken != 0 && (!dcc || keyToken != 0);
+    if (clean) {
+        if (dcc) {
+            const std::array<ImageFlags::DirtyQuery, 2> queries{{{base, bytes, dirtyToken}, {descriptor.dccAddress, keyBytes, keyToken}}};
+            clean = ImageFlags::CleanSinceAll(queries);
+        } else {
+            clean = ImageFlags::CleanSince(base, bytes, dirtyToken);
+        }
+    }
     if (clean && !ImageFlags::Verify()) {
         ImageFlags::CountStorage(true);
         ImageFlags::NoteServed(base, bytes);
+        if (dcc) ImageFlags::NoteServed(descriptor.dccAddress, keyBytes);
         NoteProved();
         return true;
     }
-    if (!clean) dirtyToken = blocked || !watchedAtRefresh ? 0 : ImageFlags::Arm(base, bytes);
+    if (!clean) {
+        dirtyToken = blocked || !watchedAtRefresh ? 0 : ImageFlags::Arm(base, bytes);
+        keyToken = dcc && dirtyToken != 0 ? ImageFlags::Arm(descriptor.dccAddress, keyBytes) : 0;
+    }
+    const auto versionBefore = Version();
     const bool current = refreshFull(firstLayer, lastLayer);
-    if (clean && !current) ImageFlags::ThrowDisagreement(base, bytes);
+    if (clean && (!current || Version() != versionBefore)) ImageFlags::ThrowDisagreement(base, bytes);
     ImageFlags::CountStorage(clean);
+    // Census for the mem lane: why an image ends a full refresh without a token.
+    if (!clean && !blocked) {
+        if (!watchedAtRefresh) {
+            if (!keptAtUnwatch.empty()) ImageFlags::CountUnwatched(ImageFlags::Unwatched::KeptAtUnwatch);
+            else if (ExistingHostImportFor(context, base, bytes) != nullptr) ImageFlags::CountUnwatched(ImageFlags::Unwatched::Imported);
+            else {
+                const auto page = HostPageClass(base);
+                ImageFlags::CountUnwatched(page == 1 ? ImageFlags::Unwatched::View : page == 2 ? ImageFlags::Unwatched::NotWritable : ImageFlags::Unwatched::Private);
+            }
+        } else if (dirtyToken == 0 || (dcc && keyToken == 0)) {
+            ImageFlags::CountUnwatched(ImageFlags::Unwatched::ArmRefused);
+        }
+    }
     return current;
 }
 

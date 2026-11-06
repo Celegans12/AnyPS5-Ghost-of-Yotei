@@ -5172,6 +5172,12 @@ bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofR
             if (C3Log::Enabled()) C3Log::ThreadSplit().epochReused = true;
             return true;
         }
+        if (C3Log::Enabled()) {
+            auto& split = C3Log::ThreadSplit();
+            split.epochMoved = epoch == 0 || provedEpoch != epoch;
+            split.proofMoved = provedProof != proof;
+            split.pendingMoved = provedPending != pending;
+        }
         const bool ok = revalidateFull(shaders, report);
         noteEpochProof(false, false, false);
         if (ok) {
@@ -5197,6 +5203,15 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    // v3 C4 census (APS5_V3E_C3_LOG): where revalidateFull's time goes.
+    const bool c3 = C3Log::Enabled();
+    auto c3Lap = c3 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto c3Step = [&](std::uint64_t C3Log::Split::*field) {
+        if (!c3) return;
+        const auto now = std::chrono::steady_clock::now();
+        C3Log::ThreadSplit().*field += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - c3Lap).count());
+        c3Lap = now;
+    };
     for (const auto& region : directRegions) {
         static_cast<void>(FlushDepthPlanes(region.begin, static_cast<std::size_t>(region.end - region.begin)));
         CompletePendingCpuWrites(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
@@ -5210,6 +5225,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
         CompletePendingCpuWrites(context, image->Descriptor().baseAddress, static_cast<std::size_t>(image->GuestBytes()));
         if (image->Descriptor().dccAddress != 0) CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
     }
+    c3Step(&C3Log::Split::completeNs);
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
@@ -5387,6 +5403,12 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             if (profile) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
         }
     }
+    c3Step(&C3Log::Split::imagesNs);
+    const auto regionsDone = [&] { c3Step(&C3Log::Split::regionsNs); };
+    struct RegionsLap {
+        decltype(regionsDone)& done;
+        ~RegionsLap() { done(); }
+    } regionsLap{regionsDone};
     // (2) The imported buffers the set reads in place: results of storage images pending in them go
     // to guest memory first (as an upload does), then each import must still be the one the set was
     // written against. This comes last because the lookups and flushes above can reconcile imports
@@ -7705,13 +7727,40 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
         }
-        if (GuestMemory::GpuOwned(begin, bytes)) {
+        const bool gpuOwned = GuestMemory::GpuOwned(begin, bytes);
+        if (gpuOwned) {
             GuestMemory::GuardRead(begin, bytes);
             stamped = false;
         }
         if (!stamped) {
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
+        }
+        // v3 C4-buffers: a range no GPU work, CPU store or ownership stands over, and that the tracker calls clean
+        // since the token its remembered buffer was read under, binds that buffer (verify: today's path runs too,
+        // its result is served and compared). The arm comes before today's read of the bytes.
+        const Recorder::FlagMemo* flagged = nullptr;
+        std::uint64_t flagToken = 0;
+        if (ImageFlags::BufferEnabled() && bytes != 0) {
+            if (gpuSourced || gpuOwned || recorder.PendingWriteOverlaps(begin, bytes) || PendingCpuWritesOverlap(context, begin, bytes)) {
+                ImageFlags::CountBufferGate(ImageFlags::BufferUse::Binding);
+            } else {
+                flagged = recorder.FlaggedSnapshot(begin, bytes, Recorder::SnapshotUse::Storage);
+                const bool clean = flagged != nullptr && ImageFlags::CleanSince(begin, bytes, flagged->token);
+                if (!clean) {
+                    flagged = nullptr;
+                    flagToken = ImageFlags::Arm(begin, bytes);
+                }
+                ImageFlags::CountBuffer(ImageFlags::BufferUse::Binding, clean, flagToken != 0);
+                if (clean && !ImageFlags::BufferVerify()) {
+                    ImageFlags::NoteServed(begin, bytes);
+                    selected.push_back(index);
+                    keep({begin, flagged->buffer, flagged->offset, bytes});
+                    totalSnapshotBytes += bytes;
+                    CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
+                    continue;
+                }
+            }
         }
         VkDeviceSize offset = 0;
         auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
@@ -7750,6 +7799,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 // C64: a range only GPU work rewrote since its snapshot is read in place (the base descriptor), not
                 // compared and patched again on every draw (two 23 MiB menu buffers, ~1.6 ms/frame, best413/414).
                 if (override == moved.end() && !RuntimeSwitches::Set(RuntimeSwitch::NoGpuWrittenInPlace) && recorder.DrawSnapshotGpuWrittenOnly(begin, bytes)) {
+                    if (flagged != nullptr) ImageFlags::ThrowBufferDisagreement(begin, bytes, "a GPU-written range read in place");
                     countGpuWrittenInPlace(bytes);
                     continue;
                 }
@@ -7763,6 +7813,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     const auto importOffset = import != nullptr ? HostImportOffset(*import, begin) : 0;
                     const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
                     if (import != nullptr && importOffset % alignment == 0 && bytes <= context.limits.maxStorageBufferRange) {
+                        if (flagged != nullptr) ImageFlags::ThrowBufferDisagreement(begin, bytes, "a GPU-written moved range read in place");
                         recorder.NotePendingRead(begin, bytes, Recorder::ReadKind::DrawInput);
                         countGpuWrittenInPlace(bytes);
                         selected.push_back(index);
@@ -7802,6 +7853,15 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             }
             if (GuestMemory::TrackerGeneration() != stamp[0]) stamped = false;
             else if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer, offset);
+        }
+        if (flagged != nullptr) {
+            if (gpuSide) ImageFlags::ThrowBufferDisagreement(begin, bytes, "a GPU-side source");
+            const auto served = buffer->Bytes();
+            const auto remembered = flagged->buffer->Bytes();
+            if (served.size() < offset + bytes || remembered.size() < flagged->offset + bytes || std::memcmp(served.data() + offset, remembered.data() + flagged->offset, bytes) != 0) ImageFlags::ThrowBufferDisagreement(begin, bytes, "other bytes");
+            ImageFlags::NoteServed(begin, bytes);
+        } else if (flagToken != 0 && !gpuSide) {
+            recorder.NoteFlaggedSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, {buffer, offset, flagToken, 0});
         }
         selected.push_back(index);
         keep({begin, std::move(buffer), offset, bytes});

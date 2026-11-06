@@ -4125,6 +4125,19 @@ GuestAllocations::Lease mappedRangesLease(const HostImports& state, const GuestA
 
 }
 
+int HostPageClass(std::uint64_t address) {
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT) return 2;
+    if (info.Type == MEM_MAPPED) return 1;
+    constexpr DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return (info.Protect & writable) != 0 ? 0 : 2;
+#else
+    static_cast<void>(address);
+    return 0;
+#endif
+}
+
 const HostImport* ExistingHostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     auto& state = Imports();

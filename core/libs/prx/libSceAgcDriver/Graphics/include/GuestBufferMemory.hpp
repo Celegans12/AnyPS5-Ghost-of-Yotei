@@ -117,6 +117,9 @@ void ReportHostImports();
 // address)` in the import's buffer.
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, ImportRequester requester = ImportRequester::Access);
 const HostImport* ExistingHostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+// Diagnostic (v3 storage-flags census): the OS view of the page at `address`: 0 private and writable, 1 a mapped
+// view, 2 not writable (or not committed).
+int HostPageClass(std::uint64_t address);
 struct HostImportLookupCache {
     const HostImport* import = nullptr;
     std::uint64_t address = 0;

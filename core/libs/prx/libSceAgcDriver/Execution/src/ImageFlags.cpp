@@ -48,6 +48,37 @@ struct Counts {
 };
 Counts counts;
 std::array<std::uint64_t, 13> reported{};
+
+// C4-buffers, storage skips and no-token classes: [bufferflags] / [storageflags] lines.
+constexpr std::size_t BufferUses = static_cast<std::size_t>(BufferUse::Count);
+constexpr std::size_t Skips = static_cast<std::size_t>(StorageSkip::Count);
+constexpr std::size_t UnwatchedClasses = static_cast<std::size_t>(Unwatched::Count);
+// per use: clean, missing or dirty, armed, gated
+constexpr std::size_t BufferFields = 4;
+constexpr std::size_t ExtraCount = BufferUses * BufferFields + 2 + Skips + UnwatchedClasses;
+std::array<std::atomic<std::uint64_t>, ExtraCount> extra{};
+std::array<std::uint64_t, ExtraCount> extraReported{};
+constexpr std::size_t DropsAt = BufferUses * BufferFields;
+constexpr std::size_t SkipsAt = DropsAt + 2;
+constexpr std::size_t UnwatchedAt = SkipsAt + Skips;
+
+void reportExtraLocked(const char* label) {
+    std::array<std::uint64_t, ExtraCount> d{};
+    for (std::size_t i = 0; i < ExtraCount; ++i) {
+        const auto now = extra[i].load(std::memory_order_relaxed);
+        d[i] = now - extraReported[i];
+        extraReported[i] = now;
+    }
+    const auto u = [&](std::size_t i) { return static_cast<unsigned long long>(d[i]); };
+    if (BufferEnabled()) {
+        AgcDriver::ProfilePrint_nid_no_patch("[bufferflags] %s: bindings clean %llu / not clean %llu (armed %llu, gated %llu); inputs clean %llu / not clean %llu (armed %llu, gated %llu); memo drops %llu (%llu entries)%s
+", label, u(0), u(1), u(2), u(3), u(4), u(5), u(6), u(7), u(DropsAt), u(DropsAt + 1), BufferVerify() ? "; verify on" : "");
+    }
+    if (Enabled()) {
+        AgcDriver::ProfilePrint_nid_no_patch("[storageflags] %s: not flagged: scoped %llu, dcc %llu, keys %llu; no token after a full refresh: kept at unwatch %llu, imported %llu, view %llu, not writable %llu, other private %llu, arm refused %llu%s
+", label, u(SkipsAt), u(SkipsAt + 1), u(SkipsAt + 2), u(UnwatchedAt), u(UnwatchedAt + 1), u(UnwatchedAt + 2), u(UnwatchedAt + 3), u(UnwatchedAt + 4), u(UnwatchedAt + 5), TargetEnabled() ? "; target flags on" : "");
+    }
+}
 std::mutex reportMutex;
 std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 
@@ -71,6 +102,50 @@ bool Enabled() {
 bool Verify() {
     static const bool verify = flag("APS5_V3E_IMAGE_FLAGS_VERIFY");
     return verify;
+}
+
+bool BufferEnabled() {
+    static const bool enabled = flag("APS5_V3E_BUFFER_FLAGS");
+    return enabled;
+}
+
+bool BufferVerify() {
+    static const bool verify = flag("APS5_V3E_BUFFER_FLAGS_VERIFY");
+    return verify;
+}
+
+bool TargetEnabled() {
+    static const bool enabled = Enabled() && flag("APS5_V3E_TARGET_FLAGS");
+    return enabled;
+}
+
+void CountBuffer(BufferUse use, bool clean, bool armed) {
+    const auto at = static_cast<std::size_t>(use) * BufferFields;
+    extra[at + (clean ? 0 : 1)].fetch_add(1, std::memory_order_relaxed);
+    if (armed) extra[at + 2].fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountBufferGate(BufferUse use) {
+    extra[static_cast<std::size_t>(use) * BufferFields + 3].fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountBufferDrop(std::size_t entries) {
+    extra[DropsAt].fetch_add(1, std::memory_order_relaxed);
+    extra[DropsAt + 1].fetch_add(entries, std::memory_order_relaxed);
+}
+
+void CountStorageSkip(StorageSkip skip) {
+    extra[SkipsAt + static_cast<std::size_t>(skip)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void CountUnwatched(Unwatched reason) {
+    extra[UnwatchedAt + static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void ThrowBufferDisagreement(std::uint64_t address, std::size_t bytes, const char* what) {
+    char text[224];
+    std::snprintf(text, sizeof(text), "AGC graphics: buffer flags call 0x%llx (+0x%zx) clean while today's path finds %s (APS5_V3E_BUFFER_FLAGS_VERIFY)", static_cast<unsigned long long>(address), bytes, what);
+    throw std::runtime_error(text);
 }
 
 void UseBackend(const Backend* use) {
@@ -125,16 +200,18 @@ void ThrowDisagreement(std::uint64_t address, std::size_t bytes) {
 }
 
 void Close(const char* label) {
-    if (!Enabled()) return;
+    if (!Enabled() && !BufferEnabled()) return;
     std::lock_guard lock(reportMutex);
-    reportLocked(label);
+    if (Enabled()) reportLocked(label);
+    reportExtraLocked(label);
 }
 
 void MaybeReport() {
-    if (!Enabled() || ProfileWindows::FrameWindows()) return;
+    if ((!Enabled() && !BufferEnabled()) || ProfileWindows::FrameWindows()) return;
     std::unique_lock lock(reportMutex, std::try_to_lock);
     if (!lock.owns_lock() || !ProfileWindows::ClockDue(lastReport)) return;
-    reportLocked("10s");
+    if (Enabled()) reportLocked("10s");
+    reportExtraLocked("10s");
 }
 
 }

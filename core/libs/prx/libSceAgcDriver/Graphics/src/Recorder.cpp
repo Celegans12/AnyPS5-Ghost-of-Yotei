@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -4049,6 +4050,19 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
     if (unwrittenSnapshots.size() >= UnwrittenSnapshotEntries || bytes > DrawSnapshotBudget - unwrittenBytes) return;
     unwrittenSnapshots.emplace(address, UnwrittenSnapshot{bytes, std::move(buffer), offset});
     unwrittenBytes += bytes;
+}
+
+const Recorder::FlagMemo* Recorder::FlaggedSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use) const {
+    const auto* entry = flaggedSnapshots.Find(address, bytes, use);
+    return entry != nullptr ? &entry->value : nullptr;
+}
+
+void Recorder::NoteFlaggedSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, FlagMemo memo) {
+    if (memo.buffer == nullptr) return;
+    const auto* holder = memo.buffer.get();
+    const auto holderBytes = memo.buffer->Bytes().size();
+    const auto token = memo.token;
+    flaggedSnapshots.Note(address, bytes, use, std::move(memo), token, holder, holderBytes);
 }
 
 std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, VkDeviceSize* offset) {

@@ -42,7 +42,7 @@ constexpr std::size_t StepCount = static_cast<std::size_t>(Step::Count);
 constexpr std::array<const char*, StepCount> StepNames{"none", "not-reusable", "in-use", "snapshots", "space", "moved", "prove", "imports", "threw"};
 
 struct SplitTotals {
-    std::uint64_t hits = 0, served = 0, keyNs = 0, findNs = 0, snapshotsNs = 0, spaceNs = 0, proveNs = 0, importsNs = 0, movedNs = 0, epochReused = 0, keysBuilt = 0;
+    std::uint64_t hits = 0, served = 0, keyNs = 0, findNs = 0, snapshotsNs = 0, spaceNs = 0, proveNs = 0, importsNs = 0, movedNs = 0, epochReused = 0, keysBuilt = 0, completeNs = 0, imagesNs = 0, regionsNs = 0, epochMoved = 0, proofMoved = 0, pendingMoved = 0;
     std::array<std::uint64_t, StepCount> refused{};
 };
 SplitTotals splits;
@@ -61,7 +61,7 @@ std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::no
 void reportLocked(const char* label) {
     std::string line = "[c3log] ";
     line += label;
-    char text[256];
+    char text[512];
     const auto perHit = [&](std::uint64_t value) { return totals.compared == 0 ? 0.0 : static_cast<double>(value) / static_cast<double>(totals.compared); };
     std::snprintf(text, sizeof(text), ": %llu compared hits, log %.0f bytes in %.1f regions per hit (max %llu), memcmp %.2f us, proof %.2f us per hit; memcmp same / differs by proof verdict:", static_cast<unsigned long long>(totals.compared), perHit(totals.bytes), perHit(totals.regions), static_cast<unsigned long long>(totals.maxBytes), perHit(totals.memcmpNs) / 1e3, perHit(totals.proofNs) / 1e3);
     line += text;
@@ -78,7 +78,7 @@ void reportLocked(const char* label) {
     std::snprintf(text, sizeof(text), "; %zu logs", logs.size());
     line += text;
     const auto per = [&](std::uint64_t ns) { return splits.hits == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(splits.hits); };
-    std::snprintf(text, sizeof(text), "; lookup split per hit (%llu hits, %llu served, %llu keys built here, %llu epoch-reused proofs): key %.2f find %.2f snapshots %.2f space %.2f prove %.2f imports %.2f moved %.2f us; refused at:", static_cast<unsigned long long>(splits.hits), static_cast<unsigned long long>(splits.served), static_cast<unsigned long long>(splits.keysBuilt), static_cast<unsigned long long>(splits.epochReused), per(splits.keyNs), per(splits.findNs), per(splits.snapshotsNs), per(splits.spaceNs), per(splits.proveNs), per(splits.importsNs), per(splits.movedNs));
+    std::snprintf(text, sizeof(text), "; lookup split per hit (%llu hits, %llu served, %llu keys built here, %llu epoch-reused proofs): key %.2f find %.2f snapshots %.2f space %.2f prove %.2f (complete %.2f images %.2f regions %.2f; epoch memo missed: epoch moved %llu, proof serial moved %llu, pending serial moved %llu) imports %.2f moved %.2f us; refused at:", static_cast<unsigned long long>(splits.hits), static_cast<unsigned long long>(splits.served), static_cast<unsigned long long>(splits.keysBuilt), static_cast<unsigned long long>(splits.epochReused), per(splits.keyNs), per(splits.findNs), per(splits.snapshotsNs), per(splits.spaceNs), per(splits.proveNs), per(splits.completeNs), per(splits.imagesNs), per(splits.regionsNs), static_cast<unsigned long long>(splits.epochMoved), static_cast<unsigned long long>(splits.proofMoved), static_cast<unsigned long long>(splits.pendingMoved), per(splits.importsNs), per(splits.movedNs));
     line += text;
     for (std::size_t i = 1; i < StepCount; ++i) {
         if (splits.refused[i] == 0) continue;
@@ -171,6 +171,12 @@ void NoteSplit(const Split& split, bool served) {
     splits.proveNs += split.proveNs;
     splits.importsNs += split.importsNs;
     splits.movedNs += split.movedNs;
+    splits.completeNs += split.completeNs;
+    splits.imagesNs += split.imagesNs;
+    splits.regionsNs += split.regionsNs;
+    if (split.epochMoved) ++splits.epochMoved;
+    if (split.proofMoved) ++splits.proofMoved;
+    if (split.pendingMoved) ++splits.pendingMoved;
     if (split.epochReused) ++splits.epochReused;
     if (split.keyBuilt) ++splits.keysBuilt;
     ++splits.refused[static_cast<std::size_t>(split.refused)];
