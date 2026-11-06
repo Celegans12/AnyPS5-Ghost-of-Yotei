@@ -38,6 +38,15 @@ struct Logged {
     std::vector<std::byte> bytes;
 };
 
+constexpr std::size_t StepCount = static_cast<std::size_t>(Step::Count);
+constexpr std::array<const char*, StepCount> StepNames{"none", "not-reusable", "in-use", "snapshots", "space", "moved", "prove", "imports", "threw"};
+
+struct SplitTotals {
+    std::uint64_t hits = 0, served = 0, keyNs = 0, findNs = 0, snapshotsNs = 0, spaceNs = 0, proveNs = 0, importsNs = 0, movedNs = 0, epochReused = 0, keysBuilt = 0;
+    std::array<std::uint64_t, StepCount> refused{};
+};
+SplitTotals splits;
+
 struct Totals {
     std::array<std::array<std::uint64_t, ProofCount>, 2> pairs{};
     std::array<std::uint64_t, SkipCount> skips{};
@@ -66,10 +75,20 @@ void reportLocked(const char* label) {
         std::snprintf(text, sizeof(text), " %s %llu", SkipNames[i], static_cast<unsigned long long>(totals.skips[i]));
         line += text;
     }
-    std::snprintf(text, sizeof(text), "; %zu logs\n", logs.size());
+    std::snprintf(text, sizeof(text), "; %zu logs", logs.size());
     line += text;
+    const auto per = [&](std::uint64_t ns) { return splits.hits == 0 ? 0.0 : static_cast<double>(ns) / 1e3 / static_cast<double>(splits.hits); };
+    std::snprintf(text, sizeof(text), "; lookup split per hit (%llu hits, %llu served, %llu keys built here, %llu epoch-reused proofs): key %.2f find %.2f snapshots %.2f space %.2f prove %.2f imports %.2f moved %.2f us; refused at:", static_cast<unsigned long long>(splits.hits), static_cast<unsigned long long>(splits.served), static_cast<unsigned long long>(splits.keysBuilt), static_cast<unsigned long long>(splits.epochReused), per(splits.keyNs), per(splits.findNs), per(splits.snapshotsNs), per(splits.spaceNs), per(splits.proveNs), per(splits.importsNs), per(splits.movedNs));
+    line += text;
+    for (std::size_t i = 1; i < StepCount; ++i) {
+        if (splits.refused[i] == 0) continue;
+        std::snprintf(text, sizeof(text), " %s %llu", StepNames[i], static_cast<unsigned long long>(splits.refused[i]));
+        line += text;
+    }
+    line += "\n";
     AgcDriver::ProfilePrint_nid_no_patch("%s", line.c_str());
     totals = {};
+    splits = {};
 }
 
 }
@@ -134,6 +153,27 @@ void NoteCompared(bool memcmpSame, Proof proof, std::uint64_t proofNs, std::uint
     totals.bytes += bytes;
     totals.regions += regions;
     if (bytes > totals.maxBytes) totals.maxBytes = bytes;
+}
+
+Split& ThreadSplit() {
+    thread_local Split split;
+    return split;
+}
+
+void NoteSplit(const Split& split, bool served) {
+    std::lock_guard lock(mutex);
+    ++splits.hits;
+    if (served) ++splits.served;
+    splits.keyNs += split.keyNs;
+    splits.findNs += split.findNs;
+    splits.snapshotsNs += split.snapshotsNs;
+    splits.spaceNs += split.spaceNs;
+    splits.proveNs += split.proveNs;
+    splits.importsNs += split.importsNs;
+    splits.movedNs += split.movedNs;
+    if (split.epochReused) ++splits.epochReused;
+    if (split.keyBuilt) ++splits.keysBuilt;
+    ++splits.refused[static_cast<std::size_t>(split.refused)];
 }
 
 void NoteSkipped(Skip reason) {

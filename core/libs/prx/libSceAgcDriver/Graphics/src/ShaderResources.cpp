@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
+#include "prx/libSceAgcDriver/Execution/include/C3Log.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -4975,11 +4976,36 @@ bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report, std::span<const GuestMemorySnapshot> snapshots) {
-    if (!addressReuse) return proveBuild(shaders, report);
+    const bool c3 = C3Log::Enabled();
+    auto& c3Split = C3Log::ThreadSplit();
+    auto c3Lap = c3 ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto c3Step = [&](std::uint64_t C3Log::Split::*field) {
+        if (!c3) return;
+        const auto now = std::chrono::steady_clock::now();
+        c3Split.*field += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - c3Lap).count());
+        c3Lap = now;
+    };
+    if (!addressReuse) {
+        const bool proved = proveBuild(shaders, report);
+        c3Step(&C3Log::Split::proveNs);
+        if (c3 && !proved) c3Split.refused = C3Log::Step::Prove;
+        return proved;
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto refuse = [&](AddressReuse reason) {
         CountAddressReuse(reason, profile ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()) : 0);
+        if (c3) {
+            switch (reason) {
+                case AddressReuse::NotReusable: c3Split.refused = C3Log::Step::NotReusable; break;
+                case AddressReuse::InUse: c3Split.refused = C3Log::Step::InUse; break;
+                case AddressReuse::Snapshots: c3Split.refused = C3Log::Step::Snapshots; break;
+                case AddressReuse::Space: c3Split.refused = C3Log::Step::Space; break;
+                case AddressReuse::Imports: c3Split.refused = C3Log::Step::Imports; break;
+                case AddressReuse::Proof: c3Split.refused = C3Log::Step::Prove; break;
+                default: c3Split.refused = C3Log::Step::Threw; break;
+            }
+        }
         return false;
     };
     CountAddressReuseProof();
@@ -4992,7 +5018,9 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (!shared && InUse()) return refuse(AddressReuse::InUse);
     if (!bdaTemplate) {
         CompleteSnapshotWrites(snapshots);
-        if (!guestMemory.SameSnapshots(snapshots)) return refuse(AddressReuse::Snapshots);
+        const bool same = guestMemory.SameSnapshots(snapshots);
+        c3Step(&C3Log::Split::snapshotsNs);
+        if (!same) return refuse(AddressReuse::Snapshots);
     }
     struct Suspend {
         GuestBufferMemory& memory;
@@ -5002,13 +5030,21 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         }
     } suspend{guestMemory};
     try {
-        if (!guestMemory.ResumeSpace()) return refuse(AddressReuse::Space);
+        const bool resumed = guestMemory.ResumeSpace();
+        c3Step(&C3Log::Split::spaceNs);
+        if (!resumed) return refuse(AddressReuse::Space);
         if (bdaTemplate) {
             CompleteSnapshotWrites(snapshots);
-            if (!guestMemory.SnapshotsServed(snapshots)) return refuse(AddressReuse::Snapshots);
+            const bool served = guestMemory.SnapshotsServed(snapshots);
+            c3Step(&C3Log::Split::snapshotsNs);
+            if (!served) return refuse(AddressReuse::Snapshots);
         }
-        if (!proveBuild(shaders, &outcome)) return refuse(outcome.failure == ProofFailure::Imports ? AddressReuse::Imports : AddressReuse::Proof);
-        if (!guestMemory.SpaceImportsCurrent()) {
+        const bool proved = proveBuild(shaders, &outcome);
+        c3Step(&C3Log::Split::proveNs);
+        if (!proved) return refuse(outcome.failure == ProofFailure::Imports ? AddressReuse::Imports : AddressReuse::Proof);
+        const bool current = guestMemory.SpaceImportsCurrent();
+        c3Step(&C3Log::Split::importsNs);
+        if (!current) {
             outcome.failure = ProofFailure::Imports;
             return refuse(AddressReuse::Imports);
         }
@@ -5053,6 +5089,7 @@ bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofR
             }
             if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
             noteEpochProof(true, false, false);
+            if (C3Log::Enabled()) C3Log::ThreadSplit().epochReused = true;
             return true;
         }
         const bool ok = revalidateFull(shaders, report);

@@ -2312,6 +2312,14 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
         ShaderResources::CountTemplateOutcome(ShaderResources::TemplateOutcome::Storing);
         if (ShaderResources::StagesStoreOnlyThroughExtInst(shaders)) ShaderResources::CountTemplateOutcome(ShaderResources::TemplateOutcome::StoringExtOnly);
     }
+    if (c3Log) C3Log::ThreadSplit() = {};
+    auto c3Lap = c3Log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto c3Step = [&](std::uint64_t C3Log::Split::*field) {
+        if (!c3Log) return;
+        const auto now = std::chrono::steady_clock::now();
+        C3Log::ThreadSplit().*field += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - c3Lap).count());
+        c3Lap = now;
+    };
     if (resolved.cacheable) {
         if (prepared != nullptr && prepared->keyed && prepared->trimmed == trimKey) {
             resolved.contentKey = std::move(prepared->contentKey);
@@ -2321,8 +2329,11 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             resolved.contentKey = ahead->contentKey;
         } else {
             resolved.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
+            if (c3Log) C3Log::ThreadSplit().keyBuilt = true;
         }
+        c3Step(&C3Log::Split::keyNs);
         auto cached = SharedResourceCache().Find(resolved.contentKey);
+        c3Step(&C3Log::Split::findNs);
         const bool inUse = cached != nullptr && cached->InUse() && !cached->SharesUses();
         if (inUse) CountAddressReuse(AddressReuse::InUse);
         if (c3Log && cached == nullptr) C3Log::NoteSkipped(C3Log::Skip::NoEntry);
@@ -2338,7 +2349,13 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             const bool valid = cached->Revalidate(shaders, c3Log ? &c3Report : nullptr, snapshots);
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
+            const auto c3MovedStart = c3Log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            if (c3Log) {
+                C3Log::ThreadSplit().movedNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - c3MovedStart).count());
+                if (valid && !moved.has_value()) C3Log::ThreadSplit().refused = C3Log::Step::Served;
+                C3Log::NoteSplit(C3Log::ThreadSplit(), moved.has_value());
+            }
             if (c3Log) {
                 const auto proofNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - c3ProofStart).count());
                 if (!c3Logged) {
