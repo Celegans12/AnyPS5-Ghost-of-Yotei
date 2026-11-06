@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestDirty.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -500,7 +501,11 @@ void Arm(Kind kind, std::uint64_t address, std::uint64_t bytes) {
         }
         if (due) Close("10 s");
     }
-    if (bytes != 0 && bytes <= MaxBytes && GuestMemory::DirtyVerifyEnabled()) GuestMemory::DirtyVerifyUse(address, static_cast<std::size_t>(bytes));
+    if (bytes != 0 && bytes <= MaxBytes && GuestMemory::DirtyVerifyEnabled()) {
+        const auto previous = GuestArena::GuestDirtySetArmKind_nid_postfix(static_cast<unsigned>(kind) + 1u);
+        GuestMemory::DirtyVerifyUse(address, static_cast<std::size_t>(bytes));
+        GuestArena::GuestDirtySetArmKind_nid_postfix(previous);
+    }
     if (!Enabled() || bytes == 0 || bytes > MaxBytes) return;
     auto& state = Get();
     std::lock_guard lock(state.mutex);
@@ -528,6 +533,7 @@ void DriverWrite(std::uint64_t address, std::uint64_t bytes) {
 
 void Close(const char* window) {
     GuestMemory::ReportDirty(window);
+    StorageTokens::Report(window);
     if (!Enabled()) return;
     auto& state = Get();
     std::lock_guard lock(state.mutex);

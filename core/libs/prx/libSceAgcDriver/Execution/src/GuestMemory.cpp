@@ -3443,6 +3443,13 @@ std::uint64_t DirtyArm(std::uint64_t address, std::size_t bytes) {
     return GuestArena::GuestDirtyArm_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
 }
 
+std::uint64_t DirtyArmAs(std::uint64_t address, std::size_t bytes, unsigned kind) {
+    const auto previous = GuestArena::GuestDirtySetArmKind_nid_postfix(kind);
+    const auto token = GuestArena::GuestDirtyArm_nid_postfix(static_cast<std::uintptr_t>(address), bytes);
+    GuestArena::GuestDirtySetArmKind_nid_postfix(previous);
+    return token;
+}
+
 bool DirtyCleanSince(std::uint64_t address, std::size_t bytes, std::uint64_t token) {
     return GuestArena::GuestDirtyCleanSince_nid_postfix(static_cast<std::uintptr_t>(address), bytes, token);
 }
@@ -3531,8 +3538,20 @@ void ReportDirty(const char* window) {
         hashDirty = std::exchange(state.hashDirty, 0);
     }
     AgcDriver::ProfilePrint_nid_no_patch("[v3m-dirty] window=%s arms %llu (%llu pages newly armed, %llu protect calls, %.2f ms), refused %llu; faults %llu (%.2f ms); marks %llu (%llu armed blocks disarmed), GPU bumps %llu; clean queries %llu, clean %llu; verify uses %llu: agree clean %llu, agree dirty %llu, tracker-dirty-only %llu, VIOLATIONS %llu, unarmable %llu, not write-watched %llu (clean by hash %llu, dirty %llu)\n", window, static_cast<unsigned long long>(counts.arms), static_cast<unsigned long long>(counts.armedPages), static_cast<unsigned long long>(counts.protectCalls), counts.armNs / 1e6, static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.faults), counts.faultNs / 1e6, static_cast<unsigned long long>(counts.marks), static_cast<unsigned long long>(counts.markedBlocks), static_cast<unsigned long long>(counts.bumps), static_cast<unsigned long long>(counts.cleanQueries), static_cast<unsigned long long>(counts.cleanAnswers), static_cast<unsigned long long>(uses), static_cast<unsigned long long>(agreeClean), static_cast<unsigned long long>(agreeDirty), static_cast<unsigned long long>(falseDirty), static_cast<unsigned long long>(violations), static_cast<unsigned long long>(unarmable), static_cast<unsigned long long>(unverifiable), static_cast<unsigned long long>(hashClean), static_cast<unsigned long long>(hashDirty));
-    const auto by = [&](GuestArena::GuestDirtyRefusal reason) { return static_cast<unsigned long long>(counts.refusedBy[reason]); };
+    const auto by = [&](GuestArena::GuestDirtyRefusal reason) {
+        unsigned long long total = 0;
+        for (const auto& kind : counts.refusedBy) total += kind[reason];
+        return total;
+    };
     AgcDriver::ProfilePrint_nid_no_patch("[v3m-dirty] window=%s refused by reason: epoch cache %llu, in flight %llu, access guards %llu, block %llu, uncommitted %llu, private not read-write %llu, other memory %llu, view %llu; host imports opened %llu, import checks that found armed pages read-only %llu\n", window, by(GuestArena::RefusedEpoch), by(GuestArena::RefusedInFlight), by(GuestArena::RefusedGuards), by(GuestArena::RefusedBlock), by(GuestArena::RefusedUncommitted), by(GuestArena::RefusedPrivateNotWritable), by(GuestArena::RefusedOtherMemory), by(GuestArena::RefusedView), static_cast<unsigned long long>(counts.importMarks), static_cast<unsigned long long>(counts.importArmedPages));
+    static constexpr const char* kinds[] = {"other", "texture", "target", "storage"};
+    for (std::size_t k = 0; k < 4; ++k) {
+        const auto& r = counts.refusedBy[k];
+        unsigned long long refused = 0;
+        for (const auto value : r) refused += value;
+        if (counts.armsBy[k] == 0 && refused == 0) continue;
+        AgcDriver::ProfilePrint_nid_no_patch("[v3m-dirty] window=%s %s arms %llu, refused %llu: epoch cache %llu, in flight %llu, access guards %llu, block %llu, uncommitted %llu, private not read-write %llu, other memory %llu, view %llu\n", window, kinds[k], static_cast<unsigned long long>(counts.armsBy[k]), refused, static_cast<unsigned long long>(r[0]), static_cast<unsigned long long>(r[1]), static_cast<unsigned long long>(r[2]), static_cast<unsigned long long>(r[3]), static_cast<unsigned long long>(r[4]), static_cast<unsigned long long>(r[5]), static_cast<unsigned long long>(r[6]), static_cast<unsigned long long>(r[7]));
+    }
 }
 
 }

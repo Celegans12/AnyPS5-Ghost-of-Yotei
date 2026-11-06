@@ -10,6 +10,8 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <functional>
+#include <thread>
 
 namespace {
 
@@ -253,6 +255,48 @@ void HostWriteOpensArmedPages() {
     Require(!GuestArena::GuestDirtyCleanSince_nid_postfix(memory.At(0), Block, token), "a host write left the block clean");
 }
 
+std::uint64_t RenewAfter(const char* name, const std::function<void(Memory&)>& between) {
+    Memory memory;
+    Require(GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), 2 * Block) != 0, name);
+    const auto window = GuestArena::GuestDirtyOpenWindow_nid_postfix(memory.At(0), 2 * Block);
+    Require(window != 0, "no window opened");
+    GuestArena::GuestDirtyBump_nid_postfix(memory.At(2 * Page), 16);
+    between(memory);
+    GuestArena::GuestDirtyCloseWindow_nid_postfix();
+    const auto token = GuestArena::GuestDirtyRenew_nid_postfix(memory.At(0), 2 * Block, window);
+    if (token != 0) Require(GuestArena::GuestDirtyCleanSince_nid_postfix(memory.At(0), 2 * Block, token) && Protection(memory.At(Page)) == PAGE_READONLY, "a renewed token is not clean or left the block unprotected");
+    return token;
+}
+
+void WindowOwnWritesRenew() {
+    Require(RenewAfter("own GPU write", [](Memory&) {}) != 0, "the image's own GPU write inside its window refused the renewal");
+    Require(RenewAfter("own CPU store", [](Memory& memory) { memory.bytes[5] = 1; }) == 0, "an own CPU store opened its block (others' stores there are invisible) and the token was still renewed");
+    Require(RenewAfter("own driver store", [](Memory& memory) { GuestArena::GuestDirtyMark_nid_postfix(memory.At(Page), 16); }) == 0, "an own driver store opened its block and the token was still renewed");
+}
+
+void WindowForeignWritesRefuseRenewal() {
+    const auto onThread = [](auto&& body) {
+        std::thread other(body);
+        other.join();
+    };
+    Require(RenewAfter("foreign store", [&](Memory& memory) {
+        onThread([&] { memory.bytes[Block + 3 * Page] = 2; });
+    }) == 0, "a CPU store by another thread into a still-armed block inside the window renewed the token");
+    Require(RenewAfter("foreign mark", [&](Memory& memory) { onThread([&] { GuestArena::GuestDirtyMark_nid_postfix(memory.At(4 * Page), 8); }); }) == 0, "a driver store by another thread inside the window renewed the token");
+    Require(RenewAfter("foreign bump", [&](Memory& memory) { onThread([&] { GuestArena::GuestDirtyBump_nid_postfix(memory.At(5 * Page), 8); }); }) == 0, "a GPU queue write recorded by another thread inside the window renewed the token");
+    Require(RenewAfter("host write", [&](Memory& memory) {
+        const GuestArena::HostWrite open(memory.bytes + 6 * Page, 16);
+    }) == 0, "a host write inside the window renewed the token");
+    Require(RenewAfter("host import", [&](Memory& memory) {
+        const GuestArena::HostImportAccess open(memory.bytes, Block);
+    }) == 0, "a host import inside the window renewed the token");
+    Require(RenewAfter("mapping change", [&](Memory& memory) { GuestArena::GuestDirtyMappingChange_nid_postfix(memory.At(7 * Page), Page); }) == 0, "a mapping change inside the window renewed the token");
+    Require(RenewAfter("protection change", [&](Memory& memory) {
+        GuestArena::GuestDirtyBeginProtection_nid_postfix(memory.At(8 * Page), Page);
+        GuestArena::GuestDirtyEndProtection_nid_postfix(memory.At(8 * Page), Page);
+    }) == 0, "a guest protection change inside the window renewed the token");
+}
+
 void HostImportOpensArmedPages() {
     Memory memory;
     const auto token = GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), Block);
@@ -308,6 +352,8 @@ int main() {
         {"alias write dirties the other view", AliasWriteDirtiesOtherView},
         {"host write opens armed pages", HostWriteOpensArmedPages},
         {"host import opens armed pages", HostImportOpensArmedPages},
+        {"window: own GPU writes renew, own CPU stores do not", WindowOwnWritesRenew},
+        {"window: other writers refuse the renewal", WindowForeignWritesRefuseRenewal},
         {"arm cost", ArmCost},
     };
     int failed = 0;

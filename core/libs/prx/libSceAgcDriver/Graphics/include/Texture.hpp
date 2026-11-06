@@ -510,6 +510,7 @@ private:
     // APS5_BLOCK_WRITEBACK_EACH=1 stores the touched units only).
     void writeBack(std::uint64_t address, std::size_t bytes);
     void writeBackLayers(const std::vector<bool>& layers);
+    void writeBackLayersBody(const std::vector<bool>& layers);
     bool unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const;
     void saveBeforeUnwatch();
     void forgetKeptAtUnwatch(std::uint32_t unit);
@@ -616,6 +617,8 @@ private:
     std::uint64_t layerBegin(std::uint32_t layer) const { return descriptor.baseAddress + static_cast<std::uint64_t>(layer) * trackedLayerBytes; }
     bool anyLayerPending() const;
     bool refresh(std::uint32_t firstLayer, std::uint32_t lastLayer);
+    bool refreshBody(std::uint32_t firstLayer, std::uint32_t lastLayer);
+    bool tokenEligible() const;
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
     void refreshGeneration();
     // `indexed`: the Refresh lookups answer from the pending index (APS5_NO_REFRESH_LOOKUP_CACHE
@@ -736,6 +739,9 @@ private:
     std::uint32_t trackedLayers = 1;
     std::uint64_t trackedLayerBytes = 0;
     std::vector<std::uint64_t> layerGeneration;
+    std::uint64_t syncToken = 0;
+    bool syncTokenClean = false;
+    bool writeBackKept = false;
     std::vector<std::uint64_t> completionKept;
     std::vector<bool> layerPending;
     std::vector<bool> layerBehind;

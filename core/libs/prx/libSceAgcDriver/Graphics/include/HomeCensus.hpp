@@ -65,6 +65,13 @@ private:
 
 }
 
+namespace AgcDriver::Graphics::StorageTokens {
+
+[[nodiscard]] int Mode();
+void Report(const char* window);
+
+}
+
 namespace AgcDriver::Graphics::FaultCensus {
 
 enum class Kind : int { Texture = 0, Target, Storage, Count };
