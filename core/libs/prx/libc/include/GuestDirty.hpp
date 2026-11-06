@@ -26,6 +26,10 @@ struct GuestDirtyCounts {
     std::uint64_t importArmedPages = 0;
     std::uint64_t importMarks = 0;
     std::uint64_t renewRefused = 0;
+    std::uint64_t lateFaults = 0;
+    std::uint64_t declined = 0;
+    std::uint64_t lastDeclined = 0;
+    std::uint64_t lastDeclinedState = 0;
 };
 
 enum GuestDirtyArmKind : unsigned { ArmOther, ArmTexture, ArmTarget, ArmStorage };

@@ -12,6 +12,7 @@
 #include <string>
 #include <functional>
 #include <thread>
+#include <vector>
 
 namespace {
 
@@ -23,10 +24,20 @@ void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+std::atomic<std::uintptr_t> stressBegin{0}, stressEnd{0};
+std::atomic<unsigned> declined{0};
+
 LONG CALLBACK HandleWrite(EXCEPTION_POINTERS* exception) {
     const auto* record = exception->ExceptionRecord;
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || record->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
-    if (!GuestArena::GuestDirtyHandleWrite_nid_postfix(record->ExceptionInformation[1]) && !GuestArena::GuestArenaHandleWrite_nid_postfix(record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_SEARCH;
+    const auto address = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
+    if (!GuestArena::GuestDirtyHandleWrite_nid_postfix(address) && !GuestArena::GuestArenaHandleWrite_nid_postfix(address)) {
+        if (address < stressBegin.load() || address >= stressEnd.load()) return EXCEPTION_CONTINUE_SEARCH;
+        ++declined;
+        DWORD previous = 0;
+        VirtualProtect(reinterpret_cast<void*>(address & ~std::uintptr_t{Page - 1}), Page, PAGE_READWRITE, &previous);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     ++handled;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -297,6 +308,54 @@ void WindowForeignWritesRefuseRenewal() {
     }) == 0, "a guest protection change inside the window renewed the token");
 }
 
+void ConcurrentWritesWhileArmingAndDisarming() {
+    constexpr std::size_t Blocks = 16;
+    auto* bytes = static_cast<unsigned char*>(VirtualAlloc(nullptr, Blocks * Block, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    Require(bytes != nullptr, "cannot allocate the stress buffer");
+    const auto base = reinterpret_cast<std::uintptr_t>(bytes);
+    stressBegin = base;
+    stressEnd = base + Blocks * Block;
+    declined = 0;
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> writes{0}, arms{0}, marks{0};
+    std::vector<std::thread> threads;
+    for (unsigned t = 0; t < 6; ++t) {
+        threads.emplace_back([&, t] {
+            std::uint32_t seed = 0x9e3779b9u * (t + 1);
+            while (!stop.load(std::memory_order_relaxed)) {
+                seed = seed * 1664525u + 1013904223u;
+                const auto offset = (seed >> 8) % (Blocks * Block / 8) * 8;
+                *reinterpret_cast<volatile std::uint64_t*>(bytes + offset) = seed;
+                writes.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (unsigned t = 0; t < 3; ++t) {
+        threads.emplace_back([&, t] {
+            std::uint32_t seed = 0x85ebca6bu * (t + 7);
+            while (!stop.load(std::memory_order_relaxed)) {
+                seed = seed * 1664525u + 1013904223u;
+                const auto first = (seed >> 8) % Blocks;
+                const auto count = 1 + (seed >> 20) % (Blocks - first);
+                switch (seed % 3) {
+                    case 0: GuestArena::GuestDirtyArm_nid_postfix(base + first * Block, count * Block); arms.fetch_add(1, std::memory_order_relaxed); break;
+                    case 1: GuestArena::GuestDirtyMark_nid_postfix(base + first * Block + (seed >> 4) % Block, 64); marks.fetch_add(1, std::memory_order_relaxed); break;
+                    default: GuestArena::GuestDirtyBump_nid_postfix(base + first * Block, Page); break;
+                }
+            }
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    stop = true;
+    for (auto& thread : threads) thread.join();
+    GuestArena::GuestDirtyMark_nid_postfix(base, Blocks * Block);
+    stressBegin = 0;
+    stressEnd = 0;
+    VirtualFree(bytes, 0, MEM_RELEASE);
+    std::printf("STRESS %llu writes, %llu arms, %llu marks, %u faults the tracker declined\n", static_cast<unsigned long long>(writes.load()), static_cast<unsigned long long>(arms.load()), static_cast<unsigned long long>(marks.load()), declined.load());
+    Require(declined.load() == 0, "a guest write into a page the tracker protected was not served (an unhandled access violation in the game)");
+}
+
 void HostImportOpensArmedPages() {
     Memory memory;
     const auto token = GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), Block);
@@ -354,6 +413,7 @@ int main() {
         {"host import opens armed pages", HostImportOpensArmedPages},
         {"window: own GPU writes renew, own CPU stores do not", WindowOwnWritesRenew},
         {"window: other writers refuse the renewal", WindowForeignWritesRefuseRenewal},
+        {"concurrent writes while arming and disarming", ConcurrentWritesWhileArmingAndDisarming},
         {"arm cost", ArmCost},
     };
     int failed = 0;
