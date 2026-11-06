@@ -52,6 +52,16 @@ inline bool BranchlessLoads() {
     return value;
 }
 
+inline bool BranchlessStores() {
+    static const bool value = EnvNumber("APS5_V3T_BRANCHLESS_STORE") != 0u;
+    return value;
+}
+
+inline bool ShareLoads() {
+    static const bool value = EnvNumber("APS5_V3T_SHARE_LOADS") != 0u;
+    return value;
+}
+
 inline bool Census() {
     static const bool value = EnvNumber("APS5_V3T_CENSUS") != 0u;
     return value;

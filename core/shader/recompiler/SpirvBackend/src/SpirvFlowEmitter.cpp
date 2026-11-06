@@ -868,6 +868,20 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
                 const auto censusStart = V3t::Census() ? state.module.FunctionWords().size() : 0u;
                 EmitStructuredInstruction(lane, functionState, *inst);
                 if (V3t::Census()) V3tCensusAdd(state, std::string(IrOpcodeName(inst->Opcode())), censusStart, half == 0);
+                if (V3t::Census() && half == 0 && state.laneCount == 2u && BufferAccessOf(inst->Opcode()) == BufferAccess::Read && inst->ArgumentCount() > 0u) {
+                    bool operands = true;
+                    for (std::size_t index = 0; index + 1u < inst->ArgumentCount(); ++index) {
+                        const auto* argument = inst->Argument(index) != nullptr ? inst->Argument(index)->Resolve() : nullptr;
+                        if (argument != nullptr && !argument->HasImmediate() && !state.sharedLaneValues.contains(argument)) operands = false;
+                    }
+                    const auto* exec = inst->Argument(inst->ArgumentCount() - 1u) != nullptr ? inst->Argument(inst->ArgumentCount() - 1u)->Resolve() : nullptr;
+                    const bool execShared = exec == nullptr || exec->HasImmediate() || state.sharedLaneValues.contains(exec);
+                    const auto& memoryInfo = state.program.Resources().memoryInfo;
+                    const auto memoryIndex = inst->Flags<MemoryFlags>().index;
+                    const auto kindName = memoryIndex < memoryInfo.size() ? std::to_string(static_cast<int>(memoryInfo[memoryIndex].kind)) + (memoryInfo[memoryIndex].formatted ? "f" : "") + (memoryInfo[memoryIndex].gpuDescriptor ? "g" : "") : std::string("?");
+                    auto& entry = V3tCensus()[std::string("~load-operands-shared") + (operands ? "1" : "0") + "-exec-shared" + (execShared ? "1" : "0") + "-kind" + kindName];
+                    ++entry[0];
+                }
                 state.runtimeBufferLabel = 0;
             }
         }

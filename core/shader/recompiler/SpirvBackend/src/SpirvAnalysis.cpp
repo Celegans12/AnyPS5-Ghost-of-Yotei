@@ -1,3 +1,4 @@
+#include "V3tSwitches.hpp"
 #include "SpirvBackend/SpirvAnalysis.hpp"
 #include "RdnaDecoder/RdnaInstruction.hpp"
 #include <algorithm>
@@ -83,6 +84,11 @@ bool LaneSource(const IrProgram& program, const IrValue& value) {
     }
     default:
         break;
+    }
+    if (V3t::ShareLoads() && BufferAccessOf(value.Opcode()) == BufferAccess::Read) {
+        const auto index = value.Flags<MemoryFlags>().index;
+        const auto& memory = program.Resources().memoryInfo;
+        if (index < memory.size() && memory[index].kind == ResourceKind::ScalarBuffer) return false;
     }
     const auto address = AddressOpcodeInfoOf(value.Opcode()).access;
     if (address == AddressAccess::Read) {
