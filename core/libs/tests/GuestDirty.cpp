@@ -10,6 +10,9 @@
 #include <iostream>
 #include <stdexcept>
 #include <string>
+#include <functional>
+#include <thread>
+#include <vector>
 
 namespace {
 
@@ -21,10 +24,20 @@ void Require(bool condition, const char* message) {
     if (!condition) throw std::runtime_error(message);
 }
 
+std::atomic<std::uintptr_t> stressBegin{0}, stressEnd{0};
+std::atomic<unsigned> declined{0};
+
 LONG CALLBACK HandleWrite(EXCEPTION_POINTERS* exception) {
     const auto* record = exception->ExceptionRecord;
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || record->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
-    if (!GuestArena::GuestDirtyHandleWrite_nid_postfix(record->ExceptionInformation[1]) && !GuestArena::GuestArenaHandleWrite_nid_postfix(record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_SEARCH;
+    const auto address = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
+    if (!GuestArena::GuestDirtyHandleWrite_nid_postfix(address) && !GuestArena::GuestArenaHandleWrite_nid_postfix(address)) {
+        if (address < stressBegin.load() || address >= stressEnd.load()) return EXCEPTION_CONTINUE_SEARCH;
+        ++declined;
+        DWORD previous = 0;
+        VirtualProtect(reinterpret_cast<void*>(address & ~std::uintptr_t{Page - 1}), Page, PAGE_READWRITE, &previous);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     ++handled;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -253,6 +266,109 @@ void HostWriteOpensArmedPages() {
     Require(!GuestArena::GuestDirtyCleanSince_nid_postfix(memory.At(0), Block, token), "a host write left the block clean");
 }
 
+std::uint64_t RenewAfter(const char* name, const std::function<void(Memory&)>& between) {
+    Memory memory;
+    Require(GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), 2 * Block) != 0, name);
+    const auto window = GuestArena::GuestDirtyOpenWindow_nid_postfix(memory.At(0), 2 * Block);
+    Require(window != 0, "no window opened");
+    GuestArena::GuestDirtyBump_nid_postfix(memory.At(2 * Page), 16);
+    between(memory);
+    GuestArena::GuestDirtyCloseWindow_nid_postfix();
+    const auto token = GuestArena::GuestDirtyRenew_nid_postfix(memory.At(0), 2 * Block, window);
+    if (token != 0) Require(GuestArena::GuestDirtyCleanSince_nid_postfix(memory.At(0), 2 * Block, token) && Protection(memory.At(Page)) == PAGE_READONLY, "a renewed token is not clean or left the block unprotected");
+    return token;
+}
+
+void WindowOwnWritesRenew() {
+    Require(RenewAfter("own GPU write", [](Memory&) {}) != 0, "the image's own GPU write inside its window refused the renewal");
+    Require(RenewAfter("own CPU store", [](Memory& memory) { memory.bytes[5] = 1; }) == 0, "an own CPU store opened its block (others' stores there are invisible) and the token was still renewed");
+    Require(RenewAfter("own driver store", [](Memory& memory) { GuestArena::GuestDirtyMark_nid_postfix(memory.At(Page), 16); }) == 0, "an own driver store opened its block and the token was still renewed");
+}
+
+void WindowForeignWritesRefuseRenewal() {
+    const auto onThread = [](auto&& body) {
+        std::thread other(body);
+        other.join();
+    };
+    Require(RenewAfter("foreign store", [&](Memory& memory) {
+        onThread([&] { memory.bytes[Block + 3 * Page] = 2; });
+    }) == 0, "a CPU store by another thread into a still-armed block inside the window renewed the token");
+    Require(RenewAfter("foreign mark", [&](Memory& memory) { onThread([&] { GuestArena::GuestDirtyMark_nid_postfix(memory.At(4 * Page), 8); }); }) == 0, "a driver store by another thread inside the window renewed the token");
+    Require(RenewAfter("foreign bump", [&](Memory& memory) { onThread([&] { GuestArena::GuestDirtyBump_nid_postfix(memory.At(5 * Page), 8); }); }) == 0, "a GPU queue write recorded by another thread inside the window renewed the token");
+    Require(RenewAfter("host write", [&](Memory& memory) {
+        const GuestArena::HostWrite open(memory.bytes + 6 * Page, 16);
+    }) == 0, "a host write inside the window renewed the token");
+    Require(RenewAfter("host import", [&](Memory& memory) {
+        const GuestArena::HostImportAccess open(memory.bytes, Block);
+    }) == 0, "a host import inside the window renewed the token");
+    Require(RenewAfter("mapping change", [&](Memory& memory) { GuestArena::GuestDirtyMappingChange_nid_postfix(memory.At(7 * Page), Page); }) == 0, "a mapping change inside the window renewed the token");
+    Require(RenewAfter("protection change", [&](Memory& memory) {
+        GuestArena::GuestDirtyBeginProtection_nid_postfix(memory.At(8 * Page), Page);
+        GuestArena::GuestDirtyEndProtection_nid_postfix(memory.At(8 * Page), Page);
+    }) == 0, "a guest protection change inside the window renewed the token");
+}
+
+void ConcurrentWritesWhileArmingAndDisarming() {
+    constexpr std::size_t Blocks = 16;
+    auto* bytes = static_cast<unsigned char*>(VirtualAlloc(nullptr, Blocks * Block, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+    Require(bytes != nullptr, "cannot allocate the stress buffer");
+    const auto base = reinterpret_cast<std::uintptr_t>(bytes);
+    stressBegin = base;
+    stressEnd = base + Blocks * Block;
+    declined = 0;
+    std::atomic<bool> stop{false};
+    std::atomic<std::uint64_t> writes{0}, arms{0}, marks{0};
+    std::vector<std::thread> threads;
+    for (unsigned t = 0; t < 6; ++t) {
+        threads.emplace_back([&, t] {
+            std::uint32_t seed = 0x9e3779b9u * (t + 1);
+            while (!stop.load(std::memory_order_relaxed)) {
+                seed = seed * 1664525u + 1013904223u;
+                const auto offset = (seed >> 8) % (Blocks * Block / 8) * 8;
+                *reinterpret_cast<volatile std::uint64_t*>(bytes + offset) = seed;
+                writes.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+    for (unsigned t = 0; t < 3; ++t) {
+        threads.emplace_back([&, t] {
+            std::uint32_t seed = 0x85ebca6bu * (t + 7);
+            while (!stop.load(std::memory_order_relaxed)) {
+                seed = seed * 1664525u + 1013904223u;
+                const auto first = (seed >> 8) % Blocks;
+                const auto count = 1 + (seed >> 20) % (Blocks - first);
+                switch (seed % 3) {
+                    case 0: GuestArena::GuestDirtyArm_nid_postfix(base + first * Block, count * Block); arms.fetch_add(1, std::memory_order_relaxed); break;
+                    case 1: GuestArena::GuestDirtyMark_nid_postfix(base + first * Block + (seed >> 4) % Block, 64); marks.fetch_add(1, std::memory_order_relaxed); break;
+                    default: GuestArena::GuestDirtyBump_nid_postfix(base + first * Block, Page); break;
+                }
+            }
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::seconds(3));
+    stop = true;
+    for (auto& thread : threads) thread.join();
+    GuestArena::GuestDirtyMark_nid_postfix(base, Blocks * Block);
+    stressBegin = 0;
+    stressEnd = 0;
+    VirtualFree(bytes, 0, MEM_RELEASE);
+    std::printf("STRESS %llu writes, %llu arms, %llu marks, %u faults the tracker declined\n", static_cast<unsigned long long>(writes.load()), static_cast<unsigned long long>(arms.load()), static_cast<unsigned long long>(marks.load()), declined.load());
+    Require(declined.load() == 0, "a guest write into a page the tracker protected was not served (an unhandled access violation in the game)");
+}
+
+void HostImportOpensArmedPages() {
+    Memory memory;
+    const auto token = GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), Block);
+    Require(token != 0 && Protection(memory.At(Page)) == PAGE_READONLY, "the block was not armed");
+    {
+        const GuestArena::HostImportAccess open(memory.bytes, Block);
+        Require(Protection(memory.At(0)) == PAGE_READWRITE && Protection(memory.At(Block - Page)) == PAGE_READWRITE, "an armed page stayed read-only under a host import's check");
+        Require(GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), Block) == 0, "a block was armed while a host import was open");
+    }
+    Require(!GuestArena::GuestDirtyCleanSince_nid_postfix(memory.At(0), Block, token), "a host import left the block clean");
+    Require(GuestArena::GuestDirtyArm_nid_postfix(memory.At(0), Block) != 0, "the block was not armable after the import closed");
+}
+
 }
 
 void ArmCost() {
@@ -294,6 +410,10 @@ int main() {
         {"GPU bump keeps protection", GpuBumpKeepsProtection},
         {"alias write dirties the other view", AliasWriteDirtiesOtherView},
         {"host write opens armed pages", HostWriteOpensArmedPages},
+        {"host import opens armed pages", HostImportOpensArmedPages},
+        {"window: own GPU writes renew, own CPU stores do not", WindowOwnWritesRenew},
+        {"window: other writers refuse the renewal", WindowForeignWritesRefuseRenewal},
+        {"concurrent writes while arming and disarming", ConcurrentWritesWhileArmingAndDisarming},
         {"arm cost", ArmCost},
     };
     int failed = 0;

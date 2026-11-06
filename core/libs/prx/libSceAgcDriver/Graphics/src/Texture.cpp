@@ -25,6 +25,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
+#include "prx/libc/include/GuestDirty.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include <algorithm>
 #include <array>
@@ -36,6 +38,8 @@
 #include <cstring>
 #include <cstdlib>
 #include <string>
+#include <string_view>
+#include <stdexcept>
 #include <stdexcept>
 #include <vector>
 #include <atomic>
@@ -51,6 +55,51 @@
 #include <utility>
 
 namespace AgcDriver::Graphics {
+
+namespace StorageTokens {
+
+namespace {
+
+struct Counts {
+    std::atomic<std::uint64_t> refreshes{0}, eligible{0}, other{0}, noToken{0}, clean{0}, dirty{0}, armRefused{0}, verified{0}, violations{0};
+    std::atomic<std::uint64_t> writeBacks{0}, renewed{0}, renewRefused{0}, kept{0}, unclean{0}, ineligible{0}, storeSaved{0}, storeChecked{0}, storeViolations{0};
+};
+
+Counts& counts() {
+    static Counts value;
+    return value;
+}
+
+}
+
+int Mode() {
+    static const int mode = [] {
+        const char* value = std::getenv("APS5_V3M_STORAGE_TOKENS");
+        if (value == nullptr || !GuestMemory::DirtyEnabled()) return 0;
+        const std::string_view text(value);
+        if (text == "throw") return 3;
+        if (text == "verify") return 2;
+        return 1;
+    }();
+    return mode;
+}
+
+void Violation(const char* what, std::uint64_t address, std::uint64_t bytes) {
+    static std::atomic<std::uint32_t> printed{0};
+    if (printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[v3m-storage] verify: %s 0x%llx+0x%llx\n", what, static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+    if (Mode() == 3) throw std::runtime_error(std::string("APS5_V3M_STORAGE_TOKENS=throw: ") + what);
+}
+
+void Report(const char* window) {
+    if (Mode() == 0) return;
+    auto& c = counts();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto refreshes = take(c.refreshes), eligible = take(c.eligible), other = take(c.other), noToken = take(c.noToken), clean = take(c.clean), dirty = take(c.dirty), armRefused = take(c.armRefused), verified = take(c.verified), violations = take(c.violations);
+    const auto writeBacks = take(c.writeBacks), renewed = take(c.renewed), renewRefused = take(c.renewRefused), kept = take(c.kept), unclean = take(c.unclean), ineligible = take(c.ineligible), storeSaved = take(c.storeSaved), storeChecked = take(c.storeChecked), storeViolations = take(c.storeViolations);
+    AgcDriver::ProfilePrint_nid_no_patch("[v3m-storage] window=%s mode %d: refreshes %llu, eligible %llu, token clean %llu (%.1f %% of refreshes), dirty %llu, no token %llu, other image pending %llu, arm refused %llu; verify %llu checked, VIOLATIONS %llu; write-backs %llu: token renewed %llu, not renewed (another writer in the window %llu, blocks kept %llu, token not clean %llu, not eligible %llu); untracked stores decided by the token %llu, checked against the compare %llu, VIOLATIONS %llu\n", window, Mode(), refreshes, eligible, clean, refreshes == 0 ? 0.0 : 100.0 * static_cast<double>(clean) / static_cast<double>(refreshes), dirty, noToken, other, armRefused, verified, violations, writeBacks, renewed, renewRefused, kept, unclean, ineligible, storeSaved, storeChecked, storeViolations);
+}
+
+}
 
 // PERF-PLAN image slabs: sampled snapshots served from a BufferPool slab slot vs given their own
 // allocation (the [texture] line).
@@ -2475,7 +2524,48 @@ bool StorageTexture::RefreshLayers(std::uint32_t first, std::uint32_t count) {
     return refresh(firstLayer, lastLayer);
 }
 
+bool StorageTexture::tokenEligible() const {
+    return descriptor.dccAddress == 0 && uploadedKeys == DccKeys::Uncompressed && guestBytes != 0;
+}
+
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
+    const int mode = StorageTokens::Mode();
+    if (mode == 0) return refreshBody(firstLayer, lastLayer);
+    auto& counts = StorageTokens::counts();
+    counts.refreshes.fetch_add(1, std::memory_order_relaxed);
+    if (firstLayer != 0 || lastLayer != trackedLayers || !tokenEligible()) {
+        syncToken = 0;
+        return refreshBody(firstLayer, lastLayer);
+    }
+    counts.eligible.fetch_add(1, std::memory_order_relaxed);
+    const auto base = descriptor.baseAddress;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    CompletePendingCpuWrites(context, base, bytes);
+    const bool other = otherPendingOverlaps(!RuntimeSwitches::Set(RuntimeSwitch::NoRefreshLookupCache));
+    const bool clean = !other && syncToken != 0 && GuestMemory::DirtyCleanSince(base, bytes, syncToken);
+    if (other) counts.other.fetch_add(1, std::memory_order_relaxed);
+    else if (syncToken == 0) counts.noToken.fetch_add(1, std::memory_order_relaxed);
+    else (clean ? counts.clean : counts.dirty).fetch_add(1, std::memory_order_relaxed);
+    if (clean && mode == 1) {
+        NoteProved();
+        return true;
+    }
+    const auto token = clean ? syncToken : other ? 0 : GuestMemory::DirtyArmAs(base, bytes, GuestArena::ArmStorage);
+    if (!clean && !other && token == 0) counts.armRefused.fetch_add(1, std::memory_order_relaxed);
+    syncToken = 0;
+    const bool current = refreshBody(firstLayer, lastLayer);
+    if (clean) {
+        counts.verified.fetch_add(1, std::memory_order_relaxed);
+        if (!current) {
+            counts.violations.fetch_add(1, std::memory_order_relaxed);
+            StorageTokens::Violation("a storage image the token called current was refreshed", base, bytes);
+        }
+    }
+    syncToken = token;
+    return current;
+}
+
+bool StorageTexture::refreshBody(std::uint32_t firstLayer, std::uint32_t lastLayer) {
     if (!ImageFlags::StorageEnabled()) return refreshFull(firstLayer, lastLayer);
     const bool whole = firstLayer == 0 && lastLayer == trackedLayers && guestBytes != 0;
     const bool dcc = descriptor.dccAddress != 0;
@@ -6695,6 +6785,39 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    const int mode = StorageTokens::Mode();
+    if (mode == 0) {
+        writeBackLayersBody(layers);
+        return;
+    }
+    auto& counts = StorageTokens::counts();
+    counts.writeBacks.fetch_add(1, std::memory_order_relaxed);
+    syncTokenClean = tokenEligible() && syncToken != 0 && GuestMemory::DirtyCleanSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), syncToken);
+    const bool basis = syncTokenClean;
+    syncToken = 0;
+    writeBackKept = true;
+    struct Reset {
+        bool& clean;
+        ~Reset() {
+            clean = false;
+            GuestArena::GuestDirtyCloseWindow_nid_postfix();
+        }
+    } reset{syncTokenClean};
+    const auto window = GuestArena::GuestDirtyOpenWindow_nid_postfix(static_cast<std::uintptr_t>(descriptor.baseAddress), static_cast<std::size_t>(guestBytes));
+    writeBackLayersBody(layers);
+    if (!basis) counts.unclean.fetch_add(1, std::memory_order_relaxed);
+    else if (writeBackKept) counts.kept.fetch_add(1, std::memory_order_relaxed);
+    else if (!tokenEligible()) counts.ineligible.fetch_add(1, std::memory_order_relaxed);
+    else {
+        const auto previous = GuestArena::GuestDirtySetArmKind_nid_postfix(GuestArena::ArmStorage);
+        syncToken = GuestArena::GuestDirtyRenew_nid_postfix(static_cast<std::uintptr_t>(descriptor.baseAddress), static_cast<std::size_t>(guestBytes), window);
+        GuestArena::GuestDirtySetArmKind_nid_postfix(previous);
+        if (syncToken != 0) counts.renewed.fetch_add(1, std::memory_order_relaxed);
+        else counts.renewRefused.fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
+void StorageTexture::writeBackLayersBody(const std::vector<bool>& layers) {
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -6757,6 +6880,26 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             if (!compareUntracked(from, static_cast<std::size_t>(end - begin), std::span(changedBlocks).subspan(static_cast<std::size_t>((from - spanBegin) / block), static_cast<std::size_t>(last / block - from / block + 1)))) continue;
             for (auto layer = static_cast<std::uint32_t>(begin / trackedLayerBytes); layer < trackedLayers && layerBegin(layer) <= last; ++layer) compared[layer] = true;
         }
+        if (syncTokenClean) {
+            auto& counts = StorageTokens::counts();
+            for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+                if (!layers[layer]) continue;
+                const auto end = layerBegin(layer) + layerBytes(layer);
+                if (compared[layer]) {
+                    counts.storeChecked.fetch_add(1, std::memory_order_relaxed);
+                    for (auto at = layerBegin(layer) & ~(block - 1); at < end; at += block) {
+                        if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] != GuestMemory::BlockWritten) continue;
+                        counts.storeViolations.fetch_add(1, std::memory_order_relaxed);
+                        StorageTokens::Violation("a block the token called unwritten differs from the saved bytes", at, block);
+                        break;
+                    }
+                    continue;
+                }
+                for (auto at = layerBegin(layer) & ~(block - 1); at < end; at += block) changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] = GuestMemory::BlockUnchanged;
+                compared[layer] = true;
+                counts.storeSaved.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
     }
     const auto forgetStored = [&] {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
@@ -6795,6 +6938,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             else keep.emplace_back(from, to);
         }
     }
+    writeBackKept = skippedAny;
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layers[layer]) forgetKeptAtUnwatch(layer);
     }
