@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
 #include <cstdio>
 #include <iostream>
 #include <stdexcept>
@@ -23,7 +24,7 @@ void Require(bool condition, const char* message) {
 LONG CALLBACK HandleWrite(EXCEPTION_POINTERS* exception) {
     const auto* record = exception->ExceptionRecord;
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || record->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
-    if (!GuestArena::GuestDirtyHandleWrite_nid_postfix(record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_SEARCH;
+    if (!GuestArena::GuestDirtyHandleWrite_nid_postfix(record->ExceptionInformation[1]) && !GuestArena::GuestArenaHandleWrite_nid_postfix(record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_SEARCH;
     ++handled;
     return EXCEPTION_CONTINUE_EXECUTION;
 }
@@ -183,6 +184,41 @@ void BatchedQueries() {
     Require(!GuestArena::GuestDirtyCleanSinceAll_nid_postfix(both, 0), "an empty batch is clean");
 }
 
+void AliasWriteDirtiesOtherView() {
+    constexpr std::size_t Bytes = 65536;
+    HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, 0, static_cast<DWORD>(Bytes), nullptr);
+    Require(section != nullptr, "cannot create a section");
+    auto* first = static_cast<unsigned char*>(GuestArena::GuestArenaAllocate_nid_postfix(Bytes, Bytes));
+    auto* second = static_cast<unsigned char*>(GuestArena::GuestArenaAllocate_nid_postfix(Bytes, Bytes));
+    Require(first != nullptr && second != nullptr, "cannot allocate two arena ranges");
+    GuestArena::GuestArenaMap_nid_postfix(first, Bytes, section, 0, PAGE_READWRITE);
+    GuestArena::GuestArenaMap_nid_postfix(second, Bytes, section, 0, PAGE_READWRITE);
+    static_cast<volatile unsigned char*>(first)[0] = 1;
+    const auto token = GuestArena::GuestDirtyArm_nid_postfix(reinterpret_cast<std::uintptr_t>(first), Bytes);
+    Require(token != 0, "a mapped view was not armed");
+    Require(GuestArena::GuestDirtyCleanSince_nid_postfix(reinterpret_cast<std::uintptr_t>(first), Bytes, token), "an armed view is not clean");
+    static_cast<volatile unsigned char*>(second)[3 * Page + 1] = 9;
+    Require(first[3 * Page + 1] == 9, "the alias write is not visible through the first view");
+    Require(!GuestArena::GuestDirtyCleanSince_nid_postfix(reinterpret_cast<std::uintptr_t>(first), Bytes, token), "a write through view B left view A clean");
+    const auto again = GuestArena::GuestDirtyArm_nid_postfix(reinterpret_cast<std::uintptr_t>(first), Bytes);
+    Require(again != 0 && GuestArena::GuestDirtyCleanSince_nid_postfix(reinterpret_cast<std::uintptr_t>(first), Bytes, again), "a re-armed view is not clean");
+    static_cast<volatile unsigned char*>(first)[5] = 1;
+    Require(!GuestArena::GuestDirtyCleanSince_nid_postfix(reinterpret_cast<std::uintptr_t>(first), Bytes, again), "a write through view A left it clean");
+    const auto armed = GuestArena::GuestDirtyArm_nid_postfix(reinterpret_cast<std::uintptr_t>(first), Bytes);
+    Require(armed != 0, "the view was not re-armed before the host write");
+    {
+        const GuestArena::HostWrite open(second + Page, 16);
+        std::memset(second + Page, 7, 16);
+    }
+    Require(!GuestArena::GuestDirtyCleanSince_nid_postfix(reinterpret_cast<std::uintptr_t>(first), Bytes, armed), "a host write through view B left view A clean");
+    const auto remapped = GuestArena::GuestDirtyArm_nid_postfix(reinterpret_cast<std::uintptr_t>(first), Bytes);
+    Require(remapped != 0, "the view was not re-armed before the unmap");
+    GuestArena::GuestArenaRelease_nid_postfix(second, Bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(first, Bytes);
+    Require(!GuestArena::GuestDirtyCleanSince_nid_postfix(reinterpret_cast<std::uintptr_t>(first), Bytes, remapped), "an unmapped view is still clean");
+    CloseHandle(section);
+}
+
 void HostWriteOpensArmedPages() {
     Memory memory;
     char path[MAX_PATH]{};
@@ -256,6 +292,7 @@ int main() {
         {"store under the block's own lock", StoreUnderOwnBlockLock},
         {"batched queries", BatchedQueries},
         {"GPU bump keeps protection", GpuBumpKeepsProtection},
+        {"alias write dirties the other view", AliasWriteDirtiesOtherView},
         {"host write opens armed pages", HostWriteOpensArmedPages},
         {"arm cost", ArmCost},
     };

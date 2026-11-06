@@ -3424,12 +3424,13 @@ namespace {
 struct DirtyVerifyEntry {
     std::uint64_t token = 0;
     std::uint64_t generation = 0;
+    std::vector<ContentHash::Hash128> hashes;
 };
 
 struct DirtyVerifyState {
     std::mutex mutex;
     std::map<std::pair<std::uint64_t, std::uint64_t>, DirtyVerifyEntry> entries;
-    std::uint64_t uses = 0, agreeClean = 0, agreeDirty = 0, falseDirty = 0, violations = 0, unarmable = 0, unverifiable = 0;
+    std::uint64_t uses = 0, agreeClean = 0, agreeDirty = 0, falseDirty = 0, violations = 0, unarmable = 0, unverifiable = 0, hashClean = 0, hashDirty = 0;
 };
 
 DirtyVerifyState& dirtyVerify() {
@@ -3484,6 +3485,19 @@ void DirtyVerifyUse(std::uint64_t address, std::size_t bytes) {
     auto& entry = state.entries[{begin, end}];
     if (entry.token != 0 && entry.generation == 0) {
         ++state.unverifiable;
+        if (DirtyCleanSince(begin, size, entry.token) && !entry.hashes.empty()) {
+            std::vector<ContentHash::Hash128> now(entry.hashes.size());
+            HashCommittedBlocks(begin, size, now);
+            if (now == entry.hashes) {
+                ++state.hashClean;
+                return;
+            }
+            ++state.violations;
+            if (state.violations <= 16) std::fprintf(stderr, "[v3m-dirty] verify: 0x%llx+0x%zx clean by the tracker but its bytes changed (token %llu)\n", static_cast<unsigned long long>(begin), size, static_cast<unsigned long long>(entry.token));
+            if (dirtyVerifyMode() == 2) throw std::runtime_error("APS5_V3M_DIRTY_VERIFY: a range the dirty tracker calls clean was written");
+        } else {
+            ++state.hashDirty;
+        }
     } else if (entry.token != 0) {
         const bool clean = DirtyCleanSince(begin, size, entry.token);
         static_cast<void>(CollectWrites(begin, size));
@@ -3501,13 +3515,22 @@ void DirtyVerifyUse(std::uint64_t address, std::size_t bytes) {
     entry.token = DirtyArm(begin, size);
     if (entry.token == 0) ++state.unarmable;
     entry.generation = CollectWrites(begin, size);
+    entry.hashes.clear();
+    if (entry.token != 0 && entry.generation == 0) {
+        FlushGpuWrites(begin, size);
+        entry.token = DirtyArm(begin, size);
+        if (entry.token != 0) {
+            entry.hashes.resize(HashBlockCount(begin, size));
+            HashCommittedBlocks(begin, size, entry.hashes);
+        }
+    }
 }
 
 void ReportDirty(const char* window) {
     if (!DirtyEnabled()) return;
     GuestArena::GuestDirtyCounts counts;
     GuestArena::GuestDirtyTakeCounts_nid_postfix(&counts);
-    std::uint64_t uses = 0, agreeClean = 0, agreeDirty = 0, falseDirty = 0, violations = 0, unarmable = 0, unverifiable = 0;
+    std::uint64_t uses = 0, agreeClean = 0, agreeDirty = 0, falseDirty = 0, violations = 0, unarmable = 0, unverifiable = 0, hashClean = 0, hashDirty = 0;
     {
         auto& state = dirtyVerify();
         std::lock_guard lock(state.mutex);
@@ -3518,8 +3541,10 @@ void ReportDirty(const char* window) {
         violations = std::exchange(state.violations, 0);
         unarmable = std::exchange(state.unarmable, 0);
         unverifiable = std::exchange(state.unverifiable, 0);
+        hashClean = std::exchange(state.hashClean, 0);
+        hashDirty = std::exchange(state.hashDirty, 0);
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[v3m-dirty] window=%s arms %llu (%llu pages newly armed, %llu protect calls, %.2f ms), refused %llu; faults %llu (%.2f ms); marks %llu (%llu armed blocks disarmed), GPU bumps %llu; clean queries %llu, clean %llu; verify uses %llu: agree clean %llu, agree dirty %llu, tracker-dirty-only %llu, VIOLATIONS %llu, unarmable %llu, unverifiable (not write-watched) %llu\n", window, static_cast<unsigned long long>(counts.arms), static_cast<unsigned long long>(counts.armedPages), static_cast<unsigned long long>(counts.protectCalls), counts.armNs / 1e6, static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.faults), counts.faultNs / 1e6, static_cast<unsigned long long>(counts.marks), static_cast<unsigned long long>(counts.markedBlocks), static_cast<unsigned long long>(counts.bumps), static_cast<unsigned long long>(counts.cleanQueries), static_cast<unsigned long long>(counts.cleanAnswers), static_cast<unsigned long long>(uses), static_cast<unsigned long long>(agreeClean), static_cast<unsigned long long>(agreeDirty), static_cast<unsigned long long>(falseDirty), static_cast<unsigned long long>(violations), static_cast<unsigned long long>(unarmable), static_cast<unsigned long long>(unverifiable));
+    AgcDriver::ProfilePrint_nid_no_patch("[v3m-dirty] window=%s arms %llu (%llu pages newly armed, %llu protect calls, %.2f ms), refused %llu; faults %llu (%.2f ms); marks %llu (%llu armed blocks disarmed), GPU bumps %llu; clean queries %llu, clean %llu; verify uses %llu: agree clean %llu, agree dirty %llu, tracker-dirty-only %llu, VIOLATIONS %llu, unarmable %llu, not write-watched %llu (clean by hash %llu, dirty %llu)\n", window, static_cast<unsigned long long>(counts.arms), static_cast<unsigned long long>(counts.armedPages), static_cast<unsigned long long>(counts.protectCalls), counts.armNs / 1e6, static_cast<unsigned long long>(counts.refused), static_cast<unsigned long long>(counts.faults), counts.faultNs / 1e6, static_cast<unsigned long long>(counts.marks), static_cast<unsigned long long>(counts.markedBlocks), static_cast<unsigned long long>(counts.bumps), static_cast<unsigned long long>(counts.cleanQueries), static_cast<unsigned long long>(counts.cleanAnswers), static_cast<unsigned long long>(uses), static_cast<unsigned long long>(agreeClean), static_cast<unsigned long long>(agreeDirty), static_cast<unsigned long long>(falseDirty), static_cast<unsigned long long>(violations), static_cast<unsigned long long>(unarmable), static_cast<unsigned long long>(unverifiable), static_cast<unsigned long long>(hashClean), static_cast<unsigned long long>(hashDirty));
 }
 
 }

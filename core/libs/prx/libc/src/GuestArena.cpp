@@ -832,7 +832,7 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
 }
 
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
-    GuestDirtyBeginProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+    GuestDirtyBeginHostWrite_nid_postfix(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     const HostChange change;
     openAccessGuardsForHost(reinterpret_cast<std::uintptr_t>(pointer), bytes);
     if (const auto hook = hostWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);

@@ -17,6 +17,8 @@ struct GuestDirtyCounts {
     std::uint64_t marks = 0;
     std::uint64_t markedBlocks = 0;
     std::uint64_t bumps = 0;
+    std::uint64_t viewLosses = 0;
+    std::uint64_t viewArms = 0;
     std::uint64_t cleanQueries = 0;
     std::uint64_t cleanAnswers = 0;
 };
@@ -39,6 +41,7 @@ bool GuestDirtyHandleWrite_nid_postfix(std::uintptr_t address);
 bool GuestDirtyArmed_nid_postfix(std::uintptr_t address);
 void GuestDirtyMappingChange_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestDirtyBeginProtection_nid_postfix(std::uintptr_t address, std::size_t bytes);
+void GuestDirtyBeginHostWrite_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestDirtyEndProtection_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestDirtyTakeCounts_nid_postfix(GuestDirtyCounts* counts);
 void GuestDirtyForceEnable_nid_no_patch(bool enabled);
