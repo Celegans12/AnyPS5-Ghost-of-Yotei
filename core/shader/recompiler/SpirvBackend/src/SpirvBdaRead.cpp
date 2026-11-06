@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvBda.hpp"
+#include "V3tSwitches.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvTypes.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvConstants.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
@@ -839,6 +840,24 @@ std::uint32_t EmitBdaAtomic(SpirvValueEmitContext& ctx, const IrValue& inst, std
             return old;
         });
     });
+}
+
+void EmitV3tPrologue(SpirvEmitterState& state) {
+    state.srtAnyPoisoned = 0;
+    const auto& resources = state.program.Resources();
+    if (!V3t::SrtGuardHoist() || resources.guardedSrtSlots.empty() || state.flattenedSrtVariable == 0 || state.faultBufferVariable == 0) return;
+    const auto u32 = TypeU32(state);
+    auto any = ConstantU32(state, 0u);
+    for (std::size_t guard = 0; guard < resources.guardedSrtSlots.size(); ++guard) {
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, TypeStorageBufferElementPointer(state), pointer, state.flattenedSrtVariable, ConstantU32(state, 0u), ConstantU32(state, resources.srtGuardOffset + static_cast<std::uint32_t>(guard)));
+        const auto value = state.module.AllocateId();
+        state.module.AddFunction(spv::OpLoad, u32, value, pointer);
+        any = Binary(state, spv::OpBitwiseOr, u32, any, value);
+    }
+    const auto variable = state.module.DefineInitializedGlobalVariable(TypePointer(state, spv::StorageClassPrivate, u32), spv::StorageClassPrivate, ConstantU32(state, 0u));
+    state.module.AddFunction(spv::OpStore, variable, any);
+    state.srtAnyPoisoned = variable;
 }
 
 // One probe of the span from the first to the last extracted dword replaces 4 lookups per dword (a
