@@ -5517,12 +5517,17 @@ bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofR
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
     bool served = false;
-    if (shaders.size() < 2 || !PrepareShadow::ProofOn()) return revalidateFullBody(shaders, report, false, false, served);
+    if (shaders.size() < 2 || !PrepareShadow::ProofOn()) {
+        if (shaders.size() < 2 || !PrepareShadow::PublishOnly()) return revalidateFullBody(shaders, report, false, false, served);
+        const bool ok = revalidateFullBody(shaders, report, false, false, served);
+        PublishProofView();
+        return ok;
+    }
     // Whatever this proof leaves in the set is what the preparer reads next (ProofView).
     struct Publish {
         ShaderResources* self;
         ~Publish() {
-            if (std::uncaught_exceptions() == 0) self->PublishProofView();
+            if (std::uncaught_exceptions() == 0 && (!PrepareShadow::NoPublish() || self->LoadProofView() == nullptr)) self->PublishProofView();
         }
     } publish{this};
     const bool prepared = PrepareShadow::TakePrepared(this);

@@ -46,6 +46,11 @@ void NotePreparedSet(const ShaderResources* set, std::span<const CompiledShader>
 // Phase (ii), at the commit (record lock held).
 bool ProofOn();
 bool VerifyProof();
+// Diagnostics (RuntimeSwitches): APS5_V3E_PP_PUBLISH_ONLY publishes ProofViews with phase (ii) off (the publication
+// cost alone); APS5_V3E_PP_NO_PUBLISH stops republishing with phase (ii) on (a set's first view, at the cache insert,
+// stays: the prepare work alone).
+bool PublishOnly();
+bool NoPublish();
 // Whether this commit may serve `set` from its prepared verdict: same set, verdict Pass, read set Valid (the storage-results
 // and shadow checks re-run at the commit when their serials moved: RecheckPending). Counts the outcome; once per commit.
 bool TakePrepared(const void* set);

@@ -145,6 +145,8 @@ std::atomic<std::uint64_t> collectDirty{0};
 std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
+// v3e: wait ns of those, and the ones a GPU-mutex (record lock) holder made.
+std::atomic<std::uint64_t> trackerWaitNs{0}, trackerLockedWaits{0}, trackerLockedWaitNs{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
@@ -371,6 +373,7 @@ public:
         }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" (waited %.1f ms; under the record lock %llu waits, %.1f ms)", trackerWaitNs.load() / 1e6, static_cast<unsigned long long>(trackerLockedWaits.load()), trackerLockedWaitNs.load() / 1e6);
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
             std::lock_guard lock(state.callersMutex);
@@ -1381,7 +1384,14 @@ public:
         }
         if (!lock.try_lock()) {
             trackerWaits.fetch_add(1, std::memory_order_relaxed);
+            const auto waitStart = std::chrono::steady_clock::now();
             lock.lock();
+            const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count());
+            trackerWaitNs.fetch_add(ns, std::memory_order_relaxed);
+            if (GpuMutex().HeldByThisThread()) {
+                trackerLockedWaits.fetch_add(1, std::memory_order_relaxed);
+                trackerLockedWaitNs.fetch_add(ns, std::memory_order_relaxed);
+            }
         }
         noteHeld();
         trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
@@ -3591,6 +3601,7 @@ void ReportDirty(const char* window) {
         return total;
     };
     AgcDriver::ProfilePrint_nid_no_patch("[v3m-dirty] window=%s refused by reason: epoch cache %llu, in flight %llu, access guards %llu, block %llu, uncommitted %llu, private not read-write %llu, other memory %llu, view %llu; host imports opened %llu, import checks that found armed pages read-only %llu; faults after a concurrent disarm %llu, faults retried while arms and disarms raced %llu, faults declined in tracked blocks %llu (last 0x%llx state 0x%llx)\n", window, by(GuestArena::RefusedEpoch), by(GuestArena::RefusedInFlight), by(GuestArena::RefusedGuards), by(GuestArena::RefusedBlock), by(GuestArena::RefusedUncommitted), by(GuestArena::RefusedPrivateNotWritable), by(GuestArena::RefusedOtherMemory), by(GuestArena::RefusedView), static_cast<unsigned long long>(counts.importMarks), static_cast<unsigned long long>(counts.importArmedPages), static_cast<unsigned long long>(counts.lateFaults), static_cast<unsigned long long>(counts.retriedFaults), static_cast<unsigned long long>(counts.declined), static_cast<unsigned long long>(counts.lastDeclined), static_cast<unsigned long long>(counts.lastDeclinedState));
+    AgcDriver::ProfilePrint_nid_no_patch("[v3m-dirty] window=%s arm-mutex waits %llu (%.1f ms)\n", window, static_cast<unsigned long long>(counts.armWaits), counts.armWaitNs / 1e6);
     static constexpr const char* kinds[] = {"other", "texture", "target", "storage"};
     for (std::size_t k = 0; k < 4; ++k) {
         const auto& r = counts.refusedBy[k];

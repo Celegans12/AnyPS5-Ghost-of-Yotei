@@ -177,6 +177,14 @@ bool ProofOn() {
     return Wrapping() && RuntimeSwitches::Set(RuntimeSwitch::V3ePrepareProof) && RuntimeSwitches::Set(RuntimeSwitch::V3eLockSplit);
 }
 
+bool PublishOnly() {
+    return RuntimeSwitches::Set(RuntimeSwitch::V3ePpPublishOnly);
+}
+
+bool NoPublish() {
+    return RuntimeSwitches::Set(RuntimeSwitch::V3ePpNoPublish);
+}
+
 bool VerifyProof() {
     static const bool verify = [] {
         const char* value = std::getenv("APS5_V3E_PREPARE_PROOF_VERIFY");

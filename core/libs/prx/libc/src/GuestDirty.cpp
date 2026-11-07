@@ -47,7 +47,7 @@ std::atomic<std::uint64_t> mappingEpoch{1};
 std::atomic<int> forced{-1};
 
 struct Counters {
-    std::atomic<std::uint64_t> arms{0}, armedPages{0}, protectCalls{0}, armNs{0}, refused{0}, faults{0}, faultNs{0}, marks{0}, markedBlocks{0}, bumps{0}, viewLosses{0}, viewArms{0}, cleanQueries{0}, cleanAnswers{0}, importArmedPages{0}, importMarks{0}, renewRefused{0}, lateFaults{0}, declined{0}, retriedFaults{0};
+    std::atomic<std::uint64_t> arms{0}, armedPages{0}, protectCalls{0}, armNs{0}, refused{0}, faults{0}, faultNs{0}, marks{0}, markedBlocks{0}, bumps{0}, viewLosses{0}, viewArms{0}, cleanQueries{0}, cleanAnswers{0}, importArmedPages{0}, importMarks{0}, renewRefused{0}, lateFaults{0}, declined{0}, retriedFaults{0}, armWaits{0}, armWaitNs{0};
     std::atomic<std::uint64_t> refusedBy[4][8]{};
     std::atomic<std::uint64_t> armsBy[4]{};
 };
@@ -261,7 +261,13 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
         return token;
     }
     GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyArm, GuestArena::GuestLockBefore);
-    std::lock_guard lock(armMutex);
+    std::unique_lock lock(armMutex, std::try_to_lock);
+    if (!lock.owns_lock()) {
+        const auto waitStart = nowNs();
+        lock.lock();
+        counters.armWaits.fetch_add(1, std::memory_order_relaxed);
+        counters.armWaitNs.fetch_add(nowNs() - waitStart, std::memory_order_relaxed);
+    }
     GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyArm, GuestArena::GuestLockHeld);
     struct ArmReleased {
         ~ArmReleased() { GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyArm, GuestArena::GuestLockReleased); }
@@ -637,6 +643,8 @@ void GuestDirtyTakeCounts_nid_postfix(GuestDirtyCounts* out) {
     out->lateFaults = take(counters.lateFaults);
     out->declined = take(counters.declined);
     out->retriedFaults = take(counters.retriedFaults);
+    out->armWaits = take(counters.armWaits);
+    out->armWaitNs = take(counters.armWaitNs);
     out->lastDeclined = lastDeclined.load(std::memory_order_relaxed);
     out->lastDeclinedState = lastDeclinedState.load(std::memory_order_relaxed);
     for (std::size_t k = 0; k < 4; ++k) {

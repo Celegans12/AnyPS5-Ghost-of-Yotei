@@ -3639,7 +3639,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     if (cacheable && built != nullptr && recorded && resources->Reusable()) {
         std::vector<std::shared_ptr<ShaderResources>> evicted;
         const bool deferEviction = recorder != nullptr && !RuntimeSwitches::Set(RuntimeSwitch::NoDeferredDrawEviction);
-        if (PrepareShadow::ProofOn()) resources->PublishProofView();
+        if (PrepareShadow::ProofOn() || PrepareShadow::PublishOnly()) resources->PublishProofView();
         SharedResourceCache().Insert(contentKey, resources, deferEviction ? &evicted : nullptr);
         for (auto& object : evicted) {
             object->KeepStorageImageBytes(*recorder);
