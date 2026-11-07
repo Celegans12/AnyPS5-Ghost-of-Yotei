@@ -118,7 +118,12 @@ void report() {
         reportNs.store(now, std::memory_order_relaxed);
         return;
     }
-    if (now - last < 10'000'000'000LL || !reportNs.compare_exchange_strong(last, now)) return;
+    // APS5_V3E_PREPARE_REPORT_MS (default 10000): the report interval; replay rows use a short one.
+    static const long long interval = [] {
+        const char* text = std::getenv("APS5_V3E_PREPARE_REPORT_MS");
+        return (text != nullptr ? std::atoll(text) : 10000LL) * 1'000'000LL;
+    }();
+    if (now - last < interval || !reportNs.compare_exchange_strong(last, now)) return;
     AgcDriver::ProfilePrint_nid_no_patch("[prepare-shadow] 10 s: %llu draw commits, %llu validated (%llu preparer-stamped), %llu without a draw-set proof, %llu proofs outside the record lock\n",
         take(commits), take(validated), take(preparerStamped), take(noSet), take(unlocked));
     if (RuntimeSwitches::Set(RuntimeSwitch::V3ePrepareProof)) {
