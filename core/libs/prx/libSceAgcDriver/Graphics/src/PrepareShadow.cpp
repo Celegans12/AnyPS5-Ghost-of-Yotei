@@ -291,7 +291,18 @@ void NotePreparedSet(const ShaderResources* set, std::span<const CompiledShader>
             copiedRanges.fetch_add(1, std::memory_order_relaxed);
             cause(CauseCopied);
         }
-        if (GuestMemory::CollectWritesUncached(address, static_cast<std::size_t>(bytes)) != 0) {
+        // Phase (ii) vouches by a dirty token first: validating it is lock-free, while a generation entry costs an
+        // uncached write-watch collect under the tracker lock at the commit (and here), which the commits then wait on
+        // (v3e-ab11: record-lock holders waited +1.1 s per 10 s on the tracker). A refused arm falls back to a generation.
+        std::uint64_t early = 0;
+        if (view != nullptr) {
+            static_cast<void>(GuestArena::GuestDirtyTakeLastRefusal_nid_postfix());
+            early = ImageFlags::Arm(address, static_cast<std::size_t>(bytes));
+        }
+        if (early != 0) {
+            shared->reads.AddToken(address, bytes, early);
+            tokens.fetch_add(1, std::memory_order_relaxed);
+        } else if (GuestMemory::CollectWritesUncached(address, static_cast<std::size_t>(bytes)) != 0) {
             shared->reads.AddGeneration(address, bytes, generation);
             generations.fetch_add(1, std::memory_order_relaxed);
         } else {
