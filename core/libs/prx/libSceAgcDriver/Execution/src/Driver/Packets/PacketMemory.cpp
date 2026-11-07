@@ -14,11 +14,62 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <mutex>
+#include <string>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 
 namespace AgcDriver::DriverDetail {
+
+// Diagnostic (APS5_TRACE_EOP=1, v3 exec 11-07): end-of-pipe interrupts deferred behind recorded work, by queue: the lag
+// from the guest packet to the delivery (the batch's completion running under a reap), and how many were delivered
+// at once; [eop] every 10 s.
+namespace {
+bool traceEop() {
+    static const bool enabled = std::getenv("APS5_TRACE_EOP") != nullptr;
+    return enabled;
+}
+struct EopQueue { std::uint64_t deferred = 0, immediate = 0, lagUs = 0, maxLagUs = 0; };
+std::mutex eopMutex;
+std::array<EopQueue, 256> eopQueues;
+std::chrono::steady_clock::time_point eopReport = std::chrono::steady_clock::now();
+void reportEopLocked(std::chrono::steady_clock::time_point now) {
+    if (now - eopReport < std::chrono::seconds(10)) return;
+    eopReport = now;
+    std::string line = "[eop] 10 s, by queue (deferred: count, packet-to-delivery avg / max ms; immediate count):";
+    for (std::size_t q = 0; q < eopQueues.size(); ++q) {
+        auto& e = eopQueues[q];
+        if (e.deferred == 0 && e.immediate == 0) continue;
+        char text[128];
+        std::snprintf(text, sizeof(text), " 0x%zx %llu %.1f / %.1f, %llu;", q, static_cast<unsigned long long>(e.deferred), e.deferred ? e.lagUs / 1000.0 / static_cast<double>(e.deferred) : 0.0, e.maxLagUs / 1000.0, static_cast<unsigned long long>(e.immediate));
+        line += text;
+        e = {};
+    }
+    std::fprintf(stderr, "%s
+", line.c_str());
+}
+}
+
+void TraceEopDelivered(std::uint32_t queue, std::chrono::steady_clock::time_point registered, bool deferred) {
+    if (!traceEop()) return;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(eopMutex);
+    auto& e = eopQueues[queue % eopQueues.size()];
+    if (deferred) {
+        const auto lag = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - registered).count());
+        ++e.deferred;
+        e.lagUs += lag;
+        e.maxLagUs = std::max(e.maxLagUs, lag);
+    } else {
+        ++e.immediate;
+    }
+    reportEopLocked(now);
+}
 
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
@@ -60,7 +111,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             }
             if (reason == 0 || reason == 5) {
                 const auto queueId = submission.queue;
-                interruptDeferred = localDevice->AfterRecordedWork([this, queueId] { deliverGuestEopInterrupt(queueId); }, submission.queue == 0);
+                interruptDeferred = localDevice->AfterRecordedWork([this, queueId, at = std::chrono::steady_clock::now()] { TraceEopDelivered(queueId, at, true); deliverGuestEopInterrupt(queueId); }, submission.queue == 0);
                 if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0);
                 wroteOnGpu = true;
             } else if (reason == 1) {
@@ -543,10 +594,13 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         bool deferred = false;
         if (bytes.empty() && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("interrupt") != 0) workOpen = true;
         if (localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
-            deferred = localDevice->AfterRecordedWork([this, queue] { deliverGuestEopInterrupt(queue); }, queue == 0);
+            deferred = localDevice->AfterRecordedWork([this, queue, at = std::chrono::steady_clock::now()] { TraceEopDelivered(queue, at, true); deliverGuestEopInterrupt(queue); }, queue == 0);
             if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0);
         }
-        if (!deferred) deliverGuestEopInterrupt(queue);
+        if (!deferred) {
+            TraceEopDelivered(queue, {}, false);
+            deliverGuestEopInterrupt(queue);
+        }
     }
     submitDueAfterCommit(localDevice.get());
 }
