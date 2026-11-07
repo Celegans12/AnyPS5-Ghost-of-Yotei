@@ -72,7 +72,7 @@ Counts& counts() {
 }
 
 int Mode() {
-    static const int mode = [] {
+    static const int checked = [] {
         const char* value = std::getenv("APS5_V3M_STORAGE_TOKENS");
         if (value == nullptr || !GuestMemory::DirtyEnabled()) return 0;
         const std::string_view text(value);
@@ -80,7 +80,9 @@ int Mode() {
         if (text == "verify") return 2;
         return 1;
     }();
-    return mode;
+    if (checked >= 2) return checked;
+    if (!GuestMemory::DirtyEnabled()) return 0;
+    return RuntimeSwitches::Set(RuntimeSwitch::V3mStorageTokens) ? 1 : 0;
 }
 
 void Violation(const char* what, std::uint64_t address, std::uint64_t bytes) {
@@ -2529,7 +2531,10 @@ bool StorageTexture::tokenEligible() const {
 
 bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) {
     const int mode = StorageTokens::Mode();
-    if (mode == 0) return refreshFull(firstLayer, lastLayer);
+    if (mode == 0) {
+        syncToken = 0;
+        return refreshFull(firstLayer, lastLayer);
+    }
     auto& counts = StorageTokens::counts();
     counts.refreshes.fetch_add(1, std::memory_order_relaxed);
     if (firstLayer != 0 || lastLayer != trackedLayers || !tokenEligible()) {
@@ -6730,6 +6735,7 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     const int mode = StorageTokens::Mode();
     if (mode == 0) {
+        syncToken = 0;
         writeBackLayersBody(layers);
         return;
     }

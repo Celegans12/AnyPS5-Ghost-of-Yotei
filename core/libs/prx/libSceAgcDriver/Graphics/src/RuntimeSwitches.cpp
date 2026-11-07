@@ -98,6 +98,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_DISPATCH_CACHE_LARGE",
     "APS5_RESOURCE_CACHE_LARGE",
     "APS5_V3M_ADDR_CEIL",
+    "APS5_V3M_STORAGE_TOKENS",
 };
 
 struct Refusal {
