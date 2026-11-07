@@ -104,6 +104,8 @@ enum class RuntimeSwitch : std::size_t {
     V3eBindingFlags,
     V3eInputFlags,
     V3eTextureRoom,
+    V3eDeepPipeline,
+    V3eMidPipeline,
     V3mAddrCeil,
     Count,
 };

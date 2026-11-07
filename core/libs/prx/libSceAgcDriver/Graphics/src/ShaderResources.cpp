@@ -5157,11 +5157,40 @@ void noteEpochProof(bool reused, bool verified, bool failed) {
 }
 }
 
+namespace {
+// Lever A census (APS5_V3E_A_CENSUS=1, log-only): for proofs the epoch memo does not serve, would a memo keyed on the
+// per-cause serial (ProofSerialCaused: ProofSerial without foreign GPU-mutex acquires) and the pending serial have held,
+// and did the full proof then pass by the fast path (stamps; no full walk)? That upper-bounds lever A's hit rate (memory
+// content is assumed proven by tokens wherever the stamp proof passed). Split by sets of one shader (dispatches) and more
+// (draws); [a-census] every 10 s.
+bool aCensus() {
+    static const bool enabled = std::getenv("APS5_V3E_A_CENSUS") != nullptr;
+    return enabled;
+}
+struct ACensus { std::array<std::atomic<std::uint64_t>, 2> proofs{}, served{}, keyHeld{}, heldFast{}, missFast{}; };
+ACensus aCounts;
+std::atomic<std::int64_t> aReportNs{0};
+void aReport() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = aReportNs.load(std::memory_order_relaxed);
+    if (last == 0) { aReportNs.store(now, std::memory_order_relaxed); return; }
+    if (now - last < 10'000'000'000LL || !aReportNs.compare_exchange_strong(last, now)) return;
+    for (std::size_t k = 0; k < 2; ++k) {
+        const auto proofs = aCounts.proofs[k].exchange(0), served = aCounts.served[k].exchange(0), held = aCounts.keyHeld[k].exchange(0), fast = aCounts.heldFast[k].exchange(0), missFast = aCounts.missFast[k].exchange(0);
+        AgcDriver::ProfilePrint_nid_no_patch("[a-census] 10 s %s: %llu proofs, %llu served by the epoch memo; of the rest, the per-cause key held for %llu, %llu of them then passed the fast proof (would be served by A: %.1f %% of the unserved); key moved but fast proof passed %llu\n", k == 0 ? "dispatch sets" : "draw sets", static_cast<unsigned long long>(proofs), static_cast<unsigned long long>(served), static_cast<unsigned long long>(held), static_cast<unsigned long long>(fast), proofs > served ? 100.0 * static_cast<double>(fast) / static_cast<double>(proofs - served) : 0.0, static_cast<unsigned long long>(missFast));
+    }
+}
+}
+
 bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
         const auto pending = StorageTexture::PendingSerial();
+        const bool census = aCensus();
+        const auto caused = census ? GuestMemory::ProofSerialCaused() : 0;
+        const std::size_t kind = shaders.size() == 1 ? 0 : 1;
+        if (census) aCounts.proofs[kind].fetch_add(1, std::memory_order_relaxed);
         if (epoch != 0 && provedEpoch == epoch && provedProof == proof && provedPending == pending) {
             static const bool verify = std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr;
             thread_local std::uint64_t reuses = 0;
@@ -5173,19 +5202,34 @@ bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofR
             if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
             noteEpochProof(true, false, false);
             if (C3Log::Enabled()) C3Log::ThreadSplit().epochReused = true;
+            if (census) {
+                aCounts.served[kind].fetch_add(1, std::memory_order_relaxed);
+                aReport();
+            }
             return true;
         }
+        const bool keyHeld = census && provedEpoch != 0 && provedCaused == caused && provedPending == pending;
         if (C3Log::Enabled()) {
             auto& split = C3Log::ThreadSplit();
             split.epochMoved = epoch == 0 || provedEpoch != epoch;
             split.proofMoved = provedProof != proof;
             split.pendingMoved = provedPending != pending;
         }
-        const bool ok = revalidateFull(shaders, report);
+        ProofReport censusReport;
+        auto* used = report != nullptr ? report : census ? &censusReport : nullptr;
+        const bool ok = revalidateFull(shaders, used);
         noteEpochProof(false, false, false);
+        if (census) {
+            const bool fast = ok && used != nullptr && used->path == ProofPath::Fast;
+            if (keyHeld) aCounts.keyHeld[kind].fetch_add(1, std::memory_order_relaxed);
+            if (keyHeld && fast) aCounts.heldFast[kind].fetch_add(1, std::memory_order_relaxed);
+            if (!keyHeld && fast) aCounts.missFast[kind].fetch_add(1, std::memory_order_relaxed);
+            aReport();
+        }
         if (ok) {
             provedEpoch = epoch;
             provedProof = proof;
+            provedCaused = caused;
             provedPending = pending;
         } else {
             provedEpoch = 0;

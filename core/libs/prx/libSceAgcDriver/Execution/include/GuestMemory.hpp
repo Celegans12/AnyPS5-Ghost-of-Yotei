@@ -252,6 +252,9 @@ void EndCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 void BreakProofs();
+// v3 exec lever A census (log-only): ProofSerial without the bumps a foreign GPU-mutex acquire makes by itself (every
+// other BreakProofs cause still bumps it).
+std::uint64_t ProofSerialCaused();
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();

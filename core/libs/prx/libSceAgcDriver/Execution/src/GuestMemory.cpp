@@ -1792,8 +1792,15 @@ std::uint64_t ProofSerial() {
     return proofSerial.load(std::memory_order_acquire);
 }
 
+std::atomic<std::uint64_t> proofSerialCaused{1};
+
+std::uint64_t ProofSerialCaused() {
+    return proofSerialCaused.load(std::memory_order_acquire);
+}
+
 void BreakProofs() {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    proofSerialCaused.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void MarkProofThread() {
@@ -2708,7 +2715,8 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        // A foreign hold breaks proofs (ProofSerial) but is not a cause of its own for the lever-A census.
+        if (!proofThread) proofSerial.fetch_add(1, std::memory_order_acq_rel);
     }
 }
 

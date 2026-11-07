@@ -410,10 +410,14 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         commit();
         return;
     }
-    if (items.size() >= Depth()) {
+    // v3 exec (runtime switches, APS5_AB): APS5_V3E_DEEP_PIPELINE lets 256 items queue before the worker waits for room,
+    // APS5_V3E_MID_PIPELINE 128 (today 64 with pipelined indirect draws). Only the room threshold moves; items still
+    // commit in order, so the switch is exact and may flip at any enqueue.
+    const auto room = Depth() == 0 ? std::size_t{0} : Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eDeepPipeline) ? std::max<std::size_t>(Depth(), 256) : Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eMidPipeline) ? std::max<std::size_t>(Depth(), 128) : Depth();
+    if (items.size() >= room) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
-        resumeAt = Depth() - 1;
+        resumeAt = room - 1;
         ++idleWaiters;
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
         --idleWaiters;
