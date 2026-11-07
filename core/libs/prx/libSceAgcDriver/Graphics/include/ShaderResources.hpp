@@ -19,6 +19,7 @@
 #include <memory>
 #include <optional>
 #include <span>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -409,6 +410,9 @@ public:
     bool ChecksFaults() const { return bda != nullptr; }
     void CheckFaults(std::uint64_t shaderAddress = 0) const;
     bool InUse() const { return usesInFlight->load(std::memory_order_acquire) != 0; }
+    // The guest ranges a draw-set proof reads (direct regions, described ranges, storage images, validated textures,
+    // with their DCC keys): the prepare-shadow census's read set.
+    void ForEachReadRange(const std::function<void(std::uint64_t, std::uint64_t)>& add) const;
     bool ReusesAddressSpace() const { return addressReuse; }
     std::shared_ptr<const void> BeginUse();
     void CompleteUse();

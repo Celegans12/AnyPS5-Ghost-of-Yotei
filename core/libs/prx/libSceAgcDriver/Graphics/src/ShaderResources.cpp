@@ -5262,27 +5262,29 @@ bool ShaderResources::proveDrawMemo(std::span<const CompiledShader> shaders, Pro
     return ok;
 }
 
+void ShaderResources::ForEachReadRange(const std::function<void(std::uint64_t, std::uint64_t)>& add) const {
+    for (const auto& region : directRegions) add(region.begin, region.end - region.begin);
+    for (const auto& range : describedRanges) {
+        add(range.address, range.bytes);
+        if (range.dccAddress != 0) add(range.dccAddress, DccKeyBytes(range.bytes));
+    }
+    for (const auto& image : storageTextures) {
+        add(image->Descriptor().baseAddress, image->GuestBytes());
+        if (image->Descriptor().dccAddress != 0) add(image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+    }
+    for (const auto& surface : validatedTextures) {
+        add(surface.resource.baseAddress, surface.bytes);
+        if (surface.resource.dccAddress != 0) add(surface.resource.dccAddress, DccKeyBytes(surface.bytes));
+    }
+}
+
 bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofReport* report) {
     struct ShadowNote {
         ShaderResources* self;
         bool draws;
         ~ShadowNote() {
             if (!draws || !PrepareShadow::Active() || std::uncaught_exceptions() != 0) return;
-            PrepareShadow::NoteDrawSet([this](const std::function<void(std::uint64_t, std::uint64_t)>& add) {
-                for (const auto& region : self->directRegions) add(region.begin, region.end - region.begin);
-                for (const auto& range : self->describedRanges) {
-                    add(range.address, range.bytes);
-                    if (range.dccAddress != 0) add(range.dccAddress, DccKeyBytes(range.bytes));
-                }
-                for (const auto& image : self->storageTextures) {
-                    add(image->Descriptor().baseAddress, image->GuestBytes());
-                    if (image->Descriptor().dccAddress != 0) add(image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
-                }
-                for (const auto& surface : self->validatedTextures) {
-                    add(surface.resource.baseAddress, surface.bytes);
-                    if (surface.resource.dccAddress != 0) add(surface.resource.dccAddress, DccKeyBytes(surface.bytes));
-                }
-            });
+            PrepareShadow::NoteDrawSet(self, [this](const std::function<void(std::uint64_t, std::uint64_t)>& add) { self->ForEachReadRange(add); });
         }
     } shadowNote{this, shaders.size() > 1 && PrepareShadow::Enabled()};
     if (shaders.size() > 1 && RuntimeSwitches::Set(RuntimeSwitch::V3eDrawProofMemo) && GuestMemory::DirtyEnabled()) return proveDrawMemo(shaders, report);

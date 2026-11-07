@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/PrepareShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
@@ -1773,13 +1774,16 @@ std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& s
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
     prepared->trimmed = trimKey;
     const bool cacheable = !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program->PipelineVariantId() != 0; }) && !ShaderResources::NeverReusable(shaders);
+    if (!cacheable && PrepareShadow::Preparing()) PrepareShadow::NotePreparedSet(nullptr, {});
     if (cacheable) {
         prepared->contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, prepared->indexBytes, !trimKey);
         prepared->keyed = true;
         // An entry found now often cannot serve the draw (its buffers moved: a miss after all), so
         // stage A is made anyway unless APS5_SPLIT_DRAW_CACHED=0; a draw the cache serves drops it.
         static const bool buildCached = [] { const char* text = std::getenv("APS5_SPLIT_DRAW_CACHED"); return text == nullptr || std::strcmp(text, "0") != 0; }();
-        if (const auto cached = SharedResourceCache().Peek(prepared->contentKey); cached != nullptr && !cached->InUse()) {
+        const auto peeked = SharedResourceCache().Peek(prepared->contentKey);
+        if (PrepareShadow::Preparing()) PrepareShadow::NotePreparedSet(peeked.get(), [&](const std::function<void(std::uint64_t, std::uint64_t)>& add) { peeked->ForEachReadRange(add); });
+        if (const auto& cached = peeked; cached != nullptr && !cached->InUse()) {
             prepared->cachedAtPrepare = true;
             counters.cachedAtPrepare.fetch_add(1, std::memory_order_relaxed);
             if (!buildCached) return prepared;
