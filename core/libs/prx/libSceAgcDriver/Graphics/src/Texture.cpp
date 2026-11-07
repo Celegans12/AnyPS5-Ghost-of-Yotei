@@ -5687,6 +5687,18 @@ bool StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t,
     return false;
 }
 
+namespace {
+
+const bool storageFactCheck = [] {
+    GuestMemory::SetRegistryCheck(GuestMemory::Registry::StorageResults, [](std::uint64_t address, std::uint64_t bytes, std::uint64_t fact) {
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, address + bytes}}};
+        return StorageTexture::AnyPendingOverlaps(range) == (fact != 0);
+    });
+    return true;
+}();
+
+}
+
 bool StorageTexture::AnyLiveOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     auto& live = Live();
     std::lock_guard lock(live.mutex);

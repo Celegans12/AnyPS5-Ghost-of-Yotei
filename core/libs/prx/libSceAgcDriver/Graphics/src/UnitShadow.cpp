@@ -554,6 +554,15 @@ bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
     return anyShadowedLocked(registry, address, bytes);
 }
 
+namespace {
+
+const bool shadowFactCheck = [] {
+    GuestMemory::SetRegistryCheck(GuestMemory::Registry::Shadows, [](std::uint64_t address, std::uint64_t bytes, std::uint64_t fact) { return AnyShadowedOverlaps(address, static_cast<std::size_t>(bytes)) == (fact != 0); });
+    return true;
+}();
+
+}
+
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
     if (!UnitShadowEnabled() || ranges.empty()) return false;
     auto& registry = Registry();
