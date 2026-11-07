@@ -62,6 +62,22 @@ void reportEopLocked(std::chrono::steady_clock::time_point now) {
 }
 }
 
+// Frame marks for [frame-chain] (Acb.cpp): when the queue-0 worker last reached a flip packet and a queue-0 EOP packet.
+std::atomic<std::int64_t> frameFlipNs{0}, frameEop0Ns{0};
+std::atomic<std::uint64_t> frameFlips{0};
+
+void TraceFlipReached() {
+    if (!traceEop()) return;
+    frameFlipNs.store(pipeNs(std::chrono::steady_clock::now()), std::memory_order_relaxed);
+    frameFlips.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TraceFrameMarks(std::int64_t* flipNs, std::int64_t* eop0Ns, std::uint64_t* flips) {
+    *flipNs = frameFlipNs.load(std::memory_order_relaxed);
+    *eop0Ns = frameEop0Ns.load(std::memory_order_relaxed);
+    *flips = frameFlips.load(std::memory_order_relaxed);
+}
+
 void TracePipeStart(std::uint32_t queue, std::chrono::steady_clock::time_point enqueued) {
     if (!traceEop()) return;
     pipeEnqueued[queue % pipeEnqueued.size()].store(pipeNs(enqueued), std::memory_order_relaxed);
@@ -78,6 +94,7 @@ std::int64_t TracePipeSubmitted(std::uint32_t queue) {
 
 void TracePipeEop(std::uint32_t queue, std::int64_t submittedNs, std::int64_t startedNs, std::int64_t seenNs, std::uint32_t flipsAhead) {
     if (!traceEop() || seenNs == 0) return;
+    if (queue == 0) frameEop0Ns.store(seenNs, std::memory_order_relaxed);
     const auto now = std::chrono::steady_clock::now();
     const auto nowNs = pipeNs(now);
     std::lock_guard lock(eopMutex);

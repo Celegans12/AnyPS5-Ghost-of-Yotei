@@ -32,6 +32,7 @@ namespace AgcDriver::DriverDetail {
 
 // PacketMemory.cpp (APS5_TRACE_EOP): queues 0x80+ are flip interrupts (0x80 + queue).
 void TraceEopDelivered(std::uint32_t queue, std::chrono::steady_clock::time_point registered, bool deferred);
+void TraceFlipReached();
 
 namespace {
 
@@ -588,6 +589,7 @@ void Driver::execute(const Submission& submission) {
                     flipInterruptDeferred = localDevice->AfterRecordedWork([this, queueId, at = std::chrono::steady_clock::now()] { TraceEopDelivered(queueId + 0x80, at, true); deliverFlipEopInterrupt(queueId); }, false);
                 }
             }
+            if (submission.queue == 0) TraceFlipReached();
             if (!flipInterruptDeferred) {
                 TraceEopDelivered(submission.queue + 0x80, {}, false);
                 deliverFlipEopInterrupt(submission.queue);
