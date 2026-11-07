@@ -68,6 +68,7 @@ thread_local Shared* currentShared = nullptr;
 thread_local std::uint32_t currentSite = 0;
 thread_local bool noted = false;
 thread_local Shared* preparing = nullptr;
+thread_local bool recheckPending = false;
 
 std::atomic<std::uint64_t> commits{0}, validated{0}, unlocked{0}, noSet{0}, preparerStamped{0};
 // v2 outcomes per commit with a draw-set proof.
@@ -77,7 +78,7 @@ std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::Val
 std::array<std::atomic<std::uint64_t>, CauseCount> unarmedBy{}, unvouchedBy{};
 std::atomic<std::uint64_t> copiedRanges{0}, leasedSets{0};
 // Phase (ii): commits that asked (TakePrepared), verdicts at prepare, outcomes at the commit.
-std::atomic<std::uint64_t> proofAsks{0}, proofSwitchMoved{0}, proofSerialMoved{0}, proofServed{0}, proofVerified{0}, proofVerifyFailed{0};
+std::atomic<std::uint64_t> noView{0}, proofAsks{0}, proofSwitchMoved{0}, proofSerialMoved{0}, proofServed{0}, proofVerified{0}, proofVerifyFailed{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::Ahead::Count)> aheadBy{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Fallback::Count)> fallbackBy{};
 std::atomic<std::int64_t> reportNs{0};
@@ -107,8 +108,8 @@ void reportProof() {
     }
     std::array<unsigned long long, static_cast<std::size_t>(Fallback::Count)> fb{};
     for (std::size_t i = 0; i < fb.size(); ++i) fb[i] = take(fallbackBy[i]);
-    AgcDriver::ProfilePrint_nid_no_patch("[prepare-proof] 10 s: %llu draw-set proofs asked, %llu served from the prepared verdict; prepared verdicts of the validated sets:%s; not served: switch moved %llu, storage results or shadows moved %llu, commit re-check moved %llu evicted %llu depth %llu imports %llu; verify %llu checked, %llu differed\n",
-        take(proofAsks), take(proofServed), aheadText, take(proofSwitchMoved), take(proofSerialMoved), fb[1], fb[2], fb[3], fb[4], take(proofVerified), take(proofVerifyFailed));
+    AgcDriver::ProfilePrint_nid_no_patch("[prepare-proof] 10 s: %llu draw-set proofs asked, %llu served from the prepared verdict; prepared verdicts of the validated sets:%s; no published view %llu; not served: switch moved %llu, commit re-check moved %llu evicted %llu depth %llu imports %llu untracked %llu pending %llu (pending re-checked after a serial move %llu); verify %llu checked, %llu differed\n",
+        take(proofAsks), take(proofServed), aheadText, take(noView), take(proofSwitchMoved), fb[1], fb[2], fb[3], fb[4], fb[5], fb[6], take(proofSerialMoved), take(proofVerified), take(proofVerifyFailed));
 }
 
 void report() {
@@ -258,19 +259,27 @@ void NotePreparedSet(const ShaderResources* set, std::span<const CompiledShader>
     registerPendingCheck();
     const auto generation = shared->prepared.generation;
     const auto snapshot = Recorder::PendingWriteSnapshot();
+    // Phase (ii) reads the set's published view and takes no cache lock (a commit's stage hold would wait on it);
+    // census v2 alone reads the set under the shared resource-set lock.
+    const auto view = shared->proof ? set->LoadProofView() : nullptr;
+    if (shared->proof && view == nullptr) {
+        noView.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     std::shared_lock<LockOrder::CacheLock> setLock(LockOrder::CacheLockFor(LockOrder::Rank::ResourceSet), std::defer_lock);
-    if (RuntimeSwitches::Set(RuntimeSwitch::V3eLockSplit)) setLock.lock();
+    if (view != nullptr) {
+    } else if (RuntimeSwitches::Set(RuntimeSwitch::V3eLockSplit)) setLock.lock();
     else unlockedReads.fetch_add(1, std::memory_order_relaxed);
     const auto cause = [&](std::uint8_t why) {
         if (shared->unvouchedCause == 0xff) shared->unvouchedCause = why;
     };
-    if (GuestMemory::AddUnwiredEntry(shared->reads, 0, 1, false, set->HoldsLease())) {
+    if (GuestMemory::AddUnwiredEntry(shared->reads, 0, 1, false, view != nullptr ? ShaderResources::ViewHoldsLease(*view) : set->HoldsLease())) {
         leasedSets.fetch_add(1, std::memory_order_relaxed);
         cause(CauseLeased);
     }
-    set->ForEachReadRange([&](std::uint64_t address, std::uint64_t bytes) {
+    const auto addRange = [&](std::uint64_t address, std::uint64_t bytes, bool copied) {
         if (bytes == 0) return;
-        if (GuestMemory::AddUnwiredEntry(shared->reads, address, bytes, set->CopiedWritesOverlap(address, static_cast<std::size_t>(bytes)), false)) {
+        if (GuestMemory::AddUnwiredEntry(shared->reads, address, bytes, copied, false)) {
             copiedRanges.fetch_add(1, std::memory_order_relaxed);
             cause(CauseCopied);
         }
@@ -290,10 +299,16 @@ void NotePreparedSet(const ShaderResources* set, std::span<const CompiledShader>
         }
         const std::pair<std::uint64_t, std::uint64_t> range{address, address + bytes};
         shared->reads.AddFact(GuestMemory::Registry::PendingWrites, address, bytes, Recorder::SnapshotOverlaps(snapshot.get(), address, static_cast<std::size_t>(bytes)) ? 1 : 0);
+        // Phase (ii) re-runs the proof's own pending and shadow checks at the commit when these serials moved
+        // (RecheckPending), with the proof's except semantics; the coarse overlap facts are census v2's.
+        if (view != nullptr) return;
         shared->reads.AddFact(GuestMemory::Registry::StorageResults, address, bytes, StorageTexture::AnyPendingOverlaps({&range, 1}) ? 1 : 0);
         shared->reads.AddFact(GuestMemory::Registry::Shadows, address, bytes, AnyShadowedOverlaps(address, static_cast<std::size_t>(bytes)) ? 1 : 0);
-    });
-    if (shared->proof) shared->ahead = set->ProveAhead(shaders);
+    };
+    if (view != nullptr) ShaderResources::ForEachViewRange(*view, addRange);
+    else set->ForEachReadRange([&](std::uint64_t address, std::uint64_t bytes) { addRange(address, bytes, bytes != 0 && set->CopiedWritesOverlap(address, static_cast<std::size_t>(bytes))); });
+    if (view != nullptr) shared->ahead = ShaderResources::ProveAhead(*view);
+    static_cast<void>(shaders);
     shared->preparedSet = set;
 }
 
@@ -309,6 +324,7 @@ void countValidation(const Shared& shared, GuestMemory::Validation result) {
 }
 
 bool TakePrepared(const void* set) {
+    recheckPending = false;
     if (current == nullptr || noted) return false;
     noted = true;
     if (!GuestMemory::GpuMutex().HeldByThisThread()) {
@@ -342,11 +358,13 @@ bool TakePrepared(const void* set) {
         return false;
     }
     if (shared->ahead != ShaderResources::Ahead::Pass) return false;
-    if (moved[static_cast<std::size_t>(GuestMemory::Registry::StorageResults)] || moved[static_cast<std::size_t>(GuestMemory::Registry::Shadows)]) {
-        proofSerialMoved.fetch_add(1, std::memory_order_relaxed);
-        return false;
-    }
+    recheckPending = moved[static_cast<std::size_t>(GuestMemory::Registry::StorageResults)] || moved[static_cast<std::size_t>(GuestMemory::Registry::Shadows)];
+    if (recheckPending) proofSerialMoved.fetch_add(1, std::memory_order_relaxed);
     return true;
+}
+
+bool RecheckPending() {
+    return recheckPending;
 }
 
 void NoteFallback(Fallback reason) {

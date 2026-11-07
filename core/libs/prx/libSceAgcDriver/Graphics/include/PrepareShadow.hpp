@@ -17,8 +17,8 @@
 // commits that same set; a commit with no set at prepare time, or another set, counts as a re-prepare
 // ([prepare-shadow2], and [v3m-validate] site "other"). Ranges a copied writer overlaps, and every set holding a BDA
 // lease, are entered unvouched (AddUnwiredEntry); unarmed ranges are counted by GuestDirty's refusal reason.
-// Phase (ii), APS5_V3E_PREPARE_PROOF (RuntimeSwitch, with APS5_V3E_LOCK_SPLIT): the preparer also runs
-// ShaderResources::ProveAhead on that set; the commit's revalidateFull serves the set from that verdict when the read
+// Phase (ii), APS5_V3E_PREPARE_PROOF (RuntimeSwitch, with APS5_V3E_LOCK_SPLIT): the preparer builds the read set from
+// the set's published ProofView and runs ShaderResources::ProveAhead on it, taking no cache lock; the commit's revalidateFull serves the set from that verdict when the read
 // set validates, the storage-results and shadow registries did not move and its own re-checks pass, else it runs
 // today's proof ([prepare-proof]). APS5_V3E_PREPARE_PROOF_VERIFY=throw runs today's proof too and throws on a difference.
 namespace AgcDriver::Graphics {
@@ -46,10 +46,12 @@ void NotePreparedSet(const ShaderResources* set, std::span<const CompiledShader>
 // Phase (ii), at the commit (record lock held).
 bool ProofOn();
 bool VerifyProof();
-// Whether this commit may serve `set` from its prepared verdict: same set, verdict Pass, read set Valid, storage results
-// and shadows unmoved. Counts the outcome; once per commit.
+// Whether this commit may serve `set` from its prepared verdict: same set, verdict Pass, read set Valid (the storage-results
+// and shadow checks re-run at the commit when their serials moved: RecheckPending). Counts the outcome; once per commit.
 bool TakePrepared(const void* set);
-enum class Fallback : std::uint8_t { None, Moved, Evicted, Depth, Imports, Count };
+enum class Fallback : std::uint8_t { None, Moved, Evicted, Depth, Imports, Untracked, Pending, Count };
+// Whether this commit's storage-results or shadow serial moved since prepare (the commit re-runs those checks).
+bool RecheckPending();
 void NoteFallback(Fallback reason);
 void NoteServed(bool served);
 void NoteVerify(bool same);

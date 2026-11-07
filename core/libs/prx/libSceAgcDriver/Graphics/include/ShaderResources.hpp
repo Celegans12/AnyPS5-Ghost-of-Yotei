@@ -17,6 +17,7 @@
 #include <list>
 #include <map>
 #include <memory>
+#include <tuple>
 #include <optional>
 #include <span>
 #include <functional>
@@ -418,7 +419,15 @@ public:
     // refresh, upload, import creation or recorder call (no DCC keys, no depth surfaces, every range write-watched);
     // the commit then serves the set when the prepare-time read set validates (revalidateFull's prepared path).
     enum class Ahead : std::uint8_t { Pass, NotReusable, AddressBased, Other, Audit, Depth, Keys, Untracked, Evicted, Pending, Shadows, Imports, Changed, Count };
-    Ahead ProveAhead(std::span<const CompiledShader> shaders) const;
+    // The fields ProveAhead reads, published by each commit of the set (RCU-style: an immutable copy swapped in, kept
+    // alive by the reader's reference), so the preparer reads them without any lock the commit's stage hold takes.
+    struct ProofView;
+    std::shared_ptr<const ProofView> LoadProofView() const { return proofView.load(std::memory_order_acquire); }
+    void PublishProofView();
+    static Ahead ProveAhead(const ProofView& view);
+    // The view's read ranges (ForEachReadRange) with whether a copied writer of the set overlaps each, and its lease.
+    static void ForEachViewRange(const ProofView& view, const std::function<void(std::uint64_t, std::uint64_t, bool)>& add);
+    static bool ViewHoldsLease(const ProofView& view);
     static const char* AheadName(Ahead result);
     bool ReusesAddressSpace() const { return addressReuse; }
     std::shared_ptr<const void> BeginUse();
@@ -672,6 +681,31 @@ private:
         std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
         std::array<std::uint64_t, 4> untracked{};
     };
+public:
+    struct ProofView {
+        struct Surface {
+            std::uint64_t address;
+            std::uint64_t bytes;
+            const StorageTexture* source;
+        };
+        bool reusable = false;
+        bool addressBased = false;
+        bool holdsLease = false;
+        const Context* context = nullptr;
+        std::vector<ValidatedSurface> surfaces;
+        std::vector<std::shared_ptr<Texture>> textures;
+        std::vector<std::shared_ptr<StorageTexture>> storage;
+        std::vector<std::uint64_t> storageKeys;
+        std::vector<std::array<std::uint64_t, 4>> storageUntracked;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> regions;
+        std::vector<std::tuple<std::uint64_t, std::uint64_t, bool>> reads;
+        HostImportsProof importsProof;
+    };
+private:
+    std::atomic<std::shared_ptr<const ProofView>> proofView;
+    // Phase (ii) at the commit, when the storage-results or shadow registry moved since prepare: the proof's pending
+    // and shadow checks over the current set (exact facts in place of the serial).
+    bool pendingClearNow() const;
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element
     // (index into textures, or into storageTextures when `storage`) whose own object stands in for
