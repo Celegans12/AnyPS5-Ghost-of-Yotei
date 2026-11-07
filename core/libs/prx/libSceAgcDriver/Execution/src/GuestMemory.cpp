@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -3185,6 +3186,21 @@ bool forEachHashBlock(std::uint64_t address, std::size_t bytes, Visit&& visit) {
     return true;
 }
 
+// The hash block at index of [address, address + bytes), as forEachHashBlock visits it: (begin, length).
+std::pair<std::uint64_t, std::size_t> hashBlockAt(std::uint64_t address, std::size_t bytes, std::size_t index) {
+    const auto begin = index == 0 ? address : (address / HashBlockBytes + index) * HashBlockBytes;
+    const auto stop = std::min<std::uint64_t>(address + bytes, (address / HashBlockBytes + index + 1) * HashBlockBytes);
+    return {begin, static_cast<std::size_t>(stop - begin)};
+}
+
+// Ranges this large share their hash blocks with the compare helpers (APS5_NO_PARALLEL_BLOCK_HASH turns
+// it off): a block costs ~10 us to copy and hash, and waking the helpers costs a few blocks' worth.
+constexpr std::size_t ParallelHashBytes = std::size_t{512} << 10u;
+
+bool parallelHash(std::size_t bytes) {
+    return bytes >= ParallelHashBytes && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoParallelBlockHash);
+}
+
 // Hashes guest blocks in place while every page is readable; otherwise each block is assembled as
 // ReadCommitted would read it (zeros where nothing is committed).
 class CommittedHasher {
@@ -3239,12 +3255,53 @@ void HashBlocksOf(std::uint64_t address, std::span<const std::byte> bytes, std::
     });
 }
 
+void ReadCommittedHashed(std::uint64_t address, std::span<std::byte> destination, std::span<ContentHash::Hash128> out) {
+    requireNotSpeculative("read of committed pages");
+    require(out.size() == HashBlockCount(address, destination.size()), "hash block count differs");
+    if (destination.empty()) return;
+    GuardRead(address, destination.size());
+    FlushGpuWrites(address, destination.size());
+    const TimedAccess timed(CounterRead, destination.size());
+    CountReadCaller(__builtin_return_address(0));
+    struct Job {
+        std::uint64_t address;
+        std::span<std::byte> destination;
+        std::span<ContentHash::Hash128> out;
+    } job{address, destination, out};
+    const auto readBlock = [](void* context, std::size_t index) {
+        const auto& state = *static_cast<const Job*>(context);
+        const auto [begin, length] = hashBlockAt(state.address, state.destination.size(), index);
+        const auto block = state.destination.subspan(static_cast<std::size_t>(begin - state.address), length);
+        copyCommitted(begin, block);
+        state.out[index] = ContentHash::Of(block.data(), length);
+    };
+    if (parallelHash(destination.size()) && Graphics::RunOnCompareHelpers(out.size(), readBlock, &job)) return;
+    for (std::size_t index = 0; index < out.size(); ++index) readBlock(&job, index);
+}
+
 bool CommittedBlocksMatch(std::uint64_t address, std::size_t bytes, std::span<const ContentHash::Hash128> expected) {
     if (expected.size() != HashBlockCount(address, bytes)) return false;
     if (bytes == 0) return true;
     if (GpuOwned(address, bytes)) return false;
     const TimedAccess timed(CounterCompare, bytes);
     CommittedHasher hash(address, bytes);
+    if (parallelHash(bytes)) {
+        // Helpers skip the blocks left once any block differs.
+        struct Job {
+            std::uint64_t address;
+            std::size_t bytes;
+            std::span<const ContentHash::Hash128> expected;
+            CommittedHasher* hash;
+            std::atomic<bool> differs{false};
+        } job{address, bytes, expected, &hash};
+        const auto matchBlock = [](void* context, std::size_t index) {
+            auto& state = *static_cast<Job*>(context);
+            if (state.differs.load(std::memory_order_relaxed)) return;
+            const auto [begin, length] = hashBlockAt(state.address, state.bytes, index);
+            if (!((*state.hash)(begin, length) == state.expected[index])) state.differs.store(true, std::memory_order_relaxed);
+        };
+        if (Graphics::RunOnCompareHelpers(expected.size(), matchBlock, &job)) return !job.differs.load(std::memory_order_relaxed);
+    }
     return forEachHashBlock(address, bytes, [&](std::size_t index, std::uint64_t begin, std::size_t length) { return hash(begin, length) == expected[index]; });
 }
 
