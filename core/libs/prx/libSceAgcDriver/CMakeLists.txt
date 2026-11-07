@@ -920,6 +920,7 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         tests/ShaderMemory.cpp
         Execution/src/ShaderMemory.cpp
         Graphics/src/RuntimeSwitches.cpp
+        Graphics/src/ParallelCompare.cpp
         Execution/src/GuestMemory.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
@@ -932,6 +933,7 @@ add_executable(agc_miss_bench EXCLUDE_FROM_ALL
         tools/MissBench.cpp
         Execution/src/ShaderMemory.cpp
         Graphics/src/RuntimeSwitches.cpp
+        Graphics/src/ParallelCompare.cpp
         Execution/src/GuestMemory.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
@@ -1023,6 +1025,7 @@ configure_windows_unwind(agc_locks_tests)
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
         Execution/src/GuestMemory.cpp
+        Graphics/src/ParallelCompare.cpp
         Graphics/src/RuntimeSwitches.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
@@ -1063,6 +1066,7 @@ if(BUILD_TESTING AND NOT WIN32)
     add_test_executable(agc_collect_memo_generation_tests
             tests/CollectMemoGeneration.cpp
             Execution/src/GuestMemory.cpp
+            Graphics/src/ParallelCompare.cpp
             Graphics/src/RuntimeSwitches.cpp
             Execution/src/PerformanceTraceThread.cpp
     )

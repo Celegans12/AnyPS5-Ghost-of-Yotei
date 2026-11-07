@@ -3,8 +3,10 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <exception>
 #include <mutex>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -22,25 +24,29 @@ public:
         }
     }
 
-    bool Run(std::span<const CompareSpan> spans, std::span<std::uint8_t> equal) {
+    bool Run(std::size_t count, HelperJob job, void* context) {
         std::unique_lock caller(callers, std::try_to_lock);
         if (!caller.owns_lock()) return false;
         {
             std::unique_lock lock(mutex);
             if (stopping) return false;
             finished.wait(lock, [&] { return working == 0; });
-            jobSpans = spans;
-            jobEqual = equal;
+            jobCount = count;
+            jobRun = job;
+            jobContext = context;
+            failure = nullptr;
             next.store(0, std::memory_order_relaxed);
             done.store(0, std::memory_order_relaxed);
             ++generation;
         }
         wake.notify_all();
-        drain(spans, equal);
+        drain(count, job, context);
         std::unique_lock lock(mutex);
-        finished.wait(lock, [&] { return working == 0 && done.load(std::memory_order_acquire) == spans.size(); });
-        jobSpans = {};
-        jobEqual = {};
+        finished.wait(lock, [&] { return working == 0 && done.load(std::memory_order_acquire) == count; });
+        jobCount = 0;
+        jobRun = nullptr;
+        jobContext = nullptr;
+        if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
         return true;
     }
 
@@ -60,14 +66,20 @@ public:
     }
 
 private:
-    void drain(std::span<const CompareSpan> spans, std::span<std::uint8_t> equal) {
-        std::size_t compared = 0;
-        for (auto index = next.fetch_add(1, std::memory_order_relaxed); index < spans.size(); index = next.fetch_add(1, std::memory_order_relaxed)) {
-            const auto& span = spans[index];
-            equal[index] = std::memcmp(span.first, span.second, span.bytes) == 0 ? 1 : 0;
-            ++compared;
+    // Every index taken counts as done, also one whose job threw: Run waits for the count and rethrows
+    // the first failure on the calling thread.
+    void drain(std::size_t count, HelperJob job, void* context) {
+        std::size_t ran = 0;
+        for (auto index = next.fetch_add(1, std::memory_order_relaxed); index < count; index = next.fetch_add(1, std::memory_order_relaxed)) {
+            try {
+                job(context, index);
+            } catch (...) {
+                std::lock_guard lock(mutex);
+                if (failure == nullptr) failure = std::current_exception();
+            }
+            ++ran;
         }
-        if (compared != 0) done.fetch_add(compared, std::memory_order_acq_rel);
+        if (ran != 0) done.fetch_add(ran, std::memory_order_acq_rel);
     }
 
     void work() {
@@ -77,11 +89,12 @@ private:
             wake.wait(lock, [&] { return generation != seen || stopping; });
             if (stopping) break;
             seen = generation;
-            const auto spans = jobSpans;
-            const auto equal = jobEqual;
+            const auto count = jobCount;
+            const auto job = jobRun;
+            const auto context = jobContext;
             ++working;
             lock.unlock();
-            drain(spans, equal);
+            if (job != nullptr) drain(count, job, context);
             lock.lock();
             --working;
             if (working == 0) finished.notify_all();
@@ -95,8 +108,10 @@ private:
     std::condition_variable finished;
     std::uint64_t generation = 0;
     unsigned working = 0;
-    std::span<const CompareSpan> jobSpans;
-    std::span<std::uint8_t> jobEqual;
+    std::size_t jobCount = 0;
+    HelperJob jobRun = nullptr;
+    void* jobContext = nullptr;
+    std::exception_ptr failure;
     std::atomic<std::size_t> next{0};
     std::atomic<std::size_t> done{0};
     std::vector<std::thread> workers;
@@ -135,13 +150,25 @@ unsigned CompareHelpers() {
     return helpers;
 }
 
+bool RunOnCompareHelpers(std::size_t count, HelperJob job, void* context) {
+    if (count < 2) return false;
+    return sharedPool()->Run(count, job, context);
+}
+
 void CompareSpansFrom(std::span<const CompareSpan> spans, std::span<std::uint8_t> equal, std::size_t parallelBytes) {
+    struct Job {
+        std::span<const CompareSpan> spans;
+        std::span<std::uint8_t> equal;
+    } job{spans, equal};
+    const auto compare = [](void* context, std::size_t index) {
+        const auto& state = *static_cast<const Job*>(context);
+        const auto& span = state.spans[index];
+        state.equal[index] = std::memcmp(span.first, span.second, span.bytes) == 0 ? 1 : 0;
+    };
     std::size_t total = 0;
     for (const auto& span : spans) total += span.bytes;
-    if (spans.size() > 1 && total >= parallelBytes) {
-        if (sharedPool()->Run(spans, equal)) return;
-    }
-    for (std::size_t index = 0; index < spans.size(); ++index) equal[index] = std::memcmp(spans[index].first, spans[index].second, spans[index].bytes) == 0 ? 1 : 0;
+    if (spans.size() > 1 && total >= parallelBytes && RunOnCompareHelpers(spans.size(), compare, &job)) return;
+    for (std::size_t index = 0; index < spans.size(); ++index) compare(&job, index);
 }
 
 void StopCompareHelpers() {

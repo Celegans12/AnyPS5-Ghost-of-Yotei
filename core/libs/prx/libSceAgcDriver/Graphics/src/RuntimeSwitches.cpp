@@ -100,6 +100,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_SNAPSHOT_SCRATCH",
     "APS5_NO_DIRECT_SNAPSHOT_STAGING",
     "APS5_NO_FUSED_SNAPSHOT_HASH",
+    "APS5_NO_PARALLEL_BLOCK_HASH",
 };
 
 struct Refusal {
