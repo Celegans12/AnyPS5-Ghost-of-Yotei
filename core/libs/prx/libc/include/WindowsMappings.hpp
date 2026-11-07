@@ -71,20 +71,26 @@ struct Scope {
 
 namespace GuestArena {
 
+extern "C" void GuestArenaNoteLock_nid_postfix(unsigned rank, unsigned event);
+
 class MappingMutex {
 public:
     void lock() {
+        GuestArenaNoteLock_nid_postfix(11, 0);
         inner.lock();
         owner.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        GuestArenaNoteLock_nid_postfix(11, 1);
     }
     bool try_lock() {
         if (!inner.try_lock()) return false;
         owner.store(GetCurrentThreadId(), std::memory_order_relaxed);
+        GuestArenaNoteLock_nid_postfix(11, 3);
         return true;
     }
     void unlock() {
         owner.store(0, std::memory_order_relaxed);
         inner.unlock();
+        GuestArenaNoteLock_nid_postfix(11, 2);
     }
     bool HeldByCurrentThread() const {
         return owner.load(std::memory_order_relaxed) == GetCurrentThreadId();

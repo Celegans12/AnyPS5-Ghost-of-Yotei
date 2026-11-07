@@ -39,6 +39,10 @@ void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaSetAccessObserver_nid_postfix(void (*callback)(std::uintptr_t address, std::size_t bytes));
 #ifdef _WIN32
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);
+enum GuestLockRank : unsigned { GuestLockTracker = 8, GuestLockDirtyArm = 9, GuestLockDirtyBlock = 10, GuestLockWindowsMappings = 11 };
+enum GuestLockEvent : unsigned { GuestLockBefore = 0, GuestLockHeld = 1, GuestLockReleased = 2, GuestLockHeldUnchecked = 3 };
+void GuestArenaSetLockObserver_nid_postfix(void (*observer)(unsigned rank, unsigned event));
+void GuestArenaNoteLock_nid_postfix(unsigned rank, unsigned event);
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address);
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes);
 void GuestArenaUnpinWritable_nid_postfix(const void* pointer, std::size_t bytes);

@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestDirty.hpp"
@@ -9,6 +10,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <iostream>
 #include <mutex>
 #include <stdexcept>
@@ -18,6 +20,7 @@
 namespace {
 
 using namespace AgcDriver::GuestMemory;
+namespace LockOrder = AgcDriver::LockOrder;
 
 constexpr std::size_t Page = 4096;
 constexpr std::size_t Block = 65536;
@@ -141,10 +144,37 @@ void MappingChangeFailsTheSet() {
     Require(Validate(stamp, reads) == Validation::MappingChanged, "a mapping change since the stamp validated");
 }
 
+void WrongOrderIsCaught() {
+    Memory memory;
+    LockOrder::SetCheckForTest(true);
+    struct Off {
+        ~Off() { LockOrder::SetCheckForTest(false); }
+    } off;
+    Require(DirtyArm(memory.At(0), Block) != 0, "the block was not armed");
+    struct Context {
+        std::uint64_t address;
+        bool caught = false;
+    } context{memory.At(0)};
+    GuestArena::GuestDirtyRunLocked_nid_no_patch(static_cast<std::uintptr_t>(memory.At(0)), [](void* argument) {
+        auto& inner = *static_cast<Context*>(argument);
+        try {
+            const std::lock_guard lock(Record());
+        } catch (const LockOrder::OrderError&) {
+            inner.caught = true;
+        }
+    }, &context);
+    Require(context.caught, "taking the record lock while holding a dirty-tracker block lock was not caught");
+    {
+        const std::lock_guard lock(Record());
+        Require(DirtyArm(memory.At(Block), Block) != 0, "arming under the record lock (the agreed order) failed");
+        DirtyMark(memory.At(Block), 8);
+    }
+}
+
 void LockOrderStress() {
     Memory memory;
     declined = 0;
-    std::mutex recordLock;
+    auto& recordLock = Record();
     std::atomic<bool> stop{false};
     std::atomic<std::uint64_t> validations{0}, valid{0}, arms{0}, writes{0};
     SetRegistryCheck(Registry::Shadows, [](std::uint64_t, std::uint64_t, std::uint64_t) { return true; });
@@ -159,9 +189,12 @@ void LockOrderStress() {
                 ReadSet reads;
                 reads.AddToken(memory.At(first * Block), Block, DirtyArm(memory.At(first * Block), Block));
                 reads.AddFact(Registry::Shadows, memory.At(first * Block), Block, 1);
+                ReadSet generations;
+                generations.AddGeneration(memory.At(first * Block), Block, 1);
                 std::lock_guard lock(recordLock);
                 const auto result = Validate(stamp, reads);
                 NoteValidation(result, 3);
+                static_cast<void>(Validate(stamp, generations));
                 ++validations;
                 if (result == Validation::Valid) ++valid;
             }
@@ -202,6 +235,7 @@ void LockOrderStress() {
 }
 
 int main() {
+    LockOrder::SetCheckForTest(std::getenv("APS5_V3E_LOCK_ORDER_CHECK") != nullptr);
     GuestArena::GuestDirtyForceEnable_nid_no_patch(true);
     void* handler = AddVectoredExceptionHandler(1, HandleWrite);
     Require(handler != nullptr, "cannot install the fault handler");
@@ -212,6 +246,7 @@ int main() {
         {"unvouched ranges never validate", UnvouchedRangesNeverValidate},
         {"moved serial rechecks only its facts", MovedSerialRechecksOnlyItsFacts},
         {"mapping change fails the set", MappingChangeFailsTheSet},
+        {"wrong order is caught", WrongOrderIsCaught},
         {"lock-order stress", LockOrderStress},
     };
     int failed = 0;

@@ -1373,18 +1373,24 @@ class TrackerLock {
 public:
     explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock) {
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (LockOrder::CheckEnabled()) LockOrder::BeforeAcquire(LockOrder::Rank::Tracker);
         if (!profile) {
             lock.lock();
+            noteHeld();
             return;
         }
         if (!lock.try_lock()) {
             trackerWaits.fetch_add(1, std::memory_order_relaxed);
             lock.lock();
         }
+        noteHeld();
         trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
     }
     ~TrackerLock() {
-        if (lock.owns_lock()) publish();
+        if (lock.owns_lock()) {
+            publish();
+            noteReleased();
+        }
     }
     TrackerLock(const TrackerLock&) = delete;
     TrackerLock& operator=(const TrackerLock&) = delete;
@@ -1392,17 +1398,27 @@ public:
     void Unlock() {
         publish();
         lock.unlock();
+        noteReleased();
     }
 
     void Suspend() {
         lock.unlock();
+        noteReleased();
     }
 
     void Resume() {
+        if (LockOrder::CheckEnabled()) LockOrder::BeforeAcquire(LockOrder::Rank::Tracker);
         lock.lock();
+        noteHeld();
     }
 
 private:
+    static void noteHeld() {
+        if (LockOrder::CheckEnabled()) LockOrder::NoteHeld(LockOrder::Rank::Tracker);
+    }
+    static void noteReleased() {
+        if (LockOrder::CheckEnabled()) LockOrder::NoteReleased(LockOrder::Rank::Tracker);
+    }
     void publish() {
         const auto current = tracker.generation.load(std::memory_order_relaxed);
         if (tracker.stable.load(std::memory_order_relaxed) != current) tracker.stable.store(current, std::memory_order_release);

@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -19,6 +21,23 @@ constexpr std::size_t ValidationCount = static_cast<std::size_t>(Validation::Cou
 constexpr std::size_t Sites = 4;
 
 std::array<std::atomic<std::uint64_t>, RegistryCount> serials{};
+
+void observeGuestLock(unsigned rank, unsigned event) {
+    if (!LockOrder::CheckEnabled()) return;
+    const auto ranked = static_cast<LockOrder::Rank>(rank);
+    switch (event) {
+        case GuestArena::GuestLockBefore: LockOrder::BeforeAcquire(ranked); break;
+        case GuestArena::GuestLockHeld:
+        case GuestArena::GuestLockHeldUnchecked: LockOrder::NoteHeld(ranked); break;
+        case GuestArena::GuestLockReleased: LockOrder::NoteReleased(ranked); break;
+        default: break;
+    }
+}
+
+const bool guestLocksObserved = [] {
+    GuestArena::GuestArenaSetLockObserver_nid_postfix(&observeGuestLock);
+    return true;
+}();
 std::array<std::atomic<RegistryCheck>, RegistryCount> checks{};
 
 struct Census {
