@@ -548,14 +548,6 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
         lookupDispatch(address, submission, key, noDispatchCache, traceCache, profile, memory, phaseTiming, phaseMs, compiledResult, keepVariant, captured, liveWords, dataHit, cached, validated, missedEntry, missedDiffering);
     }
     timing.Mark("lookup_cache");
-    if (bArmed) {
-        const bool known = !captured.empty();
-        const bool overlaps = std::any_of(captured.begin(), captured.end(), [&](const auto& region) {
-            const auto begin = region.guestAddress, end = region.guestAddress + region.bytes.size();
-            return std::any_of(bWatch.writes.begin(), bWatch.writes.end(), [&](const DrawPipeline::Range& write) { return begin < write.second && write.first < end; });
-        });
-        noteBCensus(known, overlaps, bDrainUs);
-    }
     std::vector<DrawPipeline::Range> itemWrites;
     bool pipelined = false;
     bool missItem = false;
@@ -594,6 +586,16 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             }();
             captured = shaderMemory->Regions();
             request.context.memory = captured;
+            // Lever (b) census: the miss's reads are known only once its capture ran (after the drain).
+            if (bArmed) {
+                bArmed = false;
+                const bool known = !captured.empty();
+                const bool overlaps = std::any_of(captured.begin(), captured.end(), [&](const auto& region) {
+                    const auto begin = region.guestAddress, end = region.guestAddress + region.bytes.size();
+                    return std::any_of(bWatch.writes.begin(), bWatch.writes.end(), [&](const DrawPipeline::Range& write) { return begin < write.second && write.first < end; });
+                });
+                noteBCensus(known, overlaps, bDrainUs);
+            }
             if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
             captureMs += phaseTiming.Elapsed();
             phaseTiming.Phase(PhaseCapture);
