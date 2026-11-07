@@ -47,7 +47,7 @@ std::atomic<std::uint64_t> mappingEpoch{1};
 std::atomic<int> forced{-1};
 
 struct Counters {
-    std::atomic<std::uint64_t> arms{0}, armedPages{0}, protectCalls{0}, armNs{0}, refused{0}, faults{0}, faultNs{0}, marks{0}, markedBlocks{0}, bumps{0}, viewLosses{0}, viewArms{0}, cleanQueries{0}, cleanAnswers{0}, importArmedPages{0}, importMarks{0}, renewRefused{0}, lateFaults{0}, declined{0};
+    std::atomic<std::uint64_t> arms{0}, armedPages{0}, protectCalls{0}, armNs{0}, refused{0}, faults{0}, faultNs{0}, marks{0}, markedBlocks{0}, bumps{0}, viewLosses{0}, viewArms{0}, cleanQueries{0}, cleanAnswers{0}, importArmedPages{0}, importMarks{0}, renewRefused{0}, lateFaults{0}, declined{0}, retriedFaults{0};
     std::atomic<std::uint64_t> refusedBy[4][8]{};
     std::atomic<std::uint64_t> armsBy[4]{};
 };
@@ -425,29 +425,58 @@ bool GuestDirtyHandleWrite_nid_postfix(std::uintptr_t address) {
     auto* block = findBlock(blockBase);
     if (block == nullptr) return false;
     const auto bit = 1u << ((address - blockBase) / PageBytes);
-    if ((block->armed.load(std::memory_order_seq_cst) & bit) == 0 && tracked(*block) == 0 && block->lock.load(std::memory_order_acquire) == 0 && block->opened.load(std::memory_order_relaxed) == 0) return false;
-    const auto start = nowNs();
-    const bool own = block->lock.load(std::memory_order_acquire) == threadToken();
-    if (!own) lockBlock(*block);
-    bool served = true;
-    if ((block->armed.load(std::memory_order_seq_cst) & bit) != 0) {
-        disarmLocked(blockBase, *block);
-        counters.faults.fetch_add(1, std::memory_order_relaxed);
-    } else {
+    const auto armed = [&] { return (block->armed.load(std::memory_order_seq_cst) & bit) != 0; };
+    DWORD type = 0;
+    const auto writable = [&](DWORD* protection) {
         MEMORY_BASIC_INFORMATION memory{};
         const bool queried = VirtualQuery(reinterpret_cast<const void*>(address), &memory, sizeof(memory)) == sizeof(memory);
-        served = queried && memory.State == MEM_COMMIT && (memory.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0 && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
-        if (served) {
-            counters.lateFaults.fetch_add(1, std::memory_order_relaxed);
-        } else if (tracked(*block) != 0 || block->opened.load(std::memory_order_relaxed) != 0) {
-            counters.declined.fetch_add(1, std::memory_order_relaxed);
-            lastDeclined.store(address, std::memory_order_relaxed);
-            lastDeclinedState.store((static_cast<std::uint64_t>(block->armed.load()) << 32) | (static_cast<std::uint64_t>(memory.Protect & 0xffff) << 16) | (block->viewed.load() & 0xffff), std::memory_order_relaxed);
+        *protection = queried ? memory.Protect : 0;
+        type = queried ? memory.Type : 0;
+        return queried && memory.State == MEM_COMMIT && (memory.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) != 0 && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
+    };
+    const auto start = nowNs();
+    DWORD protection = 0;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        if (armed()) {
+            const bool own = block->lock.load(std::memory_order_acquire) == threadToken();
+            if (!own) lockBlock(*block);
+            const bool still = armed();
+            if (still) disarmLocked(blockBase, *block);
+            if (!own) unlockBlock(*block);
+            if (!still) continue;
+            counters.faults.fetch_add(1, std::memory_order_relaxed);
+            counters.faultNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
+            return true;
+        }
+        if (writable(&protection)) {
+            if (block->opened.load(std::memory_order_relaxed) != 0) counters.lateFaults.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        if (!armed()) {
+            if (writable(&protection)) {
+                counters.lateFaults.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
+            if (!armed()) break;
         }
     }
-    if (!own) unlockBlock(*block);
-    counters.faultNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
-    return served;
+    thread_local std::uintptr_t retriedAddress = 0;
+    thread_local unsigned retries = 0;
+    if (tracked(*block) != 0 || block->opened.load(std::memory_order_relaxed) != 0) {
+        if (retriedAddress != address) {
+            retriedAddress = address;
+            retries = 0;
+        }
+        if (type == MEM_PRIVATE && ++retries <= 64) {
+            counters.retriedFaults.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+        retries = 0;
+        counters.declined.fetch_add(1, std::memory_order_relaxed);
+        lastDeclined.store(address, std::memory_order_relaxed);
+        lastDeclinedState.store((static_cast<std::uint64_t>(block->armed.load()) << 32) | (static_cast<std::uint64_t>(protection & 0xffff) << 16) | (block->viewed.load() & 0xffff), std::memory_order_relaxed);
+    }
+    return false;
 #else
     static_cast<void>(address);
     return false;
@@ -580,6 +609,7 @@ void GuestDirtyTakeCounts_nid_postfix(GuestDirtyCounts* out) {
     out->renewRefused = take(counters.renewRefused);
     out->lateFaults = take(counters.lateFaults);
     out->declined = take(counters.declined);
+    out->retriedFaults = take(counters.retriedFaults);
     out->lastDeclined = lastDeclined.load(std::memory_order_relaxed);
     out->lastDeclinedState = lastDeclinedState.load(std::memory_order_relaxed);
     for (std::size_t k = 0; k < 4; ++k) {
