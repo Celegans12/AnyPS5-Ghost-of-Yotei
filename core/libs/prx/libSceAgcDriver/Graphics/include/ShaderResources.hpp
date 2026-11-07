@@ -1,7 +1,9 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -114,6 +116,7 @@ std::shared_ptr<Texture> CachedTableTexture(const Context& context, std::span<co
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
 bool AnyPendingCpuWrites(const Context& context);
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
+bool PendingCpuWritesOverlap(const Context& context, std::uint64_t address, std::size_t bytes);
 bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words);
 bool ShaderStoresThroughAddresses(const ShaderRecompiler::SharedSpirv& spirv);
 void LastRecordIndices(std::span<const void* const> logged, std::span<const void* const> objects, std::vector<std::size_t>& indices);
@@ -627,6 +630,14 @@ private:
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
     bool proveBuild(std::span<const CompiledShader> shaders, ProofReport* report);
+    // v3 lever A for draw sets (APS5_V3E_DRAW_PROOF_MEMO, runtime switch): proveBuild's answer reused while the
+    // per-cause proof serial and the pending serial are unchanged and the tracker calls every range the proof reads clean
+    // since the tokens armed before the last full proof; APS5_V3E_DRAW_PROOF_MEMO_VERIFY re-proves and throws.
+    bool proveDrawMemo(std::span<const CompiledShader> shaders, ProofReport* report);
+    std::vector<ImageFlags::DirtyQuery> memoTokens;
+    std::uint64_t memoCaused = 0;
+    std::uint64_t memoPending = 0;
+    bool memoValid = false;
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
     // looked it up, so the next Revalidate can repeat the proof from write stamps and the DCC keys
@@ -783,6 +794,7 @@ private:
     std::uint64_t pendingSerialSeen = 0;
     std::uint64_t provedEpoch = 0;
     std::uint64_t provedProof = 0;
+    std::uint64_t provedCaused = 0;
     std::uint64_t provedPending = 0;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
     // The import table's identity when the direct regions' serials were last proved.
@@ -914,7 +926,7 @@ private:
             return static_cast<std::size_t>(hash);
         }
     };
-    mutable AgcDriver::Mutex mutex;
+    mutable AgcDriver::LockOrder::SplitMutex<AgcDriver::Mutex, AgcDriver::LockOrder::Rank::ResourceSet> mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
     // The entries by each sampled texture they bind (once per entry): RemoveTextures without a scan.

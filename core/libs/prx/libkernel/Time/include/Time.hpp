@@ -25,6 +25,10 @@ extern "C" {
     // variables, event queues) per guest call site and prints the sites that wait longest every 3 s,
     // with their timeout rate; a site that times out once per frame is a lost wake-up.
     void KernelTraceWait_nid_postfix(const char* kind, const void* caller, std::uint64_t waitedNanos, bool timedOut);
+    // With APS5_TRACE_WAITS: this thread's last traced wait (kind, guest call site, how long, when it ended in steady
+    // nanoseconds); false when none was traced. Diagnostic for the submit trace (APS5_TRACE_EOP).
+    bool KernelLastWait_nid_postfix(const char** kind, const void** caller, std::uint64_t* waitedNanos, std::uint64_t* endedNanos);
+    unsigned long KernelTraceThreadId_nid_postfix();
 
 }
 

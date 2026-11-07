@@ -14,11 +14,150 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <algorithm>
+#include <array>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
+#include <mutex>
+#include <string>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 
 namespace AgcDriver::DriverDetail {
+
+// Diagnostic (APS5_TRACE_EOP=1, v3 exec 11-07): end-of-pipe interrupts deferred behind recorded work, by queue: the lag
+// from the guest packet to the delivery (the batch's completion running under a reap), and how many were delivered
+// at once; [eop] every 10 s.
+namespace {
+bool traceEop() {
+    static const bool enabled = std::getenv("APS5_TRACE_EOP") != nullptr;
+    return enabled;
+}
+struct EopQueue { std::uint64_t deferred = 0, immediate = 0, lagUs = 0, maxLagUs = 0, piped = 0, submitUs = 0, maxSubmitUs = 0, startUs = 0, maxStartUs = 0, commitUs = 0, maxCommitUs = 0; std::array<std::uint64_t, 4> ahead{}; };
+std::array<std::atomic<std::int64_t>, 256> pipeEnqueued{}, pipeStarted{};
+std::int64_t pipeNs(std::chrono::steady_clock::time_point at) { return std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count(); }
+std::mutex eopMutex;
+std::array<EopQueue, 256> eopQueues;
+std::chrono::steady_clock::time_point eopReport = std::chrono::steady_clock::now();
+void reportEopLocked(std::chrono::steady_clock::time_point now) {
+    if (now - eopReport < std::chrono::seconds(10)) return;
+    eopReport = now;
+    std::string line = "[eop] 10 s, by queue (deferred: count, packet-to-delivery avg / max ms; immediate count):";
+    for (std::size_t q = 0; q < eopQueues.size(); ++q) {
+        auto& e = eopQueues[q];
+        if (e.deferred == 0 && e.immediate == 0 && e.piped == 0) continue;
+        char text[128];
+        std::snprintf(text, sizeof(text), " 0x%zx %llu %.1f / %.1f, %llu;", q, static_cast<unsigned long long>(e.deferred), e.deferred ? e.lagUs / 1000.0 / static_cast<double>(e.deferred) : 0.0, e.maxLagUs / 1000.0, static_cast<unsigned long long>(e.immediate));
+        line += text;
+        if (e.piped != 0) {
+            char pipe[384];
+            const auto n = static_cast<double>(e.piped);
+            std::snprintf(pipe, sizeof(pipe), " [EOP packets %llu: guest submit to worker start avg %.1f / max %.1f ms, worker start to packet avg %.1f / max %.1f ms, packet to commit avg %.1f / max %.1f ms; queue-0 flips ahead at the packet 0/1/2/3+: %llu/%llu/%llu/%llu];", static_cast<unsigned long long>(e.piped), e.submitUs / 1000.0 / n, e.maxSubmitUs / 1000.0, e.startUs / 1000.0 / n, e.maxStartUs / 1000.0, e.commitUs / 1000.0 / n, e.maxCommitUs / 1000.0, static_cast<unsigned long long>(e.ahead[0]), static_cast<unsigned long long>(e.ahead[1]), static_cast<unsigned long long>(e.ahead[2]), static_cast<unsigned long long>(e.ahead[3]));
+            line += pipe;
+        }
+        e = {};
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+}
+
+// Frame marks for [frame-chain] (Acb.cpp): when the queue-0 worker last reached a flip packet and a queue-0 EOP packet.
+std::atomic<std::int64_t> frameFlipNs{0}, frameEop0Ns{0};
+std::atomic<std::uint64_t> frameFlips{0};
+
+bool TraceWaitDrains() {
+    return traceEop();
+}
+
+void TraceWaitDrain(std::uint32_t writer, std::chrono::steady_clock::duration drained) {
+    static std::mutex mutex;
+    static std::array<std::pair<std::uint64_t, std::uint64_t>, 256> byWriter{};
+    static auto reported = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    auto& entry = byWriter[writer & 0xffu];
+    ++entry.first;
+    entry.second += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(drained).count());
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds(10)) return;
+    reported = now;
+    std::string line = "[wait-drains] 10 s, queue-0 WAIT_REG_MEM drains by the awaited label's last writer queue (0xfe: none seen; count, drain ms):";
+    for (std::size_t q = 0; q < byWriter.size(); ++q) {
+        if (byWriter[q].first == 0) continue;
+        char text[64];
+        std::snprintf(text, sizeof(text), " 0x%zx %llu %.1f;", q, static_cast<unsigned long long>(byWriter[q].first), byWriter[q].second / 1000.0);
+        line += text;
+        byWriter[q] = {};
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
+void TraceFlipReached() {
+    if (!traceEop()) return;
+    frameFlipNs.store(pipeNs(std::chrono::steady_clock::now()), std::memory_order_relaxed);
+    frameFlips.fetch_add(1, std::memory_order_relaxed);
+}
+
+void TraceFrameMarks(std::int64_t* flipNs, std::int64_t* eop0Ns, std::uint64_t* flips) {
+    *flipNs = frameFlipNs.load(std::memory_order_relaxed);
+    *eop0Ns = frameEop0Ns.load(std::memory_order_relaxed);
+    *flips = frameFlips.load(std::memory_order_relaxed);
+}
+
+void TracePipeStart(std::uint32_t queue, std::chrono::steady_clock::time_point enqueued) {
+    if (!traceEop()) return;
+    pipeEnqueued[queue % pipeEnqueued.size()].store(pipeNs(enqueued), std::memory_order_relaxed);
+    pipeStarted[queue % pipeStarted.size()].store(pipeNs(std::chrono::steady_clock::now()), std::memory_order_relaxed);
+}
+
+std::int64_t TracePipeStarted(std::uint32_t queue) {
+    return traceEop() ? pipeStarted[queue % pipeStarted.size()].load(std::memory_order_relaxed) : 0;
+}
+
+std::int64_t TracePipeSubmitted(std::uint32_t queue) {
+    return traceEop() ? pipeEnqueued[queue % pipeEnqueued.size()].load(std::memory_order_relaxed) : 0;
+}
+
+void TracePipeEop(std::uint32_t queue, std::int64_t submittedNs, std::int64_t startedNs, std::int64_t seenNs, std::uint32_t flipsAhead) {
+    if (!traceEop() || seenNs == 0) return;
+    if (queue == 0) frameEop0Ns.store(seenNs, std::memory_order_relaxed);
+    const auto now = std::chrono::steady_clock::now();
+    const auto nowNs = pipeNs(now);
+    std::lock_guard lock(eopMutex);
+    auto& e = eopQueues[queue % eopQueues.size()];
+    ++e.piped;
+    if (submittedNs != 0 && startedNs >= submittedNs) {
+        const auto us = static_cast<std::uint64_t>((startedNs - submittedNs) / 1000);
+        e.submitUs += us;
+        e.maxSubmitUs = std::max(e.maxSubmitUs, us);
+    }
+    if (startedNs != 0 && seenNs >= startedNs) {
+        const auto us = static_cast<std::uint64_t>((seenNs - startedNs) / 1000);
+        e.startUs += us;
+        e.maxStartUs = std::max(e.maxStartUs, us);
+    }
+    const auto commitUs = static_cast<std::uint64_t>(std::max<std::int64_t>(0, nowNs - seenNs) / 1000);
+    e.commitUs += commitUs;
+    e.maxCommitUs = std::max(e.maxCommitUs, commitUs);
+    ++e.ahead[std::min<std::uint32_t>(flipsAhead, 3)];
+    reportEopLocked(now);
+}
+
+void TraceEopDelivered(std::uint32_t queue, std::chrono::steady_clock::time_point registered, bool deferred) {
+    if (!traceEop()) return;
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(eopMutex);
+    auto& e = eopQueues[queue % eopQueues.size()];
+    if (deferred) {
+        const auto lag = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(now - registered).count());
+        ++e.deferred;
+        e.lagUs += lag;
+        e.maxLagUs = std::max(e.maxLagUs, lag);
+    } else {
+        ++e.immediate;
+    }
+    reportEopLocked(now);
+}
 
 bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue, std::span<const std::uint32_t> packet, std::uint32_t header, std::uint32_t opcode, bool& wroteOnGpu, bool& endOfPipeInterrupt, bool& interruptDeferred, bool& drawPacket, bool& sampleDump) {
     static const bool drainAll = std::getenv("APS5_DRAIN_ALL") != nullptr;
@@ -30,6 +169,11 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
     const auto interruptSelect = opcode == 0x49 ? (packet[2] >> 24u) & 7u : 0u;
     endOfPipeInterrupt = interruptSelect != 0 && interruptSelect != 3;
     interruptDeferred = false;
+    if (endOfPipeInterrupt && traceEop()) {
+        // The worker reached the EOP packet itself (async queues; queue 0 outside the draw pipeline): no commit lag.
+        const auto seen = pipeNs(std::chrono::steady_clock::now());
+        TracePipeEop(submission.queue, submission.enqueuedAt != std::chrono::steady_clock::time_point{} ? pipeNs(submission.enqueuedAt) : 0, TracePipeStarted(submission.queue), seen, flipsAhead.load(std::memory_order_relaxed));
+    }
     if (!drainAll && endOfPipeInterrupt) {
         const auto label = Pm4::DecodeLabelWrite(packet);
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
@@ -60,7 +204,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
             }
             if (reason == 0 || reason == 5) {
                 const auto queueId = submission.queue;
-                interruptDeferred = localDevice->AfterRecordedWork([this, queueId] { deliverGuestEopInterrupt(queueId); }, submission.queue == 0);
+                interruptDeferred = localDevice->AfterRecordedWork([this, queueId, at = std::chrono::steady_clock::now()] { TraceEopDelivered(queueId, at, true); deliverGuestEopInterrupt(queueId); }, submission.queue == 0);
                 if (interruptDeferred && workOpen) localDevice->SubmitRecorded(submission.queue == 0);
                 wroteOnGpu = true;
             } else if (reason == 1) {
@@ -498,8 +642,13 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
     if (endOfPipeInterrupt) bumpEpoch(&EpochBumps::drains);
     auto stored = bytes;
     auto labelBytes = bytes;
-    auto enqueue =[this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt, writes, stored = std::move(stored)]() mutable {
-        DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt] {
+    const auto pipeSubmitted = endOfPipeInterrupt ? TracePipeSubmitted(queue) : 0;
+    const auto pipeStartedAt = endOfPipeInterrupt ? TracePipeStarted(queue) : 0;
+    const auto pipeSeen = endOfPipeInterrupt && pipeSubmitted != 0 ? pipeNs(std::chrono::steady_clock::now()) : 0;
+    const auto pipeAhead = flipsAhead.load(std::memory_order_relaxed);
+    auto enqueue =[this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt, writes, stored = std::move(stored), pipeSubmitted, pipeStartedAt, pipeSeen, pipeAhead]() mutable {
+        DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt, pipeSubmitted, pipeStartedAt, pipeSeen, pipeAhead] {
+            if (pipeSeen != 0) TracePipeEop(queue, pipeSubmitted, pipeStartedAt, pipeSeen, pipeAhead);
             GuestMemory::SetCurrentPacket(opcode, queue);
             commitLabel(queue, address, bytes, endOfPipeInterrupt);
         }, std::move(writes), address, std::move(stored));
@@ -543,10 +692,13 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         bool deferred = false;
         if (bytes.empty() && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("interrupt") != 0) workOpen = true;
         if (localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
-            deferred = localDevice->AfterRecordedWork([this, queue] { deliverGuestEopInterrupt(queue); }, queue == 0);
+            deferred = localDevice->AfterRecordedWork([this, queue, at = std::chrono::steady_clock::now()] { TraceEopDelivered(queue, at, true); deliverGuestEopInterrupt(queue); }, queue == 0);
             if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0);
         }
-        if (!deferred) deliverGuestEopInterrupt(queue);
+        if (!deferred) {
+            TraceEopDelivered(queue, {}, false);
+            deliverGuestEopInterrupt(queue);
+        }
     }
     submitDueAfterCommit(localDevice.get());
 }

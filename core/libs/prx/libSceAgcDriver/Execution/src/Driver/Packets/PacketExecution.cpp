@@ -30,6 +30,12 @@
 
 namespace AgcDriver::DriverDetail {
 
+// PacketMemory.cpp (APS5_TRACE_EOP): queues 0x80+ are flip interrupts (0x80 + queue).
+void TraceEopDelivered(std::uint32_t queue, std::chrono::steady_clock::time_point registered, bool deferred);
+void TraceFlipReached();
+bool TraceWaitDrains();
+void TraceWaitDrain(std::uint32_t writer, std::chrono::steady_clock::duration drained);
+
 namespace {
 
 // APS5_DISPATCH_GAPS=1 (diagnostic): per queue, which packets lie between two consecutive dispatches
@@ -479,7 +485,20 @@ void Driver::execute(const Submission& submission) {
                 DrawPipeline::Queue0().Note(DrawPipeline::Event::SatisfiedWaitKept);
             }
         }
-        if (pipelined && !keptForWait && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+        if (pipelined && !keptForWait && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) {
+            // Diagnostic (APS5_TRACE_EOP): queue-0 drains at WAIT_REG_MEM by the queue that last stored a label at the
+            // awaited address (0xfe: no label store seen there), with the drain time and the wait after it; [wait-drains].
+            const bool traceWait = (opcode == 0x3c || opcode == 0x93) && packet.size() >= 6 && TraceWaitDrains();
+            std::uint32_t writer = 0xfe;
+            if (traceWait) {
+                const std::uint64_t awaited = (packet[2] & ~3u) | (static_cast<std::uint64_t>(packet[3]) << 32u);
+                std::lock_guard lock(labelStoresMutex);
+                if (const auto found = labelStores.find(awaited); found != labelStores.end() && found->second[0].stamp != 0) writer = found->second[0].queue;
+            }
+            const auto drainStart = std::chrono::steady_clock::now();
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
+            if (traceWait) TraceWaitDrain(writer, std::chrono::steady_clock::now() - drainStart);
+        }
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         timing.Mark("pipeline_drain");
         std::shared_lock deviceUse(deviceReplacement, std::defer_lock);
@@ -582,10 +601,14 @@ void Driver::execute(const Submission& submission) {
                 if (localDevice != nullptr) {
                     localDevice->FlipBatches(batchesAtFlip, unsignaledAtFlip);
                     const auto queueId = submission.queue;
-                    flipInterruptDeferred = localDevice->AfterRecordedWork([this, queueId] { deliverFlipEopInterrupt(queueId); }, false);
+                    flipInterruptDeferred = localDevice->AfterRecordedWork([this, queueId, at = std::chrono::steady_clock::now()] { TraceEopDelivered(queueId + 0x80, at, true); deliverFlipEopInterrupt(queueId); }, false);
                 }
             }
-            if (!flipInterruptDeferred) deliverFlipEopInterrupt(submission.queue);
+            if (submission.queue == 0) TraceFlipReached();
+            if (!flipInterruptDeferred) {
+                TraceEopDelivered(submission.queue + 0x80, {}, false);
+                deliverFlipEopInterrupt(submission.queue);
+            }
             ++flipsCounted;
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;

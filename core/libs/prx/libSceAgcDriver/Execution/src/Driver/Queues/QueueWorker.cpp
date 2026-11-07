@@ -15,6 +15,9 @@
 
 namespace AgcDriver::DriverDetail {
 
+// PacketMemory.cpp (APS5_TRACE_EOP): the guest-submit time of the submission a queue's worker starts.
+void TracePipeStart(std::uint32_t queue, std::chrono::steady_clock::time_point enqueued);
+
 namespace {
 
 constexpr auto IdleResultsQuietPeriod = std::chrono::milliseconds(50);
@@ -259,6 +262,7 @@ void Driver::run(std::uint32_t id) noexcept {
                     rethrowFailure();
                 }
                 if (APS5_ENABLE_TIMING_LOG) submission.orderedAt = std::chrono::steady_clock::now();
+                TracePipeStart(submission.queue, submission.enqueuedAt);
                 timing.Mark("dequeue_order");
                 worker.queued.fetch_sub(1, std::memory_order_acq_rel);
                 running.Start();

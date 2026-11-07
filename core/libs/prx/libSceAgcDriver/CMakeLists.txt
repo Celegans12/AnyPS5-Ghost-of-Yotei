@@ -366,10 +366,15 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/LockOrder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PrepareStamp.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/MemoryStats.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ProfileWindows.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/VkCallProfile.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/RecordWorker.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/C3Log.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ImageFlags.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/CommandMix.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -924,6 +929,7 @@ add_test_executable(agc_shader_memory_tests EXCLUDE_FROM_ALL
         Execution/src/ShaderMemory.cpp
         Graphics/src/RuntimeSwitches.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/LockOrder.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
 target_include_directories(agc_shader_memory_tests PRIVATE ${LIBS_INCLUDE_DIR})
@@ -936,6 +942,7 @@ add_executable(agc_miss_bench EXCLUDE_FROM_ALL
         Execution/src/ShaderMemory.cpp
         Graphics/src/RuntimeSwitches.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/LockOrder.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
 target_include_directories(agc_miss_bench PRIVATE ${LIBS_INCLUDE_DIR})
@@ -1027,6 +1034,7 @@ add_test_executable(agc_prepare_stamp_tests EXCLUDE_FROM_ALL
         tests/PrepareStamp.cpp
         Execution/src/PrepareStamp.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/LockOrder.cpp
         Graphics/src/RuntimeSwitches.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
@@ -1046,6 +1054,7 @@ endif()
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
         Execution/src/GuestMemory.cpp
+        Execution/src/LockOrder.cpp
         Graphics/src/RuntimeSwitches.cpp
         Execution/src/PerformanceTraceThread.cpp
 )
@@ -1086,6 +1095,7 @@ if(BUILD_TESTING AND NOT WIN32)
     add_test_executable(agc_collect_memo_generation_tests
             tests/CollectMemoGeneration.cpp
             Execution/src/GuestMemory.cpp
+            Execution/src/LockOrder.cpp
             Graphics/src/RuntimeSwitches.cpp
             Execution/src/PerformanceTraceThread.cpp
     )
@@ -1582,6 +1592,49 @@ if(BUILD_TESTING)
     add_test(NAME agc_pipeline_request_precheck COMMAND agc_pipeline_request_precheck_tests)
     if(WIN32)
         set_tests_properties(agc_pipeline_request_precheck PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_image_flags_tests EXCLUDE_FROM_ALL tests/ImageFlags.cpp)
+target_include_directories(agc_image_flags_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_image_flags_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_image_flags_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_image_flags_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_image_flags_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_image_flags COMMAND agc_image_flags_tests)
+    if(WIN32)
+        set_tests_properties(agc_image_flags PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_record_worker_tests EXCLUDE_FROM_ALL tests/RecordWorker.cpp)
+target_include_directories(agc_record_worker_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_record_worker_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_record_worker_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_record_worker_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_record_worker_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_record_worker COMMAND agc_record_worker_tests)
+    if(WIN32)
+        set_tests_properties(agc_record_worker PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_lock_order_tests EXCLUDE_FROM_ALL tests/LockOrder.cpp)
+target_include_directories(agc_lock_order_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_link_libraries(agc_lock_order_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_lock_order_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_lock_order_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_lock_order_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_lock_order COMMAND agc_lock_order_tests)
+    set_tests_properties(agc_lock_order PROPERTIES TIMEOUT 180)
+    if(WIN32)
+        set_tests_properties(agc_lock_order PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

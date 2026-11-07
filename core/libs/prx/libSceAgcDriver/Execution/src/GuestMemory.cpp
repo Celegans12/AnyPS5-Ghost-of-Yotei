@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
@@ -1372,18 +1373,24 @@ class TrackerLock {
 public:
     explicit TrackerLock(WriteTracker& tracker) : tracker(tracker), lock(tracker.mutex, std::defer_lock) {
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (LockOrder::CheckEnabled()) LockOrder::BeforeAcquire(LockOrder::Rank::Tracker);
         if (!profile) {
             lock.lock();
+            noteHeld();
             return;
         }
         if (!lock.try_lock()) {
             trackerWaits.fetch_add(1, std::memory_order_relaxed);
             lock.lock();
         }
+        noteHeld();
         trackerAcquisitions.fetch_add(1, std::memory_order_relaxed);
     }
     ~TrackerLock() {
-        if (lock.owns_lock()) publish();
+        if (lock.owns_lock()) {
+            publish();
+            noteReleased();
+        }
     }
     TrackerLock(const TrackerLock&) = delete;
     TrackerLock& operator=(const TrackerLock&) = delete;
@@ -1391,17 +1398,27 @@ public:
     void Unlock() {
         publish();
         lock.unlock();
+        noteReleased();
     }
 
     void Suspend() {
         lock.unlock();
+        noteReleased();
     }
 
     void Resume() {
+        if (LockOrder::CheckEnabled()) LockOrder::BeforeAcquire(LockOrder::Rank::Tracker);
         lock.lock();
+        noteHeld();
     }
 
 private:
+    static void noteHeld() {
+        if (LockOrder::CheckEnabled()) LockOrder::NoteHeld(LockOrder::Rank::Tracker);
+    }
+    static void noteReleased() {
+        if (LockOrder::CheckEnabled()) LockOrder::NoteReleased(LockOrder::Rank::Tracker);
+    }
     void publish() {
         const auto current = tracker.generation.load(std::memory_order_relaxed);
         if (tracker.stable.load(std::memory_order_relaxed) != current) tracker.stable.store(current, std::memory_order_release);
@@ -1590,6 +1607,10 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
+    if (P0cNoProofs()) {
+        // Ceiling ablation (inexact): no write-watch walk once the tracker has a generation.
+        if (const auto generation = tracker.stable.load(std::memory_order_acquire); generation != 0) return generation;
+    }
     // Whole pages, so a page shared with the next range is collected with either.
     constexpr std::uint64_t page = 4096;
     auto first = address & ~(page - 1);
@@ -1789,8 +1810,15 @@ std::uint64_t ProofSerial() {
     return proofSerial.load(std::memory_order_acquire);
 }
 
+std::atomic<std::uint64_t> proofSerialCaused{1};
+
+std::uint64_t ProofSerialCaused() {
+    return proofSerialCaused.load(std::memory_order_acquire);
+}
+
 void BreakProofs() {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    proofSerialCaused.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void MarkProofThread() {
@@ -1977,6 +2005,16 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     }
     if (unwatchedFrom < stop) unwatchLocked(tracker, unwatchedFrom, static_cast<std::size_t>(stop - unwatchedFrom));
     return true;
+}
+
+bool P0cNoProofs() {
+    static const bool on = std::getenv("APS5_P0C_NO_PROOFS") != nullptr;
+    return on;
+}
+
+bool P0cNoHazards() {
+    static const bool on = std::getenv("APS5_P0C_NO_HAZARDS") != nullptr;
+    return on;
 }
 
 bool WriteWatched() {
@@ -2695,7 +2733,8 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        // A foreign hold breaks proofs (ProofSerial) but is not a cause of its own for the lever-A census.
+        if (!proofThread) proofSerial.fetch_add(1, std::memory_order_acq_rel);
     }
 }
 
@@ -2734,6 +2773,7 @@ std::uint64_t GpuHoldSerial() {
 void GpuMutexType::unlock() {
     const bool outermost = --depth == 0;
     if (outermost) {
+        LockOrder::RecordReleased();
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
@@ -2763,6 +2803,7 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    if (LockOrder::CheckEnabled() && !HeldByThisThread()) LockOrder::BeforeAcquire(LockOrder::Rank::Record);
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {

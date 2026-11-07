@@ -170,6 +170,15 @@ bool DirtyVerifyEnabled();
 void DirtyVerifyUse(std::uint64_t address, std::size_t bytes);
 void ReportDirty(const char* window);
 bool WriteWatched();
+// P0-cpu (C0) ceiling ablations, diagnostic only, default off, read once, never in measured game runs
+// (inexact by design; replay only). APS5_P0C_NO_PROOFS=1: CollectWrites returns the current
+// generation without walking the write watch, and a cached resource set's Revalidate full proof
+// (revalidateFull) accepts it without its checks: the cost of the pull proofs, as a ceiling for a
+// flag-based design. APS5_P0C_NO_HAZARDS=1: draws hand the recorder empty pass access lists (a
+// pass continues whenever its key matches) and dispatches record no leading or trailing barrier:
+// the CPU cost of per-command hazard tracking, as a ceiling for guest-sync barriers.
+bool P0cNoProofs();
+bool P0cNoHazards();
 void Unwatch(std::uint64_t address, std::size_t bytes);
 void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true, bool importMayWriteGuest = true);
@@ -244,6 +253,9 @@ void EndCollectEpoch();
 void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 void BreakProofs();
+// v3 exec lever A census (log-only): ProofSerial without the bumps a foreign GPU-mutex acquire makes by itself (every
+// other BreakProofs cause still bumps it).
+std::uint64_t ProofSerialCaused();
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
@@ -302,6 +314,9 @@ private:
     std::uint32_t depth = 0;
 };
 GpuMutexType& GpuMutex();
+// The lock split's record lock (LockOrder.hpp) is today's GPU mutex under its new name.
+using RecordLock = GpuMutexType;
+inline RecordLock& Record() { return GpuMutex(); }
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.

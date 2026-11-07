@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
@@ -16,6 +17,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VkCallProfile.hpp"
+#include "prx/libSceAgcDriver/Execution/include/RecordWorker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FloatFlushProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -191,7 +194,7 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     subgroup.requiredSubgroupSize = subgroupSize;
     if (subgroupSize != 0) info.stage.pNext = &subgroup;
     info.layout = layout;
-    const auto admitted = Graphics::PipelineCreationGate::Shared().Admit(words, !GuestMemory::GpuMutex().HeldByThisThread());
+    const auto admitted = Graphics::PipelineCreationGate::Shared().Admit(words, !AgcDriver::LockOrder::MustNotWait());
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
     check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
     PerformanceCounters::CountPipeline();
@@ -554,7 +557,7 @@ struct VulkanDevice::State {
     // dispatch's find-or-insert and the verify switch's lookups touch the map, recipes hold weak
     // references to its objects.
     std::atomic<bool> verifyComputeLayouts{false};
-    AgcDriver::Mutex computePipelinesMutex;
+    AgcDriver::LockOrder::SplitMutex<AgcDriver::Mutex, AgcDriver::LockOrder::Rank::Pipeline> computePipelinesMutex;
     std::map<ComputePipelineKey, std::shared_ptr<ComputePipelineObjects>> computePipelines;
     std::map<ComputePipelineKey, std::shared_future<std::shared_ptr<ComputePipelineObjects>>> computePipelinesBuilding;
     // The journal replay building this device's pipelines on its own threads; drained first at teardown.
@@ -2216,6 +2219,8 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     state->deviceProc = MemoryStats::TrackDevice(state->device, selected, state->memoryProperties, state->deviceProc,
         state->memoryBudget ? state->InstanceFunction<PFN_vkGetPhysicalDeviceMemoryProperties2>("vkGetPhysicalDeviceMemoryProperties2") : nullptr);
+    state->deviceProc = VkCallProfile::Wrap(state->deviceProc);
+    state->deviceProc = RecordWorker::Wrap(state->deviceProc);
     // Before the profile (its target carries the result into every recompile and cache key).
     state->fusedFma = fusedFmaProbe(*state, family);
     state->shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
@@ -5877,7 +5882,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             ++d.notRefresh;
         }
         ++d.overlapped;
-    } else if ((covered & shaderAccess) == shaderAccess && barrierElision) {
+    } else if (((covered & shaderAccess) == shaderAccess && barrierElision) || GuestMemory::P0cNoHazards()) {
+        // (APS5_P0C_NO_HAZARDS: the P0-cpu ceiling ablation, inexact, replay only: no leading barrier.)
         ++d.preBarriersSkipped;
         Graphics::Recorder::CountMerged(CommandClass::DispatchLeading);
     } else {
@@ -5992,6 +5998,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.DeferDispatchBarrier(overlapQueue, runOwners);
         recorder.NoteRunAccess(record.programAddress, runAccesses);
         ++d.trailingDeferred;
+    } else if (GuestMemory::P0cNoHazards()) {
+        // The P0-cpu ceiling ablation (inexact, replay only): no trailing barrier, nothing covered.
+        recorder.MarkCovered(0);
     } else {
         const auto trailingTiming = recorder.BeginGpuTiming(CommandClass::DispatchTrailing);
         constexpr VkAccessFlags dispatchedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;

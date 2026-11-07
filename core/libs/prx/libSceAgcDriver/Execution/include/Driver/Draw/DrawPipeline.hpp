@@ -49,11 +49,19 @@ public:
         std::uint64_t retired = 0;
         std::size_t items = 0;
         std::vector<Range> writes;
+        // v3 exec (b)/(a): a queued item whose writes are not fully listed (BDA/pointer stores) was among them.
+        bool unknown = false;
     };
+    // The next Enqueue on this thread is an item whose writes are not fully listed (BDA or pointer stores): an overlap
+    // test against the queue (WatchWrites, WrittenSince) treats it as overlapping everything.
+    static void NextWritesUnknown();
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
     enum class Event : std::uint8_t { IndirectCommit, IndirectArgsDrain, SatisfiedWaitKept, Count };
 
     static DrawPipeline& Queue0();
+    // P0-cpu (C0): with frame windows (ProfileWindows, a frame replay) the [draw] pipelined line closes
+    // at each replayed frame's flip instead of every 10 s, named `label`.
+    static void CloseProfileWindow(const char* label);
     static std::size_t Depth();
     static std::size_t QueuedItems();
     static bool PipelineIndirect();
@@ -114,6 +122,7 @@ private:
         // The span of `reads` (HeldReads skips an item it misses; APS5_NO_HELD_READ_BOUNDS=1 scans every range).
         Range readBounds{~std::uint64_t{0}, 0};
         bool draw = false;
+        bool unknownWrites = false;
     };
     DrawPipeline() = default;
     template<typename TRanges, typename TBounds>
@@ -154,7 +163,7 @@ private:
     void retire(Item&& item);
     void reap();
     void rethrowFailure();
-    void report(std::chrono::steady_clock::time_point now);
+    void report(std::chrono::steady_clock::time_point now, const char* label = "10 s");
 
     std::mutex mutex;
     std::condition_variable wake;

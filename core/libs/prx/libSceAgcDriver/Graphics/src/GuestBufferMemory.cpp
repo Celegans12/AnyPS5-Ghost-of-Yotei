@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
@@ -273,13 +274,25 @@ struct ImportSettle {
 class HostImportMutex {
 public:
     void lock() {
+        const bool take = LockOrder::SplitTakes();
+        if (take) {
+            LockOrder::CacheLockFor(LockOrder::Rank::Imports).lock();
+        } else if (LockOrder::CheckEnabled()) {
+            LockOrder::BeforeAcquire(LockOrder::Rank::Imports);
+            LockOrder::NoteHeld(LockOrder::Rank::Imports);
+        }
         mutex.lock();
         owner.store(token(), std::memory_order_relaxed);
+        cacheTaken = take;
     }
 
     void unlock() {
+        const bool took = cacheTaken;
+        cacheTaken = false;
         owner.store(nullptr, std::memory_order_relaxed);
         mutex.unlock();
+        if (took) LockOrder::CacheLockFor(LockOrder::Rank::Imports).unlock();
+        else if (LockOrder::CheckEnabled()) LockOrder::NoteReleased(LockOrder::Rank::Imports);
     }
 
     bool HeldByThisThread() const {
@@ -294,6 +307,7 @@ private:
 
     std::mutex mutex;
     std::atomic<const void*> owner{nullptr};
+    bool cacheTaken = false;
 };
 
 // Imports persist across draws, keyed by allocation base, and are dropped when their allocation leaves
@@ -4133,6 +4147,19 @@ GuestAllocations::Lease mappedRangesLease(const HostImports& state, const GuestA
     return GuestAllocations::GuestAllocationsAcquireSpans_nid_postfix(spans);
 }
 
+}
+
+int HostPageClass(std::uint64_t address) {
+#ifdef _WIN32
+    MEMORY_BASIC_INFORMATION info{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT) return 2;
+    if (info.Type == MEM_MAPPED) return 1;
+    constexpr DWORD writable = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    return (info.Protect & writable) != 0 ? 0 : 2;
+#else
+    static_cast<void>(address);
+    return 0;
+#endif
 }
 
 const HostImport* ExistingHostImportFor(const Context& context, std::uint64_t address, std::size_t bytes) {

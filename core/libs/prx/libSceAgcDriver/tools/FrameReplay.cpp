@@ -87,6 +87,11 @@ struct Options {
     bool dedupePrologue = false;
     // --host-regions: print this process's host regions inside the guest arena and exit.
     bool hostRegions = false;
+    // --changed-pages (P0-cpu, C0): an in-frame memory delta writes only the 4 KiB pages whose bytes differ from
+    // guest memory, not the whole recorded 64 KiB blocks (the recorder takes every block with a write stamp, the
+    // driver's own GPU-write stamps included). The memory ends the same byte for byte; the driver's write watch
+    // then sees about the pages the title changed, as in the game, instead of every recorded block.
+    bool changedPages = false;
 };
 
 // The prologue's provably redundant ABI resolutions (--dedupe-prologue): a resolve call is redundant
@@ -309,6 +314,27 @@ void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
     reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
 }
 
+// --changed-pages: the chunk read aside, then copied page by page where it differs. Returns the bytes written.
+std::uint64_t restoreChanged(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
+    thread_local std::vector<std::byte> staged;
+    staged.resize(static_cast<std::size_t>(chunk.bytes));
+    reader.Read(chunk, std::span(staged));
+    auto* target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address));
+    constexpr std::uint64_t Page = 4096;
+    std::uint64_t written = 0;
+    for (std::uint64_t at = 0; at < chunk.bytes;) {
+        const auto pageEnd = ((chunk.address + at) / Page + 1) * Page - chunk.address;
+        const auto stop = std::min<std::uint64_t>(chunk.bytes, pageEnd);
+        const auto length = static_cast<std::size_t>(stop - at);
+        if (std::memcmp(target + at, staged.data() + at, length) != 0) {
+            std::memcpy(target + at, staged.data() + at, length);
+            written += length;
+        }
+        at = stop;
+    }
+    return written;
+}
+
 bool committedWritable(std::uint64_t address, std::uint64_t bytes) {
 #ifdef _WIN32
     for (auto at = address; at < address + bytes;) {
@@ -515,6 +541,7 @@ struct Replay {
     std::atomic<std::uint64_t> failedRegistrations{0};
     std::atomic<std::uint64_t> submits{0};
     std::atomic<std::uint64_t> deltaBytes{0};
+    std::atomic<std::uint64_t> deltaWritten{0};
     std::atomic<std::int64_t> paceWaitedNs{0};
     std::atomic<bool> stalled{false};
     std::atomic<std::uint64_t> stalledAt{0};
@@ -738,7 +765,12 @@ struct Replay {
             if (found == groups.end()) return;
             for (const auto* chunk : found->second) {
                 if (skipped.Overlaps(*chunk)) continue;
-                restore(reader, *chunk);
+                if (options.changedPages) {
+                    const auto written = restoreChanged(reader, *chunk);
+                    if (recording) deltaWritten += written;
+                } else {
+                    restore(reader, *chunk);
+                }
                 if (recording) {
                     deltaBytes += chunk->bytes;
                     AgcDriver::Graphics::ResidentCensus::NoteCpuWrite(chunk->address, chunk->bytes);
@@ -1058,6 +1090,7 @@ int usage() {
                          "  replays the driver calls and guest memory that APS5_FRAME_CAPTURE=<directory> recorded, through this\n"
                          "  build's AGC driver with no title running, and prints one JSON line with the frame times\n"
                          "  --no-pace           issues calls without waiting for the in-flight depth the title had\n"
+                         "  --changed-pages     an in-frame memory delta writes only the 4 KiB pages that differ (timing runs; same bytes)\n"
                          "  --no-release        never copies recorded CPU stores early to release a GPU wait\n"
                          "  --release-after-ms  milliseconds without a completion or a newly issued call before awaited dwords are released (50; at least 200 with --exact)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
@@ -1320,6 +1353,7 @@ int run(const Options& options, const FrameCaptureReader& reader, Clock::time_po
     std::sort(frameMs.begin(), frameMs.end());
     const auto percentile = [&](double fraction) { return frameMs.empty() ? 0.0 : frameMs[std::min(frameMs.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(frameMs.size())))]; };
     const auto seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
+    if (options.changedPages) std::fprintf(stderr, "[frame-replay] memory deltas (--changed-pages): %.1f MiB recorded, %.1f MiB written (pages that differed)\n", static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<double>(replay.deltaWritten.load()) / (1024.0 * 1024.0));
     std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"submits\":%llu,\"delta_mib\":%.1f,\"pace_timeouts\":%llu,\"memory_pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"prologue_s\":%.3f,\"prologue_skipped\":%llu,\"frame_windows\":%zu,\"undrained_windows\":%zu,\"bindless_primed\":%zu,\"gaps\":\"%s\"}\n",
                 ready.size(), seconds, seconds > 0 ? static_cast<double>(ready.size()) / seconds : 0.0, percentile(0.5), percentile(0.9), frameMs.empty() ? 0.0 : frameMs.back(), frameList.c_str(),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.paceTimeouts.load()), static_cast<unsigned long long>(replay.memoryPaceTimeouts.load()),
@@ -1355,6 +1389,7 @@ int main(int argc, char** argv) {
         else if (argument == "--wall-windows") options.frameWindows = false;
         else if (argument == "--host-regions") options.hostRegions = true;
         else if (argument == "--dedupe-prologue") options.dedupePrologue = true;
+        else if (argument == "--changed-pages") options.changedPages = true;
         else if (argument == "--no-bindless-prime") options.bindlessPrime = false;
         else if (argument == "--bindless-in" && index + 1 < argc) options.bindlessIn = argv[++index];
         else if (argument == "--bindless-out" && index + 1 < argc) options.bindlessOut = argv[++index];

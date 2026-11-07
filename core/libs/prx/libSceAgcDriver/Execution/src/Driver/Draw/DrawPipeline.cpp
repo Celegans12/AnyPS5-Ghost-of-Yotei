@@ -1,12 +1,17 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VkCallProfile.hpp"
+#include "prx/libSceAgcDriver/Execution/include/RecordWorker.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <utility>
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -192,7 +197,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     std::unique_lock lock(mutex);
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
-    if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
+    if (jobs.size() >= depth && AgcDriver::LockOrder::MustNotWait()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
     idle.wait(lock, [&] { return jobs.size() < depth; });
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
@@ -209,6 +214,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
 
 void DrawFinisher::run() {
     PerformanceTrace::BindThread("draw finisher");
+    VkCallProfile::NameThread("finisher");
     for (;;) {
         Job* job = nullptr;
         bool failed = false;
@@ -239,14 +245,14 @@ void DrawFinisher::run() {
 
 void DrawFinisher::Settle() {
     if (!Busy() || OnFinisherThread()) return;
-    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
+    if (AgcDriver::LockOrder::MustNotWait()) throw std::runtime_error("draw finisher settle under the GPU lock");
     std::unique_lock lock(mutex);
     idle.wait(lock, [&] { return jobs.empty(); });
 }
 
 void DrawFinisher::Drain() {
     if (OnFinisherThread()) return;
-    if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    if (Busy() && AgcDriver::LockOrder::MustNotWait()) throw std::runtime_error("draw finisher drain under the GPU lock");
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
@@ -332,6 +338,7 @@ DrawPipeline::Item* DrawPipeline::nextPrepare() {
 
 void DrawPipeline::prepareLoop() {
     PerformanceTrace::BindThread("draw preparer");
+    VkCallProfile::NameThread("preparer");
     for (;;) {
         Prepare job;
         {
@@ -393,7 +400,16 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
+namespace {
+thread_local bool nextWritesUnknown = false;
+}
+
+void DrawPipeline::NextWritesUnknown() {
+    nextWritesUnknown = true;
+}
+
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, Prepare prepare, bool draw) {
+    const bool unknownWrites = std::exchange(nextWritesUnknown, false);
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -405,10 +421,14 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
         commit();
         return;
     }
-    if (items.size() >= Depth()) {
-        if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
+    // v3 exec (runtime switches, APS5_AB): APS5_V3E_DEEP_PIPELINE lets 256 items queue before the worker waits for room,
+    // APS5_V3E_MID_PIPELINE 128 (today 64 with pipelined indirect draws). Only the room threshold moves; items still
+    // commit in order, so the switch is exact and may flip at any enqueue.
+    const auto room = Depth() == 0 ? std::size_t{0} : Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eDeepPipeline) ? std::max<std::size_t>(Depth(), 256) : Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eMidPipeline) ? std::max<std::size_t>(Depth(), 128) : Depth();
+    if (items.size() >= room) {
+        if (AgcDriver::LockOrder::MustNotWait()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
-        resumeAt = Depth() - 1;
+        resumeAt = room - 1;
         ++idleWaiters;
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
         --idleWaiters;
@@ -424,6 +444,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
     const bool prepared = static_cast<bool>(prepare);
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), nowNs(), std::move(prepare)});
+    items.back().unknownWrites = unknownWrites;
     items.back().draw = draw;
     addWrites(items.back().writes);
     for (const auto& [begin, limit] : items.back().reads) {
@@ -449,7 +470,18 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (!profile && !stats) return;
     const auto now = std::chrono::steady_clock::now();
-    if (now - lastReport >= std::chrono::seconds(10)) report(now);
+    if (!ProfileWindows::FrameWindows() && now - lastReport >= std::chrono::seconds(10)) {
+        report(now);
+        RecordWorker::Close("10s");
+    }
+}
+
+void DrawPipeline::CloseProfileWindow(const char* label) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!profile) return;
+    auto& pipeline = Queue0();
+    std::lock_guard lock(pipeline.mutex);
+    pipeline.report(std::chrono::steady_clock::now(), label);
 }
 
 // APS5_PROFILE_DRAW: the pending-write scans (Overlaps, OverlapsAny, DrainIfOverlaps) walk every write range of
@@ -468,7 +500,7 @@ void DrawPipeline::noteWriteScan() {
     writeScanDistinct += static_cast<std::uint64_t>(std::unique(ranges.begin(), ranges.end()) - ranges.begin());
 }
 
-void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
+void DrawPipeline::report(std::chrono::steady_clock::time_point now, const char* label) {
     const auto windowNs = std::max<double>(1.0, static_cast<double>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - lastReport).count()));
     lastReport = now;
     std::string drainText;
@@ -517,7 +549,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     std::snprintf(scans, sizeof(scans), "; write scans %llu over %.1f items, %.1f ranges, %.1f distinct", static_cast<unsigned long long>(writeScans), perSample(writeScanItems), perSample(writeScanRanges), perSample(writeScanDistinct));
     drainText += scans;
     writeScans = writeScanSamples = writeScanItems = writeScanRanges = writeScanDistinct = 0;
-    AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; indirect commits %llu, indirect drains (args overlap) %llu; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), drainText.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (%s, depth %zu): %llu commits at %.1f us each on the committer (%.1f %% busy), %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; indirect commits %llu, indirect drains (args overlap) %llu; drains:%s\n", label, Depth(), static_cast<unsigned long long>(commits), perCommit, busy, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, static_cast<unsigned long long>(counted[0]), static_cast<unsigned long long>(counted[1]), drainText.c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     roomWaits = roomWakeNs = drainWaits = drainWakeNs = committerIdles = committerIdleNs = committerWakeNs = 0;
     drains = {};
@@ -527,6 +559,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
+    VkCallProfile::NameThread("committer");
     StartCommitterSampler();
     for (;;) {
         Commit* commit = nullptr;
@@ -548,6 +581,7 @@ void DrawPipeline::run() {
             }
             isDraw = items.front().draw;
         }
+        RecordWorker::FollowCommitterAffinity();
         const auto start = std::chrono::steady_clock::now();
         std::exception_ptr fatal;
         bool failed = false;
@@ -641,7 +675,7 @@ void DrawPipeline::ReleaseRetired() {
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
-    if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
+    if ((finisherBusy || Busy()) && AgcDriver::LockOrder::MustNotWait()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     if (finisherBusy) DrawFinisher::Get().Drain();
     if (!Busy()) return;
     const auto start = std::chrono::steady_clock::now();
@@ -782,7 +816,10 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
     if (!Busy()) return {Retired(), 0, {}};
     std::lock_guard lock(mutex);
     Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
-    for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
+    for (const auto& item : items) {
+        watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
+        if (item.unknownWrites) watch.unknown = true;
+    }
     return watch;
 }
 

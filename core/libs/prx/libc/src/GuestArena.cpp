@@ -486,6 +486,18 @@ void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t byt
     noteAccess(reinterpret_cast<const void*>(address), bytes);
 }
 
+namespace {
+std::atomic<void (*)(unsigned, unsigned)> lockObserver{nullptr};
+}
+
+void GuestArenaSetLockObserver_nid_postfix(void (*observer)(unsigned rank, unsigned event)) {
+    lockObserver.store(observer, std::memory_order_release);
+}
+
+void GuestArenaNoteLock_nid_postfix(unsigned rank, unsigned event) {
+    if (const auto observer = lockObserver.load(std::memory_order_acquire)) observer(rank, event);
+}
+
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleWrite(address);
 }

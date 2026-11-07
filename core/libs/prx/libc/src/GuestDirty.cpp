@@ -114,7 +114,11 @@ std::uint32_t threadToken() {
 #endif
 }
 
+thread_local unsigned blockLocksHeld = 0;
+thread_local bool inFaultHandler = false;
+
 void lockBlock(Block& block) {
+    GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyBlock, blockLocksHeld == 0 && !inFaultHandler ? GuestArena::GuestLockBefore : GuestArena::GuestLockHeldUnchecked);
     std::uint32_t expected = 0;
     const auto self = threadToken();
     while (!block.lock.compare_exchange_weak(expected, self, std::memory_order_acquire)) {
@@ -123,10 +127,13 @@ void lockBlock(Block& block) {
         YieldProcessor();
 #endif
     }
+    if (blockLocksHeld++ == 0 && !inFaultHandler) GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyBlock, GuestArena::GuestLockHeld);
 }
 
 void unlockBlock(Block& block) {
     block.lock.store(0, std::memory_order_release);
+    if (blockLocksHeld != 0) --blockLocksHeld;
+    GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyBlock, GuestArena::GuestLockReleased);
 }
 
 std::uint32_t pageMask(std::uintptr_t blockBase, std::uintptr_t begin, std::uintptr_t end) {
@@ -247,7 +254,12 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
         counters.armNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
         return token;
     }
+    GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyArm, GuestArena::GuestLockBefore);
     std::lock_guard lock(armMutex);
+    GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyArm, GuestArena::GuestLockHeld);
+    struct ArmReleased {
+        ~ArmReleased() { GuestArena::GuestArenaNoteLock_nid_postfix(GuestArena::GuestLockDirtyArm, GuestArena::GuestLockReleased); }
+    } armReleased;
     const auto refuse = [&](unsigned reason) {
         counters.refused.fetch_add(1, std::memory_order_relaxed);
         counters.refusedBy[armKind][reason & 7u].fetch_add(1, std::memory_order_relaxed);
@@ -421,6 +433,10 @@ void GuestDirtyBump_nid_postfix(std::uintptr_t address, std::size_t bytes) {
 bool GuestDirtyHandleWrite_nid_postfix(std::uintptr_t address) {
 #ifdef _WIN32
     if (!enabled()) return false;
+    struct FaultScope {
+        bool outer = std::exchange(inFaultHandler, true);
+        ~FaultScope() { inFaultHandler = outer; }
+    } faultScope;
     const auto blockBase = address & ~(BlockBytes - 1);
     auto* block = findBlock(blockBase);
     if (block == nullptr) return false;

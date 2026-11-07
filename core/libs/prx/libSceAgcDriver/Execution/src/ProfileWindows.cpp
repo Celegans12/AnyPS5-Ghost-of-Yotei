@@ -2,7 +2,13 @@
 #include "prx/libSceAgcDriver/Execution/include/CommandMix.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/NewPath.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VkCallProfile.hpp"
+#include "prx/libSceAgcDriver/Execution/include/RecordWorker.hpp"
+#include "prx/libSceAgcDriver/Execution/include/C3Log.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
@@ -40,12 +46,18 @@ void Close(const char* label) {
     std::lock_guard lock(closing);
     Graphics::Recorder::CloseGpuTimingWindow(label);
     Graphics::CloseDrawProfileWindow(label);
+    DriverDetail::DrawPipeline::CloseProfileWindow(label);
+    DriverDetail::Driver::CloseDispatchPhasesWindow(label);
     CommandMix::Close(label);
     NewPath::Close(label);
     Graphics::ResidentCensus::Close(label);
     Graphics::HomeCensus::Close(label);
     Graphics::FaultCensus::Close(label);
     MemoryStats::ReportNow(label);
+    VkCallProfile::Close(label);
+    RecordWorker::Close(label);
+    C3Log::Close(label);
+    ImageFlags::Close(label);
     ProfileOutput_nid_no_patch().Flush();
 }
 

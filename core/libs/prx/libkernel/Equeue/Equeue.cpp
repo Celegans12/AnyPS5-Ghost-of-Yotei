@@ -13,6 +13,70 @@
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <cstdio>
+#include <cstdlib>
+#include <map>
+#include <vector>
+#include <string>
+#include <tuple>
+
+// Diagnostic (APS5_TRACE_EQUEUE=1, v3 exec 11-07): per wait site, which events woke the wait (filter, ident), how long
+// the wait lasted, whether the event had already fired at the wait's start, and the lag from the trigger to the wake;
+// every 3 s as [equeue], the 8 sites with the most wait time.
+namespace {
+bool traceEqueue() {
+    static const bool enabled = std::getenv("APS5_TRACE_EQUEUE") != nullptr;
+    return enabled;
+}
+std::mutex traceMutex;
+std::map<std::tuple<KernelEqueue, uintptr_t, int16_t>, std::uint64_t> lastTrigger;
+struct TraceSite { std::uint64_t waits = 0, events = 0, before = 0, waitNs = 0, lagNs = 0, maxWaitNs = 0, maxLagNs = 0; };
+std::map<std::string, TraceSite> traceSites;
+std::uint64_t traceReportNs = 0;
+std::uint64_t traceNow() { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()); }
+void noteTrigger(KernelEqueue eq, uintptr_t ident, int16_t filter) {
+    std::lock_guard lock(traceMutex);
+    lastTrigger[{eq, ident, filter}] = traceNow();
+}
+void noteWait(KernelEqueue eq, const void* caller, std::uint64_t startNs, const KernelEvent* ev, int count) {
+    const auto now = traceNow();
+    std::lock_guard lock(traceMutex);
+    for (int i = 0; i < std::max(count, 1); ++i) {
+        char key[160];
+        if (count <= 0) std::snprintf(key, sizeof(key), "eq%llx @%p timeout", static_cast<unsigned long long>(eq), caller);
+        else std::snprintf(key, sizeof(key), "eq%llx @%p filter %d ident %llu", static_cast<unsigned long long>(eq), caller, ev[i].filter, static_cast<unsigned long long>(ev[i].ident));
+        auto& site = traceSites[key];
+        if (i == 0) {
+            ++site.waits;
+            site.waitNs += now - startNs;
+            site.maxWaitNs = std::max(site.maxWaitNs, now - startNs);
+        }
+        if (count <= 0) break;
+        ++site.events;
+        const auto found = lastTrigger.find({eq, ev[i].ident, ev[i].filter});
+        if (found != lastTrigger.end()) {
+            if (found->second < startNs) ++site.before;
+            const auto lag = now > found->second ? now - found->second : 0;
+            site.lagNs += lag;
+            site.maxLagNs = std::max(site.maxLagNs, lag);
+        }
+    }
+    if (traceReportNs == 0) traceReportNs = now;
+    if (now - traceReportNs < 3000000000ull) return;
+    traceReportNs = now;
+    std::vector<std::pair<std::string, TraceSite>> hot(traceSites.begin(), traceSites.end());
+    std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.waitNs > b.second.waitNs; });
+    std::string line = "[equeue] 3 s:";
+    for (std::size_t i = 0; i < hot.size() && i < 8; ++i) {
+        const auto& s = hot[i].second;
+        char text[320];
+        std::snprintf(text, sizeof(text), " | %s: %llu waits avg %.1f ms (max %.0f), %llu events, %llu fired before the wait, trigger-to-wake avg %.2f ms (max %.1f)", hot[i].first.c_str(), static_cast<unsigned long long>(s.waits), s.waits ? s.waitNs / 1e6 / static_cast<double>(s.waits) : 0.0, s.maxWaitNs / 1e6, static_cast<unsigned long long>(s.events), static_cast<unsigned long long>(s.before), s.events ? s.lagNs / 1e6 / static_cast<double>(s.events) : 0.0, s.maxLagNs / 1e6);
+        line += text;
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+    traceSites.clear();
+}
+}
 
 static constexpr std::uint64_t FileRepollNs = 1000000;
 
@@ -501,6 +565,7 @@ int KernelEqueuePrivate::TriggerEvent(uintptr_t ident, int16_t filter, void* tri
     if (it == m_events.end()) {
         return SCE_KERNEL_ERROR_ENOENT;
     }
+    if (traceEqueue()) noteTrigger(m_handle, ident, filter);
     if (it->enabled) {
         if (it->filter.triggerFunc != nullptr) {
             it->filter.triggerFunc(&*it, triggerData);
@@ -666,6 +731,7 @@ int APS5_VABI sceKernelWaitEqueue(KernelEqueue eq, KernelEvent* ev, int num, int
     } else {
         *out = owner->WaitForEvents(ev, num, *timo);
     }
+    if (traceEqueue() && (timo == nullptr || *timo != 0)) noteWait(eq, __builtin_return_address(0), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waitStart.time_since_epoch()).count()), ev, *out);
     if (timo == nullptr || *timo != 0) {
         KernelTraceWait_nid_postfix("equeue", __builtin_return_address(0), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitStart).count()), *out == 0);
     }

@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/WriterReach.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include <chrono>
+#include <mutex>
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CommandMix.hpp"
@@ -33,6 +35,32 @@
 #include <utility>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+// Lever (b) census (APS5_V3E_B_CENSUS=1, log-only): for each queue-0 dispatch miss that drains the draw pipeline today,
+// do its captured reads overlap the writes of the items that were queued at the drain? [b-census] every 10 s.
+bool bCensus() {
+    static const bool enabled = std::getenv("APS5_V3E_B_CENSUS") != nullptr;
+    return enabled;
+}
+struct BCensus { std::uint64_t drains = 0, clear = 0, overlapping = 0, clearUs = 0, overlapUs = 0, unknown = 0, queuedUnknown = 0, queuedUnknownUs = 0; };
+std::mutex bMutex;
+BCensus bCounts;
+std::chrono::steady_clock::time_point bReported = std::chrono::steady_clock::now();
+void noteBCensus(bool known, bool overlaps, bool queuedUnknown, std::uint64_t drainUs) {
+    std::lock_guard lock(bMutex);
+    ++bCounts.drains;
+    if (!known) ++bCounts.unknown;
+    else if (queuedUnknown) { ++bCounts.queuedUnknown; bCounts.queuedUnknownUs += drainUs; }
+    else if (overlaps) { ++bCounts.overlapping; bCounts.overlapUs += drainUs; }
+    else { ++bCounts.clear; bCounts.clearUs += drainUs; }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - bReported < std::chrono::seconds(10)) return;
+    bReported = now;
+    AgcDriver::ProfilePrint_nid_no_patch("[b-census] 10 s: %llu queue-0 dispatch-miss drains; reads clear of the queued writes %llu (%.1f %%, %.1f ms of drain), overlapping %llu (%.1f ms), a queued item with unlisted writes %llu (%.1f ms; counted as overlapping), reads unknown %llu\n", static_cast<unsigned long long>(bCounts.drains), static_cast<unsigned long long>(bCounts.clear), bCounts.drains ? 100.0 * static_cast<double>(bCounts.clear) / static_cast<double>(bCounts.drains) : 0.0, bCounts.clearUs / 1000.0, static_cast<unsigned long long>(bCounts.overlapping), bCounts.overlapUs / 1000.0, static_cast<unsigned long long>(bCounts.queuedUnknown), bCounts.queuedUnknownUs / 1000.0, static_cast<unsigned long long>(bCounts.unknown));
+    bCounts = {};
+}
+}
 
 namespace {
 
@@ -466,6 +494,9 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
     phaseTiming.Phase(PhaseKey);
     timing.Mark("decode_key_device_setup");
     bool readsClear = false;
+    bool bArmed = false;
+    DrawPipeline::Watch bWatch;
+    std::uint64_t bDrainUs = 0;
     if (pipelineCandidate) {
         std::vector<ShaderRecompiler::MemoryRegion> reads;
         bool entryFound = false;
@@ -486,7 +517,16 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             readsClear = std::none_of(reads.begin(), reads.end(), [](const auto& region) { return DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); });
             if (!readsClear) NoteItemFallback(ItemFallback::Reads);
         }
-        if (!readsClear && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+        if (!readsClear && DrawPipeline::Queue0().Busy()) {
+            const bool census = bCensus() && !entryFound;
+            if (census) bWatch = DrawPipeline::Queue0().WatchWrites();
+            const auto drainStart = std::chrono::steady_clock::now();
+            DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
+            if (census) {
+                bArmed = true;
+                bDrainUs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - drainStart).count());
+            }
+        }
     }
     if (fromAhead) {
         compiledResult = std::move(ahead.compiledResult);
@@ -547,6 +587,16 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
             }();
             captured = shaderMemory->Regions();
             request.context.memory = captured;
+            // Lever (b) census: the miss's reads are known only once its capture ran (after the drain).
+            if (bArmed) {
+                bArmed = false;
+                const bool known = !captured.empty();
+                const bool overlaps = std::any_of(captured.begin(), captured.end(), [&](const auto& region) {
+                    const auto begin = region.guestAddress, end = region.guestAddress + region.bytes.size();
+                    return std::any_of(bWatch.writes.begin(), bWatch.writes.end(), [&](const DrawPipeline::Range& write) { return begin < write.second && write.first < end; });
+                });
+                noteBCensus(known, overlaps, bWatch.unknown, bDrainUs);
+            }
             if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
             captureMs += phaseTiming.Elapsed();
             phaseTiming.Phase(PhaseCapture);
