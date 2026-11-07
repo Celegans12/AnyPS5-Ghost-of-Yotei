@@ -261,7 +261,8 @@ void PushSplitTaken(Rank rank, bool taken) {
     }
     if (taken) {
         locks.takenBits[i] |= 1ull << depth;
-        splitTakes.fetch_add(1, std::memory_order_relaxed);
+        const auto takes = splitTakes.fetch_add(1, std::memory_order_relaxed) + 1;
+        if ((takes & 0xfffffu) == 0) std::fprintf(stderr, "[lock-split] %llu cache-lock takes under the record lock, %llu contended, %llu violations, %llu record releases holding a cache lock\n", static_cast<unsigned long long>(takes), static_cast<unsigned long long>(contended.load(std::memory_order_relaxed)), static_cast<unsigned long long>(violations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(releasesHolding.load(std::memory_order_relaxed)));
     } else {
         locks.takenBits[i] &= ~(1ull << depth);
     }
