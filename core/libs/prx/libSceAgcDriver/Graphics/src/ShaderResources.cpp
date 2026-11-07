@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Graphics/include/PrepareShadow.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/C3Log.hpp"
@@ -356,6 +358,7 @@ std::list<CachedTexture>::iterator findTexture(TextureCache& cache, const Textur
 }
 
 void eraseTexture(TextureCache& cache, std::list<CachedTexture>::iterator it) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Eviction);
     cache.bytes -= it->accounted;
     if (it->source == nullptr) {
         cache.snapshotBytes -= it->accounted;
@@ -2177,6 +2180,7 @@ std::list<CachedStorageTexture>::iterator findStorageByImage(StorageTextureCache
 
 // Evicts an entry: its pending results go to guest memory first (the image may die with the entry).
 std::shared_ptr<StorageTexture> evictStorage(StorageTextureCache& cache, std::list<CachedStorageTexture>::iterator it) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Eviction);
     auto texture = it->texture;
     it->texture->SetCached(false);
     noteUncached(it->texture);
@@ -5259,6 +5263,28 @@ bool ShaderResources::proveDrawMemo(std::span<const CompiledShader> shaders, Pro
 }
 
 bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofReport* report) {
+    struct ShadowNote {
+        ShaderResources* self;
+        bool draws;
+        ~ShadowNote() {
+            if (!draws || !PrepareShadow::Active() || std::uncaught_exceptions() != 0) return;
+            PrepareShadow::NoteDrawSet([this](const std::function<void(std::uint64_t, std::uint64_t)>& add) {
+                for (const auto& region : self->directRegions) add(region.begin, region.end - region.begin);
+                for (const auto& range : self->describedRanges) {
+                    add(range.address, range.bytes);
+                    if (range.dccAddress != 0) add(range.dccAddress, DccKeyBytes(range.bytes));
+                }
+                for (const auto& image : self->storageTextures) {
+                    add(image->Descriptor().baseAddress, image->GuestBytes());
+                    if (image->Descriptor().dccAddress != 0) add(image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+                }
+                for (const auto& surface : self->validatedTextures) {
+                    add(surface.resource.baseAddress, surface.bytes);
+                    if (surface.resource.dccAddress != 0) add(surface.resource.dccAddress, DccKeyBytes(surface.bytes));
+                }
+            });
+        }
+    } shadowNote{this, shaders.size() > 1 && PrepareShadow::Enabled()};
     if (shaders.size() > 1 && RuntimeSwitches::Set(RuntimeSwitch::V3eDrawProofMemo) && GuestMemory::DirtyEnabled()) return proveDrawMemo(shaders, report);
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
@@ -5964,6 +5990,7 @@ void ResourceCache::Insert(const Key& key, std::shared_ptr<ShaderResources> reso
 }
 
 void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Eviction);
     std::lock_guard lock(mutex);
     if (object != nullptr) {
         const auto found = index.find(key);
@@ -5973,6 +6000,7 @@ void ResourceCache::Remove(const Key& key, const ShaderResources* object) {
 }
 
 void ResourceCache::RemoveImage(const StorageTexture* image, std::vector<std::shared_ptr<ShaderResources>>* evicted) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Eviction);
     std::lock_guard lock(mutex);
     removeImage(image, evicted);
 }

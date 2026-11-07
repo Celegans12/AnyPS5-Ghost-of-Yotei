@@ -406,6 +406,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeferredDestruction.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PrepareShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ResidentCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/HomeCensus.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/WriterReach.cpp
