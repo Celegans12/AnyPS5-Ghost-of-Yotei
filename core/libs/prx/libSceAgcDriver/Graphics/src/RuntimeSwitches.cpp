@@ -105,6 +105,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_V3E_TEXTURE_ROOM",
     "APS5_V3E_DEEP_PIPELINE",
     "APS5_V3E_MID_PIPELINE",
+    "APS5_V3E_DRAW_PROOF_MEMO",
     "APS5_V3M_ADDR_CEIL",
 };
 

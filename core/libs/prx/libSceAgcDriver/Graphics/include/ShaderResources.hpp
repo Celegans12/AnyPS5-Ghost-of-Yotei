@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
@@ -628,6 +629,14 @@ private:
     VkDescriptorBufferInfo descriptor(Allocation& allocation);
     void noteReusable();
     bool proveBuild(std::span<const CompiledShader> shaders, ProofReport* report);
+    // v3 lever A for draw sets (APS5_V3E_DRAW_PROOF_MEMO, runtime switch): proveBuild's answer reused while the
+    // per-cause proof serial and the pending serial are unchanged and the tracker calls every range the proof reads clean
+    // since the tokens armed before the last full proof; APS5_V3E_DRAW_PROOF_MEMO_VERIFY re-proves and throws.
+    bool proveDrawMemo(std::span<const CompiledShader> shaders, ProofReport* report);
+    std::vector<ImageFlags::DirtyQuery> memoTokens;
+    std::uint64_t memoCaused = 0;
+    std::uint64_t memoPending = 0;
+    bool memoValid = false;
     void reportDescriptorCaches() const;
     // What a sampled texture was proved current against when the build (or the last full Revalidate)
     // looked it up, so the next Revalidate can repeat the proof from write stamps and the DCC keys

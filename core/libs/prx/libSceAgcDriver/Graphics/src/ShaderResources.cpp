@@ -5182,7 +5182,83 @@ void aReport() {
 }
 }
 
+namespace {
+struct DrawMemoCounts { std::atomic<std::uint64_t> proofs{0}, served{0}, verified{0}, keyMoved{0}, dirty{0}, cpuPending{0}, invalid{0}, unarmed{0}; };
+DrawMemoCounts drawMemo;
+std::atomic<std::int64_t> drawMemoReportNs{0};
+void reportDrawMemo() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto last = drawMemoReportNs.load(std::memory_order_relaxed);
+    if (last == 0) { drawMemoReportNs.store(now, std::memory_order_relaxed); return; }
+    if (now - last < 10'000'000'000LL || !drawMemoReportNs.compare_exchange_strong(last, now)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-memo] 10 s: %llu draw-set proofs, served %llu, verified %llu; not served: key moved %llu, ranges dirty %llu, CPU writes pending %llu, no valid memo %llu; memos left unarmed %llu\n",
+        static_cast<unsigned long long>(drawMemo.proofs.exchange(0)), static_cast<unsigned long long>(drawMemo.served.exchange(0)), static_cast<unsigned long long>(drawMemo.verified.exchange(0)), static_cast<unsigned long long>(drawMemo.keyMoved.exchange(0)), static_cast<unsigned long long>(drawMemo.dirty.exchange(0)), static_cast<unsigned long long>(drawMemo.cpuPending.exchange(0)), static_cast<unsigned long long>(drawMemo.invalid.exchange(0)), static_cast<unsigned long long>(drawMemo.unarmed.exchange(0)));
+}
+}
+
+bool ShaderResources::proveDrawMemo(std::span<const CompiledShader> shaders, ProofReport* report) {
+    static const bool verify = std::getenv("APS5_V3E_DRAW_PROOF_MEMO_VERIFY") != nullptr;
+    drawMemo.proofs.fetch_add(1, std::memory_order_relaxed);
+    const auto caused = GuestMemory::ProofSerialCaused();
+    const auto pending = StorageTexture::PendingSerial();
+    bool clean = false;
+    if (!memoValid || memoTokens.empty()) drawMemo.invalid.fetch_add(1, std::memory_order_relaxed);
+    else if (memoCaused != caused || memoPending != pending) drawMemo.keyMoved.fetch_add(1, std::memory_order_relaxed);
+    else if (!ImageFlags::CleanSinceAll(memoTokens)) drawMemo.dirty.fetch_add(1, std::memory_order_relaxed);
+    else if (std::any_of(memoTokens.begin(), memoTokens.end(), [&](const ImageFlags::DirtyQuery& range) { return PendingCpuWritesOverlap(context, range.address, range.bytes); })) drawMemo.cpuPending.fetch_add(1, std::memory_order_relaxed);
+    else clean = true;
+    if (clean && !verify) {
+        drawMemo.served.fetch_add(1, std::memory_order_relaxed);
+        for (const auto& range : memoTokens) ImageFlags::NoteServed(range.address, range.bytes);
+        if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
+        reportDrawMemo();
+        return true;
+    }
+    std::vector<ImageFlags::DirtyQuery> armed;
+    bool all = true;
+    if (!clean) {
+        const auto arm = [&](std::uint64_t address, std::uint64_t bytes) {
+            if (!all || bytes == 0) return;
+            const auto token = ImageFlags::Arm(address, static_cast<std::size_t>(bytes));
+            if (token == 0) all = false;
+            else armed.push_back({address, static_cast<std::size_t>(bytes), token});
+        };
+        for (const auto& region : directRegions) arm(region.begin, region.end - region.begin);
+        for (const auto& range : describedRanges) {
+            arm(range.address, range.bytes);
+            if (range.dccAddress != 0) arm(range.dccAddress, DccKeyBytes(range.bytes));
+        }
+        for (const auto& image : storageTextures) {
+            arm(image->Descriptor().baseAddress, image->GuestBytes());
+            if (image->Descriptor().dccAddress != 0) arm(image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()));
+        }
+        for (const auto& surface : validatedTextures) {
+            arm(surface.resource.baseAddress, surface.bytes);
+            if (surface.resource.dccAddress != 0) arm(surface.resource.dccAddress, DccKeyBytes(surface.bytes));
+        }
+    }
+    std::vector<std::uint64_t> versions;
+    if (clean) for (const auto& image : storageTextures) versions.push_back(image->Version());
+    const bool ok = revalidateFull(shaders, report);
+    if (clean) {
+        bool same = ok;
+        for (std::size_t i = 0; same && i < storageTextures.size(); ++i) same = storageTextures[i]->Version() == versions[i];
+        if (!same) throw std::runtime_error("AGC graphics: the draw proof memo served a set its full proof rejects or refreshes (APS5_V3E_DRAW_PROOF_MEMO_VERIFY)");
+        drawMemo.verified.fetch_add(1, std::memory_order_relaxed);
+        reportDrawMemo();
+        return ok;
+    }
+    if (ok && !all) drawMemo.unarmed.fetch_add(1, std::memory_order_relaxed);
+    memoValid = ok && all;
+    memoCaused = caused;
+    memoPending = pending;
+    memoTokens = std::move(armed);
+    reportDrawMemo();
+    return ok;
+}
+
 bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofReport* report) {
+    if (shaders.size() > 1 && RuntimeSwitches::Set(RuntimeSwitch::V3eDrawProofMemo) && GuestMemory::DirtyEnabled()) return proveDrawMemo(shaders, report);
     if (EpochProofs()) {
         const auto epoch = GuestMemory::CollectEpoch();
         const auto proof = GuestMemory::ProofSerial();
