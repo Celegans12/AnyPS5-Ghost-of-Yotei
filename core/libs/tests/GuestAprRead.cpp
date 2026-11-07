@@ -250,9 +250,32 @@ void TestSmallStack(const Fixture& fixture) {
 
 }
 
+#ifdef _WIN32
+void TestDescriptors(const Fixture& fixture) {
+    constexpr int StreamLimit = 9000;
+    std::vector<FileStream*> streams;
+    for (int index = 0; index < StreamLimit; ++index) {
+        FileStream* stream = fopen_nid_postfix(FilePath, "rb");
+        if (stream == nullptr) break;
+        streams.push_back(stream);
+    }
+    const bool filled = streams.size() < StreamLimit;
+    std::vector<std::uint8_t> storage(131200, 0xCC);
+    std::string error;
+    try {
+        CheckRead(fixture, storage.data() + 17, 65537, 0);
+    } catch (const std::runtime_error& failure) {
+        error = failure.what();
+    }
+    for (FileStream* stream : streams) fclose_nid_postfix(stream);
+    Require(filled, "the guest opened 9000 streams without filling the descriptor table");
+    Require(error.empty(), ("APR read failed while the guest held every descriptor (" + std::to_string(streams.size()) + " streams): " + error).c_str());
+}
+#endif
+
 int main(int argc, char** argv) {
     try {
-        Require(argc == 2, "expected host, direct, eof, errors, streams, fault or stack");
+        Require(argc == 2, "expected host, direct, eof, errors, streams, fault, stack or descriptors");
         const Fixture fixture;
         const std::string mode = argv[1];
         if (mode == "host") {
@@ -274,6 +297,8 @@ int main(int argc, char** argv) {
             Require(committedPages > 2, "APR did not exercise demand-committed destination pages");
         } else if (mode == "stack") {
             TestSmallStack(fixture);
+        } else if (mode == "descriptors") {
+            TestDescriptors(fixture);
 #endif
         } else {
             throw std::runtime_error("unknown APR read case");
