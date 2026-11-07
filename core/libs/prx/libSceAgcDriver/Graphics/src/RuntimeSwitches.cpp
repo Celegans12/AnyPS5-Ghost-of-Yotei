@@ -114,6 +114,10 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_V3E_PREPARE_PROOF",
     "APS5_V3E_PP_PUBLISH_ONLY",
     "APS5_V3E_PP_NO_PUBLISH",
+    "APS5_FM2",
+    "APS5_FM2_TRUST",
+    "APS5_FM2_SNAP",
+    "APS5_FM2_TARGET",
 };
 
 struct Refusal {

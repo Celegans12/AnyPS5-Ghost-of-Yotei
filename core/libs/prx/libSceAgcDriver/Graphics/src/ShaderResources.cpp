@@ -23,6 +23,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastMode2.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VramBudget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include <algorithm>
@@ -5749,7 +5750,45 @@ bool ShaderResources::revalidateFullBody(std::span<const CompiledShader> shaders
     refreshed.clear();
     FastFail reason = FastFail::Count;
     bool accepted = false;
-    bool fast = !noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted);
+    const bool fm2Trusted = [&] {
+        if (!FastMode2::On(RuntimeSwitch::Fm2Trust)) return false;
+        auto& counters = FastMode2::Count();
+        counters.trustAsked.fetch_add(1, std::memory_order_relaxed);
+        if (fm2ProvedPresent != Recorder::Presents()) {
+            counters.trustNotProved.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (prefixMoved || validatedTextures.size() != textures.size()) {
+            counters.trustMoved.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        bool gpuWritten = !storageTextures.empty();
+        for (std::size_t i = 0; i < textures.size(); ++i) {
+            const auto& surface = validatedTextures[i];
+            if (!surface.valid || surface.depth || textures[i] == nullptr || textures[i]->Released() || (surface.source != nullptr && !surface.source->Cached())) {
+                counters.trustEvicted.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            if (!FlushDepthPlanes(surface.resource.baseAddress, static_cast<std::size_t>(surface.bytes)).empty()) {
+                counters.trustMoved.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+            if (surface.source != nullptr) gpuWritten = true;
+        }
+        for (const auto& image : storageTextures) {
+            if (image == nullptr || !image->Cached() || DepthSurfaceOverlaps(context.device, image->Descriptor().baseAddress, image->GuestBytes())) {
+                counters.trustEvicted.fetch_add(1, std::memory_order_relaxed);
+                return false;
+            }
+        }
+        if (gpuWritten && FastMode2::TrustPlainOnly()) {
+            counters.trustPlain.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        counters.trusted.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }();
+    bool fast = fm2Trusted || (!noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted));
     {
         static const bool verifyUntracked = std::getenv("APS5_VERIFY_UNTRACKED_PROOFS") != nullptr;
         const bool anyUntracked = std::any_of(validatedTextures.begin(), validatedTextures.end(), [](const ValidatedSurface& surface) { return surface.untracked[0] != 0; }) || std::any_of(storageUntracked.begin(), storageUntracked.end(), [](const auto& stamp) { return stamp[0] != 0; });
@@ -5825,6 +5864,10 @@ bool ShaderResources::revalidateFullBody(std::span<const CompiledShader> shaders
             }
             if (profile) Revalidations().proofsVerified.fetch_add(1, std::memory_order_relaxed);
         }
+    }
+    if (!fm2Trusted && FastMode2::On(RuntimeSwitch::Fm2Trust)) {
+        fm2ProvedPresent = Recorder::Presents();
+        FastMode2::Count().trustArmed.fetch_add(1, std::memory_order_relaxed);
     }
     c3Step(&C3Log::Split::imagesNs);
     const auto regionsDone = [&] { c3Step(&C3Log::Split::regionsNs); };
@@ -8094,6 +8137,11 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     }
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
+    const bool fm2Snap = FastMode2::On(RuntimeSwitch::Fm2Snap);
+    if (fm2Snap && moved.empty()) {
+        FastMode2::Count().snapSkipped.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
     guestMemory.InPlaceReads(reads);
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
@@ -8141,6 +8189,10 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             size = override->size;
         } else {
             if (movedOnly || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
+            if (fm2Snap) {
+                FastMode2::Count().snapSkipped.fetch_add(1, std::memory_order_relaxed);
+                continue;
+            }
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
             if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
         }

@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/IndexClamp_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/FastMode2.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -891,6 +892,7 @@ void printDrawWindow(DrawProfile& profile, const char* window) {
     }
     profile.reuseSeen = reuse;
     profile.leaseSeen = leases;
+    if (RuntimeSwitches::Set(RuntimeSwitch::Fm2) || RuntimeSwitches::Set(RuntimeSwitch::Fm2Trust) || RuntimeSwitches::Set(RuntimeSwitch::Fm2Snap) || RuntimeSwitches::Set(RuntimeSwitch::Fm2Target)) FastMode2::Report();
     profile.totalsUs.fill(0);
     profile.recordSubUs.fill(0);
     profile.maxUs.fill(0);
@@ -3417,7 +3419,38 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             // (GuestMemory::BumpCollectEpoch: ordering points of the queue, or every packet under
             // APS5_PACKET_EPOCH=1); the key scan runs on every lookup regardless. Lookups of a
             // millisecond or more are counted apart; the [texture] line says how many uploaded.
-            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&] {
+            binding.resident = refreshResidentTarget(context, state, color, outcome, profile, [&]() -> std::shared_ptr<StorageTexture> {
+                struct Fm2TargetMemo {
+                    ColorTarget color{};
+                    VkDevice device = VK_NULL_HANDLE;
+                    std::uint64_t present = ~0ull;
+                    std::uint64_t pendingSerial = 0;
+                    std::weak_ptr<StorageTexture> resident;
+                };
+                thread_local std::array<Fm2TargetMemo, 8> fm2Memo{};
+                const bool fm2Target = index < fm2Memo.size() && FastMode2::On(RuntimeSwitch::Fm2Target);
+                const auto sameTarget = [](const ColorTarget& a, const ColorTarget& b) {
+                    return a.address == b.address && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.tileMode == b.tileMode && a.elementBytes == b.elementBytes && a.dccAddress == b.dccAddress && a.cmaskAddress == b.cmaskAddress && a.surfaceAddress == b.surfaceAddress && a.surfaceExtent.width == b.surfaceExtent.width && a.surfaceExtent.height == b.surfaceExtent.height && a.mipCount == b.mipCount && a.mip == b.mip && a.depth == b.depth && a.arrayAddress == b.arrayAddress && a.arrayLastSlice == b.arrayLastSlice && a.arraySlice == b.arraySlice && a.layers == b.layers && a.pipeBankXor == b.pipeBankXor;
+                };
+                if (fm2Target) {
+                    FastMode2::Count().targetAsked.fetch_add(1, std::memory_order_relaxed);
+                    auto& memo = fm2Memo[index];
+                    if (memo.device == context.device && memo.present == Recorder::Presents() && memo.pendingSerial == StorageTexture::PendingSerial() && sameTarget(memo.color, color)) {
+                        if (auto held = memo.resident.lock(); held != nullptr && held->Cached()) {
+                            FastMode2::Count().targetReused.fetch_add(1, std::memory_order_relaxed);
+                            return held;
+                        }
+                    }
+                }
+                const auto fm2Remember = [&](const std::shared_ptr<StorageTexture>& resident) {
+                    if (!fm2Target) return;
+                    auto& memo = fm2Memo[index];
+                    memo.color = color;
+                    memo.device = context.device;
+                    memo.present = Recorder::Presents();
+                    memo.pendingSerial = StorageTexture::PendingSerial();
+                    memo.resident = resident;
+                };
                 if (color.arrayLastSlice != 0) {
                     Require(color.dccAddress == 0 && color.cmaskAddress == 0 && AttachmentProxyFormat(context, color.format) == VK_FORMAT_UNDEFINED, "a slice of a 2D array color target with DCC, CMASK or an attachment proxy has no resident array image");
                     const auto array = ArraySurfaceForTarget(color);
@@ -3428,11 +3461,13 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
                     Require(color.surfaceAddress == color.arrayAddress + color.arraySlice * sliceBytes, "the array image's layer pitch differs from the color view's slice offset");
                     auto resident = CachedStorageLayers(context, array, color.arraySlice, color.layers);
                     Require(resident->Attachable(), "storage format cannot be a color attachment");
+                    fm2Remember(resident);
                     return resident;
                 }
                 auto resident = CachedStorageSurface(context, SurfaceForTarget(color));
                 Require(resident->Attachable(), "storage format cannot be a color attachment");
                 Require(color.mipCount > 1 || color.depth > 1 || resident->GuestBytes() == colorLayout.Bytes(), "resident image layout differs from the color layout");
+                fm2Remember(resident);
                 return resident;
             });
         }
