@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_LOCKORDER_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_LOCKORDER_HPP
 
+#include <array>
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
@@ -125,6 +126,34 @@ CacheLock& CacheLockFor(Rank rank);
 
 // Whether a SplitMutex acquire takes its cache lock now: APS5_V3E_LOCK_SPLIT is set and the thread holds the record lock.
 bool SplitTakes();
+// APS5_V3E_LOCK_SPLIT_LEAF (start-time): the first phase (i) build's per-acquisition takes in SplitMutex (v3e-ab6/ab7:
+// ~110k takes per frame, +29 ms/frame of mutex). Unset, the cache locks are held per stage instead (StageHold).
+void SetLeafTakesForTest(bool enabled);
+// A draw commit's stage hold: with APS5_V3E_LOCK_SPLIT set (and not the leaf mode), while the record lock is held, the
+// draw caches' locks (texture, storage, resource-set, pipeline, depth/DCC) are taken exclusive once, in rank order,
+// for the whole stage.
+constexpr std::array<Rank, 5> StageRanks{Rank::Texture, Rank::Storage, Rank::ResourceSet, Rank::Pipeline, Rank::DepthDcc};
+class StageHold {
+public:
+    StageHold();
+    ~StageHold();
+    StageHold(const StageHold&) = delete;
+    StageHold& operator=(const StageHold&) = delete;
+    bool Held() const { return held; }
+
+private:
+    friend void RecordAcquired();
+    friend void RecordReleased();
+    void suspend();
+    void resume();
+    bool held = false;
+    bool suspended = false;
+    StageHold* previous = nullptr;
+};
+// A record-lock release at depth 1 (SyncThrough around a GPU wait) releases the thread's stage holds first, and
+// the next outermost acquire takes them again, so no cache lock is held while the record lock is not.
+void RecordAcquired();
+std::uint64_t StageSuspends();
 void CountSplitTake();
 [[noreturn]] void NestedTooDeep(Rank rank);
 

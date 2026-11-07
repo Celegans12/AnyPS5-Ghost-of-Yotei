@@ -2735,6 +2735,7 @@ void GpuMutexType::acquired() {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
         // A foreign hold breaks proofs (ProofSerial) but is not a cause of its own for the lever-A census.
         if (!proofThread) proofSerial.fetch_add(1, std::memory_order_acq_rel);
+        LockOrder::RecordAcquired();
     }
 }
 

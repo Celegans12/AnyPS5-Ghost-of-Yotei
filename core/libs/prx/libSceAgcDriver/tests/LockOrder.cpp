@@ -147,6 +147,7 @@ void Split() {
     LockOrder::SplitMutex<AgcDriver::Mutex, Rank::ResourceSet> mutex;
     auto& cache = CacheLockFor(Rank::ResourceSet);
     auto& record = GuestMemory::Record();
+    LockOrder::SetLeafTakesForTest(true);
     Switches::Assign(RuntimeSwitch::V3eLockSplit, false);
     {
         std::lock_guard recordHold(record);
@@ -189,6 +190,40 @@ void Split() {
         Expect(LockOrder::HeldOnThisThread(Rank::DepthDcc) == 2, "recursive inner: cache lock re-entered");
     }
     Expect(!CacheLockFor(Rank::DepthDcc).HeldByThisThread(), "recursive inner released");
+    LockOrder::SetLeafTakesForTest(false);
+    {
+        std::lock_guard recordHold(record);
+        std::lock_guard hold(mutex);
+        Expect(!cache.HeldByThisThread(), "stage mode: a leaf acquire takes no cache lock");
+    }
+    LockOrder::SetCheckForTest(true);
+    {
+        LockOrder::StageHold outside;
+        Expect(!outside.Held(), "no stage hold without the record lock");
+        record.lock();
+        {
+            LockOrder::StageHold stage;
+            Expect(stage.Held(), "stage hold under the record lock");
+            for (auto rank : LockOrder::StageRanks) Expect(CacheLockFor(rank).HeldExclusiveByThisThread(), std::string("stage holds ") + LockOrder::Name(rank));
+            const auto suspends = LockOrder::StageSuspends();
+            const auto releases = LockOrder::Totals().releasesHolding;
+            record.unlock();
+            Expect(!CacheLockFor(Rank::Texture).HeldByThisThread(), "a record release suspends the stage");
+            Expect(LockOrder::StageSuspends() == suspends + 1, "suspend counted");
+            Expect(LockOrder::Totals().releasesHolding == releases, "a suspended stage is no release-while-holding");
+            bool otherGot = false;
+            std::thread([&] {
+                otherGot = CacheLockFor(Rank::Storage).try_lock();
+                if (otherGot) CacheLockFor(Rank::Storage).unlock();
+            }).join();
+            Expect(otherGot, "another thread can take a suspended stage's cache lock");
+            record.lock();
+            Expect(CacheLockFor(Rank::DepthDcc).HeldExclusiveByThisThread(), "the next record acquire resumes the stage");
+        }
+        for (auto rank : LockOrder::StageRanks) Expect(!CacheLockFor(rank).HeldByThisThread(), std::string("stage released ") + LockOrder::Name(rank));
+        record.unlock();
+    }
+    LockOrder::SetCheckForTest(false);
     Switches::Assign(RuntimeSwitch::V3eLockSplit, false);
 }
 
@@ -335,6 +370,7 @@ void Bench() {
     LockOrder::SplitMutex<AgcDriver::Mutex, Rank::Texture> mutex;
     std::lock_guard record(GuestMemory::Record());
     constexpr int Rounds = 2000000;
+    LockOrder::SetLeafTakesForTest(true);
     for (const bool on : {false, true, false, true}) {
         Switches::Assign(RuntimeSwitch::V3eLockSplit, on);
         const auto start = std::chrono::steady_clock::now();
@@ -345,6 +381,14 @@ void Bench() {
         const auto ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Rounds;
         std::printf("bench: SplitMutex lock+unlock under the record lock, switch %s: %.1f ns\n", on ? "on" : "off", ns);
     }
+    LockOrder::SetLeafTakesForTest(false);
+    Switches::Assign(RuntimeSwitch::V3eLockSplit, true);
+    const auto start = std::chrono::steady_clock::now();
+    for (int i = 0; i < Rounds; ++i) {
+        const LockOrder::StageHold stage;
+    }
+    const auto ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Rounds;
+    std::printf("bench: StageHold (5 cache locks) per stage: %.1f ns%c", ns, 10);
     Switches::Assign(RuntimeSwitch::V3eLockSplit, false);
 }
 

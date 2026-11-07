@@ -93,7 +93,20 @@ void BeforeAcquire(Rank rank) {
     }
 }
 
+namespace {
+thread_local StageHold* activeStage = nullptr;
+std::atomic<std::uint64_t> stageSuspends{0};
+}
+
+void RecordAcquired() {
+    if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eLockSplit)) return;
+    for (auto* stage = activeStage; stage != nullptr; stage = stage->previous) stage->resume();
+}
+
 void RecordReleased() {
+    if (Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eLockSplit)) {
+        for (auto* stage = activeStage; stage != nullptr; stage = stage->previous) stage->suspend();
+    }
     if (!CheckEnabled()) return;
     const auto& locks = Thread();
     for (std::size_t i = 1; i < RankCount; ++i) {
@@ -248,8 +261,58 @@ CacheLock& CacheLockFor(Rank rank) {
     std::abort();
 }
 
+namespace {
+std::atomic<int> leafState{-1};
+bool leafTakes() {
+    int state = leafState.load(std::memory_order_relaxed);
+    if (state < 0) {
+        state = std::getenv("APS5_V3E_LOCK_SPLIT_LEAF") != nullptr ? 1 : 0;
+        leafState.store(state, std::memory_order_relaxed);
+    }
+    return state == 1;
+}
+}
+
+void SetLeafTakesForTest(bool enabled) {
+    leafState.store(enabled ? 1 : 0, std::memory_order_relaxed);
+}
+
 bool SplitTakes() {
-    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eLockSplit) && GuestMemory::GpuMutex().HeldByThisThread();
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eLockSplit) && leafTakes() && GuestMemory::GpuMutex().HeldByThisThread();
+}
+
+StageHold::StageHold() {
+    if (!Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eLockSplit) || leafTakes() || !GuestMemory::GpuMutex().HeldByThisThread()) return;
+    for (auto rank : StageRanks) CacheLockFor(rank).lock();
+    held = true;
+    previous = activeStage;
+    activeStage = this;
+    CountSplitTake();
+}
+
+StageHold::~StageHold() {
+    if (!held) return;
+    activeStage = previous;
+    if (!suspended) {
+        for (auto it = StageRanks.rbegin(); it != StageRanks.rend(); ++it) CacheLockFor(*it).unlock();
+    }
+}
+
+void StageHold::suspend() {
+    if (suspended) return;
+    for (auto it = StageRanks.rbegin(); it != StageRanks.rend(); ++it) CacheLockFor(*it).unlock();
+    suspended = true;
+    stageSuspends.fetch_add(1, std::memory_order_relaxed);
+}
+
+void StageHold::resume() {
+    if (!suspended) return;
+    for (auto rank : StageRanks) CacheLockFor(rank).lock();
+    suspended = false;
+}
+
+std::uint64_t StageSuspends() {
+    return stageSuspends.load(std::memory_order_relaxed);
 }
 
 void CountSplitTake() {
@@ -257,7 +320,7 @@ void CountSplitTake() {
     if (++batch < 1024) return;
     batch = 0;
     const auto takes = splitTakes.fetch_add(1024, std::memory_order_relaxed) + 1024;
-    if ((takes & 0xfffffu) == 0) std::fprintf(stderr, "[lock-split] %llu cache-lock takes under the record lock, %llu contended, %llu violations, %llu record releases holding a cache lock\n", static_cast<unsigned long long>(takes), static_cast<unsigned long long>(contended.load(std::memory_order_relaxed)), static_cast<unsigned long long>(violations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(releasesHolding.load(std::memory_order_relaxed)));
+    if ((takes & 0xffffu) == 0) std::fprintf(stderr, "[lock-split] %llu cache-lock takes (stage holds, or leaf takes in APS5_V3E_LOCK_SPLIT_LEAF), %llu stage suspends at a record release, %llu contended, %llu violations, %llu record releases holding a cache lock\n", static_cast<unsigned long long>(takes), static_cast<unsigned long long>(stageSuspends.load(std::memory_order_relaxed)),static_cast<unsigned long long>(contended.load(std::memory_order_relaxed)), static_cast<unsigned long long>(violations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(releasesHolding.load(std::memory_order_relaxed)));
 }
 
 void NestedTooDeep(Rank rank) {

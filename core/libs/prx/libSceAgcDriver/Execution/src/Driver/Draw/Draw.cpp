@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CommandMix.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentCensus.hpp"
@@ -294,10 +295,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     phaseTiming.Phase(DrawRowPrecheck);
 
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+    std::optional<AgcDriver::LockOrder::StageHold> stageHold;
     if (lockedPrepare) {
 
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
+        stageHold.emplace();
         timing.Mark("gpu_mutex_wait");
         phaseTiming.Phase(DrawRowLockWait);
         if (device == nullptr) device = std::make_shared<VulkanDevice>();
@@ -966,6 +969,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
+        stageHold.emplace();
         timing.Mark("gpu_mutex_wait");
         phaseTiming.Phase(DrawRowLockWait);
 
@@ -1314,6 +1318,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    const AgcDriver::LockOrder::StageHold stageHold;
     if (auto current = device.Load(); current != nullptr && current != localDevice) {
         localDevice = std::move(current);
         prepared = nullptr;
