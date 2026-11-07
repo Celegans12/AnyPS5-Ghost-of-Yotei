@@ -106,6 +106,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_V3E_DEEP_PIPELINE",
     "APS5_V3E_MID_PIPELINE",
     "APS5_V3M_ADDR_CEIL",
+    "APS5_V3M_PROBE_MEMO",
 };
 
 struct Refusal {

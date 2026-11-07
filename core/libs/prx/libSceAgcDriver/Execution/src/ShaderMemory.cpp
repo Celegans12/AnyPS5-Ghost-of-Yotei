@@ -9,6 +9,11 @@
 #include "Optimization/ResourceProgram.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <string_view>
 #include <algorithm>
 #include <atomic>
 #include <bit>
@@ -459,14 +464,105 @@ bool ShaderMemory::accessibleProbe(ShaderMemory& self, std::uint64_t address, st
     return true;
 }
 
+namespace probeMemo {
+
+int Mode() {
+    static const int checked = [] {
+        const char* value = std::getenv("APS5_V3M_PROBE_MEMO");
+        if (value == nullptr) return 0;
+        const std::string_view text(value);
+        if (text == "throw") return 3;
+        if (text == "verify") return 2;
+        return 1;
+    }();
+    if (checked >= 2) return checked;
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3mProbeMemo) ? 1 : 0;
+}
+
+struct Counts {
+    std::atomic<std::uint64_t> probes{0}, hits{0}, seeded{0}, refused{0}, verified{0}, violations{0};
+};
+
+Counts& counts() {
+    static Counts value;
+    return value;
+}
+
+bool PageQuiet(std::uint64_t base, std::uint64_t generation) {
+    if (DriverDetail::DrawPipeline::Active()) {
+        auto& pipeline = DriverDetail::DrawPipeline::Queue0();
+        if (pipeline.Busy() && pipeline.Overlaps(base, 4096)) return false;
+    }
+    DriverDetail::PendingView view;
+    view.Load();
+    if (view.Overlaps(base, 4096)) return false;
+    return Graphics::Recorder::PublishGeneration() == generation;
+}
+
+void Report() {
+    static std::atomic<std::chrono::steady_clock::rep> next{0};
+    const auto now = std::chrono::steady_clock::now().time_since_epoch().count();
+    auto due = next.load(std::memory_order_relaxed);
+    if (now < due || !next.compare_exchange_strong(due, now + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::seconds(10)).count(), std::memory_order_relaxed)) return;
+    auto& c = counts();
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    const auto probes = take(c.probes), hits = take(c.hits), seeded = take(c.seeded), refused = take(c.refused), verified = take(c.verified), violations = take(c.violations);
+    AgcDriver::ProfilePrint_nid_no_patch("[v3m-probes] 10 s, mode %d: %llu pending probes inside one page, %llu answered from the capture's quiet pages (%.1f %%), %llu pages marked quiet, %llu not (pipeline or pending writes over the page); verify %llu, VIOLATIONS %llu\n", Mode(), probes, hits, probes == 0 ? 0.0 : 100.0 * static_cast<double>(hits) / static_cast<double>(probes), seeded, refused, verified, violations);
+}
+
+}
+
 bool ShaderMemory::pending(void* context, std::uint64_t address, std::uint64_t bytes) {
     const auto& self = *static_cast<const ShaderMemory*>(context);
     if (self.pendingWrite == nullptr || bytes == 0) {
         if (self.recordProbes) self.probes.push_back({address, bytes, true, false});
         return false;
     }
+    const int memo = probeMemo::Mode();
+    const auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1);
+    const bool onePage = memo != 0 && self.pendingSpan == &DriverDetail::Driver::QueryPendingSpan && address <= std::numeric_limits<std::uint64_t>::max() - bytes && (address + bytes - 1) / PageBytes == address / PageBytes;
+    std::uint64_t generation = 0;
+    bool quiet = false;
+    if (onePage) {
+        auto& counts = probeMemo::counts();
+        counts.probes.fetch_add(1, std::memory_order_relaxed);
+        generation = Graphics::Recorder::PublishGeneration();
+        if (self.quietGeneration != generation) {
+            self.quietPages.clear();
+            self.quietGeneration = generation;
+        }
+        quiet = std::find(self.quietPages.begin(), self.quietPages.end(), base) != self.quietPages.end();
+        if (quiet) {
+            counts.hits.fetch_add(1, std::memory_order_relaxed);
+            if (memo == 1) {
+                if (self.recordProbes) self.probes.push_back({address, bytes, true, false});
+                probeMemo::Report();
+                return false;
+            }
+        }
+    }
     const auto policy = self.pendingWrite(address, static_cast<std::size_t>(bytes), {});
     const bool answer = policy == PendingWrite::Sync || policy == PendingWrite::VerifyRaw || policy == PendingWrite::VerifyKnownValue;
+    if (onePage) {
+        auto& counts = probeMemo::counts();
+        if (quiet) {
+            counts.verified.fetch_add(1, std::memory_order_relaxed);
+            if (policy != PendingWrite::None) {
+                counts.violations.fetch_add(1, std::memory_order_relaxed);
+                static std::atomic<std::uint32_t> printed{0};
+                if (printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[v3m-probes] verify: 0x%llx+0x%llx answered from a quiet page but the probe says pending (policy %d)\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<int>(policy));
+                if (memo == 3) throw std::runtime_error("APS5_V3M_PROBE_MEMO=throw: a quiet page had a pending write");
+            }
+        } else if (policy == PendingWrite::None) {
+            if (probeMemo::PageQuiet(base, generation)) {
+                self.quietPages.push_back(base);
+                counts.seeded.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                counts.refused.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        probeMemo::Report();
+    }
     if (self.recordProbes) self.probes.push_back({address, bytes, true, answer});
     return answer;
 }
@@ -652,6 +748,178 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::Capture(c
     return capture(invocation.Request(), nullptr, &invocation);
 }
 
+
+namespace captureCensus {
+
+bool Enabled() {
+    static const bool enabled = std::getenv("APS5_V3M_CAPTURE_CENSUS") != nullptr;
+    return enabled;
+}
+
+struct Reads {
+    const ShaderRecompiler::SrtRuntime* inner = nullptr;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> words;
+};
+
+bool readMemory(void* context, std::uint64_t address, std::uint32_t* value) {
+    auto& reads = *static_cast<Reads*>(context);
+    const bool ok = reads.inner->readMemory(reads.inner->userContext, address, value);
+    if (ok) reads.words.emplace_back(address, *value);
+    return ok;
+}
+
+bool readSpecializationMemory(void* context, std::uint64_t address, std::uint32_t* value) {
+    auto& reads = *static_cast<Reads*>(context);
+    const bool ok = reads.inner->readSpecializationMemory(reads.inner->userContext, address, value);
+    if (ok) reads.words.emplace_back(address, *value);
+    return ok;
+}
+
+bool accessible(void* context, std::uint64_t address, std::uint64_t bytes) {
+    auto& reads = *static_cast<Reads*>(context);
+    return reads.inner->accessible(reads.inner->userContext, address, bytes);
+}
+
+bool pendingWrite(void* context, std::uint64_t address, std::uint64_t bytes) {
+    auto& reads = *static_cast<Reads*>(context);
+    return reads.inner->pendingWrite(reads.inner->userContext, address, bytes);
+}
+
+bool readWords(void* context, std::uint64_t address, std::uint32_t* values, std::uint64_t count) {
+    auto& reads = *static_cast<Reads*>(context);
+    const bool ok = reads.inner->readWords(reads.inner->userContext, address, values, count);
+    if (ok) {
+        for (std::uint64_t i = 0; i < count; ++i) reads.words.emplace_back(address + 4 * i, values[i]);
+    }
+    return ok;
+}
+
+ShaderRecompiler::SrtWriteStamp stampWrites(void* context, std::uint64_t address, std::uint64_t bytes) {
+    auto& reads = *static_cast<Reads*>(context);
+    return reads.inner->stampWrites(reads.inner->userContext, address, bytes);
+}
+
+bool unchangedSince(void* context, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp) {
+    auto& reads = *static_cast<Reads*>(context);
+    return reads.inner->unchangedSince(reads.inner->userContext, address, bytes, stamp);
+}
+
+bool supplyWords(void* context, const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>& words) {
+    auto& reads = *static_cast<Reads*>(context);
+    return reads.inner->supplyWords(reads.inner->userContext, words);
+}
+
+ShaderRecompiler::SrtRuntime Wrap(const ShaderRecompiler::SrtRuntime& runtime, Reads& reads) {
+    reads.inner = &runtime;
+    reads.words.clear();
+    auto wrapped = runtime;
+    wrapped.userContext = &reads;
+    if (runtime.readMemory != nullptr) wrapped.readMemory = &readMemory;
+    if (runtime.readSpecializationMemory != nullptr) wrapped.readSpecializationMemory = &readSpecializationMemory;
+    if (runtime.accessible != nullptr) wrapped.accessible = &accessible;
+    if (runtime.pendingWrite != nullptr) wrapped.pendingWrite = &pendingWrite;
+    if (runtime.readWords != nullptr) wrapped.readWords = &readWords;
+    if (runtime.stampWrites != nullptr) wrapped.stampWrites = &stampWrites;
+    if (runtime.unchangedSince != nullptr) wrapped.unchangedSince = &unchangedSince;
+    if (runtime.supplyWords != nullptr) wrapped.supplyWords = &supplyWords;
+    return wrapped;
+}
+
+struct Seen {
+    std::uint64_t userData = 0;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> words;
+    std::uint64_t captures = 0;
+};
+
+struct State {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, Seen> plans;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    std::uint64_t captures = 0, repeats = 0, sameUserData = 0, sameCount = 0, sameAddresses = 0, sameAll = 0, staticStable = 0, words = 0, staticWords = 0, staticChanged = 0, nanoseconds = 0, sameAllNanoseconds = 0, staticStableNanoseconds = 0;
+};
+
+State& state() {
+    static auto* value = new State;
+    return *value;
+}
+
+std::uint64_t mix(std::uint64_t hash, std::uint64_t value) {
+    hash ^= value + 0x9e3779b97f4a7c15ull + (hash << 6u) + (hash >> 2u);
+    return hash * 0xff51afd7ed558ccdull;
+}
+
+void Note(std::uint64_t key, std::span<const std::uint32_t> userData, std::uint64_t usedMask, const Reads& reads, std::uint64_t nanoseconds) {
+    std::uint64_t used = 0;
+    for (std::size_t i = 0; i < userData.size() && i < 64; ++i) {
+        if ((usedMask >> i) & 1u) used = mix(used, (static_cast<std::uint64_t>(i) << 32) | userData[i]);
+    }
+    if (usedMask == ~std::uint64_t{0}) {
+        for (const auto word : userData) used = mix(used, word);
+    }
+    auto& census = state();
+    std::lock_guard lock(census.mutex);
+    auto& seen = census.plans[key];
+    ++census.captures;
+    census.words += reads.words.size();
+    census.nanoseconds += nanoseconds;
+    if (seen.captures != 0) {
+        ++census.repeats;
+        const bool sameUser = seen.userData == used;
+        if (sameUser) ++census.sameUserData;
+        if (seen.words.size() == reads.words.size()) {
+            ++census.sameCount;
+            bool addresses = true, all = sameUser, stable = true;
+            for (std::size_t i = 0; i < reads.words.size(); ++i) {
+                const bool sameAddress = seen.words[i].first == reads.words[i].first;
+                const bool sameValue = seen.words[i].second == reads.words[i].second;
+                addresses = addresses && sameAddress;
+                all = all && sameAddress && sameValue;
+                if (sameAddress) {
+                    ++census.staticWords;
+                    if (!sameValue) {
+                        ++census.staticChanged;
+                        stable = false;
+                    }
+                }
+            }
+            if (addresses) ++census.sameAddresses;
+            if (all) {
+                ++census.sameAll;
+                census.sameAllNanoseconds += nanoseconds;
+            }
+            if (stable) {
+                ++census.staticStable;
+                census.staticStableNanoseconds += nanoseconds;
+            }
+        }
+    }
+    seen.userData = used;
+    seen.words = reads.words;
+    ++seen.captures;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - census.last < std::chrono::seconds(10)) return;
+    census.last = now;
+    std::vector<std::uint64_t> perPlan;
+    perPlan.reserve(census.plans.size());
+    for (const auto& [plan, value] : census.plans) perPlan.push_back(value.captures);
+    std::sort(perPlan.begin(), perPlan.end(), std::greater<>());
+    std::uint64_t all = 0, top = 0;
+    for (std::size_t i = 0; i < perPlan.size(); ++i) {
+        all += perPlan[i];
+        if (i < 32) top += perPlan[i];
+    }
+    const auto n = census.captures == 0 ? 1.0 : static_cast<double>(census.captures);
+    const auto r = census.repeats == 0 ? 1.0 : static_cast<double>(census.repeats);
+    const auto t = census.nanoseconds == 0 ? 1.0 : static_cast<double>(census.nanoseconds);
+    AgcDriver::ProfilePrint_nid_no_patch("[v3m-capture] 10 s: %llu captures (%.1f us each, %.0f words read) over %zu shaders (top 32: %.1f %% of captures so far); of %llu repeats of a shader: same used user data %.1f %%, same read count %.1f %%, same addresses %.1f %%, same addresses, values and user data (whole-result memo bound) %.1f %% (%.1f %% of capture time); words at an unchanged address %.1f %% of reads, %.2f %% of them changed value; repeats whose unchanged-address words all kept their value (replay guard bound) %.1f %% (%.1f %% of capture time)\n",
+        static_cast<unsigned long long>(census.captures), static_cast<double>(census.nanoseconds) / n / 1e3, static_cast<double>(census.words) / n, census.plans.size(), all == 0 ? 0.0 : 100.0 * static_cast<double>(top) / static_cast<double>(all),
+        static_cast<unsigned long long>(census.repeats), 100.0 * census.sameUserData / r, 100.0 * census.sameCount / r, 100.0 * census.sameAddresses / r, 100.0 * census.sameAll / r, 100.0 * census.sameAllNanoseconds / t,
+        census.words == 0 ? 0.0 : 100.0 * census.staticWords / static_cast<double>(census.words), census.staticWords == 0 ? 0.0 : 100.0 * census.staticChanged / static_cast<double>(census.staticWords), 100.0 * census.staticStable / r, 100.0 * census.staticStableNanoseconds / t);
+    census.captures = census.repeats = census.sameUserData = census.sameCount = census.sameAddresses = census.sameAll = census.staticStable = census.words = census.staticWords = census.staticChanged = census.nanoseconds = census.sameAllNanoseconds = census.staticStableNanoseconds = 0;
+}
+
+}
+
 std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(const ShaderRecompiler::RecompileRequest& request, const ShaderRecompiler::SourceHandle* handle, const ShaderRecompiler::PreparedShaderInvocation* invocation) {
     // The capture's word and page reads (through `read`) are attributed to it ([hooksync], [guestmem]).
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::Capture);
@@ -672,7 +940,14 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.stampWrites = &stampWrites;
     runtime.unchangedSince = &unchangedSince;
     runtime.supplyWords = &supplyWords;
-    auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+    quietPages.clear();
+    quietGeneration = ~std::uint64_t{0};
+    thread_local captureCensus::Reads censusReads;
+    const bool census = captureCensus::Enabled();
+    const auto censusRuntime = census ? captureCensus::Wrap(runtime, censusReads) : runtime;
+    const auto& used = census ? censusRuntime : runtime;
+    auto capture = invocation != nullptr ? invocation->Capture(used) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, used, *handle) : ShaderRecompiler::CaptureResources(request, used);
+    if (census) captureCensus::Note(request.shader.codeAddress ^ (static_cast<std::uint64_t>(request.shader.stage) << 56), request.context.userData, capture->userDataUse.asBase | capture->userDataUse.asValue, censusReads, NanosecondsSince(started));
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);
         totals.resolveNanoseconds += capture->sourceNanoseconds;
