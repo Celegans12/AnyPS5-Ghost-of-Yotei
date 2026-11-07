@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/C3Log.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
@@ -163,7 +164,7 @@ struct CachedTexture {
 // eviction takes the back. APS5_NO_TEXTURE_HASH=1 finds entries by scanning the list (the index is
 // still kept), the linear lookup of before.
 struct TextureCache {
-    AgcDriver::Mutex mutex;
+    AgcDriver::LockOrder::SplitMutex<AgcDriver::Mutex, AgcDriver::LockOrder::Rank::Texture> mutex;
     std::list<CachedTexture> entries;
     std::unordered_map<TextureKey, std::list<CachedTexture>::iterator, TextureKeyHash> index;
     std::unordered_multimap<const StorageTexture*, std::list<CachedTexture>::iterator> views;
@@ -311,7 +312,7 @@ struct SampledCacheLock {
     }
     SampledCacheLock(const SampledCacheLock&) = delete;
     SampledCacheLock& operator=(const SampledCacheLock&) = delete;
-    std::unique_lock<AgcDriver::Mutex> lock;
+    std::unique_lock<decltype(TextureCache::mutex)> lock;
     bool owner = false;
 };
 
@@ -2136,7 +2137,7 @@ struct CachedStorageTexture {
 
 // As TextureCache: use order with a hash index by key, plus one by image for StorageImageCached.
 struct StorageTextureCache {
-    AgcDriver::Mutex mutex;
+    AgcDriver::LockOrder::SplitMutex<AgcDriver::Mutex, AgcDriver::LockOrder::Rank::Storage> mutex;
     std::list<CachedStorageTexture> entries;
     std::unordered_map<StorageKey, std::list<CachedStorageTexture>::iterator, StorageKeyHash> index;
     std::unordered_map<const StorageTexture*, std::list<CachedStorageTexture>::iterator> byImage;

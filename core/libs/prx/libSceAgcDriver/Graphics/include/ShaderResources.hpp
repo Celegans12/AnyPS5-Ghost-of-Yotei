@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_SHADERRESOURCES_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
@@ -925,7 +926,7 @@ private:
             return static_cast<std::size_t>(hash);
         }
     };
-    mutable AgcDriver::Mutex mutex;
+    mutable AgcDriver::LockOrder::SplitMutex<AgcDriver::Mutex, AgcDriver::LockOrder::Rank::ResourceSet> mutex;
     std::list<std::pair<Key, std::shared_ptr<ShaderResources>>> entries;
     std::unordered_map<Key, decltype(entries)::iterator, KeyHash> index;
     // The entries by each sampled texture they bind (once per entry): RemoveTextures without a scan.

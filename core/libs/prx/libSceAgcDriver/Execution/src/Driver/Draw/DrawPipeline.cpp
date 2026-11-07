@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileWindows.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -196,7 +197,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     std::unique_lock lock(mutex);
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
-    if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
+    if (jobs.size() >= depth && AgcDriver::LockOrder::MustNotWait()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
     idle.wait(lock, [&] { return jobs.size() < depth; });
     jobs.push_back(std::move(job));
     pending.push_back(std::move(held));
@@ -244,14 +245,14 @@ void DrawFinisher::run() {
 
 void DrawFinisher::Settle() {
     if (!Busy() || OnFinisherThread()) return;
-    if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher settle under the GPU lock");
+    if (AgcDriver::LockOrder::MustNotWait()) throw std::runtime_error("draw finisher settle under the GPU lock");
     std::unique_lock lock(mutex);
     idle.wait(lock, [&] { return jobs.empty(); });
 }
 
 void DrawFinisher::Drain() {
     if (OnFinisherThread()) return;
-    if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    if (Busy() && AgcDriver::LockOrder::MustNotWait()) throw std::runtime_error("draw finisher drain under the GPU lock");
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
@@ -425,7 +426,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     // commit in order, so the switch is exact and may flip at any enqueue.
     const auto room = Depth() == 0 ? std::size_t{0} : Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eDeepPipeline) ? std::max<std::size_t>(Depth(), 256) : Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eMidPipeline) ? std::max<std::size_t>(Depth(), 128) : Depth();
     if (items.size() >= room) {
-        if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
+        if (AgcDriver::LockOrder::MustNotWait()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
         resumeAt = room - 1;
         ++idleWaiters;
@@ -674,7 +675,7 @@ void DrawPipeline::ReleaseRetired() {
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
-    if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
+    if ((finisherBusy || Busy()) && AgcDriver::LockOrder::MustNotWait()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     if (finisherBusy) DrawFinisher::Get().Drain();
     if (!Busy()) return;
     const auto start = std::chrono::steady_clock::now();

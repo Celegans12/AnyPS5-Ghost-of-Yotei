@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/DevicePageTable.hpp"
 #include "prx/libSceAgcDriver/Execution/src/Driver/NewPath/ResolvedPush.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencySession.hpp"
@@ -193,7 +194,7 @@ void CreateComputePipeline(VkDevice device, PFN_vkCreateComputePipelines create,
     subgroup.requiredSubgroupSize = subgroupSize;
     if (subgroupSize != 0) info.stage.pNext = &subgroup;
     info.layout = layout;
-    const auto admitted = Graphics::PipelineCreationGate::Shared().Admit(words, !GuestMemory::GpuMutex().HeldByThisThread());
+    const auto admitted = Graphics::PipelineCreationGate::Shared().Admit(words, !AgcDriver::LockOrder::MustNotWait());
     auto cacheLock = synchronization != nullptr ? synchronization->LockForPipelineUse() : Graphics::PipelineCacheSynchronization::PipelineUseLock{};
     check(create(device, cache, 1, &info, nullptr, pipeline), "vkCreateComputePipelines");
     PerformanceCounters::CountPipeline();
@@ -556,7 +557,7 @@ struct VulkanDevice::State {
     // dispatch's find-or-insert and the verify switch's lookups touch the map, recipes hold weak
     // references to its objects.
     std::atomic<bool> verifyComputeLayouts{false};
-    AgcDriver::Mutex computePipelinesMutex;
+    AgcDriver::LockOrder::SplitMutex<AgcDriver::Mutex, AgcDriver::LockOrder::Rank::Pipeline> computePipelinesMutex;
     std::map<ComputePipelineKey, std::shared_ptr<ComputePipelineObjects>> computePipelines;
     std::map<ComputePipelineKey, std::shared_future<std::shared_ptr<ComputePipelineObjects>>> computePipelinesBuilding;
     // The journal replay building this device's pipelines on its own threads; drained first at teardown.

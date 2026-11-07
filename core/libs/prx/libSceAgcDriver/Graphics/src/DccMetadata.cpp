@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -159,7 +160,7 @@ struct GpuKeyStore {
 };
 
 struct KeyStoreMemo {
-    AgcDriver::Mutex mutex;
+    AgcDriver::LockOrder::SplitMutex<AgcDriver::Mutex, AgcDriver::LockOrder::Rank::DepthDcc> mutex;
     std::vector<GpuKeyStore> entries;
     const Recorder* recorder = nullptr;
 };

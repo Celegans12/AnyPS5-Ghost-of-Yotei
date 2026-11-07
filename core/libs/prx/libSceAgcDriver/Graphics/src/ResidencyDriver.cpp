@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyDriver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -160,7 +161,7 @@ void ResidencyDriver::DisableFaults() {
 }
 
 void ResidencyDriver::AccessFault(std::uint64_t address) {
-    if (GuestMemory::GpuMutex().HeldByThisThread() || faultServer == nullptr) {
+    if (AgcDriver::LockOrder::MustNotWait() || faultServer == nullptr) {
         refusedFaults.fetch_add(1, std::memory_order_relaxed);
         return;
     }

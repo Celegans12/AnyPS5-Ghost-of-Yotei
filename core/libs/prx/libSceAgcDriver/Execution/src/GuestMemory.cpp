@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
@@ -2756,6 +2757,7 @@ std::uint64_t GpuHoldSerial() {
 void GpuMutexType::unlock() {
     const bool outermost = --depth == 0;
     if (outermost) {
+        LockOrder::RecordReleased();
         owner.store(nullptr, std::memory_order_relaxed);
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
@@ -2785,6 +2787,7 @@ void AssertGpuLockHeld(const char* where) {
 }
 
 void GpuMutexType::lock() {
+    if (LockOrder::CheckEnabled() && !HeldByThisThread()) LockOrder::BeforeAcquire(LockOrder::Rank::Record);
     if (!GpuLockProfiled()) {
         auto* trace = PerformanceTrace::Recording() ? PerformanceTrace::Thread() : nullptr;
         if (trace == nullptr) {

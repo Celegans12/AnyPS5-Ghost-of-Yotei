@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
@@ -1682,8 +1683,8 @@ bool sameSurface(const DepthTarget& a, const DepthTarget& b) {
     return a.address == b.address && a.stencilAddress == b.stencilAddress && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.samples == b.samples && a.htileAddress == b.htileAddress && a.htileStencil == b.htileStencil && a.stencilSwizzle == b.stencilSwizzle && (a.samples == 1u || (a.depthSwizzle == b.depthSwizzle && a.pipeBankXor == b.pipeBankXor && a.firstSlice == b.firstSlice && a.lastSlice == b.lastSlice && a.iterate256 == b.iterate256 && a.htilePipeAligned == b.htilePipeAligned && a.htileVrsEncoding == b.htileVrsEncoding && a.htileDepthOnly == b.htileDepthOnly));
 }
 
-std::recursive_mutex& surfacesMutex() {
-    static std::recursive_mutex mutex;
+AgcDriver::LockOrder::SplitMutex<std::recursive_mutex, AgcDriver::LockOrder::Rank::DepthDcc>& surfacesMutex() {
+    static AgcDriver::LockOrder::SplitMutex<std::recursive_mutex, AgcDriver::LockOrder::Rank::DepthDcc> mutex;
     return mutex;
 }
 
