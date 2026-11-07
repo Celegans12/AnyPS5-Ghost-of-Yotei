@@ -5346,7 +5346,6 @@ ShaderResources::Ahead ShaderResources::ProveAhead(std::span<const CompiledShade
         if (std::any_of(pending.begin(), pending.end(), [](const StorageTexture::PendingQuery& query) { return query.overlaps; })) return Ahead::Pending;
     }
     if (!GuestMemory::UnchangedSinceAll(queries)) return Ahead::Changed;
-    if (!StorageImagesCached(context, images)) return Ahead::Evicted;
     if (!directRegions.empty() || !guestMemory.Writes().empty()) {
         pending.clear();
         for (const auto& region : directRegions) pending.push_back({region.begin, region.end, nullptr, nullptr, false});
