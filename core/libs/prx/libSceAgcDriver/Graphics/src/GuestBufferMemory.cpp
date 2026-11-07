@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -453,6 +454,7 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     // size); the holder below outlives the batch that copies them.
     RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
     ++state.epoch;
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Imports);
     state.liveBytes -= it->second.pinnedBytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
 #ifdef _WIN32
@@ -1873,7 +1875,10 @@ const HostImport* importJoined(const Context& context, HostImports& state, std::
     const auto existing = state.imports.find(run.base);
     const bool existed = existing != state.imports.end() && sameRun(existing->second, run);
     const auto* entry = importRunAt(context, state, std::move(run), true, begin, lease, end, true, ImportRequester::Join);
-    if (entry != nullptr && !existed) ++state.epoch;
+    if (entry != nullptr && !existed) {
+        ++state.epoch;
+        GuestMemory::BumpRegistry(GuestMemory::Registry::Imports);
+    }
     return entry;
 }
 
@@ -2128,6 +2133,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
 #endif
     ++state.inserts;
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Imports);
     const auto inserted = state.imports.emplace(base, entry);
     owner.armed = false;
     return &inserted.first->second;
@@ -2176,6 +2182,7 @@ void refreshImports(const Context& context, HostImports& state, const GuestAlloc
         state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
         state.refreshedGeneration = 0;
         ++state.epoch;
+        GuestMemory::BumpRegistry(GuestMemory::Registry::Imports);
     }
     if (state.destroyBuffer == nullptr) state.destroyBuffer = context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer");
     if (state.freeMemory == nullptr) state.freeMemory = context.Function<PFN_vkFreeMemory>("vkFreeMemory");
@@ -3700,6 +3707,7 @@ void ClearHostImports(VkDevice device) {
     state.device = VK_NULL_HANDLE;
     state.refreshedGeneration = 0;
     ++state.epoch;
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Imports);
 }
 
 namespace {

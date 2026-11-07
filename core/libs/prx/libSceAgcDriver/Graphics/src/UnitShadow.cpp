@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
@@ -327,6 +328,7 @@ void verifyPublished(const UnitShadow& shadow, const std::vector<SlabCopies>& co
 
 // The publish of one shadow: `selected[k]` (k = unit - first) names the units the scope chose.
 std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_t first, std::uint64_t last, const std::vector<std::uint8_t>& selected, PublishReason reason) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Shadows);
     auto& registry = Registry();
     std::vector<SlabCopies> copies;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
@@ -421,6 +423,7 @@ std::size_t publishRange(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
 // when nothing can be freed (a pinned slab is a destination of the write-back in progress: its
 // copies are recorded into it after this decision).
 bool evictOne(Shadows& registry) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Shadows);
     std::shared_ptr<UnitShadow> victim;
     std::size_t victimSlab = 0;
     {
@@ -745,6 +748,7 @@ std::vector<ShadowRun> ShadowSources(const Context& context, const HostImport& i
 }
 
 void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Shadows);
     if (!UnitShadowEnabled() || ranges.empty() || generation == 0) return;
     auto& registry = Registry();
     std::uint64_t bytes = 0;
@@ -785,6 +789,7 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
 }
 
 void RetireShadow(VkDevice device, const HostImport& import, const std::function<bool(std::uint64_t, std::uint64_t)>& registered) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Shadows);
     if (!UnitShadowEnabled()) return;
     auto& registry = Registry();
     std::shared_ptr<UnitShadow> shadow;
@@ -849,6 +854,7 @@ void PublishAllShadows(const Context& context, PublishReason reason) {
 }
 
 void DestroyShadows(VkDevice device) {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Shadows);
     auto& registry = Registry();
     std::lock_guard lock(registry.mutex);
     for (auto it = registry.byBase.begin(); it != registry.byBase.end();) {

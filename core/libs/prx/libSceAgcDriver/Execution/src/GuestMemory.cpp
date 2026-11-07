@@ -1,4 +1,3 @@
-#include "prx/libSceAgcDriver/Graphics/include/HomeCensus.hpp"
 #include "prx/libc/include/GuestDirty.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -58,6 +57,8 @@
 #endif
 
 namespace AgcDriver::GuestMemory {
+
+std::atomic<void (*)(std::uint64_t, std::uint64_t)> driverWriteObserver{nullptr};
 namespace {
 thread_local ISpeculativeReadGate* speculativeGate = nullptr;
 thread_local std::size_t speculativePins = 0;
@@ -3137,7 +3138,7 @@ void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> cur
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
     requireNotSpeculative("store");
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    Graphics::FaultCensus::DriverWrite(address, current.size());
+    if (const auto observer = driverWriteObserver.load(std::memory_order_acquire)) observer(address, current.size());
     DirtyMark(address, current.size());
     BreakProofs();
     if (current.empty()) return;
@@ -3376,7 +3377,7 @@ bool CommittedBlocksMatchSince(std::uint64_t address, std::size_t bytes, std::sp
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment) {
     requireNotSpeculative("store");
     if (source.empty()) return;
-    Graphics::FaultCensus::DriverWrite(address, source.size());
+    if (const auto observer = driverWriteObserver.load(std::memory_order_acquire)) observer(address, source.size());
     DirtyMark(address, source.size());
     // A store, as in WriteChanged.
     const ReadSiteScope site(ReadSite::Store);
@@ -3433,6 +3434,10 @@ int dirtyVerifyMode() {
     return mode;
 }
 
+}
+
+void SetDriverWriteObserver(void (*observer)(std::uint64_t address, std::uint64_t bytes)) {
+    driverWriteObserver.store(observer, std::memory_order_release);
 }
 
 bool DirtyEnabled() {

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -5807,6 +5808,7 @@ StorageTexture::HookSkipCounts StorageTexture::TakeHookSkipCounts() {
 }
 
 void StorageTexture::BumpPendingSerial() {
+    GuestMemory::BumpRegistry(GuestMemory::Registry::StorageResults);
     pendingSerial.fetch_add(1, std::memory_order_release);
 }
 

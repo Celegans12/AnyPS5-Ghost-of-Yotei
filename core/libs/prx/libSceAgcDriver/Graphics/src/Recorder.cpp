@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -1242,6 +1243,7 @@ Recorder::~Recorder() {
         activeRecorder = nullptr;
         pendingWrites.store(nullptr, std::memory_order_release);
         publishGeneration.fetch_add(1, std::memory_order_release);
+        GuestMemory::BumpRegistry(GuestMemory::Registry::PendingWrites);
         pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
         completionLabels.store(0, std::memory_order_release);
         completionStores.store(0, std::memory_order_release);
@@ -4520,6 +4522,7 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
     published = incremental.snapshot;
     pendingWrites.store(std::move(incremental.snapshot), std::memory_order_release);
     publishGeneration.fetch_add(1, std::memory_order_release);
+    GuestMemory::BumpRegistry(GuestMemory::Registry::PendingWrites);
     if (incremental.rebuilt) ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
 }
