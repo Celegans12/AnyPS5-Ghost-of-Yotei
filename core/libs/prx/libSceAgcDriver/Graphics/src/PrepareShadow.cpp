@@ -3,11 +3,14 @@
 #include "prx/libSceAgcDriver/Execution/include/ImageFlags.hpp"
 #include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PrepareUnwired.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libc/include/GuestDirty.hpp"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -16,6 +19,7 @@
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
+#include <stdexcept>
 #include <utility>
 
 namespace AgcDriver::Graphics::PrepareShadow {
@@ -38,7 +42,18 @@ struct Shared {
     bool lookedUp = false;
     const void* preparedSet = nullptr;
     GuestMemory::ReadSet reads;
+    // Whether the read set is built (census v2, or phase (ii) on at prepare) and phase (ii)'s switch at prepare.
+    bool building = false;
+    bool proof = false;
+    ShaderResources::Ahead ahead = ShaderResources::Ahead::Other;
+    // Why the read set is unvouched, if it is (an index into causeNames).
+    std::uint8_t unvouchedCause = 0xff;
 };
+
+// Unvouched causes: GuestDirty's refusal reason + 1 (0: Arm returned 0 without one), then the unwired registries.
+constexpr const char* causeNames[] = {"no reason", "epoch", "in flight", "guards", "block", "uncommitted", "private not writable", "other memory", "view", "tracker off", "copied writes", "lease", "unwatched since prepare"};
+constexpr std::size_t CauseCount = std::size(causeNames);
+constexpr std::uint8_t CauseCopied = 10, CauseLeased = 11, CauseUnwatched = 12;
 
 Capture take() {
     Capture capture;
@@ -58,10 +73,42 @@ std::atomic<std::uint64_t> commits{0}, validated{0}, unlocked{0}, noSet{0}, prep
 // v2 outcomes per commit with a draw-set proof.
 std::atomic<std::uint64_t> notPrepared{0}, noCachedSet{0}, otherSet{0}, unlockedReads{0}, tokens{0}, generations{0}, unarmed{0};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(GuestMemory::Validation::Count)> results{};
+// Unarmed ranges by refusal reason, and unvouched commits by their first cause.
+std::array<std::atomic<std::uint64_t>, CauseCount> unarmedBy{}, unvouchedBy{};
+std::atomic<std::uint64_t> copiedRanges{0}, leasedSets{0};
+// Phase (ii): commits that asked (TakePrepared), verdicts at prepare, outcomes at the commit.
+std::atomic<std::uint64_t> proofAsks{0}, proofSwitchMoved{0}, proofSerialMoved{0}, proofServed{0}, proofVerified{0}, proofVerifyFailed{0};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ShaderResources::Ahead::Count)> aheadBy{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Fallback::Count)> fallbackBy{};
 std::atomic<std::int64_t> reportNs{0};
 
 unsigned long long take(std::atomic<std::uint64_t>& value) {
     return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed));
+}
+
+void reportCauses() {
+    char unarmedText[512] = {}, unvouchedText[512] = {};
+    std::size_t at = 0, atV = 0;
+    for (std::size_t i = 0; i < CauseCount; ++i) {
+        const auto u = take(unarmedBy[i]);
+        const auto v = take(unvouchedBy[i]);
+        if (u != 0 && at < sizeof(unarmedText)) at += static_cast<std::size_t>(std::snprintf(unarmedText + at, sizeof(unarmedText) - at, " %s %llu", causeNames[i], u));
+        if (v != 0 && atV < sizeof(unvouchedText)) atV += static_cast<std::size_t>(std::snprintf(unvouchedText + atV, sizeof(unvouchedText) - atV, " %s %llu", causeNames[i], v));
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[prepare-causes] 10 s: unarmed ranges by refusal:%s; unvouched commits by first cause:%s; copied-write ranges %llu, leased sets %llu\n", unarmedText, unvouchedText, take(copiedRanges), take(leasedSets));
+}
+
+void reportProof() {
+    char aheadText[512] = {};
+    std::size_t at = 0;
+    for (std::size_t i = 0; i < aheadBy.size(); ++i) {
+        const auto n = take(aheadBy[i]);
+        if (n != 0 && at < sizeof(aheadText)) at += static_cast<std::size_t>(std::snprintf(aheadText + at, sizeof(aheadText) - at, " %s %llu", ShaderResources::AheadName(static_cast<ShaderResources::Ahead>(i)), n));
+    }
+    std::array<unsigned long long, static_cast<std::size_t>(Fallback::Count)> fb{};
+    for (std::size_t i = 0; i < fb.size(); ++i) fb[i] = take(fallbackBy[i]);
+    AgcDriver::ProfilePrint_nid_no_patch("[prepare-proof] 10 s: %llu draw-set proofs asked, %llu served from the prepared verdict; prepared verdicts of the validated sets:%s; not served: switch moved %llu, storage results or shadows moved %llu, commit re-check moved %llu evicted %llu depth %llu imports %llu; verify %llu checked, %llu differed\n",
+        take(proofAsks), take(proofServed), aheadText, take(proofSwitchMoved), take(proofSerialMoved), fb[1], fb[2], fb[3], fb[4], take(proofVerified), take(proofVerifyFailed));
 }
 
 void report() {
@@ -74,11 +121,16 @@ void report() {
     if (now - last < 10'000'000'000LL || !reportNs.compare_exchange_strong(last, now)) return;
     AgcDriver::ProfilePrint_nid_no_patch("[prepare-shadow] 10 s: %llu draw commits, %llu validated (%llu preparer-stamped), %llu without a draw-set proof, %llu proofs outside the record lock\n",
         take(commits), take(validated), take(preparerStamped), take(noSet), take(unlocked));
+    if (RuntimeSwitches::Set(RuntimeSwitch::V3ePrepareProof)) {
+        reportProof();
+        if (Mode() != 2) reportCauses();
+    }
     if (Mode() != 2) return;
     std::array<unsigned long long, static_cast<std::size_t>(GuestMemory::Validation::Count)> counts{};
     for (std::size_t i = 0; i < counts.size(); ++i) counts[i] = take(results[i]);
     AgcDriver::ProfilePrint_nid_no_patch("[prepare-shadow2] 10 s: validated against the prepare-time set: valid %llu, unvouched %llu, content changed %llu, fact changed %llu, no check %llu, mapping changed %llu; re-prepare without validation: not prepared ahead %llu, no cached set at prepare %llu, another set committed %llu; set reads without the resource-set lock %llu; ranges by generation %llu, by token %llu, unarmed %llu\n",
         counts[0], counts[1], counts[2], counts[3], counts[4], counts[5], take(notPrepared), take(noCachedSet), take(otherSet), take(unlockedReads), take(generations), take(tokens), take(unarmed));
+    reportCauses();
 }
 
 bool pendingOverlapUnchanged(std::uint64_t address, std::uint64_t bytes, std::uint64_t fact) {
@@ -106,16 +158,41 @@ bool Enabled() {
     return Mode() != 0;
 }
 
+bool Wrapping() {
+    static const bool wrapping = [] {
+        if (Enabled() || std::getenv("APS5_V3E_PREPARE_PROOF") != nullptr) return true;
+        const char* ab = std::getenv("APS5_AB");
+        return ab != nullptr && std::strstr(ab, "APS5_V3E_PREPARE_PROOF") != nullptr;
+    }();
+    return wrapping;
+}
+
+bool ProofOn() {
+    return Wrapping() && RuntimeSwitches::Set(RuntimeSwitch::V3ePrepareProof) && RuntimeSwitches::Set(RuntimeSwitch::V3eLockSplit);
+}
+
+bool VerifyProof() {
+    static const bool verify = [] {
+        const char* value = std::getenv("APS5_V3E_PREPARE_PROOF_VERIFY");
+        return value != nullptr && std::strcmp(value, "throw") == 0;
+    }();
+    return verify;
+}
+
 void Wrap(std::function<void()>& commit, std::function<void()>& prepare) {
     auto shared = std::make_shared<Shared>();
-    shared->enqueued = take();
+    if (Mode() != 0) shared->enqueued = take();
     if (prepare) {
         prepare = [shared, inner = std::move(prepare)] {
             {
                 std::lock_guard lock(shared->mutex);
                 if (!shared->committing) {
-                    shared->prepared = take();
-                    shared->hasPrepared = true;
+                    shared->proof = RuntimeSwitches::Set(RuntimeSwitch::V3ePrepareProof);
+                    shared->building = Mode() == 2 || shared->proof;
+                    if (Mode() != 0 || shared->building) {
+                        shared->prepared = take();
+                        shared->hasPrepared = true;
+                    }
                 }
             }
             const auto* previous = std::exchange(preparing, shared->hasPrepared ? shared.get() : nullptr);
@@ -165,12 +242,12 @@ bool Active() {
 }
 
 bool Preparing() {
-    return Mode() == 2 && preparing != nullptr;
+    return preparing != nullptr && preparing->building;
 }
 
-void NotePreparedSet(const void* set, const Ranges& ranges) {
+void NotePreparedSet(const ShaderResources* set, std::span<const CompiledShader> shaders) {
     auto* shared = preparing;
-    if (Mode() != 2 || shared == nullptr) return;
+    if (shared == nullptr || !shared->building) return;
     shared->lookedUp = true;
     if (set == nullptr) return;
     registerPendingCheck();
@@ -179,22 +256,104 @@ void NotePreparedSet(const void* set, const Ranges& ranges) {
     std::shared_lock<LockOrder::CacheLock> setLock(LockOrder::CacheLockFor(LockOrder::Rank::ResourceSet), std::defer_lock);
     if (RuntimeSwitches::Set(RuntimeSwitch::V3eLockSplit)) setLock.lock();
     else unlockedReads.fetch_add(1, std::memory_order_relaxed);
-    ranges([&](std::uint64_t address, std::uint64_t bytes) {
+    const auto cause = [&](std::uint8_t why) {
+        if (shared->unvouchedCause == 0xff) shared->unvouchedCause = why;
+    };
+    if (GuestMemory::AddUnwiredEntry(shared->reads, 0, 1, false, set->HoldsLease())) {
+        leasedSets.fetch_add(1, std::memory_order_relaxed);
+        cause(CauseLeased);
+    }
+    set->ForEachReadRange([&](std::uint64_t address, std::uint64_t bytes) {
         if (bytes == 0) return;
+        if (GuestMemory::AddUnwiredEntry(shared->reads, address, bytes, set->CopiedWritesOverlap(address, static_cast<std::size_t>(bytes)), false)) {
+            copiedRanges.fetch_add(1, std::memory_order_relaxed);
+            cause(CauseCopied);
+        }
         if (GuestMemory::CollectWritesUncached(address, static_cast<std::size_t>(bytes)) != 0) {
             shared->reads.AddGeneration(address, bytes, generation);
             generations.fetch_add(1, std::memory_order_relaxed);
         } else {
+            static_cast<void>(GuestArena::GuestDirtyTakeLastRefusal_nid_postfix());
             const auto token = ImageFlags::Arm(address, static_cast<std::size_t>(bytes));
             shared->reads.AddToken(address, bytes, token);
             (token != 0 ? tokens : unarmed).fetch_add(1, std::memory_order_relaxed);
+            if (token == 0) {
+                const auto reason = std::min<std::size_t>(GuestArena::GuestDirtyTakeLastRefusal_nid_postfix(), CauseCopied - 1);
+                unarmedBy[reason].fetch_add(1, std::memory_order_relaxed);
+                cause(static_cast<std::uint8_t>(reason));
+            }
         }
         const std::pair<std::uint64_t, std::uint64_t> range{address, address + bytes};
         shared->reads.AddFact(GuestMemory::Registry::PendingWrites, address, bytes, Recorder::SnapshotOverlaps(snapshot.get(), address, static_cast<std::size_t>(bytes)) ? 1 : 0);
         shared->reads.AddFact(GuestMemory::Registry::StorageResults, address, bytes, StorageTexture::AnyPendingOverlaps({&range, 1}) ? 1 : 0);
         shared->reads.AddFact(GuestMemory::Registry::Shadows, address, bytes, AnyShadowedOverlaps(address, static_cast<std::size_t>(bytes)) ? 1 : 0);
     });
+    if (shared->proof) shared->ahead = set->ProveAhead(shaders);
     shared->preparedSet = set;
+}
+
+namespace {
+
+// Counts a validation of the prepare-time read set (census v2 and phase (ii) alike).
+void countValidation(const Shared& shared, GuestMemory::Validation result) {
+    results[static_cast<std::size_t>(result)].fetch_add(1, std::memory_order_relaxed);
+    GuestMemory::NoteValidation(result, 2);
+    if (result == GuestMemory::Validation::Unvouched) unvouchedBy[shared.unvouchedCause < CauseCount ? shared.unvouchedCause : CauseUnwatched].fetch_add(1, std::memory_order_relaxed);
+}
+
+}
+
+bool TakePrepared(const void* set) {
+    if (current == nullptr || noted) return false;
+    noted = true;
+    if (!GuestMemory::GpuMutex().HeldByThisThread()) {
+        unlocked.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    registerPendingCheck();
+    proofAsks.fetch_add(1, std::memory_order_relaxed);
+    validated.fetch_add(1, std::memory_order_relaxed);
+    const auto* shared = currentShared;
+    if (currentSite != 2 || shared == nullptr || !shared->lookedUp) {
+        notPrepared.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    preparerStamped.fetch_add(1, std::memory_order_relaxed);
+    if (shared->preparedSet == nullptr) {
+        noCachedSet.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (shared->preparedSet != set) {
+        otherSet.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    std::array<bool, static_cast<std::size_t>(GuestMemory::Registry::Count)> moved{};
+    const auto result = GuestMemory::Validate(current->stamp, shared->reads, &moved);
+    countValidation(*shared, result);
+    if (result != GuestMemory::Validation::Valid) return false;
+    aheadBy[static_cast<std::size_t>(shared->ahead)].fetch_add(1, std::memory_order_relaxed);
+    if (!shared->proof) {
+        proofSwitchMoved.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (shared->ahead != ShaderResources::Ahead::Pass) return false;
+    if (moved[static_cast<std::size_t>(GuestMemory::Registry::StorageResults)] || moved[static_cast<std::size_t>(GuestMemory::Registry::Shadows)]) {
+        proofSerialMoved.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
+}
+
+void NoteFallback(Fallback reason) {
+    fallbackBy[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteServed(bool served) {
+    if (served) proofServed.fetch_add(1, std::memory_order_relaxed);
+}
+
+void NoteVerify(bool same) {
+    (same ? proofVerified : proofVerifyFailed).fetch_add(1, std::memory_order_relaxed);
 }
 
 void NoteDrawSet(const void* set, const Ranges& ranges) {
@@ -213,9 +372,7 @@ void NoteDrawSet(const void* set, const Ranges& ranges) {
         else if (shared->preparedSet == nullptr) noCachedSet.fetch_add(1, std::memory_order_relaxed);
         else if (shared->preparedSet != set) otherSet.fetch_add(1, std::memory_order_relaxed);
         else {
-            const auto result = GuestMemory::Validate(current->stamp, shared->reads);
-            results[static_cast<std::size_t>(result)].fetch_add(1, std::memory_order_relaxed);
-            GuestMemory::NoteValidation(result, 2);
+            countValidation(*shared, GuestMemory::Validate(current->stamp, shared->reads));
         }
         return;
     }

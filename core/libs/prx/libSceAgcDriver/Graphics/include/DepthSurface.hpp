@@ -32,6 +32,8 @@ SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTar
 DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target);
 enum class DepthPlaneScope { Overlapped, Whole };
 std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes, DepthPlaneScope scope = DepthPlaneScope::Overlapped);
+// Read-only: whether FlushDepthPlanes over the range could store a plane (syncing surfaces count too). v3 phase (ii) prepare.
+bool DepthPlanesStale(std::uint64_t address, std::size_t bytes);
 bool DepthPlanesStale();
 struct DepthPlaneStoreStatistics {
     std::uint64_t stores = 0;

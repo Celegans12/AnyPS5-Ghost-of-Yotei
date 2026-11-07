@@ -112,6 +112,7 @@ enum class RuntimeSwitch : std::size_t {
     V3mProbeMemo,
     V3mPrepareStamp,
     V3eLockSplit,
+    V3ePrepareProof,
     Count,
 };
 

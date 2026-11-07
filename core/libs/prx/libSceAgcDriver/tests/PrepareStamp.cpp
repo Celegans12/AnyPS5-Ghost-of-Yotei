@@ -1,5 +1,6 @@
 #define NOMINMAX
 #include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PrepareUnwired.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/LockOrder.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -109,6 +110,39 @@ void UnvouchedRangesNeverValidate() {
     mixed.AddToken(memory.At(0), Block, DirtyArm(memory.At(0), Block));
     mixed.AddToken(memory.At(Block), Block, 0);
     Require(Validate(stamp, mixed) == Validation::Unvouched, "one unvouched range among clean ones validated");
+}
+
+void UnwiredRegistriesNeverValidate() {
+    Memory memory;
+    const auto stamp = PrepareStamp::Take();
+    const auto token = DirtyArm(memory.At(0), Block);
+    Require(token != 0, "the test block was not armed");
+    ReadSet clean;
+    clean.AddToken(memory.At(0), Block, token);
+    Require(!AddUnwiredEntry(clean, memory.At(0), Block, false, false), "a range without copied writes or leases got an entry");
+    Require(Validate(stamp, clean) == Validation::Valid, "a clean set without unwired registries did not validate");
+    ReadSet copied;
+    copied.AddToken(memory.At(0), Block, token);
+    Require(AddUnwiredEntry(copied, memory.At(0), Block, true, false), "a copied-writer overlap added no entry");
+    Require(Validate(stamp, copied) == Validation::Unvouched, "a range a copied writer overlaps validated");
+    ReadSet leased;
+    leased.AddToken(memory.At(0), Block, token);
+    Require(AddUnwiredEntry(leased, memory.At(0), 0, false, true), "a leased set added no entry");
+    Require(Validate(stamp, leased) == Validation::Unvouched, "a set holding a BDA lease validated");
+}
+
+void RefusalReasonIsReported() {
+    static_cast<void>(GuestArena::GuestDirtyTakeLastRefusal_nid_postfix());
+    Memory memory;
+    Require(DirtyArm(memory.At(0), Block) != 0, "the test block was not armed");
+    Require(GuestArena::GuestDirtyTakeLastRefusal_nid_postfix() == 0, "an armed range reported a refusal");
+    GuestArena::GuestDirtyForceEnable_nid_no_patch(false);
+    const auto token = DirtyArm(memory.At(0), Block);
+    const auto reason = GuestArena::GuestDirtyTakeLastRefusal_nid_postfix();
+    GuestArena::GuestDirtyForceEnable_nid_no_patch(true);
+    Require(token == 0, "the tracker armed while off");
+    Require(reason == GuestArena::RefusedDisabled + 1, "the refusal of a tracker that is off was not reported");
+    Require(GuestArena::GuestDirtyTakeLastRefusal_nid_postfix() == 0, "the refusal reason was not reset by the take");
 }
 
 void MovedSerialRechecksOnlyItsFacts() {
@@ -244,6 +278,8 @@ int main() {
         {"CPU write fails the set", CpuWriteFailsTheSet},
         {"driver write fails the set", DriverWriteFailsTheSet},
         {"unvouched ranges never validate", UnvouchedRangesNeverValidate},
+        {"copied writers and leases never validate", UnwiredRegistriesNeverValidate},
+        {"arm refusal reason is reported", RefusalReasonIsReported},
         {"moved serial rechecks only its facts", MovedSerialRechecksOnlyItsFacts},
         {"mapping change fails the set", MappingChangeFailsTheSet},
         {"wrong order is caught", WrongOrderIsCaught},

@@ -444,7 +444,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     ++enqueued;
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
     const bool prepared = static_cast<bool>(prepare);
-    if (draw && Graphics::PrepareShadow::Enabled()) Graphics::PrepareShadow::Wrap(commit, prepare);
+    if (draw && Graphics::PrepareShadow::Wrapping()) Graphics::PrepareShadow::Wrap(commit, prepare);
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), nowNs(), std::move(prepare)});
     items.back().unknownWrites = unknownWrites;
     items.back().draw = draw;

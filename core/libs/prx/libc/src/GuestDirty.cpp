@@ -52,6 +52,7 @@ struct Counters {
     std::atomic<std::uint64_t> armsBy[4]{};
 };
 thread_local unsigned armKind = 0;
+thread_local unsigned lastRefusal = 0;
 std::atomic<std::uintptr_t> lastDeclined{0};
 std::atomic<std::uint64_t> lastDeclinedState{0};
 struct OwnWindow {
@@ -227,7 +228,11 @@ void GuestDirtyForceEnable_nid_no_patch(bool on) {
 
 std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t bytes) {
 #ifdef _WIN32
-    if (!enabled() || bytes == 0 || address + bytes < address) return 0;
+    if (!enabled() || bytes == 0 || address + bytes < address) {
+        lastRefusal = GuestArena::RefusedDisabled + 1;
+        return 0;
+    }
+    lastRefusal = 0;
     const auto start = nowNs();
     const auto begin = address & ~(PageBytes - 1);
     const auto end = (address + bytes + PageBytes - 1) & ~(PageBytes - 1);
@@ -240,6 +245,7 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
         if (block != nullptr && block->refusedEpoch.load(std::memory_order_acquire) == epoch) {
             counters.refused.fetch_add(1, std::memory_order_relaxed);
             counters.refusedBy[armKind][GuestArena::RefusedEpoch].fetch_add(1, std::memory_order_relaxed);
+            lastRefusal = GuestArena::RefusedEpoch + 1;
             counters.armNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
             return 0;
         }
@@ -263,6 +269,7 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
     const auto refuse = [&](unsigned reason) {
         counters.refused.fetch_add(1, std::memory_order_relaxed);
         counters.refusedBy[armKind][reason & 7u].fetch_add(1, std::memory_order_relaxed);
+        lastRefusal = (reason & 7u) + 1;
         counters.armNs.fetch_add(nowNs() - start, std::memory_order_relaxed);
         return std::uint64_t{0};
     };
@@ -359,6 +366,10 @@ std::uint64_t GuestDirtyArm_nid_postfix(std::uintptr_t address, std::size_t byte
     static_cast<void>(bytes);
     return 0;
 #endif
+}
+
+unsigned GuestDirtyTakeLastRefusal_nid_postfix() {
+    return std::exchange(lastRefusal, 0u);
 }
 
 bool GuestDirtyCleanSince_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint64_t token) {

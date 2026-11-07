@@ -413,6 +413,13 @@ public:
     // The guest ranges a draw-set proof reads (direct regions, described ranges, storage images, validated textures,
     // with their DCC keys): the prepare-shadow census's read set.
     void ForEachReadRange(const std::function<void(std::uint64_t, std::uint64_t)>& add) const;
+    // v3 lock split phase (ii) (APS5_V3E_PREPARE_PROOF): the read-only part of revalidateFull, run by the preparer
+    // under the shared resource-set lock. Pass only when today's proof would pass on its fast path with no flush,
+    // refresh, upload, import creation or recorder call (no DCC keys, no depth surfaces, every range write-watched);
+    // the commit then serves the set when the prepare-time read set validates (revalidateFull's prepared path).
+    enum class Ahead : std::uint8_t { Pass, NotReusable, AddressBased, Other, Audit, Depth, Keys, Untracked, Evicted, Pending, Shadows, Imports, Changed, Count };
+    Ahead ProveAhead(std::span<const CompiledShader> shaders) const;
+    static const char* AheadName(Ahead result);
     bool ReusesAddressSpace() const { return addressReuse; }
     std::shared_ptr<const void> BeginUse();
     void CompleteUse();
@@ -801,6 +808,7 @@ private:
     std::uint64_t provedCaused = 0;
     std::uint64_t provedPending = 0;
     bool revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report);
+    bool revalidateFullBody(std::span<const CompiledShader> shaders, ProofReport* report, bool prepared, bool verify, bool& served);
     // The import table's identity when the direct regions' serials were last proved.
     HostImportsProof importsProof;
     // FNV-1a offset basis: the hash of no data buffers (DataWordsHash).

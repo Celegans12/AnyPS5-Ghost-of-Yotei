@@ -111,6 +111,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_V3M_PROBE_MEMO",
     "APS5_V3M_PREPARE_STAMP",
     "APS5_V3E_LOCK_SPLIT",
+    "APS5_V3E_PREPARE_PROOF",
 };
 
 struct Refusal {
