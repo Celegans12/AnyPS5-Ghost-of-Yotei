@@ -328,6 +328,26 @@ void Stress() {
     LockOrder::SetCheckForTest(false);
 }
 
+
+void Bench() {
+    using Graphics::RuntimeSwitch;
+    namespace Switches = Graphics::RuntimeSwitches;
+    LockOrder::SplitMutex<AgcDriver::Mutex, Rank::Texture> mutex;
+    std::lock_guard record(GuestMemory::Record());
+    constexpr int Rounds = 2000000;
+    for (const bool on : {false, true, false, true}) {
+        Switches::Assign(RuntimeSwitch::V3eLockSplit, on);
+        const auto start = std::chrono::steady_clock::now();
+        for (int i = 0; i < Rounds; ++i) {
+            mutex.lock();
+            mutex.unlock();
+        }
+        const auto ns = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - start).count() / Rounds;
+        std::printf("bench: SplitMutex lock+unlock under the record lock, switch %s: %.1f ns\n", on ? "on" : "off", ns);
+    }
+    Switches::Assign(RuntimeSwitch::V3eLockSplit, false);
+}
+
 }
 
 int main() {
@@ -337,6 +357,7 @@ int main() {
     SharedExclusive();
     Split();
     Stress();
+    Bench();
     Expect(LockOrder::Totals().releasesHolding == start.releasesHolding + 1, "only the deliberate release-while-holding was counted");
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);
