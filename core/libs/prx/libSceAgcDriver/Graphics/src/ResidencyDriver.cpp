@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidencyDriver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -262,6 +263,7 @@ ResidencyToken ResidencyDriver::WriteBack(std::span<const ResidencyCopy> copies)
     for (const auto& copy : copies) pending.ranges.emplace_back((copy.page << ResidencyPageShift) + copy.offset, copy.bytes);
     const std::lock_guard lock(stampMutex);
     pendingStamps.push_back(std::move(pending));
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Residency);
     stampsPending.store(true, std::memory_order_release);
     return token;
 }
@@ -287,6 +289,7 @@ void ResidencyDriver::stampWrittenBack(std::uint64_t address, std::size_t bytes,
             if ((all && tokens.Reached(at->token)) || (!all && overlaps)) {
                 due.push_back(std::move(*at));
                 at = pendingStamps.erase(at);
+                GuestMemory::BumpRegistry(GuestMemory::Registry::Residency);
             } else {
                 ++at;
             }

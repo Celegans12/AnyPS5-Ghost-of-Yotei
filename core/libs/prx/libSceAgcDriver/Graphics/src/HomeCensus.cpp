@@ -491,6 +491,11 @@ bool Enabled() {
 }
 
 void Arm(Kind kind, std::uint64_t address, std::uint64_t bytes) {
+    static const bool observing = [] {
+        if (Enabled()) GuestMemory::SetDriverWriteObserver(&DriverWrite);
+        return true;
+    }();
+    static_cast<void>(observing);
     if (Enabled() || GuestMemory::DirtyEnabled()) {
         static std::mutex clockMutex;
         static std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();

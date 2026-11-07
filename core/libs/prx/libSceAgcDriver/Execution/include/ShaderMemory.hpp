@@ -173,6 +173,8 @@ private:
     HookWaitCounter hookWaits = nullptr;
     bool recordProbes = false;
     mutable std::vector<Probe> probes;
+    mutable std::vector<std::uint64_t> quietPages;
+    mutable std::uint64_t quietGeneration = ~std::uint64_t{0};
     PendingWriteQuery pendingSpan = nullptr;
 };
 

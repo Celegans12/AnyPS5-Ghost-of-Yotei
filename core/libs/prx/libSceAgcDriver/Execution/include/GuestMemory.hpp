@@ -154,6 +154,7 @@ OwnedBlockCounts TakeOwnedBlockCounts();
 // resources sharing pages see each other's writes. GPU writes into host-imported memory bypass the
 // page tables and are reported with MarkWritten. Without write watching CollectWrites returns 0 and
 // UnchangedSince is always false, so callers fall back to comparing bytes.
+void SetDriverWriteObserver(void (*observer)(std::uint64_t address, std::uint64_t bytes));
 bool DirtyEnabled();
 std::uint64_t DirtyArm(std::uint64_t address, std::size_t bytes);
 std::uint64_t DirtyArmAs(std::uint64_t address, std::size_t bytes, unsigned kind);

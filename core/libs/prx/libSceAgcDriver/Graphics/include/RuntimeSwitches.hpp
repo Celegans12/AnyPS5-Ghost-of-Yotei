@@ -108,6 +108,9 @@ enum class RuntimeSwitch : std::size_t {
     V3eMidPipeline,
     V3eDrawProofMemo,
     V3mAddrCeil,
+    V3mStorageTokens,
+    V3mProbeMemo,
+    V3mPrepareStamp,
     Count,
 };
 

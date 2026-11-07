@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/PrepareStamp.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Residency.hpp"
 #include <algorithm>
 #include <array>
@@ -868,6 +869,7 @@ void ResidencyManager::forget(std::uint32_t id) {
         resident.erase(page);
     }
     if (!pages[id].dirtyRuns.empty()) --dirtyPages;
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Residency);
     pages[id].dirtyRuns.clear();
     pages[id].dirty = 0;
     publishDirty(page, 0);
@@ -890,6 +892,7 @@ void ResidencyManager::markDirty(std::uint32_t id, std::uint32_t begin, std::uin
     }
     auto& page = pages[id];
     if (page.dirtyRuns.empty()) ++dirtyPages;
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Residency);
     auto& runs = page.dirtyRuns;
     auto at = std::lower_bound(runs.begin(), runs.end(), Run{begin, begin}, [](const Run& left, const Run& right) { return left.second < right.first; });
     auto last = at;
@@ -922,6 +925,7 @@ void ResidencyManager::clearDirty(std::uint32_t id, std::uint32_t begin, std::ui
     for (const auto& run : page.dirtyRuns) page.dirty = static_cast<ResidencyMask>(page.dirty | RunMask(run.first, run.second));
     publishPage(page.index);
     if (page.dirtyRuns.empty()) --dirtyPages;
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Residency);
 }
 
 void ResidencyManager::clearAllDirty(std::uint32_t id) {
@@ -931,6 +935,7 @@ void ResidencyManager::clearAllDirty(std::uint32_t id) {
     page.dirty = 0;
     publishPage(page.index);
     --dirtyPages;
+    GuestMemory::BumpRegistry(GuestMemory::Registry::Residency);
 }
 
 void ResidencyManager::appendDirty(std::uint32_t id, std::vector<ResidencyCopy>& copies) const {

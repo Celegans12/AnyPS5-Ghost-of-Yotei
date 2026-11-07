@@ -366,6 +366,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PrepareStamp.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/MemoryStats.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ProfileWindows.cpp
@@ -1025,6 +1026,26 @@ target_include_directories(agc_locks_tests PRIVATE
 target_link_libraries(agc_locks_tests PRIVATE libSceAgcDriver libc)
 set_target_properties(agc_locks_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_locks_tests)
+
+add_test_executable(agc_prepare_stamp_tests EXCLUDE_FROM_ALL
+        tests/PrepareStamp.cpp
+        Execution/src/PrepareStamp.cpp
+        Execution/src/GuestMemory.cpp
+        Graphics/src/RuntimeSwitches.cpp
+        Execution/src/PerformanceTraceThread.cpp
+)
+target_include_directories(agc_prepare_stamp_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_prepare_stamp_tests PRIVATE shader_recompiler_agc_driver libc)
+set_target_properties(agc_prepare_stamp_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_prepare_stamp_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_prepare_stamp_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_prepare_stamp COMMAND agc_prepare_stamp_tests)
+    set_tests_properties(agc_prepare_stamp PROPERTIES TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_prepare_stamp PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
 
 add_test_executable(agc_write_tracking_tests EXCLUDE_FROM_ALL
         tests/WriteTracking.cpp
