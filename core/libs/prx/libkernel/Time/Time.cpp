@@ -270,9 +270,28 @@ static void TraceSleep(const void* caller, std::uint64_t microseconds) {
     std::fprintf(stderr, "\n");
 }
 
+namespace {
+struct LastWait { const char* kind = nullptr; const void* caller = nullptr; std::uint64_t waited = 0, ended = 0; };
+thread_local LastWait lastWait;
+}
+
+bool KernelLastWait_nid_postfix(const char** kind, const void** caller, std::uint64_t* waitedNanos, std::uint64_t* endedNanos) {
+    if (lastWait.kind == nullptr) return false;
+    *kind = lastWait.kind;
+    *caller = lastWait.caller;
+    *waitedNanos = lastWait.waited;
+    *endedNanos = lastWait.ended;
+    return true;
+}
+
+unsigned long KernelTraceThreadId_nid_postfix() {
+    return CurrentThreadIdForTrace();
+}
+
 void KernelTraceWait_nid_postfix(const char* kind, const void* caller, std::uint64_t waitedNanos, bool timedOut) {
     static const bool enabled = std::getenv("APS5_TRACE_WAITS") != nullptr;
     if (!enabled) return;
+    lastWait = {kind, caller, waitedNanos, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count())};
     struct Site { std::uint64_t calls = 0; std::uint64_t timeouts = 0; std::uint64_t nanos = 0; std::uint64_t longest = 0; unsigned long lastThread = 0; };
     static std::mutex mutex;
     static std::unordered_map<std::string, Site> sites;

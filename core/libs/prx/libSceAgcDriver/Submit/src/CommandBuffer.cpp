@@ -10,6 +10,11 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
+namespace AgcDriver {
+// Acb.cpp (APS5_TRACE_EOP): [acb-submits].
+void TraceGuestSubmit(std::uint32_t queue, const void* caller);
+}
+
 extern "C" {
 
 int APS5_VABI sceAgcDriverSubmitCommandBuffer(void* queue_context, const Packet* packet) {
@@ -18,6 +23,7 @@ int APS5_VABI sceAgcDriverSubmitCommandBuffer(void* queue_context, const Packet*
     if (queue != 0 && (queue < 0x20 || queue >= 0x58)) {
         throw std::runtime_error(std::string(__func__) + ": unsupported queue");
     }
+    AgcDriver::TraceGuestSubmit(queue, __builtin_return_address(0));
     AgcDriver::Submit(packet, queue);
     return 0;
 }
@@ -29,6 +35,7 @@ int APS5_VABI sceAgcDriverSubmitMultiCommandBuffers(void* queue_context, uint32_
     if (queue != 0 && (queue < 0x20 || queue >= 0x58)) {
         throw std::runtime_error(std::string(__func__) + ": unsupported queue");
     }
+    AgcDriver::TraceGuestSubmit(queue, __builtin_return_address(0));
     return AgcDriver::SubmitMany(command_buffers, sizes_in_dwords, count, queue);
 }
 
