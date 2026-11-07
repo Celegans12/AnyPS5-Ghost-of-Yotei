@@ -127,7 +127,7 @@ void report() {
     if (now - last < interval || !reportNs.compare_exchange_strong(last, now)) return;
     AgcDriver::ProfilePrint_nid_no_patch("[prepare-shadow] 10 s: %llu draw commits, %llu validated (%llu preparer-stamped), %llu without a draw-set proof, %llu proofs outside the record lock\n",
         take(commits), take(validated), take(preparerStamped), take(noSet), take(unlocked));
-    if (RuntimeSwitches::Set(RuntimeSwitch::V3ePrepareProof)) {
+    if (RuntimeSwitches::Set(RuntimeSwitch::V3ePrepareProof) || Mode() == 2) {
         reportProof();
         if (Mode() != 2) reportCauses();
     }
@@ -269,8 +269,11 @@ void NotePreparedSet(const ShaderResources* set, std::span<const CompiledShader>
     const auto snapshot = Recorder::PendingWriteSnapshot();
     // Phase (ii) reads the set's published view and takes no cache lock (a commit's stage hold would wait on it);
     // census v2 alone reads the set under the shared resource-set lock.
-    const auto view = shared->proof ? set->LoadProofView() : nullptr;
-    if (shared->proof && view == nullptr) {
+    // Census v2 also reads the published view (and vouches token-first) when views are published
+    // (APS5_V3E_PP_PUBLISH_ONLY), so the census takes no cache lock and adds no tracker-lock waits.
+    const bool viewed = shared->proof || PublishOnly();
+    const auto view = viewed ? set->LoadProofView() : nullptr;
+    if (viewed && view == nullptr) {
         noView.fetch_add(1, std::memory_order_relaxed);
         return;
     }
@@ -414,7 +417,9 @@ void NoteDrawSet(const void* set, const Ranges& ranges) {
         else if (shared->preparedSet == nullptr) noCachedSet.fetch_add(1, std::memory_order_relaxed);
         else if (shared->preparedSet != set) otherSet.fetch_add(1, std::memory_order_relaxed);
         else {
-            countValidation(*shared, GuestMemory::Validate(current->stamp, shared->reads));
+            const auto result = GuestMemory::Validate(current->stamp, shared->reads);
+            countValidation(*shared, result);
+            if (result == GuestMemory::Validation::Valid) aheadBy[static_cast<std::size_t>(shared->ahead)].fetch_add(1, std::memory_order_relaxed);
         }
         return;
     }
