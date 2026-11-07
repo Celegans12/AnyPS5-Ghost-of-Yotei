@@ -43,20 +43,21 @@ bool bCensus() {
     static const bool enabled = std::getenv("APS5_V3E_B_CENSUS") != nullptr;
     return enabled;
 }
-struct BCensus { std::uint64_t drains = 0, clear = 0, overlapping = 0, clearUs = 0, overlapUs = 0, unknown = 0; };
+struct BCensus { std::uint64_t drains = 0, clear = 0, overlapping = 0, clearUs = 0, overlapUs = 0, unknown = 0, queuedUnknown = 0, queuedUnknownUs = 0; };
 std::mutex bMutex;
 BCensus bCounts;
 std::chrono::steady_clock::time_point bReported = std::chrono::steady_clock::now();
-void noteBCensus(bool known, bool overlaps, std::uint64_t drainUs) {
+void noteBCensus(bool known, bool overlaps, bool queuedUnknown, std::uint64_t drainUs) {
     std::lock_guard lock(bMutex);
     ++bCounts.drains;
     if (!known) ++bCounts.unknown;
+    else if (queuedUnknown) { ++bCounts.queuedUnknown; bCounts.queuedUnknownUs += drainUs; }
     else if (overlaps) { ++bCounts.overlapping; bCounts.overlapUs += drainUs; }
     else { ++bCounts.clear; bCounts.clearUs += drainUs; }
     const auto now = std::chrono::steady_clock::now();
     if (now - bReported < std::chrono::seconds(10)) return;
     bReported = now;
-    AgcDriver::ProfilePrint_nid_no_patch("[b-census] 10 s: %llu queue-0 dispatch-miss drains; reads clear of the queued writes %llu (%.1f %%, %.1f ms of drain), overlapping %llu (%.1f ms), reads unknown %llu\n", static_cast<unsigned long long>(bCounts.drains), static_cast<unsigned long long>(bCounts.clear), bCounts.drains ? 100.0 * static_cast<double>(bCounts.clear) / static_cast<double>(bCounts.drains) : 0.0, bCounts.clearUs / 1000.0, static_cast<unsigned long long>(bCounts.overlapping), bCounts.overlapUs / 1000.0, static_cast<unsigned long long>(bCounts.unknown));
+    AgcDriver::ProfilePrint_nid_no_patch("[b-census] 10 s: %llu queue-0 dispatch-miss drains; reads clear of the queued writes %llu (%.1f %%, %.1f ms of drain), overlapping %llu (%.1f ms), a queued item with unlisted writes %llu (%.1f ms; counted as overlapping), reads unknown %llu\n", static_cast<unsigned long long>(bCounts.drains), static_cast<unsigned long long>(bCounts.clear), bCounts.drains ? 100.0 * static_cast<double>(bCounts.clear) / static_cast<double>(bCounts.drains) : 0.0, bCounts.clearUs / 1000.0, static_cast<unsigned long long>(bCounts.overlapping), bCounts.overlapUs / 1000.0, static_cast<unsigned long long>(bCounts.queuedUnknown), bCounts.queuedUnknownUs / 1000.0, static_cast<unsigned long long>(bCounts.unknown));
     bCounts = {};
 }
 }
@@ -594,7 +595,7 @@ void Driver::dispatchAttempt(QueueState& queue, std::span<const std::uint32_t> p
                     const auto begin = region.guestAddress, end = region.guestAddress + region.bytes.size();
                     return std::any_of(bWatch.writes.begin(), bWatch.writes.end(), [&](const DrawPipeline::Range& write) { return begin < write.second && write.first < end; });
                 });
-                noteBCensus(known, overlaps, bDrainUs);
+                noteBCensus(known, overlaps, bWatch.unknown, bDrainUs);
             }
             if (traceCapSync()) traceCapture("dispatch-capture", address, submission.queue, captured, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
             captureMs += phaseTiming.Elapsed();

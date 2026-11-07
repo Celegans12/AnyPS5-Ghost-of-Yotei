@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <utility>
 #include <algorithm>
 #include <array>
 #include <limits>
@@ -398,7 +399,16 @@ void DrawPipeline::rethrowFailure() {
     std::rethrow_exception(error);
 }
 
+namespace {
+thread_local bool nextWritesUnknown = false;
+}
+
+void DrawPipeline::NextWritesUnknown() {
+    nextWritesUnknown = true;
+}
+
 void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress, std::vector<std::byte> labelBytes, std::vector<Range> reads, Prepare prepare, bool draw) {
+    const bool unknownWrites = std::exchange(nextWritesUnknown, false);
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto lockStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -433,6 +443,7 @@ void DrawPipeline::Enqueue(Commit commit, std::vector<Range> writes, std::uint64
     heldReadRanges.fetch_add(reads.size(), std::memory_order_relaxed);
     const bool prepared = static_cast<bool>(prepare);
     items.push_back({std::move(commit), std::move(writes), labelAddress, std::move(labelBytes), std::move(reads), nowNs(), std::move(prepare)});
+    items.back().unknownWrites = unknownWrites;
     items.back().draw = draw;
     addWrites(items.back().writes);
     for (const auto& [begin, limit] : items.back().reads) {
@@ -804,7 +815,10 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
     if (!Busy()) return {Retired(), 0, {}};
     std::lock_guard lock(mutex);
     Watch watch{retiredItems.load(std::memory_order_relaxed), items.size(), {}};
-    for (const auto& item : items) watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
+    for (const auto& item : items) {
+        watch.writes.insert(watch.writes.end(), item.writes.begin(), item.writes.end());
+        if (item.unknownWrites) watch.unknown = true;
+    }
     return watch;
 }
 

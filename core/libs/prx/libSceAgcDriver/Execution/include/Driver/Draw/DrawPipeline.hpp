@@ -49,7 +49,12 @@ public:
         std::uint64_t retired = 0;
         std::size_t items = 0;
         std::vector<Range> writes;
+        // v3 exec (b)/(a): a queued item whose writes are not fully listed (BDA/pointer stores) was among them.
+        bool unknown = false;
     };
+    // The next Enqueue on this thread is an item whose writes are not fully listed (BDA or pointer stores): an overlap
+    // test against the queue (WatchWrites, WrittenSince) treats it as overlapping everything.
+    static void NextWritesUnknown();
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
     enum class Event : std::uint8_t { IndirectCommit, IndirectArgsDrain, SatisfiedWaitKept, Count };
 
@@ -117,6 +122,7 @@ private:
         // The span of `reads` (HeldReads skips an item it misses; APS5_NO_HELD_READ_BOUNDS=1 scans every range).
         Range readBounds{~std::uint64_t{0}, 0};
         bool draw = false;
+        bool unknownWrites = false;
     };
     DrawPipeline() = default;
     template<typename TRanges, typename TBounds>

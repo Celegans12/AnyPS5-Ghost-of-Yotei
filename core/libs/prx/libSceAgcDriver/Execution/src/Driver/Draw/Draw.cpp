@@ -39,6 +39,14 @@
 namespace AgcDriver::DriverDetail {
 
 namespace {
+// v3 exec (b)/(a): a draw whose stages store through BDA/pointers has writes DrawWriteRanges cannot list.
+bool storesThroughPointers(std::span<const Graphics::CompiledShader> stages) {
+    return std::any_of(stages.begin(), stages.end(), [](const Graphics::CompiledShader& stage) { return stage.program != nullptr && stage.program->bdaWrites; });
+}
+}
+
+
+namespace {
 
 bool TraceShaderCorrelation() {
     static const bool enabled = std::getenv("APS5_TRACE_SHADER_CORRELATION") != nullptr;
@@ -1006,6 +1014,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 for (const auto& item : expanded) commitDraw(localDevice, commitQueue, decode->state, item.direct, item.stages, item.snapshots, nullptr, {}, 0);
             };
             auto held = std::make_shared<decltype(commit)>(std::move(commit));
+            if (std::any_of(expanded.begin(), expanded.end(), [](const ExpandedDraw& item) { return storesThroughPointers(item.stages); })) DrawPipeline::NextWritesUnknown();
             pipeline.Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads));
             pipeline.Note(DrawPipeline::Event::IndirectCommit);
             phaseTiming.Phase(DrawRowLockWait);
@@ -1170,6 +1179,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                     commitDraw(localDevice, commitQueue, decode->state, direct, stages, snapshots, nullptr, {}, 0, nullptr);
                 };
                 auto held = std::make_shared<decltype(commit)>(std::move(commit));
+                if (storesThroughPointers(stages)) DrawPipeline::NextWritesUnknown();
                 DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
                 phaseTiming.Phase(DrawRowLockWait);
                 timing.Mark("draw_enqueued");
@@ -1272,6 +1282,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             };
         }
         timing.Mark("write_ranges_and_commit");
+        if (storesThroughPointers(stages)) DrawPipeline::NextWritesUnknown();
         DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), std::move(prepare), true);
         if (pipelineIndirect) DrawPipeline::Queue0().Note(DrawPipeline::Event::IndirectCommit);
         phaseTiming.Phase(DrawRowLockWait);
