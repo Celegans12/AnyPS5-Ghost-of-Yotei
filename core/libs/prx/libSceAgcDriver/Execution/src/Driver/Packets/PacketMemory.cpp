@@ -66,6 +66,32 @@ void reportEopLocked(std::chrono::steady_clock::time_point now) {
 std::atomic<std::int64_t> frameFlipNs{0}, frameEop0Ns{0};
 std::atomic<std::uint64_t> frameFlips{0};
 
+bool TraceWaitDrains() {
+    return traceEop();
+}
+
+void TraceWaitDrain(std::uint32_t writer, std::chrono::steady_clock::duration drained) {
+    static std::mutex mutex;
+    static std::array<std::pair<std::uint64_t, std::uint64_t>, 256> byWriter{};
+    static auto reported = std::chrono::steady_clock::now();
+    std::lock_guard lock(mutex);
+    auto& entry = byWriter[writer & 0xffu];
+    ++entry.first;
+    entry.second += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(drained).count());
+    const auto now = std::chrono::steady_clock::now();
+    if (now - reported < std::chrono::seconds(10)) return;
+    reported = now;
+    std::string line = "[wait-drains] 10 s, queue-0 WAIT_REG_MEM drains by the awaited label's last writer queue (0xfe: none seen; count, drain ms):";
+    for (std::size_t q = 0; q < byWriter.size(); ++q) {
+        if (byWriter[q].first == 0) continue;
+        char text[64];
+        std::snprintf(text, sizeof(text), " 0x%zx %llu %.1f;", q, static_cast<unsigned long long>(byWriter[q].first), byWriter[q].second / 1000.0);
+        line += text;
+        byWriter[q] = {};
+    }
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
 void TraceFlipReached() {
     if (!traceEop()) return;
     frameFlipNs.store(pipeNs(std::chrono::steady_clock::now()), std::memory_order_relaxed);

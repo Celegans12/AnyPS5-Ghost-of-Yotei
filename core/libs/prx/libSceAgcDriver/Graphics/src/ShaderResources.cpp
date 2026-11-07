@@ -5236,7 +5236,25 @@ bool ShaderResources::proveBuild(std::span<const CompiledShader> shaders, ProofR
         }
         return ok;
     }
-    return revalidateFull(shaders, report);
+    if (!aCensus()) return revalidateFull(shaders, report);
+    // Lever A census without the epoch memo (EpochProofs off in the game config): would the per-cause key have held?
+    const auto caused = GuestMemory::ProofSerialCaused();
+    const auto pending = StorageTexture::PendingSerial();
+    const std::size_t kind = shaders.size() == 1 ? 0 : 1;
+    aCounts.proofs[kind].fetch_add(1, std::memory_order_relaxed);
+    const bool keyHeld = provedEpoch != 0 && provedCaused == caused && provedPending == pending;
+    ProofReport censusReport;
+    auto* used = report != nullptr ? report : &censusReport;
+    const bool ok = revalidateFull(shaders, used);
+    const bool fast = ok && used->path == ProofPath::Fast;
+    if (keyHeld) aCounts.keyHeld[kind].fetch_add(1, std::memory_order_relaxed);
+    if (keyHeld && fast) aCounts.heldFast[kind].fetch_add(1, std::memory_order_relaxed);
+    if (!keyHeld && fast) aCounts.missFast[kind].fetch_add(1, std::memory_order_relaxed);
+    provedEpoch = ok ? 1 : 0;
+    provedCaused = caused;
+    provedPending = pending;
+    aReport();
+    return ok;
 }
 
 bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, ProofReport* report) {
