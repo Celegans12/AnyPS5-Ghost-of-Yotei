@@ -100,6 +100,7 @@ enum class RuntimeSwitch : std::size_t {
     ResourceCacheLarge,
     V3mAddrCeil,
     V3mStorageTokens,
+    V3mProbeMemo,
     Count,
 };
 
