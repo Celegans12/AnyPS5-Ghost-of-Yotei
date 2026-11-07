@@ -4,7 +4,9 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#ifndef _WIN32
 #include <shared_mutex>
+#endif
 #include <stdexcept>
 #include <string>
 
@@ -105,16 +107,26 @@ public:
     Rank LockRank() const { return rank; }
 
 private:
+    void rawLock();
+    bool rawTryLock();
+    void rawUnlock();
+    void rawLockShared();
+    bool rawTryLockShared();
+    void rawUnlockShared();
     Rank rank;
+#ifdef _WIN32
+    void* srw = nullptr;
+#else
     std::shared_mutex mutex;
+#endif
 };
 
 CacheLock& CacheLockFor(Rank rank);
 
 // Whether a SplitMutex acquire takes its cache lock now: APS5_V3E_LOCK_SPLIT is set and the thread holds the record lock.
 bool SplitTakes();
-void PushSplitTaken(Rank rank, bool taken);
-bool PopSplitTaken(Rank rank);
+void CountSplitTake();
+[[noreturn]] void NestedTooDeep(Rank rank);
 
 // A cache's own mutex (Inner), which with APS5_V3E_LOCK_SPLIT also takes the cache's ranked CacheLock (exclusive)
 // first while the record lock is held. Unlocked readers (stage A, PrepareDispatch probes, the preparer) take only
@@ -129,7 +141,7 @@ public:
         const bool take = SplitTakes();
         if (take) CacheLockFor(R).lock();
         inner.lock();
-        PushSplitTaken(R, take);
+        push(take);
     }
     bool try_lock() {
         const bool take = SplitTakes();
@@ -138,17 +150,28 @@ public:
             if (take) CacheLockFor(R).unlock();
             return false;
         }
-        PushSplitTaken(R, take);
+        push(take);
         return true;
     }
     void unlock() {
-        const bool took = PopSplitTaken(R);
+        const std::uint32_t level = depth != 0 ? --depth : 64;
+        const bool took = level < 64 && (takenBits >> level & 1u) != 0;
         inner.unlock();
         if (took) CacheLockFor(R).unlock();
     }
 
 private:
+    // Written and read only by the thread holding `inner` (a recursive Inner nests its holds on that one thread).
+    void push(bool take) {
+        if (depth >= 64) NestedTooDeep(R);
+        if (take) takenBits |= std::uint64_t{1} << depth;
+        else takenBits &= ~(std::uint64_t{1} << depth);
+        ++depth;
+        if (take) CountSplitTake();
+    }
     Inner inner;
+    std::uint64_t takenBits = 0;
+    std::uint32_t depth = 0;
 };
 
 }

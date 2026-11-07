@@ -4,6 +4,9 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 
 namespace AgcDriver::LockOrder {
 
@@ -21,14 +24,12 @@ std::atomic<std::uint64_t> contended{0};
 std::atomic<std::uint64_t> splitTakes{0};
 
 // Per thread and rank: held depth (annotations and cache locks; the record lock is GpuMutex's own owner token),
-// a cache lock's exclusive and shared depths and the mode it really holds, and the SplitMutex taken-bit stack.
+// a cache lock's exclusive and shared depths and the mode it really holds (SplitMutex keeps its taken bits itself).
 struct ThreadLocks {
     std::array<std::uint32_t, RankCount> held{};
     std::array<std::uint32_t, RankCount> exclusive{};
     std::array<std::uint32_t, RankCount> shared{};
     std::array<std::uint8_t, RankCount> real{};
-    std::array<std::uint64_t, RankCount> takenBits{};
-    std::array<std::uint8_t, RankCount> takenDepth{};
 };
 
 ThreadLocks& Thread() {
@@ -148,9 +149,9 @@ void CacheLock::lock() {
         throw OrderError(std::string("exclusive ") + Name(rank) + " lock asked for while holding it shared");
     }
     BeforeAcquire(rank);
-    if (!mutex.try_lock()) {
+    if (!rawTryLock()) {
         contended.fetch_add(1, std::memory_order_relaxed);
-        mutex.lock();
+        rawLock();
     }
     locks.real[i] = RealExclusive;
     ++locks.exclusive[i];
@@ -166,7 +167,7 @@ bool CacheLock::try_lock() {
         return true;
     }
     if (locks.real[i] == RealShared) return false;
-    if (!mutex.try_lock()) return false;
+    if (!rawTryLock()) return false;
     locks.real[i] = RealExclusive;
     ++locks.exclusive[i];
     ++locks.held[i];
@@ -180,7 +181,7 @@ void CacheLock::unlock() {
     --locks.held[i];
     if (locks.held[i] != 0) return;
     locks.real[i] = RealNone;
-    mutex.unlock();
+    rawUnlock();
 }
 
 void CacheLock::lock_shared() {
@@ -192,9 +193,9 @@ void CacheLock::lock_shared() {
         return;
     }
     BeforeAcquire(rank);
-    if (!mutex.try_lock_shared()) {
+    if (!rawTryLockShared()) {
         contended.fetch_add(1, std::memory_order_relaxed);
-        mutex.lock_shared();
+        rawLockShared();
     }
     locks.real[i] = RealShared;
     ++locks.shared[i];
@@ -204,7 +205,7 @@ void CacheLock::lock_shared() {
 bool CacheLock::try_lock_shared() {
     auto& locks = Thread();
     const auto i = Index(rank);
-    if (locks.real[i] == RealNone && !mutex.try_lock_shared()) return false;
+    if (locks.real[i] == RealNone && !rawTryLockShared()) return false;
     if (locks.real[i] == RealNone) locks.real[i] = RealShared;
     ++locks.shared[i];
     ++locks.held[i];
@@ -219,8 +220,8 @@ void CacheLock::unlock_shared() {
     if (locks.held[i] != 0) return;
     const auto real = locks.real[i];
     locks.real[i] = RealNone;
-    if (real == RealExclusive) mutex.unlock();
-    else mutex.unlock_shared();
+    if (real == RealExclusive) rawUnlock();
+    else rawUnlockShared();
 }
 
 bool CacheLock::HeldByThisThread() const {
@@ -251,30 +252,33 @@ bool SplitTakes() {
     return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::V3eLockSplit) && GuestMemory::GpuMutex().HeldByThisThread();
 }
 
-void PushSplitTaken(Rank rank, bool taken) {
-    auto& locks = Thread();
-    const auto i = Index(rank);
-    const auto depth = locks.takenDepth[i];
-    if (depth >= 64) {
-        std::fprintf(stderr, "[lock-order] SplitMutex %s nested deeper than 64\n", Name(rank));
-        std::abort();
-    }
-    if (taken) {
-        locks.takenBits[i] |= 1ull << depth;
-        const auto takes = splitTakes.fetch_add(1, std::memory_order_relaxed) + 1;
-        if ((takes & 0xfffffu) == 0) std::fprintf(stderr, "[lock-split] %llu cache-lock takes under the record lock, %llu contended, %llu violations, %llu record releases holding a cache lock\n", static_cast<unsigned long long>(takes), static_cast<unsigned long long>(contended.load(std::memory_order_relaxed)), static_cast<unsigned long long>(violations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(releasesHolding.load(std::memory_order_relaxed)));
-    } else {
-        locks.takenBits[i] &= ~(1ull << depth);
-    }
-    locks.takenDepth[i] = static_cast<std::uint8_t>(depth + 1);
+void CountSplitTake() {
+    thread_local std::uint32_t batch = 0;
+    if (++batch < 1024) return;
+    batch = 0;
+    const auto takes = splitTakes.fetch_add(1024, std::memory_order_relaxed) + 1024;
+    if ((takes & 0xfffffu) == 0) std::fprintf(stderr, "[lock-split] %llu cache-lock takes under the record lock, %llu contended, %llu violations, %llu record releases holding a cache lock\n", static_cast<unsigned long long>(takes), static_cast<unsigned long long>(contended.load(std::memory_order_relaxed)), static_cast<unsigned long long>(violations.load(std::memory_order_relaxed)), static_cast<unsigned long long>(releasesHolding.load(std::memory_order_relaxed)));
 }
 
-bool PopSplitTaken(Rank rank) {
-    auto& locks = Thread();
-    const auto i = Index(rank);
-    if (locks.takenDepth[i] == 0) return false;
-    const auto depth = --locks.takenDepth[i];
-    return (locks.takenBits[i] >> depth & 1u) != 0;
+void NestedTooDeep(Rank rank) {
+    std::fprintf(stderr, "[lock-order] SplitMutex %s nested deeper than 64\n", Name(rank));
+    std::abort();
 }
+
+#ifdef _WIN32
+void CacheLock::rawLock() { AcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srw)); }
+bool CacheLock::rawTryLock() { return TryAcquireSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srw)) != 0; }
+void CacheLock::rawUnlock() { ReleaseSRWLockExclusive(reinterpret_cast<PSRWLOCK>(&srw)); }
+void CacheLock::rawLockShared() { AcquireSRWLockShared(reinterpret_cast<PSRWLOCK>(&srw)); }
+bool CacheLock::rawTryLockShared() { return TryAcquireSRWLockShared(reinterpret_cast<PSRWLOCK>(&srw)) != 0; }
+void CacheLock::rawUnlockShared() { ReleaseSRWLockShared(reinterpret_cast<PSRWLOCK>(&srw)); }
+#else
+void CacheLock::rawLock() { mutex.lock(); }
+bool CacheLock::rawTryLock() { return mutex.try_lock(); }
+void CacheLock::rawUnlock() { mutex.unlock(); }
+void CacheLock::rawLockShared() { mutex.lock_shared(); }
+bool CacheLock::rawTryLockShared() { return mutex.try_lock_shared(); }
+void CacheLock::rawUnlockShared() { mutex.unlock_shared(); }
+#endif
 
 }
