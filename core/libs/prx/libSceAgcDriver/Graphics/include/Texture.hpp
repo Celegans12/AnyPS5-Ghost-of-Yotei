@@ -617,7 +617,7 @@ private:
     std::uint64_t layerBegin(std::uint32_t layer) const { return descriptor.baseAddress + static_cast<std::uint64_t>(layer) * trackedLayerBytes; }
     bool anyLayerPending() const;
     bool refresh(std::uint32_t firstLayer, std::uint32_t lastLayer);
-    // refresh (mem's storage tokens, APS5_V3M_STORAGE_TOKENS) -> refreshBody (exec's storage flags,
+    // refresh (mem's storage tokens, APS5_V3M_STORAGE_TOKENS; with tokens on it calls refreshFull directly) -> refreshBody (exec's storage flags,
     // APS5_V3E_STORAGE_FLAGS) -> refreshFull (the full refresh).
     bool refreshBody(std::uint32_t firstLayer, std::uint32_t lastLayer);
     bool refreshFull(std::uint32_t firstLayer, std::uint32_t lastLayer);

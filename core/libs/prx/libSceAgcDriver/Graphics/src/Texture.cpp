@@ -2535,7 +2535,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     counts.refreshes.fetch_add(1, std::memory_order_relaxed);
     if (firstLayer != 0 || lastLayer != trackedLayers || !tokenEligible()) {
         syncToken = 0;
-        return refreshBody(firstLayer, lastLayer);
+        return refreshFull(firstLayer, lastLayer);
     }
     counts.eligible.fetch_add(1, std::memory_order_relaxed);
     const auto base = descriptor.baseAddress;
@@ -2553,10 +2553,11 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
     const auto token = clean ? syncToken : other ? 0 : GuestMemory::DirtyArmAs(base, bytes, GuestArena::ArmStorage);
     if (!clean && !other && token == 0) counts.armRefused.fetch_add(1, std::memory_order_relaxed);
     syncToken = 0;
-    const bool current = refreshBody(firstLayer, lastLayer);
+    const auto versionBefore = Version();
+    const bool current = refreshFull(firstLayer, lastLayer);
     if (clean) {
         counts.verified.fetch_add(1, std::memory_order_relaxed);
-        if (!current) {
+        if (!current || Version() != versionBefore) {
             counts.violations.fetch_add(1, std::memory_order_relaxed);
             StorageTokens::Violation("a storage image the token called current was refreshed", base, bytes);
         }

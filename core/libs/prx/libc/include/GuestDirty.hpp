@@ -28,6 +28,7 @@ struct GuestDirtyCounts {
     std::uint64_t renewRefused = 0;
     std::uint64_t lateFaults = 0;
     std::uint64_t declined = 0;
+    std::uint64_t retriedFaults = 0;
     std::uint64_t lastDeclined = 0;
     std::uint64_t lastDeclinedState = 0;
 };
