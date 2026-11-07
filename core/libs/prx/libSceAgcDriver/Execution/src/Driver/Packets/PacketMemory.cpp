@@ -50,8 +50,7 @@ void reportEopLocked(std::chrono::steady_clock::time_point now) {
         line += text;
         e = {};
     }
-    std::fprintf(stderr, "%s
-", line.c_str());
+    std::fprintf(stderr, "%s\n", line.c_str());
 }
 }
 

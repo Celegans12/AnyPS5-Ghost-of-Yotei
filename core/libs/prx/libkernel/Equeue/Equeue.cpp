@@ -73,8 +73,7 @@ void noteWait(KernelEqueue eq, const void* caller, std::uint64_t startNs, const 
         std::snprintf(text, sizeof(text), " | %s: %llu waits avg %.1f ms (max %.0f), %llu events, %llu fired before the wait, trigger-to-wake avg %.2f ms (max %.1f)", hot[i].first.c_str(), static_cast<unsigned long long>(s.waits), s.waits ? s.waitNs / 1e6 / static_cast<double>(s.waits) : 0.0, s.maxWaitNs / 1e6, static_cast<unsigned long long>(s.events), static_cast<unsigned long long>(s.before), s.events ? s.lagNs / 1e6 / static_cast<double>(s.events) : 0.0, s.maxLagNs / 1e6);
         line += text;
     }
-    std::fprintf(stderr, "%s
-", line.c_str());
+    std::fprintf(stderr, "%s\n", line.c_str());
     traceSites.clear();
 }
 }
