@@ -34,7 +34,9 @@ bool traceEop() {
     static const bool enabled = std::getenv("APS5_TRACE_EOP") != nullptr;
     return enabled;
 }
-struct EopQueue { std::uint64_t deferred = 0, immediate = 0, lagUs = 0, maxLagUs = 0; };
+struct EopQueue { std::uint64_t deferred = 0, immediate = 0, lagUs = 0, maxLagUs = 0, piped = 0, submitUs = 0, maxSubmitUs = 0, commitUs = 0, maxCommitUs = 0; std::array<std::uint64_t, 4> ahead{}; };
+std::array<std::atomic<std::int64_t>, 256> pipeEnqueued{};
+std::int64_t pipeNs(std::chrono::steady_clock::time_point at) { return std::chrono::duration_cast<std::chrono::nanoseconds>(at.time_since_epoch()).count(); }
 std::mutex eopMutex;
 std::array<EopQueue, 256> eopQueues;
 std::chrono::steady_clock::time_point eopReport = std::chrono::steady_clock::now();
@@ -44,14 +46,48 @@ void reportEopLocked(std::chrono::steady_clock::time_point now) {
     std::string line = "[eop] 10 s, by queue (deferred: count, packet-to-delivery avg / max ms; immediate count):";
     for (std::size_t q = 0; q < eopQueues.size(); ++q) {
         auto& e = eopQueues[q];
-        if (e.deferred == 0 && e.immediate == 0) continue;
+        if (e.deferred == 0 && e.immediate == 0 && e.piped == 0) continue;
         char text[128];
         std::snprintf(text, sizeof(text), " 0x%zx %llu %.1f / %.1f, %llu;", q, static_cast<unsigned long long>(e.deferred), e.deferred ? e.lagUs / 1000.0 / static_cast<double>(e.deferred) : 0.0, e.maxLagUs / 1000.0, static_cast<unsigned long long>(e.immediate));
         line += text;
+        if (e.piped != 0) {
+            char pipe[256];
+            const auto n = static_cast<double>(e.piped);
+            std::snprintf(pipe, sizeof(pipe), " [label EOPs %llu: guest submit to packet avg %.1f / max %.1f ms, packet to commit avg %.1f / max %.1f ms; queue-0 flips ahead at the packet 0/1/2/3+: %llu/%llu/%llu/%llu];", static_cast<unsigned long long>(e.piped), e.submitUs / 1000.0 / n, e.maxSubmitUs / 1000.0, e.commitUs / 1000.0 / n, e.maxCommitUs / 1000.0, static_cast<unsigned long long>(e.ahead[0]), static_cast<unsigned long long>(e.ahead[1]), static_cast<unsigned long long>(e.ahead[2]), static_cast<unsigned long long>(e.ahead[3]));
+            line += pipe;
+        }
         e = {};
     }
     std::fprintf(stderr, "%s\n", line.c_str());
 }
+}
+
+void TracePipeStart(std::uint32_t queue, std::chrono::steady_clock::time_point enqueued) {
+    if (!traceEop()) return;
+    pipeEnqueued[queue % pipeEnqueued.size()].store(pipeNs(enqueued), std::memory_order_relaxed);
+}
+
+std::int64_t TracePipeSubmitted(std::uint32_t queue) {
+    return traceEop() ? pipeEnqueued[queue % pipeEnqueued.size()].load(std::memory_order_relaxed) : 0;
+}
+
+void TracePipeEop(std::uint32_t queue, std::int64_t submittedNs, std::int64_t seenNs, std::uint32_t flipsAhead) {
+    if (!traceEop() || seenNs == 0) return;
+    const auto now = std::chrono::steady_clock::now();
+    const auto nowNs = pipeNs(now);
+    std::lock_guard lock(eopMutex);
+    auto& e = eopQueues[queue % eopQueues.size()];
+    ++e.piped;
+    if (submittedNs != 0 && seenNs > submittedNs) {
+        const auto us = static_cast<std::uint64_t>((seenNs - submittedNs) / 1000);
+        e.submitUs += us;
+        e.maxSubmitUs = std::max(e.maxSubmitUs, us);
+    }
+    const auto commitUs = static_cast<std::uint64_t>(std::max<std::int64_t>(0, nowNs - seenNs) / 1000);
+    e.commitUs += commitUs;
+    e.maxCommitUs = std::max(e.maxCommitUs, commitUs);
+    ++e.ahead[std::min<std::uint32_t>(flipsAhead, 3)];
+    reportEopLocked(now);
 }
 
 void TraceEopDelivered(std::uint32_t queue, std::chrono::steady_clock::time_point registered, bool deferred) {
@@ -548,8 +584,12 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
     if (endOfPipeInterrupt) bumpEpoch(&EpochBumps::drains);
     auto stored = bytes;
     auto labelBytes = bytes;
-    auto enqueue =[this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt, writes, stored = std::move(stored)]() mutable {
-        DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt] {
+    const auto pipeSubmitted = endOfPipeInterrupt ? TracePipeSubmitted(queue) : 0;
+    const auto pipeSeen = endOfPipeInterrupt && pipeSubmitted != 0 ? pipeNs(std::chrono::steady_clock::now()) : 0;
+    const auto pipeAhead = flipsAhead.load(std::memory_order_relaxed);
+    auto enqueue =[this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt, writes, stored = std::move(stored), pipeSubmitted, pipeSeen, pipeAhead]() mutable {
+        DrawPipeline::Queue0().Enqueue([this, queue, opcode, address, bytes = std::move(bytes), endOfPipeInterrupt, pipeSubmitted, pipeSeen, pipeAhead] {
+            if (pipeSeen != 0) TracePipeEop(queue, pipeSubmitted, pipeSeen, pipeAhead);
             GuestMemory::SetCurrentPacket(opcode, queue);
             commitLabel(queue, address, bytes, endOfPipeInterrupt);
         }, std::move(writes), address, std::move(stored));
