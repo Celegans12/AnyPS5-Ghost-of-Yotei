@@ -7,12 +7,17 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include <chrono>
 #include <cstdio>
 #include <map>
 #include <mutex>
 #include <string>
 #include <utility>
+#include <unordered_map>
+#include <array>
+#include <memory>
 #include <vector>
 #include <algorithm>
 #include <cstdlib>
@@ -38,10 +43,11 @@ bool directEvalAccessible(void*, std::uint64_t address, std::uint64_t bytes) {
     return GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes), false);
 }
 
-void probeDirectEvaluation(const ShaderRecompiler::RecompileRequest& request) {
+void probeDirectEvaluation(const ShaderRecompiler::RecompileRequest& request, VulkanDevice* device) {
     struct Totals {
         std::uint64_t calls = 0, failed = 0, images = 0, samplers = 0, tables = 0, prepares = 0;
-        double us = 0;
+        std::uint64_t lookups = 0, lookupFailures = 0;
+        double us = 0, lookupUs = 0;
         std::map<std::string, std::uint64_t> reasons;
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     };
@@ -68,8 +74,9 @@ void probeDirectEvaluation(const ShaderRecompiler::RecompileRequest& request) {
             failure = std::string("prepare: ") + error.what();
         }
     }
-    double us = 0;
-    std::size_t images = 0, samplers = 0, tables = 0;
+    double us = 0, lookupUs = 0;
+    std::size_t images = 0, samplers = 0, tables = 0, lookups = 0, lookupFailures = 0;
+    static const bool textureProbe = std::getenv("APS5_DIRECT_TEX_PROBE") != nullptr;
     if (handle != nullptr) {
         ShaderRecompiler::SrtRuntime runtime;
         runtime.userData = request.context.userData;
@@ -83,10 +90,56 @@ void probeDirectEvaluation(const ShaderRecompiler::RecompileRequest& request) {
             images = capture->snapshot.images.size();
             samplers = capture->snapshot.samplers.size();
             tables = capture->snapshot.tables.tables.size();
+            us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+            if (textureProbe && device != nullptr && !capture->snapshot.images.empty()) {
+                const auto context = device->graphicsContext();
+                std::lock_guard gpu(GuestMemory::GpuMutex());
+                const auto lookupStarted = std::chrono::steady_clock::now();
+                static std::map<std::pair<std::uint32_t, std::uint32_t>, std::uint64_t> shapes;
+                static std::uint64_t shapeReports = 0;
+                struct MemoEntry {
+                    std::array<std::uint32_t, 8> words;
+                    std::uint64_t epoch;
+                    std::shared_ptr<Graphics::Texture> texture;
+                };
+                static std::unordered_map<std::uint64_t, MemoEntry> memo;
+                static std::uint64_t memoHits = 0, memoMisses = 0, memoReports = 0;
+                static const bool useMemo = std::getenv("APS5_DIRECT_TEX_MEMO") != nullptr;
+                const auto epoch = GuestMemory::ThreadCollectEpoch();
+                for (const auto& image : capture->snapshot.images) {
+                    ++shapes[{image.dwordCount, image.availableDwordMask}];
+                    if (image.dwordCount < 8u) continue;
+                    ++lookups;
+                    std::uint64_t hash = 1469598103934665603ull;
+                    for (const auto word : image.dwords) hash = (hash ^ word) * 1099511628211ull;
+                    if (useMemo) {
+                        if (const auto found = memo.find(hash); found != memo.end() && found->second.epoch == epoch && found->second.words == image.dwords) {
+                            ++memoHits;
+                            continue;
+                        }
+                        ++memoMisses;
+                    }
+                    try {
+                        auto texture = Graphics::CachedSampledTexture(context, std::span<const std::uint32_t>(image.dwords.data(), 8u), VK_IMAGE_VIEW_TYPE_2D);
+                        if (useMemo) memo[hash] = {image.dwords, epoch, std::move(texture)};
+                    } catch (const std::exception&) {
+                        ++lookupFailures;
+                    }
+                }
+                if (useMemo && ++memoReports % 100000u == 1u) {
+                    std::fprintf(stderr, "[direct-eval] texture memo: %llu hits, %llu misses, %zu entries\n", static_cast<unsigned long long>(memoHits), static_cast<unsigned long long>(memoMisses), memo.size());
+                    if (memo.size() > 65536u) memo.clear();
+                }
+                lookupUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - lookupStarted).count();
+                if (++shapeReports % 200000u == 1u) {
+                    std::string text = "[direct-eval] image shapes (dwords/mask: count):";
+                    for (const auto& [shape, count] : shapes) text += " " + std::to_string(shape.first) + "/0x" + std::to_string(shape.second) + ": " + std::to_string(count);
+                    std::fprintf(stderr, "%s\n", text.c_str());
+                }
+            }
         } catch (const std::exception& error) {
             failure = std::string("capture: ") + error.what();
         }
-        us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
     }
     std::lock_guard lock(mutex);
     ++totals.calls;
@@ -100,12 +153,15 @@ void probeDirectEvaluation(const ShaderRecompiler::RecompileRequest& request) {
         totals.images += images;
         totals.samplers += samplers;
         totals.tables += tables;
+        totals.lookups += lookups;
+        totals.lookupFailures += lookupFailures;
+        totals.lookupUs += lookupUs;
     }
     const auto now = std::chrono::steady_clock::now();
     if (now - totals.last < std::chrono::seconds(10)) return;
     totals.last = now;
     const auto ok = totals.calls - totals.failed;
-    std::string line = "[direct-eval] 10 s: " + std::to_string(totals.calls) + " stage evaluations, " + std::to_string(totals.failed) + " failed, " + std::to_string(totals.prepares) + " prepared; avg " + std::to_string(ok != 0 ? totals.us / static_cast<double>(ok) : 0.0) + " us; images " + std::to_string(totals.images) + ", samplers " + std::to_string(totals.samplers) + ", table columns " + std::to_string(totals.tables) + ";";
+    std::string line = "[direct-eval] 10 s: " + std::to_string(totals.calls) + " stage evaluations, " + std::to_string(totals.failed) + " failed, " + std::to_string(totals.prepares) + " prepared; avg " + std::to_string(ok != 0 ? totals.us / static_cast<double>(ok) : 0.0) + " us; images " + std::to_string(totals.images) + ", samplers " + std::to_string(totals.samplers) + ", table columns " + std::to_string(totals.tables) + "; texture lookups " + std::to_string(totals.lookups) + " (" + std::to_string(totals.lookupFailures) + " failed), avg " + std::to_string(totals.lookups != 0 ? totals.lookupUs / static_cast<double>(totals.lookups) : 0.0) + " us each;";
     std::vector<std::pair<std::uint64_t, std::string>> top;
     for (const auto& [text, count] : totals.reasons) top.emplace_back(count, text);
     std::sort(top.rbegin(), top.rend());
@@ -174,7 +230,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
         request.layout.pushConstantSizeBytes = std::min(request.layout.pushConstantSizeBytes, ShaderRecompiler::DepthRemapPushOffsetBytes - pushOffset);
     }
     static const bool directEvalProbe = std::getenv("APS5_DIRECT_EVAL_PROBE") != nullptr;
-    if (directEvalProbe) probeDirectEvaluation(request);
+    if (directEvalProbe) probeDirectEvaluation(request, localDevice.get());
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     auto invocation = [&] {
         try {
