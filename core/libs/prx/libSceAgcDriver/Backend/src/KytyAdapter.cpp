@@ -312,7 +312,12 @@ public:
             std::memcpy(reinterpret_cast<void*>(functionTable), functions.data(), sizeof(functions));
             std::memcpy(reinterpret_cast<void*>(code), validator.data(), sizeof(validator));
             std::memcpy(reinterpret_cast<void*>(base), descriptor.data(), sizeof(descriptor));
-            Print("[kyty] AGC driver block: 2 MiB direct memory at 0x%llx (physical 0x%llx), Kyty's static table layout at +0x40000\n", static_cast<unsigned long long>(DriverBlockAddress), static_cast<unsigned long long>(physical));
+            std::uint8_t* backing = nullptr;
+            std::uint64_t backingBytes = 0;
+            if (!DirectMemoryBackingView_nid_no_patch(&backing, &backingBytes) || static_cast<std::uint64_t>(physical) + DriverBlockBytes > backingBytes) throw std::runtime_error("the AGC driver block is not in the direct memory backing view");
+            const bool same = std::memcmp(backing + physical + DriverTableOffset, reinterpret_cast<const void*>(base), 0x100u + sizeof(validator)) == 0;
+            Print("[kyty] AGC driver block: 2 MiB direct memory at 0x%llx (physical 0x%llx), Kyty's static table layout at +0x40000; backing view %s the guest view's bytes\n", static_cast<unsigned long long>(DriverBlockAddress), static_cast<unsigned long long>(physical), same ? "holds" : "DOES NOT hold");
+            if (!same) throw std::runtime_error("the direct memory backing view does not see the guest's writes");
         });
         return reinterpret_cast<void*>(DriverBlockAddress + DriverTableOffset);
     }
