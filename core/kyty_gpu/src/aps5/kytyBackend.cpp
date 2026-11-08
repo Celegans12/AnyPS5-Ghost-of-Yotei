@@ -180,6 +180,7 @@ int Start(Aps5GpuBackend* /*backend*/) {
 	bool ok = true;
 	std::call_once(B().started, [&] {
 		Common::SetFatalHook(&FatalHook);
+		std::call_once(B().shaders_ready, [] { Graphics::ShaderInit(); });
 		ApplySettings();
 		Config::Initialize();
 		Config::Load(ReleaseConfig());
