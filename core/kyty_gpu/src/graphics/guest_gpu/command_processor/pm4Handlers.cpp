@@ -2650,17 +2650,20 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	return s + 1;
 }
 
+// Kyty's builder writes 7 dwords, AnyPS5's libSceAgc 4 (0xc0021018: handle, index, 0); both start with the video out
+// handle and the display buffer index.
 KYTY_CP_OP_PARSER(CpOpWaitFlipDone) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0051018);
+	EXIT_NOT_IMPLEMENTED(cmd_id != KYTY_PM4(7, Pm4::IT_NOP, Pm4::R_WAIT_FLIP_DONE) &&
+	                     cmd_id != KYTY_PM4(4, Pm4::IT_NOP, Pm4::R_WAIT_FLIP_DONE));
 
 	auto video_out_handle     = buffer[0];
 	auto display_buffer_index = buffer[1];
 
 	cp.WaitFlipDone(video_out_handle, display_buffer_index);
 
-	return 6;
+	return KYTY_PM4_LEN(cmd_id) - 1u;
 }
 
 template <typename T>
