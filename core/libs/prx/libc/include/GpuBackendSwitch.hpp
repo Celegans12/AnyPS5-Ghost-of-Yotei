@@ -1,0 +1,6 @@
+#ifndef CORE_LIBS_PRX_LIBC_INCLUDE_GPUBACKENDSWITCH_HPP
+#define CORE_LIBS_PRX_LIBC_INCLUDE_GPUBACKENDSWITCH_HPP
+
+extern "C" bool LibcGpuBackendKyty_nid_no_patch();
+
+#endif

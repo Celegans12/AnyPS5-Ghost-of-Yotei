@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GpuBackendSwitch.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <algorithm>
@@ -43,6 +44,75 @@ std::atomic<void (*)(std::uintptr_t, std::size_t, std::uint64_t)> privateMapping
 #endif
 std::atomic<void (*)(std::uintptr_t, std::size_t)> accessObserver{nullptr};
 std::atomic<void (*)(std::uintptr_t, std::size_t, bool)> mappingGuardObserver{nullptr};
+std::atomic<void (*)(std::uintptr_t, std::size_t)> hostWriteEndHook{nullptr};
+std::atomic<GuestArenaChangeBegin> backendChangeBegin{nullptr};
+std::atomic<GuestArenaChangeEnd> backendChangeEnd{nullptr};
+
+bool rangeHasPages(std::uintptr_t address, std::size_t bytes) {
+#ifdef _WIN32
+    const auto end = address + bytes;
+    for (auto cursor = address; cursor < end;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) return true;
+        if (info.State == MEM_COMMIT) return true;
+        const auto next = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (next <= cursor) return true;
+        cursor = next;
+    }
+    return false;
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return true;
+#endif
+}
+
+class BackendChange {
+public:
+    BackendChange(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, std::uint32_t protection) : address(address), bytes(bytes), kind(kind), protection(protection), exceptions(std::uncaught_exceptions()) {
+        const auto begin = backendChangeBegin.load(std::memory_order_acquire);
+        if (begin == nullptr) return;
+        begin(address, bytes, kind, rangeHasPages(address, bytes));
+        open = true;
+    }
+    ~BackendChange() {
+        if (!open) return;
+        if (const auto end = backendChangeEnd.load(std::memory_order_acquire)) end(address, bytes, kind, protection, std::uncaught_exceptions() == exceptions);
+    }
+    BackendChange(const BackendChange&) = delete;
+    BackendChange& operator=(const BackendChange&) = delete;
+
+private:
+    std::uintptr_t address;
+    std::size_t bytes;
+    std::uint32_t kind;
+    std::uint32_t protection;
+    int exceptions;
+    bool open = false;
+};
+
+struct PendingProtection {
+    std::uintptr_t address = 0;
+    std::size_t bytes = 0;
+    std::uint32_t protection = 0;
+    bool open = false;
+};
+
+thread_local PendingProtection pendingProtection;
+
+void beginBackendProtection(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
+    const auto begin = backendChangeBegin.load(std::memory_order_acquire);
+    if (begin == nullptr || pendingProtection.open) return;
+    begin(address, bytes, GuestArenaChangeProtect, true);
+    pendingProtection = {address, bytes, protection, true};
+}
+
+void endBackendProtection(bool succeeded) {
+    if (!pendingProtection.open) return;
+    const auto pending = pendingProtection;
+    pendingProtection = {};
+    if (const auto end = backendChangeEnd.load(std::memory_order_acquire)) end(pending.address, pending.bytes, GuestArenaChangeProtect, pending.protection, succeeded);
+}
 
 class MappingChange {
 public:
@@ -243,7 +313,7 @@ private:
 #if defined(__linux__) || defined(__APPLE__)
         SeedHostUsedRanges();
 #elif defined(_WIN32)
-        _writeWatched = std::getenv("APS5_NO_WRITE_WATCH") == nullptr;
+        _writeWatched = !LibcGpuBackendKyty_nid_no_patch() && std::getenv("APS5_NO_WRITE_WATCH") == nullptr;
         SYSTEM_INFO system{};
         GetSystemInfo(&system);
         const std::uintptr_t granularity = system.dwAllocationGranularity;
@@ -457,6 +527,7 @@ void GuestArenaMarkUsed_nid_postfix(const void* pointer, std::size_t bytes) {
 }
 
 void GuestArenaRelease_nid_postfix(const void* pointer, std::size_t bytes) {
+    const BackendChange backend(reinterpret_cast<std::uintptr_t>(pointer), bytes, GuestArenaChangeUnmap, 0);
     const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     Arena::Get().Release(pointer, bytes);
 }
@@ -478,9 +549,15 @@ std::invalid_argument OutsideArena(const char* operation, const void* pointer, s
 
 #ifdef _WIN32
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
-    const MappingChange change(address, bytes, false);
-    WindowsMappings::Get().SetProtection(address, bytes, protection);
-    noteAccess(reinterpret_cast<const void*>(address), bytes);
+    beginBackendProtection(address, bytes, protection);
+    try {
+        const MappingChange change(address, bytes, false);
+        WindowsMappings::Get().SetProtection(address, bytes, protection);
+        noteAccess(reinterpret_cast<const void*>(address), bytes);
+    } catch (...) {
+        endBackendProtection(false);
+        throw;
+    }
 }
 
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
@@ -533,6 +610,7 @@ void GuestArenaSetPrivateMappingObserver_nid_postfix(void (*callback)(std::uintp
 void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_t protection, std::size_t granule) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("commit", pointer, bytes);
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    const BackendChange backend(reinterpret_cast<std::uintptr_t>(pointer), bytes, GuestArenaChangeMap, protection);
     const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     const auto created = WindowsMappings::Get().Commit(pointer, bytes, protection, granule, Arena::Get().WriteWatched());
     if (const auto callback = privateMappingObserver.load(std::memory_order_acquire)) {
@@ -543,12 +621,14 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
 
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
+    const BackendChange backend(reinterpret_cast<std::uintptr_t>(pointer), bytes, GuestArenaChangeUnmap, 0);
     const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     WindowsMappings::Get().Reset(pointer, bytes);
 }
 
 void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("shared mapping", pointer, bytes);
+    const BackendChange backend(reinterpret_cast<std::uintptr_t>(pointer), bytes, GuestArenaChangeMap, protection);
     const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false);
     noteAccess(pointer, bytes);
@@ -556,12 +636,13 @@ void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, 
 
 void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("direct memory mapping", pointer, bytes);
+    const BackendChange backend(reinterpret_cast<std::uintptr_t>(pointer), bytes, GuestArenaChangeMap, protection);
     const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     std::vector<std::pair<std::uintptr_t, std::size_t>> created;
     std::exception_ptr failure;
     try {
-        WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), true, PAGE_EXECUTE_READWRITE, SIZE_MAX, &created);
+        WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), !LibcGpuBackendKyty_nid_no_patch(), PAGE_EXECUTE_READWRITE, SIZE_MAX, &created);
     } catch (...) {
         failure = std::current_exception();
     }
@@ -579,6 +660,7 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
 
 void GuestArenaMapFile_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection, std::uint32_t viewProtection, std::size_t sectionBytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("file mapping", pointer, bytes);
+    const BackendChange backend(reinterpret_cast<std::uintptr_t>(pointer), bytes, GuestArenaChangeMap, protection);
     const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false, viewProtection, sectionBytes);
 }
@@ -719,6 +801,7 @@ void GuestArenaTakeOwnedCounts_nid_no_patch(std::uint64_t* counts, std::size_t c
 
 void GuestArenaEndSetProtection_nid_no_patch(std::uintptr_t, std::size_t) {
     WindowsMappings::Get().EndSetProtection();
+    endBackendProtection(std::uncaught_exceptions() == 0);
 }
 
 std::uint32_t GuestArenaMappingLockOwner_nid_no_patch() {
@@ -853,6 +936,16 @@ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #else
     GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(pointer, bytes);
 #endif
+    if (const auto hook = hostWriteEndHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+}
+
+void GuestArenaSetHostWriteEndHook_nid_no_patch(void (*hook)(std::uintptr_t, std::size_t)) {
+    hostWriteEndHook.store(hook, std::memory_order_release);
+}
+
+void GuestArenaSetBackendObserver_nid_no_patch(GuestArenaChangeBegin begin, GuestArenaChangeEnd end) {
+    backendChangeEnd.store(end, std::memory_order_release);
+    backendChangeBegin.store(begin, std::memory_order_release);
 }
 
 #ifndef _WIN32

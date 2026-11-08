@@ -76,6 +76,13 @@ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes);
 void GuestArenaSetHostWriteHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaSetHostReadHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
 void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t bytes);
+void GuestArenaSetHostWriteEndHook_nid_no_patch(void (*hook)(std::uintptr_t address, std::size_t bytes));
+inline constexpr std::uint32_t GuestArenaChangeMap = 1;
+inline constexpr std::uint32_t GuestArenaChangeUnmap = 2;
+inline constexpr std::uint32_t GuestArenaChangeProtect = 3;
+using GuestArenaChangeBegin = void (*)(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, bool hadPages);
+using GuestArenaChangeEnd = void (*)(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, std::uint32_t protection, bool succeeded);
+void GuestArenaSetBackendObserver_nid_no_patch(GuestArenaChangeBegin begin, GuestArenaChangeEnd end);
 // Owned blocks (WindowsMappings::ArmOwned, the driver's owned proofs; write watch, no protection
 // change and no fault): arms every 64 KiB block overlapping the range (`count` = their number) and
 // stores their armed words, or arms none (false: a block that cannot be armed, outside the arena,
