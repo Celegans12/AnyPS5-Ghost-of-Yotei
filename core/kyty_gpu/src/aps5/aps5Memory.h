@@ -11,6 +11,7 @@ struct MemoryStats {
 	uint64_t direct_bytes   = 0;
 	uint64_t private_bytes  = 0;
 	uint64_t discovered     = 0;
+	uint64_t protect_splits = 0; // tracker protections the host refused whole (they crossed views) and that were split
 };
 
 // At create: the backing view (map notifications arrive from then on, before start).

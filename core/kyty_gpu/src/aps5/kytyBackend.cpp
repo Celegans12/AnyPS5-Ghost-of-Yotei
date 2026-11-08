@@ -169,12 +169,13 @@ void ReportMaybe() {
 	const auto load   = [](const std::atomic<uint64_t>& value) { return static_cast<unsigned long long>(value.load()); };
 	Log("kyty backend: submits %llu, cpu flips %llu, presents %llu, shaders %llu; mappings %llu (direct %llu MiB, private "
 	    "%llu MiB, %llu found by lookup), map %llu unmap %llu protect %llu, host writes %llu reads %llu; faults %llu "
-	    "(%llu served, %llu on guest threads)",
+	    "(%llu served, %llu on guest threads); tracker protections split %llu",
 	    load(b.counts.submits), load(b.counts.cpu_flips), load(b.counts.presents), load(b.counts.shaders),
 	    static_cast<unsigned long long>(memory.entries), static_cast<unsigned long long>(memory.direct_bytes >> 20u),
 	    static_cast<unsigned long long>(memory.private_bytes >> 20u), static_cast<unsigned long long>(memory.discovered),
 	    load(b.counts.maps), load(b.counts.unmaps), load(b.counts.protects), load(b.counts.host_writes),
-	    load(b.counts.host_reads), load(b.counts.faults), load(b.counts.faults_handled), load(b.counts.guest_faults));
+	    load(b.counts.host_reads), load(b.counts.faults), load(b.counts.faults_handled), load(b.counts.guest_faults),
+	    static_cast<unsigned long long>(memory.protect_splits));
 }
 
 int Start(Aps5GpuBackend* /*backend*/) {

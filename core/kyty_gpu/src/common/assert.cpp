@@ -54,6 +54,13 @@ void SetFatalHook(FatalHook hook) {
 	g_fatal_hook = hook;
 }
 
+void FatalExit(const char* report, int status) {
+	if (g_fatal_hook != nullptr) {
+		g_fatal_hook(report, status);
+	}
+	std::_Exit(status);
+}
+
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
 	PrintFatalFrames();
 	g_fatal_report = BuildFatalReport(title, text, file, line);

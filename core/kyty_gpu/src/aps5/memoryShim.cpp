@@ -1159,6 +1159,44 @@ static DWORD WindowsProtection(VirtualMemory::Mode mode) {
 	}
 }
 
+static std::atomic<uint64_t> g_protect_splits {0};
+
+// One VirtualProtect cannot cross from one allocation to the next. Kyty maps one view per guest mapping; AnyPS5 maps a
+// guest range as several views or commits it in granules (128 KiB views in the world), so a range the host refuses
+// whole is protected again allocation by allocation, over its committed parts only (as Kyty skips what is not mapped).
+static bool ProtectPiece(uint64_t vaddr, uint64_t size, DWORD protection) {
+	if (Aps5::ProtectGuest(vaddr, size, protection)) {
+		return true;
+	}
+	g_protect_splits.fetch_add(1, std::memory_order_relaxed);
+	const auto end    = vaddr + size;
+	auto       cursor = vaddr;
+	bool       ok     = true;
+	while (cursor < end) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) {
+			return false;
+		}
+		auto stop = std::min(end, reinterpret_cast<uint64_t>(info.BaseAddress) + info.RegionSize);
+		if (info.State != MEM_COMMIT) {
+			cursor = stop;
+			continue;
+		}
+		// The next regions of the same allocation join the piece (VirtualQuery splits one by protection).
+		while (stop < end) {
+			MEMORY_BASIC_INFORMATION next {};
+			if (VirtualQuery(reinterpret_cast<const void*>(stop), &next, sizeof(next)) == 0 ||
+			    next.AllocationBase != info.AllocationBase || next.State != MEM_COMMIT) {
+				break;
+			}
+			stop = std::min(end, reinterpret_cast<uint64_t>(next.BaseAddress) + next.RegionSize);
+		}
+		ok     = Aps5::ProtectGuest(cursor, stop - cursor, protection) && ok;
+		cursor = stop;
+	}
+	return ok;
+}
+
 // Kyty's ProtectTransient: the tracker's protection, over the committed pieces of the range only (Kyty protects mapped
 // regions and skips gaps), through the host, which orders it against AnyPS5's own mapping and protection changes.
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode mode) {
@@ -1177,11 +1215,11 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, VirtualMemory::Mode m
 		pieces[count++] = {start, bytes};
 	});
 	if (count == 0 || overflow) {
-		return Aps5::ProtectGuest(vaddr, size, protection);
+		return ProtectPiece(vaddr, size, protection);
 	}
 	bool ok = true;
 	for (size_t i = 0; i < count; i++) {
-		ok = Aps5::ProtectGuest(pieces[i].first, pieces[i].second, protection) && ok;
+		ok = ProtectPiece(pieces[i].first, pieces[i].second, protection) && ok;
 	}
 	return ok;
 }
@@ -1228,7 +1266,8 @@ void MemoryUnmapped(uint64_t address, uint64_t bytes) {
 
 MemoryStats GetMemoryStats() {
 	const auto stats = Libs::LibKernel::Memory::Map().GetStats();
-	return {stats.entries, stats.direct, stats.private_, stats.discovered};
+	return {stats.entries, stats.direct, stats.private_, stats.discovered,
+	        Libs::LibKernel::Memory::g_protect_splits.load(std::memory_order_relaxed)};
 }
 
 void MemoryForEachMapping(void (*callback)(void* context, uint64_t address, uint64_t bytes), void* context) {

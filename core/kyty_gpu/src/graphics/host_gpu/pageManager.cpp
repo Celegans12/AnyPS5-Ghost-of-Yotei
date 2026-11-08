@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/pageManager.h"
 
 #include "common/alignment.h"
+#include "common/assert.h"
 #include "common/profiler.h"
 #include "common/virtualMemory.h"
 #include "graphics/host_gpu/regionDefinitions.h"
@@ -18,6 +19,7 @@
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -61,14 +63,18 @@ constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 }
 
 [[noreturn]] void Fatal(const char* format, ...) {
-	std::fputs("PageManager fatal: ", stderr);
+	char    report[512] = "PageManager fatal: ";
 	va_list args;
 	va_start(args, format);
-	std::vfprintf(stderr, format, args);
+	const auto prefix = std::strlen(report);
+	std::vsnprintf(report + prefix, sizeof(report) - prefix, format, args);
 	va_end(args);
+	std::fputs(report, stderr);
 	std::fputc('\n', stderr);
 	std::fflush(stderr);
-	std::_Exit(322);
+	// An embedding host (AnyPS5's kyty_gpu.dll) ends the process its own way: _Exit from a DLL runs every module's
+	// detach (the world run v4b-k-w1 hung there, in a static destructor of AnyPS5's AGC driver).
+	Common::FatalExit(report, 322);
 }
 
 static inline void SpinPause() noexcept {
