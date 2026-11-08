@@ -8215,6 +8215,21 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
         if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        if (fm2Snap && override != moved.end() && !movedOnly && bytes != 0 && FastMode2::SnapMovedInPlace()) {
+            const auto* import = HostImportFor(context, begin, bytes);
+            const auto importOffset = import != nullptr ? HostImportOffset(*import, begin) : 0;
+            const auto alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4);
+            if (import != nullptr && importOffset % alignment == 0 && bytes <= context.limits.maxStorageBufferRange) {
+                recorder.NotePendingRead(begin, bytes, Recorder::ReadKind::DrawInput);
+                FastMode2::Count().snapInPlace.fetch_add(1, std::memory_order_relaxed);
+                selected.push_back(index);
+                DrawBindings::Snapshot snapshot{begin, nullptr, importOffset, bytes};
+                snapshot.inPlace = import->buffer;
+                keep(std::move(snapshot));
+                continue;
+            }
+            FastMode2::Count().snapNotInPlace.fetch_add(1, std::memory_order_relaxed);
+        }
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         if (!stamped) {
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
