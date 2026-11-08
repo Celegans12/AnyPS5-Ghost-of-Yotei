@@ -915,7 +915,7 @@ endif()
 if (KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator onecore)
 endif()
-if (GCC AND WIN32)
+if (WIN32 AND NOT KYTY_CLANG_CL)
 	# MinGW-w64 has no import library with KernelBase.dll's VirtualAlloc2, MapViewOfFile3 and UnmapViewOfFile2 (clang-cl
 	# takes them from onecore): one is made from a .def with dlltool. FFmpeg's libavutil needs bcrypt, and the Windows
 	# entry point is wmain (-municode).

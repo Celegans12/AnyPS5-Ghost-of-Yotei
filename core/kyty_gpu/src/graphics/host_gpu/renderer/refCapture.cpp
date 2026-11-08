@@ -92,7 +92,7 @@ int HostCopyFilter(unsigned long code) {
 }
 
 // Kept tiny on purpose: __try cannot share a function with objects that need unwinding.
-#if defined(_MSC_VER) || defined(__clang__)
+#if defined(_MSC_VER)
 bool GuardedHostCopy(void* destination, uint64_t source, uint64_t size) {
 	__try {
 		std::memcpy(destination, reinterpret_cast<const void*>(source), static_cast<size_t>(size));
@@ -102,7 +102,8 @@ bool GuardedHostCopy(void* destination, uint64_t source, uint64_t size) {
 	}
 }
 #else
-// GCC has no __try/__except (MinGW): ReadProcessMemory on this process fails instead of faulting on an unreadable page.
+// MinGW has no __try/__except (GCC rejects it; clang parses it but emits no handler): ReadProcessMemory on this process
+// fails instead of faulting on an unreadable page.
 bool GuardedHostCopy(void* destination, uint64_t source, uint64_t size) {
 	(void)&HostCopyFilter;
 	SIZE_T read = 0;
