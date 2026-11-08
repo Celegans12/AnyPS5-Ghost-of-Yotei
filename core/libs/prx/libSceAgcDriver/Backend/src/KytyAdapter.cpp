@@ -564,12 +564,12 @@ void ChangeBegin(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, 
     if (g_changeDepth++ == 0) adapter.protectLock.lock();
 }
 
-void ChangeEnd(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, std::uint32_t protection, bool succeeded) {
+void ChangeEnd(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, std::uint32_t protection, std::uint64_t directOffset, bool succeeded) {
     auto& adapter = A();
     if (--g_changeDepth == 0) adapter.protectLock.unlock();
     if (!succeeded) return;
     if (kind == GuestArena::GuestArenaChangeMap) {
-        adapter.api->memory_map(adapter.backend, address, bytes, protection);
+        adapter.api->memory_map(adapter.backend, address, bytes, protection, directOffset == GuestArena::GuestArenaNoSectionOffset ? APS5_GPU_NOT_DIRECT : directOffset);
         adapter.counts.maps.fetch_add(1, std::memory_order_relaxed);
         adapter.generation.fetch_add(1, std::memory_order_acq_rel);
     } else if (kind == GuestArena::GuestArenaChangeProtect) {

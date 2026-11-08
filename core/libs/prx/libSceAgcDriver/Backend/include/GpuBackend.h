@@ -28,7 +28,9 @@
  *   (no AnyPS5 queue workers and no cross-queue ordering in front of them). submit must not wait for GPU work
  *   to finish: it queues the dwords and returns.
  * - memory_unmap runs before AnyPS5 changes the pages, memory_map and memory_protect after the change landed,
- *   on the thread that changes the mapping. AnyPS5 holds none of its mapping locks during these calls.
+ *   on the thread that changes the mapping. AnyPS5 holds none of its arena mapping locks during these calls, but it
+ *   may hold its direct-memory table lock: direct_mapping must not be called from them, and memory_map passes the
+ *   range's offset in the backing view instead (APS5_GPU_NOT_DIRECT for memory that is not direct memory).
  * - protect_guest is the only way the backend changes the protection of guest pages: AnyPS5 applies it under a
  *   shared lock that every guest mapping or protection change holds exclusively, so the two never interleave.
  * - handle_fault runs inside the first vectored exception handler of the process, on the faulting thread. It
@@ -51,7 +53,8 @@
 extern "C" {
 #endif
 
-#define APS5_GPU_BACKEND_ABI_VERSION 1u
+#define APS5_GPU_BACKEND_ABI_VERSION 2u
+#define APS5_GPU_NOT_DIRECT UINT64_MAX
 #define APS5_GPU_BACKEND_CREATE_SYMBOL "Aps5GpuBackendCreate"
 
 typedef struct Aps5GpuBackend Aps5GpuBackend;
@@ -166,7 +169,7 @@ typedef struct Aps5GpuBackendApi {
     int (*register_shader)(Aps5GpuBackend* backend, const Aps5GpuShaderInfo* shader);
 
     void (*memory_unmap)(Aps5GpuBackend* backend, uint64_t address, uint64_t bytes);
-    void (*memory_map)(Aps5GpuBackend* backend, uint64_t address, uint64_t bytes, uint32_t protection);
+    void (*memory_map)(Aps5GpuBackend* backend, uint64_t address, uint64_t bytes, uint32_t protection, uint64_t direct_offset);
     void (*memory_protect)(Aps5GpuBackend* backend, uint64_t address, uint64_t bytes, uint32_t protection);
     void (*host_write_begin)(Aps5GpuBackend* backend, uint64_t address, uint64_t bytes);
     void (*host_write_end)(Aps5GpuBackend* backend, uint64_t address, uint64_t bytes);

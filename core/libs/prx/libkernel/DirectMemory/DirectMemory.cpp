@@ -1653,7 +1653,17 @@ extern "C" bool DirectMemoryBackingView_nid_no_patch(std::uint8_t** base, std::u
 }
 
 extern "C" bool DirectMemoryQueryMapping_nid_no_patch(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end, std::uint64_t* offset, int* memoryType) {
-    return QueryDirectMapping(address, start, end, offset, memoryType);
+    std::unique_lock lock(g_directLock, std::try_to_lock);
+    if (!lock.owns_lock()) return false;
+    const auto next = g_directMappings.upper_bound(address);
+    if (next == g_directMappings.begin()) return false;
+    const auto it = std::prev(next);
+    if (address >= it->second.end) return false;
+    *start = it->first;
+    *end = it->second.end;
+    *offset = it->second.phys;
+    *memoryType = it->second.memoryType;
+    return true;
 }
 
 extern "C" std::int64_t DirectMemoryMapSystemBlock_nid_no_patch(std::uintptr_t address, std::size_t bytes, int memoryType, int prot) {

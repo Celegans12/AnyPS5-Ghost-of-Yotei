@@ -69,7 +69,7 @@ bool rangeHasPages(std::uintptr_t address, std::size_t bytes) {
 
 class BackendChange {
 public:
-    BackendChange(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, std::uint32_t protection) : address(address), bytes(bytes), kind(kind), protection(protection), exceptions(std::uncaught_exceptions()) {
+    BackendChange(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, std::uint32_t protection, std::uint64_t directOffset = GuestArenaNoSectionOffset) : address(address), bytes(bytes), kind(kind), protection(protection), directOffset(directOffset), exceptions(std::uncaught_exceptions()) {
         const auto begin = backendChangeBegin.load(std::memory_order_acquire);
         if (begin == nullptr) return;
         begin(address, bytes, kind, rangeHasPages(address, bytes));
@@ -77,7 +77,7 @@ public:
     }
     ~BackendChange() {
         if (!open) return;
-        if (const auto end = backendChangeEnd.load(std::memory_order_acquire)) end(address, bytes, kind, protection, std::uncaught_exceptions() == exceptions);
+        if (const auto end = backendChangeEnd.load(std::memory_order_acquire)) end(address, bytes, kind, protection, directOffset, std::uncaught_exceptions() == exceptions);
     }
     BackendChange(const BackendChange&) = delete;
     BackendChange& operator=(const BackendChange&) = delete;
@@ -87,6 +87,7 @@ private:
     std::size_t bytes;
     std::uint32_t kind;
     std::uint32_t protection;
+    std::uint64_t directOffset;
     int exceptions;
     bool open = false;
 };
@@ -111,7 +112,7 @@ void endBackendProtection(bool succeeded) {
     if (!pendingProtection.open) return;
     const auto pending = pendingProtection;
     pendingProtection = {};
-    if (const auto end = backendChangeEnd.load(std::memory_order_acquire)) end(pending.address, pending.bytes, GuestArenaChangeProtect, pending.protection, succeeded);
+    if (const auto end = backendChangeEnd.load(std::memory_order_acquire)) end(pending.address, pending.bytes, GuestArenaChangeProtect, pending.protection, GuestArenaNoSectionOffset, succeeded);
 }
 
 class MappingChange {
@@ -636,7 +637,7 @@ void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, 
 
 void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("direct memory mapping", pointer, bytes);
-    const BackendChange backend(reinterpret_cast<std::uintptr_t>(pointer), bytes, GuestArenaChangeMap, protection);
+    const BackendChange backend(reinterpret_cast<std::uintptr_t>(pointer), bytes, GuestArenaChangeMap, protection, offset);
     const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
     std::vector<std::pair<std::uintptr_t, std::size_t>> created;

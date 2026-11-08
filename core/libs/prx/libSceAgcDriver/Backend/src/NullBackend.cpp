@@ -298,7 +298,7 @@ void MemoryUnmap(Aps5GpuBackend* backend, std::uint64_t, std::uint64_t) {
     backend->unmaps.fetch_add(1, std::memory_order_relaxed);
 }
 
-void MemoryMap(Aps5GpuBackend* backend, std::uint64_t, std::uint64_t, std::uint32_t) {
+void MemoryMap(Aps5GpuBackend* backend, std::uint64_t, std::uint64_t, std::uint32_t, std::uint64_t) {
     backend->maps.fetch_add(1, std::memory_order_relaxed);
 }
 
