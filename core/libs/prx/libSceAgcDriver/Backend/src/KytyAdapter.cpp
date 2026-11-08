@@ -221,7 +221,7 @@ public:
                 continue;
             }
             if (result != EQUEUE_OK) throw std::runtime_error("GPU interrupt delivery to an event queue failed");
-            counts.interruptsDelivered.fetch_add(1, std::memory_order_relaxed);
+            if (counts.interruptsDelivered.fetch_add(1, std::memory_order_relaxed) == 0) Print("[kyty] first GPU interrupt delivered to a guest event queue: event id 0x%x, context id 0x%x\n", eventId, contextId);
         }
     }
 
@@ -831,7 +831,7 @@ int AddEqEvent(KernelEqueue eq, int id, void* udata) {
     if (EqueueAddEvent_nid_postfix(eq, event) != EQUEUE_OK) throw std::runtime_error("sceAgcDriverAddEqEvent: event queue rejected the event");
     auto& adapter = A();
     adapter.AddRegistration(eq, id);
-    adapter.counts.eqAdds.fetch_add(1, std::memory_order_relaxed);
+    if (adapter.counts.eqAdds.fetch_add(1, std::memory_order_relaxed) < 8) Print("[kyty] guest event queue 0x%llx registered for GPU interrupt id 0x%x\n", static_cast<unsigned long long>(eq), static_cast<unsigned>(id));
     return 0;
 }
 

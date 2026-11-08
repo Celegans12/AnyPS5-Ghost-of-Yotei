@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Backend/include/GpuBackend.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -44,6 +45,7 @@ struct Aps5GpuBackend {
     std::atomic<std::uint64_t> idles{0};
     std::array<std::atomic<std::uint64_t>, 256> opcodes{};
     std::array<std::atomic<std::uint64_t>, 64> customs{};
+    std::array<std::atomic<bool>, 0x58> seenQueues{};
     std::mutex reportMutex;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
@@ -245,7 +247,27 @@ void Destroy(Aps5GpuBackend* backend) {
     delete backend;
 }
 
+void CheckBackingView(Aps5GpuBackend* backend, std::uint32_t queue, const std::uint32_t* dwords, std::uint32_t count) {
+    const auto* host = backend->host;
+    std::uint8_t* base = nullptr;
+    std::uint64_t bytes = 0;
+    std::uint64_t start = 0;
+    std::uint64_t end = 0;
+    std::uint64_t offset = 0;
+    std::int32_t type = 0;
+    const auto address = reinterpret_cast<std::uint64_t>(dwords);
+    if (host->backing_view(host->context, &base, &bytes) != APS5_GPU_OK || host->direct_mapping(host->context, address, &start, &end, &offset, &type) != APS5_GPU_OK) {
+        Log(backend, "null backend: queue 0x%x's first submission at 0x%llx is not direct memory; backing view not checked", queue, static_cast<unsigned long long>(address));
+        return;
+    }
+    const auto length = std::min<std::uint64_t>(std::uint64_t{count} * 4u, end - address);
+    const auto physical = offset + (address - start);
+    const bool same = physical + length <= bytes && std::memcmp(base + physical, dwords, static_cast<std::size_t>(length)) == 0;
+    Log(backend, "null backend: queue 0x%x's first submission at 0x%llx is direct memory (physical 0x%llx, type %d); the backing view %s its %llu bytes", queue, static_cast<unsigned long long>(address), static_cast<unsigned long long>(physical), type, same ? "holds" : "DOES NOT hold", static_cast<unsigned long long>(length));
+}
+
 int Submit(Aps5GpuBackend* backend, std::uint32_t queue, const std::uint32_t* dwords, std::uint32_t count) {
+    if (queue < backend->seenQueues.size() && !backend->seenQueues[queue].exchange(true)) CheckBackingView(backend, queue, dwords, count);
     if (First(queue == 0 ? backend->graphicsSubmits : backend->computeSubmits)) Log(backend, "null backend: first submission on queue 0x%x (%u dwords)", queue, count);
     backend->dwords.fetch_add(count, std::memory_order_relaxed);
     Walk(backend, queue, dwords, count);
