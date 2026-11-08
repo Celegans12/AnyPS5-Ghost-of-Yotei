@@ -92,6 +92,7 @@ int HostCopyFilter(unsigned long code) {
 }
 
 // Kept tiny on purpose: __try cannot share a function with objects that need unwinding.
+#if defined(_MSC_VER) || defined(__clang__)
 bool GuardedHostCopy(void* destination, uint64_t source, uint64_t size) {
 	__try {
 		std::memcpy(destination, reinterpret_cast<const void*>(source), static_cast<size_t>(size));
@@ -100,6 +101,16 @@ bool GuardedHostCopy(void* destination, uint64_t source, uint64_t size) {
 		return false;
 	}
 }
+#else
+// GCC has no __try/__except (MinGW): ReadProcessMemory on this process fails instead of faulting on an unreadable page.
+bool GuardedHostCopy(void* destination, uint64_t source, uint64_t size) {
+	(void)&HostCopyFilter;
+	SIZE_T read = 0;
+	return ReadProcessMemory(GetCurrentProcess(), reinterpret_cast<LPCVOID>(source), destination, static_cast<SIZE_T>(size),
+	                         &read) != 0 &&
+	       read == static_cast<SIZE_T>(size);
+}
+#endif
 #endif
 
 // Reads `size` bytes of guest memory from `address` through the backing store (the path of the scalar resource

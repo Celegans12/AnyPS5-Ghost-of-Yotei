@@ -268,7 +268,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 		// Arguments a previous dispatch just wrote are not read back (each read drains the GPU); the LDS storage is bound at
 		// its full size instead.
 		if (cache.IsRegionGpuModified(indirect_args, sizeof(vk::DispatchIndirectCommand))) {
-			bindings.shared_memory = {storage.Handle(), 0, limit & ~uint64_t {3}};
+			bindings.shared_memory = vk::DescriptorBufferInfo {storage.Handle(), 0, limit & ~uint64_t {3}};
 			return;
 		}
 		PerfReasonScope reason(PerfReason::IndirectArgs);
@@ -284,7 +284,7 @@ static void BindSharedMemory(RenderContext& context, ShaderComputeInputInfo& inp
 			size *= count;
 		}
 	}
-	bindings.shared_memory = {storage.Handle(), 0, size};
+	bindings.shared_memory = vk::DescriptorBufferInfo {storage.Handle(), 0, size};
 }
 
 // Names the game pass (debug marker) of a skipped compute dispatch, once per marker.

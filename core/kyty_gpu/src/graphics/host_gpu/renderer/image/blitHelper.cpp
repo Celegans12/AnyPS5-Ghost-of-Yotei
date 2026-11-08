@@ -160,10 +160,10 @@ void BlitHelper::ReinterpretColorAsMsDepth(Image& source, Image& destination) {
 	depth_attachment.imageLayout             = ColorToMsDepthLayout;
 	depth_attachment.loadOp                  = vk::AttachmentLoadOp::eClear;
 	depth_attachment.storeOp                 = vk::AttachmentStoreOp::eStore;
-	depth_attachment.clearValue.depthStencil = {0.0f, 0};
+	depth_attachment.clearValue.depthStencil = vk::ClearDepthStencilValue {0.0f, 0};
 
 	vk::RenderingInfo rendering {};
-	rendering.renderArea.extent = {destination_info.extent.width, destination_info.extent.height};
+	rendering.renderArea.extent = vk::Extent2D {destination_info.extent.width, destination_info.extent.height};
 	rendering.layerCount        = 1;
 	rendering.pDepthAttachment  = &depth_attachment;
 	command.beginRendering(&rendering);

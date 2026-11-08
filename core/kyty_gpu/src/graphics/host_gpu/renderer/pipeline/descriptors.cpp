@@ -516,7 +516,7 @@ static TextureCache::ImageDesc NullTextureDesc(const ShaderRecompiler::IR::Image
 	}
 	desc.info.pixel_format    = VulkanFormat(desc.info.guest_format);
 	desc.info.type            = Prospero::ImageType::kColor2D;
-	desc.info.extent          = {1, 1, 1};
+	desc.info.extent          = vk::Extent3D {1, 1, 1};
 	desc.info.resources       = {1, 1};
 	desc.info.bytes_per_block = Prospero::NumBytesPerElement(desc.info.guest_format);
 	desc.info.samples         = 1;
@@ -584,7 +584,7 @@ static TextureBinding NullCompareBinding(TextureCache& texture_cache, uint32_t c
 	desc.info.pixel_format    = vk::Format::eD16Unorm;
 	desc.info.guest_format    = Prospero::BufferFormat::k16UNorm;
 	desc.info.type            = Prospero::ImageType::kColor2D;
-	desc.info.extent          = {1, 1, 1};
+	desc.info.extent          = vk::Extent3D {1, 1, 1};
 	desc.info.resources       = {1, 1};
 	desc.info.bytes_per_block = 2;
 	desc.info.samples         = 1;
@@ -836,7 +836,7 @@ static bool StreamedViewSubChain(ImageInfo& info, uint32_t view_base, uint32_t v
 		return false;
 	}
 	ImageInfo sub        = info;
-	sub.extent           = {std::max(info.extent.width >> view_base, 1u), std::max(info.extent.height >> view_base, 1u), 1u};
+	sub.extent           = vk::Extent3D {std::max(info.extent.width >> view_base, 1u), std::max(info.extent.height >> view_base, 1u), 1u};
 	sub.resources.levels = view_levels;
 	sub.pitch            = 0;
 	sub.data.size        = 0;
@@ -968,7 +968,7 @@ static TextureDescribe DescribeTexture(const ShaderRecompiler::IR::ImageResource
 	desc.info.pixel_format = pixel_format;
 	desc.info.guest_format = format;
 	desc.info.type         = TextureBaseType(type);
-	desc.info.extent       = {width, height, volume ? depth : 1u};
+	desc.info.extent       = vk::Extent3D {width, height, volume ? depth : 1u};
 	desc.info.resources    = {levels, image_layers};
 	desc.info.bytes_per_block =
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
@@ -1553,7 +1553,7 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 			auto shadow_desc                 = NullTextureDesc(resource, TextureCache::BindingType::Storage);
 			shadow_desc.info.guest_format    = Prospero::BufferFormat::k8UInt;
 			shadow_desc.info.pixel_format    = vk::Format::eR8Uint;
-			shadow_desc.info.extent          = {width, height, 1};
+			shadow_desc.info.extent          = vk::Extent3D {width, height, 1};
 			shadow_desc.info.bytes_per_block = 1;
 			shadow_desc.info.mip_layout[0]   = {0, uint64_t {width} * height, width, height};
 			shadow_desc.view_info.format     = vk::Format::eR8Uint;
@@ -3929,11 +3929,11 @@ void RenderExecutor::PrepareBindingsToday(const ShaderStageRuntime& runtime,
 	const auto& program  = *runtime.program;
 	const auto& snapshot = *runtime.resources;
 	prepared.runtime = &runtime;
-	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
-	prepared.flattened_srt = {};
-	prepared.flattened_srt_uniform = {};
-	prepared.shader_data_buffer = {};
-	prepared.shared_memory = {};
+	prepared.gds = vk::DescriptorBufferInfo {nullptr, 0, VK_WHOLE_SIZE};
+	prepared.flattened_srt = vk::DescriptorBufferInfo {};
+	prepared.flattened_srt_uniform = vk::DescriptorBufferInfo {};
+	prepared.shader_data_buffer = vk::DescriptorBufferInfo {};
+	prepared.shared_memory = vk::DescriptorBufferInfo {};
 	prepared.images.resize(program.info.images.size());
 	prepared.image_source.resize(program.info.images.size(), 0u); // the table sets
 	// KYTY_TRACE_CS_WRITER_ADDR: any stage (graphics too) whose written buffer covers the address.
@@ -4384,8 +4384,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		m_uniform_words.assign(words.begin(), words.end());
 		m_uniform_words.resize((words.size() + 3u) & ~size_t {3}, 0u);
 		const auto view = NativeUpload(m_context, m_uniform_words);
-		if (storage_view != nullptr) *storage_view = {view.buffer, view.offset, words.size_bytes()};
-		*uniform_view = {view.buffer, view.offset,
+		if (storage_view != nullptr) *storage_view = vk::DescriptorBufferInfo {view.buffer, view.offset, words.size_bytes()};
+		*uniform_view = vk::DescriptorBufferInfo {view.buffer, view.offset,
 		                 std::min<vk::DeviceSize>(view.range, ShaderRecompiler::IR::UniformBufferMaxBytes)};
 	};
 	const auto upload_srt = [&](std::span<const uint32_t> words) {
@@ -5407,7 +5407,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 						                             ? cache.GetBdaPageTableBuffer()
 						                             : cache.GetFaultBuffer();
 						auto& view = address_buffers[kind == BindingKind::FaultBuffer];
-						view = {bda_buffer->Handle(), 0, bda_buffer->Size()};
+						view = vk::DescriptorBufferInfo {bda_buffer->Handle(), 0, bda_buffer->Size()};
 						write.pBufferInfo = &view;
 						break;
 					}

@@ -262,7 +262,7 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 	desc.info.pixel_format    = format;
 	desc.info.guest_format    = guest_format;
 	desc.info.type            = Prospero::ImageType::kColor2D;
-	desc.info.extent          = {width, height, 1};
+	desc.info.extent          = vk::Extent3D {width, height, 1};
 	desc.info.resources       = {1, view.image_layers};
 	desc.info.pitch           = pitch;
 	desc.info.bytes_per_block = bytes;

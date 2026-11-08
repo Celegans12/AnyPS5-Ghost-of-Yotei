@@ -1325,7 +1325,7 @@ ImageId TextureCache::GetStencilShadowImage(uint32_t width, uint32_t height) {
 	info.guest_format    = Prospero::BufferFormat::k8UInt;
 	info.pixel_format    = vk::Format::eR8Uint;
 	info.type            = Prospero::ImageType::kColor2D;
-	info.extent          = {width, height, 1};
+	info.extent          = vk::Extent3D {width, height, 1};
 	info.resources       = {1, 1};
 	info.pitch           = width;
 	info.bytes_per_block = 1;
@@ -1346,7 +1346,7 @@ ImageId TextureCache::GetNullImage(const ImageDesc& desc) {
 	info.pixel_format    = desc.info.pixel_format;
 	info.guest_format    = desc.info.guest_format;
 	info.type            = Prospero::ImageType::kColor2D;
-	info.extent          = {1, 1, 1};
+	info.extent          = vk::Extent3D {1, 1, 1};
 	info.resources       = {1, 1};
 	info.pitch           = 1;
 	info.bytes_per_block = std::max(desc.info.bytes_per_block, 1u);
@@ -1396,7 +1396,7 @@ ImageId TextureCache::GetNullDepthImage(bool one) {
 	info.pixel_format    = vk::Format::eD16Unorm;
 	info.guest_format    = Prospero::BufferFormat::k16UNorm;
 	info.type            = Prospero::ImageType::kColor2D;
-	info.extent          = {1, 1, 1};
+	info.extent          = vk::Extent3D {1, 1, 1};
 	info.resources       = {1, 1};
 	info.pitch           = 1;
 	info.bytes_per_block = 2;
@@ -2593,7 +2593,7 @@ void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
 			const bool depth = image.info.IsDepth();
 			if (depth) {
 				const auto value = clear.color.float32[0];
-				clear.depthStencil = {value, 0u};
+				clear.depthStencil = vk::ClearDepthStencilValue {value, 0u};
 			}
 			ClearImage(m_scheduler.Current(), id, depth ? image.backing.format : view.format,
 			           {depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
@@ -3763,7 +3763,7 @@ vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, ui
 		attachment.clearValue = *clear;
 	}
 	vk::RenderingInfo rendering {};
-	rendering.renderArea.extent    = {std::max(image.info.extent.width >> level, 1u),
+	rendering.renderArea.extent    = vk::Extent2D {std::max(image.info.extent.width >> level, 1u),
 	                                  std::max(image.info.extent.height >> level, 1u)};
 	rendering.layerCount           = layers;
 	rendering.colorAttachmentCount = 1;

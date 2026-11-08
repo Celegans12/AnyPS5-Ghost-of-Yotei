@@ -206,7 +206,7 @@ void Presenter::Frame::Configure(GraphicContext& graphics, vk::Extent2D extent, 
 	vk::ImageCreateInfo create {};
 	create.sType         = vk::StructureType::eImageCreateInfo;
 	create.imageType     = vk::ImageType::e2D;
-	create.extent        = {extent.width, extent.height, 1};
+	create.extent        = vk::Extent3D {extent.width, extent.height, 1};
 	create.mipLevels     = 1;
 	create.arrayLayers   = 1;
 	create.format        = format;
@@ -266,7 +266,7 @@ void Presenter::Frame::CopyFrom(CommandBuffer& command_buffer, Image& source) {
 	vk::ImageCopy copy {};
 	copy.srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, source.backing.layers};
 	copy.dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, image.layers};
-	copy.extent         = {std::min(source.backing.extent.width, image.extent.width),
+	copy.extent         = vk::Extent3D {std::min(source.backing.extent.width, image.extent.width),
 	                       std::min(source.backing.extent.height, image.extent.height), 1};
 	EXIT_IF(copy.srcSubresource.layerCount != copy.dstSubresource.layerCount);
 	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal, image.image,
@@ -441,7 +441,7 @@ void Swapchain::Create() {
 	// during creation, the next presentation will detect the newer size.
 	{
 		Common::LockGuard lock(m_window.mutex);
-		m_window_extent = {graphics.screen_width, graphics.screen_height};
+		m_window_extent = vk::Extent2D {graphics.screen_width, graphics.screen_height};
 	}
 	EXIT_IF(m_window_extent.width == 0);
 	EXIT_IF(m_window_extent.height == 0);
@@ -526,7 +526,7 @@ void Swapchain::Create() {
 		view.image                           = m_images[i];
 		view.viewType                        = vk::ImageViewType::e2D;
 		view.format                          = m_format;
-		view.components                      = {};
+		view.components                      = vk::ComponentMapping {};
 		view.subresourceRange.aspectMask     = vk::ImageAspectFlagBits::eColor;
 		view.subresourceRange.baseArrayLayer = 0;
 		view.subresourceRange.baseMipLevel   = 0;
@@ -603,8 +603,8 @@ void Swapchain::Destroy() {
 
 	m_handle        = nullptr;
 	m_format        = vk::Format::eUndefined;
-	m_extent        = {};
-	m_window_extent = {};
+	m_extent        = vk::Extent2D {};
+	m_window_extent = vk::Extent2D {};
 	m_image_index   = static_cast<uint32_t>(-1);
 	m_frame_index   = 0;
 	m_images.clear();

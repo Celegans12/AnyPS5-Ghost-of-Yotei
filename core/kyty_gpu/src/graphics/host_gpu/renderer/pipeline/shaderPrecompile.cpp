@@ -3144,7 +3144,12 @@ void LowerCurrentThreadPriority() {
 	SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
 }
 void RaiseThreadPriority(std::thread& thread) {
+#if defined(__GLIBCXX__)
+	// libstdc++ on MinGW: std::thread is a winpthreads thread, whose native handle is a pthread_t.
+	SetThreadPriority(pthread_gethandle(thread.native_handle()), THREAD_PRIORITY_NORMAL);
+#else
 	SetThreadPriority(static_cast<HANDLE>(thread.native_handle()), THREAD_PRIORITY_NORMAL);
+#endif
 }
 } // namespace
 } // namespace Libs::Graphics

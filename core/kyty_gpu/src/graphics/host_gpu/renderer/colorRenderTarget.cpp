@@ -256,7 +256,7 @@ void RenderExecutor::ResolveRenderColorTarget(CommandBuffer& buffer, RenderColor
 	desc.info.pixel_format = target_format.format;
 	desc.info.guest_format = target_format.guest_format;
 	desc.info.type         = image_type;
-	desc.info.extent       = {width, height, depth};
+	desc.info.extent       = vk::Extent3D {width, height, depth};
 	desc.info.resources       = {levels, volume ? 1u : view.image_layers};
 	desc.info.bytes_per_block = bytes_per_element;
 	desc.info.samples         = samples;

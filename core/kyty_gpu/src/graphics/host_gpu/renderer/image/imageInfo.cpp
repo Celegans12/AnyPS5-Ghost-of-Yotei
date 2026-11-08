@@ -332,7 +332,7 @@ std::vector<vk::BufferImageCopy> ImageInfo::BufferCopies(uint64_t buffer_offset,
 		                         : !IsTiled() ? mip.height * tiling.texel_height
 		                                      : Common::AlignUp(active.height, tiling.texel_height);
 		copy.imageSubresource  = {aspect, level, 0, 1};
-		copy.imageExtent       = {active.width, active.height, 1};
+		copy.imageExtent       = vk::Extent3D {active.width, active.height, 1};
 		if (image_heights[level] == 0) {
 			for (uint32_t slice = 0; slice < active.depth; ++slice) {
 				copy.bufferOffset                    = Add(Add(buffer_offset, mip.linear_offset),

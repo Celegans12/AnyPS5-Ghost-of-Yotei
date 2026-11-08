@@ -6,6 +6,15 @@
 
 // IWYU pragma: no_include <pthread.h>
 
+// MinGW's <pthread.h> (winpthreads) defines these two as macros (ENOTSUP); in a translation unit that included it first
+// they would expand in the declarations below (GCC). pthread.cpp undefines the first one the same way.
+#ifdef pthread_attr_getguardsize
+#undef pthread_attr_getguardsize
+#endif
+#ifdef pthread_attr_setguardsize
+#undef pthread_attr_setguardsize
+#endif
+
 extern "C" {
 struct sched_param;
 }

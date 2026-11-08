@@ -358,13 +358,13 @@ static void MakeGraphicsDynamicParams(const CommandBuffer& buffer, const ShaderV
 		    calc_final_scissor(vp, regs.scan, framebuffer_extent, i);
 		auto& scissor  = scissors[i];
 		scissor        = vk::Rect2D {};
-		scissor.offset = {final_scissor.left, final_scissor.top};
-		scissor.extent = {static_cast<uint32_t>(final_scissor.right - final_scissor.left),
+		scissor.offset = vk::Offset2D {final_scissor.left, final_scissor.top};
+		scissor.extent = vk::Extent2D {static_cast<uint32_t>(final_scissor.right - final_scissor.left),
 		                  static_cast<uint32_t>(final_scissor.bottom - final_scissor.top)};
 		if (viewport.width == 0.0f) {
 			// Keep empty slots at their guest index; Vulkan requires a positive viewport width.
 			viewport.width = 1.0f;
-			scissor.extent = {0, 0};
+			scissor.extent = vk::Extent2D {0, 0};
 		}
 	}
 	params.viewport_count = viewport_count;

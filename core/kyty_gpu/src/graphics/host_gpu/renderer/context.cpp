@@ -107,7 +107,7 @@ void CommandBuffer::BeginRendering(const RenderState& state) const {
 	stencil.clearValue.depthStencil.stencil = depth_stencil.clear_value[1];
 
 	vk::RenderingInfo rendering {};
-	rendering.renderArea.extent    = {state.width, state.height};
+	rendering.renderArea.extent    = vk::Extent2D {state.width, state.height};
 	rendering.layerCount           = state.num_layers;
 	rendering.colorAttachmentCount = state.num_color_attachments;
 	rendering.pColorAttachments    = colors.data();
