@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
+#include "prx/libSceAgcDriver/Backend/include/KytyAdapter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 
 #include <algorithm>
@@ -45,6 +46,7 @@ bool AgcDriverDeliverEopInterrupt(std::uint32_t queue) {
 extern "C" {
 
 int APS5_VABI sceAgcDriverAddEqEvent(KernelEqueue eq, int id, void* udata) {
+    if (AgcDriver::Kyty::Active()) return AgcDriver::Kyty::AddEqEvent(eq, id, udata);
     if (eq == 0 || !EqueuePin_nid_postfix(eq)) {
         throw std::runtime_error(std::string(__func__) + ": invalid event queue");
     }
@@ -73,6 +75,7 @@ int APS5_VABI sceAgcDriverAddEqEvent(KernelEqueue eq, int id, void* udata) {
 }
 
 int APS5_VABI sceAgcDriverDeleteEqEvent(KernelEqueue eq, int id) {
+    if (AgcDriver::Kyty::Active()) return AgcDriver::Kyty::DeleteEqEvent(eq, id);
     {
         std::lock_guard lock(g_mutex);
         std::erase_if(g_registrations, [&](const Registration& r) { return r.eq == eq && r.id == id; });

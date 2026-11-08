@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Backend/include/KytyAdapter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/BindlessPriming.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -14,6 +15,10 @@ namespace AgcDriver {
 
 void Submit(const Packet* packet, std::uint32_t queue) try {
     KernelNoteGpuSubmit_nid_no_patch();
+    if (Kyty::Active()) {
+        Kyty::Submit(packet, queue);
+        return;
+    }
     auto& driver = DriverDetail::Driver::Get();
     auto* const recorder = FrameRecorder::Active();
     if (recorder == nullptr) {
@@ -29,19 +34,23 @@ void Submit(const Packet* packet, std::uint32_t queue) try {
 }
 
 void WaitIdle() {
+    if (Kyty::Active()) return Kyty::WaitIdle();
     DriverDetail::Driver::Get().WaitIdle();
 }
 
 void Shutdown() {
+    if (Kyty::Active()) return Kyty::Shutdown();
     DriverDetail::Driver::Get().Shutdown();
 }
 
 void RegisterShader(const Shader* shader) {
+    if (Kyty::Active()) return Kyty::RegisterShader(shader);
     if (auto* const recorder = FrameRecorder::Active()) recorder->RegisterShader(shader);
     DriverDetail::Driver::Get().RegisterShader(shader);
 }
 
 void SuspendPoint() {
+    if (Kyty::Active()) return Kyty::SuspendPoint();
     auto* const recorder = FrameRecorder::Active();
     if (recorder == nullptr) {
         DriverDetail::Driver::Get().SuspendPoint();
@@ -51,33 +60,40 @@ void SuspendPoint() {
 }
 
 void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
+    if (Kyty::Active()) return Kyty::RegisterVideoOutput(handle, output);
     if (auto* const recorder = FrameRecorder::Active()) recorder->RegisterVideoOutput(handle);
     DriverDetail::Driver::Get().RegisterVideoOutput(handle, output);
 }
 
 void UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
+    if (Kyty::Active()) return Kyty::UnregisterVideoOutput(handle, output);
     if (auto* const recorder = FrameRecorder::Active()) recorder->UnregisterVideoOutput(handle);
     DriverDetail::Driver::Get().UnregisterVideoOutput(handle, output);
 }
 
 void AttachWindow(const PresentationWindow& window) {
+    if (Kyty::Active()) return Kyty::AttachWindow(window);
     DriverDetail::Driver::Get().AttachWindow(window);
 }
 
 void PresentClear(const PresentationWindow& window, bool opaque, void (*gpuReady)(void*), void* context) {
+    if (Kyty::Active()) return Kyty::Present(window, nullptr, opaque, gpuReady, context);
     DriverDetail::Driver::Get().Present(window, nullptr, opaque, gpuReady, context);
 }
 
 void PresentBuffer(const PresentationWindow& window, const DisplayBuffer& buffer, void (*gpuReady)(void*), void* context) {
+    if (Kyty::Active()) return Kyty::Present(window, &buffer, true, gpuReady, context);
     if (auto* const recorder = FrameRecorder::Active()) recorder->PresentBuffer(buffer);
     DriverDetail::Driver::Get().Present(window, &buffer, true, gpuReady, context);
 }
 
 void ReleaseWindow(void* window) {
+    if (Kyty::Active()) return Kyty::ReleaseWindow(window);
     DriverDetail::Driver::Get().ReleaseWindow(window);
 }
 
 void ReportFailure(std::exception_ptr error) {
+    if (Kyty::Active()) return Kyty::ReportFailure(error);
     DriverDetail::Driver::Get().ReportFailure(error);
 }
 
@@ -127,16 +143,19 @@ extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
 }
 
 extern "C" std::uint32_t AgcDriverReserveEopFlip_nid_postfix(const AgcDriver::FlipInfo& info) {
+    if (AgcDriver::Kyty::Active()) AgcDriver::Kyty::Unsupported(__func__);
     const auto token = AgcDriver::DriverDetail::Driver::Get().ReserveEopFlip(info);
     if (auto* const recorder = AgcDriver::FrameRecorder::Active(); recorder != nullptr && token != 0) recorder->ReserveEopFlip(info, token);
     return token;
 }
 
 extern "C" std::uint32_t AgcDriverReserveEopFlipAt_nid_postfix(const AgcDriver::FlipInfo& info, std::uint32_t token) {
+    if (AgcDriver::Kyty::Active()) AgcDriver::Kyty::Unsupported(__func__);
     return AgcDriver::DriverDetail::Driver::Get().ReserveEopFlipAt(info, token);
 }
 
 extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait* waits, std::size_t capacity) {
+    if (AgcDriver::Kyty::Active()) return 0;
     const auto awaited = AgcDriver::DriverDetail::Driver::Get().AwaitedWaits();
     const auto count = std::min(capacity, awaited.size());
     std::copy_n(awaited.begin(), count, waits);
@@ -144,46 +163,56 @@ extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait*
 }
 
 extern "C" std::vector<std::uint32_t> AgcDriverSaveQueueStates_nid_postfix() {
+    if (AgcDriver::Kyty::Active()) AgcDriver::Kyty::Unsupported(__func__);
     return AgcDriver::DriverDetail::Driver::Get().SaveQueueStates();
 }
 
 extern "C" void AgcDriverLoadQueueStates_nid_postfix(std::span<const std::uint32_t> words) {
+    if (AgcDriver::Kyty::Active()) AgcDriver::Kyty::Unsupported(__func__);
     AgcDriver::DriverDetail::Driver::Get().LoadQueueStates(words);
 }
 
 extern "C" std::vector<std::uint64_t> AgcDriverBindlessRegistrations_nid_postfix() {
+    if (AgcDriver::Kyty::Active()) AgcDriver::Kyty::Unsupported(__func__);
     return AgcDriver::BindlessRegistrationWords();
 }
 
 extern "C" void AgcDriverPrimeBindlessTables_nid_postfix(std::span<const std::uint64_t> words) try {
+    if (AgcDriver::Kyty::Active()) AgcDriver::Kyty::Unsupported(__func__);
     AgcDriver::PrimeBindlessTables(words);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 extern "C" void AgcDriverUseGdsAt_nid_postfix(std::uint64_t address) {
+    if (AgcDriver::Kyty::Active()) return;
     AgcDriver::Pm4::UseGdsAt(address);
 }
 
 extern "C" bool AgcDriverSettle_nid_postfix() {
+    if (AgcDriver::Kyty::Active()) AgcDriver::Kyty::Unsupported(__func__);
     return AgcDriver::DriverDetail::Driver::Get().SettleForCapture(std::chrono::seconds(10));
 }
 
 extern "C" bool AgcDriverFailed_nid_postfix() {
+    if (AgcDriver::Kyty::Active()) return false;
     return AgcDriver::DriverDetail::Driver::Get().Failed();
 }
 
 extern "C" bool AgcDriverQuiescent_nid_postfix() {
+    if (AgcDriver::Kyty::Active()) AgcDriver::Kyty::Unsupported(__func__);
     return AgcDriver::DriverDetail::Driver::Get().Quiescent();
 }
 
 extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std::uint64_t* completed) {
+    if (AgcDriver::Kyty::Active()) AgcDriver::Kyty::Unsupported(__func__);
     const auto [submitted, done] = AgcDriver::DriverDetail::Driver::Get().SerialProgress();
     *accepted = submitted;
     *completed = done;
 }
 
 extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info) try {
+    if (AgcDriver::Kyty::Active()) return AgcDriver::Kyty::SubmitFlip(info);
     auto* const recorder = AgcDriver::FrameRecorder::Active();
     if (recorder == nullptr) {
         AgcDriver::DriverDetail::Driver::Get().SubmitFlip(info);
@@ -196,20 +225,28 @@ extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info)
 }
 
 extern "C" std::uint64_t AgcDriverDispatchesAdoptedAhead_nid_postfix() {
+    if (AgcDriver::Kyty::Active()) return 0;
     return AgcDriver::DriverDetail::Driver::Get().DispatchesAdoptedAhead();
 }
 
 extern "C" void AgcDriverMissAheadTotals_nid_postfix(std::uint64_t* started, std::uint64_t* used) {
+    if (AgcDriver::Kyty::Active()) {
+        *started = 0;
+        *used = 0;
+        return;
+    }
     const auto [builds, uses] = AgcDriver::DriverDetail::Driver::MissAheadTotals();
     *started = builds;
     *used = uses;
 }
 
 extern "C" std::uint64_t AgcDriverDispatchesRejectedAhead_nid_postfix() {
+    if (AgcDriver::Kyty::Active()) return 0;
     return AgcDriver::DriverDetail::Driver::Get().DispatchesRejectedAhead();
 }
 
 extern "C" void AgcDriverSetAheadAdoptHook_nid_postfix(void (*hook)()) {
+    if (AgcDriver::Kyty::Active()) return;
     AgcDriver::DriverDetail::Driver::Get().SetAheadAdoptHook(hook);
 }
 
@@ -244,6 +281,7 @@ extern "C" void AgcDriverReportFailure_nid_postfix(std::exception_ptr error) {
 // ABI resolution prepares programs on the title's thread. A refusal there (APS5_SKIP_REFUSED_SHADERS only)
 // is reported and skipped; the draws and dispatches that use the program are skipped as they come.
 extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
+    if (AgcDriver::Kyty::Active()) return;
     if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveShaderAbi(shader, context, primitive);
     AgcDriver::DriverDetail::Driver::Get().ResolveShaderAbi(shader, context, primitive);
 } catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
@@ -253,6 +291,7 @@ extern "C" void AgcDriverResolveShaderAbi_nid_postfix(const Shader* shader, std:
 }
 
 extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, const Shader* pixel, std::uint32_t primitiveType) try {
+    if (AgcDriver::Kyty::Active()) return;
     if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveGraphicsAbi(vertex, pixel, primitiveType);
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsAbi(vertex, pixel, primitiveType);
 } catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
@@ -262,6 +301,7 @@ extern "C" void AgcDriverResolveGraphicsAbi_nid_postfix(const Shader* vertex, co
 }
 
 extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Shader* const> stages, std::span<const ShaderRegister> context, std::span<const ShaderRegister> primitive) try {
+    if (AgcDriver::Kyty::Active()) return;
     if (auto* const recorder = AgcDriver::FrameRecorder::Active()) recorder->ResolveGraphicsStagesAbi(stages, context, primitive);
     AgcDriver::DriverDetail::Driver::Get().ResolveGraphicsStagesAbi(stages, context, primitive);
 } catch (const AgcDriver::DriverDetail::ShaderRefusal& refusal) {
@@ -271,6 +311,7 @@ extern "C" void AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span<const Sh
 }
 
 extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address, std::size_t bytes) {
+    if (AgcDriver::Kyty::Active()) return;
     if (AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(address, bytes))
         AgcDriver::GuestMemory::FlushGpuWrites(address, bytes);
 }

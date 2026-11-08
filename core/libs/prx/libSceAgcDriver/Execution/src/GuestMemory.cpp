@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Backend/include/KytyAdapter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -3385,10 +3386,12 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
 }
 
 extern "C" void AgcDriverCheckGuestMemory_nid_postfix(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable) {
+    if (AgcDriver::Kyty::Active()) return AgcDriver::Kyty::CheckGuestMemory(pointer, bytes, alignment, writable);
     AgcDriver::GuestMemory::CheckRange(pointer, bytes, alignment, writable);
 }
 
 extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std::uint64_t value) {
+    if (AgcDriver::Kyty::Active()) return AgcDriver::Kyty::StoreGuestLabel(pointer, value);
     AgcDriver::GuestMemory::CheckRange(pointer, sizeof(*pointer), std::atomic_ref<std::uint64_t>::required_alignment, true);
     AgcDriver::GuestMemory::StoreOwnBytes(reinterpret_cast<std::uintptr_t>(pointer), sizeof(*pointer), [&] {
         std::atomic_ref(*pointer).store(value, std::memory_order_release);

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Backend/include/KytyAdapter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
@@ -254,6 +255,7 @@ void Driver::stop() {
 }
 
 Driver::Driver() {
+    if (Kyty::Active()) throw std::logic_error("the AnyPS5 AGC driver must not be constructed with APS5_GPU_BACKEND=kyty");
     InstallAsyncLog_nid_no_patch();
 #if defined(__linux__)
     static const bool faultReport = (installFatalFaultReport(), true);
@@ -596,6 +598,7 @@ std::unique_lock<std::mutex> HoldAsyncLog() {
 }
 
 extern "C" void* AgcDriverStaticTable_nid_postfix() {
+    if (AgcDriver::Kyty::Active()) return AgcDriver::Kyty::StaticTable();
     static_cast<void>(AgcDriver::DriverDetail::Driver::Get());
     return reinterpret_cast<void*>(AgcDriver::DriverDetail::FsTableAddress);
 }

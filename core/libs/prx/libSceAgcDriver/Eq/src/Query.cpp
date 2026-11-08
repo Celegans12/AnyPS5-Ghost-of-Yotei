@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Eq/include/Query.hpp"
+#include "prx/libSceAgcDriver/Backend/include/KytyAdapter.hpp"
 
 #include <cstdint>
 #include <cstddef>
@@ -17,6 +18,7 @@ uint32_t APS5_VABI sceAgcDriverGetEqContextId(const KernelEvent* ev) {
     if (ev->filter != -14) {
         throw std::runtime_error(std::string(__func__) + ": not a graphics event");
     }
+    if (AgcDriver::Kyty::Active()) return AgcDriver::Kyty::EqContextId(ev);
     if (ev->ident > std::numeric_limits<uint32_t>::max()) {
         throw std::runtime_error(std::string(__func__) + ": context id overflow");
     }
