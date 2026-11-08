@@ -915,6 +915,24 @@ endif()
 if (KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator onecore)
 endif()
+if (GCC AND WIN32)
+	# MinGW-w64 has no import library with KernelBase.dll's VirtualAlloc2, MapViewOfFile3 and UnmapViewOfFile2 (clang-cl
+	# takes them from onecore): one is made from a .def with dlltool. FFmpeg's libavutil needs bcrypt, and the Windows
+	# entry point is wmain (-municode).
+	set(KYTY_MINGW_KERNELBASE_DEF "${CMAKE_CURRENT_BINARY_DIR}/kyty_kernelbase.def")
+	set(KYTY_MINGW_KERNELBASE_LIB "${CMAKE_CURRENT_BINARY_DIR}/libkyty_kernelbase.a")
+	file(WRITE "${KYTY_MINGW_KERNELBASE_DEF}" "LIBRARY KERNELBASE.dll\nEXPORTS\nVirtualAlloc2\nMapViewOfFile3\nUnmapViewOfFile2\n")
+	add_custom_command(OUTPUT "${KYTY_MINGW_KERNELBASE_LIB}"
+		COMMAND "${CMAKE_DLLTOOL}" -d "${KYTY_MINGW_KERNELBASE_DEF}" -l "${KYTY_MINGW_KERNELBASE_LIB}"
+		DEPENDS "${KYTY_MINGW_KERNELBASE_DEF}")
+	add_custom_target(kyty_mingw_kernelbase DEPENDS "${KYTY_MINGW_KERNELBASE_LIB}")
+	add_dependencies(kyty_emulator kyty_mingw_kernelbase)
+	target_link_libraries(kyty_emulator "${KYTY_MINGW_KERNELBASE_LIB}")
+	target_link_libraries(ffmpeg INTERFACE bcrypt) # after FFmpeg's static libraries on the link line
+	target_link_options(kyty_emulator PRIVATE -municode)
+	# cpuinfo's Windows code uses the max() macro of <windows.h>, which the global NOMINMAX removes.
+	target_compile_options(cpuinfo PRIVATE -UNOMINMAX)
+endif()
 if (CLANG AND NOT KYTY_CLANG_CL)
 	target_link_libraries(kyty_emulator pthread)
 endif()
