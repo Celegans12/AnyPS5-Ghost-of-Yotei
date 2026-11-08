@@ -2,6 +2,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "ControlFlow/RequestSerializer.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "CompiledVariant.hpp"
+#include <algorithm>
+#include <map>
+#include <string>
+#include <vector>
 #include <charconv>
 #include <atomic>
 #include <chrono>
@@ -50,6 +55,55 @@ std::optional<std::set<std::uint64_t>> selectedPrograms() {
 
 }
 
+namespace {
+
+void probeDirect(const ShaderRecompiler::RecompileRequest& request) {
+    struct Counts {
+        std::uint64_t buffersOnly = 0, withImages = 0, failed = 0;
+    };
+    static AgcDriver::Mutex mutex;
+    static std::map<unsigned, Counts> byStage;
+    static std::map<std::string, std::uint64_t> failures;
+    static std::uint64_t probes = 0;
+    static auto lastReport = std::chrono::steady_clock::now();
+    auto direct = request;
+    direct.target.directResources = true;
+    const auto stage = static_cast<unsigned>(request.shader.stage);
+    std::string failure;
+    bool images = false;
+    try {
+        const auto handle = ShaderRecompiler::PrepareShader(direct, nullptr);
+        const auto& info = handle->artifact->info.info;
+        images = !info.images.empty() || !info.samplers.empty();
+    } catch (const std::exception& error) {
+        failure = error.what();
+        if (failure.size() > 90) failure.resize(90);
+    }
+    std::lock_guard lock(mutex);
+    auto& counts = byStage[stage];
+    if (!failure.empty()) {
+        ++counts.failed;
+        ++failures[failure];
+    } else if (images) {
+        ++counts.withImages;
+    } else {
+        ++counts.buffersOnly;
+    }
+    ++probes;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - lastReport < std::chrono::seconds(10)) return;
+    lastReport = now;
+    std::string line = "[direct-probe] " + std::to_string(probes) + " shaders;";
+    for (const auto& [key, value] : byStage) line += " stage " + std::to_string(key) + ": buffers-only " + std::to_string(value.buffersOnly) + ", images " + std::to_string(value.withImages) + ", failed " + std::to_string(value.failed) + ";";
+    std::vector<std::pair<std::uint64_t, std::string>> top;
+    for (const auto& [text, count] : failures) top.emplace_back(count, text);
+    std::sort(top.rbegin(), top.rend());
+    for (std::size_t index = 0; index < top.size() && index < 4; ++index) line += " [" + std::to_string(top[index].first) + "x] " + top[index].second + ";";
+    std::fprintf(stderr, "%s\n", line.c_str());
+}
+
+}
+
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
     std::exception_ptr failure;
     std::string dump;
@@ -72,6 +126,8 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnosti
     try {
         auto handle = ShaderRecompiler::PrepareShader(request, preparation);
         if (!inputDump.empty()) std::fprintf(stderr, "[prepare-input] end %s\n", inputDump.c_str());
+        static const bool directProbe = std::getenv("APS5_DIRECT_PROBE") != nullptr;
+        if (directProbe && !request.target.directResources) probeDirect(request);
         return handle;
     } catch (...) {
         failure = std::current_exception();

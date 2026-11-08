@@ -359,6 +359,7 @@ struct SpirvTarget {
     bool fixedPushSlots = false;
     bool float64DenormPreserve = false;
     bool registrationModules = false;
+    bool directResources = false;
     std::uint32_t registrationWordLimit = 200000u;
     bool vertexSubgroups = true;
     bool tessellationEvaluationSubgroups = true;

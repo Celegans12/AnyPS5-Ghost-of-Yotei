@@ -368,6 +368,7 @@ private:
         append(key, value.float64DenormPreserve);
         append(key, value.depthRangeRemap);
         append(key, value.registrationModules);
+        append(key, value.directResources);
         append(key, value.registrationWordLimit);
         append(key, value.vertexSubgroups);
         append(key, value.tessellationEvaluationSubgroups);
