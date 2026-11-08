@@ -504,16 +504,22 @@ void DefineDescriptors(SpirvEmitterState& state) {
         state.module.AddName(type, "BufferResource");
         state.module.AddName(state.pushConstantVariable, "vsharp");
     }
+    const bool direct = state.program.Metadata().directResources;
     for (const IrDescriptorBinding& binding : layout.descriptors) {
+        const bool directHeap = direct && (binding.kind == DescriptorBindingKind::Samplers || ImageBindingResourceClass(binding.kind) != ImageResourceClass::None);
         const auto Define = [&](std::uint32_t type, const char* name, std::uint32_t storage = spv::StorageClassStorageBuffer) {
             const auto variable = state.module.DefineGlobalVariable(TypePointer(state, storage, type), storage);
             state.module.AddName(variable, name);
-            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, state.fragmentDescriptorSet && stage == IrShaderStage::Pixel ? RuntimeAbi::FragmentDescriptorSet : RuntimeAbi::DescriptorSet);
-            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, NativeBinding(stage, binding.kind));
+            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, directHeap ? RuntimeAbi::DirectHeapSet : state.fragmentDescriptorSet && stage == IrShaderStage::Pixel ? RuntimeAbi::FragmentDescriptorSet : RuntimeAbi::DescriptorSet);
+            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, directHeap ? static_cast<std::uint32_t>(binding.kind) : NativeBinding(stage, binding.kind));
             return variable;
         };
         const auto ArrayType = [&](std::uint32_t type) {
             const bool heap = binding.kind == DescriptorBindingKind::Samplers || ImageBindingResourceClass(binding.kind) != ImageResourceClass::None;
+            if (heap && direct) {
+                RequireTableIndexing(state);
+                return state.module.Type(spv::OpTypeRuntimeArray, type);
+            }
             const auto count = static_cast<std::uint32_t>(binding.resources.size());
             const auto length = heap && !state.registrationModules ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::HeapCountBase + static_cast<std::uint32_t>(binding.kind), count) : ConstantU32(state, count);
             return state.module.Type(spv::OpTypeArray, type, length);

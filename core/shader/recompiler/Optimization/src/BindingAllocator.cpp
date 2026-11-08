@@ -163,6 +163,19 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
         if (samplers.size() > RuntimeAbi::SamplerHeapCapacity) fail("shader sampler pairs exceed runtime heap capacity: " + std::to_string(samplers.size() / 2u) + " samplers");
         addBinding(next, DescriptorBindingKind::Samplers, std::move(samplers));
     }
+    if (program.Metadata().directResources) {
+        std::uint32_t slots = 0;
+        for (const auto& binding : next.descriptors) {
+            if (binding.kind == DescriptorBindingKind::Samplers || ImageBindingResourceClass(binding.kind) != ImageResourceClass::None) slots += static_cast<std::uint32_t>(binding.resources.size());
+        }
+        next.directSlotCount = slots;
+        next.pushDataStartDword = next.runtimeImageCount == 0u && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= pushSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
+        if (stencilReplay) {
+            const auto offset = next.UsesPushData() ? next.ShaderDataDwords() : 0u;
+            if (offset >= pushSize) fail("stencil replay requires an unused push constant dword");
+            next.stencilReferenceDword = offset;
+        }
+    }
     if (usesGds(program)) {
         addBinding(next, DescriptorBindingKind::Gds);
     }

@@ -47,8 +47,27 @@ std::uint32_t DescriptorElementPointer(SpirvEmitterState& state, std::uint32_t r
     if (variableId == 0) {
         ExitDescriptorBindingFailure(state, kind, resource, variableName);
     }
-    const auto pointer = state.module.AllocateId();
     const bool heap = kind == DescriptorBindingKind::Samplers || ImageBindingResourceClass(kind) != ImageResourceClass::None;
+    if (heap && state.program.Metadata().directResources) {
+        const auto& layout = state.program.Metadata().bindings;
+        std::uint32_t ordinal = 0;
+        bool found = false;
+        for (const auto& binding : layout.descriptors) {
+            if (binding.kind != DescriptorBindingKind::Samplers && ImageBindingResourceClass(binding.kind) == ImageResourceClass::None) continue;
+            if (binding.kind == kind) {
+                ordinal += arrayIndex;
+                found = true;
+                break;
+            }
+            ordinal += static_cast<std::uint32_t>(binding.resources.size());
+        }
+        if (!found) ExitDescriptorBindingFailure(state, kind, resource, "direct heap slot has no descriptor group");
+        const auto slot = EmitShaderDataDwordLoad(state, layout.DirectSlotDword() + ordinal);
+        const auto pointer = state.module.AllocateId();
+        state.module.AddFunction(spv::OpAccessChain, resultPtrType, pointer, variableId, slot);
+        return pointer;
+    }
+    const auto pointer = state.module.AllocateId();
     const auto index = heap && !state.registrationModules ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::DescriptorIndex(static_cast<std::uint32_t>(kind), arrayIndex), arrayIndex) : ConstantU32(state, arrayIndex);
     state.module.AddFunction(spv::OpAccessChain, resultPtrType, pointer, variableId, index);
     return pointer;

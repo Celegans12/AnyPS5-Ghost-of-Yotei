@@ -76,6 +76,17 @@ void probeDirect(const ShaderRecompiler::RecompileRequest& request) {
         const auto handle = ShaderRecompiler::PrepareShader(direct, nullptr);
         const auto& info = handle->artifact->info.info;
         images = !info.images.empty() || !info.samplers.empty();
+        static const char* dumpFolder = std::getenv("APS5_DIRECT_PROBE_DUMP");
+        static std::atomic<int> dumped{0};
+        if (dumpFolder != nullptr && images && dumped.fetch_add(1) < 40) {
+            const auto words = handle->artifact->artifact.spirv.Words();
+            char path[512];
+            std::snprintf(path, sizeof(path), "%s/direct_%llx_stage%u.spv", dumpFolder, static_cast<unsigned long long>(request.shader.codeAddress), static_cast<unsigned>(request.shader.stage));
+            if (FILE* file = std::fopen(path, "wb")) {
+                std::fwrite(words.data(), sizeof(std::uint32_t), words.size(), file);
+                std::fclose(file);
+            }
+        }
         writes = info.directWritesFromMemory != 0 || info.directAddressWrites != 0 ? 2 : info.directWritesFromUserData != 0 ? 1 : 0;
     } catch (const std::exception& error) {
         failure = error.what();
