@@ -17,6 +17,8 @@ struct Aps5GpuBackend {
     std::atomic<std::uint64_t> computeSubmits{0};
     std::atomic<std::uint64_t> dwords{0};
     std::atomic<std::uint64_t> packets{0};
+    std::atomic<std::uint64_t> chains{0};
+    std::atomic<std::uint64_t> calls{0};
     std::atomic<std::uint64_t> malformed{0};
     std::atomic<std::uint64_t> gpuFlips{0};
     std::atomic<std::uint64_t> cpuFlips{0};
@@ -62,8 +64,8 @@ void Report(Aps5GpuBackend* backend, const char* why) {
         if (count == 0) continue;
         used += static_cast<std::size_t>(std::snprintf(opcodes + used, sizeof(opcodes) - used, " %02zx:%llu", op, static_cast<unsigned long long>(count)));
     }
-    Log(backend, "null backend (%s): submits dcb %llu acb %llu, %llu dwords, %llu packets (%llu malformed); flips gpu %llu cpu %llu (room waits %llu); release_mem %llu, label writes %llu, interrupts %llu, write_data %llu, rendering waits %llu, unsupported data %llu; shaders %llu; memory map %llu unmap %llu protect %llu, host writes %llu reads %llu, faults %llu; presents %llu clears %llu dumps %llu; windows %llu; suspends %llu idles %llu; opcodes%s", why,
-        static_cast<unsigned long long>(backend->graphicsSubmits.load()), static_cast<unsigned long long>(backend->computeSubmits.load()), static_cast<unsigned long long>(backend->dwords.load()), static_cast<unsigned long long>(backend->packets.load()), static_cast<unsigned long long>(backend->malformed.load()),
+    Log(backend, "null backend (%s): submits dcb %llu acb %llu, %llu dwords, %llu packets (%llu chained and %llu called buffers, %llu malformed); flips gpu %llu cpu %llu (room waits %llu); release_mem %llu, label writes %llu, interrupts %llu, write_data %llu, rendering waits %llu, unsupported data %llu; shaders %llu; memory map %llu unmap %llu protect %llu, host writes %llu reads %llu, faults %llu; presents %llu clears %llu dumps %llu; windows %llu; suspends %llu idles %llu; opcodes%s", why,
+        static_cast<unsigned long long>(backend->graphicsSubmits.load()), static_cast<unsigned long long>(backend->computeSubmits.load()), static_cast<unsigned long long>(backend->dwords.load()), static_cast<unsigned long long>(backend->packets.load()), static_cast<unsigned long long>(backend->chains.load()), static_cast<unsigned long long>(backend->calls.load()), static_cast<unsigned long long>(backend->malformed.load()),
         static_cast<unsigned long long>(backend->gpuFlips.load()), static_cast<unsigned long long>(backend->cpuFlips.load()), static_cast<unsigned long long>(backend->flipWaits.load()),
         static_cast<unsigned long long>(backend->releases.load()), static_cast<unsigned long long>(backend->labelWrites.load()), static_cast<unsigned long long>(backend->interrupts.load()), static_cast<unsigned long long>(backend->writeData.load()), static_cast<unsigned long long>(backend->renderingWaits.load()), static_cast<unsigned long long>(backend->unsupportedData.load()),
         static_cast<unsigned long long>(backend->shaders.load()),
@@ -159,23 +161,56 @@ void WriteData(Aps5GpuBackend* backend, const std::uint32_t* packet, std::uint32
 }
 
 void Walk(Aps5GpuBackend* backend, std::uint32_t queue, const std::uint32_t* dwords, std::uint32_t count) {
-    for (std::uint32_t at = 0; at < count;) {
-        const auto header = dwords[at];
+    struct Segment {
+        const std::uint32_t* words;
+        std::uint32_t count;
+        std::uint32_t at;
+    };
+    std::array<Segment, 8> stack{};
+    std::size_t depth = 0;
+    stack[depth++] = {dwords, count, 0};
+    std::uint64_t budget = std::uint64_t{1} << 27u;
+    while (depth != 0) {
+        auto& segment = stack[depth - 1];
+        if (segment.at >= segment.count) {
+            --depth;
+            continue;
+        }
+        const auto at = segment.at;
+        const auto header = segment.words[at];
         const auto type = header >> 30u;
         if (type == 2u) {
-            ++at;
+            ++segment.at;
             continue;
         }
         const auto words = ((header >> 16u) & 0x3fffu) + 2u;
-        if ((type != 3u && type != 0u) || words > count - at) {
-            if (First(backend->malformed)) Log(backend, "null backend: malformed packet 0x%08x at dword %u of %u on queue 0x%x; rest of the submission skipped", header, at, count, queue);
+        if ((type != 3u && type != 0u) || words > segment.count - at || words > budget) {
+            if (First(backend->malformed)) Log(backend, "null backend: malformed packet 0x%08x at dword %u of %u on queue 0x%x (depth %zu); rest of the submission skipped", header, at, segment.count, queue, depth);
             return;
         }
+        budget -= words;
+        segment.at += words;
         backend->packets.fetch_add(1, std::memory_order_relaxed);
         if (type == 3u) {
-            const auto* packet = dwords + at;
+            const auto* packet = segment.words + at;
             const auto opcode = (header >> 8u) & 0xffu;
             backend->opcodes[opcode].fetch_add(1, std::memory_order_relaxed);
+            if (opcode == 0x3fu && words == 4u) {
+                const auto* target = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(packet[1] & ~3u) | static_cast<std::uintptr_t>(packet[2] & 0xffffu) << 32u);
+                const auto targetWords = packet[3] & 0xfffffu;
+                if (target == nullptr || targetWords == 0) continue;
+                if ((packet[3] & (1u << 20u)) != 0) {
+                    backend->chains.fetch_add(1, std::memory_order_relaxed);
+                    segment = {target, targetWords, 0};
+                } else if (depth < stack.size()) {
+                    backend->calls.fetch_add(1, std::memory_order_relaxed);
+                    stack[depth++] = {target, targetWords, 0};
+                } else {
+                    if (First(backend->malformed)) Log(backend, "null backend: indirect buffers nested deeper than %zu on queue 0x%x; rest of the submission skipped", stack.size(), queue);
+                    return;
+                }
+                continue;
+            }
             if (opcode == 0x10u && (header & 0xfcu) != 0) {
                 const auto custom = (header >> 2u) & 0x3fu;
                 backend->customs[custom].fetch_add(1, std::memory_order_relaxed);
@@ -193,7 +228,6 @@ void Walk(Aps5GpuBackend* backend, std::uint32_t queue, const std::uint32_t* dwo
                 WriteData(backend, packet, words);
             }
         }
-        at += words;
     }
 }
 
