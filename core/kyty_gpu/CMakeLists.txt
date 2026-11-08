@@ -993,6 +993,10 @@ if(APPLE)
 endif()
 
 install(TARGETS kyty_emulator DESTINATION .)
+option(KYTY_BUILD_APS5_BACKEND "Build kyty_gpu.dll, the GPU backend for AnyPS5 (src/aps5)" OFF)
+if(KYTY_BUILD_APS5_BACKEND)
+	include("${KYTY_SOURCE_DIR}/aps5/aps5Backend.cmake")
+endif()
 if(KYTY_BUILD_LAUNCHER)
 	add_subdirectory("${KYTY_SOURCE_DIR}/launcher" "${CMAKE_CURRENT_BINARY_DIR}/launcher")
 
