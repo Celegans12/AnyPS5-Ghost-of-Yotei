@@ -1197,8 +1197,16 @@ namespace Aps5 {
 // Kyty commits its whole direct-memory backing up front (one SEC_COMMIT section); AnyPS5's kyty mode reserves the section
 // and commits on map. The BDA fallback imports 2 MiB granules of the backing as Vulkan host memory, and a granule with an
 // uncommitted page would be refused (its reads would stay zero): so the whole view is committed here, as on Kyty.
-void MemoryInitialize(uint8_t* backing_base, uint64_t backing_size) {
+void MemorySetBacking(uint8_t* backing_base, uint64_t backing_size) {
 	Libs::LibKernel::Memory::Map().SetBacking(backing_base, backing_size);
+}
+
+void MemoryCommitBacking() {
+	auto*      backing_base = Libs::LibKernel::Memory::Map().BackingBase();
+	const auto backing_size = Libs::LibKernel::Memory::Map().BackingSize();
+	if (backing_base == nullptr) {
+		return;
+	}
 	if (VirtualAlloc(backing_base, backing_size, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
 		Log("memory: committing the direct memory backing view failed (error %lu); BDA fallback imports of granules with "
 		    "uncommitted pages will be refused",

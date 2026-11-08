@@ -194,7 +194,7 @@ int Start(Aps5GpuBackend* /*backend*/) {
 			ok = false;
 			return;
 		}
-		MemoryInitialize(base, bytes);
+		MemoryCommitBacking();
 		Log("started: direct memory backing view %p+0x%llx; Kyty v0.1.5 + v4/base + v4/m1b, clang, libc++", base,
 		    static_cast<unsigned long long>(bytes));
 	});
@@ -531,6 +531,12 @@ extern "C" __declspec(dllexport) int Aps5GpuBackendCreate(const Aps5GpuHost* hos
 		return APS5_GPU_ERROR;
 	}
 	Aps5::SetHost(host);
+	// AnyPS5 sends mapping notifications from now on, before start: the table needs the backing view to place them.
+	uint8_t* base  = nullptr;
+	uint64_t bytes = 0;
+	if (host->backing_view(host->context, &base, &bytes) == APS5_GPU_OK && base != nullptr && bytes != 0) {
+		Aps5::MemorySetBacking(base, bytes);
+	}
 	Aps5::g_backend         = new Aps5::Backend;
 	Aps5::g_backend->handle = Aps5GpuBackend {host};
 	*api                    = &Aps5::KytyApi;

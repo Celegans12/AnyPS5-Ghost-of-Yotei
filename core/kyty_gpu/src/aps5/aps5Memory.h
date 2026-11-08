@@ -13,7 +13,10 @@ struct MemoryStats {
 	uint64_t discovered     = 0;
 };
 
-void        MemoryInitialize(uint8_t* backing_base, uint64_t backing_size);
+// At create: the backing view (map notifications arrive from then on, before start).
+void        MemorySetBacking(uint8_t* backing_base, uint64_t backing_size);
+// At start: the whole view committed, as Kyty's SEC_COMMIT backing store.
+void        MemoryCommitBacking();
 // After AnyPS5 committed or mapped [address, address + bytes): direct memory at backing_offset in the backing view, or
 // private memory (APS5_GPU_NOT_DIRECT).
 void        MemoryMapped(uint64_t address, uint64_t bytes, uint64_t backing_offset);
