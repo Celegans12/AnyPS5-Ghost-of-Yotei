@@ -1359,6 +1359,55 @@ void Presenter::Discard(Frame& frame) {
 	m_impl->frames.Release(&frame);
 }
 
+bool Presenter::ReadFrame(Frame& frame, FrameReader reader, void* context) {
+	const auto format = frame.image.format;
+	const bool bgra   = format == vk::Format::eB8G8R8A8Unorm || format == vk::Format::eB8G8R8A8Srgb;
+	const bool rgba   = format == vk::Format::eR8G8B8A8Unorm || format == vk::Format::eR8G8B8A8Srgb;
+	if ((!bgra && !rgba) || frame.image.image == nullptr || reader == nullptr) {
+		return false;
+	}
+	const auto width     = frame.image.extent.width;
+	const auto height    = frame.image.extent.height;
+	const auto row_bytes = width * 4u;
+	const auto bytes     = static_cast<vk::DeviceSize>(row_bytes) * height;
+	auto&      graphics  = m_impl->window.graphic_ctx;
+
+	VkBufferCreateInfo buffer_info {};
+	buffer_info.sType       = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+	buffer_info.size        = bytes;
+	buffer_info.usage       = VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+	buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+	VmaAllocationCreateInfo allocation_info {};
+	allocation_info.flags = VMA_ALLOCATION_CREATE_HOST_ACCESS_RANDOM_BIT | VMA_ALLOCATION_CREATE_MAPPED_BIT;
+	allocation_info.usage = VMA_MEMORY_USAGE_AUTO_PREFER_HOST;
+	VkBuffer          buffer     = VK_NULL_HANDLE;
+	VmaAllocation     allocation = nullptr;
+	VmaAllocationInfo mapped {};
+	if (vmaCreateBuffer(graphics.allocator, &buffer_info, &allocation_info, &buffer, &allocation, &mapped) != VK_SUCCESS ||
+	    mapped.pMappedData == nullptr) {
+		return false;
+	}
+	uint64_t tick = 0;
+	{
+		Common::LockGuard lock(m_impl->present_mutex);
+		Common::LockGuard render_lock(m_impl->renderer.GetMutex());
+		auto&             command = m_impl->present_scheduler.BeginCommand();
+		command.EndRendering();
+		frame.Transit(command.Handle(), vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead);
+		vk::BufferImageCopy copy {};
+		copy.imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1};
+		copy.imageExtent      = vk::Extent3D {width, height, 1};
+		command.Handle().copyImageToBuffer(frame.image.image, vk::ImageLayout::eTransferSrcOptimal, vk::Buffer(buffer),
+		                                   copy);
+		tick = m_impl->present_scheduler.Submit();
+	}
+	m_impl->present_scheduler.Wait(tick);
+	vmaInvalidateAllocation(graphics.allocator, allocation, 0, VK_WHOLE_SIZE);
+	reader(context, mapped.pMappedData, width, height, row_bytes, bgra);
+	vmaDestroyBuffer(graphics.allocator, buffer, allocation);
+	return true;
+}
+
 WindowContext::WindowContext() = default;
 
 } // namespace Libs::Graphics

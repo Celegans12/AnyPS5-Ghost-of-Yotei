@@ -39,6 +39,11 @@ public:
 	void                         Present(std::span<const Layer> layers);
 	void                         ClearLayer(int bus);
 	void                         Discard(Frame& frame);
+	// AnyPS5's frame dumps (kyty_gpu.dll): the pixels of a prepared frame whose producer finished, read back through the
+	// present queue before it is presented. False for frames that are not 4 bytes per pixel RGBA or BGRA.
+	using FrameReader = void (*)(void* context, const void* pixels, uint32_t width, uint32_t height, uint32_t row_bytes,
+	                             bool bgra);
+	[[nodiscard]] bool ReadFrame(Frame& frame, FrameReader reader, void* context);
 
 private:
 	struct Impl;

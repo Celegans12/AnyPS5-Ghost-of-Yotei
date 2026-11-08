@@ -12,6 +12,9 @@
 #include "graphics/presentation/videoOut.h"
 #include "kernel/pthread.h"
 #include "libs/errno.h"
+#if defined(KYTY_APS5_BACKEND)
+#include "aps5/aps5Host.h"
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -391,6 +394,10 @@ void RenderContext::DeleteInterruptEq(LibKernel::EventQueue::KernelEqueue eq, in
 }
 
 void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
+#if defined(KYTY_APS5_BACKEND)
+	// kyty_gpu.dll: AnyPS5 keeps the guest's event queues and their registrations; the interrupt goes to them at once.
+	Aps5::RaiseInterrupt(static_cast<uint32_t>(event_id), context_id);
+#else
 	std::vector<InterruptEqRegistration> registrations;
 	{
 		Common::LockGuard lock(m_interrupt_mutex);
@@ -412,6 +419,7 @@ void RenderContext::TriggerInterrupt(int event_id, uint32_t context_id) {
 		}
 		EXIT_NOT_IMPLEMENTED(result != OK);
 	}
+#endif
 }
 
 } // namespace Libs::Graphics

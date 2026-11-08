@@ -32,6 +32,9 @@
 #include "kernel/memory.h"
 #include "libs/controller.h"
 #include "loader/systemContent.h"
+#if defined(KYTY_APS5_BACKEND)
+#include "aps5/aps5Window.h"
+#endif
 
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
@@ -934,12 +937,18 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 }
 
 static void VulkanGetExtensions(VulkanExtensions& r) {
+#if defined(KYTY_APS5_BACKEND)
+	// kyty_gpu.dll: the instance extensions of AnyPS5's window.
+	r.required_extensions = Aps5::WindowInstanceExtensions();
+	EXIT_NOT_IMPLEMENTED(r.required_extensions.empty());
+#else
 	uint32_t required_extensions_count = 0;
 
 	const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&required_extensions_count);
 	EXIT_NOT_IMPLEMENTED(extensions == nullptr);
 	EXIT_NOT_IMPLEMENTED(required_extensions_count == 0);
 	r.required_extensions.assign(extensions, extensions + required_extensions_count);
+#endif
 
 	r.available_extensions =
 	    EnumerateVulkan<vk::ExtensionProperties>( // @suppress("Ambiguous problem")
@@ -1129,17 +1138,27 @@ static void VulkanCheckInstanceVersion() {
 }
 
 void WindowContext::CreateVulkan() {
+#if !defined(KYTY_APS5_BACKEND)
 	EXIT_IF(window == nullptr);
+#endif
 	EXIT_IF(graphic_ctx.instance != nullptr);
 	EXIT_IF(graphic_ctx.physical_device != nullptr);
 	EXIT_IF(graphic_ctx.device != nullptr);
 	EXIT_IF(surface != nullptr);
 
+#if defined(KYTY_APS5_BACKEND)
+	// kyty_gpu.dll: the Vulkan loader of the process, AnyPS5's window instead of an SDL window.
+	auto get_instance_proc_addr = Aps5::WindowVulkanLoader();
+	if (get_instance_proc_addr == nullptr) {
+		EXIT("Could not load Vulkan (vulkan-1.dll)\n");
+	}
+#else
 	auto get_instance_proc_addr =
 	    reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
 	if (get_instance_proc_addr == nullptr) {
 		EXIT("Could not load Vulkan: %s\n", SDL_GetError());
 	}
+#endif
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
 	Vr::OpenXrInit();
@@ -1238,10 +1257,17 @@ void WindowContext::CreateVulkan() {
 	}
 
 	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
+#if defined(KYTY_APS5_BACKEND)
+	native_surface = Aps5::WindowCreateSurface(static_cast<vk::Instance::CType>(graphic_ctx.instance));
+	if (native_surface == VK_NULL_HANDLE) {
+		EXIT("Could not create a Vulkan surface");
+	}
+#else
 	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
 	                              nullptr, &native_surface)) {
 		EXIT("Could not create a Vulkan surface");
 	}
+#endif
 	surface = native_surface;
 
 	std::vector<const char*> device_extensions = {
@@ -1397,16 +1423,27 @@ void WindowContext::RefreshSurfaceCapabilities() {
 }
 
 void WindowContext::RecreateSurface() {
+#if defined(KYTY_APS5_BACKEND)
+	EXIT_IF(graphic_ctx.instance == nullptr);
+#else
 	EXIT_IF(window == nullptr || graphic_ctx.instance == nullptr);
+#endif
 	if (surface != nullptr) {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);
 		surface = nullptr;
 	}
 	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
+#if defined(KYTY_APS5_BACKEND)
+	native_surface = Aps5::WindowCreateSurface(static_cast<vk::Instance::CType>(graphic_ctx.instance));
+	if (native_surface == VK_NULL_HANDLE) {
+		EXIT("Could not recreate the Vulkan surface\n");
+	}
+#else
 	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
 	                              nullptr, &native_surface)) {
 		EXIT("Could not recreate the Vulkan surface: %s\n", SDL_GetError());
 	}
+#endif
 	surface = native_surface;
 }
 
@@ -1437,11 +1474,13 @@ WindowContext::~WindowContext() {
 		graphic_ctx.instance        = nullptr;
 		graphic_ctx.physical_device = nullptr;
 	}
+#if !defined(KYTY_APS5_BACKEND)
 	if (window != nullptr) {
 		SDL_DestroyWindow(window);
 		window = nullptr;
 	}
 	SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD);
+#endif
 }
 
 } // namespace Libs::Graphics
