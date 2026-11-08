@@ -33,6 +33,7 @@
 #include <mutex>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #ifndef NOMINMAX
@@ -201,6 +202,43 @@ int Start(Aps5GpuBackend* /*backend*/) {
 	return ok ? APS5_GPU_OK : APS5_GPU_ERROR;
 }
 
+// The guest's program images: AnyPS5 relinks the game's ELF into eboot.exe and its modules into *.guest.prx, which
+// Windows maps as images, outside the guest arena that reports mappings. Their static data is guest memory the GPU
+// reads (a V# into eboot's data section stopped the first T1 run), as Kyty's program memory is. Each committed region
+// of those modules is registered as private (not direct) committed memory.
+void RegisterGuestImages() {
+	const HMODULE executable = GetModuleHandleW(nullptr);
+	uint64_t      address    = 0x10000;
+	uint64_t      regions    = 0;
+	uint64_t      bytes      = 0;
+	constexpr uint64_t End   = uint64_t {1} << 40u;
+	while (address < End) {
+		MEMORY_BASIC_INFORMATION info {};
+		if (VirtualQuery(reinterpret_cast<const void*>(address), &info, sizeof(info)) == 0) break;
+		const auto base = reinterpret_cast<uint64_t>(info.BaseAddress);
+		const auto size = static_cast<uint64_t>(info.RegionSize);
+		if (info.State == MEM_COMMIT && info.Type == MEM_IMAGE) {
+			const auto module = static_cast<HMODULE>(info.AllocationBase);
+			bool       guest  = module == executable;
+			if (!guest) {
+				wchar_t path[MAX_PATH] {};
+				const auto length = GetModuleFileNameW(module, path, MAX_PATH);
+				constexpr std::wstring_view suffix = L".guest.prx";
+				guest = length >= suffix.size() && std::wstring_view(path, length).ends_with(suffix);
+			}
+			if (guest) {
+				MemoryMapped(base, size, APS5_GPU_NOT_DIRECT);
+				regions++;
+				bytes += size;
+			}
+		}
+		if (size == 0 || base + size <= address) break;
+		address = base + size;
+	}
+	Log("guest program images: %llu committed regions (%llu MiB) registered as guest memory",
+	    static_cast<unsigned long long>(regions), static_cast<unsigned long long>(bytes >> 20u));
+}
+
 // The device, the renderer, the presenter and Kyty's GPU threads, once AnyPS5's window exists (the surface decides the
 // device). This thread becomes the one Kyty calls its main thread (the renderer's constructors check it).
 void CreateDevice() {
@@ -219,6 +257,7 @@ void CreateDevice() {
 		// What AnyPS5 mapped before the renderer existed (Kyty's kernel maps GPU ranges only once the renderer exists,
 		// but its renderer starts before the game runs; here the game has mapped memory by the time its window opens).
 		std::scoped_lock lock(b.map_mutex);
+		RegisterGuestImages();
 		uint64_t         ranges = 0;
 		uint64_t         bytes  = 0;
 		MemoryForEachMapping([&](uint64_t address, uint64_t size) {
