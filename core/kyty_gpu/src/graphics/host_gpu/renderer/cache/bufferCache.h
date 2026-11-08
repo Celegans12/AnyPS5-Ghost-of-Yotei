@@ -91,7 +91,9 @@ public:
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size);
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false);
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
-	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
+	// `defer_direct` (the fault pass, a deferred operation; KYTY_PERF_DIRECT_RANGES): a direct range the request would
+	// have to activate or grow is only marked wanted (ActivateWantedDirectRanges), and a null id is returned for it.
+	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size, bool defer_direct = false);
 	// The resolve thread's lookups (stageFLookup.h). Resolve thread: the registry's lookup lock if it is free (never waits), and its
 	// release. Between them LookupBuffer answers FindBuffer(vaddr, size) when FindBuffer would find a buffer (a null id
 	// when it would create one), writing nothing; the buffer registry epoch it saw is DrawRepeat::g_buffer_registry_epoch,
@@ -321,7 +323,10 @@ public:
 	//   - InDirectRange: [vaddr, vaddr + size) overlaps an active direct range;
 	//   - WaitDirectGpuWrites: before the GPU thread reads guest memory itself (indirect arguments, waits, predicates,
 	//     resource tables, DCC keys): waits for GPU writes recorded earlier into those bytes;
-	//   - UnmapDirect: an unmap of guest memory (after Finish) ends the direct ranges it overlaps.
+	//   - UnmapDirect: an unmap of guest memory (after Finish) ends the direct ranges it overlaps;
+	//   - ActivateWantedDirectRanges (frame boundary): activates or grows the ranges a deferred operation asked for
+	//     (FindBuffer with `defer_direct`); a deferred operation cannot do it itself, since both finish all recorded GPU
+	//     work and download the GPU-written bytes of the buffers they replace.
 	// With `cp_overlay`, command-processor writes (whose bytes the GPU
 	// thread knows) are not waited for; WaitDirectGpuWrites then returns true when such writes are still pending over
 	// the range, and the caller puts ApplyDirectCpWrites over the guest memory it reads right after.
@@ -329,6 +334,7 @@ public:
 	bool               WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_overlay = false);
 	void               ApplyDirectCpWrites(uint64_t vaddr, void* data, uint64_t size) const;
 	void               UnmapDirect(uint64_t vaddr, uint64_t size);
+	void               ActivateWantedDirectRanges();
 	// KYTY_FIX_VIRTUAL_GPU_CLOCK (virtualGpuClock.cpp), GPU thread: a value the GPU produced at an earlier, finished point
 	// of the command stream (an end-of-pipe clock value resolved once its command buffer completed) for [address,
 	// address + size).
@@ -587,6 +593,11 @@ private:
 		BufferId id      = {};
 		bool     active  = false;
 		bool     refused = false; // cannot be imported / holds images: the range stays on the tracked path
+		// A deferred operation's request to activate or grow the range, served at the frame boundary
+		// (ActivateWantedDirectRanges): the union of the requested bytes.
+		bool     wanted     = false;
+		uint64_t want_start = 0;
+		uint64_t want_end   = 0;
 	};
 	struct DirectGpuWrite {
 		uint64_t start = 0;
@@ -603,9 +614,12 @@ private:
 	std::vector<DirectGpuWrite> m_direct_cp_overlay;
 	uint32_t                    m_direct_mode_seen = 0;
 	bool                        m_direct_parsed    = false;
+	bool                        m_direct_wanted    = false; // a range is wanted, or a live A/B switch waits
 	[[nodiscard]] uint32_t DirectMode();
 	// The active direct buffer holding [vaddr, vaddr + size) (activating or growing its range), else a null id.
-	[[nodiscard]] BufferId DirectBufferFor(uint64_t vaddr, uint64_t size);
+	// `deferred` (non-null: the caller is a deferred operation, which must not wait): a range that would have to be
+	// activated, grown or ended is not touched but marked wanted, *deferred is set and a null id returned.
+	[[nodiscard]] BufferId DirectBufferFor(uint64_t vaddr, uint64_t size, bool* deferred = nullptr);
 	void                   ActivateDirect(DirectRange& range);
 	void                   DeactivateDirect(DirectRange& range, bool replace = true);
 	void                   NoteDirectGpuWrite(uint64_t vaddr, uint64_t size, const void* cp_data = nullptr);

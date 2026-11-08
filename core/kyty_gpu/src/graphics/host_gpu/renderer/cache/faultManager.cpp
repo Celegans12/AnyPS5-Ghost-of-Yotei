@@ -543,7 +543,8 @@ void FaultManager::ProcessFaultBuffer() {
 		}
 		fault_ranges.ForEach([this](uint64_t start, uint64_t end) {
 			EXIT_IF(end - start > std::numeric_limits<uint32_t>::max());
-			(void)m_buffer_cache.FindBuffer(start, end - start);
+			// A deferred operation: a direct range is not activated here but at the frame boundary (FindBuffer).
+			(void)m_buffer_cache.FindBuffer(start, end - start, true);
 		});
 		m_fault_areas[area] = 0;
 	});

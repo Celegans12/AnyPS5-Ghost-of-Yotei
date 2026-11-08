@@ -352,6 +352,8 @@ void RenderContext::RunGarbageCollector() {
 		m_fault_process_pending = false;
 		m_buffer_cache.ProcessFaultBuffer();
 	}
+	// KYTY_PERF_DIRECT_RANGES: the ranges the fault pass's completions asked for (they cannot activate them).
+	m_buffer_cache.ActivateWantedDirectRanges();
 	// Live shader flags (KYTY_PERF_INDIRECT_LOAD_FAST=3): this frame boundary's live A/B phase.
 	SpirvLive::Update(m_command_scheduler, *m_buffer_cache.GetFaultBuffer(),
 	                  BufferCache::FAULT_DIAG_BASE + BufferCache::FAULT_DIAG_WORDS);

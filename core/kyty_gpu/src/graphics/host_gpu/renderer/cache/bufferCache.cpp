@@ -1476,7 +1476,7 @@ void BufferCache::NoteSyncTimelineNeed(uint64_t vaddr, uint64_t size) {
 	SyncTimeline::SetNeed(unknown ? 0 : need_tick, inexact ? 0 : exact_tick, need_dirty, page_dirty);
 }
 
-BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
+BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size, bool defer_direct) {
 	if (vaddr == 0) {
 		return NULL_BUFFER_ID;
 	}
@@ -1484,8 +1484,14 @@ BufferId BufferCache::FindBuffer(uint64_t vaddr, uint64_t size) {
 		EXIT("BufferCache: invalid buffer discovery request\n");
 	}
 	// KYTY_PERF_DIRECT_RANGES: a direct range's buffer (never joined into another one).
-	if (const BufferId direct = DirectBufferFor(vaddr, size); direct) {
+	bool deferred = false;
+	if (const BufferId direct = DirectBufferFor(vaddr, size, defer_direct ? &deferred : nullptr); direct) {
 		return direct;
+	}
+	if (deferred) {
+		// The range is activated or grown at the frame boundary (ActivateWantedDirectRanges); an ordinary buffer
+		// created here would only be replaced there (and must not be joined with an active direct buffer).
+		return NULL_BUFFER_ID;
 	}
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
@@ -1544,9 +1550,16 @@ uint32_t BufferCache::DirectMode() {
 	return mode;
 }
 
-BufferId BufferCache::DirectBufferFor(uint64_t vaddr, uint64_t size) {
+BufferId BufferCache::DirectBufferFor(uint64_t vaddr, uint64_t size, bool* deferred) {
 	const uint32_t mode = DirectMode();
 	if (mode != m_direct_mode_seen) {
+		if (deferred != nullptr) {
+			// Ending the active ranges finishes the recorded GPU work (DeactivateDirect): the frame boundary takes the
+			// switch; until then a deferred lookup gets no buffer.
+			m_direct_wanted = true;
+			*deferred       = true;
+			return {};
+		}
 		// Live A/B: off ends the active ranges (their memory is tracked again from guest memory).
 		if (mode == 0) {
 			for (auto& range: m_direct_ranges) DeactivateDirect(range);
@@ -1557,7 +1570,27 @@ BufferId BufferCache::DirectBufferFor(uint64_t vaddr, uint64_t size) {
 	const uint64_t end = vaddr + size;
 	for (auto& range: m_direct_ranges) {
 		if (range.refused || end <= range.start || vaddr >= range.end) continue;
-		if (vaddr < range.start || end > range.end) {
+		const bool grow = vaddr < range.start || end > range.end;
+		if (deferred != nullptr && (grow || !range.active)) {
+			// A deferred operation (the fault pass's completion callback) cannot activate or grow a range: both finish
+			// all recorded GPU work and download the GPU-written bytes of the buffers they replace, and a deferred
+			// operation must not wait (CommandScheduler::WaitPriorityOperations exits). On 1.008 a shader's BDA read is
+			// the first access to the SRT ring, so the fault pass was the first lookup of the range and the game stopped
+			// at present 2. The request is kept for the frame boundary (ActivateWantedDirectRanges).
+			range.want_start = range.wanted ? std::min(range.want_start, vaddr) : vaddr;
+			range.want_end   = range.wanted ? std::max(range.want_end, end) : end;
+			range.wanted     = true;
+			m_direct_wanted  = true;
+			*deferred        = true;
+			static std::atomic_uint logged_wanted {0};
+			if (logged_wanted.fetch_add(1) < 4u) {
+				std::fprintf(stderr, "PERF_DIRECT_RANGES 0x%llx-0x%llx wanted by a deferred lookup (0x%llx+0x%llx)\n",
+				             static_cast<unsigned long long>(range.start), static_cast<unsigned long long>(range.end),
+				             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size));
+			}
+			return {};
+		}
+		if (grow) {
 			// A request reaching past the range: the range grows to hold it (a direct buffer is never joined).
 			DeactivateDirect(range, false);
 			range.start = Common::AlignDown(std::min(vaddr, range.start), CACHING_PAGESIZE);
@@ -1646,6 +1679,19 @@ void BufferCache::DeactivateDirect(DirectRange& range, bool replace) {
 	// An ordinary buffer over the whole range at once: without one, shaders reading the range through pointers (the BDA
 	// table) would read nothing until a binding created one (black squares at every live A/B switch to off).
 	if (replace) (void)CreateBuffer(range.start, range.end - range.start);
+}
+
+// GPU thread, at the frame boundary (RenderContext::RunGarbageCollector), outside any deferred operation: what deferred
+// lookups asked for (DirectBufferFor with `deferred`), done as a lookup of the requested bytes would do it.
+void BufferCache::ActivateWantedDirectRanges() {
+	if (!m_direct_wanted) return;
+	m_direct_wanted = false;
+	(void)DirectBufferFor(0, 0); // a live A/B switch a deferred lookup left
+	for (auto& range: m_direct_ranges) {
+		if (!range.wanted) continue;
+		range.wanted = false;
+		(void)DirectBufferFor(range.want_start, range.want_end - range.want_start);
+	}
 }
 
 bool BufferCache::InDirectRange(uint64_t vaddr, uint64_t size) const {
