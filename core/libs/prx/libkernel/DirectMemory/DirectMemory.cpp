@@ -3,6 +3,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/GpuBackendSwitch.hpp"
 #include <algorithm>
 #include <cerrno>
 #include <iterator>
@@ -335,8 +336,64 @@ void ZeroReusedPhysical(std::uint64_t start, std::size_t bytes) {
 #endif
 
 #ifdef _WIN32
+bool KytyMemoryMode() {
+    static const bool kyty = LibcGpuBackendKyty_nid_no_patch();
+    return kyty;
+}
+
+class KytyBackingStore {
+public:
+    static KytyBackingStore& Get() {
+        static auto* store = new KytyBackingStore;
+        return *store;
+    }
+
+    HANDLE Section() const { return section; }
+    std::uint8_t* View() const { return view; }
+
+    void ZeroReused(std::uint64_t start, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        const auto first = start / PS5_PAGE_SIZE;
+        const auto count = bytes / PS5_PAGE_SIZE;
+        for (std::size_t page = 0; page < count;) {
+            if (!mapped[first + page]) {
+                ++page;
+                continue;
+            }
+            std::size_t run = 0;
+            while (page + run < count && mapped[first + page + run]) ++run;
+            std::memset(view + (first + page) * PS5_PAGE_SIZE, 0, run * PS5_PAGE_SIZE);
+            zeroedBytes += run * PS5_PAGE_SIZE;
+            page += run;
+        }
+    }
+
+    void NoteMapped(std::uint64_t start, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        const auto first = start / PS5_PAGE_SIZE;
+        const auto count = (bytes + PS5_PAGE_SIZE - 1) / PS5_PAGE_SIZE;
+        for (std::size_t page = 0; page < count; ++page) mapped[first + page] = true;
+    }
+
+private:
+    KytyBackingStore() {
+        const auto size = static_cast<std::uint64_t>(DIRECT_MEMORY_SIZE);
+        section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
+        if (section == nullptr) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "create the kyty-mode direct memory section");
+        view = static_cast<std::uint8_t*>(MapViewOfFile(section, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, static_cast<SIZE_T>(size)));
+        if (view == nullptr) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "map the kyty-mode direct memory backing view");
+        std::fprintf(stderr, "[memory] kyty mode: one direct memory section of %llu MiB, backing view %p\n", static_cast<unsigned long long>(size >> 20), static_cast<void*>(view));
+    }
+
+    HANDLE section = nullptr;
+    std::uint8_t* view = nullptr;
+    std::mutex mutex;
+    std::vector<bool> mapped = std::vector<bool>(DIRECT_MEMORY_SIZE / PS5_PAGE_SIZE);
+    std::uint64_t zeroedBytes = 0;
+};
+
 bool SectionPoolEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_DIRECT_MEMORY_SECTION_POOL") == nullptr;
+    static const bool enabled = !KytyMemoryMode() && std::getenv("APS5_NO_DIRECT_MEMORY_SECTION_POOL") == nullptr;
     return enabled;
 }
 
@@ -387,7 +444,13 @@ class PhysicalBacking {
 public:
     PhysicalBacking(std::size_t bytes, int memoryType, std::uint64_t start) : memoryType(memoryType), bytes(bytes) {
 #ifdef _WIN32
-        static_cast<void>(start);
+        if (KytyMemoryMode()) {
+            shared = true;
+            sectionStart = start;
+            section = KytyBackingStore::Get().Section();
+            KytyBackingStore::Get().ZeroReused(start, bytes);
+            return;
+        }
         const auto size = static_cast<std::uint64_t>(bytes);
         if (SectionPoolEnabled()) section = SectionPool::Get().Take(bytes);
         if (!section) section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
@@ -422,6 +485,7 @@ public:
 
     ~PhysicalBacking() {
 #ifdef _WIN32
+        if (shared) return;
         if (!SectionPoolEnabled()) {
             GuestArena::GuestArenaForgetSection_nid_postfix(section);
             CloseHandle(section);
@@ -438,7 +502,8 @@ public:
 
     void Map(std::uintptr_t address, std::size_t bytes, std::uint64_t offset, int protection) const {
 #ifdef _WIN32
-        GuestArena::GuestArenaMapDirect_nid_postfix(reinterpret_cast<void*>(address), bytes, section, offset, WinProtFromPosix(protection));
+        GuestArena::GuestArenaMapDirect_nid_postfix(reinterpret_cast<void*>(address), bytes, section, sectionStart + offset, WinProtFromPosix(protection));
+        if (shared) KytyBackingStore::Get().NoteMapped(sectionStart + offset, bytes);
 #else
         if (::mmap(reinterpret_cast<void*>(address), bytes, protection, MAP_SHARED | MAP_FIXED, file, static_cast<off_t>(fileOffset + offset)) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map direct memory backing");
 #endif
@@ -449,6 +514,8 @@ private:
     std::size_t bytes;
 #ifdef _WIN32
     HANDLE section = nullptr;
+    std::uint64_t sectionStart = 0;
+    bool shared = false;
 #else
     int file = -1;
     void* hostWriteView = nullptr;
@@ -1570,6 +1637,38 @@ bool QueryDirectMapping(std::uintptr_t address, std::uintptr_t* start, std::uint
     *offset = it->second.phys;
     *memoryType = it->second.memoryType;
     return true;
+}
+
+extern "C" bool DirectMemoryBackingView_nid_no_patch(std::uint8_t** base, std::uint64_t* bytes) {
+#ifdef _WIN32
+    if (!KytyMemoryMode()) return false;
+    *base = KytyBackingStore::Get().View();
+    *bytes = DIRECT_MEMORY_SIZE;
+    return true;
+#else
+    static_cast<void>(base);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
+extern "C" bool DirectMemoryQueryMapping_nid_no_patch(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end, std::uint64_t* offset, int* memoryType) {
+    return QueryDirectMapping(address, start, end, offset, memoryType);
+}
+
+extern "C" std::int64_t DirectMemoryMapSystemBlock_nid_no_patch(std::uintptr_t address, std::size_t bytes, int memoryType, int prot) {
+    if (bytes == 0 || (bytes & (PS5_PAGE_SIZE - 1)) != 0 || (address & (PS5_PAGE_SIZE - 1)) != 0) throw std::invalid_argument("system direct memory block is not page aligned");
+    std::int64_t phys = -1;
+    if (DirectMemoryAlloc(0, static_cast<std::int64_t>(DIRECT_MEMORY_SIZE), bytes, bytes, memoryType, &phys) != 0) throw std::runtime_error("allocate a system direct memory block");
+    {
+        std::lock_guard lock(g_directLock);
+        AddMapping(address, bytes, static_cast<std::uint64_t>(phys), LinuxProtFromSce(prot));
+    }
+    GuestAllocations::Mutation mutation;
+    mutation.Add(reinterpret_cast<void*>(address), bytes, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0);
+    RecordProtection(reinterpret_cast<const void*>(address), bytes, prot);
+    Trace("map system block %p+0x%zx phys=0x%llx prot=0x%x", reinterpret_cast<void*>(address), bytes, static_cast<unsigned long long>(phys), prot);
+    return phys;
 }
 
 std::vector<DirectMemoryView> DirectMemoryViews(int64_t start, size_t len) {

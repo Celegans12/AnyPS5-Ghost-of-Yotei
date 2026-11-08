@@ -56,4 +56,8 @@ void ForgetJitSharedMemory(int descriptor);
 void DuplicateJitSharedMemory(int from, int to);
 void GuestPageTableUsage(std::uint64_t granularity, std::uint64_t* cpu_entries, std::uint64_t* gpu_entries);
 
+extern "C" bool DirectMemoryBackingView_nid_no_patch(std::uint8_t** base, std::uint64_t* bytes);
+extern "C" bool DirectMemoryQueryMapping_nid_no_patch(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end, std::uint64_t* offset, int* memoryType);
+extern "C" std::int64_t DirectMemoryMapSystemBlock_nid_no_patch(std::uintptr_t address, std::size_t bytes, int memoryType, int prot);
+
 #endif
