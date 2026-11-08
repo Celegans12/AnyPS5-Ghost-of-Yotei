@@ -354,6 +354,20 @@ list(REMOVE_DUPLICATES kyty_emulator_src)
 if (KYTY_CLANG_CL)
 	set_source_files_properties(${kyty_emulator_src} PROPERTIES COMPILE_FLAGS "-Wno-pragma-pack -Wno-deprecated-declarations -D_TIMESPEC_DEFINED")
 endif()
+if (GCC AND WIN32)
+	# MinGW GCC 15.2: internal compiler error "in choose_baseaddr" (RTL pass pro_and_epilogue, i386.cc:7447) in one
+	# function of each of these host-side files, at -O1 and above, with or without AVX, frame pointer, shrink-wrapping
+	# or stack realignment options. audio.cpp compiles without the loop vectorizer; the other four only without
+	# asynchronous unwind tables (no SEH unwind data for their functions: nothing unwinds through them, faults are
+	# handled by the vectored handler).
+	set_property(SOURCE "${KYTY_SOURCE_DIR}/libs/audio.cpp" APPEND PROPERTY COMPILE_OPTIONS -fno-tree-vectorize)
+	set_property(SOURCE
+		"${KYTY_SOURCE_DIR}/kernel/eventQueue.cpp"
+		"${KYTY_SOURCE_DIR}/libs/avPlayer.cpp"
+		"${KYTY_SOURCE_DIR}/libs/libKernel.cpp"
+		"${KYTY_SOURCE_DIR}/loader/runtimeLinker.cpp"
+		APPEND PROPERTY COMPILE_OPTIONS -fno-asynchronous-unwind-tables)
+endif()
 
 set(kyty_emulator_link_libraries common Vulkan::Headers spirv-tools-opt spirv-tools SDL3::SDL3-static imgui xxhash FFmpeg::ffmpeg fmt::fmt nlohmann_json::nlohmann_json LibAtrac9 kyty_git_version Zydis::Zydis xbyak::xbyak opus libzstd_static)
 
