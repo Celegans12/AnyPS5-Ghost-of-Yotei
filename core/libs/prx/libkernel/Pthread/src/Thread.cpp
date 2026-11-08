@@ -93,6 +93,10 @@ static GuestThreadState& CurrentGuestState() {
     return state;
 #endif
 }
+
+extern "C" bool IsGuestPthread_nid_no_patch() {
+    return CurrentGuestState().current != nullptr || IsInitialPthread_nid_no_patch();
+}
 static std::mutex& stackLock = *new std::mutex();
 static auto& liveStacks = *new std::map<PthreadPrivate*, std::pair<std::uintptr_t, std::uintptr_t>>();
 static auto& protectedStackPages = *new std::map<std::uintptr_t, std::size_t>();
