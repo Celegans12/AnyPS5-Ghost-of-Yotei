@@ -325,11 +325,11 @@ void MemoryUnmap(Aps5GpuBackend* /*backend*/, uint64_t address, uint64_t bytes) 
 	MemoryUnmapped(address, bytes);
 }
 
-void MemoryMap(Aps5GpuBackend* /*backend*/, uint64_t address, uint64_t bytes, uint32_t /*protection*/) {
+void MemoryMap(Aps5GpuBackend* /*backend*/, uint64_t address, uint64_t bytes, uint32_t /*protection*/, uint64_t direct_offset) {
 	auto&            b = B();
 	std::scoped_lock lock(b.map_mutex);
 	b.counts.maps.fetch_add(1, std::memory_order_relaxed);
-	MemoryMapped(address, bytes);
+	MemoryMapped(address, bytes, direct_offset);
 	if (auto* renderer = Renderer(); renderer != nullptr && Graphics::GuestRange {address, bytes}.Valid()) {
 		renderer->MapMemory(address, bytes);
 	}

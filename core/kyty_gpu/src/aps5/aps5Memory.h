@@ -14,8 +14,9 @@ struct MemoryStats {
 };
 
 void        MemoryInitialize(uint8_t* backing_base, uint64_t backing_size);
-// After AnyPS5 committed or mapped [address, address + bytes): its direct-memory pieces get their backing offsets.
-void        MemoryMapped(uint64_t address, uint64_t bytes);
+// After AnyPS5 committed or mapped [address, address + bytes): direct memory at backing_offset in the backing view, or
+// private memory (APS5_GPU_NOT_DIRECT).
+void        MemoryMapped(uint64_t address, uint64_t bytes, uint64_t backing_offset);
 // Before AnyPS5 releases or replaces the range (after Kyty's renderer let go of it).
 void        MemoryUnmapped(uint64_t address, uint64_t bytes);
 MemoryStats GetMemoryStats();

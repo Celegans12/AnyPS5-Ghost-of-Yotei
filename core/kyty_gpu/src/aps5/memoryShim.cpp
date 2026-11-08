@@ -190,17 +190,21 @@ public:
 	[[nodiscard]] uint64_t BackingSize() const noexcept { return m_backing_size; }
 	[[nodiscard]] bool     IsAvailable() const noexcept { return m_backing_base != nullptr; }
 
-	void Map(uint64_t vaddr, uint64_t size) {
+	// AnyPS5 may hold its direct-memory table lock here, so the range comes with its offset in the backing view
+	// (direct memory) or without one (private memory); nothing is looked up.
+	void Map(uint64_t vaddr, uint64_t size, uint64_t backing_offset) {
 		if (size == 0 || UINT64_MAX - vaddr < size) {
 			return;
 		}
-		std::vector<Entry> pieces;
-		Split(vaddr, size, pieces);
+		const bool direct = backing_offset != APS5_GPU_NOT_DIRECT && RangeOk(backing_offset, size);
+		if (backing_offset != APS5_GPU_NOT_DIRECT && !direct) {
+			Aps5::Log("memory: direct mapping 0x%llx+0x%llx at backing offset 0x%llx lies outside the backing view",
+			          static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+			          static_cast<unsigned long long>(backing_offset));
+		}
 		std::unique_lock lock(m_mutex);
 		RemoveUnlocked(vaddr, size);
-		for (const auto& piece: pieces) {
-			m_entries.emplace(piece.vaddr, piece);
-		}
+		m_entries.emplace(vaddr, Entry {vaddr, size, direct ? backing_offset : 0, direct});
 		m_committed.Set(vaddr, size, true);
 		m_generation.fetch_add(1, std::memory_order_release);
 	}
@@ -471,29 +475,10 @@ private:
 		return size != 0 && backing_offset < m_backing_size && size <= m_backing_size - backing_offset;
 	}
 
-	// The direct-mapping pieces of a range AnyPS5 just mapped; the rest is private (flexible, pool, file, shared memory).
-	void Split(uint64_t vaddr, uint64_t size, std::vector<Entry>& pieces) const {
-		const auto& host   = Aps5::Host();
-		const auto  end    = vaddr + size;
-		auto        cursor = vaddr;
-		while (cursor < end) {
-			uint64_t start = 0;
-			uint64_t stop  = 0;
-			uint64_t offset = 0;
-			int32_t  type   = 0;
-			if (host.direct_mapping(host.context, cursor, &start, &stop, &offset, &type) != APS5_GPU_OK || stop <= cursor ||
-			    start > cursor) {
-				pieces.push_back(Entry {cursor, end - cursor, 0, false});
-				return;
-			}
-			const auto piece_end = std::min(end, stop);
-			pieces.push_back(Entry {cursor, piece_end - cursor, offset + (cursor - start), true});
-			cursor = piece_end;
-		}
-	}
-
 	// A mapping AnyPS5 made before the backend existed (or one it never reported): a direct mapping the host knows is
-	// added on first use. Private memory cannot be found this way (no lookup for it).
+	// added on first use. Private memory cannot be found this way (no lookup for it). The host's lookup only tries its
+	// direct-memory lock (a mapping change may hold it while it waits for the GPU thread): a busy lookup is tried again a
+	// few times, then the access fails as for unmapped memory.
 	bool Discover(uint64_t vaddr) {
 		if (!Aps5::HasHost()) {
 			return false;
@@ -503,8 +488,14 @@ private:
 		uint64_t    stop   = 0;
 		uint64_t    offset = 0;
 		int32_t     type   = 0;
-		if (host.direct_mapping(host.context, vaddr, &start, &stop, &offset, &type) != APS5_GPU_OK || stop <= start ||
-		    vaddr < start || vaddr >= stop) {
+		bool        found  = false;
+		for (int attempt = 0; attempt < 8 && !found; attempt++) {
+			if (attempt != 0) {
+				SwitchToThread();
+			}
+			found = host.direct_mapping(host.context, vaddr, &start, &stop, &offset, &type) == APS5_GPU_OK;
+		}
+		if (!found || stop <= start || vaddr < start || vaddr >= stop) {
 			return false;
 		}
 		{
@@ -1218,8 +1209,8 @@ void MemoryInitialize(uint8_t* backing_base, uint64_t backing_size) {
 	}
 }
 
-void MemoryMapped(uint64_t address, uint64_t bytes) {
-	Libs::LibKernel::Memory::Map().Map(address, bytes);
+void MemoryMapped(uint64_t address, uint64_t bytes, uint64_t backing_offset) {
+	Libs::LibKernel::Memory::Map().Map(address, bytes, backing_offset);
 }
 
 void MemoryUnmapped(uint64_t address, uint64_t bytes) {
