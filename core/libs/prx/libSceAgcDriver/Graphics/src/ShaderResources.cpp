@@ -5767,7 +5767,7 @@ bool ShaderResources::revalidateFullBody(std::span<const CompiledShader> shaders
         if (!FastMode2::On(RuntimeSwitch::Fm2Trust)) return false;
         auto& counters = FastMode2::Count();
         counters.trustAsked.fetch_add(1, std::memory_order_relaxed);
-        if (fm2ProvedPresent != Recorder::Presents()) {
+        if (fm2ProvedPresent == ~0ull || Recorder::Presents() - fm2ProvedPresent >= FastMode2::TrustPresents()) {
             counters.trustNotProved.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -8152,6 +8152,8 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* readsSlot = nullptr;
     auto& reads = ShaderRecompiler::ThreadOwned(readsSlot);
     const bool fm2Snap = FastMode2::On(RuntimeSwitch::Fm2Snap);
+    const bool fm2LoopClock = FastMode2::Timing() && RuntimeSwitches::Set(RuntimeSwitch::Fm2Snap);
+    const auto fm2LoopAt = fm2LoopClock ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     if (fm2Snap && moved.empty()) {
         FastMode2::Count().snapSkipped.fetch_add(1, std::memory_order_relaxed);
         return {};
@@ -8359,6 +8361,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
+    if (fm2LoopClock) FastMode2::Count().bindLoopNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fm2LoopAt).count()), std::memory_order_relaxed);
     if (selected.empty()) return {};
     Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
     std::array<bool, 2> described{};
