@@ -2029,7 +2029,8 @@ void RenderExecutor::ExecutePreparedDraw(uint64_t submit_id, CommandBuffer& buff
 	const uint64_t c0_programs0 = CleanDraws::t_front_parts.programs_ns;
 	// A draw of today's programs whose pipeline is not created yet is not issued (StageWritesMemory, above).
 	PipelineCache::Pipeline* async_pipeline = nullptr;
-	if (DrawWritesMemory(state)) {
+	// KYTY_PERF_TABLE_ASYNC=0: every draw waits for its pipeline (none is skipped), as draws that write memory always do.
+	if (DrawWritesMemory(state) || !PipelineCache::TableAsyncEnabled()) {
 		NoteAsyncDraw(false);
 	} else {
 		bool failed    = false; // (a worker could not create it: today's creation on this thread)
