@@ -180,7 +180,6 @@ int Start(Aps5GpuBackend* /*backend*/) {
 	bool ok = true;
 	std::call_once(B().started, [&] {
 		Common::SetFatalHook(&FatalHook);
-		Common::InstallAbortReporters();
 		ApplySettings();
 		Config::Initialize();
 		Config::Load(ReleaseConfig());
