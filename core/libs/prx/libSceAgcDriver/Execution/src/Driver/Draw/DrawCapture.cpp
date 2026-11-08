@@ -6,6 +6,14 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/SrtWalker.hpp"
+#include <chrono>
+#include <cstdio>
+#include <map>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -18,6 +26,95 @@
 namespace AgcDriver::DriverDetail {
 
 namespace {
+
+bool directEvalRead(void*, std::uint64_t address, std::uint32_t* value) {
+    const auto* pointer = reinterpret_cast<const std::byte*>(address);
+    if (!GuestMemory::Accessible(pointer, sizeof(std::uint32_t), false)) return false;
+    std::memcpy(value, pointer, sizeof(std::uint32_t));
+    return true;
+}
+
+bool directEvalAccessible(void*, std::uint64_t address, std::uint64_t bytes) {
+    return GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes), false);
+}
+
+void probeDirectEvaluation(const ShaderRecompiler::RecompileRequest& request) {
+    struct Totals {
+        std::uint64_t calls = 0, failed = 0, images = 0, samplers = 0, tables = 0, prepares = 0;
+        double us = 0;
+        std::map<std::string, std::uint64_t> reasons;
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    };
+    static std::mutex mutex;
+    static Totals totals;
+    static std::map<std::pair<std::uint64_t, int>, std::shared_ptr<const ShaderRecompiler::SourceHandle>> handles;
+    auto direct = request;
+    direct.target.directResources = true;
+    const auto key = std::pair{request.shader.codeAddress, static_cast<int>(request.shader.stage)};
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    bool prepared = false;
+    std::string failure;
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = handles.find(key); found != handles.end()) handle = found->second;
+    }
+    if (handle == nullptr) {
+        try {
+            handle = ShaderRecompiler::PrepareShader(direct, nullptr);
+            prepared = true;
+            std::lock_guard lock(mutex);
+            handles[key] = handle;
+        } catch (const std::exception& error) {
+            failure = std::string("prepare: ") + error.what();
+        }
+    }
+    double us = 0;
+    std::size_t images = 0, samplers = 0, tables = 0;
+    if (handle != nullptr) {
+        ShaderRecompiler::SrtRuntime runtime;
+        runtime.userData = request.context.userData;
+        runtime.shaderBase = request.shader.codeAddress;
+        runtime.readMemory = &directEvalRead;
+        runtime.readSpecializationMemory = &directEvalRead;
+        runtime.accessible = &directEvalAccessible;
+        const auto started = std::chrono::steady_clock::now();
+        try {
+            const auto capture = ShaderRecompiler::CaptureResources(direct, runtime, *handle);
+            images = capture->snapshot.images.size();
+            samplers = capture->snapshot.samplers.size();
+            tables = capture->snapshot.tables.tables.size();
+        } catch (const std::exception& error) {
+            failure = std::string("capture: ") + error.what();
+        }
+        us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+    }
+    std::lock_guard lock(mutex);
+    ++totals.calls;
+    totals.prepares += prepared ? 1u : 0u;
+    if (!failure.empty()) {
+        ++totals.failed;
+        if (failure.size() > 100) failure.resize(100);
+        ++totals.reasons[failure];
+    } else {
+        totals.us += us;
+        totals.images += images;
+        totals.samplers += samplers;
+        totals.tables += tables;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    if (now - totals.last < std::chrono::seconds(10)) return;
+    totals.last = now;
+    const auto ok = totals.calls - totals.failed;
+    std::string line = "[direct-eval] 10 s: " + std::to_string(totals.calls) + " stage evaluations, " + std::to_string(totals.failed) + " failed, " + std::to_string(totals.prepares) + " prepared; avg " + std::to_string(ok != 0 ? totals.us / static_cast<double>(ok) : 0.0) + " us; images " + std::to_string(totals.images) + ", samplers " + std::to_string(totals.samplers) + ", table columns " + std::to_string(totals.tables) + ";";
+    std::vector<std::pair<std::uint64_t, std::string>> top;
+    for (const auto& [text, count] : totals.reasons) top.emplace_back(count, text);
+    std::sort(top.rbegin(), top.rend());
+    for (std::size_t index = 0; index < top.size() && index < 3; ++index) line += " [" + std::to_string(top[index].first) + "x] " + top[index].second + ";";
+    std::fprintf(stderr, "%s\n", line.c_str());
+    const auto last = totals.last;
+    totals = {};
+    totals.last = last;
+}
 
 void TraceMaterializationFailure(std::uint64_t token, const Submission& submission, std::size_t packetOffset, std::size_t stage, const char* phase, const std::exception_ptr& failure) {
     if (token == 0) return;
@@ -76,6 +173,8 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     if (graphics.depthRemap.mode != 0u && pushOffset < Graphics::PipelinePushSlotBytes) {
         request.layout.pushConstantSizeBytes = std::min(request.layout.pushConstantSizeBytes, ShaderRecompiler::DepthRemapPushOffsetBytes - pushOffset);
     }
+    static const bool directEvalProbe = std::getenv("APS5_DIRECT_EVAL_PROBE") != nullptr;
+    if (directEvalProbe) probeDirectEvaluation(request);
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     auto invocation = [&] {
         try {
