@@ -59,7 +59,7 @@ namespace {
 
 void probeDirect(const ShaderRecompiler::RecompileRequest& request) {
     struct Counts {
-        std::uint64_t buffersOnly = 0, withImages = 0, failed = 0;
+        std::uint64_t buffersOnly = 0, withImages = 0, failed = 0, noWrites = 0, knownWrites = 0, unknownWrites = 0;
     };
     static AgcDriver::Mutex mutex;
     static std::map<unsigned, Counts> byStage;
@@ -71,10 +71,12 @@ void probeDirect(const ShaderRecompiler::RecompileRequest& request) {
     const auto stage = static_cast<unsigned>(request.shader.stage);
     std::string failure;
     bool images = false;
+    int writes = 0;
     try {
         const auto handle = ShaderRecompiler::PrepareShader(direct, nullptr);
         const auto& info = handle->artifact->info.info;
         images = !info.images.empty() || !info.samplers.empty();
+        writes = info.directWritesFromMemory != 0 || info.directAddressWrites != 0 ? 2 : info.directWritesFromUserData != 0 ? 1 : 0;
     } catch (const std::exception& error) {
         failure = error.what();
         if (failure.size() > 90) failure.resize(90);
@@ -88,13 +90,14 @@ void probeDirect(const ShaderRecompiler::RecompileRequest& request) {
         ++counts.withImages;
     } else {
         ++counts.buffersOnly;
+        ++(writes == 0 ? counts.noWrites : writes == 1 ? counts.knownWrites : counts.unknownWrites);
     }
     ++probes;
     const auto now = std::chrono::steady_clock::now();
     if (now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
     std::string line = "[direct-probe] " + std::to_string(probes) + " shaders;";
-    for (const auto& [key, value] : byStage) line += " stage " + std::to_string(key) + ": buffers-only " + std::to_string(value.buffersOnly) + ", images " + std::to_string(value.withImages) + ", failed " + std::to_string(value.failed) + ";";
+    for (const auto& [key, value] : byStage) line += " stage " + std::to_string(key) + ": buffers-only " + std::to_string(value.buffersOnly) + " (writes none " + std::to_string(value.noWrites) + ", known " + std::to_string(value.knownWrites) + ", unknown " + std::to_string(value.unknownWrites) + "), images " + std::to_string(value.withImages) + ", failed " + std::to_string(value.failed) + ";";
     std::vector<std::pair<std::uint64_t, std::string>> top;
     for (const auto& [text, count] : failures) top.emplace_back(count, text);
     std::sort(top.rbegin(), top.rend());

@@ -33,6 +33,9 @@ struct ShaderInfo {
     bool hasBitwiseXor = false;
     bool usesDma = false;
     bool bdaWrites = false;
+    std::uint32_t directWritesFromUserData = 0;
+    std::uint32_t directWritesFromMemory = 0;
+    std::uint32_t directAddressWrites = 0;
     bool usesFaultBuffer = false;
     bool dispatchThreadLimit = false;
     bool rasterPrimitive = false;

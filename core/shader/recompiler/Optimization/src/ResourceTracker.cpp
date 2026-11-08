@@ -2253,6 +2253,13 @@ private:
         memory.gpuDescriptor = true;
         m_info.usesDma = true;
         m_info.bdaWrites = m_info.bdaWrites || access == BufferAccess::Write || access == BufferAccess::Atomic;
+        if (m_program.Metadata().directResources && (access == BufferAccess::Write || access == BufferAccess::Atomic)) {
+            const bool fromUserData = descriptor.dwordCount >= 4u && std::all_of(descriptor.dwords.begin(), descriptor.dwords.begin() + 4, [](IrValue* word) {
+                const auto* value = word != nullptr ? word->Resolve() : nullptr;
+                return value != nullptr && (value->HasImmediate() || value->Opcode() == IrOpcode::GetUserData);
+            });
+            ++(fromUserData ? m_info.directWritesFromUserData : m_info.directWritesFromMemory);
+        }
         return true;
     }
 
@@ -2515,6 +2522,7 @@ private:
             }
             m_info.usesDma = true;
             m_info.bdaWrites = m_info.bdaWrites || addressInfo.access == AddressAccess::Write || addressInfo.access == AddressAccess::Atomic;
+            if (m_program.Metadata().directResources && (addressInfo.access == AddressAccess::Write || addressInfo.access == AddressAccess::Atomic)) ++m_info.directAddressWrites;
             return;
         }
 
