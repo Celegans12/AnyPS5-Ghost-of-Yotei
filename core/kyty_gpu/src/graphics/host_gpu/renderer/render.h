@@ -488,7 +488,8 @@ private:
 	RenderContext&                        m_context;
 	uint64_t                              m_bindless_frame = UINT64_MAX;
 	std::vector<uint32_t>                 m_bindless_requests;
-		static inline thread_local std::vector<uint32_t> m_bindless_srt;
+		// Defined in descriptors.cpp (MinGW GCC emits an inline thread_local's TLS init function in every object file).
+		static thread_local std::vector<uint32_t> m_bindless_srt;
 	// The last bindless image lists CommitBindings walked, with the epochs of that walk.
 	struct BindlessLayoutMemo {
 		std::vector<ImageId> ids;
@@ -501,7 +502,7 @@ private:
 	uint64_t                          m_bound_hash = 0;
 	// Uniform const buffers (ShaderIR.h): words padded to whole uvec4 elements before an upload read as a uniform buffer.
 	// The soft-resolve flag below: set and reset around a soft resolve; read by its own image slots and table-set keys.
-	static inline thread_local std::vector<uint32_t> m_uniform_words;
+	static thread_local std::vector<uint32_t> m_uniform_words; // defined in descriptors.cpp, as m_bindless_srt
 	static inline thread_local bool                  m_soft_texture_resolve = false;
 	bool                                  m_bindless_cached      = false;
 	uint64_t                              m_bindless_draw             = 0;

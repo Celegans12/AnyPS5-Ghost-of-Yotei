@@ -76,6 +76,9 @@
 
 namespace Libs::Graphics {
 
+thread_local std::vector<uint32_t> RenderExecutor::m_bindless_srt;
+thread_local std::vector<uint32_t> RenderExecutor::m_uniform_words;
+
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
