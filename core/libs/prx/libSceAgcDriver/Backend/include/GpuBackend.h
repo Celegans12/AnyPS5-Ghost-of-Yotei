@@ -104,7 +104,7 @@ typedef struct Aps5GpuDisplayBuffer {
     uint32_t tiling_mode;
     uint32_t pitch_in_pixels;
     uint32_t alignment;
-    uint32_t reserved;
+    uint32_t dcc_control;
 } Aps5GpuDisplayBuffer;
 
 typedef struct Aps5GpuWindow {
