@@ -456,6 +456,8 @@ set(agcDriverSources
         ${agcSampleCounterShaderHeader}
         ${agcSampleDumpsShaderHeader}
         ${agcPresentationShaderHeaders}
+        ${CMAKE_CURRENT_SOURCE_DIR}/Backend/src/KytyAdapter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Backend/src/NullBackend.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp

@@ -147,6 +147,15 @@ public:
         return std::make_shared<RenderingWait>(cfg, index, cfg->bufferReuse[index].Capture());
     }
 
+    std::optional<AgcDriver::DisplayBuffer> Buffer(std::int32_t index) override {
+        std::lock_guard lock(cfg->mutex);
+        checkConfig(*cfg);
+        if (index < 0 || index >= VIDEO_OUT_BUFFER_NUM_MAX || !cfg->buffers[index].Occupied()) return std::nullopt;
+        const auto& buffer = cfg->buffers[index];
+        if (buffer.groupIndex >= VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX || !cfg->groups[buffer.groupIndex].occupied) return std::nullopt;
+        return DescribeVideoOutBuffer(buffer, cfg->groups[buffer.groupIndex]);
+    }
+
     void WaitForFlipRoom() override {
         std::unique_lock queueLock(queue->mutex);
         const bool room = queue->changed.WaitUntil(queueLock, TimedWait::DeadlineNanos(FLIP_ROOM_WAIT_MICROS), [&] {

@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <stdexcept>
+#include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 
 namespace AgcDriver {
 
@@ -47,6 +49,10 @@ public:
     virtual void WaitForFlipRoom() {}
     virtual std::shared_ptr<IRenderingWait> CaptureRenderingWait(std::uint32_t index) {
         throw std::runtime_error("VideoOut: rendering waits are unsupported by this output");
+    }
+    virtual std::optional<DisplayBuffer> Buffer(std::int32_t index) {
+        static_cast<void>(index);
+        return std::nullopt;
     }
     virtual void Fail(std::exception_ptr error) noexcept = 0;
 };
