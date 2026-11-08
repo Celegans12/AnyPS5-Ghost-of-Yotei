@@ -31,6 +31,11 @@ void DbgExit(int status);
 // FATAL_ABORT with the call stack (FATAL_FRAMES) before the process ends; without them it ends silently (0xC0000409).
 void InstallAbortReporters();
 
+// A host that runs Kyty's graphics in its own process (AnyPS5's kyty_gpu.dll) reports a fatal error and ends the process
+// itself: the hook gets the last fatal report of the thread and the exit status. Unset (Kyty): the process exits here.
+using FatalHook = void (*)(const char* report, int status);
+void SetFatalHook(FatalHook hook);
+
 } // namespace Common
 
 #define EXIT_HALT() (Common::DbgExit(321), 1)

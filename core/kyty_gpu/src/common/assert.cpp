@@ -28,8 +28,14 @@ static std::string BuildFatalReport(const char* title, std::string_view text, co
 static void PrintFatalFrames() {
 #if defined(_WIN32)
 	void*       frames[48] {};
-	const auto  count = RtlCaptureStackBackTrace(1, 48, frames, nullptr);
-	const auto  base  = reinterpret_cast<uint64_t>(GetModuleHandleW(nullptr));
+	const auto  count  = RtlCaptureStackBackTrace(1, 48, frames, nullptr);
+	HMODULE     module = nullptr;
+	// The module holding this code: the executable for Kyty, kyty_gpu.dll inside AnyPS5.
+	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+	                       reinterpret_cast<LPCWSTR>(&PrintFatalFrames), &module) == 0) {
+		module = GetModuleHandleW(nullptr);
+	}
+	const auto  base  = reinterpret_cast<uint64_t>(module);
 	std::string text  = fmt::format("FATAL_FRAMES exe_base=0x{:x}", base);
 	for (USHORT i = 0; i < count; i++) {
 		const auto address = reinterpret_cast<uint64_t>(frames[i]);
@@ -41,9 +47,17 @@ static void PrintFatalFrames() {
 #endif
 }
 
+static FatalHook                g_fatal_hook = nullptr;
+static thread_local std::string g_fatal_report;
+
+void SetFatalHook(FatalHook hook) {
+	g_fatal_hook = hook;
+}
+
 static int DbgReport(const char* title, std::string_view text, const char* file, int line) {
 	PrintFatalFrames();
-	Log::WriteFatal(BuildFatalReport(title, text, file, line));
+	g_fatal_report = BuildFatalReport(title, text, file, line);
+	Log::WriteFatal(g_fatal_report);
 	Subsystems::EmergencyShutdownActive();
 	return 1;
 }
@@ -59,13 +73,15 @@ int DbgNotImplementedHandler(const char* expr, const char* file, int line) {
 
 int DbgExitHandler(const char* file, int line, std::string_view text) {
 	PrintFatalFrames();
-	Log::WriteFatal(BuildFatalReport("--- Error ---", text, file, line));
+	g_fatal_report = BuildFatalReport("--- Error ---", text, file, line);
+	Log::WriteFatal(g_fatal_report);
 	return 1;
 }
 
 int DbgExitHandler(const char* file, int line, fmt::text_style style, std::string_view text) {
 	PrintFatalFrames();
-	Log::WriteFatal(style, BuildFatalReport("--- Error ---", text, file, line));
+	g_fatal_report = BuildFatalReport("--- Error ---", text, file, line);
+	Log::WriteFatal(style, g_fatal_report);
 	return 1;
 }
 
@@ -103,6 +119,9 @@ void InstallAbortReporters() {
 void DbgExit(int status) {
 	Subsystems::EmergencyShutdownActive();
 	std::fflush(nullptr);
+	if (g_fatal_hook != nullptr) {
+		g_fatal_hook(g_fatal_report.c_str(), status);
+	}
 	std::_Exit(status);
 }
 

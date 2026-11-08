@@ -1,5 +1,6 @@
 #include "graphics/host_gpu/renderer/dispatchCensus.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "common/cacheDir.h"
 #include "common/envRead.h"
 #include "common/shaderEnv.h"
 #include "common/uniqueFunction.h"
@@ -217,7 +218,7 @@ void BufferCache::LoadFallbackList() {
 		return;
 	(void)::Loader::SystemContentParamSfoGetString("APP_VER", &version);
 	std::ranges::replace_if(version, [](unsigned char c) { return std::isalnum(c) == 0; }, '_');
-	m_fallback_list_path = std::filesystem::path("_PipelineCache") / (title + "_" + version + ".bda_granules");
+	m_fallback_list_path = Common::PipelineCacheDir() / (title + "_" + version + ".bda_granules");
 	if (std::FILE* f = std::fopen(Common::PathToString(m_fallback_list_path).c_str(), "r"); f != nullptr) {
 		unsigned long long g = 0;
 		while (std::fscanf(f, "%llu", &g) == 1) {

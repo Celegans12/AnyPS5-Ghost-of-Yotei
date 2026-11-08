@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCacheTrace.h"
 
 #include "common/assert.h"
+#include "common/cacheDir.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/envRead.h"
@@ -1435,7 +1436,7 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 
-	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+	m_driver_cache_path     = Common::PipelineCacheDir() / (title_id + ".bin");
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
