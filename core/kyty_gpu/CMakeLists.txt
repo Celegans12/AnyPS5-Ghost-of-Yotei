@@ -930,6 +930,8 @@ if (GCC AND WIN32)
 	target_link_libraries(kyty_emulator "${KYTY_MINGW_KERNELBASE_LIB}")
 	target_link_libraries(ffmpeg INTERFACE bcrypt) # after FFmpeg's static libraries on the link line
 	target_link_options(kyty_emulator PRIVATE -municode)
+	# As clang-cl's /DYNAMICBASE:NO: the image stays at its base (--image-base above) instead of an ASLR address.
+	target_link_options(kyty_emulator PRIVATE "-Wl,--disable-dynamicbase")
 	# cpuinfo's Windows code uses the max() macro of <windows.h>, which the global NOMINMAX removes.
 	target_compile_options(cpuinfo PRIVATE -UNOMINMAX)
 endif()

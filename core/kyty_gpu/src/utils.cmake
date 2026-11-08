@@ -109,6 +109,12 @@ elseif(CLANG OR GCC)
 		set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -fno-exceptions -fdiagnostics-color=always -finput-charset=UTF-8 -fexec-charset=UTF-8 -static-libgcc -static-libstdc++ -g -fno-strict-aliasing -fno-omit-frame-pointer -Wall -Wno-unused-value -fmessage-length=0")
 	endif()
 	set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -march=x86-64-v3 -ffp-contract=off")
+	if (WIN32 AND GCC)
+		# MinGW GCC keeps the stack 16-byte aligned but spills AVX registers with aligned moves (GCC PR 54412): a
+		# vmovdqa ymm to [rbp-0x60] faulted in Swapchain::Submit at start. The assembler turns every aligned vector move
+		# into its unaligned form (same speed on aligned data).
+		set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -Wa,-muse-unaligned-vector-move")
+	endif()
 	
     if(KYTY_WARNINGS_ARE_ERRORS)
         #set(KYTY_CPP_FLAGS "${KYTY_CPP_FLAGS} -Werror")
