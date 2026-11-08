@@ -2389,11 +2389,23 @@ ResolvedResources resolveDrawResources(const Context& context, const State& stat
             if (c3Log) c3Same = C3Log::Same(resolved.contentKey, c3Regions(), c3Bytes, c3Logged, c3CompareNs);
             const auto c3ProofStart = c3Log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             ShaderResources::ProofReport c3Report;
+            const bool fm2Clock = timer.profile && RuntimeSwitches::Set(RuntimeSwitch::Fm2Trust);
+            const auto fm2At = fm2Clock ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const bool valid = cached->Revalidate(shaders, c3Log ? &c3Report : nullptr, snapshots);
+            const auto fm2Mid = fm2Clock ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             auto* recorder = Recorder::Active();
             std::optional<std::vector<ShaderResources::MovedBuffer>> moved;
             const auto c3MovedStart = c3Log ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (valid && recorder != nullptr) moved = cached->MovedReadOnlyBuffers(shaders, *recorder);
+            if (fm2Clock) {
+                auto& c = FastMode2::Count();
+                const auto end = std::chrono::steady_clock::now();
+                c.revalidates.fetch_add(1, std::memory_order_relaxed);
+                c.revalidateNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(fm2Mid - fm2At).count()), std::memory_order_relaxed);
+                c.movedCalls.fetch_add(1, std::memory_order_relaxed);
+                c.movedNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(end - fm2Mid).count()), std::memory_order_relaxed);
+                if (moved.has_value() && !moved->empty()) c.movedNonEmpty.fetch_add(1, std::memory_order_relaxed);
+            }
             if (c3Log) {
                 C3Log::ThreadSplit().movedNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - c3MovedStart).count());
                 if (valid && !moved.has_value()) C3Log::ThreadSplit().refused = C3Log::Step::Served;
@@ -3019,7 +3031,18 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     sub(1);
+    const auto fm2BindAt = timer.profile && RuntimeSwitches::Set(RuntimeSwitch::Fm2Snap) ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved);
+    if (timer.profile && RuntimeSwitches::Set(RuntimeSwitch::Fm2Snap)) {
+        auto& c = FastMode2::Count();
+        const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fm2BindAt).count());
+        c.bindCalls.fetch_add(1, std::memory_order_relaxed);
+        c.bindNs.fetch_add(ns, std::memory_order_relaxed);
+        if (!record.moved.empty()) {
+            c.bindWithMoved.fetch_add(1, std::memory_order_relaxed);
+            c.bindWithMovedNs.fetch_add(ns, std::memory_order_relaxed);
+        }
+    }
     sub(2);
     // C67: moved ranges the draw reads in place need the barrier behind earlier GPU writes as the base descriptors' do.
     if (drawBindings != nullptr) {

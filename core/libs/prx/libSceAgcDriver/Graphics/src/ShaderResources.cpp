@@ -5566,6 +5566,18 @@ bool ShaderResources::revalidateFullBody(std::span<const CompiledShader> shaders
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::None};
         return true;
     }
+    struct Fm2ProofClock {
+        bool on = FastMode2::Timing() && RuntimeSwitches::Set(RuntimeSwitch::Fm2Trust);
+        bool trusted = false;
+        std::chrono::steady_clock::time_point start = on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        ~Fm2ProofClock() {
+            if (!on) return;
+            const auto ns = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+            auto& c = FastMode2::Count();
+            (trusted ? c.provesTrusted : c.provesOther).fetch_add(1, std::memory_order_relaxed);
+            (trusted ? c.provesTrustedNs : c.provesOtherNs).fetch_add(ns, std::memory_order_relaxed);
+        }
+    } fm2Clock;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // v3 C4 census (APS5_V3E_C3_LOG): where revalidateFull's time goes.
@@ -5592,6 +5604,7 @@ bool ShaderResources::revalidateFullBody(std::span<const CompiledShader> shaders
         if (image->Descriptor().dccAddress != 0 && CompletePendingCpuWrites(context, image->Descriptor().dccAddress, DccKeyBytes(image->GuestBytes()))) prefixMoved = true;
     }
     c3Step(&C3Log::Split::completeNs);
+    if (fm2Clock.on) FastMode2::Count().prefixNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - fm2Clock.start).count()), std::memory_order_relaxed);
     // APS5_NO_FAST_REVALIDATE=1 always repeats the lookups.
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
@@ -5788,6 +5801,7 @@ bool ShaderResources::revalidateFullBody(std::span<const CompiledShader> shaders
         counters.trusted.fetch_add(1, std::memory_order_relaxed);
         return true;
     }();
+    fm2Clock.trusted = fm2Trusted;
     bool fast = fm2Trusted || (!noFast && fastRevalidate(serialBefore, refreshed, reason, overlapping, accepted));
     {
         static const bool verifyUntracked = std::getenv("APS5_VERIFY_UNTRACKED_PROOFS") != nullptr;
