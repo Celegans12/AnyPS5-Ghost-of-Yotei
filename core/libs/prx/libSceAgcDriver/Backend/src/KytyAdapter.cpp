@@ -41,6 +41,10 @@
 #endif
 
 extern "C" std::uint64_t APS5_VABI sceKernelReadTsc(void);
+extern "C" bool IsGuestPthread_nid_no_patch();
+#ifdef APS5_KYTY_GPU_BACKEND
+extern "C" int Aps5GpuBackendCreate(const Aps5GpuHost* host, const Aps5GpuBackendApi** api, Aps5GpuBackend** backend);
+#endif
 
 namespace AgcDriver::Kyty {
 namespace {
@@ -453,7 +457,7 @@ int HostDisplayBuffer(void*, std::uint32_t handle, std::int32_t index, Aps5GpuDi
         if (!output) return static_cast<int>(APS5_GPU_ERROR);
         const auto display = output->Buffer(index);
         if (!display) return static_cast<int>(APS5_GPU_ERROR);
-        *buffer = Aps5GpuDisplayBuffer{display->address, display->pixelFormat, display->dccAddress, display->dccClearColor, display->width, display->height, display->tilingMode, display->pitchInPixel, display->alignment, 0};
+        *buffer = Aps5GpuDisplayBuffer{display->address, display->pixelFormat, display->dccAddress, display->dccClearColor, display->width, display->height, display->tilingMode, display->pitchInPixel, display->alignment, display->dccControl};
         return static_cast<int>(APS5_GPU_OK);
     });
 }
@@ -537,7 +541,7 @@ std::uint64_t HostProcessTimeCounter(void*) {
 }
 
 int HostIsGuestThread(void*) {
-    return -1;
+    return IsGuestPthread_nid_no_patch() ? 1 : 0;
 }
 
 const char* HostAppTitleId(void*) {
@@ -621,6 +625,16 @@ bool FaultHookFirst() {
     return g_selfCheckServed.load(std::memory_order_acquire);
 }
 
+int CreateBackend(const Aps5GpuHost& host, const Aps5GpuBackendApi** api, Aps5GpuBackend** backend) {
+    const char* name = std::getenv("APS5_GPU_BACKEND");
+    if (name != nullptr && std::strcmp(name, "null") == 0) return Aps5NullGpuBackendCreate(&host, api, backend);
+#ifdef APS5_KYTY_GPU_BACKEND
+    return Aps5GpuBackendCreate(&host, api, backend);
+#else
+    throw std::runtime_error("APS5_GPU_BACKEND=kyty: this build has no Kyty backend (configure with APS5_KYTY_GPU_DLL)");
+#endif
+}
+
 Adapter::Adapter() {
     host.abi_version = APS5_GPU_BACKEND_ABI_VERSION;
     host.size = sizeof(Aps5GpuHost);
@@ -646,7 +660,7 @@ Adapter::Adapter() {
     host.is_guest_thread = &HostIsGuestThread;
     host.app_title_id = &HostAppTitleId;
     host.app_content_version = &HostAppContentVersion;
-    if (Aps5NullGpuBackendCreate(&host, &api, &backend) != APS5_GPU_OK || api == nullptr || backend == nullptr) throw std::runtime_error("the GPU backend could not be created");
+    if (CreateBackend(host, &api, &backend) != APS5_GPU_OK || api == nullptr || backend == nullptr) throw std::runtime_error("the GPU backend could not be created");
     if (api->abi_version != APS5_GPU_BACKEND_ABI_VERSION || api->size < sizeof(Aps5GpuBackendApi)) throw std::runtime_error("the GPU backend has another interface version");
 }
 
@@ -749,7 +763,7 @@ void Present(const PresentationWindow& window, const DisplayBuffer* buffer, bool
     adapter.EnsureStarted();
     auto& copy = adapter.Window(window);
     Aps5GpuDisplayBuffer display{};
-    if (buffer != nullptr) display = Aps5GpuDisplayBuffer{buffer->address, buffer->pixelFormat, buffer->dccAddress, buffer->dccClearColor, buffer->width, buffer->height, buffer->tilingMode, buffer->pitchInPixel, buffer->alignment, 0};
+    if (buffer != nullptr) display = Aps5GpuDisplayBuffer{buffer->address, buffer->pixelFormat, buffer->dccAddress, buffer->dccClearColor, buffer->width, buffer->height, buffer->tilingMode, buffer->pitchInPixel, buffer->alignment, buffer->dccControl};
     const int dump = buffer != nullptr ? adapter.NextDumpIndex() : -1;
     (buffer != nullptr ? adapter.counts.presents : adapter.counts.clears).fetch_add(1, std::memory_order_relaxed);
     adapter.NotePresent();

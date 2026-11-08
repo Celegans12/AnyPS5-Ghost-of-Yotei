@@ -521,6 +521,25 @@ endif()
 if(MINGW OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(libSceAgcDriver PRIVATE LINKER:--exclude-libs,$<TARGET_FILE_NAME:decoder_png>)
 endif()
+set(APS5_KYTY_GPU_DLL "" CACHE FILEPATH "kyty_gpu.prx built from Kyty's tree with llvm-mingw (APS5_GPU_BACKEND=kyty); empty: no Kyty backend")
+if(WIN32 AND APS5_KYTY_GPU_DLL)
+    set(agcKytyGpuDef ${CMAKE_CURRENT_BINARY_DIR}/kyty_gpu.def)
+    set(agcKytyGpuImplib ${CMAKE_CURRENT_BINARY_DIR}/libkyty_gpu.a)
+    file(WRITE ${agcKytyGpuDef} "LIBRARY kyty_gpu.prx\nEXPORTS\nAps5GpuBackendCreate\n")
+    add_custom_command(OUTPUT ${agcKytyGpuImplib}
+            COMMAND ${CMAKE_DLLTOOL} -d ${agcKytyGpuDef} -l ${agcKytyGpuImplib}
+            DEPENDS ${agcKytyGpuDef}
+            VERBATIM
+    )
+    add_custom_target(agc_kyty_gpu_implib DEPENDS ${agcKytyGpuImplib})
+    add_dependencies(libSceAgcDriver agc_kyty_gpu_implib)
+    target_link_libraries(libSceAgcDriver PRIVATE ${agcKytyGpuImplib})
+    target_compile_definitions(libSceAgcDriver PRIVATE APS5_KYTY_GPU_BACKEND=1)
+    add_custom_command(TARGET libSceAgcDriver POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different ${APS5_KYTY_GPU_DLL} $<TARGET_FILE_DIR:libSceAgcDriver>/kyty_gpu.prx
+            VERBATIM
+    )
+endif()
 
 if(BUILD_TESTING)
     add_test_executable(agc_driver_unsupported_diagnostics_tests tests/UnsupportedDiagnostics.cpp)
