@@ -22,9 +22,12 @@
 #include "graphics/presentation/videoOut.h"
 #include "libs/errno.h"
 
+#include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <cinttypes>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -74,6 +77,7 @@ struct VideoOutDriver::Impl {
 	std::atomic<uint64_t> presents {0};
 	std::atomic<uint64_t> mismatches {0};
 	std::atomic<uint64_t> empty_presents {0};
+	std::atomic<uint64_t> dump_failures {0};
 
 	uint64_t Reserve(const Aps5GpuFlip& flip, int* status) {
 		const auto& host  = Aps5::Host();
@@ -281,23 +285,69 @@ struct DumpContext {
 	bool    done  = false;
 };
 
-void DumpFrame(void* context, const void* pixels, uint32_t width, uint32_t height, uint32_t row_bytes, bool bgra) {
-	auto* dump = static_cast<DumpContext*>(context);
-	std::vector<uint8_t> converted;
-	const void*          data = pixels;
-	if (!bgra) {
-		converted.resize(static_cast<size_t>(row_bytes) * height);
-		const auto* in = static_cast<const uint8_t*>(pixels);
-		for (size_t i = 0; i < converted.size(); i += 4) {
-			converted[i + 0] = in[i + 2];
-			converted[i + 1] = in[i + 1];
-			converted[i + 2] = in[i + 0];
-			converted[i + 3] = in[i + 3];
+float HalfToFloat(uint16_t half) {
+	const uint32_t sign     = (half >> 15u) & 1u;
+	const uint32_t exponent = (half >> 10u) & 0x1fu;
+	const uint32_t mantissa = half & 0x3ffu;
+	float          value    = 0.0f;
+	if (exponent == 0) {
+		value = std::ldexp(static_cast<float>(mantissa), -24);
+	} else if (exponent == 31) {
+		value = mantissa == 0 ? INFINITY : 0.0f;
+	} else {
+		value = std::ldexp(static_cast<float>(mantissa | 0x400u), static_cast<int>(exponent) - 25);
+	}
+	return sign != 0 ? -value : value;
+}
+
+uint8_t Unit8(float value) {
+	return static_cast<uint8_t>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
+}
+
+// The frame in BGRA8, as AnyPS5's frame dumps want it: 8-bit formats as they are (channels swapped for RGBA), 10-bit
+// channels by their top 8 bits, 16-bit ones scaled (a float channel clamped to [0, 1]).
+void DumpFrame(void* context, const void* pixels, uint32_t width, uint32_t height, uint32_t row_bytes, uint32_t vk_format) {
+	auto*                dump   = static_cast<DumpContext*>(context);
+	const auto           format = static_cast<VkFormat>(vk_format);
+	std::vector<uint8_t> out(static_cast<size_t>(width) * height * 4u);
+	for (uint32_t y = 0; y < height; y++) {
+		const auto* row = static_cast<const uint8_t*>(pixels) + static_cast<size_t>(y) * row_bytes;
+		auto*       to  = out.data() + static_cast<size_t>(y) * width * 4u;
+		for (uint32_t x = 0; x < width; x++, to += 4) {
+			uint8_t r = 0;
+			uint8_t g = 0;
+			uint8_t b = 0;
+			uint8_t a = 255;
+			if (format == VK_FORMAT_B8G8R8A8_UNORM || format == VK_FORMAT_B8G8R8A8_SRGB) {
+				b = row[x * 4u + 0u], g = row[x * 4u + 1u], r = row[x * 4u + 2u], a = row[x * 4u + 3u];
+			} else if (format == VK_FORMAT_R8G8B8A8_UNORM || format == VK_FORMAT_R8G8B8A8_SRGB) {
+				r = row[x * 4u + 0u], g = row[x * 4u + 1u], b = row[x * 4u + 2u], a = row[x * 4u + 3u];
+			} else if (format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 || format == VK_FORMAT_A2B10G10R10_UNORM_PACK32) {
+				uint32_t v = 0;
+				std::memcpy(&v, row + x * 4u, sizeof(v));
+				const auto low  = static_cast<uint8_t>((v >> 2u) & 0xffu);
+				const auto mid  = static_cast<uint8_t>((v >> 12u) & 0xffu);
+				const auto high = static_cast<uint8_t>((v >> 22u) & 0xffu);
+				g               = mid;
+				r               = format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ? high : low;
+				b               = format == VK_FORMAT_A2R10G10B10_UNORM_PACK32 ? low : high;
+				a               = static_cast<uint8_t>(((v >> 30u) & 3u) * 85u);
+			} else {
+				uint16_t c[4] {};
+				std::memcpy(c, row + x * 8u, sizeof(c));
+				if (format == VK_FORMAT_R16G16B16A16_SFLOAT) {
+					r = Unit8(HalfToFloat(c[0])), g = Unit8(HalfToFloat(c[1])), b = Unit8(HalfToFloat(c[2])),
+					a = Unit8(HalfToFloat(c[3]));
+				} else {
+					r = static_cast<uint8_t>(c[0] >> 8u), g = static_cast<uint8_t>(c[1] >> 8u),
+					b = static_cast<uint8_t>(c[2] >> 8u), a = static_cast<uint8_t>(c[3] >> 8u);
+				}
+			}
+			to[0] = b, to[1] = g, to[2] = r, to[3] = a;
 		}
-		data = converted.data();
 	}
 	const auto& host = Host();
-	host.frame_ready(host.context, dump->index, data, width, height, row_bytes);
+	host.frame_ready(host.context, dump->index, out.data(), width, height, width * 4u);
 	dump->done = true;
 }
 
@@ -333,8 +383,10 @@ int VideoOutPresent(const Aps5GpuWindow* window, const Aps5GpuDisplayBuffer* buf
 	WindowRefreshSize();
 	if (dump_index >= 0) {
 		DumpContext dump {dump_index, false};
-		if (!impl.presenter.ReadFrame(*next.frame, &DumpFrame, &dump) && impl.presents.load() < 4) {
-			Log("videoout: frame dump %d: the frame's format cannot be read back", dump_index);
+		if (!impl.presenter.ReadFrame(*next.frame, &DumpFrame, &dump) &&
+		    impl.dump_failures.fetch_add(1, std::memory_order_relaxed) < 4) {
+			Log("videoout: frame dump %d not written: frame format %u cannot be read back", dump_index,
+			    Libs::Graphics::Presenter::FrameFormat(*next.frame));
 		}
 	}
 	impl.presenter.Present(*next.frame);

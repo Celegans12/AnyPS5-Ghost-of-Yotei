@@ -1359,16 +1359,30 @@ void Presenter::Discard(Frame& frame) {
 	m_impl->frames.Release(&frame);
 }
 
+uint32_t Presenter::FrameFormat(const Frame& frame) noexcept {
+	return static_cast<uint32_t>(frame.image.format);
+}
+
 bool Presenter::ReadFrame(Frame& frame, FrameReader reader, void* context) {
-	const auto format = frame.image.format;
-	const bool bgra   = format == vk::Format::eB8G8R8A8Unorm || format == vk::Format::eB8G8R8A8Srgb;
-	const bool rgba   = format == vk::Format::eR8G8B8A8Unorm || format == vk::Format::eR8G8B8A8Srgb;
-	if ((!bgra && !rgba) || frame.image.image == nullptr || reader == nullptr) {
+	const auto format          = frame.image.format;
+	uint32_t   bytes_per_pixel = 0;
+	switch (format) {
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eA2B10G10R10UnormPack32: bytes_per_pixel = 4; break;
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR16G16B16A16Unorm: bytes_per_pixel = 8; break;
+		default: break;
+	}
+	if (bytes_per_pixel == 0 || frame.image.image == nullptr || reader == nullptr) {
 		return false;
 	}
 	const auto width     = frame.image.extent.width;
 	const auto height    = frame.image.extent.height;
-	const auto row_bytes = width * 4u;
+	const auto row_bytes = width * bytes_per_pixel;
 	const auto bytes     = static_cast<vk::DeviceSize>(row_bytes) * height;
 	auto&      graphics  = m_impl->window.graphic_ctx;
 
@@ -1403,7 +1417,7 @@ bool Presenter::ReadFrame(Frame& frame, FrameReader reader, void* context) {
 	}
 	m_impl->present_scheduler.Wait(tick);
 	vmaInvalidateAllocation(graphics.allocator, allocation, 0, VK_WHOLE_SIZE);
-	reader(context, mapped.pMappedData, width, height, row_bytes, bgra);
+	reader(context, mapped.pMappedData, width, height, row_bytes, static_cast<uint32_t>(format));
 	vmaDestroyBuffer(graphics.allocator, buffer, allocation);
 	return true;
 }
