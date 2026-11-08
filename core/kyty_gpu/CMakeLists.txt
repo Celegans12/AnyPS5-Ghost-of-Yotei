@@ -933,6 +933,11 @@ elseif(WIN32 OR LINUX)
 	# LINK_FLAGS is a space-delimited string: a -Map path containing spaces would
 	# be split into bogus arguments, so pass it as a discrete link option instead.
 	target_link_options(kyty_emulator PRIVATE "-Wl,-Map=${KYTY_EMULATOR_MAP_LINK_PATH}")
+	if(WIN32)
+		# As clang-cl's /STACK above: host threads get the image's stack reserve, MinGW's default is 2 MiB, and shader
+		# translation recurses over large value graphs.
+		target_link_options(kyty_emulator PRIVATE "-Wl,--stack,67108864")
+	endif()
 endif()
 
 if(LINUX)
