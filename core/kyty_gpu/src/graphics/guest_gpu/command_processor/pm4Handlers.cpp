@@ -2371,10 +2371,14 @@ KYTY_CP_OP_PARSER(CpOpPushMarker) {
 	return dw_num + 1;
 }
 
+// Kyty's builder writes the release as the custom NOP R_RELEASE_MEM; AnyPS5's libSceAgc writes the real IT_RELEASE_MEM
+// packet with the same 8 dwords (event, gcr and cache policy; dst, interrupt and data selectors; address; data; interrupt
+// context id).
 KYTY_CP_OP_PARSER(CpOpReleaseMem) {
 	KYTY_PROFILER_FUNCTION();
 
-	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0061060);
+	EXIT_NOT_IMPLEMENTED(cmd_id != KYTY_PM4(8, Pm4::IT_NOP, Pm4::R_RELEASE_MEM) &&
+	                     cmd_id != KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u));
 
 	uint32_t cache_policy       = (buffer[0] >> 25u) & 0x3u;
 	uint32_t eop_event_type     = buffer[0] & 0x3fu;

@@ -202,6 +202,7 @@ constexpr auto MakeOpcodeDispatchTable() {
 	g_cp_op_func[Pm4::IT_MEM_SEMAPHORE]             = CpOpMemSemaphore; // upstream 1b7093805
 	g_cp_op_func[Pm4::IT_EVENT_WRITE_EOP]           = CpOpEventWriteEop;
 	g_cp_op_func[Pm4::IT_EVENT_WRITE_EOS]           = CpOpEventWriteEos;
+	g_cp_op_func[Pm4::IT_RELEASE_MEM]               = CpOpReleaseMem; // AnyPS5's sceAgcCbReleaseMem
 	g_cp_op_func[Pm4::IT_DMA_DATA]                  = CpOpDmaData;
 	g_cp_op_func[Pm4::IT_ACQUIRE_MEM]               = CpOpAcquireMem;
 	g_cp_op_func[Pm4::IT_REWIND]                    = CpOpRewind;
