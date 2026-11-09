@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include <limits>
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -197,6 +199,37 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
                             }
                         }
                         std::fprintf(stderr, "[direct-tables] base 0x%llx: %llu bytes accessible, %llu non-zero 32-byte blocks, last at +0x%llx\n", static_cast<unsigned long long>(column.base), static_cast<unsigned long long>(accessible), static_cast<unsigned long long>(nonZero), static_cast<unsigned long long>(lastNonZero));
+                        // Where the column's textures live: decoded guest ranges merged with gaps
+                        // under 2 MiB, so one collect could cover them.
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+                        std::uint64_t decoded = 0, failed = 0, nulls = 0;
+                        for (const auto& word : column.words) {
+                            if (word.dwordCount < 8u) continue;
+                            const std::span<const std::uint32_t> view(word.dwords.data(), 8u);
+                            if (Graphics::IsNullSampledTextureResource(view)) {
+                                ++nulls;
+                                continue;
+                            }
+                            try {
+                                const auto resource = Graphics::DecodeTextureResource(view);
+                                const auto bytes = Graphics::DescribeSurface(resource).guestBytes;
+                                if (resource.baseAddress != 0u && bytes != 0u) ranges.emplace_back(resource.baseAddress, resource.baseAddress + bytes);
+                                ++decoded;
+                            } catch (const std::exception&) {
+                                ++failed;
+                            }
+                        }
+                        std::sort(ranges.begin(), ranges.end());
+                        std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+                        std::uint64_t textureBytes = 0;
+                        for (const auto& [begin, end] : ranges) {
+                            textureBytes += end - begin;
+                            if (!runs.empty() && begin <= runs.back().second + (2ull << 20u)) runs.back().second = std::max(runs.back().second, end);
+                            else runs.emplace_back(begin, end);
+                        }
+                        std::uint64_t runBytes = 0;
+                        for (const auto& [begin, end] : runs) runBytes += end - begin;
+                        std::fprintf(stderr, "[direct-tables] base 0x%llx textures: %llu decoded, %llu null, %llu failed; %.1f MiB of textures in %zu runs covering %.1f MiB (0x%llx..0x%llx)\n", static_cast<unsigned long long>(column.base), static_cast<unsigned long long>(decoded), static_cast<unsigned long long>(nulls), static_cast<unsigned long long>(failed), static_cast<double>(textureBytes) / (1 << 20), runs.size(), static_cast<double>(runBytes) / (1 << 20), static_cast<unsigned long long>(runs.empty() ? 0 : runs.front().first), static_cast<unsigned long long>(runs.empty() ? 0 : runs.back().second));
                     }
                     table.bases.insert(column.base);
                 }
