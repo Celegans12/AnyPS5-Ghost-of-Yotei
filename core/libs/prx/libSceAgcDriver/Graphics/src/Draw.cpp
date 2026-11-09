@@ -609,8 +609,8 @@ constexpr std::array<const char*, PhaseCount> DrawPhaseNames{"validate", "vertex
 // are not all resident, no recorder is active, a switch (APS5_SYNC_DRAWS, APS5_DUMP_TARGETS,
 // APS5_SYNC_COMPLETION_DRAWS) forced it, or its completion work writes copied guest buffers or
 // releases an address-based build's lease, which the CPU must not outrun (see `recorded` in Draw).
-enum SyncReason : std::size_t { SyncNone, SyncNotResident, SyncNoRecorder, SyncDisabled, SyncCopiedWrites, SyncLease, SyncCount };
-constexpr std::array<const char*, SyncCount> SyncReasonNames{"none", "non-resident target", "no recorder", "disabled", "copied writes", "lease"};
+enum SyncReason : std::size_t { SyncNone, SyncNotResident, SyncNoRecorder, SyncDisabled, SyncCopiedWrites, SyncLease, SyncLinearMerge, SyncCount };
+constexpr std::array<const char*, SyncCount> SyncReasonNames{"none", "non-resident target", "no recorder", "disabled", "copied writes", "lease", "linear target merge"};
 constexpr std::size_t IndirectPathCount = static_cast<std::size_t>(IndirectDrawPath::Count);
 constexpr std::array<const char*, IndirectPathCount> IndirectDrawPathNames{"gpu-side", "patched SGPR not folded", "fetch offset unknown", "non-vertex path", "GE_INDX_OFFSET", "draw index", "vertex range too large", "feature gap", "pending image results", "pending label or copied write", "not imported", "disabled", "index range not fully readable", "index limit unknown"};
 
@@ -657,6 +657,13 @@ struct DrawOutcome {
     double hookWaitUs = 0;
     double ownSyncUs = 0;
 };
+
+const char* RecordedSuffix(const DrawOutcome& outcome, bool completion) {
+    if (!outcome.waited) return completion ? " recorded with completion" : " recorded";
+    if (outcome.reason == SyncLease) return " recorded then waited (lease)";
+    if (outcome.reason == SyncLinearMerge) return " recorded then waited (linear target merge)";
+    return " recorded then waited (copied writes)";
+}
 
 // The resources of a draw: a recipe hit (reserved for the draw recipe step), a resource-cache
 // template hit, a build, or an address-based (BDA) build.
@@ -2657,7 +2664,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     std::vector<bool> storeNow(residents.size(), false);
     for (std::size_t index = 0; index < residents.size(); ++index) {
         if (residents[index] == nullptr) continue;
-        if (residents[index]->Descriptor().tileMode == TextureTileMode::kLinear) storeNow[index] = !residents[index]->MarkDrawn(index < slices.size() ? slices[index].first : 0u, index < slices.size() ? slices[index].second : 0u, scissor) || !residents[index]->Cached();
+        if (residents[index]->Descriptor().tileMode == TextureTileMode::kLinear) storeNow[index] = !residents[index]->MarkDrawn(index < slices.size() ? slices[index].first : 0u, index < slices.size() ? slices[index].second : 0u, scissor) || !residents[index]->Cached() || outcome.waited;
         else if (index < slices.size()) residents[index]->MarkSliceDirty(slices[index].first, slices[index].second);
         else residents[index]->MarkDirty();
     }
@@ -3307,6 +3314,7 @@ struct TargetBinding {
     bool gpuTiling = false;
     std::shared_ptr<StorageTexture> resident;
     bool proxied = false;
+    bool linearMerge = false;
     std::unique_ptr<Buffer> transfer;
     std::unique_ptr<Buffer> tiled;
     std::unique_ptr<DeviceBuffer> tiledDevice;
@@ -3415,6 +3423,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     auto& targets = preparation.targets;
     targets.resize(state.colors.size());
     auto& targetViews = preparation.targetViews;
+    const bool mergesPartialWrite = std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.partialWriteMask != 0 && color.samples <= 1; });
     for (std::size_t index = 0; index < state.colors.size(); ++index) {
         auto& binding = targets[index];
         binding.color = state.colors[index];
@@ -3441,7 +3450,8 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         // Debug aid: APS5_NO_RESIDENT_TARGETS=1 copies every target in and out again.
         static const bool residentTargets = std::getenv("APS5_NO_RESIDENT_TARGETS") == nullptr;
         static const bool residentLinear = std::getenv("APS5_RESIDENT_LINEAR") != nullptr;
-        const bool linearResident = residentLinear && color.tileMode == ColorTileMode::Linear && ExistingHostImportFor(context, color.address, colorLayout.Bytes()) != nullptr;
+        const bool linearResident = (residentLinear || mergesPartialWrite) && residentTargets && context.detiler != nullptr && color.tileMode == ColorTileMode::Linear && (ExistingHostImportFor(context, color.address, colorLayout.Bytes()) != nullptr || (GuestMemory::Watched(color.address, colorLayout.Bytes()) && HostImportFor(context, color.address, colorLayout.Bytes(), ImportRequester::ColorTarget) != nullptr));
+        binding.linearMerge = linearResident && !residentLinear;
         if ((binding.gpuTiling || ((color.tileMode != ColorTileMode::Linear || linearResident) && context.detiler != nullptr)) && residentTargets) {
             // The lookup refreshes the image on every draw (StorageTexture::Refresh: FlushPending,
             // CollectWrites over the target's pages, the DCC key scan of TextureClearKeys, then
@@ -3660,6 +3670,10 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         else if (recorderSyncDraws) outcome.waited = true;
         else outcome.recorded = false;
     }
+    if (outcome.recorded && !outcome.waited && std::ranges::any_of(targets, [](const TargetBinding& binding) { return binding.linearMerge; })) {
+        outcome.waited = true;
+        if (outcome.reason == SyncNone) outcome.reason = SyncLinearMerge;
+    }
     const bool recorded = preparation.recorded = outcome.recorded;
     // A build this recorded draw can share with later identical ones goes into the cache (a cache
     // hit is reusable by construction, so `recorded` holds for it; one with completion work is
@@ -3858,7 +3872,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             *recipeOut = std::move(recipe);
         }
         timing.Mark("draw_and_resource_release");
-        report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
+        report(RecordedSuffix(outcome, completion));
         return;
     }
     const bool heap = BindlessHeapStages(shaders) != 0u;
@@ -4085,7 +4099,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             if (profile) ownWaitedMs += Recorder::ThreadWaitedMs() - ownBefore;
             timer.phase(PhaseSync);
         }
-        report(outcome.waited ? (outcome.reason == SyncLease ? " recorded then waited (lease)" : " recorded then waited (copied writes)") : completion ? " recorded with completion" : " recorded");
+        report(RecordedSuffix(outcome, completion));
         return;
     }
     {
