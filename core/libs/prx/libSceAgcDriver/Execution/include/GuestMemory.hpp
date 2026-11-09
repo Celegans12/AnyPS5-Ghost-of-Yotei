@@ -156,13 +156,9 @@ std::uint64_t CollectEpochBumps();
 std::uint64_t ThreadCollectEpoch();
 std::uint64_t UnwatchSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
-struct Observation {
-    enum class Status { Complete, Refused, Uncovered, Failed };
-    Status status = Status::Failed;
-    std::uint64_t generation = 0;
-};
-Observation Observe(std::uint64_t address, std::size_t bytes);
-void SetObservationHookForTest(void (*hook)(int point));
+// A frame ended (flip packet). Large ranges found clean on their last walks are walked at most once
+// per frame (rewrite branch; APS5_STRICT_COLLECTS=1 walks them at every epoch as before).
+void NoteFrame();
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the
 // tracker mutex, so every collect that bumped before it has finished its walk and every later
