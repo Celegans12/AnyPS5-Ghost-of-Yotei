@@ -127,6 +127,101 @@ std::atomic<void*> g_selfCheckPage{nullptr};
 std::atomic<bool> g_selfCheckServed{false};
 thread_local int g_changeDepth = 0;
 
+class FaultSites {
+public:
+    static bool Enabled() {
+        static const bool enabled = [] {
+            const char* value = std::getenv("APS5_KYTY_FAULT_SITES");
+            return value != nullptr && value[0] == '1';
+        }();
+        return enabled;
+    }
+
+    void Record(std::uint64_t rip, bool guestThread, std::uint64_t rsp) {
+        total.fetch_add(1, std::memory_order_relaxed);
+        if (guestThread) guest.fetch_add(1, std::memory_order_relaxed);
+        const bool entryAligned = (rsp & 15u) == 8u;
+        if (entryAligned) rspEntryAligned.fetch_add(1, std::memory_order_relaxed);
+        std::uint64_t slot = (rip * 0x9e3779b97f4a7c15ull) >> (64 - Bits);
+        for (int probe = 0; probe < 64; ++probe, slot = (slot + 1) & (Size - 1)) {
+            auto& site = sites[slot];
+            std::uint64_t seen = site.rip.load(std::memory_order_relaxed);
+            if (seen == 0 && site.rip.compare_exchange_strong(seen, rip, std::memory_order_relaxed)) seen = rip;
+            if (seen != rip) continue;
+            site.count.fetch_add(1, std::memory_order_relaxed);
+            if (guestThread) site.guest.fetch_add(1, std::memory_order_relaxed);
+            if (entryAligned) site.entryAligned.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        overflow.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void Report(const char* why) {
+        struct Row {
+            std::uint64_t rip, count, guest, entryAligned;
+        };
+        std::vector<Row> rows;
+        for (auto& site : sites) {
+            const auto rip = site.rip.load(std::memory_order_relaxed);
+            if (rip != 0) rows.push_back({rip, site.count.load(std::memory_order_relaxed), site.guest.load(std::memory_order_relaxed), site.entryAligned.load(std::memory_order_relaxed)});
+        }
+        std::sort(rows.begin(), rows.end(), [](const Row& a, const Row& b) { return a.count > b.count; });
+        std::map<std::string, std::pair<std::uint64_t, std::uint64_t>> modules;
+        std::string top;
+        std::size_t index = 0;
+        for (const auto& row : rows) {
+            HMODULE module = nullptr;
+            char name[MAX_PATH] = "?";
+            std::uint64_t base = 0;
+            if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(row.rip), &module) && module != nullptr) {
+                base = reinterpret_cast<std::uint64_t>(module);
+                char path[MAX_PATH] = {};
+                if (GetModuleFileNameA(module, path, MAX_PATH) != 0) {
+                    const char* slash = std::strrchr(path, '\\');
+                    std::snprintf(name, sizeof(name), "%s", slash != nullptr ? slash + 1 : path);
+                }
+            }
+            auto& module_total = modules[name];
+            module_total.first += row.count;
+            module_total.second += 1;
+            if (index++ < 64) {
+                char item[160];
+                std::snprintf(item, sizeof(item), " [%s+0x%llx n=%llu g=%llu e=%llu]", name, static_cast<unsigned long long>(base != 0 ? row.rip - base : row.rip), static_cast<unsigned long long>(row.count), static_cast<unsigned long long>(row.guest), static_cast<unsigned long long>(row.entryAligned));
+                top += item;
+            }
+        }
+        std::string perModule;
+        for (const auto& [name, value] : modules) {
+            char item[160];
+            std::snprintf(item, sizeof(item), " %s=%llu/%llu", name.c_str(), static_cast<unsigned long long>(value.first), static_cast<unsigned long long>(value.second));
+            perModule += item;
+        }
+        Print("[kyty] fault sites (%s): served %llu, on guest threads %llu, rsp 8 mod 16 %llu, sites %zu, overflow %llu; per module faults/sites:%s; top:%s\n", why,
+            static_cast<unsigned long long>(total.load()), static_cast<unsigned long long>(guest.load()), static_cast<unsigned long long>(rspEntryAligned.load()), rows.size(),
+            static_cast<unsigned long long>(overflow.load()), perModule.c_str(), top.c_str());
+    }
+
+private:
+    static constexpr int Bits = 16;
+    static constexpr std::uint64_t Size = std::uint64_t{1} << Bits;
+    struct Site {
+        std::atomic<std::uint64_t> rip{0};
+        std::atomic<std::uint64_t> count{0};
+        std::atomic<std::uint64_t> guest{0};
+        std::atomic<std::uint64_t> entryAligned{0};
+    };
+    Site sites[Size];
+    std::atomic<std::uint64_t> total{0};
+    std::atomic<std::uint64_t> guest{0};
+    std::atomic<std::uint64_t> rspEntryAligned{0};
+    std::atomic<std::uint64_t> overflow{0};
+};
+
+FaultSites& Sites() {
+    static auto* sites = new FaultSites;
+    return *sites;
+}
+
 class Adapter {
 public:
     static Adapter& Get() {
@@ -144,6 +239,7 @@ public:
 
     void EnsureStarted() {
         std::call_once(started, [this] {
+            if (FaultSites::Enabled()) Sites();
             if (api->start(backend) != APS5_GPU_OK) throw std::runtime_error("the GPU backend did not start");
             Print("[kyty] backend '%s' started\n", api->name);
             reporter = std::thread([this] { reportLoop(); });
@@ -345,12 +441,14 @@ private:
             if (activity == previous) continue;
             previous = activity;
             reportCounts("10 s");
+            if (FaultSites::Enabled() && ++siteReports % 6 == 0) Sites().Report("60 s");
         }
     }
 
     std::once_flag started;
     std::once_flag driverBlock;
     std::atomic<bool> stopped{false};
+    std::uint64_t siteReports = 0;
     std::thread reporter;
     std::mutex outputsMutex;
     std::map<std::uint32_t, std::shared_ptr<IVideoOutput>> outputs;
@@ -612,6 +710,7 @@ LONG WINAPI FaultHook(EXCEPTION_POINTERS* info) {
     const std::uint32_t access = kind == 1 ? APS5_GPU_FAULT_WRITE : kind == 8 ? APS5_GPU_FAULT_EXECUTE : APS5_GPU_FAULT_READ;
     if (adapter->api->handle_fault(adapter->backend, address, access) != APS5_GPU_FAULT_HANDLED) return EXCEPTION_CONTINUE_SEARCH;
     adapter->counts.faultsServed.fetch_add(1, std::memory_order_relaxed);
+    if (FaultSites::Enabled()) Sites().Record(info->ContextRecord->Rip, IsGuestPthread_nid_no_patch(), info->ContextRecord->Rsp);
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
