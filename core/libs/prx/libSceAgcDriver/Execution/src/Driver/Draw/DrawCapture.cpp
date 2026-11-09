@@ -4,6 +4,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include <limits>
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
@@ -47,6 +50,44 @@ bool directEvalRead(void*, std::uint64_t address, std::uint32_t* value) {
 
 bool directEvalAccessible(void*, std::uint64_t address, std::uint64_t bytes) {
     return GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes), false);
+}
+
+bool directEvalReadWords(void*, std::uint64_t address, std::uint32_t* values, std::uint64_t count) {
+    if (count == 0u) return true;
+    const auto bytes = count * sizeof(std::uint32_t);
+    const auto* pointer = reinterpret_cast<const std::byte*>(address);
+    if (!GuestMemory::Accessible(pointer, static_cast<std::size_t>(bytes), false)) return false;
+    std::memcpy(values, pointer, static_cast<std::size_t>(bytes));
+    return true;
+}
+
+// Write stamps for the capture's table column memos (ResourceMaterializer ColumnMemos): a column
+// whose guest range is unchanged since its stamp is taken from the memo instead of read again,
+// with the old path's rule (ShaderMemory::Vouched). The direct capture reads live guest memory,
+// so supplying the memo's words to it needs nothing. APS5_DIRECT_NO_TABLE_STAMPS=1 reads every column.
+ShaderRecompiler::SrtWriteStamp directEvalStamp(void*, std::uint64_t address, std::uint64_t bytes) {
+    if (bytes == 0u || address > std::numeric_limits<std::uint64_t>::max() - bytes) return {};
+    const auto layout = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    const auto generation = GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes));
+    if (generation == 0u) return {};
+    return {generation, layout};
+}
+
+bool directEvalUnchanged(void*, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp) {
+    return ShaderMemory::Vouched(nullptr, address, bytes, stamp);
+}
+
+bool directEvalSupply(void*, const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>& words) {
+    return words != nullptr;
+}
+
+void directEvalStamps(ShaderRecompiler::SrtRuntime& runtime) {
+    static const bool disabled = std::getenv("APS5_DIRECT_NO_TABLE_STAMPS") != nullptr;
+    runtime.readWords = &directEvalReadWords;
+    if (disabled) return;
+    runtime.stampWrites = &directEvalStamp;
+    runtime.unchangedSince = &directEvalUnchanged;
+    runtime.supplyWords = &directEvalSupply;
 }
 
 struct DirectStage {
@@ -105,6 +146,7 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
         runtime.readMemory = &directEvalRead;
         runtime.readSpecializationMemory = &directEvalRead;
         runtime.accessible = &directEvalAccessible;
+        directEvalStamps(runtime);
         auto capture = ShaderRecompiler::CaptureResources(direct, runtime, *handle);
         if (!capture->snapshot.tables.tables.empty()) {
             // Debug aid: APS5_DIRECT_TABLE_PROBE=1 reports the image tables that keep stages off
