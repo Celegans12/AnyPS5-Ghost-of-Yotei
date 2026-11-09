@@ -6205,6 +6205,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
         state->computePipelinesCreated.fetch_add(1, std::memory_order_relaxed);
         if (GuestMemory::GpuMutex().HeldByThisThread()) computePipelinesCreatedLocked.fetch_add(1, std::memory_order_relaxed);
     }
+    if (context.pipelineExecutableInfo) std::fprintf(stderr, "[pipeline-stats] compute program 0x%llx, %zu SPIR-V words\n", static_cast<unsigned long long>(programAddress), shader.spirv.size());
     Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
     if (profile && shader.spirv.size() > 100000) std::fprintf(stderr, "[dispatch] created a pipeline for %zu SPIR-V words in %.0f ms (program 0x%llx)\n", shader.spirv.size(), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count(), static_cast<unsigned long long>(programAddress));
     return objects;
