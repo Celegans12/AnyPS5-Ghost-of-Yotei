@@ -21,6 +21,7 @@
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/debugSample.h"
 #include "graphics/host_gpu/renderer/gpuTimer.h"
+#include "graphics/host_gpu/renderer/hTrace.h"
 
 #include <chrono>
 #include "graphics/host_gpu/regionManager.h"
@@ -710,6 +711,7 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 	if (draw_commands.empty()) {
 		return;
 	}
+	HTrace::NoteSubmit(0); // KYTY_TRACE_H
 	Submission submission;
 	submission.type              = SubmissionType::Graphics;
 	submission.queue_id          = 0;
@@ -724,6 +726,7 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 	EXIT_NOT_IMPLEMENTED(queue < ComputeQueueBase || queue >= ComputeQueueBase + ComputeQueueCount);
 
 	const auto compute_queue = queue - ComputeQueueBase;
+	HTrace::NoteSubmit(queue); // KYTY_TRACE_H
 	Submission submission;
 	submission.type     = SubmissionType::Compute;
 	submission.queue_id = 1 + compute_queue;
@@ -3049,8 +3052,10 @@ void CommandProcessor::WaitFlipDone(uint32_t video_out_handle, uint32_t display_
 		GetScheduler().Flush();
 
 		SyncTimeline::WaitScope timeline(SyncTimeline::Site::FlipDone, 0, 0, 0); // KYTY_TRACE_SYNC_TIMELINE
+		const int64_t           wait_start = HTrace::Enabled() ? HTrace::NowUs() : 0; // KYTY_TRACE_H
 		m_renderer.GetVideoOut().WaitFlipDone(static_cast<int>(video_out_handle),
 		                                      static_cast<int>(display_buffer_index));
+		if (wait_start != 0) HTrace::NoteFlipWait(wait_start);
 	});
 }
 

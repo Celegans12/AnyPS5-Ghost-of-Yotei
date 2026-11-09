@@ -17,6 +17,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
+#include "graphics/host_gpu/renderer/hTrace.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/window/windowInternal.h"
@@ -417,7 +418,8 @@ int HandleFault(Aps5GpuBackend* /*backend*/, uint64_t address, uint32_t access) 
 	if (renderer == nullptr) {
 		return APS5_GPU_FAULT_NOT_MINE;
 	}
-	auto& b = B();
+	auto&         b           = B();
+	const int64_t trace_start = Graphics::HTrace::Enabled() ? Graphics::HTrace::NowUs() : 0; // KYTY_TRACE_H
 	b.counts.faults.fetch_add(1, std::memory_order_relaxed);
 	const auto kind = access == APS5_GPU_FAULT_WRITE     ? Graphics::PageFaultAccess::Write
 	                  : access == APS5_GPU_FAULT_EXECUTE ? Graphics::PageFaultAccess::Execute
@@ -428,6 +430,7 @@ int HandleFault(Aps5GpuBackend* /*backend*/, uint64_t address, uint32_t access) 
 	if (!Libs::LibKernel::Memory::HandleGpuFault(kind, address)) {
 		return APS5_GPU_FAULT_NOT_MINE;
 	}
+	if (trace_start != 0) Graphics::HTrace::NoteFault(Graphics::HTrace::FaultLayer::Outer, kind == Graphics::PageFaultAccess::Write, trace_start);
 	b.counts.faults_handled.fetch_add(1, std::memory_order_relaxed);
 	if (!Graphics::GuestGpu::IsGpuThread() && b.counts.guest_faults.fetch_add(1, std::memory_order_relaxed) == 0) {
 		Log("first tracker fault served on a thread of AnyPS5's: address 0x%llx, %s",

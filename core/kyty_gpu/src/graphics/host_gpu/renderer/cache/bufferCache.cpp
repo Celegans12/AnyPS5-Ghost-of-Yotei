@@ -27,6 +27,7 @@
 #include "graphics/host_gpu/renderer/cache/textureCacheShared.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/drawRepeat.h"
+#include "graphics/host_gpu/renderer/hTrace.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/renderer/stageFLookup.h"
@@ -2381,6 +2382,11 @@ void BufferCache::CommitUploadBatch(BatchCommit reason) {
 	const size_t                       recheck_base = rechecks.size(); // a nested commit appends after ours
 	bool                               protected_now = false;
 	uint32_t updated = 0;
+	// KYTY_TRACE_H: one commit in 64 keeps its staged bytes, so a range that changed shows what changed.
+	static std::atomic<uint64_t>                           pac_sample_counter {0};
+	const bool                                             pac_sample =
+	    HTrace::Enabled() && pac_sample_counter.fetch_add(1, std::memory_order_relaxed) % 64u == 0;
+	std::vector<std::pair<uint64_t, std::vector<uint8_t>>> pac_copies;
 	// Phase 3: the copies, in claim order. The lists are taken out first: staging can wait for the GPU, and deferred
 	// work that runs meanwhile may commit too; it must find an empty batch.
 	std::vector<UploadBatchEntry>              entries;
@@ -2414,6 +2420,7 @@ void BufferCache::CommitUploadBatch(BatchCommit reason) {
 					LibKernel::Memory::ReadGuestPlain(scratch.data(), address, copy.size);
 					if (UploadClobberCheck()) NoteC0Staged(address, scratch.data(), copy.size);
 					rechecks.push_back({address, copy.size, XXH3_64bits(scratch.data(), copy.size)});
+					if (pac_sample) pac_copies.emplace_back(address, scratch);
 					std::memcpy(mapped + copy.srcOffset, scratch.data(), copy.size);
 					copy.srcOffset += base_offset;
 				}
@@ -2454,8 +2461,27 @@ void BufferCache::CommitUploadBatch(BatchCommit reason) {
 		if (differs) {
 			m_memory_tracker.MarkRegionAsCpuModified(check.address, check.size);
 			changed++;
+			HTrace::NotePacChanged(check.address, check.size); // KYTY_TRACE_H
+			const auto copy = std::find_if(pac_copies.begin(), pac_copies.end(), [&](const auto& c) {
+				return c.first == check.address && c.second.size() == check.size;
+			});
+			if (copy != pac_copies.end()) {
+				std::vector<uint8_t> now(check.size);
+				LibKernel::Memory::ReadGuestPlain(now.data(), check.address, check.size);
+				for (uint64_t offset = 0; offset + 8u <= check.size; offset += 8u) {
+					uint64_t before = 0;
+					uint64_t after  = 0;
+					std::memcpy(&before, copy->second.data() + offset, 8u);
+					std::memcpy(&after, now.data() + offset, 8u);
+					if (before != after) {
+						HTrace::NotePacSample(check.address, check.size, offset, before, after);
+						break;
+					}
+				}
+			}
 		}
 	}
+	HTrace::NotePacRanges(checks.size()); // KYTY_TRACE_H
 	const uint64_t done = g_pac_commits.fetch_add(1, std::memory_order_relaxed) + 1;
 	g_pac_ranges.fetch_add(checks.size(), std::memory_order_relaxed);
 	g_pac_bytes.fetch_add(bytes, std::memory_order_relaxed);

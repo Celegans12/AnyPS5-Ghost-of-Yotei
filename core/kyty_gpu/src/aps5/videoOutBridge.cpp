@@ -14,6 +14,7 @@
 #include "common/threads.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/renderer/hTrace.h"
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
@@ -231,6 +232,7 @@ void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& b
 }
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
+	Graphics::HTrace::NoteFlipReady(); // KYTY_TRACE_H
 	m_impl->Complete(request_id);
 }
 
@@ -356,6 +358,7 @@ void DumpFrame(void* context, const void* pixels, uint32_t width, uint32_t heigh
 int VideoOutPresent(const Aps5GpuWindow* window, const Aps5GpuDisplayBuffer* buffer, int32_t opaque, int32_t dump_index,
                     void (*presented)(void* context), void* presented_context) {
 	EXIT_IF(Libs::VideoOut::g_driver == nullptr);
+	Libs::Graphics::HTrace::NoteFlipPresentBegin(); // KYTY_TRACE_H
 	auto&                          impl = Libs::VideoOut::g_driver->State();
 	Libs::VideoOut::ReadyFrame     next {};
 	bool                           have = false;
@@ -392,6 +395,7 @@ int VideoOutPresent(const Aps5GpuWindow* window, const Aps5GpuDisplayBuffer* buf
 	impl.presenter.Present(*next.frame);
 	impl.presents.fetch_add(1, std::memory_order_relaxed);
 	presented(presented_context);
+	if (have) Libs::Graphics::HTrace::NoteFlipDone(); // KYTY_TRACE_H (AnyPS5 counts the flip right after this returns)
 	return APS5_GPU_OK;
 }
 

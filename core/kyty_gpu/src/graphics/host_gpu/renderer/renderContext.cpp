@@ -1,4 +1,5 @@
 #include "common/profiler.h"
+#include "graphics/host_gpu/renderer/hTrace.h"
 #include "graphics/host_gpu/renderer/indirectLoadFast.h"
 #include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
@@ -99,6 +100,15 @@ VideoOut::VideoOutDriver& RenderContext::GetVideoOut() const {
 }
 
 bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) noexcept {
+	// KYTY_TRACE_H: the time in this handler, by thread kind.
+	struct TraceScope {
+		int64_t start = HTrace::Enabled() ? HTrace::NowUs() : 0;
+		bool    write = false;
+		~TraceScope() {
+			if (start != 0) HTrace::NoteFault(HTrace::FaultLayer::Handler, write, start);
+		}
+	} trace_scope;
+	trace_scope.write = access == PageFaultAccess::Write;
 	// The host reports the faulting byte, not the instruction's access width. Both caches
 	// resolve its page; guessing a width can cross the end of a valid guest mapping.
 	constexpr uint64_t fault_size = 1;
