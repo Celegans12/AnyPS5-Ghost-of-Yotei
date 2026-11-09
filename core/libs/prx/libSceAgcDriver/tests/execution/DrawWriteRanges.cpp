@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
+#include "BdaAbi.hpp"
 #include "Recompiler.hpp"
 #include <algorithm>
 #include <array>
@@ -87,6 +88,38 @@ int main() {
         Require(bounded, "a dispatch whose written images are a real one and a null one is not bounded");
         Require(Contains(dispatchRanges, written, written + surfaceBytes), "a written image next to a null one is not a dispatch write range");
         Require(!Touches(dispatchRanges, 0, surfaceBytes), "a null storage image is a dispatch write range");
+        const auto withBinding = [&](ShaderRecompiler::DescriptorRole role) {
+            auto result = program;
+            result.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+            ShaderRecompiler::DescriptorBinding binding;
+            binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+            binding.role = role;
+            binding.count = 1;
+            result.bindings.push_back(binding);
+            return result;
+        };
+        auto faultOnly = withBinding(ShaderRecompiler::DescriptorRole::FaultBuffer);
+        const auto faultRanges = AgcDriver::DriverDetail::DispatchWriteRanges(faultOnly, bounded);
+        Require(bounded, "a dispatch with a fault buffer and no address table is not bounded");
+        Require(Contains(faultRanges, written, written + surfaceBytes), "a fault-buffer dispatch lost its written image");
+        auto readingTable = withBinding(ShaderRecompiler::DescriptorRole::FaultBuffer);
+        readingTable.bindings.push_back(withBinding(ShaderRecompiler::DescriptorRole::BdaPagetable).bindings.back());
+        readingTable.bdaWrites = false;
+        readingTable.spirv = std::vector<std::uint32_t>{0x07230203u, 0x00010300u, 0u, 1u, 0u};
+        static_cast<void>(AgcDriver::DriverDetail::DispatchWriteRanges(readingTable, bounded));
+        Require(bounded, "a dispatch that only reads through its address table is not bounded");
+        auto storingTable = readingTable;
+        storingTable.bdaWrites = true;
+        static_cast<void>(AgcDriver::DriverDetail::DispatchWriteRanges(storingTable, bounded));
+        Require(!bounded, "a dispatch that stores through its address table is bounded");
+        auto gds = program;
+        ShaderRecompiler::DescriptorBinding gdsBinding;
+        gdsBinding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        gdsBinding.role = ShaderRecompiler::DescriptorRole::Gds;
+        gdsBinding.count = 1;
+        gds.bindings.push_back(gdsBinding);
+        const auto gdsRanges = AgcDriver::DriverDetail::DispatchWriteRanges(gds, bounded);
+        Require(bounded && Contains(gdsRanges, AgcDriver::Pm4::GdsAddress(), AgcDriver::Pm4::GdsAddress() + AgcDriver::Pm4::GdsBytes), "a GDS dispatch is unbounded or misses the GDS range");
         AgcDriver::Graphics::State targets{};
         targets.hasColorTarget = true;
         auto& color = targets.color;
