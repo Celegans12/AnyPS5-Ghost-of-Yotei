@@ -16,7 +16,26 @@ list(APPEND kyty_gpu_src "${KYTY_SOURCE_DIR}/kernel/memoryTrace.cpp" "${KYTY_SOU
 file(GLOB kyty_gpu_aps5_src CONFIGURE_DEPENDS "${KYTY_SOURCE_DIR}/aps5/*.cpp" "${KYTY_SOURCE_DIR}/aps5/*.h")
 
 add_library(kyty_gpu SHARED ${kyty_gpu_src} ${kyty_gpu_aps5_src})
-# kyty_gpu.prx: AnyPS5's runs deploy the .prx files of its libs folder, and its libSceAgcDriver.prx imports this name.
+
+# GpuBackend.h exists in AnyPS5's tree (core/libs/prx/libSceAgcDriver/Backend/include) and here. KYTY_APS5_HEADER names
+# AnyPS5's copy: the build stops when the two differ (the ABI version and table sizes are checked again at create).
+set(KYTY_APS5_HEADER "" CACHE FILEPATH "AnyPS5's GpuBackend.h; when set, the build checks that src/aps5/GpuBackend.h is the same file")
+if(KYTY_APS5_HEADER)
+	if(NOT EXISTS "${KYTY_APS5_HEADER}")
+		message(FATAL_ERROR "KYTY_APS5_HEADER: ${KYTY_APS5_HEADER} does not exist")
+	endif()
+	set(KYTY_APS5_HEADER_STAMP "${CMAKE_CURRENT_BINARY_DIR}/kyty_gpu_header.checked")
+	add_custom_command(OUTPUT "${KYTY_APS5_HEADER_STAMP}"
+		COMMAND "${CMAKE_COMMAND}" -E compare_files "${KYTY_APS5_HEADER}" "${KYTY_SOURCE_DIR}/aps5/GpuBackend.h"
+		COMMAND "${CMAKE_COMMAND}" -E touch "${KYTY_APS5_HEADER_STAMP}"
+		DEPENDS "${KYTY_APS5_HEADER}" "${KYTY_SOURCE_DIR}/aps5/GpuBackend.h"
+		COMMENT "Checking that src/aps5/GpuBackend.h is AnyPS5's GpuBackend.h"
+		VERBATIM)
+	add_custom_target(kyty_gpu_header_check DEPENDS "${KYTY_APS5_HEADER_STAMP}")
+	add_dependencies(kyty_gpu kyty_gpu_header_check)
+endif()
+# kyty_gpu.prx: AnyPS5's runs deploy the .prx files of its libs folder, and its libSceAgcDriver.prx loads this name from
+# there when APS5_GPU_BACKEND=kyty (it does not import it: the old backend never loads it).
 set_target_properties(kyty_gpu PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS OFF PREFIX "" SUFFIX ".prx")
 target_compile_definitions(kyty_gpu PRIVATE KYTY_APS5_BACKEND=1)
 # SDL3's headers only: windowInternal.h names SDL types; nothing of SDL is called or linked.
