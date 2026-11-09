@@ -2,7 +2,9 @@
 #define AGC_GRAPHICS_DIRECTHEAP_HPP
 
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <cstdint>
+#include <span>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -56,6 +58,15 @@ private:
 };
 
 DirectHeap& DirectHeapFor(const Context& context);
+
+struct DirectSlotRequest {
+    static constexpr std::uint32_t Words = 10u;
+    static constexpr std::uint32_t Sampler = 1u;
+    static constexpr std::uint32_t Point = 2u;
+    static constexpr std::uint32_t Inactive = 4u;
+};
+
+bool ResolveDirectStages(const Context& context, std::span<const CompiledShader> shaders, std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>>& patched, std::vector<CompiledShader>& out);
 
 }
 

@@ -4273,6 +4273,9 @@ void drawTessellationGeometry(const Context& context, const State& state, const 
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
+    std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>> directPatched;
+    std::vector<CompiledShader> directShaders;
+    if (ResolveDirectStages(context, shaders, directPatched, directShaders)) shaders = directShaders;
     if (state.stages.tessellationGeometry) {
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
         return;

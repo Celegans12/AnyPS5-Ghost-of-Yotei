@@ -1,6 +1,14 @@
 #include "prx/libSceAgcDriver/Graphics/include/DirectHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "RuntimeAbi.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "Recompiler.hpp"
+#include <chrono>
+#include <cstdio>
+#include <cstring>
 #include <algorithm>
 #include <array>
 #include <map>
@@ -167,6 +175,95 @@ DirectHeap& DirectHeapFor(const Context& context) {
         }
     }
     return *heap;
+}
+
+
+bool ResolveDirectStages(const Context& context, std::span<const CompiledShader> shaders, std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>>& patched, std::vector<CompiledShader>& out) {
+    if (std::ranges::none_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->directSlotRequests.empty(); })) return false;
+    struct Totals {
+        std::uint64_t stages = 0, images = 0, missing = 0, samplers = 0, full = 0;
+        double us = 0;
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    };
+    static std::mutex totalsMutex;
+    static Totals totals;
+    const auto started = std::chrono::steady_clock::now();
+    auto& heap = DirectHeapFor(context);
+    auto* recorder = Recorder::Active();
+    if (recorder != nullptr && recorder->Device() != context.device) recorder = nullptr;
+    std::uint64_t images = 0, missing = 0, samplers = 0, full = 0;
+    out.assign(shaders.begin(), shaders.end());
+    for (auto& shader : out) {
+        const auto* program = shader.program;
+        if (program == nullptr || program->directSlotRequests.empty()) continue;
+        auto copy = std::make_shared<ShaderRecompiler::RecompileResult>(*program);
+        const auto& requests = program->directSlotRequests;
+        const auto count = requests.size() / DirectSlotRequest::Words;
+        std::vector<std::uint32_t> slots(count, 0u);
+        for (std::size_t index = 0; index < count; ++index) {
+            const auto* request = requests.data() + index * DirectSlotRequest::Words;
+            const auto kind = request[0];
+            const auto flags = request[1];
+            const std::span<const std::uint32_t> words(request + 2, 8u);
+            if ((flags & DirectSlotRequest::Inactive) != 0u) continue;
+            std::uint32_t slot = DirectHeap::NoSlot;
+            if ((flags & DirectSlotRequest::Sampler) != 0u) {
+                ++samplers;
+                if (context.samplerCache == nullptr) continue;
+                auto sampler = context.samplerCache->Get(context, words.first(4u), false, false, true, false);
+                slot = heap.SamplerSlot(sampler->Handle(), sampler);
+                if (recorder != nullptr) recorder->Keep(sampler);
+            } else {
+                ++images;
+                std::shared_ptr<Texture> texture;
+                try {
+                    texture = DirectSampledTexture(context, words);
+                } catch (const std::exception&) {
+                    texture = nullptr;
+                }
+                if (texture == nullptr) {
+                    ++missing;
+                    continue;
+                }
+                slot = heap.ImageSlot(kind, texture->View(), texture->Layout(), texture);
+                if (recorder != nullptr) recorder->Keep(texture);
+            }
+            if (slot == DirectHeap::NoSlot) {
+                ++full;
+                continue;
+            }
+            slots[index] = slot;
+        }
+        bool written = false;
+        for (auto& binding : copy->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::ShaderData) continue;
+            if (binding.guestDescriptor.size() < copy->directSlotDword + slots.size()) binding.guestDescriptor.resize(copy->directSlotDword + slots.size(), 0u);
+            std::copy(slots.begin(), slots.end(), binding.guestDescriptor.begin() + copy->directSlotDword);
+            written = true;
+        }
+        if (!written) {
+            const auto offset = static_cast<std::size_t>(copy->directSlotDword) * sizeof(std::uint32_t);
+            const auto bytes = slots.size() * sizeof(std::uint32_t);
+            if (copy->pushConstants.size() >= offset + bytes) std::memcpy(copy->pushConstants.data() + offset, slots.data(), bytes);
+        }
+        copy->directSlotRequests.clear();
+        shader.program = copy.get();
+        patched.push_back(std::move(copy));
+    }
+    std::lock_guard lock(totalsMutex);
+    ++totals.stages;
+    totals.images += images;
+    totals.missing += missing;
+    totals.samplers += samplers;
+    totals.full += full;
+    totals.us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+    const auto now = std::chrono::steady_clock::now();
+    if (now - totals.last >= std::chrono::seconds(10)) {
+        std::fprintf(stderr, "[direct-resolve] 10 s: %llu draws, avg %.2f us; images %llu (%llu missing), samplers %llu, heap full %llu; heap writes %llu, recycled %llu\n", static_cast<unsigned long long>(totals.stages), totals.stages != 0 ? totals.us / static_cast<double>(totals.stages) : 0.0, static_cast<unsigned long long>(totals.images), static_cast<unsigned long long>(totals.missing), static_cast<unsigned long long>(totals.samplers), static_cast<unsigned long long>(totals.full), static_cast<unsigned long long>(heap.Writes()), static_cast<unsigned long long>(heap.Recycled()));
+        totals = {};
+        totals.last = now;
+    }
+    return true;
 }
 
 }

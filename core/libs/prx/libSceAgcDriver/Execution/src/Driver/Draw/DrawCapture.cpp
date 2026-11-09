@@ -117,42 +117,26 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
             report(nullptr);
             return DirectStage{std::move(capture), std::move(base)};
         }
-        std::vector<std::uint32_t> slots;
-        std::vector<std::shared_ptr<void>> keep;
+        std::vector<std::uint32_t> requests;
         DirectSlotStatistics statistics;
         std::string reason;
-        bool filled = false;
-        {
-            const auto context = device->graphicsContext();
-            std::lock_guard gpu(GuestMemory::GpuMutex());
-            filled = FillDirectSlots(context, handle->artifact->info, capture->snapshot, slots, keep, statistics, reason);
-        }
-        if (!filled) {
-            static std::string lastReason;
+        if (!BuildDirectSlotRequests(handle->artifact->info, capture->snapshot, requests, statistics, reason)) {
+            static thread_local std::string lastReason;
             lastReason = reason.substr(0, 80);
             report(lastReason.c_str());
             return std::nullopt;
         }
+        bool pushed = true;
+        for (const auto& binding : base->bindings) pushed = pushed && binding.role != ShaderRecompiler::DescriptorRole::ShaderData;
+        if (pushed && base->pushConstants.size() < (static_cast<std::size_t>(base->directSlotDword) + base->directSlotCount) * sizeof(std::uint32_t)) {
+            report("slot words outside the push data");
+            return std::nullopt;
+        }
         auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*base);
-        bool written = false;
-        for (auto& binding : patched->bindings) {
-            if (binding.role != ShaderRecompiler::DescriptorRole::ShaderData) continue;
-            if (binding.guestDescriptor.size() < patched->directSlotDword + slots.size()) binding.guestDescriptor.resize(patched->directSlotDword + slots.size(), 0u);
-            std::copy(slots.begin(), slots.end(), binding.guestDescriptor.begin() + patched->directSlotDword);
-            written = true;
-        }
-        if (!written) {
-            const auto bytes = (static_cast<std::size_t>(patched->directSlotDword) + slots.size()) * sizeof(std::uint32_t);
-            if (patched->pushConstants.size() < bytes) {
-                report("slot words outside the push data");
-                return std::nullopt;
-            }
-            std::memcpy(patched->pushConstants.data() + static_cast<std::size_t>(patched->directSlotDword) * sizeof(std::uint32_t), slots.data(), slots.size() * sizeof(std::uint32_t));
-        }
+        patched->directSlotRequests = std::move(requests);
         {
             std::lock_guard lock(mutex);
             ++totals.direct;
-            kept.emplace_back(std::chrono::steady_clock::now(), std::move(keep));
         }
         report(nullptr);
         return DirectStage{std::move(capture), std::move(patched)};
@@ -234,44 +218,6 @@ void probeDirectEvaluation(const ShaderRecompiler::RecompileRequest& request, Vu
                 }
                 materializeUs = materializeUs.load() + std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - materializeStarted).count();
                 if ((materialized.load() + materializeFailed.load()) % 100000u == 0u) std::fprintf(stderr, "[direct-eval] materialize: %llu done, %llu failed, avg %.2f us\n", static_cast<unsigned long long>(materialized.load()), static_cast<unsigned long long>(materializeFailed.load()), materialized.load() != 0 ? materializeUs.load() / static_cast<double>(materialized.load()) : 0.0);
-            }
-            static const bool slotProbe = std::getenv("APS5_DIRECT_SLOT_PROBE") != nullptr;
-            if (slotProbe && tables == 0u && device != nullptr) {
-                static std::mutex slotMutex;
-                static DirectSlotStatistics slotTotals;
-                static std::uint64_t slotCalls = 0, slotFailed = 0;
-                static double slotUs = 0;
-                static std::map<std::string, std::uint64_t> slotReasons;
-                const auto context = device->graphicsContext();
-                std::vector<std::uint32_t> slots;
-                std::vector<std::shared_ptr<void>> keep;
-                DirectSlotStatistics statistics;
-                std::string reason;
-                bool filled = false;
-                const auto slotStarted = std::chrono::steady_clock::now();
-                {
-                    std::lock_guard gpu(GuestMemory::GpuMutex());
-                    filled = FillDirectSlots(context, handle->artifact->info, capture->snapshot, slots, keep, statistics, reason);
-                }
-                const auto spent = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - slotStarted).count();
-                std::lock_guard slotLock(slotMutex);
-                ++slotCalls;
-                slotUs += spent;
-                slotTotals.images += statistics.images;
-                slotTotals.inactiveImages += statistics.inactiveImages;
-                slotTotals.samplers += statistics.samplers;
-                slotTotals.textureLookups += statistics.textureLookups;
-                slotTotals.memoHits += statistics.memoHits;
-                if (!filled) {
-                    ++slotFailed;
-                    if (reason.size() > 120) reason.resize(120);
-                    ++slotReasons[reason];
-                }
-                static auto slotLast = std::chrono::steady_clock::now(); if (std::chrono::steady_clock::now() - slotLast >= std::chrono::seconds(10)) { slotLast = std::chrono::steady_clock::now();
-                    std::string line = "[direct-slots] " + std::to_string(slotCalls) + " stages, " + std::to_string(slotFailed) + " failed, avg " + std::to_string(slotUs / static_cast<double>(slotCalls)) + " us; images " + std::to_string(slotTotals.images) + " (inactive " + std::to_string(slotTotals.inactiveImages) + "), samplers " + std::to_string(slotTotals.samplers) + ", lookups " + std::to_string(slotTotals.textureLookups) + ", memo hits " + std::to_string(slotTotals.memoHits) + "; heap writes " + std::to_string(Graphics::DirectHeapFor(context).Writes()) + ";";
-                    for (const auto& [text, count] : slotReasons) line += " [" + std::to_string(count) + "x] " + text + ";";
-                    std::fprintf(stderr, "%s\n", line.c_str());
-                }
             }
             if (textureProbe && device != nullptr && !capture->snapshot.images.empty()) {
                 const auto context = device->graphicsContext();

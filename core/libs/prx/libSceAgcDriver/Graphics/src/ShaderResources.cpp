@@ -1699,6 +1699,17 @@ std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<
     return cachedTexture(context, words, resource, ViewComponents(resource), 0, false, multisampleViewType);
 }
 
+std::shared_ptr<Texture> DirectSampledTexture(const Context& context, std::span<const std::uint32_t> words) {
+    if (IsNullSampledTextureResource(words)) return nullptr;
+    const auto resource = DecodeTextureResource(words);
+    if (resource.dimension == TextureDimension::k2DMsaa) return nullptr;
+    const auto components = ViewComponents(resource);
+    const auto guestBytes = DescribeSurface(resource).guestBytes;
+    CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
+    return cachedTexture(context, words, resource, components, guestBytes, false, VK_IMAGE_VIEW_TYPE_2D, false);
+}
+
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second) {
     Require(first.size() == 8 && second.size() == 8, "sampled texture keys take eight descriptor words");
     const VkComponentMapping components{VK_COMPONENT_SWIZZLE_R, VK_COMPONENT_SWIZZLE_G, VK_COMPONENT_SWIZZLE_B, VK_COMPONENT_SWIZZLE_A};

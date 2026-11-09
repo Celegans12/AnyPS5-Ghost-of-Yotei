@@ -979,6 +979,7 @@ struct ResultKeyMemo {
 
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     ResultKeyMemo drawKeyMemo;
+    std::vector<std::uint32_t> directSlotRequests;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;
