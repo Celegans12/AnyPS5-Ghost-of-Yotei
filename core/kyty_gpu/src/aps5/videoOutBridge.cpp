@@ -55,6 +55,15 @@ struct ReadyFrame {
 	int32_t                     index   = 0;
 };
 
+// KYTY_APS5_FLIP_RESYNC=1 (default off): a present drops the ready frames of flips AnyPS5 never presented.
+bool FlipResync() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_APS5_FLIP_RESYNC");
+		return value != nullptr && value[0] == '1';
+	}();
+	return on;
+}
+
 } // namespace
 
 struct VideoOutDriver::Impl {
@@ -79,6 +88,7 @@ struct VideoOutDriver::Impl {
 	std::atomic<uint64_t> mismatches {0};
 	std::atomic<uint64_t> empty_presents {0};
 	std::atomic<uint64_t> dump_failures {0};
+	std::atomic<uint64_t> unpresented {0};
 
 	uint64_t Reserve(const Aps5GpuFlip& flip, int* status) {
 		const auto& host  = Aps5::Host();
@@ -359,16 +369,47 @@ int VideoOutPresent(const Aps5GpuWindow* window, const Aps5GpuDisplayBuffer* buf
                     void (*presented)(void* context), void* presented_context) {
 	EXIT_IF(Libs::VideoOut::g_driver == nullptr);
 	Libs::Graphics::HTrace::NoteFlipPresentBegin(); // KYTY_TRACE_H
-	auto&                          impl = Libs::VideoOut::g_driver->State();
-	Libs::VideoOut::ReadyFrame     next {};
-	bool                           have = false;
+	auto&                                   impl   = Libs::VideoOut::g_driver->State();
+	const uint64_t                          wanted = buffer != nullptr ? buffer->address : 0;
+	Libs::VideoOut::ReadyFrame              next {};
+	bool                                    have  = false;
+	size_t                                  ahead = 0;
+	std::vector<Libs::VideoOut::ReadyFrame> skipped;
 	{
 		std::scoped_lock lock(impl.ready_mutex);
+		// Each flip AnyPS5 completes is presented here once, in its queue order. Frames ahead of the first one for this
+		// buffer belong to flips AnyPS5 completed without a present (an overlay bus, a closed output): they are reported,
+		// and with KYTY_APS5_FLIP_RESYNC=1 dropped, so that this present shows its own buffer.
+		if (!impl.ready.empty() && impl.ready.front().address != wanted) {
+			for (size_t i = 1; i < impl.ready.size(); i++) {
+				if (impl.ready[i].address == wanted) {
+					ahead = i;
+					break;
+				}
+			}
+		}
+		if (ahead != 0 && Libs::VideoOut::FlipResync()) {
+			for (size_t i = 0; i < ahead; i++) {
+				skipped.push_back(impl.ready.front());
+				impl.ready.pop_front();
+			}
+		}
 		if (!impl.ready.empty()) {
 			next = impl.ready.front();
 			impl.ready.pop_front();
 			have = true;
 		}
+	}
+	if (ahead != 0) {
+		const auto count = impl.unpresented.fetch_add(ahead, std::memory_order_relaxed);
+		if (count < 8) {
+			Log("videoout: %zu ready flip frame(s) ahead of buffer 0x%llx were never presented by AnyPS5 (%llu so far)%s",
+			    ahead, static_cast<unsigned long long>(wanted), static_cast<unsigned long long>(count + ahead),
+			    skipped.empty() ? "; presenting the oldest (KYTY_APS5_FLIP_RESYNC=1 drops them)" : "; dropped");
+		}
+	}
+	for (auto& frame: skipped) {
+		impl.presenter.Discard(*frame.frame);
 	}
 	if (have && (buffer != nullptr ? buffer->address : 0) != next.address &&
 	    impl.mismatches.fetch_add(1, std::memory_order_relaxed) < 8) {
