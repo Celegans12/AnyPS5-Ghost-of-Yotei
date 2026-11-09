@@ -251,8 +251,31 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
         auto base = ShaderRecompiler::MaterializeShader(direct, *capture, *handle);
         if (!capture->snapshot.tables.tables.empty()) {
             const auto& info = handle->artifact->info.info;
+            auto resolvedTables = ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, capture->snapshot, handle->artifact->artifact.variantId);
+            // The same materialized result with the same resolved tables gives the same stage: reuse
+            // it instead of copying the result (and its table map) again.
+            struct TableStageMemo {
+                std::weak_ptr<const ShaderRecompiler::RecompileResult> base;
+                std::weak_ptr<const ShaderRecompiler::ResolvedImageTables> tables;
+                std::shared_ptr<const ShaderRecompiler::RecompileResult> stage;
+            };
+            thread_local std::array<TableStageMemo, 64> tableStages;
+            auto& slot = tableStages[(reinterpret_cast<std::uintptr_t>(base.get()) >> 4u) % tableStages.size()];
+            // Only table-only stages: slot requests come from this capture's image words, which the
+            // materialized result does not pin.
+            const bool tableOnly = base->directSlotCount == 0u;
+            if (tableOnly && slot.stage != nullptr && slot.base.lock() == base && slot.tables.lock() == resolvedTables) {
+                base = slot.stage;
+                {
+                    std::lock_guard lock(mutex);
+                    ++totals.direct;
+                }
+                report(nullptr);
+                return DirectStage{std::move(capture), std::move(base)};
+            }
             auto withTables = std::make_shared<ShaderRecompiler::RecompileResult>(*base);
-            withTables->directTables = ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, capture->snapshot, handle->artifact->artifact.variantId);
+            const auto materialized = base;
+            withTables->directTables = std::move(resolvedTables);
             if (std::ranges::any_of(withTables->directTables->elements, [](const ShaderRecompiler::ImageTableElement& element) { return ShaderRecompiler::ImageBindingResourceClass(element.kind) != ShaderRecompiler::ImageResourceClass::Sampled; })) {
                 report("storage image table");
                 return std::nullopt;
@@ -262,6 +285,15 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
                 if (sampler.table != ShaderRecompiler::NoTable && sampler.table < withTables->directSamplerTables.size()) withTables->directSamplerTables[sampler.table] = 1u;
             }
             base = std::move(withTables);
+            if (tableOnly) {
+                slot = {materialized, base->directTables, base};
+                {
+                    std::lock_guard lock(mutex);
+                    ++totals.direct;
+                }
+                report(nullptr);
+                return DirectStage{std::move(capture), std::move(base)};
+            }
         }
         if (base->directSlotCount == 0u && base->directTables == nullptr) {
             {

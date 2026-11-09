@@ -381,9 +381,30 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
     for (auto& shader : out) {
         const auto* program = shader.program;
         if (program == nullptr || (program->directSlotRequests.empty() && program->directTables == nullptr)) continue;
+        // A table-only stage patched for the same mirror map is the same result: reuse it instead of
+        // copying the program and its map again.
+        struct PatchedTableStage {
+            const ShaderRecompiler::RecompileResult* program = nullptr;
+            std::uint64_t variant = 0;
+            std::size_t spirvWords = 0;
+            std::uint64_t mapHash = 0;
+            std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
+        };
+        thread_local std::array<PatchedTableStage, 64> patchedTables;
+        const TableMirror* tableMirror = nullptr;
+        if (program->directTables != nullptr && program->directSlotRequests.empty()) {
+            tableMirror = tableMirrorFor(context, heap, *program);
+            auto& memoSlot = patchedTables[(reinterpret_cast<std::uintptr_t>(program) >> 4u) % patchedTables.size()];
+            if (memoSlot.program == program && memoSlot.variant == program->PipelineVariantId() && memoSlot.spirvWords == program->spirv.size() && memoSlot.mapHash == tableMirror->mapHash && memoSlot.patched != nullptr) {
+                if (recorder != nullptr) recorder->Keep(tableMirror->textures);
+                shader.program = memoSlot.patched.get();
+                patched.push_back(memoSlot.patched);
+                continue;
+            }
+        }
         auto copy = std::make_shared<ShaderRecompiler::RecompileResult>(*program);
         if (program->directTables != nullptr) {
-            const auto* mirror = tableMirrorFor(context, heap, *program);
+            const auto* mirror = tableMirror != nullptr ? tableMirror : tableMirrorFor(context, heap, *program);
             for (auto& binding : copy->bindings) {
                 if (binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap) binding.guestDescriptor = mirror->map;
             }
@@ -496,6 +517,7 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
         }
         copy->directSlotRequests.clear();
         shader.program = copy.get();
+        if (tableMirror != nullptr) patchedTables[(reinterpret_cast<std::uintptr_t>(program) >> 4u) % patchedTables.size()] = {program, program->PipelineVariantId(), program->spirv.size(), tableMirror->mapHash, copy};
         patched.push_back(std::move(copy));
     }
     std::lock_guard lock(totalsMutex);
