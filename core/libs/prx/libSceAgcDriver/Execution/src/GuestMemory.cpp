@@ -2915,6 +2915,15 @@ bool UnchangedSinceLastCollect(std::uint64_t address, std::size_t bytes, std::ui
     return tracker.cpuUnchanged(address, bytes, generation) && tracker.rangeUnchanged(address, bytes, generation, false);
 }
 
+bool NoStoreSinceLastCollect(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    if (bytes == 0u || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (!tracker.watched || generation == 0u || !tracker.covers(address, bytes)) return false;
+    return tracker.rangeUnchanged(address, bytes, generation, false);
+}
+
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);
