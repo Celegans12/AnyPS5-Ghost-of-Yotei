@@ -5877,6 +5877,22 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     const auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, runAccesses, &covered, overlapped) : recorder.Commands(&covered);
     constexpr VkAccessFlags runLeadingCovered = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
     if (overlapCapable && !overlapped && (covered & runLeadingCovered) != runLeadingCovered) covered = 0;
+    // Debug aid: APS5_TRACE_DISPATCH_OVERLAP=1 counts, for direct and other dispatches, how many had
+    // an overlap order, were overlap capable (and unordered), and overlapped.
+    if (static const bool traceOverlap = std::getenv("APS5_TRACE_DISPATCH_OVERLAP") != nullptr; traceOverlap) {
+        static std::array<std::array<std::uint64_t, 5>, 2> counts{};
+        static auto last = std::chrono::steady_clock::now();
+        auto& row = counts[record.shader->program->directHeap ? 1 : 0];
+        ++row[0];
+        if (overlapQueue != 0) ++row[1];
+        if (overlapCapable) ++row[2];
+        if (overlapCapable && unordered) ++row[3];
+        if (overlapped) ++row[4];
+        if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(10)) {
+            last = now;
+            for (int direct = 0; direct < 2; ++direct) std::fprintf(stderr, "[overlap-trace] %s dispatches (cumulative): %llu, with order %llu, capable %llu, capable+unordered %llu, overlapped %llu\n", direct != 0 ? "direct" : "other", static_cast<unsigned long long>(counts[direct][0]), static_cast<unsigned long long>(counts[direct][1]), static_cast<unsigned long long>(counts[direct][2]), static_cast<unsigned long long>(counts[direct][3]), static_cast<unsigned long long>(counts[direct][4]));
+        }
+    }
     recordStep(PhaseRecordCommands);
     recorder.Keep(record.objects);
     if (record.resources != nullptr) record.resources->KeepStorageImageBytes(recorder);
@@ -6247,6 +6263,30 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::computePipeline(const Grap
     return finish(std::move(objects), nullptr);
 }
 
+// Debug aid: APS5_DIRECT_DUMP_SPIRV=<dir> writes each compute program's SPIR-V once as
+// <form>_<code hash>.spv, the hash taken over the first 256 bytes of guest code so the old and
+// direct forms of one shader pair up across runs (code addresses differ per run).
+static void DumpComputeSpirv(const char* form, std::uint64_t programAddress, const ShaderRecompiler::RecompileResult& shader) {
+    static const char* dumpDir = std::getenv("APS5_DIRECT_DUMP_SPIRV");
+    if (dumpDir == nullptr || programAddress == 0) return;
+    static std::mutex dumpMutex;
+    static std::set<std::pair<std::string, std::uint64_t>> dumped;
+    std::lock_guard dumpLock(dumpMutex);
+    if (!dumped.insert({form, programAddress}).second) return;
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    if (GuestMemory::Accessible(reinterpret_cast<const void*>(programAddress), 256u)) {
+        const auto* code = reinterpret_cast<const std::uint8_t*>(programAddress);
+        for (std::size_t at = 0; at < 256u; ++at) hash = (hash ^ code[at]) * 0x100000001b3ull;
+    }
+    std::fprintf(stderr, "[spirv-dump] %s 0x%llx -> %016llx (%zu words)\n", form, static_cast<unsigned long long>(programAddress), static_cast<unsigned long long>(hash), shader.spirv.size());
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s/%s_%016llx.spv", dumpDir, form, static_cast<unsigned long long>(hash));
+    if (FILE* file = std::fopen(path, "wb")) {
+        std::fwrite(shader.spirv.data(), sizeof(std::uint32_t), shader.spirv.size(), file);
+        std::fclose(file);
+    }
+}
+
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews) {
     if (!shader.directSlotRequests.empty()) {
         const std::array<Graphics::CompiledShader, 1> stage{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0, registeredImageViews}}};
@@ -6255,22 +6295,29 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         std::vector<std::shared_ptr<Graphics::StorageTexture>> written;
         const auto directContext = graphicsContext();
         const auto started = std::chrono::steady_clock::now();
+        // Debug aid: APS5_DIRECT_TRACE_HASH=<16 hex digits> traces the slots of the first dispatches
+        // of the program whose code hash (as in the SPIR-V dump) matches.
+        static const std::uint64_t traceHash = [] {
+            const char* text = std::getenv("APS5_DIRECT_TRACE_HASH");
+            return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
+        }();
+        bool tracing = false;
+        if (traceHash != 0u && GuestMemory::Accessible(reinterpret_cast<const void*>(programAddress), 256u)) {
+            std::uint64_t hash = 0xcbf29ce484222325ull;
+            const auto* code = reinterpret_cast<const std::uint8_t*>(programAddress);
+            for (std::size_t at = 0; at < 256u; ++at) hash = (hash ^ code[at]) * 0x100000001b3ull;
+            static std::atomic<int> traced{0};
+            tracing = hash == traceHash && traced.fetch_add(1) < 3;
+            if (tracing) std::fprintf(stderr, "[direct-trace] dispatch 0x%llx groups %ux%ux%u indirect %d\n", static_cast<unsigned long long>(programAddress), x, y, z, arguments != 0 ? 1 : 0);
+        }
+        Graphics::TraceDirectSlots(tracing);
+        struct TraceOff {
+            ~TraceOff() { Graphics::TraceDirectSlots(false); }
+        } traceOff;
         if (Graphics::ResolveDirectStages(directContext, stage, patched, resolved, &written) && !patched.empty()) {
+            Graphics::TraceDirectSlots(false);
             const auto resolvedAt = std::chrono::steady_clock::now();
-            // Debug aid: APS5_DIRECT_DUMP_SPIRV=<dir> writes each direct compute program's SPIR-V once.
-            if (static const char* dumpDir = std::getenv("APS5_DIRECT_DUMP_SPIRV"); dumpDir != nullptr) {
-                static std::mutex dumpMutex;
-                static std::set<std::uint64_t> dumped;
-                std::lock_guard dumpLock(dumpMutex);
-                if (dumped.insert(programAddress).second) {
-                    char path[512];
-                    std::snprintf(path, sizeof(path), "%s/direct_%llx.spv", dumpDir, static_cast<unsigned long long>(programAddress));
-                    if (FILE* file = std::fopen(path, "wb")) {
-                        std::fwrite(patched.front()->spirv.data(), sizeof(std::uint32_t), patched.front()->spirv.size(), file);
-                        std::fclose(file);
-                    }
-                }
-            }
+            DumpComputeSpirv("direct", programAddress, *patched.front());
             // No recipe: a replay would reuse this call's slot words and skip the storage marking below.
             static const bool keepRecipe = std::getenv("APS5_DIRECT_KEEP_RECIPE") != nullptr;
             if (recipeOut != nullptr) *recipeOut = nullptr;
@@ -6283,6 +6330,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             return outcome;
         }
     }
+    if (!shader.directHeap) DumpComputeSpirv("old", programAddress, shader);
     startJournalReplay();
     for (const auto& binding : shader.bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;

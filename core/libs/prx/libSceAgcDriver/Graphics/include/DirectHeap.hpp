@@ -80,6 +80,8 @@ struct DirectSlotRequest {
 class StorageTexture;
 
 bool ResolveDirectStages(const Context& context, std::span<const CompiledShader> shaders, std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>>& patched, std::vector<CompiledShader>& out, std::vector<std::shared_ptr<StorageTexture>>* written = nullptr);
+// Debug aid: while set on this thread, ResolveDirectStages prints each slot it resolves.
+void TraceDirectSlots(bool enabled);
 void MarkDirectStorageWrites(const Context& context, std::span<const std::shared_ptr<StorageTexture>> written);
 
 }

@@ -361,6 +361,28 @@ const TableMirror* tableMirrorFor(const Context& context, DirectHeap& heap, cons
 
 }
 
+namespace {
+thread_local bool traceSlots = false;
+
+void traceSlot(const char* what, std::uint32_t kind, std::uint32_t flags, std::span<const std::uint32_t> words, std::uint32_t slot, const char* extra) {
+    if (!traceSlots) return;
+    std::string detail;
+    try {
+        const auto resource = DecodeTextureResource(words);
+        char text[200];
+        std::snprintf(text, sizeof(text), "base 0x%llx %ux%u fmt %u dim %d tile %d mips %u base %u layers %u..%u", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), static_cast<int>(resource.tileMode), resource.mipCount, resource.baseLevel, resource.baseArray, resource.depthOrLastArray);
+        detail = text;
+    } catch (const std::exception&) {
+        detail = "undecodable";
+    }
+    std::fprintf(stderr, "[direct-trace] %s kind %u flags 0x%x slot %u %s %s\n", what, kind, flags, slot, detail.c_str(), extra);
+}
+}
+
+void TraceDirectSlots(bool enabled) {
+    traceSlots = enabled;
+}
+
 bool ResolveDirectStages(const Context& context, std::span<const CompiledShader> shaders, std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>>& patched, std::vector<CompiledShader>& out, std::vector<std::shared_ptr<StorageTexture>>* written) {
     if (std::ranges::none_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && (!shader.program->directSlotRequests.empty() || shader.program->directTables != nullptr); })) return false;
     struct Totals {
@@ -471,6 +493,7 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
                 }
                 const auto view = (flags & DirectSlotRequest::Atomic64) != 0u ? storage->Atomic64View(level, firstLayer) : (flags & DirectSlotRequest::Atomic) != 0u ? storage->AtomicView(level, firstLayer) : storage->StorageView(level, firstLayer, (flags & DirectSlotRequest::UintView) != 0u);
                 slot = heap.ImageSlot(kind, view, VK_IMAGE_LAYOUT_GENERAL, storage);
+                traceSlot("storage", kind, flags, words, slot, firstLayer ? "first-layer" : "");
                 if (recorder != nullptr) recorder->Keep(storage);
                 if (writes && written != nullptr) written->push_back(storage);
                 if (memoizable && slot != DirectHeap::NoSlot) memo.entries[memoKey] = {{}, storage, slot};
@@ -494,6 +517,7 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
                 }
                 const auto view = firstLayer && texture->FirstLayerView() != VK_NULL_HANDLE ? texture->FirstLayerView() : texture->View();
                 slot = heap.ImageSlot(kind, view, texture->Layout(), texture);
+                if (traceSlots) traceSlot("sampled", kind, flags, words, slot, texture->StorageSource() != nullptr ? "storage-source" : "snapshot");
                 if (recorder != nullptr) recorder->Keep(texture);
                 if (memoizable && slot != DirectHeap::NoSlot) memo.entries[memoKey] = {texture, {}, slot};
             }

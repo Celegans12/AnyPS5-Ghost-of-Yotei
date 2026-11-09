@@ -74,6 +74,24 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> DirectDispatchHandle(const
             return text != nullptr ? std::strtoull(text, nullptr, 10) : ~0ull;
         }();
         if (refusal == nullptr && eligibleCount.load() >= maxEligible) refusal = "over APS5_DIRECT_DISPATCH_MAX";
+        // APS5_DIRECT_DISPATCH_SKIP=<hash>[,<hash>...]: programs whose code hash (FNV-1a over the first
+        // 256 code bytes, as APS5_DIRECT_DUMP_SPIRV names them) keep the existing path.
+        static const std::vector<std::uint64_t> skipped = [] {
+            std::vector<std::uint64_t> hashes;
+            const char* text = std::getenv("APS5_DIRECT_DISPATCH_SKIP");
+            for (const char* at = text; at != nullptr && *at != '\0';) {
+                char* end = nullptr;
+                hashes.push_back(std::strtoull(at, &end, 16));
+                at = end != nullptr && *end == ',' ? end + 1 : nullptr;
+            }
+            return hashes;
+        }();
+        if (refusal == nullptr && !skipped.empty() && request.shader.code.size() >= 256u) {
+            std::uint64_t hash = 0xcbf29ce484222325ull;
+            const auto* bytes = reinterpret_cast<const std::uint8_t*>(request.shader.code.data());
+            for (std::size_t at = 0; at < 256u; ++at) hash = (hash ^ bytes[at]) * 0x100000001b3ull;
+            if (std::ranges::find(skipped, hash) != skipped.end()) refusal = "APS5_DIRECT_DISPATCH_SKIP";
+        }
         for (const auto& sampler : info.samplers) {
             if (sampler.table != ShaderRecompiler::NoTable) refusal = "sampler table";
         }
