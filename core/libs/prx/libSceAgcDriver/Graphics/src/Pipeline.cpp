@@ -1281,7 +1281,7 @@ void reportPipelines(PipelineStore& store) {
 
 }
 
-bool CachedPipelineResident(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+bool CachedPipelineResident(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, std::uint64_t* keyHash) {
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (disabled) return false;
     auto& store = Pipelines();
@@ -1290,6 +1290,7 @@ bool CachedPipelineResident(const Context& context, const State& state, const Ve
     pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
     if (key.empty()) return false;
     const auto hash = hashKey(key);
+    if (keyHash != nullptr) *keyHash = hash;
     std::lock_guard lock(store.mutex);
     const auto found = store.index.find(hash);
     return found != store.index.end() && found->second->key == key && alive(*found->second, context);
