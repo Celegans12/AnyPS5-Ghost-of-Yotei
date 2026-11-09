@@ -4,6 +4,7 @@
 #include <SDL3/SDL_vulkan.h>
 
 #include "graphics/host_gpu/renderer/commandRecorder.h"
+#include "graphics/host_gpu/renderer/cache/barGpuCopy.h"
 #include "graphics/host_gpu/gpuCheckpoints.h"
 #include "common/assert.h"
 #include "common/common.h"
@@ -457,6 +458,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 	}
 }
 
+// Queues created in the universal family (2 with KYTY_PERF_BAR_GPU_COPY's queue).
+static uint32_t g_bar_copy_queue_count = 1;
+
 static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	                                 const std::vector<const char*>& device_extensions) {
 	const auto physical_device = graphics.physical_device;
@@ -469,6 +473,19 @@ static vk::Device VulkanCreateDevice(GraphicContext& graphics,
 	queue_create_info.queueFamilyIndex = queue_family;
 	queue_create_info.queueCount       = 1;
 	queue_create_info.pQueuePriorities = queue_priorities;
+	// KYTY_PERF_BAR_GPU_COPY: a second queue of the same family for the BAR download copies, only when the switch can be on.
+	if (BarGpuCopy::WantQueue()) {
+		uint32_t family_count = 0;
+		physical_device.getQueueFamilyProperties(&family_count, nullptr);
+		std::vector<vk::QueueFamilyProperties> families(family_count);
+		physical_device.getQueueFamilyProperties(&family_count, families.data());
+		if (queue_family < family_count && families[queue_family].queueCount >= 2) {
+			queue_create_info.queueCount = 2;
+		}
+		std::fprintf(stderr, "BAR_GPU_COPY queues in family %u: %u, created %u\n", queue_family,
+		             queue_family < family_count ? families[queue_family].queueCount : 0u, queue_create_info.queueCount);
+	}
+	g_bar_copy_queue_count = queue_create_info.queueCount;
 
 	vk::PhysicalDeviceColorWriteEnableFeaturesEXT color_write_ext {};
 	color_write_ext.colorWriteEnable = VK_TRUE;
@@ -1406,6 +1423,11 @@ void WindowContext::CreateVulkan() {
 	CommandRecorder::Install();
 	graphic_ctx.device.getQueue(graphic_ctx.queue_family, 0, &graphic_ctx.queue);
 	EXIT_IF(graphic_ctx.queue == nullptr);
+	if (g_bar_copy_queue_count >= 2) {
+		vk::Queue bar_queue = nullptr;
+		graphic_ctx.device.getQueue(graphic_ctx.queue_family, 1, &bar_queue);
+		BarGpuCopy::SetQueue(bar_queue, graphic_ctx.queue_family);
+	}
 
 	if (!graphic_ctx.CreateAllocator()) {
 		EXIT("Could not create Vulkan memory allocator");

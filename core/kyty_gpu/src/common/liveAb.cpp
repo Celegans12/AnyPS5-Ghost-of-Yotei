@@ -44,6 +44,12 @@ constexpr SwitchInfo Switches[] = {
     // Measurement only (APPROXIMATION): whether draw and dispatch packets inside the listed marker passes return before the
     // renderer (guest_gpu/command_processor/passCensus.cpp; the list in KYTY_DIAG_CEILING_FREE_PASSES).
     {Switch::DiagCeilingFreePasses, "KYTY_DIAG_CEILING_FREE_PASSES", 1},
+    // Only where a host-mapped download's CPU reads its bytes from (the BAR mapping, or a staging copy the GPU made
+    // after the same write tick), per download; the copy's objects hold nothing between downloads (cache/barGpuCopy.h).
+    {Switch::BarGpuCopy, "KYTY_PERF_BAR_GPU_COPY", 1024},
+    // Only how large a finished read window the host-mapped download takes (up to 8 MiB, copied by the GPU) instead of the
+    // copy path, per request; both publish the newest GPU bytes and the rest stays GPU-modified (cache/barGpuCopy.h).
+    {Switch::BarGpuLarge, "KYTY_PERF_BAR_GPU_LARGE", 1},
 };
 static_assert(std::size(Switches) == SwitchCount);
 

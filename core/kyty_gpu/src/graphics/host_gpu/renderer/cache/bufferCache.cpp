@@ -7,6 +7,7 @@
 #include "graphics/host_gpu/gpuCheckpoints.h"
 #include "graphics/host_gpu/renderer/gpuTimer.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/cache/barGpuCopy.h"
 #include "graphics/host_gpu/renderer/cache/bufferCacheTrace.h"
 
 #include "common/alignment.h"
@@ -108,6 +109,201 @@ uint64_t RingSize(const char* name, uint64_t fallback) {
 	const char* value = std::getenv(name);
 	const auto  mib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
 	return mib != 0 ? mib : fallback;
+}
+
+// KYTY_TRACE_BAR_CENSUS=1 (diagnostic, default off; read once): what the synchronous downloads of GPU-written bytes
+// read, for whom, and what it costs. Every ~5 s, per reader (the PerfReason of the request): the host-mapped downloads
+// (TryBarDownload: downloads, GPU-dirty intervals, span reads, bytes, of them the bytes inside the 4 KiB pages of the
+// access itself, time reading the mapping, time waiting for the write tick and how often that wait blocked), the
+// downloads that took the copy path (DownloadBufferMemory, time including its wait) and why the host-mapped read
+// declined them (TryBarDownload's outcomes 1-6); the host-mapped downloads by size; and the 64 KiB granules of the
+// accesses with the most mapping-read time, with their readers, buffer and write accesses. Nothing else changes.
+bool BarCensusEnabled() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_TRACE_BAR_CENSUS");
+		const bool  set   = value != nullptr && value[0] == '1';
+		if (set) std::fprintf(stderr, "TRACE_BAR_CENSUS enabled\n");
+		return set;
+	}();
+	return on;
+}
+
+struct BarCensusAccess {
+	uint64_t lo     = 0;
+	uint64_t hi     = 0;
+	bool     write  = false;
+	bool     active = false;
+};
+thread_local BarCensusAccess t_bar_census_access;
+
+class BarCensusAccessScope {
+public:
+	BarCensusAccessScope(uint64_t vaddr, uint64_t size, bool write) {
+		if (!BarCensusEnabled()) return;
+		m_previous          = t_bar_census_access;
+		m_set               = true;
+		t_bar_census_access = {vaddr, vaddr + size, write, true};
+	}
+	~BarCensusAccessScope() {
+		if (m_set) t_bar_census_access = m_previous;
+	}
+	BarCensusAccessScope(const BarCensusAccessScope&)            = delete;
+	BarCensusAccessScope& operator=(const BarCensusAccessScope&) = delete;
+
+private:
+	BarCensusAccess m_previous {};
+	bool            m_set = false;
+};
+
+struct BarCensusReader {
+	uint64_t                bar_downloads = 0, bar_intervals = 0, bar_spans = 0, bar_bytes = 0, bar_own = 0;
+	uint64_t                bar_read_ns = 0, bar_wait_ns = 0, bar_blocked = 0;
+	uint64_t                copy_downloads = 0, copy_bytes = 0, copy_ns = 0;
+	std::array<uint64_t, 7> declined {};
+};
+
+struct BarCensusGranule {
+	uint64_t calls = 0, bytes = 0, read_ns = 0, writes = 0, buffer = 0, buffer_size = 0;
+	uint32_t readers = 0;
+};
+
+struct BarCensusState {
+	std::mutex                                                           mutex;
+	std::array<BarCensusReader, static_cast<size_t>(PerfReason::Count)> readers {};
+	std::array<uint64_t, 5>                    size_calls {}, size_bytes {}, size_ns {}; // <4K <16K <64K <256K >=256K
+	std::unordered_map<uint64_t, BarCensusGranule> granules;
+	int64_t                                        window_start = 0;
+	uint32_t                                       frame_start  = 0;
+};
+
+BarCensusState& BarCensus() {
+	static auto* state = new BarCensusState; // lives for the process
+	return *state;
+}
+
+uint32_t BarCensusReason() {
+	const auto reason = static_cast<uint32_t>(PerfCurrentReason());
+	return reason < static_cast<uint32_t>(PerfReason::Count) ? reason : 0u;
+}
+
+// The caller holds the state's mutex.
+void BarCensusReportLocked(BarCensusState& s) {
+	const int64_t now =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	const uint32_t frame = DebugPresentCount().load();
+	if (s.window_start == 0) {
+		s.window_start = now;
+		s.frame_start  = frame;
+		return;
+	}
+	if (now - s.window_start < 5000) return;
+	static const char* names[] = {"other", "fault_game", "fault_gpu", "srt_walker", "dcc_meta", "indirect_args", "invalidate"};
+	const auto         ull     = [](uint64_t value) { return static_cast<unsigned long long>(value); };
+	const auto         ms      = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+	std::fprintf(stderr, "PERF bar_census window_ms=%lld frames=%u frame=%u\n", static_cast<long long>(now - s.window_start),
+	             frame - s.frame_start, frame);
+	for (size_t i = 0; i < s.readers.size(); i++) {
+		const auto& r = s.readers[i];
+		if (r.bar_downloads == 0 && r.copy_downloads == 0 &&
+		    std::ranges::all_of(r.declined, [](uint64_t value) { return value == 0; })) {
+			continue;
+		}
+		std::fprintf(stderr,
+		             "PERF bar_census_reader reader=%s bar=%llu intervals=%llu spans=%llu bar_kb=%llu own_kb=%llu "
+		             "bar_ms=%.1f wait_ms=%.1f blocked=%llu copy=%llu copy_kb=%llu copy_ms=%.1f "
+		             "declined(no_tick,open,pending,large,outside,empty)=%llu,%llu,%llu,%llu,%llu,%llu\n",
+		             names[i], ull(r.bar_downloads), ull(r.bar_intervals), ull(r.bar_spans), ull(r.bar_bytes >> 10u),
+		             ull(r.bar_own >> 10u), ms(r.bar_read_ns), ms(r.bar_wait_ns), ull(r.bar_blocked), ull(r.copy_downloads),
+		             ull(r.copy_bytes >> 10u), ms(r.copy_ns), ull(r.declined[1]), ull(r.declined[2]), ull(r.declined[3]),
+		             ull(r.declined[4]), ull(r.declined[5]), ull(r.declined[6]));
+	}
+	std::fprintf(stderr, "PERF bar_census_sizes (downloads/KiB/ms <4K <16K <64K <256K >=256K)=");
+	for (size_t i = 0; i < s.size_calls.size(); i++) {
+		std::fprintf(stderr, "%llu/%llu/%.1f ", ull(s.size_calls[i]), ull(s.size_bytes[i] >> 10u), ms(s.size_ns[i]));
+	}
+	std::fprintf(stderr, "\n");
+	std::vector<std::pair<uint64_t, const BarCensusGranule*>> top;
+	top.reserve(s.granules.size());
+	for (const auto& [key, granule]: s.granules) top.emplace_back(key, &granule);
+	const size_t count = std::min<size_t>(top.size(), 16);
+	std::partial_sort(top.begin(), top.begin() + static_cast<ptrdiff_t>(count), top.end(),
+	                  [](const auto& a, const auto& b) { return a.second->read_ns > b.second->read_ns; });
+	for (size_t i = 0; i < count; i++) {
+		const auto& g = *top[i].second;
+		std::fprintf(stderr,
+		             "PERF bar_census_top rank=%zu granule=0x%llx calls=%llu writes=%llu kb=%llu ms=%.1f readers=0x%x "
+		             "buffer=0x%llx+0x%llx\n",
+		             i, ull(top[i].first << 16u), ull(g.calls), ull(g.writes), ull(g.bytes >> 10u), ms(g.read_ns), g.readers,
+		             ull(g.buffer), ull(g.buffer_size));
+	}
+	s.readers      = {};
+	s.size_calls   = {};
+	s.size_bytes   = {};
+	s.size_ns      = {};
+	s.granules.clear();
+	s.window_start = now;
+	s.frame_start  = frame;
+}
+
+void BarCensusDecline(size_t outcome) {
+	auto&           s = BarCensus();
+	std::lock_guard lock(s.mutex);
+	if (outcome < 7) s.readers[BarCensusReason()].declined[outcome]++;
+	BarCensusReportLocked(s);
+}
+
+// A host-mapped download: its intervals (absolute guest addresses), its spans, and its times.
+void BarCensusBar(uint64_t buffer, uint64_t buffer_size, const std::vector<std::pair<uint64_t, uint64_t>>& intervals,
+                  uint64_t spans, uint64_t read_ns, uint64_t wait_ns) {
+	auto&           s      = BarCensus();
+	const auto&     access = t_bar_census_access;
+	uint64_t        bytes = 0, own = 0;
+	const uint64_t  own_lo = access.active ? access.lo & ~uint64_t {0xfff} : 0;
+	const uint64_t  own_hi = access.active ? (access.hi + 0xfffu) & ~uint64_t {0xfff} : 0;
+	for (const auto& [start, end]: intervals) {
+		bytes += end - start;
+		const uint64_t lo = std::max(start, own_lo);
+		const uint64_t hi = std::min(end, own_hi);
+		if (lo < hi) own += hi - lo;
+	}
+	std::lock_guard lock(s.mutex);
+	const uint32_t  reason = BarCensusReason();
+	auto&           r      = s.readers[reason];
+	r.bar_downloads++;
+	r.bar_intervals += intervals.size();
+	r.bar_spans += spans;
+	r.bar_bytes += bytes;
+	r.bar_own += own;
+	r.bar_read_ns += read_ns;
+	r.bar_wait_ns += wait_ns;
+	if (wait_ns >= 20000u) r.bar_blocked++;
+	const size_t bucket = bytes < 4096u ? 0u : bytes < 16384u ? 1u : bytes < 65536u ? 2u : bytes < 262144u ? 3u : 4u;
+	s.size_calls[bucket]++;
+	s.size_bytes[bucket] += bytes;
+	s.size_ns[bucket] += read_ns;
+	const uint64_t key = (access.active ? access.lo : (intervals.empty() ? 0 : intervals.front().first)) >> 16u;
+	auto&          g   = s.granules[key];
+	g.calls++;
+	g.bytes += bytes;
+	g.read_ns += read_ns;
+	if (access.active && access.write) g.writes++;
+	g.readers |= 1u << reason;
+	g.buffer      = buffer;
+	g.buffer_size = buffer_size;
+	BarCensusReportLocked(s);
+}
+
+// KYTY_PERF_BAR_GPU_LARGE (barGpuCopy.h): the most GPU-written bytes a host-mapped download takes (`bar_max` without it).
+uint64_t BarReadMaxBytes(uint64_t bar_max);
+
+void BarCensusCopy(uint64_t bytes, uint64_t ns) {
+	auto&           s = BarCensus();
+	std::lock_guard lock(s.mutex);
+	auto&           r = s.readers[BarCensusReason()];
+	r.copy_downloads++;
+	r.copy_bytes += bytes;
+	r.copy_ns += ns;
+	BarCensusReportLocked(s);
 }
 
 } // namespace
@@ -646,6 +842,10 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 			if (TryBarDownload(buffer, vaddr, size) == 1) return true;
 		}
 	}
+	// KYTY_TRACE_BAR_CENSUS: the copy path's bytes and time (with its wait), synchronous downloads only.
+	const auto census_start = !async && BarCensusEnabled() ? std::chrono::steady_clock::now()
+	                                                        : std::chrono::steady_clock::time_point {};
+	uint64_t   census_bytes = 0;
 	std::vector<vk::BufferCopy> copies;
 	uint64_t                    total_size     = 0;
 	const auto                  buffer_address = buffer.CpuAddress();
@@ -656,6 +856,7 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
+			    census_bytes += end - start;
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
 		    });
@@ -788,6 +989,11 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		}
 		publish();
 		ReportDownloadToBacking();
+		if (BarCensusEnabled()) {
+			BarCensusCopy(census_bytes, static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+			                                                      std::chrono::steady_clock::now() - census_start)
+			                                                      .count()));
+		}
 	}
 	return true;
 }
@@ -972,6 +1178,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 			SyncTimeline::RequestScope timeline(reason, vaddr, size, is_write, timeline_call);
 			if (timeline.Active()) NoteSyncTimelineNeed(vaddr, size);
 			const PerfReasonScope perf_reason(reason); // KYTY_TRACE_DOWNLOAD_WAITS: the request's reason on the GPU thread
+			const BarCensusAccessScope census_access(vaddr, size, is_write); // KYTY_TRACE_BAR_CENSUS: the access
 			// The caller wait: GPU-thread time of the eligible attempts.
 			struct CallerTimer {
 				CallerWaitStats*                      stats    = nullptr;
@@ -1229,7 +1436,7 @@ BufferCache::CallerPlan BufferCache::PlanCallerWait(uint64_t vaddr, uint64_t siz
 		return plan;
 	}
 	newest = std::max(newest, ready->second);
-	if (total > BarMaxBytes) {
+	if (total > BarReadMaxBytes(BarMaxBytes)) {
 		plan.fallback = CallerFallback::Large;
 		return plan;
 	}
@@ -3721,6 +3928,254 @@ void BufferCache::BarBatchRead(const uint8_t* mapped, uint64_t base,
 	ReportBarBatch();
 }
 
+// ---- KYTY_PERF_BAR_GPU_COPY (cache/barGpuCopy.h) ----------------------------------------------------------------------
+// The spans of a host-mapped download (BarBatchRead's, same gap rule) are copied by the GPU into a host-cached staging
+// buffer on a second queue of the universal family. The submission waits for the master timeline at the download's
+// write tick (already reached: TryBarDownload waited for it), which orders the copy after those writes and makes them
+// visible to it; no later GPU work writes these bytes (no newer granule tick, nothing in the open command buffer or
+// obtained but not recorded), so the copy reads what the mapping would. The GPU thread waits for the copy's fence and
+// publishes the intervals from the staging copy exactly as BarBatchRead does. KYTY_PERF_BAR_GPU_COPY_VERIFY=1
+// (diagnostic): every copy is also read from the mapping and compared (PERF bar_gpu_copy verify/mismatched).
+namespace {
+
+vk::Queue g_bar_copy_queue  = nullptr; // set once at device creation, before any GPU work
+uint32_t  g_bar_copy_family = 0;
+
+// A read window of KYTY_PERF_BAR_GPU_LARGE spans at most 8 MiB plus the access and page rounding.
+constexpr uint64_t BarGpuLargeMaxBytes    = uint64_t {8} << 20u;
+constexpr uint64_t BarGpuCopyStagingBytes = uint64_t {16} << 20u;
+
+// The switch's start value: the smallest download (GPU-written bytes, KiB) the GPU copies; 0 off.
+uint32_t BarGpuCopyFixed() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_PERF_BAR_GPU_COPY");
+		const auto  kb   = text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
+		const auto  v    = static_cast<uint32_t>(std::min<unsigned long>(kb, 1024ul));
+		if (v != 0) std::fprintf(stderr, "PERF_BAR_GPU_COPY host-mapped downloads of %u KiB and more are copied by the GPU\n", v);
+		return v;
+	}();
+	return value;
+}
+
+uint32_t BarGpuLargeFixed() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_PERF_BAR_GPU_LARGE");
+		const bool  on   = text != nullptr && text[0] == '1';
+		if (on) std::fprintf(stderr, "PERF_BAR_GPU_LARGE finished read windows of up to 8 MiB are copied by the GPU\n");
+		return on ? 1u : 0u;
+	}();
+	return value;
+}
+
+bool BarGpuCopyVerify() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_PERF_BAR_GPU_COPY_VERIFY");
+		const bool  set   = value != nullptr && value[0] == '1';
+		if (set) std::fprintf(stderr, "PERF_BAR_GPU_COPY_VERIFY: every GPU copy is compared with the mapping\n");
+		return set;
+	}();
+	return on;
+}
+
+struct BarGpuCopier {
+	struct Span {
+		uint64_t start = 0, end = 0, staging = 0;
+	};
+	std::mutex                  mutex;
+	bool                        tried   = false;
+	bool                        ready   = false;
+	vk::CommandPool             pool    = nullptr;
+	vk::CommandBuffer           command = nullptr;
+	vk::Fence                   fence   = nullptr;
+	std::unique_ptr<Buffer>     staging;
+	std::vector<Span>           spans;
+	std::vector<uint32_t>       owner;
+	std::vector<vk::BufferCopy> regions;
+	std::vector<uint8_t>        verify;
+	// KYTY_TRACE_PERF: PERF bar_gpu_copy every ~5 s.
+	uint64_t reads = 0, bytes = 0, span_count = 0, record_ns = 0, wait_ns = 0, publish_ns = 0;
+	uint64_t fallback_size = 0, fallback_thread = 0, fallback_init = 0, verified = 0, mismatched = 0;
+	int64_t  window_start = 0;
+};
+
+BarGpuCopier& Copier() {
+	static auto* copier = new BarGpuCopier; // lives for the process
+	return *copier;
+}
+
+// The caller holds the copier's mutex.
+void ReportBarGpuCopyLocked(BarGpuCopier& c) {
+	if (!PerfEnabled()) return;
+	const int64_t now =
+	    std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+	if (c.window_start == 0) c.window_start = now;
+	if (now - c.window_start < 5000) return;
+	c.window_start = now;
+	const auto ull = [](uint64_t value) { return static_cast<unsigned long long>(value); };
+	const auto ms  = [](uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+	std::fprintf(stderr,
+	             "PERF bar_gpu_copy reads=%llu kb=%llu spans=%llu record_ms=%.1f wait_ms=%.1f publish_ms=%.1f "
+	             "fallbacks(size,thread,init)=%llu,%llu,%llu verified=%llu mismatched=%llu (per ~5 s)\n",
+	             ull(c.reads), ull(c.bytes >> 10u), ull(c.span_count), ms(c.record_ns), ms(c.wait_ns), ms(c.publish_ns),
+	             ull(c.fallback_size), ull(c.fallback_thread), ull(c.fallback_init), ull(c.verified), ull(c.mismatched));
+	c.reads = c.bytes = c.span_count = c.record_ns = c.wait_ns = c.publish_ns = 0;
+	c.fallback_size = c.fallback_thread = c.fallback_init = c.verified = c.mismatched = 0;
+}
+
+// TryBarDownload, after its waits: the GPU copy and the publish of `intervals` of `buffer` (at guest address `base`);
+// false when the copy cannot be made (the caller then reads the mapping, as without the switch).
+bool BarGpuRead(GraphicContext& graphics, CommandScheduler& scheduler, Buffer& buffer, uint64_t base,
+                const std::vector<std::pair<uint64_t, uint64_t>>& intervals, uint64_t newest) {
+	auto&            c = Copier();
+	std::scoped_lock lock(c.mutex);
+	if (!GuestGpu::IsGpuThread()) {
+		c.fallback_thread++;
+		return false;
+	}
+	if (!c.tried) {
+		c.tried = true;
+		if (g_bar_copy_queue) {
+			vk::CommandPoolCreateInfo pool_info {};
+			pool_info.flags            = vk::CommandPoolCreateFlagBits::eResetCommandBuffer;
+			pool_info.queueFamilyIndex = g_bar_copy_family;
+			RequireVulkanSuccess(graphics.device.createCommandPool(&pool_info, nullptr, &c.pool), "create BAR copy pool");
+			vk::CommandBufferAllocateInfo allocate {};
+			allocate.commandPool        = c.pool;
+			allocate.level              = vk::CommandBufferLevel::ePrimary;
+			allocate.commandBufferCount = 1;
+			RequireVulkanSuccess(graphics.device.allocateCommandBuffers(&allocate, &c.command),
+			                     "allocate BAR copy command buffer");
+			vk::FenceCreateInfo fence_info {};
+			RequireVulkanSuccess(graphics.device.createFence(&fence_info, nullptr, &c.fence), "create BAR copy fence");
+			c.staging = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0,
+			                                     vk::BufferUsageFlagBits::eTransferDst, BarGpuCopyStagingBytes);
+			c.ready   = c.staging->Mapped().size() >= BarGpuCopyStagingBytes;
+		}
+		std::fprintf(stderr, "PERF_BAR_GPU_COPY ready=%d queue=%d staging_coherent=%d\n", c.ready ? 1 : 0,
+		             g_bar_copy_queue ? 1 : 0, c.staging && c.staging->IsCoherent() ? 1 : 0);
+	}
+	if (!c.ready) {
+		c.fallback_init++;
+		ReportBarGpuCopyLocked(c);
+		return false;
+	}
+	c.spans.clear();
+	c.owner.clear();
+	c.regions.clear();
+	uint64_t total = 0, bytes = 0;
+	for (const auto& [start, end]: intervals) {
+		bytes += end - start;
+		if (!c.spans.empty() && start >= c.spans.back().end && start - c.spans.back().end <= BarBatchGap) {
+			total += end - c.spans.back().end;
+			c.spans.back().end = end;
+		} else {
+			c.spans.push_back({start, end, total});
+			total += end - start;
+		}
+		c.owner.push_back(static_cast<uint32_t>(c.spans.size() - 1u));
+	}
+	if (total == 0 || total > BarGpuCopyStagingBytes) {
+		c.fallback_size++;
+		ReportBarGpuCopyLocked(c);
+		return false;
+	}
+	const auto start_time = std::chrono::steady_clock::now();
+	for (const auto& span: c.spans) c.regions.push_back({span.start - base, span.staging, span.end - span.start});
+	vk::CommandBufferBeginInfo begin {};
+	begin.flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit;
+	RequireVulkanSuccess(c.command.begin(&begin), "begin BAR copy");
+	c.command.copyBuffer(buffer.Handle(), c.staging->Handle(), static_cast<uint32_t>(c.regions.size()), c.regions.data());
+	vk::MemoryBarrier host {};
+	host.srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	host.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	c.command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer, vk::PipelineStageFlagBits::eHost, {}, 1, &host, 0,
+	                          nullptr, 0, nullptr);
+	RequireVulkanSuccess(c.command.end(), "end BAR copy");
+	const vk::Semaphore             master = scheduler.GetMasterSemaphore().Handle();
+	const vk::PipelineStageFlags    stage  = vk::PipelineStageFlagBits::eTransfer;
+	vk::TimelineSemaphoreSubmitInfo timeline {};
+	timeline.waitSemaphoreValueCount = 1;
+	timeline.pWaitSemaphoreValues    = &newest;
+	vk::SubmitInfo submit {};
+	submit.pNext              = &timeline;
+	submit.waitSemaphoreCount = 1;
+	submit.pWaitSemaphores    = &master;
+	submit.pWaitDstStageMask  = &stage;
+	submit.commandBufferCount = 1;
+	submit.pCommandBuffers    = &c.command;
+	RequireVulkanSuccess(g_bar_copy_queue.submit(1, &submit, c.fence), "submit BAR copy");
+	const auto submitted = std::chrono::steady_clock::now();
+	RequireVulkanSuccess(graphics.device.waitForFences(1, &c.fence, VK_TRUE, UINT64_MAX), "wait for BAR copy");
+	RequireVulkanSuccess(graphics.device.resetFences(1, &c.fence), "reset BAR copy fence");
+	const auto copied = std::chrono::steady_clock::now();
+	if (!c.staging->IsCoherent()) c.staging->Invalidate(0, total);
+	const uint8_t* staged = c.staging->Mapped().data();
+	if (BarGpuCopyVerify()) {
+		if (c.verify.size() < total) c.verify.resize(total);
+		bool same = true;
+		for (const auto& span: c.spans) {
+			CopyFromWriteCombined(c.verify.data() + span.staging, buffer.Mapped().data() + (span.start - base),
+			                      span.end - span.start);
+		}
+		// Only the published intervals count (gap bytes are dropped in both paths).
+		for (size_t i = 0; i < intervals.size(); i++) {
+			const auto [start, end] = intervals[i];
+			const auto&    span     = c.spans[c.owner[i]];
+			const uint64_t offset   = span.staging + (start - span.start);
+			if (std::memcmp(staged + offset, c.verify.data() + offset, end - start) != 0) same = false;
+		}
+		c.verified++;
+		if (!same && c.mismatched++ < 16u) {
+			std::fprintf(stderr, "PERF_BAR_GPU_COPY_MISMATCH base=0x%llx first=0x%llx intervals=%zu bytes=%llu\n",
+			             static_cast<unsigned long long>(base), static_cast<unsigned long long>(intervals.front().first),
+			             intervals.size(), static_cast<unsigned long long>(bytes));
+		}
+	}
+	for (size_t i = 0; i < intervals.size(); i++) {
+		const auto [start, end] = intervals[i];
+		const auto&    span     = c.spans[c.owner[i]];
+		const uint8_t* data     = staged + span.staging + (start - span.start);
+		SyncTimeline::NoteDownload(start, data, end - start);
+		Libs::LibKernel::Memory::WriteBacking(start, data, end - start);
+	}
+	const auto done = std::chrono::steady_clock::now();
+	const auto ns   = [](auto a, auto b) {
+        return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+	};
+	c.reads++;
+	c.bytes += bytes;
+	c.span_count += c.spans.size();
+	c.record_ns += ns(start_time, submitted);
+	c.wait_ns += ns(submitted, copied);
+	c.publish_ns += ns(copied, done);
+	ReportBarGpuCopyLocked(c);
+	return true;
+}
+
+uint64_t BarReadMaxBytes(uint64_t bar_max) {
+	if (!g_bar_copy_queue || Common::LiveAb::Gate(Common::LiveAb::Switch::BarGpuLarge, BarGpuLargeFixed()) == 0) {
+		return bar_max;
+	}
+	return BarGpuLargeMaxBytes;
+}
+
+} // namespace
+
+namespace BarGpuCopy {
+
+bool WantQueue() {
+	return Common::LiveAb::Possible(Common::LiveAb::Switch::BarGpuCopy, BarGpuCopyFixed()) ||
+	       Common::LiveAb::Possible(Common::LiveAb::Switch::BarGpuLarge, BarGpuLargeFixed());
+}
+
+void SetQueue(vk::Queue queue, uint32_t family) {
+	g_bar_copy_queue  = queue;
+	g_bar_copy_family = family;
+	std::fprintf(stderr, "PERF_BAR_GPU_COPY second queue %s (family %u)\n", queue ? "created" : "missing", family);
+}
+
+} // namespace BarGpuCopy
+
 // The read window, unless the host mapping cannot serve it at once (more than BarMaxBytes GPU-dirty, or written by work
 // not finished) while the pages of the access can: then those pages, so the read waits for their writes only and not
 // for the whole queue (frame timeline 2.11: a 4-byte SRT read at the start of a frame took a 1.36 MB window and waited
@@ -3739,7 +4194,7 @@ std::pair<uint64_t, uint64_t> BufferCache::ReadRange(Buffer& buffer, uint64_t va
 		std::vector<std::pair<uint64_t, uint64_t>> intervals;
 		uint64_t                                   newest = 0, total = 0;
 		if (ScanBarDownload(buffer, a, b - a, intervals, newest, total) >= 0) return false;
-		return total <= BarMaxBytes && std::max(newest, ready->second) < m_scheduler.CurrentTick();
+		return total <= BarReadMaxBytes(BarMaxBytes) && std::max(newest, ready->second) < m_scheduler.CurrentTick();
 	};
 	if (servable(lo, hi)) return {lo, hi};
 	const uint64_t p_lo = std::max(start, vaddr & ~0xfffull);
@@ -3749,13 +4204,14 @@ std::pair<uint64_t, uint64_t> BufferCache::ReadRange(Buffer& buffer, uint64_t va
 
 int BufferCache::TryBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	// Larger reads copy faster through the GPU into cached host memory than from the BAR mapping.
-	const uint64_t MaxBytes = BarMaxBytes;
+	const uint64_t MaxBytes = BarReadMaxBytes(BarMaxBytes); // KYTY_PERF_BAR_GPU_LARGE: up to 8 MiB
 	// Outcomes: 0 read from the mapping, 1 unknown write tick, 2 written by the open command buffer,
 	// 3 write not recorded yet, 4 too large, 5 outside the buffer, 6 nothing GPU-written.
 	static std::array<uint64_t, 7> outcomes {};
 	static uint64_t                calls = 0;
 	const auto                     outcome = [&](size_t index) {
         outcomes[index]++;
+        if (index != 0 && BarCensusEnabled()) BarCensusDecline(index); // KYTY_TRACE_BAR_CENSUS
         DownloadWaitTrace::g_last_bar_reason = static_cast<int>(index);
         if ((++calls & 0xfffu) == 0 && Common::EnvRead::PerfLines()) {
             std::fprintf(stderr,
@@ -3795,8 +4251,11 @@ int BufferCache::TryBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	// Every command buffer ends with a device-to-host memory barrier (CommandScheduler::Submit), so
 	// the writes are visible to the host once their command buffer finished.
 	SyncTimeline::SiteScope timeline_site(SyncTimeline::Site::Bar); // KYTY_TRACE_SYNC_TIMELINE
+	const bool census     = BarCensusEnabled(); // KYTY_TRACE_BAR_CENSUS: the wait and the read, timed
+	const auto wait_start = census ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	m_scheduler.Wait(newest);
 	m_scheduler.WaitPriorityOperations(newest);
+	const auto read_start = census ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point {};
 	KYTY_PROFILER_BLOCK("Download::BarCopy");
 	if (!buffer.IsCoherent()) buffer.Invalidate(0, buffer.Size());
 	const auto* mapped = buffer.Mapped().data();
@@ -3812,7 +4271,25 @@ int BufferCache::TryBarDownload(Buffer& buffer, uint64_t vaddr, uint64_t size) {
 	// Streaming loads (VMOVNTDQA) fetch a whole 64-byte line per transaction and several lines can be in flight. The bytes
 	// go to a host staging copy first, so the slow PCIe reads do not run under the address-space mutex (WriteBacking) and
 	// the merge copies do not read the BAR a second time.
-	BarBatchRead(mapped, base, intervals);
+	// KYTY_PERF_BAR_GPU_COPY (live A/B switch): a large enough download is copied by the GPU instead (barGpuCopy.h).
+	// KYTY_PERF_BAR_GPU_LARGE: a download above the old 1 MiB limit is always copied by the GPU.
+	const uint32_t gpu_copy_kb = Common::LiveAb::Gate(Common::LiveAb::Switch::BarGpuCopy, BarGpuCopyFixed());
+	const bool     gpu_copy    = (gpu_copy_kb != 0 && total >= (uint64_t {gpu_copy_kb} << 10u)) || total > BarMaxBytes;
+	if (!gpu_copy || !BarGpuRead(m_graphics, m_scheduler, buffer, base, intervals, newest)) {
+		BarBatchRead(mapped, base, intervals);
+	}
+	if (census) {
+		const auto     done  = std::chrono::steady_clock::now();
+		const auto     ns    = [](auto a, auto b) {
+            return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(b - a).count());
+		};
+		uint64_t spans = 0, end = 0;
+		for (const auto& [start, finish]: intervals) {
+			if (spans == 0 || start < end || start - end > BarBatchGap) spans++;
+			end = finish;
+		}
+		BarCensusBar(base, buffer.Size(), intervals, spans, ns(read_start, done), ns(wait_start, read_start));
+	}
 	return outcome(0);
 }
 
