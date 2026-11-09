@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/DirectHeap.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "RuntimeAbi.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -192,10 +193,60 @@ DirectHeap& DirectHeapFor(const Context& context) {
 }
 
 
+namespace {
+
+// A slot lookup's result, reused while nothing it depends on can have moved: the same collect
+// epoch (no ordering point where the CPU could have written guest memory), proof serial and pending
+// storage serial, the same rule as ShaderResources::Revalidate's epoch proof. Per worker thread,
+// since collect epochs are per thread. APS5_DIRECT_NO_SLOT_MEMO=1 looks every slot up.
+struct SlotMemoKey {
+    std::uint32_t kind = 0;
+    std::uint32_t flags = 0;
+    std::array<std::uint32_t, 8> words{};
+    bool operator<(const SlotMemoKey& other) const { return std::tie(kind, flags, words) < std::tie(other.kind, other.flags, other.words); }
+};
+
+struct SlotMemoValue {
+    std::weak_ptr<Texture> texture;
+    std::weak_ptr<StorageTexture> storage;
+    std::uint32_t slot = DirectHeap::NoSlot;
+};
+
+struct SlotMemo {
+    std::uint64_t epoch = 0;
+    std::uint64_t proof = 0;
+    std::uint64_t pending = 0;
+    std::map<SlotMemoKey, SlotMemoValue> entries;
+    std::uint64_t hits = 0;
+    std::uint64_t misses = 0;
+};
+
+bool SlotMemoEnabled() {
+    static const bool enabled = std::getenv("APS5_DIRECT_NO_SLOT_MEMO") == nullptr;
+    return enabled;
+}
+
+SlotMemo& ThreadSlotMemo() {
+    thread_local SlotMemo memo;
+    if (!SlotMemoEnabled()) return memo;
+    const auto epoch = GuestMemory::CollectEpoch();
+    const auto proof = GuestMemory::ProofSerial();
+    const auto pending = StorageTexture::PendingSerial();
+    if (epoch == 0 || epoch != memo.epoch || proof != memo.proof || pending != memo.pending) {
+        memo.entries.clear();
+        memo.epoch = epoch;
+        memo.proof = proof;
+        memo.pending = pending;
+    }
+    return memo;
+}
+
+}
+
 bool ResolveDirectStages(const Context& context, std::span<const CompiledShader> shaders, std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>>& patched, std::vector<CompiledShader>& out, std::vector<std::shared_ptr<StorageTexture>>* written) {
     if (std::ranges::none_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->directSlotRequests.empty(); })) return false;
     struct Totals {
-        std::uint64_t stages = 0, images = 0, missing = 0, samplers = 0, full = 0;
+        std::uint64_t stages = 0, images = 0, missing = 0, samplers = 0, full = 0, memoHits = 0;
         double us = 0;
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
     };
@@ -206,6 +257,8 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
     auto* recorder = Recorder::Active();
     if (recorder != nullptr && recorder->Device() != context.device) recorder = nullptr;
     std::uint64_t images = 0, missing = 0, samplers = 0, full = 0;
+    auto& memo = ThreadSlotMemo();
+    const auto memoHitsBefore = memo.hits;
     out.assign(shaders.begin(), shaders.end());
     for (auto& shader : out) {
         const auto* program = shader.program;
@@ -226,6 +279,31 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
             const bool shape2D = kind >= DirectHeap::FirstImageKind && (kind - DirectHeap::FirstImageKind) % 7u == 2u;
             const bool comparison = kind >= 22u && kind <= 28u;
             bool firstLayer = false;
+            // Written storage lookups have side effects (depth plane flushes, retiring covered
+            // depth surfaces), so only read-only images and samplers come from the memo.
+            const bool memoizable = SlotMemoEnabled() && (flags & DirectSlotRequest::Sampler) == 0u && (flags & DirectSlotRequest::Written) == 0u;
+            SlotMemoKey memoKey;
+            if (memoizable) {
+                memoKey.kind = kind;
+                memoKey.flags = flags;
+                std::copy(words.begin(), words.end(), memoKey.words.begin());
+                if (const auto found = memo.entries.find(memoKey); found != memo.entries.end()) {
+                    auto texture = found->second.texture.lock();
+                    auto storage = found->second.storage.lock();
+                    if ((texture != nullptr && !texture->Released()) || storage != nullptr) {
+                        ++images;
+                        ++memo.hits;
+                        if (recorder != nullptr) {
+                            if (texture != nullptr) recorder->Keep(texture);
+                            else recorder->Keep(storage);
+                        }
+                        slots[index] = found->second.slot;
+                        continue;
+                    }
+                    memo.entries.erase(found);
+                }
+                ++memo.misses;
+            }
             if ((flags & DirectSlotRequest::Storage) != 0u) {
                 ++images;
                 const bool writes = (flags & DirectSlotRequest::Written) != 0u;
@@ -244,6 +322,7 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
                 slot = heap.ImageSlot(kind, view, VK_IMAGE_LAYOUT_GENERAL, storage);
                 if (recorder != nullptr) recorder->Keep(storage);
                 if (writes && written != nullptr) written->push_back(storage);
+                if (memoizable && slot != DirectHeap::NoSlot) memo.entries[memoKey] = {{}, storage, slot};
             } else if ((flags & DirectSlotRequest::Sampler) != 0u) {
                 ++samplers;
                 if (context.samplerCache == nullptr) continue;
@@ -265,6 +344,7 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
                 const auto view = firstLayer && texture->FirstLayerView() != VK_NULL_HANDLE ? texture->FirstLayerView() : texture->View();
                 slot = heap.ImageSlot(kind, view, texture->Layout(), texture);
                 if (recorder != nullptr) recorder->Keep(texture);
+                if (memoizable && slot != DirectHeap::NoSlot) memo.entries[memoKey] = {texture, {}, slot};
             }
             if (slot == DirectHeap::NoSlot) {
                 ++full;
@@ -294,10 +374,11 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
     totals.missing += missing;
     totals.samplers += samplers;
     totals.full += full;
+    totals.memoHits += memo.hits - memoHitsBefore;
     totals.us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
     const auto now = std::chrono::steady_clock::now();
     if (now - totals.last >= std::chrono::seconds(10)) {
-        std::fprintf(stderr, "[direct-resolve] 10 s: %llu draws, avg %.2f us; images %llu (%llu missing), samplers %llu, heap full %llu; heap writes %llu, recycled %llu\n", static_cast<unsigned long long>(totals.stages), totals.stages != 0 ? totals.us / static_cast<double>(totals.stages) : 0.0, static_cast<unsigned long long>(totals.images), static_cast<unsigned long long>(totals.missing), static_cast<unsigned long long>(totals.samplers), static_cast<unsigned long long>(totals.full), static_cast<unsigned long long>(heap.Writes()), static_cast<unsigned long long>(heap.Recycled()));
+        std::fprintf(stderr, "[direct-resolve] 10 s: %llu draws, avg %.2f us; images %llu (%llu missing, %llu from the slot memo), samplers %llu, heap full %llu; heap writes %llu, recycled %llu\n", static_cast<unsigned long long>(totals.stages), totals.stages != 0 ? totals.us / static_cast<double>(totals.stages) : 0.0, static_cast<unsigned long long>(totals.images), static_cast<unsigned long long>(totals.missing), static_cast<unsigned long long>(totals.memoHits), static_cast<unsigned long long>(totals.samplers), static_cast<unsigned long long>(totals.full), static_cast<unsigned long long>(heap.Writes()), static_cast<unsigned long long>(heap.Recycled()));
         totals = {};
         totals.last = now;
     }
