@@ -23,7 +23,7 @@ bool DrawRecipeRecord::Expired() const {
 }
 
 bool Driver::drawEntries() {
-    static const bool entries = std::getenv("APS5_NO_DRAW_SRT_ENTRIES") == nullptr && !stampValidate();
+    static const bool entries = std::getenv("APS5_NO_DRAW_SRT_ENTRIES") == nullptr && std::getenv("APS5_DIRECT_DRAW") == nullptr && !stampValidate();
     return entries;
 }
 

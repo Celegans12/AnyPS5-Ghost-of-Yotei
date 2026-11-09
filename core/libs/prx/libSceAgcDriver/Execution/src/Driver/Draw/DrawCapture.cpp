@@ -13,6 +13,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include <chrono>
+#include <deque>
+#include <optional>
 #include <cstdio>
 #include <map>
 #include <mutex>
@@ -44,6 +46,123 @@ bool directEvalRead(void*, std::uint64_t address, std::uint32_t* value) {
 
 bool directEvalAccessible(void*, std::uint64_t address, std::uint64_t bytes) {
     return GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes), false);
+}
+
+struct DirectStage {
+    std::shared_ptr<const ShaderRecompiler::ResourceCapture> capture;
+    std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
+};
+
+std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::RecompileRequest& request, VulkanDevice* device) {
+    struct Totals {
+        std::uint64_t direct = 0, noHeap = 0;
+        std::map<std::string, std::uint64_t> fallbacks;
+        std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+        double us = 0;
+    };
+    static std::mutex mutex;
+    static Totals totals;
+    static std::map<std::pair<std::uint64_t, int>, std::shared_ptr<const ShaderRecompiler::SourceHandle>> handles;
+    static std::deque<std::pair<std::chrono::steady_clock::time_point, std::vector<std::shared_ptr<void>>>> kept;
+    const auto started = std::chrono::steady_clock::now();
+    const auto report = [&](const char* fallback) {
+        std::lock_guard lock(mutex);
+        if (fallback != nullptr) ++totals.fallbacks[fallback];
+        totals.us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+        const auto now = std::chrono::steady_clock::now();
+        while (!kept.empty() && now - kept.front().first > std::chrono::seconds(2)) kept.pop_front();
+        if (now - totals.last < std::chrono::seconds(10)) return;
+        const auto calls = totals.direct + totals.noHeap;
+        std::string line = "[direct-draw] 10 s: " + std::to_string(totals.direct) + " direct stages with heap slots, " + std::to_string(totals.noHeap) + " direct without, avg " + std::to_string(calls != 0 ? totals.us / static_cast<double>(calls) : 0.0) + " us; fallbacks:";
+        for (const auto& [text, count] : totals.fallbacks) line += " [" + std::to_string(count) + "x] " + text + ";";
+        std::fprintf(stderr, "%s\n", line.c_str());
+        totals = {};
+        totals.last = now;
+    };
+    if (device == nullptr) {
+        report("no device");
+        return std::nullopt;
+    }
+    auto direct = request;
+    direct.target.directResources = true;
+    const auto key = std::pair{request.shader.codeAddress, static_cast<int>(request.shader.stage)};
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    {
+        std::lock_guard lock(mutex);
+        if (const auto found = handles.find(key); found != handles.end()) handle = found->second;
+    }
+    try {
+        if (handle == nullptr) {
+            handle = ShaderRecompiler::PrepareShader(direct, nullptr);
+            std::lock_guard lock(mutex);
+            handles[key] = handle;
+        }
+        ShaderRecompiler::SrtRuntime runtime;
+        runtime.userData = request.context.userData;
+        runtime.shaderBase = request.shader.codeAddress;
+        runtime.readMemory = &directEvalRead;
+        runtime.readSpecializationMemory = &directEvalRead;
+        runtime.accessible = &directEvalAccessible;
+        auto capture = ShaderRecompiler::CaptureResources(direct, runtime, *handle);
+        if (!capture->snapshot.tables.tables.empty()) {
+            report("image tables");
+            return std::nullopt;
+        }
+        auto base = ShaderRecompiler::MaterializeShader(direct, *capture, *handle);
+        if (base->directSlotCount == 0u) {
+            {
+                std::lock_guard lock(mutex);
+                ++totals.noHeap;
+            }
+            report(nullptr);
+            return DirectStage{std::move(capture), std::move(base)};
+        }
+        std::vector<std::uint32_t> slots;
+        std::vector<std::shared_ptr<void>> keep;
+        DirectSlotStatistics statistics;
+        std::string reason;
+        bool filled = false;
+        {
+            const auto context = device->graphicsContext();
+            std::lock_guard gpu(GuestMemory::GpuMutex());
+            filled = FillDirectSlots(context, handle->artifact->info, capture->snapshot, slots, keep, statistics, reason);
+        }
+        if (!filled) {
+            static std::string lastReason;
+            lastReason = reason.substr(0, 80);
+            report(lastReason.c_str());
+            return std::nullopt;
+        }
+        auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*base);
+        bool written = false;
+        for (auto& binding : patched->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::ShaderData) continue;
+            if (binding.guestDescriptor.size() < patched->directSlotDword + slots.size()) binding.guestDescriptor.resize(patched->directSlotDword + slots.size(), 0u);
+            std::copy(slots.begin(), slots.end(), binding.guestDescriptor.begin() + patched->directSlotDword);
+            written = true;
+        }
+        if (!written) {
+            const auto bytes = (static_cast<std::size_t>(patched->directSlotDword) + slots.size()) * sizeof(std::uint32_t);
+            if (patched->pushConstants.size() < bytes) {
+                report("slot words outside the push data");
+                return std::nullopt;
+            }
+            std::memcpy(patched->pushConstants.data() + static_cast<std::size_t>(patched->directSlotDword) * sizeof(std::uint32_t), slots.data(), slots.size() * sizeof(std::uint32_t));
+        }
+        {
+            std::lock_guard lock(mutex);
+            ++totals.direct;
+            kept.emplace_back(std::chrono::steady_clock::now(), std::move(keep));
+        }
+        report(nullptr);
+        return DirectStage{std::move(capture), std::move(patched)};
+    } catch (const std::exception& error) {
+        static thread_local std::string lastError;
+        lastError = std::string("exception: ") + error.what();
+        if (lastError.size() > 100) lastError.resize(100);
+        report(lastError.c_str());
+        return std::nullopt;
+    }
 }
 
 void probeDirectEvaluation(const ShaderRecompiler::RecompileRequest& request, VulkanDevice* device) {
@@ -294,6 +413,21 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }
     static const bool directEvalProbe = std::getenv("APS5_DIRECT_EVAL_PROBE") != nullptr;
     if (directEvalProbe) probeDirectEvaluation(request, localDevice.get());
+    static const bool directDraw = std::getenv("APS5_DIRECT_DRAW") != nullptr;
+    const bool plainDraw = !graphics.rectList && !graphics.stages.tessellation && !graphics.stages.mesh && (program.binary.stage == Stage::Vertex || program.binary.stage == Stage::Fragment);
+    if (directDraw && plainDraw) {
+        if (auto direct = materializeDirectStage(request, localDevice.get())) {
+            auto& stageCapture = stageCaptures[i];
+            stageCapture.forgetSerial = GuestMemory::ForgetSerial();
+            stageCapture.pushOffset = pushOffset;
+            stageCapture.capture = direct->capture;
+            stageCapture.compiled = direct->result;
+            stageCapture.userDataMask = ~std::uint64_t{0};
+            stageCapture.registeredViews = std::make_shared<const std::vector<ShaderRecompiler::RegisteredImageView>>();
+            recompiled[i] = true;
+            return stageCapture.compiled;
+        }
+    }
     const auto waitedBefore = traceCapSync() || profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     auto invocation = [&] {
         try {
