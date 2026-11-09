@@ -360,6 +360,9 @@ struct SpirvTarget {
     bool float64DenormPreserve = false;
     bool registrationModules = false;
     bool directResources = false;
+    // With directResources: still fold immediate-offset SRT reads into FlattenedSrt slots the CPU
+    // fills per use, instead of reading every one through BDA at run time.
+    bool directFoldSrt = false;
     std::uint32_t registrationWordLimit = 200000u;
     bool vertexSubgroups = true;
     bool tessellationEvaluationSubgroups = true;

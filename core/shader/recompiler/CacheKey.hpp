@@ -369,6 +369,7 @@ private:
         append(key, value.depthRangeRemap);
         append(key, value.registrationModules);
         append(key, value.directResources);
+        append(key, value.directFoldSrt);
         append(key, value.registrationWordLimit);
         append(key, value.vertexSubgroups);
         append(key, value.tessellationEvaluationSubgroups);

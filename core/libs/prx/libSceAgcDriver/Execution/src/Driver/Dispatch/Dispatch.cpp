@@ -56,6 +56,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> DirectDispatchHandle(const
     }
     auto direct = request;
     direct.target.directResources = true;
+    direct.target.directFoldSrt = DirectFoldSrt();
     std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
     const char* refusal = nullptr;
     try {
@@ -269,7 +270,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         {0, 0, 0, threadGroup != std::array<std::uint32_t, 3>{} ? 0u : 128u}
     };
     const auto directHandle = DirectDispatchEnabled() ? DirectDispatchHandle(request) : nullptr;
-    if (directHandle != nullptr) request.target.directResources = true;
+    if (directHandle != nullptr) {
+        request.target.directResources = true;
+        request.target.directFoldSrt = DirectFoldSrt();
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static std::atomic<double> captureMs{0}, keyMs{0}, recompileMs{0}, deviceMs{0};
     static std::atomic<std::uint64_t> cacheHits{0};

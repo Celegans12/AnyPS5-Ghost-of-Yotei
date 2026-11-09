@@ -5,6 +5,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <exception>
 
 namespace AgcDriver::DriverDetail {
@@ -22,6 +23,11 @@ void pushRequest(std::vector<std::uint32_t>& requests, std::uint32_t kind, std::
     requests.insert(requests.end(), words.begin(), words.end());
 }
 
+}
+
+bool DirectFoldSrt() {
+    static const bool enabled = std::getenv("APS5_DIRECT_NO_FOLD_SRT") == nullptr;
+    return enabled;
 }
 
 bool BuildDirectSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, const ShaderRecompiler::ResourceSnapshot& snapshot, std::vector<std::uint32_t>& requests, DirectSlotStatistics& statistics, std::string& reason, bool allowStorage) {

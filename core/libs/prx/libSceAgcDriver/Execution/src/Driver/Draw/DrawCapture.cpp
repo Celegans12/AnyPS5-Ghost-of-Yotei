@@ -85,6 +85,7 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
     }
     auto direct = request;
     direct.target.directResources = true;
+    direct.target.directFoldSrt = DirectFoldSrt();
     const auto key = std::pair{request.shader.codeAddress, static_cast<int>(request.shader.stage)};
     std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
     {

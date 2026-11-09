@@ -91,6 +91,7 @@ extern char** environ;
 #include <cstdlib>
 #include <ctime>
 #include <mutex>
+#include <set>
 #include <SDL_loadso.h>
 #include <SDL_error.h>
 #include <spirv/unified1/spirv.hpp>
@@ -6256,6 +6257,20 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         const auto started = std::chrono::steady_clock::now();
         if (Graphics::ResolveDirectStages(directContext, stage, patched, resolved, &written) && !patched.empty()) {
             const auto resolvedAt = std::chrono::steady_clock::now();
+            // Debug aid: APS5_DIRECT_DUMP_SPIRV=<dir> writes each direct compute program's SPIR-V once.
+            if (static const char* dumpDir = std::getenv("APS5_DIRECT_DUMP_SPIRV"); dumpDir != nullptr) {
+                static std::mutex dumpMutex;
+                static std::set<std::uint64_t> dumped;
+                std::lock_guard dumpLock(dumpMutex);
+                if (dumped.insert(programAddress).second) {
+                    char path[512];
+                    std::snprintf(path, sizeof(path), "%s/direct_%llx.spv", dumpDir, static_cast<unsigned long long>(programAddress));
+                    if (FILE* file = std::fopen(path, "wb")) {
+                        std::fwrite(patched.front()->spirv.data(), sizeof(std::uint32_t), patched.front()->spirv.size(), file);
+                        std::fclose(file);
+                    }
+                }
+            }
             // No recipe: a replay would reuse this call's slot words and skip the storage marking below.
             static const bool keepRecipe = std::getenv("APS5_DIRECT_KEEP_RECIPE") != nullptr;
             if (recipeOut != nullptr) *recipeOut = nullptr;
