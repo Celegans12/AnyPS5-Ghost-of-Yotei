@@ -1820,6 +1820,10 @@ void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte>
     labelTableOwner->recordedLabels.store(recorded.size(), std::memory_order_relaxed);
 }
 
+bool Recorder::QueuedLabelOverlapsHere(std::uint64_t address, std::size_t bytes) {
+    return !QueuedLabelRanges().empty() && QueuedLabelOverlaps(address, bytes);
+}
+
 void Recorder::ForgetQueuedLabels() {
     if (QueuedLabelRanges().empty()) return;
     auto ranges = std::move(QueuedLabelRanges());

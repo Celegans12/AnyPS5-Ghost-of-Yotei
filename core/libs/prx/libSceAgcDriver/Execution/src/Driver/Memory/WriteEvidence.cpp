@@ -220,8 +220,21 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
     return validateSkipVerify() ? Policy::VerifyRaw : Policy::Raw;
 }
 
+namespace {
+
+// A range over one of this worker's queued labels: the flush hook records the group and syncs on it
+// before the access, so the capture treats it as a pending write (a page holding it is read word by
+// word, and only the label's own words wait). APS5_NO_QUEUED_LABEL_PENDING=1 turns this off.
+bool QueuedLabelPending(std::uint64_t address, std::size_t bytes) {
+    static const bool enabled = std::getenv("APS5_NO_QUEUED_LABEL_PENDING") == nullptr;
+    return enabled && Graphics::Recorder::QueuedLabelOverlapsHere(address, bytes);
+}
+
+}
+
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     using Policy = ShaderMemory::PendingWrite;
+    if (QueuedLabelPending(address, bytes)) return Policy::Sync;
     auto queued = DrawPipeline::QueuedWrite::None;
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
@@ -241,6 +254,7 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
 }
 
 ShaderMemory::PendingWrite Driver::QueryPendingSpan(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
+    if (QueuedLabelPending(address, bytes)) return ShaderMemory::PendingWrite::Sync;
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
         if (pipeline.Busy() && pipeline.Overlaps(address, bytes)) return ShaderMemory::PendingWrite::Sync;
