@@ -25,6 +25,12 @@ std::uint32_t sampledSlotsFor(const Context& context) {
     return limit == 0u ? DirectHeap::SampledSlots : std::min(DirectHeap::SampledSlots, limit / kinds);
 }
 
+std::uint32_t storageSlotsFor(const Context& context) {
+    const auto kinds = DirectHeap::LastStorageKind - DirectHeap::LastSampledKind;
+    const auto limit = context.descriptorIndexingLimits.maxDescriptorSetUpdateAfterBindStorageImages;
+    return limit == 0u ? DirectHeap::StorageSlots : std::min(DirectHeap::StorageSlots, limit / kinds);
+}
+
 std::uint32_t samplerSlotsFor(const Context& context) {
     const auto limit = context.descriptorIndexingLimits.maxDescriptorSetUpdateAfterBindSamplers;
     return limit == 0u ? DirectHeap::SamplerSlots : std::min(DirectHeap::SamplerSlots, limit);
@@ -36,7 +42,7 @@ bool DirectHeap::Supported(const Context& context) {
     return context.descriptorIndexing && context.runtimeDescriptorArray && context.partiallyBound && context.sampledImageUpdateAfterBind;
 }
 
-DirectHeap::DirectHeap(const Context& context) : context(context), kinds(LastSampledKind + 1u) {
+DirectHeap::DirectHeap(const Context& context) : context(context), kinds(LastStorageKind + 1u) {
     if (!Supported(context)) throw std::runtime_error("direct heap: the device lacks update-after-bind descriptor indexing");
     const auto sampledSlots = sampledSlotsFor(context);
     const auto samplerSlots = samplerSlotsFor(context);
@@ -45,6 +51,12 @@ DirectHeap::DirectHeap(const Context& context) : context(context), kinds(LastSam
     std::vector<VkDescriptorBindingFlags> flags;
     for (auto kind = FirstImageKind; kind <= LastSampledKind; ++kind) {
         bindings.push_back({ShaderRecompiler::RuntimeAbi::DirectHeapBindingBase + kind, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampledSlots, stages, nullptr});
+        flags.push_back(VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT);
+    }
+    storage = context.storageImageUpdateAfterBind;
+    const auto storageSlots = storage ? storageSlotsFor(context) : 0u;
+    for (auto kind = LastSampledKind + 1u; storage && kind <= LastStorageKind; ++kind) {
+        bindings.push_back({ShaderRecompiler::RuntimeAbi::DirectHeapBindingBase + kind, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storageSlots, stages, nullptr});
         flags.push_back(VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT);
     }
     bindings.push_back({ShaderRecompiler::RuntimeAbi::DirectHeapBindingBase + SamplerKind, VK_DESCRIPTOR_TYPE_SAMPLER, samplerSlots, stages, nullptr});
@@ -57,7 +69,8 @@ DirectHeap::DirectHeap(const Context& context) : context(context), kinds(LastSam
     layoutInfo.bindingCount = static_cast<std::uint32_t>(bindings.size());
     layoutInfo.pBindings = bindings.data();
     Check(context.Function<PFN_vkCreateDescriptorSetLayout>("vkCreateDescriptorSetLayout")(context.device, &layoutInfo, nullptr, &layout), "vkCreateDescriptorSetLayout direct heap");
-    const std::array<VkDescriptorPoolSize, 2> sizes{{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampledSlots * (LastSampledKind - FirstImageKind + 1u)}, {VK_DESCRIPTOR_TYPE_SAMPLER, samplerSlots}}};
+    std::vector<VkDescriptorPoolSize> sizes{{VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampledSlots * (LastSampledKind - FirstImageKind + 1u)}, {VK_DESCRIPTOR_TYPE_SAMPLER, samplerSlots}};
+    if (storage) sizes.push_back({VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, storageSlots * (LastStorageKind - LastSampledKind)});
     VkDescriptorPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolInfo.flags = VK_DESCRIPTOR_POOL_CREATE_UPDATE_AFTER_BIND_BIT;
     poolInfo.maxSets = 1u;
@@ -94,7 +107,8 @@ DirectHeap::~DirectHeap() {
 }
 
 std::uint32_t DirectHeap::ImageSlot(std::uint32_t kind, VkImageView view, VkImageLayout imageLayout, std::shared_ptr<void> keep) {
-    if (kind < FirstImageKind || kind > LastSampledKind || view == VK_NULL_HANDLE) return NoSlot;
+    const bool storageKind = kind > LastSampledKind;
+    if (kind < FirstImageKind || kind > LastStorageKind || (storageKind && !storage) || view == VK_NULL_HANDLE) return NoSlot;
     std::lock_guard lock(mutex);
     auto& entry = kinds[kind];
     std::uint32_t slot = NoSlot;
@@ -104,7 +118,7 @@ std::uint32_t DirectHeap::ImageSlot(std::uint32_t kind, VkImageView view, VkImag
         entry.slots.erase(found);
         ++recycled;
     }
-    if (slot == NoSlot && entry.free.empty() && entry.next >= sampledSlotsFor(context)) {
+    if (slot == NoSlot && entry.free.empty() && entry.next >= (storageKind ? storageSlotsFor(context) : sampledSlotsFor(context))) {
         for (auto it = entry.slots.begin(); it != entry.slots.end();) {
             if (it->second.owner.expired()) {
                 entry.free.push_back(it->second.index);
@@ -120,7 +134,7 @@ std::uint32_t DirectHeap::ImageSlot(std::uint32_t kind, VkImageView view, VkImag
         ++recycled;
     }
     if (slot == NoSlot) {
-        if (entry.next >= sampledSlotsFor(context)) return NoSlot;
+        if (entry.next >= (storageKind ? storageSlotsFor(context) : sampledSlotsFor(context))) return NoSlot;
         slot = entry.next++;
     }
     const VkDescriptorImageInfo info{VK_NULL_HANDLE, view, imageLayout};
@@ -129,7 +143,7 @@ std::uint32_t DirectHeap::ImageSlot(std::uint32_t kind, VkImageView view, VkImag
     write.dstBinding = ShaderRecompiler::RuntimeAbi::DirectHeapBindingBase + kind;
     write.dstArrayElement = slot;
     write.descriptorCount = 1u;
-    write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+    write.descriptorType = storageKind ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
     write.pImageInfo = &info;
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, 1u, &write, 0, nullptr);
     ++writes;
@@ -178,7 +192,7 @@ DirectHeap& DirectHeapFor(const Context& context) {
 }
 
 
-bool ResolveDirectStages(const Context& context, std::span<const CompiledShader> shaders, std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>>& patched, std::vector<CompiledShader>& out) {
+bool ResolveDirectStages(const Context& context, std::span<const CompiledShader> shaders, std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>>& patched, std::vector<CompiledShader>& out, std::vector<std::shared_ptr<StorageTexture>>* written) {
     if (std::ranges::none_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->directSlotRequests.empty(); })) return false;
     struct Totals {
         std::uint64_t stages = 0, images = 0, missing = 0, samplers = 0, full = 0;
@@ -207,7 +221,30 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
             const std::span<const std::uint32_t> words(request + 2, 8u);
             if ((flags & DirectSlotRequest::Inactive) != 0u) continue;
             std::uint32_t slot = DirectHeap::NoSlot;
-            if ((flags & DirectSlotRequest::Sampler) != 0u) {
+            // Image kinds come in groups of seven shapes (1D, 1D array, 2D, 2D array, MSAA, MSAA
+            // array, 3D) from kind 1; kinds 22..28 are the depth-comparison group.
+            const bool shape2D = kind >= DirectHeap::FirstImageKind && (kind - DirectHeap::FirstImageKind) % 7u == 2u;
+            const bool comparison = kind >= 22u && kind <= 28u;
+            bool firstLayer = false;
+            if ((flags & DirectSlotRequest::Storage) != 0u) {
+                ++images;
+                const bool writes = (flags & DirectSlotRequest::Written) != 0u;
+                std::uint32_t level = 0;
+                std::shared_ptr<StorageTexture> storage;
+                try {
+                    storage = DirectStorageTexture(context, words, flags >> DirectSlotRequest::MipShift, writes, level, shape2D, firstLayer);
+                } catch (const std::exception&) {
+                    storage = nullptr;
+                }
+                if (storage == nullptr) {
+                    ++missing;
+                    continue;
+                }
+                const auto view = (flags & DirectSlotRequest::Atomic64) != 0u ? storage->Atomic64View(level, firstLayer) : (flags & DirectSlotRequest::Atomic) != 0u ? storage->AtomicView(level, firstLayer) : storage->StorageView(level, firstLayer, (flags & DirectSlotRequest::UintView) != 0u);
+                slot = heap.ImageSlot(kind, view, VK_IMAGE_LAYOUT_GENERAL, storage);
+                if (recorder != nullptr) recorder->Keep(storage);
+                if (writes && written != nullptr) written->push_back(storage);
+            } else if ((flags & DirectSlotRequest::Sampler) != 0u) {
                 ++samplers;
                 if (context.samplerCache == nullptr) continue;
                 auto sampler = context.samplerCache->Get(context, words.first(4u), false, false, true, false);
@@ -217,7 +254,7 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
                 ++images;
                 std::shared_ptr<Texture> texture;
                 try {
-                    texture = DirectSampledTexture(context, words);
+                    texture = DirectSampledTexture(context, words, shape2D, comparison, firstLayer);
                 } catch (const std::exception&) {
                     texture = nullptr;
                 }
@@ -225,7 +262,8 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
                     ++missing;
                     continue;
                 }
-                slot = heap.ImageSlot(kind, texture->View(), texture->Layout(), texture);
+                const auto view = firstLayer && texture->FirstLayerView() != VK_NULL_HANDLE ? texture->FirstLayerView() : texture->View();
+                slot = heap.ImageSlot(kind, view, texture->Layout(), texture);
                 if (recorder != nullptr) recorder->Keep(texture);
             }
             if (slot == DirectHeap::NoSlot) {

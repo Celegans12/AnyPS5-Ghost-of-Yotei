@@ -24,7 +24,7 @@ void pushRequest(std::vector<std::uint32_t>& requests, std::uint32_t kind, std::
 
 }
 
-bool BuildDirectSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, const ShaderRecompiler::ResourceSnapshot& snapshot, std::vector<std::uint32_t>& requests, DirectSlotStatistics& statistics, std::string& reason) {
+bool BuildDirectSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, const ShaderRecompiler::ResourceSnapshot& snapshot, std::vector<std::uint32_t>& requests, DirectSlotStatistics& statistics, std::string& reason, bool allowStorage) {
     using Kind = ShaderRecompiler::DescriptorBindingKind;
     using Request = Graphics::DirectSlotRequest;
     const auto& info = compiled.info;
@@ -39,10 +39,13 @@ bool BuildDirectSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compile
         const bool imageHeap = ShaderRecompiler::ImageBindingResourceClass(binding.kind) != ShaderRecompiler::ImageResourceClass::None;
         if (!samplerHeap && !imageHeap) continue;
         const auto kind = static_cast<std::uint32_t>(binding.kind);
-        if (imageHeap && kind > Graphics::DirectHeap::LastSampledKind) {
+        const bool storageHeap = imageHeap && kind > Graphics::DirectHeap::LastSampledKind;
+        if (storageHeap && !allowStorage) {
             reason = "storage image kind";
             return false;
         }
+        std::uint32_t previousResource = 0xffffffffu;
+        std::uint32_t mipOffset = 0;
         for (std::size_t element = 0; element < binding.resources.size(); ++element) {
             ++slots;
             const auto resource = binding.resources[element];
@@ -89,6 +92,20 @@ bool BuildDirectSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compile
                 continue;
             }
             words = descriptor;
+            if (storageHeap) {
+                mipOffset = resource == previousResource ? mipOffset + 1u : 0u;
+                previousResource = resource;
+                const auto& image = info.images[resource];
+                const auto baseLevel = (words[3] >> 12u) & 0xfu;
+                std::uint32_t flags = Request::Storage;
+                if (image.written || image.atomic || image.atomic64) flags |= Request::Written;
+                if (image.atomic64) flags |= Request::Atomic64;
+                else if (image.atomic) flags |= Request::Atomic;
+                if (ShaderRecompiler::RuntimeAbi::UintStorageImageBinding(kind)) flags |= Request::UintView;
+                flags |= (baseLevel + (image.mipMode == ShaderRecompiler::ImageMipMode::DynamicStorage ? mipOffset : 0u)) << Request::MipShift;
+                pushRequest(requests, kind, flags, words);
+                continue;
+            }
             if (modes[mode].conversionFormat != ShaderRecompiler::IrBufferFormat::Invalid || modes[mode].depthBits) words[3] = (words[3] & ~0xfffu) | ShaderRecompiler::ShaderImageIdentitySwizzle;
             pushRequest(requests, kind, 0u, words);
         }

@@ -609,6 +609,7 @@ struct VulkanDevice::State {
     bool descriptorIndexing = false;
     bool storageBufferUpdateAfterBind = false;
     bool sampledImageUpdateAfterBind = false;
+    bool storageImageUpdateAfterBind = false;
     bool descriptorBindingPartiallyBound = false;
     bool descriptorBindingVariableDescriptorCount = false;
     bool runtimeDescriptorArray = false;
@@ -2241,6 +2242,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         state->descriptorIndexing = descriptorIndexingFeatures.shaderSampledImageArrayNonUniformIndexing == VK_TRUE && descriptorIndexingFeatures.shaderStorageImageArrayNonUniformIndexing == VK_TRUE;
         state->storageBufferUpdateAfterBind = descriptorIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind == VK_TRUE;
         state->sampledImageUpdateAfterBind = descriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind == VK_TRUE;
+        state->storageImageUpdateAfterBind = descriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind == VK_TRUE;
         state->descriptorBindingPartiallyBound = descriptorIndexingFeatures.descriptorBindingPartiallyBound == VK_TRUE;
         state->descriptorBindingVariableDescriptorCount = descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount == VK_TRUE;
         state->runtimeDescriptorArray = descriptorIndexingFeatures.runtimeDescriptorArray == VK_TRUE;
@@ -2261,6 +2263,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     }
     descriptorIndexingFeatures.descriptorBindingStorageBufferUpdateAfterBind = state->storageBufferUpdateAfterBind ? VK_TRUE : VK_FALSE;
     descriptorIndexingFeatures.descriptorBindingSampledImageUpdateAfterBind = state->sampledImageUpdateAfterBind ? VK_TRUE : VK_FALSE;
+    descriptorIndexingFeatures.descriptorBindingStorageImageUpdateAfterBind = state->storageImageUpdateAfterBind ? VK_TRUE : VK_FALSE;
     descriptorIndexingFeatures.descriptorBindingPartiallyBound = state->descriptorBindingPartiallyBound ? VK_TRUE : VK_FALSE;
     descriptorIndexingFeatures.descriptorBindingVariableDescriptorCount = state->descriptorBindingVariableDescriptorCount ? VK_TRUE : VK_FALSE;
     descriptorIndexingFeatures.runtimeDescriptorArray = state->runtimeDescriptorArray ? VK_TRUE : VK_FALSE;
@@ -4862,6 +4865,7 @@ Graphics::Context VulkanDevice::buildContext() const {
     context.partiallyBound = state->descriptorBindingPartiallyBound;
     context.variableDescriptorCount = state->descriptorBindingVariableDescriptorCount;
     context.sampledImageUpdateAfterBind = state->sampledImageUpdateAfterBind;
+    context.storageImageUpdateAfterBind = state->storageImageUpdateAfterBind;
     context.imageTableCapacity = ImageTableCapacity(context);
     context.samplerTableCapacity = SamplerTableCapacity(context);
     context.imageTableUpdateAfterBind = ImageTableUpdateAfterBind(context);
@@ -6247,7 +6251,22 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         const std::array<Graphics::CompiledShader, 1> stage{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0, registeredImageViews}}};
         std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>> patched;
         std::vector<Graphics::CompiledShader> resolved;
-        if (Graphics::ResolveDirectStages(graphicsContext(), stage, patched, resolved) && !patched.empty()) return dispatch(*patched.front(), x, y, z, arguments, snapshots, programAddress, nullptr, recipeOut, threadGroup, htileClear, registeredImageViews);
+        std::vector<std::shared_ptr<Graphics::StorageTexture>> written;
+        const auto directContext = graphicsContext();
+        const auto started = std::chrono::steady_clock::now();
+        if (Graphics::ResolveDirectStages(directContext, stage, patched, resolved, &written) && !patched.empty()) {
+            const auto resolvedAt = std::chrono::steady_clock::now();
+            // No recipe: a replay would reuse this call's slot words and skip the storage marking below.
+            static const bool keepRecipe = std::getenv("APS5_DIRECT_KEEP_RECIPE") != nullptr;
+            if (recipeOut != nullptr) *recipeOut = nullptr;
+            const auto outcome = dispatch(*patched.front(), x, y, z, arguments, snapshots, programAddress, nullptr, keepRecipe ? recipeOut : nullptr, threadGroup, htileClear, registeredImageViews);
+            const auto dispatchedAt = std::chrono::steady_clock::now();
+            Graphics::MarkDirectStorageWrites(directContext, written);
+            const auto markedAt = std::chrono::steady_clock::now();
+            const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+            if (ms(started, markedAt) > 20.0) std::fprintf(stderr, "[direct-dispatch] slow dispatch 0x%llx: resolve %.1f ms, dispatch %.1f ms, mark %.1f ms, written %zu\n", static_cast<unsigned long long>(programAddress), ms(started, resolvedAt), ms(resolvedAt, dispatchedAt), ms(dispatchedAt, markedAt), written.size());
+            return outcome;
+        }
     }
     startJournalReplay();
     for (const auto& binding : shader.bindings) {

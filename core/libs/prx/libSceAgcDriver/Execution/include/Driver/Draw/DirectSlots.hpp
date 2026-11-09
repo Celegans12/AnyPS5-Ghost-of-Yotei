@@ -17,7 +17,7 @@ struct DirectSlotStatistics {
 
 // One request per image and sampler element of a direct stage, in the order the shader reads its
 // slot words: Graphics::ResolveDirectStages turns them into heap slots at record time.
-bool BuildDirectSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, const ShaderRecompiler::ResourceSnapshot& snapshot, std::vector<std::uint32_t>& requests, DirectSlotStatistics& statistics, std::string& reason);
+bool BuildDirectSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compiled, const ShaderRecompiler::ResourceSnapshot& snapshot, std::vector<std::uint32_t>& requests, DirectSlotStatistics& statistics, std::string& reason, bool allowStorage = false);
 
 }
 

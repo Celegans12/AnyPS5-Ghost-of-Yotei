@@ -63,8 +63,16 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> DirectDispatchHandle(const
         const auto& info = handle->artifact->info.info;
         for (const auto& image : info.images) {
             if (image.table != ShaderRecompiler::NoTable) refusal = "image table";
-            else if (image.resourceClass == ShaderRecompiler::ImageResourceClass::Storage) refusal = "storage image";
+            else if (image.resourceClass == ShaderRecompiler::ImageResourceClass::Storage && image.packed) refusal = "packed storage image";
+            else if (image.resourceClass == ShaderRecompiler::ImageResourceClass::Storage && (image.written || image.atomic) && std::getenv("APS5_DIRECT_NO_STORAGE_WRITE") != nullptr) refusal = "written storage image (bisect)";
+            else if (image.resourceClass == ShaderRecompiler::ImageResourceClass::Storage && std::getenv("APS5_DIRECT_NO_STORAGE") != nullptr) refusal = "storage image (bisect)";
         }
+        // Bisect aid: APS5_DIRECT_DISPATCH_MAX=N takes only the first N eligible shaders direct.
+        static const std::uint64_t maxEligible = [] {
+            const char* text = std::getenv("APS5_DIRECT_DISPATCH_MAX");
+            return text != nullptr ? std::strtoull(text, nullptr, 10) : ~0ull;
+        }();
+        if (refusal == nullptr && eligibleCount.load() >= maxEligible) refusal = "over APS5_DIRECT_DISPATCH_MAX";
         for (const auto& sampler : info.samplers) {
             if (sampler.table != ShaderRecompiler::NoTable) refusal = "sampler table";
         }
@@ -72,6 +80,14 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> DirectDispatchHandle(const
         refusal = "direct form failed";
     }
     if (refusal != nullptr) handle = nullptr;
+    if (handle != nullptr && std::getenv("APS5_DIRECT_DISPATCH_VERBOSE") != nullptr) {
+        // One line per image: class, access, dimension, mip mode, format, and how the V# is reached.
+        const auto& info = handle->artifact->info.info;
+        for (const auto& image : info.images) {
+            std::fprintf(stderr, "[direct-dispatch]   image %s r=%d w=%d atomic=%d dim=%d mip=%d mips=%u packed=%d source=%u\n", image.resourceClass == ShaderRecompiler::ImageResourceClass::Storage ? "storage" : "sampled", image.read, image.written, image.atomic, static_cast<int>(image.dimension), static_cast<int>(image.mipMode), image.mipCount, image.packed, image.source);
+        }
+        std::fprintf(stderr, "[direct-dispatch]   buffers=%zu samplers=%zu\n", info.buffers.size(), info.samplers.size());
+    }
     ++(handle != nullptr ? eligibleCount : refusedCount);
     std::fprintf(stderr, "[direct-dispatch] shader 0x%llx %s%s (%llu eligible, %llu refused)\n", static_cast<unsigned long long>(request.shader.codeAddress), handle != nullptr ? "direct" : "existing path: ", refusal != nullptr ? refusal : "", static_cast<unsigned long long>(eligibleCount.load()), static_cast<unsigned long long>(refusedCount.load()));
     std::lock_guard lock(mutex);
@@ -288,7 +304,9 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         explicit ProbeScope(bool active) : active(active) { if (active) ShaderRecompiler::SetDebugProbeActive(true); }
         ~ProbeScope() { if (active) ShaderRecompiler::SetDebugProbeActive(false); }
     } probeScope{probeThis};
-    const bool noDispatchCache = noDispatchCacheEnv || probeThis;
+    // A direct dispatch resolves its slots at record time; a cached entry or recipe would replay them stale.
+    static const bool directCache = std::getenv("APS5_DIRECT_DISPATCH_CACHE") != nullptr;
+    const bool noDispatchCache = noDispatchCacheEnv || probeThis || (directHandle != nullptr && !directCache);
     std::uint64_t key = 0xcbf29ce484222325ull;
     const auto mix = [&](std::uint64_t value) {
         key ^= value;
@@ -475,7 +493,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
                 std::vector<std::uint32_t> requests;
                 DirectSlotStatistics statistics;
                 std::string reason;
-                if (!BuildDirectSlotRequests(directHandle->artifact->info, capture->snapshot, requests, statistics, reason)) throw std::runtime_error("direct dispatch slots: " + reason);
+                if (!BuildDirectSlotRequests(directHandle->artifact->info, capture->snapshot, requests, statistics, reason, true)) throw std::runtime_error("direct dispatch slots: " + reason);
                 auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*compiledResult);
                 patched->directSlotRequests = std::move(requests);
                 compiledResult = std::move(patched);

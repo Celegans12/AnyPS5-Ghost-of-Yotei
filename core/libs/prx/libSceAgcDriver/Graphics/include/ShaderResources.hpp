@@ -76,7 +76,10 @@ TextureCacheUse TextureCacheUsage();
 void OverrideCacheBudgetForTest(std::uint64_t bytes);
 std::uint64_t SampledTextureCacheBudget(const Context& context);
 std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words, VkImageViewType multisampleViewType = VK_IMAGE_VIEW_TYPE_2D);
-std::shared_ptr<Texture> DirectSampledTexture(const Context& context, std::span<const std::uint32_t> words);
+// The direct path's lookups. shape2D: the shader's image is 2D (heap kind); firstLayer is set when
+// the surface is an array and the view must be its first layer, as the bound path decides.
+std::shared_ptr<Texture> DirectSampledTexture(const Context& context, std::span<const std::uint32_t> words, bool shape2D, bool comparison, bool& firstLayer);
+std::shared_ptr<StorageTexture> DirectStorageTexture(const Context& context, std::span<const std::uint32_t> words, std::uint32_t mip, bool written, std::uint32_t& level, bool shape2D, bool& firstLayer);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
 bool AnyPendingCpuWrites(const Context& context);
 bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);

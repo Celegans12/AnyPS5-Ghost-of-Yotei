@@ -16,6 +16,8 @@ class DirectHeap {
 public:
     static constexpr std::uint32_t FirstImageKind = 1u;
     static constexpr std::uint32_t LastSampledKind = 28u;
+    static constexpr std::uint32_t LastStorageKind = 56u;
+    static constexpr std::uint32_t StorageSlots = 1024u;
     static constexpr std::uint32_t SamplerKind = 57u;
     static constexpr std::uint32_t SampledSlots = 8192u;
     static constexpr std::uint32_t SamplerSlots = 4096u;
@@ -31,6 +33,7 @@ public:
     VkDescriptorSet Set() const { return set; }
     std::uint32_t ImageSlot(std::uint32_t kind, VkImageView view, VkImageLayout imageLayout, std::shared_ptr<void> keep);
     std::uint32_t SamplerSlot(VkSampler sampler, std::shared_ptr<void> keep);
+    bool StorageSupported() const { return storage; }
     std::uint64_t Writes() const { return writes; }
     std::uint64_t Recycled() const { return recycled; }
 
@@ -55,6 +58,7 @@ private:
     std::uint32_t nextSampler = 2u;
     std::uint64_t writes = 0;
     std::uint64_t recycled = 0;
+    bool storage = false;
 };
 
 DirectHeap& DirectHeapFor(const Context& context);
@@ -64,9 +68,19 @@ struct DirectSlotRequest {
     static constexpr std::uint32_t Sampler = 1u;
     static constexpr std::uint32_t Point = 2u;
     static constexpr std::uint32_t Inactive = 4u;
+    static constexpr std::uint32_t Storage = 8u;
+    static constexpr std::uint32_t Written = 16u;
+    static constexpr std::uint32_t Atomic = 32u;
+    static constexpr std::uint32_t Atomic64 = 64u;
+    static constexpr std::uint32_t FirstLayer = 128u;
+    static constexpr std::uint32_t UintView = 256u;
+    static constexpr std::uint32_t MipShift = 16u;
 };
 
-bool ResolveDirectStages(const Context& context, std::span<const CompiledShader> shaders, std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>>& patched, std::vector<CompiledShader>& out);
+class StorageTexture;
+
+bool ResolveDirectStages(const Context& context, std::span<const CompiledShader> shaders, std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>>& patched, std::vector<CompiledShader>& out, std::vector<std::shared_ptr<StorageTexture>>* written = nullptr);
+void MarkDirectStorageWrites(const Context& context, std::span<const std::shared_ptr<StorageTexture>> written);
 
 }
 

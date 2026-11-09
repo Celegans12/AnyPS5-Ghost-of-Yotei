@@ -1699,10 +1699,34 @@ std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<
     return cachedTexture(context, words, resource, ViewComponents(resource), 0, false, multisampleViewType);
 }
 
-std::shared_ptr<Texture> DirectSampledTexture(const Context& context, std::span<const std::uint32_t> words) {
+std::shared_ptr<StorageTexture> DirectStorageTexture(const Context& context, std::span<const std::uint32_t> words, std::uint32_t mip, bool written, std::uint32_t& level, bool shape2D, bool& firstLayer) {
     if (IsNullSampledTextureResource(words)) return nullptr;
     const auto resource = DecodeTextureResource(words);
     if (resource.dimension == TextureDimension::k2DMsaa) return nullptr;
+    // As the bound path: a 2D image over a 2D array surface addresses its first layer.
+    firstLayer = shape2D && resource.dimension == TextureDimension::k2DArray;
+    const auto guestBytes = DescribeSurface(resource).guestBytes;
+    CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
+    if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
+    level = std::min(mip, resource.mipCount != 0u ? resource.mipCount - 1u : 0u);
+    return cachedStorageTexture(context, words, resource, level, guestBytes, written);
+}
+
+void MarkDirectStorageWrites(const Context& context, std::span<const std::shared_ptr<StorageTexture>> written) {
+    // As ShaderResources::WriteBack: GPU image writes invalidate every captured proof.
+    if (std::ranges::any_of(written, [](const auto& texture) { return texture != nullptr; }) && std::getenv("APS5_DIRECT_NO_BREAK_PROOFS") == nullptr) GuestMemory::BreakProofs();
+    for (const auto& texture : written) {
+        if (texture == nullptr) continue;
+        texture->MarkDirty();
+        static_cast<void>(DepthSurfaceStoreBack(context, *texture));
+    }
+}
+
+std::shared_ptr<Texture> DirectSampledTexture(const Context& context, std::span<const std::uint32_t> words, bool shape2D, bool comparison, bool& firstLayer) {
+    if (IsNullSampledTextureResource(words)) return nullptr;
+    const auto resource = DecodeTextureResource(words);
+    if (resource.dimension == TextureDimension::k2DMsaa) return nullptr;
+    firstLayer = shape2D && (resource.dimension == TextureDimension::k2DArray || (comparison && resource.dimension == TextureDimension::k1DArray));
     const auto components = ViewComponents(resource);
     const auto guestBytes = DescribeSurface(resource).guestBytes;
     CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
