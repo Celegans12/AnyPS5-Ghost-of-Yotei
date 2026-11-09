@@ -579,7 +579,18 @@ void DefineDescriptors(SpirvEmitterState& state) {
                     if ((ImageBindingResourceClass(kind) == ImageResourceClass::Storage) != (binding.kind == DescriptorBindingKind::ImageStorageTable)) continue;
                     if (std::any_of(state.tableImageVariables.begin(), state.tableImageVariables.end(), [&](const SpirvTableImageVariable& variable) { return variable.kind == kind; })) continue;
                     const auto name = "table_images_" + std::to_string(static_cast<std::uint32_t>(kind));
-                    state.tableImageVariables.push_back({kind, Define(state.module.Type(spv::OpTypeRuntimeArray, ImageType(state, mode)), name.c_str(), spv::StorageClassUniformConstant)});
+                    std::uint32_t variable = 0;
+                    if (!direct) {
+                        variable = Define(state.module.Type(spv::OpTypeRuntimeArray, ImageType(state, mode)), name.c_str(), spv::StorageClassUniformConstant);
+                    } else {
+                        // Direct form: a table element is a slot of the global heap of its kind (the
+                        // driver writes heap slots into the map's records and a zero element base).
+                        variable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassUniformConstant, state.module.Type(spv::OpTypeRuntimeArray, ImageType(state, mode))), spv::StorageClassUniformConstant);
+                        state.module.AddName(variable, name.c_str());
+                        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, RuntimeAbi::DirectHeapSet);
+                        state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, RuntimeAbi::DirectHeapBindingBase + static_cast<std::uint32_t>(kind));
+                    }
+                    state.tableImageVariables.push_back({kind, variable});
                     if (mode.dimension == RdnaImageDimension::Dim1D || mode.dimension == RdnaImageDimension::Dim1DArray) state.module.EmitCapability(binding.kind == DescriptorBindingKind::ImageStorageTable ? spv::CapabilityImage1D : spv::CapabilitySampled1D);
                 }
             }

@@ -2588,8 +2588,12 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
             Require(table.mapAllocation != std::numeric_limits<std::size_t>::max(), "an image table stage has no map");
             const auto& map = table.map;
             Require(map.size() >= ShaderRecompiler::ImageTableAbi::HeaderWords, "image table map is truncated");
-            const auto elements = table.images != nullptr ? table.images->count : 0u;
+            // A direct stage reads its elements from the global heap (no image table binding): the
+            // map then holds the element count and a slot array at ElementBase.
+            const bool direct = table.images == nullptr && map[ShaderRecompiler::ImageTableAbi::HeaderElementBase] != 0u;
+            const auto elements = table.images != nullptr ? table.images->count : direct ? map[ShaderRecompiler::ImageTableAbi::HeaderElementCount] : 0u;
             Require(map[ShaderRecompiler::ImageTableAbi::HeaderElementCount] == elements, "image table map disagrees with its image binding");
+            Require(!direct || static_cast<std::uint64_t>(map[ShaderRecompiler::ImageTableAbi::HeaderElementBase]) + elements <= map.size(), "direct image table map has no slot array");
             const auto faults = map[ShaderRecompiler::ImageTableAbi::HeaderElementFaults];
             const auto samplerFaults = map[ShaderRecompiler::ImageTableAbi::HeaderSamplerFaults];
             Require(static_cast<std::uint64_t>(faults) + elements <= map.size() && static_cast<std::uint64_t>(samplerFaults) + map[ShaderRecompiler::ImageTableAbi::HeaderSamplerCount] / 4u <= map.size(), "image table map is truncated");

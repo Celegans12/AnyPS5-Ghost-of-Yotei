@@ -19,7 +19,7 @@ public:
     static constexpr std::uint32_t LastStorageKind = 56u;
     static constexpr std::uint32_t StorageSlots = 1024u;
     static constexpr std::uint32_t SamplerKind = 57u;
-    static constexpr std::uint32_t SampledSlots = 8192u;
+    static constexpr std::uint32_t SampledSlots = 32768u;
     static constexpr std::uint32_t SamplerSlots = 4096u;
     static constexpr std::uint32_t NoSlot = 0xffffffffu;
 

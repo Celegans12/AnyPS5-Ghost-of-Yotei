@@ -11,6 +11,7 @@
 #include <limits>
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "CompiledVariant.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectSlots.hpp"
@@ -239,11 +240,30 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
                     table = {};
                 }
             }
-            report("image tables");
-            return std::nullopt;
+            // APS5_DIRECT_TABLES=1 takes table stages direct: their elements become heap slots at
+            // record time (ResolveDirectStages); without it they keep the existing path.
+            static const bool directTables = std::getenv("APS5_DIRECT_TABLES") != nullptr;
+            if (!directTables || !capture->snapshot.tables.nested.empty()) {
+                report(directTables ? "nested image tables" : "image tables");
+                return std::nullopt;
+            }
         }
         auto base = ShaderRecompiler::MaterializeShader(direct, *capture, *handle);
-        if (base->directSlotCount == 0u) {
+        if (!capture->snapshot.tables.tables.empty()) {
+            const auto& info = handle->artifact->info.info;
+            auto withTables = std::make_shared<ShaderRecompiler::RecompileResult>(*base);
+            withTables->directTables = ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, capture->snapshot, handle->artifact->artifact.variantId);
+            if (std::ranges::any_of(withTables->directTables->elements, [](const ShaderRecompiler::ImageTableElement& element) { return ShaderRecompiler::ImageBindingResourceClass(element.kind) != ShaderRecompiler::ImageResourceClass::Sampled; })) {
+                report("storage image table");
+                return std::nullopt;
+            }
+            withTables->directSamplerTables.assign(capture->snapshot.tables.tables.size(), 0u);
+            for (const auto& sampler : info.samplers) {
+                if (sampler.table != ShaderRecompiler::NoTable && sampler.table < withTables->directSamplerTables.size()) withTables->directSamplerTables[sampler.table] = 1u;
+            }
+            base = std::move(withTables);
+        }
+        if (base->directSlotCount == 0u && base->directTables == nullptr) {
             {
                 std::lock_guard lock(mutex);
                 ++totals.noHeap;
@@ -254,7 +274,7 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
         std::vector<std::uint32_t> requests;
         DirectSlotStatistics statistics;
         std::string reason;
-        if (!BuildDirectSlotRequests(handle->artifact->info, capture->snapshot, requests, statistics, reason)) {
+        if (base->directSlotCount != 0u && !BuildDirectSlotRequests(handle->artifact->info, capture->snapshot, requests, statistics, reason)) {
             static thread_local std::string lastReason;
             lastReason = reason.substr(0, 80);
             report(lastReason.c_str());

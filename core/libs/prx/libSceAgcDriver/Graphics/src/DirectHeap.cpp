@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "RuntimeAbi.hpp"
+#include "ImageTableAbi.hpp"
+#include "Optimization/ResourceMaterializer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -241,10 +243,122 @@ SlotMemo& ThreadSlotMemo() {
     return memo;
 }
 
+// A direct stage's image tables as heap data: the capture's map with every image record's element
+// rewritten to the heap slot of that element's texture. Built once per resolved table set (the
+// capture shares it while the table contents are unchanged) and reused while nothing the element
+// lookups depend on can have moved (the slot memo's rule). Per worker thread.
+struct TableMirror {
+    std::weak_ptr<const ShaderRecompiler::ResolvedImageTables> source;
+    std::vector<std::uint32_t> map;
+    std::shared_ptr<std::vector<std::shared_ptr<Texture>>> textures;
+    std::uint64_t epoch = 0, proof = 0, pending = 0;
+    std::uint32_t missing = 0;
+};
+
+struct TableMirrorTotals {
+    std::uint64_t builds = 0, reuses = 0, elements = 0, missing = 0;
+    double buildUs = 0;
+};
+
+TableMirrorTotals& tableMirrorTotals() {
+    thread_local TableMirrorTotals totals;
+    return totals;
+}
+
+const TableMirror* tableMirrorFor(const Context& context, DirectHeap& heap, const ShaderRecompiler::RecompileResult& program) {
+    namespace Abi = ShaderRecompiler::ImageTableAbi;
+    thread_local std::map<const ShaderRecompiler::ResolvedImageTables*, TableMirror> mirrors;
+    const auto& resolved = *program.directTables;
+    const auto epoch = GuestMemory::CollectEpoch();
+    const auto proof = GuestMemory::ProofSerial();
+    const auto pending = StorageTexture::PendingSerial();
+    auto& totals = tableMirrorTotals();
+    if (const auto found = mirrors.find(&resolved); found != mirrors.end()) {
+        auto& mirror = found->second;
+        // Table elements are guest textures: a CPU write to one is ordered by a collect epoch; a GPU
+        // write lands in the image a slot already views (storage-sourced textures). So the mirror
+        // stays valid for the epoch. APS5_DIRECT_TABLE_STRICT=1 also requires unchanged proof and
+        // pending serials, as the slot memo does.
+        static const bool strict = std::getenv("APS5_DIRECT_TABLE_STRICT") != nullptr;
+        if (mirror.source.lock().get() == &resolved && epoch != 0 && mirror.epoch == epoch && (!strict || (mirror.proof == proof && mirror.pending == pending))) {
+            ++totals.reuses;
+            return &mirror;
+        }
+        mirrors.erase(found);
+    }
+    for (auto it = mirrors.begin(); it != mirrors.end();) it = it->second.source.expired() ? mirrors.erase(it) : std::next(it);
+    const auto started = std::chrono::steady_clock::now();
+    TableMirror mirror;
+    mirror.source = program.directTables;
+    mirror.epoch = epoch;
+    mirror.proof = proof;
+    mirror.pending = pending;
+    std::vector<std::uint32_t> slots(resolved.elements.size(), 0u);
+    mirror.textures = std::make_shared<std::vector<std::shared_ptr<Texture>>>(resolved.elements.size());
+    // Elements shared between mirrors (every shader reading the same table) are looked up once per
+    // collect epoch.
+    struct ElementMemo {
+        std::uint64_t epoch = 0;
+        std::map<std::pair<std::uint32_t, std::array<std::uint32_t, 8>>, std::pair<std::shared_ptr<Texture>, std::uint32_t>> entries;
+    };
+    thread_local ElementMemo elementMemo;
+    if (elementMemo.epoch != epoch || epoch == 0) {
+        elementMemo.entries.clear();
+        elementMemo.epoch = epoch;
+    }
+    for (std::size_t index = 0; index < resolved.elements.size(); ++index) {
+        const auto& element = resolved.elements[index];
+        const auto kind = static_cast<std::uint32_t>(element.kind);
+        const auto memoKey = std::pair{kind, element.words};
+        if (const auto found = elementMemo.entries.find(memoKey); found != elementMemo.entries.end()) {
+            if (found->second.first == nullptr) {
+                ++mirror.missing;
+                continue;
+            }
+            slots[index] = found->second.second;
+            (*mirror.textures)[index] = found->second.first;
+            continue;
+        }
+        const bool shape2D = kind >= DirectHeap::FirstImageKind && (kind - DirectHeap::FirstImageKind) % 7u == 2u;
+        const bool comparison = kind >= 22u && kind <= 28u;
+        bool firstLayer = false;
+        std::shared_ptr<Texture> texture;
+        try {
+            texture = DirectSampledTexture(context, element.words, shape2D, comparison, firstLayer);
+        } catch (const std::exception&) {
+            texture = nullptr;
+        }
+        if (texture == nullptr) {
+            ++mirror.missing;
+            elementMemo.entries[memoKey] = {nullptr, 0u};
+            continue;
+        }
+        const auto view = firstLayer && texture->FirstLayerView() != VK_NULL_HANDLE ? texture->FirstLayerView() : texture->View();
+        const auto slot = heap.ImageSlot(kind, view, texture->Layout(), texture);
+        if (slot == DirectHeap::NoSlot) {
+            ++mirror.missing;
+            elementMemo.entries[memoKey] = {nullptr, 0u};
+            continue;
+        }
+        slots[index] = slot;
+        elementMemo.entries[memoKey] = {texture, slot};
+        (*mirror.textures)[index] = std::move(texture);
+    }
+    // The shader reads slot = map[map[ElementBase] + element] in the direct form.
+    mirror.map = resolved.map;
+    mirror.map[Abi::HeaderElementBase] = static_cast<std::uint32_t>(mirror.map.size());
+    mirror.map.insert(mirror.map.end(), slots.begin(), slots.end());
+    ++totals.builds;
+    totals.elements += resolved.elements.size();
+    totals.missing += mirror.missing;
+    totals.buildUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+    return &(mirrors[&resolved] = std::move(mirror));
+}
+
 }
 
 bool ResolveDirectStages(const Context& context, std::span<const CompiledShader> shaders, std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>>& patched, std::vector<CompiledShader>& out, std::vector<std::shared_ptr<StorageTexture>>* written) {
-    if (std::ranges::none_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->directSlotRequests.empty(); })) return false;
+    if (std::ranges::none_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && (!shader.program->directSlotRequests.empty() || shader.program->directTables != nullptr); })) return false;
     struct Totals {
         std::uint64_t stages = 0, images = 0, missing = 0, samplers = 0, full = 0, memoHits = 0;
         double us = 0;
@@ -262,8 +376,18 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
     out.assign(shaders.begin(), shaders.end());
     for (auto& shader : out) {
         const auto* program = shader.program;
-        if (program == nullptr || program->directSlotRequests.empty()) continue;
+        if (program == nullptr || (program->directSlotRequests.empty() && program->directTables == nullptr)) continue;
         auto copy = std::make_shared<ShaderRecompiler::RecompileResult>(*program);
+        if (program->directTables != nullptr) {
+            const auto* mirror = tableMirrorFor(context, heap, *program);
+            for (auto& binding : copy->bindings) {
+                if (binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap) binding.guestDescriptor = mirror->map;
+            }
+            std::erase_if(copy->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTable || binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable; });
+            if (recorder != nullptr) recorder->Keep(mirror->textures);
+            missing += mirror->missing;
+            copy->directTables = nullptr;
+        }
         const auto& requests = program->directSlotRequests;
         const auto count = requests.size() / DirectSlotRequest::Words;
         std::vector<std::uint32_t> slots(count, 0u);
@@ -379,6 +503,8 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
     const auto now = std::chrono::steady_clock::now();
     if (now - totals.last >= std::chrono::seconds(10)) {
         std::fprintf(stderr, "[direct-resolve] 10 s: %llu draws, avg %.2f us; images %llu (%llu missing, %llu from the slot memo), samplers %llu, heap full %llu; heap writes %llu, recycled %llu\n", static_cast<unsigned long long>(totals.stages), totals.stages != 0 ? totals.us / static_cast<double>(totals.stages) : 0.0, static_cast<unsigned long long>(totals.images), static_cast<unsigned long long>(totals.missing), static_cast<unsigned long long>(totals.memoHits), static_cast<unsigned long long>(totals.samplers), static_cast<unsigned long long>(totals.full), static_cast<unsigned long long>(heap.Writes()), static_cast<unsigned long long>(heap.Recycled()));
+        auto& mirrors = tableMirrorTotals();
+        if (mirrors.builds != 0 || mirrors.reuses != 0) std::fprintf(stderr, "[direct-tables] mirrors (this thread, cumulative): %llu builds avg %.1f us, %llu reuses; %.0f elements per build, %llu missing\n", static_cast<unsigned long long>(mirrors.builds), mirrors.builds != 0 ? mirrors.buildUs / static_cast<double>(mirrors.builds) : 0.0, static_cast<unsigned long long>(mirrors.reuses), mirrors.builds != 0 ? static_cast<double>(mirrors.elements) / static_cast<double>(mirrors.builds) : 0.0, static_cast<unsigned long long>(mirrors.missing));
         totals = {};
         totals.last = now;
     }

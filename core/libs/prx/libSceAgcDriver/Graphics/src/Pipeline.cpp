@@ -392,7 +392,7 @@ void appendKey(std::vector<std::byte>& key, const TValue& value) {
 
 bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders) {
     using Stage = ShaderRecompiler::ShaderStage;
-    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || UsesMeshWindow(shaders) || FragmentInterlock(shaders) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->directSlotCount != 0u; })) return false;
+    if (!context.graphicsPipelineLibrary || context.pipelineExecutableInfo || (state.stages.tessellation && !context.tessellationPipelineCache) || state.depthBiasPerFace || state.rectList || BarycentricPatches(state, shaders) || SplitsAlternateAlpha(state) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; }) || UsesMeshWindow(shaders) || FragmentInterlock(shaders) || std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->directHeap; })) return false;
     keys = {};
     for (const auto& shader : shaders) {
         const auto identity = shader.program->Identity();
@@ -590,7 +590,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         const bool pixelLds = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->functionLdsBuffer; });
         const bool meshWindow = UsesMeshWindow(shaders);
         const auto pixelLdsLayouts = pixelLds || meshWindow ? PixelFunctionLdsSetLayouts(context) : PixelFunctionLdsLayouts{};
-        const bool direct = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->directSlotCount != 0u; });
+        const bool direct = std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->directHeap; });
         const auto emptyLayouts = direct && !pixelLds && !meshWindow ? PixelFunctionLdsSetLayouts(context) : pixelLdsLayouts;
         const std::array<VkDescriptorSetLayout, 5> setLayouts{resources.main, (pixelLds || meshWindow || direct) && !resources.split ? emptyLayouts.empty : resources.fragment, pixelLds ? pixelLdsLayouts.buffer : emptyLayouts.empty, meshWindow ? MeshWindowSetLayout(context) : direct ? emptyLayouts.empty : VK_NULL_HANDLE, direct ? DirectHeapFor(context).Layout() : VK_NULL_HANDLE};
         const VkPushConstantRange push{pushStages, 0, PipelinePushSlotBytes};

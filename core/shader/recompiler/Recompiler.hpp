@@ -24,6 +24,8 @@
 
 namespace ShaderRecompiler {
 
+struct ResolvedImageTables;
+
 enum class ShaderStage {
     Compute,
     Vertex,
@@ -937,6 +939,9 @@ struct CompiledShaderArtifact {
     std::uint32_t stencilReferenceDword = 0xffffffffu;
     std::uint32_t directSlotCount = 0;
     std::uint32_t directSlotDword = 0;
+    // Direct form that binds the global heap (set DirectHeapSet): heap slots in ShaderData, or
+    // image table elements read from the heap arrays.
+    bool directHeap = false;
     std::uint64_t variantId = 0;
 };
 
@@ -983,6 +988,11 @@ struct ResultKeyMemo {
 struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     ResultKeyMemo drawKeyMemo;
     std::vector<std::uint32_t> directSlotRequests;
+    // Direct form with image tables: the capture's resolved tables (shared while the contents are
+    // unchanged) and, per table index, whether samplers read it; the driver turns the image elements
+    // into heap slots at record time. Not cached.
+    std::shared_ptr<const ResolvedImageTables> directTables;
+    std::vector<std::uint8_t> directSamplerTables;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;

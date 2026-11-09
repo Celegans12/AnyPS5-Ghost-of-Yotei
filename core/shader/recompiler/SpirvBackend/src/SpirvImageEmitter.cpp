@@ -2276,6 +2276,9 @@ TableAccessResult EmitTableAccess(SpirvValueEmitContext& ctx, const IrValue& ins
         result.flags = flags;
         live = selected;
         state.tableAccess.element = Binary(state, spv::OpIAdd, u32, LoadTableMap(state, ConstantU32(state, ImageTableAbi::HeaderElementBase)), element);
+        // Direct form: ElementBase is the start of a slot array in the map, one global heap slot per
+        // element (the driver appends it); bounds and fault checks above still use element indices.
+        if (state.program.Metadata().directResources) state.tableAccess.element = LoadTableMap(state, Select(state, u32, checked, state.tableAccess.element, ConstantU32(state, 0u)));
         const auto& sources = state.program.Resources().descriptorSources;
         state.tableAccess.uniform = base.source < sources.size() && sources[base.source].tableColumn.has_value() && sources[base.source].tableColumn->selected;
         if (!state.tableAccess.uniform) DecorateTableNonUniform(state, state.tableAccess.element);

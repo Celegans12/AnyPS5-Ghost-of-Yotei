@@ -5987,7 +5987,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::ScratchPoolDescriptorSet, 1, &pool->set, 0, nullptr);
         recorder.Keep(std::move(pool));
     }
-    if (record.shader->program->directSlotCount != 0u) {
+    if (record.shader->program->directHeap) {
         const auto heapSet = Graphics::DirectHeapFor(context).Set();
         context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::RuntimeAbi::DirectHeapSet, 1, &heapSet, 0, nullptr);
     }
@@ -6135,7 +6135,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     objects->module = Graphics::CreateShaderModule(state->DeviceFunction<PFN_vkCreateShaderModule>("vkCreateShaderModule"), state->device, state->graphicsPipelineLibrary, shader.spirv.data(), shader.spirv.size() * sizeof(std::uint32_t), "vkCreateShaderModule");
     objects->resourcesLayout = setLayout;
     const bool scratchPool = shader.scratchPoolSlotDwords != 0;
-    const bool directHeap = shader.directSlotCount != 0u;
+    const bool directHeap = shader.directHeap;
     const auto emptyLayout = directHeap ? Graphics::PixelFunctionLdsSetLayouts(context).empty : VK_NULL_HANDLE;
     const std::array<VkDescriptorSetLayout, 5> setLayouts{setLayout, shader.workgroupMemoryDwords != 0 || scratchPool ? state->workgroupMemoryLayout : emptyLayout, scratchPool ? state->workgroupMemoryLayout : emptyLayout, emptyLayout, directHeap ? Graphics::DirectHeapFor(context).Layout() : VK_NULL_HANDLE};
     const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};

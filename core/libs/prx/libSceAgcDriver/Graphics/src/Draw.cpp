@@ -2832,7 +2832,7 @@ bool WriteOnlyPasses() {
 }
 
 void BindDirectHeap(const Context& context, VkCommandBuffer commands, VkPipelineLayout layout, std::span<const CompiledShader> shaders) {
-    if (std::ranges::none_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->directSlotCount != 0u; })) return;
+    if (std::ranges::none_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->directHeap; })) return;
     const auto set = DirectHeapFor(context).Set();
     context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, ShaderRecompiler::RuntimeAbi::DirectHeapSet, 1, &set, 0, nullptr);
 }

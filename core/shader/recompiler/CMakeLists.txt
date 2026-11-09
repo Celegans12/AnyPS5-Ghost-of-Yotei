@@ -294,6 +294,7 @@ function(add_shader_recompiler target runtimeTarget)
             MaterializeShader
             DirectStageSpecialization
             ResourceMaterializer::RuntimeImageMode
+            ResourceMaterializer::ResolveImageTablesShared
             DescriptorBindingForImage
             ImageBindingResourceClass
             RegistrationResult

@@ -1369,6 +1369,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     }
     result.directSlotCount = variant.bindings.layout.directSlotCount;
     result.directSlotDword = variant.bindings.layout.DirectSlotDword();
+    result.directHeap = request.target.directResources && (result.directSlotCount != 0u || std::ranges::any_of(variant.info.info.images, [](const ImageResource& image) { return image.table != NoTable; }));
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules, substitutes, request.target.shaderImageMinLod);
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
     std::shared_ptr<PreparedModuleEntry> entry;
