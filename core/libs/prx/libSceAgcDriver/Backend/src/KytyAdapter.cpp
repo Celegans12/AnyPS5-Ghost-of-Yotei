@@ -3,7 +3,6 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
-#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/GpuBackendSwitch.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/Shutdown.hpp"
@@ -42,9 +41,6 @@
 
 extern "C" std::uint64_t APS5_VABI sceKernelReadTsc(void);
 extern "C" bool IsGuestPthread_nid_no_patch();
-#ifdef APS5_KYTY_GPU_BACKEND
-extern "C" int Aps5GpuBackendCreate(const Aps5GpuHost* host, const Aps5GpuBackendApi** api, Aps5GpuBackend** backend);
-#endif
 
 namespace AgcDriver::Kyty {
 namespace {
@@ -108,6 +104,122 @@ void Print(const char* format, auto... args) {
     std::fflush(stderr);
 }
 
+enum class PendingKind { Unmap, Map, Shader };
+
+struct PendingChange {
+    PendingKind kind = PendingKind::Map;
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint32_t protection = 0;
+    std::uint64_t directOffset = 0;
+    Aps5GpuShaderInfo shader{};
+};
+
+enum class AbSwitch : std::uint32_t { ProtectSrw, LeanCounters, Count };
+
+constexpr std::array<const char*, static_cast<std::size_t>(AbSwitch::Count)> AbSwitchNames{"protect-srw", "lean-counters"};
+
+std::array<std::atomic<bool>, static_cast<std::size_t>(AbSwitch::Count)> g_abSwitches{};
+
+bool AbOn(AbSwitch which) {
+    return g_abSwitches[static_cast<std::size_t>(which)].load(std::memory_order_relaxed);
+}
+
+std::uint64_t EnvNumber(const char* name, std::uint64_t fallback) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return fallback;
+    std::uint64_t parsed = 0;
+    const auto end = value + std::strlen(value);
+    const auto result = std::from_chars(value, end, parsed);
+    if (result.ec != std::errc{} || result.ptr != end) throw std::invalid_argument(std::string(name) + " must be a whole number");
+    return parsed;
+}
+
+std::vector<AbSwitch> ParseAbSwitches(const char* variable, char separator) {
+    std::vector<AbSwitch> list;
+    const char* value = std::getenv(variable);
+    if (value == nullptr) return list;
+    const std::string text(value);
+    std::size_t begin = 0;
+    while (begin <= text.size()) {
+        const auto end = std::min(text.find(separator, begin), text.size());
+        const auto item = text.substr(begin, end - begin);
+        begin = end + 1;
+        if (item.empty()) continue;
+        const auto found = std::find_if(AbSwitchNames.begin(), AbSwitchNames.end(), [&](const char* known) { return item == known; });
+        if (found == AbSwitchNames.end()) throw std::invalid_argument(std::string(variable) + ": unknown adapter switch '" + item + "' (known: protect-srw, lean-counters)");
+        list.push_back(static_cast<AbSwitch>(found - AbSwitchNames.begin()));
+    }
+    return list;
+}
+
+class AdapterAb {
+public:
+    void Configure() {
+        for (const auto which : ParseAbSwitches("APS5_ADAPTER_SWITCHES", ',')) {
+            g_abSwitches[static_cast<std::size_t>(which)].store(true, std::memory_order_relaxed);
+            fixed += std::string(fixed.empty() ? "" : ",") + AbSwitchNames[static_cast<std::size_t>(which)];
+        }
+        if (!fixed.empty()) Print("[kyty-ab] adapter switches on for the whole run: %s\n", fixed.c_str());
+        tested = ParseAbSwitches("APS5_ADAPTER_AB", '+');
+        if (tested.empty()) return;
+        period = std::chrono::seconds(EnvNumber("APS5_ADAPTER_AB_PERIOD_S", 60));
+        startPresent = EnvNumber("APS5_ADAPTER_AB_START", 1500);
+        warmup = EnvNumber("APS5_ADAPTER_AB_WARMUP", 20);
+        for (const auto which : tested) label += std::string(label.empty() ? "" : "+") + AbSwitchNames[static_cast<std::size_t>(which)];
+        Print("[kyty-ab] in-run A/B of %s: phases of %lld s from present %llu, the first %llu presents of each phase not measured, order off/on then on/off\n", label.c_str(), static_cast<long long>(period.count()), static_cast<unsigned long long>(startPresent), static_cast<unsigned long long>(warmup));
+    }
+
+    void AtPresent(std::uint64_t present) {
+        if (tested.empty() || present < startPresent) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (!running) {
+            running = true;
+            Begin(now);
+            return;
+        }
+        ++phasePresents;
+        if (phasePresents == warmup) measureStart = now;
+        if (now - phaseStart < period) return;
+        const double seconds = std::chrono::duration<double>(now - measureStart).count();
+        const auto measured = phasePresents > warmup ? phasePresents - warmup : 0;
+        Print("[kyty-ab] cycle=%u phase=%s presents=%llu seconds=%.3f rate=%.3f present=%llu\n", cycle, on ? label.c_str() : "off", static_cast<unsigned long long>(measured), seconds, seconds > 0 ? static_cast<double>(measured) * 10.0 / seconds : 0.0, static_cast<unsigned long long>(present));
+        if (++phaseInCycle == 2) {
+            phaseInCycle = 0;
+            ++cycle;
+        }
+        Begin(now);
+    }
+
+private:
+    void Begin(std::chrono::steady_clock::time_point now) {
+        on = (phaseInCycle == 1) != (cycle % 2 == 1);
+        for (const auto which : tested) g_abSwitches[static_cast<std::size_t>(which)].store(on, std::memory_order_relaxed);
+        phaseStart = now;
+        measureStart = now;
+        phasePresents = 0;
+    }
+
+    std::string fixed;
+    std::string label;
+    std::vector<AbSwitch> tested;
+    std::chrono::steady_clock::duration period{};
+    std::uint64_t startPresent = 0;
+    std::uint64_t warmup = 0;
+    bool running = false;
+    bool on = false;
+    std::uint32_t cycle = 0;
+    std::uint32_t phaseInCycle = 0;
+    std::uint64_t phasePresents = 0;
+    std::chrono::steady_clock::time_point phaseStart{};
+    std::chrono::steady_clock::time_point measureStart{};
+};
+
+AdapterAb& Ab() {
+    static auto* ab = new AdapterAb;
+    return *ab;
+}
+
 std::uint32_t DumpScale() {
     static const std::uint32_t scale = [] {
         const char* value = std::getenv("APS5_DUMP_SCALE");
@@ -120,6 +232,8 @@ std::uint32_t DumpScale() {
     }();
     return scale;
 }
+
+int CreateBackend(const Aps5GpuHost& host, const Aps5GpuBackendApi** api, Aps5GpuBackend** backend, std::string& source);
 
 class Adapter;
 std::atomic<Adapter*> g_adapter{nullptr};
@@ -138,11 +252,43 @@ public:
     Aps5GpuHost host{};
     const Aps5GpuBackendApi* api = nullptr;
     Aps5GpuBackend* backend = nullptr;
+    std::atomic<bool> created{false};
     std::shared_mutex protectLock;
+    SRWLOCK protectSrw = SRWLOCK_INIT;
     std::atomic<std::uint64_t> generation{1};
     FrameDumpOutput frameDumps;
 
+    bool Created() const {
+        return created.load(std::memory_order_acquire);
+    }
+
+    void EnsureCreated() {
+        if (Created()) return;
+        std::lock_guard lock(pendingMutex);
+        if (created.load(std::memory_order_relaxed)) return;
+        if (CreateBackend(host, &api, &backend, backendSource) != APS5_GPU_OK || api == nullptr || backend == nullptr) throw std::runtime_error("the GPU backend could not be created");
+        if (api->abi_version != APS5_GPU_BACKEND_ABI_VERSION || api->size < sizeof(Aps5GpuBackendApi)) throw std::runtime_error("the GPU backend has another interface version");
+        for (const auto& change : pending) Send(change);
+        const auto replayed = pending.size();
+        pending.clear();
+        pending.shrink_to_fit();
+        created.store(true, std::memory_order_release);
+        Print("[kyty] backend '%s' created at its first use (%s); %zu earlier memory and shader notifications replayed\n", api->name, backendSource.c_str(), replayed);
+    }
+
+    void Deliver(const PendingChange& change) {
+        if (!Created()) {
+            std::lock_guard lock(pendingMutex);
+            if (!created.load(std::memory_order_relaxed)) {
+                pending.push_back(change);
+                return;
+            }
+        }
+        Send(change);
+    }
+
     void EnsureStarted() {
+        EnsureCreated();
         std::call_once(started, [this] {
             if (api->start(backend) != APS5_GPU_OK) throw std::runtime_error("the GPU backend did not start");
             Print("[kyty] backend '%s' started\n", api->name);
@@ -153,10 +299,26 @@ public:
     }
 
     void Shutdown() {
-        if (stopped.exchange(true)) return;
+        if (!Created() || stopped.exchange(true)) return;
         reportCounts("shutdown");
         api->shutdown(backend);
     }
+
+    void Send(const PendingChange& change) {
+        switch (change.kind) {
+        case PendingKind::Unmap:
+            api->memory_unmap(backend, change.address, change.bytes);
+            break;
+        case PendingKind::Map:
+            api->memory_map(backend, change.address, change.bytes, change.protection, change.directOffset);
+            break;
+        case PendingKind::Shader:
+            if (api->register_shader(backend, &change.shader) != APS5_GPU_OK) throw std::runtime_error("the GPU backend refused a shader");
+            break;
+        }
+    }
+
+    std::string backendSource;
 
     std::shared_ptr<IVideoOutput> Output(std::uint32_t handle) {
         std::lock_guard lock(outputsMutex);
@@ -288,7 +450,7 @@ public:
         if (now - lastPresentReport < std::chrono::seconds(10)) return;
         lastPresentReport = now;
         const auto total = counts.presents.load() + counts.clears.load();
-        AgcDriver::ProfilePrint_nid_no_patch("[present] %llu presents over 10 s (kyty backend '%s'; %llu clears in total)\n", static_cast<unsigned long long>(total - lastPresentTotal), api->name, static_cast<unsigned long long>(counts.clears.load()));
+        Print("[present] %llu presents over 10 s (kyty backend '%s'; %llu clears in total)\n", static_cast<unsigned long long>(total - lastPresentTotal), api->name, static_cast<unsigned long long>(counts.clears.load()));
         lastPresentTotal = total;
     }
 
@@ -350,6 +512,8 @@ private:
 
     std::once_flag started;
     std::once_flag driverBlock;
+    std::mutex pendingMutex;
+    std::vector<PendingChange> pending;
     std::atomic<bool> stopped{false};
     std::thread reporter;
     std::mutex outputsMutex;
@@ -490,7 +654,7 @@ void HostFrameReady(void*, std::int32_t dumpIndex, const void* bgra, std::uint32
         adapter.frameDumps.Write_nid_no_patch(name, width, height, pixels);
         adapter.counts.dumps.fetch_add(1, std::memory_order_relaxed);
         static const auto start = std::chrono::steady_clock::now();
-        AgcDriver::ProfilePrint_nid_no_patch("[gpu] frame_%03d.bmp: %ux%u display read back on the GPU at %.1f s\n", dumpIndex, fullWidth, fullHeight, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
+        Print("[gpu] frame_%03d.bmp: %ux%u display read back on the GPU at %.1f s\n", dumpIndex, fullWidth, fullHeight, std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count());
     });
 }
 
@@ -517,11 +681,18 @@ std::uint64_t HostMappingGeneration(void*) {
 
 int HostProtectGuest(void*, std::uint64_t address, std::uint64_t bytes, std::uint32_t protection) {
     auto& adapter = A();
-    adapter.counts.protectGuest.fetch_add(1, std::memory_order_relaxed);
-    std::shared_lock lock(adapter.protectLock, std::defer_lock);
-    if (g_changeDepth == 0) lock.lock();
+    if (!AbOn(AbSwitch::LeanCounters)) adapter.counts.protectGuest.fetch_add(1, std::memory_order_relaxed);
     DWORD previous = 0;
-    return VirtualProtect(reinterpret_cast<void*>(address), static_cast<SIZE_T>(bytes), protection, &previous) ? APS5_GPU_OK : APS5_GPU_ERROR;
+    const auto protect = [&] { return VirtualProtect(reinterpret_cast<void*>(address), static_cast<SIZE_T>(bytes), protection, &previous) ? APS5_GPU_OK : APS5_GPU_ERROR; };
+    if (g_changeDepth != 0) return protect();
+    if (AbOn(AbSwitch::ProtectSrw)) {
+        AcquireSRWLockShared(&adapter.protectSrw);
+        const int result = protect();
+        ReleaseSRWLockShared(&adapter.protectSrw);
+        return result;
+    }
+    std::shared_lock lock(adapter.protectLock);
+    return protect();
 }
 
 std::uint64_t HostReadTsc(void*) {
@@ -557,23 +728,29 @@ const char* HostAppContentVersion(void*) {
 void ChangeBegin(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, bool hadPages) {
     auto& adapter = A();
     if (kind != GuestArena::GuestArenaChangeProtect && hadPages) {
-        adapter.api->memory_unmap(adapter.backend, address, bytes);
+        adapter.Deliver(PendingChange{PendingKind::Unmap, address, bytes, 0, 0, {}});
         adapter.counts.unmaps.fetch_add(1, std::memory_order_relaxed);
         adapter.generation.fetch_add(1, std::memory_order_acq_rel);
     }
-    if (g_changeDepth++ == 0) adapter.protectLock.lock();
+    if (g_changeDepth++ == 0) {
+        adapter.protectLock.lock();
+        AcquireSRWLockExclusive(&adapter.protectSrw);
+    }
 }
 
 void ChangeEnd(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, std::uint32_t protection, std::uint64_t directOffset, bool succeeded) {
     auto& adapter = A();
-    if (--g_changeDepth == 0) adapter.protectLock.unlock();
+    if (--g_changeDepth == 0) {
+        ReleaseSRWLockExclusive(&adapter.protectSrw);
+        adapter.protectLock.unlock();
+    }
     if (!succeeded) return;
     if (kind == GuestArena::GuestArenaChangeMap) {
-        adapter.api->memory_map(adapter.backend, address, bytes, protection, directOffset == GuestArena::GuestArenaNoSectionOffset ? APS5_GPU_NOT_DIRECT : directOffset);
+        adapter.Deliver(PendingChange{PendingKind::Map, address, bytes, protection, directOffset == GuestArena::GuestArenaNoSectionOffset ? APS5_GPU_NOT_DIRECT : directOffset, {}});
         adapter.counts.maps.fetch_add(1, std::memory_order_relaxed);
         adapter.generation.fetch_add(1, std::memory_order_acq_rel);
     } else if (kind == GuestArena::GuestArenaChangeProtect) {
-        adapter.api->memory_protect(adapter.backend, address, bytes, protection);
+        if (adapter.Created()) adapter.api->memory_protect(adapter.backend, address, bytes, protection);
         adapter.counts.protects.fetch_add(1, std::memory_order_relaxed);
     }
 }
@@ -581,18 +758,18 @@ void ChangeEnd(std::uintptr_t address, std::size_t bytes, std::uint32_t kind, st
 void HostWriteBegins(std::uintptr_t address, std::size_t bytes) {
     auto& adapter = A();
     adapter.counts.hostWrites.fetch_add(1, std::memory_order_relaxed);
-    adapter.api->host_write_begin(adapter.backend, address, bytes);
+    if (adapter.Created()) adapter.api->host_write_begin(adapter.backend, address, bytes);
 }
 
 void HostWriteEnds(std::uintptr_t address, std::size_t bytes) {
     auto& adapter = A();
-    adapter.api->host_write_end(adapter.backend, address, bytes);
+    if (adapter.Created()) adapter.api->host_write_end(adapter.backend, address, bytes);
 }
 
 void HostReads(std::uintptr_t address, std::size_t bytes) {
     auto& adapter = A();
     adapter.counts.hostReads.fetch_add(1, std::memory_order_relaxed);
-    adapter.api->host_read(adapter.backend, address, bytes);
+    if (adapter.Created()) adapter.api->host_read(adapter.backend, address, bytes);
 }
 
 LONG WINAPI FaultHook(EXCEPTION_POINTERS* info) {
@@ -602,16 +779,18 @@ LONG WINAPI FaultHook(EXCEPTION_POINTERS* info) {
     if (adapter == nullptr) return EXCEPTION_CONTINUE_SEARCH;
     const auto address = static_cast<std::uint64_t>(record->ExceptionInformation[1]);
     const auto kind = record->ExceptionInformation[0];
-    adapter->counts.faults.fetch_add(1, std::memory_order_relaxed);
+    const bool counted = !AbOn(AbSwitch::LeanCounters);
+    if (counted) adapter->counts.faults.fetch_add(1, std::memory_order_relaxed);
     if (auto* page = g_selfCheckPage.load(std::memory_order_acquire); page != nullptr && address - reinterpret_cast<std::uint64_t>(page) < 4096u) {
         DWORD previous = 0;
         if (!VirtualProtect(page, 4096, PAGE_READWRITE, &previous)) return EXCEPTION_CONTINUE_SEARCH;
         g_selfCheckServed.store(true, std::memory_order_release);
         return EXCEPTION_CONTINUE_EXECUTION;
     }
+    if (!adapter->Created()) return EXCEPTION_CONTINUE_SEARCH;
     const std::uint32_t access = kind == 1 ? APS5_GPU_FAULT_WRITE : kind == 8 ? APS5_GPU_FAULT_EXECUTE : APS5_GPU_FAULT_READ;
     if (adapter->api->handle_fault(adapter->backend, address, access) != APS5_GPU_FAULT_HANDLED) return EXCEPTION_CONTINUE_SEARCH;
-    adapter->counts.faultsServed.fetch_add(1, std::memory_order_relaxed);
+    if (counted) adapter->counts.faultsServed.fetch_add(1, std::memory_order_relaxed);
     return EXCEPTION_CONTINUE_EXECUTION;
 }
 
@@ -625,11 +804,27 @@ bool FaultHookFirst() {
     return g_selfCheckServed.load(std::memory_order_acquire);
 }
 
-int CreateBackend(const Aps5GpuHost& host, const Aps5GpuBackendApi** api, Aps5GpuBackend** backend) {
+int CreateBackend(const Aps5GpuHost& host, const Aps5GpuBackendApi** api, Aps5GpuBackend** backend, std::string& source) {
     const char* name = std::getenv("APS5_GPU_BACKEND");
-    if (name != nullptr && std::strcmp(name, "null") == 0) return Aps5NullGpuBackendCreate(&host, api, backend);
+    if (name != nullptr && std::strcmp(name, "null") == 0) {
+        source = "in-tree null backend";
+        return Aps5NullGpuBackendCreate(&host, api, backend);
+    }
 #ifdef APS5_KYTY_GPU_BACKEND
-    return Aps5GpuBackendCreate(&host, api, backend);
+    HMODULE self = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCWSTR>(&CreateBackend), &self)) throw std::runtime_error("APS5_GPU_BACKEND=kyty: the AGC driver's own module is not known");
+    std::wstring path(32768, L'\0');
+    const auto length = GetModuleFileNameW(self, path.data(), static_cast<DWORD>(path.size()));
+    if (length == 0 || length >= path.size()) throw std::runtime_error("APS5_GPU_BACKEND=kyty: the AGC driver's path is not known");
+    path.resize(length);
+    path.resize(path.find_last_of(L"\\/") + 1);
+    path += L"kyty_gpu.prx";
+    const auto module = LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+    if (module == nullptr) throw std::runtime_error("APS5_GPU_BACKEND=kyty: kyty_gpu.prx beside libSceAgcDriver.prx could not be loaded (error " + std::to_string(GetLastError()) + ")");
+    const auto create = reinterpret_cast<Aps5GpuBackendCreateFunction>(reinterpret_cast<void*>(GetProcAddress(module, APS5_GPU_BACKEND_CREATE_SYMBOL)));
+    if (create == nullptr) throw std::runtime_error("APS5_GPU_BACKEND=kyty: kyty_gpu.prx does not export " APS5_GPU_BACKEND_CREATE_SYMBOL);
+    source = "kyty_gpu.prx loaded beside libSceAgcDriver.prx";
+    return create(&host, api, backend);
 #else
     throw std::runtime_error("APS5_GPU_BACKEND=kyty: this build has no Kyty backend (configure with APS5_KYTY_GPU_DLL)");
 #endif
@@ -660,8 +855,6 @@ Adapter::Adapter() {
     host.is_guest_thread = &HostIsGuestThread;
     host.app_title_id = &HostAppTitleId;
     host.app_content_version = &HostAppContentVersion;
-    if (CreateBackend(host, &api, &backend) != APS5_GPU_OK || api == nullptr || backend == nullptr) throw std::runtime_error("the GPU backend could not be created");
-    if (api->abi_version != APS5_GPU_BACKEND_ABI_VERSION || api->size < sizeof(Aps5GpuBackendApi)) throw std::runtime_error("the GPU backend has another interface version");
 }
 
 bool Install() {
@@ -676,8 +869,10 @@ bool Install() {
     std::uint8_t* backingBase = nullptr;
     std::uint64_t backingBytes = 0;
     const bool backing = DirectMemoryBackingView_nid_no_patch(&backingBase, &backingBytes);
-    Print("[kyty] adapter installed: backend '%s' (interface v%u); guest memory observers on; fault hook %s; direct memory backing view %p+0x%llx%s\n", adapter.api->name, APS5_GPU_BACKEND_ABI_VERSION, first ? "first in the exception chain (self-check served)" : "NOT first in the exception chain", static_cast<void*>(backingBase), static_cast<unsigned long long>(backingBytes), backing ? "" : " (not in kyty memory mode)");
+    const char* name = std::getenv("APS5_GPU_BACKEND");
+    Print("[kyty] adapter installed: backend '%s' (interface v%u; created at its first use, outside the loader lock); guest memory observers on; fault hook %s; direct memory backing view %p+0x%llx%s\n", name != nullptr ? name : "?", APS5_GPU_BACKEND_ABI_VERSION, first ? "first in the exception chain (self-check served)" : "NOT first in the exception chain", static_cast<void*>(backingBase), static_cast<unsigned long long>(backingBytes), backing ? "" : " (not in kyty memory mode)");
     if (!first) throw std::runtime_error("the GPU backend's fault hook is not first in the exception chain");
+    Ab().Configure();
     return true;
 }
 
@@ -727,7 +922,7 @@ void SuspendPoint() {
 void WaitIdle() {
     auto& adapter = A();
     adapter.counts.idles.fetch_add(1, std::memory_order_relaxed);
-    adapter.api->wait_idle(adapter.backend);
+    if (adapter.Created()) adapter.api->wait_idle(adapter.backend);
 }
 
 void Shutdown() {
@@ -739,7 +934,7 @@ void RegisterShader(const Shader* shader) {
     if (shader == nullptr) throw std::runtime_error("AGC driver: null shader");
     const Aps5GpuShaderInfo info{reinterpret_cast<std::uint64_t>(shader->code), shader->user_data, shader->input_semantics, shader->num_input_semantics, shader->shader_size, shader->scratch_size_dw_per_thread, shader->type, {}};
     if (adapter.counts.shaders.fetch_add(1, std::memory_order_relaxed) == 0) Print("[kyty] first shader registration: code 0x%llx, %u bytes\n", static_cast<unsigned long long>(info.code), info.code_size_bytes);
-    if (adapter.api->register_shader(adapter.backend, &info) != APS5_GPU_OK) throw std::runtime_error("the GPU backend refused a shader");
+    adapter.Deliver(PendingChange{PendingKind::Shader, 0, 0, 0, 0, info});
 }
 
 void RegisterVideoOutput(std::uint32_t handle, const std::shared_ptr<IVideoOutput>& output) {
@@ -765,14 +960,23 @@ void Present(const PresentationWindow& window, const DisplayBuffer* buffer, bool
     Aps5GpuDisplayBuffer display{};
     if (buffer != nullptr) display = Aps5GpuDisplayBuffer{buffer->address, buffer->pixelFormat, buffer->dccAddress, buffer->dccClearColor, buffer->width, buffer->height, buffer->tilingMode, buffer->pitchInPixel, buffer->alignment, buffer->dccControl};
     const int dump = buffer != nullptr ? adapter.NextDumpIndex() : -1;
-    (buffer != nullptr ? adapter.counts.presents : adapter.counts.clears).fetch_add(1, std::memory_order_relaxed);
+    const auto presents = (buffer != nullptr ? adapter.counts.presents : adapter.counts.clears).fetch_add(1, std::memory_order_relaxed) + 1;
     adapter.NotePresent();
+    if (buffer != nullptr) Ab().AtPresent(presents);
+    static const std::uint64_t exitAt = EnvNumber("APS5_ADAPTER_TEST_EXIT_AT_PRESENT", 0);
+    if (buffer != nullptr && exitAt != 0 && presents == exitAt) {
+        Print("[kyty] APS5_ADAPTER_TEST_EXIT_AT_PRESENT: present %llu; another thread now ends the process with ExitProcess(0), every library's detach and static destructors included\n", static_cast<unsigned long long>(presents));
+        std::thread([] {
+            std::fflush(nullptr);
+            ExitProcess(0);
+        }).detach();
+    }
     if (adapter.api->present(adapter.backend, &copy.window, buffer != nullptr ? &display : nullptr, opaque ? 1 : 0, dump, gpuReady, context) != APS5_GPU_OK) throw std::runtime_error("the GPU backend could not present");
 }
 
 void ReleaseWindow(void* window) {
     auto& adapter = A();
-    if (auto copy = adapter.TakeWindow(window)) adapter.api->release_window(adapter.backend, copy.get());
+    if (auto copy = adapter.TakeWindow(window); copy && adapter.Created()) adapter.api->release_window(adapter.backend, copy.get());
 }
 
 void ReportFailure(std::exception_ptr error) {
