@@ -6374,7 +6374,10 @@ bool GuestBufferMemory::StagingDecisionsCurrent() const {
 bool GuestBufferMemory::stagingWanted(const Region& region, bool addressable) const {
     if (!stagingAllowed || (addressable && !region.overlay) || region.unstaged || !gpuCopiesEnabled() || region.sparse || region.mirror != nullptr) return false;
     const auto bytes = region.end - region.begin;
-    if (!WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
+    // Experiment (rewrite): APS5_STAGE_READS=1 also stages regions no GPU write overlaps, so
+    // shaders read a device-local copy instead of the host import in system memory.
+    static const bool stageReads = std::getenv("APS5_STAGE_READS") != nullptr;
+    if (!stageReads && !WritesOverlap(region.begin, static_cast<std::size_t>(bytes))) return false;
     if (region.atomic && atomicStagingEnabled() && bytes <= atomicStageMax()) return true;
     return writtenShadowEnabled() && bytes >= writtenShadowMin() && bytes <= (region.swept ? std::max(writtenShadowMax(context.discreteGpu), context.discreteGpu ? DiscreteSweptShadowMax : SweptShadowMax) : writtenShadowMax(context.discreteGpu));
 }
