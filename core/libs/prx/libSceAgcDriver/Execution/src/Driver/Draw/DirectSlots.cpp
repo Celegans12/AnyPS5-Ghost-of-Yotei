@@ -8,6 +8,7 @@
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
 #include <array>
+#include <cstdlib>
 #include <exception>
 #include <mutex>
 #include <unordered_map>
@@ -98,6 +99,11 @@ bool FillDirectSlots(const Graphics::Context& context, const ShaderRecompiler::C
             }
             if (mode >= modes.size() || ShaderRecompiler::DescriptorBindingForImage(modes[mode]) != binding.kind) {
                 ++statistics.inactiveImages;
+                slots.push_back(0u);
+                continue;
+            }
+            static const bool noTextures = std::getenv("APS5_DIRECT_NO_TEXTURES") != nullptr;
+            if (noTextures) {
                 slots.push_back(0u);
                 continue;
             }
