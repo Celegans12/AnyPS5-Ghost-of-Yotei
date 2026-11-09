@@ -35,10 +35,10 @@ DirectHeap::DirectHeap(const Context& context) : context(context), kinds(LastSam
     std::vector<VkDescriptorSetLayoutBinding> bindings;
     std::vector<VkDescriptorBindingFlags> flags;
     for (auto kind = FirstImageKind; kind <= LastSampledKind; ++kind) {
-        bindings.push_back({kind, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampledSlots, stages, nullptr});
+        bindings.push_back({ShaderRecompiler::RuntimeAbi::DirectHeapBindingBase + kind, VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE, sampledSlots, stages, nullptr});
         flags.push_back(VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT);
     }
-    bindings.push_back({SamplerKind, VK_DESCRIPTOR_TYPE_SAMPLER, samplerSlots, stages, nullptr});
+    bindings.push_back({ShaderRecompiler::RuntimeAbi::DirectHeapBindingBase + SamplerKind, VK_DESCRIPTOR_TYPE_SAMPLER, samplerSlots, stages, nullptr});
     flags.push_back(VK_DESCRIPTOR_BINDING_PARTIALLY_BOUND_BIT | VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT);
     VkDescriptorSetLayoutBindingFlagsCreateInfo flagInfo{VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_BINDING_FLAGS_CREATE_INFO};
     flagInfo.bindingCount = static_cast<std::uint32_t>(flags.size());
@@ -69,7 +69,7 @@ DirectHeap::DirectHeap(const Context& context) : context(context), kinds(LastSam
         placeholders.push_back({VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL});
         VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
         write.dstSet = set;
-        write.dstBinding = kind;
+        write.dstBinding = ShaderRecompiler::RuntimeAbi::DirectHeapBindingBase + kind;
         write.dstArrayElement = 0u;
         write.descriptorCount = 1u;
         write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -94,7 +94,7 @@ std::uint32_t DirectHeap::ImageSlot(std::uint32_t kind, VkImageView view, VkImag
     const VkDescriptorImageInfo info{VK_NULL_HANDLE, view, imageLayout};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = set;
-    write.dstBinding = kind;
+    write.dstBinding = ShaderRecompiler::RuntimeAbi::DirectHeapBindingBase + kind;
     write.dstArrayElement = slot;
     write.descriptorCount = 1u;
     write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
@@ -115,7 +115,7 @@ std::uint32_t DirectHeap::SamplerSlot(VkSampler sampler, std::shared_ptr<void> k
     const VkDescriptorImageInfo info{sampler, VK_NULL_HANDLE, VK_IMAGE_LAYOUT_UNDEFINED};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = set;
-    write.dstBinding = SamplerKind;
+    write.dstBinding = ShaderRecompiler::RuntimeAbi::DirectHeapBindingBase + SamplerKind;
     write.dstArrayElement = slot;
     write.descriptorCount = 1u;
     write.descriptorType = VK_DESCRIPTOR_TYPE_SAMPLER;

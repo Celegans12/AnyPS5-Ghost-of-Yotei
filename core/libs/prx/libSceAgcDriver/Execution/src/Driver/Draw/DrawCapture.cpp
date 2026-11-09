@@ -96,11 +96,19 @@ void probeDirectEvaluation(const ShaderRecompiler::RecompileRequest& request, Vu
             static std::atomic<double> materializeUs{0};
             if (materializeProbe && tables == 0u) {
                 const auto materializeStarted = std::chrono::steady_clock::now();
+                static const bool fullMaterialize = std::getenv("APS5_DIRECT_FULL_PROBE") != nullptr;
                 try {
-                    static_cast<void>(ShaderRecompiler::DirectStageSpecialization(direct, *capture, *handle));
+                    if (fullMaterialize) static_cast<void>(ShaderRecompiler::MaterializeShader(direct, *capture, *handle));
+                    else static_cast<void>(ShaderRecompiler::DirectStageSpecialization(direct, *capture, *handle));
                     ++materialized;
-                } catch (const std::exception&) {
+                } catch (const std::exception& error) {
                     ++materializeFailed;
+                    static std::mutex reasonMutex;
+                    static std::map<std::string, std::uint64_t> reasons;
+                    std::string text = error.what();
+                    if (text.size() > 160) text.resize(160);
+                    std::lock_guard reasonLock(reasonMutex);
+                    if (++reasons[text] == 1u && reasons.size() <= 12u) std::fprintf(stderr, "[direct-eval] materialize failure: %s\n", text.c_str());
                 }
                 materializeUs = materializeUs.load() + std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - materializeStarted).count();
                 if ((materialized.load() + materializeFailed.load()) % 100000u == 0u) std::fprintf(stderr, "[direct-eval] materialize: %llu done, %llu failed, avg %.2f us\n", static_cast<unsigned long long>(materialized.load()), static_cast<unsigned long long>(materializeFailed.load()), materialized.load() != 0 ? materializeUs.load() / static_cast<double>(materialized.load()) : 0.0);

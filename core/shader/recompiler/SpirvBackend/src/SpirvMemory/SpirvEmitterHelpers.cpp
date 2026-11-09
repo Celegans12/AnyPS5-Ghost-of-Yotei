@@ -511,7 +511,7 @@ void DefineDescriptors(SpirvEmitterState& state) {
             const auto variable = state.module.DefineGlobalVariable(TypePointer(state, storage, type), storage);
             state.module.AddName(variable, name);
             state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationDescriptorSet, directHeap ? RuntimeAbi::DirectHeapSet : state.fragmentDescriptorSet && stage == IrShaderStage::Pixel ? RuntimeAbi::FragmentDescriptorSet : RuntimeAbi::DescriptorSet);
-            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, directHeap ? static_cast<std::uint32_t>(binding.kind) : NativeBinding(stage, binding.kind));
+            state.module.AddAnnotation(spv::OpDecorate, variable, spv::DecorationBinding, directHeap ? RuntimeAbi::DirectHeapBindingBase + static_cast<std::uint32_t>(binding.kind) : NativeBinding(stage, binding.kind));
             return variable;
         };
         const auto ArrayType = [&](std::uint32_t type) {
