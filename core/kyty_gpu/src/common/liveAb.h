@@ -35,6 +35,7 @@ enum class Switch : uint32_t {
 	DiagCeilingFreePasses,     // KYTY_DIAG_CEILING_FREE_PASSES (measurement only, APPROXIMATION)
 	BarGpuCopy,            // KYTY_PERF_BAR_GPU_COPY (KiB threshold; cache/barGpuCopy.h)
 	BarGpuLarge,           // KYTY_PERF_BAR_GPU_LARGE (cache/barGpuCopy.h)
+	Placement,             // KYTY_PERF_PLACEMENT (the thread layout, common/gpuPlacement.h; may be listed once per value)
 	Count
 };
 

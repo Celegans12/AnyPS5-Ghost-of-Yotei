@@ -2,6 +2,7 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#include "common/gpuPlacement.h"
 #include "common/threads.h"
 
 #include <algorithm>
@@ -309,8 +310,11 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 		const auto   result    = Common::Thread::ReserveCores(cpus, min_cores);
 		std::fprintf(stderr, "GPU_THREAD_CPUS execution=%d recording=%d resolve=%d command_processor=%d: %s\n", cpus[0],
 		             cpus[1], cpus[2], cpus[3], result.c_str());
+		// The start placement, which KYTY_PERF_PLACEMENT's layouts change and layout 0 restores (gpuPlacement.h).
+		Common::GpuPlacement::SetStart(cpus, result.starts_with("reserved,"), high_priority);
 	});
 	Common::Thread::PinCurrent(cpus[static_cast<uint32_t>(stage)]);
+	Common::GpuPlacement::RegisterStage(static_cast<uint32_t>(stage));
 }
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS

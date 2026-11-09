@@ -13,6 +13,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/gpuPlacement.h"
 #include "common/liveAb.h"
 #include "common/threads.h"
 #include "common/debugCounters.h"
@@ -3672,6 +3673,7 @@ struct BarCopyPool {
 	}
 	void Main(uint32_t index) {
 		Common::Thread::SetCurrentName(("BarCopy" + std::to_string(index)).c_str());
+		Common::GpuPlacement::RegisterBarCopyThread(); // KYTY_PERF_PLACEMENT's barcopy field
 		uint32_t seen = 0;
 		for (;;) {
 			uint32_t g    = generation.load(std::memory_order_acquire);

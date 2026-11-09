@@ -8,6 +8,7 @@
 #include "aps5/aps5Memory.h"
 #include "aps5/aps5VideoOut.h"
 #include "aps5/aps5Window.h"
+#include "aps5/pgoWriter.h"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -185,6 +186,7 @@ int Start(Aps5GpuBackend* /*backend*/) {
 		Common::SetFatalHook(&FatalHook);
 		std::call_once(B().shaders_ready, [] { Graphics::ShaderInit(); });
 		ApplySettings();
+		StartPgoWriter();
 		Config::Initialize();
 		Config::Load(ReleaseConfig());
 		Log::Initialize();

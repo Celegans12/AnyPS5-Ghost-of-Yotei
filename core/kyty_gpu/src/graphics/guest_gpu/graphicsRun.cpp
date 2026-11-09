@@ -7,6 +7,7 @@
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/envRead.h"
+#include "common/gpuPlacement.h"
 #include "common/liveAb.h"
 #include "common/logging/log.h"
 #include "common/onceValue.h"
@@ -3457,7 +3458,11 @@ void CommandProcessor::WriteLodStats(void* dst, uint32_t size) {
 // KYTY_LIVE_AB: each flip ends with a submission (Flush), which also resets the scheduler's batch state; right after
 // it is the frame boundary where live A/B phases change, so no frame runs partly in one phase and partly in another.
 static void LiveAbFrameBoundary() {
-	if (GuestGpu::IsGpuThread()) Common::LiveAb::OnFrameBoundary(DebugPresentCount().load());
+	if (GuestGpu::IsGpuThread()) {
+		Common::LiveAb::OnFrameBoundary(DebugPresentCount().load());
+		// KYTY_PERF_PLACEMENT: the thread layout of the phase (or of the whole run) starts at this boundary too.
+		Common::GpuPlacement::OnFrameBoundary();
+	}
 	// KYTY_DIAG_GPU_BURN_FLIP_US=<us> (measurement only, default 0; KYTY_LIVE_AB toggles 0/5000): the GPU thread spins that
 	// long after each flip, where no other stage is waited for: how much frame time GPU-thread work costs.
 	static const uint32_t burn_fixed = [] {

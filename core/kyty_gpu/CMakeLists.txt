@@ -198,6 +198,39 @@ option(KYTY_BUILD_LAUNCHER "Build Qt launcher" ON)
 
 config_compiler_and_linker()
 
+# KYTY_PGO (default OFF): clang IR profile-guided optimisation of everything built below (3rdparty included).
+#  GEN: an instrumented build. It writes .profraw files into KYTY_PGO_DIR: at exit (the profile runtime), and in the
+#       AnyPS5 backend DLL also every KYTY_PGO_WRITE_SECONDS (src/aps5/pgoWriter.cpp), because AnyPS5's runs end by
+#       killing the process. Merge them with `llvm-profdata merge -o <file>.profdata <files>`.
+#  USE: builds with KYTY_PGO_PROFILE (the merged .profdata). A function whose code changed after the profile was taken
+#       gets no profile data (clang's -Wprofile-instr-out-of-date counts them per file); every other one keeps its data.
+set(KYTY_PGO "OFF" CACHE STRING "clang IR PGO: OFF, GEN (instrumented build) or USE (build with KYTY_PGO_PROFILE)")
+set_property(CACHE KYTY_PGO PROPERTY STRINGS OFF GEN USE)
+set(KYTY_PGO_DIR "${CMAKE_BINARY_DIR}/pgo" CACHE PATH "KYTY_PGO=GEN: where the instrumented binary writes .profraw files")
+set(KYTY_PGO_PROFILE "" CACHE FILEPATH "KYTY_PGO=USE: the merged .profdata")
+if(NOT KYTY_PGO STREQUAL "OFF")
+	if(NOT CLANG OR KYTY_CLANG_CL)
+		message(FATAL_ERROR "KYTY_PGO=${KYTY_PGO} needs clang with the GNU driver")
+	endif()
+	if(KYTY_PGO STREQUAL "GEN")
+		file(TO_CMAKE_PATH "${KYTY_PGO_DIR}" KYTY_PGO_DIR_PATH)
+		set(KYTY_PGO_FLAGS "-fprofile-generate=${KYTY_PGO_DIR_PATH}")
+		add_compile_definitions(KYTY_PGO_GENERATE=1 "KYTY_PGO_DEFAULT_DIR=\"${KYTY_PGO_DIR_PATH}\"")
+		add_link_options("-fprofile-generate=${KYTY_PGO_DIR_PATH}")
+	elseif(KYTY_PGO STREQUAL "USE")
+		file(TO_CMAKE_PATH "${KYTY_PGO_PROFILE}" KYTY_PGO_PROFILE_PATH)
+		if(NOT EXISTS "${KYTY_PGO_PROFILE_PATH}")
+			message(FATAL_ERROR "KYTY_PGO=USE: KYTY_PGO_PROFILE '${KYTY_PGO_PROFILE}' does not exist")
+		endif()
+		set(KYTY_PGO_FLAGS "-fprofile-use=${KYTY_PGO_PROFILE_PATH} -Wno-profile-instr-unprofiled")
+	else()
+		message(FATAL_ERROR "KYTY_PGO must be OFF, GEN or USE, not '${KYTY_PGO}'")
+	endif()
+	set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${KYTY_PGO_FLAGS}")
+	set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${KYTY_PGO_FLAGS}")
+	message(STATUS "KYTY_PGO=${KYTY_PGO}: ${KYTY_PGO_FLAGS}")
+endif()
+
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/3rdparty")
 add_subdirectory("${KYTY_SOURCE_DIR}/common" "${CMAKE_CURRENT_BINARY_DIR}/common")
 

@@ -25,6 +25,7 @@ struct SwitchInfo {
 	Switch      id;
 	const char* name;
 	uint32_t    max_value; // the largest value that is still a per-call choice
+	bool        per_value = false; // may be listed once for each value: one phase per value
 };
 
 constexpr SwitchInfo Switches[] = {
@@ -50,6 +51,9 @@ constexpr SwitchInfo Switches[] = {
     // Only how large a finished read window the host-mapped download takes (up to 8 MiB, copied by the GPU) instead of the
     // copy path, per request; both publish the newest GPU bytes and the rest stays GPU-modified (cache/barGpuCopy.h).
     {Switch::BarGpuLarge, "KYTY_PERF_BAR_GPU_LARGE", 1},
+    // Only where and at what priority threads run (the layouts KYTY_PLACEMENT_LAYOUT_1..4; gpuPlacement.cpp applies the
+    // value at the frame boundary, on the GPU thread). Nothing computed depends on it. Listed once per layout to compare.
+    {Switch::Placement, "KYTY_PERF_PLACEMENT", 4, true},
 };
 static_assert(std::size(Switches) == SwitchCount);
 
@@ -135,7 +139,11 @@ Config Parse() {
 		}
 		const uint32_t word = info != std::end(Switches) ? static_cast<uint32_t>(info->id) / 64u : 0u;
 		const uint64_t bit  = info != std::end(Switches) ? uint64_t {1} << (static_cast<uint32_t>(info->id) % 64u) : 0u;
-		if (reason == nullptr && (config.listed_mask[word] & bit) != 0) reason = "listed twice";
+		if (reason == nullptr && (config.listed_mask[word] & bit) != 0) {
+			const bool same_value = std::ranges::any_of(
+			    config.entries, [&](const Entry& e) { return e.id == info->id && e.value == value; });
+			if (!info->per_value || same_value) reason = "listed twice";
+		}
 		if (reason != nullptr) {
 			std::fprintf(stderr, "LIVE_AB refused %s: %s; it keeps its start value\n", item.c_str(), reason);
 			continue;
@@ -254,12 +262,21 @@ uint32_t PhaseAt(const Config& config, uint32_t cycle, uint32_t position) {
 
 void SetLiveValues(const Config& config, uint32_t phase) {
 	const auto all = (config.all_phase || config.only_all) && phase == config.phase_count - 1u;
+	// A switch listed once per value (per_value) has several entries: its value is the one of the entry that is on in
+	// this phase, so one entry's "off" never overwrites another's "on". Each switch is stored once.
+	uint32_t stored[SwitchCount] {};
+	bool     listed[SwitchCount] {};
 	for (size_t i = 0; i < config.entries.size(); ++i) {
 		const auto& entry = config.entries[i];
+		const auto  id    = static_cast<uint32_t>(entry.id);
 		const bool  on    = phase != 0 && (all || phase == i + 1u);
 		// 0 stored: the gate's start value (KYTY_LIVE_AB_OFF_START); otherwise the live value plus one.
-		const uint32_t stored = on ? entry.value + 1u : config.off_start ? 0u : 1u;
-		g_live_values[static_cast<uint32_t>(entry.id)].store(stored, std::memory_order_relaxed);
+		if (!listed[id]) stored[id] = config.off_start ? 0u : 1u;
+		if (on) stored[id] = entry.value + 1u;
+		listed[id] = true;
+	}
+	for (uint32_t id = 0; id < SwitchCount; ++id) {
+		if (listed[id]) g_live_values[id].store(stored[id], std::memory_order_relaxed);
 	}
 }
 
