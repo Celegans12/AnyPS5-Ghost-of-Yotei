@@ -993,6 +993,9 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     // into heap slots at record time. Not cached.
     std::shared_ptr<const ResolvedImageTables> directTables;
     std::vector<std::uint8_t> directSamplerTables;
+    // Set by the driver on a direct stage whose ImageTableMap holds a table mirror: a hash of that
+    // map, keyed in place of its words. Not cached.
+    std::uint64_t directTableMapHash = 0;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;

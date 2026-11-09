@@ -250,6 +250,7 @@ SlotMemo& ThreadSlotMemo() {
 struct TableMirror {
     std::weak_ptr<const ShaderRecompiler::ResolvedImageTables> source;
     std::vector<std::uint32_t> map;
+    std::uint64_t mapHash = 0;
     std::shared_ptr<std::vector<std::shared_ptr<Texture>>> textures;
     std::uint64_t epoch = 0, proof = 0, pending = 0;
     std::uint32_t missing = 0;
@@ -348,6 +349,9 @@ const TableMirror* tableMirrorFor(const Context& context, DirectHeap& heap, cons
     mirror.map = resolved.map;
     mirror.map[Abi::HeaderElementBase] = static_cast<std::uint32_t>(mirror.map.size());
     mirror.map.insert(mirror.map.end(), slots.begin(), slots.end());
+    std::uint64_t hash = 0xcbf29ce484222325ull ^ mirror.map.size();
+    for (const auto word : mirror.map) hash = (hash ^ word) * 0x100000001b3ull;
+    mirror.mapHash = hash != 0u ? hash : 1u;
     ++totals.builds;
     totals.elements += resolved.elements.size();
     totals.missing += mirror.missing;
@@ -387,6 +391,8 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
             if (recorder != nullptr) recorder->Keep(mirror->textures);
             missing += mirror->missing;
             copy->directTables = nullptr;
+            static const bool hashedKey = std::getenv("APS5_DIRECT_TABLE_FULL_KEY") == nullptr;
+            if (hashedKey) copy->directTableMapHash = mirror->mapHash;
         }
         const auto& requests = program->directSlotRequests;
         const auto count = requests.size() / DirectSlotRequest::Words;
