@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/dispatchCensus.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "common/cacheDir.h"
+#include "common/envDefaults.h"
 #include "common/envRead.h"
 #include "common/shaderEnv.h"
 #include "common/uniqueFunction.h"
@@ -3948,7 +3949,8 @@ constexpr uint64_t BarGpuCopyStagingBytes = uint64_t {16} << 20u;
 // The switch's start value: the smallest download (GPU-written bytes, KiB) the GPU copies; 0 off.
 uint32_t BarGpuCopyFixed() {
 	static const uint32_t value = [] {
-		const char* text = std::getenv("KYTY_PERF_BAR_GPU_COPY");
+		// Default from Common::EnvDefaults (8 KiB); =0 turns it off.
+		const char* text = Common::EnvOrDefault("KYTY_PERF_BAR_GPU_COPY");
 		const auto  kb   = text != nullptr ? std::strtoul(text, nullptr, 10) : 0ul;
 		const auto  v    = static_cast<uint32_t>(std::min<unsigned long>(kb, 1024ul));
 		if (v != 0) std::fprintf(stderr, "PERF_BAR_GPU_COPY host-mapped downloads of %u KiB and more are copied by the GPU\n", v);

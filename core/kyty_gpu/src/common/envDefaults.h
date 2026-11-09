@@ -45,6 +45,9 @@ inline constexpr EnvDefault EnvDefaults[] = {
     {"KYTY_PIPELINE_CACHE_ANY_REVISION", "1", "config", ""},
     // D6 step K4: what one BDA miss promotes while the BDA fallback is on (faultManager.cpp).
     {"KYTY_PERF_BDA_PROMOTE_KB", "2048", "config", ""},
+    // Measured performance switch, exact (AnyPS5 v4e: +17.6 % in-run A/B, 1,172 GPU copies verified against the BAR
+    // read with 0 mismatches): host-mapped downloads of 8 KiB and more are copied by the GPU (cache/barGpuCopy.h).
+    {"KYTY_PERF_BAR_GPU_COPY", "8", "config", ""},
     // Probably hardware behaviour, exactness check open (M48):
     {"KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL", "1", "unproven", "M48"},
     {"KYTY_FIX_RT_11_11_10_FLOAT", "1", "unproven", "M48"},
