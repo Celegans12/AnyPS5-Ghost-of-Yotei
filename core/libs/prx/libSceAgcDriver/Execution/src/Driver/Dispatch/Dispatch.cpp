@@ -16,6 +16,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "CompiledVariant.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectSlots.hpp"
+#include <string>
 #include <cstdio>
 #include <functional>
 #include <mutex>
@@ -38,10 +40,10 @@ bool DirectDispatchEnabled() {
     return enabled;
 }
 
-bool DirectDispatchEligible(const ShaderRecompiler::RecompileRequest& request) {
+std::shared_ptr<const ShaderRecompiler::SourceHandle> DirectDispatchHandle(const ShaderRecompiler::RecompileRequest& request) {
     struct Known {
         std::size_t codeHash;
-        bool eligible;
+        std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
     };
     static std::mutex mutex;
     static std::unordered_map<std::uint64_t, Known> known;
@@ -50,23 +52,31 @@ bool DirectDispatchEligible(const ShaderRecompiler::RecompileRequest& request) {
     const auto codeHash = std::hash<std::string_view>{}(code);
     {
         std::lock_guard lock(mutex);
-        if (const auto found = known.find(request.shader.codeAddress); found != known.end() && found->second.codeHash == codeHash) return found->second.eligible;
+        if (const auto found = known.find(request.shader.codeAddress); found != known.end() && found->second.codeHash == codeHash) return found->second.handle;
     }
     auto direct = request;
     direct.target.directResources = true;
-    bool eligible = false;
+    std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
+    const char* refusal = nullptr;
     try {
-        const auto handle = ShaderRecompiler::PrepareShader(direct, nullptr);
+        handle = ShaderRecompiler::PrepareShader(direct, nullptr);
         const auto& info = handle->artifact->info.info;
-        eligible = info.images.empty() && info.samplers.empty();
+        for (const auto& image : info.images) {
+            if (image.table != ShaderRecompiler::NoTable) refusal = "image table";
+            else if (image.resourceClass == ShaderRecompiler::ImageResourceClass::Storage) refusal = "storage image";
+        }
+        for (const auto& sampler : info.samplers) {
+            if (sampler.table != ShaderRecompiler::NoTable) refusal = "sampler table";
+        }
     } catch (const std::exception&) {
-        eligible = false;
+        refusal = "direct form failed";
     }
-    ++(eligible ? eligibleCount : refusedCount);
-    std::fprintf(stderr, "[direct-dispatch] shader 0x%llx %s (%llu eligible, %llu refused)\n", static_cast<unsigned long long>(request.shader.codeAddress), eligible ? "direct" : "existing path", static_cast<unsigned long long>(eligibleCount.load()), static_cast<unsigned long long>(refusedCount.load()));
+    if (refusal != nullptr) handle = nullptr;
+    ++(handle != nullptr ? eligibleCount : refusedCount);
+    std::fprintf(stderr, "[direct-dispatch] shader 0x%llx %s%s (%llu eligible, %llu refused)\n", static_cast<unsigned long long>(request.shader.codeAddress), handle != nullptr ? "direct" : "existing path: ", refusal != nullptr ? refusal : "", static_cast<unsigned long long>(eligibleCount.load()), static_cast<unsigned long long>(refusedCount.load()));
     std::lock_guard lock(mutex);
-    known[request.shader.codeAddress] = {codeHash, eligible};
-    return eligible;
+    known[request.shader.codeAddress] = {codeHash, handle};
+    return handle;
 }
 
 bool DispatchItemsEnabled() {
@@ -242,7 +252,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u),
         {0, 0, 0, threadGroup != std::array<std::uint32_t, 3>{} ? 0u : 128u}
     };
-    if (DirectDispatchEnabled() && DirectDispatchEligible(request)) request.target.directResources = true;
+    const auto directHandle = DirectDispatchEnabled() ? DirectDispatchHandle(request) : nullptr;
+    if (directHandle != nullptr) request.target.directResources = true;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static std::atomic<double> captureMs{0}, keyMs{0}, recompileMs{0}, deviceMs{0};
     static std::atomic<std::uint64_t> cacheHits{0};
@@ -460,6 +471,15 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
 
             timing.Mark("capture_resources");
             compiledResult = invocation.Materialize(*capture);
+            if (directHandle != nullptr && compiledResult->directSlotCount != 0u) {
+                std::vector<std::uint32_t> requests;
+                DirectSlotStatistics statistics;
+                std::string reason;
+                if (!BuildDirectSlotRequests(directHandle->artifact->info, capture->snapshot, requests, statistics, reason)) throw std::runtime_error("direct dispatch slots: " + reason);
+                auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*compiledResult);
+                patched->directSlotRequests = std::move(requests);
+                compiledResult = std::move(patched);
+            }
             timing.Mark("materialize");
             if (profile && compiledResult->cacheHit) cacheHits.fetch_add(1, std::memory_order_relaxed);
             const auto elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
