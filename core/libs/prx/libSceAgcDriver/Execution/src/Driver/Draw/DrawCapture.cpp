@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <map>
 #include <mutex>
+#include <set>
 #include <string>
 #include <utility>
 #include <unordered_map>
@@ -106,6 +107,63 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
         runtime.accessible = &directEvalAccessible;
         auto capture = ShaderRecompiler::CaptureResources(direct, runtime, *handle);
         if (!capture->snapshot.tables.tables.empty()) {
+            // Debug aid: APS5_DIRECT_TABLE_PROBE=1 reports the image tables that keep stages off
+            // the direct path: per 10 s, stages, columns per stage, records, bytes, and how many
+            // distinct column contents (base plus descriptor words) were seen.
+            static const bool tableProbe = std::getenv("APS5_DIRECT_TABLE_PROBE") != nullptr;
+            if (tableProbe) {
+                struct TableTotals {
+                    std::uint64_t stages = 0, columns = 0, records = 0, nested = 0, bytes = 0, maxRecords = 0, keys = 0, words = 0, readRanges = 0, codes = 0, pointers = 0, outside = 0;
+                    std::set<std::uint64_t> contents, bases;
+                    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+                };
+                static std::mutex tableMutex;
+                static TableTotals table;
+                std::lock_guard tableLock(tableMutex);
+                ++table.stages;
+                table.nested += capture->snapshot.tables.nested.size();
+                for (const auto& column : capture->snapshot.tables.tables) {
+                    ++table.columns;
+                    table.records += column.records;
+                    table.bytes += column.size;
+                    table.maxRecords = std::max<std::uint64_t>(table.maxRecords, column.records);
+                    std::uint64_t hash = 0xcbf29ce484222325ull ^ column.base;
+                    for (const auto& word : column.words) {
+                        for (std::uint32_t at = 0; at < word.dwordCount; ++at) hash = (hash ^ word.dwords[at]) * 0x100000001b3ull;
+                    }
+                    table.contents.insert(hash);
+                    table.keys += column.keys;
+                    table.words += column.words.size();
+                    table.readRanges += column.readRanges.size();
+                    table.codes += column.codes.size();
+                    table.pointers += column.pointers.size();
+                    if (column.outside) ++table.outside;
+                    // Once per base: how far the table's memory is populated (32-byte blocks with
+                    // any non-zero dword, up to 64 MiB or the first inaccessible page).
+                    static std::set<std::uint64_t> scanned;
+                    if (scanned.insert(column.base).second) {
+                        std::uint64_t accessible = 0, nonZero = 0, lastNonZero = 0;
+                        for (std::uint64_t offset = 0; offset < (64ull << 20u); offset += 32u) {
+                            const auto* at = reinterpret_cast<const std::uint32_t*>(column.base + offset);
+                            if ((offset & 4095u) == 0u && !GuestMemory::Accessible(at, 4096u)) break;
+                            accessible = offset + 32u;
+                            bool any = false;
+                            for (int dword = 0; dword < 8; ++dword) any = any || at[dword] != 0u;
+                            if (any) {
+                                ++nonZero;
+                                lastNonZero = offset;
+                            }
+                        }
+                        std::fprintf(stderr, "[direct-tables] base 0x%llx: %llu bytes accessible, %llu non-zero 32-byte blocks, last at +0x%llx\n", static_cast<unsigned long long>(column.base), static_cast<unsigned long long>(accessible), static_cast<unsigned long long>(nonZero), static_cast<unsigned long long>(lastNonZero));
+                    }
+                    table.bases.insert(column.base);
+                }
+                if (const auto now = std::chrono::steady_clock::now(); now - table.last >= std::chrono::seconds(10)) {
+                    std::fprintf(stderr, "[direct-tables] 10 s: %llu stages, %.2f columns per stage, %.1f records per column (max %llu), %.0f bytes per column, %llu nested; %zu distinct column contents over %zu bases\n", static_cast<unsigned long long>(table.stages), table.stages ? static_cast<double>(table.columns) / table.stages : 0.0, table.columns ? static_cast<double>(table.records) / table.columns : 0.0, static_cast<unsigned long long>(table.maxRecords), table.columns ? static_cast<double>(table.bytes) / table.columns : 0.0, static_cast<unsigned long long>(table.nested), table.contents.size(), table.bases.size());
+                    if (table.columns != 0) std::fprintf(stderr, "[direct-tables] per column: %.2f keys, %.2f captured words, %.2f read ranges, %.2f codes, %.2f pointers; %llu outside\n", static_cast<double>(table.keys) / table.columns, static_cast<double>(table.words) / table.columns, static_cast<double>(table.readRanges) / table.columns, static_cast<double>(table.codes) / table.columns, static_cast<double>(table.pointers) / table.columns, static_cast<unsigned long long>(table.outside));
+                    table = {};
+                }
+            }
             report("image tables");
             return std::nullopt;
         }
