@@ -338,7 +338,11 @@ void Driver::execute(Submission& submission) {
                 continue;
             }
             if (!DrawPipeline::Queue0().Overlaps(awaited, awaitedBytes) && Pm4::WaitSatisfiedUnchecked(packet) && !OwnStoreRejects(packet, awaited, awaitedBytes, submission.queue)) {
-                bumpWaitEpoch(awaited, awaitedBytes);
+                // As waitMemory at entry: a value this queue's own label stored orders no CPU write.
+                // APS5_PIPELINED_WAIT_ALWAYS_BUMPS=1 bumps for every such wait as before.
+                static const bool alwaysBump = std::getenv("APS5_PIPELINED_WAIT_ALWAYS_BUMPS") != nullptr;
+                std::uint32_t writer = submission.queue;
+                if (alwaysBump || !storedSince(packet, awaited, awaitedBytes, submission.received, submission.queue, &writer) || writer != submission.queue) bumpEpoch(&EpochBumps::waits);
                 ++waitOutcomes().atEntry;
                 gateOpened() = true;
                 noteLabelPass(packet, submission.queue);
