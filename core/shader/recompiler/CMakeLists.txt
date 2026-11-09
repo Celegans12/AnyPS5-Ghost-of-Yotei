@@ -292,6 +292,7 @@ function(add_shader_recompiler target runtimeTarget)
             MatchesPreparedShader
             GetPreparedArtifact
             MaterializeShader
+            DirectStageSpecialization
             RegistrationResult
             ResolveSource
             ResourceMaterializer::EvaluateNanoseconds

@@ -91,6 +91,20 @@ void probeDirectEvaluation(const ShaderRecompiler::RecompileRequest& request, Vu
             samplers = capture->snapshot.samplers.size();
             tables = capture->snapshot.tables.tables.size();
             us = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+            static const bool materializeProbe = std::getenv("APS5_DIRECT_MAT_PROBE") != nullptr;
+            static std::atomic<std::uint64_t> materialized{0}, materializeFailed{0};
+            static std::atomic<double> materializeUs{0};
+            if (materializeProbe && tables == 0u) {
+                const auto materializeStarted = std::chrono::steady_clock::now();
+                try {
+                    static_cast<void>(ShaderRecompiler::DirectStageSpecialization(direct, *capture, *handle));
+                    ++materialized;
+                } catch (const std::exception&) {
+                    ++materializeFailed;
+                }
+                materializeUs = materializeUs.load() + std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - materializeStarted).count();
+                if ((materialized.load() + materializeFailed.load()) % 100000u == 0u) std::fprintf(stderr, "[direct-eval] materialize: %llu done, %llu failed, avg %.2f us\n", static_cast<unsigned long long>(materialized.load()), static_cast<unsigned long long>(materializeFailed.load()), materialized.load() != 0 ? materializeUs.load() / static_cast<double>(materialized.load()) : 0.0);
+            }
             if (textureProbe && device != nullptr && !capture->snapshot.images.empty()) {
                 const auto context = device->graphicsContext();
                 std::lock_guard gpu(GuestMemory::GpuMutex());

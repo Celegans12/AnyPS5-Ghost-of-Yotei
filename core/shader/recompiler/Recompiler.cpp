@@ -2497,30 +2497,10 @@ std::uint64_t ResultMemoBytes() {
     return resultMemoCounters().heldBytes.load(std::memory_order_relaxed);
 }
 
-void SetResourcePlanBudget(std::uint64_t bytes) {
-    resourcePlanBudgetBytes().store(bytes, std::memory_order_relaxed);
-    resourcePlans().trimmedTo.store(0, std::memory_order_relaxed);
-    trimResourcePlans(bytes);
-}
-
-ResourcePlanInterval TakeResourcePlanInterval() {
-    auto& plans = resourcePlans();
-    std::lock_guard lock(plans.reportMutex);
-    const auto reloads = plans.reloads.load(std::memory_order_relaxed);
-    const auto evictions = plans.evictions.load(std::memory_order_relaxed);
-    if (auto hook = std::exchange(plans.reportHook, nullptr)) hook();
-    return {reloads - std::exchange(plans.reportedReloads, reloads), evictions - std::exchange(plans.reportedEvictions, evictions)};
-}
-
-void SetResourcePlanReportHook(std::function<void()> hook) {
-    auto& plans = resourcePlans();
-    std::lock_guard lock(plans.reportMutex);
-    plans.reportHook = std::move(hook);
-}
-
-ResourcePlanCounters ResourcePlanTotals() {
-    auto& plans = resourcePlans();
-    return {plans.heldBytes.load(std::memory_order_relaxed), plans.heldPlans.load(std::memory_order_relaxed), plans.evictions.load(std::memory_order_relaxed), plans.reloads.load(std::memory_order_relaxed)};
+std::vector<PipelineSpecializationConstant> DirectStageSpecialization(const RecompileRequest& request, const ResourceCapture& capture, const SourceHandle& handle) {
+    const auto exports = request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{};
+    const auto plan = preparedBindingPlan(*handle.artifact, capture.snapshot, exports, request.target.registrationModules, {}, request.target.shaderImageMinLod);
+    return plan->bindings.specialization;
 }
 
 }
