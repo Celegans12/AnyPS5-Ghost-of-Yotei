@@ -15,7 +15,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
@@ -342,7 +344,31 @@ void Driver::execute(Submission& submission) {
                 // APS5_PIPELINED_WAIT_ALWAYS_BUMPS=1 bumps for every such wait as before.
                 static const bool alwaysBump = std::getenv("APS5_PIPELINED_WAIT_ALWAYS_BUMPS") != nullptr;
                 std::uint32_t writer = submission.queue;
-                if (alwaysBump || !storedSince(packet, awaited, awaitedBytes, submission.received, submission.queue, &writer) || writer != submission.queue) bumpEpoch(&EpochBumps::waits);
+                const bool since = storedSince(packet, awaited, awaitedBytes, submission.received, submission.queue, &writer);
+                // Rewrite: a value no write reached since this queue's last bump orders nothing new
+                // (unwrittenSinceLastBump); a label store of another queue since arrival still bumps.
+                const bool stale = !alwaysBump && !since && unwrittenSinceLastBump(awaited, awaitedBytes);
+                if (alwaysBump || ((!since || writer != submission.queue) && !stale)) bumpEpoch(&EpochBumps::waits);
+                // Debug aid (rewrite): APS5_TRACE_WAIT_WRITERS=1 sorts the pipelined at-entry waits
+                // that bump by who stored the awaited value.
+                static const bool traceWriters = std::getenv("APS5_TRACE_WAIT_WRITERS") != nullptr;
+                if (traceWriters) {
+                    enum { KeptOwn, OtherSince, OwnBefore, OtherBefore, NoStore, Kinds };
+                    static std::array<std::atomic<std::uint64_t>, Kinds> kinds{};
+                    static std::atomic<std::int64_t> printed{0};
+                    int kind = KeptOwn;
+                    if (since && writer != submission.queue) kind = OtherSince;
+                    if (!since) {
+                        std::uint32_t earlier = submission.queue;
+                        kind = !storedSince(packet, awaited, awaitedBytes, 0, submission.queue, &earlier) ? NoStore : earlier == submission.queue ? OwnBefore : OtherBefore;
+                    }
+                    ++kinds[kind];
+                    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+                    if (auto seen = printed.load(); now - seen >= 10 && printed.compare_exchange_strong(seen, now)) {
+                        std::fprintf(stderr, "[pipelined-waits] at entry (cumulative): kept own queue %llu; bumped: other queue since arrival %llu, own queue before arrival %llu, other queue before arrival %llu, no driver store %llu\n",
+                                     static_cast<unsigned long long>(kinds[KeptOwn].load()), static_cast<unsigned long long>(kinds[OtherSince].load()), static_cast<unsigned long long>(kinds[OwnBefore].load()), static_cast<unsigned long long>(kinds[OtherBefore].load()), static_cast<unsigned long long>(kinds[NoStore].load()));
+                    }
+                }
                 ++waitOutcomes().atEntry;
                 gateOpened() = true;
                 noteLabelPass(packet, submission.queue);

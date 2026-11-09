@@ -391,6 +391,11 @@ private:
     static void bumpEpoch(std::uint64_t EpochBumps::*counter);
     static void bumpWaitEpoch(std::uint64_t address, std::size_t bytes);
     static std::chrono::steady_clock::time_point& lastEpochBump();
+    // GuestMemory::WriteGeneration at this thread's last epoch bump (0 before the first).
+    static std::uint64_t& lastBumpGeneration();
+    // A wait satisfied by memory that no write reached since this thread's last bump orders
+    // nothing new: every write before the satisfying store was visible at that bump.
+    static bool unwrittenSinceLastBump(std::uint64_t address, std::size_t bytes);
     static std::deque<const std::uint32_t*>& releasedTails();
     void noteReleasedTails(const Submission& submission);
     static bool packetEpoch();
