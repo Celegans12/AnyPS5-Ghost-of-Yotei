@@ -5,6 +5,7 @@
 #include <array>
 #include <map>
 #include <stdexcept>
+#include <string>
 
 namespace AgcDriver::Graphics {
 
@@ -24,7 +25,7 @@ std::uint32_t samplerSlotsFor(const Context& context) {
 }
 
 bool DirectHeap::Supported(const Context& context) {
-    return context.descriptorIndexing && context.runtimeDescriptorArray && context.partiallyBound && context.sampledImageUpdateAfterBind && context.samplerTableUpdateAfterBind;
+    return context.descriptorIndexing && context.runtimeDescriptorArray && context.partiallyBound && context.sampledImageUpdateAfterBind;
 }
 
 DirectHeap::DirectHeap(const Context& context) : context(context), kinds(LastSampledKind + 1u) {
@@ -88,9 +89,32 @@ std::uint32_t DirectHeap::ImageSlot(std::uint32_t kind, VkImageView view, VkImag
     if (kind < FirstImageKind || kind > LastSampledKind || view == VK_NULL_HANDLE) return NoSlot;
     std::lock_guard lock(mutex);
     auto& entry = kinds[kind];
-    if (const auto found = entry.slots.find(view); found != entry.slots.end()) return found->second;
-    if (entry.next >= sampledSlotsFor(context)) return NoSlot;
-    const auto slot = entry.next++;
+    std::uint32_t slot = NoSlot;
+    if (const auto found = entry.slots.find(view); found != entry.slots.end()) {
+        if (!found->second.owner.expired()) return found->second.index;
+        slot = found->second.index;
+        entry.slots.erase(found);
+        ++recycled;
+    }
+    if (slot == NoSlot && entry.free.empty() && entry.next >= sampledSlotsFor(context)) {
+        for (auto it = entry.slots.begin(); it != entry.slots.end();) {
+            if (it->second.owner.expired()) {
+                entry.free.push_back(it->second.index);
+                it = entry.slots.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    if (slot == NoSlot && !entry.free.empty()) {
+        slot = entry.free.back();
+        entry.free.pop_back();
+        ++recycled;
+    }
+    if (slot == NoSlot) {
+        if (entry.next >= sampledSlotsFor(context)) return NoSlot;
+        slot = entry.next++;
+    }
     const VkDescriptorImageInfo info{VK_NULL_HANDLE, view, imageLayout};
     VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
     write.dstSet = set;
@@ -101,8 +125,7 @@ std::uint32_t DirectHeap::ImageSlot(std::uint32_t kind, VkImageView view, VkImag
     write.pImageInfo = &info;
     context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, 1u, &write, 0, nullptr);
     ++writes;
-    entry.slots.emplace(view, slot);
-    entry.kept.push_back(std::move(keep));
+    entry.slots[view] = {slot, keep};
     return slot;
 }
 
@@ -131,8 +154,18 @@ DirectHeap& DirectHeapFor(const Context& context) {
     static std::mutex mutex;
     static std::map<VkDevice, std::unique_ptr<DirectHeap>> heaps;
     std::lock_guard lock(mutex);
+    static std::map<VkDevice, std::string> failed;
+    if (const auto found = failed.find(context.device); found != failed.end()) throw std::runtime_error(found->second);
     auto& heap = heaps[context.device];
-    if (heap == nullptr) heap = std::make_unique<DirectHeap>(context);
+    if (heap == nullptr) {
+        try {
+            heap = std::make_unique<DirectHeap>(context);
+        } catch (const std::exception& error) {
+            heaps.erase(context.device);
+            failed[context.device] = error.what();
+            throw;
+        }
+    }
     return *heap;
 }
 

@@ -30,11 +30,16 @@ public:
     std::uint32_t ImageSlot(std::uint32_t kind, VkImageView view, VkImageLayout imageLayout, std::shared_ptr<void> keep);
     std::uint32_t SamplerSlot(VkSampler sampler, std::shared_ptr<void> keep);
     std::uint64_t Writes() const { return writes; }
+    std::uint64_t Recycled() const { return recycled; }
 
 private:
     struct Kind {
-        std::unordered_map<VkImageView, std::uint32_t> slots;
-        std::vector<std::shared_ptr<void>> kept;
+        struct Slot {
+            std::uint32_t index = 0;
+            std::weak_ptr<void> owner;
+        };
+        std::unordered_map<VkImageView, Slot> slots;
+        std::vector<std::uint32_t> free;
         std::uint32_t next = 1u;
     };
     Context context;
@@ -47,6 +52,7 @@ private:
     std::vector<std::shared_ptr<void>> keptSamplers;
     std::uint32_t nextSampler = 2u;
     std::uint64_t writes = 0;
+    std::uint64_t recycled = 0;
 };
 
 DirectHeap& DirectHeapFor(const Context& context);

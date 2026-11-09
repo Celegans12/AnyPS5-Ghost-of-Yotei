@@ -7,6 +7,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "Optimization/SrtWalker.hpp"
+#include "CompiledVariant.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectSlots.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DirectHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include <chrono>
@@ -112,6 +115,44 @@ void probeDirectEvaluation(const ShaderRecompiler::RecompileRequest& request, Vu
                 }
                 materializeUs = materializeUs.load() + std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - materializeStarted).count();
                 if ((materialized.load() + materializeFailed.load()) % 100000u == 0u) std::fprintf(stderr, "[direct-eval] materialize: %llu done, %llu failed, avg %.2f us\n", static_cast<unsigned long long>(materialized.load()), static_cast<unsigned long long>(materializeFailed.load()), materialized.load() != 0 ? materializeUs.load() / static_cast<double>(materialized.load()) : 0.0);
+            }
+            static const bool slotProbe = std::getenv("APS5_DIRECT_SLOT_PROBE") != nullptr;
+            if (slotProbe && tables == 0u && device != nullptr) {
+                static std::mutex slotMutex;
+                static DirectSlotStatistics slotTotals;
+                static std::uint64_t slotCalls = 0, slotFailed = 0;
+                static double slotUs = 0;
+                static std::map<std::string, std::uint64_t> slotReasons;
+                const auto context = device->graphicsContext();
+                std::vector<std::uint32_t> slots;
+                std::vector<std::shared_ptr<void>> keep;
+                DirectSlotStatistics statistics;
+                std::string reason;
+                bool filled = false;
+                const auto slotStarted = std::chrono::steady_clock::now();
+                {
+                    std::lock_guard gpu(GuestMemory::GpuMutex());
+                    filled = FillDirectSlots(context, handle->artifact->info, capture->snapshot, slots, keep, statistics, reason);
+                }
+                const auto spent = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - slotStarted).count();
+                std::lock_guard slotLock(slotMutex);
+                ++slotCalls;
+                slotUs += spent;
+                slotTotals.images += statistics.images;
+                slotTotals.inactiveImages += statistics.inactiveImages;
+                slotTotals.samplers += statistics.samplers;
+                slotTotals.textureLookups += statistics.textureLookups;
+                slotTotals.memoHits += statistics.memoHits;
+                if (!filled) {
+                    ++slotFailed;
+                    if (reason.size() > 120) reason.resize(120);
+                    ++slotReasons[reason];
+                }
+                static auto slotLast = std::chrono::steady_clock::now(); if (std::chrono::steady_clock::now() - slotLast >= std::chrono::seconds(10)) { slotLast = std::chrono::steady_clock::now();
+                    std::string line = "[direct-slots] " + std::to_string(slotCalls) + " stages, " + std::to_string(slotFailed) + " failed, avg " + std::to_string(slotUs / static_cast<double>(slotCalls)) + " us; images " + std::to_string(slotTotals.images) + " (inactive " + std::to_string(slotTotals.inactiveImages) + "), samplers " + std::to_string(slotTotals.samplers) + ", lookups " + std::to_string(slotTotals.textureLookups) + ", memo hits " + std::to_string(slotTotals.memoHits) + "; heap writes " + std::to_string(Graphics::DirectHeapFor(context).Writes()) + ";";
+                    for (const auto& [text, count] : slotReasons) line += " [" + std::to_string(count) + "x] " + text + ";";
+                    std::fprintf(stderr, "%s\n", line.c_str());
+                }
             }
             if (textureProbe && device != nullptr && !capture->snapshot.images.empty()) {
                 const auto context = device->graphicsContext();

@@ -293,6 +293,9 @@ function(add_shader_recompiler target runtimeTarget)
             GetPreparedArtifact
             MaterializeShader
             DirectStageSpecialization
+            ResourceMaterializer::RuntimeImageMode
+            DescriptorBindingForImage
+            ImageBindingResourceClass
             RegistrationResult
             ResolveSource
             ResourceMaterializer::EvaluateNanoseconds
