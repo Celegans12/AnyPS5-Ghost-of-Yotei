@@ -4607,6 +4607,10 @@ bool VulkanDevice::PresentsOnOwnQueue() const {
     return state->presentQueue != VK_NULL_HANDLE;
 }
 
+std::uint32_t VulkanDevice::MaxPushConstantBytes() const {
+    return state->properties.limits.maxPushConstantsSize;
+}
+
 ShaderRecompiler::SpirvTarget VulkanDevice::ComputeTarget(std::uint32_t waveSize) const {
     auto target = Target();
     target.float32FlushToZero = state->float32FlushToZero;
@@ -6008,7 +6012,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::RuntimeAbi::DirectHeapSet, 1, &heapSet, 0, nullptr);
     }
     if (record.pushStages != 0) {
-        context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes, record.pushBytes->data());
+        context.Resolved(&Graphics::DeviceFunctions::cmdPushConstants, "vkCmdPushConstants")(commands, record.objects->layout, VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushBytesFor(*record.shader->program), record.pushBytes->data());
     }
     static const bool reportingDispatch = LibcRunReportEnabled_nid_no_patch();
     if (reportingDispatch) recorder.NoteGuestWork(commands);
@@ -6154,7 +6158,7 @@ std::shared_ptr<ComputePipelineObjects> VulkanDevice::createComputePipeline(cons
     const bool directHeap = shader.directHeap;
     const auto emptyLayout = directHeap ? Graphics::PixelFunctionLdsSetLayouts(context).empty : VK_NULL_HANDLE;
     const std::array<VkDescriptorSetLayout, 5> setLayouts{setLayout, shader.workgroupMemoryDwords != 0 || scratchPool ? state->workgroupMemoryLayout : emptyLayout, scratchPool ? state->workgroupMemoryLayout : emptyLayout, emptyLayout, directHeap ? Graphics::DirectHeapFor(context).Layout() : VK_NULL_HANDLE};
-    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushConstantBytes};
+    const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, Graphics::ComputePushBytesFor(shader)};
     VkPipelineLayoutCreateInfo layoutInfo{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
     layoutInfo.setLayoutCount = directHeap ? ShaderRecompiler::RuntimeAbi::DirectHeapSet + 1 : scratchPool ? ShaderRecompiler::ScratchPoolDescriptorSet + 1 : shader.workgroupMemoryDwords != 0 ? ShaderRecompiler::WorkgroupMemoryDescriptorSet + 1 : 1;
     layoutInfo.pSetLayouts = setLayouts.data();

@@ -13,7 +13,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "CompiledVariant.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectSlots.hpp"
@@ -40,7 +40,7 @@ bool DirectDispatchEnabled() {
     return enabled;
 }
 
-std::shared_ptr<const ShaderRecompiler::SourceHandle> DirectDispatchHandle(const ShaderRecompiler::RecompileRequest& request) {
+std::shared_ptr<const ShaderRecompiler::SourceHandle> DirectDispatchHandle(const ShaderRecompiler::RecompileRequest& request, std::uint32_t pushBytes) {
     struct Known {
         std::size_t codeHash;
         std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
@@ -57,6 +57,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> DirectDispatchHandle(const
     auto direct = request;
     direct.target.directResources = true;
     direct.target.directFoldSrt = DirectFoldSrt();
+    if (direct.layout.pushConstantSizeBytes == Graphics::ComputePushConstantBytes) direct.layout.pushConstantSizeBytes = pushBytes;
     std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
     const char* refusal = nullptr;
     try {
@@ -95,8 +96,11 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> DirectDispatchHandle(const
         for (const auto& sampler : info.samplers) {
             if (sampler.table != ShaderRecompiler::NoTable) refusal = "sampler table";
         }
-    } catch (const std::exception&) {
-        refusal = "direct form failed";
+    } catch (const std::exception& error) {
+        static thread_local std::string failure;
+        failure = std::string("direct form failed: ") + error.what();
+        if (failure.size() > 200) failure.resize(200);
+        refusal = failure.c_str();
     }
     if (refusal != nullptr) handle = nullptr;
     if (handle != nullptr && std::getenv("APS5_DIRECT_DISPATCH_VERBOSE") != nullptr) {
@@ -287,10 +291,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u),
         {0, 0, 0, threadGroup != std::array<std::uint32_t, 3>{} ? 0u : 128u}
     };
-    const auto directHandle = DirectDispatchEnabled() ? DirectDispatchHandle(request) : nullptr;
+    // Direct compute keeps its ShaderData in push constants: the heap slot words would otherwise push
+    // most shaders past 128 bytes into a storage buffer, uploaded with a barrier per dispatch. 256 bytes
+    // when the device allows; APS5_DIRECT_NARROW_PUSH=1 keeps 128.
+    static const bool narrowPush = std::getenv("APS5_DIRECT_NARROW_PUSH") != nullptr;
+    const std::uint32_t directPushBytes = !narrowPush && localDevice->MaxPushConstantBytes() >= Graphics::PipelinePushConstantBytes ? Graphics::PipelinePushConstantBytes : Graphics::ComputePushConstantBytes;
+    const auto directHandle = DirectDispatchEnabled() ? DirectDispatchHandle(request, directPushBytes) : nullptr;
     if (directHandle != nullptr) {
         request.target.directResources = true;
         request.target.directFoldSrt = DirectFoldSrt();
+        if (request.layout.pushConstantSizeBytes == Graphics::ComputePushConstantBytes) request.layout.pushConstantSizeBytes = directPushBytes;
     }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static std::atomic<double> captureMs{0}, keyMs{0}, recompileMs{0}, deviceMs{0};
