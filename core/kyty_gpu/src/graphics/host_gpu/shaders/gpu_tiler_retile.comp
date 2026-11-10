@@ -1,0 +1,71 @@
+#version 450
+#extension GL_EXT_shader_8bit_storage : require
+
+// KYTY_FIX_IMAGE_MEMORY_OWNER: one pass that gives a target image the guest bytes a source image holds over whole
+// blocks of guest memory both images cover. The blocks' texel rectangles of both images are copied into linear
+// buffers (raw texel bits; a block's rows `pitch` bytes apart: side-by-side blocks share one copied rectangle) around
+// this pass. One work-group row per block: for each
+// target texel of the block, its byte offset in the block (the target's in-block table, XOR the block position's
+// value), then for each source element covering those bytes its texel (the source's inverse in-block table at the
+// offset XOR the source block's value); bytes of source texels outside the source's extent keep the target's.
+
+layout(local_size_x = 64) in;
+
+struct Job {
+	uint t_x0;
+	uint t_y0;
+	uint w; // target texels of the block inside the target's extent
+	uint h;
+	uint s_x0;
+	uint s_y0;
+	uint s_w; // source texels of the block inside the source's extent
+	uint s_h;
+	uint t_xor;
+	uint s_xor;
+	uint t_base; // byte offset of the target rectangle in the target buffer
+	uint s_base; // byte offset of the source rectangle in the source buffer
+	uint t_pitch; // bytes between the target rectangle's rows
+	uint s_pitch; // bytes between the source rectangle's rows
+};
+
+layout(set = 0, binding = 0, std430) readonly buffer Source { uint8_t source_bytes[]; };
+layout(set = 0, binding = 1, std430) buffer Target { uint8_t target_bytes[]; };
+layout(set = 0, binding = 2, std430) readonly buffer Jobs { Job jobs[]; };
+layout(set = 0, binding = 3, std430) readonly buffer Tables { uint tables[]; };
+
+layout(push_constant) uniform Params {
+	uint t_bpe;
+	uint s_bpe;
+	uint t_block_width;
+	uint t_forward; // word index of the target's table: in-block (x, y) -> byte offset
+	uint s_inverse; // word index of the source's table: element index -> x | y << 16
+	uint job_count;
+} p;
+
+void main() {
+	const uint job_index = gl_WorkGroupID.y;
+	if (job_index >= p.job_count) return;
+	const Job  job   = jobs[job_index];
+	const uint texel = gl_WorkGroupID.x * 64u + gl_LocalInvocationID.x;
+	if (texel >= job.w * job.h) return;
+	const uint u        = texel % job.w;
+	const uint v        = texel / job.w;
+	const uint t_offset = tables[p.t_forward + v * p.t_block_width + u] ^ job.t_xor;
+	const uint target   = job.t_base + v * job.t_pitch + u * p.t_bpe;
+	uint       k        = 0u;
+	for (uint step = 0u; step < 16u && k < p.t_bpe; step++) {
+		const uint offset = t_offset + k;
+		const uint base   = offset & ~(p.s_bpe - 1u);
+		const uint place  = tables[p.s_inverse + ((base ^ job.s_xor) / p.s_bpe)];
+		const uint su     = place & 0xffffu;
+		const uint sv     = place >> 16u;
+		const uint chunk  = max(min(p.s_bpe - (offset - base), p.t_bpe - k), 1u);
+		if (place != 0xffffffffu && su < job.s_w && sv < job.s_h) {
+			const uint source = job.s_base + sv * job.s_pitch + su * p.s_bpe + (offset - base);
+			for (uint c = 0u; c < chunk; c++) {
+				target_bytes[target + k + c] = source_bytes[source + c];
+			}
+		}
+		k += chunk;
+	}
+}

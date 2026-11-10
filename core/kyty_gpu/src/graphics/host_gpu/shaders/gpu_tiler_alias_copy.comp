@@ -1,0 +1,94 @@
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_8bit_storage : require
+// KYTY_FIX_SHARED_IMAGE_MEMORY's direct path (TileManager::AliasCopy): one guest memory under two images. For every
+// texel of the target's level 0 (layer 0) in its linear host copy, the guest bytes of the texel are found in the
+// source's layout (its level 0, layer 0); every byte a source texel covers takes that byte, the others keep the
+// target's. Both linear copies hold host elements; the colour transforms turn them into guest bytes and back.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, std430) buffer Target { uint8_t data[]; } target;
+layout(set = 0, binding = 1, std430) readonly buffer Source { uint8_t data[]; } source;
+layout(set = 0, binding = 2, std430) readonly buffer Tables { uint data[]; } tables;
+
+layout(push_constant) uniform Params {
+	uint t_width;
+	uint t_height;
+	uint t_pitch;       // bytes per row of the target's linear copy
+	uint t_bpe;
+	uint t_block_shape; // block width | block height << 16 (elements)
+	uint t_columns;     // blocks per row
+	uint t_block_bytes;
+	uint t_table;       // first word of the target's in-block offsets (index y * block width + x)
+	uint s_width;
+	uint s_height;
+	uint s_pitch;
+	uint s_bpe;
+	uint s_block_shape;
+	uint s_columns;
+	uint s_block_bytes;
+	uint s_table;       // first word of the source's in-block positions (index offset / bpe: x | y << 16)
+	int  delta;         // target level 0 address - source level 0 address
+	uint s_size;        // bytes of the source's level 0
+	uint transforms;    // target transform | source transform << 8 (imageInfo.h ColorTransform)
+} p;
+
+#include "gpu_tiler_color.inc"
+
+uvec4 load_element(bool from_target, uint at, uint bpe) {
+	uvec4 v = uvec4(0u);
+	for (uint i = 0u; i < bpe; ++i) {
+		uint b = from_target ? uint(target.data[at + i]) : uint(source.data[at + i]);
+		v[i >> 2u] |= b << ((i & 3u) * 8u);
+	}
+	return v;
+}
+
+uvec4 transform(uvec4 v, uint kind, bool to_host) {
+	if (kind == 0u) return v;
+	uvec2 r = transform_color(v.xy, kind, to_host);
+	return uvec4(r, v.zw);
+}
+
+void main() {
+	uint x = gl_GlobalInvocationID.x;
+	uint y = gl_GlobalInvocationID.y;
+	if (x >= p.t_width || y >= p.t_height) return;
+	uint tbw = p.t_block_shape & 0xffffu, tbh = p.t_block_shape >> 16u;
+	uint sbw = p.s_block_shape & 0xffffu, sbh = p.s_block_shape >> 16u;
+	uint in_block = tables.data[p.t_table + (y % tbh) * tbw + (x % tbw)];
+	uint address  = ((y / tbh) * p.t_columns + (x / tbw)) * p.t_block_bytes + in_block;
+	int  first    = int(address) + p.delta; // the texel's first byte, from the source's level 0
+	if (first + int(p.t_bpe) <= 0 || first >= int(p.s_size)) return;
+	uint  t_at   = y * p.t_pitch + x * p.t_bpe;
+	uvec4 guest  = transform(load_element(true, t_at, p.t_bpe), p.transforms & 0xffu, false);
+	bool  change = false;
+	uint  cached = 0xffffffffu;
+	uvec4 s_guest = uvec4(0u);
+	for (uint j = 0u; j < p.t_bpe; ++j) {
+		int a = first + int(j);
+		if (a < 0 || a >= int(p.s_size)) continue;
+		uint ua    = uint(a);
+		uint block = ua / p.s_block_bytes;
+		uint inb   = ua % p.s_block_bytes;
+		uint pos   = tables.data[p.s_table + inb / p.s_bpe];
+		uint sx    = (block % p.s_columns) * sbw + (pos & 0xffffu);
+		uint sy    = (block / p.s_columns) * sbh + (pos >> 16u);
+		if (sx >= p.s_width || sy >= p.s_height) continue;
+		uint s_at = sy * p.s_pitch + sx * p.s_bpe;
+		if (s_at != cached) {
+			s_guest = transform(load_element(false, s_at, p.s_bpe), p.transforms >> 8u, false);
+			cached  = s_at;
+		}
+		uint k     = inb % p.s_bpe;
+		uint value = (s_guest[k >> 2u] >> ((k & 3u) * 8u)) & 0xffu;
+		uint shift = (j & 3u) * 8u;
+		guest[j >> 2u] = (guest[j >> 2u] & ~(0xffu << shift)) | (value << shift);
+		change = true;
+	}
+	if (!change) return;
+	uvec4 host = transform(guest, p.transforms & 0xffu, true);
+	for (uint i = 0u; i < p.t_bpe; ++i) {
+		target.data[t_at + i] = uint8_t((host[i >> 2u] >> ((i & 3u) * 8u)) & 0xffu);
+	}
+}
