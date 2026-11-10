@@ -2409,6 +2409,36 @@ bool importsStale(const Context& context, const HostImports& state) {
     return state.device != context.device || GuestAllocations::GuestAllocationsGeneration_nid_postfix() != state.refreshedGeneration;
 }
 
+std::vector<const HostImport*> wholeRunImports(const Context& context, HostImports& state, const GuestAllocations::Lease& lease) {
+    static const bool disabled = std::getenv("APS5_NO_WHOLE_RUN_IMPORT_PASS") != nullptr;
+    std::vector<const HostImport*> taken;
+    if (disabled || state.imports.empty()) return taken;
+#ifdef _WIN32
+    settleUnwatchedImports(context, state);
+#endif
+    if (importsStale(context, state)) return taken;
+    taken.assign(lease.size(), nullptr);
+    const auto limit = importMaxBytes.load(std::memory_order_relaxed);
+    std::size_t index = 0;
+    for (const auto& [base, entry] : state.imports) {
+        while (index < lease.size() && lease[index]->address < base) ++index;
+        if (index == lease.size()) break;
+        const auto count = entry.ranges.size();
+        if (count == 0 || lease[index]->address != base || count > lease.size() - index) continue;
+        const auto& last = *lease[index + count - 1];
+        bool same = last.address + last.bytes == entry.base + entry.bytes;
+        for (std::size_t member = 0; same && member < count; ++member) {
+            const auto& range = lease[index + member];
+            same = entry.ranges[member] == range && (limit == 0 || range->bytes <= limit);
+        }
+        if (!same) continue;
+        entry.lastUse = ++state.useCounter;
+        std::fill_n(taken.begin() + static_cast<std::ptrdiff_t>(index), count, &entry);
+        index += count;
+    }
+    return taken;
+}
+
 // The mirror registry: by range base. The map is protected by `mutex` (findMirror runs in a build's
 // unlocked stage A, UploadPrepare); the mirrors' contents (fills, refreshes, sweeps) change under
 // GuestMemory::GpuMutex only (every completion and every stage B holds it). APS5_NO_LEASE_MIRROR=1
@@ -4550,6 +4580,7 @@ void GuestBufferMemory::AcquireRegistered() {
         // Pending GPU results in these ranges are stored when Upload prepares each region.
         lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
         lap(timing.leaseUs, at);
+        std::vector<const HostImport*> taken;
         {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
@@ -4561,7 +4592,18 @@ void GuestBufferMemory::AcquireRegistered() {
             // completions can retire an import already taken; that moves the epoch, and Upload then
             // re-checks every pointer instead of trusting it.
             importsEpoch = state.epoch;
+            if (importable) taken = wholeRunImports(context, state, lease);
         }
+        const auto dropRetired = [&] {
+            if (taken.empty()) return;
+            auto& state = Imports();
+            std::lock_guard lock(state.mutex);
+            if (state.epoch != importsEpoch) taken.clear();
+        };
+        struct DropRetired {
+            decltype(dropRetired)& run;
+            ~DropRetired() { run(); }
+        };
         lap(timing.importsUs, at);
         // One pass in the registry's (ascending) order, so the regions come out sorted for AddSnapshot.
         // The import lock is taken per range: a mirror's preparation may wait for recorded work, which
@@ -4579,7 +4621,8 @@ void GuestBufferMemory::AcquireRegistered() {
         std::uint64_t coveredBegin = 0;
         std::uint64_t coveredEnd = 0;
         std::uint64_t copiedBytes = 0;
-        for (const auto& range : lease) {
+        for (std::size_t leased = 0; leased < lease.size(); ++leased) {
+            const auto& range = lease[leased];
             if (!range->readable || !range->gpu) continue;
             validate(range->address, range->bytes);
             Region region{range->address, range->address + range->bytes, range->writable, {}, nullptr};
@@ -4587,6 +4630,15 @@ void GuestBufferMemory::AcquireRegistered() {
             bool overBudget = false;
             std::vector<ImportPiece> pieces;
             const auto limit = importMaxBytes.load(std::memory_order_relaxed);
+            if (!taken.empty() && taken[leased] != nullptr) {
+                entry = taken[leased];
+                region.hostBacked = true;
+                region.direct = entry;
+                regions.push_back(std::move(region));
+                imported.emplace_back(range->address, range->address + range->bytes);
+                continue;
+            }
+            const DropRetired retiredCheck{dropRetired};
             if (importable && covering != nullptr && range->address >= coveredBegin && range->address + range->bytes <= coveredEnd) {
                 entry = covering;
             } else if (importable && limit != 0 && range->bytes > limit) {
