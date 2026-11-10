@@ -898,6 +898,11 @@ std::uint64_t ForgetStamp(std::uint64_t address, std::size_t bytes) {
     return newest;
 }
 
+std::uint64_t ForgetGuard(std::uint64_t address, std::size_t bytes) {
+    const auto serial = forgetSerial.load(std::memory_order_acquire);
+    return (serial & 1u) != 0 ? serial : ForgetStamp(address, bytes);
+}
+
 Commitment DescribeCommitted(std::uint64_t address, std::size_t bytes, bool writable) {
     require(bytes <= std::numeric_limits<std::uint64_t>::max() - address, "address range overflow");
     const TimedAccess timed(CounterVerify, bytes);

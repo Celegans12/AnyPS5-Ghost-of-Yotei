@@ -366,6 +366,7 @@ bool SpeculativeReader();
 // the states it consulted were current and no page it read changed its mapping meanwhile.
 std::uint64_t ForgetSerial();
 std::uint64_t ForgetStamp(std::uint64_t address, std::size_t bytes);
+std::uint64_t ForgetGuard(std::uint64_t address, std::size_t bytes);
 
 // Attribution of guest memory accesses (the [hooksync] line in Recorder.cpp and the read-site
 // counts of the [guestmem] line, APS5_PROFILE_DRAW): a sync the flush hook makes for an access has

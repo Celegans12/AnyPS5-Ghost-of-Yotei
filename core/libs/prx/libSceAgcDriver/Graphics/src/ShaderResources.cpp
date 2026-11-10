@@ -853,7 +853,7 @@ bool snapshotStillMatches(std::uint64_t address, std::size_t bytes, std::span<co
 
 std::array<std::uint64_t, 2> untrackedGuard(std::uint64_t address, std::size_t bytes) {
     const auto* recorder = Recorder::Active();
-    return {GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+    return {GuestMemory::ForgetGuard(address, bytes), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
 }
 
 std::uint64_t untrackedBaseline(std::uint64_t address, std::size_t bytes, GuestMemory::Commitment& layout) {
@@ -1372,7 +1372,7 @@ std::array<std::uint64_t, 4> untrackedKey(std::uint64_t address, std::size_t byt
     const auto hint = GuestMemory::UntrackedHint(address, bytes);
     if (hint == 0) return {};
     const auto* recorder = Recorder::Active();
-    const std::array<std::uint64_t, 4> key{hint, GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
+    const std::array<std::uint64_t, 4> key{hint, GuestMemory::NewestStamp(address, bytes), GuestMemory::ForgetGuard(address, bytes), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
     return (key[2] & 1u) == 0 ? key : std::array<std::uint64_t, 4>{};
 }
 

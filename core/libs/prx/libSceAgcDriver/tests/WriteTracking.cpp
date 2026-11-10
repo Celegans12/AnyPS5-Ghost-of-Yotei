@@ -79,6 +79,24 @@ bool CheckMetadataCommit() {
     return true;
 }
 
+void CheckForgetGuard() {
+    static std::array<std::uint8_t, 6 * Block> storage{};
+    const auto base = (reinterpret_cast<std::uint64_t>(storage.data()) + Block - 1) & ~std::uint64_t{Block - 1};
+    static_cast<void>(Accessible(storage.data(), 1));
+    const auto serial = ForgetSerial();
+    const auto guard = ForgetGuard(base, 2 * Block);
+    Require((guard & 1u) == 0, "a forget guard read with no forget in flight is odd");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(base + 3 * Block), Block);
+    if (ForgetSerial() == serial) return;
+    Require(ForgetSerial() == serial + 2, "a forget did not move the forget serial past itself");
+    Require(ForgetGuard(base, 2 * Block) == guard, "a forget of other memory moved a range's forget guard");
+    Require(ForgetGuard(base + 3 * Block, Block) == serial + 2, "a forget left the forget guard of the memory it covers");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(base + 2 * Block - 4096), 8192);
+    Require(ForgetGuard(base, 2 * Block) == serial + 4, "a forget of a range's last page left its forget guard");
+    Require(ForgetGuard(base, Block) == guard, "a forget beyond a range's last block moved its forget guard");
+    Require(ForgetGuard(base + 4 * Block, Block) == guard, "a forget before a range's first block moved its forget guard");
+}
+
 void CheckSparseLeafBoundaries() {
     constexpr std::uintptr_t LeafBytes = std::uintptr_t{1} << 32;
     std::uintptr_t arena = 0;
@@ -3482,6 +3500,7 @@ int main(int argc, char** argv) {
         }
         CheckContentHashes();
         CheckParallelBlockHashes();
+        CheckForgetGuard();
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;
