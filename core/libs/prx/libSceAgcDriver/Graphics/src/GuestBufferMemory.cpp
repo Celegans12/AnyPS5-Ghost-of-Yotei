@@ -1687,15 +1687,18 @@ std::uint64_t retireLeastRecent(const Context& context, HostImports& state, cons
 }
 
 std::uint64_t physicalMemoryBytes() {
+    static const std::uint64_t installed = []() -> std::uint64_t {
 #ifdef _WIN32
-    MEMORYSTATUSEX status{};
-    status.dwLength = sizeof(status);
-    return GlobalMemoryStatusEx(&status) ? status.ullTotalPhys : 0;
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        return GlobalMemoryStatusEx(&status) ? status.ullTotalPhys : 0;
 #else
-    const auto pages = sysconf(_SC_PHYS_PAGES);
-    const auto pageSize = sysconf(_SC_PAGESIZE);
-    return pages > 0 && pageSize > 0 ? static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(pageSize) : 0;
+        const auto pages = sysconf(_SC_PHYS_PAGES);
+        const auto pageSize = sysconf(_SC_PAGESIZE);
+        return pages > 0 && pageSize > 0 ? static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(pageSize) : 0;
 #endif
+    }();
+    return installed;
 }
 
 std::atomic<std::uint64_t> budgetOverride{0};
