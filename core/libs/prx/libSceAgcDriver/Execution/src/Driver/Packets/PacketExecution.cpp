@@ -275,7 +275,7 @@ void Driver::timed(double WorkerProfile::*bucket, TWork&& work) {
             std::shared_ptr<const ShaderRegistry> registry;
             {
                 std::lock_guard lock(driver.mutex);
-                registry = driver.shaders;
+                registry = driver.shaders.Share();
             }
             ReportRegisteredShaderMemory(*registry, "after_host_work");
         }

@@ -184,6 +184,34 @@ void FailedRegistrationPublication() {
     }
 }
 
+void SharedRegistryPublication() {
+    const auto makeSnapshot = [](std::uint64_t codeAddress) {
+        auto snapshot = std::make_shared<ShaderSnapshot>();
+        snapshot->codeAddress = codeAddress;
+        snapshot->headerAddress = codeAddress + 0x80u;
+        snapshot->code = {0xbf810000u};
+        return snapshot;
+    };
+    SharedShaderRegistry shaders;
+    const auto first = makeSnapshot(0x10000);
+    const auto second = makeSnapshot(0x20000);
+    const auto third = makeSnapshot(0x30000);
+    const auto fourth = makeSnapshot(0x40000);
+    shaders.Publish(first);
+    const auto afterFirst = shaders.Share();
+    Require(afterFirst->size() == 1u && RegisteredProgram(*afterFirst, 0x10000, {0}) == first, "a published shader was missing from the shared registry");
+    shaders.Publish(second);
+    Require(afterFirst->size() == 1u && !afterFirst->contains(0x20000), "a publication changed a registry that had been shared");
+    shaders.Publish(third);
+    const auto afterThird = shaders.Share();
+    Require(afterThird != afterFirst && afterThird->size() == 3u && RegisteredProgram(*afterThird, 0x20000, {0}) == second && RegisteredProgram(*afterThird, 0x30000, {0}) == third, "publications between two shares were lost");
+    Require(shaders.Share() == afterThird, "sharing an unchanged registry replaced it");
+    shaders.Publish(makeSnapshot(0x30000));
+    Require(shaders.Share() == afterThird, "an identical registration replaced a shared registry");
+    shaders.Publish(fourth);
+    Require(afterThird->size() == 3u && shaders->size() == 4u && shaders.Share() != afterThird, "a publication after a share did not leave the shared registry as it was");
+}
+
 void RegistryVersions() {
     using Expected = std::map<std::uint64_t, std::shared_ptr<const ShaderSnapshot>>;
     const auto matches = [](const ShaderRegistry& current, const Expected& expected) {
@@ -472,6 +500,7 @@ int main() {
         Transactions();
         HeaderSelection();
         FailedRegistrationPublication();
+        SharedRegistryPublication();
         RegistryVersions();
         FusedHullHeaderSelection();
         TransactionLock();

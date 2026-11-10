@@ -997,30 +997,56 @@ std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& re
     return result;
 }
 
+namespace {
+
+std::shared_ptr<const ShaderSnapshot> PublishedOver(const ShaderRegistry& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot) {
+    const auto found = registry.find(snapshot->codeAddress);
+    if (found == registry.end()) return snapshot;
+    for (const auto& current : found->second) {
+        if (current->headerAddress == snapshot->headerAddress && current->type == snapshot->type && current->code == snapshot->code && current->header == snapshot->header && !RegisteredPreparationFailed(*current)) {
+            return current == found->second.back() ? nullptr : current;
+        }
+    }
+    return snapshot;
+}
+
+void PlacePublished(ShaderRegistry& registry, const ShaderSnapshot& snapshot, std::shared_ptr<const ShaderSnapshot> published) {
+    auto& headers = registry[snapshot.codeAddress];
+    std::erase_if(headers, [&](const auto& current) { return current->headerAddress == snapshot.headerAddress || current->code != snapshot.code; });
+    headers.push_back(std::move(published));
+}
+
+}
+
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot) {
     ShaderPreparationTransaction transaction;
     transaction.Hold();
-    auto published = snapshot;
-    if (registry != nullptr) {
-        const auto found = registry->find(snapshot->codeAddress);
-        if (found != registry->end()) {
-            for (const auto& current : found->second) {
-                if (current->headerAddress == snapshot->headerAddress && current->type == snapshot->type && current->code == snapshot->code && current->header == snapshot->header && !RegisteredPreparationFailed(*current)) {
-                    if (current == found->second.back()) {
-                        transaction.Commit();
-                        return;
-                    }
-                    published = current;
-                    break;
-                }
-            }
-        }
+    auto published = registry != nullptr ? PublishedOver(*registry, snapshot) : snapshot;
+    if (published == nullptr) {
+        transaction.Commit();
+        return;
     }
     auto next = registry != nullptr ? std::make_shared<ShaderRegistry>(*registry) : std::make_shared<ShaderRegistry>();
-    auto& headers = (*next)[snapshot->codeAddress];
-    std::erase_if(headers, [&](const auto& current) { return current->headerAddress == snapshot->headerAddress || current->code != snapshot->code; });
-    headers.push_back(published);
+    PlacePublished(*next, *snapshot, std::move(published));
     registry = std::move(next);
+    transaction.Commit();
+}
+
+std::shared_ptr<const ShaderRegistry> SharedShaderRegistry::Share() {
+    shared = true;
+    return registry;
+}
+
+void SharedShaderRegistry::Publish(const std::shared_ptr<const ShaderSnapshot>& snapshot) {
+    if (shared) {
+        const auto* previous = registry.get();
+        PublishRegisteredShader(registry, snapshot);
+        shared = registry.get() == previous;
+        return;
+    }
+    ShaderPreparationTransaction transaction;
+    transaction.Hold();
+    if (auto published = PublishedOver(*registry, snapshot)) PlacePublished(*registry, *snapshot, std::move(published));
     transaction.Commit();
 }
 
@@ -2209,7 +2235,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
     std::vector<std::shared_ptr<const ShaderSnapshot>> selectedStages;
     {
         std::lock_guard lock(mutex);
-        registry = shaders;
+        registry = shaders.Share();
         for (const auto* shader : stages) {
             const auto fields = GuestShaderFields(shader);
             const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code));
@@ -2650,7 +2676,7 @@ ShaderSnapshot PrepareDepthCopyPixelProgram(bool multisampled) {
 
 std::shared_ptr<const ShaderRegistry> Driver::RegisteredShaders() {
     std::lock_guard lock(mutex);
-    return shaders;
+    return shaders.Share();
 }
 
 void Driver::RegisterShader(const Shader* shader) {
@@ -2685,7 +2711,7 @@ void Driver::RegisterShader(const Shader* shader) {
                 for (const auto& current : found->second) {
                     if (current->headerAddress == snapshot.headerAddress && current->type == snapshot.type && current->code == snapshot.code && current->header == snapshot.header && !RegisteredPreparationFailed(*current)) {
                         const auto identical = current;
-                        PublishRegisteredShader(shaders, identical);
+                        shaders.Publish(identical);
                         transaction.Commit();
                         return;
                     }
@@ -2758,17 +2784,17 @@ void Driver::RegisterShader(const Shader* shader) {
     const auto published = std::make_shared<const ShaderSnapshot>(std::move(snapshot));
     std::unique_lock lock(mutex);
     rethrowFailure();
-    PublishRegisteredShader(shaders, published);
+    shaders.Publish(published);
     if (shaders->find(NullPixelProgramAddress()) == shaders->end()) {
-        PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(PrepareNullPixelProgram(*localDevice)));
+        shaders.Publish(std::make_shared<const ShaderSnapshot>(PrepareNullPixelProgram(*localDevice)));
     }
     for (const bool multisampled : {false, true}) {
-        if (shaders->find(DepthCopyPixelProgramAddress(multisampled)) == shaders->end()) PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(PrepareDepthCopyPixelProgram(multisampled)));
+        if (shaders->find(DepthCopyPixelProgramAddress(multisampled)) == shaders->end()) shaders.Publish(std::make_shared<const ShaderSnapshot>(PrepareDepthCopyPixelProgram(multisampled)));
     }
     transaction.Commit();
     if (preparation != nullptr) PrepareRegisteredInBackground(published, std::move(preparation));
     if (RegisteredShaderMemoryDue(shaders->size())) {
-        const auto registry = shaders;
+        const auto registry = shaders.Share();
         lock.unlock();
         ReportRegisteredShaderMemory(*registry, "registration");
     }
@@ -2786,7 +2812,7 @@ void Driver::AppendMemoryStats(std::string& line) {
     std::shared_ptr<const ShaderRegistry> registry;
     for (int attempt = 0; attempt < 50 && registry == nullptr; ++attempt) {
         std::unique_lock lock(driver.mutex, std::try_to_lock);
-        if (lock.owns_lock()) registry = driver.shaders;
+        if (lock.owns_lock()) registry = driver.shaders.Share();
         else std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     if (registry != nullptr) {
