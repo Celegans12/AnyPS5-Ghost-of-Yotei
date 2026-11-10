@@ -5,7 +5,7 @@
 
 #include <cstdint>
 
-// KYTY_PERF_BAR_GPU_COPY=<KiB> (default 0, off; live A/B switch; lane v4e of AnyPS5's PLAN v4): a host-mapped download
+// KYTY_PERF_BAR_GPU_COPY=<KiB> (default 8; 0 off; live A/B switch; lane v4e of AnyPS5's PLAN v4): a host-mapped download
 // (BufferCache::TryBarDownload) of at least that many GPU-written bytes is not read by the CPU from the resizable-BAR
 // mapping but copied by the GPU into a host-cached staging buffer, on a second queue of the universal family, and
 // published from there. On a laptop RTX 3080 a CPU read of BAR memory runs at ~50-90 MB/s (streaming loads, one line in
@@ -15,7 +15,7 @@
 // writes them (TryBarDownload's own conditions), and they are published to guest memory by the same calls in the same
 // order. Only where the CPU reads them from changes.
 //
-// KYTY_PERF_BAR_GPU_LARGE=1 (default 0, off; live A/B switch): the host-mapped download takes finished read windows of up
+// KYTY_PERF_BAR_GPU_LARGE=1 (default 1; 0 off; live A/B switch): the host-mapped download takes finished read windows of up
 // to 8 MiB GPU-written bytes instead of 1 MiB (BufferCache::ReadRange, PlanCallerWait, TryBarDownload), and every
 // download above 1 MiB is copied by the GPU as above. Such a window otherwise takes the copy path: the open command
 // buffer is submitted with the copy and the whole queue is waited for. Which bytes a read publishes ahead changes; every

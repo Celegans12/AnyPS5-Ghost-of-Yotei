@@ -3963,7 +3963,8 @@ uint32_t BarGpuCopyFixed() {
 
 uint32_t BarGpuLargeFixed() {
 	static const uint32_t value = [] {
-		const char* text = std::getenv("KYTY_PERF_BAR_GPU_LARGE");
+		// Default from Common::EnvDefaults (on); =0 turns it off.
+		const char* text = Common::EnvOrDefault("KYTY_PERF_BAR_GPU_LARGE");
 		const bool  on   = text != nullptr && text[0] == '1';
 		if (on) std::fprintf(stderr, "PERF_BAR_GPU_LARGE finished read windows of up to 8 MiB are copied by the GPU\n");
 		return on ? 1u : 0u;

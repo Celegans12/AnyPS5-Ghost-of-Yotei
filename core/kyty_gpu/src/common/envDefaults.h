@@ -48,6 +48,10 @@ inline constexpr EnvDefault EnvDefaults[] = {
     // Measured performance switch, exact (AnyPS5 v4e: +17.6 % in-run A/B, 1,172 GPU copies verified against the BAR
     // read with 0 mismatches): host-mapped downloads of 8 KiB and more are copied by the GPU (cache/barGpuCopy.h).
     {"KYTY_PERF_BAR_GPU_COPY", "8", "config", ""},
+    // Measured performance switch, exact, on top of the GPU copy (AnyPS5 v4 integration: +7.5 % and +6.1 % in two in-run
+    // A/Bs, faster in 10 of 10 cycles each; v4e verified its copies against the BAR read with 0 mismatches): finished
+    // read windows of up to 8 MiB are taken by the host-mapped download and copied by the GPU (cache/barGpuCopy.h).
+    {"KYTY_PERF_BAR_GPU_LARGE", "1", "config", ""},
     // Probably hardware behaviour, exactness check open (M48):
     {"KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL", "1", "unproven", "M48"},
     {"KYTY_FIX_RT_11_11_10_FLOAT", "1", "unproven", "M48"},
