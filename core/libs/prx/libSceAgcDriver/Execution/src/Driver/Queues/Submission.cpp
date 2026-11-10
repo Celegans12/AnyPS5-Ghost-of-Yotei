@@ -32,6 +32,29 @@ std::uint64_t& flipSubmissionsOfThread() {
     return HostThreadLocal<std::uint64_t, FlipSubmissionsStorage>();
 }
 
+std::vector<std::uint64_t> boundPrograms(const Submission& submission) {
+    std::vector<std::uint64_t> programs;
+    const auto note = [&](std::uint32_t location, std::uint32_t value) {
+        const auto offset = location & ~0x70000000u;
+        if (offset == 0x008u || offset == 0x088u || offset == 0x0c8u || offset == 0x108u || offset == 0x148u || offset == 0x20cu) programs.push_back(static_cast<std::uint64_t>(value) << 8u);
+    };
+    const auto& commands = submission.commands;
+    for (std::size_t cursor = 0; cursor < commands.size(); cursor += Pm4::PacketWords(commands[cursor])) {
+        const auto header = commands[cursor];
+        if ((header >> 30u) != 3u) continue;
+        const auto opcode = (header >> 8u) & 0xffu;
+        const auto words = Pm4::PacketWords(header);
+        if (opcode == 0x76 && words >= 3 && cursor + words <= commands.size()) {
+            for (std::size_t word = 2; word < words; ++word) note(commands[cursor + 1] + static_cast<std::uint32_t>(word - 2), commands[cursor + word]);
+        } else if (opcode == 0x63) {
+            const auto found = submission.registerLists.find(cursor);
+            if (found == submission.registerLists.end()) continue;
+            for (std::size_t pair = 0; pair + 1 < found->second.size(); pair += 2) note(found->second[pair], found->second[pair + 1]);
+        }
+    }
+    return programs;
+}
+
 bool progressEligible(const Submission& submission) {
     if (submission.queue != 0 || !submission.flips.empty()
         || !submission.renderingWaits.empty() || !submission.conditionalEnds.empty()) return false;
@@ -415,7 +438,10 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
     if (APS5_ENABLE_TIMING_LOG) submission.validatedAt = std::chrono::steady_clock::now();
     waitForFlipRoom(submission);
     holdFlipBehindWorker(submission);
-    AwaitRegistrationPreparation();
+    if (RegistrationPreparationPending()) {
+        PerformanceTimer timing("Driver.Submit.registration_wait");
+        AwaitRegistrationPreparation(boundPrograms(submission));
+    }
     if (APS5_ENABLE_TIMING_LOG) submission.roomReadyAt = std::chrono::steady_clock::now();
     static const bool trace = std::getenv("APS5_TRACE_GPU") != nullptr;
     if (trace) std::fprintf(stderr, "[gpu] %.1f submit queue=0x%x dwords=%zu at %p\n", TraceMs(), queue, submission.commands.size(), static_cast<const void*>(descriptor.addr));

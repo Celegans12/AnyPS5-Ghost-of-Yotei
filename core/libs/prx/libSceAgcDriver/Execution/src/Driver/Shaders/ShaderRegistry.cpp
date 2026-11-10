@@ -1813,14 +1813,16 @@ private:
 
 public:
 
-    void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr) {
+    void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr, std::uint64_t codeBegin = 0, std::uint64_t codeBytes = 0) {
         {
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
                 const auto sequence = ++submitted;
-                if (prepared != nullptr && prepared->demanded.load()) tasks.push_front({std::move(task), prepared, sequence});
-                else tasks.push_back({std::move(task), prepared, sequence});
+                const auto codeKey = codeBegin & ProgramAddressMask;
+                if (prepared != nullptr && prepared->demanded.load()) tasks.push_front({std::move(task), prepared, sequence, codeKey, codeBytes});
+                else tasks.push_back({std::move(task), prepared, sequence, codeKey, codeBytes});
                 unfinished.insert(sequence);
+                if (codeBytes != 0) programs.emplace(codeKey, Program{codeBytes, sequence});
                 lock.unlock();
                 ready.notify_one();
                 return;
@@ -1848,6 +1850,31 @@ public:
         idle.wait(lock, [&] { return unfinished.empty() || *unfinished.begin() > ticket; });
     }
 
+    bool ProgramsPending() {
+        std::lock_guard lock(mutex);
+        return !programs.empty();
+    }
+
+    void AwaitPrograms(std::span<const std::uint64_t> addresses) {
+        std::unique_lock lock(mutex);
+        if (programs.empty()) return;
+        std::vector<std::uint64_t> awaited;
+        for (const auto address : addresses) {
+            const auto key = address & ProgramAddressMask;
+            const auto next = programs.upper_bound(key);
+            if (next == programs.begin()) continue;
+            const auto [first, last] = programs.equal_range(std::prev(next)->first);
+            for (auto program = first; program != last; ++program) {
+                if (key - program->first < program->second.bytes) awaited.push_back(program->second.sequence);
+            }
+        }
+        if (awaited.empty()) return;
+        std::ranges::sort(awaited);
+        awaited.erase(std::unique(awaited.begin(), awaited.end()), awaited.end());
+        std::stable_partition(tasks.begin(), tasks.end(), [&](const Task& task) { return std::ranges::binary_search(awaited, task.sequence); });
+        idle.wait(lock, [&] { return std::ranges::none_of(awaited, [&](std::uint64_t sequence) { return unfinished.contains(sequence); }); });
+    }
+
     void Close(bool dropQueued) {
         std::vector<Worker> joined;
         std::deque<Task> dropped;
@@ -1856,7 +1883,10 @@ public:
             closed = true;
             if (dropQueued) {
                 dropped.swap(tasks);
-                for (const auto& task : dropped) unfinished.erase(task.sequence);
+                for (const auto& task : dropped) {
+                    unfinished.erase(task.sequence);
+                    forget(task.codeKey, task.codeBytes, task.sequence);
+                }
                 idle.notify_all();
             }
             idle.wait(lock, [&] { return tasks.empty() && running == 0; });
@@ -1938,6 +1968,8 @@ private:
                 ++pool.running;
             }
             const auto sequence = task.sequence;
+            const auto codeKey = task.codeKey;
+            const auto codeBytes = task.codeBytes;
             task.function();
             task = {};
             bool drained = false;
@@ -1945,6 +1977,7 @@ private:
                 std::lock_guard lock(pool.mutex);
                 --pool.running;
                 pool.unfinished.erase(sequence);
+                pool.forget(codeKey, codeBytes, sequence);
                 drained = pool.tasks.empty() && pool.running == 0;
                 pool.idle.notify_all();
             }
@@ -1959,7 +1992,23 @@ private:
         std::function<void()> function;
         const PreparedShaders* prepared = nullptr;
         std::uint64_t sequence = 0;
+        std::uint64_t codeKey = 0;
+        std::uint64_t codeBytes = 0;
     };
+
+    struct Program {
+        std::uint64_t bytes;
+        std::uint64_t sequence;
+    };
+
+    static constexpr std::uint64_t ProgramAddressMask = (std::uint64_t{1} << 40u) - 1u;
+
+    void forget(std::uint64_t codeKey, std::uint64_t codeBytes, std::uint64_t sequence) {
+        if (codeBytes == 0) return;
+        const auto [first, last] = programs.equal_range(codeKey);
+        const auto found = std::find_if(first, last, [&](const auto& program) { return program.second.sequence == sequence; });
+        if (found != last) programs.erase(found);
+    }
 
     std::mutex mutex;
     std::condition_variable ready;
@@ -1971,6 +2020,7 @@ private:
     unsigned running = 0;
     std::uint64_t submitted = 0;
     std::set<std::uint64_t> unfinished;
+    std::multimap<std::uint64_t, Program> programs;
     bool closed = false;
 };
 
@@ -1981,6 +2031,8 @@ bool AsyncRegistrationPrepare() {
 
 void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan) {
     const auto* preparedKey = snapshot->prepared.get();
+    const auto codeBegin = snapshot->codeAddress;
+    const auto codeBytes = static_cast<std::uint64_t>(snapshot->code.size()) * sizeof(std::uint32_t);
     SubmitRegistrationPreparation([snapshot = std::move(snapshot), plan = std::move(plan)] {
         PerformanceContext timingContext(FrameTiming::Preparation());
         std::vector<PreparedShaders::Entry> entries;
@@ -2002,13 +2054,13 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
             prepared.pending = false;
         }
         prepared.settled.notify_all();
-    }, preparedKey);
+    }, preparedKey, codeBegin, codeBytes);
 }
 
 }
 
-void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared) {
-    RegistrationPreparePool::Instance().Submit(std::move(task), prepared);
+void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared, std::uint64_t codeBegin, std::uint64_t codeBytes) {
+    RegistrationPreparePool::Instance().Submit(std::move(task), prepared, codeBegin, codeBytes);
 }
 
 void PrioritizeRegistrationPreparation(PreparedShaders& prepared) {
@@ -2018,6 +2070,15 @@ void PrioritizeRegistrationPreparation(PreparedShaders& prepared) {
 
 void AwaitRegistrationPreparation() {
     if (auto* pool = RegistrationPreparePool::Existing()) pool->AwaitSubmitted();
+}
+
+bool RegistrationPreparationPending() {
+    auto* pool = RegistrationPreparePool::Existing();
+    return pool != nullptr && pool->ProgramsPending();
+}
+
+void AwaitRegistrationPreparation(std::span<const std::uint64_t> programs) {
+    if (auto* pool = RegistrationPreparePool::Existing()) pool->AwaitPrograms(programs);
 }
 
 void SubmitLibraryPrebuild(std::function<void()> task) {

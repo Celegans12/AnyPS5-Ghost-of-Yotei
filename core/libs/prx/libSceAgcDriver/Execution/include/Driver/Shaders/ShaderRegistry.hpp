@@ -235,9 +235,11 @@ std::optional<ShaderRecompiler::ShaderFloatMode> DispatchFloatMode(const ShaderS
 std::shared_ptr<const ShaderSnapshot> RegisteredHeader(const ShaderRegistry& registry, const Shader* shader);
 std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& registry, std::uint64_t address, std::initializer_list<std::uint8_t> types);
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot);
-void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared = nullptr);
+void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared = nullptr, std::uint64_t codeBegin = 0, std::uint64_t codeBytes = 0);
 void PrioritizeRegistrationPreparation(PreparedShaders& prepared);
 void AwaitRegistrationPreparation();
+bool RegistrationPreparationPending();
+void AwaitRegistrationPreparation(std::span<const std::uint64_t> programs);
 void SubmitLibraryPrebuild(std::function<void()> task);
 void AwaitLibraryPrebuilds();
 void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Graphics::ShaderStages& stages, ShaderRecompiler::ShaderStage stage, std::shared_ptr<const ShaderRecompiler::RecompileResult> result, std::uint32_t pushOffset);
