@@ -708,7 +708,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPl
     DescriptorBindingPlan selected;
     std::set<std::uint32_t> remaining(bindings.begin(), bindings.end());
     selected.bindings.reserve(remaining.size());
-    for (auto at = remaining.begin(); at != remaining.end();) at = *at >= RuntimeAbi::DirectHeapBindingBase ? remaining.erase(at) : std::next(at);
+    for (auto at = remaining.begin(); at != remaining.end();) at = *at >= RuntimeAbi::DirectHeapBindingBase && *at - RuntimeAbi::DirectHeapBindingBase < RuntimeAbi::DirectHeapBindingCount ? remaining.erase(at) : std::next(at);
     for (const auto& binding : plan.bindings) {
         if (remaining.erase(binding.descriptor.binding) == 0u) continue;
         selected.storageData |= binding.descriptor.role == DescriptorRole::ShaderData;

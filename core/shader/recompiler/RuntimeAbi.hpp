@@ -14,6 +14,8 @@ inline constexpr std::uint32_t DescriptorSet = 0u;
 inline constexpr std::uint32_t FragmentDescriptorSet = 1u;
 inline constexpr std::uint32_t DirectHeapSet = 4u;
 inline constexpr std::uint32_t DirectHeapBindingBase = 1000u;
+// One binding per heap kind (image kinds 0-56, sampler 57); bindings past the range are unknown.
+inline constexpr std::uint32_t DirectHeapBindingCount = 58u;
 inline constexpr std::uint32_t StageCount = 4u;
 inline constexpr std::uint32_t PushConstantDwords = 32u;
 inline constexpr std::uint32_t FirstImageBinding = 1u;
