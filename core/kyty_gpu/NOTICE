@@ -52,8 +52,10 @@ Changed (35):
   2026-11-08  src/kernel/pthread.h
   2026-11-08  src/utils.cmake
 
-Added (22):
+Added (24):
   2026-11-11  cmake/treeVersion.cmake
+  2026-11-11  pgo/.gitattributes
+  2026-11-11  pgo/kyty_gpu.profdata
   2026-11-08  src/aps5/GpuBackend.h
   2026-11-11  src/aps5/aps5Backend.cmake
   2026-11-08  src/aps5/aps5Host.cpp
