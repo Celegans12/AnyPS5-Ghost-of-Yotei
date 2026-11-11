@@ -745,6 +745,12 @@ constexpr std::size_t IndirectPathCount = static_cast<std::size_t>(IndirectDrawP
 constexpr std::array<const char*, IndirectPathCount> IndirectDrawPathNames{"gpu-side", "patched SGPR not folded", "fetch offset unknown", "non-vertex path", "GE_INDX_OFFSET", "draw index", "vertex range too large", "feature gap", "pending image results", "pending label or copied write", "not imported", "disabled", "index range not fully readable", "index limit unknown", "records settled"};
 
 // What became of one draw, for the totals.
+// Why draws forced a new render pass since the last [draws] report (the StartDrawPass terms).
+std::array<std::atomic<std::uint64_t>, 7>& ForcedPassReasons() {
+    static std::array<std::atomic<std::uint64_t>, 7> reasons{};
+    return reasons;
+}
+
 struct DrawOutcome {
     // In the recorder; `waited` when the recorder was synced right after (copied writes or a lease).
     bool recorded = false;
@@ -966,6 +972,16 @@ void reportDraw(const std::array<double, PhaseCount>& us, const ShaderResources:
         if (count == 0) continue;
         n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s%s %llu", listed ? ", " : " (", PassBreakNames[i], static_cast<unsigned long long>(count));
         listed = true;
+    }
+    if (room()) {
+        static constexpr std::array<const char*, 7> forcedNames{"capture", "reads target", "indirect", "mesh indirect", "captured", "staged", "pixel lds"};
+        bool any = false;
+        for (std::size_t why = 0; why < forcedNames.size() && room(); ++why) {
+            const auto count = ForcedPassReasons()[why].exchange(0, std::memory_order_relaxed);
+            if (count == 0) continue;
+            n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s%s %llu", any ? ", " : "; forced by: ", forcedNames[why], static_cast<unsigned long long>(count));
+            any = true;
+        }
     }
     if (room()) n += std::snprintf(line + n, sizeof(line) - static_cast<std::size_t>(n), "%s, %llu draws continued one; waited or synchronous because:", listed ? ")" : "", static_cast<unsigned long long>(profile.passesContinued));
     for (std::size_t i = SyncNone + 1; i < SyncCount && room(); ++i) {
@@ -2419,6 +2435,28 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
 // the record's dword as the first vertex / instance, and the constant is what the fixed-function
 // fetch must start at). The scratch is kept until the batch completed. Returns whether a copy was
 // rewritten; `argumentBuffer`/`argumentOffset` receive where the draw reads the records.
+// The CPU snapshot of a GPU-side indirect draw's argument records, taken when the CPU can read them
+// now: the count is not read from memory and no GPU write or lease is pending over them. It records
+// no command, so such a draw can continue the open render pass. Returns whether it was taken.
+bool snapshotIndirectArguments(const Context& context, Recorder* recorder, const IndirectRecord& indirect, std::shared_ptr<Buffer>& snapshot, VkBuffer& argumentBuffer, VkDeviceSize& argumentOffset) {
+    using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
+    const auto* args = indirect.args;
+    const auto bytes = static_cast<std::size_t>(args->RangeBytes());
+    const auto* source = reinterpret_cast<const std::byte*>(args->arguments);
+    if (args->countIndirect || bytes == 0 || Recorder::SnapshotWriteOverlaps(args->arguments, bytes) || (recorder != nullptr && recorder->PendingLeaseSerial(args->arguments, bytes) != 0) || !GuestMemory::Accessible(source, bytes, false)) return false;
+    snapshot = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
+    const auto out = snapshot->Bytes();
+    std::memcpy(out.data(), source, bytes);
+    for (std::uint32_t record = 0; record < args->count; ++record) {
+        const auto base = static_cast<std::size_t>(record) * args->stride;
+        if (args->vertexRule == Rule::Constant) std::memcpy(out.data() + base + args->VertexDwordOffset(), &args->vertexConstant, 4);
+        if (args->instanceRule == Rule::Constant) std::memcpy(out.data() + base + args->InstanceDwordOffset(), &args->instanceConstant, 4);
+    }
+    argumentBuffer = snapshot->Handle();
+    argumentOffset = 0;
+    return true;
+}
+
 bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, Recorder* recorder, bool recorded, const IndirectRecord& indirect, std::unique_ptr<DeviceBuffer>& scratch, std::shared_ptr<Buffer>& snapshot, VkBuffer& argumentBuffer, VkDeviceSize& argumentOffset, const std::function<void(std::uint32_t)>& countBarrier) {
     using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
     const auto* args = indirect.args;
@@ -2426,20 +2464,7 @@ bool recordIndirectArguments(const Context& context, VkCommandBuffer commands, R
     countBarrier(1);
     const bool rewritten = args->vertexRule == Rule::Constant || args->instanceRule == Rule::Constant;
     const auto bytes = static_cast<std::size_t>(args->RangeBytes());
-    const auto* source = reinterpret_cast<const std::byte*>(args->arguments);
-    if (!args->countIndirect && bytes != 0 && !Recorder::SnapshotWriteOverlaps(args->arguments, bytes) && (recorder == nullptr || recorder->PendingLeaseSerial(args->arguments, bytes) == 0) && GuestMemory::Accessible(source, bytes, false)) {
-        snapshot = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT);
-        const auto out = snapshot->Bytes();
-        std::memcpy(out.data(), source, bytes);
-        for (std::uint32_t record = 0; record < args->count; ++record) {
-            const auto base = static_cast<std::size_t>(record) * args->stride;
-            if (args->vertexRule == Rule::Constant) std::memcpy(out.data() + base + args->VertexDwordOffset(), &args->vertexConstant, 4);
-            if (args->instanceRule == Rule::Constant) std::memcpy(out.data() + base + args->InstanceDwordOffset(), &args->instanceConstant, 4);
-        }
-        argumentBuffer = snapshot->Handle();
-        argumentOffset = 0;
-        return rewritten;
-    }
+    if (snapshotIndirectArguments(context, recorder, indirect, snapshot, argumentBuffer, argumentOffset)) return rewritten;
     if (recorded) {
         // Read in place from the import when the batch runs (a synchronous draw waits for its own).
         recorder->NotePendingRead(args->arguments, static_cast<std::size_t>(args->RangeBytes()), Recorder::ReadKind::Indirect);
@@ -2929,7 +2954,23 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     resources.RequireGuestBuffers();
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
-    const auto start = recorder->StartDrawPass(passKey, capture || readsTarget || gpuIndirect || meshIndirect || captured || !record.staged.empty() || PixelFunctionLdsSubgroup(shaders) != 0u, fenced, passAccess);
+    std::shared_ptr<Buffer> argumentSnapshot;
+    VkBuffer argumentBuffer = VK_NULL_HANDLE;
+    VkDeviceSize argumentOffset = 0;
+    bool rewritten = false;
+    // rewrite/direct (DESIGN-3 phase 5): a GPU-side indirect draw whose arguments the CPU can
+    // snapshot now records nothing outside a pass, so it no longer forces a new one.
+    static const bool indirectInPass = std::getenv("APS5_NO_INDIRECT_IN_PASS") == nullptr;
+    const bool argumentsSnapshotted = indirectInPass && gpuIndirect && !meshIndirect && !captured && snapshotIndirectArguments(context, recorder, *record.indirect, argumentSnapshot, argumentBuffer, argumentOffset);
+    if (argumentsSnapshotted) rewritten = args->vertexRule == Pm4::DrawParameters::IndirectDraw::Rule::Constant || args->instanceRule == Pm4::DrawParameters::IndirectDraw::Rule::Constant;
+    const std::array<bool, 7> forcedWhy{capture, readsTarget, gpuIndirect && !argumentsSnapshotted, static_cast<bool>(meshIndirect), captured, !record.staged.empty(), PixelFunctionLdsSubgroup(shaders) != 0u};
+    const bool forcedPass = std::ranges::any_of(forcedWhy, [](bool why) { return why; });
+    if (forcedPass) {
+        for (std::size_t why = 0; why < forcedWhy.size(); ++why) {
+            if (forcedWhy[why]) ForcedPassReasons()[why].fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    const auto start = recorder->StartDrawPass(passKey, forcedPass, fenced, passAccess);
     if (record.spaceKeep != nullptr) *record.spaceKeep = reserveSpaceKeep(*recorder, resources);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
@@ -2960,11 +3001,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         recorder->NoteAccess(CommandClass::Draw, Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | inputs.shaderStages, resources.HoldsLease()});
     }
     std::unique_ptr<DeviceBuffer> scratch;
-    std::shared_ptr<Buffer> argumentSnapshot;
     std::shared_ptr<Buffer> meshArguments;
-    VkBuffer argumentBuffer = VK_NULL_HANDLE;
-    VkDeviceSize argumentOffset = 0;
-    bool rewritten = false;
     if (!meshIndirect && !inputs.restartTable.empty()) meshArguments = directMeshArguments(context, draw, inputs.restartTable);
     if (continued) {
         record.pipeline->Continue(recording, state, record.masked);
@@ -2993,7 +3030,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         } else if (meshIndirect) {
             meshArguments = recordMeshArguments(context, commands, recorder, true, state, draw, *record.indirect, countBarrier, inputs.restartTable);
             argumentBuffer = meshArguments->Handle();
-        } else if (gpuIndirect) {
+        } else if (gpuIndirect && !argumentsSnapshotted) {
             rewritten = recordIndirectArguments(context, commands, recorder, true, *record.indirect, scratch, argumentSnapshot, argumentBuffer, argumentOffset, countBarrier);
         }
         // Earlier recorded work (dispatches, the previous draw) wrote the images in the general
