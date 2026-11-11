@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "DirectPath.hpp"
 #include <cstdlib>
 #include <mutex>
 
@@ -23,7 +24,7 @@ bool DrawRecipeRecord::Expired() const {
 }
 
 bool Driver::drawEntries() {
-    static const bool entries = std::getenv("APS5_NO_DRAW_SRT_ENTRIES") == nullptr && std::getenv("APS5_DIRECT_DRAW") == nullptr && !stampValidate();
+    static const bool entries = std::getenv("APS5_NO_DRAW_SRT_ENTRIES") == nullptr && !ShaderRecompiler::DirectPath::Draws() && !stampValidate();
     return entries;
 }
 

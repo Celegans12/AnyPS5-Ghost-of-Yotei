@@ -9,6 +9,7 @@
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "ThreadOwned.hpp"
 #include "ImageTableAbi.hpp"
+#include "DirectPath.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -1913,12 +1914,12 @@ ResolutionMemo& resolutionMemo() {
 constexpr std::size_t ResolutionMemoEntries = 256;
 constexpr std::size_t ResolutionMemoVariantEntries = 4;
 // APS5_TABLE_MEMO_MIB=<n> sets the resolution memo's budget (default 32 MiB of words, 256 MiB with
-// APS5_DIRECT_TABLES: every direct table stage shares one resolution per variant, and the footprint
+// direct tables: every direct table stage shares one resolution per variant, and the footprint
 // counts the shared columns of each entry again).
 const std::size_t ResolutionMemoWords = [] {
     const char* text = std::getenv("APS5_TABLE_MEMO_MIB");
     auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
-    if (mib == 0ull && std::getenv("APS5_DIRECT_TABLES") != nullptr) mib = 256ull;
+    if (mib == 0ull && DirectPath::Tables()) mib = 256ull;
     return mib != 0ull ? static_cast<std::size_t>(mib) * (std::size_t{1} << 20u) / sizeof(std::uint32_t) : std::size_t{1} << 23u;
 }();
 

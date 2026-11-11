@@ -14,6 +14,7 @@
 #include "Optimization/ResourceMaterializer.hpp"
 #include "Optimization/SrtWalker.hpp"
 #include "CompiledVariant.hpp"
+#include "DirectPath.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectSlots.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DirectHeap.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -249,9 +250,9 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
                     table = {};
                 }
             }
-            // APS5_DIRECT_TABLES=1 takes table stages direct: their elements become heap slots at
-            // record time (ResolveDirectStages); without it they keep the existing path.
-            static const bool directTables = std::getenv("APS5_DIRECT_TABLES") != nullptr;
+            // Table stages go direct by default: their elements become heap slots at record time
+            // (ResolveDirectStages). With APS5_NO_DIRECT_TABLES=1 they keep the existing path.
+            static const bool directTables = ShaderRecompiler::DirectPath::Tables();
             if (!directTables || !capture->snapshot.tables.nested.empty()) {
                 report(directTables ? "nested image tables" : "image tables");
                 return std::nullopt;
@@ -554,7 +555,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     }
     static const bool directEvalProbe = std::getenv("APS5_DIRECT_EVAL_PROBE") != nullptr;
     if (directEvalProbe) probeDirectEvaluation(request, localDevice.get());
-    static const bool directDraw = std::getenv("APS5_DIRECT_DRAW") != nullptr;
+    static const bool directDraw = ShaderRecompiler::DirectPath::Draws();
     const bool plainDraw = !graphics.rectList && !graphics.stages.tessellation && !graphics.stages.mesh && (program.binary.stage == Stage::Vertex || program.binary.stage == Stage::Fragment);
     if (directDraw && plainDraw) {
         if (auto direct = materializeDirectStage(request, localDevice.get())) {
