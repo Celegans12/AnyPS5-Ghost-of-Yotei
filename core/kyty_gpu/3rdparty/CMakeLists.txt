@@ -1,85 +1,70 @@
 set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 
+# What kyty_gpu links. SPIRV-Tools, SPIRV-Headers, fmt, spdlog, nlohmann_json, magic_enum, xxHash, ZArchive and SDL3
+# (headers only) are submodules of this directory, at Kyty's commits. Vulkan-Headers, VulkanMemoryAllocator, tracy and
+# zstd are AnyPS5's submodules in KYTY_SHARED_THIRD_PARTY_DIR: the same commits when this directory was imported.
+set(kyty_shared_pins
+	"Vulkan-Headers=2fa203425eb4af9dfc6b03f97ef72b0b5bcb8350"
+	"VulkanMemoryAllocator=a1d434708c217b2a6c7b365f1fe41fa03a562e59"
+	"tracy=30997d5ca6bb632cc10807a1da8a6d3de0aeeb3c"
+	"zstd=f8745da6ff1ad1e7bab384bd1f9d742439278e99"
+)
+foreach(kyty_pin IN LISTS kyty_shared_pins)
+	string(REPLACE "=" ";" kyty_pin "${kyty_pin}")
+	list(GET kyty_pin 0 kyty_pin_name)
+	list(GET kyty_pin 1 kyty_pin_commit)
+	set(kyty_pin_dir "${KYTY_SHARED_THIRD_PARTY_DIR}/${kyty_pin_name}")
+	if(NOT EXISTS "${kyty_pin_dir}/.git")
+		message(FATAL_ERROR "kyty_gpu: ${kyty_pin_dir} is empty; run git submodule update --init --recursive in AnyPS5's tree")
+	endif()
+	if(GIT_EXECUTABLE)
+		execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${kyty_pin_dir}" rev-parse HEAD
+			OUTPUT_VARIABLE kyty_pin_head OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+		if(NOT kyty_pin_head STREQUAL kyty_pin_commit)
+			message(WARNING "kyty_gpu: 3rdparty/${kyty_pin_name} is at ${kyty_pin_head}; this directory was imported "
+				"and tested with ${kyty_pin_commit}")
+		endif()
+	endif()
+endforeach()
+foreach(kyty_own IN ITEMS SPIRV-Tools SPIRV-Headers fmt spdlog nlohmann_json magic_enum xxHash ZArchive SDL3)
+	if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${kyty_own}/.git")
+		message(FATAL_ERROR "kyty_gpu: ${CMAKE_CURRENT_SOURCE_DIR}/${kyty_own} is empty; run "
+			"git submodule update --init --recursive in AnyPS5's tree")
+	endif()
+endforeach()
+
 add_subdirectory(cpuinfo)
 
-include(FetchContent)
-
-# The Bluetooth DualSense transports speaker audio as fixed-size Opus packets.
-set(kyty_build_testing_saved "${BUILD_TESTING}")
-set(BUILD_TESTING OFF)
-set(OPUS_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
-set(OPUS_INSTALL_CMAKE_CONFIG_MODULE OFF CACHE BOOL "" FORCE)
-if(MSVC AND CMAKE_C_COMPILER_ID STREQUAL "Clang")
-	# Opus assumes MSVC accepts SSE4.1 intrinsics without per-file flags, but
-	# clang-cl rejects them in its baseline x64 files. Its AVX2 dispatch also
-	# depends on the SSE4.1 declarations, so retain the x64 SSE2 baseline only.
-	set(OPUS_X86_MAY_HAVE_SSE4_1 OFF CACHE BOOL "" FORCE)
-	set(OPUS_X86_MAY_HAVE_AVX2 OFF CACHE BOOL "" FORCE)
-endif()
-FetchContent_Declare(opus
-	GIT_REPOSITORY https://github.com/xiph/opus.git
-	GIT_TAG ddbe48383984d56acd9e1ab6a090c54ca6b735a6
-	GIT_SHALLOW FALSE)
-FetchContent_MakeAvailable(opus)
-set(BUILD_TESTING "${kyty_build_testing_saved}")
-install(FILES "${opus_SOURCE_DIR}/COPYING" DESTINATION "licenses/opus")
-
-# The guest instruction patcher needs a decoder/encoder and a small
-# trampoline assembler. Pin the same revisions used by shadPS4's implementation.
-set(XBYAK_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-	xbyak
-	GIT_REPOSITORY https://github.com/herumi/xbyak.git
-	GIT_TAG 44a72f369268f7d552650891b296693e91db86bb
-	GIT_SHALLOW FALSE
-)
-
-set(ZYDIS_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-set(ZYDIS_BUILD_TOOLS OFF CACHE BOOL "" FORCE)
-set(ZYDIS_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-set(ZYDIS_BUILD_DOXYGEN OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-	zydis
-	GIT_REPOSITORY https://github.com/zyantific/zydis.git
-	GIT_TAG 120e0e705f8e3b507dc49377ac2879979f0d545c
-	GIT_SUBMODULES_RECURSE TRUE
-	GIT_SHALLOW FALSE
-)
-
-FetchContent_MakeAvailable(xbyak zydis)
-target_compile_definitions(xbyak INTERFACE XBYAK_NO_EXCEPTION)
-
 # ZArchive provides random-access reads for compressed game dumps. Build only
-# the reader/writer library and its zstd dependency; the command-line tool is
-# not part of KytyPS5's runtime distribution.
+# the reader/writer library and its zstd dependency.
 set(ZSTD_BUILD_PROGRAMS OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_SHARED OFF CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_STATIC ON CACHE BOOL "" FORCE)
 set(ZSTD_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(ZSTD_LEGACY_SUPPORT OFF CACHE BOOL "" FORCE)
 set(ZSTD_MULTITHREAD_SUPPORT OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-	zstd
-	GIT_REPOSITORY https://github.com/facebook/zstd.git
-	GIT_TAG f8745da6ff1ad1e7bab384bd1f9d742439278e99
-	GIT_SHALLOW FALSE
-	SOURCE_SUBDIR build/cmake
-)
-FetchContent_Declare(
-	zarchive_source
-	GIT_REPOSITORY https://github.com/Exzap/ZArchive.git
-	GIT_TAG d2c717730092c7bf8cbb033b12fd4001b7c4d932
-	GIT_SHALLOW FALSE
-	PATCH_COMMAND "${GIT_EXECUTABLE}" apply --ignore-whitespace
-		"${CMAKE_CURRENT_SOURCE_DIR}/patches/zarchive-reader.patch"
-	SOURCE_SUBDIR kyty-library-only
-)
-FetchContent_MakeAvailable(zstd zarchive_source)
+set(zstd_SOURCE_DIR "${KYTY_SHARED_THIRD_PARTY_DIR}/zstd")
+add_subdirectory("${zstd_SOURCE_DIR}/build/cmake" "${CMAKE_CURRENT_BINARY_DIR}/zstd" EXCLUDE_FROM_ALL)
 
-# Keep the fetched libraries' install rules out of the package.
-foreach(kyty_dir "${opus_SOURCE_DIR}" "${openxr_SOURCE_DIR}" "${xbyak_SOURCE_DIR}" "${zydis_SOURCE_DIR}"
-		"${zstd_SOURCE_DIR}/build/cmake")
-	set_property(DIRECTORY "${kyty_dir}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+# patches/zarchive-reader.patch goes onto a copy of the submodule's sources in the build directory, so the submodule
+# itself stays as checked out.
+set(zarchive_source_SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/zarchive-src")
+set(zarchive_patch_dir "${CMAKE_CURRENT_BINARY_DIR}/zarchive-patch")
+file(REMOVE_RECURSE "${zarchive_patch_dir}")
+file(COPY "${CMAKE_CURRENT_SOURCE_DIR}/ZArchive/src" "${CMAKE_CURRENT_SOURCE_DIR}/ZArchive/include"
+	DESTINATION "${zarchive_patch_dir}")
+execute_process(
+	COMMAND "${CMAKE_COMMAND}" -E env "GIT_CEILING_DIRECTORIES=${CMAKE_CURRENT_BINARY_DIR}"
+		"${GIT_EXECUTABLE}" apply --ignore-whitespace "${CMAKE_CURRENT_SOURCE_DIR}/patches/zarchive-reader.patch"
+	WORKING_DIRECTORY "${zarchive_patch_dir}"
+	RESULT_VARIABLE zarchive_patch_result
+	ERROR_VARIABLE zarchive_patch_error)
+if(NOT zarchive_patch_result EQUAL 0)
+	message(FATAL_ERROR "kyty_gpu: patches/zarchive-reader.patch does not apply to 3rdparty/ZArchive: ${zarchive_patch_error}")
+endif()
+file(GLOB_RECURSE zarchive_patched RELATIVE "${zarchive_patch_dir}" "${zarchive_patch_dir}/*")
+foreach(zarchive_file IN LISTS zarchive_patched)
+	configure_file("${zarchive_patch_dir}/${zarchive_file}" "${zarchive_source_SOURCE_DIR}/${zarchive_file}" COPYONLY)
 endforeach()
 
 add_library(zarchive STATIC
@@ -92,43 +77,13 @@ target_include_directories(zarchive SYSTEM PUBLIC "${zarchive_source_SOURCE_DIR}
 target_include_directories(zarchive PRIVATE "${zstd_SOURCE_DIR}/lib")
 target_link_libraries(zarchive PRIVATE libzstd_static)
 target_compile_features(zarchive PRIVATE cxx_std_20)
-if(MSVC)
-	target_compile_options(zarchive PRIVATE /W0)
-else()
-	target_compile_options(zarchive PRIVATE -w)
-endif()
-
-set(SDL_SHARED OFF CACHE BOOL "" FORCE)
-if(APPLE)
-	# SDL's built-in iconv fallback does not support CP932.
-	set(SDL_SYSTEM_ICONV ON CACHE BOOL "Use system iconv for CP932 conversion" FORCE)
-endif()
-add_subdirectory(SDL3)
+target_compile_options(zarchive PRIVATE -w)
 
 add_library(Vulkan-Headers INTERFACE)
 add_library(Vulkan::Headers ALIAS Vulkan-Headers)
 target_include_directories(Vulkan-Headers INTERFACE
-	"${CMAKE_CURRENT_SOURCE_DIR}/Vulkan-Headers/include"
+	"${KYTY_SHARED_THIRD_PARTY_DIR}/Vulkan-Headers/include"
 )
-
-add_library(imgui STATIC
-	imgui/imgui.cpp
-	imgui/imgui_draw.cpp
-	imgui/imgui_tables.cpp
-	imgui/imgui_widgets.cpp
-	imgui/backends/imgui_impl_vulkan.cpp
-)
-target_include_directories(imgui PUBLIC
-	"${CMAKE_CURRENT_SOURCE_DIR}/imgui"
-	"${CMAKE_CURRENT_SOURCE_DIR}/imgui/backends"
-)
-target_compile_definitions(imgui PRIVATE IMGUI_IMPL_VULKAN_NO_PROTOTYPES)
-target_link_libraries(imgui PUBLIC Vulkan::Headers)
-if(MSVC)
-	target_compile_options(imgui PRIVATE /W0)
-else()
-	target_compile_options(imgui PRIVATE -w)
-endif()
 
 set(SPIRV_SKIP_TESTS ON CACHE BOOL "" FORCE)
 set(SPIRV_SKIP_EXECUTABLES ON CACHE BOOL "" FORCE)
@@ -160,37 +115,8 @@ set(SPDLOG_BUILD_WARNINGS OFF CACHE BOOL "" FORCE)
 set(SPDLOG_INSTALL OFF CACHE BOOL "" FORCE)
 set(SPDLOG_FMT_EXTERNAL ON CACHE BOOL "" FORCE)
 set(SPDLOG_NO_EXCEPTIONS ON CACHE BOOL "" FORCE)
-if(WIN32)
-	set(SPDLOG_WCHAR_FILENAMES ON CACHE BOOL "" FORCE)
-endif()
+set(SPDLOG_WCHAR_FILENAMES ON CACHE BOOL "" FORCE)
 add_subdirectory(spdlog EXCLUDE_FROM_ALL)
-
-if (NOT TARGET FFmpeg::ffmpeg)
-	# On macOS the target arch is driven by CMAKE_OSX_ARCHITECTURES, not the host
-	# CMAKE_SYSTEM_PROCESSOR (which reports arm64 even for an x86_64/Rosetta build).
-	if(APPLE AND CMAKE_OSX_ARCHITECTURES)
-		if(CMAKE_OSX_ARCHITECTURES MATCHES "^(x86_64)$")
-			set(ARCHITECTURE x86_64)
-		elseif(CMAKE_OSX_ARCHITECTURES MATCHES "^(arm64)$")
-			set(ARCHITECTURE arm64)
-		else()
-			set(ARCHITECTURE x86_64 arm64) # universal
-		endif()
-	elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "^(aarch64|arm64|ARM64)$")
-		set(ARCHITECTURE arm64)
-	else()
-		set(ARCHITECTURE x86_64)
-	endif()
-	add_subdirectory(ffmpeg-core)
-	add_library(FFmpeg::ffmpeg ALIAS ffmpeg)
-endif()
-
-file(GLOB LIBATRAC9_SOURCES LibAtrac9/C/src/*.c)
-add_library(LibAtrac9 STATIC ${LIBATRAC9_SOURCES})
-target_include_directories(LibAtrac9 PUBLIC LibAtrac9/C/src)
-if(MSVC)
-	target_compile_options(LibAtrac9 PRIVATE /W0)
-endif()
 
 set(TRACY_STATIC ON CACHE BOOL "" FORCE)
 set(TRACY_ENABLE ON CACHE BOOL "" FORCE)
@@ -198,11 +124,8 @@ set(TRACY_NO_CRASH_HANDLER ON CACHE BOOL "" FORCE)
 set(TRACY_ON_DEMAND ON CACHE BOOL "" FORCE)
 set(TRACY_DELAYED_INIT ON CACHE BOOL "" FORCE)
 set(TRACY_MANUAL_LIFETIME ON CACHE BOOL "" FORCE)
-add_subdirectory(tracy EXCLUDE_FROM_ALL)
+add_subdirectory("${KYTY_SHARED_THIRD_PARTY_DIR}/tracy" "${CMAKE_CURRENT_BINARY_DIR}/tracy" EXCLUDE_FROM_ALL)
 if (TARGET TracyClient)
-	if (MSVC)
-		target_compile_options(TracyClient PRIVATE /WX-)
-	endif()
 	if (CLANG)
 		target_compile_options(TracyClient PRIVATE
 			-Wno-error
@@ -211,8 +134,4 @@ if (TARGET TracyClient)
 			-Wno-unused-variable
 		)
 	endif()
-endif()
-
-if (CLANG AND MSVC)
-add_subdirectory(winpthread)
 endif()

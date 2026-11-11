@@ -41,7 +41,7 @@ target_compile_definitions(kyty_gpu PRIVATE KYTY_APS5_BACKEND=1)
 # SDL3's headers only: windowInternal.h names SDL types; nothing of SDL is called or linked.
 target_include_directories(kyty_gpu PRIVATE ${inc_headers} "${KYTY_THIRD_PARTY_DIR}/SDL3/include")
 target_link_libraries(kyty_gpu PRIVATE common Vulkan::Headers spirv-tools-opt spirv-tools xxhash fmt::fmt
-	nlohmann_json::nlohmann_json kyty_git_version Zydis::Zydis xbyak::xbyak libzstd_static)
+	nlohmann_json::nlohmann_json kyty_git_version libzstd_static)
 if(WIN32 AND NOT KYTY_CLANG_CL)
 	set(KYTY_GPU_KERNELBASE_DEF "${CMAKE_CURRENT_BINARY_DIR}/kyty_gpu_kernelbase.def")
 	set(KYTY_GPU_KERNELBASE_LIB "${CMAKE_CURRENT_BINARY_DIR}/libkyty_gpu_kernelbase.a")
@@ -58,3 +58,10 @@ if(CLANG AND NOT KYTY_CLANG_CL)
 	target_link_options(kyty_gpu PRIVATE ${KYTY_LD_OPTIONS} "-Wl,-Map=${CMAKE_CURRENT_BINARY_DIR}/kyty_gpu.map"
 		"-Wl,--error-limit=0")
 endif()
+# deploy/kyty_gpu.prx is the copy AnyPS5's libs folder gets: the same DLL without its debug sections (13 MB instead of
+# ~200 MB). The one beside it in the build directory keeps them, for symbolising.
+add_custom_command(TARGET kyty_gpu POST_BUILD
+	COMMAND "${CMAKE_COMMAND}" -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/deploy"
+	COMMAND "${CMAKE_OBJCOPY}" --strip-debug "$<TARGET_FILE:kyty_gpu>" "${CMAKE_CURRENT_BINARY_DIR}/deploy/kyty_gpu.prx"
+	BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/deploy/kyty_gpu.prx"
+	VERBATIM)
