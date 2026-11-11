@@ -26,7 +26,8 @@ if(NOT APS5_KYTY_GPU)
     return()
 endif()
 
-set(kytyGpuHelp "kyty_gpu.prx is built with llvm-mingw 20261104 (ucrt, x86_64) from https://github.com/mstorsjo/llvm-mingw/releases. "
+string(CONCAT kytyGpuHelp
+    "kyty_gpu.prx is built with llvm-mingw 20261104 (ucrt, x86_64) from https://github.com/mstorsjo/llvm-mingw/releases. "
     "Unpack it and pass -DAPS5_LLVM_MINGW_ROOT=<its directory>, or set the environment variable LLVM_MINGW_ROOT. "
     "-DAPS5_KYTY_GPU=OFF builds AnyPS5 without this backend.")
 file(TO_CMAKE_PATH "${APS5_LLVM_MINGW_ROOT}" kytyGpuToolchain)
