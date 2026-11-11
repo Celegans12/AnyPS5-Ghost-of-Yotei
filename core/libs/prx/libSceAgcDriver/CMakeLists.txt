@@ -1143,7 +1143,7 @@ target_sources(agc_driver_scattered_runs_tests PRIVATE tests/AllocationFailure.c
 if(BUILD_TESTING)
     get_property(agcDriverDirectOffCandidates DIRECTORY PROPERTY TESTS)
     foreach(agcTest IN LISTS agcDriverDirectOffCandidates)
-        if(agcTest MATCHES "^agc_driver_(draw_cache|draw_data_hit|draw_recapture|dumped_constant_capture|image_table_cache_bounds|lazy_resolved_abi|mesh_draw_relocation|mesh_index_cache|queued_constant_ram_dump|raw_pointer_store_pending|stencil_copy_draw|graphics_dump)")
+        if(agcTest MATCHES "^agc_driver_(draw_cache|draw_data_hit|draw_recapture|draw_relocate|draw_shader_failure_materialization|dumped_constant_capture|image_table_cache_bounds|lazy_resolved_abi|mesh_draw_relocation|mesh_index_cache|queued_constant_ram_dump|raw_pointer_store_pending|stencil_copy_draw|graphics_dump)")
             set_property(TEST ${agcTest} APPEND PROPERTY ENVIRONMENT "APS5_NO_DIRECT=1")
         endif()
     endforeach()

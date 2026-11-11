@@ -1,3 +1,4 @@
+#include "DirectPath.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
@@ -1930,9 +1931,9 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         if (!compileOnly) Graphics::SetHostImportWindow(8ull << 20u);
         if (!compileOnly) Graphics::SetHostImportMaxBytes(maintenance3.maxMemoryAllocationSize);
         // Importable GDS on every GPU: its DMA_DATA stays on the GPU instead of syncing the worker
-        // (LEGO +5.5%, FF +3%, AoM neutral on an RTX 5080). APS5_NO_IMPORTABLE_GDS=1 keeps the old
+        // (LEGO +5.5%, FF +3%, AoM neutral on an RTX 5080). APS5_NO_DIRECT=1 keeps the old
         // host-only GDS on discrete GPUs.
-        if (!compileOnly) Pm4::RequestImportableGds(state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || std::getenv("APS5_NO_IMPORTABLE_GDS") == nullptr);
+        if (!compileOnly) Pm4::RequestImportableGds(state->properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU || ShaderRecompiler::DirectPath::Enabled());
 #ifdef _WIN32
         // Imported pages are locked; locking is bounded by the process working-set minimum.
         if (const char* value = std::getenv("APS5_WORKING_SET_MIB"); value != nullptr && !compileOnly) {
@@ -6296,49 +6297,7 @@ static void DumpComputeSpirv(const char* form, std::uint64_t programAddress, con
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut, const std::array<std::uint32_t, 3>& threadGroup, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear, const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews) {
-    if (!shader.directSlotRequests.empty()) {
-        const std::array<Graphics::CompiledShader, 1> stage{{{ShaderRecompiler::ShaderStage::Compute, &shader, 0, registeredImageViews}}};
-        std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>> patched;
-        std::vector<Graphics::CompiledShader> resolved;
-        std::vector<std::shared_ptr<Graphics::StorageTexture>> written;
-        const auto directContext = graphicsContext();
-        const auto started = std::chrono::steady_clock::now();
-        // Debug aid: APS5_DIRECT_TRACE_HASH=<16 hex digits> traces the slots of the first dispatches
-        // of the program whose code hash (as in the SPIR-V dump) matches.
-        static const std::uint64_t traceHash = [] {
-            const char* text = std::getenv("APS5_DIRECT_TRACE_HASH");
-            return text != nullptr ? std::strtoull(text, nullptr, 16) : 0ull;
-        }();
-        bool tracing = false;
-        if (traceHash != 0u && GuestMemory::Accessible(reinterpret_cast<const void*>(programAddress), 256u)) {
-            std::uint64_t hash = 0xcbf29ce484222325ull;
-            const auto* code = reinterpret_cast<const std::uint8_t*>(programAddress);
-            for (std::size_t at = 0; at < 256u; ++at) hash = (hash ^ code[at]) * 0x100000001b3ull;
-            static std::atomic<int> traced{0};
-            tracing = hash == traceHash && traced.fetch_add(1) < 3;
-            if (tracing) std::fprintf(stderr, "[direct-trace] dispatch 0x%llx groups %ux%ux%u indirect %d\n", static_cast<unsigned long long>(programAddress), x, y, z, arguments != 0 ? 1 : 0);
-        }
-        Graphics::TraceDirectSlots(tracing);
-        struct TraceOff {
-            ~TraceOff() { Graphics::TraceDirectSlots(false); }
-        } traceOff;
-        if (Graphics::ResolveDirectStages(directContext, stage, patched, resolved, &written) && !patched.empty()) {
-            Graphics::TraceDirectSlots(false);
-            const auto resolvedAt = std::chrono::steady_clock::now();
-            DumpComputeSpirv("direct", programAddress, *patched.front());
-            // No recipe: a replay would reuse this call's slot words and skip the storage marking below.
-            static const bool keepRecipe = std::getenv("APS5_DIRECT_KEEP_RECIPE") != nullptr;
-            if (recipeOut != nullptr) *recipeOut = nullptr;
-            const auto outcome = dispatch(*patched.front(), x, y, z, arguments, snapshots, programAddress, nullptr, keepRecipe ? recipeOut : nullptr, threadGroup, htileClear, registeredImageViews);
-            const auto dispatchedAt = std::chrono::steady_clock::now();
-            Graphics::MarkDirectStorageWrites(directContext, written);
-            const auto markedAt = std::chrono::steady_clock::now();
-            const auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
-            if (ms(started, markedAt) > 20.0) std::fprintf(stderr, "[direct-dispatch] slow dispatch 0x%llx: resolve %.1f ms, dispatch %.1f ms, mark %.1f ms, written %zu\n", static_cast<unsigned long long>(programAddress), ms(started, resolvedAt), ms(resolvedAt, dispatchedAt), ms(dispatchedAt, markedAt), written.size());
-            return outcome;
-        }
-    }
-    if (!shader.directHeap) DumpComputeSpirv("old", programAddress, shader);
+    DumpComputeSpirv("old", programAddress, shader);
     startJournalReplay();
     for (const auto& binding : shader.bindings) {
         if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;

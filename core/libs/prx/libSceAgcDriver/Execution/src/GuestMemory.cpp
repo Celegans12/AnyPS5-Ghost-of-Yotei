@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "ThreadOwned.hpp"
+#include "DirectPath.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -2073,7 +2074,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 // LargeCleanWalks walks found clean is walked at most once per frame (NoteFrame) and at most every
 // LargeCleanMaxAge: a guest CPU store into such a range (a GPU surface the CPU leaves alone) becomes
 // visible at the next frame instead of at the next ordering point. A walk that finds a store puts
-// the range back on strict ordering. Uncached collects always walk. APS5_STRICT_COLLECTS=1 turns
+// the range back on strict ordering. Uncached collects always walk. APS5_NO_DIRECT=1 turns
 // this off.
 std::atomic<std::uint64_t> frameSerial{1};
 constexpr std::uint32_t LargeCleanWalks = 3;
@@ -2102,7 +2103,7 @@ LargeCleanRanges& largeCleanRanges() {
 
 std::uint64_t largeCleanBytes() {
     static const std::uint64_t bytes = [] {
-        if (std::getenv("APS5_STRICT_COLLECTS") != nullptr) return std::numeric_limits<std::uint64_t>::max();
+        if (!ShaderRecompiler::DirectPath::Enabled()) return std::numeric_limits<std::uint64_t>::max();
         const char* value = std::getenv("APS5_LARGE_CLEAN_MIB");
         return (value != nullptr ? std::strtoull(value, nullptr, 10) : 8ull) << 20u;
     }();

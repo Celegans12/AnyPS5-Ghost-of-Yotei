@@ -24,7 +24,7 @@ bool DrawRecipeRecord::Expired() const {
 }
 
 bool Driver::drawEntries() {
-    static const bool entries = std::getenv("APS5_NO_DRAW_SRT_ENTRIES") == nullptr && !ShaderRecompiler::DirectPath::Draws() && !stampValidate();
+    static const bool entries = std::getenv("APS5_NO_DRAW_SRT_ENTRIES") == nullptr && !ShaderRecompiler::DirectPath::Enabled() && !stampValidate();
     return entries;
 }
 

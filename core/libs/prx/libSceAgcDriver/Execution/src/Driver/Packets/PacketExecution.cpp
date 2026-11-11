@@ -1,3 +1,4 @@
+#include "DirectPath.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
@@ -341,8 +342,8 @@ void Driver::execute(Submission& submission) {
             }
             if (!DrawPipeline::Queue0().Overlaps(awaited, awaitedBytes) && Pm4::WaitSatisfiedUnchecked(packet) && !OwnStoreRejects(packet, awaited, awaitedBytes, submission.queue)) {
                 // As waitMemory at entry: a value this queue's own label stored orders no CPU write.
-                // APS5_PIPELINED_WAIT_ALWAYS_BUMPS=1 bumps for every such wait as before.
-                static const bool alwaysBump = std::getenv("APS5_PIPELINED_WAIT_ALWAYS_BUMPS") != nullptr;
+                // APS5_NO_DIRECT=1 bumps for every such wait as before.
+                static const bool alwaysBump = !ShaderRecompiler::DirectPath::Enabled();
                 std::uint32_t writer = submission.queue;
                 const bool since = storedSince(packet, awaited, awaitedBytes, submission.received, submission.queue, &writer);
                 // Rewrite: a value no write reached since this queue's last bump orders nothing new

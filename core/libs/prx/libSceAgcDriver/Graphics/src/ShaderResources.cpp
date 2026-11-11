@@ -1712,15 +1712,6 @@ std::shared_ptr<StorageTexture> DirectStorageTexture(const Context& context, std
     return cachedStorageTexture(context, words, resource, level, guestBytes, written);
 }
 
-void MarkDirectStorageWrites(const Context& context, std::span<const std::shared_ptr<StorageTexture>> written) {
-    // As ShaderResources::WriteBack: GPU image writes invalidate every captured proof.
-    if (std::ranges::any_of(written, [](const auto& texture) { return texture != nullptr; }) && std::getenv("APS5_DIRECT_NO_BREAK_PROOFS") == nullptr) GuestMemory::BreakProofs();
-    for (const auto& texture : written) {
-        if (texture == nullptr) continue;
-        texture->MarkDirty();
-        static_cast<void>(DepthSurfaceStoreBack(context, *texture));
-    }
-}
 
 std::shared_ptr<Texture> DirectSampledTexture(const Context& context, std::span<const std::uint32_t> words, bool shape2D, bool comparison, bool& firstLayer) {
     if (IsNullSampledTextureResource(words)) return nullptr;

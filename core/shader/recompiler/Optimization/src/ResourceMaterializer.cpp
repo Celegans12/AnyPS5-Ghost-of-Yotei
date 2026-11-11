@@ -1919,7 +1919,7 @@ constexpr std::size_t ResolutionMemoVariantEntries = 4;
 const std::size_t ResolutionMemoWords = [] {
     const char* text = std::getenv("APS5_TABLE_MEMO_MIB");
     auto mib = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
-    if (mib == 0ull && DirectPath::Tables()) mib = 256ull;
+    if (mib == 0ull && DirectPath::Enabled()) mib = 256ull;
     return mib != 0ull ? static_cast<std::size_t>(mib) * (std::size_t{1} << 20u) / sizeof(std::uint32_t) : std::size_t{1} << 23u;
 }();
 

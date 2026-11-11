@@ -25,6 +25,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "ThreadOwned.hpp"
+#include "DirectPath.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "Optimization/include/Optimization/ShaderStageInputInfo.hpp"
@@ -2960,7 +2961,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     bool rewritten = false;
     // rewrite/direct (DESIGN-3 phase 5): a GPU-side indirect draw whose arguments the CPU can
     // snapshot now records nothing outside a pass, so it no longer forces a new one.
-    static const bool indirectInPass = std::getenv("APS5_NO_INDIRECT_IN_PASS") == nullptr;
+    static const bool indirectInPass = ShaderRecompiler::DirectPath::Enabled();
     const bool argumentsSnapshotted = indirectInPass && gpuIndirect && !meshIndirect && !captured && snapshotIndirectArguments(context, recorder, *record.indirect, argumentSnapshot, argumentBuffer, argumentOffset);
     if (argumentsSnapshotted) rewritten = args->vertexRule == Pm4::DrawParameters::IndirectDraw::Rule::Constant || args->instanceRule == Pm4::DrawParameters::IndirectDraw::Rule::Constant;
     const std::array<bool, 7> forcedWhy{capture, readsTarget, gpuIndirect && !argumentsSnapshotted, static_cast<bool>(meshIndirect), captured, !record.staged.empty(), PixelFunctionLdsSubgroup(shaders) != 0u};

@@ -1,3 +1,4 @@
+#include "DirectPath.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
@@ -224,9 +225,9 @@ namespace {
 
 // A range over one of this worker's queued labels: the flush hook records the group and syncs on it
 // before the access, so the capture treats it as a pending write (a page holding it is read word by
-// word, and only the label's own words wait). APS5_NO_QUEUED_LABEL_PENDING=1 turns this off.
+// word, and only the label's own words wait). APS5_NO_DIRECT=1 turns this off.
 bool QueuedLabelPending(std::uint64_t address, std::size_t bytes) {
-    static const bool enabled = std::getenv("APS5_NO_QUEUED_LABEL_PENDING") == nullptr;
+    const bool enabled = ShaderRecompiler::DirectPath::Enabled();
     return enabled && Graphics::Recorder::QueuedLabelOverlapsHere(address, bytes);
 }
 
