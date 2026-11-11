@@ -98,6 +98,15 @@ struct DirectStage {
     std::shared_ptr<const ShaderRecompiler::RecompileResult> result;
 };
 
+// A result nobody else holds (a memo donor's patched copy, or this function's own table copy) is
+// completed in place; a shared one (a result memo entry) is copied. Results are created non-const.
+// APS5_DIRECT_COPY_RESULTS=1 always copies.
+std::shared_ptr<ShaderRecompiler::RecompileResult> ownResult(std::shared_ptr<const ShaderRecompiler::RecompileResult>& base) {
+    static const bool copyAlways = std::getenv("APS5_DIRECT_COPY_RESULTS") != nullptr;
+    if (!copyAlways && base.use_count() == 1) return std::const_pointer_cast<ShaderRecompiler::RecompileResult>(std::move(base));
+    return std::make_shared<ShaderRecompiler::RecompileResult>(*base);
+}
+
 std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::RecompileRequest& request, VulkanDevice* device) {
     struct Totals {
         std::uint64_t direct = 0, noHeap = 0;
@@ -273,8 +282,8 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
                 report(nullptr);
                 return DirectStage{std::move(capture), std::move(base)};
             }
-            auto withTables = std::make_shared<ShaderRecompiler::RecompileResult>(*base);
-            const auto materialized = base;
+            const std::weak_ptr<const ShaderRecompiler::RecompileResult> materialized = base;
+            auto withTables = ownResult(base);
             withTables->directTables = std::move(resolvedTables);
             if (std::ranges::any_of(withTables->directTables->elements, [](const ShaderRecompiler::ImageTableElement& element) { return ShaderRecompiler::ImageBindingResourceClass(element.kind) != ShaderRecompiler::ImageResourceClass::Sampled; })) {
                 report("storage image table");
@@ -318,7 +327,7 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
             report("slot words outside the push data");
             return std::nullopt;
         }
-        auto patched = std::make_shared<ShaderRecompiler::RecompileResult>(*base);
+        auto patched = ownResult(base);
         patched->directSlotRequests = std::move(requests);
         {
             std::lock_guard lock(mutex);
