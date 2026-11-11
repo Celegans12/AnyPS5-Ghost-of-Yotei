@@ -370,7 +370,7 @@ public:
 	// are logged (DIAG_PAGE_MARK_MISMATCH). It waits where the path without it does not: it checks, it does not
 	// measure speed.
 	[[nodiscard]] static bool PageMarkCheck();
-	// KYTY_FIX_DIRECT_PAGE_MARK=1 (default 0, off; live A/B switch), GPU thread: the fix for the case above. An ordinary
+	// KYTY_FIX_DIRECT_PAGE_MARK=1 (the default from Common::EnvDefaults; =0 off; live A/B switch), GPU thread: the fix for the case above. An ordinary
 	// read does not mark its page while a direct write is pending anywhere on the page (DirectPendingIn over the 4 KiB),
 	// so every further read of that page in the walk asks about its own bytes again: it waits for a shader write over
 	// them and takes a pending command-processor write over guest memory, as the first read does. A page with nothing

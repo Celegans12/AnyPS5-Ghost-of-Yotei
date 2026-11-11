@@ -52,6 +52,14 @@ inline constexpr EnvDefault EnvDefaults[] = {
     // A/Bs, faster in 10 of 10 cycles each; v4e verified its copies against the BAR read with 0 mismatches): finished
     // read windows of up to 8 MiB are taken by the host-mapped download and copied by the GPU (cache/barGpuCopy.h).
     {"KYTY_PERF_BAR_GPU_LARGE", "1", "config", ""},
+    // Exactness fix, measured free (AnyPS5 v4x2: in-run A/Bs between -0.7 % and +1.1 %, SE 0.5-1.7; T1 byte-identical
+    // with it on): on a CPU write fault into a data-ring page the GPU bytes written before the previous frame are
+    // downloaded like any other GPU bytes, not dropped (cache/bufferCache.cpp).
+    {"KYTY_FIX_RING_DEAD_DOWNLOAD", "1", "config", ""},
+    // Exactness fix, measured free (AnyPS5 v4e3: +0.6 % in-run A/B, SE 0.8; T1 byte-identical with it on): an ordinary
+    // table read does not mark a direct-range page clean for its walk while a GPU write is still pending elsewhere on
+    // the page (cache/bufferCache.h).
+    {"KYTY_FIX_DIRECT_PAGE_MARK", "1", "config", ""},
     // Probably hardware behaviour, exactness check open (M48):
     {"KYTY_FIX_TEXTURE_CLAMP_LAST_LEVEL", "1", "unproven", "M48"},
     {"KYTY_FIX_RT_11_11_10_FLOAT", "1", "unproven", "M48"},

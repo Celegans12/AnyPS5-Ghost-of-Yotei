@@ -2070,11 +2070,12 @@ bool BufferCache::DropDeadRingBytes(uint64_t vaddr) {
 			live = true;
 		}
 	});
-	// KYTY_FIX_RING_DEAD_DOWNLOAD=1 (lane v4x; default 0 = the rule above, the G2 behaviour; a KYTY_LIVE_AB switch): the
+	// KYTY_FIX_RING_DEAD_DOWNLOAD=1 (lane v4x; the default from Common::EnvDefaults; =0 is the rule above, the G2
+	// behaviour; a KYTY_LIVE_AB switch): the
 	// exact variant: no GPU byte is dropped, the fault downloads them as on any other page (counted as kept).
 	static constinit Common::OnceValue<uint32_t> download_once;
 	const uint32_t download = Common::LiveAb::Gate(Common::LiveAb::Switch::RingDeadDownload, download_once.Get([] {
-		const char*    value = std::getenv("KYTY_FIX_RING_DEAD_DOWNLOAD");
+		const char*    value = Common::EnvOrDefault("KYTY_FIX_RING_DEAD_DOWNLOAD");
 		const uint32_t m     = value != nullptr && value[0] == '1' ? 1u : 0u;
 		if (m != 0) std::fprintf(stderr, "FIX_RING_DEAD_DOWNLOAD on: data-ring GPU bytes are downloaded, not dropped\n");
 		return m;
@@ -2354,7 +2355,8 @@ bool BufferCache::PageMarkCheck() {
 // ---- KYTY_FIX_DIRECT_PAGE_MARK (bufferCache.h) ------------------------------------------------------------------------
 bool BufferCache::DirectPageMarkFix() {
 	static const uint32_t fixed = [] {
-		const char* text = std::getenv("KYTY_FIX_DIRECT_PAGE_MARK");
+		// Default from Common::EnvDefaults (on); =0 turns it off.
+		const char* text = Common::EnvOrDefault("KYTY_FIX_DIRECT_PAGE_MARK");
 		const bool  on   = text != nullptr && text[0] == '1';
 		if (on) {
 			std::fprintf(stderr, "FIX_DIRECT_PAGE_MARK=1: a direct-range page with a pending GPU write is not marked clean for the walk\n");
