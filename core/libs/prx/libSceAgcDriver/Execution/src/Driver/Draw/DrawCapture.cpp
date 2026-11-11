@@ -557,6 +557,21 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
             stageCapture.userDataMask = ~std::uint64_t{0};
             stageCapture.registeredViews = std::make_shared<const std::vector<ShaderRecompiler::RegisteredImageView>>();
             recompiled[i] = true;
+            // Debug aid: APS5_DIRECT_DUMP_SPIRV=<dir> writes each direct draw stage's SPIR-V once as
+            // draw_<code address>.spv (the first module seen for that code).
+            if (static const char* dumpDir = std::getenv("APS5_DIRECT_DUMP_SPIRV"); dumpDir != nullptr) {
+                static std::mutex dumpMutex;
+                static std::set<std::uint64_t> dumped;
+                std::lock_guard dumpLock(dumpMutex);
+                if (dumped.insert(program.binary.codeAddress).second) {
+                    char path[512];
+                    std::snprintf(path, sizeof(path), "%s/draw_%llx.spv", dumpDir, static_cast<unsigned long long>(program.binary.codeAddress));
+                    if (std::FILE* file = std::fopen(path, "wb")) {
+                        std::fwrite(direct->result->spirv.data(), sizeof(std::uint32_t), direct->result->spirv.size(), file);
+                        std::fclose(file);
+                    }
+                }
+            }
             return stageCapture.compiled;
         }
     }
