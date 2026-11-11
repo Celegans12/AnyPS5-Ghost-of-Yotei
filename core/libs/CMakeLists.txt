@@ -248,11 +248,11 @@ if(TARGET mimalloc)
     list(APPEND PATCHED_OUTPUTS ${PATCHED_DIR}/mimalloc.dll ${PATCHED_DIR}/mimalloc-redirect.dll)
 endif()
 
-if(WIN32 AND APS5_KYTY_GPU_DLL)
+if(ANYPS5_KYTY_GPU_FILE)
     add_custom_command(
             OUTPUT ${PATCHED_DIR}/kyty_gpu.prx
-            COMMAND ${CMAKE_COMMAND} -E copy ${APS5_KYTY_GPU_DLL} ${PATCHED_DIR}/kyty_gpu.prx
-            DEPENDS ${APS5_KYTY_GPU_DLL}
+            COMMAND ${CMAKE_COMMAND} -E copy ${ANYPS5_KYTY_GPU_FILE} ${PATCHED_DIR}/kyty_gpu.prx
+            DEPENDS ${ANYPS5_KYTY_GPU_FILE} ${ANYPS5_KYTY_GPU_TARGET}
             COMMENT "Copying Kyty's GPU backend beside the libraries"
     )
     list(APPEND PATCHED_OUTPUTS ${PATCHED_DIR}/kyty_gpu.prx)

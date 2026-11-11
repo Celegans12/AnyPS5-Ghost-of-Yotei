@@ -404,6 +404,7 @@ if(WIN32)
     endif()
 endif()
 
+include(cmake/KytyGpu.cmake)
 add_subdirectory(core/shader/recompiler)
 add_subdirectory(core/Decoder/Jpeg)
 add_subdirectory(core/Decoder/Png)
