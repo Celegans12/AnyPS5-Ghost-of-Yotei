@@ -637,6 +637,13 @@ static bool MeasuredInvalidClock(int clockId) {
 }
 
 int APS5_VABI clock_gettime_nid_postfix(int clockId, KernelTimespec* tp) {
+    // rewrite/direct local carry, not for upstream: a PS5 answers id 20 with a time (#16437) and
+    // upstream throws until that clock is implemented. AoM's Party.prx falls back to gettimeofday
+    // on EINVAL, so the branch fails id 20 to keep AoM running.
+    if (clockId == 20) {
+        *__error_nid_postfix() = GUEST_EINVAL;
+        return -1;
+    }
     if (!IsCpuClock(clockId) && (clockId < 0 || clockId >= 32 || MeasuredInvalidClock(clockId))) {
         *__error_nid_postfix() = GUEST_EINVAL;
         return -1;
