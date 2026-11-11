@@ -21,6 +21,7 @@
 #include "graphics/guest_gpu/hardwareContext.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/renderer/debugSample.h"
+#include "graphics/host_gpu/renderer/frameTimeline.h"
 #include "graphics/host_gpu/renderer/gpuTimer.h"
 #include "graphics/host_gpu/renderer/hTrace.h"
 
@@ -306,8 +307,9 @@ static void PerfReport(RenderContext& renderer) {
 				std::fprintf(stderr, " %s=%llu/%.1fms", n[i], static_cast<unsigned long long>(s.queries[i].exchange(0)),
 				             static_cast<double>(s.query_ns[i].exchange(0)) / 1e6);
 			}
-			std::fprintf(stderr, " blocks=%llu/%.1fms\n", static_cast<unsigned long long>(s.blocks.exchange(0)),
-			             static_cast<double>(s.block_ns.exchange(0)) / 1e6);
+			std::fprintf(stderr, " blocks=%llu/%.1fms polls=%llu/%.1fms\n", static_cast<unsigned long long>(s.blocks.exchange(0)),
+			             static_cast<double>(s.block_ns.exchange(0)) / 1e6, static_cast<unsigned long long>(s.polls.exchange(0)),
+			             static_cast<double>(s.poll_ns.exchange(0)) / 1e6);
 		}
 		std::fprintf(stderr, "PERF image_unregister %s\n", TakeImageUnregisterStats().c_str());
 	}
@@ -514,6 +516,8 @@ static void CopyFromGuest(void* destination, const volatile void* source, size_t
 namespace {
 struct LabelStats {
 	std::atomic<uint64_t> deferred {0}, published {0}, overlay_hits {0}, lag_ns {0}, max_lag_ns {0}, max_pending {0};
+	// The part of the lag after the priority thread saw the work finished: until the GPU thread ran the publish.
+	std::atomic<uint64_t> pickup_ns {0}, max_pickup_ns {0};
 };
 LabelStats g_label_stats;
 
@@ -534,13 +538,16 @@ void ReportLabelStats() {
 	const uint64_t lag   = s.lag_ns.exchange(0, std::memory_order_relaxed);
 	std::fprintf(stderr,
 	             "PERF label_at_completion deferred=%llu published=%llu overlay_hits=%llu lag_ms_avg=%.2f lag_ms_max=%.2f "
-	             "max_pending=%llu\n",
+	             "max_pending=%llu pickup_ms_avg=%.2f pickup_ms_max=%.2f\n",
 	             static_cast<unsigned long long>(s.deferred.exchange(0, std::memory_order_relaxed)),
 	             static_cast<unsigned long long>(pub),
 	             static_cast<unsigned long long>(s.overlay_hits.exchange(0, std::memory_order_relaxed)),
 	             pub == 0 ? 0.0 : static_cast<double>(lag) / static_cast<double>(pub) / 1e6,
 	             static_cast<double>(s.max_lag_ns.exchange(0, std::memory_order_relaxed)) / 1e6,
-	             static_cast<unsigned long long>(s.max_pending.exchange(0, std::memory_order_relaxed)));
+	             static_cast<unsigned long long>(s.max_pending.exchange(0, std::memory_order_relaxed)),
+	             pub == 0 ? 0.0
+	                      : static_cast<double>(s.pickup_ns.exchange(0, std::memory_order_relaxed)) / static_cast<double>(pub) / 1e6,
+	             static_cast<double>(s.max_pickup_ns.exchange(0, std::memory_order_relaxed)) / 1e6);
 }
 
 // Defers an end-of-pipe label (labels at completion); the journal holds it since its packet. Only on the GPU thread.
@@ -553,8 +560,9 @@ void DeferLabel(CommandScheduler& scheduler, RenderContext& renderer, int event_
 	scheduler.DeferPriorityOperation([gpu, &renderer, event_id, sequence, dst, value, size, with_interrupt,
 	                                  interrupt_context_id, recorded_ns] {
 		if (gpu->IsStopping()) return;
+		const int64_t ready_ns = LabelNowNs(); // KYTY_TRACE_PERF: the GPU thread's pickup of the publish starts here
 		const auto publish = [gpu, &renderer, event_id, sequence, dst, value, size, with_interrupt, interrupt_context_id,
-		                      recorded_ns] {
+		                      recorded_ns, ready_ns] {
 			// The immediate path's write (the write-through or a plain store). In a direct range
 			// (KYTY_PERF_DIRECT_RANGES) a plain store: the work before the label is done, which is when the console's CP
 			// writes it, and an update recorded now would reach guest memory only with a later submit.
@@ -570,7 +578,18 @@ void DeferLabel(CommandScheduler& scheduler, RenderContext& renderer, int event_
 			if (lag > g_label_stats.max_lag_ns.load(std::memory_order_relaxed)) {
 				g_label_stats.max_lag_ns.store(lag, std::memory_order_relaxed);
 			}
+			const auto pickup = static_cast<uint64_t>(std::max<int64_t>(LabelNowNs() - ready_ns, 0));
+			g_label_stats.pickup_ns.fetch_add(pickup, std::memory_order_relaxed);
+			if (pickup > g_label_stats.max_pickup_ns.load(std::memory_order_relaxed)) {
+				g_label_stats.max_pickup_ns.store(pickup, std::memory_order_relaxed);
+			}
 			ReportLabelStats();
+			if (FrameTimeline::Active()) { // KYTY_TRACE_FRAME_TIMELINE
+				FrameTimeline::Event("label rec_us=%lld done_us=%lld dst=0x%llx value=0x%llx size=%u irq=%d ctx=0x%x",
+				                     static_cast<long long>(recorded_ns / 1000), static_cast<long long>(ready_ns / 1000),
+				                     static_cast<unsigned long long>(dst), static_cast<unsigned long long>(value), size,
+				                     with_interrupt ? 1 : 0, interrupt_context_id);
+			}
 			if (with_interrupt) renderer.TriggerInterrupt(event_id, interrupt_context_id);
 		};
 		gpu->SendCommand(publish);
@@ -713,6 +732,7 @@ void GuestGpu::Submit(std::span<const uint32_t> draw_commands,
 		return;
 	}
 	HTrace::NoteSubmit(0); // KYTY_TRACE_H
+	if (FrameTimeline::Active()) FrameTimeline::Event("submit q=0"); // KYTY_TRACE_FRAME_TIMELINE
 	Submission submission;
 	submission.type              = SubmissionType::Graphics;
 	submission.queue_id          = 0;
@@ -728,6 +748,7 @@ void GuestGpu::SubmitCompute(uint32_t queue, std::span<const uint32_t> commands)
 
 	const auto compute_queue = queue - ComputeQueueBase;
 	HTrace::NoteSubmit(queue); // KYTY_TRACE_H
+	if (FrameTimeline::Active()) FrameTimeline::Event("submit q=%u", queue); // KYTY_TRACE_FRAME_TIMELINE
 	Submission submission;
 	submission.type     = SubmissionType::Compute;
 	submission.queue_id = 1 + compute_queue;
@@ -906,6 +927,10 @@ void GuestGpu::ExecutionThread() {
 			if (g_gpu_stage_stats) {
 				g_stage_stats.execution_idle.fetch_add(1, std::memory_order_relaxed);
 				g_stage_stats.execution_idle_ns.fetch_add(StageNowNs() - idle_start, std::memory_order_relaxed);
+				// KYTY_TRACE_FRAME_TIMELINE (needs KYTY_TRACE_PERF for the idle clock): idle stretches of 200 us or more.
+				if (const uint64_t idle_ns = StageNowNs() - idle_start; idle_ns >= 200000u && FrameTimeline::Active()) {
+					FrameTimeline::Event("idle dur_us=%llu", static_cast<unsigned long long>(idle_ns / 1000u));
+				}
 			}
 			continue;
 		}
@@ -3459,6 +3484,8 @@ void CommandProcessor::WriteLodStats(void* dst, uint32_t size) {
 // it is the frame boundary where live A/B phases change, so no frame runs partly in one phase and partly in another.
 static void LiveAbFrameBoundary() {
 	if (GuestGpu::IsGpuThread()) {
+		if (FrameTimeline::Active()) FrameTimeline::Event("frame"); // KYTY_TRACE_FRAME_TIMELINE
+		FrameTimeline::Flush(); // ... its kept lines, once the window is over
 		Common::LiveAb::OnFrameBoundary(DebugPresentCount().load());
 		// KYTY_PERF_PLACEMENT: the thread layout of the phase (or of the whole run) starts at this boundary too.
 		Common::GpuPlacement::OnFrameBoundary();

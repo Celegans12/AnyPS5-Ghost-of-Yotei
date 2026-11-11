@@ -271,6 +271,13 @@ void Accumulate(State& s, const Chunk& chunk) {
 		if (base == 0) base = begin;
 		std::vector<std::pair<uint64_t, uint32_t>> by_marker; // (ticks, marker)
 		std::vector<std::pair<uint64_t, uint64_t>> by_mark;   // (ticks, emulator operation id): marked operations
+		struct ProgramTime {
+			char     kind;
+			uint64_t a;
+			uint64_t ticks;
+			uint32_t calls;
+		};
+		std::vector<ProgramTime>                   by_program;
 		uint64_t                                   other_ticks = 0;
 		for (uint32_t query = 0; query + 1u < chunk.used; query++) {
 			const auto from = ts(query), to = ts(query + 1u);
@@ -291,6 +298,15 @@ void Accumulate(State& s, const Chunk& chunk) {
 			auto it = std::find_if(by_marker.begin(), by_marker.end(), [&](const auto& e) { return e.second == marker; });
 			if (it == by_marker.end()) by_marker.push_back({to - from, marker});
 			else it->first += to - from;
+			// The buffer's programs: (kind, hash) as in the GPUTIME_TOP lines, with their time and calls in this buffer.
+			const auto& command = chunk.commands[index];
+			auto prog = std::find_if(by_program.begin(), by_program.end(),
+			                         [&](const auto& e) { return e.kind == command.kind && e.a == command.a; });
+			if (prog == by_program.end()) by_program.push_back({command.kind, command.a, to - from, 1u});
+			else {
+				prog->ticks += to - from;
+				prog->calls++;
+			}
 		}
 		std::sort(by_marker.begin(), by_marker.end(), [](const auto& x, const auto& y) { return x.first > y.first; });
 		const auto us = [&](uint64_t ticks) { return static_cast<double>(ticks) * s.ns_per_tick / 1.0e3; };
@@ -308,6 +324,15 @@ void Accumulate(State& s, const Chunk& chunk) {
 			char item[48];
 			std::snprintf(item, sizeof(item), " %llx=%dus", static_cast<unsigned long long>(by_mark[i].second),
 			              static_cast<int>(us(by_mark[i].first)));
+			top += item;
+		}
+		std::sort(by_program.begin(), by_program.end(), [](const auto& x, const auto& y) { return x.ticks > y.ticks; });
+		top += " prog:";
+		for (size_t i = 0; i < by_program.size() && i < 6u; i++) {
+			char item[64];
+			std::snprintf(item, sizeof(item), " %c:%016llx=%dus/%u", by_program[i].kind,
+			              static_cast<unsigned long long>(by_program[i].a), static_cast<int>(us(by_program[i].ticks)),
+			              by_program[i].calls);
 			top += item;
 		}
 		const int64_t cpu_base = g_cpu_base.load();

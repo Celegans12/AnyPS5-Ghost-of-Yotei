@@ -37,6 +37,13 @@ enum class Switch : uint32_t {
 	BarGpuLarge,           // KYTY_PERF_BAR_GPU_LARGE (cache/barGpuCopy.h)
 	Placement,             // KYTY_PERF_PLACEMENT (the thread layout, common/gpuPlacement.h; may be listed once per value)
 	RingDeadDownload,          // KYTY_FIX_RING_DEAD_DOWNLOAD (lane v4x: the data ring's old GPU bytes downloaded, not dropped)
+	ExactWalker,           // KYTY_PERF_EXACT_WALKER (cache/exactTicks.h)
+	GpuPoll,               // KYTY_PERF_GPU_POLL (masterSemaphore.h)
+	ExactFaults,           // KYTY_PERF_EXACT_FAULTS (cache/exactTicks.h)
+	VerifyRange,           // KYTY_PERF_VERIFY_RANGE (cache/bufferCache.h, DirectPendingIn)
+	DirectPageMark,        // KYTY_FIX_DIRECT_PAGE_MARK (cache/bufferCache.h, DirectPageMarkFix)
+	BarGpuDirect,          // KYTY_PERF_BAR_GPU_DIRECT (cache/barGpuCopy.h)
+	CopyHandback,          // KYTY_PERF_COPY_HANDBACK (cache/barGpuCopy.h)
 	Count
 };
 

@@ -35,11 +35,19 @@ public:
 	void Wait(uint64_t tick);
 
 	// KYTY_TRACE_PERF (PERF semaphore): semaphore queries (calls/ns) by caller: 0 Refresh, 1 Wait before blocking, 2 Wait
-	// after blocking, 3 other; blocking waits (calls/ns). GPU thread only; reset by TakeStats.
+	// after blocking, 3 other; blocking waits (calls/ns). GPU thread only; reset by TakeStats. polls/poll_ns: the GPU
+	// thread's waits served by KYTY_PERF_GPU_POLL.
 	struct Stats {
-		std::atomic<uint64_t> queries[4] {}, query_ns[4] {}, blocks {0}, block_ns {0};
+		std::atomic<uint64_t> queries[4] {}, query_ns[4] {}, blocks {0}, block_ns {0}, polls {0}, poll_ns {0};
 	};
 	static Stats& GetStats();
+
+	// KYTY_PERF_GPU_POLL=1 (default 0, off; live A/B switch; lane v4e2 of AnyPS5's PLAN v4): the GPU thread waits for the
+	// GPU by polling (here the timeline value, vkGetSemaphoreCounterValue, ~0.1 us on the NVIDIA driver; the BAR copy its
+	// fence, vkGetFenceStatus) with a pause backoff of at most ~2 us, instead of blocking in the driver until the OS wakes
+	// it. Only how the thread waits changes; the condition it waits for is the same. A wait still unmet after 100 ms
+	// blocks as before. True on the GPU thread while the switch is on (read once per wait).
+	[[nodiscard]] static bool PollWaits() noexcept;
 
 private:
 	GraphicContext&       m_graphics;

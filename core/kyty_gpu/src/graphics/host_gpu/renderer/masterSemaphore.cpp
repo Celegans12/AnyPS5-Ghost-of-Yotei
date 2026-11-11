@@ -3,11 +3,15 @@
 #include "graphics/host_gpu/renderer/masterSemaphore.h"
 
 #include "common/assert.h"
+#include "common/liveAb.h"
 #include "common/onceValue.h"
 #include "common/debugCounters.h"
+#include "common/spscQueue.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/gpuCheckpoints.h"
+#include "graphics/host_gpu/renderer/frameTimeline.h"
 #include "graphics/host_gpu/renderer/gpuTimer.h"
+#include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/host_gpu/renderer/syncTimeline.h"
 
 #include <chrono>
@@ -37,6 +41,24 @@ MasterSemaphore::~MasterSemaphore() {
 MasterSemaphore::Stats& MasterSemaphore::GetStats() {
 	static Stats stats;
 	return stats;
+}
+
+namespace {
+// KYTY_PERF_GPU_POLL's start value (masterSemaphore.h).
+uint32_t GpuPollFixed() {
+	static const uint32_t value = [] {
+		const char* text = std::getenv("KYTY_PERF_GPU_POLL");
+		const bool  on   = text != nullptr && text[0] == '1';
+		if (on) std::fprintf(stderr, "PERF_GPU_POLL the GPU thread polls while it waits for the GPU\n");
+		return on ? 1u : 0u;
+	}();
+	return value;
+}
+constexpr int64_t GpuPollMaxNs = 100'000'000;
+} // namespace
+
+bool MasterSemaphore::PollWaits() noexcept {
+	return PerfIsGpuThread() && Common::LiveAb::Gate(Common::LiveAb::Switch::GpuPoll, GpuPollFixed()) != 0;
 }
 
 namespace {
@@ -109,22 +131,52 @@ void MasterSemaphore::Wait(uint64_t tick) {
 
 	Common::DebugCounters::ScopedTimer timer(Common::DebugCounters::Counter::GpuWaits,
 	                                         Common::DebugCounters::Counter::GpuWaitNs);
-	const auto result = m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
+	// KYTY_PERF_GPU_POLL: the GPU thread polls the value; a failed query or a wait past GpuPollMaxNs blocks below.
+	bool polled = false;
+	if (PollWaits()) {
+		uint32_t pauses = 1;
+		for (uint32_t round = 1;; round++) {
+			uint64_t counter = 0;
+			if (m_graphics.device.getSemaphoreCounterValue(m_semaphore, &counter) != vk::Result::eSuccess) break;
+			auto known = m_gpu_tick.load(std::memory_order_acquire);
+			while (known < counter && !m_gpu_tick.compare_exchange_weak(known, counter, std::memory_order_release,
+			                                                           std::memory_order_relaxed)) {
+			}
+			if (counter >= tick) {
+				polled = true;
+				break;
+			}
+			for (uint32_t i = 0; i < pauses; i++) Common::SpinPause();
+			if (pauses < 64u) pauses <<= 1u;
+			if ((round & 63u) == 0 && std::chrono::steady_clock::now() - block_start >= std::chrono::nanoseconds(GpuPollMaxNs)) {
+				break;
+			}
+		}
+	}
+	const auto result = polled ? vk::Result::eSuccess : m_graphics.device.waitSemaphores(&wait_info, UINT64_MAX);
 	PassCensus::t_wait_ns += static_cast<uint64_t>(
 	    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - block_start).count()); // KYTY_TRACE_PASS_CENSUS
 	if (GpuTimer::Enabled() && GpuTimer::TimelineCpuActive()) GpuTimer::NoteCpuWait('f', block_start); // KYTY_TRACE_GPU_TIMELINE
+	if (FrameTimeline::Active()) { // KYTY_TRACE_FRAME_TIMELINE
+		FrameTimeline::Event("wait thr=%s kind=sem dur_us=%lld tick=%llu", PerfIsGpuThread() ? "exec" : "other",
+		                     static_cast<long long>(FrameTimeline::NowUs() - FrameTimeline::Us(block_start)),
+		                     static_cast<unsigned long long>(tick));
+	}
 	if (result != vk::Result::eSuccess) {
 		std::fprintf(stderr, "waitSemaphores failed: %s\n", vk::to_string(result).c_str());
 		GpuCheckpoints::Dump(m_graphics.queue);
 	}
 	EXIT_NOT_IMPLEMENTED(result != vk::Result::eSuccess);
 	{
-		auto& s = GetStats();
+		auto&          s  = GetStats();
+		const uint64_t ns = static_cast<uint64_t>(
+		    std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - block_start).count());
 		s.blocks.fetch_add(1, std::memory_order_relaxed);
-		s.block_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
-		                                               std::chrono::steady_clock::now() - block_start)
-		                                               .count()),
-		                     std::memory_order_relaxed);
+		s.block_ns.fetch_add(ns, std::memory_order_relaxed);
+		if (polled) {
+			s.polls.fetch_add(1, std::memory_order_relaxed);
+			s.poll_ns.fetch_add(ns, std::memory_order_relaxed);
+		}
 	}
 	const QuerySite site(2);
 	RefreshNow();

@@ -58,6 +58,30 @@ constexpr SwitchInfo Switches[] = {
     // dropped (0, the G2 behaviour) or downloaded like any other GPU bytes (1); the fault decides with the one value it
     // read and nothing it leaves depends on it (dropped bytes stay as the off phase left them).
     {Switch::RingDeadDownload, "KYTY_FIX_RING_DEAD_DOWNLOAD", 1},
+    // Only how long a read of GPU-written bytes by the SRT walker waits (for the exact write tick of the bytes it needs,
+    // or for the 64 KiB granule's) and which finished GPU-dirty bytes it publishes, per request; the exact write ticks
+    // are kept whenever the switch can be on, so either phase finds them (cache/exactTicks.h).
+    {Switch::ExactWalker, "KYTY_PERF_EXACT_WALKER", 1},
+    // Only whether the GPU thread polls or blocks while it waits for the GPU (timeline semaphore, BAR copy fence), per
+    // wait; nothing is computed from it (masterSemaphore.h).
+    {Switch::GpuPoll, "KYTY_PERF_GPU_POLL", 1},
+    // As KYTY_PERF_EXACT_WALKER, for guest read and write faults (the faulting pages are published whole), per request.
+    {Switch::ExactFaults, "KYTY_PERF_EXACT_FAULTS", 1},
+    // Only whether a read-log check and an ordinary table read of a direct-range page with a GPU write still pending
+    // wait by the page or by the bytes they read, per read; the page is then not remembered as clean for the rest of
+    // the walk, and nothing outlives the walk (cache/bufferCache.h, DirectPendingIn).
+    {Switch::VerifyRange, "KYTY_PERF_VERIFY_RANGE", 1},
+    // Only whether an ordinary table read marks a direct-range page as clean for the rest of its walk while a GPU write
+    // is still pending somewhere on the page, per read; a mark never outlives the walk (cache/bufferCache.h).
+    {Switch::DirectPageMark, "KYTY_FIX_DIRECT_PAGE_MARK", 1},
+    // Only where the second-queue copy of a host-mapped download puts the bytes (the staging buffer and a CPU copy, or
+    // the imported guest backing), per download. A backing granule imported for it stays imported in the other phase
+    // too and is added to the game's granule list, as the copy path's direct downloads do (cache/barGpuCopy.h).
+    {Switch::BarGpuDirect, "KYTY_PERF_BAR_GPU_DIRECT", 1},
+    // Only who waits for the second-queue copy of a guest fault's download (the GPU thread, or the faulting thread after
+    // the request was handed back), per request. A copy started in one phase is finished and applied whatever the phase
+    // is then; its granule imports are KYTY_PERF_BAR_GPU_DIRECT's (cache/barGpuCopy.h).
+    {Switch::CopyHandback, "KYTY_PERF_COPY_HANDBACK", 1},
 };
 static_assert(std::size(Switches) == SwitchCount);
 

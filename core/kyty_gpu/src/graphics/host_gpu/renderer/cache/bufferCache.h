@@ -332,6 +332,57 @@ public:
 	// the range, and the caller puts ApplyDirectCpWrites over the guest memory it reads right after.
 	[[nodiscard]] bool InDirectRange(uint64_t vaddr, uint64_t size) const;
 	bool               WaitDirectGpuWrites(uint64_t vaddr, uint64_t size, bool cp_overlay = false);
+	// KYTY_PERF_VERIFY_RANGE=1 (default 0, off; live A/B switch), GPU thread. The resource walker's read-log check
+	// (FastVerifyLoggedReads) and its ordinary reads ask WaitPendingReadbacks about a whole 4 KiB page and then remember
+	// the page as clean for the rest of the walk. In a direct range the page-wide question waits for a GPU write of
+	// unknown bytes anywhere in the page (flush, then the whole queue: ~8 ms once per frame in the river village),
+	// although the read may not touch those bytes. With the switch a page that still has a pending GPU write is asked
+	// about per read, with the read's own bytes, and is not remembered: a read no pending write overlaps takes guest
+	// memory at once (no recorded GPU work will change those bytes), one that overlaps a write of unknown bytes waits
+	// for it as before, one under a command-processor write goes to the readers with the overlay as before.
+	//   - DirectPendingIn: the GPU writes recorded into a direct range that the host GPU has not finished (as far as
+	//     the known GPU tick says) and that overlap [vaddr, vaddr + size): bit 0 any, bit 1 one of unknown bytes;
+	//   - VerifyRangeOn: the switch's value now; NoteVerifyRange: PERF verify_range counters (KYTY_TRACE_PERF).
+	[[nodiscard]] uint32_t DirectPendingIn(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] static bool VerifyRangeOn();
+	// KYTY_PERF_VERIFY_RANGE_CHECK=1 (diagnostic, default off, read once; with the switch on): a run the read-log check
+	// takes without the page-wide wait is copied, the page-wide question is then asked for each of its pages (waiting
+	// as the path without the switch does) and the run is read again; different bytes are counted and the first 16
+	// logged (PERF_VERIFY_RANGE_MISMATCH). The waits are back while it is on: it checks, it does not measure speed.
+	[[nodiscard]] static bool VerifyRangeCheck();
+	enum class VerifyRangeEvent : uint32_t {
+		PagePending, PageUnknown, PageOnly, RunCheck, RunWait, RunOverlay, NotCached, Checked, Mismatched, Count
+	};
+	static void NoteVerifyRange(VerifyRangeEvent event);
+	// The number of blocking waits WaitDirectGpuWrites made so far (monotonic).
+	[[nodiscard]] static uint64_t DirectWaitTotal();
+	// KYTY_DIAG_PAGE_MARK_CHECK=1 (diagnostic, default off, read once), GPU thread. The resource walker remembers a
+	// 4 KiB page as clean for the rest of one walk (OrdinaryReadPageCache in aps5/memoryShim.cpp and kernel/memory.cpp);
+	// a read through that mark takes guest memory without a question. An ordinary read sets the mark after asking
+	// WaitPendingReadbacks about its own bytes, and in a direct range that question is about those bytes only, so
+	// another read of the page can lie over a GPU write that is still pending. With the check on, every read through a
+	// mark is asked about with its own bytes (DirectPendingIn, a pending eager copy, GPU-dirty bytes); when something
+	// is pending, the bytes the read returns are compared with the readers' answer for them (the wait for writes of
+	// unknown bytes, then guest memory with the pending command-processor writes over it). PERF page_mark every ~5 s:
+	// read_hits / verify_hits (reads and read-log runs through a mark), pending (of them with something pending over
+	// their bytes: unknown, cp, eager, dirty), compared, mismatched, marked_pending (marks set while a direct write was
+	// pending elsewhere on the page), not_marked (marks KYTY_FIX_DIRECT_PAGE_MARK withheld). The first 32 differences
+	// are logged (DIAG_PAGE_MARK_MISMATCH). It waits where the path without it does not: it checks, it does not
+	// measure speed.
+	[[nodiscard]] static bool PageMarkCheck();
+	// KYTY_FIX_DIRECT_PAGE_MARK=1 (default 0, off; live A/B switch), GPU thread: the fix for the case above. An ordinary
+	// read does not mark its page while a direct write is pending anywhere on the page (DirectPendingIn over the 4 KiB),
+	// so every further read of that page in the walk asks about its own bytes again: it waits for a shader write over
+	// them and takes a pending command-processor write over guest memory, as the first read does. A page with nothing
+	// pending is marked as before (no GPU write is recorded during a walk, so it stays clean until the walk ends), and
+	// the read-log check's own marks were always set after a page-wide question. Only waits and overlays the stream
+	// order asks for are added.
+	[[nodiscard]] static bool DirectPageMarkFix();
+	enum class PageMarkEvent : uint32_t {
+		ReadHit, VerifyHit, Pending, PendingUnknown, PendingCp, PendingEager, PendingDirty, Compared, Mismatched,
+		MarkedPending, NotMarked, Count
+	};
+	static void NotePageMark(PageMarkEvent event);
 	void               ApplyDirectCpWrites(uint64_t vaddr, void* data, uint64_t size) const;
 	void               UnmapDirect(uint64_t vaddr, uint64_t size);
 	void               ActivateWantedDirectRanges();
@@ -381,6 +432,12 @@ private:
 	struct CallerPlan {
 		uint64_t       tick     = 0; // the request would wait for the GPU up to this tick (0: it would not wait)
 		CallerFallback fallback = CallerFallback::None; // it would wait, for a reason only the drain path serves
+		// KYTY_PERF_COPY_HANDBACK: a hand-back copy of the bytes is under way (its value of the copy timeline), and, when
+		// the request would wait for nothing, the host-mapped download it would make now (buffer: null when none).
+		uint64_t                                   copy_tick = 0;
+		Buffer*                                    buffer    = nullptr;
+		uint64_t                                   lo = 0, hi = 0, newest = 0, total = 0;
+		std::vector<std::pair<uint64_t, uint64_t>> intervals;
 	};
 	// GPU thread, before the request changes anything: what a guest fault's ReadMemory request would wait for.
 	[[nodiscard]] CallerPlan PlanCallerWait(uint64_t vaddr, uint64_t size, bool is_write);
@@ -397,6 +454,10 @@ private:
 		std::atomic<uint64_t> gpu_defer_ns {0};   // of it, attempts that were (1) / would have been (2) handed back
 		std::atomic<uint64_t> gpu_retry_ns {0};   // of it, attempts after a wait
 		std::atomic<uint64_t> fallback[static_cast<uint32_t>(CallerFallback::Count)] {};
+		// KYTY_PERF_COPY_HANDBACK: copies started and handed back; requests handed back for a copy already under way;
+		// requests it could have served but did not (small, no plan, no slot, dead ring, overlap); waits of the GPU
+		// thread for such a copy (its own readers, a download over the window).
+		std::atomic<uint64_t> copy_issued {0}, copy_joined {0}, copy_declined {0}, copy_exec_waits {0};
 	};
 	CallerWaitStats m_caller_stats;
 	// KYTY_RECORD_KEYED_VERIFY: pages of the written record-keyed ranges listed per frame (a ring of frames, rotated by
@@ -652,7 +713,26 @@ private:
 		std::shared_ptr<std::atomic_bool> done;
 		// GPU-dirty byte intervals the copy took out of m_gpu_modified_ranges (a superset).
 		std::vector<std::pair<uint64_t, uint64_t>> bytes;
+		// KYTY_PERF_COPY_HANDBACK: not 0 for a hand-back copy. It wrote the backing itself on the second queue and is
+		// finished when the copy timeline reached this value (asked there, then remembered in `done`).
+		uint64_t copy_tick = 0;
 	};
+	// KYTY_PERF_COPY_HANDBACK (barGpuCopy.h). CopyHandbackOn: the switch's value now. StartCopyReadback: GPU thread, in a
+	// guest fault's request before it changed anything; starts the copy of the plan's download and lists it, returns
+	// the copy timeline value to wait for (0: nothing started). EagerDone: whether a readback's copy finished.
+	// WaitCopyReadbacks: waits for the hand-back copies under way over the range. UnmarkPublishedWindow: the pages of
+	// the window without GPU-dirty bytes and without bytes of another unfinished readback leave the GPU-modified
+	// state, run by run. DeadRingWouldFree: DropDeadRingBytes's answer for the page, without changing anything.
+	[[nodiscard]] static bool CopyHandbackOn();
+	[[nodiscard]] uint64_t    StartCopyReadback(CallerPlan& plan, uint64_t vaddr, bool is_write);
+	[[nodiscard]] bool        EagerDone(const EagerReadback& entry) const;
+	void                      WaitCopyReadbacks(uint64_t vaddr, uint64_t size);
+	void                      UnmarkPublishedWindow(uint64_t lo, uint64_t hi);
+	[[nodiscard]] bool        DeadRingWouldFree(uint64_t vaddr);
+	// KYTY_PERF_BAR_GPU_COPY_VERIFY=1 with a hand-back copy: when the finished readback is applied, its bytes in the
+	// backing are compared with the buffer's mapping, interval by interval; intervals a GPU write was recorded over
+	// since are GPU-dirty again and are skipped (PERF bar_gpu_copy verified / mismatched).
+	void                      VerifyCopyReadback(const std::vector<std::pair<uint64_t, uint64_t>>& bytes);
 	// True when an unfinished eager readback is copying one of the bytes of the range.
 	[[nodiscard]] bool PendingReadbackCovers(uint64_t vaddr, uint64_t size) const;
 	void        RecordHotRead(uint64_t vaddr);
@@ -708,6 +788,11 @@ private:
 	// download then takes the download ring as before.
 	[[nodiscard]] bool    PlanDownloadToBacking(uint64_t buffer_address, const std::vector<vk::BufferCopy>& copies,
 	                                            DownloadToBackingPlan& plan);
+	// The second-queue GPU copy of a host-mapped download's intervals (barGpuCopy.h), after the caller's waits; with
+	// KYTY_PERF_BAR_GPU_DIRECT straight into the imported backing when PlanDownloadToBacking can place them all. False:
+	// no GPU copy was made (the caller reads the mapping).
+	[[nodiscard]] bool    BarGpuCopyIntervals(Buffer& buffer, uint64_t base,
+	                                          const std::vector<std::pair<uint64_t, uint64_t>>& intervals, uint64_t tick);
 	Common::SlotVector<Buffer>                        m_slot_buffers;
 	Common::LeastRecentlyUsedCache<BufferId, uint64_t> m_lru_cache;
 	BufferMap                                         m_buffers;
@@ -778,6 +863,33 @@ private:
 	// The same answers with fewer entries (an insert already held is skipped, equal-tick neighbours are joined).
 	static void InsertTickRangeJoined(std::map<uint64_t, WriteTick>& ticks, uint64_t start, uint64_t end, uint64_t tick);
 	[[nodiscard]] static uint64_t QueryTicks(const std::map<uint64_t, WriteTick>& ticks, uint64_t start, uint64_t end);
+	// KYTY_PERF_EXACT_WALKER / KYTY_PERF_EXACT_FAULTS (cache/exactTicks.h): the exact write ticks inside the learned
+	// granules (GPU thread only), the learned granules (WriteTickKey, sorted; with the learn clock of their last read),
+	// and set when a write was noted off the GPU thread (the ticks are then not used).
+	std::map<uint64_t, WriteTick>                 m_exact_ticks;
+	std::vector<std::pair<uint64_t, uint64_t>>    m_exact_granules;
+	uint64_t                                      m_exact_clock = 0;
+	std::atomic<bool>                             m_exact_broken {false};
+	// [start, end) loses its entries (the parts of entries outside it keep their ticks).
+	static void EraseTickRange(std::map<uint64_t, WriteTick>& ticks, uint64_t start, uint64_t end);
+	void ExactLearn(uint64_t vaddr, uint64_t size);
+	void ExactNote(uint64_t vaddr, uint64_t size, uint64_t tick);
+	struct ExactInterval {
+		uint64_t start = 0, end = 0;
+		uint64_t tick  = 0; // exact, else the granules' newest; UINT64_MAX: unknown
+		bool     need  = false; // overlaps the bytes the read needs
+	};
+	// The GPU-dirty intervals of the GPU-modified pages of [lo, hi), with `need` for those overlapping [n_lo, n_hi).
+	// False: one lies outside the buffer.
+	bool ExactScan(Buffer& buffer, uint64_t lo, uint64_t hi, uint64_t n_lo, uint64_t n_hi, std::vector<ExactInterval>& out);
+	// The usual path's alternative for a read of [vaddr, vaddr + size) (whole_pages: a guest fault, its pages). True: the
+	// needed bytes are published; `published` holds what was published (address order). False: nothing changed.
+	bool TryExactDownload(Buffer& buffer, uint64_t vaddr, uint64_t size, bool whole_pages,
+	                      std::vector<std::pair<uint64_t, uint64_t>>& published);
+	// The tick such a read of a guest fault's pages would wait for (PlanCallerWait); false: the usual plan.
+	bool ExactFaultTick(Buffer& buffer, uint64_t vaddr, uint64_t size, uint64_t& tick);
+	// After TryExactDownload: the pages of `published` without GPU-dirty bytes are unmarked, except [keep_lo, keep_hi).
+	void ExactUnmark(const std::vector<std::pair<uint64_t, uint64_t>>& published, uint64_t keep_lo, uint64_t keep_hi);
 	// Ranges whose granule write ticks were raised to `tick` (NoteGpuWriteTick); the granule
 	// values only rise, so a range inside one of them at the same tick needs no new loop.
 	struct GranuleNote {

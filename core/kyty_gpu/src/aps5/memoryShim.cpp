@@ -821,6 +821,59 @@ static void SrtReadSession(bool begin) {
 
 static thread_local bool t_srt_classes_nested = false;
 
+// KYTY_DIAG_PAGE_MARK_CHECK (cache/bufferCache.h): a read that goes through a walk's page mark. What is pending over its
+// own bytes, and whether the bytes it returns (guest memory as it is) differ from the readers' answer for them.
+static void PageMarkCheckRead(uint64_t vaddr, uint64_t size, bool verify) {
+	using Event = Graphics::BufferCache::PageMarkEvent;
+	if (g_gpu_resources == nullptr || size == 0u || !Graphics::GuestGpu::IsGpuThread()) return;
+	auto& buffers = GetGpuResources().GetBufferCache();
+	Graphics::BufferCache::NotePageMark(verify ? Event::VerifyHit : Event::ReadHit);
+	const uint32_t direct = buffers.DirectPendingIn(vaddr, size);
+	const bool     eager  = buffers.HasPendingReadback(vaddr, size);
+	const bool     dirty  = buffers.IsRegionGpuModified(vaddr, size) && buffers.HasGpuDirtyBytes(vaddr, size);
+	if (direct == 0u && !eager && !dirty) return;
+	Graphics::BufferCache::NotePageMark(Event::Pending);
+	if ((direct & 2u) != 0u) {
+		Graphics::BufferCache::NotePageMark(Event::PendingUnknown);
+	} else if (direct != 0u) {
+		Graphics::BufferCache::NotePageMark(Event::PendingCp);
+	}
+	if (eager) Graphics::BufferCache::NotePageMark(Event::PendingEager);
+	if (dirty) Graphics::BufferCache::NotePageMark(Event::PendingDirty);
+	thread_local std::vector<uint8_t> before;
+	thread_local std::vector<uint8_t> after;
+	before.resize(size);
+	after.resize(size);
+	ReadGuestPlain(before.data(), vaddr, size); // what the read returns today
+	if (dirty) {
+		// The strict reader: waits, downloads, puts the pending command-processor writes over the bytes.
+		if (!TryReadBufferBacking(vaddr, after.data(), size)) return;
+	} else {
+		const bool overlay = buffers.WaitPendingReadbacks(vaddr, size);
+		ReadGuestPlain(after.data(), vaddr, size);
+		if (overlay) buffers.ApplyDirectCpWrites(vaddr, after.data(), size);
+	}
+	Graphics::BufferCache::NotePageMark(Event::Compared);
+	if (std::memcmp(before.data(), after.data(), static_cast<size_t>(size)) == 0) return;
+	Graphics::BufferCache::NotePageMark(Event::Mismatched);
+	static std::atomic_uint logged {0};
+	if (logged.fetch_add(1) < 32u) {
+		uint64_t at = 0;
+		while (at < size && before[at] == after[at]) ++at;
+		uint64_t was = 0;
+		uint64_t now = 0;
+		std::memcpy(&was, before.data() + at, static_cast<size_t>(std::min<uint64_t>(size - at, sizeof(was))));
+		std::memcpy(&now, after.data() + at, static_cast<size_t>(std::min<uint64_t>(size - at, sizeof(now))));
+		std::fprintf(stderr,
+		             "DIAG_PAGE_MARK_MISMATCH addr=0x%llx size=%llu at=+%llu returned=0x%llx exact=0x%llx direct=%u eager=%d "
+		             "dirty=%d verify=%d frame=%u\n",
+		             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+		             static_cast<unsigned long long>(at), static_cast<unsigned long long>(was),
+		             static_cast<unsigned long long>(now), direct, eager ? 1 : 0, dirty ? 1 : 0, verify ? 1 : 0,
+		             Graphics::DebugPresentCount().load());
+	}
+}
+
 static bool OrdinaryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	auto&          cache    = t_ordinary_read_pages;
 	const uint64_t page     = vaddr >> 12u;
@@ -841,6 +894,7 @@ static bool OrdinaryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size)
 				std::fprintf(stderr, "SRT_READ_PAGE_CACHE hits=%u stale=%u\n", count, stale.load());
 			}
 		}
+		if (Graphics::BufferCache::PageMarkCheck()) PageMarkCheckRead(vaddr, size, false); // KYTY_DIAG_PAGE_MARK_CHECK
 		return false;
 	}
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size) && Graphics::GuestGpu::IsGpuThread()) {
@@ -857,7 +911,21 @@ static bool OrdinaryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size)
 				return true;
 			}
 			if (cache.active && one_page && IsGpuAddressRange(page << 12u, 4096u)) {
-				cache.pages[page % OrdinaryReadPageCache::kSlots] = page;
+				// KYTY_FIX_DIRECT_PAGE_MARK / KYTY_PERF_VERIFY_RANGE: a direct-range page with a GPU write still pending
+				// anywhere on it is not remembered (the question above was about this read's bytes only; another read
+				// of the page asks again).
+				const bool verify_range = Graphics::BufferCache::VerifyRangeOn();
+				if ((verify_range || Graphics::BufferCache::DirectPageMarkFix()) &&
+				    buffers.DirectPendingIn(page << 12u, 4096u) != 0u) {
+					if (verify_range) Graphics::BufferCache::NoteVerifyRange(Graphics::BufferCache::VerifyRangeEvent::NotCached);
+					Graphics::BufferCache::NotePageMark(Graphics::BufferCache::PageMarkEvent::NotMarked);
+				} else {
+					// KYTY_DIAG_PAGE_MARK_CHECK: the mark is set while a direct write is pending elsewhere on the page.
+					if (Graphics::BufferCache::PageMarkCheck() && buffers.DirectPendingIn(page << 12u, 4096u) != 0u) {
+						Graphics::BufferCache::NotePageMark(Graphics::BufferCache::PageMarkEvent::MarkedPending);
+					}
+					cache.pages[page % OrdinaryReadPageCache::kSlots] = page;
+				}
 			}
 			return false;
 		}
@@ -968,8 +1036,9 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReads(
 		       e.size <= byte_count - e.first;
 	};
 
-	uint64_t last_page = ~0ull;
-	size_t   index     = begin;
+	uint64_t last_page   = ~0ull;
+	bool     last_marked = false; // KYTY_DIAG_PAGE_MARK_CHECK: last_page was taken on a mark set before this check
+	size_t   index       = begin;
 	while (index < count) {
 		const auto& head = log.entries[index];
 		if (!plain(head)) {
@@ -996,10 +1065,16 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReads(
 			for (size_t i = index; i < next; ++i) run_class |= log.entries[i].cls;
 		}
 		bool clean = IsGpuAddressRange(head.address, run_size);
+		// KYTY_PERF_VERIFY_RANGE (cache/bufferCache.h): a page of the run that still has a pending direct-range GPU write
+		// is not asked about as a whole and not remembered; the run's own bytes are asked about after the loop.
+		bool by_range = false;
+		bool on_mark  = false; // KYTY_DIAG_PAGE_MARK_CHECK: a page of the run is taken on a mark set before this check
 		if (clean) {
+			using VerifyRangeEvent = Graphics::BufferCache::VerifyRangeEvent;
 			const uint64_t last = (head.address + run_size - 1u) >> 12u;
 			for (uint64_t page = head.address >> 12u; page <= last; ++page) {
 				if (page == last_page) {
+					on_mark |= last_marked;
 					continue;
 				}
 				auto& slot = pages[page % OrdinaryReadPageCache::kSlots];
@@ -1009,6 +1084,21 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReads(
 						clean = false;
 						break;
 					}
+					if (const bool range_on = Graphics::BufferCache::VerifyRangeOn(); range_on || Graphics::PerfEnabled()) {
+						if (const uint32_t pending = buffers.DirectPendingIn(base, 4096u); pending != 0u) {
+							Graphics::BufferCache::NoteVerifyRange(VerifyRangeEvent::PagePending);
+							if ((pending & 2u) != 0u) {
+								Graphics::BufferCache::NoteVerifyRange(VerifyRangeEvent::PageUnknown);
+								if ((buffers.DirectPendingIn(head.address, run_size) & 2u) == 0u) {
+									Graphics::BufferCache::NoteVerifyRange(VerifyRangeEvent::PageOnly);
+								}
+							}
+							if (range_on) {
+								by_range = true;
+								continue;
+							}
+						}
+					}
 					const uint64_t wait_start = Ir::SrtClassTrace() ? SrtClassesNowNs() : 0;
 					const bool     page_busy  = buffers.WaitPendingReadbacks(base, 4096u);
 					if (Ir::SrtClassTrace()) SrtClassesWait("verify", run_class, base, SrtClassesNowNs() - wait_start);
@@ -1016,9 +1106,53 @@ static Graphics::ShaderRecompiler::IR::FastVerifyResult FastVerifyLoggedReads(
 						clean = false;
 						break;
 					}
-					slot = page;
+					slot        = page;
+					last_marked = false;
+				} else {
+					on_mark     = true;
+					last_marked = true;
 				}
 				last_page = page;
+			}
+			// KYTY_DIAG_PAGE_MARK_CHECK: a run that takes a page on such a mark is asked about with its own bytes.
+			if (clean && on_mark && Graphics::BufferCache::PageMarkCheck()) PageMarkCheckRead(head.address, run_size, true);
+			if (clean && by_range) {
+				// The readers' question, for the run's bytes: waits for a write of unknown bytes over them (and for a
+				// pending eager copy); a command-processor write over them sends the run to the readers, which put it
+				// over what they read. The pages keep no mark, so the next run on them asks again.
+				Graphics::BufferCache::NoteVerifyRange(VerifyRangeEvent::RunCheck);
+				const uint64_t waits_before = Graphics::BufferCache::DirectWaitTotal();
+				const uint64_t wait_start   = Ir::SrtClassTrace() ? SrtClassesNowNs() : 0;
+				const bool     run_busy     = buffers.WaitPendingReadbacks(head.address, run_size);
+				if (Ir::SrtClassTrace()) SrtClassesWait("verify", run_class, head.address, SrtClassesNowNs() - wait_start);
+				if (Graphics::BufferCache::DirectWaitTotal() != waits_before) {
+					Graphics::BufferCache::NoteVerifyRange(VerifyRangeEvent::RunWait);
+				}
+				if (run_busy) Graphics::BufferCache::NoteVerifyRange(VerifyRangeEvent::RunOverlay);
+				if (run_busy || buffers.IsRegionGpuModified(head.address, run_size)) clean = false;
+				// KYTY_PERF_VERIFY_RANGE_CHECK=1 (diagnostic): the bytes this path is about to compare, read before and
+				// after the page-wide question (which waits for every pending write of unknown bytes in the run's pages).
+				if (clean && Graphics::BufferCache::VerifyRangeCheck()) {
+					thread_local std::vector<uint8_t> before;
+					thread_local std::vector<uint8_t> after;
+					before.resize(run_size);
+					after.resize(run_size);
+					ReadGuestPlain(before.data(), head.address, run_size);
+					for (uint64_t page = head.address >> 12u; page <= last; ++page) {
+						(void)buffers.WaitPendingReadbacks(page << 12u, 4096u);
+					}
+					ReadGuestPlain(after.data(), head.address, run_size);
+					Graphics::BufferCache::NoteVerifyRange(VerifyRangeEvent::Checked);
+					if (std::memcmp(before.data(), after.data(), static_cast<size_t>(run_size)) != 0) {
+						Graphics::BufferCache::NoteVerifyRange(VerifyRangeEvent::Mismatched);
+						static std::atomic_uint logged {0};
+						if (logged.fetch_add(1) < 16u) {
+							std::fprintf(stderr, "PERF_VERIFY_RANGE_MISMATCH addr=0x%llx size=%llu frame=%u\n",
+							             static_cast<unsigned long long>(head.address), static_cast<unsigned long long>(run_size),
+							             Graphics::DebugPresentCount().load());
+						}
+					}
+				}
 			}
 		}
 		if (!clean) {

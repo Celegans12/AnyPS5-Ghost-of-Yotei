@@ -20,6 +20,7 @@
 #include <optional>
 
 #include "graphics/host_gpu/renderer/perfCounters.h"
+#include "graphics/host_gpu/renderer/frameTimeline.h"
 #include "graphics/host_gpu/renderer/gpuTimer.h"
 #include "graphics/host_gpu/renderer/syncTimeline.h"
 #include "graphics/host_gpu/renderer/virtualGpuClock.h"
@@ -90,6 +91,7 @@ static_assert(std::is_trivially_copyable_v<AsyncSubmitPacket>);
 void AsyncSubmitOnWorker(const void* blob) {
 	auto packet = *static_cast<const AsyncSubmitPacket*>(blob);
 	if (GpuTimer::Enabled()) GpuTimer::NoteQueueSubmit(packet.tick); // KYTY_TRACE_GPU_TIMELINE
+	if (FrameTimeline::Active()) FrameTimeline::Event("qsubmit tick=%llu", static_cast<unsigned long long>(packet.tick)); // KYTY_TRACE_FRAME_TIMELINE
 	const auto result = QueueSubmitLocked(*packet.graphics, packet.buffer, packet.submit);
 	if (result != vk::Result::eSuccess) {
 		GpuCheckpoints::Dump(packet.graphics->queue);
@@ -398,6 +400,7 @@ void CommandScheduler::PriorityOperationsThread(std::stop_token stop) {
 			m_priority_active_tick = operation.tick;
 		}
 		{ PerfScope perf_wait(PerfKind::FenceWait); WaitSites::Scope wait_site; m_master.Wait(operation.tick); }
+		if (FrameTimeline::Active()) FrameTimeline::Event("tick tick=%llu", static_cast<unsigned long long>(operation.tick)); // KYTY_TRACE_FRAME_TIMELINE
 		if (!stop.stop_requested()) {
 			RunOperation(std::move(operation.callback));
 		}
@@ -558,6 +561,7 @@ uint64_t CommandScheduler::Submit(SubmitInfo submit) {
 	if (GpuTimer::Enabled()) GpuTimer::Submitted(buffer, tick);
 	if (VirtualGpuClock::Enabled()) VirtualGpuClock::Submitted(buffer, tick); // KYTY_FIX_VIRTUAL_GPU_CLOCK
 	if (SyncTimeline::Enabled()) SyncTimeline::NoteSubmit(tick);
+	if (FrameTimeline::Active()) FrameTimeline::Event("cbuf tick=%llu", static_cast<unsigned long long>(tick)); // KYTY_TRACE_FRAME_TIMELINE
 
 	m_command.m_buffer      = nullptr;
 	m_commands_since_submit = 0;

@@ -398,11 +398,12 @@ void BufferCache::ReportCallerWaitPerf() {
 	             "PERF fault_wait_on_caller eligible=%llu deferred=%llu deferrals=%llu caller_wait_ms=%llu "
 	             "retries=%llu retry_slow=%llu new_writer=%llu exhausted=%llu gpu_ms=%llu "
 	             "gpu_defer_ms=%llu gpu_retry_ms=%llu fallback[unknown_tick=%llu outside=%llu large=%llu no_mapping=%llu "
-	             "pending=%llu]\n",
+	             "pending=%llu] copy_issued=%llu copy_joined=%llu copy_declined=%llu copy_exec_waits=%llu\n",
 	             take(s.eligible), take(s.deferred), take(s.deferrals), ms(s.caller_wait_ns), take(s.retries),
 	             take(s.retry_slow), take(s.new_writer), take(s.exhausted), ms(s.gpu_ns),
 	             ms(s.gpu_defer_ns), ms(s.gpu_retry_ns), fb(CallerFallback::UnknownTick), fb(CallerFallback::Outside),
-	             fb(CallerFallback::Large), fb(CallerFallback::NoMapping), fb(CallerFallback::Pending));
+	             fb(CallerFallback::Large), fb(CallerFallback::NoMapping), fb(CallerFallback::Pending),
+	             take(s.copy_issued), take(s.copy_joined), take(s.copy_declined), take(s.copy_exec_waits));
 }
 
 void BufferCache::TakeCensus(Census& census) {
