@@ -64,3 +64,31 @@
 [submodule "3rdparty/vorbis"]
 	path = 3rdparty/vorbis
 	url = https://github.com/xiph/vorbis.git
+[submodule "core/kyty_gpu/3rdparty/SPIRV-Tools"]
+	path = core/kyty_gpu/3rdparty/SPIRV-Tools
+	url = https://github.com/KhronosGroup/SPIRV-Tools.git
+[submodule "core/kyty_gpu/3rdparty/SPIRV-Headers"]
+	path = core/kyty_gpu/3rdparty/SPIRV-Headers
+	url = https://github.com/KhronosGroup/SPIRV-Headers.git
+[submodule "core/kyty_gpu/3rdparty/fmt"]
+	path = core/kyty_gpu/3rdparty/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "core/kyty_gpu/3rdparty/spdlog"]
+	path = core/kyty_gpu/3rdparty/spdlog
+	url = https://github.com/gabime/spdlog.git
+[submodule "core/kyty_gpu/3rdparty/nlohmann_json"]
+	path = core/kyty_gpu/3rdparty/nlohmann_json
+	url = https://github.com/nlohmann/json.git
+[submodule "core/kyty_gpu/3rdparty/magic_enum"]
+	path = core/kyty_gpu/3rdparty/magic_enum
+	url = https://github.com/Neargye/magic_enum.git
+[submodule "core/kyty_gpu/3rdparty/xxHash"]
+	path = core/kyty_gpu/3rdparty/xxHash
+	url = https://github.com/Cyan4973/xxHash.git
+[submodule "core/kyty_gpu/3rdparty/ZArchive"]
+	path = core/kyty_gpu/3rdparty/ZArchive
+	url = https://github.com/Exzap/ZArchive.git
+[submodule "core/kyty_gpu/3rdparty/SDL3"]
+	path = core/kyty_gpu/3rdparty/SDL3
+	url = https://github.com/libsdl-org/SDL.git
+	branch = release-3.4.x
