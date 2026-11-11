@@ -996,6 +996,9 @@ struct RecompileResult : CompiledShaderArtifact, ShaderInvocation {
     // Set by the driver on a direct stage whose ImageTableMap holds a table mirror: a hash of that
     // map, keyed in place of its words. Not cached.
     std::uint64_t directTableMapHash = 0;
+    // Set with directTableMapHash: the mirror map's words, shared between the stages that use the
+    // mirror. The ImageTableMap binding then holds only the map header. Not cached.
+    std::shared_ptr<const std::vector<std::uint32_t>> directTableMap;
     bool cacheHit = false;
     std::uint32_t workgroupMemoryDwords = 0;
     std::vector<std::uint32_t> shaderDataUserWords;

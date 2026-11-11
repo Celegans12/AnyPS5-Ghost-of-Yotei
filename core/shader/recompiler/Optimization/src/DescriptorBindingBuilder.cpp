@@ -727,7 +727,7 @@ DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPl
     return selected;
 }
 
-void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, const CompiledBindingLayout& compiled, const DescriptorBindingPlan& plan, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, const ResolvedImageTables* tables) const {
+void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, const CompiledBindingLayout& compiled, const DescriptorBindingPlan& plan, std::uint32_t userDataBase, const ResourceSnapshot& snapshot, const std::array<std::uint32_t, 3>& partialThreads, const ResolvedImageTables* tables, bool tableElementsUnread) const {
     const auto& layout = compiled.layout;
     const bool needsShaderData = layout.UsesPushData() || plan.storageData;
     auto shaderData = needsShaderData ? ShaderDataDwordsFor(layout, userDataBase, snapshot, partialThreads, plan.imageMetadata, plan.runtimeState) : std::vector<std::uint32_t>{};
@@ -772,6 +772,13 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
         case DescriptorRole::ImageTable:
         case DescriptorRole::ImageStorageTable:
             if (tables == nullptr) fail("DescriptorBindingBuilder::Populate image table elements were not resolved");
+            // A direct stage's elements become heap slots from the resolved tables themselves and
+            // the driver drops this binding, so its per-element words and flags are left out:
+            // they are tens of bytes per element in every copy of the result.
+            if (tableElementsUnread) {
+                physical.count = static_cast<std::uint32_t>(tables->elements.size());
+                break;
+            }
             physical.guestDescriptor.reserve(tables->elements.size() * 8u);
             physical.imageShapes.reserve(physical.imageShapes.size() + tables->elements.size());
             physical.imageDepthCompare.reserve(physical.imageDepthCompare.size() + tables->elements.size());
@@ -810,7 +817,10 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             break;
         case DescriptorRole::ImageTableMap:
             if (tables == nullptr || tables->map.empty()) fail("DescriptorBindingBuilder::Populate image table map was not resolved");
-            physical.guestDescriptor = tables->map;
+            // A direct stage's map is rebuilt from the resolved tables as a heap mirror, so only
+            // the header is kept here (the map is hundreds of KiB in every copy of the result).
+            if (tableElementsUnread && tables->map.size() > ImageTableAbi::HeaderWords) physical.guestDescriptor.assign(tables->map.begin(), tables->map.begin() + ImageTableAbi::HeaderWords);
+            else physical.guestDescriptor = tables->map;
             break;
         case DescriptorRole::FlattenedSrt:
             if (snapshot.flattenedSrt.empty()) {

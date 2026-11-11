@@ -250,6 +250,7 @@ SlotMemo& ThreadSlotMemo() {
 struct TableMirror {
     std::weak_ptr<const ShaderRecompiler::ResolvedImageTables> source;
     std::vector<std::uint32_t> map;
+    std::shared_ptr<const std::vector<std::uint32_t>> sharedMap;
     std::uint64_t mapHash = 0;
     std::shared_ptr<std::vector<std::shared_ptr<Texture>>> textures;
     std::uint64_t epoch = 0, proof = 0, pending = 0;
@@ -352,6 +353,7 @@ const TableMirror* tableMirrorFor(const Context& context, DirectHeap& heap, cons
     std::uint64_t hash = 0xcbf29ce484222325ull ^ mirror.map.size();
     for (const auto word : mirror.map) hash = (hash ^ word) * 0x100000001b3ull;
     mirror.mapHash = hash != 0u ? hash : 1u;
+    mirror.sharedMap = std::make_shared<const std::vector<std::uint32_t>>(mirror.map);
     ++totals.builds;
     totals.elements += resolved.elements.size();
     totals.missing += mirror.missing;
@@ -427,14 +429,18 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
         auto copy = std::make_shared<ShaderRecompiler::RecompileResult>(*program);
         if (program->directTables != nullptr) {
             const auto* mirror = tableMirror != nullptr ? tableMirror : tableMirrorFor(context, heap, *program);
+            static const bool hashedKey = std::getenv("APS5_DIRECT_TABLE_FULL_KEY") == nullptr;
             for (auto& binding : copy->bindings) {
-                if (binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap) binding.guestDescriptor = mirror->map;
+                if (binding.role != ShaderRecompiler::DescriptorRole::ImageTableMap) continue;
+                // Keyed by hash: the words stay shared with the mirror, the binding keeps the header.
+                if (hashedKey) binding.guestDescriptor.assign(mirror->map.begin(), mirror->map.begin() + ShaderRecompiler::ImageTableAbi::HeaderWords);
+                else binding.guestDescriptor = mirror->map;
             }
+            if (hashedKey) copy->directTableMap = mirror->sharedMap;
             std::erase_if(copy->bindings, [](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == ShaderRecompiler::DescriptorRole::ImageTable || binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable; });
             if (recorder != nullptr) recorder->Keep(mirror->textures);
             missing += mirror->missing;
             copy->directTables = nullptr;
-            static const bool hashedKey = std::getenv("APS5_DIRECT_TABLE_FULL_KEY") == nullptr;
             if (hashedKey) copy->directTableMapHash = mirror->mapHash;
         }
         const auto& requests = program->directSlotRequests;

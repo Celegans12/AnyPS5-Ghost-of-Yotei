@@ -2495,8 +2495,10 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                     continue;
                 }
                 if (binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap) {
-                    Require(binding.kind == ShaderRecompiler::DescriptorKind::StorageBuffer && binding.count == 1 && binding.guestDescriptor.size() >= ShaderRecompiler::ImageTableAbi::HeaderWords && !binding.readOnly && binding.guestDescriptor[ShaderRecompiler::ImageTableAbi::HeaderVersion] == ShaderRecompiler::ImageTableAbi::Version, "image table map binding is malformed");
-                    const auto size = binding.guestDescriptor.size() * sizeof(std::uint32_t);
+                    // A direct stage's mirror map is shared (RecompileResult::directTableMap).
+                    const auto& mapWords = shader.program->directTableMap != nullptr ? *shader.program->directTableMap : binding.guestDescriptor;
+                    Require(binding.kind == ShaderRecompiler::DescriptorKind::StorageBuffer && binding.count == 1 && mapWords.size() >= ShaderRecompiler::ImageTableAbi::HeaderWords && !binding.readOnly && mapWords[ShaderRecompiler::ImageTableAbi::HeaderVersion] == ShaderRecompiler::ImageTableAbi::Version, "image table map binding is malformed");
+                    const auto size = mapWords.size() * sizeof(std::uint32_t);
                     Require(size <= context.limits.maxStorageBufferRange, "image table map exceeds the storage buffer range limit");
                     stageStorageBuffers += 1;
                     stageResources += 1;
@@ -2504,7 +2506,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                     requireStageLimits();
                     auto& table = tableStage(shader);
                     Require(table.mapAllocation == std::numeric_limits<std::size_t>::max(), "a stage binds two image table maps");
-                    table.map = binding.guestDescriptor;
+                    table.map = mapWords;
                     allocations.push_back({0, size, false, std::make_unique<Buffer>(context, size, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT), ShaderRecompiler::DescriptorRole::ImageTableMap});
                     table.mapAllocation = allocations.size() - 1u;
                     bindings.push_back({{binding.binding, VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 1, flags, nullptr}, {allocations.size() - 1u}});
