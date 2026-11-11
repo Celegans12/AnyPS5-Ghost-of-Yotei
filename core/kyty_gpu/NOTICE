@@ -15,44 +15,51 @@ The files listed below differ from the base commit or were added after it; the d
 change. Every other file here that the base commit has is an unmodified copy of it. This list is generated from
 the history of this directory.
 
-Changed (35):
+Changed (42):
   2026-11-11  3rdparty/CMakeLists.txt
   2026-11-11  CMakeLists.txt
   2026-11-08  src/common/assert.cpp
   2026-11-08  src/common/assert.h
   2026-11-09  src/common/emulatorConfig.cpp
-  2026-11-10  src/common/envDefaults.h
-  2026-11-09  src/common/liveAb.cpp
-  2026-11-09  src/common/liveAb.h
+  2026-11-11  src/common/envDefaults.h
+  2026-11-11  src/common/liveAb.cpp
+  2026-11-11  src/common/liveAb.h
   2026-11-08  src/graphics/guest_gpu/command_processor/pm4Dispatch.cpp
   2026-11-08  src/graphics/guest_gpu/command_processor/pm4Handlers.cpp
-  2026-11-09  src/graphics/guest_gpu/graphicsRun.cpp
+  2026-11-11  src/graphics/guest_gpu/graphicsRun.cpp
   2026-11-08  src/graphics/host_gpu/pageManager.cpp
-  2026-11-10  src/graphics/host_gpu/renderer/cache/bufferCache.cpp
-  2026-11-08  src/graphics/host_gpu/renderer/cache/bufferCache.h
-  2026-11-08  src/graphics/host_gpu/renderer/cache/faultManager.cpp
+  2026-11-11  src/graphics/host_gpu/renderer/cache/bufferCache.cpp
+  2026-11-11  src/graphics/host_gpu/renderer/cache/bufferCache.h
+  2026-11-11  src/graphics/host_gpu/renderer/cache/bufferCacheTrace.cpp
+  2026-11-11  src/graphics/host_gpu/renderer/cache/faultManager.cpp
   2026-11-08  src/graphics/host_gpu/renderer/cache/textureCache.cpp
   2026-11-08  src/graphics/host_gpu/renderer/colorRenderTarget.cpp
+  2026-11-11  src/graphics/host_gpu/renderer/commandScheduler.cpp
   2026-11-08  src/graphics/host_gpu/renderer/context.cpp
   2026-11-08  src/graphics/host_gpu/renderer/depthRenderTarget.cpp
+  2026-11-11  src/graphics/host_gpu/renderer/gpuTimer.cpp
   2026-11-08  src/graphics/host_gpu/renderer/image/blitHelper.cpp
   2026-11-08  src/graphics/host_gpu/renderer/image/image.cpp
   2026-11-08  src/graphics/host_gpu/renderer/image/imageInfo.cpp
-  2026-11-08  src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
+  2026-11-11  src/graphics/host_gpu/renderer/masterSemaphore.cpp
+  2026-11-11  src/graphics/host_gpu/renderer/masterSemaphore.h
+  2026-11-11  src/graphics/host_gpu/renderer/pipeline/descriptors.cpp
   2026-11-08  src/graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
   2026-11-08  src/graphics/host_gpu/renderer/pipeline/shaderPrecompile.cpp
   2026-11-08  src/graphics/host_gpu/renderer/refCapture.cpp
   2026-11-08  src/graphics/host_gpu/renderer/render.h
-  2026-11-08  src/graphics/host_gpu/renderer/renderCompute.cpp
+  2026-11-11  src/graphics/host_gpu/renderer/renderCompute.cpp
   2026-11-09  src/graphics/host_gpu/renderer/renderContext.cpp
-  2026-11-08  src/graphics/host_gpu/renderer/renderDraw.cpp
+  2026-11-11  src/graphics/host_gpu/renderer/renderDraw.cpp
   2026-11-08  src/graphics/presentation/presenter.h
   2026-11-08  src/graphics/presentation/window/swapchain.cpp
   2026-11-09  src/graphics/presentation/window/vulkanWindow.cpp
+  2026-11-11  src/graphics/shader/recompiler/backend/spirv/spirvEmitterInternal.h
+  2026-11-11  src/graphics/shader/recompiler/backend/spirv/spirvEmitterProgram.cpp
   2026-11-08  src/kernel/pthread.h
   2026-11-08  src/utils.cmake
 
-Added (24):
+Added (28):
   2026-11-11  cmake/treeVersion.cmake
   2026-11-11  pgo/.gitattributes
   2026-11-11  pgo/kyty_gpu.profdata
@@ -60,12 +67,12 @@ Added (24):
   2026-11-11  src/aps5/aps5Backend.cmake
   2026-11-08  src/aps5/aps5Host.cpp
   2026-11-08  src/aps5/aps5Host.h
-  2026-11-08  src/aps5/aps5Memory.h
+  2026-11-11  src/aps5/aps5Memory.h
   2026-11-08  src/aps5/aps5VideoOut.h
   2026-11-08  src/aps5/aps5Window.h
   2026-11-08  src/aps5/kernelShim.cpp
-  2026-11-09  src/aps5/kytyBackend.cpp
-  2026-11-08  src/aps5/memoryShim.cpp
+  2026-11-11  src/aps5/kytyBackend.cpp
+  2026-11-11  src/aps5/memoryShim.cpp
   2026-11-09  src/aps5/pgoWriter.cpp
   2026-11-09  src/aps5/pgoWriter.h
   2026-11-08  src/aps5/presentationStubs.cpp
@@ -74,6 +81,10 @@ Added (24):
   2026-11-08  src/common/cacheDir.h
   2026-11-09  src/common/gpuPlacement.cpp
   2026-11-09  src/common/gpuPlacement.h
-  2026-11-10  src/graphics/host_gpu/renderer/cache/barGpuCopy.h
+  2026-11-11  src/graphics/host_gpu/renderer/cache/barGpuCopy.h
+  2026-11-11  src/graphics/host_gpu/renderer/cache/exactTicks.h
+  2026-11-11  src/graphics/host_gpu/renderer/frameTimeline.h
   2026-11-09  src/graphics/host_gpu/renderer/hTrace.cpp
   2026-11-09  src/graphics/host_gpu/renderer/hTrace.h
+  2026-11-11  src/graphics/host_gpu/renderer/pendingClearCheck.h
+  2026-11-11  src/graphics/host_gpu/renderer/pendingClearNote.h
