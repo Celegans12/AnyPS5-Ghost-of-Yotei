@@ -182,6 +182,38 @@ public:
 	};
 	enum class CompareResult { Equal, Different, Unknown };
 
+	// Lane v4x: backing calls that failed for want of a backing view (memory_shim counters, reported with the backend's
+	// 10-s line; the first few of each kind are logged with their address).
+	enum class BackingCall : uint32_t { Read, Write, Sparse, Compare, Count };
+	static constexpr const char* BackingCallNames[] = {"read", "write", "sparse read", "compare"};
+
+	void NoteMiss(BackingCall call, uint64_t vaddr, uint64_t size, bool is_private) {
+		auto& counter = (is_private ? m_private_misses : m_unknown_misses)[static_cast<uint32_t>(call)];
+		if (counter.fetch_add(1, std::memory_order_relaxed) < 8) {
+			Aps5::Log("memory: backing %s of 0x%llx+0x%llx failed: %s", BackingCallNames[static_cast<uint32_t>(call)],
+			          static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+			          is_private ? "private memory (committed, no backing view)" : "not in the mapping table");
+		}
+	}
+
+	// After a failed backing call, outside the lock: private memory or an address the table does not know.
+	void NoteMissLookup(BackingCall call, uint64_t vaddr, uint64_t size) {
+		bool is_private = false;
+		{
+			std::shared_lock lock(m_mutex);
+			Entry            entry {};
+			is_private = FindContainingUnlocked(vaddr, &entry) && !entry.direct;
+		}
+		NoteMiss(call, vaddr, size, is_private);
+	}
+
+	void MissCounts(uint64_t* private_misses, uint64_t* unknown_misses) const {
+		for (uint32_t i = 0; i < static_cast<uint32_t>(BackingCall::Count); i++) {
+			private_misses[i] = m_private_misses[i].load(std::memory_order_relaxed);
+			unknown_misses[i] = m_unknown_misses[i].load(std::memory_order_relaxed);
+		}
+	}
+
 	void SetBacking(uint8_t* base, uint64_t size) {
 		m_backing_base = base;
 		m_backing_size = size;
@@ -305,6 +337,7 @@ public:
 				break;
 			}
 		}
+		NoteMissLookup(BackingCall::Read, vaddr, size);
 		return false;
 	}
 
@@ -336,6 +369,7 @@ public:
 				break;
 			}
 		}
+		NoteMissLookup(BackingCall::Write, vaddr, size);
 		return false;
 	}
 
@@ -359,8 +393,10 @@ public:
 			}
 			const auto end = span.vaddr + span.size;
 			if (!have_mapping || span.vaddr < mapping.vaddr || span.vaddr - mapping.vaddr >= mapping.size) {
-				have_mapping = FindSlotUnlocked(span.vaddr, &mapping) && mapping.direct;
+				const bool found = FindSlotUnlocked(span.vaddr, &mapping);
+				have_mapping     = found && mapping.direct;
 				if (!have_mapping) {
+					NoteMiss(BackingCall::Compare, span.vaddr, span.size, found);
 					return CompareResult::Unknown;
 				}
 			}
@@ -405,6 +441,8 @@ public:
 			} else if (copy_private) {
 				std::memcpy(out + (start - vaddr), reinterpret_cast<const void*>(start), bytes);
 			} else {
+				lock.unlock();
+				NoteMiss(BackingCall::Sparse, start, bytes, true);
 				return false;
 			}
 			cursor = start + bytes;
@@ -651,6 +689,8 @@ private:
 
 	uint8_t*                  m_backing_base = nullptr;
 	uint64_t                  m_backing_size = 0;
+	std::atomic<uint64_t>     m_private_misses[static_cast<uint32_t>(BackingCall::Count)] {};
+	std::atomic<uint64_t>     m_unknown_misses[static_cast<uint32_t>(BackingCall::Count)] {};
 	std::shared_mutex         m_mutex;
 	std::map<uint64_t, Entry> m_entries;
 	std::atomic<uint64_t>     m_generation {uint64_t {1} << 40u};
@@ -1265,9 +1305,11 @@ void MemoryUnmapped(uint64_t address, uint64_t bytes) {
 }
 
 MemoryStats GetMemoryStats() {
-	const auto stats = Libs::LibKernel::Memory::Map().GetStats();
-	return {stats.entries, stats.direct, stats.private_, stats.discovered,
-	        Libs::LibKernel::Memory::g_protect_splits.load(std::memory_order_relaxed)};
+	const auto  stats = Libs::LibKernel::Memory::Map().GetStats();
+	MemoryStats result {stats.entries, stats.direct, stats.private_, stats.discovered,
+	                    Libs::LibKernel::Memory::g_protect_splits.load(std::memory_order_relaxed)};
+	Libs::LibKernel::Memory::Map().MissCounts(result.private_misses, result.unknown_misses);
+	return result;
 }
 
 void MemoryForEachMapping(void (*callback)(void* context, uint64_t address, uint64_t bytes), void* context) {

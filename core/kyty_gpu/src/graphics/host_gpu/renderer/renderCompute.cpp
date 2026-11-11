@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/renderer/twinDispatch.h"
 #include "graphics/host_gpu/renderer/gpuTimer.h"
 #include "graphics/host_gpu/gpuCheckpoints.h"
+#include "graphics/host_gpu/renderer/pendingClearNote.h"
 #include "common/assert.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
@@ -65,7 +66,7 @@ static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::Descriptor
 // that reads and rewrites one depth surface's HTile in place (Ghost of Yotei clears each shadow map's HTile so, shader
 // b25b01ff1361e795) still runs, but the clear is recorded for the next draw. UpdateComputeMetaClears never takes a
 // read metadata buffer, so the shadow maps were never cleared and every caster failed the depth test (no moonlight).
-static void RecordHtileRewriteClear(TextureCache& cache, const ShaderComputeInputInfo& input) {
+static void RecordHtileRewriteClear(TextureCache& cache, const ShaderComputeInputInfo& input, const CommandBuffer& buffer) {
 	static constinit Common::OnceValue<bool> enabled_once;
 	const bool enabled = enabled_once.Get([] {
 		const char* value = std::getenv("KYTY_FIX_HTILE_RMW_CLEAR");
@@ -95,6 +96,11 @@ static void RecordHtileRewriteClear(TextureCache& cache, const ShaderComputeInpu
 			std::fprintf(stderr, "HTILE_RMW_CLEAR hash=%016llx meta=0x%llx frame=%u" "\n",
 			             static_cast<unsigned long long>(program.shader_hash), static_cast<unsigned long long>(meta),
 			             DebugPresentCount().load());
+		}
+		if (PendingClearCheck::Enabled()) { // KYTY_DIAG_PENDING_CLEAR_CHECK (lane v4x2): how the clear flag was set
+			PendingClearCheck::NoteClearSet(meta, meta_size, PendingClearCheck::ClearPath::ComputeRmw, false, 0, true,
+			                                buffer.GetRegisters().GetDepthClearValue(), program.shader_hash,
+			                                DebugPresentCount().load());
 		}
 	}
 }
@@ -128,7 +134,13 @@ void RenderExecutor::UpdateComputeMetaClears(const ShaderComputeInputInfo& input
 			if (resource.written) {
 				const auto descriptor =
 				    DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-				(void)cache.ClearMetaWrite(descriptor.Base48(), descriptor.GetSize());
+				const bool cleared = cache.ClearMetaWrite(descriptor.Base48(), descriptor.GetSize());
+				if (cleared && PendingClearCheck::Enabled()) { // KYTY_DIAG_PENDING_CLEAR_CHECK (lane v4x2)
+					PendingClearCheck::NoteClearSet(descriptor.Base48(), descriptor.GetSize(),
+					                                PendingClearCheck::ClearPath::ComputeWrite, false, 0, true,
+					                                buffer.GetRegisters().GetDepthClearValue(), program.shader_hash,
+					                                DebugPresentCount().load());
+				}
 			}
 		}
 	}
@@ -437,7 +449,7 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto& resources = *input_info.stage.resources;
 	if (ComputeTrace::ProxyPhaseOn()) ComputeTrace::ProxyPhaseNote(program.shader_hash, &resources);
 	if (DispatchCensusTimer::Enabled()) census_timer.NoteDispatch(input_info, mode); // KYTY_TRACE_DISPATCH_CENSUS
-	RecordHtileRewriteClear(m_context.GetTextureCache(), input_info);
+	RecordHtileRewriteClear(m_context.GetTextureCache(), input_info, buffer);
 	// upstream 01ce9738: metadata addresses can be reused as ordinary buffers, so a metadata write only records the
 	// clear state and the dispatch still runs (the guest's stores are kept).
 	if (resources.specialization_reads.empty()) {

@@ -16,8 +16,39 @@
 #include <type_traits>
 #include <unordered_set>
 #include <utility>
+#include <atomic>
+#include <mutex>
 
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
+
+// Lane v4x (KYTY_DIAG_RT_TRIPS census): totals over the programs translated so far, a line every 256 programs, and the
+// programs with a dispatcher loop or a cap site whose trips cannot be counted (the first 64).
+void NoteLoopCapSites(uint64_t shader_hash, uint32_t structured, uint32_t dispatcher, uint32_t cas, uint32_t uncounted) {
+	static std::mutex mutex;
+	static uint64_t   programs = 0, with_cap = 0, structured_loops = 0, dispatcher_loops = 0, cas_sites = 0, uncounted_sites = 0;
+	static uint32_t   named    = 0;
+	const std::lock_guard lock(mutex);
+	programs++;
+	with_cap += (structured + dispatcher + cas) != 0 ? 1u : 0u;
+	structured_loops += structured;
+	dispatcher_loops += dispatcher;
+	cas_sites += cas;
+	uncounted_sites += uncounted;
+	if ((dispatcher != 0 || uncounted != 0) && named < 64u) {
+		named++;
+		std::fprintf(stderr, "LOOP_CAP_SITES hash=0x%016llx structured=%u dispatcher=%u cas=%u uncounted=%u\n",
+		             static_cast<unsigned long long>(shader_hash), structured, dispatcher, cas, uncounted);
+	}
+	if ((programs % 256u) == 0u || programs <= 2u) {
+		std::fprintf(stderr,
+		             "LOOP_CAP_CENSUS programs=%llu with_cap=%llu structured_loops=%llu dispatcher_loops=%llu cas_loops=%llu "
+		             "uncounted=%llu\n",
+		             static_cast<unsigned long long>(programs), static_cast<unsigned long long>(with_cap),
+		             static_cast<unsigned long long>(structured_loops), static_cast<unsigned long long>(dispatcher_loops),
+		             static_cast<unsigned long long>(cas_sites), static_cast<unsigned long long>(uncounted_sites));
+	}
+}
+
 namespace {
 
 void EmitKillIfBoolFalse(EmitterState& state, uint32_t active) {
@@ -625,6 +656,12 @@ void EmitDispatcherFunction(ValueEmitContext& ctx, const DispatcherFunctionState
 	EmitLabel(state, dispatcher.continue_label);
 	state.builder.AddFunction(spv::OpBranch, dispatcher.header_label);
 	EmitLabel(state, dispatcher.merge_label);
+	if (iteration != 0 && DiagRtTripsFor(state.program.shader_hash) && state.fault_buffer_variable != 0) {
+		// Lane v4x (KYTY_DIAG_RT_TRIPS): the dispatcher loop left at its cap counts as a trip (word 0, as structured loops).
+		const auto at_cap = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), iteration,
+		                           ConstantU32(state, ShaderLoopLimitFor(state.program.shader_hash)));
+		(void)FaultDiagAdd(state, 0, Select(state, TypeU32(state), at_cap, ConstantU32(state, 1), ConstantU32(state, 0)));
+	}
 	EmitReturn(ctx);
 }
 
@@ -1191,6 +1228,15 @@ void EmitProgram(EmitterState& state) {
 	}
 	state.builder.AddFunction(spv::OpFunctionEnd);
 	LaneShareReport(state);
+	if (DiagRtTripsFor(state.program.shader_hash)) { // KYTY_DIAG_RT_TRIPS census (lane v4x)
+		const bool dispatcher_loop = state.program.dispatcher_fallback && !program.blocks.empty() &&
+		                             ShaderLoopLimitFor(state.program.shader_hash) != 0;
+		const bool counted         = state.fault_buffer_variable != 0;
+		NoteLoopCapSites(state.program.shader_hash, static_cast<uint32_t>(state.loop_counter_variables.size()),
+		                 dispatcher_loop ? 1u : 0u, state.cas_loop_sites,
+		                 state.cas_loop_sites_uncounted +
+		                     (counted ? 0u : static_cast<uint32_t>(state.loop_counter_variables.size()) + (dispatcher_loop ? 1u : 0u)));
+	}
 	state.current_block = nullptr;
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);

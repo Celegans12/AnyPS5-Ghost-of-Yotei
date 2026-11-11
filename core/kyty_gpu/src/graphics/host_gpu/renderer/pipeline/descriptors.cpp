@@ -2,6 +2,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptorsTrace.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pendingClearCheck.h"
 
 #include "common/alignment.h"
 #include "common/assert.h"
@@ -1469,6 +1470,33 @@ void BuildResolveRecord(RenderContext& renderer, const ShaderRecompiler::IR::Res
 
 } // namespace StageF
 
+// KYTY_DIAG_PENDING_CLEAR_READS=1 (lane v4x, diagnostic, default off; v4b row 8): a depth image bound as a texture
+// while a fast clear of its HTILE has not reached the host image yet (the clear lands at the next depth bind; the PS5's
+// texture unit sees it at once, and the HTILE expand draws that would write it are dropped as no-output draws). Counts
+// such binds and how many of them read the slice with the pending clear; one line at powers of two and every 4096.
+static void NotePendingClearRead(TextureCache& cache, const Image& image, const TextureCache::ImageDesc& desc, bool storage) {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_DIAG_PENDING_CLEAR_READS");
+		const bool  set   = value != nullptr && value[0] == '1';
+		if (set) std::fprintf(stderr, "DIAG_PENDING_CLEAR_READS enabled\n");
+		return set;
+	}();
+	if (!on || storage || !image.info.IsDepth() || image.info.metadata.kind != ImageMetadataKind::Htile) return;
+	static std::atomic<uint64_t> binds {0}, pending {0};
+	const uint64_t n = binds.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (!cache.IsMetaCleared(image.info.metadata.range.address, desc.view_info.base_layer)) return;
+	const uint64_t p = pending.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (std::has_single_bit(p) || (p % 4096u) == 0u) {
+		std::fprintf(stderr,
+		             "PENDING_CLEAR_READS depth_texture_binds=%llu with_pending_clear=%llu frame=%u depth=0x%llx htile=0x%llx "
+		             "slice=%u %ux%u\n",
+		             static_cast<unsigned long long>(n), static_cast<unsigned long long>(p), DebugPresentCount().load(),
+		             static_cast<unsigned long long>(image.info.data.address),
+		             static_cast<unsigned long long>(image.info.metadata.range.address), desc.view_info.base_layer,
+		             image.info.extent.width, image.info.extent.height);
+	}
+}
+
 // ResolveTexture after the description: the texture cache lookup (FindImage may adjust desc) and the checks against
 // the found image (also for a cached description).
 TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::ImageResource& resource,
@@ -1486,6 +1514,12 @@ TextureBinding RenderExecutor::FindResolvedTexture(const ShaderRecompiler::IR::I
 	}
 	KYTY_PROFILER_BLOCK("ResolveTexture::Tail");
 	auto*      image               = &texture_cache.GetImage(id);
+	NotePendingClearRead(texture_cache, *image, desc, storage); // KYTY_DIAG_PENDING_CLEAR_READS (lane v4x)
+	if (PendingClearCheck::Enabled()) { // KYTY_DIAG_PENDING_CLEAR_CHECK (lane v4x2): keeps the slice a pending clear leaves stale
+		PendingClearCheck::OnTextureBind(m_context.GetGraphics(), m_context.GetCommandScheduler(), texture_cache, *image,
+		                                 desc, storage, resource.r128, descriptor.MetaCompress(),
+		                                 descriptor.MetaAddr() << 8u);
+	}
 	const bool stencil_association = static_cast<bool>(image->depth_id);
 	// KYTY_WORKAROUND_STENCIL_ALIAS_COPY=1: logged APPROXIMATION for dynamic resolution. A stencil plane
 	// sampled at an extent other than its depth target's is cached as a separate R8 image nothing

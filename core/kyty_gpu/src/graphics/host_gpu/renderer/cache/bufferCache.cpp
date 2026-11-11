@@ -64,6 +64,7 @@
 
 #include "graphics/host_gpu/renderer/perfCounters.h"
 #include "graphics/host_gpu/renderer/debugSample.h"
+#include "graphics/host_gpu/renderer/pendingClearNote.h"
 #include "graphics/host_gpu/renderer/syncTimeline.h"
 
 #include "graphics/host_gpu/queueLockSite.h"
@@ -365,8 +366,34 @@ namespace {
 // only once the GPU uses it: a shader read the fault pass reports as 0, a direct download into it, or the game's
 // granule list from earlier sessions (map §3m, 3.11: one Snake cutscene used ~160 granules, ~330 MB, of the 12 GB the
 // whole backing in 256 MiB chunks pinned).
-constexpr uint64_t FallbackChunkBytes = uint64_t {2} << 20u;
-constexpr uint64_t FallbackMaxChunks  = 1536; // 3 GB pinned at most (and Vulkan's allocation count)
+constexpr uint64_t FallbackGranuleBytes = uint64_t {2} << 20u;
+constexpr uint64_t FallbackMaxChunks    = 1536; // 3 GB pinned at most (and Vulkan's allocation count)
+
+// KYTY_FIX_BDA_FALLBACK_EAGER=<MiB> (lane v4x, AnyPS5 backend; default 0 = off, the G2 behaviour above): the exact
+// variant of the first-use zeros. Under AnyPS5 all direct memory is one section with one backing view, so the fallback
+// imports the backing in units of <MiB> (a power of two, 2 to 4096) as soon as a direct mapping reaches a unit: every
+// mapped direct page without a buffer then has its fallback entry before the GPU first reads it, and no BDA read of
+// direct memory returns zero. The units stay imported (pinned) for the session; the game's granule list is neither read
+// nor written (its indices are 2 MiB granules); a unit the driver refuses is logged, and its pages then miss as without
+// the fallback. Read once.
+uint64_t FallbackEagerUnitBytes() {
+	static const uint64_t bytes = [] {
+		const char* value = std::getenv("KYTY_FIX_BDA_FALLBACK_EAGER");
+		uint64_t    mib   = value != nullptr ? std::strtoull(value, nullptr, 10) : 0;
+		if (mib == 0) return uint64_t {0};
+		mib = std::clamp<uint64_t>(std::bit_ceil(mib), 2, 4096);
+		std::fprintf(stderr, "FIX_BDA_FALLBACK_EAGER on: the direct memory backing is imported in %llu MiB units at map\n",
+		             static_cast<unsigned long long>(mib));
+		return mib << 20u;
+	}();
+	return bytes;
+}
+
+// The fallback's import unit: a 2 MiB granule, or the eager unit.
+uint64_t FallbackChunkBytes() {
+	const uint64_t eager = FallbackEagerUnitBytes();
+	return eager != 0 ? eager : FallbackGranuleBytes;
+}
 } // namespace
 
 int BufferCache::BdaEntryShareMode() {
@@ -393,10 +420,10 @@ bool BufferCache::FallbackEntry(uint64_t page, vk::DeviceAddress* entry) {
 	if (!LibKernel::Memory::GuestBackingOffset(page, CACHING_PAGESIZE, &offset)) return false;
 	const uint64_t total = LibKernel::Memory::GuestBackingSize();
 	if (LibKernel::Memory::GuestBackingBase() == 0 || offset >= total) return false;
-	const size_t chunk  = static_cast<size_t>(offset / FallbackChunkBytes);
-	Buffer*      import = FallbackChunk(chunk, false);
+	const size_t chunk  = static_cast<size_t>(offset / FallbackChunkBytes());
+	Buffer*      import = FallbackChunk(chunk, FallbackEagerUnitBytes() != 0); // KYTY_FIX_BDA_FALLBACK_EAGER
 	if (import == nullptr) return false;
-	const uint64_t in_chunk = offset - static_cast<uint64_t>(chunk) * FallbackChunkBytes;
+	const uint64_t in_chunk = offset - static_cast<uint64_t>(chunk) * FallbackChunkBytes();
 	if (in_chunk + CACHING_PAGESIZE > import->Size()) return false;
 	*entry = (import->BufferDeviceAddress() + in_chunk) | vk::DeviceAddress {1};
 	return true;
@@ -407,10 +434,14 @@ bool BufferCache::FallbackEntry(uint64_t page, vk::DeviceAddress* entry) {
 void BufferCache::LoadFallbackList() {
 	m_fallback_list_loaded = true;
 	const uint64_t total   = LibKernel::Memory::GuestBackingSize();
-	const size_t   count   = static_cast<size_t>((total + FallbackChunkBytes - 1) / FallbackChunkBytes);
+	const size_t   count   = static_cast<size_t>((total + FallbackChunkBytes() - 1) / FallbackChunkBytes());
 	m_fallback_chunks.resize(count);
 	m_fallback_chunk_failed.resize(count, 0);
 	m_fallback_wanted.resize(count, 0);
+	if (FallbackEagerUnitBytes() != 0) { // KYTY_FIX_BDA_FALLBACK_EAGER: every mapped unit is imported, no list
+		std::fprintf(stderr, "FIX_BDA_FALLBACK granule list not used (eager units): %zu units\n", count);
+		return;
+	}
 	std::string title, version;
 	if (!::Loader::SystemContentParamSfoGetString("TITLE_ID", &title) || title.empty() ||
 	    !std::ranges::all_of(title, [](unsigned char c) { return std::isalnum(c) != 0; }))
@@ -440,11 +471,11 @@ void BufferCache::LoadFallbackList() {
 Buffer* BufferCache::FallbackChunk(size_t chunk, bool want) {
 	const uint64_t base  = LibKernel::Memory::GuestBackingBase();
 	const uint64_t total = LibKernel::Memory::GuestBackingSize();
-	if (base == 0 || static_cast<uint64_t>(chunk) * FallbackChunkBytes >= total) return nullptr;
+	if (base == 0 || static_cast<uint64_t>(chunk) * FallbackChunkBytes() >= total) return nullptr;
 	if (!m_fallback_list_loaded) LoadFallbackList();
 	if (!m_fallback_chunks[chunk]) {
 		if (m_fallback_chunk_failed[chunk] != 0 || (!want && m_fallback_wanted[chunk] == 0)) return nullptr;
-		if (m_fallback_stats.chunks >= FallbackMaxChunks) {
+		if (FallbackEagerUnitBytes() == 0 && m_fallback_stats.chunks >= FallbackMaxChunks) {
 			m_fallback_chunk_failed[chunk] = 1;
 			m_fallback_stats.failed++;
 			return nullptr;
@@ -461,8 +492,8 @@ Buffer* BufferCache::FallbackChunk(size_t chunk, bool want) {
 				}
 			}
 		}
-		const uint64_t start = static_cast<uint64_t>(chunk) * FallbackChunkBytes;
-		const uint64_t bytes = std::min(FallbackChunkBytes, total - start) & ~uint64_t {0xfff};
+		const uint64_t start = static_cast<uint64_t>(chunk) * FallbackChunkBytes();
+		const uint64_t bytes = std::min(FallbackChunkBytes(), total - start) & ~uint64_t {0xfff};
 		if (bytes == 0 || !Buffer::CanImportGuestMemory(m_graphics, base + start, bytes)) {
 			m_fallback_chunk_failed[chunk] = 1;
 			m_fallback_stats.failed++;
@@ -473,8 +504,14 @@ Buffer* BufferCache::FallbackChunk(size_t chunk, bool want) {
 		const auto t0     = std::chrono::steady_clock::now();
 		bool       failed = false;
 		auto       import = std::make_unique<Buffer>(m_graphics, m_scheduler, GuestDirectTag {&failed}, base + start, bytes);
-		m_fallback_stats.import_us += static_cast<uint64_t>(
+		const auto import_us = static_cast<uint64_t>(
 		    std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count());
+		m_fallback_stats.import_us += import_us;
+		if (FallbackEagerUnitBytes() != 0) { // KYTY_FIX_BDA_FALLBACK_EAGER: each unit's import, as it happens
+			std::fprintf(stderr, "FIX_BDA_FALLBACK_EAGER unit %zu (backing 0x%llx+0x%llx) %s in %.1f ms (frame %u)\n", chunk,
+			             static_cast<unsigned long long>(start), static_cast<unsigned long long>(bytes),
+			             failed ? "REFUSED" : "imported", static_cast<double>(import_us) / 1000.0, DebugPresentCount().load());
+		}
 		if (failed) { // D6 step K4: the driver refused the import (e.g. no more host memory it can lock)
 			m_fallback_chunk_failed[chunk] = 1;
 			m_fallback_stats.failed++;
@@ -493,12 +530,12 @@ void BufferCache::WantFallback(uint64_t page) {
 	page            = page & ~(CACHING_PAGESIZE - 1);
 	uint64_t offset = 0;
 	if (!LibKernel::Memory::GuestBackingOffset(page, CACHING_PAGESIZE, &offset)) return;
-	if (FallbackChunk(static_cast<size_t>(offset / FallbackChunkBytes), true) == nullptr) return;
+	if (FallbackChunk(static_cast<size_t>(offset / FallbackChunkBytes()), true) == nullptr) return;
 	// The guest range that maps the granule where `page` maps it (WriteFallbackRange checks each page's own granule;
 	// another view of the granule gets its entries when it is mapped again or faults itself).
-	const uint64_t in_granule = offset % FallbackChunkBytes;
+	const uint64_t in_granule = offset % FallbackChunkBytes();
 	if (page < in_granule) return;
-	WriteFallbackRange(page - in_granule, FallbackChunkBytes);
+	WriteFallbackRange(page - in_granule, FallbackChunkBytes());
 }
 
 // Fallback entries for the pages of [vaddr, vaddr + size) that hold no buffer (one table write per run of pages).
@@ -789,7 +826,7 @@ bool BufferCache::PlanDownloadToBacking(uint64_t buffer_address, const std::vect
 		plan.items.push_back({vaddr, backing, copy.size});
 		// D6 step K4: the BDA fallback's import table serves the copies too, so no host range is imported twice; a granule
 		// a download needs is imported now (and so serves first reads afterwards).
-		const uint64_t granule = FallbackChunkBytes;
+		const uint64_t granule = FallbackChunkBytes();
 		for (uint64_t done = 0; done < copy.size;) {
 			const uint64_t at         = backing + done;
 			const uint64_t chunk      = at / granule;
@@ -1517,6 +1554,7 @@ void ReportDirectStats(size_t pending) {
 namespace {
 struct RingDeadStats {
 	std::atomic<uint64_t> faults {0}, freed {0}, dropped_bytes {0}, partial {0};
+	std::atomic<uint64_t> kept {0}, kept_bytes {0}; // KYTY_FIX_RING_DEAD_DOWNLOAD: faults (and bytes) downloaded instead
 };
 RingDeadStats g_ring_dead;
 std::array<uint64_t, 8>  g_ring_frame_ticks {}; // tick at the end of frame n (collector pass), slot n % 8
@@ -1933,10 +1971,27 @@ bool BufferCache::DropDeadRingBytes(uint64_t vaddr) {
 			live = true;
 		}
 	});
+	// KYTY_FIX_RING_DEAD_DOWNLOAD=1 (lane v4x; default 0 = the rule above, the G2 behaviour; a KYTY_LIVE_AB switch): the
+	// exact variant: no GPU byte is dropped, the fault downloads them as on any other page (counted as kept).
+	static constinit Common::OnceValue<uint32_t> download_once;
+	const uint32_t download = Common::LiveAb::Gate(Common::LiveAb::Switch::RingDeadDownload, download_once.Get([] {
+		const char*    value = std::getenv("KYTY_FIX_RING_DEAD_DOWNLOAD");
+		const uint32_t m     = value != nullptr && value[0] == '1' ? 1u : 0u;
+		if (m != 0) std::fprintf(stderr, "FIX_RING_DEAD_DOWNLOAD on: data-ring GPU bytes are downloaded, not dropped\n");
+		return m;
+	}));
 	uint64_t bytes = 0;
 	for (const auto& [start, end]: dead) {
-		GpuDirtySubtract(start, end - start);
+		if (download == 0) GpuDirtySubtract(start, end - start);
 		bytes += end - start;
+	}
+	if (download != 0) {
+		if (bytes != 0) {
+			g_ring_dead.kept.fetch_add(1, std::memory_order_relaxed);
+			g_ring_dead.kept_bytes.fetch_add(bytes, std::memory_order_relaxed);
+		}
+		bytes = 0;
+		live  = true;
 	}
 	if (bytes != 0 && UploadClobberCheck()) { // KYTY_D6_C0=2/3: no clobber there
 		m_c0_dead_pages.insert(page);
@@ -1951,11 +2006,13 @@ bool BufferCache::DropDeadRingBytes(uint64_t vaddr) {
 	if (window_start == 0) window_start = now;
 	if (now - window_start >= 5000 && Common::EnvRead::PerfLines()) {
 		window_start = now;
-		std::fprintf(stderr, "PERF ring_dead faults=%llu freed=%llu partial=%llu dropped_KiB=%llu\n",
+		std::fprintf(stderr, "PERF ring_dead faults=%llu freed=%llu partial=%llu dropped_KiB=%llu kept=%llu kept_KiB=%llu\n",
 		             static_cast<unsigned long long>(g_ring_dead.faults.exchange(0)),
 		             static_cast<unsigned long long>(g_ring_dead.freed.exchange(0)),
 		             static_cast<unsigned long long>(g_ring_dead.partial.exchange(0)),
-		             static_cast<unsigned long long>(g_ring_dead.dropped_bytes.exchange(0) / 1024u));
+		             static_cast<unsigned long long>(g_ring_dead.dropped_bytes.exchange(0) / 1024u),
+		             static_cast<unsigned long long>(g_ring_dead.kept.exchange(0)),
+		             static_cast<unsigned long long>(g_ring_dead.kept_bytes.exchange(0) / 1024u));
 	}
 	return !live;
 }
@@ -3228,7 +3285,11 @@ void BufferCache::FillBuffer(uint64_t vaddr, uint64_t size, uint32_t value, bool
 	if (vaddr == 0) {
 		EXIT("BufferCache: invalid fill memory address\n");
 	}
-	(void)m_texture_cache.ClearMetaWrite(vaddr, size); // a larger fill is an ordinary write
+	const bool meta_clear = m_texture_cache.ClearMetaWrite(vaddr, size); // a larger fill is an ordinary write
+	if (meta_clear && PendingClearCheck::Enabled()) { // KYTY_DIAG_PENDING_CLEAR_CHECK (lane v4x2): the HTILE fill word
+		PendingClearCheck::NoteClearSet(vaddr, size, PendingClearCheck::ClearPath::Fill, true, value, false, 0.0f, 0,
+		                                DebugPresentCount().load());
+	}
 	if (!IsRegionGpuModified(vaddr, size) && !InDirectRange(vaddr, size)) { // KYTY_PERF_DIRECT_RANGES: in-stream fill
 		// Access the guest mapping so write faults invalidate cached buffers and images.
 		auto* destination = reinterpret_cast<uint32_t*>(vaddr);

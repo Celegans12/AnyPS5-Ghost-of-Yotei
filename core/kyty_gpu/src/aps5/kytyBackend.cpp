@@ -178,6 +178,11 @@ void ReportMaybe() {
 	    load(b.counts.maps), load(b.counts.unmaps), load(b.counts.protects), load(b.counts.host_writes),
 	    load(b.counts.host_reads), load(b.counts.faults), load(b.counts.faults_handled), load(b.counts.guest_faults),
 	    static_cast<unsigned long long>(memory.protect_splits));
+	const auto u = [](uint64_t value) { return static_cast<unsigned long long>(value); };
+	Log("kyty backend: backing misses (read/write/sparse/compare): private %llu/%llu/%llu/%llu, not in the table "
+	    "%llu/%llu/%llu/%llu",
+	    u(memory.private_misses[0]), u(memory.private_misses[1]), u(memory.private_misses[2]), u(memory.private_misses[3]),
+	    u(memory.unknown_misses[0]), u(memory.unknown_misses[1]), u(memory.unknown_misses[2]), u(memory.unknown_misses[3]));
 }
 
 int Start(Aps5GpuBackend* /*backend*/) {

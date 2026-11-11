@@ -32,6 +32,17 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+#include <atomic>
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h> // IWYU pragma: keep (VirtualQuery, lane v4x's BDA_ZERO_NO_BACKING line)
+#endif
 
 namespace Libs::Graphics {
 
@@ -52,6 +63,26 @@ bool FaultDiagTripsEnabled() {
 		return set;
 	}();
 	return on;
+}
+
+// Lane v4x (report only): a BDA read that returned zero from memory the backing cannot serve (committed private memory,
+// reserved, or unknown to the mapping table): the first 32, with what the host's memory manager has at the page.
+void NoteZeroWithoutBacking(const char* kind, uint64_t page) {
+	static std::atomic_uint logged {0};
+	if (logged.fetch_add(1) >= 32u) return;
+#ifdef _WIN32
+	MEMORY_BASIC_INFORMATION info {};
+	const bool queried = VirtualQuery(reinterpret_cast<const void*>(page), &info, sizeof(info)) != 0;
+	std::fprintf(stderr,
+	             "BDA_ZERO_NO_BACKING frame=%u kind=%s page=0x%llx host: state=0x%lx type=0x%lx protect=0x%lx allocation=%p "
+	             "region=%p+0x%llx\n",
+	             DebugPresentCount().load(), kind, static_cast<unsigned long long>(page), queried ? info.State : 0ul,
+	             queried ? info.Type : 0ul, queried ? info.Protect : 0ul, queried ? info.AllocationBase : nullptr,
+	             queried ? info.BaseAddress : nullptr, queried ? static_cast<unsigned long long>(info.RegionSize) : 0ull);
+#else
+	std::fprintf(stderr, "BDA_ZERO_NO_BACKING frame=%u kind=%s page=0x%llx\n", DebugPresentCount().load(), kind,
+	             static_cast<unsigned long long>(page));
+#endif
 }
 
 } // namespace
@@ -498,10 +529,13 @@ void FaultManager::ProcessFaultBuffer() {
 				} else if (LibKernel::Memory::ClampRangeSizeAhead(page, BufferCache::CACHING_PAGESIZE, &generation) ==
 				           BufferCache::CACHING_PAGESIZE) {
 					zero_committed++;
+					NoteZeroWithoutBacking("committed", page);
 				} else if (LibKernel::Memory::TryClampReservedRangeSize(page, BufferCache::CACHING_PAGESIZE) != 0) {
 					zero_reserved++;
+					NoteZeroWithoutBacking("reserved", page);
 				} else {
 					zero_unmapped++;
+					NoteZeroWithoutBacking("unmapped", page);
 				}
 			}
 			if (window >= 2u * BufferCache::CACHING_PAGESIZE && address != 0) {

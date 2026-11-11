@@ -36,6 +36,7 @@ enum class Switch : uint32_t {
 	BarGpuCopy,            // KYTY_PERF_BAR_GPU_COPY (KiB threshold; cache/barGpuCopy.h)
 	BarGpuLarge,           // KYTY_PERF_BAR_GPU_LARGE (cache/barGpuCopy.h)
 	Placement,             // KYTY_PERF_PLACEMENT (the thread layout, common/gpuPlacement.h; may be listed once per value)
+	RingDeadDownload,          // KYTY_FIX_RING_DEAD_DOWNLOAD (lane v4x: the data ring's old GPU bytes downloaded, not dropped)
 	Count
 };
 

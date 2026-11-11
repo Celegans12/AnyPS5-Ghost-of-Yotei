@@ -54,6 +54,10 @@ constexpr SwitchInfo Switches[] = {
     // Only where and at what priority threads run (the layouts KYTY_PLACEMENT_LAYOUT_1..4; gpuPlacement.cpp applies the
     // value at the frame boundary, on the GPU thread). Nothing computed depends on it. Listed once per layout to compare.
     {Switch::Placement, "KYTY_PERF_PLACEMENT", 4, true},
+    // Lane v4x: per CPU write fault into a data-ring page, whether the GPU bytes written before the previous frame are
+    // dropped (0, the G2 behaviour) or downloaded like any other GPU bytes (1); the fault decides with the one value it
+    // read and nothing it leaves depends on it (dropped bytes stay as the off phase left them).
+    {Switch::RingDeadDownload, "KYTY_FIX_RING_DEAD_DOWNLOAD", 1},
 };
 static_assert(std::size(Switches) == SwitchCount);
 

@@ -218,6 +218,9 @@ struct EmitterState {
 	// and the latch block that increments it.
 	std::unordered_map<uint32_t, std::pair<uint32_t, uint32_t>> loop_counter_variables;
 	std::unordered_map<uint32_t, uint32_t>                      back_edge_counters;
+	// Lane v4x (KYTY_DIAG_RT_TRIPS census): compare-exchange loops emitted (AtomicUpdate), and those without a fault buffer.
+	uint32_t                   cas_loop_sites                        = 0;
+	uint32_t                   cas_loop_sites_uncounted              = 0;
 	uint32_t                   subgroup_local_invocation_id_variable = 0;
 	uint32_t                   helper_invocation_variable            = 0; // upstream 5429888d4
 	// Paired shaders: a wave64 compute shader runs one guest lane per host invocation on a
@@ -554,10 +557,17 @@ inline bool DiagRtTripsFor(uint64_t shader_hash) {
 // loop gets the fault buffer, so its loop-cap trips are counted and reported even without DMA. Before, only programs
 // with DMA had it: the terrain PS 7de43c82ec18f609 (cap 256) had none, and its RT_TRIPS run of 16.10 ("0 trips") could
 // not have reported any. The dispatcher form (dispatcher_fallback) counts no trips. RT_TRIPS off: no change.
+// Lane v4x (AnyPS5 backend): every program RT_TRIPS names gets the fault buffer, so the two loop caps that are not
+// structured loops count their trips in the same word 0 too: the dispatcher form's whole-program loop
+// (EmitDispatcherFunction) and the compare-exchange loops of emulated atomics and subword stores (AtomicUpdate).
+// RT_TRIPS off: no change.
 inline bool RtTripsCheckBinding(const IR::Program& program) {
-	if (program.dispatcher_fallback || !DiagRtTripsFor(program.shader_hash)) return false;
-	return std::ranges::any_of(program.blocks, [](const IR::Block* block) { return block->terminator.loop_header; });
+	return DiagRtTripsFor(program.shader_hash);
 }
+
+// Lane v4x (KYTY_DIAG_RT_TRIPS, report only): what the translator emitted with a loop cap, per form (structured loops,
+// dispatcher loops, compare-exchange loops), and how many of those cap sites count their trips.
+void NoteLoopCapSites(uint64_t shader_hash, uint32_t structured, uint32_t dispatcher, uint32_t cas, uint32_t uncounted);
 
 // KYTY_SHADER_LOOP_LIMIT_HASHES=<hex hash>:<limit>[,...] (logged APPROXIMATION): a lower loop
 // cap for the listed shaders, e.g. a per-pixel loop that would otherwise run past the GPU
@@ -977,6 +987,7 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	                          exchange_label);
 	auto success = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpIEqual, TypeBool(state), success, exchanged, observed);
+	const auto landed = success;
 	state.builder.AddFunction(spv::OpIAdd, TypeU32(state), next_iteration, iteration,
 	                          ConstantU32(state, 1));
 	if (ShaderLoopLimit() != 0) {
@@ -991,6 +1002,19 @@ uint32_t AtomicUpdate(EmitterState& state, uint32_t pointer, IR::ResourceKind ki
 	EmitLabel(state, cont);
 	state.builder.AddFunction(spv::OpBranch, header);
 	EmitLabel(state, merge);
+	if (ShaderLoopLimit() != 0) {
+		// Lane v4x (KYTY_DIAG_RT_TRIPS): an update that gave up at the cap without landing counts as a trip (word 0).
+		state.cas_loop_sites++;
+		if (DiagRtTripsFor(state.program.shader_hash) && state.fault_buffer_variable != 0) {
+			const auto at_cap  = Binary(state, spv::OpUGreaterThanEqual, TypeBool(state), iteration,
+			                            ConstantU32(state, ShaderLoopLimit()));
+			const auto gave_up = Binary(state, spv::OpLogicalAnd, TypeBool(state), at_cap,
+			                            Unary(state, spv::OpLogicalNot, TypeBool(state), landed));
+			(void)FaultDiagAdd(state, 0, Select(state, TypeU32(state), gave_up, ConstantU32(state, 1), ConstantU32(state, 0)));
+		} else {
+			state.cas_loop_sites_uncounted++;
+		}
+	}
 	EmitAtomicMemoryBarrier(state, kind);
 	return observed;
 }

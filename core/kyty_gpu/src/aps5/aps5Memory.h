@@ -12,6 +12,10 @@ struct MemoryStats {
 	uint64_t private_bytes  = 0;
 	uint64_t discovered     = 0;
 	uint64_t protect_splits = 0; // tracker protections the host refused whole (they crossed views) and that were split
+	// Lane v4x: backing calls that failed because the range has no backing view, by call (read, write, sparse read,
+	// compare), for private (committed, not direct) memory and for addresses the table does not know.
+	uint64_t private_misses[4] {};
+	uint64_t unknown_misses[4] {};
 };
 
 // At create: the backing view (map notifications arrive from then on, before start).

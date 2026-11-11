@@ -3,6 +3,7 @@
 #include "graphics/host_gpu/renderer/debugSample.h"
 #include "graphics/host_gpu/gpuCheckpoints.h"
 #include "graphics/host_gpu/renderer/renderDraw.h"
+#include "graphics/host_gpu/renderer/pendingClearCheck.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -975,6 +976,10 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 				                                         native->info);
 			}
 		}
+		if (PendingClearCheck::Enabled()) { // KYTY_DIAG_PENDING_CLEAR_CHECK (lane v4x2): this bind lands a pending clear
+			PendingClearCheck::OnDepthBind(metadata.range.address, depth.desc.view_info.base_layer, meta_clear,
+			                               depth.depth_clear_value, static_cast<bool>(sampled_aspects));
+		}
 		if (feedback_aspects && !m_context.GetGraphics().attachment_feedback_loop_enabled) {
 			static std::atomic_bool logged = false;
 			if (!logged.exchange(true, std::memory_order_relaxed)) {
@@ -1439,11 +1444,35 @@ static NoOutputDraw ClassifyNoOutputDraw(const CommandBuffer& buffer, const Draw
 	if (result.db_metadata_op && z.z_info.htile_acceleration && z.htile_data_base_addr != 0) {
 		result.pending_clear =
 		    context.GetTextureCache().IsMetaCleared(z.htile_data_base_addr, z.depth_view.slice_start);
+		if (result.pending_clear && PendingClearCheck::Enabled()) { // KYTY_DIAG_PENDING_CLEAR_CHECK (lane v4x2)
+			PendingClearCheck::OnExpandLeftOut(z.htile_data_base_addr, z.depth_view.slice_start, regs.GetDepthClearValue());
+		}
 	}
 	return result;
 }
 
+// Lane v4x (report only): the no-output draws left out, by reason (the order of NoOutputDropReason's tests), with one line
+// at the first drop of each reason, at powers of two up to 4096 drops and every 65,536 after.
+static void NoteNoOutputDrop(const NoOutputDraw& draw) {
+	static std::atomic<uint64_t> counts[5] {};
+	static constexpr const char* names[] = {"occlusion_uncounted", "vertex_writes", "pending_clear", "db_metadata", "no_effect"};
+	const uint32_t kind = draw.counted ? 0u : draw.vertex_writes ? 1u : draw.pending_clear ? 2u : draw.db_metadata_op ? 3u : 4u;
+	const uint64_t kind_count = counts[kind].fetch_add(1, std::memory_order_relaxed) + 1u;
+	static std::atomic<uint64_t> total {0};
+	const uint64_t n = total.fetch_add(1, std::memory_order_relaxed) + 1u;
+	if (kind_count == 1u || (n <= 4096u && std::has_single_bit(n)) || (n % 65536u) == 0u) {
+		std::fprintf(stderr,
+		             "NO_OUTPUT_DRAW_DROPS total=%llu occlusion_uncounted=%llu vertex_writes=%llu pending_clear=%llu "
+		             "db_metadata=%llu no_effect=%llu (frame %u, newest: %s)\n",
+		             static_cast<unsigned long long>(n), static_cast<unsigned long long>(counts[0].load()),
+		             static_cast<unsigned long long>(counts[1].load()), static_cast<unsigned long long>(counts[2].load()),
+		             static_cast<unsigned long long>(counts[3].load()), static_cast<unsigned long long>(counts[4].load()),
+		             DebugPresentCount().load(), names[kind]);
+	}
+}
+
 static const char* NoOutputDropReason(const NoOutputDraw& draw) {
+	NoteNoOutputDrop(draw);
 	if (draw.counted) return "render state (no output): occlusion query draw, not counted (KYTY_FIX_OCCLUSION_QUERIES off)";
 	// Running these (vertex stage writes; the expand binding the surface so its pending fast clear lands) left the
 	// game on its loading screen: they stay dropped.
