@@ -762,18 +762,12 @@ public:
         Require(sampling.refusal.empty(), sampling.refusal);
         Require(!clearPending, "native multisample depth clear has not been recorded");
         const auto* recorder = RecorderFor(context);
-        const auto checkEpoch = GuestMemory::ThreadCollectEpoch();
-        const auto checkMapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-        if (checkEpoch != 0u && checkEpoch == checkedEpoch && checkMapping == checkedMapping && clearGeneration == 0u && stencilClearGeneration == 0u && pendingClear == 0u && !publicationFailure) {
-            const bool pendingWrite = recorder != nullptr && std::ranges::any_of(sampling.initial, [&](const auto& range) { return recorder->PendingWriteOverlaps(range.address, range.bytes); });
-            if (!pendingWrite && GuestMemory::UnchangedSinceAll(sampling.initial)) return;
-        }
         if (recorder != nullptr && clearGeneration != 0u && clearPattern.has_value() && clearFillNote == 0u) clearFillNote = fillNoteAfter(*recorder, sampling.initial[1], clearFillFloor, *clearPattern);
         if (recorder != nullptr && stencilClearGeneration != 0u && stencilFillNote == 0u) stencilFillNote = fillNoteAfter(*recorder, sampling.initial[2], stencilFillFloor, *stencilClearValue * 0x01010101u);
         if (!publication.empty()) {
             if (auto* pending = RecorderFor(context)) {
-                if (clearFillNote != 0u && pending->NewestWriteNote(sampling.initial[1].address, sampling.initial[1].bytes) != clearFillNote) pending->SyncThrough(sampling.initial[1].address, sampling.initial[1].bytes);
-                if (stencilFillNote != 0u && pending->NewestWriteNote(sampling.initial[2].address, sampling.initial[2].bytes) != stencilFillNote) pending->SyncThrough(sampling.initial[2].address, sampling.initial[2].bytes);
+                if (clearFillNote != 0u) pending->SyncThrough(sampling.initial[1].address, sampling.initial[1].bytes);
+                if (stencilFillNote != 0u) pending->SyncThrough(sampling.initial[2].address, sampling.initial[2].bytes);
             }
         }
         const auto newestHtileNote = recorder != nullptr ? recorder->NewestStoreNote(sampling.initial[1].address, sampling.initial[1].bytes) : 0u;
@@ -819,7 +813,7 @@ public:
             stencilFill = *stencilClearValue;
             RecordClear(VK_IMAGE_ASPECT_STENCIL_BIT);
             plane.generation = generation;
-            RebasePublication(2u, queuedStencilFill ? std::optional<std::uint32_t>(*stencilClearValue * 0x01010101u) : std::nullopt);
+            RebasePublication(2u);
             stencilClearGeneration = 0u;
             sampling.unprovenStencil.reset();
         }
@@ -846,14 +840,12 @@ public:
             Require(GuestMemory::UnchangedSinceCollected(metadata.address, metadata.bytes, clearGeneration), "CPU writes raced native multisample depth clear");
             RecordClear(clearAspects);
             sampling.initial = current;
-            RebasePublication(1u, queuedFill ? clearPattern : std::nullopt);
+            RebasePublication(1u);
             clearGeneration = 0u;
             clearAspects = 0u;
             pendingClear = 0u;
         }
-        Require(GuestMemory::UnchangedSinceAll(sampling.initial) || AcceptHeldPublication(), "guest writes over native multisample depth are not implemented");
-        checkedEpoch = checkEpoch;
-        checkedMapping = checkMapping;
+        Require(GuestMemory::UnchangedSinceAll(sampling.initial), "guest writes over native multisample depth are not implemented");
     }
 
     void CheckResource(const GuestTextureResource& resource) const {
@@ -1148,7 +1140,6 @@ public:
     }
 
     void PublishToGuest();
-    bool PublishHtileToGuest(std::uint64_t address, std::size_t bytes);
 
     std::uint64_t written = ++depthWrites;
     std::shared_ptr<std::atomic<bool>> hostWritten = std::make_shared<std::atomic<bool>>(false);
@@ -1750,7 +1741,6 @@ public:
 private:
     struct PublicationPlane {
         static constexpr std::size_t PageBytes = 4096u;
-        std::vector<std::uint64_t> pageHashes;
         static constexpr std::size_t Repeated = std::numeric_limits<std::size_t>::max();
         GuestMemory::UnchangedQuery range;
         std::vector<std::uint32_t> words;
@@ -1770,9 +1760,6 @@ private:
         }
     };
     std::vector<PublicationPlane> publication;
-    std::array<std::vector<std::uint64_t>, 3> publishedPages;
-    std::uint64_t checkedEpoch = 0u;
-    std::uint64_t checkedMapping = 0u;
     bool publicationInProgress = false;
     bool publicationFailed = false;
     std::exception_ptr publicationFailure;
@@ -1837,7 +1824,6 @@ private:
             const auto first = index * PublicationPlane::PageBytes;
             const auto length = std::min(PublicationPlane::PageBytes, range.bytes - first);
             GuestMemory::CopyGuestBytes(page.data(), reinterpret_cast<const void*>(range.address + first), length);
-            plane.pageHashes.push_back(PublishedPageHash(page.data(), length));
             if (length <= 4u || std::equal(page.begin() + 4u, page.begin() + length, page.begin())) {
                 std::memcpy(&plane.words[index], page.data(), std::min<std::size_t>(length, 4u));
             } else {
@@ -1845,97 +1831,12 @@ private:
                 plane.stored.insert(plane.stored.end(), page.begin(), page.begin() + length);
             }
         }
+        Require(GuestMemory::UnchangedSinceCollected(range.address, range.bytes, plane.range.generation) && GuestMemory::UnchangedSince(range.address, range.bytes, plane.range.generation), "guest writes raced native multisample depth publication capture");
         return plane;
     }
 
-    static std::uint64_t PublishedPageHash(const std::byte* page, std::size_t bytes) {
-        constexpr std::uint64_t prime1 = 0x9E3779B185EBCA87ull;
-        constexpr std::uint64_t prime2 = 0xC2B2AE3D27D4EB4Full;
-        const auto round = [](std::uint64_t accumulator, std::uint64_t word) { return std::rotl(accumulator + word * prime2, 31) * prime1; };
-        const auto finish = [](std::uint64_t hash) {
-            hash ^= hash >> 33u;
-            hash *= prime2;
-            return hash ^ (hash >> 29u);
-        };
-        if (bytes > 4u && std::memcmp(page, page + 4u, bytes - 4u) == 0) {
-            std::uint32_t word = 0u;
-            std::memcpy(&word, page, sizeof(word));
-            return finish(round(bytes, word));
-        }
-        std::array<std::uint64_t, 4> lanes{prime1 + prime2, prime2, 0u, 0u - prime1};
-        std::size_t offset = 0u;
-        for (; offset + sizeof(lanes) <= bytes; offset += sizeof(lanes)) {
-            std::array<std::uint64_t, 4> words;
-            std::memcpy(words.data(), page + offset, sizeof(words));
-            for (std::size_t lane = 0u; lane < lanes.size(); ++lane) lanes[lane] = round(lanes[lane], words[lane]);
-        }
-        std::uint64_t hash = std::rotl(lanes[0], 1) + std::rotl(lanes[1], 7) + std::rotl(lanes[2], 12) + std::rotl(lanes[3], 18) + bytes;
-        for (; offset < bytes; offset += sizeof(std::uint64_t)) {
-            std::uint64_t word = 0u;
-            std::memcpy(&word, page + offset, std::min(sizeof(word), bytes - offset));
-            hash = round(hash, word);
-        }
-        return finish(hash);
-    }
-
-    void NotePublishedBytes(std::size_t index, std::span<const std::byte> bytes) {
-        auto& hashes = publishedPages[index];
-        hashes.clear();
-        for (std::size_t offset = 0u; offset < bytes.size(); offset += PublicationPlane::PageBytes) {
-            const auto length = std::min(PublicationPlane::PageBytes, bytes.size() - offset);
-            hashes.push_back(PublishedPageHash(bytes.data() + offset, length));
-        }
-    }
-
-public:
-    void NoteImportedBytes() {
-        for (std::size_t index = 0u; index < sampling.initial.size(); ++index) {
-            const auto& plane = sampling.initial[index];
-            std::vector<std::byte> bytes(plane.bytes);
-            GuestMemory::CopyGuestBytes(bytes.data(), reinterpret_cast<const void*>(plane.address), plane.bytes);
-            NotePublishedBytes(index, bytes);
-        }
-    }
-
-private:
-    bool AcceptHeldPublication() {
-        std::array<std::byte, PublicationPlane::PageBytes> page;
-        for (std::size_t index = 0u; index < sampling.initial.size(); ++index) {
-            auto& plane = sampling.initial[index];
-            if (GuestMemory::UnchangedSince(plane.address, plane.bytes, plane.generation)) continue;
-            const auto& hashes = publishedPages[index];
-            if (hashes.size() != (plane.bytes + PublicationPlane::PageBytes - 1u) / PublicationPlane::PageBytes) return false;
-            const auto generation = GuestMemory::CollectWritesUncached(plane.address, plane.bytes);
-            for (std::size_t pageIndex = 0u; pageIndex < hashes.size(); ++pageIndex) {
-                const auto offset = pageIndex * PublicationPlane::PageBytes;
-                const auto length = std::min(PublicationPlane::PageBytes, plane.bytes - offset);
-                if (GuestMemory::UnchangedSince(plane.address + offset, length, plane.generation)) continue;
-                if (!GuestMemory::NoStoreSinceLastCollect(plane.address + offset, length, plane.generation)) return false;
-                GuestMemory::CopyGuestBytes(page.data(), reinterpret_cast<const void*>(plane.address + offset), length);
-                if (PublishedPageHash(page.data(), length) != hashes[pageIndex]) return false;
-            }
-            if (generation != 0u) plane.generation = generation;
-        }
-        return true;
-    }
-
-    void RebasePublication(std::size_t index, std::optional<std::uint32_t> fill = std::nullopt) {
+    void RebasePublication(std::size_t index) {
         if (publication.empty()) return;
-        if (fill.has_value()) {
-            const auto& range = sampling.initial[index];
-            const auto pages = (range.bytes + PublicationPlane::PageBytes - 1u) / PublicationPlane::PageBytes;
-            PublicationPlane plane;
-            plane.range = range;
-            plane.words.assign(pages, *fill);
-            plane.starts.assign(pages, PublicationPlane::Repeated);
-            std::array<std::uint32_t, PublicationPlane::PageBytes / sizeof(std::uint32_t)> words;
-            words.fill(*fill);
-            auto& hashes = publishedPages[index];
-            hashes.assign(pages, PublishedPageHash(reinterpret_cast<const std::byte*>(words.data()), PublicationPlane::PageBytes));
-            if (const auto tail = range.bytes % PublicationPlane::PageBytes; tail != 0u) hashes.back() = PublishedPageHash(reinterpret_cast<const std::byte*>(words.data()), tail);
-            publication[index] = std::move(plane);
-            return;
-        }
         try {
             publication[index] = CapturePublication(sampling.initial[index]);
         } catch (...) {
@@ -2793,34 +2694,6 @@ std::uint32_t expandedHtileWord(std::uint32_t word, bool stencilInHtile, VkImage
     return word;
 }
 
-bool DepthSurface::PublishHtileToGuest(std::uint64_t address, std::size_t bytes) {
-    if (publication.size() != 3u || publicationInProgress || publicationFailed || publicationFailure || Recorder::InCompletion()) return false;
-    const auto& plane = publication[1];
-    if (address < plane.range.address || address + bytes > plane.range.address + plane.range.bytes) return false;
-    if (!sampling.refusal.empty() || clearPending || clearGeneration != 0u || stencilClearGeneration != 0u || pendingClear != 0u) return false;
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(plane.range.address), plane.range.bytes, true) || !GuestMemory::Watched(plane.range.address, plane.range.bytes)) return false;
-    const std::pair<std::uint64_t, std::uint64_t> range{plane.range.address, plane.range.address + plane.range.bytes};
-    if (MultisampleColorTargetOver(plane.range.address, plane.range.bytes) || StorageTexture::AnyPendingOverlaps(std::span(&range, 1u))) return false;
-    if (auto* recorder = RecorderFor(context); recorder != nullptr && recorder->PendingWriteOverlaps(plane.range.address, plane.range.bytes)) return false;
-    auto expanded = plane.Expand();
-    std::vector<std::byte> current(plane.range.bytes);
-    const auto generation = GuestMemory::CollectWritesUncached(plane.range.address, plane.range.bytes);
-    GuestMemory::CopyGuestBytes(current.data(), reinterpret_cast<const void*>(plane.range.address), plane.range.bytes);
-    if (current != expanded) return false;
-    for (std::size_t offset = 0u; offset + 4u <= expanded.size(); offset += 4u) {
-        std::uint32_t word;
-        std::memcpy(&word, expanded.data() + offset, 4u);
-        word = expandedHtileWord(word, !target.htileDepthOnly, VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT);
-        std::memcpy(expanded.data() + offset, &word, 4u);
-    }
-    if (expanded == current) return true;
-    if (GuestMemory::WriteChangedIfHeld(plane.range.address, expanded, current, 0u) != 0u) return false;
-    sampling.initial[1].generation = GuestMemory::CollectWritesUncached(plane.range.address, plane.range.bytes);
-    RebasePublication(1u);
-    NotePublishedBytes(1u, expanded);
-    return generation != 0u;
-}
-
 void DepthSurface::PublishToGuest() {
     Require(!Recorder::InCompletion(), "native multisample depth publication inside a GPU completion is not implemented");
     Require(!publicationInProgress, "recursive native multisample depth publication is not implemented");
@@ -2904,7 +2777,7 @@ void DepthSurface::PublishToGuest() {
             for (auto first = begin; first < end;) {
                 const auto address = plane.range.address + first;
                 const auto bytes = std::min<std::size_t>(4096u - (address & 4095u), end - first);
-                if (!GuestMemory::NoStoreSinceLastCollect(address, bytes, plane.range.generation)) {
+                if (!GuestMemory::UnchangedSinceLastCollect(address, bytes, plane.range.generation)) {
                     if (GuestMemory::StoredAllSince_nid_no_patch(address, bytes, plane.range.generation)) {
                         if (!std::equal(current[index].begin() + first, current[index].begin() + first + bytes, result[index].begin() + first)) tookGuest[index] = true;
                         std::copy_n(current[index].begin() + first, bytes, result[index].begin() + first);
@@ -2912,7 +2785,7 @@ void DepthSurface::PublishToGuest() {
                         if (current[index][offset] != plane.Byte(offset) || current[index][offset] == result[index][offset] || GuestMemory::StoredAllSince_nid_no_patch(plane.range.address + offset, 1u, plane.range.generation)) {
                             if (current[index][offset] != result[index][offset]) tookGuest[index] = true;
                             result[index][offset] = current[index][offset];
-                        } else Require(GuestMemory::NoStoreSinceLastCollect(plane.range.address + offset, 1u, plane.range.generation), "native multisample depth publication cannot distinguish an unwritten byte from a same-value guest store");
+                        } else Require(GuestMemory::UnchangedSinceLastCollect(plane.range.address + offset, 1u, plane.range.generation), "native multisample depth publication cannot distinguish an unwritten byte from a same-value guest store");
                     }
                 }
                 first += bytes;
@@ -2944,10 +2817,7 @@ void DepthSurface::PublishToGuest() {
         const auto generation = GuestMemory::CollectWritesUncached(range.address, range.bytes);
         std::vector<std::byte> committed(range.bytes);
         GuestMemory::CopyGuestBytes(committed.data(), reinterpret_cast<const void*>(range.address), range.bytes);
-        if (committed == result[index]) {
-            sampling.initial[index].generation = generation;
-            NotePublishedBytes(index, committed);
-        }
+        if (committed == result[index]) sampling.initial[index].generation = generation;
     }
     hostWritten->store(false, std::memory_order_release);
     publication.clear();
@@ -2955,19 +2825,15 @@ void DepthSurface::PublishToGuest() {
     if (superseded[2]) RetireMultisampleColorTarget(sampling.stencilAlias->active);
 }
 
-bool publishWrittenDepth(std::span<const std::shared_ptr<std::atomic<bool>>> written, std::uint64_t address, std::size_t bytes) {
+void publishWrittenDepth(std::span<const std::shared_ptr<std::atomic<bool>>> written) {
     std::lock_guard gpu(GuestMemory::GpuMutex());
     std::lock_guard lock(surfacesMutex());
-    bool htileOnly = !written.empty();
     for (const auto& flag : written) {
         if (!flag->load(std::memory_order_acquire)) continue;
         const auto found = std::ranges::find_if(surfaces(), [&](const auto& surface) { return surface->hostWritten == flag && surface->active->load(std::memory_order_acquire); });
         if (found == surfaces().end()) continue;
-        if ((*found)->PublishHtileToGuest(address, bytes)) continue;
-        htileOnly = false;
         (*found)->PublishToGuest();
     }
-    return htileOnly;
 }
 
 std::mutex& htileReadsMutex() {
@@ -3483,7 +3349,7 @@ void RequireNoResidentDepthRead_nid_no_patch(std::uint64_t address, std::size_t 
     if (!written.empty()) {
         Require(allowPublication && !HoldsMultisampleTargetsLock(), "sample-preserving guest publication of native multisample depth is not implemented while a multisampled colour target is being acquired");
         if (const auto hook = depthPublicationHook.load(std::memory_order_acquire)) hook(DepthPublicationStage::ReadCaptured);
-        if (publishWrittenDepth(written, address, bytes)) return;
+        publishWrittenDepth(written);
     }
     std::unique_lock lock(depthGuardMutex());
     for (const auto& range : depthGuards()) {
@@ -3678,7 +3544,6 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
             publishDepthGuards(true);
             InstallResidentImageReadGuard_nid_no_patch();
             fresh.samplingActive = true;
-            fresh.NoteImportedBytes();
         }
         surface = surfaces().back().get();
     }

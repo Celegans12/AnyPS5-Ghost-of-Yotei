@@ -939,7 +939,7 @@ void CheckGuardedWrite() {
 }
 
 enum class PublicationUnmap { None, Middle, Head, Tail, EmptyDepth, EmptyStencil, EmptyHtile, Remap, Inaccessible };
-enum class PublicationClear { None, Clear, Redraw, Different, QueuedHtile, Stencil, StencilRedraw, StencilSameRedraw, QueuedStencilRedraw };
+enum class PublicationClear { None, Clear, Redraw, Different, Stencil, StencilRedraw, StencilSameRedraw, QueuedStencilRedraw };
 std::barrier<>* publicationReadBarrier = nullptr;
 std::function<void(DepthPublicationStage)> publicationAction;
 
@@ -1048,8 +1048,7 @@ void CheckDepthPublication(Context context, std::uint32_t samples, PublicationWr
         } else {
             const std::uint32_t word = clear == PublicationClear::Different ? (depthOnly ? 0xfffffff0u : 0xfffc0000u) : 0u;
             NoteDepthMetadataFill(target.htileAddress, metadataBytes, word);
-            if (clear == PublicationClear::QueuedHtile) QueueTargetWordFill(context, recorder, target.htileAddress, metadataBytes, word);
-            else AgcDriver::GuestMemory::StoreOwnBytes(target.htileAddress, metadataBytes, [&] { for (std::size_t offset = 0u; offset < metadataBytes; offset += 4u) std::memcpy(metadata.Data() + offset, &word, 4u); });
+            AgcDriver::GuestMemory::StoreOwnBytes(target.htileAddress, metadataBytes, [&] { for (std::size_t offset = 0u; offset < metadataBytes; offset += 4u) std::memcpy(metadata.Data() + offset, &word, 4u); });
         }
         Require(DepthSurfaceView(context, target) == view, "publication did not apply its native clear in place");
         if (redraw) {
@@ -1065,9 +1064,9 @@ void CheckDepthPublication(Context context, std::uint32_t samples, PublicationWr
     for (std::uint32_t y = 0u; y < extent.height; ++y) {
         for (std::uint32_t x = 0u; x < extent.width; ++x) {
             for (std::uint32_t sample = 0u; sample < samples; ++sample) {
-                const auto value = clear == PublicationClear::Clear || clear == PublicationClear::QueuedHtile ? target.clearDepth : (redraw ? 0.5f : 0.25f) + static_cast<float>(sample + 1u) / 16.0f;
+                const auto value = clear == PublicationClear::Clear ? target.clearDepth : (redraw ? 0.5f : 0.25f) + static_cast<float>(sample + 1u) / 16.0f;
                 std::memcpy(expected[0].data() + depthLayout.Offset(x, y, 0u, sample), &value, 4u);
-                expected[2][stencilLayout.Offset(x, y, 0u, sample)] = static_cast<std::byte>(((clear == PublicationClear::Clear || clear == PublicationClear::QueuedHtile) && !depthOnly) || clear == PublicationClear::Stencil ? target.clearStencil : 0x20u + sample);
+                expected[2][stencilLayout.Offset(x, y, 0u, sample)] = static_cast<std::byte>((clear == PublicationClear::Clear && !depthOnly) || clear == PublicationClear::Stencil ? target.clearStencil : 0x20u + sample);
             }
         }
     }
@@ -4411,7 +4410,6 @@ int main(int argc, char** argv) {
                 CheckDepthPublication(publishing, samples, PublicationWrite::None, true, PublicationUnmap::None, PublicationClear::StencilRedraw);
             }
             for (const auto clear : {PublicationClear::Stencil, PublicationClear::StencilSameRedraw, PublicationClear::QueuedStencilRedraw}) CheckDepthPublication(publishing, 4u, PublicationWrite::None, true, PublicationUnmap::None, clear);
-            CheckDepthPublication(publishing, 4u, PublicationWrite::None, true, PublicationUnmap::None, PublicationClear::QueuedHtile);
             CheckGuardedWrite();
             for (const auto write : {PublicationWrite::CopyRace, PublicationWrite::Retired, PublicationWrite::ColorAcquisition, PublicationWrite::DrawAlias, PublicationWrite::DrawPending, PublicationWrite::DriverSameDepth, PublicationWrite::DriverSameStencil, PublicationWrite::DriverSameHtile}) CheckDepthPublication(publishing, 4u, write, true);
             for (const auto write : {PublicationWrite::LateStore, PublicationWrite::PlaneStore}) CheckDepthPublication(publishing, 4u, write, false);
