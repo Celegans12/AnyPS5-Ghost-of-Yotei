@@ -7135,26 +7135,40 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         std::uint64_t address = item.address;
         std::size_t size = item.size;
+        bool pendingWrite = false;
         if (override != moved.end()) {
             address = override->address;
             size = override->size;
         } else {
             if (movedOnly || !item.guest || item.written || guestMemory.WritesOverlap(item.address, item.size)) continue;
             const bool direct = std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return item.address >= range.first && item.address < range.second && item.size <= range.second - item.address; });
-            if (!direct || recorder.PendingWriteOverlaps(item.address, item.size)) continue;
+            if (!direct) continue;
+            // A range with a recorded write still pending is not read by the CPU here; it may bind
+            // its device-local copy, which the GPU fills on the queue after that write.
+            pendingWrite = recorder.PendingWriteOverlaps(item.address, item.size);
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-        if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
+        const bool overLimit = override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes);
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         if (!stamped) {
             stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
         }
         VkDeviceSize offset = 0;
-        auto buffer = recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
+        auto buffer = pendingWrite ? nullptr : recorder.UnwrittenDrawSnapshot(begin, bytes, stamp, &offset);
+        // rewrite/direct (DESIGN section B): a range draws keep binding is read from its device-local
+        // copy, whatever its size; until it has a current one it takes the path below.
+        bool resident = buffer != nullptr && !buffer->Mapped();
+        if (buffer == nullptr) {
+            buffer = recorder.ResidentDrawBuffer(begin, bytes, registryGeneration);
+            resident = buffer != nullptr;
+            if (GuestMemory::TrackerGeneration() != stamp[0]) stamped = false;
+            else if (resident && !pendingWrite) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer, 0);
+        }
+        if ((pendingWrite || overLimit) && !resident) continue;
         static const bool verifySnapshots = std::getenv("APS5_VERIFY_DRAW_SNAPSHOTS") != nullptr;
-        if (verifySnapshots && buffer != nullptr) {
+        if (verifySnapshots && buffer != nullptr && !resident) {
             static std::atomic<std::uint64_t> checked{0}, differing{0};
             const auto fast = buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes);
             VkDeviceSize slowOffset = 0;
@@ -7184,14 +7198,14 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         selected.push_back(index);
         keep({begin, std::move(buffer), offset, bytes});
-        totalSnapshotBytes += bytes;
+        if (!resident) totalSnapshotBytes += bytes;
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty() && !rebound) return {};
     writeDrawSets(*result, selected, faultRecord);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) {
-        if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        if (snapshot.buffer->Mapped()) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     }
     return result;
 }

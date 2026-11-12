@@ -229,7 +229,19 @@ public:
     static constexpr std::size_t DrawInputEntries = 16384;
     std::shared_ptr<Buffer> UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset = nullptr);
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset = 0);
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr, std::size_t from = 0, std::uint32_t* lowest = nullptr);
+    // rewrite/direct (DESIGN section B, walk-based): a device-local copy of [address, address + bytes),
+    // a range a host import serves, once draws bound it in ResidentFrames frames. Filled by a GPU
+    // copy from the import (recorded into the open batch, so it follows every write recorded before
+    // it, a pending one included; ends an open render pass) and returned while no write was
+    // collected over the range. After a collected write it is filled again, at most once per frame;
+    // null (the caller reads the import) for a second write in the frame and while the range is not
+    // resident. APS5_DIRECT_NO_RESIDENT=1 (A/B lever) and APS5_NO_DIRECT=1 turn it off.
+    static constexpr std::size_t ResidentMinBytes = 65536;
+    static constexpr std::size_t ResidentBudget = std::size_t{2048} << 20u;
+    static constexpr std::size_t ResidentEntries = 4096;
+    static constexpr std::uint64_t ResidentFrames = 3;
+    std::shared_ptr<Buffer> ResidentDrawBuffer(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration);
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr);
     struct OwnedDrawInputProof {
         std::vector<std::uint64_t> words;
         std::uint64_t since = 0;
@@ -731,6 +743,8 @@ private:
         CommandState graphicsState;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
+        // Resident copies whose fill this batch records: dropped if the batch is discarded.
+        std::vector<std::pair<std::uint64_t, std::size_t>> residentFills;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
@@ -1086,6 +1100,32 @@ private:
     std::array<std::uint64_t, 3> unwrittenStamp{};
     std::size_t unwrittenBytes = 0;
     void retireUnwrittenSnapshots(const std::array<std::uint64_t, 3>& stamp);
+    // One range's residency, in the terms of the DESIGN's block states: while no write was collected
+    // since `generation` its blocks are clean and `buffer` is current; after one the import is the
+    // newest content (the walk-based form never withholds a GPU write from guest memory, so no block
+    // is GPU-owned yet and CPU reads and waits need nothing from the copy). `currentFrom` is the
+    // serial of the batch whose completion makes `buffer` current: what a wait on a GPU-owned block
+    // will block on once the host write is withheld (DESIGN sections A and C).
+    struct ResidentCopy {
+        std::uint64_t generation;
+        std::uint64_t registryGeneration;
+        std::uint64_t lastUse;
+        std::shared_ptr<Buffer> buffer;
+        // Frames the range was bound in, the frame of the last fill and of the last refusal.
+        std::uint64_t frames = 1;
+        std::uint64_t filled = std::numeric_limits<std::uint64_t>::max();
+        std::uint64_t refused = std::numeric_limits<std::uint64_t>::max();
+        std::uint64_t currentFrom = 0;
+        // Whether `buffer` holds the range's newest bytes as of the last check, and the last answer
+        // with the tracker state (generation, collect epoch, registry) it was given in.
+        bool current = false;
+        bool answered = false;
+        std::array<std::uint64_t, 3> answeredAt{};
+    };
+    std::map<std::pair<std::uint64_t, std::size_t>, ResidentCopy> residentCopies;
+    std::size_t residentBytes = 0;
+    void dropResidentCopy(ResidentCopy& entry, std::size_t bytes);
+    bool makeResidentRoom(std::size_t bytes, std::uint64_t frame);
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     std::size_t ownedDrawInputs = 0;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);

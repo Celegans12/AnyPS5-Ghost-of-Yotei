@@ -13,6 +13,7 @@
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "DirectPath.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
@@ -3561,6 +3562,169 @@ void Recorder::eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterat
     drawSnapshots.erase(entry);
 }
 
+namespace {
+struct ResidentStats {
+    std::atomic<std::uint64_t> served{0};
+    std::atomic<std::uint64_t> filled{0};
+    std::atomic<std::uint64_t> filledBytes{0};
+    std::atomic<std::uint64_t> dropped{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::uint64_t> stale{0};
+    std::atomic<std::int64_t> reportedMs{0};
+};
+
+ResidentStats& Residents() {
+    static ResidentStats stats;
+    return stats;
+}
+}
+
+void Recorder::dropResidentCopy(ResidentCopy& entry, std::size_t bytes) {
+    if (entry.buffer == nullptr) return;
+    entry.buffer.reset();
+    residentBytes -= bytes;
+    Residents().dropped.fetch_add(1, std::memory_order_relaxed);
+}
+
+// Room for a new copy of `bytes`: the least recently used copies no draw of this or the previous
+// frame bound are dropped first.
+bool Recorder::makeResidentRoom(std::size_t bytes, std::uint64_t frame) {
+    while (residentBytes + bytes > ResidentBudget) {
+        auto victim = residentCopies.end();
+        for (auto entry = residentCopies.begin(); entry != residentCopies.end(); ++entry) {
+            if (entry->second.buffer == nullptr || entry->second.lastUse + 1 >= frame) continue;
+            if (victim == residentCopies.end() || entry->second.lastUse < victim->second.lastUse) victim = entry;
+        }
+        if (victim == residentCopies.end()) return false;
+        dropResidentCopy(victim->second, victim->first.second);
+        residentCopies.erase(victim);
+    }
+    return true;
+}
+
+std::shared_ptr<Buffer> Recorder::ResidentDrawBuffer(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration) {
+    static const bool enabled = ShaderRecompiler::DirectPath::Enabled() && std::getenv("APS5_DIRECT_NO_RESIDENT") == nullptr;
+    if (!enabled || bytes < ResidentMinBytes || bytes > ResidentBudget || !GuestMemory::WriteWatched()) return {};
+    auto& stats = Residents();
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) {
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = stats.reportedMs.load(std::memory_order_relaxed);
+        if (nowMs - last >= 10000 && stats.reportedMs.compare_exchange_strong(last, nowMs)) {
+            std::size_t held = 0;
+            for (const auto& [key, entry] : residentCopies) held += entry.buffer != nullptr ? 1 : 0;
+            AgcDriver::ProfilePrint_nid_no_patch("[resident] %zu copies holding %.1f MiB of %zu ranges seen; cumulative: %llu binds served, %llu fills (%.1f MiB), %llu binds read the import after a second write in a frame, %llu dropped, %llu refused\n", held, residentBytes / 1048576.0, residentCopies.size(), static_cast<unsigned long long>(stats.served.load()), static_cast<unsigned long long>(stats.filled.load()), stats.filledBytes.load() / 1048576.0, static_cast<unsigned long long>(stats.stale.load()), static_cast<unsigned long long>(stats.dropped.load()), static_cast<unsigned long long>(stats.refused.load()));
+        }
+    }
+    const auto frame = HostImportFramesEnded();
+    const std::pair<std::uint64_t, std::size_t> key{address, bytes};
+    auto found = residentCopies.find(key);
+    // The answer stands while the tracker made no collect and no mark since it was given (every one
+    // bumps its generation) in the same collect epoch: no tracker query per bind.
+    const std::array<std::uint64_t, 3> state{GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
+    if (found != residentCopies.end() && found->second.answeredAt == state && found->second.lastUse == frame) {
+        if (!found->second.answered) return {};
+        stats.served.fetch_add(1, std::memory_order_relaxed);
+        return found->second.buffer;
+    }
+    const auto generation = GuestMemory::CollectWrites(address, bytes);
+    if (generation == 0) return {};
+    // Noted on every return below: the answer and the tracker state it was given in.
+    struct Answer {
+        Recorder& recorder;
+        const std::pair<std::uint64_t, std::size_t>& key;
+        std::uint64_t epoch;
+        std::uint64_t registry;
+        ~Answer() {
+            const auto entry = recorder.residentCopies.find(key);
+            if (entry == recorder.residentCopies.end()) return;
+            entry->second.answeredAt = {GuestMemory::TrackerGeneration(), epoch, registry};
+            entry->second.answered = entry->second.buffer != nullptr && entry->second.current;
+        }
+    } answer{*this, key, state[1], registryGeneration};
+    if (found == residentCopies.end()) {
+        if (residentCopies.size() >= ResidentEntries) {
+            for (auto entry = residentCopies.begin(); entry != residentCopies.end();) {
+                if (entry->second.lastUse + 2 < frame) {
+                    dropResidentCopy(entry->second, entry->first.second);
+                    entry = residentCopies.erase(entry);
+                } else {
+                    ++entry;
+                }
+            }
+            if (residentCopies.size() >= ResidentEntries) return {};
+        }
+        residentCopies.emplace(key, ResidentCopy{generation, registryGeneration, frame, nullptr});
+        return {};
+    }
+    auto& entry = found->second;
+    entry.current = false;
+    if (entry.lastUse != frame) ++entry.frames;
+    entry.lastUse = frame;
+    if (entry.registryGeneration != registryGeneration || !GuestMemory::UnchangedSince(address, bytes, entry.generation)) {
+        // A write was collected over the range (the CPU's, or a GPU write the driver marked when it
+        // recorded it): the import holds the newest bytes. The copy is filled again, once per frame;
+        // after a second write in the frame the range reads the import until the next frame.
+        if (entry.registryGeneration != registryGeneration) {
+            // The mapping changed: the range may be other memory now.
+            dropResidentCopy(entry, bytes);
+            entry.frames = 1;
+            entry.registryGeneration = registryGeneration;
+        }
+        if (entry.buffer == nullptr) entry.generation = generation;
+        if (entry.frames < ResidentFrames || entry.filled == frame) {
+            if (entry.buffer != nullptr) stats.stale.fetch_add(1, std::memory_order_relaxed);
+            return {};
+        }
+    } else if (entry.buffer != nullptr) {
+        entry.current = true;
+        stats.served.fetch_add(1, std::memory_order_relaxed);
+        return entry.buffer;
+    } else if (entry.frames < ResidentFrames || entry.refused == frame) {
+        return {};
+    }
+    const auto* import = ExistingHostImportFor(context, address, bytes);
+    if (import == nullptr || (entry.buffer == nullptr && !makeResidentRoom(bytes, frame))) {
+        entry.refused = frame;
+        stats.refused.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    const bool held = entry.buffer != nullptr;
+    std::shared_ptr<Buffer> buffer = entry.buffer;
+    try {
+        if (!held) buffer = Buffer::WithinDeviceLocalHeadroom(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+    } catch (const std::exception&) {
+    }
+    if (buffer == nullptr) {
+        // No device memory to be had now: asked again next frame, not per draw.
+        entry.refused = frame;
+        stats.refused.fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    const auto source = import->buffer;
+    const auto sourceOffset = HostImportOffset(*import, address);
+    // A queued DCC key store or label store over the range lands before the copy reads it.
+    FlushKeyStoresOverlapping(address, bytes);
+    FlushStoresOverlapping(address, bytes);
+    const auto commands = Commands();
+    Keep(buffer);
+    open->residentFills.push_back(key);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    CopyBuffer(context, commands, source, sourceOffset, buffer->Handle(), 0, bytes);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    found = residentCopies.find(key);
+    if (found == residentCopies.end()) return {};
+    found->second.buffer = buffer;
+    found->second.generation = generation;
+    found->second.filled = frame;
+    found->second.currentFrom = OpenSerial();
+    found->second.current = true;
+    if (!held) residentBytes += bytes;
+    stats.filled.fetch_add(1, std::memory_order_relaxed);
+    stats.filledBytes.fetch_add(bytes, std::memory_order_relaxed);
+    return buffer;
+}
+
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
     const VkDeviceSize alignment = std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 16);
     auto offset = (drawUploadUsed + alignment - 1) & ~(alignment - 1);
@@ -5214,6 +5378,17 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 }
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
+    // A resident copy whose fill was never submitted holds nothing; neither may the per-stamp memo.
+    if (!batch->residentFills.empty()) {
+        for (const auto& key : batch->residentFills) {
+            if (const auto found = residentCopies.find(key); found != residentCopies.end()) {
+                dropResidentCopy(found->second, key.second);
+                residentCopies.erase(found);
+            }
+        }
+        unwrittenSnapshots.clear();
+        unwrittenBytes = 0;
+    }
     removeLabels(*batch);
     if (batch->completionLabelCount != 0) completionLabels.fetch_sub(batch->completionLabelCount, std::memory_order_acq_rel);
     if (batch->completionStoreCount != 0) completionStores.fetch_sub(batch->completionStoreCount, std::memory_order_acq_rel);
