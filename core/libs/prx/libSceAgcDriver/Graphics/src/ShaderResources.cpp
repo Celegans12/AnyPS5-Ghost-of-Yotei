@@ -2887,7 +2887,7 @@ void ShaderResources::buildComplete() {
         requireGuestBuffers();
         guestMemory.UploadFinish(usesBda, htileClear);
         timing.uploadMs += phase(BuildPhase::Upload);
-        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, faultReportOnly);
+        if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory, faultReportOnly, drawBuild && bdaReadOnly);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context, faultReportOnly);
         if (bda) bda->SetSrtGuards(std::move(srtGuardFaults));
         finishImageTables();
@@ -7443,6 +7443,10 @@ void ShaderResources::WriteBackBuffers() {
 
 std::span<const std::byte> ShaderResources::AddressTableBytes() const {
     return bda != nullptr ? bda->TableBytes() : std::span<const std::byte>{};
+}
+
+std::span<const std::shared_ptr<ResidentRange>> ShaderResources::ResidentRanges() const {
+    return bda != nullptr ? bda->ResidentRanges() : std::span<const std::shared_ptr<ResidentRange>>{};
 }
 
 bool ShaderResources::AddressTableGuardCurrent() {

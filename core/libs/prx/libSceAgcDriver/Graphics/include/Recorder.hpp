@@ -29,6 +29,7 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
+struct ResidentRange;
 class DeviceBuffer;
 
 class CommandState {
@@ -241,6 +242,20 @@ public:
     static constexpr std::size_t ResidentEntries = 4096;
     static constexpr std::uint64_t ResidentFrames = 3;
     std::shared_ptr<Buffer> ResidentDrawBuffer(std::uint64_t address, std::size_t bytes, std::uint64_t registryGeneration);
+    // rewrite/direct (DESIGN section B, second step): guest memory read-only draws reach through the
+    // address table. Called before such a draw is recorded, with the copies its table names and its
+    // index range. Every named copy is brought up to date once per frame: the 64 KiB blocks with a
+    // collected write since its last fill are copied from the import into the open batch (writes
+    // pending later in the frame are allowed, per the section B rule). The ResidentWindowBytes
+    // window around the index range, once such draws used it in ResidentFrames frames, gets a copy
+    // and is published for the tables built from then on (BdaResources::PublishResidentRanges). A
+    // window whose refills copy more than twice its size within ResidentChurnWindow frames, or
+    // unused for ResidentIdleFrames, leaves the published set. The copies count against
+    // ResidentBudget. APS5_DIRECT_NO_RESIDENT_READS=1 is the A/B lever.
+    static constexpr std::size_t ResidentWindowBytes = std::size_t{32} << 20u;
+    static constexpr std::uint64_t ResidentIdleFrames = 120;
+    static constexpr std::uint64_t ResidentChurnWindow = 32;
+    void UseResidentRanges(std::span<const std::shared_ptr<ResidentRange>> named, std::uint64_t indexAddress, std::uint64_t indexBytes);
     std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr);
     struct OwnedDrawInputProof {
         std::vector<std::uint64_t> words;
@@ -745,6 +760,7 @@ private:
         std::vector<std::shared_ptr<void>> kept;
         // Resident copies whose fill this batch records: dropped if the batch is discarded.
         std::vector<std::pair<std::uint64_t, std::size_t>> residentFills;
+        std::vector<std::shared_ptr<ResidentRange>> residentRangeFills;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
@@ -1125,6 +1141,22 @@ private:
     std::map<std::pair<std::uint64_t, std::size_t>, ResidentCopy> residentCopies;
     std::size_t residentBytes = 0;
     void dropResidentCopy(ResidentCopy& entry, std::size_t bytes);
+    // Windows around the index data of read-only address draws, by window begin.
+    struct ResidentWindow {
+        std::uint64_t frames = 0;
+        std::uint64_t lastUse = std::numeric_limits<std::uint64_t>::max();
+        std::uint64_t refused = std::numeric_limits<std::uint64_t>::max();
+        // A window that kept changing is not copied again before this frame.
+        std::uint64_t barredUntil = 0;
+        std::shared_ptr<ResidentRange> copy;
+    };
+    std::map<std::uint64_t, ResidentWindow> residentWindows;
+    std::size_t residentWindowBytes = 0;
+    std::uint64_t residentWindowsSwept = 0;
+    void refreshResidentRange(const std::shared_ptr<ResidentRange>& range, std::uint64_t frame, std::uint64_t registryGeneration);
+    void noteResidentWindow(std::uint64_t begin, std::uint64_t indexAddress, std::uint64_t indexBytes, std::uint64_t frame);
+    void sweepResidentWindows(std::uint64_t frame);
+    void publishResidentWindows();
     bool makeResidentRoom(std::size_t bytes, std::uint64_t frame);
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     std::size_t ownedDrawInputs = 0;

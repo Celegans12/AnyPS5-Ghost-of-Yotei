@@ -3,6 +3,8 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "Recompiler.hpp"
+#include <array>
+#include <limits>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -17,10 +19,46 @@ bool LoopGuardTripped();
 
 struct BdaFaultChunk;
 
+// rewrite/direct (DESIGN section B, second step): a device-local copy of a window of guest memory
+// that read-only draws reach through the address table. The table of such a draw names the copy
+// instead of the host import, and holds it: the recorder brings every copy a draw's table names up
+// to date before the draw (Recorder::UseResidentRanges). The fields after `buffer` belong to that
+// recorder.
+struct ResidentRange {
+    std::uint64_t begin = 0;
+    std::uint64_t end = 0;
+    std::shared_ptr<Buffer> buffer;
+    // Tracker generation of the last fill, and the guest mapping generation it was made under.
+    std::uint64_t generation = 0;
+    std::uint64_t registryGeneration = 0;
+    // The whole range is copied at the next use (new, remapped, or its fill was never submitted).
+    bool refill = true;
+    // No table may name the copy any more (its import is gone): it left the published set.
+    bool dead = false;
+    std::uint64_t lastUse = 0;
+    // The batch that last kept `buffer` alive for its draws.
+    std::uint64_t keptSerial = 0;
+    // The last check and the tracker state (generation, collect epoch, registry) it was made in.
+    std::uint64_t checkedFrame = std::numeric_limits<std::uint64_t>::max();
+    std::array<std::uint64_t, 3> checkedAt{};
+    // Frames with a fill, for the "keeps changing" rule.
+    std::uint64_t filledFrame = std::numeric_limits<std::uint64_t>::max();
+    std::uint32_t filledFrames = 0;
+    std::uint64_t countedFrom = 0;
+    // Bytes copied in since countedFrom: a window is dropped for its refill cost, not for how often
+    // a few blocks of it change.
+    std::uint64_t filledBytes = 0;
+};
+
 class BdaResources {
 public:
     explicit BdaResources(const Context& context, bool reportOnly = false);
-    BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly = false);
+    // `residentReads`: the table is for a read-only draw and names the published resident ranges.
+    BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly = false, bool residentReads = false);
+    // The set tables of read-only draws are built with from now on; a table built with another set
+    // fails TableGuardCurrent, so its draw builds a new one. A table in use is never rewritten.
+    static void PublishResidentRanges(VkDevice device, std::vector<std::shared_ptr<ResidentRange>> ranges);
+    std::span<const std::shared_ptr<ResidentRange>> ResidentRanges() const { return residentRanges; }
     ~BdaResources();
     BdaResources(const BdaResources&) = delete;
     BdaResources& operator=(const BdaResources&) = delete;
@@ -90,6 +128,9 @@ private:
     std::uint64_t lastUse = 0;
     std::size_t tableBytes = 0;
     std::uint64_t tableGuardSerial = 0;
+    bool residentReads = false;
+    std::uint64_t residentSerial = 0;
+    std::vector<std::shared_ptr<ResidentRange>> residentRanges;
     std::vector<ImageTableFaults> imageTables;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> imageTableRanges;
     std::vector<SrtGuardFaults> srtGuards;

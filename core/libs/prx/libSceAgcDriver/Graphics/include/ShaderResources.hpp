@@ -299,6 +299,8 @@ public:
     bool SpaceReuse() const { return spaceReuse; }
     static bool SpaceReuseDisabled();
     bool BdaReadOnly() const { return usesBda && bdaReadOnly; }
+    // The device-local copies this draw's address table names (DESIGN section B, second step).
+    std::span<const std::shared_ptr<ResidentRange>> ResidentRanges() const;
     bool RetakeSpace() { return guestMemory.RetakeSpace(); }
     bool SpaceHeld() const { return guestMemory.SpaceHeld(); }
     SnapshotService SnapshotsServedInPlace(std::span<const GuestMemorySnapshot> snapshots) const { return guestMemory.SnapshotsServedInPlace(snapshots); }

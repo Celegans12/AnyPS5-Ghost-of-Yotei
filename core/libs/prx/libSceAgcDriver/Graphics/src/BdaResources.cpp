@@ -310,12 +310,69 @@ bool BdaResources::TakeFaultSlot(const Context& context) {
     return true;
 }
 
-BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly) : BdaResources(context, reportOnly) {
+namespace {
+
+// The resident ranges tables of read-only draws are built with (ascending, not overlapping).
+struct PublishedResidents {
+    std::mutex mutex;
+    VkDevice device = VK_NULL_HANDLE;
+    std::vector<std::shared_ptr<ResidentRange>> ranges;
+    std::atomic<std::uint64_t> serial{0};
+};
+
+PublishedResidents& Published() {
+    static PublishedResidents state;
+    return state;
+}
+
+// `ranges` with every resident range that lies inside one readable range cut out of it and pointed
+// at its copy; `used` receives the copies the result names.
+std::vector<ShaderRecompiler::BdaAbi::Range> nameResidentRanges(std::span<const ShaderRecompiler::BdaAbi::Range> ranges, std::span<const std::shared_ptr<ResidentRange>> resident, std::vector<std::shared_ptr<ResidentRange>>& used) {
+    std::vector<ShaderRecompiler::BdaAbi::Range> out;
+    out.reserve(ranges.size() + 2 * resident.size());
+    for (auto range : ranges) {
+        if ((range.permissions & ShaderRecompiler::BdaAbi::Read) != 0) {
+            for (const auto& copy : resident) {
+                if (copy->begin < range.begin || copy->end > range.end) continue;
+                if (copy->begin > range.begin) out.push_back({range.begin, copy->begin, range.deviceAddress, range.permissions, 0});
+                out.push_back({copy->begin, copy->end, copy->buffer->DeviceAddress(), ShaderRecompiler::BdaAbi::Read, 0});
+                used.push_back(copy);
+                range.deviceAddress += copy->end - range.begin;
+                range.begin = copy->end;
+            }
+        }
+        if (range.begin < range.end) out.push_back(range);
+    }
+    return out;
+}
+
+}
+
+void BdaResources::PublishResidentRanges(VkDevice device, std::vector<std::shared_ptr<ResidentRange>> ranges) {
+    std::sort(ranges.begin(), ranges.end(), [](const auto& left, const auto& right) { return left->begin < right->begin; });
+    auto& state = Published();
+    std::lock_guard lock(state.mutex);
+    state.device = device;
+    state.ranges = std::move(ranges);
+    state.serial.fetch_add(1, std::memory_order_release);
+}
+
+BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memory, bool reportOnly, bool residentReads) : BdaResources(context, reportOnly) {
     const auto cached = memory.CachedAddressTable();
     std::vector<ShaderRecompiler::BdaAbi::Range> built;
     if (!cached.has_value()) built = memory.AddressRanges();
     const auto& addressRanges = cached.has_value() ? *cached->ranges : built;
-    const auto serial = cached.has_value() ? cached->serial : 0;
+    this->residentReads = residentReads;
+    std::vector<std::shared_ptr<ResidentRange>> resident;
+    if (residentReads) {
+        auto& state = Published();
+        std::lock_guard lock(state.mutex);
+        residentSerial = state.serial.load(std::memory_order_acquire);
+        if (state.device == context.device) resident = state.ranges;
+    }
+    // A table that names copies is found by its content only: the space serial stands for the
+    // imports' addresses.
+    const auto serial = cached.has_value() && resident.empty() ? cached->serial : 0;
     auto guardSerial = MultisampleTargetRangeGeneration();
     if (tableCacheEnabled() && serial != 0) {
         auto& cache = Tables();
@@ -342,7 +399,9 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
     }
     auto filtered = ExcludeMultisampleTargetRanges(context.device, addressRanges, guardSerial);
     tableGuardSerial = guardSerial;
-    const auto& ranges = filtered.has_value() ? *filtered : addressRanges;
+    std::vector<ShaderRecompiler::BdaAbi::Range> named;
+    if (!resident.empty()) named = nameResidentRanges(filtered.has_value() ? std::span<const ShaderRecompiler::BdaAbi::Range>(*filtered) : std::span<const ShaderRecompiler::BdaAbi::Range>(addressRanges), resident, residentRanges);
+    const auto& ranges = !residentRanges.empty() ? named : filtered.has_value() ? *filtered : addressRanges;
     Require(ranges.size() <= std::numeric_limits<std::uint32_t>::max(), "BDA table range count overflow");
     Require(ranges.size() <= (std::numeric_limits<std::size_t>::max() - sizeof(ShaderRecompiler::BdaAbi::Header)) / sizeof(ShaderRecompiler::BdaAbi::Range), "BDA table size overflow");
     tableBytes = sizeof(ShaderRecompiler::BdaAbi::Header) + ranges.size() * sizeof(ShaderRecompiler::BdaAbi::Range);
@@ -405,7 +464,7 @@ BdaResources::BdaResources(const Context& context, const GuestBufferMemory& memo
             cache.entries.clear();
             cache.device = context.device;
         }
-        auto cachedRanges = filtered.has_value() ? std::move(*filtered) : cached.has_value() ? *cached->ranges : std::move(built);
+        auto cachedRanges = !residentRanges.empty() ? std::move(named) : filtered.has_value() ? std::move(*filtered) : cached.has_value() ? *cached->ranges : std::move(built);
         cache.entries.push_front({hash, std::move(cachedRanges), table, {}});
         if (serial != 0) cache.entries.front().spaceKeys.emplace_back(serial, guardSerial);
         while (cache.entries.size() > tableCacheEntries()) cache.entries.pop_back();
@@ -433,7 +492,11 @@ std::span<const std::byte> BdaResources::TableBytes() const {
 }
 
 bool BdaResources::TableGuardCurrent(VkDevice device, std::span<const ShaderRecompiler::BdaAbi::Range> ranges) {
+    // Built with another set of resident ranges: the draw builds a new table.
+    if (table != nullptr && residentReads && residentSerial != Published().serial.load(std::memory_order_acquire)) return false;
     if (table == nullptr || tableGuardSerial == MultisampleTargetRangeGeneration()) return true;
+    // A table that names copies is not the guest's ranges; it is built again with the new guard.
+    if (!residentRanges.empty()) return false;
     auto generation = tableGuardSerial;
     const auto filtered = ExcludeMultisampleTargetRanges(device, ranges, generation);
     const auto expected = filtered.has_value() ? std::span<const ShaderRecompiler::BdaAbi::Range>(*filtered) : ranges;

@@ -1394,6 +1394,11 @@ Recorder::~Recorder() {
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[gpu] recorder teardown: %s\n", error.what());
     }
+    // The published copies are this recorder's and die with it.
+    if (!residentWindows.empty()) {
+        residentWindows.clear();
+        publishResidentWindows();
+    }
     ForgetHtileMasks_nid_no_patch(id);
     progressWatcher.reset();
     holdKept.clear();
@@ -3589,7 +3594,7 @@ void Recorder::dropResidentCopy(ResidentCopy& entry, std::size_t bytes) {
 // Room for a new copy of `bytes`: the least recently used copies no draw of this or the previous
 // frame bound are dropped first.
 bool Recorder::makeResidentRoom(std::size_t bytes, std::uint64_t frame) {
-    while (residentBytes + bytes > ResidentBudget) {
+    while (residentBytes + residentWindowBytes + bytes > ResidentBudget) {
         auto victim = residentCopies.end();
         for (auto entry = residentCopies.begin(); entry != residentCopies.end(); ++entry) {
             if (entry->second.buffer == nullptr || entry->second.lastUse + 1 >= frame) continue;
@@ -3723,6 +3728,228 @@ std::shared_ptr<Buffer> Recorder::ResidentDrawBuffer(std::uint64_t address, std:
     stats.filled.fetch_add(1, std::memory_order_relaxed);
     stats.filledBytes.fetch_add(bytes, std::memory_order_relaxed);
     return buffer;
+}
+
+namespace {
+struct ResidentWindowStats {
+    std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> named{0};
+    std::atomic<std::uint64_t> checks{0};
+    std::atomic<std::uint64_t> fills{0};
+    std::atomic<std::uint64_t> wholeFills{0};
+    std::atomic<std::uint64_t> filledBytes{0};
+    std::atomic<std::uint64_t> made{0};
+    std::atomic<std::uint64_t> idle{0};
+    std::atomic<std::uint64_t> churned{0};
+    std::atomic<std::uint64_t> lost{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::int64_t> reportedMs{0};
+};
+
+ResidentWindowStats& ResidentWindows() {
+    static ResidentWindowStats stats;
+    return stats;
+}
+}
+
+void Recorder::publishResidentWindows() {
+    std::vector<std::shared_ptr<ResidentRange>> ranges;
+    for (const auto& [begin, window] : residentWindows) {
+        if (window.copy != nullptr && !window.copy->dead) ranges.push_back(window.copy);
+    }
+    BdaResources::PublishResidentRanges(context.device, std::move(ranges));
+}
+
+void Recorder::refreshResidentRange(const std::shared_ptr<ResidentRange>& range, std::uint64_t frame, std::uint64_t registryGeneration) {
+    auto& stats = ResidentWindows();
+    stats.checks.fetch_add(1, std::memory_order_relaxed);
+    const auto bytes = static_cast<std::size_t>(range->end - range->begin);
+    const auto generation = GuestMemory::CollectWrites(range->begin, bytes);
+    // Not provable without the write watch; after a change of the guest mappings the range may be
+    // other memory.
+    if (generation == 0 || range->registryGeneration != registryGeneration) range->refill = true;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    if (range->refill) {
+        runs.emplace_back(range->begin, range->end);
+    } else if (!GuestMemory::UnchangedSince(range->begin, bytes, range->generation)) {
+        const auto blocks = (bytes + 65535u) / 65536u;
+        const std::vector<std::uint64_t> generations(blocks, range->generation);
+        std::vector<std::uint8_t> changed(blocks, GuestMemory::BlockWritten);
+        static_cast<void>(GuestMemory::ChangedBlocks(range->begin, bytes, generations, changed));
+        for (std::size_t block = 0; block < blocks; ++block) {
+            if (changed[block] == GuestMemory::BlockUnchanged) continue;
+            const auto begin = range->begin + block * 65536u;
+            const auto end = std::min<std::uint64_t>(range->end, begin + 65536u);
+            if (!runs.empty() && runs.back().second == begin) runs.back().second = end;
+            else runs.emplace_back(begin, end);
+        }
+    }
+    if (runs.empty()) return;
+    auto* import = ExistingHostImportFor(context, range->begin, bytes);
+    if (import == nullptr) import = HostImportFor(context, range->begin, bytes);
+    if (import == nullptr) {
+        // No source any more: the copy leaves the published set, and tables that name it are built
+        // again (this draw's still reads the copy as last filled).
+        if (!range->dead) {
+            range->dead = true;
+            stats.lost.fetch_add(1, std::memory_order_relaxed);
+            publishResidentWindows();
+        }
+        return;
+    }
+    // A queued DCC key store or label store over the range lands before the copy reads it.
+    FlushKeyStoresOverlapping(range->begin, bytes);
+    FlushStoresOverlapping(range->begin, bytes);
+    const auto commands = Commands();
+    Keep(range->buffer);
+    range->keptSerial = OpenSerial();
+    open->residentRangeFills.push_back(range);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    std::uint64_t copied = 0;
+    for (const auto& [begin, end] : runs) {
+        CopyBuffer(context, commands, import->buffer, HostImportOffset(*import, begin), range->buffer->Handle(), begin - range->begin, end - begin);
+        copied += end - begin;
+    }
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    if (range->refill) stats.wholeFills.fetch_add(1, std::memory_order_relaxed);
+    stats.fills.fetch_add(1, std::memory_order_relaxed);
+    stats.filledBytes.fetch_add(copied, std::memory_order_relaxed);
+    range->generation = generation;
+    range->registryGeneration = registryGeneration;
+    range->refill = generation == 0;
+    if (frame - range->countedFrom >= ResidentChurnWindow) {
+        range->countedFrom = frame;
+        range->filledFrames = 0;
+        range->filledBytes = 0;
+    }
+    if (range->filledFrame != frame) {
+        range->filledFrame = frame;
+        ++range->filledFrames;
+    }
+    range->filledBytes += copied;
+}
+
+void Recorder::noteResidentWindow(std::uint64_t begin, std::uint64_t indexAddress, std::uint64_t indexBytes, std::uint64_t frame) {
+    auto& window = residentWindows[begin];
+    if (window.lastUse != frame) {
+        ++window.frames;
+        window.lastUse = frame;
+    }
+    if (window.copy != nullptr || window.frames < ResidentFrames || window.refused == frame || frame < window.barredUntil) return;
+    auto& stats = ResidentWindows();
+    // The window is cut to the import that serves the index data, on tracker block bounds.
+    const auto pieceBegin = std::max(begin, indexAddress);
+    const auto pieceEnd = std::min(begin + ResidentWindowBytes, indexAddress + indexBytes);
+    const auto* import = pieceBegin < pieceEnd ? ExistingHostImportFor(context, pieceBegin, static_cast<std::size_t>(pieceEnd - pieceBegin)) : nullptr;
+    std::shared_ptr<Buffer> buffer;
+    std::uint64_t from = 0;
+    std::uint64_t to = 0;
+    if (import != nullptr) {
+        from = std::max(begin, (import->base + 65535u) & ~std::uint64_t{65535});
+        to = std::min(begin + ResidentWindowBytes, (import->base + import->bytes) & ~std::uint64_t{65535});
+    }
+    if (from < to && residentBytes + residentWindowBytes + (to - from) <= ResidentBudget) {
+        try {
+            buffer = Buffer::WithinDeviceLocalHeadroom(context, static_cast<std::size_t>(to - from), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        } catch (const std::exception&) {
+        }
+    }
+    if (buffer == nullptr) {
+        // Asked again next frame, not per draw.
+        window.refused = frame;
+        stats.refused.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    window.copy = std::make_shared<ResidentRange>();
+    window.copy->begin = from;
+    window.copy->end = to;
+    window.copy->buffer = std::move(buffer);
+    window.copy->lastUse = frame;
+    window.copy->countedFrom = frame;
+    residentWindowBytes += static_cast<std::size_t>(to - from);
+    stats.made.fetch_add(1, std::memory_order_relaxed);
+    publishResidentWindows();
+}
+
+void Recorder::sweepResidentWindows(std::uint64_t frame) {
+    auto& stats = ResidentWindows();
+    bool changed = false;
+    for (auto entry = residentWindows.begin(); entry != residentWindows.end();) {
+        auto& window = entry->second;
+        if (window.copy == nullptr) {
+            if (window.lastUse + ResidentIdleFrames < frame && window.barredUntil <= frame) entry = residentWindows.erase(entry);
+            else ++entry;
+            continue;
+        }
+        // Refills copy only the changed blocks; a window churns when they add up to more than twice
+        // its size within one count window (the first whole fill is one of those sizes).
+        const bool churns = window.copy->filledBytes > 2 * (window.copy->end - window.copy->begin);
+        const bool idle = window.copy->lastUse + ResidentIdleFrames < frame && window.lastUse + ResidentIdleFrames < frame;
+        if (window.copy->dead || churns || idle) {
+            if (churns) {
+                window.barredUntil = frame + 20 * ResidentIdleFrames;
+                stats.churned.fetch_add(1, std::memory_order_relaxed);
+            } else if (idle) {
+                stats.idle.fetch_add(1, std::memory_order_relaxed);
+            }
+            residentWindowBytes -= static_cast<std::size_t>(window.copy->end - window.copy->begin);
+            window.copy.reset();
+            window.frames = 0;
+            changed = true;
+        }
+        ++entry;
+    }
+    if (changed) publishResidentWindows();
+}
+
+void Recorder::UseResidentRanges(std::span<const std::shared_ptr<ResidentRange>> named, std::uint64_t indexAddress, std::uint64_t indexBytes) {
+    auto& stats = ResidentWindows();
+    const auto frame = HostImportFramesEnded();
+    stats.draws.fetch_add(1, std::memory_order_relaxed);
+    if (!named.empty()) {
+        stats.named.fetch_add(1, std::memory_order_relaxed);
+        const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        const auto serial = OpenSerial();
+        for (const auto& range : named) {
+            range->lastUse = frame;
+            // The answer stands while the tracker made no collect and no mark since the check began
+            // (every one bumps its generation), in the same collect epoch and frame.
+            const std::array<std::uint64_t, 3> state{GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
+            // Rule (DESIGN section B): refilled once per frame after a write; writes still pending in
+            // the frame are allowed. A mapping change still forces a check (refill).
+            if (range->refill || range->checkedFrame != frame || range->checkedAt[2] != state[2]) {
+                refreshResidentRange(range, frame, registryGeneration);
+                range->checkedFrame = frame;
+                range->checkedAt = state;
+            }
+            if (range->keptSerial != serial) {
+                Keep(range->buffer);
+                range->keptSerial = OpenSerial();
+            }
+        }
+    }
+    static const bool enabled = ShaderRecompiler::DirectPath::Enabled() && std::getenv("APS5_DIRECT_NO_RESIDENT") == nullptr && std::getenv("APS5_DIRECT_NO_RESIDENT_READS") == nullptr;
+    if (!enabled || !GuestMemory::WriteWatched()) return;
+    if (residentWindowsSwept != frame) {
+        residentWindowsSwept = frame;
+        sweepResidentWindows(frame);
+    }
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (profile) {
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = stats.reportedMs.load(std::memory_order_relaxed);
+        if (nowMs - last >= 10000 && stats.reportedMs.compare_exchange_strong(last, nowMs)) {
+            std::size_t held = 0;
+            for (const auto& [begin, window] : residentWindows) held += window.copy != nullptr ? 1 : 0;
+            for (const auto& [begin, window] : residentWindows) {
+                if (window.copy != nullptr) AgcDriver::ProfilePrint_nid_no_patch("[resident-reads] window 0x%llx..0x%llx held, filled in %u of the last frames (%.1f MiB), last use frame %llu of %llu\n", static_cast<unsigned long long>(window.copy->begin), static_cast<unsigned long long>(window.copy->end), window.copy->filledFrames, window.copy->filledBytes / 1048576.0, static_cast<unsigned long long>(window.copy->lastUse), static_cast<unsigned long long>(frame));
+                else AgcDriver::ProfilePrint_nid_no_patch("[resident-reads] window 0x%llx not held: used in %llu frames, barred until frame %llu of %llu\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(window.frames), static_cast<unsigned long long>(window.barredUntil), static_cast<unsigned long long>(frame));
+            }
+            AgcDriver::ProfilePrint_nid_no_patch("[resident-reads] %zu windows holding %.1f MiB of %zu seen; cumulative: %llu read-only address draws, %llu with copies in their table, %llu checks, %llu fills (%llu whole, %.1f MiB), %llu made, %llu left idle, %llu left changing, %llu lost their import, %llu refused\n", held, residentWindowBytes / 1048576.0, residentWindows.size(), static_cast<unsigned long long>(stats.draws.load()), static_cast<unsigned long long>(stats.named.load()), static_cast<unsigned long long>(stats.checks.load()), static_cast<unsigned long long>(stats.fills.load()), static_cast<unsigned long long>(stats.wholeFills.load()), stats.filledBytes.load() / 1048576.0, static_cast<unsigned long long>(stats.made.load()), static_cast<unsigned long long>(stats.idle.load()), static_cast<unsigned long long>(stats.churned.load()), static_cast<unsigned long long>(stats.lost.load()), static_cast<unsigned long long>(stats.refused.load()));
+        }
+    }
+    if (indexBytes == 0) return;
+    for (auto begin = indexAddress & ~std::uint64_t{ResidentWindowBytes - 1}; begin < indexAddress + indexBytes; begin += ResidentWindowBytes) noteResidentWindow(begin, indexAddress, indexBytes, frame);
 }
 
 Recorder::UploadSlice Recorder::DrawUpload(std::size_t bytes) {
@@ -5379,6 +5606,10 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
     // A resident copy whose fill was never submitted holds nothing; neither may the per-stamp memo.
+    for (const auto& range : batch->residentRangeFills) {
+        range->refill = true;
+        range->checkedAt = {};
+    }
     if (!batch->residentFills.empty()) {
         for (const auto& key : batch->residentFills) {
             if (const auto found = residentCopies.find(key); found != residentCopies.end()) {

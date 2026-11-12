@@ -299,6 +299,66 @@ record also keeps the serial of the batch whose completion makes the copy curren
 withholds the host write (GPU-owned), a wait on such a block blocks on that batch (section C,
 third rule) and never polls.
 
+### Section B, second step: mesh data read through the address table (2026-11-12)
+
+Measured first (experiments only, saved as `probe-patches\xlocal-placement-and-xprobe.patch` and
+`probe-patches\vertex-pointer-reads-ceiling.patch`):
+
+- None of the classes listed above is the cost. With small uploads, snapshots, table maps, data
+  buffers, vertex and index snapshots and the address range table all placed in VRAM, the two
+  programs do not change.
+- It is the vertex stage: with a one-pixel scissor the two programs keep about 90 % of their GPU
+  time (369 and 155 us per draw against about 410 and 180).
+- The shared vertex shader (code 0x3f849c900) reads guest memory one byte at a time through the
+  address range table. The draws declare no ranges of their own, so every such read lands in a
+  whole-heap host import (table ranges of 7.7 GiB and 4 GiB).
+- Ceiling: five guessed windows around the index data (304 MiB) held in VRAM and entered in the
+  table. Picture correct; per draw about 400 -> 116 to 236 us and about 180 -> 63 to 166 us, GPU
+  time per 10 s 8.9 s -> 4.4 to 8.3 s depending on the title's camera scene. The windows covered
+  the mesh data only partly.
+
+Step (approved by the user 2026-11-12):
+
+- The class is guest memory that read-only draws reach through the address table. The shader's
+  addresses are not known to the CPU, so the copy set is derived from what is: the index range of
+  each such draw. The fixed-size window of guest memory around an index range that such draws use
+  in 3 frames gets a device-local copy, filled by a GPU copy from the import.
+- The copies are entered in the address table of read-only draws when the table is built. A table
+  is never rewritten while in use (that loses the device); a change of the copy set changes a
+  generation, and a draw whose table is older builds a new one, as it does for the multisample
+  guard.
+- A table that names a copy keeps it alive and current: before a draw that uses the table, the
+  64 KiB blocks with a collected write since the last fill are copied again on the same queue.
+  One upload per change, proportional to the changed bytes.
+- A window whose blocks keep changing (refilled in most frames) leaves the set; so does one that
+  no draw used for some frames. The copies share the 2 GiB budget of the first step.
+- Dispatches and draws that store through addresses keep the imports.
+
+Gate: the two programs near their mirror times (4 to 5 ms per frame), picture unchanged, frame
+time not worse; then one regression pair on FF and LEGO. If the windows around index data do not
+cover the vertex data, the next measurement is which addresses the vertex stage still reads from
+the import (unreadable-outside-copies table, fault addresses), not a larger guess.
+
+Result (2026-11-12, kept):
+
+- The vertex stage's buffer descriptors (SRT probe, `probe-patches\srt-pointer-probe.patch`) name
+  only the two 64 MiB raw buffers that already have copies; the mesh addresses come from pointers
+  loaded inside the shader, so the index range stays the CPU's only handle on them.
+- As first built, 4 of 7 windows (0x3e4, 0x3ec, 0x3f8, 0x43e) were dropped as changing: a few
+  blocks in them are written every frame, and the test counted frames refilled, not bytes. Changed:
+  a window leaves the set when its block refills copy more than twice its size within 32 frames.
+  Now 6 of 7 are held (192 MiB); the hot index windows refill 1 to 9 MiB per 32 frames. 0x3ec
+  (inside the 64 MiB raw buffer area) still churns.
+- The per-draw check ran again whenever the write tracker moved (196k checks in 130 s) and cost
+  about 10 ms of frame time in the CPU-bound scene. Changed to the approved rule: one check per
+  copy per frame (a mapping change still forces one).
+- AoM (no profile flags, head against change): title frame p50 167-178 -> 146-158 ms, GPU per
+  present 178-186 -> 146-151 ms; scene after the pad press frame 153-161 -> 148-158 ms, GPU
+  105-107 -> 81-97 ms. Picture unchanged. Per draw the two programs 408 -> 225 us and 190 -> 133 us;
+  per frame about 26 and 30 -> 13 and 12 ms. FF 32.9 / 33.0 ms, LEGO 49.1 / 48.6 ms (level).
+- Gate not met yet: the two programs are at 12 to 13 ms, not 4 to 5. Next, per the gate: measure
+  which addresses the vertex stage still reads from the import.
+
 ### Phase 1 audit, first pass (2026-11-11)
 
 `relinker --windows --frame-red-zone --dry-run` on each title's executable (LEGO and FF need
