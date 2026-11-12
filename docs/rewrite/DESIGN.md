@@ -248,6 +248,57 @@ dispatches read and the write watch has shown clean for several frames, bind a d
 drop back to the import when a write is collected. Measure on AoM (target: the four buffer-reading
 programs near their mirror times with frame time not worse), then FF and LEGO.
 
+### Section B, first build step: result and rule change (2026-11-12)
+
+The step as written above made no copy on AoM. Its draws read two 64 MiB buffers, used in
+alternate frames, and the GPU itself rewrites each one before the frame that reads it: the driver
+marks all 1,025 blocks written once per frame, none by the CPU. A range like that is never clean
+for several frames. Two thirds of the bindings also had that write still pending when they were
+prepared.
+
+Rule as built (approved by the user 2026-11-12, replaces "clean for several frames, drop on a
+write"):
+
+- A range of at least 64 KiB that draws bind in 3 frames gets a device-local copy, filled by a GPU
+  copy from the import. No host snapshot and no compare.
+- The copy serves every binding while no write is collected over the range.
+- After a collected write the copy is filled again, at most once per frame. A second write in the
+  same frame reads the import until the next frame.
+- A binding prepared while a recorded write is pending may use the copy: the fill is recorded
+  after that write on the same queue.
+- Budget 2 GiB of copies, least recently used first out. `APS5_DIRECT_NO_RESIDENT=1` turns the
+  copies off (A/B lever).
+
+Same build, alternating runs, per frame:
+
+| | Copies off | Copies on |
+|---|---|---|
+| AoM title | 215 to 217 ms | 174 to 181 ms |
+| AoM title, GPU busy | 215 ms | 178 ms |
+| AoM scene after the title (CPU-bound) | 147 to 151 ms | 147 to 155 ms |
+| FF Resonance | 32.8 ms | 32.7 ms |
+| LEGO | 48.0 ms | 48.5 ms (no range qualifies) |
+
+AoM per program (ms per frame, off / on): draw 0x7f8 47.7 / 26.2, draw 0x7f6 44.6 / 29.8, draw
+0x789 10.1 / 8.1, compute 0x3f7a97000 10.6 / 11.2 (dispatches do not use the copies yet). The
+fill costs about 2.6 ms of GPU time per frame (one 64 MiB copy). AoM holds 128 MiB of copies, FF
+17 MiB.
+
+The target (the four programs near their mirror times of 3 to 5 ms) is not met. What the draws
+still read from host memory, per frame on the AoM title: about 2,700 small uploads (1.4 KiB
+each), about 400 host snapshots (15 KiB each), about 2,600 bindings that are not guest memory
+(direct-path data such as table maps, 123 KiB each), and vertex and index data. Next within
+section B, in this order: measure which of these the two programs spend their time on, then move
+that class to device-local memory with one upload per change.
+
+How this feeds section C: each copy's record is kept in the block states' terms. While no write
+is collected since its generation the blocks are clean and the copy is current; after one the
+import holds the newest content. The walk-based form never withholds a GPU write from guest
+memory, so no block is GPU-owned yet and waits and CPU reads need nothing from the copy. The
+record also keeps the serial of the batch whose completion makes the copy current. When phase 4
+withholds the host write (GPU-owned), a wait on such a block blocks on that batch (section C,
+third rule) and never polls.
+
 ### Phase 1 audit, first pass (2026-11-11)
 
 `relinker --windows --frame-red-zone --dry-run` on each title's executable (LEGO and FF need
