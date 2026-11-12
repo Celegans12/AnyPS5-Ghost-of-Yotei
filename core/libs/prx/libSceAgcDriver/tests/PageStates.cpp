@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -78,6 +79,29 @@ void CheckMetadata() {
     const auto queried = PrivateBytes();
     Require(!Accessible(range.Data() + 2 * ChunkGuestBytes, Unit), "reserved fixture tail is accessible");
     Require(PrivateBytes() < queried + (4ull << 20u), "querying reserved pages allocated untouched metadata chunks");
+}
+
+void CheckSparseRanges() {
+    constexpr std::size_t span = 64ull << 30u;
+    Range range(span);
+    range.Commit(0);
+    range.Commit(span - Unit);
+    const auto base = reinterpret_cast<std::uint64_t>(range.Data());
+    Require(Accessible(range.Data(), Unit, true), "sparse fixture start is inaccessible");
+    const auto before = PrivateBytes();
+    const auto start = std::chrono::steady_clock::now();
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> expected{{base, base + Unit}, {base + span - Unit, base + span}};
+    for (unsigned round = 0; round < 128; ++round) {
+        Require(CommittedRanges(base, span, true) == expected, "sparse scan lost committed pages across absent metadata chunks");
+    }
+    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    const auto after = PrivateBytes();
+    const auto added = after > before ? after - before : 0;
+    Require(added < (4ull << 20u), "sparse scans allocated metadata for untouched chunks");
+    range.Commit(span / 2);
+    const std::vector<std::pair<std::uint64_t, std::uint64_t>> committed{{base, base + Unit}, {base + span / 2, base + span / 2 + Unit}, {base + span - Unit, base + span}};
+    Require(CommittedRanges(base, span, true) == committed, "committing inside a skipped chunk retained inaccessible state");
+    std::printf("128 sparse 64 GiB scans: %.3f ms, %zu bytes of private commit\n", ms, added);
 }
 
 void CheckBoundaries() {
@@ -239,6 +263,7 @@ int main(int argc, char** argv) {
     try {
         Require(GuestArena::GuestArenaAvailable_nid_postfix(), "page-state fixture needs the guest arena");
         if (argc == 2 && std::string_view(argv[1]) == "--metadata") CheckMetadata();
+        else if (argc == 2 && std::string_view(argv[1]) == "--sparse-ranges") CheckSparseRanges();
         else if (argc == 2 && std::string_view(argv[1]) == "--runs") CheckRuns();
         else CheckBoundaries();
         return 0;

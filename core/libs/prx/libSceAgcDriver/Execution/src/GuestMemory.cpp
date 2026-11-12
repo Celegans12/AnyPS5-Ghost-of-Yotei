@@ -702,9 +702,14 @@ struct PageSpan {
     void settle(std::size_t first, std::size_t last) {
         std::atomic_thread_fence(std::memory_order_seq_cst);
         for (auto block = first / BlockPages; block <= (last - 1) / BlockPages; ++block) {
-            const auto value = common(block);
             auto* summary = blockEntry(block, false);
-            if (summary == nullptr || loadByte(summary) == value) continue;
+            if (summary == nullptr) {
+                constexpr auto blocksPerChunk = ChunkEntries / BlockPages;
+                block = (block / blocksPerChunk + 1) * blocksPerChunk - 1;
+                continue;
+            }
+            const auto value = common(block);
+            if (loadByte(summary) == value) continue;
             storeByte(summary, value);
             if (value == 0) continue;
             std::atomic_thread_fence(std::memory_order_seq_cst);
