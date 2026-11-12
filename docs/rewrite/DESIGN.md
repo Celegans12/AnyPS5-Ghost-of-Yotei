@@ -3,9 +3,9 @@
 Status: approved by the user 2026-11-11, including the three decisions at the end as recommended
 (red-zone rule reversed for titles that pass the phase 1 gate; LEGO for the GPU track and AoM for
 the coherence track, 007 once it has a repeatable gameplay scene; 30 fps first for AoM and 007).
-Divinity is not a test title. Branch base: upstream 1b485ff745 merged 2026-11-11. It replaces the "Gates from here" and "007 follow-up"
-sections of DESIGN.md (draft 2). Everything else in draft 2 (direct shaders, heap slots, table
-mirror, fallback) stays as built. Branch `rewrite/direct`, local, never a PR.
+Divinity is not a test title. Branch base: upstream 1b485ff745 merged 2026-11-11. This draft
+supersedes the earlier "Gates from here" and "007 follow-up" plans; the rest of the design (direct
+shaders, heap slots, table mirror, fallback) stays as built. Branch `rewrite/direct`.
 
 ## Why a new draft
 
@@ -22,7 +22,7 @@ longer the only limit, and on some titles not the main one.
 Target: 16.7 ms per frame. That needs the CPU worker at or under about 10 ms per frame and the GPU
 at or under about 14 ms. No title is within 2x on either side.
 
-Three limits are left, and draft 2 has a built mechanism for none of them:
+Three limits are left, and the direct path as built has a mechanism for none of them:
 
 1. **Coherence.** The CPU re-establishes what guest memory holds at every ordering point: write-watch
    walks, collect epochs, memo revalidation, uploads of data that did not change, syncs before
@@ -34,7 +34,7 @@ Three limits are left, and draft 2 has a built mechanism for none of them:
 
 1. Work happens when memory changes, and the change is an event. Nothing asks "did this change?"
    per draw, per epoch or per submission.
-2. Descriptors stay CPU-known (draft 2). Shaders never chase guest pointers on the GPU.
+2. Descriptors stay CPU-known. Shaders never chase guest pointers on the GPU.
 3. GPU results stay on the GPU until the CPU actually reads them.
 4. A worker never polls. It blocks on the event that satisfies its wait.
 5. The GPU timeline carries shader work: one pass for consecutive draws into the same targets,
@@ -56,7 +56,7 @@ Each 64 KiB block of GPU-registered guest memory is in one of three states:
 | GPU-owned | no access | The newest content is on the GPU | a guest read or write faults: the block is written back, then becomes CPU-dirty |
 
 - The dirty list replaces `CollectWrites` walks, collect epochs and the visibility policies tried in
-  draft 2. A submission reads a list; it does not walk ranges.
+  earlier work. A submission reads a list; it does not walk ranges.
 - GPU-owned replaces eager write-back and the syncs before CPU reads of GPU results (DMA_DATA
   sources, storage image copies). Data nobody reads on the CPU is never copied back.
 - Blocks that fault every frame stay CPU-dirty permanently (no fault cost) and are uploaded per
@@ -72,7 +72,7 @@ that keeps the write-watch model.
 
 ### B. Residency
 
-The device-local mirror of draft 1 (section 1 and 1b), now fed by section A instead of walks:
+The device-local mirror, now fed by section A instead of walks:
 
 - CPU-clean and GPU-owned blocks have a device-local copy; shaders and draws read that, never a
   host import.
@@ -90,7 +90,7 @@ The device-local mirror of draft 1 (section 1 and 1b), now fed by section A inst
 - Only a wait on a value the GPU computes blocks on GPU completion, through a fence or timeline
   semaphore.
 
-### D. Direct path (draft 2, with new validity)
+### D. Direct path (as built, with new validity)
 
 Unchanged in form: light capture, data-independent shaders, heap slots, table mirror, fallback per
 draw. One change: memos (slot memo, table mirror, column stamps, binding plans) are valid until a
@@ -105,7 +105,7 @@ Two separate pieces of work, both per title:
   images on the GPU (section A makes this legal). AoM is the test: 274 ms busy for about 40 ms of
   shaders.
 - **Translation:** the dominant program per title. LEGO's is latency-bound with no single emulation
-  cost to remove (draft 2, "First GPU profile"). The open question is whether the wave64 mapping can
+  cost to remove (first GPU profile). The open question is whether the wave64 mapping can
   be restructured (one lane per invocation changes occupancy and the LDS pattern) or whether the
   guest workload at 3840x2160 is the cost. This is the least certain part of the plan.
 
@@ -114,7 +114,7 @@ Two separate pieces of work, both per title:
 | Phase | Work | Gate to continue | If the gate fails |
 |---|---|---|---|
 | 0 | Hygiene. Reject stage A (slower in 3 pairs), save as patch. Split and commit or shelve the sparse-settle change. One fixed gameplay scene per title; 007 run with `APS5_DIRECT_DRAW=1`. Worker and GPU profile of each title on the direct path. | A ranked list per title: ms per frame in coherence, waiting, GPU timeline, shaders | n/a |
-| 1 | Red-zone audit. Convert all four titles with `--frame-red-zone`; get skipped functions to zero. Build a fault-storm test: arm everything, fault constantly with AVX state live. | Zero skipped in every module; storm runs 30 min clean per title; the same storm *without* framing reproduces corruption (proves the test can fail) | Keep write-watch. Do draft 2's plan step 3 (one hot-set walk per submission) instead of A |
+| 1 | Red-zone audit. Convert all four titles with `--frame-red-zone`; get skipped functions to zero. Build a fault-storm test: arm everything, fault constantly with AVX state live. | Zero skipped in every module; storm runs 30 min clean per title; the same storm *without* framing reproduces corruption (proves the test can fail) | Keep write-watch. Do one hot-set walk per submission instead of A |
 | 2 | Section A, CPU-clean and CPU-dirty only. Start from the `APS5_PROTECT_PRIVATE_WATCH` prototype (branch proto/fault-tracking), with its correctness fixes. | Walks and epoch bumps near zero; the phase 0 coherence share falls by at least half on AoM and FF; pictures match | Revert, keep as patch |
 | 3 | Section C. | Worker wait time under 2 ms per frame on LEGO and 007; GPU idle gaps under 20 % of the frame where the CPU is not the limit | Revert per wait class |
 | 4 | Section D validity change, then section B and the GPU-owned state. | Uploads and write-backs per frame proportional to changed bytes; 007 and LEGO upload time down by 5x; footprint not above today's | Keep eager write-back for the failing resource class |
@@ -124,7 +124,7 @@ Two separate pieces of work, both per title:
 Phases 3 and 5 do not depend on phase 1 and can run while the audit is open. Each kept change
 gets one regression pair on a second title, as now.
 
-## Phase 0 result (2026-11-11, merged build, direct path, runs `merge1b48-profile`)
+## Phase 0 result (2026-11-11, merged build, direct path)
 
 Per frame, with draw and GPU profiling on (frames are 1 to 3 ms slower than unprofiled):
 
@@ -161,7 +161,7 @@ and does not depend on phase 1; phase 1 audit in parallel; then phases 2 to 4 me
 
 A GPU-side indirect draw whose arguments the CPU can snapshot records no command, so it no longer
 forces a pass. `APS5_NO_INDIRECT_IN_PASS=1` restores the old behaviour. Alternating pairs, same
-build and cache (libs `inpass`):
+build:
 
 | | Off | On |
 |---|---|---|
@@ -170,8 +170,7 @@ build and cache (libs `inpass`):
 
 CORRECTION to point 1 above: the pass boundaries were about 35 ms of AoM's frame, not 200. The
 "draw" class of `[gputime]` covers everything inside draw passes, including shading; with the
-passes merged it is still 158 ms per frame. Per-draw timing (`APS5_PROFILE_GPU_DRAWS=1`, run
-`aom\inpass-gpudraws`, per frame at 43 presents per 10 s):
+passes merged it is still 158 ms per frame. Per-draw timing (`APS5_PROFILE_GPU_DRAWS=1`, per frame at 43 presents per 10 s):
 
 | Pixel program (variant, code address) | Draws per frame | GPU per frame |
 |---|---|---|
@@ -189,8 +188,8 @@ time (table lookups through the heap slot map, host-import reads, float paths).
 
 ### AoM pixel shaders: first look (2026-11-11)
 
-Dumps: `runs\aom\dump-spv\draw_<code address>.spv` and `.txt` (aid committed: `APS5_DIRECT_DUMP_SPIRV`
-now also writes direct draw stages). The 47 ms program (0x3f8610600) is small: 12 texture samples,
+Dumps: `draw_<code address>.spv` and `.txt` in the `APS5_DIRECT_DUMP_SPIRV` directory (the switch
+also writes direct draw stages). The 47 ms program (0x3f8610600) is small: 12 texture samples,
 one loop, 8.6k words. Two things in it are not in the guest shader:
 
 - A fault buffer (storage buffer with atomics and stores) and a final conditional `OpKill`, with no
@@ -199,12 +198,12 @@ one loop, 8.6k words. Two things in it are not in the guest shader:
   the guest wave's control flow).
 
 Ceiling experiment `APS5_X_FORCE_EARLY_Z=1` (early tests forced on every pixel shader without a
-depth, stencil or coverage export; wrong picture for alpha-tested draws; reverted, kept as
-`force-early-z-experiment.patch`, libs `earlyz`): GPU busy 213 -> 176 ms per frame, frame 213 -> 219
+depth, stencil or coverage export; wrong picture for alpha-tested draws; experiment only, not in
+the tree): GPU busy 213 -> 176 ms per frame, frame 213 -> 219
 ms. So shading rejected pixels is at most about 37 ms of AoM's GPU time, and with the GPU at 176 ms
 the frame did not get shorter: something else holds the frame near 215 ms. Open questions, in order:
 
-ANSWER to question 1 (run `aom\earlyz-force-profile`): the CPU. With the GPU at 180 ms the worker is
+ANSWER to question 1 (profile of the forced run): the CPU. With the GPU at 180 ms the worker is
 99 % busy and spends about 200 ms per frame in packets: draws 118 ms (of which stage preparation,
 `Shader.DrawStage`, 61 ms) and dispatches 80 ms (140 per frame, `Vulkan.Dispatch` 54 ms). That is
 about 156 us per draw, not the 25 us in the phase 0 table: the `[draws]` average counts only the
@@ -220,13 +219,13 @@ against their packet times and stand (15.8 and 14.7 ms per frame in draws).
 
 ### AoM GPU time: host-import reads confirmed (2026-11-11)
 
-Not resolution: the trace (`aom\inpass-tracedraws`, `APS5_TRACE_DRAWS=1`) shows the scene is rendered
+Not resolution: the trace (`APS5_TRACE_DRAWS=1`) shows the scene is rendered
 at 1920x1080 (about 133 draws per frame into 6 targets), shadows at 2048x2048 depth-only (about
 527), and only about 42 draws go to the 3840x2160 target. Not the ballot loop either: it is the
 guest's own readfirstlane loop for per-pixel texture indices and runs once for one material.
 
-`APS5_HOST_IMPORT_MIB=64` (imports refused, buffers served from device-local mirrors; run
-`aom\inpass-noimport-gpudraws`, per frame, 3 frames in the window, same draw counts):
+`APS5_HOST_IMPORT_MIB=64` (imports refused, buffers served from device-local mirrors; per frame,
+3 frames in the window, same draw counts):
 
 | Program | Host imports (normal) | Device-local mirrors |
 |---|---|---|
@@ -252,7 +251,7 @@ programs near their mirror times with frame time not worse), then FF and LEGO.
 ### Phase 1 audit, first pass (2026-11-11)
 
 `relinker --windows --frame-red-zone --dry-run` on each title's executable (LEGO and FF need
-`--sce-module-path <game>\app0`). Logs: `logs\redzone-audit-aom.log`, `logs\redzone-audit-ff.log`.
+`--sce-module-path <game>\app0`).
 
 | Title | Functions with bounds | Leaves using the red zone | Framed | Skipped |
 |---|---|---|---|---|
@@ -296,8 +295,8 @@ modules, and account for code without bounds. Until then phases 2 and 4 use the 
 
 ## Not in this plan
 
-- GPU-side descriptor reads, hash tables and miss rings (measured slower, draft 2).
+- GPU-side descriptor reads, hash tables and miss rings (measured slower).
 - Further tuning of the locked draw preparation (stage A, binding-plan caches) before phase 0 ranks
   it as a top cost.
-- Visibility policies for clean ranges (measured flat, draft 2).
+- Visibility policies for clean ranges (measured flat).
 - Larger caches.
