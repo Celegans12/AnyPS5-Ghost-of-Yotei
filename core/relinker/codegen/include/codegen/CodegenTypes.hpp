@@ -37,6 +37,10 @@ struct TrampolineSite {
     std::vector<std::uint8_t> Body;
     std::size_t ReturnBranchOffset;
     std::vector<StubRelocation> Relocations = {};
+    // A jump into another site's stub instead of a stub of its own: that site is JoinBack entries
+    // earlier, and the jump lands JoinOffset bytes into its body. Body is then empty.
+    std::size_t JoinBack = 0;
+    std::size_t JoinOffset = 0;
 };
 
 struct ConvertResult {

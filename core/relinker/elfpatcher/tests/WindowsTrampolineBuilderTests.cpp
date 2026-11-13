@@ -99,6 +99,24 @@ void run() {
     requireRejected(image, {site(0x1002)}, fresh, endRva - SectionAlignment, "Windows trampoline section overlaps preceding section");
     requireRejected(image, {site(0x1002)}, sections, nextRva, "Duplicate Windows trampoline section");
 
+    // A join site jumps into the stub of the site JoinBack entries before it, JoinOffset bytes in.
+    auto join = site(0x1010);
+    join.Body.clear();
+    join.ReturnBranchOffset = 0;
+    join.JoinBack = 1;
+    join.JoinOffset = 2;
+    auto joined = image.BuildSections();
+    auto joinedRva = endRva;
+    WindowsTrampolineBuilder().Build({site(0x1002), join}, image, joined, joinedRva);
+    std::int32_t rel = 0;
+    std::memcpy(&rel, joined[0].Data.data() + 0x11, 4);
+    require(joined[0].Data[0x10] == 0xE9 && static_cast<std::int64_t>(joined[0].Rva) + 0x15 + rel == static_cast<std::int64_t>(joined.back().Rva) + 2, "A join site does not jump into the earlier site's stub at its offset");
+    require(joined.back().Data.size() < 2 * StubBody.size() + 16, "A join site was given a stub of its own");
+    requireRejected(image, {join}, fresh, endRva, "Invalid trampoline join site");
+    auto pastBody = join;
+    pastBody.JoinOffset = StubBody.size();
+    requireRejected(image, {site(0x1002), pastBody}, fresh, endRva, "Invalid trampoline join site");
+
     auto untouched = image.BuildSections();
     auto untouchedRva = endRva;
     WindowsTrampolineBuilder().Build({}, image, untouched, untouchedRva);
