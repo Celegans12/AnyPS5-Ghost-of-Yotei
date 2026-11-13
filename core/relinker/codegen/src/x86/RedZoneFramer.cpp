@@ -452,7 +452,7 @@ void frameSegment(
             if (use.RspDisp < 0) depth = std::max(depth, -use.RspDisp);
             if (use.Indexed || (use.Address && use.RspDisp < 0)) wholeRedZone = true;
         }
-        const auto shift = wholeRedZone ? kRedZoneBytes : std::min(kRedZoneBytes, (depth + kStackAlignment - 1) / kStackAlignment * kStackAlignment);
+        auto shift = wholeRedZone ? kRedZoneBytes : std::min(kRedZoneBytes, (depth + kStackAlignment - 1) / kStackAlignment * kStackAlignment);
         // A leaf without pushes, allocation or frame pointer whose exits cannot be patched returns
         // through a thunk instead: the entry stub lowers rsp and calls the rest of itself, so every
         // ret lands on `lea rsp, [rsp+shift]; ret`. Its rsp operands also move over that slot.
@@ -562,10 +562,10 @@ void frameSegment(
         ++report.RedZoneFunctions;
         // The thunk's slot sits where the leaf's own pushes go: they must balance on every path, so
         // that each ret finds the thunk's address (a fragment popping its caller's pushes would not).
+        std::map<std::size_t, std::int64_t> depthAt{{0, 0}};
         const auto balanced = [&] {
             std::map<std::size_t, std::size_t> index;
             for (std::size_t k = 0; k < body.size(); ++k) index[body[k].Offset] = k;
-            std::map<std::size_t, std::int64_t> depthAt{{0, 0}};
             std::vector<std::size_t> pending{0};
             const auto reach = [&](const std::size_t k, const std::int64_t depth) {
                 const auto [it, inserted] = depthAt.emplace(k, depth);
@@ -604,8 +604,23 @@ void frameSegment(
         if (frameless && reason == nullptr && exitReason != nullptr && !thunk) reason = exitReason;
         if (thunk) {
             exits.clear();
+            // The leaf's own pushes now go below the thunk's slot, so the gap must also cover the
+            // pushes made before each red-zone operand, and no operand may read a pushed slot.
+            std::int64_t need = 0;
+            std::int64_t deepest = 0;
+            for (const auto& [k, pushes] : depthAt) deepest = std::max(deepest, pushes);
+            for (const auto k : rspOperands) {
+                const auto use = memoryUse(at(k), body[k]);
+                const auto found = depthAt.find(k);
+                const auto below = 8 * (found != depthAt.end() ? found->second : deepest);
+                if (use.RspDisp >= 0 && use.RspDisp < below) { reason = "rsp operand on a pushed register"; break; }
+                if (use.RspDisp < 0) need = std::max(need, below - use.RspDisp);
+            }
+            if (wholeRedZone) need = std::max(need, kRedZoneBytes + 8 * deepest);
+            shift = std::max(shift, (need + kStackAlignment - 1) / kStackAlignment * kStackAlignment);
+            if (reason == nullptr && shift > kRedZoneBytes) reason = "red zone below the leaf's pushes too deep for a thunk";
             bodyShift = shift + 8;
-            if (!sawRet) reason = "no ret exit";
+            if (reason == nullptr && !sawRet) reason = "no ret exit";
         }
         for (const auto k : rspOperands) {
             const auto use = memoryUse(at(k), body[k]);
