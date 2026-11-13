@@ -3,6 +3,7 @@
 #include <tlhelp32.h>
 #include "prx/libc/include/CallTrace.hpp"
 #include "prx/libc/include/FailureReport.hpp"
+#include "prx/libc/include/FaultStorm.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestPageTrack.hpp"
 #include "prx/libc/include/HostFault.hpp"
@@ -371,6 +372,7 @@ LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (FaultStorm::Handle(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleHostFault(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* record = info->ExceptionRecord;
@@ -695,6 +697,7 @@ const bool g_crashReportInstalled = [] {
     std::signal(SIGABRT, AbortSignalHandler);
     _set_invalid_parameter_handler(InvalidParameterHandler);
     InstallWatch();
+    FaultStorm::Start();
     if (const char* hang = std::getenv("APS5_HANG_DUMP_SECS")) {
         unsigned long long seconds = 0;
         if (hang[0] >= '0' && hang[0] <= '9') {
