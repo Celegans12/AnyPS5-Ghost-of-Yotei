@@ -95,6 +95,32 @@ struct MemoryUse {
     bool Address = false;
 };
 
+// A register among rax, rcx, rdx and rbx that a ModRM memory operand does not name as base or index.
+std::optional<std::uint8_t> scratchBesideOperand(const std::uint8_t* code, const Insn& insn) {
+    const auto& info = insn.Info;
+    if (!info.HasModRm || (info.ModRmByte >> 6) == 3) return std::nullopt;
+    std::set<std::uint8_t> named;
+    const auto rm = static_cast<std::uint8_t>(info.ModRmByte & 7);
+    if (rm == 4) {
+        if (info.ModRmOffset + 1 >= insn.Length) return std::nullopt;
+        const auto sib = code[info.ModRmOffset + 1];
+        named.insert(static_cast<std::uint8_t>((sib & 7) | ((info.RexPrefix & 1) << 3)));
+        named.insert(static_cast<std::uint8_t>(((sib >> 3) & 7) | ((info.RexPrefix & 2) << 2)));
+    } else {
+        named.insert(static_cast<std::uint8_t>(rm | ((info.RexPrefix & 1) << 3)));
+    }
+    for (std::uint8_t reg = 0; reg < 4; ++reg)
+        if (!named.contains(reg)) return reg;
+    return std::nullopt;
+}
+
+// The instruction with its ModRM reg field set to reg (below 8, so REX.R stays clear).
+std::vector<std::uint8_t> withRegField(const std::uint8_t* code, const Insn& insn, const std::uint8_t reg) {
+    std::vector<std::uint8_t> bytes(code, code + insn.Length);
+    bytes[insn.Info.ModRmOffset] = static_cast<std::uint8_t>((bytes[insn.Info.ModRmOffset] & 0xc7) | ((reg & 7) << 3));
+    return bytes;
+}
+
 bool xopPrefixed(const std::uint8_t* code, const Insn& insn) {
     const auto at = insn.Info.OpcodeOffset;
     return code[at] == 0x8f && at + 1 < insn.Length && (code[at + 1] & 0x1f) >= 8;
@@ -781,6 +807,17 @@ void frameSegment(
                         continue;
                     }
                     const auto op = info.Opcode;
+                    // pop rsp (a realigned frame restoring its saved rsp): the saved value sits at the
+                    // real slot, rsp + shift. It is loaded into a scratch pushed below rsp, lowered by
+                    // the shift and popped into rsp, so rsp is never above the leaf's lowered rsp.
+                    if (!info.IsTwoByteOpcode && code[info.OpcodeOffset] == 0x5c && (info.RexPrefix & 1) == 0 && info.OpcodeOffset + 1 == insn.Length) {
+                        append({0x50});
+                        append(memoryOperand(0x8b, 0, kRegRsp, static_cast<std::int32_t>(8 + shift)));
+                        append(memoryOperand(0x8d, 0, 0, static_cast<std::int32_t>(-shift)));
+                        append(memoryOperand(0x87, 0, kRegRsp, 0));
+                        append({0x5c});
+                        continue;
+                    }
                     if (use.RegisterRsp) return "push or pop of rsp in a relocated leaf";
                     const bool pop = info.IsTwoByteOpcode ? (op == 0xa1 || op == 0xa9) : ((op >= 0x58 && op <= 0x5f) || op == 0x9d || op == 0x8f);
                     // Any other push or pop runs as itself through a slot at rsp, then moves the value:
@@ -842,17 +879,34 @@ void frameSegment(
                             continue;
                         }
                     }
-                    // mov rsp, [mem] (longjmp) loads an rsp the leaf does not keep: load it, then lower
-                    // it by the shift like the leaf's own.
-                    if (const auto load = modRmFields(code, insn, 0x8b, true, false); load && load->first == kRegRsp) {
+                    // mov rsp, [mem] (longjmp) loads an rsp the leaf does not keep, and mov [mem], rsp
+                    // stores the leaf's rsp, which is rsp + shift. Both go through a scratch pushed
+                    // below rsp (free: the leaf's slots are at rsp and above), so no flags change and
+                    // rsp never rises above the leaf's lowered rsp. An rsp operand moves by the shift
+                    // and the push.
+                    const auto load = modRmFields(code, insn, 0x8b, true, false);
+                    const auto store = modRmFields(code, insn, 0x89, true, false);
+                    if (((load && load->first == kRegRsp) || (store && store->first == kRegRsp)) && !info.HasRipRelativeDisp) {
+                        const auto scratch = scratchBesideOperand(code, insn);
+                        if (!scratch) return "rsp load or store with no scratch register";
+                        const auto operand = withRegField(code, insn, *scratch);
+                        std::vector<std::uint8_t> access = operand;
                         if (use.RspBased) {
-                            const auto bytes = withDisplacement(code, insn, use, use.RspDisp + shift);
+                            const auto bytes = withDisplacement(operand.data(), insn, use, use.RspDisp + shift + 8);
                             if (!bytes) return "rsp operand that cannot move";
-                            append(*bytes);
-                        } else {
-                            appendOriginal(k);
+                            access = *bytes;
                         }
-                        append(lowerRsp(shift));
+                        append({static_cast<std::uint8_t>(0x50 + *scratch)});
+                        if (load && load->first == kRegRsp) {
+                            append(access);
+                            append(memoryOperand(0x8d, *scratch, *scratch, static_cast<std::int32_t>(-shift)));
+                            append(memoryOperand(0x87, *scratch, kRegRsp, 0));
+                            append({0x5c});
+                        } else {
+                            append(memoryOperand(0x8d, *scratch, kRegRsp, static_cast<std::int32_t>(8 + shift)));
+                            append(access);
+                            append({static_cast<std::uint8_t>(0x58 + *scratch)});
+                        }
                         continue;
                     }
                     return "other use of rsp in a relocated leaf";
@@ -1476,6 +1530,131 @@ void frameSegment(
     }
 }
 
+// Decodes code outside every function's bounds one instruction at a time: visit(offset, length),
+// with length 0 for a byte that does not decode (data), which is then stepped over.
+template<typename TVisit>
+void walkUncovered(const std::vector<std::uint8_t>& code, TVisit&& visit) {
+    const X64InstructionDecoder decoder;
+    for (std::size_t at = 0; at < code.size();) {
+        std::size_t length = 0;
+        try {
+            length = decoder.Decode(code.data() + at, code.size() - at);
+        } catch (const std::exception&) {
+            length = 0;
+        }
+        visit(at, length);
+        at += length == 0 ? 1 : length;
+    }
+}
+
+// Padding between functions: int3, bytes that do not decode, and `add [rax], al` (zero fill) end
+// a function; a nop does not start one (functions align loops with nops, so it ends none).
+enum class UncoveredKind { Code, Nop, Break };
+
+UncoveredKind uncoveredKind(const X64InstructionDecoder& decoder, const std::vector<std::uint8_t>& code, const std::size_t at, const std::size_t length) {
+    if (length == 0 || (length == 1 && code[at] == 0xcc) || (length == 2 && code[at] == 0 && code[at + 1] == 0)) return UncoveredKind::Break;
+    const auto info = decoder.DecodeInstruction(code.data() + at, length);
+    if ((!info.IsTwoByteOpcode && info.Opcode == 0x90 && (info.RexPrefix & 1) == 0) || (info.IsTwoByteOpcode && info.Opcode == 0x1f)) return UncoveredKind::Nop;
+    return UncoveredKind::Code;
+}
+
+// Code-segment bytes that no function's bounds cover, padding trimmed: the framer never examines
+// them, so a red-zone leaf there would stay unframed.
+void measureUncovered(const std::vector<std::uint8_t>& fileBytes, const Domain::ProgramHeader& ph, const std::vector<RedZoneFunction>& functions, RedZoneFrameReport& report) {
+    const auto segOffset = static_cast<std::size_t>(ph.Offset);
+    const auto segSize = static_cast<std::size_t>(ph.FileSize);
+    if (segOffset > fileBytes.size() || segSize > fileBytes.size() - segOffset) return;
+    const auto* seg = fileBytes.data() + segOffset;
+    std::vector<std::pair<std::size_t, std::size_t>> spans;
+    for (const auto& function : functions) {
+        if (function.End <= ph.MappedAddress || function.Begin >= ph.MappedAddress + segSize) continue;
+        spans.emplace_back(static_cast<std::size_t>(std::max(function.Begin, ph.MappedAddress) - ph.MappedAddress), static_cast<std::size_t>(std::min<std::uint64_t>(function.End, ph.MappedAddress + segSize) - ph.MappedAddress));
+    }
+    std::sort(spans.begin(), spans.end());
+    const X64InstructionDecoder decoder;
+    const auto gap = [&](const std::size_t begin, const std::size_t end) {
+        const std::vector<std::uint8_t> code(seg + begin, seg + end);
+        bool belowRsp = false;
+        bool plt = false;
+        std::optional<std::size_t> first;
+        std::size_t last = 0;
+        walkUncovered(code, [&](const std::size_t at, const std::size_t length) {
+            if (uncoveredKind(decoder, code, at, length) != UncoveredKind::Code) return;
+            if (!first) first = at;
+            last = at + length;
+            const Insn insn{at, length, decoder.DecodeInstruction(code.data() + at, length)};
+            if (length == 6 && code[at] == 0xff && code[at + 1] == 0x25) plt = true;
+            const auto use = memoryUse(code.data() + at, insn);
+            if (use.RspBased && use.RspDisp < 0) belowRsp = true;
+        });
+        if (!first) return;
+        ++report.UncoveredRanges;
+        report.UncoveredBytes += last - *first;
+        if (plt) ++report.UncoveredPltRanges;
+        if (belowRsp) {
+            ++report.UncoveredBelowRsp;
+            report.UncoveredBelowRspAddresses.push_back(ph.MappedAddress + begin + *first);
+        }    };
+    std::size_t cursor = 0;
+    for (const auto& [begin, end] : spans) {
+        if (begin > cursor) gap(cursor, begin);
+        cursor = std::max(cursor, end);
+    }
+    if (cursor < segSize) gap(cursor, segSize);
+}
+
+}
+
+std::vector<RedZoneFunction> SplitUncoveredCode(const std::vector<std::uint8_t>& fileBytes, const std::vector<Domain::ProgramHeader>& codeSegments, const std::vector<RedZoneFunction>& functions) {
+    std::vector<RedZoneFunction> pieces;
+    const auto scanner = MakeInstructionScanner();
+    const X64InstructionDecoder decoder;
+    for (const auto& ph : codeSegments) {
+        const auto segOffset = static_cast<std::size_t>(ph.Offset);
+        const auto segSize = static_cast<std::size_t>(ph.FileSize);
+        if (segOffset > fileBytes.size() || segSize > fileBytes.size() - segOffset) continue;
+        const std::vector<std::uint8_t> seg(fileBytes.begin() + static_cast<std::ptrdiff_t>(segOffset), fileBytes.begin() + static_cast<std::ptrdiff_t>(segOffset + segSize));
+        std::set<std::size_t> callTargets;
+        for (const auto& match : scanner->ScanCodeSection(seg, 0, seg.size())) {
+            const auto info = decoder.DecodeInstruction(seg.data() + match.Offset, match.Length);
+            if (info.FlowKind != ControlFlowKind::Call || !info.HasBranchTarget || info.HasRipRelativeDisp) continue;
+            const auto target = static_cast<std::int64_t>(match.Offset + match.Length) + info.BranchDisp;
+            if (target >= 0 && static_cast<std::size_t>(target) < seg.size()) callTargets.insert(static_cast<std::size_t>(target));
+        }
+        std::vector<std::pair<std::size_t, std::size_t>> spans;
+        for (const auto& function : functions) {
+            if (function.End <= ph.MappedAddress || function.Begin >= ph.MappedAddress + segSize) continue;
+            spans.emplace_back(static_cast<std::size_t>(std::max(function.Begin, ph.MappedAddress) - ph.MappedAddress), static_cast<std::size_t>(std::min<std::uint64_t>(function.End, ph.MappedAddress + segSize) - ph.MappedAddress));
+        }
+        std::sort(spans.begin(), spans.end());
+        const auto gap = [&](const std::size_t begin, const std::size_t end) {
+            const std::vector<std::uint8_t> code(seg.begin() + static_cast<std::ptrdiff_t>(begin), seg.begin() + static_cast<std::ptrdiff_t>(end));
+            // A piece runs from its first instruction that is not padding to the end of its last one
+            // that is not a nop.
+            std::optional<std::size_t> start;
+            std::size_t last = 0;
+            const auto close = [&]() {
+                if (start && last > *start) pieces.push_back({ph.MappedAddress + begin + *start, ph.MappedAddress + begin + last});
+                start.reset();
+            };
+            walkUncovered(code, [&](const std::size_t at, const std::size_t length) {
+                const auto kind = uncoveredKind(decoder, code, at, length);
+                if (kind == UncoveredKind::Break) { close(); return; }
+                if (kind == UncoveredKind::Nop) return;
+                if (start && callTargets.contains(begin + at)) close();
+                if (!start) start = at;
+                last = at + length;
+            });
+            close();
+        };
+        std::size_t cursor = 0;
+        for (const auto& [begin, end] : spans) {
+            if (begin > cursor) gap(cursor, begin);
+            cursor = std::max(cursor, end);
+        }
+        if (cursor < segSize) gap(cursor, segSize);
+    }
+    return pieces;
 }
 
 std::vector<TrampolineSite> FrameRedZoneFunctions(
@@ -1489,7 +1668,10 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     const std::map<std::uint64_t, std::uint64_t>& relativeAddends
 ) {
     std::vector<TrampolineSite> sites;
-    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, loadSegments, relativeAddends);
+    for (const auto& ph : codeSegments) {
+        frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, loadSegments, relativeAddends);
+        measureUncovered(fileBytes, ph, functions, report);
+    }
     return sites;
 }
 
