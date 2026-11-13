@@ -198,6 +198,8 @@ struct Leaf {
     bool HostRuns = true;
     // Data placed right after the leaf, outside its function bounds (a jump table).
     std::vector<std::uint8_t> Data = {};
+    // False for code that is only a branch target of another leaf: not run, not expected framed.
+    bool Framed = true;
 };
 
 bool hostHasBmi1() {
@@ -437,6 +439,46 @@ std::vector<Leaf> thunkTailCallLeaves() {
     };
 }
 
+// Leaves whose frames cannot be patched in place, relocated whole into a stub. The first jumps
+// into the middle of the function after it (at 0x70), which is not a leaf.
+std::vector<Leaf> relocatedLeaves() {
+    return {
+        {"leaf spilling below rsp whose jne lands in the middle of another function", {
+            0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0x48, 0x85, 0xf6,
+            0x0f, 0x85, 0x22, 0x00, 0x00, 0x00, 0xc3,
+        }, kA + kB},
+        {"function with a call whose middle adds rsi", {0xe8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x01, 0xf0, 0xc3}, 0, false, {}, false},
+        // `push rax` as a slot written and read at [rsp], freed by an add: no thunk can hold it.
+        {"leaf using its push rax slot at rsp beside a spill below rsp", {
+            0x53, 0x50, 0x48, 0x89, 0x3c, 0x24, 0x48, 0x89, 0x74, 0x24, 0xf8, 0x48, 0x8b, 0x04, 0x24,
+            0x48, 0x03, 0x44, 0x24, 0xf8, 0x48, 0x83, 0xc4, 0x08, 0x5b, 0xc3,
+        }, kA + kB},
+        // add rax, [rsp] sits between a loop head and a je target: no room for an operand stub.
+        {"leaf with an [rsp] operand between two branch targets", {
+            0x53, 0x48, 0x83, 0xec, 0x10, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x89, 0x34, 0x24,
+            0x31, 0xc0, 0xb9, 0x02, 0x00, 0x00, 0x00, 0x48, 0x85, 0xd2, 0x74, 0x04,
+            0x48, 0x03, 0x04, 0x24, 0x48, 0x03, 0x44, 0x24, 0xf8, 0xff, 0xc9, 0x75, 0xf3,
+            0x48, 0x83, 0xc4, 0x10, 0x5b, 0xc3,
+        }, 2 * (kA + kB)},
+        {"leaf starting with a short jmp over padding", {
+            0xeb, 0x0e, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3,
+        }, kA},
+        {"leaf whose loop heads at its short first instruction", {
+            0x48, 0x39, 0xd6, 0x74, 0x0a, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x89, 0xd6, 0xeb, 0xf1,
+            0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3,
+        }, kA},
+        // The same loop through a switch whose cases jump back to the start: each case enters the
+        // stub through a jump of its own.
+        {"leaf looping to its start through a jump table", {
+            0x48, 0x39, 0xd6, 0x74, 0x25, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x89, 0xd6, 0x83, 0xe7, 0x01,
+            0x48, 0x8d, 0x0d, 0x1a, 0x00, 0x00, 0x00, 0x48, 0x63, 0x04, 0xb9, 0x48, 0x01, 0xc8, 0xff, 0xe0,
+            0xe9, 0xdb, 0xff, 0xff, 0xff, 0xe9, 0xd6, 0xff, 0xff, 0xff,
+            0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3, 0xcc,
+        }, kA, true, {0xef, 0xff, 0xff, 0xff, 0xf4, 0xff, 0xff, 0xff}},
+    };
+}
+
 void writeRel32(std::uint8_t* at, const std::uint64_t target, const std::uint64_t next) {
     const auto displacement = static_cast<std::int64_t>(target) - static_cast<std::int64_t>(next);
     require(displacement >= std::numeric_limits<std::int32_t>::min() && displacement <= std::numeric_limits<std::int32_t>::max(), "a stub jump is out of rel32 range");
@@ -506,11 +548,21 @@ Framing load(const Image& image, const bool frame) {
     framing.Sites = Codegen::FrameRedZoneFunctions(image.Bytes, segments, functions, {}, framing.Report, framing.Displacements);
     for (const auto& moved : framing.Displacements) std::copy(moved.Bytes.begin(), moved.Bytes.end(), arena + moved.Offset);
     std::size_t cursor = kStubBase;
-    for (const auto& site : framing.Sites) {
+    std::vector<std::uint64_t> stubs(framing.Sites.size(), 0);
+    for (std::size_t index = 0; index < framing.Sites.size(); ++index) {
+        const auto& site = framing.Sites[index];
         const auto at = static_cast<std::size_t>(site.Address - base);
         require(std::equal(site.OriginalBytes.begin(), site.OriginalBytes.end(), arena + at), "a framed site's bytes changed before it was patched");
+        if (site.JoinBack != 0) {
+            require(site.JoinBack <= index && site.Body.empty() && stubs[index - site.JoinBack] != 0, "a join site does not follow the stub it jumps into");
+            std::fill_n(arena + at, site.Length, 0x90);
+            arena[at] = 0xe9;
+            writeRel32(arena + at + 1, stubs[index - site.JoinBack] + site.JoinOffset, site.Address + 5);
+            continue;
+        }
         cursor = (cursor + 15) / 16 * 16;
-        require(cursor + site.Body.size() <= kProbeBase, "the stubs do not fit before the calibration probe");
+        stubs[index] = base + cursor;
+        require(cursor + site.Body.size() <= kRunnerBase, "the stubs do not fit before the runner");
         auto* stub = arena + cursor;
         std::copy(site.Body.begin(), site.Body.end(), stub);
         Codegen::ApplyStubRelocations(std::span<std::uint8_t>(stub, site.ReturnBranchOffset), site.Relocations, site.Address, base + cursor, site.Offset);
@@ -589,8 +641,10 @@ Codegen::RedZoneFrameReport runLeaves(const std::vector<Leaf>& leaves) {
         require(clobbered.back().Result != leaves[index].Expected, std::string(leaves[index].Name) + ": the unframed leaf survived writes below rsp, so the case proves nothing");
     }
     const auto framing = load(image, true);
-    require(framing.Report.Framed == leaves.size(), "only " + std::to_string(framing.Report.Framed) + " of " + std::to_string(leaves.size()) + " leaves were framed");
+    const auto expected = static_cast<std::size_t>(std::count_if(leaves.begin(), leaves.end(), [](const Leaf& leaf) { return leaf.Framed; }));
+    require(framing.Report.Framed == expected, "only " + std::to_string(framing.Report.Framed) + " of " + std::to_string(expected) + " leaves were framed");
     for (std::size_t index = 0; index < leaves.size(); ++index) {
+        if (!leaves[index].Framed) continue;
         if (!leaves[index].HostRuns) {
             std::cout << leaves[index].Name << ": framed but not executed, this CPU cannot execute an instruction in it\n";
             continue;
@@ -644,6 +698,8 @@ int main() {
         require(thunkTail.ReturnThunks == 1 && thunkTail.Exits == 2, "the thunk leaf ending in a tail call was framed with " + std::to_string(thunkTail.ReturnThunks) + " thunks and " + std::to_string(thunkTail.Exits) + " exits, not 1 and 2");
         const auto switched = runLeaves(jumpTableLeaves());
         require(switched.Exits == 4 && switched.WidenedExits == 4, "the leaves with jump tables were framed with " + std::to_string(switched.Exits) + " exits, " + std::to_string(switched.WidenedExits) + " widened, not 4 and 4");
+        const auto relocated = runLeaves(relocatedLeaves());
+        require(relocated.Relocated == 6 && relocated.RelocatedCases == 2 && relocated.RelocatedOpenJumps == 0, "the leaves that cannot be framed in place were relocated " + std::to_string(relocated.Relocated) + " times with " + std::to_string(relocated.RelocatedCases) + " case jumps and " + std::to_string(relocated.RelocatedOpenJumps) + " open jumps, not 6, 2 and 0");
         std::cout << "red-zone framer execution tests passed\n";
         return 0;
     } catch (const SteppingDegraded& error) {

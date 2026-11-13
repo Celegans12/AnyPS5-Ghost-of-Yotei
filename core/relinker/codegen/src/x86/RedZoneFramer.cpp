@@ -304,11 +304,12 @@ std::optional<std::vector<std::uint8_t>> movedDisplacement(const MemoryUse& use,
     return std::nullopt;
 }
 
-std::optional<std::vector<std::uint8_t>> withDisplacement(const std::uint8_t* code, const Insn& insn, const MemoryUse& use, const std::int64_t disp) {
+// With wide the displacement is always 32 bits: an EVEX disp8 would be scaled.
+std::optional<std::vector<std::uint8_t>> withDisplacement(const std::uint8_t* code, const Insn& insn, const MemoryUse& use, const std::int64_t disp, const bool wide = false) {
     if (disp < std::numeric_limits<std::int32_t>::min() || disp > std::numeric_limits<std::int32_t>::max()) return std::nullopt;
     const std::size_t oldBytes = use.Mod == 1 ? 1 : use.Mod == 2 ? 4 : 0;
     if (use.DispOffset + oldBytes > insn.Length) return std::nullopt;
-    const bool narrow = disp >= std::numeric_limits<std::int8_t>::min() && disp <= std::numeric_limits<std::int8_t>::max();
+    const bool narrow = !wide && disp >= std::numeric_limits<std::int8_t>::min() && disp <= std::numeric_limits<std::int8_t>::max();
     std::vector<std::uint8_t> bytes(code, code + use.DispOffset);
     bytes[insn.Info.ModRmOffset] = static_cast<std::uint8_t>((bytes[insn.Info.ModRmOffset] & 0x3f) | (narrow ? 0x40 : 0x80));
     const auto value = static_cast<std::uint32_t>(static_cast<std::int32_t>(disp));
@@ -348,10 +349,23 @@ std::optional<JumpTableDispatch> jumpTableDispatch(const std::vector<Insn>& body
     bool loaded = false;
     bool sameBase = false;
     std::set<std::uint8_t> holders;
-    for (std::size_t back = 1; back <= 16 && back <= k; ++back) {
+    // VEX vector instructions that write no general register do not count toward the window.
+    const auto vectorOnly = [&](const std::uint8_t* code, const Insn& insn) {
+        const auto at = insn.Info.OpcodeOffset;
+        const auto lead = code[at];
+        if (insn.Info.RexPrefix != 0 || (lead != 0xc4 && lead != 0xc5) || at + 3 >= insn.Length) return false;
+        const auto map = lead == 0xc5 ? std::uint8_t{1} : static_cast<std::uint8_t>(code[at + 1] & 0x1f);
+        const auto op = code[lead == 0xc5 ? at + 2 : at + 3];
+        if (map == 1) return op != 0x7e && op != 0x50 && op != 0xd7 && op != 0xc5 && op != 0x2c && op != 0x2d;
+        if (map == 2) return op < 0xf0;
+        if (map == 3) return op < 0x14 || op > 0x17;
+        return false;
+    };
+    for (std::size_t back = 1, counted = 0; back <= 64 && back <= k && counted < 16; ++back) {
         const auto j = k - back;
         const auto* code = at(j);
         const auto& insn = body[j];
+        if (!vectorOnly(code, insn)) ++counted;
         if (!addBase) {
             if (const auto add = modRmFields(code, insn, 0x01, true, true); add && add->second == target) addBase = add->first;
             else if (const auto add3 = modRmFields(code, insn, 0x03, true, true); add3 && add3->first == target) addBase = add3->second;
@@ -395,6 +409,35 @@ std::optional<JumpTableDispatch> jumpTableDispatch(const std::vector<Insn>& body
     if (loaded && sameBase) return JumpTableDispatch{std::nullopt};
     return std::nullopt;
 }
+
+// `jmp [base+index*8]`: a jump through a table of absolute addresses.
+bool absoluteTableJump(const std::uint8_t* code, const Insn& insn) {
+    const auto& info = insn.Info;
+    if (info.FlowKind != ControlFlowKind::IndirectJump || info.IsTwoByteOpcode || info.Opcode != 0xff || !info.HasModRm || ((info.ModRmByte >> 3) & 7) != 4) return false;
+    const auto mod = info.ModRmByte >> 6;
+    if ((info.ModRmByte & 7) != 4 || mod >= 2 || info.ModRmOffset == 0 || info.ModRmOffset + 1 >= insn.Length) return false;
+    const auto sib = code[info.ModRmOffset + 1];
+    if ((sib >> 6) != 3 || (((sib >> 3) & 7) == 4 && (info.RexPrefix & 2) == 0)) return false;
+    if ((mod == 0 && (sib & 7) == 5) || ((sib & 7) == kRegRsp && (info.RexPrefix & 1) == 0)) return false;
+    return mod == 0 || (info.ModRmOffset + 2 < insn.Length && code[info.ModRmOffset + 2] == 0);
+}
+
+// `op reg, [base+disp]` with REX.W, or without REX when the opcode takes no register size.
+std::vector<std::uint8_t> memoryOperand(const std::uint8_t opcode, const std::uint8_t reg, const std::uint8_t base, const std::int32_t disp, const bool rexW = true) {
+    const bool narrow = disp >= std::numeric_limits<std::int8_t>::min() && disp <= std::numeric_limits<std::int8_t>::max();
+    std::vector<std::uint8_t> out;
+    const auto rex = static_cast<std::uint8_t>((rexW ? 0x48 : 0x40) | ((reg & 8) >> 1) | ((base & 8) >> 3));
+    if (rex != 0x40) out.push_back(rex);
+    out.push_back(opcode);
+    out.push_back(static_cast<std::uint8_t>((narrow ? 0x40 : 0x80) | ((reg & 7) << 3) | (base & 7)));
+    if ((base & 7) == kRegRsp) out.push_back(0x24);
+    const auto value = static_cast<std::uint32_t>(disp);
+    for (std::size_t index = 0; index < (narrow ? 1u : 4u); ++index) out.push_back(static_cast<std::uint8_t>(value >> (8 * index)));
+    return out;
+}
+
+// A relocated leaf runs this far below the rsp it keeps: the red zone's size.
+constexpr std::int64_t kRelocatedShift = kRedZoneBytes;
 
 // A RIP-relative instruction copied into a stub: Offset and End are within the copied bytes,
 // Target is the segment offset it addresses.
@@ -457,7 +500,8 @@ void frameSegment(
     std::vector<TrampolineSite>& sites,
     std::vector<RedZoneDisplacement>& displacements,
     RedZoneFrameReport& report,
-    const std::vector<Domain::ProgramHeader>& loadSegments
+    const std::vector<Domain::ProgramHeader>& loadSegments,
+    const std::map<std::uint64_t, std::uint64_t>& relativeAddends
 ) {
     const auto segOffset = static_cast<std::size_t>(ph.Offset);
     const auto segSize = static_cast<std::size_t>(ph.FileSize);
@@ -467,12 +511,19 @@ void frameSegment(
     const X64InstructionDecoder decoder;
 
     std::set<std::size_t> targets;
+    // Every branch as (target, source), by target: a relocated leaf checks that no branch from
+    // outside it lands inside it.
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> edges;
     for (const auto& match : scanner->ScanCodeSection(seg, 0, seg.size())) {
         const auto info = decoder.DecodeInstruction(seg.data() + match.Offset, match.Length);
         if (!info.HasBranchTarget || info.HasRipRelativeDisp || info.FlowKind == ControlFlowKind::Call) continue;
         const auto target = static_cast<std::int64_t>(match.Offset + match.Length) + info.BranchDisp;
-        if (target >= 0 && static_cast<std::size_t>(target) < seg.size()) targets.insert(static_cast<std::size_t>(target));
+        if (target >= 0 && static_cast<std::size_t>(target) < seg.size()) {
+            targets.insert(static_cast<std::size_t>(target));
+            edges.emplace_back(static_cast<std::uint32_t>(target), static_cast<std::uint32_t>(match.Offset));
+        }
     }
+    std::sort(edges.begin(), edges.end());
     std::vector<std::pair<std::size_t, std::size_t>> taken;
     for (const auto& site : existing) {
         if (site.Address < ph.MappedAddress || site.Address >= ph.MappedAddress + segSize) continue;
@@ -570,6 +621,298 @@ void frameSegment(
             for (const auto c : cases) targets.insert(body[c].Offset);
             tables.emplace(k, std::move(cases));
         }
+        // A leaf whose frame cannot be patched in place is relocated whole into a stub that runs it
+        // with rsp kRelocatedShift lower than the leaf keeps it. Every rsp operand moves up by the
+        // shift and every push and pop is rewritten to keep its slot, so the leaf's stack data stays
+        // at its addresses, which are now above rsp. Every way out raises rsp first, so code outside
+        // the stub sees the stack as before. The leaf's start jumps to the stub, and each case of a
+        // jump table gets a jump into it. Returns why the leaf could not be relocated, or nothing.
+        // A branch from outside the leaf (another function, or code past its first int3) into
+        // [begin, end).
+        const auto enteredFromOutside = [&](const std::size_t begin, const std::size_t end) {
+            auto edge = std::lower_bound(edges.begin(), edges.end(), std::pair<std::uint32_t, std::uint32_t>{static_cast<std::uint32_t>(begin), 0});
+            for (; edge != edges.end() && edge->first < end; ++edge)
+                if (edge->second < start || edge->second >= static_cast<std::size_t>(bodyEnd)) return true;
+            return false;
+        };
+        const auto relocate = [&]() -> const char* {
+            constexpr std::int64_t shift = kRelocatedShift;
+            if (bodyEnd - static_cast<std::int64_t>(start) < static_cast<std::int64_t>(kJumpBytes)) return "leaf shorter than a jump";
+            if (overlapsExisting(start, static_cast<std::size_t>(bodyEnd))) return "overlaps another stub";
+            if (enteredFromOutside(start + 1, start + kJumpBytes)) return "branch from outside into the start of a relocated leaf";
+            const auto inside = [&](const std::int64_t target) -> std::optional<std::size_t> {
+                if (target < static_cast<std::int64_t>(start) || target >= bodyEnd) return std::nullopt;
+                const auto found = indexOf.find(static_cast<std::size_t>(target));
+                if (found == indexOf.end()) return std::nullopt;
+                return found->second;
+            };
+            // Jump tables: relative ones as resolved above, and tables of absolute addresses, read
+            // from the relocations that fill them (or the file) for every table a lea addresses.
+            std::set<std::size_t> dispatches;
+            std::set<std::size_t> cases;
+            for (const auto& [k, found] : tables) {
+                dispatches.insert(k);
+                cases.insert(found.begin(), found.end());
+            }
+            // A table of other functions' starts (threaded code: each handler jumps to the next) makes
+            // its jump a tail call, like a jump through a function pointer.
+            std::set<std::size_t> tailJumps;
+            for (std::size_t k = 0; k < body.size(); ++k) {
+                if (!absoluteTableJump(at(k), body[k])) continue;
+                std::set<std::size_t> found;
+                std::size_t starts = 0;
+                for (const auto table : leaTables)
+                    for (std::int64_t entry = 0; entry < kJumpTableEntryLimit; ++entry) {
+                        const auto address = static_cast<std::uint64_t>(static_cast<std::int64_t>(ph.MappedAddress) + table + 8 * entry);
+                        std::optional<std::uint64_t> value;
+                        if (const auto addend = relativeAddends.find(address); addend != relativeAddends.end()) value = addend->second;
+                        else if (const auto low = readGuest32(address), high = readGuest32(address + 4); low && high && (*low != 0 || *high != 0))
+                            value = static_cast<std::uint32_t>(*low) | (static_cast<std::uint64_t>(static_cast<std::uint32_t>(*high)) << 32);
+                        if (!value) break;
+                        const auto offset = static_cast<std::int64_t>(*value) - static_cast<std::int64_t>(ph.MappedAddress);
+                        // The leaf's own start is entered like a call, through its entry jump.
+                        const auto c = offset == static_cast<std::int64_t>(start) ? std::nullopt : inside(offset);
+                        if (c) found.insert(*c);
+                        else if (offset >= 0 && static_cast<std::size_t>(offset) < seg.size() && (offset <= static_cast<std::int64_t>(start) || offset >= static_cast<std::int64_t>(limit)) && tailCallTarget(offset)) ++starts;
+                        else break;
+                    }
+                if (found.empty() && starts > 0) tailJumps.insert(k);
+                // A table with both cases and other functions' starts would need rsp both ways.
+                if (!found.empty() && starts > 0) return "jump table of both cases and functions";
+                if (found.empty()) continue;
+                dispatches.insert(k);
+                cases.insert(found.begin(), found.end());
+            }
+            Copied out{lowerRsp(shift), {}};
+            const auto raise = raiseRsp(shift);
+            const auto append = [&](const std::vector<std::uint8_t>& bytes) { out.Bytes.insert(out.Bytes.end(), bytes.begin(), bytes.end()); };
+            const auto appendOriginal = [&](const std::size_t k) {
+                const auto& insn = body[k];
+                Copied copied{std::vector<std::uint8_t>(at(k), at(k) + insn.Length), {}};
+                if (insn.Info.HasRipRelativeDisp && insn.Info.RipRelativeDispOffset + 4 <= insn.Length) {
+                    std::int32_t disp = 0;
+                    std::memcpy(&disp, at(k) + insn.Info.RipRelativeDispOffset, 4);
+                    copied.Rips.push_back({insn.Info.RipRelativeDispOffset, insn.Length, static_cast<std::int64_t>(insn.Offset + insn.Length) + disp, insn.Info.AddressSize32});
+                }
+                out.Append(copied);
+            };
+            const auto leaveTo = [&](const std::int64_t target) {
+                append(raise);
+                out.Append(Copied{{0xe9, 0, 0, 0, 0}, {{1, 5, target, false}}});
+            };
+            std::vector<std::size_t> labelAt(body.size());
+            std::vector<std::pair<std::size_t, std::size_t>> internal;
+            std::map<std::int64_t, std::vector<std::size_t>> outside;
+            bool openJump = false;
+            bool leavesIntoFunction = false;
+            const auto branchTo = [&](const std::int64_t target) {
+                const auto field = out.Bytes.size() - 4;
+                if (const auto k = inside(target)) internal.emplace_back(field, *k);
+                else {
+                    outside[target].push_back(field);
+                    if (target >= static_cast<std::int64_t>(start) && target < static_cast<std::int64_t>(limit)) leavesIntoFunction = true;
+                }
+            };
+            for (std::size_t k = 0; k < body.size(); ++k) {
+                labelAt[k] = out.Bytes.size();
+                const auto& insn = body[k];
+                const auto* code = at(k);
+                const auto& info = insn.Info;
+                const auto flow = info.FlowKind;
+                const auto use = memoryUse(code, insn);
+                const auto target = static_cast<std::int64_t>(insn.Offset + insn.Length) + info.BranchDisp;
+                if (flow == ControlFlowKind::ConditionalBranch) {
+                    const auto op = info.Opcode;
+                    const bool shortForm = !info.IsTwoByteOpcode && op >= 0x70 && op <= 0x7f;
+                    const bool nearForm = info.IsTwoByteOpcode && op >= 0x80 && op <= 0x8f;
+                    if (!info.HasBranchTarget || info.HasRipRelativeDisp || (!shortForm && !nearForm)) return "loop or jrcxz in a relocated leaf";
+                    append({0x0f, static_cast<std::uint8_t>(0x80 | (op & 0x0f)), 0, 0, 0, 0});
+                    branchTo(target);
+                    continue;
+                }
+                if (flow == ControlFlowKind::UnconditionalJump && info.HasBranchTarget && !info.HasRipRelativeDisp) {
+                    if (inside(target)) {
+                        append({0xe9, 0, 0, 0, 0});
+                        branchTo(target);
+                    } else {
+                        if (target >= static_cast<std::int64_t>(start) && target < static_cast<std::int64_t>(limit)) leavesIntoFunction = true;
+                        leaveTo(target);
+                    }
+                    continue;
+                }
+                if (flow == ControlFlowKind::Return) {
+                    append(raise);
+                    append(std::vector<std::uint8_t>(code + info.OpcodeOffset, code + insn.Length));
+                    continue;
+                }
+                if (flow == ControlFlowKind::IndirectJump || flow == ControlFlowKind::UnconditionalJump) {
+                    // A jump table's dispatch lands on a case's jump into the stub; any other indirect
+                    // jump leaves, its rsp operand read with rsp raised as in the leaf.
+                    if (dispatches.contains(k)) {
+                        if (use.RspBased) return "jump table through an rsp operand";
+                    } else {
+                        append(raise);
+                        // Through memory without an index: a function pointer, so a tail call.
+                        bool pointer = info.HasModRm && (info.ModRmByte >> 6) != 3 && !use.RspBased;
+                        if (pointer && (info.ModRmByte & 7) == 4 && info.ModRmOffset + 1 < insn.Length) pointer = ((code[info.ModRmOffset + 1] >> 3) & 7) == 4 && (info.RexPrefix & 2) == 0;
+                        if (!pointer && !tailJumps.contains(k)) openJump = true;
+                    }
+                    appendOriginal(k);
+                    continue;
+                }
+                if (flow != ControlFlowKind::Sequential && flow != ControlFlowKind::Trap) return "call in a relocated leaf";
+                if (!info.IsTwoByteOpcode && info.Opcode == 0xc9 && code[info.OpcodeOffset] == 0xc9) {
+                    // leave: rsp from rbp, then pop rbp.
+                    append(memoryOperand(0x8d, kRegRsp, kRegRbp, static_cast<std::int32_t>(-shift)));
+                    append(memoryOperand(0x8b, kRegRbp, kRegRsp, static_cast<std::int32_t>(shift)));
+                    append(raiseRsp(8));
+                    continue;
+                }
+                if (pushesOrPops(code, insn)) {
+                    if (std::find(code, code + info.OpcodeOffset, 0x66) != code + info.OpcodeOffset) return "16-bit push or pop in a relocated leaf";
+                    if (const auto reg = pushedRegister(code, insn)) {
+                        append(memoryOperand(0x89, *reg, kRegRsp, static_cast<std::int32_t>(shift - 8)));
+                        append(lowerRsp(8));
+                        continue;
+                    }
+                    if (const auto reg = poppedRegister(code, insn)) {
+                        append(memoryOperand(0x8b, *reg, kRegRsp, static_cast<std::int32_t>(shift)));
+                        append(raiseRsp(8));
+                        continue;
+                    }
+                    const auto op = info.Opcode;
+                    if (use.RegisterRsp) return "push or pop of rsp in a relocated leaf";
+                    const bool pop = info.IsTwoByteOpcode ? (op == 0xa1 || op == 0xa9) : ((op >= 0x58 && op <= 0x5f) || op == 0x9d || op == 0x8f);
+                    // Any other push or pop runs as itself through a slot at rsp, then moves the value:
+                    // a push's address is taken before it lowers rsp, a pop's after it raises it.
+                    Copied moved;
+                    if (use.RspBased) {
+                        const auto bytes = withDisplacement(code, insn, use, use.RspDisp + shift + (pop ? 8 : 0));
+                        if (!bytes) return "rsp operand that cannot move";
+                        moved.Bytes = *bytes;
+                    } else {
+                        const auto mark = out.Bytes.size();
+                        appendOriginal(k);
+                        moved.Bytes.assign(out.Bytes.begin() + static_cast<std::ptrdiff_t>(mark), out.Bytes.end());
+                        for (auto rip : out.Rips)
+                            if (rip.Offset >= mark) moved.Rips.push_back({rip.Offset - mark, rip.End - mark, rip.Target, rip.AddressSize32});
+                        out.Bytes.resize(mark);
+                        out.Rips.erase(std::remove_if(out.Rips.begin(), out.Rips.end(), [&](const CopiedRip& rip) { return rip.Offset >= mark; }), out.Rips.end());
+                    }
+                    if (!pop) {
+                        out.Append(moved);
+                        append(memoryOperand(0x8f, 0, kRegRsp, static_cast<std::int32_t>(shift - 8), false));
+                        append(lowerRsp(8));
+                    } else {
+                        append(memoryOperand(0xff, 6, kRegRsp, static_cast<std::int32_t>(shift), false));
+                        out.Append(moved);
+                        append(raiseRsp(8));
+                    }
+                    continue;
+                }
+                if (use.RegisterRsp) {
+                    if (rspAdjustment(code, insn)) {
+                        appendOriginal(k);
+                        continue;
+                    }
+                    // mov reg, rsp reads the leaf's rsp; mov rsp, reg sets it.
+                    const auto fromRsp = [&]() -> std::optional<std::uint8_t> {
+                        if (const auto mov = modRmFields(code, insn, 0x89, true, true); mov && mov->first == kRegRsp && mov->second != kRegRsp) return mov->second;
+                        if (const auto mov = modRmFields(code, insn, 0x8b, true, true); mov && mov->second == kRegRsp && mov->first != kRegRsp) return mov->first;
+                        return std::nullopt;
+                    };
+                    const auto toRsp = [&]() -> std::optional<std::uint8_t> {
+                        if (const auto mov = modRmFields(code, insn, 0x89, true, true); mov && mov->second == kRegRsp && mov->first != kRegRsp) return mov->first;
+                        if (const auto mov = modRmFields(code, insn, 0x8b, true, true); mov && mov->first == kRegRsp && mov->second != kRegRsp) return mov->second;
+                        return std::nullopt;
+                    };
+                    if (const auto reg = fromRsp()) {
+                        append(memoryOperand(0x8d, *reg, kRegRsp, static_cast<std::int32_t>(shift)));
+                        continue;
+                    }
+                    if (const auto reg = toRsp()) {
+                        append(memoryOperand(0x8d, kRegRsp, *reg, static_cast<std::int32_t>(-shift)));
+                        continue;
+                    }
+                    // and rsp, -2^n keeps the shift when 2^n divides it.
+                    if (insn.Length == 4 && code[0] == 0x48 && code[1] == 0x83 && code[2] == 0xe4) {
+                        const auto mask = -static_cast<std::int64_t>(static_cast<std::int8_t>(code[3]));
+                        if (mask > 0 && (mask & (mask - 1)) == 0 && shift % mask == 0) {
+                            appendOriginal(k);
+                            continue;
+                        }
+                    }
+                    return "other use of rsp in a relocated leaf";
+                }
+                if (use.RspBased) {
+                    const bool evex = info.RexPrefix == 0 && code[info.OpcodeOffset] == 0x62;
+                    if (evex && use.Mod == 1) return "EVEX rsp operand with a scaled displacement";
+                    if (info.AddressSize32) return "32-bit rsp operand";
+                    const auto bytes = withDisplacement(code, insn, use, use.RspDisp + shift, evex);
+                    if (!bytes) return "rsp operand that cannot move";
+                    append(*bytes);
+                    continue;
+                }
+                appendOriginal(k);
+            }
+            if (const auto last = body.back().Info.FlowKind; last == ControlFlowKind::Sequential || last == ControlFlowKind::ConditionalBranch || last == ControlFlowKind::Trap) {
+                leavesIntoFunction = true;
+                leaveTo(bodyEnd);
+            }
+            const auto patch = [&](const std::size_t field, const std::size_t label) {
+                const auto value = static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int64_t>(label) - static_cast<std::int64_t>(field + 4)));
+                for (std::size_t index = 0; index < 4; ++index) out.Bytes[field + index] = static_cast<std::uint8_t>(value >> (8 * index));
+            };
+            for (const auto& [target, fields] : outside) {
+                const auto label = out.Bytes.size();
+                leaveTo(target);
+                for (const auto field : fields) patch(field, label);
+            }
+            for (const auto& [field, k] : internal) patch(field, labelAt[k]);
+            // A case's jump assumes rsp is already lowered: only the stub may reach it, so the original
+            // code must not run (no branch from outside into it, nothing in the stub going back to it).
+            std::vector<std::size_t> pads;
+            for (const auto c : cases) pads.push_back(body[c].Offset);
+            if (!pads.empty()) {
+                if (enteredFromOutside(start + 1, static_cast<std::size_t>(bodyEnd))) return "branch from outside into a relocated leaf with jump tables";
+                if (openJump) return "indirect jump in a relocated leaf with jump tables";
+                if (leavesIntoFunction) return "relocated leaf with jump tables leaves into its own code";
+                for (std::size_t index = 0; index < pads.size(); ++index) {
+                    const auto begin = pads[index];
+                    if (begin < start + kJumpBytes || begin + kJumpBytes > limit || (index + 1 < pads.size() && pads[index + 1] < begin + kJumpBytes)) return "jump table cases closer than a jump";
+                    if (overlapsExisting(begin, begin + kJumpBytes)) return "overlaps another stub";
+                }
+            }
+            TrampolineSite site;
+            site.Offset = ph.Offset + start;
+            site.Address = ph.MappedAddress + start;
+            site.Length = kJumpBytes;
+            site.OriginalBytes.assign(seg.begin() + static_cast<std::ptrdiff_t>(start), seg.begin() + static_cast<std::ptrdiff_t>(start + kJumpBytes));
+            site.ReturnBranchOffset = out.Bytes.size();
+            for (const auto& rip : out.Rips) site.Relocations.push_back({rip.Offset, rip.End, rip.Target - static_cast<std::int64_t>(start), rip.AddressSize32});
+            out.Bytes.insert(out.Bytes.end(), std::begin(kJumpBack), std::end(kJumpBack));
+            site.Body = std::move(out.Bytes);
+            taken.emplace_back(start, start + kJumpBytes);
+            const auto main = sites.size();
+            sites.push_back(std::move(site));
+            for (std::size_t index = 0; index < pads.size(); ++index) {
+                TrampolineSite pad;
+                pad.Offset = ph.Offset + pads[index];
+                pad.Address = ph.MappedAddress + pads[index];
+                pad.Length = kJumpBytes;
+                pad.OriginalBytes.assign(seg.begin() + static_cast<std::ptrdiff_t>(pads[index]), seg.begin() + static_cast<std::ptrdiff_t>(pads[index] + kJumpBytes));
+                pad.ReturnBranchOffset = 0;
+                pad.JoinBack = sites.size() - main;
+                pad.JoinOffset = labelAt[indexOf.at(pads[index])];
+                taken.emplace_back(pads[index], pads[index] + kJumpBytes);
+                sites.push_back(std::move(pad));
+            }
+            ++report.Relocated;
+            ++report.Framed;
+            report.RelocatedCases += pads.size();
+            if (openJump) ++report.RelocatedOpenJumps;
+            return nullptr;
+        };
         // A leaf without a frame pointer whose frame cannot be patched in place (a short exit, a
         // branch into one) is tried again as a return thunk, its pushes and allocation taken as
         // part of the body. If that fails too, the first reason is reported.
@@ -1052,12 +1395,17 @@ void frameSegment(
                 if (stub.End - stub.Begin < kJumpBytes || targetInside(stub.Begin, stub.End) || overlapsSite(stub.Begin, stub.End) || overlapsExisting(stub.Begin, stub.End)) reason = "rsp operand that cannot move and has no room for a stub";
                 else stubs.push_back(std::move(stub));
             }
+            // Code entered from outside its start runs there with rsp as the leaf keeps it, so the
+            // leaf's own code must stay as it is: it is relocated whole instead.
+            if (reason == nullptr && enteredFromOutside(start + 1, static_cast<std::size_t>(bodyEnd))) reason = "entered from outside its start";
             if (reason != nullptr) {
                 if (!asThunk && !rbpPrologue && (!pushed.empty() || allocation > 0)) {
                     firstReason = reason;
                     continue;
                 }
-                skip(firstReason != nullptr ? firstReason : reason);
+                const auto relocation = relocate();
+                if (relocation == nullptr) break;
+                skip(relocation);
                 break;
             }
             for (const auto& stub : stubs)
@@ -1124,10 +1472,11 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     const std::vector<TrampolineSite>& existing,
     RedZoneFrameReport& report,
     std::vector<RedZoneDisplacement>& displacements,
-    const std::vector<Domain::ProgramHeader>& loadSegments
+    const std::vector<Domain::ProgramHeader>& loadSegments,
+    const std::map<std::uint64_t, std::uint64_t>& relativeAddends
 ) {
     std::vector<TrampolineSite> sites;
-    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, loadSegments);
+    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, loadSegments, relativeAddends);
     return sites;
 }
 
