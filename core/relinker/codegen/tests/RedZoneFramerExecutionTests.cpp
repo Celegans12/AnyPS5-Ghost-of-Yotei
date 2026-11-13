@@ -398,6 +398,15 @@ std::vector<Leaf> jumpTableLeaves() {
             0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3,
             0x48, 0x8b, 0x44, 0x24, 0xf8, 0x48, 0x01, 0xd0, 0xc3, 0xcc,
         }, kB + kC, true, {0xf0, 0xff, 0xff, 0xff, 0xf6, 0xff, 0xff, 0xff}},
+        // The same switch with its lea 19 instructions before the dispatch, as when hoisted out of
+        // a loop: the table is found from the function's RIP-relative leas.
+        {"leaf without pushes dispatching through a jump table whose lea is far before", {
+            0x48, 0x8d, 0x0d, 0x32, 0x00, 0x00, 0x00, 0x48, 0x89, 0x74, 0x24, 0xf8, 0x83, 0xe7, 0x01,
+            0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
+            0x48, 0x63, 0x04, 0xb9, 0x48, 0x01, 0xc8, 0xff, 0xe0,
+            0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3,
+            0x48, 0x8b, 0x44, 0x24, 0xf8, 0x48, 0x01, 0xd0, 0xc3, 0xcc,
+        }, kB + kC, true, {0xf0, 0xff, 0xff, 0xff, 0xf6, 0xff, 0xff, 0xff}},
     };
 }
 
@@ -634,7 +643,7 @@ int main() {
         const auto thunkTail = runLeaves(thunkTailCallLeaves());
         require(thunkTail.ReturnThunks == 1 && thunkTail.Exits == 2, "the thunk leaf ending in a tail call was framed with " + std::to_string(thunkTail.ReturnThunks) + " thunks and " + std::to_string(thunkTail.Exits) + " exits, not 1 and 2");
         const auto switched = runLeaves(jumpTableLeaves());
-        require(switched.Exits == 2 && switched.WidenedExits == 2, "the leaf with a jump table was framed with " + std::to_string(switched.Exits) + " exits, " + std::to_string(switched.WidenedExits) + " widened, not 2 and 2");
+        require(switched.Exits == 4 && switched.WidenedExits == 4, "the leaves with jump tables were framed with " + std::to_string(switched.Exits) + " exits, " + std::to_string(switched.WidenedExits) + " widened, not 4 and 4");
         std::cout << "red-zone framer execution tests passed\n";
         return 0;
     } catch (const SteppingDegraded& error) {
