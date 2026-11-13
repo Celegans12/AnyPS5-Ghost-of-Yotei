@@ -377,6 +377,7 @@ public:
     void Upload(bool addressable);
     void UploadPrepare(bool addressable);
     void UploadFinish(bool addressable);
+    bool PresyncSpaceWrites() const;
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
@@ -599,7 +600,7 @@ private:
     // drops the space: for a region that partially overlaps a base region, and for a build whose
     // imports changed under the space (`resolve`: the direct regions are re-resolved by UploadFinish).
     void dissolveSpace(bool resolve);
-    void completeSpaceWrites() const;
+    void completeSpaceWrites(bool waitUnlocked = false) const;
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address, std::uint64_t end) const;

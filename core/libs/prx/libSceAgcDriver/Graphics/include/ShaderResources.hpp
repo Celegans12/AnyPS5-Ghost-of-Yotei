@@ -113,7 +113,7 @@ std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<
 std::shared_ptr<Texture> CachedTableTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint64_t guestBytes, bool depthCompare);
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second);
 bool AnyPendingCpuWrites(const Context& context);
-bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes);
+bool CompletePendingCpuWrites(const Context& context, std::uint64_t address, std::size_t bytes, bool waitUnlocked = false);
 bool SpirvStoresThroughAddresses(std::span<const std::uint32_t> words);
 bool ShaderStoresThroughAddresses(const ShaderRecompiler::SharedSpirv& spirv);
 void LastRecordIndices(std::span<const void* const> logged, std::span<const void* const> objects, std::vector<std::size_t>& indices);
@@ -469,6 +469,7 @@ public:
     // compiled shader's bindings itself when stage A has not run), and on a completed object from
     // the resource cache (its Revalidate repeats the same lookups), without the device lock.
     std::vector<PresyncSurface> PresyncSurfaces() const;
+    bool PresyncSpaceWrites() const { return guestMemory.PresyncSpaceWrites(); }
 
 private:
     friend class AgcDriver::VulkanDevice;

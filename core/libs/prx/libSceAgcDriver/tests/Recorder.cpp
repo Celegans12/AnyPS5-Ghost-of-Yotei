@@ -1220,6 +1220,40 @@ void spaceWriteSyncTests(const Device& device, Recorder& recorder) {
     build();
     Require(noted && landed(rangeAt(1) + 0x80) && landed(rangeAt(3) + 0x80) && Recorder::PendingCompletionLabels() == 0, "a build over the address space missed a label a completion noted during its sync");
     recorder.Sync();
+    {
+        GuestBufferMemory spaceless(context);
+        Require(!spaceless.PresyncSpaceWrites(), "a build without an address space pre-synced");
+    }
+    build();
+    {
+        GuestBufferMemory cached(context);
+        if (!cached.AcquireRegisteredCached()) {
+            std::cout << "the address space is not cached: the space pre-sync is not tested\n";
+        } else {
+            const auto spaceLabel = rangeAt(2) + 0x200;
+            const auto gapLabel = rangeAt(2) + bytes + 0x200;
+            static_cast<void>(recorder.Commands());
+            recorder.AfterCompletions(spaceLabel, value, 7006, 0, false);
+            recorder.Submit();
+            static_cast<void>(recorder.Commands());
+            recorder.AfterCompletions(gapLabel, value, 7007, 0, false);
+            recorder.Submit();
+            Require(!landed(spaceLabel) && !landed(gapLabel) && Recorder::PendingCompletionLabels() == 2, "the labels for the space pre-sync are not pending");
+            const auto depth = GpuMutex().DepthOnThisThread();
+            for (std::uint32_t level = 0; level < depth; ++level) GpuMutex().unlock();
+            const bool presynced = cached.PresyncSpaceWrites();
+            const bool released = !GpuMutex().HeldByThisThread();
+            for (std::uint32_t level = 0; level < depth; ++level) GpuMutex().lock();
+            Require(presynced, "a build holding the address space did not pre-sync its pending write-backs");
+            Require(released, "the space pre-sync left the GPU mutex held");
+            Require(landed(spaceLabel) && !landed(gapLabel) && Recorder::PendingCompletionLabels() == 1, "the space pre-sync did not complete exactly the label inside the space");
+            cached.AddReadable(rangeAt(0) + 64, 16);
+            cached.Upload(true);
+            cached.WriteBack();
+            Require(!landed(gapLabel), "the upload after the pre-sync completed a label outside the space");
+        }
+    }
+    recorder.Sync();
     registry(false);
     ::operator delete(block, std::align_val_t{65536});
 }

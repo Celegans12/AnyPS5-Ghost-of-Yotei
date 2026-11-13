@@ -4841,6 +4841,9 @@ struct PresyncCounters {
     std::atomic<std::uint64_t> waitedUs{0};
     std::atomic<std::uint64_t> keyChecks{0};
     std::atomic<std::uint64_t> keyWaits{0};
+    std::atomic<std::uint64_t> spaceChecks{0};
+    std::atomic<std::uint64_t> spacePresyncs{0};
+    std::atomic<std::uint64_t> spaceUs{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -5401,7 +5404,7 @@ std::uint64_t VulkanDevice::presync(std::span<const Graphics::PresyncSurface> su
         auto last = counters.lastReport.load();
         if (nowMs - last >= 10000 && counters.lastReport.compare_exchange_strong(last, nowMs)) {
             const auto keyWaitCounts = Graphics::KeyWaitCounts();
-            AgcDriver::ProfilePrint_nid_no_patch("[presync] %llu dispatches checked, %llu pre-syncs waited %.0f ms (cumulative); key ranges %llu checked, %llu pre-syncs that only the keys required; WaitForKeyWriters %llu calls: %llu without a pending writer, %llu known keys, %llu fills leaving uncompressed, %llu synced\n", static_cast<unsigned long long>(counters.checked.load()), static_cast<unsigned long long>(counters.presyncs.load()), counters.waitedUs.load() / 1000.0, static_cast<unsigned long long>(counters.keyChecks.load()), static_cast<unsigned long long>(counters.keyWaits.load()), static_cast<unsigned long long>(keyWaitCounts.calls), static_cast<unsigned long long>(keyWaitCounts.noPending), static_cast<unsigned long long>(keyWaitCounts.known), static_cast<unsigned long long>(keyWaitCounts.fillsUncompressed), static_cast<unsigned long long>(keyWaitCounts.synced));
+            AgcDriver::ProfilePrint_nid_no_patch("[presync] %llu dispatches checked, %llu pre-syncs waited %.0f ms (cumulative); key ranges %llu checked, %llu pre-syncs that only the keys required; WaitForKeyWriters %llu calls: %llu without a pending writer, %llu known keys, %llu fills leaving uncompressed, %llu synced; address spaces %llu checked, %llu with pending write-backs, %.0f ms\n", static_cast<unsigned long long>(counters.checked.load()), static_cast<unsigned long long>(counters.presyncs.load()), counters.waitedUs.load() / 1000.0, static_cast<unsigned long long>(counters.keyChecks.load()), static_cast<unsigned long long>(counters.keyWaits.load()), static_cast<unsigned long long>(keyWaitCounts.calls), static_cast<unsigned long long>(keyWaitCounts.noPending), static_cast<unsigned long long>(keyWaitCounts.known), static_cast<unsigned long long>(keyWaitCounts.fillsUncompressed), static_cast<unsigned long long>(keyWaitCounts.synced), static_cast<unsigned long long>(counters.spaceChecks.load()), static_cast<unsigned long long>(counters.spacePresyncs.load()), counters.spaceUs.load() / 1000.0);
         }
     }
     return serial;
@@ -5496,6 +5499,15 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         Presyncs().checked.fetch_add(1, std::memory_order_relaxed);
         const auto surfaces = cached != nullptr ? cached->PresyncSurfaces() : prepared->resources->PresyncSurfaces();
         prepared->presyncSerial = presync(surfaces);
+        if (cached == nullptr && !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoSpacePresync)) {
+            auto& counters = Presyncs();
+            counters.spaceChecks.fetch_add(1, std::memory_order_relaxed);
+            const auto spaceStart = std::chrono::steady_clock::now();
+            if (prepared->resources->PresyncSpaceWrites()) {
+                counters.spacePresyncs.fetch_add(1, std::memory_order_relaxed);
+                counters.spaceUs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - spaceStart).count()), std::memory_order_relaxed);
+            }
+        }
         phase(PreparedDispatch::PreparePresync);
     }
     if (profile) prepared->prepareMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();

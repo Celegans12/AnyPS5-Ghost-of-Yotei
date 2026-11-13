@@ -5810,7 +5810,16 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
     }
 }
 
-void GuestBufferMemory::completeSpaceWrites() const {
+bool GuestBufferMemory::PresyncSpaceWrites() const {
+    if (space == nullptr || uploaded || Recorder::InCompletion()) return false;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    if (Recorder::Active() == nullptr || !AnyPendingCpuWrites(context)) return false;
+    completeSpaceWrites(true);
+    return true;
+}
+
+void GuestBufferMemory::completeSpaceWrites(bool waitUnlocked) const {
     auto* recorder = Recorder::Active();
     if (recorder == nullptr || Recorder::InCompletion() || !AnyPendingCpuWrites(context)) return;
     const auto& base = space->base;
@@ -5822,7 +5831,7 @@ void GuestBufferMemory::completeSpaceWrites() const {
         OverlappedRanges(std::span<const Region>(base), next, writes, candidates);
         next = base.size();
         for (const auto index : candidates) {
-            if (!CompletePendingCpuWrites(context, base[index].begin, static_cast<std::size_t>(base[index].end - base[index].begin))) continue;
+            if (!CompletePendingCpuWrites(context, base[index].begin, static_cast<std::size_t>(base[index].end - base[index].begin), waitUnlocked)) continue;
             next = index + 1;
             break;
         }
