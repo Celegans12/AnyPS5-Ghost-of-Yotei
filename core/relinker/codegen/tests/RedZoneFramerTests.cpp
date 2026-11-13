@@ -383,6 +383,24 @@ void framesLeavesReadingAh() {
     require(report.Framed == 1 && report.Skipped.empty(), "a leaf reading AH was refused as using rsp");
 }
 
+void ignoresFramePointerLeavesInsideTheirAllocation() {
+    // push rbp; mov rbp, rsp; push rbx; sub rsp, 0x10; mov [rbp-0x14], edi; mov eax, [rbp-0x14]:
+    // the slot is inside the allocation, freed only in an epilogue ending in a ret or a tail call.
+    const std::vector<std::uint8_t> prologue{0x55, 0x48, 0x89, 0xe5, 0x53, 0x48, 0x83, 0xec, 0x10};
+    const std::vector<std::uint8_t> body{0x89, 0x7d, 0xec, 0x8b, 0x45, 0xec, 0x85, 0xc0, 0x75, 0x0b};
+    const std::vector<std::uint8_t> tailCall{0x48, 0x83, 0xc4, 0x10, 0x5b, 0x5d, 0xe9, 0x00, 0x01, 0x00, 0x00};
+    const std::vector<std::uint8_t> exit{0x48, 0x83, 0xc4, 0x10, 0x5b, 0x5d, 0xc3};
+    std::vector<std::uint8_t> inside = body;
+    append(inside, tailCall);
+    // The same leaf freeing its allocation before the slot is read again does use the red zone.
+    std::vector<std::uint8_t> early{0x89, 0x7d, 0xec, 0x48, 0x83, 0xc4, 0x10, 0x8b, 0x45, 0xec, 0x48, 0x83, 0xec, 0x10};
+    const auto input = image({framelessLeaf(prologue, inside, exit), framelessLeaf(prologue, early, exit)});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.RedZoneFunctions == 1, "a frame-pointer leaf whose slots lie in its allocation was counted as using the red zone, or one freeing it early was not");
+}
+
 void skipsWideningOverBranchTargets() {
     const std::vector<std::uint8_t> loopToStart{0x48, 0x89, 0x7c, 0x24, 0xf0, 0xff, 0xc9, 0x75, 0xf7, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0xc3};
     std::vector<std::uint8_t> jumpToPop = StoreBelowRsp;
@@ -707,7 +725,7 @@ void skipsAllocatingLeavesWithoutAMatchingFree() {
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
     require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 3, "an allocating leaf without a matching free, or with more rsp arithmetic, was framed");
     require(report.Skipped.at("exit does not free the prologue's allocation") == 1, "an exit that does not free the allocation was not reported with its own reason");
-    require(report.Skipped.at("other use of rsp") == 2, "an add of another size before the pops, or more rsp arithmetic in the body, was not reported as another use of rsp");
+    require(report.Skipped.at("rsp arithmetic that does not balance") == 2, "an add of another size before the pops, or more rsp arithmetic in the body, was not reported as unbalanced rsp arithmetic");
 }
 
 void skipsLeavesWithoutFramePointerThatPushOrPop() {
@@ -1017,6 +1035,7 @@ int main() {
         skipsFragmentsThatPopWithoutPushing();
         framesLeavesEnteredByATailJump();
         framesLeavesReadingAh();
+        ignoresFramePointerLeavesInsideTheirAllocation();
         skipsWideningOverBranchTargets();
         skipsBranchesIntoTheInstructionsAfterAShortPrologue();
         widensAShortPrologueThatAllocates();
