@@ -86,6 +86,7 @@ add_library(relinker_core STATIC
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/output/CallRegistryWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/patching/GamePatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/pipeline/Conversion.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/pipeline/RedZoneFraming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/relinker/src/pipeline/RelinkerPipeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../libs/nid/src/NidCompute.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../libs/nid/src/Sha1.cpp

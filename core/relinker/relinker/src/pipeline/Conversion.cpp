@@ -19,6 +19,7 @@
 #include <relinker/guest/GuestImage.hpp>
 #include <codegen/IAmd64OnlyConverter.hpp>
 #include <codegen/x86/RedZoneFramer.hpp>
+#include <relinker/pipeline/RedZoneFraming.hpp>
 #include <relinker/analysis/UnusedNidFilter/EhFrameReader.hpp>
 #include <map>
 #include <codegen/CodegenException.hpp>
@@ -117,38 +118,9 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
     std::vector<Codegen::RedZoneDisplacement> displacements;
     if (options.FrameRedZone) {
         const auto headers = Relinker::ElfReader(sourceBytes).ReadProgramHeaders();
-        std::vector<Domain::ProgramHeader> codeSegments;
-        std::vector<Domain::ProgramHeader> loadSegments;
-        for (const auto& header : headers) if (header.Type == 1 && (header.Flags & 1) != 0) codeSegments.push_back(header);
-        for (const auto& header : headers) if (header.Type == 1) loadSegments.push_back(header);
-        std::vector<Codegen::RedZoneFunction> functions;
-        for (const auto& region : Relinker::UnusedNidFilter::ReadExceptionFunctions(sourceBytes, headers, {}, {})) functions.push_back({region.Begin, region.End});
-        if (functions.empty()) throw Domain::RelinkerException("Red-zone framing needs function bounds from the executable's .eh_frame, and it has none");
-        // R_X86_64_RELATIVE addends: tables of absolute addresses are zero in the file.
-        std::map<std::uint64_t, std::uint64_t> relativeAddends;
-        const auto& rela = result.DynamicSection.RelaData;
-        for (std::size_t at = 0; at + 24 <= rela.size(); at += 24) {
-            std::uint64_t offset = 0;
-            std::uint64_t info = 0;
-            std::uint64_t addend = 0;
-            std::memcpy(&offset, rela.data() + at, 8);
-            std::memcpy(&info, rela.data() + at + 8, 8);
-            std::memcpy(&addend, rela.data() + at + 16, 8);
-            if ((info & 0xffffffffu) == 8) relativeAddends.emplace(offset, addend);
-        }
-        Codegen::RedZoneFrameReport report;
-        auto framed = Codegen::FrameRedZoneFunctions(sourceBytes, codeSegments, functions, trampolines, report, displacements, loadSegments, relativeAddends);
-        for (const auto& moved : displacements) {
-            if (moved.Offset > sourceBytes.size() || moved.Bytes.size() > sourceBytes.size() - moved.Offset)
-                throw Domain::RelinkerException("Red-zone displacement exceeds source image", moved.Offset);
-            std::copy(moved.Bytes.begin(), moved.Bytes.end(), sourceBytes.begin() + static_cast<std::ptrdiff_t>(moved.Offset));
-        }
-        { std::ostringstream message; message << "Red-zone framing: " << report.Functions << " functions, " << report.RedZoneFunctions << " leaf functions keep values below RSP, " << report.Framed << " framed (" << report.FramedWithoutFramePointer << " without a frame pointer, " << report.MovedOperands << " rsp operands moved, " << report.StubbedOperands << " in " << report.OperandStubs << " operand stubs; " << report.Exits << " exits)\n"; inputProgress.Message(message.str()); }
-        if (report.ReturnThunks != 0) { std::ostringstream message; message << "Red-zone framing: " << report.ReturnThunks << " leaves return through a thunk, as their exits could not be patched\n"; inputProgress.Message(message.str()); }
-        if (report.Relocated != 0) { std::ostringstream message; message << "Red-zone framing: " << report.Relocated << " leaves relocated whole into a stub, as their frames could not be patched in place (" << report.RelocatedCases << " jump-table cases enter through a jump; " << report.RelocatedOpenJumps << " leaves have an indirect jump that leaves the stub)\n"; inputProgress.Message(message.str()); }
-        if (report.WidenedPrologues != 0 || report.WidenedExits != 0) { std::ostringstream message; message << "Red-zone framing: " << report.WidenedPrologues << " prologues widened over the instructions after them and " << report.WidenedExits << " exits over the instructions before them, as they were shorter than a jump (" << report.WidenedOperands << " rsp operands moved into their stubs)\n"; inputProgress.Message(message.str()); }
-        for (const auto& [reason, count] : report.Skipped) { std::ostringstream message; message << "Red-zone framing: skipped " << count << ": " << reason << '\n'; inputProgress.Message(message.str()); }
-        trampolines.insert(trampolines.end(), std::make_move_iterator(framed.begin()), std::make_move_iterator(framed.end()));
+        auto framing = Relinker::FrameRedZoneImage(sourceBytes, headers, result.DynamicSection.RelaData, trampolines, "Red-zone framing", [&](std::string_view text) { inputProgress.Message(text); });
+        if (!framing.HasBounds) throw Domain::RelinkerException("Red-zone framing needs function bounds from the executable's .eh_frame, and it has none");
+        displacements = std::move(framing.Displacements);
     }
     GamePatch::CheckOverlaps(options.TargetName, patchedRanges, {.RelinkPatches = result.Patches, .RelaData = result.DynamicSection.RelaData, .RelaPltData = result.DynamicSection.RelaPltData, .RedZoneSites = std::span<const Codegen::TrampolineSite>(trampolines).subspan(intelSites), .RedZoneDisplacements = displacements});
 
@@ -165,7 +137,7 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
 
     std::vector<Relinker::GuestArtifact> guestArtifacts;
     if (!input.Modules.empty()) {
-        guestArtifacts = Relinker::GuestModuleBuilder().Build(input.InputPath, input.OutputPath, result.DynamicSection, windows, macos, options.ToIntel, Codegen::Amd64OnlyTargetFor(options.ToRosetta, options.ToAvx), *syscallScanner, options.LazyBinding, options.OmitUnavailableDependencies, options.RunPath, options.ExcludedModules, input.ModuleRoot, input.RuntimeDirectories, std::move(input.Modules), inputProgress, options.FunctionSymbolRoots);
+        guestArtifacts = Relinker::GuestModuleBuilder().Build(input.InputPath, input.OutputPath, result.DynamicSection, windows, macos, options.ToIntel, options.ToRosetta, *syscallScanner, options.LazyBinding, options.OmitUnavailableDependencies, options.RunPath, options.ExcludedModules, input.ModuleRoot, input.RuntimeDirectories, std::move(input.Modules), inputProgress, options.FunctionSymbolRoots, options.FrameRedZone);
     }
 
     auto byteWriter = std::make_shared<Io::ByteWriter>();

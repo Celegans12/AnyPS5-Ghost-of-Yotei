@@ -476,6 +476,12 @@ std::vector<Leaf> relocatedLeaves() {
             0xe9, 0xdb, 0xff, 0xff, 0xff, 0xe9, 0xd6, 0xff, 0xff, 0xff,
             0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3, 0xcc,
         }, kA, true, {0xef, 0xff, 0xff, 0xff, 0xf4, 0xff, 0xff, 0xff}},
+        // longjmp-shaped: rsp saved to a buffer after the code and reloaded from it (libc's
+        // `mov rsp, [rdx+0x10]`), then a spill below the new rsp written and read.
+        {"leaf reloading rsp from a buffer", {
+            0x48, 0x89, 0xe0, 0x48, 0x8d, 0x15, 0x16, 0x00, 0x00, 0x00, 0x48, 0x89, 0x42, 0x10, 0x48, 0x8b, 0x62, 0x10,
+            0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0x48, 0x01, 0xf0, 0xc3,
+        }, kA + kB, true, std::vector<std::uint8_t>(24, 0)},
     };
 }
 
@@ -699,7 +705,7 @@ int main() {
         const auto switched = runLeaves(jumpTableLeaves());
         require(switched.Exits == 4 && switched.WidenedExits == 4, "the leaves with jump tables were framed with " + std::to_string(switched.Exits) + " exits, " + std::to_string(switched.WidenedExits) + " widened, not 4 and 4");
         const auto relocated = runLeaves(relocatedLeaves());
-        require(relocated.Relocated == 6 && relocated.RelocatedCases == 2 && relocated.RelocatedOpenJumps == 0, "the leaves that cannot be framed in place were relocated " + std::to_string(relocated.Relocated) + " times with " + std::to_string(relocated.RelocatedCases) + " case jumps and " + std::to_string(relocated.RelocatedOpenJumps) + " open jumps, not 6, 2 and 0");
+        require(relocated.Relocated == 7 && relocated.RelocatedCases == 2 && relocated.RelocatedOpenJumps == 0 && relocated.Skipped.empty(), "the leaves that cannot be framed in place were relocated " + std::to_string(relocated.Relocated) + " times with " + std::to_string(relocated.RelocatedCases) + " case jumps and " + std::to_string(relocated.RelocatedOpenJumps) + " open jumps and " + std::to_string(relocated.Skipped.size()) + " skip reasons, not 7, 2, 0 and 0");
         std::cout << "red-zone framer execution tests passed\n";
         return 0;
     } catch (const SteppingDegraded& error) {
