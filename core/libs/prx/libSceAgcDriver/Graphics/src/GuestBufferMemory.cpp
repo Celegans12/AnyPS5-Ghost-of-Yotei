@@ -1829,7 +1829,10 @@ ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, s
     if (run.ranges.empty()) return run;
     if (std::all_of(run.ranges.begin(), run.ranges.end(), [window](const auto& range) { return range->bytes > window; })) return run;
     if (begin == run.base) return run;
-    if (run.ranges.front()->bytes > window && run.bytes - run.ranges.front()->bytes <= window) return run;
+    // A binding from inside the first range joins too when that range is imported on its own (no
+    // window block groups it with its neighbours): left apart, every use is copied on the CPU (007
+    // First Light binds 12.5 MiB from inside a 2 MiB range into the 12 MiB one after it, per draw).
+    if (const auto bounds = importRunBounds(lease, begin); bounds.found && bounds.first == bounds.last) return run;
     return {};
 }
 
