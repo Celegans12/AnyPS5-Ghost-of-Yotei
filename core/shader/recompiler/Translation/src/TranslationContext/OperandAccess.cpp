@@ -367,8 +367,8 @@ IrU32 TranslationContext::quietNan32(IrU32 bits) {
 
 IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> sources, IrValue* result, IrValue* invalidProduct, bool multiplication) {
     if (!ExactF32Arithmetic()) return result;
-    const auto isNan = [&](IrValue& value) -> IrValue& { return ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {&value}); };
-    IrValue* candidate = nullptr;
+    const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {&ir.BitCastF32(bits)}); };
+    IrValue* bits = &ir.BitCastU32(*result);
     const bool normalFactor = multiplication && std::any_of(sources.begin(), sources.end(), [](const IrValue* source) {
         const IrValue* constant = constantF32Bits(*source);
         if (constant == nullptr) return false;
@@ -390,7 +390,7 @@ IrValue* TranslationContext::nanResultF32(std::initializer_list<IrValue*> source
 
 IrValue* TranslationContext::propagatedNanResultF32(std::initializer_list<IrValue*> sources, IrValue* result) {
     if (!ExactF32Arithmetic()) return result;
-    const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.UGreaterThan(ir.BitwiseAnd(bits, ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u)); };
+    const auto isNan = [&](IrValue& bits) -> IrValue& { return ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {&ir.BitCastF32(bits)}); };
     IrValue* nan = &ir.Constant(0xffc00000u);
     for (auto source = sources.end(); source != sources.begin();) {
         --source;
@@ -411,7 +411,7 @@ IrValue& TranslationContext::invalidProductF32(IrValue* lhs, IrValue* rhs) {
 IrValue& TranslationContext::invalidOperationF32(std::initializer_list<IrValue*> sources, IrValue& invalidProduct) {
     IrValue* noNan = &ir.ConstantBool(true);
     for (IrValue* source : sources) {
-        IrValue& nan = ir.UGreaterThan(ir.BitwiseAnd(ir.BitCastU32(*source), ir.Constant(0x7fffffffu)), ir.Constant(0x7f800000u));
+        IrValue& nan = ir.Emit(IrOpcode::FPIsNan32, IrType::U1, {&ir.BitCastF32(ir.BitCastU32(*source))});
         noNan = &ir.LogicalAnd(*noNan, ir.LogicalNot(nan));
     }
     return ir.LogicalOr(invalidProduct, *noNan);
