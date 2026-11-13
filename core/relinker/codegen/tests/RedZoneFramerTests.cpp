@@ -360,6 +360,29 @@ void skipsFragmentsThatPopWithoutPushing() {
     require(sites.empty() && displacements.empty() && report.Skipped.at("push or pop in a leaf without pushes") == 1, "a fragment without pushes that pops a register its caller pushed was framed");
 }
 
+void framesLeavesEnteredByATailJump() {
+    std::vector<std::uint8_t> body = StoreBelowRsp;
+    append(body, LoadBelowRsp);
+    // The second function sits at 0x60 and jumps to the leaf at 0x40, as a tail call does.
+    const auto input = image({framelessLeaf({}, body, Ret), {0xe9, 0xdb, 0xff, 0xff, 0xff}});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.Framed == 1 && report.WidenedPrologues == 1 && sites.size() == 2 && sites[0].Address == Base + 0x40, "a leaf whose widened prologue another function jumps to was not framed");
+}
+
+void framesLeavesReadingAh() {
+    // movzx ecx, ah and mov [rsi+1], ah name register 4 of a byte operand, which is AH without REX.
+    std::vector<std::uint8_t> body = StoreBelowRsp;
+    append(body, {0x0f, 0xb6, 0xcc, 0x88, 0x66, 0x01});
+    append(body, LoadBelowRsp);
+    const auto input = image({framelessLeaf({}, body, Ret)});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.Framed == 1 && report.Skipped.empty(), "a leaf reading AH was refused as using rsp");
+}
+
 void skipsWideningOverBranchTargets() {
     const std::vector<std::uint8_t> loopToStart{0x48, 0x89, 0x7c, 0x24, 0xf0, 0xff, 0xc9, 0x75, 0xf7, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0xc3};
     std::vector<std::uint8_t> jumpToPop = StoreBelowRsp;
@@ -992,6 +1015,8 @@ int main() {
         widensAShortFramePointerPrologue();
         framesLeavesWithoutPushes();
         skipsFragmentsThatPopWithoutPushing();
+        framesLeavesEnteredByATailJump();
+        framesLeavesReadingAh();
         skipsWideningOverBranchTargets();
         skipsBranchesIntoTheInstructionsAfterAShortPrologue();
         widensAShortPrologueThatAllocates();
