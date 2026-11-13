@@ -842,6 +842,19 @@ void frameSegment(
                             continue;
                         }
                     }
+                    // mov rsp, [mem] (longjmp) loads an rsp the leaf does not keep: load it, then lower
+                    // it by the shift like the leaf's own.
+                    if (const auto load = modRmFields(code, insn, 0x8b, true, false); load && load->first == kRegRsp) {
+                        if (use.RspBased) {
+                            const auto bytes = withDisplacement(code, insn, use, use.RspDisp + shift);
+                            if (!bytes) return "rsp operand that cannot move";
+                            append(*bytes);
+                        } else {
+                            appendOriginal(k);
+                        }
+                        append(lowerRsp(shift));
+                        continue;
+                    }
                     return "other use of rsp in a relocated leaf";
                 }
                 if (use.RspBased) {
