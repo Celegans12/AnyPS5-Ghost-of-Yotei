@@ -142,7 +142,7 @@ Divinity is not a test title. BO1 was removed from testing on 2026-11-13 (game d
 | Phase | State |
 |---|---|
 | 0 | Done for all four titles. |
-| 1 | Eboot framing done: every red-zone leaf of the four eboots is framed, 0 skipped (from 132 / 147 / 158 / 39; 18 relocated whole, 98cf5da8d9). Framed crash checks (40 s) clean on all four. Open: the bundled PRX modules, code without `.eh_frame` bounds, the fault-storm test. |
+| 1 | Eboot framing done: every red-zone leaf of the four eboots is framed, 0 skipped (from 132 / 147 / 158 / 39; 18 relocated whole, 98cf5da8d9). Framed crash checks (40 s) clean on all four. Bundled PRX modules framed too (5 / 11 / 16 / 1 modules for FF / AoM / LEGO / 007, 0 skipped, every module has `.eh_frame` bounds; the one skip was libc's longjmp `mov rsp, [mem]`, now loaded and lowered by the shift); framed crash checks clean. Open: code without `.eh_frame` bounds, the fault-storm test. |
 | 2 | Not started (waits on the phase 1 gate). |
 | 3 | Not started. |
 | 4 | Section B built in walk-based form (AoM title 216 to about 150 ms); 007 binding join fix 375d360e24 (387-426 to 127-133 ms). Section D validity change not started. |
@@ -151,8 +151,8 @@ Divinity is not a test title. BO1 was removed from testing on 2026-11-13 (game d
 
 ### Next, in phase order
 
-1. **Phase 1:** frame the bundled PRX modules, account for code without `.eh_frame` bounds, and
-   build the fault-storm test. Check each change with one framed run per title for crashes (40 s,
+1. **Phase 1:** account for code without `.eh_frame` bounds (code an FDE does not cover, in the
+   eboots and modules), and build the fault-storm test. Check each change with one framed run per title for crashes (40 s,
    no benchmarks needed).
 2. **Phase 2** once a title passes the phase 1 gate.
 3. **Phase 3** (waits) after that; it does not depend on phase 1.

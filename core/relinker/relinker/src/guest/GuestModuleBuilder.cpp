@@ -2,6 +2,8 @@
 #include <relinker/analysis/RelativeJumpTables.hpp>
 #include <relinker/analysis/SceCodeExtent.hpp>
 #include <relinker/analysis/UnusedNidFilter/EhFrameReader.hpp>
+#include <relinker/pipeline/RedZoneFraming.hpp>
+#include <relinker/patching/GamePatch.hpp>
 #include <elfpatcher/general/GuestModuleWriter.hpp>
 #include <codegen/IAmd64OnlyConverter.hpp>
 #include <domain/ImportModule.hpp>
@@ -90,7 +92,7 @@ std::string ModuleStem(std::string name, const bool windows) {
 
 }
 
-std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, const bool windows, const bool macos, const bool toIntel, const Codegen::Amd64OnlyTarget target, ISyscallScanner& syscallScanner, const bool lazyBinding, const bool omitUnavailableDependencies, const std::string& runPath, const std::set<std::string>& excludedModules, const std::filesystem::path& root, const std::vector<std::filesystem::path>& runtimeDirectories, std::vector<GuestModuleInput> modules, Domain::IProgress& progress, const bool functionSymbolRoots) const {
+std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, const bool windows, const bool macos, const bool toIntel, const bool toRosetta, ISyscallScanner& syscallScanner, const bool lazyBinding, const bool omitUnavailableDependencies, const std::string& runPath, const std::set<std::string>& excludedModules, const std::filesystem::path& root, const std::vector<std::filesystem::path>& runtimeDirectories, std::vector<GuestModuleInput> modules, Domain::IProgress& progress, const bool functionSymbolRoots, const bool frameRedZone) const {
     std::vector<std::filesystem::path> paths;
     std::map<std::filesystem::path, GuestImage> discovered;
     progress.Report({Domain::ProgressStage::Modules, {}, 0, modules.size()});
@@ -469,6 +471,9 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     }
     const auto outputDirectory = outputPath.parent_path().lexically_normal();
     std::vector<GuestArtifact> artifacts;
+    std::size_t redZoneModules = 0;
+    std::size_t redZoneSkipped = 0;
+    std::size_t redZoneUnbounded = 0;
     for (const auto index : order) {
         auto& image = images[index];
         progress.Report({Domain::ProgressStage::Modules, Io::Utf8Path(image.SourcePath), artifacts.size(), order.size()});
@@ -511,6 +516,18 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 image.Bytes[header.Offset + offset] = 0x0F;
                 image.Bytes[header.Offset + offset + 1] = 0x0B;
             }
+        }
+        if (frameRedZone) {
+            // After the syscall traps, as for the executable: framing sees the final bytes.
+            const auto prefix = "Red-zone framing (" + Io::Utf8Path(image.SourcePath.filename()) + ")";
+            auto framing = FrameRedZoneImage(image.Bytes, image.Headers, image.Dynamic.RelaData, image.Trampolines, prefix, [&](std::string_view text) { progress.Message(text); });
+            if (!framing.HasBounds) {
+                ++redZoneUnbounded;
+                progress.Message(prefix + ": no .eh_frame function bounds, not framed\n");
+            }
+            redZoneSkipped += framing.Skipped;
+            ++redZoneModules;
+            if (!image.PatchedRanges.empty()) GamePatch::CheckOverlaps(Io::Utf8Path(image.SourcePath), image.PatchedRanges, {.RedZoneSites = std::span<const Codegen::TrampolineSite>(image.Trampolines).subspan(framing.FirstSite), .RedZoneDisplacements = framing.Displacements});
         }
         const auto relativeDirectory = appDirectory(image);
         const auto destination = outputDirectory / relativeDirectory;
@@ -566,6 +583,11 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             if (findGuest(name) == guestNames.end() && !unavailableUnused(index, name)) neededLibraries.push_back(hostLibrary(name));
         artifacts.push_back({target, std::move(output), std::move(imports), image.SourcePath, std::move(neededLibraries)});
         progress.Report({Domain::ProgressStage::Modules, Io::Utf8Path(image.SourcePath), artifacts.size(), order.size()});
+    }
+    if (frameRedZone) {
+        std::ostringstream text;
+        text << "Red-zone framing: " << redZoneModules << " guest modules, " << redZoneSkipped << " leaves skipped, " << redZoneUnbounded << " modules without .eh_frame bounds\n";
+        progress.Message(text.str());
     }
     return artifacts;
 }
