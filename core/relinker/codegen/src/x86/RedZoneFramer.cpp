@@ -232,13 +232,22 @@ MemoryUse memoryUse(const std::uint8_t* code, const Insn& insn) {
     const auto reg = static_cast<std::uint8_t>((modrm >> 3) & 7);
     const auto rm = static_cast<std::uint8_t>(modrm & 7);
     const bool vex = info.RexPrefix == 0 && (code[info.OpcodeOffset] == 0xc4 || code[info.OpcodeOffset] == 0xc5 || code[info.OpcodeOffset] == 0x62 || xopPrefixed(code, insn));
-    if (!vex && !info.IsTwoByteOpcode && reg == kRegRsp && !r) {
-        const auto op = info.Opcode;
-        if ((op <= 0x3f && (op & 7) <= 3) || op == 0x63 || op == 0x69 || op == 0x6b || (op >= 0x84 && op <= 0x8b) || op == 0x8d) use.UsesRsp = use.RegisterRsp = true;
+    // Register 4 of a byte operand without a REX prefix is AH, not rsp.
+    const auto op = info.Opcode;
+    const bool ah = info.RexPrefix == 0 && !vex;
+    const bool byteOneByte = !info.IsTwoByteOpcode && ((op <= 0x3f && (op & 7) <= 3 && (op & 1) == 0) || op == 0x80 || op == 0x82 || op == 0x84 || op == 0x86 || op == 0x88 || op == 0x8a || op == 0xc0 || op == 0xc6 || op == 0xd0 || op == 0xd2 || op == 0xf6 || op == 0xfe);
+    const bool byteTwoByteReg = info.IsTwoByteOpcode && (op == 0xb0 || op == 0xc0);
+    const bool byteTwoByteRm = info.IsTwoByteOpcode && (op == 0xb0 || op == 0xc0 || op == 0xb6 || op == 0xbe);
+    if (ah && (byteOneByte || byteTwoByteReg) && reg == kRegRsp) {
+    } else if (!vex && !info.IsTwoByteOpcode && reg == kRegRsp && !r) {
+        if ((op <= 0x3f && (op & 7) <= 3) || (op >= 0x84 && op <= 0x8b) || op == 0x8d) use.UsesRsp = use.RegisterRsp = true;
     }
-    if ((vex || info.IsTwoByteOpcode) && extendedOpcodeUsesRsp(code, insn, mod, reg, rm, r, b)) use.UsesRsp = use.RegisterRsp = true;
+    const bool twoByteReg = reg == kRegRsp && !r && twoByteRegisterIsGeneral(op) && !(ah && byteTwoByteReg);
+    const bool twoByteRm = mod == 3 && rm == kRegRsp && !b && twoByteRmIsGeneral(op) && !(ah && byteTwoByteRm);
+    if (!vex && info.IsTwoByteOpcode && (twoByteReg || twoByteRm)) use.UsesRsp = use.RegisterRsp = true;
+    if (vex && vexGeneralUsesRsp(code, insn, mod, reg, rm, r, b)) use.UsesRsp = use.RegisterRsp = true;
     if (mod == 3) {
-        const bool generalPurpose = !vex && !info.IsTwoByteOpcode && !(info.Opcode >= 0xd8 && info.Opcode <= 0xdf);
+        const bool generalPurpose = !vex && !info.IsTwoByteOpcode && !(info.Opcode >= 0xd8 && info.Opcode <= 0xdf) && !(ah && byteOneByte);
         if (generalPurpose && rm == kRegRsp && !b) use.UsesRsp = use.RegisterRsp = true;
         return use;
     }
@@ -622,7 +631,12 @@ void frameSegment(
         }
         if (reason == nullptr && entryEnd - start < kJumpBytes) reason = "prologue shorter than a jump";
         if (reason == nullptr && targetInside(start, entryEnd)) reason = entryEnd == prologueEnd ? "branch into the prologue" : "branch into the instructions after a short prologue";
-        if (reason == nullptr && entryEnd != prologueEnd && targets.contains(start)) reason = "branch to the start of a widened prologue";
+        // A jump from another function to the start enters like a call and runs the stub; only a
+        // branch from inside the leaf would lower rsp a second time.
+        const bool loopsToStart = std::any_of(body.begin(), body.end(), [&](const Insn& insn) {
+            return insn.Info.HasBranchTarget && !insn.Info.HasRipRelativeDisp && insn.Info.FlowKind != ControlFlowKind::Call && static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp == static_cast<std::int64_t>(start);
+        });
+        if (reason == nullptr && entryEnd != prologueEnd && loopsToStart) reason = "branch to the start of a widened prologue";
         if (reason == nullptr && !thunk && exits.empty()) reason = "no ret exit";
         if (reason == nullptr && std::any_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return exit.Begin < entryEnd; })) reason = "prologue shorter than a jump";
         if (reason == nullptr && (overlapsExisting(start, entryEnd) || std::any_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return overlapsExisting(exit.Begin, exit.End); }))) reason = "overlaps another stub";
