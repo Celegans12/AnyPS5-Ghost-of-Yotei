@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/InflightBuilds.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/IndexClamp_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/MemoryStats.hpp"
@@ -45,6 +46,9 @@
 #include <memory>
 #include <unordered_set>
 #include <deque>
+#include <future>
+#include <thread>
+#include <condition_variable>
 #include <mutex>
 #include <set>
 #include <unordered_map>
@@ -1633,6 +1637,11 @@ struct PreparedDraw {
     std::shared_ptr<ShaderResources> resources;
     std::uint64_t forgetSerial = 0;
     std::uint64_t registryGeneration = 0;
+    std::shared_future<void> pipeline;
+
+    ~PreparedDraw() {
+        if (pipeline.valid()) pipeline.wait();
+    }
 };
 
 namespace {
@@ -1655,12 +1664,33 @@ struct SplitCounters {
     std::atomic<std::uint64_t> staleOther{0};
     std::atomic<std::uint64_t> lockedBuilds{0};
     std::atomic<std::uint64_t> keyReused{0};
+    std::atomic<std::uint64_t> pipelinesQueued{0};
+    std::atomic<std::uint64_t> pipelinesSkipped{0};
+    std::atomic<std::uint64_t> dedupeQueued{0};
+    std::atomic<std::uint64_t> dedupeHits{0};
+    std::atomic<std::uint64_t> dedupeAttached{0};
+    std::atomic<std::uint64_t> dedupeBuilt{0};
+    std::atomic<std::uint64_t> pipelineWaits{0};
+    std::atomic<std::uint64_t> pipelineWaitNs{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
 SplitCounters& Splits() {
     static auto* counters = new SplitCounters();
     return *counters;
+}
+
+bool PrebuildDedupe() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_NO_PREBUILD_DEDUPE");
+        return text == nullptr || std::strcmp(text, "1") != 0;
+    }();
+    return enabled;
+}
+
+InflightBuilds& InflightPrebuilds() {
+    static auto* builds = new InflightBuilds();
+    return *builds;
 }
 
 void reportSplits() {
@@ -1684,7 +1714,19 @@ void reportSplits() {
     const auto other = take(c.staleOther);
     const auto locked = take(c.lockedBuilds);
     const auto keys = take(c.keyReused);
-    std::fprintf(stderr, "[split] draws prepared (10 s): %llu (cache entry then %llu, address tables left to the lock %llu, address-based stage A %llu, forget serial in change %llu); stage A built %llu in %.1f ms (%llu refused); at the draw: %llu builds completed from stage A, %llu served by the cache instead, discarded as stale %llu (forget serial %llu, registry %llu, other %llu); %llu builds made under the lock; %llu keys reused\n", prepared, cached, address, addressStageA, inChange, stageA, stageAMs, failed, used, served, forget + registry + other, forget, registry, other, locked, keys);
+    const auto queuedPipelines = take(c.pipelinesQueued);
+    const auto skippedPipelines = take(c.pipelinesSkipped);
+    const auto pipelineWaits = take(c.pipelineWaits);
+    const auto pipelineWaitMs = static_cast<double>(take(c.pipelineWaitNs)) / 1e6;
+    const auto committerBuilds = TakeCommitterBuilds();
+    if (PrebuildDedupe()) {
+        const auto dedupeQueued = take(c.dedupeQueued);
+        const auto dedupeHits = take(c.dedupeHits);
+        const auto dedupeAttached = take(c.dedupeAttached);
+        const auto dedupeBuilt = take(c.dedupeBuilt);
+        std::fprintf(stderr, "[split] prebuild dedupe (10 s): queued %llu, deduped %llu (already in flight), committer attached %llu, committer built %llu\n", dedupeQueued, dedupeHits, dedupeAttached, dedupeBuilt);
+    }
+    std::fprintf(stderr, "[split] draws prepared (10 s): %llu (cache entry then %llu, address tables left to the lock %llu, address-based stage A %llu, forget serial in change %llu); stage A built %llu in %.1f ms (%llu refused); at the draw: %llu builds completed from stage A, %llu served by the cache instead, discarded as stale %llu (forget serial %llu, registry %llu, other %llu); %llu builds made under the lock; %llu keys reused; pipelines prebuilt %llu (%llu skipped at a full queue), commits waited for %llu (%.1f ms); committer builds %llu (%.1f ms)\n", prepared, cached, address, addressStageA, inChange, stageA, stageAMs, failed, used, served, forget + registry + other, forget, registry, other, locked, keys, queuedPipelines, skippedPipelines, pipelineWaits, pipelineWaitMs, static_cast<unsigned long long>(committerBuilds.builds), static_cast<double>(committerBuilds.nanoseconds) / 1e6);
     {
         const auto& o = CachedAcquireOutcomes();
         std::fprintf(stderr, "[split] address-based stage A (cumulative): taken %llu, refused: cache off %llu, no space %llu, writable mirrors %llu, heap mirrors %llu, sparse mirrors %llu, stale %llu\n", static_cast<unsigned long long>(o[0].load()), static_cast<unsigned long long>(o[1].load()), static_cast<unsigned long long>(o[2].load()), static_cast<unsigned long long>(o[3].load()), static_cast<unsigned long long>(o[4].load()), static_cast<unsigned long long>(o[5].load()), static_cast<unsigned long long>(o[6].load()));
@@ -1712,6 +1754,7 @@ std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& s
     }
     prepared->indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
     if (std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program == nullptr; })) return prepared;
+    prepared->pipeline = PrebuildDrawPipeline(context, state, shaders);
     static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
     static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
@@ -3135,6 +3178,130 @@ std::shared_ptr<const AheadDraw> PrepareAheadDraw(const Context& context, const 
 
 namespace {
 
+struct PipelinePrebuilds {
+    std::mutex mutex;
+    std::condition_variable work;
+    std::deque<std::packaged_task<void()>> jobs;
+    std::vector<std::thread> threads;
+};
+
+constexpr std::size_t MaximumQueuedPipelines = 64;
+
+PipelinePrebuilds& Prebuilds() {
+    static auto* prebuilds = new PipelinePrebuilds();
+    return *prebuilds;
+}
+
+std::size_t PrebuildThreads() {
+    static const std::size_t threads = [] {
+        const char* text = std::getenv("APS5_PREBUILD_DRAW_PIPELINE_THREADS");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 3ull;
+        return static_cast<std::size_t>(std::clamp<unsigned long long>(value, 1ull, 16ull));
+    }();
+    return threads;
+}
+
+void runPrebuilds(PipelinePrebuilds& prebuilds) {
+    MarkBuildThread(BuildThread::Pool);
+    for (;;) {
+        std::packaged_task<void()> job;
+        {
+            std::unique_lock lock(prebuilds.mutex);
+            prebuilds.work.wait(lock, [&] { return !prebuilds.jobs.empty(); });
+            job = std::move(prebuilds.jobs.front());
+            prebuilds.jobs.pop_front();
+        }
+        job();
+    }
+}
+
+}
+
+std::shared_future<void> PrebuildDrawPipeline(const Context& context, const State& state, std::span<const CompiledShader> shaders) {
+    static const bool disabled = std::getenv("APS5_NO_PREBUILD_DRAW_PIPELINE") != nullptr || std::getenv("APS5_DRAW_TRANSITIONS") != nullptr;
+    if (disabled || context.descriptorCache == nullptr || shaders.empty()) return {};
+    try {
+        bool memoized = false;
+        bool hit = false;
+        const auto fragmentOutputs = CachedFragmentOutputs(context, shaders, state, memoized, hit, false);
+        auto masked = maskedState(state, fragmentOutputs);
+        const auto& attributes = shaders.front().program->vertexAttributes;
+        auto vertexInput = attributes.empty() ? VertexInputLayout{} : BuildVertexInputLayout(context, attributes);
+        auto described = DescribeSetLayouts(context, shaders);
+        std::uint64_t keyHash = 0;
+        if (CachedPipelineResident(context, masked.has_value() ? *masked : state, vertexInput, described.View(), shaders, VK_IMAGE_LAYOUT_GENERAL, &keyHash)) return {};
+        const std::uint64_t inflightKey = PrebuildDedupe() ? keyHash : 0;
+        std::packaged_task<void()> job([inflightKey, context, pipelineState = masked.has_value() ? std::move(*masked) : state, vertexInput = std::move(vertexInput), described = std::move(described), stages = std::vector<CompiledShader>(shaders.begin(), shaders.end())] {
+            try {
+                static_cast<void>(CachedPipeline(context, pipelineState, vertexInput, described.View(), stages, VK_IMAGE_LAYOUT_GENERAL, nullptr));
+            } catch (...) {
+            }
+            if (inflightKey != 0) InflightPrebuilds().Release(inflightKey);
+        });
+        auto built = job.get_future().share();
+        auto& prebuilds = Prebuilds();
+        const bool dedupe = PrebuildDedupe() && keyHash != 0;
+        {
+            std::lock_guard lock(prebuilds.mutex);
+            if (prebuilds.jobs.size() >= MaximumQueuedPipelines) {
+                Splits().pipelinesSkipped.fetch_add(1, std::memory_order_relaxed);
+                return {};
+            }
+            if (dedupe) {
+                auto claim = InflightPrebuilds().Acquire(keyHash, built);
+                if (!claim.owner) {
+                    Splits().dedupeHits.fetch_add(1, std::memory_order_relaxed);
+                    return claim.existing;
+                }
+                Splits().dedupeQueued.fetch_add(1, std::memory_order_relaxed);
+            }
+            while (prebuilds.threads.size() < PrebuildThreads()) prebuilds.threads.emplace_back([&prebuilds] { runPrebuilds(prebuilds); });
+            prebuilds.jobs.push_back(std::move(job));
+        }
+        prebuilds.work.notify_one();
+        Splits().pipelinesQueued.fetch_add(1, std::memory_order_relaxed);
+        return built;
+    } catch (...) {
+        return {};
+    }
+}
+
+namespace {
+
+void AttachInflightPrebuild(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& layouts, std::span<const CompiledShader> shaders, VkImageLayout layout) {
+    if (!PrebuildDedupe()) return;
+    std::uint64_t key = 0;
+    if (CachedPipelineResident(context, state, vertexInput, layouts, shaders, layout, &key) || key == 0) return;
+    const auto inflight = InflightPrebuilds().Find(key);
+    if (!inflight.valid() || inflight.wait_for(std::chrono::seconds(0)) == std::future_status::ready) return;
+    inflight.wait();
+    Splits().dedupeAttached.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::shared_ptr<Pipeline> CommitterPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout layout) {
+    if (!PrebuildDedupe()) return CachedPipeline(context, state, vertexInput, resources, shaders, layout);
+    const auto layouts = resources.SetLayouts();
+    AttachInflightPrebuild(context, state, vertexInput, layouts, shaders, layout);
+    bool created = false;
+    auto pipeline = CachedPipeline(context, state, vertexInput, layouts, shaders, layout, &created);
+    if (created) Splits().dedupeBuilt.fetch_add(1, std::memory_order_relaxed);
+    return pipeline;
+}
+
+}
+
+void WaitForPreparedPipeline(const PreparedDraw* prepared) {
+    if (prepared == nullptr || !prepared->pipeline.valid()) return;
+    if (prepared->pipeline.wait_for(std::chrono::seconds(0)) == std::future_status::ready) return;
+    const auto start = std::chrono::steady_clock::now();
+    prepared->pipeline.wait();
+    auto& counters = Splits();
+    counters.pipelineWaits.fetch_add(1, std::memory_order_relaxed);
+    counters.pipelineWaitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+}
+
+namespace {
+
 struct TargetBinding {
     ColorTarget color;
     bool gpuTiling = false;
@@ -3562,12 +3729,12 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         selected.stencilReplayReference = reference;
         selected.stencilFront.reference = reference;
         selected.stencilBack.reference = reference;
-        auto selectedPipeline = stencilReplay.empty() ? CachedPipeline(context, selected, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+        auto selectedPipeline = stencilReplay.empty() ? CommitterPipeline(context, selected, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
         Require(!selectedPipeline->SplitsFaces() && !selectedPipeline->SplitsSecondChannel(), "stencil replay refuses pipeline face or channel splits");
         stencilReplay.emplace_back(reference, std::move(selectedPipeline));
     }
     auto& pipeline = preparation.pipeline;
-    pipeline = stencilReplay.empty() ? CachedPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
+    pipeline = stencilReplay.empty() ? CommitterPipeline(context, pipelineState, inputs.VertexLayout(), *resources, shaders, lean ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL) : stencilReplay.front().second;
     // Resident targets' views are stable while their storage image lives, so the framebuffer is
     // reused with the pipeline; a per-draw RenderTarget gets a framebuffer of its own.
     auto& owners = preparation.owners;

@@ -311,6 +311,9 @@ namespace {
 
 thread_local bool prebuilding = false;
 thread_local bool prebuilt = false;
+thread_local BuildThread buildThread = BuildThread::Other;
+std::atomic<std::uint64_t> committerBuilds{0};
+std::atomic<std::uint64_t> committerBuildNs{0};
 
 VkShaderStageFlags pushStagesOf(const Context& context) {
     return PreRasterizationPushStages(context.meshShader, context.tessellationShader, context.geometryShader);
@@ -1278,6 +1281,29 @@ void reportPipelines(PipelineStore& store) {
 
 }
 
+bool CachedPipelineResident(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, std::uint64_t* keyHash) {
+    static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
+    if (disabled) return false;
+    auto& store = Pipelines();
+    struct ResidentKeyStorage {};
+    auto& key = HostThreadLocal<std::vector<std::byte>, ResidentKeyStorage>();
+    pipelineKey(key, context, state, vertexInput, resources, shaders, attachmentLayout);
+    if (key.empty()) return false;
+    const auto hash = hashKey(key);
+    if (keyHash != nullptr) *keyHash = hash;
+    std::lock_guard lock(store.mutex);
+    const auto found = store.index.find(hash);
+    return found != store.index.end() && found->second->key == key && alive(*found->second, context);
+}
+
+void MarkBuildThread(BuildThread role) {
+    buildThread = role;
+}
+
+CommitterBuildTotals TakeCommitterBuilds() {
+    return {committerBuilds.exchange(0, std::memory_order_relaxed), committerBuildNs.exchange(0, std::memory_order_relaxed)};
+}
+
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     return CachedPipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout);
 }
@@ -1339,8 +1365,14 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     // Built outside the mutex: a draw that finds its pipeline resident is not held behind another
     // thread's build (the journal replay builds here too), and a device's driver compiles in
     // parallel when several threads build at once.
+    const auto buildStart = std::chrono::steady_clock::now();
     auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    const auto buildUs = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - buildStart).count();
     const bool replaying = PipelineJournalReplaying();
+    if (buildThread == BuildThread::Committer) {
+        committerBuilds.fetch_add(1, std::memory_order_relaxed);
+        committerBuildNs.fetch_add(static_cast<std::uint64_t>(buildUs) * 1000u, std::memory_order_relaxed);
+    }
     {
         std::lock_guard lock(store.mutex);
         bool collision = false;

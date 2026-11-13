@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -332,6 +333,7 @@ DrawPipeline::Item* DrawPipeline::nextPrepare() {
 
 void DrawPipeline::prepareLoop() {
     PerformanceTrace::BindThread("draw preparer");
+    Graphics::MarkBuildThread(Graphics::BuildThread::Preparer);
     for (;;) {
         Prepare job;
         {
@@ -527,6 +529,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 
 void DrawPipeline::run() {
     PerformanceTrace::BindThread("draw committer");
+    Graphics::MarkBuildThread(Graphics::BuildThread::Committer);
     StartCommitterSampler();
     for (;;) {
         Commit* commit = nullptr;
