@@ -4,6 +4,8 @@
 #include <cstdlib>
 #include <functional>
 #include <initializer_list>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -88,8 +90,8 @@ public:
 
 bool failed = false;
 
-void expect(const char* name, const Module& module, bool rejected) {
-    const auto reason = ShaderRecompiler::SpannedBarrierInDivergentFlow(module.words);
+void expect(const char* name, const Module& module, bool rejected, std::span<const std::pair<std::uint32_t, std::uint32_t>> scalarLoads = {}) {
+    const auto reason = ShaderRecompiler::SpannedBarrierInDivergentFlow(module.words, scalarLoads);
     if (reason.has_value() == rejected) return;
     std::fprintf(stderr, "%s: expected %s, got %s\n", name, rejected ? "a rejection" : "no rejection", reason ? reason->c_str() : "none");
     failed = true;
@@ -305,6 +307,41 @@ int main() {
         module.emit(spv::OpLoad, {Uint, First + 6u, Storage});
         module.emit(spv::OpIEqual, {Bool, First + 8u, First + 6u, Two});
     }), true);
+    const auto storedThenRead = joined([](Module& module) {
+        module.emit(spv::OpConvertUToPtr, {PhysicalPointer, First + 10u, Two});
+        module.emit(spv::OpStore, {First + 10u, Three});
+        module.emit(spv::OpLoad, {Uint, First + 6u, Storage});
+        module.emit(spv::OpIEqual, {Bool, First + 8u, First + 6u, Two});
+    });
+    const std::pair<std::uint32_t, std::uint32_t> scalarLoad{First + 6u, First + 7u};
+    expect("a barrier under a guest scalar load after a store through a device address", storedThenRead, false, std::span(&scalarLoad, 1u));
+    const std::pair<std::uint32_t, std::uint32_t> otherLoad{First + 30u, First + 31u};
+    expect("a barrier under a buffer load outside the scalar load ranges after a store", storedThenRead, true, std::span(&otherLoad, 1u));
+    {
+        // The helper's id falls in the range: it was made while emitting a scalar load and may serve others.
+        Module module;
+        module.emit(spv::OpTypeFunction, {First + 40u, Uint});
+        module.emit(spv::OpFunction, {Uint, First + 41u, spv::FunctionControlMaskNone, First + 40u});
+        module.emit(spv::OpLabel, {First + 42u});
+        module.emit(spv::OpLoad, {Uint, First + 43u, Storage});
+        module.emit(spv::OpReturnValue, {First + 43u});
+        module.emit(spv::OpFunctionEnd, {});
+        module.function(Main);
+        module.emit(spv::OpLabel, {First});
+        module.emit(spv::OpConvertUToPtr, {PhysicalPointer, First + 10u, Two});
+        module.emit(spv::OpStore, {First + 10u, Three});
+        module.emit(spv::OpFunctionCall, {Uint, First + 6u, First + 41u});
+        module.emit(spv::OpIEqual, {Bool, First + 8u, First + 6u, Two});
+        module.emit(spv::OpSelectionMerge, {First + 9u, spv::SelectionControlMaskNone});
+        module.emit(spv::OpBranchConditional, {First + 8u, First + 7u, First + 9u});
+        module.emit(spv::OpLabel, {First + 7u});
+        module.barrier();
+        module.emit(spv::OpBranch, {First + 9u});
+        module.emit(spv::OpLabel, {First + 9u});
+        module.end();
+        const std::pair<std::uint32_t, std::uint32_t> helperLoad{First + 40u, First + 44u};
+        expect("a barrier under a load in a helper function made inside a scalar load range", module, true, std::span(&helperLoad, 1u));
+    }
     expect("a barrier under a workgroup word read at a lane index", joined([](Module& module) {
         module.emit(spv::OpAccessChain, {WorkgroupPointer, First + 5u, Exchange, First + 1u});
         module.emit(spv::OpLoad, {Uint, First + 6u, First + 5u});

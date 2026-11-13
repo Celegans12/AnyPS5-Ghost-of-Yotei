@@ -107,6 +107,8 @@ struct SpirvEmitterState {
     std::uint32_t spannedExchangeVariable = 0;
     std::uint32_t spannedBallotVariable = 0;
     std::uint32_t spannedBallotParityVariable = 0;
+    // Id ranges [first, bound) allocated while emitting a guest scalar load (see SpirvSpannedUniformity).
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> scalarLoadIds;
     bool narrowSubgroupClock = false;
     bool float64DenormPreserve = false;
     bool depthRangeRemap = false;

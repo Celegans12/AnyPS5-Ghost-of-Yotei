@@ -39,6 +39,7 @@ private:
 public:
     explicit SpirvModule(std::uint32_t version = 0x00010300u);
     [[nodiscard]] std::uint32_t AllocateId();
+    [[nodiscard]] std::uint32_t IdBound() const { return nextId; }
     [[nodiscard]] std::uint32_t SpecializationConstant(std::uint32_t type, std::uint32_t constantId, std::uint32_t defaultValue);
     void EmitCapability(std::uint32_t capability);
     void EmitExtension(const std::string& extensionName);

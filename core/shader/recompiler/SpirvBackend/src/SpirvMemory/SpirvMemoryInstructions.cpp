@@ -613,7 +613,12 @@ void LoadAddress(SpirvValueEmitContext& ctx, const IrValue& inst, std::uint32_t 
     case ResourceKind::Scratch:
         ctx.Define(inst, bits == 32u ? LoadWord(ctx, inst, mem) : LoadSubword(ctx, inst, mem, bits));
         return;
-    case ResourceKind::ScalarAddress:
+    case ResourceKind::ScalarAddress: {
+        const auto first = ctx.state.module.IdBound();
+        ctx.Define(inst, LoadBda(ctx, inst, mem, bits));
+        ctx.state.scalarLoadIds.emplace_back(first, ctx.state.module.IdBound());
+        return;
+    }
     case ResourceKind::Flat:
     case ResourceKind::Global:
         ctx.Define(inst, LoadBda(ctx, inst, mem, bits));
@@ -1619,7 +1624,7 @@ std::uint32_t AtomicFloatCompareSwap(SpirvEmitterState& state, std::uint32_t old
     return AtomicFloatBits{state, false, flush}.compareSwap(old, comparator, desired);
 }
 
-std::uint32_t EmitReadConst(SpirvValueEmitContext& ctx, const IrValue& inst) {
+static std::uint32_t ReadFlattenedSrt(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     if (state.flattenedSrtVariable == 0) {
         ctx.Fail(inst, "requires the flattened SRT descriptor");
@@ -1674,11 +1679,21 @@ std::uint32_t EmitReadConst(SpirvValueEmitContext& ctx, const IrValue& inst) {
     return value;
 }
 
+// SRT reads are the guest's scalar loads of its resource tables, served from the flattened copy.
+std::uint32_t EmitReadConst(SpirvValueEmitContext& ctx, const IrValue& inst) {
+    const auto first = ctx.state.module.IdBound();
+    const auto value = ReadFlattenedSrt(ctx, inst);
+    ctx.state.scalarLoadIds.emplace_back(first, ctx.state.module.IdBound());
+    return value;
+}
+
 void EmitReadConstBuffer(SpirvValueEmitContext& ctx, const IrValue& inst) {
     const auto& mem = ctx.Memory(inst);
     if (mem.planningOnly) return;
     if (mem.kind != ResourceKind::ScalarBuffer) ctx.Fail(inst, "must read a scalar buffer resource");
+    const auto first = ctx.state.module.IdBound();
     ctx.Define(inst, EmitRuntimeScalarBufferLoad(ctx, inst));
+    ctx.state.scalarLoadIds.emplace_back(first, ctx.state.module.IdBound());
 }
 
 void EmitGetSrtResource(SpirvValueEmitContext& context) {

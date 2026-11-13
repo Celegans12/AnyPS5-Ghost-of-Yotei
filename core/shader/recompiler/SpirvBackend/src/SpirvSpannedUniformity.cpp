@@ -148,7 +148,7 @@ bool ImageRead(spv::Op op) {
 
 class Analysis {
 public:
-    explicit Analysis(const Module& module) : module(module) {
+    Analysis(const Module& module, std::span<const std::pair<std::uint32_t, std::uint32_t>> scalarLoads) : module(module), scalarLoads(scalarLoads) {
         for (const auto& function : module.functions) {
             for (const auto& block : function.blocks) {
                 for (const auto& instruction : block.body) {
@@ -218,6 +218,10 @@ private:
         if (type == types.end()) return UnknownClass;
         const auto storage = module.pointerClasses.find(type->second);
         return storage == module.pointerClasses.end() ? UnknownClass : MemoryClass(storage->second);
+    }
+
+    bool ScalarLoad(std::uint32_t id) const {
+        return std::ranges::any_of(scalarLoads, [id](const auto& range) { return id >= range.first && id < range.second; });
     }
 
     bool Written(std::uint32_t storageClass) const {
@@ -406,6 +410,8 @@ private:
             }
         }
         const auto fencedEntries = FencedEntries(function, flow, blocks);
+        // A helper function made while emitting a scalar load can be called from other loads too.
+        const bool scalarLoadsHere = !ScalarLoad(function.id);
         for (const auto parameter : function.parameters) nonUniform.insert(parameter);
         std::unordered_set<std::uint32_t> divergent;
         std::unordered_set<std::uint32_t> divergentMerges;
@@ -494,11 +500,12 @@ private:
                     const auto builtin = module.builtins.find(variable);
                     const auto storage = module.storageClasses.find(variable);
                     varying = NonUniform(instruction[3]) || (builtin != module.builtins.end() && VaryingBuiltin(builtin->second)) || storedNonUniform.contains(variable) ||
-                        (storage != module.storageClasses.end() && storage->second == spv::StorageClassInput && builtin == module.builtins.end()) || Racy(instruction[3], fencedBefore);
+                        (storage != module.storageClasses.end() && storage->second == spv::StorageClassInput && builtin == module.builtins.end()) ||
+                        (Racy(instruction[3], fencedBefore) && !(scalarLoadsHere && ScalarLoad(result) && GuestMemory(instruction[3])));
                     break;
                 }
                 case spv::OpAtomicLoad:
-                    varying = NonUniform(instruction.at(3)) || Racy(instruction[3], fencedBefore);
+                    varying = NonUniform(instruction.at(3)) || (Racy(instruction[3], fencedBefore) && !(scalarLoadsHere && ScalarLoad(result) && GuestMemory(instruction[3])));
                     break;
                 case spv::OpPhi:
                     varying = inDivergentFlow || divergentMerges.contains(label);
@@ -522,7 +529,13 @@ private:
 
     static constexpr std::uint32_t UnknownClass = 0xffffffffu;
 
+    // Only guest memory: a scalar load's emission can also touch workgroup words (wave exchanges).
+    bool GuestMemory(std::uint32_t pointer) const {
+        return ClassOf(pointer) == spv::StorageClassStorageBuffer;
+    }
+
     const Module& module;
+    std::span<const std::pair<std::uint32_t, std::uint32_t>> scalarLoads;
     std::unordered_map<std::uint32_t, std::uint32_t> types;
     std::unordered_set<std::uint32_t> written;
     std::unordered_set<std::uint32_t> barriers;
@@ -534,12 +547,12 @@ private:
 
 }
 
-std::optional<std::string> SpannedBarrierInDivergentFlow(std::span<const std::uint32_t> words) {
+std::optional<std::string> SpannedBarrierInDivergentFlow(std::span<const std::uint32_t> words, std::span<const std::pair<std::uint32_t, std::uint32_t>> scalarLoads) {
     bool barrier = false;
     for (std::size_t cursor = 5u; !barrier && cursor < words.size(); cursor += std::max(words[cursor] >> 16u, 1u)) barrier = (words[cursor] & 0xffffu) == spv::OpControlBarrier;
     if (!barrier) return std::nullopt;
     const auto module = Parse(words);
-    return Analysis(module).Run();
+    return Analysis(module, scalarLoads).Run();
 }
 
 }

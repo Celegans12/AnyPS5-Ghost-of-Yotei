@@ -339,7 +339,10 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.module.EmitEntryPoint(ExecutionModelForStage(state.program.Resources().stage), state.mainFunc, "main", state.interfaceVariables);
     auto words = state.module.Finalize();
     if (state.spannedWave) {
-        if (auto reason = SpannedBarrierInDivergentFlow(words)) throw SpannedWaveUnsupported(*reason);
+        // A guest scalar load reads through the scalar cache, which a program sees its own dispatch's
+        // stores through only after invalidating it; without that, both halves read the same value.
+        const std::span<const std::pair<std::uint32_t, std::uint32_t>> scalarLoads = state.program.Metadata().invalidatesCaches ? std::span<const std::pair<std::uint32_t, std::uint32_t>>{} : state.scalarLoadIds;
+        if (auto reason = SpannedBarrierInDivergentFlow(words, scalarLoads)) throw SpannedWaveUnsupported(*reason);
     }
     if (info != nullptr) {
         info->fullSubgroups = state.spannedWave;
