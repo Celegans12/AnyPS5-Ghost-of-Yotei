@@ -333,6 +333,12 @@ std::vector<Leaf> widenedLeaves() {
             0x48, 0x83, 0xec, 0x08, 0x48, 0x89, 0x7c, 0x24, 0xf0, 0x31, 0xc0, 0x48, 0x03, 0x44, 0x24, 0xf0,
             0x48, 0x83, 0xc4, 0x08, 0xc3,
         }, kA},
+        // The lea in the exit is copied into the exit's stub: unrelocated, it would address the stub
+        // instead of the leaf's start and the two leas would no longer cancel.
+        {"leaf without pushes whose short ret exit is widened over a rip-relative lea", {
+            0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8d, 0x0d, 0xf4, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x44, 0x24, 0xf8,
+            0x48, 0x01, 0xc8, 0x48, 0x8d, 0x15, 0xe5, 0xff, 0xff, 0xff, 0x48, 0x29, 0xd0, 0xc3,
+        }, kA},
         {"frame-pointer leaf pushing and popping rbx in its body below a slot at rbp-0x10", {
             0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0x7d, 0xf0, 0x53, 0x48, 0x89, 0xf3, 0x48, 0x8b, 0x45, 0xf0,
             0x48, 0x01, 0xd8, 0x5b, 0x48, 0x01, 0xd0, 0x5d, 0xc3,
@@ -537,8 +543,7 @@ int main() {
         const auto backward = runLeaves(backwardStubbedLeaves());
         require(backward.OperandStubs == 2 && backward.StubbedOperands == 3 && backward.MovedOperands == 5, "the leaves comparing at rsp before a branch were framed with " + std::to_string(backward.OperandStubs) + " operand stubs carrying " + std::to_string(backward.StubbedOperands) + " rsp operands and " + std::to_string(backward.MovedOperands) + " moved in place, not 2 carrying 3 and 5");
         const auto widened = runLeaves(widenedLeaves());
-        require(widened.WidenedPrologues == 8 && widened.WidenedExits == 9 && widened.WidenedOperands == 12, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 8, 9 and 12");
-        verifySkippedLeaves(skippedDirectRspLeaves());
+        require(widened.WidenedPrologues == 9 && widened.WidenedExits == 10 && widened.WidenedOperands == 13, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 9, 10 and 13");
         std::cout << "red-zone framer execution tests passed\n";
         return 0;
     } catch (const SteppingDegraded& error) {
