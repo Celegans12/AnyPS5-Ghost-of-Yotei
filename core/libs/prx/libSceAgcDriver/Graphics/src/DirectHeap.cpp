@@ -197,6 +197,46 @@ DirectHeap& DirectHeapFor(const Context& context) {
 
 namespace {
 
+// The GPU-written storage images the current direct draw samples or binds (heap slots, so not in its
+// ShaderResources): the draw's pass access names them as ShaderResources::StorageImages and
+// ReadsImage do for bound textures, so a read after a write gets its barrier or a new pass.
+// Per recording thread; ResolveDirectStages resets it for each draw.
+struct DirectImageAccess {
+    std::vector<std::pair<VkImage, bool>> images;
+    std::vector<const StorageTexture*> sources;
+};
+
+DirectImageAccess& threadDirectImages() {
+    thread_local DirectImageAccess access;
+    return access;
+}
+
+void noteDirectImage(const StorageTexture* image, bool written) {
+    if (image == nullptr) return;
+    auto& access = threadDirectImages();
+    access.images.emplace_back(image->Image(), written);
+    access.sources.push_back(image);
+}
+
+}
+
+std::span<const std::pair<VkImage, bool>> DirectDrawImages() {
+    return threadDirectImages().images;
+}
+
+bool DirectDrawReads(const StorageTexture* image) {
+    if (image == nullptr) return false;
+    const auto& sources = threadDirectImages().sources;
+    return std::find(sources.begin(), sources.end(), image) != sources.end();
+}
+
+void ClearDirectDrawImages() {
+    threadDirectImages().images.clear();
+    threadDirectImages().sources.clear();
+}
+
+namespace {
+
 // A slot lookup's result, reused while nothing it depends on can have moved: the same collect
 // epoch (no ordering point where the CPU could have written guest memory), proof serial and pending
 // storage serial, the same rule as ShaderResources::Revalidate's epoch proof. Per worker thread,
@@ -253,6 +293,8 @@ struct TableMirror {
     std::shared_ptr<const std::vector<std::uint32_t>> sharedMap;
     std::uint64_t mapHash = 0;
     std::shared_ptr<std::vector<std::shared_ptr<Texture>>> textures;
+    // Elements sampled from GPU-written storage images: the draw's pass access names them.
+    std::vector<std::shared_ptr<StorageTexture>> storageSources;
     std::uint64_t epoch = 0, proof = 0, pending = 0;
     std::uint32_t missing = 0;
 };
@@ -317,6 +359,7 @@ const TableMirror* tableMirrorFor(const Context& context, DirectHeap& heap, cons
             }
             slots[index] = found->second.second;
             (*mirror.textures)[index] = found->second.first;
+            if (const auto& source = found->second.first->SharedStorageSource(); source != nullptr) mirror.storageSources.push_back(source);
             continue;
         }
         const bool shape2D = kind >= DirectHeap::FirstImageKind && (kind - DirectHeap::FirstImageKind) % 7u == 2u;
@@ -342,6 +385,7 @@ const TableMirror* tableMirrorFor(const Context& context, DirectHeap& heap, cons
         }
         slots[index] = slot;
         elementMemo.entries[memoKey] = {texture, slot};
+        if (const auto& source = texture->SharedStorageSource(); source != nullptr) mirror.storageSources.push_back(source);
         (*mirror.textures)[index] = std::move(texture);
     }
     // The shader reads slot = map[map[ElementBase] + element] in the direct form.
@@ -363,6 +407,8 @@ const TableMirror* tableMirrorFor(const Context& context, DirectHeap& heap, cons
 
 
 bool ResolveDirectStages(const Context& context, std::span<const CompiledShader> shaders, std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>>& patched, std::vector<CompiledShader>& out, std::vector<std::shared_ptr<StorageTexture>>* written) {
+    threadDirectImages().images.clear();
+    threadDirectImages().sources.clear();
     if (std::ranges::none_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && (!shader.program->directSlotRequests.empty() || shader.program->directTables != nullptr); })) return false;
     struct Totals {
         std::uint64_t stages = 0, images = 0, missing = 0, samplers = 0, full = 0, memoHits = 0;
@@ -395,6 +441,7 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
         const TableMirror* tableMirror = nullptr;
         if (program->directTables != nullptr && program->directSlotRequests.empty()) {
             tableMirror = tableMirrorFor(context, heap, *program);
+            for (const auto& source : tableMirror->storageSources) noteDirectImage(source.get(), false);
             auto& memoSlot = patchedTables[(reinterpret_cast<std::uintptr_t>(program) >> 4u) % patchedTables.size()];
             if (memoSlot.program == program && memoSlot.variant == program->PipelineVariantId() && memoSlot.spirvWords == program->spirv.size() && memoSlot.mapHash == tableMirror->mapHash && memoSlot.patched != nullptr) {
                 if (recorder != nullptr) recorder->Keep(tableMirror->textures);
@@ -405,7 +452,11 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
         }
         auto copy = std::make_shared<ShaderRecompiler::RecompileResult>(*program);
         if (program->directTables != nullptr) {
-            const auto* mirror = tableMirror != nullptr ? tableMirror : tableMirrorFor(context, heap, *program);
+            const auto* mirror = tableMirror;
+            if (mirror == nullptr) {
+                mirror = tableMirrorFor(context, heap, *program);
+                for (const auto& source : mirror->storageSources) noteDirectImage(source.get(), false);
+            }
             static const bool hashedKey = std::getenv("APS5_DIRECT_TABLE_FULL_KEY") == nullptr;
             for (auto& binding : copy->bindings) {
                 if (binding.role != ShaderRecompiler::DescriptorRole::ImageTableMap) continue;
@@ -453,6 +504,7 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
                             if (texture != nullptr) recorder->Keep(texture);
                             else recorder->Keep(storage);
                         }
+                        noteDirectImage(texture != nullptr ? texture->StorageSource() : storage.get(), false);
                         slots[index] = found->second.slot;
                         continue;
                     }
@@ -478,6 +530,7 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
                 slot = heap.ImageSlot(kind, view, VK_IMAGE_LAYOUT_GENERAL, storage);
                 if (recorder != nullptr) recorder->Keep(storage);
                 if (writes && written != nullptr) written->push_back(storage);
+                noteDirectImage(storage.get(), writes);
                 if (memoizable && slot != DirectHeap::NoSlot) memo.entries[memoKey] = {{}, storage, slot};
             } else if ((flags & DirectSlotRequest::Sampler) != 0u) {
                 ++samplers;
@@ -499,6 +552,7 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
                 }
                 const auto view = firstLayer && texture->FirstLayerView() != VK_NULL_HANDLE ? texture->FirstLayerView() : texture->View();
                 slot = heap.ImageSlot(kind, view, texture->Layout(), texture);
+                noteDirectImage(texture->StorageSource(), false);
                 if (recorder != nullptr) recorder->Keep(texture);
                 if (memoizable && slot != DirectHeap::NoSlot) memo.entries[memoKey] = {texture, {}, slot};
             }

@@ -359,6 +359,30 @@ Result (2026-11-12, kept):
 - Gate not met yet: the two programs are at 12 to 13 ms, not 4 to 5. Next, per the gate: measure
   which addresses the vertex stage still reads from the import.
 
+### Section D fix: heap-slot images in the pass hazard check (2026-11-13)
+
+Reported on PPSA34501 (Black Ops 1): with the direct path the main menu is a pale field with dark
+specks that flickers; `APS5_NO_DIRECT=1` is clean. Bisected to direct draws, then pixel shaders,
+then one program (code 0x400088b700, one fullscreen draw per frame) sampling the scene's
+R16G16B16A16 HDR target.
+
+- Cause: a direct stage binds its images in heap slots, outside its ShaderResources, so the draw's
+  pass access (`StorageImages`, `ReadsImage`) never named them. The composite read the HDR target
+  inside the open pass with no barrier after the draws that wrote it.
+- Fix: `ResolveDirectStages` notes, per draw, the GPU-written storage images it binds (sampled
+  storage sources as reads, storage images with their write flag, table-mirror elements included);
+  `recordDraw` adds them to the pass images and the reads-its-target test. Hazard information
+  only (principle 5); no per-draw change check.
+- Result: BO1 menu clean in 4 runs (1.5 % near-white pixels against 97 % before). Regression pairs,
+  head against fix: FF 33.1 / 30.6 against 32.8 / 32.3 ms, LEGO 46.7 / 46.9 against 47.6 / 47.3 ms
+  (inside the noise floor; any LEGO cost would be the passes this hazard now breaks).
+- Not kept (saved as a patch outside the tree): sampler compare,
+  unnormalized and integer-border flags and the base-level view for unnormalized images in direct
+  requests. They match the classic path but changed nothing on BO1. A per-use `RefreshDepthCopy`
+  was also tried and dropped: no effect, and it is a per-draw change check (principle 1).
+- Seen, not examined: `APS5_DIRECT_NO_FOLD_SRT=1` alone breaks BO1 (28 draws per 10 s,
+  `BDA access failed`).
+
 ### Phase 1 audit, first pass (2026-11-11)
 
 `relinker --windows --frame-red-zone --dry-run` on each title's executable (LEGO and FF need

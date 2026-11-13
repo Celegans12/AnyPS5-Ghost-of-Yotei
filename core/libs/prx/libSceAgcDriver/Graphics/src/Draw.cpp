@@ -2876,7 +2876,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // draw neither reads its attachments (a barrier would be owed, which no pass allows) nor
     // records anything outside a pass (an indirect draw's argument barrier and scratch copies).
     const auto passKey = DrawRenderPassKey(context, state, record.targetViews);
-    const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
+    const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()) || DirectDrawReads(target.get()); });
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
     // address-based build), or over its GPU-side records, lands before it, as before a dispatch
     // (VulkanDevice::dispatch); the flush ends an open pass, so it comes before the decision.
@@ -2909,12 +2909,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
-    for (const auto& entry : record.moved) {
-        if (entry.inPlace == VK_NULL_HANDLE) continue;
-        const auto begin = entry.address - entry.adjustment;
-        passReads.emplace_back(begin, begin + GuestBufferMemory::ViewBytes(entry.size, entry.adjustment));
-    }
-    const auto passImages = resources.StorageImages();
+    auto passImages = resources.StorageImages();
+    // Direct stages bind their images in heap slots, outside the ShaderResources.
+    const auto directImages = DirectDrawImages();
+    passImages.insert(passImages.end(), directImages.begin(), directImages.end());
+    ClearDirectDrawImages();
     std::vector<std::pair<VkImage, bool>> passAttachments;
     passAttachments.reserve(record.targets.size());
     for (const auto& target : record.targets) {

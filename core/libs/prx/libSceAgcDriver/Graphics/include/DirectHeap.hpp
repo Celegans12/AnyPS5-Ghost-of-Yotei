@@ -80,6 +80,13 @@ struct DirectSlotRequest {
 class StorageTexture;
 
 bool ResolveDirectStages(const Context& context, std::span<const CompiledShader> shaders, std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>>& patched, std::vector<CompiledShader>& out, std::vector<std::shared_ptr<StorageTexture>>* written = nullptr);
+// The GPU-written storage images the last ResolveDirectStages call on this thread bound in heap slots
+// (sampled storage sources as reads, storage images with their write flag), for the draw's pass access.
+std::span<const std::pair<VkImage, bool>> DirectDrawImages();
+// Whether that draw reads `image` (its own render target, for example).
+bool DirectDrawReads(const StorageTexture* image);
+// Forgets them once the draw's pass access holds them, so no later draw inherits them.
+void ClearDirectDrawImages();
 // Debug aid: while set on this thread, ResolveDirectStages prints each slot it resolves.
 
 }
