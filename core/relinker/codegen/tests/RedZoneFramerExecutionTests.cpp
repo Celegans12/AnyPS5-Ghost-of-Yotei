@@ -358,6 +358,12 @@ std::vector<Leaf> thunkLeaves() {
             0x48, 0x89, 0x7c, 0x24, 0xe8, 0x53, 0x48, 0x89, 0xf3, 0x48, 0x8b, 0x44, 0x24, 0xf0,
             0x48, 0x01, 0xd8, 0x5b, 0xc3,
         }, kA + kB},
+        // AoM's crc32 shape: an early-out ret before the pushes, so the pushes go below the thunk's
+        // slot and the gap must cover them as well as the spill below them.
+        {"leaf pushing after an early-out ret and spilling below its pushes", {
+            0x48, 0x85, 0xf6, 0x74, 0x15, 0x52, 0x52, 0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x8b, 0x44, 0x24, 0xf0,
+            0x59, 0x5a, 0x48, 0x01, 0xd0, 0x48, 0x01, 0xc8, 0xc3, 0x31, 0xc0, 0xc3,
+        }, kA + 2 * kC},
     };
 }
 
@@ -560,7 +566,7 @@ int main() {
         const auto widened = runLeaves(widenedLeaves());
         require(widened.WidenedPrologues == 9 && widened.WidenedExits == 10 && widened.WidenedOperands == 13, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 9, 10 and 13");
         const auto thunked = runLeaves(thunkLeaves());
-        require(thunked.ReturnThunks == 2 && thunked.Exits == 0, "the leaves whose exits cannot be patched were framed with " + std::to_string(thunked.ReturnThunks) + " return thunks and " + std::to_string(thunked.Exits) + " exit stubs, not 2 and 0");
+        require(thunked.ReturnThunks == 3 && thunked.Exits == 0, "the leaves whose exits cannot be patched were framed with " + std::to_string(thunked.ReturnThunks) + " return thunks and " + std::to_string(thunked.Exits) + " exit stubs, not 3 and 0");
         std::cout << "red-zone framer execution tests passed\n";
         return 0;
     } catch (const SteppingDegraded& error) {
