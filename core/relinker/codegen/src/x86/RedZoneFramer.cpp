@@ -331,9 +331,10 @@ std::optional<std::pair<std::uint8_t, std::uint8_t>> modRmFields(const std::uint
 
 // A switch's dispatch: `lea base, [rip+table]` ... `movsxd target, [base+index*4]` ...
 // `add target, base` ... `jmp target`, the base possibly copied by movs. Returns the table's
-// segment offset, from the lea.
+// segment offset from the lea, or no table when the base was set further back (a lea hoisted
+// out of a loop): the caller then takes every table the function's RIP-relative leas address.
 struct JumpTableDispatch {
-    std::int64_t Table;
+    std::optional<std::int64_t> Table;
 };
 
 std::optional<JumpTableDispatch> jumpTableDispatch(const std::vector<Insn>& body, const std::size_t k, const std::uint8_t* segment) {
@@ -345,6 +346,7 @@ std::optional<JumpTableDispatch> jumpTableDispatch(const std::vector<Insn>& body
     const auto target = jumpForm->second;
     std::optional<std::uint8_t> addBase;
     bool loaded = false;
+    bool sameBase = false;
     std::set<std::uint8_t> holders;
     for (std::size_t back = 1; back <= 16 && back <= k; ++back) {
         const auto j = k - back;
@@ -369,6 +371,7 @@ std::optional<JumpTableDispatch> jumpTableDispatch(const std::vector<Insn>& body
             if (mod == 2) return std::nullopt;
             holders.insert(base);
             loaded = true;
+            sameBase = base == *addBase;
             continue;
         }
         if (const auto copy = modRmFields(code, insn, 0x89, true, true); copy && holders.contains(copy->second)) {
@@ -388,6 +391,8 @@ std::optional<JumpTableDispatch> jumpTableDispatch(const std::vector<Insn>& body
             return JumpTableDispatch{static_cast<std::int64_t>(insn.Offset + insn.Length) + disp};
         }
     }
+    // The load and the add use one base register, set before the window.
+    if (loaded && sameBase) return JumpTableDispatch{std::nullopt};
     return std::nullopt;
 }
 
@@ -528,20 +533,40 @@ void frameSegment(
         std::map<std::size_t, std::size_t> indexOf;
         for (std::size_t k = 0; k < body.size(); ++k) indexOf[body[k].Offset] = k;
         std::map<std::size_t, std::vector<std::size_t>> tables;
+        // The scan stops at the first int3: an entry landing between it and the FDE end may be a
+        // case the scan never saw, so that table is not resolved (returns false).
+        const auto bodyEnd = static_cast<std::int64_t>(body.back().Offset + body.back().Length);
+        const auto tableCases = [&](const std::int64_t table, std::set<std::size_t>& cases) {
+            for (std::int64_t entry = 0; entry < kJumpTableEntryLimit; ++entry) {
+                const auto value = readGuest32(static_cast<std::uint64_t>(static_cast<std::int64_t>(ph.MappedAddress) + table + 4 * entry));
+                if (!value) break;
+                const auto caseOffset = table + *value;
+                if (caseOffset < static_cast<std::int64_t>(start) || caseOffset >= static_cast<std::int64_t>(limit)) break;
+                if (caseOffset >= bodyEnd) return false;
+                const auto found = indexOf.find(static_cast<std::size_t>(caseOffset));
+                if (found == indexOf.end()) break;
+                cases.insert(found->second);
+            }
+            return true;
+        };
+        // Every table the function's RIP-relative leas address, for a dispatch whose base was set
+        // before its window: the real table is among them, the others only add cases.
+        std::vector<std::int64_t> leaTables;
+        for (std::size_t k = 0; k < body.size(); ++k)
+            if (const auto lea = modRmFields(at(k), body[k], 0x8d, true, false); lea && body[k].Info.HasRipRelativeDisp) {
+                std::int32_t disp = 0;
+                std::memcpy(&disp, at(k) + body[k].Info.RipRelativeDispOffset, 4);
+                leaTables.push_back(static_cast<std::int64_t>(body[k].Offset + body[k].Length) + disp);
+            }
         for (std::size_t k = 0; k < body.size(); ++k) {
             const auto dispatch = jumpTableDispatch(body, k, seg.data());
             if (!dispatch) continue;
-            std::vector<std::size_t> cases;
-            for (std::int64_t entry = 0; entry < kJumpTableEntryLimit; ++entry) {
-                const auto value = readGuest32(static_cast<std::uint64_t>(static_cast<std::int64_t>(ph.MappedAddress) + dispatch->Table + 4 * entry));
-                if (!value) break;
-                const auto caseOffset = dispatch->Table + *value;
-                if (caseOffset < static_cast<std::int64_t>(start) || caseOffset >= static_cast<std::int64_t>(limit)) break;
-                const auto found = indexOf.find(static_cast<std::size_t>(caseOffset));
-                if (found == indexOf.end()) break;
-                cases.push_back(found->second);
-            }
-            if (cases.empty()) continue;
+            std::set<std::size_t> found;
+            bool complete = true;
+            if (dispatch->Table) complete = tableCases(*dispatch->Table, found);
+            else for (const auto table : leaTables) complete = tableCases(table, found) && complete;
+            const std::vector<std::size_t> cases(found.begin(), found.end());
+            if (!complete || cases.empty()) continue;
             for (const auto c : cases) targets.insert(body[c].Offset);
             tables.emplace(k, std::move(cases));
         }
@@ -610,9 +635,21 @@ void frameSegment(
             // returns through a thunk, its pushes and allocations taken as part of the body.
             // A jmp through memory without an index ([reg+disp], [rip+disp]) loads a function
             // pointer: a tail call even in a leaf without pushes.
+            // So is `mov reg, [base+disp]; jmp reg`.
             const auto pointerJumpAt = [&](const std::size_t k) {
                 const auto& insn = body[k];
-                if (insn.Info.FlowKind != ControlFlowKind::IndirectJump || !insn.Info.HasModRm || (insn.Info.ModRmByte >> 6) == 3) return false;
+                if (insn.Info.FlowKind != ControlFlowKind::IndirectJump || !insn.Info.HasModRm) return false;
+                if ((insn.Info.ModRmByte >> 6) == 3) {
+                    const auto jump = modRmFields(at(k), insn, 0xff, false, true);
+                    if (!jump || k == 0) return false;
+                    const auto& prior = body[k - 1];
+                    const auto load = modRmFields(at(k - 1), prior, 0x8b, true, false);
+                    if (!load || load->first != jump->second || memoryUse(at(k - 1), prior).RspBased || prior.Info.HasRipRelativeDisp) return false;
+                    if ((prior.Info.ModRmByte & 7) != 4) return true;
+                    if (prior.Info.ModRmOffset + 1 >= prior.Length) return false;
+                    const auto sib = at(k - 1)[prior.Info.ModRmOffset + 1];
+                    return ((sib >> 3) & 7) == 4 && (prior.Info.RexPrefix & 0x02) == 0;
+                }
                 if ((insn.Info.ModRmByte & 7) != 4) return true;
                 if (insn.Info.ModRmOffset + 1 >= insn.Length) return false;
                 const auto sib = at(k)[insn.Info.ModRmOffset + 1];
@@ -668,7 +705,9 @@ void frameSegment(
             std::map<std::size_t, std::pair<std::size_t, std::vector<std::uint8_t>>> moves;
             std::vector<std::size_t> stubbed;
             std::vector<std::size_t> stackMoves;
-            const auto functionEnd = limit;
+            // Branches are checked against the scanned code: one past the first int3 reaches code
+            // the scan never saw.
+            const auto functionEnd = static_cast<std::size_t>(bodyEnd);
             std::int64_t depth = 0;
             bool wholeRedZone = rbpPrologue;
             for (std::size_t k = p; k < body.size(); ++k) {
