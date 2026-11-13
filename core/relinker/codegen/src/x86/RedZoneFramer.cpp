@@ -316,6 +316,7 @@ MemoryUse memoryUse(const std::uint8_t* code, const Insn& insn) {
     if (base == kRegRbp && !baseExtended && mod != 0) {
         use.RbpBased = true;
         use.RbpDisp = disp;
+        use.Indexed = indexed;
     }
     return use;
 }
@@ -1110,6 +1111,13 @@ void frameSegment(
 
             bool leaf = true;
             bool redZone = false;
+            bool called = false;
+            bool redZoneBeforeCall = false;
+            // Exits through `leave` (frame pointer, nothing else pushed): `pop rbp`s to rewrite.
+            const bool leaveExits = rbpPrologue && pushed.empty() && !asThunk;
+            std::vector<std::size_t> leaves;
+            std::size_t leaveExitCount = 0;
+            std::int64_t frameBeforeCall = static_cast<std::int64_t>(8 * pushed.size());
             const char* reason = nullptr;
             std::vector<ExitSite> exits;
             std::map<std::size_t, std::pair<std::size_t, std::vector<std::uint8_t>>> moves;
@@ -1170,16 +1178,55 @@ void frameSegment(
                 }
                 return out;
             };
+            // Inline assembly calls helpers inside its own function (AES key expansion: `call 1f` per
+            // round): straight-line code after a jmp or ret, entered only by calls, ending in a ret
+            // without touching the stack. Such calls keep the function a leaf, and the helper's ret is
+            // not an exit; a lowered rsp only moves the return address further from the red zone.
+            std::set<std::size_t> helperCalls;
+            std::set<std::size_t> helperRets;
+            for (std::size_t k = p; k < body.size(); ++k) {
+                const auto& insn = body[k];
+                if (insn.Info.FlowKind != ControlFlowKind::Call || !insn.Info.HasBranchTarget || insn.Info.HasRipRelativeDisp) continue;
+                const auto target = static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp;
+                if (target <= static_cast<std::int64_t>(start) || target >= static_cast<std::int64_t>(functionEnd)) continue;
+                const auto found = indexOf.find(static_cast<std::size_t>(target));
+                if (found == indexOf.end() || found->second == 0) continue;
+                const auto prior = body[found->second - 1].Info.FlowKind;
+                if (prior != ControlFlowKind::UnconditionalJump && prior != ControlFlowKind::Return) continue;
+                auto j = found->second;
+                while (j < body.size() && body[j].Info.FlowKind == ControlFlowKind::Sequential && !memoryUse(at(j), body[j]).UsesRsp && !pushesOrPops(at(j), body[j])) ++j;
+                if (j >= body.size() || body[j].Info.FlowKind != ControlFlowKind::Return || body[j].Length != 1 || at(j)[0] != 0xc3) continue;
+                helperCalls.insert(k);
+                helperRets.insert(j);
+            }
             for (std::size_t k = p; k < body.size(); ++k) {
                 const auto& insn = body[k];
                 const auto* code = at(k);
                 const auto flow = insn.Info.FlowKind;
-                if (flow == ControlFlowKind::Call || flow == ControlFlowKind::IndirectCall) { leaf = false; break; }
+                if (helperCalls.contains(k) || helperRets.contains(k)) continue;
+                // A function that calls is scanned on: some keep values below rsp before their calls
+                // (libc's bounds-checked copies compare a slot at [rbp-8] with their own frame).
+                if (flow == ControlFlowKind::Call || flow == ControlFlowKind::IndirectCall) { leaf = false; called = true; continue; }
                 if (frees.contains(k)) continue;
                 const auto use = memoryUse(code, insn);
                 if (use.RbpBased && rbpPrologue && use.RbpDisp < -static_cast<std::int64_t>(8 * pushed.size()) - rbpAllocation) redZone = true;
                 if (use.RspBased && use.RspDisp < 0) redZone = true;
+                // For a function that calls, only a slot below the frame built so far (pushes and every
+                // `sub rsp` before the first call) counts: after a call, nothing can live below rsp.
+                if (!called) {
+                    // `and rsp, -N` realigns the frame by an unknown amount: rbp slots are inside it.
+                    if (insn.Length == 4 && code[0] == 0x48 && code[1] == 0x83 && code[2] == 0xe4) frameBeforeCall = std::numeric_limits<std::int64_t>::max() / 2;
+                    else if (const auto adjustment = rspAdjustment(code, insn)) { if (*adjustment < 0) frameBeforeCall += -*adjustment; }
+                    // An indexed operand ([rsp+rdx-0x10]) addresses an array in the frame: its
+                    // displacement says nothing about the red zone. An `lea` stores nothing: below rsp
+                    // it is an alloca's new rsp, or an array base biased below its first element.
+                    else if (!use.Indexed && !(!insn.Info.IsTwoByteOpcode && insn.Info.Opcode == 0x8d) && ((use.RbpBased && rbpPrologue && use.RbpDisp < -frameBeforeCall) || (use.RspBased && use.RspDisp < 0))) {
+                        redZoneBeforeCall = true;
+                    }
+                }
                 if (reason != nullptr) continue;
+                // With only rbp pushed, `leave` restores rsp from rbp however far rsp was lowered.
+                if (code[insn.Info.OpcodeOffset] == 0xc9 && insn.Length == 1 && leaveExits) continue;
                 if (code[insn.Info.OpcodeOffset] == 0xc9 || code[insn.Info.OpcodeOffset] == 0xc8) { reason = "leave or enter"; continue; }
                 if (frameless && pushesOrPops(code, insn) && exitReason == nullptr) exitReason = "push or pop in a leaf without pushes";
                 if (!rbpPrologue && pushesOrPops(code, insn)) stackMoves.push_back(k);
@@ -1220,6 +1267,13 @@ void frameSegment(
                     if (flow == ControlFlowKind::Return && (insn.Length != 1 || code[0] != 0xc3)) { reason = "ret with an immediate"; continue; }
                     if (flow == ControlFlowKind::Return) sawRet = true;
                     if (exitReason != nullptr) continue;
+                    // A frame-pointer function that pushes only rbp leaves through `leave`: its 1-byte
+                    // `pop rbp` becomes one, and an exit that already has one needs nothing.
+                    if (leaveExits && k > p && body[k - 1].Length == 1 && body[k - 1].Offset + 1 == insn.Offset) {
+                        const auto prior = at(k - 1)[0];
+                        if (prior == 0xc9) { ++leaveExitCount; continue; }
+                        if (prior == 0x5d) { leaves.push_back(k - 1); ++leaveExitCount; continue; }
+                    }
                     const auto pops = popsBefore(k);
                     // A jump that does not undo the prologue first is not a tail call: a jump table, or
                     // a jump to a part that still uses the frame.
@@ -1257,8 +1311,15 @@ void frameSegment(
                     exits.push_back(std::move(exit));
                 }
             }
-            if (!leaf || !redZone) break;
+            if (!redZone || (!leaf && !redZoneBeforeCall)) break;
             if (!asThunk) ++report.RedZoneFunctions;
+            // A function that calls is framed only with a frame pointer: its unwind data finds the
+            // caller's frame through rbp, and its callees build their frames below whatever rsp is.
+            // Without one, outgoing stack arguments and unwinding are both relative to rsp.
+            if (!leaf && !rbpPrologue) {
+                skip("function with calls keeps values below rsp without a frame pointer");
+                break;
+            }
             // The thunk's slot sits where the leaf's own pushes go: they must balance on every path, so
             // that each ret finds the thunk's address (a fragment popping its caller's pushes would not).
             // The stack below the entry at each instruction, from the entry down: pushed slots and
@@ -1418,7 +1479,8 @@ void frameSegment(
                 return insn.Info.HasBranchTarget && !insn.Info.HasRipRelativeDisp && insn.Info.FlowKind != ControlFlowKind::Call && static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp == static_cast<std::int64_t>(start);
             });
             if (reason == nullptr && entryEnd != prologueEnd && loopsToStart) reason = "branch to the start of a widened prologue";
-            if (reason == nullptr && !thunk && exits.empty()) reason = "no ret exit";
+            if (reason == nullptr && !thunk && exits.empty() && leaveExitCount == 0) reason = "no ret exit";
+            if (reason == nullptr && std::any_of(leaves.begin(), leaves.end(), [&](const std::size_t k) { return body[k].Offset < entryEnd || overlapsExisting(body[k].Offset, body[k].Offset + 1); })) reason = "prologue shorter than a jump";
             if (reason == nullptr && std::any_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return exit.Begin < entryEnd; })) reason = "prologue shorter than a jump";
             if (reason == nullptr && (overlapsExisting(start, entryEnd) || std::any_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return overlapsExisting(exit.Begin, exit.End); }))) reason = "overlaps another stub";
             const auto carried = [&](const std::size_t k) {
@@ -1466,6 +1528,11 @@ void frameSegment(
             // leaf's own code must stay as it is: it is relocated whole instead.
             if (reason == nullptr && enteredFromOutside(start + 1, static_cast<std::size_t>(bodyEnd))) reason = "entered from outside its start";
             if (reason != nullptr) {
+                // Relocation refuses calls: a function that calls reports why it was not framed in place.
+                if (!leaf) {
+                    skip(reason);
+                    break;
+                }
                 if (!asThunk && !rbpPrologue && (!pushed.empty() || allocation > 0)) {
                     firstReason = reason;
                     continue;
@@ -1513,6 +1580,8 @@ void frameSegment(
             }
             for (auto& stub : stubs) addSite(stub.Begin, stub.End, std::move(stub.Body));
             for (auto& [k, move] : moves) displacements.push_back({ph.Offset + move.first, std::move(move.second)});
+            for (const auto k : leaves) displacements.push_back({ph.Offset + body[k].Offset, {0xc9}});
+            report.LeaveExits += leaveExitCount;
             ++report.Framed;
             if (!rbpPrologue) ++report.FramedWithoutFramePointer;
             report.Exits += exits.size();
@@ -1523,6 +1592,7 @@ void frameSegment(
                 report.WidenedOperands += exit.Operands;
             }
             report.MovedOperands += moves.size();
+            if (!leaf) ++report.FramedWithCalls;
             report.OperandStubs += stubs.size();
             for (const auto& stub : stubs) report.StubbedOperands += stub.Operands;
             break;
@@ -1633,17 +1703,36 @@ std::vector<RedZoneFunction> SplitUncoveredCode(const std::vector<std::uint8_t>&
             // that is not a nop.
             std::optional<std::size_t> start;
             std::size_t last = 0;
+            // The furthest direct branch target in the piece so far, and whether it has an indirect
+            // jump (a jump table's cases can sit anywhere after it).
+            std::optional<std::int64_t> reach;
+            bool opaque = false;
             const auto close = [&]() {
                 if (start && last > *start) pieces.push_back({ph.MappedAddress + begin + *start, ph.MappedAddress + begin + last});
                 start.reset();
+                reach.reset();
+                opaque = false;
             };
+            // Functions follow each other with no padding (16-byte ones always do): after a ret, jmp
+            // or ud2, a `push rbp; mov rbp, rsp` prologue starts the next one, and so does any code no
+            // branch before it reaches (a shrink-wrapped function tests before it pushes).
+            bool afterExit = false;
             walkUncovered(code, [&](const std::size_t at, const std::size_t length) {
                 const auto kind = uncoveredKind(decoder, code, at, length);
-                if (kind == UncoveredKind::Break) { close(); return; }
+                if (kind == UncoveredKind::Break) { close(); afterExit = false; return; }
                 if (kind == UncoveredKind::Nop) return;
-                if (start && callTargets.contains(begin + at)) close();
+                const bool prologue = at + 4 <= code.size() && code[at] == 0x55 && code[at + 1] == 0x48 && code[at + 2] == 0x89 && code[at + 3] == 0xe5;
+                const bool unreached = !opaque && (!reach || *reach < static_cast<std::int64_t>(at));
+                if (start && (callTargets.contains(begin + at) || (afterExit && (prologue || unreached)))) close();
                 if (!start) start = at;
                 last = at + length;
+                const auto info = decoder.DecodeInstruction(code.data() + at, length);
+                if (info.FlowKind == ControlFlowKind::IndirectJump) opaque = true;
+                if ((info.FlowKind == ControlFlowKind::ConditionalBranch || info.FlowKind == ControlFlowKind::UnconditionalJump) && info.HasBranchTarget && !info.HasRipRelativeDisp) {
+                    const auto target = static_cast<std::int64_t>(at + length) + info.BranchDisp;
+                    reach = reach ? std::max(*reach, target) : target;
+                }
+                afterExit = info.FlowKind == ControlFlowKind::Return || info.FlowKind == ControlFlowKind::UnconditionalJump || info.FlowKind == ControlFlowKind::IndirectJump || (length == 2 && code[at] == 0x0f && code[at + 1] == 0x0b);
             });
             close();
         };

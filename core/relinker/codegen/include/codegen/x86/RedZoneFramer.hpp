@@ -37,6 +37,11 @@ struct RedZoneFrameReport {
     // Relocated leaves with an indirect jump of unknown target, which leaves the stub.
     std::size_t RelocatedOpenJumps = 0;
     std::map<std::string, std::size_t> Skipped;
+    // Frame-pointer functions that call and keep values below rsp before a call, framed like leaves.
+    std::size_t FramedWithCalls = 0;
+    // Exits of frame-pointer functions that push only rbp, left through `leave` (a `pop rbp`
+    // rewritten in place, or a `leave` already there) instead of an exit stub.
+    std::size_t LeaveExits = 0;
     // Code-segment ranges outside every function's bounds (padding trimmed), never examined.
     std::size_t UncoveredRanges = 0;
     std::size_t UncoveredBytes = 0;
