@@ -210,7 +210,7 @@ Per phase:
     - Compiled pipelines are cached (our cache plus NVIDIA's), so each run gets further.
     - Open: translation size (section E). The levers measured on LEGO are cheaper NaN checks (-5 %
       words), `APS5_FAST_F32` (-22 %) and the spanned wave (-39 %).
-  - **Translation size, measured (2026-11-13, uncommitted in the tree):** 158 compute requests
+  - **Translation size, measured (2026-11-13, bc7ef96c09 and cb4485926e):** 158 compute requests
     dumped to the title (`APS5_DUMP_SHADERS=1`, run `007\dump1`), replayed offline. All 29 large
     programs fell back from spanned to paired: the spanned uniformity check counts every guest-memory
     load as per-invocation once the module stores guest memory, and the deciding loads are guest
@@ -232,6 +232,33 @@ Per phase:
 - **1:** first audit pass fails on all three titles. Skipped functions: LEGO 158, FF 39, AoM 147.
   The bundled PRX modules are not framed, and code without `.eh_frame` bounds is not checked. The
   two "shorter than a jump" shapes and the push/pop shape are about 70 % of the skipped functions.
+  - **RIP-relative widening (2026-11-13, 58acf93710, `probe-patches\redzone-rip-relative-widening.patch`):**
+    prologue, exit and operand stubs may now cover RIP-relative instructions, with a relocation
+    per copied displacement. Skipped: LEGO 158 -> 77 (short exits 87 -> 17, short prologues
+    14 -> 2), AoM 147 -> 136, FF 39 unchanged. LEGO converted with `--frame-red-zone` runs the
+    bench scene normally (46.6-48.1 vs 46.8 ms unframed, same picture; runs `lego\rz-plain1`,
+    `lego\rz-framed1/2`); the game folder was restored to its previous conversion afterwards
+    (backup `lego-convert-backup`). Tests: red-zone unit and execution tests pass (new execution
+    case: a short exit widened over a RIP-relative lea, checked under the clobber).
+  - **Skipped leaves without stores (measured, not used):** a leaf that stores only through rsp
+    cannot take a write-protection fault. FF 13 of 39, LEGO 28 of 158 (before the change above).
+  - **Return thunks (96f2e8d266):** a leaf without pushes, allocation or frame pointer whose exits
+    cannot be patched gets an entry stub that lowers rsp and calls the rest of itself, so each ret
+    lands on `lea rsp, [rsp+shift]; ret`; its pushes and pops must balance on every path. Stubs may
+    also carry a jcc. Skipped: AoM 136 -> 66 (66 thunks), LEGO 77 -> 52 (23), FF 39 -> 31 (7).
+    LEGO framed runs normally (46.8-48.1 ms, runs `lego\rz-thunk1/2`), folder restored after.
+  - **Tail-jump entries and AH (1d54fb40d5):** only a branch from inside the leaf to its start
+    blocks a widened prologue; `ah` (register 4 without REX) is no longer read as rsp. Skipped:
+    AoM 66 -> 44, LEGO 52 -> 42, FF 31 -> 18.
+  - **Thunk gap fix (110ddcf025):** a leaf with pushes after an early-out ret went through a thunk
+    whose gap did not cover those pushes, so its spills overwrote its saved registers (framed AoM
+    crashed at start-up in crc32 at 0x39f1900). The gap now covers the pushes before each red-zone
+    operand; past 128 bytes the leaf is skipped ("too deep for a thunk": AoM 5, 007 5).
+    Framed runs: AoM title screen correct, p50 158 ms vs 163-167 plain (`aom\rz-aom-framed2`,
+    `rz-aom-plain3/4`); 007 p50 125 ms, no crash (`007\rz-framed1`). Folders restored after.
+  - Remaining skipped (AoM 49 / LEGO ~42 / FF ~18 / 007 132): other use of rsp (`sub/add rsp` in
+    the body, `mov rbp,rsp`, `push rsp`), indirect jump, branch leaves the function (tail calls),
+    branch into the instructions before a short exit, and a few others.
 - **2 and 3:** not started.
 - **4:** section B is built in its walk-based form (bound ranges and index windows). It took the
   AoM title from 216 to about 150 ms. The section D validity change is not started.
@@ -251,22 +278,22 @@ Per phase:
 - **6:** per-draw record cost is 12 to 25 us. On the AoM worker, stage preparation brings this to
   about 156 us per draw.
 
-Next:
+Next, in phase order:
 
-1. **AoM.** Probe: resolve each fetch base's range when the binding plan is built (section E
-   translation), then bench the AoM title. First check that the fetch bases are CPU-known. The
-   table-size probe changed nothing, so the gain is not proven. After that, the timeline outliers
-   above.
-2. **FF.** One worker profile on head to split coherence from waits. Waits lead to phase 3;
-   coherence makes phase 1 the critical path.
-3. **LEGO.** The translation question above.
+1. **Phase 1.** Frame the remaining skipped leaf shapes in the relinker: other use of rsp,
+   indirect jumps, tail calls, branches into short exits. Check each change with one framed run
+   per title for crashes (no benchmarks needed). Then frame the bundled PRX modules, account for
+   code without `.eh_frame` bounds, and build the fault-storm test.
+2. **Phase 2** once a title passes the phase 1 gate.
+3. **Phase 3** (waits) after that; it does not depend on phase 1.
+
+Parked until their phase comes up: the AoM fetch-range probe and timeline outliers (phase 5), the
+FF worker profile, and the LEGO translation question (phase 5).
 
 Open:
 
 - The AoM mirror ceiling (35 and 74 us per draw) was measured on isolated draws, so it may not be a
   like-for-like target.
-- On BO1, `APS5_DIRECT_NO_FOLD_SRT=1` alone breaks rendering (`BDA access failed`). Seen, not
-  examined.
 
 ## What this can and cannot deliver
 
