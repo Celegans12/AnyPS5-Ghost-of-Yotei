@@ -37,12 +37,23 @@ struct RedZoneFrameReport {
     // Relocated leaves with an indirect jump of unknown target, which leaves the stub.
     std::size_t RelocatedOpenJumps = 0;
     std::map<std::string, std::size_t> Skipped;
+    // Code-segment ranges outside every function's bounds (padding trimmed), never examined.
+    std::size_t UncoveredRanges = 0;
+    std::size_t UncoveredBytes = 0;
+    // Of those, ranges with a PLT-style `jmp [rip+x]`, and ranges with an access below rsp.
+    std::size_t UncoveredPltRanges = 0;
+    std::size_t UncoveredBelowRsp = 0;
+    std::vector<std::uint64_t> UncoveredBelowRspAddresses;
 };
 
 struct RedZoneDisplacement {
     Domain::FileByteOffset Offset;
     std::vector<std::uint8_t> Bytes;
 };
+
+// Code-segment code outside every function's bounds, split into functions at int3 padding and at
+// direct call targets.
+std::vector<RedZoneFunction> SplitUncoveredCode(const std::vector<std::uint8_t>& fileBytes, const std::vector<Domain::ProgramHeader>& codeSegments, const std::vector<RedZoneFunction>& functions);
 
 std::vector<TrampolineSite> FrameRedZoneFunctions(
     const std::vector<std::uint8_t>& fileBytes,

@@ -18,10 +18,15 @@ RedZoneFramingResult FrameRedZoneImage(std::vector<std::uint8_t>& bytes, const s
     for (const auto& header : headers) if (header.Type == 1) loadSegments.push_back(header);
     std::vector<Codegen::RedZoneFunction> functions;
     for (const auto& region : UnusedNidFilter::ReadExceptionFunctions(bytes, headers, {}, {})) functions.push_back({region.Begin, region.End});
-    if (functions.empty()) {
-        result.HasBounds = false;
-        return result;
-    }
+    result.HasBounds = !functions.empty();
+    // Code no FDE covers (FF's eboot: 94 % of its code) is split into functions at int3 padding and
+    // direct call targets, and framed like the rest; the framer's own checks (branches into a leaf
+    // from outside it, exits that leave it) hold for these bounds too.
+    const auto pieces = Codegen::SplitUncoveredCode(bytes, codeSegments, functions);
+    result.SplitFunctions = pieces.size();
+    if (!pieces.empty()) message(prefix + ": " + std::to_string(pieces.size()) + " functions taken from code outside .eh_frame bounds, split at int3 padding and call targets\n");
+    functions.insert(functions.end(), pieces.begin(), pieces.end());
+    if (functions.empty()) return result;
     // R_X86_64_RELATIVE addends: tables of absolute addresses are zero in the file.
     std::map<std::uint64_t, std::uint64_t> relativeAddends;
     for (std::size_t at = 0; at + 24 <= relaData.size(); at += 24) {
@@ -45,6 +50,14 @@ RedZoneFramingResult FrameRedZoneImage(std::vector<std::uint8_t>& bytes, const s
     if (report.ReturnThunks != 0) { std::ostringstream text; text << prefix << ": " << report.ReturnThunks << " leaves return through a thunk, as their exits could not be patched\n"; say(text); }
     if (report.Relocated != 0) { std::ostringstream text; text << prefix << ": " << report.Relocated << " leaves relocated whole into a stub, as their frames could not be patched in place (" << report.RelocatedCases << " jump-table cases enter through a jump; " << report.RelocatedOpenJumps << " leaves have an indirect jump that leaves the stub)\n"; say(text); }
     if (report.WidenedPrologues != 0 || report.WidenedExits != 0) { std::ostringstream text; text << prefix << ": " << report.WidenedPrologues << " prologues widened over the instructions after them and " << report.WidenedExits << " exits over the instructions before them, as they were shorter than a jump (" << report.WidenedOperands << " rsp operands moved into their stubs)\n"; say(text); }
+    if (report.UncoveredRanges != 0) {
+        std::ostringstream text;
+        text << prefix << ": " << report.UncoveredRanges << " code ranges (" << report.UncoveredBytes << " bytes) outside every function's .eh_frame bounds, not examined; " << report.UncoveredPltRanges << " hold PLT-style jumps, " << report.UncoveredBelowRsp << " access memory below rsp";
+        for (std::size_t index = 0; index < report.UncoveredBelowRspAddresses.size() && index < 8; ++index) text << (index == 0 ? " (at 0x" : ", 0x") << std::hex << report.UncoveredBelowRspAddresses[index] << std::dec;
+        if (!report.UncoveredBelowRspAddresses.empty()) text << (report.UncoveredBelowRspAddresses.size() > 8 ? ", ...)" : ")");
+        text << '\n';
+        say(text);
+    }
     for (const auto& [reason, count] : report.Skipped) {
         result.Skipped += count;
         std::ostringstream text; text << prefix << ": skipped " << count << ": " << reason << '\n'; say(text);
