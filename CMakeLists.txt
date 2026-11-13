@@ -136,6 +136,11 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
     add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fmacro-prefix-map=${CMAKE_SOURCE_DIR}/=>)
 endif()
+# Windows delivers exceptions below rsp: a sysv_abi function (every export guest code calls) keeping
+# values in the red zone loses them to a fault taken while it runs. MS ABI functions have no red zone.
+if(MINGW)
+    add_compile_options($<$<COMPILE_LANGUAGE:C,CXX>:-mno-red-zone>)
+endif()
 
 include(CheckCXXSourceCompiles)
 function(anyps5_check_cxx_links_standard_library)

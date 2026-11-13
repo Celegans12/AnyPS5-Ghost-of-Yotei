@@ -11,6 +11,7 @@
 #include <cwchar>
 #include <map>
 #include <random>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -29,9 +30,19 @@ std::atomic<DWORD> g_pending{0};
 std::atomic<unsigned> g_remaining{0};
 unsigned g_burst = 1;
 bool g_clobber = true;
+bool g_clobberGuestOnly = false;
 constexpr std::size_t RedZoneBytes = 0x80;
 std::atomic<unsigned long long> g_delivered{0};
 std::atomic<unsigned long long> g_stray{0};
+
+// APS5_FAULT_STORM_CLOBBER_RANGE=<image>:<begin>-<end> (hex offsets into the image named, e.g.
+// game.exe or libc.prx.guest.prx): overwrite the red zone only at steps there, to bisect a leaf
+// the framer missed.
+std::wstring g_clobberImage;
+std::uintptr_t g_clobberBegin = 0;
+std::uintptr_t g_clobberEnd = 0;
+std::atomic<std::uintptr_t> g_clobberLow{0};
+std::atomic<std::uintptr_t> g_clobberHigh{0};
 
 struct Range {
     std::uintptr_t Begin;
@@ -58,6 +69,14 @@ std::vector<Range> GuestCode() {
         if (!K32GetModuleInformation(process, modules[index], &info, sizeof(info))) continue;
         const auto base = reinterpret_cast<std::uintptr_t>(info.lpBaseOfDll);
         ranges.push_back({base, base + info.SizeOfImage});
+        if (!g_clobberImage.empty()) {
+            const wchar_t* file = name;
+            for (DWORD at = 0; at < length; ++at) if (name[at] == L'\\' || name[at] == L'/') file = name + at + 1;
+            if (_wcsicmp(file, g_clobberImage.c_str()) == 0) {
+                g_clobberLow.store(base + g_clobberBegin, std::memory_order_relaxed);
+                g_clobberHigh.store(base + g_clobberEnd, std::memory_order_release);
+            }
+        }
     }
     return ranges;
 }
@@ -65,6 +84,10 @@ std::vector<Range> GuestCode() {
 bool Inside(const std::vector<Range>& ranges, const std::uintptr_t address) {
     return std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return address >= range.Begin && address < range.End; });
 }
+
+// The guest code ranges for the exception handler: published by the storm thread, never freed
+// (a handful of small vectors per run), so the handler reads them without a lock.
+std::atomic<const std::vector<Range>*> g_guestCode{nullptr};
 
 long long Now() {
     LARGE_INTEGER value;
@@ -101,6 +124,7 @@ DWORD WINAPI Run(LPVOID parameter) {
             if (code.size() != before) {
                 std::fprintf(stderr, "[fault-storm] %zu guest code images\n", code.size());
                 std::fflush(stderr);
+                g_guestCode.store(new std::vector<Range>(code), std::memory_order_release);
             }
             nextModules = now + 2 * second;
         }
@@ -209,7 +233,10 @@ bool Handle(EXCEPTION_POINTERS* info) {
         // rsp itself. Without it, as on most guest steps here, a 9800X3D's frame stops 0x658 bytes
         // below rsp and never touches the red zone, so the storm writes the red zone itself. Host
         // code keeps nothing below rsp (Windows x64 ABI).
-        if (g_clobber) std::memset(reinterpret_cast<void*>(context->Rsp - RedZoneBytes), 0xa5, RedZoneBytes);
+        const auto* guest = g_guestCode.load(std::memory_order_acquire);
+        const auto rip = static_cast<std::uintptr_t>(context->Rip);
+        const bool inRange = g_clobberImage.empty() || (rip >= g_clobberLow.load(std::memory_order_relaxed) && rip < g_clobberHigh.load(std::memory_order_acquire));
+        if (g_clobber && inRange && (!g_clobberGuestOnly || (guest != nullptr && Inside(*guest, rip)))) std::memset(reinterpret_cast<void*>(context->Rsp - RedZoneBytes), 0xa5, RedZoneBytes);
         if (g_remaining.fetch_sub(1, std::memory_order_relaxed) <= 1) {
             context->EFlags &= ~TrapFlag;
             g_pending.store(0, std::memory_order_release);
@@ -237,6 +264,19 @@ void Start() {
     else g_burst = 256;
     // APS5_FAULT_STORM_NO_CLOBBER=1: real frames only (on an AVX-512 CPU they rarely reach the red zone).
     g_clobber = std::getenv("APS5_FAULT_STORM_NO_CLOBBER") == nullptr;
+    // APS5_FAULT_STORM_GUEST_CLOBBER=1: overwrite the red zone only at steps in guest code (the
+    // relinker's framed images), not in host code the guest calls.
+    g_clobberGuestOnly = std::getenv("APS5_FAULT_STORM_GUEST_CLOBBER") != nullptr;
+    if (const char* range = std::getenv("APS5_FAULT_STORM_CLOBBER_RANGE")) {
+        const char* colon = std::strchr(range, ':');
+        const char* dash = colon != nullptr ? std::strchr(colon, '-') : nullptr;
+        if (colon != nullptr && dash != nullptr) {
+            for (const char* at = range; at < colon; ++at) g_clobberImage.push_back(static_cast<wchar_t>(*at));
+            g_clobberBegin = static_cast<std::uintptr_t>(std::strtoull(colon + 1, nullptr, 16));
+            g_clobberEnd = static_cast<std::uintptr_t>(std::strtoull(dash + 1, nullptr, 16));
+            std::fprintf(stderr, "[fault-storm] red zone overwritten only in %.*s+0x%llx..0x%llx\n", static_cast<int>(colon - range), range, static_cast<unsigned long long>(g_clobberBegin), static_cast<unsigned long long>(g_clobberEnd));
+        }
+    }
     g_active.store(true, std::memory_order_relaxed);
     std::fprintf(stderr, "[fault-storm] on: up to %llu landings per second in guest code, %u steps each, red zone %s at every step\n", rate, g_burst, g_clobber ? "overwritten" : "left to the real frame");
     std::fflush(stderr);
