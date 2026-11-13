@@ -256,9 +256,14 @@ Per phase:
     operand; past 128 bytes the leaf is skipped ("too deep for a thunk": AoM 5, 007 5).
     Framed runs: AoM title screen correct, p50 158 ms vs 163-167 plain (`aom\rz-aom-framed2`,
     `rz-aom-plain3/4`); 007 p50 125 ms, no crash (`007\rz-framed1`). Folders restored after.
-  - Remaining skipped (AoM 49 / LEGO ~42 / FF ~18 / 007 132): other use of rsp (`sub/add rsp` in
-    the body, `mov rbp,rsp`, `push rsp`), indirect jump, branch leaves the function (tail calls),
-    branch into the instructions before a short exit, and a few others.
+  - **rsp arithmetic in the body (b4eec7ba80):** frame-pointer leaves whose `[rbp-x]` slots lie in
+    a `sub rsp` allocation freed only in epilogues are not red-zone users (007: 31). Leaves without
+    a frame pointer that move rsp outside their prologue allocation and frees return through a
+    thunk whose walk tracks pushed slots and allocations; the gap holds the whole frame (up to
+    2 KiB, disp32 lea). Crash checks (40 s, framed, folders restored): AoM, 007, LEGO, FF clean.
+  - Remaining skipped (AoM 37 / LEGO 33 / FF 18 / 007 87): indirect jump 11 / 15 / 11 / 28,
+    branch leaves the function 6 / 8 / 5 / 25, branch into the instructions before a short exit
+    10 / 4 / 0 / 16, exit shorter than a jump 3 / 1 / 1 / 12, and a few others.
 - **2 and 3:** not started.
 - **4:** section B is built in its walk-based form (bound ranges and index windows). It took the
   AoM title from 216 to about 150 ms. The section D validity change is not started.
@@ -280,8 +285,8 @@ Per phase:
 
 Next, in phase order:
 
-1. **Phase 1.** Frame the remaining skipped leaf shapes in the relinker: other use of rsp,
-   indirect jumps, tail calls, branches into short exits. Check each change with one framed run
+1. **Phase 1.** Frame the remaining skipped leaf shapes in the relinker: indirect jumps, tail
+   calls, branches into short exits. Check each change with one framed run
    per title for crashes (no benchmarks needed). Then frame the bundled PRX modules, account for
    code without `.eh_frame` bounds, and build the fault-storm test.
 2. **Phase 2** once a title passes the phase 1 gate.
