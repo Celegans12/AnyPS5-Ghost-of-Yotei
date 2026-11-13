@@ -200,6 +200,35 @@ Per phase:
     head too (pre-existing).
   - **Next for 007:** re-profile the committer and workers on 375d360e24. The menus are now about
     8 fps; move to gameplay once they are reasonable.
+  - **First cutscene, cold cache (manual run, 2026-11-13):** rendering stops for minutes at a time
+    while queue worker 0 is inside the NVIDIA compiler (`vkCreate*Pipelines`). The other workers
+    wait in `PollSleep`; game audio continues.
+    - The cutscene's shaders are very large: 26 cache entries over 2 MiB, eight of them 7 to
+      9 MiB. One is 2.29 M SPIR-V words (476k instructions, 16 % `OpSelect`) from about 98 KiB of
+      guest code.
+    - 0x30032da200 falls back to two lanes per invocation (a barrier under per-lane control flow).
+    - Compiled pipelines are cached (our cache plus NVIDIA's), so each run gets further.
+    - Open: translation size (section E). The levers measured on LEGO are cheaper NaN checks (-5 %
+      words), `APS5_FAST_F32` (-22 %) and the spanned wave (-39 %).
+  - **Translation size, measured (2026-11-13, uncommitted in the tree):** 158 compute requests
+    dumped to the title (`APS5_DUMP_SHADERS=1`, run `007\dump1`), replayed offline. All 29 large
+    programs fell back from spanned to paired: the spanned uniformity check counts every guest-memory
+    load as per-invocation once the module stores guest memory, and the deciding loads are guest
+    scalar loads (s_buffer_load, s_load, SRT reads), which are one value per wave in the guest's
+    scalar cache unless the program invalidates it.
+    - Change (`probe-patches\spanned-scalar-loads.patch`): the emitter records the id ranges of
+      scalar-load emission; the check exempts loads in them unless the program invalidates caches.
+      0 fallbacks; 21.3 M -> 13.9 M words. NVIDIA compile of the largest (0x3500c6aa00), timed
+      offline: 92.9 s -> 42.7 s; 0x3000b8fc00 13.5 -> 6.3 s.
+    - Change (`probe-patches\cheaper-nan-check.patch`): `FPIsNan32` instead of And + UGreaterThan in
+      the f32 NaN propagation, exact, -3.4 % words.
+    - Cold start (empty NVIDIA and our caches, 300 s; runs `007\cold-head`, `007\cold-span`): head
+      still black at 250 s (236 presents); change past the stall at about 150 s, boot notice shown.
+    - Warm, steady (runs `007\warm-span1/2`, `007\warm-head2`): 121-129 ms with the change vs
+      126-141 ms on head; no runtime cost seen. Tests: only `agc_driver_graphics` and
+      `agc_driver_frame_replay_rewind_copy` fail, both on head too. LEGO 45.9-47.1 vs 47.1-47.6 ms,
+      FF 31.5-31.7 vs 32.3 ms (runs `<title>\span-on1/2`, `span-head1/2`), pictures correct.
+    - Next: the largest program still takes 43 s; `APS5_FAST_F32` (-18 % here) is not exact.
 - **1:** first audit pass fails on all three titles. Skipped functions: LEGO 158, FF 39, AoM 147.
   The bundled PRX modules are not framed, and code without `.eh_frame` bounds is not checked. The
   two "shorter than a jump" shapes and the push/pop shape are about 70 % of the skipped functions.
