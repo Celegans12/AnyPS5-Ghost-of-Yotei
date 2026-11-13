@@ -277,7 +277,7 @@ void skipsLeavesWithOperandsThatCannotMove() {
     std::vector<std::uint8_t> beforeTarget = StoreBelowRsp;
     append(beforeTarget, LoadAtRsp);
     append(beforeTarget, {0xff, 0xc0, 0x3b, 0x44, 0x24, 0xf0, 0x72, 0xf8});
-    std::vector<std::uint8_t> afterShortPrologue{0x72, 0x00};
+    std::vector<std::uint8_t> afterShortPrologue{0xeb, 0x00};
     append(afterShortPrologue, StoreBelowRsp);
     const auto input = image({framelessLeaf(FramelessPrologue, evex, FramelessExit), framelessLeaf(FramelessPrologue, beforeExit, FramelessExit), framelessLeaf(FramelessPrologue, beforeTarget, FramelessExit), framelessLeaf({0x41, 0x56, 0x41, 0x57}, afterShortPrologue, {0x41, 0x5f, 0x41, 0x5e, 0xc3})});
     Codegen::RedZoneFrameReport report;
