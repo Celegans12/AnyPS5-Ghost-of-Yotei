@@ -20,8 +20,14 @@ constexpr std::int64_t kRedZoneBytes = 0x80;
 constexpr std::int64_t kStackAlignment = 16;
 constexpr std::uint8_t kJumpBack[] = {0xe9, 0x00, 0x00, 0x00, 0x00};
 
+// A return thunk's gap holds the leaf's whole frame: at most this many bytes, so that the stack
+// touches it adds stay within a guard page of the caller's.
+constexpr std::int64_t kThunkGapLimit = 0x800;
+
 std::vector<std::uint8_t> lowerRsp(const std::int64_t shift) {
-    return {0x48, 0x8d, 0x64, 0x24, static_cast<std::uint8_t>(-shift)};
+    if (shift <= 0x80) return {0x48, 0x8d, 0x64, 0x24, static_cast<std::uint8_t>(-shift)};
+    const auto value = static_cast<std::uint32_t>(-shift);
+    return {0x48, 0x8d, 0xa4, 0x24, static_cast<std::uint8_t>(value), static_cast<std::uint8_t>(value >> 8), static_cast<std::uint8_t>(value >> 16), static_cast<std::uint8_t>(value >> 24)};
 }
 
 std::vector<std::uint8_t> raiseRsp(const std::int64_t shift) {
@@ -420,6 +426,32 @@ void frameSegment(
         std::int64_t allocation = 0;
         if (!rbpPrologue && p < body.size())
             if (const auto adjustment = rspAdjustment(at(p), body[p]); adjustment && *adjustment < 0) { allocation = -*adjustment; ++p; }
+        // A frame-pointer leaf that allocates with `sub rsp, N` after its pushes keeps [rbp-x] inside
+        // that allocation, provided rsp only goes back up in epilogues: instructions that move rsp
+        // up to a ret. Such slots are not below rsp.
+        std::int64_t rbpAllocation = 0;
+        if (rbpPrologue && p < body.size())
+            if (const auto adjustment = rspAdjustment(at(p), body[p]); adjustment && *adjustment < 0) {
+                rbpAllocation = -*adjustment;
+                const auto raisesRsp = [&](const std::size_t k) {
+                    return at(k)[body[k].Info.OpcodeOffset] == 0xc9 || poppedRegister(at(k), body[k]).has_value() || memoryUse(at(k), body[k]).RegisterRsp;
+                };
+                // An epilogue ends in a ret or in a tail call: a jump out of the function.
+                const auto leaves = [&](const std::size_t k) {
+                    const auto& insn = body[k];
+                    if (insn.Info.FlowKind == ControlFlowKind::Return || insn.Info.FlowKind == ControlFlowKind::IndirectJump) return true;
+                    if (insn.Info.FlowKind != ControlFlowKind::UnconditionalJump || !insn.Info.HasBranchTarget || insn.Info.HasRipRelativeDisp) return false;
+                    const auto target = static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp;
+                    return target < static_cast<std::int64_t>(start) || target >= static_cast<std::int64_t>(limit);
+                };
+                for (std::size_t k = p + 1; k < body.size(); ++k) {
+                    if (!raisesRsp(k)) continue;
+                    auto q = k;
+                    while (q < body.size() && raisesRsp(q)) ++q;
+                    if (q >= body.size() || !leaves(q)) { rbpAllocation = 0; break; }
+                    k = q;
+                }
+            }
         std::vector<std::uint8_t> expected(pushed.begin(), pushed.end());
         if (rbpPrologue) expected.insert(expected.begin(), kRegRbp);
         const auto popsBefore = [&](const std::size_t k) -> std::optional<std::size_t> {
@@ -435,6 +467,20 @@ void frameSegment(
             for (std::size_t k = p; k < body.size(); ++k)
                 if (body[k].Info.FlowKind == ControlFlowKind::Return)
                     if (const auto q = popsBefore(k); q && *q > p && rspAdjustment(at(*q - 1), body[*q - 1]) == allocation) frees.insert(*q - 1);
+        // A leaf that moves rsp anywhere but its prologue allocation and the frees before its exits
+        // returns through a thunk, its pushes and allocations taken as part of the body.
+        bool rspArithmetic = false;
+        if (!rbpPrologue)
+            for (std::size_t k = 0; k < body.size(); ++k)
+                if (rspAdjustment(at(k), body[k]) && !(allocation > 0 && k + 1 == p) && !frees.contains(k)) {
+                    rspArithmetic = true;
+                    p = 0;
+                    pushed.clear();
+                    expected.clear();
+                    allocation = 0;
+                    frees.clear();
+                    break;
+                }
 
         bool leaf = true;
         bool redZone = false;
@@ -503,7 +549,7 @@ void frameSegment(
             if (flow == ControlFlowKind::Call || flow == ControlFlowKind::IndirectCall) { leaf = false; break; }
             if (frees.contains(k)) continue;
             const auto use = memoryUse(code, insn);
-            if (use.RbpBased && rbpPrologue && use.RbpDisp < -static_cast<std::int64_t>(8 * pushed.size())) redZone = true;
+            if (use.RbpBased && rbpPrologue && use.RbpDisp < -static_cast<std::int64_t>(8 * pushed.size()) - rbpAllocation) redZone = true;
             if (use.RspBased && use.RspDisp < 0) redZone = true;
             if (reason != nullptr) continue;
             if (code[insn.Info.OpcodeOffset] == 0xc9 || code[insn.Info.OpcodeOffset] == 0xc8) { reason = "leave or enter"; continue; }
@@ -512,6 +558,10 @@ void frameSegment(
             if (rbpPrologue) {
                 if (use.UsesRsp) { reason = "other use of rsp"; continue; }
             } else {
+                if (use.RegisterRsp && frameless && rspAdjustment(code, insn)) {
+                    if (exitReason == nullptr) exitReason = "rsp moved in a leaf without pushes";
+                    continue;
+                }
                 if (use.RegisterRsp) { reason = "other use of rsp"; continue; }
                 if (use.RspBased) {
                     if (code[insn.Info.OpcodeOffset] == 0x62) { reason = "rsp operand that cannot move with rsp"; continue; }
@@ -562,38 +612,59 @@ void frameSegment(
         ++report.RedZoneFunctions;
         // The thunk's slot sits where the leaf's own pushes go: they must balance on every path, so
         // that each ret finds the thunk's address (a fragment popping its caller's pushes would not).
-        std::map<std::size_t, std::int64_t> depthAt{{0, 0}};
+        // The stack below the entry at each instruction, from the entry down: pushed slots and
+        // allocated bytes.
+        struct Slot {
+            bool Pushed;
+            std::int64_t Bytes;
+            bool operator==(const Slot&) const = default;
+        };
+        std::map<std::size_t, std::vector<Slot>> layoutAt{{0, {}}};
+        const auto bytesOf = [](const std::vector<Slot>& layout) {
+            std::int64_t total = 0;
+            for (const auto& slot : layout) total += slot.Bytes;
+            return total;
+        };
         const auto balanced = [&] {
             std::map<std::size_t, std::size_t> index;
             for (std::size_t k = 0; k < body.size(); ++k) index[body[k].Offset] = k;
             std::vector<std::size_t> pending{0};
-            const auto reach = [&](const std::size_t k, const std::int64_t depth) {
-                const auto [it, inserted] = depthAt.emplace(k, depth);
+            const auto reach = [&](const std::size_t k, const std::vector<Slot>& layout) {
+                const auto [it, inserted] = layoutAt.emplace(k, layout);
                 if (inserted) pending.push_back(k);
-                return it->second == depth;
+                return it->second == layout;
             };
             while (!pending.empty()) {
                 const auto k = pending.back();
                 pending.pop_back();
                 const auto& insn = body[k];
-                auto depth = depthAt.at(k);
+                auto layout = layoutAt.at(k);
                 if (pushesOrPops(at(k), insn)) {
                     const auto op = insn.Info.Opcode;
                     const bool pop = insn.Info.IsTwoByteOpcode ? (op == 0xa1 || op == 0xa9) : ((op >= 0x58 && op <= 0x5f) || op == 0x9d || op == 0x8f);
-                    depth += pop ? -1 : 1;
-                    if (depth < 0) return false;
+                    if (!pop) layout.push_back({true, 8});
+                    else if (layout.empty() || !layout.back().Pushed) return false;
+                    else layout.pop_back();
+                } else if (const auto adjustment = rspAdjustment(at(k), insn)) {
+                    if (*adjustment < 0) layout.push_back({false, -*adjustment});
+                    // An add frees whole slots, a pushed one included (`push rax` as a slot).
+                    for (auto left = *adjustment; left > 0;) {
+                        if (layout.empty() || layout.back().Bytes > left) return false;
+                        left -= layout.back().Bytes;
+                        layout.pop_back();
+                    }
                 }
                 const auto flow = insn.Info.FlowKind;
                 if (flow == ControlFlowKind::Return) {
-                    if (depth != 0) return false;
+                    if (!layout.empty()) return false;
                     continue;
                 }
                 if ((flow == ControlFlowKind::ConditionalBranch || flow == ControlFlowKind::UnconditionalJump) && insn.Info.HasBranchTarget) {
                     const auto target = index.find(static_cast<std::size_t>(static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp));
-                    if (target == index.end() || !reach(target->second, depth)) return false;
+                    if (target == index.end() || !reach(target->second, layout)) return false;
                 }
                 if (flow == ControlFlowKind::Sequential || flow == ControlFlowKind::ConditionalBranch) {
-                    if (k + 1 >= body.size() || !reach(k + 1, depth)) return false;
+                    if (k + 1 >= body.size() || !reach(k + 1, layout)) return false;
                 } else if (flow != ControlFlowKind::UnconditionalJump) {
                     return false;
                 }
@@ -601,24 +672,36 @@ void frameSegment(
             return true;
         };
         const bool thunk = frameless && reason == nullptr && exitReason != nullptr && balanced();
-        if (frameless && reason == nullptr && exitReason != nullptr && !thunk) reason = exitReason;
+        if (frameless && reason == nullptr && exitReason != nullptr && !thunk) reason = rspArithmetic ? "rsp arithmetic that does not balance" : exitReason;
         if (thunk) {
             exits.clear();
-            // The leaf's own pushes now go below the thunk's slot, so the gap must also cover the
-            // pushes made before each red-zone operand, and no operand may read a pushed slot.
+            // The leaf's pushes and allocations now go below the thunk's slot while its rsp operands
+            // keep their addresses, so the gap must hold every frame address an operand reaches,
+            // and no operand may read a pushed slot: the push went below the gap.
             std::int64_t need = 0;
             std::int64_t deepest = 0;
-            for (const auto& [k, pushes] : depthAt) deepest = std::max(deepest, pushes);
+            for (const auto& [k, layout] : layoutAt) deepest = std::max(deepest, bytesOf(layout));
             for (const auto k : rspOperands) {
                 const auto use = memoryUse(at(k), body[k]);
-                const auto found = depthAt.find(k);
-                const auto below = 8 * (found != depthAt.end() ? found->second : deepest);
-                if (use.RspDisp >= 0 && use.RspDisp < below) { reason = "rsp operand on a pushed register"; break; }
-                if (use.RspDisp < 0) need = std::max(need, below - use.RspDisp);
+                if (pushesOrPops(at(k), body[k])) { reason = "push or pop with an rsp operand in a thunk"; break; }
+                const auto found = layoutAt.find(k);
+                const auto below = found != layoutAt.end() ? bytesOf(found->second) : deepest;
+                if (use.RspDisp >= below) continue;
+                if (use.RspDisp >= 0) {
+                    if (found == layoutAt.end()) { reason = "rsp operand on a pushed register"; break; }
+                    std::int64_t offset = 0;
+                    bool pushedSlot = false;
+                    for (auto slot = found->second.rbegin(); slot != found->second.rend(); ++slot) {
+                        if (use.RspDisp < offset + slot->Bytes) { pushedSlot = slot->Pushed; break; }
+                        offset += slot->Bytes;
+                    }
+                    if (pushedSlot) { reason = "rsp operand on a pushed register"; break; }
+                }
+                need = std::max(need, below - use.RspDisp);
             }
-            if (wholeRedZone) need = std::max(need, kRedZoneBytes + 8 * deepest);
+            if (wholeRedZone) need = std::max(need, kRedZoneBytes + deepest);
             shift = std::max(shift, (need + kStackAlignment - 1) / kStackAlignment * kStackAlignment);
-            if (reason == nullptr && shift > kRedZoneBytes) reason = "red zone below the leaf's pushes too deep for a thunk";
+            if (reason == nullptr && shift > kThunkGapLimit) reason = "frame too deep for a thunk";
             bodyShift = shift + 8;
             if (reason == nullptr && !sawRet) reason = "no ret exit";
         }
@@ -635,7 +718,7 @@ void frameSegment(
         std::size_t entryOperands = 0;
         while (entryEnd - start < kJumpBytes && entryLast < body.size()) {
             const auto& covered = body[entryLast];
-            if (covered.Offset != entryEnd || (covered.Info.FlowKind != ControlFlowKind::Sequential && covered.Info.FlowKind != ControlFlowKind::ConditionalBranch) || frees.contains(entryLast) || pushesOrPops(at(entryLast), covered)) break;
+            if (covered.Offset != entryEnd || (covered.Info.FlowKind != ControlFlowKind::Sequential && covered.Info.FlowKind != ControlFlowKind::ConditionalBranch) || frees.contains(entryLast) || (!thunk && pushesOrPops(at(entryLast), covered))) break;
             if (std::any_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return covered.Offset < exit.End && exit.Begin < covered.Offset + covered.Length; })) break;
             const auto copied = copy(entryLast);
             if (!copied) break;
