@@ -49,10 +49,17 @@ void WindowsTrampolineBuilder::Build(const std::vector<Codegen::TrampolineSite>&
     std::map<std::uint32_t, std::uint64_t> ranges;
     std::vector<SitePatch> patches;
     patches.reserve(sites.size());
-    for (const auto& site : sites) {
+    std::vector<std::uint32_t> stubRvas(sites.size(), 0);
+    for (std::size_t index = 0; index < sites.size(); ++index) {
+        const auto& site = sites[index];
         const auto siteRva = image.GetRva(site.Address, site.Length);
-        if (site.Length < kJmpRel32.Size || site.OriginalBytes.size() != site.Length || site.Body.size() < kJmpRel32.Size || site.ReturnBranchOffset > site.Body.size() - kJmpRel32.Size || site.Body[site.ReturnBranchOffset] != kJmpRel32.Bytes[0])
+        const bool join = site.JoinBack != 0;
+        if (join) {
+            if (site.Length < kJmpRel32.Size || site.OriginalBytes.size() != site.Length || !site.Body.empty() || site.JoinBack > index || sites[index - site.JoinBack].JoinBack != 0 || site.JoinOffset >= sites[index - site.JoinBack].Body.size())
+                throw Domain::RelinkerException("Invalid trampoline join site", siteRva);
+        } else if (site.Length < kJmpRel32.Size || site.OriginalBytes.size() != site.Length || site.Body.size() < kJmpRel32.Size || site.ReturnBranchOffset > site.Body.size() - kJmpRel32.Size || site.Body[site.ReturnBranchOffset] != kJmpRel32.Bytes[0]) {
             throw Domain::RelinkerException("Invalid AMD-only trampoline site", siteRva);
+        }
         const auto siteEndRva = static_cast<std::uint64_t>(siteRva) + site.Length;
         const auto next = ranges.lower_bound(siteRva);
         if ((next != ranges.end() && next->first < siteEndRva) || (next != ranges.begin() && std::prev(next)->second > siteRva))
@@ -62,8 +69,15 @@ void WindowsTrampolineBuilder::Build(const std::vector<Codegen::TrampolineSite>&
         const auto offset = static_cast<std::ptrdiff_t>(siteRva - section.Rva);
         if (!std::equal(site.OriginalBytes.begin(), site.OriginalBytes.end(), section.Data.begin() + offset))
             throw Domain::RelinkerException("AMD-only site bytes changed before patching", siteRva);
+        if (join) {
+            WindowsStubEmitter jump(siteRva);
+            jump.Rip({0xe9}, CheckedRva(static_cast<std::uint64_t>(stubRvas[index - site.JoinBack]) + site.JoinOffset));
+            patches.push_back({&section, offset, site.Length, jump.TakeBytes()});
+            continue;
+        }
         bytes.resize(Io::AlignUp(bytes.size(), kStubAlignment), kTrapFill);
         const auto stubRva = CheckedRva(sectionRva + bytes.size());
+        stubRvas[index] = stubRva;
         const auto bodyOffset = bytes.size();
         bytes.insert(bytes.end(), site.Body.begin(), site.Body.end());
         Codegen::ApplyStubRelocations(std::span<std::uint8_t>(bytes.data() + bodyOffset, site.ReturnBranchOffset), site.Relocations, siteRva, stubRva, site.Offset);

@@ -30,6 +30,12 @@ struct RedZoneFrameReport {
     std::size_t StubbedOperands = 0;
     // Leaves without pushes whose exits could not be patched, returning through a thunk instead.
     std::size_t ReturnThunks = 0;
+    // Leaves whose frames could not be patched in place, relocated whole into a stub; their jump
+    // tables' cases enter the stub through a jump each.
+    std::size_t Relocated = 0;
+    std::size_t RelocatedCases = 0;
+    // Relocated leaves with an indirect jump of unknown target, which leaves the stub.
+    std::size_t RelocatedOpenJumps = 0;
     std::map<std::string, std::size_t> Skipped;
 };
 
@@ -46,7 +52,9 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     RedZoneFrameReport& report,
     std::vector<RedZoneDisplacement>& displacements,
     // Every loaded segment, to read the jump tables of switch statements from.
-    const std::vector<Domain::ProgramHeader>& loadSegments = {}
+    const std::vector<Domain::ProgramHeader>& loadSegments = {},
+    // The addends of R_X86_64_RELATIVE relocations by address: tables of absolute addresses.
+    const std::map<std::uint64_t, std::uint64_t>& relativeAddends = {}
 );
 
 }
