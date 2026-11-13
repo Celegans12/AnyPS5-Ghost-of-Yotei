@@ -275,10 +275,16 @@ Per phase:
     tail call leaves through a stub raising rsp over the gap and slot (callee sees the caller's
     return address and stack arguments).
   - Crash checks (40 s, all four titles) clean after each step.
-  - **Remaining skipped: 007 9, AoM 7, LEGO 2, FF 1** (from 132 / 147 / 158 / 39). 7 have `[rsp]`
-    operands without a displacement next to branch targets (no room for a stub), 4 read a pushed
-    slot through rsp in a thunk, 4 unresolved indirect jumps, 4 single cases. These need the leaf
-    relocated whole into stub space (all rsp operands rewritten, branches and tables relocated).
+  - **Whole-leaf relocation (98cf5da8d9): skipped 0 on all four titles** (from 132 / 147 / 158 /
+    39 at the start of phase 1). A leaf that neither in-place framing nor a thunk can take is
+    copied into a stub that runs it with rsp 0x80 lower: rsp operands +0x80, pushes and pops
+    rewritten as mov + lea so every stack slot keeps its address, every exit (ret, tail call,
+    branch out) raises rsp first. The start jumps to the stub; jump-table cases get a join site
+    each (none needed in the four titles). Absolute tables are read from RELATIVE addends; a table
+    of other functions' starts (007's threaded interpreter handlers) is a tail call. A function
+    entered from outside its start is relocated instead of patched (none in the four titles).
+    Relocated: 007 8, AoM 7, LEGO 2, FF 1; 007's last leaf framed in place once its dispatch
+    window skips VEX vector instructions. Crash checks (40 s) clean; folders restored.
 - **2 and 3:** not started.
 - **4:** section B is built in its walk-based form (bound ranges and index windows). It took the
   AoM title from 216 to about 150 ms. The section D validity change is not started.
@@ -300,10 +306,9 @@ Per phase:
 
 Next, in phase order:
 
-1. **Phase 1.** Relocate the last skipped leaves whole (19 across the four titles), or decide
-   they are acceptable. Check each change with one framed run per title for crashes (40 s, no
-   benchmarks needed). Then frame the bundled PRX modules, account for
-   code without `.eh_frame` bounds, and build the fault-storm test.
+1. **Phase 1.** Every red-zone leaf of the four eboots is framed. Next: frame the bundled PRX
+   modules, account for code without `.eh_frame` bounds, and build the fault-storm test. Check
+   each change with one framed run per title for crashes (40 s, no benchmarks needed).
 2. **Phase 2** once a title passes the phase 1 gate.
 3. **Phase 3** (waits) after that; it does not depend on phase 1.
 
