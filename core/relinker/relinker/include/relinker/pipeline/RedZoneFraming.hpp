@@ -19,8 +19,10 @@ struct RedZoneFramingResult {
     std::vector<Codegen::RedZoneDisplacement> Displacements;
     // Leaves that keep values below RSP and were not framed; zero is the phase 1 gate.
     std::size_t Skipped = 0;
-    // False when the image has no .eh_frame function bounds, so nothing was framed.
+    // False when the image has no .eh_frame function bounds; its functions all come from splitting.
     bool HasBounds = true;
+    // Functions split from code outside every .eh_frame bound.
+    std::size_t SplitFunctions = 0;
 };
 
 // Frames the red-zone leaves of one image (the executable or a guest module). The image's

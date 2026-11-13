@@ -523,7 +523,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             auto framing = FrameRedZoneImage(image.Bytes, image.Headers, image.Dynamic.RelaData, image.Trampolines, prefix, [&](std::string_view text) { progress.Message(text); });
             if (!framing.HasBounds) {
                 ++redZoneUnbounded;
-                progress.Message(prefix + ": no .eh_frame function bounds, not framed\n");
+                progress.Message(prefix + ": no .eh_frame function bounds; all its functions come from splitting\n");
             }
             redZoneSkipped += framing.Skipped;
             ++redZoneModules;

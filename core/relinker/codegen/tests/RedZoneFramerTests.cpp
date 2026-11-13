@@ -1035,8 +1035,30 @@ void framesModRmAndVectorNonStackOperands() {
 
 }
 
+// Code outside every FDE splits at int3 padding and at call targets; nop padding makes no function,
+// and a nop inside a function does not end it.
+void splitsCodeOutsideFunctionBounds() {
+    std::vector<std::uint8_t> bytes = padTo({0xc3}, 0x10);
+    append(bytes, callTo(0x10, 0x30));
+    append(bytes, callTo(0x15, 0x3e));
+    bytes.push_back(0xc3);
+    bytes = padTo(bytes, 0x20);
+    append(bytes, {0x0f, 0x1f, 0x44, 0x00, 0x00, 0x66, 0x90});
+    bytes = padTo(bytes, 0x30);
+    append(bytes, {0x48, 0x89, 0x7c, 0x24, 0xf8, 0x0f, 0x1f, 0x00, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3});
+    append(bytes, {0x31, 0xc0, 0xc3});
+    bytes = padTo(bytes, 0x50);
+    const std::vector<Domain::ProgramHeader> segments{{1, 5, 0, Base, Base, bytes.size(), bytes.size(), 16}};
+    const auto pieces = Codegen::SplitUncoveredCode(bytes, segments, {{Base, Base + 1}});
+    require(pieces.size() == 3, "code outside function bounds split into " + std::to_string(pieces.size()) + " functions, not 3");
+    require(pieces[0].Begin == Base + 0x10 && pieces[0].End == Base + 0x1b, "the caller outside function bounds was not split at its int3 padding");
+    require(pieces[1].Begin == Base + 0x30 && pieces[1].End == Base + 0x3e, "a function with a nop inside was split at the nop, or nop padding made a function");
+    require(pieces[2].Begin == Base + 0x3e && pieces[2].End == Base + 0x41, "a call target right after a ret was not split off");
+}
+
 int main() {
     try {
+        splitsCodeOutsideFunctionBounds();
         framesRedZoneLeaf();
         leavesOtherFunctions();
         skipsSitesTakenByOtherStubs();
