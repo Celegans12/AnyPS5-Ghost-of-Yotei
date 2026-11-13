@@ -301,12 +301,44 @@ std::optional<std::vector<std::uint8_t>> withDisplacement(const std::uint8_t* co
     return bytes;
 }
 
+// A RIP-relative instruction copied into a stub: Offset and End are within the copied bytes,
+// Target is the segment offset it addresses.
+struct CopiedRip {
+    std::size_t Offset;
+    std::size_t End;
+    std::int64_t Target;
+    bool AddressSize32;
+};
+
+struct Copied {
+    std::vector<std::uint8_t> Bytes;
+    std::vector<CopiedRip> Rips;
+
+    void Append(const Copied& other) {
+        for (auto rip : other.Rips) {
+            rip.Offset += Bytes.size();
+            rip.End += Bytes.size();
+            Rips.push_back(rip);
+        }
+        Bytes.insert(Bytes.end(), other.Bytes.begin(), other.Bytes.end());
+    }
+
+    void Prepend(const Copied& other) {
+        for (auto& rip : Rips) {
+            rip.Offset += other.Bytes.size();
+            rip.End += other.Bytes.size();
+        }
+        Rips.insert(Rips.begin(), other.Rips.begin(), other.Rips.end());
+        Bytes.insert(Bytes.begin(), other.Bytes.begin(), other.Bytes.end());
+    }
+};
+
 struct OperandStub {
     std::size_t First;
     std::size_t Last;
     std::size_t Begin;
     std::size_t End;
-    std::vector<std::uint8_t> Body;
+    Copied Body;
     std::size_t Operands = 0;
 };
 
@@ -316,7 +348,7 @@ struct ExitSite {
     std::size_t Begin;
     std::size_t TailBegin;
     std::size_t End;
-    std::vector<std::uint8_t> Lead;
+    Copied Lead;
     std::size_t Operands = 0;
 };
 
@@ -412,6 +444,28 @@ void frameSegment(
             if (use.Indexed || (use.Address && use.RspDisp < 0)) wholeRedZone = true;
         }
         const auto shift = wholeRedZone ? kRedZoneBytes : std::min(kRedZoneBytes, (depth + kStackAlignment - 1) / kStackAlignment * kStackAlignment);
+        // An instruction moved into a stub: rsp operands move with the shift, RIP-relative ones are
+        // relocated to the stub.
+        const auto copy = [&](const std::size_t k) -> std::optional<Copied> {
+            const auto& insn = body[k];
+            const auto use = memoryUse(at(k), insn);
+            Copied out;
+            if (use.RspBased) {
+                auto bytes = withDisplacement(at(k), insn, use, use.RspDisp + shift);
+                if (!bytes) return std::nullopt;
+                out.Bytes = std::move(*bytes);
+                return out;
+            }
+            out.Bytes.assign(at(k), at(k) + insn.Length);
+            if (insn.Info.HasRipRelativeDisp) {
+                const auto offset = insn.Info.RipRelativeDispOffset;
+                if (offset + 4 > insn.Length) return std::nullopt;
+                std::int32_t disp = 0;
+                std::memcpy(&disp, at(k) + offset, 4);
+                out.Rips.push_back({offset, insn.Length, static_cast<std::int64_t>(insn.Offset + insn.Length) + disp, insn.Info.AddressSize32});
+            }
+            return out;
+        };
         for (std::size_t k = p; k < body.size(); ++k) {
             const auto& insn = body[k];
             const auto* code = at(k);
@@ -454,12 +508,11 @@ void frameSegment(
                 while (exit.End - exit.Begin < kJumpBytes && exit.First > p) {
                     const auto j = exit.First - 1;
                     const auto& prior = body[j];
-                    if (prior.Offset + prior.Length != exit.Begin || prior.Info.FlowKind != ControlFlowKind::Sequential || prior.Info.HasRipRelativeDisp || frees.contains(j) || pushesOrPops(at(j), prior)) break;
-                    const auto priorUse = memoryUse(at(j), prior);
-                    const auto bytes = priorUse.RspBased ? withDisplacement(at(j), prior, priorUse, priorUse.RspDisp + shift) : std::vector<std::uint8_t>(at(j), at(j) + prior.Length);
-                    if (!bytes) break;
-                    exit.Lead.insert(exit.Lead.begin(), bytes->begin(), bytes->end());
-                    if (priorUse.RspBased) ++exit.Operands;
+                    if (prior.Offset + prior.Length != exit.Begin || prior.Info.FlowKind != ControlFlowKind::Sequential || frees.contains(j) || pushesOrPops(at(j), prior)) break;
+                    const auto copied = copy(j);
+                    if (!copied) break;
+                    exit.Lead.Prepend(*copied);
+                    if (memoryUse(at(j), prior).RspBased) ++exit.Operands;
                     exit.Begin = prior.Offset;
                     exit.First = j;
                 }
@@ -474,17 +527,16 @@ void frameSegment(
         if (reason == nullptr && std::any_of(stackMoves.begin(), stackMoves.end(), [&](const std::size_t k) { return std::none_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return exit.Begin <= body[k].Offset && body[k].Offset < exit.End; }); })) reason = "push or pop inside the body";
         auto entryEnd = prologueEnd;
         auto entryLast = p;
-        std::vector<std::uint8_t> entryTail;
+        Copied entryTail;
         std::size_t entryOperands = 0;
         while (entryEnd - start < kJumpBytes && entryLast < body.size()) {
             const auto& covered = body[entryLast];
-            if (covered.Offset != entryEnd || covered.Info.FlowKind != ControlFlowKind::Sequential || covered.Info.HasRipRelativeDisp || frees.contains(entryLast) || pushesOrPops(at(entryLast), covered)) break;
+            if (covered.Offset != entryEnd || covered.Info.FlowKind != ControlFlowKind::Sequential || frees.contains(entryLast) || pushesOrPops(at(entryLast), covered)) break;
             if (std::any_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return covered.Offset < exit.End && exit.Begin < covered.Offset + covered.Length; })) break;
-            const auto use = memoryUse(at(entryLast), covered);
-            const auto bytes = use.RspBased ? withDisplacement(at(entryLast), covered, use, use.RspDisp + shift) : std::vector<std::uint8_t>(at(entryLast), at(entryLast) + covered.Length);
-            if (!bytes) break;
-            entryTail.insert(entryTail.end(), bytes->begin(), bytes->end());
-            if (use.RspBased) ++entryOperands;
+            const auto copied = copy(entryLast);
+            if (!copied) break;
+            entryTail.Append(*copied);
+            if (memoryUse(at(entryLast), covered).RspBased) ++entryOperands;
             entryEnd += covered.Length;
             ++entryLast;
         }
@@ -513,24 +565,22 @@ void frameSegment(
             OperandStub stub{k, k, body[k].Offset, body[k].Offset, {}};
             while (stub.Last < body.size() && stub.End - stub.Begin < kJumpBytes) {
                 const auto& covered = body[stub.Last];
-                if (covered.Offset != stub.End || covered.Info.FlowKind != ControlFlowKind::Sequential || covered.Info.HasRipRelativeDisp || frees.contains(stub.Last)) break;
-                const auto use = memoryUse(at(stub.Last), covered);
-                const auto bytes = use.RspBased ? withDisplacement(at(stub.Last), covered, use, use.RspDisp + shift) : std::vector<std::uint8_t>(at(stub.Last), at(stub.Last) + covered.Length);
-                if (!bytes) break;
-                stub.Body.insert(stub.Body.end(), bytes->begin(), bytes->end());
-                if (use.RspBased) ++stub.Operands;
+                if (covered.Offset != stub.End || covered.Info.FlowKind != ControlFlowKind::Sequential || frees.contains(stub.Last)) break;
+                const auto copied = copy(stub.Last);
+                if (!copied) break;
+                stub.Body.Append(*copied);
+                if (memoryUse(at(stub.Last), covered).RspBased) ++stub.Operands;
                 stub.End += covered.Length;
                 ++stub.Last;
             }
             while (stub.End - stub.Begin < kJumpBytes && stub.First > p) {
                 const auto j = stub.First - 1;
                 const auto& prior = body[j];
-                if (prior.Offset + prior.Length != stub.Begin || prior.Info.FlowKind != ControlFlowKind::Sequential || prior.Info.HasRipRelativeDisp || frees.contains(j)) break;
-                const auto use = memoryUse(at(j), prior);
-                const auto bytes = use.RspBased ? withDisplacement(at(j), prior, use, use.RspDisp + shift) : std::vector<std::uint8_t>(at(j), at(j) + prior.Length);
-                if (!bytes) break;
-                stub.Body.insert(stub.Body.begin(), bytes->begin(), bytes->end());
-                if (use.RspBased) ++stub.Operands;
+                if (prior.Offset + prior.Length != stub.Begin || prior.Info.FlowKind != ControlFlowKind::Sequential || frees.contains(j)) break;
+                const auto copied = copy(j);
+                if (!copied) break;
+                stub.Body.Prepend(*copied);
+                if (memoryUse(at(j), prior).RspBased) ++stub.Operands;
                 stub.Begin = prior.Offset;
                 stub.First = j;
             }
@@ -541,30 +591,28 @@ void frameSegment(
         for (const auto& stub : stubs)
             for (auto k = stub.First; k < stub.Last; ++k) moves.erase(k);
 
-        const auto addSite = [&](const std::size_t begin, const std::size_t end, std::vector<std::uint8_t> code) {
+        const auto addSite = [&](const std::size_t begin, const std::size_t end, Copied code) {
             TrampolineSite site;
             site.Offset = ph.Offset + begin;
             site.Address = ph.MappedAddress + begin;
             site.Length = end - begin;
             site.OriginalBytes.assign(seg.begin() + static_cast<std::ptrdiff_t>(begin), seg.begin() + static_cast<std::ptrdiff_t>(end));
-            site.ReturnBranchOffset = code.size();
-            code.insert(code.end(), std::begin(kJumpBack), std::end(kJumpBack));
-            site.Body = std::move(code);
+            site.ReturnBranchOffset = code.Bytes.size();
+            for (const auto& rip : code.Rips) site.Relocations.push_back({rip.Offset, rip.End, rip.Target - static_cast<std::int64_t>(begin), rip.AddressSize32});
+            code.Bytes.insert(code.Bytes.end(), std::begin(kJumpBack), std::end(kJumpBack));
+            site.Body = std::move(code.Bytes);
             taken.emplace_back(begin, end);
             sites.push_back(std::move(site));
         };
-        const auto original = [&](const std::size_t begin, const std::size_t end) { return std::vector<std::uint8_t>(seg.begin() + static_cast<std::ptrdiff_t>(begin), seg.begin() + static_cast<std::ptrdiff_t>(end)); };
+        const auto original = [&](const std::size_t begin, const std::size_t end) { return Copied{std::vector<std::uint8_t>(seg.begin() + static_cast<std::ptrdiff_t>(begin), seg.begin() + static_cast<std::ptrdiff_t>(end)), {}}; };
         auto entry = original(start, prologueEnd);
-        const auto lower = lowerRsp(shift);
-        entry.insert(entry.end(), lower.begin(), lower.end());
-        entry.insert(entry.end(), entryTail.begin(), entryTail.end());
+        entry.Append(Copied{lowerRsp(shift), {}});
+        entry.Append(entryTail);
         addSite(start, entryEnd, std::move(entry));
         for (auto& exit : exits) {
             auto code = std::move(exit.Lead);
-            const auto raise = raiseRsp(shift);
-            code.insert(code.end(), raise.begin(), raise.end());
-            const auto tail = original(exit.TailBegin, exit.End);
-            code.insert(code.end(), tail.begin(), tail.end());
+            code.Append(Copied{raiseRsp(shift), {}});
+            code.Append(original(exit.TailBegin, exit.End));
             addSite(exit.Begin, exit.End, std::move(code));
         }
         for (auto& stub : stubs) addSite(stub.Begin, stub.End, std::move(stub.Body));
