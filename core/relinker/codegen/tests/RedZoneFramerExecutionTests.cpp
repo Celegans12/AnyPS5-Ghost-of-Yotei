@@ -380,6 +380,19 @@ std::vector<Leaf> thunkLeaves() {
     };
 }
 
+// The first leaf ends in a tail call to the second: place() puts them at 0x40 and 0x70.
+std::vector<Leaf> tailCallLeaves() {
+    return {
+        {"leaf pushing rbx and spilling below rsp that pops and tail-calls the next leaf", {
+            0x53, 0x48, 0x89, 0x54, 0x24, 0xf0, 0x48, 0x8b, 0x5c, 0x24, 0xf0, 0x48, 0x8d, 0x3c, 0x3b,
+            0x5b, 0xe9, 0x1b, 0x00, 0x00, 0x00,
+        }, kA + kB + kC},
+        {"tail-called leaf without pushes adding its spill to rsi", {
+            0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0x48, 0x01, 0xf0, 0xc3,
+        }, kA + kB},
+    };
+}
+
 void writeRel32(std::uint8_t* at, const std::uint64_t target, const std::uint64_t next) {
     const auto displacement = static_cast<std::int64_t>(target) - static_cast<std::int64_t>(next);
     require(displacement >= std::numeric_limits<std::int32_t>::min() && displacement <= std::numeric_limits<std::int32_t>::max(), "a stub jump is out of rel32 range");
@@ -580,6 +593,8 @@ int main() {
         require(widened.WidenedPrologues == 9 && widened.WidenedExits == 10 && widened.WidenedOperands == 13, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 9, 10 and 13");
         const auto thunked = runLeaves(thunkLeaves());
         require(thunked.ReturnThunks == 5 && thunked.Exits == 0, "the leaves whose exits cannot be patched were framed with " + std::to_string(thunked.ReturnThunks) + " return thunks and " + std::to_string(thunked.Exits) + " exit stubs, not 5 and 0");
+        const auto tailCalled = runLeaves(tailCallLeaves());
+        require(tailCalled.Exits == 2, "the leaves ending in a tail call and a ret were framed with " + std::to_string(tailCalled.Exits) + " exit stubs, not 2");
         std::cout << "red-zone framer execution tests passed\n";
         return 0;
     } catch (const SteppingDegraded& error) {
