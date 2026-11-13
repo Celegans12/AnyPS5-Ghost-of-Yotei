@@ -261,9 +261,13 @@ Per phase:
     a frame pointer that move rsp outside their prologue allocation and frees return through a
     thunk whose walk tracks pushed slots and allocations; the gap holds the whole frame (up to
     2 KiB, disp32 lea). Crash checks (40 s, framed, folders restored): AoM, 007, LEGO, FF clean.
-  - Remaining skipped (AoM 37 / LEGO 33 / FF 18 / 007 87): indirect jump 11 / 15 / 11 / 28,
-    branch leaves the function 6 / 8 / 5 / 25, branch into the instructions before a short exit
-    10 / 4 / 0 / 16, exit shorter than a jump 3 / 1 / 1 / 12, and a few others.
+  - **Tail-call exits (bb0218c541):** a jmp to another function's start (or outside every
+    function), or an indirect jmp right after the prologue's pops, is an exit; its stub relocates
+    the jump. Indirect jumps without pushes or pops first (jump tables) stay refused. Crash checks
+    (40 s) clean on all four titles.
+  - Remaining skipped (AoM 34 / LEGO 24 / FF 14 / 007 70): indirect jump (jump tables), exit
+    shorter than a jump, branch into the instructions before a short exit, exit does not pop,
+    and a few others.
 - **2 and 3:** not started.
 - **4:** section B is built in its walk-based form (bound ranges and index windows). It took the
   AoM title from 216 to about 150 ms. The section D validity change is not started.
@@ -285,8 +289,8 @@ Per phase:
 
 Next, in phase order:
 
-1. **Phase 1.** Frame the remaining skipped leaf shapes in the relinker: indirect jumps, tail
-   calls, branches into short exits. Check each change with one framed run
+1. **Phase 1.** Frame the remaining skipped leaf shapes in the relinker: jump tables, short
+   exits and branches into them. Check each change with one framed run
    per title for crashes (no benchmarks needed). Then frame the bundled PRX modules, account for
    code without `.eh_frame` bounds, and build the fault-storm test.
 2. **Phase 2** once a title passes the phase 1 gate.
