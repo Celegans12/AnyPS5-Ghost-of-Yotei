@@ -36,6 +36,10 @@ std::string Refusal(const char* ab, const char* start = "", const char* settle =
 }
 
 void registry() {
+    Require(RuntimeSwitches::Find("APS5_NO_SNAPSHOT_SCRATCH") == RuntimeSwitch::NoSnapshotScratch, "snapshot scratch is not runtime switchable");
+    Require(RuntimeSwitches::Find("APS5_NO_DIRECT_SNAPSHOT_STAGING") == RuntimeSwitch::NoDirectSnapshotStaging, "direct snapshot staging is not runtime switchable");
+    Require(RuntimeSwitches::Find("APS5_NO_FUSED_SNAPSHOT_HASH") == RuntimeSwitch::NoFusedSnapshotHash, "fused snapshot hash is not runtime switchable");
+    Require(RuntimeSwitches::Find("APS5_NO_PARALLEL_BLOCK_HASH") == RuntimeSwitch::NoParallelBlockHash, "parallel block hash is not runtime switchable");
     Require(RuntimeSwitches::Set(RuntimeSwitch::NoDispatchOverlap), "a switch set in the environment did not start set");
     Require(!RuntimeSwitches::Set(RuntimeSwitch::NoBdaStaging), "a switch unset in the environment started set");
     Require(RuntimeSwitches::Find("APS5_NO_BDA_STAGING") == RuntimeSwitch::NoBdaStaging, "APS5_NO_BDA_STAGING is not a runtime switch");
