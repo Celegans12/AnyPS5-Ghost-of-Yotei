@@ -23,6 +23,7 @@ constexpr std::uint8_t kJumpBack[] = {0xe9, 0x00, 0x00, 0x00, 0x00};
 // A return thunk's gap holds the leaf's whole frame: at most this many bytes, so that the stack
 // touches it adds stay within a guard page of the caller's.
 constexpr std::int64_t kThunkGapLimit = 0x800;
+constexpr std::int64_t kJumpTableEntryLimit = 4096;
 
 std::vector<std::uint8_t> lowerRsp(const std::int64_t shift) {
     if (shift <= 0x80) return {0x48, 0x8d, 0x64, 0x24, static_cast<std::uint8_t>(-shift)};
@@ -316,6 +317,80 @@ std::optional<std::vector<std::uint8_t>> withDisplacement(const std::uint8_t* co
     return bytes;
 }
 
+// The reg and rm fields (with REX) of a one-byte-opcode instruction with this opcode, or nothing.
+// With registerForm the instruction must name two registers (mod 3), else a memory operand.
+std::optional<std::pair<std::uint8_t, std::uint8_t>> modRmFields(const std::uint8_t* code, const Insn& insn, const std::uint8_t opcode, const bool wide, const bool registerForm) {
+    const auto& info = insn.Info;
+    if (info.IsTwoByteOpcode || info.Opcode != opcode || code[info.OpcodeOffset] != opcode || !info.HasModRm) return std::nullopt;
+    if (wide && (info.RexPrefix & 0x08) == 0) return std::nullopt;
+    if (((info.ModRmByte >> 6) == 3) != registerForm) return std::nullopt;
+    const auto reg = static_cast<std::uint8_t>(((info.ModRmByte >> 3) & 7) | ((info.RexPrefix & 0x04) << 1));
+    const auto rm = static_cast<std::uint8_t>((info.ModRmByte & 7) | ((info.RexPrefix & 0x01) << 3));
+    return std::pair{reg, rm};
+}
+
+// A switch's dispatch: `lea base, [rip+table]` ... `movsxd target, [base+index*4]` ...
+// `add target, base` ... `jmp target`, the base possibly copied by movs. Returns the table's
+// segment offset, from the lea.
+struct JumpTableDispatch {
+    std::int64_t Table;
+};
+
+std::optional<JumpTableDispatch> jumpTableDispatch(const std::vector<Insn>& body, const std::size_t k, const std::uint8_t* segment) {
+    const auto at = [&](const std::size_t j) { return segment + body[j].Offset; };
+    const auto& jump = body[k];
+    if (jump.Info.FlowKind != ControlFlowKind::IndirectJump) return std::nullopt;
+    const auto jumpForm = modRmFields(at(k), jump, 0xff, false, true);
+    if (!jumpForm || (jump.Info.ModRmByte >> 3 & 7) != 4) return std::nullopt;
+    const auto target = jumpForm->second;
+    std::optional<std::uint8_t> addBase;
+    bool loaded = false;
+    std::set<std::uint8_t> holders;
+    for (std::size_t back = 1; back <= 16 && back <= k; ++back) {
+        const auto j = k - back;
+        const auto* code = at(j);
+        const auto& insn = body[j];
+        if (!addBase) {
+            if (const auto add = modRmFields(code, insn, 0x01, true, true); add && add->second == target) addBase = add->first;
+            else if (const auto add3 = modRmFields(code, insn, 0x03, true, true); add3 && add3->first == target) addBase = add3->second;
+            if (addBase) holders.insert(*addBase);
+            continue;
+        }
+        if (!loaded) {
+            const auto load = modRmFields(code, insn, 0x63, true, false);
+            if (!load || load->first != target || (insn.Info.ModRmByte & 7) != 4) continue;
+            if (insn.Info.ModRmOffset == 0 || insn.Info.ModRmOffset + 2 > insn.Length) return std::nullopt;
+            const auto sib = code[insn.Info.ModRmOffset + 1];
+            const auto mod = insn.Info.ModRmByte >> 6;
+            const auto base = static_cast<std::uint8_t>((sib & 7) | ((insn.Info.RexPrefix & 0x01) << 3));
+            const auto index = static_cast<std::uint8_t>(((sib >> 3) & 7) | ((insn.Info.RexPrefix & 0x02) << 2));
+            if ((sib >> 6) != 2 || index == 4 || ((sib & 7) == 5 && mod == 0)) return std::nullopt;
+            if (mod == 1 && code[insn.Info.ModRmOffset + 2] != 0) return std::nullopt;
+            if (mod == 2) return std::nullopt;
+            holders.insert(base);
+            loaded = true;
+            continue;
+        }
+        if (const auto copy = modRmFields(code, insn, 0x89, true, true); copy && holders.contains(copy->second)) {
+            holders.erase(copy->second);
+            holders.insert(copy->first);
+            continue;
+        }
+        if (const auto copy = modRmFields(code, insn, 0x8b, true, true); copy && holders.contains(copy->first)) {
+            holders.erase(copy->first);
+            holders.insert(copy->second);
+            continue;
+        }
+        if (const auto lea = modRmFields(code, insn, 0x8d, true, false); lea && insn.Info.HasRipRelativeDisp && holders.contains(lea->first)) {
+            if (holders.size() != 1) return std::nullopt;
+            std::int32_t disp = 0;
+            std::memcpy(&disp, code + insn.Info.RipRelativeDispOffset, 4);
+            return JumpTableDispatch{static_cast<std::int64_t>(insn.Offset + insn.Length) + disp};
+        }
+    }
+    return std::nullopt;
+}
+
 // A RIP-relative instruction copied into a stub: Offset and End are within the copied bytes,
 // Target is the segment offset it addresses.
 struct CopiedRip {
@@ -376,7 +451,8 @@ void frameSegment(
     const std::vector<TrampolineSite>& existing,
     std::vector<TrampolineSite>& sites,
     std::vector<RedZoneDisplacement>& displacements,
-    RedZoneFrameReport& report
+    RedZoneFrameReport& report,
+    const std::vector<Domain::ProgramHeader>& loadSegments
 ) {
     const auto segOffset = static_cast<std::size_t>(ph.Offset);
     const auto segSize = static_cast<std::size_t>(ph.FileSize);
@@ -405,6 +481,20 @@ void frameSegment(
         const auto hit = targets.upper_bound(begin);
         return hit != targets.end() && *hit < end;
     };
+    const auto readGuest32 = [&](const std::uint64_t address) -> std::optional<std::int32_t> {
+        const auto read = [&](const Domain::ProgramHeader& segment) -> std::optional<std::int32_t> {
+            if (address < segment.MappedAddress || address + 4 > segment.MappedAddress + segment.FileSize) return std::nullopt;
+            const auto offset = static_cast<std::size_t>(segment.Offset + (address - segment.MappedAddress));
+            if (offset + 4 > fileBytes.size()) return std::nullopt;
+            std::int32_t value = 0;
+            std::memcpy(&value, fileBytes.data() + offset, 4);
+            return value;
+        };
+        if (const auto value = read(ph)) return value;
+        for (const auto& segment : loadSegments)
+            if (const auto value = read(segment)) return value;
+        return std::nullopt;
+    };
     // A tail call's target: another function's start, or code outside every function (a PLT stub).
     // A jump into the middle of another function (a cold part) may come back, so it is not one.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
@@ -432,6 +522,29 @@ void frameSegment(
         }
         if (body.size() < 3) continue;
         const auto at = [&](const std::size_t k) { return seg.data() + body[k].Offset; };
+        // Jump tables: entries are read until one does not land on an instruction of this function.
+        // The real entries come first and all land, so every case is taken, and at worst a few
+        // words past the table: those only add branch targets and paths to check.
+        std::map<std::size_t, std::size_t> indexOf;
+        for (std::size_t k = 0; k < body.size(); ++k) indexOf[body[k].Offset] = k;
+        std::map<std::size_t, std::vector<std::size_t>> tables;
+        for (std::size_t k = 0; k < body.size(); ++k) {
+            const auto dispatch = jumpTableDispatch(body, k, seg.data());
+            if (!dispatch) continue;
+            std::vector<std::size_t> cases;
+            for (std::int64_t entry = 0; entry < kJumpTableEntryLimit; ++entry) {
+                const auto value = readGuest32(static_cast<std::uint64_t>(static_cast<std::int64_t>(ph.MappedAddress) + dispatch->Table + 4 * entry));
+                if (!value) break;
+                const auto caseOffset = dispatch->Table + *value;
+                if (caseOffset < static_cast<std::int64_t>(start) || caseOffset >= static_cast<std::int64_t>(limit)) break;
+                const auto found = indexOf.find(static_cast<std::size_t>(caseOffset));
+                if (found == indexOf.end()) break;
+                cases.push_back(found->second);
+            }
+            if (cases.empty()) continue;
+            for (const auto c : cases) targets.insert(body[c].Offset);
+            tables.emplace(k, std::move(cases));
+        }
         const bool rbpPrologue = body[0].Length == 1 && at(0)[0] == 0x55 && body[1].Length == 3 && std::memcmp(at(1), "\x48\x89\xe5", 3) == 0;
         std::vector<std::uint8_t> pushed;
         std::size_t p = rbpPrologue ? 2 : 0;
@@ -478,7 +591,7 @@ void frameSegment(
         };
         const auto leavesByTailCall = [&](const std::size_t k) {
             const auto& insn = body[k];
-            if (insn.Info.FlowKind == ControlFlowKind::IndirectJump) return true;
+            if (insn.Info.FlowKind == ControlFlowKind::IndirectJump) return !tables.contains(k);
             if (insn.Info.FlowKind != ControlFlowKind::UnconditionalJump || !insn.Info.HasBranchTarget) return false;
             const auto target = static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp;
             return (target < static_cast<std::int64_t>(start) || target >= static_cast<std::int64_t>(limit)) && tailCallTarget(target);
@@ -593,9 +706,21 @@ void frameSegment(
             // A tail call: a jmp to another function's start (or to code outside every function,
             // such as a PLT stub), or an indirect jmp right after the pops that undo the prologue;
             // an indirect jmp in a leaf without pushes may be a jump table and is refused.
+            // A jump table's cases are branch targets inside the leaf, like a jcc's.
+            if (flow == ControlFlowKind::IndirectJump && tables.contains(k)) continue;
+            // A jmp through memory without an index ([reg+disp], [rip+disp]) loads a function
+            // pointer: a tail call even in a leaf without pushes.
+            bool pointerJump = false;
+            if (flow == ControlFlowKind::IndirectJump && insn.Info.HasModRm && (insn.Info.ModRmByte >> 6) != 3) {
+                pointerJump = true;
+                if ((insn.Info.ModRmByte & 7) == 4 && insn.Info.ModRmOffset + 1 < insn.Length) {
+                    const auto sib = code[insn.Info.ModRmOffset + 1];
+                    pointerJump = ((sib >> 3) & 7) == 4 && (insn.Info.RexPrefix & 0x02) == 0;
+                }
+            }
             bool tailCall = false;
             if (flow == ControlFlowKind::IndirectJump) {
-                if (pushed.empty() && allocation == 0) { reason = "indirect jump"; continue; }
+                if (pushed.empty() && allocation == 0 && !pointerJump) { reason = "indirect jump"; continue; }
                 if (use.RspBased) { reason = "indirect jump through an rsp operand"; continue; }
                 tailCall = true;
             }
@@ -619,7 +744,7 @@ void frameSegment(
                     if (q == p || !frees.contains(q - 1)) { reason = "exit does not free the prologue's allocation"; continue; }
                     --q;
                 }
-                if (flow == ControlFlowKind::IndirectJump && q == k) { reason = "indirect jump"; continue; }
+                if (flow == ControlFlowKind::IndirectJump && q == k && !pointerJump) { reason = "indirect jump"; continue; }
                 ExitSite exit{q, q, body[q].Offset, body[q].Offset, insn.Offset + insn.Length, {}};
                 exit.Trail.Bytes.assign(at(q), at(k));
                 if (!tailCall) exit.Trail.Bytes.push_back(0xc3);
@@ -707,6 +832,13 @@ void frameSegment(
                 const auto flow = insn.Info.FlowKind;
                 if (flow == ControlFlowKind::Return) {
                     if (!layout.empty()) return false;
+                    continue;
+                }
+                if (flow == ControlFlowKind::IndirectJump) {
+                    const auto table = tables.find(k);
+                    if (table == tables.end()) return false;
+                    for (const auto c : table->second)
+                        if (!reach(c, layout)) return false;
                     continue;
                 }
                 if ((flow == ControlFlowKind::ConditionalBranch || flow == ControlFlowKind::UnconditionalJump) && insn.Info.HasBranchTarget) {
@@ -891,10 +1023,11 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     const std::vector<RedZoneFunction>& functions,
     const std::vector<TrampolineSite>& existing,
     RedZoneFrameReport& report,
-    std::vector<RedZoneDisplacement>& displacements
+    std::vector<RedZoneDisplacement>& displacements,
+    const std::vector<Domain::ProgramHeader>& loadSegments
 ) {
     std::vector<TrampolineSite> sites;
-    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report);
+    for (const auto& ph : codeSegments) frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, loadSegments);
     return sites;
 }
 

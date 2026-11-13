@@ -44,7 +44,9 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     const std::vector<RedZoneFunction>& functions,
     const std::vector<TrampolineSite>& existing,
     RedZoneFrameReport& report,
-    std::vector<RedZoneDisplacement>& displacements
+    std::vector<RedZoneDisplacement>& displacements,
+    // Every loaded segment, to read the jump tables of switch statements from.
+    const std::vector<Domain::ProgramHeader>& loadSegments = {}
 );
 
 }

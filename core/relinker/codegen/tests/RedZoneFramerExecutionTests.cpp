@@ -196,6 +196,8 @@ struct Leaf {
     std::vector<std::uint8_t> Code;
     std::uint64_t Expected;
     bool HostRuns = true;
+    // Data placed right after the leaf, outside its function bounds (a jump table).
+    std::vector<std::uint8_t> Data = {};
 };
 
 bool hostHasBmi1() {
@@ -380,6 +382,19 @@ std::vector<Leaf> thunkLeaves() {
     };
 }
 
+// A switch on rdi & 1 through a table of offsets after an int3: each case's exit starts at
+// the case label, which the widened exits must not cover.
+std::vector<Leaf> jumpTableLeaves() {
+    return {
+        {"leaf without pushes spilling below rsp and dispatching through a jump table", {
+            0x48, 0x89, 0x74, 0x24, 0xf8, 0x83, 0xe7, 0x01, 0x48, 0x8d, 0x0d, 0x19, 0x00, 0x00, 0x00,
+            0x48, 0x63, 0x04, 0xb9, 0x48, 0x01, 0xc8, 0xff, 0xe0,
+            0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3,
+            0x48, 0x8b, 0x44, 0x24, 0xf8, 0x48, 0x01, 0xd0, 0xc3, 0xcc,
+        }, kB + kC, true, {0xf0, 0xff, 0xff, 0xff, 0xf6, 0xff, 0xff, 0xff}},
+    };
+}
+
 // The first leaf ends in a tail call to the second: place() puts them at 0x40 and 0x70.
 std::vector<Leaf> tailCallLeaves() {
     return {
@@ -429,6 +444,7 @@ Image place(const std::vector<Leaf>& leaves) {
         image.Bytes.resize(image.Starts[index], 0xcc);
         image.Bytes.insert(image.Bytes.end(), leaves[index].Code.begin(), leaves[index].Code.end());
         image.Ends.push_back(image.Bytes.size());
+        image.Bytes.insert(image.Bytes.end(), leaves[index].Data.begin(), leaves[index].Data.end());
     }
     image.Bytes.resize((image.Bytes.size() + 15) / 16 * 16 + 16, 0xcc);
     require(image.Bytes.size() <= kStubBase, "the leaves do not fit before the stubs");
@@ -595,6 +611,8 @@ int main() {
         require(thunked.ReturnThunks == 5 && thunked.Exits == 0, "the leaves whose exits cannot be patched were framed with " + std::to_string(thunked.ReturnThunks) + " return thunks and " + std::to_string(thunked.Exits) + " exit stubs, not 5 and 0");
         const auto tailCalled = runLeaves(tailCallLeaves());
         require(tailCalled.Exits == 2, "the leaves ending in a tail call and a ret were framed with " + std::to_string(tailCalled.Exits) + " exit stubs, not 2");
+        const auto switched = runLeaves(jumpTableLeaves());
+        require(switched.Exits == 2 && switched.WidenedExits == 2, "the leaf with a jump table was framed with " + std::to_string(switched.Exits) + " exits, " + std::to_string(switched.WidenedExits) + " widened, not 2 and 2");
         std::cout << "red-zone framer execution tests passed\n";
         return 0;
     } catch (const SteppingDegraded& error) {
