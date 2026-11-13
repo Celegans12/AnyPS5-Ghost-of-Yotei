@@ -411,9 +411,11 @@ void skipsWideningOverBranchTargets() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 2, "a leaf with a branch into a widened site was framed");
+    require(report.RedZoneFunctions == 2 && report.Framed == 1 && sites.size() == 1, "a leaf with a branch into a widened site was framed with an exit stub, or not retried as a thunk");
     require(report.Skipped.at("branch to the start of a widened prologue") == 1, "a leaf without pushes whose loop branches back to its first instruction was not refused");
-    require(report.Skipped.at("branch into the instructions before a short exit") == 1, "a short exit that a branch reaches past the add before it was not refused");
+    // The leaf whose short exit a branch reaches past the add returns through a thunk: it needs no
+    // exit stub, so the branch to its pop is harmless.
+    require(report.ReturnThunks == 1 && report.Exits == 0 && sites[0].Address == Base + 0x60, "a short exit that a branch reaches past the add before it was not framed as a return thunk");
 }
 
 void skipsBranchesIntoTheInstructionsAfterAShortPrologue() {
@@ -752,9 +754,12 @@ void skipsLeavesWithoutFramePointerThatPushOrPop() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(report.RedZoneFunctions == functions.size() && report.FramedWithoutFramePointer == 0 && displacements.empty(), "a leaf without a frame pointer that pushes or pops between its prologue and its exits was framed, so its rsp operands after a push were moved past the pushed slot");
-    require(report.Skipped.at("push or pop inside the body") == moves.size(), "a leaf without a frame pointer that pushes or pops between its prologue and its exits was not reported with its reason");
-    require(report.Framed == 1 && sites.size() == 2, "a leaf with a frame pointer, whose rsp operands are refused anyway, was not framed because it pushes and pops");
+    // Retried as return thunks, the leaves whose rsp operands do not touch the pushed slot (push
+    // and pop r8, push and pop gs) are framed; those reading or writing the slot, pushing through
+    // an rsp operand, or pushing 16 bits stay refused with the first pass's reason.
+    require(report.RedZoneFunctions == functions.size() && report.FramedWithoutFramePointer == 2 && report.ReturnThunks == 2, "a leaf without a frame pointer that pushes or pops in its body was not retried as a thunk, or one touching the pushed slot was framed");
+    require(report.Skipped.at("push or pop inside the body") == moves.size() - 2, "a leaf without a frame pointer that pushes or pops between its prologue and its exits was not reported with its reason");
+    require(report.Framed == 3, "a leaf with a frame pointer, whose rsp operands are refused anyway, was not framed because it pushes and pops");
 }
 
 Image calledThenUncalled(const std::vector<std::uint8_t>& called, const std::vector<std::uint8_t>& uncalled) {
