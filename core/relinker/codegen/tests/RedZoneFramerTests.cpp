@@ -1,4 +1,5 @@
 #include <codegen/x86/RedZoneFramer.hpp>
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -784,16 +785,30 @@ void framesEachFunctionFromItsOwnFde() {
 }
 
 void treatsATailCallPastTheFdeEndAsLeaving() {
-    std::vector<std::uint8_t> called = FramelessPrologue;
-    append(called, StoreBelowRsp);
-    append(called, {0x85, 0xff, 0x75, 0x06});
-    append(called, FramelessExit);
-    append(called, {0x41, 0x5f, 0x41, 0x5e, 0x5b, 0xe9, 0x02, 0x00, 0x00, 0x00});
-    const auto input = calledThenUncalled(called, framelessLeaf(FramelessPrologue, StoreBelowRsp, FramelessExit));
+    // The leaf pops its registers and jumps to the next function's start, or into its middle.
+    const auto tailCalling = [](const std::int32_t past) {
+        std::vector<std::uint8_t> called = FramelessPrologue;
+        append(called, StoreBelowRsp);
+        append(called, {0x85, 0xff, 0x75, 0x06});
+        append(called, FramelessExit);
+        append(called, {0x41, 0x5f, 0x41, 0x5e, 0x5b, 0xe9});
+        const auto disp = static_cast<std::uint32_t>(0x60 + past - static_cast<std::int32_t>(0x40 + called.size() + 4));
+        for (int index = 0; index < 4; ++index) called.push_back(static_cast<std::uint8_t>(disp >> (index * 8)));
+        return calledThenUncalled(called, framelessLeaf(FramelessPrologue, StoreBelowRsp, FramelessExit));
+    };
+    const auto tail = tailCalling(0);
+    Codegen::RedZoneFrameReport tailReport;
+    std::vector<Codegen::RedZoneDisplacement> tailDisplacements;
+    const auto tailSites = Codegen::FrameRedZoneFunctions(tail.bytes, tail.segments, tail.functions, {}, tailReport, tailDisplacements);
+    require(tailReport.Framed == 2 && tailReport.Exits == 3 && tailReport.Skipped.empty(), "a leaf whose pops end in a tail call to another function's start was not framed with that tail call as an exit");
+    const auto exitSite = std::find_if(tailSites.begin(), tailSites.end(), [](const Codegen::TrampolineSite& site) { return site.OriginalBytes.size() >= 5 && site.OriginalBytes[site.OriginalBytes.size() - 5] == 0xe9; });
+    require(exitSite != tailSites.end() && exitSite->Relocations.size() == 1 && exitSite->Relocations[0].SiteTarget + static_cast<std::int64_t>(exitSite->Address - Base) == 0x60, "the tail call's stub does not jump to the next function's start");
+
+    const auto input = tailCalling(static_cast<std::int32_t>(FramelessPrologue.size()));
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(report.Skipped.at("branch leaves the function") == 1, "the tail call past the FDE end was not reported as leaving the function");
+    require(report.Skipped.at("branch leaves the function") == 1, "a jump into the middle of another function was not reported as leaving the function");
     require(report.Framed == 1 && sites.size() == 2 && sites[0].Address == Base + 0x60, "the tail-called function was not framed from its own FDE start");
 }
 
