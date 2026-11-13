@@ -265,9 +265,20 @@ Per phase:
     function), or an indirect jmp right after the prologue's pops, is an exit; its stub relocates
     the jump. Indirect jumps without pushes or pops first (jump tables) stay refused. Crash checks
     (40 s) clean on all four titles.
-  - Remaining skipped (AoM 34 / LEGO 24 / FF 14 / 007 70): indirect jump (jump tables), exit
-    shorter than a jump, branch into the instructions before a short exit, exit does not pop,
-    and a few others.
+  - **Jump tables (a3fe6be7cc, 7e21d150bd):** `lea; movsxd [base+i*4]; add; jmp reg` tables are
+    read (from any load segment) until an entry misses an instruction of the function; a lea
+    hoisted out of the window takes every table the function's RIP-relative leas address. Cases
+    become branch targets and walk successors. Function-pointer jumps (`jmp [reg+disp]`,
+    `mov reg,[..]; jmp reg`) are tail calls. Entries or branches past the first int3 refuse.
+  - **Thunk retry (59d1573627) and thunk tail calls (68a1d63afa):** a leaf without a frame pointer
+    whose exits cannot be patched is retried as a thunk with its pushes in the body; a thunk's
+    tail call leaves through a stub raising rsp over the gap and slot (callee sees the caller's
+    return address and stack arguments).
+  - Crash checks (40 s, all four titles) clean after each step.
+  - **Remaining skipped: 007 9, AoM 7, LEGO 2, FF 1** (from 132 / 147 / 158 / 39). 7 have `[rsp]`
+    operands without a displacement next to branch targets (no room for a stub), 4 read a pushed
+    slot through rsp in a thunk, 4 unresolved indirect jumps, 4 single cases. These need the leaf
+    relocated whole into stub space (all rsp operands rewritten, branches and tables relocated).
 - **2 and 3:** not started.
 - **4:** section B is built in its walk-based form (bound ranges and index windows). It took the
   AoM title from 216 to about 150 ms. The section D validity change is not started.
@@ -289,9 +300,9 @@ Per phase:
 
 Next, in phase order:
 
-1. **Phase 1.** Frame the remaining skipped leaf shapes in the relinker: jump tables, short
-   exits and branches into them. Check each change with one framed run
-   per title for crashes (no benchmarks needed). Then frame the bundled PRX modules, account for
+1. **Phase 1.** Relocate the last skipped leaves whole (19 across the four titles), or decide
+   they are acceptable. Check each change with one framed run per title for crashes (40 s, no
+   benchmarks needed). Then frame the bundled PRX modules, account for
    code without `.eh_frame` bounds, and build the fault-storm test.
 2. **Phase 2** once a title passes the phase 1 gate.
 3. **Phase 3** (waits) after that; it does not depend on phase 1.
