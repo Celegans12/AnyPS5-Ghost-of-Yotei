@@ -414,6 +414,20 @@ std::vector<Leaf> tailCallLeaves() {
     };
 }
 
+// The first leaf's 3-byte `xor eax, eax; ret` cannot take an exit stub, so it is a thunk; its
+// tail call to the second leaf (at 0x70) leaves through a stub that raises rsp over the gap.
+std::vector<Leaf> thunkTailCallLeaves() {
+    return {
+        {"thunk leaf without pushes spilling below rsp that tail-calls the next leaf", {
+            0x48, 0x89, 0x54, 0x24, 0xf0, 0x48, 0x85, 0xf6, 0x74, 0x0e, 0x48, 0x8b, 0x44, 0x24, 0xf0,
+            0x48, 0x8d, 0x3c, 0x38, 0xe9, 0x18, 0x00, 0x00, 0x00, 0x31, 0xc0, 0xc3,
+        }, kA + kB + kC},
+        {"tail-called leaf without pushes adding its spill to rsi", {
+            0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0x48, 0x01, 0xf0, 0xc3,
+        }, kA + kB},
+    };
+}
+
 void writeRel32(std::uint8_t* at, const std::uint64_t target, const std::uint64_t next) {
     const auto displacement = static_cast<std::int64_t>(target) - static_cast<std::int64_t>(next);
     require(displacement >= std::numeric_limits<std::int32_t>::min() && displacement <= std::numeric_limits<std::int32_t>::max(), "a stub jump is out of rel32 range");
@@ -617,6 +631,8 @@ int main() {
         require(thunked.ReturnThunks == 6 && thunked.Exits == 0, "the leaves whose exits cannot be patched were framed with " + std::to_string(thunked.ReturnThunks) + " return thunks and " + std::to_string(thunked.Exits) + " exit stubs, not 6 and 0");
         const auto tailCalled = runLeaves(tailCallLeaves());
         require(tailCalled.Exits == 2, "the leaves ending in a tail call and a ret were framed with " + std::to_string(tailCalled.Exits) + " exit stubs, not 2");
+        const auto thunkTail = runLeaves(thunkTailCallLeaves());
+        require(thunkTail.ReturnThunks == 1 && thunkTail.Exits == 2, "the thunk leaf ending in a tail call was framed with " + std::to_string(thunkTail.ReturnThunks) + " thunks and " + std::to_string(thunkTail.Exits) + " exits, not 1 and 2");
         const auto switched = runLeaves(jumpTableLeaves());
         require(switched.Exits == 2 && switched.WidenedExits == 2, "the leaf with a jump table was framed with " + std::to_string(switched.Exits) + " exits, " + std::to_string(switched.WidenedExits) + " widened, not 2 and 2");
         std::cout << "red-zone framer execution tests passed\n";
