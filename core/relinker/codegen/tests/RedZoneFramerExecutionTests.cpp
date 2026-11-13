@@ -346,6 +346,21 @@ std::vector<Leaf> widenedLeaves() {
     };
 }
 
+std::vector<Leaf> thunkLeaves() {
+    return {
+        // jne lands on the ret, inside the exit a stub would need: the leaf returns through a thunk.
+        {"leaf without pushes whose ret is a branch target right after a load from below rsp", {
+            0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x89, 0x74, 0x24, 0xf0, 0x48, 0x8b, 0x44, 0x24, 0xf8,
+            0x48, 0x39, 0xf7, 0x75, 0x05, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0xc3,
+        }, kA},
+        // The body's push sits below the slot it spilled to, so the rsp operand after it moves too.
+        {"leaf without prologue pushes pushing and popping rbx around a load from below rsp", {
+            0x48, 0x89, 0x7c, 0x24, 0xe8, 0x53, 0x48, 0x89, 0xf3, 0x48, 0x8b, 0x44, 0x24, 0xf0,
+            0x48, 0x01, 0xd8, 0x5b, 0xc3,
+        }, kA + kB},
+    };
+}
+
 void writeRel32(std::uint8_t* at, const std::uint64_t target, const std::uint64_t next) {
     const auto displacement = static_cast<std::int64_t>(target) - static_cast<std::int64_t>(next);
     require(displacement >= std::numeric_limits<std::int32_t>::min() && displacement <= std::numeric_limits<std::int32_t>::max(), "a stub jump is out of rel32 range");
@@ -544,6 +559,8 @@ int main() {
         require(backward.OperandStubs == 2 && backward.StubbedOperands == 3 && backward.MovedOperands == 5, "the leaves comparing at rsp before a branch were framed with " + std::to_string(backward.OperandStubs) + " operand stubs carrying " + std::to_string(backward.StubbedOperands) + " rsp operands and " + std::to_string(backward.MovedOperands) + " moved in place, not 2 carrying 3 and 5");
         const auto widened = runLeaves(widenedLeaves());
         require(widened.WidenedPrologues == 9 && widened.WidenedExits == 10 && widened.WidenedOperands == 13, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 9, 10 and 13");
+        const auto thunked = runLeaves(thunkLeaves());
+        require(thunked.ReturnThunks == 2 && thunked.Exits == 0, "the leaves whose exits cannot be patched were framed with " + std::to_string(thunked.ReturnThunks) + " return thunks and " + std::to_string(thunked.Exits) + " exit stubs, not 2 and 0");
         std::cout << "red-zone framer execution tests passed\n";
         return 0;
     } catch (const SteppingDegraded& error) {

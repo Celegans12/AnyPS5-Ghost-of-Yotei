@@ -28,6 +28,8 @@ struct RedZoneFrameReport {
     std::size_t MovedOperands = 0;
     std::size_t OperandStubs = 0;
     std::size_t StubbedOperands = 0;
+    // Leaves without pushes whose exits could not be patched, returning through a thunk instead.
+    std::size_t ReturnThunks = 0;
     std::map<std::string, std::size_t> Skipped;
 };
 

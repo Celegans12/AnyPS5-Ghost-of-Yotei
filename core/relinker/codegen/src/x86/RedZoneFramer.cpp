@@ -444,14 +444,35 @@ void frameSegment(
             if (use.Indexed || (use.Address && use.RspDisp < 0)) wholeRedZone = true;
         }
         const auto shift = wholeRedZone ? kRedZoneBytes : std::min(kRedZoneBytes, (depth + kStackAlignment - 1) / kStackAlignment * kStackAlignment);
+        // A leaf without pushes, allocation or frame pointer whose exits cannot be patched returns
+        // through a thunk instead: the entry stub lowers rsp and calls the rest of itself, so every
+        // ret lands on `lea rsp, [rsp+shift]; ret`. Its rsp operands also move over that slot.
+        const bool frameless = !rbpPrologue && p == 0;
+        const char* exitReason = nullptr;
+        bool sawRet = false;
+        std::int64_t bodyShift = shift;
+        std::vector<std::size_t> rspOperands;
         // An instruction moved into a stub: rsp operands move with the shift, RIP-relative ones are
         // relocated to the stub.
         const auto copy = [&](const std::size_t k) -> std::optional<Copied> {
             const auto& insn = body[k];
-            const auto use = memoryUse(at(k), insn);
             Copied out;
+            if (insn.Info.FlowKind == ControlFlowKind::ConditionalBranch) {
+                // A jcc goes into the stub as its rel32 form, relocated to its target in the
+                // function; jcxz and loop have no rel32 form.
+                if (!insn.Info.HasBranchTarget || insn.Info.HasRipRelativeDisp || insn.Info.OpcodeOffset != 0) return std::nullopt;
+                const auto op = insn.Info.Opcode;
+                const bool shortForm = !insn.Info.IsTwoByteOpcode && op >= 0x70 && op <= 0x7f;
+                const bool nearForm = insn.Info.IsTwoByteOpcode && op >= 0x80 && op <= 0x8f;
+                if (!shortForm && !nearForm) return std::nullopt;
+                out.Bytes = {0x0f, static_cast<std::uint8_t>(0x80 | (op & 0x0f)), 0, 0, 0, 0};
+                out.Rips.push_back({2, 6, static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp, false});
+                return out;
+            }
+            if (insn.Info.FlowKind != ControlFlowKind::Sequential) return std::nullopt;
+            const auto use = memoryUse(at(k), insn);
             if (use.RspBased) {
-                auto bytes = withDisplacement(at(k), insn, use, use.RspDisp + shift);
+                auto bytes = withDisplacement(at(k), insn, use, use.RspDisp + bodyShift);
                 if (!bytes) return std::nullopt;
                 out.Bytes = std::move(*bytes);
                 return out;
@@ -477,7 +498,7 @@ void frameSegment(
             if (use.RspBased && use.RspDisp < 0) redZone = true;
             if (reason != nullptr) continue;
             if (code[insn.Info.OpcodeOffset] == 0xc9 || code[insn.Info.OpcodeOffset] == 0xc8) { reason = "leave or enter"; continue; }
-            if (!rbpPrologue && pushed.empty() && allocation == 0 && pushesOrPops(code, insn)) { reason = "push or pop in a leaf without pushes"; continue; }
+            if (frameless && pushesOrPops(code, insn) && exitReason == nullptr) exitReason = "push or pop in a leaf without pushes";
             if (!rbpPrologue && pushesOrPops(code, insn)) stackMoves.push_back(k);
             if (rbpPrologue) {
                 if (use.UsesRsp) { reason = "other use of rsp"; continue; }
@@ -486,8 +507,7 @@ void frameSegment(
                 if (use.RspBased) {
                     if (code[insn.Info.OpcodeOffset] == 0x62) { reason = "rsp operand that cannot move with rsp"; continue; }
                     if (overlapsExisting(insn.Offset, insn.Offset + insn.Length)) { reason = "overlaps another stub"; continue; }
-                    if (auto moved = movedDisplacement(use, shift)) moves.emplace(k, std::pair{insn.Offset + use.DispOffset, std::move(*moved)});
-                    else stubbed.push_back(k);
+                    rspOperands.push_back(k);
                 }
             }
             if (flow == ControlFlowKind::IndirectJump) { reason = "indirect jump"; continue; }
@@ -497,6 +517,8 @@ void frameSegment(
             }
             if (flow == ControlFlowKind::Return) {
                 if (insn.Length != 1 || code[0] != 0xc3) { reason = "ret with an immediate"; continue; }
+                sawRet = true;
+                if (exitReason != nullptr) continue;
                 const auto pops = popsBefore(k);
                 if (!pops) { reason = "exit does not pop the prologue's registers"; continue; }
                 auto q = *pops;
@@ -508,7 +530,7 @@ void frameSegment(
                 while (exit.End - exit.Begin < kJumpBytes && exit.First > p) {
                     const auto j = exit.First - 1;
                     const auto& prior = body[j];
-                    if (prior.Offset + prior.Length != exit.Begin || prior.Info.FlowKind != ControlFlowKind::Sequential || frees.contains(j) || pushesOrPops(at(j), prior)) break;
+                    if (prior.Offset + prior.Length != exit.Begin || (prior.Info.FlowKind != ControlFlowKind::Sequential && prior.Info.FlowKind != ControlFlowKind::ConditionalBranch) || frees.contains(j) || pushesOrPops(at(j), prior)) break;
                     const auto copied = copy(j);
                     if (!copied) break;
                     exit.Lead.Prepend(*copied);
@@ -516,22 +538,80 @@ void frameSegment(
                     exit.Begin = prior.Offset;
                     exit.First = j;
                 }
-                if (exit.End - exit.Begin < kJumpBytes) { reason = "exit shorter than a jump"; continue; }
-                if (targetInside(exit.Begin, exit.End)) { reason = exit.First == exit.Tail ? "branch into an exit" : "branch into the instructions before a short exit"; continue; }
+                const char* exitFailure = nullptr;
+                if (exit.End - exit.Begin < kJumpBytes) exitFailure = "exit shorter than a jump";
+                else if (targetInside(exit.Begin, exit.End)) exitFailure = exit.First == exit.Tail ? "branch into an exit" : "branch into the instructions before a short exit";
+                if (exitFailure != nullptr) {
+                    if (frameless) exitReason = exitFailure;
+                    else reason = exitFailure;
+                    continue;
+                }
                 exits.push_back(std::move(exit));
             }
         }
         if (!leaf || !redZone) continue;
         ++report.RedZoneFunctions;
+        // The thunk's slot sits where the leaf's own pushes go: they must balance on every path, so
+        // that each ret finds the thunk's address (a fragment popping its caller's pushes would not).
+        const auto balanced = [&] {
+            std::map<std::size_t, std::size_t> index;
+            for (std::size_t k = 0; k < body.size(); ++k) index[body[k].Offset] = k;
+            std::map<std::size_t, std::int64_t> depthAt{{0, 0}};
+            std::vector<std::size_t> pending{0};
+            const auto reach = [&](const std::size_t k, const std::int64_t depth) {
+                const auto [it, inserted] = depthAt.emplace(k, depth);
+                if (inserted) pending.push_back(k);
+                return it->second == depth;
+            };
+            while (!pending.empty()) {
+                const auto k = pending.back();
+                pending.pop_back();
+                const auto& insn = body[k];
+                auto depth = depthAt.at(k);
+                if (pushesOrPops(at(k), insn)) {
+                    const auto op = insn.Info.Opcode;
+                    const bool pop = insn.Info.IsTwoByteOpcode ? (op == 0xa1 || op == 0xa9) : ((op >= 0x58 && op <= 0x5f) || op == 0x9d || op == 0x8f);
+                    depth += pop ? -1 : 1;
+                    if (depth < 0) return false;
+                }
+                const auto flow = insn.Info.FlowKind;
+                if (flow == ControlFlowKind::Return) {
+                    if (depth != 0) return false;
+                    continue;
+                }
+                if ((flow == ControlFlowKind::ConditionalBranch || flow == ControlFlowKind::UnconditionalJump) && insn.Info.HasBranchTarget) {
+                    const auto target = index.find(static_cast<std::size_t>(static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp));
+                    if (target == index.end() || !reach(target->second, depth)) return false;
+                }
+                if (flow == ControlFlowKind::Sequential || flow == ControlFlowKind::ConditionalBranch) {
+                    if (k + 1 >= body.size() || !reach(k + 1, depth)) return false;
+                } else if (flow != ControlFlowKind::UnconditionalJump) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        const bool thunk = frameless && reason == nullptr && exitReason != nullptr && balanced();
+        if (frameless && reason == nullptr && exitReason != nullptr && !thunk) reason = exitReason;
+        if (thunk) {
+            exits.clear();
+            bodyShift = shift + 8;
+            if (!sawRet) reason = "no ret exit";
+        }
+        for (const auto k : rspOperands) {
+            const auto use = memoryUse(at(k), body[k]);
+            if (auto moved = movedDisplacement(use, bodyShift)) moves.emplace(k, std::pair{body[k].Offset + use.DispOffset, std::move(*moved)});
+            else stubbed.push_back(k);
+        }
         const auto prologueEnd = p > 0 ? body[p - 1].Offset + body[p - 1].Length : start;
-        if (reason == nullptr && std::any_of(stackMoves.begin(), stackMoves.end(), [&](const std::size_t k) { return std::none_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return exit.Begin <= body[k].Offset && body[k].Offset < exit.End; }); })) reason = "push or pop inside the body";
+        if (reason == nullptr && !thunk && std::any_of(stackMoves.begin(), stackMoves.end(), [&](const std::size_t k) { return std::none_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return exit.Begin <= body[k].Offset && body[k].Offset < exit.End; }); })) reason = "push or pop inside the body";
         auto entryEnd = prologueEnd;
         auto entryLast = p;
         Copied entryTail;
         std::size_t entryOperands = 0;
         while (entryEnd - start < kJumpBytes && entryLast < body.size()) {
             const auto& covered = body[entryLast];
-            if (covered.Offset != entryEnd || covered.Info.FlowKind != ControlFlowKind::Sequential || frees.contains(entryLast) || pushesOrPops(at(entryLast), covered)) break;
+            if (covered.Offset != entryEnd || (covered.Info.FlowKind != ControlFlowKind::Sequential && covered.Info.FlowKind != ControlFlowKind::ConditionalBranch) || frees.contains(entryLast) || pushesOrPops(at(entryLast), covered)) break;
             if (std::any_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return covered.Offset < exit.End && exit.Begin < covered.Offset + covered.Length; })) break;
             const auto copied = copy(entryLast);
             if (!copied) break;
@@ -543,7 +623,7 @@ void frameSegment(
         if (reason == nullptr && entryEnd - start < kJumpBytes) reason = "prologue shorter than a jump";
         if (reason == nullptr && targetInside(start, entryEnd)) reason = entryEnd == prologueEnd ? "branch into the prologue" : "branch into the instructions after a short prologue";
         if (reason == nullptr && entryEnd != prologueEnd && targets.contains(start)) reason = "branch to the start of a widened prologue";
-        if (reason == nullptr && exits.empty()) reason = "no ret exit";
+        if (reason == nullptr && !thunk && exits.empty()) reason = "no ret exit";
         if (reason == nullptr && std::any_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return exit.Begin < entryEnd; })) reason = "prologue shorter than a jump";
         if (reason == nullptr && (overlapsExisting(start, entryEnd) || std::any_of(exits.begin(), exits.end(), [&](const ExitSite& exit) { return overlapsExisting(exit.Begin, exit.End); }))) reason = "overlaps another stub";
         const auto carried = [&](const std::size_t k) {
@@ -607,6 +687,15 @@ void frameSegment(
         const auto original = [&](const std::size_t begin, const std::size_t end) { return Copied{std::vector<std::uint8_t>(seg.begin() + static_cast<std::ptrdiff_t>(begin), seg.begin() + static_cast<std::ptrdiff_t>(end)), {}}; };
         auto entry = original(start, prologueEnd);
         entry.Append(Copied{lowerRsp(shift), {}});
+        if (thunk) {
+            // call over the thunk: pushes the thunk's address as the leaf's return address.
+            const auto raise = raiseRsp(shift);
+            const auto over = static_cast<std::uint32_t>(raise.size() + 1);
+            entry.Append(Copied{{0xe8, static_cast<std::uint8_t>(over), static_cast<std::uint8_t>(over >> 8), static_cast<std::uint8_t>(over >> 16), static_cast<std::uint8_t>(over >> 24)}, {}});
+            entry.Append(Copied{raise, {}});
+            entry.Append(Copied{{0xc3}, {}});
+            ++report.ReturnThunks;
+        }
         entry.Append(entryTail);
         addSite(start, entryEnd, std::move(entry));
         for (auto& exit : exits) {
