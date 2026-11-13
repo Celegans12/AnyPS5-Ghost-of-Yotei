@@ -365,6 +365,8 @@ struct ExitSite {
     std::size_t End;
     Copied Lead;
     std::size_t Operands = 0;
+    // The pops and the ret, or the pops and the tail call with its target relocated.
+    Copied Trail;
 };
 
 void frameSegment(
@@ -402,6 +404,18 @@ void frameSegment(
     const auto targetInside = [&](const std::size_t begin, const std::size_t end) {
         const auto hit = targets.upper_bound(begin);
         return hit != targets.end() && *hit < end;
+    };
+    // A tail call's target: another function's start, or code outside every function (a PLT stub).
+    // A jump into the middle of another function (a cold part) may come back, so it is not one.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    for (const auto& function : functions) spans.emplace_back(function.Begin, function.End);
+    std::sort(spans.begin(), spans.end());
+    const auto tailCallTarget = [&](const std::int64_t target) {
+        const auto address = static_cast<std::uint64_t>(static_cast<std::int64_t>(ph.MappedAddress) + target);
+        auto span = std::upper_bound(spans.begin(), spans.end(), std::pair{address, std::numeric_limits<std::uint64_t>::max()});
+        if (span == spans.begin()) return true;
+        --span;
+        return address == span->first || address >= span->second;
     };
     for (const auto& function : functions) {
         if (function.Begin < ph.MappedAddress || function.End <= function.Begin || function.End - ph.MappedAddress > segSize) continue;
@@ -462,10 +476,17 @@ void frameSegment(
             if (popped != expected) return std::nullopt;
             return q;
         };
+        const auto leavesByTailCall = [&](const std::size_t k) {
+            const auto& insn = body[k];
+            if (insn.Info.FlowKind == ControlFlowKind::IndirectJump) return true;
+            if (insn.Info.FlowKind != ControlFlowKind::UnconditionalJump || !insn.Info.HasBranchTarget) return false;
+            const auto target = static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp;
+            return (target < static_cast<std::int64_t>(start) || target >= static_cast<std::int64_t>(limit)) && tailCallTarget(target);
+        };
         std::set<std::size_t> frees;
         if (allocation > 0)
             for (std::size_t k = p; k < body.size(); ++k)
-                if (body[k].Info.FlowKind == ControlFlowKind::Return)
+                if (body[k].Info.FlowKind == ControlFlowKind::Return || leavesByTailCall(k))
                     if (const auto q = popsBefore(k); q && *q > p && rspAdjustment(at(*q - 1), body[*q - 1]) == allocation) frees.insert(*q - 1);
         // A leaf that moves rsp anywhere but its prologue allocation and the frees before its exits
         // returns through a thunk, its pushes and allocations taken as part of the body.
@@ -569,23 +590,52 @@ void frameSegment(
                     rspOperands.push_back(k);
                 }
             }
-            if (flow == ControlFlowKind::IndirectJump) { reason = "indirect jump"; continue; }
+            // A tail call: a jmp to another function's start (or to code outside every function,
+            // such as a PLT stub), or an indirect jmp right after the pops that undo the prologue;
+            // an indirect jmp in a leaf without pushes may be a jump table and is refused.
+            bool tailCall = false;
+            if (flow == ControlFlowKind::IndirectJump) {
+                if (pushed.empty() && allocation == 0) { reason = "indirect jump"; continue; }
+                if (use.RspBased) { reason = "indirect jump through an rsp operand"; continue; }
+                tailCall = true;
+            }
             if ((flow == ControlFlowKind::UnconditionalJump || flow == ControlFlowKind::ConditionalBranch) && insn.Info.HasBranchTarget) {
                 const auto target = static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp;
-                if (insn.Info.HasRipRelativeDisp || target < static_cast<std::int64_t>(start) || target >= static_cast<std::int64_t>(functionEnd)) { reason = "branch leaves the function"; continue; }
+                if (insn.Info.HasRipRelativeDisp || target < static_cast<std::int64_t>(start) || target >= static_cast<std::int64_t>(functionEnd)) {
+                    if (flow != ControlFlowKind::UnconditionalJump || !tailCallTarget(target)) { reason = "branch leaves the function"; continue; }
+                    tailCall = true;
+                }
             }
-            if (flow == ControlFlowKind::Return) {
-                if (insn.Length != 1 || code[0] != 0xc3) { reason = "ret with an immediate"; continue; }
-                sawRet = true;
+            if (flow == ControlFlowKind::Return || tailCall) {
+                if (flow == ControlFlowKind::Return && (insn.Length != 1 || code[0] != 0xc3)) { reason = "ret with an immediate"; continue; }
+                if (flow == ControlFlowKind::Return) sawRet = true;
                 if (exitReason != nullptr) continue;
                 const auto pops = popsBefore(k);
-                if (!pops) { reason = "exit does not pop the prologue's registers"; continue; }
+                // A jump that does not undo the prologue first is not a tail call: a jump table, or
+                // a jump to a part that still uses the frame.
+                if (!pops) { reason = !tailCall ? "exit does not pop the prologue's registers" : flow == ControlFlowKind::IndirectJump ? "indirect jump" : "branch leaves the function"; continue; }
                 auto q = *pops;
                 if (allocation > 0) {
                     if (q == p || !frees.contains(q - 1)) { reason = "exit does not free the prologue's allocation"; continue; }
                     --q;
                 }
-                ExitSite exit{q, q, body[q].Offset, body[q].Offset, insn.Offset + 1, {}};
+                if (flow == ControlFlowKind::IndirectJump && q == k) { reason = "indirect jump"; continue; }
+                ExitSite exit{q, q, body[q].Offset, body[q].Offset, insn.Offset + insn.Length, {}};
+                exit.Trail.Bytes.assign(at(q), at(k));
+                if (!tailCall) exit.Trail.Bytes.push_back(0xc3);
+                else if (flow == ControlFlowKind::UnconditionalJump) {
+                    exit.Trail.Append(Copied{{0xe9, 0, 0, 0, 0}, {{1, 5, static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp, false}}});
+                } else {
+                    Copied jump{std::vector<std::uint8_t>(code, code + insn.Length), {}};
+                    if (insn.Info.HasRipRelativeDisp) {
+                        const auto offset = insn.Info.RipRelativeDispOffset;
+                        if (offset + 4 > insn.Length) { reason = "indirect jump"; continue; }
+                        std::int32_t disp = 0;
+                        std::memcpy(&disp, code + offset, 4);
+                        jump.Rips.push_back({offset, insn.Length, static_cast<std::int64_t>(insn.Offset + insn.Length) + disp, insn.Info.AddressSize32});
+                    }
+                    exit.Trail.Append(jump);
+                }
                 while (exit.End - exit.Begin < kJumpBytes && exit.First > p) {
                     const auto j = exit.First - 1;
                     const auto& prior = body[j];
@@ -813,7 +863,7 @@ void frameSegment(
         for (auto& exit : exits) {
             auto code = std::move(exit.Lead);
             code.Append(Copied{raiseRsp(shift), {}});
-            code.Append(original(exit.TailBegin, exit.End));
+            code.Append(exit.Trail);
             addSite(exit.Begin, exit.End, std::move(code));
         }
         for (auto& stub : stubs) addSite(stub.Begin, stub.End, std::move(stub.Body));
