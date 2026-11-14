@@ -288,6 +288,19 @@ public:
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
     void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     static constexpr std::int16_t ReachValue = -2;
+    // Diagnostic only: 6 while a shader's bound storage writes are being noted (GpuWrites kinds).
+    static inline thread_local unsigned NoteSource = 0;
+    // Section A: while one is alive with on set, the writes this thread notes are stores that go
+    // through store imports only (HostImport::store): their submission makes just those imports
+    // uniformly protected. Any other noted write is taken to go through an ordinary import.
+    static inline thread_local bool NoteDedicated = false;
+    struct DedicatedStores {
+        explicit DedicatedStores(bool on) : previous(NoteDedicated) { NoteDedicated = on; }
+        ~DedicatedStores() { NoteDedicated = previous; }
+        DedicatedStores(const DedicatedStores&) = delete;
+        DedicatedStores& operator=(const DedicatedStores&) = delete;
+        bool previous;
+    };
     void NotePendingReach(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
     bool PendingStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
@@ -766,6 +779,10 @@ private:
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
+        // The same notes for the submission (GuestArena::Submission): those made under
+        // DedicatedStores, and the rest.
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> storeWrites;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> regularWrites;
         std::vector<std::uint64_t> writeNotes;
         std::vector<std::int16_t> writeValues;
         std::vector<std::int64_t> writeWords;

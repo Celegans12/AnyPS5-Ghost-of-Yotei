@@ -275,7 +275,11 @@ bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& 
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
     Recorder::CountBarriers(Recorder::CommandClass::ShadowPublish);
     recorder->EndGpuTiming(timing, bytes);
-    recorder->NotePendingWrites(ranges);
+    {
+        // Stored by the CPU at the completion: no import is stored through.
+        const Recorder::DedicatedStores dedicated(true);
+        recorder->NotePendingWrites(ranges);
+    }
     recorder->OnComplete([host, pieces = std::move(pieces), checked] {
         host->Invalidate();
         for (const auto& piece : pieces) {
@@ -293,7 +297,7 @@ bool recordCopiesOnCpu(const UnitShadow& shadow, const std::vector<SlabCopies>& 
 
 // Records the copies as one command group into the active recorder's open batch (a waited batch
 // without one). `ranges` are the guest ranges copied, for the note and the hazard tracker.
-void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes) {
+void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copies, const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges, std::uint64_t bytes, bool retiring) {
     const auto& context = shadow.context;
     using CommandClass = Recorder::CommandClass;
     auto* recorder = Recorder::Active();
@@ -319,12 +323,21 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
         Recorder::CountBarriers(CommandClass::ShadowPublish);
     }
     const auto copyBuffer = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
-    for (const auto& entry : copies) copyBuffer(commands, entry.slab->buffer, shadow.importBuffer, static_cast<std::uint32_t>(entry.regions.size()), entry.regions.data());
+    // The stores go through store imports (StoreTargetAt), except at the import's retirement: the
+    // host imports' lock is held there, and the copies go into its old buffer.
+    bool dedicatedStores = true;
+    for (const auto& entry : copies) {
+        auto regions = entry.regions;
+        const auto* store = retiring ? nullptr : StoreTargetAt(context, shadow.importBase, shadow.importLead, regions);
+        dedicatedStores = dedicatedStores && store != nullptr;
+        copyBuffer(commands, entry.slab->buffer, store != nullptr ? store->buffer : shadow.importBuffer, static_cast<std::uint32_t>(regions.size()), regions.data());
+    }
     // The published bytes are visible to everything recorded after and to the host, as after a fill.
     constexpr VkAccessFlags publishedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, publishedAccess);
     Recorder::CountBarriers(CommandClass::ShadowPublish);
     if (batch) {
+        for (const auto& [begin, end] : ranges) batch->NoteStore(begin, end, dedicatedStores);
         batch->SubmitAndWait();
         return;
     }
@@ -332,6 +345,7 @@ void recordCopies(const UnitShadow& shadow, const std::vector<SlabCopies>& copie
     recorder->MarkCovered(publishedAccess);
     for (const auto& entry : copies) recorder->Keep(entry.slab);
     // CPU readers reach the import's bytes only after the hook's SyncThrough waits by this note.
+    const Recorder::DedicatedStores dedicated(dedicatedStores);
     recorder->NotePendingWrites(ranges);
 }
 
@@ -447,7 +461,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
         std::fprintf(stderr, "[shadow] publish %s: 0x%llx+0x%llx, %zu units, %.2f MiB, %zu slabs (packet 0x%x queue 0x%x)\n", ReasonNames[static_cast<std::size_t>(reason)], static_cast<unsigned long long>(ranges.front().first), static_cast<unsigned long long>(ranges.back().second - ranges.front().first), units, bytes / 1048576.0, copies.size(), packet.opcode, packet.queue);
     }
     if (const auto hook = publishSelectedHook.load(std::memory_order_acquire)) hook(ranges.front().first, ranges.front().second);
-    if (!publishOnCpu() || !recordCopiesOnCpu(*shadow, copies, ranges, bytes, checked)) recordCopies(*shadow, copies, ranges, bytes);
+    if (!publishOnCpu() || !recordCopiesOnCpu(*shadow, copies, ranges, bytes, checked)) recordCopies(*shadow, copies, ranges, bytes, reason == PublishReason::Retire);
     if (ShadowVerify()) verifyPublished(*shadow, copies);
     return units;
 }

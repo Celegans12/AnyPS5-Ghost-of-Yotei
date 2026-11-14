@@ -5,9 +5,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
-#ifdef APS5_COUNT_MAPPING_QUERIES
 #include <atomic>
-#endif
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -15,6 +13,7 @@
 #include <cstring>
 #include <mutex>
 #include <map>
+#include <set>
 #include <memory>
 #include <unordered_map>
 #include <vector>
@@ -98,6 +97,7 @@ public:
                     mapped->second.armed = 0;
                     invalidate(mapped->first, mapped->second);
                 }
+                openArmed(cursor, stop);
                 DWORD previous;
                 if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
                 cursor = stop;
@@ -242,6 +242,12 @@ public:
         std::lock_guard lock(mutex);
         disown(address, address + bytes);
         collectableRanges.clear();
+        // The caller applies the guest protection after this returns, outside the lock: a block armed
+        // in between would keep a stale record of being writable, so mprotected memory is never armed.
+        const auto first = address & ~std::uintptr_t{4095};
+        const auto last = (address + bytes + 4095) & ~std::uintptr_t{4095};
+        openArmed(first, last);
+        remember(unarmable, first, last);
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
             it->second.armed = 0;
@@ -253,6 +259,7 @@ public:
         std::lock_guard lock(mutex);
         disown(address, address + bytes);
         ownedPins.emplace(address, address + bytes);
+        openArmed(address & ~std::uintptr_t{4095}, (address + bytes + 4095) & ~std::uintptr_t{4095});
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             if (it->second.resident) {
                 ++it->second.pins;
@@ -275,6 +282,7 @@ public:
         std::lock_guard lock(mutex);
         disown(address, address + bytes);
         eraseOwnedRange(ownedPins, address, address + bytes);
+        retryImports(address, address + bytes);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& pins = it->second.resident ? it->second.pins : it->second.page->pins;
             if (pins != 0) --pins;
@@ -325,11 +333,40 @@ public:
         }
     }
 
-    bool HandleWrite(std::uintptr_t address) {
+    bool HandleWrite(std::uintptr_t address, std::uintptr_t instruction = 0) {
+        if (const auto owner = submitter.load(std::memory_order_acquire); owner != 0 && protectTrace())
+            std::fprintf(stderr, "[protect] write fault at 0x%llx on thread %lu during the submission of thread %lu\n", static_cast<unsigned long long>(address), GetCurrentThreadId(), owner);
         std::lock_guard lock(mutex);
+        if (armedAt(address)) {
+            // Section A: a CPU-clean block becomes CPU-dirty. The OS write watch records the store
+            // once it resumes, and the next collect walks the block again.
+            const auto block = address & ~(armBlockBytes - 1);
+            forgetClean(block, block + armBlockBytes);
+            ++armFaults;
+            if (groupProbe() || groupWalkProbe()) {
+                const auto next = probeGroups.upper_bound(address);
+                if (next != probeGroups.begin() && std::prev(next)->second > address) {
+                    const auto [start, end] = *std::prev(next);
+                    ++groupFaultBlocks[{start, end}][block];
+                } else {
+                    ++unmappedGroupFaults;
+                }
+            }
+            if (walkProbe() && (armFaults & 63) == 1) {
+                ++faultBlocks[block];
+                ++faultSites[instruction];
+            }
+            if (overlapsStore(block, block + armBlockBytes)) remember(faultedBlocks, block, block + armBlockBytes);
+            auto& strikes = armStrikes[block];
+            strikes = static_cast<std::uint8_t>(std::min(255, strikes + armFaultStrikes));
+            return true;
+        }
         const auto base = address & ~(pageBytes - 1);
         const auto found = views.find(base);
-        if (found == views.end() || !writable(found->second.protection)) return false;
+        // A store that faulted while its block was being armed (the arming thread held the lock and
+        // then left the block writable): retry it.
+        if (found == views.end()) return protectTracking() && privateAllocationEnd(address) != 0 && writable(query(address).Protect);
+        if (!writable(found->second.protection)) return false;
         auto& view = found->second;
         if (view.resident) {
             const auto memory = query(address);
@@ -380,6 +417,9 @@ public:
         disown(address, end);
         forgetZero(address, end);
         ownedHostAccess.emplace(address, end);
+        // Kernel and other non-faulting writes (ReadFile, WriteProcessMemory, imports) need the
+        // pages writable for real; the open bracket keeps the range from being armed again.
+        openArmed(address & ~std::uintptr_t{4095}, (end + 4095) & ~std::uintptr_t{4095});
         for (auto it = first; it != views.end() && it->first < end; ++it) {
             auto& view = it->second;
             if (store) ++view.hostWrites;
@@ -403,6 +443,7 @@ public:
         const auto end = address + bytes;
         disown(address, end);
         eraseOwnedRange(ownedHostAccess, address, end);
+        retryImports(address, end);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
             if (store) --it->second.hostWrites;
             else --it->second.hostImports;
@@ -495,10 +536,251 @@ public:
 
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
         std::lock_guard lock(mutex);
+        if (armedAt(address)) {
+            // Armed for write tracking only: to the guest and the driver it is writable.
+            *protection = PAGE_READWRITE;
+            return true;
+        }
         const auto found = views.find(address & ~(pageBytes - 1));
         if (found == views.end()) return false;
         *protection = found->second.protection;
         return true;
+    }
+
+    // Section A (event-driven write tracking): private and resident guest memory that a resetting
+    // collect found consumed is armed read-only (CPU-clean) and skipped by later collects without a
+    // system call; a guest store faults once, opens its 64 KiB block (CPU-dirty) and the next collect
+    // walks it. Needs the libc exception handler, so tests without it keep the walk-only model.
+    // APS5_NO_PROTECT_TRACKING=1 turns it off.
+    // Precondition (red-zone safety): a fault on a guest thread makes Windows write the exception
+    // frame below RSP, so arming is allowed only when the executable carries the relinker's mark for
+    // a conversion framed with no leaf skipped in any module (FramedMark at FramedMarkOffset of its
+    // DOS header). Programs without guest code (tests, probes) pass unframed, or set
+    // APS5_PROTECT_TRACKING=1.
+    static constexpr std::size_t FramedMarkOffset = 0x28;
+    static constexpr char FramedMark[8] = {'A', 'P', 'S', '5', 'R', 'Z', '0', '1'};
+
+    static void EnableWriteFaults(bool unframed = false) {
+        static const bool forced = std::getenv("APS5_PROTECT_TRACKING") != nullptr;
+        if (!unframed && !forced) {
+            const auto* image = reinterpret_cast<const char*>(GetModuleHandleW(nullptr));
+            if (image == nullptr || std::memcmp(image + FramedMarkOffset, FramedMark, sizeof(FramedMark)) != 0) return;
+        }
+        writeFaultsHandled().store(true, std::memory_order_release);
+    }
+
+    static bool Arming() {
+        return protectTracking();
+    }
+
+    // Memory a thread may run on as its stack (the guest main stack): never armed, as an exception
+    // cannot be delivered on a read-only stack and the process would end without a report.
+    void NeverArm(std::uintptr_t address, std::size_t bytes) {
+        if (bytes == 0) return;
+        std::lock_guard lock(mutex);
+        const auto first = address & ~std::uintptr_t{4095};
+        const auto last = (address + bytes + 4095) & ~std::uintptr_t{4095};
+        openArmed(first, last);
+        remember(unarmable, first, last);
+    }
+
+    // Section A at a submission. Measured on the RTX 5080 (probe-patches\import_protect_probe.cpp,
+    // 2026-11-13): the driver drops the GPU writes of a submission into a host import whose pages are
+    // partly read-only at vkQueueSubmit (about 1 in 12, no error), while an import that is uniformly
+    // read-only or read-write at the call is unaffected, also when its protection changes later
+    // (in flight or still queued). So every import is made uniform here, and the lock is held until
+    // EndSubmit, so no fault or host write opens a block during the call: the blocks opened since the
+    // last submission are re-armed (the submission consumes the dirty list), and an import holding
+    // memory that cannot be armed is opened as a whole.
+    // Only an import the submission stores through must be uniform (a read of a mixed import loses
+    // nothing: 0 of 60, and a store through its own uniform import over the same pages loses
+    // nothing: 0 of 120 fills, 0 of 120 shader stores, 2026-11-14). So the driver stores through
+    // small store imports of their own (RegisterImport with store set) and names the guest ranges
+    // each submission stores into: `stores` went through store imports, and only the groups of
+    // store imports holding them are made uniform (armed as a whole, or open as a whole). `regular`
+    // went through ordinary imports: every armed page of the import group holding them is opened
+    // for this submission. With all set the stores are unknown and every armed page inside any
+    // import is opened. An ordinary import is otherwise armed per block by the collects
+    // (armWalked) and may stay mixed.
+    void BeginSubmit(const std::pair<std::uint64_t, std::uint64_t>* stores, std::size_t count, const std::pair<std::uint64_t, std::uint64_t>* regular, std::size_t regularCount, bool all) {
+        mutex.lock();
+        ++submits;
+        if (anyPendingGpuWrites) countGpuWrites();
+        while (!hotRetries.empty() && hotRetries.begin()->first <= submits) {
+            const auto [from, to] = hotRetries.begin()->second;
+            hotRetries.erase(hotRetries.begin());
+            if (!overlapsStore(from, to)) continue;
+            forget(openImports, from, to);
+            if (walkProbe()) for (auto& cause : openCauses) forget(cause, from, to);
+            remember(unevenImports, from, to);
+        }
+        if (!protectTracking()) {
+            submitter.store(GetCurrentThreadId(), std::memory_order_release);
+            return;
+        }
+        try {
+            if (all) {
+                ++submitsAll;
+                std::vector<std::pair<std::uintptr_t, std::uintptr_t>> armed;
+                for (const auto& [start, end] : armedRanges) {
+                    if (overlapsImport(start, end)) armed.emplace_back(start, end);
+                }
+                for (const auto& [start, end] : armed) {
+                    regularOpened += end - start;
+                    openArmed(start, end);
+                }
+            } else {
+                if (count != 0 || regularCount != 0) ++submitsStoring;
+                for (std::size_t i = 0; i < regularCount; ++i) {
+                    auto from = static_cast<std::uintptr_t>(regular[i].first), to = static_cast<std::uintptr_t>(regular[i].second);
+                    if (from >= to || !importGroup(importExtents, longestImport, from, to)) continue;
+                    ++regularStores;
+                    if (!overlaps(armedRanges, from, to)) continue;
+                    ++regularOpens;
+                    auto it = armedRanges.lower_bound(from);
+                    if (it != armedRanges.begin() && std::prev(it)->second > from) --it;
+                    for (; it != armedRanges.end() && it->first < to; ++it) regularOpened += std::min(to, it->second) - std::max(from, it->first);
+                    openArmed(from, to);
+                }
+                for (std::size_t i = 0; i < count; ++i) {
+                    auto from = static_cast<std::uintptr_t>(stores[i].first), to = static_cast<std::uintptr_t>(stores[i].second);
+                    if (from >= to || !importGroup(storeExtents, longestStore, from, to)) continue;
+                    if (!overlaps(unevenImports, from, to)) continue;
+                    ++storeUniforms;
+                    uniform(from, to);
+                    forget(unevenImports, from, to);
+                }
+            }
+        } catch (...) {
+            mutex.unlock();
+            throw;
+        }
+        submitter.store(GetCurrentThreadId(), std::memory_order_release);
+    }
+
+    // Grows [from, to) to the group of the given imports overlapping it (the imports overlapping it,
+    // transitively). False when none overlaps it.
+    static bool importGroup(const std::multimap<std::uintptr_t, std::uintptr_t>& extents, std::uintptr_t longest, std::uintptr_t& from, std::uintptr_t& to) {
+        bool any = false;
+        for (bool grew = true; grew;) {
+            grew = false;
+            for (auto it = extents.lower_bound(from > longest ? from - longest : 0); it != extents.end() && it->first < to; ++it) {
+                if (it->second <= from) continue;
+                any = true;
+                if (it->first < from) from = it->first, grew = true;
+                if (it->second > to) to = it->second, grew = true;
+            }
+        }
+        return any;
+    }
+
+    void EndSubmit() {
+        submitter.store(0, std::memory_order_release);
+        mutex.unlock();
+    }
+
+    // Diagnostic only (APS5_WALK_PROBE with APS5_WALK_PROBE_GROUP_WALKS): the driver notes a guest
+    // range the GPU will write (label stores, storage write-backs, reach notes). The notes are
+    // charged to the next submission of any kind, per import group (printGpuWrites).
+    // kind: 0 own label store, 1 note on an in-flight batch, 2 storage target created, 3 write-back
+    // windows, 4 storage layers marked GPU-pending, 5 write-back layers, 6 a shader's bound storage
+    // writes, 7 reach (ranges an address-chasing shader could store into), 8 other command stores
+    // (fills, copies, metadata). Kinds 2, 4 and 7 are not counted as stores.
+    void GpuWrites(std::uintptr_t address, std::size_t bytes, unsigned kind) {
+        if (!groupWalkProbe() || bytes == 0 || kind >= GpuWriteKinds) return;
+        std::lock_guard lock(mutex);
+        ++gpuWriteNotes;
+        anyPendingGpuWrites = true;
+        remember(pendingGpuWrites[kind], address, address + bytes);
+    }
+
+    // A host import of the guest's own pages (no alias) was made: its extent is kept until
+    // ForgetImport (the import can outlive the guest range), because an import must be uniformly
+    // protected at each submission that stores through it (BeginSubmit). With store set it is a
+    // store import: the driver stores through it and names those stores. With used false the GPU
+    // has not used the import yet: its pages stay open until ImportUsed, as a first use over
+    // read-only pages loses the import's later writes where another import covers the same pages.
+    void RegisterImport(std::uintptr_t address, std::size_t bytes, bool used, bool store) {
+        if (bytes == 0) return;
+        std::lock_guard lock(mutex);
+        const auto from = address & ~std::uintptr_t{4095};
+        const auto to = (address + bytes + 4095) & ~std::uintptr_t{4095};
+        importExtents.emplace(from, to);
+        longestImport = std::max(longestImport, to - from);
+        if (store) {
+            storeExtents.emplace(from, to);
+            longestStore = std::max(longestStore, to - from);
+            remember(unevenImports, from, to);
+        }
+        if (!used) unusedImports.emplace(from, to);
+        openArmed(from, to);
+    }
+
+    // Changes whenever armed (CPU-clean) memory was opened; unchanged means no store landed in any
+    // memory that was armed at the earlier reading.
+    std::uint64_t ArmedOpens() const {
+        return armedOpens.load(std::memory_order_acquire);
+    }
+
+    void ImportUsed(std::uintptr_t address, std::size_t bytes) {
+        if (bytes == 0) return;
+        std::lock_guard lock(mutex);
+        const auto from = address & ~std::uintptr_t{4095};
+        const auto to = (address + bytes + 4095) & ~std::uintptr_t{4095};
+        eraseOwnedRange(unusedImports, from, to);
+        retryImports(from, to);
+    }
+
+    // The import registered with the same range was destroyed.
+    void ForgetImport(std::uintptr_t address, std::size_t bytes, bool store) {
+        if (bytes == 0) return;
+        std::lock_guard lock(mutex);
+        const auto from = address & ~std::uintptr_t{4095};
+        const auto to = (address + bytes + 4095) & ~std::uintptr_t{4095};
+        eraseOwnedRange(importExtents, from, to);
+        if (store) eraseOwnedRange(storeExtents, from, to);
+        if (groupProbe() || groupWalkProbe()) forget(probeGroups, from, to);
+        eraseOwnedRange(unusedImports, from, to);
+        retryImports(from, to);
+        if (!overlapsStore(from, to)) {
+            forget(openImports, from, to);
+            if (walkProbe()) for (auto& cause : openCauses) forget(cause, from, to);
+            forget(unevenImports, from, to);
+            forget(faultedBlocks, from, to);
+            groupHeat.erase(from);
+        }
+    }
+
+    // Whether no CPU write can have landed in [address, address + bytes) since its last resetting
+    // collect: the whole range is clean (armed private or resident memory, or protection-tracked
+    // shared views). A collect of such a range reports nothing, so callers may skip it.
+    bool Clean(std::uintptr_t address, std::size_t bytes) {
+        if (bytes == 0) return false;
+        std::lock_guard lock(mutex);
+        // Armed and clean only: shared views the write-watch model keeps clean are not walkable,
+        // and their collect must still answer as the walk does.
+        const auto from = address & ~std::uintptr_t{4095}, to = (address + bytes + 4095) & ~std::uintptr_t{4095};
+        return covered(armedRanges, from, to) && covered(cleanRanges, from, to);
+    }
+
+    struct ProtectCounts {
+        std::uint64_t walks = 0;
+        std::uint64_t armedRuns = 0;
+        std::uint64_t faults = 0;
+        std::uint64_t hotSkips = 0;
+        std::uint64_t raced = 0;
+        std::uint64_t armedBytes = 0;
+        std::uint64_t armedPieces = 0;
+        std::uint64_t submits = 0;
+        std::uint64_t submitArms = 0;
+        std::uint64_t importOpens = 0;
+    };
+
+    ProtectCounts ProtectCounted() {
+        std::lock_guard lock(mutex);
+        ProtectCounts counts{collectWalks, armRuns, armFaults, armHotSkips, armRaced, 0, armedRanges.size(), submits, submitArms, importOpens};
+        for (const auto& [start, end] : armedRanges) counts.armedBytes += end - start;
+        return counts;
     }
 
 #ifdef APS5_COUNT_MAPPING_QUERIES
@@ -676,7 +958,13 @@ public:
                 if (available == 0) return true;
                 const auto run = std::prev(residentRuns.upper_bound(cursor));
                 const auto stop = std::min({end, run->second.end, (cursor & ~std::uintptr_t{4095}) + available * 4096, nextClean == cleanRanges.end() ? end : nextClean->first});
+                // A resetting collect of everything settles each page it walks (a page never
+                // collected before is reported and marked collected), whatever the rest of the
+                // run still holds: the walked range can be armed.
+                const bool settled = collection == Collection::All;
                 collectResident(run->first, run->second, cursor, stop, pages, count, clear, collection);
+                if (walkProbe() && collection != Collection::Fresh) ++residentWalkWhy[!clear ? 0 : collection != Collection::All ? 1 : !settled ? 2 : 3];
+                if (clear && settled && protectTracking()) armWalked(cursor, stop);
                 if (*count == capacity) return true;
                 cursor = stop;
             } else if (found != views.end()) {
@@ -772,19 +1060,25 @@ public:
                 const auto stop = ownedPending.empty() ? std::min(end, allocationEnd) : std::min({end, allocationEnd, (cursor & ~std::uintptr_t{4095}) + (capacity - *count) * 4096});
                 const auto touched = (((stop + 4095) & ~static_cast<std::uintptr_t>(4095)) - (cursor & ~static_cast<std::uintptr_t>(4095))) / 4096;
                 ULONG_PTR available = std::min<ULONG_PTR>(capacity - *count, touched);
+                const auto requested = available;
                 DWORD granularity = 0;
 #ifdef APS5_COUNT_MAPPING_QUERIES
                 ++collectSystemCalls;
                 collectPieces += (stop + pageBytes - 1) / pageBytes - cursor / pageBytes;
 #endif
+                countWalk(cursor, stop, false);
                 const bool committed = !verifyDirect() || committedPrivate(cursor, stop);
                 if (collectOwnedWrites(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) {
                     const auto memory = query(cursor);
                     if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                     fail("collect private guest writes");
                 }
+                countHotResult(cursor, stop, available);
                 if (!committed) staleProof(cursor, stop);
                 *count += available;
+                // Arm only after a walk that reported every written page (a full buffer may have
+                // left some of the range unreset).
+                if (clear && collection == Collection::All && (available < requested || requested == touched) && protectTracking()) armWalked(cursor, stop);
                 if (*count == capacity) return true;
                 cursor = stop;
             }
@@ -828,7 +1122,8 @@ private:
         if (overlapsOwnedRange(ownedPins, block, end) || overlapsOwnedRange(ownedHostAccess, block, end)) return false;
         for (auto cursor = block; cursor < end;) {
             const auto memory = query(cursor);
-            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE || (memory.Protect != PAGE_READWRITE && memory.Protect != PAGE_EXECUTE_READWRITE)) return false;
+            const auto protect = memory.Protect == PAGE_READONLY && armedAt(cursor) ? PAGE_READWRITE : memory.Protect;
+            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE || (protect != PAGE_READWRITE && protect != PAGE_EXECUTE_READWRITE)) return false;
             const auto found = views.find(cursor & ~(pageBytes - 1));
             if (found != views.end()) {
                 const auto& view = found->second;
@@ -1044,6 +1339,15 @@ private:
         throw std::runtime_error(text);
     }
 
+    // End of the guest private allocation or resident run holding address, or 0.
+    std::uintptr_t guestAllocationEnd(std::uintptr_t address) const {
+        if (const auto end = privateAllocationEnd(address); end != 0) return end;
+        const auto next = residentRuns.upper_bound(address);
+        if (next == residentRuns.begin()) return 0;
+        const auto run = std::prev(next);
+        return address < run->second.end ? run->second.end : 0;
+    }
+
     std::uintptr_t privateAllocationEnd(std::uintptr_t address) const {
         const auto next = privateAllocations.upper_bound(address);
         if (next == privateAllocations.begin()) return 0;
@@ -1141,12 +1445,14 @@ private:
 
     void collectResident(std::uintptr_t start, Run& run, std::uintptr_t from, std::uintptr_t stop, void** pages, std::size_t* count, bool clear, Collection collection) {
         if (clear) run.reset = true;
+        countWalk(from, stop, collection == Collection::Fresh);
         const auto first = from & ~std::uintptr_t{4095};
         if (run.fresh == 0 && collection != Collection::Fresh) {
             ULONG_PTR reported = (stop - first + 4095) / 4096;
             DWORD granularity = 0;
             if (collectOwnedWrites(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, pages + *count, &reported, &granularity) != 0) fail("collect resident guest writes");
             for (ULONG_PTR index = 0; index < reported; ++index) pages[*count + index] = reinterpret_cast<void*>(std::max(from, reinterpret_cast<std::uintptr_t>(pages[*count + index])));
+            countHotResult(from, stop, reported);
             *count += reported;
             return;
         }
@@ -1158,6 +1464,7 @@ private:
             if (collectOwnedWrites(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, found.data(), &reported, &granularity) != 0) fail("collect resident guest writes");
             for (ULONG_PTR index = 0; index < reported; ++index) written.push_back(reinterpret_cast<std::uintptr_t>(found[index]));
         }
+        if (collection != Collection::Fresh) countHotResult(from, stop, written.size());
         auto next = written.begin();
         std::uintptr_t resetFrom = 0;
         const auto flushReset = [&](std::uintptr_t to) {
@@ -1468,8 +1775,649 @@ private:
         ranges.emplace(start, end);
     }
 
+    // Every armed range is also clean, so whatever ends a range's clean state (a fault, a host
+    // write, a pin, a protection change, a release) opens its armed part as well.
     void forgetClean(std::uintptr_t start, std::uintptr_t end) {
         forget(cleanRanges, start, end);
+        openArmed(start, end);
+    }
+
+    static std::atomic<bool>& writeFaultsHandled() {
+        static std::atomic<bool> handled{false};
+        return handled;
+    }
+
+    static bool protectTracking() {
+        static const bool off = std::getenv("APS5_NO_PROTECT_TRACKING") != nullptr;
+        return !off && writeFaultsHandled().load(std::memory_order_acquire);
+    }
+
+    static bool overlaps(const Ranges& ranges, std::uintptr_t start, std::uintptr_t end) {
+        if (ranges.empty() || end <= start) return false;
+        auto it = ranges.lower_bound(start);
+        if (it != ranges.begin() && std::prev(it)->second > start) return true;
+        return it != ranges.end() && it->first < end;
+    }
+
+    static bool covered(const Ranges& ranges, std::uintptr_t start, std::uintptr_t end) {
+        const auto next = ranges.upper_bound(start);
+        return next != ranges.begin() && std::prev(next)->second >= end;
+    }
+
+    bool armedAt(std::uintptr_t address) const {
+        if (armedRanges.empty()) return false;
+        const auto next = armedRanges.upper_bound(address);
+        return next != armedRanges.begin() && std::prev(next)->second > address;
+    }
+
+    // Whether [start, end) may be armed: not pinned, not inside an open host write or import, never
+    // mprotected by the guest, no owned-proof pages pending, and only resident views without pins,
+    // host writes or imports.
+    static bool walkProbe() {
+        static const bool enabled = std::getenv("APS5_WALK_PROBE") != nullptr;
+        return enabled;
+    }
+
+    static bool groupProbe() {
+        static const bool enabled = walkProbe() && std::getenv("APS5_WALK_PROBE_GROUPS") != nullptr;
+        return enabled;
+    }
+
+    static bool groupWalkProbe() {
+        static const bool enabled = walkProbe() && std::getenv("APS5_WALK_PROBE_GROUP_WALKS") != nullptr;
+        return enabled;
+    }
+
+    void countGroupWalk(std::uintptr_t from, std::uintptr_t to) {
+        auto group = probeGroups.lower_bound(from);
+        if (group != probeGroups.begin() && std::prev(group)->second > from) --group;
+        for (; group != probeGroups.end() && group->first < to; ++group) {
+            const auto start = std::max(from, group->first);
+            const auto end = std::min(to, group->second);
+            if (start >= end || !covered(openCauses[0], start, end)) continue;
+            auto& [walks, bytes] = groupWalks[*group];
+            ++walks;
+            bytes += end - start;
+        }
+    }
+
+    void printGroupWalks() {
+        using Row = std::pair<std::pair<std::uint64_t, std::uint64_t>, std::pair<std::uintptr_t, std::uintptr_t>>;
+        std::vector<Row> rows;
+        std::uint64_t walks = 0, bytes = 0;
+        for (const auto& [group, counts] : groupWalks) {
+            rows.emplace_back(counts, group);
+            walks += counts.first;
+            bytes += counts.second;
+        }
+        std::fprintf(stderr, "[group-walk] total touches %llu bytes %llu groups %zu\n",
+            static_cast<unsigned long long>(walks), static_cast<unsigned long long>(bytes), rows.size());
+        const auto report = [&](const char* order, auto compare) {
+            const auto n = std::min<std::size_t>(rows.size(), 12);
+            std::partial_sort(rows.begin(), rows.begin() + n, rows.end(), compare);
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto [counts, group] = rows[i];
+                std::fprintf(stderr, "[group-walk] %s %llx-%llx touches %llu bytes %llu\n", order,
+                    static_cast<unsigned long long>(group.first), static_cast<unsigned long long>(group.second),
+                    static_cast<unsigned long long>(counts.first), static_cast<unsigned long long>(counts.second));
+            }
+        };
+        report("by-touches", std::greater<>{});
+        report("by-bytes", [](const Row& left, const Row& right) { return left.first.second > right.first.second; });
+    }
+
+    struct GpuWriteGroup {
+        std::uint64_t submits = 0;
+        std::uint64_t whileHot = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t overflow = 0;
+        std::uint64_t kinds[9]{};
+        // Written ranges rounded to arm blocks, with how many submissions' notes named each.
+        std::map<std::pair<std::uintptr_t, std::uintptr_t>, std::uint64_t> ranges;
+    };
+
+    void countGpuWrites() {
+        ++gpuWriteSubmits;
+        anyPendingGpuWrites = false;
+        std::set<std::pair<std::uintptr_t, std::uintptr_t>> touched;
+        for (unsigned kind = 0; kind < GpuWriteKinds; ++kind) countGpuWriteKind(kind, touched);
+    }
+
+    void countGpuWriteKind(unsigned kind, std::set<std::pair<std::uintptr_t, std::uintptr_t>>& touched) {
+        std::set<std::pair<std::uintptr_t, std::uintptr_t>> touchedKind;
+        const bool stores = kind != 2 && kind != 4 && kind != 7;
+        for (const auto& [start, end] : pendingGpuWrites[kind]) {
+            auto from = start, to = end;
+            bool any = false;
+            for (bool grew = true; grew;) {
+                grew = false;
+                for (auto it = importExtents.lower_bound(from > longestImport ? from - longestImport : 0); it != importExtents.end() && it->first < to; ++it) {
+                    if (it->second <= from) continue;
+                    any = true;
+                    if (it->first < from) from = it->first, grew = true;
+                    if (it->second > to) to = it->second, grew = true;
+                }
+            }
+            if (!any) {
+                ++gpuWritesOutside;
+                gpuWriteOutsideBytes += end - start;
+                continue;
+            }
+            auto& group = gpuWriteGroups[{from, to}];
+            if (touchedKind.emplace(from, to).second) ++group.kinds[kind];
+            if (!stores) continue;
+            if (touched.emplace(from, to).second) {
+                ++group.submits;
+                if (overlaps(openCauses[0], from, to)) ++group.whileHot;
+            }
+            group.bytes += end - start;
+            const std::pair<std::uintptr_t, std::uintptr_t> key{start & ~(armBlockBytes - 1), (end + armBlockBytes - 1) & ~(armBlockBytes - 1)};
+            if (group.ranges.size() < 4096 || group.ranges.contains(key)) ++group.ranges[key];
+            else ++group.overflow;
+        }
+        pendingGpuWrites[kind].clear();
+    }
+
+    void printGpuWrites() {
+        std::fprintf(stderr, "[gpu-write] submissions %llu: stores unknown %llu, stores named %llu, store groups made uniform %llu, stores through ordinary imports %llu (%llu opened armed pages, %llu MiB opened with unknown stores), store imports %zu of %zu imports\n",
+            static_cast<unsigned long long>(submits), static_cast<unsigned long long>(submitsAll), static_cast<unsigned long long>(submitsStoring), static_cast<unsigned long long>(storeUniforms),
+            static_cast<unsigned long long>(regularStores), static_cast<unsigned long long>(regularOpens), static_cast<unsigned long long>(regularOpened >> 20u), storeExtents.size(), importExtents.size());
+        std::fprintf(stderr, "[gpu-write] notes %llu; %llu of %llu submissions carried notes; %llu ranges (%llu bytes) outside imports; groups %zu\n",
+            static_cast<unsigned long long>(gpuWriteNotes), static_cast<unsigned long long>(gpuWriteSubmits), static_cast<unsigned long long>(submits),
+            static_cast<unsigned long long>(gpuWritesOutside), static_cast<unsigned long long>(gpuWriteOutsideBytes), gpuWriteGroups.size());
+        using Group = std::pair<std::uintptr_t, std::uintptr_t>;
+        std::vector<std::pair<std::uint64_t, Group>> top;
+        for (const auto& [group, counts] : gpuWriteGroups) top.emplace_back(counts.submits + counts.kinds[4], group);
+        const auto n = std::min<std::size_t>(top.size(), 10);
+        std::partial_sort(top.begin(), top.begin() + n, top.end(), std::greater<>{});
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto [start, end] = top[i].second;
+            const auto& counts = gpuWriteGroups.at(top[i].second);
+            const auto base = start & ~(armBlockBytes - 1);
+            const auto capacity = static_cast<std::size_t>((end - 1) / armBlockBytes - start / armBlockBytes + 1);
+            std::vector<bool> written(capacity);
+            for (const auto& [range, count] : counts.ranges) {
+                for (auto block = std::max(range.first, base); block < range.second && (block - base) / armBlockBytes < capacity; block += armBlockBytes) written[(block - base) / armBlockBytes] = true;
+            }
+            std::size_t writtenBlocks = 0;
+            for (const bool bit : written) writtenBlocks += bit;
+            std::size_t faulted = 0, faultedWritten = 0;
+            std::uint64_t faults = 0, faultsWritten = 0;
+            for (const auto& [faultGroup, blocks] : groupFaultBlocks) {
+                if (faultGroup.first >= end || faultGroup.second <= start) continue;
+                for (const auto& [block, count] : blocks) {
+                    if (block < base || (block - base) / armBlockBytes >= capacity) continue;
+                    ++faulted;
+                    faults += count;
+                    if (written[(block - base) / armBlockBytes]) ++faultedWritten, faultsWritten += count;
+                }
+            }
+            std::fprintf(stderr, "[gpu-write] group %llx-%llx submissions %llu (%llu while hot-open) bytes %llu ranges %zu (+%llu uncounted) blocks written %zu/%zu; faulted blocks %zu, %zu of them written; faults %llu, %llu in written blocks; submissions by kind %llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu/%llu\n",
+                static_cast<unsigned long long>(start), static_cast<unsigned long long>(end), static_cast<unsigned long long>(counts.submits),
+                static_cast<unsigned long long>(counts.whileHot), static_cast<unsigned long long>(counts.bytes), counts.ranges.size(),
+                static_cast<unsigned long long>(counts.overflow), writtenBlocks, capacity, faulted, faultedWritten,
+                static_cast<unsigned long long>(faults), static_cast<unsigned long long>(faultsWritten),
+                static_cast<unsigned long long>(counts.kinds[0]), static_cast<unsigned long long>(counts.kinds[1]), static_cast<unsigned long long>(counts.kinds[2]),
+                static_cast<unsigned long long>(counts.kinds[3]), static_cast<unsigned long long>(counts.kinds[4]), static_cast<unsigned long long>(counts.kinds[5]),
+                static_cast<unsigned long long>(counts.kinds[6]), static_cast<unsigned long long>(counts.kinds[7]), static_cast<unsigned long long>(counts.kinds[8]));
+            std::vector<std::pair<std::uint64_t, Group>> ranges;
+            for (const auto& [range, count] : counts.ranges) ranges.emplace_back(count, range);
+            const auto m = std::min<std::size_t>(ranges.size(), 6);
+            std::partial_sort(ranges.begin(), ranges.begin() + m, ranges.end(), std::greater<>{});
+            for (std::size_t j = 0; j < m; ++j)
+                std::fprintf(stderr, "[gpu-write]   range block %llu + %llu blocks: %llu\n",
+                    static_cast<unsigned long long>((ranges[j].second.first - base) / armBlockBytes),
+                    static_cast<unsigned long long>((ranges[j].second.second - ranges[j].second.first) / armBlockBytes),
+                    static_cast<unsigned long long>(ranges[j].first));
+        }
+    }
+
+    // Submission counts (BeginSubmit): stores unknown, stores named, store groups made uniform,
+    // named stores through ordinary imports, those that opened armed pages, and the bytes opened
+    // for them and for unknown stores.
+    std::uint64_t submitsAll = 0;
+    std::uint64_t submitsStoring = 0;
+    std::uint64_t storeUniforms = 0;
+    std::uint64_t regularStores = 0;
+    std::uint64_t regularOpens = 0;
+    std::uint64_t regularOpened = 0;
+    static constexpr unsigned GpuWriteKinds = 9;
+    Ranges pendingGpuWrites[GpuWriteKinds];
+    bool anyPendingGpuWrites = false;
+    std::map<std::pair<std::uintptr_t, std::uintptr_t>, GpuWriteGroup> gpuWriteGroups;
+    std::uint64_t gpuWriteNotes = 0;
+    std::uint64_t gpuWriteSubmits = 0;
+    std::uint64_t gpuWritesOutside = 0;
+    std::uint64_t gpuWriteOutsideBytes = 0;
+
+    void countHotResult(std::uintptr_t from, std::uintptr_t to, std::size_t pages) {
+        if (!groupWalkProbe() || !covered(openCauses[0], from, to)) return;
+        ++hotResults;
+        if (pages == 0) ++hotEmptyResults;
+        hotResultPages += pages;
+        if ((hotResults & 0xffff) == 0)
+            std::fprintf(stderr, "[hot-result] walks %llu empty %llu pages %llu\n",
+                static_cast<unsigned long long>(hotResults), static_cast<unsigned long long>(hotEmptyResults),
+                static_cast<unsigned long long>(hotResultPages));
+    }
+
+    std::uint64_t hotResults = 0;
+    std::uint64_t hotEmptyResults = 0;
+    std::uint64_t hotResultPages = 0;
+
+    void printGroupFaults() {
+        using Group = std::pair<std::uintptr_t, std::uintptr_t>;
+        std::vector<std::pair<std::uint64_t, Group>> top;
+        std::uint64_t total = 0;
+        for (const auto& [group, blocks] : groupFaultBlocks) {
+            std::uint64_t faults = 0;
+            for (const auto& [block, count] : blocks) faults += count;
+            top.emplace_back(faults, group);
+            total += faults;
+        }
+        const auto n = std::min<std::size_t>(top.size(), 8);
+        std::partial_sort(top.begin(), top.begin() + n, top.end(), std::greater<>{});
+        std::fprintf(stderr, "[group-probe] mapped %llu unmapped %llu groups %zu\n",
+            static_cast<unsigned long long>(total), static_cast<unsigned long long>(unmappedGroupFaults), top.size());
+        for (std::size_t i = 0; i < n; ++i) {
+            const auto [faults, group] = top[i];
+            const auto& blocks = groupFaultBlocks.at(group);
+            std::vector<std::uint64_t> counts;
+            for (const auto& [block, count] : blocks) counts.push_back(count);
+            std::sort(counts.begin(), counts.end(), std::greater<>{});
+            std::uint64_t topEight = 0;
+            for (std::size_t j = 0; j < std::min<std::size_t>(8, counts.size()); ++j) topEight += counts[j];
+            const auto [start, end] = group;
+            const auto capacity = (end - 1) / armBlockBytes - start / armBlockBytes + 1;
+            std::fprintf(stderr, "[group-probe] group %llx-%llx faults %llu blocks %zu/%zu top8 %llu peak %llu\n",
+                static_cast<unsigned long long>(start), static_cast<unsigned long long>(end), static_cast<unsigned long long>(faults),
+                blocks.size(), static_cast<std::size_t>(capacity), static_cast<unsigned long long>(topEight), static_cast<unsigned long long>(counts.front()));
+        }
+    }
+
+    void countWalk(std::uintptr_t from, std::uintptr_t to, bool fresh) {
+        ++collectWalks;
+        if (!walkProbe()) return;
+        unsigned reason = 0;
+        if (fresh) reason = 8;
+        else if (overlaps(openImports, from, to)) {
+            unsigned matches = 0;
+            for (unsigned i = 0; i < openCauses.size(); ++i) {
+                if (overlaps(openCauses[i], from, to)) {
+                    ++matches;
+                    reason = i + 1;
+                }
+            }
+            if (matches != 1) reason = 4;
+        } else if (overlaps(unarmable, from, to) || overlapsOwnedRange(ownedPins, from, to) || overlapsOwnedRange(ownedHostAccess, from, to)) reason = 3;
+        else if (covered(armedRanges, from & ~std::uintptr_t{4095}, (to + 4095) & ~std::uintptr_t{4095})) reason = 5;
+        else if (overlaps(everArmed, from, to)) reason = 6;
+        else reason = 7;
+        ++walkCauses[reason];
+        if (reason == 7) {
+            // Why the walked range was never armed: it holds no whole page, a shared view covers
+            // it, its memory is not private read-write, its block is hot, or none of these.
+            const auto first = (from + 4095) & ~std::uintptr_t{4095}, last = to & ~std::uintptr_t{4095};
+            unsigned why = 4;
+            if (first >= last) why = 0;
+            else if (const auto view = views.lower_bound(first & ~(pageBytes - 1)); view != views.end() && view->first < last) {
+                // A view record covers it: not resident, pinned, inside a host write or import
+                // bracket, with owned-proof pages pending, hot, not private read-write, or none.
+                const auto& found = view->second;
+                const auto memory = query(first);
+                const auto strikes = armStrikes.find(first & ~(armBlockBytes - 1));
+                const auto pending = ownedPending.lower_bound(first & ~(ownedBlockBytes - 1));
+                why = !found.resident ? 1 : found.pins != 0 ? 5 : found.hostWrites != 0 ? 6 : found.hostImports != 0 ? 7 : pending != ownedPending.end() && pending->first < last ? 8
+                    : strikes != armStrikes.end() && strikes->second >= armHotLimit ? 9 : memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE || memory.Protect != PAGE_READWRITE ? 10 : 11;
+            } else if (const auto memory = query(first); memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE || memory.Protect != PAGE_READWRITE) why = 2;
+            else if (const auto strikes = armStrikes.find(first & ~(armBlockBytes - 1)); strikes != armStrikes.end() && strikes->second >= armHotLimit) why = 3;
+            ++neverArmedWhy[why];
+            neverArmedBytes[why] += to - from;
+        }
+        if (groupWalkProbe() && !fresh && overlaps(openCauses[0], from, to)) countGroupWalk(from, to);
+        if ((collectWalks & 0xffff) != 0) return;
+        std::fprintf(stderr, "[walk-probe] walks %llu unknown %llu hot %llu unused %llu refused %llu mixed-open %llu armed %llu previously-armed %llu never-armed %llu fresh %llu\n",
+            static_cast<unsigned long long>(collectWalks), static_cast<unsigned long long>(walkCauses[0]), static_cast<unsigned long long>(walkCauses[1]),
+            static_cast<unsigned long long>(walkCauses[2]), static_cast<unsigned long long>(walkCauses[3]), static_cast<unsigned long long>(walkCauses[4]),
+            static_cast<unsigned long long>(walkCauses[5]), static_cast<unsigned long long>(walkCauses[6]), static_cast<unsigned long long>(walkCauses[7]),
+            static_cast<unsigned long long>(walkCauses[8]));
+        std::fprintf(stderr, "[walk-probe] never-armed walks by cause (walks/MiB): no whole page %llu/%llu, shared view %llu/%llu, not private read-write %llu/%llu, hot block %llu/%llu, other %llu/%llu\n",
+            static_cast<unsigned long long>(neverArmedWhy[0]), static_cast<unsigned long long>(neverArmedBytes[0] >> 20u), static_cast<unsigned long long>(neverArmedWhy[1]), static_cast<unsigned long long>(neverArmedBytes[1] >> 20u),
+            static_cast<unsigned long long>(neverArmedWhy[2]), static_cast<unsigned long long>(neverArmedBytes[2] >> 20u), static_cast<unsigned long long>(neverArmedWhy[3]), static_cast<unsigned long long>(neverArmedBytes[3] >> 20u),
+            static_cast<unsigned long long>(neverArmedWhy[4]), static_cast<unsigned long long>(neverArmedBytes[4] >> 20u));
+        std::fprintf(stderr, "[walk-probe] never-armed walks of resident views (walks): pinned %llu, in a host write %llu, in a host import %llu, owned pages pending %llu, hot block %llu, not private read-write %llu, none of these %llu\n",
+            static_cast<unsigned long long>(neverArmedWhy[5]), static_cast<unsigned long long>(neverArmedWhy[6]), static_cast<unsigned long long>(neverArmedWhy[7]), static_cast<unsigned long long>(neverArmedWhy[8]),
+            static_cast<unsigned long long>(neverArmedWhy[9]), static_cast<unsigned long long>(neverArmedWhy[10]), static_cast<unsigned long long>(neverArmedWhy[11]));
+        std::fprintf(stderr, "[walk-probe] resident walks: not resetting %llu, armed-only collection %llu, run not settled %llu, offered for arming %llu; arm pieces: already armed %llu, open store group %llu, hot %llu, pinned %llu, host access or unused import %llu, unarmable %llu, owned pending %llu, view %llu, arm failed %llu, armed %llu\n",
+            static_cast<unsigned long long>(residentWalkWhy[0]), static_cast<unsigned long long>(residentWalkWhy[1]), static_cast<unsigned long long>(residentWalkWhy[2]), static_cast<unsigned long long>(residentWalkWhy[3]),
+            static_cast<unsigned long long>(armPieceWhy[0]), static_cast<unsigned long long>(armPieceWhy[1]), static_cast<unsigned long long>(armPieceWhy[2]), static_cast<unsigned long long>(armPieceWhy[3]),
+            static_cast<unsigned long long>(armPieceWhy[4]), static_cast<unsigned long long>(armPieceWhy[5]), static_cast<unsigned long long>(armPieceWhy[6]), static_cast<unsigned long long>(armPieceWhy[7]),
+            static_cast<unsigned long long>(armPieceWhy[8]), static_cast<unsigned long long>(armPieceWhy[9]));
+        const auto printTop = [](const char* name, const auto& histogram) {
+            std::vector<std::pair<std::uint64_t, std::uintptr_t>> top;
+            std::uint64_t total = 0;
+            for (const auto& [address, count] : histogram) {
+                top.emplace_back(count, address);
+                total += count;
+            }
+            const auto n = std::min<std::size_t>(top.size(), 8);
+            std::partial_sort(top.begin(), top.begin() + n, top.end(), std::greater<>{});
+            std::fprintf(stderr, "[walk-probe] %s unique %zu samples %llu", name, top.size(), static_cast<unsigned long long>(total));
+            for (std::size_t i = 0; i < n; ++i) {
+                const auto [count, address] = top[i];
+                char image[MAX_PATH]{};
+                MEMORY_BASIC_INFORMATION memory{};
+                if (name[0] == 'i' && VirtualQuery(reinterpret_cast<void*>(address), &memory, sizeof(memory)) != 0)
+                    GetModuleFileNameA(static_cast<HMODULE>(memory.AllocationBase), image, MAX_PATH);
+                std::fprintf(stderr, " 0x%llx=%llu[%s+0x%llx]", static_cast<unsigned long long>(address), static_cast<unsigned long long>(count),
+                    image, static_cast<unsigned long long>(memory.AllocationBase ? address - reinterpret_cast<std::uintptr_t>(memory.AllocationBase) : 0));
+            }
+            std::fprintf(stderr, "\n");
+        };
+        printTop("blocks", faultBlocks);
+        printTop("instructions", faultSites);
+        if (groupProbe()) printGroupFaults();
+        if (groupWalkProbe()) {
+            printGroupWalks();
+            printGroupFaults();
+            printGpuWrites();
+        }
+    }
+
+    bool armable(std::uintptr_t start, std::uintptr_t end) {
+        if (overlapsOwnedRange(ownedPins, start, end)) return refuse(0, start, end);
+        if (overlapsOwnedRange(ownedHostAccess, start, end) || overlapsOwnedRange(unusedImports, start, end)) return refuse(1, start, end);
+        if (overlaps(unarmable, start, end)) return refuse(2, start, end);
+        if (const auto pending = ownedPending.lower_bound(start & ~(ownedBlockBytes - 1)); pending != ownedPending.end() && pending->first < end) return refuse(3, start, end);
+        for (auto view = views.lower_bound(start & ~(pageBytes - 1)); view != views.end() && view->first < end; ++view) {
+            const auto& found = view->second;
+            if (!found.resident || found.pins != 0 || found.hostWrites != 0 || found.hostImports != 0) return refuse(4, start, end);
+        }
+        return true;
+    }
+
+    // Probe: bytes refused per reason (pins, open host access, unarmable, owned pending, views),
+    // printed with APS5_PROTECT_PROBE=1 every 2^16 refusals.
+    static bool protectProbe() {
+        static const bool probe = std::getenv("APS5_PROTECT_PROBE") != nullptr;
+        return probe;
+    }
+
+    bool refuse(int reason, std::uintptr_t start, std::uintptr_t end) {
+        groupRefusal = reason + 1;
+        if (!protectProbe()) return false;
+        refusedBytes[reason] += end - start;
+        if ((++refusals & 0xffff) == 0) {
+            std::uint64_t unarmableBytes = 0;
+            for (const auto& [from, to] : unarmable) unarmableBytes += to - from;
+            std::fprintf(stderr, "[protect] refused MiB: pins %.0f host %.0f unarmable %.0f pending %.0f views %.0f; unarmable ranges %zu (%.0f MiB)\n", refusedBytes[0] / 1048576.0, refusedBytes[1] / 1048576.0, refusedBytes[2] / 1048576.0, refusedBytes[3] / 1048576.0, refusedBytes[4] / 1048576.0, unarmable.size(), unarmableBytes / 1048576.0);
+        }
+        return false;
+    }
+    std::array<std::uint64_t, 5> refusedBytes{};
+    std::uint64_t refusals = 0;
+
+    // A range a resetting collect just walked under the lock: its armed part had no store since (a
+    // store faults first), so it becomes clean. Unarmed, armable memory outside imports is armed; a
+    // block that faulted recently (strikes at or above armHotLimit) stays CPU-dirty, and each attempt
+    // wears a strike off. Memory inside imports is armed the same way (a store import left uneven
+    // is made uniform at its next storing submission), except inside a store group opened as a
+    // whole, which stays open until it is retried.
+    void armWalked(std::uintptr_t from, std::uintptr_t to) {
+        from = (from + 4095) & ~std::uintptr_t{4095};
+        to &= ~std::uintptr_t{4095};
+        if (from >= to) return;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+        auto armed = armedRanges.upper_bound(from);
+        if (armed != armedRanges.begin() && std::prev(armed)->second > from) --armed;
+        for (auto cursor = from; cursor < to;) {
+            if (armed != armedRanges.end() && armed->first <= cursor) {
+                const auto armedEnd = std::min(to, armed->second);
+                if (cursor < armedEnd) remember(cleanRanges, cursor, armedEnd);
+                ++armPieceWhy[0];
+                cursor = std::max(cursor, armed->second);
+                ++armed;
+                continue;
+            }
+            const auto gapEnd = armed == armedRanges.end() ? to : std::min(to, armed->first);
+            const bool openGroups = overlaps(openImports, cursor, gapEnd);
+            while (cursor < gapEnd) {
+                const auto block = cursor & ~(armBlockBytes - 1);
+                const auto pieceEnd = std::min(gapEnd, block + armBlockBytes);
+                if (openGroups && overlaps(openImports, cursor, pieceEnd)) {
+                    ++armPieceWhy[1];
+                    cursor = pieceEnd;
+                    continue;
+                }
+                bool eligible = true;
+                if (const auto strikes = armStrikes.find(block); strikes != armStrikes.end()) {
+                    eligible = strikes->second < armHotLimit;
+                    if (--strikes->second == 0) armStrikes.erase(strikes);
+                    if (!eligible) ++armHotSkips, ++armPieceWhy[2];
+                }
+                if (eligible) {
+                    if (armable(cursor, pieceEnd)) {
+                        if (!runs.empty() && runs.back().second == cursor) runs.back().second = pieceEnd;
+                        else runs.emplace_back(cursor, pieceEnd);
+                    } else ++armPieceWhy[2 + std::clamp(groupRefusal, 1, 5)];
+                }
+                cursor = pieceEnd;
+            }
+        }
+        for (const auto& [start, end] : runs) ++armPieceWhy[armRun(start, end) ? 9 : 8];
+    }
+
+    // Whether [start, end) holds committed private read-write memory only (what armRun arms).
+    bool armablePrivate(std::uintptr_t start, std::uintptr_t end) {
+        for (auto at = start; at < end;) {
+            const auto memory = query(at);
+            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE || memory.Protect != PAGE_READWRITE) return false;
+            at = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+        }
+        return true;
+    }
+
+    // Arms [start, end) read-only. With walked set, a resetting collect has just walked it and it
+    // becomes clean unless a store landed after the walk's reset (it is then armed but not clean,
+    // and the next walk consumes the store). Without, it is armed and not clean: its stores since the
+    // last walk are still in the write watch.
+    bool armRun(std::uintptr_t start, std::uintptr_t end, bool walked = true) {
+        if (!armablePrivate(start, end)) return false;
+        // Recorded before the protection changes: a store faulting meanwhile waits for the lock and
+        // then finds the block armed and resumes.
+        remember(armedRanges, start, end);
+        DWORD previous;
+        if (!VirtualProtect(reinterpret_cast<void*>(start), end - start, PAGE_READONLY, &previous)) {
+            groupError = GetLastError();
+            forget(armedRanges, start, end);
+            return false;
+        }
+        noteUneven(start, end);
+        ++armRuns;
+        if (walkProbe()) remember(everArmed, start, end);
+        if (protectTrace()) std::fprintf(stderr, "[protect] arm 0x%llx-0x%llx%s\n", static_cast<unsigned long long>(start), static_cast<unsigned long long>(end), walked ? "" : " (submission)");
+        if (!walked) return true;
+        void* written[1]{};
+        ULONG_PTR reported = 1;
+        DWORD granularity = 0;
+        if (GetWriteWatch(0, reinterpret_cast<void*>(start), end - start, written, &reported, &granularity) != 0 || reported != 0) {
+            ++armRaced;
+            return true;
+        }
+        remember(cleanRanges, start, end);
+        return true;
+    }
+
+    bool overlapsImport(std::uintptr_t start, std::uintptr_t end) const {
+        for (auto it = importExtents.lower_bound(start > longestImport ? start - longestImport : 0); it != importExtents.end() && it->first < end; ++it) {
+            if (it->second > start) return true;
+        }
+        return false;
+    }
+
+    bool overlapsStore(std::uintptr_t start, std::uintptr_t end) const {
+        for (auto it = storeExtents.lower_bound(start > longestStore ? start - longestStore : 0); it != storeExtents.end() && it->first < end; ++it) {
+            if (it->second > start) return true;
+        }
+        return false;
+    }
+
+    void noteUneven(std::uintptr_t start, std::uintptr_t end) {
+        if (overlapsStore(start, end)) remember(unevenImports, start, end);
+    }
+
+    // A cause that kept an import group open (a pin, an open host access) ended in [start, end):
+    // the next submission tries to arm the group again.
+    void retryImports(std::uintptr_t start, std::uintptr_t end) {
+        if (!overlaps(openImports, start, end)) return;
+        auto it = openImports.lower_bound(start);
+        if (it != openImports.begin() && std::prev(it)->second > start) --it;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> groups;
+        for (; it != openImports.end() && it->first < end; ++it) groups.emplace_back(*it);
+        for (const auto& [from, to] : groups) {
+            forget(openImports, from, to);
+            if (walkProbe()) for (auto& cause : openCauses) forget(cause, from, to);
+            remember(unevenImports, from, to);
+        }
+    }
+
+    // Makes the group of store imports overlapping [start, end) (those overlapping it,
+    // transitively) uniform: all armed, or, when some committed page in it cannot be armed, all open.
+    void uniform(std::uintptr_t start, std::uintptr_t end) {
+        auto from = start, to = end;
+        if (!importGroup(storeExtents, longestStore, from, to)) return;
+        if (groupProbe() || groupWalkProbe()) {
+            forget(probeGroups, from, to);
+            probeGroups.insert_or_assign(from, to);
+        }
+        groupRefusal = 0;
+        const bool wasOpen = overlaps(openImports, from, to);
+        // A group whose blocks fault again soon after each arming costs more armed than walked: it
+        // stays CPU-dirty as a whole (uniform read-write) and is retried later, each time later.
+        const bool faulted = overlaps(faultedBlocks, from, to);
+        if (faulted) forget(faultedBlocks, from, to);
+        auto heat = groupHeat.find(from);
+        if (faulted && !wasOpen) {
+            if (heat == groupHeat.end()) heat = groupHeat.emplace(from, GroupHeat{}).first;
+            auto& entry = heat->second;
+            if (entry.armed != 0 && submits - entry.armed < hotSubmits) entry.strikes = static_cast<std::uint8_t>(std::min(255, entry.strikes + 1));
+            else if (entry.strikes != 0) --entry.strikes;
+            if (entry.strikes >= hotStrikes && !groupProbe()) {
+                const auto wait = (hotSubmits * 2) << std::min<unsigned>(entry.strikes - hotStrikes, 6);
+                hotRetries.emplace(submits + wait, std::pair{from, to});
+                ++hotGroups;
+                if (groupWalkProbe() && to - from >= 64ull * 1024 * 1024) {
+                    const auto found = groupFaultBlocks.find({from, to});
+                    std::fprintf(stderr, "[group-trigger] %llx-%llx strikes %u blocks %zu\n",
+                        static_cast<unsigned long long>(from), static_cast<unsigned long long>(to), static_cast<unsigned>(entry.strikes),
+                        found == groupFaultBlocks.end() ? 0 : found->second.size());
+                    if (found != groupFaultBlocks.end()) {
+                        for (const auto& [block, count] : found->second)
+                            std::fprintf(stderr, "[group-trigger-block] %llx %llu\n", static_cast<unsigned long long>(block), static_cast<unsigned long long>(count));
+                    }
+                    for (auto it = importExtents.lower_bound(from > longestImport ? from - longestImport : 0);
+                         it != importExtents.end() && it->first < to; ++it) {
+                        if (it->second > from)
+                            std::fprintf(stderr, "[group-trigger-import] %llx-%llx\n", static_cast<unsigned long long>(it->first), static_cast<unsigned long long>(it->second));
+                    }
+                }
+                if (protectProbe() && groupReports++ < 400) std::fprintf(stderr, "[protect] import group 0x%llx+%.1f MiB stays open: hot (strikes %u, retried in %llu submissions)\n", static_cast<unsigned long long>(from), (to - from) / 1048576.0, static_cast<unsigned>(entry.strikes), static_cast<unsigned long long>(wait));
+                remember(openImports, from, to);
+                if (walkProbe()) remember(openCauses[0], from, to);
+                if (overlaps(armedRanges, from, to)) openArmed(from, to);
+                return;
+            }
+        }
+        if (!wasOpen && armGroup(from, to)) {
+            if (heat != groupHeat.end()) heat->second.armed = submits;
+            return;
+        }
+        remember(openImports, from, to);
+        if (walkProbe() && !wasOpen) {
+            const bool unused = groupRefusal == 2 && overlapsOwnedRange(unusedImports, from, to);
+            const bool host = overlapsOwnedRange(ownedHostAccess, from, to);
+            remember(openCauses[unused && !host ? 1 : 2], from, to);
+        }
+        if (protectProbe() && !wasOpen && groupReports++ < 400) {
+            // Reasons: 1 pin, 2 open host access or unused import, 3 unarmable, 4 owned pending,
+            // 5 shared view, 6 not a guest allocation, 7 not private read-write, 8 protect failed.
+            std::uint64_t openBytes = 0;
+            for (const auto& [start, stop] : openImports) openBytes += stop - start;
+            const auto memory = query(groupRefusalAt);
+            std::fprintf(stderr, "[protect] import group 0x%llx+%.1f MiB stays open: reason %d at 0x%llx (state 0x%lx type 0x%lx protect 0x%lx); open groups hold %.0f MiB, %zu imports, %zu unused, %zu host accesses, %zu pins, error %lu\n", static_cast<unsigned long long>(from), (to - from) / 1048576.0, groupRefusal, static_cast<unsigned long long>(groupRefusalAt), memory.State, memory.Type, memory.Protect, openBytes / 1048576.0, importExtents.size(), unusedImports.size(), ownedHostAccess.size(), ownedPins.size(), groupError);
+        }
+        if (!overlaps(armedRanges, from, to)) return;
+        ++importOpens;
+        if (protectTrace()) std::fprintf(stderr, "[protect] open import group 0x%llx-0x%llx\n", static_cast<unsigned long long>(from), static_cast<unsigned long long>(to));
+        openArmed(from, to);
+    }
+
+    // Arms every unarmed committed page of [from, to), or nothing when one of them cannot be armed.
+    // Pages not committed are left (they hold no imported memory).
+    bool armGroup(std::uintptr_t from, std::uintptr_t to) {
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+        std::uintptr_t runAllocation = 0;
+        auto armed = armedRanges.upper_bound(from);
+        if (armed != armedRanges.begin() && std::prev(armed)->second > from) --armed;
+        for (auto cursor = from; cursor < to;) {
+            if (armed != armedRanges.end() && armed->first <= cursor) {
+                cursor = std::max(cursor, armed->second);
+                ++armed;
+                continue;
+            }
+            const auto gapEnd = armed == armedRanges.end() ? to : std::min(to, armed->first);
+            while (cursor < gapEnd) {
+                const auto memory = query(cursor);
+                auto regionEnd = std::min(gapEnd, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                if (memory.State == MEM_COMMIT) {
+                    // Only guest allocations are armed: an import of host memory (driver pools,
+                    // test buffers) has no fault handling for its writers, so its group stays open.
+                    const auto guestEnd = guestAllocationEnd(cursor);
+                    groupRefusalAt = cursor;
+                    if (guestEnd == 0) return groupRefusal = 6, false;
+                    regionEnd = std::min(regionEnd, guestEnd);
+                    if (memory.Type != MEM_PRIVATE || memory.Protect != PAGE_READWRITE) return groupRefusal = 7, false;
+                    if (!armable(cursor, regionEnd)) return false;
+                    // A protection change cannot span two allocations: runs join only inside one.
+                    const auto allocation = reinterpret_cast<std::uintptr_t>(memory.AllocationBase);
+                    if (!runs.empty() && runs.back().second == cursor && runAllocation == allocation) runs.back().second = regionEnd;
+                    else runs.emplace_back(cursor, regionEnd);
+                    runAllocation = allocation;
+                }
+                cursor = regionEnd;
+            }
+        }
+        for (const auto& [start, end] : runs) {
+            if (!armRun(start, end, false)) return groupRefusalAt = start, groupRefusal = 8, false;
+            submitArms += end - start;
+        }
+        return true;
+    }
+
+    static bool protectTrace() {
+        static const bool trace = std::getenv("APS5_PROTECT_TRACE") != nullptr;
+        return trace;
+    }
+
+    void openArmed(std::uintptr_t start, std::uintptr_t end) {
+        if (!overlaps(armedRanges, start, end)) return;
+        armedOpens.fetch_add(1, std::memory_order_release);
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> opened;
+        auto it = armedRanges.lower_bound(start);
+        if (it != armedRanges.begin() && std::prev(it)->second > start) --it;
+        for (; it != armedRanges.end() && it->first < end; ++it) opened.emplace_back(std::max(start, it->first), std::min(end, it->second));
+        forget(armedRanges, start, end);
+        for (const auto& [from, to] : opened) {
+            forget(cleanRanges, from, to);
+            noteUneven(from, to);
+            for (auto at = from; at < to;) {
+                const auto memory = query(at);
+                const auto regionEnd = std::min(to, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                DWORD previous;
+                if (memory.State == MEM_COMMIT && memory.Protect == PAGE_READONLY && !VirtualProtect(reinterpret_cast<void*>(at), regionEnd - at, PAGE_READWRITE, &previous)) fail("open armed guest memory");
+                at = regionEnd;
+            }
+        }
     }
 
     void rememberClean(std::uintptr_t start, std::uintptr_t end) {
@@ -1577,6 +2525,8 @@ private:
         const auto end = address + bytes;
         privateAllocations.erase(privateAllocations.lower_bound(address), privateAllocations.lower_bound(end));
         forgetClean(address, end);
+        forget(unarmable, address, end);
+        if (walkProbe()) forget(everArmed, address, end);
         breakRun(address);
         breakRun(end);
         breakView(address);
@@ -1673,8 +2623,69 @@ private:
     std::map<std::uintptr_t, std::uint16_t> ownedPending;
     OwnedRanges ownedPins;
     OwnedRanges ownedHostAccess;
+    // Registered imports the GPU has not used yet (RegisterImport).
+    OwnedRanges unusedImports;
+    // Probe (APS5_PROTECT_PROBE): why the last import group could not be armed, and where.
+    int groupRefusal = 0;
+    std::uintptr_t groupRefusalAt = 0;
+    std::uint64_t groupReports = 0;
+    DWORD groupError = 0;
     std::uint64_t nextOwned = 1;
     Ranges cleanRanges;
+    static constexpr std::uintptr_t armBlockBytes = 0x10000;
+    static constexpr std::uint8_t armHotLimit = 8;
+    static constexpr int armFaultStrikes = 16;
+    Ranges armedRanges;
+    Ranges unarmable;
+    // Times armed memory was opened (a fault, a host write, a pin, an import): read without the
+    // lock by ArmedOpens.
+    std::atomic<std::uint64_t> armedOpens{0};
+    std::multimap<std::uintptr_t, std::uintptr_t> importExtents;
+    std::uintptr_t longestImport = 0;
+    // The store imports among them (RegisterImport with store set).
+    std::multimap<std::uintptr_t, std::uintptr_t> storeExtents;
+    std::uintptr_t longestStore = 0;
+    // Ranges whose armed state changed inside a store import since it was last made uniform
+    // (BeginSubmit), and store groups found unarmable or hot (opened; retried once a cause ends).
+    Ranges unevenImports;
+    Ranges openImports;
+    std::array<Ranges, 3> openCauses;
+    Ranges everArmed;
+    Ranges probeGroups;
+    std::map<std::pair<std::uintptr_t, std::uintptr_t>, std::pair<std::uint64_t, std::uint64_t>> groupWalks;
+    std::map<std::pair<std::uintptr_t, std::uintptr_t>, std::map<std::uintptr_t, std::uint64_t>> groupFaultBlocks;
+    std::uint64_t unmappedGroupFaults = 0;
+    std::array<std::uint64_t, 9> walkCauses{};
+    std::array<std::uint64_t, 12> neverArmedWhy{};
+    std::array<std::uint64_t, 12> neverArmedBytes{};
+    // Probe: resident walks by what kept them from arming, and armWalked pieces by outcome.
+    std::array<std::uint64_t, 4> residentWalkWhy{};
+    std::array<std::uint64_t, 10> armPieceWhy{};
+    std::map<std::uintptr_t, std::uint64_t> faultBlocks;
+    std::map<std::uintptr_t, std::uint64_t> faultSites;
+    std::atomic<DWORD> submitter{0};
+    std::uint64_t submits = 0;
+    std::uint64_t submitArms = 0;
+    std::uint64_t importOpens = 0;
+    // Import groups (by start) that faulted after an arming: when they were last armed and how
+    // often they faulted again within hotSubmits submissions; blocks inside imports that faulted
+    // since their group was last made uniform; hot groups by the submission that retries them.
+    struct GroupHeat {
+        std::uint64_t armed = 0;
+        std::uint8_t strikes = 0;
+    };
+    static constexpr std::uint64_t hotSubmits = 256;
+    static constexpr std::uint8_t hotStrikes = 3;
+    std::unordered_map<std::uintptr_t, GroupHeat> groupHeat;
+    Ranges faultedBlocks;
+    std::multimap<std::uint64_t, std::pair<std::uintptr_t, std::uintptr_t>> hotRetries;
+    std::uint64_t hotGroups = 0;
+    std::unordered_map<std::uintptr_t, std::uint8_t> armStrikes;
+    std::uint64_t collectWalks = 0;
+    std::uint64_t armRuns = 0;
+    std::uint64_t armFaults = 0;
+    std::uint64_t armHotSkips = 0;
+    std::uint64_t armRaced = 0;
     Ranges collectableRanges;
     Ranges privateAllocations;
 #ifdef APS5_COUNT_MAPPING_QUERIES

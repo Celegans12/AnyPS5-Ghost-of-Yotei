@@ -667,8 +667,60 @@ void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t byt
     noteAccess(reinterpret_cast<const void*>(address), bytes);
 }
 
-bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
-    return WindowsMappings::Get().HandleWrite(address);
+bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address, std::uintptr_t instruction) {
+    return WindowsMappings::Get().HandleWrite(address, instruction);
+}
+
+bool GuestArenaClean_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().Clean(address, bytes);
+}
+
+void GuestArenaBeginSubmit_nid_no_patch(const std::pair<std::uint64_t, std::uint64_t>* stores, std::size_t count, const std::pair<std::uint64_t, std::uint64_t>* regular, std::size_t regularCount, bool all) {
+    WindowsMappings::Get().BeginSubmit(stores, count, regular, regularCount, all);
+}
+
+void GuestArenaEndSubmit_nid_no_patch() {
+    WindowsMappings::Get().EndSubmit();
+}
+
+void GuestArenaGpuWrites_nid_no_patch(std::uintptr_t address, std::size_t bytes, unsigned kind) {
+    WindowsMappings::Get().GpuWrites(address, bytes, kind);
+}
+
+void GuestArenaRegisterImport_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool used, bool store) {
+    WindowsMappings::Get().RegisterImport(address, bytes, used, store);
+}
+
+void GuestArenaImportUsed_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().ImportUsed(address, bytes);
+}
+
+void GuestArenaForgetImport_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool store) {
+    WindowsMappings::Get().ForgetImport(address, bytes, store);
+}
+
+std::uint64_t GuestArenaArmedOpens_nid_no_patch() {
+    return WindowsMappings::Get().ArmedOpens();
+}
+
+bool GuestArenaArming_nid_no_patch() {
+    return WindowsMappings::Arming();
+}
+
+void GuestArenaNeverArm_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().NeverArm(address, bytes);
+}
+
+void GuestArenaEnableWriteFaults_nid_no_patch() {
+    WindowsMappings::EnableWriteFaults();
+}
+
+std::size_t GuestArenaProtectCounts_nid_no_patch(std::uint64_t* values, std::size_t count) {
+    const auto counts = WindowsMappings::Get().ProtectCounted();
+    const std::uint64_t all[] = {counts.walks, counts.armedRuns, counts.faults, counts.hotSkips, counts.raced, counts.armedBytes, counts.armedPieces, counts.submits, counts.submitArms, counts.importOpens};
+    const auto written = std::min(count, std::size(all));
+    std::copy_n(all, written, values);
+    return written;
 }
 
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {

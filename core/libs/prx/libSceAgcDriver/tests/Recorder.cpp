@@ -4445,6 +4445,11 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
             if (overElement && staged) {
                 Require(range.begin == element && range.end == element + elementBytes && !inImport, "the staged element's BDA range does not send its addresses to the shadow");
                 Require((range.permissions & ShaderRecompiler::BdaAbi::Write) != 0u, "the staged element's BDA range is not writable");
+            } else if (overElement && !inImport) {
+                // Not staged: where the arena arms the import's pages (section A), the written
+                // element is bound in place through a store import of its own.
+                const auto* store = StoreImportFor(context, range.begin, static_cast<std::size_t>(range.end - range.begin));
+                Require(store != nullptr && store->store && range.deviceAddress == store->address + (range.begin - store->base), "the written element's BDA range left the import and its store import");
             } else {
                 Require(inImport, "a BDA range outside the staged element left the import");
             }
@@ -4501,7 +4506,11 @@ bool bdaStagingTests(const Device& device, Recorder& recorder) {
         memory.Upload(true);
         checkTable(memory.AddressRanges(), false);
         std::uint32_t adjustment = 0;
-        Require(memory.Descriptor(element, elementBytes, adjustment).buffer == importBuffer, "an element crossed by an in-place read was staged");
+        // In place: through the import, or through the element's store import where the arena
+        // arms the import's pages (section A).
+        const auto bound = memory.Descriptor(element, elementBytes, adjustment).buffer;
+        const auto* store = StoreImportFor(context, element, elementBytes);
+        Require(bound == importBuffer || (store != nullptr && store->store && bound == store->buffer), "an element crossed by an in-place read was staged");
         memory.RecordCopyBacks(recorder);
         recorder.Sync();
         memory.WriteBack();

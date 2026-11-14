@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
@@ -3076,7 +3077,7 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
-    const auto* import = Graphics::HostImportFor(context, address, bytes.size());
+    const auto* import = Graphics::StoreImportFor(context, address, bytes.size());
     const bool listed = !state->copiedWriters->empty() || !Graphics::DrawCopiedWriters()->empty();
     const bool storesPending = Graphics::Recorder::PendingCompletionStores() != 0;
     const auto unregistered = import == nullptr && !listed && !storesPending ? Graphics::UnregisteredHostImport(context, address, bytes.size()) : nullptr;
@@ -3118,6 +3119,8 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     if (drain) {
         if (listed) return 2;
     } else if (bytes.size() <= 8 ? (listed || storesPending) : (storesPending && recorder.CompletionLabelIn(address, bytes.size()))) {
+        // Stored by the CPU at the reap: no import is stored through.
+        const Graphics::Recorder::DedicatedStores dedicated(true);
         recorder.AfterCompletions(address, bytes, stamp, queue, false);
         return 5;
     }
@@ -3141,12 +3144,14 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
         recordStore();
         // Commands() opened the batch the store went into, so the completion is appended to that
         // batch and runs at its reap, after the write-backs of every batch before it.
+        const Graphics::Recorder::DedicatedStores dedicated(import->store);
         recorder.AfterCompletions(address, bytes, stamp, queue, true);
         GuestMemory::MarkWritten(address, bytes.size());
         return 5;
     }
     recordStore();
     // The table entry and the label's own pending-write note (Recorder::NoteLabel).
+    const Graphics::Recorder::DedicatedStores dedicated(import->store);
     recorder.NoteLabel(address, bytes, stamp, queue);
     GuestMemory::MarkWritten(address, bytes.size());
     // No submit per label: the batch goes out at the queue worker's next non-label packet, at a
@@ -3177,12 +3182,13 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     if (state->CopiedWriterOverlaps(address, bytes) || (Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.CompletionLabelIn(address, bytes))) return false;
     const auto context = graphicsContext();
     Graphics::StorageTexture::FlushPending(address, bytes, nullptr, "occlusion counter dump", Graphics::PublishScope::PartialUnits);
-    const auto* import = Graphics::HostImportFor(context, address, bytes);
+    const auto* import = Graphics::StoreImportFor(context, address, bytes);
     if (import == nullptr || import->address == 0) return false;
     if (Graphics::AnyShadowedOverlaps(address, bytes)) Graphics::PublishShadow(address, bytes, Graphics::PublishScope::PartialUnits, Graphics::PublishReason::Label);
     if (!recorder.QueuesSampleDumps()) recorder.FlushStoresOverlapping(address, bytes);
     recorder.FlushKeyStoresOverlapping(address, bytes);
     if (!recorder.DumpSamples(import->address + (address - import->base), address)) return false;
+    const Graphics::Recorder::DedicatedStores dedicated(import->store);
     recorder.NotePendingWrite(address, bytes);
     GuestMemory::MarkWritten(address, bytes);
     return true;
@@ -3197,7 +3203,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     // import table. Debug aid: APS5_NO_OPPORTUNISTIC_REAP=1 skips it.
     if (OpportunisticReap()) recorder.Reap();
     const auto context = graphicsContext();
-    const Graphics::HostImport* import = Graphics::HostImportFor(context, address, bytes);
+    const Graphics::HostImport* import = Graphics::StoreImportFor(context, address, bytes);
     if (import == nullptr) return false;
     // Earlier recorded work that stores into the range must land before the fill, or it would
     // overwrite the fill later. Stores the GPU makes (direct dispatch writes, GPU labels, earlier
@@ -3251,7 +3257,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
             syncedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - syncStart).count();
             // The sync ran completions, whose write-backs can refresh the import table and retire
             // the import looked up above; the caller stores the fill itself when it is gone.
-            import = Graphics::HostImportFor(context, address, bytes);
+            import = Graphics::StoreImportFor(context, address, bytes);
             if (import == nullptr) return false;
         } else {
             ++ordered;
@@ -3376,8 +3382,11 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     recorder.EndGpuTiming(timing, bytes);
     recorder.MarkCovered(filledAccess);
     phase(recordMs);
-    if (uniform) recorder.NotePendingWordFill(address, bytes, pattern[0]);
-    else recorder.NotePendingWrite(address, bytes);
+    {
+        const Graphics::Recorder::DedicatedStores dedicated(import->store);
+        if (uniform) recorder.NotePendingWordFill(address, bytes, pattern[0]);
+        else recorder.NotePendingWrite(address, bytes);
+    }
     const auto generation = GuestMemory::MarkWritten(address, bytes);
     if (elideRepeats && generation != 0) {
         constexpr std::size_t RepeatedFillsKept = 256;
@@ -3615,7 +3624,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     Graphics::StorageTexture::FlushPending(destination, bytes, nullptr, "buffer copy destination", Graphics::PublishScope::PartialUnits);
     // Looked up after the sync (its completions' write-backs can refresh the import table and
     // retire an import) and the flushes (which may import memory themselves).
-    const Graphics::HostImport* destinationImport = Graphics::HostImportFor(context, destination, bytes);
+    const Graphics::HostImport* destinationImport = Graphics::StoreImportFor(context, destination, bytes);
     const Graphics::HostImport* sourceImport = destinationImport != nullptr ? Graphics::HostImportFor(context, source, bytes) : nullptr;
     if (destinationImport == nullptr || sourceImport == nullptr) return outcome;
     using CommandClass = Graphics::Recorder::CommandClass;
@@ -3655,7 +3664,10 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     recorder.MarkCovered(copiedAccess);
     recorder.NotePendingRead(source, bytes, Graphics::Recorder::ReadKind::CopySource);
     GuestMemory::MarkWritten(destination, bytes);
-    recorder.NotePendingWrite(destination, bytes);
+    {
+        const Graphics::Recorder::DedicatedStores dedicated(destinationImport->store);
+        recorder.NotePendingWrite(destination, bytes);
+    }
     // The destination's bytes after the transfer are the source's now when nothing recorded,
     // pending or still to land can change the source before the transfer reads it (a CPU store
     // to it in between is a hardware race too): the caller's ring entry carries them, stamped
@@ -3664,6 +3676,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> sourceRange{{{source, source + bytes}}};
     const bool sourceCurrent = bytes <= knownMax && generation != 0 && !recorder.PendingWriteOverlaps(source, bytes) && !recorder.PendingLabelIn(source, bytes) && !completionStoreOverlaps(source) && !Graphics::StorageTexture::AnyPendingOverlaps(sourceRange) && !Graphics::AnyShadowedOverlaps(sourceRange);
     noteWriter(sourceCurrent ? std::span(reinterpret_cast<const std::byte*>(source), bytes) : std::span<const std::byte>{}, sourceCurrent ? generation : 0);
+    const Graphics::Recorder::DedicatedStores dedicated(destinationImport->store);
     recorder.NotePendingWrite(destination, bytes);
     outcome.path = 1;
     return outcome;
@@ -4461,7 +4474,10 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
     timing.Mark("command_record_scale");
     // The slot's fence signaled (retired above) or was never used: the reset cannot block.
     check(state->DeviceFunction<PFN_vkResetFences>("vkResetFences")(state->device, 1, &slot.fence), "vkResetFences present");
-    check(state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence), "vkQueueSubmit clear");
+    check([&] {
+        const GuestArena::Submission submitting{GuestArena::Submission::NoStores{}};
+        return state->DeviceFunction<PFN_vkQueueSubmit>("vkQueueSubmit")(state->queue, 1, &submit, slot.fence);
+    }(), "vkQueueSubmit clear");
     const auto submittedAt = std::chrono::steady_clock::now();
     timing.Mark("queue_submit");
     APS5_LOG_CHARS_OUT_DEBUG("Presentation vkQueueSubmit OK");

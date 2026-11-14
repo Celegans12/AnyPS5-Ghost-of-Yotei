@@ -2325,7 +2325,15 @@ static void CheckLargeResidentWritesDoNotFault() {
     Require(collect() == bytes / 4096);
     Require(collect() == 0 && collect() == 0);
     MEMORY_BASIC_INFORMATION memory{};
-    Require(VirtualQuery(mapped, &memory, sizeof(memory)) == sizeof(memory) && memory.Protect == PAGE_READWRITE);
+    // Section A (rewrite): collected resident memory may be armed read-only while clean; the guest
+    // and the driver still see it writable.
+    const auto guestWritable = [&] {
+        std::uint32_t logical = 0;
+        if (VirtualQuery(mapped, &memory, sizeof(memory)) != sizeof(memory)) return false;
+        if (memory.Protect == PAGE_READWRITE) return true;
+        return memory.Protect == PAGE_READONLY && GuestArena::GuestArenaProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(mapped), &logical) && logical == PAGE_READWRITE;
+    };
+    Require(guestWritable());
     auto* data = static_cast<unsigned char*>(mapped);
     const auto path = std::filesystem::path("anyps5-resident-read-" +
         std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()) + ".bin");
@@ -2353,7 +2361,7 @@ static void CheckLargeResidentWritesDoNotFault() {
         Require(collect() == 1 && collect() == 0);
     }
     for (unsigned int round = 0; round < 16; ++round) Require(collect() == 0);
-    Require(VirtualQuery(mapped, &memory, sizeof(memory)) == sizeof(memory) && memory.Protect == PAGE_READWRITE);
+    Require(guestWritable());
     const auto before = g_accessViolations;
     const auto handler = AddVectoredExceptionHandler(1, CountAccessViolations);
     Require(handler != nullptr);
@@ -2362,8 +2370,10 @@ static void CheckLargeResidentWritesDoNotFault() {
         Require(collect() == bytes / 4096 && collect() == 0);
     }
     Require(RemoveVectoredExceptionHandler(handler));
-    Require(g_accessViolations == before);
-    Require(VirtualQuery(mapped, &memory, sizeof(memory)) == sizeof(memory) && memory.Protect == PAGE_READWRITE);
+    // Every 64 KiB block is written every round: under section A it faults when armed and then
+    // stays dirty as a hot block, so far fewer faults than one per block per round.
+    Require(g_accessViolations - before < 16 * (bytes / 0x10000) / 2);
+    Require(guestWritable());
     Require(mprotect_nid_postfix(mapped, bytes, 1) == 0);
     Require(collect() == 0 && collect() == 0);
     Require(mprotect_nid_postfix(mapped, bytes, 3) == 0);

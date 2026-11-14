@@ -279,6 +279,9 @@ extern "C" [[noreturn]] void APS5_VABI EnterGuestMainStack_nid_no_patch(void* ar
     if (mapped != 0 || reinterpret_cast<std::uintptr_t>(mapping) + bytes != top)
         throw std::runtime_error("EnterGuestMainStack: cannot map the guest main stack");
     if (DoMprotect(mapping, GUEST_STACK_GUARD, 0) != 0) throw std::runtime_error("EnterGuestMainStack: cannot protect the guest main stack guard");
+#ifdef _WIN32
+    GuestArena::GuestArenaNeverArm_nid_no_patch(reinterpret_cast<std::uintptr_t>(mapping), bytes);
+#endif
     guestMainStackHigh.store(top, std::memory_order_release);
     guestMainStackLow.store(reinterpret_cast<std::uintptr_t>(mapping) + GUEST_STACK_GUARD, std::memory_order_release);
     if (auto* self = CurrentGuestState().current) {

@@ -1034,6 +1034,82 @@ void CheckKnownZeroShared() {
     Require(KnownZeroPages(region.first, Bytes).empty(), "shared memory is known zero");
 }
 
+// Section A: with write faults enabled, a resetting collect arms consumed private memory read-only,
+// later collects skip it without a GetWriteWatch walk, a guest store faults once and is collected,
+// and host writes, guest protection changes and pins keep working.
+void CheckProtectedPrivate() {
+    auto& mappings = Mappings::Get();
+    Mappings::EnableWriteFaults(true);
+    constexpr std::size_t Total = 6 * Bytes;
+    auto* memory = static_cast<unsigned char*>(mappings.Reserve(nullptr, Total));
+    Require(memory != nullptr, "private reservation failed");
+    mappings.Commit(memory, Total, PAGE_READWRITE, Total, true);
+    const auto address = reinterpret_cast<std::uintptr_t>(memory);
+    const auto collect = [&] {
+        std::array<void*, 256> pages{};
+        auto count = pages.size();
+        Require(mappings.Collect(address, Total, pages.data(), &count, true), "collecting protected private memory failed");
+        std::set<std::size_t> written;
+        for (std::size_t i = 0; i < count; ++i) written.insert(reinterpret_cast<std::uintptr_t>(pages[i]) - address);
+        return written;
+    };
+    const auto protection = [&](std::size_t offset) {
+        return RegionAt(memory + offset).Protect;
+    };
+    const auto store = [&](std::size_t offset, unsigned char value) {
+        static_cast<volatile unsigned char*>(memory)[offset] = value;
+    };
+    collect();
+    Require(protection(0) == PAGE_READONLY && protection(5 * Bytes) == PAGE_READONLY, "a collected private allocation was not armed");
+    std::uint32_t logical = 0;
+    Require(mappings.Protection(address, &logical) && logical == PAGE_READWRITE, "an armed page did not report its guest protection");
+    const auto walks = mappings.ProtectCounted().walks;
+    Require(collect().empty(), "an armed allocation nobody wrote reported pages");
+    Require(mappings.ProtectCounted().walks == walks, "a clean armed allocation was walked with GetWriteWatch");
+
+    auto before = faults.load();
+    store(Bytes + Small, 5);
+    store(Bytes + 2 * Small, 6);
+    Require(faults.load() == before + 1, "stores into one armed block did not fault exactly once");
+    Require(collect() == std::set<std::size_t>({Bytes + Small, Bytes + 2 * Small}), "stores into an armed block were not collected");
+    Require(collect().empty(), "collected stores were reported again");
+
+    Require(mappings.BeginHostWrite(address + 2 * Bytes, Small), "host write refused");
+    Require(protection(2 * Bytes) == PAGE_READWRITE, "a host write did not open its armed page");
+    const unsigned char value = 7;
+    SIZE_T moved = 0;
+    Require(WriteProcessMemory(GetCurrentProcess(), memory + 2 * Bytes, &value, 1, &moved) && moved == 1, "a kernel write into opened memory failed");
+    mappings.EndHostWrite(address + 2 * Bytes, Small);
+    Require(collect().contains(2 * Bytes), "a kernel write inside a host write was not collected");
+
+    mappings.SetProtection(address + 3 * Bytes, Bytes, PAGE_READWRITE);
+    DWORD previous = 0;
+    Require(VirtualProtect(memory + 3 * Bytes, Bytes, PAGE_READWRITE, &previous) != 0, "cannot apply the guest protection change");
+    before = faults.load();
+    store(3 * Bytes, 9);
+    Require(faults.load() == before, "a store after a guest protection change faulted");
+    Require(collect().contains(3 * Bytes), "a store after a guest protection change was not collected");
+    Require(protection(3 * Bytes) == PAGE_READWRITE, "guest-protected memory was armed again");
+
+    mappings.Pin(address + 4 * Bytes, Small);
+    Require(protection(4 * Bytes) == PAGE_READWRITE, "a pin did not open its armed page");
+    before = faults.load();
+    store(4 * Bytes, 1);
+    Require(faults.load() == before && collect().contains(4 * Bytes), "a store into a pinned page faulted or was lost");
+    Require(protection(4 * Bytes) == PAGE_READWRITE, "a pinned page was armed");
+    mappings.Unpin(address + 4 * Bytes, Small);
+
+    const auto hotBefore = mappings.ProtectCounted().hotSkips;
+    for (int frame = 0; frame < 4; ++frame) {
+        store(5 * Bytes + Small, static_cast<unsigned char>(frame));
+        Require(collect().contains(5 * Bytes + Small), "a store into a hot block was lost");
+    }
+    Require(mappings.ProtectCounted().hotSkips > hotBefore, "a block written every collect kept being armed");
+
+    mappings.Reset(memory, Total);
+    VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 int main(int argc, char** argv) {
     auto* handler = AddVectoredExceptionHandler(1, HandleWrite);
     try {
@@ -1073,6 +1149,7 @@ int main(int argc, char** argv) {
         CheckKnownZeroResident();
         CheckKnownZeroShared();
         CheckKnownZeroFirstReads();
+        CheckProtectedPrivate();
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

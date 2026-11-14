@@ -116,11 +116,13 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
     }
     const auto intelSites = trampolines.size();
     std::vector<Codegen::RedZoneDisplacement> displacements;
+    std::size_t redZoneSkipped = 0;
     if (options.FrameRedZone) {
         const auto headers = Relinker::ElfReader(sourceBytes).ReadProgramHeaders();
         auto framing = Relinker::FrameRedZoneImage(sourceBytes, headers, result.DynamicSection.RelaData, trampolines, "Red-zone framing", [&](std::string_view text) { inputProgress.Message(text); });
         if (!framing.HasBounds) inputProgress.Message("Red-zone framing: the executable has no .eh_frame function bounds; all its functions come from splitting\n");
         displacements = std::move(framing.Displacements);
+        redZoneSkipped = framing.Skipped;
     }
     GamePatch::CheckOverlaps(options.TargetName, patchedRanges, {.RelinkPatches = result.Patches, .RelaData = result.DynamicSection.RelaData, .RelaPltData = result.DynamicSection.RelaPltData, .RedZoneSites = std::span<const Codegen::TrampolineSite>(trampolines).subspan(intelSites), .RedZoneDisplacements = displacements});
 
@@ -175,6 +177,22 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
         throw;
     }
 
+    if (options.FrameRedZone) {
+        // The mark libc requires before it arms guest memory read-only (WindowsMappings::FramedMark,
+        // in the DOS header's reserved words, which the loader ignores): the executable and every
+        // converted module are framed with no red-zone leaf skipped, so an exception frame on a
+        // guest thread cannot overwrite live values.
+        for (const auto& artifact : guestArtifacts) redZoneSkipped += artifact.RedZoneSkipped;
+        constexpr std::size_t markOffset = 0x28;
+        constexpr char mark[8] = {'A', 'P', 'S', '5', 'R', 'Z', '0', '1'};
+        const bool markable = executableBytes.size() >= 0x40 && executableBytes[0] == 'M' && executableBytes[1] == 'Z' && executableBytes[0x3c] >= 0x40;
+        if (redZoneSkipped == 0 && markable) {
+            std::copy(std::begin(mark), std::end(mark), executableBytes.begin() + markOffset);
+            inputProgress.Message("Red-zone framing: no leaf skipped in any image; the executable is marked as framed\n");
+        } else {
+            inputProgress.Message("Red-zone framing: the executable is not marked as framed (" + std::to_string(redZoneSkipped) + " leaves skipped)\n");
+        }
+    }
     if (!windows) inputProgress.Report({Domain::ProgressStage::Image, Io::Utf8Path(input.InputPath), 1, 1});
     std::string diagnostics;
     if (windows) diagnostics = std::static_pointer_cast<Elfpatcher::Windows::WindowsPePatcher>(patcher)->GetDiagnostics();

@@ -132,8 +132,18 @@ Outcome RepeatsAreElidedUntilTheRangeChanges(AgcDriver::VulkanDevice& device, co
     }
     RequireFilled(guest, FillOffset, FillBytes, Pattern, "the first fill");
     Require(guest.Data()[FillOffset - 1] == 0x37 && guest.Data()[FillOffset + FillBytes] == 0x37, "repeated fill elision: the first fill stored outside its range");
+    // The block's initial bytes, stored before the first fill, are collected and stamped only here.
+    // A second fill then starts from a collected range: what proves it unchanged afterwards (the
+    // write watch, or the arena's read-only arming of the collected block) is what the repeats
+    // are elided by.
     GuestMemory::CollectWritesUncached(address, FillBytes);
-    const bool proven = GuestMemory::Watched(address, FillBytes) && GuestMemory::UnchangedSince(address, FillBytes, filled);
+    {
+        std::lock_guard lock(GuestMemory::GpuMutex());
+        Require(device.FillBuffer(address, FillBytes, Pattern), "repeated fill elision: the fill after the first collect was not stored on the GPU");
+        filled = GuestMemory::TrackerGeneration();
+        device.WaitIdle();
+    }
+    const bool proven = GuestMemory::CollectWritesUncached(address, FillBytes) != 0 && GuestMemory::UnchangedSince(address, FillBytes, filled);
     const auto repeat = proven ? Store::Elided : Store::Recorded;
     std::printf("repeated fill elision, %s: %s\n", mode, proven ? "the write watch proves the range unchanged, so repeats are elided" : "nothing proves the range unchanged, so every fill is recorded");
 

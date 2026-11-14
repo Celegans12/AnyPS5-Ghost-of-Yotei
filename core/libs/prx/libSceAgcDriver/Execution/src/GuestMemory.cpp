@@ -323,7 +323,38 @@ void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
 }
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
+std::atomic<std::uint64_t> collectCleanSkips{0};
+// Walks by this thread of memory the arena does not report clean, and epoch bumps skipped because no
+// such walk and no opening of armed memory happened since the thread's last bump.
+thread_local std::uint64_t uncleanWalks = 0;
+std::atomic<std::uint64_t> collectEpochSkips{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
+// Epoch stamps taken by callers (CollectEpoch, ThreadCollectEpoch), and what made each real bump
+// under arming necessary: a walk of unclean memory, an opening of armed memory, or only a stamp.
+std::atomic<std::uint64_t> epochStamps{0};
+thread_local std::uint64_t threadEpochStamps = 0;
+std::array<std::atomic<std::uint64_t>, 3> epochBumpCauses{};
+struct StampSite {
+    std::atomic<const char*> file{nullptr};
+    std::atomic<int> line{0};
+    std::atomic<std::uint64_t> count{0};
+};
+std::array<StampSite, 32> stampSites;
+
+void noteEpochStamp(const char* file, int line) {
+    epochStamps.fetch_add(1, std::memory_order_relaxed);
+    ++threadEpochStamps;
+    static const bool probe = std::getenv("APS5_EPOCH_PROBE") != nullptr;
+    if (!probe) return;
+    for (auto& site : stampSites) {
+        auto held = site.file.load(std::memory_order_relaxed);
+        if (held == nullptr && site.file.compare_exchange_strong(held, file, std::memory_order_relaxed)) site.line.store(line, std::memory_order_relaxed), held = file;
+        if (held == file && site.line.load(std::memory_order_relaxed) == line) {
+            site.count.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+    }
+}
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
 // tracker mutex acquisitions that had to wait (APS5_PROFILE_DRAW; see lockTracker).
@@ -571,8 +602,27 @@ public:
         for (std::size_t i = 0; i < MemoryCounterCount; ++i) {
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
-        AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu (%llu skipped; real after a walk %llu, an armed open %llu, a stamp only %llu), clean skips %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()), static_cast<unsigned long long>(collectEpochSkips.load()), static_cast<unsigned long long>(epochBumpCauses[0].load()), static_cast<unsigned long long>(epochBumpCauses[1].load()), static_cast<unsigned long long>(epochBumpCauses[2].load()), static_cast<unsigned long long>(collectCleanSkips.load()));
+        if (stampSites[0].file.load(std::memory_order_relaxed) != nullptr) {
+            AgcDriver::ProfilePrint_nid_no_patch(" | epoch stamps %llu:", static_cast<unsigned long long>(epochStamps.load()));
+            for (const auto& site : stampSites) {
+                const auto file = site.file.load(std::memory_order_relaxed);
+                if (file == nullptr) break;
+                const char* name = file;
+                for (const char* at = file; *at != 0; ++at) {
+                    if (*at == '/' || *at == '\\') name = at + 1;
+                }
+                AgcDriver::ProfilePrint_nid_no_patch(" %s:%d=%llu", name, site.line.load(std::memory_order_relaxed), static_cast<unsigned long long>(site.count.load()));
+            }
+        }
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
+#ifdef _WIN32
+        {
+            std::uint64_t protect[10]{};
+            GuestArena::GuestArenaProtectCounts_nid_no_patch(protect, std::size(protect));
+            AgcDriver::ProfilePrint_nid_no_patch(" | protect walks %llu arms %llu faults %llu hot %llu raced %llu armed %.0f MiB in %llu; submits %llu armed there %.0f MiB, import groups opened %llu", static_cast<unsigned long long>(protect[0]), static_cast<unsigned long long>(protect[1]), static_cast<unsigned long long>(protect[2]), static_cast<unsigned long long>(protect[3]), static_cast<unsigned long long>(protect[4]), protect[5] / 1048576.0, static_cast<unsigned long long>(protect[6]), static_cast<unsigned long long>(protect[7]), protect[8] / 1048576.0, static_cast<unsigned long long>(protect[9]));
+        }
+#endif
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
             std::lock_guard lock(state.callersMutex);
@@ -2055,7 +2105,7 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool* dirty = nullptr) {
     ++tracker.generation;
-    observationPoint(1);
+    ++uncleanWalks;
     StampRuns runs{tracker, kind, 0, window, {}};
 #ifdef _WIN32
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
@@ -2205,7 +2255,18 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         }
     }
     bool dirty = true;
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, &dirty)) {
+#ifdef _WIN32
+    // Section A: a range that is clean since its last resetting collect (armed, so any CPU store
+    // would have faulted and ended that) has nothing to stamp. The walk is skipped; the observation
+    // is recorded below as for a walk that found nothing.
+    const bool clean = GuestArena::GuestArenaClean_nid_no_patch(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first));
+#else
+    const bool clean = false;
+#endif
+    if (clean) {
+        collectCleanSkips.fetch_add(1, std::memory_order_relaxed);
+        dirty = false;
+    } else if (!walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, &dirty)) {
 #ifdef _WIN32
         if (first == requestedFirst && stop == requestedStop) return 0;
         first = requestedFirst;
@@ -2353,14 +2414,43 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
 }
 
 void BumpCollectEpoch() {
-    const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+#ifdef _WIN32
+    // Section A: the dirty list answers the memo. While the arena arms memory, everything observed
+    // since this thread's last bump was clean (armed) unless some thread walked, and it is still
+    // unwritten unless armed memory was opened (a store faults first). With neither, the epoch's
+    // observations still hold and the bump is skipped.
+    if (GuestArena::GuestArenaArming_nid_no_patch() && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0) {
+        struct Seen {
+            std::uint64_t walks = ~std::uint64_t{0};
+            std::uint64_t opens = ~std::uint64_t{0};
+            std::uint64_t stamps = ~std::uint64_t{0};
+        };
+        struct Slot {};
+        auto& seen = ThreadScratch<Seen, Slot>();
+        const auto walks = uncleanWalks;
+        const auto opens = GuestArena::GuestArenaArmedOpens_nid_no_patch();
+        const auto stamps = threadEpochStamps;
+        if (seen.walks == walks && seen.opens == opens && seen.stamps == stamps) {
+            collectEpochSkips.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        epochBumpCauses[seen.walks != walks ? 0 : seen.opens != opens ? 1 : 2].fetch_add(1, std::memory_order_relaxed);
+        seen.walks = walks;
+        seen.opens = opens;
+        seen.stamps = stamps;
+    }
+#endif
+    const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
     while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
 }
 
-std::uint64_t ThreadCollectEpoch() {
+std::uint64_t ThreadCollectEpoch(const char* file, int line) {
+    // A caller stamps something it observed outside the collect path (untracked memory included)
+    // with the epoch: the arena cannot answer for it, so the next bump is a real one.
+    noteEpochStamp(file, line);
     return collectMemoEnabled() ? HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() : 0;
 }
 
@@ -2394,7 +2484,8 @@ void MarkProofThread() {
     proofThread = true;
 }
 
-std::uint64_t CollectEpoch() {
+std::uint64_t CollectEpoch(const char* file, int line) {
+    noteEpochStamp(file, line);
     return collectMemoEnabled() ? HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() : 0;
 }
 
@@ -2950,6 +3041,7 @@ thread_local ThreadCollectMemo threadHintMemo;
 bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
     auto cursor = first;
     bool marked = false;
+    ++uncleanWalks;
     StampRuns runs{tracker, StampKind::Cpu};
     while (cursor < stop) {
         std::size_t count = tracker.pages.size();

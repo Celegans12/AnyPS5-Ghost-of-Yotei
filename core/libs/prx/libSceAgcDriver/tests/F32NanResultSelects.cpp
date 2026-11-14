@@ -60,8 +60,11 @@ bool Constant(const Module& module, std::uint32_t id, std::uint32_t value) {
     return found != module.constants.end() && found->second == value;
 }
 
+// The NaN test of a select: the value compared unordered-not-equal with itself (FPIsNan32), or its
+// bits' magnitude above the infinity pattern.
 bool NanTest(const Module& module, std::uint32_t id) {
     const auto compare = module.definitions.find(id);
+    if (compare != module.definitions.end() && compare->second.opcode == spv::OpFUnordNotEqual && compare->second.operands.size() == 2 && compare->second.operands[0] == compare->second.operands[1]) return true;
     if (compare == module.definitions.end() || compare->second.opcode != spv::OpUGreaterThan || compare->second.operands.size() != 2) return false;
     if (!Constant(module, compare->second.operands[1], 0x7f800000u)) return false;
     const auto magnitude = module.definitions.find(compare->second.operands[0]);
@@ -74,18 +77,20 @@ std::uint32_t NanSelectsOnResult(const Module& module, std::uint32_t result) {
     for (bool advanced = true; advanced;) {
         advanced = false;
         const auto [first, last] = module.users.equal_range(value);
-        for (auto user = first; user != last; ++user) {
+        // A select on the value comes before a cast of it: the value may also be cast only to be
+        // tested (the float the FPIsNan32 form compares).
+        for (auto user = first; user != last && !advanced; ++user) {
             const auto& instruction = module.definitions.at(user->second);
-            if (instruction.opcode == spv::OpBitcast) {
-                value = user->second;
-                advanced = true;
-                break;
-            }
             if (instruction.opcode == spv::OpSelect && instruction.operands.size() == 3 && instruction.operands[2] == value && NanTest(module, instruction.operands[0])) {
                 value = user->second;
                 ++selects;
                 advanced = true;
-                break;
+            }
+        }
+        for (auto user = first; user != last && !advanced; ++user) {
+            if (module.definitions.at(user->second).opcode == spv::OpBitcast) {
+                value = user->second;
+                advanced = true;
             }
         }
     }

@@ -8,6 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DeviceFault.hpp"
@@ -1757,6 +1758,11 @@ std::shared_ptr<StorageTexture> StorageTexture::Create(const Context& context, T
     }();
     static_cast<void>(unwatchHooked);
     const MapImportGate::PublishHold publication(descriptor.baseAddress, DescribeSurface(descriptor).guestBytes);
+#ifdef _WIN32
+    // Section A: a storage target's guest range is GPU-written (every write-back stores into it,
+    // some through their own command batch), so it is never CPU-clean.
+    GuestArena::GuestArenaGpuWrites_nid_no_patch(static_cast<std::uintptr_t>(descriptor.baseAddress), static_cast<std::size_t>(DescribeSurface(descriptor).guestBytes), 2);
+#endif
     auto texture = std::shared_ptr<StorageTexture>(new StorageTexture(context, detiler, descriptor, mipLevel));
     uploadReason = "first";
     texture->upload();
@@ -4346,6 +4352,8 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
             if (directRanges[i].first == directRanges[i].second) detiler.Dispatch(commands, descriptor.tileMode, elementBytes, linear->Handle(), linearPositions[i], tiledScratch->Handle(), scratchPositions[i], mips[window.level], true, window.layer, false, retile);
         }
     }
+    // Whether every store into the import went through a store import (StoreTarget).
+    bool dedicatedStores = true;
     if (tiledScratch) {
         // The retiled scratch (and a seed's slab bytes, which the scratch copies overwrite in
         // part) precede the copies into the slabs and the import.
@@ -4356,7 +4364,10 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
             if (!pieces.copies.empty()) copyBuffer(commands, tiledScratch->Handle(), pieces.slab->buffer, static_cast<std::uint32_t>(pieces.copies.size()), pieces.copies.data());
         }
         for (std::size_t segment = 0; segment < segments.size(); ++segment) {
-            if (!importCopies[segment].empty()) copyBuffer(commands, tiledScratch->Handle(), segments[segment].import->buffer, static_cast<std::uint32_t>(importCopies[segment].size()), importCopies[segment].data());
+            if (importCopies[segment].empty()) continue;
+            const auto* target = StoreTarget(context, *segments[segment].import, importCopies[segment]);
+            dedicatedStores = dedicatedStores && target->store;
+            copyBuffer(commands, tiledScratch->Handle(), target->buffer, static_cast<std::uint32_t>(importCopies[segment].size()), importCopies[segment].data());
         }
         if (!saves.empty()) copyBuffer(commands, tiledScratch->Handle(), save->Handle(), static_cast<std::uint32_t>(saves.size()), saves.data());
     }
@@ -4370,13 +4381,19 @@ std::uint64_t StorageTexture::writeBackWindows(std::span<const ImportSegment> se
     constexpr VkAccessFlags storedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT;
     const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, storedAccess};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, direct ? 0u : 1u, &backToGeneral);
+#ifdef _WIN32
+    // Section A: the pieces copied into the import are GPU writes (the own-batch branch notes none).
+    for (const auto& [begin, end] : imported) GuestArena::GuestArenaGpuWrites_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin), 3);
+#endif
     if (batch) {
+        for (const auto& [begin, end] : imported) batch->NoteStore(begin, end, dedicatedStores);
         batch->SubmitAndWait();
     } else {
         recorder->EndGpuTiming(timing, storedBytes);
         recorder->MarkCovered(storedAccess);
         // Only the pieces written into the import are stores a CPU reader must wait for; the
         // shadowed ones reach it through a publish, which notes its own.
+        const Recorder::DedicatedStores dedicated(dedicatedStores);
         if (!imported.empty()) recorder->NotePendingWrites(imported);
     }
     partialWriteBacks.fetch_add(1, std::memory_order_relaxed);
@@ -4554,6 +4571,9 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial};
     }
     GuestMemory::NoteGpuPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+#ifdef _WIN32
+    GuestArena::GuestArenaGpuWrites_nid_no_patch(static_cast<std::uintptr_t>(descriptor.baseAddress), static_cast<std::size_t>(guestBytes), 4);
+#endif
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
     ++writes;
     static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
@@ -4847,6 +4867,8 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
         return (row - area.top) * rowBytes + offset - row * mip.pitchBytes - area.left * elementBytes;
     };
     const auto copyBuffer = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    // Whether every store into the import went through a store import (StoreTarget).
+    bool dedicatedStores = true;
     for (const auto& segment : segments) {
         std::vector<VkBufferCopy> copies;
         for (const auto& [from, to] : stores) {
@@ -4854,7 +4876,10 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
             const auto end = std::min(to, segment.end);
             if (begin < end) copies.push_back({scratchOffset(begin), HostImportOffset(*segment.import, begin), end - begin});
         }
-        if (!copies.empty()) copyBuffer(commands, scratch->Handle(), segment.import->buffer, static_cast<std::uint32_t>(copies.size()), copies.data());
+        if (copies.empty()) continue;
+        const auto* target = StoreTarget(context, *segment.import, copies);
+        dedicatedStores = dedicatedStores && target->store;
+        copyBuffer(commands, scratch->Handle(), target->buffer, static_cast<std::uint32_t>(copies.size()), copies.data());
     }
     if (!saveUnits.empty()) {
         if (original.size() != guestBytes) original.resize(static_cast<std::size_t>(guestBytes));
@@ -4875,12 +4900,16 @@ std::uint64_t StorageTexture::storeDrawnRect(const DrawnArea& area, std::span<co
     const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_READ_BIT};
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, 1, &backToGeneral);
     if (batch) {
+        batch->NoteStore(hullBegin, hullBegin + hullBytes, dedicatedStores);
         batch->SubmitAndWait();
         return storedBytes;
     }
     recorder->EndGpuTiming(timing, storedBytes);
     recorder->MarkShaderReadsCovered();
-    recorder->NotePendingWrite(hullBegin, hullBytes);
+    {
+        const Recorder::DedicatedStores dedicated(dedicatedStores);
+        recorder->NotePendingWrite(hullBegin, hullBytes);
+    }
     noteStore(recorder->LastWriteNote(hullBegin, hullBytes));
     return storedBytes;
 }
@@ -7407,6 +7436,13 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 if (wholeLayers == keep && HostImportDeviceLocal(context, *segments.front().import)) directImport = segments.front().import;
             }
         }
+        // Whether every store into the import goes through a store import (StoreImportFor).
+        bool dedicatedStores = true;
+        if (directImport != nullptr) {
+            const auto* store = StoreImportFor(context, firstStored, static_cast<std::size_t>(lastStored - firstStored));
+            if (store != nullptr && store->store) directImport = store;
+            dedicatedStores = directImport->store;
+        }
         const auto tiledScratch = directImport == nullptr ? std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT) : nullptr;
         detiler.BeginBatch();
         auto* recorder = recorderFor(context);
@@ -7483,7 +7519,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                     const auto end = std::min(to, segment.end);
                     if (begin < end) copies.push_back({begin - descriptor.baseAddress, HostImportOffset(*segment.import, begin), end - begin});
                 }
-                if (!copies.empty()) context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, tiledScratch->Handle(), segment.import->buffer, static_cast<std::uint32_t>(copies.size()), copies.data());
+                if (copies.empty()) continue;
+                const auto* target = StoreTarget(context, *segment.import, copies);
+                dedicatedStores = dedicatedStores && target->store;
+                context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer")(commands, tiledScratch->Handle(), target->buffer, static_cast<std::uint32_t>(copies.size()), copies.data());
             }
             if (!saveUnits.empty()) {
                 std::vector<VkBufferCopy> saves;
@@ -7498,12 +7537,20 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         backToGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
         const VkMemoryBarrier stored{VK_STRUCTURE_TYPE_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_HOST_READ_BIT};
         context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, 0, 1, &stored, 0, nullptr, 1, &backToGeneral);
+#ifdef _WIN32
+        // Section A: the retile stores into the import (the own-batch branch notes none).
+        GuestArena::GuestArenaGpuWrites_nid_no_patch(static_cast<std::uintptr_t>(firstStored), static_cast<std::size_t>(lastStored - firstStored), 5);
+#endif
         if (batch) {
+            batch->NoteStore(firstStored, lastStored, dedicatedStores);
             batch->SubmitAndWait();
         } else {
             recorder->EndGpuTiming(timing, storedBytes);
             recorder->MarkShaderReadsCovered();
-            recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+            {
+                const Recorder::DedicatedStores dedicated(dedicatedStores);
+                recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+            }
             if (drawn.drawn) noteStore(recorder->LastWriteNote(firstStored, static_cast<std::size_t>(lastStored - firstStored)));
         }
         countStorageWriteBack(storedBytes, true, drawn.drawn);

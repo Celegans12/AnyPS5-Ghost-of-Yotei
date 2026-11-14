@@ -4245,9 +4245,27 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     GuestMemory::ForgetKnownZero(address, bytes);
+#ifdef _WIN32
+    // Section A: an import the GPU writes is not CPU-clean; it is opened before the submission.
+    // Probe APS5_PROTECT_IGNORE_REACH=1: reach notes (ranges a pointer-chasing shader could write)
+    // open nothing, to measure how much of the marking they cause.
+    static const bool ignoreReach = std::getenv("APS5_PROTECT_IGNORE_REACH") != nullptr;
+    if (!(ignoreReach && value == ReachValue)) GuestArena::GuestArenaGpuWrites_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, value == ReachValue ? 7u : ownLabel ? 0u : NoteSource == 6 ? 6u : 8u);
+#endif
     ensureOpen();
     const auto end = address + bytes;
     open->writes.emplace_back(address, end);
+    (NoteDedicated ? open->storeWrites : open->regularWrites).emplace_back(address, end);
+#ifdef _WIN32
+    // Probe (APS5_WALK_PROBE): the notes taken to go through ordinary imports, by source.
+    static const bool probe = std::getenv("APS5_WALK_PROBE") != nullptr;
+    if (probe && !NoteDedicated) {
+        static std::array<std::atomic<std::uint64_t>, 4> regular{};
+        static std::atomic<std::uint64_t> total{0};
+        regular[value == ReachValue ? 2u : ownLabel ? 0u : NoteSource == 6 ? 1u : 3u].fetch_add(1, std::memory_order_relaxed);
+        if ((total.fetch_add(1, std::memory_order_relaxed) & 0x3fff) == 0x3fff) std::fprintf(stderr, "[gpu-write] notes through ordinary imports: label %llu, shader storage %llu, reach %llu, other %llu\n", static_cast<unsigned long long>(regular[0].load()), static_cast<unsigned long long>(regular[1].load()), static_cast<unsigned long long>(regular[2].load()), static_cast<unsigned long long>(regular[3].load()));
+    }
+#endif
     open->writeNotes.push_back(++writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, end)) published = nullptr;
     open->writeValues.push_back(static_cast<std::int16_t>(value));
@@ -4277,6 +4295,9 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
+#ifdef _WIN32
+    GuestArena::GuestArenaGpuWrites_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, 1);
+#endif
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     if (published != nullptr && !SnapshotCovers(published.get(), address, address + bytes)) published = nullptr;
@@ -5023,7 +5044,11 @@ void Recorder::Submit() {
     DestroyDeferredAtIdle(context);
     const auto submitStart = std::chrono::steady_clock::now();
     batch->submitStarted.store(true, std::memory_order_release);
-    const auto result = function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    const auto result = [&] {
+        // The batch's pending-write notes (reach notes included) are the ranges it may store into.
+        const GuestArena::Submission submitting(batch->storeWrites, batch->regularWrites);
+        return function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
+    }();
     if (result == VK_ERROR_DEVICE_LOST) {
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();

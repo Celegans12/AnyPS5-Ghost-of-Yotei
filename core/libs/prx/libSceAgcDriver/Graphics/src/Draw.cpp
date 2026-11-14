@@ -656,7 +656,10 @@ void recordCmaskClear(const Context& context, Recorder& recorder, const HostImpo
     if (resident != nullptr && !resident->Cached()) recorder.KeepBytes(resident.get(), static_cast<std::size_t>(resident->BudgetBytes()));
     recorder.Keep(resident);
     context.detiler->DispatchCmaskClear(commands, import.buffer, HostImportOffset(import, address), bytes, view, color.extent.width, color.extent.height, color.elementBytes, color.clearWords, color.dccAddress == 0);
-    recorder.NotePendingWrite(address, bytes);
+    {
+        const Recorder::DedicatedStores dedicated(import.store);
+        recorder.NotePendingWrite(address, bytes);
+    }
     proveCmask(address, bytes, GuestMemory::MarkWritten(address, bytes));
 }
 
@@ -673,7 +676,7 @@ bool materializeCmaskClear(const Context& context, const ColorTarget& color, con
     }
     auto* recorder = Recorder::Active();
     if (resident != nullptr && context.detiler != nullptr && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread()) {
-        const auto* import = HostImportFor(context, color.cmaskAddress, bytes);
+        const auto* import = StoreImportFor(context, color.cmaskAddress, bytes);
         const auto view = import != nullptr ? resident->ElementView() : VK_NULL_HANDLE;
         if (view != VK_NULL_HANDLE) {
             recordCmaskClear(context, *recorder, *import, color, layout, resident, view);
@@ -4193,6 +4196,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     {
         // The recorder sync SubmitAndWait makes is the draw's own wait, not a nested hook wait.
         const auto ownBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
+        // The draw's shaders may store through bound guest buffers: ranges not gathered here.
+        batch->StoresUnknown();
         batch->SubmitAndWait();
         if (!stencilReferences.empty()) resources->CheckFaults();
         if (profile) ownWaitedMs += Recorder::ThreadWaitedMs() - ownBefore;

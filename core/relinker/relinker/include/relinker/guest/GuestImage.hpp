@@ -78,6 +78,8 @@ struct GuestArtifact {
     std::vector<Domain::CallRegistryEntry> Imports;
     std::filesystem::path SourcePath;
     std::vector<std::string> NeededLibraries;
+    // Red-zone leaves of this module left unframed (meaningful when framing was requested).
+    std::size_t RedZoneSkipped = 0;
 };
 
 struct GuestModuleInput {

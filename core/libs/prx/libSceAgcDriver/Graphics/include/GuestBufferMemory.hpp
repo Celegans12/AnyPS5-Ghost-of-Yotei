@@ -48,6 +48,15 @@ struct HostImport {
     std::uint64_t lead = 0;
     std::uint64_t memoryBase = 0;
     std::uint64_t pinnedBytes = 0;
+    // The range registered with the guest arena (GuestArenaRegisterImport_nid_no_patch), forgotten
+    // when the import is destroyed; 0 bytes when not registered.
+    std::uint64_t registeredBase = 0;
+    std::uint64_t registeredBytes = 0;
+    // A store import (StoreImportFor): a small import of its own over pages an ordinary import
+    // also holds, which GPU stores go through, so that only it must be uniformly protected at
+    // their submission. Writes noted for stores through it are noted under
+    // Recorder::DedicatedStores.
+    bool store = false;
     std::uint32_t memoryType = std::numeric_limits<std::uint32_t>::max();
     std::uint64_t backingSerial = 0;
     mutable std::uint64_t spaceSerial = 0;
@@ -125,6 +134,19 @@ void ReportHostImports();
 const HostImport* HostImportFor(const Context& context, std::uint64_t address, std::size_t bytes, ImportRequester requester = ImportRequester::Access);
 bool HostImportUsesDmaBuf(const Context& context, std::uint64_t address, std::size_t bytes);
 const HostImport* ExistingHostImportFor(const Context& context, std::uint64_t address, std::size_t bytes);
+// The import a GPU store into [address, address + bytes) goes through: a store import of the
+// 64 KiB blocks holding the range (HostImport::store), made on demand over the range's ordinary
+// import, or that ordinary import where the arena does not arm its pages or no store import could
+// be made. Null as HostImportFor. The caller notes the store under
+// Recorder::DedicatedStores(import->store) (or CommandBatch::NoteStore with it).
+const HostImport* StoreImportFor(const Context& context, std::uint64_t address, std::size_t bytes, ImportRequester requester = ImportRequester::Access);
+// For transfers into `import` (destination offsets as HostImportOffset gives them): the store
+// import of the guest range the copies cover, with their destination offsets moved to it, or
+// `&import` with the copies unchanged where there is none.
+const HostImport* StoreTarget(const Context& context, const HostImport& import, std::span<VkBufferCopy> copies);
+// The same for an import known by its base and lead only; null (copies unchanged) where there is
+// no store import. Not under the host imports' lock.
+const HostImport* StoreTargetAt(const Context& context, std::uint64_t importBase, std::uint64_t importLead, std::span<VkBufferCopy> copies);
 void RequireGpuLockBeforeImports(const char* where);
 bool ImportsHeldByThisThread();
 bool WatchedAfterSettle(const Context& context, std::uint64_t address, std::size_t bytes);
@@ -410,6 +432,10 @@ public:
     bool CopiedWritesOverlap(std::uint64_t address, std::size_t bytes) const;
     // Guest ranges the shader may write through descriptors, as [begin, end).
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& Writes() const { return writes; }
+    // Whether no GPU store into the written ranges goes through an ordinary host import the arena
+    // arms: each is stored through a store import (HostImport::store), into a buffer of the
+    // device's own, or by the CPU. The writes are then noted under Recorder::DedicatedStores.
+    bool StoresDedicated() const;
     // Whether any written range lives in a copied buffer, so a write-back must run once the GPU is done.
     bool HasCopiedWrites() const;
     // Reports writes into host-imported memory (made by the GPU in place, or copied back into it by
@@ -522,6 +548,8 @@ private:
         VkBuffer copySource = VK_NULL_HANDLE;
         std::uint64_t copySourceBase = 0;
         VkDeviceAddress copySourceAddress = 0;
+        // Whether `copySource` is a store import's buffer or one the arena does not arm.
+        bool copySourceStore = false;
         bool copiedBack = false;
         std::shared_ptr<Buffer> shadowCopy;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
@@ -585,6 +613,7 @@ private:
     bool stagingWanted(const Region& region, bool addressable) const;
     bool adaptiveInPlace(const Region& region, bool use) const;
     bool overlayCandidate(const Region& inside, bool readOnly) const;
+    bool storeOverlay(const Region& inside) const;
     void resolveOverlays();
     bool bindableInPlace(std::uint64_t offset, bool addressable) const;
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with

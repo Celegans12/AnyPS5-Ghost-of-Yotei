@@ -109,9 +109,18 @@ public:
     void SubmitAndWait();
     void Submit();
     void Wait();
+    // Section A: a guest range this batch's commands store into through a host import; dedicated
+    // when every store into it goes through a store import (HostImport::store). The submission
+    // makes the imports stored through uniformly protected (GuestArena::Submission); a batch whose
+    // stores are not known says so.
+    void NoteStore(std::uint64_t begin, std::uint64_t end, bool dedicated = false) { (dedicated ? dedicatedStores : stores).emplace_back(begin, end); }
+    void StoresUnknown() { storesUnknown = true; }
 
 private:
     void release() noexcept;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stores;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> dedicatedStores;
+    bool storesUnknown = false;
     Context context;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;

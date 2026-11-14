@@ -2958,7 +2958,7 @@ std::optional<std::pair<VkImageAspectFlags, std::uint32_t>> htileAfterMaskClear(
 
 bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t word) {
     if (address % 4u != 0 || bytes % 4u != 0) return false;
-    const auto* import = HostImportFor(context, address, bytes);
+    const auto* import = StoreImportFor(context, address, bytes);
     if (import == nullptr) return false;
     recorder.FlushKeyStoresOverlapping(address, bytes);
     recorder.FlushStoresOverlapping(address, bytes);
@@ -2972,6 +2972,7 @@ bool storeHtileOnGpu(const Context& context, Recorder& recorder, std::uint64_t a
     Recorder::CountBarriers(Recorder::CommandClass::Fill);
     recorder.EndGpuTiming(timing, bytes);
     recorder.MarkCovered(filledAccess);
+    const Recorder::DedicatedStores dedicated(import->store);
     recorder.NotePendingWordFill(address, bytes, word);
     GuestMemory::MarkWritten(address, bytes);
     return true;

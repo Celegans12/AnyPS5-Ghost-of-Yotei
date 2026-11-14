@@ -151,9 +151,9 @@ void AdoptLatestCollectEpoch();
 std::uint64_t ProofSerial();
 void BreakProofs();
 void MarkProofThread();
-std::uint64_t CollectEpoch();
+std::uint64_t CollectEpoch(const char* file = __builtin_FILE(), int line = __builtin_LINE());
 std::uint64_t CollectEpochBumps();
-std::uint64_t ThreadCollectEpoch();
+std::uint64_t ThreadCollectEpoch(const char* file = __builtin_FILE(), int line = __builtin_LINE());
 std::uint64_t UnwatchSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // A frame ended (flip packet). Large ranges found clean on their last walks are walked at most once
