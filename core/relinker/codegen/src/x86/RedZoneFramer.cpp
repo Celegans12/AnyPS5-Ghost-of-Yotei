@@ -271,14 +271,17 @@ MemoryUse memoryUse(const std::uint8_t* code, const Insn& insn) {
     const bool byteOneByte = !info.IsTwoByteOpcode && ((op <= 0x3f && (op & 7) <= 3 && (op & 1) == 0) || op == 0x80 || op == 0x82 || op == 0x84 || op == 0x86 || op == 0x88 || op == 0x8a || op == 0xc0 || op == 0xc6 || op == 0xd0 || op == 0xd2 || op == 0xf6 || op == 0xfe);
     const bool byteTwoByteReg = info.IsTwoByteOpcode && (op == 0xb0 || op == 0xc0);
     const bool byteTwoByteRm = info.IsTwoByteOpcode && (op == 0xb0 || op == 0xc0 || op == 0xb6 || op == 0xbe);
-    if (ah && (byteOneByte || byteTwoByteReg) && reg == kRegRsp) {
-    } else if (!vex && !info.IsTwoByteOpcode && reg == kRegRsp && !r) {
-        if ((op <= 0x3f && (op & 7) <= 3) || (op >= 0x84 && op <= 0x8b) || op == 0x8d) use.UsesRsp = use.RegisterRsp = true;
+    if (!vex && !info.IsTwoByteOpcode && reg == kRegRsp && !r && !(ah && byteOneByte)) {
+        if ((op <= 0x3f && (op & 7) <= 3) || op == 0x63 || op == 0x69 || op == 0x6b || (op >= 0x84 && op <= 0x8b) || op == 0x8d) use.UsesRsp = use.RegisterRsp = true;
     }
-    const bool twoByteReg = reg == kRegRsp && !r && twoByteRegisterIsGeneral(op) && !(ah && byteTwoByteReg);
-    const bool twoByteRm = mod == 3 && rm == kRegRsp && !b && twoByteRmIsGeneral(op) && !(ah && byteTwoByteRm);
-    if (!vex && info.IsTwoByteOpcode && (twoByteReg || twoByteRm)) use.UsesRsp = use.RegisterRsp = true;
-    if (vex && vexGeneralUsesRsp(code, insn, mod, reg, rm, r, b)) use.UsesRsp = use.RegisterRsp = true;
+    if ((vex || info.IsTwoByteOpcode) && extendedOpcodeUsesRsp(code, insn, mod, reg, rm, r, b)) {
+        const bool regRsp = reg == kRegRsp && !r;
+        const bool rmRsp = mod == 3 && rm == kRegRsp && !b;
+        const bool regAh = ah && byteTwoByteReg && regRsp;
+        const bool rmAh = ah && byteTwoByteRm && rmRsp;
+        const bool onlyAh = (regAh || rmAh) && (!regRsp || regAh) && (!rmRsp || rmAh);
+        if (!onlyAh) use.UsesRsp = use.RegisterRsp = true;
+    }
     if (mod == 3) {
         const bool generalPurpose = !vex && !info.IsTwoByteOpcode && !(info.Opcode >= 0xd8 && info.Opcode <= 0xdf) && !(ah && byteOneByte);
         if (generalPurpose && rm == kRegRsp && !b) use.UsesRsp = use.RegisterRsp = true;

@@ -3,7 +3,6 @@
 #include "ConstrainedFieldPosition.hpp"
 #include "TerminateBuffer.hpp"
 #include "Enumeration.hpp"
-#include "List.hpp"
 #include "ErrorName.hpp"
 #include "Invariant.hpp"
 #include "Iterator.hpp"

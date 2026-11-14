@@ -256,7 +256,7 @@ public:
     static constexpr std::uint64_t ResidentIdleFrames = 120;
     static constexpr std::uint64_t ResidentChurnWindow = 32;
     void UseResidentRanges(std::span<const std::shared_ptr<ResidentRange>> named, std::uint64_t indexAddress, std::uint64_t indexBytes);
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr);
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr, std::size_t from = 0, std::uint32_t* lowest = nullptr);
     struct OwnedDrawInputProof {
         std::vector<std::uint64_t> words;
         std::uint64_t since = 0;
@@ -557,6 +557,7 @@ public:
     // Whether the range overlaps one of the calling worker's queued labels (the flush hook records
     // the group and syncs on it before such an access). No lock; the ranges are per thread.
     static bool QueuedLabelOverlapsHere(std::uint64_t address, std::size_t bytes);
+    static bool QueuedLabelsPending();
     // The function the flush hook calls, on the accessing thread (which may hold the GPU mutex),
     // when an access overlaps one of that thread's queued labels; it records them. Set once.
     static void SetQueuedLabelRecorder(void (*recorder)());

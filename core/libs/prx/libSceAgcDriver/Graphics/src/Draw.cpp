@@ -2807,7 +2807,7 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
     };
     if (bindings != nullptr) {
         for (const auto& snapshot : bindings->snapshots) {
-            if (!snapshot.buffer->Mapped()) continue;
+            if (snapshot.buffer == nullptr || !snapshot.buffer->Mapped()) continue;
             const auto bytes = snapshot.Bytes();
             addSample(snapshot.address, bytes.size(), snapshot.buffer->Handle(), snapshot.offset, bytes.data());
         }
@@ -2912,6 +2912,11 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (args->countIndirect) passReads.emplace_back(args->countAddress, args->countAddress + 4);
     }
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
+    for (const auto& entry : record.moved) {
+        if (entry.inPlace == VK_NULL_HANDLE) continue;
+        const auto begin = entry.address - entry.adjustment;
+        passReads.emplace_back(begin, begin + GuestBufferMemory::ViewBytes(entry.size, entry.adjustment));
+    }
     auto passImages = resources.StorageImages();
     // Direct stages bind their images in heap slots, outside the ShaderResources.
     const auto directImages = DirectDrawImages();

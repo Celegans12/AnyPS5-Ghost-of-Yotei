@@ -143,7 +143,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         bool bump = true;
         int exit = ExitLanded;
         ~EpochPoint() {
-            if (bump) bumpEpoch(&EpochBumps::waits);
+            if (bump) bumpWaitEpoch(address, bytes);
             static const bool trace = std::getenv("APS5_TRACE_WAIT_WRITERS") != nullptr;
             if (!trace) return;
             static std::array<std::atomic<std::uint64_t>, ExitCount * 2> counts{};

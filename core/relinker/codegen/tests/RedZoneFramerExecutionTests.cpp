@@ -253,6 +253,35 @@ std::vector<Leaf> framedLeaves() {
             0x53, 0x48, 0x89, 0x7c, 0x24, 0xf0, 0xe8, 0x0a, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x44, 0x24, 0xf0,
             0x48, 0x01, 0xf0, 0x5b, 0xc3, 0x31, 0xc9, 0xc3,
         }, kA + kB},
+        {"leaf transferring a red-zone spill through xmm4 with movq", frameless({
+            0x48, 0x89, 0x7c, 0x24, 0xf0, 0xf3, 0x0f, 0x7e, 0x64, 0x24, 0xf0,
+            0xf3, 0x0f, 0x7e, 0xc4, 0x66, 0x48, 0x0f, 0x7e, 0xc0,
+        }), kA},
+    };
+}
+
+std::vector<Leaf> skippedDirectRspLeaves() {
+    return {
+        {"leaf reading rsp through vmovq", {
+            0x53, 0x48, 0x83, 0xec, 0x10, 0x48, 0x89, 0x3c, 0x24, 0x48, 0x89, 0x74, 0x24, 0xf0,
+            0xc4, 0xe1, 0xf9, 0x6e, 0xc4, 0xc4, 0xc1, 0xf9, 0x7e, 0xc0, 0x49, 0x8b, 0x00,
+            0x48, 0x83, 0xc4, 0x10, 0x5b, 0xc3,
+        }, kA},
+        {"leaf reading rsp through pinsrq", {
+            0x53, 0x48, 0x83, 0xec, 0x10, 0x48, 0x89, 0x3c, 0x24, 0x48, 0x89, 0x74, 0x24, 0xf0,
+            0x66, 0x48, 0x0f, 0x3a, 0x22, 0xc4, 0x01, 0x66, 0x49, 0x0f, 0x3a, 0x16, 0xc0, 0x01, 0x49, 0x8b, 0x00,
+            0x48, 0x83, 0xc4, 0x10, 0x5b, 0xc3,
+        }, kA},
+        {"leaf reading rsp through movbe", {
+            0x53, 0x48, 0x83, 0xec, 0x10, 0x48, 0x89, 0x3c, 0x24, 0x4c, 0x8d, 0x4c, 0x24, 0xf0,
+            0x49, 0x0f, 0x38, 0xf1, 0x21, 0x4d, 0x0f, 0x38, 0xf0, 0x01, 0x48, 0x89, 0x74, 0x24, 0xf0, 0x49, 0x8b, 0x00,
+            0x48, 0x83, 0xc4, 0x10, 0x5b, 0xc3,
+        }, kA},
+        {"leaf writing rsp through immediate imul", {
+            0x53, 0x48, 0x83, 0xec, 0x10, 0x48, 0x89, 0x3c, 0x24, 0x4c, 0x8d, 0x4c, 0x24, 0xf0,
+            0x4d, 0x8d, 0x41, 0x10, 0x4d, 0x89, 0x01, 0x49, 0x6b, 0x21, 0x01, 0x48, 0x8b, 0x04, 0x24,
+            0x48, 0x83, 0xc4, 0x10, 0x5b, 0xc3,
+        }, kA},
     };
 }
 
@@ -562,7 +591,7 @@ Framing load(const Image& image, const bool frame) {
         }
         cursor = (cursor + 15) / 16 * 16;
         stubs[index] = base + cursor;
-        require(cursor + site.Body.size() <= kRunnerBase, "the stubs do not fit before the runner");
+        require(cursor + site.Body.size() <= kProbeBase, "the stubs do not fit before the calibration probe");
         auto* stub = arena + cursor;
         std::copy(site.Body.begin(), site.Body.end(), stub);
         Codegen::ApplyStubRelocations(std::span<std::uint8_t>(stub, site.ReturnBranchOffset), site.Relocations, site.Address, base + cursor, site.Offset);
@@ -669,7 +698,7 @@ void verifySkippedLeaves(const std::vector<Leaf>& leaves) {
     }
     require(framing.Report.RedZoneFunctions == leaves.size() && framing.Report.Framed == 0 && framing.Sites.empty() && framing.Displacements.empty(),
             "a leaf with a direct rsp operand was framed");
-    require(framing.Report.Skipped.at("other use of rsp") == leaves.size(),
+    require((framing.Report.Skipped.contains("other use of rsp") ? framing.Report.Skipped.at("other use of rsp") : 0) + (framing.Report.Skipped.contains("other use of rsp in a relocated leaf") ? framing.Report.Skipped.at("other use of rsp in a relocated leaf") : 0) == leaves.size(),
             "not every leaf with a direct rsp operand was skipped as another use of rsp");
 }
 
@@ -701,6 +730,7 @@ int main() {
         require(switched.Exits == 4 && switched.WidenedExits == 4, "the leaves with jump tables were framed with " + std::to_string(switched.Exits) + " exits, " + std::to_string(switched.WidenedExits) + " widened, not 4 and 4");
         const auto relocated = runLeaves(relocatedLeaves());
         require(relocated.Relocated == 9 && relocated.RelocatedCases == 2 && relocated.RelocatedOpenJumps == 0 && relocated.Skipped.empty(), "the leaves that cannot be framed in place were relocated " + std::to_string(relocated.Relocated) + " times with " + std::to_string(relocated.RelocatedCases) + " case jumps and " + std::to_string(relocated.RelocatedOpenJumps) + " open jumps and " + std::to_string(relocated.Skipped.size()) + " skip reasons, not 9, 2, 0 and 0");
+        verifySkippedLeaves(skippedDirectRspLeaves());
         std::cout << "red-zone framer execution tests passed\n";
         return 0;
     } catch (const SteppingDegraded& error) {

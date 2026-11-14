@@ -613,6 +613,11 @@ std::size_t retireStoreImports(HostImports& state, std::uint64_t begin, std::uin
     return retired;
 }
 
+bool retireFreesAtOnce(bool hold) {
+    const auto* recorder = Recorder::Active();
+    return recorder == nullptr || (!hold && recorder->Idle());
+}
+
 void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, bool hold = true) {
 #ifdef _WIN32
     auto* reading = forgetSettle(state, it->first);
@@ -1878,12 +1883,16 @@ ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, s
     if (run.ranges.empty()) return run;
     if (std::all_of(run.ranges.begin(), run.ranges.end(), [window](const auto& range) { return range->bytes > window; })) return run;
     if (begin == run.base) return run;
+    if (run.ranges.front()->bytes > window && run.bytes - run.ranges.front()->bytes <= window) return run;
     // A binding from inside the first range joins too when that range is imported on its own (no
     // window block groups it with its neighbours) and the run holds a range larger than the
     // window: left apart, every use is copied on the CPU (007 First Light binds 12.5 MiB from
     // inside a 2 MiB range into the 12 MiB one after it, per draw). A run of ranges no larger than
-    // the window stays apart: those are grouped by window blocks.
-    if (std::any_of(run.ranges.begin(), run.ranges.end(), [window](const auto& range) { return range->bytes > window; })) {
+    // the window stays apart: those are grouped by window blocks. As for the first-range rule
+    // above, the ranges beside the large one must fit one window.
+    std::uint64_t largest = 0;
+    for (const auto& range : run.ranges) largest = std::max<std::uint64_t>(largest, range->bytes);
+    if (largest > window && run.bytes - largest <= window) {
         if (const auto bounds = importRunBounds(lease, begin); bounds.found && bounds.first == bounds.last) return run;
     }
     return {};
@@ -2563,7 +2572,12 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     const bool arming = GuestArena::GuestArenaArming_nid_no_patch();
     const bool deferred = deferredSettles.load(std::memory_order_relaxed) && entry.alias == nullptr && state.watchPrivateImports && writable && !watchedHostPointer;
 #endif
-    GuestMemory::ImportWatched(base, bytes, [&] {
+#ifndef _WIN32
+    const bool dmaBufOnly = state.dmaBufSelected && sharedBacked(context, base, bytes);
+#else
+    constexpr bool dmaBufOnly = false;
+#endif
+    if (!dmaBufOnly) GuestMemory::ImportWatched(base, bytes, [&] {
         step = watchedDmaBuf == watchedHostPointer ? createImport(context, entry, result, state.dmaBufImportsCoherent) : createHostPointerImport(context, entry, result);
 #ifdef _WIN32
         // Without a settle, an import the arena may arm still needs its first GPU use here, while

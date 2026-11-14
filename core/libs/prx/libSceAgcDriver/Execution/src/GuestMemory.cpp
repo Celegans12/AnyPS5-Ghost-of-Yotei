@@ -324,9 +324,10 @@ void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectCleanSkips{0};
-// Walks by this thread of memory the arena does not report clean, and epoch bumps skipped because no
+// Walks by any thread of memory the arena does not report clean (observations are shared between
+// threads, so another thread's walk can serve this one's memo), and epoch bumps skipped because no
 // such walk and no opening of armed memory happened since the thread's last bump.
-thread_local std::uint64_t uncleanWalks = 0;
+std::atomic<std::uint64_t> uncleanWalks{0};
 std::atomic<std::uint64_t> collectEpochSkips{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 // Epoch stamps taken by callers (CollectEpoch, ThreadCollectEpoch), and what made each real bump
@@ -2105,7 +2106,8 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr, bool* dirty = nullptr) {
     ++tracker.generation;
-    ++uncleanWalks;
+    uncleanWalks.fetch_add(1, std::memory_order_relaxed);
+    observationPoint(1);
     StampRuns runs{tracker, kind, 0, window, {}};
 #ifdef _WIN32
     const bool complete = collectWindowsWrites(runs, first, stop, armedOnly);
@@ -2187,8 +2189,9 @@ void largeCleanNote(std::uint64_t first, std::uint64_t stop, bool dirty, std::ui
     entry.mapping = mapping;
 }
 
-std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
-    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
+    using Status = Observation::Status;
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return {Status::Uncovered, 0};
     auto& tracker = Tracker();
     constexpr std::uint64_t page = 4096;
     const auto first = address & ~(page - 1);
@@ -2200,13 +2203,15 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
         return {Status::Complete, tracker.stable.load(std::memory_order_acquire)};
     }
+    const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const bool large = memoized && collectMemoEnabled() && stop - first >= largeCleanBytes();
     if (large && largeCleanSkip(first, stop, unwatched, mapping)) {
         largeCleanSkips.fetch_add(1, std::memory_order_relaxed);
         largeCleanSkippedMiB.fetch_add((stop - first) >> 20u, std::memory_order_relaxed);
-        return tracker.stable.load(std::memory_order_acquire);
+        return {Status::Complete, tracker.stable.load(std::memory_order_acquire)};
     }
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
     if (!tracker.watched || !tracker.covers(address, bytes)) return {Status::Uncovered, 0};
     syncObservationContext(tracker, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix());
@@ -2247,49 +2252,35 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (!runs.empty()) timed.emplace(CounterCollect, bytes);
     std::size_t done = 0;
     auto status = Status::Complete;
+    bool dirty = false;
+    // Section A: a run that is clean since its last resetting collect (armed, so any CPU store
+    // would have faulted and ended that) has nothing to stamp. Its walk is skipped and it is
+    // observed like a run whose walk found nothing.
+    const auto walk = [&](const Run& run) {
+#ifdef _WIN32
+        if (GuestArena::GuestArenaClean_nid_no_patch(static_cast<std::uintptr_t>(run.first), static_cast<std::size_t>(run.stop - run.first))) {
+            collectCleanSkips.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+#endif
+        bool written = true;
+        const bool complete = walkWrites(tracker, run.first, run.stop, StampKind::Cpu, false, nullptr, &written);
+        dirty = dirty || written || !complete;
+        return complete;
+    };
     for (auto& run : runs) {
-        bool complete = walkWrites(tracker, run.first, run.stop, StampKind::Cpu);
+        bool complete = walk(run);
         if (!complete && (run.first < first || run.stop > stop)) {
             run = {std::max(first, run.first), std::min(stop, run.stop), true};
-            complete = walkWrites(tracker, run.first, run.stop, StampKind::Cpu);
+            complete = walk(run);
         }
-    }
-    bool dirty = true;
+        if (!complete) {
 #ifdef _WIN32
-    // Section A: a range that is clean since its last resetting collect (armed, so any CPU store
-    // would have faulted and ended that) has nothing to stamp. The walk is skipped; the observation
-    // is recorded below as for a walk that found nothing.
-    const bool clean = GuestArena::GuestArenaClean_nid_no_patch(static_cast<std::uintptr_t>(first), static_cast<std::size_t>(stop - first));
-#else
-    const bool clean = false;
-#endif
-    if (clean) {
-        collectCleanSkips.fetch_add(1, std::memory_order_relaxed);
-        dirty = false;
-    } else if (!walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, &dirty)) {
-#ifdef _WIN32
-        if (first == requestedFirst && stop == requestedStop) return 0;
-        first = requestedFirst;
-        stop = requestedStop;
-        if (!walkWrites(tracker, first, stop, StampKind::Cpu, false, nullptr, &dirty)) return 0;
+            status = Status::Refused;
 #else
             status = Status::Failed;
 #endif
-    }
-    if (large) largeCleanNote(requestedFirst, requestedStop, dirty, unwatched, mapping);
-    // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
-    if (collectMemoEnabled()) {
-        const auto serial = unwatchSerial.load(std::memory_order_relaxed);
-        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial, mapping};
-        else {
-            if (useMemo && epochal) {
-                auto& memo = threadCollectMemo();
-                memo.entries[memo.next++ % memo.entries.size()] = {first, stop, epoch, serial, mapping};
-            }
-            if (epochal && epochCollectMapEnabled()) {
-                auto& entry = epochCollectMap(epoch).ranges[first];
-                if (entry.unwatched != serial || entry.mapping != mapping || entry.end < stop) entry = {first, stop, epoch, serial, mapping};
-            }
+            break;
         }
         if (shared && run.exact) tracker.exactObservations[tracker.nextExactObservation++ % tracker.exactObservations.size()] = {run.first, run.stop, tick};
         ++done;
@@ -2304,6 +2295,8 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
         if (end > from) tracker.publishObserved(from, end - 1, tick);
     }
     if (status != Status::Complete) return {status, 0};
+    // A range served wholly by other observations of the epoch says nothing new about its walks.
+    if (large && done != 0) largeCleanNote(first, stop, dirty, unwatched, mapping);
     return {Status::Complete, generation};
 }
 
@@ -2427,7 +2420,7 @@ void BumpCollectEpoch() {
         };
         struct Slot {};
         auto& seen = ThreadScratch<Seen, Slot>();
-        const auto walks = uncleanWalks;
+        const auto walks = uncleanWalks.load(std::memory_order_relaxed);
         const auto opens = GuestArena::GuestArenaArmedOpens_nid_no_patch();
         const auto stamps = threadEpochStamps;
         if (seen.walks == walks && seen.opens == opens && seen.stamps == stamps) {
@@ -2440,7 +2433,7 @@ void BumpCollectEpoch() {
         seen.stamps = stamps;
     }
 #endif
-    const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
+    const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
     while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
@@ -3041,7 +3034,7 @@ thread_local ThreadCollectMemo threadHintMemo;
 bool walkHints(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop) {
     auto cursor = first;
     bool marked = false;
-    ++uncleanWalks;
+    uncleanWalks.fetch_add(1, std::memory_order_relaxed);
     StampRuns runs{tracker, StampKind::Cpu};
     while (cursor < stop) {
         std::size_t count = tracker.pages.size();

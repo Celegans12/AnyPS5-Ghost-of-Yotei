@@ -102,13 +102,13 @@ inline std::array<std::byte, PipelinePushConstantBytes> AssemblePushConstants(st
         if (bytes.empty()) continue;
         Require(bytes.size() % 4 == 0 && shader.pushConstantOffset % 4 == 0, "shader push constant range is not DWORD aligned");
         Require(shader.pushConstantOffset < PipelinePushConstantBytes && bytes.size() <= PipelinePushConstantBytes - shader.pushConstantOffset, "shader push constant range lies outside the pipeline push constant block");
+        // rewrite/direct: a direct compute program may fill the whole block (ComputePushBytesFor).
         Require(shader.stage == ShaderRecompiler::ShaderStage::Compute || bytes.size() <= PipelinePushSlotBytes - shader.pushConstantOffset % PipelinePushSlotBytes, "shader push constant range crosses a push constant slot");
-        for (std::size_t i = 0; i < bytes.size(); ++i) {
-            const auto position = shader.pushConstantOffset + i;
-            Require(!occupied[position], "shader push constant ranges of different stages overlap");
-            occupied[position] = true;
-            result[position] = bytes[i];
-        }
+        const auto dwords = bytes.size() / 4;
+        const auto range = (dwords >= 64 ? ~std::uint64_t{0} : (std::uint64_t{1} << dwords) - 1) << (shader.pushConstantOffset / 4);
+        Require((occupied & range) == 0, "shader push constant ranges of different stages overlap");
+        occupied |= range;
+        std::memcpy(result.data() + shader.pushConstantOffset, bytes.data(), bytes.size());
     }
     return result;
 }

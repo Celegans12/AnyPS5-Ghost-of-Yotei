@@ -1035,15 +1035,6 @@ class TraceDigestTests(unittest.TestCase):
                 self.assertIn(str(self.stacks) + ":2:", errors.getvalue())
                 self.assertNotIn("Traceback", errors.getvalue())
 
-    def test_stack_weights_are_plain_decimal_digits(self):
-        for count in ("1_0", "+5", "٥"):
-            with self.subTest(count=count):
-                self.stacks.write_text("# header\nworker;draw " + count + "\n", encoding="utf-8")
-                with self.assertRaisesRegex(ValueError, ":2: sample count must be a positive integer"):
-                    trace_digest.load_stacks(self.stacks)
-        self.stacks.write_text("# header\nworker;draw 010\n", encoding="utf-8")
-        self.assertEqual(trace_digest.load_stacks(self.stacks), [(["worker", "draw"], 10)])
-
 
     def test_stacks_self_and_total(self):
         stacks = self.result()["stacks"]

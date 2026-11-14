@@ -139,6 +139,8 @@ std::size_t NanTests(std::span<const std::uint32_t> words) {
         const auto opcode = words[offset] & spv::OpCodeMask;
         if (opcode == spv::OpConstant && count == 4 && words[offset + 3] == 0x7f800000u) infinities.insert(words[offset + 2]);
         if (opcode == spv::OpUGreaterThan && count == 5 && infinities.contains(words[offset + 4])) ++tests;
+        // rewrite/direct emits the add and subtract NaN test as FPIsNan32 (x != x, unordered).
+        if (opcode == spv::OpFUnordNotEqual && count == 5 && words[offset + 3] == words[offset + 4]) ++tests;
         offset += count;
     }
     return tests;

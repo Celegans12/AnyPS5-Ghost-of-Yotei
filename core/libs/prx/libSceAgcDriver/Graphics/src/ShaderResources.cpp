@@ -3225,6 +3225,17 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
         // A direct stage's table mirror map is keyed by its hash, not its (large) words.
         const bool hashedMap = binding.role == ShaderRecompiler::DescriptorRole::ImageTableMap && program.directTableMapHash != 0u;
         for (const auto word : {static_cast<std::uint32_t>(binding.kind), static_cast<std::uint32_t>(binding.role), binding.descriptorSet, binding.binding, binding.count, binding.readOnly ? 1u : 0u, binding.imageShape.has_value() ? static_cast<std::uint32_t>(*binding.imageShape) + 1u : 0u, hashedMap ? 2u : static_cast<std::uint32_t>(binding.guestDescriptor.size())}) visit(word);
+        if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable && binding.guestDescriptor.size() > CompactTableKeyWords) {
+            TableKeyHash hash;
+            hash.bytes(binding.guestDescriptor.data(), binding.guestDescriptor.size() * sizeof(std::uint32_t));
+            hash.bytes(binding.imageSamplers.data(), binding.imageSamplers.size() * sizeof(binding.imageSamplers[0]));
+            hash.bytes(binding.imageShapes.data(), binding.imageShapes.size() * sizeof(binding.imageShapes[0]));
+            for (const auto* set : {&binding.imageWritten, &binding.samplerDepthCompare, &binding.imageDepthCompare, &binding.imageAtomic, &binding.samplerUnnormalized, &binding.samplerIntegerBorder, &binding.samplerCoordinatesIgnored, &binding.imageUnnormalized, &binding.imageUnnormalizedBaseLevel, &binding.bufferWritten}) hash.bits(*set);
+            const auto first = hash.a();
+            const auto second = hash.b();
+            for (const auto word : {0xc0de7ab1u, static_cast<std::uint32_t>(first), static_cast<std::uint32_t>(first >> 32u), static_cast<std::uint32_t>(second), static_cast<std::uint32_t>(second >> 32u)}) visit(word);
+            continue;
+        }
         if (hashedMap) {
             visit(static_cast<std::uint32_t>(program.directTableMapHash));
             visit(static_cast<std::uint32_t>(program.directTableMapHash >> 32u));
@@ -7205,7 +7216,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     writeDrawSets(*result, selected, faultRecord);
     recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) {
-        if (snapshot.buffer->Mapped()) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+        if (snapshot.buffer != nullptr && snapshot.buffer->Mapped()) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     }
     return result;
 }

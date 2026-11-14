@@ -596,6 +596,8 @@ int main(int argc, char** argv) {
     try {
         SetObservationHookForTest(&Hook);
 #ifdef _WIN32
+        // rewrite/direct: the test counts OS walks, and section A answers clean memory without one.
+        _putenv_s("APS5_NO_PROTECT_TRACKING", "1");
         if (!WriteWatched()) {
             std::cout << "collect memo generation test skipped: the guest arena is not write watched\n";
             return 77;

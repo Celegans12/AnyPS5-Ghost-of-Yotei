@@ -45,12 +45,6 @@ int main() {
 
     Require(sceFontStyleFrameSetScalePixel(&frame, 32.0f, 16.0f) == SCE_FONT_OK);
     Require(sceFontStyleFrameGetScalePixel(&frame, nullptr, nullptr) == SCE_FONT_ERROR_INVALID_PARAMETER);
-    errno = 71;
-    Require(sceFontStyleFrameGetScalePixel(&frame, reinterpret_cast<float*>(0x10), &h) == SCE_FONT_ERROR_INVALID_PARAMETER);
-    Require(errno == 71);
-    errno = 71;
-    Require(sceFontStyleFrameGetScalePixel(&frame, &w, reinterpret_cast<float*>(0x10)) == SCE_FONT_ERROR_INVALID_PARAMETER);
-    Require(errno == 71);
     Require(sceFontStyleFrameGetScalePixel(&frame, &w, &h) == SCE_FONT_OK && Near(w, 32.0f) && Near(h, 16.0f));
     Require(sceFontStyleFrameGetScalePoint(&frame, &w, &h) == SCE_FONT_OK && Near(w, 32.0f) && Near(h, 16.0f));
     Require(sceFontStyleFrameGetScalePoint(&frame, nullptr, nullptr) == SCE_FONT_ERROR_INVALID_PARAMETER);

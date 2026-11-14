@@ -779,8 +779,13 @@ public:
         for (std::size_t index = 0u; index < sampling.initial.size(); ++index) {
             const auto& range = sampling.initial[index];
             Require(GuestMemory::Accessible(reinterpret_cast<const void*>(range.address), range.bytes) && GuestMemory::Watched(range.address, range.bytes), "native multisample depth requires watched accessible guest memory");
-            if (recorder != nullptr && !(index == 1u && queuedFill) && !(index == 2u && queuedStencilFill)) Require(!recorder->PendingWriteOverlaps(range.address, range.bytes), "external GPU writes over native multisample depth are not implemented");
-            GuestMemory::CollectWrites(range.address, range.bytes);
+            if (recorder != nullptr && !(index == 1u && queuedFill) && !(index == 2u && queuedStencilFill) && recorder->PendingWriteOverlaps(range.address, range.bytes)) {
+                Require(!recorder->PendingStoreOverlaps(range.address, range.bytes), "external GPU writes over native multisample depth are not implemented");
+                const auto settled = GuestMemory::TrackerGeneration();
+                RecorderFor(context)->SyncThrough(range.address, range.bytes);
+                Require(!GuestMemory::WrittenSince(range.address, range.bytes, settled), "external GPU writes over native multisample depth are not implemented");
+            }
+            GuestMemory::CollectWritesUncached(range.address, range.bytes);
             const auto alias = MultisampleColorTargetOver(range.address, range.bytes);
             if (!alias || (index == 2u && sampling.unprovenStencil && stencilClearGeneration == 0u)) continue;
             if (index == 0u && sampling.depthAlias && sameDepthAlias(*sampling.depthAlias, range)) continue;
@@ -1069,28 +1074,7 @@ public:
     }
 
     void NoteHostWrite() {
-        if (samplingActive && target.format == VK_FORMAT_D32_SFLOAT_S8_UINT && context.detiler != nullptr && !hostWritten->load(std::memory_order_acquire)) {
-            try {
-                const auto lease = GuestAllocations::GuestAllocationsAcquireAll_nid_postfix();
-                constexpr int captureAttempts = 8;
-                for (int attempt = 1;; ++attempt) {
-                    try {
-                        CheckCurrent();
-                        std::vector<PublicationPlane> captured;
-                        for (const auto& range : sampling.initial) captured.push_back(CapturePublication(range));
-                        for (std::size_t index = 0u; index < captured.size(); ++index) publishedPages[index] = captured[index].pageHashes;
-                        Require(AcceptHeldPublication(), "guest writes raced native multisample depth publication capture");
-                        publication = std::move(captured);
-                        break;
-                    } catch (...) {
-                        if (attempt == captureAttempts) throw;
-                    }
-                }
-            } catch (...) {
-                publicationFailure = std::current_exception();
-                publication.clear();
-            }
-        }
+        if (samplingActive && !hostWritten->load(std::memory_order_acquire)) capturePublication();
         hostEverWritten->store(true, std::memory_order_release);
         hostWritten->store(true, std::memory_order_release);
     }

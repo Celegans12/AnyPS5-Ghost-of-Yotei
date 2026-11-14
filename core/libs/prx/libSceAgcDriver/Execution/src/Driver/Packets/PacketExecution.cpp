@@ -349,7 +349,7 @@ void Driver::execute(Submission& submission) {
                 // Rewrite: a value no write reached since this queue's last bump orders nothing new
                 // (unwrittenSinceLastBump); a label store of another queue since arrival still bumps.
                 const bool stale = !alwaysBump && !since && unwrittenSinceLastBump(awaited, awaitedBytes);
-                if (alwaysBump || ((!since || writer != submission.queue) && !stale)) bumpEpoch(&EpochBumps::waits);
+                if (alwaysBump || ((!since || writer != submission.queue) && !stale)) bumpWaitEpoch(awaited, awaitedBytes);
                 // Debug aid (rewrite): APS5_TRACE_WAIT_WRITERS=1 sorts the pipelined at-entry waits
                 // that bump by who stored the awaited value.
                 static const bool traceWriters = std::getenv("APS5_TRACE_WAIT_WRITERS") != nullptr;
