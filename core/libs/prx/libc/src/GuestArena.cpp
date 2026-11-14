@@ -418,6 +418,26 @@ public:
         }
         return false;
     }
+
+#ifndef _WIN32
+    void ReleaseHostRegion(const void* pointer, std::size_t bytes) {
+        Release(pointer, bytes);
+        std::lock_guard lock(_lock);
+        const auto start = reinterpret_cast<std::uintptr_t>(pointer);
+        const auto end = start + bytes;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> kept;
+        for (const auto& [regionStart, regionEnd] : _hostRegions) {
+            if (regionEnd <= start || regionStart >= end) {
+                kept.emplace_back(regionStart, regionEnd);
+                continue;
+            }
+            if (regionStart < start) kept.emplace_back(regionStart, start);
+            if (regionEnd > end) kept.emplace_back(end, regionEnd);
+        }
+        _hostRegions = std::move(kept);
+        static_cast<void>(ReserveNoReplace(start, bytes));
+    }
+#endif
 };
 
 const bool g_reserved = (Arena::Get(), true);
@@ -552,6 +572,19 @@ void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, 
     const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
     WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), false);
     noteAccess(pointer, bytes);
+}
+
+void GuestArenaMapZero_nid_postfix(void* pointer, std::size_t bytes) {
+    if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("zero page mapping", pointer, bytes);
+    const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
+    const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    WindowsMappings::Get().MapZero(pointer, bytes);
+    if (const auto callback = privateMappingObserver.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes, generation);
+    noteAccess(pointer, bytes);
+}
+
+bool GuestArenaRecoverRead_nid_no_patch(EXCEPTION_POINTERS*) {
+    return false;
 }
 
 void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
@@ -860,6 +893,7 @@ namespace {
 
 std::atomic<SharedBackingResolver> sharedBackingResolver{nullptr};
 std::atomic<SharedBackingWriter> sharedBackingWriter{nullptr};
+std::atomic<SharedBackingRunsResolver> sharedBackingRunsResolver{nullptr};
 
 }
 
@@ -879,6 +913,23 @@ bool GuestArenaWriteSharedBacking_nid_no_patch(std::uintptr_t address, const voi
 bool GuestArenaSharedBacking_nid_postfix(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset) {
     const auto resolver = sharedBackingResolver.load(std::memory_order_acquire);
     return resolver != nullptr && resolver(address, bytes, file, offset);
+}
+
+void GuestArenaSetSharedBackingRuns_nid_postfix(SharedBackingRunsResolver resolver) {
+    sharedBackingRunsResolver.store(resolver, std::memory_order_release);
+}
+
+bool GuestArenaSharedBackingRuns_nid_postfix(std::uintptr_t address, std::size_t bytes, int* file, SharedBackingRun* runs, std::size_t capacity, std::size_t* count) {
+    const auto resolver = sharedBackingRunsResolver.load(std::memory_order_acquire);
+    return resolver != nullptr && resolver(address, bytes, file, runs, capacity, count);
+}
+
+bool GuestArenaOverlapsHostRegion_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return Arena::Get().OverlapsHostRegion(address, bytes);
+}
+
+void GuestArenaReleaseHostRegion_nid_no_patch(const void* pointer, std::size_t bytes) {
+    Arena::Get().ReleaseHostRegion(pointer, bytes);
 }
 #endif
 

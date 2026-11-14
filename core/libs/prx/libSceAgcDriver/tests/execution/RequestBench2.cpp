@@ -204,7 +204,9 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::seconds(limit));
             std::fprintf(stderr, "request bench: exceeded %u s, exiting without waiting for the device\n", limit);
             std::fflush(stderr);
+#ifdef _WIN32
             TerminateProcess(GetCurrentProcess(), 3);
+#endif
             std::_Exit(3);
         }).detach();
         auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(argv[1]));
@@ -554,7 +556,9 @@ int main(int argc, char** argv) {
         }
         std::fflush(stdout);
         std::fflush(nullptr);
+#ifdef _WIN32
         TerminateProcess(GetCurrentProcess(), 0);  // no DLL detach: ExitProcess after APS5_PROFILE_GPU hung in teardown
+#endif
         std::_Exit(0);
     } catch (const std::exception& error) {
         std::cerr << "request bench: " << error.what() << '\n';

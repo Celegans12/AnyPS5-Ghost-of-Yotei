@@ -78,6 +78,7 @@ bool CheckMetadataCommit() {
     Require(queried.PrivateUsage < after.PrivateUsage + (4u << 20u), "queries allocated untouched tracking leaves");
     return true;
 }
+#endif
 
 void CheckForgetGuard() {
     static std::array<std::uint8_t, 6 * Block> storage{};
@@ -97,6 +98,7 @@ void CheckForgetGuard() {
     Require(ForgetGuard(base + 4 * Block, Block) == guard, "a forget before a range's first block moved its forget guard");
 }
 
+#ifdef _WIN32
 void CheckSparseLeafBoundaries() {
     constexpr std::uintptr_t LeafBytes = std::uintptr_t{1} << 32;
     std::uintptr_t arena = 0;

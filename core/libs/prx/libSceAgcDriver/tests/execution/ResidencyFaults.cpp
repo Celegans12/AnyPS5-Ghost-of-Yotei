@@ -197,7 +197,9 @@ void RefusedGuardWritesBack(const Harness& harness, std::uint32_t index) {
         return;
     }
     const auto unguardable = harness.driver.Manager().Counts().accessUnguardable;
+#ifdef _WIN32
     GuestArena::GuestArenaPinWritable_nid_postfix(harness.guest.Words(index), ResidencyPageBytes);
+#endif
     harness.FillMirror(index, 6, 0x6e6e6e6eu, 0);
     Expect(harness.driver.Manager().Counts().accessUnguardable == unguardable + 1, "refused guard: the pinned page's guard was not refused");
     Expect(!GuestArena::GuestArenaAccessGuarded_nid_no_patch(harness.guest.Address(index, 6)), "refused guard: a guard was armed over a pinned page");
@@ -207,7 +209,9 @@ void RefusedGuardWritesBack(const Harness& harness, std::uint32_t index) {
         harness.device.SubmitRecorded(false);
         harness.device.WaitIdle();
     }
+#ifdef _WIN32
     GuestArena::GuestArenaUnpinWritable_nid_postfix(harness.guest.Words(index), ResidencyPageBytes);
+#endif
     Expect(!harness.driver.Manager().Slot(harness.Page(index)).has_value(), "refused guard: the page was not demoted, so the GPU write could not go to guest memory directly");
     Expect(harness.guest.Words(index)[6 * WordsPerSubpage + 9] == 0x6e6e6e6eu, "refused guard: the GPU write did not reach guest memory");
     Expect(harness.guest.Words(index)[5 * WordsPerSubpage + 9] == Pattern(index, 5 * WordsPerSubpage + 9), "refused guard: a subpage the GPU did not write changed");
