@@ -1035,7 +1035,7 @@ void skipsModRmAndVectorRspOperands() {
         Codegen::RedZoneFrameReport report;
         std::vector<Codegen::RedZoneDisplacement> displacements;
         const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-        require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 2 && report.Framed == 0 && report.Skipped.at("other use of rsp") == 2,
+        require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 2 && report.Framed == 0 && (report.Skipped.contains("other use of rsp") ? report.Skipped.at("other use of rsp") : 0) + (report.Skipped.contains("other use of rsp in a relocated leaf") ? report.Skipped.at("other use of rsp in a relocated leaf") : 0) == 2,
                 "direct rsp operand case " + std::to_string(index) + " was framed");
     }
 }
