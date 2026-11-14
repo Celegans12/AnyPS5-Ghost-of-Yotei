@@ -92,10 +92,10 @@ The reports under `docs/yotei/kyty-backend/` have the runs behind each number.
 
 ## The write-ups
 
-`docs/yotei/kyty-backend/` holds the plan and the working reports of those days, as written at the time, with a few
+`docs/yotei/kyty-backend/` holds the working reports of those days, as written at the time, with a few
 lines removed that concerned unrelated work (marked `[redacted]`). They are lab notes: they name local paths, run
 tags and work folders that are not in this repository, and `2026-11-11-v4-intree.md` was never finished (its `TODO`
-markers are original). Start with `PLAN-v4.md`, `2026-11-08-v4-g2.md` and `2026-11-11-v4-intree.md`;
+markers are original). Start with `2026-11-08-v4-seam.md`, `2026-11-08-v4-g2.md` and `2026-11-11-v4-intree.md`;
 `2026-11-08-tried-ledger.md` lists what was tried on the old backend before this.
 
 You need your own legally obtained copy of the game. No game files are in this repository.
