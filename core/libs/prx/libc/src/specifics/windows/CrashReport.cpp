@@ -638,6 +638,23 @@ DWORD WINAPI HangWatchdog(LPVOID param) {
     return 0;
 }
 
+// Debug aid: APS5_STALL_DUMP_SECS=<n> aborts, with every thread's stack in the report, once no GPU
+// submission was made for n seconds after the first one.
+DWORD WINAPI StallWatchdog(LPVOID param) {
+    const auto seconds = static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(param));
+    for (;;) {
+        Sleep(1000);
+        const auto last = GuestArena::GuestArenaLastSubmitTick_nid_no_patch();
+        if (last == 0) continue;
+        const auto now = GetTickCount64();
+        if (now > last && now - last > seconds * 1000ull) break;
+    }
+    Report("\nFATAL: no GPU submission for %llu s (APS5_STALL_DUMP_SECS); aborting\n", seconds);
+    std::fflush(stderr);
+    std::abort();
+    return 0;
+}
+
 void ReportStackCandidates(std::uint64_t rsp, int limit, std::uint64_t span) {
     char line[256];
     Report("  stack return address candidates:\n");
@@ -704,6 +721,10 @@ const bool g_crashReportInstalled = [] {
             if (end && *end == 0) seconds = value;
         }
         if (seconds > 0) CreateThread(nullptr, 0, HangWatchdog, reinterpret_cast<LPVOID>(static_cast<std::uintptr_t>(seconds)), 0, nullptr);
+    }
+    if (const char* stall = std::getenv("APS5_STALL_DUMP_SECS")) {
+        const auto seconds = std::strtoull(stall, nullptr, 10);
+        if (seconds > 0) CreateThread(nullptr, 0, StallWatchdog, reinterpret_cast<LPVOID>(static_cast<std::uintptr_t>(seconds)), 0, nullptr);
     }
     return true;
 }();

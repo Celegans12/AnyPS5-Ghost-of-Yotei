@@ -4959,6 +4959,8 @@ const HostImport* lockedImportFor(const Context& context, HostImports& state, st
 
 constexpr std::uint64_t storeBlockBytes = 0x10000;
 constexpr std::size_t storeImportLimit = 8192;
+constexpr std::uint64_t largeStoreBytes = 0x100000;
+constexpr std::uint64_t largeStoreGrid = 0x1000000;
 
 // Drops the least recently used store imports no build holds, down to seven eighths of the limit.
 void trimStoreImports(HostImports& state) {
@@ -5006,8 +5008,12 @@ const HostImport* storeImport(const Context& context, HostImports& state, const 
         return found;
     }
     const auto alignment = context.hostImportAlignment;
-    const auto base = std::max(regular.base, begin & ~(storeBlockBytes - 1));
-    const auto limit = std::min(regular.base + regular.bytes, (end + storeBlockBytes - 1) & ~(storeBlockBytes - 1));
+    // A large store (a shader's written region of tens of MiB) takes an import on a coarse grid:
+    // a title that moves such a region by a little each frame (007) would otherwise leave one
+    // import per position, hundreds of them over the same pages.
+    const std::uint64_t grid = end - begin >= largeStoreBytes ? largeStoreGrid : storeBlockBytes;
+    const auto base = std::max(regular.base, begin & ~(grid - 1));
+    const auto limit = std::min(regular.base + regular.bytes, (end + grid - 1) & ~(grid - 1));
     const auto bytes = limit - base;
     const auto refuse = [&]() -> const HostImport* {
         ++state.storesRefused;
@@ -5020,6 +5026,12 @@ const HostImport* storeImport(const Context& context, HostImports& state, const 
     }
     // A shorter store import at the same base gives way, unless a build holds its pointer.
     if (const auto same = state.storeImports.find(base); same != state.storeImports.end()) {
+        // The one at this base already covers the store (the nearest-base search above gives up
+        // after a few smaller imports in between).
+        if (same->second.base + same->second.bytes >= limit) {
+            same->second.lastUse = ++state.useCounter;
+            return &same->second;
+        }
         if (pointerHeld(state, same->second)) return refuse();
         auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.storeImports.extract(same));
         if (auto* recorder = Recorder::Active()) recorder->KeepThroughHold(std::move(holder));
@@ -8024,8 +8036,14 @@ bool GuestBufferMemory::StoresDedicated() const {
         if ((builds.fetch_add(1, std::memory_order_relaxed) & 0xfff) == 0xfff) std::fprintf(stderr, "[gpu-write] builds stored through ordinary imports: no owner %llu, own region in place %llu, heap region in place %llu, copy-back %llu\n", static_cast<unsigned long long>(reasons[0].load()), static_cast<unsigned long long>(reasons[1].load()), static_cast<unsigned long long>(reasons[2].load()), static_cast<unsigned long long>(reasons[3].load()));
         return false;
     };
+    static const bool check = std::getenv("APS5_PROTECT_CHECK") != nullptr;
+    static std::atomic<std::uint32_t> checked{0};
     for (const auto& [begin, end] : writes) {
         const auto* region = owner(begin, end);
+        if (check && end - begin >= (1u << 20u) && checked.fetch_add(1, std::memory_order_relaxed) < 40) {
+            if (region == nullptr) std::fprintf(stderr, "[protect-check] build write 0x%llx+%llu KiB has no owner\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>((end - begin) >> 10u));
+            else std::fprintf(stderr, "[protect-check] build write 0x%llx+%llu KiB: region 0x%llx-0x%llx own %d direct %d (store %d registered %llu KiB alias %d) gpuCopy %d copiedBack %d deviceLocal %d copySourceStore %d copySource %d mirror %d sparse %d overlay %d unstaged %d\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>((end - begin) >> 10u), static_cast<unsigned long long>(region->begin), static_cast<unsigned long long>(region->end), !regions.empty() && region >= regions.data() && region < regions.data() + regions.size() ? 1 : 0, region->direct != nullptr ? 1 : 0, region->direct != nullptr && region->direct->store ? 1 : 0, static_cast<unsigned long long>(region->direct != nullptr ? region->direct->registeredBytes >> 10u : 0), region->direct != nullptr && region->direct->alias != nullptr ? 1 : 0, region->gpuCopy ? 1 : 0, region->copiedBack ? 1 : 0, region->deviceLocal ? 1 : 0, region->copySourceStore ? 1 : 0, region->copySource != VK_NULL_HANDLE ? 1 : 0, region->mirror != nullptr ? 1 : 0, region->sparse ? 1 : 0, region->overlay ? 1 : 0, region->unstaged ? 1 : 0);
+        }
         if (region == nullptr) return refuse(0);
         if (region->direct != nullptr) {
             if (region->direct->store || region->direct->registeredBytes == 0) continue;

@@ -618,9 +618,9 @@ public:
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
 #ifdef _WIN32
         {
-            std::uint64_t protect[10]{};
+            std::uint64_t protect[12]{};
             GuestArena::GuestArenaProtectCounts_nid_no_patch(protect, std::size(protect));
-            AgcDriver::ProfilePrint_nid_no_patch(" | protect walks %llu arms %llu faults %llu hot %llu raced %llu armed %.0f MiB in %llu; submits %llu armed there %.0f MiB, import groups opened %llu", static_cast<unsigned long long>(protect[0]), static_cast<unsigned long long>(protect[1]), static_cast<unsigned long long>(protect[2]), static_cast<unsigned long long>(protect[3]), static_cast<unsigned long long>(protect[4]), protect[5] / 1048576.0, static_cast<unsigned long long>(protect[6]), static_cast<unsigned long long>(protect[7]), protect[8] / 1048576.0, static_cast<unsigned long long>(protect[9]));
+            AgcDriver::ProfilePrint_nid_no_patch(" | protect walks %llu arms %llu faults %llu hot %llu raced %llu armed %.0f MiB in %llu; submits %llu armed there %.0f MiB, import groups opened %llu, lock held in submits %.1f s (%.1f s of it preparing)", static_cast<unsigned long long>(protect[0]), static_cast<unsigned long long>(protect[1]), static_cast<unsigned long long>(protect[2]), static_cast<unsigned long long>(protect[3]), static_cast<unsigned long long>(protect[4]), protect[5] / 1048576.0, static_cast<unsigned long long>(protect[6]), static_cast<unsigned long long>(protect[7]), protect[8] / 1048576.0, static_cast<unsigned long long>(protect[9]), protect[10] / 1e6, protect[11] / 1e6);
         }
 #endif
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);

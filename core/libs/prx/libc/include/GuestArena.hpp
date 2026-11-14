@@ -67,6 +67,7 @@ std::size_t GuestArenaProtectCounts_nid_no_patch(std::uint64_t* values, std::siz
 // known, every armed page inside an import is opened.
 void GuestArenaBeginSubmit_nid_no_patch(const std::pair<std::uint64_t, std::uint64_t>* stores, std::size_t count, const std::pair<std::uint64_t, std::uint64_t>* regular, std::size_t regularCount, bool all);
 void GuestArenaEndSubmit_nid_no_patch();
+void GuestArenaReportSubmit_nid_no_patch(const std::pair<std::uint64_t, std::uint64_t>* stores, std::size_t count, const std::pair<std::uint64_t, std::uint64_t>* regular, std::size_t regularCount);
 // Diagnostic only: a guest range the GPU will write (counted per import group under the walk probe).
 void GuestArenaGpuWrites_nid_no_patch(std::uintptr_t address, std::size_t bytes, unsigned kind);
 // A host import of guest pages (no alias) was made, known until
@@ -79,6 +80,8 @@ void GuestArenaImportUsed_nid_no_patch(std::uintptr_t address, std::size_t bytes
 void GuestArenaForgetImport_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool store);
 // Changes whenever armed (CPU-clean) guest memory was opened to writes. Lock-free.
 std::uint64_t GuestArenaArmedOpens_nid_no_patch();
+// GetTickCount64 at the latest submission bracket (0 before the first).
+std::uint64_t GuestArenaLastSubmitTick_nid_no_patch();
 // Whether the arena arms guest memory read-only (section A is on for this process).
 bool GuestArenaArming_nid_no_patch();
 // Guest memory a thread runs on as its stack: never armed read-only (an exception cannot be

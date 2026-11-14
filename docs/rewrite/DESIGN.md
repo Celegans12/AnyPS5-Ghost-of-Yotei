@@ -185,6 +185,32 @@ sharing (phase 4).
    Divinity is not a test title.
 3. **Milestones.** 30 fps first for AoM and 007.
 
+## Related work to take later (noted 2026-11-14)
+
+`simnJS:integ/stack-12` (compare `boykopovar/AnyPS5` main against it): 13 commits of NVIDIA-on-Windows
+performance work, measured on TCG Card Shop Simulator (PPSA36301, RTX 4080 SUPER). Read from the
+commit messages and file list only, not the diffs. It sits on an upstream main of 2026-11-14 (this
+branch is on 2026-11-11), so it needs an upstream merge first, and it rewrites staging and
+copy-back code that phase 2 changed (`GuestBufferMemory.cpp`, `Recorder.cpp`,
+`ShaderResources.cpp`, `Texture.cpp`).
+
+| Their change | Their measured effect | Where it fits here |
+|---|---|---|
+| Staged regions copied back with a buffer copy instead of a compute pass | 63 to 7 ms per frame | 007 (about 41 GiB staged in and back in two minutes); phase 4 |
+| Staging shadow handed to the next dispatch; one shared shadow per region | 271-334 to 10-19 MiB staged per frame | 007; phase 4. Would also shrink the large store regions of the 007 device loss |
+| Staging shadows of cached builds bounded | avoids a collapse to 1.4 fps | footprint (principle 7) |
+| Device-local input twins for read-only dispatch inputs | 114-121 to 2-8 us per dispatch | section B for dispatches (built here for draw buffers only) |
+| Draw inputs behind a pending GPU write copied on the GPU | removes a 35 ms committer wait | 007 committer; section C |
+| Draw proofs reused while nothing they read moved; twin verdict per collect epoch | not measured in the title | section D validity change (phase 4); keyed on the collect epoch, so the epoch skips extend it |
+| Draw shape reuse across moved user words; relocation learned where the draw finishes | not measured in the title | phase 6 |
+| Single-key storage image upload on the GPU | not measured | one committer sync less |
+| One write per log line, prints off the GPU mutex; clock reads only when profiling | n/a | general |
+
+Rule when taking it: every copy-back is a GPU store into a host import, so it must go through a
+store import and be named at its submission (section A), or the dropped-write hazard returns.
+Order: staging commits and input twins first (007's two largest costs), proofs with phase 4, shape
+reuse with phase 6.
+
 ## Not in this plan
 
 - GPU-side descriptor reads, hash tables and miss rings (measured slower).

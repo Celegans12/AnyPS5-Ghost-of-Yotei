@@ -5050,6 +5050,10 @@ void Recorder::Submit() {
         return function(queueSubmit, "vkQueueSubmit")(context.queue, 1, &submission, batch->fence);
     }();
     if (result == VK_ERROR_DEVICE_LOST) {
+#ifdef _WIN32
+        std::fprintf(stderr, "[protect-lost] vkQueueSubmit recorder lost the device at batch %llu\n", static_cast<unsigned long long>(serial));
+        GuestArena::GuestArenaReportSubmit_nid_no_patch(batch->storeWrites.data(), batch->storeWrites.size(), batch->regularWrites.data(), batch->regularWrites.size());
+#endif
         const auto idle = context.Function<PFN_vkDeviceWaitIdle>("vkDeviceWaitIdle")(context.device);
         if (idle != VK_SUCCESS && idle != VK_ERROR_DEVICE_LOST) std::terminate();
     }

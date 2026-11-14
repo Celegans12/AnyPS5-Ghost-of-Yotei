@@ -5,6 +5,7 @@
 #include <windows.h>
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <atomic>
 #include <cstdio>
 #include <cstddef>
@@ -573,6 +574,10 @@ public:
         return protectTracking();
     }
 
+    static std::uint64_t LastSubmitTick() {
+        return lastSubmitTick().load(std::memory_order_relaxed);
+    }
+
     // Memory a thread may run on as its stack (the guest main stack): never armed, as an exception
     // cannot be delivered on a read-only stack and the process would end without a report.
     void NeverArm(std::uintptr_t address, std::size_t bytes) {
@@ -604,6 +609,8 @@ public:
     // (armWalked) and may stay mixed.
     void BeginSubmit(const std::pair<std::uint64_t, std::uint64_t>* stores, std::size_t count, const std::pair<std::uint64_t, std::uint64_t>* regular, std::size_t regularCount, bool all) {
         mutex.lock();
+        submitStart = std::chrono::steady_clock::now();
+        lastSubmitTick().store(GetTickCount64(), std::memory_order_relaxed);
         ++submits;
         if (anyPendingGpuWrites) countGpuWrites();
         while (!hotRetries.empty() && hotRetries.begin()->first <= submits) {
@@ -619,7 +626,8 @@ public:
             return;
         }
         try {
-            if (all) {
+            static const bool openAll = std::getenv("APS5_PROTECT_OPEN_ALL") != nullptr;
+            if (all || openAll) {
                 ++submitsAll;
                 std::vector<std::pair<std::uintptr_t, std::uintptr_t>> armed;
                 for (const auto& [start, end] : armedRanges) {
@@ -644,17 +652,37 @@ public:
                 }
                 for (std::size_t i = 0; i < count; ++i) {
                     auto from = static_cast<std::uintptr_t>(stores[i].first), to = static_cast<std::uintptr_t>(stores[i].second);
-                    if (from >= to || !importGroup(storeExtents, longestStore, from, to)) continue;
-                    if (!overlaps(unevenImports, from, to)) continue;
-                    ++storeUniforms;
-                    uniform(from, to);
-                    forget(unevenImports, from, to);
+                    if (from >= to || !importGroup(storeExtents, longestStore, from, to)) {
+                        if (protectCheck() && from < to) {
+                            auto groupFrom = from, groupTo = to;
+                            if (importGroup(importExtents, longestImport, groupFrom, groupTo)) {
+                                const auto before = checksFailed;
+                                checkUniform("the import group of a store named dedicated without a store import", groupFrom, groupTo);
+                                if (checksFailed != before && checksFailed <= 200) std::fprintf(stderr, "[protect-check]   the store is 0x%llx+%llu bytes\n", static_cast<unsigned long long>(from), static_cast<unsigned long long>(to - from));
+                            }
+                            else if (checksFailed++ < 200) std::fprintf(stderr, "[protect-check] dedicated store 0x%llx-0x%llx is in no import at submission %llu\n", static_cast<unsigned long long>(from), static_cast<unsigned long long>(to), static_cast<unsigned long long>(submits));
+                        }
+                        continue;
+                    }
+                    if (overlaps(unevenImports, from, to)) {
+                        ++storeUniforms;
+                        uniform(from, to);
+                        forget(unevenImports, from, to);
+                    }
+                    if (protectCheck()) checkUniform("store group", from, to);
+                }
+                if (protectCheck()) {
+                    for (std::size_t i = 0; i < regularCount; ++i) {
+                        auto from = static_cast<std::uintptr_t>(regular[i].first), to = static_cast<std::uintptr_t>(regular[i].second);
+                        if (from < to && importGroup(importExtents, longestImport, from, to)) checkUniform("ordinary import group stored through", from, to);
+                    }
                 }
             }
         } catch (...) {
             mutex.unlock();
             throw;
         }
+        submitHeldMaxUs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - submitStart).count());
         submitter.store(GetCurrentThreadId(), std::memory_order_release);
     }
 
@@ -674,7 +702,61 @@ public:
         return any;
     }
 
+    // Diagnostic: a submission was refused with a lost device. Prints the protection state of the
+    // import groups its named stores lie in, and the latest import registrations.
+    void ReportSubmit(const std::pair<std::uint64_t, std::uint64_t>* stores, std::size_t count, const std::pair<std::uint64_t, std::uint64_t>* regular, std::size_t regularCount) {
+        std::lock_guard lock(mutex);
+        std::fprintf(stderr, "[protect-lost] submission %llu: %zu dedicated stores, %zu regular stores, arming %d, armed ranges %zu, store imports %zu, imports %zu, unused %zu, open groups %zu, uneven %zu\n", static_cast<unsigned long long>(submits), count, regularCount, protectTracking() ? 1 : 0, armedRanges.size(), storeExtents.size(), importExtents.size(), unusedImports.size(), openImports.size(), unevenImports.size());
+        const auto describe = [&](const char* what, std::uint64_t first, std::uint64_t last) {
+            auto from = static_cast<std::uintptr_t>(first), to = static_cast<std::uintptr_t>(last);
+            auto storeFrom = from, storeTo = to;
+            const bool inStore = from < to && importGroup(storeExtents, longestStore, storeFrom, storeTo);
+            auto groupFrom = from, groupTo = to;
+            const bool inImport = from < to && importGroup(importExtents, longestImport, groupFrom, groupTo);
+            const auto scan = [&](std::uintptr_t start, std::uintptr_t end, std::uint64_t& readOnly, std::uint64_t& writable) {
+                for (auto at = start; at < end;) {
+                    const auto memory = query(at);
+                    const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                    if (memory.State == MEM_COMMIT) ((memory.Protect & 0xffu) == PAGE_READONLY ? readOnly : writable) += regionEnd - at;
+                    at = regionEnd;
+                }
+            };
+            std::uint64_t storeReadOnly = 0, storeWritable = 0, groupReadOnly = 0, groupWritable = 0;
+            if (inStore) scan(storeFrom, storeTo, storeReadOnly, storeWritable);
+            if (inImport) scan(groupFrom, groupTo, groupReadOnly, groupWritable);
+            std::fprintf(stderr, "[protect-lost]   %s 0x%llx+%llu: store group %d 0x%llx-0x%llx read-only %llu KiB writable %llu KiB; import group %d 0x%llx-0x%llx read-only %llu KiB writable %llu KiB; unused %d open %d\n", what, static_cast<unsigned long long>(first), static_cast<unsigned long long>(last - first), inStore ? 1 : 0, static_cast<unsigned long long>(storeFrom), static_cast<unsigned long long>(storeTo), static_cast<unsigned long long>(storeReadOnly >> 10u), static_cast<unsigned long long>(storeWritable >> 10u), inImport ? 1 : 0, static_cast<unsigned long long>(groupFrom), static_cast<unsigned long long>(groupTo), static_cast<unsigned long long>(groupReadOnly >> 10u), static_cast<unsigned long long>(groupWritable >> 10u), inImport && overlapsOwnedRange(unusedImports, groupFrom, groupTo) ? 1 : 0, inImport && overlaps(openImports, groupFrom, groupTo) ? 1 : 0);
+        };
+        for (std::size_t i = 0; i < count && i < 48; ++i) describe("dedicated", stores[i].first, stores[i].second);
+        for (std::size_t i = 0; i < regularCount && i < 48; ++i) describe("regular", regular[i].first, regular[i].second);
+        for (std::size_t i = 0; i < importLog.size(); ++i) {
+            const auto& entry = importLog[(importLogNext + i) % importLog.size()];
+            if (entry.to == 0) continue;
+            std::fprintf(stderr, "[protect-lost]   import %s 0x%llx-0x%llx used %d store %d at submission %llu, %llu ms ago\n", entry.kind == 0 ? "registered" : entry.kind == 1 ? "forgotten" : "first used", static_cast<unsigned long long>(entry.from), static_cast<unsigned long long>(entry.to), entry.used ? 1 : 0, entry.store ? 1 : 0, static_cast<unsigned long long>(entry.submit), static_cast<unsigned long long>(GetTickCount64() - entry.tick));
+        }
+        std::fflush(stderr);
+    }
+
+    struct ImportLogEntry {
+        std::uintptr_t from = 0;
+        std::uintptr_t to = 0;
+        std::uint64_t submit = 0;
+        std::uint64_t tick = 0;
+        std::uint8_t kind = 0;
+        bool used = false;
+        bool store = false;
+    };
+    std::array<ImportLogEntry, 64> importLog{};
+    std::size_t importLogNext = 0;
+
+    void logImport(std::uintptr_t from, std::uintptr_t to, std::uint8_t kind, bool used, bool store) {
+        importLog[importLogNext++ % importLog.size()] = {from, to, submits, GetTickCount64(), kind, used, store};
+        importLogNext %= importLog.size();
+    }
+
     void EndSubmit() {
+        const auto held = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - submitStart).count());
+        submitHeldUs += held;
+        static_cast<void>(held);
         submitter.store(0, std::memory_order_release);
         mutex.unlock();
     }
@@ -706,6 +788,7 @@ public:
         const auto from = address & ~std::uintptr_t{4095};
         const auto to = (address + bytes + 4095) & ~std::uintptr_t{4095};
         importExtents.emplace(from, to);
+        logImport(from, to, 0, used, store);
         longestImport = std::max(longestImport, to - from);
         if (store) {
             storeExtents.emplace(from, to);
@@ -713,6 +796,8 @@ public:
             remember(unevenImports, from, to);
         }
         if (!used) unusedImports.emplace(from, to);
+        if (protectCheck() && used && overlaps(armedRanges, from, to) && checksFailed++ < 200)
+            std::fprintf(stderr, "[protect-check] import 0x%llx-0x%llx (store %d) registered as used over armed pages at submission %llu\n", static_cast<unsigned long long>(from), static_cast<unsigned long long>(to), store ? 1 : 0, static_cast<unsigned long long>(submits));
         openArmed(from, to);
     }
 
@@ -728,6 +813,7 @@ public:
         const auto from = address & ~std::uintptr_t{4095};
         const auto to = (address + bytes + 4095) & ~std::uintptr_t{4095};
         eraseOwnedRange(unusedImports, from, to);
+        logImport(from, to, 2, true, false);
         retryImports(from, to);
     }
 
@@ -738,6 +824,7 @@ public:
         const auto from = address & ~std::uintptr_t{4095};
         const auto to = (address + bytes + 4095) & ~std::uintptr_t{4095};
         eraseOwnedRange(importExtents, from, to);
+        logImport(from, to, 1, false, store);
         if (store) eraseOwnedRange(storeExtents, from, to);
         if (groupProbe() || groupWalkProbe()) forget(probeGroups, from, to);
         eraseOwnedRange(unusedImports, from, to);
@@ -774,11 +861,13 @@ public:
         std::uint64_t submits = 0;
         std::uint64_t submitArms = 0;
         std::uint64_t importOpens = 0;
+        std::uint64_t submitHeldUs = 0;
+        std::uint64_t submitHeldMaxUs = 0;
     };
 
     ProtectCounts ProtectCounted() {
         std::lock_guard lock(mutex);
-        ProtectCounts counts{collectWalks, armRuns, armFaults, armHotSkips, armRaced, 0, armedRanges.size(), submits, submitArms, importOpens};
+        ProtectCounts counts{collectWalks, armRuns, armFaults, armHotSkips, armRaced, 0, armedRanges.size(), submits, submitArms, importOpens, submitHeldUs, submitHeldMaxUs};
         for (const auto& [start, end] : armedRanges) counts.armedBytes += end - start;
         return counts;
     }
@@ -1782,6 +1871,12 @@ private:
         openArmed(start, end);
     }
 
+    // GetTickCount64 at the latest BeginSubmit (0 before the first): the stall watchdog reads it.
+    static std::atomic<std::uint64_t>& lastSubmitTick() {
+        static std::atomic<std::uint64_t> tick{0};
+        return tick;
+    }
+
     static std::atomic<bool>& writeFaultsHandled() {
         static std::atomic<bool> handled{false};
         return handled;
@@ -2398,6 +2493,41 @@ private:
         static const bool trace = std::getenv("APS5_PROTECT_TRACE") != nullptr;
         return trace;
     }
+
+    // APS5_PROTECT_CHECK=1: reports breaches of the submission rules (a store group mixed at its
+    // storing submission, an import registered as used over read-only pages).
+    static bool protectCheck() {
+        static const bool enabled = std::getenv("APS5_PROTECT_CHECK") != nullptr;
+        return enabled;
+    }
+
+    void checkUniform(const char* what, std::uintptr_t from, std::uintptr_t to) {
+        std::uintptr_t readOnly = 0, writable = 0, firstReadOnly = 0, firstWritable = 0;
+        for (auto at = from; at < to;) {
+            const auto memory = query(at);
+            const auto regionEnd = std::min(to, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            if (memory.State == MEM_COMMIT) {
+                if ((memory.Protect & 0xffu) == PAGE_READONLY) {
+                    if (readOnly == 0) firstReadOnly = at;
+                    readOnly += regionEnd - at;
+                } else {
+                    if (writable == 0) firstWritable = at;
+                    writable += regionEnd - at;
+                }
+            }
+            at = regionEnd;
+        }
+        ++checksMade;
+        if (readOnly == 0 || writable == 0) return;
+        if (checksFailed++ < 200)
+            std::fprintf(stderr, "[protect-check] %s 0x%llx-0x%llx is mixed at submission %llu: %llu KiB read-only from 0x%llx, %llu KiB writable from 0x%llx; open %d uneven %d hot-retries %zu\n", what, static_cast<unsigned long long>(from), static_cast<unsigned long long>(to), static_cast<unsigned long long>(submits), static_cast<unsigned long long>(readOnly >> 10u), static_cast<unsigned long long>(firstReadOnly), static_cast<unsigned long long>(writable >> 10u), static_cast<unsigned long long>(firstWritable), overlaps(openImports, from, to) ? 1 : 0, overlaps(unevenImports, from, to) ? 1 : 0, hotRetries.size());
+    }
+
+    std::uint64_t checksMade = 0;
+    std::chrono::steady_clock::time_point submitStart{};
+    std::uint64_t submitHeldUs = 0;
+    std::uint64_t submitHeldMaxUs = 0;
+    std::uint64_t checksFailed = 0;
 
     void openArmed(std::uintptr_t start, std::uintptr_t end) {
         if (!overlaps(armedRanges, start, end)) return;

@@ -679,6 +679,10 @@ void GuestArenaBeginSubmit_nid_no_patch(const std::pair<std::uint64_t, std::uint
     WindowsMappings::Get().BeginSubmit(stores, count, regular, regularCount, all);
 }
 
+void GuestArenaReportSubmit_nid_no_patch(const std::pair<std::uint64_t, std::uint64_t>* stores, std::size_t count, const std::pair<std::uint64_t, std::uint64_t>* regular, std::size_t regularCount) {
+    WindowsMappings::Get().ReportSubmit(stores, count, regular, regularCount);
+}
+
 void GuestArenaEndSubmit_nid_no_patch() {
     WindowsMappings::Get().EndSubmit();
 }
@@ -699,6 +703,10 @@ void GuestArenaForgetImport_nid_no_patch(std::uintptr_t address, std::size_t byt
     WindowsMappings::Get().ForgetImport(address, bytes, store);
 }
 
+std::uint64_t GuestArenaLastSubmitTick_nid_no_patch() {
+    return WindowsMappings::LastSubmitTick();
+}
+
 std::uint64_t GuestArenaArmedOpens_nid_no_patch() {
     return WindowsMappings::Get().ArmedOpens();
 }
@@ -717,7 +725,7 @@ void GuestArenaEnableWriteFaults_nid_no_patch() {
 
 std::size_t GuestArenaProtectCounts_nid_no_patch(std::uint64_t* values, std::size_t count) {
     const auto counts = WindowsMappings::Get().ProtectCounted();
-    const std::uint64_t all[] = {counts.walks, counts.armedRuns, counts.faults, counts.hotSkips, counts.raced, counts.armedBytes, counts.armedPieces, counts.submits, counts.submitArms, counts.importOpens};
+    const std::uint64_t all[] = {counts.walks, counts.armedRuns, counts.faults, counts.hotSkips, counts.raced, counts.armedBytes, counts.armedPieces, counts.submits, counts.submitArms, counts.importOpens, counts.submitHeldUs, counts.submitHeldMaxUs};
     const auto written = std::min(count, std::size(all));
     std::copy_n(all, written, values);
     return written;
