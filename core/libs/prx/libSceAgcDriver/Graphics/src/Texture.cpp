@@ -148,13 +148,13 @@ std::atomic<std::uint64_t> deferredRefreshFlushes{0};
 //   reap could land before or after the recorded write-back (APS5_DEFER_OVER_COMPLETIONS);
 // - a writer of the async lane overlaps a stored range while the flushing thread records on lane 0: the write-back
 //   in lane 0 is not ordered after it (APS5_DEFER_OVER_LANE).
-// An address-based lease over a stored range is not waited for: in measured runs almost no such wait stamped the
-// stored blocks, and waiting cost the whole gain. Its BDA stores are stamped only when its batch completes, so a lease
-// that does write the stored range would have them stored over. The lease guard samples: every
-// APS5_DEFER_LEASE_SAMPLE-th (default 16, 0 = never) flush over a pending lease still waits for it, alone
-// (Recorder::FinishWritersByLane with leasesOnly), and the first sampled wait whose completion stamps the stored
-// blocks turns the lease waits back on for the rest of the run ([defer] line). APS5_NO_DEFER_OVER_LEASES always waits;
-// APS5_NO_LEASE_GUARD samples nothing. In a deferred write-back, a 64 KiB block written since its layer's generation
+// An address-based lease over a stored range is waited for, alone (Recorder::FinishWritersByLane with leasesOnly):
+// its BDA stores are stamped only when its batch completes, so a write-back recorded without the wait would store
+// older texels over a lease that does write the stored range. APS5_DEFER_OVER_LEASES=1 skips that wait (in measured
+// runs almost no such wait stamped the stored blocks, and the wait cost the whole gain) under the lease guard: every
+// APS5_DEFER_LEASE_SAMPLE-th (default 16, 0 = never) flush over a pending lease still waits for it, and the first
+// sampled wait whose completion stamps the stored blocks turns the lease waits back on for the rest of the run
+// ([defer] line). APS5_NO_LEASE_GUARD samples nothing. In a deferred write-back, a 64 KiB block written since its layer's generation
 // that an unfinished batch writes is left to that writer without comparing its guest bytes (writeBackLayers;
 // APS5_NO_DEFER_KEEP_WRITER compares as before). APS5_NO_DEFER_STORES waits as before, with the refresh deferral alone.
 constexpr std::array<const char*, 7> GpuOrderedReasons{"readback before label", "readback before interrupt", "depth plane store", "storage image creation", "imported buffer region", "written buffer range", "storage refresh"};
@@ -4978,11 +4978,11 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             if (refusal) {
                 deferWriter = false;
                 gpuOrderRefusals[static_cast<std::size_t>(*refusal)].fetch_add(1, std::memory_order_relaxed);
-            } else if (RuntimeSwitches::Set(RuntimeSwitch::NoDeferOverLeases) || leaseGuardTripped.load(std::memory_order_relaxed)) {
+            } else if (!RuntimeSwitches::Set(RuntimeSwitch::DeferOverLeases) || leaseGuardTripped.load(std::memory_order_relaxed)) {
                 leaseWait = true;
             } else {
-                // A lease still pending over the stored layers (finished batches retired first) is skipped, except
-                // for the guard's samples.
+                // APS5_DEFER_OVER_LEASES: a lease still pending over the stored layers (finished batches retired
+                // first) is skipped, except for the guard's samples.
                 auto& active = *Recorder::Active();
                 const auto leased = [&] { return std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.second > range.first && active.PendingLeaseSerial(range.first, static_cast<std::size_t>(range.second - range.first)) != 0; }); };
                 if (leased()) {

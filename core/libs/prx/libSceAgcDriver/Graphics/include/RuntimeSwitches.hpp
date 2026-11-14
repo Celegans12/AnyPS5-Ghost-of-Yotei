@@ -104,7 +104,7 @@ enum class RuntimeSwitch : std::size_t {
     DeferOverCompletions,
     DeferOverLane,
     NoDeferKeepWriter,
-    NoDeferOverLeases,
+    DeferOverLeases,
     NoLeaseGuard,
     Count,
 };
