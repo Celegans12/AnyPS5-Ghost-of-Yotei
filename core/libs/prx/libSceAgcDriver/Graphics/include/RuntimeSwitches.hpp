@@ -103,6 +103,8 @@ enum class RuntimeSwitch : std::size_t {
     NoFusedSnapshotHash,
     NoParallelBlockHash,
     NoSpacePresync,
+    TextureKeep,
+    TextureShareByUse,
     Count,
 };
 

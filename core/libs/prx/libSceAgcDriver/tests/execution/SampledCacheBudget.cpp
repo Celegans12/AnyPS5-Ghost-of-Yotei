@@ -930,6 +930,35 @@ void frameTests(const Context& context) {
     Require(TextureCacheUsage().sampledEntries == capacity, "a second frame over other textures left " + std::to_string(TextureCacheUsage().sampledEntries) + " entries cached");
 }
 
+void keepHotTests(const Context& context) {
+    Require(std::getenv("APS5_TEXTURE_KEEP") != nullptr, "the keep-hot tests need APS5_TEXTURE_KEEP=1");
+    Block block(context);
+    ClearCachedTextures(context.device);
+    Recorder::CountPresent();
+    const auto bytes = Sampled(context, block.Surface(0))->AllocationBytes();
+    const auto capacity = static_cast<std::size_t>(Budget / bytes);
+    const auto held = static_cast<std::size_t>(Ceiling / bytes);
+    const auto frame = held;
+    Require(held > capacity && frame + capacity <= Surfaces, "a snapshot of the 256 KiB surface holds " + std::to_string(bytes) + " bytes, which the test's 1 MiB budget and its ceiling do not fit as planned");
+    std::vector<std::weak_ptr<Texture>> made(frame);
+    for (std::size_t surface = 0; surface < frame; ++surface) made[surface] = Sampled(context, block.Surface(surface));
+    Require(TextureCacheUsage().sampledEntries == held && TextureCacheUsage().sampledBytes > Budget && TextureCacheUsage().sampledBytes <= Ceiling, "a frame of " + std::to_string(frame) + " textures left " + std::to_string(TextureCacheUsage().sampledEntries) + " cached, not the " + std::to_string(held) + " the ceiling holds while every entry is hot");
+    Recorder::CountPresent();
+    std::size_t hits = 0;
+    for (std::size_t surface = 0; surface < frame; ++surface) {
+        const auto again = Sampled(context, block.Surface(surface));
+        hits += again == made[surface].lock();
+    }
+    Require(hits == held, "the next frame over the same " + std::to_string(frame) + " textures found " + std::to_string(hits) + " of them cached, not the " + std::to_string(held) + " kept over the budget");
+    Recorder::CountPresent();
+    std::vector<std::weak_ptr<Texture>> fresh(capacity);
+    for (std::size_t surface = 0; surface < capacity; ++surface) fresh[surface] = Sampled(context, block.Surface(frame + surface));
+    Recorder::CountPresent();
+    std::size_t kept = 0;
+    for (std::size_t surface = 0; surface < capacity; ++surface) kept += Sampled(context, block.Surface(frame + surface)) == fresh[surface].lock();
+    Require(kept == capacity && TextureCacheUsage().sampledBytes <= Ceiling, "a working set that moved to " + std::to_string(capacity) + " new textures found " + std::to_string(kept) + " of them cached the frame after, with " + std::to_string(TextureCacheUsage().sampledBytes) + " bytes cached");
+}
+
 void scanTests(const Context& context) {
     Block block(context);
     ClearCachedTextures(context.device);
@@ -1796,6 +1825,13 @@ int main(int argc, char** argv) {
             std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
             if (!resourceCacheTests(context, mode)) return VulkanTestSkipped;
             std::puts("resource cache tests passed");
+            return 0;
+        }
+        if (mode == "keep-hot") {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            keepHotTests(context);
+            ClearCachedTextures(context.device);
+            std::puts("sampled texture cache keep-hot tests passed");
             return 0;
         }
         if (mode == "resource-replaced") {
