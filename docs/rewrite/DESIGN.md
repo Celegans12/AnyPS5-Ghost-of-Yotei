@@ -131,7 +131,7 @@ Each 64 KiB block of GPU-registered guest memory is in one of three states:
 Phases 3 and 5 do not depend on phase 1. Each kept change gets one regression pair on a second
 title.
 
-## Progress (2026-11-13)
+## Progress (2026-11-14)
 
 ### Per game
 
@@ -139,10 +139,10 @@ Completion is the share of the 60 fps target reached: 16.7 ms divided by today's
 
 | Title | Where it runs | Frame | Completion | Bound by | Phase work open |
 |---|---|---|---|---|---|
-| FF Resonance | in game, bench scene | 30.6 to 33 ms | **52 %** | CPU: worker 0 at 97 % | 1, then 2 to 4 |
-| LEGO | in game, bench scene | 44 to 49 ms | **36 %** | GPU: one compute program, 22.8 ms | 1, then 5 (translation) |
-| 007 | title screen and menus; first cutscene stalls on cold shader compiles | 121 to 129 ms | **13 %** | CPU: the draw committer | 1, then 4 |
-| AoM | title screen and the scene after the pad press | 146 to 158 ms | **11 %** | title GPU, scene CPU | 1, then 5 and 6 |
+| FF Resonance | in game, bench scene | 30.6 to 33 ms | **52 %** | CPU: worker 0 at 97 % | 3, then 4 (carries the walk and epoch target) |
+| LEGO | in game, bench scene | 44 to 49 ms | **36 %** | GPU: one compute program, 22.8 ms | 3, then 5 (translation) |
+| 007 | title screen and menus; first cutscene stalls on cold shader compiles | 121 to 129 ms | **13 %** | CPU: the draw committer | 2 (section A fails: stall and device loss), then 4 |
+| AoM | title screen and the scene after the pad press | 146 to 158 ms | **11 %** | title GPU, scene CPU | 3, then 5 and 6 |
 
 Divinity is not a test title. BO1 was removed from testing on 2026-11-13 (game deleted).
 
