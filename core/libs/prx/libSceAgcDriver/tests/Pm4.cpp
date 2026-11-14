@@ -674,6 +674,19 @@ void testTraceRegisterWrites() {
     }
 }
 
+void testTagMarkers() {
+    for (const auto flags : {0u, 1u, 4u}) {
+        const auto tag = makePacket(0x79, {0x342u, 0xc6000005u}, flags);
+        check(AgcDriver::Pm4::IsTagMarker(tag), "a tag write to 0x342 was not a tag marker");
+        AgcDriver::Pm4::Validate(tag, 0x20u);
+        AgcDriver::QueueState state;
+        execute(state, tag);
+        check(!state.userConfig.contains(0x342u), "a tag marker wrote register state");
+    }
+    check(!AgcDriver::Pm4::IsTagMarker(makePacket(0x79, {0x343u, 0xc6000005u}, 4)), "a write to another register was a tag marker");
+    expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0x79, {0x343u, 0xc6000005u}), 0x20u); }, "graphics packet in compute queue");
+}
+
 void testMemoryCopyDecode() {
     using AgcDriver::Pm4::DecodeMemoryCopy;
     constexpr std::uint64_t source = 0x1120000000ull, destination = 0x403d7b400ull;
@@ -2118,6 +2131,7 @@ int main(int argc, char** argv) {
         testIndexAttributesIndirect();
         testMemory();
         testTraceRegisterWrites();
+        testTagMarkers();
         testCopies();
         testMemoryCopyDecode();
         testMemorySynchronization();

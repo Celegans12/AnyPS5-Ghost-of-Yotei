@@ -547,9 +547,7 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
 }
 
 bool IsTagMarker(std::span<const std::uint32_t> packet) {
-    // libSceAgc brackets waits and draws with predicated SET_UCONFIG_REG writes of a tag value to
-    // 0x342; they carry no register state.
-    return packet.size() >= 3 && ((packet[0] >> 8u) & 0xffu) == 0x79u && (packet[0] & 1u) != 0 && packet[1] == 0x342u;
+    return packet.size() >= 3 && ((packet[0] >> 8u) & 0xffu) == 0x79u && packet[1] == 0x342u;
 }
 
 namespace {

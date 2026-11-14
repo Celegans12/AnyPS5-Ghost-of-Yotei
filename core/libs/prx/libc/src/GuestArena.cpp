@@ -554,6 +554,19 @@ void GuestArenaMap_nid_postfix(void* pointer, std::size_t bytes, void* section, 
     noteAccess(pointer, bytes);
 }
 
+void GuestArenaMapZero_nid_postfix(void* pointer, std::size_t bytes) {
+    if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("zero page mapping", pointer, bytes);
+    const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
+    const auto generation = commitGeneration.fetch_add(1, std::memory_order_acq_rel) + 1;
+    WindowsMappings::Get().MapZero(pointer, bytes);
+    if (const auto callback = privateMappingObserver.load(std::memory_order_acquire)) callback(reinterpret_cast<std::uintptr_t>(pointer), bytes, generation);
+    noteAccess(pointer, bytes);
+}
+
+bool GuestArenaRecoverRead_nid_no_patch(EXCEPTION_POINTERS*) {
+    return false;
+}
+
 void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* section, std::uint64_t offset, std::uint32_t protection) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("direct memory mapping", pointer, bytes);
     const MappingChange change(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
