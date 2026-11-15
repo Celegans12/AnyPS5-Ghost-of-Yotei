@@ -27,6 +27,7 @@ inline constexpr std::uint32_t ImageNormalizedValues = 1u << (4u * ImageComponen
 enum class ImageComponentConstant : std::uint32_t { None, Zero, IntegerOne, FloatOne };
 inline constexpr std::uint32_t VertexBase = 4096u;
 inline constexpr std::uint32_t VertexWords = 6u;
+inline constexpr std::uint32_t BlockAddressOffset = 8187u;
 inline constexpr std::uint32_t PushDataOffset = 8188u;
 inline constexpr std::uint32_t ExportBase = 8192u;
 inline constexpr std::uint32_t ExportPackingBase = 8224u;

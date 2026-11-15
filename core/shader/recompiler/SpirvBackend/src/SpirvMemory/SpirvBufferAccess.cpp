@@ -52,6 +52,10 @@ std::uint32_t EmitShaderDataDwordLoad(SpirvEmitterState& state, std::uint32_t dw
 void EmitMemoryOffsets(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
     state.memoryByteOffsets.assign(layout.memoryOffsetCount, 0u);
+    if (state.blockAccess) {
+        state.memoryByteOffsets.assign(layout.memoryOffsetCount, ConstantU32(state, 0u));
+        return;
+    }
     for (std::uint32_t i = 0; i < layout.memoryOffsetCount; i++) {
         const auto word = EmitShaderDataDwordLoad(state, layout.memoryOffsetDword + i / 4u);
         const auto shift = ConstantU32(state, (i % 4u) * 8u);

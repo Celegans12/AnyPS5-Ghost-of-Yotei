@@ -805,15 +805,34 @@ void prepareInterface(const RecompileRequest& request, IrProgram& program) {
     shaderInfoCollector.Collect(program, inputInfo);
 }
 
+bool blockAddressable(const IrProgram& program) {
+    for (const auto& block : program.Blocks()) {
+        for (const IrValue* instruction : block->Instructions()) {
+            if (instruction->Opcode() == IrOpcode::ReadConst && !instruction->Argument(1)->Resolve()->HasImmediate()) return false;
+        }
+    }
+    return true;
+}
+
 CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program) {
     const auto inputInfo = RequestInputInfo(request);
     constexpr BindingAllocator bindingAllocator;
     bool registration = request.target.registrationModules && request.shader.stage == ShaderStage::Fragment;
     program.Metadata().bindingLayoutComplete = false;
     const bool stencilReplay = request.shader.stage == ShaderStage::Fragment && std::ranges::any_of(program.Info().outputs, [](const StageOutput& output) { return output.kind == StageOutputKind::StencilRef; }) && std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityStencilExportEXT)) == request.target.supportedCapabilities.end();
-    auto bindings = bindingAllocator.Allocate(program, request.layout, registration, stencilReplay);
+    BlockLayout blockLayout;
+    bool block = false;
+    if (request.target.blockAccess) {
+        blockLayout = BuildBlockLayout(program.Resources());
+        block = blockLayout.Eligible() && !stencilReplay && request.layout.pushConstantSizeBytes / 4u >= BlockAbi::PushAddressDwords && blockAddressable(program);
+    }
+    BindingAllocationResult bindings;
+    if (!block) bindings = bindingAllocator.Allocate(program, request.layout, registration, stencilReplay);
 
     SpirvTargetOptions targetOptions {};
+    targetOptions.blockAccess = block;
+    targetOptions.blockWords = blockLayout.words;
+    targetOptions.blockBuffers = static_cast<std::uint32_t>(blockLayout.buffers.size());
     targetOptions.vulkanVersion = request.target.vulkanVersion;
     targetOptions.spirvVersion = request.target.spirvVersion;
     targetOptions.subgroupSize = HostSubgroupSize(request) == 1u ? 1u : request.target.subgroupSize;
@@ -881,21 +900,41 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     CompiledShaderArtifact result;
     result.variantId = nextVariantId();
     SpirvEmitInfo emitted;
-    try {
-        result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
-    } catch (const SpannedWaveUnsupported& error) {
-        std::fprintf(stderr, "[spanned-wave] 0x%llx falls back to two lanes per invocation: %s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
-        targetOptions.spannedWaves = false;
-        result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
+    const auto emit = [&] {
+        try {
+            result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
+        } catch (const SpannedWaveUnsupported& error) {
+            std::fprintf(stderr, "[spanned-wave] 0x%llx falls back to two lanes per invocation: %s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
+            targetOptions.spannedWaves = false;
+            result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
+        }
+    };
+    if (block) {
+        try {
+            bindings = bindingAllocator.Allocate(program, request.layout, registration, stencilReplay, true);
+            emit();
+        } catch (const std::runtime_error& error) {
+            std::fprintf(stderr, "[draw-block] 0x%llx falls back to its classic module: %s\n", static_cast<unsigned long long>(request.shader.codeAddress), error.what());
+            block = false;
+            program.Metadata().bindingLayoutComplete = false;
+            bindings = bindingAllocator.Allocate(program, request.layout, registration, stencilReplay);
+            targetOptions.blockAccess = false;
+            emit();
+        }
+    } else {
+        emit();
     }
     if (registration && result.spirv.size() > request.target.registrationWordLimit) {
         registration = false;
         program.Metadata().bindingLayoutComplete = false;
-        bindings = bindingAllocator.Allocate(program, request.layout, false, stencilReplay);
+        bindings = bindingAllocator.Allocate(program, request.layout, false, stencilReplay, block);
         targetOptions.registrationModules = false;
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
     }
     result.registrationModule = registration;
+    result.blockModule = block;
+    if (block) result.blockAddressDword = bindings.layout.blockAddressDword - request.layout.pushConstantOffsetBytes / 4u;
+    result.blockLayout = std::move(blockLayout);
     if (request.shader.stage == ShaderStage::Mesh && request.graphics) result.meshBarycentrics = request.graphics->meshBarycentrics;
     result.layerReplaySafe = LayerReplaySafe(program);
     result.stencilReplaySafe = (request.shader.stage == ShaderStage::Vertex || stencilReplay) && StencilReplaySafe(program);
@@ -1365,6 +1404,9 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         .bdaWrites = artifact.bdaWrites,
         .layerReplaySafe = artifact.layerReplaySafe,
         .stencilReferenceDword = artifact.stencilReferenceDword,
+        .blockModule = artifact.blockModule,
+        .blockAddressDword = artifact.blockAddressDword,
+        .blockLayout = artifact.blockLayout,
         .variantId = artifact.variantId
     };
     for (const auto reg : variant.bindings.layout.userDataRegisters) {
@@ -1377,6 +1419,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     struct LocalModuleKeyStorage {};
     auto& moduleKey = HostThreadLocal<std::vector<std::uint32_t>, LocalModuleKeyStorage>();
     moduleKey.clear();
+    if (variant.bindings.layout.UsesBlock()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u + artifact.blockAddressDword);
     if (variant.bindings.layout.UsesPushData()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u);
     if (!artifact.stencilReferences.empty()) moduleKey.push_back(request.layout.pushConstantOffsetBytes / 4u + artifact.stencilReferenceDword);
     if (request.context.pixel) {
@@ -1427,7 +1470,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             if (artifact.registrationModule) runtimeSelectors.at(input.location / RuntimeAbi::VertexSelectorsPerDword) |= (selectors & 0xfffu) << (input.location % RuntimeAbi::VertexSelectorsPerDword * 16u);
         }
     }
-    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || !artifact.vertexInputPatches.empty() || request.context.pixel || depthRemap || request.shader.stage == ShaderStage::Mesh) {
+    if (!plan->bindings.specialization.empty() || variant.bindings.layout.UsesPushData() || variant.bindings.layout.UsesBlock() || !artifact.vertexInputPatches.empty() || request.context.pixel || depthRemap || request.shader.stage == ShaderStage::Mesh) {
         {
             std::shared_lock lock(plan->mutex);
             if (const auto found = plan->modules.find(moduleKey); found != plan->modules.end()) entry = found->second;
@@ -1442,6 +1485,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
             constants.push_back({PipelineSpecialization::MeshLayerBase, 0u});
             constants.push_back({PipelineSpecialization::MeshLayerCount, 0xffffffffu});
             std::size_t index = 0;
+            if (variant.bindings.layout.UsesBlock()) constants.push_back({PipelineSpecialization::BlockAddressOffset, moduleKey[index++]});
             if (variant.bindings.layout.UsesPushData()) constants.push_back({PipelineSpecialization::PushDataOffset, moduleKey[index++]});
             if (!artifact.stencilReferences.empty()) constants.push_back({PipelineSpecialization::StencilReferenceOffset, moduleKey[index++]});
             if (request.context.pixel) {
@@ -1470,8 +1514,8 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
         const auto prepare = [&] {
             auto specialized = specialize();
             const auto& module = specialized.module;
-            if (variant.bindings.layout.UsesPushData() && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
-            auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings);
+            if ((variant.bindings.layout.UsesPushData() || variant.bindings.layout.UsesBlock()) && !module->pushData) throw std::runtime_error("specialization removed the prepared push constant interface");
+            auto selected = DescriptorBindingBuilder{}.Select(plan->bindings, module->bindings, artifact.blockModule);
             entry->bindings = std::move(selected);
             entry->module = module;
             built = std::move(specialized.spirv);
@@ -2462,6 +2506,7 @@ bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& 
     const auto words = prepared.ShaderDataDwords();
     const bool usesPush = prepared.runtimeImageCount == 0u && words != 0u && words <= layout.pushConstantSizeBytes / 4u;
     if (prepared.UsesPushData() != usesPush) return false;
+    if (prepared.UsesBlock() && (usesPush ? words : 0u) + prepared.BlockAddressDwords() > layout.pushConstantSizeBytes / 4u) return false;
     if (!handle.artifact->artifact.stencilReferences.empty() && (prepared.stencilReferenceDword >= layout.pushConstantSizeBytes / 4u || prepared.stencilReferenceDword != (usesPush ? words : 0u))) return false;
     if (!std::ranges::equal(key, handle.staticKey) || handle.source->code.size() != request.shader.code.size()) return false;
     return handle.source->code.data() == request.shader.code.data() || std::ranges::equal(handle.source->code, request.shader.code);

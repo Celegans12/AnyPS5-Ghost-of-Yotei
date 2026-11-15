@@ -2,6 +2,8 @@
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
 #include "RuntimeAbi.hpp"
+#include "BlockAbi.hpp"
+#include "Optimization/BlockLayout.hpp"
 #include "PipelineSpecialization.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include <algorithm>
@@ -382,6 +384,7 @@ struct SpirvTarget {
     bool float16WidenNans = false;
     bool float16NarrowNans = false;
     bool meshInlineFunctions = false;
+    bool blockAccess = false;
 };
 
 struct BindingLayout {
@@ -932,6 +935,9 @@ struct CompiledShaderArtifact {
     bool bdaWrites = false;
     bool layerReplaySafe = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;
+    bool blockModule = false;
+    std::uint32_t blockAddressDword = 0xffffffffu;
+    BlockLayout blockLayout;
     std::uint64_t variantId = 0;
 };
 

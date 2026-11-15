@@ -49,6 +49,9 @@ struct SpirvTargetOptions {
     bool float16WidenNans = false;
     bool float16NarrowNans = false;
     bool meshInlineFunctions = false;
+    bool blockAccess = false;
+    std::uint32_t blockWords = 0;
+    std::uint32_t blockBuffers = 0;
 };
 
 struct SpirvEmitInfo {

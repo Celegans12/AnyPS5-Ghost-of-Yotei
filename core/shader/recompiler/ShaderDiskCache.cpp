@@ -581,6 +581,25 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.bdaWrites);
     writer.Value(result.layerReplaySafe);
     writer.Value(result.stencilReferenceDword);
+    writer.Value(result.blockModule);
+    writer.Value(result.blockAddressDword);
+    writer.Value(result.blockLayout.abiVersion);
+    writer.Value(result.blockLayout.words);
+    writer.List(result.blockLayout.buffers, [](Writer& out, const BlockBuffer& buffer) {
+        out.Value(buffer.resource);
+        for (const auto word : buffer.descriptorWords) out.Value(word);
+        out.Value(buffer.formatFixed);
+        out.Value(buffer.typedAlignment);
+    });
+    writer.List(result.blockLayout.variantKey, [](Writer& out, const BlockVariantBit& bit) {
+        out.Value(bit.word);
+        out.Value(bit.mask);
+    });
+    writer.List(result.blockLayout.imageKey, [](Writer& out, const BlockImageKeyWord& word) {
+        out.Value(word.word);
+        out.Value(word.mask);
+    });
+    writer.Value(result.blockLayout.refusal);
 }
 
 void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
@@ -652,6 +671,25 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.bdaWrites);
     reader.Value(result.layerReplaySafe);
     reader.Value(result.stencilReferenceDword);
+    reader.Value(result.blockModule);
+    reader.Value(result.blockAddressDword);
+    reader.Value(result.blockLayout.abiVersion);
+    reader.Value(result.blockLayout.words);
+    reader.List(result.blockLayout.buffers, 12, [](Reader& in, BlockBuffer& buffer) {
+        in.Value(buffer.resource);
+        for (auto& word : buffer.descriptorWords) in.Value(word);
+        in.Value(buffer.formatFixed);
+        in.Value(buffer.typedAlignment);
+    });
+    reader.List(result.blockLayout.variantKey, 8, [](Reader& in, BlockVariantBit& bit) {
+        in.Value(bit.word);
+        in.Value(bit.mask);
+    });
+    reader.List(result.blockLayout.imageKey, 8, [](Reader& in, BlockImageKeyWord& word) {
+        in.Value(word.word);
+        in.Value(word.mask);
+    });
+    reader.Value(result.blockLayout.refusal);
     result.variantId = 0;
 }
 
@@ -737,6 +775,7 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
 void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
     writer.Value(layout.pushDataStartDword);
     writer.Value(layout.stencilReferenceDword);
+    writer.Value(layout.blockAddressDword);
     writer.Value(layout.memoryOffsetDword);
     writer.Value(layout.memoryOffsetCount);
     writer.Value(layout.dispatchThreadLimit);
@@ -752,6 +791,7 @@ void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
 void decodeLayout(Reader& reader, IrBindingLayout& layout) {
     reader.Value(layout.pushDataStartDword);
     reader.Value(layout.stencilReferenceDword);
+    reader.Value(layout.blockAddressDword);
     reader.Value(layout.memoryOffsetDword);
     reader.Value(layout.memoryOffsetCount);
     reader.Value(layout.dispatchThreadLimit);

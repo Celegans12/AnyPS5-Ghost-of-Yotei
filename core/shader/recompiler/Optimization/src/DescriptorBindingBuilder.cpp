@@ -488,10 +488,11 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         auto alignment = static_cast<std::uint32_t>(buffer.typedAlignment);
         if (buffer.descriptorFormatted && format != 0u) alignment = std::max(alignment, std::min(GetFormatInfo(static_cast<IrBufferFormat>(format)).byteSize, 4u));
         if (alignment == 0u || misalignment % alignment != 0u) fail("is a formatted buffer access through a V# whose base is not aligned to its element");
-        if (registrationModules && buffer.descriptorFormatted) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 1u, fields.word3});
-        if (registrationModules) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 2u, fields.tail});
-        if (registrationModules) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 3u, misalignment});
-        if (!registrationModules) {
+        const bool block = layout.UsesBlock();
+        if ((registrationModules || block) && buffer.descriptorFormatted) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 1u, fields.word3});
+        if (registrationModules && !block) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 2u, fields.tail});
+        if (registrationModules && !block) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 3u, misalignment});
+        if (!registrationModules && !block) {
             const auto first = PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords;
             plan.specialization.push_back({first, fields.word1});
             plan.specialization.push_back({first + 1u, fields.word3});
@@ -703,12 +704,13 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     return plan;
 }
 
-DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPlan& plan, std::span<const std::uint32_t> bindings) const {
+DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPlan& plan, std::span<const std::uint32_t> bindings, bool blockModule) const {
     DescriptorBindingPlan selected;
     std::set<std::uint32_t> remaining(bindings.begin(), bindings.end());
     selected.bindings.reserve(remaining.size());
     for (const auto& binding : plan.bindings) {
-        if (remaining.erase(binding.descriptor.binding) == 0u) continue;
+        const bool blockMetadata = blockModule && (binding.descriptor.role == DescriptorRole::GuestBuffers || binding.descriptor.role == DescriptorRole::FlattenedSrt);
+        if (remaining.erase(binding.descriptor.binding) == 0u && !blockMetadata) continue;
         selected.storageData |= binding.descriptor.role == DescriptorRole::ShaderData;
         selected.bindings.push_back(binding);
     }
@@ -847,6 +849,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
         allocation.pushConstants.resize(static_cast<std::size_t>(shaderData.size()) * sizeof(std::uint32_t));
         std::memcpy(allocation.pushConstants.data(), shaderData.data(), allocation.pushConstants.size());
     }
+    allocation.pushConstants.resize(allocation.pushConstants.size() + static_cast<std::size_t>(layout.BlockAddressDwords()) * sizeof(std::uint32_t));
 }
 
 }

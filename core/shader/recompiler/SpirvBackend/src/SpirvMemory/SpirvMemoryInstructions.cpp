@@ -1,4 +1,5 @@
 #include "SpirvBackend/SpirvBda.hpp"
+#include "SpirvBackend/SpirvBlockAccess.hpp"
 #include "SpirvBackend/SpirvRuntimeBuffer.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
@@ -1621,6 +1622,11 @@ std::uint32_t AtomicFloatCompareSwap(SpirvEmitterState& state, std::uint32_t old
 
 std::uint32_t EmitReadConst(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
+    if (state.blockAccess) {
+        const IrValue* word = inst.Argument(1)->Resolve();
+        if (!word->HasImmediate()) ctx.Fail(inst, "reads the flattened SRT at a runtime slot, which a block module cannot address");
+        return EmitBlockWord(state, word->ImmediateU32());
+    }
     if (state.flattenedSrtVariable == 0) {
         ctx.Fail(inst, "requires the flattened SRT descriptor");
     }

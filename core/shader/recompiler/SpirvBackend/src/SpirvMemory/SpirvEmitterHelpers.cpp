@@ -166,9 +166,9 @@ void CheckBindings(const IrProgram& program, const CompiledBindingLayout& bindin
     }
 }
 
-void EmitBaseHeader(SpirvModule& module, const IrProgram& program) {
+void EmitBaseHeader(SpirvModule& module, const IrProgram& program, bool blockAccess) {
     module.EmitCapability(spv::CapabilityShader);
-    const bool physical = program.Info().usesDma || program.Resources().stage == IrShaderStage::Mesh;
+    const bool physical = program.Info().usesDma || program.Resources().stage == IrShaderStage::Mesh || blockAccess;
     if (physical) {
         module.EmitCapability(spv::CapabilityInt64);
         module.EmitCapability(spv::CapabilityPhysicalStorageBufferAddresses);
@@ -498,7 +498,7 @@ void DefineOutputs(SpirvEmitterState& state) {
 void DefineDescriptors(SpirvEmitterState& state) {
     const IrBindingLayout& layout = state.program.Metadata().bindings;
     const IrShaderStage stage = state.program.Resources().stage;
-    if (layout.UsesPushData() || state.stencilReplay || stage == IrShaderStage::Mesh || stage == IrShaderStage::TessellationControl || (state.depthRangeRemap && (stage == IrShaderStage::Vertex || stage == IrShaderStage::TessellationEvaluation))) {
+    if (layout.UsesPushData() || layout.UsesBlock() || state.stencilReplay || stage == IrShaderStage::Mesh || stage == IrShaderStage::TessellationControl || (state.depthRangeRemap && (stage == IrShaderStage::Vertex || stage == IrShaderStage::TessellationEvaluation))) {
         const auto type = PushConstantBlockType(state);
         state.pushConstantVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPushConstant, type), spv::StorageClassPushConstant);
         state.module.AddName(type, "BufferResource");
@@ -518,6 +518,7 @@ void DefineDescriptors(SpirvEmitterState& state) {
             const auto length = heap && !state.registrationModules ? state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::HeapCountBase + static_cast<std::uint32_t>(binding.kind), count) : ConstantU32(state, count);
             return state.module.Type(spv::OpTypeArray, type, length);
         };
+        if (state.blockAccess && (binding.kind == DescriptorBindingKind::Buffers || binding.kind == DescriptorBindingKind::FlattenedSrt)) continue;
         switch (binding.kind) {
         case DescriptorBindingKind::Buffers:
             state.storageBufferVariable = Define(ArrayType(StorageBufferBlockType(state)), "buffers");

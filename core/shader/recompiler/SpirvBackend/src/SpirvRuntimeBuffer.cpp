@@ -1,6 +1,7 @@
 #include "SpirvBackend/SpirvRuntimeBuffer.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
+#include "SpirvBackend/SpirvBlockAccess.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvInputOutput.hpp"
@@ -142,11 +143,11 @@ RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& inst
     const auto* handle = instruction.Argument(0)->Resolve();
     if (handle->Opcode() != IrOpcode::GetBufferResource || handle->ArgumentCount() != 4u) context.Fail(instruction, "requires a runtime four-dword V#");
     const auto& memory = context.Memory(instruction);
-    const bool runtime = memory.gpuDescriptor || state.registrationModules;
+    const bool runtime = memory.gpuDescriptor || state.registrationModules || state.blockAccess;
     const auto first = PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords;
     auto word1 = runtime ? context.Arg(*handle, 1u) : state.module.SpecializationConstant(TypeU32(state), first, 0u);
     if (runtime && GcnGuestShaders()) word1 = Binary(state, spv::OpBitwiseAnd, TypeU32(state), word1, ConstantU32(state, GcnBufferWord1Mask));
-    const bool runtimeFormat = memory.gpuDescriptor || (state.registrationModules && !state.program.Info().buffers.at(memory.resource).descriptorFormatted);
+    const bool runtimeFormat = memory.gpuDescriptor || ((state.registrationModules || state.blockAccess) && !state.program.Info().buffers.at(memory.resource).descriptorFormatted);
     auto word3 = runtimeFormat ? context.Arg(*handle, 3u) : state.module.SpecializationConstant(TypeU32(state), first + 1u, 0u);
     if (runtimeFormat && GcnGuestShaders()) word3 = gcnWord3(state, word1, word3);
     const auto u32 = TypeU32(state);
@@ -222,6 +223,7 @@ RuntimeAddress address(SpirvValueEmitContext& context, const IrValue& instructio
 MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue& instruction, bool wide = false, bool plainLoad = false) {
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
+    if (state.blockAccess) context.Fail(instruction, "accesses a guest buffer through its descriptor, which a block module does not declare");
     const auto variable = wide ? state.storageBufferU64Variable : plainLoad || state.storageBufferCoherentVariable == 0u ? state.storageBufferVariable : state.storageBufferCoherentVariable;
     if (variable == 0u) context.Fail(instruction, "direct buffer descriptor array is missing");
     const auto element = ResourceForDescriptor(state, DescriptorBindingKind::Buffers, memory.resource);
@@ -250,7 +252,7 @@ MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue&
 
 std::uint32_t baseMisalignment(SpirvValueEmitContext& context, const IrValue& instruction) {
     const auto& memory = context.Memory(instruction);
-    if (memory.kind == ResourceKind::ScalarBuffer) return ConstantU32(context.state, 0u);
+    if (memory.kind == ResourceKind::ScalarBuffer || context.state.blockAccess) return ConstantU32(context.state, 0u);
     auto& state = context.state;
     return state.module.SpecializationConstant(TypeU32(state), PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords + 3u, 0u);
 }
@@ -261,9 +263,31 @@ std::uint32_t directWordIndex(SpirvEmitterState& state, const MemoryResourceAcce
     return EmitAddU32(state, relative, base);
 }
 
+BlockBufferOperands blockBuffer(SpirvEmitterState& state, std::uint32_t buffer) {
+    if (!state.module.InHelperFunction()) {
+        for (const auto& entry : state.blockBufferEntries) {
+            if (entry.buffer == buffer && entry.label == state.currentLabel) return {entry.address, entry.bytes, entry.misalignment, entry.present};
+        }
+    }
+    const auto operands = EmitBlockBuffer(state, buffer);
+    if (!state.module.InHelperFunction()) state.blockBufferEntries.push_back({buffer, state.currentLabel, operands.address, operands.bytes, operands.misalignment, operands.present});
+    return operands;
+}
+
+std::uint32_t readBlockBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits, std::uint32_t enable) {
+    auto& state = context.state;
+    const auto u32 = TypeU32(state);
+    const auto buffer = blockBuffer(state, context.Memory(instruction).resource);
+    const auto word = EmitBlockLoad32(state, buffer, EmitAndConstant(state, address, ~3u), enable != 0u ? enable : ConstantBool(state, true));
+    if (bits == 32u) return word;
+    const auto shift = Binary(state, spv::OpShiftLeftLogical, u32, EmitAndConstant(state, address, 3u), ConstantU32(state, 3u));
+    return EmitAndConstant(state, Binary(state, spv::OpShiftRightLogical, u32, word, shift), (1u << bits) - 1u);
+}
+
 std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits, std::uint32_t enable = 0u, std::uint32_t boundedEnable = 0u) {
     if (context.Memory(instruction).gpuDescriptor) return EmitBdaRead(context, instruction, address, bits);
     auto& state = context.state;
+    if (state.blockAccess) return readBlockBuffer(context, instruction, address, bits, enable);
     const auto access = directAccess(context, instruction, false, !context.Memory(instruction).coherent);
     const auto index = directWordIndex(state, access, address);
     const auto misalignment = baseMisalignment(context, instruction);
@@ -857,7 +881,7 @@ std::uint32_t formattedCall(SpirvValueEmitContext& context, const IrValue& instr
         state.memoryByteOffsets.at(element) = parameters[4];
         const auto first = PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords;
         RuntimeDescriptor shared{};
-        if (state.registrationModules) {
+        if (state.registrationModules || state.blockAccess) {
             const auto word3 = state.program.Info().buffers.at(memory.resource).descriptorFormatted ? state.module.SpecializationConstant(u32, first + 1u, 0u) : parameters[6];
             shared = {ConstantU32(state, 0u), parameters[3], parameters[5], word3, nonzero(state, parameters[7]), parameters[0], nonzero(state, parameters[8]), parameters[1], parameters[2]};
         } else {
@@ -1124,6 +1148,7 @@ std::uint32_t EmitRuntimeScalarBufferLoad(SpirvValueEmitContext& context, const 
     const auto limit = Unary(state, spv::OpUConvert, u32, Binary(state, spv::OpShiftRightLogical, u64, boundedSize, BdaConstant(state, 2u)));
     const auto word = Binary(state, spv::OpShiftRightLogical, u32, byte, ConstantU32(state, 2u));
     const auto inBounds = both(state, noCarry, both(state, resource.valid, Binary(state, spv::OpULessThan, TypeBool(state), word, limit)));
+    if (!context.Memory(instruction).gpuDescriptor && state.blockAccess) return readBuffer(context, instruction, byte, 32u, inBounds);
     if (!context.Memory(instruction).gpuDescriptor) {
         const auto first = PipelineSpecialization::BufferBase + context.Memory(instruction).resource * PipelineSpecialization::BufferWords;
         const auto misalignment = state.module.SpecializationConstant(TypeU32(state), first + 3u, 0u);

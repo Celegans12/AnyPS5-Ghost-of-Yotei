@@ -389,6 +389,8 @@ private:
         append(key, value.float16WidenNans);
         append(key, value.float16NarrowNans);
         append(key, value.meshInlineFunctions);
+        append(key, value.blockAccess);
+        if (value.blockAccess) append(key, BlockAbi::Version);
     }
 };
 

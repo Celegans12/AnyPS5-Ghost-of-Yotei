@@ -4,6 +4,7 @@
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
+#include "SpirvBackend/SpirvBlockAccess.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvFormatConvert.hpp"
 #include <cmath>
 #include <spirv/unified1/GLSL.std.450.h>
@@ -2004,6 +2005,7 @@ void EmitProgram(SpirvEmitterState& state) {
         state.module.AddFunction(spv::OpBeginInvocationInterlockEXT);
     }
     EmitMemoryOffsets(state);
+    if (state.blockAccess) EmitBlockBase(state);
     if (state.program.Resources().stage == IrShaderStage::Pixel && state.inputInfo.pixel != nullptr && state.inputInfo.pixel->QuadMasked()) {
         const auto& pixel = *state.inputInfo.pixel;
         const auto quad = EmitQuadPixel(state);

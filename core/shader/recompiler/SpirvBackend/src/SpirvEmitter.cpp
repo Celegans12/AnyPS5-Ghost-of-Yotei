@@ -268,6 +268,9 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
     state.float64DenormPreserve = target.float64DenormPreserve;
     state.depthRangeRemap = target.depthRangeRemap;
     state.registrationModules = target.registrationModules;
+    state.blockAccess = target.blockAccess;
+    state.blockWords = target.blockWords;
+    state.blockBuffers = target.blockBuffers;
     state.fragmentDescriptorSet = target.fragmentDescriptorSet;
     state.meshBarycentricPixel = target.meshBarycentricPixel;
     state.meshBarycentricVertex = target.meshBarycentricVertex;
