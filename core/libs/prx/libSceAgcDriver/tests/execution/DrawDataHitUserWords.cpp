@@ -177,7 +177,8 @@ void UnreadUserWordsKeepTheStage(bool verify) {
     const auto moved = counters;
     counters = Submit(std::move(commands));
     Require(counters.dataHits == moved.dataHits + 1, "a draw that pointed the pixel stage at another buffer descriptor was not a data-only hit: " + Counts(counters));
-    const bool volatileWords = !verify && std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr && std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") == nullptr;
+    const bool sameHigh = (reinterpret_cast<std::uintptr_t>(first) >> 32u) == (reinterpret_cast<std::uintptr_t>(second) >> 32u);
+    const bool volatileWords = !verify && sameHigh && std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr && std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") == nullptr;
     if (volatileWords) Require(counters.dataStagesCompiled == moved.dataStagesCompiled && counters.dataStagesReused - moved.dataStagesReused == 2, "a draw that pointed the pixel stage at another descriptor of a read-only buffer did not reuse the pixel stage with the descriptor patched: " + Counts(counters));
     else Require(counters.dataStagesCompiled - moved.dataStagesCompiled >= 1, "a draw that pointed the pixel stage at another buffer descriptor reused the pixel stage: " + Counts(counters));
     if (!verify && !volatileWords) Require(counters.dataStagesReused - moved.dataStagesReused == 1, "a draw that changed only the pixel stage's descriptor pointer did not reuse the vertex stage: " + Counts(counters));

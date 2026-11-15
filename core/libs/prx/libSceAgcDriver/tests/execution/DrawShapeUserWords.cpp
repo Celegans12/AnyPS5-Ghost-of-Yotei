@@ -516,7 +516,7 @@ void BufferWordsFollowTables(bool enabled, bool verify) {
 
     tables[5][1] |= 4u << 16u;
     outcome = draw(5, tables[5], "a draw of a buffer with another stride");
-    if (!verify && enabled) Require(outcome.step.compiled == 1 && outcome.after.refused >= outcome.before.refused + 1, "a draw whose buffer descriptor has another stride, which the stage is specialized for, was not refused and built: " + detail(outcome));
+    if (!verify && enabled) Require(outcome.step.compiled == 1 && outcome.after.stages == outcome.before.stages, "a draw whose buffer descriptor has another stride, in the dword that stays frozen, was not built: " + detail(outcome));
     outcome = draw(1, tables[1], "a draw of the first stride after the other one");
     if (!verify && enabled) Require(outcome.step.compiled == 0, "a draw of the first stride built a stage after another stride was seen: " + detail(outcome));
 }
