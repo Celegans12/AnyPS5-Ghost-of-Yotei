@@ -4,6 +4,7 @@
 #ifdef _WIN32
 #include "prx/libc/include/GuestArena.hpp"
 #include <windows.h>
+#include "prx/libc/include/WindowsPageTrack.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>

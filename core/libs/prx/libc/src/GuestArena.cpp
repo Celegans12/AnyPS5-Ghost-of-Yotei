@@ -2,6 +2,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/HostRegionIndex.hpp"
 #include "prx/libc/include/WindowsMappings.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -669,6 +670,18 @@ void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t byt
 
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleWrite(address);
+}
+
+bool GuestPageTrackEnabled_nid_no_patch() {
+    return WindowsPageTrack::Get().Enabled();
+}
+
+bool GuestPageTrackHandleWrite_nid_no_patch(std::uintptr_t address) {
+    return WindowsPageTrack::Get().HandleWrite(address);
+}
+
+int GuestPageTrackState_nid_no_patch(std::uintptr_t address) {
+    return static_cast<int>(WindowsPageTrack::Get().StateOf(address & ~(WindowsPageTrack::BlockBytes - 1)));
 }
 
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {
