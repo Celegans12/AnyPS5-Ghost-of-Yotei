@@ -18,8 +18,11 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FlatTransport.hpp"
 
 namespace AgcDriver::DriverDetail {
+
+class DrawFinisher;
 
 class DrawPipeline {
 public:
@@ -53,6 +56,21 @@ public:
     static bool SharedCollectEpoch();
     static bool VerifiesOrder();
     static unsigned Committers();
+    static bool Flat();
+    static std::size_t WakeBatch(std::size_t depth);
+    struct TransportCounts {
+        std::uint64_t elements = 0;
+        std::uint64_t wide = 0;
+        std::uint64_t roomWaits = 0;
+        std::uint64_t consumerWakes = 0;
+        std::uint64_t consumerSleeps = 0;
+        std::uint64_t waiterWakes = 0;
+        std::uint64_t collisions = 0;
+        std::uint64_t queries = 0;
+        std::uint64_t scanned = 0;
+        std::uint64_t lockedQueries = 0;
+    };
+    static TransportCounts Transported();
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
     void Enqueue(CommitKind kind, Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
@@ -64,13 +82,13 @@ public:
     static std::uint64_t DrainRequestsByOpcode(std::uint32_t opcode);
     static std::uint64_t DrainRequestsByReason(DrainReason reason);
     bool Busy() const;
-    std::size_t Outstanding() const { return outstanding.load(std::memory_order_acquire); }
+    std::size_t Outstanding() const;
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     bool OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     Watch WatchWrites();
     bool WrittenSince(const Watch& watch, const std::vector<Range>& reads);
     std::optional<bool> WrittenWhileQueued(std::uint64_t retiredBefore, const std::vector<Range>& reads);
-    std::uint64_t Retired() const { return retiredItems.load(std::memory_order_acquire); }
+    std::uint64_t Retired() const;
     void NoteDecodeDrain() { decodeDrains.fetch_add(1, std::memory_order_relaxed); }
     std::uint64_t DecodeDrains() const { return decodeDrains.load(std::memory_order_relaxed); }
     std::optional<std::uint64_t> PendingLabel(std::uint64_t address, std::size_t bytes);
@@ -83,6 +101,7 @@ public:
     static void CountPipelinedMetadataPass();
     static std::uint64_t PipelinedMetadataPasses();
 private:
+    friend class DrawFinisher;
     struct Item {
         Commit commit;
         std::vector<Range> writes;
@@ -99,8 +118,11 @@ private:
     void enqueue(Item item);
     void relay(Item item);
     void push(Item item);
+    void pushFlat(Item item);
     void run();
+    void runFlat();
     void rethrowFailure();
+    void rethrowFlatFailure();
     void report(std::chrono::steady_clock::time_point now);
     void countWrites(const std::vector<Range>& writes, bool added);
     static void breakProofsAfter(CommitKind kind, const std::vector<Range>& writes);
@@ -140,6 +162,16 @@ private:
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CommitKind::Count)> kindNs{};
     std::uint64_t depthSum = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+    std::unique_ptr<FlatQueue<Item>> flat;
+    std::atomic<bool> flatFailed{false};
+    std::atomic<bool> flatStarted{false};
+    std::atomic<std::uint64_t> flatCommits{0};
+    std::atomic<std::uint64_t> flatCommitNs{0};
+    std::atomic<std::uint64_t> flatCommitErrors{0};
+    std::atomic<std::uint64_t> flatIdleWaits{0};
+    std::atomic<std::uint64_t> flatIdleNs{0};
+    std::atomic<std::uint64_t> flatRoomWaits{0};
+    std::uint64_t flatReportedWakes = 0;
 };
 
 class DrawFinisher {
@@ -212,6 +244,7 @@ public:
     static void NoteCacheWait(std::uint64_t nanoseconds);
     static void NoteUnlockedHit();
     static std::string LookupText();
+    static DrawPipeline::TransportCounts Transported();
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
     void Drain();
@@ -221,6 +254,14 @@ public:
     void ReleaseRan();
 
 private:
+    friend class DrawPipeline;
+    struct Work {
+        Job job;
+        DrawPipeline::Item relayed;
+        DrawPipeline* target = nullptr;
+        std::uint64_t epoch = 0;
+        DrawPipeline::Order order;
+    };
     struct Slot {
         Job job;
         Pending held;
@@ -237,6 +278,9 @@ private:
     };
     DrawFinisher() = default;
     void run();
+    void runFlat();
+    void enqueueFlat(Job job, DrawPipeline::Item* relayed, DrawPipeline* target, const Pending& held);
+    void rethrowFlatFailure();
     void enqueuePooled(Job job, Pending held);
     void work(unsigned index);
     void retire(std::unique_lock<std::mutex>& lock);
@@ -264,6 +308,10 @@ private:
     bool running = false;
     bool sleeping = false;
     std::thread thread;
+    std::unique_ptr<FlatQueue<Work>> flat;
+    std::unique_ptr<PendingLedger> poolLedger;
+    std::atomic<bool> flatFailed{false};
+    std::atomic<bool> flatStarted{false};
 };
 
 template<typename TMutex>
