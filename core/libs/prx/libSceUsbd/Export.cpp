@@ -3,6 +3,7 @@
 #include <cstddef>
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 
 #include <libusb.h>
 
@@ -53,6 +54,7 @@ struct UsbdState {
     std::unordered_map<libusb_device_handle*, std::uint32_t> claimed;
     std::unordered_set<libusb_config_descriptor*> configs;
     std::unordered_map<UsbdTransfer*, libusb_transfer*> inFlight;
+    std::unordered_set<UsbdTransfer*> hostWrites;
     std::unordered_map<const UsbdTransfer*, std::int32_t> isoCapacities;
 };
 
@@ -223,11 +225,14 @@ void LIBUSB_CALL CompleteTransfer(libusb_transfer* host) {
         guest->isoPacketDescriptors[packet].actualLength = host->iso_packet_desc[packet].actual_length;
         guest->isoPacketDescriptors[packet].status = host->iso_packet_desc[packet].status;
     }
+    bool written = false;
     {
         auto& state = State();
         std::lock_guard lock(state.mutex);
         state.inFlight.erase(guest);
+        written = state.hostWrites.erase(guest) != 0;
     }
+    if (written) GuestArena::GuestArenaEndHostWrite_nid_postfix(host->buffer, static_cast<std::size_t>(host->length));
     libusb_free_transfer(host);
     Events().completions.fetch_add(1);
     if (guest->callback != nullptr) guest->callback(guest);
@@ -469,6 +474,7 @@ std::int32_t APS5_VABI sceUsbdBulkTransfer(void* deviceHandle, std::uint8_t endp
     if (deviceHandle == nullptr || (length != 0 && data == nullptr)) return SCE_USBD_ERROR_INVALID_ARG;
     if (transferred == nullptr) throw std::runtime_error(std::string(__func__) + ": null transferred output");
     *transferred = 0;
+    const GuestArena::HostWrite guard(data, length > 0 ? static_cast<std::size_t>(length) : 0);
     return ToGuestError(libusb_bulk_transfer(KnownHandle(deviceHandle, __func__), endpoint, data, length, transferred, timeout));
 }
 
@@ -476,6 +482,7 @@ std::int32_t APS5_VABI sceUsbdInterruptTransfer(void* deviceHandle, std::uint8_t
     if (deviceHandle == nullptr || (length != 0 && data == nullptr)) return SCE_USBD_ERROR_INVALID_ARG;
     if (transferred == nullptr) throw std::runtime_error(std::string(__func__) + ": null transferred output");
     *transferred = 0;
+    const GuestArena::HostWrite guard(data, length > 0 ? static_cast<std::size_t>(length) : 0);
     return ToGuestError(libusb_interrupt_transfer(KnownHandle(deviceHandle, __func__), endpoint, data, length, transferred, timeout));
 }
 
@@ -674,12 +681,20 @@ std::int32_t APS5_VABI sceUsbdSubmitTransfer(UsbdTransfer* transfer) {
             return ToGuestError(LIBUSB_ERROR_BUSY);
         }
     }
+    const bool written = host->buffer != nullptr && host->length > 0 && GuestArena::GuestArenaBeginHostWrite_nid_postfix(host->buffer, static_cast<std::size_t>(host->length));
+    if (written) {
+        std::lock_guard lock(state.mutex);
+        state.hostWrites.insert(transfer);
+    }
     const int result = libusb_submit_transfer(host);
     if (result != 0) {
+        bool open = false;
         {
             std::lock_guard lock(state.mutex);
             state.inFlight.erase(transfer);
+            open = state.hostWrites.erase(transfer) != 0;
         }
+        if (open) GuestArena::GuestArenaEndHostWrite_nid_postfix(host->buffer, static_cast<std::size_t>(host->length));
         libusb_free_transfer(host);
     }
     return ToGuestError(result);

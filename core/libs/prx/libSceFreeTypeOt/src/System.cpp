@@ -8,6 +8,7 @@
 #include "prx/libSceFreeTypeOt/include/Memory.hpp"
 #include "prx/libc/include/FilesystemError.hpp"
 #include "prx/libc/include/General.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -52,6 +53,7 @@ std::uint64_t APS5_VABI StreamIo(GuestStreamRec* stream, std::uint64_t offset, s
     }
     if (!count || !file) return 0;
     const auto request = static_cast<std::streamsize>(std::min<std::uint64_t>(count, std::numeric_limits<std::streamsize>::max()));
+    const GuestArena::HostWrite guard(buffer, static_cast<std::size_t>(request));
     file.read(reinterpret_cast<char*>(buffer), request);
     return static_cast<std::uint64_t>(file.gcount());
 }
