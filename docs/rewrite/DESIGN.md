@@ -236,9 +236,24 @@ buffer regions often span two mappings and no single import served them. Found a
   scene change, 119 to 132 after). FF 35.6 and 37.0, LEGO 49.0, AoM 155.4 and 162.2: unchanged.
   Tests 1,808 of 1,808 with section A on and off.
 - 007's storage cache sits at its 7.2 GiB budget and makes about 41 images per present: the
-  title allocates the same kind of target at hundreds of addresses in a cycle (1280x720 format
-  36 at 338 addresses). Each new image uploads its whole surface ("first", 231 MiB per present).
-  Not changed.
+  title cycles 1,955 targets (address and format; 10.9 GiB together, 3840x2160 format 71 at 42
+  addresses alone 2.7 GiB) in about 5 s, so every image is evicted before its turn comes again
+  and the cache gives these images nothing. Each new image uploads its whole surface ("first",
+  23 GiB per 10 s) after the pending images under it are written back (16.7 GiB per 10 s). The
+  10.9 GiB do not fit (heap budget 14 GiB, 4.6 GiB used elsewhere).
+- Image memory (4141821e30, `libs\i4`): making an image object cost 0.13 ms, 6.6 s of 7.1 s per
+  run in the memory allocation. NVIDIA prefers a dedicated allocation for these images, which
+  the image memory pool cannot serve, so each creation allocated and each eviction freed device
+  memory. A budgeted image whose dedicated allocation is only preferred now takes pooled memory
+  (`APS5_NO_POOLED_PREFERRED_IMAGES=1`). 007: dispatch on the main worker 66 to 48 ms per
+  frame; frame 75 to 88 ms (was 80 to 105). FF, LEGO, AoM unchanged in back-to-back runs. Tests
+  1,808 of 1,808 with section A on and off. Tried first and dropped: a recycler keeping released
+  image objects with their memory (`failed-patches\phase4-storage-image-recycler.patch`); it
+  broke 13 tests that require image memory to be released at its last use, and 007's GPU time
+  rose after 60 s in two of three runs (1 GiB more held).
+- f8e0ee64d4: eight `thread_local` caches of the direct path had destructors; the draw committer
+  crashed in one at thread exit (`agc_driver_village_draw_cost` hung in 9 of 120 runs with
+  section A off). They use `ThreadScratch` now; 150 of 150 runs pass.
 
 Build plan that follows from this, in order:
 
