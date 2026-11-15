@@ -639,6 +639,23 @@ bool LabelRunsPerBatch() {
 }
 std::atomic<std::uint64_t> storeRunsAtSubmit{0}, storeRunsForced{0};
 
+bool SwitchedOn(const char* name) {
+    const char* text = std::getenv(name);
+    return text != nullptr && text[0] != '\0' && !(text[0] == '0' && text[1] == '\0');
+}
+
+bool ReapBySerial() {
+    static const bool enabled = SwitchedOn("APS5_REAP_BY_SERIAL");
+    return enabled;
+}
+
+bool VerifyReapBySerial() {
+    static const bool enabled = SwitchedOn("APS5_VERIFY_REAP_BY_SERIAL");
+    return enabled;
+}
+
+std::atomic<std::uint64_t> serialRefusals{0}, serialFenceQueries{0}, serialLate{0}, serialEarly{0};
+
 // APS5_NO_JOIN_WAW_CHECK=1: a contiguous store joins the pending one without the check against
 // the run's recorded stores, as before (see RecordStore).
 bool JoinWawCheck() {
@@ -1304,6 +1321,8 @@ struct Recorder::ProgressWatcher {
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<bool> stop{false};
     std::atomic<std::uint32_t> wakes{0};
+    std::atomic<std::uint64_t> observed{0};
+    std::atomic<bool> watching{true};
     std::thread thread;
 
     ProgressWatcher(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, PFN_vkGetSemaphoreCounterValueKHR counterValue) {
@@ -1326,11 +1345,13 @@ struct Recorder::ProgressWatcher {
                 if (result == VK_TIMEOUT) continue;
                 if (result != VK_SUCCESS) {
                     std::fprintf(stderr, "[gpu] progress watcher: vkWaitSemaphoresKHR failed (%d), watcher stops\n", static_cast<int>(result));
+                    watching.store(false, std::memory_order_release);
                     return;
                 }
                 std::uint64_t value = target;
                 if (counterValue(device, timeline, &value) != VK_SUCCESS) value = target;
                 seen = std::max(target, value);
+                observed.store(seen, std::memory_order_release);
                 KernelWakeSleepers_nid_no_patch();
             }
         });
@@ -4551,7 +4572,26 @@ std::uint64_t Recorder::PendingLeaseSerial(std::uint64_t address, std::size_t by
 }
 
 bool Recorder::signaled(const Batch& batch) const {
-    return batch.submitted && fenceStatus(batch.fence) == VK_SUCCESS;
+    return batch.submitted && fenceSignaled(batch);
+}
+
+bool Recorder::fenceSignaled(const Batch& batch) const {
+    const bool filtered = ReapBySerial() && batch.serial != 0 && progressWatcher != nullptr && progressWatcher->watching.load(std::memory_order_acquire);
+    if (filtered && progressWatcher->observed.load(std::memory_order_acquire) < batch.serial) {
+        serialRefusals.fetch_add(1, std::memory_order_relaxed);
+        if (VerifyReapBySerial() && fenceStatus(batch.fence) == VK_SUCCESS) serialLate.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const bool fence = fenceStatus(batch.fence) == VK_SUCCESS;
+    if (filtered) {
+        serialFenceQueries.fetch_add(1, std::memory_order_relaxed);
+        if (!fence && serialEarly.fetch_add(1, std::memory_order_relaxed) == 0 && VerifyReapBySerial()) std::fprintf(stderr, "[gpu] APS5_VERIFY_REAP_BY_SERIAL: the timeline reached batch %llu before its fence was signaled\n", static_cast<unsigned long long>(batch.serial));
+    }
+    return fence;
+}
+
+Recorder::SerialReapStatistics Recorder::SerialReapCounts() {
+    return SerialReapStatistics{ReapBySerial(), serialRefusals.load(std::memory_order_relaxed), serialFenceQueries.load(std::memory_order_relaxed), serialLate.load(std::memory_order_relaxed), serialEarly.load(std::memory_order_relaxed)};
 }
 
 bool Recorder::PendingWriteSettled(std::uint64_t address, std::size_t bytes) const {
@@ -4767,7 +4807,7 @@ std::optional<Recorder::PendingWriteInfo> Recorder::DescribePendingWrite(std::ui
         const auto* range = firstOverlap(**it);
         if (range == nullptr) continue;
         // In flight means submitted, so the fence is live; signaled = the GPU already ran it.
-        const bool signaled = fenceStatus((*it)->fence) == VK_SUCCESS;
+        const bool signaled = fenceSignaled(**it);
         if (syncAll) return PendingWriteInfo{submissions + (open != nullptr ? 1 : 0), open != nullptr, signaled, range->first, range->second, allBatches};
         return PendingWriteInfo{(*it)->serial, false, signaled, range->first, range->second, finished};
     }
@@ -4912,7 +4952,7 @@ std::optional<Recorder::LabelHit> Recorder::lookupLabel(std::uint64_t address, s
 
 bool Recorder::unsignaled(std::uint64_t serial) const {
     for (const auto& batch : inFlight) {
-        if (batch->serial == serial) return fenceStatus(batch->fence) != VK_SUCCESS;
+        if (batch->serial == serial) return !fenceSignaled(*batch);
     }
     return false;
 }
@@ -5651,7 +5691,7 @@ bool Recorder::Reap() {
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     std::uint64_t retired = 0;
     while (!inFlight.empty()) {
-        if (fenceStatus(inFlight.front()->fence) != VK_SUCCESS) break;
+        if (!fenceSignaled(*inFlight.front())) break;
         auto batch = std::move(inFlight.front());
         inFlight.pop_front();
         finish(std::move(batch), false, 4);

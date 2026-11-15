@@ -720,6 +720,11 @@ public:
         std::uint64_t runsAtSubmit, runsForced;
     };
     static StoreStatistics StoreCounts();
+    struct SerialReapStatistics {
+        bool enabled;
+        std::uint64_t refused, fenceQueries, late, early;
+    };
+    static SerialReapStatistics SerialReapCounts();
     // APS5_PROFILE_GPU=1: GPU time of recorded work by key (a guest program address), from timestamp
     // queries around each timed range; the totals per key are reported every 10 s. Begin returns the
     // range index to pass to End, or NoTiming when timing is off or the batch's queries are used up.
@@ -1090,6 +1095,7 @@ private:
     static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only = std::nullopt);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> notedReads(const Batch& batch);
     bool signaled(const Batch& batch) const;
+    bool fenceSignaled(const Batch& batch) const;
     // Rebuilds the lock-free snapshot of pending writes from open, inFlight and finishing.
     void publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions = {}) const;
     // Appends one range to the open batch; returns whether the snapshot must be rebuilt for it.
