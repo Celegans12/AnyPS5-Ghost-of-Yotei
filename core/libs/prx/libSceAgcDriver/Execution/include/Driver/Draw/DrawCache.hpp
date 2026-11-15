@@ -62,6 +62,22 @@ struct PreparedGraphicsStage {
 
 std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decoded, const ShaderRecompiler::SpirvTarget& target, bool deferUnprepared = false);
 
+struct DrawContentKey {
+    std::uint64_t hash = 0;
+    std::vector<std::uint32_t> words;
+};
+
+struct ContentRecipeCounts {
+    std::size_t held = 0;
+    std::uint64_t evicted = 0;
+};
+
+bool ContentRecipes();
+std::shared_ptr<const DrawContentKey> ContentKeyOf(std::uint64_t shape, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> stages);
+std::shared_ptr<const DrawRecipe> FindContentRecipe(const DrawContentKey& key);
+void AttachContentRecipe(const std::shared_ptr<const DrawContentKey>& key, std::shared_ptr<const DrawRecipe> recipe);
+ContentRecipeCounts ContentRecipesHeld();
+
 struct DrawRecipeRecord {
     std::vector<std::weak_ptr<const DispatchVariant>> stages;
     std::shared_ptr<const DrawRecipe> recipe;

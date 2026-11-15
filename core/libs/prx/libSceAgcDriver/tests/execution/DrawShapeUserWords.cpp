@@ -30,6 +30,7 @@
 #include <memory>
 #include <numeric>
 #include <string>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -278,12 +279,26 @@ using RecipeDraws = AgcDriver::VulkanDevice::DrawRecipeDrawCounts;
 std::string Decisions(const RecipeDraws& before, const RecipeDraws& after) {
     const auto shape = static_cast<std::size_t>(AgcDriver::VulkanDevice::DrawRecipeOrigin::Shape);
     const auto skip = [&](AgcDriver::VulkanDevice::DrawRecipeSkip reason) { return std::to_string(after.skipped[static_cast<std::size_t>(reason)] - before.skipped[static_cast<std::size_t>(reason)]); };
-    return std::to_string(after.Draws() - before.Draws()) + " draws counted: " + std::to_string(after.found[shape] - before.found[shape]) + " found a recipe through their shape, " + std::to_string(after.recorded[shape] - before.recorded[shape]) + " were recorded from it, " + std::to_string(after.absent[shape] - before.absent[shape]) + " found none, " + skip(AgcDriver::VulkanDevice::DrawRecipeSkip::Captured) + " captured a stage, " + skip(AgcDriver::VulkanDevice::DrawRecipeSkip::Split) + " reused stages of several remembered draws, " + skip(AgcDriver::VulkanDevice::DrawRecipeSkip::Ineligible) + " were not eligible";
+    const auto content = static_cast<std::size_t>(AgcDriver::VulkanDevice::DrawRecipeOrigin::Content);
+    return std::to_string(after.Draws() - before.Draws()) + " draws counted: " + std::to_string(after.found[content] - before.found[content]) + " found a recipe under their content key, " + std::to_string(after.recorded[content] - before.recorded[content]) + " were recorded from it, " + std::to_string(after.contentAbsent - before.contentAbsent) + " found none under it, " + std::to_string(after.contentUnkeyed - before.contentUnkeyed) + " had no content key, " + std::to_string(after.found[shape] - before.found[shape]) + " found a recipe through their shape, " + std::to_string(after.recorded[shape] - before.recorded[shape]) + " were recorded from it, " + std::to_string(after.absent[shape] - before.absent[shape]) + " found none, " + skip(AgcDriver::VulkanDevice::DrawRecipeSkip::Captured) + " captured a stage, " + skip(AgcDriver::VulkanDevice::DrawRecipeSkip::Split) + " reused stages of several remembered draws, " + skip(AgcDriver::VulkanDevice::DrawRecipeSkip::Ineligible) + " were not eligible";
 }
 
 bool Decided(const RecipeDraws& before, const RecipeDraws& after, AgcDriver::VulkanDevice::DrawRecipeSkip reason) {
     const auto index = static_cast<std::size_t>(reason);
     return after.Draws() == before.Draws() + 1 && after.skipped[index] == before.skipped[index] + 1;
+}
+
+bool RecordedByContent(const RecipeDraws& before, const RecipeDraws& after) {
+    const auto content = static_cast<std::size_t>(AgcDriver::VulkanDevice::DrawRecipeOrigin::Content);
+    return after.Draws() == before.Draws() + 1 && after.found[content] == before.found[content] + 1 && after.recorded[content] == before.recorded[content] + 1;
+}
+
+bool ContentRecipesOn() {
+    return std::getenv("APS5_NO_CONTENT_RECIPES") == nullptr && std::getenv("APS5_NO_SHAPE_RECIPES") == nullptr && std::getenv("APS5_NO_DRAW_RECIPE") == nullptr;
+}
+
+bool ContentRecipesFollowBuffers() {
+    return ContentRecipesOn() && std::getenv("APS5_NO_MOVED_BUFFER_TEMPLATES") == nullptr;
 }
 
 void RememberedDrawsAlternate(bool enabled, bool verify, bool recipes) {
@@ -322,7 +337,8 @@ void RememberedDrawsAlternate(bool enabled, bool verify, bool recipes) {
             counters = draw(set, tables[set], "teaching");
             const auto step = Between(before, counters);
             const auto now = AgcDriver::VulkanDevice::DrawRecipeDraws();
-            if (!verify) Require(Decided(decided, now, shapeRecipes ? AgcDriver::VulkanDevice::DrawRecipeSkip::Captured : AgcDriver::VulkanDevice::DrawRecipeSkip::Ineligible), std::string("a draw that captured its pixel stage was not counted as ") + (shapeRecipes ? "having captured a stage" : "not eligible, with the shape recipes off") + ": " + Decisions(decided, now));
+            if (!verify && (ContentRecipesFollowBuffers() || (ContentRecipesOn() && sighting == 1))) Require(RecordedByContent(decided, now), std::string("a draw that captured its pixel stage for ") + (ContentRecipesFollowBuffers() ? "a buffer at another address" : "the buffer its previous draw built a recipe for") + " was not recorded from the recipe kept under its content key: " + Decisions(decided, now));
+            else if (!verify) Require(Decided(decided, now, shapeRecipes ? AgcDriver::VulkanDevice::DrawRecipeSkip::Captured : AgcDriver::VulkanDevice::DrawRecipeSkip::Ineligible), std::string("a draw that captured its pixel stage was not counted as ") + (shapeRecipes ? "having captured a stage" : "not eligible, with the shape recipes off") + ": " + Decisions(decided, now));
             Require(counters.dataHits == before.dataHits + 1 && counters.inserts == before.inserts, "a draw of another buffer through the same shape was not a data-only hit: " + Counts(counters));
             Require(step.compiled == (verify ? 2u : 1u), "sighting " + std::to_string(sighting + 1) + " of buffer " + std::to_string(set) + ", which no remembered draw of the shape binds, built " + std::to_string(step.compiled) + " stages: " + Counts(counters));
             Require(step.updates == (enabled && sighting == 1 ? 1u : 0u), "sighting " + std::to_string(sighting + 1) + " of buffer " + std::to_string(set) + " added " + std::to_string(step.updates) + " remembered draws to the shape: " + Counts(counters));
@@ -414,6 +430,48 @@ void RememberedDrawsAlternate(bool enabled, bool verify, bool recipes) {
         step = Between(before, counters);
         Require(step.compiled == 0 && step.reused == 2, "a draw of buffer " + std::to_string(set) + ", whose remembered draw is within k, reused " + std::to_string(step.reused) + " stages and built " + std::to_string(step.compiled) + ": " + Counts(counters));
     }
+}
+
+void ContentKeysSeparateDescriptors() {
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    auto* block = GuestBlock();
+    constexpr std::array<float, 3> values{0.375f, 0.125f, 0.6875f};
+    constexpr std::array<unsigned, 3> colors{96, 32, 175};
+    std::array<std::uint32_t*, 3> tables{};
+    for (std::size_t set = 0; set < tables.size(); ++set) {
+        tables[set] = block + set * 64;
+        Describe(tables[set], tables[set] + DataWord, values[set]);
+    }
+    for (const std::size_t set : {std::size_t{1}, std::size_t{2}}) tables[set][1] |= 4u << 16u;
+    const auto draw = [&](std::size_t set, const char* what) {
+        const auto before = AgcDriver::VulkanDevice::DrawRecipeDraws();
+        const auto counters = Draw(tables[set]);
+        const auto color = Brightest();
+        Require(CloseTo(color, colors[set]), std::string(what) + " wrote " + std::to_string(color) + ", expected " + std::to_string(colors[set]) + " (" + Counts(counters) + ")");
+        return std::pair{before, AgcDriver::VulkanDevice::DrawRecipeDraws()};
+    };
+    const bool on = ContentRecipesOn();
+    const bool content = ContentRecipesFollowBuffers();
+    const auto found = [](const RecipeDraws& counts) { return counts.found[static_cast<std::size_t>(AgcDriver::VulkanDevice::DrawRecipeOrigin::Content)]; };
+    const auto recorded = [](const RecipeDraws& counts) { return std::accumulate(counts.recorded.begin(), counts.recorded.end(), std::uint64_t{0}); };
+    const auto ownKeyOnly = [&](const RecipeDraws& before, const RecipeDraws& after, const char* what) {
+        if (on && !content) Require(found(after) == found(before) && after.contentAbsent == before.contentAbsent + 1, std::string("with templates keyed by the whole buffer descriptor, ") + what + " did not find its own content key empty: " + Decisions(before, after));
+    };
+    const auto held = AgcDriver::DriverDetail::ContentRecipesHeld().held;
+    auto [before, after] = draw(0, "a draw of a buffer with the stride the shape's recipe was built for");
+    if (content) Require(RecordedByContent(before, after), "a draw of another buffer with the descriptor words the shape's recipe was built for was not recorded from the recipe kept under its content key: " + Decisions(before, after));
+    ownKeyOnly(before, after, "the first draw of a buffer at another address");
+    std::tie(before, after) = draw(1, "the first draw of a buffer with another stride");
+    Require(recorded(after) == recorded(before), "the first draw of a buffer whose descriptor has another stride, which the resource template keys, was recorded from a recipe: " + Decisions(before, after));
+    if (on) Require(after.contentAbsent == before.contentAbsent + 1 && after.contentAttaches == before.contentAttaches + 1, "the first draw of a buffer whose descriptor has another stride did not look its own content key up, find it empty and keep the recipe it built under it: " + Decisions(before, after));
+    if (content) Require(AgcDriver::DriverDetail::ContentRecipesHeld().held == held + 1, "the recipe built for another stride was not kept under one more content key");
+    std::tie(before, after) = draw(2, "a draw of a second buffer with the other stride");
+    if (content) Require(RecordedByContent(before, after) && AgcDriver::DriverDetail::ContentRecipesHeld().held == held + 1, "a draw of a second buffer with the other stride was not recorded from the recipe the first one built: " + Decisions(before, after));
+    ownKeyOnly(before, after, "the first draw of a second buffer with the other stride");
+    std::tie(before, after) = draw(0, "a draw of the first stride after the other one");
+    if (on) Require(recorded(after) == recorded(before) + 1 && after.contentAttaches == before.contentAttaches, "a second draw of the first buffer was not recorded from a recipe once another stride had its own: " + Decisions(before, after));
+    else Require(found(after) == 0 && after.contentAttaches == 0 && AgcDriver::DriverDetail::ContentRecipesHeld().held == 0, "with the content recipes off, a recipe was kept or found under a content key: " + Decisions(before, after));
 }
 
 void VertexInputsFollowMovedTables(bool enabled, bool vertexInputs, bool verify, bool recipes) {
@@ -927,6 +985,7 @@ int main() {
             SitesFollowRetainedDraws(sites, pipelined);
             SitesFollowMovedVertexTables(sites, pipelined, vertexInputs);
         }
+        if (!verify) ContentKeysSeparateDescriptors();
         const auto siteCounters = DrawSiteAccess::Counters();
         const auto origins = AgcDriver::VulkanDevice::DrawRecipeOrigins();
         const auto shape = static_cast<std::size_t>(AgcDriver::VulkanDevice::DrawRecipeOrigin::Shape);

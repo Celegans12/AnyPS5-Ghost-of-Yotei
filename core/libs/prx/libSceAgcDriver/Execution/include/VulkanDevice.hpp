@@ -361,7 +361,7 @@ public:
     static void NoteRecipe(RecipeEvent event, RecipeKind kind);
     enum class DrawRecipePrecheck : std::size_t { NoRecipe, Device };
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
-    enum class DrawRecipeOrigin : std::size_t { Exact, Relocated, Shape, Count };
+    enum class DrawRecipeOrigin : std::size_t { Exact, Relocated, Shape, Content, Count };
     static void NoteDrawRecipeAttach(DrawRecipeOrigin origin);
     static void NoteShapeRecipeRefused();
     struct DrawRecipeOriginCounts {
@@ -373,19 +373,21 @@ public:
     static DrawRecipeOriginCounts DrawRecipeOrigins();
     enum class DrawRecipeSkip : std::size_t { Ineligible, Captured, Split, Count };
     static void NoteDrawRecipeSkip(DrawRecipeSkip skip);
+    static void NoteContentRecipeAttach();
     static void NoteDrawRecipeLookup(DrawRecipeOrigin origin, bool found);
     static void NoteDrawRecipeUnbuilt();
+    static void NoteContentRecipeLookup(bool keyed);
     struct DrawRecipeDrawCounts {
         std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeOrigin::Count)> recorded{};
         std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeOrigin::Count)> found{};
         std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeOrigin::Count)> absent{};
         std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeSkip::Count)> skipped{};
-        std::uint64_t device = 0, notRecordable = 0, objectsGone = 0, templateGone = 0, layout = 0, proof = 0, buffers = 0, attaches = 0, unbuilt = 0;
+        std::uint64_t device = 0, notRecordable = 0, objectsGone = 0, templateGone = 0, layout = 0, proof = 0, buffers = 0, attaches = 0, unbuilt = 0, contentAbsent = 0, contentUnkeyed = 0, contentAttaches = 0;
         std::array<std::uint64_t, static_cast<std::size_t>(Graphics::DrawRecipeRefusal::Count)> refusals{};
         [[nodiscard]] std::uint64_t Draws() const;
     };
     static DrawRecipeDrawCounts DrawRecipeDraws();
-    static std::string DrawRecipeDrawsReport();
+    static std::string DrawRecipeDrawsReport(std::size_t contentHeld, std::uint64_t contentEvicted);
     using DrawTraceContext = Graphics::DrawTraceContext;
     static std::uint64_t DrawRecipeHits();
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw

@@ -21,6 +21,15 @@ if(BUILD_TESTING)
     add_test(NAME agc_driver_draw_shape_user_words_no_shape_recipes COMMAND agc_driver_draw_shape_user_words_tests)
     set_tests_properties(agc_driver_draw_shape_user_words_no_shape_recipes PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_SHAPE_RECIPES=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_draw_shape_user_words_no_content_recipes COMMAND agc_driver_draw_shape_user_words_tests)
+    set_tests_properties(agc_driver_draw_shape_user_words_no_content_recipes PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_CONTENT_RECIPES=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_draw_shape_user_words_untrimmed_keys COMMAND agc_driver_draw_shape_user_words_tests)
+    set_tests_properties(agc_driver_draw_shape_user_words_untrimmed_keys PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_DRAW_KEY_TRIM=1;APS5_VERIFY_DRAW_RECIPE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    add_test(NAME agc_driver_draw_shape_user_words_no_moved_templates COMMAND agc_driver_draw_shape_user_words_tests)
+    set_tests_properties(agc_driver_draw_shape_user_words_no_moved_templates PROPERTIES
+        ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_MOVED_BUFFER_TEMPLATES=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(NAME agc_driver_draw_shape_user_words_recipe_verify COMMAND agc_driver_draw_shape_user_words_tests)
     set_tests_properties(agc_driver_draw_shape_user_words_recipe_verify PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_VERIFY_DRAW_RECIPE=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
@@ -37,7 +46,7 @@ if(BUILD_TESTING)
     set_tests_properties(agc_driver_draw_shape_user_words_sites_vertex_off PROPERTIES
         ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_SITES=1;APS5_NO_SHAPE_VERTEX_INPUT_STAGES=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
-        set_tests_properties(agc_driver_draw_shape_user_words_verify agc_driver_draw_shape_user_words_off agc_driver_draw_data_hit_user_words_shape_off agc_driver_draw_cache_reuse_shape_off agc_driver_draw_cache_relocation_shape_off agc_driver_draw_shape_user_words_off_verify agc_driver_draw_data_hit_user_words_shape_off_verify agc_driver_draw_data_hit_user_words_shape_off_refresh agc_driver_draw_shape_user_words_vertex_off agc_driver_draw_shape_user_words_no_shape_recipes agc_driver_draw_shape_user_words_recipe_verify agc_driver_draw_shape_user_words_sites agc_driver_draw_shape_user_words_sites_finisher agc_driver_draw_shape_user_words_sites_inline agc_driver_draw_shape_user_words_sites_vertex_off PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_draw_shape_user_words_verify agc_driver_draw_shape_user_words_off agc_driver_draw_data_hit_user_words_shape_off agc_driver_draw_cache_reuse_shape_off agc_driver_draw_cache_relocation_shape_off agc_driver_draw_shape_user_words_off_verify agc_driver_draw_data_hit_user_words_shape_off_verify agc_driver_draw_data_hit_user_words_shape_off_refresh agc_driver_draw_shape_user_words_vertex_off agc_driver_draw_shape_user_words_no_shape_recipes agc_driver_draw_shape_user_words_no_content_recipes agc_driver_draw_shape_user_words_untrimmed_keys agc_driver_draw_shape_user_words_no_moved_templates agc_driver_draw_shape_user_words_recipe_verify agc_driver_draw_shape_user_words_sites agc_driver_draw_shape_user_words_sites_finisher agc_driver_draw_shape_user_words_sites_inline agc_driver_draw_shape_user_words_sites_vertex_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

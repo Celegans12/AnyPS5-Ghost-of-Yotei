@@ -5264,7 +5264,7 @@ struct DrawRecipeTotals {
     static constexpr std::size_t Origins = static_cast<std::size_t>(VulkanDevice::DrawRecipeOrigin::Count);
     std::array<std::atomic<std::uint64_t>, Origins> recorded{}, found{}, absent{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(VulkanDevice::DrawRecipeSkip::Count)> skipped{};
-    std::atomic<std::uint64_t> device{0}, notRecordable{0}, objectsGone{0}, templateGone{0}, layout{0}, proof{0}, buffers{0}, attaches{0}, unbuilt{0};
+    std::atomic<std::uint64_t> device{0}, notRecordable{0}, objectsGone{0}, templateGone{0}, layout{0}, proof{0}, buffers{0}, attaches{0}, unbuilt{0}, contentAbsent{0}, contentUnkeyed{0}, contentAttaches{0};
 };
 
 DrawRecipeTotals& DrawRecipeDrawTotals() {
@@ -5362,7 +5362,7 @@ void reportRecipes() {
         if (kind == 2) {
             const auto origin = [&](auto& slots, VulkanDevice::DrawRecipeOrigin which) { return take(slots[static_cast<std::size_t>(which)]); };
             char text[512];
-            std::snprintf(text, sizeof(text), "; hits by origin: exact entry %llu, relocated entry %llu, shape %llu; layout misses %llu; attaches on a donor entry: relocated %llu, shape %llu (exact entry %llu); shape draws without one remembered entry for every stage %llu", origin(recipes.drawOriginHits, VulkanDevice::DrawRecipeOrigin::Exact), origin(recipes.drawOriginHits, VulkanDevice::DrawRecipeOrigin::Relocated), origin(recipes.drawOriginHits, VulkanDevice::DrawRecipeOrigin::Shape), take(recipes.drawLayoutMisses), origin(recipes.drawOriginAttaches, VulkanDevice::DrawRecipeOrigin::Relocated), origin(recipes.drawOriginAttaches, VulkanDevice::DrawRecipeOrigin::Shape), origin(recipes.drawOriginAttaches, VulkanDevice::DrawRecipeOrigin::Exact), take(recipes.shapeRefused));
+            std::snprintf(text, sizeof(text), "; hits by origin: exact entry %llu, relocated entry %llu, shape %llu, content key %llu; layout misses %llu; attaches on a donor entry: relocated %llu, shape %llu (exact entry %llu); shape draws without one remembered entry for every stage %llu", origin(recipes.drawOriginHits, VulkanDevice::DrawRecipeOrigin::Exact), origin(recipes.drawOriginHits, VulkanDevice::DrawRecipeOrigin::Relocated), origin(recipes.drawOriginHits, VulkanDevice::DrawRecipeOrigin::Shape), origin(recipes.drawOriginHits, VulkanDevice::DrawRecipeOrigin::Content), take(recipes.drawLayoutMisses), origin(recipes.drawOriginAttaches, VulkanDevice::DrawRecipeOrigin::Relocated), origin(recipes.drawOriginAttaches, VulkanDevice::DrawRecipeOrigin::Shape), origin(recipes.drawOriginAttaches, VulkanDevice::DrawRecipeOrigin::Exact), take(recipes.shapeRefused));
             origins = text;
         }
         AgcDriver::ProfilePrint_nid_no_patch("[recipe] %s (10 s): hits %llu; pre-check misses: %s; proofs: %s; rebuilds: %s; presyncs from the recipe %llu (recomputed %llu, waited %llu); data refreshes recorded %llu / skipped by hash %llu (%llu decided by words: data hits); restarts %llu, attaches %llu; us per hit: pre-check %.1f, proof %.1f, record %.1f; verified %llu (object replaced %llu)%s\n", kind == 0 ? "dispatch" : kind == 1 ? "indirect" : "draw", hits, misses.c_str(), proofs.c_str(), rebuilds.c_str(), take(counters.presyncsFromRecipe), take(counters.presyncsRecomputed), take(counters.presyncWaits), take(counters.dataRefreshed), take(counters.dataSkipped), take(counters.refreshByWords), take(counters.restarts), take(counters.attaches), precheckUs, proofUs, recordUs, take(counters.verified), take(counters.verifyReplaced), origins.c_str());
@@ -5584,6 +5584,15 @@ void VulkanDevice::NoteDrawRecipeUnbuilt() {
     DrawRecipeDrawTotals().unbuilt.fetch_add(1, std::memory_order_relaxed);
 }
 
+void VulkanDevice::NoteContentRecipeLookup(bool keyed) {
+    auto& totals = DrawRecipeDrawTotals();
+    (keyed ? totals.contentAbsent : totals.contentUnkeyed).fetch_add(1, std::memory_order_relaxed);
+}
+
+void VulkanDevice::NoteContentRecipeAttach() {
+    DrawRecipeDrawTotals().contentAttaches.fetch_add(1, std::memory_order_relaxed);
+}
+
 std::uint64_t VulkanDevice::DrawRecipeDrawCounts::Draws() const {
     std::uint64_t draws = 0;
     for (const auto count : found) draws += count;
@@ -5609,13 +5618,16 @@ VulkanDevice::DrawRecipeDrawCounts VulkanDevice::DrawRecipeDraws() {
     counts.layout = load(totals.layout);
     counts.proof = load(totals.proof);
     counts.buffers = load(totals.buffers);
+    counts.contentAbsent = load(totals.contentAbsent);
+    counts.contentUnkeyed = load(totals.contentUnkeyed);
+    counts.contentAttaches = load(totals.contentAttaches);
     counts.refusals = Graphics::DrawRecipeRefusals();
     counts.attaches = load(totals.attaches);
     counts.unbuilt = load(totals.unbuilt);
     return counts;
 }
 
-std::string VulkanDevice::DrawRecipeDrawsReport() {
+std::string VulkanDevice::DrawRecipeDrawsReport(std::size_t contentHeld, std::uint64_t contentEvicted) {
     static std::mutex reportMutex;
     static DrawRecipeDrawCounts reported;
     const auto now = DrawRecipeDraws();
@@ -5629,15 +5641,18 @@ std::string VulkanDevice::DrawRecipeDrawsReport() {
     const auto exact = static_cast<std::size_t>(DrawRecipeOrigin::Exact);
     const auto relocated = static_cast<std::size_t>(DrawRecipeOrigin::Relocated);
     const auto shape = static_cast<std::size_t>(DrawRecipeOrigin::Shape);
+    const auto content = static_cast<std::size_t>(DrawRecipeOrigin::Content);
     unsigned long long recorded = 0;
     for (std::size_t origin = 0; origin < now.recorded.size(); ++origin) recorded += now.recorded[origin] - reported.recorded[origin];
     char line[1024];
     std::string text;
-    std::snprintf(line, sizeof(line), "[recipe-draws] (10 s): %llu direct draws, %llu recorded from a recipe (%.1f%%: exact entry %llu, relocated entry %llu, shape %llu)", draws, recorded, draws != 0 ? 100.0 * static_cast<double>(recorded) / static_cast<double>(draws) : 0.0, since(now.recorded[exact], reported.recorded[exact]), since(now.recorded[relocated], reported.recorded[relocated]), since(now.recorded[shape], reported.recorded[shape]));
+    std::snprintf(line, sizeof(line), "[recipe-draws] (10 s): %llu direct draws, %llu recorded from a recipe (%.1f%%: exact entry %llu, relocated entry %llu, shape %llu, content key %llu)", draws, recorded, draws != 0 ? 100.0 * static_cast<double>(recorded) / static_cast<double>(draws) : 0.0, since(now.recorded[exact], reported.recorded[exact]), since(now.recorded[relocated], reported.recorded[relocated]), since(now.recorded[shape], reported.recorded[shape]), since(now.recorded[content], reported.recorded[content]));
     text += line;
     std::snprintf(line, sizeof(line), "; no recipe looked up: a stage was captured %llu, stages reused from several remembered draws %llu, not eligible %llu", since(now.skipped[static_cast<std::size_t>(DrawRecipeSkip::Captured)], reported.skipped[static_cast<std::size_t>(DrawRecipeSkip::Captured)]), since(now.skipped[static_cast<std::size_t>(DrawRecipeSkip::Split)], reported.skipped[static_cast<std::size_t>(DrawRecipeSkip::Split)]), since(now.skipped[static_cast<std::size_t>(DrawRecipeSkip::Ineligible)], reported.skipped[static_cast<std::size_t>(DrawRecipeSkip::Ineligible)]));
     text += line;
     std::snprintf(line, sizeof(line), "; no recipe on the entry: exact %llu, relocated %llu, shape %llu", since(now.absent[exact], reported.absent[exact]), since(now.absent[relocated], reported.absent[relocated]), since(now.absent[shape], reported.absent[shape]));
+    text += line;
+    std::snprintf(line, sizeof(line), "; of the draws without one, %llu had no recipe under their content key and %llu no content key (%llu recipes attached to a content key, %zu held, %llu evicted since the start)", since(now.contentAbsent, reported.contentAbsent), since(now.contentUnkeyed, reported.contentUnkeyed), since(now.contentAttaches, reported.contentAttaches), contentHeld, static_cast<unsigned long long>(contentEvicted));
     text += line;
     for (std::size_t origin = 0; origin < now.found.size(); ++origin) reported.found[origin] = now.found[origin];
     std::snprintf(line, sizeof(line), "; recipes refused at the commit: device %llu, not recordable %llu, targets or pipeline gone %llu, template gone %llu, vertex layout %llu, proof %llu, moved buffers %llu", since(now.device, reported.device), since(now.notRecordable, reported.notRecordable), since(now.objectsGone, reported.objectsGone), since(now.templateGone, reported.templateGone), since(now.layout, reported.layout), since(now.proof, reported.proof), since(now.buffers, reported.buffers));

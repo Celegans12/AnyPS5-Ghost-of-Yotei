@@ -1303,6 +1303,26 @@ bool MovableBuffers() {
     return enabled;
 }
 
+std::shared_ptr<const std::vector<std::uint32_t>> StageKeyWords(const CompiledShader& shader) {
+    auto& memo = shader.program->drawKeyMemo.words;
+    if (auto words = memo.load(std::memory_order_acquire); words != nullptr) return words;
+    std::vector<std::uint32_t> key;
+    ShaderResources::AppendContentKey(shader, true, MovableBuffers(), key);
+    auto words = std::make_shared<const std::vector<std::uint32_t>>(std::move(key));
+    memo.store(words, std::memory_order_release);
+    return words;
+}
+
+bool DrawTemplatesKeyed() {
+    static const bool keyed = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") == nullptr && std::getenv("APS5_NO_TEXTURE_CACHE") == nullptr;
+    return keyed;
+}
+
+bool DrawKeysTrimmed() {
+    static const bool trimmed = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
+    return trimmed;
+}
+
 ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
     ResourceCache::Key key;
     key.reserve(256);
@@ -1314,16 +1334,9 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
     append64(reinterpret_cast<std::uint64_t>(context.device));
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
     for (const auto& shader : shaders) {
-        const auto sizeAt = key.size();
-        key.push_back(0u);
-        auto& memo = shader.program->drawKeyMemo.words;
-        if (auto words = memo.load(std::memory_order_acquire); words != nullptr) {
-            key.insert(key.end(), words->begin(), words->end());
-        } else {
-            ShaderResources::AppendContentKey(shader, true, MovableBuffers(), key);
-            memo.store(std::make_shared<const std::vector<std::uint32_t>>(key.begin() + static_cast<std::ptrdiff_t>(sizeAt + 1u), key.end()), std::memory_order_release);
-        }
-        key[sizeAt] = static_cast<std::uint32_t>(key.size() - sizeAt - 1u);
+        const auto words = StageKeyWords(shader);
+        key.push_back(static_cast<std::uint32_t>(words->size()));
+        key.insert(key.end(), words->begin(), words->end());
     }
     key.push_back(colorAttachments);
     if (ranges) {
@@ -1854,10 +1867,8 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
         if (plan.retainedVertexInput == nullptr) plan.vertexInput = BuildVertexInputLayout(context, attributes);
     }
     timer.charge(PhaseVertex, layoutStart);
-    static const bool noDrawResourceCache = std::getenv("APS5_NO_DRAW_RESOURCE_CACHE") != nullptr;
-    static const bool noTextureCache = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    static const bool trimKey = std::getenv("APS5_NO_DRAW_KEY_TRIM") == nullptr;
-    plan.candidate = recipe == nullptr && !noDrawResourceCache && !noTextureCache && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; });
+    const bool trimKey = DrawKeysTrimmed();
+    plan.candidate = recipe == nullptr && DrawTemplatesKeyed() && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; });
     plan.keyed = plan.candidate && !ShaderResources::NeverReusable(shaders);
     if (plan.keyed) {
         const auto keyStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -4642,6 +4653,28 @@ void verifyDrawRecipe(const Context& context, const State& state, const Pm4::Dra
     if (const auto stored = FindCachedPipeline(context, key); stored != nullptr && stored != pipeline) fail("pipeline");
 }
 
+}
+
+bool AppendDrawContentKey(std::span<const CompiledShader> shaders, const Pm4::DrawParameters& draw, std::vector<std::uint32_t>& key) {
+    if (shaders.empty() || draw.indirect || !DrawTemplatesKeyed()) return false;
+    if (!std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) || ShaderResources::NeverReusable(shaders)) return false;
+    key.push_back(static_cast<std::uint32_t>(shaders.size()));
+    key.push_back(static_cast<std::uint32_t>(PushConstantStages(shaders)));
+    for (const auto& shader : shaders) {
+        const auto identity = shader.program->Identity();
+        if (identity.Empty()) return false;
+        const auto words = StageKeyWords(shader);
+        for (const auto word : {static_cast<std::uint32_t>(shader.stage), static_cast<std::uint32_t>(identity.low), static_cast<std::uint32_t>(identity.low >> 32u), static_cast<std::uint32_t>(identity.high), static_cast<std::uint32_t>(identity.high >> 32u), KeyedPushOffset(shader), static_cast<std::uint32_t>(words->size())}) key.push_back(word);
+        key.insert(key.end(), words->begin(), words->end());
+    }
+    const auto layout = DescribeVertexLayout(shaders.front().program->vertexAttributes);
+    key.push_back(static_cast<std::uint32_t>(layout.size()));
+    key.insert(key.end(), layout.begin(), layout.end());
+    if (!DrawKeysTrimmed()) {
+        const auto indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+        for (const auto word : {static_cast<std::uint32_t>(draw.indexAddress), static_cast<std::uint32_t>(draw.indexAddress >> 32u), static_cast<std::uint32_t>(indexBytes), static_cast<std::uint32_t>(indexBytes >> 32u)}) key.push_back(word);
+    }
+    return true;
 }
 
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
