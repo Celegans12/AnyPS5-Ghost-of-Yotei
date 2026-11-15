@@ -42,6 +42,7 @@ namespace {
 std::jthread processSamplerThread;
 std::jthread workerSamplerThread;
 std::jthread committerSamplerThread;
+std::jthread finisherSamplerThread;
 
 std::optional<std::string> ConfiguredPath(const wchar_t* value) {
     if (value == nullptr) return std::nullopt;
@@ -371,18 +372,25 @@ void StartCommitterSampler() {
     StartCallingThreadSampler(ConfiguredPath(_wgetenv(L"APS5_SAMPLE_COMMITTER")), committerSamplerThread);
 }
 
+void StartFinisherSampler() {
+    StartCallingThreadSampler(ConfiguredPath(_wgetenv(L"APS5_SAMPLE_FINISHER")), finisherSamplerThread);
+}
+
 void StopWorkerSampler() {
     processSamplerThread.request_stop();
     workerSamplerThread.request_stop();
     committerSamplerThread.request_stop();
+    finisherSamplerThread.request_stop();
     if (processSamplerThread.joinable()) processSamplerThread.join();
     if (workerSamplerThread.joinable()) workerSamplerThread.join();
     if (committerSamplerThread.joinable()) committerSamplerThread.join();
+    if (finisherSamplerThread.joinable()) finisherSamplerThread.join();
 }
 #else
 bool ReadableStackRegion(std::uint64_t, std::uint64_t&, std::uint64_t&) { return false; }
 void StartWorkerSampler(std::uint32_t) {}
 void StartCommitterSampler() {}
+void StartFinisherSampler() {}
 void StopWorkerSampler() {}
 #endif
 

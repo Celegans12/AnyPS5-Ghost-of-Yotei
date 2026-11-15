@@ -211,6 +211,7 @@ void DrawFinisher::run() {
     NameDriverThread("draw-finish");
     PerformanceTrace::BindThread("draw finisher");
     ReserveFinisherCore();
+    StartFinisherSampler();
     for (;;) {
         Job* job = nullptr;
         bool failed = false;
