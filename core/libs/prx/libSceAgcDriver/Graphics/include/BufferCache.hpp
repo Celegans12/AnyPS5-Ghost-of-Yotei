@@ -252,7 +252,7 @@ private:
     View acquire(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial, bool partialHead, bool partialTail, bool dirtyFirst);
     View cleanInput(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial);
     View ringInput(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial, std::uint64_t run, const Input& input);
-    View looseInput(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t run, const Input& input);
+    View looseInput(std::uint64_t address, std::size_t bytes, std::size_t from, const Input& input);
     bool nextRingChunk();
     static std::size_t ringIndex(std::uint64_t address, std::size_t bytes, std::size_t from);
     static std::size_t derivedIndex(std::uint64_t address, std::size_t bytes, std::uint32_t kind);
