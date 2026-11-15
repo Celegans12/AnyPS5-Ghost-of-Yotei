@@ -1923,12 +1923,23 @@ const std::size_t ResolutionMemoWords = [] {
     return mib != 0ull ? static_cast<std::size_t>(mib) * (std::size_t{1} << 20u) / sizeof(std::uint32_t) : std::size_t{1} << 23u;
 }();
 
+// Columns the capture read again (pointer columns and key-narrowed ones bypass the column memo)
+// hold equal values in blocks of their own: those match by content. 007 First Light's table stages
+// are all of that kind, and without this each one resolved its tables again (about 50 us per
+// stage). APS5_TABLE_MEMO_SHARED_ONLY=1 matches shared blocks only, as before.
+template <typename TValues>
+bool sameValues(const TValues& left, const TValues& right) {
+    if (left.Shares(right)) return true;
+    static const bool sharedOnly = std::getenv("APS5_TABLE_MEMO_SHARED_ONLY") != nullptr;
+    return !sharedOnly && left.size() == right.size() && std::equal(left.begin(), left.end(), right.begin());
+}
+
 bool sameColumns(const std::vector<ImageTableColumnSnapshot>& left, const std::vector<ImageTableColumnSnapshot>& right) {
     if (left.size() != right.size()) return false;
     for (std::size_t index = 0; index < left.size(); index++) {
         const auto& a = left[index];
         const auto& b = right[index];
-        if (a.base != b.base || a.size != b.size || a.records != b.records || a.keys != b.keys || a.fault != b.fault || a.outside != b.outside || a.nested != b.nested || !a.pointers.Shares(b.pointers) || !a.codes.Shares(b.codes) || !a.words.Shares(b.words) || a.resourceViews != b.resourceViews) return false;
+        if (a.base != b.base || a.size != b.size || a.records != b.records || a.keys != b.keys || a.fault != b.fault || a.outside != b.outside || a.nested != b.nested || !sameValues(a.pointers, b.pointers) || !sameValues(a.codes, b.codes) || !sameValues(a.words, b.words) || a.resourceViews != b.resourceViews) return false;
     }
     return true;
 }
@@ -2232,6 +2243,54 @@ std::shared_ptr<const ResolvedImageTables> ResourceMaterializer::ResolveImageTab
             std::rotate(memo.entries.begin(), found, found + 1);
             totals.resolutionsShared.fetch_add(1, std::memory_order_relaxed);
             return memo.entries.front().resolved;
+        }
+    }
+    // Debug aid: APS5_TABLE_RESOLVE_PROBE=1 reports, per 10 s, why resolutions missed the memo:
+    // against the variant's entries, the first thing that differs.
+    static const bool probe = std::getenv("APS5_TABLE_RESOLVE_PROBE") != nullptr;
+    if (probe) {
+        static std::mutex probeMutex;
+        static std::map<std::string, std::uint64_t> counts;
+        static std::set<std::uint64_t> variants;
+        static auto last = std::chrono::steady_clock::now();
+        std::lock_guard lock(memo.mutex);
+        std::lock_guard probeLock(probeMutex);
+        variants.insert(memoKey);
+        std::string what = "no entry of the variant";
+        for (const auto& entry : memo.entries) {
+            if (entry.memoKey != memoKey) continue;
+            const auto& left = entry.tables;
+            const auto& right = snapshot.tables.tables;
+            if (entry.reducing != reducing) what = "reducing samplers";
+            else if (left.size() != right.size()) what = "column count";
+            else {
+                what = "nested or equal";
+                for (std::size_t index = 0; index < left.size(); index++) {
+                    const auto& a = left[index];
+                    const auto& b = right[index];
+                    if (a.base != b.base) what = "column base";
+                    else if (a.size != b.size || a.records != b.records || a.keys != b.keys) what = "column shape";
+                    else if (!a.words.Shares(b.words)) {
+                        const auto same = [](const auto& x, const auto& y) { return x.size() == y.size() && std::equal(x.begin(), x.end(), y.begin()); };
+                        std::size_t differing = 0;
+                        for (std::size_t at = 0; at < std::min(a.words.size(), b.words.size()); at++) differing += a.words.at(at) == b.words.at(at) ? 0u : 1u;
+                        what = same(a.words, b.words) ? "column " + std::to_string(index) + " words equal but not shared" : "column " + std::to_string(index) + " words differ (" + std::to_string(differing) + " of " + std::to_string(a.words.size()) + ", against " + std::to_string(b.words.size()) + ")";
+                    }
+                    else if (!a.codes.Shares(b.codes)) what = "column codes not shared";
+                    else if (!a.pointers.Shares(b.pointers)) what = "column pointers not shared";
+                    else continue;
+                    break;
+                }
+            }
+            break;
+        }
+        ++counts[what];
+        if (const auto now = std::chrono::steady_clock::now(); now - last >= std::chrono::seconds(10)) {
+            std::string line = "[table-resolve] misses against the variant's newest entry (10 s), " + std::to_string(variants.size()) + " variants seen, " + std::to_string(memo.entries.size()) + " entries:";
+            for (const auto& [text, number] : counts) line += " [" + std::to_string(number) + "x] " + text + ";";
+            std::fprintf(stderr, "%s\n", line.c_str());
+            counts.clear();
+            last = now;
         }
     }
     auto resolved = std::make_shared<const ResolvedImageTables>(ResolveImageTables(info, snapshot, memoKey));

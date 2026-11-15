@@ -114,9 +114,14 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
         std::map<std::string, std::uint64_t> fallbacks;
         std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
         double us = 0;
+        // The stage's parts: the capture, the materialized result, the table resolution.
+        double captureUs = 0, materializeUs = 0, resolveUs = 0;
+        std::uint64_t tableStages = 0;
     };
     static std::mutex mutex;
     static Totals totals;
+    double captureUs = 0, materializeUs = 0, resolveUs = 0;
+    bool tableStage = false;
     static std::map<std::pair<std::uint64_t, int>, std::shared_ptr<const ShaderRecompiler::SourceHandle>> handles;
     static std::deque<std::pair<std::chrono::steady_clock::time_point, std::vector<std::shared_ptr<void>>>> kept;
     const auto started = std::chrono::steady_clock::now();
@@ -124,12 +129,19 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
         std::lock_guard lock(mutex);
         if (fallback != nullptr) ++totals.fallbacks[fallback];
         totals.us += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - started).count();
+        totals.captureUs += captureUs;
+        totals.materializeUs += materializeUs;
+        totals.resolveUs += resolveUs;
+        totals.tableStages += tableStage ? 1u : 0u;
         const auto now = std::chrono::steady_clock::now();
         while (!kept.empty() && now - kept.front().first > std::chrono::seconds(2)) kept.pop_front();
         if (now - totals.last < std::chrono::seconds(10)) return;
         const auto calls = totals.direct + totals.noHeap;
         std::string line = "[direct-draw] 10 s: " + std::to_string(totals.direct) + " direct stages with heap slots, " + std::to_string(totals.noHeap) + " direct without, avg " + std::to_string(calls != 0 ? totals.us / static_cast<double>(calls) : 0.0) + " us; fallbacks:";
         for (const auto& [text, count] : totals.fallbacks) line += " [" + std::to_string(count) + "x] " + text + ";";
+        char parts[200];
+        std::snprintf(parts, sizeof(parts), " parts per stage (us): capture %.2f, materialize %.2f, table resolve %.2f; %llu table stages", calls != 0 ? totals.captureUs / static_cast<double>(calls) : 0.0, calls != 0 ? totals.materializeUs / static_cast<double>(calls) : 0.0, calls != 0 ? totals.resolveUs / static_cast<double>(calls) : 0.0, static_cast<unsigned long long>(totals.tableStages));
+        line += parts;
         std::fprintf(stderr, "%s\n", line.c_str());
         totals = {};
         totals.last = now;
@@ -160,7 +172,10 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
         runtime.readSpecializationMemory = &directEvalRead;
         runtime.accessible = &directEvalAccessible;
         directEvalStamps(runtime);
+        const auto captureStarted = std::chrono::steady_clock::now();
         auto capture = ShaderRecompiler::CaptureResources(direct, runtime, *handle);
+        captureUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - captureStarted).count();
+        tableStage = !capture->snapshot.tables.tables.empty();
         if (!capture->snapshot.tables.tables.empty()) {
             // Debug aid: APS5_DIRECT_TABLE_PROBE=1 reports the image tables that keep stages off
             // the direct path: per 10 s, stages, columns per stage, records, bytes, and how many
@@ -258,10 +273,14 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
                 return std::nullopt;
             }
         }
+        const auto materializeStarted = std::chrono::steady_clock::now();
         auto base = ShaderRecompiler::MaterializeShader(direct, *capture, *handle);
+        materializeUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - materializeStarted).count();
         if (!capture->snapshot.tables.tables.empty()) {
             const auto& info = handle->artifact->info.info;
+            const auto resolveStarted = std::chrono::steady_clock::now();
             auto resolvedTables = ShaderRecompiler::ResourceMaterializer::ResolveImageTablesShared(info, capture->snapshot, handle->artifact->artifact.variantId);
+            resolveUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - resolveStarted).count();
             // The same materialized result with the same resolved tables gives the same stage: reuse
             // it instead of copying the result (and its table map) again.
             struct TableStageMemo {
