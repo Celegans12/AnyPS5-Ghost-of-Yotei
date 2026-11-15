@@ -95,6 +95,7 @@ struct DrawDataCandidate {
     std::uint8_t rank = 0;
     DrawShapeReuse kind = DrawShapeReuse::EqualWords;
     bool rebased = false;
+    const DispatchVariant* remembered = nullptr;
 };
 
 using DrawDataCandidates = std::vector<std::vector<DrawDataCandidate>>;

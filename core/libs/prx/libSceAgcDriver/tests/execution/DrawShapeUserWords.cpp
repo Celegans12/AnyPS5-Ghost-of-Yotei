@@ -1,8 +1,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "Recompiler.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -10,6 +13,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <sys/mman.h>
 #endif
 #include <algorithm>
 #include <array>
@@ -54,10 +59,36 @@ alignas(256) constexpr std::array<std::uint32_t, 10> InputVertexCode{
     0xf80008cfu, 0x0d0c0b0au,
     0xbf810000u,
 };
-alignas(256) std::array<std::byte, 1024> ColorMemory{};
+constexpr std::uint32_t RenderTargetAttrib3 = 0x9000000u | (0x1bu << 14u);
+constexpr std::size_t TargetBytes = 65536;
 
 constexpr std::size_t BlockBytes = 65536;
 constexpr std::size_t DataWord = 1024;
+
+std::uint8_t* TargetBlock() {
+    static std::uint8_t* const target = [] {
+        std::uint8_t* block = nullptr;
+#ifdef _WIN32
+        block = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(TargetBytes, TargetBytes));
+        if (block != nullptr) GuestArena::GuestArenaCommit_nid_postfix(block, TargetBytes, PAGE_READWRITE, TargetBytes);
+#else
+        void* mapped = mmap(nullptr, TargetBytes * 2, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapped != MAP_FAILED) {
+            const auto begin = reinterpret_cast<std::uintptr_t>(mapped);
+            const auto aligned = (begin + TargetBytes - 1) & ~(static_cast<std::uintptr_t>(TargetBytes) - 1);
+            if (aligned != begin) munmap(mapped, aligned - begin);
+            if (aligned != begin + TargetBytes) munmap(reinterpret_cast<void*>(aligned + TargetBytes), begin + TargetBytes - aligned);
+            block = reinterpret_cast<std::uint8_t*>(aligned);
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, TargetBytes);
+        }
+#endif
+        Require(block != nullptr, "shape user words: cannot allocate the tiled color target");
+        std::memset(block, 0, TargetBytes);
+        GuestAllocations::Mutation().Add(block, TargetBytes, true, true, true);
+        return block;
+    }();
+    return target;
+}
 
 struct Header {
     Shader shader{};
@@ -127,7 +158,7 @@ void Append(std::vector<std::uint32_t>& commands, std::uint32_t opcode, std::ini
 }
 
 std::vector<std::uint32_t> Setup(std::uintptr_t vertex = reinterpret_cast<std::uintptr_t>(TriangleVertexCode.data()), const std::vector<std::uint32_t>& vertexWords = {}) {
-    const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
+    const auto color = reinterpret_cast<std::uintptr_t>(TargetBlock());
     const auto pixel = reinterpret_cast<std::uintptr_t>(PixelCode.data());
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         {0x2d5, 0x2000},
@@ -139,7 +170,7 @@ std::vector<std::uint32_t> Setup(std::uintptr_t vertex = reinterpret_cast<std::u
         {0x8e, 0xf}, {0x8f, 0xf}, {0x202, 0xcc0010},
         {0x1c4, 0}, {0x1c5, 9}, {0x1c3, 4}, {0x31c, 0x28028},
         {0x31b, 0}, {0x31d, 0}, {0x3b0, (63u << 14u) | 3u},
-        {0x3b8, 0x9000000}, {0x1e0, 0},
+        {0x3b8, RenderTargetAttrib3}, {0x1e0, 0},
         {0xc, 0}, {0xd, 0x40040},
         {0x81, 0x80000000}, {0x82, 0x40040},
         {0x90, 0x80000000}, {0x91, 0x40040},
@@ -173,7 +204,7 @@ DrawEntryCounters Draw(const std::uint32_t* table, std::uintptr_t vertex = reint
     Append(commands, 0x76, {0x00d, static_cast<std::uint32_t>(address >> 32u)});
     Append(commands, 0x76, {0x00e, ++Unread});
     Append(commands, 0x2d, {3, 2});
-    ColorMemory.fill(std::byte{0});
+    std::memset(TargetBlock(), 0, TargetBytes);
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
     Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
     AgcDriverWaitIdle_nid_postfix();
@@ -181,9 +212,9 @@ DrawEntryCounters Draw(const std::uint32_t* table, std::uintptr_t vertex = reint
 }
 
 unsigned Brightest() {
-    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
+    AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(TargetBlock()), TargetBytes);
     unsigned brightest = 0;
-    for (const auto value : ColorMemory) brightest = std::max(brightest, static_cast<unsigned>(std::to_integer<std::uint8_t>(value)));
+    for (std::size_t at = 0; at < TargetBytes; ++at) brightest = std::max(brightest, static_cast<unsigned>(TargetBlock()[at]));
     return brightest;
 }
 
@@ -225,7 +256,16 @@ std::size_t Reason(DrawShapeMiss reason) {
     return static_cast<std::size_t>(reason);
 }
 
-void RememberedDrawsAlternate(bool enabled, bool verify) {
+std::uint64_t ShapeRecipeHits() {
+    return AgcDriver::VulkanDevice::DrawRecipeOrigins().hits[static_cast<std::size_t>(AgcDriver::VulkanDevice::DrawRecipeOrigin::Shape)];
+}
+
+std::string RecipeCounts() {
+    const auto origins = AgcDriver::VulkanDevice::DrawRecipeOrigins();
+    return "recipe hits " + std::to_string(origins.hits[0]) + "/" + std::to_string(origins.hits[1]) + "/" + std::to_string(origins.hits[2]) + " and attaches " + std::to_string(origins.attaches[0]) + "/" + std::to_string(origins.attaches[1]) + "/" + std::to_string(origins.attaches[2]) + " (exact/relocated/shape), " + std::to_string(origins.layoutMisses) + " layout misses, " + std::to_string(origins.shapeRefused) + " shape draws without one remembered draw for every stage";
+}
+
+void RememberedDrawsAlternate(bool enabled, bool verify, bool recipes) {
     Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
     const auto limit = enabled ? std::size_t{4} : std::size_t{1};
@@ -266,9 +306,12 @@ void RememberedDrawsAlternate(bool enabled, bool verify) {
     for (std::size_t round = 0; round < 3; ++round) {
         for (std::size_t set = 0; set < 4; ++set) {
             const auto before = counters;
+            const auto recipeHits = ShapeRecipeHits();
             counters = draw(set, tables[set], "alternating");
             const auto step = Between(before, counters);
             Require(counters.dataHits == before.dataHits + 1 && counters.hits == before.hits, "an alternating draw with a new unread user word was not a data-only hit: " + Counts(counters));
+            const auto recorded = ShapeRecipeHits() - recipeHits;
+            Require(recorded == (enabled && recipes ? 1u : recorded) && (recipes || recorded == 0), "round " + std::to_string(round) + ": an alternating draw of buffer " + std::to_string(set) + " that reused both stages of one remembered draw made " + std::to_string(recorded) + " recipe hits through its shape, expected " + (recipes ? "one" : "none") + ": " + RecipeCounts() + "; " + Counts(counters));
             if (verify) {
                 Require(step.verified == (enabled || set == 0 ? 2u : 1u), "verify mode compared " + std::to_string(step.verified) + " reused stages of buffer " + std::to_string(set) + " with their full build: " + Counts(counters));
                 continue;
@@ -286,9 +329,12 @@ void RememberedDrawsAlternate(bool enabled, bool verify) {
     for (auto* table : moved) std::memcpy(table, tables[0], 4 * sizeof(std::uint32_t));
     for (const std::uint32_t* table : {static_cast<const std::uint32_t*>(moved[0]), static_cast<const std::uint32_t*>(moved[1]), static_cast<const std::uint32_t*>(moved[0])}) {
         const auto before = counters;
+        const auto recipeHits = ShapeRecipeHits();
         counters = draw(0, table, "relocated");
         const auto step = Between(before, counters);
         const auto relocated = counters.shapeReuses[Kind(DrawShapeReuse::Relocated)] - before.shapeReuses[Kind(DrawShapeReuse::Relocated)];
+        const auto recorded = ShapeRecipeHits() - recipeHits;
+        Require(recorded == (enabled && recipes ? 1u : 0u), "a draw whose descriptor table moved made " + std::to_string(recorded) + " recipe hits through the remembered draw it reused, expected " + (enabled && recipes ? "one" : "none") + ": " + RecipeCounts() + "; " + Counts(counters));
         if (verify) Require(step.verified == (enabled ? 2u : 1u), "verify mode compared " + std::to_string(step.verified) + " stages of a draw whose descriptor table moved with their full build: " + Counts(counters));
         else if (enabled) Require(step.reused == 2 && step.compiled == 0 && relocated == 1, "a draw whose descriptor table moved to another address with the same words reused " + std::to_string(step.reused) + " stages (" + std::to_string(relocated) + " relocated) and built " + std::to_string(step.compiled) + ": " + Counts(counters));
         else Require(step.reused == 1 && step.compiled == 1 && relocated == 0, "with the shape user words off, a draw whose descriptor table moved reused " + std::to_string(step.reused) + " stages and built " + std::to_string(step.compiled) + ": " + Counts(counters));
@@ -337,7 +383,7 @@ void RememberedDrawsAlternate(bool enabled, bool verify) {
     }
 }
 
-void VertexInputsFollowMovedTables(bool enabled, bool vertexInputs, bool verify) {
+void VertexInputsFollowMovedTables(bool enabled, bool vertexInputs, bool verify, bool recipes) {
     RegisterInputVertex();
     auto* block = GuestBlock();
     auto* pixelTable = block;
@@ -405,10 +451,13 @@ void VertexInputsFollowMovedTables(bool enabled, bool vertexInputs, bool verify)
     }};
     for (const auto& tried : cases) {
         before = counters;
+        const auto recipeHits = ShapeRecipeHits();
         counters = draw(tried.table, tried.attribute, tried.lit, tried.what);
         const auto step = Between(before, counters);
         Require(counters.dataHits == before.dataHits + 1 && counters.inserts == before.inserts, std::string(tried.what) + ": the draw was not a data-only hit of its shape: " + Counts(counters));
         const bool reuses = vertexInputs && tried.sameLayout;
+        const auto recorded = ShapeRecipeHits() - recipeHits;
+        Require(recorded == (reuses && recipes ? 1u : 0u), std::string(tried.what) + ": the draw made " + std::to_string(recorded) + " recipe hits through its shape, expected " + (reuses && recipes ? "one, its vertex buffers bound from its own V#" : "none") + ": " + RecipeCounts() + "; " + Counts(counters));
         if (verify) {
             Require(step.verified == (reuses ? 2u : 1u) && counters.shapeVertexVerified - before.shapeVertexVerified == (reuses ? 1u : 0u), std::string(tried.what) + ": verify mode compared " + std::to_string(step.verified) + " reused stages with their full build: " + Counts(counters));
             continue;
@@ -533,6 +582,7 @@ void VertexTablesAreClassified() {
     decoded[1].size = 16;
     std::memcpy(decoded[1].data.data(), fresh.resources[0].fields.data(), 16);
     const auto copy = Driver::movedShapeVariant(variant, moved);
+    Require(copy->donor == variant && Driver::movedShapeVariant(copy, moved)->donor == variant, "a moved stage does not name the remembered stage it was copied from as its donor");
     Require(Driver::rebaseVertexInputs(*copy, fresh, decoded), "a moved stage with vertex inputs was not rebased on its re-decoded tables");
     const std::vector<std::pair<std::uint64_t, std::uint64_t>> runs{{0x1100u, 0x1110u}, {0x6100u, 0x6104u}, {0x7100u, 0x7110u}};
     Require(copy->runs == runs && copy->decodeRuns == 2 && variant->runs[1].first == 0x6000u, "the rebased stage does not validate its shifted walk runs and its fresh decode reads, or the remembered stage changed");
@@ -607,6 +657,7 @@ void MovedWordsAreClassified() {
         now[7] = 0x71u;
         Require(Driver::shapeUserWordMoves(*variant, was, now, moves) == DrawShapeReuse::Relocated && moves.size() == 2, "a relocated pointer with a forwarded word did not classify as relocated");
         const auto moved = Driver::movedShapeVariant(variant, moves);
+        Require(moved->donor == variant, "a moved variant does not name its donor variant");
         Require(moved->runs[0] == std::pair<std::uint64_t, std::uint64_t>{0x3000u, 0x3010u} && moved->runs[1] == variant->runs[1], "the runs read through the moved pointer did not move with it, or another run moved");
         Require(moved->shared.empty(), "a variant whose runs moved kept the shared words of its old addresses");
         Require(moved->shaderDataPatches == std::vector<std::pair<std::uint32_t, std::uint32_t>>{{1u, 0x3000u}, {0u, 0x71u}}, "the forwarded copies of the moved words were not patched");
@@ -669,10 +720,15 @@ int main() {
         const bool enabled = std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") == nullptr;
         const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
         const bool vertexInputs = enabled && std::getenv("APS5_NO_SHAPE_VERTEX_INPUT_STAGES") == nullptr;
-        RememberedDrawsAlternate(enabled, verify);
-        VertexInputsFollowMovedTables(enabled, vertexInputs, verify);
+        const bool shapeRecipes = std::getenv("APS5_NO_SHAPE_RECIPES") == nullptr && std::getenv("APS5_NO_DRAW_RECIPE") == nullptr;
+        const bool recipes = shapeRecipes && !verify;
+        RememberedDrawsAlternate(enabled, verify, recipes);
+        VertexInputsFollowMovedTables(enabled, vertexInputs, verify, recipes);
+        const auto origins = AgcDriver::VulkanDevice::DrawRecipeOrigins();
+        const auto shape = static_cast<std::size_t>(AgcDriver::VulkanDevice::DrawRecipeOrigin::Shape);
+        Require(shapeRecipes || (origins.hits[shape] == 0 && origins.attaches[shape] == 0), "with the shape recipes off, " + std::to_string(origins.hits[shape]) + " draws were recorded from a remembered draw's recipe and " + std::to_string(origins.attaches[shape]) + " recipes were attached to one");
         AgcDriverShutdown_nid_postfix();
-        std::cout << "Draws of one shape " << (verify ? "verified" : enabled ? "reused" : "rebuilt, with the shape user words off,") << " the stages of the shape's remembered draws across moved user words; stages with vertex inputs " << (vertexInputs ? "followed moved vertex tables" : "were captured again when their tables moved") << "\n";
+        std::cout << "Draws of one shape " << (verify ? "verified" : enabled ? "reused" : "rebuilt, with the shape user words off,") << " the stages of the shape's remembered draws across moved user words; stages with vertex inputs " << (vertexInputs ? "followed moved vertex tables" : "were captured again when their tables moved") << "; " << origins.hits[shape] << " draws recorded from a remembered draw's recipe, " << origins.attaches[shape] << " recipes attached to one, " << origins.layoutMisses << " layout misses\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

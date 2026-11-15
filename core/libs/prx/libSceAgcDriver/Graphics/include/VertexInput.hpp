@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <list>
 #include <mutex>
@@ -118,6 +119,40 @@ struct VertexInputLayout {
     std::vector<VkVertexInputBindingDescription> bindings;
     std::vector<VkVertexInputAttributeDescription> attributes;
 };
+
+using VertexLayoutSignature = std::vector<std::uint32_t>;
+
+inline constexpr std::size_t VertexSignatureWords = 7;
+
+inline std::array<std::uint32_t, VertexSignatureWords> VertexSignatureOf(const ShaderRecompiler::VertexAttribute& attribute) {
+    const auto& fields = attribute.resource.fields;
+    return {attribute.location, attribute.components, attribute.formatComponents, attribute.fetchIndex, NullVertexDescriptor(attribute) ? 1u : 0u, fields[1] >> 16u, fields[3]};
+}
+
+inline VertexLayoutSignature DescribeVertexLayout(std::span<const ShaderRecompiler::VertexAttribute> attributes) {
+    VertexLayoutSignature signature;
+    signature.reserve(attributes.size() * VertexSignatureWords);
+    for (const auto& attribute : attributes) {
+        const auto words = VertexSignatureOf(attribute);
+        signature.insert(signature.end(), words.begin(), words.end());
+    }
+    return signature;
+}
+
+inline bool SameVertexLayout(const VertexLayoutSignature& signature, std::span<const ShaderRecompiler::VertexAttribute> attributes) {
+    if (signature.size() != attributes.size() * VertexSignatureWords) return false;
+    for (std::size_t index = 0; index < attributes.size(); ++index) {
+        const auto words = VertexSignatureOf(attributes[index]);
+        if (!std::equal(words.begin(), words.end(), signature.begin() + static_cast<std::ptrdiff_t>(index * VertexSignatureWords))) return false;
+    }
+    return true;
+}
+
+inline bool SameVertexInputLayout(const VertexInputLayout& a, const VertexInputLayout& b) {
+    const auto sameBinding = [](const VkVertexInputBindingDescription& x, const VkVertexInputBindingDescription& y) { return x.binding == y.binding && x.stride == y.stride && x.inputRate == y.inputRate; };
+    const auto sameAttribute = [](const VkVertexInputAttributeDescription& x, const VkVertexInputAttributeDescription& y) { return x.location == y.location && x.binding == y.binding && x.format == y.format && x.offset == y.offset; };
+    return std::equal(a.bindings.begin(), a.bindings.end(), b.bindings.begin(), b.bindings.end(), sameBinding) && std::equal(a.attributes.begin(), a.attributes.end(), b.attributes.begin(), b.attributes.end(), sameAttribute);
+}
 
 inline std::array<char, 160> VertexDescriptorFlagsMessage(const ShaderRecompiler::VertexAttribute& attribute) {
     std::array<char, 160> message{};

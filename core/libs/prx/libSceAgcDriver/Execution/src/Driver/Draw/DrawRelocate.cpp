@@ -518,6 +518,7 @@ std::shared_ptr<DispatchVariant> Driver::movedShapeVariant(const std::shared_ptr
     copy->valueSlots = variant->valueSlots;
     copy->calleeWords = variant->calleeWords;
     copy->calleeReads = variant->calleeReads;
+    copy->donor = variant->donor != nullptr ? variant->donor : variant;
     copy->words = variant->words;
     copy->forgetSerial = variant->forgetSerial;
     copy->compiled = variant->compiled;

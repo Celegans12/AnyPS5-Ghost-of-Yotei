@@ -1548,6 +1548,17 @@ std::shared_ptr<Pipeline> TouchCachedPipeline(const Context& context, std::uint6
     return it->pipeline;
 }
 
+std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, std::span<const std::byte> key) {
+    if (key.empty()) return nullptr;
+    auto& store = Pipelines();
+    std::lock_guard lock(store.mutex);
+    const auto found = store.index.find(hashKey(key));
+    if (found == store.index.end()) return nullptr;
+    auto& entry = *found->second;
+    if (entry.key.size() != key.size() || std::memcmp(entry.key.data(), key.data(), key.size()) != 0 || !alive(entry, context)) return nullptr;
+    return entry.pipeline;
+}
+
 void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     struct PipelineScratchStorage {};
     auto& storage = HostThreadLocal<std::vector<std::byte>, PipelineScratchStorage>();

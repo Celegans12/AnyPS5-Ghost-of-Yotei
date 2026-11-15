@@ -138,6 +138,7 @@ PipelineStoreCounters PipelineStoreTotals();
 bool PipelineStoreCanGrow();
 // The pipeline store's key of a configuration (empty when the configuration gets a private pipeline).
 void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
+std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, std::span<const std::byte> key);
 struct DescribedSetLayouts {
     PipelineSetLayouts layouts;
     std::vector<std::uint32_t> mainKey;

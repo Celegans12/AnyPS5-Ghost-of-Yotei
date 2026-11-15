@@ -19,7 +19,7 @@ foreach(agcDrawRecipeVariant IN ITEMS Buffers Data)
     )
     list(APPEND agcDrawRecipeHeaders ${agcDrawRecipeHeader})
 endforeach()
-target_sources(agc_driver_draw_recipe_buffers_tests PRIVATE ${agcCoverShaderHeaders} ${agcDrawRecipeHeaders})
+target_sources(agc_driver_draw_recipe_buffers_tests PRIVATE ${agcCoverShaderHeaders} ${agcVertexRangeHeaders} ${agcDrawRecipeHeaders})
 target_include_directories(agc_driver_draw_recipe_buffers_tests PRIVATE ${agcTestShaderGeneratedRoot})
 
 if(BUILD_TESTING)

@@ -7,7 +7,9 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "VulkanTestDevice.hpp"
+#include "Cover_frag_spv.h"
 #include "Cover_vert_spv.h"
+#include "VertexRange_vert_spv.h"
 #include "DrawRecipeBuffers_spv.h"
 #include "DrawRecipeData_spv.h"
 #ifdef _WIN32
@@ -94,31 +96,7 @@ void CheckPixels(const ColorTarget& target, const std::array<std::uint8_t, 4>& e
     }
 }
 
-bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dataWords) {
-    auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
-    if (!dataWords && context.hostImportAlignment == 0) {
-        std::cout << "skipped, host imports are unavailable\n";
-        return false;
-    }
-    Require(context.recorder != nullptr && context.descriptorCache != nullptr, "recipe tests need a recorder and descriptor cache");
-    const auto program = [](const auto& spirv, std::uint64_t variant) {
-        ShaderRecompiler::RecompileResult result;
-        result.spirv = std::vector<std::uint32_t>(std::begin(spirv), std::end(spirv));
-        result.variantId = variant;
-        return result;
-    };
-    auto vertex = program(COVER_VERT_SPV, 1);
-    auto fragment = dataWords ? program(DRAW_RECIPE_DATA_SPV, 3) : program(DRAW_RECIPE_BUFFERS_SPV, 2);
-    if (dataWords) fragment.shaderDataDwords = 4;
-    ShaderRecompiler::DescriptorBinding binding;
-    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
-    binding.role = dataWords ? ShaderRecompiler::DescriptorRole::ShaderData : ShaderRecompiler::DescriptorRole::GuestBuffers;
-    binding.descriptorSet = 0;
-    binding.binding = 0;
-    binding.count = 1;
-    binding.bufferWritten = {false};
-    fragment.bindings = {binding};
-    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+State TargetState(const Block& block) {
     State state{};
     state.stages.path = ShaderPath::Vertex;
     state.color = {block.Address(), {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, Unit, 0xe4u, ColorTileMode::RenderTarget, 4};
@@ -131,6 +109,87 @@ bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dat
     state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
     state.blend.colorWriteMask = 15;
     state.blends = {state.blend};
+    return state;
+}
+
+template <typename TSpirv>
+ShaderRecompiler::RecompileResult Program(const TSpirv& spirv, std::uint64_t variant) {
+    ShaderRecompiler::RecompileResult result;
+    result.spirv = std::vector<std::uint32_t>(std::begin(spirv), std::end(spirv));
+    result.variantId = variant;
+    return result;
+}
+
+void CheckLayout(AgcDriver::VulkanDevice& device, const Block& block) {
+    auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    const auto offsets = block.Address(Unit + 4096);
+    std::array<float, 20> words{};
+    words[4] = -8.0f;
+    AgcDriver::GuestMemory::Write(offsets, std::as_bytes(std::span(words)));
+    const auto attribute = [&](std::uint32_t stride) {
+        return ShaderRecompiler::VertexAttribute{0, 4, {{static_cast<std::uint32_t>(offsets), (static_cast<std::uint32_t>(offsets >> 32u) & 0xffffu) | (stride << 16u), 3u, 77u << 12u}}, 0};
+    };
+    auto narrow = Program(VERTEXRANGE_VERT_SPV, 4);
+    narrow.vertexAttributes = {attribute(16)};
+    auto wide = narrow;
+    wide.vertexAttributes = {attribute(32)};
+    auto fragment = Program(COVER_FRAG_SPV, 5);
+    const std::array narrowShaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &narrow, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    const std::array wideShaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &wide, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    const auto state = TargetState(block);
+    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
+    std::vector<std::byte> cleared(64 * 64 * 4);
+    AgcDriver::GuestMemory::Write(block.Address(), cleared);
+    std::shared_ptr<const AgcDriver::DrawRecipe> recipe;
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Draw(context, state, triangle, narrowShaders, {}, &recipe);
+    }
+    WaitForOptimizedPipelines(context.device);
+    Require(recipe != nullptr, "the draw with a vertex stride of 16 did not produce a recipe");
+    CheckPixels(state.color, {0, 0, 0, 0});
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        const auto hit = DrawWithRecipe(context, state, triangle, narrowShaders, {}, *recipe);
+        Require(hit.recorded, "a draw with the vertex layout of its recipe refused it");
+    }
+    CheckPixels(state.color, {0, 0, 0, 0});
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        const auto hit = DrawWithRecipe(context, state, triangle, wideShaders, {}, *recipe);
+        Require(!hit.recorded && hit.miss == DrawRecipeMiss::Layout, std::string("a draw whose vertex stride differs from its recipe's was not refused for its layout (miss: ") + DrawRecipeMissName(hit.miss) + ")");
+    }
+    CheckPixels(state.color, {0, 0, 0, 0});
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        Draw(context, state, triangle, wideShaders);
+    }
+    WaitForOptimizedPipelines(context.device);
+    CheckPixels(state.color, {255, 255, 255, 255});
+    device.WaitIdle();
+}
+
+bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dataWords) {
+    auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    if (!dataWords && context.hostImportAlignment == 0) {
+        std::cout << "skipped, host imports are unavailable\n";
+        return false;
+    }
+    Require(context.recorder != nullptr && context.descriptorCache != nullptr, "recipe tests need a recorder and descriptor cache");
+    const auto program = [](const auto& spirv, std::uint64_t variant) { return Program(spirv, variant); };
+    auto vertex = program(COVER_VERT_SPV, 1);
+    auto fragment = dataWords ? program(DRAW_RECIPE_DATA_SPV, 3) : program(DRAW_RECIPE_BUFFERS_SPV, 2);
+    if (dataWords) fragment.shaderDataDwords = 4;
+    ShaderRecompiler::DescriptorBinding binding;
+    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+    binding.role = dataWords ? ShaderRecompiler::DescriptorRole::ShaderData : ShaderRecompiler::DescriptorRole::GuestBuffers;
+    binding.descriptorSet = 0;
+    binding.binding = 0;
+    binding.count = 1;
+    binding.bufferWritten = {false};
+    fragment.bindings = {binding};
+    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
+    const auto state = TargetState(block);
     const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
     const std::array<float, 4> red{1, 0, 0, 1};
     const std::array<float, 4> green{0, 1, 0, 1};
@@ -183,6 +242,19 @@ bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dat
         }
         CheckPixels(state.color, second ? std::array<std::uint8_t, 4>{0, 255, 0, 255} : std::array<std::uint8_t, 4>{255, 0, 0, 255});
     }
+    for (const bool second : {true, false, true}) {
+        select(second);
+        auto patched = fragment;
+        select(!second);
+        const std::array copies{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &patched, 0}};
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            const auto hit = DrawWithRecipe(context, state, triangle, copies, {}, *recipe);
+            Require(hit.recorded, "a copy of the fragment program whose constants moved, as a reuse of a remembered stage patches it, refused the recipe");
+        }
+        CheckPixels(state.color, second ? std::array<std::uint8_t, 4>{0, 255, 0, 255} : std::array<std::uint8_t, 4>{255, 0, 0, 255});
+    }
+    select(false);
     const auto refused = [&] {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         const auto hit = DrawWithRecipe(context, state, triangle, shaders, {}, *recipe);
@@ -220,7 +292,8 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         const bool dataWords = argc == 2 && std::string_view(argv[1]) == "--data";
         if (!CheckBindings(*device, block, dataWords)) return VulkanTestSkipped;
-        std::cout << "draw recipes consume relocated buffers and changed shader data\n";
+        CheckLayout(*device, block);
+        std::cout << "draw recipes consume relocated buffers and changed shader data, also through patched copies of their programs, and refuse another vertex layout\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

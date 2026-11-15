@@ -42,6 +42,11 @@ bool Driver::drawShapeUserWords() {
     return enabled;
 }
 
+bool Driver::shapeRecipes() {
+    static const bool enabled = std::getenv("APS5_NO_SHAPE_RECIPES") == nullptr;
+    return enabled;
+}
+
 bool Driver::shapeVertexInputStages() {
     static const bool enabled = drawShapeUserWords() && std::getenv("APS5_NO_SHAPE_VERTEX_INPUT_STAGES") == nullptr;
     return enabled;
@@ -355,7 +360,7 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
     return nullptr;
 }
 
-void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe, const std::shared_ptr<DrawEntry>& donor) {
+void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe, const std::shared_ptr<DrawEntry>& donor, VulkanDevice::DrawRecipeOrigin origin) {
     std::shared_ptr<DrawEntry> entry = donor;
     if (entry == nullptr) {
         std::lock_guard cacheLock(drawCacheMutex);
@@ -378,6 +383,7 @@ void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_p
         records = std::move(next);
     } while (!entry->recipes.compare_exchange_strong(old, records));
     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, VulkanDevice::RecipeKind::Draw);
+    VulkanDevice::NoteDrawRecipeAttach(origin);
 }
 
 }

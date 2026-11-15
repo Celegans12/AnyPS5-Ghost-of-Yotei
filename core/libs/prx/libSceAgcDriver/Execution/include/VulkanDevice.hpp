@@ -361,6 +361,16 @@ public:
     static void NoteRecipe(RecipeEvent event, RecipeKind kind);
     enum class DrawRecipePrecheck : std::size_t { NoRecipe, Device };
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
+    enum class DrawRecipeOrigin : std::size_t { Exact, Relocated, Shape, Count };
+    static void NoteDrawRecipeAttach(DrawRecipeOrigin origin);
+    static void NoteShapeRecipeRefused();
+    struct DrawRecipeOriginCounts {
+        std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeOrigin::Count)> hits{};
+        std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeOrigin::Count)> attaches{};
+        std::uint64_t layoutMisses = 0;
+        std::uint64_t shapeRefused = 0;
+    };
+    static DrawRecipeOriginCounts DrawRecipeOrigins();
     using DrawTraceContext = Graphics::DrawTraceContext;
     static std::uint64_t DrawRecipeHits();
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
@@ -373,7 +383,7 @@ public:
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe
     // missed (nothing recorded: the caller runs Draw with the hit's stages and re-attaches).
-    RecipeOutcome DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const DrawTraceContext* trace = nullptr);
+    RecipeOutcome DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const DrawTraceContext* trace = nullptr, DrawRecipeOrigin origin = DrawRecipeOrigin::Exact);
     // The indirect draw features the device enabled, for the driver's decision whether an indirect
     // draw's records can be read by the GPU (Graphics::Draw) or must be resolved on the CPU.
     struct IndirectDrawSupport {

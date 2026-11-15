@@ -5248,6 +5248,10 @@ struct RecipeCounters {
         std::atomic<std::uint64_t> precheckNs{0}, proofNs{0}, recordNs{0};
     };
     std::array<Kind, 3> kinds;
+    static constexpr std::size_t Origins = static_cast<std::size_t>(VulkanDevice::DrawRecipeOrigin::Count);
+    std::array<std::atomic<std::uint64_t>, Origins> drawOriginHits{};
+    std::array<std::atomic<std::uint64_t>, Origins> drawOriginAttaches{};
+    std::atomic<std::uint64_t> drawLayoutMisses{0}, shapeRefused{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -5342,7 +5346,14 @@ void reportRecipes() {
         const auto precheckUs = perHit(counters.precheckNs);
         const auto proofUs = perHit(counters.proofNs);
         const auto recordUs = perHit(counters.recordNs);
-        AgcDriver::ProfilePrint_nid_no_patch("[recipe] %s (10 s): hits %llu; pre-check misses: %s; proofs: %s; rebuilds: %s; presyncs from the recipe %llu (recomputed %llu, waited %llu); data refreshes recorded %llu / skipped by hash %llu (%llu decided by words: data hits); restarts %llu, attaches %llu; us per hit: pre-check %.1f, proof %.1f, record %.1f; verified %llu (object replaced %llu)\n", kind == 0 ? "dispatch" : kind == 1 ? "indirect" : "draw", hits, misses.c_str(), proofs.c_str(), rebuilds.c_str(), take(counters.presyncsFromRecipe), take(counters.presyncsRecomputed), take(counters.presyncWaits), take(counters.dataRefreshed), take(counters.dataSkipped), take(counters.refreshByWords), take(counters.restarts), take(counters.attaches), precheckUs, proofUs, recordUs, take(counters.verified), take(counters.verifyReplaced));
+        std::string origins;
+        if (kind == 2) {
+            const auto origin = [&](auto& slots, VulkanDevice::DrawRecipeOrigin which) { return take(slots[static_cast<std::size_t>(which)]); };
+            char text[512];
+            std::snprintf(text, sizeof(text), "; hits by origin: exact entry %llu, relocated entry %llu, shape %llu; layout misses %llu; attaches on a donor entry: relocated %llu, shape %llu (exact entry %llu); shape draws without one remembered entry for every stage %llu", origin(recipes.drawOriginHits, VulkanDevice::DrawRecipeOrigin::Exact), origin(recipes.drawOriginHits, VulkanDevice::DrawRecipeOrigin::Relocated), origin(recipes.drawOriginHits, VulkanDevice::DrawRecipeOrigin::Shape), take(recipes.drawLayoutMisses), origin(recipes.drawOriginAttaches, VulkanDevice::DrawRecipeOrigin::Relocated), origin(recipes.drawOriginAttaches, VulkanDevice::DrawRecipeOrigin::Shape), origin(recipes.drawOriginAttaches, VulkanDevice::DrawRecipeOrigin::Exact), take(recipes.shapeRefused));
+            origins = text;
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[recipe] %s (10 s): hits %llu; pre-check misses: %s; proofs: %s; rebuilds: %s; presyncs from the recipe %llu (recomputed %llu, waited %llu); data refreshes recorded %llu / skipped by hash %llu (%llu decided by words: data hits); restarts %llu, attaches %llu; us per hit: pre-check %.1f, proof %.1f, record %.1f; verified %llu (object replaced %llu)%s\n", kind == 0 ? "dispatch" : kind == 1 ? "indirect" : "draw", hits, misses.c_str(), proofs.c_str(), rebuilds.c_str(), take(counters.presyncsFromRecipe), take(counters.presyncsRecomputed), take(counters.presyncWaits), take(counters.dataRefreshed), take(counters.dataSkipped), take(counters.refreshByWords), take(counters.restarts), take(counters.attaches), precheckUs, proofUs, recordUs, take(counters.verified), take(counters.verifyReplaced), origins.c_str());
     }
 }
 
@@ -5539,7 +5550,27 @@ std::uint64_t VulkanDevice::DrawRecipeHits() {
     return Recipes().kinds[static_cast<std::size_t>(RecipeKind::Draw)].hits.load(std::memory_order_relaxed);
 }
 
-RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const DrawTraceContext* trace) {
+void VulkanDevice::NoteDrawRecipeAttach(DrawRecipeOrigin origin) {
+    Recipes().drawOriginAttaches[static_cast<std::size_t>(origin)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void VulkanDevice::NoteShapeRecipeRefused() {
+    Recipes().shapeRefused.fetch_add(1, std::memory_order_relaxed);
+}
+
+VulkanDevice::DrawRecipeOriginCounts VulkanDevice::DrawRecipeOrigins() {
+    auto& recipes = Recipes();
+    DrawRecipeOriginCounts counts;
+    for (std::size_t origin = 0; origin < counts.hits.size(); ++origin) {
+        counts.hits[origin] = recipes.drawOriginHits[origin].load(std::memory_order_relaxed);
+        counts.attaches[origin] = recipes.drawOriginAttaches[origin].load(std::memory_order_relaxed);
+    }
+    counts.layoutMisses = recipes.drawLayoutMisses.load(std::memory_order_relaxed);
+    counts.shapeRefused = recipes.shapeRefused.load(std::memory_order_relaxed);
+    return counts;
+}
+
+RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const DrawTraceContext* trace, DrawRecipeOrigin origin) {
     PerformanceTimer timing("Vulkan.DrawFromRecipe");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& counters = Recipes().kinds[static_cast<std::size_t>(RecipeKind::Draw)];
@@ -5558,12 +5589,14 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
             case Graphics::DrawRecipeMiss::ObjectsGone: counters.precheckMisses[MissObjectsGone].fetch_add(1, std::memory_order_relaxed); break;
             case Graphics::DrawRecipeMiss::TemplateGone: counters.precheckMisses[MissTemplateGone].fetch_add(1, std::memory_order_relaxed); break;
             case Graphics::DrawRecipeMiss::Proof: counters.rebuilds[static_cast<std::size_t>(outcome.proof.failure)].fetch_add(1, std::memory_order_relaxed); break;
+            case Graphics::DrawRecipeMiss::Layout: Recipes().drawLayoutMisses.fetch_add(1, std::memory_order_relaxed); break;
             default: break;
         }
         return RecipeOutcome::Rebuild;
     }
     counters.proofPaths[static_cast<std::size_t>(outcome.proof.path)].fetch_add(1, std::memory_order_relaxed);
     counters.hits.fetch_add(1, std::memory_order_relaxed);
+    Recipes().drawOriginHits[static_cast<std::size_t>(origin)].fetch_add(1, std::memory_order_relaxed);
     if (profile) {
         counters.proofNs.fetch_add(static_cast<std::uint64_t>(outcome.proofUs * 1000.0), std::memory_order_relaxed);
         counters.recordNs.fetch_add(static_cast<std::uint64_t>(outcome.recordUs * 1000.0), std::memory_order_relaxed);

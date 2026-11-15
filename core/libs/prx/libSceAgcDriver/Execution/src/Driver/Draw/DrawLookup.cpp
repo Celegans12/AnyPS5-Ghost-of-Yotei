@@ -314,7 +314,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             continue;
                         }
                         if (reused != variant) applyShaderDataPatches(*reused);
-                        candidates.push_back({std::move(reused), std::move(regions), dataEntries[rank].first, static_cast<std::uint8_t>(rank), *kind, rebased});
+                        candidates.push_back({std::move(reused), std::move(regions), dataEntries[rank].first, static_cast<std::uint8_t>(rank), *kind, rebased, variant.get()});
                     }
                 }
                 shapeMisses[i] = miss;
@@ -340,7 +340,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     appendEntryRegions(*variant, regions);
                     auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
                     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
-                    if (result == EntryOutcome::Equal) candidates.push_back({variant, std::move(regions), dataEntries.front().first, 0, DrawShapeReuse::EqualWords});
+                    if (result == EntryOutcome::Equal) candidates.push_back({variant, std::move(regions), dataEntries.front().first, 0, DrawShapeReuse::EqualWords, false, variant.get()});
                 }
             }
         }

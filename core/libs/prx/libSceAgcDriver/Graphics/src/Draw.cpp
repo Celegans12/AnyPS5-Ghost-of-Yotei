@@ -1436,7 +1436,7 @@ bool DrawRecipes() {
 }
 
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof", "buffers"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof", "buffers", "layout"};
     return names[static_cast<std::size_t>(miss)];
 }
 
@@ -1815,6 +1815,11 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
 
 bool VerifyDrawPlan() {
     static const bool verify = std::getenv("APS5_VERIFY_DRAW_PLAN") != nullptr;
+    return verify;
+}
+
+bool VerifyDrawRecipe() {
+    static const bool verify = std::getenv("APS5_VERIFY_DRAW_RECIPE") != nullptr;
     return verify;
 }
 
@@ -4034,6 +4039,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
             recipe->targetViews = targetViews;
             recipe->passKey = DrawRenderPassKey(context, state, targetViews);
             recipe->vertexInput = inputs.VertexLayout();
+            recipe->vertexSignature = DescribeVertexLayout(shaders.front().program->vertexAttributes);
+            if (VerifyDrawRecipe()) BuildPipelineStoreKey(recipe->pipelineKey, context, masked.has_value() ? *masked : state, inputs.VertexLayout(), resources->SetLayouts(), shaders, VK_IMAGE_LAYOUT_GENERAL);
             recipe->pushStages = PushConstantStages(shaders);
             if (recipe->pushStages != 0) {
                 recipe->pushBytes = AssemblePushConstants(shaders);
@@ -4464,6 +4471,29 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     keepHeldSpace(prepared);
 }
 
+namespace {
+
+void verifyDrawRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, const std::shared_ptr<ShaderResources>& resources, const std::shared_ptr<Pipeline>& pipeline) {
+    DrawOutcome scratch;
+    DrawTimer scratchTimer(false);
+    const auto plan = planDraw(context, state, draw, shaders, nullptr, scratch, scratchTimer);
+    const auto fail = [&](const char* what) {
+        throw std::runtime_error(std::string("APS5_VERIFY_DRAW_RECIPE: a draw recorded from its recipe differs from the template path in its ") + what + " (" + std::to_string(shaders.front().program->vertexAttributes.size()) + " vertex attributes, " + std::to_string(recipe.vertexInput.attributes.size()) + " in the recipe's layout)");
+    };
+    if (plan.nothing || !SameVertexInputLayout(plan.VertexLayout(), recipe.vertexInput)) fail("vertex input layout");
+    if (plan.fragmentOutputs != recipe.fragmentOutputs || plan.shaderStages != recipe.shaderStages) fail("fragment outputs or pipeline stages");
+    if (!plan.keyed || plan.contentKey != recipe.key) fail("resource template key");
+    if (const auto served = SharedResourceCache().Find(plan.contentKey); served != nullptr && served != resources) fail("resource template");
+    const auto masked = maskedState(state, plan.fragmentOutputs);
+    if (masked.has_value() != recipe.masked.has_value()) fail("masked blend state");
+    std::vector<std::byte> key;
+    BuildPipelineStoreKey(key, context, masked.has_value() ? *masked : state, plan.VertexLayout(), resources->SetLayouts(), shaders, VK_IMAGE_LAYOUT_GENERAL);
+    if (key != recipe.pipelineKey) fail("pipeline store key");
+    if (const auto stored = FindCachedPipeline(context, key); stored != nullptr && stored != pipeline) fail("pipeline");
+}
+
+}
+
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
@@ -4491,6 +4521,9 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     if (recipe.hasDepth != state.depth.has_value()) return miss(DrawRecipeMiss::TargetGone);
     const std::size_t expectedViews = state.colors.size() + (recipe.hasDepth ? 1u : 0u);
     Require(recipe.targets.size() == state.colors.size() && recipe.targetViews.size() == expectedViews, "draw recipe targets do not match the state");
+    const auto& attributes = shaders.front().program->vertexAttributes;
+    if (!SameVertexLayout(recipe.vertexSignature, attributes)) return miss(DrawRecipeMiss::Layout);
+    ValidateVertexAddresses(attributes);
     const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer);
     DrawInputs inputs;
     if (plan.nothing) inputs.nothing = true;
@@ -4565,6 +4598,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         const std::vector<std::shared_ptr<void>> framebufferOwners(targets.begin(), targets.end());
         framebuffer = pipeline->AcquireFramebuffer(recipe.targetViews, framebufferOwners, state.renderExtent, state.renderLayers);
     }
+    if (VerifyDrawRecipe()) verifyDrawRecipe(context, state, draw, shaders, recipe, resources, pipeline);
     timer.phase(PhasePipeline);
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;
