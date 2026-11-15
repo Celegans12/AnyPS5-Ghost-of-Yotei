@@ -4898,6 +4898,23 @@ BufferCache::View CachedRange(Recorder& recorder, std::uint64_t address, std::si
     return view;
 }
 
+BufferCache::View CachedStageRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment) {
+    auto* cache = recorder.Buffers();
+    if (cache == nullptr) return {};
+    struct Serving {
+        BufferCache& cache;
+        explicit Serving(BufferCache& cache) : cache(cache) { cache.Stage(true); }
+        ~Serving() { cache.Stage(false); }
+    };
+    BufferCache::View view;
+    {
+        const Serving serving(*cache);
+        view = CachedRange(recorder, address, bytes, 0, alignment);
+    }
+    BufferCache::NoteStage(static_cast<bool>(view));
+    return view;
+}
+
 Recorder::UploadSlice Recorder::DrawInputUpload(std::size_t bytes) {
     constexpr VkDeviceSize alignment = 16;
     auto offset = (drawInputUploadUsed + alignment - 1) & ~(alignment - 1);
@@ -4913,7 +4930,7 @@ BufferCache* Recorder::Buffers() {
     if (!BufferCache::Enabled()) return nullptr;
     if (bufferCache == nullptr) {
         auto allocate = [this](std::size_t bytes) {
-            auto buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+            auto buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             BufferCache::Backing backing;
             backing.bytes = buffer->Bytes().data();
             backing.handle = buffer->Handle();

@@ -99,6 +99,9 @@ public:
         std::uint64_t streamSwitches = 0;
         std::uint64_t streamReturns = 0;
         std::uint64_t edgePages = 0;
+        std::uint64_t stageViews = 0;
+        std::uint64_t stageLeft = 0;
+        std::array<std::uint64_t, Refusals> stageRefused{};
         std::uint64_t heldBytes = 0;
         std::array<std::uint64_t, Refusals> refused{};
         std::array<std::uint64_t, UnarmedReasons> unarmed{};
@@ -114,6 +117,8 @@ public:
     static bool Arming();
     static bool Streaming();
     static void NoteStreamed(std::size_t bytes);
+    static bool StageViews();
+    static void NoteStage(bool served);
     static Source& TrackerSource();
     static void SetArmedBlocks(const ArmedBlocks& table);
     static Counts Counted();
@@ -127,6 +132,7 @@ public:
     std::optional<Derived> Known(const View& view, std::uint64_t address, std::size_t bytes, std::uint32_t kind) const;
     void Keep(const View& view, std::uint64_t address, std::size_t bytes, std::uint32_t kind, const Derived& value);
     std::size_t Mirrors() const { return mirrors.size(); }
+    void Stage(bool serving) { stage = serving; }
 
 private:
     struct Granule {
@@ -185,11 +191,13 @@ private:
     std::uint64_t sequence = 0;
     std::uint64_t executedFloor = 0;
     std::uint64_t pendingFloor = 0;
+    bool stage = false;
 };
 
 class Recorder;
 
 BufferCache::View CachedRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t from, std::size_t alignment);
+BufferCache::View CachedStageRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment);
 
 }
 

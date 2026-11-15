@@ -36,6 +36,9 @@ struct Counters {
     std::atomic<std::uint64_t> streamSwitches{0};
     std::atomic<std::uint64_t> streamReturns{0};
     std::atomic<std::uint64_t> edgePages{0};
+    std::atomic<std::uint64_t> stageViews{0};
+    std::atomic<std::uint64_t> stageLeft{0};
+    std::array<std::atomic<std::uint64_t>, BufferCache::Refusals> stageRefused{};
     std::atomic<std::uint64_t> heldBytes{0};
     std::array<std::atomic<std::uint64_t>, BufferCache::Refusals> refused{};
     std::array<std::atomic<std::uint64_t>, BufferCache::UnarmedReasons> unarmed{};
@@ -282,6 +285,16 @@ bool BufferCache::Streaming() {
     return streaming;
 }
 
+bool BufferCache::StageViews() {
+    static const bool views = Enabled() && std::getenv("APS5_NO_BUFFER_CACHE_STAGE_VIEWS") == nullptr;
+    return views;
+}
+
+void BufferCache::NoteStage(bool served) {
+    auto& counted = counters();
+    add(served ? counted.stageViews : counted.stageLeft);
+}
+
 void BufferCache::NoteStreamed(std::size_t bytes) {
     auto& counted = counters();
     add(counted.streamed);
@@ -320,6 +333,9 @@ BufferCache::Counts BufferCache::Counted() {
     counts.streamSwitches = held.streamSwitches.load(std::memory_order_relaxed);
     counts.streamReturns = held.streamReturns.load(std::memory_order_relaxed);
     counts.edgePages = held.edgePages.load(std::memory_order_relaxed);
+    counts.stageViews = held.stageViews.load(std::memory_order_relaxed);
+    counts.stageLeft = held.stageLeft.load(std::memory_order_relaxed);
+    for (std::size_t reason = 0; reason < Refusals; ++reason) counts.stageRefused[reason] = held.stageRefused[reason].load(std::memory_order_relaxed);
     counts.heldBytes = held.heldBytes.load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < Refusals; ++reason) counts.refused[reason] = held.refused[reason].load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < UnarmedReasons; ++reason) counts.unarmed[reason] = held.unarmed[reason].load(std::memory_order_relaxed);
@@ -366,12 +382,26 @@ std::string BufferCache::Report() {
         std::snprintf(edges, sizeof(edges), "[buffer-cache] edges (10 s): %llu pages shared with a pending GPU write compared in part\n", since(now.edgePages, reported.edgePages));
         text += edges;
     }
+    if (now.stageViews != reported.stageViews || now.stageLeft != reported.stageLeft) {
+        std::string reasons;
+        for (std::size_t reason = 0; reason < Refusals; ++reason) {
+            if (now.stageRefused[reason] == reported.stageRefused[reason]) continue;
+            char item[48];
+            std::snprintf(item, sizeof(item), " %s %llu", RefusalNames[reason], since(now.stageRefused[reason], reported.stageRefused[reason]));
+            reasons += item;
+        }
+        char stage[192];
+        std::snprintf(stage, sizeof(stage), "[buffer-cache] stage (10 s): %llu stage buffers bound to a mirror, %llu left to draw snapshots; refused:", since(now.stageViews, reported.stageViews), since(now.stageLeft, reported.stageLeft));
+        text += stage + reasons + "\n";
+    }
     reported = now;
     return text;
 }
 
 BufferCache::View BufferCache::Refuse(Refusal reason) {
-    add(counters().refused[static_cast<std::size_t>(reason)]);
+    auto& counted = counters();
+    add(counted.refused[static_cast<std::size_t>(reason)]);
+    if (stage) add(counted.stageRefused[static_cast<std::size_t>(reason)]);
     return {};
 }
 
