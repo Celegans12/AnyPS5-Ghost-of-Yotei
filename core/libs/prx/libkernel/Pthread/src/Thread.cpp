@@ -11,6 +11,7 @@
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include "prx/libc/include/general/AsmMacros.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
@@ -364,7 +365,7 @@ static void RetireGuestStack(PthreadPrivate*) {}
 static bool CommittedReadWrite(std::uintptr_t begin, std::uintptr_t end) {
     for (auto cursor = begin; cursor < end;) {
         MEMORY_BASIC_INFORMATION memory{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory) || memory.RegionSize == 0)
+        if (!GuestArena::GuestPageTrackQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &memory) || memory.RegionSize == 0)
             throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "Querying the host thread stack");
         if (memory.State != MEM_COMMIT || memory.Protect != PAGE_READWRITE) return false;
         cursor = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
@@ -457,6 +458,7 @@ static void RegisterStack(PthreadPrivate* self) {
 static void RestoreStackPages(std::uintptr_t start, std::size_t bytes) noexcept {
 #ifdef _WIN32
     DWORD previous = 0;
+    GuestArena::GuestPageTrackKeepOpen_nid_no_patch(reinterpret_cast<const void*>(start), bytes);
     const bool restored = VirtualAlloc(reinterpret_cast<void*>(start), bytes, MEM_COMMIT, PAGE_READWRITE) != nullptr &&
         VirtualProtect(reinterpret_cast<void*>(start), bytes, PAGE_READWRITE, &previous) != 0;
 #else

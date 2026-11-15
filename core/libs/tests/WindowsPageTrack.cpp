@@ -142,6 +142,177 @@ void CheckHolds() {
     Require(track.Armable(memory.Block(2)) && track.Armable(memory.Block(3)), "forgetting a range kept its imports or bars");
 }
 
+class Guest {
+public:
+    Guest(bool resident, std::size_t size) : bytes(size) {
+        auto& mappings = Mappings::Get();
+        reservation = static_cast<unsigned char*>(mappings.Reserve(nullptr, bytes + RunBytes));
+        Require(reservation != nullptr, "cannot reserve guest test memory");
+        data = reinterpret_cast<unsigned char*>((reinterpret_cast<std::uintptr_t>(reservation) + RunBytes - 1) & ~(RunBytes - 1));
+        if (resident) {
+            section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE | SEC_RESERVE, 0, static_cast<DWORD>(bytes), nullptr);
+            Require(section != nullptr, "cannot reserve the backing of resident test memory");
+            mappings.ForgetSection(section);
+            mappings.Map(data, bytes, section, 0, PAGE_READWRITE, true, true);
+        } else {
+            mappings.Commit(data, bytes, PAGE_READWRITE, bytes, true);
+        }
+        for (std::size_t at = 0; at < bytes; at += PageBytes) data[at] = 1;
+    }
+    ~Guest() {
+        if (!released) Mappings::Get().Reset(data, bytes);
+        if (section != nullptr) {
+            Mappings::Get().ForgetSection(section);
+            CloseHandle(section);
+        }
+    }
+    Guest(const Guest&) = delete;
+    Guest& operator=(const Guest&) = delete;
+
+    std::uintptr_t Address() const { return reinterpret_cast<std::uintptr_t>(data); }
+    std::uintptr_t Block(std::size_t index) const { return Address() + index * BlockBytes; }
+    void Write(std::size_t block, std::size_t page, unsigned char value) const { static_cast<volatile unsigned char*>(data)[block * BlockBytes + page * PageBytes + 3] = value; }
+    DWORD Protection(std::size_t block, std::size_t page = 0) const {
+        MEMORY_BASIC_INFORMATION memory{};
+        Require(VirtualQuery(data + block * BlockBytes + page * PageBytes, &memory, sizeof(memory)) == sizeof(memory), "cannot query guest test memory");
+        return memory.Protect;
+    }
+    std::set<std::size_t> Collect(std::size_t firstPage, std::size_t pages, bool clear = true) const {
+        std::set<std::size_t> written;
+        auto cursor = Address() + firstPage * PageBytes;
+        const auto end = cursor + pages * PageBytes;
+        while (cursor < end) {
+            std::array<void*, 64> found{};
+            std::size_t count = found.size();
+            Require(Mappings::Get().Collect(cursor, end - cursor, found.data(), &count, clear), "collecting guest test memory failed");
+            for (std::size_t index = 0; index < count; ++index) written.insert((reinterpret_cast<std::uintptr_t>(found[index]) - Address()) / PageBytes);
+            if (count < found.size()) break;
+            cursor = reinterpret_cast<std::uintptr_t>(found[count - 1]) + PageBytes;
+        }
+        return written;
+    }
+    void Release() {
+        Mappings::Get().Reset(data, bytes);
+        released = true;
+    }
+
+    unsigned char* data = nullptr;
+    std::size_t bytes;
+
+private:
+    unsigned char* reservation = nullptr;
+    HANDLE section = nullptr;
+    bool released = false;
+};
+
+struct TemporaryFile {
+    std::wstring path;
+    HANDLE handle = INVALID_HANDLE_VALUE;
+
+    TemporaryFile() {
+        wchar_t directory[MAX_PATH];
+        wchar_t name[MAX_PATH];
+        Require(GetTempPathW(MAX_PATH, directory) != 0 && GetTempFileNameW(directory, L"aps", 0, name) != 0, "cannot name a temporary file");
+        path = name;
+        const HANDLE writer = CreateFileW(name, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        Require(writer != INVALID_HANDLE_VALUE, "cannot create a temporary file");
+        std::array<unsigned char, PageBytes> content;
+        content.fill(0xa5);
+        DWORD written = 0;
+        Require(WriteFile(writer, content.data(), static_cast<DWORD>(content.size()), &written, nullptr) != 0 && written == content.size(), "cannot fill a temporary file");
+        CloseHandle(writer);
+        handle = CreateFileW(name, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        Require(handle != INVALID_HANDLE_VALUE, "cannot reopen a temporary file");
+    }
+    ~TemporaryFile() {
+        CloseHandle(handle);
+        DeleteFileW(path.c_str());
+    }
+    bool Read(void* destination, DWORD* error) const {
+        SetFilePointer(handle, 0, nullptr, FILE_BEGIN);
+        DWORD read = 0;
+        SetLastError(0);
+        const bool done = ReadFile(handle, destination, PageBytes, &read, nullptr) != 0 && read == PageBytes;
+        *error = done ? 0 : GetLastError();
+        return done;
+    }
+};
+
+void CheckGuards(bool resident) {
+    auto& track = Track::Get();
+    auto& mappings = Mappings::Get();
+    const std::string kind = resident ? "resident" : "private";
+    Guest memory(resident, 32 * BlockBytes);
+    const auto arm = [&](std::size_t block) {
+        Require(track.Armable(memory.Block(block)) && track.Arm(memory.Block(block)) && memory.Protection(block) == PAGE_READONLY, kind + ": cannot arm block " + std::to_string(block));
+    };
+    const auto open = [&](std::size_t block) { return track.StateOf(memory.Block(block)) == State::Unarmed && memory.Protection(block) == PAGE_READWRITE; };
+
+    arm(0);
+    mappings.Pin(memory.Block(0) + 0x2000, 0x3000);
+    Require(open(0) && !track.Armable(memory.Block(0)), kind + ": pinning a guest stack left its block armed or armable");
+    mappings.Unpin(memory.Block(0) + 0x2000, 0x3000);
+    Require(track.Armable(memory.Block(0)), kind + ": an unpinned block stays unarmable");
+
+    TemporaryFile file;
+    DWORD error = 0;
+    arm(1);
+    Require(!file.Read(memory.data + BlockBytes, &error) && error == ERROR_NOACCESS && memory.data[BlockBytes + 8] == 0, kind + ": a kernel write into an armed block without a host write bracket did not fail with ERROR_NOACCESS");
+    Require(mappings.BeginHostWrite(memory.Block(1), PageBytes), kind + ": a host write on an armed block was refused");
+    Require(open(1) && !track.Armable(memory.Block(1)), kind + ": a host write left its block armed or armable");
+    Require(file.Read(memory.data + BlockBytes, &error) && memory.data[BlockBytes + 8] == 0xa5, kind + ": a kernel write under a host write bracket failed");
+    mappings.EndHostWrite(memory.Block(1), PageBytes);
+    Require(track.Armable(memory.Block(1)), kind + ": a block stays unarmable after its host write");
+
+    arm(2);
+    Require(mappings.BeginHostWrite(memory.Block(2), BlockBytes, false), kind + ": a host import of an armed block was refused");
+    Require(open(2), kind + ": a host import left its block armed");
+    mappings.EndHostWrite(memory.Block(2), BlockBytes, false);
+    Require(!track.Armable(memory.Block(2)) && track.Armable(memory.Block(3)), kind + ": an imported block can be armed again, or its neighbour cannot");
+
+    arm(4);
+    Require(mappings.Protect(memory.Block(4) + PageBytes, PageBytes, PAGE_READONLY, true), kind + ": protecting guest memory failed");
+    Require(track.StateOf(memory.Block(4)) == State::Unarmed && memory.Protection(4, 0) == PAGE_READWRITE && memory.Protection(4, 1) == PAGE_READONLY && memory.Protection(4, 2) == PAGE_READWRITE, kind + ": a guest protection change did not reopen the block and protect exactly its range");
+    Require(!track.HandleWrite(memory.Block(4) + PageBytes + 5), kind + ": a write to memory the guest made read-only was taken for a tracked write");
+    Require(mappings.Protect(memory.Block(4) + PageBytes, PageBytes, PAGE_READWRITE, true) && memory.Protection(4, 1) == PAGE_READWRITE, kind + ": restoring the guest protection failed");
+    arm(4);
+    Require(mappings.Protect(memory.Block(4), BlockBytes, PAGE_READWRITE, true) && open(4), kind + ": a guest protection change to read-write left the block armed");
+
+    if (!resident) {
+        arm(5);
+        mappings.Commit(memory.data + 5 * BlockBytes, BlockBytes, PAGE_READONLY, BlockBytes, true);
+        Require(track.StateOf(memory.Block(5)) == State::Unarmed && memory.Protection(5) == PAGE_READONLY && !track.HandleWrite(memory.Block(5) + 5), kind + ": committing over an armed block with a new protection kept it tracked");
+        mappings.Commit(memory.data + 5 * BlockBytes, BlockBytes, PAGE_READWRITE, BlockBytes, true);
+    }
+
+    arm(6);
+    mappings.SetProtection(memory.Block(6), PageBytes, PAGE_READWRITE);
+    Require(open(6), kind + ": an announced protection change left the block armed");
+
+    arm(8);
+    arm(10);
+    MEMORY_BASIC_INFORMATION info{};
+    Require(mappings.QueryOpened(memory.Block(9), &info) && info.Protect == PAGE_READWRITE && open(8) && open(10), kind + ": the query the guest sees did not reopen the armed blocks of its allocation");
+    Require(reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize >= memory.Block(11), kind + ": the query the guest sees stops at a block that was armed");
+
+    arm(12);
+    mappings.KeepOpen(memory.Block(12), PageBytes);
+    Require(open(12) && !track.Armable(memory.Block(12)), kind + ": a range the kernel layer commits itself can still be armed");
+
+    arm(14);
+    std::array<std::uint64_t, 1> words{};
+    Require(mappings.ArmOwned(memory.Block(14) + 0x100, 0x200, words.data(), words.size(), Mappings::OwnedPrivate), kind + ": an owned proof was refused because its block is armed");
+    Require(mappings.OwnedUnchanged(memory.Block(14) + 0x100, 0x200, words.data(), words.size()), kind + ": an owned proof over an armed clean block does not hold");
+    const auto before = handled.load();
+    memory.Write(14, 0, 9);
+    Require(handled.load() - before == 1 && !mappings.OwnedUnchanged(memory.Block(14) + 0x100, 0x200, words.data(), words.size()), kind + ": an owned proof survived a write to its armed block");
+
+    arm(16);
+    arm(17);
+    memory.Release();
+    Require(track.StateOf(memory.Block(16)) == State::Unarmed && track.StateOf(memory.Block(17)) == State::Unarmed && track.Counted().armed == 0, kind + ": released guest memory kept armed blocks");
+}
+
 void CheckRace() {
     constexpr std::size_t Writers = 8;
     constexpr std::size_t Blocks = 32;
@@ -222,8 +393,11 @@ int main(int argc, char** argv) {
             CheckHolds();
         } else if (mode == "race") {
             CheckRace();
+        } else if (mode == "guards") {
+            CheckGuards(false);
+            CheckGuards(true);
         } else {
-            std::fprintf(stderr, "usage: %s table|race\n", argv[0]);
+            std::fprintf(stderr, "usage: %s table|race|guards\n", argv[0]);
             result = 2;
         }
         if (result == 0) std::printf("page tracking %.*s tests passed\n", static_cast<int>(mode.size()), mode.data());

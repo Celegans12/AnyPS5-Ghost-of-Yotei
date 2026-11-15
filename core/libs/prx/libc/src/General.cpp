@@ -52,6 +52,7 @@
 #include "prx/libc/include/FilesystemError.hpp"
 #include "prx/libc/include/AppArchive.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include "prx/libc/include/ApplicationHeap.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 
@@ -851,7 +852,7 @@ extern "C" bool GuestWritable_nid_no_patch(void* destination, std::size_t bytes)
     for (auto address = start; address < start + bytes;) {
 #ifdef _WIN32
         MEMORY_BASIC_INFORMATION memory{};
-        if (VirtualQuery(reinterpret_cast<LPCVOID>(address), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT ||
+        if (!GuestArena::GuestPageTrackQuery_nid_no_patch(reinterpret_cast<LPCVOID>(address), &memory) || memory.State != MEM_COMMIT ||
             (memory.Protect & PAGE_GUARD) != 0 ||
             (memory.Protect & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0) return false;
         address = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;

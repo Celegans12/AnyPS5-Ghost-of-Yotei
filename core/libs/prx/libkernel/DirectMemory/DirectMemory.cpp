@@ -2,6 +2,7 @@
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -169,22 +170,8 @@ static bool AtStackReserveBottom(std::uintptr_t start, std::uintptr_t end) {
 static int mprotect(void* addr, size_t len, int prot) {
     GuestArena::GuestArenaSetProtection_nid_postfix(reinterpret_cast<std::uintptr_t>(addr), len, WinProtFromPosix(prot));
     if (prot != PROT_NONE && KernelArena::Get().Owns(addr, len)) CommitArenaRange(addr, len, WinProtFromPosix(prot));
-    auto cursor = reinterpret_cast<std::uintptr_t>(addr);
-    const auto end = cursor + len;
-    while (cursor < end) {
-        MEMORY_BASIC_INFORMATION memory{};
-        if (VirtualQuery(reinterpret_cast<void*>(cursor), &memory, sizeof(memory)) != sizeof(memory))
-            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "VirtualQuery failed");
-        const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
-        if (memory.State == MEM_COMMIT) {
-            DWORD old;
-            if (!VirtualProtect(reinterpret_cast<void*>(cursor), regionEnd - cursor, WinProtFromPosix(prot), &old))
-                throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "VirtualProtect failed");
-        } else if (prot != PROT_NONE) {
-            throw std::runtime_error("mprotect of uncommitted memory outside the guest arena");
-        }
-        cursor = regionEnd;
-    }
+    if (!GuestArena::GuestPageTrackProtect_nid_no_patch(addr, len, WinProtFromPosix(prot), prot != PROT_NONE))
+        throw std::runtime_error("mprotect of uncommitted memory outside the guest arena");
     return 0;
 }
 #endif
@@ -1268,6 +1255,7 @@ int DoMapAnon(void** addr, size_t len, int prot, int flags, size_t alignment, bo
             EraseProtections(start, start + len, replacement);
             const auto recorded = replacement.emplace(start, ProtectedRange{start + len, ReportedProtection(prot)}).first;
             result = SCE_KERNEL_ERROR_ENOMEM;
+            GuestArena::GuestPageTrackKeepOpen_nid_no_patch(*addr, len);
             if (!VirtualFree(*addr, len, MEM_DECOMMIT)) return false;
             if (VirtualAlloc(*addr, len, MEM_COMMIT, WinProtFromPosix(LinuxProtFromSce(prot))) != *addr) {
                 const auto error = GetLastError();

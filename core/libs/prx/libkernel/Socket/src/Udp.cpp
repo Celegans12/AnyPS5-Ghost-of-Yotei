@@ -31,6 +31,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include "prx/libc/include/PreciseWait.hpp"
 #include "prx/libc/include/general/VabiMacros.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -478,7 +479,7 @@ std::uint64_t GuestPrefix(const void* pointer, std::uint64_t length, DWORD allow
     while (covered < length) {
         const auto address = start + covered;
         MEMORY_BASIC_INFORMATION memory{};
-        if (VirtualQuery(reinterpret_cast<LPCVOID>(address), &memory, sizeof(memory)) != sizeof(memory)) break;
+        if (!GuestArena::GuestPageTrackQuery_nid_no_patch(reinterpret_cast<LPCVOID>(address), &memory)) break;
         if (memory.State != MEM_COMMIT || (memory.Protect & PAGE_GUARD) != 0 || (memory.Protect & allowed) == 0) break;
         covered += reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize - address;
     }

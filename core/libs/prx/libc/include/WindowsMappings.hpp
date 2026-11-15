@@ -130,12 +130,49 @@ public:
                     mapped->second.armed = 0;
                     invalidate(mapped->first, mapped->second);
                 }
+                track.Open(cursor, stop);
                 DWORD previous;
                 if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
                 cursor = stop;
             }
         }
         return created;
+    }
+
+    bool Protect(std::uintptr_t address, std::size_t bytes, DWORD protection, bool requireCommitted) {
+        std::unique_lock lock(mutex, std::defer_lock);
+        if (track.Enabled()) lock.lock();
+        const auto end = address + bytes;
+        track.Open(address, end);
+        for (auto cursor = address; cursor < end;) {
+            const auto memory = query(cursor);
+            const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            if (memory.State == MEM_COMMIT) {
+                DWORD previous;
+                if (!VirtualProtect(reinterpret_cast<void*>(cursor), regionEnd - cursor, protection, &previous)) fail("protect guest memory");
+            } else if (requireCommitted) {
+                return false;
+            }
+            cursor = regionEnd;
+        }
+        return true;
+    }
+
+    void KeepOpen(std::uintptr_t address, std::size_t bytes) {
+        std::lock_guard lock(mutex);
+        track.Bar(address, address + bytes);
+    }
+
+    bool QueryOpened(std::uintptr_t address, MEMORY_BASIC_INFORMATION* memory) {
+        if (!track.Enabled()) return VirtualQuery(reinterpret_cast<const void*>(address), memory, sizeof(*memory)) == sizeof(*memory);
+        std::lock_guard lock(mutex);
+        const auto run = residentRuns.upper_bound(address);
+        if (run != residentRuns.begin() && std::prev(run)->second.end > address) {
+            track.Open(std::prev(run)->first, std::prev(run)->second.end);
+        } else if (const auto allocation = privateAllocations.upper_bound(address); allocation != privateAllocations.begin() && std::prev(allocation)->second > address) {
+            track.Open(std::prev(allocation)->first, std::prev(allocation)->second);
+        }
+        return VirtualQuery(reinterpret_cast<const void*>(address), memory, sizeof(*memory)) == sizeof(*memory);
     }
 
     void Reset(void* address, std::size_t bytes) {
@@ -273,6 +310,7 @@ public:
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
         std::lock_guard lock(mutex);
         disown(address, address + bytes);
+        track.Open(address, address + bytes);
         collectableRanges.clear();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
@@ -285,6 +323,7 @@ public:
         std::lock_guard lock(mutex);
         disown(address, address + bytes);
         ownedPins.emplace(address, address + bytes);
+        track.Hold(address, address + bytes);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             if (it->second.resident) {
                 ++it->second.pins;
@@ -307,6 +346,7 @@ public:
         std::lock_guard lock(mutex);
         disown(address, address + bytes);
         eraseOwnedRange(ownedPins, address, address + bytes);
+        track.Release(address, address + bytes);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             auto& pins = it->second.resident ? it->second.pins : it->second.page->pins;
             if (pins != 0) --pins;
@@ -412,6 +452,8 @@ public:
         disown(address, end);
         forgetZero(address, end);
         ownedHostAccess.emplace(address, end);
+        track.Hold(address, end);
+        if (!store) track.Import(address, end);
         for (auto it = first; it != views.end() && it->first < end; ++it) {
             auto& view = it->second;
             if (store) ++view.hostWrites;
@@ -435,6 +477,7 @@ public:
         const auto end = address + bytes;
         disown(address, end);
         eraseOwnedRange(ownedHostAccess, address, end);
+        track.Release(address, end);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
             if (store) --it->second.hostWrites;
             else --it->second.hostImports;
@@ -863,9 +906,10 @@ private:
     bool ownable(std::uintptr_t block, unsigned flags) {
         const auto end = block + ownedBlockBytes;
         if (overlapsOwnedRange(ownedPins, block, end) || overlapsOwnedRange(ownedHostAccess, block, end)) return false;
+        const bool guarded = track.Protected(block);
         for (auto cursor = block; cursor < end;) {
             const auto memory = query(cursor);
-            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE || (memory.Protect != PAGE_READWRITE && memory.Protect != PAGE_EXECUTE_READWRITE)) return false;
+            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE || (memory.Protect != PAGE_READWRITE && memory.Protect != PAGE_EXECUTE_READWRITE && !(guarded && memory.Protect == PAGE_READONLY))) return false;
             const auto found = views.find(cursor & ~(pageBytes - 1));
             if (found != views.end()) {
                 const auto& view = found->second;
@@ -1442,6 +1486,7 @@ private:
         const auto start = run->first;
         const auto stop = run->second.end;
         disown(start, stop);
+        track.Forget(start, stop);
         forgetOwnedPending(start, stop);
         forgetZero(start, stop);
         const auto entry = indexEntry(run);
@@ -1505,6 +1550,7 @@ private:
         const auto start = run->first;
         const auto stop = run->second.end;
         disown(start, stop);
+        track.Forget(start, stop);
         forgetOwnedPending(start, stop);
         forgetZero(start, stop);
         DWORD previous;
@@ -1695,6 +1741,7 @@ private:
 
     void reset(std::uintptr_t address, std::size_t bytes) {
         disown(address, address + bytes);
+        track.Forget(address, address + bytes);
         forgetOwnedPending(address, address + bytes);
         forgetZero(address, address + bytes);
         collectableRanges.clear();
@@ -1983,6 +2030,7 @@ private:
     SiteMutex mutex;
     std::array<std::atomic<std::uint64_t>, MappingForgetOutcomes> forgetOutcomes{};
     std::array<std::atomic<ZeroLeaf*>, zeroLeaves> zeroCounts{};
+    WindowsPageTrack& track = WindowsPageTrack::Get();
     HANDLE zeroSection = nullptr;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;

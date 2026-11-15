@@ -21,6 +21,7 @@
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
@@ -1652,7 +1653,7 @@ ImportPages importPages(std::uint64_t base, std::uint64_t bytes, bool opening = 
     ImportPages pages;
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+        if (!GuestArena::GuestPageTrackQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &info) || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
             pages.committed = false;
             return pages;
         }
@@ -5024,6 +5025,8 @@ std::shared_ptr<HostImport> UnregisteredHostImport(const Context& context, std::
     const auto end = (address + bytes + alignment - 1) / alignment * alignment;
     if (const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(base), true); range != nullptr && range->address < end) return nullptr;
 #ifdef _WIN32
+    std::optional<GuestArena::HostImportAccess> importAccess;
+    if (GuestArena::GuestPageTrackEnabled_nid_no_patch()) importAccess.emplace(reinterpret_cast<void*>(base), static_cast<std::size_t>(end - base));
     const void* allocation = nullptr;
     for (std::uint64_t cursor = base; cursor < end;) {
         MEMORY_BASIC_INFORMATION info{};

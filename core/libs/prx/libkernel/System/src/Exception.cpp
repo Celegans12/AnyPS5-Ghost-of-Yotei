@@ -4,6 +4,7 @@
 #include "SceTypes.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/HostFault.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
@@ -275,7 +276,7 @@ bool CodeReadable(DWORD64 low, DWORD64 high) {
 bool StackWritable(DWORD64 low, DWORD64 high) {
     for (DWORD64 address = low; address < high;) {
         MEMORY_BASIC_INFORMATION info{};
-        if (VirtualQuery(reinterpret_cast<void*>(address), &info, sizeof(info)) != sizeof(info)) return false;
+        if (!GuestArena::GuestPageTrackQuery_nid_no_patch(reinterpret_cast<void*>(address), &info)) return false;
         if (info.State != MEM_COMMIT || (info.Protect & PAGE_GUARD) != 0 || (info.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE)) == 0) return false;
         address = reinterpret_cast<DWORD64>(info.BaseAddress) + info.RegionSize;
     }

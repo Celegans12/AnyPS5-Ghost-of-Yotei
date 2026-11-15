@@ -9,6 +9,7 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
@@ -1142,7 +1143,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             static_cast<void>(emit(PageRun{cursor, end, false, false}));
             return true;
         }
-        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return false;
+        if (!GuestArena::GuestPageTrackQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &memory)) return false;
         // Debug aid: APS5_TRACE_QUERY prints every 16th page query with its cost.
         static const bool traceQuery = std::getenv("APS5_TRACE_QUERY") != nullptr;
         if (traceQuery) {

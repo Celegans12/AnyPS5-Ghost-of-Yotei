@@ -10,6 +10,7 @@
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/AppMetadata/include/ParamJsonParser.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
@@ -470,7 +471,7 @@ int APS5_VABI sceKernelVirtualQuery(const void* addr, int flags, VirtualQueryInf
  // region around the address is the honest extent; unmapped memory is an error, as on the PS5.
  #ifdef _WIN32
  MEMORY_BASIC_INFORMATION host{};
- if (VirtualQuery(addr, &host, sizeof(host)) == 0 || host.State != MEM_COMMIT) return SCE_KERNEL_ERROR_EACCES;
+ if (!GuestArena::GuestPageTrackQueryOpened_nid_no_patch(addr, &host) || host.State != MEM_COMMIT) return SCE_KERNEL_ERROR_EACCES;
  info->start = reinterpret_cast<uintptr_t>(host.BaseAddress);
  info->end = info->start + host.RegionSize;
  const bool writable = (host.Protect & (PAGE_READWRITE | PAGE_EXECUTE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY)) != 0;

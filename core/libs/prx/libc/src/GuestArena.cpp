@@ -684,6 +684,23 @@ int GuestPageTrackState_nid_no_patch(std::uintptr_t address) {
     return static_cast<int>(WindowsPageTrack::Get().StateOf(address & ~(WindowsPageTrack::BlockBytes - 1)));
 }
 
+bool GuestPageTrackQuery_nid_no_patch(const void* address, MEMORY_BASIC_INFORMATION* memory) {
+    return WindowsPageTrack::Get().Query(reinterpret_cast<std::uintptr_t>(address), memory);
+}
+
+bool GuestPageTrackQueryOpened_nid_no_patch(const void* address, MEMORY_BASIC_INFORMATION* memory) {
+    return WindowsMappings::Get().QueryOpened(reinterpret_cast<std::uintptr_t>(address), memory);
+}
+
+bool GuestPageTrackProtect_nid_no_patch(void* pointer, std::size_t bytes, std::uint32_t protection, bool requireCommitted) {
+    return WindowsMappings::Get().Protect(reinterpret_cast<std::uintptr_t>(pointer), bytes, protection, requireCommitted);
+}
+
+void GuestPageTrackKeepOpen_nid_no_patch(const void* pointer, std::size_t bytes) {
+    if (!WindowsPageTrack::Get().Enabled()) return;
+    WindowsMappings::Get().KeepOpen(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+}
+
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleRead(address);
 }
