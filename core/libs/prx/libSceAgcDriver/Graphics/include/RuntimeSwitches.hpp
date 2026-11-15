@@ -64,6 +64,13 @@ private:
     std::optional<double> firstSeconds;
 };
 
+bool DrawBlocks();
+bool VerifyDrawBlocks();
+std::size_t CoreRingMax();
+bool DrawBlockStats();
+void ForceDrawBlocks(bool blocks, bool verify);
+void UnforceDrawBlocks();
+
 bool AbConfigured();
 std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds);
 

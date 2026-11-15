@@ -14,6 +14,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/StagedMerge.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawBlock.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
@@ -3396,6 +3397,8 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     const auto drawUse = resources.BeginDrawUse(*recorder);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, false, drawUse != nullptr ? drawUse->record.get() : nullptr);
+    DrawBlockSections blockSections;
+    WriteDrawBlocks(context, recorder, shaders, &state.color, blockSections, nullptr);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -3549,6 +3552,17 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
             if (pushBytes == nullptr) pushStages = PushConstantStages(shaders);
             pushBytes = &movedPush;
         }
+    }
+    if (blockSections.count != 0) {
+        if (pushBytes != &movedPush) {
+            movedPush = pushBytes != nullptr ? *pushBytes : AssemblePushConstants(shaders);
+            if (pushBytes == nullptr) {
+                resources.PatchPushConstants(movedPush);
+                pushStages = PushConstantStages(shaders);
+            }
+            pushBytes = &movedPush;
+        }
+        blockSections.Patch(movedPush);
     }
     pushDrawConstants(*record.pipeline, commands, state, draw, shaders, resources, pushBytes, pushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
@@ -4464,6 +4478,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return touches(begin, end) || std::any_of(inputs.inPlaceReads.begin(), inputs.inPlaceReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }); }, resources->HoldsLease() || resources->UsesAddressTable() || resources->HasCopiedWrites()));
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
     APS5_LOG_CHARS_OUT_DEBUG("Creating CommandBatch");
+    std::vector<std::shared_ptr<void>> blockKept;
     std::optional<CommandBatch> batch;
     if (!recorded) {
         // The color-target detiles below take their descriptor sets from a fresh batch.
@@ -4578,13 +4593,25 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     if (pixelLdsSubgroup != 0u) BindPixelFunctionLds(context, commands, pipeline->Layout());
     if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
-    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, nullptr, 0, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
+    DrawBlockSections blockSections;
+    WriteDrawBlocks(context, recorded ? recorder : nullptr, shaders, &state.color, blockSections, &blockKept);
+    std::array<std::byte, PipelinePushConstantBytes> blockPush;
+    const std::array<std::byte, PipelinePushConstantBytes>* blockPushBytes = nullptr;
+    VkShaderStageFlags blockPushStages = 0;
+    if (blockSections.count != 0) {
+        blockPush = AssemblePushConstants(shaders);
+        resources->PatchPushConstants(blockPush);
+        blockSections.Patch(blockPush);
+        blockPushBytes = &blockPush;
+        blockPushStages = PushConstantStages(shaders);
+    }
+    pushDrawConstants(*pipeline, commands, state, draw, shaders, *resources, blockPushBytes, blockPushStages, meshArguments != nullptr ? meshArguments->DeviceAddress() : 0, !inputs.restartTable.empty(), inputs.meshLayerStride);
     APS5_LOG_CHARS_OUT_DEBUG("Push constants recorded");
     std::uint32_t subdraw = 0;
     if (recorded) noteDrawFaultToken(context, *recorder, commands, shaders, draw, static_cast<std::uint32_t>(state.stages.mesh.has_value() ? AgcDriver::FaultStage::mesh : AgcDriver::FaultStage::graphics), args);
     if (stencilReplay.empty()) recordDrawCommands(context, commands, state, draw, inputs, args != nullptr ? &indirect : nullptr, argumentBuffer, argumentOffset, prepared.trace, subdraw);
     else {
-        recordStencilReplay(context, recording, state, draw, inputs, stencilReplay, shaders, *resources);
+        recordStencilReplay(context, recording, state, draw, inputs, stencilReplay, shaders, *resources, blockPushBytes, blockPushStages);
         if (recorded) for (const auto& [reference, selectedPipeline] : stencilReplay) recorder->Keep(selectedPipeline);
     }
     if (pipeline->SplitsFaces()) {

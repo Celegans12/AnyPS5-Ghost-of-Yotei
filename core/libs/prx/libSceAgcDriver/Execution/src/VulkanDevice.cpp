@@ -66,6 +66,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DrawBlock.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -1207,6 +1208,7 @@ struct VulkanDevice::State {
             resourceCache.Clear();
             Graphics::ClearRetainedSpaces(device);
             Graphics::ClearCachedTextures(device);
+            Core::DrawBlockHost::Release(device);
             Graphics::ClearSnapshotCopies(device);
             Graphics::ClearUploadCopies(device);
             Graphics::ClearInputTwins(device);

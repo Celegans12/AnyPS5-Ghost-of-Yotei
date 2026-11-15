@@ -2467,6 +2467,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
                 updateAfterBind = true;
             };
             for (const auto& binding : shader.program->bindings) {
+                if (BlockMetadata(*shader.program, binding)) continue;
                 Require(binding.descriptorSet == ShaderRecompiler::RuntimeAbi::DescriptorSet || (shader.stage == ShaderRecompiler::ShaderStage::Fragment && binding.descriptorSet == ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet), "unexpected descriptor set: a shader resource must use its stage's descriptor set");
                 if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable || binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable) {
                     const bool storage = binding.role == ShaderRecompiler::DescriptorRole::ImageStorageTable;
@@ -2748,7 +2749,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
 }
 
 bool SplitsSets(const Context& context, std::span<const CompiledShader> shaders) {
-    const auto fragmentSet = [](const CompiledShader& shader) { return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [](const auto& binding) { return binding.descriptorSet == ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet; }); };
+    const auto fragmentSet = [](const CompiledShader& shader) { return shader.program != nullptr && std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [&](const auto& binding) { return binding.descriptorSet == ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet && !BlockMetadata(*shader.program, binding); }); };
     const auto fragmentStage = [](const CompiledShader& shader) { return shader.stage == ShaderRecompiler::ShaderStage::Fragment; };
     return std::any_of(shaders.begin(), shaders.end(), fragmentSet) || (context.graphicsPipelineLibrary && std::any_of(shaders.begin(), shaders.end(), fragmentStage));
 }
@@ -2770,6 +2771,7 @@ DescribedSetLayouts DescribeSetLayouts(const Context& context, std::span<const C
         std::uint64_t stageStorageBuffers = 0;
         std::uint64_t stageResources = 0;
         for (const auto& binding : shader.program->bindings) {
+            if (BlockMetadata(*shader.program, binding)) continue;
             const auto set = binding.descriptorSet == ShaderRecompiler::RuntimeAbi::FragmentDescriptorSet ? 1 : 0;
             if (binding.role == ShaderRecompiler::DescriptorRole::ImageTable) {
                 tableFlags[split && shader.stage == ShaderRecompiler::ShaderStage::Fragment ? 1 : 0] |= flags;
@@ -5986,7 +5988,7 @@ bool ShaderResources::DataWordsDiffer(const CompiledShader& shader) const {
     Require(shader.program != nullptr, "missing compiled shader");
     const auto& program = *shader.program;
     for (const auto& binding : program.bindings) {
-        if (!DataRole(binding.role)) continue;
+        if (!DataRole(binding.role) || BlockMetadata(program, binding)) continue;
         const auto held = std::ranges::find_if(bindings, [&](const Binding& candidate) { return candidate.layout.binding == binding.binding; });
         if (held == bindings.end() || held->allocations.size() != 1) return true;
         const auto& allocation = allocations[held->allocations.front()];
@@ -6010,7 +6012,7 @@ bool ShaderResources::refreshData(VkCommandBuffer commands, const CompiledShader
     auto timing = Recorder::NoTiming;
     std::uint64_t refreshedBytes = 0;
     for (const auto& binding : program.bindings) {
-        if (!DataRole(binding.role)) continue;
+        if (!DataRole(binding.role) || BlockMetadata(program, binding)) continue;
         const auto held = std::ranges::find_if(bindings, [&](const Binding& candidate) { return candidate.layout.binding == binding.binding; });
         Require(held != bindings.end(), "template bindings disagree with the shader");
         Require(held->allocations.size() == 1, "data binding without its buffer");
@@ -7373,6 +7375,7 @@ bool ShaderResources::CollectMovedReadOnlyBuffers(std::span<const CompiledShader
     for (const auto& shader : shaders) {
         if (shader.program == nullptr) return false;
         for (const auto& binding : shader.program->bindings) {
+            if (BlockMetadata(*shader.program, binding)) continue;
             if (DataRole(binding.role)) {
                 const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
                 if (kept == bindings.end() || kept->allocations.size() != 1) return false;

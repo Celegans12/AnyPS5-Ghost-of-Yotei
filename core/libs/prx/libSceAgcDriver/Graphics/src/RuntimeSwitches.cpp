@@ -188,6 +188,57 @@ std::string SwitchSettings(const AbState& state, bool b) {
 
 }
 
+namespace {
+
+struct BlockSwitches {
+    std::atomic<int> forced{-1};
+    bool blocks = false;
+    bool verify = false;
+    bool stats = false;
+    std::size_t ringMax = 16384;
+    BlockSwitches() {
+        verify = std::getenv("APS5_VERIFY_DRAW_BLOCK") != nullptr;
+        blocks = verify || std::getenv("APS5_DRAW_BLOCK") != nullptr;
+        stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        if (const char* text = std::getenv("APS5_CORE_RING_MAX")) ringMax = static_cast<std::size_t>(std::min<unsigned long long>(std::strtoull(text, nullptr, 10), 4194304ull));
+    }
+};
+
+BlockSwitches& Blocks() {
+    static BlockSwitches switches;
+    return switches;
+}
+
+}
+
+bool DrawBlocks() {
+    const auto& switches = Blocks();
+    const auto forced = switches.forced.load(std::memory_order_relaxed);
+    return forced >= 0 ? (forced & 1) != 0 : switches.blocks;
+}
+
+bool VerifyDrawBlocks() {
+    const auto& switches = Blocks();
+    const auto forced = switches.forced.load(std::memory_order_relaxed);
+    return forced >= 0 ? (forced & 2) != 0 : switches.verify;
+}
+
+std::size_t CoreRingMax() {
+    return Blocks().ringMax;
+}
+
+bool DrawBlockStats() {
+    return Blocks().stats;
+}
+
+void ForceDrawBlocks(bool blocks, bool verify) {
+    Blocks().forced.store((blocks || verify ? 1 : 0) | (verify ? 2 : 0), std::memory_order_relaxed);
+}
+
+void UnforceDrawBlocks() {
+    Blocks().forced.store(-1, std::memory_order_relaxed);
+}
+
 bool AbConfigured() {
     static const bool configured = std::getenv("APS5_AB") != nullptr;
     return configured;

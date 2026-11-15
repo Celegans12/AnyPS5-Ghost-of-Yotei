@@ -1,0 +1,284 @@
+#include "prx/libSceAgcDriver/Graphics/include/DrawBlock.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "BlockAbi.hpp"
+#include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <exception>
+#include <memory>
+#include <mutex>
+#include <stdexcept>
+#include <utility>
+
+namespace AgcDriver::Core {
+
+namespace {
+
+struct Counters {
+    std::atomic<std::uint64_t> draws{0}, stages{0}, sectionBytes{0}, copies{0}, copyBytes{0}, apart{0}, apartBytes{0}, absent{0}, synced{0}, unreadable{0}, mixed{0}, verified{0}, mismatches{0}, classic{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawBlockRefusal::Count)> refused{};
+};
+
+Counters& counters() {
+    static Counters counted;
+    return counted;
+}
+
+void add(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
+    counter.fetch_add(amount, std::memory_order_relaxed);
+}
+
+struct Registry {
+    std::mutex mutex;
+    std::vector<std::pair<VkDevice, std::unique_ptr<DrawBlockHost>>> hosts;
+};
+
+Registry& registry() {
+    static Registry* kept = new Registry();
+    return *kept;
+}
+
+constexpr VkBufferUsageFlags RingUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+
+}
+
+const char* DrawBlockRefusalName(DrawBlockRefusal refusal) {
+    switch (refusal) {
+        case DrawBlockRefusal::None: return "none";
+        case DrawBlockRefusal::Address: return "no device address";
+        case DrawBlockRefusal::Layout: return "layout";
+        case DrawBlockRefusal::Count: break;
+    }
+    return "?";
+}
+
+bool ReadGuestBytes(std::uint64_t address, std::span<std::byte> out) {
+    if (out.empty()) return true;
+#ifdef _WIN32
+    if (GuestArena::GuestArenaCopyOwned_nid_no_patch(static_cast<std::uintptr_t>(address), out.data(), out.size())) return true;
+#endif
+    return GuestMemory::CopyMapped(address, out) == GuestMemory::Compare::Equal;
+}
+
+DrawBlockHost::DrawBlockHost(const Graphics::Context& context) : context(context), ring(RingSource{&DrawBlockHost::allocate, &DrawBlockHost::executed, this}) {}
+
+DrawBlockHost::~DrawBlockHost() = default;
+
+DrawBlockHost& DrawBlockHost::For(const Graphics::Context& context) {
+    auto& kept = registry();
+    const std::lock_guard lock(kept.mutex);
+    for (const auto& [device, host] : kept.hosts) {
+        if (device == context.device) return *host;
+    }
+    kept.hosts.emplace_back(context.device, std::make_unique<DrawBlockHost>(context));
+    return *kept.hosts.back().second;
+}
+
+void DrawBlockHost::Release(VkDevice device) {
+    auto& kept = registry();
+    const std::lock_guard lock(kept.mutex);
+    std::erase_if(kept.hosts, [&](const auto& entry) { return entry.first == device; });
+}
+
+RingChunk DrawBlockHost::allocate(void* context, std::size_t bytes) {
+    auto& host = *static_cast<DrawBlockHost*>(context);
+    if (!host.context.bufferDeviceAddress) return {};
+    try {
+        auto buffer = std::make_shared<Graphics::Buffer>(host.context, bytes, RingUsage);
+        RingChunk chunk;
+        chunk.bytes = buffer->Bytes().data();
+        chunk.deviceAddress = buffer->DeviceAddress();
+        chunk.owner = std::move(buffer);
+        return chunk;
+    } catch (const std::exception&) {
+        return {};
+    }
+}
+
+bool DrawBlockHost::executed(void* context, std::uint64_t serial) {
+    const auto& host = *static_cast<DrawBlockHost*>(context);
+    return host.recorder != nullptr && host.recorder->ExecutedThrough(serial);
+}
+
+DrawBlockCounts DrawBlockHost::Counted() {
+    const auto& counted = counters();
+    const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+    DrawBlockCounts counts;
+    counts.draws = load(counted.draws);
+    counts.stages = load(counted.stages);
+    counts.sectionBytes = load(counted.sectionBytes);
+    counts.copies = load(counted.copies);
+    counts.copyBytes = load(counted.copyBytes);
+    counts.apart = load(counted.apart);
+    counts.apartBytes = load(counted.apartBytes);
+    counts.absent = load(counted.absent);
+    counts.synced = load(counted.synced);
+    counts.unreadable = load(counted.unreadable);
+    counts.mixed = load(counted.mixed);
+    counts.verified = load(counted.verified);
+    counts.mismatches = load(counted.mismatches);
+    counts.classic = load(counted.classic);
+    for (std::size_t index = 0; index < counts.refused.size(); ++index) counts.refused[index] = load(counted.refused[index]);
+    auto& kept = registry();
+    const std::lock_guard lock(kept.mutex);
+    for (const auto& [device, host] : kept.hosts) {
+        const auto ring = host->ring.Counted();
+        counts.ring.chunks += ring.chunks;
+        counts.ring.laps += ring.laps;
+        counts.ring.full += ring.full;
+        counts.ring.bytes += ring.bytes;
+    }
+    return counts;
+}
+
+std::string DrawBlockHost::Report() {
+    const auto counts = Counted();
+    const auto value = [](std::uint64_t number) { return static_cast<unsigned long long>(number); };
+    const auto refused = [&](DrawBlockRefusal refusal) { return value(counts.refused[static_cast<std::size_t>(refusal)]); };
+    char text[768];
+    std::snprintf(text, sizeof(text), "[draw-block] draws served %llu (%llu stages, %llu with a classic stage beside), classic draws %llu, refused: no device address %llu, layout %llu; section bytes %llu, copies %llu (%llu bytes), apart %llu (%llu bytes), absent buffers %llu, unreadable %llu, read after a wait %llu; ring chunks %llu, laps %llu, empty takes %llu; verified %llu, mismatches %llu",
+            value(counts.draws), value(counts.stages), value(counts.mixed), value(counts.classic), refused(DrawBlockRefusal::Address), refused(DrawBlockRefusal::Layout),
+            value(counts.sectionBytes), value(counts.copies), value(counts.copyBytes), value(counts.apart), value(counts.apartBytes), value(counts.absent), value(counts.unreadable), value(counts.synced),
+            value(counts.ring.chunks), value(counts.ring.laps), value(counts.ring.full), value(counts.verified), value(counts.mismatches));
+    return text;
+}
+
+void DrawBlockHost::NoteClassic() {
+    add(counters().classic);
+}
+
+void DrawBlockHost::NoteRefused(DrawBlockRefusal refusal) {
+    add(counters().refused[static_cast<std::size_t>(refusal)]);
+}
+
+void DrawBlockHost::NoteVerified(std::size_t mismatches) {
+    add(counters().verified);
+    add(counters().mismatches, mismatches);
+}
+
+DrawBlockHost::Draw::Draw(DrawBlockHost& host, Graphics::Recorder* recorder, std::vector<std::shared_ptr<void>>* kept, bool shadowed) : host(host), recorder(recorder), kept(kept), shadowed(shadowed) {
+    if (recorder != nullptr) host.recorder = recorder;
+}
+
+DrawBlockHost::Draw::~Draw() {
+    const auto serial = served && recorder != nullptr ? recorder->OpenSerial() : std::uint64_t{0};
+    for (std::size_t index = 0; index < heldCount; ++index) host.ring.Posted(held[index]);
+    for (std::size_t index = 0; index < heldCount; ++index) host.ring.Emitted(held[index], serial);
+}
+
+bool DrawBlockHost::Draw::hold(const RingSlice& slice) {
+    if (slice.bytes == nullptr) return false;
+    for (std::size_t index = 0; index < heldCount; ++index) {
+        if (held[index].chunk == slice.chunk && held[index].lap == slice.lap) return true;
+    }
+    held[heldCount++] = slice;
+    return true;
+}
+
+std::byte* DrawBlockHost::Draw::take(std::size_t bytes, std::uint64_t& deviceAddress, bool& ringed) {
+    ringed = false;
+    if (recorder != nullptr && bytes <= BlockRing::ChunkBytes && heldCount < held.size()) {
+        const auto slice = host.ring.Take(bytes, ShaderRecompiler::BlockAbi::SectionAlignmentBytes);
+        if (hold(slice)) {
+            ringed = true;
+            deviceAddress = slice.deviceAddress;
+            return slice.bytes;
+        }
+    }
+    auto buffer = std::make_shared<Graphics::Buffer>(host.context, bytes, RingUsage);
+    auto* target = buffer->Bytes().data();
+    deviceAddress = buffer->DeviceAddress();
+    if (recorder != nullptr) recorder->Keep(std::move(buffer), bytes);
+    else if (kept != nullptr) kept->push_back(std::move(buffer));
+    else throw std::runtime_error("a draw block outside a recorded batch has no owner for its buffers");
+    add(counters().apart);
+    add(counters().apartBytes, bytes);
+    return target;
+}
+
+std::uint32_t* DrawBlockHost::Draw::Section(std::size_t bytes, std::uint64_t& deviceAddress) {
+    bool ringed = false;
+    auto* target = take(bytes, deviceAddress, ringed);
+    add(counters().sectionBytes, bytes);
+    if (shadowed) ranges.push_back({deviceAddress, target, bytes});
+    return reinterpret_cast<std::uint32_t*>(target);
+}
+
+bool DrawBlockHost::Draw::Copy(std::uint64_t address, std::size_t bytes, std::size_t padded, std::uint64_t& deviceAddress) {
+    if (bytes == 0) return false;
+    const bool hazard = recorder == nullptr || recorder->PendingWriteOverlaps(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes) || recorder->PendingLabelIn(address, bytes) || Graphics::PendingStorageOverlaps(address, bytes, nullptr) || Graphics::AnyShadowedOverlaps(address, bytes);
+    bool ringed = false;
+    auto* target = take(padded, deviceAddress, ringed);
+    bool read = false;
+    if (hazard) {
+        try {
+            GuestMemory::Read(address, std::span<std::byte>(target, bytes));
+            read = true;
+            add(counters().synced);
+        } catch (const std::exception&) {
+        }
+    } else {
+        read = ReadGuestBytes(address, std::span<std::byte>(target, bytes));
+    }
+    if (!read) {
+        add(counters().unreadable);
+        return false;
+    }
+    if (padded > bytes && !ReadGuestBytes(address + bytes, std::span<std::byte>(target + bytes, padded - bytes))) std::fill(target + bytes, target + padded, std::byte{0});
+    if (ringed) {
+        add(counters().copies);
+        add(counters().copyBytes, padded);
+    }
+    if (shadowed) ranges.push_back({deviceAddress, target, padded});
+    return true;
+}
+
+void DrawBlockHost::Draw::Served(std::size_t stages, bool mixed) {
+    served = true;
+    add(counters().draws);
+    add(counters().stages, stages);
+    if (mixed) add(counters().mixed);
+}
+
+void DrawBlockHost::Draw::Absent() {
+    add(counters().absent);
+}
+
+bool DrawBlockHost::Draw::Read(void* context, std::uint64_t address, std::uint32_t* out, std::uint32_t count) {
+    static_cast<void>(context);
+    return ReadGuestBytes(address, std::as_writable_bytes(std::span<std::uint32_t>(out, count)));
+}
+
+bool DrawBlockHost::Draw::Resolve(void* context, const BufferRequest& request, BufferAnswer& answer) {
+    auto& draw = *static_cast<Draw*>(context);
+    answer = {};
+    if (!request.present || request.bytes == 0 || request.bytes > 0xfffffff0ull) {
+        draw.Absent();
+        return true;
+    }
+    const auto begin = request.address - request.misalignment;
+    const auto bytes = static_cast<std::size_t>(request.bytes + request.misalignment);
+    const auto padded = (bytes + 3u) & ~std::size_t{3};
+    std::uint64_t deviceAddress = 0;
+    if (!draw.Copy(begin, bytes, padded, deviceAddress)) return true;
+    answer.deviceAddress = deviceAddress + request.misalignment;
+    answer.bytes = static_cast<std::uint32_t>(padded - request.misalignment);
+    return true;
+}
+
+std::span<const std::byte> DrawBlockHost::Draw::BytesAt(void* context, std::uint64_t deviceAddress, std::uint32_t bytes) {
+    const auto& draw = *static_cast<const Draw*>(context);
+    for (const auto& range : draw.ranges) {
+        if (deviceAddress < range.deviceAddress || deviceAddress - range.deviceAddress >= range.size) continue;
+        const auto offset = static_cast<std::size_t>(deviceAddress - range.deviceAddress);
+        return std::span<const std::byte>(range.bytes + offset, std::min<std::size_t>(bytes, range.size - offset));
+    }
+    return {};
+}
+
+}

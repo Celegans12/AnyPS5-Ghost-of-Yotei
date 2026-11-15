@@ -406,6 +406,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
         if (resources.split) {
             auto& sets = shader.stage == Stage::Fragment ? keys.fragmentSets : keys.preRasterizationSets;
             for (const auto& binding : shader.program->bindings) {
+                if (BlockMetadata(*shader.program, binding)) continue;
                 Require(binding.descriptorSet < 2u, "split pipeline library descriptor set exceeds two slots");
                 sets |= 1u << binding.descriptorSet;
             }

@@ -43,6 +43,10 @@ struct CompiledShader {
     const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews = nullptr;
 };
 
+inline bool BlockMetadata(const ShaderRecompiler::RecompileResult& program, const ShaderRecompiler::DescriptorBinding& binding) {
+    return program.blockModule && (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers || binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt);
+}
+
 inline std::uint32_t KeyedPushOffset(const CompiledShader& shader) {
     return shader.program->pushConstants.empty() ? 0u : shader.pushConstantOffset;
 }
