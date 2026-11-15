@@ -29,6 +29,7 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
+class BufferCache;
 class DeviceBuffer;
 
 class CommandState {
@@ -250,6 +251,8 @@ public:
     bool Idle() const { return open == nullptr && inFlight.empty(); }
     std::uint64_t OpenSerial() const { return submissions + 1; }
     std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
+    bool ExecutedThrough(std::uint64_t serial) const;
+    BufferCache* Buffers();
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
@@ -1137,6 +1140,7 @@ private:
     LandingSite submitSite = LandingSite::Submit;
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
+    std::unique_ptr<BufferCache> bufferCache;
     std::vector<VkFence> spare;
     std::vector<VkQueryPool> sparePools;
     mutable AgcDriver::Mutex completedMutex;

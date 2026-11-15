@@ -8,6 +8,7 @@
 #include "prx/libc/include/HostThreadSlot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ReferenceStorage.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
@@ -4852,6 +4853,32 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
         if (batch->serial == serial) return fenceStatus(batch->fence) != VK_SUCCESS;
     }
     return false;
+}
+
+bool Recorder::ExecutedThrough(std::uint64_t serial) const {
+    if (serial > submissions) return false;
+    for (const auto& batch : inFlight) {
+        if (batch->serial > serial) break;
+        if (!signaled(*batch)) return false;
+    }
+    return true;
+}
+
+BufferCache* Recorder::Buffers() {
+    if (!BufferCache::Enabled()) return nullptr;
+    if (bufferCache == nullptr) {
+        auto allocate = [this](std::size_t bytes) {
+            auto buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+            BufferCache::Backing backing;
+            backing.bytes = buffer->Bytes().data();
+            backing.handle = buffer->Handle();
+            backing.owner = std::move(buffer);
+            return backing;
+        };
+        auto executed = [this](std::uint64_t serial) { return ExecutedThrough(serial); };
+        bufferCache = std::make_unique<BufferCache>(std::move(allocate), std::move(executed), BufferCache::TrackerSource());
+    }
+    return bufferCache.get();
 }
 
 void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, bool storedOnGpu) {
