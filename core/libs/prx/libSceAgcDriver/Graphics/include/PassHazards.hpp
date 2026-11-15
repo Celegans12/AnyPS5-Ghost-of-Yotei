@@ -63,10 +63,17 @@ class PassHazards {
 public:
     PassHazard Check(const PassAccess& access, bool samePass) const;
     void Add(const PassAccess& access);
-    void BeginPass() { ++pass; }
+    void BeginPass() {
+        ++pass;
+        accepted.clear();
+    }
     void SealWriteOnly();
     void Clear();
     bool Empty() const;
+    void Accept(std::uint64_t summary);
+    bool Accepted(std::uint64_t summary) const;
+    std::size_t AcceptedCount() const { return accepted.size(); }
+    static constexpr std::size_t AcceptedLimit = 256;
 
 private:
     struct Attachment {
@@ -80,6 +87,7 @@ private:
     GuestRangeSet writeOnly;
     std::vector<std::pair<VkImage, bool>> images;
     std::vector<Attachment> attachments;
+    std::vector<std::uint64_t> accepted;
     std::uint64_t pass = 0;
     bool anyReads = false;
     bool anyWrites = false;

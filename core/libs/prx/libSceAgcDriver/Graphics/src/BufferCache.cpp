@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PassState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include <algorithm>
@@ -368,10 +369,12 @@ std::size_t BufferCache::RingLimit() {
 }
 
 void BufferCache::BreakDrawRun() {
+    PassState::Break();
     drawRun.fetch_add(1, std::memory_order_acq_rel);
 }
 
 void BufferCache::EndDrawRun(RunEnd reason) {
+    PassState::Break();
     const auto runs = drawRuns();
     if (runs == Runs::Off) return;
     auto& counted = counters();
@@ -384,6 +387,7 @@ void BufferCache::EndDrawRun(RunEnd reason) {
 }
 
 void BufferCache::KeepDrawRun() {
+    PassState::Break();
     if (drawRuns() != Runs::Off) add(counters().runsKept);
 }
 

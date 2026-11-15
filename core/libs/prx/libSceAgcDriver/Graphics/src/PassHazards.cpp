@@ -58,7 +58,24 @@ PassHazard PassHazards::Check(const PassAccess& access, bool samePass) const {
     return PassHazard::None;
 }
 
+void PassHazards::Accept(std::uint64_t summary) {
+    if (summary == 0 || Accepted(summary)) return;
+    if (accepted.size() >= AcceptedLimit) accepted.clear();
+    accepted.push_back(summary);
+}
+
+bool PassHazards::Accepted(std::uint64_t summary) const {
+    return summary != 0 && std::find(accepted.begin(), accepted.end(), summary) != accepted.end();
+}
+
 void PassHazards::Add(const PassAccess& access) {
+    if (!accepted.empty()) {
+        const auto nonEmpty = [](GuestRangeList ranges) { return std::any_of(ranges.begin(), ranges.end(), [](const auto& range) { return range.first < range.second; }); };
+        const bool mutating = access.anyReads || access.anyWrites || nonEmpty(access.writes) || nonEmpty(access.writeOnly) || std::any_of(access.images.begin(), access.images.end(), [](const auto& image) { return image.first != VK_NULL_HANDLE && image.second; });
+        const bool attached = std::any_of(access.images.begin(), access.images.end(), [&](const auto& image) { return image.first != VK_NULL_HANDLE && std::any_of(attachments.begin(), attachments.end(), [&](const Attachment& seen) { return seen.image == image.first; }); });
+        const bool foreign = std::any_of(access.attachments.begin(), access.attachments.end(), [&](const auto& attachment) { return attachment.first != VK_NULL_HANDLE && std::none_of(attachments.begin(), attachments.end(), [&](const Attachment& seen) { return seen.image == attachment.first && seen.pass == pass; }); });
+        if (mutating || attached || foreign) accepted.clear();
+    }
     for (const auto& [begin, end] : access.reads) reads.Insert(begin, end);
     for (const auto& [begin, end] : access.writes) writes.Insert(begin, end);
     for (const auto& [begin, end] : access.writeOnly) writeOnly.Insert(begin, end);
@@ -81,6 +98,7 @@ void PassHazards::Add(const PassAccess& access) {
 void PassHazards::SealWriteOnly() {
     for (const auto& [begin, end] : writeOnly.Ranges()) writes.Insert(begin, end);
     writeOnly.Clear();
+    accepted.clear();
 }
 
 void PassHazards::Clear() {
@@ -89,6 +107,7 @@ void PassHazards::Clear() {
     writeOnly.Clear();
     images.clear();
     attachments.clear();
+    accepted.clear();
     anyReads = anyWrites = false;
 }
 

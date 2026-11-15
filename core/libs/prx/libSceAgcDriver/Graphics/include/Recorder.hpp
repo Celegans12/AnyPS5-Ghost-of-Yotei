@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PassState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
 #include <unordered_map>
@@ -233,6 +234,11 @@ public:
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(CommandState&)> afterPass = {});
     void SealPassWriteOnly();
+    std::uint64_t OpenBatchId() const { return open != nullptr ? open->id : 0; }
+    bool PassAccepts(std::uint64_t key, std::uint64_t summary) const { return open != nullptr && open->renderPass.open && open->renderPass.key == key && open->passHazards.Accepted(summary); }
+    void AcceptInPass(std::uint64_t key, std::uint64_t summary);
+    PassHazard OpenPassHazard(std::uint64_t key, const PassAccess& access) const;
+    bool OpenKeeps(const void* object) const;
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
     // label store (RecordStore), or before a command that writes or reads a queued range (the
@@ -822,6 +828,7 @@ private:
         std::unordered_set<const void*> keptOwners;
         const void* lastKeptOwner = nullptr;
         std::shared_ptr<void> drawArena;
+        std::uint64_t id = 0;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;

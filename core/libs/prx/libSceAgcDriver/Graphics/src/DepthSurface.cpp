@@ -3634,6 +3634,7 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
 }
 
 VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten, std::optional<std::uint8_t> overwrittenStencil) {
+    PassState::NoteDepthView();
     const auto planeBytes = [&](std::uint32_t bytesPerTexel) { return target.samples == 1u ? DepthSliceBytes(target.extent, bytesPerTexel) : MultisampledDepthBytes_nid_no_patch(target.extent, bytesPerTexel, target.samples); };
     if (target.depthPartiallyResident) Require(resident(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u)) && (target.htileAddress == 0u || resident(target.htileAddress, HtileMetadataBytes(target.extent))), "partially resident depth (DB_Z_INFO) with pages that are not mapped is unsupported");
     if (target.stencilPartiallyResident) Require(resident(target.stencilAddress, planeBytes(1u)), "partially resident stencil (DB_STENCIL_INFO) with pages that are not mapped is unsupported");

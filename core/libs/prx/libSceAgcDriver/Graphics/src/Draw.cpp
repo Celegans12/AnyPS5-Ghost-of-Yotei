@@ -3061,6 +3061,7 @@ struct RecordedDraw {
     bool listed = false;
     bool completion = false;
     bool waited = false;
+    bool fromRecipe = false;
     const std::array<std::byte, PipelinePushConstantBytes>* pushBytes = nullptr;
     VkShaderStageFlags pushStages = 0;
     std::vector<std::pair<std::uint32_t, std::shared_ptr<Pipeline>>> stencilReplay;
@@ -3260,7 +3261,6 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     // draw neither reads its attachments (a barrier would be owed, which no pass allows) nor
     // records anything outside a pass (an indirect draw's argument barrier and scratch copies).
     const auto passKey = DrawRenderPassKey(context, state, record.targetViews);
-    const bool readsTarget = std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); });
     // A queued DCC key store over memory the draw writes or reads in place (unknown for an
     // address-based build), or over its GPU-side records, lands before it, as before a dispatch
     // (VulkanDevice::dispatch); the flush ends an open pass, so it comes before the decision.
@@ -3281,13 +3281,21 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         outcome.storesFlushed = true;
     }
     const bool capture = CaptureInputsEnabled();
+    const bool summarized = record.fromRecipe && PassState::Enabled() && !capture && record.multisampleImages.empty() && record.proxies.empty() && record.staged.empty();
+    const auto* summary = summarized ? resources.PassAccessSummary() : nullptr;
+    const bool known = summary != nullptr && recorder->PassAccepts(passKey, summary->id);
+    if (summarized && summary == nullptr) PassState::Count(PassState::Refusal::NoSummary);
+    else if (summarized && !known) PassState::Count(PassState::Refusal::Unaccepted);
+    const auto readsOwnTarget = [&] { return std::any_of(record.targets.begin(), record.targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources.ReadsImage(target.get()); }); };
+    const bool readsTarget = known ? false : readsOwnTarget();
     const bool meshIndirect = state.stages.mesh && args != nullptr;
     const bool captured = state.stages.mesh && state.tessellationCapture != nullptr;
     const bool addressBased = resources.HoldsLease();
     thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>>* passReadsSlot = nullptr;
     auto& passReads = ShaderRecompiler::ThreadOwned(passReadsSlot);
     passReads.clear();
-    if (!addressBased) resources.DeviceReads(passReads);
+    if (known) passReads.assign(summary->reads.begin(), summary->reads.end());
+    else if (!addressBased) resources.DeviceReads(passReads);
     const auto deviceReads = passReads.size();
     if (gpuIndirect) {
         passReads.emplace_back(args->arguments, args->arguments + args->RangeBytes());
@@ -3305,13 +3313,18 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     std::vector<std::pair<VkImage, bool>> ownAttachments;
     auto& passImages = leanCommit ? ShaderRecompiler::ThreadOwned(passImagesSlot) : ownImages;
     auto& passAttachments = leanCommit ? ShaderRecompiler::ThreadOwned(passAttachmentsSlot) : ownAttachments;
-    resources.StorageImages(passImages);
+    const auto fillPassImages = [&] {
+        resources.StorageImages(passImages);
+        passAttachments.clear();
+        passAttachments.reserve(record.targets.size());
+        for (const auto& target : record.targets) {
+            if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
+        }
+        for (const auto image : record.multisampleImages) passAttachments.emplace_back(image, true);
+    };
+    passImages.clear();
     passAttachments.clear();
-    passAttachments.reserve(record.targets.size());
-    for (const auto& target : record.targets) {
-        if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
-    }
-    for (const auto image : record.multisampleImages) passAttachments.emplace_back(image, true);
+    if (!known) fillPassImages();
     const bool unknownMemory = addressBased || resources.UsesAddressTable() || resources.HasCopiedWrites();
     static_cast<void>(StorageTexture::StoreDrawnLinearTouching("draw access", [&](std::uint64_t begin, std::uint64_t end) { return std::any_of(passReads.begin(), passReads.end(), [&](const auto& read) { return read.first < end && begin < read.second; }) || resources.WritesOverlap(begin, static_cast<std::size_t>(end - begin)); }, unknownMemory));
     const auto drawUse = resources.BeginDrawUse(*recorder);
@@ -3342,7 +3355,23 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         passWrites = hazardWrites;
         passWriteOnly = writeOnly;
     }
-    const PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
+    PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
+    if (known) passAccess.reads = GuestRangeList(passReads).subspan(deviceReads);
+    if (known && PassState::Verifies() && recorder->PassAccepts(passKey, summary->id)) {
+        std::vector<std::pair<VkImage, bool>> fullImages;
+        std::vector<std::pair<VkImage, bool>> fullAttachments;
+        resources.StorageImages(fullImages);
+        for (const auto& target : record.targets) {
+            if (target != nullptr) fullAttachments.emplace_back(target->Image(), true);
+        }
+        const PassAccess full{passReads, passWrites, fullImages, fullAttachments, unknownMemory, unknownWrites, passWriteOnly};
+        const bool sameDecision = (recorder->OpenPassHazard(passKey, full) == PassHazard::None) == (recorder->OpenPassHazard(passKey, passAccess) == PassHazard::None);
+        PassState::CountVerified();
+        if (!sameDecision || readsOwnTarget() || unknownMemory || unknownWrites || !passWrites.empty() || !resources.PassAccessSummaryCurrent(*summary)) {
+            PassState::CountMismatch();
+            throw std::runtime_error(std::string("APS5_VERIFY_PASS_STATE: a draw served by the access summary its pass accepted differs from the full path in ") + (!sameDecision ? "the decision of the pass" : "the accesses of its template"));
+        }
+    }
     const bool fenced = state.depth.has_value() || !record.proxies.empty();
     resources.RequireGuestBuffers();
     if (UsesMeshWindow(shaders)) PrepareMeshWindow(context);
@@ -3350,6 +3379,13 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     if (record.spaceKeep != nullptr) *record.spaceKeep = reserveSpaceKeep(*recorder, resources);
     for (const auto& target : record.multisampleTargets) KeepMultisampleTarget_nid_no_patch(target);
     const bool continued = start.continued;
+    if (known && continued) {
+        PassState::Count(PassState::Served::Access);
+    } else if (known) {
+        PassState::Count(PassState::Refusal::PassBroken);
+        fillPassImages();
+        passAccess = PassAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, passWriteOnly};
+    }
     outcome.passContinued = continued;
     outcome.passBegun = !continued;
     outcome.passBreak = start.reason;
@@ -3503,6 +3539,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    if (summary != nullptr && !readsTarget && !(known && continued)) recorder->AcceptInPass(passKey, summary->id);
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, record.targets, record.targetSlices, state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, drawUse, record.spaceKeep != nullptr && *record.spaceKeep != nullptr ? record.spaceKeep->get() : nullptr);
     timer.phase(PhaseKeep);
@@ -4708,6 +4745,7 @@ void drawTessellationGeometry(const Context& context, const State& state, const 
 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
+    PassState::Break();
     if (state.stages.tessellationGeometry) {
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
         return;
@@ -4998,6 +5036,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     RecordedDraw record;
     record.recorder = recorder;
+    record.fromRecipe = true;
     record.masked = recipe.masked.has_value() ? &*recipe.masked : nullptr;
     record.completion = outcome.completion;
     record.resources = std::move(resources);

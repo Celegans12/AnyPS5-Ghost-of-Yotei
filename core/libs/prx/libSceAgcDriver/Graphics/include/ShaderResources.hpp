@@ -366,6 +366,15 @@ public:
     void InPlaceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.InPlaceReads(out); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     void StorageImages(std::vector<std::pair<VkImage, bool>>& images) const;
+    struct AccessSummary {
+        std::uint64_t id = 0;
+        std::uint64_t epoch = 0;
+        bool readOnly = false;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+        std::vector<std::pair<VkImage, bool>> images;
+    };
+    const AccessSummary* PassAccessSummary() const;
+    bool PassAccessSummaryCurrent(const AccessSummary& summary) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     void DeviceReads(std::vector<std::pair<std::uint64_t, std::uint64_t>>& out) const { guestMemory.DeviceReads(out); }
     bool ReadsImage(const StorageTexture* image) const;
@@ -807,6 +816,8 @@ private:
     std::vector<FaultDescriptor> faultDescriptors;
     void prepareFaultSlot() const;
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    mutable std::unique_ptr<AccessSummary> accessSummary;
+    std::uint64_t accessEpoch = 0;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);
     mutable std::vector<VkDescriptorPoolSize> drawPoolSizes;
     // Guest buffer elements bound read-only: each use of this object skips that many pending-write

@@ -2247,8 +2247,22 @@ void Recorder::SealPassWriteOnly() {
     if (open != nullptr) open->passHazards.SealWriteOnly();
 }
 
+void Recorder::AcceptInPass(std::uint64_t key, std::uint64_t summary) {
+    if (open != nullptr && open->renderPass.open && open->renderPass.key == key) open->passHazards.Accept(summary);
+}
+
+PassHazard Recorder::OpenPassHazard(std::uint64_t key, const PassAccess& access) const {
+    Require(open != nullptr && open->renderPass.open, "no render pass is open for a hazard check");
+    return open->passHazards.Check(access, open->renderPass.key == key);
+}
+
+bool Recorder::OpenKeeps(const void* object) const {
+    return open != nullptr && std::any_of(open->kept.begin(), open->kept.end(), [&](const std::shared_ptr<void>& kept) { return kept.get() == object; });
+}
+
 void Recorder::endOpenRenderPass(PassBreak by, bool barrier) {
     auto& pass = open->renderPass;
+    PassState::Break();
     if (open->segmentActive) endSegment(*open);
     EndRenderPass(context, open->commands);
     // The pass's attachment and shader writes are visible to everything recorded after it (the
@@ -2365,6 +2379,7 @@ void Recorder::ensureOpen() {
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
         if (keptHint != 0 && LeanCommit()) batch->kept.reserve(batch->kept.size() + keptHint);
+        batch->id = PassState::NextId();
         open = std::move(batch);
         open->predictedSerial = submissions + 1;
         try {
@@ -5810,6 +5825,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
 }
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {
+    PassState::Break();
     outdateDrawInputCopies();
     OutdateInputTwins(context.device);
     removeLabels(*batch);

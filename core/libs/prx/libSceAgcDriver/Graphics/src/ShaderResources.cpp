@@ -4724,10 +4724,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
         proofHeld = false;
+        ++accessEpoch;
         return false;
     }
     if (!DrawProofsEnabled() && !EpochProofs()) {
         NoteDrawProofMissed(DrawProofKind::Resources, DrawProofMiss::None);
+        ++accessEpoch;
         return revalidateFull(shaders, report);
     }
     const auto now = DrawProofStamp::Now();
@@ -4743,7 +4745,10 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             else touchedEpoch = now.epoch;
         }
         if (miss == DrawProofMiss::None) {
-            if (DrawProofVerifyDue()) return verifyProof(shaders, report);
+            if (DrawProofVerifyDue()) {
+                ++accessEpoch;
+                return verifyProof(shaders, report);
+            }
             if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
             NoteDrawProofReused(DrawProofKind::Resources);
             return true;
@@ -4753,6 +4758,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     } else {
         NoteDrawProofMissed(DrawProofKind::Resources, DrawProofMiss::None);
     }
+    ++accessEpoch;
     struct SweptTag {};
     auto& swept = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, SweptTag>();
     struct NotedTag {};
@@ -7942,6 +7948,28 @@ std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
     std::vector<std::pair<VkImage, bool>> images;
     StorageImages(images);
     return images;
+}
+
+const ShaderResources::AccessSummary* ShaderResources::PassAccessSummary() const {
+    if (!reusable || usesBda || guestMemory.HoldsLease() || guestMemory.HasCopiedWrites() || !guestMemory.Writes().empty() || !writeOnlyRanges.empty()) return nullptr;
+    if (accessSummary == nullptr || accessSummary->epoch != accessEpoch) {
+        auto summary = std::make_unique<AccessSummary>();
+        summary->id = PassState::NextId();
+        summary->epoch = accessEpoch;
+        guestMemory.DeviceReads(summary->reads);
+        StorageImages(summary->images);
+        summary->readOnly = std::none_of(summary->images.begin(), summary->images.end(), [](const auto& image) { return image.second; });
+        accessSummary = std::move(summary);
+    }
+    return accessSummary->readOnly ? accessSummary.get() : nullptr;
+}
+
+bool ShaderResources::PassAccessSummaryCurrent(const AccessSummary& summary) const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    std::vector<std::pair<VkImage, bool>> images;
+    guestMemory.DeviceReads(reads);
+    StorageImages(images);
+    return reads == summary.reads && images == summary.images && guestMemory.Writes().empty() && writeOnlyRanges.empty() && !usesBda && !guestMemory.HoldsLease() && !guestMemory.HasCopiedWrites();
 }
 
 void ShaderResources::StorageImages(std::vector<std::pair<VkImage, bool>>& images) const {
