@@ -1,26 +1,39 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "Recompiler.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include "VulkanTestDevice.hpp"
 #include <array>
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <initializer_list>
 #include <iostream>
 #include <memory>
+#include <span>
 #include <string>
 #include <utility>
 #include <vector>
 
+namespace AgcDriver::DriverDetail {
+
+struct DriverTestAccess {
+    static bool PatchBufferWords(DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint32_t>> live) { return Driver::patchBufferWords(variant, live); }
+};
+
+}
+
 namespace {
 
 using AgcDriver::Graphics::Require;
+using AgcDriver::DriverDetail::DriverTestAccess;
 using AgcDriver::DriverDetail::DispatchVariant;
 using AgcDriver::DriverDetail::DrawProgram;
 using AgcDriver::DriverDetail::Driver;
@@ -165,6 +178,190 @@ void BufferValueWordsArePatchedInTheirBinding() {
     Require((ownCount->valueWords >> 6u & 1u) != 0u, "a record count used by one descriptor only was not tagged next to an independent second descriptor");
 }
 
+struct TableStage {
+    std::vector<std::uint32_t> descriptor;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    std::vector<std::uint32_t> words;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> leaves;
+    std::vector<std::uint32_t> flatOffsets;
+    std::vector<std::uint32_t> sources;
+    std::vector<ShaderRecompiler::DescriptorBinding> bindings;
+};
+
+TableStage TableStageOf(std::vector<std::uint32_t> descriptor, bool written) {
+    TableStage stage;
+    stage.descriptor = std::move(descriptor);
+    stage.runs = {{0x8000u, 0x8018u}};
+    stage.words = {stage.descriptor[0], stage.descriptor[1], stage.descriptor[2], stage.descriptor[3], 0x55u, 0x66u};
+    stage.leaves = {{0u, 0x8000u}, {1u, 0x8004u}, {2u, 0x8008u}};
+    stage.flatOffsets = {0u, 1u, 2u};
+    stage.sources = {0u};
+    stage.bindings.push_back(GuestBuffer(stage.descriptor, written));
+    stage.bindings.back().bufferResources = {0u};
+    stage.bindings.push_back(ShaderRecompiler::DescriptorBinding{ShaderRecompiler::DescriptorKind::StorageBuffer, ShaderRecompiler::DescriptorRole::FlattenedSrt, 0, 1, 1, {stage.descriptor[0], stage.descriptor[1], stage.descriptor[2], 0x99u}});
+    return stage;
+}
+
+void TableLeavesBecomeBaseAndSizePositions() {
+    using Positions = std::vector<std::uint32_t>;
+    using Slots = std::vector<std::array<std::uint32_t, 2>>;
+    Positions positions;
+    Slots slots;
+    const auto place = [&](const TableStage& stage) { return AgcDriver::BufferWordPositions(stage.runs, stage.leaves, stage.flatOffsets, stage.words, stage.sources, stage.bindings, positions, slots); };
+    const std::vector<std::uint32_t> descriptor{0x10000u, 0u, 16u, 0x20077facu};
+    for (const bool gcn : {false, true}) {
+        ShaderRecompiler::SetGcnGuestShaders(gcn);
+        const auto counts = place(TableStageOf(descriptor, false));
+        Require(positions == Positions{0u, 0u, 2u, 2u} && slots == Slots{{0u, 0u}, {1u, 0u}, {0u, 2u}, {1u, 2u}}, std::string(gcn ? "under GCN guest shaders, " : "") + "the base and size leaves of a read-only table descriptor did not become positions bound to the descriptor word and to the flat word (" + std::to_string(positions.size()) + " positions)");
+        Require(counts.frozen == 1 && counts.unmapped == 0 && counts.unbound == 0 && counts.written == 0 && counts.mismatched == 0, std::string(gcn ? "under GCN guest shaders, " : "") + "the address high word of a table descriptor was not the one leaf left frozen");
+    }
+    ShaderRecompiler::SetGcnGuestShaders(false);
+
+    auto counts = place(TableStageOf(descriptor, true));
+    Require(positions.empty() && counts.written == 2, "the leaves of a descriptor the shader writes through became volatile positions");
+
+    auto changed = TableStageOf(descriptor, false);
+    changed.words[0] ^= 0x100u;
+    counts = place(changed);
+    Require(positions == Positions{2u, 2u} && counts.mismatched == 1, "a leaf whose captured word is not the bound descriptor word became a volatile position");
+
+    auto flat = TableStageOf(descriptor, false);
+    flat.bindings[1].guestDescriptor[2] ^= 1u;
+    counts = place(flat);
+    Require(positions == Positions{0u, 0u} && counts.mismatched == 1, "a leaf whose flat word differs from its captured word became a volatile position");
+
+    auto unbound = TableStageOf(descriptor, false);
+    unbound.sources = {5u};
+    counts = place(unbound);
+    Require(positions.empty() && counts.unbound == 2, "the leaves of a source no bound buffer element uses became volatile positions");
+
+    auto outside = TableStageOf(descriptor, false);
+    outside.leaves = {{0u, 0x9000u}, {2u, 0x800au}};
+    outside.flatOffsets = {0u, 2u};
+    counts = place(outside);
+    Require(positions.empty() && counts.unmapped == 2, "a leaf outside the stage's runs, or at an unaligned address, became a volatile position");
+
+    counts = place(TableStageOf({0x10000u, 0u, 0u, 0x20077facu}, false));
+    Require(positions.empty() && counts.mismatched == 2, "the leaves of an empty descriptor, whose size is zero, became volatile positions");
+    counts = place(TableStageOf({0u, 0u, 16u, 0x20077facu}, false));
+    Require(positions.empty() && counts.mismatched == 2, "the leaves of a null descriptor became volatile positions");
+}
+
+void PatchedDescriptorsKeepTheirSpecialization() {
+    ShaderRecompiler::SetGcnGuestShaders(false);
+    const std::vector<std::uint32_t> descriptor{0x10000u, 0u, 16u, 0x20077facu};
+    const auto stage = TableStageOf(descriptor, false);
+    std::vector<std::uint32_t> positions;
+    std::vector<std::array<std::uint32_t, 2>> slots;
+    static_cast<void>(AgcDriver::BufferWordPositions(stage.runs, stage.leaves, stage.flatOffsets, stage.words, stage.sources, stage.bindings, positions, slots));
+    const auto fresh = [&] {
+        auto compiled = std::make_shared<RecompileResult>();
+        compiled->bindings = stage.bindings;
+        auto variant = Variant(compiled);
+        variant->runs = stage.runs;
+        variant->words = stage.words;
+        variant->bufferPositions = positions;
+        variant->bufferSlots = slots;
+        variant->maskPositions = positions;
+        return variant;
+    };
+    using Live = std::vector<std::pair<std::uint32_t, std::uint32_t>>;
+    using Patches = std::vector<std::array<std::uint32_t, 3>>;
+    const auto patch = [&](const Live& live) {
+        const auto variant = fresh();
+        return DriverTestAccess::PatchBufferWords(*variant, live);
+    };
+
+    const auto moved = fresh();
+    Require(DriverTestAccess::PatchBufferWords(*moved, Live{{0u, 0x20000u}, {2u, 20u}}), "a base moved with the same alignment and a size with the same tail were refused");
+    Require(moved->words[0] == 0x20000u && moved->words[2] == 20u && moved->words[1] == descriptor[1], "the live words were not written into the copy's captured words");
+    Require(moved->descriptorPatches == Patches{{0u, 0u, 0x20000u}, {1u, 0u, 0x20000u}, {0u, 2u, 20u}, {1u, 2u, 20u}}, "the live words were not queued for the descriptor word and the flat word of their slot");
+    Driver::applyShaderDataPatches(*moved);
+    const auto& bound = moved->compiled->bindings[0].guestDescriptor;
+    const auto& flat = moved->compiled->bindings[1].guestDescriptor;
+    Require(bound == std::vector<std::uint32_t>{0x20000u, descriptor[1], 20u, descriptor[3]} && flat == std::vector<std::uint32_t>{0x20000u, descriptor[1], 20u, 0x99u}, "the patched stage does not hold the live base and size in its descriptor and in its flat words");
+
+    Require(!patch(Live{{0u, 0x20002u}}), "a base whose alignment changed was patched into a stage specialized for the remembered alignment");
+    Require(!patch(Live{{0u, 0u}}), "a base that became null was patched into a stage specialized for a present buffer");
+    Require(!patch(Live{{2u, 0u}}), "a size that became zero was patched into a stage specialized for a present buffer");
+    Require(!patch(Live{{2u, 18u}}), "a size whose byte count changed its tail was patched into a stage specialized for the remembered tail");
+    Require(!patch(Live{{1u, descriptor[1] | 1u}}), "the address high word, which is not a volatile position, was patched");
+    Require(!patch(Live{{4u, 1u}}), "a word that is no descriptor leaf was patched");
+    Require(patch(Live{}), "a stage without a live word was refused");
+
+    const auto tagged = fresh();
+    tagged->valueSlots = {{4u, 0u, 0u}, {6u, 0u, 2u}, {5u, 0u, 1u}};
+    tagged->valueWords = (1u << 4u) | (1u << 5u) | (1u << 6u);
+    Require(Driver::valueWordMoves(*tagged, 4u, 0x10000u, 0x30000u) && Driver::valueWordMoves(*tagged, 6u, 16u, 24u), "a tagged base moved with the same alignment, or a tagged size with the same tail, was refused");
+    Require(!Driver::valueWordMoves(*tagged, 4u, 0x10000u, 0x30002u), "a tagged base whose alignment changed was allowed: an entry relocated through an alias would keep a module specialized for the remembered alignment");
+    Require(!Driver::valueWordMoves(*tagged, 6u, 16u, 18u), "a tagged size whose byte count changed its tail was allowed");
+    Require(!Driver::valueWordMoves(*tagged, 4u, 0x10000u, 0u) && !Driver::valueWordMoves(*tagged, 6u, 16u, 0u), "a tagged base or size that became zero was allowed");
+    Require(!Driver::valueWordMoves(*tagged, 5u, 1u, 2u), "a tagged word bound to the address high word of a descriptor was allowed to move");
+    Require(!Driver::valueWordMoves(*tagged, 7u, 1u, 2u), "a word without a tagged descriptor slot was allowed to move");
+}
+
+void UserLeafWordsAreTaggedFromThePlan() {
+    ShaderRecompiler::SetGcnGuestShaders(false);
+    const std::vector<std::uint32_t> descriptor{0x10000u, 0u, 16u, 0x20077facu};
+    ShaderRecompiler::IrResourcePlan plan;
+    ShaderRecompiler::BufferResource buffer;
+    buffer.source = 0;
+    plan.info.buffers.push_back(buffer);
+    plan.descriptorUserWords = {0u, 4u, 1u, 5u, 2u, 6u};
+    DrawProgram program{};
+    program.binary.stage = ShaderRecompiler::ShaderStage::Fragment;
+    program.firstUserSgpr = 0;
+    program.userData = {0u, 0u, 0u, 0u, descriptor[0], descriptor[1], descriptor[2], descriptor[3]};
+    const auto fresh = [&](bool written) {
+        auto compiled = std::make_shared<RecompileResult>();
+        compiled->bindings.push_back(GuestBuffer(descriptor, written));
+        compiled->bindings.back().bufferResources = {0u};
+        auto variant = Variant(compiled);
+        variant->userWordsAsValue = (1u << 4u) | (1u << 5u) | (1u << 6u);
+        variant->userWordsWalked = variant->userWordsAsValue;
+        return variant;
+    };
+    const bool leaves = std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr;
+
+    const auto variant = fresh(false);
+    Driver::tagUserLeafWords(*variant, plan, program);
+    if (!leaves) {
+        Require(variant->valueWords == 0u && variant->valueSlots.empty(), "with the descriptor leaves off, a user word was tagged from the resource plan");
+        return;
+    }
+    Require(variant->valueWords == ((1u << 4u) | (1u << 6u)), "the base and the size a read-only descriptor takes from user words of their own were not the words tagged (mask " + std::to_string(variant->valueWords) + ")");
+    Require(variant->valueSlots.size() == 2u && variant->valueSlots[0] == std::array<std::uint32_t, 3>{4u, 0u, 0u} && variant->valueSlots[1] == std::array<std::uint32_t, 3>{6u, 0u, 2u}, "the tagged user words do not name their descriptor words");
+
+    const auto written = fresh(true);
+    Driver::tagUserLeafWords(*written, plan, program);
+    Require(written->valueWords == 0u, "a user word of a descriptor the shader writes through was tagged");
+
+    const auto pointer = fresh(false);
+    pointer->userWordsAsBase = 1u << 4u;
+    Driver::tagUserLeafWords(*pointer, plan, program);
+    Require(pointer->valueWords == (1u << 6u), "a user word the walk also reads through as a pointer was tagged as a buffer value (mask " + std::to_string(pointer->valueWords) + ")");
+
+    const auto unread = fresh(false);
+    unread->userWordsAsValue = 1u << 6u;
+    Driver::tagUserLeafWords(*unread, plan, program);
+    Require(unread->valueWords == (1u << 6u), "a user word the walk did not read as a value was tagged (mask " + std::to_string(unread->valueWords) + ")");
+
+    auto other = program;
+    other.userData[4] ^= 0x100u;
+    const auto mismatched = fresh(false);
+    Driver::tagUserLeafWords(*mismatched, plan, other);
+    Require(mismatched->valueWords == (1u << 6u), "a user word that is not the bound descriptor word was tagged (mask " + std::to_string(mismatched->valueWords) + ")");
+
+    ShaderRecompiler::IrResourcePlan elsewhere;
+    ShaderRecompiler::BufferResource apart;
+    apart.source = 3;
+    elsewhere.info.buffers.push_back(apart);
+    elsewhere.descriptorUserWords = plan.descriptorUserWords;
+    const auto unbound = fresh(false);
+    Driver::tagUserLeafWords(*unbound, elsewhere, program);
+    Require(unbound->valueWords == 0u, "the user words of a source no bound buffer element uses were tagged");
+}
+
 alignas(256) constexpr std::array<std::uint32_t, 16> VertexCode{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
     0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
@@ -295,14 +492,18 @@ int main() {
         CalleeWordsAreKeyedByTheirCode();
         BufferValueWordsArePatchedInTheirBinding();
         BufferValueWordsKeyByNothing();
+        TableLeavesBecomeBaseAndSizePositions();
+        PatchedDescriptorsKeepTheirSpecialization();
+        UserLeafWordsAreTaggedFromThePlan();
         {
             const auto device = OpenVulkanTestDevice();
             if (!device) return VulkanTestSkipped;
         }
+        const auto before = AgcDriver::DriverDetail::BufferWordTotals();
         MovedRecordCountsReachEveryDescriptor(true);
         MovedRecordCountsReachEveryDescriptor(false);
         const auto tagged = AgcDriver::DriverDetail::BufferWordTotals();
-        if (std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr) Require(tagged.userLeaves != 0 && tagged.userTagged != 0, "of " + std::to_string(tagged.userLeaves) + " descriptor dwords the resource plans of the drawn stages take from user words of their own, " + std::to_string(tagged.userTagged) + " were tagged as buffer values");
+        if (std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr) Require(tagged.userLeaves != before.userLeaves && tagged.userTagged != before.userTagged, "of " + std::to_string(tagged.userLeaves - before.userLeaves) + " descriptor dwords the resource plans of the drawn stages take from user words of their own, " + std::to_string(tagged.userTagged - before.userTagged) + " were tagged as buffer values");
         else Require(tagged.userTagged == 0, "with the descriptor leaves off, a user word was tagged from the resource plan");
         AgcDriverShutdown_nid_postfix();
         std::cout << "User-data V# values and fetch subroutine pointers relocate\n";

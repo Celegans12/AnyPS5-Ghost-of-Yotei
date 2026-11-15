@@ -1069,6 +1069,7 @@ int main() {
         const bool volatileBufferWords = std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr;
         if (volatileBufferWords) {
             BufferWordsFollowTables(enabled, verify);
+            VertexInputsFollowMovedTables(enabled, vertexInputs, verify, recipes);
         } else {
             RememberedDrawsAlternate(enabled, verify, recipes);
             VertexInputsFollowMovedTables(enabled, vertexInputs, verify, recipes);
