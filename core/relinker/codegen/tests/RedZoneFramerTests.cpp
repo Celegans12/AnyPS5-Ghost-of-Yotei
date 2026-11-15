@@ -325,15 +325,14 @@ void widensAShortFramePointerPrologue() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(report.Framed == 1 && report.FramedWithoutFramePointer == 0 && report.WidenedPrologues == 1 && report.WidenedExits == 1 && report.WidenedOperands == 0 && sites.size() == 2 && displacements.empty(), "a frame-pointer leaf without other pushes was not framed by widening its 4-byte prologue and 2-byte exit");
+    // Its 2-byte `pop rbp; ret` leaves through `leave` instead: the pop is rewritten in place.
+    const auto pop = 0x40 + framePrologue.size() + body.size();
+    require(report.Framed == 1 && report.FramedWithoutFramePointer == 0 && report.WidenedPrologues == 1 && report.WidenedExits == 0 && report.LeaveExits == 1 && report.WidenedOperands == 0 && sites.size() == 1, "a frame-pointer leaf without other pushes was not framed by widening its 4-byte prologue and leaving through `leave`");
+    require(displacements.size() == 1 && displacements[0].Offset == pop && displacements[0].Bytes == std::vector<std::uint8_t>{0xc9}, "the leaf's `pop rbp` was not rewritten to `leave`");
     std::vector<std::uint8_t> entryBody = framePrologue;
     append(entryBody, {0x48, 0x8d, 0x64, 0x24, 0x80});
     append(entryBody, StoreBelowPushes);
     require(sites[0].OriginalBytes.size() == framePrologue.size() + StoreBelowPushes.size() && sites[0].Body == stubBody(entryBody), "the store through rbp was not copied unchanged after rsp is lowered by the whole red zone");
-    std::vector<std::uint8_t> exitBody = LoadBelowPushes;
-    append(exitBody, {0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00});
-    append(exitBody, popRbpExit);
-    require(sites[1].OriginalBytes.size() == LoadBelowPushes.size() + popRbpExit.size() && sites[1].Body == stubBody(exitBody), "the load through rbp was not copied unchanged ahead of raising rsp and popping rbp");
 }
 
 void framesLeavesWithoutPushes() {
@@ -501,12 +500,11 @@ void framesFramePointerLeavesThatPushInTheirBody() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(report.Framed == 1 && report.FramedWithoutFramePointer == 0 && report.WidenedPrologues == 1 && report.WidenedExits == 1 && report.WidenedOperands == 0 && sites.size() == 2 && displacements.empty() && report.Skipped.empty(), "a frame-pointer leaf that pushes and pops rbx in its body was not framed");
+    require(report.Framed == 1 && report.FramedWithoutFramePointer == 0 && report.WidenedPrologues == 1 && report.WidenedExits == 0 && report.LeaveExits == 1 && report.WidenedOperands == 0 && sites.size() == 1 && displacements.size() == 1 && displacements[0].Bytes == std::vector<std::uint8_t>{0xc9} && report.Skipped.empty(), "a frame-pointer leaf that pushes and pops rbx in its body was not framed with a `leave` exit");
     std::vector<std::uint8_t> entryBody = framePrologue;
     append(entryBody, {0x48, 0x8d, 0x64, 0x24, 0x80});
     append(entryBody, StoreBelowPushes);
     require(sites[0].Body == stubBody(entryBody), "the store through rbp was not copied unchanged after rsp is lowered by the whole red zone");
-    require(sites[1].Body == stubBody({0x48, 0x01, 0xd0, 0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00, 0x5d, 0xc3}), "the add before pop rbp was not copied ahead of raising rsp");
 }
 
 void skipsOpcodeEncodedRspUses() {
@@ -872,15 +870,55 @@ void keepsLoopsAlignedAfterAJump() {
 }
 
 void leavesOtherFunctions() {
-    std::vector<std::uint8_t> nonLeaf = Prologue;
-    append(nonLeaf, StoreBelowPushes);
-    append(nonLeaf, {0xff, 0xd0});
-    append(nonLeaf, Exit);
-    const auto input = image({leaf(LoadAbovePushes), nonLeaf});
+    // Below its frame after a call: nothing can live there (the call itself writes below rsp).
+    std::vector<std::uint8_t> afterCall = Prologue;
+    append(afterCall, {0xff, 0xd0});
+    append(afterCall, StoreBelowPushes);
+    append(afterCall, Exit);
+    const auto input = image({leaf(LoadAbovePushes), afterCall});
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(sites.empty() && report.RedZoneFunctions == 0, "a leaf without red-zone use or a function that calls was framed");
+    require(sites.empty() && report.RedZoneFunctions == 0, "a leaf without red-zone use, or a function using the red zone only after a call, was framed");
+    // Below its frame before its first call (libc's bounds-checked copies): framed like a leaf.
+    std::vector<std::uint8_t> beforeCall = Prologue;
+    append(beforeCall, StoreBelowPushes);
+    append(beforeCall, LoadBelowPushes);
+    append(beforeCall, {0xff, 0xd0});
+    append(beforeCall, Exit);
+    const auto framed = image({beforeCall});
+    Codegen::RedZoneFrameReport framedReport;
+    std::vector<Codegen::RedZoneDisplacement> framedDisplacements;
+    const auto framedSites = Codegen::FrameRedZoneFunctions(framed.bytes, framed.segments, framed.functions, {}, framedReport, framedDisplacements);
+    require(framedReport.RedZoneFunctions == 1 && framedReport.Framed == 1 && framedReport.FramedWithCalls == 1 && !framedSites.empty(), "a frame-pointer function using the red zone before its first call was not framed");
+    // An `lea` below the frame before a call stores nothing (an alloca's new rsp, a biased array base).
+    std::vector<std::uint8_t> leaBeforeCall = Prologue;
+    append(leaBeforeCall, {0x48, 0x8d, 0x45, 0xe0, 0xff, 0xd0});
+    append(leaBeforeCall, Exit);
+    const auto addressed = image({leaBeforeCall});
+    Codegen::RedZoneFrameReport addressedReport;
+    std::vector<Codegen::RedZoneDisplacement> addressedDisplacements;
+    const auto addressedSites = Codegen::FrameRedZoneFunctions(addressed.bytes, addressed.segments, addressed.functions, {}, addressedReport, addressedDisplacements);
+    require(addressedSites.empty() && addressedReport.RedZoneFunctions == 0, "a function taking an address below its frame before a call was framed");
+}
+
+// Inline assembly calling a helper inside its own function (AES key expansion): the call keeps the
+// function a leaf and the helper's ret is not an exit.
+void framesLeavesCallingTheirOwnHelper() {
+    std::vector<std::uint8_t> function = FramelessPrologue;
+    append(function, StoreBelowRsp);
+    const auto call = function.size();
+    const auto helper = call + 5 + LoadBelowRsp.size() + FramelessExit.size();
+    append(function, callTo(call, helper));
+    append(function, LoadBelowRsp);
+    append(function, FramelessExit);
+    append(function, {0x48, 0x01, 0xd0, 0xc3});
+    const auto input = image({function});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.Framed == 1 && report.FramedWithCalls == 0 && report.Exits == 1 && sites.size() == 2, "a leaf calling its own helper was not framed with one exit");
+    require(sites[1].Address + sites[1].Length == Base + 0x40 + helper, "the leaf's exit is not the ret before its helper");
 }
 
 void skipsSitesTakenByOtherStubs() {
@@ -997,7 +1035,7 @@ void skipsModRmAndVectorRspOperands() {
         Codegen::RedZoneFrameReport report;
         std::vector<Codegen::RedZoneDisplacement> displacements;
         const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-        require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 2 && report.Framed == 0 && report.Skipped.at("other use of rsp") == 2,
+        require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 2 && report.Framed == 0 && (report.Skipped.contains("other use of rsp") ? report.Skipped.at("other use of rsp") : 0) + (report.Skipped.contains("other use of rsp in a relocated leaf") ? report.Skipped.at("other use of rsp in a relocated leaf") : 0) == 2,
                 "direct rsp operand case " + std::to_string(index) + " was framed");
     }
 }
@@ -1054,6 +1092,16 @@ void splitsCodeOutsideFunctionBounds() {
     require(pieces[0].Begin == Base + 0x10 && pieces[0].End == Base + 0x1b, "the caller outside function bounds was not split at its int3 padding");
     require(pieces[1].Begin == Base + 0x30 && pieces[1].End == Base + 0x3e, "a function with a nop inside was split at the nop, or nop padding made a function");
     require(pieces[2].Begin == Base + 0x3e && pieces[2].End == Base + 0x41, "a call target right after a ret was not split off");
+    // After a ret, code a branch before it reaches stays (a cold block); code none reaches starts a
+    // function (one that tests before its prologue).
+    bytes.resize(0x50);
+    append(bytes, {0x85, 0xc0, 0x74, 0x01, 0xc3, 0x31, 0xc0, 0xc3, 0x8b, 0x07, 0x85, 0xc0, 0xc3});
+    bytes = padTo(bytes, 0x70);
+    const std::vector<Domain::ProgramHeader> longer{{1, 5, 0, Base, Base, bytes.size(), bytes.size(), 16}};
+    const auto split = Codegen::SplitUncoveredCode(bytes, longer, {{Base, Base + 1}});
+    require(split.size() == 5, "code after a ret split into " + std::to_string(split.size() - 3) + " functions, not 2");
+    require(split[3].Begin == Base + 0x50 && split[3].End == Base + 0x58, "a cold block after a ret was split off its function");
+    require(split[4].Begin == Base + 0x58 && split[4].End == Base + 0x5d, "code no branch reaches after a ret did not start a function");
 }
 
 int main() {
@@ -1061,6 +1109,7 @@ int main() {
         splitsCodeOutsideFunctionBounds();
         framesRedZoneLeaf();
         leavesOtherFunctions();
+        framesLeavesCallingTheirOwnHelper();
         skipsSitesTakenByOtherStubs();
         framesLeafWithoutFramePointer();
         shiftsByTheDeepestOperandBelowRsp();

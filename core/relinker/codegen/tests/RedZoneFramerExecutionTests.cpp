@@ -241,6 +241,18 @@ std::vector<Leaf> framedLeaves() {
             0xff, 0xc9, 0x75, 0xed, 0x48, 0x8b, 0x54, 0x24, 0x38,
             0x48, 0x83, 0xc4, 0x40, 0x5b, 0x41, 0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3,
         }, 4 * (kB + 2 * kA)},
+        // libc's bounds-checked copy: a frame-pointer function that keeps [rbp-8] below rsp before
+        // its call (to a ret just past its end) and leaves by `pop rbp`, rewritten to `leave`.
+        {"frame-pointer function using the red zone before a call", {
+            0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0x7d, 0xf8, 0x48, 0x8b, 0x45, 0xf8, 0x48, 0x01, 0xf0,
+            0xe8, 0x02, 0x00, 0x00, 0x00, 0x5d, 0xc3,
+        }, kA + kB, true, {0xc3}},
+        // Inline-assembly AES key expansion: a leaf calling a helper inside its own bounds, with a
+        // value below rsp live across the call; the helper's ret is not an exit.
+        {"leaf calling its own helper", {
+            0x53, 0x48, 0x89, 0x7c, 0x24, 0xf0, 0xe8, 0x0a, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x44, 0x24, 0xf0,
+            0x48, 0x01, 0xf0, 0x5b, 0xc3, 0x31, 0xc9, 0xc3,
+        }, kA + kB},
         {"leaf transferring a red-zone spill through xmm4 with movq", frameless({
             0x48, 0x89, 0x7c, 0x24, 0xf0, 0xf3, 0x0f, 0x7e, 0x64, 0x24, 0xf0,
             0xf3, 0x0f, 0x7e, 0xc4, 0x66, 0x48, 0x0f, 0x7e, 0xc0,
@@ -579,7 +591,7 @@ Framing load(const Image& image, const bool frame) {
         }
         cursor = (cursor + 15) / 16 * 16;
         stubs[index] = base + cursor;
-        require(cursor + site.Body.size() <= kRunnerBase, "the stubs do not fit before the runner");
+        require(cursor + site.Body.size() <= kProbeBase, "the stubs do not fit before the calibration probe");
         auto* stub = arena + cursor;
         std::copy(site.Body.begin(), site.Body.end(), stub);
         Codegen::ApplyStubRelocations(std::span<std::uint8_t>(stub, site.ReturnBranchOffset), site.Relocations, site.Address, base + cursor, site.Offset);
@@ -686,7 +698,7 @@ void verifySkippedLeaves(const std::vector<Leaf>& leaves) {
     }
     require(framing.Report.RedZoneFunctions == leaves.size() && framing.Report.Framed == 0 && framing.Sites.empty() && framing.Displacements.empty(),
             "a leaf with a direct rsp operand was framed");
-    require(framing.Report.Skipped.at("other use of rsp") == leaves.size(),
+    require((framing.Report.Skipped.contains("other use of rsp") ? framing.Report.Skipped.at("other use of rsp") : 0) + (framing.Report.Skipped.contains("other use of rsp in a relocated leaf") ? framing.Report.Skipped.at("other use of rsp in a relocated leaf") : 0) == leaves.size(),
             "not every leaf with a direct rsp operand was skipped as another use of rsp");
 }
 
@@ -706,7 +718,8 @@ int main() {
         const auto backward = runLeaves(backwardStubbedLeaves());
         require(backward.OperandStubs == 2 && backward.StubbedOperands == 3 && backward.MovedOperands == 5, "the leaves comparing at rsp before a branch were framed with " + std::to_string(backward.OperandStubs) + " operand stubs carrying " + std::to_string(backward.StubbedOperands) + " rsp operands and " + std::to_string(backward.MovedOperands) + " moved in place, not 2 carrying 3 and 5");
         const auto widened = runLeaves(widenedLeaves());
-        require(widened.WidenedPrologues == 9 && widened.WidenedExits == 10 && widened.WidenedOperands == 13, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 9, 10 and 13");
+        // Two frame-pointer leaves that push only rbp leave through `leave` instead of widened exits.
+        require(widened.WidenedPrologues == 9 && widened.WidenedExits == 8 && widened.LeaveExits == 2 && widened.WidenedOperands == 13, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits, " + std::to_string(widened.LeaveExits) + " leave exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 9, 8, 2 and 13");
         const auto thunked = runLeaves(thunkLeaves());
         require(thunked.ReturnThunks == 6 && thunked.Exits == 0, "the leaves whose exits cannot be patched were framed with " + std::to_string(thunked.ReturnThunks) + " return thunks and " + std::to_string(thunked.Exits) + " exit stubs, not 6 and 0");
         const auto tailCalled = runLeaves(tailCallLeaves());
@@ -717,6 +730,7 @@ int main() {
         require(switched.Exits == 4 && switched.WidenedExits == 4, "the leaves with jump tables were framed with " + std::to_string(switched.Exits) + " exits, " + std::to_string(switched.WidenedExits) + " widened, not 4 and 4");
         const auto relocated = runLeaves(relocatedLeaves());
         require(relocated.Relocated == 9 && relocated.RelocatedCases == 2 && relocated.RelocatedOpenJumps == 0 && relocated.Skipped.empty(), "the leaves that cannot be framed in place were relocated " + std::to_string(relocated.Relocated) + " times with " + std::to_string(relocated.RelocatedCases) + " case jumps and " + std::to_string(relocated.RelocatedOpenJumps) + " open jumps and " + std::to_string(relocated.Skipped.size()) + " skip reasons, not 9, 2, 0 and 0");
+        verifySkippedLeaves(skippedDirectRspLeaves());
         std::cout << "red-zone framer execution tests passed\n";
         return 0;
     } catch (const SteppingDegraded& error) {
