@@ -478,7 +478,7 @@ public:
     }
 
     Counts Counted() const {
-        Counts counted{armed.load(std::memory_order_relaxed), arms.load(std::memory_order_relaxed), faults.load(std::memory_order_relaxed), quiet.load(std::memory_order_relaxed), rests.load(std::memory_order_relaxed), divergences.load(std::memory_order_relaxed), {}};
+        Counts counted{armed.load(std::memory_order_relaxed), arms.load(std::memory_order_relaxed), faults.load(std::memory_order_relaxed), quiet.load(std::memory_order_relaxed), rests.load(std::memory_order_relaxed), divergences.load(std::memory_order_relaxed), {}, 0, 0};
         for (std::size_t reason = 0; reason < left.size(); ++reason) counted.left[reason] = left[reason].load(std::memory_order_relaxed);
         counted.importArms = importArms.load(std::memory_order_relaxed);
         counted.gpuMarks = gpuMarks.load(std::memory_order_relaxed);
