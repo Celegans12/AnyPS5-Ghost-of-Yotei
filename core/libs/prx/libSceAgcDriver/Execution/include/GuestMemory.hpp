@@ -152,7 +152,26 @@ void AdoptLatestCollectEpoch();
 void AdoptCollectEpoch(std::uint64_t epoch);
 std::uint64_t HeldCollectEpoch();
 std::uint64_t ProofSerial();
-void BreakProofs();
+enum class ProofBreak : std::uint8_t { Store, Marked, Changed, GpuHold, Commit, WriteBack, CopiedWriters, Label, RecordedWork, Count };
+void BreakProofs(ProofBreak source);
+const char* ProofBreakName(ProofBreak source);
+struct ProofBreakCounts {
+    std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> breaks{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> serialMisses{};
+};
+ProofBreakCounts ProofBreaksCounted();
+void NoteSerialMiss();
+struct DirtyBlockCounts {
+    std::uint64_t distinct = 0;
+    std::uint64_t recurrent = 0;
+    std::uint64_t findings = 0;
+    std::uint64_t collectBytes = 0;
+    std::uint64_t collectDirtyBytes = 0;
+    std::uint64_t variantBytes = 0;
+    std::uint64_t variantDirtyBytes = 0;
+};
+DirtyBlockCounts TakeDirtyBlockCounts();
+void CountValidatedBytes(std::uint64_t address, std::size_t bytes);
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();

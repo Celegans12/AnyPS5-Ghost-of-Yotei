@@ -62,6 +62,39 @@ void CountVkDraw(VkDrawKind kind) {
     vkDrawCounts[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
 }
 
+struct DrawSites {
+    AgcDriver::Mutex mutex;
+    std::unordered_map<std::uint64_t, std::uint64_t> lastByShape;
+    std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> shaped{0};
+    std::atomic<std::uint64_t> seen{0};
+    std::atomic<std::uint64_t> stable{0};
+};
+
+DrawSites& drawSites() {
+    static auto* sites = new DrawSites;
+    return *sites;
+}
+
+bool drawSiteStats() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return stats;
+}
+
+std::uint64_t& recordedDrawSite() {
+    static thread_local std::uint64_t site = 0;
+    return site;
+}
+
+void noteRecordedDrawSite(const void* resources, const void* pipeline, const void* framebuffer) {
+    if (!drawSiteStats()) return;
+    std::uint64_t site = 0x9E3779B97F4A7C15ull;
+    for (const auto* part : {resources, pipeline, framebuffer}) {
+        site ^= static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(part)) + 0x9E3779B97F4A7C15ull + (site << 6) + (site >> 2);
+    }
+    recordedDrawSite() = site | 1u;
+}
+
 
 bool DrawFaultTokens() {
     static const bool enabled = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr;
@@ -2744,7 +2777,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
             resources->WriteBackBuffers();
         });
         writers->push_back(resources);
-        GuestMemory::BreakProofs();
+        GuestMemory::BreakProofs(GuestMemory::ProofBreak::CopiedWriters);
     } else if (completion) {
         if (use != nullptr) recorder.OnComplete([resources, use] { resources->CompleteDrawUse(*use); });
         else if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
@@ -2981,6 +3014,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     std::uint32_t subdraw = 0;
     auto* recorder = record.recorder;
     auto& resources = *record.resources;
+    noteRecordedDrawSite(record.resources.get(), record.pipeline.get(), record.framebuffer.get());
     const auto* args = record.indirect != nullptr ? record.indirect->args : nullptr;
     const bool gpuIndirect = args != nullptr && record.indirect->path == IndirectDrawPath::Gpu;
     using CommandClass = Recorder::CommandClass;
@@ -4760,6 +4794,28 @@ VkDrawCounts TakeVkDrawCounts() {
     counts.indirect = vkDrawCounts[static_cast<std::size_t>(VkDrawKind::Indirect)].exchange(0, std::memory_order_relaxed);
     counts.mesh = vkDrawCounts[static_cast<std::size_t>(VkDrawKind::Mesh)].exchange(0, std::memory_order_relaxed);
     return counts;
+}
+
+void NoteDrawSite(std::uint64_t shape) {
+    if (!drawSiteStats()) return;
+    const auto site = std::exchange(recordedDrawSite(), 0);
+    if (site == 0) return;
+    auto& sites = drawSites();
+    sites.draws.fetch_add(1, std::memory_order_relaxed);
+    if (shape == 0) return;
+    sites.shaped.fetch_add(1, std::memory_order_relaxed);
+    std::lock_guard lock(sites.mutex);
+    if (sites.lastByShape.size() >= 65536u) sites.lastByShape.clear();
+    const auto [entry, inserted] = sites.lastByShape.try_emplace(shape, site);
+    if (inserted) return;
+    sites.seen.fetch_add(1, std::memory_order_relaxed);
+    if (entry->second == site) sites.stable.fetch_add(1, std::memory_order_relaxed);
+    entry->second = site;
+}
+
+DrawSiteCounts TakeDrawSiteCounts() {
+    auto& sites = drawSites();
+    return {sites.draws.exchange(0, std::memory_order_relaxed), sites.shaped.exchange(0, std::memory_order_relaxed), sites.seen.exchange(0, std::memory_order_relaxed), sites.stable.exchange(0, std::memory_order_relaxed)};
 }
 
 }

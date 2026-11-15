@@ -1519,6 +1519,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     phaseTiming.Phase(DrawRowVectors);
     if (recipe != nullptr) {
         if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, recipeOrigin) == RecipeOutcome::Recorded) {
+            Graphics::NoteDrawSite(tail.shapeKey);
             phaseTiming.Phase(DrawRowGraphics);
             timing.Mark("draw_and_resource_release");
             return drawn();
@@ -1528,6 +1529,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, tail.shapeKey);
+    Graphics::NoteDrawSite(tail.shapeKey);
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr && ownKey != 0) attachDrawRecipe(ownKey, recipeStages, built);
     if (built != nullptr) attachDrawRecipe(recipeKey, recipeStages, std::move(built), recipeDonor, recipeOrigin);
@@ -1617,11 +1619,15 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(stages, queue);
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, origin) == RecipeOutcome::Recorded) return;
+        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, origin) == RecipeOutcome::Recorded) {
+            Graphics::NoteDrawSite(shape);
+            return;
+        }
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape);
+    Graphics::NoteDrawSite(shape);
     if (built != nullptr && ownKey != 0) attachDrawRecipe(ownKey, recipeStages, built);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor, origin);
 }

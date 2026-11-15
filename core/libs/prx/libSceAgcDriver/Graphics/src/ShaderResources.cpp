@@ -4212,6 +4212,7 @@ void NoteDrawProofProved(DrawProofKind kind) {
 
 void NoteDrawProofMissed(DrawProofKind kind, DrawProofMiss miss) {
     drawProofCounters(kind).missed[static_cast<std::size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
+    if (miss == DrawProofMiss::Serial) GuestMemory::NoteSerialMiss();
 }
 
 void NoteDrawProofVerified(DrawProofKind kind, bool differing, bool stored, const char* what) {
@@ -7595,7 +7596,7 @@ void ShaderResources::WriteBack() {
     } catch (const BdaUnalignedAccess&) {
         unaligned = std::current_exception();
     }
-    if (!guestMemory.Writes().empty() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end() || (usesBda && !bdaReadOnly)) GuestMemory::BreakProofs();
+    if (!guestMemory.Writes().empty() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end() || (usesBda && !bdaReadOnly)) GuestMemory::BreakProofs(GuestMemory::ProofBreak::WriteBack);
     if (!SkipWriteBack()) {
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (!storageWritten[index] || storageTextures[index] == nullptr) continue;

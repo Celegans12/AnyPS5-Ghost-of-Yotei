@@ -1344,6 +1344,71 @@ struct WindowCopy {
 void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_t generation);
 #endif
 
+bool pipelineStats() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    return stats;
+}
+
+std::uint64_t statsEpoch();
+
+struct DirtyBlocks {
+    static constexpr std::size_t Slots = 65536;
+    std::array<std::atomic<std::uint64_t>, Slots> blocks{};
+    std::array<std::atomic<std::uint64_t>, Slots> slices{};
+    std::array<std::atomic<std::uint64_t>, Slots> epochs{};
+    std::array<std::atomic<std::uint64_t>, Slots> repeats{};
+    std::atomic<std::uint64_t> slice{2};
+    std::atomic<std::uint64_t> distinct{0};
+    std::atomic<std::uint64_t> recurrent{0};
+    std::atomic<std::uint64_t> findings{0};
+    std::atomic<std::uint64_t> collectBytes{0};
+    std::atomic<std::uint64_t> collectDirtyBytes{0};
+    std::atomic<std::uint64_t> variantBytes{0};
+    std::atomic<std::uint64_t> variantDirtyBytes{0};
+
+    void note(std::uint64_t block, std::uint64_t epoch) {
+        const auto now = slice.load(std::memory_order_relaxed);
+        const auto slot = block % Slots;
+        const bool same = blocks[slot].load(std::memory_order_relaxed) == block + 1;
+        const auto last = same ? slices[slot].load(std::memory_order_relaxed) : 0;
+        if (last == now && epochs[slot].load(std::memory_order_relaxed) == epoch) return;
+        findings.fetch_add(1, std::memory_order_relaxed);
+        if (last != now) {
+            distinct.fetch_add(1, std::memory_order_relaxed);
+            blocks[slot].store(block + 1, std::memory_order_relaxed);
+            slices[slot].store(now, std::memory_order_relaxed);
+        } else if (repeats[slot].load(std::memory_order_relaxed) != now) {
+            recurrent.fetch_add(1, std::memory_order_relaxed);
+            repeats[slot].store(now, std::memory_order_relaxed);
+        }
+        epochs[slot].store(epoch, std::memory_order_relaxed);
+    }
+
+    std::uint64_t dirtyBytes(std::uint64_t address, std::size_t bytes) const {
+        if (bytes == 0) return 0;
+        const auto now = slice.load(std::memory_order_relaxed);
+        const auto end = address + bytes;
+        std::uint64_t dirty = 0;
+        for (auto block = address / WriteBlockBytes; block <= (end - 1) / WriteBlockBytes; ++block) {
+            if (blocks[block % Slots].load(std::memory_order_relaxed) != block + 1 || slices[block % Slots].load(std::memory_order_relaxed) + 1 < now) continue;
+            dirty += std::min<std::uint64_t>(end, (block + 1) * WriteBlockBytes) - std::max<std::uint64_t>(address, block * WriteBlockBytes);
+        }
+        return dirty;
+    }
+};
+
+DirtyBlocks& dirtyBlocks() {
+    static auto* blocks = new DirtyBlocks;
+    return *blocks;
+}
+
+void countCollectedBytes(std::uint64_t address, std::size_t bytes) {
+    if (!pipelineStats() || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
+    auto& dirty = dirtyBlocks();
+    dirty.collectBytes.fetch_add(bytes, std::memory_order_relaxed);
+    dirty.collectDirtyBytes.fetch_add(dirty.dirtyBytes(address, bytes), std::memory_order_relaxed);
+}
+
 struct WriteTracker {
     AgcDriver::Mutex mutex;
     bool initialized = false;
@@ -1827,6 +1892,7 @@ struct WriteTracker {
             coarse = std::max(coarse, stampGeneration);
         }
         if (cpu) leaf.cpuBlocks[block % LeafBlocks] = stampGeneration;
+        if (pipelineStats() && (kind == StampKind::Cpu || kind == StampKind::Fresh)) dirtyBlocks().note(blockBegin(block) / WriteBlockBytes, statsEpoch());
         if (stored) bumpSubscriptions(blockBegin(block), WriteBlockBytes, kind == StampKind::Driver ? WriteBumpSource::Driver : WriteBumpSource::Cpu);
     }
 };
@@ -1931,6 +1997,11 @@ std::atomic<void (*)(int)> observationHook{nullptr};
 std::uint64_t currentCollectEpoch() {
     if (const auto epoch = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get(); epoch != 0) return epoch;
     return nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
+}
+
+std::uint64_t statsEpoch() {
+    if (const auto epoch = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get(); epoch != 0) return epoch;
+    return nextCollectEpoch.load(std::memory_order_acquire);
 }
 
 bool collectMemoEnabled() {
@@ -2090,6 +2161,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     using Status = Observation::Status;
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return {Status::Uncovered, 0};
+    countCollectedBytes(address, bytes);
     auto& tracker = Tracker();
     constexpr std::uint64_t page = 4096;
     const auto first = address & ~(page - 1);
@@ -2320,8 +2392,56 @@ std::uint64_t ProofSerial() {
     return proofSerial.load(std::memory_order_acquire);
 }
 
-void BreakProofs() {
+namespace {
+constexpr std::size_t ProofBreakSources = static_cast<std::size_t>(ProofBreak::Count);
+std::array<std::atomic<std::uint64_t>, ProofBreakSources> proofBreaks{};
+std::array<std::atomic<std::uint64_t>, ProofBreakSources> serialMisses{};
+std::atomic<std::uint8_t> lastProofBreak{0};
+constexpr std::array<const char*, ProofBreakSources> ProofBreakNames{"store", "marked", "changed", "gpu lock", "commit", "write-back", "copied writers", "label", "recorded work"};
+}
+
+void BreakProofs(ProofBreak source) {
     proofSerial.fetch_add(1, std::memory_order_acq_rel);
+    proofBreaks[static_cast<std::size_t>(source)].fetch_add(1, std::memory_order_relaxed);
+    lastProofBreak.store(static_cast<std::uint8_t>(source), std::memory_order_relaxed);
+}
+
+const char* ProofBreakName(ProofBreak source) {
+    return static_cast<std::size_t>(source) < ProofBreakNames.size() ? ProofBreakNames[static_cast<std::size_t>(source)] : "?";
+}
+
+ProofBreakCounts ProofBreaksCounted() {
+    ProofBreakCounts counts;
+    for (std::size_t i = 0; i < ProofBreakSources; ++i) {
+        counts.breaks[i] = proofBreaks[i].load(std::memory_order_relaxed);
+        counts.serialMisses[i] = serialMisses[i].load(std::memory_order_relaxed);
+    }
+    return counts;
+}
+
+void NoteSerialMiss() {
+    serialMisses[lastProofBreak.load(std::memory_order_relaxed) % ProofBreakSources].fetch_add(1, std::memory_order_relaxed);
+}
+
+DirtyBlockCounts TakeDirtyBlockCounts() {
+    auto& dirty = dirtyBlocks();
+    DirtyBlockCounts counts;
+    counts.distinct = dirty.distinct.exchange(0, std::memory_order_relaxed);
+    counts.recurrent = dirty.recurrent.exchange(0, std::memory_order_relaxed);
+    counts.findings = dirty.findings.exchange(0, std::memory_order_relaxed);
+    counts.collectBytes = dirty.collectBytes.exchange(0, std::memory_order_relaxed);
+    counts.collectDirtyBytes = dirty.collectDirtyBytes.exchange(0, std::memory_order_relaxed);
+    counts.variantBytes = dirty.variantBytes.exchange(0, std::memory_order_relaxed);
+    counts.variantDirtyBytes = dirty.variantDirtyBytes.exchange(0, std::memory_order_relaxed);
+    dirty.slice.fetch_add(1, std::memory_order_relaxed);
+    return counts;
+}
+
+void CountValidatedBytes(std::uint64_t address, std::size_t bytes) {
+    if (!pipelineStats() || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
+    auto& dirty = dirtyBlocks();
+    dirty.variantBytes.fetch_add(bytes, std::memory_order_relaxed);
+    dirty.variantDirtyBytes.fetch_add(dirty.dirtyBytes(address, bytes), std::memory_order_relaxed);
 }
 
 void MarkProofThread() {
@@ -2689,7 +2809,7 @@ void SetOwnStoreCompare(bool compare) {
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, bool imaged, const std::function<std::pair<std::uint64_t, std::uint64_t>(std::span<std::byte>)>& store, bool complete = true) {
     if (bytes == 0) return 0;
     const auto pinned = pinStoreRanges(address, bytes);
-    BreakProofs();
+    BreakProofs(ProofBreak::Store);
     noteDriverStore(address, bytes);
     const auto stampStored = [complete](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
@@ -2757,7 +2877,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
-    BreakProofs();
+    BreakProofs(ProofBreak::Marked);
     noteDriverStore(address, bytes);
     auto& tracker = Tracker();
     auto lock = lockTracker(tracker);
@@ -3153,7 +3273,7 @@ void GpuMutexType::acquired() {
     owner.store(CurrentThreadToken(), std::memory_order_relaxed);
     if (++depth == 1) {
         gpuHoldSerial.fetch_add(1, std::memory_order_relaxed);
-        if (!proofThread) BreakProofs();
+        if (!proofThread) BreakProofs(ProofBreak::GpuHold);
     }
 }
 
@@ -3739,7 +3859,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
 
 static void writeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, [[maybe_unused]] std::uint32_t byteStoreLimit, bool keepGuest) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(ProofBreak::Changed);
     if (current.empty()) return;
     // A store: the hook sync it makes orders this write after a pending GPU write, whatever a read
     // site above it was doing (the [hooksync] line counts stores apart).
@@ -3804,7 +3924,7 @@ static_assert(std::atomic_ref<std::uint64_t>::is_always_lock_free && std::atomic
 
 std::size_t WriteChangedIfHeld(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original, std::uint64_t unchangedSince) {
     require(current.size() == original.size(), "write-back snapshot sizes differ");
-    BreakProofs();
+    BreakProofs(ProofBreak::Changed);
     if (current.empty()) return 0;
     const ReadSiteScope site(ReadSite::Store);
     FlushGpuWrites(address, current.size());

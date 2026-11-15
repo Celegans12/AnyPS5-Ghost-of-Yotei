@@ -440,11 +440,31 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     }
     AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
     const auto vk = Graphics::TakeVkDrawCounts();
-    AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.Take()), static_cast<unsigned long long>(drawKeysSameAsPrevious.Take()), static_cast<unsigned long long>(drawKeysSeenRecently.Take()), static_cast<unsigned long long>(drawShapesSameAsPrevious.Take()), static_cast<unsigned long long>(drawShapesSeenRecently.Take()));
+    const auto sites = Graphics::TakeDrawSiteCounts();
+    AgcDriver::ProfilePrint_nid_no_patch("[vkdraw] (10 s): %llu vkCmdDraw, %llu vkCmdDrawIndexed, %llu vkCmdDrawIndirect calls, %llu mesh; draw keys %llu, same as the previous draw %llu, seen within the last 4096 draws %llu; draw shapes (state without per-draw user words) same as the previous %llu, seen within the last 4096 %llu; recorded draws %llu, %llu with a shape, %llu of a shape seen before, %llu of them with the shape's last resources template, pipeline and framebuffer\n", static_cast<unsigned long long>(vk.direct), static_cast<unsigned long long>(vk.indexed), static_cast<unsigned long long>(vk.indirect), static_cast<unsigned long long>(vk.mesh), static_cast<unsigned long long>(drawKeys.Take()), static_cast<unsigned long long>(drawKeysSameAsPrevious.Take()), static_cast<unsigned long long>(drawKeysSeenRecently.Take()), static_cast<unsigned long long>(drawShapesSameAsPrevious.Take()), static_cast<unsigned long long>(drawShapesSeenRecently.Take()), static_cast<unsigned long long>(sites.draws), static_cast<unsigned long long>(sites.shaped), static_cast<unsigned long long>(sites.seen), static_cast<unsigned long long>(sites.stable));
     static GuestMemory::CollectCounts reportedCollects{};
     const auto collects = GuestMemory::CollectCounted();
     AgcDriver::ProfilePrint_nid_no_patch("[collects] (10 s): %llu GetWriteWatch calls, %llu of them on the committer; %llu collect epochs; %llu collect-memo hits\n", static_cast<unsigned long long>(collects.watchCalls - reportedCollects.watchCalls), static_cast<unsigned long long>(collects.committerWatchCalls - reportedCollects.committerWatchCalls), static_cast<unsigned long long>(collects.epochBumps - reportedCollects.epochBumps), static_cast<unsigned long long>(collects.memoHits - reportedCollects.memoHits));
     reportedCollects = collects;
+    const auto dirty = GuestMemory::TakeDirtyBlockCounts();
+    const auto share = [](std::uint64_t part, std::uint64_t whole) { return whole == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(whole); };
+    AgcDriver::ProfilePrint_nid_no_patch("[dirty] (10 s): %llu distinct 64 KiB blocks found written by the CPU, %llu of them in more than one collect epoch, %llu (block, epoch) findings; collects %.1f MiB, %.1f %% in blocks written in this or the previous 10 s; variant validations %.1f MiB, %.1f %% in such blocks\n", static_cast<unsigned long long>(dirty.distinct), static_cast<unsigned long long>(dirty.recurrent), static_cast<unsigned long long>(dirty.findings), static_cast<double>(dirty.collectBytes) / 1048576.0, share(dirty.collectDirtyBytes, dirty.collectBytes), static_cast<double>(dirty.variantBytes) / 1048576.0, share(dirty.variantDirtyBytes, dirty.variantBytes));
+    static Graphics::DrawProofCounts reportedProofs{};
+    const auto proofs = Graphics::DrawProofCounted();
+    static GuestMemory::ProofBreakCounts reportedBreaks{};
+    const auto breaks = GuestMemory::ProofBreaksCounted();
+    std::string breakText;
+    for (std::size_t i = 0; i < breaks.breaks.size(); ++i) {
+        const auto count = breaks.breaks[i] - reportedBreaks.breaks[i];
+        const auto missed = breaks.serialMisses[i] - reportedBreaks.serialMisses[i];
+        if (count == 0 && missed == 0) continue;
+        char item[96];
+        std::snprintf(item, sizeof(item), " %s %llu (%llu serial misses after it)", GuestMemory::ProofBreakName(static_cast<GuestMemory::ProofBreak>(i)), static_cast<unsigned long long>(count), static_cast<unsigned long long>(missed));
+        breakText += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[proofs] (10 s): %s; breaks:%s\n", Graphics::DrawProofText(proofs, reportedProofs).c_str(), breakText.c_str());
+    reportedProofs = proofs;
+    reportedBreaks = breaks;
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};
     drainWaitNs = {};
@@ -479,7 +499,7 @@ void DrawPipeline::run() {
         bool shutdown = false;
         try {
             if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofs();
+            if (!isDraw) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Commit);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

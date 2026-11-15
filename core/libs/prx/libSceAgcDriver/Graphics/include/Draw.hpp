@@ -21,6 +21,14 @@ struct VkDrawCounts {
     std::uint64_t mesh = 0;
 };
 VkDrawCounts TakeVkDrawCounts();
+struct DrawSiteCounts {
+    std::uint64_t draws = 0;
+    std::uint64_t shaped = 0;
+    std::uint64_t seen = 0;
+    std::uint64_t stable = 0;
+};
+void NoteDrawSite(std::uint64_t shape);
+DrawSiteCounts TakeDrawSiteCounts();
 
 struct HostImport;
 
