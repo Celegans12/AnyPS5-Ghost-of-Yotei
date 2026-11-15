@@ -270,6 +270,9 @@ public:
     // submitted (0: today's render fence wait before the flip completes, 1 default, 2; larger
     // values are refused; 0 when APS5_SYNC_FLIP is set).
     static std::size_t FlipInFlight();
+    enum class FlipCompletion { Gpu, Guest, Queue };
+    static FlipCompletion ConfiguredFlipCompletion();
+    std::optional<std::uint64_t> GuestWorkSerial() const;
     double RetirePresents(std::size_t keepInFlight);
     // Whether presenting `buffer` will use the single scaler source, staging or upload objects (a
     // GPU frame dump, the guest-memory path, a source-size change) while an in-flight blit still
@@ -294,7 +297,7 @@ public:
     // (APS5_FLIP_READ_CHECK=1) and found overwritten before the blit's fence.
     struct PresentStatistics {
         std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten, acquireDrops, planes, keyWriterWaits;
-        double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs, keyWriterWaitMs;
+        double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs, keyWriterWaitMs, queuePresentMs;
     };
     static PresentStatistics PresentCounts();
     static std::uint64_t FillCompletionSyncCount();

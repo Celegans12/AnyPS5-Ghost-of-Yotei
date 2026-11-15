@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -104,10 +106,14 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     std::shared_ptr<VulkanDevice> presenting;
     timing.Mark("validate");
     try {
+        static const auto completion = VulkanDevice::ConfiguredFlipCompletion();
         bool submitted = false;
         bool presentable = false;
         bool trailing = false;
         bool queueUnlocked = false;
+        bool early = false;
+        bool blitted = false;
+        std::uint64_t guestWork = 0;
         double waitedMs = 0;
         {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
@@ -150,6 +156,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 submitted = presenting->PresentClear(window.width, window.height, opaque, plane);
                 timing.Mark("present_clear");
             }
+            blitted = submitted;
             if (submitted && syncFlip) {
                 waitedMs = presenting->FinishPresent();
                 timing.Mark("render_fence_wait");
@@ -163,6 +170,12 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                     timing.Mark("queue_present");
                 }
                 trailing = !syncFlip;
+                early = trailing && plane == nullptr && completion != VulkanDevice::FlipCompletion::Gpu;
+                if (early && completion == VulkanDevice::FlipCompletion::Guest) {
+                    const auto newest = presenting->GuestWorkSerial();
+                    early = newest.has_value();
+                    guestWork = newest.value_or(0);
+                }
                 submitted = false;
             }
         }
@@ -170,7 +183,16 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             presenting->QueuePresent();
             timing.Mark("queue_present");
         }
-        if (trailing) {
+        if (trailing && early) {
+            if (guestWork != 0) {
+                const auto waitStart = std::chrono::steady_clock::now();
+                presenting->WaitRecorded(guestWork);
+                waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
+                timing.Mark("guest_work_wait");
+            }
+            waitedMs += presenting->RetirePresents(1);
+            timing.Mark("render_fence_wait");
+        } else if (trailing) {
             waitedMs += presenting->FinishPresent();
             timing.Mark("render_fence_wait");
         }
@@ -186,6 +208,10 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 presenting->QueuePresent();
             }
             timing.Mark("queue_present");
+        }
+        if (!blitted && completion != VulkanDevice::FlipCompletion::Gpu) {
+            waitedMs += presenting->RetirePresents(0);
+            timing.Mark("render_fence_wait");
         }
         gpuReady(context);
         timing.Mark("release_and_callback");

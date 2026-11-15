@@ -4521,6 +4521,22 @@ std::size_t VulkanDevice::FlipInFlight() {
     return count;
 }
 
+VulkanDevice::FlipCompletion VulkanDevice::ConfiguredFlipCompletion() {
+    static const FlipCompletion mode = [] {
+        const char* value = std::getenv("APS5_FLIP_COMPLETION");
+        if (value == nullptr || *value == '\0' || std::strcmp(value, "gpu") == 0) return FlipCompletion::Gpu;
+        if (std::strcmp(value, "guest") == 0) return FlipCompletion::Guest;
+        if (std::strcmp(value, "queue") == 0) return FlipCompletion::Queue;
+        throw std::runtime_error(std::string("APS5_FLIP_COMPLETION=") + value + " is refused: use gpu, guest or queue");
+    }();
+    return mode;
+}
+
+std::optional<std::uint64_t> VulkanDevice::GuestWorkSerial() const {
+    if (!CanWaitUnlocked()) return std::nullopt;
+    return state->recorder->NewestGuestWork();
+}
+
 std::uint64_t VulkanDevice::UpscaledPresents() {
     return upscaledPresents.load(std::memory_order_relaxed);
 }
@@ -4601,7 +4617,9 @@ void VulkanDevice::QueuePresent() {
     present.pImageIndices = &index;
     std::unique_lock presentQueueLock(state->presentQueueMutex, std::defer_lock);
     if (state->presentQueue != VK_NULL_HANDLE) presentQueueLock.lock();
+    const auto queuedAt = std::chrono::steady_clock::now();
     const auto presented = state->DeviceFunction<PFN_vkQueuePresentKHR>("vkQueuePresentKHR")(state->presentQueue != VK_NULL_HANDLE ? state->presentQueue : state->queue, &present);
+    presentCounters.queuePresentMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - queuedAt).count();
     if (presented == VK_ERROR_OUT_OF_DATE_KHR) state->extent = {0, 0};
     else if (presented != VK_SUBOPTIMAL_KHR) check(presented, "vkQueuePresentKHR");
     if (state->queueGuestFrame && (presented == VK_SUCCESS || presented == VK_SUBOPTIMAL_KHR)) LibcRunReportFramePresented_nid_no_patch();
