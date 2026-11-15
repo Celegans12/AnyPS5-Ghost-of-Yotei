@@ -614,14 +614,7 @@ private:
     // layer, a CPU write or another image's store then costs the blocks it touched, moved through
     // windows of their (layer, mip) slices (whole tile blocks in whole rows, see
     // TextureDetiler::DetileWindow), not the surface. The last unit may be short.
-    // At a base that is not a 64 KiB base (`unitLead` = base % 64 KiB, block units only) the
-    // first unit is the short piece before the first block boundary, so every unit still lies in
-    // one stamp block and unit k is block k of the surface.
-    std::uint64_t unitOffset(std::uint32_t unit) const { return unit == 0 ? 0 : static_cast<std::uint64_t>(unit) * trackedLayerBytes - unitLead; }
-    std::uint64_t layerBytes(std::uint32_t layer) const { return std::min<std::uint64_t>(guestBytes, static_cast<std::uint64_t>(layer + 1u) * trackedLayerBytes - unitLead) - unitOffset(layer); }
-    // The unit holding a surface-relative offset, and one past the last unit of a range ending at `end`.
-    std::uint32_t unitAt(std::uint64_t offset) const { return static_cast<std::uint32_t>((offset + unitLead) / trackedLayerBytes); }
-    std::uint32_t unitsEnd(std::uint64_t end) const { return static_cast<std::uint32_t>(std::min<std::uint64_t>((end + unitLead + trackedLayerBytes - 1) / trackedLayerBytes, trackedLayers)); }
+    std::uint64_t layerBytes(std::uint32_t layer) const { return std::min<std::uint64_t>(trackedLayerBytes, guestBytes - static_cast<std::uint64_t>(layer) * trackedLayerBytes); }
     // Contiguous runs of the selected units, surface-relative [begin, end).
     std::vector<std::pair<std::uint64_t, std::uint64_t>> unitRuns(const std::vector<bool>& units) const;
     struct SliceWindow {
@@ -701,7 +694,7 @@ private:
     // bytes were last known to match the image at, and a pending layer holds results (a clear, a
     // shader write, a device copy) guest memory has not received. `generation` stays the oldest
     // layer generation (the whole-surface fast check), `dirty` whether any layer is pending.
-    std::uint64_t layerBegin(std::uint32_t layer) const { return descriptor.baseAddress + unitOffset(layer); }
+    std::uint64_t layerBegin(std::uint32_t layer) const { return descriptor.baseAddress + static_cast<std::uint64_t>(layer) * trackedLayerBytes; }
     bool anyLayerPending() const;
     bool refresh(std::uint32_t firstLayer, std::uint32_t lastLayer);
     void noteLayersBehind(std::uint32_t firstLayer, std::uint32_t lastLayer, const std::vector<bool>& outside);
@@ -828,7 +821,6 @@ private:
     std::uint64_t generation = 0;
     std::uint32_t trackedLayers = 1;
     std::uint64_t trackedLayerBytes = 0;
-    std::uint64_t unitLead = 0;
     std::vector<std::uint64_t> layerGeneration;
     std::vector<std::uint64_t> layerPendingSince;
     std::vector<std::uint64_t> completionKept;

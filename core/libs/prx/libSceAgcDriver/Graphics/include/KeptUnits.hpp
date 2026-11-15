@@ -12,16 +12,13 @@ struct UnitLayout {
     std::uint64_t base = 0;
     std::uint64_t unitBytes = 0;
     std::uint64_t totalBytes = 0;
-    // Bytes the first unit is short by (a surface whose base is not a unit boundary).
-    std::uint64_t lead = 0;
 
     std::uint64_t Begin(std::uint32_t unit) const {
-        return base + (unit == 0 ? 0 : static_cast<std::uint64_t>(unit) * unitBytes - lead);
+        return base + static_cast<std::uint64_t>(unit) * unitBytes;
     }
 
     std::uint64_t End(std::uint32_t unit) const {
-        const auto begin = Begin(unit);
-        return begin + std::min<std::uint64_t>(unit == 0 ? unitBytes - lead : unitBytes, totalBytes - (begin - base));
+        return Begin(unit) + std::min<std::uint64_t>(unitBytes, totalBytes - static_cast<std::uint64_t>(unit) * unitBytes);
     }
 };
 
