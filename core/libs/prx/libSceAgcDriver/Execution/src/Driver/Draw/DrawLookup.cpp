@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
@@ -210,72 +211,106 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 }
             }
             drawHit = !miss;
-            std::lock_guard cacheLock(drawCacheMutex);
-            auto& counters = drawEntryCounters;
-            counters.stageValidations += stageValidations;
-            counters.stageEqual += stageEqual;
-            counters.variantsCompared += compared;
+            bool rotate = false;
             if (drawHit) {
-                ++counters.hits;
-                counters.stageDataHits += dataStages;
-                counters.stageDataWords += dataWords;
-                if (registerKey) ++counters.registerKeyHits;
-                ++drawCacheHits;
-                drawCacheUseful().fetch_add(1, std::memory_order_relaxed);
-                bool rotate = false;
                 for (std::size_t i = 0; i < programs.size(); ++i) {
-                    if (matched[i] == nullptr) continue;
-                    ++counters.variantHitsByRank[ranks[i]];
-                    if (ranks[i] != 0) rotate = true;
+                    if (matched[i] != nullptr && ranks[i] != 0) rotate = true;
                 }
-
-                const auto again = drawCache.find(drawKey);
-                if (again != drawCache.end() && again->second == entry) {
-                    if (rotate) {
-                        auto rotated = std::make_shared<DrawEntry>();
-                        rotated->decode = entry->decode;
-                        rotated->stages = entry->stages;
-                        rotated->shape = entry->shape;
-                        rotated->recipes.store(entry->recipes.load());
-                        for (std::size_t i = 0; i < programs.size(); ++i) {
-                            if (ranks[i] == 0) continue;
-                            auto& variants = rotated->stages[i];
-                            variants.erase(variants.begin() + static_cast<std::ptrdiff_t>(ranks[i]));
-                            variants.insert(variants.begin(), !patchedFrom.empty() && patchedFrom[i] != nullptr ? patchedFrom[i] : matched[i]);
-                        }
-                        rotated->touched = entry->touched;
-                        rotated->order = entry->order;
-                        again->second = std::move(rotated);
-                    }
-                    if (drawCacheHits - again->second->touched > drawCacheEntries() / 8) {
-                        drawOrder.splice(drawOrder.begin(), drawOrder, again->second->order);
-                        again->second->touched = drawCacheHits;
-                        ++counters.touches;
-                    }
-                }
-                if (verifyDrawEntries()) {
-                    ++counters.verifyHits;
-                    verifyHit = true;
-                    drawHit = false;
-                }
-                if (dataStages != 0 && verifyDrawDataHits()) drawHit = false;
-                if (bufferStages != 0 && verifyDrawDataHits()) {
-                    drawHit = false;
-                    for (std::size_t i = 0; i < programs.size(); ++i) {
-                        if (patchedFrom[i] != nullptr) dataCandidates[i].push_back({matched[i], matchedRegions[i], drawKey, 0, DrawShapeReuse::EqualWords, false, patchedFrom[i].get()});
-                    }
-                }
-            } else {
-                ++counters.misses[static_cast<std::size_t>(*miss)];
-                if (registerKey && entry->decode != nullptr) ++counters.decodePartial;
             }
-            if (profile) {
+            std::unique_lock cacheLock(drawCacheMutex, std::try_to_lock);
+            if (!cacheLock.owns_lock() && (profile || !unblockedDrawHits() || verifyDrawEntries() || verifyDrawDataHits())) {
+                const auto waitFrom = std::chrono::steady_clock::now();
+                cacheLock.lock();
+                DrawFinisher::NoteCacheWait(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitFrom).count()));
+            }
+            if (!cacheLock.owns_lock()) {
+                auto& overflow = drawLookupOverflow;
+                const auto add = [](std::atomic<std::uint64_t>& counter, std::uint64_t value) { counter.fetch_add(value, std::memory_order_relaxed); };
+                add(overflow.stageValidations, stageValidations);
+                add(overflow.stageEqual, stageEqual);
+                add(overflow.variantsCompared, compared);
+                if (drawHit) {
+                    add(overflow.hits, 1);
+                    add(overflow.stageDataHits, dataStages);
+                    add(overflow.stageDataWords, dataWords);
+                    if (registerKey) add(overflow.registerKeyHits, 1);
+                    add(overflow.cacheHits, 1);
+                    drawCacheUseful().fetch_add(1, std::memory_order_relaxed);
+                    for (std::size_t i = 0; i < programs.size(); ++i) {
+                        if (matched[i] != nullptr) add(overflow.variantHitsByRank[ranks[i]], 1);
+                    }
+                } else {
+                    add(overflow.misses[static_cast<std::size_t>(*miss)], 1);
+                    if (registerKey && entry->decode != nullptr) add(overflow.decodePartial, 1);
+                }
+                overflow.pending.fetch_add(1, std::memory_order_release);
+                DrawFinisher::NoteUnlockedHit();
+            } else {
+                foldDrawLookupOverflow();
+                auto& counters = drawEntryCounters;
+                counters.stageValidations += stageValidations;
+                counters.stageEqual += stageEqual;
+                counters.variantsCompared += compared;
+                if (drawHit) {
+                    ++counters.hits;
+                    counters.stageDataHits += dataStages;
+                    counters.stageDataWords += dataWords;
+                    if (registerKey) ++counters.registerKeyHits;
+                    ++drawCacheHits;
+                    drawCacheUseful().fetch_add(1, std::memory_order_relaxed);
+                    for (std::size_t i = 0; i < programs.size(); ++i) {
+                        if (matched[i] == nullptr) continue;
+                        ++counters.variantHitsByRank[ranks[i]];
+                    }
 
-                phaseTiming.Phase(DrawRowKeyLookupValidate);
-                const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBeforeValidate, phaseMs[DrawRowKeyLookupValidate]);
-                phaseMs[DrawRowKeyLookupValidate] -= waited;
-                phaseMs[DrawRowValidateWait] += waited;
-                counters.validateUs += phaseMs[DrawRowKeyLookupValidate] * 1000;
+                    const auto again = drawCache.find(drawKey);
+                    if (again != drawCache.end() && again->second == entry) {
+                        if (rotate) {
+                            auto rotated = std::make_shared<DrawEntry>();
+                            rotated->decode = entry->decode;
+                            rotated->stages = entry->stages;
+                            rotated->shape = entry->shape;
+                            rotated->recipes.store(entry->recipes.load());
+                            for (std::size_t i = 0; i < programs.size(); ++i) {
+                                if (ranks[i] == 0) continue;
+                                auto& variants = rotated->stages[i];
+                                variants.erase(variants.begin() + static_cast<std::ptrdiff_t>(ranks[i]));
+                                variants.insert(variants.begin(), !patchedFrom.empty() && patchedFrom[i] != nullptr ? patchedFrom[i] : matched[i]);
+                            }
+                            rotated->touched = entry->touched;
+                            rotated->order = entry->order;
+                            again->second = std::move(rotated);
+                        }
+                        if (drawCacheHits - again->second->touched > drawCacheEntries() / 8) {
+                            drawOrder.splice(drawOrder.begin(), drawOrder, again->second->order);
+                            again->second->touched = drawCacheHits;
+                            ++counters.touches;
+                        }
+                    }
+                    if (verifyDrawEntries()) {
+                        ++counters.verifyHits;
+                        verifyHit = true;
+                        drawHit = false;
+                    }
+                    if (dataStages != 0 && verifyDrawDataHits()) drawHit = false;
+                    if (bufferStages != 0 && verifyDrawDataHits()) {
+                        drawHit = false;
+                        for (std::size_t i = 0; i < programs.size(); ++i) {
+                            if (patchedFrom[i] != nullptr) dataCandidates[i].push_back({matched[i], matchedRegions[i], drawKey, 0, DrawShapeReuse::EqualWords, false, patchedFrom[i].get()});
+                        }
+                    }
+                } else {
+                    ++counters.misses[static_cast<std::size_t>(*miss)];
+                    if (registerKey && entry->decode != nullptr) ++counters.decodePartial;
+                }
+                if (profile) {
+
+                    phaseTiming.Phase(DrawRowKeyLookupValidate);
+                    const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBeforeValidate, phaseMs[DrawRowKeyLookupValidate]);
+                    phaseMs[DrawRowKeyLookupValidate] -= waited;
+                    phaseMs[DrawRowValidateWait] += waited;
+                    counters.validateUs += phaseMs[DrawRowKeyLookupValidate] * 1000;
+                }
             }
         } else if (drawShapeUserWords() && !dataEntries.empty() && graphics.stages.path == Graphics::ShaderPath::Vertex) {
             constexpr std::size_t MaxRefusals = 2;

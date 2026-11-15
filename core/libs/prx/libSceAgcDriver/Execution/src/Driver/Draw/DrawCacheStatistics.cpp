@@ -15,11 +15,36 @@ void Driver::traceInsert(std::unordered_set<std::uint64_t>& set, std::uint64_t k
     set.insert(key);
 }
 
+bool Driver::unblockedDrawHits() {
+    static const bool enabled = std::getenv("APS5_NO_UNBLOCKED_DRAW_HITS") == nullptr;
+    return enabled;
+}
+
+void Driver::foldDrawLookupOverflow() {
+    auto& overflow = drawLookupOverflow;
+    if (overflow.pending.load(std::memory_order_acquire) == 0) return;
+    overflow.pending.store(0, std::memory_order_release);
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return counter.exchange(0, std::memory_order_acq_rel); };
+    auto& counters = drawEntryCounters;
+    counters.stageValidations += take(overflow.stageValidations);
+    counters.stageEqual += take(overflow.stageEqual);
+    counters.variantsCompared += take(overflow.variantsCompared);
+    counters.hits += take(overflow.hits);
+    counters.stageDataHits += take(overflow.stageDataHits);
+    counters.stageDataWords += take(overflow.stageDataWords);
+    counters.registerKeyHits += take(overflow.registerKeyHits);
+    counters.decodePartial += take(overflow.decodePartial);
+    drawCacheHits += take(overflow.cacheHits);
+    for (std::size_t i = 0; i < overflow.misses.size(); ++i) counters.misses[i] += take(overflow.misses[i]);
+    for (std::size_t i = 0; i < overflow.variantHitsByRank.size(); ++i) counters.variantHitsByRank[i] += take(overflow.variantHitsByRank[i]);
+}
+
 void Driver::maybeReportDrawCache(bool profile) {
     auto& counters = drawEntryCounters;
     if (!profile && !traceDrawCache()) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - counters.lastReport < std::chrono::seconds(10)) return;
+    foldDrawLookupOverflow();
     reportDrawCache(counters, profile);
     counters.lastReport = now;
 }
@@ -44,6 +69,7 @@ void Driver::reportDrawCache(DrawEntryCounters& counters, bool profile) {
 
 DrawEntryCounters Driver::DrawCacheCounters() {
     std::lock_guard cacheLock(drawCacheMutex);
+    foldDrawLookupOverflow();
     return drawEntryCounters;
 }
 
@@ -55,7 +81,8 @@ Driver::DispatchCacheFootprint Driver::DrawCacheSize() {
 OverlayDriverCounters Driver::OverlayCounters() {
     OverlayDriverCounters counters{flipsCounted.load(std::memory_order_relaxed), std::nullopt};
     std::unique_lock cacheLock(drawCacheMutex, std::try_to_lock);
-    if (cacheLock.owns_lock()) counters.drawCache = OverlayHits{drawEntryCounters.lookups, drawEntryCounters.hits};
+    if (cacheLock.owns_lock()) foldDrawLookupOverflow();
+    if (cacheLock.owns_lock()) counters.drawCache =OverlayHits{drawEntryCounters.lookups, drawEntryCounters.hits};
     return counters;
 }
 

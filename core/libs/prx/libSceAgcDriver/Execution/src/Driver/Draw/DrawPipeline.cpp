@@ -259,7 +259,7 @@ std::array<std::atomic<std::uint64_t>, DrawFinisher::MaxThreads> poolBusyNs{};
 std::atomic<std::int64_t> poolReportedAt{0};
 
 struct alignas(64) ThreadTally {
-    std::atomic<std::uint64_t> jobs{0}, idleNs{0}, turns{0}, turnNs{0}, outputNs{0}, lookups{0}, lookupNs{0}, cacheWaits{0}, cacheWaitNs{0};
+    std::atomic<std::uint64_t> jobs{0}, idleNs{0}, turns{0}, turnNs{0}, outputNs{0}, lookups{0}, lookupNs{0}, cacheWaits{0}, cacheWaitNs{0}, unlockedHits{0};
 };
 std::array<ThreadTally, DrawFinisher::MaxThreads + 1> threadTallies{};
 
@@ -280,7 +280,7 @@ DrawFinisher::PoolCounts DrawFinisher::PoolCounted() {
 DrawFinisher::ThreadCounts DrawFinisher::ThreadCounted(unsigned index) {
     const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
     const auto& tally = threadTallies[std::min(index, OtherThreads)];
-    return {load(tally.jobs), index < MaxThreads ? load(poolBusyNs[index]) : 0, load(tally.idleNs), load(tally.turns), load(tally.turnNs), load(tally.outputNs), load(tally.lookups), load(tally.lookupNs), load(tally.cacheWaits), load(tally.cacheWaitNs)};
+    return {load(tally.jobs), index < MaxThreads ? load(poolBusyNs[index]) : 0, load(tally.idleNs), load(tally.turns), load(tally.turnNs), load(tally.outputNs), load(tally.lookups), load(tally.lookupNs), load(tally.cacheWaits), load(tally.cacheWaitNs), load(tally.unlockedHits)};
 }
 
 bool DrawFinisher::Timed() {
@@ -300,23 +300,27 @@ void DrawFinisher::NoteCacheWait(std::uint64_t nanoseconds) {
     tally.cacheWaitNs.fetch_add(nanoseconds, std::memory_order_relaxed);
 }
 
+void DrawFinisher::NoteUnlockedHit() {
+    ownTally().unlockedHits.fetch_add(1, std::memory_order_relaxed);
+}
+
 std::string DrawFinisher::LookupText() {
     static std::mutex reportMutex;
     static std::array<ThreadCounts, MaxThreads + 1> reported{};
     std::lock_guard lock(reportMutex);
     const auto since = [](std::uint64_t current, std::uint64_t previous) { return static_cast<unsigned long long>(current - previous); };
     const auto milliseconds = [](std::uint64_t current, std::uint64_t previous) { return static_cast<double>(current - previous) / 1e6; };
-    std::string text = "; per finisher thread (lookups in ms, waits for the draw cache lock in ms):";
+    std::string text = "; per finisher thread (lookups in ms, waits for the draw cache lock in ms, lookups counted without that lock):";
     for (unsigned index = 0; index < Threads(); ++index) {
         const auto counted = ThreadCounted(index);
         char item[96];
-        std::snprintf(item, sizeof(item), " %llu in %.1f, %llu in %.2f;", since(counted.lookups, reported[index].lookups), milliseconds(counted.lookupNs, reported[index].lookupNs), since(counted.cacheWaits, reported[index].cacheWaits), milliseconds(counted.cacheWaitNs, reported[index].cacheWaitNs));
+        std::snprintf(item, sizeof(item), " %llu in %.1f, %llu in %.2f, %llu;", since(counted.lookups, reported[index].lookups), milliseconds(counted.lookupNs, reported[index].lookupNs), since(counted.cacheWaits, reported[index].cacheWaits), milliseconds(counted.cacheWaitNs, reported[index].cacheWaitNs), since(counted.unlockedHits, reported[index].unlockedHits));
         text += item;
         reported[index] = counted;
     }
     const auto others = ThreadCounted(OtherThreads);
-    char item[96];
-    std::snprintf(item, sizeof(item), " other threads waited %llu times for the draw cache lock in %.2f ms", since(others.cacheWaits, reported[OtherThreads].cacheWaits), milliseconds(others.cacheWaitNs, reported[OtherThreads].cacheWaitNs));
+    char item[160];
+    std::snprintf(item, sizeof(item), " other threads waited %llu times for the draw cache lock in %.2f ms and counted %llu lookups without it", since(others.cacheWaits, reported[OtherThreads].cacheWaits), milliseconds(others.cacheWaitNs, reported[OtherThreads].cacheWaitNs), since(others.unlockedHits, reported[OtherThreads].unlockedHits));
     text += item;
     reported[OtherThreads] = others;
     return text;

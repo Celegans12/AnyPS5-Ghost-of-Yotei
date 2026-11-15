@@ -209,6 +209,12 @@ struct DrawEntryCounters {
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
+struct DrawLookupOverflow {
+    std::atomic<std::uint64_t> pending{0}, stageValidations{0}, stageEqual{0}, variantsCompared{0}, hits{0}, stageDataHits{0}, stageDataWords{0}, registerKeyHits{0}, decodePartial{0}, cacheHits{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawMiss::Count)> misses{};
+    std::array<std::atomic<std::uint64_t>, MaxDispatchVariants> variantHitsByRank{};
+};
+
 class DrawKeySightings {
 public:
     static constexpr std::size_t Ways = 4;

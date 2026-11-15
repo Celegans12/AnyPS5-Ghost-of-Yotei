@@ -203,12 +203,14 @@ public:
         std::uint64_t lookupNs = 0;
         std::uint64_t cacheWaits = 0;
         std::uint64_t cacheWaitNs = 0;
+        std::uint64_t unlockedHits = 0;
     };
     static constexpr unsigned OtherThreads = MaxThreads;
     static ThreadCounts ThreadCounted(unsigned index);
     static bool Timed();
     static void NoteLookup(std::uint64_t nanoseconds);
     static void NoteCacheWait(std::uint64_t nanoseconds);
+    static void NoteUnlockedHit();
     static std::string LookupText();
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
