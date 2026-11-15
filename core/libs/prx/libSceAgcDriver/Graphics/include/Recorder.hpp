@@ -262,6 +262,8 @@ public:
     static void SetLeanCommitForTest(int lean);
     std::size_t OpenKeptObjects() const { return open != nullptr ? open->kept.size() : 0; }
     std::size_t OpenCompletions() const { return open != nullptr ? open->completions.size() : 0; }
+    const std::shared_ptr<void>* OpenDrawArena() const { return open != nullptr && open->drawArena != nullptr ? &open->drawArena : nullptr; }
+    void KeepDrawArena(std::shared_ptr<void> arena);
     enum class UploadScratch : std::uint8_t { Tiled = 0, Linear, Count };
     std::shared_ptr<DeviceBuffer> UploadScratchBuffer(UploadScratch kind, std::size_t bytes);
     static constexpr VkPipelineStageFlags UploadScratchReuseStages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -819,6 +821,7 @@ private:
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
         const void* lastKeptOwner = nullptr;
+        std::shared_ptr<void> drawArena;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;

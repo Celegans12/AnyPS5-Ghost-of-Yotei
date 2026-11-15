@@ -7254,6 +7254,11 @@ bool ShaderResources::LayoutUpdateAfterBind() const {
 }
 
 ShaderResources::DrawBindings::~DrawBindings() {
+    Release();
+}
+
+void ShaderResources::DrawBindings::Release() noexcept {
+    snapshots.clear();
     if (cache == nullptr) return;
     const auto release = [&](VkDescriptorSetLayout setLayout, const DescriptorCache::SetAllocation& set) {
         if (set.set == VK_NULL_HANDLE) return;
@@ -7262,6 +7267,91 @@ ShaderResources::DrawBindings::~DrawBindings() {
     };
     release(layout, allocation);
     release(fragmentLayout, fragmentAllocation);
+    cache = nullptr;
+    layout = VK_NULL_HANDLE;
+    fragmentLayout = VK_NULL_HANDLE;
+    allocation = {};
+    fragmentAllocation = {};
+}
+
+namespace {
+
+struct DrawBindingsArena {
+    static constexpr std::size_t ChunkItems = 32;
+    std::vector<std::unique_ptr<ShaderResources::DrawBindings[]>> chunks;
+    std::size_t used = 0;
+    ShaderResources::DrawBindings& Next() {
+        if (used == chunks.size() * ChunkItems) chunks.push_back(std::make_unique<ShaderResources::DrawBindings[]>(ChunkItems));
+        auto& item = chunks[used / ChunkItems][used % ChunkItems];
+        ++used;
+        return item;
+    }
+    void Reset() noexcept {
+        for (std::size_t index = 0; index < used; ++index) chunks[index / ChunkItems][index % ChunkItems].Release();
+        used = 0;
+    }
+};
+
+struct DrawBindingsPool {
+    static constexpr std::size_t SpareArenas = 64;
+    AgcDriver::Mutex mutex;
+    std::vector<std::unique_ptr<DrawBindingsArena>> spare;
+    std::atomic<std::uint64_t> arenasMade{0};
+    std::atomic<std::uint64_t> arenasReused{0};
+    std::atomic<std::uint64_t> served{0};
+};
+
+DrawBindingsPool& drawBindingsPool() {
+    static auto* pool = new DrawBindingsPool;
+    return *pool;
+}
+
+std::shared_ptr<DrawBindingsArena> takeDrawBindingsArena() {
+    auto& pool = drawBindingsPool();
+    std::unique_ptr<DrawBindingsArena> arena;
+    {
+        std::lock_guard lock(pool.mutex);
+        if (!pool.spare.empty()) {
+            arena = std::move(pool.spare.back());
+            pool.spare.pop_back();
+        }
+    }
+    if (arena != nullptr) {
+        pool.arenasReused.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        arena = std::make_unique<DrawBindingsArena>();
+        pool.arenasMade.fetch_add(1, std::memory_order_relaxed);
+    }
+    return std::shared_ptr<DrawBindingsArena>(arena.release(), [](DrawBindingsArena* done) {
+        std::unique_ptr<DrawBindingsArena> owned(done);
+        owned->Reset();
+        auto& home = drawBindingsPool();
+        std::lock_guard lock(home.mutex);
+        if (home.spare.size() >= DrawBindingsPool::SpareArenas) return;
+        try {
+            home.spare.push_back(std::move(owned));
+        } catch (...) {
+        }
+    });
+}
+
+std::shared_ptr<ShaderResources::DrawBindings> pooledDrawBindings(Recorder& recorder) {
+    const auto* held = recorder.OpenDrawArena();
+    if (held == nullptr) {
+        recorder.KeepDrawArena(takeDrawBindingsArena());
+        held = recorder.OpenDrawArena();
+    }
+    auto* arena = static_cast<DrawBindingsArena*>(held->get());
+    auto& item = arena->Next();
+    drawBindingsPool().served.fetch_add(1, std::memory_order_relaxed);
+    return std::shared_ptr<ShaderResources::DrawBindings>(*held, &item);
+}
+
+}
+
+ShaderResources::DrawBindingsPoolCounts ShaderResources::DrawBindingsPooled() {
+    const auto& pool = drawBindingsPool();
+    return {pool.arenasMade.load(std::memory_order_relaxed), pool.arenasReused.load(std::memory_order_relaxed), pool.served.load(std::memory_order_relaxed)};
 }
 
 std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData) const {
@@ -7445,15 +7535,26 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
     const auto maxSnapshotBytes = maxDrawSnapshotBytes;
     const auto uploadLimit = DrawUploadLimit();
     std::size_t totalSnapshotBytes = 0;
-    auto result = std::make_shared<DrawBindings>();
+    const bool pooled = Recorder::LeanCommit();
+    std::shared_ptr<DrawBindings> result;
+    if (!pooled) result = std::make_shared<DrawBindings>();
+    thread_local std::vector<DrawBindings::Snapshot>* pendingSlot = nullptr;
+    auto& pending = pooled ? ShaderRecompiler::ThreadOwned(pendingSlot) : result->snapshots;
+    struct Dropped {
+        std::vector<DrawBindings::Snapshot>* list;
+        ~Dropped() {
+            if (list != nullptr) list->clear();
+        }
+    } dropped{pooled ? &pending : nullptr};
+    if (pooled) pending.clear();
     thread_local std::vector<std::size_t>* selectedSlot = nullptr;
     auto& selected = ShaderRecompiler::ThreadOwned(selectedSlot);
     selected.clear();
     std::array<std::uint64_t, 3> stamp{};
     bool stamped = false;
     const auto keep = [&](DrawBindings::Snapshot snapshot) {
-        if (result->snapshots.empty()) result->snapshots.reserve(allocations.size());
-        result->snapshots.push_back(std::move(snapshot));
+        if (pending.empty()) pending.reserve(allocations.size());
+        pending.push_back(std::move(snapshot));
     };
     const auto toldInData = [&](const MovedBuffer& entry, std::size_t data) {
         const auto& element = allocations[entry.allocation];
@@ -7555,8 +7656,12 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty() && !rebound) return {};
+    if (pooled) {
+        result = pooledDrawBindings(recorder);
+        std::swap(result->snapshots, pending);
+    }
     writeDrawSets(*result, selected, faultRecord);
-    recorder.Keep(result);
+    if (!pooled) recorder.Keep(result);
     for (const auto& snapshot : result->snapshots) {
         if (snapshot.buffer != nullptr) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
     }

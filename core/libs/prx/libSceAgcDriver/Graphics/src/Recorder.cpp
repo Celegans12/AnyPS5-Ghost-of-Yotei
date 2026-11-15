@@ -3698,6 +3698,12 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     open->keptBytes += bytes;
 }
 
+void Recorder::KeepDrawArena(std::shared_ptr<void> arena) {
+    ensureOpen();
+    open->kept.push_back(arena);
+    open->drawArena = std::move(arena);
+}
+
 void Recorder::KeepThroughHold(std::shared_ptr<void> object) {
     GuestMemory::AssertGpuLockHeld("Recorder::KeepThroughHold");
     if (const auto hold = GuestMemory::GpuHoldSerial(); hold != holdKeptSerial) {

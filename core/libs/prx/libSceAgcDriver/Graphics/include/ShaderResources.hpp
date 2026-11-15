@@ -277,8 +277,15 @@ public:
         DescriptorCache::SetAllocation fragmentAllocation;
         DescriptorCache::SetAllocation allocation;
         std::vector<Snapshot> snapshots;
+        void Release() noexcept;
         ~DrawBindings();
     };
+    struct DrawBindingsPoolCounts {
+        std::uint64_t arenasMade = 0;
+        std::uint64_t arenasReused = 0;
+        std::uint64_t served = 0;
+    };
+    static DrawBindingsPoolCounts DrawBindingsPooled();
     struct MovedBuffer {
         std::size_t allocation;
         std::uint64_t address;
