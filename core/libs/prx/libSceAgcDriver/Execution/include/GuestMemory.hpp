@@ -205,6 +205,7 @@ struct CollectCounts {
     std::uint64_t pageQuiet = 0;
     std::uint64_t pageRests = 0;
     std::uint64_t pageDivergences = 0;
+    std::array<std::uint64_t, 4> pageLeft{};
 };
 CollectCounts CollectCounted();
 void ReportCollectCosts();

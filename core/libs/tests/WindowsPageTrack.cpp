@@ -276,14 +276,16 @@ void CheckGuards(bool resident) {
     Require(track.StateOf(memory.Block(4)) == State::Unarmed && memory.Protection(4, 0) == PAGE_READWRITE && memory.Protection(4, 1) == PAGE_READONLY && memory.Protection(4, 2) == PAGE_READWRITE, kind + ": a guest protection change did not reopen the block and protect exactly its range");
     Require(!track.HandleWrite(memory.Block(4) + PageBytes + 5), kind + ": a write to memory the guest made read-only was taken for a tracked write");
     Require(mappings.Protect(memory.Block(4) + PageBytes, PageBytes, PAGE_READWRITE, true) && memory.Protection(4, 1) == PAGE_READWRITE, kind + ": restoring the guest protection failed");
-    arm(4);
-    Require(mappings.Protect(memory.Block(4), BlockBytes, PAGE_READWRITE, true) && open(4), kind + ": a guest protection change to read-write left the block armed");
+    Require(!track.Armable(memory.Block(4)), kind + ": a block the guest gave another protection can be armed again");
+    arm(18);
+    Require(mappings.Protect(memory.Block(18), BlockBytes, PAGE_READWRITE, true) && open(18) && track.Armable(memory.Block(18)), kind + ": a guest protection change to read-write left the block armed or barred it");
 
     if (!resident) {
         arm(5);
         mappings.Commit(memory.data + 5 * BlockBytes, BlockBytes, PAGE_READONLY, BlockBytes, true);
         Require(track.StateOf(memory.Block(5)) == State::Unarmed && memory.Protection(5) == PAGE_READONLY && !track.HandleWrite(memory.Block(5) + 5), kind + ": committing over an armed block with a new protection kept it tracked");
         mappings.Commit(memory.data + 5 * BlockBytes, BlockBytes, PAGE_READWRITE, BlockBytes, true);
+        Require(!track.Armable(memory.Block(5)), kind + ": a block committed again with another protection can be armed");
     }
 
     arm(6);
@@ -408,8 +410,8 @@ void CheckCollectRace(bool resident) {
     constexpr std::size_t Writers = 8;
     constexpr std::size_t Blocks = 32;
     constexpr std::size_t Pages = Blocks * BlockPages;
-    constexpr std::size_t Trials = 600;
-    constexpr std::size_t Burst = 3;
+    constexpr std::size_t Trials = 1800;
+    constexpr std::size_t Burst = 6;
     auto& track = Track::Get();
     Guest memory(resident, Blocks * BlockBytes);
     const auto counter = [&](std::size_t page) { return reinterpret_cast<std::uint64_t*>(memory.data + page * PageBytes); };
@@ -427,7 +429,7 @@ void CheckCollectRace(bool resident) {
                     if (stop.load(std::memory_order_acquire)) return;
                     YieldProcessor();
                 }
-                for (std::size_t write = 0; write < Burst; ++write) {
+                for (std::size_t write = 0; write < Burst && current % 6 == 0; ++write) {
                     const auto page = (random() % (Pages / Writers)) * Writers + writer;
                     auto* value = static_cast<volatile std::uint64_t*>(counter(page));
                     *value = *value + 1;
@@ -444,7 +446,7 @@ void CheckCollectRace(bool resident) {
     for (std::size_t current = 1; current <= Trials; ++current) {
         track.AdvancePeriod();
         trial.store(current, std::memory_order_release);
-        collect();
+        for (std::size_t pass = 0; pass < 8; ++pass) collect();
         while (finished.load(std::memory_order_acquire) != current * Writers) collect();
         collect();
         for (std::size_t page = 0; page < Pages; ++page) {
@@ -507,36 +509,50 @@ void CheckHot(bool resident) {
     Settle(memory, Blocks);
     Require(all().empty() && track.Counted().armed == Blocks, kind + ": the blocks were not armed");
     const auto rests = track.Counted().rests;
-    const auto frame = [&](bool write) {
-        if (write) memory.Write(3, 0, 1);
+    std::size_t writes = 0;
+    for (std::size_t frame = 0; frame < 8; ++frame) {
+        all();
+        if (track.Clean(memory.Block(3))) {
+            memory.Write(3, 0, 1);
+            ++writes;
+        }
         all();
         track.AdvancePeriod();
-    };
-    for (std::size_t round = 0; round < 3; ++round) {
-        all();
-        Require(track.Clean(memory.Block(3)), kind + ": the block was not armed before round " + std::to_string(round));
-        frame(true);
-        frame(false);
     }
-    Require(track.Faults(memory.Block(3)) == Track::HotFrames && track.Counted().rests == rests + 1, kind + ": a block that faulted in 3 of 8 frames was not put to rest");
-    for (std::size_t later = 0; later < 20; ++later) frame(later % 2 == 0);
-    Require(track.Faults(memory.Block(3)) == Track::HotFrames && !track.Clean(memory.Block(3)) && track.Clean(memory.Block(2)) && track.Clean(memory.Block(4)), kind + ": a resting block was armed again, or its neighbours were not kept armed");
-    for (std::size_t later = 0; later < Track::RestFrames; ++later) frame(false);
+    Require(writes == Track::HotFrames && track.Faults(memory.Block(3)) == Track::HotFrames && track.Counted().rests == rests + 1, kind + ": a block written as soon as it is armed did not fault in 3 of 8 frames and rest, after waits of 1, 2 and 4 frames");
+    for (std::size_t frame = 0; frame < Track::RestFrames - 8; ++frame) {
+        all();
+        Require(!track.Clean(memory.Block(3)), kind + ": a resting block was armed again");
+        track.AdvancePeriod();
+    }
+    Require(track.Clean(memory.Block(2)) && track.Clean(memory.Block(4)), kind + ": the neighbours of a resting block were not kept armed");
+    for (std::size_t frame = 0; frame < 16; ++frame) {
+        all();
+        track.AdvancePeriod();
+    }
     all();
     Require(track.Clean(memory.Block(3)), kind + ": a block was not armed again after its rest");
-    frame(true);
+    memory.Write(3, 0, 2);
+    all();
     Require(track.Faults(memory.Block(3)) == Track::HotFrames + 1, kind + ": a block armed after its rest did not fault on a write");
 
     const auto before = track.Faults(memory.Block(5));
-    for (std::size_t round = 0; round < 12; ++round) {
-        frame(false);
-        frame(false);
-        frame(false);
-        frame(false);
-        memory.Write(5, 1, 2);
+    for (std::size_t frame = 0; frame < 96; ++frame) {
+        all();
+        if (frame % 3 == 0) memory.Write(5, 1, 2);
+        all();
+        track.AdvancePeriod();
     }
-    all();
-    Require(track.Faults(memory.Block(5)) - before >= 10 && track.Counted().rests == rests + 1, kind + ": a block written once in four frames was put to rest or stopped being armed");
+    Require(track.Faults(memory.Block(5)) - before <= 3, kind + ": a block written every third frame kept being armed");
+
+    const auto slow = track.Faults(memory.Block(6));
+    for (std::size_t frame = 0; frame < 160; ++frame) {
+        all();
+        if (frame % 40 == 39) memory.Write(6, 1, 3);
+        all();
+        track.AdvancePeriod();
+    }
+    Require(track.Faults(memory.Block(6)) - slow == 4, kind + ": a block written every fortieth frame was not armed again for each of its writes");
 }
 
 void CheckRace() {

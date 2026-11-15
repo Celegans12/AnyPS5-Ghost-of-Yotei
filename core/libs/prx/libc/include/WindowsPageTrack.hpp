@@ -12,6 +12,7 @@
 #include <cstdlib>
 #include <memory>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace GuestArena {
 
@@ -21,7 +22,22 @@ public:
     static constexpr unsigned HistoryFrames = 8;
     static constexpr unsigned HotFrames = 3;
     static constexpr std::uint64_t RestFrames = 64;
+    static constexpr unsigned LongestWait = 64;
+    static constexpr std::uint32_t WorthAnswers = 16;
     enum class State : std::uint64_t { Unarmed = 0, Arming = 1, Armed = 2, Opening = 3, Written = 4 };
+    struct Block {
+        std::atomic<std::uint64_t> word{0};
+        std::atomic<std::uint32_t> faults{0};
+        std::uint16_t holds = 0;
+        std::uint8_t flags = 0;
+        std::uint8_t history = 0;
+        std::uint32_t cleanPeriod = 0;
+        std::uint32_t writtenPeriod = 0;
+        std::uint32_t faultPeriod = 0;
+        std::uint32_t restUntil = 0;
+        std::uint32_t answers = 0;
+        std::uint32_t wait = 0;
+    };
     struct Counts {
         std::uint64_t armed = 0;
         std::uint64_t arms = 0;
@@ -29,7 +45,9 @@ public:
         std::uint64_t quiet = 0;
         std::uint64_t rests = 0;
         std::uint64_t divergences = 0;
+        std::array<std::uint64_t, 4> left{};
     };
+    enum class Left : std::size_t { Edge, Held, Imported, Waiting };
 
     static WindowsPageTrack& Get() {
         static auto* track = new WindowsPageTrack;
@@ -121,9 +139,25 @@ public:
         }
     }
 
+    Block* Peek(std::uintptr_t block) const {
+        return find(block);
+    }
+
+    Block& Touch(std::uintptr_t block) {
+        return at(block);
+    }
+
+    static State StateOfWord(std::uint64_t word) {
+        return stateOf(word);
+    }
+
+    static State StateOf(const Block& entry) {
+        return stateOf(entry.word.load(std::memory_order_acquire));
+    }
+
     State StateOf(std::uintptr_t block) const {
         const auto* entry = find(block);
-        return entry == nullptr ? State::Unarmed : stateOf(entry->word.load(std::memory_order_acquire));
+        return entry == nullptr ? State::Unarmed : StateOf(*entry);
     }
 
     bool Clean(std::uintptr_t block) const {
@@ -157,13 +191,16 @@ public:
         return true;
     }
 
+    static bool TakeWritten(Block& entry) {
+        const auto word = entry.word.load(std::memory_order_acquire);
+        if (stateOf(word) != State::Written) return false;
+        entry.word.store(with(word, State::Unarmed), std::memory_order_release);
+        return true;
+    }
+
     bool TakeWritten(std::uintptr_t block) {
         auto* entry = find(block);
-        if (entry == nullptr) return false;
-        const auto word = entry->word.load(std::memory_order_acquire);
-        if (stateOf(word) != State::Written) return false;
-        entry->word.store(with(word, State::Unarmed), std::memory_order_release);
-        return true;
+        return entry != nullptr && TakeWritten(*entry);
     }
 
     std::uint64_t Word(std::uintptr_t block) const {
@@ -171,50 +208,85 @@ public:
         return entry == nullptr ? 0 : entry->word.load(std::memory_order_acquire);
     }
 
-    std::uint64_t Period() const {
+    std::uint32_t Period() const {
         return period.load(std::memory_order_relaxed);
     }
 
     void AdvancePeriod() {
-        if (enabled) period.fetch_add(1, std::memory_order_relaxed);
+        if (!enabled) return;
+        auto current = period.load(std::memory_order_relaxed);
+        while (current < UINT32_MAX - RestFrames && !period.compare_exchange_weak(current, current + 1, std::memory_order_relaxed)) {}
+    }
+
+    static bool Free(const Block& entry) {
+        return entry.holds == 0 && entry.flags == 0;
+    }
+
+    static void NoteClean(Block& entry, std::uint32_t now) {
+        if (entry.cleanPeriod != now) entry.cleanPeriod = now;
+    }
+
+    static void NoteWritten(Block& entry, std::uint32_t now) {
+        if (entry.writtenPeriod != now) entry.writtenPeriod = now;
     }
 
     void NoteClean(std::uintptr_t block) {
-        at(block).cleanPeriod = Period();
+        NoteClean(at(block), Period());
     }
 
     void NoteWritten(std::uintptr_t block) {
-        at(block).writtenPeriod = Period();
+        NoteWritten(at(block), Period());
     }
 
-    void NoteFault(std::uintptr_t block) {
-        auto& entry = at(block);
-        const auto now = Period();
+    static std::uint32_t Wait(const Block& entry) {
+        return std::max<std::uint32_t>(1, entry.wait);
+    }
+
+    static void NoteArmed(Block& entry) {
+        entry.answers = 0;
+    }
+
+    static void NoteAnswer(Block& entry) {
+        if (entry.answers < WorthAnswers) ++entry.answers;
+    }
+
+    void NoteFault(Block& entry, std::uint32_t now) {
         entry.writtenPeriod = now;
+        const auto wait = Wait(entry);
+        entry.wait = entry.answers >= WorthAnswers ? std::max<std::uint32_t>(1, wait / 2) : std::min<std::uint32_t>(LongestWait, wait * 2);
         if (entry.faultPeriod == now) return;
         const auto gap = now - entry.faultPeriod;
         entry.history = static_cast<std::uint8_t>((gap >= HistoryFrames ? 0u : static_cast<unsigned>(entry.history) << gap) | 1u);
         entry.faultPeriod = now;
         if (static_cast<unsigned>(__builtin_popcount(entry.history)) < HotFrames) return;
         entry.history = 0;
-        entry.restUntil = now + RestFrames;
+        entry.restUntil = now + static_cast<std::uint32_t>(RestFrames);
         rests.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void NoteFault(std::uintptr_t block) {
+        NoteFault(at(block), Period());
+    }
+
+    static bool Cold(const Block& entry, std::uint32_t now) {
+        return Free(entry) && entry.cleanPeriod > entry.writtenPeriod && now > entry.cleanPeriod && now >= entry.restUntil && now - entry.writtenPeriod >= Wait(entry);
     }
 
     bool Cold(std::uintptr_t block) const {
         const auto* entry = find(block);
-        const auto now = Period();
-        return entry != nullptr && entry->holds == 0 && entry->flags == 0 && entry->cleanPeriod > entry->writtenPeriod && now > entry->cleanPeriod && now >= entry->restUntil;
+        return entry != nullptr && Cold(*entry, Period());
     }
 
     void SetDigest(std::uintptr_t block, std::uint64_t digest) {
-        at(block).digest = digest;
+        digests[block] = digest;
     }
 
     std::uint64_t Digest(std::uintptr_t block) const {
-        const auto* entry = find(block);
-        return entry == nullptr ? 0 : entry->digest;
+        const auto found = digests.find(block);
+        return found == digests.end() ? 0 : found->second;
     }
+
+    static_assert(sizeof(Block) == 40, "a block of the page tracking table stays within a cache line");
 
     void NoteDivergence() {
         divergences.fetch_add(1, std::memory_order_relaxed);
@@ -233,7 +305,7 @@ public:
     void Hold(std::uintptr_t first, std::uintptr_t end) {
         if (!enabled || end <= first) return;
         forEach(first, end, true, [&](std::uintptr_t block, Block& entry) {
-            if (entry.holds == UINT32_MAX) throw std::runtime_error("page tracking: too many holds on one block of guest memory");
+            if (entry.holds == UINT16_MAX) throw std::runtime_error("page tracking: too many holds on one block of guest memory");
             ++entry.holds;
             open(block, entry);
         });
@@ -265,6 +337,8 @@ public:
             entry.faultPeriod = 0;
             entry.restUntil = 0;
             entry.history = 0;
+            entry.answers = 0;
+            entry.wait = 0;
         });
     }
 
@@ -272,8 +346,20 @@ public:
         quiet.fetch_add(answers, std::memory_order_relaxed);
     }
 
+    void NoteLeft(const std::array<std::uint64_t, 4>& blocks) {
+        for (std::size_t reason = 0; reason < left.size(); ++reason) {
+            if (blocks[reason] != 0) left[reason].store(left[reason].load(std::memory_order_relaxed) + blocks[reason], std::memory_order_relaxed);
+        }
+    }
+
+    static Left LeftBecause(const Block& entry) {
+        return entry.holds != 0 ? Left::Held : entry.flags != 0 ? Left::Imported : Left::Waiting;
+    }
+
     Counts Counted() const {
-        return {armed.load(std::memory_order_relaxed), arms.load(std::memory_order_relaxed), faults.load(std::memory_order_relaxed), quiet.load(std::memory_order_relaxed), rests.load(std::memory_order_relaxed), divergences.load(std::memory_order_relaxed)};
+        Counts counted{armed.load(std::memory_order_relaxed), arms.load(std::memory_order_relaxed), faults.load(std::memory_order_relaxed), quiet.load(std::memory_order_relaxed), rests.load(std::memory_order_relaxed), divergences.load(std::memory_order_relaxed), {}};
+        for (std::size_t reason = 0; reason < left.size(); ++reason) counted.left[reason] = left[reason].load(std::memory_order_relaxed);
+        return counted;
     }
 
 private:
@@ -284,19 +370,6 @@ private:
     static constexpr unsigned ChunkShift = 30;
     static constexpr std::size_t ChunkBlocks = (std::size_t{1} << ChunkShift) / BlockBytes;
     static constexpr std::size_t Chunks = std::size_t{1} << (47 - ChunkShift);
-
-    struct Block {
-        std::atomic<std::uint64_t> word{0};
-        std::atomic<std::uint32_t> faults{0};
-        std::uint32_t holds = 0;
-        std::uint8_t flags = 0;
-        std::uint64_t cleanPeriod = 0;
-        std::uint64_t writtenPeriod = 0;
-        std::uint64_t digest = 0;
-        std::uint64_t faultPeriod = 0;
-        std::uint64_t restUntil = 0;
-        std::uint8_t history = 0;
-    };
 
     WindowsPageTrack() {
         verifying = set("APS5_VERIFY_PAGE_TRACK", std::getenv("APS5_VERIFY_PAGE_TRACK"));
@@ -411,7 +484,9 @@ private:
     std::atomic<std::uint64_t> quiet{0};
     std::atomic<std::uint64_t> rests{0};
     std::atomic<std::uint64_t> divergences{0};
-    std::atomic<std::uint64_t> period{1};
+    std::array<std::atomic<std::uint64_t>, 4> left{};
+    std::atomic<std::uint32_t> period{1};
+    std::unordered_map<std::uintptr_t, std::uint64_t> digests;
 };
 
 }

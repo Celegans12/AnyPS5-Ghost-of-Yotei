@@ -100,6 +100,7 @@ thread_local char t_watchWhere[MAX_PATH + 64];
 
 void ProtectWatchPage(DWORD protection) {
     DWORD old;
+    GuestArena::GuestPageTrackKeepOpen_nid_no_patch(reinterpret_cast<const void*>(g_watchPage), 0x1000);
     VirtualProtect(reinterpret_cast<void*>(g_watchPage), 0x1000, protection, &old);
 }
 
