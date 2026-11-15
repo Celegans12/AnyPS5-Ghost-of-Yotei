@@ -682,6 +682,101 @@ void DirtyFirstVerificationTellsAStaleViewFromALaterWrite(std::uint64_t base) {
     Require(BufferCache::Counted().inputRunDiffers == before.inputRunDiffers + 1, "a repeated copy differing from guest memory was not counted");
 }
 
+struct InputCopiesForTest {
+    explicit InputCopiesForTest(BufferCache::InputCopies copies) {
+        BufferCache::SetInputCopiesForTest(copies);
+    }
+    ~InputCopiesForTest() {
+        BufferCache::SetInputCopiesForTest(BufferCache::InputCopies::Environment);
+    }
+    InputCopiesForTest(const InputCopiesForTest&) = delete;
+    InputCopiesForTest& operator=(const InputCopiesForTest&) = delete;
+};
+
+void ReadableInputsAreCopiedInPlace(std::uint64_t base) {
+    const InputCopiesForTest copies(BufferCache::InputCopies::Direct);
+    const bool inPlace = BufferCache::DirectInputCopies();
+    Harness harness;
+    const auto address = base + 3 * Page + 8;
+    const std::size_t bytes = 600;
+    Fill(address, bytes, 161);
+    auto before = BufferCache::Counted();
+    const auto small = harness.Input(address, bytes);
+    auto after = BufferCache::Counted();
+    Require(small && small.served == BufferCache::Served::Copied && Same(small, address, bytes), "a small readable input was not served its bytes");
+    Require(after.inputDirect == before.inputDirect + (inPlace ? 1 : 0) && after.inputDirectBytes == before.inputDirectBytes + (inPlace ? bytes : 0), "a small readable input was not counted as copied in place where the host allows it");
+    Require(after.inputChecked == before.inputChecked + (inPlace ? 0 : 1) && after.inputUnreadable == before.inputUnreadable, "a small readable input reached the checked system copy beside its copy in place");
+    const auto large = base + 4 * Granule;
+    const std::size_t largeBytes = 5 * Page;
+    Fill(large, largeBytes, 162);
+    before = after;
+    const auto mirrored = harness.Input(large, largeBytes);
+    after = BufferCache::Counted();
+    Require(mirrored && mirrored.served == BufferCache::Served::Copied && Same(mirrored, large, largeBytes) && harness.cache.Mirrors() == 1, "a large readable input was not uploaded to a mirror");
+    Require(after.inputDirectBytes == before.inputDirectBytes + (inPlace ? largeBytes : 0) && (after.inputChecked == before.inputChecked) == inPlace && after.inputUnreadable == before.inputUnreadable, "the pages of a mirror were not uploaded in place where the host allows it");
+    BufferCache::SetInputCopiesForTest(BufferCache::InputCopies::System);
+    Require(!BufferCache::DirectInputCopies(), "the system copy was asked for and the copy in place stayed on");
+    const auto other = address + 2 * Page;
+    Fill(other, bytes, 163);
+    before = after;
+    const auto checked = harness.Input(other, bytes);
+    after = BufferCache::Counted();
+    Require(checked && checked.served == BufferCache::Served::Copied && Same(checked, other, bytes), "an input was not served its bytes through the checked system copy");
+    Require(after.inputDirect == before.inputDirect && after.inputChecked == before.inputChecked + 1 && after.inputUnreadable == before.inputUnreadable, "an input was copied in place while the system copy was asked for");
+    before = after;
+    harness.cache.VerifyInput(checked, other, bytes, 0);
+    Fill(other, bytes, 164);
+    harness.cache.VerifyInput(checked, other, bytes, 0);
+    after = BufferCache::Counted();
+    Require(after.inputCopiesVerified == before.inputCopiesVerified + 2 && after.inputCopyDiffers == before.inputCopyDiffers + 1 && after.inputVerified == before.inputVerified, "a fresh copy was not compared with guest memory by its verification");
+}
+
+#ifdef _WIN32
+void ReadOnlyInputsAreCopiedInPlace(std::uint64_t base) {
+    const InputCopiesForTest copies(BufferCache::InputCopies::Direct);
+    Harness harness;
+    const auto page = base + 32 * Page;
+    const auto address = page + 100;
+    const std::size_t bytes = 2000;
+    Fill(address, bytes, 171);
+    DWORD previous = 0;
+    Require(VirtualProtect(At(page), static_cast<SIZE_T>(Page), PAGE_READONLY, &previous) != 0, "cannot make the fixture page read-only");
+    const auto before = BufferCache::Counted();
+    const auto view = harness.Input(address, bytes);
+    const auto after = BufferCache::Counted();
+    DWORD readOnly = 0;
+    Require(VirtualProtect(At(page), static_cast<SIZE_T>(Page), previous, &readOnly) != 0, "cannot restore the fixture page");
+    Require(view && view.served == BufferCache::Served::Copied && Same(view, address, bytes), "an input of a read-only page was not served its bytes");
+    Require(after.inputDirect == before.inputDirect + 1 && after.inputChecked == before.inputChecked && after.inputUnreadable == before.inputUnreadable, "an input of a read-only page was not copied in place");
+}
+
+void UnreadableInputsAreRefusedWithoutAFault(std::uint64_t base) {
+    const InputCopiesForTest copies(BufferCache::InputCopies::Direct);
+    Harness harness;
+    const auto page = base + 40 * Page;
+    const std::size_t bytes = 600;
+    const std::size_t largeBytes = 5 * Page;
+    Fill(page - Page, largeBytes, 181);
+    Require(VirtualFree(At(page), static_cast<SIZE_T>(Page), MEM_DECOMMIT) != 0, "cannot release the fixture page");
+    auto before = BufferCache::Counted();
+    const auto inside = harness.Input(page + 64, bytes);
+    const auto straddling = harness.Input(page - 200, bytes);
+    const auto mirrored = harness.Input(page - Page, largeBytes);
+    auto after = BufferCache::Counted();
+    Require(VirtualAlloc(At(page), static_cast<SIZE_T>(Page), MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot commit the fixture page again");
+    Require(!inside && !straddling && !mirrored, "an input over a released page was served");
+    Require(after.inputRefused == before.inputRefused + 3 && Refused(after, BufferCache::Refusal::Unmapped) > Refused(before, BufferCache::Refusal::Unmapped), "an input over a released page was not refused as unmapped");
+    Require(after.inputDirect == before.inputDirect && after.inputUnreadable >= before.inputUnreadable + 3 && after.inputChecked - before.inputChecked == after.inputUnreadable - before.inputUnreadable, "an input over a released page was not left to the checked system copy, or that copy read it");
+    Fill(page - Page, largeBytes, 182);
+    before = after;
+    const auto small = harness.Input(page - 200, bytes);
+    const auto large = harness.Input(page - Page, largeBytes);
+    after = BufferCache::Counted();
+    Require(small && Same(small, page - 200, bytes) && large && Same(large, page - Page, largeBytes), "an input was not served its bytes once its page was committed again");
+    Require(after.inputDirect > before.inputDirect && after.inputChecked == before.inputChecked, "an input was not copied in place once its page was committed again");
+}
+#endif
+
 std::unordered_map<std::uint64_t, std::uint64_t>& ArmedWords() {
     static std::unordered_map<std::uint64_t, std::uint64_t> words;
     return words;
@@ -871,6 +966,13 @@ int main() {
         InputsKeptApartNeverReachAMirror(inputs);
         DirtyFirstVerificationTellsAStaleViewFromALaterWrite(inputs);
         RunsOfDrawsEndWhenAnEffectCanBeSeen();
+        const auto copies = AllocateGuest(static_cast<std::size_t>(Zone));
+        Require(copies % Zone == 0, "the guest block of the input copy scenarios does not start a zone");
+        ReadableInputsAreCopiedInPlace(copies);
+#ifdef _WIN32
+        ReadOnlyInputsAreCopiedInPlace(copies);
+        UnreadableInputsAreRefusedWithoutAFault(copies);
+#endif
         if (GuestMemory::Watched(base, bytes)) {
             TrackedWritesReachTheMirror(base);
             ArmedBlocksAnswerWithoutTheTracker(base);
