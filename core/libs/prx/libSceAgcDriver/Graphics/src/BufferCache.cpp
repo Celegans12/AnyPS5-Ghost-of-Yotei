@@ -580,8 +580,7 @@ std::string BufferCache::Report() {
         }
         char runs[192];
         std::snprintf(runs, sizeof(runs), "[buffer-cache] dirty-first runs (10 s): %llu labels, stores and seals left the run of draws open; runs ended by:", since(now.runsKept, reported.runsKept));
-        text += runs + ends + "
-";
+        text += runs + ends + "\n";
         if (now.inputVerified != reported.inputVerified) {
             char verified[256];
             std::snprintf(verified, sizeof(verified), "[buffer-cache] dirty-first verification (10 s): %llu inputs served without a copy compared with guest memory, %llu of them behind a later write, %llu differing inside a run of draws\n", since(now.inputVerified, reported.inputVerified), since(now.inputRaces, reported.inputRaces), since(now.inputRunDiffers, reported.inputRunDiffers));
