@@ -147,6 +147,31 @@ slower on FF and AoM, so only part of the FF and AoM change is real (see "Since 
 | 007 | title screen and menus only; crashes after "continue" (device lost in the first cutscene, or a RenderThread read of 0x40), which predates phases 3 and 4 | 68 to 80 ms once warm; 75 to 100 ms in the first minute | **21 to 25 %** warm | CPU: about 48 ms of dispatch per frame on the main worker, plus the draw committer. GPU is 38 ms per present, of which 22 ms is storage write-back, upload and staging | 4 step 3 (staging); the surface exchange from pool reuse (storage-image sharing, parked); then 5. The crashes are open and set aside |
 | AoM | title screen and the scene after the pad press | 142 to 148 ms | **11 to 12 %** | Title screen: CPU and GPU close. The worker spends about 165 ms per frame in packets (dispatch 95, draws 70) and the GPU 85 to 90 ms per present (profiled) | 5 and 6; phase 4 has little left for it (label stores are gone) |
 
+CPU and GPU cost per unit of work, in microseconds (profiled scene runs, late 10-second
+intervals; phase 6 aims at 20 us of CPU per draw):
+
+| Title | Draws / dispatches per frame | CPU per draw, worker | of it recording | direct stage | CPU per dispatch | GPU per draw or dispatch | Worker per frame | GPU per present |
+|---|---|---|---|---|---|---|---|---|
+| FF | 615 / about 150 | 24 us | 20 us | 8.2 us | about 80 us | 21 us | 15.0 ms draws, 12.4 ms dispatches | 16.4 ms |
+| LEGO | 1,209 / about 115 | 14 us | 11 us | 2.9 us | not broken out | 33 us | 16.5 ms draws | 43.2 ms |
+| 007 | 468 / about 140 | 39 us | 17 us | 14.1 us | about 380 us | 107 us | 18.4 ms draws, 52 ms dispatches | 65 ms |
+| AoM | 615 / about 110 | 143 us | 25 us | 31.1 us | about 930 us | 121 us | 88 ms draws, 104 ms dispatches | 88 ms |
+
+- CPU per draw is the worker's draw time per frame (`Packet.draw`) over the draws per frame;
+  "recording" is the `[draws]` recorded average and "direct stage" the `[direct-draw]` average
+  per stage. CPU per dispatch is `Packet.dispatch` over the dispatches per frame; the dispatch
+  count per frame is estimated from the cumulative `[dispatch]` count over the run, so those
+  two columns are approximate. GPU per draw or dispatch is the `gpu` time per present over
+  draws plus dispatches.
+- Reading: FF and LEGO are near the per-draw target on the CPU (24 and 14 us); 007 and AoM are
+  not, and for both the dispatch path costs more per frame than the draw path (007 52 against
+  18 ms, AoM 104 against 88 ms). AoM's draw cost is stage preparation (143 us per draw with
+  25 us of recording). On the GPU, 007 and AoM pay about four times as much per unit as FF.
+- Runs used: FF `runs\FF\cmp-i4b-FF` and LEGO `runs\LEGO\i4-LEGO` (`libs\i4`), 007
+  `runs\007\j3ns-off-007` (`libs\j3`, unit shadows off), AoM `runs\AoM\k10p-traps-AoM`
+  (`libs\k10`, traps before their fixes). They are profiled, so their frame times are higher
+  than the table above, and none is on `libs\k24`: one profiled scene per title on the current
+  build would replace them.
 Since the last table (same day, before phase 4):
 
 - **007: 160 to 221 ms then, 68 to 80 ms now.** Real, and the largest change of the phase:
