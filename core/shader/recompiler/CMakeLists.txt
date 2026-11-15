@@ -275,6 +275,7 @@ function(add_shader_recompiler target runtimeTarget)
             DescriptorLeaves
             DecodeRdnaInstruction
             DepthBitsTextureWidth
+            Detail::SrtTape::For
             HashBytes
             LayoutBarycentricEmulation
             MeshBarycentricLayoutOf
