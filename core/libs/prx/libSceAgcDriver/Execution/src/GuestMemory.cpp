@@ -2720,6 +2720,15 @@ bool ArmedCleanSince(std::uint64_t address, std::size_t bytes, std::span<const s
 #endif
 }
 
+void AnnounceGpuWrite(std::uint64_t address, std::size_t bytes) {
+#ifdef _WIN32
+    GuestArena::GuestPageTrackGpuWrite_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#endif
+}
+
 bool ArmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens) {
     std::fill(tokens.begin(), tokens.end(), std::uint64_t{0});
 #ifdef _WIN32
@@ -2768,6 +2777,9 @@ std::uint8_t UnarmedReason(std::uint64_t address) {
             break;
         case GuestArena::PageTrackReason::Resting:
             reason = Unarmed::Resting;
+            break;
+        case GuestArena::PageTrackReason::GpuWritten:
+            reason = Unarmed::GpuWritten;
             break;
         case GuestArena::PageTrackReason::Edge:
             reason = Unarmed::Edge;
@@ -2938,14 +2950,14 @@ void ReportCollectCosts() {
 }
 
 CollectCounts CollectCounted() {
-    std::array<std::uint64_t, 10> page{};
+    std::array<std::uint64_t, 12> page{};
 #ifdef _WIN32
     const auto watchCalls = GuestArena::GuestArenaCollectWatchCalls_nid_no_patch();
     GuestArena::GuestPageTrackCounts_nid_no_patch(page.data(), page.size());
 #else
     const std::uint64_t watchCalls = 0;
 #endif
-    return {watchCalls, committerWatchCalls.load(std::memory_order_relaxed), collectEpochBumps.load(std::memory_order_relaxed), collectMemoHits.load(std::memory_order_relaxed), collectWalkedEpochs.load(std::memory_order_relaxed), page[0], page[1], page[2], page[3], page[4], page[5], {page[6], page[7], page[8], page[9]}};
+    return {watchCalls, committerWatchCalls.load(std::memory_order_relaxed), collectEpochBumps.load(std::memory_order_relaxed), collectMemoHits.load(std::memory_order_relaxed), collectWalkedEpochs.load(std::memory_order_relaxed), page[0], page[1], page[2], page[3], page[4], page[5], {page[6], page[7], page[8], page[9]}, page[10], page[11]};
 }
 
 const char* TrackerLockSiteName(TrackerLockSite site) {
@@ -3163,6 +3175,7 @@ void beforeUnwatchUnproven(std::uint64_t address, std::size_t bytes) {
 }
 
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
+    AnnounceGpuWrite(address, bytes);
     if (!tracker.watched) return;
 #ifdef _WIN32
     tracker.startHints(address, bytes);
@@ -3654,6 +3667,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
+    AnnounceGpuWrite(address, bytes);
     breakLegacyProofs(ProofBreak::Marked);
     const StoreBump storeBump{address, bytes};
     noteDriverStore(address, bytes);

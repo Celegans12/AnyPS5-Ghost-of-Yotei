@@ -134,7 +134,8 @@ bool ArmedTokens(std::uint64_t address, std::size_t bytes, std::span<std::uint64
 bool ArmedCleanSince(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> tokens);
 bool ArmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens);
 bool RearmWritten(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> since, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written);
-enum class Unarmed : std::uint8_t { No = 0, Held = 1, Imported = 2, Barred = 3, Resting = 4, Edge = 5, Other = 6 };
+enum class Unarmed : std::uint8_t { No = 0, Held = 1, Imported = 2, Barred = 3, Resting = 4, Edge = 5, Other = 6, GpuWritten = 7 };
+void AnnounceGpuWrite(std::uint64_t address, std::size_t bytes);
 std::uint8_t UnarmedReason(std::uint64_t address);
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::span<std::uint64_t> tokens = {});
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);
@@ -214,6 +215,8 @@ struct CollectCounts {
     std::uint64_t pageRests = 0;
     std::uint64_t pageDivergences = 0;
     std::array<std::uint64_t, 4> pageLeft{};
+    std::uint64_t pageImportArms = 0;
+    std::uint64_t pageGpuMarks = 0;
 };
 CollectCounts CollectCounted();
 void ReportCollectCosts();

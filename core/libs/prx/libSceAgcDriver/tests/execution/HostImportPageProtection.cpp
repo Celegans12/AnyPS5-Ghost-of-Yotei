@@ -1,4 +1,5 @@
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -13,6 +14,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -81,6 +83,7 @@ LONG CALLBACK HandleFault(EXCEPTION_POINTERS* exception) {
     if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || record->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
     const auto base = watchedBase.load(std::memory_order_acquire);
     const auto address = static_cast<std::uintptr_t>(record->ExceptionInformation[1]);
+    if (GuestArena::GuestPageTrackHandleWrite_nid_no_patch(address)) return EXCEPTION_CONTINUE_EXECUTION;
     if (base == 0 || address < base || address >= base + RegionBytes) return EXCEPTION_CONTINUE_SEARCH;
     DWORD previous;
     if (!VirtualProtect(reinterpret_cast<void*>(address & ~(BlockBytes - 1)), BlockBytes, PAGE_READWRITE, &previous)) return EXCEPTION_CONTINUE_SEARCH;
@@ -478,6 +481,65 @@ void ImportAfterProtect(Vulkan& vulkan, bool resident, Findings& findings) {
     vulkan.Destroy(staging);
 }
 
+void ArmedImport(Vulkan& vulkan, bool resident, bool& failed) {
+    constexpr std::size_t Blocks = RegionBytes / BlockBytes;
+    GuestRegion region(resident);
+    watchedBase.store(0, std::memory_order_release);
+    const auto kind = region.Kind();
+    const auto base = reinterpret_cast<std::uintptr_t>(region.data);
+    const auto check = [&](bool condition, const char* what) {
+        std::printf("[armed import %s] %s: %s\n", kind, what, condition ? "yes" : "NO");
+        if (!condition) failed = true;
+    };
+    const auto counts = [] {
+        std::array<std::uint64_t, 12> values{};
+        GuestArena::GuestPageTrackCounts_nid_no_patch(values.data(), values.size());
+        return values;
+    };
+    std::array<std::uint64_t, Blocks> tokens{};
+    const auto arm = [&] { return GuestArena::GuestPageTrackArm_nid_no_patch(base, RegionBytes, tokens.data(), nullptr, Blocks); };
+    const auto clean = [&] { return GuestArena::GuestPageTrackCleanSince_nid_no_patch(base, RegionBytes, tokens.data(), Blocks); };
+
+    check(arm() && region.Protection() == PAGE_READONLY, "the range is armed before anything imports it");
+    auto staging = vulkan.Staging(RegionBytes);
+    std::optional<GuestArena::HostImportAccess> access;
+    access.emplace(region.data, RegionBytes);
+    check(!clean() && region.Protection() == PAGE_READWRITE, "the import access opened the armed range and ended its tokens before the import exists");
+    auto imported = vulkan.Import(region.data, RegionBytes);
+    access.reset();
+    check(imported.result == VK_SUCCESS, "the import of a range that was armed succeeds once the range is open");
+    if (imported.result != VK_SUCCESS) {
+        vulkan.Destroy(imported);
+        vulkan.Destroy(staging);
+        return;
+    }
+    const auto matches = [&] {
+        std::memset(staging.mapped, 0, RegionBytes);
+        return vulkan.Copy(imported.buffer, staging.buffer, RegionBytes) == VK_SUCCESS && std::memcmp(staging.mapped, region.data, RegionBytes) == 0;
+    };
+
+    check(arm() && clean() && region.Protection() == PAGE_READONLY, "the imported range is armed again after the import");
+    check(matches() && clean(), "the GPU reads the armed imported range and its tokens still hold");
+
+    const auto before = counts();
+    static_cast<volatile unsigned char*>(region.data)[5 * BlockBytes + 7] = 0x5a;
+    const auto after = counts();
+    check(after[2] == before[2] + 1 && !GuestArena::GuestPageTrackCleanSince_nid_no_patch(base + 5 * BlockBytes, BlockBytes, &tokens[5], 1) && GuestArena::GuestPageTrackCleanSince_nid_no_patch(base + 6 * BlockBytes, BlockBytes, &tokens[6], 1), "a CPU write to an armed imported block faults once and ends the token of that block alone");
+    check(matches(), "the GPU reads the byte the CPU wrote through the fault");
+
+    GuestArena::GuestPageTrackGpuWrite_nid_no_patch(base + 2 * BlockBytes + 100, 8);
+    check(region.Protection(2 * BlockBytes) == PAGE_READWRITE && region.Protection(3 * BlockBytes) == PAGE_READONLY && !GuestArena::GuestPageTrackCleanSince_nid_no_patch(base + 2 * BlockBytes, BlockBytes, &tokens[2], 1), "an announced GPU write opens its block and ends its token before the write, and leaves the next block armed");
+
+    GuestArena::GuestPageTrackGpuWrite_nid_no_patch(base, RegionBytes);
+    std::memset(staging.mapped, 0x33, RegionBytes);
+    const auto copied = vulkan.Copy(staging.buffer, imported.buffer, RegionBytes);
+    check(copied == VK_SUCCESS && region.Holds(0x33) && region.Protection() == PAGE_READWRITE, "an announced GPU copy into the import lands in an open range");
+    const bool rearmed = arm();
+    check(!rearmed && std::all_of(tokens.begin(), tokens.end(), [](std::uint64_t token) { return token == 0; }) && region.Protection() == PAGE_READWRITE, "blocks the GPU wrote are not armed again");
+    vulkan.Destroy(imported);
+    vulkan.Destroy(staging);
+}
+
 }
 #endif
 
@@ -497,6 +559,12 @@ int main() {
             ProtectAfterImport(vulkan, resident, findings);
             ImportAfterProtect(vulkan, resident, findings);
         }
+        bool failed = false;
+        if (GuestArena::GuestPageTrackArmsImports_nid_no_patch()) {
+            for (const bool resident : {false, true}) ArmedImport(vulkan, resident, failed);
+        } else {
+            std::puts("[armed import] skipped, set APS5_PAGE_TRACK=1 and APS5_ARM_READ_IMPORTS=1 to arm imported blocks through the page tracking table");
+        }
         RemoveVectoredExceptionHandler(handler);
         std::printf("[import] GPU reads of an armed import: %s\n", findings.readsArmed ? "work" : "fail");
         std::printf("[import] GPU writes into an armed import: %s, %s, %s\n", findings.writesLandArmed ? "land" : "do not land", findings.writesFault ? "fault on the CPU" : "raise no CPU fault", findings.writesWatched ? "reach the write watch" : "never reach the write watch");
@@ -506,7 +574,8 @@ int main() {
         else if (findings.writesLandArmed && !findings.writesFault) std::puts("verdict import: safe under a condition: the import and GPU reads survive the protection, but GPU writes bypass the page tables, so a range the GPU can write must never be armed and keeps relying on the driver's own marks");
         else if (!findings.writesLandArmed) std::puts("verdict import: impossible for ranges the GPU writes: the protection makes GPU writes fail");
         else std::puts("verdict import: safe: GPU writes into an armed range fault like CPU writes");
-        return 0;
+        if (failed) std::puts("verdict armed import: FAILED, an imported block armed through the page tracking table did not behave as the driver relies on");
+        return failed ? 1 : 0;
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
         return 1;
