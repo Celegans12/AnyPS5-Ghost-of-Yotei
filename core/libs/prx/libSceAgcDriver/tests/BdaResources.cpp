@@ -3582,6 +3582,16 @@ void importWatchTests() {
     Require(AgcDriver::GuestMemory::MarkWritten(label, 4) == now + 1, "a GPU write into a block with nothing left to collect advanced the generation more than once");
     words[1] = 2;
     Require(!AgcDriver::GuestMemory::UnchangedSinceCollected(label, 4, before), "a CPU write next to a GPU write was not seen");
+    static_cast<void>(AgcDriver::GuestMemory::CollectWritesUncached(label, 4));
+    const auto quiet = AgcDriver::GuestMemory::TrackerGeneration();
+    const auto marksBefore = AgcDriver::GuestMemory::CollectedMarkCounted();
+    Require(AgcDriver::GuestMemory::MarkWrittenInCollectedBlock(label + 16, 4) != 0, "a GPU write into a block already collected for its batch was not stamped");
+    Require(AgcDriver::GuestMemory::UnchangedSinceCollected(label, 4, quiet), "a GPU write into a block already collected for its batch read as a CPU write of its block");
+    words[2] = 3;
+    Require(AgcDriver::GuestMemory::MarkWrittenInCollectedBlock(label + 16, 4) != 0, "a second GPU write into a block already collected for its batch was not stamped");
+    Require(!AgcDriver::GuestMemory::UnchangedSinceCollected(label, 4, quiet), "a CPU write made before a GPU write that skipped its collect was lost");
+    const auto marksAfter = AgcDriver::GuestMemory::CollectedMarkCounted();
+    Require(marksAfter.skipped + marksAfter.verified - marksBefore.skipped - marksBefore.verified == 2, "the GPU writes into a block already collected were not counted");
     void* awaitedArea = mmap(nullptr, 2 * blockBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     Require(awaitedArea != MAP_FAILED, "cannot map the awaited block");
     const auto awaitedBlock = (reinterpret_cast<std::uintptr_t>(awaitedArea) + blockBytes - 1) & ~(blockBytes - 1);

@@ -1911,6 +1911,28 @@ void completionWaitTests(const Device& device, Recorder& recorder) {
     Require(memory[1] == 9u && Recorder::PendingCompletionLabels() == 0, "completion wait: a reader of a label stored behind a completion did not wait for that store");
 }
 
+void reapBySerialTests(Recorder& recorder) {
+    recorder.Sync();
+    const auto before = Recorder::SerialReapCounts();
+    Require(before.enabled, "reap by serial: the test needs APS5_REAP_BY_SERIAL=1");
+    int completed = 0;
+    for (int round = 0; round < 4; ++round) {
+        recorder.NotePendingWrite(0x60000, 0x100);
+        recorder.OnComplete([&] { ++completed; });
+        recorder.Submit();
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (recorder.InFlightBatches() != 0 && std::chrono::steady_clock::now() < deadline) {
+            recorder.Reap();
+            std::this_thread::sleep_for(std::chrono::microseconds(200));
+        }
+        Require(recorder.InFlightBatches() == 0 && completed == round + 1, "reap by serial: a finished batch was not retired");
+    }
+    const auto after = Recorder::SerialReapCounts();
+    if (recorder.HasTimeline()) Require(after.fenceQueries - before.fenceQueries >= 4, "reap by serial: a batch was retired without its fence");
+    else Require(after.refused == before.refused && after.fenceQueries == before.fenceQueries, "reap by serial: a recorder without a timeline consulted a serial");
+    std::cout << "Reap by serial checked, timeline=" << recorder.HasTimeline() << ", refused=" << after.refused - before.refused << ", fence queries=" << after.fenceQueries - before.fenceQueries << ", late=" << after.late - before.late << ", early=" << after.early - before.early << '\n';
+}
+
 int gpuTimingCompletionTests(const Device& device, bool incomplete) {
     const auto& context = device.GetContext();
     if (!device.Timestamps()) {
@@ -17221,6 +17243,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--completion-wait-only") {
             completionWaitTests(device, recorder);
             std::cout << "Completion wait tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--reap-by-serial-only") {
+            reapBySerialTests(recorder);
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--pending-write-snapshot-only") {

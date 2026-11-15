@@ -1,3 +1,8 @@
 if(BUILD_TESTING)
     agc_add_draw_pipeline_test(agc_driver_finisher_label_order)
+    add_test(NAME agc_driver_finisher_label_order_off_draw COMMAND agc_driver_finisher_label_order_tests)
+    set_tests_properties(agc_driver_finisher_label_order_off_draw PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_DRAW_PIPELINE=1;APS5_PIPELINED_DRAWS=32;APS5_PIPELINE_DISPATCH=1;APS5_REAP_BY_SERIAL=1;APS5_VERIFY_REAP_BY_SERIAL=1;APS5_LABEL_MARKS_PER_BATCH=1;APS5_SUBMIT_GROUP=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_driver_finisher_label_order_off_draw PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
 endif()
