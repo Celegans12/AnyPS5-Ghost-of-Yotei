@@ -252,6 +252,18 @@ namespace {
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawFinisher::DrainSite::Count)> finisherDrains{}, finisherSkips{}, finisherDrainsEver{}, finisherSkipsEver{}, finisherSiteWaitNs{};
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> itemDrains{}, itemRelays{};
 std::atomic<std::uint64_t> finisherWaits{0}, finisherWaitNs{0}, finisherRoomWaits{0}, finisherRoomWaitNs{0};
+std::atomic<std::uint64_t> poolJobs{0}, poolBeside{0}, poolAloneDraws{0}, poolAloneUnlisted{0}, poolSkipped{0}, poolTurns{0}, poolReordered{0}, poolReorderNs{0};
+std::array<std::atomic<std::uint64_t>, DrawFinisher::MaxThreads> poolBusyNs{};
+std::atomic<std::int64_t> poolReportedAt{0};
+
+std::int64_t steadyNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+}
+
+DrawFinisher::PoolCounts DrawFinisher::PoolCounted() {
+    const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+    return {load(poolJobs), load(poolBeside), load(poolAloneDraws), load(poolAloneUnlisted), load(poolSkipped), load(poolTurns), load(poolReordered), load(poolReorderNs)};
 }
 
 void DrawFinisher::NoteDrain(DrainSite site, bool drained) {
@@ -316,6 +328,28 @@ std::string DrawFinisher::DrainText() {
     kinds(itemDrains);
     text += "; items relayed:";
     kinds(itemRelays);
+    if (Threads() > 1) {
+        static std::mutex reportMutex;
+        static PoolCounts reported;
+        static std::array<std::uint64_t, MaxThreads> reportedBusy{};
+        std::lock_guard lock(reportMutex);
+        const auto counted = PoolCounted();
+        const auto since = [](std::uint64_t current, std::uint64_t previous) { return static_cast<unsigned long long>(current - previous); };
+        const auto at = steadyNs();
+        const auto previous = poolReportedAt.exchange(at, std::memory_order_relaxed);
+        const auto elapsed = previous == 0 ? 0.0 : static_cast<double>(at - previous);
+        char pool[512];
+        std::snprintf(pool, sizeof(pool), "; finisher pool of %u threads: %llu jobs, %llu started while another ran, %llu ran alone (%llu draws that may write beyond their targets, %llu jobs queued without their writes), %llu skipped behind a failed job, %llu turns taken to drain the pipeline, %llu jobs waited %.1f ms in the reorder buffer; busy per thread:", Threads(), since(counted.jobs, reported.jobs), since(counted.beside, reported.beside), since(counted.aloneDraws + counted.aloneUnlisted, reported.aloneDraws + reported.aloneUnlisted), since(counted.aloneDraws, reported.aloneDraws), since(counted.aloneUnlisted, reported.aloneUnlisted), since(counted.skipped, reported.skipped), since(counted.turns, reported.turns), since(counted.reordered, reported.reordered), static_cast<double>(counted.reorderNs - reported.reorderNs) / 1e6);
+        text += pool;
+        for (unsigned index = 0; index < Threads(); ++index) {
+            const auto busy = poolBusyNs[index].load(std::memory_order_relaxed);
+            char item[24];
+            std::snprintf(item, sizeof(item), " %.0f%%", elapsed > 0.0 ? 100.0 * static_cast<double>(busy - reportedBusy[index]) / elapsed : 0.0);
+            text += item;
+            reportedBusy[index] = busy;
+        }
+        reported = counted;
+    }
     return text;
 }
 
@@ -414,6 +448,7 @@ void DrawFinisher::enqueuePooled(Job job, Pending held) {
     slot->epoch = GuestMemory::HeldCollectEpoch();
     slot->order = nextOrder();
     slot->alone = held.unknown;
+    const bool draw = held.key != 0 || held.shape != 0;
     slot->job = std::move(job);
     slot->held = std::move(held);
     struct ReclaimStorage {};
@@ -430,9 +465,14 @@ void DrawFinisher::enqueuePooled(Job job, Pending held) {
         finisherRoomWaitNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
     }
     slot->sequence = ++queuedSequence;
+    if (slot->alone) (draw ? poolAloneDraws : poolAloneUnlisted).fetch_add(1, std::memory_order_relaxed);
     slots.push_back(std::move(slot));
     outstanding.fetch_add(1, std::memory_order_release);
     unstarted.fetch_add(1, std::memory_order_release);
+    if (workers.empty()) {
+        std::int64_t unset = 0;
+        poolReportedAt.compare_exchange_strong(unset, steadyNs(), std::memory_order_relaxed);
+    }
     while (workers.size() < Threads()) {
         const auto index = static_cast<unsigned>(workers.size());
         workers.emplace_back([this, index] {
@@ -467,12 +507,17 @@ void DrawFinisher::work(unsigned index) {
         Slot& slot = *slots[started];
         const bool misplaced = DrawPipeline::VerifiesOrder() && (barrier || (slot.alone && (started != 0 || active != 0 || flushing)));
         const bool failed = failure != nullptr;
+        const bool beside = active != 0;
         ++started;
         ++active;
         unstarted.fetch_sub(1, std::memory_order_release);
         if (slot.alone) barrier = true;
         if (sleepers != 0 && startable()) wake.notify_one();
         lock.unlock();
+        poolJobs.fetch_add(1, std::memory_order_relaxed);
+        if (beside) poolBeside.fetch_add(1, std::memory_order_relaxed);
+        if (failed) poolSkipped.fetch_add(1, std::memory_order_relaxed);
+        const auto began = std::chrono::steady_clock::now();
         runningOrder = slot.order;
         runningSequence = slot.sequence;
         if (DrawPipeline::SharedCollectEpoch()) GuestMemory::AdoptCollectEpoch(slot.epoch);
@@ -490,9 +535,11 @@ void DrawFinisher::work(unsigned index) {
         deferredOutputs = nullptr;
         deferredReads = nullptr;
         runningSequence = 0;
+        poolBusyNs[index].fetch_add(elapsedNs(began), std::memory_order_relaxed);
         lock.lock();
         slot.done = true;
         --active;
+        if (flushing || slots.front().get() != &slot) slot.finished = std::chrono::steady_clock::now();
         retire(lock);
         lock.unlock();
     }
@@ -510,6 +557,11 @@ void DrawFinisher::retire(std::unique_lock<std::mutex>& lock) {
         bool shutdown = !dropped && slot.shutdown;
         auto outputs = std::move(slot.outputs);
         const auto order = slot.order;
+        if (slot.finished != std::chrono::steady_clock::time_point{}) {
+            poolReordered.fetch_add(1, std::memory_order_relaxed);
+            poolReorderNs.fetch_add(elapsedNs(slot.finished), std::memory_order_relaxed);
+        }
+        if (dropped && !outputs.empty()) poolSkipped.fetch_add(1, std::memory_order_relaxed);
         lock.unlock();
         if (!dropped) {
             runningOrder = order;
@@ -545,6 +597,7 @@ void DrawFinisher::TakeTurn() {
     if (deferredOutputs == nullptr) return;
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher turn taken under the GPU lock");
     auto& stashed = *deferredOutputs;
+    poolTurns.fetch_add(1, std::memory_order_relaxed);
     {
         std::unique_lock lock(mutex);
         idle.wait(lock, [&] { return !flushing && slots.front()->sequence == runningSequence; });

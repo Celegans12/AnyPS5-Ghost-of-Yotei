@@ -180,6 +180,17 @@ public:
     bool DeferredReads(std::uint64_t address, std::uint64_t end);
     static bool Behind();
     void TakeTurn();
+    struct PoolCounts {
+        std::uint64_t jobs = 0;
+        std::uint64_t beside = 0;
+        std::uint64_t aloneDraws = 0;
+        std::uint64_t aloneUnlisted = 0;
+        std::uint64_t skipped = 0;
+        std::uint64_t turns = 0;
+        std::uint64_t reordered = 0;
+        std::uint64_t reorderNs = 0;
+    };
+    static PoolCounts PoolCounted();
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
     void Drain();
@@ -196,6 +207,7 @@ private:
         std::vector<Range> reads;
         std::exception_ptr error;
         DrawPipeline::Order order;
+        std::chrono::steady_clock::time_point finished{};
         std::uint64_t epoch = 0;
         std::uint64_t sequence = 0;
         bool alone = false;
