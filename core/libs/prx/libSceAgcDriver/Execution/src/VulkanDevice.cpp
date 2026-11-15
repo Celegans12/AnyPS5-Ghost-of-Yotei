@@ -3030,6 +3030,18 @@ std::uint64_t VulkanDevice::SubmittedEpoch() const {
     return state->recorder ? state->recorder->NewestSubmitted() : 0;
 }
 
+double VulkanDevice::CompletedGpuMs(std::uint64_t afterBatch, std::uint64_t throughBatch, std::vector<std::uint64_t>& recorded) const {
+    recorded.clear();
+    if (!state->recorder) return 0.0;
+    std::size_t missing = 0;
+    double busyMs = 0.0;
+    for (const auto& batch : state->recorder->CompletedBatches(afterBatch, throughBatch, missing)) {
+        recorded.push_back(batch.serial);
+        if (batch.gpuEndNs > batch.gpuStartNs) busyMs += (batch.gpuEndNs - batch.gpuStartNs) / 1e6;
+    }
+    return busyMs;
+}
+
 bool VulkanDevice::WaitRecordedFor(std::uint64_t serial, std::uint64_t timeoutNanos) {
     return state->recorder && state->recorder->WaitSerialFor(serial, timeoutNanos);
 }

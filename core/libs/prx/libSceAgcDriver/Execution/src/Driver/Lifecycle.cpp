@@ -380,6 +380,13 @@ std::pair<std::uint64_t, std::uint64_t> Driver::SerialProgress() {
     return {accepted, completed};
 }
 
+double Driver::CompletedGpuMs(std::uint64_t afterBatch, std::uint64_t throughBatch, std::uint64_t& newestBatch, std::vector<std::uint64_t>& recorded) {
+    const auto localDevice = device.Load();
+    newestBatch = localDevice ? localDevice->SubmittedEpoch() : 0;
+    recorded.clear();
+    return localDevice ? localDevice->CompletedGpuMs(afterBatch, std::min(throughBatch, newestBatch), recorded) : 0.0;
+}
+
 void Driver::CheckFailure() {
     if (failed.load(std::memory_order_acquire)) {
         std::lock_guard lock(mutex);

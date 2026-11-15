@@ -84,6 +84,7 @@ public:
     std::uint32_t ReserveEopFlipAt(const FlipInfo& info, std::uint32_t token);
     std::vector<std::uint32_t> PendingEopFlipTokens();
     std::pair<std::uint64_t, std::uint64_t> SerialProgress();
+    double CompletedGpuMs(std::uint64_t afterBatch, std::uint64_t throughBatch, std::uint64_t& newestBatch, std::vector<std::uint64_t>& recorded);
     std::uint64_t FlipSubmissions() const;
     std::uint64_t RewindTailFlips() const;
     std::vector<AwaitedWait> AwaitedWaits();

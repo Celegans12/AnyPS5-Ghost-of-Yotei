@@ -179,6 +179,14 @@ extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std
     *completed = done;
 }
 
+extern "C" double AgcDriverCompletedGpuMs_nid_postfix(std::uint64_t afterBatch, std::uint64_t throughBatch, std::uint64_t* newestBatch, std::uint64_t* recorded, std::size_t capacity, std::size_t* count) {
+    std::vector<std::uint64_t> serials;
+    const auto busyMs = AgcDriver::DriverDetail::Driver::Get().CompletedGpuMs(afterBatch, throughBatch, *newestBatch, serials);
+    *count = std::min(capacity, serials.size());
+    std::copy_n(serials.begin(), *count, recorded);
+    return busyMs;
+}
+
 extern "C" bool AgcDriverHoldSettled_nid_postfix(std::int64_t milliseconds) {
     return AgcDriver::DriverDetail::Driver::Get().WaitSettledFor(std::chrono::milliseconds(milliseconds));
 }
