@@ -500,7 +500,7 @@ void Driver::noteAwaitingTitle(std::uint32_t queue, std::uint64_t awaited) {
     if (queue != 0 || flipHolders.load(std::memory_order_acquire) == 0 || queue0AwaitsTitle.load(std::memory_order_acquire) || !awaitsTitle(awaited)) return;
     std::lock_guard lock(mutex);
     queue0AwaitsTitle.store(true, std::memory_order_release);
-    changed.notify_all();
+    WaitEvents::NotifyState(changed);
 }
 
 bool Driver::holdFlipBehindWorker(const Submission& submission, bool cpuFlip) {
@@ -574,7 +574,7 @@ void Driver::waitFlipWork(std::uint64_t workSerial) {
 void Driver::releaseFlipHold() {
     std::lock_guard lock(mutex);
     flipsAhead.fetch_sub(1, std::memory_order_acq_rel);
-    if (flipHolders.load(std::memory_order_acquire) != 0) changed.notify_all();
+    if (flipHolders.load(std::memory_order_acquire) != 0) WaitEvents::NotifyState(changed);
 }
 
 void Driver::finishFlipWork(const std::shared_ptr<FlipWork>& work, std::uint64_t workSerial) {
@@ -584,7 +584,7 @@ void Driver::finishFlipWork(const std::shared_ptr<FlipWork>& work, std::uint64_t
         work->finished = true;
         flipWorkDone(work);
     }
-    if (flipHolders.load(std::memory_order_acquire) != 0) changed.notify_all();
+    if (flipHolders.load(std::memory_order_acquire) != 0) WaitEvents::NotifyState(changed);
 }
 
 void Driver::reserveOutputs(Submission& submission) {
@@ -854,7 +854,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
         enqueue(std::move(submission));
         ++accepted;
     }
-    changed.notify_all();
+    WaitEvents::NotifyState(changed);
     if (capture != nullptr) writeCaptured(*this, *capture, captured);
     if (progress) {
         PerformanceTimer timing("Driver.SubmitProgress");
@@ -902,7 +902,7 @@ void Driver::SuspendPoint() {
     enqueue(std::move(boundary));
     ++accepted;
 
-    changed.notify_all();
+    WaitEvents::NotifyState(changed);
     if (capture == nullptr) return;
     lock.unlock();
     writeCaptured(*this, *capture, captured);
@@ -969,14 +969,14 @@ void Driver::noteWaitBlocked(std::uint32_t queue, std::uint64_t awaited, bool bl
     if (blocked) {
         if (runningWorkers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
             idleEpoch.fetch_add(1, std::memory_order_release);
-            changed.notify_all();
+            WaitEvents::NotifyState(changed);
         }
     }
     if (queue == 0) queue0Awaited.store(blocked ? awaited : 0, std::memory_order_release);
     if (queue == 0 && !blocked) queue0AwaitsTitle.store(false, std::memory_order_release);
     if (blocked && orderHolders.load(std::memory_order_acquire) != 0) {
         std::lock_guard lock(mutex);
-        changed.notify_all();
+        WaitEvents::NotifyState(changed);
     }
 }
 

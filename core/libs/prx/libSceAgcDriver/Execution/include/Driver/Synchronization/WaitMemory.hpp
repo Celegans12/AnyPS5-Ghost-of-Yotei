@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/LabelStores.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitEvents.hpp"
 #include <array>
 #include <chrono>
 #include <cstddef>
@@ -14,6 +15,16 @@ namespace AgcDriver::DriverDetail {
 inline constexpr const char* LabelRefusalNames[6] = {"none", "trust-off", "queued", "overwritten", "unclosed", "behind-completion"};
 
 inline constexpr std::chrono::microseconds PollTryInterval{1000};
+
+// A blocked wait (section C). EventFallback bounds a sleep whose producer the driver knows of, so
+// the stall watch, the timeout report and a missed event cost at most this; CpuStoreInterval is the
+// timed wait for a value no driver event announces (a guest CPU store).
+inline constexpr std::chrono::microseconds EventFallback{2000};
+inline constexpr std::chrono::microseconds CpuStoreInterval{200};
+// How often a blocked wait asks the flush hook for results held behind queued draws, and a landing
+// wait asks whether its recorded writes settled.
+inline constexpr std::chrono::microseconds HeldFlushInterval{6400};
+inline constexpr std::chrono::microseconds SettleInterval{3200};
 
 struct LabelStore {
     std::uint64_t stamp = 0;
@@ -35,6 +46,21 @@ struct PollStats {
     std::array<std::uint64_t, 6> refusals{};
     double longestTryHoldUs = 0;
     double tryHoldUs = 0;
+    // Blocked rounds of a wait: how each ended (an event, the fallback with a known producer, the
+    // timed wait for a CPU store), the time blocked, and the waits that ended right after a timer
+    // wake (a value that came without an event).
+    std::uint64_t blocks = 0, eventWakes = 0, timerWakesKnown = 0, timerWakesCpu = 0, endedByTimer = 0;
+    double blockedUs = 0;
+    // Event wakes by WaitEvents::Kind bit: range, progress, driver state, mutex free, labels.
+    std::array<std::uint64_t, 5> wakeKinds{};
+    // The queue worker's own sleeps (order waits, idle with completions pending): rounds, those the
+    // fallback ended, and order waits released right after a fallback wake (a missed event).
+    std::uint64_t workerSleeps = 0, workerFallbacks = 0, orderEndedByTimer = 0;
+    // Waits that left the entry checks, by what ended them: the value in memory, the driver's label
+    // history, the recorder's label table, settled recorded writes.
+    enum End : std::size_t { EndMemory, EndHistory, EndTable, EndSettled, EndCount };
+    std::array<std::uint64_t, EndCount> ended{};
+    std::array<double, EndCount> endedMs{};
 };
 
 struct WaitOutcomes {

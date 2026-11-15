@@ -96,7 +96,7 @@ void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress)
 void Driver::wakeQueueZeroForCompletions() {
     if (!completionsPending()) return;
     std::lock_guard lock(mutex);
-    changed.notify_all();
+    WaitEvents::NotifyState(changed);
 }
 
 std::uint64_t Driver::submitFlipWork(std::uint32_t queue) {
@@ -122,7 +122,7 @@ void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, st
                 if (found != driver.queue0Uncommitted.end()) driver.queue0Uncommitted.erase(found);
                 notify = driver.idleWaiters != 0 || driver.orderHolders.load(std::memory_order_acquire) != 0 || completionsPending();
             }
-            if (notify) driver.changed.notify_all();
+            if (notify) WaitEvents::NotifyState(driver.changed);
         }
     } complete{*this, serial, received, labelWrites};
     if (flipWork != nullptr) finishFlipWork(flipWork, submitFlipWork(0));
@@ -139,12 +139,18 @@ std::atomic<std::uint64_t>*& Driver::workerPacket() {
     return packet;
 }
 
-void Driver::reapCompletionLabels() {
+void Driver::reapCompletionLabels(WaitEvents::Listener* events) {
     std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
+    if (!gpuLock.owns_lock() && events != nullptr) {
+        // Registered before the second try, so a release after it is signaled.
+        events->WantMutex(true);
+        static_cast<void>(gpuLock.try_lock());
+    }
     if (!gpuLock.owns_lock()) {
         ++triesFailed[TryIdle];
         return;
     }
+    if (events != nullptr) events->WantMutex(false);
 
     if (!completionsPending()) return;
 
@@ -167,6 +173,7 @@ void Driver::run(std::uint32_t id) noexcept {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool idleStore = std::getenv("APS5_NO_IDLE_STORE") == nullptr;
     auto& costs = submissionCosts(id);
+    WaitEvents::Listener events(WaitEvents::DriverState | WaitEvents::Progress);
     try {
         PerformanceTrace::BindThread(role);
         for (;;) {
@@ -185,7 +192,7 @@ void Driver::run(std::uint32_t id) noexcept {
                 ~Running() {
                     if (active && count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
                         idleEpoch.fetch_add(1, std::memory_order_release);
-                        changed.notify_all();
+                        WaitEvents::NotifyState(changed);
                     }
                 }
             } running{runningWorkers, idleEpoch, changed};
@@ -208,18 +215,31 @@ void Driver::run(std::uint32_t id) noexcept {
                 const auto idleResultsPending = [&] {
                     return idleStore && id == 0 && Graphics::StorageTexture::AnyPending() && allQueuesIdle() && !completionsPending();
                 };
-                const auto poll = [&](const auto& done) {
-#ifdef _WIN32
+                // Section C: the worker sleeps on the driver's state changes and on GPU progress.
+                // The token is read under the mutex before the condition is checked, so a change
+                // signaled after that check ends the sleep.
+                const auto sleepOnEvents = [&](std::uint32_t token) {
                     lock.unlock();
-                    PollSleep();
+                    const bool signaled = events.Wait(token, EventFallback);
+                    if (profile) {
+                        ++pollStats().workerSleeps;
+                        if (!signaled) ++pollStats().workerFallbacks;
+                    }
                     lock.lock();
-                    return done();
-#else
-                    return changed.wait_for(lock, std::chrono::milliseconds(1), done);
-#endif
+                    return signaled;
+                };
+                const auto waitFor = [&](const auto& done, const auto& eachRound) {
+                    bool timerWoke = false;
+                    for (auto token = events.Token(); !done(); token = events.Token()) {
+                        timerWoke = !sleepOnEvents(token);
+                        eachRound();
+                    }
+                    if (profile && timerWoke) ++pollStats().orderEndedByTimer;
                 };
 
-                while (!ready()) {
+                for (;;) {
+                    const auto idleToken = events.Token();
+                    if (ready()) break;
                     if (!completionsPending() || (id != 0 && Graphics::Recorder::PendingCompletionLabels() == 0)) {
                         const auto idleEpochAtCheck = idleEpoch.load(std::memory_order_acquire);
                         const bool storeIdleResults = idleResultsPending();
@@ -251,10 +271,16 @@ void Driver::run(std::uint32_t id) noexcept {
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
                         continue;
                     }
-                    if (poll(ready)) break;
+                    // Completions are pending: reap what finished, then sleep until a batch finishes,
+                    // the GPU mutex the reap could not try is released, or work arrives.
+                    // A reap that retired a batch signals progress itself, so the sleep after it
+                    // returns at once and the next round sees what is left.
                     lock.unlock();
-                    reapCompletionLabels();
+                    reapCompletionLabels(&events);
                     lock.lock();
+                    if (ready()) break;
+                    sleepOnEvents(idleToken);
+                    events.WantMutex(false);
                 }
                 timing.Mark("idle_and_completion_poll");
                 rethrowFailure();
@@ -278,7 +304,7 @@ void Driver::run(std::uint32_t id) noexcept {
                         OrderHold hold{orderHolders};
                         const auto released = [&] { return failure || stopping || !waitFreeBefore(submission.received); };
                         StallWatch stall(id);
-                        while (!released() && !poll(released)) stall.Check("order behind other queues for event", submission.received, &lock);
+                        waitFor(released, [&] { stall.Check("order behind other queues for event", submission.received, &lock); });
                     }
                     rethrowFailure();
                 }
@@ -286,12 +312,15 @@ void Driver::run(std::uint32_t id) noexcept {
                     worker.executingWaitFree = submission.waitFree ? submission.received : 0;
                     worker.executingWaits = !submission.waitFree && !submission.suspend;
                 }
+                // The dequeue changed what the order waits of other workers read (the pending
+                // lists, queue 0's executing event, this worker's wait-free state).
+                if (orderHolders.load(std::memory_order_acquire) != 0) WaitEvents::Signal(WaitEvents::DriverState);
                 if (submission.waitFree) {
                     {
                         OrderHold hold{orderHolders};
                         const auto released = [&] { return failure || stopping || orderReleased(id, submission.received); };
                         StallWatch stall(id);
-                        while (!released() && !poll(released)) stall.Check("order behind queue 0 for event", submission.received, &lock);
+                        waitFor(released, [&] { stall.Check("order behind queue 0 for event", submission.received, &lock); });
                     }
                     rethrowFailure();
                 }
@@ -324,7 +353,7 @@ void Driver::run(std::uint32_t id) noexcept {
 
                 notify = idleWaiters != 0 || orderHolders.load(std::memory_order_acquire) != 0;
             }
-            if (notify) changed.notify_all();
+            if (notify) WaitEvents::NotifyState(changed);
             else ++costs.notifiesSkipped;
             if (profile) costs.completeNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - completeStart).count());
         }

@@ -427,7 +427,8 @@ private:
     void markCompleted(std::uint64_t serial);
     static const std::atomic<std::uint64_t>*& workerQueued();
     static std::atomic<std::uint64_t>*& workerPacket();
-    void reapCompletionLabels();
+    // A try: with `events`, a failed one registers that listener for the release of the GPU mutex.
+    void reapCompletionLabels(WaitEvents::Listener* events = nullptr);
     void run(std::uint32_t id) noexcept;
 
     std::mutex mutex;

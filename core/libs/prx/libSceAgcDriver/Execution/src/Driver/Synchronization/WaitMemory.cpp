@@ -5,10 +5,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitEvents.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <cstdlib>
 #include <mutex>
+#include <optional>
 #include <set>
 #ifdef _WIN32
 #include <windows.h>
@@ -209,6 +211,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     std::uint64_t refusedGeneration = 0;
 
     bool behindCompletion = false;
+    // The table refused a label whose group is still open: only then does a closing group matter.
+    bool unclosedLabel = false;
+    // Whether the last wake of a blocked wait asks for the tables to be consulted again.
+    bool consult = true;
     const auto traceLate = [&](const char* outcome, const std::optional<Graphics::Recorder::LabelHit>& hit, Graphics::Recorder::LabelRefusal refusal) {
         static std::atomic<int> shown{0};
         if (shown.fetch_add(1) >= 200) return;
@@ -217,6 +223,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     };
     const auto takeLabel = [&](const std::optional<Graphics::Recorder::LabelHit>& hit, Graphics::Recorder::LabelRefusal refusal, bool polling, bool unlockedHit) {
         behindCompletion = refusal == Graphics::Recorder::LabelRefusal::BehindCompletion;
+        unclosedLabel = refusal == Graphics::Recorder::LabelRefusal::Unclosed;
         const bool trace = traceLateLabels() && (refusal != Graphics::Recorder::LabelRefusal::None || (hit.has_value() && hit->late));
         if (!hit.has_value() || !Pm4::WaitComparesValue(packet, hit->value)) {
             if (trace) traceLate(hit.has_value() ? "value mismatch" : "refused by the table", hit, refusal);
@@ -289,17 +296,39 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
 
     const bool reapAll = pollReapAll() || !labelShortcut || queue == 0;
     std::chrono::steady_clock::time_point lastTry{};
+    std::optional<WaitEvents::Listener> events;
+    // A try of the GPU mutex. A failed one registers for the release of the hold it lost to, and
+    // tries once more so a release between the two is not missed.
+    const auto tryGpu = [&](std::unique_lock<GuestMemory::GpuMutexType>& lock) {
+        if (lock.try_lock()) {
+            if (events) events->WantMutex(false);
+            return true;
+        }
+        if (!events) return false;
+        events->WantMutex(true);
+        if (!lock.try_lock()) return false;
+        events->WantMutex(false);
+        return true;
+    };
     const auto pollService = [&](bool sleeping) {
         if (pollProfile) ++poll.ticks;
         const auto generation = Graphics::Recorder::WriteGeneration();
-        const bool changed = generation != seenGeneration || recheck;
+        // The write generation moves on any noted write. A blocked wait consults the tables only
+        // when an event over its own range (or the fallback timer) says so.
+        const bool changed = recheck || (generation != seenGeneration && (!events || consult));
         const bool labelDue = labelFlushDue();
         const bool reap = sleeping && (behindCompletion || ownStoreUnlanded || ((reapAll || queue0Dormant.load(std::memory_order_relaxed)) && completionsPending()));
-        if (!changed && !labelDue && !reap) return false;
+        if (!changed && !labelDue && !reap) {
+            if (events) events->WantMutex(false);
+            return false;
+        }
 
         if (!changed && !pollTryEach()) {
             const auto now = std::chrono::steady_clock::now();
-            if (now - lastTry < PollTryInterval) return false;
+            if (now - lastTry < PollTryInterval) {
+                if (events) events->WantMutex(false);
+                return false;
+            }
             lastTry = now;
         }
         if (changed && unlocked && labelTable) {
@@ -312,10 +341,12 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             pollRefused(refusal);
         }
         if (pollProfile) ++poll.tries;
-        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::try_to_lock);
-        if (!gpuLock.owns_lock()) {
+        std::unique_lock gpuLock(GuestMemory::GpuMutex(), std::defer_lock);
+        if (!tryGpu(gpuLock)) {
             ++triesFailed[TryPoll];
             if (pollProfile) ++poll.triesFailed;
+            // The consult still owed is made when the mutex is free.
+            if (changed) recheck = true;
             return false;
         }
 
@@ -392,33 +423,93 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     StallWatch stall(queue);
     std::uint64_t producerToken = 0;
     auto lastProducerScan = std::chrono::steady_clock::now() - std::chrono::milliseconds(100);
-    while (!memorySatisfied()) {
+    // Section C: after the spin the worker blocks on the events that can end this wait (a label
+    // store or GPU write noted over the awaited range, a closed label group, a finished batch, the
+    // GPU mutex it could not try). The timeout is the label flush deadline, or the fallback below
+    // for a value that arrives without an event.
+    const auto listen = [&] { events.emplace(WaitEvents::Range, awaited, awaitedBytes); };
+    if (!spinning) listen();
+    std::uint32_t eventToken = 0;
+    bool timerWoke = false;
+    const auto ended = [&](PollStats::End how) {
+        if (!pollProfile) return;
+        ++poll.ended[how];
+        poll.endedMs[how] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - spinStart).count();
+        if (timerWoke) ++poll.endedByTimer;
+    };
+    std::chrono::steady_clock::time_point lastHeldFlush{}, lastSettle{};
+    for (;;) {
+        if (!spinning) eventToken = events->Token();
+        if (memorySatisfied()) break;
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer)) {
             if (writer != queue) notePendingWait(packet, queue, received);
             else epochPoint.bump = false;
+            ended(PollStats::EndHistory);
             return;
         }
         ++polls;
         if (spinning) {
             PreciseSpinPause();
             if ((polls & 63u) != 0) continue;
-            if (std::chrono::steady_clock::now() - spinStart > spinLimit) spinning = false;
-        } else if (pauseSpin || polls >= 4000) {
-            PollSleep();
-        } else {
-            std::this_thread::yield();
+            if (std::chrono::steady_clock::now() - spinStart > spinLimit) {
+                // The first blocking round reads its token before it checks anything.
+                spinning = false;
+                listen();
+                continue;
+            }
         }
         CheckFailure();
-        if (pollService(!spinning)) return;
-        if (storeHeldResults && !spinning && (polls & 31u) == 0) GuestMemory::FlushGpuWrites(awaited, awaitedBytes);
+        if (pollService(!spinning)) {
+            ended(PollStats::EndTable);
+            return;
+        }
+        const auto serviced = std::chrono::steady_clock::now();
+        if (storeHeldResults && !spinning && serviced - lastHeldFlush >= HeldFlushInterval) {
+            lastHeldFlush = serviced;
+            GuestMemory::FlushGpuWrites(awaited, awaitedBytes);
+        }
         noteAwaitingTitle(queue, awaited);
-        if (requireMemory && (polls & 15u) == 0) {
-            std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
-            if (settleLock.owns_lock()) {
+        if (requireMemory && serviced - lastSettle >= SettleInterval) {
+            lastSettle = serviced;
+            if (std::unique_lock settleLock(GuestMemory::GpuMutex(), std::defer_lock); tryGpu(settleLock)) {
                 if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) {
                     epochPoint.exit = ExitSettled;
+                    ended(PollStats::EndSettled);
                     return;
                 }
+            }
+        }
+        if (!spinning) {
+            // GPU progress ends this wait only when a pending GPU write or a completion holds its
+            // value; a write noted later is a range event, which brings the wait back here. The
+            // reaping queues listen always: the completions they run land other queues' values.
+            const bool onGpu = behindCompletion || ownStoreUnlanded || Graphics::Recorder::SnapshotWriteOverlaps(awaited, awaitedBytes);
+            const bool reaps = reapAll || (queue0Dormant.load(std::memory_order_relaxed) && completionsPending());
+            const bool progressOn = events->Listen(WaitEvents::Progress, reaps || requireMemory || onGpu);
+            const bool labelsOn = events->Listen(WaitEvents::Labels, unclosedLabel);
+            if (progressOn || labelsOn) {
+                // An event of a kind just turned on may have passed: check again before sleeping.
+                consult = true;
+                continue;
+            }
+            // A producer the driver knows of announces itself through the events; without one the
+            // value can only come from a guest CPU store, which has no event: the short timed wait.
+            std::uint64_t ignored = 0;
+            const bool producerKnown = onGpu || findWaitProducer(awaited, awaitedBytes, ignored);
+            auto timeout = producerKnown ? EventFallback : CpuStoreInterval;
+            if (const auto since = Graphics::Recorder::PendingLabelSince(); since.has_value()) {
+                const auto due = std::max(*since + labelFlushDeadline(), lastTry + PollTryInterval);
+                timeout = std::clamp(std::chrono::duration_cast<std::chrono::microseconds>(due - serviced), std::chrono::microseconds(50), timeout);
+            }
+            const auto blockedAt = pollProfile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            timerWoke = !events->Wait(eventToken, timeout);
+            const auto arrived = events->TakeArrived();
+            consult = timerWoke || (arrived & (WaitEvents::Range | WaitEvents::Labels)) != 0;
+            if (pollProfile) {
+                ++poll.blocks;
+                ++(timerWoke ? (producerKnown ? poll.timerWakesKnown : poll.timerWakesCpu) : poll.eventWakes);
+                poll.blockedUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - blockedAt).count();
+                for (std::size_t kind = 0; kind < poll.wakeKinds.size(); ++kind) poll.wakeKinds[kind] += (arrived >> kind) & 1u;
             }
         }
         if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
@@ -475,6 +566,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     }
     ++outcomes.polled;
+    ended(PollStats::EndMemory);
     if (storedByOwnLabel()) epochPoint.bump = false;
 }
 

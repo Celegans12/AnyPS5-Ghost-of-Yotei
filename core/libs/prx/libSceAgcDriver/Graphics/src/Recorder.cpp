@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitEvents.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
@@ -1331,6 +1332,8 @@ struct Recorder::ProgressWatcher {
                 if (counterValue(device, timeline, &value) != VK_SUCCESS) value = target;
                 seen = std::max(target, value);
                 KernelWakeSleepers_nid_no_patch();
+                // A worker blocked on a value the GPU computes, or on a completion it must reap.
+                WaitEvents::Signal(WaitEvents::Progress);
             }
         });
     }
@@ -1803,8 +1806,9 @@ void Recorder::CloseLabelGroup(std::uint64_t trackerGeneration) {
         const auto found = recorded.find(dword);
         if (found != recorded.end() && found->second.stamp == stamp && found->second.batch != nullptr && !found->second.batch->submitted) found->second.generation = trackerGeneration;
     }
-    // A poller that refused the group as unclosed re-consults the table on the next generation.
+    // A waiter that refused the group as unclosed re-consults the table on the next generation.
     writeGeneration.fetch_add(1, std::memory_order_release);
+    WaitEvents::Signal(WaitEvents::Labels);
 }
 
 void Recorder::NoteQueuedLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
@@ -4271,8 +4275,11 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     open->writeValues.push_back(static_cast<std::int16_t>(value));
     open->writeWords.push_back(word);
     if (!ownLabel) markOverwritten(address, end);
-    // A poller waiting on this range learns that the open batch may now hold its producer.
-    if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
+    // A waiter on this range learns that the open batch may now hold its producer.
+    if (activeRecorder == this) {
+        writeGeneration.fetch_add(1, std::memory_order_release);
+        WaitEvents::SignalRange(address, bytes);
+    }
     // Consecutive dispatches write the same output buffers: a range the snapshot already contains
     // leaves the published union unchanged, so the O(N log N) rebuild is skipped.
     if (SnapshotCovers(address, end)) {
@@ -4304,7 +4311,10 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writeValues.push_back(-1);
     batch.writeWords.push_back(-1);
     if (!ownLabel) markOverwritten(address, address + bytes);
-    if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
+    if (activeRecorder == this) {
+        writeGeneration.fetch_add(1, std::memory_order_release);
+        WaitEvents::SignalRange(address, bytes);
+    }
     if (!SnapshotCovers(address, address + bytes)) {
         const std::array ranges{std::pair{address, address + bytes}};
         publishPendingWrites(ranges);
@@ -5631,6 +5641,8 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     // its entry and belongs to another batch). Correctness never depended on this removal.
     removeLabels(*batch);
     release(*batch);
+    // The batch's completions stored their values and its writes left the pending snapshot.
+    WaitEvents::Signal(WaitEvents::Progress);
 }
 
 void Recorder::discard(std::unique_ptr<Batch> batch) noexcept {

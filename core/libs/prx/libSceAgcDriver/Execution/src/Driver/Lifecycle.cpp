@@ -186,7 +186,7 @@ void Driver::stop() {
             worker.queued.store(0, std::memory_order_release);
         }
     }
-    changed.notify_all();
+    WaitEvents::NotifyState(changed);
     for (auto& [queue, worker] : workers) {
         if (worker.thread.joinable()) worker.thread.join();
     }
@@ -344,7 +344,7 @@ void Driver::ReleaseSettled() {
         std::lock_guard lock(mutex);
         captureHold.store(false, std::memory_order_relaxed);
     }
-    changed.notify_all();
+    WaitEvents::NotifyState(changed);
 }
 
 std::vector<AwaitedWait> Driver::AwaitedWaits() {
@@ -406,7 +406,7 @@ void Driver::ReportFailure(std::exception_ptr error) {
         }
         if (first) PrintFailure(error);
     }
-    changed.notify_all();
+    WaitEvents::NotifyState(changed);
 }
 
 void Driver::rethrowFailure() const {

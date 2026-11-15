@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitEvents.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
@@ -3344,6 +3345,8 @@ void GpuMutexType::unlock() {
         // Still the holder here: the hold ends when the mutex is given up, not before.
         if (GpuHoldProfiled()) EndHold();
         mutex.unlock();
+        // A waiter whose try failed services its wait once the hold ends.
+        WaitEvents::SignalMutexFree();
     }
     // After the release, so what the hook does (destroying a batch's kept objects) is neither part
     // of the hold nor waited for by the next holder.

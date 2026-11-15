@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/WaitEvents.hpp"
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -10,14 +11,18 @@ namespace AgcDriver::DriverDetail {
 
 void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
     if (!KeepsLabelStore(address, bytes.size())) return;
-    std::lock_guard lock(labelStoresMutex);
-    for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {
-        auto& history = labelStores[address + offset];
-        std::shift_right(history.begin(), history.end(), 1);
-        history[0].stamp = stamp;
-        history[0].queue = queue;
-        std::memcpy(&history[0].value, bytes.data() + offset, 4);
+    {
+        std::lock_guard lock(labelStoresMutex);
+        for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {
+            auto& history = labelStores[address + offset];
+            std::shift_right(history.begin(), history.end(), 1);
+            history[0].stamp = stamp;
+            history[0].queue = queue;
+            std::memcpy(&history[0].value, bytes.data() + offset, 4);
+        }
     }
+    // A wait on this label is resolved from the record (storedSince), with no GPU completion.
+    WaitEvents::SignalRange(address, bytes.size());
 }
 
 void Driver::noteLabelPass(std::span<const std::uint32_t> packet, std::uint32_t queue) {
