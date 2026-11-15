@@ -2,10 +2,12 @@
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <array>
 #include <atomic>
+#include <cstdlib>
 #include <iostream>
 #include <set>
 #include <string>
 #include <thread>
+#include <vector>
 
 namespace {
 using Mappings = GuestArena::WindowsMappings;
@@ -1060,6 +1062,9 @@ void CheckLockCounts() {
     const auto absent = outcome(Mappings::ForgetOutcome::Absent);
     const auto empty = outcome(Mappings::ForgetOutcome::Empty);
     Require(after.forgets[absent] + after.forgets[empty] == reset.forgets[absent] + reset.forgets[empty] + 1, "a forget over a range without known zero pages was not counted as one");
+    mappings.Commit(memory, Bytes, PAGE_READWRITE, Bytes, true);
+    mappings.ForgetKnownZero(address, Small);
+    const auto recommitted = mappings.LockCounted();
     std::atomic<bool> stop{false};
     std::thread collector([&] {
         std::array<void*, 32> pages{};
@@ -1068,7 +1073,7 @@ void CheckLockCounts() {
             mappings.Collect(address, Bytes, pages.data(), &found, false);
         }
     });
-    for (int round = 0; round < 20000; ++round) mappings.ForgetKnownZero(address, Bytes);
+    for (int round = 0; round < 20000; ++round) mappings.ForgetKnownZero(address, Small);
     stop.store(true, std::memory_order_release);
     collector.join();
     const auto contended = mappings.LockCounted();
@@ -1079,8 +1084,122 @@ void CheckLockCounts() {
         for (std::size_t holder = 0; holder < GuestArena::MappingLockSites; ++holder) behind += counts.behindNs[holder];
         Require(behind == counts.waitNs, "the waits of a site are not all charged to a holder");
     }
-    Require(contended.sites[forget].acquisitions == after.sites[forget].acquisitions + 20000, "contended forgets were not all counted");
+    Require(contended.sites[forget].acquisitions == recommitted.sites[forget].acquisitions + 20000, "contended forgets were not all counted");
+    mappings.Reset(memory, Bytes);
     VirtualFree(memory, 0, MEM_RELEASE);
+}
+
+void CheckKnownZeroFilter(bool filtered) {
+    auto& mappings = Mappings::Get();
+    constexpr std::size_t Span = 4 * Bytes;
+    const auto pages = Span / Small;
+    auto* memory = static_cast<unsigned char*>(mappings.Reserve(nullptr, Span));
+    Require(memory != nullptr, "known zero filter reservation failed");
+    mappings.Commit(memory, Span, PAGE_READWRITE, Span, true);
+    const auto address = reinterpret_cast<std::uintptr_t>(memory);
+    const auto locked = [&] { return mappings.LockCounted().sites[static_cast<std::size_t>(Mappings::LockSite::Forget)].acquisitions; };
+    std::set<std::size_t> gone;
+    const auto forgotten = [&](std::size_t first, std::size_t count) {
+        for (auto page = first; page < first + count; ++page) gone.insert(page);
+    };
+    Require(KnownZeroPages(memory, Span) == PagesBelow(pages), "a fresh watched commit of several blocks is not known zero");
+    auto before = locked();
+    mappings.ForgetKnownZero(address + 2 * Small, Small);
+    forgotten(2, 1);
+    Require(locked() == before + 1, "a forget over a known zero page did not take the mapping lock");
+    Require(KnownZeroPages(memory, Span) == PagesBelow(pages, gone), "a forget did not clear exactly its page");
+    mappings.ForgetKnownZero(address + 2 * Small, Small);
+    Require(locked() == before + 2, "a forget in a block that still holds known zero pages did not take the mapping lock");
+    mappings.ForgetKnownZero(address + Bytes, Bytes);
+    forgotten(16, 16);
+    Require(KnownZeroPages(memory, Span) == PagesBelow(pages, gone), "a forget did not clear exactly its block");
+    before = locked();
+    mappings.ForgetKnownZero(address + Bytes + 4 * Small, 3 * Small);
+    mappings.ForgetKnownZero(address + Bytes, Bytes);
+    mappings.ForgetKnownZero(address + Bytes + 1, 1);
+    Require(locked() == before + (filtered ? 0 : 3), filtered ? "a forget over a block without known zero pages took the mapping lock" : "a forget skipped the mapping lock with the filter switched off");
+    Require(KnownZeroPages(memory, Span) == PagesBelow(pages, gone), "a forget that found nothing changed the known zero pages");
+    before = locked();
+    mappings.ForgetKnownZero(address + 2 * Bytes - Small, 2 * Small);
+    forgotten(32, 1);
+    Require(locked() == before + 1, "a forget reaching a known zero page of the next block did not take the mapping lock");
+    Require(KnownZeroPages(memory, Span) == PagesBelow(pages, gone), "a forget across two blocks did not clear the known zero page it reached");
+    for (std::size_t page = 48; page < 64; ++page) static_cast<volatile unsigned char*>(memory)[page * Small] = 1;
+    std::vector<void*> written(pages);
+    std::size_t count = written.size();
+    Require(mappings.Collect(address, Span, written.data(), &count, true), "known zero filter collect failed");
+    forgotten(48, 16);
+    Require(KnownZeroPages(memory, Span) == PagesBelow(pages, gone), "a collected store stayed known zero");
+    before = locked();
+    mappings.ForgetKnownZero(address + 3 * Bytes, Bytes);
+    Require(locked() == before + (filtered ? 0 : 1), filtered ? "a forget over a block whose stores were collected took the mapping lock" : "a forget skipped the mapping lock with the filter switched off");
+    mappings.Reset(memory, Span);
+    Require(KnownZeroPages(memory, Span).empty(), "a reset range stayed known zero");
+    before = locked();
+    mappings.ForgetKnownZero(address, Span);
+    Require(locked() == before + (filtered ? 0 : 1), filtered ? "a forget over a reset range took the mapping lock" : "a forget skipped the mapping lock with the filter switched off");
+    mappings.Commit(memory, Span, PAGE_READWRITE, Span, true);
+    Require(KnownZeroPages(memory, Span) == PagesBelow(pages), "a recommitted range is not known zero");
+    before = locked();
+    mappings.ForgetKnownZero(address + Bytes + 4 * Small, 3 * Small);
+    Require(locked() == before + 1, "a forget over a recommitted page did not take the mapping lock");
+    Require(KnownZeroPages(memory, Span) == PagesBelow(pages, {20, 21, 22}), "a forget after a recommit left its pages known zero");
+    mappings.Reset(memory, Span);
+    VirtualFree(memory, 0, MEM_RELEASE);
+}
+
+void CheckKnownZeroFilterRaces(bool filtered) {
+    auto& mappings = Mappings::Get();
+    constexpr std::size_t Workers = 4;
+    constexpr std::size_t Span = 2 * Bytes;
+    constexpr std::size_t Rounds = 200;
+    constexpr std::uintptr_t Alias = std::uintptr_t{1} << 32;
+    const auto pages = Span / Small;
+    std::array<unsigned char*, Workers> regions{};
+    for (std::uintptr_t base = std::uintptr_t{0x210} << 32; base < (std::uintptr_t{0x400} << 32); base += Alias * Workers) {
+        std::size_t reserved = 0;
+        while (reserved < Workers && (regions[reserved] = static_cast<unsigned char*>(mappings.Reserve(reinterpret_cast<void*>(base + reserved * Alias), Span))) != nullptr) ++reserved;
+        if (reserved == Workers) break;
+        for (std::size_t index = 0; index < reserved; ++index) VirtualFree(regions[index], 0, MEM_RELEASE);
+        regions = {};
+    }
+    Require(regions[0] != nullptr, "cannot reserve test ranges four gibibytes apart");
+    std::array<const char*, Workers> failures{};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> workers;
+    for (std::size_t worker = 0; worker < Workers; ++worker) {
+        workers.emplace_back([&, worker] {
+            auto* memory = regions[worker];
+            const auto address = reinterpret_cast<std::uintptr_t>(memory);
+            const auto check = [&](bool condition, const char* message) {
+                if (!condition && failures[worker] == nullptr) failures[worker] = message;
+            };
+            while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+            for (std::size_t round = 0; round < Rounds && failures[worker] == nullptr; ++round) {
+                mappings.Commit(memory, Span, PAGE_READWRITE, Span, true);
+                check(KnownZeroPages(memory, Span) == PagesBelow(pages), "a commit racing other ranges' forgets is not known zero");
+                const auto first = (round * 7 + worker) % pages;
+                const auto count = std::min<std::size_t>(1 + round % 5, pages - first);
+                mappings.ForgetKnownZero(address + first * Small, count * Small);
+                std::set<std::size_t> gone;
+                for (auto page = first; page < first + count; ++page) gone.insert(page);
+                check(KnownZeroPages(memory, Span) == PagesBelow(pages, gone), "a forget racing the commits and forgets of other ranges did not clear exactly its pages");
+                mappings.ForgetKnownZero(address, Span);
+                check(KnownZeroPages(memory, Span).empty(), "a forget of a whole range racing the commits and forgets of other ranges left a page known zero");
+                mappings.ForgetKnownZero(address + Small, Small);
+                check(KnownZeroPages(memory, Span).empty(), "a forget that found nothing marked a page known zero");
+                mappings.Reset(memory, Span);
+            }
+        });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto& worker : workers) worker.join();
+    for (const auto* failure : failures) Require(failure == nullptr, failure != nullptr ? failure : "");
+    const auto before = mappings.LockCounted().sites[static_cast<std::size_t>(Mappings::LockSite::Forget)].acquisitions;
+    for (auto* memory : regions) mappings.ForgetKnownZero(reinterpret_cast<std::uintptr_t>(memory), Span);
+    const auto after = mappings.LockCounted().sites[static_cast<std::size_t>(Mappings::LockSite::Forget)].acquisitions;
+    Require(after == before + (filtered ? 0 : Workers), filtered ? "the block counts of ranges that hold no known zero page are not back to zero" : "a forget skipped the mapping lock with the filter switched off");
+    for (auto* memory : regions) VirtualFree(memory, 0, MEM_RELEASE);
 }
 
 void CheckKnownZeroShared() {
@@ -1092,6 +1211,15 @@ int main(int argc, char** argv) {
     auto* handler = AddVectoredExceptionHandler(1, HandleWrite);
     try {
         Require(handler != nullptr, "cannot install test handler");
+        if (argc > 1 && std::string(argv[1]) == "--no-known-zero-filter") {
+            Require(_putenv_s("APS5_NO_KNOWN_ZERO_FILTER", "1") == 0, "cannot set APS5_NO_KNOWN_ZERO_FILTER");
+            CheckKnownZeroPrivate();
+            CheckKnownZeroFilter(false);
+            CheckKnownZeroFilterRaces(false);
+            std::cout << "Windows known zero tests without the filter passed\n";
+            RemoveVectoredExceptionHandler(handler);
+            return 0;
+        }
         if (argc > 1 && std::string(argv[1]) == "--verify-direct") {
             CheckVerifiedPrivateCollect();
             std::cout << "Windows verified private collect tests passed\n";
@@ -1128,6 +1256,8 @@ int main(int argc, char** argv) {
         CheckKnownZeroShared();
         CheckKnownZeroFirstReads();
         CheckLockCounts();
+        CheckKnownZeroFilter(true);
+        CheckKnownZeroFilterRaces(true);
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

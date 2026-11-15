@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstddef>
@@ -586,10 +587,13 @@ public:
 
     void ForgetKnownZero(std::uintptr_t address, std::size_t bytes) {
         if (bytes == 0 || bytes > UINTPTR_MAX - address) return;
+        if (zeroFilterAnswers() && !mayHoldZero(address, address + bytes)) {
+            forgetOutcomes[static_cast<std::size_t>(ForgetOutcome::Absent)].fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
         const SiteLock lock(mutex, LockSite::Forget);
         const auto outcome = zeroPages.empty() ? ForgetOutcome::Empty : !zeroChunkIn(address, address + bytes) ? ForgetOutcome::Absent : forgetZero(address, address + bytes) ? ForgetOutcome::Cleared : ForgetOutcome::Kept;
-        auto& counted = forgetOutcomes[static_cast<std::size_t>(outcome)];
-        counted.store(counted.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        forgetOutcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
     }
 
     void KnownZero(std::uintptr_t address, std::size_t bytes, void (*zero)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context) {
@@ -878,17 +882,66 @@ private:
             const auto chunk = start & ~(chunkBytes - 1);
             const auto stop = std::min(end, chunk + chunkBytes);
             auto& bits = zeroPages[chunk];
-            for (auto bit = (start - chunk) >> 12; bit < (stop - chunk) >> 12; ++bit) bits[bit >> 6] |= std::uint64_t{1} << (bit & 63);
+            for (auto block = start & ~(zeroBlockBytes - 1); block < stop; block += zeroBlockBytes) {
+                auto& word = bits[(block - chunk) >> 18];
+                const auto added = zeroBlockMask(chunk, block, start, stop) & ~word;
+                if (added == 0) continue;
+                if (auto* count = zeroCount(block, true)) count->fetch_add(static_cast<std::uint8_t>(std::popcount(added)));
+                word |= added;
+            }
             start = stop;
         }
     }
 
-    static bool clearZeroBits(auto& bits, std::uintptr_t chunk, std::uintptr_t from, std::uintptr_t to) {
+    static std::uint64_t zeroBlockMask(std::uintptr_t chunk, std::uintptr_t block, std::uintptr_t from, std::uintptr_t to) {
+        const auto first = std::max(from, block);
+        const auto last = std::min(to, block + zeroBlockBytes);
+        if (first >= last) return 0;
+        return ((std::uint64_t{1} << ((last - first) >> 12)) - 1) << (((first - chunk) >> 12) & 63);
+    }
+
+    std::atomic<std::uint8_t>* zeroCount(std::uintptr_t block, bool create) {
+        const auto index = block / zeroBlockBytes;
+        if (index / zeroLeafBlocks >= zeroLeaves) return nullptr;
+        auto& slot = zeroCounts[index / zeroLeafBlocks];
+        auto* leaf = slot.load(std::memory_order_relaxed);
+        if (leaf == nullptr) {
+            if (!create) return nullptr;
+            leaf = new ZeroLeaf();
+            slot.store(leaf);
+        }
+        return &(*leaf)[index % zeroLeafBlocks];
+    }
+
+    static bool zeroFilterAnswers() {
+        static const bool answers = std::getenv("APS5_NO_KNOWN_ZERO_FILTER") == nullptr;
+        return answers;
+    }
+
+    bool mayHoldZero(std::uintptr_t start, std::uintptr_t end) const {
+        const auto first = start / zeroBlockBytes;
+        const auto last = (end - 1) / zeroBlockBytes;
+        if (last - first >= zeroUnlockedBlocks || last / zeroLeafBlocks >= zeroLeaves) return true;
+        for (auto block = first; block <= last; ++block) {
+            const auto* leaf = zeroCounts[block / zeroLeafBlocks].load();
+            if (leaf == nullptr) {
+                block |= zeroLeafBlocks - 1;
+                continue;
+            }
+            if ((*leaf)[block % zeroLeafBlocks].load() != 0) return true;
+        }
+        return false;
+    }
+
+    bool clearZeroBits(auto& bits, std::uintptr_t chunk, std::uintptr_t from, std::uintptr_t to) {
         bool cleared = false;
-        for (auto bit = (from - chunk) >> 12; bit < (to - chunk) >> 12; ++bit) {
-            const auto mask = std::uint64_t{1} << (bit & 63);
-            cleared = cleared || (bits[bit >> 6] & mask) != 0;
-            bits[bit >> 6] &= ~mask;
+        for (auto block = from & ~(zeroBlockBytes - 1); block < to; block += zeroBlockBytes) {
+            auto& word = bits[(block - chunk) >> 18];
+            const auto removed = zeroBlockMask(chunk, block, from, to) & word;
+            if (removed == 0) continue;
+            word &= ~removed;
+            if (auto* count = zeroCount(block, false)) count->fetch_sub(static_cast<std::uint8_t>(std::popcount(removed)));
+            cleared = true;
         }
         return cleared;
     }
@@ -1094,6 +1147,12 @@ private:
     static constexpr std::size_t subpages = pageBytes / subpageBytes;
     static constexpr std::uint8_t allSubpages = (1u << subpages) - 1;
     static constexpr std::size_t chunkBytes = 0x200000;
+    static constexpr std::size_t zeroBlockBytes = 0x10000;
+    static constexpr std::size_t zeroLeafBlocks = std::size_t{1} << 16;
+    static constexpr std::size_t zeroLeaves = std::size_t{1} << 15;
+    static constexpr std::size_t zeroUnlockedBlocks = std::size_t{1} << 12;
+    static_assert(chunkBytes % zeroBlockBytes == 0 && zeroBlockBytes / 4096 <= 64 && 64 % (zeroBlockBytes / 4096) == 0, "a known zero block is one aligned field of a chunk word");
+    using ZeroLeaf = std::array<std::atomic<std::uint8_t>, zeroLeafBlocks>;
     struct SharedPage {
         std::array<std::uint64_t, subpages> generation = [] {
             std::array<std::uint64_t, subpages> initial{};
@@ -1825,6 +1884,7 @@ private:
 
     SiteMutex mutex;
     std::array<std::atomic<std::uint64_t>, MappingForgetOutcomes> forgetOutcomes{};
+    std::array<std::atomic<ZeroLeaf*>, zeroLeaves> zeroCounts{};
     HANDLE zeroSection = nullptr;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;
