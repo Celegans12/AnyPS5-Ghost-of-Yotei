@@ -259,18 +259,21 @@ buffer regions often span two mappings and no single import served them. Found a
   sit at a 4 KiB base that is not a 64 KiB base and so have no block units: they are written
   back and uploaded whole. GPU time per present on `libs\i4`: storage write-back 10.1 ms
   (307 MiB), storage upload 8.1 ms (281 MiB), staging 3.7 ms, of 38 ms.
-- Block units at 4 KiB bases (c5bf9f081a, `libs\j3`, **built, off by default, not yet a gain**;
-  `APS5_UNALIGNED_BLOCK_UNITS=1`): the first unit is the short piece before the first stamp
-  block boundary, so unit k stays block k of the surface; admitted when every level's tile block
-  divides 4 KiB (007's tile mode 2, not its 64 KiB modes). With it on, 007's storage upload and
-  write-back cost 3.3 and 2.6 ms of GPU time per present (8.1 and 10.1 off) and the first 60 s
-  of the scene run at 74 to 77 ms (80 to 97 off), but after 60 s the frame is 110 to 113 ms
-  (about 80 off) in every run: syncs wait 19 s for the GPU per run instead of 3.4 s (untagged
-  threads' pending-write syncs 0.5 to 6.7 s, idle syncs 2.1 to 5.4 s; `Recorder.Sync` 0.1 to
-  20 ms per frame on the main worker). Suspected, not shown: the short first and last units
-  share a stamp block with neighbouring CPU-written data. A first try with units cut relative to
-  the base (`probe-patches\unaligned-block-units-relative.patch`) was wrong: per-unit state is
-  indexed by stamp block. Tests 1,808 of 1,808 with the switch on and off, section A on and off.
+- Block units at 4 KiB bases (c5bf9f081a, **reverted**, `failed-patches\phase4-unaligned-block-units.patch`):
+  the first unit was the short piece before the first stamp block boundary; admitted when every
+  level's tile block divides 4 KiB (007's tile mode 2). It cut 007's storage upload and
+  write-back to 3.3 and 2.6 ms of GPU time per present (8.1 and 10.1 without), but the frame
+  did not follow. Back to back on 007 (2 rounds, 10-second intervals after warm-up): default 70
+  to 99 ms; unit shadows off 70 to 81; new units with shadows off 74 to 88; new units with
+  shadows on 76 to 119. Cause of the last: those surfaces stored into unit shadows for the
+  first time, and a live shadow makes each label's "readback before label" store wait for the
+  GPU (511 waits, 16 s per run). Storing them straight to the import again did not recover it,
+  and their refreshes still waited ("storage refresh" 325 waits against 45: a refresh with
+  pending units of its own may not flush in order; `APS5_TRACE_REFRESH_ORDER=1` prints why).
+- Unit shadows off (`APS5_NO_UNIT_SHADOW=1`, same build, `libs\k1`) was the steadiest 007
+  configuration above, and in one run each (shadows-on run first, so order may count): FF 34.5
+  to 30.9 ms, LEGO 48.6 to 47.6, AoM 150.8 to 146.8. The shadow is step 1's mechanism, so the
+  default is unchanged; whether step 1 as built pays for itself is open for the user.
 - f8e0ee64d4: eight `thread_local` caches of the direct path had destructors; the draw committer
   crashed in one at thread exit (`agc_driver_village_draw_cost` hung in 9 of 120 runs with
   section A off). They use `ThreadScratch` now; 150 of 150 runs pass.
@@ -280,8 +283,8 @@ Build plan that follows from this, in order:
 1. Section B for storage images: a device-local copy of the guest ranges that storage images
    exchange. A write-back whose reader is another image goes to that copy, and the upload reads
    it. Host memory is still written (eagerly) at this step. Expected: 007 storage-upload from the
-   import gone (7 ms). Exists for 64 KiB bases (see the correction above); what is left is block
-   units for surfaces at 4 KiB bases.
+   import gone (7 ms). Exists for 64 KiB bases (see the correction above). Block units for
+   surfaces at 4 KiB bases were tried and reverted (above).
 2. GPU-owned: blocks whose newest content is in that copy become no-access; a guest or host read
    faults and stores them first. Then the eager write-back to host memory goes (007 9 to 12 ms,
    AoM 7.5 ms, FF 1.1 ms). Needs a read-fault path that can wait for the GPU from a guest thread;
