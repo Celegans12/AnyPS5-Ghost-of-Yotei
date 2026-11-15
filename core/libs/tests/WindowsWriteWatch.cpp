@@ -20,7 +20,8 @@ void Require(bool condition, const char* message) {
 
 LONG CALLBACK HandleWrite(EXCEPTION_POINTERS* exception) {
     const auto* record = exception->ExceptionRecord;
-    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || record->ExceptionInformation[0] != 1) return EXCEPTION_CONTINUE_SEARCH;
+    if (record->ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record->NumberParameters < 2 || record->ExceptionInformation[0] > 1) return EXCEPTION_CONTINUE_SEARCH;
+    if (record->ExceptionInformation[0] == 0) return Mappings::Get().HandleRead(record->ExceptionInformation[1]) ? EXCEPTION_CONTINUE_EXECUTION : EXCEPTION_CONTINUE_SEARCH;
     if (!Mappings::Get().HandleWrite(record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_SEARCH;
     ++faults;
     return EXCEPTION_CONTINUE_EXECUTION;
@@ -1110,6 +1111,131 @@ void CheckProtectedPrivate() {
     VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+std::atomic<unsigned> trapCalls{0};
+std::atomic<unsigned char> trapFill{0};
+std::atomic<DWORD> trapThread{0};
+std::atomic<bool> trapQuiet{false};
+std::atomic<bool> trapEnded{false};
+
+// Stands for the driver's resolver: stores the newest content, then releases its trap.
+void ResolveTestTrap(std::uintptr_t begin, std::uintptr_t end) {
+    ++trapCalls;
+    trapThread = GetCurrentThreadId();
+    if (trapQuiet) Sleep(20);
+    else std::memset(reinterpret_cast<void*>(begin), trapFill.load(), end - begin);
+    Mappings::Get().ReleaseReads(begin, end);
+    trapEnded = true;
+}
+
+void CheckReadTraps() {
+    auto& mappings = Mappings::Get();
+    Mappings::EnableWriteFaults(true);
+    constexpr std::size_t Total = 8 * Bytes;
+    auto* memory = static_cast<unsigned char*>(mappings.Reserve(nullptr, Total));
+    Require(memory != nullptr, "private reservation failed");
+    mappings.Commit(memory, Total, PAGE_READWRITE, Total, true);
+    const auto address = reinterpret_cast<std::uintptr_t>(memory);
+    const auto protection = [&](std::size_t offset) { return RegionAt(memory + offset).Protect; };
+    const auto load = [&](std::size_t offset) { return static_cast<const volatile unsigned char*>(memory)[offset]; };
+    const auto trappedBytes = [&] {
+        std::size_t bytes = 0;
+        mappings.ReadTraps(address, address + Total, +[](void* context, std::uintptr_t begin, std::uintptr_t end) { *static_cast<std::size_t*>(context) += end - begin; }, &bytes);
+        return bytes;
+    };
+
+    Require(!mappings.TrapReads(address, address + Small), "a read trap was set without a resolver");
+    Require(mappings.SetReadTrapResolver(&ResolveTestTrap), "cannot set the read trap resolver");
+    Require(!mappings.TrapReads(address, address), "an empty read trap was set");
+
+    // A read parks its thread; the resolver thread stores, and the read sees the stored bytes.
+    trapFill = 0x5a;
+    Require(mappings.TrapReads(address, address + Small) && mappings.TrapReads(address, address + Small), "cannot set a read trap twice");
+    Require(protection(0) == PAGE_NOACCESS && protection(Small) == PAGE_READWRITE, "a trapped page is not no-access, or its neighbour is");
+    Require(trappedBytes() == Small, "the trapped page was not reported");
+    std::uint32_t logical = 0;
+    Require(mappings.Protection(address, &logical) && logical == PAGE_READWRITE, "a trapped page did not report its guest protection");
+    Require(load(16) == 0x5a, "a trapped read did not see the resolver's bytes");
+    Require(trapCalls == 1 && trapThread != GetCurrentThreadId(), "the resolver did not run once on its own thread");
+    Require(protection(0) == PAGE_READWRITE && trappedBytes() == 0, "a resolved page stayed trapped");
+    Require(load(17) == 0x5a && trapCalls == 1, "a second read resolved again");
+
+    // A store faults the same way; the resolver's bytes land first.
+    trapFill = 0x11;
+    Require(mappings.TrapReads(address + Bytes, address + Bytes + Small), "cannot set a read trap");
+    static_cast<volatile unsigned char*>(memory)[Bytes + 8] = 7;
+    Require(load(Bytes + 8) == 7 && load(Bytes + 9) == 0x11 && trapCalls == 2, "a store into a trapped page did not resolve it first");
+
+    // A released trap opens its pages without a resolver call.
+    Require(mappings.TrapReads(address + 2 * Bytes, address + 2 * Bytes + 2 * Small), "cannot set a read trap");
+    mappings.ReleaseReads(address + 2 * Bytes, address + 2 * Bytes + 2 * Small);
+    Require(protection(2 * Bytes) == PAGE_READWRITE && load(2 * Bytes) == 0 && trapCalls == 2, "a released trap stayed, or resolved");
+
+    // Two traps sharing a page: the page opens when the second is released.
+    Require(mappings.TrapReads(address + 3 * Bytes, address + 3 * Bytes + 100) && mappings.TrapReads(address + 3 * Bytes + 200, address + 3 * Bytes + 300), "cannot set two read traps in one page");
+    mappings.ReleaseReads(address + 3 * Bytes, address + 3 * Bytes + 100);
+    Require(protection(3 * Bytes) == PAGE_NOACCESS, "a page two traps share opened with the first release");
+    mappings.ReleaseReads(address + 3 * Bytes + 200, address + 3 * Bytes + 300);
+    Require(protection(3 * Bytes) == PAGE_READWRITE, "a page two traps shared stayed trapped");
+
+    // An armed (read-only) page can be trapped; it is writable to the guest afterwards.
+    std::array<void*, 256> pages{};
+    auto count = pages.size();
+    Require(mappings.Collect(address, Total, pages.data(), &count, true), "collecting private memory failed");
+    Require(protection(4 * Bytes) == PAGE_READONLY, "a collected private allocation was not armed");
+    trapFill = 0x22;
+    Require(mappings.TrapReads(address + 4 * Bytes, address + 4 * Bytes + Small), "an armed page could not be trapped");
+    Require(protection(4 * Bytes) == PAGE_NOACCESS, "a trapped armed page is not no-access");
+    count = pages.size();
+    Require(mappings.Collect(address, Total, pages.data(), &count, true) && protection(4 * Bytes) == PAGE_NOACCESS, "a collect armed or opened a trapped page");
+    Require(load(4 * Bytes + 1) == 0x22 && trapCalls == 3 && protection(4 * Bytes) == PAGE_READWRITE, "a trapped armed page did not resolve to read-write");
+
+    // A host write resolves the traps over its range on the calling thread before it opens it.
+    trapFill = 0x33;
+    Require(mappings.TrapReads(address + 5 * Bytes, address + 5 * Bytes + Small), "cannot set a read trap");
+    Require(mappings.BeginHostWrite(address + 5 * Bytes, Small), "host write refused");
+    Require(trapCalls == 4 && trapThread == GetCurrentThreadId() && protection(5 * Bytes) == PAGE_READWRITE, "a host write did not resolve its trap first");
+    Require(!mappings.TrapReads(address + 5 * Bytes, address + 5 * Bytes + Small), "a read trap was set under a host write");
+    const unsigned char value = 9;
+    SIZE_T moved = 0;
+    Require(WriteProcessMemory(GetCurrentProcess(), memory + 5 * Bytes, &value, 1, &moved) && moved == 1, "a kernel write into resolved memory failed");
+    mappings.EndHostWrite(address + 5 * Bytes, Small);
+    Require(load(5 * Bytes) == 9 && load(5 * Bytes + 1) == 0x33, "a host write over a trap lost bytes");
+
+    // A thread the bypass names gets the page opened at once, without the resolver.
+    static std::atomic<bool> bypassing{false};
+    mappings.SetReadTrapBypass(+[] { return bypassing.load(); });
+    Require(mappings.TrapReads(address + 6 * Bytes, address + 6 * Bytes + 2 * Small), "cannot set a read trap");
+    bypassing = true;
+    Require(load(6 * Bytes) == 0 && trapCalls == 4, "a bypassed read ran the resolver");
+    bypassing = false;
+    Require(protection(6 * Bytes) == PAGE_READWRITE && protection(6 * Bytes + Small) == PAGE_NOACCESS, "a bypassed read opened more or less than its page");
+    trapFill = 0x44;
+    Require(load(6 * Bytes + Small) == 0x44 && load(6 * Bytes) == 0x44 && trapCalls == 5, "the rest of a bypassed trap did not resolve");
+    mappings.SetReadTrapBypass(nullptr);
+
+    // Many readers of one trapped page: one resolver call, and no reader resumes before it ended.
+    // The resolver leaves the bytes alone here (the driver stores on the GPU, which keeps the
+    // pages closed; a resolver's own CPU store opens its page at once).
+    trapQuiet = true;
+    trapEnded = false;
+    Require(mappings.TrapReads(address + 7 * Bytes, address + 7 * Bytes + Small), "cannot set a read trap");
+    std::array<std::thread, 8> readers;
+    std::array<bool, 8> after{};
+    for (std::size_t index = 0; index < readers.size(); ++index) readers[index] = std::thread([&, index] {
+        static_cast<void>(load(7 * Bytes + index));
+        after[index] = trapEnded.load();
+    });
+    for (auto& reader : readers) reader.join();
+    trapQuiet = false;
+    Require(std::all_of(after.begin(), after.end(), [](bool ended) { return ended; }) && trapCalls == 6, "concurrent readers of a trapped page did not all wait for one resolve");
+
+    // Releasing the memory forgets its traps.
+    Require(mappings.TrapReads(address, address + Small), "cannot set a read trap");
+    mappings.Reset(memory, Total);
+    VirtualFree(memory, 0, MEM_RELEASE);
+    Require(trapCalls == 6, "releasing trapped memory ran the resolver");
+}
+
 int main(int argc, char** argv) {
     auto* handler = AddVectoredExceptionHandler(1, HandleWrite);
     try {
@@ -1150,6 +1276,7 @@ int main(int argc, char** argv) {
         CheckKnownZeroShared();
         CheckKnownZeroFirstReads();
         CheckProtectedPrivate();
+        CheckReadTraps();
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

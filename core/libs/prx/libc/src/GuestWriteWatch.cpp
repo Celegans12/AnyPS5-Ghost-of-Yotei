@@ -1,4 +1,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#ifdef _WIN32
+#include "prx/libc/include/GuestArena.hpp"
+#endif
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -1351,6 +1354,8 @@ bool GuestWriteWatchCollectArmed_nid_postfix(std::uintptr_t address, std::size_t
 bool GuestWriteWatchSetReadTrapResolver_nid_postfix(void (*resolve)(std::uintptr_t begin, std::uintptr_t end)) {
 #if defined(__APPLE__)
     return Watch::Get().SetReadTrapResolver(resolve);
+#elif defined(_WIN32)
+    return GuestArena::GuestArenaSetReadTrapResolver_nid_no_patch(resolve);
 #else
     static_cast<void>(resolve);
     return false;
@@ -1360,6 +1365,8 @@ bool GuestWriteWatchSetReadTrapResolver_nid_postfix(void (*resolve)(std::uintptr
 void GuestWriteWatchSetReadTrapBypass_nid_postfix(bool (*bypass)()) {
 #if defined(__APPLE__)
     Watch::Get().SetReadTrapBypass(bypass);
+#elif defined(_WIN32)
+    GuestArena::GuestArenaSetReadTrapBypass_nid_no_patch(bypass);
 #else
     static_cast<void>(bypass);
 #endif
@@ -1368,6 +1375,8 @@ void GuestWriteWatchSetReadTrapBypass_nid_postfix(bool (*bypass)()) {
 bool GuestWriteWatchTrapReads_nid_postfix(std::uintptr_t address, std::size_t bytes) {
 #if defined(__APPLE__)
     return bytes != 0 && address + bytes > address && Watch::Get().TrapReads(address, address + bytes);
+#elif defined(_WIN32)
+    return bytes != 0 && address + bytes > address && GuestArena::GuestArenaTrapReads_nid_no_patch(address, bytes);
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
@@ -1378,6 +1387,8 @@ bool GuestWriteWatchTrapReads_nid_postfix(std::uintptr_t address, std::size_t by
 void GuestWriteWatchReadTraps_nid_postfix(std::uintptr_t address, std::size_t bytes, void (*trapped)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context) {
 #if defined(__APPLE__)
     if (bytes != 0 && address + bytes > address) Watch::Get().ReadTraps(address, address + bytes, trapped, context);
+#elif defined(_WIN32)
+    if (bytes != 0 && address + bytes > address) GuestArena::GuestArenaReadTraps_nid_no_patch(address, bytes, trapped, context);
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
@@ -1389,6 +1400,8 @@ void GuestWriteWatchReadTraps_nid_postfix(std::uintptr_t address, std::size_t by
 void GuestWriteWatchReleaseReads_nid_postfix(std::uintptr_t address, std::size_t bytes) {
 #if defined(__APPLE__)
     if (bytes != 0 && address + bytes > address) Watch::Get().ReleaseReads(address, address + bytes);
+#elif defined(_WIN32)
+    if (bytes != 0 && address + bytes > address) GuestArena::GuestArenaReleaseReads_nid_no_patch(address, bytes);
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);

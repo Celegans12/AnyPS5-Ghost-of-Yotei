@@ -735,6 +735,33 @@ bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleRead(address);
 }
 
+bool GuestArenaSetReadTrapResolver_nid_no_patch(void (*resolve)(std::uintptr_t begin, std::uintptr_t end)) {
+    return WindowsMappings::Get().SetReadTrapResolver(resolve);
+}
+
+void GuestArenaSetReadTrapBypass_nid_no_patch(bool (*bypass)()) {
+    WindowsMappings::Get().SetReadTrapBypass(bypass);
+}
+
+bool GuestArenaTrapReads_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().TrapReads(address, address + bytes);
+}
+
+void GuestArenaReadTraps_nid_no_patch(std::uintptr_t address, std::size_t bytes, void (*trapped)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context) {
+    WindowsMappings::Get().ReadTraps(address, address + bytes, trapped, context);
+}
+
+void GuestArenaReleaseReads_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().ReleaseReads(address, address + bytes);
+}
+
+std::size_t GuestArenaReadTrapCounts_nid_no_patch(std::uint64_t* values, std::size_t count) {
+    const auto all = WindowsMappings::Get().TrapCounts();
+    const auto written = std::min(count, all.size());
+    std::copy_n(all.begin(), written, values);
+    return written;
+}
+
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) return;
     WindowsMappings::Get().Pin(reinterpret_cast<std::uintptr_t>(pointer), bytes);

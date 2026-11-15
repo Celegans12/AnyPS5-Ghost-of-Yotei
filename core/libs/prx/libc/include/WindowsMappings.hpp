@@ -98,6 +98,7 @@ public:
                     mapped->second.armed = 0;
                     invalidate(mapped->first, mapped->second);
                 }
+                dropTraps(cursor, stop);
                 openArmed(cursor, stop);
                 DWORD previous;
                 if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
@@ -247,6 +248,7 @@ public:
         // in between would keep a stale record of being writable, so mprotected memory is never armed.
         const auto first = address & ~std::uintptr_t{4095};
         const auto last = (address + bytes + 4095) & ~std::uintptr_t{4095};
+        dropTraps(first, last);
         openArmed(first, last);
         remember(unarmable, first, last);
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
@@ -337,6 +339,7 @@ public:
     bool HandleWrite(std::uintptr_t address, std::uintptr_t instruction = 0) {
         if (const auto owner = submitter.load(std::memory_order_acquire); owner != 0 && protectTrace())
             std::fprintf(stderr, "[protect] write fault at 0x%llx on thread %lu during the submission of thread %lu\n", static_cast<unsigned long long>(address), GetCurrentThreadId(), owner);
+        if (trapFault(address, true)) return true;
         std::lock_guard lock(mutex);
         if (armedAt(address)) {
             // Section A: a CPU-clean block becomes CPU-dirty. The OS write watch records the store
@@ -381,10 +384,81 @@ public:
     }
 
     bool HandleRead(std::uintptr_t address) {
+        if (trapFault(address, false)) return true;
         std::lock_guard lock(mutex);
         if (!views.contains(address & ~(pageBytes - 1))) return false;
         const auto memory = query(address);
         return memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
+    }
+
+    // Read traps (section A, GPU-owned): committed private read-write guest pages whose newest
+    // content is on the GPU are made no-access. A guest or host access faults, parks its thread,
+    // and a resolver thread runs the driver's resolver for every trap over the page (it stores the
+    // content; a GPU store through an existing host import lands in no-access pages) before the
+    // pages open again. A thread the bypass names (the GPU mutex holder) and the thread running a
+    // resolver get the page opened at once. Available only while write faults are handled.
+    using TrapResolver = void (*)(std::uintptr_t begin, std::uintptr_t end);
+
+    bool SetReadTrapResolver(TrapResolver resolver) {
+        if (resolver == nullptr || !protectTracking()) return false;
+        std::call_once(trapResolverStarted, [this] { startTrapResolver(); });
+        if (!trapResolverRunning.load(std::memory_order_acquire)) return false;
+        trapResolver.store(resolver, std::memory_order_release);
+        return true;
+    }
+
+    void SetReadTrapBypass(bool (*bypass)()) {
+        trapBypass.store(bypass, std::memory_order_release);
+    }
+
+    bool TrapReads(std::uintptr_t begin, std::uintptr_t end) {
+        if (end <= begin || trapResolver.load(std::memory_order_acquire) == nullptr) return false;
+        const auto first = begin & ~trapPageMask;
+        const auto last = (end + trapPageMask) & ~trapPageMask;
+        std::lock_guard lock(mutex);
+        if (hasTrap(begin, end)) return true;
+        if (overlapsOwnedRange(ownedHostAccess, first, last) || overlaps(unarmable, first, last) || !trappable(first, last)) return false;
+        forgetClean(first, last);
+        DWORD previous;
+        if (!VirtualProtect(reinterpret_cast<void*>(first), last - first, PAGE_NOACCESS, &previous)) return false;
+        traps.emplace(begin, end);
+        longestTrap = std::max(longestTrap, end - begin);
+        remember(everTrapped, first, last);
+        ++trapsSet;
+        trapping.store(true, std::memory_order_release);
+        return true;
+    }
+
+    void ReadTraps(std::uintptr_t begin, std::uintptr_t end, void (*trapped)(void*, std::uintptr_t, std::uintptr_t), void* context) {
+        if (end <= begin || !trapping.load(std::memory_order_acquire)) return;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+        {
+            std::lock_guard lock(mutex);
+            const auto last = (end + trapPageMask) & ~trapPageMask;
+            for (auto page = begin & ~trapPageMask; page < last; page += trapPageBytes) {
+                if (!trapCovers(page, page + trapPageBytes) && !resolvingCovers(page, page + trapPageBytes, TrapOwner::Any)) continue;
+                if (query(page).Protect != PAGE_NOACCESS) continue;
+                if (!runs.empty() && runs.back().second == page) runs.back().second = page + trapPageBytes;
+                else runs.emplace_back(page, page + trapPageBytes);
+            }
+        }
+        for (const auto& [runBegin, runEnd] : runs) trapped(context, runBegin, runEnd);
+    }
+
+    void ReleaseReads(std::uintptr_t begin, std::uintptr_t end) {
+        if (end <= begin || !trapping.load(std::memory_order_acquire)) return;
+        std::lock_guard lock(mutex);
+        const auto [first, last] = traps.equal_range(begin);
+        const auto found = std::find_if(first, last, [&](const auto& trap) { return trap.second == end; });
+        if (found == last) return;
+        traps.erase(found);
+        untrap(begin, end);
+    }
+
+    // Sets, faults parked for the resolver, faults opened at once (bypass or resolver), resolver calls.
+    std::array<std::uint64_t, 4> TrapCounts() {
+        std::lock_guard lock(mutex);
+        return {trapsSet, trapsParked, trapsBypassed, trapsResolved};
     }
 
     bool ResidentSpan(std::uintptr_t address, std::size_t bytes, std::uintptr_t* start, std::uintptr_t* end) {
@@ -409,7 +483,7 @@ public:
     }
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes, bool store = true) {
-        std::lock_guard lock(mutex);
+        const auto lock = lockWithoutTraps(address, address + bytes);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
         for (auto it = first; it != views.end() && it->first < end; ++it) {
@@ -537,8 +611,8 @@ public:
 
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
         std::lock_guard lock(mutex);
-        if (armedAt(address)) {
-            // Armed for write tracking only: to the guest and the driver it is writable.
+        if (armedAt(address) || (!traps.empty() && trapCovers(address & ~trapPageMask, (address & ~trapPageMask) + trapPageBytes))) {
+            // Armed for write tracking or trapped for reads: to the guest and the driver it is writable.
             *protection = PAGE_READWRITE;
             return true;
         }
@@ -585,6 +659,7 @@ public:
         std::lock_guard lock(mutex);
         const auto first = address & ~std::uintptr_t{4095};
         const auto last = (address + bytes + 4095) & ~std::uintptr_t{4095};
+        dropTraps(first, last);
         openArmed(first, last);
         remember(unarmable, first, last);
     }
@@ -2654,6 +2729,8 @@ private:
         collectableRanges.clear();
         const auto end = address + bytes;
         privateAllocations.erase(privateAllocations.lower_bound(address), privateAllocations.lower_bound(end));
+        dropTraps(address, end);
+        forget(everTrapped, address, end);
         forgetClean(address, end);
         forget(unarmable, address, end);
         if (walkProbe()) forget(everArmed, address, end);
@@ -2748,6 +2825,280 @@ private:
         }
         return error;
     }
+
+    // ---- Read traps ----
+    static constexpr std::uintptr_t trapPageBytes = 4096;
+    static constexpr std::uintptr_t trapPageMask = trapPageBytes - 1;
+    enum class TrapOwner { Any, Self, Others };
+    struct TrapResolving {
+        std::uintptr_t begin;
+        std::uintptr_t end;
+        DWORD owner;
+    };
+    struct TrapSlot {
+        std::atomic<unsigned> state{0};
+        std::uintptr_t page = 0;
+        HANDLE done = nullptr;
+    };
+    static constexpr unsigned TrapFree = 0, TrapClaimed = 1, TrapQueued = 2, TrapRunning = 3;
+
+    bool hasTrap(std::uintptr_t begin, std::uintptr_t end) const {
+        const auto [first, last] = traps.equal_range(begin);
+        return std::any_of(first, last, [&](const auto& trap) { return trap.second == end; });
+    }
+
+    bool trapCovers(std::uintptr_t begin, std::uintptr_t end) const {
+        for (auto it = traps.lower_bound(begin > longestTrap ? begin - longestTrap : 0); it != traps.end() && it->first < end; ++it) {
+            if (it->second > begin) return true;
+        }
+        return false;
+    }
+
+    bool resolvingCovers(std::uintptr_t begin, std::uintptr_t end, TrapOwner owner) const {
+        const auto self = GetCurrentThreadId();
+        return std::any_of(trapsResolving.begin(), trapsResolving.end(), [&](const TrapResolving& entry) {
+            if ((entry.begin & ~trapPageMask) >= end || begin >= ((entry.end + trapPageMask) & ~trapPageMask)) return false;
+            return owner == TrapOwner::Any || (entry.owner == self) == (owner == TrapOwner::Self);
+        });
+    }
+
+    // Whether [first, last) is committed private memory that is read-write to the guest: read-write,
+    // armed read-only, or already no-access under another trap.
+    bool trappable(std::uintptr_t first, std::uintptr_t last) {
+        for (auto at = first; at < last;) {
+            const auto memory = query(at);
+            const auto regionEnd = std::min(last, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
+            if (memory.Protect == PAGE_READONLY) {
+                if (!covered(armedRanges, at, regionEnd)) return false;
+            } else if (memory.Protect == PAGE_NOACCESS) {
+                for (auto page = at; page < regionEnd; page += trapPageBytes) {
+                    if (!trapCovers(page, page + trapPageBytes) && !resolvingCovers(page, page + trapPageBytes, TrapOwner::Any)) return false;
+                }
+            } else if (memory.Protect != PAGE_READWRITE) {
+                return false;
+            }
+            at = regionEnd;
+        }
+        return true;
+    }
+
+    // Opens the no-access pages of [begin, end) that no remaining trap and no other thread's
+    // resolve covers.
+    void untrap(std::uintptr_t begin, std::uintptr_t end) {
+        const auto first = begin & ~trapPageMask;
+        const auto last = (end + trapPageMask) & ~trapPageMask;
+        const bool shared = trapCovers(first, last) || resolvingCovers(first, last, TrapOwner::Others);
+        for (auto at = first; at < last;) {
+            const auto memory = query(at);
+            auto regionEnd = std::min(last, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            if (memory.State == MEM_COMMIT && memory.Protect == PAGE_NOACCESS) {
+                if (shared) {
+                    regionEnd = at + trapPageBytes;
+                    if (trapCovers(at, regionEnd) || resolvingCovers(at, regionEnd, TrapOwner::Others)) {
+                        at = regionEnd;
+                        continue;
+                    }
+                }
+                DWORD previous;
+                if (!VirtualProtect(reinterpret_cast<void*>(at), regionEnd - at, PAGE_READWRITE, &previous)) fail("open trapped guest memory");
+            }
+            at = regionEnd;
+        }
+    }
+
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> takeTraps(std::uintptr_t begin, std::uintptr_t end) {
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> taken;
+        const auto first = begin & ~trapPageMask;
+        const auto last = (end + trapPageMask) & ~trapPageMask;
+        for (auto it = traps.lower_bound(first > longestTrap + trapPageBytes ? first - longestTrap - trapPageBytes : 0); it != traps.end() && it->first < last;) {
+            if (it->second <= first) {
+                ++it;
+                continue;
+            }
+            taken.emplace_back(*it);
+            it = traps.erase(it);
+        }
+        return taken;
+    }
+
+    // The memory is going away or changes its guest protection: its traps are forgotten.
+    void dropTraps(std::uintptr_t begin, std::uintptr_t end) {
+        if (traps.empty()) return;
+        for (const auto& [first, last] : takeTraps(begin, end)) untrap(first, last);
+    }
+
+    // The resolver thread hit another trap while resolving: that trap is resolved by it as well.
+    void deferCovering(std::uintptr_t page) {
+        const auto self = GetCurrentThreadId();
+        for (auto it = traps.lower_bound(page > longestTrap ? page - longestTrap : 0); it != traps.end() && it->first < page + trapPageBytes; ++it) {
+            if (it->second <= page) continue;
+            if (std::any_of(trapsDeferred.begin(), trapsDeferred.end(), [&](const TrapResolving& entry) { return entry.begin == it->first && entry.end == it->second; })) continue;
+            trapsResolving.push_back({it->first, it->second, self});
+            trapsDeferred.push_back({it->first, it->second, self});
+        }
+    }
+
+    // Runs the resolver for every trap over [begin, end) on this thread and opens their pages.
+    void resolveTraps(std::uintptr_t begin, std::uintptr_t end) {
+        const auto self = GetCurrentThreadId();
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> taken;
+        {
+            std::unique_lock lock(mutex);
+            while (resolvingCovers(begin & ~trapPageMask, (end + trapPageMask) & ~trapPageMask, TrapOwner::Others)) {
+                lock.unlock();
+                SwitchToThread();
+                lock.lock();
+            }
+            taken = takeTraps(begin, end);
+            for (const auto& [first, last] : taken) trapsResolving.push_back({first, last, self});
+            trapsResolved += taken.size();
+        }
+        if (taken.empty()) return;
+        const auto resolver = trapResolver.load(std::memory_order_acquire);
+        for (const auto& [first, last] : taken) resolver(first, last);
+        for (;;) {
+            std::pair<std::uintptr_t, std::uintptr_t> deferred;
+            {
+                std::lock_guard lock(mutex);
+                const auto found = std::find_if(trapsDeferred.begin(), trapsDeferred.end(), [&](const TrapResolving& entry) { return entry.owner == self; });
+                if (found == trapsDeferred.end()) break;
+                deferred = {found->begin, found->end};
+                trapsDeferred.erase(found);
+                auto [first, last] = traps.equal_range(deferred.first);
+                while (first != last && first->second != deferred.second) ++first;
+                if (first == last) {
+                    const auto entry = std::find_if(trapsResolving.begin(), trapsResolving.end(), [&](const TrapResolving& resolving) { return resolving.begin == deferred.first && resolving.end == deferred.second && resolving.owner == self; });
+                    if (entry != trapsResolving.end()) trapsResolving.erase(entry);
+                    continue;
+                }
+                traps.erase(first);
+                ++trapsResolved;
+            }
+            taken.push_back(deferred);
+            resolver(deferred.first, deferred.second);
+        }
+        std::lock_guard lock(mutex);
+        for (const auto& [first, last] : taken) {
+            const auto found = std::find_if(trapsResolving.begin(), trapsResolving.end(), [&](const TrapResolving& entry) { return entry.begin == first && entry.end == last && entry.owner == self; });
+            if (found != trapsResolving.end()) trapsResolving.erase(found);
+        }
+        for (const auto& [first, last] : taken) untrap(first, last);
+    }
+
+    // A fault at `address`: true when the access may be retried (the page was trapped and is open
+    // now, or was opened since the fault).
+    bool trapFault(std::uintptr_t address, bool write) {
+        if (!trapping.load(std::memory_order_acquire)) return false;
+        const auto page = address & ~trapPageMask;
+        {
+            std::lock_guard lock(mutex);
+            const bool trapped = trapCovers(page, page + trapPageBytes);
+            if (!trapped && !resolvingCovers(page, page + trapPageBytes, TrapOwner::Any)) {
+                if (!overlaps(everTrapped, page, page + trapPageBytes)) return false;
+                const auto memory = query(page);
+                return memory.State == MEM_COMMIT && (memory.Protect == PAGE_READWRITE || (!write && memory.Protect == PAGE_READONLY));
+            }
+            const bool own = GetCurrentThreadId() == trapResolverThread || resolvingCovers(page, page + trapPageBytes, TrapOwner::Self);
+            const auto bypass = trapBypass.load(std::memory_order_acquire);
+            if (own || (bypass != nullptr && bypass())) {
+                if (own && trapped) deferCovering(page);
+                ++trapsBypassed;
+                DWORD previous;
+                return query(page).Protect != PAGE_NOACCESS || VirtualProtect(reinterpret_cast<void*>(page), trapPageBytes, PAGE_READWRITE, &previous) != 0;
+            }
+            ++trapsParked;
+        }
+        TrapSlot* slot = nullptr;
+        while (slot == nullptr) {
+            for (auto& candidate : trapSlots) {
+                unsigned expected = TrapFree;
+                if (candidate.state.compare_exchange_strong(expected, TrapClaimed, std::memory_order_acq_rel)) {
+                    slot = &candidate;
+                    break;
+                }
+            }
+            if (slot == nullptr) SwitchToThread();
+        }
+        slot->page = page;
+        slot->state.store(TrapQueued, std::memory_order_release);
+        ReleaseSemaphore(trapWake, 1, nullptr);
+        WaitForSingleObject(slot->done, INFINITE);
+        slot->state.store(TrapFree, std::memory_order_release);
+        return true;
+    }
+
+    void startTrapResolver() {
+        trapWake = CreateSemaphoreW(nullptr, 0, 0x7fffffff, nullptr);
+        if (trapWake == nullptr) return;
+        for (auto& slot : trapSlots) {
+            if ((slot.done = CreateEventW(nullptr, FALSE, FALSE, nullptr)) == nullptr) return;
+        }
+        const HANDLE thread = CreateThread(nullptr, 0, [](void* self) -> DWORD {
+            static_cast<WindowsMappings*>(self)->trapResolveLoop();
+            return 0;
+        }, this, CREATE_SUSPENDED, &trapResolverThread);
+        if (thread == nullptr) return;
+        if (const auto describe = reinterpret_cast<HRESULT (WINAPI*)(HANDLE, PCWSTR)>(GetProcAddress(GetModuleHandleW(L"KernelBase.dll"), "SetThreadDescription"))) describe(thread, L"guest read traps");
+        trapResolverRunning.store(true, std::memory_order_release);
+        ResumeThread(thread);
+        CloseHandle(thread);
+    }
+
+    void trapResolveLoop() {
+        for (;;) {
+            if (WaitForSingleObject(trapWake, INFINITE) != WAIT_OBJECT_0) continue;
+            for (auto& slot : trapSlots) {
+                unsigned expected = TrapQueued;
+                if (!slot.state.compare_exchange_strong(expected, TrapRunning, std::memory_order_acq_rel)) continue;
+                const auto page = slot.page;
+                try {
+                    resolveTraps(page, page + trapPageBytes);
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "[read-trap] resolving 0x%llx failed: %s\n", static_cast<unsigned long long>(page), error.what());
+                    std::lock_guard lock(mutex);
+                    std::erase_if(trapsResolving, [](const TrapResolving& entry) { return entry.owner == GetCurrentThreadId(); });
+                    std::erase_if(trapsDeferred, [](const TrapResolving& entry) { return entry.owner == GetCurrentThreadId(); });
+                    untrap(page, page + trapPageBytes);
+                }
+                SetEvent(slot.done);
+            }
+        }
+    }
+
+    // Before a host write or import of [begin, end): no trap may remain over it. Returns with the
+    // mutex held.
+    std::unique_lock<std::mutex> lockWithoutTraps(std::uintptr_t begin, std::uintptr_t end) {
+        std::unique_lock lock(mutex, std::defer_lock);
+        if (!trapping.load(std::memory_order_acquire)) {
+            lock.lock();
+            return lock;
+        }
+        const auto first = begin & ~trapPageMask;
+        const auto last = (end + trapPageMask) & ~trapPageMask;
+        for (;;) {
+            resolveTraps(begin, end);
+            lock.lock();
+            if (!trapCovers(first, last) && !resolvingCovers(first, last, TrapOwner::Others)) return lock;
+            lock.unlock();
+            SwitchToThread();
+        }
+    }
+
+    std::multimap<std::uintptr_t, std::uintptr_t> traps;
+    std::uintptr_t longestTrap = 0;
+    std::vector<TrapResolving> trapsResolving;
+    std::vector<TrapResolving> trapsDeferred;
+    Ranges everTrapped;
+    std::array<TrapSlot, 16> trapSlots;
+    HANDLE trapWake = nullptr;
+    DWORD trapResolverThread = 0;
+    std::once_flag trapResolverStarted;
+    std::atomic<bool> trapResolverRunning{false};
+    std::atomic<bool> trapping{false};
+    std::atomic<TrapResolver> trapResolver{nullptr};
+    std::atomic<bool (*)()> trapBypass{nullptr};
+    std::uint64_t trapsSet = 0, trapsParked = 0, trapsBypassed = 0, trapsResolved = 0;
 
     std::map<std::uintptr_t, std::uint64_t> ownedWords;
     std::map<std::uintptr_t, std::uint16_t> ownedPending;

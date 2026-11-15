@@ -51,6 +51,15 @@ void GuestArenaSetAccessObserver_nid_postfix(void (*callback)(std::uintptr_t add
 #ifdef _WIN32
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address, std::uintptr_t instruction = 0);
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address);
+// Read traps (section A, GPU-owned blocks; see WindowsMappings::TrapReads). The GuestWriteWatch
+// read-trap functions forward here on Windows. Counts: traps set, faults parked for the resolver,
+// faults opened at once, resolver calls.
+bool GuestArenaSetReadTrapResolver_nid_no_patch(void (*resolve)(std::uintptr_t begin, std::uintptr_t end));
+void GuestArenaSetReadTrapBypass_nid_no_patch(bool (*bypass)());
+bool GuestArenaTrapReads_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+void GuestArenaReadTraps_nid_no_patch(std::uintptr_t address, std::size_t bytes, void (*trapped)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context);
+void GuestArenaReleaseReads_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+std::size_t GuestArenaReadTrapCounts_nid_no_patch(std::uint64_t* values, std::size_t count);
 // Called once the libc exception handler is installed: write faults on armed guest memory are then
 // resumed, so collects may arm consumed private and resident memory (section A of the rewrite).
 void GuestArenaEnableWriteFaults_nid_no_patch();
