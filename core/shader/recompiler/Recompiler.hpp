@@ -3,7 +3,7 @@
 
 #include "RuntimeAbi.hpp"
 #include "BlockAbi.hpp"
-#include "Optimization/BlockLayout.hpp"
+#include "Optimization/include/Optimization/BlockLayout.hpp"
 #include "PipelineSpecialization.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include <algorithm>
