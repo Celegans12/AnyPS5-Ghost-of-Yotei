@@ -25,6 +25,7 @@ public:
     static constexpr std::uint64_t RestFrames = 64;
     static constexpr unsigned LongestWait = 64;
     static constexpr std::uint32_t WorthAnswers = 16;
+    static constexpr std::uint64_t TokenLimit = std::uint64_t{1} << 63;
     enum class State : std::uint64_t { Unarmed = 0, Arming = 1, Armed = 2, Opening = 3, Written = 4 };
     struct Block {
         std::atomic<std::uint64_t> word{0};
@@ -177,6 +178,7 @@ public:
         const auto word = entry.word.load(std::memory_order_acquire);
         const auto state = stateOf(word);
         if (state != State::Unarmed && state != State::Written) return false;
+        if (word >= TokenLimit - SerialStep) return false;
         const auto next = word + SerialStep;
         entry.word.store(with(next, State::Arming), std::memory_order_release);
         transitions.fetch_add(1, std::memory_order_acq_rel);

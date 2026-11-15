@@ -592,6 +592,81 @@ void CheckRearm(bool resident) {
     mappings.Unpin(memory.Block(5), BlockBytes);
 }
 
+void CheckTokens(bool resident) {
+    constexpr std::size_t Blocks = 10;
+    using Reason = GuestArena::PageTrackReason;
+    auto& track = Track::Get();
+    auto& mappings = Mappings::Get();
+    const std::string kind = resident ? "resident" : "private";
+    Guest memory(resident, Blocks * BlockBytes);
+    memory.Collect(0, Blocks * BlockPages);
+    const auto arm = [&](std::size_t block) {
+        std::uint64_t token = 0;
+        Require(mappings.ArmBlocks(memory.Block(block), BlockBytes, &token, nullptr, 1) && token != 0 && token < Track::TokenLimit, kind + ": a block was not armed with a token below 2^63");
+        return token;
+    };
+    const auto holds = [&](std::size_t block, std::uint64_t token) { return track.CleanSince(memory.Block(block), BlockBytes, &token, 1); };
+    const auto denied = [&](std::size_t block) {
+        std::uint64_t token = 1;
+        std::uint64_t reason = 0;
+        Require(!mappings.ArmBlocks(memory.Block(block), BlockBytes, &token, &reason, 1) && token == 0, kind + ": a block that cannot be armed got a token");
+        return ReasonOf(reason);
+    };
+
+    auto token = arm(0);
+    Require(holds(0, token) && !holds(0, 0) && !holds(0, token + 8), kind + ": a fresh token does not hold, or another word does");
+    mappings.Pin(memory.Block(0) + 100, 8);
+    Require(!holds(0, token) && denied(0) == Reason::Held, kind + ": a pin did not end the token of its block");
+    mappings.Unpin(memory.Block(0) + 100, 8);
+    const auto after = arm(0);
+    Require(after > token && !holds(0, token) && holds(0, after), kind + ": an ended token holds again, or an arming returned it");
+
+    token = arm(1);
+    Require(mappings.BeginHostWrite(memory.Block(1) + 12 * PageBytes, 16), kind + ": a host write was refused");
+    Require(!holds(1, token) && denied(1) == Reason::Held, kind + ": a host write did not end the token of its block");
+    mappings.EndHostWrite(memory.Block(1) + 12 * PageBytes, 16);
+    Require(!holds(1, token) && arm(1) > token, kind + ": the end of a host write revived a token");
+
+    token = arm(2);
+    Require(mappings.BeginHostWrite(memory.Block(2), BlockBytes, false), kind + ": a host import was refused");
+    mappings.EndHostWrite(memory.Block(2), BlockBytes, false);
+    Require(!holds(2, token) && denied(2) == Reason::Imported, kind + ": an import did not end the token of its block for good");
+
+    token = arm(3);
+    mappings.KeepOpen(memory.Block(3), PageBytes);
+    Require(!holds(3, token) && denied(3) == Reason::Barred, kind + ": a bar did not end the token of its block for good");
+
+    token = arm(4);
+    Require(mappings.Protect(memory.Block(4), PageBytes, PAGE_READWRITE, true), kind + ": a protection change was refused");
+    Require(!holds(4, token) && arm(4) > token, kind + ": a protection change did not end the token of its block");
+
+    auto last = arm(5);
+    for (unsigned cycle = 0; cycle < 64; ++cycle) {
+        track.Open(memory.Block(5), memory.Block(5) + 1);
+        Require(!holds(5, last), kind + ": opening a block did not end its token");
+        const auto next = arm(5);
+        Require(next > last && !holds(5, last), kind + ": an arming returned an earlier token");
+        last = next;
+    }
+
+    const auto six = arm(6);
+    std::array<std::uint64_t, 2> words{7, 7};
+    Require(!track.Tokens(memory.Block(6) + 100, BlockBytes, words.data(), 2) && words[0] == six && words[1] == 0, kind + ": the tokens of a range are not indexed from the block of its address, or an unarmed block got one");
+    words = {7, 7};
+    Require(!track.Tokens(memory.Block(6) + 100, BlockBytes, words.data(), 1) && words[0] == 0 && words[1] == 7, kind + ": a wrong block count was answered with tokens");
+    const auto seven = arm(7);
+    Require(track.Tokens(memory.Block(6) + 100, BlockBytes, words.data(), 2) && words[0] == six && words[1] == seven && track.CleanSince(memory.Block(6) + 100, BlockBytes, words.data(), 2), kind + ": the tokens of two armed blocks are not those their armings returned");
+
+    const auto eight = arm(8);
+    const auto address = memory.Block(8);
+    memory.Release();
+    Require(!track.CleanSince(address, BlockBytes, &eight, 1), kind + ": unmapping did not end the token of a block");
+    Require(Track::SameArming(track.Word(address), eight), kind + ": unmapping lost the serial of a block, so a later arming could return its token");
+    std::uint64_t none = 1;
+    std::uint64_t reason = 0;
+    Require(!mappings.ArmBlocks(address, BlockBytes, &none, &reason, 1) && none == 0 && ReasonOf(reason) == Reason::Edge, kind + ": a released block was armed");
+}
+
 void CheckDemandRace(bool resident) {
     constexpr std::size_t Writers = 8;
     constexpr std::size_t Blocks = 16;
@@ -868,6 +943,9 @@ int main(int argc, char** argv) {
         } else if (mode == "rearm") {
             CheckRearm(false);
             CheckRearm(true);
+        } else if (mode == "tokens") {
+            CheckTokens(false);
+            CheckTokens(true);
         } else if (mode == "demand-race") {
             CheckDemandRace(false);
             CheckDemandRace(true);
@@ -876,6 +954,8 @@ int main(int argc, char** argv) {
             CheckDemand(true);
             CheckRearm(false);
             CheckRearm(true);
+            CheckTokens(false);
+            CheckTokens(true);
             CheckDemandRace(false);
             CheckDemandRace(true);
             Require(Track::Get().Counted().divergences == 0, "verified collects diverged under requested armings");
@@ -889,7 +969,7 @@ int main(int argc, char** argv) {
                 Require(Track::Get().Counted().divergences == 0, "verified collects diverged under concurrent writers");
             }
         } else {
-            std::fprintf(stderr, "usage: %s table|race|guards|collect|hot|collect-race|demand|rearm|demand-race|verify|verify-race|verify-demand\n", argv[0]);
+            std::fprintf(stderr, "usage: %s table|race|guards|collect|hot|collect-race|demand|rearm|tokens|demand-race|verify|verify-race|verify-demand\n", argv[0]);
             result = 2;
         }
         if (result == 0) std::printf("page tracking %.*s tests passed\n", static_cast<int>(mode.size()), mode.data());

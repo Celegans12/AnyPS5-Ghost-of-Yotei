@@ -28,6 +28,18 @@ The write watch can leave guest pages read-only between collections: every watch
 - Third-party code that writes guest memory on its own (driver threads, library worker threads) can't be bracketed. List it in that library's debt file.
 
 `python3 tools/guest_pointer_audit.py [library ...]` lists exported functions that read or write a guest pointer parameter directly (`->`, `[]`, `*`, or a raw `mem*`, `str*` or `std::copy` call) instead of through `GuestCopyIn_nid_no_patch`, `GuestCopyOut_nid_no_patch` or the `CopyGuest*` helpers in [General.hpp](../../core/libs/prx/libc/include/General.hpp), which report unmapped or unwritable memory instead of faulting. The error such an export returns is decided per function; `--json` prints the findings for scripts. It is a report, not a gate: it always exits 0, and it sees only accesses in the export's own body, so a pointer passed to a helper or copied to a local is not followed and an empty report does not prove a library safe.
+
+### Page tracking tokens
+
+With `APS5_PAGE_TRACK=1` on Windows, a reader that keeps a copy of guest memory can hold tokens of the page tracking table: `GuestPageTrackArm`, `GuestPageTrackRearm`, `GuestPageTrackTokens`, `GuestPageTrackCleanSince` and `GuestPageTrackReasons` in [GuestPageTrack.hpp](../../core/libs/prx/libc/include/GuestPageTrack.hpp), wrapped for the AGC driver as `ArmBlocks`, `RearmBlocks`, `ArmedTokens`, `ArmedCleanSince` and `ArmedReasons` in [GuestMemory.hpp](../../core/libs/prx/libSceAgcDriver/Execution/include/GuestMemory.hpp). One token stands for one 64 KiB block. Every call takes one entry per block the range touches, entry 0 for the block that holds the range's address, and refuses any other count.
+
+- A token is the word of an armed block: never 0, always below 2^63. A block that is not armed gets 0.
+- A token holds while its block has stayed armed since the token was returned. A CPU write to the block faults first and ends it. So do a hold (`HostWrite`, a pin), a host import, a bar (`GuestPageTrackKeepOpen`, a protection other than read-write), any other protection change through the arena, and the unmapping of the block.
+- A token that ended never holds again, and no later arming of the same address returns it: each arming advances a serial kept in the word, and the serial survives the unmapping.
+- The reader takes the token first and reads the bytes after. A write that landed before the block was protected is in those bytes; a write after the token ends it. `GuestPageTrackRearm` names the 4 KiB pages written since a token only while no collect took them; otherwise it reports every page.
+- A token says nothing about GPU writes, which is why an imported block is never armed, nor about a kernel write that was pending when the block was protected.
+- Arming protects the block first and resets its write watch after; the pages that reset reports stay pending for the collect that covers them, so the write tracker of the driver loses none.
+
 ### Host-only test executables
 
 A host-only test executable (one that links no guest library) whose sources inherit the `-fno-asynchronous-unwind-tables` policy of `core/libs/CMakeLists.txt`, and that is built for MinGW, must call `configure_host_test_executable(<target>)` (root `CMakeLists.txt`) after `add_test_executable`. On MinGW only, it adds `-fasynchronous-unwind-tables` to the executable's compile options and `-static -static-libgcc -static-libstdc++` to its link options, and nothing else.
