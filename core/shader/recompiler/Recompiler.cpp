@@ -6,6 +6,7 @@
 #include <array>
 #include <cstring>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdlib>
 #include <cstdio>
@@ -37,6 +38,7 @@
 #include "Optimization/include/Optimization/DescriptorBindingBuilder.hpp"
 #include "Optimization/include/Optimization/HostInterpolationChecker.hpp"
 #include "Optimization/include/Optimization/MaskedSelectEliminator.hpp"
+#include "Optimization/include/Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "Optimization/include/Optimization/NanPayloadEliminator.hpp"
 #include "Optimization/include/Optimization/ReadLaneEliminator.hpp"
 #include "Optimization/include/Optimization/GotoPhiRefiner.hpp"
@@ -556,7 +558,7 @@ std::uint64_t resourcePlanBytes(const IrResourcePlan& plan) {
         if (value.Arguments().capacity() > IrOperands::InlineCapacity) total += static_cast<std::uint64_t>(value.Arguments().capacity()) * sizeof(IrValue*);
         total += bytes(value.OperandUses());
     }
-    total += bytes(plan.blockStorage) + bytes(plan.memoryInfo) + bytes(plan.descriptorSources) + bytes(plan.controlFlow) + bytes(plan.materializationSources) + bytes(plan.srtReads) + bytes(plan.guardedSrtSlots) + bytes(plan.cleanFlatSlots) + bytes(plan.pureFlatSlots);
+    total += bytes(plan.blockStorage) + bytes(plan.memoryInfo) + bytes(plan.descriptorSources) + bytes(plan.controlFlow) + bytes(plan.materializationSources) + bytes(plan.srtReads) + bytes(plan.guardedSrtSlots) + bytes(plan.cleanFlatSlots) + bytes(plan.pureFlatSlots) + bytes(plan.descriptorLeafDwords);
     total += bytes(plan.compact.values) + bytes(plan.compact.arguments) + bytes(plan.compact.sourceDwords) + bytes(plan.compact.srtReads) + bytes(plan.compact.conditions);
     return total;
 }
@@ -1499,6 +1501,9 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     if (patch != nullptr) recordMemoPatch(*patch, *bindingPlan, variant);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
+    for (std::size_t index = 0; index < result.bindings.size() && index < bindingPlan->bindings.size(); ++index) {
+        if (bindingPlan->bindings[index].descriptor.role == DescriptorRole::GuestBuffers && result.bindings[index].role == DescriptorRole::GuestBuffers) result.bindings[index].bufferResources = bindingPlan->bindings[index].resources;
+    }
     static const bool reporting = [] {
         const auto* sink = Diagnostics();
         return sink != nullptr && sink->descriptor != nullptr && (sink->enabled == nullptr || sink->enabled());
@@ -2305,23 +2310,91 @@ namespace {
 
 // The capture's materialization; with pure flat slots in the plan the walk's read addresses are
 // traced into the capture (ResourceCapture::readTrace).
+struct DescriptorLeafCounters {
+    std::atomic<std::uint64_t> captures{0}, traced{0}, buffers{0}, planned{0}, leaves{0}, aliased{0};
+};
+
+DescriptorLeafCounters& descriptorLeafCounters() {
+    static DescriptorLeafCounters counters;
+    return counters;
+}
+
+void settleDescriptorLeaves(SrtReadTrace& trace, bool kept) {
+    auto& other = trace.otherReads;
+    auto& described = trace.descriptorLeaves;
+    std::sort(other.begin(), other.end());
+    other.erase(std::unique(other.begin(), other.end()), other.end());
+    if (described.empty()) return;
+    std::sort(described.begin(), described.end(), [](const auto& left, const auto& right) { return left.second != right.second ? left.second < right.second : left.first < right.first; });
+    described.erase(std::unique(described.begin(), described.end()), described.end());
+    const auto all = described;
+    if (kept) {
+        const auto before = described.size();
+        std::erase_if(described, [&](const std::pair<std::uint32_t, std::uint64_t>& leaf) {
+            if (std::binary_search(other.begin(), other.end(), leaf.second)) return true;
+            if (std::any_of(trace.leaves.begin(), trace.leaves.end(), [&](const std::pair<std::uint32_t, std::uint64_t>& flat) { return flat.second == leaf.second; })) return true;
+            return std::count_if(all.begin(), all.end(), [&](const std::pair<std::uint32_t, std::uint64_t>& same) { return same.second == leaf.second; }) != 1;
+        });
+        descriptorLeafCounters().aliased.fetch_add(before - described.size(), std::memory_order_relaxed);
+        descriptorLeafCounters().leaves.fetch_add(described.size(), std::memory_order_relaxed);
+    } else {
+        described.clear();
+    }
+    for (const auto& leaf : all) other.push_back(leaf.second);
+    std::sort(other.begin(), other.end());
+    other.erase(std::unique(other.begin(), other.end()), other.end());
+}
+
 void materializeCapture(ResourceCapture& capture, const SrtRuntime& runtime) {
     const auto& plan = *capture.plan;
     SrtRuntime traced = runtime;
     traced.userDataUse = &capture.userDataUse;
-    if (std::none_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; })) {
+    const bool pure = std::any_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t slot) { return slot != 0u; });
+    std::uint64_t planned = 0;
+    for (const auto dwords : plan.descriptorLeafDwords) planned += static_cast<std::uint64_t>(std::popcount(dwords));
+    const bool described = DescriptorLeaves() && planned != 0;
+    auto& counters = descriptorLeafCounters();
+    counters.captures.fetch_add(1, std::memory_order_relaxed);
+    counters.buffers.fetch_add(plan.info.buffers.size(), std::memory_order_relaxed);
+    if (!pure && !described) {
         ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
         return;
     }
+    if (described) {
+        counters.traced.fetch_add(1, std::memory_order_relaxed);
+        counters.planned.fetch_add(planned, std::memory_order_relaxed);
+    }
     traced.readTrace = &capture.readTrace;
     ResourceMaterializer{}.Materialize(plan, traced, capture.snapshot);
-    auto& other = capture.readTrace.otherReads;
-    if (other.size() > 1) {
-        std::sort(other.begin(), other.end());
-        other.erase(std::unique(other.begin(), other.end()), other.end());
-    }
+    settleDescriptorLeaves(capture.readTrace, described);
 }
 
+}
+
+bool DescriptorLeaves() {
+    static const bool enabled = std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr;
+    return enabled;
+}
+
+DescriptorLeafCounts DescriptorLeafTotals() {
+    const auto& counters = descriptorLeafCounters();
+    return {counters.captures.load(std::memory_order_relaxed), counters.traced.load(std::memory_order_relaxed), counters.buffers.load(std::memory_order_relaxed), counters.planned.load(std::memory_order_relaxed), counters.leaves.load(std::memory_order_relaxed), counters.aliased.load(std::memory_order_relaxed)};
+}
+
+std::uint32_t DescriptorLeafFlatOffset(const IrResourcePlan& plan, std::uint32_t leaf) {
+    const auto slot = Detail::DescriptorDwordSlot(plan, leaf / 8u, leaf % 8u);
+    return slot != Detail::NoDescriptorDwordSlot ? plan.srtReads[slot].flatOffset : ~std::uint32_t{0};
+}
+
+bool SameBufferSpecialization(std::span<const std::uint32_t, 4> stored, std::span<const std::uint32_t, 4> fresh) {
+    DescriptorValue before, after;
+    before.dwordCount = after.dwordCount = 4;
+    std::copy(stored.begin(), stored.end(), before.dwords.begin());
+    std::copy(fresh.begin(), fresh.end(), after.dwords.begin());
+    if (!BufferDescriptorPresent(before) || !BufferDescriptorPresent(after)) return false;
+    const auto left = BufferSpecializationFields(before, {}, 0);
+    const auto right = BufferSpecializationFields(after, {}, 0);
+    return left.word1 == right.word1 && left.word3 == right.word3 && left.misalignment == right.misalignment && left.tail == right.tail && left.known == right.known;
 }
 
 std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime) {

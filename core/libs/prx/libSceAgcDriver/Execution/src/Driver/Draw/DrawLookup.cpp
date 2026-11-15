@@ -132,6 +132,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, dataStages = 0, dataWords = 0;
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
             auto* live = drawStageDataHits() ? &liveData : nullptr;
+            std::vector<std::shared_ptr<DispatchVariant>> patchedFrom(programs.size());
+            std::uint64_t bufferStages = 0;
             if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
 
             std::uint32_t cursor = 0;
@@ -164,6 +166,25 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         if (!anyLayout) outcome = result;
                         anyLayout = true;
                         if (result != EntryOutcome::Equal && result != EntryOutcome::EqualData) continue;
+                        auto served = variant;
+                        if (result == EntryOutcome::EqualData && !variant->bufferPositions.empty()) {
+                            const auto buffers = static_cast<std::size_t>(std::count_if(liveData.begin(), liveData.end(), [&](const std::pair<std::uint32_t, std::uint32_t>& word) { return std::binary_search(variant->bufferPositions.begin(), variant->bufferPositions.end(), word.first); }));
+                            if (buffers != 0) {
+                                served = movedShapeVariant(variant, {});
+                                const bool patched = buffers == liveData.size() && patchBufferWords(*served, liveData);
+                                NoteBufferWordReuse(liveData.size(), patched);
+                                if (!patched) {
+                                    outcome = EntryOutcome::Differing;
+                                    continue;
+                                }
+                                applyShaderDataPatches(*served);
+                                regions.clear();
+                                appendEntryRegions(*served, regions);
+                                patchedFrom[i] = variant;
+                                result = EntryOutcome::Equal;
+                                ++bufferStages;
+                            }
+                        }
                         if (result == EntryOutcome::EqualData) {
                             auto& hit = stageData[i];
                             hit.words = variant->words;
@@ -174,7 +195,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             ++dataStages;
                             dataWords += liveData.size();
                         }
-                        matched[i] = variant;
+                        matched[i] = served;
                         ranks[i] = rank;
                         ++stageEqual;
                         cursor += static_cast<std::uint32_t>(variant->compiled->pushConstants.size());
@@ -219,7 +240,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             if (ranks[i] == 0) continue;
                             auto& variants = rotated->stages[i];
                             variants.erase(variants.begin() + static_cast<std::ptrdiff_t>(ranks[i]));
-                            variants.insert(variants.begin(), matched[i]);
+                            variants.insert(variants.begin(), patchedFrom[i] != nullptr ? patchedFrom[i] : matched[i]);
                         }
                         rotated->touched = entry->touched;
                         rotated->order = entry->order;
@@ -237,6 +258,12 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     drawHit = false;
                 }
                 if (dataStages != 0 && verifyDrawDataHits()) drawHit = false;
+                if (bufferStages != 0 && verifyDrawDataHits()) {
+                    drawHit = false;
+                    for (std::size_t i = 0; i < programs.size(); ++i) {
+                        if (patchedFrom[i] != nullptr) dataCandidates[i].push_back({matched[i], matchedRegions[i], drawKey, 0, DrawShapeReuse::EqualWords, false, patchedFrom[i].get()});
+                    }
+                }
             } else {
                 ++counters.misses[static_cast<std::size_t>(*miss)];
                 if (registerKey && entry->decode != nullptr) ++counters.decodePartial;
@@ -255,6 +282,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
             std::optional<SampledReadScope> sampling;
             std::vector<UserWordMove> moves;
+            std::vector<std::pair<std::uint32_t, std::uint32_t>> liveBuffers;
             for (std::size_t i = 0; i < programs.size(); ++i) {
                 if (roles[i] == Role::GeometryBack) continue;
                 const auto& now = programs[i].userData;
@@ -291,11 +319,19 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                                 continue;
                             }
                         }
-                        if (!movedRunsReadEqual(*variant, moves, tables)) {
+                        if (!movedRunsReadEqual(*variant, moves, tables, &liveBuffers)) {
                             miss = std::max(miss, DrawShapeMiss::Memory);
                             continue;
                         }
-                        auto reused = moves.empty() ? variant : movedShapeVariant(variant, moves);
+                        auto reused = moves.empty() && liveBuffers.empty() ? variant : movedShapeVariant(variant, moves);
+                        if (!liveBuffers.empty()) {
+                            const bool patched = patchBufferWords(*reused, liveBuffers);
+                            NoteBufferWordReuse(liveBuffers.size(), patched);
+                            if (!patched) {
+                                miss = std::max(miss, DrawShapeMiss::Memory);
+                                continue;
+                            }
+                        }
                         bool rebased = false;
                         if (tables) {
                             if (!rebaseVertexInputs(*reused, *vertexInfos[i], decodeReads[i])) {

@@ -177,8 +177,10 @@ void UnreadUserWordsKeepTheStage(bool verify) {
     const auto moved = counters;
     counters = Submit(std::move(commands));
     Require(counters.dataHits == moved.dataHits + 1, "a draw that pointed the pixel stage at another buffer descriptor was not a data-only hit: " + Counts(counters));
-    Require(counters.dataStagesCompiled - moved.dataStagesCompiled >= 1, "a draw that pointed the pixel stage at another buffer descriptor reused the pixel stage: " + Counts(counters));
-    if (!verify) Require(counters.dataStagesReused - moved.dataStagesReused == 1, "a draw that changed only the pixel stage's descriptor pointer did not reuse the vertex stage: " + Counts(counters));
+    const bool volatileWords = !verify && std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr && std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") == nullptr;
+    if (volatileWords) Require(counters.dataStagesCompiled == moved.dataStagesCompiled && counters.dataStagesReused - moved.dataStagesReused == 2, "a draw that pointed the pixel stage at another descriptor of a read-only buffer did not reuse the pixel stage with the descriptor patched: " + Counts(counters));
+    else Require(counters.dataStagesCompiled - moved.dataStagesCompiled >= 1, "a draw that pointed the pixel stage at another buffer descriptor reused the pixel stage: " + Counts(counters));
+    if (!verify && !volatileWords) Require(counters.dataStagesReused - moved.dataStagesReused == 1, "a draw that changed only the pixel stage's descriptor pointer did not reuse the vertex stage: " + Counts(counters));
 
     const bool refresh = std::getenv("APS5_DRAW_PIPELINE") != nullptr || std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") == nullptr;
     for (const std::uint32_t unread : {0x33u, 0x44u}) {
@@ -190,6 +192,10 @@ void UnreadUserWordsKeepTheStage(bool verify) {
         Require(counters.dataHits == last.dataHits + 1 && counters.inserts == last.inserts, "a draw at the moved pointer with a new unread word: " + Counts(counters));
         if (verify) continue;
         const auto compiled = counters.dataStagesCompiled - last.dataStagesCompiled;
+        if (volatileWords) {
+            Require(compiled == 0 && counters.shapeUpdates == last.shapeUpdates, "a draw at the moved pointer, whose buffer descriptor is patched, built a stage or refreshed the shape: " + Counts(counters));
+            continue;
+        }
         const bool expectReuse = refresh && unread == 0x44u;
         Require(compiled == (expectReuse ? 0u : 1u), std::string(expectReuse ? "after a refresh, the draw at the moved pointer compiled its pixel stage again: " : "the draw at the moved pointer did not compile its pixel stage: ") + Counts(counters));
         Require(counters.shapeUpdates - last.shapeUpdates == (refresh && unread == 0x33u ? 1u : 0u), "shape refreshes: " + std::to_string(counters.shapeUpdates - last.shapeUpdates) + " (" + Counts(counters) + ")");

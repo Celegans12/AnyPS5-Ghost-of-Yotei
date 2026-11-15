@@ -3,6 +3,7 @@
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/MovedRead.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -745,6 +746,15 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto contentRecipes = DriverDetail::ContentRecipesHeld();
     AgcDriver::ProfilePrint_nid_no_patch("%s", VulkanDevice::DrawRecipeDrawsReport(contentRecipes.held, contentRecipes.evicted).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s", MovedReadsReport().c_str());
+    static ShaderRecompiler::DescriptorLeafCounts reportedLeaves;
+    const auto leaves = ShaderRecompiler::DescriptorLeafTotals();
+    AgcDriver::ProfilePrint_nid_no_patch("[descriptor-leaves] (10 s): %llu stage captures over %llu buffers, %llu captures traced for %llu planned leaf dwords: %llu leaves traced, %llu left out as aliased\n", static_cast<unsigned long long>(leaves.captures - reportedLeaves.captures), static_cast<unsigned long long>(leaves.buffers - reportedLeaves.buffers), static_cast<unsigned long long>(leaves.traced - reportedLeaves.traced), static_cast<unsigned long long>(leaves.planned - reportedLeaves.planned), static_cast<unsigned long long>(leaves.leaves - reportedLeaves.leaves), static_cast<unsigned long long>(leaves.aliased - reportedLeaves.aliased));
+    reportedLeaves = leaves;
+    static BufferWordCounts reportedWords;
+    const auto bufferWords = BufferWordTotals();
+    const auto wordsSince = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
+    AgcDriver::ProfilePrint_nid_no_patch("[buffer-words] (10 s): of %llu descriptor leaves of the stages kept, %llu became volatile positions (%llu outside the stage's runs, %llu bound to no buffer element, %llu of a written element, %llu not the bound word); %llu stages reused with %llu buffer words patched, %llu refused for another specialization\n", wordsSince(bufferWords.leaves, reportedWords.leaves), wordsSince(bufferWords.positions, reportedWords.positions), wordsSince(bufferWords.unmapped, reportedWords.unmapped), wordsSince(bufferWords.unbound, reportedWords.unbound), wordsSince(bufferWords.written, reportedWords.written), wordsSince(bufferWords.mismatched, reportedWords.mismatched), wordsSince(bufferWords.stages, reportedWords.stages), wordsSince(bufferWords.words, reportedWords.words), wordsSince(bufferWords.refused, reportedWords.refused));
+    reportedWords = bufferWords;
     if (DrawSiteAccess::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("%s", DrawSiteAccess::Report().c_str());
     static GuestMemory::LockCounts reportedLocks{};
     const auto locks = GuestMemory::LockCounted();

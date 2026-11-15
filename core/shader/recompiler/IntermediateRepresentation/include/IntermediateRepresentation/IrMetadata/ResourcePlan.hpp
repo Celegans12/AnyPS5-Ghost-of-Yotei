@@ -276,6 +276,7 @@ struct IrResourcePlan {
     // One byte per srtReads slot, 1 when the CPU walk never consumes the slot's value (see
     // Detail::ComputePureFlatSlots): a driver may reuse a capture whose words differ only there.
     std::vector<std::uint8_t> pureFlatSlots;
+    std::vector<std::uint8_t> descriptorLeafDwords;
     bool denseValueIds = false;
     CompactResourcePlan compact;
     bool requiresSpecializationMemory = false;

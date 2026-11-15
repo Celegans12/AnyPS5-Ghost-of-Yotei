@@ -171,6 +171,13 @@ struct UserWordMove {
     std::uint32_t index, from, to;
 };
 
+struct BufferWordCounts {
+    std::uint64_t leaves = 0, positions = 0, unmapped = 0, unbound = 0, written = 0, mismatched = 0, stages = 0, words = 0, refused = 0;
+};
+void NoteBufferWordPositions(std::size_t leaves, std::size_t positions, std::uint64_t unmapped, std::uint64_t unbound, std::uint64_t written, std::uint64_t mismatched);
+void NoteBufferWordReuse(std::size_t words, bool accepted);
+BufferWordCounts BufferWordTotals();
+
 struct StageDataHit {
     std::vector<std::uint32_t> words;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;

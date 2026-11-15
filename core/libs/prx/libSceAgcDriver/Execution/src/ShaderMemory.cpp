@@ -1086,6 +1086,73 @@ std::size_t VouchSharedRegions(std::span<const SharedWords> shared, std::size_t 
     return words;
 }
 
+BufferWordPositionCounts BufferWordPositions(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint32_t> flatOffsets, std::span<const std::uint32_t> words, std::span<const std::uint32_t> bufferSources, std::span<const ShaderRecompiler::DescriptorBinding> bindings, std::vector<std::uint32_t>& positions, std::vector<std::array<std::uint32_t, 2>>& slots) {
+    BufferWordPositionCounts counts;
+    positions.clear();
+    slots.clear();
+    std::vector<std::size_t> prefix(runs.size() + 1, 0);
+    for (std::size_t i = 0; i < runs.size(); ++i) prefix[i + 1] = prefix[i] + static_cast<std::size_t>((runs[i].second - runs[i].first) / sizeof(std::uint32_t));
+    std::vector<std::array<std::uint32_t, 3>> found;
+    std::vector<std::array<std::uint32_t, 2>> targets;
+    for (std::size_t leaf = 0; leaf < leaves.size(); ++leaf) {
+        const auto& [code, address] = leaves[leaf];
+        auto run = std::upper_bound(runs.begin(), runs.end(), address, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& candidate) { return value < candidate.first; });
+        if (leaf >= flatOffsets.size() || flatOffsets[leaf] == ~std::uint32_t{0} || (address & 3u) != 0 || run == runs.begin() || address + sizeof(std::uint32_t) > (run - 1)->second) {
+            ++counts.unmapped;
+            continue;
+        }
+        --run;
+        const auto position = prefix[static_cast<std::size_t>(run - runs.begin())] + static_cast<std::size_t>((address - run->first) / sizeof(std::uint32_t));
+        if (position >= words.size()) {
+            ++counts.unmapped;
+            continue;
+        }
+        const auto source = code / 8u;
+        const auto dword = code % 8u;
+        targets.clear();
+        bool written = false, mismatched = false;
+        for (std::uint32_t binding = 0; binding < bindings.size(); ++binding) {
+            const auto& bound = bindings[binding];
+            if (bound.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            for (std::uint32_t element = 0; element < bound.bufferResources.size(); ++element) {
+                const auto resource = bound.bufferResources[element];
+                if (resource >= bufferSources.size() || bufferSources[resource] != source) continue;
+                const auto slot = element * 4u + dword;
+                if (dword >= 3u || bound.guestDescriptor.size() != bound.bufferResources.size() * 4u || element >= bound.bufferWritten.size() || bound.bufferWritten[element]) {
+                    written = true;
+                    continue;
+                }
+                const std::span<const std::uint32_t, 4> descriptor(bound.guestDescriptor.data() + element * 4u, 4);
+                if (bound.guestDescriptor[slot] != words[position] || !ShaderRecompiler::SameBufferSpecialization(descriptor, descriptor)) {
+                    mismatched = true;
+                    continue;
+                }
+                targets.push_back({binding, slot});
+            }
+        }
+        if (!written && !mismatched && !targets.empty()) {
+            for (std::uint32_t binding = 0; binding < bindings.size(); ++binding) {
+                const auto& bound = bindings[binding];
+                if (bound.role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
+                if (flatOffsets[leaf] >= bound.guestDescriptor.size() || bound.guestDescriptor[flatOffsets[leaf]] != words[position]) mismatched = true;
+                else targets.push_back({binding, flatOffsets[leaf]});
+            }
+        }
+        if (written) ++counts.written;
+        else if (mismatched) ++counts.mismatched;
+        else if (targets.empty()) ++counts.unbound;
+        if (written || mismatched) continue;
+        for (const auto& [binding, slot] : targets) found.push_back({static_cast<std::uint32_t>(position), binding, slot});
+    }
+    std::sort(found.begin(), found.end());
+    found.erase(std::unique(found.begin(), found.end()), found.end());
+    for (const auto& [position, binding, slot] : found) {
+        positions.push_back(position);
+        slots.push_back({binding, slot});
+    }
+    return counts;
+}
+
 DataWordPositionCounts DataWordPositions(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads, std::span<const std::uint32_t> words, std::span<const std::uint32_t> flattenedSrt, std::vector<std::uint32_t>& positions, std::vector<std::uint32_t>& slots) {
     DataWordPositionCounts counts;
     positions.clear();

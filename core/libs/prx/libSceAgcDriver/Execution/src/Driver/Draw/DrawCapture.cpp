@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <atomic>
+#include <iterator>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -196,6 +198,78 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
     throw RefusedDraw(programs[i].binary.codeAddress, error.what());
 }
 
+namespace {
+
+struct BufferWordCounters {
+    std::atomic<std::uint64_t> leaves{0}, positions{0}, unmapped{0}, unbound{0}, written{0}, mismatched{0}, stages{0}, words{0}, refused{0};
+};
+
+BufferWordCounters& bufferWordCounters() {
+    static BufferWordCounters counters;
+    return counters;
+}
+
+}
+
+void NoteBufferWordPositions(std::size_t leaves, std::size_t positions, std::uint64_t unmapped, std::uint64_t unbound, std::uint64_t written, std::uint64_t mismatched) {
+    auto& counters = bufferWordCounters();
+    counters.leaves.fetch_add(leaves, std::memory_order_relaxed);
+    counters.positions.fetch_add(positions, std::memory_order_relaxed);
+    counters.unmapped.fetch_add(unmapped, std::memory_order_relaxed);
+    counters.unbound.fetch_add(unbound, std::memory_order_relaxed);
+    counters.written.fetch_add(written, std::memory_order_relaxed);
+    counters.mismatched.fetch_add(mismatched, std::memory_order_relaxed);
+}
+
+void NoteBufferWordReuse(std::size_t words, bool accepted) {
+    auto& counters = bufferWordCounters();
+    if (!accepted) {
+        counters.refused.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    counters.stages.fetch_add(1, std::memory_order_relaxed);
+    counters.words.fetch_add(words, std::memory_order_relaxed);
+}
+
+BufferWordCounts BufferWordTotals() {
+    const auto& counters = bufferWordCounters();
+    const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+    return {load(counters.leaves), load(counters.positions), load(counters.unmapped), load(counters.unbound), load(counters.written), load(counters.mismatched), load(counters.stages), load(counters.words), load(counters.refused)};
+}
+
+void Driver::recordStageBufferPositions(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture, const std::vector<Graphics::DecodeRead>& decodeReads) {
+    std::vector<std::uint32_t> sources;
+    sources.reserve(capture.plan->info.buffers.size());
+    for (const auto& buffer : capture.plan->info.buffers) sources.push_back(buffer.source);
+    std::vector<std::uint32_t> flatOffsets;
+    flatOffsets.reserve(capture.readTrace.descriptorLeaves.size());
+    for (const auto& leaf : capture.readTrace.descriptorLeaves) flatOffsets.push_back(ShaderRecompiler::DescriptorLeafFlatOffset(*capture.plan, leaf.first));
+    const auto counts = BufferWordPositions(variant.runs, capture.readTrace.descriptorLeaves, flatOffsets, variant.words, sources, variant.compiled->bindings, variant.bufferPositions, variant.bufferSlots);
+    std::vector<bool> decoded(variant.words.size(), false);
+    std::size_t offset = 0;
+    for (const auto& [begin, end] : variant.runs) {
+        for (const auto& read : decodeReads) {
+            const auto from = std::max(begin, read.address);
+            const auto to = std::min(end, read.address + read.size);
+            if (from >= to) continue;
+            for (auto word = (from - begin) / sizeof(std::uint32_t); word < (to - begin + sizeof(std::uint32_t) - 1) / sizeof(std::uint32_t); ++word) decoded[offset + static_cast<std::size_t>(word)] = true;
+        }
+        offset += static_cast<std::size_t>((end - begin) / sizeof(std::uint32_t));
+    }
+    std::size_t kept = 0;
+    for (std::size_t k = 0; k < variant.bufferPositions.size(); ++k) {
+        if (decoded[variant.bufferPositions[k]] || std::binary_search(variant.dataPositions.begin(), variant.dataPositions.end(), variant.bufferPositions[k])) continue;
+        variant.bufferPositions[kept] = variant.bufferPositions[k];
+        variant.bufferSlots[kept] = variant.bufferSlots[k];
+        ++kept;
+    }
+    variant.bufferPositions.resize(kept);
+    variant.bufferSlots.resize(kept);
+    variant.maskPositions.clear();
+    std::merge(variant.dataPositions.begin(), variant.dataPositions.end(), variant.bufferPositions.begin(), variant.bufferPositions.end(), std::back_inserter(variant.maskPositions));
+    NoteBufferWordPositions(capture.readTrace.descriptorLeaves.size(), kept, counts.unmapped, counts.unbound, counts.written, counts.mismatched);
+}
+
 void Driver::recordStageDataPositions(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture, const std::vector<Graphics::DecodeRead>& decodeReads) {
     const auto& compiled = *variant.compiled;
     for (std::size_t b = 0; b < compiled.bindings.size(); ++b) {
@@ -264,6 +338,7 @@ bool Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             const bool relocatable = !vertexInputs || tailed;
             tagVariantRuns(*variant, regions, stageCapture.userDataUse, relocatable, programs[i].hiddenUserWords, stageCapture.supplied);
             if (drawStageDataHits() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) recordStageDataPositions(*variant, *stageCapture.capture, decodeReads[i]);
+            if (stageCapture.capture != nullptr && stageCapture.capture->plan != nullptr && !stageCapture.capture->readTrace.descriptorLeaves.empty()) recordStageBufferPositions(*variant, *stageCapture.capture, decodeReads[i]);
             if (tailed) {
                 appendDecodeRuns(*variant, decodeReads[i]);
                 variant->vertexTableWords = stageCapture.vertexTableWords;

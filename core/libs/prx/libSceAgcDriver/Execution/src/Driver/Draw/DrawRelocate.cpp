@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -529,6 +530,9 @@ std::shared_ptr<DispatchVariant> Driver::movedShapeVariant(const std::shared_ptr
     copy->dataPositions = variant->dataPositions;
     copy->dataSlots = variant->dataSlots;
     copy->flatBinding = variant->flatBinding;
+    copy->bufferPositions = variant->bufferPositions;
+    copy->bufferSlots = variant->bufferSlots;
+    copy->maskPositions = variant->maskPositions;
     copy->pushOffset = variant->pushOffset;
     copy->userDataMask = variant->userDataMask;
     copy->forwardedWords = variant->forwardedWords;
@@ -558,8 +562,39 @@ std::shared_ptr<DispatchVariant> Driver::movedShapeVariant(const std::shared_ptr
     return copy;
 }
 
-bool Driver::movedRunsReadEqual(const DispatchVariant& variant, std::span<const UserWordMove> moves, bool redecoded) {
-    std::array<std::uint32_t, MaxContentWords> live;
+bool Driver::patchBufferWords(DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint32_t>> live) {
+    if (live.empty()) return true;
+    const auto& bindings = variant.compiled->bindings;
+    std::vector<std::array<std::uint32_t, 2>> touched;
+    for (const auto& [position, value] : live) {
+        const auto [first, last] = std::equal_range(variant.bufferPositions.begin(), variant.bufferPositions.end(), position);
+        if (first == last || position >= variant.words.size()) return false;
+        variant.words[position] = value;
+        for (auto at = first; at != last; ++at) {
+            const auto& [binding, slot] = variant.bufferSlots[static_cast<std::size_t>(at - variant.bufferPositions.begin())];
+            if (binding >= bindings.size() || slot >= bindings[binding].guestDescriptor.size()) return false;
+            variant.descriptorPatches.push_back({binding, slot, value});
+            if (bindings[binding].role == ShaderRecompiler::DescriptorRole::GuestBuffers) touched.push_back({binding, slot / 4u});
+        }
+    }
+    std::sort(touched.begin(), touched.end());
+    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
+    for (const auto& [binding, element] : touched) {
+        const auto& stored = bindings[binding].guestDescriptor;
+        if (static_cast<std::size_t>(element) * 4u + 4u > stored.size()) return false;
+        std::array<std::uint32_t, 4> fresh{stored[element * 4u], stored[element * 4u + 1u], stored[element * 4u + 2u], stored[element * 4u + 3u]};
+        for (const auto& [patched, slot, value] : variant.descriptorPatches) {
+            if (patched == binding && slot / 4u == element) fresh[slot % 4u] = value;
+        }
+        if (bindings[binding].role == ShaderRecompiler::DescriptorRole::GuestBuffers && !ShaderRecompiler::SameBufferSpecialization(std::span<const std::uint32_t, 4>(stored.data() + element * 4u, 4), fresh)) return false;
+    }
+    variant.shared.clear();
+    return true;
+}
+
+bool Driver::movedRunsReadEqual(const DispatchVariant& variant, std::span<const UserWordMove> moves, bool redecoded, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
+    if (live != nullptr) live->clear();
+    std::array<std::uint32_t, MaxContentWords> read;
     std::size_t offset = 0;
     if (redecoded && variant.decodeRuns > variant.runs.size()) return false;
     const auto compared = redecoded ? variant.runs.size() - variant.decodeRuns : variant.runs.size();
@@ -574,8 +609,16 @@ bool Driver::movedRunsReadEqual(const DispatchVariant& variant, std::span<const 
         }
         for (std::size_t done = 0; done < words; done += MaxContentWords) {
             const auto count = std::min<std::size_t>(words - done, MaxContentWords);
-            if (CopyMoved(begin + done * sizeof(std::uint32_t), std::as_writable_bytes(std::span(live).first(count))) != GuestMemory::Compare::Equal) return false;
-            if (std::memcmp(live.data(), variant.words.data() + offset + done, count * sizeof(std::uint32_t)) != 0) return false;
+            if (CopyMoved(begin + done * sizeof(std::uint32_t), std::as_writable_bytes(std::span(read).first(count))) != GuestMemory::Compare::Equal) return false;
+            if (std::memcmp(read.data(), variant.words.data() + offset + done, count * sizeof(std::uint32_t)) != 0) {
+                if (live == nullptr || variant.bufferPositions.empty()) return false;
+                for (std::size_t word = 0; word < count; ++word) {
+                    const auto position = static_cast<std::uint32_t>(offset + done + word);
+                    if (read[word] == variant.words[position]) continue;
+                    if (!std::binary_search(variant.bufferPositions.begin(), variant.bufferPositions.end(), position)) return false;
+                    live->emplace_back(position, read[word]);
+                }
+            }
         }
         offset += words;
     }

@@ -2,6 +2,7 @@
 #include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtAddressArithmetic.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
+#include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "IntermediateRepresentation/IrBuilder.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 
@@ -442,7 +443,7 @@ bool SrtTape::compute(Frame& frame, const Node& node, std::uint64_t& result) con
             if (frame.runtime.userDataUse != nullptr) frame.runtime.userDataUse->reads.emplace_back(address, origin);
             if (node.loaded && frame.runtime.accessible != nullptr && !frame.runtime.accessible(frame.runtime.userContext, address, sizeof(std::uint32_t))) return false;
             if (auto* trace = frame.runtime.readTrace; trace != nullptr) {
-                if (node.source == trace->leaf) trace->leaves.emplace_back(trace->leafSlot, address);
+                if (node.source == trace->leaf) (trace->leafDescriptor ? trace->descriptorLeaves : trace->leaves).emplace_back(trace->leafSlot, address);
                 else trace->otherReads.push_back(address);
             }
             const auto reader = node.clean ? frame.runtime.readSpecializationMemory : frame.runtime.readMemory;
@@ -553,6 +554,7 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     auto* trace = runtime.readTrace;
     const auto leavesBefore = trace != nullptr ? trace->leaves.size() : 0;
     const auto readsBefore = trace != nullptr ? trace->otherReads.size() : 0;
+    const auto descriptorLeavesBefore = trace != nullptr ? trace->descriptorLeaves.size() : 0;
     auto* use = runtime.userDataUse;
     const auto baseBefore = use != nullptr ? use->asBase : 0;
     const auto valueBefore = use != nullptr ? use->asValue : 0;
@@ -561,7 +563,9 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         if (trace != nullptr) {
             trace->leaves.resize(leavesBefore);
             trace->otherReads.resize(readsBefore);
+            trace->descriptorLeaves.resize(descriptorLeavesBefore);
             trace->leaf = nullptr;
+            trace->leafDescriptor = false;
         }
         if (use != nullptr) {
             use->asBase = baseBefore;
@@ -667,7 +671,18 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
             for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) {
                 std::uint64_t word = 0;
                 frame.descriptorBytes = source.dwordCount > 1u ? static_cast<std::size_t>(source.dwordCount - dword) * sizeof(std::uint32_t) : 0u;
+                const auto leafSlot = trace != nullptr && sourceIndex < plan.descriptorLeafDwords.size() && (plan.descriptorLeafDwords[sourceIndex] >> dword & 1u) != 0u ? DescriptorDwordSlot(plan, sourceIndex, dword) : NoDescriptorDwordSlot;
+                const bool leaf = leafSlot != NoDescriptorDwordSlot;
+                if (leaf) {
+                    trace->leaf = plan.srtReads[leafSlot].value->Resolve();
+                    trace->leafSlot = sourceIndex * 8u + dword;
+                    trace->leafDescriptor = true;
+                }
                 const bool ok = evaluate(frame, sourceDwords[sourceIndex][dword], word);
+                if (leaf) {
+                    trace->leaf = nullptr;
+                    trace->leafDescriptor = false;
+                }
                 frame.descriptorBytes = 0u;
                 if (!ok) return refuse();
                 value.dwords[dword] = static_cast<std::uint32_t>(word);

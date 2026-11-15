@@ -195,6 +195,14 @@ struct DataWordPositionCounts {
 };
 DataWordPositionCounts DataWordPositions(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads, std::span<const std::uint32_t> words, std::span<const std::uint32_t> flattenedSrt, std::vector<std::uint32_t>& positions, std::vector<std::uint32_t>& slots);
 
+struct BufferWordPositionCounts {
+    std::uint64_t unmapped = 0;
+    std::uint64_t unbound = 0;
+    std::uint64_t written = 0;
+    std::uint64_t mismatched = 0;
+};
+BufferWordPositionCounts BufferWordPositions(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint32_t> flatOffsets, std::span<const std::uint32_t> words, std::span<const std::uint32_t> bufferSources, std::span<const ShaderRecompiler::DescriptorBinding> bindings, std::vector<std::uint32_t>& positions, std::vector<std::array<std::uint32_t, 2>>& slots);
+
 struct SharedWords {
     std::size_t first = 0;
     std::size_t count = 0;

@@ -45,6 +45,19 @@ struct ResourceCapture {
 };
 [[nodiscard]] std::shared_ptr<const ResourceCapture> CaptureResources(const RecompileRequest& request, const SrtRuntime& runtime);
 
+struct DescriptorLeafCounts {
+    std::uint64_t captures = 0;
+    std::uint64_t traced = 0;
+    std::uint64_t buffers = 0;
+    std::uint64_t planned = 0;
+    std::uint64_t leaves = 0;
+    std::uint64_t aliased = 0;
+};
+[[nodiscard]] bool DescriptorLeaves();
+[[nodiscard]] DescriptorLeafCounts DescriptorLeafTotals();
+[[nodiscard]] std::uint32_t DescriptorLeafFlatOffset(const IrResourcePlan& plan, std::uint32_t leaf);
+[[nodiscard]] bool SameBufferSpecialization(std::span<const std::uint32_t, 4> stored, std::span<const std::uint32_t, 4> fresh);
+
 // The resolved source of a request (its cache entry with the plan built), for a driver that
 // memoizes it per registered shader: ResolveSource is what CaptureResources does before the walk
 // (the stage input validation, the key over the code, the lookup, the first-sight plan build), and

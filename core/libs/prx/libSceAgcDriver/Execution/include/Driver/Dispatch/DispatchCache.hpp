@@ -60,6 +60,10 @@ struct DispatchVariant {
     std::vector<std::uint32_t> dataPositions;
     std::vector<std::uint32_t> dataSlots;
     std::uint32_t flatBinding = NoFlatBinding;
+    std::vector<std::uint32_t> bufferPositions;
+    std::vector<std::array<std::uint32_t, 2>> bufferSlots;
+    std::vector<std::uint32_t> maskPositions;
+    [[nodiscard]] const std::vector<std::uint32_t>& MaskedPositions() const { return bufferPositions.empty() ? dataPositions : maskPositions; }
 
     std::uint32_t pushOffset = 0;
     std::vector<std::int8_t> runBases;

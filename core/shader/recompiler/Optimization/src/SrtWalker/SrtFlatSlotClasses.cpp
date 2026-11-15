@@ -62,6 +62,109 @@ std::vector<std::uint8_t> ComputePureFlatSlots(const IrResourcePlan& plan) {
     return pure;
 }
 
+std::uint32_t DescriptorDwordSlot(const IrResourcePlan& plan, std::size_t source, std::uint32_t dword) {
+    if (source >= plan.descriptorSources.size()) return NoDescriptorDwordSlot;
+    const auto& dwords = plan.descriptorSources[source];
+    if (dword >= dwords.dwordCount || dword >= dwords.dwords.size() || dwords.dwords[dword] == nullptr) return NoDescriptorDwordSlot;
+    const IrValue* value = dwords.dwords[dword]->Resolve();
+    if (value->Opcode() != IrOpcode::ReadConst || value->ArgumentCount() < 2 || value->Argument(1) == nullptr) return NoDescriptorDwordSlot;
+    const IrValue* slot = value->Argument(1)->Resolve();
+    if (!slot->HasImmediate() || slot->Type() != IrType::U32 || slot->ImmediateU32() >= plan.srtReads.size() || plan.srtReads[slot->ImmediateU32()].value == nullptr) return NoDescriptorDwordSlot;
+    return slot->ImmediateU32();
+}
+
+std::vector<std::uint8_t> ComputeDescriptorLeafDwords(const IrResourcePlan& plan) {
+    std::vector<std::uint8_t> leaves(plan.descriptorSources.size(), 0u);
+    if (leaves.empty() || plan.info.buffers.empty()) return leaves;
+    const bool disqualified = !plan.srtPlanComplete || plan.requiresSpecializationMemory
+        || std::any_of(plan.descriptorSources.begin(), plan.descriptorSources.end(), [](const DescriptorSource& source) { return source.tableColumn.has_value(); })
+        || (plan.uniformFill.fill.kind != UniformFillKind::None && plan.uniformFill.fill.words > plan.uniformFill.values.size());
+    if (disqualified) return leaves;
+    std::vector<std::uint8_t> buffer(leaves.size(), 0u);
+    for (const auto& resource : plan.info.buffers) {
+        if (resource.source < buffer.size()) buffer[resource.source] = 1u;
+    }
+    for (const auto& resource : plan.info.buffers) {
+        if (resource.source < buffer.size() && resource.imageAlias != BufferResource::NoImageAlias) buffer[resource.source] = 0u;
+    }
+    for (const auto& image : plan.info.images) {
+        if (image.source < buffer.size()) buffer[image.source] = 0u;
+    }
+    for (const auto& sampler : plan.info.samplers) {
+        if (sampler.source < buffer.size()) buffer[sampler.source] = 0u;
+    }
+    std::unordered_map<const IrValue*, std::uint32_t> roots;
+    std::vector<std::uint32_t> slotRoots(plan.srtReads.size(), 0u);
+    for (std::size_t source = 0; source < plan.descriptorSources.size(); ++source) {
+        const auto& dwords = plan.descriptorSources[source];
+        for (std::uint32_t i = 0; i < dwords.dwordCount && i < dwords.dwords.size(); ++i) {
+            if (dwords.dwords[i] == nullptr) continue;
+            ++roots[dwords.dwords[i]->Resolve()];
+            if (const auto slot = DescriptorDwordSlot(plan, source, i); slot != NoDescriptorDwordSlot) ++slotRoots[slot];
+        }
+    }
+    const auto clean = [&](std::uint32_t slot) {
+        const auto flat = plan.srtReads[slot].flatOffset;
+        return (slot < plan.cleanFlatSlots.size() && plan.cleanFlatSlots[slot] != 0u) || (flat < plan.cleanFlatSlots.size() && plan.cleanFlatSlots[flat] != 0u);
+    };
+    const auto candidate = [&](std::size_t source, std::uint32_t dword) {
+        if (buffer[source] == 0u || dword >= DescriptorLeafDwordLimit) return false;
+        const auto slot = DescriptorDwordSlot(plan, source, dword);
+        if (slot == NoDescriptorDwordSlot || slotRoots[slot] != 1u || clean(slot) || roots[plan.descriptorSources[source].dwords[dword]->Resolve()] != 1u) return false;
+        const IrValue* read = plan.srtReads[slot].value->Resolve();
+        return read->Opcode() == IrOpcode::LoadAddressU32 || read->Opcode() == IrOpcode::ReadConstBuffer;
+    };
+    std::unordered_set<const IrValue*> consumed;
+    std::vector<IrValue*> pending;
+    const auto drain = [&] {
+        while (!pending.empty()) {
+            IrValue* value = pending.back()->Resolve();
+            pending.pop_back();
+            if (!consumed.insert(value).second) continue;
+            if (value->Opcode() == IrOpcode::ReadConst && value->ArgumentCount() >= 2 && value->Argument(1) != nullptr) {
+                const IrValue* slot = value->Argument(1)->Resolve();
+                if (slot->HasImmediate() && slot->Type() == IrType::U32 && slot->ImmediateU32() < plan.srtReads.size() && plan.srtReads[slot->ImmediateU32()].value != nullptr) pending.push_back(plan.srtReads[slot->ImmediateU32()].value);
+            }
+            for (std::size_t i = 0; i < value->ArgumentCount(); ++i) {
+                if (value->Argument(i) != nullptr) pending.push_back(value->Argument(i));
+            }
+        }
+    };
+    const auto consume = [&](IrValue* root) {
+        if (root == nullptr) return;
+        pending.push_back(root);
+        drain();
+    };
+    const auto consumeBelow = [&](IrValue* root) {
+        if (root == nullptr) return;
+        IrValue* value = root->Resolve();
+        for (std::size_t i = 0; i < value->ArgumentCount(); ++i) {
+            if (value->Argument(i) != nullptr) pending.push_back(value->Argument(i));
+        }
+        drain();
+    };
+    for (std::size_t source = 0; source < plan.descriptorSources.size(); ++source) {
+        const auto& dwords = plan.descriptorSources[source];
+        for (std::uint32_t i = 0; i < dwords.dwordCount && i < dwords.dwords.size(); ++i) {
+            if (!candidate(source, i)) consume(dwords.dwords[i]);
+        }
+    }
+    for (const auto& block : plan.controlFlow) consume(block.condition);
+    if (plan.uniformFill.fill.kind != UniformFillKind::None) {
+        for (std::uint32_t i = 0; i < plan.uniformFill.fill.words; ++i) consume(plan.uniformFill.values[i]);
+    }
+    for (const auto& read : plan.srtReads) consumeBelow(read.value);
+    for (std::size_t source = 0; source < plan.descriptorSources.size(); ++source) {
+        const auto& dwords = plan.descriptorSources[source];
+        for (std::uint32_t i = 0; i < dwords.dwordCount && i < DescriptorLeafDwordLimit; ++i) {
+            if (!candidate(source, i)) continue;
+            const auto slot = DescriptorDwordSlot(plan, source, i);
+            if (!consumed.contains(dwords.dwords[i]->Resolve()) && !consumed.contains(plan.srtReads[slot].value->Resolve())) leaves[source] |= static_cast<std::uint8_t>(1u << i);
+        }
+    }
+    return leaves;
+}
+
 std::vector<std::uint32_t> ComputeGuardedFlatSlots(const IrResourcePlan& plan) {
     std::unordered_map<const IrValue*, std::vector<const IrValue*>> users;
     std::unordered_set<const IrValue*> seen;

@@ -119,8 +119,8 @@ EntryOutcome Driver::validateVariant(std::uint64_t program, std::uint32_t queue,
             pipeline.Drain(DrawPipeline::DrainReason::Capture);
         }
     }
-    const bool masked = live != nullptr && !variant.dataPositions.empty();
-    const DataMask mask{variant.dataPositions, live};
+    const bool masked = live != nullptr && !variant.MaskedPositions().empty();
+    const DataMask mask{variant.MaskedPositions(), live};
     thread_local std::vector<VouchedRegions>* vouchedSlot = nullptr;
     auto& vouched = ShaderRecompiler::ThreadOwned(vouchedSlot);
     vouched.clear();

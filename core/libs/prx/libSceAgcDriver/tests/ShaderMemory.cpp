@@ -262,7 +262,7 @@ void verifyFrontendProgram(const ShaderRecompiler::IrProgram& reused, const Shad
     const auto& left = reused.Resources();
     const auto& right = fresh.Resources();
     require(left.stage == right.stage && left.shaderHash == right.shaderHash && left.userDataBase == right.userDataBase && left.userDataCount == right.userDataCount && left.srgbDecodeFormats == right.srgbDecodeFormats, "frontend pair: resource identity changed");
-    require(left.memoryInfo == right.memoryInfo && left.materializationSources == right.materializationSources && left.guardedSrtSlots == right.guardedSrtSlots && left.srtGuardOffset == right.srtGuardOffset && left.cleanFlatSlots == right.cleanFlatSlots && left.pureFlatSlots == right.pureFlatSlots, "frontend pair: resource planning changed");
+    require(left.memoryInfo == right.memoryInfo && left.materializationSources == right.materializationSources && left.guardedSrtSlots == right.guardedSrtSlots && left.srtGuardOffset == right.srtGuardOffset && left.cleanFlatSlots == right.cleanFlatSlots && left.pureFlatSlots == right.pureFlatSlots && left.descriptorLeafDwords == right.descriptorLeafDwords, "frontend pair: resource planning changed");
     require(left.descriptorSources.size() == right.descriptorSources.size() && left.srtReads.size() == right.srtReads.size(), "frontend pair: resource counts changed");
     for (std::size_t index = 0; index < left.descriptorSources.size(); ++index) {
         const auto& a = left.descriptorSources[index];
@@ -2908,6 +2908,115 @@ void verifyOutOfRangeConstantReads() {
         });
     };
     require(holds(first) && holds(std::array<std::uint32_t, 8>{}), "out-of-range s_buffer_load: a T# read through a null V# was not evaluated as zero");
+}
+
+void verifyDescriptorLeafDwords() {
+    using namespace ShaderRecompiler;
+    std::vector<std::unique_ptr<IrValue>> values;
+    std::uint32_t ids = 0;
+    const auto make = [&](IrOpcode opcode, IrType type) -> IrValue& {
+        values.push_back(std::make_unique<IrValue>(opcode, type, ids++));
+        return *values.back();
+    };
+    const auto constant = [&](std::uint32_t value) -> IrValue& {
+        auto& immediate = make(IrOpcode::Void, IrType::U32);
+        immediate.SetImmediateU32(value);
+        return immediate;
+    };
+    auto& resource = make(IrOpcode::GetSrtResource, IrType::SrtResource);
+    const auto userData = [&](std::uint32_t index) -> IrValue& {
+        auto& reg = make(IrOpcode::Void, IrType::ScalarReg);
+        reg.SetRegister({RegisterBank::Scalar, index});
+        auto& read = make(IrOpcode::GetUserData, IrType::U32);
+        read.AddArgument(&reg);
+        return read;
+    };
+    const auto handle = [&](IrValue& low, IrValue& high) -> IrValue& {
+        auto& composed = make(IrOpcode::CompositeConstructU64, IrType::U64);
+        composed.AddArgument(&low);
+        composed.AddArgument(&high);
+        return composed;
+    };
+    const auto rawRead = [&](IrValue& address, std::uint32_t offset) -> IrValue& {
+        auto& read = make(IrOpcode::LoadAddressU32, IrType::U32);
+        read.AddArgument(&address);
+        read.AddArgument(&constant(offset));
+        return read;
+    };
+    const auto readConst = [&](std::uint32_t slot) -> IrValue& {
+        auto& read = make(IrOpcode::ReadConst, IrType::U32);
+        read.AddArgument(&resource);
+        read.AddArgument(&constant(slot));
+        return read;
+    };
+    auto& table = handle(userData(0), userData(1));
+    std::array<IrValue*, 5> reads{&rawRead(table, 0), &rawRead(table, 4), &rawRead(table, 8), &rawRead(table, 12), &rawRead(table, 16)};
+    IrResourcePlan plan;
+    plan.srtPlanComplete = true;
+    plan.resourceTrackingComplete = true;
+    for (std::uint32_t slot = 0; slot < 4; ++slot) plan.srtReads.push_back({reads[slot], slot});
+    DescriptorSource source;
+    source.dwordCount = 4;
+    for (std::uint32_t dword = 0; dword < 4; ++dword) source.dwords[dword] = &readConst(dword);
+    plan.descriptorSources.push_back(source);
+    BufferResource buffer;
+    buffer.source = 0;
+    plan.info.buffers.push_back(buffer);
+    using Leaves = std::vector<std::uint8_t>;
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0111}, "descriptor leaf dwords: the base and size dwords a buffer source reads through flat slots of their own are not its leaves");
+    require(Detail::DescriptorDwordSlot(plan, 0, 2) == 2 && Detail::DescriptorDwordSlot(plan, 0, 4) == Detail::NoDescriptorDwordSlot && Detail::DescriptorDwordSlot(plan, 1, 0) == Detail::NoDescriptorDwordSlot, "descriptor leaf dwords: a dword does not name the flat slot it reads");
+    plan.srtReads.push_back({reads[4], 4});
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0111}, "descriptor leaf dwords: a flat slot read at another offset removed a leaf");
+    plan.srtReads.push_back({&rawRead(handle(readConst(0), readConst(1)), 0), 5});
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0100}, "descriptor leaf dwords: dwords in the address cone of another flat slot stayed leaves");
+    plan.srtReads.pop_back();
+    plan.controlFlow.push_back({&readConst(0), {}, {}});
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0110}, "descriptor leaf dwords: a dword whose slot a control-flow condition reads stayed a leaf");
+    plan.controlFlow.clear();
+    plan.uniformFill.fill.kind = UniformFillKind::Buffer;
+    plan.uniformFill.fill.words = 1;
+    plan.uniformFill.values[0] = &readConst(1);
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0101}, "descriptor leaf dwords: a dword whose slot a uniform-fill value reads stayed a leaf");
+    plan.uniformFill = {};
+    DescriptorSource second;
+    second.dwordCount = 1;
+    second.dwords[0] = &readConst(0);
+    plan.descriptorSources.push_back(second);
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0110, 0}, "descriptor leaf dwords: a slot two sources read stayed a leaf, or a source no buffer uses gained one");
+    BufferResource other;
+    other.source = 1;
+    plan.info.buffers.push_back(other);
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0110, 0}, "descriptor leaf dwords: a slot two buffer sources read became a leaf of one of them");
+    plan.descriptorSources[1].dwords[0] = &readConst(4);
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0111, 0b0001}, "descriptor leaf dwords: a second buffer source did not gain the dword it alone reads");
+    ImageResource image;
+    image.source = 1;
+    plan.info.images.push_back(image);
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0111, 0}, "descriptor leaf dwords: a source an image also uses kept a leaf");
+    plan.info.images.clear();
+    plan.info.buffers[1].imageAlias = 0;
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0111, 0}, "descriptor leaf dwords: a buffer that aliases an image kept a leaf");
+    plan.info.buffers.pop_back();
+    plan.descriptorSources.pop_back();
+    plan.cleanFlatSlots = {0u, 1u, 0u, 0u, 0u};
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0101}, "descriptor leaf dwords: a dword read through a clean flat slot stayed a leaf");
+    plan.cleanFlatSlots.clear();
+    auto* through = plan.descriptorSources[0].dwords[2];
+    plan.descriptorSources[0].dwords[2] = reads[2];
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0011}, "descriptor leaf dwords: a dword that names a raw read without its flat slot became a leaf");
+    plan.descriptorSources[0].dwords[2] = through;
+    auto* own = plan.descriptorSources[0].dwords[1];
+    plan.descriptorSources[0].dwords[1] = plan.descriptorSources[0].dwords[0];
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0b0100}, "descriptor leaf dwords: one read that fills two dwords stayed a leaf");
+    plan.descriptorSources[0].dwords[1] = own;
+    plan.descriptorSources[0].tableColumn = TableColumn{};
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0}, "descriptor leaf dwords: a table column did not disqualify the plan");
+    plan.descriptorSources[0].tableColumn.reset();
+    plan.requiresSpecializationMemory = true;
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0}, "descriptor leaf dwords: specialization memory did not disqualify the plan");
+    plan.requiresSpecializationMemory = false;
+    plan.srtPlanComplete = false;
+    require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0}, "descriptor leaf dwords: an incomplete SRT plan was not disqualified");
 }
 
 // The pure flat slots of a hand-built plan (Detail::ComputePureFlatSlots): a slot is pure unless
@@ -12968,6 +13077,7 @@ int main(int argc, char** argv) {
         verifyMayEvaluate();
         verifyMayDecideSharedConditions();
         verifyPureFlatSlots();
+        verifyDescriptorLeafDwords();
         verifyPlanConditionPruning();
         verifyPlanRetention();
         verifyPendingBranchLeftUnpruned();

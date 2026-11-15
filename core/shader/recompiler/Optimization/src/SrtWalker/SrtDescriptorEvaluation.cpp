@@ -1,6 +1,7 @@
 #include "Optimization/SrtWalker/SrtDescriptorEvaluation.hpp"
 #include "Optimization/SrtWalker/SrtEvaluator.hpp"
 #include "Optimization/SrtWalker/SrtTape.hpp"
+#include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 
 #include <cstdio>
@@ -146,7 +147,19 @@ bool evaluateRuntimeSources(const IrResourcePlan& program, std::span<const std::
                 const auto remainingBytes = source->dwordCount > 1u ? static_cast<std::size_t>(source->dwordCount - index) * sizeof(std::uint32_t) : 0u;
                 evaluator.SetDescriptorBytes(remainingBytes);
                 cleanEvaluator.SetDescriptorBytes(remainingBytes);
+                auto* trace = runtime.readTrace;
+                const auto leafSlot = trace != nullptr && sourceIndex < program.descriptorLeafDwords.size() && (program.descriptorLeafDwords[sourceIndex] >> index & 1u) != 0u ? DescriptorDwordSlot(program, sourceIndex, index) : NoDescriptorDwordSlot;
+                const bool leaf = leafSlot != NoDescriptorDwordSlot;
+                if (leaf) {
+                    trace->leaf = TNode::SrtRead(program, leafSlot).Value();
+                    trace->leafSlot = sourceIndex * 8u + index;
+                    trace->leafDescriptor = true;
+                }
                 const bool evaluatedDword = evaluator.Evaluate(TNode::SourceDword(program, sourceIndex, index), value.dwords[index]);
+                if (leaf) {
+                    trace->leaf = nullptr;
+                    trace->leafDescriptor = false;
+                }
                 evaluator.SetDescriptorBytes(0u);
                 cleanEvaluator.SetDescriptorBytes(0u);
                 if (!evaluatedDword) {
@@ -250,6 +263,7 @@ bool interpretRuntimeSources(const IrResourcePlan& program, std::span<const std:
     auto* trace = runtime.readTrace;
     const auto leavesBefore = trace != nullptr ? trace->leaves.size() : 0;
     const auto readsBefore = trace != nullptr ? trace->otherReads.size() : 0;
+    const auto descriptorLeavesBefore = trace != nullptr ? trace->descriptorLeaves.size() : 0;
     auto* use = runtime.userDataUse;
     const auto baseBefore = use != nullptr ? use->asBase : 0;
     const auto valueBefore = use != nullptr ? use->asValue : 0;
@@ -260,7 +274,9 @@ bool interpretRuntimeSources(const IrResourcePlan& program, std::span<const std:
                 if (trace != nullptr) {
                     trace->leaves.resize(leavesBefore);
                     trace->otherReads.resize(readsBefore);
+                    trace->descriptorLeaves.resize(descriptorLeavesBefore);
                     trace->leaf = nullptr;
+                    trace->leafDescriptor = false;
                 }
                 if (use != nullptr) {
                     use->asBase = baseBefore;
@@ -308,7 +324,7 @@ bool sameUserDataUse(const SrtUserDataUse& tape, const SrtUserDataUse& interpret
     return tapeReads == interpretedReads;
 }
 
-void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads, std::size_t leavesBefore, std::size_t readsBefore, const SrtUserDataUse* useBefore) {
+void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources, std::vector<SrtReadPoison>* poison, std::uint32_t* nullRootReads, std::size_t leavesBefore, std::size_t readsBefore, std::size_t descriptorLeavesBefore, const SrtUserDataUse* useBefore) {
     SrtReadTrace expectedTrace;
     SrtUserDataUse expectedUse = useBefore != nullptr ? *useBefore : SrtUserDataUse {};
     SrtRuntime interpreted = runtime;
@@ -337,11 +353,18 @@ void verifyTape(const IrResourcePlan& program, const SrtRuntime& runtime, std::v
         reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
         std::sort(expectedReads.begin(), expectedReads.end());
         expectedReads.erase(std::unique(expectedReads.begin(), expectedReads.end()), expectedReads.end());
+        auto descriptorLeaves = std::vector(trace->descriptorLeaves.begin() + static_cast<std::ptrdiff_t>(descriptorLeavesBefore), trace->descriptorLeaves.end());
+        auto expectedDescriptorLeaves = expectedTrace.descriptorLeaves;
+        std::sort(descriptorLeaves.begin(), descriptorLeaves.end());
+        std::sort(expectedDescriptorLeaves.begin(), expectedDescriptorLeaves.end());
         if (leaves != expectedLeaves) difference = "traced leaf reads";
+        else if (descriptorLeaves != expectedDescriptorLeaves) difference = "traced descriptor leaf reads";
         else if (reads != expectedReads) difference = "traced reads";
         if (!difference.empty()) {
             trace->leaves.resize(leavesBefore);
             trace->otherReads.resize(readsBefore);
+            trace->descriptorLeaves.resize(descriptorLeavesBefore);
+            trace->descriptorLeaves.insert(trace->descriptorLeaves.end(), expectedTrace.descriptorLeaves.begin(), expectedTrace.descriptorLeaves.end());
             trace->leaves.insert(trace->leaves.end(), expectedTrace.leaves.begin(), expectedTrace.leaves.end());
             trace->otherReads.insert(trace->otherReads.end(), expectedTrace.otherReads.begin(), expectedTrace.otherReads.end());
         }
@@ -397,12 +420,13 @@ bool EvaluateRuntimeSourcesImpl(const IrResourcePlan& program, std::span<const s
         if (const auto* tape = SrtTape::For(program); tape != nullptr) {
             const auto leavesBefore = runtime.readTrace != nullptr ? runtime.readTrace->leaves.size() : 0;
             const auto readsBefore = runtime.readTrace != nullptr ? runtime.readTrace->otherReads.size() : 0;
+            const auto descriptorLeavesBefore = runtime.readTrace != nullptr ? runtime.readTrace->descriptorLeaves.size() : 0;
             std::optional<SrtUserDataUse> useBefore;
             if (SrtTape::Verified() && runtime.userDataUse != nullptr) useBefore = *runtime.userDataUse;
             if (tape->Run(program, runtime, results, flat, activeSources)) {
                 if (poison != nullptr) poison->clear();
                 if (nullRootReads != nullptr) *nullRootReads = 0;
-                if (SrtTape::Verified()) verifyTape(program, runtime, results, flat, activeSources, poison, nullRootReads, leavesBefore, readsBefore, useBefore ? &*useBefore : nullptr);
+                if (SrtTape::Verified()) verifyTape(program, runtime, results, flat, activeSources, poison, nullRootReads, leavesBefore, readsBefore, descriptorLeavesBefore, useBefore ? &*useBefore : nullptr);
                 return true;
             }
         }

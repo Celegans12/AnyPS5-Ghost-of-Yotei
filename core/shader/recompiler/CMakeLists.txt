@@ -262,6 +262,9 @@ function(add_shader_recompiler target runtimeTarget)
             BuildTessellationCaptureGeometryShader
             CaptureResources
             DebugProbeActive
+            DescriptorLeafCounts
+            DescriptorLeafTotals
+            DescriptorLeaves
             DecodeRdnaInstruction
             DepthBitsTextureWidth
             HashBytes
@@ -293,6 +296,8 @@ function(add_shader_recompiler target runtimeTarget)
             GetPreparedArtifact
             MaterializeShader
             RegistrationResult
+            SameBufferSpecialization
+            DescriptorLeafFlatOffset
             ResolveSource
             ResourceMaterializer::EvaluateNanoseconds
             ResourceMaterializer::MaterializeNanoseconds

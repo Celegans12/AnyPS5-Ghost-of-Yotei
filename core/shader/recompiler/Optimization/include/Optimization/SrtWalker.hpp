@@ -95,7 +95,9 @@ using SrtSnapshotCurrent = bool (*)(void* userData, std::span<const RegisteredIm
 struct SrtReadTrace {
     const IrValue* leaf = nullptr;
     std::uint32_t leafSlot = 0;
+    bool leafDescriptor = false;
     std::vector<std::pair<std::uint32_t, std::uint64_t>> leaves;
+    std::vector<std::pair<std::uint32_t, std::uint64_t>> descriptorLeaves;
     std::vector<std::uint64_t> otherReads;
 };
 

@@ -205,13 +205,14 @@ std::vector<std::uint32_t> Setup(std::uintptr_t vertex = reinterpret_cast<std::u
 }
 
 std::uint32_t Unread = 0x1000;
+bool KeepUnread = false;
 
 DrawEntryCounters Draw(const std::uint32_t* table, std::uintptr_t vertex = reinterpret_cast<std::uintptr_t>(TriangleVertexCode.data()), const std::vector<std::uint32_t>& vertexWords = {}) {
     auto commands = Setup(vertex, vertexWords);
     const auto address = reinterpret_cast<std::uintptr_t>(table);
     Append(commands, 0x76, {0x00c, static_cast<std::uint32_t>(address)});
     Append(commands, 0x76, {0x00d, static_cast<std::uint32_t>(address >> 32u)});
-    Append(commands, 0x76, {0x00e, ++Unread});
+    Append(commands, 0x76, {0x00e, KeepUnread ? Unread : ++Unread});
     Append(commands, 0x2d, {3, 2});
     std::memset(TargetBlock(), 0, TargetBytes);
     Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
@@ -430,6 +431,94 @@ void RememberedDrawsAlternate(bool enabled, bool verify, bool recipes) {
         step = Between(before, counters);
         Require(step.compiled == 0 && step.reused == 2, "a draw of buffer " + std::to_string(set) + ", whose remembered draw is within k, reused " + std::to_string(step.reused) + " stages and built " + std::to_string(step.compiled) + ": " + Counts(counters));
     }
+}
+
+std::string BufferWords(const AgcDriver::DriverDetail::BufferWordCounts& before, const AgcDriver::DriverDetail::BufferWordCounts& after) {
+    return std::to_string(after.stages - before.stages) + " stages reused with " + std::to_string(after.words - before.words) + " buffer words patched, " + std::to_string(after.refused - before.refused) + " refused for another specialization, " + std::to_string(after.positions - before.positions) + " volatile positions kept of " + std::to_string(after.leaves - before.leaves) + " descriptor leaves (" + std::to_string(after.unmapped - before.unmapped) + " outside the runs, " + std::to_string(after.unbound - before.unbound) + " unbound, " + std::to_string(after.written - before.written) + " written, " + std::to_string(after.mismatched - before.mismatched) + " not the bound word)";
+}
+
+void BufferWordsFollowTables(bool enabled, bool verify) {
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    constexpr std::size_t Sets = 6;
+    constexpr std::array<float, Sets> values{1.0f, 0.75f, 0.5f, 0.25f, 0.875f, 0.625f};
+    constexpr std::array<unsigned, Sets> colors{255, 191, 128, 64, 223, 159};
+    auto* block = GuestBlock();
+    std::array<std::uint32_t*, Sets> tables{};
+    for (std::size_t set = 0; set < Sets; ++set) {
+        tables[set] = block + set * 64;
+        Describe(tables[set], tables[set] + DataWord, values[set]);
+    }
+    const bool recipes = !verify && std::getenv("APS5_NO_SHAPE_RECIPES") == nullptr && std::getenv("APS5_NO_DRAW_RECIPE") == nullptr;
+    const auto recorded = [] {
+        const auto counts = AgcDriver::VulkanDevice::DrawRecipeDraws();
+        return std::accumulate(counts.recorded.begin(), counts.recorded.end(), std::uint64_t{0});
+    };
+    struct Outcome {
+        Step step;
+        AgcDriver::DriverDetail::BufferWordCounts before, after;
+        std::uint64_t hits, recorded;
+        DrawEntryCounters counters;
+    };
+    DrawEntryCounters last = Driver::Get().DrawCacheCounters();
+    const auto draw = [&](std::size_t set, const std::uint32_t* table, const std::string& what) {
+        Outcome outcome;
+        outcome.before = AgcDriver::DriverDetail::BufferWordTotals();
+        const auto recipesBefore = recorded();
+        const auto counters = Draw(table);
+        const auto color = Brightest();
+        Require(CloseTo(color, colors[set]), what + " wrote " + std::to_string(color) + ", expected " + std::to_string(colors[set]) + " (" + Counts(counters) + ")");
+        outcome.after = AgcDriver::DriverDetail::BufferWordTotals();
+        outcome.step = Between(last, counters);
+        outcome.hits = counters.hits - last.hits;
+        outcome.recorded = recorded() - recipesBefore;
+        outcome.counters = counters;
+        last = counters;
+        return outcome;
+    };
+    const auto detail = [&](const Outcome& outcome) { return BufferWords(outcome.before, outcome.after) + "; " + std::to_string(outcome.step.reused) + " stages reused and " + std::to_string(outcome.step.compiled) + " built, " + std::to_string(outcome.hits) + " draw-cache hits, " + std::to_string(outcome.recorded) + " recorded from a recipe; " + Counts(outcome.counters); };
+
+    KeepUnread = true;
+    auto outcome = draw(0, tables[0], "the first draw of the shape");
+    outcome = draw(0, tables[0], "the second draw of the shape");
+    Require(outcome.counters.inserts >= 1, "the shape's second draw was not cached: " + detail(outcome));
+    Require(AgcDriver::DriverDetail::BufferWordTotals().positions != 0, "the pixel stage kept for the shape has no volatile buffer word, though its buffer descriptor is read from the table through flat slots of its own: " + detail(outcome));
+    outcome = draw(0, tables[0], "the third draw of the shape");
+    if (!verify) Require(outcome.hits == 1 && outcome.after.stages == outcome.before.stages, "a repeated draw was not a draw-cache hit without a patched buffer word: " + detail(outcome));
+
+    Describe(tables[0], tables[4] + DataWord, values[4]);
+    outcome = draw(4, tables[0], "a draw whose table names another buffer in place");
+    if (!verify) Require(outcome.hits == 1 && outcome.step.compiled == 0 && outcome.after.stages == outcome.before.stages + 1 && outcome.after.words > outcome.before.words, "a draw whose table changed in place only in the base of its read-only buffer was not a draw-cache hit with the descriptor patched: " + detail(outcome));
+    if (recipes) Require(outcome.recorded == 1, "a draw-cache hit with a patched buffer descriptor was not recorded from a recipe: " + detail(outcome));
+    Describe(tables[0], tables[0] + DataWord, values[0]);
+    outcome = draw(0, tables[0], "a draw whose table names the first buffer again");
+    if (!verify) Require(outcome.hits == 1 && outcome.step.compiled == 0 && outcome.after.stages == outcome.before.stages, "a draw whose table changed back to the words its remembered stage holds was not a plain draw-cache hit: " + detail(outcome));
+
+    tables[0][2] = 18;
+    outcome = draw(0, tables[0], "a draw whose buffer has another size tail");
+    if (!verify) Require(outcome.hits == 0 && outcome.after.refused == outcome.before.refused + 1 && outcome.after.stages == outcome.before.stages, "a draw whose buffer size changed its tail, which the stage is specialized for, was a draw-cache hit or was not refused: " + detail(outcome));
+    tables[0][2] = 16;
+    KeepUnread = false;
+
+    for (std::size_t set = 1; set < 4; ++set) {
+        outcome = draw(set, tables[set], "a draw of buffer " + std::to_string(set) + " through a table at another address");
+        if (verify) continue;
+        if (enabled) Require(outcome.step.reused == 2 && outcome.step.compiled == 0 && outcome.after.stages == outcome.before.stages + 1 && outcome.after.words > outcome.before.words, "a draw whose table moved and names another read-only buffer did not reuse the remembered pixel stage with the descriptor patched: " + detail(outcome));
+        else Require(outcome.step.compiled == 1 && outcome.after.stages == outcome.before.stages, "with the shape user words off, a draw through a table at another address was not built: " + detail(outcome));
+        if (enabled && recipes) Require(outcome.recorded == 1, "a stage reused with a patched buffer descriptor was not recorded from a recipe: " + detail(outcome));
+    }
+    for (std::size_t round = 0; round < 2; ++round) {
+        for (std::size_t set = 0; set < 4; ++set) {
+            outcome = draw(set, tables[set], "an alternating draw of buffer " + std::to_string(set));
+            if (!verify && enabled) Require(outcome.step.compiled == 0, "round " + std::to_string(round) + ": an alternating draw of buffer " + std::to_string(set) + " built a stage: " + detail(outcome));
+        }
+    }
+
+    tables[5][1] |= 4u << 16u;
+    outcome = draw(5, tables[5], "a draw of a buffer with another stride");
+    if (!verify && enabled) Require(outcome.step.compiled == 1 && outcome.after.refused >= outcome.before.refused + 1, "a draw whose buffer descriptor has another stride, which the stage is specialized for, was not refused and built: " + detail(outcome));
+    outcome = draw(1, tables[1], "a draw of the first stride after the other one");
+    if (!verify && enabled) Require(outcome.step.compiled == 0, "a draw of the first stride built a stage after another stride was seen: " + detail(outcome));
 }
 
 void ContentKeysSeparateDescriptors() {
@@ -976,16 +1065,22 @@ int main() {
         const bool vertexInputs = enabled && std::getenv("APS5_NO_SHAPE_VERTEX_INPUT_STAGES") == nullptr;
         const bool shapeRecipes = std::getenv("APS5_NO_SHAPE_RECIPES") == nullptr && std::getenv("APS5_NO_DRAW_RECIPE") == nullptr;
         const bool recipes = shapeRecipes && !verify;
-        RememberedDrawsAlternate(enabled, verify, recipes);
-        VertexInputsFollowMovedTables(enabled, vertexInputs, verify, recipes);
         const bool sites = std::getenv("APS5_DRAW_SITES") != nullptr;
-        const char* depth = std::getenv("APS5_PIPELINED_DRAWS");
-        const bool pipelined = depth == nullptr || std::string(depth) != "0";
-        if (enabled && !verify) {
-            SitesFollowRetainedDraws(sites, pipelined);
-            SitesFollowMovedVertexTables(sites, pipelined, vertexInputs);
+        const bool volatileBufferWords = std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr;
+        if (volatileBufferWords) {
+            BufferWordsFollowTables(enabled, verify);
+        } else {
+            RememberedDrawsAlternate(enabled, verify, recipes);
+            VertexInputsFollowMovedTables(enabled, vertexInputs, verify, recipes);
+            const char* depth = std::getenv("APS5_PIPELINED_DRAWS");
+            const bool pipelined = depth == nullptr || std::string(depth) != "0";
+            if (enabled && !verify) {
+                SitesFollowRetainedDraws(sites, pipelined);
+                SitesFollowMovedVertexTables(sites, pipelined, vertexInputs);
+            }
+            if (!verify) ContentKeysSeparateDescriptors();
+            Require(AgcDriver::DriverDetail::BufferWordTotals().positions == 0 && AgcDriver::DriverDetail::BufferWordTotals().stages == 0, "with the descriptor leaves off, a buffer word was volatile");
         }
-        if (!verify) ContentKeysSeparateDescriptors();
         const auto siteCounters = DrawSiteAccess::Counters();
         const auto origins = AgcDriver::VulkanDevice::DrawRecipeOrigins();
         const auto shape = static_cast<std::size_t>(AgcDriver::VulkanDevice::DrawRecipeOrigin::Shape);

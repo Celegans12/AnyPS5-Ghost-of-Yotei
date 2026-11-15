@@ -16,6 +16,10 @@ namespace ShaderRecompiler::Detail {
 // fill) has no pure slot. Reachability over-approximates what the evaluators consume, so an
 // unknown opcode only makes more slots impure.
 std::vector<std::uint8_t> ComputePureFlatSlots(const IrResourcePlan& plan);
+inline constexpr std::uint32_t DescriptorLeafDwordLimit = 3;
+inline constexpr std::uint32_t NoDescriptorDwordSlot = ~std::uint32_t{0};
+std::uint32_t DescriptorDwordSlot(const IrResourcePlan& plan, std::size_t source, std::uint32_t dword);
+std::vector<std::uint8_t> ComputeDescriptorLeafDwords(const IrResourcePlan& plan);
 std::vector<std::uint32_t> ComputeGuardedFlatSlots(const IrResourcePlan& plan);
 
 }
