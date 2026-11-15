@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBC_INCLUDE_WINDOWSPAGETRACK_HPP
 
 #ifdef _WIN32
+#include "prx/libc/include/GuestArena.hpp"
 #include <windows.h>
 #include <algorithm>
 #include <array>
@@ -206,6 +207,24 @@ public:
     std::uint64_t Word(std::uintptr_t block) const {
         const auto* entry = find(block);
         return entry == nullptr ? 0 : entry->word.load(std::memory_order_acquire);
+    }
+
+    std::uint64_t ArmedWord(std::uintptr_t block) const {
+        return with(Word(block), State::Armed);
+    }
+
+    static std::uint64_t Reason(PageTrackReason reason, std::uint64_t frames = 0) {
+        return static_cast<std::uint64_t>(reason) | (frames << PageTrackReasonFramesShift);
+    }
+
+    static std::uint64_t Refusal(const Block& entry, std::uint32_t now) {
+        if (entry.holds != 0) return Reason(PageTrackReason::Held);
+        const std::uint8_t flags = entry.flags;
+        if ((flags & Imported) != 0) return Reason(PageTrackReason::Imported);
+        if (flags != 0) return Reason(PageTrackReason::Barred);
+        const std::uint32_t rest = entry.restUntil;
+        if (now < rest) return Reason(PageTrackReason::Resting, rest - now);
+        return Reason(PageTrackReason::Armable);
     }
 
     static bool Spans(std::uintptr_t address, std::size_t bytes, std::size_t count) {

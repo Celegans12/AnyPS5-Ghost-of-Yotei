@@ -719,6 +719,10 @@ bool GuestPageTrackCleanSince_nid_no_patch(std::uintptr_t address, std::size_t b
     return WindowsPageTrack::Get().CleanSince(address, bytes, tokens, count);
 }
 
+bool GuestPageTrackArm_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* tokens, std::uint64_t* reasons, std::size_t count) {
+    return WindowsMappings::Get().ArmBlocks(address, bytes, tokens, reasons, count);
+}
+
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleRead(address);
 }

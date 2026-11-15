@@ -462,6 +462,156 @@ void CheckCollectRace(bool resident) {
     Require(refused.load() == 0, "a fault on tracked memory was refused");
 }
 
+GuestArena::PageTrackReason ReasonOf(std::uint64_t reason) {
+    return static_cast<GuestArena::PageTrackReason>(reason & GuestArena::PageTrackReasonMask);
+}
+
+std::uint64_t FramesOf(std::uint64_t reason) {
+    return reason >> GuestArena::PageTrackReasonFramesShift;
+}
+
+void CheckDemand(bool resident) {
+    constexpr std::size_t Blocks = 8;
+    using Reason = GuestArena::PageTrackReason;
+    auto& track = Track::Get();
+    auto& mappings = Mappings::Get();
+    const std::string kind = resident ? "resident" : "private";
+    Guest memory(resident, Blocks * BlockBytes);
+    const auto all = [&] { return memory.Collect(0, Blocks * BlockPages); };
+    const std::set<std::size_t> none;
+    std::array<std::uint64_t, Blocks> tokens{};
+    std::array<std::uint64_t, Blocks> reasons{};
+    Require(mappings.ArmBlocks(memory.Address(), Blocks * BlockBytes, tokens.data(), reasons.data(), Blocks), kind + ": a request did not arm every block of an allocation");
+    for (std::size_t block = 0; block < Blocks; ++block) {
+        Require(tokens[block] != 0 && ReasonOf(reasons[block]) == Reason::Armed && track.Clean(memory.Block(block)) && memory.Protection(block) == PAGE_READONLY, kind + ": a requested block is not armed with a token");
+    }
+    Require(track.CleanSince(memory.Address(), Blocks * BlockBytes, tokens.data(), Blocks), kind + ": fresh tokens do not hold");
+    Require(all().size() == Blocks * BlockPages, kind + ": the pages written before a requested arming were lost for the collect");
+    Require(all() == none && track.CleanSince(memory.Address(), Blocks * BlockBytes, tokens.data(), Blocks), kind + ": a collect of blocks armed on request reported pages twice or broke their tokens");
+
+    const auto faults = handled.load();
+    memory.Write(2, 5, 9);
+    memory.Write(2, 6, 9);
+    Require(handled.load() - faults == 1 && track.StateOf(memory.Block(2)) == State::Written, kind + ": two writes to a block armed on request did not fault once");
+    Require(!track.CleanSince(memory.Address(), Blocks * BlockBytes, tokens.data(), Blocks) && !track.CleanSince(memory.Block(2), BlockBytes, &tokens[2], 1) && track.CleanSince(memory.Block(3), BlockBytes, &tokens[3], 1), kind + ": a write did not break the token of its block alone");
+    std::uint64_t again = 0;
+    Require(mappings.ArmBlocks(memory.Block(2), BlockBytes, &again, nullptr, 1) && again != 0 && again != tokens[2] && track.Clean(memory.Block(2)), kind + ": a written block was not armed again at once on request");
+    Require(all() == Pages(2, {5, 6}), kind + ": the pages written before a second requested arming were lost for the collect");
+    Require(track.CleanSince(memory.Block(2), BlockBytes, &again, 1), kind + ": a collect broke the token of a block armed on request");
+    std::uint64_t same = 0;
+    Require(mappings.ArmBlocks(memory.Block(2), BlockBytes, &same, nullptr, 1) && same == again, kind + ": a request on an armed block did not return its token");
+
+    std::array<std::uint64_t, 2> pair{};
+    Require(!mappings.ArmBlocks(memory.Block(4) + 100, BlockBytes, pair.data(), nullptr, 1) && pair[0] == 0, kind + ": a request with the wrong number of blocks was accepted");
+    Require(mappings.ArmBlocks(memory.Block(4) + 100, BlockBytes, pair.data(), nullptr, 2) && pair[0] == tokens[4] && pair[1] == tokens[5], kind + ": a range over two blocks did not get both tokens, the first for the block of its address");
+
+    std::uint64_t hot = 0;
+    std::uint64_t reason = 0;
+    for (unsigned frame = 0; frame < Track::HotFrames; ++frame) {
+        track.AdvancePeriod();
+        Require(mappings.ArmBlocks(memory.Block(6), BlockBytes, &hot, &reason, 1) && hot != 0, kind + ": a block that faulted in fewer than three frames was refused");
+        memory.Write(6, 1, static_cast<unsigned char>(frame + 1));
+    }
+    track.AdvancePeriod();
+    Require(!mappings.ArmBlocks(memory.Block(6), BlockBytes, &hot, &reason, 1) && hot == 0 && ReasonOf(reason) == Reason::Resting && FramesOf(reason) == Track::RestFrames && memory.Protection(6) == PAGE_READWRITE, kind + ": a block that faulted in three frames was not put to rest for requests");
+    for (std::uint64_t frame = 0; frame + 1 < Track::RestFrames; ++frame) track.AdvancePeriod();
+    Require(!mappings.ArmBlocks(memory.Block(6), BlockBytes, &hot, &reason, 1) && ReasonOf(reason) == Reason::Resting && FramesOf(reason) == 1, kind + ": a resting block was armed on request before its rest ended");
+    track.AdvancePeriod();
+    Require(mappings.ArmBlocks(memory.Block(6), BlockBytes, &hot, &reason, 1) && hot != 0 && ReasonOf(reason) == Reason::Armed, kind + ": a block was not armed on request after its rest");
+    Require(all() == Pages(6, {1}), kind + ": the writes of a resting block were lost for the collect");
+
+    mappings.Pin(memory.Block(7), BlockBytes);
+    Require(!mappings.ArmBlocks(memory.Block(7), BlockBytes, &hot, &reason, 1) && hot == 0 && ReasonOf(reason) == Reason::Held && memory.Protection(7) == PAGE_READWRITE, kind + ": a pinned block was armed on request");
+    mappings.Unpin(memory.Block(7), BlockBytes);
+    Require(mappings.ArmBlocks(memory.Block(7), BlockBytes, &hot, &reason, 1) && hot != 0, kind + ": an unpinned block was not armed on request");
+    Require(!mappings.ArmBlocks(memory.Block(Blocks), BlockBytes, &hot, &reason, 1) && hot == 0 && ReasonOf(reason) == Reason::Edge, kind + ": a block outside the allocation was armed on request");
+}
+
+void CheckDemandRace(bool resident) {
+    constexpr std::size_t Writers = 8;
+    constexpr std::size_t Blocks = 16;
+    constexpr std::size_t Pages = Blocks * BlockPages;
+    constexpr std::size_t Trials = 600;
+    constexpr std::size_t Burst = 6;
+    auto& track = Track::Get();
+    auto& mappings = Mappings::Get();
+    Guest memory(resident, Blocks * BlockBytes);
+    const auto counter = [&](std::size_t page) { return reinterpret_cast<std::uint64_t*>(memory.data + page * PageBytes); };
+    const auto value = [&](std::size_t page) { return *static_cast<volatile std::uint64_t*>(counter(page)); };
+    for (std::size_t page = 0; page < Pages; ++page) *counter(page) = 0;
+    std::vector<std::uint64_t> copy(Pages, 0);
+    std::vector<std::uint64_t> collected(Pages, 0);
+    std::array<std::uint64_t, Blocks> tokens{};
+    std::atomic<std::size_t> trial{0};
+    std::atomic<std::size_t> finished{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> writers;
+    for (std::size_t writer = 0; writer < Writers; ++writer) {
+        writers.emplace_back([&, writer] {
+            std::mt19937 random(static_cast<unsigned>(writer) * 104729u + 17u);
+            for (std::size_t current = 1;; ++current) {
+                while (trial.load(std::memory_order_acquire) != current) {
+                    if (stop.load(std::memory_order_acquire)) return;
+                    YieldProcessor();
+                }
+                for (std::size_t write = 0; write < Burst && current % 3 == 0; ++write) {
+                    const auto page = (random() % (Pages / Writers)) * Writers + writer;
+                    auto* slot = static_cast<volatile std::uint64_t*>(counter(page));
+                    *slot = *slot + 1;
+                }
+                finished.fetch_add(1, std::memory_order_release);
+            }
+        });
+    }
+    const auto refresh = [&] {
+        for (std::size_t block = 0; block < Blocks; ++block) {
+            if (tokens[block] != 0 && track.CleanSince(memory.Block(block), BlockBytes, &tokens[block], 1)) continue;
+            std::uint64_t token = 0;
+            mappings.ArmBlocks(memory.Block(block), BlockBytes, &token, nullptr, 1);
+            for (std::size_t page = block * BlockPages; page < (block + 1) * BlockPages; ++page) copy[page] = value(page);
+            tokens[block] = token;
+        }
+    };
+    const auto collect = [&] {
+        for (const auto page : memory.Collect(0, Pages)) collected[page] = value(page);
+    };
+    std::size_t stale = 0;
+    std::size_t lost = 0;
+    std::size_t trusted = 0;
+    const auto before = track.Counted();
+    for (std::size_t current = 1; current <= Trials; ++current) {
+        track.AdvancePeriod();
+        trial.store(current, std::memory_order_release);
+        for (std::size_t pass = 0; pass < 8; ++pass) {
+            refresh();
+            collect();
+        }
+        while (finished.load(std::memory_order_acquire) != current * Writers) {
+            refresh();
+            collect();
+        }
+        collect();
+        for (std::size_t block = 0; block < Blocks; ++block) {
+            if (tokens[block] == 0 || !track.CleanSince(memory.Block(block), BlockBytes, &tokens[block], 1)) continue;
+            ++trusted;
+            for (std::size_t page = block * BlockPages; page < (block + 1) * BlockPages; ++page) {
+                if (copy[page] != *counter(page)) ++stale;
+            }
+        }
+        for (std::size_t page = 0; page < Pages; ++page) {
+            if (collected[page] != *counter(page)) ++lost;
+        }
+    }
+    stop.store(true, std::memory_order_release);
+    for (auto& writer : writers) writer.join();
+    const auto after = track.Counted();
+    std::printf("%s memory, %zu writers against requested armings: %zu trials, %llu arms, %llu faults, %zu blocks trusted by their token, %zu stale copies, %zu writes lost for the collect\n", resident ? "resident" : "private", Writers, Trials, static_cast<unsigned long long>(after.arms - before.arms), static_cast<unsigned long long>(after.faults - before.faults), trusted, stale, lost);
+    Require(stale == 0, "a copy taken after a token differs from memory while the token holds");
+    Require(lost == 0, "a write was lost for the collect under requested armings");
+    Require(after.arms != before.arms && after.faults != before.faults && trusted != 0, "the race never armed a block, never faulted or never trusted a token");
+    Require(refused.load() == 0, "a fault on tracked memory was refused");
+}
+
 void CheckVerify(bool resident) {
     constexpr std::size_t Blocks = 8;
     auto& track = Track::Get();
@@ -624,7 +774,7 @@ void CheckRace() {
 
 int main(int argc, char** argv) {
     const std::string_view mode = argc > 1 ? argv[1] : "";
-    _putenv_s(mode == "verify" || mode == "verify-race" ? "APS5_VERIFY_PAGE_TRACK" : "APS5_PAGE_TRACK", "1");
+    _putenv_s(mode.starts_with("verify") ? "APS5_VERIFY_PAGE_TRACK" : "APS5_PAGE_TRACK", "1");
     const auto handler = AddVectoredExceptionHandler(1, HandleFault);
     int result = 0;
     try {
@@ -647,6 +797,18 @@ int main(int argc, char** argv) {
         } else if (mode == "collect-race") {
             CheckCollectRace(false);
             CheckCollectRace(true);
+        } else if (mode == "demand") {
+            CheckDemand(false);
+            CheckDemand(true);
+        } else if (mode == "demand-race") {
+            CheckDemandRace(false);
+            CheckDemandRace(true);
+        } else if (mode == "verify-demand") {
+            CheckDemand(false);
+            CheckDemand(true);
+            CheckDemandRace(false);
+            CheckDemandRace(true);
+            Require(Track::Get().Counted().divergences == 0, "verified collects diverged under requested armings");
         } else if (mode == "verify" || mode == "verify-race") {
             if (mode == "verify") {
                 CheckVerify(false);
@@ -657,7 +819,7 @@ int main(int argc, char** argv) {
                 Require(Track::Get().Counted().divergences == 0, "verified collects diverged under concurrent writers");
             }
         } else {
-            std::fprintf(stderr, "usage: %s table|race|guards|collect|hot|collect-race|verify|verify-race\n", argv[0]);
+            std::fprintf(stderr, "usage: %s table|race|guards|collect|hot|collect-race|demand|demand-race|verify|verify-race|verify-demand\n", argv[0]);
             result = 2;
         }
         if (result == 0) std::printf("page tracking %.*s tests passed\n", static_cast<int>(mode.size()), mode.data());

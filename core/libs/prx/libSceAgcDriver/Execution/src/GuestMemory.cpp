@@ -2720,6 +2720,19 @@ bool ArmedCleanSince(std::uint64_t address, std::size_t bytes, std::span<const s
 #endif
 }
 
+bool ArmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens, std::span<std::uint64_t> reasons) {
+    std::fill(tokens.begin(), tokens.end(), std::uint64_t{0});
+    std::fill(reasons.begin(), reasons.end(), static_cast<std::uint64_t>(ArmReason::Disabled));
+    if (!reasons.empty() && reasons.size() != tokens.size()) return false;
+#ifdef _WIN32
+    return GuestArena::GuestPageTrackArm_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, tokens.data(), reasons.empty() ? nullptr : reasons.data(), tokens.size());
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::span<std::uint64_t> tokens) {
     written.clear();
     std::fill(tokens.begin(), tokens.end(), std::uint64_t{0});

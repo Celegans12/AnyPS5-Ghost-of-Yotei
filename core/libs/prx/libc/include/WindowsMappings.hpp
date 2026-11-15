@@ -650,6 +650,23 @@ public:
         return true;
     }
 
+    bool ArmBlocks(std::uintptr_t address, std::size_t bytes, std::uint64_t* tokens, std::uint64_t* reasons, std::size_t count) {
+        if (tokens == nullptr) return false;
+        std::fill_n(tokens, count, std::uint64_t{0});
+        if (reasons != nullptr) std::fill_n(reasons, count, WindowsPageTrack::Reason(PageTrackReason::Disabled));
+        if (!track.Enabled() || !WindowsPageTrack::Spans(address, bytes, count)) return false;
+        std::lock_guard lock(mutex);
+        const auto now = track.Period();
+        bool every = true;
+        auto block = address & ~(WindowsPageTrack::BlockBytes - 1);
+        for (std::size_t index = 0; index < count; ++index, block += WindowsPageTrack::BlockBytes) {
+            const auto reason = armOnRequest(block, now, &tokens[index], nullptr);
+            if (reasons != nullptr) reasons[index] = reason;
+            if (tokens[index] == 0) every = false;
+        }
+        return every;
+    }
+
     void ForgetKnownZero(std::uintptr_t address, std::size_t bytes) {
         if (bytes == 0 || bytes > UINTPTR_MAX - address) return;
         if (zeroFilterAnswers() && !mayHoldZero(address, address + bytes)) {
@@ -1198,6 +1215,47 @@ private:
         if (track.Arm(block)) return true;
         track.NoteWritten(block);
         return false;
+    }
+
+    std::uint64_t armOnRequest(std::uintptr_t block, std::uint32_t now, std::uint64_t* token, std::uint16_t* found) {
+        constexpr auto blockBytes = WindowsPageTrack::BlockBytes;
+        *token = 0;
+        Run* run = nullptr;
+        if (const auto next = residentRuns.upper_bound(block); next != residentRuns.begin() && std::prev(next)->second.end > block) {
+            run = &std::prev(next)->second;
+            if (!run->watched || run->end < block + blockBytes) return WindowsPageTrack::Reason(PageTrackReason::Edge);
+        } else if (privateAllocationStart(block) == 0 || privateAllocationEnd(block) < block + blockBytes) {
+            return WindowsPageTrack::Reason(PageTrackReason::Edge);
+        }
+        auto& entry = track.Touch(block);
+        const auto word = track.Word(block);
+        const auto state = WindowsPageTrack::StateOfWord(word);
+        if (state == WindowsPageTrack::State::Armed) {
+            *token = word;
+            return WindowsPageTrack::Reason(PageTrackReason::Armed);
+        }
+        if (state == WindowsPageTrack::State::Opening) return WindowsPageTrack::Reason(PageTrackReason::Busy);
+        if (state == WindowsPageTrack::State::Written && WindowsPageTrack::TakeWritten(entry)) track.NoteFault(entry, now);
+        if (const auto refusal = WindowsPageTrack::Refusal(entry, now); refusal != WindowsPageTrack::Reason(PageTrackReason::Armable)) return refusal;
+        if (!armBlock(block)) return WindowsPageTrack::Reason(PageTrackReason::Edge);
+        disown(block, block + blockBytes);
+        if (run != nullptr) run->reset = true;
+        std::array<void*, blockBytes / 4096> local{};
+        ULONG_PTR reported = local.size();
+        DWORD granularity = 0;
+        if (watchWrites(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(block), blockBytes, local.data(), &reported, &granularity) != 0) {
+            track.Open(block, block + blockBytes);
+            return WindowsPageTrack::Reason(PageTrackReason::Edge);
+        }
+        std::uint16_t pages = 0;
+        if (const auto pending = ownedPending.find(block); pending != ownedPending.end()) pages = pending->second;
+        for (ULONG_PTR index = 0; index < reported; ++index) pages |= static_cast<std::uint16_t>(std::uint16_t{1} << ((reinterpret_cast<std::uintptr_t>(local[index]) - block) / 4096));
+        if (pages != 0) ownedPending[block] = pages;
+        if (found != nullptr) *found = pages;
+        WindowsPageTrack::NoteArmed(entry);
+        if (track.Verifying()) track.SetDigest(block, blockDigest(block));
+        *token = track.ArmedWord(block);
+        return WindowsPageTrack::Reason(PageTrackReason::Armed);
     }
 
     void deferCollected(void* const* pages, ULONG_PTR count) {
