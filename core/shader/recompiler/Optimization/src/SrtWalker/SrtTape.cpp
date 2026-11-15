@@ -26,6 +26,25 @@ std::uint64_t float32Bits(float value) { return std::bit_cast<std::uint32_t>(val
 constexpr std::uint32_t MainContext = 0;
 constexpr std::uint32_t CleanContext = 1;
 constexpr std::uint32_t MaxDepth = 512;
+constexpr std::size_t InlineNodes = 512;
+constexpr std::size_t InlineBlocks = 512;
+constexpr std::size_t InlineFlatSlots = 4096;
+constexpr std::size_t SlotBits = 64;
+
+struct FlatReader {
+    BlockWordReader read = nullptr;
+    void* context = nullptr;
+    bool refused = false;
+};
+
+bool readFlatWord(void* user, std::uint64_t address, std::uint32_t* value) {
+    auto& reader = *static_cast<FlatReader*>(user);
+    if (reader.read(reader.context, address, value, 1u)) return true;
+    reader.refused = true;
+    return false;
+}
+
+bool slotActive(const std::uint64_t* bits, std::size_t slot) { return (bits[slot / SlotBits] >> (slot % SlotBits) & 1u) != 0u; }
 
 }
 
@@ -574,7 +593,6 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
         }
         return false;
     };
-    constexpr std::size_t InlineNodes = 512;
     std::array<std::uint64_t, InlineNodes> inlineValues;
     std::array<std::uint8_t, InlineNodes> inlineStates;
     std::vector<std::uint64_t> heapValues;
@@ -715,6 +733,78 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     activeSources.swap(active);
     flat.assign(flattened.begin(), flattened.end());
     return true;
+}
+
+BlockWalk SrtTape::RunInto(const IrResourcePlan& plan, std::span<const std::uint32_t> userData, std::uint64_t shaderBase, BlockWordReader read, void* context, std::span<std::uint32_t> out) const {
+    if (!plan.srtPlanComplete || read == nullptr || nodes.size() > InlineNodes) return BlockWalk::Unsupported;
+    if (out.size() != plan.srtReads.size() || flatRoots.size() != plan.srtReads.size() || conditionRoots.size() != plan.controlFlow.size()) return BlockWalk::Unsupported;
+    const bool guarded = !plan.controlFlow.empty();
+    if (guarded && (plan.controlFlow.size() > InlineBlocks || out.size() > InlineFlatSlots)) return BlockWalk::Unsupported;
+    FlatReader reader {read, context};
+    SrtRuntime runtime {userData, shaderBase};
+    runtime.readMemory = readFlatWord;
+    runtime.userContext = &reader;
+    runtime.readSpecializationMemory = readFlatWord;
+    std::array<std::uint64_t, InlineNodes> values;
+    std::array<std::uint8_t, InlineNodes> states;
+    std::fill_n(states.data(), nodes.size(), std::uint8_t {0});
+    Frame frame {runtime, values.data(), states.data()};
+    std::array<std::uint64_t, InlineFlatSlots / SlotBits> activeFlat;
+    if (guarded) {
+        std::fill_n(activeFlat.data(), (out.size() + SlotBits - 1u) / SlotBits, ~std::uint64_t {0});
+        for (const auto& block : plan.controlFlow) {
+            for (const auto slot : block.flatSlots) {
+                if (slot >= out.size()) return BlockWalk::Unsupported;
+                activeFlat[slot / SlotBits] &= ~(std::uint64_t {1} << (slot % SlotBits));
+            }
+        }
+        std::array<std::uint8_t, InlineBlocks> queued;
+        std::array<std::uint32_t, InlineBlocks> pending;
+        std::fill_n(queued.data(), plan.controlFlow.size(), std::uint8_t {0});
+        std::size_t pendingCount = 0;
+        const auto enqueue = [&](std::uint32_t block) {
+            if (block >= plan.controlFlow.size()) return false;
+            if (queued[block] == 0u) {
+                queued[block] = 1u;
+                pending[pendingCount++] = block;
+            }
+            return true;
+        };
+        queued[0] = 1u;
+        pending[pendingCount++] = 0u;
+        while (pendingCount != 0u) {
+            const auto index = pending[--pendingCount];
+            const auto& block = plan.controlFlow[index];
+            for (const auto slot : block.flatSlots) activeFlat[slot / SlotBits] |= std::uint64_t {1} << (slot % SlotBits);
+            std::uint64_t condition = 0;
+            bool cleanEvaluable = false;
+            {
+                const SrtBranchScope branch;
+                cleanEvaluable = block.condition != nullptr && conditionRoots[index] != NoNode && evaluate(frame, conditionRoots[index], condition);
+            }
+            if (frame.nullRoot) return BlockWalk::Poisoned;
+            if (cleanEvaluable) {
+                if (block.successors.size() < 2u || !enqueue(block.successors[static_cast<std::uint32_t>(condition) != 0u ? 0u : 1u])) return BlockWalk::Unsupported;
+            } else {
+                for (const auto successor : block.successors) {
+                    if (!enqueue(successor)) return BlockWalk::Unsupported;
+                }
+            }
+        }
+    }
+    std::fill(out.begin(), out.end(), 0u);
+    for (std::size_t slot = 0; slot < plan.srtReads.size(); ++slot) {
+        const auto offset = plan.srtReads[slot].flatOffset;
+        if (offset >= out.size()) return BlockWalk::Unsupported;
+        if (guarded && !slotActive(activeFlat.data(), offset)) continue;
+        std::uint64_t word = 0;
+        if (!evaluate(frame, flatRoots[slot], word)) {
+            if (reader.refused) return BlockWalk::Unreadable;
+            return frame.nullRoot ? BlockWalk::Poisoned : BlockWalk::Unsupported;
+        }
+        out[offset] = static_cast<std::uint32_t>(word);
+    }
+    return BlockWalk::Done;
 }
 
 }

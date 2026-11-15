@@ -7,7 +7,15 @@
 #include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
+
+namespace ShaderRecompiler {
+
+enum class BlockWalk : std::uint32_t { Done, Unreadable, Unsupported, Poisoned };
+using BlockWordReader = bool (*)(void* context, std::uint64_t address, std::uint32_t* out, std::uint32_t count);
+
+}
 
 namespace ShaderRecompiler::Detail {
 
@@ -18,6 +26,7 @@ public:
     static bool Verified();
 
     bool Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::vector<DescriptorValue>& results, std::vector<std::uint32_t>& flat, std::vector<std::uint8_t>& activeSources) const;
+    [[nodiscard]] BlockWalk RunInto(const IrResourcePlan& plan, std::span<const std::uint32_t> userData, std::uint64_t shaderBase, BlockWordReader read, void* context, std::span<std::uint32_t> out) const;
 
     std::size_t Nodes() const { return nodes.size(); }
 
