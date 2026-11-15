@@ -19,6 +19,7 @@
 #include <span>
 #include <stdexcept>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -39,7 +40,9 @@ void Require(bool condition, const char* message) {
 class Writes final : public BufferCache::Source {
 public:
     std::uint64_t layout = 1;
+    std::uint64_t polls = 0;
     bool tracked = true;
+    std::unordered_set<std::uint64_t> volatileBlocks;
 
     void Note(std::uint64_t address, std::size_t bytes) {
         ++generation;
@@ -51,6 +54,7 @@ public:
     }
 
     bool Poll(std::uint64_t address, std::size_t, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written) override {
+        ++polls;
         if (!tracked) return false;
         for (std::size_t block = 0; block < tokens.size(); ++block) {
             written[block] = changed(address / Granule + block, tokens[block]) ? BufferCache::EveryPage : std::uint16_t{0};
@@ -64,6 +68,10 @@ public:
             if (changed(address / Granule + block, tokens[block])) return false;
         }
         return true;
+    }
+
+    bool Volatile(std::uint64_t address) override {
+        return volatileBlocks.contains(address / Granule);
     }
 
 private:
@@ -321,6 +329,30 @@ void VerificationTellsALostWriteFromALaterOne(Harness& harness, std::uint64_t ba
     Require(BufferCache::Counted().verifyRaces == before.verifyRaces + 1, "a mirror behind a write reported after its upload failed its verification");
 }
 
+void VolatileBlocksAreLeftToTheStream(Harness& harness, std::uint64_t base) {
+    const auto address = base + 18 * Granule + 12;
+    const std::size_t bytes = Page;
+    const auto block = address / Granule;
+    Fill(address, bytes, 91);
+    harness.writes.Note(address, bytes);
+    harness.writes.volatileBlocks.insert(block);
+    auto before = BufferCache::Counted();
+    const auto left = harness.Acquire(address, bytes);
+    auto after = BufferCache::Counted();
+    Require(!left && left.streamed && Refused(after, BufferCache::Refusal::Streamed) == Refused(before, BufferCache::Refusal::Streamed) + 1, "a block the source calls volatile was not left to the stream");
+    Require(after.streamSwitches == before.streamSwitches + 1 && after.pages == before.pages, "a block left to the stream was uploaded");
+    const auto polls = harness.writes.polls;
+    const auto again = harness.Acquire(address, bytes);
+    Require(!again && again.streamed && harness.writes.polls == polls, "a block left to the stream was still tracked");
+    harness.writes.volatileBlocks.erase(block);
+    harness.serial += BufferCache::StreamRest;
+    harness.executed = harness.serial - 1;
+    before = BufferCache::Counted();
+    const auto back = harness.Acquire(address, bytes);
+    after = BufferCache::Counted();
+    Require(back && Same(back, address, bytes) && after.streamReturns == before.streamReturns + 1, "a block was not taken back from the stream once its rest ended");
+}
+
 void TrackedWritesReachTheMirror(std::uint64_t base) {
     std::uint64_t handles = 0;
     BufferCache cache([&handles](std::size_t bytes) { return AllocateBacking(handles, bytes); }, [](std::uint64_t) { return true; }, BufferCache::TrackerSource());
@@ -519,6 +551,7 @@ int main() {
         RefusalsLeaveTheRangeToTheCaller(harness, base);
         DerivedValuesLastUntilAnUpload(harness, base);
         VerificationTellsALostWriteFromALaterOne(harness, base);
+        VolatileBlocksAreLeftToTheStream(harness, base);
         if (GuestMemory::Watched(base, bytes)) {
             TrackedWritesReachTheMirror(base);
             ArmedBlocksAnswerWithoutTheTracker(base);

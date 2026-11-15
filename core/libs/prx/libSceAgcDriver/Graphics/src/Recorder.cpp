@@ -4867,6 +4867,17 @@ bool Recorder::ExecutedThrough(std::uint64_t serial) const {
     return true;
 }
 
+Recorder::UploadSlice Recorder::DrawInputUpload(std::size_t bytes) {
+    constexpr VkDeviceSize alignment = 16;
+    auto offset = (drawInputUploadUsed + alignment - 1) & ~(alignment - 1);
+    if (drawInputUpload == nullptr || offset + bytes > drawInputUpload->Bytes().size()) {
+        drawInputUpload = std::make_shared<Buffer>(context, std::max(DrawUploadChunk, bytes), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+        offset = 0;
+    }
+    drawInputUploadUsed = offset + bytes;
+    return {drawInputUpload, offset, drawInputUpload->Bytes().data() + offset};
+}
+
 BufferCache* Recorder::Buffers() {
     if (!BufferCache::Enabled()) return nullptr;
     if (bufferCache == nullptr) {

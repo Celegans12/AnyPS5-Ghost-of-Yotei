@@ -31,6 +31,10 @@ struct Counters {
     std::atomic<std::uint64_t> armedPolls{0};
     std::atomic<std::uint64_t> armsRequested{0};
     std::atomic<std::uint64_t> armsGranted{0};
+    std::atomic<std::uint64_t> streamed{0};
+    std::atomic<std::uint64_t> streamedBytes{0};
+    std::atomic<std::uint64_t> streamSwitches{0};
+    std::atomic<std::uint64_t> streamReturns{0};
     std::atomic<std::uint64_t> heldBytes{0};
     std::array<std::atomic<std::uint64_t>, BufferCache::Refusals> refused{};
     std::array<std::atomic<std::uint64_t>, BufferCache::UnarmedReasons> unarmed{};
@@ -45,7 +49,7 @@ void add(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
     counter.fetch_add(amount, std::memory_order_relaxed);
 }
 
-constexpr std::array<const char*, BufferCache::Refusals> RefusalNames{"range", "alignment", "gpu write", "untracked", "unmapped", "busy", "span", "budget", "allocation", "raced"};
+constexpr std::array<const char*, BufferCache::Refusals> RefusalNames{"range", "alignment", "gpu write", "untracked", "unmapped", "busy", "span", "budget", "allocation", "raced", "streamed"};
 
 constexpr std::array<const char*, BufferCache::UnarmedReasons> UnarmedNames{"armed", "held", "imported", "barred", "resting", "edge", "other"};
 
@@ -198,6 +202,13 @@ public:
         return true;
     }
 
+    bool Volatile(std::uint64_t address) override {
+        const auto reason = unarmedReason.load(std::memory_order_acquire);
+        if (reason == nullptr) return false;
+        const auto code = reason(address);
+        return code == static_cast<std::uint8_t>(BufferCache::Unarmed::Resting) || code == static_cast<std::uint8_t>(BufferCache::Unarmed::Edge);
+    }
+
 private:
     static void armRun(std::uint64_t firstBlock, std::size_t from, std::size_t to, std::span<const std::uint64_t> held, std::span<std::uint64_t> current, std::span<std::uint16_t> written) {
         const auto arm = armBlocks.load(std::memory_order_acquire);
@@ -265,6 +276,17 @@ bool BufferCache::Arming() {
     return arming;
 }
 
+bool BufferCache::Streaming() {
+    static const bool streaming = std::getenv("APS5_NO_BUFFER_CACHE_STREAM") == nullptr;
+    return streaming;
+}
+
+void BufferCache::NoteStreamed(std::size_t bytes) {
+    auto& counted = counters();
+    add(counted.streamed);
+    add(counted.streamedBytes, bytes);
+}
+
 void BufferCache::SetArmedBlocks(const ArmedBlocks& table) {
     armedTokens.store(table.tokens, std::memory_order_release);
     armedCleanSince.store(table.cleanSince, std::memory_order_release);
@@ -292,6 +314,10 @@ BufferCache::Counts BufferCache::Counted() {
     counts.armedPolls = held.armedPolls.load(std::memory_order_relaxed);
     counts.armsRequested = held.armsRequested.load(std::memory_order_relaxed);
     counts.armsGranted = held.armsGranted.load(std::memory_order_relaxed);
+    counts.streamed = held.streamed.load(std::memory_order_relaxed);
+    counts.streamedBytes = held.streamedBytes.load(std::memory_order_relaxed);
+    counts.streamSwitches = held.streamSwitches.load(std::memory_order_relaxed);
+    counts.streamReturns = held.streamReturns.load(std::memory_order_relaxed);
     counts.heldBytes = held.heldBytes.load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < Refusals; ++reason) counts.refused[reason] = held.refused[reason].load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < UnarmedReasons; ++reason) counts.unarmed[reason] = held.unarmed[reason].load(std::memory_order_relaxed);
@@ -327,6 +353,11 @@ std::string BufferCache::Report() {
         char arming[160];
         std::snprintf(arming, sizeof(arming), "[buffer-cache] arming (10 s): %llu blocks asked to be armed at their upload, %llu armed; left unarmed:", since(now.armsRequested, reported.armsRequested), since(now.armsGranted, reported.armsGranted));
         text += arming + reasons + "\n";
+    }
+    if (now.streamed != reported.streamed || now.streamSwitches != reported.streamSwitches || now.streamReturns != reported.streamReturns) {
+        char stream[224];
+        std::snprintf(stream, sizeof(stream), "[buffer-cache] stream (10 s): %llu ranges copied to the per-frame stream (%.1f MiB), %llu blocks left to it, %llu taken back\n", since(now.streamed, reported.streamed), static_cast<double>(now.streamedBytes - reported.streamedBytes) / 1048576.0, since(now.streamSwitches, reported.streamSwitches), since(now.streamReturns, reported.streamReturns));
+        text += stream;
     }
     reported = now;
     return text;
@@ -469,11 +500,38 @@ BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes,
     const auto stop = (end + PageBytes - 1) & ~(PageBytes - 1);
     const auto firstGranule = static_cast<std::size_t>((first - mirror->begin) / GranuleBytes);
     const auto blocks = static_cast<std::size_t>((stop - 1 - mirror->begin) / GranuleBytes) - firstGranule + 1;
+    const auto leave = [&] {
+        auto refused = Refuse(Refusal::Streamed);
+        refused.streamed = true;
+        return refused;
+    };
     held.resize(blocks);
-    for (std::size_t block = 0; block < blocks; ++block) held[block] = mirror->granules[firstGranule + block].token.load(std::memory_order_acquire);
+    bool streamed = false;
+    for (std::size_t block = 0; block < blocks; ++block) {
+        auto& granule = mirror->granules[firstGranule + block];
+        held[block] = granule.token.load(std::memory_order_acquire);
+        if (granule.streamUntil == 0) continue;
+        if (serial < granule.streamUntil) {
+            streamed = true;
+            continue;
+        }
+        granule.streamUntil = 0;
+        add(counted.streamReturns);
+    }
+    if (streamed) return leave();
     tokens = held;
     written.assign(blocks, EveryPage);
     if (!source.Poll(first, static_cast<std::size_t>(stop - first), tokens, written)) return Refuse(Refusal::Untracked);
+    if (Streaming()) {
+        for (std::size_t block = 0; block < blocks; ++block) {
+            if ((written[block] == 0 && held[block] != 0) || (tokens[block] & ArmedToken) != 0) continue;
+            if (!source.Volatile(mirror->begin + (firstGranule + block) * GranuleBytes)) continue;
+            mirror->granules[firstGranule + block].streamUntil = serial + StreamRest;
+            add(counted.streamSwitches);
+            streamed = true;
+        }
+        if (streamed) return leave();
+    }
     pendingFloor = std::numeric_limits<std::uint64_t>::max();
     std::uint64_t newest = 0;
     std::uint64_t copiedPages = 0;
@@ -590,7 +648,7 @@ std::optional<BufferCache::Derived> BufferCache::Known(const View& view, std::ui
 }
 
 void BufferCache::Keep(const View& view, std::uint64_t address, std::size_t bytes, std::uint32_t kind, const Derived& value) {
-    if (!view) return;
+    if (!view || view.mirror == 0) return;
     auto& entry = derived[derivedIndex(address, bytes, kind)];
     entry.address = address;
     entry.bytes = bytes;

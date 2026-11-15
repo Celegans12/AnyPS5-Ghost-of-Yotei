@@ -25,6 +25,7 @@ public:
     static constexpr std::uint64_t Budget = std::uint64_t{1} << 30u;
     static constexpr std::uint64_t AddressLimit = std::uint64_t{1} << 47u;
     static constexpr std::size_t DerivedEntries = 8192;
+    static constexpr std::uint64_t StreamRest = 128;
 
     class Source {
     public:
@@ -32,6 +33,7 @@ public:
         virtual std::uint64_t Layout() = 0;
         virtual bool Poll(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written) = 0;
         virtual bool Quiet(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> tokens) = 0;
+        virtual bool Volatile(std::uint64_t) { return false; }
     };
 
     enum class Unarmed : std::uint8_t { Armed, Held, Imported, Barred, Resting, Edge, Other, Count };
@@ -55,7 +57,7 @@ public:
     using Allocate = std::function<Backing(std::size_t bytes)>;
     using Executed = std::function<bool(std::uint64_t serial)>;
 
-    enum class Refusal : std::uint8_t { Range, Alignment, GpuWrite, Untracked, Unmapped, Busy, Span, Budget, Allocation, Raced, Count };
+    enum class Refusal : std::uint8_t { Range, Alignment, GpuWrite, Untracked, Unmapped, Busy, Span, Budget, Allocation, Raced, Streamed, Count };
     static constexpr std::size_t Refusals = static_cast<std::size_t>(Refusal::Count);
 
     struct View {
@@ -65,6 +67,7 @@ public:
         std::shared_ptr<void> owner;
         std::uint64_t mirror = 0;
         std::uint64_t sequence = 0;
+        bool streamed = false;
         explicit operator bool() const { return handle != VK_NULL_HANDLE; }
     };
 
@@ -91,6 +94,10 @@ public:
         std::uint64_t armedPolls = 0;
         std::uint64_t armsRequested = 0;
         std::uint64_t armsGranted = 0;
+        std::uint64_t streamed = 0;
+        std::uint64_t streamedBytes = 0;
+        std::uint64_t streamSwitches = 0;
+        std::uint64_t streamReturns = 0;
         std::uint64_t heldBytes = 0;
         std::array<std::uint64_t, Refusals> refused{};
         std::array<std::uint64_t, UnarmedReasons> unarmed{};
@@ -104,6 +111,8 @@ public:
     static bool Enabled();
     static bool Verifying();
     static bool Arming();
+    static bool Streaming();
+    static void NoteStreamed(std::size_t bytes);
     static Source& TrackerSource();
     static void SetArmedBlocks(const ArmedBlocks& table);
     static Counts Counted();
@@ -122,6 +131,7 @@ private:
     struct Granule {
         std::atomic<std::uint64_t> token{0};
         std::uint64_t sequence = 0;
+        std::uint64_t streamUntil = 0;
         std::uint16_t valid = 0;
     };
     struct Mirror {

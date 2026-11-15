@@ -1771,6 +1771,19 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
     return zero;
 }
 
+BufferCache::View streamedDrawInput(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t from) {
+    if (bytes > Recorder::DrawUploadChunk) return {};
+    auto slice = recorder.DrawInputUpload(bytes);
+    GuestMemory::Read(address + from, std::span<std::byte>(slice.bytes + from, bytes - from), 1);
+    BufferCache::NoteStreamed(bytes - from);
+    BufferCache::View view;
+    view.handle = slice.buffer->Handle();
+    view.offset = slice.offset;
+    view.bytes = slice.bytes;
+    view.owner = std::move(slice.buffer);
+    return view;
+}
+
 BufferCache::View cachedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t from, std::size_t alignment) {
     auto* recorder = context.recorder;
     auto* cache = recorder != nullptr ? recorder->Buffers() : nullptr;
@@ -1782,6 +1795,7 @@ BufferCache::View cachedDrawInput(const Context& context, std::uint64_t address,
     if (recorder->PendingWriteOverlaps(first, reach) || recorder->PendingLabelIn(first, reach) || recorder->QueuedStoreOverlaps(first, reach) || recorder->QueuedKeyStoreOverlaps(first, reach)) return cache->Refuse(BufferCache::Refusal::GpuWrite);
     GuestMemory::FlushGpuWrites(first, reach);
     auto view = cache->Acquire(address, bytes, from, recorder->OpenSerial());
+    if (!view && view.streamed) return streamedDrawInput(*recorder, address, bytes, from);
     if (view && BufferCache::Verifying()) cache->Verify(view, address, bytes, from);
     return view;
 }
