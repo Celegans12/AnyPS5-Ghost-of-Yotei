@@ -391,6 +391,7 @@ public:
         bool signaled;
     };
     std::optional<PendingReadInfo> DescribePendingRead(std::uint64_t address, std::size_t bytes) const;
+    std::optional<std::uint64_t> NewestGuestWork() const;
     // Counters of the read tracking (cumulative, for the [recorder] line): ranges noted, overlap
     // queries, hits by reader kind, and hits ignored because the reader's fence had signaled.
     struct ReadStatistics {

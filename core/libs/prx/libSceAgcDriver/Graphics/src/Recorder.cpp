@@ -4685,6 +4685,16 @@ std::optional<Recorder::PendingReadInfo> Recorder::DescribePendingRead(std::uint
     return std::nullopt;
 }
 
+std::optional<std::uint64_t> Recorder::NewestGuestWork() const {
+    if (!ReadTrackingEnabled()) return std::nullopt;
+    const auto touchesGuest = [](const Batch& batch) { return !batch.reads.empty() || !batch.readLists.empty() || !batch.writes.empty() || !batch.completions.empty(); };
+    if (open != nullptr && touchesGuest(*open)) return std::nullopt;
+    for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
+        if (touchesGuest(**it)) return (*it)->serial;
+    }
+    return std::uint64_t{0};
+}
+
 Recorder::ReadStatistics Recorder::ReadCounts() {
     ReadStatistics counts{readsNoted.Sum(), readQueries.Sum(), readStaleIgnored.Sum(), {}};
     for (std::size_t kind = 0; kind < ReadKinds; ++kind) counts.hits[kind] = readHits[kind].Sum();

@@ -1311,6 +1311,32 @@ void readTrackingTests(const Device& device, Recorder& recorder) {
     Require(recorder.Idle() && !recorder.PendingReadOverlaps(0x20000, 0x1000, false), "noted ranges outlived their batch");
 }
 
+void newestGuestWorkTests(Recorder& recorder) {
+    const std::optional<std::uint64_t> none{0};
+    recorder.Sync();
+    Require(recorder.Idle() && recorder.NewestGuestWork() == none, "an idle recorder reports guest work");
+    static_cast<void>(recorder.Commands());
+    Require(recorder.NewestGuestWork() == none, "an open batch that touches no guest memory is guest work");
+    recorder.NotePendingRead(0x60000, 0x100, Kind::DispatchElement);
+    Require(!recorder.NewestGuestWork().has_value(), "an open batch that reads guest memory leaves no serial to wait for");
+    recorder.Submit();
+    const std::optional<std::uint64_t> reading{recorder.Submissions()};
+    Require(recorder.NewestGuestWork() == reading, "the batch that reads guest memory in place is not the guest work");
+    static_cast<void>(recorder.Commands());
+    recorder.Submit();
+    Require(recorder.Submissions() == *reading + 1 && recorder.NewestGuestWork() == reading, "a later batch that touches no guest memory became the guest work");
+    recorder.NotePendingWrite(0x61000, 16);
+    recorder.Submit();
+    const std::optional<std::uint64_t> writing{recorder.Submissions()};
+    Require(*writing == *reading + 2 && recorder.NewestGuestWork() == writing, "the batch that writes guest memory is not the guest work");
+    recorder.OnComplete([] {});
+    recorder.Submit();
+    const std::optional<std::uint64_t> completing{recorder.Submissions()};
+    Require(*completing == *writing + 1 && recorder.NewestGuestWork() == completing, "the batch with a completion action is not the guest work");
+    recorder.Sync();
+    Require(recorder.Idle() && recorder.NewestGuestWork() == none, "finished batches are still guest work");
+}
+
 Recorder::WriteRanges expectedWriteUnion(Recorder::WriteRanges ranges) {
     std::sort(ranges.begin(), ranges.end());
     Recorder::WriteRanges result;
@@ -17597,6 +17623,7 @@ int main(int argc, char** argv) {
 #endif
         readTrackingTests(device, recorder);
         readListTests(device, recorder);
+        newestGuestWorkTests(recorder);
         overlappedRangeTests(recorder);
         spaceWriteSyncTests(device, recorder);
         changedCopyTests(device, recorder);
