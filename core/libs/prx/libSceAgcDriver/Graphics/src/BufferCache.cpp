@@ -38,6 +38,7 @@ struct Counters {
     std::atomic<std::uint64_t> edgePages{0};
     std::atomic<std::uint64_t> stageViews{0};
     std::atomic<std::uint64_t> stageLeft{0};
+    std::atomic<std::uint64_t> movedViews{0};
     std::array<std::atomic<std::uint64_t>, BufferCache::Refusals> stageRefused{};
     std::atomic<std::uint64_t> heldBytes{0};
     std::array<std::atomic<std::uint64_t>, BufferCache::Refusals> refused{};
@@ -295,6 +296,15 @@ void BufferCache::NoteStage(bool served) {
     add(served ? counted.stageViews : counted.stageLeft);
 }
 
+bool BufferCache::MovedViews() {
+    static const bool views = Enabled() && std::getenv("APS5_NO_BUFFER_CACHE_MOVED_VIEWS") == nullptr;
+    return views;
+}
+
+void BufferCache::NoteMoved() {
+    add(counters().movedViews);
+}
+
 void BufferCache::NoteStreamed(std::size_t bytes) {
     auto& counted = counters();
     add(counted.streamed);
@@ -335,6 +345,7 @@ BufferCache::Counts BufferCache::Counted() {
     counts.edgePages = held.edgePages.load(std::memory_order_relaxed);
     counts.stageViews = held.stageViews.load(std::memory_order_relaxed);
     counts.stageLeft = held.stageLeft.load(std::memory_order_relaxed);
+    counts.movedViews = held.movedViews.load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < Refusals; ++reason) counts.stageRefused[reason] = held.stageRefused[reason].load(std::memory_order_relaxed);
     counts.heldBytes = held.heldBytes.load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < Refusals; ++reason) counts.refused[reason] = held.refused[reason].load(std::memory_order_relaxed);
@@ -391,7 +402,7 @@ std::string BufferCache::Report() {
             reasons += item;
         }
         char stage[192];
-        std::snprintf(stage, sizeof(stage), "[buffer-cache] stage (10 s): %llu stage buffers bound to a mirror, %llu left to draw snapshots; refused:", since(now.stageViews, reported.stageViews), since(now.stageLeft, reported.stageLeft));
+        std::snprintf(stage, sizeof(stage), "[buffer-cache] stage (10 s): %llu stage buffers bound to a mirror, %llu of them moved, %llu left to draw snapshots; refused:", since(now.stageViews, reported.stageViews), since(now.movedViews, reported.movedViews), since(now.stageLeft, reported.stageLeft));
         text += stage + reasons + "\n";
     }
     reported = now;

@@ -101,6 +101,7 @@ public:
         std::uint64_t edgePages = 0;
         std::uint64_t stageViews = 0;
         std::uint64_t stageLeft = 0;
+        std::uint64_t movedViews = 0;
         std::array<std::uint64_t, Refusals> stageRefused{};
         std::uint64_t heldBytes = 0;
         std::array<std::uint64_t, Refusals> refused{};
@@ -119,6 +120,8 @@ public:
     static void NoteStreamed(std::size_t bytes);
     static bool StageViews();
     static void NoteStage(bool served);
+    static bool MovedViews();
+    static void NoteMoved();
     static Source& TrackerSource();
     static void SetArmedBlocks(const ArmedBlocks& table);
     static Counts Counted();
