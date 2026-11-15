@@ -15,6 +15,7 @@ namespace {
 constexpr VkAccessFlags anyWrite = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
 constexpr VkAccessFlags anyAccess = anyWrite | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT;
 constexpr std::uint32_t setsPerPool = 64;
+constexpr std::uint64_t StagedMergeTimingKey = std::uint64_t{0xaa} << 40u | 11u;
 
 struct MergePush {
     std::uint32_t origin[2];
@@ -259,13 +260,18 @@ void RecordStagedClear(const Context& context, VkCommandBuffer commands, StagedT
 
 void RecordStagedMerge(const Context& context, VkCommandBuffer commands, StagedTemporary& temporary, VkImageView target, std::uint32_t mask, std::uint32_t samples, VkRect2D area) {
     if (area.extent.width == 0 || area.extent.height == 0) return;
+    auto* recorder = Recorder::Active();
+    const auto timing = recorder != nullptr && recorder->Device() == context.device ? recorder->BeginGpuTiming(StagedMergeTimingKey) : Recorder::NoTiming;
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, anyWrite, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     {
         std::lock_guard lock(mergesMutex());
         mergesFor(context).Merge(commands, temporary, target, mask, samples, area);
     }
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, anyAccess);
-    if (Recorder::Active() != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+    if (recorder != nullptr) {
+        recorder->EndGpuTiming(timing);
+        Recorder::CountBarriers(Recorder::CommandClass::Draw, 2);
+    }
 }
 
 void ClearStagedMerges(VkDevice device) {

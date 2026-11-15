@@ -191,13 +191,30 @@ std::optional<std::uint8_t> texelByte(VkFormat format, const VkClearColorValue& 
     return static_cast<std::uint8_t>(code);
 }
 
+constexpr std::uint64_t MultisampleTimingKey(std::uint64_t site) {
+    return std::uint64_t{0xaa} << 40u | site;
+}
+
+constexpr std::uint64_t CreationClearTimingKey = MultisampleTimingKey(1);
+constexpr std::uint64_t GuestSampleUploadTimingKey = MultisampleTimingKey(2);
+constexpr std::uint64_t StorableCopyTimingKey = MultisampleTimingKey(3);
+constexpr std::uint64_t FastClearTimingKey = MultisampleTimingKey(4);
+constexpr std::uint64_t RecreateClearTimingKey = MultisampleTimingKey(5);
+constexpr std::uint64_t StorageSettleTimingKey = MultisampleTimingKey(6);
+constexpr std::uint64_t StorageAccessTimingKey = MultisampleTimingKey(7);
+constexpr std::uint64_t SampledBarrierTimingKey = MultisampleTimingKey(8);
+constexpr std::uint64_t ResolveTimingKey = MultisampleTimingKey(9);
+
 template<typename Record>
-void recordCommands(const Context& context, Record&& record) {
+void recordCommands(const Context& context, std::uint64_t timingKey, Record&& record) {
     auto* recorder = Recorder::Active();
     if (recorder != nullptr && recorder->Device() != context.device) recorder = nullptr;
     std::unique_ptr<CommandBatch> batch;
     if (recorder == nullptr) batch = std::make_unique<CommandBatch>(context);
-    record(recorder != nullptr ? recorder->Commands() : batch->Handle(), recorder);
+    const auto commands = recorder != nullptr ? recorder->Commands() : batch->Handle();
+    const auto timing = recorder != nullptr ? recorder->BeginGpuTiming(timingKey) : Recorder::NoTiming;
+    record(commands, recorder);
+    if (recorder != nullptr) recorder->EndGpuTiming(timing);
     if (batch) batch->SubmitAndWait();
 }
 
@@ -287,7 +304,7 @@ public:
                 info.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
                 Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &info, nullptr, &uploadView), "vkCreateImageView multisampled guest color upload");
             }
-            recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
+            recordCommands(context, upload ? GuestSampleUploadTimingKey : CreationClearTimingKey, [&](VkCommandBuffer commands, Recorder* recorder) {
                 if (!upload) {
                     recordToGeneral(commands, image);
                     const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
@@ -397,14 +414,17 @@ public:
         if ((usage & VK_IMAGE_USAGE_STORAGE_BIT) != 0) return;
         const auto storable = allocate(usage | VK_IMAGE_USAGE_STORAGE_BIT, storageFlags);
         const auto source = image;
-        recordToGeneral(recorder.Commands(), storable.image);
-        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        const auto commands = recorder.Commands();
+        const auto timing = recorder.BeginGpuTiming(StorableCopyTimingKey);
+        recordToGeneral(commands, storable.image);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
         VkImageCopy region{};
         region.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         region.dstSubresource = region.srcSubresource;
         region.extent = {target.extent.width, target.extent.height, 1};
-        context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(recorder.Commands(), source, VK_IMAGE_LAYOUT_GENERAL, storable.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
-        RecordMemoryBarrier(context, recorder.Commands(), VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, source, VK_IMAGE_LAYOUT_GENERAL, storable.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        recorder.EndGpuTiming(timing);
         Recorder::CountBarriers(Recorder::CommandClass::Draw, 3);
         for (auto& [key, texture] : textures) retiredTextures.push_back(std::move(texture));
         textures.clear();
@@ -454,7 +474,7 @@ public:
         checkDccCurrent(use, refilled);
         if (!refilled && !TakeMultisampledClear(cmask, colorFill, use, clear)) return;
         Keep();
-        recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
+        recordCommands(context, FastClearTimingKey, [&](VkCommandBuffer commands, Recorder* recorder) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
             const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             context.Resolved(&DeviceFunctions::cmdClearColorImage, "vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &clear, 1, &range);
@@ -481,7 +501,7 @@ public:
         cleared = initial;
         drawn = false;
         ++contents;
-        recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
+        recordCommands(context, RecreateClearTimingKey, [&](VkCommandBuffer commands, Recorder* recorder) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
             const VkImageSubresourceRange range{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
             context.Resolved(&DeviceFunctions::cmdClearColorImage, "vkCmdClearColorImage")(commands, image, VK_IMAGE_LAYOUT_GENERAL, &initial, 1, &range);
@@ -493,7 +513,7 @@ public:
     void SettleStorageWrites() {
         if (!storageWritten) return;
         storageWritten = false;
-        recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
+        recordCommands(context, StorageSettleTimingKey, [&](VkCommandBuffer commands, Recorder* recorder) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
             if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 1);
         });
@@ -526,7 +546,7 @@ public:
             }
             Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &selectedView), "vkCreateImageView multisampled target storage");
         }
-        recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
+        recordCommands(context, StorageAccessTimingKey, [&](VkCommandBuffer commands, Recorder* recorder) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
             if (recorder != nullptr) Recorder::CountBarriers(Recorder::CommandClass::Draw, 1);
         });
@@ -574,7 +594,7 @@ public:
         Keep();
         SettleStorageWrites();
         ApplyFastClear(target);
-        recordCommands(context, [&](VkCommandBuffer commands, Recorder*) {
+        recordCommands(context, SampledBarrierTimingKey, [&](VkCommandBuffer commands, Recorder*) {
             RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
             Recorder::CountBarriers(Recorder::CommandClass::Draw, 1);
         });
@@ -1678,7 +1698,7 @@ void ResolveMultisampleTarget(const Context& context, const ColorTarget& source,
     target.Keep();
     const std::array<VkImageView, 2> views{target.View(source.format), destinationView};
     auto framebuffer = std::make_shared<Framebuffer>(context, target.ResolvePass(source.format), views, source.extent);
-    recordCommands(context, [&](VkCommandBuffer commands, Recorder* recorder) {
+    recordCommands(context, ResolveTimingKey, [&](VkCommandBuffer commands, Recorder* recorder) {
         RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
         VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
         begin.renderPass = target.ResolvePass(source.format);

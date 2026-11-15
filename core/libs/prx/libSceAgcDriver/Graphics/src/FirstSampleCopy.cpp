@@ -12,6 +12,8 @@
 namespace AgcDriver::Graphics {
 namespace {
 
+constexpr std::uint64_t FirstSampleTimingKey = std::uint64_t{0xaa} << 40u | 10u;
+
 bool sintFormat(VkFormat format) {
     switch (format) {
         case VK_FORMAT_R8_SINT: case VK_FORMAT_R8G8_SINT: case VK_FORMAT_R8G8B8A8_SINT: case VK_FORMAT_B8G8R8A8_SINT:
@@ -237,6 +239,8 @@ void FirstSampleCopy::Record(Recorder& recorder, VkImageView source, VkImageLayo
     write.pImageInfo = &imageInfo;
     context.Function<PFN_vkUpdateDescriptorSets>("vkUpdateDescriptorSets")(context.device, 1, &write, 0, nullptr);
     recorder.Keep(pool);
+    recorder.Commands();
+    const auto timing = recorder.BeginGpuTiming(FirstSampleTimingKey);
     recorder.RecordUncounted([&](CommandState& recording) {
         const auto commands = recording.Commands();
         VkRenderPassBeginInfo begin{VK_STRUCTURE_TYPE_RENDER_PASS_BEGIN_INFO};
@@ -249,6 +253,7 @@ void FirstSampleCopy::Record(Recorder& recorder, VkImageView source, VkImageLayo
         context.Function<PFN_vkCmdDraw>("vkCmdDraw")(commands, 3, 1, 0, 0);
         context.Resolved(&DeviceFunctions::cmdEndRenderPass, "vkCmdEndRenderPass")(commands);
     });
+    recorder.EndGpuTiming(timing);
 }
 
 }
