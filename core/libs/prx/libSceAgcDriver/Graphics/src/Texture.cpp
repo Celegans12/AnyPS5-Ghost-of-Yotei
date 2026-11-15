@@ -5791,7 +5791,8 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
         for (const auto* texture : pending.textures) {
             if (texture->descriptor.tileMode != TextureTileMode::kLinear && texture->guestBytes > SmallStoreBytes) continue;
 #if defined(__APPLE__) || defined(_WIN32)
-            if (trap && !sharesLabelBlock(texture) && !TrapReadBackRecently(texture->descriptor.baseAddress) && !sharesPage(texture) && (texture->readTrapped.load(std::memory_order_acquire) || !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) && GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) {
+            static const bool dryTraps = std::getenv("APS5_LABEL_READ_TRAP_DRY") != nullptr;
+            if (trap && !dryTraps && !sharesLabelBlock(texture) && !TrapReadBackRecently(texture->descriptor.baseAddress) && !sharesPage(texture) && (texture->readTrapped.load(std::memory_order_acquire) || !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) && GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) {
                 texture->readTrapped.store(true, std::memory_order_release);
                 continue;
             }

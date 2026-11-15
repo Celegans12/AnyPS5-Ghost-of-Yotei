@@ -435,13 +435,28 @@ public:
         if (end <= begin || !trapping.load(std::memory_order_acquire)) return;
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
         {
+            // Walks the traps over the range, not its pages: callers ask about whole collected
+            // ranges (megabytes) and almost always no trap is inside.
             std::lock_guard lock(mutex);
+            if (traps.empty() && trapsResolving.empty()) return;
+            const auto first = begin & ~trapPageMask;
             const auto last = (end + trapPageMask) & ~trapPageMask;
-            for (auto page = begin & ~trapPageMask; page < last; page += trapPageBytes) {
-                if (!trapCovers(page, page + trapPageBytes) && !resolvingCovers(page, page + trapPageBytes, TrapOwner::Any)) continue;
-                if (query(page).Protect != PAGE_NOACCESS) continue;
-                if (!runs.empty() && runs.back().second == page) runs.back().second = page + trapPageBytes;
-                else runs.emplace_back(page, page + trapPageBytes);
+            std::vector<std::pair<std::uintptr_t, std::uintptr_t>> covering;
+            for (auto it = traps.lower_bound(first > longestTrap + trapPageBytes ? first - longestTrap - trapPageBytes : 0); it != traps.end() && it->first < last; ++it) {
+                if (it->second > first) covering.emplace_back(it->first & ~trapPageMask, (it->second + trapPageMask) & ~trapPageMask);
+            }
+            for (const auto& entry : trapsResolving) {
+                if (entry.begin < last && entry.end > first) covering.emplace_back(entry.begin & ~trapPageMask, (entry.end + trapPageMask) & ~trapPageMask);
+            }
+            std::sort(covering.begin(), covering.end());
+            std::uintptr_t done = first;
+            for (const auto& [from, to] : covering) {
+                for (auto page = std::max({from, first, done}); page < std::min(to, last); page += trapPageBytes) {
+                    if (query(page).Protect != PAGE_NOACCESS) continue;
+                    if (!runs.empty() && runs.back().second == page) runs.back().second = page + trapPageBytes;
+                    else runs.emplace_back(page, page + trapPageBytes);
+                }
+                done = std::max(done, std::min(to, last));
             }
         }
         for (const auto& [runBegin, runEnd] : runs) trapped(context, runBegin, runEnd);

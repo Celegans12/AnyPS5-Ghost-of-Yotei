@@ -295,8 +295,11 @@ buffer regions often span two mappings and no single import served them. Found a
   line). Back to back: 007 68 to 80 ms with, 69 to 98 without (no clear difference); FF 31.1
   and 32.8 with, 31.0 and 32.8 without; LEGO 46.7 / 47.1; AoM 170 to 175 with, 138 to 148
   without, in five pairs. AoM sets about 5 traps per second and parks no thread, so the cost is
-  not faults; dispatch is 102 to 106 ms per frame against 93 to 95. Not understood yet. Tests
-  1,809 of 1,809 with the traps on and off, section A on and off.
+  not faults; dispatch is 102 to 106 ms per frame against 93 to 95. With the trap code on but
+  no trap ever set (`APS5_LABEL_READ_TRAP_DRY=1`) AoM is 142 to 144 ms, so the cost comes from
+  surfaces being trapped: threads then wait 25 ms per frame for the GPU mutex against 6
+  (`GpuMutex.wait` in the profile), with no extra CPU work in any thread. The holder is not
+  identified. Tests 1,809 of 1,809 with the traps on and off, section A on and off.
 - f8e0ee64d4: eight `thread_local` caches of the direct path had destructors; the draw committer
   crashed in one at thread exit (`agc_driver_village_draw_cost` hung in 9 of 120 runs with
   section A off). They use `ThreadScratch` now; 150 of 150 runs pass.
