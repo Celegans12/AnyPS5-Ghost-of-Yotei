@@ -2364,6 +2364,7 @@ void Recorder::ensureOpen() {
         if (countingSamples && !segmentMode()) beginSamples(*batch);
         dropStaleHoldKept();
         batch->kept.insert(batch->kept.end(), holdKept.begin(), holdKept.end());
+        if (keptHint != 0 && LeanCommit()) batch->kept.reserve(batch->kept.size() + keptHint);
         open = std::move(batch);
         open->predictedSerial = submissions + 1;
         try {
@@ -3711,9 +3712,27 @@ void Recorder::dropStaleHoldKept() {
     if (!holdKept.empty() && holdKeptSerial != GuestMemory::GpuHoldSerial() && GuestMemory::GpuMutex().HeldByThisThread()) holdKept.clear();
 }
 
+namespace {
+std::atomic<int> leanCommitForTest{-1};
+}
+
+bool Recorder::LeanCommit() {
+    static const bool enabled = std::getenv("APS5_NO_LEAN_COMMIT") == nullptr;
+    const auto forced = leanCommitForTest.load(std::memory_order_relaxed);
+    return forced < 0 ? enabled : forced != 0;
+}
+
+void Recorder::SetLeanCommitForTest(int lean) {
+    leanCommitForTest.store(lean, std::memory_order_relaxed);
+}
+
 void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
     if (owner == nullptr || bytes == 0) return;
     ensureOpen();
+    if (LeanCommit()) {
+        if (open->lastKeptOwner == owner) return;
+        open->lastKeptOwner = owner;
+    }
     if (open->keptOwners.insert(owner).second) open->keptBytes += bytes;
 }
 
@@ -5628,6 +5647,7 @@ bool Recorder::Reap() {
 
 void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool releaseNow) {
     inFlightKeptBytes -= batch->keptBytes;
+    keptHint = std::max(keptHint - keptHint / 4, std::min<std::size_t>(batch->kept.size(), 4096));
     // The batch's writes stay published until its completions ran, on every exit path.
     struct Finishing {
         Recorder& recorder;

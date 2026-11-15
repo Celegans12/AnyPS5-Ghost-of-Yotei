@@ -20,6 +20,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -2928,22 +2929,52 @@ struct Kept {
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
-void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>> targets, std::vector<std::pair<std::uint32_t, std::uint32_t>> slices, VkRect2D scissor, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, std::shared_ptr<ShaderResources::DrawUse> use, std::shared_ptr<const void>* spaceKeep) {
-    auto kept = std::make_shared<Kept>();
-    kept->resources = resources;
-    kept->pipeline = std::move(pipeline);
-    kept->framebuffer = std::move(framebuffer);
-    kept->indices = std::move(inputs.indices);
-    kept->vertexBuffers = std::move(inputs.vertexBuffers);
-    kept->mirrors = std::move(inputs.mirrors);
-    kept->scratch = std::move(scratch);
-    kept->targets = std::move(targets);
-    const auto& residents = kept->targets;
+void keepDrawObjects(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline>& pipeline, std::shared_ptr<Framebuffer>& framebuffer, DrawInputs& inputs, std::span<const std::shared_ptr<StorageTexture>> targets, std::unique_ptr<DeviceBuffer>& scratch) {
+    if (scratch != nullptr) recorder.Keep(std::shared_ptr<DeviceBuffer>(std::move(scratch)));
+    for (const auto& target : targets) {
+        if (target != nullptr) recorder.Keep(target);
+    }
+    for (auto& mirror : inputs.mirrors) {
+        if (mirror != nullptr) recorder.Keep(std::move(mirror));
+    }
+    inputs.mirrors.clear();
+    for (auto& buffer : inputs.vertexBuffers) {
+        if (buffer != nullptr) recorder.Keep(std::move(buffer));
+    }
+    inputs.vertexBuffers.clear();
+    if (inputs.indices != nullptr) recorder.Keep(std::move(inputs.indices));
+    if (framebuffer != nullptr) recorder.Keep(std::move(framebuffer));
+    if (pipeline != nullptr) recorder.Keep(std::move(pipeline));
+    if (resources != nullptr) recorder.Keep(resources);
+}
+
+void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>>& targets, std::span<const std::pair<std::uint32_t, std::uint32_t>> slices, VkRect2D scissor, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, std::shared_ptr<ShaderResources::DrawUse> use, std::shared_ptr<const void>* spaceKeep) {
+    const bool leanCommit = Recorder::LeanCommit();
+    std::shared_ptr<Kept> kept;
+    if (!leanCommit) {
+        kept = std::make_shared<Kept>();
+        kept->resources = resources;
+        kept->pipeline = std::move(pipeline);
+        kept->framebuffer = std::move(framebuffer);
+        kept->indices = std::move(inputs.indices);
+        kept->vertexBuffers = std::move(inputs.vertexBuffers);
+        kept->mirrors = std::move(inputs.mirrors);
+        kept->scratch = std::move(scratch);
+        kept->targets = std::move(targets);
+    }
+    const auto& residents = leanCommit ? targets : kept->targets;
+    struct Emptied {
+        std::vector<std::shared_ptr<StorageTexture>>* targets;
+        ~Emptied() {
+            if (targets != nullptr) targets->clear();
+        }
+    } emptied{leanCommit ? &targets : nullptr};
     resources->KeepStorageImageBytes(recorder);
     for (const auto& target : residents) {
         if (target != nullptr && !target->Cached()) recorder.KeepBytes(target.get(), static_cast<std::size_t>(target->BudgetBytes()));
     }
-    recorder.Keep(kept);
+    if (leanCommit) keepDrawObjects(recorder, resources, pipeline, framebuffer, inputs, residents, scratch);
+    else recorder.Keep(kept);
     if (resources != nullptr) recorder.KeepBytes(resources.get(), resources->CopiedBytes());
     if (checkRecords) recorder.OnComplete(std::move(checkRecords));
     // Counted for the [address-sync] line: a lease released by the completion (the pin waiter
@@ -2967,19 +2998,36 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
         writers->push_back(resources);
         for (const auto& [begin, end] : resources->GpuWrites()) GuestMemory::BreakProofs(GuestMemory::ProofBreak::CopiedWriters, begin, static_cast<std::size_t>(end - begin));
     } else if (completion) {
-        if (use != nullptr) recorder.OnComplete([resources, use] { resources->CompleteDrawUse(*use); });
-        else if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });
-        else recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
+        if (use != nullptr) {
+            recorder.OnComplete([resources, use] { resources->CompleteDrawUse(*use); });
+        } else if (leanCommit) {
+            recorder.Keep(resources);
+            auto* held = resources.get();
+            if (resources->Reusable()) recorder.OnComplete([held] { held->CheckFaults(); });
+            else recorder.OnComplete([held] { held->WriteBackBuffers(); });
+        } else if (resources->Reusable()) {
+            recorder.OnComplete([resources] { resources->CheckFaults(); });
+        } else {
+            recorder.OnComplete([resources] { resources->WriteBackBuffers(); });
+        }
     }
-    std::vector<bool> storeNow(residents.size(), false);
+    const bool narrow = leanCommit && residents.size() <= 64;
+    std::uint64_t storeBits = 0;
+    std::vector<bool> storeNow(narrow ? 0 : residents.size(), false);
     for (std::size_t index = 0; index < residents.size(); ++index) {
         if (residents[index] == nullptr) continue;
-        if (residents[index]->Descriptor().tileMode == TextureTileMode::kLinear) storeNow[index] = !residents[index]->MarkDrawn(index < slices.size() ? slices[index].first : 0u, index < slices.size() ? slices[index].second : 0u, scissor) || !residents[index]->Cached();
-        else if (index < slices.size()) residents[index]->MarkSliceDirty(slices[index].first, slices[index].second);
-        else residents[index]->MarkDirty();
+        if (residents[index]->Descriptor().tileMode == TextureTileMode::kLinear) {
+            const bool now = !residents[index]->MarkDrawn(index < slices.size() ? slices[index].first : 0u, index < slices.size() ? slices[index].second : 0u, scissor) || !residents[index]->Cached();
+            if (narrow) storeBits |= static_cast<std::uint64_t>(now) << index;
+            else storeNow[index] = now;
+        } else if (index < slices.size()) {
+            residents[index]->MarkSliceDirty(slices[index].first, slices[index].second);
+        } else {
+            residents[index]->MarkDirty();
+        }
     }
     for (std::size_t index = 0; index < residents.size(); ++index) {
-        if (storeNow[index]) StorageTexture::FlushPending(residents[index]->Descriptor().baseAddress, static_cast<std::size_t>(residents[index]->GuestBytes()), nullptr, "linear target");
+        if (narrow ? ((storeBits >> index) & 1u) != 0 : static_cast<bool>(storeNow[index])) StorageTexture::FlushPending(residents[index]->Descriptor().baseAddress, static_cast<std::size_t>(residents[index]->GuestBytes()), nullptr, "linear target");
     }
 }
 
@@ -3222,12 +3270,13 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         if (!gpuIndirect) return false;
         return (begin < args->arguments + args->RangeBytes() && args->arguments < end) || (args->countIndirect && begin < args->countAddress + 4 && args->countAddress < end);
     };
-    if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || recorder->AnyQueuedKeyStore(touches))) {
+    const bool leanCommit = Recorder::LeanCommit();
+    if (recorder->HasQueuedKeyStores() && (resources.HoldsLease() || (leanCommit ? recorder->AnyQueuedKeyStore(std::cref(touches)) : recorder->AnyQueuedKeyStore(touches)))) {
         recorder->FlushKeyStores();
         outcome.keyStoresFlushed = true;
     }
     // A queued label store over such memory likewise (Recorder::RecordStore).
-    if (recorder->HasQueuedStores() && (resources.HoldsLease() || recorder->AnyQueuedStore(touches))) {
+    if (recorder->HasQueuedStores() && (resources.HoldsLease() || (leanCommit ? recorder->AnyQueuedStore(std::cref(touches)) : recorder->AnyQueuedStore(touches)))) {
         recorder->FlushStores();
         outcome.storesFlushed = true;
     }
@@ -3250,8 +3299,14 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         const auto begin = entry.address - entry.adjustment;
         passReads.emplace_back(begin, begin + GuestBufferMemory::ViewBytes(entry.size, entry.adjustment));
     }
-    const auto passImages = resources.StorageImages();
-    std::vector<std::pair<VkImage, bool>> passAttachments;
+    thread_local std::vector<std::pair<VkImage, bool>>* passImagesSlot = nullptr;
+    thread_local std::vector<std::pair<VkImage, bool>>* passAttachmentsSlot = nullptr;
+    std::vector<std::pair<VkImage, bool>> ownImages;
+    std::vector<std::pair<VkImage, bool>> ownAttachments;
+    auto& passImages = leanCommit ? ShaderRecompiler::ThreadOwned(passImagesSlot) : ownImages;
+    auto& passAttachments = leanCommit ? ShaderRecompiler::ThreadOwned(passAttachmentsSlot) : ownAttachments;
+    resources.StorageImages(passImages);
+    passAttachments.clear();
     passAttachments.reserve(record.targets.size());
     for (const auto& target : record.targets) {
         if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
@@ -3449,7 +3504,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
     timer.phase(PhaseRecord);
-    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, drawUse, record.spaceKeep != nullptr && *record.spaceKeep != nullptr ? record.spaceKeep->get() : nullptr);
+    keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, record.targets, record.targetSlices, state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, drawUse, record.spaceKeep != nullptr && *record.spaceKeep != nullptr ? record.spaceKeep->get() : nullptr);
     timer.phase(PhaseKeep);
     if (!record.staged.empty()) {
         const auto merged = recorder->Commands();
@@ -4514,7 +4569,8 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     APS5_LOG_CHARS_OUT_DEBUG("SubmitAndWait");
     timer.phase(PhaseRecord);
     if (recorded) {
-        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, owners, [&] { std::vector<std::pair<std::uint32_t, std::uint32_t>> slices; for (const auto& binding : targets) slices.emplace_back(binding.color.arraySlice, binding.color.arrayLastSlice != 0 ? binding.color.layers : 1u); return slices; }(), state.scissor, std::move(scratch), std::move(checkRecords), listed, completion, outcome, drawUse, prepared.spaceKeep != nullptr ? prepared.spaceKeep.get() : nullptr);
+        auto keptTargets = owners;
+        keepRecordedDraw(*recorder, resources, pipeline, framebuffer, inputs, keptTargets, [&] { std::vector<std::pair<std::uint32_t, std::uint32_t>> slices; for (const auto& binding : targets) slices.emplace_back(binding.color.arraySlice, binding.color.arrayLastSlice != 0 ? binding.color.layers : 1u); return slices; }(), state.scissor, std::move(scratch), std::move(checkRecords), listed, completion, outcome, drawUse, prepared.spaceKeep != nullptr ? prepared.spaceKeep.get() : nullptr);
         timer.phase(PhaseKeep);
         if (outcome.waited) {
             // The wait the dispatch path makes for such work (source 3, "address-based"): the
@@ -4747,6 +4803,80 @@ bool AppendDrawContentKey(std::span<const CompiledShader> shaders, const Pm4::Dr
     return true;
 }
 
+namespace {
+
+struct DrawAllocations {
+    std::atomic<std::uint64_t> draws{0};
+    std::atomic<std::uint64_t> inputs{0};
+    std::atomic<std::uint64_t> commit{0};
+    std::atomic<std::uint64_t> kept{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+DrawAllocations& drawAllocations() {
+    static auto* counters = new DrawAllocations;
+    return *counters;
+}
+
+void noteDrawAllocations(std::uint64_t inputs, std::uint64_t commit, std::uint64_t kept) {
+    auto& counters = drawAllocations();
+    counters.draws.fetch_add(1, std::memory_order_relaxed);
+    counters.inputs.fetch_add(inputs, std::memory_order_relaxed);
+    counters.commit.fetch_add(commit, std::memory_order_relaxed);
+    counters.kept.fetch_add(kept, std::memory_order_relaxed);
+    const auto nowMs = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    auto last = counters.lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        counters.lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto draws = counters.draws.exchange(0, std::memory_order_relaxed);
+    const auto inputsTaken = counters.inputs.exchange(0, std::memory_order_relaxed);
+    const auto commitTaken = counters.commit.exchange(0, std::memory_order_relaxed);
+    const auto keptTaken = counters.kept.exchange(0, std::memory_order_relaxed);
+    if (draws == 0) return;
+    const auto each = [&](std::uint64_t total) { return static_cast<double>(total) / static_cast<double>(draws); };
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-alloc] (10 s): %llu draws recorded from a recipe, %.2f host allocations per draw (%.2f for the index and vertex inputs, %.2f for the rest of the commit), %.2f objects kept by the batch per draw; lean commit %s\n", static_cast<unsigned long long>(draws), each(inputsTaken + commitTaken), each(inputsTaken), each(commitTaken), each(keptTaken), Recorder::LeanCommit() ? "on" : "off");
+}
+
+struct RecipeScratch {
+    std::vector<std::shared_ptr<StorageTexture>> targets;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> slices;
+    std::vector<ShaderResources::MovedBuffer> moved;
+};
+
+struct RecipeScratchTag {};
+
+struct RecipeVectors {
+    explicit RecipeVectors(RecipeScratch* home) : home(home) {
+        if (home == nullptr) return;
+        targets = std::move(home->targets);
+        slices = std::move(home->slices);
+        moved = std::move(home->moved);
+        targets.clear();
+        slices.clear();
+        moved.clear();
+    }
+    ~RecipeVectors() {
+        if (home == nullptr) return;
+        targets.clear();
+        slices.clear();
+        moved.clear();
+        home->targets = std::move(targets);
+        home->slices = std::move(slices);
+        home->moved = std::move(moved);
+    }
+    RecipeVectors(const RecipeVectors&) = delete;
+    RecipeVectors& operator=(const RecipeVectors&) = delete;
+    RecipeScratch* home;
+    std::vector<std::shared_ptr<StorageTexture>> targets;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> slices;
+    std::vector<ShaderResources::MovedBuffer> moved;
+};
+
+}
+
 DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const DrawRecipe& recipe, const DrawTraceContext* trace) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
@@ -4777,6 +4907,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     const auto& attributes = shaders.front().program->vertexAttributes;
     if (!SameVertexLayout(recipe.vertexSignature, attributes)) return miss(DrawRecipeMiss::Layout);
     ValidateVertexAddresses(attributes);
+    const bool allocationsCounted = drawSiteStats() && HostAllocationsCounted();
+    const auto allocationsBefore = allocationsCounted ? HostAllocationsOnThread() : 0;
     const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer);
     DrawInputs inputs;
     if (plan.nothing) inputs.nothing = true;
@@ -4785,24 +4917,28 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         result.recorded = true;
         return result;
     }
+    const auto allocationsAfterInputs = allocationsCounted ? HostAllocationsOnThread() : 0;
     // The resident-target proof on the stored images (design_cpu_final 3.7): while an image is
     // still the storage cache's for its surface (StorageImageCached: the cache entry, removed under
     // the cache mutex before an eviction's flush, and the LRU touch a lookup would make), it is
     // what the lookup would return, and Refresh brings it up to date exactly as the lookup's does
     // (FlushPending, the whole-surface collect and UnchangedSince, the key scan). An image gone
     // from the cache is a miss: the ordinary path looks up anew.
-    std::vector<std::shared_ptr<StorageTexture>> targets;
+    const bool leanCommit = Recorder::LeanCommit();
+    RecipeVectors vectors(leanCommit ? &ThreadScratch<RecipeScratch, RecipeScratchTag>() : nullptr);
+    auto& targets = vectors.targets;
     targets.reserve(recipe.targets.size());
     for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
         timer.phase(PhaseSetup);
         if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
         auto stored = recipe.targets[index].lock();
         if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
-        auto resident = refreshResidentTarget(context, state, state.colors[index], outcome, profile, index, stored.get(), [&] {
+        const auto refreshed = [&] {
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, state.colors[index].layers);
             else stored->Refresh();
             return stored;
-        });
+        };
+        auto resident = leanCommit ? refreshResidentTarget(context, state, state.colors[index], outcome, profile, index, stored.get(), std::cref(refreshed)) : refreshResidentTarget(context, state, state.colors[index], outcome, profile, index, stored.get(), refreshed);
         timer.phase(PhaseReadTarget);
         if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
         targets.push_back(std::move(resident));
@@ -4831,8 +4967,14 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         timer.phase(PhaseLookup);
         return miss(DrawRecipeMiss::Proof);
     }
-    const auto moved = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
-    if (!moved.has_value()) return miss(DrawRecipeMiss::Buffers);
+    std::optional<std::vector<ShaderResources::MovedBuffer>> movedOwned;
+    if (leanCommit) {
+        if (!resources->CollectMovedReadOnlyBuffers(shaders, *recorder, &state.color, vectors.moved)) return miss(DrawRecipeMiss::Buffers);
+    } else {
+        movedOwned = resources->MovedReadOnlyBuffers(shaders, *recorder, &state.color);
+        if (!movedOwned.has_value()) return miss(DrawRecipeMiss::Buffers);
+    }
+    const std::span<const ShaderResources::MovedBuffer> moved = leanCommit ? std::span<const ShaderResources::MovedBuffer>(vectors.moved) : std::span<const ShaderResources::MovedBuffer>(*movedOwned);
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     SharedResourceCache().Touch(recipe.key);
@@ -4859,11 +5001,12 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.masked = recipe.masked.has_value() ? &*recipe.masked : nullptr;
     record.completion = outcome.completion;
     record.resources = std::move(resources);
-    record.moved = *moved;
+    record.moved = moved;
     record.pipeline = std::move(pipeline);
     record.framebuffer = std::move(framebuffer);
     record.targetViews = recipe.targetViews;
     record.targets = std::move(targets);
+    record.targetSlices = std::move(vectors.slices);
     for (const auto& color : state.colors) record.targetSlices.emplace_back(color.arraySlice, color.arrayLastSlice != 0 ? color.layers : 1u);
     auto pushBytes = recipe.pushBytes;
     if (recipe.pushStages != 0) {
@@ -4873,7 +5016,14 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     record.pushBytes = &pushBytes;
     record.pushStages = recipe.pushStages;
     record.depthLocations = passDepthLocations(context, state, *record.pipeline);
+    const auto keptBefore = recorder->OpenKeptObjects();
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, trace);
+    vectors.targets = std::move(record.targets);
+    vectors.slices = std::move(record.targetSlices);
+    if (allocationsCounted) {
+        const auto keptAfter = recorder->OpenKeptObjects();
+        noteDrawAllocations(allocationsAfterInputs - allocationsBefore, HostAllocationsOnThread() - allocationsAfterInputs, keptAfter >= keptBefore ? keptAfter - keptBefore : 0);
+    }
     if (profile) {
         result.recordUs = std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - recordStart).count();
         auto& stats = Profile();
