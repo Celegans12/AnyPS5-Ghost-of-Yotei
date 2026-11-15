@@ -420,9 +420,16 @@ public:
         // An import the GPU has not used yet pins its pages at that first use, which needs them
         // accessible.
         if (overlapsOwnedRange(ownedHostAccess, first, last) || overlapsOwnedRange(unusedImports, first, last) || overlaps(unarmable, first, last) || !trappable(first, last)) return false;
-        forgetClean(first, last);
+        // An armed page stays armed and clean under the trap (the CPU cannot write it without a
+        // fault either) and is read-only again when the trap goes. Dropping that state made every
+        // trap open its import group: Age of Mythology walked and armed memory again each frame.
         DWORD previous;
         if (!VirtualProtect(reinterpret_cast<void*>(first), last - first, PAGE_NOACCESS, &previous)) return false;
+        // The trapped pages count as armed (not clean: their stores since the last walk are still
+        // in the write watch), so an import group holding them can be armed as a whole. A group
+        // with a page that cannot be armed is opened at every submission.
+        remember(armedRanges, first, last);
+        noteUneven(first, last);
         traps.emplace(begin, end);
         longestTrap = std::max(longestTrap, end - begin);
         remember(everTrapped, first, last);
@@ -2406,8 +2413,18 @@ private:
     bool armablePrivate(std::uintptr_t start, std::uintptr_t end) {
         for (auto at = start; at < end;) {
             const auto memory = query(at);
-            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE || memory.Protect != PAGE_READWRITE) return false;
-            at = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
+            const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            if (memory.Protect == PAGE_NOACCESS) {
+                // Pages trapped for reads are closed to the CPU already and are armed as they are.
+                if (traps.empty()) return false;
+                for (auto page = at; page < regionEnd; page += trapPageBytes) {
+                    if (!trapCovers(page, page + trapPageBytes) && !resolvingCovers(page, page + trapPageBytes, TrapOwner::Any)) return false;
+                }
+            } else if (memory.Protect != PAGE_READWRITE) {
+                return false;
+            }
+            at = regionEnd;
         }
         return true;
     }
@@ -2422,7 +2439,19 @@ private:
         // then finds the block armed and resumes.
         remember(armedRanges, start, end);
         DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(start), end - start, PAGE_READONLY, &previous)) {
+        bool protectedAll = true;
+        if (traps.empty() && trapsResolving.empty()) {
+            protectedAll = VirtualProtect(reinterpret_cast<void*>(start), end - start, PAGE_READONLY, &previous) != 0;
+        } else {
+            // Trapped (no-access) pages inside the run keep their trap.
+            for (auto at = start; at < end && protectedAll;) {
+                const auto memory = query(at);
+                const auto regionEnd = std::min(end, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                if (memory.Protect != PAGE_NOACCESS) protectedAll = VirtualProtect(reinterpret_cast<void*>(at), regionEnd - at, PAGE_READONLY, &previous) != 0;
+                at = regionEnd;
+            }
+        }
+        if (!protectedAll) {
             groupError = GetLastError();
             forget(armedRanges, start, end);
             return false;
@@ -2571,6 +2600,12 @@ private:
                     groupRefusalAt = cursor;
                     if (guestEnd == 0) return groupRefusal = 6, false;
                     regionEnd = std::min(regionEnd, guestEnd);
+                    // A trapped page that lost its armed record (its range was opened) is closed
+                    // to the CPU already.
+                    if (memory.Protect == PAGE_NOACCESS && !traps.empty() && trapCovers(cursor, cursor + trapPageBytes)) {
+                        cursor += trapPageBytes;
+                        continue;
+                    }
                     if (memory.Type != MEM_PRIVATE || memory.Protect != PAGE_READWRITE) return groupRefusal = 7, false;
                     if (!armable(cursor, regionEnd)) return false;
                     // A protection change cannot span two allocations: runs join only inside one.
@@ -2908,6 +2943,19 @@ private:
         return true;
     }
 
+    // Gives the no-access pages [from, to) their protection without the trap: read-only where
+    // they are armed, read-write elsewhere.
+    void openTrapped(std::uintptr_t from, std::uintptr_t to, const char* operation) {
+        for (auto at = from; at < to;) {
+            const auto next = armedRanges.upper_bound(at);
+            const bool armed = next != armedRanges.begin() && std::prev(next)->second > at;
+            const auto stop = armed ? std::min(to, std::prev(next)->second) : next != armedRanges.end() ? std::min(to, next->first) : to;
+            DWORD previous;
+            if (!VirtualProtect(reinterpret_cast<void*>(at), stop - at, armed ? PAGE_READONLY : PAGE_READWRITE, &previous)) fail(operation);
+            at = stop;
+        }
+    }
+
     // Opens the no-access pages of [begin, end) that no remaining trap and no other thread's
     // resolve covers.
     void untrap(std::uintptr_t begin, std::uintptr_t end) {
@@ -2925,8 +2973,7 @@ private:
                         continue;
                     }
                 }
-                DWORD previous;
-                if (!VirtualProtect(reinterpret_cast<void*>(at), regionEnd - at, PAGE_READWRITE, &previous)) fail("open trapped guest memory");
+                openTrapped(at, regionEnd, "open trapped guest memory");
             }
             at = regionEnd;
         }
@@ -3029,8 +3076,11 @@ private:
             if (own || (bypass != nullptr && bypass())) {
                 if (own && trapped) deferCovering(page);
                 ++trapsBypassed;
-                DWORD previous;
-                return query(page).Protect != PAGE_NOACCESS || VirtualProtect(reinterpret_cast<void*>(page), trapPageBytes, PAGE_READWRITE, &previous) != 0;
+                // Already open: a read may go on; a store into a page that is armed again takes
+                // the write-fault path.
+                if (const auto protect = query(page).Protect; protect != PAGE_NOACCESS) return !write || protect == PAGE_READWRITE;
+                openTrapped(page, page + trapPageBytes, "open trapped guest memory at once");
+                return true;
             }
             ++trapsParked;
         }
@@ -3119,8 +3169,7 @@ private:
         bool handed = false;
         for (auto page = first; page < last; page += trapPageBytes) {
             if (!trapCovers(page, page + trapPageBytes) && !resolvingCovers(page, page + trapPageBytes, TrapOwner::Any)) continue;
-            DWORD previous;
-            if (query(page).Protect == PAGE_NOACCESS && !VirtualProtect(reinterpret_cast<void*>(page), trapPageBytes, PAGE_READWRITE, &previous)) fail("open trapped guest memory for an import");
+            if (query(page).Protect == PAGE_NOACCESS) openTrapped(page, page + trapPageBytes, "open trapped guest memory for an import");
             if (trapCovers(page, page + trapPageBytes)) {
                 trapsHanded.push_back(page);
                 handed = true;

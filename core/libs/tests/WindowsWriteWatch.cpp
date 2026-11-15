@@ -1136,6 +1136,8 @@ void CheckReadTraps() {
     mappings.Commit(memory, Total, PAGE_READWRITE, Total, true);
     const auto address = reinterpret_cast<std::uintptr_t>(memory);
     const auto protection = [&](std::size_t offset) { return RegionAt(memory + offset).Protect; };
+    // A page whose trap went without a store is armed: read-only until the first store.
+    const auto open = [&](std::size_t offset) { return protection(offset) == PAGE_READONLY; };
     const auto load = [&](std::size_t offset) { return static_cast<const volatile unsigned char*>(memory)[offset]; };
     const auto trappedBytes = [&] {
         std::size_t bytes = 0;
@@ -1156,7 +1158,7 @@ void CheckReadTraps() {
     Require(mappings.Protection(address, &logical) && logical == PAGE_READWRITE, "a trapped page did not report its guest protection");
     Require(load(16) == 0x5a, "a trapped read did not see the resolver's bytes");
     Require(trapCalls == 1 && trapThread != GetCurrentThreadId(), "the resolver did not run once on its own thread");
-    Require(protection(0) == PAGE_READWRITE && trappedBytes() == 0, "a resolved page stayed trapped");
+    Require(protection(0) == PAGE_READWRITE && trappedBytes() == 0, "a resolved page the resolver stored into is not read-write");
     Require(load(17) == 0x5a && trapCalls == 1, "a second read resolved again");
 
     // A store faults the same way; the resolver's bytes land first.
@@ -1168,14 +1170,16 @@ void CheckReadTraps() {
     // A released trap opens its pages without a resolver call.
     Require(mappings.TrapReads(address + 2 * Bytes, address + 2 * Bytes + 2 * Small), "cannot set a read trap");
     mappings.ReleaseReads(address + 2 * Bytes, address + 2 * Bytes + 2 * Small);
-    Require(protection(2 * Bytes) == PAGE_READWRITE && load(2 * Bytes) == 0 && trapCalls == 2, "a released trap stayed, or resolved");
+    Require(open(2 * Bytes) && load(2 * Bytes) == 0 && trapCalls == 2, "a released trap stayed, or resolved");
+    static_cast<volatile unsigned char*>(memory)[2 * Bytes + 1] = 3;
+    Require(load(2 * Bytes + 1) == 3 && protection(2 * Bytes) == PAGE_READWRITE, "a store after a released trap did not open the armed page");
 
     // Two traps sharing a page: the page opens when the second is released.
     Require(mappings.TrapReads(address + 3 * Bytes, address + 3 * Bytes + 100) && mappings.TrapReads(address + 3 * Bytes + 200, address + 3 * Bytes + 300), "cannot set two read traps in one page");
     mappings.ReleaseReads(address + 3 * Bytes, address + 3 * Bytes + 100);
     Require(protection(3 * Bytes) == PAGE_NOACCESS, "a page two traps share opened with the first release");
     mappings.ReleaseReads(address + 3 * Bytes + 200, address + 3 * Bytes + 300);
-    Require(protection(3 * Bytes) == PAGE_READWRITE, "a page two traps shared stayed trapped");
+    Require(open(3 * Bytes), "a page two traps shared stayed trapped");
 
     // An armed (read-only) page can be trapped; it is writable to the guest afterwards.
     std::array<void*, 256> pages{};
@@ -1208,7 +1212,7 @@ void CheckReadTraps() {
     bypassing = true;
     Require(load(6 * Bytes) == 0 && trapCalls == 4, "a bypassed read ran the resolver");
     bypassing = false;
-    Require(protection(6 * Bytes) == PAGE_READWRITE && protection(6 * Bytes + Small) == PAGE_NOACCESS, "a bypassed read opened more or less than its page");
+    Require(open(6 * Bytes) && protection(6 * Bytes + Small) == PAGE_NOACCESS, "a bypassed read opened more or less than its page");
     trapFill = 0x44;
     Require(load(6 * Bytes + Small) == 0x44 && load(6 * Bytes) == 0x44 && trapCalls == 5, "the rest of a bypassed trap did not resolve");
     mappings.SetReadTrapBypass(nullptr);

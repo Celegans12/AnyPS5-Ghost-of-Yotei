@@ -298,8 +298,14 @@ buffer regions often span two mappings and no single import served them. Found a
   not faults; dispatch is 102 to 106 ms per frame against 93 to 95. With the trap code on but
   no trap ever set (`APS5_LABEL_READ_TRAP_DRY=1`) AoM is 142 to 144 ms, so the cost comes from
   surfaces being trapped: threads then wait 25 ms per frame for the GPU mutex against 6
-  (`GpuMutex.wait` in the profile), with no extra CPU work in any thread. The holder is not
-  identified. Tests 1,809 of 1,809 with the traps on and off, section A on and off.
+  (`GpuMutex.wait` in the profile), behind the draw committer. Cause in the tracker's counters
+  (`[guestmem]`, per run, traps on / off): import groups opened at a submission 217 / 0,
+  memory armed at submissions 30 / 2.9 GiB, lock held in submissions 2.8 / 0.5 s, collect
+  walks 470 k / 168 k. A group with a trap in it is opened about every third frame (the probe
+  says "hot": faulting again soon after arming) and armed again, 138 MiB each time. Built on
+  the way and kept: a trapped page keeps its armed and clean state, counts as armed, is
+  read-only again when the trap goes, and arming works around it. What makes the group hot
+  is open. Tests 1,809 of 1,809 with the traps on and off, section A on and off.
 - f8e0ee64d4: eight `thread_local` caches of the direct path had destructors; the draw committer
   crashed in one at thread exit (`agc_driver_village_draw_cost` hung in 9 of 120 runs with
   section A off). They use `ThreadScratch` now; 150 of 150 runs pass.
