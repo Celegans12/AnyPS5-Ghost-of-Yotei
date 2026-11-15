@@ -5032,8 +5032,14 @@ bool servesNow(HostImports& state, const HostImport* import, std::uint64_t begin
 // (StoreImportFor). Section A (WindowsMappings::BeginSubmit): an import must be uniformly protected
 // at a submission that stores through it, so stores go through small imports of their own and the
 // ordinary import, which is then only read, may stay armed block by block.
+// Debug aid (APS5_TRACE_REGULAR_STORES=1): why the last storeImport call returned the ordinary
+// import (1 unregistered, 2 alias, 3 lead or alignment, 4 failed this epoch, 5 pointer held, 6 limit,
+// 7 creation failed).
+int lastStoreRefusal = 0;
+
 const HostImport* storeImport(const Context& context, HostImports& state, const HostImport& regular, std::uint64_t begin, std::uint64_t end) {
 #ifdef _WIN32
+    lastStoreRefusal = regular.store ? 0 : regular.registeredBytes == 0 ? 1 : regular.alias != nullptr ? 2 : 0;
     if (regular.registeredBytes == 0 || regular.alias != nullptr || regular.store) return &regular;
     if (auto* found = coveringStore(state, begin, end)) {
         found->lastUse = ++state.useCounter;
@@ -5051,9 +5057,9 @@ const HostImport* storeImport(const Context& context, HostImports& state, const 
         ++state.storesRefused;
         return &regular;
     };
-    if (regular.lead != 0 || base % alignment != 0 || bytes % alignment != 0 || context.settleQueue == VK_NULL_HANDLE || context.settleQueueMutex == nullptr) return refuse();
+    if (regular.lead != 0 || base % alignment != 0 || bytes % alignment != 0 || context.settleQueue == VK_NULL_HANDLE || context.settleQueueMutex == nullptr) return lastStoreRefusal = 3, refuse();
     if (const auto failed = state.storeFailures.find({base, bytes}); failed != state.storeFailures.end()) {
-        if (failed->second == state.epoch) return refuse();
+        if (failed->second == state.epoch) return lastStoreRefusal = 4, refuse();
         state.storeFailures.erase(failed);
     }
     // A shorter store import at the same base gives way, unless a build holds its pointer.
@@ -5064,14 +5070,14 @@ const HostImport* storeImport(const Context& context, HostImports& state, const 
             same->second.lastUse = ++state.useCounter;
             return &same->second;
         }
-        if (pointerHeld(state, same->second)) return refuse();
+        if (pointerHeld(state, same->second)) return lastStoreRefusal = 5, refuse();
         auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.storeImports.extract(same));
         if (auto* recorder = Recorder::Active()) recorder->KeepThroughHold(std::move(holder));
         ++state.storesRetired;
         bumpEpoch(state);
     }
     if (state.storeImports.size() >= storeImportLimit) trimStoreImports(state);
-    if (state.storeImports.size() >= storeImportLimit) return refuse();
+    if (state.storeImports.size() >= storeImportLimit) return lastStoreRefusal = 6, refuse();
     HostImport entry{base, bytes, VK_NULL_HANDLE, VK_NULL_HANDLE, 0};
     entry.range = regular.range;
     entry.ranges = regular.ranges;
@@ -5099,7 +5105,7 @@ const HostImport* storeImport(const Context& context, HostImports& state, const 
         static std::uint32_t reported = 0;
         if (reported++ < 8) std::fprintf(stderr, "[gpu] store import of 0x%llx+0x%llx failed at %s (%d); its stores go through the import of 0x%llx+0x%llx\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), step, static_cast<int>(result), static_cast<unsigned long long>(regular.base), static_cast<unsigned long long>(regular.bytes));
         state.storeFailures.insert_or_assign(std::pair{base, bytes}, state.epoch);
-        return refuse();
+        return lastStoreRefusal = 7, refuse();
     }
     entry.registeredBase = base;
     entry.registeredBytes = bytes;
@@ -5127,7 +5133,16 @@ const HostImport* StoreImportFor(const Context& context, std::uint64_t address, 
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     const auto* regular = lockedImportFor(context, state, address, bytes, requester);
-    return regular != nullptr ? storeImport(context, state, *regular, address, address + bytes) : nullptr;
+    const auto* store = regular != nullptr ? storeImport(context, state, *regular, address, address + bytes) : nullptr;
+    static const bool traceRegular = std::getenv("APS5_TRACE_REGULAR_STORES") != nullptr;
+    if (traceRegular && (store == nullptr || !store->store)) {
+        static std::atomic<std::uint32_t> reports{0};
+        if (reports.fetch_add(1, std::memory_order_relaxed) < 400) {
+            std::fprintf(stderr, "[regular-store] 0x%llx+0x%zx: %s, reason %d; import 0x%llx+0x%llx lead %llu%c", static_cast<unsigned long long>(address), bytes, regular == nullptr ? "no import" : "ordinary import", regular == nullptr ? -1 : lastStoreRefusal,
+                static_cast<unsigned long long>(regular != nullptr ? regular->base : 0), static_cast<unsigned long long>(regular != nullptr ? regular->bytes : 0), static_cast<unsigned long long>(regular != nullptr ? regular->lead : 0), 10);
+        }
+    }
+    return store;
 }
 
 const HostImport* StoreTargetAt(const Context& context, std::uint64_t importBase, std::uint64_t importLead, std::span<VkBufferCopy> copies) {

@@ -316,6 +316,25 @@ buffer regions often span two mappings and no single import served them. Found a
   open. Tests 1,809 of 1,809 with the traps on and off (one suite run had 8 tests time out
   together, all pass alone; `agc_driver_dumped_constant_capture` failed once with traps and
   section A on, 20 of 20 alone).
+- Label read traps, **default on Windows since 2026-11-15** (user; `APS5_NO_LABEL_READ_TRAP=1`
+  stores at labels as before). What made AoM slow with them, found with counters
+  (`APS5_TRACE_ARMED_OPENS=1`, `APS5_TRACE_REGULAR_STORES=1`, the `[read-trap]` lines):
+  - A protection change cannot span two allocations, so the arena refused AoM's 31.6 MiB
+    linear surface every time; traps are set region by region now.
+  - The store import made before a trap got in the way of that surface's own stores (same
+    base, other length, pointer held), which then went through the ordinary import and opened
+    the 4 GiB import group 108 to 120 times per run (137 to 152 GiB opened). The driver asks
+    the arena first (`CanTrapReads`).
+  - A pending neighbour or alias in the same pages kept a surface from being trapped (the
+    macOS rule); AoM's large linear surfaces have aliases, so they were stored at every label.
+    On Windows only an image being flushed blocks a trap (`APS5_LABEL_READ_TRAP_ALONE=1`
+    applies the old rule).
+  AoM with traps / without, per run: stored at labels 0 / 11 to 12 GiB per 10 s; import groups
+  opened by ordinary stores 3 / 3; arms 14.7 k / 15.5 k; collect walks 51 k / 163 k; armed at
+  submissions 1.2 / 2.8 GiB. Frame p50, three clean pairs: 144.3 / 147.9, 153.7 / 163.3,
+  142.4 / 145.2 ms. The picture is right. 007, FF and LEGO were not timed again on this build
+  (equal on the build before these fixes). Tests 1,809 of 1,809 with the traps on and off,
+  section A on and off.
 - What step 2 can still remove, from the `[storage]` lines (10 s of the scene):
   - 007 with unit shadows: 28.8 GiB retiled into shadows, 22.5 GiB detiled from them, 7.0 GiB
     published to host memory (5.5 GiB for "written buffer range", 0.9 GiB upload, 0.6 GiB

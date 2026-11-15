@@ -58,9 +58,13 @@ bool GuestArenaSetReadTrapResolver_nid_no_patch(void (*resolve)(std::uintptr_t b
 void GuestArenaSetReadTrapBypass_nid_no_patch(bool (*bypass)());
 bool GuestArenaTrapReads_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaReadTraps_nid_no_patch(std::uintptr_t address, std::size_t bytes, void (*trapped)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context);
+bool GuestArenaCanTrapReads_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 bool GuestArenaReadTrapped_nid_no_patch(std::uintptr_t address);
 void GuestArenaReleaseReads_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 std::size_t GuestArenaReadTrapCounts_nid_no_patch(std::uint64_t* values, std::size_t count);
+// Debug aid (APS5_TRACE_ARMED_OPENS=1): (source line in WindowsMappings.hpp, opens, bytes) triples
+// of the callers that opened armed memory, largest first; returns the values written.
+std::size_t GuestArenaOpenSites_nid_no_patch(std::uint64_t* values, std::size_t count);
 // Called once the libc exception handler is installed: write faults on armed guest memory are then
 // resumed, so collects may arm consumed private and resident memory (section A of the rewrite).
 void GuestArenaEnableWriteFaults_nid_no_patch();

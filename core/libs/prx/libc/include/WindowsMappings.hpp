@@ -411,6 +411,17 @@ public:
         trapBypass.store(bypass, std::memory_order_release);
     }
 
+    // Whether TrapReads would set (or already holds) a trap over the range now. A caller that must
+    // prepare something before trapping (the driver's store import) asks first.
+    bool CanTrapReads(std::uintptr_t begin, std::uintptr_t end) {
+        if (end <= begin || trapResolver.load(std::memory_order_acquire) == nullptr) return false;
+        const auto first = begin & ~trapPageMask;
+        const auto last = (end + trapPageMask) & ~trapPageMask;
+        std::lock_guard lock(mutex);
+        if (hasTrap(begin, end)) return true;
+        return !overlapsOwnedRange(ownedHostAccess, first, last) && !overlapsOwnedRange(unusedImports, first, last) && !overlaps(unarmable, first, last) && trappable(first, last);
+    }
+
     bool TrapReads(std::uintptr_t begin, std::uintptr_t end) {
         if (end <= begin || trapResolver.load(std::memory_order_acquire) == nullptr) return false;
         const auto first = begin & ~trapPageMask;
@@ -423,8 +434,18 @@ public:
         // An armed page stays armed and clean under the trap (the CPU cannot write it without a
         // fault either) and is read-only again when the trap goes. Dropping that state made every
         // trap open its import group: Age of Mythology walked and armed memory again each frame.
-        DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(first), last - first, PAGE_NOACCESS, &previous)) return false;
+        // Region by region: one protection change cannot span two allocations (Age of Mythology's
+        // 31.6 MiB linear surface does). A failure part way restores what was closed.
+        for (auto at = first; at < last;) {
+            const auto memory = query(at);
+            const auto regionEnd = std::min(last, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+            DWORD previous;
+            if (memory.Protect != PAGE_NOACCESS && !VirtualProtect(reinterpret_cast<void*>(at), regionEnd - at, PAGE_NOACCESS, &previous)) {
+                if (at > first) untrap(first, at);
+                return false;
+            }
+            at = regionEnd;
+        }
         // Nothing else changes: the armed record of the pages stays as it was, and their import
         // group is not marked for another look (arming works around trapped pages). Marking it
         // made the tracker open Age of Mythology's 272 MiB group at every trap, because one block
@@ -484,6 +505,26 @@ public:
         if (found == last) return;
         traps.erase(found);
         untrap(begin, end);
+    }
+
+    // Debug aid (APS5_TRACE_ARMED_OPENS=1): armed memory opened, by the source line of the caller
+    // in this file, as (line, opens, bytes) triples, largest first.
+    static bool countOpenSites() {
+        static const bool enabled = std::getenv("APS5_TRACE_ARMED_OPENS") != nullptr;
+        return enabled;
+    }
+
+    std::size_t OpenSites(std::uint64_t* values, std::size_t count) {
+        std::lock_guard lock(mutex);
+        std::vector<std::array<std::uint64_t, 3>> rows;
+        for (const auto& [site, entry] : openSites) rows.push_back({static_cast<std::uint64_t>(site), entry.first, entry.second});
+        std::sort(rows.begin(), rows.end(), [](const auto& left, const auto& right) { return left[2] > right[2]; });
+        std::size_t written = 0;
+        for (const auto& row : rows) {
+            if (written + 3 > count) break;
+            for (const auto value : row) values[written++] = value;
+        }
+        return written;
     }
 
     // Sets, faults parked for the resolver, faults opened at once (bypass or resolver), resolver calls.
@@ -1972,9 +2013,9 @@ private:
 
     // Every armed range is also clean, so whatever ends a range's clean state (a fault, a host
     // write, a pin, a protection change, a release) opens its armed part as well.
-    void forgetClean(std::uintptr_t start, std::uintptr_t end) {
+    void forgetClean(std::uintptr_t start, std::uintptr_t end, int site = __builtin_LINE()) {
         forget(cleanRanges, start, end);
-        openArmed(start, end);
+        openArmed(start, end, site);
     }
 
     // GetTickCount64 at the latest BeginSubmit (0 before the first): the stall watchdog reads it.
@@ -2663,8 +2704,16 @@ private:
     std::uint64_t submitHeldMaxUs = 0;
     std::uint64_t checksFailed = 0;
 
-    void openArmed(std::uintptr_t start, std::uintptr_t end) {
+    // `site` is the source line of the caller (debug aid: OpenSites names who opens armed memory).
+    void openArmed(std::uintptr_t start, std::uintptr_t end, int site = __builtin_LINE()) {
         if (!overlaps(armedRanges, start, end)) return;
+        if (countOpenSites()) {
+            auto& entry = openSites[site];
+            ++entry.first;
+            auto it = armedRanges.lower_bound(start);
+            if (it != armedRanges.begin() && std::prev(it)->second > start) --it;
+            for (; it != armedRanges.end() && it->first < end; ++it) entry.second += std::min(end, it->second) - std::max(start, it->first);
+        }
         armedOpens.fetch_add(1, std::memory_order_release);
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> opened;
         auto it = armedRanges.lower_bound(start);
@@ -3202,6 +3251,7 @@ private:
     std::vector<TrapResolving> trapsResolving;
     std::vector<TrapResolving> trapsDeferred;
     std::vector<std::uintptr_t> trapsHanded;
+    std::map<int, std::pair<std::uint64_t, std::uint64_t>> openSites;
     Ranges everTrapped;
     std::array<TrapSlot, 16> trapSlots;
     HANDLE trapWake = nullptr;

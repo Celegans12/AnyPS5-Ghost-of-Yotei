@@ -5057,6 +5057,8 @@ struct TrapReadBack {
 std::mutex trapReadBackMutex;
 std::unordered_map<std::uint64_t, TrapReadBack> trapReadBacks;
 std::atomic<std::uint64_t> trapResolves{0};
+std::atomic<std::uint64_t> trapOutcomes[7] = {};
+std::atomic<std::uint64_t> trapOutcomeBytes[7] = {};
 
 void NoteTrapReadBack(std::uint64_t begin) {
     const auto now = std::chrono::steady_clock::now();
@@ -5086,13 +5088,10 @@ void ResolveLabelTrap(std::uintptr_t begin, std::uintptr_t end) {
 
 bool LabelTrapsEnabled() {
     static const bool enabled = [] {
-#if defined(_WIN32)
-        // On Windows the traps are built but not a gain yet, so they are opt-in
-        // (APS5_LABEL_READ_TRAP=1): 007 First Light, FF and LEGO measure the same with them, and
-        // Age of Mythology's title screen is 172 ms per frame against 142 (hardly any faults:
-        // about 5 traps set per second, none parked; the cost is in what stays pending).
-        if (std::getenv("APS5_LABEL_READ_TRAP") == nullptr) return false;
-#endif
+        // On by default (on Windows while section A arms memory; the resolver cannot be set
+        // otherwise). Age of Mythology's title screen stores 10 GiB per 10 s at labels without the
+        // traps and nothing with them: 142 to 154 ms per frame against 145 to 163.
+        // APS5_NO_LABEL_READ_TRAP=1 stores at labels as before.
         if (std::getenv("APS5_NO_LABEL_READ_TRAP") != nullptr || !GuestWriteWatch::GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveLabelTrap)) return false;
         GuestWriteWatch::GuestWriteWatchSetReadTrapBypass_nid_postfix(+[] { return GuestMemory::GpuMutex().HeldByThisThread(); });
         return true;
@@ -5758,10 +5757,23 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
         // Profile line (APS5_PROFILE_DRAW=1), every 10 s: what the read traps did.
         static const bool profileTraps = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         static auto nextTrapReport = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        static const bool traceOpens = std::getenv("APS5_TRACE_ARMED_OPENS") != nullptr;
+        if (traceOpens && std::chrono::steady_clock::now() >= nextTrapReport) {
+            std::uint64_t rows[18]{};
+            const auto written = GuestArena::GuestArenaOpenSites_nid_no_patch(rows, 18);
+            std::string text;
+            for (std::size_t at = 0; at + 3 <= written; at += 3) text += " line " + std::to_string(rows[at]) + ": " + std::to_string(rows[at + 1]) + " opens " + std::to_string(rows[at + 2] >> 20) + " MiB;";
+            std::fprintf(stderr, "[armed-opens] cumulative, by caller line in WindowsMappings.hpp:%s\n", text.c_str());
+            if (!(trap && profileTraps)) nextTrapReport += std::chrono::seconds(10);
+        }
         if (trap && profileTraps && std::chrono::steady_clock::now() >= nextTrapReport) {
             nextTrapReport += std::chrono::seconds(10);
             std::uint64_t counts[4]{};
             GuestArena::GuestArenaReadTrapCounts_nid_no_patch(counts, 4);
+            static const char* const outcomeNames[7] = {"trapped", "in the label's block", "read back recently", "shares a page", "aliased", "no store import", "refused by the arena"};
+            std::string outcomes;
+            for (int outcome = 0; outcome < 7; ++outcome) outcomes += std::string(outcome == 0 ? " " : ", ") + outcomeNames[outcome] + " " + std::to_string(trapOutcomes[outcome].load(std::memory_order_relaxed)) + "/" + std::to_string(trapOutcomeBytes[outcome].load(std::memory_order_relaxed) >> 20) + " MiB";
+            std::fprintf(stderr, "[read-trap] surfaces at labels, cumulative (count/MiB):%s%c", outcomes.c_str(), 10);
             std::fprintf(stderr, "[read-trap] cumulative: %llu traps set, %llu faults parked for the resolver, %llu faults opened at once, %llu traps resolved (%llu by the driver's resolver); %zu surfaces stored again after a read-back\n", static_cast<unsigned long long>(counts[0]),
                 static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]), static_cast<unsigned long long>(trapResolves.load(std::memory_order_relaxed)), trapReadBacks.size());
         }
@@ -5774,6 +5786,9 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
         // memory armed in the meantime opens the whole import group at that submission.
         const auto trapStoreReady = [&](const StorageTexture* texture) {
 #if defined(_WIN32)
+            // Only for a surface the arena would trap: a store import made for one it refuses
+            // gets in the way of that surface's own stores (same base, other length).
+            if (!texture->readTrapped.load(std::memory_order_acquire) && !GuestArena::GuestArenaCanTrapReads_nid_no_patch(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) return false;
             const auto* store = StoreImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
             return store != nullptr && store->store;
 #else
@@ -5797,6 +5812,15 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
             const auto bytes = static_cast<std::size_t>(((texture->descriptor.baseAddress + texture->guestBytes + page - 1) & ~(page - 1)) - first);
             const auto shares = [&](const StorageTexture* other) { return other != texture && other->overlaps(first, bytes); };
             const auto sharesStored = [&](const StorageTexture* other) { return shares(other) && (other->descriptor.tileMode == TextureTileMode::kLinear || other->guestBytes <= SmallStoreBytes); };
+#if defined(_WIN32)
+            // On Windows a pending neighbour or alias in the same pages does not keep a surface
+            // from being trapped: a GPU store lands in no-access pages, and a flush of the other
+            // image takes the trapped images it overlaps with it. Age of Mythology's large linear
+            // surfaces have such aliases and were stored at every label (10 GiB per 10 s).
+            // Debug aid: APS5_LABEL_READ_TRAP_ALONE=1 applies the rule again.
+            static const bool alone = std::getenv("APS5_LABEL_READ_TRAP_ALONE") != nullptr;
+            if (!alone) return std::any_of(pending.flushing.begin(), pending.flushing.end(), shares);
+#endif
             return std::any_of(pending.textures.begin(), pending.textures.end(), sharesStored) || std::any_of(pending.flushing.begin(), pending.flushing.end(), shares);
         };
 #endif
@@ -5804,9 +5828,25 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
             if (texture->descriptor.tileMode != TextureTileMode::kLinear && texture->guestBytes > SmallStoreBytes) continue;
 #if defined(__APPLE__) || defined(_WIN32)
             static const bool dryTraps = std::getenv("APS5_LABEL_READ_TRAP_DRY") != nullptr;
-            if (trap && !dryTraps && !sharesLabelBlock(texture) && !TrapReadBackRecently(texture->descriptor.baseAddress) && !sharesPage(texture) && (texture->readTrapped.load(std::memory_order_acquire) || !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) && trapStoreReady(texture) && GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) {
-                texture->readTrapped.store(true, std::memory_order_release);
-                continue;
+            // Why a surface is stored instead of trapped, counted for the [read-trap] line (count
+            // and bytes): 0 trapped, 1 in the label's block, 2 read back recently, 3 shares a page
+            // with a stored surface, 4 aliased direct memory, 5 no store import, 6 the arena refused.
+            const auto trapOutcome = [&] {
+                if (sharesLabelBlock(texture)) return 1;
+                if (TrapReadBackRecently(texture->descriptor.baseAddress)) return 2;
+                if (sharesPage(texture)) return 3;
+                if (!texture->readTrapped.load(std::memory_order_acquire) && DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) return 4;
+                if (!trapStoreReady(texture)) return 5;
+                return GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes)) ? 0 : 6;
+            };
+            if (trap && !dryTraps) {
+                const auto outcome = trapOutcome();
+                trapOutcomes[outcome].fetch_add(1, std::memory_order_relaxed);
+                trapOutcomeBytes[outcome].fetch_add(texture->guestBytes, std::memory_order_relaxed);
+                if (outcome == 0) {
+                    texture->readTrapped.store(true, std::memory_order_release);
+                    continue;
+                }
             }
 #endif
             ranges.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
