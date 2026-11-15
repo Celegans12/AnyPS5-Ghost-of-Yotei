@@ -35,6 +35,7 @@ struct Counters {
     std::atomic<std::uint64_t> streamedBytes{0};
     std::atomic<std::uint64_t> streamSwitches{0};
     std::atomic<std::uint64_t> streamReturns{0};
+    std::atomic<std::uint64_t> edgePages{0};
     std::atomic<std::uint64_t> heldBytes{0};
     std::array<std::atomic<std::uint64_t>, BufferCache::Refusals> refused{};
     std::array<std::atomic<std::uint64_t>, BufferCache::UnarmedReasons> unarmed{};
@@ -49,7 +50,7 @@ void add(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
     counter.fetch_add(amount, std::memory_order_relaxed);
 }
 
-constexpr std::array<const char*, BufferCache::Refusals> RefusalNames{"range", "alignment", "gpu write", "untracked", "unmapped", "busy", "span", "budget", "allocation", "raced", "streamed"};
+constexpr std::array<const char*, BufferCache::Refusals> RefusalNames{"range", "alignment", "gpu write", "untracked", "unmapped", "busy", "span", "budget", "allocation", "raced", "streamed", "label"};
 
 constexpr std::array<const char*, BufferCache::UnarmedReasons> UnarmedNames{"armed", "held", "imported", "barred", "resting", "edge", "other"};
 
@@ -318,6 +319,7 @@ BufferCache::Counts BufferCache::Counted() {
     counts.streamedBytes = held.streamedBytes.load(std::memory_order_relaxed);
     counts.streamSwitches = held.streamSwitches.load(std::memory_order_relaxed);
     counts.streamReturns = held.streamReturns.load(std::memory_order_relaxed);
+    counts.edgePages = held.edgePages.load(std::memory_order_relaxed);
     counts.heldBytes = held.heldBytes.load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < Refusals; ++reason) counts.refused[reason] = held.refused[reason].load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < UnarmedReasons; ++reason) counts.unarmed[reason] = held.unarmed[reason].load(std::memory_order_relaxed);
@@ -358,6 +360,11 @@ std::string BufferCache::Report() {
         char stream[224];
         std::snprintf(stream, sizeof(stream), "[buffer-cache] stream (10 s): %llu ranges copied to the per-frame stream (%.1f MiB), %llu blocks left to it, %llu taken back\n", since(now.streamed, reported.streamed), static_cast<double>(now.streamedBytes - reported.streamedBytes) / 1048576.0, since(now.streamSwitches, reported.streamSwitches), since(now.streamReturns, reported.streamReturns));
         text += stream;
+    }
+    if (now.edgePages != reported.edgePages) {
+        char edges[128];
+        std::snprintf(edges, sizeof(edges), "[buffer-cache] edges (10 s): %llu pages shared with a pending GPU write compared in part\n", since(now.edgePages, reported.edgePages));
+        text += edges;
     }
     reported = now;
     return text;
@@ -479,7 +486,7 @@ bool BufferCache::pending(std::uint64_t serial) {
     return true;
 }
 
-BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial) {
+BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial, bool partialHead, bool partialTail) {
     auto& counted = counters();
     add(counted.lookups);
     if (bytes == 0 || from >= bytes || address >= AddressLimit || bytes > AddressLimit - address) return Refuse(Refusal::Range);
@@ -533,6 +540,7 @@ BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes,
         if (streamed) return leave();
     }
     pendingFloor = std::numeric_limits<std::uint64_t>::max();
+    const auto shared = [&](std::uint64_t page) { return (partialHead && page == first) || (partialTail && page + PageBytes == stop); };
     std::uint64_t newest = 0;
     std::uint64_t copiedPages = 0;
     for (std::size_t block = 0; block < blocks; ++block) {
@@ -549,6 +557,24 @@ BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes,
             }
             const auto guest = base + page * PageBytes;
             const auto index = static_cast<std::size_t>((guest - mirror->begin) / PageBytes);
+            if (shared(guest)) {
+                const auto low = std::max(guest, address + from);
+                const auto high = std::min(guest + PageBytes, end);
+                const auto length = static_cast<std::size_t>(high - low);
+                auto* part = mirror->backing.bytes + (low - mirror->begin);
+                const auto compared = GuestMemory::CompareMapped(low, std::span<const std::byte>(part, length));
+                if (compared == GuestMemory::Compare::Unmapped) return Refuse(Refusal::Unmapped);
+                if (compared == GuestMemory::Compare::Differs) {
+                    if (pending(mirror->bound[index])) return Refuse(Refusal::Busy);
+                    if (GuestMemory::CopyMapped(low, std::span<std::byte>(part, length)) != GuestMemory::Compare::Equal) return Refuse(Refusal::Unmapped);
+                    add(counted.bytes, length);
+                    ++copiedPages;
+                    copied = true;
+                }
+                add(counted.edgePages);
+                ++page;
+                continue;
+            }
             auto* target = mirror->backing.bytes + (guest - mirror->begin);
             if (pending(mirror->bound[index])) {
                 const auto compared = GuestMemory::CompareMapped(guest, std::span<const std::byte>(target, static_cast<std::size_t>(PageBytes)));
@@ -560,7 +586,7 @@ BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes,
                 continue;
             }
             auto run = page + 1;
-            while (run < stopPage && ((granule.valid >> run) & 1u) == 0 && !pending(mirror->bound[index + (run - page)])) ++run;
+            while (run < stopPage && ((granule.valid >> run) & 1u) == 0 && !shared(base + run * PageBytes) && !pending(mirror->bound[index + (run - page)])) ++run;
             const auto length = static_cast<std::size_t>(run - page) * static_cast<std::size_t>(PageBytes);
             if (GuestMemory::CopyMapped(guest, std::span<std::byte>(target, length)) != GuestMemory::Compare::Equal) return Refuse(Refusal::Unmapped);
             for (auto bit = page; bit < run; ++bit) granule.valid = static_cast<std::uint16_t>(granule.valid | (1u << bit));

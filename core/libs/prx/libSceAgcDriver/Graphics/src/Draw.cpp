@@ -1786,17 +1786,9 @@ BufferCache::View streamedDrawInput(Recorder& recorder, std::uint64_t address, s
 
 BufferCache::View cachedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t from, std::size_t alignment) {
     auto* recorder = context.recorder;
-    auto* cache = recorder != nullptr ? recorder->Buffers() : nullptr;
-    if (cache == nullptr || bytes == 0 || from >= bytes) return {};
-    if (alignment > 1 && (address % BufferCache::ZoneBytes) % alignment != 0) return cache->Refuse(BufferCache::Refusal::Alignment);
-    const auto first = (address + from) & ~(BufferCache::PageBytes - 1);
-    const auto stop = (address + bytes + BufferCache::PageBytes - 1) & ~(BufferCache::PageBytes - 1);
-    const auto reach = static_cast<std::size_t>(stop - first);
-    if (recorder->PendingWriteOverlaps(first, reach) || recorder->PendingLabelIn(first, reach) || recorder->QueuedStoreOverlaps(first, reach) || recorder->QueuedKeyStoreOverlaps(first, reach)) return cache->Refuse(BufferCache::Refusal::GpuWrite);
-    GuestMemory::FlushGpuWrites(first, reach);
-    auto view = cache->Acquire(address, bytes, from, recorder->OpenSerial());
+    if (recorder == nullptr) return {};
+    auto view = CachedRange(*recorder, address, bytes, from, alignment);
     if (!view && view.streamed) return streamedDrawInput(*recorder, address, bytes, from);
-    if (view && BufferCache::Verifying()) cache->Verify(view, address, bytes, from);
     return view;
 }
 

@@ -329,6 +329,29 @@ void VerificationTellsALostWriteFromALaterOne(Harness& harness, std::uint64_t ba
     Require(BufferCache::Counted().verifyRaces == before.verifyRaces + 1, "a mirror behind a write reported after its upload failed its verification");
 }
 
+void PageSharedWithAPendingWriteIsComparedInPart(Harness& harness, std::uint64_t base) {
+    const auto page = base + 24 * Granule + Page;
+    const auto address = page + 100;
+    const std::size_t bytes = 2 * Page;
+    Fill(page, 4 * Page, 95);
+    harness.writes.Note(page, 4 * Page);
+    auto before = BufferCache::Counted();
+    const auto beside = harness.cache.Acquire(address, bytes, 0, harness.serial, true, false);
+    auto after = BufferCache::Counted();
+    Require(beside && Same(beside, address, bytes), "a range beside a pending write was not served its own bytes");
+    Require(after.pages == before.pages + 2 && after.edgePages == before.edgePages + 1, "the page shared with a pending write was uploaded whole");
+    Require(std::memcmp(beside.bytes - 100, At(page), 100) != 0, "the bytes a pending write covers were read into the mirror");
+    before = after;
+    const auto again = harness.cache.Acquire(address, bytes, 0, harness.serial, true, false);
+    after = BufferCache::Counted();
+    Require(again && after.pages == before.pages && after.bytes == before.bytes && after.edgePages == before.edgePages + 1, "an unchanged shared page was copied again");
+    harness.Finish();
+    before = after;
+    const auto whole = harness.Acquire(address, bytes);
+    after = BufferCache::Counted();
+    Require(whole && after.pages == before.pages + 1 && std::memcmp(whole.bytes - 100, At(page), 100) == 0, "the shared page was not uploaded whole once the write beside it was over");
+}
+
 void VolatileBlocksAreLeftToTheStream(Harness& harness, std::uint64_t base) {
     const auto address = base + 18 * Granule + 12;
     const std::size_t bytes = Page;
@@ -551,6 +574,7 @@ int main() {
         RefusalsLeaveTheRangeToTheCaller(harness, base);
         DerivedValuesLastUntilAnUpload(harness, base);
         VerificationTellsALostWriteFromALaterOne(harness, base);
+        PageSharedWithAPendingWriteIsComparedInPart(harness, base);
         VolatileBlocksAreLeftToTheStream(harness, base);
         if (GuestMemory::Watched(base, bytes)) {
             TrackedWritesReachTheMirror(base);

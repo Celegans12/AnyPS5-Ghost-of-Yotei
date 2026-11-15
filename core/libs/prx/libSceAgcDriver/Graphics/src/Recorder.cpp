@@ -4868,6 +4868,36 @@ bool Recorder::ExecutedThrough(std::uint64_t serial) const {
     return true;
 }
 
+BufferCache::View CachedRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t from, std::size_t alignment) {
+    auto* cache = recorder.Buffers();
+    if (cache == nullptr || bytes == 0 || from >= bytes) return {};
+    if (alignment > 1 && (address % BufferCache::ZoneBytes) % alignment != 0) return cache->Refuse(BufferCache::Refusal::Alignment);
+    const auto begin = address + from;
+    const auto end = address + bytes;
+    const auto first = begin & ~(BufferCache::PageBytes - 1);
+    const auto stop = (end + BufferCache::PageBytes - 1) & ~(BufferCache::PageBytes - 1);
+    const auto written = [&](std::uint64_t low, std::uint64_t high) { return high > low && recorder.PendingWriteOverlaps(low, static_cast<std::size_t>(high - low)); };
+    const auto stored = [&](std::uint64_t low, std::uint64_t high) {
+        if (high <= low) return false;
+        const auto size = static_cast<std::size_t>(high - low);
+        return recorder.PendingLabelIn(low, size) || recorder.QueuedStoreOverlaps(low, size) || recorder.QueuedKeyStoreOverlaps(low, size);
+    };
+    bool partialHead = false;
+    bool partialTail = false;
+    if (written(first, stop) || stored(first, stop)) {
+        if (written(begin, end)) return cache->Refuse(BufferCache::Refusal::GpuWrite);
+        if (stored(begin, end)) return cache->Refuse(BufferCache::Refusal::Label);
+        partialHead = written(first, begin) || stored(first, begin);
+        partialTail = written(end, stop) || stored(end, stop);
+    }
+    const auto flushBegin = partialHead ? begin : first;
+    const auto flushEnd = partialTail ? end : stop;
+    GuestMemory::FlushGpuWrites(flushBegin, static_cast<std::size_t>(flushEnd - flushBegin));
+    auto view = cache->Acquire(address, bytes, from, recorder.OpenSerial(), partialHead, partialTail);
+    if (view && BufferCache::Verifying()) cache->Verify(view, address, bytes, from);
+    return view;
+}
+
 Recorder::UploadSlice Recorder::DrawInputUpload(std::size_t bytes) {
     constexpr VkDeviceSize alignment = 16;
     auto offset = (drawInputUploadUsed + alignment - 1) & ~(alignment - 1);

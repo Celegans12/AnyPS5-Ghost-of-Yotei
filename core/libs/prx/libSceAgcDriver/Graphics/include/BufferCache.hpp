@@ -57,7 +57,7 @@ public:
     using Allocate = std::function<Backing(std::size_t bytes)>;
     using Executed = std::function<bool(std::uint64_t serial)>;
 
-    enum class Refusal : std::uint8_t { Range, Alignment, GpuWrite, Untracked, Unmapped, Busy, Span, Budget, Allocation, Raced, Streamed, Count };
+    enum class Refusal : std::uint8_t { Range, Alignment, GpuWrite, Untracked, Unmapped, Busy, Span, Budget, Allocation, Raced, Streamed, Label, Count };
     static constexpr std::size_t Refusals = static_cast<std::size_t>(Refusal::Count);
 
     struct View {
@@ -98,6 +98,7 @@ public:
         std::uint64_t streamedBytes = 0;
         std::uint64_t streamSwitches = 0;
         std::uint64_t streamReturns = 0;
+        std::uint64_t edgePages = 0;
         std::uint64_t heldBytes = 0;
         std::array<std::uint64_t, Refusals> refused{};
         std::array<std::uint64_t, UnarmedReasons> unarmed{};
@@ -119,7 +120,7 @@ public:
     static const char* RefusalName(Refusal reason);
     static std::string Report();
 
-    View Acquire(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial);
+    View Acquire(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial, bool partialHead = false, bool partialTail = false);
     View Refuse(Refusal reason);
     void Invalidate(std::uint64_t address, std::size_t bytes);
     void Verify(const View& view, std::uint64_t address, std::size_t bytes, std::size_t from);
@@ -185,6 +186,10 @@ private:
     std::uint64_t executedFloor = 0;
     std::uint64_t pendingFloor = 0;
 };
+
+class Recorder;
+
+BufferCache::View CachedRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t from, std::size_t alignment);
 
 }
 
