@@ -418,6 +418,8 @@ struct HostImports {
     std::map<std::uint64_t, std::uint64_t> sparseRunEnds;
     std::map<std::uint64_t, std::uint32_t> sparseRunJoins;
     std::set<std::pair<std::uint64_t, std::size_t>> importedAtMap;
+    std::uint64_t mapDeferred = 0;
+    std::uint64_t mapDeferredBytes = 0;
     std::map<std::pair<std::uint64_t, std::uint64_t>, ImportFailure> failedBlocks;
     std::map<std::pair<std::uint64_t, std::uint64_t>, ImportRefusal> refusals;
     std::map<std::pair<std::uint64_t, std::uint64_t>, EvictingRefusal> evictingRefusals;
@@ -4866,7 +4868,16 @@ const char* ImportRequesterName(ImportRequester requester) {
 HostImportCounts HostImportCounters() {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
-    return {state.imports.size(), state.liveBytes, state.counts, state.growth.size(), state.budgetChecks, retiredPinnedBytes.load(std::memory_order_acquire)};
+    HostImportCounts counts;
+    counts.live = state.imports.size();
+    counts.liveBytes = state.liveBytes;
+    counts.requesters = state.counts;
+    counts.growing = state.growth.size();
+    counts.budgetChecks = state.budgetChecks;
+    counts.retiredPinnedBytes = retiredPinnedBytes.load(std::memory_order_acquire);
+    counts.mapDeferred = state.mapDeferred;
+    counts.mapDeferredBytes = state.mapDeferredBytes;
+    return counts;
 }
 
 std::string FormatHostImportCounts(const HostImportCounts& counts) {
@@ -4890,6 +4901,11 @@ std::string FormatHostImportCounts(const HostImportCounts& counts) {
         char pinned[64];
         std::snprintf(pinned, sizeof(pinned), "; %.1f MiB retired and still pinned", counts.retiredPinnedBytes / 1048576.0);
         requesters += pinned;
+    }
+    if (counts.mapDeferred != 0) {
+        char deferred[96];
+        std::snprintf(deferred, sizeof(deferred), "; %llu mappings left to their first use (%.1f MiB)", static_cast<unsigned long long>(counts.mapDeferred), counts.mapDeferredBytes / 1048576.0);
+        requesters += deferred;
     }
     return text + requesters;
 }
@@ -5049,6 +5065,11 @@ std::shared_ptr<HostImport> UnregisteredHostImport(const Context& context, std::
     return std::shared_ptr<HostImport>(holder, &holder->node.mapped());
 }
 
+bool LazyMapImports() {
+    static const bool lazy = std::getenv("APS5_LAZY_MAP_IMPORTS") != nullptr;
+    return lazy;
+}
+
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
     if (context.hostImportAlignment == 0) return true;
     ensurePinWaiter();
@@ -5067,6 +5088,11 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
     for (const auto& mapped : ranges) {
         const auto range = mapped.lock();
         if (range == nullptr || range->bytes <= 0x10000) continue;
+        if (LazyMapImports()) {
+            ++state.mapDeferred;
+            state.mapDeferredBytes += range->bytes;
+            continue;
+        }
         if (current.empty()) current = GuestAllocations::GuestAllocationsAcquireMapped_nid_no_patch(ranges);
         if (leasedRangeOwner(current, range->address) != range) continue;
         try {

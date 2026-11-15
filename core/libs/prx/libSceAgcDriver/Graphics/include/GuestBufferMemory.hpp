@@ -112,6 +112,8 @@ struct HostImportCounts {
     std::uint64_t growing = 0;
     std::uint64_t budgetChecks = 0;
     std::uint64_t retiredPinnedBytes = 0;
+    std::uint64_t mapDeferred = 0;
+    std::uint64_t mapDeferredBytes = 0;
 };
 
 const char* ImportRequesterName(ImportRequester requester);
@@ -159,6 +161,7 @@ HostImportSettleCounts HostImportSettles();
 // Tests: how many imports settleImport has used on the settle queue.
 std::uint64_t HostImportsSettled();
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
+bool LazyMapImports();
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
 // made outside the device lock (a sampled texture's path, a dispatch's pre-sync); the path taken
