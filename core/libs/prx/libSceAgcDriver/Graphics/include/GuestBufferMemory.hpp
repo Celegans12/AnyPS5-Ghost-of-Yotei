@@ -463,6 +463,15 @@ public:
         return false;
     }
     void MarkStagedWrites() const;
+    // A staging shadow, shared by the builds that stage the same guest range. `generation`: the
+    // tracker generation up to which the shadow holds what the import holds (0: not known to);
+    // read and written under the device lock.
+    struct StagedShadow {
+        std::shared_ptr<Buffer> buffer;
+        std::atomic<std::uint64_t> generation{0};
+    };
+    // Publishes the regions' `stagedGeneration` to their shadows at the end of a use.
+    void noteStagedRanges(bool deferred) const;
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
@@ -559,6 +568,16 @@ private:
         mutable std::uint64_t copyInGeneration = 0;
         mutable std::uint64_t stagedGeneration = 0;
         bool copyInSkipped = false;
+        // Why the last use left no `stagedGeneration` (profile counters): 1 no copy-in generation,
+        // 2 a block stamped between the copy-in and the use's end, 3 an own store left no stamp,
+        // 4 the use never reached MarkDirectWrites.
+        mutable std::uint8_t stagedRefusal = 4;
+        // The use is inside a run: MarkStagedWrites set `stagedGeneration`, the copy-back follows.
+        mutable bool copyBackDeferred = false;
+        // The copy-in being recorded is a reused build's (RecordStagingCopies).
+        bool reusedCopyIn = false;
+        // The staging shadow `buffer` belongs to, shared with other builds over the same range.
+        std::shared_ptr<StagedShadow> shadow;
         std::shared_ptr<Buffer> shadowCopy;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
