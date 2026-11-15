@@ -10,6 +10,7 @@
 #include <deque>
 #include <exception>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -171,6 +172,14 @@ public:
     static bool Enabled();
     static bool OnFinisherThread();
     static bool Busy() { return outstanding.load(std::memory_order_acquire) != 0; }
+    static constexpr unsigned MaxThreads = 16;
+    static constexpr std::size_t QueueDepth = 16;
+    static unsigned Threads();
+    static bool Defers();
+    static void Defer(Job output, std::vector<Range> reads);
+    bool DeferredReads(std::uint64_t address, std::uint64_t end);
+    static bool Behind();
+    void TakeTurn();
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
     void Drain();
@@ -180,9 +189,27 @@ public:
     void ReleaseRan();
 
 private:
+    struct Slot {
+        Job job;
+        Pending held;
+        std::vector<Job> outputs;
+        std::vector<Range> reads;
+        std::exception_ptr error;
+        DrawPipeline::Order order;
+        std::uint64_t epoch = 0;
+        std::uint64_t sequence = 0;
+        bool alone = false;
+        bool done = false;
+        bool shutdown = false;
+    };
     DrawFinisher() = default;
     void run();
+    void enqueuePooled(Job job, Pending held);
+    void work(unsigned index);
+    void retire(std::unique_lock<std::mutex>& lock);
+    bool startable() const;
     inline static std::atomic<std::size_t> outstanding{0};
+    inline static std::atomic<std::uint64_t> retiredSequence{0};
     std::mutex mutex;
     std::condition_variable wake;
     std::condition_variable idle;
@@ -190,8 +217,17 @@ private:
     std::deque<std::uint64_t> epochs;
     std::deque<DrawPipeline::Order> orders;
     std::deque<Pending> pending;
+    std::deque<std::unique_ptr<Slot>> slots;
     std::vector<Job> ran;
     std::exception_ptr failure;
+    std::vector<std::thread> workers;
+    std::atomic<std::size_t> unstarted{0};
+    std::uint64_t queuedSequence = 0;
+    std::size_t started = 0;
+    unsigned active = 0;
+    unsigned sleepers = 0;
+    bool barrier = false;
+    bool flushing = false;
     bool running = false;
     bool sleeping = false;
     std::thread thread;
@@ -226,6 +262,7 @@ private:
     void rethrowFailure();
 
     std::array<Entry, Capacity> ring{};
+    std::mutex producers;
     alignas(64) std::atomic<std::uint64_t> tail{0};
     std::uint64_t knownHead = 0;
     std::atomic<std::uint64_t> handed{0};
