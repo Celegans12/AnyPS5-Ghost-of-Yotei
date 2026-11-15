@@ -203,7 +203,7 @@ Correction (2026-11-15, later): step 1 below already exists upstream as unit sha
 is written only for host-facing readers). It covers only surfaces at a 64 KiB base. 007's pool
 surfaces are at 4 KiB bases and its pool is mapped in 2 to 48 MiB pieces, so its images and
 buffer regions often span two mappings and no single import served them. Found and changed
-(`libs\e2`, uncommitted, `logs\phase4-e2.diff`):
+(a05fb7e28b, kept by the user, `libs\e2`):
 
 - About 30 buffer regions per frame (2 to 8 MiB) were copied on the CPU, each behind the GPU
   results pending in it (50 to 90 ms per dispatch; 32 GiB read per run). `joinedRun` now joins a
