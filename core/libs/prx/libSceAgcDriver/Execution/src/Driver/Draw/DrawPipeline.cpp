@@ -1085,6 +1085,7 @@ void DrawPipeline::run() {
     StartCommitterSampler();
     static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
     CommitOrder committed;
+    std::uint64_t ordered = 0;
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
@@ -1113,6 +1114,8 @@ void DrawPipeline::run() {
             order = items.front().order;
         }
         if (SharedCollectEpoch()) GuestMemory::AdoptCollectEpoch(epoch);
+        if (!isDraw || epoch != ordered) Graphics::BufferCache::EndDrawRun();
+        ordered = epoch;
         const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::exception_ptr fatal;
         bool failed = false;
@@ -1175,6 +1178,7 @@ void DrawPipeline::ReleaseRetired() {
 void DrawPipeline::Drain(DrainReason reason, std::uint32_t opcode) {
     drainRequests[std::min<std::uint32_t>(opcode, 0x100)].fetch_add(1, std::memory_order_relaxed);
     reasonRequests[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    Graphics::BufferCache::EndDrawRun();
     const bool finisherBusy = DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread();
     if ((finisherBusy || Busy()) && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline drain under the GPU lock (reason " + std::to_string(static_cast<unsigned>(reason)) + ", opcode " + std::to_string(opcode) + ")");
     if (finisherBusy) DrawFinisher::Get().Drain();

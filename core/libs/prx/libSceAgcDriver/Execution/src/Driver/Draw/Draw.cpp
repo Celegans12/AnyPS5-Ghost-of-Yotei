@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <atomic>
@@ -320,7 +321,7 @@ bool FinisherPrecollect() {
 constexpr std::uint64_t FinisherInputPrecollectBytes = 16ull << 20u;
 
 bool FinisherInputPrecollect() {
-    static const bool enabled = std::getenv("APS5_NO_FINISHER_INPUT_PRECOLLECT") == nullptr;
+    static const bool enabled = std::getenv("APS5_NO_FINISHER_INPUT_PRECOLLECT") == nullptr && !Graphics::BufferCache::DirtyFirst();
     return enabled && FinisherPrecollect();
 }
 
@@ -1272,6 +1273,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
         require(tail.queue != nullptr, "the draw finisher reached a draw it cannot commit through the pipeline");
+        Graphics::BufferCache::EndDrawRun();
         if (gpuLock.owns_lock()) return;
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
