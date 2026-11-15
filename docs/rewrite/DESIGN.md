@@ -198,12 +198,35 @@ intermittently under parallel load before that commit; both causes are fixed in 
 - LEGO's storage-upload byte count in that line is not credible (3 GiB per present in 3.2 ms);
   the time is.
 
+Correction (2026-11-15, later): step 1 below already exists upstream as unit shadows
+(`UnitShadow.cpp`: storage write-backs go to device-local slabs, uploads read them, host memory
+is written only for host-facing readers). It covers only surfaces at a 64 KiB base. 007's pool
+surfaces are at 4 KiB bases and its pool is mapped in 2 to 48 MiB pieces, so its images and
+buffer regions often span two mappings and no single import served them. Found and changed
+(`libs\e2`, uncommitted, `logs\phase4-e2.diff`):
+
+- About 30 buffer regions per frame (2 to 8 MiB) were copied on the CPU, each behind the GPU
+  results pending in it (50 to 90 ms per dispatch; 32 GiB read per run). `joinedRun` now joins a
+  run whose mappings are all 2 MiB or larger (`APS5_NO_LARGE_RANGE_JOIN=1` turns it off).
+- About 12 storage-image uploads per frame took the CPU path (guest read plus a waited batch).
+  A surface without block units that several imports serve is now gathered on the GPU into a
+  device-local buffer and detiled from it (`APS5_NO_GATHERED_UPLOAD=1`). With the join in place
+  this only removes the last 72 such uploads per run; frame time is the same with and without it.
+- 007: 142 to 167 ms per frame before its scene change (was 160 to 175) and 180 to 188 after
+  (was 197 to 221), two runs; CPU-copied regions 6,419 to 128 in 40 s. FF 36.2, LEGO 49.1 and
+  50.6, AoM 161.4: unchanged. No errors; tests 1,790 of 1,790 with section A on and off.
+- 007's storage cache sits at its 7.2 GiB budget and makes about 41 images per present: the
+  title allocates the same kind of target at hundreds of addresses in a cycle (1280x720 format
+  36 at 338 addresses). Each new image uploads its whole surface ("first", 231 MiB per present).
+  Not changed.
+
 Build plan that follows from this, in order:
 
 1. Section B for storage images: a device-local copy of the guest ranges that storage images
    exchange. A write-back whose reader is another image goes to that copy, and the upload reads
    it. Host memory is still written (eagerly) at this step. Expected: 007 storage-upload from the
-   import gone (7 ms).
+   import gone (7 ms). Exists for 64 KiB bases (see the correction above); what is left is block
+   units for surfaces at 4 KiB bases.
 2. GPU-owned: blocks whose newest content is in that copy become no-access; a guest or host read
    faults and stores them first. Then the eager write-back to host memory goes (007 9 to 12 ms,
    AoM 7.5 ms, FF 1.1 ms). Needs a read-fault path that can wait for the GPU from a guest thread;
