@@ -551,6 +551,14 @@ private:
         // Whether `copySource` is a store import's buffer or one the arena does not arm.
         bool copySourceStore = false;
         bool copiedBack = false;
+        // Staging shadows only. `copyInGeneration`: the tracker generation the import's bytes
+        // were collected at when the shadow was last filled. `stagedGeneration`: set once this
+        // use's own stores were stamped and nothing else had stamped the region since the fill;
+        // while no block of the region carries a newer stamp, the shadow still holds what the
+        // import holds and the next use skips its copy-in (`copyInSkipped` for that use).
+        mutable std::uint64_t copyInGeneration = 0;
+        mutable std::uint64_t stagedGeneration = 0;
+        bool copyInSkipped = false;
         std::shared_ptr<Buffer> shadowCopy;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;

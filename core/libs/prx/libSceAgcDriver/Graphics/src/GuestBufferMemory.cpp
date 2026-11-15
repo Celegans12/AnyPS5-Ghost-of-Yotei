@@ -6521,6 +6521,9 @@ struct CopyStats {
     std::atomic<std::uint64_t> stagedAtomic{0};
     std::atomic<std::uint64_t> stagedReused{0};
     std::atomic<std::uint64_t> stagedInBytes{0};
+    // Reused staging shadows whose copy-in was skipped (still what the import holds).
+    std::atomic<std::uint64_t> stagedSkipped{0};
+    std::atomic<std::uint64_t> stagedSkippedBytes{0};
     std::atomic<std::uint64_t> stagedOutBytes{0};
     std::atomic<std::uint64_t> stagedLost{0};
     std::atomic<std::uint64_t> stagingRefused{0};
@@ -6647,6 +6650,12 @@ void reportStaging() {
     const auto in = stats.stagedInBytes.load();
     const auto out = stats.stagedOutBytes.load();
     AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused, %llu MiB in live shadows (limit %llu MiB); last 10 s: %llu regions, %.0f KiB in, %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(liveShadowBytes.load() >> 20u), static_cast<unsigned long long>(liveShadowLimit.load() >> 20u), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0);
+    static std::uint64_t lastSkipped = 0, lastSkippedBytes = 0;
+    const auto skipped = stats.stagedSkipped.load();
+    const auto skippedBytes = stats.stagedSkippedBytes.load();
+    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging copy-ins skipped (shadow still current): %llu regions, %.0f KiB; last 10 s: %llu regions, %.0f KiB%c", static_cast<unsigned long long>(skipped), skippedBytes / 1024.0, static_cast<unsigned long long>(skipped - lastSkipped), (skippedBytes - lastSkippedBytes) / 1024.0, 10);
+    lastSkipped = skipped;
+    lastSkippedBytes = skippedBytes;
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
@@ -7442,6 +7451,16 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         recorder->Keep(region->buffer);
+        if (region->copyInSkipped) {
+            // The shadow still holds the import's bytes (RecordStagingCopies checked the stamps).
+            if (profile) {
+                Copies().stagedSkipped.fetch_add(1, std::memory_order_relaxed);
+                Copies().stagedSkippedBytes.fetch_add(bytes, std::memory_order_relaxed);
+            }
+            copiedBytes -= bytes;
+            continue;
+        }
+        if (region->deviceLocal) region->copyInGeneration = GuestMemory::CollectWrites(region->begin, static_cast<std::size_t>(bytes));
         CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -7890,14 +7909,22 @@ void GuestBufferMemory::MarkStagedWrites() const {
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {
+    // Staging shadows whose import nothing else stamped since their copy-in: after the stamps
+    // below (this use's own stores) they are current until the next stamp.
+    for (const auto& region : regions) {
+        region.stagedGeneration = 0;
+        if (!region.gpuCopy || !region.deviceLocal || !region.copiedBack || region.copyInGeneration == 0) continue;
+        if (GuestMemory::UnchangedSince(region.begin, static_cast<std::size_t>(region.end - region.begin), region.copyInGeneration)) region.stagedGeneration = region.copyInGeneration;
+    }
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);
         if (found == nullptr) continue;
         const auto& region = *found;
         if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) {
             std::uint64_t order = 0;
-            static_cast<void>(GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin), order));
+            const auto stamped = GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin), order);
             directWritesGeneration = std::max(directWritesGeneration, order);
+            if (region.stagedGeneration != 0) region.stagedGeneration = stamped == 0 ? 0 : std::max(region.stagedGeneration, stamped);
         }
     }
 }
@@ -8255,6 +8282,19 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
         // copy-in refills. The import is the one the region was taken from (the caller checked its
         // serial), so the copy source still stands.
         if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
+        // The copy-in is skipped while no block of the region was stamped after this build's own
+        // stores of its last use: the shadow then holds the import's bytes already (phase 4 step
+        // 3; 007 First Light copied 59 MiB per present in). The collect turns CPU stores not yet
+        // seen into stamps first. APS5_NO_STAGING_COPY_IN_SKIP=1 copies in every time.
+        static const bool skipCopyIn = std::getenv("APS5_NO_STAGING_COPY_IN_SKIP") == nullptr;
+        const auto bytes = static_cast<std::size_t>(region.end - region.begin);
+        region.copyInSkipped = false;
+        if (skipCopyIn && region.copiedBack && region.stagedGeneration != 0 && region.buffer != nullptr) {
+            static_cast<void>(GuestMemory::CollectWrites(region.begin, bytes));
+            region.copyInSkipped = GuestMemory::UnchangedSince(region.begin, bytes, region.stagedGeneration);
+        }
+        if (region.copyInSkipped) region.copyInGeneration = region.stagedGeneration;
+        region.stagedGeneration = 0;
         region.copiedBack = false;
         copies.push_back(&region);
     }
