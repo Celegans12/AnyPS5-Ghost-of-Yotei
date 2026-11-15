@@ -29,15 +29,16 @@ public:
     struct Block {
         std::atomic<std::uint64_t> word{0};
         std::atomic<std::uint32_t> faults{0};
-        std::uint16_t holds = 0;
-        std::uint8_t flags = 0;
+        std::atomic<std::uint16_t> holds{0};
+        std::atomic<std::uint8_t> flags{0};
         std::uint8_t history = 0;
         std::uint32_t cleanPeriod = 0;
         std::uint32_t writtenPeriod = 0;
-        std::uint32_t faultPeriod = 0;
-        std::uint32_t restUntil = 0;
+        std::atomic<std::uint32_t> faultPeriod{0};
+        std::atomic<std::uint32_t> restUntil{0};
         std::uint32_t answers = 0;
         std::uint32_t wait = 0;
+        std::atomic<std::uint8_t> edge{0};
     };
     struct Counts {
         std::uint64_t armed = 0;
@@ -231,6 +232,31 @@ public:
         return Reason(PageTrackReason::Armable);
     }
 
+    void NoteEdge(std::uintptr_t block, bool edge) {
+        at(block).edge.store(edge ? 1 : 0, std::memory_order_relaxed);
+    }
+
+    bool Reasons(std::uintptr_t address, std::size_t bytes, std::uint64_t* reasons, std::size_t count) const {
+        if (reasons == nullptr) return false;
+        std::fill_n(reasons, count, Reason(PageTrackReason::Disabled));
+        if (!enabled || !Spans(address, bytes, count)) return false;
+        const auto now = Period();
+        auto block = address & ~(BlockBytes - 1);
+        for (std::size_t index = 0; index < count; ++index, block += BlockBytes) {
+            const auto* entry = find(block);
+            if (entry == nullptr) {
+                reasons[index] = Reason(PageTrackReason::Armable);
+                continue;
+            }
+            const auto state = StateOf(*entry);
+            if (state == State::Armed) reasons[index] = Reason(PageTrackReason::Armed);
+            else if (state == State::Arming || state == State::Opening) reasons[index] = Reason(PageTrackReason::Busy);
+            else if (const auto refusal = Refusal(*entry, now); refusal != Reason(PageTrackReason::Armable)) reasons[index] = refusal;
+            else reasons[index] = Reason(entry->edge.load(std::memory_order_relaxed) != 0 ? PageTrackReason::Edge : PageTrackReason::Armable);
+        }
+        return true;
+    }
+
     static bool Spans(std::uintptr_t address, std::size_t bytes, std::size_t count) {
         if (bytes == 0 || address >= (std::uintptr_t{1} << 47) || bytes > (std::uintptr_t{1} << 47) - address) return false;
         return count == (address + bytes - 1) / BlockBytes - address / BlockBytes + 1;
@@ -305,8 +331,9 @@ public:
         entry.writtenPeriod = now;
         const auto wait = Wait(entry);
         entry.wait = entry.answers >= WorthAnswers ? std::max<std::uint32_t>(1, wait / 2) : std::min<std::uint32_t>(LongestWait, wait * 2);
-        if (entry.faultPeriod == now) return;
-        const auto gap = now - entry.faultPeriod;
+        const std::uint32_t last = entry.faultPeriod;
+        if (last == now) return;
+        const auto gap = now - last;
         entry.history = static_cast<std::uint8_t>((gap >= HistoryFrames ? 0u : static_cast<unsigned>(entry.history) << gap) | 1u);
         entry.faultPeriod = now;
         if (static_cast<unsigned>(__builtin_popcount(entry.history)) < HotFrames) return;
@@ -337,7 +364,7 @@ public:
         return found == digests.end() ? 0 : found->second;
     }
 
-    static_assert(sizeof(Block) == 40, "a block of the page tracking table stays within a cache line");
+    static_assert(sizeof(Block) == 48, "a block of the page tracking table stays within a cache line");
 
     void NoteDivergence() {
         divergences.fetch_add(1, std::memory_order_relaxed);
@@ -383,6 +410,7 @@ public:
             open(block, entry);
             entry.word.store(with(entry.word.load(std::memory_order_acquire), State::Unarmed), std::memory_order_release);
             entry.flags = 0;
+            entry.edge = 0;
             entry.cleanPeriod = 0;
             entry.writtenPeriod = 0;
             entry.faultPeriod = 0;

@@ -1252,12 +1252,15 @@ private:
         constexpr auto blockBytes = WindowsPageTrack::BlockBytes;
         *token = 0;
         Run* run = nullptr;
+        bool whole = false;
         if (const auto next = residentRuns.upper_bound(block); next != residentRuns.begin() && std::prev(next)->second.end > block) {
             run = &std::prev(next)->second;
-            if (!run->watched || run->end < block + blockBytes) return WindowsPageTrack::Reason(PageTrackReason::Edge);
-        } else if (privateAllocationStart(block) == 0 || privateAllocationEnd(block) < block + blockBytes) {
-            return WindowsPageTrack::Reason(PageTrackReason::Edge);
+            whole = run->watched && run->end >= block + blockBytes;
+        } else {
+            whole = privateAllocationStart(block) != 0 && privateAllocationEnd(block) >= block + blockBytes;
         }
+        track.NoteEdge(block, !whole);
+        if (!whole) return WindowsPageTrack::Reason(PageTrackReason::Edge);
         auto& entry = track.Touch(block);
         const auto word = track.Word(block);
         const auto state = WindowsPageTrack::StateOfWord(word);
@@ -1268,7 +1271,10 @@ private:
         if (state == WindowsPageTrack::State::Opening) return WindowsPageTrack::Reason(PageTrackReason::Busy);
         if (state == WindowsPageTrack::State::Written && WindowsPageTrack::TakeWritten(entry)) track.NoteFault(entry, now);
         if (const auto refusal = WindowsPageTrack::Refusal(entry, now); refusal != WindowsPageTrack::Reason(PageTrackReason::Armable)) return refusal;
-        if (!armBlock(block)) return WindowsPageTrack::Reason(PageTrackReason::Edge);
+        if (!armBlock(block)) {
+            track.NoteEdge(block, true);
+            return WindowsPageTrack::Reason(PageTrackReason::Edge);
+        }
         disown(block, block + blockBytes);
         if (run != nullptr) run->reset = true;
         std::array<void*, blockBytes / 4096> local{};
@@ -1276,6 +1282,7 @@ private:
         DWORD granularity = 0;
         if (watchWrites(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(block), blockBytes, local.data(), &reported, &granularity) != 0) {
             track.Open(block, block + blockBytes);
+            track.NoteEdge(block, true);
             return WindowsPageTrack::Reason(PageTrackReason::Edge);
         }
         std::uint16_t pages = 0;

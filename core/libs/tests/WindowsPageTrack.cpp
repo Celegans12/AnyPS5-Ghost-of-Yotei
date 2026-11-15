@@ -514,6 +514,9 @@ void CheckDemand(bool resident) {
     }
     track.AdvancePeriod();
     Require(!mappings.ArmBlocks(memory.Block(6), BlockBytes, &hot, &reason, 1) && hot == 0 && ReasonOf(reason) == Reason::Resting && FramesOf(reason) == Track::RestFrames && memory.Protection(6) == PAGE_READWRITE, kind + ": a block that faulted in three frames was not put to rest for requests");
+    std::uint64_t seen = 0;
+    Require(track.Reasons(memory.Block(6), BlockBytes, &seen, 1) && ReasonOf(seen) == Reason::Resting && FramesOf(seen) == Track::RestFrames, kind + ": the table does not say that a block rests, or for how long");
+    Require(track.Reasons(memory.Block(5), BlockBytes, &seen, 1) && ReasonOf(seen) == Reason::Armed, kind + ": the table does not say that a block is armed");
     for (std::uint64_t frame = 0; frame + 1 < Track::RestFrames; ++frame) track.AdvancePeriod();
     Require(!mappings.ArmBlocks(memory.Block(6), BlockBytes, &hot, &reason, 1) && ReasonOf(reason) == Reason::Resting && FramesOf(reason) == 1, kind + ": a resting block was armed on request before its rest ended");
     track.AdvancePeriod();
@@ -522,9 +525,14 @@ void CheckDemand(bool resident) {
 
     mappings.Pin(memory.Block(7), BlockBytes);
     Require(!mappings.ArmBlocks(memory.Block(7), BlockBytes, &hot, &reason, 1) && hot == 0 && ReasonOf(reason) == Reason::Held && memory.Protection(7) == PAGE_READWRITE, kind + ": a pinned block was armed on request");
+    Require(track.Reasons(memory.Block(7), BlockBytes, &seen, 1) && ReasonOf(seen) == Reason::Held, kind + ": the table does not say that a block is held");
     mappings.Unpin(memory.Block(7), BlockBytes);
+    Require(track.Reasons(memory.Block(7), BlockBytes, &seen, 1) && ReasonOf(seen) == Reason::Armable, kind + ": the table still refuses a block after its last hold");
     Require(mappings.ArmBlocks(memory.Block(7), BlockBytes, &hot, &reason, 1) && hot != 0, kind + ": an unpinned block was not armed on request");
     Require(!mappings.ArmBlocks(memory.Block(Blocks), BlockBytes, &hot, &reason, 1) && hot == 0 && ReasonOf(reason) == Reason::Edge, kind + ": a block outside the allocation was armed on request");
+    Require(track.Reasons(memory.Block(Blocks), BlockBytes, &seen, 1) && ReasonOf(seen) == Reason::Edge, kind + ": the table forgot that a block is outside a whole allocation");
+    std::array<std::uint64_t, Blocks> every{};
+    Require(track.Reasons(memory.Address(), Blocks * BlockBytes, every.data(), Blocks) && !track.Reasons(memory.Address(), Blocks * BlockBytes, every.data(), Blocks - 1) && ReasonOf(every[0]) == Reason::Disabled, kind + ": the reasons of a range are not given per block, or a wrong block count was accepted");
 }
 
 void CheckRearm(bool resident) {

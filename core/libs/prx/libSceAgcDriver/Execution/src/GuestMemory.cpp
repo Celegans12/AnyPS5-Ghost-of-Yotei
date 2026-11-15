@@ -2733,6 +2733,17 @@ bool ArmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t
 #endif
 }
 
+bool ArmedReasons(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> reasons) {
+    std::fill(reasons.begin(), reasons.end(), static_cast<std::uint64_t>(ArmReason::Disabled));
+#ifdef _WIN32
+    return GuestArena::GuestPageTrackReasons_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, reasons.data(), reasons.size());
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
 bool RearmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written, std::span<std::uint64_t> reasons) {
     std::fill(written.begin(), written.end(), EveryArmedPage);
     std::fill(reasons.begin(), reasons.end(), static_cast<std::uint64_t>(ArmReason::Disabled));

@@ -723,6 +723,10 @@ bool GuestPageTrackArm_nid_no_patch(std::uintptr_t address, std::size_t bytes, s
     return WindowsMappings::Get().ArmBlocks(address, bytes, tokens, reasons, count);
 }
 
+bool GuestPageTrackReasons_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* reasons, std::size_t count) {
+    return WindowsPageTrack::Get().Reasons(address, bytes, reasons, count);
+}
+
 bool GuestPageTrackRearm_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* tokens, std::uint16_t* written, std::uint64_t* reasons, std::size_t count) {
     return WindowsMappings::Get().RearmBlocks(address, bytes, tokens, written, reasons, count);
 }

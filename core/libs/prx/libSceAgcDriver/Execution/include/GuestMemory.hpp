@@ -136,6 +136,7 @@ using ArmReason = GuestArena::PageTrackReason;
 constexpr ArmReason ArmReasonOf(std::uint64_t reason) { return static_cast<ArmReason>(reason & GuestArena::PageTrackReasonMask); }
 constexpr std::uint32_t ArmReasonFrames(std::uint64_t reason) { return static_cast<std::uint32_t>(reason >> GuestArena::PageTrackReasonFramesShift); }
 bool ArmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens, std::span<std::uint64_t> reasons = {});
+bool ArmedReasons(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> reasons);
 inline constexpr std::uint16_t EveryArmedPage = 0xffffu;
 bool RearmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written, std::span<std::uint64_t> reasons = {});
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::span<std::uint64_t> tokens = {});
