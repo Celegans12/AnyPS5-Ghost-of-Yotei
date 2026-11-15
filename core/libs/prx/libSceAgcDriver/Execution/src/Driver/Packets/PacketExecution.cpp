@@ -13,6 +13,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include <atomic>
@@ -127,6 +128,7 @@ bool& drawnSinceSeal() {
 }
 
 void Driver::deliverGuestEopInterrupt(std::uint32_t queue, std::uint32_t context) {
+    Graphics::BufferCache::EndDrawRun(Graphics::BufferCache::RunEnd::Interrupt);
     AgcDriverDeliverEopInterrupt(queue, context);
 }
 

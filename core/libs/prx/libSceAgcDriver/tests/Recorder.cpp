@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -1982,6 +1983,30 @@ void labelTests(Recorder& recorder) {
     Require(recorder.PendingLabelIn(0x60020, 4) && recorder.PendingLabelIn(0x60000, 0x100) && !recorder.PendingLabelIn(0x60000, 0x20), "a recorded label is not seen by PendingLabelIn");
     recorder.Sync();
     Require(!recorder.PendingLabelIn(0x60000, 0x100), "a recorded label outlived its batch");
+}
+
+void drawRunTests(Recorder& recorder) {
+    struct Restore {
+        ~Restore() { BufferCache::SetDrawRunsForTest(BufferCache::Runs::Environment); }
+    } restore;
+    const std::array<std::byte, 4> value{std::byte{1}, std::byte{0}, std::byte{0}, std::byte{0}};
+    recorder.Sync();
+    BufferCache::SetDrawRunsForTest(BufferCache::Runs::Long);
+    auto run = BufferCache::DrawRun();
+    recorder.NoteLabel(0x61020, value, 3, 0);
+    Require(BufferCache::DrawRun() == run, "a label recorded in the open batch ended the run of draws before its batch was submitted");
+    recorder.NotePendingWrite(0x62000, 16);
+    Require(BufferCache::DrawRun() != run, "a recorded GPU write that is no label kept the run of draws");
+    run = BufferCache::DrawRun();
+    recorder.Submit();
+    Require(BufferCache::DrawRun() != run, "the submission of a batch that holds a label kept the run of draws");
+    recorder.Sync();
+    BufferCache::SetDrawRunsForTest(BufferCache::Runs::Short);
+    run = BufferCache::DrawRun();
+    recorder.NoteLabel(0x61020, value, 4, 0);
+    Require(BufferCache::DrawRun() != run, "a recorded label kept the run of draws with the long runs off");
+    recorder.Sync();
+    Require(!recorder.PendingLabelIn(0x61000, 0x100), "a label of the run tests outlived its batch");
 }
 
 // The late rule (Recorder::NoteLabel): an entry with stamp <= afterStamp is served once its group
@@ -17309,6 +17334,7 @@ int main(int argc, char** argv) {
             afterRecordedWorkTests(device, recorder);
             directCompletionLabelTests(recorder);
             labelTests(recorder);
+            drawRunTests(recorder);
             lateLabelTests(recorder);
             largeLabelTests(recorder);
             storedBytesTests(recorder);
@@ -17633,6 +17659,7 @@ int main(int argc, char** argv) {
         directCompletionLabelTests(recorder);
         batchStampTests(recorder);
         labelTests(recorder);
+        drawRunTests(recorder);
         lateLabelTests(recorder);
         largeLabelTests(recorder);
         storedBytesTests(recorder);

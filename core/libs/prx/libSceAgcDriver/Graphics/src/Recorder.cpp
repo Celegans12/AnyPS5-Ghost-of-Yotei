@@ -1685,7 +1685,7 @@ Recorder* Recorder::Active() {
 
 static void NoteDriverStore(std::uint64_t address, std::size_t bytes) {
     OutdateStoredInputTwins(address, bytes);
-    BufferCache::EndDrawRun();
+    BufferCache::EndDrawRun(BufferCache::RunEnd::Store);
 }
 
 void Recorder::Activate() {
@@ -4272,7 +4272,8 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     GuestMemory::AnnounceGpuWrite(address, bytes, GuestArena::PageTrackOrigin::RecorderWrite);
-    BufferCache::EndDrawRun();
+    if (ownLabel && BufferCache::LongRuns()) BufferCache::KeepDrawRun();
+    else BufferCache::EndDrawRun(BufferCache::RunEnd::GpuWrite);
     GuestMemory::ForgetKnownZero(address, bytes);
     ensureOpen();
     const auto end = address + bytes;
@@ -4309,7 +4310,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
     GuestMemory::AnnounceGpuWrite(address, bytes, GuestArena::PageTrackOrigin::RecorderBatch);
-    BufferCache::EndDrawRun();
+    BufferCache::EndDrawRun(BufferCache::RunEnd::GpuWrite);
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     outdateDrawInputCopies(address, address + bytes);
@@ -5120,6 +5121,7 @@ void Recorder::Submit() {
     dropStaleHoldKept();
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
+    BufferCache::EndDrawRun(BufferCache::RunEnd::Submit);
     flushDeferredDispatch();
     flushCopyBacks(submitSite);
     if (!open->keyStores.empty()) recordKeyStores(false);

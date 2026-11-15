@@ -1116,7 +1116,10 @@ void DrawPipeline::run() {
             order = items.front().order;
         }
         if (SharedCollectEpoch()) GuestMemory::AdoptCollectEpoch(epoch);
-        if (!isDraw || epoch != ordered) Graphics::BufferCache::EndDrawRun();
+        const bool seenLater = kind == CommitKind::EndOfPipe || kind == CommitKind::DmaWrite || kind == CommitKind::Store || kind == CommitKind::Seal;
+        if (epoch != ordered) Graphics::BufferCache::EndDrawRun(Graphics::BufferCache::RunEnd::Epoch);
+        else if (!isDraw && !(seenLater && Graphics::BufferCache::LongRuns())) Graphics::BufferCache::EndDrawRun(Graphics::BufferCache::RunEnd::Item);
+        else if (!isDraw) Graphics::BufferCache::KeepDrawRun();
         ordered = epoch;
         const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::exception_ptr fatal;

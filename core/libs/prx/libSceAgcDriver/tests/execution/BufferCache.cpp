@@ -612,6 +612,45 @@ void InputsKeptApartNeverReachAMirror(std::uint64_t base) {
     Require(!refused && after.inputRefused == before.inputRefused + 1, "an empty input was served");
 }
 
+void RunsOfDrawsEndWhenAnEffectCanBeSeen() {
+    struct Restore {
+        ~Restore() { BufferCache::SetDrawRunsForTest(BufferCache::Runs::Environment); }
+    } restore;
+    using End = BufferCache::RunEnd;
+    BufferCache::SetDrawRunsForTest(BufferCache::Runs::Off);
+    auto run = BufferCache::DrawRun();
+    BufferCache::EndDrawRun(End::Submit);
+    Require(BufferCache::DrawRun() == run && !BufferCache::LongRuns(), "a run of draws ended without the dirty-first inputs");
+    BufferCache::SetDrawRunsForTest(BufferCache::Runs::Long);
+    Require(BufferCache::LongRuns(), "long runs of draws are not on");
+    auto before = BufferCache::Counted();
+    for (const auto reason : {End::Other, End::Item, End::Epoch, End::GpuWrite, End::Store, End::Submit, End::Interrupt}) {
+        run = BufferCache::DrawRun();
+        BufferCache::EndDrawRun(reason);
+        Require(BufferCache::DrawRun() == run + 1, "an effect the title can see kept the run of draws");
+    }
+    auto after = BufferCache::Counted();
+    Require(after.runEnds[static_cast<std::size_t>(End::Submit)] == before.runEnds[static_cast<std::size_t>(End::Submit)] + 1 && after.runsKept == before.runsKept, "the ends of the runs of draws are not counted by their reason");
+    run = BufferCache::DrawRun();
+    {
+        const BufferCache::LabelMark marked;
+        BufferCache::EndDrawRun(End::Store);
+        Require(BufferCache::DrawRun() == run && BufferCache::Counted().runsKept == after.runsKept + 1, "the write mark of a label recorded for the GPU ended the run of draws");
+        BufferCache::EndDrawRun(End::Submit);
+        Require(BufferCache::DrawRun() == run + 1, "a submission inside a label's write mark kept the run of draws");
+    }
+    run = BufferCache::DrawRun();
+    BufferCache::EndDrawRun(End::Store);
+    Require(BufferCache::DrawRun() == run + 1, "a driver store after a label's write mark kept the run of draws");
+    BufferCache::SetDrawRunsForTest(BufferCache::Runs::Short);
+    run = BufferCache::DrawRun();
+    {
+        const BufferCache::LabelMark marked;
+        BufferCache::EndDrawRun(End::Store);
+    }
+    Require(BufferCache::DrawRun() == run + 1 && !BufferCache::LongRuns(), "a label's write mark kept the run of draws with the long runs off");
+}
+
 void DirtyFirstVerificationTellsAStaleViewFromALaterWrite(std::uint64_t base) {
     Harness harness;
     const auto address = base + 14 * Granule;
@@ -831,6 +870,7 @@ int main() {
         UnarmableBlocksAreUploadedOncePerRun(inputs);
         InputsKeptApartNeverReachAMirror(inputs);
         DirtyFirstVerificationTellsAStaleViewFromALaterWrite(inputs);
+        RunsOfDrawsEndWhenAnEffectCanBeSeen();
         if (GuestMemory::Watched(base, bytes)) {
             TrackedWritesReachTheMirror(base);
             ArmedBlocksAnswerWithoutTheTracker(base);

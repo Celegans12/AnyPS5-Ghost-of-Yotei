@@ -60,9 +60,24 @@ struct Counters {
     std::atomic<std::uint64_t> ringChunks{0};
     std::atomic<std::uint64_t> ringLaps{0};
     std::atomic<std::uint64_t> ringFull{0};
+    std::array<std::atomic<std::uint64_t>, BufferCache::RunEnds> runEnds{};
+    std::atomic<std::uint64_t> runsKept{0};
 };
 
 std::atomic<std::uint64_t> drawRun{1};
+
+std::atomic<BufferCache::Runs> testedRuns{BufferCache::Runs::Environment};
+
+thread_local unsigned labelMarks = 0;
+
+constexpr std::array<const char*, BufferCache::RunEnds> RunEndNames{"other", "commit that is no draw", "ordering point", "recorded GPU write", "driver store", "submission", "interrupt"};
+
+BufferCache::Runs drawRuns() {
+    const auto tested = testedRuns.load(std::memory_order_acquire);
+    if (tested != BufferCache::Runs::Environment) return tested;
+    static const BufferCache::Runs runs = !BufferCache::DirtyFirst() ? BufferCache::Runs::Off : std::getenv("APS5_NO_DIRTY_FIRST_LONG_RUNS") != nullptr ? BufferCache::Runs::Short : BufferCache::Runs::Long;
+    return runs;
+}
 
 Counters& counters() {
     static Counters held;
@@ -356,8 +371,36 @@ void BufferCache::BreakDrawRun() {
     drawRun.fetch_add(1, std::memory_order_acq_rel);
 }
 
-void BufferCache::EndDrawRun() {
-    if (DirtyFirst()) BreakDrawRun();
+void BufferCache::EndDrawRun(RunEnd reason) {
+    const auto runs = drawRuns();
+    if (runs == Runs::Off) return;
+    auto& counted = counters();
+    if (runs == Runs::Long && reason == RunEnd::Store && labelMarks != 0) {
+        add(counted.runsKept);
+        return;
+    }
+    add(counted.runEnds[static_cast<std::size_t>(reason) < RunEnds ? static_cast<std::size_t>(reason) : 0]);
+    BreakDrawRun();
+}
+
+void BufferCache::KeepDrawRun() {
+    if (drawRuns() != Runs::Off) add(counters().runsKept);
+}
+
+bool BufferCache::LongRuns() {
+    return drawRuns() == Runs::Long;
+}
+
+void BufferCache::SetDrawRunsForTest(Runs runs) {
+    testedRuns.store(runs, std::memory_order_release);
+}
+
+BufferCache::LabelMark::LabelMark() {
+    ++labelMarks;
+}
+
+BufferCache::LabelMark::~LabelMark() {
+    --labelMarks;
 }
 
 std::uint64_t BufferCache::DrawRun() {
@@ -466,6 +509,8 @@ BufferCache::Counts BufferCache::Counted() {
     counts.ringLaps = held.ringLaps.load(std::memory_order_relaxed);
     counts.ringFull = held.ringFull.load(std::memory_order_relaxed);
     counts.drawRuns = drawRun.load(std::memory_order_relaxed);
+    for (std::size_t reason = 0; reason < RunEnds; ++reason) counts.runEnds[reason] = held.runEnds[reason].load(std::memory_order_relaxed);
+    counts.runsKept = held.runsKept.load(std::memory_order_relaxed);
     return counts;
 }
 
@@ -526,6 +571,17 @@ std::string BufferCache::Report() {
         char inputs[640];
         std::snprintf(inputs, sizeof(inputs), "[buffer-cache] dirty-first (10 s): %llu draw inputs asked without a collect, %llu answered by armed blocks alone, %llu by pages uploaded earlier in the run of draws, %llu uploaded to a mirror (%.1f MiB), %llu copied to the ring (%.1f MiB), %llu copied apart (%.1f MiB), %llu repeated from the run of draws, %llu refused; %llu runs of draws; ring: %llu chunks made, %llu taken again, %llu times full\n", since(now.inputs, reported.inputs), since(now.inputClean, reported.inputClean), since(now.inputKept, reported.inputKept), since(now.inputUploads, reported.inputUploads), mib(now.inputUploadBytes, reported.inputUploadBytes), since(now.inputRing, reported.inputRing), mib(now.inputRingBytes, reported.inputRingBytes), since(now.inputLoose, reported.inputLoose), mib(now.inputLooseBytes, reported.inputLooseBytes), since(now.inputRepeats, reported.inputRepeats), since(now.inputRefused, reported.inputRefused), since(now.drawRuns, reported.drawRuns), since(now.ringChunks, reported.ringChunks), since(now.ringLaps, reported.ringLaps), since(now.ringFull, reported.ringFull));
         text += inputs;
+        std::string ends;
+        for (std::size_t reason = 0; reason < RunEnds; ++reason) {
+            if (now.runEnds[reason] == reported.runEnds[reason]) continue;
+            char item[64];
+            std::snprintf(item, sizeof(item), " %s %llu", RunEndNames[reason], since(now.runEnds[reason], reported.runEnds[reason]));
+            ends += item;
+        }
+        char runs[192];
+        std::snprintf(runs, sizeof(runs), "[buffer-cache] dirty-first runs (10 s): %llu labels, stores and seals left the run of draws open; runs ended by:", since(now.runsKept, reported.runsKept));
+        text += runs + ends + "
+";
         if (now.inputVerified != reported.inputVerified) {
             char verified[256];
             std::snprintf(verified, sizeof(verified), "[buffer-cache] dirty-first verification (10 s): %llu inputs served without a copy compared with guest memory, %llu of them behind a later write, %llu differing inside a run of draws\n", since(now.inputVerified, reported.inputVerified), since(now.inputRaces, reported.inputRaces), since(now.inputRunDiffers, reported.inputRunDiffers));

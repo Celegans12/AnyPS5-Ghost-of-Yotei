@@ -76,6 +76,19 @@ public:
 
     enum class Served : std::uint8_t { Tracked, Copied, Repeated, Kept, Clean };
 
+    enum class RunEnd : std::uint8_t { Other, Item, Epoch, GpuWrite, Store, Submit, Interrupt, Count };
+    static constexpr std::size_t RunEnds = static_cast<std::size_t>(RunEnd::Count);
+
+    enum class Runs : std::uint8_t { Environment, Off, Short, Long };
+
+    class LabelMark {
+    public:
+        LabelMark();
+        ~LabelMark();
+        LabelMark(const LabelMark&) = delete;
+        LabelMark& operator=(const LabelMark&) = delete;
+    };
+
     struct Input {
         std::size_t alignment = 1;
         bool apart = false;
@@ -149,6 +162,8 @@ public:
         std::uint64_t ringLaps = 0;
         std::uint64_t ringFull = 0;
         std::uint64_t drawRuns = 0;
+        std::array<std::uint64_t, RunEnds> runEnds{};
+        std::uint64_t runsKept = 0;
     };
 
     BufferCache(Allocate allocate, Executed executed, Source& source);
@@ -162,7 +177,10 @@ public:
     static bool VerifyingDirtyFirst();
     static std::size_t RingLimit();
     static void BreakDrawRun();
-    static void EndDrawRun();
+    static void EndDrawRun(RunEnd reason = RunEnd::Other);
+    static void KeepDrawRun();
+    static bool LongRuns();
+    static void SetDrawRunsForTest(Runs runs);
     static std::uint64_t DrawRun();
     static bool Arming();
     static bool Streaming();
