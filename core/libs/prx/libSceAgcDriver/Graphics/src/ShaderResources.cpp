@@ -7496,7 +7496,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         }
         const auto begin = address - item.adjustment;
         const auto bytes = static_cast<std::size_t>(GuestBufferMemory::ViewBytes(size, item.adjustment));
-        if (override == moved.end() ? BufferCache::StageViews() : BufferCache::MovedViews()) {
+        if (override == moved.end() ? BufferCache::StageViews() : !movedOnly && BufferCache::MovedViews()) {
             if (auto view = CachedStageRange(recorder, begin, bytes, static_cast<std::size_t>(std::max<VkDeviceSize>(context.limits.minStorageBufferOffsetAlignment, 4)))) {
                 if (override != moved.end()) BufferCache::NoteMoved();
                 recorder.Keep(std::move(view.owner));
