@@ -25,6 +25,7 @@
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleCounter_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/SampleDumps_spv.h"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4Opcodes.hpp"
@@ -4891,6 +4892,9 @@ BufferCache* Recorder::Buffers() {
         };
         auto executed = [this](std::uint64_t serial) { return ExecutedThrough(serial); };
         bufferCache = std::make_unique<BufferCache>(std::move(allocate), std::move(executed), BufferCache::TrackerSource());
+#ifdef _WIN32
+        if (GuestArena::GuestPageTrackEnabled_nid_no_patch()) BufferCache::SetArmedBlocks({&GuestMemory::ArmedTokens, &GuestMemory::ArmedCleanSince, &GuestMemory::ArmBlocks, &GuestMemory::RearmWritten, &GuestMemory::UnarmedReason});
+#endif
     }
     return bufferCache.get();
 }
