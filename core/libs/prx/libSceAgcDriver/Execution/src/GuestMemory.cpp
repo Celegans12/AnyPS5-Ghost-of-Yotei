@@ -1402,6 +1402,7 @@ std::uint64_t statsEpoch();
 
 struct DirtyBlocks {
     static constexpr std::size_t Slots = 65536;
+    static constexpr std::uint64_t SampledBlocks = 64;
     std::array<std::atomic<std::uint64_t>, Slots> blocks{};
     std::array<std::atomic<std::uint64_t>, Slots> slices{};
     std::array<std::atomic<std::uint64_t>, Slots> epochs{};
@@ -1437,12 +1438,15 @@ struct DirtyBlocks {
         if (bytes == 0) return 0;
         const auto now = slice.load(std::memory_order_relaxed);
         const auto end = address + bytes;
+        const auto first = address / WriteBlockBytes;
+        const auto last = (end - 1) / WriteBlockBytes;
+        const auto stride = std::max<std::uint64_t>(1, (last - first + 1) / SampledBlocks);
         std::uint64_t dirty = 0;
-        for (auto block = address / WriteBlockBytes; block <= (end - 1) / WriteBlockBytes; ++block) {
+        for (auto block = first; block <= last; block += stride) {
             if (blocks[block % Slots].load(std::memory_order_relaxed) != block + 1 || slices[block % Slots].load(std::memory_order_relaxed) + 1 < now) continue;
-            dirty += std::min<std::uint64_t>(end, (block + 1) * WriteBlockBytes) - std::max<std::uint64_t>(address, block * WriteBlockBytes);
+            dirty += (std::min<std::uint64_t>(end, (block + 1) * WriteBlockBytes) - std::max<std::uint64_t>(address, block * WriteBlockBytes)) * stride;
         }
-        return dirty;
+        return std::min<std::uint64_t>(dirty, bytes);
     }
 };
 
