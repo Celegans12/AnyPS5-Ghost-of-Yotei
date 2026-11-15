@@ -157,7 +157,7 @@ Divinity is not a test title. BO1 was removed from testing on 2026-11-13 (game d
 | 1 | **Gate passed for all four titles (2026-11-13).** Every red-zone leaf of the four eboots and their bundled modules is framed, 0 skipped, including code outside `.eh_frame` bounds. Fault storm at 2000 landings/s: unframed, all four crash with the fill pattern in registers; framed, all four ran 30 min clean. Rule approved 2026-11-13: the storm overwrites the red zone only at steps in guest code, and native modules are built with `-mno-red-zone`. Detail: `DESIGN-history.md`, "Phase 1 and 2 status detail to 2026-11-15". |
 | 2 | **Kept for all four titles** (aba95ed26b; 007 store-import grid fix 6bccb2bfa7; rebase onto upstream 3c310597b6 and its two fixes 0bc66be545, libs `libs\merge4`). As built: collected memory is armed per 64 KiB block; GPU stores go through small dedicated store imports made uniform at their storing submission; submissions name their stores; collects skip clean ranges. On the rebased tree, on against off: FF walks 3.00 M to 1.39 M, AoM 1.44 M to 0.20 M, 007 5.21 M to 1.59 M; pictures correct. Gate judgement (user, 2026-11-14): coherence share more than halved; the FF walk and epoch target moved to phase 4. **Open:** 007 GPU time after its scene change (about 205 or 221 ms against 185 to 190 before the rebase; next step per-program GPU times against `libs\protect24`). Detail: `DESIGN-history.md`, "Phase 1 and 2 status detail to 2026-11-15". |
 | 3 | **Built and kept (user, 2026-11-15); gate met on LEGO, not on 007.** All three section C items are built (`WaitEvents.hpp`): a blocked wait or worker sleeps on events instead of a timed poll. Events: a label store or recorded GPU write over the awaited range, a finished GPU batch (only for waits whose value is on the GPU), driver queue state, release of the GPU mutex after a failed try, a closed label group. The timer left is the label-flush deadline, a 2 ms fallback with a known producer and a 200 us wait for values no driver event announces (a guest CPU store). `PollSleep` remains only in the REWIND wait (a guest CPU store) and the capture-hold test loop. Queue 0 time in waits per frame: LEGO about 1.0 ms to 0.4-0.5 ms (gate met, and met before); 007 about 22 ms to 14-23 ms (gate not met). 007's queue 0 waits on compute queues that themselves wait 150 to 200 ms on GPU-computed values, so its wait is bounded by GPU time (phases 4 and 5), not by wait mechanics. Almost every wait ends on an event (waits ended after a timer wake: 0, once 1, per 10 s). Frame times unchanged within run variance: FF 35.3 to 36.6, LEGO 49.2 to 49.9, AoM 155 to 158, 007 about 200 ms; no errors. GPU idle gaps not measured. Tried and dropped: trusting late label stores (0 on queue 0), and limiting mutex-release wakes to the wait's own consults (wake counts unchanged). A blocked LEGO compute queue still wakes about 15 k times per 10 s, almost all on GPU mutex releases. Tests: see the note below the table. |
-| 4 | Section B built in walk-based form (AoM title 216 to about 150 ms); 007 binding join fix 375d360e24 (387-426 to 127-133 ms). Section D validity change not started. |
+| 4 | **Started 2026-11-15; nothing kept yet.** Earlier: section B built in walk-based form (AoM title 216 to about 150 ms); 007 binding join fix 375d360e24 (387-426 to 127-133 ms). Section D validity change: a memo of whole direct stages (request plus replayed guest reads) gave no gain and is in `failed-patches\phase4-direct-stage-memo.patch` (FF 0 % hits, LEGO under 1 % and 51.8 ms against 49.0, AoM 20 % with no frame change): every draw's stage carries buffer addresses that are new each frame. The slot memo is cleared by the proof serial, not by collect epochs (FF 148 k clears per run); its misses cost about 1.5 ms per FF frame and 1.4 ms per LEGO frame of worker time, so the per-block rule can save at most that. Gate baselines and the build plan for section B and GPU-owned: "Phase 4 baselines" below. |
 | 5 | Indirect draws continue the pass (AoM 745 to 72 passes per frame). 007 translation size cut 35 % (spanned scalar loads, cheaper NaN check). AoM's hot vertex program is latency-bound (about 30 % in the per-fetch `probe_bda_pointer` search, 25 % waiting on vertex data). LEGO's top program has no single emulation cost to remove. |
 | 6 | Per-draw record cost 12 to 25 us; about 156 us per draw with stage preparation on the AoM worker. |
 
@@ -177,11 +177,46 @@ intermittently under parallel load before that commit; both causes are fixed in 
   stored ahead of the copies: 0 (expected 1)", when an idle flush stores the plane before the copy
   does. A timing assumption of the test, not a wrong picture.
 
+### Phase 4 baselines (2026-11-15, `libs\c8`, `APS5_PROFILE_GPU=1`, last `[gputime]` line, per present)
+
+| Class | FF | LEGO | AoM | 007 |
+|---|---|---|---|---|
+| storage-upload (guest memory into a storage image) | 0.5 ms, 59 MiB | 3.2 ms | 0.01 ms | 7.1 ms, 258 MiB |
+| storage-writeback (image results into guest memory) | 1.1 ms, 78 MiB | 0.1 ms | 7.5 ms, 210 MiB | 9 to 12 ms, 310 MiB |
+| staging-in (import into a device-local buffer) | 1.5 ms, 39 MiB | 0.7 ms, 9 MiB | 0.3 ms | 2.2 ms, 82 MiB |
+| staging-out (written sub-ranges back) | 1.5 ms, 39 MiB | 0.7 ms, 9 MiB | 0.3 ms | 2.2 ms, 82 MiB |
+| shadow-publish | 1.3 ms, 59 MiB | none | 0.06 ms | 1.7 ms, 71 MiB |
+| draw | 3.3 ms | 2.2 ms | 82.6 ms | 1.4 to 1.6 ms |
+
+- 007's GPU time is about 60 ms per present. One compute program (0x3001052300, three runs per
+  present) is 34 ms of it (phase 5). The copy classes above are about 25 ms.
+- 007 storage uploads are all "guest memory changed" (`APS5_TRACE_UPLOAD=1`). The title reuses the
+  same guest memory within a frame for different images (0x425aa00000 as 128x1, 16x16, 54x31 and
+  640x360; 0x425b13d000 as 640x360 and 1280x720). Each image is written back to host memory so
+  that the next one can be uploaded from it: 570 MiB per present through the import.
+- AoM writes 210 MiB of image results back per present and uploads almost none of it again.
+- LEGO's storage-upload byte count in that line is not credible (3 GiB per present in 3.2 ms);
+  the time is.
+
+Build plan that follows from this, in order:
+
+1. Section B for storage images: a device-local copy of the guest ranges that storage images
+   exchange. A write-back whose reader is another image goes to that copy, and the upload reads
+   it. Host memory is still written (eagerly) at this step. Expected: 007 storage-upload from the
+   import gone (7 ms).
+2. GPU-owned: blocks whose newest content is in that copy become no-access; a guest or host read
+   faults and stores them first. Then the eager write-back to host memory goes (007 9 to 12 ms,
+   AoM 7.5 ms, FF 1.1 ms). Needs a read-fault path that can wait for the GPU from a guest thread;
+   today's `HandleRead` only rechecks the protection.
+3. Staging: skip the copy-in when the staging buffer is still what the import holds (no stamp on
+   its blocks since its own copy-back); then the copy-back under GPU-owned.
+4. Slot memo and table mirror validity per source block (small; see the phase 4 row).
+
 ### Next, in phase order
 
 1. **Phases 1 and 2:** passed and kept (see their rows). Open from phase 2: 007's GPU time after its scene change.
 2. **Phase 3** (section C, waits): built and kept; 007's wait gate is left to phases 4 and 5 (see the phase 3 row).
-3. **Phase 4** (section D validity change, then section B and GPU-owned) next.
+3. **Phase 4** in progress: step 1 of the build plan in "Phase 4 baselines" is next.
 
 Parked until their phase comes up: the AoM fetch-range probe and timeline outliers, the FF worker
 profile, the LEGO translation question (phase 5), the 007 committer re-profile and storage-image
