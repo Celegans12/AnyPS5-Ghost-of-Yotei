@@ -1316,6 +1316,18 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
     return retiredNow - watch.retired > watch.items || overlaps(watch.writes);
 }
 
+std::optional<bool> DrawPipeline::WrittenWhileQueued(std::uint64_t retiredBefore, const std::vector<Range>& reads) {
+    if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
+    std::lock_guard lock(mutex);
+    if (retiredItems.load(std::memory_order_relaxed) != retiredBefore) return std::nullopt;
+    for (const auto& [range, count] : queuedWrites) {
+        for (const auto& read : reads) {
+            if (read.first < range.second && range.first < read.second) return true;
+        }
+    }
+    return false;
+}
+
 bool DrawPipeline::Busy() const {
     return outstanding.load(std::memory_order_acquire) != 0 || (finisherProducer && DrawFinisher::Busy() && DrawFinisher::Overlap()) || DrawFinisher::Behind();
 }

@@ -1,8 +1,13 @@
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include <vector>
+#include <optional>
+#include <chrono>
+#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -41,6 +46,30 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeOrderedVertexStageInfo(std::span<c
     };
     if (!DrawPipeline::Active()) return decode();
     auto& queue = DrawPipeline::Queue0();
+    static const bool light = std::getenv("APS5_NO_LIGHT_DECODE_WATCH") == nullptr;
+    if (light) {
+        static std::atomic<std::uint64_t> watched{0}, retried{0};
+        static std::atomic<std::int64_t> reportedAt{0};
+        static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        const auto retired = queue.Retired();
+        auto info = decode();
+        std::vector<DrawPipeline::Range> ranges;
+        ranges.reserve(reads.size());
+        for (const auto& read : reads) ranges.emplace_back(read.address, read.address + read.size);
+        const auto written = queue.WrittenWhileQueued(retired, ranges);
+        watched.fetch_add(1, std::memory_order_relaxed);
+        if (!written.has_value()) retried.fetch_add(1, std::memory_order_relaxed);
+        if (stats) {
+            const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+            if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) != tenSeconds) AgcDriver::ProfilePrint_nid_no_patch("[decode-watch] (10 s): %llu vertex stage decodes checked against the committer's queue without a copy of its writes, %llu decoded again with the copy because an item retired meanwhile\n", static_cast<unsigned long long>(watched.exchange(0)), static_cast<unsigned long long>(retried.exchange(0)));
+        }
+        if (written.has_value()) {
+            if (!*written) return info;
+            queue.NoteDecodeDrain();
+            queue.Drain(DrawPipeline::DrainReason::Capture);
+            return decode();
+        }
+    }
     const auto watch = queue.WatchWrites();
     auto info = decode();
     if (watch.items == 0 && !queue.Busy() && queue.Retired() == watch.retired) return info;
