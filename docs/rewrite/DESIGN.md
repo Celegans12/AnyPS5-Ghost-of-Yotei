@@ -215,6 +215,15 @@ buffer regions often span two mappings and no single import served them. Found a
 - 007: 142 to 167 ms per frame before its scene change (was 160 to 175) and 180 to 188 after
   (was 197 to 221), two runs; CPU-copied regions 6,419 to 128 in 40 s. FF 36.2, LEGO 49.1 and
   50.6, AoM 161.4: unchanged. No errors; tests 1,790 of 1,790 with section A on and off.
+- Image tables (c4d8f47c8f, `libs\f3`): 007's direct stages cost 67 us each, 50 us of it
+  resolving image tables. Its table columns are pointer columns and key-narrowed columns, which
+  bypass the column memo, so each capture held equal values in blocks of its own; the resolution
+  memo matched shared blocks only, and the heap mirror was rebuilt for every stage (0 reuses).
+  The memo now also matches equal content (`APS5_TABLE_MEMO_SHARED_ONLY=1` restores the old
+  match). Direct stage 15 us, mirrors reused, `Shader.DrawStage` 65 to 70 ms per frame gone from
+  the top costs. 007: 117 to 135 ms per frame over the whole scene, two runs. FF 36.6, LEGO 49.1,
+  AoM 157.1: unchanged. Tests: 1,808 of 1,808 with section A on; with it off one label test
+  (`agc_driver_unregistered_label_on_gpu`) failed once and passed 70 repeats after.
 - 007's storage cache sits at its 7.2 GiB budget and makes about 41 images per present: the
   title allocates the same kind of target at hundreds of addresses in a cycle (1280x720 format
   36 at 338 addresses). Each new image uploads its whole surface ("first", 231 MiB per present).
