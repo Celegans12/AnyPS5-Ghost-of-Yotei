@@ -1888,11 +1888,13 @@ ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, s
     // window block groups it with its neighbours) and the run holds a range larger than the
     // window: left apart, every use is copied on the CPU (007 First Light binds 12.5 MiB from
     // inside a 2 MiB range into the 12 MiB one after it, per draw). A run of ranges no larger than
-    // the window stays apart: those are grouped by window blocks. As for the first-range rule
-    // above, the ranges beside the large one must fit one window.
+    // the window stays apart: those are grouped by window blocks. A run whose first range is
+    // the large one is left to the rule above (its small ranges must fit one window); here the
+    // first range is small, and how much the run holds beside the large range does not matter
+    // (007's runs exceed a window there, and narrowing this cost it 77 GiB of CPU copies in 300 s).
     std::uint64_t largest = 0;
     for (const auto& range : run.ranges) largest = std::max<std::uint64_t>(largest, range->bytes);
-    if (largest > window && run.bytes - largest <= window) {
+    if (run.ranges.front()->bytes <= window && largest > window) {
         if (const auto bounds = importRunBounds(lease, begin); bounds.found && bounds.first == bounds.last) return run;
     }
     return {};
@@ -2467,7 +2469,14 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
     const bool immediate = retireFreesAtOnce(true);
     const auto pinned = pinnedTotal(state);
-    const auto live = pinned - (immediate ? replaced : 0);
+    // rewrite/direct: the imports a run replaces are also credited while their retirement is held,
+    // when the host heap's own report has room for the run beside them (they stay pinned until
+    // their batch completes). Without it a heap first imported in pieces never fits as a whole
+    // while a recorder is active: the pieces fill the budget the whole needs (Age of Mythology's
+    // 4 GiB heap stayed in 64 MiB pieces, and every draw binding across two of them took an
+    // address-based build). With no report the replaced imports count until they are released.
+    const bool roomBeside = state.reportedHeapBudget != 0 && state.reportedHeapUsage + bytes <= state.reportedHeapBudget;
+    const auto live = pinned - (immediate || roomBeside ? std::min(pinned, replaced) : 0);
     auto ready = std::numeric_limits<std::uint64_t>::max();
     auto readyHeld = std::numeric_limits<std::uint64_t>::max();
     const auto evictable = evict && live + bytes > budget ? evictableBytes(state, base, base + bytes, ready, readyHeld) * (immediate ? 1 : 0) : 0;
