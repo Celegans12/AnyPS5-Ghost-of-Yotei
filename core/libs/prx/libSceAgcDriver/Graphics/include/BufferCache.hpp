@@ -34,9 +34,15 @@ public:
         virtual bool Quiet(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> tokens) = 0;
     };
 
+    enum class Unarmed : std::uint8_t { Armed, Held, Imported, Barred, Resting, Edge, Other, Count };
+    static constexpr std::size_t UnarmedReasons = static_cast<std::size_t>(Unarmed::Count);
+
     struct ArmedBlocks {
         bool (*tokens)(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words) = nullptr;
         bool (*cleanSince)(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> words) = nullptr;
+        bool (*arm)(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> words) = nullptr;
+        bool (*rearm)(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> since, std::span<std::uint64_t> words, std::span<std::uint16_t> written) = nullptr;
+        std::uint8_t (*reason)(std::uint64_t address) = nullptr;
     };
     static constexpr std::uint64_t ArmedToken = std::uint64_t{1} << 63u;
     static constexpr std::uint16_t EveryPage = 0xffffu;
@@ -83,8 +89,11 @@ public:
         std::uint64_t verified = 0;
         std::uint64_t verifyRaces = 0;
         std::uint64_t armedPolls = 0;
+        std::uint64_t armsRequested = 0;
+        std::uint64_t armsGranted = 0;
         std::uint64_t heldBytes = 0;
         std::array<std::uint64_t, Refusals> refused{};
+        std::array<std::uint64_t, UnarmedReasons> unarmed{};
     };
 
     BufferCache(Allocate allocate, Executed executed, Source& source);
@@ -94,6 +103,7 @@ public:
 
     static bool Enabled();
     static bool Verifying();
+    static bool Arming();
     static Source& TrackerSource();
     static void SetArmedBlocks(const ArmedBlocks& table);
     static Counts Counted();

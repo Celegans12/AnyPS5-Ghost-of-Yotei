@@ -29,8 +29,11 @@ struct Counters {
     std::atomic<std::uint64_t> verified{0};
     std::atomic<std::uint64_t> verifyRaces{0};
     std::atomic<std::uint64_t> armedPolls{0};
+    std::atomic<std::uint64_t> armsRequested{0};
+    std::atomic<std::uint64_t> armsGranted{0};
     std::atomic<std::uint64_t> heldBytes{0};
     std::array<std::atomic<std::uint64_t>, BufferCache::Refusals> refused{};
+    std::array<std::atomic<std::uint64_t>, BufferCache::UnarmedReasons> unarmed{};
 };
 
 Counters& counters() {
@@ -44,11 +47,18 @@ void add(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
 
 constexpr std::array<const char*, BufferCache::Refusals> RefusalNames{"range", "alignment", "gpu write", "untracked", "unmapped", "busy", "span", "budget", "allocation", "raced"};
 
+constexpr std::array<const char*, BufferCache::UnarmedReasons> UnarmedNames{"armed", "held", "imported", "barred", "resting", "edge", "other"};
+
 using ArmedTokensFunction = bool (*)(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens);
 using ArmedCleanFunction = bool (*)(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> tokens);
+using RearmFunction = bool (*)(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> since, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written);
+using UnarmedReasonFunction = std::uint8_t (*)(std::uint64_t address);
 
 std::atomic<ArmedTokensFunction> armedTokens{nullptr};
 std::atomic<ArmedCleanFunction> armedCleanSince{nullptr};
+std::atomic<ArmedTokensFunction> armBlocks{nullptr};
+std::atomic<RearmFunction> rearmBlocks{nullptr};
+std::atomic<UnarmedReasonFunction> unarmedReason{nullptr};
 
 template <class TValue>
 class Scratch {
@@ -97,43 +107,63 @@ public:
                 return true;
             }
         }
-        Scratch<std::uint64_t> fresh(count);
-        if (take != nullptr) static_cast<void>(take(address, bytes, fresh.view));
-        const bool everyFresh = std::all_of(fresh.view.begin(), fresh.view.end(), [](std::uint64_t token) { return token != 0; });
-        const bool anyFresh = std::any_of(fresh.view.begin(), fresh.view.end(), [](std::uint64_t token) { return token != 0; });
-        const bool anyHeldArmed = std::any_of(tokens.begin(), tokens.end(), armed);
+        Scratch<std::uint64_t> current(count);
+        if (take != nullptr) static_cast<void>(take(address, bytes, current.view));
+        const bool anyCurrent = std::any_of(current.view.begin(), current.view.end(), [](std::uint64_t token) { return token != 0; });
         const bool anyGeneration = std::any_of(tokens.begin(), tokens.end(), [](std::uint64_t token) { return token != 0 && !armed(token); });
+        const bool everyGeneration = std::all_of(tokens.begin(), tokens.end(), [](std::uint64_t token) { return token != 0 && !armed(token); });
         std::uint64_t generation = 0;
-        if (!everyFresh || anyGeneration) {
-            generation = GuestMemory::CollectWrites(address, bytes);
-            if (generation == 0 && !everyFresh) return false;
-        }
+        bool collected = false;
+        const auto collect = [&] {
+            if (!collected) generation = GuestMemory::CollectWrites(address, bytes);
+            collected = true;
+            return generation;
+        };
         Scratch<std::uint8_t> changed(count, GuestMemory::BlockWritten);
-        if (generation != 0) {
-            if (!anyFresh && !anyHeldArmed) {
+        if (anyGeneration && collect() != 0) {
+            if (everyGeneration && !anyCurrent) {
                 const auto oldest = *std::min_element(tokens.begin(), tokens.end());
-                if (oldest != 0 && GuestMemory::UnchangedSince(address, bytes, oldest)) {
+                if (GuestMemory::UnchangedSince(address, bytes, oldest)) {
                     std::fill(written.begin(), written.end(), std::uint16_t{0});
                     return true;
                 }
             }
             Scratch<std::uint64_t> since(count);
             for (std::size_t block = 0; block < count; ++block) since.view[block] = armed(tokens[block]) ? 0 : tokens[block];
-            if (!GuestMemory::ChangedBlocks(address, bytes, since.view, changed.view)) {
-                if (!everyFresh) return false;
-                std::fill(changed.view.begin(), changed.view.end(), GuestMemory::BlockWritten);
-            }
+            if (!GuestMemory::ChangedBlocks(address, bytes, since.view, changed.view)) std::fill(changed.view.begin(), changed.view.end(), GuestMemory::BlockWritten);
         }
+        Scratch<std::uint8_t> upload(count);
         for (std::size_t block = 0; block < count; ++block) {
             const auto held = tokens[block];
-            bool same = held != 0 && !armed(held) && changed.view[block] == GuestMemory::BlockUnchanged;
-            if (fresh.view[block] != 0) {
-                if (armed(held)) same = (held & ~BufferCache::ArmedToken) == fresh.view[block];
-                tokens[block] = fresh.view[block] | BufferCache::ArmedToken;
-            } else if (!same) {
-                tokens[block] = generation;
+            written[block] = BufferCache::EveryPage;
+            if (armed(held)) {
+                if (current.view[block] == (held & ~BufferCache::ArmedToken)) written[block] = 0;
+                else upload.view[block] = 1;
+            } else if (held != 0 && changed.view[block] == GuestMemory::BlockUnchanged) {
+                written[block] = 0;
+                if (current.view[block] != 0) tokens[block] = current.view[block] | BufferCache::ArmedToken;
+            } else {
+                upload.view[block] = 1;
             }
-            written[block] = same ? std::uint16_t{0} : BufferCache::EveryPage;
+        }
+        for (std::size_t block = 0; block < count;) {
+            if (upload.view[block] == 0) {
+                ++block;
+                continue;
+            }
+            auto stop = block + 1;
+            while (stop < count && upload.view[stop] != 0) ++stop;
+            armRun(address / BufferCache::GranuleBytes, block, stop, tokens, current.view, written);
+            block = stop;
+        }
+        for (std::size_t block = 0; block < count; ++block) {
+            if (upload.view[block] == 0) continue;
+            if (current.view[block] != 0) {
+                tokens[block] = current.view[block] | BufferCache::ArmedToken;
+                continue;
+            }
+            if (collect() == 0) return false;
+            tokens[block] = generation;
         }
         return true;
     }
@@ -167,6 +197,43 @@ public:
         }
         return true;
     }
+
+private:
+    static void armRun(std::uint64_t firstBlock, std::size_t from, std::size_t to, std::span<const std::uint64_t> held, std::span<std::uint64_t> current, std::span<std::uint16_t> written) {
+        const auto arm = armBlocks.load(std::memory_order_acquire);
+        const auto rearm = rearmBlocks.load(std::memory_order_acquire);
+        if (!BufferCache::Arming() || (arm == nullptr && rearm == nullptr)) return;
+        if (std::all_of(current.begin() + static_cast<std::ptrdiff_t>(from), current.begin() + static_cast<std::ptrdiff_t>(to), [](std::uint64_t token) { return token != 0; })) return;
+        const auto run = to - from;
+        const auto base = (firstBlock + from) * BufferCache::GranuleBytes;
+        const auto bytes = run * static_cast<std::size_t>(BufferCache::GranuleBytes);
+        Scratch<std::uint64_t> words(run);
+        if (rearm != nullptr) {
+            Scratch<std::uint64_t> since(run);
+            Scratch<std::uint16_t> masks(run, BufferCache::EveryPage);
+            for (std::size_t index = 0; index < run; ++index) since.view[index] = armed(held[from + index]) ? held[from + index] & ~BufferCache::ArmedToken : 0;
+            static_cast<void>(rearm(base, bytes, since.view, words.view, masks.view));
+            for (std::size_t index = 0; index < run; ++index) {
+                if (words.view[index] != 0 && since.view[index] != 0) written[from + index] = masks.view[index];
+            }
+        } else {
+            static_cast<void>(arm(base, bytes, words.view));
+        }
+        const auto reason = unarmedReason.load(std::memory_order_acquire);
+        auto& counted = counters();
+        for (std::size_t index = 0; index < run; ++index) {
+            const bool wanted = current[from + index] == 0;
+            if (words.view[index] != 0) current[from + index] = words.view[index];
+            if (!wanted) continue;
+            add(counted.armsRequested);
+            if (words.view[index] != 0) {
+                add(counted.armsGranted);
+                continue;
+            }
+            const auto code = reason != nullptr ? static_cast<std::size_t>(reason(base + index * BufferCache::GranuleBytes)) : static_cast<std::size_t>(BufferCache::Unarmed::Other);
+            add(counted.unarmed[code < BufferCache::UnarmedReasons ? code : static_cast<std::size_t>(BufferCache::Unarmed::Other)]);
+        }
+    }
 };
 
 }
@@ -193,9 +260,17 @@ BufferCache::Source& BufferCache::TrackerSource() {
     return tracked;
 }
 
+bool BufferCache::Arming() {
+    static const bool arming = std::getenv("APS5_NO_BUFFER_CACHE_ARMING") == nullptr;
+    return arming;
+}
+
 void BufferCache::SetArmedBlocks(const ArmedBlocks& table) {
     armedTokens.store(table.tokens, std::memory_order_release);
     armedCleanSince.store(table.cleanSince, std::memory_order_release);
+    armBlocks.store(table.arm, std::memory_order_release);
+    rearmBlocks.store(table.rearm, std::memory_order_release);
+    unarmedReason.store(table.reason, std::memory_order_release);
 }
 
 BufferCache::Counts BufferCache::Counted() {
@@ -215,8 +290,11 @@ BufferCache::Counts BufferCache::Counted() {
     counts.verified = held.verified.load(std::memory_order_relaxed);
     counts.verifyRaces = held.verifyRaces.load(std::memory_order_relaxed);
     counts.armedPolls = held.armedPolls.load(std::memory_order_relaxed);
+    counts.armsRequested = held.armsRequested.load(std::memory_order_relaxed);
+    counts.armsGranted = held.armsGranted.load(std::memory_order_relaxed);
     counts.heldBytes = held.heldBytes.load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < Refusals; ++reason) counts.refused[reason] = held.refused[reason].load(std::memory_order_relaxed);
+    for (std::size_t reason = 0; reason < UnarmedReasons; ++reason) counts.unarmed[reason] = held.unarmed[reason].load(std::memory_order_relaxed);
     return counts;
 }
 
@@ -237,8 +315,21 @@ std::string BufferCache::Report() {
     }
     char line[768];
     std::snprintf(line, sizeof(line), "[buffer-cache] (10 s): %llu lookups, %llu clean, %llu answered by armed blocks alone, %llu uploaded %llu pages (%.1f MiB), %llu pending pages left as they equal guest memory; %llu index range hits; %llu mirrors made, %llu of them by a merge, %llu evicted, %.1f MiB held; %llu invalidations; %llu verified, %llu of them behind a later write; refused:%s\n", since(now.lookups, reported.lookups), since(now.clean, reported.clean), since(now.armedPolls, reported.armedPolls), since(now.uploads, reported.uploads), since(now.pages, reported.pages), static_cast<double>(now.bytes - reported.bytes) / 1048576.0, since(now.equalPages, reported.equalPages), since(now.derivedHits, reported.derivedHits), since(now.mirrors, reported.mirrors), since(now.merges, reported.merges), since(now.evictions, reported.evictions), static_cast<double>(now.heldBytes) / 1048576.0, since(now.invalidations, reported.invalidations), since(now.verified, reported.verified), since(now.verifyRaces, reported.verifyRaces), refusals.c_str());
+    std::string text = line;
+    if (now.armsRequested != reported.armsRequested) {
+        std::string reasons;
+        for (std::size_t reason = 0; reason < UnarmedReasons; ++reason) {
+            if (now.unarmed[reason] == reported.unarmed[reason]) continue;
+            char item[48];
+            std::snprintf(item, sizeof(item), " %s %llu", UnarmedNames[reason], since(now.unarmed[reason], reported.unarmed[reason]));
+            reasons += item;
+        }
+        char arming[160];
+        std::snprintf(arming, sizeof(arming), "[buffer-cache] arming (10 s): %llu blocks asked to be armed at their upload, %llu armed; left unarmed:", since(now.armsRequested, reported.armsRequested), since(now.armsGranted, reported.armsGranted));
+        text += arming + reasons + "\n";
+    }
     reported = now;
-    return line;
+    return text;
 }
 
 BufferCache::View BufferCache::Refuse(Refusal reason) {

@@ -403,6 +403,101 @@ void ArmedBlocksAnswerWithoutTheTracker(std::uint64_t base) {
     Require(unarmed && Same(unarmed, address, bytes), "a block that lost its armed token was not handed back to the write tracker");
 }
 
+std::unordered_map<std::uint64_t, std::uint16_t>& WrittenPages() {
+    static std::unordered_map<std::uint64_t, std::uint16_t> pages;
+    return pages;
+}
+
+std::unordered_map<std::uint64_t, std::uint8_t>& UnarmableBlocks() {
+    static std::unordered_map<std::uint64_t, std::uint8_t> blocks;
+    return blocks;
+}
+
+std::uint64_t& NextArmedWord() {
+    static std::uint64_t word = 34;
+    return word;
+}
+
+bool RearmForTest(std::uint64_t address, std::size_t, std::span<const std::uint64_t> since, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written) {
+    bool every = true;
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        const auto block = address / Granule + index;
+        written[index] = BufferCache::EveryPage;
+        tokens[index] = 0;
+        if (UnarmableBlocks().contains(block)) {
+            every = false;
+            continue;
+        }
+        const auto found = ArmedWords().find(block);
+        if (found != ArmedWords().end()) {
+            tokens[index] = found->second;
+            if (since[index] == found->second) written[index] = 0;
+            continue;
+        }
+        const auto pages = WrittenPages().find(block);
+        if (since[index] != 0 && pages != WrittenPages().end()) {
+            written[index] = pages->second;
+            WrittenPages().erase(pages);
+        }
+        NextArmedWord() += 8;
+        ArmedWords()[block] = NextArmedWord();
+        tokens[index] = NextArmedWord();
+    }
+    return every;
+}
+
+std::uint8_t UnarmedReasonForTest(std::uint64_t address) {
+    const auto found = UnarmableBlocks().find(address / Granule);
+    return found == UnarmableBlocks().end() ? std::uint8_t{0} : found->second;
+}
+
+void BlocksAreArmedAtTheirUpload(std::uint64_t base) {
+    struct Reset {
+        ~Reset() {
+            BufferCache::SetArmedBlocks({});
+            ArmedWords().clear();
+            WrittenPages().clear();
+            UnarmableBlocks().clear();
+        }
+    } reset;
+    BufferCache::ArmedBlocks table;
+    table.tokens = &ArmedTokensForTest;
+    table.cleanSince = &ArmedCleanForTest;
+    table.rearm = &RearmForTest;
+    table.reason = &UnarmedReasonForTest;
+    BufferCache::SetArmedBlocks(table);
+    std::uint64_t handles = 0;
+    BufferCache cache([&handles](std::size_t bytes) { return AllocateBacking(handles, bytes); }, [](std::uint64_t) { return true; }, BufferCache::TrackerSource());
+    const auto address = base + 20 * Granule;
+    const std::size_t bytes = 2 * Page;
+    const auto block = address / Granule;
+    Fill(address, bytes, 81);
+    auto before = BufferCache::Counted();
+    const auto first = cache.Acquire(address, bytes, 0, 1);
+    auto after = BufferCache::Counted();
+    Require(first && Same(first, address, bytes) && after.armsRequested == before.armsRequested + 1 && after.armsGranted == before.armsGranted + 1, "a block was not armed at its first upload");
+    before = after;
+    const auto clean = cache.Acquire(address, bytes, 0, 2);
+    after = BufferCache::Counted();
+    Require(clean && after.armedPolls == before.armedPolls + 1 && after.pages == before.pages, "a block armed at its upload was not answered by its token alone");
+    Fill(address + Page, 32, 82);
+    ArmedWords().erase(block);
+    WrittenPages()[block] = 2;
+    before = after;
+    const auto rearmed = cache.Acquire(address, bytes, 0, 3);
+    after = BufferCache::Counted();
+    Require(rearmed && Same(rearmed, address, bytes) && after.pages == before.pages + 1, "a block armed again did not upload exactly the pages written since its token");
+    const auto refused = base + 22 * Granule;
+    UnarmableBlocks()[refused / Granule] = static_cast<std::uint8_t>(BufferCache::Unarmed::Imported);
+    Fill(refused, bytes, 83);
+    before = after;
+    const auto tracked = cache.Acquire(refused, bytes, 0, 4);
+    after = BufferCache::Counted();
+    const auto imported = static_cast<std::size_t>(BufferCache::Unarmed::Imported);
+    Require(tracked && Same(tracked, refused, bytes), "a block that cannot be armed was not served through the write tracker");
+    Require(after.armsRequested == before.armsRequested + 1 && after.armsGranted == before.armsGranted && after.unarmed[imported] == before.unarmed[imported] + 1, "a block that cannot be armed was not counted with its reason");
+}
+
 }
 
 int main() {
@@ -427,6 +522,7 @@ int main() {
         if (GuestMemory::Watched(base, bytes)) {
             TrackedWritesReachTheMirror(base);
             ArmedBlocksAnswerWithoutTheTracker(base);
+            BlocksAreArmedAtTheirUpload(base);
         } else {
             std::cout << "buffer cache tracker scenarios skipped: the test block is not write watched\n";
         }
