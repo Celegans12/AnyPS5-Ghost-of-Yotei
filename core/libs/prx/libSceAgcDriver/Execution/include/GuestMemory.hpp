@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -198,6 +199,25 @@ struct CollectCounts {
     std::uint64_t memoHits = 0;
 };
 CollectCounts CollectCounted();
+enum class TrackerLockSite : std::uint8_t { Other = 0, Generation, Unchanged, Written, Watched, Collect, Mark, Store, Count };
+const char* TrackerLockSiteName(TrackerLockSite site);
+struct LockCounts {
+    static constexpr std::size_t TrackerSites = static_cast<std::size_t>(TrackerLockSite::Count);
+    static constexpr std::size_t WaitBuckets = 4;
+    struct TrackerSite {
+        std::uint64_t acquisitions = 0;
+        std::uint64_t waits = 0;
+        std::uint64_t waitNs = 0;
+        std::uint64_t committerWaits = 0;
+        std::uint64_t committerWaitNs = 0;
+        std::array<std::uint64_t, WaitBuckets> waitsBelow{};
+        std::array<std::uint64_t, TrackerSites> behindNs{};
+    };
+    std::array<TrackerSite, TrackerSites> tracker{};
+    GuestArena::MappingLockCounts mappings{};
+};
+LockCounts LockCounted();
+std::string LockReport(const LockCounts& from, const LockCounts& to);
 std::uint64_t ThreadCollectEpoch();
 std::uint64_t UnwatchSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);

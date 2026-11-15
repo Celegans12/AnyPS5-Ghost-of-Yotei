@@ -2,10 +2,12 @@
 #define CORE_LIBS_PRX_LIBC_INCLUDE_WINDOWSMAPPINGS_HPP
 
 #ifdef _WIN32
+#include "prx/libc/include/GuestArena.hpp"
 #include <windows.h>
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -39,6 +41,16 @@ public:
 
     std::uint64_t CollectWatchCalls() const {
         return collectWatchCalls.load(std::memory_order_relaxed);
+    }
+
+    enum class LockSite : std::uint8_t { Other, Forget, Collect, Count };
+    enum class ForgetOutcome : std::uint8_t { Empty, Absent, Kept, Cleared, Count };
+    static_assert(static_cast<std::size_t>(LockSite::Count) == MappingLockSites && static_cast<std::size_t>(ForgetOutcome::Count) == MappingForgetOutcomes);
+
+    MappingLockCounts LockCounted() const {
+        auto counts = mutex.Counted();
+        for (std::size_t outcome = 0; outcome < MappingForgetOutcomes; ++outcome) counts.forgets[outcome] = forgetOutcomes[outcome].load(std::memory_order_relaxed);
+        return counts;
     }
 
     void* Reserve(void* address, std::size_t bytes) {
@@ -574,8 +586,10 @@ public:
 
     void ForgetKnownZero(std::uintptr_t address, std::size_t bytes) {
         if (bytes == 0 || bytes > UINTPTR_MAX - address) return;
-        std::lock_guard lock(mutex);
-        forgetZero(address, address + bytes);
+        const SiteLock lock(mutex, LockSite::Forget);
+        const auto outcome = zeroPages.empty() ? ForgetOutcome::Empty : !zeroChunkIn(address, address + bytes) ? ForgetOutcome::Absent : forgetZero(address, address + bytes) ? ForgetOutcome::Cleared : ForgetOutcome::Kept;
+        auto& counted = forgetOutcomes[static_cast<std::size_t>(outcome)];
+        counted.store(counted.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
     }
 
     void KnownZero(std::uintptr_t address, std::size_t bytes, void (*zero)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context) {
@@ -633,7 +647,7 @@ public:
     }
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, LockSite::Collect);
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -869,18 +883,25 @@ private:
         }
     }
 
-    static void clearZeroBits(auto& bits, std::uintptr_t chunk, std::uintptr_t from, std::uintptr_t to) {
-        for (auto bit = (from - chunk) >> 12; bit < (to - chunk) >> 12; ++bit) bits[bit >> 6] &= ~(std::uint64_t{1} << (bit & 63));
+    static bool clearZeroBits(auto& bits, std::uintptr_t chunk, std::uintptr_t from, std::uintptr_t to) {
+        bool cleared = false;
+        for (auto bit = (from - chunk) >> 12; bit < (to - chunk) >> 12; ++bit) {
+            const auto mask = std::uint64_t{1} << (bit & 63);
+            cleared = cleared || (bits[bit >> 6] & mask) != 0;
+            bits[bit >> 6] &= ~mask;
+        }
+        return cleared;
     }
 
     static bool noZeroBits(const auto& bits) {
         return std::all_of(bits.begin(), bits.end(), [](std::uint64_t word) { return word == 0; });
     }
 
-    void forgetZero(std::uintptr_t start, std::uintptr_t end) {
-        if (zeroPages.empty() || end <= start) return;
+    bool forgetZero(std::uintptr_t start, std::uintptr_t end) {
+        if (zeroPages.empty() || end <= start) return false;
         start &= ~std::uintptr_t{4095};
         end = (end + 4095) & ~std::uintptr_t{4095};
+        bool cleared = false;
         if ((end - start) / chunkBytes > zeroPages.size()) {
             for (auto it = zeroPages.begin(); it != zeroPages.end();) {
                 const auto chunk = it->first;
@@ -888,21 +909,33 @@ private:
                     ++it;
                     continue;
                 }
-                clearZeroBits(it->second, chunk, std::max(start, chunk), std::min(end, chunk + chunkBytes));
+                if (clearZeroBits(it->second, chunk, std::max(start, chunk), std::min(end, chunk + chunkBytes))) cleared = true;
                 if (noZeroBits(it->second)) it = zeroPages.erase(it);
                 else ++it;
             }
-            return;
+            return cleared;
         }
         while (start < end) {
             const auto chunk = start & ~(chunkBytes - 1);
             const auto stop = std::min(end, chunk + chunkBytes);
             if (const auto found = zeroPages.find(chunk); found != zeroPages.end()) {
-                clearZeroBits(found->second, chunk, start, stop);
+                if (clearZeroBits(found->second, chunk, start, stop)) cleared = true;
                 if (noZeroBits(found->second)) zeroPages.erase(found);
             }
             start = stop;
         }
+        return cleared;
+    }
+
+    bool zeroChunkIn(std::uintptr_t start, std::uintptr_t end) const {
+        const auto first = start & ~(chunkBytes - 1);
+        if ((end - first) / chunkBytes > zeroPages.size()) {
+            return std::any_of(zeroPages.begin(), zeroPages.end(), [&](const auto& entry) { return entry.first + chunkBytes > start && entry.first < end; });
+        }
+        for (auto chunk = first; chunk < end; chunk += chunkBytes) {
+            if (zeroPages.find(chunk) != zeroPages.end()) return true;
+        }
+        return false;
     }
 
     bool anyZero(std::uintptr_t start, std::uintptr_t end) const {
@@ -1710,7 +1743,88 @@ private:
 #ifdef APS5_COUNT_MAPPING_QUERIES
     static inline std::atomic<std::uint64_t> queries{0};
 #endif
-    std::mutex mutex;
+    class SiteMutex {
+    public:
+        void lock() {
+            Lock(LockSite::Other);
+        }
+
+        bool try_lock() {
+            if (!inner.try_lock()) return false;
+            entered(LockSite::Other);
+            return true;
+        }
+
+        void unlock() {
+            inner.unlock();
+        }
+
+        void Lock(LockSite site) {
+            if (!inner.try_lock()) {
+                const auto behind = holder.load(std::memory_order_relaxed);
+                const auto start = std::chrono::steady_clock::now();
+                inner.lock();
+                const auto waited = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+                auto& counts = sites[static_cast<std::size_t>(site)];
+                add(counts.waits, 1);
+                add(counts.waitNs, waited);
+                add(counts.behindNs[behind], waited);
+            }
+            entered(site);
+        }
+
+        MappingLockCounts Counted() const {
+            MappingLockCounts counts;
+            for (std::size_t site = 0; site < MappingLockSites; ++site) {
+                counts.sites[site].acquisitions = sites[site].acquisitions.load(std::memory_order_relaxed);
+                counts.sites[site].waits = sites[site].waits.load(std::memory_order_relaxed);
+                counts.sites[site].waitNs = sites[site].waitNs.load(std::memory_order_relaxed);
+                for (std::size_t behind = 0; behind < MappingLockSites; ++behind) counts.sites[site].behindNs[behind] = sites[site].behindNs[behind].load(std::memory_order_relaxed);
+            }
+            return counts;
+        }
+
+    private:
+        struct Site {
+            std::atomic<std::uint64_t> acquisitions{0};
+            std::atomic<std::uint64_t> waits{0};
+            std::atomic<std::uint64_t> waitNs{0};
+            std::array<std::atomic<std::uint64_t>, MappingLockSites> behindNs{};
+        };
+
+        static void add(std::atomic<std::uint64_t>& counter, std::uint64_t amount) {
+            counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+        }
+
+        void entered(LockSite site) {
+            add(sites[static_cast<std::size_t>(site)].acquisitions, 1);
+            holder.store(static_cast<std::uint8_t>(site), std::memory_order_relaxed);
+        }
+
+        std::mutex inner;
+        std::atomic<std::uint8_t> holder{0};
+        std::array<Site, MappingLockSites> sites{};
+    };
+
+    class SiteLock {
+    public:
+        SiteLock(SiteMutex& mutex, LockSite site) : mutex(mutex) {
+            mutex.Lock(site);
+        }
+
+        ~SiteLock() {
+            mutex.unlock();
+        }
+
+        SiteLock(const SiteLock&) = delete;
+        SiteLock& operator=(const SiteLock&) = delete;
+
+    private:
+        SiteMutex& mutex;
+    };
+
+    SiteMutex mutex;
+    std::array<std::atomic<std::uint64_t>, MappingForgetOutcomes> forgetOutcomes{};
     HANDLE zeroSection = nullptr;
     AllocateFunction allocate = nullptr;
     MapFunction map = nullptr;

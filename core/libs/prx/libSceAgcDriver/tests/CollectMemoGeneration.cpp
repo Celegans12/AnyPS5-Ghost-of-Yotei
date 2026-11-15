@@ -649,6 +649,48 @@ void CheckWatchCallsCounted() {
 }
 #endif
 
+void CheckTrackerWaitsCounted() {
+    const auto mark = static_cast<std::size_t>(TrackerLockSite::Mark);
+    const auto collect = static_cast<std::size_t>(TrackerLockSite::Collect);
+    const auto address = Base + 66 * Block;
+    bool charged = false;
+    for (int attempt = 0; attempt < 20 && !charged; ++attempt) {
+        const auto before = LockCounted();
+        std::atomic<bool> started{false};
+        std::thread marker;
+        {
+            PausedWalk walker(1, [&] { CollectWritesUncached(address, Block); });
+            marker = std::thread([&] {
+                MarkProofThread();
+                started.store(true);
+                MarkWritten(address + Block, Page);
+            });
+            while (!started.load()) std::this_thread::yield();
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+            walker.Release();
+        }
+        marker.join();
+        const auto after = LockCounted();
+        const auto& was = before.tracker[mark];
+        const auto& now = after.tracker[mark];
+        Require(now.acquisitions == was.acquisitions + 1, "a marked store was not counted as one tracker acquisition");
+        Require(after.tracker[collect].acquisitions == before.tracker[collect].acquisitions + 1, "a collect was not counted as one tracker acquisition");
+        Require(now.waits - was.waits <= 1, "one acquisition was counted as several waits");
+        if (now.waits == was.waits) continue;
+        const auto waited = now.waitNs - was.waitNs;
+        Require(waited != 0, "a wait for the tracker took no time");
+        Require(now.behindNs[collect] - was.behindNs[collect] == waited, "a wait behind a collect was not charged to it");
+        Require(now.committerWaits == was.committerWaits + 1 && now.committerWaitNs - was.committerWaitNs == waited, "the committer's wait was not attributed to it");
+        std::uint64_t bucketed = 0;
+        for (std::size_t bucket = 0; bucket < LockCounts::WaitBuckets; ++bucket) bucketed += now.waitsBelow[bucket] - was.waitsBelow[bucket];
+        Require(bucketed == 1, "a wait was not counted in one duration bucket");
+        const auto report = LockReport(before, after);
+        Require(report.find(" mark 1 acquired, 1 waited") != std::string::npos && report.find("behind collect") != std::string::npos, "the lock report does not name the wait: " + report);
+        charged = true;
+    }
+    Require(charged, "a store made while a walk held the tracker never waited for it");
+}
+
 void CheckCoverageThreadAndDriverWrites() {
     BumpCollectEpoch();
     Require(CollectWrites(Base, 4 * Block) != 0, "the covering collection failed");
@@ -714,6 +756,7 @@ int main(int argc, char** argv) {
         CheckWaiterNeedingLaterTickWalks();
         CheckMappingChangeForcesWalk();
         CheckFailedRequestPublishesNothing();
+        CheckTrackerWaitsCounted();
 #ifdef _WIN32
         CheckWatchCallsCounted();
 #endif

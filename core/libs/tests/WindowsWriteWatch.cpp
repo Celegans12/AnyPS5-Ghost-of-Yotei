@@ -1029,6 +1029,60 @@ void CheckKnownZeroFirstReads() {
     VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+void CheckLockCounts() {
+    auto& mappings = Mappings::Get();
+    auto* memory = static_cast<unsigned char*>(mappings.Reserve(nullptr, Bytes));
+    Require(memory != nullptr, "lock count reservation failed");
+    mappings.Commit(memory, Bytes, PAGE_READWRITE, Bytes, true);
+    const auto address = reinterpret_cast<std::uintptr_t>(memory);
+    const auto forget = static_cast<std::size_t>(Mappings::LockSite::Forget);
+    const auto collect = static_cast<std::size_t>(Mappings::LockSite::Collect);
+    const auto other = static_cast<std::size_t>(Mappings::LockSite::Other);
+    const auto outcome = [](Mappings::ForgetOutcome value) { return static_cast<std::size_t>(value); };
+    const auto before = mappings.LockCounted();
+    mappings.ForgetKnownZero(address + 2 * Small, Small);
+    mappings.ForgetKnownZero(address + 2 * Small, Small);
+    std::array<void*, 32> written{};
+    std::size_t count = written.size();
+    Require(mappings.Collect(address, Bytes, written.data(), &count, true), "lock count collect failed");
+    const auto counted = mappings.LockCounted();
+    Require(counted.sites[forget].acquisitions == before.sites[forget].acquisitions + 2, "a known zero forget was not counted as one acquisition");
+    Require(counted.sites[collect].acquisitions == before.sites[collect].acquisitions + 1, "a collect was not counted as one acquisition");
+    Require(counted.sites[other].acquisitions == before.sites[other].acquisitions, "a forget or a collect was counted as another acquisition");
+    Require(counted.forgets[outcome(Mappings::ForgetOutcome::Cleared)] == before.forgets[outcome(Mappings::ForgetOutcome::Cleared)] + 1, "a forget that cleared a known zero page was not counted as one");
+    Require(counted.forgets[outcome(Mappings::ForgetOutcome::Kept)] == before.forgets[outcome(Mappings::ForgetOutcome::Kept)] + 1, "a forget over a page already forgotten was not counted as keeping its chunk");
+    Require(KnownZeroPages(memory, Bytes) == PagesBelow(Bytes / Small, {2}), "a counted forget cleared another page or kept its own");
+    mappings.Reset(memory, Bytes);
+    const auto reset = mappings.LockCounted();
+    Require(reset.sites[other].acquisitions > counted.sites[other].acquisitions, "a reset was not counted as an acquisition");
+    mappings.ForgetKnownZero(address, Bytes);
+    const auto after = mappings.LockCounted();
+    const auto absent = outcome(Mappings::ForgetOutcome::Absent);
+    const auto empty = outcome(Mappings::ForgetOutcome::Empty);
+    Require(after.forgets[absent] + after.forgets[empty] == reset.forgets[absent] + reset.forgets[empty] + 1, "a forget over a range without known zero pages was not counted as one");
+    std::atomic<bool> stop{false};
+    std::thread collector([&] {
+        std::array<void*, 32> pages{};
+        while (!stop.load(std::memory_order_acquire)) {
+            std::size_t found = pages.size();
+            mappings.Collect(address, Bytes, pages.data(), &found, false);
+        }
+    });
+    for (int round = 0; round < 20000; ++round) mappings.ForgetKnownZero(address, Bytes);
+    stop.store(true, std::memory_order_release);
+    collector.join();
+    const auto contended = mappings.LockCounted();
+    for (std::size_t site = 0; site < GuestArena::MappingLockSites; ++site) {
+        const auto& counts = contended.sites[site];
+        Require(counts.waits <= counts.acquisitions, "a site waited more often than it acquired the mapping lock");
+        std::uint64_t behind = 0;
+        for (std::size_t holder = 0; holder < GuestArena::MappingLockSites; ++holder) behind += counts.behindNs[holder];
+        Require(behind == counts.waitNs, "the waits of a site are not all charged to a holder");
+    }
+    Require(contended.sites[forget].acquisitions == after.sites[forget].acquisitions + 20000, "contended forgets were not all counted");
+    VirtualFree(memory, 0, MEM_RELEASE);
+}
+
 void CheckKnownZeroShared() {
     Region region;
     Require(KnownZeroPages(region.first, Bytes).empty(), "shared memory is known zero");
@@ -1073,6 +1127,7 @@ int main(int argc, char** argv) {
         CheckKnownZeroResident();
         CheckKnownZeroShared();
         CheckKnownZeroFirstReads();
+        CheckLockCounts();
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

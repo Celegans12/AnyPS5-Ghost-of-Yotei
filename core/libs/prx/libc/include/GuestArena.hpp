@@ -18,6 +18,19 @@ inline constexpr std::uintptr_t GuestAddressOffset = 0x0000100000000000ull;
 inline constexpr std::uintptr_t GuestAddressOffset = 0;
 #endif
 
+inline constexpr std::size_t MappingLockSites = 3;
+inline constexpr std::size_t MappingForgetOutcomes = 4;
+struct MappingLockSiteCounts {
+    std::uint64_t acquisitions = 0;
+    std::uint64_t waits = 0;
+    std::uint64_t waitNs = 0;
+    std::uint64_t behindNs[MappingLockSites] = {};
+};
+struct MappingLockCounts {
+    MappingLockSiteCounts sites[MappingLockSites];
+    std::uint64_t forgets[MappingForgetOutcomes] = {};
+};
+
 #ifndef _WIN32
 using SharedBackingResolver = bool (*)(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);
 using SharedBackingWriter = bool (*)(std::uintptr_t address, const void* source, std::size_t bytes);
@@ -59,6 +72,7 @@ bool GuestArenaCollectWrites_nid_postfix(std::uintptr_t address, std::size_t byt
 bool GuestArenaCollectArmedWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear);
 bool GuestArenaCollectFreshWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear);
 std::uint64_t GuestArenaCollectWatchCalls_nid_no_patch();
+void GuestArenaMappingLockCounts_nid_no_patch(MappingLockCounts* counts);
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes);
 std::size_t GuestArenaHostRegions_nid_no_patch(std::uintptr_t* regions, std::size_t capacity);
 bool GuestArenaHostRegionIndexActive_nid_no_patch();

@@ -483,6 +483,10 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto contentRecipes = DriverDetail::ContentRecipesHeld();
     AgcDriver::ProfilePrint_nid_no_patch("%s", VulkanDevice::DrawRecipeDrawsReport(contentRecipes.held, contentRecipes.evicted).c_str());
     if (DrawSiteAccess::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("%s", DrawSiteAccess::Report().c_str());
+    static GuestMemory::LockCounts reportedLocks{};
+    const auto locks = GuestMemory::LockCounted();
+    AgcDriver::ProfilePrint_nid_no_patch("[locks] (10 s): %s\n", GuestMemory::LockReport(reportedLocks, locks).c_str());
+    reportedLocks = locks;
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};
     drainWaitNs = {};

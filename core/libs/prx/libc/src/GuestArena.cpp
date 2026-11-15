@@ -705,6 +705,10 @@ std::uint64_t GuestArenaCollectWatchCalls_nid_no_patch() {
     return WindowsMappings::Get().CollectWatchCalls();
 }
 
+void GuestArenaMappingLockCounts_nid_no_patch(MappingLockCounts* counts) {
+    *counts = WindowsMappings::Get().LockCounted();
+}
+
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes) {
     return Arena::Get().OverlapsHostRegion(address, bytes);
 }
