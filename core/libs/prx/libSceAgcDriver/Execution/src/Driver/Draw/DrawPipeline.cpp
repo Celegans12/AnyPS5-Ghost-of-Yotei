@@ -709,6 +709,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     reportedCollects = collects;
     reportedBumps = bumps;
     reportedWalker = walker;
+    GuestMemory::ReportCollectCosts();
     const auto dirty = GuestMemory::TakeDirtyBlockCounts();
     const auto share = [](std::uint64_t part, std::uint64_t whole) { return whole == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(whole); };
     AgcDriver::ProfilePrint_nid_no_patch("[dirty] (10 s): %llu distinct 64 KiB blocks found written by the CPU, %llu of them in more than one collect epoch, %llu (block, epoch) findings; collects %.1f MiB, %.1f %% in blocks written in this or the previous 10 s; variant validations %.1f MiB, %.1f %% in such blocks\n", static_cast<unsigned long long>(dirty.distinct), static_cast<unsigned long long>(dirty.recurrent), static_cast<unsigned long long>(dirty.findings), static_cast<double>(dirty.collectBytes) / 1048576.0, share(dirty.collectDirtyBytes, dirty.collectBytes), static_cast<double>(dirty.variantBytes) / 1048576.0, share(dirty.variantDirtyBytes, dirty.variantBytes));

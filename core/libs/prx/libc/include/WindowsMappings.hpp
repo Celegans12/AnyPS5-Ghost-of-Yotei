@@ -46,6 +46,16 @@ public:
         return collectWatchCalls.load(std::memory_order_relaxed);
     }
 
+    static void TimeWriteWatch(bool timed) {
+        timeWriteWatch.store(timed, std::memory_order_relaxed);
+    }
+
+    static void WriteWatchCost(std::uint64_t* threadTicks, std::uint64_t* calls, std::uint64_t* ticks) {
+        *threadTicks = threadWatchTicks();
+        *calls = watchCalls.load(std::memory_order_relaxed);
+        *ticks = watchTicks.load(std::memory_order_relaxed);
+    }
+
     enum class LockSite : std::uint8_t { Other, Forget, Collect, Count };
     enum class ForgetOutcome : std::uint8_t { Empty, Absent, Kept, Cleared, Count };
     static_assert(static_cast<std::size_t>(LockSite::Count) == MappingLockSites && static_cast<std::size_t>(ForgetOutcome::Count) == MappingForgetOutcomes);
@@ -1028,7 +1038,10 @@ private:
     UINT watchWrites(DWORD flags, void* address, std::size_t bytes, void** pages, ULONG_PTR* count, DWORD* granularity, bool dropZero = false, bool aloft = false) {
         const auto capacity = *count;
         const auto flight = aloft ? mutex.TakeOff(reinterpret_cast<std::uintptr_t>(address), reinterpret_cast<std::uintptr_t>(address) + bytes) : SiteMutex::Grounded;
+        const bool timed = timeWriteWatch.load(std::memory_order_relaxed);
+        const auto started = timed ? __builtin_ia32_rdtsc() : 0;
         const auto result = GetWriteWatch(flags, address, bytes, pages, count, granularity);
+        if (timed) noteWatchCost(__builtin_ia32_rdtsc() - started);
         if (flight != SiteMutex::Grounded) mutex.Land(flight);
         if (result != 0 || zeroPages.empty()) return result;
         const auto first = reinterpret_cast<std::uintptr_t>(address) & ~std::uintptr_t{4095};
@@ -1057,7 +1070,13 @@ private:
 
     bool resetWrites(std::uintptr_t start, std::uintptr_t end) {
         collectWatchCalls.fetch_add(1, std::memory_order_relaxed);
-        if (!anyZero(start, end)) return ResetWriteWatch(reinterpret_cast<void*>(start), end - start) == 0;
+        if (!anyZero(start, end)) {
+            const bool timed = timeWriteWatch.load(std::memory_order_relaxed);
+            const auto started = timed ? __builtin_ia32_rdtsc() : 0;
+            const bool reset = ResetWriteWatch(reinterpret_cast<void*>(start), end - start) == 0;
+            if (timed) noteWatchCost(__builtin_ia32_rdtsc() - started);
+            return reset;
+        }
         std::vector<void*> written(((end + 4095) & ~std::uintptr_t{4095}) / 4096 - (start & ~std::uintptr_t{4095}) / 4096);
         ULONG_PTR reported = written.size();
         DWORD granularity = 0;
@@ -1786,6 +1805,20 @@ private:
     std::uint64_t collectPieces = 0;
 #endif
     std::atomic<std::uint64_t> collectWatchCalls{0};
+    static inline std::atomic<bool> timeWriteWatch{false};
+    static inline std::atomic<std::uint64_t> watchCalls{0};
+    static inline std::atomic<std::uint64_t> watchTicks{0};
+
+    static std::uint64_t& threadWatchTicks() {
+        static thread_local std::uint64_t ticks = 0;
+        return ticks;
+    }
+
+    static void noteWatchCost(std::uint64_t ticks) {
+        threadWatchTicks() += ticks;
+        watchCalls.fetch_add(1, std::memory_order_relaxed);
+        watchTicks.fetch_add(ticks, std::memory_order_relaxed);
+    }
     Ranges freshRanges;
     std::unordered_map<std::uintptr_t, std::array<std::uint64_t, chunkBytes / 4096 / 64>> zeroPages;
     std::map<std::uintptr_t, View> views;

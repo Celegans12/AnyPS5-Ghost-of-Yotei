@@ -353,6 +353,144 @@ std::atomic<std::uint64_t> collectWalkedEpochs{0};
 std::atomic<std::uint64_t> committerWatchCalls{0};
 thread_local bool proofThread = false;
 std::atomic<std::uint64_t> unwatchSerial{0};
+
+std::uint64_t collectTicks() {
+#if defined(__x86_64__)
+    return __builtin_ia32_rdtsc();
+#else
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+#endif
+}
+
+struct CollectClock {
+    std::uint64_t ticks = collectTicks();
+    std::chrono::steady_clock::time_point time = std::chrono::steady_clock::now();
+};
+
+const CollectClock* collectClock() {
+    static const CollectClock* const origin = []() -> const CollectClock* {
+        if (std::getenv("APS5_PIPELINE_STATS") == nullptr) return nullptr;
+#ifdef _WIN32
+        GuestArena::GuestArenaTimeWriteWatch_nid_no_patch(true);
+#endif
+        return new CollectClock;
+    }();
+    return origin;
+}
+
+bool collectTimed() {
+    return collectClock() != nullptr;
+}
+
+struct CollectCost {
+    std::atomic<std::uint64_t> observes{0};
+    std::atomic<std::uint64_t> observeTicks{0};
+    std::atomic<std::uint64_t> memoObserves{0};
+    std::atomic<std::uint64_t> memoTicks{0};
+    std::atomic<std::uint64_t> lockTicks{0};
+    std::atomic<std::uint64_t> arenaTicks{0};
+    std::atomic<std::uint64_t> watchTicks{0};
+    std::atomic<std::uint64_t> stamped{0};
+    std::array<std::atomic<std::uint64_t>, 3> walks{};
+    std::array<std::atomic<std::uint64_t>, 3> walkTicks{};
+    std::array<std::atomic<std::uint64_t>, 3> walkWatchTicks{};
+    std::array<std::atomic<std::uint64_t>, 3> walkBytes{};
+    std::array<std::atomic<std::uint64_t>, 3> cleanWalks{};
+    std::array<std::atomic<std::uint64_t>, 3> cleanTicks{};
+    std::array<std::atomic<std::uint64_t>, 3> cleanWatchTicks{};
+};
+
+thread_local std::uint64_t threadWalkWatchTicks = 0;
+
+std::array<CollectCost, 2> collectCosts;
+
+CollectCost& collectCost() {
+    return collectCosts[proofThread ? 0 : 1];
+}
+
+class ObserveCost {
+public:
+    ObserveCost() : start(collectTimed() ? collectTicks() : 0) {}
+    ~ObserveCost() {
+        if (!collectTimed()) return;
+        auto& cost = collectCost();
+        cost.observes.fetch_add(1, std::memory_order_relaxed);
+        cost.observeTicks.fetch_add(collectTicks() - start, std::memory_order_relaxed);
+    }
+    ObserveCost(const ObserveCost&) = delete;
+    ObserveCost& operator=(const ObserveCost&) = delete;
+
+    void Memo() const {
+        if (!collectTimed()) return;
+        auto& cost = collectCost();
+        cost.memoObserves.fetch_add(1, std::memory_order_relaxed);
+        cost.memoTicks.fetch_add(collectTicks() - start, std::memory_order_relaxed);
+    }
+
+private:
+    std::uint64_t start;
+};
+
+class WalkCost {
+public:
+    WalkCost(std::uint64_t first, std::uint64_t stop) : bytes(stop - first), start(collectTimed() ? collectTicks() : 0) {
+        threadWalkWatchTicks = 0;
+    }
+    WalkCost(const WalkCost&) = delete;
+    WalkCost& operator=(const WalkCost&) = delete;
+
+    void Finish(std::size_t stamped) const {
+        if (!collectTimed()) return;
+        auto& cost = collectCost();
+        const std::size_t size = bytes <= 0x10000 ? 0 : bytes <= 0x200000 ? 1 : 2;
+        const auto spent = collectTicks() - start;
+        cost.walks[size].fetch_add(1, std::memory_order_relaxed);
+        cost.walkTicks[size].fetch_add(spent, std::memory_order_relaxed);
+        cost.walkWatchTicks[size].fetch_add(threadWalkWatchTicks, std::memory_order_relaxed);
+        cost.walkBytes[size].fetch_add(bytes, std::memory_order_relaxed);
+        if (stamped == 0) {
+            cost.cleanWalks[size].fetch_add(1, std::memory_order_relaxed);
+            cost.cleanTicks[size].fetch_add(spent, std::memory_order_relaxed);
+            cost.cleanWatchTicks[size].fetch_add(threadWalkWatchTicks, std::memory_order_relaxed);
+        }
+        cost.stamped.fetch_add(stamped, std::memory_order_relaxed);
+    }
+
+private:
+    std::uint64_t bytes;
+    std::uint64_t start;
+};
+
+#ifdef _WIN32
+class ArenaCollectCost {
+public:
+    ArenaCollectCost() : timed(collectTimed()) {
+        if (!timed) return;
+        std::uint64_t calls = 0;
+        std::uint64_t ticks = 0;
+        GuestArena::GuestArenaWriteWatchCost_nid_no_patch(&watchBefore, &calls, &ticks);
+        start = collectTicks();
+    }
+    ~ArenaCollectCost() {
+        if (!timed) return;
+        auto& cost = collectCost();
+        cost.arenaTicks.fetch_add(collectTicks() - start, std::memory_order_relaxed);
+        std::uint64_t watchAfter = 0;
+        std::uint64_t calls = 0;
+        std::uint64_t ticks = 0;
+        GuestArena::GuestArenaWriteWatchCost_nid_no_patch(&watchAfter, &calls, &ticks);
+        cost.watchTicks.fetch_add(watchAfter - watchBefore, std::memory_order_relaxed);
+        threadWalkWatchTicks += watchAfter - watchBefore;
+    }
+    ArenaCollectCost(const ArenaCollectCost&) = delete;
+    ArenaCollectCost& operator=(const ArenaCollectCost&) = delete;
+
+private:
+    bool timed;
+    std::uint64_t watchBefore = 0;
+    std::uint64_t start = 0;
+};
+#endif
 std::atomic<std::uint64_t> collectDirty{0};
 #ifndef _WIN32
 std::atomic<std::uint64_t> collectDirtyRuns{0};
@@ -2305,7 +2443,12 @@ bool collectWindowsWrites(StampRuns& runs, std::uint64_t first, std::uint64_t st
         auto cursor = first;
         while (cursor < stop) {
             std::size_t count = tracker.pages.size();
-            if (!collect(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, clear)) return false;
+            bool collected = false;
+            {
+                const ArenaCollectCost timed;
+                collected = collect(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, clear);
+            }
+            if (!collected) return false;
             for (std::size_t i = 0; i < count; ++i) {
                 const auto page = reinterpret_cast<std::uintptr_t>(tracker.pages[i]);
                 stampWrittenRun(&runs, page, page + WritePageBytes);
@@ -2343,6 +2486,7 @@ void noteRefusedWalk(WriteTracker& tracker, std::uint64_t first, std::uint64_t s
 #endif
 
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false, const WindowCopy* window = nullptr) {
+    const WalkCost walked(first, stop);
     ++tracker.generation;
     observationPoint(1);
     StampRuns runs{tracker, kind, 0, window, {}};
@@ -2362,6 +2506,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 #ifdef _WIN32
     if (!complete) noteRefusedWalk(tracker, first, stop);
 #endif
+    walked.Finish(runs.stamped);
     return complete;
 }
 
@@ -2376,7 +2521,12 @@ bool collectAloft(std::uint64_t first, std::uint64_t stop, std::vector<std::uint
     auto cursor = first;
     while (cursor < stop) {
         std::size_t count = buffer.size();
-        if (!GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(cursor), static_cast<std::size_t>(stop - cursor), buffer.data(), &count, true)) return false;
+        bool collected = false;
+        {
+            const ArenaCollectCost timed;
+            collected = GuestArena::GuestArenaCollectWrites_nid_postfix(static_cast<std::uintptr_t>(cursor), static_cast<std::size_t>(stop - cursor), buffer.data(), &count, true);
+        }
+        if (!collected) return false;
         for (std::size_t i = 0; i < count; ++i) written.push_back(reinterpret_cast<std::uintptr_t>(buffer[i]));
         if (count < buffer.size()) break;
         cursor = reinterpret_cast<std::uintptr_t>(buffer[count - 1]) + WritePageBytes;
@@ -2393,11 +2543,14 @@ bool walkObserved(WriteTracker& tracker, TrackerLock& lock, std::uint64_t first,
         if (auto* flight = tracker.takeOff(first, stop)) {
             auto& written = ThreadScratch<std::vector<std::uintptr_t>, FlightPagesSlot>();
             written.clear();
+            const WalkCost walked(first, stop);
+            std::size_t stamped = 0;
             const auto land = [&] {
                 ++tracker.generation;
                 StampRuns runs{tracker, StampKind::Cpu};
                 for (const auto page : written) stampWrittenRun(&runs, page, page + WritePageBytes);
                 if (runs.stamped != 0) collectDirty.fetch_add(1, std::memory_order_relaxed);
+                stamped = runs.stamped;
                 tracker.land(*flight);
             };
             bool complete = false;
@@ -2411,6 +2564,7 @@ bool walkObserved(WriteTracker& tracker, TrackerLock& lock, std::uint64_t first,
             }
             land();
             if (!complete) noteRefusedWalk(tracker, first, stop);
+            walked.Finish(stamped);
             return complete;
         }
     }
@@ -2429,13 +2583,17 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     const auto first = address & ~(page - 1);
     const auto stop = (address + bytes + page - 1) & ~(page - 1);
     if (stop <= first) return {Status::Uncovered, 0};
+    const ObserveCost observed;
     const auto epoch = currentCollectEpoch();
     const bool shared = memoized && collectMemoEnabled() && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0;
     if (shared && tracker.observedSince(first, stop, epoch, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix())) {
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+        observed.Memo();
         return {Status::Complete, tracker.stable.load(std::memory_order_acquire)};
     }
+    const auto lockStart = collectTimed() ? collectTicks() : 0;
     auto lock = lockTracker(tracker, TrackerLockSite::Collect, first, stop);
+    if (collectTimed()) collectCost().lockTicks.fetch_add(collectTicks() - lockStart, std::memory_order_relaxed);
     tracker.initialize();
     if (!tracker.watched || !tracker.covers(address, bytes)) return {Status::Uncovered, 0};
     syncObservationContext(tracker, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix());
@@ -2636,6 +2794,53 @@ bool UnchangedSinceEpochStart(std::uint64_t address, std::size_t bytes) {
 
 std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
+}
+
+void ReportCollectCosts() {
+    const auto* origin = collectClock();
+    if (origin == nullptr) return;
+    const auto ticks = collectTicks();
+    const auto elapsed = std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - origin->time).count();
+    const double nanoseconds = ticks == origin->ticks ? 0.0 : elapsed / static_cast<double>(ticks - origin->ticks);
+    const auto ms = [&](std::uint64_t spent) { return static_cast<double>(spent) * nanoseconds / 1e6; };
+    const auto take = [](std::atomic<std::uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+    const char* const names[] = {"committer", "other threads"};
+    const char* const sizes[] = {"up to 64 KiB", "up to 2 MiB", "larger"};
+    for (std::size_t index = 0; index < collectCosts.size(); ++index) {
+        auto& cost = collectCosts[index];
+        const auto observes = take(cost.observes);
+        const auto observeTicks = take(cost.observeTicks);
+        const auto memoObserves = take(cost.memoObserves);
+        const auto memoTicks = take(cost.memoTicks);
+        const auto lockTicks = take(cost.lockTicks);
+        const auto arenaTicks = take(cost.arenaTicks);
+        const auto watchTicks = take(cost.watchTicks);
+        const auto stamped = take(cost.stamped);
+        AgcDriver::ProfilePrint_nid_no_patch("[collect-cost] (10 s) %s: %llu observes taking %.2f ms, %llu of them answered by the memo in %.2f ms; %.2f ms waiting for the tracker; %.2f ms of the walks inside the arena collect, %.2f ms of that inside GetWriteWatch; %llu pages stamped; walks", names[index], static_cast<unsigned long long>(observes), ms(observeTicks), static_cast<unsigned long long>(memoObserves), ms(memoTicks), ms(lockTicks), ms(arenaTicks), ms(watchTicks), static_cast<unsigned long long>(stamped));
+        for (std::size_t size = 0; size < cost.walks.size(); ++size) {
+            const auto walks = take(cost.walks[size]);
+            const auto walkTicks = take(cost.walkTicks[size]);
+            const auto walkWatchTicks = take(cost.walkWatchTicks[size]);
+            const auto walkBytes = take(cost.walkBytes[size]);
+            const auto cleanWalks = take(cost.cleanWalks[size]);
+            const auto cleanTicks = take(cost.cleanTicks[size]);
+            const auto cleanWatchTicks = take(cost.cleanWatchTicks[size]);
+            AgcDriver::ProfilePrint_nid_no_patch("%s %s: %llu of %.0f KiB taking %.2f ms, %.2f ms of it in GetWriteWatch, of which %llu found nothing written and took %.2f ms, %.2f ms of it in GetWriteWatch", size == 0 ? "" : ";", sizes[size], static_cast<unsigned long long>(walks), walks == 0 ? 0.0 : static_cast<double>(walkBytes) / 1024.0 / static_cast<double>(walks), ms(walkTicks), ms(walkWatchTicks), static_cast<unsigned long long>(cleanWalks), ms(cleanTicks), ms(cleanWatchTicks));
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("\n");
+    }
+#ifdef _WIN32
+    static std::uint64_t reportedCalls = 0;
+    static std::uint64_t reportedTicks = 0;
+    std::uint64_t thread = 0;
+    std::uint64_t calls = 0;
+    std::uint64_t watchTicks = 0;
+    GuestArena::GuestArenaWriteWatchCost_nid_no_patch(&thread, &calls, &watchTicks);
+    const auto each = [&](std::uint64_t spent, std::uint64_t count) { return count == 0 ? 0.0 : static_cast<double>(spent) * nanoseconds / 1e3 / static_cast<double>(count); };
+    AgcDriver::ProfilePrint_nid_no_patch("[collect-cost] (10 s) every GetWriteWatch and ResetWriteWatch of the arena, collects and owned proofs together: %llu calls taking %.2f ms, %.2f us each\n", static_cast<unsigned long long>(calls - reportedCalls), ms(watchTicks - reportedTicks), each(watchTicks - reportedTicks, calls - reportedCalls));
+    reportedCalls = calls;
+    reportedTicks = watchTicks;
+#endif
 }
 
 CollectCounts CollectCounted() {

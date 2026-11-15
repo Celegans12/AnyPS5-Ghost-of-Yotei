@@ -709,6 +709,14 @@ void GuestArenaMappingLockCounts_nid_no_patch(MappingLockCounts* counts) {
     *counts = WindowsMappings::Get().LockCounted();
 }
 
+void GuestArenaTimeWriteWatch_nid_no_patch(bool timed) {
+    WindowsMappings::TimeWriteWatch(timed);
+}
+
+void GuestArenaWriteWatchCost_nid_no_patch(std::uint64_t* threadTicks, std::uint64_t* calls, std::uint64_t* ticks) {
+    WindowsMappings::WriteWatchCost(threadTicks, calls, ticks);
+}
+
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes) {
     return Arena::Get().OverlapsHostRegion(address, bytes);
 }

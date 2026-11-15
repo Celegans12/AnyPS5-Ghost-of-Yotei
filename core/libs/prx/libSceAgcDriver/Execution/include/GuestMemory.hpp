@@ -201,6 +201,7 @@ struct CollectCounts {
     std::uint64_t walkedEpochs = 0;
 };
 CollectCounts CollectCounted();
+void ReportCollectCosts();
 enum class TrackerLockSite : std::uint8_t { Other = 0, Generation, Unchanged, Written, Watched, Collect, Mark, Store, Count };
 const char* TrackerLockSiteName(TrackerLockSite site);
 struct LockCounts {

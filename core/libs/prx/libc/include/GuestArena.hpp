@@ -73,6 +73,8 @@ bool GuestArenaCollectArmedWrites_nid_postfix(std::uintptr_t address, std::size_
 bool GuestArenaCollectFreshWrites_nid_postfix(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear);
 std::uint64_t GuestArenaCollectWatchCalls_nid_no_patch();
 void GuestArenaMappingLockCounts_nid_no_patch(MappingLockCounts* counts);
+void GuestArenaTimeWriteWatch_nid_no_patch(bool timed);
+void GuestArenaWriteWatchCost_nid_no_patch(std::uint64_t* threadTicks, std::uint64_t* calls, std::uint64_t* ticks);
 bool GuestArenaHostRegionOverlaps_nid_postfix(std::uintptr_t address, std::size_t bytes);
 std::size_t GuestArenaHostRegions_nid_no_patch(std::uintptr_t* regions, std::size_t capacity);
 bool GuestArenaHostRegionIndexActive_nid_no_patch();
