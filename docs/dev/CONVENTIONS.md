@@ -39,6 +39,7 @@ With `APS5_PAGE_TRACK=1` on Windows, a reader that keeps a copy of guest memory 
 - The reader takes the token first and reads the bytes after. A write that landed before the block was protected is in those bytes; a write after the token ends it. `GuestPageTrackRearm` names the 4 KiB pages written since a token only while no collect took them; otherwise it reports every page.
 - A token says nothing about GPU writes, which is why an imported block is never armed, nor about a kernel write that was pending when the block was protected.
 - Arming protects the block first and resets its write watch after; the pages that reset reports stay pending for the collect that covers them, so the write tracker of the driver loses none.
+- A request arms a block whatever its collects found, without the wait of 1 to 64 frames that a collect observes. Two limits remain, counted in the frames the AGC driver reports: a block that faulted twice in a frame is not armed again on request before the next frame, and a block that faulted in three of its last eight frames rests for 64 frames. `GuestPageTrackReasons` tells both apart, with the frames left, so that a reader can stop asking and treat the block as rewritten every frame.
 
 ### Host-only test executables
 

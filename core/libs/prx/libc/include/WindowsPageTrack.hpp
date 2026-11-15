@@ -26,6 +26,7 @@ public:
     static constexpr unsigned LongestWait = 64;
     static constexpr std::uint32_t WorthAnswers = 16;
     static constexpr std::uint64_t TokenLimit = std::uint64_t{1} << 63;
+    static constexpr std::uint32_t RequestFaults = 2;
     enum class State : std::uint64_t { Unarmed = 0, Arming = 1, Armed = 2, Opening = 3, Written = 4 };
     struct Block {
         std::atomic<std::uint64_t> word{0};
@@ -39,6 +40,7 @@ public:
         std::atomic<std::uint32_t> restUntil{0};
         std::uint32_t answers = 0;
         std::uint32_t wait = 0;
+        std::atomic<std::uint32_t> frameFaults{0};
         std::atomic<std::uint8_t> edge{0};
     };
     struct Counts {
@@ -231,6 +233,8 @@ public:
         if (flags != 0) return Reason(PageTrackReason::Barred);
         const std::uint32_t rest = entry.restUntil;
         if (now < rest) return Reason(PageTrackReason::Resting, rest - now);
+        const std::uint32_t last = entry.faultPeriod;
+        if (last == now && entry.frameFaults.load(std::memory_order_relaxed) >= RequestFaults) return Reason(PageTrackReason::Faulted, 1);
         return Reason(PageTrackReason::Armable);
     }
 
@@ -334,7 +338,11 @@ public:
         const auto wait = Wait(entry);
         entry.wait = entry.answers >= WorthAnswers ? std::max<std::uint32_t>(1, wait / 2) : std::min<std::uint32_t>(LongestWait, wait * 2);
         const std::uint32_t last = entry.faultPeriod;
-        if (last == now) return;
+        if (last == now) {
+            entry.frameFaults.store(entry.frameFaults.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+            return;
+        }
+        entry.frameFaults.store(1, std::memory_order_relaxed);
         const auto gap = now - last;
         entry.history = static_cast<std::uint8_t>((gap >= HistoryFrames ? 0u : static_cast<unsigned>(entry.history) << gap) | 1u);
         entry.faultPeriod = now;
@@ -413,6 +421,7 @@ public:
             entry.word.store(with(entry.word.load(std::memory_order_acquire), State::Unarmed), std::memory_order_release);
             entry.flags = 0;
             entry.edge = 0;
+            entry.frameFaults = 0;
             entry.cleanPeriod = 0;
             entry.writtenPeriod = 0;
             entry.faultPeriod = 0;

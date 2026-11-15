@@ -533,6 +533,15 @@ void CheckDemand(bool resident) {
     Require(track.Reasons(memory.Block(Blocks), BlockBytes, &seen, 1) && ReasonOf(seen) == Reason::Edge, kind + ": the table forgot that a block is outside a whole allocation");
     std::array<std::uint64_t, Blocks> every{};
     Require(track.Reasons(memory.Address(), Blocks * BlockBytes, every.data(), Blocks) && !track.Reasons(memory.Address(), Blocks * BlockBytes, every.data(), Blocks - 1) && ReasonOf(every[0]) == Reason::Disabled, kind + ": the reasons of a range are not given per block, or a wrong block count was accepted");
+
+    track.AdvancePeriod();
+    memory.Write(3, 0, 1);
+    Require(mappings.ArmBlocks(memory.Block(3), BlockBytes, &hot, &reason, 1) && hot != 0, kind + ": a block was not armed again on request after its first fault of a frame");
+    memory.Write(3, 0, 2);
+    Require(!mappings.ArmBlocks(memory.Block(3), BlockBytes, &hot, &reason, 1) && hot == 0 && ReasonOf(reason) == Reason::Faulted && FramesOf(reason) == 1 && memory.Protection(3) == PAGE_READWRITE, kind + ": a block that faulted twice in a frame was armed again on request in that frame");
+    Require(track.Reasons(memory.Block(3), BlockBytes, &seen, 1) && ReasonOf(seen) == Reason::Faulted, kind + ": the table does not say that a block faulted twice in this frame");
+    track.AdvancePeriod();
+    Require(mappings.ArmBlocks(memory.Block(3), BlockBytes, &hot, &reason, 1) && hot != 0, kind + ": a block that faulted twice in a frame was not armed on request in the next frame");
 }
 
 void CheckRearm(bool resident) {
