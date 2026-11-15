@@ -166,6 +166,10 @@ bool ArmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t
 bool RearmWritten(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> since, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written);
 enum class Unarmed : std::uint8_t { No = 0, Held = 1, Imported = 2, Barred = 3, Resting = 4, Edge = 5, Other = 6, GpuWritten = 7 };
 void AnnounceGpuWrite(std::uint64_t address, std::size_t bytes, GuestArena::PageTrackOrigin origin);
+void AnnounceGpuUnwatched(std::uint64_t address, std::size_t bytes);
+void AnnounceGpuWatched(std::uint64_t address, std::size_t bytes);
+std::uint64_t BeginGpuFlight();
+void EndGpuFlight(std::uint64_t flight);
 void ReportPageOrigins();
 std::uint8_t UnarmedReason(std::uint64_t address);
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::span<std::uint64_t> tokens = {});
@@ -248,6 +252,7 @@ struct CollectCounts {
     std::array<std::uint64_t, 6> pageLeft{};
     std::uint64_t pageImportArms = 0;
     std::uint64_t pageGpuMarks = 0;
+    std::uint64_t pageGpuExpiries = 0;
 };
 CollectCounts CollectCounted();
 void ReportCollectCosts();

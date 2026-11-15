@@ -115,6 +115,7 @@ private:
     Context context;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
+    std::uint64_t gpuFlight = 0;
     bool pending = false;
     bool submitted = false;
 };

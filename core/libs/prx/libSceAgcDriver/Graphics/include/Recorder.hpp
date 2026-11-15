@@ -835,6 +835,7 @@ private:
         std::vector<ReadListNote> readLists;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
+        std::uint64_t gpuFlight = 0;
         std::uint64_t predictedSerial = 0;
         AgcDriver::FaultToken firstToken = 0;
         AgcDriver::FaultToken lastToken = 0;

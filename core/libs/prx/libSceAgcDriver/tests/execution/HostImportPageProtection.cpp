@@ -530,12 +530,17 @@ void ArmedImport(Vulkan& vulkan, bool resident, bool& failed) {
     GuestArena::GuestPageTrackGpuWrite_nid_no_patch(base + 2 * BlockBytes + 100, 8);
     check(region.Protection(2 * BlockBytes) == PAGE_READWRITE && region.Protection(3 * BlockBytes) == PAGE_READONLY && !GuestArena::GuestPageTrackCleanSince_nid_no_patch(base + 2 * BlockBytes, BlockBytes, &tokens[2], 1), "an announced GPU write opens its block and ends its token before the write, and leaves the next block armed");
 
+    const auto flight = GuestArena::GuestPageTrackGpuFlightBegin_nid_no_patch();
     GuestArena::GuestPageTrackGpuWrite_nid_no_patch(base, RegionBytes);
     std::memset(staging.mapped, 0x33, RegionBytes);
     const auto copied = vulkan.Copy(staging.buffer, imported.buffer, RegionBytes);
     check(copied == VK_SUCCESS && region.Holds(0x33) && region.Protection() == PAGE_READWRITE, "an announced GPU copy into the import lands in an open range");
+    GuestArena::GuestPageTrackFrame_nid_no_patch();
+    GuestArena::GuestPageTrackFrame_nid_no_patch();
     const bool rearmed = arm();
-    check(!rearmed && std::all_of(tokens.begin(), tokens.end(), [](std::uint64_t token) { return token == 0; }) && region.Protection() == PAGE_READWRITE, "blocks the GPU wrote are not armed again");
+    check(!rearmed && std::all_of(tokens.begin(), tokens.end(), [](std::uint64_t token) { return token == 0; }) && region.Protection() == PAGE_READWRITE, "blocks the GPU writes are not armed while the batch that carries the write is in flight");
+    GuestArena::GuestPageTrackGpuFlightEnd_nid_no_patch(flight);
+    check(arm() && clean() && region.Protection() == PAGE_READONLY && region.Holds(0x33) && matches(), "blocks the GPU wrote are armed again once the batch that carried the write finished, with the bytes it wrote (unless APS5_NO_GPU_WRITE_MARK_EXPIRY=1)");
     vulkan.Destroy(imported);
     vulkan.Destroy(staging);
 }

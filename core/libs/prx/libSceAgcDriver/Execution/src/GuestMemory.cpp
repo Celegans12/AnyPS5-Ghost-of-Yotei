@@ -2730,6 +2730,40 @@ void AnnounceGpuWrite(std::uint64_t address, std::size_t bytes, GuestArena::Page
 #endif
 }
 
+void AnnounceGpuUnwatched(std::uint64_t address, std::size_t bytes) {
+#ifdef _WIN32
+    GuestArena::GuestPageTrackGpuUnwatched_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#endif
+}
+
+void AnnounceGpuWatched(std::uint64_t address, std::size_t bytes) {
+#ifdef _WIN32
+    GuestArena::GuestPageTrackGpuWatched_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#endif
+}
+
+std::uint64_t BeginGpuFlight() {
+#ifdef _WIN32
+    return GuestArena::GuestPageTrackGpuFlightBegin_nid_no_patch();
+#else
+    return 0;
+#endif
+}
+
+void EndGpuFlight(std::uint64_t flight) {
+#ifdef _WIN32
+    if (flight != 0) GuestArena::GuestPageTrackGpuFlightEnd_nid_no_patch(flight);
+#else
+    static_cast<void>(flight);
+#endif
+}
+
 void ReportPageOrigins() {
 #ifdef _WIN32
     constexpr auto origins = GuestArena::PageTrackOrigins;
@@ -3008,14 +3042,14 @@ void ReportCollectCosts() {
 }
 
 CollectCounts CollectCounted() {
-    std::array<std::uint64_t, 14> page{};
+    std::array<std::uint64_t, 15> page{};
 #ifdef _WIN32
     const auto watchCalls = GuestArena::GuestArenaCollectWatchCalls_nid_no_patch();
     GuestArena::GuestPageTrackCounts_nid_no_patch(page.data(), page.size());
 #else
     const std::uint64_t watchCalls = 0;
 #endif
-    return {watchCalls, committerWatchCalls.load(std::memory_order_relaxed), collectEpochBumps.load(std::memory_order_relaxed), collectMemoHits.load(std::memory_order_relaxed), collectWalkedEpochs.load(std::memory_order_relaxed), page[0], page[1], page[2], page[3], page[4], page[5], {page[6], page[7], page[8], page[9], page[12], page[13]}, page[10], page[11]};
+    return {watchCalls, committerWatchCalls.load(std::memory_order_relaxed), collectEpochBumps.load(std::memory_order_relaxed), collectMemoHits.load(std::memory_order_relaxed), collectWalkedEpochs.load(std::memory_order_relaxed), page[0], page[1], page[2], page[3], page[4], page[5], {page[6], page[7], page[8], page[9], page[12], page[13]}, page[10], page[11], page[14]};
 }
 
 const char* TrackerLockSiteName(TrackerLockSite site) {
@@ -3241,7 +3275,7 @@ void beforeUnwatchUnproven(std::uint64_t address, std::size_t bytes) {
 }
 
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
-    AnnounceGpuWrite(address, bytes, GuestArena::PageTrackOrigin::Unwatch);
+    AnnounceGpuUnwatched(address, bytes);
     if (!tracker.watched) return;
 #ifdef _WIN32
     tracker.startHints(address, bytes);
@@ -3331,6 +3365,9 @@ void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
         for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) {
             tracker.driverPieces.erase(block);
             tracker.stamp(block, tracker.generation, StampKind::Cpu);
+        }
+        for (auto block = begin & ~(ArmedBlockBytes - 1); block < end; block += ArmedBlockBytes) {
+            if (tracker.coverage.Covers(block, static_cast<std::size_t>(ArmedBlockBytes))) AnnounceGpuWatched(block, static_cast<std::size_t>(ArmedBlockBytes));
         }
         restored = true;
     }
