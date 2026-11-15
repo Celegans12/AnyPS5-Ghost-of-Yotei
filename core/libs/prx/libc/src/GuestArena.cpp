@@ -702,7 +702,7 @@ void GuestPageTrackFrame_nid_no_patch() {
 
 void GuestPageTrackCounts_nid_no_patch(std::uint64_t* counts, std::size_t capacity) {
     const auto counted = WindowsPageTrack::Get().Counted();
-    const std::uint64_t values[] = {counted.armed, counted.arms, counted.faults, counted.quiet, counted.rests, counted.divergences, counted.left[0], counted.left[1], counted.left[2], counted.left[3], counted.importArms, counted.gpuMarks};
+    const std::uint64_t values[] = {counted.armed, counted.arms, counted.faults, counted.quiet, counted.rests, counted.divergences, counted.left[0], counted.left[1], counted.left[2], counted.left[3], counted.importArms, counted.gpuMarks, counted.left[4], counted.left[5]};
     for (std::size_t index = 0; index < capacity; ++index) counts[index] = index < std::size(values) ? values[index] : 0;
 }
 

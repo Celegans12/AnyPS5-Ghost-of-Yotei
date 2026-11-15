@@ -27,6 +27,7 @@ public:
     static constexpr std::uint32_t WorthAnswers = 16;
     static constexpr std::uint64_t TokenLimit = std::uint64_t{1} << 63;
     static constexpr std::uint32_t RequestFaults = 2;
+    static constexpr std::size_t LeftReasons = 6;
     enum class State : std::uint64_t { Unarmed = 0, Arming = 1, Armed = 2, Opening = 3, Written = 4 };
     struct Block {
         std::atomic<std::uint64_t> word{0};
@@ -50,11 +51,11 @@ public:
         std::uint64_t quiet = 0;
         std::uint64_t rests = 0;
         std::uint64_t divergences = 0;
-        std::array<std::uint64_t, 4> left{};
+        std::array<std::uint64_t, LeftReasons> left{};
         std::uint64_t importArms = 0;
         std::uint64_t gpuMarks = 0;
     };
-    enum class Left : std::size_t { Edge, Held, Imported, Waiting };
+    enum class Left : std::size_t { Edge, Held, Imported, Waiting, Barred, GpuWritten };
 
     static WindowsPageTrack& Get() {
         static auto* track = new WindowsPageTrack;
@@ -467,14 +468,19 @@ public:
         quiet.fetch_add(answers, std::memory_order_relaxed);
     }
 
-    void NoteLeft(const std::array<std::uint64_t, 4>& blocks) {
+    void NoteLeft(const std::array<std::uint64_t, LeftReasons>& blocks) {
         for (std::size_t reason = 0; reason < left.size(); ++reason) {
             if (blocks[reason] != 0) left[reason].store(left[reason].load(std::memory_order_relaxed) + blocks[reason], std::memory_order_relaxed);
         }
     }
 
     static Left LeftBecause(const Block& entry) {
-        return entry.holds != 0 ? Left::Held : (entry.flags & Blocking) != 0 ? Left::Imported : Left::Waiting;
+        if (entry.holds != 0) return Left::Held;
+        const std::uint8_t flags = entry.flags;
+        if ((flags & GpuWrites) != 0) return Left::GpuWritten;
+        if ((flags & Imported) != 0) return Left::Imported;
+        if ((flags & Barred) != 0) return Left::Barred;
+        return Left::Waiting;
     }
 
     Counts Counted() const {
@@ -614,7 +620,7 @@ private:
     std::atomic<std::uint64_t> divergences{0};
     std::atomic<std::uint64_t> importArms{0};
     std::atomic<std::uint64_t> gpuMarks{0};
-    std::array<std::atomic<std::uint64_t>, 4> left{};
+    std::array<std::atomic<std::uint64_t>, LeftReasons> left{};
     std::atomic<std::uint32_t> period{1};
     std::unordered_map<std::uintptr_t, std::uint64_t> digests;
 };

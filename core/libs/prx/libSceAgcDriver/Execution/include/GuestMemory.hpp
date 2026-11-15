@@ -214,7 +214,7 @@ struct CollectCounts {
     std::uint64_t pageQuiet = 0;
     std::uint64_t pageRests = 0;
     std::uint64_t pageDivergences = 0;
-    std::array<std::uint64_t, 4> pageLeft{};
+    std::array<std::uint64_t, 6> pageLeft{};
     std::uint64_t pageImportArms = 0;
     std::uint64_t pageGpuMarks = 0;
 };

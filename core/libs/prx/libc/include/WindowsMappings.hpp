@@ -1321,7 +1321,7 @@ private:
     void notePlain(std::uintptr_t first, std::uintptr_t end, std::uintptr_t lower, std::uintptr_t upper, bool armable, void* const* pages, ULONG_PTR found, bool complete) {
         constexpr auto blockBytes = WindowsPageTrack::BlockBytes;
         const auto now = track.Period();
-        std::array<std::uint64_t, 4> left{};
+        std::array<std::uint64_t, WindowsPageTrack::LeftReasons> left{};
         ULONG_PTR index = 0;
         for (auto block = first & ~(blockBytes - 1); block < end; block += blockBytes) {
             bool written = false;

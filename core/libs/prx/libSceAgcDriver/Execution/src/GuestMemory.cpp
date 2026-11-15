@@ -2950,14 +2950,14 @@ void ReportCollectCosts() {
 }
 
 CollectCounts CollectCounted() {
-    std::array<std::uint64_t, 12> page{};
+    std::array<std::uint64_t, 14> page{};
 #ifdef _WIN32
     const auto watchCalls = GuestArena::GuestArenaCollectWatchCalls_nid_no_patch();
     GuestArena::GuestPageTrackCounts_nid_no_patch(page.data(), page.size());
 #else
     const std::uint64_t watchCalls = 0;
 #endif
-    return {watchCalls, committerWatchCalls.load(std::memory_order_relaxed), collectEpochBumps.load(std::memory_order_relaxed), collectMemoHits.load(std::memory_order_relaxed), collectWalkedEpochs.load(std::memory_order_relaxed), page[0], page[1], page[2], page[3], page[4], page[5], {page[6], page[7], page[8], page[9]}, page[10], page[11]};
+    return {watchCalls, committerWatchCalls.load(std::memory_order_relaxed), collectEpochBumps.load(std::memory_order_relaxed), collectMemoHits.load(std::memory_order_relaxed), collectWalkedEpochs.load(std::memory_order_relaxed), page[0], page[1], page[2], page[3], page[4], page[5], {page[6], page[7], page[8], page[9], page[12], page[13]}, page[10], page[11]};
 }
 
 const char* TrackerLockSiteName(TrackerLockSite site) {
