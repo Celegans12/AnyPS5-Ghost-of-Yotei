@@ -620,17 +620,28 @@ void Driver::execute(Submission& submission) {
         cursor = nextCursor;
     }
 
-    if (submission.queue == 0) DrawFinisher::Get().DrainAt(DrawFinisher::DrainSite::SubmissionEnd);
+    const bool queuesEnd = pipelined && orderedCompletion && deferredLabels().labels.empty();
+    const bool relaysEnd = queuesEnd && DrawFinisher::RelaysSubmissionEnd();
+    const auto rewindReleased = [&] { return submission.rewindTail != nullptr && (std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0; };
+    bool rewinds = relaysEnd && rewindReleased();
+    if (relaysEnd && (submission.rewindTail == nullptr || rewinds)) {
+        if (DrawFinisher::Busy()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::SubmissionEnd, false);
+        DrawFinisher::Get().CheckFailure();
+        settleFinisher.queue0 = false;
+    } else {
+        if (submission.queue == 0) DrawFinisher::Get().DrainAt(DrawFinisher::DrainSite::SubmissionEnd);
+        rewinds = queuesEnd && rewindReleased();
+    }
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");
     static const bool submitAtEnd = std::getenv("APS5_SUBMIT_AT_END") != nullptr;
-    if (pipelined && orderedCompletion && deferredLabels().labels.empty()) {
+    if (queuesEnd) {
         if (submission.rewindTail == nullptr) {
             flipHold.working = false;
             deferCompletion(submission);
             return;
         }
-        if ((std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0) {
+        if (rewinds) {
             const bool holdsFlip = std::exchange(flipHold.working, false);
             DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::SubmitEnd, [this, holdsFlip, flipWork = submission.flipWork, progress = submission.progress] {
                 if (holdsFlip) finishFlipWork(flipWork, submitFlipWork(0));

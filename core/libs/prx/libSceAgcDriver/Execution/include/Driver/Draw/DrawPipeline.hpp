@@ -164,6 +164,7 @@ public:
     static void NoteItemRelay(DrawPipeline::CommitKind kind);
     static std::uint64_t DrainCount(DrainSite site, bool drained);
     static bool Relays();
+    static bool RelaysSubmissionEnd();
     static std::string DrainText();
     static void NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits);
     static DrawFinisher& Get();
@@ -174,6 +175,7 @@ public:
     void Enqueue(Job job, Pending held);
     void Drain();
     void DrainAt(DrainSite site);
+    void CheckFailure();
     void Settle();
     void ReleaseRan();
 

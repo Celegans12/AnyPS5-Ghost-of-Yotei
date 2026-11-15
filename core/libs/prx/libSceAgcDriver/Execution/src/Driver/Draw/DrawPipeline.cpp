@@ -101,6 +101,11 @@ bool DrawFinisher::Relays() {
     return relays;
 }
 
+bool DrawFinisher::RelaysSubmissionEnd() {
+    static const bool relays = Relays() && std::getenv("APS5_NO_RELAYED_SUBMISSION_END") == nullptr;
+    return relays;
+}
+
 bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
     if (!Busy() || !finisherProducer) return false;
     std::lock_guard lock(mutex);
@@ -283,11 +288,16 @@ void DrawFinisher::run() {
         }
         if (DrawPipeline::SharedCollectEpoch()) GuestMemory::AdoptCollectEpoch(epoch);
         std::exception_ptr error;
+        bool shutdown = false;
         try {
             if (!failed) (*job)();
+        } catch (const ProcessShutdown&) {
+            shutdown = true;
+            error = std::current_exception();
         } catch (...) {
             error = std::current_exception();
         }
+        if (error != nullptr && !shutdown && RelaysSubmissionEnd()) Driver::Get().ReportFailure(error);
         std::lock_guard lock(mutex);
         if (error != nullptr && failure == nullptr) failure = error;
         ran.push_back(std::move(jobs.front()));
@@ -319,6 +329,11 @@ void DrawFinisher::Drain() {
         finisherWaits.fetch_add(1, std::memory_order_relaxed);
         finisherWaitNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
     }
+    if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
+}
+
+void DrawFinisher::CheckFailure() {
+    std::lock_guard lock(mutex);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
 }
 
