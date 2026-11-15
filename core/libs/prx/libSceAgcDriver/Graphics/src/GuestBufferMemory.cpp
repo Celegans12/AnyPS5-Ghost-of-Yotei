@@ -7027,6 +7027,11 @@ void reportStaging() {
         const auto resident = ResidentStagingCounters();
         AgcDriver::ProfilePrint_nid_no_patch("[buffers] resident staging (cumulative): %llu shadows made, %llu taken from another build, %llu live; copy-ins: %llu skipped (%.0f KiB not read from imports), %llu limited to the pages the CPU wrote (%.0f KiB copied, %.0f KiB not), %llu whole (%.0f KiB; %llu untracked, %llu under a label or queued store); %llu uses left the shadow current, %llu shadows outdated by recorded writes or driver stores; verified %llu, differing %llu\n", static_cast<unsigned long long>(resident.made), static_cast<unsigned long long>(resident.shared), static_cast<unsigned long long>(resident.live), static_cast<unsigned long long>(resident.skipped), resident.skippedBytes / 1024.0, static_cast<unsigned long long>(resident.partial), resident.partialBytes / 1024.0, resident.partialSavedBytes / 1024.0, static_cast<unsigned long long>(resident.full), resident.fullBytes / 1024.0, static_cast<unsigned long long>(resident.untracked), static_cast<unsigned long long>(resident.blocked), static_cast<unsigned long long>(resident.sealed), static_cast<unsigned long long>(resident.outdated), static_cast<unsigned long long>(resident.verified), static_cast<unsigned long long>(resident.differing));
     }
+    if (Recorder::ReadTrapEnabled()) {
+        const auto trap = Recorder::ReadTrapCounts();
+        AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging read trap (cumulative): %llu copy-backs guarded (%.0f KiB), %llu left unguarded (%.0f KiB; not whole 4 KiB pages of shared views); %llu kept past a label, %llu replaced by a newer result without being copied (%.0f KiB not copied back); faults: %llu served, %llu on a thread holding the GPU lock, %llu released by hand; landed by a fault %llu (%.0f KiB), by a reader the driver records %llu (%.0f KiB); %llu ranges trapped now; verified %llu, differing %llu
+", static_cast<unsigned long long>(trap.guarded), trap.guardedBytes / 1024.0, static_cast<unsigned long long>(trap.unguarded), trap.unguardedBytes / 1024.0, static_cast<unsigned long long>(trap.kept), static_cast<unsigned long long>(trap.replaced), trap.replacedBytes / 1024.0, static_cast<unsigned long long>(trap.faults), static_cast<unsigned long long>(trap.nestedFaults), static_cast<unsigned long long>(trap.forcedReleases), static_cast<unsigned long long>(trap.faultLanded), trap.faultLandedBytes / 1024.0, static_cast<unsigned long long>(trap.readerLanded), trap.readerLandedBytes / 1024.0, static_cast<unsigned long long>(trap.held), static_cast<unsigned long long>(trap.verified), static_cast<unsigned long long>(trap.differing));
+    }
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
@@ -8510,7 +8515,11 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         if (!region.gpuCopy || region.copiedBack) continue;
         if (defers && region.deviceLocal && region.shadowCopy == nullptr && region.buffer != nullptr) {
             auto written = writtenWithin(region.begin, region.end);
-            if (!written.empty()) recorder.DeferCopyBack({region.begin, region.end, region.copySource, region.copySourceBase, region.buffer, std::move(written), 0});
+            if (!written.empty()) {
+                Recorder::StagedCopyBack held{region.begin, region.end, region.copySource, region.copySourceBase, region.buffer, std::move(written), 0};
+                held.guardable = usesResident(region);
+                recorder.DeferCopyBack(std::move(held));
+            }
             region.copiedBack = true;
             sealResident(region);
             continue;

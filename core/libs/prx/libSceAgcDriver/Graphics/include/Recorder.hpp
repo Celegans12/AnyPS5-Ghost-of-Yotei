@@ -172,7 +172,7 @@ public:
     static constexpr std::uint64_t RunAccessWritten = 1, RunAccessImage = 2;
     using RunAccess = std::array<std::uint64_t, 3>;
     static std::uint32_t PeekUnorderedDispatch();
-    enum class LandingSite : std::uint8_t { Command, DrawPass, LabelStore, StoreRun, Samples, Submit, Sync, KeptBytes, StagingReach, StagingUnknown, DispatchReach, DispatchUnknown, Overlap, Count };
+    enum class LandingSite : std::uint8_t { Command, DrawPass, LabelStore, StoreRun, Samples, Submit, Sync, KeptBytes, StagingReach, StagingUnknown, DispatchReach, DispatchUnknown, Overlap, ReadTrap, Count };
     static constexpr std::size_t LandingSites = static_cast<std::size_t>(LandingSite::Count);
     struct CopyBackReach {
         std::uint64_t taker = 0;
@@ -195,7 +195,19 @@ public:
         std::shared_ptr<Buffer> shadow;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
         std::uint64_t taker = 0;
+        bool guardable = false;
+        std::shared_ptr<void> guard;
+        bool landed = false;
+        bool carriedOver = false;
     };
+    struct ReadTrapStatistics {
+        std::uint64_t guarded, guardedBytes, unguarded, unguardedBytes, kept, replaced, replacedBytes, faults, nestedFaults, forcedReleases, faultLanded, faultLandedBytes, readerLanded, readerLandedBytes, verified, differing, held;
+    };
+    static bool ReadTrapEnabled();
+    static bool ReadTrapVerified();
+    static ReadTrapStatistics ReadTrapCounts();
+    static void SetReadTrapForTests(bool enabled, bool verified);
+    bool LandGuardedOver(std::uint64_t address, std::size_t bytes);
     struct StagedClaim {
         std::uint64_t begin = 0;
         std::uint64_t end = 0;
@@ -215,8 +227,8 @@ public:
     static void CountForwardedCopyIns(std::uint64_t skipped, std::uint64_t redirected, std::uint64_t bytes);
     bool JoinsRun(std::uint32_t queueKey, const void* owner, std::span<const RunAccess> accesses, const CopyBackReach& reach) const;
     void CloseRun();
-    bool HasPendingCopyBacks() const { return open != nullptr && !open->copyBacks.empty(); }
-    std::size_t PendingCopyBacks() const { return open != nullptr ? open->copyBacks.size() : 0; }
+    bool HasPendingCopyBacks() const { return (open != nullptr && !open->copyBacks.empty()) || !carried.empty(); }
+    std::size_t PendingCopyBacks() const { return (open != nullptr ? open->copyBacks.size() : 0) + carried.size(); }
     bool PendingCopyBackOverlaps(std::uint64_t address, std::size_t bytes) const;
     void DeferCopyBack(StagedCopyBack entry);
     std::uint64_t ClaimCopyBacks(std::span<StagedClaim> claims);
@@ -1073,6 +1085,9 @@ private:
     void flushCopyBacks(LandingSite site, const CopyBackReach* reach = nullptr);
     VkCommandBuffer openCommands(VkAccessFlags* coveredAccess);
     static bool landsFor(const StagedCopyBack& held, const CopyBackReach* reach);
+    bool guardedOverlaps(std::uint64_t address, std::uint64_t end) const;
+    bool underQueuedStore(const StagedCopyBack& held) const;
+    void guardCopyBack(StagedCopyBack& entry);
     bool runConflict(std::span<const RunAccess> accesses) const;
     bool joinsRun(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses, const CopyBackReach& reach) const;
     void dropStaleHoldKept();
@@ -1169,6 +1184,7 @@ private:
     std::uint64_t writeNoteCount = 0;
     std::uint64_t copyBackClaims = 0;
     LandingSite submitSite = LandingSite::Submit;
+    std::vector<StagedCopyBack> carried;
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
     std::unique_ptr<BufferCache> bufferCache;

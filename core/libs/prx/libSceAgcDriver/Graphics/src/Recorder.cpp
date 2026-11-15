@@ -1060,6 +1060,113 @@ private:
     std::chrono::steady_clock::time_point start;
 };
 
+std::atomic<std::uint64_t> trapGuarded{0}, trapGuardedBytes{0}, trapUnguarded{0}, trapUnguardedBytes{0}, trapKept{0}, trapReplaced{0}, trapReplacedBytes{0}, trapFaults{0}, trapNestedFaults{0}, trapForcedReleases{0}, trapFaultLanded{0}, trapFaultLandedBytes{0}, trapReaderLanded{0}, trapReaderLandedBytes{0}, trapVerified{0}, trapDiffering{0};
+std::atomic<int> readTrapForTests{-1};
+constexpr std::uint64_t ReadTrapPage = 4096;
+
+struct ReadTrapRegistry {
+    std::mutex mutex;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, std::uint32_t> held;
+    std::atomic<std::uint64_t> count{0};
+};
+
+ReadTrapRegistry& ReadTraps() {
+    static auto* registry = new ReadTrapRegistry;
+    return *registry;
+}
+
+bool TrapGuestReads(std::uint64_t begin, std::uint64_t end) {
+#ifdef _WIN32
+    return GuestArena::GuestArenaTrapReads_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
+#else
+    static_cast<void>(begin);
+    static_cast<void>(end);
+    return false;
+#endif
+}
+
+void ReleaseGuestReads(std::uint64_t begin, std::uint64_t end) {
+#ifdef _WIN32
+    GuestArena::GuestArenaReleaseReads_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
+#else
+    static_cast<void>(begin);
+    static_cast<void>(end);
+#endif
+}
+
+bool ReadTrapOverlaps(std::uint64_t address, std::size_t bytes) {
+    auto& registry = ReadTraps();
+    if (bytes == 0 || registry.count.load(std::memory_order_acquire) == 0) return false;
+    const auto end = address + bytes;
+    std::lock_guard lock(registry.mutex);
+    return std::any_of(registry.held.begin(), registry.held.end(), [&](const auto& entry) { return address < entry.first.second && entry.first.first < end; });
+}
+
+struct ReadTrapHold {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    ReadTrapHold() = default;
+    ReadTrapHold(const ReadTrapHold&) = delete;
+    ReadTrapHold& operator=(const ReadTrapHold&) = delete;
+    ~ReadTrapHold() {
+        auto& registry = ReadTraps();
+        std::lock_guard lock(registry.mutex);
+        for (const auto& range : ranges) {
+            const auto found = registry.held.find(range);
+            if (found == registry.held.end() || --found->second != 0) continue;
+            registry.held.erase(found);
+            registry.count.fetch_sub(1, std::memory_order_release);
+            ReleaseGuestReads(range.first, range.second);
+        }
+    }
+};
+
+std::shared_ptr<ReadTrapHold> HoldReadTraps(std::span<const std::pair<std::uint64_t, std::uint64_t>> written) {
+    if (written.empty()) return nullptr;
+    for (const auto& [begin, end] : written) {
+        if (begin >= end || begin % ReadTrapPage != 0 || end % ReadTrapPage != 0) return nullptr;
+    }
+    auto hold = std::make_shared<ReadTrapHold>();
+    auto& registry = ReadTraps();
+    std::lock_guard lock(registry.mutex);
+    for (const auto& range : written) {
+        if (const auto found = registry.held.find(range); found != registry.held.end()) {
+            ++found->second;
+            hold->ranges.push_back(range);
+            continue;
+        }
+        const bool crossing = std::any_of(registry.held.begin(), registry.held.end(), [&](const auto& entry) { return range.first < entry.first.second && entry.first.first < range.second; });
+        if (crossing || !TrapGuestReads(range.first, range.second)) {
+            for (const auto& taken : hold->ranges) {
+                const auto found = registry.held.find(taken);
+                if (--found->second != 0) continue;
+                registry.held.erase(found);
+                registry.count.fetch_sub(1, std::memory_order_release);
+                ReleaseGuestReads(taken.first, taken.second);
+            }
+            hold->ranges.clear();
+            return nullptr;
+        }
+        registry.held.emplace(range, 1u);
+        registry.count.fetch_add(1, std::memory_order_release);
+        hold->ranges.push_back(range);
+    }
+    return hold;
+}
+
+void NoteReadTrapVerified(std::uint64_t begin, std::uint64_t end, std::span<const std::byte> staged, std::span<const std::byte> imported) {
+    trapVerified.fetch_add(1, std::memory_order_relaxed);
+    const auto bytes = std::min(staged.size(), imported.size());
+    if (std::memcmp(staged.data(), imported.data(), bytes) == 0) return;
+    std::size_t first = bytes;
+    std::size_t differing = 0;
+    for (std::size_t index = 0; index < bytes; ++index) {
+        if (staged[index] == imported[index]) continue;
+        if (first == bytes) first = index;
+        ++differing;
+    }
+    if (trapDiffering.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[staging] read trap verify: 0x%llx+0x%llx differs in %zu bytes, first at +0x%zx (staged %02x, guest memory %02x)\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), differing, first, std::to_integer<unsigned>(staged[first]), std::to_integer<unsigned>(imported[first]));
+}
+
 // GuestMemory flush hook: a CPU access to memory that recorded GPU work will write waits for that
 // work first; then storage image results pending for the range are stored. The recorder is only
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
@@ -1080,7 +1187,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             record();
         }
     }
-    if (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes)) {
+    if (!HookSnapshotEnabled() || SnapshotOverlaps(address, bytes) || ReadTrapOverlaps(address, bytes)) {
         hookLocks.fetch_add(1, std::memory_order_relaxed);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
         std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -1132,6 +1239,36 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
         }
     }
 }
+
+#ifdef _WIN32
+bool ResolveReadTrap(std::uintptr_t begin, std::uintptr_t end) {
+    trapFaults.fetch_add(1, std::memory_order_relaxed);
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
+        trapNestedFaults.fetch_add(1, std::memory_order_relaxed);
+        if (Recorder::ReadTrapVerified()) {
+            ReleaseGuestReads(begin, end);
+            return true;
+        }
+        static std::atomic<unsigned> reported{0};
+        if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[staging] read trap: a thread holding the GPU lock touched 0x%llx, whose staged result is still on the GPU; the access is not served\n", static_cast<unsigned long long>(begin));
+        return false;
+    }
+    FlushForAccess(begin, bytes);
+    if (!ReadTrapOverlaps(begin, bytes)) return true;
+    {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+            recorder->LandGuardedOver(begin, bytes);
+            recorder->Sync();
+        }
+    }
+    if (!ReadTrapOverlaps(begin, bytes)) return true;
+    if (trapForcedReleases.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[staging] read trap: 0x%llx stayed trapped after a full sync; released by hand\n", static_cast<unsigned long long>(begin));
+    ReleaseGuestReads(begin, end);
+    return true;
+}
+#endif
 
 }
 
@@ -1718,6 +1855,9 @@ void Recorder::Activate() {
     }
     GuestMemory::SetFlushHook(&FlushForAccess);
     GuestMemory::SetStoreHook(&NoteDriverStore);
+#ifdef _WIN32
+    if (ReadTrapEnabled()) GuestArena::GuestArenaSetReadTrapResolver_nid_no_patch(&ResolveReadTrap);
+#endif
 }
 
 std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) {
@@ -1900,7 +2040,7 @@ thread_local DispatchOrder nextDispatchOrder;
 std::atomic<std::uint64_t> overlapDeferred{0}, overlapJoined{0}, overlapFlushed{0};
 std::atomic<std::uint64_t> handoversTaken{0}, handoverSkipped{0}, handoverRedirected{0}, handoverForwardedBytes{0}, handoverElided{0}, handoverElidedBytes{0}, handoverLanded{0}, handoverLandedBytes{0};
 std::array<std::atomic<std::uint64_t>, Recorder::LandingSites> handoverLandedAt{};
-constexpr std::array<const char*, Recorder::LandingSites> LandingSiteNames{"another command", "a draw pass", "a label store", "a store run", "sample counting", "a submit", "a sync", "the kept bytes bound", "a staging copy over the region", "a staging copy of unknown reach", "a dispatch over the region", "a dispatch of unknown reach", "an overlapping copy-back"};
+constexpr std::array<const char*, Recorder::LandingSites> LandingSiteNames{"another command", "a draw pass", "a label store", "a store run", "sample counting", "a submit", "a sync", "the kept bytes bound", "a staging copy over the region", "a staging copy of unknown reach", "a dispatch over the region", "a dispatch of unknown reach", "an overlapping copy-back", "a read trap"};
 
 using GuestRanges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
 
@@ -1940,6 +2080,68 @@ const char* Recorder::LandingSiteName(LandingSite site) {
     return LandingSiteNames[static_cast<std::size_t>(site)];
 }
 
+bool Recorder::ReadTrapEnabled() {
+#ifdef _WIN32
+    static const bool enabled = (std::getenv("APS5_STAGING_READ_TRAP") != nullptr || std::getenv("APS5_VERIFY_STAGING_READ_TRAP") != nullptr) && std::getenv("APS5_RESIDENT_STAGING") != nullptr;
+    const auto forced = readTrapForTests.load(std::memory_order_relaxed);
+    return forced >= 0 ? forced != 0 : enabled;
+#else
+    return false;
+#endif
+}
+
+bool Recorder::ReadTrapVerified() {
+    static const bool verified = std::getenv("APS5_VERIFY_STAGING_READ_TRAP") != nullptr;
+    const auto forced = readTrapForTests.load(std::memory_order_relaxed);
+    return ReadTrapEnabled() && (forced >= 0 ? forced == 2 : verified);
+}
+
+void Recorder::SetReadTrapForTests(bool enabled, bool verified) {
+    readTrapForTests.store(!enabled ? 0 : verified ? 2 : 1, std::memory_order_relaxed);
+#ifdef _WIN32
+    GuestArena::GuestArenaSetReadTrapResolver_nid_no_patch(enabled ? &ResolveReadTrap : nullptr);
+#endif
+}
+
+Recorder::ReadTrapStatistics Recorder::ReadTrapCounts() {
+    return {trapGuarded.load(std::memory_order_relaxed), trapGuardedBytes.load(std::memory_order_relaxed), trapUnguarded.load(std::memory_order_relaxed), trapUnguardedBytes.load(std::memory_order_relaxed), trapKept.load(std::memory_order_relaxed), trapReplaced.load(std::memory_order_relaxed), trapReplacedBytes.load(std::memory_order_relaxed), trapFaults.load(std::memory_order_relaxed), trapNestedFaults.load(std::memory_order_relaxed), trapForcedReleases.load(std::memory_order_relaxed), trapFaultLanded.load(std::memory_order_relaxed), trapFaultLandedBytes.load(std::memory_order_relaxed), trapReaderLanded.load(std::memory_order_relaxed), trapReaderLandedBytes.load(std::memory_order_relaxed), trapVerified.load(std::memory_order_relaxed), trapDiffering.load(std::memory_order_relaxed), ReadTraps().count.load(std::memory_order_relaxed)};
+}
+
+bool Recorder::guardedOverlaps(std::uint64_t address, std::uint64_t end) const {
+    if (carried.empty() && (open == nullptr || open->copyBacks.empty())) return false;
+    const auto overlapping = [&](const StagedCopyBack& held) { return held.guard != nullptr && std::any_of(held.written.begin(), held.written.end(), [&](const auto& range) { return address < range.second && range.first < end; }); };
+    return std::any_of(carried.begin(), carried.end(), overlapping) || (open != nullptr && std::any_of(open->copyBacks.begin(), open->copyBacks.end(), overlapping));
+}
+
+bool Recorder::underQueuedStore(const StagedCopyBack& held) const {
+    const auto bytes = static_cast<std::size_t>(held.end - held.begin);
+    return QueuedStoreOverlaps(held.begin, bytes) || QueuedKeyStoreOverlaps(held.begin, bytes);
+}
+
+void Recorder::guardCopyBack(StagedCopyBack& entry) {
+    const auto bytes = RangeBytes(entry.written);
+    auto hold = HoldReadTraps(entry.written);
+    if (hold == nullptr) {
+        trapUnguarded.fetch_add(1, std::memory_order_relaxed);
+        trapUnguardedBytes.fetch_add(bytes, std::memory_order_relaxed);
+        return;
+    }
+    trapGuarded.fetch_add(1, std::memory_order_relaxed);
+    trapGuardedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    entry.guard = std::move(hold);
+}
+
+bool Recorder::LandGuardedOver(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || !guardedOverlaps(address, address + bytes)) return false;
+    GuestMemory::AssertGpuLockHeld("Recorder::LandGuardedOver");
+    ensureOpen();
+    flushDeferredDispatch();
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> over{{{address, address + bytes}}};
+    const CopyBackReach reach{0, true, false, over};
+    flushCopyBacks(LandingSite::ReadTrap, &reach);
+    return true;
+}
+
 bool Recorder::landsFor(const StagedCopyBack& held, const CopyBackReach* reach) {
     if (reach == nullptr) return true;
     if (reach->taker != 0 && held.taker == reach->taker) return false;
@@ -1957,7 +2159,24 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
     if (open == nullptr || open->copyBacks.empty()) return;
     auto& pending = open->copyBacks;
     std::vector<StagedCopyBack> landing;
-    if (reach == nullptr) {
+    const bool keeps = reach == nullptr && (site == LandingSite::LabelStore || site == LandingSite::StoreRun || site == LandingSite::Submit || site == LandingSite::KeptBytes);
+    if (keeps) {
+        const bool verified = ReadTrapVerified();
+        for (auto held = pending.begin(); held != pending.end();) {
+            if (held->guard == nullptr || underQueuedStore(*held)) {
+                landing.push_back(std::move(*held));
+                held = pending.erase(held);
+                continue;
+            }
+            if (verified && !held->landed) {
+                held->landed = true;
+                landing.push_back(*held);
+                landing.back().guard = nullptr;
+            }
+            if (site == LandingSite::LabelStore) trapKept.fetch_add(1, std::memory_order_relaxed);
+            ++held;
+        }
+    } else if (reach == nullptr) {
         landing = std::move(pending);
         pending.clear();
     } else {
@@ -1976,16 +2195,50 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
     }
     const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
     GuestRanges landed;
+    GuestRanges renoted;
     std::uint64_t bytes = 0;
-    for (const auto& entry : landing) {
+    std::uint64_t copied = 0;
+    for (auto& entry : landing) {
+        if (entry.guard != nullptr && entry.landed) {
+            const auto size = static_cast<std::size_t>(RangeBytes(entry.written));
+            auto staged = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            auto imported = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            Keep(staged, size);
+            Keep(imported, size);
+            std::vector<VkBufferCopy> fromShadow;
+            std::vector<VkBufferCopy> fromImport;
+            VkDeviceSize at = 0;
+            for (const auto& [begin, end] : entry.written) {
+                fromShadow.push_back({begin - entry.begin, at, end - begin});
+                fromImport.push_back({begin - entry.targetBase, at, end - begin});
+                renoted.emplace_back(begin, end);
+                at += end - begin;
+            }
+            copy(commands, entry.shadow->Handle(), staged->Handle(), static_cast<std::uint32_t>(fromShadow.size()), fromShadow.data());
+            copy(commands, entry.target, imported->Handle(), static_cast<std::uint32_t>(fromImport.size()), fromImport.data());
+            open->hostReadOwed = true;
+            open->completions.push_back([staged, imported, begin = entry.begin, end = entry.end, hold = std::move(entry.guard)]() mutable {
+                NoteReadTrapVerified(begin, end, staged->Bytes(), imported->Bytes());
+                hold.reset();
+            });
+            continue;
+        }
         std::vector<VkBufferCopy> regions;
         regions.reserve(entry.written.size());
+        std::uint64_t entryBytes = 0;
         for (const auto& [begin, end] : entry.written) {
             regions.push_back({begin - entry.begin, begin - entry.targetBase, end - begin});
             landed.emplace_back(begin, end);
-            bytes += end - begin;
+            entryBytes += end - begin;
+            if (entry.guard != nullptr && entry.carriedOver) renoted.emplace_back(begin, end);
         }
+        bytes += entryBytes;
+        ++copied;
         copy(commands, entry.shadow->Handle(), entry.target, static_cast<std::uint32_t>(regions.size()), regions.data());
+        if (entry.guard == nullptr) continue;
+        (site == LandingSite::ReadTrap ? trapFaultLanded : trapReaderLanded).fetch_add(1, std::memory_order_relaxed);
+        (site == LandingSite::ReadTrap ? trapFaultLandedBytes : trapReaderLandedBytes).fetch_add(entryBytes, std::memory_order_relaxed);
+        open->completions.push_back([hold = std::move(entry.guard)]() mutable { hold.reset(); });
     }
     if (BarrierValidate()) NoteAccess(CommandClass::StagingOut, Access{{}, landed, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
     constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
@@ -1993,15 +2246,17 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
     CountBarriers(CommandClass::StagingOut);
     open->coveredAccess = copiedAccess;
     EndGpuTiming(timing, bytes);
-    handoverLanded.fetch_add(landing.size(), std::memory_order_relaxed);
+    handoverLanded.fetch_add(copied, std::memory_order_relaxed);
     handoverLandedBytes.fetch_add(bytes, std::memory_order_relaxed);
-    handoverLandedAt[static_cast<std::size_t>(site)].fetch_add(landing.size(), std::memory_order_relaxed);
+    handoverLandedAt[static_cast<std::size_t>(site)].fetch_add(copied, std::memory_order_relaxed);
+    for (const auto& [begin, end] : renoted) NotePendingWrite(begin, static_cast<std::size_t>(end - begin));
 }
 
 bool Recorder::PendingCopyBackOverlaps(std::uint64_t address, std::size_t bytes) const {
-    if (open == nullptr || bytes == 0) return false;
+    if (bytes == 0) return false;
     const auto end = address + bytes;
-    return std::any_of(open->copyBacks.begin(), open->copyBacks.end(), [&](const StagedCopyBack& held) { return std::any_of(held.written.begin(), held.written.end(), [&](const auto& range) { return address < range.second && range.first < end; }); });
+    const auto overlapping = [&](const StagedCopyBack& held) { return std::any_of(held.written.begin(), held.written.end(), [&](const auto& range) { return address < range.second && range.first < end; }); };
+    return std::any_of(carried.begin(), carried.end(), overlapping) || (open != nullptr && std::any_of(open->copyBacks.begin(), open->copyBacks.end(), overlapping));
 }
 
 void Recorder::DeferCopyBack(StagedCopyBack entry) {
@@ -2010,11 +2265,19 @@ void Recorder::DeferCopyBack(StagedCopyBack entry) {
     ensureOpen();
     Keep(entry.shadow);
     entry.taker = 0;
+    entry.guard = nullptr;
+    entry.landed = false;
+    entry.carriedOver = false;
+    if (entry.guardable && ReadTrapEnabled()) guardCopyBack(entry);
     auto& pending = open->copyBacks;
     const auto same = std::find_if(pending.begin(), pending.end(), [&](const StagedCopyBack& held) { return held.begin == entry.begin && held.end == entry.end && held.target == entry.target && held.targetBase == entry.targetBase; });
     if (same != pending.end() && RangesCover(entry.written, same->written)) {
         handoverElided.fetch_add(1, std::memory_order_relaxed);
         handoverElidedBytes.fetch_add(RangeBytes(same->written), std::memory_order_relaxed);
+        if (same->guard != nullptr && !same->landed) {
+            trapReplaced.fetch_add(1, std::memory_order_relaxed);
+            trapReplacedBytes.fetch_add(RangeBytes(same->written), std::memory_order_relaxed);
+        }
         *same = std::move(entry);
         return;
     }
@@ -2026,6 +2289,7 @@ void Recorder::DeferCopyBack(StagedCopyBack entry) {
 
 std::uint64_t Recorder::ClaimCopyBacks(std::span<StagedClaim> claims) {
     GuestMemory::AssertGpuLockHeld("Recorder::ClaimCopyBacks");
+    if (!carried.empty()) ensureOpen();
     if (open == nullptr || open->copyBacks.empty()) return 0;
     auto& pending = open->copyBacks;
     for (auto& held : pending) held.taker = 0;
@@ -2404,6 +2668,11 @@ void Recorder::ensureOpen() {
         batch->id = PassState::NextId();
         open = std::move(batch);
         open->predictedSerial = submissions + 1;
+        if (!carried.empty()) {
+            for (const auto& held : carried) Keep(held.shadow);
+            open->copyBacks = std::move(carried);
+            carried.clear();
+        }
         try {
             if (open->queue == 0) WriteCheckpointSerial(context, open->commands, open->predictedSerial, open->queue);
             else WriteCheckpointSentinel(context, open->commands);
@@ -2424,6 +2693,11 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     if (bytes.empty()) return;
     ensureOpen();
     flushDeferredDispatch();
+    if (!open->copyBacks.empty() && ReadTrapEnabled()) {
+        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> stored{{{address, address + bytes.size()}}};
+        const CopyBackReach reach{0, true, false, stored};
+        flushCopyBacks(LandingSite::Overlap, &reach);
+    }
     flushCopyBacks(LandingSite::LabelStore);
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
@@ -4503,6 +4777,7 @@ bool Recorder::overlaps(const Batch& batch, std::uint64_t address, std::uint64_t
 
 bool Recorder::PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const {
     if (bytes == 0) return false;
+    if (guardedOverlaps(address, address + bytes)) return true;
     if (published != nullptr && !SnapshotOverlaps(published.get(), address, bytes)) return false;
     const auto end = address + bytes;
     if (open != nullptr && overlaps(*open, address, end)) return true;
@@ -5220,6 +5495,12 @@ void Recorder::Submit() {
     BufferCache::EndDrawRun(BufferCache::RunEnd::Submit);
     flushDeferredDispatch();
     flushCopyBacks(submitSite);
+    for (auto& held : open->copyBacks) {
+        held.taker = 0;
+        held.carriedOver = true;
+        carried.push_back(std::move(held));
+    }
+    open->copyBacks.clear();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass(PassBreak::NewBatch);
     const bool segments = segmentMode();
@@ -5448,6 +5729,7 @@ void Recorder::FlushDeferredReleases() {
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
     if (bytes == 0) return;
+    LandGuardedOver(address, bytes);
     const auto end = address + bytes;
     if (completionDepth() != 0 && !CompletionStoreSyncs()) {
         // A store made by a completion action (a copied buffer's write-back, GuestBufferMemory::
