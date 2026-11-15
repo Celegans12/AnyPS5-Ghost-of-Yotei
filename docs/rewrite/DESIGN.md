@@ -277,10 +277,26 @@ buffer regions often span two mappings and no single import served them. Found a
   mechanism and step 2 builds on it, so the default is unchanged.
 - Probe for step 2 (`agc_driver_no_access_import_probe_tests`, RTX 5080): a GPU store through
   an existing host import lands while the imported pages are read-only or no-access for the
-  process. So a GPU-owned block can keep its import, be no-access for the guest, and be stored
-  by the GPU before the pages are opened. The read-trap interface the driver already uses on
-  macOS (`GuestWriteWatchTrapReads`, resolver thread, bypass for the GPU mutex holder; label
-  surfaces only) is a stub on Windows; step 2 starts by implementing it in `WindowsMappings`.
+  process. The first GPU use of an import needs its pages accessible (the driver pins them
+  then): a trap over an unused import left the device waiting forever in about 1 run of 20.
+- Step 2, first part, built (61ddfa9c6f and the commit after it): read traps on Windows in
+  `WindowsMappings` (`TrapReads`, `ReleaseReads`, `ReadTraps`, resolver thread, bypass for the
+  GPU mutex holder), reached through the `GuestWriteWatch` read-trap functions the driver used
+  on macOS only. Committed private read-write pages become no-access; a fault parks its thread
+  while the resolver thread runs the driver's resolver, then the pages open. Rules found while
+  building: a host write resolves the traps over its range on its own thread; an import made
+  over trapped pages opens them at once and hands the traps to the resolver thread (resolving
+  there deadlocked on the import lock), so the driver never traps a surface in the 64 KiB
+  block of the label being stored; no trap over an import the GPU has not used; arming skips
+  trapped pages; a surface the CPU touched while trapped is stored at labels again for 2 s,
+  doubling to 64 s.
+- First consumer, the label read traps (small and linear surfaces trapped at a label instead
+  of stored): **built, opt-in on Windows** (`APS5_LABEL_READ_TRAP=1`; `[read-trap]` profile
+  line). Back to back: 007 68 to 80 ms with, 69 to 98 without (no clear difference); FF 31.1
+  and 32.8 with, 31.0 and 32.8 without; LEGO 46.7 / 47.1; AoM 170 to 175 with, 138 to 148
+  without, in five pairs. AoM sets about 5 traps per second and parks no thread, so the cost is
+  not faults; dispatch is 102 to 106 ms per frame against 93 to 95. Not understood yet. Tests
+  1,809 of 1,809 with the traps on and off, section A on and off.
 - f8e0ee64d4: eight `thread_local` caches of the direct path had destructors; the draw committer
   crashed in one at thread exit (`agc_driver_village_draw_cost` hung in 9 of 120 runs with
   section A off). They use `ThreadScratch` now; 150 of 150 runs pass.
