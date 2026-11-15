@@ -792,6 +792,136 @@ void CheckImportDivergence(bool resident) {
     Require(!track.CleanSince(memory.Block(1), BlockBytes, &token, 1) && !mappings.ArmBlocks(memory.Block(1), BlockBytes, &token, &reason, 1) && token == 0 && ReasonOf(reason) == Reason::GpuWritten, kind + ": a block that diverged was not barred as written by the GPU");
 }
 
+void CheckGpuMarkExpiry(bool resident, bool expires) {
+    constexpr std::size_t Blocks = 8;
+    using Reason = GuestArena::PageTrackReason;
+    auto& track = Track::Get();
+    auto& mappings = Mappings::Get();
+    const std::string kind = resident ? "resident" : "private";
+    Require(track.ArmsImports() && track.ExpiresGpuMarks() == expires, "the expiry of GPU write marks is not set as the mode asks");
+    Guest memory(resident, Blocks * BlockBytes);
+    const auto all = [&] { return memory.Collect(0, Blocks * BlockPages); };
+    const auto request = [&](std::size_t block, std::uint64_t* reason) {
+        std::uint64_t token = 0;
+        mappings.ArmBlocks(memory.Block(block), BlockBytes, &token, reason, 1);
+        return token;
+    };
+    const auto denied = [&](std::size_t block) {
+        std::uint64_t reason = 0;
+        return request(block, &reason) == 0 && ReasonOf(reason) == Reason::GpuWritten;
+    };
+    const auto frames = [&](unsigned count) {
+        for (unsigned frame = 0; frame < count; ++frame) track.AdvancePeriod();
+    };
+    all();
+    std::uint64_t reason = 0;
+    Require(mappings.BeginHostWrite(memory.Block(1), 4 * BlockBytes, false), kind + ": a host import was refused");
+    mappings.EndHostWrite(memory.Block(1), 4 * BlockBytes, false);
+
+    const auto earlier = track.BeginGpuFlight();
+    const auto carrier = track.BeginGpuFlight();
+    Require(earlier != 0 && carrier != 0, kind + ": a GPU flight got no ticket");
+    const auto first = request(1, &reason);
+    Require(first != 0 && ReasonOf(reason) == Reason::Armed, kind + ": an imported block was not armed on request");
+    const auto expiries = track.Counted().gpuExpiries;
+    mappings.GpuWrite(memory.Block(1) + 100, 8);
+    Require(memory.Protection(1) == PAGE_READWRITE && denied(1), kind + ": an announced GPU write did not open its block and bar it");
+    frames(Track::GpuQuietFrames + 1);
+    Require(denied(1), kind + ": a block was armed while the batch that carries its GPU write is in flight");
+    track.EndGpuFlight(track.BeginGpuFlight());
+    frames(Track::GpuQuietFrames + 1);
+    Require(denied(1), kind + ": the end of a later batch expired the mark of a GPU write that an earlier batch still carries");
+    track.EndGpuFlight(carrier);
+    Require(denied(1), kind + ": a block was armed while a batch opened before its GPU write was announced is in flight");
+    track.EndGpuFlight(earlier);
+    mappings.GpuWrite(memory.Block(1) + 100, 8);
+    track.EndGpuFlight(track.BeginGpuFlight());
+    frames(Track::GpuQuietFrames - 1);
+    Require(denied(1), kind + ": a block was armed before the last GPU write announced into it was two frames old");
+    frames(1);
+    if (!expires) {
+        Require(denied(1), kind + ": APS5_NO_GPU_WRITE_MARK_EXPIRY=1 did not keep a block the GPU wrote off the armed blocks");
+        Settle(memory, Blocks);
+        all();
+        Require(track.StateOf(memory.Block(1)) == State::Unarmed && track.Counted().gpuExpiries == expiries, kind + ": APS5_NO_GPU_WRITE_MARK_EXPIRY=1 let the collects arm a block the GPU wrote");
+        return;
+    }
+    Require(track.Reasons(memory.Block(1), BlockBytes, &reason, 1) && ReasonOf(reason) != Reason::GpuWritten, kind + ": the table still says that the GPU writes a block whose mark expired");
+    const auto second = request(1, &reason);
+    Require(second > first && ReasonOf(reason) == Reason::Armed && memory.Protection(1) == PAGE_READONLY && track.Counted().gpuExpiries == expiries + 1, kind + ": a block the GPU wrote once was not armed again after its batch finished");
+
+    const auto marks = track.Counted().gpuMarks;
+    const auto again = track.BeginGpuFlight();
+    mappings.GpuWrite(memory.Block(1), BlockBytes);
+    Require(!track.CleanSince(memory.Block(1), BlockBytes, &second, 1) && memory.Protection(1) == PAGE_READWRITE && denied(1) && track.Counted().gpuMarks == marks + 1, kind + ": a GPU write announced after the mark expired did not open the block and bar it again");
+    mappings.GpuWrite(memory.Block(2), BlockBytes);
+    track.EndGpuFlight(again);
+    frames(Track::GpuQuietFrames);
+    all();
+    track.AdvancePeriod();
+    all();
+    Require(track.Clean(memory.Block(2)) && memory.Protection(2) == PAGE_READONLY, kind + ": the collects did not arm a block again once the mark of its GPU write expired");
+
+    mappings.GpuUnwatched(memory.Block(3) + PageBytes, PageBytes);
+    track.EndGpuFlight(track.BeginGpuFlight());
+    frames(Track::GpuQuietFrames + 1);
+    Require(denied(3), kind + ": a block the driver stopped watching was armed while the GPU may write it without an announcement");
+    mappings.GpuWrite(memory.Block(3), 8);
+    track.EndGpuFlight(track.BeginGpuFlight());
+    frames(Track::GpuQuietFrames + 1);
+    Require(denied(3), kind + ": an announced GPU write let a block the driver stopped watching be armed once its batch finished");
+    const auto watching = track.BeginGpuFlight();
+    mappings.GpuWatched(memory.Block(3), BlockBytes);
+    frames(Track::GpuQuietFrames + 1);
+    Require(denied(3), kind + ": a block watched again was armed while a batch from before is in flight");
+    track.EndGpuFlight(watching);
+    Require(request(3, &reason) != 0 && ReasonOf(reason) == Reason::Armed, kind + ": a block watched again was not armed once the batches from before finished");
+}
+
+void CheckGpuWriteInFlight(bool resident) {
+    constexpr std::size_t Blocks = 4;
+    using Reason = GuestArena::PageTrackReason;
+    auto& track = Track::Get();
+    auto& mappings = Mappings::Get();
+    const std::string kind = resident ? "resident" : "private";
+    Require(track.ArmsImports() && track.Verifying() && track.ExpiresGpuMarks(), "the verified expiry of GPU write marks is not on");
+    Guest memory(resident, Blocks * BlockBytes);
+    const auto all = [&] { return memory.Collect(0, Blocks * BlockPages); };
+    all();
+    Require(mappings.BeginHostWrite(memory.Block(1), BlockBytes, false), kind + ": a host import was refused");
+    mappings.EndHostWrite(memory.Block(1), BlockBytes, false);
+    std::uint64_t token = 0;
+    std::uint64_t reason = 0;
+    Require(mappings.ArmBlocks(memory.Block(1), BlockBytes, &token, &reason, 1) && token != 0, kind + ": an imported block was not armed on request");
+    const auto divergences = track.Counted().divergences;
+    const auto flight = track.BeginGpuFlight();
+    mappings.GpuWrite(memory.Block(1) + 5 * PageBytes, 16);
+    for (unsigned frame = 0; frame < Track::GpuQuietFrames + 2; ++frame) {
+        track.AdvancePeriod();
+        all();
+        token = 0;
+        mappings.ArmBlocks(memory.Block(1), BlockBytes, &token, &reason, 1);
+        Require(token == 0 && memory.Protection(1) == PAGE_READWRITE, kind + ": a block was armed while the batch that carries its GPU write is in flight");
+    }
+    memory.data[BlockBytes + 5 * PageBytes + 9] ^= 0x5a;
+    Require(ResetWriteWatch(memory.data + BlockBytes, BlockBytes) == 0, kind + ": cannot hide a write from the write watch as a GPU write is hidden");
+    track.EndGpuFlight(flight);
+    all();
+    Require(mappings.ArmBlocks(memory.Block(1), BlockBytes, &token, &reason, 1) && token != 0 && memory.Protection(1) == PAGE_READONLY, kind + ": a block was not armed again once the batch that carried its GPU write finished");
+    Require(all().empty() && track.Counted().divergences == divergences, kind + ": a GPU write that landed before its mark expired was taken for a divergence");
+
+    DWORD previous = 0;
+    Require(VirtualProtect(memory.data + BlockBytes, BlockBytes, PAGE_READWRITE, &previous) != 0, kind + ": cannot open a block behind the table");
+    memory.data[BlockBytes + 5 * PageBytes + 9] ^= 0x5a;
+    Require(VirtualProtect(memory.data + BlockBytes, BlockBytes, PAGE_READONLY, &previous) != 0 && ResetWriteWatch(memory.data + BlockBytes, BlockBytes) == 0, kind + ": cannot close a block behind the table");
+    Require(all().empty() && track.Counted().divergences == divergences + 1 && memory.Protection(1) == PAGE_READWRITE, kind + ": a GPU write that landed after the mark of its block expired was not counted as a divergence, or the block stayed armed");
+    track.EndGpuFlight(track.BeginGpuFlight());
+    for (unsigned frame = 0; frame < Track::GpuQuietFrames + 1; ++frame) track.AdvancePeriod();
+    all();
+    token = 0;
+    Require(!mappings.ArmBlocks(memory.Block(1), BlockBytes, &token, &reason, 1) && token == 0 && ReasonOf(reason) == Reason::GpuWritten, kind + ": a block that diverged was armed again when later batches finished");
+}
+
 void CheckDemandRace(bool resident) {
     constexpr std::size_t Writers = 8;
     constexpr std::size_t Blocks = 16;
@@ -1041,6 +1171,7 @@ int main(int argc, char** argv) {
     const std::string_view mode = argc > 1 ? argv[1] : "";
     _putenv_s(mode.starts_with("verify") ? "APS5_VERIFY_PAGE_TRACK" : "APS5_PAGE_TRACK", "1");
     if (mode.ends_with("imports")) _putenv_s("APS5_ARM_READ_IMPORTS", "1");
+    if (mode.starts_with("sticky")) _putenv_s("APS5_NO_GPU_WRITE_MARK_EXPIRY", "1");
     const auto handler = AddVectoredExceptionHandler(1, HandleFault);
     int result = 0;
     try {
@@ -1082,6 +1213,18 @@ int main(int argc, char** argv) {
             Require(divergences == 0, "verified collects diverged over armed imported blocks");
             CheckImportDivergence(false);
             CheckImportDivergence(true);
+        } else if (mode == "expiring-imports") {
+            CheckGpuMarkExpiry(false, true);
+            CheckGpuMarkExpiry(true, true);
+        } else if (mode == "sticky-imports") {
+            CheckGpuMarkExpiry(false, false);
+            CheckGpuMarkExpiry(true, false);
+        } else if (mode == "verify-expiring-imports") {
+            CheckGpuMarkExpiry(false, true);
+            CheckGpuMarkExpiry(true, true);
+            Require(Track::Get().Counted().divergences == 0, "verified collects diverged over blocks whose GPU write marks expired");
+            CheckGpuWriteInFlight(false);
+            CheckGpuWriteInFlight(true);
         } else if (mode == "demand-race") {
             CheckDemandRace(false);
             CheckDemandRace(true);
@@ -1105,7 +1248,7 @@ int main(int argc, char** argv) {
                 Require(Track::Get().Counted().divergences == 0, "verified collects diverged under concurrent writers");
             }
         } else {
-            std::fprintf(stderr, "usage: %s table|race|guards|collect|hot|collect-race|demand|rearm|tokens|imports|demand-race|verify|verify-race|verify-demand|verify-imports\n", argv[0]);
+            std::fprintf(stderr, "usage: %s table|race|guards|collect|hot|collect-race|demand|rearm|tokens|imports|demand-race|verify|verify-race|verify-demand|verify-imports|expiring-imports|sticky-imports|verify-expiring-imports\n", argv[0]);
             result = 2;
         }
         if (result == 0) std::printf("page tracking %.*s tests passed\n", static_cast<int>(mode.size()), mode.data());

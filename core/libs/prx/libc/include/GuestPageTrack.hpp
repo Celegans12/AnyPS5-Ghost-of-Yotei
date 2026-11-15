@@ -32,6 +32,10 @@ bool GuestPageTrackCleanSince_nid_no_patch(std::uintptr_t address, std::size_t b
 bool GuestPageTrackArm_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* tokens, std::uint64_t* reasons, std::size_t count);
 bool GuestPageTrackArmsImports_nid_no_patch();
 void GuestPageTrackGpuWrite_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint8_t origin = static_cast<std::uint8_t>(PageTrackOrigin::Announced));
+void GuestPageTrackGpuUnwatched_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+void GuestPageTrackGpuWatched_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+std::uint64_t GuestPageTrackGpuFlightBegin_nid_no_patch();
+void GuestPageTrackGpuFlightEnd_nid_no_patch(std::uint64_t flight);
 bool GuestPageTrackReasons_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* reasons, std::size_t count);
 bool GuestPageTrackRearm_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* tokens, std::uint16_t* written, std::uint64_t* reasons, std::size_t count);
 void GuestPageTrackFrame_nid_no_patch();

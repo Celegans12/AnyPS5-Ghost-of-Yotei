@@ -14,6 +14,7 @@
 #include <memory>
 #include <stdexcept>
 #include <unordered_map>
+#include <vector>
 
 namespace GuestArena {
 
@@ -28,6 +29,7 @@ public:
     static constexpr std::uint64_t TokenLimit = std::uint64_t{1} << 63;
     static constexpr std::uint32_t RequestFaults = 2;
     static constexpr std::size_t LeftReasons = 6;
+    static constexpr std::uint32_t GpuQuietFrames = 2;
     enum class State : std::uint64_t { Unarmed = 0, Arming = 1, Armed = 2, Opening = 3, Written = 4 };
     struct Block {
         std::atomic<std::uint64_t> word{0};
@@ -45,6 +47,7 @@ public:
         std::atomic<std::uint8_t> edge{0};
         std::uint8_t origin = 0;
         std::atomic<std::uint16_t> gpuStamp{0};
+        std::atomic<std::uint64_t> gpuMark{0};
     };
     struct Counts {
         std::uint64_t armed = 0;
@@ -56,6 +59,7 @@ public:
         std::array<std::uint64_t, LeftReasons> left{};
         std::uint64_t importArms = 0;
         std::uint64_t gpuMarks = 0;
+        std::uint64_t gpuExpiries = 0;
     };
     enum class Left : std::size_t { Edge, Held, Imported, Waiting, Barred, GpuWritten };
 
@@ -81,25 +85,93 @@ public:
         return entry != nullptr && (entry->flags & ReadImport) != 0;
     }
 
-    bool MarkedGpuWrites(std::uintptr_t first, std::uintptr_t end) const {
+    bool ExpiresGpuMarks() const {
+        return expireGpuMarks;
+    }
+
+    bool RestampGpuWrites(std::uintptr_t first, std::uintptr_t end) {
         if (!armImports || end <= first) return true;
+        const auto stamp = gpuStampNow();
         for (auto block = first & ~(BlockBytes - 1); block < end; block += BlockBytes) {
-            const auto* entry = find(block);
-            if (entry == nullptr || (entry->flags & GpuWrites) == 0) return false;
+            auto* entry = find(block);
+            if (entry == nullptr) return false;
+            auto mark = entry->gpuMark.load(std::memory_order_acquire);
+            for (;;) {
+                if (mark == 0) return false;
+                if ((mark >> GpuPeriodBits) > (stamp >> GpuPeriodBits)) break;
+                if (entry->gpuMark.compare_exchange_weak(mark, stamp, std::memory_order_acq_rel, std::memory_order_acquire)) break;
+            }
         }
         return true;
     }
 
     void GpuWrite(std::uintptr_t first, std::uintptr_t end, PageTrackOrigin origin) {
         if (!armImports || end <= first) return;
-        const auto stamp = static_cast<std::uint16_t>(Period());
+        const auto stamp = gpuStampNow();
+        const auto frame = static_cast<std::uint16_t>(Period());
         forEach(first, end, true, [&](std::uintptr_t block, Block& entry) {
-            if ((entry.flags & GpuWrites) == 0) gpuMarks.fetch_add(1, std::memory_order_relaxed);
-            noteOrigin(entry, GpuWrites, origin);
-            entry.flags |= GpuWrites;
-            entry.gpuStamp.store(stamp, std::memory_order_relaxed);
+            if (!gpuWritten(entry)) gpuMarks.fetch_add(1, std::memory_order_relaxed);
+            noteOrigin(entry, GpuUnwatched, origin);
+            raiseGpuMark(entry, stamp);
+            entry.gpuStamp.store(frame, std::memory_order_relaxed);
             open(block, entry);
         });
+    }
+
+    bool GpuUnwatchedOver(std::uintptr_t first, std::uintptr_t end) const {
+        if (!armImports || end <= first) return true;
+        for (auto block = first & ~(BlockBytes - 1); block < end; block += BlockBytes) {
+            const auto* entry = find(block);
+            if (entry == nullptr || (entry->flags & GpuUnwatched) == 0) return false;
+        }
+        return true;
+    }
+
+    void NoteGpuUnwatched(std::uintptr_t first, std::uintptr_t end) {
+        gpuFlag(first, end, GpuUnwatched, PageTrackOrigin::Unwatch);
+    }
+
+    void NoteGpuDiverged(std::uintptr_t first, std::uintptr_t end) {
+        gpuFlag(first, end, GpuDiverged, PageTrackOrigin::VerifyClean);
+    }
+
+    void GpuWatched(std::uintptr_t first, std::uintptr_t end) {
+        if (!armImports || end <= first) return;
+        const auto stamp = gpuStampNow();
+        forEach(first, end, false, [&](std::uintptr_t, Block& entry) {
+            if ((entry.flags & GpuUnwatched) == 0) return;
+            raiseGpuMark(entry, stamp);
+            entry.flags &= static_cast<std::uint8_t>(~GpuUnwatched);
+        });
+    }
+
+    std::uint64_t BeginGpuFlight() {
+        if (!armImports) return 0;
+        const FlightLock lock(flightsBusy);
+        const auto epoch = gpuEpoch.load(std::memory_order_relaxed);
+        flights.push_back(epoch);
+        return epoch;
+    }
+
+    void EndGpuFlight(std::uint64_t flight) {
+        if (!armImports || flight == 0) return;
+        const FlightLock lock(flightsBusy);
+        const auto found = std::find(flights.begin(), flights.end(), flight);
+        if (found == flights.end()) return;
+        *found = flights.back();
+        flights.pop_back();
+        const auto epoch = gpuEpoch.load(std::memory_order_relaxed) + 1;
+        gpuEpoch.store(epoch, std::memory_order_release);
+        const auto oldest = flights.empty() ? epoch : *std::min_element(flights.begin(), flights.end());
+        gpuSettled.store(oldest - 1, std::memory_order_release);
+    }
+
+    bool SettleGpuWrite(Block& entry, std::uint32_t now) {
+        auto mark = entry.gpuMark.load(std::memory_order_acquire);
+        if (!gpuMarkExpired(entry, mark, now)) return false;
+        if (!entry.gpuMark.compare_exchange_strong(mark, 0, std::memory_order_acq_rel, std::memory_order_acquire)) return false;
+        gpuExpiries.fetch_add(1, std::memory_order_relaxed);
+        return true;
     }
 
     void NoteAnnounce(std::uintptr_t first, std::uintptr_t end, PageTrackOrigin origin) {
@@ -110,7 +182,7 @@ public:
         announcedBlocks[index].fetch_add(((end - 1) >> 16) - (first >> 16) + 1, std::memory_order_relaxed);
         const auto stamp = static_cast<std::uint16_t>(Period());
         for (auto block = first & ~(BlockBytes - 1); block < end; block += BlockBytes) {
-            if (auto* entry = find(block); entry != nullptr && (entry->flags & GpuWrites) != 0) entry->gpuStamp.store(stamp, std::memory_order_relaxed);
+            if (auto* entry = find(block); entry != nullptr && gpuWritten(*entry)) entry->gpuStamp.store(stamp, std::memory_order_relaxed);
         }
     }
 
@@ -219,7 +291,7 @@ public:
     bool Armable(std::uintptr_t block) const {
         if (!enabled) return false;
         const auto* entry = find(block);
-        return entry == nullptr || (entry->holds == 0 && (entry->flags & Blocking) == 0);
+        return entry == nullptr || (entry->holds == 0 && !blocked(*entry));
     }
 
     bool Arm(std::uintptr_t block) {
@@ -275,16 +347,7 @@ public:
     }
 
     static std::uint64_t Refusal(const Block& entry, std::uint32_t now) {
-        if (entry.holds != 0) return Reason(PageTrackReason::Held);
-        const std::uint8_t flags = entry.flags;
-        if ((flags & GpuWrites) != 0) return Reason(PageTrackReason::GpuWritten);
-        if ((flags & Imported) != 0) return Reason(PageTrackReason::Imported);
-        if ((flags & Barred) != 0) return Reason(PageTrackReason::Barred);
-        const std::uint32_t rest = entry.restUntil;
-        if (now < rest) return Reason(PageTrackReason::Resting, rest - now);
-        const std::uint32_t last = entry.faultPeriod;
-        if (last == now && entry.frameFaults.load(std::memory_order_relaxed) >= RequestFaults) return Reason(PageTrackReason::Faulted, 1);
-        return Reason(PageTrackReason::Armable);
+        return refusalOf(entry, now, gpuWritten(entry));
     }
 
     void NoteEdge(std::uintptr_t block, bool edge) {
@@ -306,7 +369,7 @@ public:
             const auto state = StateOf(*entry);
             if (state == State::Armed) reasons[index] = Reason(PageTrackReason::Armed);
             else if (state == State::Arming || state == State::Opening) reasons[index] = Reason(PageTrackReason::Busy);
-            else if (const auto refusal = Refusal(*entry, now); refusal != Reason(PageTrackReason::Armable)) reasons[index] = refusal;
+            else if (const auto refusal = refusalOf(*entry, now, gpuWritten(*entry) && !gpuMarkExpired(*entry, entry->gpuMark.load(std::memory_order_acquire), now)); refusal != Reason(PageTrackReason::Armable)) reasons[index] = refusal;
             else reasons[index] = Reason(entry->edge.load(std::memory_order_relaxed) != 0 ? PageTrackReason::Edge : PageTrackReason::Armable);
         }
         return true;
@@ -351,7 +414,7 @@ public:
     }
 
     static bool Free(const Block& entry) {
-        return entry.holds == 0 && (entry.flags & Blocking) == 0;
+        return entry.holds == 0 && !blocked(entry);
     }
 
     static void NoteClean(Block& entry, std::uint32_t now) {
@@ -423,7 +486,7 @@ public:
         return found == digests.end() ? 0 : found->second;
     }
 
-    static_assert(sizeof(Block) == 48, "a block of the page tracking table stays within a cache line");
+    static_assert(sizeof(Block) <= 64, "a block of the page tracking table stays within a cache line");
 
     void NoteDivergence() {
         divergences.fetch_add(1, std::memory_order_relaxed);
@@ -499,6 +562,7 @@ public:
             open(block, entry);
             entry.word.store(with(entry.word.load(std::memory_order_acquire), State::Unarmed), std::memory_order_release);
             entry.flags = 0;
+            entry.gpuMark = 0;
             entry.origin = 0;
             entry.gpuStamp = 0;
             entry.edge = 0;
@@ -556,7 +620,7 @@ public:
     static Left LeftBecause(const Block& entry) {
         if (entry.holds != 0) return Left::Held;
         const std::uint8_t flags = entry.flags;
-        if ((flags & GpuWrites) != 0) return Left::GpuWritten;
+        if (gpuWritten(entry)) return Left::GpuWritten;
         if ((flags & Imported) != 0) return Left::Imported;
         if ((flags & Barred) != 0) return Left::Barred;
         return Left::Waiting;
@@ -567,6 +631,7 @@ public:
         for (std::size_t reason = 0; reason < left.size(); ++reason) counted.left[reason] = left[reason].load(std::memory_order_relaxed);
         counted.importArms = importArms.load(std::memory_order_relaxed);
         counted.gpuMarks = gpuMarks.load(std::memory_order_relaxed);
+        counted.gpuExpiries = gpuExpiries.load(std::memory_order_relaxed);
         return counted;
     }
 
@@ -575,18 +640,83 @@ private:
     static constexpr std::uint64_t SerialStep = 8;
     static constexpr std::uint8_t Imported = 1;
     static constexpr std::uint8_t Barred = 2;
-    static constexpr std::uint8_t GpuWrites = 4;
+    static constexpr std::uint8_t GpuUnwatched = 4;
     static constexpr std::uint8_t ReadImport = 8;
-    static constexpr std::uint8_t Blocking = Imported | Barred | GpuWrites;
+    static constexpr std::uint8_t GpuDiverged = 16;
+    static constexpr std::uint8_t Blocking = Imported | Barred | GpuUnwatched | GpuDiverged;
+    static constexpr unsigned GpuPeriodBits = 24;
+    static constexpr std::uint64_t GpuPeriodMask = (std::uint64_t{1} << GpuPeriodBits) - 1;
     static constexpr unsigned ChunkShift = 30;
     static constexpr std::size_t ChunkBlocks = (std::size_t{1} << ChunkShift) / BlockBytes;
     static constexpr std::size_t Chunks = std::size_t{1} << (47 - ChunkShift);
+
+    struct FlightLock {
+        explicit FlightLock(std::atomic<bool>& flag) : busy(flag) {
+            for (unsigned spins = 0; busy.exchange(true, std::memory_order_acquire); ++spins) {
+                if (spins % 64 == 63) SwitchToThread();
+                else YieldProcessor();
+            }
+        }
+        ~FlightLock() {
+            busy.store(false, std::memory_order_release);
+        }
+        FlightLock(const FlightLock&) = delete;
+        FlightLock& operator=(const FlightLock&) = delete;
+        std::atomic<bool>& busy;
+    };
 
     WindowsPageTrack() {
         verifying = set("APS5_VERIFY_PAGE_TRACK", std::getenv("APS5_VERIFY_PAGE_TRACK"));
         enabled = set("APS5_PAGE_TRACK", std::getenv("APS5_PAGE_TRACK")) || verifying;
         armImports = set("APS5_ARM_READ_IMPORTS", std::getenv("APS5_ARM_READ_IMPORTS")) && enabled;
+        expireGpuMarks = !set("APS5_NO_GPU_WRITE_MARK_EXPIRY", std::getenv("APS5_NO_GPU_WRITE_MARK_EXPIRY")) && armImports;
         if (enabled) chunks = std::make_unique<std::atomic<Block*>[]>(Chunks);
+        if (armImports) flights.reserve(256);
+    }
+
+    static bool gpuWritten(const Block& entry) {
+        return (entry.flags & (GpuUnwatched | GpuDiverged)) != 0 || entry.gpuMark.load(std::memory_order_acquire) != 0;
+    }
+
+    static bool blocked(const Block& entry) {
+        return (entry.flags & Blocking) != 0 || entry.gpuMark.load(std::memory_order_acquire) != 0;
+    }
+
+    static std::uint64_t refusalOf(const Block& entry, std::uint32_t now, bool gpu) {
+        if (entry.holds != 0) return Reason(PageTrackReason::Held);
+        const std::uint8_t flags = entry.flags;
+        if (gpu) return Reason(PageTrackReason::GpuWritten);
+        if ((flags & Imported) != 0) return Reason(PageTrackReason::Imported);
+        if ((flags & Barred) != 0) return Reason(PageTrackReason::Barred);
+        const std::uint32_t rest = entry.restUntil;
+        if (now < rest) return Reason(PageTrackReason::Resting, rest - now);
+        const std::uint32_t last = entry.faultPeriod;
+        if (last == now && entry.frameFaults.load(std::memory_order_relaxed) >= RequestFaults) return Reason(PageTrackReason::Faulted, 1);
+        return Reason(PageTrackReason::Armable);
+    }
+
+    std::uint64_t gpuStampNow() const {
+        return (gpuEpoch.load(std::memory_order_acquire) << GpuPeriodBits) | (Period() & GpuPeriodMask);
+    }
+
+    static void raiseGpuMark(Block& entry, std::uint64_t stamp) {
+        auto mark = entry.gpuMark.load(std::memory_order_acquire);
+        while ((mark >> GpuPeriodBits) <= (stamp >> GpuPeriodBits) && !entry.gpuMark.compare_exchange_weak(mark, stamp, std::memory_order_acq_rel, std::memory_order_acquire)) {}
+    }
+
+    bool gpuMarkExpired(const Block& entry, std::uint64_t mark, std::uint32_t now) const {
+        if (mark == 0 || !expireGpuMarks || (entry.flags & GpuUnwatched) != 0) return false;
+        return (mark >> GpuPeriodBits) <= gpuSettled.load(std::memory_order_acquire) && ((now - mark) & GpuPeriodMask) >= GpuQuietFrames;
+    }
+
+    void gpuFlag(std::uintptr_t first, std::uintptr_t end, std::uint8_t flag, PageTrackOrigin origin) {
+        if (!armImports || end <= first) return;
+        forEach(first, end, true, [&](std::uintptr_t block, Block& entry) {
+            if (!gpuWritten(entry)) gpuMarks.fetch_add(1, std::memory_order_relaxed);
+            noteOrigin(entry, flag, origin);
+            entry.flags |= flag;
+            open(block, entry);
+        });
     }
 
     static bool set(const char* name, const char* value) {
@@ -679,7 +809,7 @@ private:
     }
 
     void noteOrigin(Block& entry, std::uint8_t flag, PageTrackOrigin origin) {
-        if ((flag & Blocking) == 0 || (entry.flags & Blocking) != 0) return;
+        if ((flag & Blocking) == 0 || blocked(entry)) return;
         entry.origin = static_cast<std::uint8_t>(origin);
         originMarks[static_cast<std::size_t>(origin)].fetch_add(1, std::memory_order_relaxed);
     }
@@ -696,6 +826,7 @@ private:
     bool enabled = false;
     bool verifying = false;
     bool armImports = false;
+    bool expireGpuMarks = false;
     std::unique_ptr<std::atomic<Block*>[]> chunks;
     mutable std::atomic<std::uint64_t> transitions{0};
     std::atomic<std::uint64_t> armed{0};
@@ -706,6 +837,11 @@ private:
     std::atomic<std::uint64_t> divergences{0};
     std::atomic<std::uint64_t> importArms{0};
     std::atomic<std::uint64_t> gpuMarks{0};
+    std::atomic<std::uint64_t> gpuExpiries{0};
+    std::atomic<std::uint64_t> gpuEpoch{1};
+    std::atomic<std::uint64_t> gpuSettled{0};
+    std::atomic<bool> flightsBusy{false};
+    std::vector<std::uint64_t> flights;
     std::array<std::atomic<std::uint64_t>, LeftReasons> left{};
     std::array<std::atomic<std::uint64_t>, PageTrackOrigins> leftOrigins{};
     std::array<std::atomic<std::uint64_t>, PageTrackOrigins> originMarks{};

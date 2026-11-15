@@ -760,12 +760,26 @@ public:
         return held;
     }
 
-    void GpuWrite(std::uintptr_t address, std::size_t bytes, PageTrackOrigin origin) {
+    void GpuWrite(std::uintptr_t address, std::size_t bytes, PageTrackOrigin origin = PageTrackOrigin::Announced) {
         if (!track.ArmsImports() || bytes == 0 || address >= (std::uintptr_t{1} << 47) || bytes > (std::uintptr_t{1} << 47) - address) return;
         track.NoteAnnounce(address, address + bytes, origin);
-        if (track.MarkedGpuWrites(address, address + bytes)) return;
+        if (track.RestampGpuWrites(address, address + bytes)) return;
         const SiteLock lock(mutex, MappingLockCaller::GpuWrite);
         track.GpuWrite(address, address + bytes, origin);
+    }
+
+    void GpuUnwatched(std::uintptr_t address, std::size_t bytes) {
+        if (!track.ArmsImports() || bytes == 0 || address >= (std::uintptr_t{1} << 47) || bytes > (std::uintptr_t{1} << 47) - address) return;
+        track.NoteAnnounce(address, address + bytes, PageTrackOrigin::Unwatch);
+        if (track.GpuUnwatchedOver(address, address + bytes)) return;
+        const SiteLock lock(mutex, MappingLockCaller::GpuWrite);
+        track.NoteGpuUnwatched(address, address + bytes);
+    }
+
+    void GpuWatched(std::uintptr_t address, std::size_t bytes) {
+        if (!track.ArmsImports() || bytes == 0 || address >= (std::uintptr_t{1} << 47) || bytes > (std::uintptr_t{1} << 47) - address) return;
+        const SiteLock lock(mutex, MappingLockCaller::GpuWrite);
+        track.GpuWatched(address, address + bytes);
     }
 
     bool ArmBlocks(std::uintptr_t address, std::size_t bytes, std::uint64_t* tokens, std::uint64_t* reasons, std::size_t count) {
@@ -1515,7 +1529,7 @@ private:
         std::snprintf(text, sizeof(text), "page tracking: the %sblock 0x%llx is armed and clean, but %s (APS5_VERIFY_PAGE_TRACK)", imported ? "imported " : "", static_cast<unsigned long long>(block), result != 0 ? "its write watch cannot be read" : found != 0 ? "the write watch reports written pages" : imported ? "its bytes changed without a fault: a GPU write was not announced" : "its bytes changed without a fault");
         std::fprintf(stderr, "%s\n", text);
         if (imported) {
-            track.GpuWrite(block, block + WindowsPageTrack::BlockBytes, PageTrackOrigin::VerifyClean);
+            track.NoteGpuDiverged(block, block + WindowsPageTrack::BlockBytes);
             return;
         }
         throw std::runtime_error(text);
@@ -1564,6 +1578,7 @@ private:
         }
         if (state == WindowsPageTrack::State::Opening) return WindowsPageTrack::Reason(PageTrackReason::Busy);
         if (state == WindowsPageTrack::State::Written && WindowsPageTrack::TakeWritten(entry)) track.NoteFault(entry, now);
+        track.SettleGpuWrite(entry, now);
         if (const auto refusal = WindowsPageTrack::Refusal(entry, now); refusal != WindowsPageTrack::Reason(PageTrackReason::Armable)) return refusal;
         if (!armBlock(block)) {
             track.NoteEdge(block, true);
@@ -1616,6 +1631,7 @@ private:
                 continue;
             }
             auto& entry = track.Touch(block);
+            track.SettleGpuWrite(entry, now);
             if (!written) {
                 const auto reason = WindowsPageTrack::LeftBecause(entry);
                 ++left[static_cast<std::size_t>(reason)];

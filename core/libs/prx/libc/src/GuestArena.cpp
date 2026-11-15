@@ -702,7 +702,7 @@ void GuestPageTrackFrame_nid_no_patch() {
 
 void GuestPageTrackCounts_nid_no_patch(std::uint64_t* counts, std::size_t capacity) {
     const auto counted = WindowsPageTrack::Get().Counted();
-    const std::uint64_t values[] = {counted.armed, counted.arms, counted.faults, counted.quiet, counted.rests, counted.divergences, counted.left[0], counted.left[1], counted.left[2], counted.left[3], counted.importArms, counted.gpuMarks, counted.left[4], counted.left[5]};
+    const std::uint64_t values[] = {counted.armed, counted.arms, counted.faults, counted.quiet, counted.rests, counted.divergences, counted.left[0], counted.left[1], counted.left[2], counted.left[3], counted.importArms, counted.gpuMarks, counted.left[4], counted.left[5], counted.gpuExpiries};
     for (std::size_t index = 0; index < capacity; ++index) counts[index] = index < std::size(values) ? values[index] : 0;
 }
 
@@ -741,6 +741,22 @@ bool GuestPageTrackArmsImports_nid_no_patch() {
 
 void GuestPageTrackGpuWrite_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint8_t origin) {
     WindowsMappings::Get().GpuWrite(address, bytes, static_cast<std::size_t>(origin) < PageTrackOrigins ? static_cast<PageTrackOrigin>(origin) : PageTrackOrigin::Announced);
+}
+
+void GuestPageTrackGpuUnwatched_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().GpuUnwatched(address, bytes);
+}
+
+void GuestPageTrackGpuWatched_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().GpuWatched(address, bytes);
+}
+
+std::uint64_t GuestPageTrackGpuFlightBegin_nid_no_patch() {
+    return WindowsPageTrack::Get().BeginGpuFlight();
+}
+
+void GuestPageTrackGpuFlightEnd_nid_no_patch(std::uint64_t flight) {
+    WindowsPageTrack::Get().EndGpuFlight(flight);
 }
 
 bool GuestPageTrackReasons_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* reasons, std::size_t count) {
