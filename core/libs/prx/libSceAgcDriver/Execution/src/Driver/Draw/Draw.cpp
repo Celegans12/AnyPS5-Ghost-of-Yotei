@@ -316,6 +316,13 @@ bool FinisherPrecollect() {
     return enabled && DrawPipeline::SharedCollectEpoch();
 }
 
+constexpr std::uint64_t FinisherInputPrecollectBytes = 16ull << 20u;
+
+bool FinisherInputPrecollect() {
+    static const bool enabled = std::getenv("APS5_NO_FINISHER_INPUT_PRECOLLECT") == nullptr;
+    return enabled && FinisherPrecollect();
+}
+
 struct CpuIndirectProgramsStorage {};
 
 std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
@@ -1559,8 +1566,15 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto commitPacket = tail.packetOpcode;
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        if (recipe != nullptr && DrawFinisher::OnFinisherThread() && FinisherPrecollect() && GuestMemory::CollectEpoch() != 0) {
-            for (const auto& [address, bytes] : recipe->surfaces) GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes));
+        if (DrawFinisher::OnFinisherThread() && FinisherPrecollect() && GuestMemory::CollectEpoch() != 0) {
+            if (recipe != nullptr) {
+                for (const auto& [address, bytes] : recipe->surfaces) GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes));
+            }
+            if (FinisherInputPrecollect()) {
+                for (const auto& [begin, end] : reads) {
+                    if (end - begin <= FinisherInputPrecollectBytes) GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin));
+                }
+            }
         }
         auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), recipeKey, recipeDonor, recipeOrigin, ownKey, contentKey = std::move(contentKey), byContent, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
             DrawPipeline::FollowEpoch(epoch);
