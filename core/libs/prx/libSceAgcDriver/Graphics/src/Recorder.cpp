@@ -1683,6 +1683,11 @@ Recorder* Recorder::Active() {
     return activeRecorder;
 }
 
+static void NoteDriverStore(std::uint64_t address, std::size_t bytes) {
+    OutdateStoredInputTwins(address, bytes);
+    BufferCache::EndDrawRun();
+}
+
 void Recorder::Activate() {
     activeRecorder = this;
     {
@@ -1690,7 +1695,7 @@ void Recorder::Activate() {
         labelTableOwner = this;
     }
     GuestMemory::SetFlushHook(&FlushForAccess);
-    GuestMemory::SetStoreHook(&OutdateStoredInputTwins);
+    GuestMemory::SetStoreHook(&NoteDriverStore);
 }
 
 std::optional<Recorder::LabelHit> Recorder::LookupLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) {
@@ -4267,6 +4272,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     GuestMemory::AnnounceGpuWrite(address, bytes);
+    BufferCache::EndDrawRun();
     GuestMemory::ForgetKnownZero(address, bytes);
     ensureOpen();
     const auto end = address + bytes;
@@ -4303,6 +4309,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
     GuestMemory::AnnounceGpuWrite(address, bytes);
+    BufferCache::EndDrawRun();
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     outdateDrawInputCopies(address, address + bytes);
@@ -4911,9 +4918,42 @@ BufferCache::View CachedStageRange(Recorder& recorder, std::uint64_t address, st
     BufferCache::View view;
     {
         const Serving serving(*cache);
-        view = CachedRange(recorder, address, bytes, 0, alignment);
+        view = BufferCache::DirtyFirst() ? DirtyFirstRange(recorder, address, bytes, 0, alignment) : CachedRange(recorder, address, bytes, 0, alignment);
     }
     BufferCache::NoteStage(static_cast<bool>(view));
+    return view;
+}
+
+BufferCache::View DirtyFirstRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t from, std::size_t alignment) {
+    auto* cache = recorder.Buffers();
+    if (cache == nullptr || bytes == 0 || from >= bytes) return {};
+    const auto begin = address + from;
+    const auto end = address + bytes;
+    const auto first = begin & ~(BufferCache::PageBytes - 1);
+    const auto stop = (end + BufferCache::PageBytes - 1) & ~(BufferCache::PageBytes - 1);
+    const auto written = [&](std::uint64_t low, std::uint64_t high) { return high > low && recorder.PendingWriteOverlaps(low, static_cast<std::size_t>(high - low)); };
+    const auto stored = [&](std::uint64_t low, std::uint64_t high) {
+        if (high <= low) return false;
+        const auto size = static_cast<std::size_t>(high - low);
+        return recorder.PendingLabelIn(low, size) || recorder.QueuedStoreOverlaps(low, size) || recorder.QueuedKeyStoreOverlaps(low, size);
+    };
+    BufferCache::Input input;
+    input.alignment = alignment;
+    input.apart = alignment > 1 && (address % BufferCache::ZoneBytes) % alignment != 0;
+    if (written(first, stop) || stored(first, stop)) {
+        if (written(begin, end) || stored(begin, end)) {
+            input.apart = true;
+            input.fresh = true;
+        } else {
+            input.partialHead = written(first, begin) || stored(first, begin);
+            input.partialTail = written(end, stop) || stored(end, stop);
+        }
+    }
+    const auto flushBegin = input.fresh || input.partialHead ? begin : first;
+    const auto flushEnd = input.fresh || input.partialTail ? end : stop;
+    GuestMemory::FlushGpuWrites(flushBegin, static_cast<std::size_t>(flushEnd - flushBegin));
+    auto view = cache->AcquireInput(address, bytes, from, recorder.OpenSerial(), input);
+    if (view && BufferCache::VerifyingDirtyFirst()) cache->VerifyInput(view, address, bytes, from);
     return view;
 }
 
@@ -4941,9 +4981,12 @@ BufferCache* Recorder::Buffers() {
         };
         auto executed = [this](std::uint64_t serial) { return ExecutedThrough(serial); };
         bufferCache = std::make_unique<BufferCache>(std::move(allocate), std::move(executed), BufferCache::TrackerSource());
+        bool armable = false;
 #ifdef _WIN32
-        if (GuestArena::GuestPageTrackEnabled_nid_no_patch()) BufferCache::SetArmedBlocks({&GuestMemory::ArmedTokens, &GuestMemory::ArmedCleanSince, &GuestMemory::ArmBlocks, &GuestMemory::RearmWritten, &GuestMemory::UnarmedReason});
+        armable = GuestArena::GuestPageTrackEnabled_nid_no_patch();
+        if (armable) BufferCache::SetArmedBlocks({&GuestMemory::ArmedTokens, &GuestMemory::ArmedCleanSince, &GuestMemory::ArmBlocks, &GuestMemory::RearmWritten, &GuestMemory::UnarmedReason});
 #endif
+        if (BufferCache::DirtyFirst() && !armable) std::fprintf(stderr, "[buffer-cache] APS5_DIRTY_FIRST_INPUTS without page tracking (APS5_PAGE_TRACK=1 on Windows): no block is ever armed, every draw input above the ring size is uploaded once per run of draws\n");
     }
     return bufferCache.get();
 }

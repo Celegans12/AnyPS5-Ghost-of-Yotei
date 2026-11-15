@@ -1558,7 +1558,9 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     Require(from == 0 || (use == Recorder::SnapshotUse::Vertex && from < bytes), "only a vertex input starts past its address");
     DrawInputCopy copy;
     copy.from = from;
-    if (recorder != nullptr && bytes != 0) {
+    if (recorder != nullptr && bytes != 0 && BufferCache::DirtyFirst()) {
+        GuestMemory::FlushGpuWrites(address, bytes);
+    } else if (recorder != nullptr && bytes != 0) {
         GuestMemory::FlushGpuWrites(address, bytes);
 #ifdef _WIN32
         const bool owned = !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawInputs);
@@ -1598,7 +1600,7 @@ DrawInputCopy CopyZeroPaddedDrawInput(const Context& context, std::uint64_t addr
     if (readable != 0) GuestMemory::FlushGpuWrites(address, readable);
     DrawInputCopy copy;
     auto* recorder = context.recorder;
-    const bool keep = recorder != nullptr && readable != 0 && readable <= std::numeric_limits<std::uint32_t>::max();
+    const bool keep = recorder != nullptr && readable != 0 && readable <= std::numeric_limits<std::uint32_t>::max() && !BufferCache::DirtyFirst();
     if (keep) {
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, readable);
@@ -1711,7 +1713,7 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
         indices.highest = bounds->highest;
         indices.lowest = bounds->lowest;
     };
-    if (bytes < Recorder::KeptIndexRangeIndices * indexSize) {
+    if (bytes < Recorder::KeptIndexRangeIndices * indexSize || BufferCache::DirtyFirst()) {
         scan();
         return indices;
     }
@@ -1787,6 +1789,7 @@ BufferCache::View streamedDrawInput(Recorder& recorder, std::uint64_t address, s
 BufferCache::View cachedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t from, std::size_t alignment) {
     auto* recorder = context.recorder;
     if (recorder == nullptr) return {};
+    if (BufferCache::DirtyFirst()) return DirtyFirstRange(*recorder, address, bytes, from, alignment);
     auto view = CachedRange(*recorder, address, bytes, from, alignment);
     if (!view && view.streamed) return streamedDrawInput(*recorder, address, bytes, from);
     return view;
@@ -2228,18 +2231,23 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.inPlaceReads.emplace_back(begin, end);
             continue;
         }
-        if (auto cached = cachedDrawInput(context, begin, bytes, rangeFrom[range], plan.alignments[range])) {
+        const bool dirtyFirst = BufferCache::DirtyFirst() && context.recorder != nullptr;
+        const bool behind = dirtyFirst && context.recorder->PendingWriteOverlaps(begin, bytes);
+        const auto served = [&](BufferCache::View cached) {
+            if (!cached) return false;
             rangeHandles.push_back(cached.handle);
             rangeOffsets.push_back(cached.offset);
             inputs.mirrors.push_back(std::move(cached.owner));
-            continue;
-        }
-        if (auto copied = GpuCopiedDrawInput(context, begin, bytes, rangeFrom[range])) {
+            return true;
+        };
+        if (!behind && served(cachedDrawInput(context, begin, bytes, rangeFrom[range], plan.alignments[range]))) continue;
+        if (auto copied = !dirtyFirst || behind ? GpuCopiedDrawInput(context, begin, bytes, rangeFrom[range]) : std::shared_ptr<Buffer>{}) {
             rangeHandles.push_back(copied->Handle());
             rangeOffsets.push_back(0);
             inputs.vertexBuffers.push_back(std::move(copied));
             continue;
         }
+        if (behind && served(cachedDrawInput(context, begin, bytes, rangeFrom[range], plan.alignments[range]))) continue;
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, rangeFrom[range]);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
         rangeHandles.push_back(copy.buffer->Handle());

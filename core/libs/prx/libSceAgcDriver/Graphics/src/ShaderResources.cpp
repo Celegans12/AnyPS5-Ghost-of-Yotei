@@ -7524,7 +7524,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
         if (buffer == nullptr) {
-            const bool uploaded = bytes != 0 && bytes <= uploadLimit;
+            const bool uploaded = (bytes != 0 && bytes <= uploadLimit) || BufferCache::DirtyFirst();
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
                 std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
