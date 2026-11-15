@@ -684,6 +684,96 @@ void CheckTokens(bool resident) {
     Require(!mappings.ArmBlocks(address, BlockBytes, &none, &reason, 1) && none == 0 && ReasonOf(reason) == Reason::Edge, kind + ": a released block was armed");
 }
 
+void CheckImports(bool resident) {
+    constexpr std::size_t Blocks = 8;
+    using Reason = GuestArena::PageTrackReason;
+    auto& track = Track::Get();
+    auto& mappings = Mappings::Get();
+    const std::string kind = resident ? "resident" : "private";
+    Require(track.ArmsImports(), "APS5_ARM_READ_IMPORTS=1 did not let imported blocks be armed");
+    Guest memory(resident, Blocks * BlockBytes);
+    const auto all = [&] { return memory.Collect(0, Blocks * BlockPages); };
+    const auto calls = [&] { return mappings.CollectWatchCalls(); };
+    const std::set<std::size_t> none;
+    const auto holds = [&](std::size_t block, std::uint64_t token) { return track.CleanSince(memory.Block(block), BlockBytes, &token, 1); };
+    const auto request = [&](std::size_t block, std::uint64_t* reason) {
+        std::uint64_t token = 0;
+        mappings.ArmBlocks(memory.Block(block), BlockBytes, &token, reason, 1);
+        return token;
+    };
+    const auto lease = [&](std::size_t block, std::size_t blocks) {
+        Require(mappings.BeginHostWrite(memory.Block(block), blocks * BlockBytes, false), kind + ": a host import was refused");
+        mappings.EndHostWrite(memory.Block(block), blocks * BlockBytes, false);
+    };
+    all();
+    std::uint64_t reason = 0;
+
+    lease(1, 2);
+    const auto before = track.Counted();
+    const auto first = request(1, &reason);
+    Require(first != 0 && ReasonOf(reason) == Reason::Armed && memory.Protection(1) == PAGE_READONLY && track.Counted().importArms == before.importArms + 1, kind + ": an imported block that the GPU only reads was not armed on request");
+    const auto faults = handled.load();
+    memory.Write(1, 3, 7);
+    Require(handled.load() - faults == 1 && !holds(1, first), kind + ": a CPU write to an armed imported block did not fault and end its token");
+    Require(all() == Pages(1, {3}), kind + ": a CPU write to an armed imported block was lost for the collect");
+
+    Settle(memory, Blocks);
+    all();
+    Require(track.Clean(memory.Block(2)) && track.Clean(memory.Block(5)), kind + ": the collects did not arm an imported block that is only read, or its neighbours");
+    const auto quiet = calls();
+    Require(all() == none && calls() == quiet, kind + ": a collect of armed imported blocks made a system call");
+
+    std::uint64_t second = 0;
+    Require(track.Tokens(memory.Block(2), BlockBytes, &second, 1) && second != 0, kind + ": an armed imported block has no token");
+    const auto marks = track.Counted().gpuMarks;
+    mappings.GpuWrite(memory.Block(2) + 100, 8);
+    Require(!holds(2, second) && memory.Protection(2) == PAGE_READWRITE && track.Counted().gpuMarks == marks + 1, kind + ": an announced GPU write did not open its block and end its token");
+    Require(request(2, &reason) == 0 && ReasonOf(reason) == Reason::GpuWritten, kind + ": a block the GPU writes was armed on request");
+    Require(track.Reasons(memory.Block(2), BlockBytes, &reason, 1) && ReasonOf(reason) == Reason::GpuWritten, kind + ": the table does not say that the GPU writes a block");
+    mappings.GpuWrite(memory.Block(2), BlockBytes);
+    Require(track.Counted().gpuMarks == marks + 1 && track.Clean(memory.Block(3)), kind + ": a second announcement counted the block again or touched its neighbour");
+    Settle(memory, Blocks);
+    all();
+    Require(track.StateOf(memory.Block(2)) == State::Unarmed && memory.Protection(2) == PAGE_READWRITE, kind + ": a block the GPU writes was armed again by the collects");
+
+    mappings.GpuWrite(memory.Block(6) + BlockBytes - 4, 8);
+    Require(memory.Protection(6) == PAGE_READWRITE && memory.Protection(7) == PAGE_READWRITE && request(6, &reason) == 0 && request(7, &reason) == 0, kind + ": an announced GPU write over two blocks left one armed or armable");
+
+    std::uint64_t third = 0;
+    Require(track.Tokens(memory.Block(4), BlockBytes, &third, 1) && third != 0, kind + ": a cold block is not armed");
+    lease(4, 1);
+    Require(!holds(4, third) && memory.Protection(4) == PAGE_READWRITE, kind + ": an import of an armed block did not open it and end its token first");
+    Require(request(4, &reason) > third && ReasonOf(reason) == Reason::Armed, kind + ": a block imported while armed was not armed again on request");
+
+    const auto address = memory.Block(2);
+    memory.Release();
+    Require(track.Reasons(address, BlockBytes, &reason, 1) && ReasonOf(reason) != Reason::GpuWritten, kind + ": unmapping did not forget that the GPU wrote a block");
+}
+
+void CheckImportDivergence(bool resident) {
+    constexpr std::size_t Blocks = 4;
+    using Reason = GuestArena::PageTrackReason;
+    auto& track = Track::Get();
+    auto& mappings = Mappings::Get();
+    const std::string kind = resident ? "resident" : "private";
+    Require(track.ArmsImports() && track.Verifying(), "the import verification mode is not on");
+    Guest memory(resident, Blocks * BlockBytes);
+    memory.Collect(0, Blocks * BlockPages);
+    Require(mappings.BeginHostWrite(memory.Block(1), BlockBytes, false), kind + ": a host import was refused");
+    mappings.EndHostWrite(memory.Block(1), BlockBytes, false);
+    std::uint64_t token = 0;
+    std::uint64_t reason = 0;
+    Require(mappings.ArmBlocks(memory.Block(1), BlockBytes, &token, &reason, 1) && token != 0, kind + ": an imported block was not armed on request");
+    DWORD previous = 0;
+    Require(VirtualProtect(memory.data + BlockBytes, BlockBytes, PAGE_READWRITE, &previous) != 0, kind + ": cannot open a block behind the table");
+    memory.data[BlockBytes + 5 * PageBytes + 9] ^= 0x5a;
+    Require(VirtualProtect(memory.data + BlockBytes, BlockBytes, PAGE_READONLY, &previous) != 0 && ResetWriteWatch(memory.data + BlockBytes, BlockBytes) == 0, kind + ": cannot close a block behind the table");
+    const auto divergences = track.Counted().divergences;
+    Require(memory.Collect(0, Blocks * BlockPages).empty(), kind + ": a collect reported pages for a write that left no trace");
+    Require(track.Counted().divergences == divergences + 1 && memory.Protection(1) == PAGE_READWRITE, kind + ": bytes that changed under an armed imported block were not counted as a divergence, or the block stayed armed");
+    Require(!track.CleanSince(memory.Block(1), BlockBytes, &token, 1) && !mappings.ArmBlocks(memory.Block(1), BlockBytes, &token, &reason, 1) && token == 0 && ReasonOf(reason) == Reason::GpuWritten, kind + ": a block that diverged was not barred as written by the GPU");
+}
+
 void CheckDemandRace(bool resident) {
     constexpr std::size_t Writers = 8;
     constexpr std::size_t Blocks = 16;
@@ -932,6 +1022,7 @@ void CheckRace() {
 int main(int argc, char** argv) {
     const std::string_view mode = argc > 1 ? argv[1] : "";
     _putenv_s(mode.starts_with("verify") ? "APS5_VERIFY_PAGE_TRACK" : "APS5_PAGE_TRACK", "1");
+    if (mode.ends_with("imports")) _putenv_s("APS5_ARM_READ_IMPORTS", "1");
     const auto handler = AddVectoredExceptionHandler(1, HandleFault);
     int result = 0;
     try {
@@ -963,6 +1054,16 @@ int main(int argc, char** argv) {
         } else if (mode == "tokens") {
             CheckTokens(false);
             CheckTokens(true);
+        } else if (mode == "imports") {
+            CheckImports(false);
+            CheckImports(true);
+        } else if (mode == "verify-imports") {
+            CheckImports(false);
+            CheckImports(true);
+            const auto divergences = Track::Get().Counted().divergences;
+            Require(divergences == 0, "verified collects diverged over armed imported blocks");
+            CheckImportDivergence(false);
+            CheckImportDivergence(true);
         } else if (mode == "demand-race") {
             CheckDemandRace(false);
             CheckDemandRace(true);
@@ -986,7 +1087,7 @@ int main(int argc, char** argv) {
                 Require(Track::Get().Counted().divergences == 0, "verified collects diverged under concurrent writers");
             }
         } else {
-            std::fprintf(stderr, "usage: %s table|race|guards|collect|hot|collect-race|demand|rearm|tokens|demand-race|verify|verify-race|verify-demand\n", argv[0]);
+            std::fprintf(stderr, "usage: %s table|race|guards|collect|hot|collect-race|demand|rearm|tokens|imports|demand-race|verify|verify-race|verify-demand|verify-imports\n", argv[0]);
             result = 2;
         }
         if (result == 0) std::printf("page tracking %.*s tests passed\n", static_cast<int>(mode.size()), mode.data());

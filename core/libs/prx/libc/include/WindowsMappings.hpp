@@ -651,6 +651,13 @@ public:
         return true;
     }
 
+    void GpuWrite(std::uintptr_t address, std::size_t bytes) {
+        if (!track.ArmsImports() || bytes == 0 || address >= (std::uintptr_t{1} << 47) || bytes > (std::uintptr_t{1} << 47) - address) return;
+        if (track.MarkedGpuWrites(address, address + bytes)) return;
+        std::lock_guard lock(mutex);
+        track.GpuWrite(address, address + bytes);
+    }
+
     bool ArmBlocks(std::uintptr_t address, std::size_t bytes, std::uint64_t* tokens, std::uint64_t* reasons, std::size_t count) {
         if (tokens == nullptr) return false;
         std::fill_n(tokens, count, std::uint64_t{0});
@@ -684,7 +691,8 @@ public:
             const auto held = tokens[index];
             const auto word = track.Word(block);
             const auto state = WindowsPageTrack::StateOfWord(word);
-            if (held != 0 && word == held && state == WindowsPageTrack::State::Armed) {
+            if (held != 0 && word == held && state == WindowsPageTrack::State::Armed) verifyClean(block);
+            if (held != 0 && track.Word(block) == held && state == WindowsPageTrack::State::Armed) {
                 written[index] = 0;
                 if (reasons != nullptr) reasons[index] = WindowsPageTrack::Reason(PageTrackReason::Armed);
                 continue;
@@ -1224,9 +1232,14 @@ private:
         if (track.Word(block) != word) return;
         if (result == 0 && found == 0 && digest == track.Digest(block)) return;
         track.NoteDivergence();
-        char text[224];
-        std::snprintf(text, sizeof(text), "page tracking: the block 0x%llx is armed and clean, but %s (APS5_VERIFY_PAGE_TRACK)", static_cast<unsigned long long>(block), result != 0 ? "its write watch cannot be read" : found != 0 ? "the write watch reports written pages" : "its bytes changed without a fault");
+        const bool imported = track.ReadImported(block);
+        char text[256];
+        std::snprintf(text, sizeof(text), "page tracking: the %sblock 0x%llx is armed and clean, but %s (APS5_VERIFY_PAGE_TRACK)", imported ? "imported " : "", static_cast<unsigned long long>(block), result != 0 ? "its write watch cannot be read" : found != 0 ? "the write watch reports written pages" : imported ? "its bytes changed without a fault: a GPU write was not announced" : "its bytes changed without a fault");
         std::fprintf(stderr, "%s\n", text);
+        if (imported) {
+            track.GpuWrite(block, block + WindowsPageTrack::BlockBytes);
+            return;
+        }
         throw std::runtime_error(text);
     }
 
@@ -1266,6 +1279,8 @@ private:
         const auto word = track.Word(block);
         const auto state = WindowsPageTrack::StateOfWord(word);
         if (state == WindowsPageTrack::State::Armed) {
+            verifyClean(block);
+            if (track.Word(block) != word) return WindowsPageTrack::Reason(PageTrackReason::Busy);
             *token = word;
             return WindowsPageTrack::Reason(PageTrackReason::Armed);
         }

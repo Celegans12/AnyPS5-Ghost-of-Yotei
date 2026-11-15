@@ -702,7 +702,7 @@ void GuestPageTrackFrame_nid_no_patch() {
 
 void GuestPageTrackCounts_nid_no_patch(std::uint64_t* counts, std::size_t capacity) {
     const auto counted = WindowsPageTrack::Get().Counted();
-    const std::uint64_t values[] = {counted.armed, counted.arms, counted.faults, counted.quiet, counted.rests, counted.divergences, counted.left[0], counted.left[1], counted.left[2], counted.left[3]};
+    const std::uint64_t values[] = {counted.armed, counted.arms, counted.faults, counted.quiet, counted.rests, counted.divergences, counted.left[0], counted.left[1], counted.left[2], counted.left[3], counted.importArms, counted.gpuMarks};
     for (std::size_t index = 0; index < capacity; ++index) counts[index] = index < std::size(values) ? values[index] : 0;
 }
 
@@ -721,6 +721,14 @@ bool GuestPageTrackCleanSince_nid_no_patch(std::uintptr_t address, std::size_t b
 
 bool GuestPageTrackArm_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* tokens, std::uint64_t* reasons, std::size_t count) {
     return WindowsMappings::Get().ArmBlocks(address, bytes, tokens, reasons, count);
+}
+
+bool GuestPageTrackArmsImports_nid_no_patch() {
+    return WindowsPageTrack::Get().ArmsImports();
+}
+
+void GuestPageTrackGpuWrite_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().GpuWrite(address, bytes);
 }
 
 bool GuestPageTrackReasons_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* reasons, std::size_t count) {

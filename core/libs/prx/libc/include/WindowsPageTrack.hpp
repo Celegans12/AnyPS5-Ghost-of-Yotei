@@ -51,6 +51,8 @@ public:
         std::uint64_t rests = 0;
         std::uint64_t divergences = 0;
         std::array<std::uint64_t, 4> left{};
+        std::uint64_t importArms = 0;
+        std::uint64_t gpuMarks = 0;
     };
     enum class Left : std::size_t { Edge, Held, Imported, Waiting };
 
@@ -65,6 +67,33 @@ public:
 
     bool Verifying() const {
         return verifying;
+    }
+
+    bool ArmsImports() const {
+        return armImports;
+    }
+
+    bool ReadImported(std::uintptr_t block) const {
+        const auto* entry = find(block);
+        return entry != nullptr && (entry->flags & ReadImport) != 0;
+    }
+
+    bool MarkedGpuWrites(std::uintptr_t first, std::uintptr_t end) const {
+        if (!armImports || end <= first) return true;
+        for (auto block = first & ~(BlockBytes - 1); block < end; block += BlockBytes) {
+            const auto* entry = find(block);
+            if (entry == nullptr || (entry->flags & GpuWrites) == 0) return false;
+        }
+        return true;
+    }
+
+    void GpuWrite(std::uintptr_t first, std::uintptr_t end) {
+        if (!armImports || end <= first) return;
+        forEach(first, end, true, [&](std::uintptr_t block, Block& entry) {
+            if ((entry.flags & GpuWrites) == 0) gpuMarks.fetch_add(1, std::memory_order_relaxed);
+            entry.flags |= GpuWrites;
+            open(block, entry);
+        });
     }
 
     bool HandleWrite(std::uintptr_t address) {
@@ -172,7 +201,7 @@ public:
     bool Armable(std::uintptr_t block) const {
         if (!enabled) return false;
         const auto* entry = find(block);
-        return entry == nullptr || (entry->holds == 0 && entry->flags == 0);
+        return entry == nullptr || (entry->holds == 0 && (entry->flags & Blocking) == 0);
     }
 
     bool Arm(std::uintptr_t block) {
@@ -193,6 +222,7 @@ public:
             return false;
         }
         arms.fetch_add(1, std::memory_order_relaxed);
+        if ((entry.flags & ReadImport) != 0) importArms.fetch_add(1, std::memory_order_relaxed);
         entry.word.store(with(next, State::Armed), std::memory_order_release);
         return true;
     }
@@ -229,8 +259,9 @@ public:
     static std::uint64_t Refusal(const Block& entry, std::uint32_t now) {
         if (entry.holds != 0) return Reason(PageTrackReason::Held);
         const std::uint8_t flags = entry.flags;
+        if ((flags & GpuWrites) != 0) return Reason(PageTrackReason::GpuWritten);
         if ((flags & Imported) != 0) return Reason(PageTrackReason::Imported);
-        if (flags != 0) return Reason(PageTrackReason::Barred);
+        if ((flags & Barred) != 0) return Reason(PageTrackReason::Barred);
         const std::uint32_t rest = entry.restUntil;
         if (now < rest) return Reason(PageTrackReason::Resting, rest - now);
         const std::uint32_t last = entry.faultPeriod;
@@ -302,7 +333,7 @@ public:
     }
 
     static bool Free(const Block& entry) {
-        return entry.holds == 0 && entry.flags == 0;
+        return entry.holds == 0 && (entry.flags & Blocking) == 0;
     }
 
     static void NoteClean(Block& entry, std::uint32_t now) {
@@ -407,7 +438,7 @@ public:
     }
 
     void Import(std::uintptr_t first, std::uintptr_t end) {
-        mark(first, end, Imported);
+        mark(first, end, armImports ? ReadImport : Imported);
     }
 
     void Bar(std::uintptr_t first, std::uintptr_t end) {
@@ -443,12 +474,14 @@ public:
     }
 
     static Left LeftBecause(const Block& entry) {
-        return entry.holds != 0 ? Left::Held : entry.flags != 0 ? Left::Imported : Left::Waiting;
+        return entry.holds != 0 ? Left::Held : (entry.flags & Blocking) != 0 ? Left::Imported : Left::Waiting;
     }
 
     Counts Counted() const {
         Counts counted{armed.load(std::memory_order_relaxed), arms.load(std::memory_order_relaxed), faults.load(std::memory_order_relaxed), quiet.load(std::memory_order_relaxed), rests.load(std::memory_order_relaxed), divergences.load(std::memory_order_relaxed), {}};
         for (std::size_t reason = 0; reason < left.size(); ++reason) counted.left[reason] = left[reason].load(std::memory_order_relaxed);
+        counted.importArms = importArms.load(std::memory_order_relaxed);
+        counted.gpuMarks = gpuMarks.load(std::memory_order_relaxed);
         return counted;
     }
 
@@ -457,6 +490,9 @@ private:
     static constexpr std::uint64_t SerialStep = 8;
     static constexpr std::uint8_t Imported = 1;
     static constexpr std::uint8_t Barred = 2;
+    static constexpr std::uint8_t GpuWrites = 4;
+    static constexpr std::uint8_t ReadImport = 8;
+    static constexpr std::uint8_t Blocking = Imported | Barred | GpuWrites;
     static constexpr unsigned ChunkShift = 30;
     static constexpr std::size_t ChunkBlocks = (std::size_t{1} << ChunkShift) / BlockBytes;
     static constexpr std::size_t Chunks = std::size_t{1} << (47 - ChunkShift);
@@ -464,6 +500,7 @@ private:
     WindowsPageTrack() {
         verifying = set("APS5_VERIFY_PAGE_TRACK", std::getenv("APS5_VERIFY_PAGE_TRACK"));
         enabled = set("APS5_PAGE_TRACK", std::getenv("APS5_PAGE_TRACK")) || verifying;
+        armImports = set("APS5_ARM_READ_IMPORTS", std::getenv("APS5_ARM_READ_IMPORTS")) && enabled;
         if (enabled) chunks = std::make_unique<std::atomic<Block*>[]>(Chunks);
     }
 
@@ -566,6 +603,7 @@ private:
 
     bool enabled = false;
     bool verifying = false;
+    bool armImports = false;
     std::unique_ptr<std::atomic<Block*>[]> chunks;
     mutable std::atomic<std::uint64_t> transitions{0};
     std::atomic<std::uint64_t> armed{0};
@@ -574,6 +612,8 @@ private:
     std::atomic<std::uint64_t> quiet{0};
     std::atomic<std::uint64_t> rests{0};
     std::atomic<std::uint64_t> divergences{0};
+    std::atomic<std::uint64_t> importArms{0};
+    std::atomic<std::uint64_t> gpuMarks{0};
     std::array<std::atomic<std::uint64_t>, 4> left{};
     std::atomic<std::uint32_t> period{1};
     std::unordered_map<std::uintptr_t, std::uint64_t> digests;

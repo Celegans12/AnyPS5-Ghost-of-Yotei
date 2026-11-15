@@ -31,7 +31,7 @@ struct MappingLockCounts {
     std::uint64_t forgets[MappingForgetOutcomes] = {};
 };
 
-enum class PageTrackReason : std::uint64_t { Armable = 0, Armed, Disabled, Edge, Held, Imported, Barred, Resting, Faulted, Busy };
+enum class PageTrackReason : std::uint64_t { Armable = 0, Armed, Disabled, Edge, Held, Imported, Barred, Resting, Faulted, Busy, GpuWritten };
 inline constexpr std::uint64_t PageTrackReasonMask = 0xffffffffu;
 inline constexpr unsigned PageTrackReasonFramesShift = 32;
 
