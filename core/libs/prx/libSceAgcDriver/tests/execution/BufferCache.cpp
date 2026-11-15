@@ -44,6 +44,8 @@ public:
     bool tracked = true;
     std::unordered_set<std::uint64_t> volatileBlocks;
     std::unordered_set<std::uint64_t> armedBlocks;
+    std::unordered_set<std::uint64_t> unarmableBlocks;
+    std::uint64_t arms = 0;
     std::unordered_map<std::uint64_t, std::uint16_t> pageMasks;
 
     void Note(std::uint64_t address, std::size_t bytes) {
@@ -81,6 +83,26 @@ public:
         return volatileBlocks.contains(address / Granule);
     }
 
+    bool Holds(std::uint64_t address, std::size_t, std::span<const std::uint64_t> tokens) override {
+        for (std::size_t block = 0; block < tokens.size(); ++block) {
+            const auto index = address / Granule + block;
+            if ((tokens[block] & BufferCache::ArmedToken) == 0 || !armedBlocks.contains(index) || changed(index, tokens[block])) return false;
+        }
+        return true;
+    }
+
+    void Arm(std::uint64_t address, std::size_t, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written) override {
+        for (std::size_t block = 0; block < tokens.size(); ++block) {
+            const auto index = address / Granule + block;
+            ++arms;
+            written[block] = BufferCache::EveryPage;
+            tokens[block] = 0;
+            if (unarmableBlocks.contains(index)) continue;
+            armedBlocks.insert(index);
+            tokens[block] = generation | BufferCache::ArmedToken;
+        }
+    }
+
 private:
     bool changed(std::uint64_t block, std::uint64_t token) const {
         const auto stamp = token & ~BufferCache::ArmedToken;
@@ -113,6 +135,10 @@ struct Harness {
 
     BufferCache::View Acquire(std::uint64_t address, std::size_t bytes, std::size_t from = 0) {
         return cache.Acquire(address, bytes, from, serial);
+    }
+
+    BufferCache::View Input(std::uint64_t address, std::size_t bytes, std::size_t from = 0, const BufferCache::Input& input = BufferCache::Input()) {
+        return cache.AcquireInput(address, bytes, from, serial, input);
     }
 
     void Finish() {
@@ -438,6 +464,185 @@ void TrackedWritesReachTheMirror(std::uint64_t base) {
     Require(remapped && Same(remapped, address, bytes) && BufferCache::Counted().pages > before.pages, "a range was served without an upload after the guest's mappings changed");
 }
 
+void SmallDirtyInputsAreCopiedToTheRing(std::uint64_t base) {
+    Harness harness;
+    const auto address = base + 3 * Page + 8;
+    const std::size_t bytes = 600;
+    Fill(address, bytes, 101);
+    auto before = BufferCache::Counted();
+    const auto first = harness.Input(address, bytes);
+    auto after = BufferCache::Counted();
+    Require(first && Same(first, address, bytes) && first.served == BufferCache::Served::Copied, "a small input of unarmed blocks was not copied");
+    Require(after.inputRing == before.inputRing + 1 && after.inputRingBytes == before.inputRingBytes + bytes && harness.cache.Mirrors() == 0, "a small input of unarmed blocks did not go to the ring");
+    Require(harness.writes.polls == 0 && harness.writes.arms == 0, "a small input asked for a collect or for an arming");
+    before = after;
+    const auto again = harness.Input(address, bytes);
+    after = BufferCache::Counted();
+    Require(again && again.served == BufferCache::Served::Repeated && again.handle == first.handle && again.offset == first.offset, "a second draw of the run was not served the first draw's copy");
+    Require(after.inputRepeats == before.inputRepeats + 1 && after.inputRingBytes == before.inputRingBytes, "a second draw of the run copied its input again");
+    Fill(address, bytes, 102);
+    const auto kept = harness.Input(address, bytes);
+    Require(kept && kept.served == BufferCache::Served::Repeated && !Same(kept, address, bytes), "a draw of the same run was not served the run's copy");
+    BufferCache::Input fresh;
+    fresh.fresh = true;
+    const auto forced = harness.Input(address, bytes, 0, fresh);
+    Require(forced && forced.served == BufferCache::Served::Copied && Same(forced, address, bytes), "an input behind a pending write was served the run's copy");
+    Fill(address, bytes, 103);
+    BufferCache::BreakDrawRun();
+    const auto next = harness.Input(address, bytes);
+    Require(next && next.served == BufferCache::Served::Copied && Same(next, address, bytes), "the first draw after an ordered item was served an earlier run's copy");
+    Require(std::memcmp(first.bytes, next.bytes, bytes) != 0, "a later copy overwrote the bytes an unfinished draw reads");
+    BufferCache::Input aligned;
+    aligned.alignment = 64;
+    const auto bound = harness.Input(address + 1024, bytes, 0, aligned);
+    Require(bound && bound.offset % 64 == 0 && Same(bound, address + 1024, bytes), "a ring copy was not bound at the alignment asked");
+    const std::size_t from = 1000;
+    const auto tail = harness.Input(address, 3000, from);
+    Require(tail && std::memcmp(tail.bytes + from, At(address + from), 3000 - from) == 0, "a ring copy read from an inner byte was not bound at the range's address");
+    Require(harness.writes.polls == 0 && harness.writes.arms == 0 && harness.cache.Mirrors() == 0, "ring copies reached the tracker or a mirror");
+}
+
+void RingChunkIsTakenAgainOnlyOnceItsDrawsRan(std::uint64_t base) {
+    Harness harness;
+    const auto address = base + 16 * Page;
+    const std::size_t bytes = 4 * Page;
+    Fill(address, bytes, 111);
+    BufferCache::Input fresh;
+    fresh.fresh = true;
+    const auto before = BufferCache::Counted();
+    const auto first = harness.Input(address, bytes, 0, fresh);
+    Require(first && BufferCache::Counted().ringChunks == before.ringChunks + 1, "the first ring copy did not make a chunk");
+    BufferCache::View last = first;
+    for (std::size_t copy = 0; copy < 600 && BufferCache::Counted().ringChunks < before.ringChunks + 2; ++copy) last = harness.Input(address, bytes, 0, fresh);
+    auto after = BufferCache::Counted();
+    Require(last && last.handle != first.handle && after.ringChunks == before.ringChunks + 2 && after.ringLaps == before.ringLaps, "a full chunk whose draws have not run was written again");
+    harness.Finish();
+    for (std::size_t copy = 0; copy < 600 && BufferCache::Counted().ringLaps == before.ringLaps; ++copy) last = harness.Input(address, bytes, 0, fresh);
+    after = BufferCache::Counted();
+    Require(last && last.handle == first.handle && after.ringLaps == before.ringLaps + 1 && after.ringChunks == before.ringChunks + 2, "a chunk whose draws ran was not taken again");
+}
+
+void LargeInputsAreProtectedThenUploaded(std::uint64_t base) {
+    Harness harness;
+    const auto address = base + 4 * Granule + 100;
+    const std::size_t bytes = 5 * Page;
+    Fill(address, bytes, 121);
+    auto before = BufferCache::Counted();
+    const auto first = harness.Input(address, bytes);
+    auto after = BufferCache::Counted();
+    Require(first && Same(first, address, bytes) && first.served == BufferCache::Served::Copied && first.offset == address - base, "a large input was not uploaded to the mirror of its zone");
+    Require(harness.writes.arms == 1 && harness.writes.polls == 0 && after.inputUploads == before.inputUploads + 1 && after.inputRing == before.inputRing, "a large input was not armed at its upload");
+    before = after;
+    const auto clean = harness.Input(address, bytes);
+    after = BufferCache::Counted();
+    Require(clean && clean.served == BufferCache::Served::Clean && after.inputClean == before.inputClean + 1 && after.pages == before.pages && harness.writes.arms == 1, "an armed and unwritten input was not answered by its tokens alone");
+    harness.Finish();
+    Fill(address + Page, 64, 122);
+    harness.writes.Note(address + Page, 64);
+    before = after;
+    const auto written = harness.Input(address, bytes);
+    after = BufferCache::Counted();
+    Require(written && Same(written, address, bytes) && written.served == BufferCache::Served::Copied && harness.writes.arms == 2 && after.inputUploads == before.inputUploads + 1, "a write that ended a token did not reach the next draw");
+    Require(harness.writes.polls == 0, "a large input asked for a collect");
+}
+
+void UnarmableBlocksAreUploadedOncePerRun(std::uint64_t base) {
+    Harness harness;
+    const auto address = base + 8 * Granule;
+    const std::size_t bytes = 6 * Page;
+    const auto block = address / Granule;
+    harness.writes.unarmableBlocks.insert(block);
+    Fill(address, bytes, 131);
+    auto before = BufferCache::Counted();
+    const auto first = harness.Input(address, bytes);
+    auto after = BufferCache::Counted();
+    Require(first && Same(first, address, bytes) && first.served == BufferCache::Served::Copied && after.pages == before.pages + 6 && harness.writes.arms == 1, "an input of a block that cannot be armed was not uploaded");
+    const std::vector<std::byte> recorded(first.bytes, first.bytes + bytes);
+    before = after;
+    const auto again = harness.Input(address, bytes);
+    after = BufferCache::Counted();
+    Require(again && again.served == BufferCache::Served::Kept && again.handle == first.handle && after.pages == before.pages && after.inputKept == before.inputKept + 1, "a block that cannot be armed was uploaded twice in one run of draws");
+    Require(harness.writes.arms == 1, "a block that refused its arming was asked again at the next draw");
+    Fill(address, bytes, 132);
+    BufferCache::BreakDrawRun();
+    before = after;
+    const auto apart = harness.Input(address, bytes);
+    after = BufferCache::Counted();
+    Require(apart && Same(apart, address, bytes) && apart.handle != first.handle && after.inputLoose == before.inputLoose + 1, "a rewritten input whose mirror pages an unfinished draw reads was not copied apart");
+    Require(std::memcmp(first.bytes, recorded.data(), bytes) == 0, "the bytes an unfinished draw reads changed in its mirror");
+    harness.Finish();
+    BufferCache::BreakDrawRun();
+    before = after;
+    const auto next = harness.Input(address, bytes);
+    after = BufferCache::Counted();
+    Require(next && Same(next, address, bytes) && next.handle == first.handle && after.inputUploads == before.inputUploads + 1 && harness.writes.arms == 1, "a block that cannot be armed was not uploaded again in the next run of draws");
+    harness.writes.unarmableBlocks.erase(block);
+    harness.serial += BufferCache::ArmRest;
+    harness.executed = harness.serial - 1;
+    BufferCache::BreakDrawRun();
+    const auto armed = harness.Input(address, bytes);
+    Require(armed && Same(armed, address, bytes) && harness.writes.arms == 2, "a block that became armable was not armed on request");
+    before = BufferCache::Counted();
+    BufferCache::BreakDrawRun();
+    const auto clean = harness.Input(address, bytes);
+    after = BufferCache::Counted();
+    Require(clean && clean.served == BufferCache::Served::Clean && after.pages == before.pages, "a block armed on request was uploaded again");
+    Require(harness.writes.polls == 0, "an input of a block that cannot be armed asked for a collect");
+}
+
+void InputsKeptApartNeverReachAMirror(std::uint64_t base) {
+    Harness harness;
+    const auto address = base + 12 * Granule + 4;
+    const std::size_t bytes = 5 * Page;
+    Fill(address, bytes, 141);
+    BufferCache::Input apart;
+    apart.apart = true;
+    auto before = BufferCache::Counted();
+    const auto first = harness.Input(address, bytes, 0, apart);
+    auto after = BufferCache::Counted();
+    Require(first && Same(first, address, bytes) && first.offset == 0 && after.inputLoose == before.inputLoose + 1 && harness.cache.Mirrors() == 0, "an input kept apart was not copied to a buffer of its own");
+    const auto again = harness.Input(address, bytes, 0, apart);
+    Require(again && again.served == BufferCache::Served::Repeated && again.handle == first.handle, "an input kept apart was copied twice in one run of draws");
+    BufferCache::BreakDrawRun();
+    const auto next = harness.Input(address, bytes, 0, apart);
+    Require(next && next.served == BufferCache::Served::Copied && next.handle != first.handle, "an input kept apart was served an earlier run's copy");
+    before = BufferCache::Counted();
+    const auto refused = harness.Input(address, 0);
+    after = BufferCache::Counted();
+    Require(!refused && after.inputRefused == before.inputRefused + 1, "an empty input was served");
+}
+
+void DirtyFirstVerificationTellsAStaleViewFromALaterWrite(std::uint64_t base) {
+    Harness harness;
+    const auto address = base + 14 * Granule;
+    const std::size_t bytes = 5 * Page;
+    Fill(address, bytes, 151);
+    Require(static_cast<bool>(harness.Input(address, bytes)), "a large input was not served for its verification");
+    const auto clean = harness.Input(address, bytes);
+    Require(clean && clean.served == BufferCache::Served::Clean, "an armed input was not served clean for its verification");
+    harness.cache.VerifyInput(clean, address, bytes, 0);
+    Fill(address, bytes, 152);
+    bool thrown = false;
+    try {
+        harness.cache.VerifyInput(clean, address, bytes, 0);
+    } catch (const std::runtime_error&) {
+        thrown = true;
+    }
+    Require(thrown, "an armed view differing from guest memory with its tokens held passed its verification");
+    harness.writes.Note(address, bytes);
+    auto before = BufferCache::Counted();
+    harness.cache.VerifyInput(clean, address, bytes, 0);
+    Require(BufferCache::Counted().inputRaces == before.inputRaces + 1, "an armed view behind a write that ended its tokens failed its verification");
+    const auto small = address + 8 * Page;
+    Fill(small, 256, 153);
+    Require(static_cast<bool>(harness.Input(small, 256)), "a small input was not served for its verification");
+    const auto repeated = harness.Input(small, 256);
+    Fill(small, 256, 154);
+    before = BufferCache::Counted();
+    harness.cache.VerifyInput(repeated, small, 256, 0);
+    Require(BufferCache::Counted().inputRunDiffers == before.inputRunDiffers + 1, "a repeated copy differing from guest memory was not counted");
+}
+
 std::unordered_map<std::uint64_t, std::uint64_t>& ArmedWords() {
     static std::unordered_map<std::uint64_t, std::uint64_t> words;
     return words;
@@ -618,6 +823,14 @@ int main() {
         PageSharedWithAPendingWriteIsComparedInPart(harness, base);
         VolatileBlocksAreLeftToTheStream(harness, base);
         OnlyTheRewrittenPagesOfARestingBlockAreStreamed(harness, base);
+        const auto inputs = AllocateGuest(static_cast<std::size_t>(Zone));
+        Require(inputs % Zone == 0, "the guest block of the dirty-first scenarios does not start a zone");
+        SmallDirtyInputsAreCopiedToTheRing(inputs);
+        RingChunkIsTakenAgainOnlyOnceItsDrawsRan(inputs);
+        LargeInputsAreProtectedThenUploaded(inputs);
+        UnarmableBlocksAreUploadedOncePerRun(inputs);
+        InputsKeptApartNeverReachAMirror(inputs);
+        DirtyFirstVerificationTellsAStaleViewFromALaterWrite(inputs);
         if (GuestMemory::Watched(base, bytes)) {
             TrackedWritesReachTheMirror(base);
             ArmedBlocksAnswerWithoutTheTracker(base);
