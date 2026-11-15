@@ -254,7 +254,77 @@ void testWriteOnly() {
     Expect(hazards.Empty(), "cleared write-only stores");
 }
 
+void testAcceptedSummaries() {
+    PassHazards hazards;
+    hazards.BeginPass();
+    Use first;
+    first.reads = {{0x1000, 0x2000}};
+    first.images = {{image(40), false}};
+    first.attachments = {{image(50), true}};
+    hazards.Add(first.View());
+    hazards.Accept(7);
+    hazards.Accept(0);
+    Expect(hazards.Accepted(7) && !hazards.Accepted(8) && !hazards.Accepted(0) && hazards.AcceptedCount() == 1, "a pass remembers the summary it accepted and never the null one");
+    Use inputs;
+    inputs.reads = {{0x5000, 0x5100}};
+    Expect(hazards.Check(inputs.View(), true) == PassHazard::None, "the reads of a draw's own inputs continue the pass");
+    hazards.Add(inputs.View());
+    Use second;
+    second.reads = {{0x3000, 0x4000}};
+    second.images = {{image(41), false}};
+    second.attachments = {{image(50), true}};
+    hazards.Add(second.View());
+    hazards.Accept(8);
+    Expect(hazards.Accepted(7) && hazards.Accepted(8), "draws that only read keep the accepted summaries");
+    Expect(hazards.Check(first.View(), true) == PassHazard::None, "the whole access of an accepted summary still continues the pass");
+    Use writer;
+    writer.writes = {{0x9000, 0x9100}};
+    hazards.Add(writer.View());
+    Expect(!hazards.Accepted(7) && !hazards.Accepted(8), "a GPU write forgets the accepted summaries");
+    Use overWritten;
+    overWritten.reads = {{0x9000, 0x9010}};
+    Expect(hazards.Check(overWritten.View(), true) == PassHazard::ReadAfterWrite, "a moved buffer read in place over a write of the pass");
+    hazards.Accept(7);
+    Use storesOnly;
+    storesOnly.writeOnly = {{0xa000, 0xa100}};
+    hazards.Add(storesOnly.View());
+    Expect(!hazards.Accepted(7), "write-only stores forget the accepted summaries");
+    hazards.Accept(7);
+    Use unknown;
+    unknown.anyReads = true;
+    hazards.Add(unknown.View());
+    Expect(!hazards.Accepted(7), "unknown memory forgets the accepted summaries");
+    hazards.Accept(7);
+    Use stored;
+    stored.images = {{image(42), true}};
+    hazards.Add(stored.View());
+    Expect(!hazards.Accepted(7), "a stored image forgets the accepted summaries");
+    hazards.Accept(7);
+    Use readsAttachment;
+    readsAttachment.images = {{image(50), false}};
+    Expect(hazards.Check(readsAttachment.View(), true) == PassHazard::Image, "an image read that is an attachment of the pass");
+    hazards.Add(readsAttachment.View());
+    Expect(!hazards.Accepted(7), "an image read that is an attachment forgets the accepted summaries");
+    hazards.Accept(7);
+    Use otherTarget;
+    otherTarget.attachments = {{image(51), true}};
+    hazards.Add(otherTarget.View());
+    Expect(!hazards.Accepted(7), "an attachment new to the pass forgets the accepted summaries");
+    hazards.Accept(7);
+    hazards.SealWriteOnly();
+    Expect(!hazards.Accepted(7), "a seal forgets the accepted summaries");
+    hazards.Accept(7);
+    hazards.BeginPass();
+    Expect(!hazards.Accepted(7), "a new pass forgets the accepted summaries");
+    hazards.Accept(7);
+    hazards.Clear();
+    Expect(!hazards.Accepted(7) && hazards.AcceptedCount() == 0, "a cleared pass forgets the accepted summaries");
+    for (std::uint64_t summary = 1; summary <= PassHazards::AcceptedLimit + 1; ++summary) hazards.Accept(summary);
+    Expect(hazards.AcceptedCount() == 1 && hazards.Accepted(PassHazards::AcceptedLimit + 1) && !hazards.Accepted(1), "the accepted summaries are bounded");
+}
+
 int main() {
+    testAcceptedSummaries();
     testRangeSet();
     testRanges();
     testUnknown();
