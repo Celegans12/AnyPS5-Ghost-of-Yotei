@@ -662,6 +662,37 @@ std::pair<std::uint64_t, std::uint64_t> staleStencilRange(const DepthSurface& su
 void noteStalePlane(std::uint64_t begin, std::uint64_t end);
 std::uint64_t nextPlaneSerial();
 
+bool depthViewProofs() {
+    static const bool enabled = std::getenv("APS5_NO_DEPTH_VIEW_PROOFS") == nullptr;
+    return enabled && DrawProofsEnabled() && GuestMemory::ResourceVersions();
+}
+
+bool depthProofVerifyEvery() {
+    static const bool every = std::getenv("APS5_VERIFY_DRAW_PROOFS") != nullptr;
+    return every;
+}
+
+struct DepthProofCall {
+    bool eligible = false;
+    bool verify = false;
+    bool ran = false;
+    bool skipped = false;
+    bool recorded = false;
+    bool differing = false;
+    const char* what = "none";
+    DrawProofMiss miss = DrawProofMiss::None;
+
+    void Ran(DrawProofMiss reason) {
+        if (!ran) miss = reason;
+        ran = true;
+    }
+
+    void Differ(const char* reason) {
+        if (!differing) what = reason;
+        differing = true;
+    }
+};
+
 class DepthSurface {
 public:
     DepthSurface(const Context& context, const DepthTarget& target, DepthSamplingState sampling = {}) : context(context), target(target), hostFormat(HostDepthFormat(context, target.format)), sampling(std::move(sampling)) {
@@ -1007,10 +1038,25 @@ public:
         if ((aspects & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) stencilFill.reset();
     }
 
+    bool StencilWatched(std::uint64_t begin, std::size_t bytes) {
+        const auto serial = GuestMemory::UnwatchSerial() + 1u;
+        const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        if (depthViewProofs() && !target.stencilPartiallyResident && stencilWatchedSerial == serial && stencilWatchedMapping == mapping) {
+            if (!depthProofVerifyEvery()) return true;
+            const bool watched = GuestMemory::Watched(begin, bytes);
+            if (!watched) NoteDrawProofVerified(DrawProofKind::Depth, true, false, "the stencil plane left the write watch");
+            return watched;
+        }
+        const bool watched = GuestMemory::Watched(begin, bytes);
+        stencilWatchedSerial = watched ? serial : 0u;
+        stencilWatchedMapping = mapping;
+        return watched;
+    }
+
     void TakeStencilBaseline() {
         const auto [begin, end] = staleStencilRange(*this);
         const auto bytes = static_cast<std::size_t>(end - begin);
-        if (GuestMemory::Watched(begin, bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) {
+        if (StencilWatched(begin, bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) {
             stencilBaseline.clear();
             return;
         }
@@ -1687,6 +1733,22 @@ public:
     std::uint64_t unitBytes = 0;
     bool syncing = false;
     std::uint64_t scannedEpoch = 0;
+    GuestMemory::ResourceVersion depthVersion;
+    GuestMemory::ResourceVersion stencilVersion;
+    std::uint64_t depthSynced = 0;
+    std::uint64_t stencilSynced = 0;
+    std::uint64_t depthNoted = 0;
+    std::uint64_t stencilNoted = 0;
+    std::uint64_t stencilWatchedSerial = 0;
+    std::uint64_t stencilWatchedMapping = 0;
+
+    bool SyncQuietHolds() const {
+        return (pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) == 0 && backingGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix() && !unitGeneration.empty() && std::ranges::none_of(unitGeneration, [](std::uint64_t generation) { return generation == 0u; });
+    }
+
+    bool NotedHolds() const {
+        return depthMemory != 0u && (target.stencilAddress == 0u || stencilMemory != 0u);
+    }
     mutable std::uint64_t mirrorBytes = 0;
     mutable std::uint64_t stencilMirrorBytes = 0;
 
@@ -2984,7 +3046,7 @@ void forgetCopiesInside(std::uint64_t address, std::size_t bytes) {
     std::erase_if(copyDestinations(), [&](const auto& range) { return address <= range.first && range.second <= address + bytes; });
 }
 
-VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target) {
+VkImageAspectFlags storeBackClearedHtileFull(const Context& context, const DepthTarget& target) {
     if (target.htileAddress == 0) return 0;
     const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true)) return 0;
@@ -3039,6 +3101,72 @@ VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarg
     htileReads()[target.htileAddress] = generation;
     if (cleared == 0 && untracked) untrackedHtileScans()[target.htileAddress] = {bytes, target.htileStencil, *untracked};
     else untrackedHtileScans().erase(target.htileAddress);
+    return cleared;
+}
+
+struct HtileProof {
+    GuestMemory::ResourceVersion version;
+    std::size_t bytes = 0;
+    bool stencil = false;
+    std::uint64_t generation = 0;
+    std::uint64_t reads = 0;
+};
+
+std::mutex& htileProofsMutex() {
+    static std::mutex mutex;
+    return mutex;
+}
+
+std::map<std::uint64_t, HtileProof>& htileProofs() {
+    static auto* proofs = new std::map<std::uint64_t, HtileProof>();
+    return *proofs;
+}
+
+std::uint64_t htileReadOf(std::uint64_t address) {
+    std::lock_guard lock(htileReadsMutex());
+    const auto found = htileReads().find(address);
+    return found == htileReads().end() ? 0u : found->second;
+}
+
+VkImageAspectFlags storeBackClearedHtile(const Context& context, const DepthTarget& target, DepthProofCall& call, std::atomic<std::uint64_t>& skips) {
+    if (target.htileAddress == 0 || !call.eligible) return storeBackClearedHtileFull(context, target);
+    const auto bytes = static_cast<std::size_t>(HtileMetadataBytes(target.extent));
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(target.htileAddress), bytes, true) || copiedOver(target.htileAddress, bytes)) return 0;
+    auto* recorder = RecorderFor(context);
+    if (recorder != nullptr && recorder->PendingWriteOverlaps(target.htileAddress, bytes)) {
+        call.Ran(DrawProofMiss::PendingWrite);
+        return storeBackClearedHtileFull(context, target);
+    }
+    std::unique_lock proofLock(htileProofsMutex());
+    auto& proof = htileProofs()[target.htileAddress];
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> swept{{target.htileAddress, target.htileAddress + bytes}};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> noted;
+    std::uint64_t generation = 0;
+    if (GuestMemory::HoldVersion(proof.version, swept, noted)) generation = GuestMemory::CurrentVersion(proof.version, GuestMemory::CollectEpoch());
+    const bool held = generation != 0 && proof.generation == generation && proof.bytes == bytes && proof.stencil == target.htileStencil && proof.reads != 0 && proof.reads == htileReadOf(target.htileAddress);
+    if (held) {
+        call.skipped = true;
+        if (!call.verify) {
+            skips.fetch_add(1, std::memory_order_relaxed);
+            return 0;
+        }
+    } else {
+        call.Ran(generation == 0 ? DrawProofMiss::Sweep : proof.generation == 0 ? DrawProofMiss::None : DrawProofMiss::Versions);
+    }
+    proofLock.unlock();
+    const auto cleared = storeBackClearedHtileFull(context, target);
+    if (held && cleared != 0) call.Differ("the HTILE store-back found a fast clear");
+    proofLock.lock();
+    const auto reads = htileReadOf(target.htileAddress);
+    if (cleared == 0 && generation != 0 && reads != 0) {
+        proof.generation = generation;
+        proof.bytes = bytes;
+        proof.stencil = target.htileStencil;
+        proof.reads = reads;
+        call.recorded = true;
+    } else {
+        proof.generation = 0;
+    }
     return cleared;
 }
 
@@ -3459,6 +3587,10 @@ bool resident(std::uint64_t address, std::uint64_t bytes) {
 }
 
 struct DepthViewCounters {
+    std::atomic<std::uint64_t> depthSkips{0};
+    std::atomic<std::uint64_t> stencilSkips{0};
+    std::atomic<std::uint64_t> htileSkips{0};
+    std::atomic<std::uint64_t> noteSkips{0};
     std::atomic<std::uint64_t> calls{0};
     std::atomic<std::uint64_t> depthSyncs{0};
     std::atomic<std::uint64_t> quietDepthSyncs{0};
@@ -3490,6 +3622,10 @@ DepthViewCounts TakeDepthViewCounts() {
     counts.quietStencilSyncs = counters.quietStencilSyncs.exchange(0, std::memory_order_relaxed);
     counts.htileChecks = counters.htileChecks.exchange(0, std::memory_order_relaxed);
     counts.quietHtileChecks = counters.quietHtileChecks.exchange(0, std::memory_order_relaxed);
+    counts.depthSkips = counters.depthSkips.exchange(0, std::memory_order_relaxed);
+    counts.stencilSkips = counters.stencilSkips.exchange(0, std::memory_order_relaxed);
+    counts.htileSkips = counters.htileSkips.exchange(0, std::memory_order_relaxed);
+    counts.noteSkips = counters.noteSkips.exchange(0, std::memory_order_relaxed);
     return counts;
 }
 
@@ -3506,9 +3642,11 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     if (target.htileAddress != 0u) ClaimMultisampleTargetMemory(target.htileAddress, HtileMetadataBytes(target.extent));
     auto& counters = depthViewCounters();
     counters.calls.fetch_add(1, std::memory_order_relaxed);
-    NoteDrawProofMissed(DrawProofKind::Depth, DrawProofMiss::None);
+    DepthProofCall call;
+    call.eligible = depthViewProofs() && target.samples == 1u && !target.depthPartiallyResident && !target.stencilPartiallyResident;
+    call.verify = call.eligible && DrawProofVerifyDue();
     const bool routed = RoutesToNativeDepthOwner(target);
-    const auto htileCleared = routed ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
+    const auto htileCleared = routed ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target, call, counters.htileSkips);
     if (!routed && target.htileAddress != 0u) countSync(counters.htileChecks, counters.quietHtileChecks, htileCleared == 0u);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, target.address);
@@ -3587,14 +3725,76 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
-    if (mirrorable(target)) countSync(counters.depthSyncs, counters.quietDepthSyncs, surface->SyncFromMemory(mirrorResource(target)));
-    if (surface->StencilMirrorable()) countSync(counters.stencilSyncs, counters.quietStencilSyncs, surface->SyncStencilFromMemory(stencilResource(target)));
+    std::uint64_t depthNow = 0;
+    std::uint64_t stencilNow = 0;
+    const bool versioned = call.eligible && !created;
+    if (versioned) {
+        const auto epoch = GuestMemory::CollectEpoch();
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> swept{{target.address, target.address + std::max(surface->MirrorBytes(), DepthSliceBytes(target.extent, target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u))}};
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> noted;
+        if (GuestMemory::HoldVersion(surface->depthVersion, swept, noted)) depthNow = GuestMemory::CurrentVersion(surface->depthVersion, epoch);
+        if (target.stencilAddress != 0u) {
+            swept = {{target.stencilAddress, target.stencilAddress + std::max(surface->StencilMirrorBytes(), DepthSliceBytes(target.extent, 1u))}};
+            if (GuestMemory::HoldVersion(surface->stencilVersion, swept, noted)) stencilNow = GuestMemory::CurrentVersion(surface->stencilVersion, epoch);
+        }
+    } else {
+        call.Ran(DrawProofMiss::None);
+    }
+    const auto refusal = [&](std::uint64_t version, std::uint64_t proved, bool holds) {
+        if (version == 0u) return DrawProofMiss::Sweep;
+        if (!holds) return DrawProofMiss::Clear;
+        return proved == 0u ? DrawProofMiss::None : DrawProofMiss::Versions;
+    };
+    if (mirrorable(target)) {
+        const bool holds = surface->SyncQuietHolds();
+        const bool held = versioned && depthNow != 0u && surface->depthSynced == depthNow && holds;
+        if (held) call.skipped = true;
+        if (held && !call.verify) {
+            counters.depthSkips.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (!held && versioned) call.Ran(refusal(depthNow, surface->depthSynced, holds));
+            const bool quiet = surface->SyncFromMemory(mirrorResource(target));
+            countSync(counters.depthSyncs, counters.quietDepthSyncs, quiet);
+            if (held && !quiet) call.Differ("the depth plane sync found a write");
+            surface->depthSynced = quiet && depthNow != 0u ? depthNow : 0u;
+            if (surface->depthSynced != 0u) call.recorded = true;
+        }
+    }
+    if (surface->StencilMirrorable()) {
+        const bool holds = surface->stencilGeneration != 0u;
+        const bool held = versioned && stencilNow != 0u && surface->stencilSynced == stencilNow && holds;
+        if (held) call.skipped = true;
+        if (held && !call.verify) {
+            counters.stencilSkips.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (!held && versioned) call.Ran(refusal(stencilNow, surface->stencilSynced, holds));
+            const bool quiet = surface->SyncStencilFromMemory(stencilResource(target));
+            countSync(counters.stencilSyncs, counters.quietStencilSyncs, quiet);
+            if (held && !quiet) call.Differ("the stencil plane sync found a write");
+            surface->stencilSynced = quiet && stencilNow != 0u ? stencilNow : 0u;
+            if (surface->stencilSynced != 0u) call.recorded = true;
+        }
+    }
     surface->TakeStencilStorage();
     surface->ApplyFastClear();
     if (stencilTested && surface->samplingActive) surface->RequireStencilProven();
     if (drawnDepth != nullptr && drawnDepth != surface) drawnDepth->written = ++depthWrites;
     surface->written = ++depthWrites;
-    surface->NoteMemory();
+    {
+        const bool stencilHeld = target.stencilAddress == 0u || (stencilNow != 0u && surface->stencilNoted == stencilNow);
+        const bool held = versioned && depthNow != 0u && surface->depthNoted == depthNow && stencilHeld && surface->NotedHolds();
+        if (held) call.skipped = true;
+        if (held && !call.verify) {
+            counters.noteSkips.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            if (!held && versioned) call.Ran(refusal(depthNow != 0u && (target.stencilAddress == 0u || stencilNow != 0u) ? depthNow : 0u, surface->depthNoted, surface->NotedHolds()));
+            if (held && surface->OverwrittenInMemory()) call.Differ("the depth or stencil plane was written since its memory was noted");
+            surface->NoteMemory();
+            surface->depthNoted = depthNow;
+            surface->stencilNoted = stencilNow;
+            if (depthNow != 0u) call.recorded = true;
+        }
+    }
     if (mirrorable(target) && surface->scannedEpoch != mirrorEpoch) {
         surface->scannedEpoch = mirrorEpoch;
         const auto plane = stalePlaneRange(*surface);
@@ -3615,6 +3815,16 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     }
     if (stencilWritten || created || stencilRebound) surface->MarkStencilStale(stencilWritten);
     drawnDepth = surface;
+    if (!call.eligible) {
+        NoteDrawProofMissed(DrawProofKind::Depth, DrawProofMiss::None);
+    } else if (call.verify && call.skipped && !call.ran) {
+        NoteDrawProofVerified(DrawProofKind::Depth, call.differing, false, call.what);
+    } else if (!call.ran) {
+        NoteDrawProofReused(DrawProofKind::Depth);
+    } else {
+        NoteDrawProofMissed(DrawProofKind::Depth, call.miss);
+        if (call.recorded) NoteDrawProofProved(DrawProofKind::Depth);
+    }
     return surface->view;
 }
 

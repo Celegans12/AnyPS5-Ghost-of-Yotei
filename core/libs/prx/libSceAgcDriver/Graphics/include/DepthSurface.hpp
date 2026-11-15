@@ -42,6 +42,10 @@ struct DepthViewCounts {
     std::uint64_t quietStencilSyncs = 0;
     std::uint64_t htileChecks = 0;
     std::uint64_t quietHtileChecks = 0;
+    std::uint64_t depthSkips = 0;
+    std::uint64_t stencilSkips = 0;
+    std::uint64_t htileSkips = 0;
+    std::uint64_t noteSkips = 0;
 };
 DepthViewCounts TakeDepthViewCounts();
 std::uint64_t DepthSurfacesReleased();

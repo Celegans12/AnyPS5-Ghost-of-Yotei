@@ -4155,7 +4155,7 @@ DrawProofCounters& drawProofCounters(DrawProofKind kind) {
     return counters[static_cast<std::size_t>(kind)];
 }
 
-constexpr std::array<const char*, static_cast<std::size_t>(DrawProofMiss::Count)> DrawProofMissNames{"unproved", "epoch", "serial", "registry", "depth surfaces", "unwatch", "images", "depth planes", "imports", "staging", "target", "evicted", "input twins", "structure", "versions", "sweep", "audit"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawProofMiss::Count)> DrawProofMissNames{"unproved", "epoch", "serial", "registry", "depth surfaces", "unwatch", "images", "depth planes", "imports", "staging", "target", "evicted", "input twins", "structure", "versions", "sweep", "audit", "clear", "pending write"};
 constexpr std::array<const char*, static_cast<std::size_t>(DrawProofKind::Count)> DrawProofKindNames{"resource", "target", "depth"};
 
 void reportEpochProofs() {
