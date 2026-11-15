@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Sampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Recompiler.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Shaders.hpp"
@@ -26,7 +27,6 @@
 #include <vector>
 
 namespace AgcDriver { class VulkanDevice; }
-namespace AgcDriver::GuestMemory { struct WriteSubscription; }
 
 namespace AgcDriver::Graphics {
 
@@ -104,14 +104,20 @@ struct DrawProofStamp {
     std::uint64_t pending = 0;
     std::uint64_t depthSurfaces = 0;
     std::uint64_t unwatch = 0;
+    std::uint64_t wide = 0;
+    std::uint64_t forget = 0;
+    std::uint64_t imports = 0;
+    bool versioned = false;
     static DrawProofStamp Now();
+    DrawProofStamp Legacy() const;
     bool operator==(const DrawProofStamp&) const = default;
 };
 enum class DrawProofKind : std::size_t { Resources, Targets, Count };
-enum class DrawProofMiss : std::size_t { None, Epoch, Serial, Registry, DepthSurfaces, Unwatch, Images, DepthPlanes, Imports, Staging, Target, Evicted, InputTwins, Count };
+enum class DrawProofMiss : std::size_t { None, Epoch, Serial, Registry, DepthSurfaces, Unwatch, Images, DepthPlanes, Imports, Staging, Target, Evicted, InputTwins, Structure, Versions, Sweep, Audit, Count };
 struct DrawProofKindCounts {
     std::uint64_t reused = 0;
     std::uint64_t proved = 0;
+    std::uint64_t legacy = 0;
     std::uint64_t verified = 0;
     std::uint64_t differing = 0;
     std::uint64_t stored = 0;
@@ -124,6 +130,7 @@ DrawProofMiss DrawProofStampMiss(const DrawProofStamp& proved, const DrawProofSt
 const char* DrawProofMissName(DrawProofMiss miss);
 void NoteDrawProofReused(DrawProofKind kind);
 void NoteDrawProofProved(DrawProofKind kind);
+void NoteDrawProofLegacy(DrawProofKind kind);
 void NoteDrawProofMissed(DrawProofKind kind, DrawProofMiss miss);
 void NoteDrawProofVerified(DrawProofKind kind, bool differing, bool stored, const char* what);
 DrawProofCounts DrawProofCounted();
@@ -837,6 +844,11 @@ private:
     std::uint64_t pendingSerialSeen = 0;
     DrawProofStamp provedStamp;
     bool proofHeld = false;
+    GuestMemory::ResourceVersion versions;
+    std::uint64_t provedGeneration = 0;
+    std::uint64_t touchedEpoch = 0;
+    bool touchProvedImages() const;
+    void versionRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& swept, std::vector<std::pair<std::uint64_t, std::uint64_t>>& noted) const;
     std::vector<std::pair<const StorageTexture*, std::uint64_t>> provedImages;
     std::vector<std::uint64_t> provedTwins;
     bool proofEligible() const;

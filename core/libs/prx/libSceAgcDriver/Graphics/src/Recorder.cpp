@@ -4888,7 +4888,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         completionLabels.fetch_add(1, std::memory_order_acq_rel);
         ++batch.completionStoreCount;
         completionStores.fetch_add(1, std::memory_order_acq_rel);
-        GuestMemory::BreakProofs(GuestMemory::ProofBreak::Label);
+        GuestMemory::BreakProofs(GuestMemory::ProofBreak::Label, address, bytes.size());
     }
     // The table entry before the write note: the note bumps the generation a poller watches, and a
     // poller that sees the bump then finds the label without the GPU mutex.
@@ -4933,7 +4933,7 @@ void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
             label.counted = true;
             ++batch.completionLabelCount;
             completionLabels.fetch_add(1, std::memory_order_acq_rel);
-            GuestMemory::BreakProofs(GuestMemory::ProofBreak::Label);
+            GuestMemory::BreakProofs(GuestMemory::ProofBreak::Label, label.begin, static_cast<std::size_t>(label.end - label.begin));
             completionLabelsCountedLate.fetch_add(1, std::memory_order_relaxed);
             ++batch.completionStoreCount;
             completionStores.fetch_add(1, std::memory_order_acq_rel);

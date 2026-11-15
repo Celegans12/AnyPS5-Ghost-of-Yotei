@@ -6160,7 +6160,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         // Listed after the registration: a throw there leaves nothing that would pin the CPU path forever.
         if (resources.HasCopiedWrites()) {
             writers->push_back(kept);
-            GuestMemory::BreakProofs(GuestMemory::ProofBreak::CopiedWriters);
+            for (const auto& [begin, end] : resources.GpuWrites()) GuestMemory::BreakProofs(GuestMemory::ProofBreak::CopiedWriters, begin, static_cast<std::size_t>(end - begin));
         }
     }
     recordStep(PhaseRecordCompletion);

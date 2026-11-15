@@ -482,6 +482,9 @@ public:
         for (const auto& region : regions) if (region.gpuCopy && region.deviceLocal && region.twin == nullptr) return true;
         return false;
     }
+    void AppendTwinRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
+        for (const auto& region : regions) if (region.twin != nullptr && region.end > region.begin) ranges.emplace_back(region.begin, region.end);
+    }
     void MarkStagedWrites() const;
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.

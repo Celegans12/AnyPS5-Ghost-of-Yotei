@@ -456,13 +456,26 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     std::string breakText;
     for (std::size_t i = 0; i < breaks.breaks.size(); ++i) {
         const auto count = breaks.breaks[i] - reportedBreaks.breaks[i];
+        const auto wide = breaks.wide[i] - reportedBreaks.wide[i];
         const auto missed = breaks.serialMisses[i] - reportedBreaks.serialMisses[i];
         if (count == 0 && missed == 0) continue;
-        char item[96];
-        std::snprintf(item, sizeof(item), " %s %llu (%llu serial misses after it)", GuestMemory::ProofBreakName(static_cast<GuestMemory::ProofBreak>(i)), static_cast<unsigned long long>(count), static_cast<unsigned long long>(missed));
+        char item[128];
+        std::snprintf(item, sizeof(item), " %s %llu (%llu of them wide, %llu serial misses after it)", GuestMemory::ProofBreakName(static_cast<GuestMemory::ProofBreak>(i)), static_cast<unsigned long long>(count), static_cast<unsigned long long>(wide), static_cast<unsigned long long>(missed));
         breakText += item;
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[proofs] (10 s): %s; breaks:%s\n", Graphics::DrawProofText(proofs, reportedProofs).c_str(), breakText.c_str());
+    static GuestMemory::WriteIndexStats reportedIndex{};
+    const auto index = GuestMemory::WriteIndexCounted();
+    constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::WriteBumpSource::Count)> bumpNames{"cpu", "driver", "pending", "unwatch", "forget", "release", "import", "break", "registry"};
+    std::string bumpText;
+    for (std::size_t i = 0; i < bumpNames.size(); ++i) {
+        const auto count = index.bySource[i] - reportedIndex.bySource[i];
+        if (count == 0) continue;
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %llu", bumpNames[i], static_cast<unsigned long long>(count));
+        bumpText += item;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[proofs] (10 s): %s; breaks:%s; subscriptions %llu over %llu blocks, %llu bumps (%s ) in %llu lookups (%.1f ms), %llu sweeps, %llu refused\n", Graphics::DrawProofText(proofs, reportedProofs).c_str(), breakText.c_str(), static_cast<unsigned long long>(index.subscriptions - reportedIndex.subscriptions), static_cast<unsigned long long>(index.blocks - reportedIndex.blocks), static_cast<unsigned long long>(index.bumps - reportedIndex.bumps), bumpText.c_str(), static_cast<unsigned long long>(index.lookups - reportedIndex.lookups), static_cast<double>(index.lookupNanoseconds - reportedIndex.lookupNanoseconds) / 1e6, static_cast<unsigned long long>(index.sweeps - reportedIndex.sweeps), static_cast<unsigned long long>(index.sweepFailures - reportedIndex.sweepFailures));
+    reportedIndex = index;
     reportedProofs = proofs;
     reportedBreaks = breaks;
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
@@ -470,6 +483,14 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     drainWaitNs = {};
 }
 
+
+void DrawPipeline::breakProofsAfter(CommitKind kind, const std::vector<Range>& writes) {
+    for (const auto& [begin, end] : writes) {
+        if (end > begin) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Commit, begin, static_cast<std::size_t>(end - begin));
+    }
+    const bool storesThroughDriver = kind == CommitKind::Seal || kind == CommitKind::SubmitEnd || kind == CommitKind::Completion || kind == CommitKind::EndOfPipe;
+    if (writes.empty() && !storesThroughDriver) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Commit);
+}
 
 void DrawPipeline::run() {
     NameDriverThread("draw-commit");
@@ -481,6 +502,8 @@ void DrawPipeline::run() {
         Commit* commit = nullptr;
         bool isDraw = false;
         std::uint64_t epoch = 0;
+        const std::vector<Range>* writes = nullptr;
+        auto kind = CommitKind::Other;
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -491,6 +514,8 @@ void DrawPipeline::run() {
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
             epoch = items.front().collectEpoch;
+            writes = &items.front().writes;
+            kind = items.front().kind;
         }
         if (SharedCollectEpoch()) GuestMemory::AdoptCollectEpoch(epoch);
         const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -499,7 +524,7 @@ void DrawPipeline::run() {
         bool shutdown = false;
         try {
             if (commit != nullptr) (*commit)();
-            if (!isDraw) GuestMemory::BreakProofs(GuestMemory::ProofBreak::Commit);
+            if (!isDraw) breakProofsAfter(kind, *writes);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();

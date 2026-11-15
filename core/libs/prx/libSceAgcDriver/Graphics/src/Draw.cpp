@@ -2198,7 +2198,58 @@ struct TargetProof {
     std::weak_ptr<StorageTexture> resident;
     DrawProofStamp stamp{};
     bool held = false;
+    std::uint64_t generation = 0;
+    std::uint64_t touchedEpoch = 0;
 };
+
+struct TargetVersion {
+    GuestMemory::ResourceVersion version;
+    TargetProof proof;
+    std::uint64_t used = 0;
+};
+
+constexpr std::size_t TargetVersionLimit = 64;
+struct TargetVersionsTag {};
+
+std::unordered_map<std::uint64_t, TargetVersion>& targetVersions() {
+    return ThreadScratch<std::unordered_map<std::uint64_t, TargetVersion>, TargetVersionsTag>();
+}
+
+std::uint64_t targetVersionKey(VkDevice device, const ColorTarget& color) {
+    std::uint64_t key = 0x9E3779B97F4A7C15ull;
+    for (const auto part : {static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(device)), color.address, static_cast<std::uint64_t>(color.bytes), color.dccAddress, color.cmaskAddress, static_cast<std::uint64_t>(color.cmaskBytes)}) {
+        key ^= part + 0x9E3779B97F4A7C15ull + (key << 6) + (key >> 2);
+    }
+    return key;
+}
+
+TargetVersion& targetEntry(std::uint64_t key) {
+    static thread_local std::uint64_t uses = 0;
+    auto& versions = targetVersions();
+    if (versions.size() >= TargetVersionLimit && !versions.contains(key)) {
+        auto oldest = versions.begin();
+        for (auto it = versions.begin(); it != versions.end(); ++it) {
+            if (it->second.used < oldest->second.used) oldest = it;
+        }
+        versions.erase(oldest);
+    }
+    auto& entry = versions[key];
+    entry.used = ++uses;
+    return entry;
+}
+
+void targetRanges(const ColorTarget& color, const StorageTexture& resident, std::vector<std::pair<std::uint64_t, std::uint64_t>>& swept) {
+    swept.clear();
+    const auto add = [&](std::uint64_t begin, std::uint64_t bytes) {
+        if (begin != 0 && bytes != 0) swept.emplace_back(begin, begin + bytes);
+    };
+    const auto& own = resident.Descriptor();
+    add(own.baseAddress, resident.GuestBytes());
+    if (own.dccAddress != 0) add(own.dccAddress, DccKeyBytes(resident.GuestBytes()));
+    add(color.address, color.bytes);
+    if (color.dccAddress != 0) add(color.dccAddress, DccKeyBytes(color.bytes));
+    if (color.cmaskAddress != 0) add(color.cmaskAddress, color.cmaskBytes);
+}
 
 constexpr std::size_t TargetProofSlots = 8;
 constexpr std::size_t NoTargetProof = std::numeric_limits<std::size_t>::max();
@@ -2211,7 +2262,9 @@ std::array<TargetProof, TargetProofSlots>& targetProofs() {
 std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, const State& state, const ColorTarget& color, DrawOutcome& outcome, bool profile, std::size_t slot, const StorageTexture* stored, const std::function<std::shared_ptr<StorageTexture>()>& lookup) {
     const bool proofs = DrawProofsEnabled();
     if (slot < TargetProofSlots && !proofs) NoteDrawProofMissed(DrawProofKind::Targets, DrawProofMiss::None);
-    auto* proof = slot < TargetProofSlots && proofs ? &targetProofs()[slot] : nullptr;
+    const bool versions = slot < TargetProofSlots && proofs && GuestMemory::ResourceVersions();
+    auto* entry = versions ? &targetEntry(targetVersionKey(context.device, color)) : nullptr;
+    auto* proof = entry != nullptr ? &entry->proof : slot < TargetProofSlots && proofs ? &targetProofs()[slot] : nullptr;
     DrawProofStamp now{};
     std::shared_ptr<StorageTexture> proved;
     if (proof != nullptr) {
@@ -2225,6 +2278,15 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
                 if (proved == nullptr || !proved->Cached()) miss = DrawProofMiss::Evicted;
                 else if (stored != nullptr && proved.get() != stored) miss = DrawProofMiss::Target;
             }
+            if (miss == DrawProofMiss::None && proof->stamp.versioned) {
+                const auto generation = entry != nullptr ? GuestMemory::CurrentVersion(entry->version, now.epoch) : 0;
+                if (generation == 0) miss = DrawProofMiss::Sweep;
+                else if (generation != proof->generation) miss = DrawProofMiss::Versions;
+            }
+            if (miss == DrawProofMiss::None && proof->stamp.versioned && proof->touchedEpoch != now.epoch) {
+                if (!StorageImageCached(context, proved.get())) miss = DrawProofMiss::Evicted;
+                else proof->touchedEpoch = now.epoch;
+            }
         }
         if (proof->held && miss == DrawProofMiss::None) {
             if (!DrawProofVerifyDue()) {
@@ -2236,6 +2298,12 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
             proved.reset();
         }
         proof->held = false;
+    }
+    std::uint64_t generation = 0;
+    std::uint64_t renewals = 0;
+    if (entry != nullptr && now.versioned && now.epoch != 0) {
+        generation = GuestMemory::CurrentVersion(entry->version, now.epoch);
+        renewals = entry->version.renewals;
     }
     const auto provedVersion = proved != nullptr ? proved->Version() : 0;
     const auto pendingBefore = StorageTexture::PendingSerial();
@@ -2275,14 +2343,32 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
         const char* what = other ? "the lookup returned another image" : uploaded ? "the lookup uploaded or cleared the image" : registry ? "the lookup changed the pending registry" : storedNow ? "a store during the lookup" : "none";
         NoteDrawProofVerified(DrawProofKind::Targets, other || uploaded || registry, storedNow, what);
     }
-    if (resident != nullptr && now.epoch != 0 && DrawProofStamp::Now() == now) {
-        proof->device = context.device;
-        proof->color = color;
-        proof->resident = resident;
-        proof->stamp = now;
-        proof->held = true;
-        if (proved == nullptr) NoteDrawProofProved(DrawProofKind::Targets);
+    if (resident == nullptr || now.epoch == 0) return resident;
+    const auto after = DrawProofStamp::Now();
+    bool versioned = false;
+    if (now.versioned && entry != nullptr) {
+        struct SweptTag {};
+        auto& swept = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, SweptTag>();
+        struct NotedTag {};
+        auto& noted = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, NotedTag>();
+        targetRanges(color, *resident, swept);
+        noted.clear();
+        auto& version = entry->version;
+        if (GuestMemory::HoldVersion(version, swept, noted)) {
+            if (generation == 0 || version.renewals != renewals || DrawProofStampMiss(now, after) != DrawProofMiss::None || GuestMemory::CurrentVersion(version, now.epoch) != generation) return resident;
+            versioned = true;
+        }
     }
+    if (!versioned && DrawProofStampMiss(now.Legacy(), after) != DrawProofMiss::None) return resident;
+    proof->device = context.device;
+    proof->color = color;
+    proof->resident = resident;
+    proof->stamp = versioned ? now : now.Legacy();
+    proof->generation = generation;
+    proof->touchedEpoch = now.epoch;
+    proof->held = true;
+    if (proved == nullptr) NoteDrawProofProved(DrawProofKind::Targets);
+    if (now.versioned && !versioned) NoteDrawProofLegacy(DrawProofKind::Targets);
     return resident;
 }
 
@@ -2777,7 +2863,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
             resources->WriteBackBuffers();
         });
         writers->push_back(resources);
-        GuestMemory::BreakProofs(GuestMemory::ProofBreak::CopiedWriters);
+        for (const auto& [begin, end] : resources->GpuWrites()) GuestMemory::BreakProofs(GuestMemory::ProofBreak::CopiedWriters, begin, static_cast<std::size_t>(end - begin));
     } else if (completion) {
         if (use != nullptr) recorder.OnComplete([resources, use] { resources->CompleteDrawUse(*use); });
         else if (resources->Reusable()) recorder.OnComplete([resources] { resources->CheckFaults(); });

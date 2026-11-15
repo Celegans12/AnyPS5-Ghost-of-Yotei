@@ -4736,12 +4736,12 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
     if (const auto format = ResolveTextureFormat(descriptor.format); format == VK_FORMAT_R8_UINT || format == VK_FORMAT_R8_UNORM) eightBitWrites().fetch_add(1, std::memory_order_release);
     const bool wasLent = std::exchange(lent, false);
     if (dirty) {
-        if (wasLent) BumpPendingSerial();
+        if (wasLent) BumpPendingSerial(descriptor.baseAddress, guestBytes);
         return;
     }
     dirty = true;
     pending.textures.push_back(this);
-    BumpPendingSerial();
+    BumpPendingSerial(descriptor.baseAddress, guestBytes);
 }
 
 void StorageTexture::reconcilePending() {
@@ -4753,7 +4753,7 @@ void StorageTexture::reconcilePending() {
     dirty = any;
     if (any) pending.textures.push_back(this);
     else pending.textures.remove(this);
-    BumpPendingSerial();
+    BumpPendingSerial(descriptor.baseAddress, guestBytes);
 }
 
 bool StorageTexture::Dirty() const {
@@ -4987,7 +4987,7 @@ void StorageTexture::Flush(const char* reason) {
         if (!dirty) return;
         dirty = false;
         pending.textures.remove(this);
-        BumpPendingSerial();
+        BumpPendingSerial(descriptor.baseAddress, guestBytes);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
     const auto previous = std::exchange(flushReason, reason);
@@ -5174,7 +5174,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         // Still pending for the adjacency rule of writeBack until each one is stored.
         for (const auto& texture : flush) pending.flushing.push_back(texture.get());
         pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
-        if (!flush.empty()) BumpPendingSerial();
+        for (const auto& texture : flush) BumpPendingSerial(texture->descriptor.baseAddress, texture->guestBytes);
         for (const auto& texture : flush) {
             if (texture->drawnListed) ownNotes.insert(ownNotes.end(), texture->storeNotes.begin(), texture->storeNotes.end());
         }
@@ -5195,7 +5195,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             std::lock_guard lock(pending.mutex);
             for (const auto& texture : flush) std::erase(pending.flushing, texture.get());
             pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
-            BumpPendingSerial();
+            for (const auto& texture : flush) BumpPendingSerial(texture->descriptor.baseAddress, texture->guestBytes);
         }
     } unregister{flush};
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
@@ -6159,7 +6159,8 @@ bool StorageTexture::OrderedFlushArmedForTest() {
     return GpuOrderedFlush();
 }
 
-void StorageTexture::BumpPendingSerial() {
+void StorageTexture::BumpPendingSerial(std::uint64_t address, std::uint64_t bytes) {
+    GuestMemory::NoteRegistryChange(address, static_cast<std::size_t>(bytes));
     pendingSerial.fetch_add(1, std::memory_order_release);
 }
 
@@ -6231,7 +6232,7 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             ++it;
         }
     }
-    if (discarded != 0) BumpPendingSerial();
+    if (discarded != 0) BumpPendingSerial(address, bytes);
     return discarded;
 }
 
@@ -6389,7 +6390,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
         if (dirty) {
             dirty = false;
             pending.textures.remove(this);
-            BumpPendingSerial();
+            BumpPendingSerial(descriptor.baseAddress, guestBytes);
         }
     }
     const auto commands = recorder->Commands();
@@ -7777,7 +7778,7 @@ StorageTexture::~StorageTexture() {
         if (dirty) {
             dirty = false;
             pending.textures.remove(this);
-            BumpPendingSerial();
+            BumpPendingSerial(descriptor.baseAddress, guestBytes);
             static std::atomic<int> reports{0};
             if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx destroyed with GPU results pending\n", static_cast<unsigned long long>(descriptor.baseAddress));
         }

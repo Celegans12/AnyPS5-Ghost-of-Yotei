@@ -3583,7 +3583,7 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
     const auto index = GuestMemory::WriteIndexCounted();
     GuestMemory::ResetWriteIndexCounts();
     std::string sources;
-    constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::WriteBumpSource::Count)> SourceNames{"cpu", "driver", "pending", "unwatch", "forget", "release", "import"};
+    constexpr std::array<const char*, static_cast<std::size_t>(GuestMemory::WriteBumpSource::Count)> SourceNames{"cpu", "driver", "pending", "unwatch", "forget", "release", "import", "break", "registry"};
     for (std::size_t i = 0; i < SourceNames.size(); ++i) sources += " " + std::string(SourceNames[i]) + " " + std::to_string(index.bySource[i]);
     static std::array<std::uint64_t, IndexCountCount> reported{};
     std::array<std::uint64_t, IndexCountCount> counts{};
@@ -4143,6 +4143,7 @@ namespace {
 struct DrawProofCounters {
     std::atomic<std::uint64_t> reused{0};
     std::atomic<std::uint64_t> proved{0};
+    std::atomic<std::uint64_t> legacy{0};
     std::atomic<std::uint64_t> verified{0};
     std::atomic<std::uint64_t> differing{0};
     std::atomic<std::uint64_t> stored{0};
@@ -4154,7 +4155,7 @@ DrawProofCounters& drawProofCounters(DrawProofKind kind) {
     return counters[static_cast<std::size_t>(kind)];
 }
 
-constexpr std::array<const char*, static_cast<std::size_t>(DrawProofMiss::Count)> DrawProofMissNames{"unproved", "epoch", "serial", "registry", "depth surfaces", "unwatch", "images", "depth planes", "imports", "staging", "target", "evicted", "input twins"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawProofMiss::Count)> DrawProofMissNames{"unproved", "epoch", "serial", "registry", "depth surfaces", "unwatch", "images", "depth planes", "imports", "staging", "target", "evicted", "input twins", "structure", "versions", "sweep", "audit"};
 constexpr std::array<const char*, static_cast<std::size_t>(DrawProofKind::Count)> DrawProofKindNames{"resource", "target"};
 
 void reportEpochProofs() {
@@ -4170,7 +4171,19 @@ void reportEpochProofs() {
 }
 
 DrawProofStamp DrawProofStamp::Now() {
-    return {GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), DepthSurfacesSerial(), GuestMemory::UnwatchSerial()};
+    DrawProofStamp stamp{GuestMemory::CollectEpoch(), GuestMemory::ProofSerial(), StorageTexture::PendingSerial(), DepthSurfacesSerial(), GuestMemory::UnwatchSerial()};
+    if (!GuestMemory::ResourceVersions()) return stamp;
+    stamp.wide = GuestMemory::WideProofSerial();
+    stamp.forget = GuestMemory::ForgetSerial();
+    stamp.imports = HostImportSetGeneration();
+    stamp.versioned = true;
+    return stamp;
+}
+
+DrawProofStamp DrawProofStamp::Legacy() const {
+    auto stamp = *this;
+    stamp.versioned = false;
+    return stamp;
 }
 
 bool DrawProofsEnabled() {
@@ -4188,6 +4201,13 @@ bool DrawProofVerifyDue() {
 }
 
 DrawProofMiss DrawProofStampMiss(const DrawProofStamp& proved, const DrawProofStamp& now) {
+    if (proved.versioned) {
+        if (now.epoch == 0 || !now.versioned) return DrawProofMiss::Epoch;
+        if (now.wide != proved.wide) return DrawProofMiss::Serial;
+        if (now.depthSurfaces != proved.depthSurfaces) return DrawProofMiss::DepthSurfaces;
+        if (now.unwatch != proved.unwatch || now.imports != proved.imports || (now.forget & 1u) != 0) return DrawProofMiss::Structure;
+        return DrawProofMiss::None;
+    }
     if (now.epoch == 0 || now.epoch != proved.epoch) return DrawProofMiss::Epoch;
     if (now.proof != proved.proof) return DrawProofMiss::Serial;
     if (now.pending != proved.pending) return DrawProofMiss::Registry;
@@ -4208,6 +4228,10 @@ void NoteDrawProofReused(DrawProofKind kind) {
 void NoteDrawProofProved(DrawProofKind kind) {
     drawProofCounters(kind).proved.fetch_add(1, std::memory_order_relaxed);
     reportEpochProofs();
+}
+
+void NoteDrawProofLegacy(DrawProofKind kind) {
+    drawProofCounters(kind).legacy.fetch_add(1, std::memory_order_relaxed);
 }
 
 void NoteDrawProofMissed(DrawProofKind kind, DrawProofMiss miss) {
@@ -4233,6 +4257,7 @@ DrawProofCounts DrawProofCounted() {
         auto& count = counts[kind];
         count.reused = counters.reused.load(std::memory_order_relaxed);
         count.proved = counters.proved.load(std::memory_order_relaxed);
+        count.legacy = counters.legacy.load(std::memory_order_relaxed);
         count.verified = counters.verified.load(std::memory_order_relaxed);
         count.differing = counters.differing.load(std::memory_order_relaxed);
         count.stored = counters.stored.load(std::memory_order_relaxed);
@@ -4248,7 +4273,7 @@ std::string DrawProofText(const DrawProofCounts& now, const DrawProofCounts& see
         const auto& before = seen[kind];
         const auto delta = [](std::uint64_t value, std::uint64_t base) { return static_cast<unsigned long long>(value - base); };
         char part[160];
-        std::snprintf(part, sizeof(part), "%s%s proofs reused %llu, proved %llu, not reused:", kind == 0 ? "" : "; ", DrawProofKindNames[kind], delta(current.reused, before.reused), delta(current.proved, before.proved));
+        std::snprintf(part, sizeof(part), "%s%s proofs reused %llu, proved %llu (%llu without versions), not reused:", kind == 0 ? "" : "; ", DrawProofKindNames[kind], delta(current.reused, before.reused), delta(current.proved, before.proved), delta(current.legacy, before.legacy));
         text += part;
         for (std::size_t miss = 0; miss < current.missed.size(); ++miss) {
             if (current.missed[miss] == before.missed[miss]) continue;
@@ -4603,6 +4628,7 @@ bool ShaderResources::takeProof(const DrawProofStamp& stamp) {
 
 DrawProofMiss ShaderResources::proofMiss(const DrawProofStamp& now) const {
     if (const auto miss = DrawProofStampMiss(provedStamp, now); miss != DrawProofMiss::None) return miss;
+    if (provedStamp.versioned && AuditEveryInterval() && TemplateAuditDue(lastFullWalk)) return DrawProofMiss::Audit;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->Released()) return DrawProofMiss::Images;
     }
@@ -4651,6 +4677,47 @@ bool ShaderResources::verifyProof(std::span<const CompiledShader> shaders, Proof
     return ok;
 }
 
+void ShaderResources::versionRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& swept, std::vector<std::pair<std::uint64_t, std::uint64_t>>& noted) const {
+    swept.clear();
+    noted.clear();
+    const auto keys = [](std::vector<std::pair<std::uint64_t, std::uint64_t>>& into, std::uint64_t dccAddress, std::uint64_t bytes) {
+        if (dccAddress != 0) into.emplace_back(dccAddress, dccAddress + DccKeyBytes(bytes));
+    };
+    for (std::size_t i = 0; i < textures.size() && i < validatedTextures.size(); ++i) {
+        const auto& surface = validatedTextures[i];
+        if (textures[i] == nullptr || !surface.valid || surface.depth || surface.bytes == 0) continue;
+        swept.emplace_back(surface.resource.baseAddress, surface.resource.baseAddress + surface.bytes);
+        keys(swept, surface.resource.dccAddress, surface.bytes);
+        if (surface.source != nullptr) keys(swept, surface.source->Descriptor().dccAddress, surface.source->GuestBytes());
+    }
+    for (std::size_t i = 0; i < storageTextures.size(); ++i) {
+        const auto& image = storageTextures[i];
+        if (image == nullptr || (i != 0 && image == storageTextures[i - 1])) continue;
+        const auto& own = image->Descriptor();
+        swept.emplace_back(own.baseAddress, own.baseAddress + image->GuestBytes());
+        keys(swept, own.dccAddress, image->GuestBytes());
+    }
+    guestMemory.AppendTwinRanges(swept);
+    for (const auto& region : directRegions) {
+        if (region.end > region.begin) noted.emplace_back(region.begin, region.end);
+    }
+    for (const auto& range : describedRanges) {
+        if (range.bytes != 0) noted.emplace_back(range.address, range.address + range.bytes);
+        keys(noted, range.dccAddress, range.bytes);
+    }
+    for (const auto& [begin, end] : guestMemory.Writes()) {
+        if (end > begin) noted.emplace_back(begin, end);
+    }
+}
+
+bool ShaderResources::touchProvedImages() const {
+    struct TouchedTag {};
+    auto& images = ThreadScratch<std::vector<const StorageTexture*>, TouchedTag>();
+    images.clear();
+    for (const auto& [image, version] : provedImages) images.push_back(image);
+    return images.empty() || StorageImagesCached(context, images);
+}
+
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     if (!registeredImageViewsCurrent(registeredImageViews)) {
         if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
@@ -4663,7 +4730,16 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     }
     const auto now = DrawProofStamp::Now();
     if (proofHeld) {
-        const auto miss = proofMiss(now);
+        auto miss = proofMiss(now);
+        if (miss == DrawProofMiss::None && provedStamp.versioned) {
+            const auto generation = GuestMemory::CurrentVersion(versions, now.epoch);
+            if (generation == 0) miss = DrawProofMiss::Sweep;
+            else if (generation != provedGeneration) miss = DrawProofMiss::Versions;
+        }
+        if (miss == DrawProofMiss::None && provedStamp.versioned && touchedEpoch != now.epoch) {
+            if (!touchProvedImages()) miss = DrawProofMiss::Images;
+            else touchedEpoch = now.epoch;
+        }
         if (miss == DrawProofMiss::None) {
             if (DrawProofVerifyDue()) return verifyProof(shaders, report);
             if (report != nullptr) *report = {ProofPath::Fast, ProofFailure::None};
@@ -4675,10 +4751,35 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     } else {
         NoteDrawProofMissed(DrawProofKind::Resources, DrawProofMiss::None);
     }
+    struct SweptTag {};
+    auto& swept = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, SweptTag>();
+    struct NotedTag {};
+    auto& noted = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, NotedTag>();
+    std::uint64_t generation = 0;
+    std::uint64_t renewals = 0;
+    if (now.versioned && now.epoch != 0 && proofEligible()) {
+        versionRanges(swept, noted);
+        if (GuestMemory::HoldVersion(versions, swept, noted)) generation = GuestMemory::CurrentVersion(versions, now.epoch);
+        renewals = versions.renewals;
+    }
     ProofReport local;
     auto* out = report != nullptr ? report : &local;
     const bool ok = revalidateFull(shaders, out);
-    if (ok && now.epoch != 0 && out->path != ProofPath::Full && proofEligible() && takeProof(now)) NoteDrawProofProved(DrawProofKind::Resources);
+    if (!ok || now.epoch == 0 || out->path == ProofPath::Full || !proofEligible()) return ok;
+    if (generation != 0) {
+        versionRanges(swept, noted);
+        if (!GuestMemory::HoldVersion(versions, swept, noted) || versions.renewals != renewals || GuestMemory::CurrentVersion(versions, now.epoch) != generation) return ok;
+        if (takeProof(now)) {
+            provedGeneration = generation;
+            touchedEpoch = now.epoch;
+            NoteDrawProofProved(DrawProofKind::Resources);
+        }
+        return ok;
+    }
+    if (takeProof(now.Legacy())) {
+        NoteDrawProofProved(DrawProofKind::Resources);
+        if (now.versioned) NoteDrawProofLegacy(DrawProofKind::Resources);
+    }
     return ok;
 }
 
@@ -7596,7 +7697,11 @@ void ShaderResources::WriteBack() {
     } catch (const BdaUnalignedAccess&) {
         unaligned = std::current_exception();
     }
-    if (!guestMemory.Writes().empty() || std::find(storageWritten.begin(), storageWritten.end(), true) != storageWritten.end() || (usesBda && !bdaReadOnly)) GuestMemory::BreakProofs(GuestMemory::ProofBreak::WriteBack);
+    if (usesBda && !bdaReadOnly) GuestMemory::BreakProofs(GuestMemory::ProofBreak::WriteBack);
+    for (const auto& [begin, end] : guestMemory.Writes()) GuestMemory::BreakProofs(GuestMemory::ProofBreak::WriteBack, begin, static_cast<std::size_t>(end - begin));
+    for (std::size_t index = 0; index < storageTextures.size() && index < storageWritten.size(); ++index) {
+        if (storageWritten[index] && storageTextures[index] != nullptr) GuestMemory::BreakProofs(GuestMemory::ProofBreak::WriteBack, storageTextures[index]->Descriptor().baseAddress, static_cast<std::size_t>(storageTextures[index]->GuestBytes()));
+    }
     if (!SkipWriteBack()) {
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (!storageWritten[index] || storageTextures[index] == nullptr) continue;

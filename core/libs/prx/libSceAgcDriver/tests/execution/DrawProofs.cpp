@@ -30,6 +30,8 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <functional>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -46,7 +48,8 @@ constexpr std::uint32_t Type2D = 9;
 constexpr std::size_t TextureBytes = std::size_t{Side} * Side * 4u;
 constexpr std::size_t TargetOffset = 0;
 constexpr std::size_t TextureOffset = Unit;
-constexpr std::size_t BlockBytes = TextureOffset + TextureBytes;
+constexpr std::size_t SecondTextureOffset = TextureOffset + TextureBytes;
+constexpr std::size_t BlockBytes = SecondTextureOffset + TextureBytes;
 constexpr std::size_t Draws = 8;
 
 enum class Mode { Default, Verify, Off };
@@ -184,8 +187,10 @@ void Run(AgcDriver::VulkanDevice& device, const Block& block, Mode mode) {
         result.variantId = variant;
         return result;
     };
+    const bool versions = AgcDriver::GuestMemory::ResourceVersions();
     auto vertex = program(COVER_VERT_SPV, 0x7001);
     auto fragment = program(DRAW_PROOFS_SPV, 0x7002);
+    auto secondFragment = program(DRAW_PROOFS_SPV, 0x7003);
     ShaderRecompiler::DescriptorBinding binding;
     binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
     binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
@@ -198,7 +203,11 @@ void Run(AgcDriver::VulkanDevice& device, const Block& block, Mode mode) {
     const auto words = TextureDescriptor(block.Address(TextureOffset));
     binding.guestDescriptor.assign(words.begin(), words.end());
     fragment.bindings = {binding};
+    const auto secondWords = TextureDescriptor(block.Address(SecondTextureOffset));
+    binding.guestDescriptor.assign(secondWords.begin(), secondWords.end());
+    secondFragment.bindings = {binding};
     const std::array shaders{CompiledShader{ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderStage::Fragment, &fragment, 0}};
+    const std::array secondShaders{CompiledShader{ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderStage::Fragment, &secondFragment, 0}};
     State state{};
     state.stages.path = ShaderPath::Vertex;
     state.color = {block.Address(TargetOffset), {Target, Target}, VK_FORMAT_R8G8B8A8_UNORM, Unit, 0xe4u, ColorTileMode::RenderTarget, 4};
@@ -216,6 +225,11 @@ void Run(AgcDriver::VulkanDevice& device, const Block& block, Mode mode) {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         device.Draw(drawn, triangle, shaders);
     };
+    const auto drawSecond = [&](const State& drawn) {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        device.Draw(drawn, triangle, secondShaders);
+    };
+    const auto refusal = [versions](DrawProofMiss legacy) { return versions ? DrawProofMiss::Versions : legacy; };
     const bool proofs = mode != Mode::Off;
 
     constexpr std::uint32_t first = 0xff2040c0u;
@@ -247,7 +261,7 @@ void Run(AgcDriver::VulkanDevice& device, const Block& block, Mode mode) {
     before = Take();
     draw(state);
     after = Take();
-    if (proofs) Require(Missed(Delta(before, after, DrawProofKind::Resources), DrawProofMiss::Epoch) == 1u && Delta(before, after, DrawProofKind::Resources).reused == 0, "a CPU store to the texture behind an ordering point did not refuse the resource proof");
+    if (proofs) Require(Missed(Delta(before, after, DrawProofKind::Resources), refusal(DrawProofMiss::Epoch)) == 1u && Delta(before, after, DrawProofKind::Resources).reused == 0, "a CPU store to the texture behind an ordering point did not refuse the resource proof");
     CheckPixels(state.color, Unpacked(second), Unpacked(second), "CPU store to the texture between two draws");
 
     for (std::size_t index = 0; index < 3; ++index) draw(state);
@@ -257,7 +271,7 @@ void Run(AgcDriver::VulkanDevice& device, const Block& block, Mode mode) {
     before = Take();
     draw(state);
     after = Take();
-    if (proofs) Require(Missed(Delta(before, after, DrawProofKind::Resources), DrawProofMiss::Serial) == 1u && Delta(before, after, DrawProofKind::Resources).reused == 0, "a driver store to the texture inside the epoch did not refuse the resource proof");
+    if (proofs) Require(Missed(Delta(before, after, DrawProofKind::Resources), refusal(DrawProofMiss::Serial)) == 1u && Delta(before, after, DrawProofKind::Resources).reused == 0, "a driver store to the texture inside the epoch did not refuse the resource proof");
     CheckPixels(state.color, Unpacked(third), Unpacked(third), "driver store to the texture between two draws");
 
     for (std::size_t index = 0; index < 3; ++index) draw(state);
@@ -283,8 +297,53 @@ void Run(AgcDriver::VulkanDevice& device, const Block& block, Mode mode) {
     before = Take();
     draw(half);
     after = Take();
-    if (proofs) Require(Missed(Delta(before, after, DrawProofKind::Targets), DrawProofMiss::Epoch) == 1u && Delta(before, after, DrawProofKind::Targets).reused == 0, "a CPU store to the target between two draws did not refuse the target proof");
+    if (proofs) Require(Missed(Delta(before, after, DrawProofKind::Targets), refusal(DrawProofMiss::Epoch)) == 1u && Delta(before, after, DrawProofKind::Targets).reused == 0, "a CPU store to the target between two draws did not refuse the target proof");
     CheckPixels(state.color, Unpacked(0x33cc44ddu), Unpacked(written), "target written between two draws");
+
+    if (proofs && versions) {
+        constexpr std::uint32_t untouched = 0x0a0b0c0du;
+        Fill(block, SecondTextureOffset, TextureBytes, untouched);
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        for (std::size_t index = 0; index < 3; ++index) {
+            draw(state);
+            drawSecond(state);
+        }
+        const auto isolated = [&](const char* what, const std::function<void()>& change, bool touchesFirst) {
+            change();
+            const auto start = Take();
+            draw(state);
+            const auto middle = Take();
+            drawSecond(state);
+            const auto end = Take();
+            const auto first = Delta(start, middle, DrawProofKind::Resources);
+            const auto second = Delta(middle, end, DrawProofKind::Resources);
+            std::cout << what << ": " << DrawProofText(middle.proofs, start.proofs) << " / " << DrawProofText(end.proofs, middle.proofs) << '\n';
+            if (touchesFirst) Require(Missed(first, DrawProofMiss::Versions) + Missed(first, DrawProofMiss::Images) == 1u && Skipped(first, mode) == 0, std::string(what) + " did not refuse the proof of the texture it touched");
+            else Require(Skipped(first, mode) == 1u, std::string(what) + " refused the proof of a texture it did not touch");
+            Require(Skipped(second, mode) == 1u, std::string(what) + " refused the proof of the other texture");
+            draw(state);
+        };
+        isolated("a CPU store to one texture", [&] {
+            Fill(block, TextureOffset, TextureBytes, 0x01020304u);
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+        }, true);
+        CheckPixels(state.color, Unpacked(0x01020304u), Unpacked(0x01020304u), "CPU store to one of two textures");
+        isolated("a driver store to one texture", [&] {
+            std::vector<std::uint32_t> words(TextureBytes / 4u, 0x05060708u);
+            AgcDriver::GuestMemory::Write(block.Address(TextureOffset), std::as_bytes(std::span(words)));
+        }, true);
+        CheckPixels(state.color, Unpacked(0x05060708u), Unpacked(0x05060708u), "driver store to one of two textures");
+        isolated("a pending GPU write to one texture", [&] { StoreTexels(device, block, FirstStore); }, true);
+        CheckPixels(state.color, Unpacked(0x11aa22bbu), Unpacked(0x11aa22bbu), "dispatch writing one of two textures");
+        isolated("an unmap of one texture's range", [&] { GuestAllocations::GuestAllocationsInvalidate_nid_postfix(block.Address(TextureOffset), TextureBytes); }, true);
+        isolated("a commit over a disjoint range", [&] { AgcDriver::GuestMemory::BreakProofs(AgcDriver::GuestMemory::ProofBreak::Commit, block.Address(TargetOffset), Unit); }, false);
+        isolated("a GPU-lock hold of another thread", [&] {
+            std::thread other([] { std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex()); });
+            other.join();
+        }, false);
+        drawSecond(state);
+        CheckPixels(state.color, Unpacked(untouched), Unpacked(untouched), "the untouched texture");
+    }
 
     const auto total = DrawProofCounted();
     for (std::size_t kind = 0; kind < total.size(); ++kind) Require(total[kind].differing == 0 && total[kind].stored == 0, "a full check beside a reused proof found a difference");

@@ -172,8 +172,17 @@ void EndFrame() {
     AgcDriver::Graphics::NoteHostImportFrame();
 }
 
+std::uint64_t ResourceProofsReused() {
+    return AgcDriver::Graphics::DrawProofCounted()[static_cast<std::size_t>(AgcDriver::Graphics::DrawProofKind::Resources)].reused;
+}
+
 struct Marks {
     InputTwinCounts before = AgcDriver::Graphics::InputTwinCounters();
+    std::uint64_t proofsBefore = ResourceProofsReused();
+
+    std::uint64_t ProofsSince() const {
+        return ResourceProofsReused() - proofsBefore;
+    }
 
     InputTwinCounts Since() const {
         auto now = AgcDriver::Graphics::InputTwinCounters();
@@ -513,15 +522,16 @@ void OneEpoch(AgcDriver::VulkanDevice& device, const Settings& settings) {
     Expect(first, 14000, "an input read by many dispatches of one collect epoch");
     Expect(second, 14000, "an input read by a second program in one collect epoch");
     const auto since = marks.Since();
-    std::printf("input twins: %u dispatches of one collect epoch took %.2f us each (%s)\n", Dispatches, elapsed / Dispatches, Verdicts(since).c_str());
+    const auto proofs = marks.ProofsSince();
+    std::printf("input twins: %u dispatches of one collect epoch took %.2f us each (%s, %llu served by a resource proof)\n", Dispatches, elapsed / Dispatches, Verdicts(since).c_str(), static_cast<unsigned long long>(proofs));
     ExpectOff(settings.twins, marks, "dispatches of one collect epoch");
     if (!settings.twins) return;
-    Require(since.copies == 0 && since.reuses == Dispatches, "input twins: " + std::to_string(Dispatches) + " dispatches of one collect epoch gave " + Text(since) + ", expected a reuse each");
+    Require(since.copies == 0 && since.reuses + proofs == Dispatches, "input twins: " + std::to_string(Dispatches) + " dispatches of one collect epoch gave " + Text(since) + " and " + std::to_string(proofs) + " resource proofs, expected a reuse each");
     if (!settings.verdicts) {
-        Require(since.memoised == 0 && since.checked == Dispatches, "input twins: without memoised verdicts, " + std::to_string(Dispatches) + " dispatches gave " + Verdicts(since) + ", expected a full check each");
+        Require(since.memoised == 0 && since.checked + proofs == Dispatches, "input twins: without memoised verdicts, " + std::to_string(Dispatches) + " dispatches gave " + Verdicts(since) + ", expected a full check each");
         return;
     }
-    Require(since.checked == 1 && since.memoised == Dispatches - 1, "input twins: " + std::to_string(Dispatches) + " dispatches of two programs over one twin in one collect epoch gave " + Verdicts(since) + ", expected one full check");
+    Require(since.checked <= 1 && since.checked + since.memoised + proofs == Dispatches, "input twins: " + std::to_string(Dispatches) + " dispatches of two programs over one twin in one collect epoch gave " + Verdicts(since) + " and " + std::to_string(proofs) + " resource proofs, expected one full check");
     if (settings.verify) Require(since.verified == Dispatches && since.differing == 0, "input twins: the verification of memoised verdicts gave " + Verdicts(since));
 }
 
@@ -550,6 +560,7 @@ void LargeInput(AgcDriver::VulkanDevice& device, const Settings& settings) {
     const auto inEpoch = timed(false);
     const auto epochs = timed(true);
     const auto since = marks.Since();
+    const auto proofs = marks.ProofsSince();
     double walk = 0;
     {
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
@@ -564,8 +575,8 @@ void LargeInput(AgcDriver::VulkanDevice& device, const Settings& settings) {
     std::printf("input twins: a dispatch over a 2 MiB input took %.2f us within one collect epoch and %.2f us behind an ordering point each (%s); a collect of the 2 MiB range in a new epoch took %.2f us\n", inEpoch, epochs, Verdicts(since).c_str(), walk);
     ExpectOff(settings.twins, marks, "a 2 MiB input");
     if (!settings.twins) return;
-    Require(since.copies == 0 && since.reuses == Dispatches * 2u, "input twins: an unchanged 2 MiB input gave " + Text(since) + ", expected a reuse per dispatch");
-    if (settings.verdicts) Require(since.checked == Dispatches + 1u && since.memoised == Dispatches - 1u, "input twins: an unchanged 2 MiB input gave " + Verdicts(since) + ", expected one full check per collect epoch");
+    Require(since.copies == 0 && since.reuses + proofs == Dispatches * 2u, "input twins: an unchanged 2 MiB input gave " + Text(since) + " and " + std::to_string(proofs) + " resource proofs, expected a reuse per dispatch");
+    if (settings.verdicts) Require(since.checked <= Dispatches + 1u && since.checked + since.memoised + proofs == Dispatches * 2u, "input twins: an unchanged 2 MiB input gave " + Verdicts(since) + " and " + std::to_string(proofs) + " resource proofs, expected one full check per collect epoch");
 }
 
 void StoresInEpoch(AgcDriver::VulkanDevice& device, const Settings& settings) {
@@ -588,6 +599,7 @@ void StoresInEpoch(AgcDriver::VulkanDevice& device, const Settings& settings) {
     twice();
     Expect(target, 15000, "an input reused within one collect epoch");
     const auto inEpoch = reused.Since();
+    const auto inEpochProofs = reused.ProofsSince();
     const Marks driver;
     std::array<std::uint32_t, Lanes> words{};
     for (std::uint32_t lane = 0; lane < Lanes; ++lane) words[lane] = 16000 + lane;
@@ -616,7 +628,7 @@ void StoresInEpoch(AgcDriver::VulkanDevice& device, const Settings& settings) {
     Expect(target, 18000, "an input reused after a recorded write was copied");
     ExpectOff(settings.twins, reused, "stores inside one collect epoch");
     if (!settings.twins) return;
-    if (settings.verdicts) Require(inEpoch.memoised == 1 && inEpoch.checked == 1, "input twins: two dispatches of one collect epoch gave " + Verdicts(inEpoch) + ", expected one full check and one memoised verdict");
+    if (settings.verdicts) Require(inEpoch.memoised <= 1 && inEpoch.checked <= 1 && inEpoch.memoised + inEpoch.checked + inEpochProofs == 2, "input twins: two dispatches of one collect epoch gave " + Verdicts(inEpoch) + " and " + std::to_string(inEpochProofs) + " resource proofs, expected one full check and one memoised verdict");
     Require(afterDriver.copies == 1 && afterDriver.refreshes == 1 && afterDriver.outdated == 1 && afterDriver.memoised == 0, "input twins: a driver store inside one collect epoch gave " + Text(afterDriver) + ", " + Verdicts(afterDriver) + ", expected the twin outdated and refreshed");
     Require(afterCpu.copies == 1 && afterCpu.refreshes == 1 && afterCpu.memoised == 0, "input twins: a CPU store behind an ordering point gave " + Text(afterCpu) + ", " + Verdicts(afterCpu) + ", expected a refresh");
     Require(afterGpu.outdated == 1 && Missed(afterGpu, InputTwinMiss::PendingWrite) == 1 && afterGpu.refreshes == 1 && afterGpu.memoised == 0, "input twins: a recorded write over a twin inside one collect epoch gave " + Text(afterGpu) + ", " + Verdicts(afterGpu) + ", expected the twin outdated and copied behind the write");

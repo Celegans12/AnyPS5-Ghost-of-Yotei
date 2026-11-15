@@ -89,7 +89,20 @@ void TrimSubscriptionBumps(WriteSubscription& subscription, std::uint64_t genera
 std::uint64_t WriteBlockOf(std::uint64_t address);
 void NoteGpuPending(std::uint64_t address, std::size_t bytes);
 void NoteTextureReleased(std::uint64_t address);
-enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Count };
+void NoteRegistryChange(std::uint64_t address, std::size_t bytes);
+enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Break, Registry, Count };
+bool ResourceVersions();
+struct ResourceVersion {
+    std::shared_ptr<WriteSubscription> subscription;
+    std::shared_ptr<WriteSubscription> notedSubscription;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> swept;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> noted;
+    std::uint64_t sweptEpoch = 0;
+    std::uint64_t refusedUnwatch = 0;
+    std::uint64_t renewals = 0;
+};
+bool HoldVersion(ResourceVersion& version, std::vector<std::pair<std::uint64_t, std::uint64_t>>& swept, std::vector<std::pair<std::uint64_t, std::uint64_t>>& noted);
+std::uint64_t CurrentVersion(ResourceVersion& version, std::uint64_t epoch);
 struct WriteIndexStats {
     std::uint64_t subscriptions = 0;
     std::uint64_t blocks = 0;
@@ -152,11 +165,14 @@ void AdoptLatestCollectEpoch();
 void AdoptCollectEpoch(std::uint64_t epoch);
 std::uint64_t HeldCollectEpoch();
 std::uint64_t ProofSerial();
-enum class ProofBreak : std::uint8_t { Store, Marked, Changed, GpuHold, Commit, WriteBack, CopiedWriters, Label, RecordedWork, Count };
+enum class ProofBreak : std::uint8_t { Store, Marked, Changed, GpuHold, Commit, WriteBack, CopiedWriters, Label, RecordedWork, Registry, Count };
 void BreakProofs(ProofBreak source);
+void BreakProofs(ProofBreak source, std::uint64_t address, std::size_t bytes);
+std::uint64_t WideProofSerial();
 const char* ProofBreakName(ProofBreak source);
 struct ProofBreakCounts {
     std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> breaks{};
+    std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> wide{};
     std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> serialMisses{};
 };
 ProofBreakCounts ProofBreaksCounted();

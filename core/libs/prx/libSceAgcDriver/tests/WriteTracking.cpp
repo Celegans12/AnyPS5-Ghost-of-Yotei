@@ -2530,6 +2530,77 @@ void CheckCommittedRanges() {
     Require(!UnchangedCommittedSince(first, 0), "an unknown generation was accepted for the committed parts");
 }
 
+void CheckResourceVersions() {
+    if (!ResourceVersions()) return;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(5 * Block));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0, 5 * Block);
+    BumpCollectEpoch();
+    using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    ResourceVersion first;
+    ResourceVersion second;
+    ResourceVersion inPlace;
+    Ranges firstSwept{{base, base + Block}};
+    Ranges secondSwept{{base + 2 * Block, base + 3 * Block}};
+    Ranges noted{{base + 4 * Block, base + 5 * Block}};
+    Ranges none;
+    Ranges nothingSwept;
+    Require(HoldVersion(first, firstSwept, none) && HoldVersion(second, secondSwept, none) && HoldVersion(inPlace, nothingSwept, noted), "a watched range was refused a version");
+    std::array<std::uint64_t, 3> versions{};
+    const auto take = [&] {
+        const auto epoch = CollectEpoch();
+        return std::array<std::uint64_t, 3>{CurrentVersion(first, epoch), CurrentVersion(second, epoch), CurrentVersion(inPlace, epoch)};
+    };
+    versions = take();
+    Require(versions[0] != 0 && versions[1] != 0 && versions[2] != 0, "a version without an epoch or sweep");
+    const auto expect = [&](const char* what, std::array<bool, 3> moved) {
+        const auto now = take();
+        for (std::size_t index = 0; index < now.size(); ++index) {
+            Require(now[index] != 0, std::string(what) + ": a sweep was refused");
+            Require((now[index] != versions[index]) == moved[index], std::string(what) + (moved[index] ? ": the touched resource kept its version" : ": an untouched resource moved its version") + " (resource " + std::to_string(index) + ")");
+        }
+        versions = now;
+    };
+    memory[64] = 1;
+    expect("a CPU store inside the swept epoch", {false, false, false});
+    BumpCollectEpoch();
+    expect("a CPU store after an ordering point", {true, false, false});
+    memory[4 * Block + 64] = 1;
+    BumpCollectEpoch();
+    CollectWrites(base + 4 * Block, Block);
+    expect("a CPU store to a range read in place", {false, false, false});
+    const std::array<std::byte, 16> bytes{};
+    Write(base + 2 * Block + 128, bytes);
+    expect("a driver store", {false, true, false});
+    MarkWritten(base + 256, 64);
+    expect("a GPU write mark", {true, false, false});
+    NoteGpuPending(base, Block);
+    expect("a GPU write to an image already pending", {false, false, false});
+    NoteRegistryChange(base + 2 * Block, Block);
+    expect("a GPU write that makes an image pending", {false, true, false});
+    NoteRegistryChange(base + 4 * Block, 64);
+    expect("a pending image over a range read in place", {false, false, true});
+    BreakProofs(ProofBreak::Commit, base + 3 * Block, Block);
+    expect("a commit over a disjoint range", {false, false, false});
+    BreakProofs(ProofBreak::Commit, base + Block - 64, 128);
+    expect("a commit over the range", {true, false, false});
+    const auto wide = WideProofSerial();
+    BreakProofs(ProofBreak::GpuHold);
+    Require(WideProofSerial() == wide, "a GPU-lock hold broke every versioned proof");
+    BreakProofs(ProofBreak::Commit);
+    Require(WideProofSerial() != wide, "a commit with unknown writes kept the versioned proofs");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(base + 2 * Block), Block);
+    expect("an unmap", {false, true, false});
+    Ranges moved{{base, base + 2 * Block}};
+    const auto renewals = first.renewals;
+    Require(HoldVersion(first, moved, none) && first.renewals == renewals + 1, "a moved range kept its subscription");
+    Require(HoldVersion(first, moved, none) && first.renewals == renewals + 1, "an unchanged range renewed its subscription");
+    std::vector<std::uint8_t> outside(2 * Block);
+    Ranges unwatched{{reinterpret_cast<std::uint64_t>(outside.data()), reinterpret_cast<std::uint64_t>(outside.data()) + outside.size()}};
+    ResourceVersion refused;
+    if (!Watched(unwatched.front().first, outside.size())) Require(!HoldVersion(refused, unwatched, none) && CurrentVersion(refused, CollectEpoch()) == 0, "an unwatched range was given a version");
+}
+
 void CheckAdoptLatestEpoch() {
     std::uint64_t bumped = 0;
     std::thread([&] {
@@ -2768,6 +2839,7 @@ int main(int argc, char** argv) {
         CheckUnwatchHooks();
         CheckCommittedRanges();
         CheckAdoptLatestEpoch();
+        CheckResourceVersions();
 #ifndef _WIN32
         CheckOwnStoreImages();
 #endif

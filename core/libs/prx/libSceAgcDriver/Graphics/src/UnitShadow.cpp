@@ -879,7 +879,9 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
     Stats().retiledBytes.fetch_add(bytes, std::memory_order_relaxed);
     // The resource cache's pending memos (fastRevalidate) must see the change of the surface's
     // source, as they see a write-back.
-    StorageTexture::BumpPendingSerial();
+    for (const auto& range : ranges) {
+        if (range.end > range.begin) StorageTexture::BumpPendingSerial(range.begin, range.end - range.begin);
+    }
 }
 
 void RetireShadow(VkDevice device, const HostImport& import, const std::function<bool(std::uint64_t, std::uint64_t)>& registered) {
