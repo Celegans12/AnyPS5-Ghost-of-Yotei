@@ -206,6 +206,7 @@ struct LockCounts {
     static constexpr std::size_t WaitBuckets = 4;
     struct TrackerSite {
         std::uint64_t acquisitions = 0;
+        std::uint64_t unlocked = 0;
         std::uint64_t waits = 0;
         std::uint64_t waitNs = 0;
         std::uint64_t committerWaits = 0;
@@ -233,6 +234,7 @@ void SetObservationHookForTest(void (*hook)(int point));
 // tracker mutex, so every collect that bumped before it has finished its walk and every later
 // collect stamps newer.
 std::uint64_t TrackerGeneration();
+std::uint64_t SettledGeneration();
 void AdvanceTrackerGenerationForTest(std::uint64_t generation);
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
 std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);

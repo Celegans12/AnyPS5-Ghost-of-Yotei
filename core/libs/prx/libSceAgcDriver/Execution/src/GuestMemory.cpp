@@ -358,6 +358,7 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 struct TrackerSiteCounters {
     std::atomic<std::uint64_t> acquisitions{0};
+    std::atomic<std::uint64_t> unlocked{0};
     std::atomic<std::uint64_t> waits{0};
     std::atomic<std::uint64_t> waitNs{0};
     std::atomic<std::uint64_t> committerWaits{0};
@@ -2444,6 +2445,7 @@ LockCounts LockCounted() {
         const auto& from = trackerSiteCounters[site];
         auto& to = counts.tracker[site];
         to.acquisitions = from.acquisitions.load(std::memory_order_relaxed);
+        to.unlocked = from.unlocked.load(std::memory_order_relaxed);
         to.waits = from.waits.load(std::memory_order_relaxed);
         to.waitNs = from.waitNs.load(std::memory_order_relaxed);
         to.committerWaits = from.committerWaits.load(std::memory_order_relaxed);
@@ -2465,9 +2467,13 @@ std::string LockReport(const LockCounts& from, const LockCounts& to) {
     for (std::size_t site = 0; site < LockCounts::TrackerSites; ++site) {
         const auto& a = from.tracker[site];
         const auto& b = to.tracker[site];
-        if (b.acquisitions == a.acquisitions) continue;
+        if (b.acquisitions == a.acquisitions && b.unlocked == a.unlocked) continue;
         std::snprintf(item, sizeof(item), " %s %llu acquired, %llu waited %.2f ms", TrackerLockSiteName(static_cast<TrackerLockSite>(site)), count(b.acquisitions - a.acquisitions), count(b.waits - a.waits), ms(b.waitNs - a.waitNs));
         text += item;
+        if (b.unlocked != a.unlocked) {
+            std::snprintf(item, sizeof(item), ", %llu unlocked", count(b.unlocked - a.unlocked));
+            text += item;
+        }
         if (b.waits != a.waits) {
             std::snprintf(item, sizeof(item), " (committer %llu, %.2f ms; under 1/10/100 us %llu/%llu/%llu, longer %llu; behind", count(b.committerWaits - a.committerWaits), ms(b.committerWaitNs - a.committerWaitNs), count(b.waitsBelow[0] - a.waitsBelow[0]), count(b.waitsBelow[1] - a.waitsBelow[1]), count(b.waitsBelow[2] - a.waitsBelow[2]), count(b.waitsBelow[3] - a.waitsBelow[3]));
             text += item;
@@ -3211,6 +3217,13 @@ std::uint64_t TrackerGeneration() {
     // when the value is read absorbs stores made after it with a stamp not newer than the value.
     const auto lock = lockTracker(tracker, TrackerLockSite::Generation);
     return tracker.generation;
+}
+
+std::uint64_t SettledGeneration() {
+    static const bool settled = std::getenv("APS5_NO_SETTLED_GENERATION") == nullptr;
+    if (!settled) return TrackerGeneration();
+    trackerSiteCounters[static_cast<std::size_t>(TrackerLockSite::Generation)].unlocked.fetch_add(1, std::memory_order_relaxed);
+    return Tracker().stable.load(std::memory_order_acquire);
 }
 
 void AdvanceTrackerGenerationForTest(std::uint64_t generation) {

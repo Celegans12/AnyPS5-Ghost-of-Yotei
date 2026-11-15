@@ -7498,7 +7498,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         if (override == moved.end() && (bytes > maxSnapshotBytes || totalSnapshotBytes + bytes > maxSnapshotBytes)) continue;
         const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         if (!stamped) {
-            stamp = {GuestMemory::TrackerGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
+            stamp = {GuestMemory::SettledGeneration(), GuestMemory::CollectEpoch(), registryGeneration};
             stamped = true;
         }
         VkDeviceSize offset = 0;
@@ -7529,7 +7529,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                     recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
                 }
             }
-            if (GuestMemory::TrackerGeneration() != stamp[0]) stamped = false;
+            if (GuestMemory::SettledGeneration() != stamp[0]) stamped = false;
             else if (!uploaded || stamp[1] != 0) recorder.NoteUnwrittenDrawSnapshot(begin, bytes, stamp, buffer, offset);
         }
         selected.push_back(index);

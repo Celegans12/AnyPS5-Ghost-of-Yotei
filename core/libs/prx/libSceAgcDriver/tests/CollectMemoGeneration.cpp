@@ -691,6 +691,72 @@ void CheckTrackerWaitsCounted() {
     Require(charged, "a store made while a walk held the tracker never waited for it");
 }
 
+void CheckSettledGenerationDuringWalk() {
+    BumpCollectEpoch();
+    const auto block = Base + 68 * Block;
+    const auto page = block + 3 * Page;
+    Require(CollectWritesUncached(block, Block) != 0, "the block was not collected");
+    const auto before = SettledGeneration();
+    Require(before == TrackerGeneration(), "the settled generation is not the tracker's while no update runs");
+    const auto counted = LockCounted().tracker[static_cast<std::size_t>(TrackerLockSite::Generation)];
+    Store(page);
+    std::uint64_t during = 0;
+    std::atomic<bool> read{false};
+    {
+        PausedWalk walker(1, [&] { CollectWritesUncached(block, Block); });
+        std::thread reader([&] {
+            during = SettledGeneration();
+            read.store(true);
+        });
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (!read.load() && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        const bool answered = read.load();
+        walker.Release();
+        reader.join();
+        Require(answered, "the settled generation waited for a walk holding the tracker");
+    }
+    Require(during == before, "the settled generation moved while the only update was still running");
+    Require(!UnchangedSince(page & ~(Page - 1), Page, during), "a walk stamped a store with the generation read while it ran");
+    Require(SettledGeneration() > during, "a finished walk that found a store did not move the settled generation");
+    const auto written = MarkWritten(Base + 69 * Block, Page);
+    Require(written != 0 && SettledGeneration() >= written, "a finished driver store is newer than the settled generation");
+    const auto after = LockCounted().tracker[static_cast<std::size_t>(TrackerLockSite::Generation)];
+    Require(after.unlocked == counted.unlocked + 3 && after.acquisitions == counted.acquisitions, "the settled generation reads were not counted as answered without the tracker");
+}
+
+void CheckSettledGenerationUnderWalks() {
+    constexpr std::size_t Readers = 3;
+    constexpr int Rounds = 1500;
+    const auto first = Base + 72 * Block;
+    std::atomic<bool> stop{false};
+    std::atomic<std::size_t> trusted{0};
+    std::atomic<std::size_t> refused{0};
+    std::vector<std::thread> readers;
+    for (std::size_t reader = 0; reader < Readers; ++reader) {
+        readers.emplace_back([&, reader] {
+            const auto page = first + reader * Block + 5 * Page;
+            for (int round = 0; round < Rounds; ++round) {
+                const auto generation = SettledGeneration();
+                Store(page);
+                if (CollectWritesUncached(page, Page) == 0) refused.fetch_add(1);
+                else if (UnchangedSince(page, Page, generation)) trusted.fetch_add(1);
+            }
+        });
+    }
+    std::thread walker([&] {
+        while (!stop.load()) CollectWritesUncached(first, Readers * Block);
+    });
+    std::thread marker([&] {
+        while (!stop.load()) MarkWritten(first + Readers * Block, Page);
+    });
+    for (auto& reader : readers) reader.join();
+    stop.store(true);
+    walker.join();
+    marker.join();
+    Require(refused.load() == 0, "a collect of a covered page failed under concurrent walks");
+    Require(trusted.load() == 0, "a store made after the settled generation was read was trusted against it");
+}
+
 void CheckCoverageThreadAndDriverWrites() {
     BumpCollectEpoch();
     Require(CollectWrites(Base, 4 * Block) != 0, "the covering collection failed");
@@ -757,6 +823,8 @@ int main(int argc, char** argv) {
         CheckMappingChangeForcesWalk();
         CheckFailedRequestPublishesNothing();
         CheckTrackerWaitsCounted();
+        CheckSettledGenerationDuringWalk();
+        CheckSettledGenerationUnderWalks();
 #ifdef _WIN32
         CheckWatchCallsCounted();
 #endif
