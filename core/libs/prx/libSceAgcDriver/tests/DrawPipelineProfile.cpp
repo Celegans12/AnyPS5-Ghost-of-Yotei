@@ -54,12 +54,12 @@ public:
     StderrCapture(const StderrCapture&) = delete;
     StderrCapture& operator=(const StderrCapture&) = delete;
 
-    std::string ReadReport() const {
+    std::string ReadReport(std::string_view head = "[draw] pipelined ") const {
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
         do {
             std::ifstream file(path, std::ios::binary);
             const std::string text{std::istreambuf_iterator<char>(file), std::istreambuf_iterator<char>()};
-            const auto begin = text.find("[draw] pipelined ");
+            const auto begin = text.find(head);
             if (begin != std::string::npos) {
                 const auto end = text.find('\n', begin);
                 if (end != std::string::npos) return text.substr(begin, end - begin);
@@ -108,6 +108,13 @@ void TestReport() {
     Check(Count(report, " decode drains") == 1, "pipeline decode-drain counters were printed more than once");
     Check(report.find("; drains:") != std::string::npos, "pipeline drain counters were lost");
     Check(report.find("packet drains by opcode:") != std::string::npos, "pipeline opcode counters were lost");
+    if (!DrawPipeline::Flat()) return;
+    const auto transport = capture.ReadReport("[transport] ");
+    std::cout << transport << '
+';
+    Check(transport.find(" committer queue: 2 elements (0 wider than a flat record), 0 waits for room,") != std::string::npos, "the elements of the flat committer queue were not counted");
+    Check(transport.find(" 1 overlap queries over 1 records (0 under the wide-record lock);") != std::string::npos, "the queries on the flat committer queue were not counted");
+    Check(transport.find(" finisher queue: 0 elements ") != std::string::npos, "the flat finisher queue was not reported");
 }
 
 }

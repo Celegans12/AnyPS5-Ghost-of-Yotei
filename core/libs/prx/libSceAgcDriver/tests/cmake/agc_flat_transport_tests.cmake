@@ -1,0 +1,10 @@
+add_test_executable(agc_flat_transport_tests EXCLUDE_FROM_ALL tests/FlatTransport.cpp)
+target_include_directories(agc_flat_transport_tests PRIVATE ${LIBS_INCLUDE_DIR})
+set_target_properties(agc_flat_transport_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(agc_flat_transport_tests)
+
+if(BUILD_TESTING)
+    set_target_properties(agc_flat_transport_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_flat_transport COMMAND agc_flat_transport_tests)
+    set_tests_properties(agc_flat_transport PROPERTIES TIMEOUT 30)
+endif()
