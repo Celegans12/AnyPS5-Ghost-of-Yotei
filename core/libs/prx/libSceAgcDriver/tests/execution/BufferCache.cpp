@@ -43,6 +43,8 @@ public:
     std::uint64_t polls = 0;
     bool tracked = true;
     std::unordered_set<std::uint64_t> volatileBlocks;
+    std::unordered_set<std::uint64_t> armedBlocks;
+    std::unordered_map<std::uint64_t, std::uint16_t> pageMasks;
 
     void Note(std::uint64_t address, std::size_t bytes) {
         ++generation;
@@ -57,8 +59,13 @@ public:
         ++polls;
         if (!tracked) return false;
         for (std::size_t block = 0; block < tokens.size(); ++block) {
-            written[block] = changed(address / Granule + block, tokens[block]) ? BufferCache::EveryPage : std::uint16_t{0};
-            if (written[block] != 0) tokens[block] = generation;
+            const auto index = address / Granule + block;
+            written[block] = 0;
+            if (!changed(index, tokens[block])) continue;
+            const auto mask = pageMasks.find(index);
+            written[block] = mask != pageMasks.end() ? mask->second : BufferCache::EveryPage;
+            if (mask != pageMasks.end()) pageMasks.erase(mask);
+            tokens[block] = armedBlocks.contains(index) ? generation | BufferCache::ArmedToken : generation;
         }
         return true;
     }
@@ -76,9 +83,10 @@ public:
 
 private:
     bool changed(std::uint64_t block, std::uint64_t token) const {
-        if (token == 0) return true;
+        const auto stamp = token & ~BufferCache::ArmedToken;
+        if (stamp == 0) return true;
         const auto found = stamps.find(block);
-        return found != stamps.end() && found->second > token;
+        return found != stamps.end() && found->second > stamp;
     }
 
     std::uint64_t generation = 1;
@@ -376,6 +384,39 @@ void VolatileBlocksAreLeftToTheStream(Harness& harness, std::uint64_t base) {
     Require(back && Same(back, address, bytes) && after.streamReturns == before.streamReturns + 1, "a block was not taken back from the stream once its rest ended");
 }
 
+void OnlyTheRewrittenPagesOfARestingBlockAreStreamed(Harness& harness, std::uint64_t base) {
+    const auto address = base + 26 * Granule;
+    const std::size_t bytes = 4 * Page;
+    const std::size_t wideBytes = 5 * Granule;
+    const auto block = address / Granule;
+    harness.Finish();
+    Fill(address, wideBytes, 97);
+    harness.writes.Note(address, wideBytes);
+    harness.writes.armedBlocks.insert(block);
+    Require(static_cast<bool>(harness.Acquire(address, bytes)), "an armed block was not served");
+    harness.Finish();
+    Fill(address + Page, 16, 98);
+    harness.writes.Note(address + Page, 16);
+    harness.writes.pageMasks[block] = 2;
+    auto before = BufferCache::Counted();
+    const auto second = harness.Acquire(address, bytes);
+    auto after = BufferCache::Counted();
+    Require(second && Same(second, address, bytes) && after.pages == before.pages + 1, "a block armed again uploaded more than its written page");
+    harness.Finish();
+    harness.writes.armedBlocks.erase(block);
+    harness.writes.volatileBlocks.insert(block);
+    harness.writes.Note(address, bytes);
+    before = after;
+    const auto stable = harness.Acquire(address + 2 * Page, 2 * Page);
+    after = BufferCache::Counted();
+    Require(stable && Same(stable, address + 2 * Page, 2 * Page) && after.streamSwitches == before.streamSwitches + 1, "pages of a resting block that are not rewritten were left to the stream");
+    const auto hot = harness.Acquire(address + Page, Page);
+    Require(!hot && hot.streamed, "the rewritten page of a resting block was not left to the stream");
+    const auto wide = harness.Acquire(address, wideBytes);
+    Require(wide && Same(wide, address, wideBytes), "a range wider than the stream serves was left to it");
+    harness.writes.volatileBlocks.erase(block);
+}
+
 void TrackedWritesReachTheMirror(std::uint64_t base) {
     std::uint64_t handles = 0;
     BufferCache cache([&handles](std::size_t bytes) { return AllocateBacking(handles, bytes); }, [](std::uint64_t) { return true; }, BufferCache::TrackerSource());
@@ -576,6 +617,7 @@ int main() {
         VerificationTellsALostWriteFromALaterOne(harness, base);
         PageSharedWithAPendingWriteIsComparedInPart(harness, base);
         VolatileBlocksAreLeftToTheStream(harness, base);
+        OnlyTheRewrittenPagesOfARestingBlockAreStreamed(harness, base);
         if (GuestMemory::Watched(base, bytes)) {
             TrackedWritesReachTheMirror(base);
             ArmedBlocksAnswerWithoutTheTracker(base);

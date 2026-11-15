@@ -26,6 +26,7 @@ public:
     static constexpr std::uint64_t AddressLimit = std::uint64_t{1} << 47u;
     static constexpr std::size_t DerivedEntries = 8192;
     static constexpr std::uint64_t StreamRest = 128;
+    static constexpr std::uint64_t StreamSpan = 4 * GranuleBytes;
 
     class Source {
     public:
@@ -143,6 +144,7 @@ private:
         std::uint64_t sequence = 0;
         std::uint64_t streamUntil = 0;
         std::uint16_t valid = 0;
+        std::uint16_t hot = 0;
     };
     struct Mirror {
         std::uint64_t id = 0;

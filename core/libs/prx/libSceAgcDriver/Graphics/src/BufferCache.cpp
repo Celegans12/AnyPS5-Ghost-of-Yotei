@@ -553,6 +553,15 @@ BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes,
         refused.streamed = true;
         return refused;
     };
+    const bool narrow = stop - first <= StreamSpan;
+    const auto rewritten = [&](const Granule& granule, std::size_t block) {
+        if (!narrow) return false;
+        if (granule.hot == 0) return true;
+        const auto base = mirror->begin + (firstGranule + block) * GranuleBytes;
+        const auto low = static_cast<unsigned>((std::max(first, base) - base) / PageBytes);
+        const auto high = static_cast<unsigned>((std::min(stop, base + GranuleBytes) - base) / PageBytes);
+        return (granule.hot & ((1u << high) - 1u) & ~((1u << low) - 1u)) != 0;
+    };
     held.resize(blocks);
     bool streamed = false;
     for (std::size_t block = 0; block < blocks; ++block) {
@@ -560,26 +569,28 @@ BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes,
         held[block] = granule.token.load(std::memory_order_acquire);
         if (granule.streamUntil == 0) continue;
         if (serial < granule.streamUntil) {
-            streamed = true;
+            streamed = streamed || rewritten(granule, block);
             continue;
         }
         granule.streamUntil = 0;
+        granule.hot = 0;
         add(counted.streamReturns);
     }
     if (streamed) return leave();
     tokens = held;
     written.assign(blocks, EveryPage);
     if (!source.Poll(first, static_cast<std::size_t>(stop - first), tokens, written)) return Refuse(Refusal::Untracked);
-    if (Streaming()) {
-        for (std::size_t block = 0; block < blocks; ++block) {
-            if ((written[block] == 0 && held[block] != 0) || (tokens[block] & ArmedToken) != 0) continue;
-            if (!source.Volatile(mirror->begin + (firstGranule + block) * GranuleBytes)) continue;
-            mirror->granules[firstGranule + block].streamUntil = serial + StreamRest;
-            add(counted.streamSwitches);
-            streamed = true;
-        }
-        if (streamed) return leave();
+    for (std::size_t block = 0; block < blocks; ++block) {
+        auto& granule = mirror->granules[firstGranule + block];
+        if ((held[block] & ArmedToken) != 0 && written[block] != 0 && written[block] != EveryPage) granule.hot = static_cast<std::uint16_t>(granule.hot | written[block]);
+        if (!Streaming() || granule.streamUntil != 0) continue;
+        if ((written[block] == 0 && held[block] != 0) || (tokens[block] & ArmedToken) != 0) continue;
+        if (!source.Volatile(mirror->begin + (firstGranule + block) * GranuleBytes)) continue;
+        granule.streamUntil = serial + StreamRest;
+        add(counted.streamSwitches);
+        streamed = streamed || rewritten(granule, block);
     }
+    if (streamed) return leave();
     pendingFloor = std::numeric_limits<std::uint64_t>::max();
     const auto shared = [&](std::uint64_t page) { return (partialHead && page == first) || (partialTail && page + PageBytes == stop); };
     std::uint64_t newest = 0;
