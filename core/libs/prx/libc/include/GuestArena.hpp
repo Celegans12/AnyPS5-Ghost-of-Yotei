@@ -29,6 +29,7 @@ struct MappingLockSiteCounts {
 struct MappingLockCounts {
     MappingLockSiteCounts sites[MappingLockSites];
     std::uint64_t forgets[MappingForgetOutcomes] = {};
+    std::uint64_t unlocked = 0;
 };
 
 enum class PageTrackReason : std::uint64_t { Armable = 0, Armed, Disabled, Edge, Held, Imported, Barred, Resting, Faulted, Busy, GpuWritten };

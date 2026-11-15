@@ -7,6 +7,8 @@ if(BUILD_TESTING)
     set_tests_properties(guest_owned_memory PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(guest_owned_memory PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        add_test(NAME guest_owned_memory_no_unlocked_mapping_reads COMMAND guest_owned_memory_tests)
+        set_tests_properties(guest_owned_memory_no_unlocked_mapping_reads PROPERTIES TIMEOUT 30 ENVIRONMENT "APS5_NO_UNLOCKED_MAPPING_READS=1" ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
     if(WIN32)

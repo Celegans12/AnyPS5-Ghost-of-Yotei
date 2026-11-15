@@ -68,6 +68,7 @@ public:
     MappingLockCounts LockCounted() const {
         auto counts = mutex.Counted();
         for (std::size_t outcome = 0; outcome < MappingForgetOutcomes; ++outcome) counts.forgets[outcome] = forgetOutcomes[outcome].load(std::memory_order_relaxed);
+        counts.unlocked = unlockedAnswers.load(std::memory_order_relaxed);
         return counts;
     }
 
@@ -611,7 +612,10 @@ public:
             if (!ownable(block, flags)) return false;
         }
         disown(first, end + 1);
-        while (ownedWords.size() > ownedEntryLimit - count) ownedWords.erase(ownedWords.begin());
+        while (ownedWords.size() > ownedEntryLimit - count) {
+            publishOwned(ownedWords.begin()->first, 0);
+            ownedWords.erase(ownedWords.begin());
+        }
         for (auto block = first; block < end; block += ownedBlockBytes) {
             auto& pending = ownedPending[block];
             auto run = residentRuns.upper_bound(block);
@@ -626,29 +630,54 @@ public:
             if (pending == 0) ownedPending.erase(block);
         }
         for (auto block = first; block < end; block += ownedBlockBytes) {
-            ownedWords[block] = nextOwned++;
+            const auto word = nextOwned++;
+            ownedWords[block] = word;
+            publishOwned(block, word);
         }
         for (auto block = first; block < end; block += ownedBlockBytes) words[(block - first) / ownedBlockBytes] = ownedWords.at(block);
         return true;
     }
 
     bool OwnedUnchanged(std::uintptr_t address, std::size_t bytes, const std::uint64_t* words, std::size_t count) {
-        std::lock_guard lock(mutex);
         if (words == nullptr || !ownedRange(address, bytes, count)) return false;
         const auto first = address & ~(ownedBlockBytes - 1);
         const auto end = (address + bytes - 1) | (ownedBlockBytes - 1);
-        for (auto block = first; block < end; block += ownedBlockBytes) {
-            const auto found = ownedWords.find(block);
-            if (found == ownedWords.end() || found->second != words[(block - first) / ownedBlockBytes]) return false;
+        if (!unlockedReads()) {
+            std::lock_guard lock(mutex);
+            for (auto block = first; block < end; block += ownedBlockBytes) {
+                const auto found = ownedWords.find(block);
+                if (found == ownedWords.end() || found->second != words[(block - first) / ownedBlockBytes]) return false;
+                std::array<void*, ownedBlockBytes / 4096> written{};
+                ULONG_PTR reported = written.size();
+                DWORD granularity = 0;
+                if (watchWrites(0, reinterpret_cast<void*>(block), ownedBlockBytes, written.data(), &reported, &granularity) != 0 || reported != 0) {
+                    publishOwned(block, 0);
+                    ownedWords.erase(found);
+                    return false;
+                }
+            }
+            return true;
+        }
+        bool held = true;
+        for (auto block = first; held && block < end; block += ownedBlockBytes) {
+            const auto word = words[(block - first) / ownedBlockBytes];
+            const auto* slot = ownedSlot(block, false);
+            if (word == 0 || slot == nullptr || slot->load() != word) {
+                held = false;
+                break;
+            }
             std::array<void*, ownedBlockBytes / 4096> written{};
             ULONG_PTR reported = written.size();
             DWORD granularity = 0;
-            if (watchWrites(0, reinterpret_cast<void*>(block), ownedBlockBytes, written.data(), &reported, &granularity) != 0 || reported != 0) {
-                ownedWords.erase(found);
+            const auto result = timedWatch(0, reinterpret_cast<void*>(block), ownedBlockBytes, written.data(), &reported, &granularity);
+            if (result != 0 || reported != 0) {
+                forfeitOwned(block, word, written.data(), result == 0 ? reported : 0);
                 return false;
             }
+            held = slot->load() == word;
         }
-        return true;
+        unlockedAnswers.fetch_add(1, std::memory_order_relaxed);
+        return held;
     }
 
     void GpuWrite(std::uintptr_t address, std::size_t bytes) {
@@ -962,7 +991,52 @@ private:
 
     void disown(std::uintptr_t first, std::uintptr_t end) {
         if (end <= first) return;
-        ownedWords.erase(ownedWords.lower_bound(first & ~(ownedBlockBytes - 1)), ownedWords.lower_bound(end));
+        const auto from = ownedWords.lower_bound(first & ~(ownedBlockBytes - 1));
+        const auto to = ownedWords.lower_bound(end);
+        for (auto it = from; it != to; ++it) publishOwned(it->first, 0);
+        ownedWords.erase(from, to);
+    }
+
+    static bool unlockedReads() {
+        static const bool unlocked = std::getenv("APS5_NO_UNLOCKED_MAPPING_READS") == nullptr;
+        return unlocked;
+    }
+
+    std::atomic<std::uint64_t>* ownedSlot(std::uintptr_t block, bool create) {
+        const auto index = block / ownedBlockBytes;
+        if (index / zeroLeafBlocks >= zeroLeaves) return nullptr;
+        auto& slot = ownedTable[index / zeroLeafBlocks];
+        auto* leaf = slot.load();
+        if (leaf == nullptr) {
+            if (!create) return nullptr;
+            leaf = new OwnedLeaf();
+            slot.store(leaf);
+        }
+        return &(*leaf)[index % zeroLeafBlocks];
+    }
+
+    void publishOwned(std::uintptr_t block, std::uint64_t word) {
+        if (auto* slot = ownedSlot(block, word != 0)) slot->store(word);
+    }
+
+    void forfeitOwned(std::uintptr_t block, std::uint64_t word, void* const* written, ULONG_PTR reported) {
+        const SiteLock lock(mutex, LockSite::Other, block, block + ownedBlockBytes);
+        if (const auto found = ownedWords.find(block); found != ownedWords.end() && found->second == word) {
+            publishOwned(block, 0);
+            ownedWords.erase(found);
+        }
+        for (ULONG_PTR index = 0; index < reported; ++index) {
+            const auto page = reinterpret_cast<std::uintptr_t>(written[index]) & ~std::uintptr_t{4095};
+            forgetZero(page, page + 4096);
+        }
+    }
+
+    static UINT timedWatch(DWORD flags, void* address, std::size_t bytes, void** pages, ULONG_PTR* count, DWORD* granularity) {
+        const bool timed = timeWriteWatch.load(std::memory_order_relaxed);
+        const auto started = timed ? __builtin_ia32_rdtsc() : 0;
+        const auto result = GetWriteWatch(flags, address, bytes, pages, count, granularity);
+        if (timed) noteWatchCost(__builtin_ia32_rdtsc() - started);
+        return result;
     }
 
     bool ownable(std::uintptr_t block, unsigned flags) {
@@ -1145,10 +1219,7 @@ private:
     UINT watchWrites(DWORD flags, void* address, std::size_t bytes, void** pages, ULONG_PTR* count, DWORD* granularity, bool dropZero = false, bool aloft = false) {
         const auto capacity = *count;
         const auto flight = aloft ? mutex.TakeOff(reinterpret_cast<std::uintptr_t>(address), reinterpret_cast<std::uintptr_t>(address) + bytes) : SiteMutex::Grounded;
-        const bool timed = timeWriteWatch.load(std::memory_order_relaxed);
-        const auto started = timed ? __builtin_ia32_rdtsc() : 0;
-        const auto result = GetWriteWatch(flags, address, bytes, pages, count, granularity);
-        if (timed) noteWatchCost(__builtin_ia32_rdtsc() - started);
+        const auto result = timedWatch(flags, address, bytes, pages, count, granularity);
         if (flight != SiteMutex::Grounded) mutex.Land(flight);
         if (result != 0 || zeroPages.empty()) return result;
         const auto first = reinterpret_cast<std::uintptr_t>(address) & ~std::uintptr_t{4095};
@@ -1516,6 +1587,8 @@ private:
     static constexpr std::size_t zeroUnlockedBlocks = std::size_t{1} << 12;
     static_assert(chunkBytes % zeroBlockBytes == 0 && zeroBlockBytes / 4096 <= 64 && 64 % (zeroBlockBytes / 4096) == 0, "a known zero block is one aligned field of a chunk word");
     using ZeroLeaf = std::array<std::atomic<std::uint8_t>, zeroLeafBlocks>;
+    static_assert(ownedBlockBytes == zeroBlockBytes, "the published owned words are laid out like the known zero counts");
+    using OwnedLeaf = std::array<std::atomic<std::uint64_t>, zeroLeafBlocks>;
     struct SharedPage {
         std::array<std::uint64_t, subpages> generation = [] {
             std::array<std::uint64_t, subpages> initial{};
@@ -2327,6 +2400,8 @@ private:
     SiteMutex mutex;
     std::array<std::atomic<std::uint64_t>, MappingForgetOutcomes> forgetOutcomes{};
     std::array<std::atomic<ZeroLeaf*>, zeroLeaves> zeroCounts{};
+    std::array<std::atomic<OwnedLeaf*>, zeroLeaves> ownedTable{};
+    std::atomic<std::uint64_t> unlockedAnswers{0};
     WindowsPageTrack& track = WindowsPageTrack::Get();
     HANDLE zeroSection = nullptr;
     AllocateFunction allocate = nullptr;

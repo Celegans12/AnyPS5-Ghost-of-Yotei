@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <source_location>
 #include <stdexcept>
@@ -263,6 +264,81 @@ static void CheckWriterAndCollector() {
     writer.join();
     Require(exact);
 }
+
+static void CheckUnlockedReads() {
+    const bool unlocked = std::getenv("APS5_NO_UNLOCKED_MAPPING_READS") == nullptr;
+    const auto other = static_cast<std::size_t>(Mappings::LockSite::Other);
+    Memory memory(2 * blockBytes);
+    auto& mappings = memory.mappings;
+    const auto taken = [&] { return mappings.LockCounted().sites[other].acquisitions; };
+    const auto answered = [&] { return mappings.LockCounted().unlocked; };
+    std::array<std::uint64_t, 2> words{};
+    Require(memory.Arm(words.data()));
+    auto locks = taken();
+    auto answers = answered();
+    Require(memory.Same(words.data()));
+    Require(taken() == locks + (unlocked ? 0u : 1u) && answered() == answers + (unlocked ? 1u : 0u));
+    const std::array<std::uint64_t, 2> stale{words[0], words[1] + 1};
+    const std::array<std::uint64_t, 2> blank{};
+    locks = taken();
+    Require(!memory.Same(stale.data()) && !memory.Same(blank.data()));
+    Require(taken() == locks + (unlocked ? 0u : 2u));
+    Require(memory.Same(words.data()));
+    memory.base[blockBytes + 8192] = 3;
+    locks = taken();
+    answers = answered();
+    Require(!memory.Same(words.data()));
+    Require(taken() == locks + 1 && answered() == answers);
+    Require(mappings.OwnedUnchanged(memory.Address(), blockBytes, words.data(), 1));
+    locks = taken();
+    Require(!mappings.OwnedUnchanged(memory.Address() + blockBytes, blockBytes, &words[1], 1));
+    Require(taken() == locks + (unlocked ? 0u : 1u));
+    const auto old = words[0];
+    Require(memory.Arm(words.data()) && words[0] != old);
+    Require(!mappings.OwnedUnchanged(memory.Address(), blockBytes, &old, 1) && memory.Same(words.data()));
+    memory.Collect(true);
+    Require(!memory.Same(words.data()));
+    Require(memory.Arm(words.data()) && memory.Same(words.data()));
+    mappings.Pin(memory.Address(), blockBytes);
+    Require(!memory.Same(words.data()) && mappings.OwnedUnchanged(memory.Address() + blockBytes, blockBytes, &words[1], 1));
+    mappings.Unpin(memory.Address(), blockBytes);
+    const auto address = memory.Address();
+    mappings.Reset(memory.base, memory.bytes);
+    Require(!mappings.OwnedUnchanged(address + blockBytes, blockBytes, &words[1], 1));
+}
+
+static void CheckUnlockedProofRaces() {
+    Memory memory;
+    memory.Collect(true);
+    std::atomic<std::uint64_t> armed{0};
+    std::atomic<bool> written{false};
+    std::atomic<bool> stop{false};
+    std::atomic<bool> missed{false};
+    std::thread reader([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            const auto word = armed.load(std::memory_order_acquire);
+            const bool after = written.load(std::memory_order_acquire);
+            if (word != 0 && memory.Same(&word) && after) missed.store(true, std::memory_order_release);
+        }
+    });
+    bool exact = true;
+    for (unsigned round = 1; round <= 2000 && exact; ++round) {
+        written.store(false, std::memory_order_release);
+        std::uint64_t word = 0;
+        exact &= memory.Arm(&word);
+        armed.store(word, std::memory_order_release);
+        memory.base[(round % 16) * 4096] = static_cast<unsigned char>(round);
+        written.store(true, std::memory_order_release);
+        std::array<void*, 16> pages{};
+        std::size_t count = pages.size();
+        exact &= memory.mappings.Collect(memory.Address(), memory.bytes, pages.data(), &count, true) && count == 1;
+        exact &= !memory.Same(&word);
+    }
+    stop.store(true, std::memory_order_release);
+    reader.join();
+    Require(exact);
+    Require(!missed.load(std::memory_order_acquire));
+}
 #endif
 
 static void CheckExports() {
@@ -299,6 +375,8 @@ int main() {
         CheckEviction();
         CheckRefusals();
         CheckWriterAndCollector();
+        CheckUnlockedReads();
+        CheckUnlockedProofRaces();
 #endif
         CheckExports();
         std::puts("owned guest memory checks passed");
