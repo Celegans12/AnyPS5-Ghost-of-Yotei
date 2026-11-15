@@ -454,7 +454,8 @@ public:
     }
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes, bool store = true) {
-        std::lock_guard lock(mutex);
+        const bool ranged = rangedHostWrites();
+        const SiteLock lock(mutex, LockSite::Other, ranged ? address : 0, ranged ? address + bytes : UINTPTR_MAX);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
         for (auto it = first; it != views.end() && it->first < end; ++it) {
@@ -484,7 +485,8 @@ public:
     }
 
     void EndHostWrite(std::uintptr_t address, std::size_t bytes, bool store = true) {
-        std::lock_guard lock(mutex);
+        const bool ranged = rangedHostWrites();
+        const SiteLock lock(mutex, LockSite::Other, ranged ? address : 0, ranged ? address + bytes : UINTPTR_MAX);
         const auto end = address + bytes;
         disown(address, end);
         eraseOwnedRange(ownedHostAccess, address, end);
@@ -1010,6 +1012,11 @@ private:
         const auto to = ownedWords.lower_bound(end);
         for (auto it = from; it != to; ++it) publishOwned(it->first, 0);
         ownedWords.erase(from, to);
+    }
+
+    static bool rangedHostWrites() {
+        static const bool ranged = std::getenv("APS5_NO_RANGED_HOST_WRITES") == nullptr;
+        return ranged;
     }
 
     static bool unlockedReads() {

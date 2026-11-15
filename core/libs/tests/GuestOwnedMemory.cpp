@@ -340,6 +340,45 @@ static void CheckUnlockedProtection() {
     Require(mappings.Protection(again.Address() + blockBytes - 1, &protection) && protection == PAGE_READWRITE);
 }
 
+static void CheckRangedHostWrites() {
+    const auto other = static_cast<std::size_t>(Mappings::LockSite::Other);
+    Memory memory(blockBytes, false);
+    Memory collected(4 * blockBytes, false);
+    auto& mappings = memory.mappings;
+    memory.Collect(true);
+    collected.Collect(true);
+    std::atomic<bool> stop{false};
+    std::atomic<bool> failed{false};
+    std::thread collector([&] {
+        std::array<void*, 64> pages{};
+        while (!stop.load(std::memory_order_acquire)) {
+            collected.base[blockBytes] = 1;
+            std::size_t count = pages.size();
+            if (!mappings.Collect(collected.Address(), collected.bytes, pages.data(), &count, true) || count != 1) failed.store(true, std::memory_order_release);
+        }
+    });
+    const auto before = mappings.LockCounted().sites[other].acquisitions;
+    constexpr unsigned rounds = 4000;
+    bool exact = true;
+    for (unsigned round = 0; round < rounds; ++round) {
+        const auto offset = (round % 15) * 4096 + 7;
+        std::uint64_t word = 0;
+        exact &= mappings.BeginHostWrite(memory.Address() + offset, 4096);
+        exact &= !memory.Arm(&word, Mappings::OwnedPrivate);
+        memory.base[offset] = static_cast<unsigned char>(round);
+        mappings.EndHostWrite(memory.Address() + offset, 4096);
+        exact &= memory.Arm(&word, Mappings::OwnedPrivate);
+    }
+    const auto after = mappings.LockCounted().sites[other].acquisitions;
+    stop.store(true, std::memory_order_release);
+    collector.join();
+    Require(exact);
+    Require(!failed.load(std::memory_order_acquire));
+    Require(after - before == 4u * rounds);
+    const auto pages = memory.Collect(true);
+    Require(!pages.empty());
+}
+
 static void CheckUnlockedProofRaces() {
     Memory memory;
     memory.Collect(true);
@@ -411,6 +450,7 @@ int main() {
         CheckUnlockedReads();
         CheckUnlockedProtection();
         CheckUnlockedProofRaces();
+        CheckRangedHostWrites();
 #endif
         CheckExports();
         std::puts("owned guest memory checks passed");
