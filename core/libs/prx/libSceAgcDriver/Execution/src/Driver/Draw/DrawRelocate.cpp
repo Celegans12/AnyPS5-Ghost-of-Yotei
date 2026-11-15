@@ -148,7 +148,7 @@ void Driver::tagUserLeafWords(DispatchVariant& variant, const ShaderRecompiler::
         const auto index = plan.descriptorUserWords[pair + 1];
         if ((dword != 0u && dword != 2u) || index < program.hiddenUserWords || index >= program.userData.size() || index >= 64u) continue;
         const auto bit = std::uint64_t {1} << index;
-        if (((variant.relocatableWords | variant.valueWords | variant.calleeWords | variant.vertexTableWords) & bit) != 0 || (variant.userWordsAsValue & bit) == 0 || ((variant.userWordsWalked ^ variant.userWordsAsValue) & bit) != 0) continue;
+        if (((variant.relocatableWords | variant.valueWords | variant.calleeWords | variant.vertexTableWords) & bit) != 0 || (variant.userWordsAsValue & bit) == 0 || (variant.userWordsAsBase & bit) != 0) continue;
         slots.clear();
         bool refused = false;
         for (std::uint32_t binding = 0; binding < bindings.size() && !refused; ++binding) {
@@ -177,6 +177,7 @@ void Driver::tagUserLeafWords(DispatchVariant& variant, const ShaderRecompiler::
 void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied) {
     variant.userWordsWalked = use.asBase | use.asValue;
     variant.userWordsAsValue = use.asValue;
+    variant.userWordsAsBase = use.asBase;
     std::uint64_t relocatable = eligible && drawRelocationEnabled() ? use.asBase & ~use.asValue : 0;
     if (hiddenWords != 0) relocatable &= hiddenWords >= 64 ? 0 : ~((std::uint64_t {1} << hiddenWords) - 1);
     std::vector<std::pair<std::uint64_t, std::int32_t>> reads;

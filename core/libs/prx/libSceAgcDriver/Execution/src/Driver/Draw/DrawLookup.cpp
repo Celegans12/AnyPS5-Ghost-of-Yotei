@@ -132,7 +132,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::uint64_t stageValidations = 0, stageEqual = 0, compared = 0, imagesFlushed = 0, runsSynced = 0, dataStages = 0, dataWords = 0;
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
             auto* live = drawStageDataHits() ? &liveData : nullptr;
-            std::vector<std::shared_ptr<DispatchVariant>> patchedFrom(programs.size());
+            std::vector<std::shared_ptr<DispatchVariant>> patchedFrom;
             std::uint64_t bufferStages = 0;
             if (entry->stages.size() != programs.size()) miss = DrawMiss::Stages;
 
@@ -180,6 +180,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                                 applyShaderDataPatches(*served);
                                 regions.clear();
                                 appendEntryRegions(*served, regions);
+                                if (patchedFrom.empty()) patchedFrom.resize(programs.size());
                                 patchedFrom[i] = variant;
                                 result = EntryOutcome::Equal;
                                 ++bufferStages;
@@ -240,7 +241,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             if (ranks[i] == 0) continue;
                             auto& variants = rotated->stages[i];
                             variants.erase(variants.begin() + static_cast<std::ptrdiff_t>(ranks[i]));
-                            variants.insert(variants.begin(), patchedFrom[i] != nullptr ? patchedFrom[i] : matched[i]);
+                            variants.insert(variants.begin(), !patchedFrom.empty() && patchedFrom[i] != nullptr ? patchedFrom[i] : matched[i]);
                         }
                         rotated->touched = entry->touched;
                         rotated->order = entry->order;
