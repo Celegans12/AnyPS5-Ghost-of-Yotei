@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/DirectHeap.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
 #include "RuntimeAbi.hpp"
 #include "ImageTableAbi.hpp"
@@ -207,8 +208,10 @@ struct DirectImageAccess {
 };
 
 DirectImageAccess& threadDirectImages() {
-    thread_local DirectImageAccess access;
-    return access;
+    // Thread scratch, not thread_local: a thread_local object with a destructor can be destroyed
+    // after its memory is gone when a MinGW thread exits (seen on the draw committer).
+    struct Slot {};
+    return ThreadScratch<DirectImageAccess, Slot>();
 }
 
 void noteDirectImage(const StorageTexture* image, bool written) {
@@ -269,7 +272,8 @@ bool SlotMemoEnabled() {
 }
 
 SlotMemo& ThreadSlotMemo() {
-    thread_local SlotMemo memo;
+    struct Slot {};
+    auto& memo = ThreadScratch<SlotMemo, Slot>();
     if (!SlotMemoEnabled()) return memo;
     const auto epoch = GuestMemory::CollectEpoch();
     const auto proof = GuestMemory::ProofSerial();
@@ -305,13 +309,14 @@ struct TableMirrorTotals {
 };
 
 TableMirrorTotals& tableMirrorTotals() {
-    thread_local TableMirrorTotals totals;
-    return totals;
+    struct Slot {};
+    return ThreadScratch<TableMirrorTotals, Slot>();
 }
 
 const TableMirror* tableMirrorFor(const Context& context, DirectHeap& heap, const ShaderRecompiler::RecompileResult& program) {
     namespace Abi = ShaderRecompiler::ImageTableAbi;
-    thread_local std::map<const ShaderRecompiler::ResolvedImageTables*, TableMirror> mirrors;
+    struct MirrorSlot {};
+    auto& mirrors = ThreadScratch<std::map<const ShaderRecompiler::ResolvedImageTables*, TableMirror>, MirrorSlot>();
     const auto& resolved = *program.directTables;
     const auto epoch = GuestMemory::CollectEpoch();
     const auto proof = GuestMemory::ProofSerial();
@@ -343,7 +348,8 @@ const TableMirror* tableMirrorFor(const Context& context, DirectHeap& heap, cons
         std::uint64_t epoch = 0;
         std::map<std::pair<std::uint32_t, std::array<std::uint32_t, 8>>, std::pair<std::shared_ptr<Texture>, std::uint32_t>> entries;
     };
-    thread_local ElementMemo elementMemo;
+    struct ElementSlot {};
+    auto& elementMemo = ThreadScratch<ElementMemo, ElementSlot>();
     if (elementMemo.epoch != epoch || epoch == 0) {
         elementMemo.entries.clear();
         elementMemo.epoch = epoch;
@@ -437,7 +443,8 @@ bool ResolveDirectStages(const Context& context, std::span<const CompiledShader>
             std::uint64_t mapHash = 0;
             std::shared_ptr<ShaderRecompiler::RecompileResult> patched;
         };
-        thread_local std::array<PatchedTableStage, 64> patchedTables;
+        struct PatchedSlot {};
+        auto& patchedTables = ThreadScratch<std::array<PatchedTableStage, 64>, PatchedSlot>();
         const TableMirror* tableMirror = nullptr;
         if (program->directTables != nullptr && program->directSlotRequests.empty()) {
             tableMirror = tableMirrorFor(context, heap, *program);

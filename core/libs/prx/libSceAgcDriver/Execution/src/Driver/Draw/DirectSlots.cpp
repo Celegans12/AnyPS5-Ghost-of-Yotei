@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DirectSlots.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DirectHeap.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "IntermediateRepresentation/IrMetadata/BufferFormat.hpp"
 #include "IntermediateRepresentation/IrProgram.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
@@ -37,7 +38,9 @@ bool BuildDirectSlotRequests(const ShaderRecompiler::CompiledShaderInfo& compile
     const auto& layout = compiled.bindings;
     requests.clear();
     requests.reserve(static_cast<std::size_t>(layout.directSlotCount) * Request::Words);
-    thread_local std::vector<std::uint32_t> modeOf;
+    // Thread scratch, not thread_local (a destructor at a MinGW thread's exit).
+    struct ModeSlot {};
+    auto& modeOf = ThreadScratch<std::vector<std::uint32_t>, ModeSlot>();
     modeOf.assign(info.images.size(), 0xffffffffu);
     std::size_t slots = 0;
     for (const auto& binding : layout.descriptors) {

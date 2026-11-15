@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
@@ -288,7 +289,9 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
                 std::weak_ptr<const ShaderRecompiler::ResolvedImageTables> tables;
                 std::shared_ptr<const ShaderRecompiler::RecompileResult> stage;
             };
-            thread_local std::array<TableStageMemo, 64> tableStages;
+            // Thread scratch, not thread_local (a destructor at a MinGW thread's exit).
+            struct TableStageSlot {};
+            auto& tableStages = ThreadScratch<std::array<TableStageMemo, 64>, TableStageSlot>();
             auto& slot = tableStages[(reinterpret_cast<std::uintptr_t>(base.get()) >> 4u) % tableStages.size()];
             // Only table-only stages: slot requests come from this capture's image words, which the
             // materialized result does not pin.
