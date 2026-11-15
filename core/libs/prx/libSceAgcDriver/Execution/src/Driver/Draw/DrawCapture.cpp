@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -401,7 +402,7 @@ bool Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
         }
         insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr, registerKey && drawDataHits() ? shapeKey : 0, replaceShape);
         if (relocation.key != 0) {
-            std::lock_guard cacheLock(drawCacheMutex);
+            const ContendedLock cacheLock(drawCacheMutex);
             learnRelocation(relocation);
         }
         std::uint64_t dataInserts = 0, dataPositions = 0;
@@ -411,7 +412,7 @@ bool Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             dataPositions += fresh[i]->dataPositions.size();
         }
         if (unstable != 0 || mismatches != 0 || differingSameRuns != 0 || differingRunsChanged != 0 || dataInserts != 0) {
-            std::lock_guard cacheLock(drawCacheMutex);
+            const ContendedLock cacheLock(drawCacheMutex);
             drawEntryCounters.stageDataInserts += dataInserts;
             drawEntryCounters.stageDataPositions += dataPositions;
             drawEntryCounters.unstable += unstable;

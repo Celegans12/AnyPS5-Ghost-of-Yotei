@@ -353,7 +353,7 @@ void noteLaterLookup() {
     if (!stats) return;
     const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
     if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
-    AgcDriver::ProfilePrint_nid_no_patch("[finisher-lookup] (10 s): %llu draws looked up on the draw finisher, %llu of them hits, %llu queued without the ranges they write because a program stores to memory; %llu lookups repeated on the finisher (APS5_VERIFY_FINISHER_LOOKUP), %llu differing\n", static_cast<unsigned long long>(laterLookups.exchange(0)), static_cast<unsigned long long>(laterLookupHits.exchange(0)), static_cast<unsigned long long>(laterLookupsUnknown.exchange(0)), static_cast<unsigned long long>(laterLookupsVerified.exchange(0)), static_cast<unsigned long long>(laterLookupsDiffering.exchange(0)));
+    AgcDriver::ProfilePrint_nid_no_patch("[finisher-lookup] (10 s): %llu draws looked up on the draw finisher, %llu of them hits, %llu queued without the ranges they write because a program stores to memory; %llu lookups repeated on the finisher (APS5_VERIFY_FINISHER_LOOKUP), %llu differing%s\n", static_cast<unsigned long long>(laterLookups.exchange(0)), static_cast<unsigned long long>(laterLookupHits.exchange(0)), static_cast<unsigned long long>(laterLookupsUnknown.exchange(0)), static_cast<unsigned long long>(laterLookupsVerified.exchange(0)), static_cast<unsigned long long>(laterLookupsDiffering.exchange(0)), DrawFinisher::LookupText().c_str());
 }
 
 DrawFinisher::Pending heldWritesAhead(const DrawTail& tail) {
@@ -601,7 +601,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         bool aliasFirst = false;
         if (drawRelocationEnabled()) {
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
-            std::lock_guard cacheLock(drawCacheMutex);
+            const ContendedLock cacheLock(drawCacheMutex);
             const auto known = drawRelocations.find(drawIdentity);
             if (known != drawRelocations.end()) {
                 auto& trial = drawRelocationTrials[drawIdentity];
@@ -620,7 +620,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (DrawFinisher::Busy()) {
             bool shapeMatters = false;
             if (DrawFinisher::Overlap() && drawDataHits()) {
-                std::lock_guard peekLock(drawCacheMutex);
+                const ContendedLock peekLock(drawCacheMutex);
                 const auto shape = drawShapes.find(shapeKey);
                 shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || std::none_of(shape->second.slots.begin(), shape->second.slots.begin() + shape->second.count, [&](const DrawShapeKeys::Slot& slot) { return drawCache.contains(slot.key); }));
             }
@@ -684,7 +684,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
         userPatches.clear();
-        std::lock_guard cacheLock(drawCacheMutex);
+        const ContendedLock cacheLock(drawCacheMutex);
         eraseDrawEntry(drawKey, entry);
         ++drawEntryCounters.absent;
         entry = nullptr;
@@ -925,6 +925,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                         PipelineScope() : previous(std::exchange(DrawPipeline::Active(), true)) {}
                         ~PipelineScope() { DrawPipeline::Active() = previous; }
                     } pipelineScope;
+                    const auto lookupFrom = DrawFinisher::Timed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+                    const struct LookupNote {
+                        std::chrono::steady_clock::time_point from;
+                        ~LookupNote() { DrawFinisher::NoteLookup(DrawFinisher::Timed() ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count()) : 0); }
+                    } lookupNote{lookupFrom};
                     if (job.resolveLater) {
                         resolveDrawTail(job, *job.submission);
                         if (job.drawHit) laterLookupHits.fetch_add(1, std::memory_order_relaxed);
@@ -1033,7 +1038,7 @@ void Driver::resolveDrawTail(DrawTail& tail, const Submission& submission) {
     }
     const auto relocatedDecode = decode;
     if (!userPatches.empty()) {
-        std::lock_guard cacheLock(drawCacheMutex);
+        const ContendedLock cacheLock(drawCacheMutex);
         if (drawHit || verifyHit) {
             ++drawRelocationCounters.hits;
             ++drawRelocationTrials[drawIdentity].hits;
@@ -1071,7 +1076,7 @@ void Driver::resolveDrawTail(DrawTail& tail, const Submission& submission) {
             if (matched[i] != nullptr && verifyDrawRecipe() && (vertexInfos[i].has_value() != (matched[i]->vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *matched[i]->vertexInfo)))) {
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit has a vertex stage info unlike its variant's\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress));
-                std::lock_guard cacheLock(drawCacheMutex);
+                const ContendedLock cacheLock(drawCacheMutex);
                 ++drawEntryCounters.verifyDecodeMismatches;
             }
         }
@@ -1323,12 +1328,12 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     }
 
     if (stageDataVerified != 0) {
-        std::lock_guard cacheLock(drawCacheMutex);
+        const ContendedLock cacheLock(drawCacheMutex);
         drawEntryCounters.stageDataVerified += stageDataVerified;
     }
     bool stageSeenBefore = false;
     if (dataEntry != nullptr) {
-        std::lock_guard cacheLock(drawCacheMutex);
+        const ContendedLock cacheLock(drawCacheMutex);
         auto& counters = drawEntryCounters;
         counters.dataStagesReused += dataStagesReused;
         counters.dataStagesCompiled += dataStagesCompiled;
@@ -1532,7 +1537,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         std::vector<RecordWord> recordWords;
         const auto countRecordWords = [&] {
             if (wordsForwarded == 0 && stagesRecompiled == 0 && wordsRefused == 0 && wordsVerified == 0) return;
-            std::lock_guard cacheLock(drawCacheMutex);
+            const ContendedLock cacheLock(drawCacheMutex);
             drawEntryCounters.recordWordsForwarded += wordsForwarded;
             drawEntryCounters.recordStagesRecompiled += stagesRecompiled;
             drawEntryCounters.recordWordsRefused += wordsRefused;

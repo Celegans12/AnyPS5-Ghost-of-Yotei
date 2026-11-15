@@ -192,6 +192,24 @@ public:
         std::uint64_t reorderNs = 0;
     };
     static PoolCounts PoolCounted();
+    struct ThreadCounts {
+        std::uint64_t jobs = 0;
+        std::uint64_t busyNs = 0;
+        std::uint64_t idleNs = 0;
+        std::uint64_t turns = 0;
+        std::uint64_t turnNs = 0;
+        std::uint64_t outputNs = 0;
+        std::uint64_t lookups = 0;
+        std::uint64_t lookupNs = 0;
+        std::uint64_t cacheWaits = 0;
+        std::uint64_t cacheWaitNs = 0;
+    };
+    static constexpr unsigned OtherThreads = MaxThreads;
+    static ThreadCounts ThreadCounted(unsigned index);
+    static bool Timed();
+    static void NoteLookup(std::uint64_t nanoseconds);
+    static void NoteCacheWait(std::uint64_t nanoseconds);
+    static std::string LookupText();
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
     void Drain();
@@ -244,6 +262,23 @@ private:
     bool running = false;
     bool sleeping = false;
     std::thread thread;
+};
+
+template<typename TMutex>
+class ContendedLock {
+public:
+    explicit ContendedLock(TMutex& held) : mutex(held) {
+        if (mutex.try_lock()) return;
+        const auto from = std::chrono::steady_clock::now();
+        mutex.lock();
+        DrawFinisher::NoteCacheWait(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count()));
+    }
+    ~ContendedLock() { mutex.unlock(); }
+    ContendedLock(const ContendedLock&) = delete;
+    ContendedLock& operator=(const ContendedLock&) = delete;
+
+private:
+    TMutex& mutex;
 };
 
 class CollectWalker {

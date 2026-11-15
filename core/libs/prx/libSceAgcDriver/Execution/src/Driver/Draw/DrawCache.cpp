@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include <algorithm>
 #include <bit>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -184,7 +185,7 @@ bool Driver::drawEntriesThisDraw() {
 }
 
 bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape, const DrawRelocationPending& pending) {
-    std::lock_guard cacheLock(drawCacheMutex);
+    const ContendedLock cacheLock(drawCacheMutex);
     if (drawCache.contains(key)) return true;
     if (!drawKeySightings) drawKeySightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
     bool seen = drawKeySightings->SeenBefore(key);
@@ -208,7 +209,7 @@ bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape, const DrawRelo
 }
 
 void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape, bool replaceShape) {
-    std::lock_guard cacheLock(drawCacheMutex);
+    const ContendedLock cacheLock(drawCacheMutex);
     auto& counters = drawEntryCounters;
     const auto shapeLimit = drawShapeKeys();
     if (replaceShape && shape != 0) {
@@ -348,7 +349,7 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
     if (donor != nullptr) {
         records = donor->recipes.load();
     } else {
-        std::lock_guard cacheLock(drawCacheMutex);
+        const ContendedLock cacheLock(drawCacheMutex);
         const auto found = drawCache.find(key);
         if (found == drawCache.end()) return nullptr;
         records = found->second->recipes.load();
@@ -363,7 +364,7 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
 void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe, const std::shared_ptr<DrawEntry>& donor, VulkanDevice::DrawRecipeOrigin origin) {
     std::shared_ptr<DrawEntry> entry = donor;
     if (entry == nullptr) {
-        std::lock_guard cacheLock(drawCacheMutex);
+        const ContendedLock cacheLock(drawCacheMutex);
         const auto found = drawCache.find(key);
         if (found == drawCache.end()) return;
         entry = found->second;

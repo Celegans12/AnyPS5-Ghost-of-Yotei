@@ -61,6 +61,7 @@ struct ClearOnExit {
 
 namespace {
 thread_local bool finisherThread = false;
+thread_local unsigned finisherIndex = DrawFinisher::OtherThreads;
 thread_local bool finisherProducer = false;
 thread_local DrawPipeline::Order runningOrder{};
 thread_local std::uint64_t runningSequence = 0;
@@ -257,6 +258,15 @@ std::atomic<std::uint64_t> poolJobs{0}, poolBeside{0}, poolAloneDraws{0}, poolAl
 std::array<std::atomic<std::uint64_t>, DrawFinisher::MaxThreads> poolBusyNs{};
 std::atomic<std::int64_t> poolReportedAt{0};
 
+struct alignas(64) ThreadTally {
+    std::atomic<std::uint64_t> jobs{0}, idleNs{0}, turns{0}, turnNs{0}, outputNs{0}, lookups{0}, lookupNs{0}, cacheWaits{0}, cacheWaitNs{0};
+};
+std::array<ThreadTally, DrawFinisher::MaxThreads + 1> threadTallies{};
+
+ThreadTally& ownTally() {
+    return threadTallies[finisherIndex];
+}
+
 std::int64_t steadyNs() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
@@ -265,6 +275,51 @@ std::int64_t steadyNs() {
 DrawFinisher::PoolCounts DrawFinisher::PoolCounted() {
     const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
     return {load(poolJobs), load(poolBeside), load(poolAloneDraws), load(poolAloneUnlisted), load(poolSkipped), load(poolTurns), load(poolReordered), load(poolReorderNs)};
+}
+
+DrawFinisher::ThreadCounts DrawFinisher::ThreadCounted(unsigned index) {
+    const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+    const auto& tally = threadTallies[std::min(index, OtherThreads)];
+    return {load(tally.jobs), index < MaxThreads ? load(poolBusyNs[index]) : 0, load(tally.idleNs), load(tally.turns), load(tally.turnNs), load(tally.outputNs), load(tally.lookups), load(tally.lookupNs), load(tally.cacheWaits), load(tally.cacheWaitNs)};
+}
+
+bool DrawFinisher::Timed() {
+    static const bool timed = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return timed;
+}
+
+void DrawFinisher::NoteLookup(std::uint64_t nanoseconds) {
+    auto& tally = ownTally();
+    tally.lookups.fetch_add(1, std::memory_order_relaxed);
+    tally.lookupNs.fetch_add(nanoseconds, std::memory_order_relaxed);
+}
+
+void DrawFinisher::NoteCacheWait(std::uint64_t nanoseconds) {
+    auto& tally = ownTally();
+    tally.cacheWaits.fetch_add(1, std::memory_order_relaxed);
+    tally.cacheWaitNs.fetch_add(nanoseconds, std::memory_order_relaxed);
+}
+
+std::string DrawFinisher::LookupText() {
+    static std::mutex reportMutex;
+    static std::array<ThreadCounts, MaxThreads + 1> reported{};
+    std::lock_guard lock(reportMutex);
+    const auto since = [](std::uint64_t current, std::uint64_t previous) { return static_cast<unsigned long long>(current - previous); };
+    const auto milliseconds = [](std::uint64_t current, std::uint64_t previous) { return static_cast<double>(current - previous) / 1e6; };
+    std::string text = "; per finisher thread (lookups in ms, waits for the draw cache lock in ms):";
+    for (unsigned index = 0; index < Threads(); ++index) {
+        const auto counted = ThreadCounted(index);
+        char item[96];
+        std::snprintf(item, sizeof(item), " %llu in %.1f, %llu in %.2f;", since(counted.lookups, reported[index].lookups), milliseconds(counted.lookupNs, reported[index].lookupNs), since(counted.cacheWaits, reported[index].cacheWaits), milliseconds(counted.cacheWaitNs, reported[index].cacheWaitNs));
+        text += item;
+        reported[index] = counted;
+    }
+    const auto others = ThreadCounted(OtherThreads);
+    char item[96];
+    std::snprintf(item, sizeof(item), " other threads waited %llu times for the draw cache lock in %.2f ms", since(others.cacheWaits, reported[OtherThreads].cacheWaits), milliseconds(others.cacheWaitNs, reported[OtherThreads].cacheWaitNs));
+    text += item;
+    reported[OtherThreads] = others;
+    return text;
 }
 
 void DrawFinisher::NoteDrain(DrainSite site, bool drained) {
@@ -333,6 +388,7 @@ std::string DrawFinisher::DrainText() {
         static std::mutex reportMutex;
         static PoolCounts reported;
         static std::array<std::uint64_t, MaxThreads> reportedBusy{};
+        static std::array<ThreadCounts, MaxThreads> reportedThreads{};
         std::lock_guard lock(reportMutex);
         const auto counted = PoolCounted();
         const auto since = [](std::uint64_t current, std::uint64_t previous) { return static_cast<unsigned long long>(current - previous); };
@@ -348,6 +404,15 @@ std::string DrawFinisher::DrainText() {
             std::snprintf(item, sizeof(item), " %.0f%%", elapsed > 0.0 ? 100.0 * static_cast<double>(busy - reportedBusy[index]) / elapsed : 0.0);
             text += item;
             reportedBusy[index] = busy;
+        }
+        text += "; per thread (jobs, ms waiting for a job, turns taken in ms, ms handing items to the committer):";
+        for (unsigned index = 0; index < Threads(); ++index) {
+            const auto current = ThreadCounted(index);
+            const auto& before = reportedThreads[index];
+            char item[96];
+            std::snprintf(item, sizeof(item), " %llu, %.1f, %llu in %.1f, %.1f;", since(current.jobs, before.jobs), static_cast<double>(current.idleNs - before.idleNs) / 1e6, since(current.turns, before.turns), static_cast<double>(current.turnNs - before.turnNs) / 1e6, static_cast<double>(current.outputNs - before.outputNs) / 1e6);
+            text += item;
+            reportedThreads[index] = current;
         }
         reported = counted;
     }
@@ -393,6 +458,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
         running = true;
         thread = std::thread([this] {
             finisherThread = true;
+            finisherIndex = 0;
             run();
         });
     }
@@ -478,6 +544,7 @@ void DrawFinisher::enqueuePooled(Job job, Pending held) {
         const auto index = static_cast<unsigned>(workers.size());
         workers.emplace_back([this, index] {
             finisherThread = true;
+            finisherIndex = index;
             work(index);
         });
     }
@@ -499,12 +566,17 @@ void DrawFinisher::work(unsigned index) {
         StartFinisherSampler();
     }
     std::unique_lock lock(mutex, std::defer_lock);
+    const bool timed = Timed();
+    auto& tally = threadTallies[index];
     for (;;) {
+        const auto idleFrom = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SpinUntil(HandoffSpinWindow(), [&] { return unstarted.load(std::memory_order_acquire) != 0; });
         lock.lock();
         ++sleepers;
         wake.wait(lock, [&] { return startable(); });
         --sleepers;
+        if (timed) tally.idleNs.fetch_add(elapsedNs(idleFrom), std::memory_order_relaxed);
+        tally.jobs.fetch_add(1, std::memory_order_relaxed);
         Slot& slot = *slots[started];
         const bool misplaced = DrawPipeline::VerifiesOrder() && (barrier || (slot.alone && (started != 0 || active != 0 || flushing)));
         const bool failed = failure != nullptr;
@@ -564,6 +636,7 @@ void DrawFinisher::retire(std::unique_lock<std::mutex>& lock) {
         }
         if (dropped && !outputs.empty()) poolSkipped.fetch_add(1, std::memory_order_relaxed);
         lock.unlock();
+        const auto outputFrom = Timed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (!dropped) {
             runningOrder = order;
             try {
@@ -579,6 +652,7 @@ void DrawFinisher::retire(std::unique_lock<std::mutex>& lock) {
             }
         }
         outputs.clear();
+        if (Timed()) ownTally().outputNs.fetch_add(elapsedNs(outputFrom), std::memory_order_relaxed);
         if (error != nullptr && !shutdown && RelaysSubmissionEnd()) Driver::Get().ReportFailure(error);
         lock.lock();
         if (error != nullptr && failure == nullptr) failure = error;
@@ -599,11 +673,14 @@ void DrawFinisher::TakeTurn() {
     if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher turn taken under the GPU lock");
     auto& stashed = *deferredOutputs;
     poolTurns.fetch_add(1, std::memory_order_relaxed);
+    const auto turnFrom = Timed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     {
         std::unique_lock lock(mutex);
         idle.wait(lock, [&] { return !flushing && slots.front()->sequence == runningSequence; });
         deferredReads->clear();
     }
+    ownTally().turns.fetch_add(1, std::memory_order_relaxed);
+    if (Timed()) ownTally().turnNs.fetch_add(elapsedNs(turnFrom), std::memory_order_relaxed);
     deferredOutputs = nullptr;
     const auto outputs = std::exchange(stashed, {});
     for (const auto& output : outputs) output();

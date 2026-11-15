@@ -72,6 +72,16 @@ bool Within(std::chrono::milliseconds patience, const std::function<bool()>& rea
     return true;
 }
 
+DrawFinisher::ThreadCounts ThreadsCounted() {
+    DrawFinisher::ThreadCounts total;
+    for (unsigned index = 0; index < DrawFinisher::Threads(); ++index) {
+        const auto counted = DrawFinisher::ThreadCounted(index);
+        total.jobs += counted.jobs;
+        total.turns += counted.turns;
+    }
+    return total;
+}
+
 void Settle() {
     DrawFinisher::Get().Drain();
     DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
@@ -111,6 +121,7 @@ void CommitsKeepTheQueuedOrder() {
     RequireInOrder(commits->Taken(), queued);
     const auto after = DrawFinisher::PoolCounted();
     Require(after.jobs >= counted.jobs + Draws, "the jobs of the pool were not counted");
+    Require(ThreadsCounted().jobs == after.jobs, "the jobs counted per thread do not add up to the jobs of the pool");
     Require(after.beside > counted.beside, "no job was counted as started while another ran");
     Require(after.reordered > counted.reordered, "no finished job was counted as waiting in the reorder buffer");
 }
@@ -226,6 +237,7 @@ void JobThatDrainsThePipelineTakesItsTurn() {
     auto& finisher = DrawFinisher::Get();
     auto& pipeline = DrawPipeline::Queue0();
     const auto turns = DrawFinisher::PoolCounted().turns;
+    const auto threadTurns = ThreadsCounted().turns;
     Gate gate;
     const OpenOnExit opening{gate};
     const auto commits = std::make_shared<Commits>();
@@ -245,6 +257,7 @@ void JobThatDrainsThePipelineTakesItsTurn() {
     Settle();
     Require(seen->load() == 1, "a job that drained the pipeline did not find the earlier job's item and its own committed in order");
     Require(DrawFinisher::PoolCounted().turns > turns, "the turn the draining job took was not counted");
+    Require(ThreadsCounted().turns > threadTurns, "the turn the draining job took was not counted on its thread");
 }
 
 void FailureOfAJobReachesTheQueuingThread() {
