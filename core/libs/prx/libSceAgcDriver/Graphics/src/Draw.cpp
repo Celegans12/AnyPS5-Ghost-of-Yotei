@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -1745,6 +1746,7 @@ struct DrawInputs {
     VertexInputLayout vertexInput;
     std::shared_ptr<const VertexInputLayout> retainedVertexInput;
     std::vector<std::shared_ptr<Buffer>> vertexBuffers;
+    std::vector<std::shared_ptr<void>> mirrors;
     std::vector<VkBuffer> vertexHandles;
     std::vector<VkDeviceSize> vertexOffsets;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
@@ -1767,6 +1769,42 @@ std::shared_ptr<Buffer> zeroVertexBuffer(const Context& context, std::size_t byt
     auto zero = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT);
     std::fill(zero->Bytes().begin(), zero->Bytes().end(), std::byte{0});
     return zero;
+}
+
+BufferCache::View cachedDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t from, std::size_t alignment) {
+    auto* recorder = context.recorder;
+    auto* cache = recorder != nullptr ? recorder->Buffers() : nullptr;
+    if (cache == nullptr || bytes == 0 || from >= bytes) return {};
+    if (alignment > 1 && (address % BufferCache::ZoneBytes) % alignment != 0) return cache->Refuse(BufferCache::Refusal::Alignment);
+    const auto first = (address + from) & ~(BufferCache::PageBytes - 1);
+    const auto stop = (address + bytes + BufferCache::PageBytes - 1) & ~(BufferCache::PageBytes - 1);
+    const auto reach = static_cast<std::size_t>(stop - first);
+    if (recorder->PendingWriteOverlaps(first, reach) || recorder->PendingLabelIn(first, reach) || recorder->QueuedStoreOverlaps(first, reach) || recorder->QueuedKeyStoreOverlaps(first, reach)) return cache->Refuse(BufferCache::Refusal::GpuWrite);
+    GuestMemory::FlushGpuWrites(first, reach);
+    auto view = cache->Acquire(address, bytes, from, recorder->OpenSerial());
+    if (view && BufferCache::Verifying()) cache->Verify(view, address, bytes, from);
+    return view;
+}
+
+InPlaceIndices cachedIndexRange(BufferCache& cache, const BufferCache::View& view, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart, Recorder::SnapshotUse use) {
+    InPlaceIndices indices;
+    const auto kind = static_cast<std::uint32_t>(use);
+    if (const auto known = cache.Known(view, address, bytes, kind)) {
+        if (known->some) indices.highest = known->highest;
+        indices.lowest = known->lowest;
+        indices.reused = true;
+        return indices;
+    }
+    BufferCache::Derived derived;
+    if (const auto bounds = DrawIndexRange(std::span<const std::byte>(view.bytes, bytes), indexSize, skipRestart)) {
+        indices.highest = bounds->highest;
+        indices.lowest = bounds->lowest;
+        derived.some = true;
+        derived.highest = bounds->highest;
+        derived.lowest = bounds->lowest;
+    }
+    cache.Keep(view, address, bytes, kind, derived);
+    return indices;
 }
 
 // Draw's validation, index and vertex phases. With `recipe` the fragment outputs, the pipeline
@@ -2041,13 +2079,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool skipRestart = state.primitiveRestart && (!listTopology || context.primitiveListRestart);
         const auto use = draw.indexSize == 2 ? (skipRestart ? Recorder::SnapshotUse::Index16Restart : Recorder::SnapshotUse::Index16) : (skipRestart ? Recorder::SnapshotUse::Index32Restart : Recorder::SnapshotUse::Index32);
         const auto* import = InPlaceDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize);
+        auto cached = import == nullptr ? cachedDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), 0, draw.indexSize) : BufferCache::View{};
         DrawInputCopy copy;
-        if (import == nullptr) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
-        else GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
+        if (import == nullptr && !cached) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        else if (import != nullptr) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
         std::uint32_t lowest = 0;
         if (import != nullptr) {
             const auto range = InPlaceIndexRange(*context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart);
+            highest = range.highest;
+            lowest = range.lowest;
+        } else if (cached) {
+            const auto range = cachedIndexRange(*context.recorder->Buffers(), cached, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, skipRestart, use);
             highest = range.highest;
             lowest = range.lowest;
         } else if (!copy.reused) {
@@ -2075,6 +2118,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 GuestMemory::Read(draw.indexAddress, bytes, draw.indexSize);
                 const auto clampedBounds = ClampDrawIndices(bytes, draw.indexSize, skipRestart, limit);
                 import = nullptr;
+                cached = BufferCache::View{};
                 copy = DrawInputCopy{};
                 copy.buffer = std::move(clamped);
                 if (!clampedBounds) {
@@ -2089,13 +2133,17 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.maxIndex = *highest;
         inputs.minIndex = lowest;
         if (skipRestart && state.stages.mesh && (state.stages.mesh->inputPrimitive == 5 || state.stages.mesh->inputPrimitive == 6)) {
-            const auto indexSpan = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
+            const auto indexSpan = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : cached ? std::span<const std::byte>(cached.bytes, static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
             inputs.restartTable = MeshRestartTable(indexSpan, draw.indexSize);
         }
         if (import != nullptr) {
             inputs.indexHandle = import->buffer;
             inputs.indexOffset = HostImportOffset(*import, draw.indexAddress);
             inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
+        } else if (cached) {
+            inputs.indexHandle = cached.handle;
+            inputs.indexOffset = cached.offset;
+            inputs.mirrors.push_back(std::move(cached.owner));
         } else {
             inputs.indices = std::move(copy.buffer);
             inputs.indexHandle = inputs.indices->Handle();
@@ -2172,6 +2220,12 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(HostImportOffset(*import, begin));
             inputs.inPlaceReads.emplace_back(begin, end);
+            continue;
+        }
+        if (auto cached = cachedDrawInput(context, begin, bytes, rangeFrom[range], plan.alignments[range])) {
+            rangeHandles.push_back(cached.handle);
+            rangeOffsets.push_back(cached.offset);
+            inputs.mirrors.push_back(std::move(cached.owner));
             continue;
         }
         if (auto copied = GpuCopiedDrawInput(context, begin, bytes, rangeFrom[range])) {
@@ -2852,6 +2906,7 @@ struct Kept {
     std::shared_ptr<Framebuffer> framebuffer;
     std::shared_ptr<Buffer> indices;
     std::vector<std::shared_ptr<Buffer>> vertexBuffers;
+    std::vector<std::shared_ptr<void>> mirrors;
     std::vector<std::shared_ptr<StorageTexture>> targets;
     std::unique_ptr<DeviceBuffer> scratch;
 };
@@ -2866,6 +2921,7 @@ void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>
     kept->framebuffer = std::move(framebuffer);
     kept->indices = std::move(inputs.indices);
     kept->vertexBuffers = std::move(inputs.vertexBuffers);
+    kept->mirrors = std::move(inputs.mirrors);
     kept->scratch = std::move(scratch);
     kept->targets = std::move(targets);
     const auto& residents = kept->targets;

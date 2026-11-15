@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -1048,6 +1049,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto contentRecipes = DriverDetail::ContentRecipesHeld();
     AgcDriver::ProfilePrint_nid_no_patch("%s", VulkanDevice::DrawRecipeDrawsReport(contentRecipes.held, contentRecipes.evicted).c_str());
     AgcDriver::ProfilePrint_nid_no_patch("%s", MovedReadsReport().c_str());
+    if (Graphics::BufferCache::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("%s", Graphics::BufferCache::Report().c_str());
     static ShaderRecompiler::DescriptorLeafCounts reportedLeaves;
     const auto leaves = ShaderRecompiler::DescriptorLeafTotals();
     AgcDriver::ProfilePrint_nid_no_patch("[descriptor-leaves] (10 s): %llu stage captures over %llu buffers, %llu captures traced for %llu planned leaf dwords: %llu leaves traced, %llu left out as aliased\n", static_cast<unsigned long long>(leaves.captures - reportedLeaves.captures), static_cast<unsigned long long>(leaves.buffers - reportedLeaves.buffers), static_cast<unsigned long long>(leaves.traced - reportedLeaves.traced), static_cast<unsigned long long>(leaves.planned - reportedLeaves.planned), static_cast<unsigned long long>(leaves.leaves - reportedLeaves.leaves), static_cast<unsigned long long>(leaves.aliased - reportedLeaves.aliased));
