@@ -5178,6 +5178,26 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             BumpPendingSerial();
         }
     } unregister{flush};
+    // Debug aid: APS5_TRACE_FLUSH_WAIT=1 (with APS5_PROFILE_DRAW=1) names each flush during which
+    // this thread waited 5 ms or more for the GPU.
+    static const bool traceWait = std::getenv("APS5_TRACE_FLUSH_WAIT") != nullptr;
+    struct WaitTrace {
+        bool on;
+        const std::vector<std::shared_ptr<StorageTexture>>& flush;
+        const char* reason;
+        std::uint64_t address;
+        std::size_t bytes;
+        double before = on ? Recorder::ThreadWaitedMs() : 0.0;
+        int ordered = -1, recording = -1, imports = -1, publishesNothing = -1, scope = -1;
+        ~WaitTrace() {
+            if (!on) return;
+            const auto waited = Recorder::ThreadWaitedMs() - before;
+            if (waited < 5.0) return;
+            const auto* first = flush.empty() ? nullptr : flush.front().get();
+            std::fprintf(stderr, "[flush-wait] ordered %d recording %d imports %d publishes-nothing %d scope %d\n", ordered, recording, imports, publishesNothing, scope);
+            std::fprintf(stderr, "[flush-wait] %.1f ms for %s 0x%llx+0x%zx: %zu images, first 0x%llx+0x%llx %ux%u format %u tile %d block units %d\n", waited, reason != nullptr ? reason : "other", static_cast<unsigned long long>(address), bytes, flush.size(), static_cast<unsigned long long>(first != nullptr ? first->descriptor.baseAddress : 0), static_cast<unsigned long long>(first != nullptr ? first->guestBytes : 0), first != nullptr ? first->descriptor.width : 0u, first != nullptr ? first->descriptor.height : 0u, first != nullptr ? first->descriptor.format : 0u, first != nullptr ? static_cast<int>(first->descriptor.tileMode) : 0, first != nullptr && first->blockUnits ? 1 : 0);
+        }
+    } waitTrace{traceWait, flush, reason, address, bytes};
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
     static const bool trace = std::getenv("APS5_TRACE_FLUSH") != nullptr;
     if (trace) {
@@ -5196,9 +5216,35 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         const auto last = end > top - block ? end : (end + block - 1) / block * block;
         return active.PendingLeaseSerial(first, static_cast<std::size_t>(last - first)) == 0;
     };
-    const bool orderedSkip = GpuOrderedFlush() && orderedRecorder != nullptr && !Recorder::InCompletion() && !flush.empty() && std::all_of(flush.begin(), flush.end(), [orderedRecorder](const std::shared_ptr<StorageTexture>& texture) { return texture->context.device == orderedRecorder->Device() && HostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr; }) && publishesNothing(*orderedRecorder);
+    // A surface that several imports serve is written back on the GPU as well (writeBack takes
+    // importSegments), so its store is recorded in order like one import's and needs no wait for
+    // the writers before it. 007 First Light's pool surfaces span two mappings and waited here
+    // (about 12 ms per frame). APS5_ORDERED_FLUSH_ONE_IMPORT=1 skips the wait for one import only.
+    static const bool segmentedOrdered = std::getenv("APS5_ORDERED_FLUSH_ONE_IMPORT") == nullptr;
+    // Flushes whose reader is recorded GPU work (a buffer region bound from the import, a fill or
+    // a store over the range, a new image's upload) are ordered by the queue as well: the store
+    // is recorded behind the writers and ahead of the reader, and a CPU reader still waits on the
+    // store's pending-write note. They waited for the writers' batches before (007 First Light:
+    // about 900 waits of 5 ms or more per scene, 14 s). APS5_NO_CONSUMER_GPU_ORDERED=1 waits.
+    static const bool consumerOrdered = std::getenv("APS5_NO_CONSUMER_GPU_ORDERED") == nullptr;
+    const auto gpuConsumer = [](const char* why) {
+        if (why == nullptr) return false;
+        for (const char* name : {"storage image creation", "imported buffer region", "copied buffer region", "written buffer range", "buffer fill"}) {
+            if (std::strcmp(why, name) == 0) return true;
+        }
+        return false;
+    };
+    const bool orderedSkip = (GpuOrderedFlush() || (consumerOrdered && gpuConsumer(reason))) && orderedRecorder != nullptr && !Recorder::InCompletion() && !flush.empty() && std::all_of(flush.begin(), flush.end(), [orderedRecorder](const std::shared_ptr<StorageTexture>& texture) { return texture->context.device == orderedRecorder->Device() && (HostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr || (segmentedOrdered && !texture->importSegments().empty())); }) && publishesNothing(*orderedRecorder);
+    if (traceWait) {
+        waitTrace.ordered = GpuOrderedFlush() ? 1 : 0;
+        waitTrace.recording = orderedRecorder != nullptr && !Recorder::InCompletion() ? 1 : 0;
+        waitTrace.imports = std::all_of(flush.begin(), flush.end(), [](const std::shared_ptr<StorageTexture>& texture) { return HostImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes)) != nullptr || !texture->importSegments().empty(); }) ? 1 : 0;
+        waitTrace.publishesNothing = orderedRecorder != nullptr && publishesNothing(*orderedRecorder) ? 1 : 0;
+        waitTrace.scope = static_cast<int>(scope);
+    }
     if (orderedSkip) {
-        GpuOrderedSkipped() = true;
+        // The flag answers the scope that asked for an ordered flush, not a consumer's own.
+        if (GpuOrderedFlush()) GpuOrderedSkipped() = true;
         orderedFlushSkips.fetch_add(1, std::memory_order_relaxed);
     }
     if (flushFailureForTest.exchange(false, std::memory_order_acq_rel)) {
@@ -7721,6 +7767,13 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     std::uint64_t storedBytes = 0;
     for (const auto& [from, to] : stores) storedBytes += to - from;
     countStorageWriteBack(drawn.rect ? storedBytes : guestBytes, false, drawn.drawn);
+    // Debug aid: APS5_TRACE_WRITEBACK_CPU=1 names every write-back that took the CPU path (a
+    // waited batch and a CPU store), with its reason and whether imports serve the surface.
+    static const bool traceCpu = std::getenv("APS5_TRACE_WRITEBACK_CPU") != nullptr;
+    if (traceCpu) {
+        const bool whole = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
+        std::fprintf(stderr, "[writeback-cpu] 0x%llx+0x%llx %ux%u format %u mips %u tile %d for %s: %s, %zu import segments, block units %d, watched %d, registered %d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, descriptor.format, descriptor.mipCount, static_cast<int>(descriptor.tileMode), flushReason != nullptr ? flushReason : "other", whole ? "one import covers it" : "no single import", whole ? std::size_t{1} : importSegments().size(), blockUnits ? 1 : 0, GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) ? 1 : 0, RegisteredReadableCovers(descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) ? 1 : 0);
+    }
     if (profile) Profile().storageGpu += timer.lap();
     if (dump) {
         char name[64];
