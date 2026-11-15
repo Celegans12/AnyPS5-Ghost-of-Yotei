@@ -199,6 +199,29 @@ std::uint64_t RunFlag(WatchedFlag& flag, std::uint32_t waits) {
     return AgcDriver::GuestMemory::CollectEpochBumps() - before;
 }
 
+std::uint64_t RunFlagStoredLate(WatchedFlag& flag, bool wait) {
+    *flag.Done() = 0;
+    *flag.Flag() = 0;
+    std::vector<std::uint32_t> words;
+    if (wait) WaitEqual(words, flag.Flag(), 1);
+    WriteData(words, flag.Done(), 1);
+    const auto before = AgcDriver::GuestMemory::CollectEpochBumps();
+    Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+    Require(sceAgcDriverSubmitAcb(0x20, &packet) == 0, "late flag submit failed");
+    const auto start = std::chrono::steady_clock::now();
+    while (AgcDriver::GuestMemory::CollectEpochBumps() == before) {
+        Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), "the late flag submission did not start a collect epoch");
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    *flag.Flag() = 1;
+    while (*flag.Done() == 0) {
+        Require(std::chrono::steady_clock::now() - start < std::chrono::seconds(10), "the late flag submission did not finish");
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+    AgcDriverWaitIdle_nid_postfix();
+    return AgcDriver::GuestMemory::CollectEpochBumps() - before;
+}
+
 std::uint64_t RunLanded(Slot& slot, std::uint32_t value, bool wait) {
     slot.done = 0;
     slot.gate = 0;
@@ -268,15 +291,14 @@ int main() {
                 repeatedExtra = std::min(repeatedExtra, with > without ? with - without : 0);
             }
             Require(repeatedExtra < Waits / 2, "WAIT_REG_MEMs on a CPU flag an earlier wait already saw with the same value, unwritten since, started new collect epochs: " + std::to_string(repeatedExtra) + " extra bumps for " + std::to_string(Waits) + " waits");
-            std::uint64_t rewrittenExtra = ~std::uint64_t{0};
+            std::uint64_t lateExtra = ~std::uint64_t{0};
             for (std::uint32_t attempt = 0; attempt < 3; ++attempt) {
-                const auto without = RunFlag(flag, 0);
-                *flag.Flag() = 1;
-                const auto with = RunFlag(flag, 1);
-                std::cout << "rewritten flag attempt " << attempt << ": " << with << " bumps with one wait, " << without << " without\n";
-                rewrittenExtra = std::min(rewrittenExtra, with > without ? with - without : 0);
+                const auto without = RunFlagStoredLate(flag, false);
+                const auto with = RunFlagStoredLate(flag, true);
+                std::cout << "late flag attempt " << attempt << ": " << with << " bumps with one wait, " << without << " without\n";
+                lateExtra = std::min(lateExtra, with > without ? with - without : 0);
             }
-            Require(rewrittenExtra >= 1, "a WAIT_REG_MEM on a CPU flag rewritten with the same value did not start a new collect epoch");
+            Require(lateExtra >= 1, "a WAIT_REG_MEM on a CPU flag cleared before its submission and stored again with the same value after the submission's collect epoch began did not start a new collect epoch");
         }
         std::cout << "same-queue label wait test passed\n";
         AgcDriverShutdown_nid_postfix();

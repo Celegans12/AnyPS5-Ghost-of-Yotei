@@ -43,7 +43,7 @@ struct WaitOutcomes {
 };
 
 struct EpochBumps {
-    std::uint64_t submissions = 0, waits = 0, drains = 0, reaps = 0, packets = 0, waitsOrdered = 0, interrupts = 0, queuedInterrupts = 0;
+    std::uint64_t submissions = 0, waits = 0, drains = 0, reaps = 0, packets = 0, waitsOrdered = 0, interrupts = 0, queuedInterrupts = 0, waitsBeforeEpoch = 0, awaitedPageCollects = 0;
 };
 
 EpochBumps EpochBumpsCounted();

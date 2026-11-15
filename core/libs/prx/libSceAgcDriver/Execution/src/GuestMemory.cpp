@@ -2193,6 +2193,7 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
 
 std::atomic<std::uint64_t> nextCollectEpoch{1};
 struct CollectEpochSlot {};
+struct CollectEpochStartSlot {};
 std::atomic<std::uint64_t> lastBumpedEpoch{0};
 std::atomic<void (*)(int)> observationHook{nullptr};
 
@@ -2600,6 +2601,7 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
 }
 
 void BumpCollectEpoch() {
+    HostThreadSlot<std::uint64_t, CollectEpochStartSlot>::Set(Tracker().stable.load(std::memory_order_acquire));
     const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
     HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
@@ -2625,6 +2627,11 @@ void AdoptCollectEpoch(std::uint64_t epoch) {
 
 std::uint64_t HeldCollectEpoch() {
     return HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get();
+}
+
+bool UnchangedSinceEpochStart(std::uint64_t address, std::size_t bytes) {
+    const auto start = HostThreadSlot<std::uint64_t, CollectEpochStartSlot>::Get();
+    return start != 0 && UnchangedSince(address, bytes, start);
 }
 
 std::uint64_t CollectEpochBumps() {

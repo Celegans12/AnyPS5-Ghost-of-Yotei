@@ -338,7 +338,7 @@ void Driver::execute(Submission& submission) {
                 continue;
             }
             if (!DrawPipeline::Queue0().Overlaps(awaited, awaitedBytes) && Pm4::WaitSatisfiedUnchecked(packet) && !OwnStoreRejects(packet, awaited, awaitedBytes, submission.queue)) {
-                bumpWaitEpoch(awaited, awaitedBytes);
+                bumpWaitEpoch(awaited, awaitedBytes, true);
                 ++waitOutcomes().atEntry;
                 gateOpened() = true;
                 noteLabelPass(packet, submission.queue);

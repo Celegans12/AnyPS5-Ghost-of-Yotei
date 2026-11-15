@@ -757,6 +757,42 @@ void CheckSettledGenerationUnderWalks() {
     Require(trusted.load() == 0, "a store made after the settled generation was read was trusted against it");
 }
 
+void CheckEpochStartSeparatesStores() {
+    const auto block = Base + 104 * Block;
+    const auto flag = block + 3 * Page + 16;
+    const auto distant = block + 9 * Page;
+    bool stranger = true;
+    std::thread other([&] { stranger = CollectWritesUncached(flag, 8) != 0 && UnchangedSinceEpochStart(flag, 8); });
+    other.join();
+    Require(!stranger, "a thread that never started an epoch read a range as unchanged since its epoch began");
+    Store(flag);
+    Require(CollectWritesUncached(flag, 8) != 0, "the flag's page was not collected");
+    BumpCollectEpoch();
+    Require(CollectWritesUncached(flag, 8) != 0 && UnchangedSinceEpochStart(flag, 8), "a store collected before the epoch began reads as made in it");
+    Store(distant);
+    Require(CollectWritesUncached(distant, 8) != 0 && UnchangedSinceEpochStart(flag, 8), "a store to another page of the flag's block reads as a store over the flag");
+    Store(flag + 512);
+    Require(CollectWritesUncached(flag, 8) != 0 && !UnchangedSinceEpochStart(flag, 8), "a store to the flag's page made in the epoch reads as older than it");
+    BumpCollectEpoch();
+    Require(CollectWritesUncached(flag, 8) != 0 && UnchangedSinceEpochStart(flag, 8), "a new epoch did not start from the stores collected before it");
+    Store(flag);
+    BumpCollectEpoch();
+    Require(CollectWritesUncached(flag, 8) != 0 && !UnchangedSinceEpochStart(flag, 8), "a store collected only after the epoch began reads as older than it");
+    BumpCollectEpoch();
+    Require(MarkWritten(flag + 64, 8) != 0 && UnchangedSinceEpochStart(flag, 8), "a driver store beside the flag reads as a store over it");
+    Require(MarkWritten(flag, 8) != 0 && !UnchangedSinceEpochStart(flag, 8), "a driver store over the flag made in the epoch reads as older than it");
+    BumpCollectEpoch();
+    Require(UnchangedSinceEpochStart(flag, 8), "a driver store made before the epoch began reads as made in it");
+    const auto held = HeldCollectEpoch();
+    bool taken = true;
+    std::thread taker([&] {
+        AdoptCollectEpoch(held);
+        taken = HeldCollectEpoch() == held && CollectWritesUncached(flag, 8) != 0 && UnchangedSinceEpochStart(flag, 8);
+    });
+    taker.join();
+    Require(!taken, "a thread that took another thread's epoch read a range as unchanged since an epoch it never started");
+}
+
 #ifdef _WIN32
 bool AnsweredWithin(std::atomic<bool>& answered, std::chrono::milliseconds patience) {
     const auto until = std::chrono::steady_clock::now() + patience;
@@ -1029,6 +1065,7 @@ int main(int argc, char** argv) {
         CheckTrackerWaitsCounted();
         CheckSettledGenerationDuringWalk();
         CheckSettledGenerationUnderWalks();
+        CheckEpochStartSeparatesStores();
 #ifdef _WIN32
         CheckUnlockedReadsDuringWalk();
         CheckStampedBlockWaitsForItsWalk();

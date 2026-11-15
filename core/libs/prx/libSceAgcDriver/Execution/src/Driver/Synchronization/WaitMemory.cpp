@@ -139,8 +139,9 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         std::uint64_t address;
         std::size_t bytes;
         bool bump = true;
+        bool memory = false;
         ~EpochPoint() {
-            if (bump) bumpWaitEpoch(address, bytes);
+            if (bump) bumpWaitEpoch(address, bytes, memory);
         }
     } epochPoint{awaited, awaitedBytes};
     bool ownStoreUnlanded = false;
@@ -160,6 +161,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
                                *reinterpret_cast<const volatile std::uint32_t*>(awaited));
     if (memorySatisfied()) {
         ++outcomes.atEntry;
+        epochPoint.memory = true;
         if (storedByOwnLabel()) epochPoint.bump = false;
         return;
     }
@@ -441,6 +443,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     }
     ++outcomes.polled;
+    epochPoint.memory = true;
     if (storedByOwnLabel()) epochPoint.bump = false;
 }
 
