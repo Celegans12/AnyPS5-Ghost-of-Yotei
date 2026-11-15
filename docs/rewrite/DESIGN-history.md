@@ -524,6 +524,183 @@ modules, and account for code without bounds. Until then phases 2 and 4 use the 
 - Visibility policies for clean ranges (measured flat).
 - Larger caches.
 
+## Per-phase status detail to 2026-11-13 (moved from DESIGN.md when it was condensed)
+
+## Current status (2026-11-13, head 9817f28fbe)
+
+| Title | Frame | GPU busy | Bound by | Track |
+|---|---|---|---|---|
+| LEGO | 47 to 49 ms | 39 ms | GPU: one compute program, 22.8 ms | 5, translation |
+| FF Resonance | 30.6 to 33 ms | about 20 ms | CPU: worker 0 at 97 % (phase 0 profile only) | 1 to 4 |
+| AoM title | 146 to 158 ms | 146 to 151 ms | GPU | 5, translation and timeline |
+| AoM scene after the pad press | 148 to 158 ms | 81 to 97 ms | CPU | 6 |
+| 007 title screen | 127 to 133 ms | about 70 ms | CPU: the draw committer (below) | 4 |
+
+Per phase:
+
+- **0:** done for LEGO, FF and AoM.
+  - **007** was added on 2026-11-13 with the title screen as its scene (run `007\p0-head`; worker
+    samples in `runs\007\stacks-p0-head-samples.txt`).
+  - Per frame, summed over the five workers: packets 2,469 ms, of which the `memory_wait` zone is
+    1,732 ms, dispatch 426 ms and draw 284 ms.
+  - The worker samples show 57 % self time in one unresolved ntdll wait (`ntdll+0x1628a4`). What
+    calls it is not resolved: `DrawPipeline::Enqueue` (36.5 % inclusive) is a likely caller, but
+    only 1.5 % of samples sit under `waitMemory`, where `PollSleep` is 58 %.
+  - Real work in the samples:
+    - storage textures created and uploaded per use (`cachedStorageTexture` 19 %;
+      `StorageTexture::Create` 10 %, `::upload` 11 %)
+    - `ResolveImageTables` 8 % self
+    - `materializeDrawStage` 15 %
+    - `VulkanDevice::Dispatch` 22 % (in the NVIDIA driver)
+  - Over 300 s, the log shows:
+    - 326k buffer uploads, with 100 s of guest reads
+    - 37.5 GiB copied out of imports and 37.5 GiB written back (eager write-back)
+    - 26.7k dispatch-cache evictions against 43k hits
+  - **Cause of the blocked time:**
+    - 69 % of the ntdll wait is `DrawPipeline::enqueue` waiting for room and 12 % is `Drain`.
+      The five workers are back-pressured by the single committer thread.
+    - The committer runs 14,940 commits per 10 s at 453 us each, 6.8 s busy. Workers wait 292 us
+      per draw. Draw resources are 4.4 s per 10 s, of which uploads are 4.0 s.
+  - **Storage images**, per 10 s:
+    - About 810 created (39 per frame, about 5.6 MiB each) against about 11,000 reused.
+    - "first" uploads 4.5 GiB, and write-backs at storage image creation 3.6 GiB.
+    - 837 LRU evictions, none of which flush anything.
+    - The cache sits at its budget: 7.4 GiB of a 14.9 GiB device budget, 12.4 GiB in use.
+  - **Reading:** per frame, new storage images over guest memory evict dead ones, and creating
+    them writes back the images they overlap. That is eager write-back (principle 3, section B /
+    GPU-owned), not a budget problem: there is no VRAM headroom to raise it.
+  - **Storage creation probe** (`probe-patches\storage-create-probe.patch`, run `007\xstorage1`,
+    150 s):
+    - 10,937 creations (53.8 GiB) over 3,501 distinct addresses:
+      - 48 % reuse a known address with another shape;
+      - 20 % reuse a known address with the same shape (an entry recreated after being dropped);
+      - 32 % are first uses of an address.
+    - The game aliases a transient pool: one 2 MiB address is created as 44 shapes and formats.
+    - Its dynamic resolution walks 1280x720 to 1920x1080 in 64-pixel steps, so every frame brings
+      new sizes.
+    - 76 % of creations are of written images and 58 % flush an overlapping one.
+    - Each creation costs about 1.4 ms on the committer (image, memory and first upload).
+    - So the cost is one storage image per (address, shape), created and filled through guest
+      memory each time the transient pool is re-used.
+  - Storage images were not the limit: they are built on the workers, which are mostly blocked.
+    Sharing device memory per range (approved option 1) is parked until it is.
+  - **Committer** (`APS5_SAMPLE_COMMITTER`, run `007\committer1`): 39 % idle, 51 % draw commits.
+    `UploadFinish` took 29 % of its samples, as CPU copies of guest buffers (`copyRegion`).
+  - **Copy probe** (`probe-patches\copy-region-probe.patch`): every copy was a binding with no
+    import. 92 % of the bytes were one 12.5 MiB binding (0x3f00094200), about 920 copies per
+    second. It starts inside a 2 MiB registered range and runs into the adjacent 12 MiB one;
+    `joinedRun` joined such runs only for a binding from the run's base.
+  - **Fixed in 375d360e24:** a binding from inside the first range also joins when that range is
+    imported on its own. 007 title went from 387-426 to 127-133 ms per frame; picture correct;
+    FF and LEGO level. `agc_driver_graphics` fails the "read-only V# across two imports" check on
+    head too (pre-existing).
+  - **Next for 007:** re-profile the committer and workers on 375d360e24. The menus are now about
+    8 fps; move to gameplay once they are reasonable.
+  - **First cutscene, cold cache (manual run, 2026-11-13):** rendering stops for minutes at a time
+    while queue worker 0 is inside the NVIDIA compiler (`vkCreate*Pipelines`). The other workers
+    wait in `PollSleep`; game audio continues.
+    - The cutscene's shaders are very large: 26 cache entries over 2 MiB, eight of them 7 to
+      9 MiB. One is 2.29 M SPIR-V words (476k instructions, 16 % `OpSelect`) from about 98 KiB of
+      guest code.
+    - 0x30032da200 falls back to two lanes per invocation (a barrier under per-lane control flow).
+    - Compiled pipelines are cached (our cache plus NVIDIA's), so each run gets further.
+    - Open: translation size (section E). The levers measured on LEGO are cheaper NaN checks (-5 %
+      words), `APS5_FAST_F32` (-22 %) and the spanned wave (-39 %).
+  - **Translation size, measured (2026-11-13, bc7ef96c09 and cb4485926e):** 158 compute requests
+    dumped to the title (`APS5_DUMP_SHADERS=1`, run `007\dump1`), replayed offline. All 29 large
+    programs fell back from spanned to paired: the spanned uniformity check counts every guest-memory
+    load as per-invocation once the module stores guest memory, and the deciding loads are guest
+    scalar loads (s_buffer_load, s_load, SRT reads), which are one value per wave in the guest's
+    scalar cache unless the program invalidates it.
+    - Change (`probe-patches\spanned-scalar-loads.patch`): the emitter records the id ranges of
+      scalar-load emission; the check exempts loads in them unless the program invalidates caches.
+      0 fallbacks; 21.3 M -> 13.9 M words. NVIDIA compile of the largest (0x3500c6aa00), timed
+      offline: 92.9 s -> 42.7 s; 0x3000b8fc00 13.5 -> 6.3 s.
+    - Change (`probe-patches\cheaper-nan-check.patch`): `FPIsNan32` instead of And + UGreaterThan in
+      the f32 NaN propagation, exact, -3.4 % words.
+    - Cold start (empty NVIDIA and our caches, 300 s; runs `007\cold-head`, `007\cold-span`): head
+      still black at 250 s (236 presents); change past the stall at about 150 s, boot notice shown.
+    - Warm, steady (runs `007\warm-span1/2`, `007\warm-head2`): 121-129 ms with the change vs
+      126-141 ms on head; no runtime cost seen. Tests: only `agc_driver_graphics` and
+      `agc_driver_frame_replay_rewind_copy` fail, both on head too. LEGO 45.9-47.1 vs 47.1-47.6 ms,
+      FF 31.5-31.7 vs 32.3 ms (runs `<title>\span-on1/2`, `span-head1/2`), pictures correct.
+    - Next: the largest program still takes 43 s; `APS5_FAST_F32` (-18 % here) is not exact.
+- **1:** first audit pass fails on all three titles. Skipped functions: LEGO 158, FF 39, AoM 147.
+  The bundled PRX modules are not framed, and code without `.eh_frame` bounds is not checked. The
+  two "shorter than a jump" shapes and the push/pop shape are about 70 % of the skipped functions.
+  - **RIP-relative widening (2026-11-13, 58acf93710, `probe-patches\redzone-rip-relative-widening.patch`):**
+    prologue, exit and operand stubs may now cover RIP-relative instructions, with a relocation
+    per copied displacement. Skipped: LEGO 158 -> 77 (short exits 87 -> 17, short prologues
+    14 -> 2), AoM 147 -> 136, FF 39 unchanged. LEGO converted with `--frame-red-zone` runs the
+    bench scene normally (46.6-48.1 vs 46.8 ms unframed, same picture; runs `lego\rz-plain1`,
+    `lego\rz-framed1/2`); the game folder was restored to its previous conversion afterwards
+    (backup `lego-convert-backup`). Tests: red-zone unit and execution tests pass (new execution
+    case: a short exit widened over a RIP-relative lea, checked under the clobber).
+  - **Skipped leaves without stores (measured, not used):** a leaf that stores only through rsp
+    cannot take a write-protection fault. FF 13 of 39, LEGO 28 of 158 (before the change above).
+  - **Return thunks (96f2e8d266):** a leaf without pushes, allocation or frame pointer whose exits
+    cannot be patched gets an entry stub that lowers rsp and calls the rest of itself, so each ret
+    lands on `lea rsp, [rsp+shift]; ret`; its pushes and pops must balance on every path. Stubs may
+    also carry a jcc. Skipped: AoM 136 -> 66 (66 thunks), LEGO 77 -> 52 (23), FF 39 -> 31 (7).
+    LEGO framed runs normally (46.8-48.1 ms, runs `lego\rz-thunk1/2`), folder restored after.
+  - **Tail-jump entries and AH (1d54fb40d5):** only a branch from inside the leaf to its start
+    blocks a widened prologue; `ah` (register 4 without REX) is no longer read as rsp. Skipped:
+    AoM 66 -> 44, LEGO 52 -> 42, FF 31 -> 18.
+  - **Thunk gap fix (110ddcf025):** a leaf with pushes after an early-out ret went through a thunk
+    whose gap did not cover those pushes, so its spills overwrote its saved registers (framed AoM
+    crashed at start-up in crc32 at 0x39f1900). The gap now covers the pushes before each red-zone
+    operand; past 128 bytes the leaf is skipped ("too deep for a thunk": AoM 5, 007 5).
+    Framed runs: AoM title screen correct, p50 158 ms vs 163-167 plain (`aom\rz-aom-framed2`,
+    `rz-aom-plain3/4`); 007 p50 125 ms, no crash (`007\rz-framed1`). Folders restored after.
+  - **rsp arithmetic in the body (b4eec7ba80):** frame-pointer leaves whose `[rbp-x]` slots lie in
+    a `sub rsp` allocation freed only in epilogues are not red-zone users (007: 31). Leaves without
+    a frame pointer that move rsp outside their prologue allocation and frees return through a
+    thunk whose walk tracks pushed slots and allocations; the gap holds the whole frame (up to
+    2 KiB, disp32 lea). Crash checks (40 s, framed, folders restored): AoM, 007, LEGO, FF clean.
+  - **Tail-call exits (bb0218c541):** a jmp to another function's start (or outside every
+    function), or an indirect jmp right after the prologue's pops, is an exit; its stub relocates
+    the jump. Indirect jumps without pushes or pops first (jump tables) stay refused. Crash checks
+    (40 s) clean on all four titles.
+  - **Jump tables (a3fe6be7cc, 7e21d150bd):** `lea; movsxd [base+i*4]; add; jmp reg` tables are
+    read (from any load segment) until an entry misses an instruction of the function; a lea
+    hoisted out of the window takes every table the function's RIP-relative leas address. Cases
+    become branch targets and walk successors. Function-pointer jumps (`jmp [reg+disp]`,
+    `mov reg,[..]; jmp reg`) are tail calls. Entries or branches past the first int3 refuse.
+  - **Thunk retry (59d1573627) and thunk tail calls (68a1d63afa):** a leaf without a frame pointer
+    whose exits cannot be patched is retried as a thunk with its pushes in the body; a thunk's
+    tail call leaves through a stub raising rsp over the gap and slot (callee sees the caller's
+    return address and stack arguments).
+  - Crash checks (40 s, all four titles) clean after each step.
+  - **Whole-leaf relocation (98cf5da8d9): skipped 0 on all four titles** (from 132 / 147 / 158 /
+    39 at the start of phase 1). A leaf that neither in-place framing nor a thunk can take is
+    copied into a stub that runs it with rsp 0x80 lower: rsp operands +0x80, pushes and pops
+    rewritten as mov + lea so every stack slot keeps its address, every exit (ret, tail call,
+    branch out) raises rsp first. The start jumps to the stub; jump-table cases get a join site
+    each (none needed in the four titles). Absolute tables are read from RELATIVE addends; a table
+    of other functions' starts (007's threaded interpreter handlers) is a tail call. A function
+    entered from outside its start is relocated instead of patched (none in the four titles).
+    Relocated: 007 8, AoM 7, LEGO 2, FF 1; 007's last leaf framed in place once its dispatch
+    window skips VEX vector instructions. Crash checks (40 s) clean; folders restored.
+- **2 and 3:** not started.
+- **4:** section B is built in its walk-based form (bound ranges and index windows). It took the
+  AoM title from 216 to about 150 ms. The section D validity change is not started.
+- **5:**
+  - The timeline item for indirect draws in the pass is done (AoM 745 to 72 passes per frame).
+  - **AoM translation**, from a GPU Trace of one title frame
+    (`traces\game_2026_11_13_01_07_27.ngfx-gputrace`):
+    - The vertex code 0x3f849c900 shared by the two hot programs is memory-latency bound.
+    - About 30 % of the hot program's samples are the per-fetch `probe_bda_pointer` binary search
+      (13 fetches per invocation), and about 25 % wait on the vertex data.
+    - Every host-memory class has been ruled out by probes.
+  - **AoM timeline:** draws sum to 49 ms and dispatches to 35 ms of the 147 ms frame. One draw takes
+    12.5 ms and one dispatch takes 8 ms.
+  - **LEGO translation:** the program is latency-bound with no single emulation cost to remove.
+    Open: restructure the wave64 mapping, or accept that the guest workload at 3840x2160 is the
+    cost.
+- **6:** per-draw record cost is 12 to 25 us. On the AoM worker, stage preparation brings this to
+  about 156 us per draw.
+
+
 ## Phase 1 and 2 status detail to 2026-11-15 (moved from DESIGN.md when its rows were condensed)
 
 | Phase | State |

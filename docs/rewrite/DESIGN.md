@@ -224,6 +224,17 @@ buffer regions often span two mappings and no single import served them. Found a
   the top costs. 007: 117 to 135 ms per frame over the whole scene, two runs. FF 36.6, LEGO 49.1,
   AoM 157.1: unchanged. Tests: 1,808 of 1,808 with section A on; with it off one label test
   (`agc_driver_unregistered_label_on_gpu`) failed once and passed 70 repeats after.
+- Flush waits (08734574ed, `libs\g2`): 007 spent about 14.5 s per run in 930 storage flushes
+  that waited 5 ms or more for earlier batches (storage image creation 5.8 s, imported buffer
+  region 2.9 s, written buffer range 2.9 s, buffer fill 2.5 s). They were refused the ordered
+  (no-wait) flush because the caller had not asked for it, although the reader was recorded GPU
+  work. Flushes for those four readers and for copied buffer regions are now ordered, and a
+  texture served by several imports qualifies (`APS5_NO_CONSUMER_GPU_ORDERED=1`,
+  `APS5_ORDERED_FLUSH_ONE_IMPORT=1` restore the old rules; `APS5_TRACE_FLUSH_WAIT=1` with a
+  profiled run lists the waits). Waits left: about 2 s per run, half of it "readback before
+  label". 007: 83 to 93 ms per frame in one run and 85 to 122 in the other (was 95 before the
+  scene change, 119 to 132 after). FF 35.6 and 37.0, LEGO 49.0, AoM 155.4 and 162.2: unchanged.
+  Tests 1,808 of 1,808 with section A on and off.
 - 007's storage cache sits at its 7.2 GiB budget and makes about 41 images per present: the
   title allocates the same kind of target at hundreds of addresses in a cycle (1280x720 format
   36 at 338 addresses). Each new image uploads its whole surface ("first", 231 MiB per present).
