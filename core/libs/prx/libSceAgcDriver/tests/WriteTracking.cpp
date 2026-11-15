@@ -27,6 +27,7 @@
 #include <limits>
 #include <mutex>
 #include <random>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -2601,6 +2602,113 @@ void CheckResourceVersions() {
     if (!Watched(unwatched.front().first, outside.size())) Require(!HoldVersion(refused, unwatched, none) && CurrentVersion(refused, CollectEpoch()) == 0, "an unwatched range was given a version");
 }
 
+std::vector<std::uint64_t> fakeArmedWords;
+std::uint64_t fakeArmedBase = 0;
+std::uint64_t fakeArmRequests = 0;
+bool fakeArmable = true;
+
+std::uint64_t* FakeArmedWord(std::uint64_t address, std::size_t index) {
+    const auto block = address / Block + index;
+    const auto first = fakeArmedBase / Block;
+    return block >= first && block - first < fakeArmedWords.size() ? &fakeArmedWords[static_cast<std::size_t>(block - first)] : nullptr;
+}
+
+bool FakeArmedTokens(std::uint64_t address, std::size_t, std::span<std::uint64_t> tokens) {
+    bool every = !tokens.empty();
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        const auto* word = FakeArmedWord(address, index);
+        tokens[index] = word != nullptr && (*word & 1u) != 0 ? *word : 0;
+        every = every && tokens[index] != 0;
+    }
+    return every;
+}
+
+bool FakeArmedClean(std::uint64_t address, std::size_t, std::span<const std::uint64_t> tokens) {
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        const auto* word = FakeArmedWord(address, index);
+        if (word == nullptr || tokens[index] == 0 || *word != tokens[index]) return false;
+    }
+    return !tokens.empty();
+}
+
+bool FakeArm(std::uint64_t address, std::size_t, std::span<std::uint64_t> tokens) {
+    ++fakeArmRequests;
+    std::fill(tokens.begin(), tokens.end(), std::uint64_t{0});
+    if (!fakeArmable) return false;
+    for (std::size_t index = 0; index < tokens.size(); ++index) {
+        auto* word = FakeArmedWord(address, index);
+        if (word == nullptr) return false;
+        *word |= 1u;
+        tokens[index] = *word;
+    }
+    return true;
+}
+
+void FakeArmedWrite(std::uint64_t address) {
+    auto* word = FakeArmedWord(address, 0);
+    if (word != nullptr && (*word & 1u) != 0) ++*word;
+}
+
+void CheckArmedProofs() {
+    if (!ResourceVersions()) return;
+    auto* memory = static_cast<std::uint8_t*>(AllocateWatched(3 * Block));
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0, 3 * Block);
+    fakeArmedBase = base;
+    fakeArmedWords.assign(3, 0);
+    fakeArmRequests = 0;
+    fakeArmable = true;
+    const ArmedProofSource source{&FakeArmedTokens, &FakeArmedClean, &FakeArm};
+    SetArmedProofSourceForTest(&source);
+    Require(ArmedProofs(), "a test source did not turn the armed proofs on");
+    using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+    Ranges swept{{base, base + Block}};
+    Ranges none;
+    ResourceVersion version;
+    BumpCollectEpoch();
+    Require(HoldVersion(version, swept, none), "a watched range was refused a version");
+    const auto established = CurrentVersion(version, CollectEpoch());
+    Require(established != 0 && version.armed.size() == 1 && version.armed.front().held && fakeArmRequests == 1, "a swept range was not armed and collected once for its version");
+    BumpCollectEpoch();
+    auto counted = ArmedProofsCounted();
+    auto calls = CollectCounted().watchCalls;
+    Require(CurrentVersion(version, CollectEpoch()) == established, "an unwritten armed range moved its version");
+    Require(ArmedProofsCounted().sweeps == counted.sweeps + 1 && CollectCounted().watchCalls == calls && fakeArmRequests == 1, "the sweep of an armed and unwritten range collected or armed again");
+    memory[64] = 1;
+    FakeArmedWrite(base);
+    BumpCollectEpoch();
+    counted = ArmedProofsCounted();
+    const auto written = CurrentVersion(version, CollectEpoch());
+    Require(written != 0 && written != established, "a write to an armed range kept its version");
+    Require(ArmedProofsCounted().broken == counted.broken + 1 && version.armed.front().held, "a written range was not armed and collected again");
+    fakeArmable = false;
+    memory[128] = 2;
+    FakeArmedWrite(base);
+    BumpCollectEpoch();
+    const auto requests = fakeArmRequests;
+    const auto refused = CurrentVersion(version, CollectEpoch());
+    Require(refused != 0 && refused != written && !version.armed.front().held && fakeArmRequests == requests + 1, "a range that cannot be armed was not swept by a collect");
+    memory[192] = 3;
+    BumpCollectEpoch();
+    const auto swept2 = CurrentVersion(version, CollectEpoch());
+    Require(swept2 != 0 && swept2 != refused && fakeArmRequests == requests + 1, "a refused range was asked again before its rest, or its sweep missed a write");
+    fakeArmable = true;
+    ArmedProof proof;
+    const auto first = CollectWritesArmed(proof, base + Block, Block);
+    Require(first != 0 && proof.held, "a collected range was not armed for its proof");
+    counted = ArmedProofsCounted();
+    calls = CollectCounted().watchCalls;
+    const auto second = CollectWritesArmed(proof, base + Block, Block);
+    Require(second != 0 && ArmedProofsCounted().answered == counted.answered + 1 && CollectCounted().watchCalls == calls, "an armed and unwritten range was collected again");
+    Require(UnchangedSince(base + Block, Block, second), "an answer from armed blocks is not a generation the range is unchanged since");
+    memory[Block + 8] = 4;
+    FakeArmedWrite(base + Block);
+    const auto third = CollectWritesArmed(proof, base + Block, Block);
+    Require(third != 0 && !UnchangedSince(base + Block, Block, second) && UnchangedSince(base + Block, Block, third), "a write to an armed range was not collected");
+    Require(proof.held && !ArmedProofHolds(proof, base + 2 * Block, Block) && !proof.held, "a proof answered for another range");
+    SetArmedProofSourceForTest(nullptr);
+}
+
 void CheckAdoptLatestEpoch() {
     std::uint64_t bumped = 0;
     std::thread([&] {
@@ -2840,6 +2948,7 @@ int main(int argc, char** argv) {
         CheckCommittedRanges();
         CheckAdoptLatestEpoch();
         CheckResourceVersions();
+        CheckArmedProofs();
 #ifndef _WIN32
         CheckOwnStoreImages();
 #endif

@@ -3523,6 +3523,161 @@ std::shared_ptr<WriteSubscription> subscribe(std::span<const std::pair<std::uint
     return std::shared_ptr<WriteSubscription>(subscription, &releaseSubscription);
 }
 
+struct ArmedProofCounters {
+    std::atomic<std::uint64_t> answered{0};
+    std::atomic<std::uint64_t> sweeps{0};
+    std::atomic<std::uint64_t> asked{0};
+    std::atomic<std::uint64_t> granted{0};
+    std::atomic<std::uint64_t> broken{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> races{0};
+};
+
+ArmedProofCounters& armedProofCounters() {
+    static ArmedProofCounters counters;
+    return counters;
+}
+
+std::atomic<const ArmedProofSource*> armedProofSource{nullptr};
+
+const ArmedProofSource& armedSource() {
+    static const ArmedProofSource tracked{&ArmedTokens, &ArmedCleanSince, &ArmBlocks};
+    const auto* source = armedProofSource.load(std::memory_order_acquire);
+    return source != nullptr ? *source : tracked;
+}
+
+bool armedProofsVerified() {
+    static const bool verified = std::getenv("APS5_VERIFY_DIRTY_FIRST_INPUTS") != nullptr;
+    return verified;
+}
+
+void verifyArmedProof(const ArmedProof& proof, std::uint64_t address, std::size_t bytes) {
+    auto& counters = armedProofCounters();
+    counters.verified.fetch_add(1, std::memory_order_relaxed);
+    const auto before = TrackerGeneration();
+    if (!CpuWroteSince(address, bytes, before)) return;
+    if (!armedSource().clean(address, bytes, proof.tokens)) {
+        counters.races.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    char text[192];
+    std::snprintf(text, sizeof(text), "APS5_VERIFY_DIRTY_FIRST_INPUTS: the blocks of 0x%llx+0x%zx are armed and unwritten while a collect finds processor writes in them", static_cast<unsigned long long>(address), bytes);
+    throw std::runtime_error(text);
+}
+
+std::uint64_t establishArmedProof(ArmedProof& proof, std::uint64_t address, std::size_t bytes) {
+    proof.held = false;
+    const auto now = nextCollectEpoch.load(std::memory_order_acquire);
+    const auto blocks = ArmedBlocks(address, bytes);
+    if (blocks == 0 || blocks > ArmedProofBlocks) return 0;
+    if (proof.address == address && proof.bytes == bytes && now < proof.askAfter) return 0;
+    auto& counters = armedProofCounters();
+    const auto& source = armedSource();
+    proof.address = address;
+    proof.bytes = bytes;
+    proof.askAfter = 0;
+    proof.tokens.assign(blocks, 0);
+    counters.asked.fetch_add(1, std::memory_order_relaxed);
+    if (!source.tokens(address, bytes, proof.tokens) && !source.arm(address, bytes, proof.tokens)) {
+        proof.askAfter = now + ArmedProofRest;
+        proof.tokens.clear();
+        return 0;
+    }
+    counters.granted.fetch_add(1, std::memory_order_relaxed);
+    const auto generation = CollectWritesUncached(address, bytes);
+    proof.held = generation != 0;
+    if (!proof.held) proof.askAfter = now + ArmedProofRest;
+    return generation;
+}
+
+bool sweepArmed(ResourceVersion& version) {
+    if (!ArmedProofs()) return false;
+    auto& armed = version.armed;
+    if (armed.size() != version.swept.size()) armed.assign(version.swept.size(), ArmedProof{});
+    const auto every = [&] {
+        bool held = true;
+        for (std::size_t index = 0; index < armed.size(); ++index) {
+            const auto& [begin, end] = version.swept[index];
+            if (end > begin && !ArmedProofHolds(armed[index], begin, static_cast<std::size_t>(end - begin))) held = false;
+        }
+        return held;
+    };
+    if (!every()) {
+        bool established = true;
+        for (std::size_t index = 0; index < armed.size(); ++index) {
+            const auto& [begin, end] = version.swept[index];
+            if (end <= begin || armed[index].held) continue;
+            if (establishArmedProof(armed[index], begin, static_cast<std::size_t>(end - begin)) == 0) established = false;
+        }
+        if (!established) return false;
+    }
+    armedProofCounters().sweeps.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+}
+
+bool ArmedProofs() {
+    if (armedProofSource.load(std::memory_order_acquire) != nullptr) return true;
+    static const bool enabled = [] {
+        if (std::getenv("APS5_DIRTY_FIRST_INPUTS") == nullptr || std::getenv("APS5_NO_DIRTY_FIRST_PROOFS") != nullptr) return false;
+#ifdef _WIN32
+        return GuestArena::GuestPageTrackEnabled_nid_no_patch();
+#else
+        return false;
+#endif
+    }();
+    return enabled;
+}
+
+void SetArmedProofSourceForTest(const ArmedProofSource* source) {
+    armedProofSource.store(source, std::memory_order_release);
+}
+
+bool ArmedProofHolds(ArmedProof& proof, std::uint64_t address, std::size_t bytes) {
+    if (!proof.held) return false;
+    if (ArmedProofs() && proof.address == address && proof.bytes == bytes && proof.tokens.size() == ArmedBlocks(address, bytes) && armedSource().clean(address, bytes, proof.tokens)) {
+        if (armedProofsVerified()) verifyArmedProof(proof, address, bytes);
+        return true;
+    }
+    proof.held = false;
+    armedProofCounters().broken.fetch_add(1, std::memory_order_relaxed);
+    return false;
+}
+
+std::uint64_t CollectWritesArmed(ArmedProof& proof, std::uint64_t address, std::size_t bytes) {
+    if (!ArmedProofs()) return CollectWrites(address, bytes);
+    if (ArmedProofHolds(proof, address, bytes)) {
+        if (const auto generation = Tracker().stable.load(std::memory_order_acquire); generation != 0) {
+            armedProofCounters().answered.fetch_add(1, std::memory_order_relaxed);
+            return generation;
+        }
+    }
+    if (const auto generation = establishArmedProof(proof, address, bytes); generation != 0) return generation;
+    return CollectWrites(address, bytes);
+}
+
+ArmedProofCounts ArmedProofsCounted() {
+    const auto& counters = armedProofCounters();
+    ArmedProofCounts counts;
+    counts.answered = counters.answered.load(std::memory_order_relaxed);
+    counts.sweeps = counters.sweeps.load(std::memory_order_relaxed);
+    counts.asked = counters.asked.load(std::memory_order_relaxed);
+    counts.granted = counters.granted.load(std::memory_order_relaxed);
+    counts.broken = counters.broken.load(std::memory_order_relaxed);
+    counts.verified = counters.verified.load(std::memory_order_relaxed);
+    counts.races = counters.races.load(std::memory_order_relaxed);
+    return counts;
+}
+
+std::string ArmedProofReport() {
+    static ArmedProofCounts reported{};
+    const auto now = ArmedProofsCounted();
+    const auto since = [](std::uint64_t current, std::uint64_t before) { return static_cast<unsigned long long>(current - before); };
+    char text[448];
+    std::snprintf(text, sizeof(text), "%llu collects of a proved surface answered by armed blocks alone, %llu version sweeps answered by armed blocks alone, %llu ranges asked to be armed for a proof, %llu of them armed and collected once, %llu proofs ended by a write to their blocks, %llu answers verified against a collect, %llu of them behind a later write", since(now.answered, reported.answered), since(now.sweeps, reported.sweeps), since(now.asked, reported.asked), since(now.granted, reported.granted), since(now.broken, reported.broken), since(now.verified, reported.verified), since(now.races, reported.races));
+    reported = now;
+    return text;
 }
 
 std::shared_ptr<WriteSubscription> SubscribeWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
@@ -3542,6 +3697,7 @@ bool HoldVersion(ResourceVersion& version, std::vector<std::pair<std::uint64_t, 
     const bool refused = !swept.empty() && version.subscription == nullptr;
     version.notedSubscription = !refused && !noted.empty() ? subscribe({}, noted, NotedSources, false, false) : nullptr;
     version.sweptEpoch = 0;
+    version.armed.clear();
     ++version.renewals;
     version.swept = swept;
     version.noted = noted;
@@ -3553,7 +3709,7 @@ bool HoldVersion(ResourceVersion& version, std::vector<std::pair<std::uint64_t, 
 std::uint64_t CurrentVersion(ResourceVersion& version, std::uint64_t epoch) {
     if (epoch == 0 || (version.subscription == nullptr && version.notedSubscription == nullptr)) return 0;
     if (version.subscription != nullptr && version.sweptEpoch != epoch) {
-        if (!SweepSubscription(*version.subscription)) return 0;
+        if (!sweepArmed(version) && !SweepSubscription(*version.subscription)) return 0;
         version.sweptEpoch = epoch;
     }
     const auto swept = version.subscription != nullptr ? SubscriptionGeneration(*version.subscription) : 0;

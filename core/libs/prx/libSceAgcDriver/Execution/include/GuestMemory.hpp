@@ -93,6 +93,35 @@ void NoteTextureReleased(std::uint64_t address);
 void NoteRegistryChange(std::uint64_t address, std::size_t bytes);
 enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Break, Registry, Count };
 bool ResourceVersions();
+struct ArmedProof {
+    std::vector<std::uint64_t> tokens;
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t askAfter = 0;
+    bool held = false;
+};
+struct ArmedProofSource {
+    bool (*tokens)(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens) = nullptr;
+    bool (*clean)(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> tokens) = nullptr;
+    bool (*arm)(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens) = nullptr;
+};
+struct ArmedProofCounts {
+    std::uint64_t answered = 0;
+    std::uint64_t sweeps = 0;
+    std::uint64_t asked = 0;
+    std::uint64_t granted = 0;
+    std::uint64_t broken = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t races = 0;
+};
+inline constexpr std::size_t ArmedProofBlocks = 4096;
+inline constexpr std::uint64_t ArmedProofRest = 256;
+bool ArmedProofs();
+void SetArmedProofSourceForTest(const ArmedProofSource* source);
+bool ArmedProofHolds(ArmedProof& proof, std::uint64_t address, std::size_t bytes);
+std::uint64_t CollectWritesArmed(ArmedProof& proof, std::uint64_t address, std::size_t bytes);
+ArmedProofCounts ArmedProofsCounted();
+std::string ArmedProofReport();
 struct ResourceVersion {
     std::shared_ptr<WriteSubscription> subscription;
     std::shared_ptr<WriteSubscription> notedSubscription;
@@ -101,6 +130,7 @@ struct ResourceVersion {
     std::uint64_t sweptEpoch = 0;
     std::uint64_t refusedUnwatch = 0;
     std::uint64_t renewals = 0;
+    std::vector<ArmedProof> armed;
 };
 bool HoldVersion(ResourceVersion& version, std::vector<std::pair<std::uint64_t, std::uint64_t>>& swept, std::vector<std::pair<std::uint64_t, std::uint64_t>>& noted);
 std::uint64_t CurrentVersion(ResourceVersion& version, std::uint64_t epoch);
