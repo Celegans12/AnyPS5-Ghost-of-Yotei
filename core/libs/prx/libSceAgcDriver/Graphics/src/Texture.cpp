@@ -300,8 +300,21 @@ bool GatheredUploads() {
 std::atomic<std::uint64_t> gatheredUploads{0}, gatheredUploadBytes{0};
 
 bool StorageBlockUnits(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry) {
-    return LayerTrackingEnabled() && BlockTrackingEnabled() && !geometry.thick && descriptor.tileMode != TextureTileMode::kLinear && descriptor.baseAddress % 65536 == 0
-        && std::none_of(geometry.mips.begin(), geometry.mips.end(), [](const TileMipLayout& mip) { return mip.gcnSplitStride != 0; });
+    if (!LayerTrackingEnabled() || !BlockTrackingEnabled() || geometry.thick || descriptor.tileMode == TextureTileMode::kLinear) return false;
+    if (std::any_of(geometry.mips.begin(), geometry.mips.end(), [](const TileMipLayout& mip) { return mip.gcnSplitStride != 0; })) return false;
+    const auto lead = descriptor.baseAddress % 65536;
+    if (lead == 0) return true;
+    // A base that is not a 64 KiB base: the units still follow the stamp blocks (a short first
+    // unit), so every level's tile blocks must divide the 4 KiB grid the block boundaries then
+    // fall on. Experiment: APS5_UNALIGNED_BLOCK_UNITS=1 turns it on.
+    static const bool unaligned = std::getenv("APS5_UNALIGNED_BLOCK_UNITS") != nullptr;
+    if (!unaligned || lead % 4096 != 0 || IsBlockCompressed(descriptor.format)) return false;
+    const auto elementBytes = BytesPerElement(descriptor.format);
+    if (!std::has_single_bit(elementBytes) || elementBytes > 16u) return false;
+    return std::all_of(geometry.mips.begin(), geometry.mips.end(), [&](const TileMipLayout& mip) {
+        const auto block = ThinBlockLayout(MipTileMode(descriptor.tileMode, mip), elementBytes)[0];
+        return block != 0 && block <= 4096u && 4096u % block == 0;
+    });
 }
 
 struct PhaseTimer {
@@ -1824,7 +1837,8 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         // Tile blocks divide the stamp blocks, so at an aligned base every unit is whole tile blocks
         // of its (layer, mip) slices (sliceWindows).
         blockUnits = StorageBlockUnits(descriptor, geometry);
-        trackedLayers = blockUnits ? static_cast<std::uint32_t>((guestBytes + 65535) / 65536) : layered && LayerTrackingEnabled() ? geometry.layers : 1u;
+        unitLead = blockUnits ? descriptor.baseAddress % 65536 : 0;
+        trackedLayers = blockUnits ? static_cast<std::uint32_t>((unitLead + guestBytes + 65535) / 65536) : layered && LayerTrackingEnabled() ? geometry.layers : 1u;
         trackedLayerBytes = blockUnits ? 65536 : guestBytes / trackedLayers;
         layerGeneration.assign(trackedLayers, 0);
         layerPendingSince.assign(trackedLayers, 0);
@@ -2494,8 +2508,8 @@ bool StorageTexture::RefreshLayers(std::uint32_t first, std::uint32_t count) {
     if (count == 0 || geometry.thick || geometry.imageLayers <= 1 || first >= geometry.imageLayers || count > geometry.imageLayers - first || geometry.layerBytes == 0 || trackedLayerBytes == 0 || descriptor.dccAddress != 0) return whole();
     const auto begin = geometry.GuestLayerOffset(first);
     const auto end = geometry.GuestLayerOffset(first + count - 1) + geometry.layerBytes;
-    const auto firstLayer = static_cast<std::uint32_t>(begin / trackedLayerBytes);
-    const auto lastLayer = static_cast<std::uint32_t>(std::min<std::uint64_t>((end + trackedLayerBytes - 1) / trackedLayerBytes, trackedLayers));
+    const auto firstLayer = unitAt(begin);
+    const auto lastLayer = unitsEnd(end);
     if (firstLayer >= lastLayer || (firstLayer == 0 && lastLayer == trackedLayers)) return whole();
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (layerPending[layer] && (layer < firstLayer || layer >= lastLayer)) return whole();
@@ -2681,7 +2695,7 @@ bool StorageTexture::refresh(std::uint32_t firstLayer, std::uint32_t lastLayer) 
             }
             if (compared) {
                 for (const auto& [from, unitGeneration] : keptAtUnwatch) {
-                    const auto unit = static_cast<std::uint32_t>((from - descriptor.baseAddress) / trackedLayerBytes);
+                    const auto unit = unitAt(from - descriptor.baseAddress);
                     if (keptAtUnwatchHolds(from, unit)) stampedBlocks[static_cast<std::size_t>(from / 65536 - descriptor.baseAddress / 65536)] = GuestMemory::BlockWritten;
                 }
                 if (scoped) {
@@ -3044,7 +3058,7 @@ bool StorageTexture::guestBytesStillHeld() const {
     if (original.size() != bytes || !originalHolds(descriptor.baseAddress, bytes)) return false;
     if (std::any_of(savedTicket.begin(), savedTicket.end(), [](std::uint64_t ticket) { return ticket != 0; })) return false;
     for (const auto& [from, unitGeneration] : keptAtUnwatch) {
-        if (keptAtUnwatchHolds(from, static_cast<std::uint32_t>((from - descriptor.baseAddress) / trackedLayerBytes))) return false;
+        if (keptAtUnwatchHolds(from, unitAt(from - descriptor.baseAddress))) return false;
     }
     constexpr std::uint64_t blockBytes = 65536;
     std::vector<std::uint8_t> blocks(static_cast<std::size_t>((descriptor.baseAddress + guestBytes - 1) / blockBytes - descriptor.baseAddress / blockBytes + 1));
@@ -3162,7 +3176,7 @@ StorageTexture::BaselineMiss StorageTexture::baselineMiss(std::uint32_t unit) co
 }
 
 bool StorageTexture::originalHolds(std::uint64_t address, std::size_t bytes) const {
-    for (auto layer = (address - descriptor.baseAddress) / trackedLayerBytes; layer < trackedLayers && layer * trackedLayerBytes < address - descriptor.baseAddress + bytes; ++layer) {
+    for (auto layer = unitAt(address - descriptor.baseAddress); layer < trackedLayers && unitOffset(layer) < address - descriptor.baseAddress + bytes; ++layer) {
         if (!layerOriginal[static_cast<std::size_t>(layer)]) return false;
     }
     return true;
@@ -3231,7 +3245,7 @@ std::vector<bool> StorageTexture::cpuUploadLayers(const std::vector<bool>& units
     for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
         const auto begin = geometry.GuestLayerOffset(layer);
         const auto end = begin + geometry.layerBytes;
-        if (end <= begin || end > guestBytes || begin % trackedLayerBytes != 0 || (end % trackedLayerBytes != 0 && end != guestBytes)) return {};
+        if (end <= begin || end > guestBytes || unitLead != 0 || begin % trackedLayerBytes != 0 || (end % trackedLayerBytes != 0 && end != guestBytes)) return {};
         const auto first = static_cast<std::uint32_t>(begin / trackedLayerBytes);
         const auto last = static_cast<std::uint32_t>((end + trackedLayerBytes - 1) / trackedLayerBytes);
         if (first >= last || last > trackedLayers) return {};
@@ -3584,7 +3598,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> StorageTexture::unitRuns(co
     std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
     for (std::uint32_t unit = 0; unit < trackedLayers; ++unit) {
         if (!units[unit]) continue;
-        const auto begin = static_cast<std::uint64_t>(unit) * trackedLayerBytes;
+        const auto begin = unitOffset(unit);
         const auto end = begin + layerBytes(unit);
         if (!runs.empty() && runs.back().second == begin) runs.back().second = end;
         else runs.emplace_back(begin, end);
@@ -4502,8 +4516,8 @@ void StorageTexture::MarkSliceDirty(std::uint32_t slice, std::uint32_t count) {
         return;
     }
     const auto begin = geometry.GuestLayerOffset(slice);
-    const auto first = static_cast<std::uint32_t>(begin / trackedLayerBytes);
-    const auto last = static_cast<std::uint32_t>(std::min<std::uint64_t>((begin + geometry.layerBytes * count + trackedLayerBytes - 1) / trackedLayerBytes, trackedLayers));
+    const auto first = unitAt(begin);
+    const auto last = unitsEnd(begin + geometry.layerBytes * count);
     if (first >= last) {
         MarkDirty();
         return;
@@ -4555,8 +4569,8 @@ void StorageTexture::noteLayersBehind(std::uint32_t firstLayer, std::uint32_t la
                 const auto begin = std::max(from, other->layerBegin(unit));
                 const auto end = std::min(to, other->layerBegin(unit) + other->layerBytes(unit));
                 if (end <= begin) continue;
-                const auto first = static_cast<std::uint32_t>((begin - descriptor.baseAddress) / trackedLayerBytes);
-                const auto last = static_cast<std::uint32_t>(std::min<std::uint64_t>((end - descriptor.baseAddress + trackedLayerBytes - 1) / trackedLayerBytes, trackedLayers));
+                const auto first = unitAt(begin - descriptor.baseAddress);
+                const auto last = unitsEnd(end - descriptor.baseAddress);
                 for (auto layer = first; layer < last; ++layer) layerBehind[layer] = true;
             }
         }
@@ -4666,7 +4680,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         layerPending.SetRange(first, count, true);
     }
     const auto pendingSince = GuestMemory::TrackerGeneration();
-    StampUnkeptUnits(keptAtUnwatch, {descriptor.baseAddress, trackedLayerBytes, guestBytes}, layerGeneration, layerPendingSince, first, count, pendingSince);
+    StampUnkeptUnits(keptAtUnwatch, {descriptor.baseAddress, trackedLayerBytes, guestBytes, unitLead}, layerGeneration, layerPendingSince, first, count, pendingSince);
     // Results of this image now cover the alias's results borrowed into these units: this image
     // stores them, the alias no longer has to (its results, unchanged since the borrow, are in
     // this image's content). An alias written since keeps its own newer results pending.
@@ -6528,7 +6542,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
             return false;
         }
     }
-    if (layer != WholeImage && blockUnits && ((begin - descriptor.baseAddress) % trackedLayerBytes != 0 || bytes % trackedLayerBytes != 0)) {
+    if (layer != WholeImage && blockUnits && (unitLead != 0 || (begin - descriptor.baseAddress) % trackedLayerBytes != 0 || bytes % trackedLayerBytes != 0)) {
         refusal = "layer alignment";
         return false;
     }
@@ -6767,15 +6781,15 @@ void StorageTexture::MarkUnitsWritten(const std::vector<bool>& units) {
     }
     uploadedKeys = DccKeys::Uncompressed;
     for (const auto& [begin, end] : runs) {
-        const auto first = static_cast<std::uint32_t>(begin / trackedLayerBytes);
-        const auto count = static_cast<std::uint32_t>((end - begin + trackedLayerBytes - 1) / trackedLayerBytes);
+        const auto first = unitAt(begin);
+        const auto count = unitsEnd(end) - first;
         const auto collected = GuestMemory::CollectWritesUncached(descriptor.baseAddress + begin, static_cast<std::size_t>(end - begin));
         for (auto unit = first; unit < first + count; ++unit) layerGeneration[unit] = collected;
     }
     refreshGeneration();
     for (const auto& [begin, end] : runs) {
-        const auto first = static_cast<std::uint32_t>(begin / trackedLayerBytes);
-        const auto count = static_cast<std::uint32_t>((end - begin + trackedLayerBytes - 1) / trackedLayerBytes);
+        const auto first = unitAt(begin);
+        const auto count = unitsEnd(end) - first;
         forgetBorrowed(first, count);
         markLayersPending(first, count);
     }
@@ -6798,7 +6812,7 @@ std::vector<StorageTexture::Adjacent> StorageTexture::adjacentPendingUnchanged(s
             // Surfaces that do not overlap share at most one block: the neighbour's tracked layer
             // holding it is what the stamps touch.
             const auto shared = std::max(neighbourFirst, firstBlock);
-            const auto layer = static_cast<std::uint32_t>((std::max(shared * block, begin) - begin) / texture->trackedLayerBytes);
+            const auto layer = texture->unitAt(std::max(shared * block, begin) - begin);
             if (auto alive = texture->weak_from_this().lock()) adjacent.push_back({std::move(alive), layer, texture->layerGeneration[layer]});
         };
         for (auto* texture : pending.textures) consider(texture);
@@ -6878,7 +6892,7 @@ std::uint64_t StorageTexture::HandedOverSuperseded() {
 }
 
 std::optional<DccKeys> StorageTexture::clearHandOver() {
-    if (!ClearHandOverOn().load(std::memory_order_relaxed) || !blockUnits || descriptor.dccAddress == 0 || anyLayerPending()) return std::nullopt;
+    if (!ClearHandOverOn().load(std::memory_order_relaxed) || !blockUnits || unitLead != 0 || descriptor.dccAddress == 0 || anyLayerPending()) return std::nullopt;
     if (!GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) return std::nullopt;
     const auto others = overlappingPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (others.empty()) return std::nullopt;
@@ -6903,7 +6917,7 @@ std::optional<DccKeys> StorageTexture::clearHandOver() {
     for (const auto& other : others) {
         for (std::uint32_t unit = 0; unit < other->trackedLayers; ++unit) {
             const auto from = other->layerBegin(unit);
-            if (other->layerPending[unit] && from >= begin && from < end) handedUnits[static_cast<std::size_t>((from - begin) / trackedLayerBytes)] = true;
+            if (other->layerPending[unit] && from >= begin && from < end) handedUnits[unitAt(from - begin)] = true;
         }
         const auto same = std::find_if(handedOver.begin(), handedOver.end(), [&](const auto& entry) { return entry.first.lock() == other; });
         if (same != handedOver.end()) same->second = other->writes;
@@ -6998,7 +7012,7 @@ StorageTexture::CreationHandOver StorageTexture::PrepareCreation(const Context& 
     flushed = false;
     if (!ClearHandOverOn().load(std::memory_order_relaxed) || descriptor.dccAddress == 0 || IsBlockCompressed(descriptor.format)) return storeFirst();
     const auto geometry = DescribeSurface(descriptor);
-    if (geometry.guestBytes != guestBytes || !StorageBlockUnits(descriptor, geometry)) return storeFirst();
+    if (geometry.guestBytes != guestBytes || descriptor.baseAddress % 65536 != 0 || !StorageBlockUnits(descriptor, geometry)) return storeFirst();
     const auto keyBytes = DccKeyBytes(guestBytes);
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     CompletePendingCpuWrites(context, descriptor.dccAddress, keyBytes);
@@ -7031,7 +7045,7 @@ StorageTexture::CreationHandOver StorageTexture::PrepareCreation(const Context& 
 
 void StorageTexture::AdoptHandOver(CreationHandOver handOver) {
     if (!handOver.handed) return;
-    if (!blockUnits || trackedLayerBytes != 65536 || uploadedKeys != handOver.keys || anyLayerPending()) {
+    if (!blockUnits || trackedLayerBytes != 65536 || unitLead != 0 || uploadedKeys != handOver.keys || anyLayerPending()) {
         FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), this, "storage image creation", PublishScope::None);
         if (handOver.detached != nullptr) handOver.detached->Flush();
         if (uploadedKeys != handOver.keys) Refresh();
@@ -7043,7 +7057,7 @@ void StorageTexture::AdoptHandOver(CreationHandOver handOver) {
     for (const auto& source : handOver.sources) {
         for (std::uint32_t unit = 0; unit < source->trackedLayers; ++unit) {
             const auto from = source->layerBegin(unit);
-            if (source->layerPending[unit] && from >= begin && from < end) handedUnits[static_cast<std::size_t>((from - begin) / trackedLayerBytes)] = true;
+            if (source->layerPending[unit] && from >= begin && from < end) handedUnits[unitAt(from - begin)] = true;
         }
         const auto same = std::find_if(handedOver.begin(), handedOver.end(), [&](const auto& entry) { return entry.first.lock() == source; });
         if (same != handedOver.end()) same->second = source->writes;
@@ -7343,7 +7357,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             const auto from = descriptor.baseAddress + begin;
             const auto last = descriptor.baseAddress + end - 1;
             if (!compareUntracked(from, static_cast<std::size_t>(end - begin), std::span(changedBlocks).subspan(static_cast<std::size_t>((from - spanBegin) / block), static_cast<std::size_t>(last / block - from / block + 1)))) continue;
-            for (auto layer = static_cast<std::uint32_t>(begin / trackedLayerBytes); layer < trackedLayers && layerBegin(layer) <= last; ++layer) compared[layer] = true;
+            for (auto layer = unitAt(begin); layer < trackedLayers && layerBegin(layer) <= last; ++layer) compared[layer] = true;
         }
     }
     const auto forgetStored = [&] {
