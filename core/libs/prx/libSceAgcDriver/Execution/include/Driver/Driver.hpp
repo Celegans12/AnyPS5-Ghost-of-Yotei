@@ -57,6 +57,7 @@ inline std::uint32_t ThreadDimensionGroups(std::uint32_t threads, std::uint32_t 
 }
 
 struct DrawTail;
+struct DrawSiteAccess;
 
 class Driver {
 public:
@@ -152,6 +153,7 @@ private:
     friend struct PendingView;
     friend struct PacketTimer;
     friend struct DriverTestAccess;
+    friend struct DrawSiteAccess;
     void stop();
     Driver();
     void rethrowFailure() const;

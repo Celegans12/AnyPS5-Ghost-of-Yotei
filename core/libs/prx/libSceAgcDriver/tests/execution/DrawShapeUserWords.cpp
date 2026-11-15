@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawSites.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
@@ -41,6 +42,10 @@ using AgcDriver::DriverDetail::DrawShapeKeys;
 using AgcDriver::DriverDetail::DrawShapeMiss;
 using AgcDriver::DriverDetail::DrawShapeReuse;
 using AgcDriver::DriverDetail::DrawShapeWord;
+using AgcDriver::DriverDetail::DrawSiteAccess;
+using AgcDriver::DriverDetail::DrawSiteCounters;
+using AgcDriver::DriverDetail::DrawSiteMiss;
+using AgcDriver::DriverDetail::DrawSiteRefusal;
 using AgcDriver::DriverDetail::Driver;
 using AgcDriver::DriverDetail::UserWordMove;
 using ShaderRecompiler::RecompileResult;
@@ -59,6 +64,8 @@ alignas(256) constexpr std::array<std::uint32_t, 10> InputVertexCode{
     0xf80008cfu, 0x0d0c0b0au,
     0xbf810000u,
 };
+alignas(256) constexpr auto SiteVertexCode = TriangleVertexCode;
+alignas(256) constexpr auto SiteInputVertexCode = InputVertexCode;
 constexpr std::uint32_t RenderTargetAttrib3 = 0x9000000u | (0x1bu << 14u);
 constexpr std::size_t TargetBytes = 65536;
 
@@ -97,6 +104,7 @@ struct Header {
 
 alignas(8) Header VertexHeader{};
 alignas(8) Header PixelHeader{};
+alignas(8) Header SiteVertexHeader{};
 
 void Registered(Header& header, const std::uint32_t* code, std::size_t bytes, std::uint8_t type) {
     header.shader.file_header = 0x34333231u;
@@ -117,9 +125,9 @@ struct InputHeader {
 };
 
 alignas(8) InputHeader VertexInputHeader{};
+alignas(8) InputHeader SiteInputHeader{};
 
-void RegisterInputVertex() {
-    auto& header = VertexInputHeader;
+void RegisterInputVertex(InputHeader& header = VertexInputHeader, const std::uint32_t* code = InputVertexCode.data()) {
     header.direct.fill(ShaderRegs::AGC_ILLEGAL_DIRECT_OFFSET);
     header.direct[static_cast<std::size_t>(ShaderRegs::AgcDirectResourceType::PtrVertexBufferTable)] = 0;
     header.direct[static_cast<std::size_t>(ShaderRegs::AgcDirectResourceType::PtrVertexAttribDescTable)] = 2;
@@ -132,7 +140,7 @@ void RegisterInputVertex() {
     header.shader.version = 0x18u;
     header.shader.header_size = sizeof(InputHeader);
     header.shader.shader_size = static_cast<std::uint32_t>(sizeof(InputVertexCode));
-    header.shader.code = InputVertexCode.data();
+    header.shader.code = code;
     header.shader.type = 2;
     header.shader.user_data = &header.userData;
     header.shader.input_semantics = header.semantics.data();
@@ -486,6 +494,169 @@ void VertexInputsFollowMovedTables(bool enabled, bool vertexInputs, bool verify,
     if (verify) Require(counters.shapeVertexDiffered == start.shapeVertexDiffered && (counters.shapeVertexVerified > start.shapeVertexVerified) == vertexInputs, "verify mode found reused stages with vertex inputs that differ from their full build: " + Counts(counters));
 }
 
+std::size_t Refusal(DrawSiteRefusal reason) {
+    return static_cast<std::size_t>(reason);
+}
+
+std::size_t Miss(DrawSiteMiss miss) {
+    return static_cast<std::size_t>(miss);
+}
+
+std::string SiteCounts(const DrawSiteCounters& counters) {
+    const auto list = [](const auto& values) {
+        std::string text;
+        for (const auto value : values) text += (text.empty() ? "" : "/") + std::to_string(value);
+        return text;
+    };
+    return std::to_string(counters.draws) + " draws, " + std::to_string(counters.served) + " a site would serve (" + std::to_string(counters.redecoded) + " re-decoded, " + std::to_string(counters.rebased) + " rebased, " + std::to_string(counters.patched) + " patched), " + std::to_string(counters.ineligible) + " not eligible, refused " + list(counters.refused) + ", stages unknown " + list(counters.missed) + ", " + std::to_string(counters.bufferWords) + " unlike a retained draw only in buffer V# words" + ", retained " + std::to_string(counters.retained) + " (" + std::to_string(counters.replaced) + " replaced, " + std::to_string(counters.kept) + " held), not retained " + list(counters.excluded);
+}
+
+struct SiteStep {
+    std::uint64_t draws, served, redecoded, rebased, patched, retained, kept, bufferWords;
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawSiteRefusal::Count)> refused;
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawSiteMiss::Count)> missed;
+};
+
+SiteStep SiteBetween(const DrawSiteCounters& before, const DrawSiteCounters& after) {
+    SiteStep step{after.draws - before.draws, after.served - before.served, after.redecoded - before.redecoded, after.rebased - before.rebased, after.patched - before.patched, after.retained - before.retained, after.kept - before.kept, after.bufferWords - before.bufferWords, {}, {}};
+    for (std::size_t i = 0; i < step.refused.size(); ++i) step.refused[i] = after.refused[i] - before.refused[i];
+    for (std::size_t i = 0; i < step.missed.size(); ++i) step.missed[i] = after.missed[i] - before.missed[i];
+    return step;
+}
+
+void SitesFollowRetainedDraws(bool sites, bool pipelined) {
+    Registered(SiteVertexHeader, SiteVertexCode.data(), sizeof(SiteVertexCode), 2);
+    const auto vertex = reinterpret_cast<std::uintptr_t>(SiteVertexCode.data());
+    auto* block = GuestBlock();
+    const std::array<std::uint32_t*, 2> tables{block, block + 64};
+    const std::array<std::uint32_t*, 3> buffers{block + DataWord, block + DataWord + 64, block + DataWord + 128};
+    Describe(tables[0], buffers[0], 1.0f);
+    Describe(tables[1], buffers[1], 0.5f);
+    buffers[2][0] = std::bit_cast<std::uint32_t>(0.25f);
+    const auto draw = [&](const std::uint32_t* table, unsigned expected, const std::string& what) {
+        const auto before = DrawSiteAccess::Counters();
+        Draw(table, vertex);
+        const auto color = Brightest();
+        const auto after = DrawSiteAccess::Counters();
+        Require(CloseTo(color, expected), what + ": the draw wrote " + std::to_string(color) + ", expected " + std::to_string(expected) + " (" + SiteCounts(after) + ")");
+        const auto step = SiteBetween(before, after);
+        if (!sites) Require(after.draws == 0 && after.retained == 0 && after.sites == 0, what + ": without APS5_DRAW_SITES a draw reached the draw sites: " + SiteCounts(after));
+        else if (!pipelined) Require(step.draws == 1 && after.ineligible - before.ineligible == 1 && step.served == 0 && step.retained == 0, what + ": a draw recorded on the queue worker was walked or retained: " + SiteCounts(after));
+        else Require(step.draws == 1, what + ": the draw did not reach the draw sites once: " + SiteCounts(after));
+        return std::pair{step, after};
+    };
+    const bool walks = sites && pipelined;
+    for (std::size_t set = 0; set < tables.size(); ++set) {
+        for (std::size_t sighting = 0; sighting < 2; ++sighting) {
+            const auto [step, counters] = draw(tables[set], set == 0 ? 255 : 128, "teaching the sites");
+            if (!walks) continue;
+            Require(step.served == 0, "sighting " + std::to_string(sighting + 1) + " of a table no retained draw read was counted as served: " + SiteCounts(counters));
+            Require(step.retained == sighting, "sighting " + std::to_string(sighting + 1) + " of a table retained " + std::to_string(step.retained) + " draws, expected " + std::to_string(sighting) + ": " + SiteCounts(counters));
+        }
+    }
+    for (std::size_t round = 0; round < 3; ++round) {
+        for (std::size_t set = 0; set < tables.size(); ++set) {
+            const auto [step, counters] = draw(tables[set], set == 0 ? 255 : 128, "alternating retained draws");
+            if (!walks) continue;
+            Require(step.served == 1 && step.retained == 0 && step.kept == 1 && step.redecoded == 0 && step.rebased == 0 && step.patched == 0, "round " + std::to_string(round) + ": a draw that only changed an unread user word and its table pointer among retained tables was not one a site would serve unpatched: " + SiteCounts(counters));
+        }
+    }
+    {
+        buffers[0][0] = std::bit_cast<std::uint32_t>(0.75f);
+        const auto [step, counters] = draw(tables[0], 191, "a constant changed in the buffer a retained table names");
+        if (walks) Require(step.served == 1 && step.retained == 0, "a draw whose buffer contents changed, with its table and user words as retained, was not one a site would serve: " + SiteCounts(counters));
+        buffers[0][0] = std::bit_cast<std::uint32_t>(1.0f);
+    }
+    {
+        Describe(tables[0], buffers[2], 0.25f);
+        const auto [step, counters] = draw(tables[0], 64, "a table changed in place to name another buffer");
+        if (walks) Require(step.served == 0 && step.refused[Refusal(DrawSiteRefusal::Signature)] == 1 && step.missed[Miss(DrawSiteMiss::PixelTables)] == 1 && step.missed[Miss(DrawSiteMiss::FrontWords)] == 0 && step.missed[Miss(DrawSiteMiss::FrontTables)] == 0 && step.missed[Miss(DrawSiteMiss::PixelWords)] == 0 && step.bufferWords == 1, "a draw whose table changed in place to another buffer V# was not refused for a pixel stage whose tables no retained draw read, or not counted as unlike a retained draw only in buffer V# words: " + SiteCounts(counters));
+        Describe(tables[0], buffers[0], 1.0f);
+        const auto [restored, after] = draw(tables[0], 255, "the restored table");
+        if (walks) Require(restored.served == 1, "a draw of the restored table was not one a site would serve: " + SiteCounts(after));
+    }
+    alignas(16) static std::array<std::uint32_t, 4> distant{};
+    std::memcpy(distant.data(), tables[0], 4 * sizeof(std::uint32_t));
+    if ((reinterpret_cast<std::uintptr_t>(distant.data()) >> 32u) != (reinterpret_cast<std::uintptr_t>(block) >> 32u)) {
+        const auto [step, counters] = draw(distant.data(), 255, "a table whose pointer's high word, which the pixel stage reads as a value, changed");
+        if (walks) Require(step.served == 0 && step.refused[Refusal(DrawSiteRefusal::Signature)] == 1 && step.missed[Miss(DrawSiteMiss::PixelWords)] == 1 && step.missed[Miss(DrawSiteMiss::PixelTables)] == 0 && step.bufferWords == 0, "a draw with a changed user word its pixel stage reads as a value was not refused for a pixel stage whose user words no retained draw has: " + SiteCounts(counters));
+    }
+}
+
+void SitesFollowMovedVertexTables(bool sites, bool pipelined, bool vertexInputs) {
+    RegisterInputVertex(SiteInputHeader, SiteInputVertexCode.data());
+    auto* block = GuestBlock();
+    auto* pixelTable = block;
+    Describe(pixelTable, pixelTable + DataWord, 1.0f);
+    using Positions = std::array<std::array<float, 4>, 3>;
+    constexpr Positions Covering{{{-1.0f, -1.0f, 0.0f, 1.0f}, {3.0f, -1.0f, 0.0f, 1.0f}, {-1.0f, 3.0f, 0.0f, 1.0f}}};
+    constexpr Positions Outside{{{2.0f, 2.0f, 0.0f, 1.0f}, {3.0f, 2.0f, 0.0f, 1.0f}, {2.0f, 3.0f, 0.0f, 1.0f}}};
+    const auto write = [&](std::size_t word, std::uint32_t stride, const Positions& positions) {
+        for (std::size_t corner = 0; corner < positions.size(); ++corner) std::memcpy(block + word + corner * (stride / sizeof(std::uint32_t)), positions[corner].data(), sizeof(positions[corner]));
+        return static_cast<const std::uint32_t*>(block + word);
+    };
+    const auto* covering = write(4096, 16, Covering);
+    const auto* outside = write(4160, 16, Outside);
+    const auto* wide = write(4224, 32, Covering);
+    constexpr std::uint32_t Float4 = 0x0104dfacu;
+    const auto sharp = [](const std::uint32_t* buffer, std::uint32_t stride) {
+        const auto address = reinterpret_cast<std::uintptr_t>(buffer);
+        return std::array<std::uint32_t, 4>{static_cast<std::uint32_t>(address), (static_cast<std::uint32_t>(address >> 32u) & 0xffffu) | (stride << 16u), 3u, Float4};
+    };
+    std::array<std::uint32_t*, 4> tables{};
+    for (std::size_t n = 0; n < tables.size(); ++n) tables[n] = block + 8192 + n * 64;
+    const auto put = [](std::uint32_t* table, const std::array<std::uint32_t, 4>& descriptor) { std::memcpy(table, descriptor.data(), sizeof(descriptor)); };
+    put(tables[0], sharp(covering, 16));
+    put(tables[1], sharp(covering, 16));
+    put(tables[2], sharp(outside, 16));
+    put(tables[3], sharp(wide, 32));
+    auto* attribute = block + 12288;
+    attribute[0] = 0;
+    const auto draw = [&](const std::uint32_t* table, bool lit, const std::string& what) {
+        const auto buffers = reinterpret_cast<std::uintptr_t>(table);
+        const auto fetches = reinterpret_cast<std::uintptr_t>(attribute);
+        const auto before = DrawSiteAccess::Counters();
+        Draw(pixelTable, reinterpret_cast<std::uintptr_t>(SiteInputVertexCode.data()), {static_cast<std::uint32_t>(buffers), static_cast<std::uint32_t>(buffers >> 32u), static_cast<std::uint32_t>(fetches), static_cast<std::uint32_t>(fetches >> 32u)});
+        const auto color = Brightest();
+        const auto after = DrawSiteAccess::Counters();
+        Require(lit ? CloseTo(color, 255) : color == 0, what + ": the draw wrote " + std::to_string(color) + ", expected " + (lit ? "255" : "nothing") + " (" + SiteCounts(after) + ")");
+        if (!sites) Require(after.draws == 0 && after.retained == 0, what + ": without APS5_DRAW_SITES a draw reached the draw sites: " + SiteCounts(after));
+        return std::pair{SiteBetween(before, after), after};
+    };
+    const bool walks = sites && pipelined;
+    draw(tables[0], true, "the first draw with vertex inputs");
+    {
+        const auto [step, counters] = draw(tables[0], true, "the second draw with vertex inputs");
+        if (walks) Require(step.retained == 1 && step.served == 0, "the second draw with vertex inputs was not retained by its site: " + SiteCounts(counters));
+    }
+    {
+        const auto [step, counters] = draw(tables[0], true, "a retained draw with vertex inputs");
+        if (walks) Require(step.served == 1 && step.redecoded == 0, "a draw with vertex inputs at the retained tables was not one a site would serve without re-decoding them: " + SiteCounts(counters));
+    }
+    {
+        const auto [step, counters] = draw(tables[1], true, "a vertex buffer table moved to another address with the same V#");
+        if (walks && vertexInputs) Require(step.served == 1 && step.redecoded == 1 && step.rebased == 0, "a draw whose vertex buffer table moved with the same V# was not one a site would serve from re-decoded tables without a patch: " + SiteCounts(counters));
+        if (walks && !vertexInputs) Require(step.served == 0 && step.refused[Refusal(DrawSiteRefusal::Signature)] == 1 && step.missed[Miss(DrawSiteMiss::FrontWords)] == 1, "with stages with vertex inputs captured again when their tables move, a moved vertex buffer table was not refused for a front stage whose user words no retained draw has: " + SiteCounts(counters));
+    }
+    if (!vertexInputs) return;
+    {
+        const auto [step, counters] = draw(tables[2], false, "a moved vertex buffer table whose V# names another vertex buffer");
+        if (walks) Require(step.served == 1 && step.redecoded == 1 && step.rebased == 1, "a draw whose moved vertex buffer table names another vertex buffer was not one a site would serve with its V# patched: " + SiteCounts(counters));
+    }
+    {
+        const auto [step, counters] = draw(tables[3], true, "a moved vertex buffer table whose V# has another stride");
+        if (walks) Require(step.served == 0 && step.refused[Refusal(DrawSiteRefusal::VertexLayout)] == 1, "a draw whose moved vertex buffer table decodes to another layout was not refused for its vertex layout: " + SiteCounts(counters));
+    }
+    {
+        put(tables[0], sharp(outside, 16));
+        const auto [step, counters] = draw(tables[0], false, "a vertex buffer table changed in place to name another vertex buffer");
+        if (walks) Require(step.served == 0 && step.refused[Refusal(DrawSiteRefusal::Memory)] == 1, "a draw whose vertex buffer table changed in place was not refused because the memory a retained draw read differs: " + SiteCounts(counters));
+        put(tables[0], sharp(covering, 16));
+        const auto [restored, after] = draw(tables[0], true, "the restored vertex buffer table");
+        if (walks) Require(restored.served == 1, "a draw of the restored vertex buffer table was not one a site would serve: " + SiteCounts(after));
+    }
+}
+
 std::shared_ptr<DispatchVariant> VertexVariant() {
     ShaderRecompiler::ShaderVertexStageInfo info{};
     info.fetchEmbedded = true;
@@ -724,11 +895,19 @@ int main() {
         const bool recipes = shapeRecipes && !verify;
         RememberedDrawsAlternate(enabled, verify, recipes);
         VertexInputsFollowMovedTables(enabled, vertexInputs, verify, recipes);
+        const bool sites = std::getenv("APS5_DRAW_SITES") != nullptr;
+        const char* depth = std::getenv("APS5_PIPELINED_DRAWS");
+        const bool pipelined = depth == nullptr || std::string(depth) != "0";
+        if (enabled && !verify) {
+            SitesFollowRetainedDraws(sites, pipelined);
+            SitesFollowMovedVertexTables(sites, pipelined, vertexInputs);
+        }
+        const auto siteCounters = DrawSiteAccess::Counters();
         const auto origins = AgcDriver::VulkanDevice::DrawRecipeOrigins();
         const auto shape = static_cast<std::size_t>(AgcDriver::VulkanDevice::DrawRecipeOrigin::Shape);
         Require(shapeRecipes || (origins.hits[shape] == 0 && origins.attaches[shape] == 0), "with the shape recipes off, " + std::to_string(origins.hits[shape]) + " draws were recorded from a remembered draw's recipe and " + std::to_string(origins.attaches[shape]) + " recipes were attached to one");
         AgcDriverShutdown_nid_postfix();
-        std::cout << "Draws of one shape " << (verify ? "verified" : enabled ? "reused" : "rebuilt, with the shape user words off,") << " the stages of the shape's remembered draws across moved user words; stages with vertex inputs " << (vertexInputs ? "followed moved vertex tables" : "were captured again when their tables moved") << "; " << origins.hits[shape] << " draws recorded from a remembered draw's recipe, " << origins.attaches[shape] << " recipes attached to one, " << origins.layoutMisses << " layout misses\n";
+        std::cout << "Draws of one shape " << (verify ? "verified" : enabled ? "reused" : "rebuilt, with the shape user words off,") << " the stages of the shape's remembered draws across moved user words; stages with vertex inputs " << (vertexInputs ? "followed moved vertex tables" : "were captured again when their tables moved") << "; " << origins.hits[shape] << " draws recorded from a remembered draw's recipe, " << origins.attaches[shape] << " recipes attached to one, " << origins.layoutMisses << " layout misses; " << (sites ? "a draw site would serve " + std::to_string(siteCounters.served) + " of " + std::to_string(siteCounters.draws) + " draws" : std::string("no draw reached the draw sites")) << "\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

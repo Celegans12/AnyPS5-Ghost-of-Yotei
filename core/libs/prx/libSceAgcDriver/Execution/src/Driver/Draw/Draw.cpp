@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawSites.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
@@ -114,6 +115,11 @@ const char* DrawVerdictName(DrawVerdict verdict) {
     return "Unknown";
 }
 
+bool TraceDrawPrograms() {
+    static const bool enabled = std::getenv("APS5_TRACE_DRAW_PROGRAMS") != nullptr;
+    return enabled;
+}
+
 std::string_view TrimmedReason(std::string_view reason) {
     if (reason.size() > 200) reason = reason.substr(0, 200);
     return reason;
@@ -186,6 +192,7 @@ struct DrawTail {
     std::uint64_t traceToken = 0;
     VulkanDevice::DrawTraceContext trace{};
     std::string ownRejected;
+    DrawSiteOutcome site;
     GpuLock* gpuLock = nullptr;
     GpuLock ownLock{GuestMemory::GpuMutex(), std::defer_lock};
 };
@@ -438,6 +445,22 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto& shapeKey = tail.shapeKey;
     std::uint64_t drawIdentity = 0, drawAlias = 0;
     std::vector<DrawUserPatch> userPatches;
+    std::uint64_t siteKey = 0, siteShape = 0;
+    if (registerKey && DrawSiteAccess::Enabled()) {
+        tail.site.eligible = pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !TraceDrawPrograms() && traceToken == 0 && !verifyDrawDataHits() && !verifyDrawEntries() && deferredLabels().labels.empty();
+        if (!tail.site.eligible) {
+            DrawSiteAccess::NoteIneligible();
+        } else {
+            siteKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &siteShape);
+            DrawSiteHit hit;
+            DrawSiteAccess::Walk(*this, queue, siteShape, hit);
+            tail.site.walked = true;
+            tail.site.matched = hit.matched;
+            tail.site.served = hit.served;
+            tail.site.refusal = hit.refusal;
+            tail.site.retained = std::move(hit.retained);
+        }
+    }
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::shared_ptr<const DrawRelocation> relocation;
@@ -453,7 +476,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 aliasFirst = relocation != nullptr && trial.productive;
             }
         }
-        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
+        if (tail.site.walked && !aliasFirst && !traceDrawCache()) {
+            drawKey = siteKey;
+            shapeKey = siteShape;
+        } else {
+            drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
+        }
         DrawPipeline::NoteDrawKey(drawKey, shapeKey);
         if (DrawFinisher::Busy()) {
             bool shapeMatters = false;
@@ -602,7 +630,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (!drawParameters.indirect) setMeshIndexBuffer(drawParameters);
     else if (graphics.stages.mesh) setMeshIndexBuffer(Pm4::DrawParameters{drawParameters.indexAddress, std::max(drawParameters.indexCount, 1u), drawParameters.indexSize, 1, 0, drawParameters.indexed});
     const std::vector<Role>& roles = decode->roles;
-    static const bool tracePrograms = std::getenv("APS5_TRACE_DRAW_PROGRAMS") != nullptr;
+    const bool tracePrograms = TraceDrawPrograms();
     if (tracePrograms) {
         std::vector<DrawProgramTraceEntry> identities;
         identities.reserve(programs.size());
@@ -1488,6 +1516,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             return finishDraw(tail, timing);
         }
         phaseTiming.Phase(DrawRowVectors);
+        if (tail.site.eligible) {
+            std::vector<std::shared_ptr<DispatchVariant>> served(programs.size());
+            for (std::size_t i = 0; i < programs.size(); ++i) served[i] = drawHit || reused[i] ? matched[i] : fresh[i];
+            DrawSiteAccess::Retain(*this, shapeKey, tail.site, decode, programs, served, recipeStages, recipeKey, recipeDonor, patchedStages);
+        }
         auto writes = drawWriteRanges(graphics, stages);
         const auto commitQueue = submission.queue;
         const auto commitPacket = tail.packetOpcode;

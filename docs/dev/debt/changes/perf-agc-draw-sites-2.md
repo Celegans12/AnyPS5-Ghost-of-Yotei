@@ -1,0 +1,5 @@
+# libSceAgcDriver
+
+## add Opt-in draw paths
+
+- [Draw sites](../../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawSites.cpp) (`APS5_DRAW_SITES`) - opt-in and count only: a draw is decoded, looked up and finished as before, and the site of its register shape only counts on the `[draw-sites]` line whether a draw it retains would have served it. A site matches a draw by the user words its stages depend on and the tables read through relocatable pointers, so it refuses a draw whose buffer V# base or size differs from every retained draw when the V# is read from a table, or held in a user word the stage also forwards or reads by value (constants allocated per frame). Not retained: shader paths other than vertex and pixel, indirect draws, raw or merged programs, user-data callees, image tables, stages that write beyond the targets or that the draw cache did not admit. Closes when: such V# words are known volatile from the capture, and a retained draw is committed without the general path. Labels: code, tested.
