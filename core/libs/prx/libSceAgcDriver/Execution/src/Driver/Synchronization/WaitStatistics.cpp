@@ -2,10 +2,34 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdlib>
 #include <unordered_map>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+constexpr std::array<std::uint64_t EpochBumps::*, 8> EpochBumpReasons{&EpochBumps::submissions, &EpochBumps::waits, &EpochBumps::drains, &EpochBumps::reaps, &EpochBumps::packets, &EpochBumps::waitsOrdered, &EpochBumps::interrupts, &EpochBumps::queuedInterrupts};
+std::array<std::atomic<std::uint64_t>, EpochBumpReasons.size()> epochBumpTotals{};
+
+void countEpochTotal(std::uint64_t EpochBumps::*reason) {
+    for (std::size_t index = 0; index < EpochBumpReasons.size(); ++index) {
+        if (EpochBumpReasons[index] != reason) continue;
+        epochBumpTotals[index].fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+}
+
+}
+
+EpochBumps EpochBumpsCounted() {
+    EpochBumps counted;
+    for (std::size_t index = 0; index < EpochBumpReasons.size(); ++index) counted.*EpochBumpReasons[index] = epochBumpTotals[index].load(std::memory_order_relaxed);
+    return counted;
+}
 
 PollStats& Driver::pollStats() {
     static thread_local PollStats stats;
@@ -37,6 +61,7 @@ void Driver::bumpEpoch(std::uint64_t EpochBumps::*counter) {
     GuestMemory::BumpCollectEpoch();
     if (DrawPipeline::Active()) DrawPipeline::EpochToken().fetch_add(1, std::memory_order_relaxed);
     ++(epochBumps().*counter);
+    countEpochTotal(counter);
 }
 
 void Driver::bumpWaitEpoch(std::uint64_t address, std::size_t bytes) {
@@ -57,6 +82,7 @@ void Driver::bumpWaitEpoch(std::uint64_t address, std::size_t bytes) {
         const auto found = ordered.find(address);
         if (found != ordered.end() && found->second.value == value && GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {
             ++epochBumps().waitsOrdered;
+            countEpochTotal(&EpochBumps::waitsOrdered);
             return;
         }
     }

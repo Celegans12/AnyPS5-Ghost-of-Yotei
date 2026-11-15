@@ -67,7 +67,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         const auto label = Pm4::DecodeLabelWrite(packet);
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
         if (label.has_value() || storesNothing) {
-            bumpEpoch(&EpochBumps::drains);
+            bumpEpoch(&EpochBumps::interrupts);
             ++DrainEpochCounts().interrupts;
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -512,7 +512,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
         writes.emplace_back(address, address + bytes.size());
     }
     if (endOfPipeInterrupt) {
-        bumpEpoch(&EpochBumps::drains);
+        bumpEpoch(&EpochBumps::queuedInterrupts);
         ++DrainEpochCounts().queuedInterrupts;
     }
     auto stored = bytes;

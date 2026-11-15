@@ -349,6 +349,7 @@ void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
+std::atomic<std::uint64_t> collectWalkedEpochs{0};
 std::atomic<std::uint64_t> committerWatchCalls{0};
 thread_local bool proofThread = false;
 std::atomic<std::uint64_t> unwatchSerial{0};
@@ -1568,6 +1569,8 @@ struct WriteTracker {
     };
     std::array<ExactObservation, 16> exactObservations{};
     std::size_t nextExactObservation = 0;
+    std::array<std::uint64_t, 8> walkedEpochs{};
+    std::size_t nextWalkedEpoch = 0;
 
     bool exactlyObserved(std::uint64_t first, std::uint64_t stop, std::uint64_t need) const {
         for (const auto& entry : exactObservations) {
@@ -2468,6 +2471,10 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
         if (open) addRun(from, lastBlock);
     }
     if (runs.empty()) collectMemoHits.fetch_add(1, std::memory_order_relaxed);
+    if (shared && !runs.empty() && std::find(tracker.walkedEpochs.begin(), tracker.walkedEpochs.end(), epoch) == tracker.walkedEpochs.end()) {
+        tracker.walkedEpochs[tracker.nextWalkedEpoch++ % tracker.walkedEpochs.size()] = epoch;
+        collectWalkedEpochs.fetch_add(1, std::memory_order_relaxed);
+    }
     std::optional<TimedAccess> timed;
     if (!runs.empty()) timed.emplace(CounterCollect, bytes);
     std::size_t done = 0;
@@ -2630,7 +2637,7 @@ CollectCounts CollectCounted() {
 #else
     const std::uint64_t watchCalls = 0;
 #endif
-    return {watchCalls, committerWatchCalls.load(std::memory_order_relaxed), collectEpochBumps.load(std::memory_order_relaxed), collectMemoHits.load(std::memory_order_relaxed)};
+    return {watchCalls, committerWatchCalls.load(std::memory_order_relaxed), collectEpochBumps.load(std::memory_order_relaxed), collectMemoHits.load(std::memory_order_relaxed), collectWalkedEpochs.load(std::memory_order_relaxed)};
 }
 
 const char* TrackerLockSiteName(TrackerLockSite site) {
