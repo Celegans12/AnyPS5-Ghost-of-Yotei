@@ -955,6 +955,7 @@ BufferCache::View BufferCache::acquire(std::uint64_t address, std::size_t bytes,
     View view;
     view.handle = mirror->backing.handle;
     view.offset = address - mirror->begin;
+    view.deviceAddress = mirror->backing.deviceAddress != 0 ? mirror->backing.deviceAddress + view.offset : 0;
     view.bytes = mirror->backing.bytes + view.offset;
     view.owner = mirror->backing.owner;
     view.mirror = mirror->id;
@@ -1024,6 +1025,7 @@ BufferCache::View BufferCache::cleanInput(std::uint64_t address, std::size_t byt
     View view;
     view.handle = mirror->backing.handle;
     view.offset = address - mirror->begin;
+    view.deviceAddress = mirror->backing.deviceAddress != 0 ? mirror->backing.deviceAddress + view.offset : 0;
     view.bytes = mirror->backing.bytes + view.offset;
     view.owner = mirror->backing.owner;
     view.mirror = mirror->id;
@@ -1078,6 +1080,7 @@ BufferCache::View BufferCache::ringInput(std::uint64_t address, std::size_t byte
         View view;
         view.handle = entry.chunk->backing.handle;
         view.offset = entry.offset;
+        view.deviceAddress = entry.chunk->backing.deviceAddress != 0 ? entry.chunk->backing.deviceAddress + entry.offset : 0;
         view.bytes = entry.chunk->backing.bytes + entry.offset;
         view.owner = entry.chunk->backing.owner;
         view.mirror = entry.id;
@@ -1143,6 +1146,7 @@ BufferCache::View BufferCache::looseInput(std::uint64_t address, std::size_t byt
     View view;
     view.handle = backing.handle;
     view.bytes = backing.bytes;
+    view.deviceAddress = backing.deviceAddress;
     view.owner = std::move(backing.owner);
     view.mirror = CopyIds | ++copyIds;
     view.served = Served::Copied;

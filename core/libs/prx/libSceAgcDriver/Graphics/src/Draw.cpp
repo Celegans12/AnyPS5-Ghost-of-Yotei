@@ -3398,7 +3398,7 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
     const auto drawUse = resources.BeginDrawUse(*recorder);
     const auto drawBindings = resources.PrepareDrawBindings(*recorder, record.moved, false, drawUse != nullptr ? drawUse->record.get() : nullptr);
     DrawBlockSections blockSections;
-    WriteDrawBlocks(context, recorder, shaders, &state.color, blockSections, nullptr);
+    WriteDrawBlocks(context, recorder, shaders, &state.color, blockSections, nullptr, &passReads);
     static const bool addressReadPasses = std::getenv("APS5_NO_ADDRESS_READ_PASSES") == nullptr;
     const bool readOnlyBda = addressReadPasses && resources.BdaReadOnly();
     outcome.addressDraw = addressBased;
@@ -4594,7 +4594,7 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
     if (UsesMeshWindow(shaders)) BindMeshWindow(context, commands, pipeline->Layout());
     APS5_LOG_CHARS_OUT_DEBUG("Resources bound");
     DrawBlockSections blockSections;
-    WriteDrawBlocks(context, recorded ? recorder : nullptr, shaders, &state.color, blockSections, &blockKept);
+    WriteDrawBlocks(context, recorded ? recorder : nullptr, shaders, &state.color, blockSections, &blockKept, nullptr);
     std::array<std::byte, PipelinePushConstantBytes> blockPush;
     const std::array<std::byte, PipelinePushConstantBytes>* blockPushBytes = nullptr;
     VkShaderStageFlags blockPushStages = 0;
@@ -5037,6 +5037,8 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     DrawRecipeOutcome result;
     DrawOutcome outcome;
     outcome.kind = KindRecipeHit;
+    const bool blockTimed = DrawBlocks() && DrawBlockStats();
+    const auto blockStart = blockTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
     const bool passState = PassState::Enabled();
@@ -5256,6 +5258,7 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         std::lock_guard lock(stats.mutex);
         ++stats.recipeHits;
     }
+    if (blockTimed) NoteDrawBlockCommit(DrawBlockClassOf(shaders), static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - blockStart).count()));
     timing.Mark("draw_and_resource_release");
     reportDrawEnd(state, timer, nullptr, outcome, waitedBefore, ownWaitedMs, " recorded from recipe");
     result.recorded = true;

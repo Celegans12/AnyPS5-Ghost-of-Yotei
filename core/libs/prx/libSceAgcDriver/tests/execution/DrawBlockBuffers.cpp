@@ -273,10 +273,27 @@ void CheckDraws(AgcDriver::VulkanDevice& device, const Block& block, bool verify
     Require(setsAfter.sets == setsBefore.sets && setsAfter.reusedSets == setsBefore.reusedSets, "a recipe draw served by the block allocated a descriptor set");
     Require(ShaderResources::DrawBindingsPooled().served == pooledBefore.served, "a recipe draw served by the block took rewritten bindings");
 
-    constexpr std::uint32_t LargeBytes = 32768;
-    std::vector<float> filled(LargeBytes / sizeof(float));
+    constexpr std::uint32_t LargeBytes = 16384;
+    constexpr std::uint32_t PlacedBytes = 32768;
+    std::vector<float> filled(PlacedBytes / sizeof(float));
     for (std::size_t index = 0; index < filled.size(); ++index) filled[index] = index % 4 == 1 || index % 4 == 3 ? 1.0f : 0.0f;
     AgcDriver::GuestMemory::Write(large, std::as_bytes(std::span(filled)));
+    const auto placedBefore = DrawBlockHost::Counted();
+    for (int index = 0; index < 4; ++index) {
+        Select(scene, large, PlacedBytes, white);
+        const auto shaders = Shaders(scene, true);
+        {
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            const auto hit = DrawWithRecipe(context, state, triangle, shaders, {}, *recipe);
+            Require(hit.recorded, "a draw over a range above the ring size refused its recipe");
+        }
+        CheckPixels(state.color, {0, 255, 0, 255}, "a draw over a range above the ring size");
+    }
+    const auto placedAfter = DrawBlockHost::Counted();
+    if (context.hostImportAlignment != 0) {
+        Require(placedAfter.imported + placedAfter.mirrored >= placedBefore.imported + placedBefore.mirrored + 4, "a range above the ring size was copied instead of read in place");
+        Require(placedAfter.copyBytes == placedBefore.copyBytes && placedAfter.apart == placedBefore.apart, "a range read in place was copied as well");
+    }
     const auto ringBefore = DrawBlockHost::Counted();
     constexpr int Laps = 3;
     const int perChunk = static_cast<int>(AgcDriver::Core::BlockRing::ChunkBytes / LargeBytes);

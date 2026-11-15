@@ -3,6 +3,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "BlockAbi.hpp"
@@ -20,7 +24,7 @@ namespace AgcDriver::Core {
 namespace {
 
 struct Counters {
-    std::atomic<std::uint64_t> draws{0}, stages{0}, sectionBytes{0}, copies{0}, copyBytes{0}, apart{0}, apartBytes{0}, absent{0}, synced{0}, unreadable{0}, mixed{0}, verified{0}, mismatches{0}, classic{0};
+    std::atomic<std::uint64_t> draws{0}, stages{0}, sectionBytes{0}, copies{0}, copyBytes{0}, apart{0}, apartBytes{0}, absent{0}, synced{0}, unreadable{0}, mixed{0}, mirrored{0}, mirroredBytes{0}, imported{0}, importedBytes{0}, verified{0}, mismatches{0}, classic{0};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawBlockRefusal::Count)> refused{};
 };
 
@@ -120,6 +124,10 @@ DrawBlockCounts DrawBlockHost::Counted() {
     counts.synced = load(counted.synced);
     counts.unreadable = load(counted.unreadable);
     counts.mixed = load(counted.mixed);
+    counts.mirrored = load(counted.mirrored);
+    counts.mirroredBytes = load(counted.mirroredBytes);
+    counts.imported = load(counted.imported);
+    counts.importedBytes = load(counted.importedBytes);
     counts.verified = load(counted.verified);
     counts.mismatches = load(counted.mismatches);
     counts.classic = load(counted.classic);
@@ -140,10 +148,10 @@ std::string DrawBlockHost::Report() {
     const auto counts = Counted();
     const auto value = [](std::uint64_t number) { return static_cast<unsigned long long>(number); };
     const auto refused = [&](DrawBlockRefusal refusal) { return value(counts.refused[static_cast<std::size_t>(refusal)]); };
-    char text[768];
-    std::snprintf(text, sizeof(text), "[draw-block] draws served %llu (%llu stages, %llu with a classic stage beside), classic draws %llu, refused: no device address %llu, layout %llu; section bytes %llu, copies %llu (%llu bytes), apart %llu (%llu bytes), absent buffers %llu, unreadable %llu, read after a wait %llu; ring chunks %llu, laps %llu, empty takes %llu; verified %llu, mismatches %llu",
+    char text[1024];
+    std::snprintf(text, sizeof(text), "[draw-block] draws served %llu (%llu stages, %llu with a classic stage beside), classic draws %llu, refused: no device address %llu, layout %llu; section bytes %llu, copies %llu (%llu bytes), apart %llu (%llu bytes), read from a mirror %llu (%llu bytes), read in place from an import %llu (%llu bytes), absent buffers %llu, unreadable %llu, read after a wait %llu; ring chunks %llu, laps %llu, empty takes %llu; verified %llu, mismatches %llu",
             value(counts.draws), value(counts.stages), value(counts.mixed), value(counts.classic), refused(DrawBlockRefusal::Address), refused(DrawBlockRefusal::Layout),
-            value(counts.sectionBytes), value(counts.copies), value(counts.copyBytes), value(counts.apart), value(counts.apartBytes), value(counts.absent), value(counts.unreadable), value(counts.synced),
+            value(counts.sectionBytes), value(counts.copies), value(counts.copyBytes), value(counts.apart), value(counts.apartBytes), value(counts.mirrored), value(counts.mirroredBytes), value(counts.imported), value(counts.importedBytes), value(counts.absent), value(counts.unreadable), value(counts.synced),
             value(counts.ring.chunks), value(counts.ring.laps), value(counts.ring.full), value(counts.verified), value(counts.mismatches));
     return text;
 }
@@ -161,7 +169,7 @@ void DrawBlockHost::NoteVerified(std::size_t mismatches) {
     add(counters().mismatches, mismatches);
 }
 
-DrawBlockHost::Draw::Draw(DrawBlockHost& host, Graphics::Recorder* recorder, std::vector<std::shared_ptr<void>>* kept, bool shadowed) : host(host), recorder(recorder), kept(kept), shadowed(shadowed) {
+DrawBlockHost::Draw::Draw(DrawBlockHost& host, Graphics::Recorder* recorder, std::vector<std::shared_ptr<void>>* kept, bool shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>* reads) : host(host), recorder(recorder), kept(kept), reads(reads), shadowed(shadowed) {
     if (recorder != nullptr) host.recorder = recorder;
 }
 
@@ -209,8 +217,43 @@ std::uint32_t* DrawBlockHost::Draw::Section(std::size_t bytes, std::uint64_t& de
     return reinterpret_cast<std::uint32_t*>(target);
 }
 
-bool DrawBlockHost::Draw::Copy(std::uint64_t address, std::size_t bytes, std::size_t padded, std::uint64_t& deviceAddress) {
+bool DrawBlockHost::Draw::inPlace(std::uint64_t address, std::size_t bytes, std::uint64_t& deviceAddress) {
+    if (recorder == nullptr || reads == nullptr) return false;
+    const auto& context = host.context;
+    if (Graphics::BufferCache::StageViews()) {
+        if (auto view = Graphics::CachedStageRange(*recorder, address, bytes, 4); view && view.deviceAddress != 0) {
+            deviceAddress = view.deviceAddress;
+            recorder->Keep(std::move(view.owner));
+            add(counters().mirrored);
+            add(counters().mirroredBytes, bytes);
+            if (shadowed) ranges.push_back({deviceAddress, view.bytes, bytes});
+            return true;
+        }
+    }
+    if (context.hostImportAlignment == 0) return false;
+    const auto* import = Graphics::HostImportFor(context, address, bytes);
+    if (import == nullptr || import->address == 0 || address < import->base || address + bytes > import->base + import->bytes) return false;
+    if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes) || Graphics::PendingStorageOverlaps(address, bytes, nullptr) || Graphics::AnyShadowedOverlaps(address, bytes)) return false;
+    const auto overlaps = [&](const auto& writer) { return writer->WritesOverlap(address, bytes); };
+    if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return false;
+    const auto drawWriters = Graphics::DrawCopiedWriters();
+    if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return false;
+    deviceAddress = import->address + Graphics::HostImportOffset(*import, address);
+    recorder->NotePendingRead(address, bytes, Graphics::Recorder::ReadKind::DispatchElement);
+    reads->emplace_back(address, address + bytes);
+    add(counters().imported);
+    add(counters().importedBytes, bytes);
+    if (shadowed) ranges.push_back({deviceAddress, reinterpret_cast<const std::byte*>(address), bytes});
+    return true;
+}
+
+bool DrawBlockHost::Draw::Copy(std::uint64_t address, std::size_t bytes, std::size_t padded, std::uint64_t& deviceAddress, bool& placed) {
+    placed = false;
     if (bytes == 0) return false;
+    if (bytes > Graphics::CoreRingMax() && inPlace(address, bytes, deviceAddress)) {
+        placed = true;
+        return true;
+    }
     const bool hazard = recorder == nullptr || recorder->PendingWriteOverlaps(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes) || recorder->PendingLabelIn(address, bytes) || Graphics::PendingStorageOverlaps(address, bytes, nullptr) || Graphics::AnyShadowedOverlaps(address, bytes);
     bool ringed = false;
     auto* target = take(padded, deviceAddress, ringed);
@@ -265,9 +308,10 @@ bool DrawBlockHost::Draw::Resolve(void* context, const BufferRequest& request, B
     const auto bytes = static_cast<std::size_t>(request.bytes + request.misalignment);
     const auto padded = (bytes + 3u) & ~std::size_t{3};
     std::uint64_t deviceAddress = 0;
-    if (!draw.Copy(begin, bytes, padded, deviceAddress)) return true;
+    bool placed = false;
+    if (!draw.Copy(begin, bytes, padded, deviceAddress, placed)) return true;
     answer.deviceAddress = deviceAddress + request.misalignment;
-    answer.bytes = static_cast<std::uint32_t>(padded - request.misalignment);
+    answer.bytes = static_cast<std::uint32_t>((placed ? bytes : padded) - request.misalignment);
     return true;
 }
 

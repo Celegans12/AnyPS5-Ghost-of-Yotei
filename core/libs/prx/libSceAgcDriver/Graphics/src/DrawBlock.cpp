@@ -44,6 +44,36 @@ void writeEntry(std::uint32_t* entry, const Core::BufferAnswer& answer, std::uin
     entry[Abi::EntryService] = misalignment & Abi::ServiceMisalignmentMask;
 }
 
+constexpr std::size_t RefusalCount = static_cast<std::size_t>(ShaderRecompiler::BlockRefusal::Count);
+
+constexpr std::size_t StageKinds = 2;
+constexpr std::size_t ClassCount = static_cast<std::size_t>(DrawBlockClass::Count);
+
+std::array<std::atomic<std::uint64_t>, RefusalCount * StageKinds>& classicStages() {
+    static std::array<std::atomic<std::uint64_t>, RefusalCount * StageKinds> counted{};
+    return counted;
+}
+
+struct CommitTimes {
+    std::array<std::atomic<std::uint64_t>, ClassCount> commits{};
+    std::array<std::atomic<std::uint64_t>, ClassCount> nanoseconds{};
+};
+
+CommitTimes& commitTimes() {
+    static CommitTimes times;
+    return times;
+}
+
+void noteClassicStages(std::span<const CompiledShader> shaders) {
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr || shader.program->blockModule) continue;
+        const auto refusal = static_cast<std::size_t>(shader.program->blockLayout.refusal);
+        if (!classicBuffers(*shader.program)) continue;
+        const std::size_t kind = shader.stage == ShaderRecompiler::ShaderStage::Fragment ? 1u : 0u;
+        if (refusal < RefusalCount) classicStages()[refusal * StageKinds + kind].fetch_add(1, std::memory_order_relaxed);
+    }
+}
+
 void report() {
     if (!DrawBlockStats()) return;
     static std::atomic<std::int64_t> lastReport{0};
@@ -51,6 +81,22 @@ void report() {
     auto last = lastReport.load(std::memory_order_relaxed);
     if (nowMs - last < 5000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
     std::fprintf(stderr, "%s%c", Core::DrawBlockHost::Report().c_str(), 10);
+    std::string stages = "[draw-block] stages with buffers or words left to descriptors, by reason (vertex/fragment):";
+    for (std::size_t index = 0; index < RefusalCount; ++index) {
+        const auto vertex = classicStages()[index * StageKinds].load(std::memory_order_relaxed);
+        const auto fragment = classicStages()[index * StageKinds + 1].load(std::memory_order_relaxed);
+        if (vertex == 0 && fragment == 0) continue;
+        const auto name = ShaderRecompiler::BlockRefusalName(static_cast<ShaderRecompiler::BlockRefusal>(index));
+        stages += " " + std::string(index == 0 ? "not a block module" : name) + " " + std::to_string(vertex) + "/" + std::to_string(fragment) + ";";
+    }
+    std::fprintf(stderr, "%s%c", stages.c_str(), 10);
+    const auto& times = commitTimes();
+    const auto microseconds = [&](DrawBlockClass kind) {
+        const auto commits = times.commits[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed);
+        return commits != 0 ? static_cast<double>(times.nanoseconds[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(commits) : 0.0;
+    };
+    const auto commits = [&](DrawBlockClass kind) { return static_cast<unsigned long long>(times.commits[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[draw-block] recipe commits (cumulative, us per commit): every stage by block %llu at %.2f, block and descriptor stages %llu at %.2f, descriptors only %llu at %.2f%c", commits(DrawBlockClass::Block), microseconds(DrawBlockClass::Block), commits(DrawBlockClass::Mixed), microseconds(DrawBlockClass::Mixed), commits(DrawBlockClass::Classic), microseconds(DrawBlockClass::Classic), 10);
 }
 
 struct StageTruth {
@@ -70,7 +116,7 @@ void verifyStage(const ShaderRecompiler::RecompileResult& program, std::span<con
         if (!request.present) continue;
         auto& bytes = truth.bytes[index];
         const auto wanted = static_cast<std::size_t>(request.bytes);
-        const auto padded = ((wanted + request.misalignment + 3u) & ~std::size_t{3}) - request.misalignment;
+        const auto padded = entry[Abi::EntryBytes] == wanted ? wanted : ((wanted + request.misalignment + 3u) & ~std::size_t{3}) - request.misalignment;
         bytes.resize(padded);
         bool read = true;
         try {
@@ -103,15 +149,33 @@ void DrawBlockSections::Patch(std::array<std::byte, PipelinePushConstantBytes>& 
     }
 }
 
+DrawBlockClass DrawBlockClassOf(std::span<const CompiledShader> shaders) {
+    bool block = false;
+    bool classic = false;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) continue;
+        block = block || shader.program->blockModule;
+        classic = classic || classicBuffers(*shader.program);
+    }
+    return !block ? DrawBlockClass::Classic : classic ? DrawBlockClass::Mixed : DrawBlockClass::Block;
+}
+
+void NoteDrawBlockCommit(DrawBlockClass kind, std::uint64_t nanoseconds) {
+    auto& times = commitTimes();
+    times.commits[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+    times.nanoseconds[static_cast<std::size_t>(kind)].fetch_add(nanoseconds, std::memory_order_relaxed);
+}
+
 bool UsesDrawBlocks(std::span<const CompiledShader> shaders) {
     return std::any_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->blockModule; });
 }
 
-void WriteDrawBlocks(const Context& context, Recorder* recorder, std::span<const CompiledShader> shaders, const ColorTarget* target, DrawBlockSections& sections, std::vector<std::shared_ptr<void>>* kept) {
+void WriteDrawBlocks(const Context& context, Recorder* recorder, std::span<const CompiledShader> shaders, const ColorTarget* target, DrawBlockSections& sections, std::vector<std::shared_ptr<void>>* kept, std::vector<std::pair<std::uint64_t, std::uint64_t>>* reads) {
     sections = {};
     if (!UsesDrawBlocks(shaders)) {
         if (DrawBlocks()) {
             Core::DrawBlockHost::NoteClassic();
+            noteClassicStages(shaders);
             report();
         }
         return;
@@ -119,7 +183,7 @@ void WriteDrawBlocks(const Context& context, Recorder* recorder, std::span<const
     Require(context.bufferDeviceAddress, "a shader compiled for draw blocks needs the buffer device address feature");
     const bool verify = VerifyDrawBlocks();
     auto& host = Core::DrawBlockHost::For(context);
-    Core::DrawBlockHost::Draw draw(host, recorder, kept, verify);
+    Core::DrawBlockHost::Draw draw(host, recorder, kept, verify, reads);
     std::size_t stages = 0;
     bool mixed = false;
     std::array<Core::BufferRequest, Abi::MaxBuffers> requests{};
@@ -169,6 +233,7 @@ void WriteDrawBlocks(const Context& context, Recorder* recorder, std::span<const
         ++stages;
     }
     draw.Served(stages, mixed);
+    if (mixed) noteClassicStages(shaders);
     report();
 }
 

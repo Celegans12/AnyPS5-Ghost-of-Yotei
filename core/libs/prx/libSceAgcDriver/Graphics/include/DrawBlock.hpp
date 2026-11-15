@@ -11,6 +11,7 @@
 #include <memory>
 #include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::Graphics {
@@ -35,6 +36,10 @@ struct DrawBlockCounts {
     std::uint64_t synced = 0;
     std::uint64_t unreadable = 0;
     std::uint64_t mixed = 0;
+    std::uint64_t mirrored = 0;
+    std::uint64_t mirroredBytes = 0;
+    std::uint64_t imported = 0;
+    std::uint64_t importedBytes = 0;
     std::uint64_t verified = 0;
     std::uint64_t mismatches = 0;
     std::uint64_t classic = 0;
@@ -68,12 +73,12 @@ public:
 
     class Draw {
     public:
-        Draw(DrawBlockHost& host, Graphics::Recorder* recorder, std::vector<std::shared_ptr<void>>* kept, bool shadowed);
+        Draw(DrawBlockHost& host, Graphics::Recorder* recorder, std::vector<std::shared_ptr<void>>* kept, bool shadowed, std::vector<std::pair<std::uint64_t, std::uint64_t>>* reads);
         ~Draw();
         Draw(const Draw&) = delete;
         Draw& operator=(const Draw&) = delete;
         [[nodiscard]] std::uint32_t* Section(std::size_t bytes, std::uint64_t& deviceAddress);
-        [[nodiscard]] bool Copy(std::uint64_t address, std::size_t bytes, std::size_t padded, std::uint64_t& deviceAddress);
+        [[nodiscard]] bool Copy(std::uint64_t address, std::size_t bytes, std::size_t padded, std::uint64_t& deviceAddress, bool& placed);
         void Served(std::size_t stages, bool mixed);
         void Absent();
         [[nodiscard]] std::span<const Range> Ranges() const { return ranges; }
@@ -83,10 +88,12 @@ public:
 
     private:
         bool hold(const RingSlice& slice);
+        bool inPlace(std::uint64_t address, std::size_t bytes, std::uint64_t& deviceAddress);
         std::byte* take(std::size_t bytes, std::uint64_t& deviceAddress, bool& ringed);
         DrawBlockHost& host;
         Graphics::Recorder* recorder = nullptr;
         std::vector<std::shared_ptr<void>>* kept = nullptr;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>>* reads = nullptr;
         bool shadowed = false;
         bool served = false;
         std::array<RingSlice, 8> held{};
@@ -118,7 +125,10 @@ struct DrawBlockSections {
 };
 
 [[nodiscard]] bool UsesDrawBlocks(std::span<const CompiledShader> shaders);
-void WriteDrawBlocks(const Context& context, Recorder* recorder, std::span<const CompiledShader> shaders, const ColorTarget* target, DrawBlockSections& sections, std::vector<std::shared_ptr<void>>* kept);
+enum class DrawBlockClass : std::uint32_t { Classic, Mixed, Block, Count };
+[[nodiscard]] DrawBlockClass DrawBlockClassOf(std::span<const CompiledShader> shaders);
+void NoteDrawBlockCommit(DrawBlockClass kind, std::uint64_t nanoseconds);
+void WriteDrawBlocks(const Context& context, Recorder* recorder, std::span<const CompiledShader> shaders, const ColorTarget* target, DrawBlockSections& sections, std::vector<std::shared_ptr<void>>* kept, std::vector<std::pair<std::uint64_t, std::uint64_t>>* reads);
 
 }
 

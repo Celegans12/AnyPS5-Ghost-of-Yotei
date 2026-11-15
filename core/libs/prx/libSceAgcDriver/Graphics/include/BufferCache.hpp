@@ -67,6 +67,7 @@ public:
         std::shared_ptr<void> owner;
         std::byte* bytes = nullptr;
         VkBuffer handle = VK_NULL_HANDLE;
+        std::uint64_t deviceAddress = 0;
     };
     using Allocate = std::function<Backing(std::size_t bytes)>;
     using Executed = std::function<bool(std::uint64_t serial)>;
@@ -106,6 +107,7 @@ public:
         std::shared_ptr<void> owner;
         std::uint64_t mirror = 0;
         std::uint64_t sequence = 0;
+        std::uint64_t deviceAddress = 0;
         bool streamed = false;
         Served served = Served::Tracked;
         explicit operator bool() const { return handle != VK_NULL_HANDLE; }

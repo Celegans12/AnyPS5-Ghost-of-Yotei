@@ -5354,8 +5354,10 @@ BufferCache* Recorder::Buffers() {
     if (!BufferCache::Enabled()) return nullptr;
     if (bufferCache == nullptr) {
         auto allocate = [this](std::size_t bytes) {
-            auto buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
+            const bool addressed = context.bufferDeviceAddress && DrawBlocks();
+            auto buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | (addressed ? VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT : 0u));
             BufferCache::Backing backing;
+            if (addressed) backing.deviceAddress = buffer->DeviceAddress();
             backing.bytes = buffer->Bytes().data();
             backing.handle = buffer->Handle();
             backing.owner = std::move(buffer);
