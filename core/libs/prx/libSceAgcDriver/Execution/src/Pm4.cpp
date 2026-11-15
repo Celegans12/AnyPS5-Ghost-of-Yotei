@@ -141,10 +141,21 @@ Registers& registersFor(QueueState& queue, std::uint32_t opcode) {
     return queue.userConfig;
 }
 
+void noteRegisterWrite(QueueState& queue, const Registers& bank, Core::Bank kind, std::uint32_t offset, std::uint32_t value) {
+    const bool had = bank.contains(offset);
+    const auto before = had ? bank.at(offset) : 0u;
+    if (had && before == value) return;
+    queue.runMask.Register(kind, offset);
+    if (Core::UserDataRegister(kind, offset) || (queue.staleDigests & (1u << static_cast<unsigned>(kind))) != 0) return;
+    Core::DigestWrite(kind == Core::Bank::Shader ? queue.shaderDigest : kind == Core::Bank::Context ? queue.contextDigest : queue.userConfigDigest, offset, had, before, value);
+}
+
 void writeRegister(QueueState& queue, std::uint32_t opcode, std::uint32_t offset, std::uint32_t value) {
     if ((opcode == 0x69 || opcode == 0x9f) && (offset == 0x8e || offset == 0x8f || offset == 0x318 || offset == 0x31b || offset == 0x31c || offset == 0x31d || offset == 0x390 || offset == 0x3b0 || offset == 0x3b8))
         APS5_LOG_OUT_DEBUG("CONTEXT WRITE opcode=0x%x offset=0x%x value=0x%x", opcode, offset, value);
-    registersFor(queue, opcode).insert_or_assign(offset, value);
+    auto& bank = registersFor(queue, opcode);
+    noteRegisterWrite(queue, bank, opcode == 0x69 || opcode == 0x9f ? Core::Bank::Context : opcode == 0x76 || opcode == 0x63 ? Core::Bank::Shader : Core::Bank::UserConfig, offset, value);
+    bank.insert_or_assign(offset, value);
     if (TraceContextState() && (opcode == 0x69 || opcode == 0x9f) && ((offset >= 0x318 && offset < 0x318 + 8 * 0xf && (offset - 0x318) % 0xf == 0) || offset == 0x8e)) std::fprintf(stderr, "[context]   write %x = %08x (0x%x)\n", offset, value, opcode);
     if ((opcode == 0x64 || opcode == 0x79 || opcode == 0x7a) && offset == 0x243) queue.indexType = value & 3u;
 }
@@ -1039,6 +1050,8 @@ std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> 
 
 void NoteDispatchRegisters(std::span<const std::uint32_t> packet, QueueState& queue) {
     const bool direct = ((packet[0] >> 8u) & 0xffu) == 0x15u;
+    queue.staleDigests |= 1u;
+    queue.runMask.bits |= Core::RunMask::State;
     queue.shader.insert_or_assign(0x200, packet.back());
     for (std::uint32_t i = 0; i < 3; ++i) {
         if (direct) queue.shader.insert_or_assign(0x201 + i, packet[1 + i]);
@@ -1105,6 +1118,21 @@ void executeIndexAttributes(const IndexAttributes& attributes, QueueState& queue
     queue.indexType = attributes.words[3];
 }
 
+}
+
+void RefreshDigests(QueueState& queue) {
+    if (queue.staleDigests == 0) return;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> registers;
+    const auto refresh = [&](const Registers& bank, Core::Bank kind, Core::BankDigest& digest) {
+        if ((queue.staleDigests & (1u << static_cast<unsigned>(kind))) == 0) return;
+        registers.clear();
+        bank.ForEach([&](std::uint32_t offset, std::uint32_t value) { registers.emplace_back(offset, value); });
+        digest = Core::DigestOf(registers, kind);
+    };
+    refresh(queue.shader, Core::Bank::Shader, queue.shaderDigest);
+    refresh(queue.context, Core::Bank::Context, queue.contextDigest);
+    refresh(queue.userConfig, Core::Bank::UserConfig, queue.userConfigDigest);
+    queue.staleDigests = 0;
 }
 
 void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {

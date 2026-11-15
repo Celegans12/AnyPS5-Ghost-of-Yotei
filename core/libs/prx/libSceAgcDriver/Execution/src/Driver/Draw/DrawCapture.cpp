@@ -327,6 +327,7 @@ bool Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             if (stageCapture.compiled == nullptr || !CacheableResult(*stageCapture.compiled)) continue;
             auto variant = std::make_shared<DispatchVariant>();
             variant->compiled = stageCapture.compiled;
+            if (stageCapture.capture != nullptr) variant->plan = stageCapture.capture->plan;
             variant->registeredViews = stageCapture.registeredViews;
             if (programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh) {
                 std::copy_n(programs[i].userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord, variant->meshIndexDescriptor.size(), variant->meshIndexDescriptor.begin());

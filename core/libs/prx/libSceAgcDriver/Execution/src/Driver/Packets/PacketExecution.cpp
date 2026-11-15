@@ -303,6 +303,7 @@ void Driver::execute(Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        if (opcode != 0x10 || (((header >> 2u) & 0x3fu) != 0 && ((header >> 2u) & 0x3fu) != 0x0b && ((header >> 2u) & 0x3fu) != 0x0c)) queue.runMask.Packet(opcode);
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;

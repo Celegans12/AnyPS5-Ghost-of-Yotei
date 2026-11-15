@@ -50,6 +50,12 @@ class PerformanceTimer;
 struct OverlayDriverCounters;
 }
 
+namespace AgcDriver::Core {
+struct FrontOutcome;
+struct CoreDraw;
+class Front;
+}
+
 namespace AgcDriver::DriverDetail {
 
 inline std::uint32_t ThreadDimensionGroups(std::uint32_t threads, std::uint32_t groupThreads) {
@@ -164,6 +170,7 @@ private:
     friend struct PacketTimer;
     friend struct DriverTestAccess;
     friend struct DrawSiteAccess;
+    friend class Core::Front;
     void stop();
     Driver();
     void rethrowFailure() const;
@@ -283,6 +290,10 @@ private:
     void resolveDrawTail(DrawTail& tail, const Submission& submission);
     DrawVerdict finishDraw(DrawTail& tail, PerformanceTimer& timing);
     void restartFinishedDraw(DrawTail& tail);
+    static bool CoreVertexInputsMatch(const ShaderRecompiler::ShaderVertexStageInfo& was, const ShaderRecompiler::ShaderVertexStageInfo& now) { return shapeVertexInputsMatch(was, now); }
+    bool tryCoreDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, const Pm4::DrawParameters& drawParameters, std::uint64_t deviceSerial, Core::FrontOutcome& outcome);
+    void commitCoreDraw(const std::shared_ptr<Core::CoreDraw>& record);
+    static void precollectCoreDraw(const DrawRecipe& recipe, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
     static PendingDispatchPhases& pendingDispatchPhases();
     static std::chrono::steady_clock::time_point& packetStartedAt();

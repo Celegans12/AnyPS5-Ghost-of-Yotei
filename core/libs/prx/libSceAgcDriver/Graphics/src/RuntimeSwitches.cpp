@@ -195,10 +195,14 @@ struct BlockSwitches {
     bool blocks = false;
     bool verify = false;
     bool stats = false;
+    bool coreRun = false;
+    bool verifyCoreRun = false;
     std::size_t ringMax = 16384;
     BlockSwitches() {
         verify = std::getenv("APS5_VERIFY_DRAW_BLOCK") != nullptr;
-        blocks = verify || std::getenv("APS5_DRAW_BLOCK") != nullptr;
+        verifyCoreRun = std::getenv("APS5_VERIFY_CORE_RUN") != nullptr;
+        coreRun = verifyCoreRun || std::getenv("APS5_CORE_RUN") != nullptr;
+        blocks = verify || coreRun || std::getenv("APS5_DRAW_BLOCK") != nullptr;
         stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
         if (const char* text = std::getenv("APS5_CORE_RING_MAX")) ringMax = static_cast<std::size_t>(std::min<unsigned long long>(std::strtoull(text, nullptr, 10), 4194304ull));
     }
@@ -228,6 +232,18 @@ std::size_t CoreRingMax() {
 }
 
 bool DrawBlockStats() {
+    return Blocks().stats;
+}
+
+bool CoreRun() {
+    return Blocks().coreRun;
+}
+
+bool VerifyCoreRun() {
+    return Blocks().verifyCoreRun;
+}
+
+bool CoreRunStats() {
     return Blocks().stats;
 }
 

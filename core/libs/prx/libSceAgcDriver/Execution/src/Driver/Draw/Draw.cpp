@@ -7,6 +7,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawSites.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
+#include "prx/libSceAgcDriver/Core/include/Front.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -198,6 +200,7 @@ struct DrawTail {
     VulkanDevice::DrawTraceContext trace{};
     std::string ownRejected;
     DrawSiteOutcome site;
+    Core::FrontOutcome core;
     std::vector<DrawUserPatch> userPatches;
     std::uint64_t drawIdentity = 0;
     std::uint64_t drawAlias = 0;
@@ -569,6 +572,25 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && !dumpGraphics && dumpTarget == 0 && dumpSlot1 == 0 && drawEntriesThisDraw();
     tail.registerKey = useDrawEntries && registerKeyEnabled();
     const bool registerKey = tail.registerKey;
+    static const bool coreRun = Graphics::CoreRun();
+    if (coreRun) {
+        const bool eligible = registerKey && pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !TraceDrawPrograms() && traceToken == 0 && !verifyDrawDataHits() && !verifyDrawEntries() && !verifyDrawRecipe() && deferredLabels().labels.empty() && DrawFinisher::Enabled() && submission.queue == 0 && queue.predication.operation == 0;
+        const bool taken = eligible && tryCoreDraw(queue, packet, submission, drawParameters, localDevice->Serial(), tail.core);
+        queue.runMask.Drawn();
+        if (tail.core.candidate != nullptr && !taken) {
+            const auto full = decodeDraw(queue, submission, localDevice->graphicsContext());
+            const auto& plan = *tail.core.candidate->variant->plan;
+            for (std::size_t i = 0; i < full->programs.size() && i < plan.decode->programs.size(); ++i) full->programs[i].userData = plan.decode->programs[i].userData;
+            if (!sameDecode(*plan.decode, *full)) {
+                Core::Front::Get().NoteVerified(true);
+                throw std::runtime_error("APS5_VERIFY_CORE_RUN: the state decoded for a state key differs from the state of the plan taught under that key");
+            }
+        }
+        if (taken) {
+            timing.Mark("draw_taken_by_core");
+            return drawn();
+        }
+    }
     auto& drawKey = tail.drawKey;
     std::array<std::uint64_t, 5> drawKeyComponents{};
     auto& entry = tail.entry;
@@ -967,6 +989,17 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.rejected = &rejected;
     tail.gpuLock = &gpuLock;
     return finishDraw(tail, timing);
+}
+
+void Driver::precollectCoreDraw(const DrawRecipe& recipe, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads) {
+    if (!FinisherPrecollect() || GuestMemory::CollectEpoch() == 0 || !CollectWalker::Enabled()) return;
+    const auto walkEpoch = GuestMemory::HeldCollectEpoch();
+    auto& walker = CollectWalker::Get();
+    for (const auto& [address, bytes] : recipe.surfaces) walker.Offer(walkEpoch, address, bytes);
+    if (!FinisherInputPrecollect()) return;
+    for (const auto& [begin, end] : reads) {
+        if (end - begin <= FinisherInputPrecollectBytes) walker.Offer(walkEpoch, begin, end - begin);
+    }
 }
 
 FinisherLookupCounts Driver::FinisherLookupCounted() {
@@ -1774,6 +1807,27 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
         noteRecipeDecision();
         phaseTiming.Phase(DrawRowVectors);
+        if (tail.core.candidate != nullptr) {
+            auto& front = Core::Front::Get();
+            const auto difference = front.Compare(*tail.core.candidate, *decode, stages, recipe.get());
+            front.NoteVerified(!difference.empty());
+            front.Release(std::move(tail.core.candidate));
+            if (!difference.empty()) throw std::runtime_error("APS5_VERIFY_CORE_RUN: a draw the core would take differs from the classic path in " + difference);
+        }
+        if (tail.core.teach && recipe != nullptr && !patchedStages && tail.userPatches.empty() && !drawParameters.indirect) {
+            std::vector<std::shared_ptr<DispatchVariant>> served(programs.size());
+            for (std::size_t i = 0; i < programs.size(); ++i) served[i] = drawHit || reused[i] ? matched[i] : fresh[i];
+            Core::TeachInputs inputs;
+            inputs.key = tail.core.key;
+            inputs.decode = decode;
+            inputs.programs = programs;
+            inputs.stages = stages;
+            inputs.served = served;
+            inputs.recipe = recipe;
+            inputs.writes = DrawWriteRanges(graphics, stages, ExactDrawWrites());
+            inputs.shape = tail.shapeKey;
+            Core::Front::Get().Teach(inputs);
+        }
         if (tail.site.eligible) {
             std::vector<std::shared_ptr<DispatchVariant>> served(programs.size());
             for (std::size_t i = 0; i < programs.size(); ++i) served[i] = drawHit || reused[i] ? matched[i] : fresh[i];

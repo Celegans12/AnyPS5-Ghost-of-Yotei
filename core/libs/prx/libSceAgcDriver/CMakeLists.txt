@@ -460,6 +460,12 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/BlockWriter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/BlockVerify.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DrawBlockHost.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/BlockLedger.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/RunKey.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/RunPlan.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/ResourceCache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/Front.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/Back.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DrawBlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeferredDestruction.cpp

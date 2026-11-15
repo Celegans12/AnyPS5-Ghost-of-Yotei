@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_QUEUESTATE_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_QUEUESTATE_HPP
 
+#include "prx/libSceAgcDriver/Core/include/RunKey.hpp"
 #include <bit>
 #include <cstddef>
 #include <cstdint>
@@ -300,20 +301,34 @@ struct QueueState {
     std::uint32_t instanceCount = 1;
     std::vector<std::string> markers;
     Predication predication;
+    Core::BankDigest shaderDigest;
+    Core::BankDigest contextDigest;
+    Core::BankDigest userConfigDigest;
+    Core::BankDigest savedContextDigest;
+    std::uint8_t staleDigests = 7;
+    bool savedContextStale = true;
+    Core::RunMask runMask{Core::RunMask::Other | Core::RunMask::State};
 
     void ClearContext() {
         context = ClearStateContextRegisters();
+        staleDigests |= 2u;
+        runMask.bits |= Core::RunMask::State;
     }
 
     void PushContext() {
         spareContext.registers = context;
         savedContext.emplace(std::move(spareContext.registers));
+        savedContextDigest = contextDigest;
+        savedContextStale = (staleDigests & 2u) != 0;
     }
 
     void PopContext() {
         std::swap(context, *savedContext);
         spareContext.registers = std::move(*savedContext);
         savedContext.reset();
+        contextDigest = savedContextDigest;
+        staleDigests = static_cast<std::uint8_t>((staleDigests & ~2u) | (savedContextStale ? 2u : 0u));
+        runMask.bits |= Core::RunMask::State;
     }
 
     std::span<const std::uint32_t> ConstantRam() const {

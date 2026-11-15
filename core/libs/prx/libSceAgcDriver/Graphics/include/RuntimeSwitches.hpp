@@ -68,6 +68,9 @@ bool DrawBlocks();
 bool VerifyDrawBlocks();
 std::size_t CoreRingMax();
 bool DrawBlockStats();
+bool CoreRun();
+bool VerifyCoreRun();
+bool CoreRunStats();
 void ForceDrawBlocks(bool blocks, bool verify);
 void UnforceDrawBlocks();
 
