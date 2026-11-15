@@ -114,12 +114,10 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
         next.runtimeStateDwords = (attributes + RuntimeAbi::VertexSelectorsPerDword - 1u) / RuntimeAbi::VertexSelectorsPerDword;
     }
     const auto pushSize = layout.pushConstantSizeBytes / 4u;
-    next.pushDataStartDword = next.runtimeImageCount == 0u && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= pushSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
-    if (blockAccess) {
-        const auto pushed = next.UsesPushData() ? next.ShaderDataDwords() : 0u;
-        if (pushSize < BlockAbi::PushAddressDwords || pushed > pushSize - BlockAbi::PushAddressDwords) fail("shader binding layout failed: the push constant range cannot hold the block address");
-        next.blockAddressDword = layout.pushConstantOffsetBytes / 4u + pushed;
-    }
+    if (blockAccess && pushSize < BlockAbi::PushAddressDwords) fail("shader binding layout failed: the push constant range cannot hold the block address");
+    const auto pushDataSize = blockAccess ? pushSize - BlockAbi::PushAddressDwords : pushSize;
+    next.pushDataStartDword = next.runtimeImageCount == 0u && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= pushDataSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
+    if (blockAccess) next.blockAddressDword = layout.pushConstantOffsetBytes / 4u + (next.UsesPushData() ? next.ShaderDataDwords() : 0u);
     if (stencilReplay) {
         if (blockAccess) fail("shader binding layout failed: stencil replay is not laid out with a block address");
         const auto offset = next.UsesPushData() ? next.ShaderDataDwords() : 0u;

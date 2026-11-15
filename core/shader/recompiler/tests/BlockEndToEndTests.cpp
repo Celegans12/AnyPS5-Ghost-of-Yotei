@@ -193,6 +193,27 @@ void Run() {
     Expect(!narrow.blockModule && narrow.blockAddressDword == NoWord, "a push range too small for the block address still produced a block module");
     Expect(std::ranges::equal(narrow.spirv.Words(), narrowClassic.spirv.Words()), "a refused block request does not produce the classic module");
     Expect(narrow.pushConstants == narrowClassic.pushConstants, "a refused block request changes the push constants");
+
+    const auto exact = static_cast<std::uint32_t>(classic.pushConstants.size());
+    Expect(exact >= sizeof(std::uint32_t) && exact % sizeof(std::uint32_t) == 0u, "the classic result of the reference shader pushes no shader data");
+    const auto exactClassic = Recompile(fixture.Request(false, exact));
+    Expect(exactClassic.pushConstants == classic.pushConstants, "a push range of exactly the shader data does not push it in a classic module");
+    for (const std::uint32_t pushBytes : {exact, exact + 4u}) {
+        const auto tight = Recompile(fixture.Request(true, pushBytes));
+        const auto tightWords = tight.spirv.Copy();
+        Expect(tight.blockModule, "a push range that holds the block address but not the shader data beside it produced a classic module");
+        Expect(tight.blockAddressDword == 0u, "the block address does not open a push range that holds no shader data");
+        Expect(tight.pushConstants.size() == BlockAbi::PushAddressDwords * sizeof(std::uint32_t), "a push range without room for the shader data pushes more than the block address");
+        Expect(tight.shaderDataDwords == classic.shaderDataDwords && tight.memoryOffsetDword == classic.memoryOffsetDword, "moving the shader data out of the push range changes its layout");
+        Expect(Roles(tight, DescriptorRole::ShaderData) == 0u && tight.shaderDataUserWords.empty(), "a block module that reads no shader data still asks for it outside the push range");
+        Expect(tight.blockLayout.words == block.blockLayout.words && tight.blockLayout.buffers.size() == block.blockLayout.buffers.size(), "the block layout depends on where the shader data lives");
+        Expect(Valid(tightWords), "the block module with its shader data outside the push range is rejected by the validator");
+        const auto tightShape = Describe(tightWords);
+        Expect(tightShape.physical && tightShape.arrayLengths == 0u, "the block module with its shader data outside the push range does not read through the block");
+        Expect(tightShape.bindings == blockShape.bindings, "the block module with its shader data outside the push range declares other bindings than the block module that pushes it");
+    }
+    const auto roomy = Recompile(fixture.Request(true, exact + 8u));
+    Expect(roomy.blockModule && roomy.blockAddressDword * sizeof(std::uint32_t) == exact && roomy.pushConstants.size() == block.pushConstants.size(), "a push range of exactly the shader data and the block address does not hold both");
 }
 
 }

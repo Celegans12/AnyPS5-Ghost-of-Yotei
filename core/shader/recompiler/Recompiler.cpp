@@ -927,9 +927,22 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     if (registration && result.spirv.size() > request.target.registrationWordLimit) {
         registration = false;
         program.Metadata().bindingLayoutComplete = false;
-        bindings = bindingAllocator.Allocate(program, request.layout, false, stencilReplay, block);
         targetOptions.registrationModules = false;
-        result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
+        if (block) {
+            try {
+                bindings = bindingAllocator.Allocate(program, request.layout, false, stencilReplay, true);
+                result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
+            } catch (const std::runtime_error& error) {
+                std::fprintf(stderr, "[draw-block] 0x%llx falls back to its classic module: %s%c", static_cast<unsigned long long>(request.shader.codeAddress), error.what(), 10);
+                block = false;
+                program.Metadata().bindingLayoutComplete = false;
+                targetOptions.blockAccess = false;
+            }
+        }
+        if (!block) {
+            bindings = bindingAllocator.Allocate(program, request.layout, false, stencilReplay);
+            result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions, &emitted);
+        }
     }
     result.registrationModule = registration;
     result.blockModule = block;
@@ -2504,9 +2517,10 @@ bool MatchesPreparedShader(const RecompileRequest& request, const SourceHandle& 
     if (layout.descriptorSet != handle.artifact->layout.descriptorSet || layout.firstBinding != handle.artifact->layout.firstBinding) return false;
     if (layout.pushConstantOffsetBytes % 4u != 0u || layout.pushConstantSizeBytes % 4u != 0u || layout.pushConstantOffsetBytes > NativePushConstantSize || layout.pushConstantSizeBytes > NativePushConstantSize - layout.pushConstantOffsetBytes) return false;
     const auto words = prepared.ShaderDataDwords();
-    const bool usesPush = prepared.runtimeImageCount == 0u && words != 0u && words <= layout.pushConstantSizeBytes / 4u;
+    const auto pushWords = layout.pushConstantSizeBytes / 4u;
+    if (pushWords < prepared.BlockAddressDwords()) return false;
+    const bool usesPush = prepared.runtimeImageCount == 0u && words != 0u && words <= pushWords - prepared.BlockAddressDwords();
     if (prepared.UsesPushData() != usesPush) return false;
-    if (prepared.UsesBlock() && (usesPush ? words : 0u) + prepared.BlockAddressDwords() > layout.pushConstantSizeBytes / 4u) return false;
     if (!handle.artifact->artifact.stencilReferences.empty() && (prepared.stencilReferenceDword >= layout.pushConstantSizeBytes / 4u || prepared.stencilReferenceDword != (usesPush ? words : 0u))) return false;
     if (!std::ranges::equal(key, handle.staticKey) || handle.source->code.size() != request.shader.code.size()) return false;
     return handle.source->code.data() == request.shader.code.data() || std::ranges::equal(handle.source->code, request.shader.code);
