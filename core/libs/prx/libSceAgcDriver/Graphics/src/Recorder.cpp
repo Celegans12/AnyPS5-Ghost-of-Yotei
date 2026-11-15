@@ -4857,6 +4857,9 @@ bool Recorder::unsignaled(std::uint64_t serial) const {
 
 bool Recorder::ExecutedThrough(std::uint64_t serial) const {
     if (serial > submissions) return false;
+    for (const auto* batch : finishing) {
+        if (batch->serial <= serial && !signaled(*batch)) return false;
+    }
     for (const auto& batch : inFlight) {
         if (batch->serial > serial) break;
         if (!signaled(*batch)) return false;
