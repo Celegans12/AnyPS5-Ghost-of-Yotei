@@ -135,20 +135,39 @@ title.
 
 ### Per game
 
-Completion is the share of the 60 fps target reached: 16.7 ms divided by today's frame time.
+Re-evaluated 2026-11-15 after phase 4 steps 1 and 2. Completion is the share of the 60 fps
+target reached: 16.7 ms divided by the frame time. Frame times are p50 of unprofiled runs
+(`scripts\bench.ps1`); the table before this one used profiled runs, which read about 10 %
+slower on FF and AoM, so only part of the FF and AoM change is real (see "Since the last table").
 
 | Title | Where it runs | Frame | Completion | Bound by | Phase work open |
 |---|---|---|---|---|---|
-| FF Resonance | in game, bench scene | 35.3 to 36.6 ms | **47 %** | CPU: worker 0 at 97 % | 4 (carries the walk and epoch target) |
-| LEGO | in game, bench scene | 49 to 50 ms | **34 %** | GPU: about 40 ms per frame, one compute program on top | 5 (translation) |
-| 007 | title screen and menus; first cutscene stalls on cold shader compiles | 160 to 175 ms before the scene change, about 200 to 221 ms after it | **8 to 10 %** | CPU: the draw committer; queue 0 waits 14 to 23 ms per frame on GPU-computed values | GPU time after the scene change higher since the rebase (open), then 4 and 5 |
-| AoM | title screen and the scene after the pad press | 155 to 163 ms | **10 to 11 %** | title GPU, scene CPU | 4, then 5 and 6 |
+| FF Resonance | in game, bench scene | 31 to 33 ms | **51 to 54 %** | CPU: worker 0 (97 % busy when last profiled, on `libs\c8`) | 4 step 4 (slot memo and table mirror validity; carries the walk and epoch target) |
+| LEGO | in game, bench scene | 47 to 49 ms | **34 to 36 %** | GPU: about 40 ms per frame, one compute program on top | 5 (translation) |
+| 007 | title screen and menus only; crashes after "continue" (device lost in the first cutscene, or a RenderThread read of 0x40), which predates phases 3 and 4 | 68 to 80 ms once warm; 75 to 100 ms in the first minute | **21 to 25 %** warm | CPU: about 48 ms of dispatch per frame on the main worker, plus the draw committer. GPU is 38 ms per present, of which 22 ms is storage write-back, upload and staging | 4 step 3 (staging); the surface exchange from pool reuse (storage-image sharing, parked); then 5. The crashes are open and set aside |
+| AoM | title screen and the scene after the pad press | 142 to 148 ms | **11 to 12 %** | Title screen: CPU and GPU close. The worker spends about 165 ms per frame in packets (dispatch 95, draws 70) and the GPU 85 to 90 ms per present (profiled) | 5 and 6; phase 4 has little left for it (label stores are gone) |
 
-Frame times are on the rebased tree (upstream 3c310597b6), which is slower than the pre-rebase
-numbers this table held before (FF 30.6 to 33, LEGO 44 to 49, 007 121 to 129, AoM 146 to 158 ms).
+Since the last table (same day, before phase 4):
+
+- **007: 160 to 221 ms then, 68 to 80 ms now.** Real, and the largest change of the phase:
+  the binding join and gathered storage upload (to 117 to 135 ms), image tables matched by
+  content, ordered flushes for GPU consumers (83 to 93 ms), pooled image memory (75 to 88 ms).
+  The scene change at about 103 s no longer shows as a step. The title still does not get past
+  its first cutscene.
+- **FF: 35.3 to 36.6 ms then, 31 to 33 ms now.** Mostly the harness: profiled scenes on
+  `libs\i4` still read 35.7 to 38.3 ms. No phase 4 change targets FF yet.
+- **LEGO: 49 to 50 ms then, 47 to 49 ms now.** Unchanged within run variance, as expected for a
+  GPU-bound title.
+- **AoM: 155 to 163 ms then, 142 to 148 ms now.** Part harness; the label read traps add 2 to
+  6 % (three back-to-back pairs).
+
+What the numbers rest on: AoM is timed on the current build (`libs\k23`, traps on). 007, FF
+and LEGO were last timed on `libs\k8`, before the last three trap fixes, and are equal with and
+without traps there; one round on `libs\k24` is owed. Frame times move by a few percent with
+machine load, so the ranges are from back-to-back runs. "Bound by" for FF and LEGO is from
+profiles taken before phase 4 and was not measured again.
 
 Divinity is not a test title. BO1 was removed from testing on 2026-11-13 (game deleted).
-
 ### Per phase
 
 | Phase | State |
