@@ -251,6 +251,14 @@ buffer regions often span two mappings and no single import served them. Found a
   image objects with their memory (`failed-patches\phase4-storage-image-recycler.patch`); it
   broke 13 tests that require image memory to be released at its last use, and 007's GPU time
   rose after 60 s in two of three runs (1 GiB more held).
+- What a new 007 storage image is made over (`[storage-over]`, `runs\007\j0-over`, 52,746
+  creations, 42,248 pending images under them): 96 % are other surfaces whose memory the title
+  reused (partial overlap 18,825; old inside new 12,808; new inside old 8,450); only 1,865 are
+  the same range and size under another format. So an image-to-image copy or a shared image
+  would cover 4 %; the rest needs steps 1 and 2 below. Of the creations, 33,750 (206 of 287 GiB)
+  sit at a 4 KiB base that is not a 64 KiB base and so have no block units: they are written
+  back and uploaded whole. GPU time per present on `libs\i4`: storage write-back 10.1 ms
+  (307 MiB), storage upload 8.1 ms (281 MiB), staging 3.7 ms, of 38 ms.
 - f8e0ee64d4: eight `thread_local` caches of the direct path had destructors; the draw committer
   crashed in one at thread exit (`agc_driver_village_draw_cost` hung in 9 of 120 runs with
   section A off). They use `ThreadScratch` now; 150 of 150 runs pass.
