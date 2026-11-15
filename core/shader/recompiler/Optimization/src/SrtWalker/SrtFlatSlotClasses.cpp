@@ -73,6 +73,16 @@ std::uint32_t DescriptorDwordSlot(const IrResourcePlan& plan, std::size_t source
     return slot->ImmediateU32();
 }
 
+std::uint32_t DescriptorDwordUserWord(const IrResourcePlan& plan, std::size_t source, std::uint32_t dword) {
+    if (source >= plan.descriptorSources.size()) return NoDescriptorDwordSlot;
+    const auto& dwords = plan.descriptorSources[source];
+    if (dword >= dwords.dwordCount || dword >= dwords.dwords.size() || dwords.dwords[dword] == nullptr) return NoDescriptorDwordSlot;
+    const IrValue* value = dwords.dwords[dword]->Resolve();
+    if (value->Opcode() != IrOpcode::GetUserData || value->ArgumentCount() < 1 || value->Argument(0) == nullptr) return NoDescriptorDwordSlot;
+    const auto reg = RegIndex(static_cast<ScalarReg>(value->Argument(0)->Register().index));
+    return reg >= plan.userDataBase && reg - plan.userDataBase < plan.userDataCount ? reg - plan.userDataBase : NoDescriptorDwordSlot;
+}
+
 std::vector<std::uint8_t> ComputeDescriptorLeafDwords(const IrResourcePlan& plan) {
     std::vector<std::uint8_t> leaves(plan.descriptorSources.size(), 0u);
     if (leaves.empty() || plan.info.buffers.empty()) return leaves;

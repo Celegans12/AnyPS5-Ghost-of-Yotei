@@ -599,6 +599,14 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
         out.Value(word.word);
         out.Value(word.mask);
     });
+    writer.List(result.blockLayout.userVariantKey, [](Writer& out, const BlockVariantBit& bit) {
+        out.Value(bit.word);
+        out.Value(bit.mask);
+    });
+    writer.List(result.blockLayout.userImageKey, [](Writer& out, const BlockImageKeyWord& word) {
+        out.Value(word.word);
+        out.Value(word.mask);
+    });
     writer.Value(result.blockLayout.refusal);
 }
 
@@ -686,6 +694,14 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
         in.Value(bit.mask);
     });
     reader.List(result.blockLayout.imageKey, 8, [](Reader& in, BlockImageKeyWord& word) {
+        in.Value(word.word);
+        in.Value(word.mask);
+    });
+    reader.List(result.blockLayout.userVariantKey, 8, [](Reader& in, BlockVariantBit& bit) {
+        in.Value(bit.word);
+        in.Value(bit.mask);
+    });
+    reader.List(result.blockLayout.userImageKey, 8, [](Reader& in, BlockImageKeyWord& word) {
         in.Value(word.word);
         in.Value(word.mask);
     });

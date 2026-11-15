@@ -81,6 +81,28 @@ public:
         return read(handle);
     }
 
+    IrValue* user(std::uint32_t index) {
+        IrValue* reg = value(IrOpcode::Void, IrType::ScalarReg);
+        reg->SetRegister(GuestRegister{RegisterBank::UserData, index});
+        IrValue* result = value(IrOpcode::GetUserData, IrType::U32);
+        result->AddArgument(reg);
+        return result;
+    }
+
+    std::uint32_t sourceOf(std::initializer_list<IrValue*> values) {
+        DescriptorSource entry;
+        for (IrValue* dword : values) entry.dwords[entry.dwordCount++] = dword;
+        plan.descriptorSources.push_back(entry);
+        return static_cast<std::uint32_t>(plan.descriptorSources.size() - 1u);
+    }
+
+    std::uint32_t userSource(std::uint32_t first, std::uint32_t count) {
+        DescriptorSource entry;
+        for (std::uint32_t index = 0; index < count; ++index) entry.dwords[entry.dwordCount++] = user(first + index);
+        plan.descriptorSources.push_back(entry);
+        return static_cast<std::uint32_t>(plan.descriptorSources.size() - 1u);
+    }
+
     std::uint32_t source(std::initializer_list<std::uint32_t> slots) {
         DescriptorSource entry;
         for (const auto slot : slots) entry.dwords[entry.dwordCount++] = slot == Missing ? value(IrOpcode::GetUserData, IrType::U32) : flat(slot);
@@ -123,6 +145,13 @@ private:
 bool Same(const BlockLayout& left, const BlockLayout& right) {
     if (left.abiVersion != right.abiVersion || left.words != right.words || left.refusal != right.refusal) return false;
     if (left.buffers.size() != right.buffers.size() || left.variantKey.size() != right.variantKey.size() || left.imageKey.size() != right.imageKey.size()) return false;
+    if (left.userVariantKey.size() != right.userVariantKey.size() || left.userImageKey.size() != right.userImageKey.size()) return false;
+    for (std::size_t index = 0; index < left.userVariantKey.size(); ++index) {
+        if (left.userVariantKey[index].word != right.userVariantKey[index].word || left.userVariantKey[index].mask != right.userVariantKey[index].mask) return false;
+    }
+    for (std::size_t index = 0; index < left.userImageKey.size(); ++index) {
+        if (left.userImageKey[index].word != right.userImageKey[index].word || left.userImageKey[index].mask != right.userImageKey[index].mask) return false;
+    }
     for (std::size_t index = 0; index < left.buffers.size(); ++index) {
         const auto& a = left.buffers[index];
         const auto& b = right.buffers[index];
@@ -271,37 +300,37 @@ void CheckRefusals() {
         Plan plan;
         FillTwoBuffers(plan);
         plan.plan.srtPlanComplete = false;
-        Expect(RefusalOf(plan) == BlockRefusal::IncompletePlan, "a plan without a completed SRT plan is not refused as IncompletePlan");
+        Expect(RefusalOf(plan) == BlockRefusal::SrtPlanIncomplete, "a plan without a completed SRT plan is not refused as SrtPlanIncomplete");
     }
     {
         Plan plan;
         FillTwoBuffers(plan);
         plan.plan.resourceTrackingComplete = false;
-        Expect(RefusalOf(plan) == BlockRefusal::IncompletePlan, "a plan without completed resource tracking is not refused as IncompletePlan");
+        Expect(RefusalOf(plan) == BlockRefusal::ResourceTrackingIncomplete, "a plan without completed resource tracking is not refused as ResourceTrackingIncomplete");
     }
     {
         Plan plan;
         FillTwoBuffers(plan);
         plan.plan.info.buffers[1].source = 7u;
-        Expect(RefusalOf(plan) == BlockRefusal::IncompletePlan, "a buffer without a descriptor source is not refused as IncompletePlan");
+        Expect(RefusalOf(plan) == BlockRefusal::BufferSourceMissing, "a buffer without a descriptor source is not refused as BufferSourceMissing");
     }
     {
         Plan plan;
         FillTwoBuffers(plan);
         plan.plan.srtReads[1].flatOffset = 0u;
-        Expect(RefusalOf(plan) == BlockRefusal::IncompletePlan, "two slots sharing a flat offset are not refused as IncompletePlan");
+        Expect(RefusalOf(plan) == BlockRefusal::WordShared, "two slots sharing a flat offset are not refused as WordShared");
     }
     {
         Plan plan;
         plan.words(4u);
         plan.buffer(plan.source({0u, 1u, 2u, Missing})).descriptorFormatted = true;
-        Expect(RefusalOf(plan) == BlockRefusal::IncompletePlan, "a fixed-format buffer whose format word is outside the block is not refused as IncompletePlan");
+        Expect(RefusalOf(plan) == BlockRefusal::BufferFormatWordMissing, "a fixed-format buffer whose format word is outside the block is not refused as BufferFormatWordMissing");
     }
     {
         Plan plan;
         plan.words(8u);
         plan.image(plan.source({0u, 1u, 2u, Missing, 4u, 5u, 6u, 7u}), 2u);
-        Expect(RefusalOf(plan) == BlockRefusal::IncompletePlan, "a multi-mode image with a T# word outside the block is not refused as IncompletePlan");
+        Expect(RefusalOf(plan) == BlockRefusal::ImageWordMissing, "a multi-mode image with a T# word outside the block is not refused as ImageWordMissing");
     }
 }
 
@@ -313,7 +342,7 @@ void CheckRefusalNames() {
         Expect(!names[index].empty(), "a refusal has no name");
         for (std::size_t other = 0; other < index; ++other) Expect(names[index] != names[other], "two refusals share a name");
     }
-    Expect(BlockRefusalName(BlockRefusal::None) == "None" && BlockRefusalName(BlockRefusal::IncompletePlan) == "IncompletePlan", "refusal names do not match their enumerators");
+    Expect(BlockRefusalName(BlockRefusal::None) == "None" && BlockRefusalName(BlockRefusal::SamplerSourceMissing) == "SamplerSourceMissing", "refusal names do not match their enumerators");
     Expect(!BlockRefusalName(BlockRefusal::Count).empty(), "an out-of-range refusal has no name");
 }
 
@@ -397,6 +426,114 @@ void CheckImageKeys() {
     Expect(BlockVariantKey(layout, changed) == base, "the variant key follows a sampler word");
 }
 
+void CheckUserDataImages() {
+    {
+        Plan plan;
+        plan.words(6u);
+        plan.buffer(plan.source({0u, 1u, 2u, 3u}));
+        plan.image(plan.userSource(4u, 8u), 3u);
+        plan.image(plan.userSource(12u, 8u), 1u);
+        plan.sampler(plan.userSource(20u, 4u));
+        const auto layout = BuildBlockLayout(plan.plan);
+        Expect(layout.Eligible(), "a plan whose T# and S# words are user data words is refused");
+        Expect(layout.words == 6u && layout.buffers.size() == 1u, "user data words of images change the block words or buffers");
+        Expect(layout.variantKey.empty() && layout.imageKey.empty(), "user data words of images are listed as block words");
+        Expect(layout.userVariantKey.size() == 8u, "the user variant key does not list the T# words of the multi-mode image alone");
+        for (std::size_t index = 0; index < layout.userVariantKey.size(); ++index) Expect(layout.userVariantKey[index].word == index + 4u && layout.userVariantKey[index].mask == WholeWord, "a user variant word is misplaced or masked");
+        Expect(layout.userImageKey.size() == 20u, "the user image key does not list every T# and S# word held in user data");
+        for (std::size_t index = 0; index < layout.userImageKey.size(); ++index) Expect(layout.userImageKey[index].word == index + 4u && layout.userImageKey[index].mask == WholeWord, "a user image key word is misplaced or masked");
+        std::vector<std::uint32_t> words(6u, 0x11111111u);
+        std::vector<std::uint32_t> userData(64u, 0x22222222u);
+        const auto base = BlockVariantKey(layout, words, userData);
+        Expect(BlockVariantKey(layout, words, userData) == base, "the variant key of the same user data changes");
+        for (std::uint32_t word = 4u; word < 12u; ++word) {
+            auto changed = userData;
+            changed[word] ^= 1u << 20u;
+            Expect(BlockVariantKey(layout, words, changed) != base, "the variant key ignores a T# word of a multi-mode image held in user data");
+        }
+        for (const std::uint32_t outside : {0u, 3u, 12u, 19u, 20u, 23u, 63u}) {
+            auto changed = userData;
+            changed[outside] ^= 1u << 20u;
+            Expect(BlockVariantKey(layout, words, changed) == base, "the variant key follows a user data word outside the key");
+        }
+        auto changedWords = words;
+        changedWords[3] ^= 1u;
+        Expect(BlockVariantKey(layout, changedWords, userData) == base, "the variant key follows a block word outside the key");
+        bool refused = false;
+        try {
+            static_cast<void>(BlockVariantKey(layout, words));
+        } catch (const std::logic_error&) {
+            refused = true;
+        }
+        Expect(refused, "a layout keyed on user data gives a variant key without the user data");
+        bool thrown = false;
+        try {
+            static_cast<void>(BlockVariantKey(layout, words, std::span<const std::uint32_t>(userData).first(11u)));
+        } catch (const std::out_of_range&) {
+            thrown = true;
+        }
+        Expect(thrown, "a variant word outside the given user data is read");
+    }
+    {
+        Plan plan;
+        plan.words(8u);
+        plan.image(plan.sourceOf({plan.flat(0u), plan.user(9u), plan.constant(7u), plan.flat(3u), plan.user(2u), plan.flat(5u), plan.constant(0u), plan.flat(7u)}), 2u);
+        const auto layout = BuildBlockLayout(plan.plan);
+        Expect(layout.Eligible(), "a multi-mode image whose T# mixes block words, user data words and constants is refused");
+        Expect(layout.variantKey.size() == 4u && layout.imageKey.size() == 4u, "the block words of a mixed T# are not all keyed");
+        Expect(layout.userVariantKey.size() == 2u && layout.userImageKey.size() == 2u, "the user data words of a mixed T# are not all keyed");
+        if (layout.variantKey.size() == 4u) Expect(layout.variantKey[0].word == 0u && layout.variantKey[1].word == 3u && layout.variantKey[2].word == 5u && layout.variantKey[3].word == 7u, "the block words of a mixed T# are misplaced");
+        if (layout.userVariantKey.size() == 2u) Expect(layout.userVariantKey[0].word == 9u && layout.userVariantKey[1].word == 2u, "the user data words of a mixed T# are misplaced");
+        std::vector<std::uint32_t> words(8u, 1u);
+        std::vector<std::uint32_t> userData(16u, 2u);
+        const auto base = BlockVariantKey(layout, words, userData);
+        auto changed = userData;
+        changed[2] ^= 4u;
+        Expect(BlockVariantKey(layout, words, changed) != base, "the variant key ignores the user data half of a mixed T#");
+        auto changedWords = words;
+        changedWords[5] ^= 4u;
+        Expect(BlockVariantKey(layout, changedWords, userData) != base, "the variant key ignores the block half of a mixed T#");
+    }
+    {
+        Plan plan;
+        plan.words(2u);
+        plan.image(plan.userSource(0u, 8u), 1u);
+        const auto layout = BuildBlockLayout(plan.plan);
+        Expect(layout.Eligible() && layout.userVariantKey.empty() && layout.userImageKey.size() == 8u, "a single-mode image held in user data is refused or keyed as a variant");
+        const std::vector<std::uint32_t> words(2u, 5u);
+        Expect(BlockVariantKey(layout, words) == BlockVariantKey(layout, words, {}), "a layout without user variant words gives two keys");
+    }
+    {
+        Plan plan;
+        plan.words(2u);
+        plan.plan.userDataCount = 8u;
+        plan.image(plan.userSource(4u, 8u), 2u);
+        Expect(RefusalOf(plan) == BlockRefusal::ImageWordMissing, "a multi-mode image with a T# word past the user data words is not refused as ImageWordMissing");
+    }
+    {
+        Plan plan;
+        plan.words(2u);
+        plan.plan.userDataBase = 16u;
+        plan.image(plan.userSource(16u, 8u), 2u);
+        const auto layout = BuildBlockLayout(plan.plan);
+        Expect(layout.Eligible() && layout.userVariantKey.size() == 8u && layout.userVariantKey[0].word == 0u && layout.userVariantKey[7].word == 7u, "user data words are not counted from the stage's first user data register");
+        Plan below;
+        below.words(2u);
+        below.plan.userDataBase = 16u;
+        below.image(below.userSource(12u, 8u), 2u);
+        Expect(RefusalOf(below) == BlockRefusal::ImageWordMissing, "a T# word before the stage's user data words is not refused as ImageWordMissing");
+    }
+    {
+        Plan plan;
+        plan.words(4u);
+        IrValue* sum = plan.value(IrOpcode::BitwiseOr32, IrType::U32);
+        sum->AddArgument(plan.flat(0u));
+        sum->AddArgument(plan.user(1u));
+        plan.image(plan.sourceOf({sum, plan.flat(1u), plan.flat(2u), plan.flat(3u), plan.user(4u), plan.user(5u), plan.user(6u), plan.user(7u)}), 2u);
+        Expect(RefusalOf(plan) == BlockRefusal::ImageWordMissing, "a multi-mode image with a computed T# word is not refused as ImageWordMissing");
+    }
+}
+
 void CheckSamePlanSameLayout() {
     Plan plan;
     plan.words(30u);
@@ -431,6 +568,7 @@ int main() {
         CheckRefusalNames();
         CheckVariantKey();
         CheckImageKeys();
+        CheckUserDataImages();
         CheckSamePlanSameLayout();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "block layout: unexpected exception: %s\n", error.what());
