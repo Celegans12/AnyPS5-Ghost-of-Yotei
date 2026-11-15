@@ -2929,10 +2929,73 @@ struct Kept {
 // The completion side of a recorded draw: the kept objects, the record check, the lease outcome,
 // the GPU write notes, the copied-buffer write-back (listed in DrawCopiedWriters or run as a
 // completion action) and the targets marked dirty.
+struct DrawRunState {
+    std::uint64_t gate = 0;
+    DrawProofStamp stamp{};
+    VkDevice device = VK_NULL_HANDLE;
+    bool begun = false;
+    bool targetsHeld = false;
+    std::vector<ColorTarget> colors;
+    std::vector<const StorageTexture*> targets;
+    bool depthHeld = false;
+    DepthTarget depth{};
+    bool depthWrite = false;
+    bool stencilTest = false;
+    bool stencilWritten = false;
+    std::optional<std::uint8_t> overwrittenStencil;
+    VkImageView depthView = VK_NULL_HANDLE;
+    std::uint64_t depthViews = 0;
+    std::uint64_t keptBatch = 0;
+    const void* keptResources = nullptr;
+    const void* keptPipeline = nullptr;
+    const void* keptFramebuffer = nullptr;
+    std::vector<const void*> keptTargets;
+};
+
+DrawRunState& drawRunState() {
+    static auto* state = new DrawRunState;
+    return *state;
+}
+
+[[noreturn]] void failPassState(const char* what) {
+    PassState::CountMismatch();
+    throw std::runtime_error(std::string("APS5_VERIFY_PASS_STATE: a draw served by the state of its run differs from the full path in ") + what);
+}
+
+bool sameDepthTarget(const DepthTarget& a, const DepthTarget& b) {
+    return a.address == b.address && a.stencilAddress == b.stencilAddress && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && a.clearDepth == b.clearDepth && a.clearStencil == b.clearStencil && a.htileAddress == b.htileAddress && a.htileStencil == b.htileStencil && a.samples == b.samples && a.depthSwizzle == b.depthSwizzle && a.pipeBankXor == b.pipeBankXor && a.firstSlice == b.firstSlice && a.lastSlice == b.lastSlice && a.iterate256 == b.iterate256 && a.htilePipeAligned == b.htilePipeAligned && a.htileVrsEncoding == b.htileVrsEncoding && a.htileDepthOnly == b.htileDepthOnly && a.gcn == b.gcn && a.depthPartiallyResident == b.depthPartiallyResident && a.stencilPartiallyResident == b.stencilPartiallyResident;
+}
+
 void keepDrawObjects(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline>& pipeline, std::shared_ptr<Framebuffer>& framebuffer, DrawInputs& inputs, std::span<const std::shared_ptr<StorageTexture>> targets, std::unique_ptr<DeviceBuffer>& scratch) {
+    auto* run = PassState::Enabled() ? &drawRunState() : nullptr;
+    const auto batch = run != nullptr ? recorder.OpenBatchId() : 0;
+    const bool sameBatch = batch != 0 && run->keptBatch == batch;
+    const bool verify = sameBatch && PassState::Verifies();
+    const auto held = [&](const void* object, const void* last) {
+        if (!sameBatch || object == nullptr || object != last) return false;
+        if (verify && !recorder.OpenKeeps(object)) failPassState("an object its batch no longer keeps");
+        return true;
+    };
+    bool sameTargets = sameBatch && run->keptTargets.size() == targets.size();
+    for (std::size_t index = 0; sameTargets && index < targets.size(); ++index) sameTargets = targets[index].get() == run->keptTargets[index] && (targets[index] == nullptr || held(targets[index].get(), run->keptTargets[index]));
+    const bool sameFramebuffer = held(framebuffer.get(), run != nullptr ? run->keptFramebuffer : nullptr);
+    const bool samePipeline = held(pipeline.get(), run != nullptr ? run->keptPipeline : nullptr);
+    const bool sameResources = held(resources.get(), run != nullptr ? run->keptResources : nullptr);
+    if (run != nullptr) {
+        run->keptBatch = 0;
+        run->keptFramebuffer = framebuffer.get();
+        run->keptPipeline = pipeline.get();
+        run->keptResources = resources.get();
+        if (!sameTargets) {
+            run->keptTargets.clear();
+            for (const auto& target : targets) run->keptTargets.push_back(target.get());
+        }
+    }
     if (scratch != nullptr) recorder.Keep(std::shared_ptr<DeviceBuffer>(std::move(scratch)));
-    for (const auto& target : targets) {
-        if (target != nullptr) recorder.Keep(target);
+    if (!sameTargets) {
+        for (const auto& target : targets) {
+            if (target != nullptr) recorder.Keep(target);
+        }
     }
     for (auto& mirror : inputs.mirrors) {
         if (mirror != nullptr) recorder.Keep(std::move(mirror));
@@ -2943,9 +3006,13 @@ void keepDrawObjects(Recorder& recorder, const std::shared_ptr<ShaderResources>&
     }
     inputs.vertexBuffers.clear();
     if (inputs.indices != nullptr) recorder.Keep(std::move(inputs.indices));
-    if (framebuffer != nullptr) recorder.Keep(std::move(framebuffer));
-    if (pipeline != nullptr) recorder.Keep(std::move(pipeline));
-    if (resources != nullptr) recorder.Keep(resources);
+    if (framebuffer != nullptr && !sameFramebuffer) recorder.Keep(std::move(framebuffer));
+    if (pipeline != nullptr && !samePipeline) recorder.Keep(std::move(pipeline));
+    if (resources != nullptr && !sameResources) recorder.Keep(resources);
+    if (run != nullptr) {
+        run->keptBatch = recorder.OpenBatchId();
+        if (sameTargets && sameFramebuffer && samePipeline && sameResources) PassState::Count(PassState::Served::Kept);
+    }
 }
 
 void keepRecordedDraw(Recorder& recorder, const std::shared_ptr<ShaderResources>& resources, std::shared_ptr<Pipeline> pipeline, std::shared_ptr<Framebuffer> framebuffer, DrawInputs& inputs, std::vector<std::shared_ptr<StorageTexture>>& targets, std::span<const std::pair<std::uint32_t, std::uint32_t>> slices, VkRect2D scissor, std::unique_ptr<DeviceBuffer> scratch, std::function<void()> checkRecords, bool listed, bool completion, const DrawOutcome& outcome, std::shared_ptr<ShaderResources::DrawUse> use, std::shared_ptr<const void>* spaceKeep) {
@@ -4856,6 +4923,24 @@ DrawAllocations& drawAllocations() {
     return *counters;
 }
 
+void reportPassState() {
+    static std::int64_t lastReport = 0;
+    static PassState::Counts reported{};
+    const auto nowMs = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    if (lastReport == 0) lastReport = nowMs;
+    if (nowMs - lastReport < 10000) return;
+    lastReport = nowMs;
+    const auto counts = PassState::Counted();
+    std::string served;
+    for (std::size_t index = 0; index < PassState::ServedKinds; ++index) served += std::string(index == 0 ? " " : ", ") + PassState::ServedNames[index] + " " + std::to_string(counts.served[index] - reported.served[index]);
+    std::string refused;
+    for (std::size_t index = 0; index < PassState::Refusals; ++index) {
+        if (counts.refused[index] != reported.refused[index]) refused += std::string(" ") + PassState::RefusalNames[index] + " " + std::to_string(counts.refused[index] - reported.refused[index]) + ";";
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[pass-state] (10 s): %llu draws recorded from a recipe in %llu runs; served without the full path:%s; refused:%s %llu answers verified, %llu differing\n", static_cast<unsigned long long>(counts.draws - reported.draws), static_cast<unsigned long long>(counts.runs - reported.runs), served.c_str(), refused.c_str(), static_cast<unsigned long long>(counts.verified - reported.verified), static_cast<unsigned long long>(counts.mismatches - reported.mismatches));
+    reported = counts;
+}
+
 void noteDrawAllocations(std::uint64_t inputs, std::uint64_t commit, std::uint64_t kept) {
     auto& counters = drawAllocations();
     counters.draws.fetch_add(1, std::memory_order_relaxed);
@@ -4927,8 +5012,10 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     outcome.kind = KindRecipeHit;
     const auto waitedBefore = profile ? Recorder::ThreadWaitedMs() : 0.0;
     double ownWaitedMs = 0;
+    const bool passState = PassState::Enabled();
     const auto miss = [&](DrawRecipeMiss reason) {
         result.miss = reason;
+        if (passState) PassState::Break();
         if (profile) {
             auto& stats = Profile();
             std::lock_guard lock(stats.mutex);
@@ -4966,11 +5053,54 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
     RecipeVectors vectors(leanCommit ? &ThreadScratch<RecipeScratch, RecipeScratchTag>() : nullptr);
     auto& targets = vectors.targets;
     targets.reserve(recipe.targets.size());
-    for (std::size_t index = 0; index < recipe.targets.size(); ++index) {
+    const bool verifyState = PassState::Verifies();
+    auto* run = passState ? &drawRunState() : nullptr;
+    bool runCurrent = false;
+    if (passState) {
+        PassState::CountDraw();
+        if (drawSiteStats()) reportPassState();
+        const auto gate = PassState::Gate();
+        const auto stamp = DrawProofStamp::Now();
+        runCurrent = run->begun && run->gate == gate && run->device == context.device && run->stamp == stamp;
+        if (!runCurrent) {
+            if (run->begun) PassState::Count(run->gate != gate || run->device != context.device ? PassState::Refusal::Gate : PassState::Refusal::Stamp);
+            PassState::CountRun();
+            run->begun = true;
+            run->gate = gate;
+            run->stamp = stamp;
+            run->device = context.device;
+            run->targetsHeld = false;
+            run->depthHeld = false;
+        }
+    }
+    bool targetsServed = runCurrent && run->targetsHeld && run->targets.size() == recipe.targets.size() && run->colors.size() == state.colors.size();
+    if (runCurrent && !targetsServed && run->targetsHeld) PassState::Count(PassState::Refusal::Targets);
+    for (std::size_t index = 0; targetsServed && index < recipe.targets.size(); ++index) {
+        if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
+        auto stored = recipe.targets[index].lock();
+        if (stored == nullptr || stored.get() != run->targets[index] || !sameColorTarget(run->colors[index], state.colors[index])) {
+            PassState::Count(PassState::Refusal::Targets);
+            targetsServed = false;
+        } else if (!stored->Cached()) {
+            PassState::Count(PassState::Refusal::Evicted);
+            targetsServed = false;
+        } else {
+            targets.push_back(std::move(stored));
+        }
+    }
+    if (targetsServed) PassState::Count(PassState::Served::Targets);
+    if (targetsServed && verifyState) PassState::CountVerified();
+    const bool fullTargets = !targetsServed || verifyState;
+    if (fullTargets) targets.clear();
+    const auto targetGone = [&] {
+        if (targetsServed) failPassState("a target the full path no longer proves");
+        return miss(DrawRecipeMiss::TargetGone);
+    };
+    for (std::size_t index = 0; fullTargets && index < recipe.targets.size(); ++index) {
         timer.phase(PhaseSetup);
         if (state.colors[index].fmaskAddress != 0) GuardOneFragmentFmask(context, state.colors[index]);
         auto stored = recipe.targets[index].lock();
-        if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return miss(DrawRecipeMiss::TargetGone);
+        if (stored == nullptr || !StorageImageCached(context, stored.get()) || !StorageImageServesKeys(*stored, SurfaceForTarget(state.colors[index]).dccAddress)) return targetGone();
         const auto refreshed = [&] {
             if (state.colors[index].arrayLastSlice != 0) stored->RefreshLayers(state.colors[index].arraySlice, state.colors[index].layers);
             else stored->Refresh();
@@ -4978,14 +5108,44 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
         };
         auto resident = leanCommit ? refreshResidentTarget(context, state, state.colors[index], outcome, profile, index, stored.get(), std::cref(refreshed)) : refreshResidentTarget(context, state, state.colors[index], outcome, profile, index, stored.get(), refreshed);
         timer.phase(PhaseReadTarget);
-        if (resident == nullptr) return miss(DrawRecipeMiss::TargetGone);
+        if (resident == nullptr) return targetGone();
+        if (targetsServed && resident.get() != run->targets[index]) failPassState("the image of a target");
         targets.push_back(std::move(resident));
     }
+    if (passState && !targetsServed) {
+        run->colors.assign(state.colors.begin(), state.colors.end());
+        run->targets.clear();
+        for (const auto& target : targets) run->targets.push_back(target.get());
+        run->targetsHeld = true;
+    }
     if (recipe.hasDepth) {
-        timer.phase(PhaseSetup);
-        const auto depthView = DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, writesStencilTarget(state), overwrittenStencil(state));
-        timer.phase(PhaseReadTarget);
-        if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
+        const bool stencilWritten = writesStencilTarget(state);
+        const auto stencilOverwritten = overwrittenStencil(state);
+        bool depthServed = false;
+        if (runCurrent && run->depthHeld) {
+            if (run->depthViews != PassState::DepthViews()) PassState::Count(PassState::Refusal::DepthCalls);
+            else if (run->depthWrite != state.depthWrite || run->stencilTest != state.stencilTest || run->stencilWritten != stencilWritten || run->overwrittenStencil != stencilOverwritten || run->depthView != recipe.targetViews.back() || !sameDepthTarget(run->depth, *state.depth)) PassState::Count(PassState::Refusal::Depth);
+            else depthServed = true;
+        }
+        if (depthServed) PassState::Count(PassState::Served::Depth);
+        if (depthServed && verifyState) PassState::CountVerified();
+        if (!depthServed || verifyState) {
+            timer.phase(PhaseSetup);
+            const auto depthView = DepthSurfaceViewWithStencilWriteIntent(context, *state.depth, state.depthWrite, state.stencilTest, stencilWritten, stencilOverwritten);
+            timer.phase(PhaseReadTarget);
+            if (depthServed && depthView != run->depthView) failPassState("the view of its depth target");
+            if (recipe.targetViews.back() != depthView) return miss(DrawRecipeMiss::TargetGone);
+            if (passState) {
+                run->depth = *state.depth;
+                run->depthWrite = state.depthWrite;
+                run->stencilTest = state.stencilTest;
+                run->stencilWritten = stencilWritten;
+                run->overwrittenStencil = stencilOverwritten;
+                run->depthView = depthView;
+                run->depthViews = PassState::DepthViews();
+                run->depthHeld = true;
+            }
+        }
     }
     timer.phase(PhasePrepare);
     // The template's proof (rules R6/R7): ProveCurrent, T1 included, the alias checks the trimmed
