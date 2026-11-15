@@ -290,6 +290,15 @@ bool BlockWriteBackEach() {
     return each;
 }
 
+// A surface without block units whose memory several imports serve is uploaded by a gather on the
+// GPU (StorageTexture::upload). APS5_NO_GATHERED_UPLOAD=1 leaves it to the CPU path, as before.
+bool GatheredUploads() {
+    static const bool disabled = std::getenv("APS5_NO_GATHERED_UPLOAD") != nullptr;
+    return !disabled;
+}
+
+std::atomic<std::uint64_t> gatheredUploads{0}, gatheredUploadBytes{0};
+
 bool StorageBlockUnits(const GuestTextureResource& descriptor, const SurfaceGeometry& geometry) {
     return LayerTrackingEnabled() && BlockTrackingEnabled() && !geometry.thick && descriptor.tileMode != TextureTileMode::kLinear && descriptor.baseAddress % 65536 == 0
         && std::none_of(geometry.mips.begin(), geometry.mips.end(), [](const TileMipLayout& mip) { return mip.gcnSplitStride != 0; });
@@ -3329,7 +3338,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     std::vector<ImportSegment> segments;
     if (uploadedKeys == DccKeys::Uncompressed) {
         if (const auto* whole = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) segments.push_back({whole, descriptor.baseAddress, descriptor.baseAddress + guestBytes});
-        else if (blockUnits) segments = importSegments();
+        else if (blockUnits || GatheredUploads()) segments = importSegments();
     }
     if (!segments.empty()) {
         const auto* import = segments.front().import;
@@ -3378,6 +3387,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         }
         const bool direct = singlePass();
         auto linear = direct ? nullptr : std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        // Outlives a waited batch (declared before it); a recorded one keeps it itself.
+        std::shared_ptr<DeviceBuffer> gatheredHold;
         detiler.BeginBatch();
         auto* recorder = Recorder::Active();
         std::unique_ptr<CommandBatch> batch;
@@ -3403,7 +3414,27 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             batch = std::make_unique<CommandBatch>(context);
             commands = batch->Handle();
         }
-        const auto importOffset = HostImportOffset(*import, descriptor.baseAddress);
+        // A surface without block units that several imports serve (its memory spans separately
+        // mapped ranges, not at a 64 KiB base): the GPU gathers the pieces into one device-local
+        // buffer and the detile reads that, in the same batch. Without this the surface took the
+        // CPU path below: a guest read behind every pending result and a waited batch per upload.
+        auto sourceBuffer = import->buffer;
+        auto importOffset = HostImportOffset(*import, descriptor.baseAddress);
+        if (segments.size() > 1) {
+            auto gathered = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+            for (const auto& segment : segments) CopyBuffer(context, commands, segment.import->buffer, HostImportOffset(*segment.import, segment.begin), gathered->Handle(), segment.begin - descriptor.baseAddress, segment.end - segment.begin);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            if (recorder != nullptr) {
+                recorder->Keep(gathered, gathered->Size());
+                Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, 2);
+            }
+            gatheredUploads.fetch_add(1, std::memory_order_relaxed);
+            gatheredUploadBytes.fetch_add(guestBytes, std::memory_order_relaxed);
+            sourceBuffer = gathered->Handle();
+            importOffset = 0;
+            gatheredHold = std::move(gathered);
+        }
         if (direct) {
             recordDirectUploadBarrier(commands, layers == nullptr);
             for (std::uint32_t layer = 0; layer < arrayLayers; ++layer) {
@@ -3411,7 +3442,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
                 for (std::uint32_t level = 0; level < mips.size(); ++level) {
                     if (!geometry.HasLayer(level, layer)) continue;
                     const auto& mip = mips[level];
-                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestOffset(layer, mip), elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
+                    detiler.DispatchImage(commands, descriptor.tileMode, elementBytes, sourceBuffer, importOffset + geometry.GuestOffset(layer, mip), elementLayerView(level, layer), mip, false, layer, {.pipeBankXor = descriptor.pipeBankXor});
                 }
             }
             recordDirectUploadDone(commands);
@@ -3430,7 +3461,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             for (std::uint32_t level = 0; level < mips.size(); ++level) {
                 if (!geometry.HasLayer(level, layer)) continue;
                 const auto& mip = mips[level];
-                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, import->buffer, importOffset + geometry.GuestOffset(layer, mip), linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
+                detiler.Dispatch(commands, descriptor.tileMode, elementBytes, sourceBuffer, importOffset + geometry.GuestOffset(layer, mip), linear->Handle(), geometry.LinearLayerOffset(layer) + mip.linearOffset, mip, false, layer, geometry.thick, {.pipeBankXor = descriptor.pipeBankXor});
             }
         }
         const auto linearRead = WholeBufferBarrier(linear->Handle(), VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
@@ -3538,6 +3569,13 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             APS5_LOG_CHARS_OUT_DEBUG("StorageTexture upload done");
     }
     countStorageUpload(2, uploadedBytes);
+    // Debug aid: APS5_TRACE_UPLOAD_CPU=1 names every upload that took the CPU path (a guest read
+    // and a waited batch), and why no import served it.
+    static const bool traceCpu = std::getenv("APS5_TRACE_UPLOAD_CPU") != nullptr;
+    if (traceCpu) {
+        const bool imported = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) != nullptr;
+        std::fprintf(stderr, "[upload-cpu] 0x%llx+0x%llx %ux%u format %u mips %u tile %d: keys %s, %s, %s, block units %d, version %llu, recorder %d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width, descriptor.height, descriptor.format, descriptor.mipCount, static_cast<int>(descriptor.tileMode), DccKeysName(uploadedKeys), imported ? "an import covers it" : "no import covers it", layers != nullptr ? "partial" : "whole", blockUnits ? 1 : 0, static_cast<unsigned long long>(version), Recorder::Active() != nullptr ? 1 : 0);
+    }
     ++version;
     if (profile) LookupOutcomes::Add(LookupOutcomes::UploadCpu, start);
 }

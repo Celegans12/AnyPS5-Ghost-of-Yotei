@@ -1884,6 +1884,15 @@ ImportRun joinedRun(const GuestAllocations::Lease& lease, std::uint64_t begin, s
     if (std::all_of(run.ranges.begin(), run.ranges.end(), [window](const auto& range) { return range->bytes > window; })) return run;
     if (begin == run.base) return run;
     if (run.ranges.front()->bytes > window && run.bytes - run.ranges.front()->bytes <= window) return run;
+    // A run of large mappings (2 MiB or more each) joins whatever their sizes are against the
+    // window: 007 First Light maps its target pool in 2 to 48 MiB pieces and binds 2 to 8 MiB
+    // regions across their borders in about 30 dispatches per frame. Left apart, each is copied on
+    // the CPU behind the GPU results pending in it (50 to 90 ms per dispatch). Later joins extend
+    // this one (importJoined), so the pool ends as few imports. Small mappings stay with the
+    // window blocks. APS5_NO_LARGE_RANGE_JOIN=1 leaves these runs apart.
+    static const bool largeJoin = std::getenv("APS5_NO_LARGE_RANGE_JOIN") == nullptr;
+    constexpr std::uint64_t LargeRange = std::uint64_t{2} << 20u;
+    if (largeJoin && std::all_of(run.ranges.begin(), run.ranges.end(), [](const auto& range) { return range->bytes >= LargeRange; })) return run;
     // A binding from inside the first range joins too when that range is imported on its own (no
     // window block groups it with its neighbours) and the run holds a range larger than the
     // window: left apart, every use is copied on the CPU (007 First Light binds 12.5 MiB from
@@ -7169,6 +7178,27 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             // region falls back to a host buffer of its own.
             region.buffer.reset();
             region.deviceLocal = false;
+        }
+        // Debug aid: APS5_TRACE_REGION_COPY=1 names each region copied on the CPU with the
+        // registered ranges it spans.
+        static const bool traceCopy = std::getenv("APS5_TRACE_REGION_COPY") != nullptr;
+        if (traceCopy && bytes >= 65536) {
+            std::string pieces;
+            std::size_t count = 0;
+            const auto& lease = importRanges();
+            for (auto cursor = region.begin; cursor < region.end && count < 12;) {
+                const auto index = leasedIndexContaining(lease, cursor);
+                if (index == lease.size()) {
+                    pieces += " unregistered@0x" + std::to_string(cursor);
+                    break;
+                }
+                char text[64];
+                std::snprintf(text, sizeof(text), " 0x%llx+0x%llx", static_cast<unsigned long long>(lease[index]->address), static_cast<unsigned long long>(lease[index]->bytes));
+                pieces += text;
+                ++count;
+                cursor = lease[index]->address + lease[index]->bytes;
+            }
+            std::fprintf(stderr, "[region-copy] 0x%llx+0x%llx written %d host %d writable %d sparse %d addressable %d recorder %d:%s\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(bytes), WritesOverlap(region.begin, static_cast<std::size_t>(bytes)) ? 1 : 0, region.hostBacked ? 1 : 0, region.writable ? 1 : 0, region.sparse ? 1 : 0, addressable ? 1 : 0, recorder != nullptr ? 1 : 0, pieces.c_str());
         }
         const auto copyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         copyRegion(region, addressable);

@@ -1579,6 +1579,10 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             static const bool keepNew = std::getenv("APS5_NO_KEEP_NEW_STORAGE") == nullptr;
             if (auto* recorder = Recorder::Active(); keepNew && recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && recorder->Recording()) recorder->Keep(entry.texture);
             entry.accounted = heldBytes(*entry.texture);
+            // Debug aid: APS5_TRACE_STORAGE_CREATE=1 names every storage image made, with the
+            // cache's size before it.
+            static const bool traceCreate = std::getenv("APS5_TRACE_STORAGE_CREATE") != nullptr;
+            if (traceCreate) std::fprintf(stderr, "[storage-create] 0x%llx+0x%llx %ux%u format %u mips %u mip %u dimension %d slices %u..%u tile %d, %.1f MiB held; cache %zu images %.0f MiB\n", static_cast<unsigned long long>(resource.baseAddress), static_cast<unsigned long long>(guestBytes), resource.width, resource.height, resource.format, resource.mipCount, mip, static_cast<int>(resource.dimension), resource.baseArray, resource.depthOrLastArray, static_cast<int>(resource.tileMode), entry.accounted / 1048576.0, cache.entries.size(), cache.bytes / 1048576.0);
             const auto budget = storageBudget(context, cache.bytes + entry.accounted);
             while (!cache.entries.empty()) {
                 const bool overBudget = cache.bytes + entry.accounted > budget;
