@@ -56,7 +56,7 @@ void add(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
 
 constexpr std::array<const char*, BufferCache::Refusals> RefusalNames{"range", "alignment", "gpu write", "untracked", "unmapped", "busy", "span", "budget", "allocation", "raced", "streamed", "label"};
 
-constexpr std::array<const char*, BufferCache::UnarmedReasons> UnarmedNames{"armed", "held", "imported", "barred", "resting", "edge", "other"};
+constexpr std::array<const char*, BufferCache::UnarmedReasons> UnarmedNames{"armed", "held", "imported", "barred", "resting", "edge", "other", "written by the GPU"};
 
 using ArmedTokensFunction = bool (*)(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens);
 using ArmedCleanFunction = bool (*)(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> tokens);

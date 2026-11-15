@@ -37,7 +37,7 @@ public:
         virtual bool Volatile(std::uint64_t) { return false; }
     };
 
-    enum class Unarmed : std::uint8_t { Armed, Held, Imported, Barred, Resting, Edge, Other, Count };
+    enum class Unarmed : std::uint8_t { Armed, Held, Imported, Barred, Resting, Edge, Other, GpuWritten, Count };
     static constexpr std::size_t UnarmedReasons = static_cast<std::size_t>(Unarmed::Count);
 
     struct ArmedBlocks {
