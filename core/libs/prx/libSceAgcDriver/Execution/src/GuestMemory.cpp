@@ -3094,6 +3094,10 @@ std::string LockReport(const LockCounts& from, const LockCounts& to) {
         std::snprintf(item, sizeof(item), " %llu reads unlocked;", count(to.mappings.unlocked - from.mappings.unlocked));
         text += item;
     }
+    if (to.mappings.unlockedHostWrites != from.mappings.unlockedHostWrites) {
+        std::snprintf(item, sizeof(item), " %llu host writes unlocked;", count(to.mappings.unlockedHostWrites - from.mappings.unlockedHostWrites));
+        text += item;
+    }
     text += " known-zero forgets";
     for (std::size_t outcome = 0; outcome < GuestArena::MappingForgetOutcomes; ++outcome) {
         std::snprintf(item, sizeof(item), " %s %llu", forgetNames[outcome], count(to.mappings.forgets[outcome] - from.mappings.forgets[outcome]));
