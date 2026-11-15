@@ -5707,6 +5707,7 @@ void Recorder::Sync() {
     PerformanceTimer frameTiming("Recorder.Sync");
     const auto source = std::exchange(announcedSource, 4);
     const void* site = std::exchange(announcedSite, nullptr);
+    if (!carried.empty()) ensureOpen();
     {
         const LandingSiteScope landing(submitSite, LandingSite::Sync);
         Submit();
