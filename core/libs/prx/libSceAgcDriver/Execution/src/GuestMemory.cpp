@@ -2693,8 +2693,36 @@ std::uint64_t WriteGeneration() {
     return Tracker().generation.load(std::memory_order_acquire);
 }
 
-std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written) {
+std::size_t ArmedBlocks(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
+    return static_cast<std::size_t>((address + bytes - 1) / ArmedBlockBytes - address / ArmedBlockBytes + 1);
+}
+
+bool ArmedTokens(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens) {
+    std::fill(tokens.begin(), tokens.end(), std::uint64_t{0});
+#ifdef _WIN32
+    return GuestArena::GuestPageTrackTokens_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, tokens.data(), tokens.size());
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
+bool ArmedCleanSince(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> tokens) {
+#ifdef _WIN32
+    return GuestArena::GuestPageTrackCleanSince_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, tokens.data(), tokens.size());
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    static_cast<void>(tokens);
+    return false;
+#endif
+}
+
+std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::span<std::uint64_t> tokens) {
     written.clear();
+    std::fill(tokens.begin(), tokens.end(), std::uint64_t{0});
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return 0;
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker, TrackerLockSite::Collect, address, rangeStop(address, bytes));
@@ -2712,13 +2740,15 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
     };
     std::uint64_t spanBegin = 0;
     std::uint64_t spanEnd = 0;
+    bool walked = true;
     const auto walkSpan = [&] {
-        if (spanEnd > spanBegin) walkWrites(tracker, spanBegin & ~std::uint64_t{WritePageBytes - 1}, (spanEnd + WritePageBytes - 1) & ~std::uint64_t{WritePageBytes - 1}, StampKind::Cpu);
+        if (spanEnd > spanBegin && !walkWrites(tracker, spanBegin & ~std::uint64_t{WritePageBytes - 1}, (spanEnd + WritePageBytes - 1) & ~std::uint64_t{WritePageBytes - 1}, StampKind::Cpu)) walked = false;
         spanBegin = spanEnd = 0;
     };
     for (auto block = first; block <= last; ++block) {
         const auto [begin, stop] = clip(block);
         if (!tracker.covers(begin, stop - begin)) {
+            walked = false;
             walkSpan();
             continue;
         }
@@ -2756,6 +2786,7 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
             if (listed[page]) append(std::max<std::uint64_t>(begin, blockStart + page * WritePageBytes), std::min<std::uint64_t>(stop, blockStart + (page + 1) * WritePageBytes));
         }
     }
+    if (walked && !tokens.empty()) ArmedTokens(address, bytes, tokens);
     return tracker.generation.load(std::memory_order_relaxed);
 }
 

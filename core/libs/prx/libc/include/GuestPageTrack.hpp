@@ -18,6 +18,8 @@ bool GuestPageTrackQuery_nid_no_patch(const void* address, _MEMORY_BASIC_INFORMA
 bool GuestPageTrackQueryOpened_nid_no_patch(const void* address, _MEMORY_BASIC_INFORMATION* memory);
 bool GuestPageTrackProtect_nid_no_patch(void* pointer, std::size_t bytes, std::uint32_t protection, bool requireCommitted);
 void GuestPageTrackKeepOpen_nid_no_patch(const void* pointer, std::size_t bytes);
+bool GuestPageTrackTokens_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* tokens, std::size_t count);
+bool GuestPageTrackCleanSince_nid_no_patch(std::uintptr_t address, std::size_t bytes, const std::uint64_t* tokens, std::size_t count);
 void GuestPageTrackFrame_nid_no_patch();
 void GuestPageTrackCounts_nid_no_patch(std::uint64_t* counts, std::size_t capacity);
 

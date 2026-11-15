@@ -208,6 +208,34 @@ public:
         return entry == nullptr ? 0 : entry->word.load(std::memory_order_acquire);
     }
 
+    static bool Spans(std::uintptr_t address, std::size_t bytes, std::size_t count) {
+        if (bytes == 0 || address >= (std::uintptr_t{1} << 47) || bytes > (std::uintptr_t{1} << 47) - address) return false;
+        return count == (address + bytes - 1) / BlockBytes - address / BlockBytes + 1;
+    }
+
+    bool Tokens(std::uintptr_t address, std::size_t bytes, std::uint64_t* tokens, std::size_t count) const {
+        if (tokens == nullptr) return false;
+        std::fill_n(tokens, count, std::uint64_t{0});
+        if (!enabled || !Spans(address, bytes, count)) return false;
+        bool armed = true;
+        auto block = address & ~(BlockBytes - 1);
+        for (std::size_t index = 0; index < count; ++index, block += BlockBytes) {
+            const auto word = Word(block);
+            if (stateOf(word) == State::Armed) tokens[index] = word;
+            else armed = false;
+        }
+        return armed;
+    }
+
+    bool CleanSince(std::uintptr_t address, std::size_t bytes, const std::uint64_t* tokens, std::size_t count) const {
+        if (!enabled || tokens == nullptr || !Spans(address, bytes, count)) return false;
+        auto block = address & ~(BlockBytes - 1);
+        for (std::size_t index = 0; index < count; ++index, block += BlockBytes) {
+            if (tokens[index] == 0 || Word(block) != tokens[index]) return false;
+        }
+        return true;
+    }
+
     std::uint32_t Period() const {
         return period.load(std::memory_order_relaxed);
     }
