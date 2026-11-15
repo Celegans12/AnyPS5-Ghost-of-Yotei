@@ -11,12 +11,17 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "BlockAbi.hpp"
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace AgcDriver::Core {
@@ -48,6 +53,80 @@ Registry& registry() {
 }
 
 constexpr VkBufferUsageFlags RingUsage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+constexpr VkMemoryPropertyFlags SystemRing = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+constexpr VkMemoryPropertyFlags CardRing = SystemRing | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+constexpr std::array<std::pair<VkMemoryPropertyFlags, const char*>, 4> FlagNames{{
+    {VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, "device local"},
+    {VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT, "host visible"},
+    {VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, "host coherent"},
+    {VK_MEMORY_PROPERTY_HOST_CACHED_BIT, "host cached"},
+}};
+
+bool systemRingForced() {
+    static const bool forced = [] {
+        const char* text = std::getenv("APS5_CORE_RING_SYSTEM");
+        return text != nullptr && std::strcmp(text, "0") != 0;
+    }();
+    return forced;
+}
+
+std::optional<std::uint32_t> cardRingType(const Graphics::Context& context) {
+    for (std::uint32_t type = 0; type < context.memory.memoryTypeCount; ++type) {
+        if ((context.memory.memoryTypes[type].propertyFlags & CardRing) == CardRing) return type;
+    }
+    return std::nullopt;
+}
+
+const char* systemRingReason(const Graphics::Context& context, std::size_t bytes) {
+    if (systemRingForced()) return "APS5_CORE_RING_SYSTEM is set";
+    const auto type = cardRingType(context);
+    if (!type) return "the device has no device-local host-visible coherent memory type";
+    const auto heap = context.memory.memoryTypes[*type].heapIndex;
+    if (context.memory.memoryHeaps[heap].size < bytes || !context.DeviceLocalHeadroom(*type, bytes)) return "its device-local heap has no room";
+    return nullptr;
+}
+
+std::string flagNames(VkMemoryPropertyFlags flags) {
+    std::string text;
+    for (const auto& [bit, name] : FlagNames) {
+        if ((flags & bit) == 0) continue;
+        if (!text.empty()) text += ", ";
+        text += name;
+    }
+    return text.empty() ? std::string("no host or device property") : text;
+}
+
+void announce(const Graphics::Context& context, const Graphics::Buffer& buffer, VkMemoryPropertyFlags properties, std::size_t bytes, const char* reason) {
+    static std::atomic<bool> cardTold{false};
+    static std::atomic<bool> systemTold{false};
+    auto& told = properties == CardRing ? cardTold : systemTold;
+    if (told.exchange(true, std::memory_order_relaxed)) return;
+    VkMemoryRequirements requirements{};
+    context.Resolved(&Graphics::DeviceFunctions::getBufferMemoryRequirements, "vkGetBufferMemoryRequirements")(context.device, buffer.Handle(), &requirements);
+    const auto type = context.BufferMemoryType(requirements.memoryTypeBits, properties, bytes);
+    const auto heap = context.memory.memoryTypes[type].heapIndex;
+    const auto names = flagNames(context.memory.memoryTypes[type].propertyFlags);
+    const auto heapMiB = static_cast<unsigned long long>(context.memory.memoryHeaps[heap].size >> 20u);
+    if (reason == nullptr) std::fprintf(stderr, "[draw-block] ring memory: type %u (%s), heap %u of %llu MiB, in card memory\n", type, names.c_str(), heap, heapMiB);
+    else std::fprintf(stderr, "[draw-block] ring memory: type %u (%s), heap %u of %llu MiB, in system memory: %s\n", type, names.c_str(), heap, heapMiB, reason);
+}
+
+std::shared_ptr<Graphics::Buffer> ringBuffer(const Graphics::Context& context, std::size_t bytes) {
+    auto reason = systemRingReason(context, bytes);
+    if (reason == nullptr) {
+        try {
+            auto buffer = std::make_shared<Graphics::Buffer>(context, bytes, RingUsage, CardRing);
+            announce(context, *buffer, CardRing, bytes, nullptr);
+            return buffer;
+        } catch (const std::exception&) {
+            reason = "its card memory allocation failed";
+        }
+    }
+    auto buffer = std::make_shared<Graphics::Buffer>(context, bytes, RingUsage, SystemRing);
+    announce(context, *buffer, SystemRing, bytes, reason);
+    return buffer;
+}
 
 }
 
@@ -93,7 +172,7 @@ RingChunk DrawBlockHost::allocate(void* context, std::size_t bytes) {
     auto& host = *static_cast<DrawBlockHost*>(context);
     if (!host.context.bufferDeviceAddress) return {};
     try {
-        auto buffer = std::make_shared<Graphics::Buffer>(host.context, bytes, RingUsage);
+        auto buffer = ringBuffer(host.context, bytes);
         RingChunk chunk;
         chunk.bytes = buffer->Bytes().data();
         chunk.deviceAddress = buffer->DeviceAddress();
@@ -198,7 +277,7 @@ std::byte* DrawBlockHost::Draw::take(std::size_t bytes, std::uint64_t& deviceAdd
             return slice.bytes;
         }
     }
-    auto buffer = std::make_shared<Graphics::Buffer>(host.context, bytes, RingUsage);
+    auto buffer = ringBuffer(host.context, bytes);
     auto* target = buffer->Bytes().data();
     deviceAddress = buffer->DeviceAddress();
     if (recorder != nullptr) recorder->Keep(std::move(buffer), bytes);
