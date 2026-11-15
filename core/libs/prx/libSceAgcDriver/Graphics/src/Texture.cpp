@@ -5747,6 +5747,8 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
     } ordered{gpuOrdered};
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
     std::vector<std::pair<std::uint64_t, std::size_t>> occasional;
+    // Surfaces to trap instead of store, decided under the pending mutex and trapped after it.
+    std::vector<std::shared_ptr<StorageTexture>> candidates;
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
@@ -5781,21 +5783,6 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
         const auto page = TrapPage();
         // The label's own store goes through an import of its 64 KiB block, and making an import
         // needs the block's pages accessible: a surface in that block is stored, not trapped.
-        // The later store of a trapped surface must find its store import made and used: one
-        // cannot be made over no-access pages, and a store through the ordinary import into
-        // memory armed in the meantime opens the whole import group at that submission.
-        const auto trapStoreReady = [&](const StorageTexture* texture) {
-#if defined(_WIN32)
-            // Only for a surface the arena would trap: a store import made for one it refuses
-            // gets in the way of that surface's own stores (same base, other length).
-            if (!texture->readTrapped.load(std::memory_order_acquire) && !GuestArena::GuestArenaCanTrapReads_nid_no_patch(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) return false;
-            const auto* store = StoreImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
-            return store != nullptr && store->store;
-#else
-            static_cast<void>(texture);
-            return true;
-#endif
-        };
         const auto sharesLabelBlock = [&](const StorageTexture* texture) {
 #if defined(_WIN32)
             constexpr std::uint64_t block = 65536;
@@ -5836,16 +5823,21 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
                 if (TrapReadBackRecently(texture->descriptor.baseAddress)) return 2;
                 if (sharesPage(texture)) return 3;
                 if (!texture->readTrapped.load(std::memory_order_acquire) && DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) return 4;
-                if (!trapStoreReady(texture)) return 5;
-                return GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes)) ? 0 : 6;
+                return 0;
             };
             if (trap && !dryTraps) {
                 const auto outcome = trapOutcome();
-                trapOutcomes[outcome].fetch_add(1, std::memory_order_relaxed);
-                trapOutcomeBytes[outcome].fetch_add(texture->guestBytes, std::memory_order_relaxed);
                 if (outcome == 0) {
-                    texture->readTrapped.store(true, std::memory_order_release);
-                    continue;
+                    // The store import and the trap are made below, without the pending mutex:
+                    // making an import takes the imports mutex, which another thread may hold
+                    // while it waits for this one (007 First Light stopped at startup that way).
+                    if (auto alive = const_cast<StorageTexture*>(texture)->weak_from_this().lock()) {
+                        candidates.push_back(std::move(alive));
+                        continue;
+                    }
+                } else {
+                    trapOutcomes[outcome].fetch_add(1, std::memory_order_relaxed);
+                    trapOutcomeBytes[outcome].fetch_add(texture->guestBytes, std::memory_order_relaxed);
                 }
             }
 #endif
@@ -5859,6 +5851,27 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
             occasional.emplace_back(texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
         }
     }
+#if defined(__APPLE__) || defined(_WIN32)
+    for (const auto& texture : candidates) {
+        const auto address = static_cast<std::uintptr_t>(texture->descriptor.baseAddress);
+        const auto bytes = static_cast<std::size_t>(texture->guestBytes);
+        int outcome = 0;
+#if defined(_WIN32)
+        // The store import only for a surface the arena would trap: one made for a surface it
+        // refuses gets in the way of that surface's own stores (same base, other length).
+        if (!texture->readTrapped.load(std::memory_order_acquire) && !GuestArena::GuestArenaCanTrapReads_nid_no_patch(address, bytes)) outcome = 6;
+        if (outcome == 0) {
+            const auto* store = StoreImportFor(texture->context, texture->descriptor.baseAddress, bytes);
+            if (store == nullptr || !store->store) outcome = 5;
+        }
+#endif
+        if (outcome == 0 && !GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(address, bytes)) outcome = 6;
+        trapOutcomes[outcome].fetch_add(1, std::memory_order_relaxed);
+        trapOutcomeBytes[outcome].fetch_add(texture->guestBytes, std::memory_order_relaxed);
+        if (outcome == 0) texture->readTrapped.store(true, std::memory_order_release);
+        else ranges.emplace_back(texture->descriptor.baseAddress, bytes);
+    }
+#endif
     for (const auto& [address, bytes] : ranges) static_cast<void>(FlushPending(address, bytes, nullptr, reason));
     for (const auto& [address, bytes] : occasional) static_cast<void>(FlushPending(address, bytes, nullptr, reason, PublishScope::Whole, nullptr, false, device));
 }
