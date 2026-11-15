@@ -1468,6 +1468,27 @@ bool DrawRecipes() {
     return !noDrawRecipe;
 }
 
+namespace {
+
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawRecipeRefusal::Count)>& recipeRefusals() {
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawRecipeRefusal::Count)> refusals{};
+    return refusals;
+}
+
+void refuseRecipe(std::shared_ptr<const DrawRecipe>*& recipeOut, DrawRecipeRefusal reason) {
+    if (recipeOut == nullptr) return;
+    recipeRefusals()[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+    recipeOut = nullptr;
+}
+
+}
+
+std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeRefusal::Count)> DrawRecipeRefusals() {
+    std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeRefusal::Count)> counts{};
+    for (std::size_t reason = 0; reason < counts.size(); ++reason) counts[reason] = recipeRefusals()[reason].load(std::memory_order_relaxed);
+    return counts;
+}
+
 const char* DrawRecipeMissName(DrawRecipeMiss miss) {
     constexpr std::array<const char*, static_cast<std::size_t>(DrawRecipeMiss::Count)> names{"none", "not recordable", "target gone", "template gone", "objects gone", "proof", "buffers", "layout"};
     return names[static_cast<std::size_t>(miss)];
@@ -3647,9 +3668,9 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
         }
         Require(static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount <= 0x100000000ull && (draw.indexed || static_cast<std::uint64_t>(draw.firstVertex) + draw.indexCount <= 0x100000000ull), "stencil replay draw indices overflow");
         Require(state.samples == 1u && (!state.depth || HasStencil(state.depth->format)), "stencil replay requires single-sample rendering and an eight-bit stencil format");
-        recipeOut = nullptr;
+        refuseRecipe(recipeOut, DrawRecipeRefusal::StencilReplay);
     }
-    if (state.quadList || StripPatches(state, shaders)) recipeOut = nullptr;
+    if (state.quadList || StripPatches(state, shaders)) refuseRecipe(recipeOut, DrawRecipeRefusal::QuadListOrPatches);
     if (context.recorder != nullptr) context.recorder->BoundKeptBytes();
     auto& timing = prepared.timing.emplace("Graphics.Draw");
     // APS5_PROFILE_DRAW prints the time of each phase of the draw (microseconds) and the [draws] totals.
@@ -3995,7 +4016,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     // The state is copied only when a mask must change.
     auto& masked = prepared.masked;
     masked = maskedState(state, inputs.fragmentOutputs);
-    if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; })) recipeOut = nullptr;
+    if (std::any_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied; })) refuseRecipe(recipeOut, DrawRecipeRefusal::ProxiedTarget);
     for (std::size_t index = 0; index < targets.size(); ++index) {
         if (!targets[index].proxied) continue;
         if (!masked.has_value()) masked = state;
@@ -4148,6 +4169,15 @@ void recordPreparedDraw(const Context& context, const State& state, const Pm4::D
         // only a template the resource cache serves under this content key (reusable: no lease,
         // no copied writes, every direct region import- or mirror-served) of a direct draw, so a
         // hit's proof is the template's ProveCurrent and nothing needs completion work.
+        if (auto* refused = DrawRecipes() ? recipeOut : nullptr; refused != nullptr) {
+            if (!cacheable) refuseRecipe(refused, DrawRecipeRefusal::Uncacheable);
+            else if (outcome.waited) refuseRecipe(refused, DrawRecipeRefusal::Waited);
+            else if (args != nullptr) refuseRecipe(refused, DrawRecipeRefusal::Indirect);
+            else if (!resources->Reusable()) refuseRecipe(refused, DrawRecipeRefusal::TemplateNotReusable);
+            else if (resources->SpaceReuse()) refuseRecipe(refused, DrawRecipeRefusal::SpaceReuse);
+            else if (multisampled) refuseRecipe(refused, DrawRecipeRefusal::Multisampled);
+            else if (pipeline->ReordersSamples()) refuseRecipe(refused, DrawRecipeRefusal::ReorderedSamples);
+        }
         if (recipeOut != nullptr && DrawRecipes() && cacheable && !outcome.waited && args == nullptr && resources->Reusable() && !resources->SpaceReuse() && !multisampled && !pipeline->ReordersSamples()) {
             auto recipe = std::make_shared<DrawRecipe>();
             recipe->device = context.device;

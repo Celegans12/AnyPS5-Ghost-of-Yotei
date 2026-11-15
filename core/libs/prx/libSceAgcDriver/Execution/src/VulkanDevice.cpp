@@ -5260,6 +5260,18 @@ RecipeCounters& Recipes() {
     return counters;
 }
 
+struct DrawRecipeTotals {
+    static constexpr std::size_t Origins = static_cast<std::size_t>(VulkanDevice::DrawRecipeOrigin::Count);
+    std::array<std::atomic<std::uint64_t>, Origins> recorded{}, found{}, absent{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(VulkanDevice::DrawRecipeSkip::Count)> skipped{};
+    std::atomic<std::uint64_t> device{0}, notRecordable{0}, objectsGone{0}, templateGone{0}, layout{0}, proof{0}, buffers{0}, attaches{0}, unbuilt{0};
+};
+
+DrawRecipeTotals& DrawRecipeDrawTotals() {
+    static DrawRecipeTotals totals;
+    return totals;
+}
+
 constexpr std::size_t MoveRefusals = static_cast<std::size_t>(Graphics::ShaderResources::MoveRefusal::Count);
 
 struct DispatchMoveCounters {
@@ -5537,6 +5549,7 @@ void VulkanDevice::NoteRecipe(RecipeEvent event, bool indirect) {
 }
 
 void VulkanDevice::NoteRecipe(RecipeEvent event, RecipeKind kind) {
+    if (event == RecipeEvent::Attach && kind == RecipeKind::Draw) DrawRecipeDrawTotals().attaches.fetch_add(1, std::memory_order_relaxed);
     auto& counters = Recipes().kinds[static_cast<std::size_t>(kind)];
     (event == RecipeEvent::Restart ? counters.restarts : counters.attaches).fetch_add(1, std::memory_order_relaxed);
 }
@@ -5558,6 +5571,93 @@ void VulkanDevice::NoteShapeRecipeRefused() {
     Recipes().shapeRefused.fetch_add(1, std::memory_order_relaxed);
 }
 
+void VulkanDevice::NoteDrawRecipeSkip(DrawRecipeSkip skip) {
+    DrawRecipeDrawTotals().skipped[static_cast<std::size_t>(skip)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void VulkanDevice::NoteDrawRecipeLookup(DrawRecipeOrigin origin, bool found) {
+    auto& totals = DrawRecipeDrawTotals();
+    (found ? totals.found : totals.absent)[static_cast<std::size_t>(origin)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void VulkanDevice::NoteDrawRecipeUnbuilt() {
+    DrawRecipeDrawTotals().unbuilt.fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t VulkanDevice::DrawRecipeDrawCounts::Draws() const {
+    std::uint64_t draws = 0;
+    for (const auto count : found) draws += count;
+    for (const auto count : absent) draws += count;
+    for (const auto count : skipped) draws += count;
+    return draws;
+}
+
+VulkanDevice::DrawRecipeDrawCounts VulkanDevice::DrawRecipeDraws() {
+    const auto& totals = DrawRecipeDrawTotals();
+    const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
+    DrawRecipeDrawCounts counts;
+    for (std::size_t origin = 0; origin < counts.recorded.size(); ++origin) {
+        counts.recorded[origin] = load(totals.recorded[origin]);
+        counts.found[origin] = load(totals.found[origin]);
+        counts.absent[origin] = load(totals.absent[origin]);
+    }
+    for (std::size_t skip = 0; skip < counts.skipped.size(); ++skip) counts.skipped[skip] = load(totals.skipped[skip]);
+    counts.device = load(totals.device);
+    counts.notRecordable = load(totals.notRecordable);
+    counts.objectsGone = load(totals.objectsGone);
+    counts.templateGone = load(totals.templateGone);
+    counts.layout = load(totals.layout);
+    counts.proof = load(totals.proof);
+    counts.buffers = load(totals.buffers);
+    counts.refusals = Graphics::DrawRecipeRefusals();
+    counts.attaches = load(totals.attaches);
+    counts.unbuilt = load(totals.unbuilt);
+    return counts;
+}
+
+std::string VulkanDevice::DrawRecipeDrawsReport() {
+    static std::mutex reportMutex;
+    static DrawRecipeDrawCounts reported;
+    const auto now = DrawRecipeDraws();
+    std::lock_guard lock(reportMutex);
+    const auto since = [](std::uint64_t current, std::uint64_t& previous) {
+        const auto delta = current - previous;
+        previous = current;
+        return static_cast<unsigned long long>(delta);
+    };
+    const auto draws = static_cast<unsigned long long>(now.Draws() - reported.Draws());
+    const auto exact = static_cast<std::size_t>(DrawRecipeOrigin::Exact);
+    const auto relocated = static_cast<std::size_t>(DrawRecipeOrigin::Relocated);
+    const auto shape = static_cast<std::size_t>(DrawRecipeOrigin::Shape);
+    unsigned long long recorded = 0;
+    for (std::size_t origin = 0; origin < now.recorded.size(); ++origin) recorded += now.recorded[origin] - reported.recorded[origin];
+    char line[1024];
+    std::string text;
+    std::snprintf(line, sizeof(line), "[recipe-draws] (10 s): %llu direct draws, %llu recorded from a recipe (%.1f%%: exact entry %llu, relocated entry %llu, shape %llu)", draws, recorded, draws != 0 ? 100.0 * static_cast<double>(recorded) / static_cast<double>(draws) : 0.0, since(now.recorded[exact], reported.recorded[exact]), since(now.recorded[relocated], reported.recorded[relocated]), since(now.recorded[shape], reported.recorded[shape]));
+    text += line;
+    std::snprintf(line, sizeof(line), "; no recipe looked up: a stage was captured %llu, stages reused from several remembered draws %llu, not eligible %llu", since(now.skipped[static_cast<std::size_t>(DrawRecipeSkip::Captured)], reported.skipped[static_cast<std::size_t>(DrawRecipeSkip::Captured)]), since(now.skipped[static_cast<std::size_t>(DrawRecipeSkip::Split)], reported.skipped[static_cast<std::size_t>(DrawRecipeSkip::Split)]), since(now.skipped[static_cast<std::size_t>(DrawRecipeSkip::Ineligible)], reported.skipped[static_cast<std::size_t>(DrawRecipeSkip::Ineligible)]));
+    text += line;
+    std::snprintf(line, sizeof(line), "; no recipe on the entry: exact %llu, relocated %llu, shape %llu", since(now.absent[exact], reported.absent[exact]), since(now.absent[relocated], reported.absent[relocated]), since(now.absent[shape], reported.absent[shape]));
+    text += line;
+    for (std::size_t origin = 0; origin < now.found.size(); ++origin) reported.found[origin] = now.found[origin];
+    std::snprintf(line, sizeof(line), "; recipes refused at the commit: device %llu, not recordable %llu, targets or pipeline gone %llu, template gone %llu, vertex layout %llu, proof %llu, moved buffers %llu", since(now.device, reported.device), since(now.notRecordable, reported.notRecordable), since(now.objectsGone, reported.objectsGone), since(now.templateGone, reported.templateGone), since(now.layout, reported.layout), since(now.proof, reported.proof), since(now.buffers, reported.buffers));
+    text += line;
+    const auto unbuilt = since(now.unbuilt, reported.unbuilt);
+    constexpr std::array<const char*, static_cast<std::size_t>(Graphics::DrawRecipeRefusal::Count)> refusalNames{"stencil replay", "quad list or patches", "proxied target", "no template key", "waited", "indirect", "template not reusable", "space reuse", "multisampled", "reordered samples"};
+    std::snprintf(line, sizeof(line), "; %llu recipes attached, %llu full draws built none", since(now.attaches, reported.attaches), unbuilt);
+    text += line;
+    unsigned long long named = 0;
+    for (std::size_t reason = 0; reason < refusalNames.size(); ++reason) {
+        const auto count = since(now.refusals[reason], reported.refusals[reason]);
+        named += count;
+        std::snprintf(line, sizeof(line), "%s%s %llu", reason == 0 ? " (" : ", ", refusalNames[reason], count);
+        text += line;
+    }
+    std::snprintf(line, sizeof(line), ", not recorded or other %llu)\n", unbuilt > named ? unbuilt - named : 0ull);
+    text += line;
+    return text;
+}
+
 VulkanDevice::DrawRecipeOriginCounts VulkanDevice::DrawRecipeOrigins() {
     auto& recipes = Recipes();
     DrawRecipeOriginCounts counts;
@@ -5576,24 +5676,43 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
     auto& counters = Recipes().kinds[static_cast<std::size_t>(RecipeKind::Draw)];
     // R10: the recipe names the device it was built on (the driver may have replaced the device
     // between the hit and the lock).
+    auto& totals = DrawRecipeDrawTotals();
     if (recipe->device != state->device) {
         counters.rebuildDevice.fetch_add(1, std::memory_order_relaxed);
+        totals.device.fetch_add(1, std::memory_order_relaxed);
         return RecipeOutcome::Rebuild;
     }
     const auto context = graphicsContext();
     const auto outcome = Graphics::DrawWithRecipe(context, graphics, draw, shaders, snapshots, *recipe, trace);
     if (!outcome.recorded) {
         switch (outcome.miss) {
-            case Graphics::DrawRecipeMiss::NotRecordable: counters.precheckMisses[MissNotRecordable].fetch_add(1, std::memory_order_relaxed); break;
+            case Graphics::DrawRecipeMiss::NotRecordable:
+                counters.precheckMisses[MissNotRecordable].fetch_add(1, std::memory_order_relaxed);
+                totals.notRecordable.fetch_add(1, std::memory_order_relaxed);
+                break;
             case Graphics::DrawRecipeMiss::TargetGone:
-            case Graphics::DrawRecipeMiss::ObjectsGone: counters.precheckMisses[MissObjectsGone].fetch_add(1, std::memory_order_relaxed); break;
-            case Graphics::DrawRecipeMiss::TemplateGone: counters.precheckMisses[MissTemplateGone].fetch_add(1, std::memory_order_relaxed); break;
-            case Graphics::DrawRecipeMiss::Proof: counters.rebuilds[static_cast<std::size_t>(outcome.proof.failure)].fetch_add(1, std::memory_order_relaxed); break;
-            case Graphics::DrawRecipeMiss::Layout: Recipes().drawLayoutMisses.fetch_add(1, std::memory_order_relaxed); break;
+            case Graphics::DrawRecipeMiss::ObjectsGone:
+                counters.precheckMisses[MissObjectsGone].fetch_add(1, std::memory_order_relaxed);
+                totals.objectsGone.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case Graphics::DrawRecipeMiss::TemplateGone:
+                counters.precheckMisses[MissTemplateGone].fetch_add(1, std::memory_order_relaxed);
+                totals.templateGone.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case Graphics::DrawRecipeMiss::Proof:
+                counters.rebuilds[static_cast<std::size_t>(outcome.proof.failure)].fetch_add(1, std::memory_order_relaxed);
+                totals.proof.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case Graphics::DrawRecipeMiss::Layout:
+                Recipes().drawLayoutMisses.fetch_add(1, std::memory_order_relaxed);
+                totals.layout.fetch_add(1, std::memory_order_relaxed);
+                break;
+            case Graphics::DrawRecipeMiss::Buffers: totals.buffers.fetch_add(1, std::memory_order_relaxed); break;
             default: break;
         }
         return RecipeOutcome::Rebuild;
     }
+    totals.recorded[static_cast<std::size_t>(origin)].fetch_add(1, std::memory_order_relaxed);
     counters.proofPaths[static_cast<std::size_t>(outcome.proof.path)].fetch_add(1, std::memory_order_relaxed);
     counters.hits.fetch_add(1, std::memory_order_relaxed);
     Recipes().drawOriginHits[static_cast<std::size_t>(origin)].fetch_add(1, std::memory_order_relaxed);

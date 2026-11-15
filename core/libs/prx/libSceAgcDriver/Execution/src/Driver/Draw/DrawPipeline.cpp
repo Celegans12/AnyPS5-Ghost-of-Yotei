@@ -480,6 +480,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     reportedIndex = index;
     reportedProofs = proofs;
     reportedBreaks = breaks;
+    AgcDriver::ProfilePrint_nid_no_patch("%s", VulkanDevice::DrawRecipeDrawsReport().c_str());
     if (DrawSiteAccess::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("%s", DrawSiteAccess::Report().c_str());
     commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
     drains = {};

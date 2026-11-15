@@ -273,6 +273,19 @@ std::string RecipeCounts() {
     return "recipe hits " + std::to_string(origins.hits[0]) + "/" + std::to_string(origins.hits[1]) + "/" + std::to_string(origins.hits[2]) + " and attaches " + std::to_string(origins.attaches[0]) + "/" + std::to_string(origins.attaches[1]) + "/" + std::to_string(origins.attaches[2]) + " (exact/relocated/shape), " + std::to_string(origins.layoutMisses) + " layout misses, " + std::to_string(origins.shapeRefused) + " shape draws without one remembered draw for every stage";
 }
 
+using RecipeDraws = AgcDriver::VulkanDevice::DrawRecipeDrawCounts;
+
+std::string Decisions(const RecipeDraws& before, const RecipeDraws& after) {
+    const auto shape = static_cast<std::size_t>(AgcDriver::VulkanDevice::DrawRecipeOrigin::Shape);
+    const auto skip = [&](AgcDriver::VulkanDevice::DrawRecipeSkip reason) { return std::to_string(after.skipped[static_cast<std::size_t>(reason)] - before.skipped[static_cast<std::size_t>(reason)]); };
+    return std::to_string(after.Draws() - before.Draws()) + " draws counted: " + std::to_string(after.found[shape] - before.found[shape]) + " found a recipe through their shape, " + std::to_string(after.recorded[shape] - before.recorded[shape]) + " were recorded from it, " + std::to_string(after.absent[shape] - before.absent[shape]) + " found none, " + skip(AgcDriver::VulkanDevice::DrawRecipeSkip::Captured) + " captured a stage, " + skip(AgcDriver::VulkanDevice::DrawRecipeSkip::Split) + " reused stages of several remembered draws, " + skip(AgcDriver::VulkanDevice::DrawRecipeSkip::Ineligible) + " were not eligible";
+}
+
+bool Decided(const RecipeDraws& before, const RecipeDraws& after, AgcDriver::VulkanDevice::DrawRecipeSkip reason) {
+    const auto index = static_cast<std::size_t>(reason);
+    return after.Draws() == before.Draws() + 1 && after.skipped[index] == before.skipped[index] + 1;
+}
+
 void RememberedDrawsAlternate(bool enabled, bool verify, bool recipes) {
     Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
@@ -286,10 +299,14 @@ void RememberedDrawsAlternate(bool enabled, bool verify, bool recipes) {
         tables[set] = block + set * 64;
         Describe(tables[set], tables[set] + DataWord, values[set]);
     }
+    const bool shapeRecipes = std::getenv("APS5_NO_SHAPE_RECIPES") == nullptr && std::getenv("APS5_NO_DRAW_RECIPE") == nullptr;
     const auto draw = [&](std::size_t set, const std::uint32_t* table, const char* what) {
+        const auto decided = AgcDriver::VulkanDevice::DrawRecipeDraws();
         const auto counters = Draw(table);
         const auto color = Brightest();
         Require(CloseTo(color, colors[set]), std::string(what) + ": a draw of buffer " + std::to_string(set) + " wrote " + std::to_string(color) + ", expected " + std::to_string(colors[set]) + " (" + Counts(counters) + ")");
+        const auto now = AgcDriver::VulkanDevice::DrawRecipeDraws();
+        Require(now.Draws() == decided.Draws() + 1, std::string(what) + ": one draw was not counted once by the recipe counters: " + Decisions(decided, now));
         return counters;
     };
 
@@ -301,8 +318,11 @@ void RememberedDrawsAlternate(bool enabled, bool verify, bool recipes) {
     for (std::size_t set = 1; set < 4; ++set) {
         for (std::size_t sighting = 0; sighting < 2; ++sighting) {
             const auto before = counters;
+            const auto decided = AgcDriver::VulkanDevice::DrawRecipeDraws();
             counters = draw(set, tables[set], "teaching");
             const auto step = Between(before, counters);
+            const auto now = AgcDriver::VulkanDevice::DrawRecipeDraws();
+            if (!verify) Require(Decided(decided, now, shapeRecipes ? AgcDriver::VulkanDevice::DrawRecipeSkip::Captured : AgcDriver::VulkanDevice::DrawRecipeSkip::Ineligible), std::string("a draw that captured its pixel stage was not counted as ") + (shapeRecipes ? "having captured a stage" : "not eligible, with the shape recipes off") + ": " + Decisions(decided, now));
             Require(counters.dataHits == before.dataHits + 1 && counters.inserts == before.inserts, "a draw of another buffer through the same shape was not a data-only hit: " + Counts(counters));
             Require(step.compiled == (verify ? 2u : 1u), "sighting " + std::to_string(sighting + 1) + " of buffer " + std::to_string(set) + ", which no remembered draw of the shape binds, built " + std::to_string(step.compiled) + " stages: " + Counts(counters));
             Require(step.updates == (enabled && sighting == 1 ? 1u : 0u), "sighting " + std::to_string(sighting + 1) + " of buffer " + std::to_string(set) + " added " + std::to_string(step.updates) + " remembered draws to the shape: " + Counts(counters));
@@ -315,8 +335,13 @@ void RememberedDrawsAlternate(bool enabled, bool verify, bool recipes) {
         for (std::size_t set = 0; set < 4; ++set) {
             const auto before = counters;
             const auto recipeHits = ShapeRecipeHits();
+            const auto decided = AgcDriver::VulkanDevice::DrawRecipeDraws();
             counters = draw(set, tables[set], "alternating");
             const auto step = Between(before, counters);
+            const auto now = AgcDriver::VulkanDevice::DrawRecipeDraws();
+            const auto shape = static_cast<std::size_t>(AgcDriver::VulkanDevice::DrawRecipeOrigin::Shape);
+            if (enabled && recipes) Require(now.found[shape] == decided.found[shape] + 1 && now.recorded[shape] == decided.recorded[shape] + 1, "round " + std::to_string(round) + ": an alternating draw of buffer " + std::to_string(set) + " was not counted as recorded from a recipe found through its shape: " + Decisions(decided, now));
+            if (!shapeRecipes) Require(Decided(decided, now, AgcDriver::VulkanDevice::DrawRecipeSkip::Ineligible), "with the shape recipes off, an alternating draw was not counted as not eligible: " + Decisions(decided, now));
             Require(counters.dataHits == before.dataHits + 1 && counters.hits == before.hits, "an alternating draw with a new unread user word was not a data-only hit: " + Counts(counters));
             const auto recorded = ShapeRecipeHits() - recipeHits;
             Require(recorded == (enabled && recipes ? 1u : recorded) && (recipes || recorded == 0), "round " + std::to_string(round) + ": an alternating draw of buffer " + std::to_string(set) + " that reused both stages of one remembered draw made " + std::to_string(recorded) + " recipe hits through its shape, expected " + (recipes ? "one" : "none") + ": " + RecipeCounts() + "; " + Counts(counters));

@@ -1471,7 +1471,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     auto recipeDonor = drawHit && entry != nullptr ? entry->donor : nullptr;
     auto recipeOrigin = recipeDonor != nullptr ? Origin::Relocated : Origin::Exact;
     auto recipeKey = drawKey;
-    if (registerKey && !drawParameters.indirect && !patchedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes()) {
+    const bool recipeEligible = registerKey && !drawParameters.indirect && !patchedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes();
+    if (recipeEligible) {
         if (!drawHit && shapeRecipes()) {
             if (auto [key, donor] = shapeRecipeDonor(programs, roles, reused, shapeReuses, tail.dataEntries); donor != nullptr) {
                 recipeKey = key;
@@ -1490,6 +1491,21 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         recipe = findDrawRecipe(recipeKey, recipeStages, recipeDonor);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
     }
+    const bool recipeLookedUp = (drawHit || recipeOrigin == Origin::Shape) && !recipeStages.empty();
+    const bool recipeFound = recipe != nullptr;
+    const auto noteRecipeDecision = [&] {
+        if (recipeLookedUp) {
+            VulkanDevice::NoteDrawRecipeLookup(recipeOrigin, recipeFound);
+            return;
+        }
+        bool everyStageReused = false;
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            if (roles[i] == Role::GeometryBack) continue;
+            everyStageReused = reused[i];
+            if (!everyStageReused) break;
+        }
+        VulkanDevice::NoteDrawRecipeSkip(!recipeEligible || drawHit || !shapeRecipes() ? VulkanDevice::DrawRecipeSkip::Ineligible : everyStageReused ? VulkanDevice::DrawRecipeSkip::Split : VulkanDevice::DrawRecipeSkip::Captured);
+    };
     const auto ownKey = recipeOrigin == Origin::Shape && inserted ? drawKey : 0;
     if (recipe != nullptr && ownKey != 0) attachDrawRecipe(ownKey, recipeStages, recipe);
     if (recipe == nullptr) {
@@ -1515,6 +1531,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             restartFinishedDraw(tail);
             return finishDraw(tail, timing);
         }
+        noteRecipeDecision();
         phaseTiming.Phase(DrawRowVectors);
         if (tail.site.eligible) {
             std::vector<std::shared_ptr<DispatchVariant>> served(programs.size());
@@ -1548,6 +1565,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const RecaptureScope recapture;
         return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
     }
+    noteRecipeDecision();
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
     if (recipe != nullptr) {
@@ -1563,6 +1581,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, tail.shapeKey);
     Graphics::NoteDrawSite(tail.shapeKey);
+    if (built == nullptr && !recipeStages.empty()) VulkanDevice::NoteDrawRecipeUnbuilt();
     phaseTiming.Phase(DrawRowGraphics);
     if (built != nullptr && ownKey != 0) attachDrawRecipe(ownKey, recipeStages, built);
     if (built != nullptr) attachDrawRecipe(recipeKey, recipeStages, std::move(built), recipeDonor, recipeOrigin);
@@ -1661,6 +1680,7 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     std::shared_ptr<const DrawRecipe> built;
     localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape);
     Graphics::NoteDrawSite(shape);
+    if (built == nullptr && !recipeStages.empty()) VulkanDevice::NoteDrawRecipeUnbuilt();
     if (built != nullptr && ownKey != 0) attachDrawRecipe(ownKey, recipeStages, built);
     if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor, origin);
 }
