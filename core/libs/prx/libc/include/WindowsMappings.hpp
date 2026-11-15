@@ -154,6 +154,8 @@ public:
     }
 
     bool Protect(std::uintptr_t address, std::size_t bytes, DWORD protection, bool requireCommitted) {
+        settleTraps(address, bytes);
+        ReleaseReads(address, bytes);
         std::unique_lock lock(mutex, std::defer_lock);
         if (track.Enabled()) lock.lock();
         const auto end = address + bytes;
@@ -179,7 +181,11 @@ public:
     }
 
     bool QueryOpened(std::uintptr_t address, MEMORY_BASIC_INFORMATION* memory) {
-        if (!track.Enabled()) return VirtualQuery(reinterpret_cast<const void*>(address), memory, sizeof(*memory)) == sizeof(*memory);
+        if (!track.Enabled()) {
+            if (VirtualQuery(reinterpret_cast<const void*>(address), memory, sizeof(*memory)) != sizeof(*memory)) return false;
+            ShowTrapped(address, memory);
+            return true;
+        }
         const SiteLock lock(mutex, MappingLockCaller::QueryOpened);
         const auto run = residentRuns.upper_bound(address);
         if (run != residentRuns.begin() && std::prev(run)->second.end > address) {
@@ -187,15 +193,76 @@ public:
         } else if (const auto allocation = privateAllocations.upper_bound(address); allocation != privateAllocations.begin() && std::prev(allocation)->second > address) {
             track.Open(std::prev(allocation)->first, std::prev(allocation)->second);
         }
-        return VirtualQuery(reinterpret_cast<const void*>(address), memory, sizeof(*memory)) == sizeof(*memory);
+        if (VirtualQuery(reinterpret_cast<const void*>(address), memory, sizeof(*memory)) != sizeof(*memory)) return false;
+        showTrapped(address, memory);
+        return true;
+    }
+
+    using TrapResolver = bool (*)(std::uintptr_t begin, std::uintptr_t end);
+
+    void SetTrapResolver(TrapResolver resolver) {
+        trapResolver.store(resolver, std::memory_order_release);
+    }
+
+    bool TrapReads(std::uintptr_t address, std::size_t bytes) {
+        if (bytes == 0 || address % subpageBytes != 0 || bytes % subpageBytes != 0 || bytes > UINTPTR_MAX - address || trapResolver.load(std::memory_order_acquire) == nullptr) return false;
+        std::lock_guard lock(mutex);
+        const auto end = address + bytes;
+        const auto first = address & ~(pageBytes - 1);
+        for (auto base = first; base < end; base += pageBytes) {
+            const auto found = views.find(base);
+            if (found == views.end()) return false;
+            const auto& view = found->second;
+            if (view.resident || view.page == nullptr || view.viewBytes != pageBytes || !writable(view.protection) || view.hostWrites != 0 || view.page->pins != 0 || view.page->comparedWhenShared || view.page->aliases.size() != 1) return false;
+        }
+        for (auto base = first; base < end; base += pageBytes) {
+            auto& view = views.find(base)->second;
+            const auto mask = static_cast<std::uint8_t>(subpagesOf(base, address, end) & ~view.trapped);
+            if (mask == 0) continue;
+            protectSubpages(base, mask, PAGE_NOACCESS, "trap reads of shared guest memory", view.viewBytes);
+            if (view.trapped == 0) trappedViews.fetch_add(1, std::memory_order_release);
+            view.trapped |= mask;
+        }
+        return true;
+    }
+
+    void ReleaseReads(std::uintptr_t address, std::size_t bytes) {
+        if (bytes == 0 || bytes > UINTPTR_MAX - address || trappedViews.load(std::memory_order_acquire) == 0) return;
+        std::lock_guard lock(mutex);
+        releaseTraps(address, address + bytes);
+    }
+
+    bool ReadsTrapped(std::uintptr_t address, std::size_t bytes) {
+        if (bytes == 0 || bytes > UINTPTR_MAX - address || trappedViews.load(std::memory_order_acquire) == 0) return false;
+        std::lock_guard lock(mutex);
+        return anyTrapped(address, address + bytes);
+    }
+
+    bool HandleTrap(std::uintptr_t address) {
+        if (trappedViews.load(std::memory_order_acquire) == 0) return false;
+        {
+            std::lock_guard lock(mutex);
+            if (!anyTrapped(address, address + 1)) return false;
+        }
+        const auto resolver = trapResolver.load(std::memory_order_acquire);
+        const auto page = address & ~(subpageBytes - 1);
+        return resolver != nullptr && resolver(page, page + subpageBytes);
+    }
+
+    void ShowTrapped(std::uintptr_t address, MEMORY_BASIC_INFORMATION* memory) {
+        if (trappedViews.load(std::memory_order_acquire) == 0) return;
+        std::lock_guard lock(mutex);
+        showTrapped(address, memory);
     }
 
     void Reset(void* address, std::size_t bytes) {
+        settleTraps(reinterpret_cast<std::uintptr_t>(address), bytes);
         const SiteLock lock(mutex, MappingLockCaller::Reset);
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
     void MapZero(void* address, std::size_t bytes) {
+        settleTraps(reinterpret_cast<std::uintptr_t>(address), bytes);
         const SiteLock lock(mutex, MappingLockCaller::MapZero);
         if (zeroSection == nullptr && (zeroSection = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READONLY, 0, static_cast<DWORD>(pageBytes), nullptr)) == nullptr) fail("create the read-only zero guest page");
         const auto start = reinterpret_cast<std::uintptr_t>(address);
@@ -208,6 +275,7 @@ public:
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection, bool watched = false, bool resident = false, DWORD viewProtection = PAGE_EXECUTE_READWRITE, std::size_t sectionBytes = SIZE_MAX, std::vector<std::pair<std::uintptr_t, std::size_t>>* createdPrivate = nullptr) {
         if (sectionBytes < bytes && (resident || sectionBytes == 0 || bytes - sectionBytes >= pageBytes)) throw std::runtime_error("shared guest mapping extends a whole page past its section");
+        settleTraps(reinterpret_cast<std::uintptr_t>(address), bytes);
         const SiteLock lock(mutex, MappingLockCaller::Map);
         collectableRanges.clear();
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
@@ -330,7 +398,9 @@ public:
     }
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
+        settleTraps(address, bytes);
         const SiteLock lock(mutex, MappingLockCaller::SetProtection);
+        releaseTraps(address, address + bytes);
         disown(address, address + bytes);
         if (protection != PAGE_READWRITE) track.Bar(address, address + bytes, PageTrackOrigin::SetProtection);
         else track.Open(address, address + bytes);
@@ -344,7 +414,9 @@ public:
     }
 
     void Pin(std::uintptr_t address, std::size_t bytes) {
+        settleTraps(address, bytes);
         const SiteLock lock(mutex, MappingLockCaller::Pin);
+        releaseTraps(address, address + bytes);
         disown(address, address + bytes);
         ownedPins.emplace(address, address + bytes);
         track.Hold(address, address + bytes);
@@ -359,7 +431,7 @@ public:
             for (const auto alias : page.aliases) {
                 auto& view = views.at(alias);
                 if (view.armed == 0) continue;
-                protectSubpages(alias, view.armed, view.protection, "pin shared guest page writable", view.viewBytes);
+                protectView(alias, view, view.armed, view.protection, "pin shared guest page writable");
                 view.armed = 0;
             }
             invalidate(page);
@@ -379,7 +451,9 @@ public:
     }
 
     void CompareWhenShared(std::uintptr_t address, std::size_t bytes, bool residentOnly = false) {
+        settleTraps(address, bytes);
         const SiteLock lock(mutex, MappingLockCaller::CompareWhenShared);
+        releaseTraps(address, address + bytes);
         collectableRanges.clear();
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             if (residentOnly && !it->second.resident && !it->second.aliasDemoted) continue;
@@ -397,7 +471,7 @@ public:
                 if (view.resident) continue;
                 if (!marked) view.unreported = allSubpages;
                 if (view.armed == 0) continue;
-                protectSubpages(alias, view.armed, view.protection, "stop arming a compared shared page", view.viewBytes);
+                protectView(alias, view, view.armed, view.protection, "stop arming a compared shared page");
                 view.armed = 0;
             }
         }
@@ -438,6 +512,7 @@ public:
             return memory.State == MEM_COMMIT && writable(memory.Protect & 0xffu);
         }
         const auto written = subpagesOf(base, address, address + 1);
+        if ((view.trapped & written) != 0) return false;
         invalidate(*view.page, written);
         protectSubpages(base, written, view.protection, "resume shared memory write", view.viewBytes);
         view.armed &= static_cast<std::uint8_t>(~written);
@@ -496,10 +571,12 @@ public:
     }
 
     bool beginHostWrite(std::uintptr_t address, std::size_t bytes, bool store, std::uint64_t* token) {
+        if (store) settleTraps(address, bytes);
         const bool ranged = rangedHostWrites();
         const SiteLock lock(mutex, LockSite::Other, ranged ? address : 0, ranged ? address + bytes : UINTPTR_MAX, MappingLockCaller::BeginHostWrite);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
+        if (store && anyTrapped(address, end)) return false;
         for (auto it = first; it != views.end() && it->first < end; ++it) {
             if (!writable(it->second.protection)) return false;
         }
@@ -520,7 +597,7 @@ public:
             }
             const auto opened = static_cast<std::uint8_t>((store || view.resident) ? view.armed & written : 0);
             if (opened == 0) continue;
-            protectSubpages(it->first, opened, view.protection, "open shared memory to a host write", view.viewBytes);
+            protectView(it->first, view, opened, view.protection, "open shared memory to a host write");
             view.armed &= static_cast<std::uint8_t>(~opened);
         }
         if (token != nullptr) *token = (viewSerial + 1) << 1;
@@ -1004,7 +1081,7 @@ public:
                             continue;
                         }
                         const DWORD protection = other.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
-                        protectSubpages(alias, arming, protection, "arm shared memory write tracking", other.viewBytes);
+                        protectView(alias, other, arming, protection, "arm shared memory write tracking");
                         other.armed |= arming;
                     }
                     const auto tracked = static_cast<std::uint8_t>(settled & ~untracked);
@@ -1894,6 +1971,7 @@ private:
         bool aliasDemoted = false;
         std::uint8_t unreported = 0;
         std::uint64_t born = 0;
+        std::uint8_t trapped = 0;
     };
     struct Run {
         std::uintptr_t end;
@@ -2304,6 +2382,67 @@ private:
         }
     }
 
+    static void protectView(std::uintptr_t base, const View& view, std::uint8_t mask, DWORD protection, const char* operation) {
+        protectSubpages(base, static_cast<std::uint8_t>(mask & ~view.trapped), protection, operation, view.viewBytes);
+    }
+
+    bool anyTrapped(std::uintptr_t address, std::uintptr_t end) const {
+        if (trappedViews.load(std::memory_order_acquire) == 0) return false;
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
+            if ((subpagesOf(it->first, address, end) & it->second.trapped) != 0) return true;
+        }
+        return false;
+    }
+
+    void releaseTraps(std::uintptr_t address, std::uintptr_t end) {
+        if (trappedViews.load(std::memory_order_acquire) == 0) return;
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
+            auto& view = it->second;
+            const auto mask = static_cast<std::uint8_t>(subpagesOf(it->first, address, end) & view.trapped);
+            if (mask == 0) continue;
+            view.trapped &= static_cast<std::uint8_t>(~mask);
+            if (view.trapped == 0) trappedViews.fetch_sub(1, std::memory_order_release);
+            const auto armed = static_cast<std::uint8_t>(mask & view.armed);
+            const auto opened = static_cast<std::uint8_t>(mask & ~view.armed);
+            if (armed != 0) protectSubpages(it->first, armed, view.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY, "release a read trap on armed shared memory", view.viewBytes);
+            if (opened != 0) protectSubpages(it->first, opened, view.protection, "release a read trap on shared guest memory", view.viewBytes);
+        }
+    }
+
+    void settleTraps(std::uintptr_t address, std::size_t bytes) {
+        if (bytes == 0 || trappedViews.load(std::memory_order_acquire) == 0) return;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+        {
+            std::lock_guard lock(mutex);
+            const auto end = address + bytes;
+            for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
+                const auto mask = static_cast<std::uint8_t>(subpagesOf(it->first, address, end) & it->second.trapped);
+                for (std::size_t sub = 0; sub < subpages; ++sub) {
+                    if ((mask & (1u << sub)) == 0) continue;
+                    const auto from = it->first + sub * subpageBytes;
+                    if (!runs.empty() && runs.back().second == from) runs.back().second = from + subpageBytes;
+                    else runs.emplace_back(from, from + subpageBytes);
+                }
+            }
+        }
+        const auto resolver = trapResolver.load(std::memory_order_acquire);
+        if (resolver == nullptr) return;
+        for (const auto& [from, to] : runs) resolver(from, to);
+    }
+
+    void showTrapped(std::uintptr_t address, MEMORY_BASIC_INFORMATION* memory) const {
+        if (trappedViews.load(std::memory_order_acquire) == 0 || memory->State != MEM_COMMIT || memory->Protect != PAGE_NOACCESS) return;
+        const auto base = address & ~(pageBytes - 1);
+        const auto found = views.find(base);
+        if (found == views.end()) return;
+        const auto& view = found->second;
+        const auto bit = subpagesOf(base, address, address + 1);
+        if ((view.trapped & bit) == 0) return;
+        memory->BaseAddress = reinterpret_cast<void*>(address & ~(subpageBytes - 1));
+        memory->RegionSize = subpageBytes;
+        memory->Protect = (view.armed & bit) == 0 ? view.protection : view.protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ : PAGE_READONLY;
+    }
+
     bool sameSection(HANDLE first, HANDLE second) const {
         return compare != nullptr && compare(first, second);
     }
@@ -2401,6 +2540,7 @@ private:
             if (memory.Type == MEM_MAPPED) {
                 if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(cursor), MEM_PRESERVE_PLACEHOLDER)) fail("unmap shared guest page");
                 for (auto found = views.lower_bound(cursor); found != views.end() && found->first < allocationEnd;) {
+                    if (found->second.trapped != 0) trappedViews.fetch_sub(1, std::memory_order_release);
                     if (found->second.page != nullptr) std::erase(found->second.page->aliases, found->first);
                     retireView(found->first);
                     found = views.erase(found);
@@ -2728,6 +2868,8 @@ private:
     };
 
     SiteMutex mutex;
+    std::atomic<std::uint64_t> trappedViews{0};
+    std::atomic<TrapResolver> trapResolver{nullptr};
     std::array<std::atomic<std::uint64_t>, MappingForgetOutcomes> forgetOutcomes{};
     std::array<std::atomic<ZeroLeaf*>, zeroLeaves> zeroCounts{};
     std::array<std::atomic<OwnedLeaf*>, zeroLeaves> ownedTable{};

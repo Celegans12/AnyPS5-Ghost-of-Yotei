@@ -71,6 +71,10 @@ void GuestArenaSetAccessObserver_nid_postfix(void (*callback)(std::uintptr_t add
 #ifdef _WIN32
 bool GuestArenaHandleWrite_nid_postfix(std::uintptr_t address);
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address);
+void GuestArenaSetReadTrapResolver_nid_no_patch(bool (*resolve)(std::uintptr_t begin, std::uintptr_t end));
+bool GuestArenaTrapReads_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+void GuestArenaReleaseReads_nid_no_patch(std::uintptr_t address, std::size_t bytes);
+bool GuestArenaReadsTrapped_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 bool GuestArenaCopyOwned_nid_no_patch(std::uintptr_t source, void* destination, std::size_t bytes);
 bool GuestArenaCompareOwned_nid_no_patch(std::uintptr_t source, const void* expected, std::size_t bytes, bool* equal);
 bool GuestArenaRecoverRead_nid_no_patch(_EXCEPTION_POINTERS* exception);

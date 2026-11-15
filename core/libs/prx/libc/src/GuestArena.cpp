@@ -652,6 +652,7 @@ bool GuestArenaCompareOwned_nid_no_patch(std::uintptr_t source, const void* expe
 bool GuestArenaRecoverRead_nid_no_patch(EXCEPTION_POINTERS* exception) {
     const auto* record = exception->ExceptionRecord;
     const auto code = record->ExceptionCode;
+    if (code == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2 && record->ExceptionInformation[0] <= 1 && WindowsMappings::Get().HandleTrap(static_cast<std::uintptr_t>(record->ExceptionInformation[1]))) return true;
     if ((code != EXCEPTION_ACCESS_VIOLATION && code != EXCEPTION_IN_PAGE_ERROR) || record->NumberParameters < 2 || record->ExceptionInformation[0] != 0) return false;
     auto* context = exception->ContextRecord;
     const auto at = reinterpret_cast<const char*>(context->Rip);
@@ -685,7 +686,9 @@ int GuestPageTrackState_nid_no_patch(std::uintptr_t address) {
 }
 
 bool GuestPageTrackQuery_nid_no_patch(const void* address, MEMORY_BASIC_INFORMATION* memory) {
-    return WindowsPageTrack::Get().Query(reinterpret_cast<std::uintptr_t>(address), memory);
+    if (!WindowsPageTrack::Get().Query(reinterpret_cast<std::uintptr_t>(address), memory)) return false;
+    WindowsMappings::Get().ShowTrapped(reinterpret_cast<std::uintptr_t>(address), memory);
+    return true;
 }
 
 bool GuestPageTrackQueryOpened_nid_no_patch(const void* address, MEMORY_BASIC_INFORMATION* memory) {
@@ -769,6 +772,22 @@ bool GuestPageTrackRearm_nid_no_patch(std::uintptr_t address, std::size_t bytes,
 
 bool GuestArenaHandleRead_nid_postfix(std::uintptr_t address) {
     return WindowsMappings::Get().HandleRead(address);
+}
+
+void GuestArenaSetReadTrapResolver_nid_no_patch(bool (*resolve)(std::uintptr_t begin, std::uintptr_t end)) {
+    WindowsMappings::Get().SetTrapResolver(resolve);
+}
+
+bool GuestArenaTrapReads_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().TrapReads(address, bytes);
+}
+
+void GuestArenaReleaseReads_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    WindowsMappings::Get().ReleaseReads(address, bytes);
+}
+
+bool GuestArenaReadsTrapped_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    return WindowsMappings::Get().ReadsTrapped(address, bytes);
 }
 
 void GuestArenaPinWritable_nid_postfix(const void* pointer, std::size_t bytes) {
