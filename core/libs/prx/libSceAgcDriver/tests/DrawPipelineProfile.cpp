@@ -110,8 +110,7 @@ void TestReport() {
     Check(report.find("packet drains by opcode:") != std::string::npos, "pipeline opcode counters were lost");
     if (!DrawPipeline::Flat()) return;
     const auto transport = capture.ReadReport("[transport] ");
-    std::cout << transport << '
-';
+    std::cout << transport << '\n';
     Check(transport.find(" committer queue: 2 elements (0 wider than a flat record), 0 waits for room,") != std::string::npos, "the elements of the flat committer queue were not counted");
     Check(transport.find(" 1 overlap queries over 1 records (0 under the wide-record lock);") != std::string::npos, "the queries on the flat committer queue were not counted");
     Check(transport.find(" finisher queue: 0 elements ") != std::string::npos, "the flat finisher queue was not reported");
