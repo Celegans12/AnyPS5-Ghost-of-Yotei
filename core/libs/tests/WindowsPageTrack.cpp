@@ -592,8 +592,16 @@ void CheckRearm(bool resident) {
     memory.Write(4, 9, 4);
     std::array<std::uint64_t, 1> words{};
     Require(mappings.ArmOwned(memory.Block(4) + 0x100, 0x200, words.data(), words.size(), Mappings::OwnedPrivate), kind + ": an owned proof of a written block was refused");
-    Require(mappings.RearmBlocks(memory.Block(4), BlockBytes, &tokens[4], &written[4], nullptr, 1) && written[4] == bit(9), kind + ": the pages an owned proof took from the write watch were missing at the rearm");
-    Require(all() == Pages(4, {9}), kind + ": a page an owned proof and a rearm both saw was lost for the collect");
+    Require(mappings.RearmBlocks(memory.Block(4), BlockBytes, &tokens[4], &written[4], nullptr, 1) && written[4] == Every, kind + ": a block whose write watch an owned proof reset was answered with a page mask");
+    Require(all() == Pages(4, {9}), kind + ": a page an owned proof took from the write watch was lost for the collect");
+
+    track.AdvancePeriod();
+    memory.Write(3, 2, 5);
+    Require(mappings.RearmBlocks(memory.Block(3), BlockBytes, &tokens[3], &written[3], nullptr, 1) && written[3] == bit(2), kind + ": a rearm did not report the page written since the token");
+    track.AdvancePeriod();
+    memory.Write(3, 5, 6);
+    Require(mappings.RearmBlocks(memory.Block(3), BlockBytes, &tokens[3], &written[3], nullptr, 1) && written[3] == bit(5), kind + ": a rearm reported pages of an earlier rearm that no collect had taken yet");
+    Require(all() == Pages(3, {2, 5}), kind + ": the pages of two rearms without a collect between them were lost for the collect");
 
     mappings.Pin(memory.Block(5), BlockBytes);
     std::uint64_t reason = 0;

@@ -621,6 +621,7 @@ public:
             ULONG_PTR reported = written.size();
             DWORD granularity = 0;
             if (watchWrites(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(block), ownedBlockBytes, written.data(), &reported, &granularity) != 0) return false;
+            if (track.TakeWritten(block)) track.NoteFault(block);
             for (ULONG_PTR index = 0; index < reported; ++index) pending |= std::uint16_t{1} << ((reinterpret_cast<std::uintptr_t>(written[index]) - block) / 4096);
             if (pending == 0) ownedPending.erase(block);
         }
@@ -1286,9 +1287,8 @@ private:
             return WindowsPageTrack::Reason(PageTrackReason::Edge);
         }
         std::uint16_t pages = 0;
-        if (const auto pending = ownedPending.find(block); pending != ownedPending.end()) pages = pending->second;
         for (ULONG_PTR index = 0; index < reported; ++index) pages |= static_cast<std::uint16_t>(std::uint16_t{1} << ((reinterpret_cast<std::uintptr_t>(local[index]) - block) / 4096));
-        if (pages != 0) ownedPending[block] = pages;
+        if (pages != 0) ownedPending[block] |= pages;
         if (found != nullptr) *found = pages;
         WindowsPageTrack::NoteArmed(entry);
         if (track.Verifying()) track.SetDigest(block, blockDigest(block));
