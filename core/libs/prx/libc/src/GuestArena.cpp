@@ -751,6 +751,10 @@ void GuestArenaReadTraps_nid_no_patch(std::uintptr_t address, std::size_t bytes,
     WindowsMappings::Get().ReadTraps(address, address + bytes, trapped, context);
 }
 
+bool GuestArenaReadTrapped_nid_no_patch(std::uintptr_t address) {
+    return WindowsMappings::Get().ReadTrapped(address);
+}
+
 void GuestArenaReleaseReads_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
     WindowsMappings::Get().ReleaseReads(address, address + bytes);
 }

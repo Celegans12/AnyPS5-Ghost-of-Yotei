@@ -417,7 +417,9 @@ public:
         const auto last = (end + trapPageMask) & ~trapPageMask;
         std::lock_guard lock(mutex);
         if (hasTrap(begin, end)) return true;
-        if (overlapsOwnedRange(ownedHostAccess, first, last) || overlaps(unarmable, first, last) || !trappable(first, last)) return false;
+        // An import the GPU has not used yet pins its pages at that first use, which needs them
+        // accessible.
+        if (overlapsOwnedRange(ownedHostAccess, first, last) || overlapsOwnedRange(unusedImports, first, last) || overlaps(unarmable, first, last) || !trappable(first, last)) return false;
         forgetClean(first, last);
         DWORD previous;
         if (!VirtualProtect(reinterpret_cast<void*>(first), last - first, PAGE_NOACCESS, &previous)) return false;
@@ -443,6 +445,14 @@ public:
             }
         }
         for (const auto& [runBegin, runEnd] : runs) trapped(context, runBegin, runEnd);
+    }
+
+    // Whether a read trap (or its resolve in progress) covers the page of `address`.
+    bool ReadTrapped(std::uintptr_t address) {
+        if (!trapping.load(std::memory_order_acquire)) return false;
+        const auto page = address & ~trapPageMask;
+        std::lock_guard lock(mutex);
+        return trapCovers(page, page + trapPageBytes) || resolvingCovers(page, page + trapPageBytes, TrapOwner::Any);
     }
 
     void ReleaseReads(std::uintptr_t begin, std::uintptr_t end) {
@@ -483,7 +493,7 @@ public:
     }
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes, bool store = true) {
-        const auto lock = lockWithoutTraps(address, address + bytes);
+        const auto lock = store ? lockWithoutTraps(address, address + bytes) : lockOpeningTraps(address, address + bytes);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
         for (auto it = first; it != views.end() && it->first < end; ++it) {
@@ -3063,7 +3073,46 @@ private:
                 }
                 SetEvent(slot.done);
             }
+            std::vector<std::uintptr_t> handed;
+            {
+                std::lock_guard lock(mutex);
+                handed.swap(trapsHanded);
+            }
+            for (const auto page : handed) {
+                try {
+                    resolveTraps(page, page + trapPageBytes);
+                } catch (const std::exception& error) {
+                    std::fprintf(stderr, "[read-trap] resolving 0x%llx failed: %s\n", static_cast<unsigned long long>(page), error.what());
+                    std::lock_guard lock(mutex);
+                    std::erase_if(trapsResolving, [](const TrapResolving& entry) { return entry.owner == GetCurrentThreadId(); });
+                    std::erase_if(trapsDeferred, [](const TrapResolving& entry) { return entry.owner == GetCurrentThreadId(); });
+                }
+            }
         }
+    }
+
+    // Before a host import of [begin, end): the driver pins the pages, so they must be accessible,
+    // and the caller may hold driver locks a resolver needs. The trapped pages open at once and
+    // their traps are handed to the resolver thread; until it ran, the guest can read the older
+    // bytes there. Returns with the mutex held.
+    std::unique_lock<std::mutex> lockOpeningTraps(std::uintptr_t begin, std::uintptr_t end) {
+        std::unique_lock lock(mutex);
+        if (!trapping.load(std::memory_order_acquire)) return lock;
+        const auto first = begin & ~trapPageMask;
+        const auto last = (end + trapPageMask) & ~trapPageMask;
+        if (!trapCovers(first, last) && !resolvingCovers(first, last, TrapOwner::Any)) return lock;
+        bool handed = false;
+        for (auto page = first; page < last; page += trapPageBytes) {
+            if (!trapCovers(page, page + trapPageBytes) && !resolvingCovers(page, page + trapPageBytes, TrapOwner::Any)) continue;
+            DWORD previous;
+            if (query(page).Protect == PAGE_NOACCESS && !VirtualProtect(reinterpret_cast<void*>(page), trapPageBytes, PAGE_READWRITE, &previous)) fail("open trapped guest memory for an import");
+            if (trapCovers(page, page + trapPageBytes)) {
+                trapsHanded.push_back(page);
+                handed = true;
+            }
+        }
+        if (handed) ReleaseSemaphore(trapWake, 1, nullptr);
+        return lock;
     }
 
     // Before a host write or import of [begin, end): no trap may remain over it. Returns with the
@@ -3089,6 +3138,7 @@ private:
     std::uintptr_t longestTrap = 0;
     std::vector<TrapResolving> trapsResolving;
     std::vector<TrapResolving> trapsDeferred;
+    std::vector<std::uintptr_t> trapsHanded;
     Ranges everTrapped;
     std::array<TrapSlot, 16> trapSlots;
     HANDLE trapWake = nullptr;

@@ -244,7 +244,12 @@ int main(int argc, char** argv) {
             LabelAfterStore(surface, label);
         }
         const auto labelCounts = StorageTexture::TakeOrderedSkipCounts();
-        if (mode == Mode::Enabled) Require(labelCounts.flushes != 0, "label ordered flush: no label store took the GPU-ordered flush over the host import");
+        // With section A on, the surface is trapped for reads at the label instead of stored.
+        std::uint64_t trapsSet = 0;
+#ifdef _WIN32
+        GuestArena::GuestArenaReadTrapCounts_nid_no_patch(&trapsSet, 1);
+#endif
+        if (mode == Mode::Enabled) Require(labelCounts.flushes != 0 || trapsSet != 0, "label ordered flush: no label store took the GPU-ordered flush over the host import");
         else Require(labelCounts.flushes == 0, "label ordered flush: a label store skipped its writer wait with the ordered flush off or no host import");
         GuestAllocations::Mutation().Add(Output.data(), sizeof(Output), true, true, true);
         struct UnregisterOutput {

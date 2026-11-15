@@ -5033,16 +5033,50 @@ bool StorageTexture::pendingUnitInside(std::uint64_t address, std::size_t bytes)
 
 namespace {
 
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
 std::atomic<bool> labelTrapsSet{false};
 
 std::uint64_t TrapPage() {
+#if defined(_WIN32)
+    static const std::uint64_t page = 4096;
+#else
     static const auto page = static_cast<std::uint64_t>(::getpagesize());
+#endif
     return page;
+}
+
+// Surfaces the CPU touched while trapped (a fault or a host write resolved the trap). A fault
+// with its wait for the GPU costs more than the store at the label, so such a surface is stored
+// at labels again for a while, twice as long after every further resolve (blocks that fault
+// every frame stay stored, DESIGN section A). Age of Mythology's title screen reads its small
+// surfaces back every frame: 172 ms per frame with every one trapped, 142 stored.
+struct TrapReadBack {
+    std::chrono::steady_clock::time_point until;
+    std::chrono::milliseconds span{0};
+};
+std::mutex trapReadBackMutex;
+std::unordered_map<std::uint64_t, TrapReadBack> trapReadBacks;
+std::atomic<std::uint64_t> trapResolves{0};
+
+void NoteTrapReadBack(std::uint64_t begin) {
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard lock(trapReadBackMutex);
+    auto& entry = trapReadBacks[begin];
+    entry.span = entry.span.count() == 0 ? std::chrono::milliseconds(2000) : std::min(entry.span * 2, std::chrono::milliseconds(64000));
+    entry.until = now + entry.span;
+}
+
+bool TrapReadBackRecently(std::uint64_t begin) {
+    std::lock_guard lock(trapReadBackMutex);
+    if (trapReadBacks.empty()) return false;
+    const auto found = trapReadBacks.find(begin);
+    return found != trapReadBacks.end() && std::chrono::steady_clock::now() < found->second.until;
 }
 
 void ResolveLabelTrap(std::uintptr_t begin, std::uintptr_t end) {
     const auto bytes = static_cast<std::size_t>(end - begin);
+    trapResolves.fetch_add(1, std::memory_order_relaxed);
+    NoteTrapReadBack(begin);
     GuestMemory::FlushGpuWrites(begin, bytes);
     while (AgcDriver::DriverDetail::DrawPipeline::HeldReads(begin, bytes)) {
         std::this_thread::sleep_for(std::chrono::microseconds(50));
@@ -5052,6 +5086,13 @@ void ResolveLabelTrap(std::uintptr_t begin, std::uintptr_t end) {
 
 bool LabelTrapsEnabled() {
     static const bool enabled = [] {
+#if defined(_WIN32)
+        // On Windows the traps are built but not a gain yet, so they are opt-in
+        // (APS5_LABEL_READ_TRAP=1): 007 First Light, FF and LEGO measure the same with them, and
+        // Age of Mythology's title screen is 172 ms per frame against 142 (hardly any faults:
+        // about 5 traps set per second, none parked; the cost is in what stays pending).
+        if (std::getenv("APS5_LABEL_READ_TRAP") == nullptr) return false;
+#endif
         if (std::getenv("APS5_NO_LABEL_READ_TRAP") != nullptr || !GuestWriteWatch::GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveLabelTrap)) return false;
         GuestWriteWatch::GuestWriteWatchSetReadTrapBypass_nid_postfix(+[] { return GuestMemory::GpuMutex().HeldByThisThread(); });
         return true;
@@ -5142,7 +5183,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                 ++it;
             }
         }
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
         if (!flush.empty() && labelTrapsSet.load(std::memory_order_relaxed)) {
             const auto selected = flush.size();
             for (auto it = pending.textures.begin(); it != pending.textures.end();) {
@@ -5696,7 +5737,7 @@ std::size_t StorageTexture::StoreSmallPending(const char* reason) {
     return stored;
 }
 
-void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice device) {
+void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice device, std::uint64_t label, std::size_t labelBytes) {
     static const bool disabled = std::getenv("APS5_NO_LABEL_READBACK_STORE") != nullptr;
     if (disabled) return;
     static const bool gpuOrdered = std::getenv("APS5_NO_FLUSH_GPU_ORDERED") == nullptr;
@@ -5710,10 +5751,35 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
         const bool trap = LabelTrapsEnabled();
         if (trap) labelTrapsSet.store(true, std::memory_order_relaxed);
+#if defined(_WIN32)
+        // Profile line (APS5_PROFILE_DRAW=1), every 10 s: what the read traps did.
+        static const bool profileTraps = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+        static auto nextTrapReport = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        if (trap && profileTraps && std::chrono::steady_clock::now() >= nextTrapReport) {
+            nextTrapReport += std::chrono::seconds(10);
+            std::uint64_t counts[4]{};
+            GuestArena::GuestArenaReadTrapCounts_nid_no_patch(counts, 4);
+            std::fprintf(stderr, "[read-trap] cumulative: %llu traps set, %llu faults parked for the resolver, %llu faults opened at once, %llu traps resolved (%llu by the driver's resolver); %zu surfaces stored again after a read-back\n", static_cast<unsigned long long>(counts[0]),
+                static_cast<unsigned long long>(counts[1]), static_cast<unsigned long long>(counts[2]), static_cast<unsigned long long>(counts[3]), static_cast<unsigned long long>(trapResolves.load(std::memory_order_relaxed)), trapReadBacks.size());
+        }
+#endif
         const auto page = TrapPage();
+        // The label's own store goes through an import of its 64 KiB block, and making an import
+        // needs the block's pages accessible: a surface in that block is stored, not trapped.
+        const auto sharesLabelBlock = [&](const StorageTexture* texture) {
+#if defined(_WIN32)
+            constexpr std::uint64_t block = 65536;
+            if (labelBytes == 0) return false;
+            const auto first = label / block * block;
+            return texture->overlaps(first, static_cast<std::size_t>((label + labelBytes + block - 1) / block * block - first));
+#else
+            static_cast<void>(texture);
+            return false;
+#endif
+        };
         const auto sharesPage = [&](const StorageTexture* texture) {
             const auto first = texture->descriptor.baseAddress & ~(page - 1);
             const auto bytes = static_cast<std::size_t>(((texture->descriptor.baseAddress + texture->guestBytes + page - 1) & ~(page - 1)) - first);
@@ -5724,8 +5790,8 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
 #endif
         for (const auto* texture : pending.textures) {
             if (texture->descriptor.tileMode != TextureTileMode::kLinear && texture->guestBytes > SmallStoreBytes) continue;
-#if defined(__APPLE__)
-            if (trap && !sharesPage(texture) && (texture->readTrapped.load(std::memory_order_acquire) || !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) && GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) {
+#if defined(__APPLE__) || defined(_WIN32)
+            if (trap && !sharesLabelBlock(texture) && !TrapReadBackRecently(texture->descriptor.baseAddress) && !sharesPage(texture) && (texture->readTrapped.load(std::memory_order_acquire) || !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) && GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) {
                 texture->readTrapped.store(true, std::memory_order_release);
                 continue;
             }
@@ -7164,7 +7230,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
 }
 
 void StorageTexture::releaseReadTraps(bool sharingPages) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
     if (!labelTrapsSet.load(std::memory_order_relaxed)) return;
     const auto release = [](const StorageTexture* texture) {
         if (texture->readTrapped.exchange(false, std::memory_order_acq_rel)) GuestWriteWatch::GuestWriteWatchReleaseReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes));
@@ -7188,7 +7254,7 @@ void StorageTexture::releaseReadTraps(bool sharingPages) {
 }
 
 void StorageTexture::storeTrappedOverlaps(const char* reason) {
-#if defined(__APPLE__)
+#if defined(__APPLE__) || defined(_WIN32)
     if (!labelTrapsSet.load(std::memory_order_relaxed)) return;
     std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
     {
