@@ -142,6 +142,19 @@ void CheckReadTraps() {
     Require(!mappings.ReadsTrapped(start + 5 * PageBytes, PageBytes) && ReadByte(base + 5 * PageBytes) == Published);
     mappings.Unpin(start + 5 * PageBytes, PageBytes);
 
+    mappings.CompareWhenShared(start + 7 * PageBytes, PageBytes);
+    const auto compared = [&] {
+        std::vector<void*> pages(PageBytes / SubpageBytes);
+        std::size_t count = pages.size();
+        mappings.ComparedPages(start + 7 * PageBytes, PageBytes, pages.data(), &count, false);
+        return count;
+    };
+    Require(compared() == PageBytes / SubpageBytes);
+    Require(mappings.TrapReads(start + 7 * PageBytes, 2 * SubpageBytes));
+    Require(compared() == PageBytes / SubpageBytes - 2);
+    mappings.ReleaseReads(start + 7 * PageBytes, 2 * SubpageBytes);
+    Require(compared() == PageBytes / SubpageBytes && ReadByte(base + 7 * PageBytes) == Initial);
+
     Require(mappings.TrapReads(start + 6 * PageBytes, PageBytes));
     const auto before = resolved.load();
     mappings.Reset(base, Bytes);

@@ -213,7 +213,7 @@ public:
             const auto found = views.find(base);
             if (found == views.end()) return false;
             const auto& view = found->second;
-            if (view.resident || view.page == nullptr || view.viewBytes != pageBytes || !writable(view.protection) || view.hostWrites != 0 || view.page->pins != 0 || view.page->comparedWhenShared || view.page->aliases.size() != 1) return false;
+            if (view.resident || view.page == nullptr || view.viewBytes != pageBytes || !writable(view.protection) || view.hostWrites != 0 || view.page->pins != 0 || view.page->aliases.size() != 1) return false;
         }
         for (auto base = first; base < end; base += pageBytes) {
             auto& view = views.find(base)->second;
@@ -490,7 +490,7 @@ public:
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
             auto& view = it->second;
             if (view.resident || !view.page->comparedWhenShared) continue;
-            const auto listed = static_cast<std::uint8_t>(subpagesOf(it->first, address, end) & (unreported ? view.unreported : allSubpages));
+            const auto listed = static_cast<std::uint8_t>(subpagesOf(it->first, address, end) & (unreported ? view.unreported : allSubpages) & ~view.trapped);
             for (std::size_t sub = 0; sub < subpages; ++sub) {
                 const auto bit = static_cast<std::uint8_t>(1u << sub);
                 if ((listed & bit) == 0) continue;
