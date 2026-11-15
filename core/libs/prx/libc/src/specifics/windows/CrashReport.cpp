@@ -7,6 +7,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestPageTrack.hpp"
 #include "prx/libc/include/HostFault.hpp"
+#include "prx/libc/include/RedZoneGate.hpp"
 #include "prx/libc/include/LogFile.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libc/include/CrashText.hpp"
@@ -697,6 +698,7 @@ const bool g_crashReportInstalled = [] {
     std::signal(SIGABRT, AbortSignalHandler);
     _set_invalid_parameter_handler(InvalidParameterHandler);
     InstallWatch();
+    RedZoneGate::Watch();
     FaultStorm::Start();
     if (const char* hang = std::getenv("APS5_HANG_DUMP_SECS")) {
         unsigned long long seconds = 0;
