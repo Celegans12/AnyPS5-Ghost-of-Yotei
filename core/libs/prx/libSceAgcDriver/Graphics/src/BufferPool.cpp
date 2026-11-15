@@ -751,7 +751,12 @@ ImageAllocation BufferPool::AllocateImage(const Context& context, VkImage image,
     Require(needed.size != 0 && std::has_single_bit(needed.alignment), "invalid image memory requirements");
     auto pool = GetBufferPool(context);
     Require(pool.get() == this, "an image allocation must use its context's buffer pool");
-    const bool separate = dedicated.requiresDedicatedAllocation != VK_FALSE || dedicated.prefersDedicatedAllocation != VK_FALSE;
+    // A budgeted image (a storage image) whose dedicated allocation is only preferred takes pooled
+    // memory: a title that cycles more targets than the cache holds makes and frees them every
+    // frame, and a dedicated allocation can serve no other image
+    // (APS5_NO_POOLED_PREFERRED_IMAGES=1 restores the dedicated allocation).
+    static const bool poolPreferred = std::getenv("APS5_NO_POOLED_PREFERRED_IMAGES") == nullptr;
+    const bool separate = dedicated.requiresDedicatedAllocation != VK_FALSE || (dedicated.prefersDedicatedAllocation != VK_FALSE && !(poolPreferred && budgeted));
     static const bool disabled = std::getenv("APS5_NO_IMAGE_SLABS") != nullptr;
     const bool eligible = !disabled && !separate && imageInfo.tiling == VK_IMAGE_TILING_OPTIMAL && imageInfo.pNext == nullptr && needed.size <= (VkDeviceSize{1} << 20u) && needed.alignment < imageBlockBytes;
     const auto preferredType = context.MemoryType(needed.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);

@@ -5229,6 +5229,8 @@ struct IndirectHold {
 // the device call (this thread's), the pre-dispatch barriers recorded or skipped (Recorder::Commands).
 struct DispatchCounters {
     std::array<double, DispatchRows> phaseTotals{};
+    // Image lookups of every profiled dispatch by outcome (the [dispatch] totals line).
+    std::array<std::uint64_t, Graphics::LookupOutcomes::Count> outcomeCounts{};
     std::uint64_t profiledDispatches = 0;
     IndirectHold indirectHold;
     std::uint64_t cacheHits = 0, cacheMisses = 0, cacheInvalidated = 0, templateRefreshed = 0, templateSameWords = 0, templateByNumber = 0;
@@ -5411,6 +5413,11 @@ struct DispatchTimer {
         std::string report;
         for (std::size_t row = 0; row < DispatchPhaseCount; ++row) {
             if (d.phaseTotals[row] != 0) report += " " + std::string(DispatchRowName(row)) + "=" + std::to_string(static_cast<long long>(d.phaseTotals[row] / 1000)) + "s";
+        }
+        report += "; image lookups by outcome (cumulative):";
+        for (std::size_t kind = 0; kind < Graphics::LookupOutcomes::Count; ++kind) {
+            if (d.outcomeCounts[kind] == 0) continue;
+            report += " " + std::string(Graphics::LookupOutcomes::Name(static_cast<Graphics::LookupOutcomes::Kind>(kind))) + " " + std::to_string(d.outcomeCounts[kind]) + "x " + std::to_string(static_cast<long long>(d.phaseTotals[DispatchPhaseCount + kind])) + " ms";
         }
         AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %llu dispatches, phase totals:%s\n", static_cast<unsigned long long>(d.profiledDispatches), report.c_str());
     }
@@ -6388,6 +6395,8 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     const auto waitedBefore = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     // The image lookups of this call by outcome (stage B, a Revalidate or a locked build), for the
     // [indirect] line: reset here, read after the resources phase.
+    // Other dispatches leave the thread's counts alone and charge the difference to the totals.
+    const auto outcomesBefore = profile && arguments == 0 ? Graphics::ThreadLookupOutcomes() : Graphics::LookupOutcomes{};
     if (profile && arguments != 0) Graphics::ThreadLookupOutcomes() = {};
     const auto noteRefusalBuild = [](bool inserted) {
         auto& moves = DispatchMoves();
@@ -6532,11 +6541,14 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (profile) timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
     // The lookup outcomes of this call: rows with counts on the [indirect] line, and a summary for
     // the longest call.
-    if (profile && arguments != 0) {
+    if (profile) {
         const auto& outcomes = Graphics::ThreadLookupOutcomes();
         for (std::size_t kind = 0; kind < Graphics::LookupOutcomes::Count; ++kind) {
-            if (outcomes.counts[kind] == 0) continue;
+            if (outcomes.counts[kind] == outcomesBefore.counts[kind]) continue;
             const auto row = DispatchPhaseCount + kind;
+            d.phaseTotals[row] += outcomes.ms[kind] - outcomesBefore.ms[kind];
+            d.outcomeCounts[kind] += outcomes.counts[kind] - outcomesBefore.counts[kind];
+            if (arguments == 0) continue;
             timer.callMs[row] += outcomes.ms[kind];
             d.indirectHold.phaseMs[row] += outcomes.ms[kind];
             d.indirectHold.phaseCounts[row] += outcomes.counts[kind];
