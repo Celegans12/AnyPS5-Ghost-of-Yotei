@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/PassState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -63,11 +64,19 @@ struct Counters {
     std::atomic<std::uint64_t> ringFull{0};
     std::array<std::atomic<std::uint64_t>, BufferCache::RunEnds> runEnds{};
     std::atomic<std::uint64_t> runsKept{0};
+    std::atomic<std::uint64_t> inputDirect{0};
+    std::atomic<std::uint64_t> inputDirectBytes{0};
+    std::atomic<std::uint64_t> inputChecked{0};
+    std::atomic<std::uint64_t> inputUnreadable{0};
+    std::atomic<std::uint64_t> inputCopiesVerified{0};
+    std::atomic<std::uint64_t> inputCopyDiffers{0};
 };
 
 std::atomic<std::uint64_t> drawRun{1};
 
 std::atomic<BufferCache::Runs> testedRuns{BufferCache::Runs::Environment};
+
+std::atomic<BufferCache::InputCopies> testedCopies{BufferCache::InputCopies::Environment};
 
 thread_local unsigned labelMarks = 0;
 
@@ -87,6 +96,22 @@ Counters& counters() {
 
 void add(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
     counter.fetch_add(amount, std::memory_order_relaxed);
+}
+
+bool copyInput(std::uint64_t address, std::span<std::byte> out, bool dirtyFirst) {
+    if (!dirtyFirst) return GuestMemory::CopyMapped(address, out) == GuestMemory::Compare::Equal;
+    auto& counted = counters();
+#ifdef _WIN32
+    if (BufferCache::DirectInputCopies() && GuestArena::GuestArenaCopyOwned_nid_no_patch(static_cast<std::uintptr_t>(address), out.data(), out.size())) {
+        add(counted.inputDirect);
+        add(counted.inputDirectBytes, out.size());
+        return true;
+    }
+#endif
+    add(counted.inputChecked);
+    if (GuestMemory::CopyMapped(address, out) == GuestMemory::Compare::Equal) return true;
+    add(counted.inputUnreadable);
+    return false;
 }
 
 constexpr std::array<const char*, BufferCache::Refusals> RefusalNames{"range", "alignment", "gpu write", "untracked", "unmapped", "busy", "span", "budget", "allocation", "raced", "streamed", "label"};
@@ -411,6 +436,21 @@ std::uint64_t BufferCache::DrawRun() {
     return drawRun.load(std::memory_order_acquire);
 }
 
+bool BufferCache::DirectInputCopies() {
+#ifdef _WIN32
+    const auto tested = testedCopies.load(std::memory_order_acquire);
+    if (tested != InputCopies::Environment) return tested == InputCopies::Direct;
+    static const bool direct = std::getenv("APS5_NO_DIRECT_INPUT_COPY") == nullptr;
+    return direct;
+#else
+    return false;
+#endif
+}
+
+void BufferCache::SetInputCopiesForTest(InputCopies copies) {
+    testedCopies.store(copies, std::memory_order_release);
+}
+
 bool BufferCache::Verifying() {
     static const bool verifying = std::getenv("APS5_VERIFY_BUFFER_CACHE") != nullptr;
     return verifying;
@@ -515,6 +555,12 @@ BufferCache::Counts BufferCache::Counted() {
     counts.drawRuns = drawRun.load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < RunEnds; ++reason) counts.runEnds[reason] = held.runEnds[reason].load(std::memory_order_relaxed);
     counts.runsKept = held.runsKept.load(std::memory_order_relaxed);
+    counts.inputDirect = held.inputDirect.load(std::memory_order_relaxed);
+    counts.inputDirectBytes = held.inputDirectBytes.load(std::memory_order_relaxed);
+    counts.inputChecked = held.inputChecked.load(std::memory_order_relaxed);
+    counts.inputUnreadable = held.inputUnreadable.load(std::memory_order_relaxed);
+    counts.inputCopiesVerified = held.inputCopiesVerified.load(std::memory_order_relaxed);
+    counts.inputCopyDiffers = held.inputCopyDiffers.load(std::memory_order_relaxed);
     return counts;
 }
 
@@ -585,6 +631,16 @@ std::string BufferCache::Report() {
         char runs[192];
         std::snprintf(runs, sizeof(runs), "[buffer-cache] dirty-first runs (10 s): %llu labels, stores and seals left the run of draws open; runs ended by:", since(now.runsKept, reported.runsKept));
         text += runs + ends + "\n";
+        if (now.inputDirect != reported.inputDirect || now.inputChecked != reported.inputChecked) {
+            char copies[256];
+            std::snprintf(copies, sizeof(copies), "[buffer-cache] dirty-first copies (10 s): %llu ranges copied in place under the read guard (%.1f MiB), %llu through the checked system copy, %llu of them unreadable\n", since(now.inputDirect, reported.inputDirect), mib(now.inputDirectBytes, reported.inputDirectBytes), since(now.inputChecked, reported.inputChecked), since(now.inputUnreadable, reported.inputUnreadable));
+            text += copies;
+        }
+        if (now.inputCopiesVerified != reported.inputCopiesVerified) {
+            char compared[224];
+            std::snprintf(compared, sizeof(compared), "[buffer-cache] dirty-first copy verification (10 s): %llu fresh copies compared with guest memory, %llu differing\n", since(now.inputCopiesVerified, reported.inputCopiesVerified), since(now.inputCopyDiffers, reported.inputCopyDiffers));
+            text += compared;
+        }
         if (now.inputVerified != reported.inputVerified) {
             char verified[256];
             std::snprintf(verified, sizeof(verified), "[buffer-cache] dirty-first verification (10 s): %llu inputs served without a copy compared with guest memory, %llu of them behind a later write, %llu differing inside a run of draws\n", since(now.inputVerified, reported.inputVerified), since(now.inputRaces, reported.inputRaces), since(now.inputRunDiffers, reported.inputRunDiffers));
@@ -847,7 +903,7 @@ BufferCache::View BufferCache::acquire(std::uint64_t address, std::size_t bytes,
                 if (compared == GuestMemory::Compare::Unmapped) return Refuse(Refusal::Unmapped);
                 if (compared == GuestMemory::Compare::Differs) {
                     if (pending(mirror->bound[index])) return Refuse(Refusal::Busy);
-                    if (GuestMemory::CopyMapped(low, std::span<std::byte>(part, length)) != GuestMemory::Compare::Equal) return Refuse(Refusal::Unmapped);
+                    if (!copyInput(low, std::span<std::byte>(part, length), dirtyFirst)) return Refuse(Refusal::Unmapped);
                     add(counted.bytes, length);
                     copiedBytes += length;
                     ++copiedPages;
@@ -870,7 +926,7 @@ BufferCache::View BufferCache::acquire(std::uint64_t address, std::size_t bytes,
             auto run = page + 1;
             while (run < stopPage && ((granule.valid >> run) & 1u) == 0 && !shared(base + run * PageBytes) && !pending(mirror->bound[index + (run - page)])) ++run;
             const auto length = static_cast<std::size_t>(run - page) * static_cast<std::size_t>(PageBytes);
-            if (GuestMemory::CopyMapped(guest, std::span<std::byte>(target, length)) != GuestMemory::Compare::Equal) return Refuse(Refusal::Unmapped);
+            if (!copyInput(guest, std::span<std::byte>(target, length), dirtyFirst)) return Refuse(Refusal::Unmapped);
             for (auto bit = page; bit < run; ++bit) granule.valid = static_cast<std::uint16_t>(granule.valid | (1u << bit));
             add(counted.pages, run - page);
             add(counted.bytes, length);
@@ -1047,7 +1103,7 @@ BufferCache::View BufferCache::ringInput(std::uint64_t address, std::size_t byte
         position = from;
     }
     auto& chunk = *ring[ringAt];
-    if (GuestMemory::CopyMapped(address + from, std::span<std::byte>(chunk.backing.bytes + position, span)) != GuestMemory::Compare::Equal) return Refuse(Refusal::Unmapped);
+    if (!copyInput(address + from, std::span<std::byte>(chunk.backing.bytes + position, span), true)) return Refuse(Refusal::Unmapped);
     ringUsed = position + span;
     chunk.serial = std::max(chunk.serial, serial);
     entry.address = address;
@@ -1083,7 +1139,7 @@ BufferCache::View BufferCache::looseInput(std::uint64_t address, std::size_t byt
         return Refuse(Refusal::Allocation);
     }
     if (backing.bytes == nullptr || backing.handle == VK_NULL_HANDLE) return Refuse(Refusal::Allocation);
-    if (GuestMemory::CopyMapped(address + from, std::span<std::byte>(backing.bytes + from, bytes - from)) != GuestMemory::Compare::Equal) return Refuse(Refusal::Unmapped);
+    if (!copyInput(address + from, std::span<std::byte>(backing.bytes + from, bytes - from), true)) return Refuse(Refusal::Unmapped);
     View view;
     view.handle = backing.handle;
     view.bytes = backing.bytes;
@@ -1103,8 +1159,14 @@ BufferCache::View BufferCache::looseInput(std::uint64_t address, std::size_t byt
 }
 
 void BufferCache::VerifyInput(const View& view, std::uint64_t address, std::size_t bytes, std::size_t from) {
-    if (!view || from >= bytes || view.served == Served::Tracked || view.served == Served::Copied) return;
+    if (!view || from >= bytes || view.served == Served::Tracked) return;
     auto& counted = counters();
+    if (view.served == Served::Copied) {
+        add(counted.inputCopiesVerified);
+        if (GuestMemory::CompareMapped(address + from, std::span<const std::byte>(view.bytes + from, bytes - from)) != GuestMemory::Compare::Differs) return;
+        if (counted.inputCopyDiffers.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[buffer-cache] APS5_VERIFY_DIRTY_FIRST_INPUTS: the copy of 0x%llx+0x%zx made for this draw differs from guest memory\n", static_cast<unsigned long long>(address), bytes);
+        return;
+    }
     add(counted.inputVerified);
     if (GuestMemory::CompareMapped(address + from, std::span<const std::byte>(view.bytes + from, bytes - from)) != GuestMemory::Compare::Differs) return;
     if (view.served == Served::Clean) {

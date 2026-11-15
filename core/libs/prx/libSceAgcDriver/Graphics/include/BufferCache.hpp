@@ -81,6 +81,8 @@ public:
 
     enum class Runs : std::uint8_t { Environment, Off, Short, Long };
 
+    enum class InputCopies : std::uint8_t { Environment, Direct, System };
+
     class LabelMark {
     public:
         LabelMark();
@@ -164,6 +166,12 @@ public:
         std::uint64_t drawRuns = 0;
         std::array<std::uint64_t, RunEnds> runEnds{};
         std::uint64_t runsKept = 0;
+        std::uint64_t inputDirect = 0;
+        std::uint64_t inputDirectBytes = 0;
+        std::uint64_t inputChecked = 0;
+        std::uint64_t inputUnreadable = 0;
+        std::uint64_t inputCopiesVerified = 0;
+        std::uint64_t inputCopyDiffers = 0;
     };
 
     BufferCache(Allocate allocate, Executed executed, Source& source);
@@ -182,6 +190,8 @@ public:
     static bool LongRuns();
     static void SetDrawRunsForTest(Runs runs);
     static std::uint64_t DrawRun();
+    static bool DirectInputCopies();
+    static void SetInputCopiesForTest(InputCopies copies);
     static bool Arming();
     static bool Streaming();
     static void NoteStreamed(std::size_t bytes);
