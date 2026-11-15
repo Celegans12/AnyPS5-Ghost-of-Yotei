@@ -1109,6 +1109,10 @@ BufferWordPositionCounts BufferWordPositions(std::span<const std::pair<std::uint
         }
         const auto source = code / 8u;
         const auto dword = code % 8u;
+        if (dword != 0u && dword != 2u) {
+            ++counts.frozen;
+            continue;
+        }
         targets.clear();
         bool written = false, mismatched = false;
         for (std::uint32_t binding = 0; binding < bindings.size(); ++binding) {
@@ -1118,7 +1122,7 @@ BufferWordPositionCounts BufferWordPositions(std::span<const std::pair<std::uint
                 const auto resource = bound.bufferResources[element];
                 if (resource >= bufferSources.size() || bufferSources[resource] != source) continue;
                 const auto slot = element * 4u + dword;
-                if (dword >= 3u || bound.guestDescriptor.size() != bound.bufferResources.size() * 4u || element >= bound.bufferWritten.size() || bound.bufferWritten[element]) {
+                if (bound.guestDescriptor.size() != bound.bufferResources.size() * 4u || element >= bound.bufferWritten.size() || bound.bufferWritten[element]) {
                     written = true;
                     continue;
                 }

@@ -201,7 +201,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 namespace {
 
 struct BufferWordCounters {
-    std::atomic<std::uint64_t> leaves{0}, positions{0}, unmapped{0}, unbound{0}, written{0}, mismatched{0}, stages{0}, words{0}, refused{0}, userLeaves{0}, userTagged{0};
+    std::atomic<std::uint64_t> leaves{0}, positions{0}, unmapped{0}, unbound{0}, written{0}, mismatched{0}, stages{0}, words{0}, refused{0}, userLeaves{0}, userTagged{0}, frozen{0};
 };
 
 BufferWordCounters& bufferWordCounters() {
@@ -211,7 +211,7 @@ BufferWordCounters& bufferWordCounters() {
 
 }
 
-void NoteBufferWordPositions(std::size_t leaves, std::size_t positions, std::uint64_t unmapped, std::uint64_t unbound, std::uint64_t written, std::uint64_t mismatched) {
+void NoteBufferWordPositions(std::size_t leaves, std::size_t positions, std::uint64_t unmapped, std::uint64_t unbound, std::uint64_t written, std::uint64_t mismatched, std::uint64_t frozen) {
     auto& counters = bufferWordCounters();
     counters.leaves.fetch_add(leaves, std::memory_order_relaxed);
     counters.positions.fetch_add(positions, std::memory_order_relaxed);
@@ -219,6 +219,7 @@ void NoteBufferWordPositions(std::size_t leaves, std::size_t positions, std::uin
     counters.unbound.fetch_add(unbound, std::memory_order_relaxed);
     counters.written.fetch_add(written, std::memory_order_relaxed);
     counters.mismatched.fetch_add(mismatched, std::memory_order_relaxed);
+    counters.frozen.fetch_add(frozen, std::memory_order_relaxed);
 }
 
 void NoteBufferWordReuse(std::size_t words, bool accepted) {
@@ -240,7 +241,7 @@ void NoteUserLeafWords(std::size_t planned, std::uint64_t tagged) {
 BufferWordCounts BufferWordTotals() {
     const auto& counters = bufferWordCounters();
     const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
-    return {load(counters.leaves), load(counters.positions), load(counters.unmapped), load(counters.unbound), load(counters.written), load(counters.mismatched), load(counters.stages), load(counters.words), load(counters.refused), load(counters.userLeaves), load(counters.userTagged)};
+    return {load(counters.leaves), load(counters.positions), load(counters.unmapped), load(counters.unbound), load(counters.written), load(counters.mismatched), load(counters.stages), load(counters.words), load(counters.refused), load(counters.userLeaves), load(counters.userTagged), load(counters.frozen)};
 }
 
 void Driver::recordStageBufferPositions(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture, const std::vector<Graphics::DecodeRead>& decodeReads) {
@@ -273,7 +274,7 @@ void Driver::recordStageBufferPositions(DispatchVariant& variant, const ShaderRe
     variant.bufferSlots.resize(kept);
     variant.maskPositions.clear();
     std::merge(variant.dataPositions.begin(), variant.dataPositions.end(), variant.bufferPositions.begin(), variant.bufferPositions.end(), std::back_inserter(variant.maskPositions));
-    NoteBufferWordPositions(capture.readTrace.descriptorLeaves.size(), kept, counts.unmapped, counts.unbound, counts.written, counts.mismatched);
+    NoteBufferWordPositions(capture.readTrace.descriptorLeaves.size(), kept, counts.unmapped, counts.unbound, counts.written, counts.mismatched, counts.frozen);
 }
 
 void Driver::recordStageDataPositions(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture, const std::vector<Graphics::DecodeRead>& decodeReads) {
