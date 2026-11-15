@@ -204,6 +204,26 @@ void StageDataHitsRefreshTheirWords(bool libraries) {
     Require(BrightestColorByte() == 255, mode + ": the draw of constant 1.0 wrote " + std::to_string(BrightestColorByte()) + ", expected 255");
 }
 
+void MovedConstantsReuseTheStage(bool libraries) {
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
+    const bool reuses = std::getenv("APS5_NO_DRAW_STAGE_DATA_HITS") == nullptr && std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") == nullptr && std::getenv("APS5_VERIFY_DRAW_ENTRIES") == nullptr && std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr;
+    alignas(256) static std::array<float, 4> moved{};
+    moved[0] = 0.5f;
+    PixelConstant[0] = 1.0f;
+    static_cast<void>(SubmitConstantDraws(3));
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto constant = reinterpret_cast<std::uintptr_t>(moved.data());
+    ColorMemory.fill(std::byte{0});
+    const auto after = Submit(Draws(32.0f, TriangleVertexCode.data(), 0, ConstantPixelCode.data(), 2, {{static_cast<std::uint32_t>(constant), static_cast<std::uint32_t>(constant >> 32u)}}));
+    Require(BrightestColorByte() >= 126 && BrightestColorByte() <= 129, mode + ": a draw whose constant pointer moved to a table holding 0.5 wrote " + std::to_string(BrightestColorByte()) + ", expected 127 or 128");
+    const auto compiled = after.dataStagesCompiled - before.dataStagesCompiled;
+    const auto reused = after.dataStagesReused - before.dataStagesReused;
+    if ((static_cast<std::uint64_t>(constant) >> 32u) != (reinterpret_cast<std::uintptr_t>(PixelConstant.data()) >> 32u) || verify) return;
+    if (reuses) Require(compiled == 0 && reused == 2, mode + ": a draw whose constant table moved and holds another constant, which the pixel stage only passes to the shader, built " + std::to_string(compiled) + " stages and reused " + std::to_string(reused) + ", expected both reused with the constant patched");
+    else Require(compiled >= 1, mode + ": with the stage data hits, the shape user words or the descriptor leaves off, a draw whose constant table moved and changed reused its pixel stage");
+}
+
 void RefreshedStageDataVerifies() {
     Registered(TriangleVertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
     Registered(ConstantPixelHeader, ConstantPixelCode.data(), sizeof(ConstantPixelCode), 1);
@@ -482,6 +502,7 @@ int main(int argc, char** argv) {
             ThirdDrawHitsTheCache(libraries);
             UserDataDrawsReuseTheirShape(libraries);
             StageDataHitsRefreshTheirWords(libraries);
+            MovedConstantsReuseTheStage(libraries);
             RetainedPixelCacheTransitions();
             CpuPathIndirectDrawsAreCachedWhenAsked(libraries);
             RecordsKeepThePacketsFragmentWord(libraries);

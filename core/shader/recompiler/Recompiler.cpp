@@ -558,7 +558,7 @@ std::uint64_t resourcePlanBytes(const IrResourcePlan& plan) {
         if (value.Arguments().capacity() > IrOperands::InlineCapacity) total += static_cast<std::uint64_t>(value.Arguments().capacity()) * sizeof(IrValue*);
         total += bytes(value.OperandUses());
     }
-    total += bytes(plan.blockStorage) + bytes(plan.memoryInfo) + bytes(plan.descriptorSources) + bytes(plan.controlFlow) + bytes(plan.materializationSources) + bytes(plan.srtReads) + bytes(plan.guardedSrtSlots) + bytes(plan.cleanFlatSlots) + bytes(plan.pureFlatSlots) + bytes(plan.descriptorLeafDwords);
+    total += bytes(plan.blockStorage) + bytes(plan.memoryInfo) + bytes(plan.descriptorSources) + bytes(plan.controlFlow) + bytes(plan.materializationSources) + bytes(plan.srtReads) + bytes(plan.guardedSrtSlots) + bytes(plan.cleanFlatSlots) + bytes(plan.pureFlatSlots) + bytes(plan.descriptorLeafDwords) + bytes(plan.descriptorUserWords);
     total += bytes(plan.compact.values) + bytes(plan.compact.arguments) + bytes(plan.compact.sourceDwords) + bytes(plan.compact.srtReads) + bytes(plan.compact.conditions);
     return total;
 }

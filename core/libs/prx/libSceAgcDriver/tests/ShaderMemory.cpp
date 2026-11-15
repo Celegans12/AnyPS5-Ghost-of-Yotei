@@ -262,7 +262,7 @@ void verifyFrontendProgram(const ShaderRecompiler::IrProgram& reused, const Shad
     const auto& left = reused.Resources();
     const auto& right = fresh.Resources();
     require(left.stage == right.stage && left.shaderHash == right.shaderHash && left.userDataBase == right.userDataBase && left.userDataCount == right.userDataCount && left.srgbDecodeFormats == right.srgbDecodeFormats, "frontend pair: resource identity changed");
-    require(left.memoryInfo == right.memoryInfo && left.materializationSources == right.materializationSources && left.guardedSrtSlots == right.guardedSrtSlots && left.srtGuardOffset == right.srtGuardOffset && left.cleanFlatSlots == right.cleanFlatSlots && left.pureFlatSlots == right.pureFlatSlots && left.descriptorLeafDwords == right.descriptorLeafDwords, "frontend pair: resource planning changed");
+    require(left.memoryInfo == right.memoryInfo && left.materializationSources == right.materializationSources && left.guardedSrtSlots == right.guardedSrtSlots && left.srtGuardOffset == right.srtGuardOffset && left.cleanFlatSlots == right.cleanFlatSlots && left.pureFlatSlots == right.pureFlatSlots && left.descriptorLeafDwords == right.descriptorLeafDwords && left.descriptorUserWords == right.descriptorUserWords, "frontend pair: resource planning changed");
     require(left.descriptorSources.size() == right.descriptorSources.size() && left.srtReads.size() == right.srtReads.size(), "frontend pair: resource counts changed");
     for (std::size_t index = 0; index < left.descriptorSources.size(); ++index) {
         const auto& a = left.descriptorSources[index];
@@ -3017,6 +3017,39 @@ void verifyDescriptorLeafDwords() {
     plan.requiresSpecializationMemory = false;
     plan.srtPlanComplete = false;
     require(Detail::ComputeDescriptorLeafDwords(plan) == Leaves{0}, "descriptor leaf dwords: an incomplete SRT plan was not disqualified");
+    plan.srtPlanComplete = true;
+
+    using Words = std::vector<std::uint32_t>;
+    auto& base = userData(8);
+    auto& high = userData(9);
+    auto& size = userData(10);
+    DescriptorSource held;
+    held.dwordCount = 4;
+    held.dwords = {&base, &high, &size, &userData(11)};
+    plan.descriptorSources.push_back(held);
+    BufferResource user;
+    user.source = 1;
+    plan.info.buffers.push_back(user);
+    require(Detail::ComputeDescriptorUserWords(plan) == Words{8, 8, 9, 9, 10, 10}, "descriptor user words: the base, high and size dwords a buffer source takes from user words of their own are not listed");
+    plan.userDataBase = 8;
+    require(Detail::ComputeDescriptorUserWords(plan) == Words{8, 0, 9, 1, 10, 2}, "descriptor user words: a user word is not counted from the plan's user-data base");
+    plan.userDataBase = 0;
+    plan.srtReads.push_back({&rawRead(handle(userData(8), userData(12)), 0), 5});
+    require(Detail::ComputeDescriptorUserWords(plan) == Words{9, 9, 10, 10}, "descriptor user words: a user word another read uses as a pointer stayed listed");
+    plan.srtReads.pop_back();
+    plan.controlFlow.push_back({&size, {}, {}});
+    require(Detail::ComputeDescriptorUserWords(plan) == Words{8, 8, 9, 9}, "descriptor user words: a user word a control-flow condition reads stayed listed");
+    plan.controlFlow.clear();
+    plan.descriptorSources[1].dwords[1] = &base;
+    require(Detail::ComputeDescriptorUserWords(plan) == Words{10, 10}, "descriptor user words: one user word that fills two dwords stayed listed");
+    plan.descriptorSources[1].dwords[1] = &high;
+    ImageResource sampled;
+    sampled.source = 1;
+    plan.info.images.push_back(sampled);
+    require(Detail::ComputeDescriptorUserWords(plan).empty(), "descriptor user words: a source an image also uses kept its user words");
+    plan.info.images.clear();
+    plan.requiresSpecializationMemory = true;
+    require(Detail::ComputeDescriptorUserWords(plan).empty(), "descriptor user words: specialization memory did not disqualify the plan");
 }
 
 // The pure flat slots of a hand-built plan (Detail::ComputePureFlatSlots): a slot is pure unless

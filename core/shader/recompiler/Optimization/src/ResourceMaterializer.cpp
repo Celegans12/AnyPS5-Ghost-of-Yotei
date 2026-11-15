@@ -2902,6 +2902,7 @@ IrResourcePlan ResourceMaterializer::ExtractPlan(const IrProgram& program) const
     }
     plan.pureFlatSlots = Detail::ComputePureFlatSlots(plan);
     plan.descriptorLeafDwords = Detail::ComputeDescriptorLeafDwords(plan);
+    plan.descriptorUserWords = Detail::ComputeDescriptorUserWords(plan);
     plan.guardedSrtSlots = Detail::ComputeGuardedFlatSlots(plan);
     ownPlanValues(plan);
     buildCompactPlan(plan);

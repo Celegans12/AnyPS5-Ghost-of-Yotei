@@ -114,6 +114,7 @@ public:
     static std::optional<Graphics::IndirectDrawPath> ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect);
     static void tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied = {});
     static void tagUserValueWords(DispatchVariant& variant, const DrawProgram& program);
+    static void tagUserLeafWords(DispatchVariant& variant, const ShaderRecompiler::IrResourcePlan& plan, const DrawProgram& program);
     static std::optional<DrawShapeReuse> shapeUserWordMoves(const DispatchVariant& variant, std::span<const std::uint32_t> was, std::span<const std::uint32_t> now, std::vector<UserWordMove>& moves, std::uint32_t* refused = nullptr);
     static std::shared_ptr<DispatchVariant> movedShapeVariant(const std::shared_ptr<DispatchVariant>& variant, std::span<const UserWordMove> moves);
     static bool shapeVertexInputStages();

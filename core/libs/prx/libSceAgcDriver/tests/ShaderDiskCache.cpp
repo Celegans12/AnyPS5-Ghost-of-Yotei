@@ -2101,6 +2101,7 @@ IrResourcePlan handBuiltPlan() {
     plan.cleanFlatSlots = {0u, 1u};
     plan.pureFlatSlots = {1u, 0u};
     plan.descriptorLeafDwords = {5u};
+    plan.descriptorUserWords = {8u, 3u};
     plan.requiresSpecializationMemory = true;
     plan.srtPlanComplete = true;
     plan.resourceTrackingComplete = true;
@@ -2184,7 +2185,7 @@ bool samePlan(const IrResourcePlan& left, const IrResourcePlan& right) {
     for (std::size_t index = 0; index < left.uniformFill.values.size(); ++index) {
         if (!sameValue(left.uniformFill.values[index], right.uniformFill.values[index])) return false;
     }
-    return left.materializationSources == right.materializationSources && left.guardedSrtSlots == right.guardedSrtSlots && left.srtGuardOffset == right.srtGuardOffset && left.cleanFlatSlots == right.cleanFlatSlots && left.pureFlatSlots == right.pureFlatSlots && left.descriptorLeafDwords == right.descriptorLeafDwords &&
+    return left.materializationSources == right.materializationSources && left.guardedSrtSlots == right.guardedSrtSlots && left.srtGuardOffset == right.srtGuardOffset && left.cleanFlatSlots == right.cleanFlatSlots && left.pureFlatSlots == right.pureFlatSlots && left.descriptorLeafDwords == right.descriptorLeafDwords && left.descriptorUserWords == right.descriptorUserWords &&
            left.requiresSpecializationMemory == right.requiresSpecializationMemory && left.srtPlanComplete == right.srtPlanComplete && left.resourceTrackingComplete == right.resourceTrackingComplete && left.info == right.info && left.uniformFill.fill == right.uniformFill.fill;
 }
 
@@ -2562,6 +2563,7 @@ void verifyPlanRoundTrip() {
     require(covers([](const IrResourcePlan& plan) { return !plan.guardedSrtSlots.empty(); }), "no fixture plans a guarded SRT read");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; }); }), "no fixture plans a pure flat slot");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorLeafDwords.begin(), plan.descriptorLeafDwords.end(), [](std::uint8_t dwords) { return dwords != 0u; }); }), "no fixture plans a descriptor leaf dword");
+    require(covers([](const IrResourcePlan& plan) { return !plan.descriptorUserWords.empty(); }), "no fixture plans a descriptor dword held in a user word");
 }
 
 void verifyPlanBudget() {

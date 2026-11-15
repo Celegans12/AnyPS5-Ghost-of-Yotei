@@ -201,7 +201,7 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 namespace {
 
 struct BufferWordCounters {
-    std::atomic<std::uint64_t> leaves{0}, positions{0}, unmapped{0}, unbound{0}, written{0}, mismatched{0}, stages{0}, words{0}, refused{0};
+    std::atomic<std::uint64_t> leaves{0}, positions{0}, unmapped{0}, unbound{0}, written{0}, mismatched{0}, stages{0}, words{0}, refused{0}, userLeaves{0}, userTagged{0};
 };
 
 BufferWordCounters& bufferWordCounters() {
@@ -231,10 +231,16 @@ void NoteBufferWordReuse(std::size_t words, bool accepted) {
     counters.words.fetch_add(words, std::memory_order_relaxed);
 }
 
+void NoteUserLeafWords(std::size_t planned, std::uint64_t tagged) {
+    auto& counters = bufferWordCounters();
+    counters.userLeaves.fetch_add(planned, std::memory_order_relaxed);
+    counters.userTagged.fetch_add(tagged, std::memory_order_relaxed);
+}
+
 BufferWordCounts BufferWordTotals() {
     const auto& counters = bufferWordCounters();
     const auto load = [](const std::atomic<std::uint64_t>& counter) { return counter.load(std::memory_order_relaxed); };
-    return {load(counters.leaves), load(counters.positions), load(counters.unmapped), load(counters.unbound), load(counters.written), load(counters.mismatched), load(counters.stages), load(counters.words), load(counters.refused)};
+    return {load(counters.leaves), load(counters.positions), load(counters.unmapped), load(counters.unbound), load(counters.written), load(counters.mismatched), load(counters.stages), load(counters.words), load(counters.refused), load(counters.userLeaves), load(counters.userTagged)};
 }
 
 void Driver::recordStageBufferPositions(DispatchVariant& variant, const ShaderRecompiler::ResourceCapture& capture, const std::vector<Graphics::DecodeRead>& decodeReads) {
@@ -343,6 +349,7 @@ bool Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 appendDecodeRuns(*variant, decodeReads[i]);
                 variant->vertexTableWords = stageCapture.vertexTableWords;
             }
+            if (relocatable && stageCapture.capture != nullptr && stageCapture.capture->plan != nullptr) tagUserLeafWords(*variant, *stageCapture.capture->plan, programs[i]);
             if (relocatable) tagUserValueWords(*variant, programs[i]);
             if (traceDrawCache() && entry != nullptr && matched[i] == nullptr && i < entry->stages.size()) {
                 const auto& variants = entry->stages[i];

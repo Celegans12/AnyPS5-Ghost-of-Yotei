@@ -137,6 +137,43 @@ void Driver::tagUserValueWords(DispatchVariant& variant, const DrawProgram& prog
     }
 }
 
+void Driver::tagUserLeafWords(DispatchVariant& variant, const ShaderRecompiler::IrResourcePlan& plan, const DrawProgram& program) {
+    if (!ShaderRecompiler::DescriptorLeaves() || variant.compiled == nullptr) return;
+    const auto& bindings = variant.compiled->bindings;
+    std::uint64_t tagged = 0;
+    std::vector<std::array<std::uint32_t, 3>> slots;
+    for (std::size_t pair = 0; pair + 1 < plan.descriptorUserWords.size(); pair += 2) {
+        const auto source = plan.descriptorUserWords[pair] / 8u;
+        const auto dword = plan.descriptorUserWords[pair] % 8u;
+        const auto index = plan.descriptorUserWords[pair + 1];
+        if ((dword != 0u && dword != 2u) || index < program.hiddenUserWords || index >= program.userData.size() || index >= 64u) continue;
+        const auto bit = std::uint64_t {1} << index;
+        if (((variant.relocatableWords | variant.valueWords | variant.calleeWords | variant.vertexTableWords) & bit) != 0 || (variant.userWordsAsValue & bit) == 0 || ((variant.userWordsWalked ^ variant.userWordsAsValue) & bit) != 0) continue;
+        slots.clear();
+        bool refused = false;
+        for (std::uint32_t binding = 0; binding < bindings.size() && !refused; ++binding) {
+            const auto& bound = bindings[binding];
+            if (bound.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            for (std::uint32_t element = 0; element < bound.bufferResources.size(); ++element) {
+                const auto resource = bound.bufferResources[element];
+                if (resource >= plan.info.buffers.size() || plan.info.buffers[resource].source != source) continue;
+                const auto slot = element * 4u + dword;
+                const bool readOnly = bound.guestDescriptor.size() == bound.bufferResources.size() * 4u && element < bound.bufferWritten.size() && !bound.bufferWritten[element] && (element >= bound.bufferAtomic.size() || !bound.bufferAtomic[element]);
+                if (!readOnly || bound.guestDescriptor[slot] != program.userData[index] || !ShaderRecompiler::SameBufferSpecialization(std::span<const std::uint32_t, 4>(bound.guestDescriptor.data() + element * 4u, 4), std::span<const std::uint32_t, 4>(bound.guestDescriptor.data() + element * 4u, 4))) {
+                    refused = true;
+                    break;
+                }
+                slots.push_back({index, binding, slot});
+            }
+        }
+        if (refused || slots.empty()) continue;
+        variant.valueWords |= bit;
+        variant.valueSlots.insert(variant.valueSlots.end(), slots.begin(), slots.end());
+        ++tagged;
+    }
+    NoteUserLeafWords(plan.descriptorUserWords.size() / 2u, tagged);
+}
+
 void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied) {
     variant.userWordsWalked = use.asBase | use.asValue;
     variant.userWordsAsValue = use.asValue;
@@ -568,8 +605,14 @@ bool Driver::patchBufferWords(DispatchVariant& variant, std::span<const std::pai
     std::vector<std::array<std::uint32_t, 2>> touched;
     for (const auto& [position, value] : live) {
         const auto [first, last] = std::equal_range(variant.bufferPositions.begin(), variant.bufferPositions.end(), position);
-        if (first == last || position >= variant.words.size()) return false;
+        const auto [dataFirst, dataLast] = std::equal_range(variant.dataPositions.begin(), variant.dataPositions.end(), position);
+        if ((first == last && dataFirst == dataLast) || position >= variant.words.size()) return false;
         variant.words[position] = value;
+        for (auto at = dataFirst; at != dataLast; ++at) {
+            const auto slot = variant.dataSlots[static_cast<std::size_t>(at - variant.dataPositions.begin())];
+            if (variant.flatBinding >= bindings.size() || slot >= bindings[variant.flatBinding].guestDescriptor.size()) return false;
+            variant.descriptorPatches.push_back({variant.flatBinding, slot, value});
+        }
         for (auto at = first; at != last; ++at) {
             const auto& [binding, slot] = variant.bufferSlots[static_cast<std::size_t>(at - variant.bufferPositions.begin())];
             if (binding >= bindings.size() || slot >= bindings[binding].guestDescriptor.size()) return false;
@@ -611,11 +654,12 @@ bool Driver::movedRunsReadEqual(const DispatchVariant& variant, std::span<const 
             const auto count = std::min<std::size_t>(words - done, MaxContentWords);
             if (CopyMoved(begin + done * sizeof(std::uint32_t), std::as_writable_bytes(std::span(read).first(count))) != GuestMemory::Compare::Equal) return false;
             if (std::memcmp(read.data(), variant.words.data() + offset + done, count * sizeof(std::uint32_t)) != 0) {
-                if (live == nullptr || variant.bufferPositions.empty()) return false;
+                const auto& masked = variant.MaskedPositions();
+                if (live == nullptr || masked.empty()) return false;
                 for (std::size_t word = 0; word < count; ++word) {
                     const auto position = static_cast<std::uint32_t>(offset + done + word);
                     if (read[word] == variant.words[position]) continue;
-                    if (!std::binary_search(variant.bufferPositions.begin(), variant.bufferPositions.end(), position)) return false;
+                    if (!std::binary_search(masked.begin(), masked.end(), position)) return false;
                     live->emplace_back(position, read[word]);
                 }
             }

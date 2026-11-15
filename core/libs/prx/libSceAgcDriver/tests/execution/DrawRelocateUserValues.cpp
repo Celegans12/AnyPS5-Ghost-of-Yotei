@@ -301,6 +301,9 @@ int main() {
         }
         MovedRecordCountsReachEveryDescriptor(true);
         MovedRecordCountsReachEveryDescriptor(false);
+        const auto tagged = AgcDriver::DriverDetail::BufferWordTotals();
+        if (std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr) Require(tagged.userLeaves != 0 && tagged.userTagged != 0, "of " + std::to_string(tagged.userLeaves) + " descriptor dwords the resource plans of the drawn stages take from user words of their own, " + std::to_string(tagged.userTagged) + " were tagged as buffer values");
+        else Require(tagged.userTagged == 0, "with the descriptor leaves off, a user word was tagged from the resource plan");
         AgcDriverShutdown_nid_postfix();
         std::cout << "User-data V# values and fetch subroutine pointers relocate\n";
         return 0;

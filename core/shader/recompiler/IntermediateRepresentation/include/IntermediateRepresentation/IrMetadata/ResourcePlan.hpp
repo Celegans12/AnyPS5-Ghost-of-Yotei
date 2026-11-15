@@ -277,6 +277,7 @@ struct IrResourcePlan {
     // Detail::ComputePureFlatSlots): a driver may reuse a capture whose words differ only there.
     std::vector<std::uint8_t> pureFlatSlots;
     std::vector<std::uint8_t> descriptorLeafDwords;
+    std::vector<std::uint32_t> descriptorUserWords;
     bool denseValueIds = false;
     CompactResourcePlan compact;
     bool requiresSpecializationMemory = false;

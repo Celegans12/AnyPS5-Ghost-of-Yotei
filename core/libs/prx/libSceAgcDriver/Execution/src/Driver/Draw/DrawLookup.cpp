@@ -171,7 +171,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             const auto buffers = static_cast<std::size_t>(std::count_if(liveData.begin(), liveData.end(), [&](const std::pair<std::uint32_t, std::uint32_t>& word) { return std::binary_search(variant->bufferPositions.begin(), variant->bufferPositions.end(), word.first); }));
                             if (buffers != 0) {
                                 served = movedShapeVariant(variant, {});
-                                const bool patched = buffers == liveData.size() && patchBufferWords(*served, liveData);
+                                const bool patched = patchBufferWords(*served, liveData);
                                 NoteBufferWordReuse(liveData.size(), patched);
                                 if (!patched) {
                                     outcome = EntryOutcome::Differing;
@@ -319,7 +319,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                                 continue;
                             }
                         }
-                        if (!movedRunsReadEqual(*variant, moves, tables, &liveBuffers)) {
+                        if (!movedRunsReadEqual(*variant, moves, tables, ShaderRecompiler::DescriptorLeaves() ? &liveBuffers : nullptr)) {
                             miss = std::max(miss, DrawShapeMiss::Memory);
                             continue;
                         }
