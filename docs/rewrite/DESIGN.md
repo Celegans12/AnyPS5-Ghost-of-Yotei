@@ -147,31 +147,35 @@ slower on FF and AoM, so only part of the FF and AoM change is real (see "Since 
 | 007 | title screen and menus only; crashes after "continue" (device lost in the first cutscene, or a RenderThread read of 0x40), which predates phases 3 and 4 | 68 to 80 ms once warm; 75 to 100 ms in the first minute | **21 to 25 %** warm | CPU: about 48 ms of dispatch per frame on the main worker, plus the draw committer. GPU is 38 ms per present, of which 22 ms is storage write-back, upload and staging | 4 step 3 (staging); the surface exchange from pool reuse (storage-image sharing, parked); then 5. The crashes are open and set aside |
 | AoM | title screen and the scene after the pad press | 142 to 148 ms | **11 to 12 %** | Title screen: CPU and GPU close. The worker spends about 165 ms per frame in packets (dispatch 95, draws 70) and the GPU 85 to 90 ms per present (profiled) | 5 and 6; phase 4 has little left for it (label stores are gone) |
 
-CPU and GPU cost per unit of work, in microseconds (profiled scene runs, late 10-second
-intervals; phase 6 aims at 20 us of CPU per draw):
+CPU and GPU cost per unit of work, in microseconds (one profiled scene per title on
+`libs\k25`, the current build, late 10-second intervals; phase 6 aims at 20 us of CPU per
+draw):
 
-| Title | Draws / dispatches per frame | CPU per draw, worker | of it recording | direct stage | CPU per dispatch | GPU per draw or dispatch | Worker per frame | GPU per present |
+| Title | Draws / dispatches per frame | CPU per draw, worker | of it recording | direct stage | CPU per dispatch | GPU per draw or dispatch | Worker per frame | GPU time per present |
 |---|---|---|---|---|---|---|---|---|
-| FF | 615 / about 150 | 24 us | 20 us | 8.2 us | about 80 us | 21 us | 15.0 ms draws, 12.4 ms dispatches | 16.4 ms |
-| LEGO | 1,209 / about 115 | 14 us | 11 us | 2.9 us | not broken out | 33 us | 16.5 ms draws | 43.2 ms |
-| 007 | 468 / about 140 | 39 us | 17 us | 14.1 us | about 380 us | 107 us | 18.4 ms draws, 52 ms dispatches | 65 ms |
-| AoM | 615 / about 110 | 143 us | 25 us | 31.1 us | about 930 us | 121 us | 88 ms draws, 104 ms dispatches | 88 ms |
+| FF | 614 / 197 | 23 us | 19 us | 7.6 us | 62 us | 4.3 us | 13.9 ms draws, 12.3 ms dispatches | 3.5 ms |
+| LEGO | 1,198 / 114 | 13 us | 9 us | 2.8 us | 92 us | 24 us | 15.1 ms draws, 10.5 ms dispatches | 31.0 ms |
+| 007 | 468 / 95 | 41 us | 16 us | 13.9 us | 624 us | 67 us | 19.0 ms draws, 59 ms dispatches | 37.7 ms |
+| AoM | 623 / 118 | 106 us | 20 us | 28.4 us | 808 us | 48 us | 66 ms draws, 95 ms dispatches | 35.5 ms |
 
 - CPU per draw is the worker's draw time per frame (`Packet.draw`) over the draws per frame;
   "recording" is the `[draws]` recorded average and "direct stage" the `[direct-draw]` average
-  per stage. CPU per dispatch is `Packet.dispatch` over the dispatches per frame; the dispatch
-  count per frame is estimated from the cumulative `[dispatch]` count over the run, so those
-  two columns are approximate. GPU per draw or dispatch is the `gpu` time per present over
-  draws plus dispatches.
-- Reading: FF and LEGO are near the per-draw target on the CPU (24 and 14 us); 007 and AoM are
-  not, and for both the dispatch path costs more per frame than the draw path (007 52 against
-  18 ms, AoM 104 against 88 ms). AoM's draw cost is stage preparation (143 us per draw with
-  25 us of recording). On the GPU, 007 and AoM pay about four times as much per unit as FF.
-- Runs used: FF `runs\FF\cmp-i4b-FF` and LEGO `runs\LEGO\i4-LEGO` (`libs\i4`), 007
-  `runs\007\j3ns-off-007` (`libs\j3`, unit shadows off), AoM `runs\AoM\k10p-traps-AoM`
-  (`libs\k10`, traps before their fixes). They are profiled, so their frame times are higher
-  than the table above, and none is on `libs\k24`: one profiled scene per title on the current
-  build would replace them.
+  per stage. CPU per dispatch is `Packet.dispatch` over queue 0's dispatches per frame (direct
+  and indirect, counted by the `[lock]` line; dispatches on other queues are not in the
+  count). GPU time is the `[gputime]` total (`APS5_PROFILE_GPU=1`) per present, and GPU per
+  draw or dispatch divides it by draws plus dispatches.
+- GPU time is not the GPU-busy span: the span from the first to the last command of a present
+  is 15.6 ms on FF, 38.8 on LEGO, 63.5 on 007 and 84 to 134 on AoM. FF, 007 and AoM leave
+  the GPU waiting for the CPU inside that span (FF 3.5 ms of work in 15.6 ms); LEGO does not
+  (31 of 39 ms), which is what GPU-bound means here.
+- Reading: FF and LEGO are near the per-draw target on the CPU (23 and 13 us); 007 and AoM are
+  not, and for both the dispatch path costs more per frame than the draw path (007 59 against
+  19 ms, AoM 95 against 66 ms). A dispatch costs 0.6 to 0.8 ms of CPU on those two against
+  0.06 to 0.09 ms on FF and LEGO. AoM's draw cost is stage preparation (106 us per draw with
+  20 us of recording).
+- Runs: `runs\ff\k25p-ff`, `runs\lego\k25p-lego`, `runs\007\k25p-007` (`libs\k25`) and
+  `runs\aom\k24p-aom` (`libs\k24`, the same code for AoM). Profiled, so their frame times
+  (FF 36.7, LEGO 47.9, 007 77.8, AoM 156 to 168 ms) are above the unprofiled table.
 Since the last table (same day, before phase 4):
 
 - **007: 160 to 221 ms then, 68 to 80 ms now.** Real, and the largest change of the phase:
@@ -186,9 +190,11 @@ Since the last table (same day, before phase 4):
 - **AoM: 155 to 163 ms then, 142 to 148 ms now.** Part harness; the label read traps add 2 to
   6 % (three back-to-back pairs).
 
-What the numbers rest on: AoM is timed on the current build (`libs\k23`, traps on). 007, FF
-and LEGO were last timed on `libs\k8`, before the last three trap fixes, and are equal with and
-without traps there; one round on `libs\k24` is owed. Frame times move by a few percent with
+What the numbers rest on: AoM is timed on `libs\k23` and 007 on `libs\k25` (three pairs: 67
+to 79 ms after the first minute with traps off, 70 to 77 with them on, each with single
+intervals near 95), both with the label read traps on. FF and LEGO were last timed unprofiled
+on `libs\k8`, equal with and without traps there. `libs\k24` deadlocked 007 at startup (a
+lock order in the trap code); `libs\k25` (538c042e6c) fixes it. Frame times move by a few percent with
 machine load, so the ranges are from back-to-back runs. "Bound by" for FF and LEGO is from
 profiles taken before phase 4 and was not measured again.
 
