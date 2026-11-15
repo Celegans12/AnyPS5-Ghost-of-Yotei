@@ -92,7 +92,7 @@ static_assert(sizeof(ShaderInvocation) == 216, "ShaderInvocation changed: update
 #if defined(__cpp_lib_atomic_shared_ptr)
 static_assert(sizeof(RecompileResult) == 552, "RecompileResult changed: update EncodeResult and DecodeResult");
 #endif
-static_assert(sizeof(DescriptorBinding) == 864, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 888, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
@@ -109,7 +109,7 @@ static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: u
 static_assert(sizeof(BindingAllocationResult) == 184, "BindingAllocationResult changed: update the allocation encoder");
 static_assert(sizeof(CompiledBindingLayout) == 88, "CompiledBindingLayout changed: update the allocation encoder");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
-static_assert(sizeof(IrResourcePlan) == 728, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(sizeof(IrResourcePlan) == 776, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(sizeof(IrValue) == 144, "IrValue changed: update the plan value encoder");
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
@@ -483,6 +483,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Values(std::span<const std::uint64_t>(binding.imageSamplers));
     writer.Flags(binding.bufferRead);
     writer.Values(std::span<const std::uint32_t>(binding.bufferExtent));
+    writer.Values(std::span<const std::uint32_t>(binding.bufferResources));
 }
 
 void decodeBinding(Reader& reader, DescriptorBinding& binding) {
@@ -512,6 +513,7 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Values(binding.imageSamplers);
     reader.Flags(binding.bufferRead);
     reader.Values(binding.bufferExtent);
+    reader.Values(binding.bufferResources);
 }
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
