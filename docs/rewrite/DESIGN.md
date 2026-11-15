@@ -271,9 +271,16 @@ buffer regions often span two mappings and no single import served them. Found a
   and their refreshes still waited ("storage refresh" 325 waits against 45: a refresh with
   pending units of its own may not flush in order; `APS5_TRACE_REFRESH_ORDER=1` prints why).
 - Unit shadows off (`APS5_NO_UNIT_SHADOW=1`, same build, `libs\k1`) was the steadiest 007
-  configuration above, and in one run each (shadows-on run first, so order may count): FF 34.5
-  to 30.9 ms, LEGO 48.6 to 47.6, AoM 150.8 to 146.8. The shadow is step 1's mechanism, so the
-  default is unchanged; whether step 1 as built pays for itself is open for the user.
+  configuration above. The other titles do not care (two runs each, order swapped): FF 34.5 and
+  32.1 on, 30.9 and 31.9 off (the 34.5 was the first run after a build); LEGO 48.6 and 48.2 on,
+  47.6 and 48.7 off; AoM 150.8 and 146.5 on, 146.8 and 146.5 off. The shadow is step 1's
+  mechanism and step 2 builds on it, so the default is unchanged.
+- Probe for step 2 (`agc_driver_no_access_import_probe_tests`, RTX 5080): a GPU store through
+  an existing host import lands while the imported pages are read-only or no-access for the
+  process. So a GPU-owned block can keep its import, be no-access for the guest, and be stored
+  by the GPU before the pages are opened. The read-trap interface the driver already uses on
+  macOS (`GuestWriteWatchTrapReads`, resolver thread, bypass for the GPU mutex holder; label
+  surfaces only) is a stub on Windows; step 2 starts by implementing it in `WindowsMappings`.
 - f8e0ee64d4: eight `thread_local` caches of the direct path had destructors; the draw committer
   crashed in one at thread exit (`agc_driver_village_draw_cost` hung in 9 of 120 runs with
   section A off). They use `ThreadScratch` now; 150 of 150 runs pass.
