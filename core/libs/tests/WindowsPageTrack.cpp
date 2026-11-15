@@ -138,7 +138,7 @@ void CheckHolds() {
     track.Import(memory.Block(2), memory.Block(2) + PageBytes);
     Require(!track.Armable(memory.Block(2)) && memory.Protection(2) == PAGE_READWRITE, "an import did not reopen its block for good");
     Require(track.Arm(memory.Block(3)), "cannot arm a block");
-    track.Bar(memory.Block(3), memory.Block(3) + PageBytes);
+    track.Bar(memory.Block(3), memory.Block(3) + PageBytes, GuestArena::PageTrackOrigin::Protect);
     Require(!track.Armable(memory.Block(3)) && memory.Protection(3) == PAGE_READWRITE, "a barred block stays armed");
     track.Forget(memory.Block(2), memory.Block(3) + BlockBytes);
     Require(track.Armable(memory.Block(2)) && track.Armable(memory.Block(3)), "forgetting a range kept its imports or bars");
