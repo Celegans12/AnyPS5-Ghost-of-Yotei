@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawSites.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/MovedRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
@@ -482,6 +483,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     reportedBreaks = breaks;
     const auto contentRecipes = DriverDetail::ContentRecipesHeld();
     AgcDriver::ProfilePrint_nid_no_patch("%s", VulkanDevice::DrawRecipeDrawsReport(contentRecipes.held, contentRecipes.evicted).c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("%s", MovedReadsReport().c_str());
     if (DrawSiteAccess::Enabled()) AgcDriver::ProfilePrint_nid_no_patch("%s", DrawSiteAccess::Report().c_str());
     static GuestMemory::LockCounts reportedLocks{};
     const auto locks = GuestMemory::LockCounted();

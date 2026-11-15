@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawSites.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/MovedRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -152,7 +153,7 @@ bool readWords(const QueueState& queue, const DrawSiteStagePlan& plan, DrawSiteS
 }
 
 bool readRun(std::uint64_t address, std::span<std::uint32_t> out) {
-    return GuestMemory::CopyMapped(address, std::as_writable_bytes(out)) == GuestMemory::Compare::Equal;
+    return CopyMoved(address, std::as_writable_bytes(out)) == GuestMemory::Compare::Equal;
 }
 
 bool runEquals(std::uint64_t address, std::span<const std::uint32_t> kept) {

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/MovedRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
 #include <cstring>
@@ -82,7 +83,7 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
         thread_local std::vector<std::byte>* liveSlot = nullptr;
         auto& live = ShaderRecompiler::ThreadOwned(liveSlot);
         live.resize(region.bytes.size());
-        const auto copied = GuestMemory::CopyMapped(region.guestAddress, live);
+        const auto copied = CopyMoved(region.guestAddress, live);
         if (copied != GuestMemory::Compare::Equal) return copied;
         const auto count = region.bytes.size() / sizeof(std::uint32_t);
         for (std::size_t i = 0; i < count; ++i) {

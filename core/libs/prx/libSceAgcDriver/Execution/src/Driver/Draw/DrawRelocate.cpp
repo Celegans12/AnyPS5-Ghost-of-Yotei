@@ -2,6 +2,7 @@
 #include "ControlFlow/GraphBuilder.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/MovedRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
@@ -51,7 +52,7 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
         for (std::size_t done = 0; done < words; done += MaxContentWords) {
             const auto count = std::min<std::size_t>(words - done, MaxContentWords);
             const auto address = (static_cast<std::uint64_t>(word.high) << 32u) + AlignedWord(value) + static_cast<std::uint64_t>(offset) + done * sizeof(std::uint32_t);
-            if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(content).first(count))) != GuestMemory::Compare::Equal) {
+            if (CopyMoved(address, std::as_writable_bytes(std::span(content).first(count))) != GuestMemory::Compare::Equal) {
                 readable = false;
                 return hash;
             }
@@ -573,7 +574,7 @@ bool Driver::movedRunsReadEqual(const DispatchVariant& variant, std::span<const 
         }
         for (std::size_t done = 0; done < words; done += MaxContentWords) {
             const auto count = std::min<std::size_t>(words - done, MaxContentWords);
-            if (GuestMemory::CopyMapped(begin + done * sizeof(std::uint32_t), std::as_writable_bytes(std::span(live).first(count))) != GuestMemory::Compare::Equal) return false;
+            if (CopyMoved(begin + done * sizeof(std::uint32_t), std::as_writable_bytes(std::span(live).first(count))) != GuestMemory::Compare::Equal) return false;
             if (std::memcmp(live.data(), variant.words.data() + offset + done, count * sizeof(std::uint32_t)) != 0) return false;
         }
         offset += words;
