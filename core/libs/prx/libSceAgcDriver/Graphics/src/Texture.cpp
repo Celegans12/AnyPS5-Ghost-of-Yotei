@@ -6982,6 +6982,15 @@ StorageTexture::CreationHandOver StorageTexture::PrepareCreation(const Context& 
     CreationHandOver handOver;
     const auto storeFirst = [&] {
         const bool dirty = detached != nullptr && detached->Dirty();
+        // Debug aid: APS5_TRACE_STORAGE_CREATE=1 names the pending images a new image is made over.
+        static const bool traceOver = std::getenv("APS5_TRACE_STORAGE_CREATE") != nullptr;
+        if (traceOver) {
+            for (const auto& other : overlappingPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+                std::fprintf(stderr, "[storage-over] new 0x%llx+0x%llx %ux%u format %u tile %d over pending 0x%llx+0x%llx %ux%u format %u tile %d mips %u\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), descriptor.width,
+                    descriptor.height, descriptor.format, static_cast<int>(descriptor.tileMode), static_cast<unsigned long long>(other->descriptor.baseAddress), static_cast<unsigned long long>(other->guestBytes), other->descriptor.width, other->descriptor.height, other->descriptor.format,
+                    static_cast<int>(other->descriptor.tileMode), other->descriptor.mipCount);
+            }
+        }
         if (detached != nullptr) detached->Flush();
         flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) || dirty;
         return CreationHandOver();
