@@ -150,7 +150,11 @@ public:
                 else upload.view[block] = 1;
             } else if (held != 0 && changed.view[block] == GuestMemory::BlockUnchanged) {
                 written[block] = 0;
-                if (current.view[block] != 0) tokens[block] = current.view[block] | BufferCache::ArmedToken;
+                if (current.view[block] != 0) {
+                    const auto base = (address / BufferCache::GranuleBytes + block) * BufferCache::GranuleBytes;
+                    std::uint8_t whole = GuestMemory::BlockWritten;
+                    if (GuestMemory::CollectWritesUncached(base, static_cast<std::size_t>(BufferCache::GranuleBytes)) != 0 && GuestMemory::ChangedBlocks(base, static_cast<std::size_t>(BufferCache::GranuleBytes), std::span<const std::uint64_t>(&held, 1), std::span<std::uint8_t>(&whole, 1)) && whole == GuestMemory::BlockUnchanged) tokens[block] = current.view[block] | BufferCache::ArmedToken;
+                }
             } else {
                 upload.view[block] = 1;
             }
