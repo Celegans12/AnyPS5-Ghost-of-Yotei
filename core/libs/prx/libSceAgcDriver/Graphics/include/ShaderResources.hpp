@@ -112,7 +112,7 @@ struct DrawProofStamp {
     DrawProofStamp Legacy() const;
     bool operator==(const DrawProofStamp&) const = default;
 };
-enum class DrawProofKind : std::size_t { Resources, Targets, Count };
+enum class DrawProofKind : std::size_t { Resources, Targets, Depth, Count };
 enum class DrawProofMiss : std::size_t { None, Epoch, Serial, Registry, DepthSurfaces, Unwatch, Images, DepthPlanes, Imports, Staging, Target, Evicted, InputTwins, Structure, Versions, Sweep, Audit, Count };
 struct DrawProofKindCounts {
     std::uint64_t reused = 0;

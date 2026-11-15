@@ -34,6 +34,16 @@ DepthPlaneStoreStatistics DepthPlaneStoreCounts();
 void NoteDepthSurfaceWrite(const Context& context, const DepthTarget& target);
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples);
 std::uint64_t DepthSurfacesSerial();
+struct DepthViewCounts {
+    std::uint64_t calls = 0;
+    std::uint64_t depthSyncs = 0;
+    std::uint64_t quietDepthSyncs = 0;
+    std::uint64_t stencilSyncs = 0;
+    std::uint64_t quietStencilSyncs = 0;
+    std::uint64_t htileChecks = 0;
+    std::uint64_t quietHtileChecks = 0;
+};
+DepthViewCounts TakeDepthViewCounts();
 std::uint64_t DepthSurfacesReleased();
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
 bool DirectDepthCopy(const Context& context, VkFormat depthFormat, VkImageAspectFlagBits aspect, VkFormat colorFormat);

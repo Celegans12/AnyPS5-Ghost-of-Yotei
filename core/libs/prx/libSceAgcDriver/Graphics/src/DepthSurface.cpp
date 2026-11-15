@@ -1583,7 +1583,7 @@ public:
         return changed;
     }
 
-    void SyncFromMemory(const GuestTextureResource& resource, bool storing = false) {
+    bool SyncFromMemory(const GuestTextureResource& resource, bool storing = false) {
         std::uint64_t generation = 0;
         const auto changed = WrittenUnits(resource, generation);
         // The registry generation moves on every mapping mutation, so an unchanged value means every recorded backing is still current. Read it before the lookups: a mutation racing them leaves the stored value old and the next sync refreshes again.
@@ -1594,7 +1594,7 @@ public:
         const bool clearing = (pendingClear & VK_IMAGE_ASPECT_DEPTH_BIT) != 0;
         if ((clearing && !storing) || !anyUnit(changed)) {
             unitGeneration.assign(unitGeneration.size(), generation);
-            return;
+            return !clearing && !anyUnit(changed);
         }
         if (clearing) {
             ClearStale();
@@ -1625,6 +1625,7 @@ public:
             copyPlane(mirrorPlane, mirror, false, false, true);
         }
         written = ++depthWrites;
+        return false;
     }
 
     void DropMirror() {
@@ -1635,13 +1636,14 @@ public:
         return target.samples == 1u && target.stencilAddress != 0u && target.depthSwizzle == XorSwizzleMode(TextureTileMode::kZ64KBX);
     }
 
-    void SyncStencilFromMemory(const GuestTextureResource& resource) {
+    bool SyncStencilFromMemory(const GuestTextureResource& resource) {
         const auto bytes = static_cast<std::size_t>(StencilMirrorBytes());
         GuestMemory::CollectWrites(resource.baseAddress, bytes);
         const auto generation = GuestMemory::TrackerGeneration();
-        const bool changed = stencilGeneration != 0u && GuestMemory::WrittenSince(resource.baseAddress, bytes, stencilGeneration);
+        const bool known = stencilGeneration != 0u;
+        const bool changed = known && GuestMemory::WrittenSince(resource.baseAddress, bytes, stencilGeneration);
         stencilGeneration = generation;
-        if (!changed || (pendingClear & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) return;
+        if (!changed || (pendingClear & VK_IMAGE_ASPECT_STENCIL_BIT) != 0) return known && !changed;
         stencilStale = false;
         {
             struct Syncing {
@@ -1654,6 +1656,7 @@ public:
         }
         copyPlane(stencilMirror, stencilMirror.storage, true, false, true);
         written = ++depthWrites;
+        return false;
     }
 
     std::shared_ptr<StorageTexture> StoreStencilPlane(const GuestTextureResource& resource) {
@@ -3455,6 +3458,39 @@ bool resident(std::uint64_t address, std::uint64_t bytes) {
     return GuestMemory::DescribeCommitted(address, static_cast<std::size_t>(bytes)).whole;
 }
 
+struct DepthViewCounters {
+    std::atomic<std::uint64_t> calls{0};
+    std::atomic<std::uint64_t> depthSyncs{0};
+    std::atomic<std::uint64_t> quietDepthSyncs{0};
+    std::atomic<std::uint64_t> stencilSyncs{0};
+    std::atomic<std::uint64_t> quietStencilSyncs{0};
+    std::atomic<std::uint64_t> htileChecks{0};
+    std::atomic<std::uint64_t> quietHtileChecks{0};
+};
+
+DepthViewCounters& depthViewCounters() {
+    static DepthViewCounters counters;
+    return counters;
+}
+
+void countSync(std::atomic<std::uint64_t>& runs, std::atomic<std::uint64_t>& quiet, bool wasQuiet) {
+    runs.fetch_add(1, std::memory_order_relaxed);
+    if (wasQuiet) quiet.fetch_add(1, std::memory_order_relaxed);
+}
+
+}
+
+DepthViewCounts TakeDepthViewCounts() {
+    auto& counters = depthViewCounters();
+    DepthViewCounts counts;
+    counts.calls = counters.calls.exchange(0, std::memory_order_relaxed);
+    counts.depthSyncs = counters.depthSyncs.exchange(0, std::memory_order_relaxed);
+    counts.quietDepthSyncs = counters.quietDepthSyncs.exchange(0, std::memory_order_relaxed);
+    counts.stencilSyncs = counters.stencilSyncs.exchange(0, std::memory_order_relaxed);
+    counts.quietStencilSyncs = counters.quietStencilSyncs.exchange(0, std::memory_order_relaxed);
+    counts.htileChecks = counters.htileChecks.exchange(0, std::memory_order_relaxed);
+    counts.quietHtileChecks = counters.quietHtileChecks.exchange(0, std::memory_order_relaxed);
+    return counts;
 }
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested) {
@@ -3468,7 +3504,12 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     ClaimMultisampleTargetMemory(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u));
     if (target.stencilAddress != 0u) ClaimMultisampleTargetMemory(target.stencilAddress, planeBytes(1u));
     if (target.htileAddress != 0u) ClaimMultisampleTargetMemory(target.htileAddress, HtileMetadataBytes(target.extent));
-    const auto htileCleared = RoutesToNativeDepthOwner(target) ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
+    auto& counters = depthViewCounters();
+    counters.calls.fetch_add(1, std::memory_order_relaxed);
+    NoteDrawProofMissed(DrawProofKind::Depth, DrawProofMiss::None);
+    const bool routed = RoutesToNativeDepthOwner(target);
+    const auto htileCleared = routed ? VkImageAspectFlags{0} : storeBackClearedHtile(context, target);
+    if (!routed && target.htileAddress != 0u) countSync(counters.htileChecks, counters.quietHtileChecks, htileCleared == 0u);
     std::lock_guard gpu(GuestMemory::GpuMutex());
     settlePendingHtileClear(context, target.address);
     std::unique_lock lock(surfacesMutex());
@@ -3546,8 +3587,8 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
         if (!created) surface->NoteHtileClear(VK_IMAGE_ASPECT_DEPTH_BIT);
     }
     if (!created) surface->NoteHtileClear(htileCleared);
-    if (mirrorable(target)) surface->SyncFromMemory(mirrorResource(target));
-    if (surface->StencilMirrorable()) surface->SyncStencilFromMemory(stencilResource(target));
+    if (mirrorable(target)) countSync(counters.depthSyncs, counters.quietDepthSyncs, surface->SyncFromMemory(mirrorResource(target)));
+    if (surface->StencilMirrorable()) countSync(counters.stencilSyncs, counters.quietStencilSyncs, surface->SyncStencilFromMemory(stencilResource(target)));
     surface->TakeStencilStorage();
     surface->ApplyFastClear();
     if (stencilTested && surface->samplingActive) surface->RequireStencilProven();

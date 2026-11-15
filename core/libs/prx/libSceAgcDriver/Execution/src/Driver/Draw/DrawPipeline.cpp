@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -615,6 +616,8 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     AgcDriver::ProfilePrint_nid_no_patch("[proofs] (10 s): %s; breaks:%s; subscriptions %llu over %llu blocks, %llu bumps (%s ) in %llu lookups (%.1f ms), %llu sweeps, %llu refused\n", Graphics::DrawProofText(proofs, reportedProofs).c_str(), breakText.c_str(), static_cast<unsigned long long>(index.subscriptions - reportedIndex.subscriptions), static_cast<unsigned long long>(index.blocks - reportedIndex.blocks), static_cast<unsigned long long>(index.bumps - reportedIndex.bumps), bumpText.c_str(), static_cast<unsigned long long>(index.lookups - reportedIndex.lookups), static_cast<double>(index.lookupNanoseconds - reportedIndex.lookupNanoseconds) / 1e6, static_cast<unsigned long long>(index.sweeps - reportedIndex.sweeps), static_cast<unsigned long long>(index.sweepFailures - reportedIndex.sweepFailures));
     reportedIndex = index;
     reportedProofs = proofs;
+    const auto depth = Graphics::TakeDepthViewCounts();
+    AgcDriver::ProfilePrint_nid_no_patch("[depth-view] (10 s): %llu depth views; depth plane syncs %llu, %llu of them found nothing written; stencil syncs %llu, %llu found nothing; HTILE store-back checks %llu, %llu returned no clear\n", static_cast<unsigned long long>(depth.calls), static_cast<unsigned long long>(depth.depthSyncs), static_cast<unsigned long long>(depth.quietDepthSyncs), static_cast<unsigned long long>(depth.stencilSyncs), static_cast<unsigned long long>(depth.quietStencilSyncs), static_cast<unsigned long long>(depth.htileChecks), static_cast<unsigned long long>(depth.quietHtileChecks));
     reportedBreaks = breaks;
     const auto contentRecipes = DriverDetail::ContentRecipesHeld();
     AgcDriver::ProfilePrint_nid_no_patch("%s", VulkanDevice::DrawRecipeDrawsReport(contentRecipes.held, contentRecipes.evicted).c_str());

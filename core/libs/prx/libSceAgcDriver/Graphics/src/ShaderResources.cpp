@@ -4156,7 +4156,7 @@ DrawProofCounters& drawProofCounters(DrawProofKind kind) {
 }
 
 constexpr std::array<const char*, static_cast<std::size_t>(DrawProofMiss::Count)> DrawProofMissNames{"unproved", "epoch", "serial", "registry", "depth surfaces", "unwatch", "images", "depth planes", "imports", "staging", "target", "evicted", "input twins", "structure", "versions", "sweep", "audit"};
-constexpr std::array<const char*, static_cast<std::size_t>(DrawProofKind::Count)> DrawProofKindNames{"resource", "target"};
+constexpr std::array<const char*, static_cast<std::size_t>(DrawProofKind::Count)> DrawProofKindNames{"resource", "target", "depth"};
 
 void reportEpochProofs() {
     static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_VERIFY_DRAW_PIPELINE") != nullptr || std::getenv("APS5_VERIFY_DRAW_PROOFS") != nullptr;
