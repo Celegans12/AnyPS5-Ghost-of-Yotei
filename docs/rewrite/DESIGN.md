@@ -259,6 +259,18 @@ buffer regions often span two mappings and no single import served them. Found a
   sit at a 4 KiB base that is not a 64 KiB base and so have no block units: they are written
   back and uploaded whole. GPU time per present on `libs\i4`: storage write-back 10.1 ms
   (307 MiB), storage upload 8.1 ms (281 MiB), staging 3.7 ms, of 38 ms.
+- Block units at 4 KiB bases (c5bf9f081a, `libs\j3`, **built, off by default, not yet a gain**;
+  `APS5_UNALIGNED_BLOCK_UNITS=1`): the first unit is the short piece before the first stamp
+  block boundary, so unit k stays block k of the surface; admitted when every level's tile block
+  divides 4 KiB (007's tile mode 2, not its 64 KiB modes). With it on, 007's storage upload and
+  write-back cost 3.3 and 2.6 ms of GPU time per present (8.1 and 10.1 off) and the first 60 s
+  of the scene run at 74 to 77 ms (80 to 97 off), but after 60 s the frame is 110 to 113 ms
+  (about 80 off) in every run: syncs wait 19 s for the GPU per run instead of 3.4 s (untagged
+  threads' pending-write syncs 0.5 to 6.7 s, idle syncs 2.1 to 5.4 s; `Recorder.Sync` 0.1 to
+  20 ms per frame on the main worker). Suspected, not shown: the short first and last units
+  share a stamp block with neighbouring CPU-written data. A first try with units cut relative to
+  the base (`probe-patches\unaligned-block-units-relative.patch`) was wrong: per-unit state is
+  indexed by stamp block. Tests 1,808 of 1,808 with the switch on and off, section A on and off.
 - f8e0ee64d4: eight `thread_local` caches of the direct path had destructors; the draw committer
   crashed in one at thread exit (`agc_driver_village_draw_cost` hung in 9 of 120 runs with
   section A off). They use `ThreadScratch` now; 150 of 150 runs pass.
