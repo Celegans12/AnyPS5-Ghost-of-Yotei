@@ -446,6 +446,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_NO_UNIT_SHADOW` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/UnitShadow.cpp` |  | makes every unit shadow primitive inert |
 | `APS5_NO_UNLOCKED_DEVICE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/Dispatch.cpp` |  | loads the device and runs a dispatch under the GPU mutex instead of using an unlocked device |
 | `APS5_NO_UNLOCKED_DRAIN` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Packets/PacketMemory.cpp` |  | keeps the GPU mutex held while draining a packet instead of the unlocked drain |
+| `APS5_NO_UNLOCKED_TRACKER_READS` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/GuestMemory.cpp` |  | takes the write tracker's mutex for every `UnchangedSince`, `UnchangedSinceAll`, `WrittenSince`, `Watched` and `WriteWatched` instead of answering without it from the 64 KiB block stamps and the coverage table |
 | `APS5_NO_UNLOCKED_VALIDATE` | presence | `core/libs/prx/libSceAgcDriver/Execution/src/Driver/Dispatch/DispatchLookup.cpp` |  | keeps the dispatch-cache mutex held while validating a cache entry |
 | `APS5_NO_UNREGISTERED_DROP` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Texture.cpp` |  | stores a storage image's pending results even when its memory is no longer registered, instead of dropping them |
 | `APS5_NO_VALIDATE_CACHE` | presence | `core/libs/prx/libSceAgcDriver/Graphics/src/Draw.cpp` |  | validates every draw instead of serving the validation memo |

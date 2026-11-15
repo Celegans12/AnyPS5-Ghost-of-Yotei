@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <vector>
@@ -16,10 +17,9 @@ public:
     void Initialize(std::uint64_t address, std::size_t bytes, bool summarize = true) {
         base = address;
         size = bytes;
-        excluded.assign(bytes / BlockBytes + (bytes % BlockBytes != 0), 0);
+        excluded = std::vector<std::atomic<std::uint16_t>>(bytes / BlockBytes + (bytes % BlockBytes != 0));
         excludedGenerations.clear();
-        summary.clear();
-        if (summarize) summary.assign((excluded.size() + BlocksPerWord - 1) / BlocksPerWord, 0);
+        summary = std::vector<std::atomic<std::uint64_t>>(summarize ? (excluded.size() + BlocksPerWord - 1) / BlocksPerWord : 0);
     }
 
     bool Summarized() const { return !summary.empty(); }
@@ -30,10 +30,10 @@ public:
         const auto last = (address - base + bytes - 1) / BlockBytes;
         const auto firstPage = (address - base) % BlockBytes / PageBytes;
         const auto lastPage = (address - base + bytes - 1) % BlockBytes / PageBytes;
-        if (first == last) return (excluded[first] & pageMask(firstPage, lastPage + 1)) == 0;
-        if ((excluded[first] & pageMask(firstPage, PagesPerBlock)) != 0 || (excluded[last] & pageMask(0, lastPage + 1)) != 0) return false;
+        if (first == last) return (excludedPages(first) & pageMask(firstPage, lastPage + 1)) == 0;
+        if ((excludedPages(first) & pageMask(firstPage, PagesPerBlock)) != 0 || (excludedPages(last) & pageMask(0, lastPage + 1)) != 0) return false;
         if (!summary.empty()) return noneExcluded(first + 1, last);
-        return std::none_of(excluded.begin() + first + 1, excluded.begin() + last, [](auto mask) { return mask != 0; });
+        return std::none_of(excluded.begin() + first + 1, excluded.begin() + last, [](const auto& mask) { return mask.load(std::memory_order_relaxed) != 0; });
     }
 
     bool ExcludedSpan(std::uint64_t address, std::size_t bytes, std::uint64_t* begin, std::uint64_t* end) const {
@@ -56,10 +56,11 @@ public:
             const auto from = block == first ? firstPage % PagesPerBlock : 0;
             const auto to = block == last ? (endPage - 1) % PagesPerBlock + 1 : PagesPerBlock;
             const auto mask = pageMask(from, to);
-            changed = changed || (excluded[block] & mask) != mask;
+            const auto held = excludedPages(block);
+            changed = changed || (held & mask) != mask;
             auto& stamps = excludedGenerations[block];
             for (auto page = from; page < to; ++page) stamps[page] = std::max(stamps[page], std::max<std::uint64_t>(generation, 1));
-            excluded[block] |= mask;
+            excluded[block].store(static_cast<std::uint16_t>(held | mask), std::memory_order_relaxed);
             updateSummary(block);
         }
         return changed;
@@ -85,15 +86,17 @@ public:
         for (auto block = first; block <= last; ++block) {
             const auto from = block == first ? firstPage % PagesPerBlock : 0;
             const auto to = block == last ? (endPage - 1) % PagesPerBlock + 1 : PagesPerBlock;
-            if ((excluded[block] & pageMask(from, to)) == 0) continue;
+            auto held = excludedPages(block);
+            if ((held & pageMask(from, to)) == 0) continue;
             const auto& stamps = excludedGenerations.at(block);
             for (auto page = from; page < to; ++page) {
                 const auto bit = static_cast<std::uint16_t>(1u << page);
-                if ((excluded[block] & bit) == 0 || stamps[page] >= generation) continue;
-                excluded[block] &= static_cast<std::uint16_t>(~bit);
+                if ((held & bit) == 0 || stamps[page] >= generation) continue;
+                held &= static_cast<std::uint16_t>(~bit);
                 changed = true;
             }
-            if (excluded[block] == 0) excludedGenerations.erase(block);
+            excluded[block].store(held, std::memory_order_relaxed);
+            if (held == 0) excludedGenerations.erase(block);
             updateSummary(block);
         }
         return changed;
@@ -103,11 +106,15 @@ private:
     static std::uint16_t pageMask(std::size_t first, std::size_t end) {
         return static_cast<std::uint16_t>(((1u << end) - 1u) & ~((1u << first) - 1u));
     }
+    std::uint16_t excludedPages(std::size_t block) const {
+        return excluded[block].load(std::memory_order_relaxed);
+    }
     void updateSummary(std::size_t block) {
         if (summary.empty()) return;
         const auto bit = std::uint64_t{1} << (block % BlocksPerWord);
-        if (excluded[block] != 0) summary[block / BlocksPerWord] |= bit;
-        else summary[block / BlocksPerWord] &= ~bit;
+        auto& word = summary[block / BlocksPerWord];
+        const auto held = word.load(std::memory_order_relaxed);
+        word.store(excludedPages(block) != 0 ? held | bit : held & ~bit, std::memory_order_relaxed);
     }
     bool noneExcluded(std::size_t from, std::size_t to) const {
         if (from >= to) return true;
@@ -115,9 +122,10 @@ private:
         const auto lastWord = (to - 1) / BlocksPerWord;
         const auto lowMask = ~std::uint64_t{0} << (from % BlocksPerWord);
         const auto highMask = ~std::uint64_t{0} >> (BlocksPerWord - 1 - (to - 1) % BlocksPerWord);
-        if (firstWord == lastWord) return (summary[firstWord] & lowMask & highMask) == 0;
-        if ((summary[firstWord] & lowMask) != 0 || (summary[lastWord] & highMask) != 0) return false;
-        return std::none_of(summary.begin() + firstWord + 1, summary.begin() + lastWord, [](auto word) { return word != 0; });
+        const auto word = [&](std::size_t index) { return summary[index].load(std::memory_order_relaxed); };
+        if (firstWord == lastWord) return (word(firstWord) & lowMask & highMask) == 0;
+        if ((word(firstWord) & lowMask) != 0 || (word(lastWord) & highMask) != 0) return false;
+        return std::none_of(summary.begin() + firstWord + 1, summary.begin() + lastWord, [](const auto& held) { return held.load(std::memory_order_relaxed) != 0; });
     }
     bool excludedBlocks(std::uint64_t address, std::size_t bytes, std::size_t& first, std::size_t& last) const {
         if (bytes == 0 || size == 0) return false;
@@ -139,8 +147,8 @@ private:
     static constexpr std::size_t BlocksPerWord = 64;
     std::uint64_t base = 0;
     std::size_t size = 0;
-    std::vector<std::uint16_t> excluded;
-    std::vector<std::uint64_t> summary;
+    std::vector<std::atomic<std::uint16_t>> excluded;
+    std::vector<std::atomic<std::uint64_t>> summary;
     std::unordered_map<std::uint64_t, std::array<std::uint64_t, PagesPerBlock>> excludedGenerations;
 };
 
