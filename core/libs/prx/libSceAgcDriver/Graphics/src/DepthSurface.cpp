@@ -1541,6 +1541,7 @@ public:
             changed[unit] = true;
         };
         if (collected == 0u) {
+            unitsUnwatched = !GuestMemory::Watched(resource.baseAddress, bytes);
             for (std::size_t unit = 0; unit < unitGeneration.size(); ++unit) {
                 const auto offset = unit * unitBytes;
                 const auto address = resource.baseAddress + offset;
@@ -1560,6 +1561,11 @@ public:
             generation = GuestMemory::TrackerGeneration();
             return changed;
         }
+        // The plane was outside the write watch at the last sync (an import of it was still
+        // settling). Putting a range back in the watch stamps all of it as written, which says
+        // nothing about stores: the surface keeps its content, as it did while unwatched, and
+        // takes this generation as its baseline.
+        if (std::exchange(unitsUnwatched, false)) return changed;
         if (unitGeneration.size() == 1u) {
             if (GuestMemory::WrittenSince(resource.baseAddress, bytes, unitGeneration[0])) mark(0);
             return changed;
@@ -1681,6 +1687,7 @@ public:
     std::vector<std::uint64_t> unitBacking;
     std::uint64_t backingGeneration = 0;
     std::vector<std::uint64_t> unitGeneration;
+    bool unitsUnwatched = false;
     std::uint64_t unitBytes = 0;
     bool syncing = false;
     std::uint64_t scannedEpoch = 0;

@@ -317,9 +317,10 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
         DirectSlotStatistics statistics;
         std::string reason;
         if (base->directSlotCount != 0u && !BuildDirectSlotRequests(handle->artifact->info, capture->snapshot, requests, statistics, reason)) {
-            static thread_local std::string lastReason;
-            lastReason = reason.substr(0, 80);
-            report(lastReason.c_str());
+            // A plain local: report() copies the text. (A thread_local string is destroyed at thread
+            // exit after its storage was freed, which corrupts the heap.)
+            const std::string shortReason = reason.substr(0, 80);
+            report(shortReason.c_str());
             return std::nullopt;
         }
         bool pushed = true;
@@ -337,8 +338,7 @@ std::optional<DirectStage> materializeDirectStage(const ShaderRecompiler::Recomp
         report(nullptr);
         return DirectStage{std::move(capture), std::move(patched)};
     } catch (const std::exception& error) {
-        static thread_local std::string lastError;
-        lastError = std::string("exception: ") + error.what();
+        std::string lastError = std::string("exception: ") + error.what();
         if (lastError.size() > 100) lastError.resize(100);
         report(lastError.c_str());
         return std::nullopt;
