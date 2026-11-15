@@ -78,6 +78,7 @@ struct GuestArtifact {
     std::vector<Domain::CallRegistryEntry> Imports;
     std::filesystem::path SourcePath;
     std::vector<std::string> NeededLibraries;
+    bool RedZoneFramed = false;
 };
 
 struct GuestModuleInput {

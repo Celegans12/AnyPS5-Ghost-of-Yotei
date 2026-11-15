@@ -1,6 +1,7 @@
 #include <relinker/pipeline/RedZoneFraming.hpp>
 #include <relinker/analysis/UnusedNidFilter.hpp>
 #include <relinker/analysis/UnusedNidFilter/EhFrameReader.hpp>
+#include <io/BufferUtils.hpp>
 #include <algorithm>
 #include <cstring>
 #include <iterator>
@@ -56,12 +57,26 @@ RedZoneFramingResult FrameRedZoneImage(std::vector<std::uint8_t>& bytes, const s
         text << '\n';
         say(text);
     }
+    result.Unexamined = report.UncoveredBelowRsp;
     for (const auto& [reason, count] : report.Skipped) {
         result.Skipped += count;
         std::ostringstream text; text << prefix << ": skipped " << count << ": " << reason << '\n'; say(text);
     }
     trampolines.insert(trampolines.end(), std::make_move_iterator(framed.begin()), std::make_move_iterator(framed.end()));
     return result;
+}
+
+bool RedZoneFramingComplete(const RedZoneFramingResult& result) {
+    return result.Skipped == 0 && result.Unexamined == 0;
+}
+
+bool MarkRedZoneFramed(std::vector<std::uint8_t>& image) {
+    constexpr std::size_t dosHeaderBytes = 0x40;
+    if (image.size() < dosHeaderBytes || image[0] != 'M' || image[1] != 'Z' || Io::ReadU32(image, 0x3c) < dosHeaderBytes) return false;
+    const auto mark = image.begin() + static_cast<std::ptrdiff_t>(RedZoneMarkOffset);
+    if (!std::all_of(mark, mark + static_cast<std::ptrdiff_t>(RedZoneMark.size()), [](const std::uint8_t value) { return value == 0; })) return false;
+    std::copy(RedZoneMark.begin(), RedZoneMark.end(), mark);
+    return true;
 }
 
 }

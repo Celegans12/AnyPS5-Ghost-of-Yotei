@@ -473,6 +473,8 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
     std::vector<GuestArtifact> artifacts;
     std::size_t redZoneModules = 0;
     std::size_t redZoneSkipped = 0;
+    std::size_t redZoneUnexamined = 0;
+    std::size_t redZoneMarked = 0;
     std::size_t redZoneUnbounded = 0;
     for (const auto index : order) {
         auto& image = images[index];
@@ -517,6 +519,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 image.Bytes[header.Offset + offset + 1] = 0x0B;
             }
         }
+        bool redZoneComplete = false;
         if (frameRedZone) {
             const auto prefix = "Red-zone framing (" + Io::Utf8Path(image.SourcePath.filename()) + ")";
             auto framing = FrameRedZoneImage(image.Bytes, image.Headers, image.Dynamic.RelaData, image.Trampolines, prefix, [&](std::string_view text) { progress.Message(text); });
@@ -525,6 +528,8 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 progress.Message(prefix + ": no .eh_frame function bounds; all its functions come from splitting\n");
             }
             redZoneSkipped += framing.Skipped;
+            redZoneUnexamined += framing.Unexamined;
+            redZoneComplete = RedZoneFramingComplete(framing);
             ++redZoneModules;
             if (!image.PatchedRanges.empty()) GamePatch::CheckOverlaps(Io::Utf8Path(image.SourcePath), image.PatchedRanges, {.RedZoneSites = std::span<const Codegen::TrampolineSite>(image.Trampolines).subspan(framing.FirstSite), .RedZoneDisplacements = framing.Displacements});
         }
@@ -560,6 +565,9 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             const bool deferLinuxStart = isRuntime(index) && (!standardDirectory(index) || (executableLoadsModules && !required[index]));
             output = macos ? Elfpatcher::GuestModuleWriter().WriteMacOs(image, needed, guestRunPath, message) : Elfpatcher::GuestModuleWriter().WriteLinux(image, needed, guestRunPath, deferLinuxStart);
         }
+        const bool redZoneFramed = windows && redZoneComplete && MarkRedZoneFramed(output);
+        if (redZoneFramed) ++redZoneMarked;
+        if (frameRedZone) progress.Message("Red-zone framing (" + Io::Utf8Path(image.SourcePath.filename()) + (redZoneFramed ? "): marked as framed\n" : "): not marked as framed\n"));
         if (windows) {
             for (const auto& [name, provider] : guestNames) {
                 if (provider == index && std::find(runtime.Names.begin(), runtime.Names.end(), name) == runtime.Names.end()) runtime.Names.push_back(name);
@@ -580,12 +588,12 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
         std::vector<std::string> neededLibraries;
         for (const auto& name : image.Dependencies)
             if (findGuest(name) == guestNames.end() && !unavailableUnused(index, name)) neededLibraries.push_back(hostLibrary(name));
-        artifacts.push_back({target, std::move(output), std::move(imports), image.SourcePath, std::move(neededLibraries)});
+        artifacts.push_back({target, std::move(output), std::move(imports), image.SourcePath, std::move(neededLibraries), redZoneFramed});
         progress.Report({Domain::ProgressStage::Modules, Io::Utf8Path(image.SourcePath), artifacts.size(), order.size()});
     }
     if (frameRedZone) {
         std::ostringstream text;
-        text << "Red-zone framing: " << redZoneModules << " guest modules, " << redZoneSkipped << " leaves skipped, " << redZoneUnbounded << " modules without .eh_frame bounds\n";
+        text << "Red-zone framing: " << redZoneModules << " guest modules, " << redZoneMarked << " marked as framed, " << redZoneSkipped << " leaves skipped, " << redZoneUnexamined << " code ranges below RSP left unexamined, " << redZoneUnbounded << " modules without .eh_frame bounds\n";
         progress.Message(text.str());
     }
     return artifacts;

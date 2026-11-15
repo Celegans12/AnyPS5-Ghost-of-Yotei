@@ -116,10 +116,14 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
     }
     const auto intelSites = trampolines.size();
     std::vector<Codegen::RedZoneDisplacement> displacements;
+    bool redZoneComplete = false;
+    std::size_t redZoneLeft = 0;
     if (options.FrameRedZone) {
         const auto headers = Relinker::ElfReader(sourceBytes).ReadProgramHeaders();
         auto framing = Relinker::FrameRedZoneImage(sourceBytes, headers, result.DynamicSection.RelaData, trampolines, "Red-zone framing", [&](std::string_view text) { inputProgress.Message(text); });
         if (!framing.HasBounds) inputProgress.Message("Red-zone framing: the executable has no .eh_frame function bounds; all its functions come from splitting\n");
+        redZoneComplete = Relinker::RedZoneFramingComplete(framing);
+        redZoneLeft = framing.Skipped + framing.Unexamined;
         displacements = std::move(framing.Displacements);
     }
     GamePatch::CheckOverlaps(options.TargetName, patchedRanges, {.RelinkPatches = result.Patches, .RelaData = result.DynamicSection.RelaData, .RelaPltData = result.DynamicSection.RelaPltData, .RedZoneSites = std::span<const Codegen::TrampolineSite>(trampolines).subspan(intelSites), .RedZoneDisplacements = displacements});
@@ -175,6 +179,14 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
         throw;
     }
 
+    if (options.FrameRedZone) {
+        const bool marked = windows && redZoneComplete && Relinker::MarkRedZoneFramed(executableBytes);
+        const auto unmarkedModules = static_cast<std::size_t>(std::count_if(guestArtifacts.begin(), guestArtifacts.end(), [](const Relinker::GuestArtifact& artifact) { return !artifact.RedZoneFramed; }));
+        std::ostringstream message;
+        message << "Red-zone framing: the executable is " << (marked ? "marked as framed" : "not marked as framed") << " (" << redZoneLeft << " leaves or code ranges left); " << unmarkedModules << " of " << guestArtifacts.size() << " guest modules are not marked\n";
+        if (!marked || unmarkedModules != 0) message << "Red-zone framing: the title keeps values below RSP that a fault can overwrite; libc arms no page tracking block and sets no read trap while an unmarked image is loaded\n";
+        inputProgress.Message(message.str());
+    }
     if (!windows) inputProgress.Report({Domain::ProgressStage::Image, Io::Utf8Path(input.InputPath), 1, 1});
     std::string diagnostics;
     if (windows) diagnostics = std::static_pointer_cast<Elfpatcher::Windows::WindowsPePatcher>(patcher)->GetDiagnostics();
