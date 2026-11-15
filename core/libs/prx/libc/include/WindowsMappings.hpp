@@ -858,7 +858,7 @@ public:
                 collectPieces += (stop + pageBytes - 1) / pageBytes - cursor / pageBytes;
 #endif
                 const bool committed = !verifyDirect() || committedPrivate(cursor, stop);
-                if (collectOwnedWrites(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) {
+                if (collectTracked(clear, privateAllocationStart(cursor), allocationEnd, true, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) {
                     const auto memory = query(cursor);
                     if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
                     fail("collect private guest writes");
@@ -1147,9 +1147,136 @@ private:
         collectWatchCalls.fetch_add(1, std::memory_order_relaxed);
         const auto result = watchWrites(flags, address, bytes, pages, count, granularity, false, true);
         if (result != 0 || ownedPending.empty()) return result;
+        mergeOwnedPending(flags, reinterpret_cast<std::uintptr_t>(address), bytes, pages, count, capacity);
+        return result;
+    }
+
+    static std::uint64_t blockDigest(std::uintptr_t block) {
+        const auto* words = reinterpret_cast<const std::uint64_t*>(block);
+        std::uint64_t digest = 0xcbf29ce484222325ull;
+        for (std::size_t index = 0; index < WindowsPageTrack::BlockBytes / sizeof(std::uint64_t); ++index) digest = (digest ^ words[index]) * 0x100000001b3ull;
+        return digest;
+    }
+
+    void verifyClean(std::uintptr_t block) {
+        if (!track.Verifying()) return;
+        const auto word = track.Word(block);
+        std::array<void*, WindowsPageTrack::BlockBytes / 4096> written{};
+        ULONG_PTR found = written.size();
+        DWORD granularity = 0;
+        const auto result = GetWriteWatch(0, reinterpret_cast<void*>(block), WindowsPageTrack::BlockBytes, written.data(), &found, &granularity);
+        const auto digest = blockDigest(block);
+        if (track.Word(block) != word) return;
+        if (result == 0 && found == 0 && digest == track.Digest(block)) return;
+        track.NoteDivergence();
+        char text[224];
+        std::snprintf(text, sizeof(text), "page tracking: the block 0x%llx is armed and clean, but %s (APS5_VERIFY_PAGE_TRACK)", static_cast<unsigned long long>(block), result != 0 ? "its write watch cannot be read" : found != 0 ? "the write watch reports written pages" : "its bytes changed without a fault");
+        std::fprintf(stderr, "%s\n", text);
+        throw std::runtime_error(text);
+    }
+
+    bool armBlock(std::uintptr_t block) {
+        const auto memory = query(block);
+        const auto base = reinterpret_cast<std::uintptr_t>(memory.BaseAddress);
+        if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE || memory.Protect != PAGE_READWRITE || base > block || base + memory.RegionSize < block + WindowsPageTrack::BlockBytes) {
+            track.NoteWritten(block);
+            return false;
+        }
+        return track.Arm(block);
+    }
+
+    void deferCollected(void* const* pages, ULONG_PTR count) {
+        for (ULONG_PTR index = 0; index < count; ++index) {
+            const auto page = reinterpret_cast<std::uintptr_t>(pages[index]);
+            ownedPending[page & ~(ownedBlockBytes - 1)] |= std::uint16_t{1} << ((page & (ownedBlockBytes - 1)) / 4096);
+        }
+    }
+
+    void notePlain(std::uintptr_t first, std::uintptr_t end, void* const* pages, ULONG_PTR found, bool complete) {
+        constexpr auto blockBytes = WindowsPageTrack::BlockBytes;
+        ULONG_PTR index = 0;
+        for (auto block = first & ~(blockBytes - 1); block < end; block += blockBytes) {
+            bool written = false;
+            while (index < found && reinterpret_cast<std::uintptr_t>(pages[index]) < block + blockBytes) {
+                written = true;
+                ++index;
+            }
+            if (written) track.NoteWritten(block);
+            else if (complete) track.NoteClean(block);
+        }
+    }
+
+    UINT collectTracked(bool clear, std::uintptr_t lower, std::uintptr_t upper, bool armable, void* address, std::size_t bytes, void** pages, ULONG_PTR* count, DWORD* granularity) {
+        const DWORD flags = clear ? WRITE_WATCH_FLAG_RESET : 0;
+        if (!track.Enabled()) return collectOwnedWrites(flags, address, bytes, pages, count, granularity);
+        constexpr auto blockBytes = WindowsPageTrack::BlockBytes;
+        const auto capacity = *count;
+        const auto first = reinterpret_cast<std::uintptr_t>(address);
+        const auto end = first + bytes;
+        const auto firstPage = first & ~std::uintptr_t{4095};
+        const auto inside = [&](std::uintptr_t block) { return armable && block >= lower && block + blockBytes <= upper; };
+        ULONG_PTR total = 0;
+        bool called = false;
+        for (auto cursor = first; cursor < end;) {
+            const auto block = cursor & ~(blockBytes - 1);
+            const auto blockEnd = block + blockBytes;
+            if (track.Clean(block)) {
+                verifyClean(block);
+                cursor = std::min(end, blockEnd);
+                continue;
+            }
+            if (clear && track.TakeWritten(block)) track.NoteWritten(block);
+            if (clear && capacity - total >= (std::min(end, blockEnd) - (cursor & ~std::uintptr_t{4095}) + 4095) / 4096 && inside(block) && track.Cold(block) && armBlock(block)) {
+                disown(block, blockEnd);
+                std::array<void*, blockBytes / 4096> local{};
+                ULONG_PTR found = local.size();
+                collectWatchCalls.fetch_add(1, std::memory_order_relaxed);
+                called = true;
+                const auto result = watchWrites(WRITE_WATCH_FLAG_RESET, reinterpret_cast<void*>(block), blockBytes, local.data(), &found, granularity);
+                if (result != 0) {
+                    track.Open(block, blockEnd);
+                    deferCollected(pages, total);
+                    return result;
+                }
+                for (ULONG_PTR index = 0; index < found; ++index) {
+                    const auto page = reinterpret_cast<std::uintptr_t>(local[index]);
+                    if (page >= firstPage && page < end) pages[total++] = local[index];
+                    else ownedPending[block] |= std::uint16_t{1} << ((page - block) / 4096);
+                }
+                if (found != 0) track.NoteWritten(block);
+                if (track.Verifying()) track.SetDigest(block, blockDigest(block));
+                cursor = std::min(end, blockEnd);
+                continue;
+            }
+            auto stop = std::min(end, blockEnd);
+            while (stop < end && !track.Clean(stop) && !(clear && inside(stop) && track.Cold(stop))) {
+                if (clear && track.TakeWritten(stop)) track.NoteWritten(stop);
+                stop = std::min(end, stop + blockBytes);
+            }
+            ULONG_PTR found = capacity - total;
+            if (found == 0) break;
+            collectWatchCalls.fetch_add(1, std::memory_order_relaxed);
+            called = true;
+            const auto result = watchWrites(flags, reinterpret_cast<void*>(cursor), stop - cursor, pages + total, &found, granularity);
+            if (result != 0) {
+                if (clear) deferCollected(pages, total);
+                return result;
+            }
+            const bool complete = total + found < capacity;
+            if (clear && armable) notePlain(std::max(cursor, lower), std::min(stop, upper), pages + total, found, complete);
+            total += found;
+            if (!complete) break;
+            cursor = stop;
+        }
+        *count = total;
+        if (!called) track.NoteQuiet(1);
+        if (!ownedPending.empty()) mergeOwnedPending(flags, first, bytes, pages, count, capacity);
+        return 0;
+    }
+
+    void mergeOwnedPending(DWORD flags, std::uintptr_t first, std::size_t bytes, void** pages, ULONG_PTR* count, ULONG_PTR capacity) {
         std::sort(pages, pages + *count);
         const auto reported = *count;
-        const auto first = reinterpret_cast<std::uintptr_t>(address);
         const auto end = first + bytes;
         for (auto it = ownedPending.lower_bound(first & ~(ownedBlockBytes - 1)); it != ownedPending.end() && it->first < end; ++it) {
             for (unsigned bit = 0; bit < ownedBlockBytes / 4096; ++bit) {
@@ -1164,7 +1291,6 @@ private:
         }
         std::sort(pages, pages + *count);
         if ((flags & WRITE_WATCH_FLAG_RESET) != 0) forgetOwnedPending(first, end);
-        return result;
     }
 
     bool collectable(std::uintptr_t address, std::uintptr_t end) {
@@ -1204,6 +1330,13 @@ private:
         char text[192];
         std::snprintf(text, sizeof(text), "a private collect of guest writes succeeded over 0x%llx+0x%llx, which is no longer committed private memory (APS5_VERIFY_DIRECT_COLLECT)", static_cast<unsigned long long>(address), static_cast<unsigned long long>(end - address));
         throw std::runtime_error(text);
+    }
+
+    std::uintptr_t privateAllocationStart(std::uintptr_t address) const {
+        const auto next = privateAllocations.upper_bound(address);
+        if (next == privateAllocations.begin()) return 0;
+        const auto allocation = std::prev(next);
+        return address < allocation->second ? allocation->first : 0;
     }
 
     std::uintptr_t privateAllocationEnd(std::uintptr_t address) const {
@@ -1313,10 +1446,13 @@ private:
         if (run.fresh == 0 && collection != Collection::Fresh) {
             ULONG_PTR reported = (stop - first + 4095) / 4096;
             DWORD granularity = 0;
-            if (collectOwnedWrites(clear ? WRITE_WATCH_FLAG_RESET : 0, reinterpret_cast<void*>(first), stop - first, pages + *count, &reported, &granularity) != 0) fail("collect resident guest writes");
+            if (collectTracked(clear, start, run.end, run.watched, reinterpret_cast<void*>(first), stop - first, pages + *count, &reported, &granularity) != 0) fail("collect resident guest writes");
             for (ULONG_PTR index = 0; index < reported; ++index) pages[*count + index] = reinterpret_cast<void*>(std::max(from, reinterpret_cast<std::uintptr_t>(pages[*count + index])));
             *count += reported;
             return;
+        }
+        if (clear && track.Enabled()) {
+            for (auto block = first & ~(WindowsPageTrack::BlockBytes - 1); block < stop; block += WindowsPageTrack::BlockBytes) track.NoteWritten(block);
         }
         std::vector<std::uintptr_t> written;
         if (collection != Collection::Fresh) {

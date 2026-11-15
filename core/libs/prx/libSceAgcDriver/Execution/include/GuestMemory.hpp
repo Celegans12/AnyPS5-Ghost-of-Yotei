@@ -199,6 +199,12 @@ struct CollectCounts {
     std::uint64_t epochBumps = 0;
     std::uint64_t memoHits = 0;
     std::uint64_t walkedEpochs = 0;
+    std::uint64_t pageArmed = 0;
+    std::uint64_t pageArms = 0;
+    std::uint64_t pageFaults = 0;
+    std::uint64_t pageQuiet = 0;
+    std::uint64_t pageResting = 0;
+    std::uint64_t pageDivergences = 0;
 };
 CollectCounts CollectCounted();
 void ReportCollectCosts();

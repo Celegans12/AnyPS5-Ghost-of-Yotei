@@ -696,6 +696,16 @@ bool GuestPageTrackProtect_nid_no_patch(void* pointer, std::size_t bytes, std::u
     return WindowsMappings::Get().Protect(reinterpret_cast<std::uintptr_t>(pointer), bytes, protection, requireCommitted);
 }
 
+void GuestPageTrackFrame_nid_no_patch() {
+    WindowsPageTrack::Get().AdvancePeriod();
+}
+
+void GuestPageTrackCounts_nid_no_patch(std::uint64_t* counts, std::size_t capacity) {
+    const auto counted = WindowsPageTrack::Get().Counted();
+    const std::uint64_t values[] = {counted.armed, counted.arms, counted.faults, counted.quiet, counted.resting, counted.divergences};
+    for (std::size_t index = 0; index < capacity; ++index) counts[index] = index < std::size(values) ? values[index] : 0;
+}
+
 void GuestPageTrackKeepOpen_nid_no_patch(const void* pointer, std::size_t bytes) {
     if (!WindowsPageTrack::Get().Enabled()) return;
     WindowsMappings::Get().KeepOpen(reinterpret_cast<std::uintptr_t>(pointer), bytes);

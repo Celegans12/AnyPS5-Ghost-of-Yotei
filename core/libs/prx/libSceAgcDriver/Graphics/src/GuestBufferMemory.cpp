@@ -4731,6 +4731,9 @@ void NoteHostImportFrame() {
     state.frameFloor = state.useCounter + 1;
     ++state.framesEnded;
     inputTwinFrames.fetch_add(1, std::memory_order_relaxed);
+#ifdef _WIN32
+    GuestArena::GuestPageTrackFrame_nid_no_patch();
+#endif
 }
 
 std::uint64_t HostImportEpoch() {

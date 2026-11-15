@@ -25,6 +25,7 @@ public:
         std::uint64_t faults = 0;
         std::uint64_t quiet = 0;
         std::uint64_t resting = 0;
+        std::uint64_t divergences = 0;
     };
 
     static WindowsPageTrack& Get() {
@@ -162,6 +163,45 @@ public:
         return true;
     }
 
+    std::uint64_t Word(std::uintptr_t block) const {
+        const auto* entry = find(block);
+        return entry == nullptr ? 0 : entry->word.load(std::memory_order_acquire);
+    }
+
+    std::uint64_t Period() const {
+        return period.load(std::memory_order_relaxed);
+    }
+
+    void AdvancePeriod() {
+        if (enabled) period.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void NoteClean(std::uintptr_t block) {
+        at(block).cleanPeriod = Period();
+    }
+
+    void NoteWritten(std::uintptr_t block) {
+        at(block).writtenPeriod = Period();
+    }
+
+    bool Cold(std::uintptr_t block) const {
+        const auto* entry = find(block);
+        return entry != nullptr && entry->holds == 0 && entry->flags == 0 && entry->cleanPeriod > entry->writtenPeriod && Period() > entry->cleanPeriod;
+    }
+
+    void SetDigest(std::uintptr_t block, std::uint64_t digest) {
+        at(block).digest = digest;
+    }
+
+    std::uint64_t Digest(std::uintptr_t block) const {
+        const auto* entry = find(block);
+        return entry == nullptr ? 0 : entry->digest;
+    }
+
+    void NoteDivergence() {
+        divergences.fetch_add(1, std::memory_order_relaxed);
+    }
+
     std::uint32_t Faults(std::uintptr_t block) const {
         const auto* entry = find(block);
         return entry == nullptr ? 0 : entry->faults.load(std::memory_order_relaxed);
@@ -202,6 +242,8 @@ public:
             open(block, entry);
             entry.word.store(with(entry.word.load(std::memory_order_acquire), State::Unarmed), std::memory_order_release);
             entry.flags = 0;
+            entry.cleanPeriod = 0;
+            entry.writtenPeriod = 0;
         });
     }
 
@@ -210,7 +252,7 @@ public:
     }
 
     Counts Counted() const {
-        return {armed.load(std::memory_order_relaxed), arms.load(std::memory_order_relaxed), faults.load(std::memory_order_relaxed), quiet.load(std::memory_order_relaxed), resting.load(std::memory_order_relaxed)};
+        return {armed.load(std::memory_order_relaxed), arms.load(std::memory_order_relaxed), faults.load(std::memory_order_relaxed), quiet.load(std::memory_order_relaxed), resting.load(std::memory_order_relaxed), divergences.load(std::memory_order_relaxed)};
     }
 
 private:
@@ -227,16 +269,18 @@ private:
         std::atomic<std::uint32_t> faults{0};
         std::uint32_t holds = 0;
         std::uint8_t flags = 0;
+        std::uint64_t cleanPeriod = 0;
+        std::uint64_t writtenPeriod = 0;
+        std::uint64_t digest = 0;
     };
 
     WindowsPageTrack() {
-        verifying = set("APS5_VERIFY_PAGE_TRACK");
-        enabled = verifying || set("APS5_PAGE_TRACK");
+        verifying = set("APS5_VERIFY_PAGE_TRACK", std::getenv("APS5_VERIFY_PAGE_TRACK"));
+        enabled = set("APS5_PAGE_TRACK", std::getenv("APS5_PAGE_TRACK")) || verifying;
         if (enabled) chunks = std::make_unique<std::atomic<Block*>[]>(Chunks);
     }
 
-    static bool set(const char* name) {
-        const char* value = std::getenv(name);
+    static bool set(const char* name, const char* value) {
         if (value == nullptr || value[0] == '\0' || (value[0] == '0' && value[1] == '\0')) return false;
         if (value[0] == '1' && value[1] == '\0') return true;
         char text[96];
@@ -342,6 +386,8 @@ private:
     std::atomic<std::uint64_t> faults{0};
     std::atomic<std::uint64_t> quiet{0};
     std::atomic<std::uint64_t> resting{0};
+    std::atomic<std::uint64_t> divergences{0};
+    std::atomic<std::uint64_t> period{1};
 };
 
 }

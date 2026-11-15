@@ -5,6 +5,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <initializer_list>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -313,6 +314,190 @@ void CheckGuards(bool resident) {
     Require(track.StateOf(memory.Block(16)) == State::Unarmed && track.StateOf(memory.Block(17)) == State::Unarmed && track.Counted().armed == 0, kind + ": released guest memory kept armed blocks");
 }
 
+std::set<std::size_t> Pages(std::size_t block, std::initializer_list<std::size_t> pages) {
+    std::set<std::size_t> result;
+    for (const auto page : pages) result.insert(block * BlockPages + page);
+    return result;
+}
+
+void Settle(const Guest& memory, std::size_t blocks) {
+    auto& track = Track::Get();
+    memory.Collect(0, blocks * BlockPages);
+    track.AdvancePeriod();
+    memory.Collect(0, blocks * BlockPages);
+    track.AdvancePeriod();
+}
+
+void CheckCollect(bool resident) {
+    constexpr std::size_t Blocks = 32;
+    auto& track = Track::Get();
+    auto& mappings = Mappings::Get();
+    const std::string kind = resident ? "resident" : "private";
+    Guest memory(resident, Blocks * BlockBytes);
+    const auto all = [&] { return memory.Collect(0, Blocks * BlockPages); };
+    const auto calls = [&] { return mappings.CollectWatchCalls(); };
+    const std::set<std::size_t> none;
+    Require(all().size() == Blocks * BlockPages, kind + ": the first collect did not report every written page");
+    Require(all() == none && track.Counted().armed == 0, kind + ": a block was armed in the frame it was written in");
+    track.AdvancePeriod();
+    Require(all() == none && track.Counted().armed == 0, kind + ": a block was armed before a whole frame found it clean");
+    track.AdvancePeriod();
+    auto before = calls();
+    Require(all() == none && track.Counted().armed == Blocks && calls() - before == Blocks, kind + ": cold blocks were not armed, one reset of the write watch each");
+    before = calls();
+    const auto quiet = track.Counted().quiet;
+    Require(all() == none && calls() == before && track.Counted().quiet > quiet, kind + ": a collect of armed clean blocks made a system call");
+    Require(memory.Collect(3 * BlockPages + 2, 5, false) == none && calls() == before, kind + ": a collect without reset of an armed clean block made a system call");
+
+    auto faults = handled.load();
+    memory.Write(5, 3, 7);
+    memory.Write(5, 11, 8);
+    Require(handled.load() - faults == 1, kind + ": two writes to one armed block did not fault once");
+    before = calls();
+    Require(all() == Pages(5, {3, 11}) && calls() - before == 1, kind + ": the collect after a fault did not report exactly the written pages with one system call");
+    Require(track.StateOf(memory.Block(5)) == State::Unarmed && track.Counted().armed == Blocks - 1, kind + ": a block written in this frame was armed again at once");
+    Require(all() == none, kind + ": a written block is reported twice");
+    track.AdvancePeriod();
+    Require(all() == none && track.Counted().armed == Blocks - 1, kind + ": a written block was armed before a later frame found it clean");
+    track.AdvancePeriod();
+    Require(all() == none && track.Counted().armed == Blocks, kind + ": a block that stayed clean for a frame was not armed again");
+
+    memory.Write(7, 2, 1);
+    memory.Write(7, 9, 2);
+    Require(memory.Collect(7 * BlockPages, 4) == Pages(7, {2}), kind + ": a collect of part of a written block did not report the page inside it");
+    Require(all() == Pages(7, {9}), kind + ": a page outside an earlier partial collect was lost");
+    Settle(memory, Blocks);
+    Require(all() == none && track.Counted().armed == Blocks, kind + ": the blocks were not armed again");
+
+    Require(mappings.BeginHostWrite(memory.Block(9) + 12 * PageBytes, 16), kind + ": a host write was refused");
+    memory.Write(9, 12, 5);
+    mappings.EndHostWrite(memory.Block(9) + 12 * PageBytes, 16);
+    Require(track.StateOf(memory.Block(9)) == State::Unarmed, kind + ": a host write did not reopen its block");
+    before = calls();
+    Require(memory.Collect(9 * BlockPages, 4) == none && track.Clean(memory.Block(9)) && calls() - before == 1, kind + ": a partial collect did not arm the cold block it touched");
+    before = calls();
+    Require(memory.Collect(9 * BlockPages + 8, 8) == Pages(9, {12}) && calls() == before && track.Clean(memory.Block(9)), kind + ": a page the arming found outside the collected range was not reported later without a system call");
+    Require(all() == none, kind + ": a page found by an arming was reported twice");
+
+    memory.Write(11, 0, 1);
+    for (std::size_t page = 0; page < BlockPages; ++page) memory.Write(12, page, 2);
+    std::array<void*, 4> few{};
+    std::size_t count = few.size();
+    Require(mappings.Collect(memory.Block(11), 2 * BlockBytes, few.data(), &count, true) && count == few.size() && few[0] == memory.data + 11 * BlockBytes, kind + ": a collect into a short buffer did not fill it in address order");
+    std::set<std::size_t> rest = memory.Collect(11 * BlockPages + (reinterpret_cast<std::uintptr_t>(few[3]) - memory.Block(11)) / PageBytes + 1, 2 * BlockPages - ((reinterpret_cast<std::uintptr_t>(few[3]) - memory.Block(11)) / PageBytes + 1));
+    Require(rest.size() == BlockPages - 3, kind + ": pages past a short buffer were lost or reported twice");
+
+    mappings.Pin(memory.Block(21), BlockBytes);
+    Settle(memory, Blocks);
+    all();
+    Require(track.StateOf(memory.Block(21)) == State::Unarmed && track.Clean(memory.Block(22)), kind + ": a pinned block was armed, or its neighbour was not");
+    mappings.Unpin(memory.Block(21), BlockBytes);
+    track.AdvancePeriod();
+    all();
+    Require(track.Clean(memory.Block(21)), kind + ": an unpinned block was not armed");
+
+    Require(mappings.BeginHostWrite(memory.Block(20), BlockBytes, false), kind + ": a host import was refused");
+    mappings.EndHostWrite(memory.Block(20), BlockBytes, false);
+    Settle(memory, Blocks);
+    all();
+    Require(track.StateOf(memory.Block(20)) == State::Unarmed, kind + ": an imported block was armed");
+    Require(track.Clean(memory.Block(19)), kind + ": the neighbour of an imported block was not armed");
+}
+
+void CheckCollectRace(bool resident) {
+    constexpr std::size_t Writers = 8;
+    constexpr std::size_t Blocks = 32;
+    constexpr std::size_t Pages = Blocks * BlockPages;
+    constexpr std::size_t Trials = 600;
+    constexpr std::size_t Burst = 3;
+    auto& track = Track::Get();
+    Guest memory(resident, Blocks * BlockBytes);
+    const auto counter = [&](std::size_t page) { return reinterpret_cast<std::uint64_t*>(memory.data + page * PageBytes); };
+    for (std::size_t page = 0; page < Pages; ++page) *counter(page) = 0;
+    std::vector<std::uint64_t> shadow(Pages, 0);
+    std::atomic<std::size_t> trial{0};
+    std::atomic<std::size_t> finished{0};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> writers;
+    for (std::size_t writer = 0; writer < Writers; ++writer) {
+        writers.emplace_back([&, writer] {
+            std::mt19937 random(static_cast<unsigned>(writer) * 104729u + 11u);
+            for (std::size_t current = 1;; ++current) {
+                while (trial.load(std::memory_order_acquire) != current) {
+                    if (stop.load(std::memory_order_acquire)) return;
+                    YieldProcessor();
+                }
+                for (std::size_t write = 0; write < Burst; ++write) {
+                    const auto page = (random() % (Pages / Writers)) * Writers + writer;
+                    auto* value = static_cast<volatile std::uint64_t*>(counter(page));
+                    *value = *value + 1;
+                }
+                finished.fetch_add(1, std::memory_order_release);
+            }
+        });
+    }
+    const auto collect = [&] {
+        for (const auto page : memory.Collect(0, Pages)) shadow[page] = *static_cast<volatile std::uint64_t*>(counter(page));
+    };
+    std::size_t lost = 0;
+    const auto before = track.Counted();
+    for (std::size_t current = 1; current <= Trials; ++current) {
+        track.AdvancePeriod();
+        trial.store(current, std::memory_order_release);
+        collect();
+        while (finished.load(std::memory_order_acquire) != current * Writers) collect();
+        collect();
+        for (std::size_t page = 0; page < Pages; ++page) {
+            if (shadow[page] != *counter(page)) ++lost;
+        }
+    }
+    stop.store(true, std::memory_order_release);
+    for (auto& writer : writers) writer.join();
+    const auto after = track.Counted();
+    std::printf("%s memory, %zu writers against collects: %zu trials, %llu arms, %llu faults, %llu collects without a system call, %zu last writes lost\n", resident ? "resident" : "private", Writers, Trials, static_cast<unsigned long long>(after.arms - before.arms), static_cast<unsigned long long>(after.faults - before.faults), static_cast<unsigned long long>(after.quiet - before.quiet), lost);
+    Require(lost == 0, "a write was lost by a collect over armed blocks");
+    Require(after.arms != before.arms && after.faults != before.faults, "the race never armed a block or never faulted");
+    Require(refused.load() == 0, "a fault on tracked memory was refused");
+}
+
+void CheckVerify(bool resident) {
+    constexpr std::size_t Blocks = 8;
+    auto& track = Track::Get();
+    Require(track.Verifying(), "APS5_VERIFY_PAGE_TRACK=1 did not turn verification on");
+    const std::string kind = resident ? "resident" : "private";
+    Guest memory(resident, Blocks * BlockBytes);
+    const auto all = [&] { return memory.Collect(0, Blocks * BlockPages); };
+    const auto diverged = track.Counted().divergences;
+    Settle(memory, Blocks);
+    Require(all().empty() && track.Counted().armed == Blocks, kind + ": the blocks were not armed");
+    memory.Write(2, 1, 4);
+    Require(all() == Pages(2, {1}) && all().empty() && track.Counted().divergences == diverged, kind + ": verified collects diverged on ordinary writes");
+    const auto expectDivergence = [&](const char* what) {
+        const auto before = track.Counted().divergences;
+        bool thrown = false;
+        try {
+            all();
+        } catch (const std::runtime_error&) {
+            thrown = true;
+        }
+        Require(thrown && track.Counted().divergences == before + 1, kind + ": " + what);
+        track.Open(memory.Block(4), memory.Block(4) + 1);
+        Settle(memory, Blocks);
+        all();
+    };
+    DWORD previous;
+    Require(VirtualProtect(memory.data + 4 * BlockBytes, BlockBytes, PAGE_READWRITE, &previous) != 0, "cannot reopen a block behind the tracker");
+    memory.Write(4, 6, 9);
+    Require(VirtualProtect(memory.data + 4 * BlockBytes, BlockBytes, PAGE_READONLY, &previous) != 0, "cannot protect a block behind the tracker");
+    expectDivergence("a write that reached an armed block without a fault was not reported");
+    Require(track.Clean(memory.Block(4)), kind + ": the block was not armed again after the divergence");
+    Require(VirtualProtect(memory.data + 4 * BlockBytes, BlockBytes, PAGE_READWRITE, &previous) != 0, "cannot reopen a block behind the tracker");
+    memory.Write(4, 6, 10);
+    Require(ResetWriteWatch(memory.data + 4 * BlockBytes, BlockBytes) == 0, "cannot reset the write watch behind the tracker");
+    Require(VirtualProtect(memory.data + 4 * BlockBytes, BlockBytes, PAGE_READONLY, &previous) != 0, "cannot protect a block behind the tracker");
+    expectDivergence("bytes that changed in an armed block without the write watch seeing them were not reported");
+}
+
 void CheckRace() {
     constexpr std::size_t Writers = 8;
     constexpr std::size_t Blocks = 32;
@@ -382,7 +567,7 @@ void CheckRace() {
 
 int main(int argc, char** argv) {
     const std::string_view mode = argc > 1 ? argv[1] : "";
-    _putenv_s("APS5_PAGE_TRACK", "1");
+    _putenv_s(mode == "verify" || mode == "verify-race" ? "APS5_VERIFY_PAGE_TRACK" : "APS5_PAGE_TRACK", "1");
     const auto handler = AddVectoredExceptionHandler(1, HandleFault);
     int result = 0;
     try {
@@ -396,8 +581,23 @@ int main(int argc, char** argv) {
         } else if (mode == "guards") {
             CheckGuards(false);
             CheckGuards(true);
+        } else if (mode == "collect") {
+            CheckCollect(false);
+            CheckCollect(true);
+        } else if (mode == "collect-race") {
+            CheckCollectRace(false);
+            CheckCollectRace(true);
+        } else if (mode == "verify" || mode == "verify-race") {
+            if (mode == "verify") {
+                CheckVerify(false);
+                CheckVerify(true);
+            } else {
+                CheckCollectRace(false);
+                CheckCollectRace(true);
+                Require(Track::Get().Counted().divergences == 0, "verified collects diverged under concurrent writers");
+            }
         } else {
-            std::fprintf(stderr, "usage: %s table|race|guards\n", argv[0]);
+            std::fprintf(stderr, "usage: %s table|race|guards|collect|collect-race|verify|verify-race\n", argv[0]);
             result = 2;
         }
         if (result == 0) std::printf("page tracking %.*s tests passed\n", static_cast<int>(mode.size()), mode.data());
