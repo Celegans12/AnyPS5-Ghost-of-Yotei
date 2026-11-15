@@ -29,6 +29,7 @@ alignas(256) std::array<float, 4> PixelConstant{};
 alignas(256) std::array<std::byte, 1024> ColorMemory{};
 constexpr std::uint32_t Labels = 8;
 alignas(256) std::array<std::uint32_t, Labels> LabelMemory{};
+alignas(256) std::array<std::uint32_t, Labels> StoreMemory{};
 
 struct Header {
     Shader shader{};
@@ -105,6 +106,11 @@ void WaitLabel(std::vector<std::uint32_t>& commands, std::uint32_t index, std::u
     commands.insert(commands.end(), {0xc0053c00u, 0x13u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), value, 0xffffffffu, 0x19u});
 }
 
+void StoreWord(std::vector<std::uint32_t>& commands, std::uint32_t index, std::uint32_t value) {
+    const auto address = reinterpret_cast<std::uintptr_t>(&StoreMemory[index]);
+    commands.insert(commands.end(), {0xc0055000u, 2u << 29u, value, 0u, static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 4u});
+}
+
 }
 
 int main() {
@@ -127,21 +133,26 @@ int main() {
             Append(commands, 0x2d, {3, 2});
             WriteLabel(commands, index, 0x100u + index);
             WaitLabel(commands, index, 0x100u + index);
+            StoreWord(commands, index, 0x200u + index);
         }
+        const auto itemDrains = DrawFinisher::DrainCount(DrawFinisher::DrainSite::Item, true);
         Packet packet{commands.data(), static_cast<std::uint32_t>(commands.size()), 0, {}};
         Require(sceAgcDriverSubmitDcb(&packet) == 0, "the draw submission failed");
         AgcDriverWaitIdle_nid_postfix();
         const auto drains = DrawFinisher::DrainText();
         AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(LabelMemory.data()), sizeof(LabelMemory));
+        AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(StoreMemory.data()), sizeof(StoreMemory));
         AgcDriver::GuestMemory::FlushGpuWrites(reinterpret_cast<std::uintptr_t>(ColorMemory.data()), ColorMemory.size());
         for (std::uint32_t index = 0; index < Labels; ++index) {
             Require(LabelMemory[index] == 0x100u + index, "label " + std::to_string(index) + " is " + std::to_string(LabelMemory[index]) + " after the draws before it, expected " + std::to_string(0x100u + index));
+            Require(StoreMemory[index] == 0x200u + index, "the word stored after draw " + std::to_string(index) + " is " + std::to_string(StoreMemory[index]) + ", expected " + std::to_string(0x200u + index));
         }
         unsigned brightest = 0;
         for (const auto value : ColorMemory) brightest = std::max(brightest, static_cast<unsigned>(std::to_integer<std::uint8_t>(value)));
         Require(brightest + 2 >= 128 && brightest <= 130, "the draws before the labels wrote " + std::to_string(brightest) + ", expected 128");
         if (finisher) Require(drains.find(" 0x37 x") == std::string::npos, "a WRITE_DATA label after a draw handed to the finisher drained the finisher:" + drains);
         if (finisher) Require(drains.find(" 0x3c x") == std::string::npos, "a WAIT_REG_MEM on a label the finisher holds drained the finisher:" + drains);
+        if (DrawFinisher::Relays()) Require(DrawFinisher::DrainCount(DrawFinisher::DrainSite::Item, true) == itemDrains, "a DMA_DATA store queued behind a draw handed to the finisher drained the finisher:" + drains);
         AgcDriverShutdown_nid_postfix();
         std::cout << "labels after finisher draws " << (finisher ? "queued through the finisher" : "written in order") << "\n";
         return 0;

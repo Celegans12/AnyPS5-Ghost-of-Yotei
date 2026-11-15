@@ -56,6 +56,15 @@ struct ClearOnExit {
 namespace {
 thread_local bool finisherThread = false;
 thread_local bool finisherProducer = false;
+thread_local DrawPipeline::Order runningOrder{};
+
+DrawPipeline::Order nextOrder() {
+    static std::atomic<std::uint64_t> producers{0};
+    thread_local std::uint64_t producer = 0;
+    thread_local std::uint64_t sequence = 0;
+    if (producer == 0) producer = producers.fetch_add(1, std::memory_order_relaxed) + 1;
+    return {producer, ++sequence};
+}
 }
 
 DrawFinisher& DrawFinisher::Get() {
@@ -85,6 +94,11 @@ void DrawPipeline::CountPipelinedMetadataPass() {
 
 bool DrawFinisher::Overlap() {
     return Graphics::DrawPipelineEnabled();
+}
+
+bool DrawFinisher::Relays() {
+    static const bool relays = Overlap() && std::getenv("APS5_NO_FINISHER_RELAY") == nullptr;
+    return relays;
 }
 
 bool DrawFinisher::PendingOverlaps(std::uint64_t begin, std::uint64_t end) {
@@ -137,7 +151,7 @@ bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
 
 namespace {
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawFinisher::DrainSite::Count)> finisherDrains{}, finisherSkips{}, finisherDrainsEver{}, finisherSkipsEver{}, finisherSiteWaitNs{};
-std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> itemDrains{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> itemDrains{}, itemRelays{};
 std::atomic<std::uint64_t> finisherWaits{0}, finisherWaitNs{0}, finisherRoomWaits{0}, finisherRoomWaitNs{0};
 }
 
@@ -148,6 +162,10 @@ void DrawFinisher::NoteDrain(DrainSite site, bool drained) {
 
 void DrawFinisher::NoteItemDrain(DrawPipeline::CommitKind kind) {
     itemDrains[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawFinisher::NoteItemRelay(DrawPipeline::CommitKind kind) {
+    itemRelays[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
 }
 
 std::uint64_t DrawFinisher::DrainCount(DrainSite site, bool drained) {
@@ -187,13 +205,18 @@ std::string DrawFinisher::DrainText() {
     char waits[256];
     std::snprintf(waits, sizeof(waits), "; worker waits on the finisher: %llu drains (%.1f ms), of them submission end (%.1f ms) item (%.1f ms), %llu for room (%.1f ms); items that drained:", static_cast<unsigned long long>(finisherWaits.exchange(0)), milliseconds(finisherWaitNs), milliseconds(finisherSiteWaitNs[static_cast<std::size_t>(DrainSite::SubmissionEnd)]), milliseconds(finisherSiteWaitNs[static_cast<std::size_t>(DrainSite::Item)]), static_cast<unsigned long long>(finisherRoomWaits.exchange(0)), milliseconds(finisherRoomWaitNs));
     text += waits;
-    for (std::size_t i = 0; i < itemDrains.size(); ++i) {
-        const auto count = itemDrains[i].exchange(0);
-        if (count == 0) continue;
-        char item[48];
-        std::snprintf(item, sizeof(item), " %s %llu", KindNames[i], static_cast<unsigned long long>(count));
-        text += item;
-    }
+    const auto kinds = [&text](std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)>& counts) {
+        for (std::size_t i = 0; i < counts.size(); ++i) {
+            const auto count = counts[i].exchange(0);
+            if (count == 0) continue;
+            char item[48];
+            std::snprintf(item, sizeof(item), " %s %llu", KindNames[i], static_cast<unsigned long long>(count));
+            text += item;
+        }
+    };
+    kinds(itemDrains);
+    text += "; items relayed:";
+    kinds(itemRelays);
     return text;
 }
 
@@ -208,6 +231,7 @@ void DrawFinisher::Enqueue(Job job) {
 void DrawFinisher::Enqueue(Job job, Pending held) {
     finisherProducer = true;
     const auto epoch = GuestMemory::HeldCollectEpoch();
+    const auto order = nextOrder();
     constexpr std::size_t depth = 16;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
@@ -224,6 +248,7 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     }
     jobs.push_back(std::move(job));
     epochs.push_back(epoch);
+    orders.push_back(order);
     pending.push_back(std::move(held));
     outstanding.fetch_add(1, std::memory_order_release);
     if (!running) {
@@ -253,6 +278,7 @@ void DrawFinisher::run() {
             sleeping = false;
             job = &jobs.front();
             epoch = epochs.front();
+            runningOrder = orders.front();
             failed = failure != nullptr;
         }
         if (DrawPipeline::SharedCollectEpoch()) GuestMemory::AdoptCollectEpoch(epoch);
@@ -267,6 +293,7 @@ void DrawFinisher::run() {
         ran.push_back(std::move(jobs.front()));
         jobs.pop_front();
         epochs.pop_front();
+        orders.pop_front();
         pending.pop_front();
         outstanding.fetch_sub(1, std::memory_order_release);
         idle.notify_all();
@@ -362,6 +389,22 @@ bool DrawPipeline::SharedCollectEpoch() {
     return shared;
 }
 
+bool DrawPipeline::VerifiesOrder() {
+    static const bool verifies = std::getenv("APS5_VERIFY_PIPELINE_ORDER") != nullptr;
+    return verifies;
+}
+
+bool DrawPipeline::CommitOrder::Accept(Order next) {
+    const auto found = std::find_if(last.begin(), last.end(), [&](const Order& seen) { return seen.producer == next.producer; });
+    if (found == last.end()) {
+        last.push_back(next);
+        return true;
+    }
+    if (next.sequence < found->sequence) return false;
+    found->sequence = next.sequence;
+    return true;
+}
+
 unsigned DrawPipeline::Committers() {
     return runningCommitters.load(std::memory_order_acquire);
 }
@@ -407,9 +450,31 @@ void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vecto
 void DrawPipeline::enqueue(Item item) {
     item.collectEpoch = GuestMemory::HeldCollectEpoch();
     if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
+        if (DrawFinisher::Relays() && item.reads.empty()) {
+            relay(std::move(item));
+            return;
+        }
         DrawFinisher::NoteItemDrain(item.kind);
         DrawFinisher::Get().DrainAt(DrawFinisher::DrainSite::Item);
     }
+    push(std::move(item));
+}
+
+void DrawPipeline::relay(Item item) {
+    const auto kind = item.kind;
+    DrawFinisher::Pending held;
+    held.unknown = false;
+    held.writes = item.writes;
+    held.labelAddress = item.labelAddress;
+    held.labelBytes = item.labelBytes;
+    auto carried = std::make_shared<Item>(std::move(item));
+    DrawFinisher::Get().Enqueue([this, carried] { push(std::move(*carried)); }, std::move(held));
+    DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Item, false);
+    DrawFinisher::NoteItemRelay(kind);
+}
+
+void DrawPipeline::push(Item item) {
+    item.order = DrawFinisher::OnFinisherThread() ? runningOrder : nextOrder();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
@@ -561,10 +626,12 @@ void DrawPipeline::run() {
     ReserveCommitterCore();
     StartCommitterSampler();
     static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    CommitOrder committed;
     for (;;) {
         Commit* commit = nullptr;
         bool isDraw = false;
         std::uint64_t epoch = 0;
+        Order order;
         const std::vector<Range>* writes = nullptr;
         auto kind = CommitKind::Other;
         const bool starved = timed && outstanding.load(std::memory_order_acquire) == 0;
@@ -585,6 +652,7 @@ void DrawPipeline::run() {
             epoch = items.front().collectEpoch;
             writes = &items.front().writes;
             kind = items.front().kind;
+            order = items.front().order;
         }
         if (SharedCollectEpoch()) GuestMemory::AdoptCollectEpoch(epoch);
         const auto start = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -592,6 +660,7 @@ void DrawPipeline::run() {
         bool failed = false;
         bool shutdown = false;
         try {
+            if (VerifiesOrder() && !committed.Accept(order)) throw std::runtime_error("draw pipeline: the committer reached an item its thread queued before one already committed (APS5_VERIFY_PIPELINE_ORDER)");
             if (commit != nullptr) (*commit)();
             if (!isDraw) breakProofsAfter(kind, *writes);
         } catch (const std::exception&) {

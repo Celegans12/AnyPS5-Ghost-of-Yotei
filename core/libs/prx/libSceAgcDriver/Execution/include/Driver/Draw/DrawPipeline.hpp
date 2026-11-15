@@ -32,6 +32,16 @@ public:
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
     enum class QueuedWrite : std::uint8_t { None, Stored, Unknown };
     enum class CommitKind : std::uint8_t { Other, Draw, IndirectDraw, ColorMetadata, Dispatch, SampleDump, DmaFill, DmaWrite, DmaCopy, Store, EndOfPipe, Seal, SubmitEnd, Completion, BufferFill, Count };
+    struct Order {
+        std::uint64_t producer = 0;
+        std::uint64_t sequence = 0;
+    };
+    class CommitOrder {
+    public:
+        bool Accept(Order next);
+    private:
+        std::vector<Order> last;
+    };
 
     static DrawPipeline& Queue0();
     static std::size_t Depth();
@@ -40,6 +50,7 @@ public:
     static std::atomic<std::uint64_t>& EpochToken();
     static void FollowEpoch(std::uint64_t token);
     static bool SharedCollectEpoch();
+    static bool VerifiesOrder();
     static unsigned Committers();
 
     void Enqueue(Commit commit, std::vector<Range> writes, std::uint64_t labelAddress = 0, std::vector<std::byte> labelBytes = {}, std::vector<Range> reads = {}, bool draw = false);
@@ -80,9 +91,12 @@ private:
         bool store = false;
         CommitKind kind = CommitKind::Other;
         std::uint64_t collectEpoch = 0;
+        Order order;
     };
     DrawPipeline() = default;
     void enqueue(Item item);
+    void relay(Item item);
+    void push(Item item);
     void run();
     void rethrowFailure();
     void report(std::chrono::steady_clock::time_point now);
@@ -147,7 +161,9 @@ public:
     enum class DrainSite : std::uint32_t { Lookup, Reads, Packet, Kept, SubmissionEnd, Item, Count };
     static void NoteDrain(DrainSite site, bool drained);
     static void NoteItemDrain(DrawPipeline::CommitKind kind);
+    static void NoteItemRelay(DrawPipeline::CommitKind kind);
     static std::uint64_t DrainCount(DrainSite site, bool drained);
+    static bool Relays();
     static std::string DrainText();
     static void NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits);
     static DrawFinisher& Get();
@@ -170,6 +186,7 @@ private:
     std::condition_variable idle;
     std::deque<Job> jobs;
     std::deque<std::uint64_t> epochs;
+    std::deque<DrawPipeline::Order> orders;
     std::deque<Pending> pending;
     std::vector<Job> ran;
     std::exception_ptr failure;

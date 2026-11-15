@@ -1,0 +1,5 @@
+# libSceAgcDriver
+
+## add Opt-in draw paths
+
+- [Ordered items behind the draw finisher](../../../core/libs/prx/libSceAgcDriver/Execution/src/Driver/Draw/DrawPipeline.cpp) (`APS5_DRAW_PIPELINE`) - an ordered item queued while the finisher holds work is handed to the finisher, which queues it for the committer behind the draws before it (`APS5_NO_FINISHER_RELAY` drains instead). Only an item without read ranges is relayed: `DrawPipeline::HeldReads`, which holds a write-back back over memory a queued item still reads, sees the committer's queue alone, so a DMA copy still drains the finisher first. A store the finisher still holds answers `StoredBytes` with `Unknown`, so a capture over it drains the pipeline instead of taking the queued bytes. The finisher's pending list answers only the thread that queued it; another thread asking `Overlaps` or `Busy` sees a relayed item once the committer's queue holds it, as it already sees a draw handed to the finisher. A failed finisher job skips the items relayed behind it; the failure reaches the worker at its next hand-off or drain, and the items are not committed.
