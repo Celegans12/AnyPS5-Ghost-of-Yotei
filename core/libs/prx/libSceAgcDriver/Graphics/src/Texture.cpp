@@ -5769,6 +5769,18 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
         const auto page = TrapPage();
         // The label's own store goes through an import of its 64 KiB block, and making an import
         // needs the block's pages accessible: a surface in that block is stored, not trapped.
+        // The later store of a trapped surface must find its store import made and used: one
+        // cannot be made over no-access pages, and a store through the ordinary import into
+        // memory armed in the meantime opens the whole import group at that submission.
+        const auto trapStoreReady = [&](const StorageTexture* texture) {
+#if defined(_WIN32)
+            const auto* store = StoreImportFor(texture->context, texture->descriptor.baseAddress, static_cast<std::size_t>(texture->guestBytes));
+            return store != nullptr && store->store;
+#else
+            static_cast<void>(texture);
+            return true;
+#endif
+        };
         const auto sharesLabelBlock = [&](const StorageTexture* texture) {
 #if defined(_WIN32)
             constexpr std::uint64_t block = 65536;
@@ -5792,7 +5804,7 @@ void StorageTexture::StoreReadbackBeforeLabel(const char* reason, VkDevice devic
             if (texture->descriptor.tileMode != TextureTileMode::kLinear && texture->guestBytes > SmallStoreBytes) continue;
 #if defined(__APPLE__) || defined(_WIN32)
             static const bool dryTraps = std::getenv("APS5_LABEL_READ_TRAP_DRY") != nullptr;
-            if (trap && !dryTraps && !sharesLabelBlock(texture) && !TrapReadBackRecently(texture->descriptor.baseAddress) && !sharesPage(texture) && (texture->readTrapped.load(std::memory_order_acquire) || !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) && GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) {
+            if (trap && !dryTraps && !sharesLabelBlock(texture) && !TrapReadBackRecently(texture->descriptor.baseAddress) && !sharesPage(texture) && (texture->readTrapped.load(std::memory_order_acquire) || !DirectMemoryAliased_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) && trapStoreReady(texture) && GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(texture->descriptor.baseAddress), static_cast<std::size_t>(texture->guestBytes))) {
                 texture->readTrapped.store(true, std::memory_order_release);
                 continue;
             }

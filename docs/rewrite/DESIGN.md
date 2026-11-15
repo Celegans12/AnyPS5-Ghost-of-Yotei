@@ -307,12 +307,26 @@ buffer regions often span two mappings and no single import served them. Found a
   the trap goes, arming works around it, and setting a trap does not mark its group for
   another look. None of these changed AoM (177 to 179 ms with traps). The group is the 272 MiB
   one at 0x3fb000000, hot through one block (0x3fb740000); it opens once per trap set (217
-  each). Lead, not verified: the opening comes with the deferred store. A GPU store through an
-  ordinary import into memory that was armed in the meantime opens the whole group for that
-  submission, while the store at the label lands in memory that is still open. If so, deferred
-  stores (all of step 2) must go through the block-exact store imports. Tests 1,809 of 1,809
-  with the traps off; with them on, `agc_driver_dumped_constant_capture` failed once in one
-  suite run with section A on (no message; 20 of 20 alone).
+  each). The opening came with the deferred store: a store import cannot be made over no-access
+  pages, so the later store of a trapped surface went through the ordinary import, and such a
+  store into memory armed in the meantime opens the whole group for that submission. The
+  driver now makes (and uses) the store import before it sets the trap: groups opened 0. AoM
+  is still 185 ms against 155 (both profiled): submissions still arm 29 GiB per run against
+  2.8 (about 116 MiB per trap), collect walks 455 k against 163 k. What opens that memory is
+  open. Tests 1,809 of 1,809 with the traps on and off (one suite run had 8 tests time out
+  together, all pass alone; `agc_driver_dumped_constant_capture` failed once with traps and
+  section A on, 20 of 20 alone).
+- What step 2 can still remove, from the `[storage]` lines (10 s of the scene):
+  - 007 with unit shadows: 28.8 GiB retiled into shadows, 22.5 GiB detiled from them, 7.0 GiB
+    published to host memory (5.5 GiB for "written buffer range", 0.9 GiB upload, 0.6 GiB
+    region: GPU consumers that bind the import, which a read trap does not remove). CPU-facing
+    is the store at labels, 0.7 GiB, which the label traps cover. So on 007 the eager host
+    write is mostly gone with step 1; what costs is the exchange itself (the title reuses pool
+    memory for new surfaces: storage-image sharing, parked).
+  - AoM: "readback before label" stores 10.9 to 12.5 GiB per 10 s, almost all from large
+    surfaces written occasionally (`OccasionalStoreBytes`), which the label traps do not cover
+    (small and linear only). Trapping those instead of storing them is the piece of step 2
+    with a target (7.5 ms of GPU time per present), once the trap overhead above is gone.
 - f8e0ee64d4: eight `thread_local` caches of the direct path had destructors; the draw committer
   crashed in one at thread exit (`agc_driver_village_draw_cost` hung in 9 of 120 runs with
   section A off). They use `ThreadScratch` now; 150 of 150 runs pass.
