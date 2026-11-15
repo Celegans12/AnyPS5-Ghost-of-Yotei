@@ -867,7 +867,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.packetOffset = packetOffset;
     tail.traceToken = traceToken;
     const auto handsOff = [&] { return pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !dumpGraphics && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled(); };
-    const bool laterEligible = (FinisherLookup() || VerifyFinisherLookup()) && registerKey && stageEntries && traceToken == 0 && DrawFinisher::Threads() == 1 && !verifyDrawEntries() && !verifyDrawRecipe() && handsOff();
+    const bool laterEligible = (FinisherLookup() || VerifyFinisherLookup()) && registerKey && stageEntries && traceToken == 0 && !verifyDrawEntries() && !verifyDrawRecipe() && handsOff();
     tail.resolveLater = laterEligible && !VerifyFinisherLookup();
     if (laterEligible && VerifyFinisherLookup()) tail.lookupShadow = LookupShadow(tail);
     if (!tail.resolveLater) resolveDrawTail(tail, submission);
