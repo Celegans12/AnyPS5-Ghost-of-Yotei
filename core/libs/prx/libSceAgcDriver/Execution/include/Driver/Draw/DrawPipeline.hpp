@@ -106,6 +106,8 @@ private:
     bool stopped = false;
     bool closing = false;
     std::uint64_t wakes = 0;
+    std::uint64_t idleWaits = 0;
+    std::uint64_t idleNs = 0;
     std::uint64_t lockWaitNs = 0;
     std::thread thread;
     std::uint64_t commits = 0;
@@ -142,8 +144,10 @@ public:
     LabelLookup PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t& value);
     bool PendingOverlapsAny(std::span<const Range> ranges);
     bool PendingKey(std::uint64_t key, std::uint64_t shape);
-    enum class DrainSite : std::uint32_t { Lookup, Reads, Packet, Kept, Count };
+    enum class DrainSite : std::uint32_t { Lookup, Reads, Packet, Kept, SubmissionEnd, Item, Count };
     static void NoteDrain(DrainSite site, bool drained);
+    static void NoteItemDrain(DrawPipeline::CommitKind kind);
+    static std::uint64_t DrainCount(DrainSite site, bool drained);
     static std::string DrainText();
     static void NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits);
     static DrawFinisher& Get();
@@ -153,6 +157,7 @@ public:
     void Enqueue(Job job);
     void Enqueue(Job job, Pending held);
     void Drain();
+    void DrainAt(DrainSite site);
     void Settle();
     void ReleaseRan();
 

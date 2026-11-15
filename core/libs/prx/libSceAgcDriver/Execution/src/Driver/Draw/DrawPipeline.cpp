@@ -136,11 +136,22 @@ bool DrawFinisher::PendingKey(std::uint64_t key, std::uint64_t shape) {
 }
 
 namespace {
-std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawFinisher::DrainSite::Count)> finisherDrains{}, finisherSkips{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawFinisher::DrainSite::Count)> finisherDrains{}, finisherSkips{}, finisherDrainsEver{}, finisherSkipsEver{}, finisherSiteWaitNs{};
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(DrawPipeline::CommitKind::Count)> itemDrains{};
+std::atomic<std::uint64_t> finisherWaits{0}, finisherWaitNs{0}, finisherRoomWaits{0}, finisherRoomWaitNs{0};
 }
 
 void DrawFinisher::NoteDrain(DrainSite site, bool drained) {
     (drained ? finisherDrains : finisherSkips)[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+    (drained ? finisherDrainsEver : finisherSkipsEver)[static_cast<std::size_t>(site)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void DrawFinisher::NoteItemDrain(DrawPipeline::CommitKind kind) {
+    itemDrains[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+}
+
+std::uint64_t DrawFinisher::DrainCount(DrainSite site, bool drained) {
+    return (drained ? finisherDrainsEver : finisherSkipsEver)[static_cast<std::size_t>(site)].load(std::memory_order_relaxed);
 }
 
 namespace {
@@ -153,7 +164,7 @@ void DrawFinisher::NoteDrainedOpcode(std::uint32_t opcode, bool besideCommits) {
 }
 
 std::string DrawFinisher::DrainText() {
-    constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> names{"lookup", "reads", "packet", "kept draw"};
+    constexpr std::array<const char*, static_cast<std::size_t>(DrainSite::Count)> names{"lookup", "reads", "packet", "kept draw", "submission end", "item"};
     std::string text = "; worker drains of the finisher (drained/skipped):";
     for (std::size_t i = 0; i < names.size(); ++i) {
         char item[64];
@@ -170,6 +181,17 @@ std::string DrawFinisher::DrainText() {
         if (count == 0) break;
         char item[48];
         std::snprintf(item, sizeof(item), " 0x%02zx x%llu (%llu)", top, static_cast<unsigned long long>(count), static_cast<unsigned long long>(drainedBeside[top].exchange(0)));
+        text += item;
+    }
+    const auto milliseconds = [](std::atomic<std::uint64_t>& nanoseconds) { return static_cast<double>(nanoseconds.exchange(0)) / 1e6; };
+    char waits[256];
+    std::snprintf(waits, sizeof(waits), "; worker waits on the finisher: %llu drains (%.1f ms), of them submission end (%.1f ms) item (%.1f ms), %llu for room (%.1f ms); items that drained:", static_cast<unsigned long long>(finisherWaits.exchange(0)), milliseconds(finisherWaitNs), milliseconds(finisherSiteWaitNs[static_cast<std::size_t>(DrainSite::SubmissionEnd)]), milliseconds(finisherSiteWaitNs[static_cast<std::size_t>(DrainSite::Item)]), static_cast<unsigned long long>(finisherRoomWaits.exchange(0)), milliseconds(finisherRoomWaitNs));
+    text += waits;
+    for (std::size_t i = 0; i < itemDrains.size(); ++i) {
+        const auto count = itemDrains[i].exchange(0);
+        if (count == 0) continue;
+        char item[48];
+        std::snprintf(item, sizeof(item), " %s %llu", KindNames[i], static_cast<unsigned long long>(count));
         text += item;
     }
     return text;
@@ -194,7 +216,12 @@ void DrawFinisher::Enqueue(Job job, Pending held) {
     if (!ran.empty()) std::swap(ran, reclaim);
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
     if (jobs.size() >= depth && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher full while the enqueuing thread holds the GPU lock");
-    idle.wait(lock, [&] { return jobs.size() < depth; });
+    if (jobs.size() >= depth) {
+        const auto start = std::chrono::steady_clock::now();
+        idle.wait(lock, [&] { return jobs.size() < depth; });
+        finisherRoomWaits.fetch_add(1, std::memory_order_relaxed);
+        finisherRoomWaitNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+    }
     jobs.push_back(std::move(job));
     epochs.push_back(epoch);
     pending.push_back(std::move(held));
@@ -255,11 +282,33 @@ void DrawFinisher::Settle() {
 
 void DrawFinisher::Drain() {
     if (OnFinisherThread()) return;
-    if (Busy() && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    const bool waits = Busy();
+    if (waits && GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw finisher drain under the GPU lock");
+    const auto start = waits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     SpinUntil(HandoffSpinWindow() * 2, [&] { return outstanding.load(std::memory_order_acquire) == 0; });
     std::unique_lock lock(mutex);
     if (!jobs.empty()) idle.wait(lock, [&] { return jobs.empty(); });
+    if (waits) {
+        finisherWaits.fetch_add(1, std::memory_order_relaxed);
+        finisherWaitNs.fetch_add(elapsedNs(start), std::memory_order_relaxed);
+    }
     if (failure != nullptr) std::rethrow_exception(std::exchange(failure, nullptr));
+}
+
+void DrawFinisher::DrainAt(DrainSite site) {
+    struct Waited {
+        DrainSite site;
+        bool waits;
+        std::chrono::steady_clock::time_point start;
+        ~Waited() {
+            if (!waits) return;
+            NoteDrain(site, true);
+            finisherSiteWaitNs[static_cast<std::size_t>(site)].fetch_add(elapsedNs(start), std::memory_order_relaxed);
+        }
+    };
+    const bool waits = Busy() && !OnFinisherThread();
+    const Waited waited{site, waits, waits ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}};
+    Drain();
 }
 
 void DrawFinisher::ReleaseRan() {
@@ -357,7 +406,10 @@ void DrawPipeline::EnqueueStore(Commit commit, std::uint64_t address, std::vecto
 
 void DrawPipeline::enqueue(Item item) {
     item.collectEpoch = GuestMemory::HeldCollectEpoch();
-    if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) DrawFinisher::Get().Drain();
+    if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
+        DrawFinisher::NoteItemDrain(item.kind);
+        DrawFinisher::Get().DrainAt(DrawFinisher::DrainSite::Item);
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
@@ -431,7 +483,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     char reads[96];
     std::snprintf(reads, sizeof(reads), " %llu read ranges, %llu stores held, %llu decode drains", static_cast<unsigned long long>(heldReadRanges.Sum()), static_cast<unsigned long long>(heldReadHits.Take()), static_cast<unsigned long long>(decodeDrainCount - reportedDecodeDrains));
     reportedDecodeDrains = decodeDrainCount;
-    AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), reads, drainText.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[draw] pipelined (10 s, depth %zu): %llu commits at %.1f us each on the committer, %llu failed; %llu enqueued behind %.2f on average, waiting %.1f us per draw for room, %.2f us for the lock; %llu committer wakes, idle %.1f ms in %llu waits;%s; drains:%s\n", Depth(), static_cast<unsigned long long>(commits), perCommit, static_cast<unsigned long long>(commitErrors), static_cast<unsigned long long>(enqueued), queued, perDraw, enqueued == 0 ? 0.0 : static_cast<double>(lockWaitNs) / 1e3 / static_cast<double>(enqueued), static_cast<unsigned long long>(wakes), static_cast<double>(idleNs) / 1e6, static_cast<unsigned long long>(idleWaits), reads, drainText.c_str());
     std::string kindText;
     for (std::size_t i = 0; i < kindCommits.size(); ++i) {
         const auto count = kindCommits[i].exchange(0, std::memory_order_relaxed);
@@ -489,7 +541,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     const auto locks = GuestMemory::LockCounted();
     AgcDriver::ProfilePrint_nid_no_patch("[locks] (10 s): %s\n", GuestMemory::LockReport(reportedLocks, locks).c_str());
     reportedLocks = locks;
-    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = 0;
+    commits = commitNs = commitErrors = enqueued = fullWaitNs = depthSum = wakes = lockWaitNs = idleWaits = idleNs = 0;
     drains = {};
     drainWaitNs = {};
 }
@@ -515,6 +567,8 @@ void DrawPipeline::run() {
         std::uint64_t epoch = 0;
         const std::vector<Range>* writes = nullptr;
         auto kind = CommitKind::Other;
+        const bool starved = timed && outstanding.load(std::memory_order_acquire) == 0;
+        const auto idleStart = starved ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0; });
         {
             std::unique_lock lock(mutex);
@@ -522,6 +576,10 @@ void DrawPipeline::run() {
             wake.wait(lock, [&] { return !items.empty() || closing; });
             committerWaiting = false;
             if (items.empty()) break;
+            if (starved) {
+                ++idleWaits;
+                idleNs += elapsedNs(idleStart);
+            }
             commit = stopped ? nullptr : &items.front().commit;
             isDraw = items.front().draw;
             epoch = items.front().collectEpoch;
