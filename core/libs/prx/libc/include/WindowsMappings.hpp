@@ -667,6 +667,37 @@ public:
         return every;
     }
 
+    bool RearmBlocks(std::uintptr_t address, std::size_t bytes, std::uint64_t* tokens, std::uint16_t* written, std::uint64_t* reasons, std::size_t count) {
+        if (tokens == nullptr || written == nullptr) return false;
+        std::fill_n(written, count, std::uint16_t{0xffff});
+        if (reasons != nullptr) std::fill_n(reasons, count, WindowsPageTrack::Reason(PageTrackReason::Disabled));
+        if (!track.Enabled() || !WindowsPageTrack::Spans(address, bytes, count)) {
+            std::fill_n(tokens, count, std::uint64_t{0});
+            return false;
+        }
+        std::lock_guard lock(mutex);
+        const auto now = track.Period();
+        bool every = true;
+        auto block = address & ~(WindowsPageTrack::BlockBytes - 1);
+        for (std::size_t index = 0; index < count; ++index, block += WindowsPageTrack::BlockBytes) {
+            const auto held = tokens[index];
+            const auto word = track.Word(block);
+            const auto state = WindowsPageTrack::StateOfWord(word);
+            if (held != 0 && word == held && state == WindowsPageTrack::State::Armed) {
+                written[index] = 0;
+                if (reasons != nullptr) reasons[index] = WindowsPageTrack::Reason(PageTrackReason::Armed);
+                continue;
+            }
+            const bool since = held != 0 && state == WindowsPageTrack::State::Written && WindowsPageTrack::SameArming(word, held);
+            std::uint16_t pages = 0;
+            const auto reason = armOnRequest(block, now, &tokens[index], &pages);
+            if (tokens[index] != 0 && since) written[index] = pages;
+            if (reasons != nullptr) reasons[index] = reason;
+            if (tokens[index] == 0) every = false;
+        }
+        return every;
+    }
+
     void ForgetKnownZero(std::uintptr_t address, std::size_t bytes) {
         if (bytes == 0 || bytes > UINTPTR_MAX - address) return;
         if (zeroFilterAnswers() && !mayHoldZero(address, address + bytes)) {
@@ -1557,7 +1588,10 @@ private:
             return;
         }
         if (clear && track.Enabled()) {
-            for (auto block = first & ~(WindowsPageTrack::BlockBytes - 1); block < stop; block += WindowsPageTrack::BlockBytes) track.NoteWritten(block);
+            for (auto block = first & ~(WindowsPageTrack::BlockBytes - 1); block < stop; block += WindowsPageTrack::BlockBytes) {
+                if (run.fresh != 0 && track.TakeWritten(block)) track.NoteFault(block);
+                else track.NoteWritten(block);
+            }
         }
         std::vector<std::uintptr_t> written;
         if (collection != Collection::Fresh) {

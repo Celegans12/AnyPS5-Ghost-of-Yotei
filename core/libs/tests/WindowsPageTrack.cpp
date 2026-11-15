@@ -527,6 +527,63 @@ void CheckDemand(bool resident) {
     Require(!mappings.ArmBlocks(memory.Block(Blocks), BlockBytes, &hot, &reason, 1) && hot == 0 && ReasonOf(reason) == Reason::Edge, kind + ": a block outside the allocation was armed on request");
 }
 
+void CheckRearm(bool resident) {
+    constexpr std::size_t Blocks = 6;
+    constexpr std::uint16_t Every = 0xffffu;
+    auto& track = Track::Get();
+    auto& mappings = Mappings::Get();
+    const std::string kind = resident ? "resident" : "private";
+    Guest memory(resident, Blocks * BlockBytes);
+    const auto all = [&] { return memory.Collect(0, Blocks * BlockPages); };
+    const auto bit = [](std::size_t page) { return static_cast<std::uint16_t>(1u << page); };
+    const std::set<std::size_t> none;
+    all();
+    std::array<std::uint64_t, Blocks> tokens{};
+    std::array<std::uint16_t, Blocks> written{};
+    Require(mappings.RearmBlocks(memory.Address(), Blocks * BlockBytes, tokens.data(), written.data(), nullptr, Blocks), kind + ": a rearm without tokens did not arm every block");
+    for (std::size_t block = 0; block < Blocks; ++block) Require(tokens[block] != 0 && written[block] == Every && track.Clean(memory.Block(block)), kind + ": a block armed without a token held did not report every page");
+    const auto first = tokens;
+    Require(mappings.RearmBlocks(memory.Address(), Blocks * BlockBytes, tokens.data(), written.data(), nullptr, Blocks) && tokens == first, kind + ": a rearm of clean blocks changed their tokens");
+    for (std::size_t block = 0; block < Blocks; ++block) Require(written[block] == 0, kind + ": a clean block reported written pages");
+
+    memory.Write(1, 3, 1);
+    memory.Write(1, 7, 1);
+    memory.Write(2, 15, 1);
+    Require(mappings.RearmBlocks(memory.Address(), Blocks * BlockBytes, tokens.data(), written.data(), nullptr, Blocks), kind + ": written blocks were not armed again");
+    Require(written[0] == 0 && written[3] == 0 && tokens[0] == first[0] && tokens[3] == first[3], kind + ": the neighbours of written blocks lost their tokens or reported pages");
+    Require(written[1] == (bit(3) | bit(7)) && written[2] == bit(15) && tokens[1] != first[1] && tokens[2] != first[2], kind + ": the pages written since the token were not reported at the rearm");
+    Require(track.Clean(memory.Block(1)) && track.Clean(memory.Block(2)) && memory.Protection(1) == PAGE_READONLY, kind + ": a block was not armed again by the rearm");
+    auto expected = Pages(1, {3, 7});
+    expected.insert(2 * BlockPages + 15);
+    Require(all() == expected, kind + ": the pages reported at a rearm were taken from the collect");
+    Require(all() == none && track.CleanSince(memory.Address(), Blocks * BlockBytes, tokens.data(), Blocks), kind + ": a collect after a rearm reported pages twice or broke the tokens");
+
+    track.AdvancePeriod();
+    memory.Write(1, 4, 2);
+    Require(mappings.RearmBlocks(memory.Block(1), BlockBytes, &tokens[1], &written[1], nullptr, 1) && written[1] == bit(4), kind + ": a second rearm reported pages of the first");
+
+    memory.Write(0, 1, 3);
+    expected = Pages(0, {1});
+    expected.insert(BlockPages + 4);
+    Require(all() == expected, kind + ": the collect lost a page written to a block armed on request");
+    Require(mappings.RearmBlocks(memory.Block(0), BlockBytes, &tokens[0], &written[0], nullptr, 1) && written[0] == Every && tokens[0] != first[0], kind + ": a block whose pages a collect took first was not reported whole");
+
+    std::uint64_t outdated = first[2];
+    std::uint16_t mask = 0;
+    Require(mappings.RearmBlocks(memory.Block(2), BlockBytes, &outdated, &mask, nullptr, 1) && outdated == tokens[2] && mask == Every, kind + ": an outdated token was answered with a page mask");
+
+    memory.Write(4, 9, 4);
+    std::array<std::uint64_t, 1> words{};
+    Require(mappings.ArmOwned(memory.Block(4) + 0x100, 0x200, words.data(), words.size(), Mappings::OwnedPrivate), kind + ": an owned proof of a written block was refused");
+    Require(mappings.RearmBlocks(memory.Block(4), BlockBytes, &tokens[4], &written[4], nullptr, 1) && written[4] == bit(9), kind + ": the pages an owned proof took from the write watch were missing at the rearm");
+    Require(all() == Pages(4, {9}), kind + ": a page an owned proof and a rearm both saw was lost for the collect");
+
+    mappings.Pin(memory.Block(5), BlockBytes);
+    std::uint64_t reason = 0;
+    Require(!mappings.RearmBlocks(memory.Block(5), BlockBytes, &tokens[5], &written[5], &reason, 1) && tokens[5] == 0 && written[5] == Every && ReasonOf(reason) == GuestArena::PageTrackReason::Held, kind + ": a pinned block was armed again or reported a page mask");
+    mappings.Unpin(memory.Block(5), BlockBytes);
+}
+
 void CheckDemandRace(bool resident) {
     constexpr std::size_t Writers = 8;
     constexpr std::size_t Blocks = 16;
@@ -800,12 +857,17 @@ int main(int argc, char** argv) {
         } else if (mode == "demand") {
             CheckDemand(false);
             CheckDemand(true);
+        } else if (mode == "rearm") {
+            CheckRearm(false);
+            CheckRearm(true);
         } else if (mode == "demand-race") {
             CheckDemandRace(false);
             CheckDemandRace(true);
         } else if (mode == "verify-demand") {
             CheckDemand(false);
             CheckDemand(true);
+            CheckRearm(false);
+            CheckRearm(true);
             CheckDemandRace(false);
             CheckDemandRace(true);
             Require(Track::Get().Counted().divergences == 0, "verified collects diverged under requested armings");
@@ -819,7 +881,7 @@ int main(int argc, char** argv) {
                 Require(Track::Get().Counted().divergences == 0, "verified collects diverged under concurrent writers");
             }
         } else {
-            std::fprintf(stderr, "usage: %s table|race|guards|collect|hot|collect-race|demand|demand-race|verify|verify-race|verify-demand\n", argv[0]);
+            std::fprintf(stderr, "usage: %s table|race|guards|collect|hot|collect-race|demand|rearm|demand-race|verify|verify-race|verify-demand\n", argv[0]);
             result = 2;
         }
         if (result == 0) std::printf("page tracking %.*s tests passed\n", static_cast<int>(mode.size()), mode.data());

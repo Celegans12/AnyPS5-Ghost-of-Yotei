@@ -213,6 +213,10 @@ public:
         return with(Word(block), State::Armed);
     }
 
+    static bool SameArming(std::uint64_t word, std::uint64_t token) {
+        return (word & ~StateMask) == (token & ~StateMask);
+    }
+
     static std::uint64_t Reason(PageTrackReason reason, std::uint64_t frames = 0) {
         return static_cast<std::uint64_t>(reason) | (frames << PageTrackReasonFramesShift);
     }
