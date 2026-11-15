@@ -4,6 +4,7 @@
 #include <array>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <initializer_list>
 #include <random>
@@ -309,6 +310,23 @@ void CheckGuards(bool resident) {
     const auto before = handled.load();
     memory.Write(14, 0, 9);
     Require(handled.load() - before == 1 && !mappings.OwnedUnchanged(memory.Block(14) + 0x100, 0x200, words.data(), words.size()), kind + ": an owned proof survived a write to its armed block");
+
+    const bool unlocked = std::getenv("APS5_NO_UNLOCKED_HOST_WRITES") == nullptr;
+    const auto target = memory.Block(22) + 3 * PageBytes;
+    auto token = mappings.OpenHostWrite(target, 16);
+    Require(token > 1, kind + ": the first host write to a page of fresh guest memory did not take the mapping lock");
+    mappings.CloseHostWrite(target, 16, token);
+    token = mappings.OpenHostWrite(target, 16);
+    Require(token != 0 && (token == 1) == unlocked, kind + ": a short host write to an open block took the wrong path");
+    Require(!track.Armable(memory.Block(22)) && !track.Arm(memory.Block(22)) && open(22), kind + ": a block under an open host write can be armed");
+    mappings.CloseHostWrite(target, 16, token);
+    Require(track.Armable(memory.Block(22)), kind + ": a block stays unarmable after its short host write");
+    arm(22);
+    token = mappings.OpenHostWrite(target, 16);
+    Require(token > 1 && open(22), kind + ": a short host write on an armed block left it armed");
+    Require(file.Read(memory.data + 22 * BlockBytes + 3 * PageBytes, &error) && memory.data[22 * BlockBytes + 3 * PageBytes + 8] == 0xa5, kind + ": a kernel write under a short host write failed");
+    mappings.CloseHostWrite(target, 16, token);
+    Require(track.Armable(memory.Block(22)), kind + ": a block stays unarmable after the host write that reopened it");
 
     arm(16);
     arm(17);

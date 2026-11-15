@@ -419,6 +419,160 @@ static void CheckUnlockedProofRaces() {
     Require(exact);
     Require(!missed.load(std::memory_order_acquire));
 }
+
+static void CheckUnlockedHostWrites(bool resident) {
+    const bool unlocked = std::getenv("APS5_NO_UNLOCKED_HOST_WRITES") == nullptr;
+    const auto other = static_cast<std::size_t>(Mappings::LockSite::Other);
+    const unsigned flags = resident ? 0 : Mappings::OwnedPrivate;
+    Memory memory(2 * blockBytes, resident);
+    auto& mappings = memory.mappings;
+    const auto taken = [&] { return mappings.LockCounted().sites[other].acquisitions; };
+    const auto opened = [&] { return mappings.LockCounted().unlockedHostWrites; };
+    const auto target = memory.Address() + 4096 + 7;
+    auto token = mappings.OpenHostWrite(target, 4);
+    Require(token > 1);
+    mappings.CloseHostWrite(target, 4, token);
+    memory.Collect(true);
+    auto locks = taken();
+    const auto writes = opened();
+    token = mappings.OpenHostWrite(target, 4);
+    Require(token != 0 && (token == 1) == unlocked);
+    Require(taken() == locks + (unlocked ? 0u : 1u) && opened() == writes + (unlocked ? 1u : 0u));
+    std::array<std::uint64_t, 2> words{};
+    Require(!memory.Arm(words.data(), flags));
+    memory.base[4096 + 7] = 29;
+    locks = taken();
+    mappings.CloseHostWrite(target, 4, token);
+    Require(taken() == locks + (unlocked ? 0u : 1u));
+    const auto written = memory.Collect(true);
+    Require(written.size() == 1 && written[0] == memory.base + 4096);
+    Require(memory.Arm(words.data(), flags));
+    token = mappings.OpenHostWrite(target, 4);
+    Require(token > 1 && !memory.Same(words.data()));
+    mappings.CloseHostWrite(target, 4, token);
+    token = mappings.OpenHostWrite(target + 8192, 4);
+    Require(token > 1);
+    mappings.CloseHostWrite(target + 8192, 4, token);
+    token = mappings.OpenHostWrite(memory.Address() + 4096, blockBytes + 1);
+    Require(token > 1);
+    mappings.CloseHostWrite(memory.Address() + 4096, blockBytes + 1, token);
+    token = mappings.OpenHostWrite(target, 0);
+    Require(token > 1);
+    mappings.CloseHostWrite(target, 0, token);
+    token = mappings.OpenHostWrite(target, 4);
+    Require(token != 0 && (token == 1) == unlocked);
+    mappings.CloseHostWrite(target, 4, token);
+    Require(memory.Arm(words.data(), flags));
+    if (!resident) return;
+    mappings.SetProtection(memory.Address(), memory.bytes, PAGE_READONLY);
+    Require(mappings.OpenHostWrite(target, 4) == 0);
+    mappings.SetProtection(memory.Address(), memory.bytes, PAGE_READWRITE);
+    token = mappings.OpenHostWrite(target, 4);
+    Require(token != 0 && (token == 1) == unlocked);
+    Require(mappings.MapAlias(memory.Address(), memory.bytes) == nullptr);
+    std::uint32_t protection = 0;
+    Require(mappings.Protection(target, &protection) && protection == PAGE_READWRITE);
+    mappings.CloseHostWrite(target, 4, token);
+    auto* alias = static_cast<unsigned char*>(mappings.MapAlias(memory.Address(), memory.bytes));
+    Require(alias != nullptr);
+    token = mappings.OpenHostWrite(target, 4);
+    Require(token > 1);
+    memory.base[4096 + 7] = 31;
+    mappings.CloseHostWrite(target, 4, token);
+    Require(alias[4096 + 7] == 31);
+    mappings.UnmapAlias(alias);
+}
+
+static void CheckHostWriteTokens() {
+    Memory memory;
+    auto& mappings = memory.mappings;
+    const auto target = memory.Address() + 8192;
+    const auto token = mappings.OpenHostWrite(target, 8);
+    Require(token > 1);
+    mappings.Reset(memory.base, memory.bytes);
+    mappings.Map(memory.base, memory.bytes, memory.section, 0, PAGE_READWRITE, true, true);
+    mappings.CloseHostWrite(target, 8, token);
+    auto* alias = mappings.MapAlias(memory.Address(), memory.bytes);
+    Require(alias != nullptr);
+    mappings.UnmapAlias(alias);
+}
+
+static void CheckUnlockedHostWriteRaces() {
+    const bool unlocked = std::getenv("APS5_NO_UNLOCKED_HOST_WRITES") == nullptr;
+    constexpr std::size_t pages = 4 * blockBytes / 4096;
+    Memory memory(4 * blockBytes, false);
+    Memory churn;
+    auto& mappings = memory.mappings;
+    for (std::size_t page = 0; page < pages; ++page) {
+        const auto token = mappings.OpenHostWrite(memory.Address() + page * 4096, 4096);
+        Require(token != 0);
+        mappings.CloseHostWrite(memory.Address() + page * 4096, 4096, token);
+    }
+    memory.Collect(true);
+    const auto before = mappings.LockCounted().unlockedHostWrites;
+    std::array<std::atomic<bool>, pages> owed{};
+    std::atomic<bool> stop{false};
+    std::atomic<bool> failed{false};
+    std::atomic<unsigned> writing{2};
+    std::thread collector([&] {
+        std::array<void*, pages> found{};
+        while (!stop.load(std::memory_order_acquire)) {
+            std::size_t count = found.size();
+            if (!mappings.Collect(memory.Address(), memory.bytes, found.data(), &count, true)) failed.store(true, std::memory_order_release);
+            for (std::size_t index = 0; index < count; ++index) owed[(reinterpret_cast<std::uintptr_t>(found[index]) - memory.Address()) / 4096].store(false);
+        }
+    });
+    std::thread mapper([&] {
+        while (!stop.load(std::memory_order_acquire)) {
+            mappings.Reset(churn.base, churn.bytes);
+            mappings.Map(churn.base, churn.bytes, churn.section, 0, PAGE_READWRITE, true, true);
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1500);
+    const auto write = [&](unsigned id) {
+        for (unsigned round = 0; !failed.load(std::memory_order_acquire); ++round) {
+            if (round % 64 == 0 && std::chrono::steady_clock::now() >= until) break;
+            const auto page = (round * 7 + id * 13) % pages;
+            const auto offset = page * 4096 + 64 + id;
+            const auto token = mappings.OpenHostWrite(memory.Address() + offset, 1);
+            if (token == 0) {
+                failed.store(true, std::memory_order_release);
+                break;
+            }
+            owed[page].store(true);
+            memory.base[offset] = static_cast<unsigned char>(round);
+            mappings.CloseHostWrite(memory.Address() + offset, 1, token);
+            if (round % 16 != 0) continue;
+            const auto spare = churn.Address() + (round / 16 % 16) * 4096;
+            const auto held = mappings.OpenHostWrite(spare, 8);
+            mappings.CloseHostWrite(spare, 8, held);
+        }
+        writing.fetch_sub(1);
+    };
+    std::thread first(write, 0u);
+    std::thread second(write, 1u);
+    std::array<std::uint64_t, 4> words{};
+    while (writing.load() != 0) {
+        memory.Arm(words.data(), Mappings::OwnedPrivate);
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    first.join();
+    second.join();
+    stop.store(true, std::memory_order_release);
+    collector.join();
+    mapper.join();
+    Require(!failed.load(std::memory_order_acquire));
+    std::vector<bool> reported(pages);
+    for (auto* page : memory.Collect(true)) reported[(reinterpret_cast<std::uintptr_t>(page) - memory.Address()) / 4096] = true;
+    for (std::size_t page = 0; page < pages; ++page) Require(!owed[page].load() || reported[page]);
+    Require(memory.Arm(words.data(), Mappings::OwnedPrivate));
+    const auto opened = mappings.LockCounted().unlockedHostWrites - before;
+    Require(unlocked ? opened != 0 : opened == 0);
+    auto* alias = mappings.MapAlias(churn.Address(), churn.bytes);
+    Require(alias != nullptr);
+    mappings.UnmapAlias(alias);
+}
 #endif
 
 static void CheckExports() {
@@ -459,6 +613,10 @@ int main() {
         CheckUnlockedProtection();
         CheckUnlockedProofRaces();
         CheckRangedHostWrites();
+        CheckUnlockedHostWrites(true);
+        CheckUnlockedHostWrites(false);
+        CheckHostWriteTokens();
+        CheckUnlockedHostWriteRaces();
 #endif
         CheckExports();
         std::puts("owned guest memory checks passed");

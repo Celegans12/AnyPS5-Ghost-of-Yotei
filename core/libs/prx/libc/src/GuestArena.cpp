@@ -1077,6 +1077,25 @@ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #endif
 }
 
+std::uint64_t GuestArenaOpenHostWrite_nid_no_patch(void* pointer, std::size_t bytes) {
+    if (const auto hook = hostWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+#ifdef _WIN32
+    return WindowsMappings::Get().OpenHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+#else
+    GuestWriteWatch::GuestWriteWatchBeginHostWrite_nid_postfix(pointer, bytes);
+    return 1;
+#endif
+}
+
+void GuestArenaCloseHostWrite_nid_no_patch(void* pointer, std::size_t bytes, std::uint64_t token) {
+    if (token == 0) return;
+#ifdef _WIN32
+    WindowsMappings::Get().CloseHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, token);
+#else
+    GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(pointer, bytes);
+#endif
+}
+
 #ifndef _WIN32
 namespace {
 

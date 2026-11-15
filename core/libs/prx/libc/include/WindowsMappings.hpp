@@ -78,6 +78,7 @@ public:
         auto counts = mutex.Counted();
         for (std::size_t outcome = 0; outcome < MappingForgetOutcomes; ++outcome) counts.forgets[outcome] = forgetOutcomes[outcome].load(std::memory_order_relaxed);
         counts.unlocked = unlockedAnswers.load(std::memory_order_relaxed);
+        counts.unlockedHostWrites = unlockedWrites.load(std::memory_order_relaxed);
         return counts;
     }
 
@@ -138,7 +139,7 @@ public:
                 if (memory.State != MEM_COMMIT) throw std::runtime_error("guest memory is not committed");
                 for (auto mapped = views.lower_bound(cursor & ~(pageBytes - 1)); mapped != views.end() && mapped->first < stop; ++mapped) {
                     mapped->second.protection = protection;
-                    publishView(mapped->first, protection);
+                    publishView(mapped->first, protection, mapped->second.resident);
                     mapped->second.armed = 0;
                     invalidate(mapped->first, mapped->second);
                 }
@@ -266,7 +267,8 @@ public:
                         physical.erase(found);
                     }
                     const auto placed = views.emplace(base + at, View{nullptr, protection, {}, 0, compared, 0, owned, offset + done + at, 0, 0, true}).first;
-                    publishView(placed->first, placed->second.protection);
+                    placed->second.born = ++viewSerial;
+                    publishView(placed->first, placed->second.protection, true);
                 }
                 forgetClean(base, base + runBytes);
                 remember(freshRanges, base, base + runBytes);
@@ -287,7 +289,8 @@ public:
                 slot->stored = true;
                 shared->aliases.push_back(base);
                 const auto created = views.emplace(base, View{shared, protection, {}, 0, false, 0, owned, offset + done, 0, 0, false, slot, hostPages(viewBytes)}).first;
-                publishView(created->first, created->second.protection);
+                created->second.born = ++viewSerial;
+                publishView(created->first, created->second.protection, false);
                 if (shared->comparedWhenShared) created->second.unreported = allSubpages;
                 remember(freshRanges, base, base + pageBytes);
                 invalidate(*shared);
@@ -317,7 +320,8 @@ public:
                 shared->aliases.push_back(base + at);
                 invalidate(*shared);
                 const auto created = views.emplace(base + at, View{std::move(shared), protection, {}, 0, false, 0, owned, offset + done + at, 0, 0, false, std::move(slot)}).first;
-                publishView(created->first, created->second.protection);
+                created->second.born = ++viewSerial;
+                publishView(created->first, created->second.protection, false);
                 if (created->second.page->comparedWhenShared) created->second.unreported = allSubpages;
             }
             remember(freshRanges, base, base + runBytes);
@@ -333,7 +337,7 @@ public:
         collectableRanges.clear();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
-            publishView(it->first, protection);
+            publishView(it->first, protection, it->second.resident);
             it->second.armed = 0;
             invalidate(it->first, it->second);
         }
@@ -468,7 +472,30 @@ public:
         return blank;
     }
 
+    std::uint64_t OpenHostWrite(std::uintptr_t address, std::size_t bytes) {
+        if (enterUnlockedWrite(address, bytes)) {
+            unlockedWrites.fetch_add(1, std::memory_order_relaxed);
+            return unlockedWriteToken;
+        }
+        std::uint64_t token = 0;
+        return beginHostWrite(address, bytes, true, &token) ? token : 0;
+    }
+
+    void CloseHostWrite(std::uintptr_t address, std::size_t bytes, std::uint64_t token) {
+        if (token == 0) return;
+        if (token == unlockedWriteToken) leaveUnlockedWrite(address, bytes);
+        else endHostWrite(address, bytes, true, (token >> 1) - 1);
+    }
+
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes, bool store = true) {
+        return beginHostWrite(address, bytes, store, nullptr);
+    }
+
+    void EndHostWrite(std::uintptr_t address, std::size_t bytes, bool store = true) {
+        endHostWrite(address, bytes, store, UINT64_MAX);
+    }
+
+    bool beginHostWrite(std::uintptr_t address, std::size_t bytes, bool store, std::uint64_t* token) {
         const bool ranged = rangedHostWrites();
         const SiteLock lock(mutex, LockSite::Other, ranged ? address : 0, ranged ? address + bytes : UINTPTR_MAX, MappingLockCaller::BeginHostWrite);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
@@ -496,10 +523,11 @@ public:
             protectSubpages(it->first, opened, view.protection, "open shared memory to a host write", view.viewBytes);
             view.armed &= static_cast<std::uint8_t>(~opened);
         }
+        if (token != nullptr) *token = (viewSerial + 1) << 1;
         return true;
     }
 
-    void EndHostWrite(std::uintptr_t address, std::size_t bytes, bool store = true) {
+    void endHostWrite(std::uintptr_t address, std::size_t bytes, bool store, std::uint64_t serial) {
         const bool ranged = rangedHostWrites();
         const SiteLock lock(mutex, LockSite::Other, ranged ? address : 0, ranged ? address + bytes : UINTPTR_MAX, MappingLockCaller::EndHostWrite);
         const auto end = address + bytes;
@@ -507,8 +535,10 @@ public:
         eraseOwnedRange(ownedHostAccess, address, end);
         track.Release(address, end);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
-            if (store) --it->second.hostWrites;
-            else --it->second.hostImports;
+            if (it->second.born <= serial) {
+                if (store) --it->second.hostWrites;
+                else --it->second.hostImports;
+            }
             if (store) invalidate(it->first, it->second, subpagesOf(it->first, address, end));
             else if (it->second.resident) forgetClean(it->first, it->first + pageBytes);
         }
@@ -550,6 +580,20 @@ public:
             for (auto page = views.find(run->first); page != views.end() && page->first < run->second.end; ++page) {
                 if (page->second.hostWrites != 0) return nullptr;
             }
+        }
+        bool fenced = false;
+        for (std::size_t done = 0; done < bytes; done += pageBytes) {
+            const auto found = views.find(address + done);
+            if (found == views.end() || !found->second.resident) continue;
+            fenceView(found->first);
+            fenced = true;
+        }
+        if (fenced && writersIn(address, address + bytes)) {
+            for (std::size_t done = 0; done < bytes; done += pageBytes) {
+                const auto found = views.find(address + done);
+                if (found != views.end() && found->second.resident) publishView(found->first, found->second.protection, true);
+            }
+            return nullptr;
         }
         for (std::size_t done = 0; done < bytes; done += pageBytes) {
             const auto found = views.find(address + done);
@@ -603,7 +647,7 @@ public:
             if (published != viewUnpublished) {
                 unlockedAnswers.fetch_add(1, std::memory_order_relaxed);
                 if (published == 0) return false;
-                *protection = published;
+                *protection = published & ~viewResident;
                 return true;
             }
         }
@@ -665,6 +709,10 @@ public:
             const auto word = nextOwned++;
             ownedWords[block] = word;
             publishOwned(block, word);
+        }
+        if (writersIn(first, end + 1)) {
+            disown(first, end + 1);
+            return false;
         }
         for (auto block = first; block < end; block += ownedBlockBytes) words[(block - first) / ownedBlockBytes] = ownedWords.at(block);
         return true;
@@ -1082,8 +1130,106 @@ private:
         return &(*leaf)[index % viewLeafPages];
     }
 
-    void publishView(std::uintptr_t base, DWORD protection) {
-        if (auto* slot = viewSlot(base, true)) slot->store(protection == 0 || protection >= viewUnpublished ? viewUnpublished : static_cast<std::uint32_t>(protection));
+    void publishView(std::uintptr_t base, DWORD protection, bool resident) {
+        if (auto* slot = viewSlot(base, true)) slot->store(protection == 0 || protection >= viewResident ? viewUnpublished : static_cast<std::uint32_t>(protection) | (resident ? viewResident : std::uint32_t{0}));
+    }
+
+    void fenceView(std::uintptr_t base) {
+        if (auto* slot = viewSlot(base, true)) slot->store(viewUnpublished);
+    }
+
+    static bool unlockedHostWrites() {
+        static const bool unlocked = std::getenv("APS5_NO_UNLOCKED_HOST_WRITES") == nullptr;
+        return unlocked;
+    }
+
+    std::atomic<std::uint32_t>& writerSlot(std::uintptr_t block) {
+        const auto index = block / ownedBlockBytes;
+        auto& slot = writerTable[index / zeroLeafBlocks];
+        auto* leaf = slot.load();
+        if (leaf == nullptr) {
+            auto* fresh = new WriterLeaf();
+            if (slot.compare_exchange_strong(leaf, fresh)) leaf = fresh;
+            else delete fresh;
+        }
+        return (*leaf)[index % zeroLeafBlocks];
+    }
+
+    bool writersIn(std::uintptr_t first, std::uintptr_t end) const {
+        if (end <= first) return false;
+        const auto last = (end - 1) / ownedBlockBytes;
+        for (auto index = first / ownedBlockBytes; index <= last; ++index) {
+            if (index / zeroLeafBlocks >= zeroLeaves) return false;
+            const auto* leaf = writerTable[index / zeroLeafBlocks].load();
+            if (leaf == nullptr) {
+                index |= zeroLeafBlocks - 1;
+                continue;
+            }
+            if ((*leaf)[index % zeroLeafBlocks].load() != 0) return true;
+        }
+        return false;
+    }
+
+    bool viewsTakeUnlockedWrite(std::uintptr_t address, std::uintptr_t end) const {
+        const auto last = (end - 1) / pageBytes;
+        for (auto index = address / pageBytes; index <= last; ++index) {
+            const auto* leaf = viewTable[index / viewLeafPages].load();
+            const auto published = leaf == nullptr ? std::uint32_t{0} : (*leaf)[index % viewLeafPages].load();
+            if (published == 0) continue;
+            if (published == viewUnpublished || (published & viewResident) == 0 || !writable(published & ~viewResident)) return false;
+        }
+        return true;
+    }
+
+    bool ownedIn(std::uintptr_t address, std::uintptr_t end) const {
+        const auto last = (end - 1) / ownedBlockBytes;
+        for (auto index = address / ownedBlockBytes; index <= last; ++index) {
+            const auto* leaf = ownedTable[index / zeroLeafBlocks].load();
+            if (leaf != nullptr && (*leaf)[index % zeroLeafBlocks].load() != 0) return true;
+        }
+        return false;
+    }
+
+    bool zeroIn(std::uintptr_t address, std::uintptr_t end) const {
+        const auto last = (end - 1) / zeroBlockBytes;
+        for (auto index = address / zeroBlockBytes; index <= last; ++index) {
+            const auto* leaf = zeroMasks[index / zeroLeafBlocks].load();
+            if (leaf == nullptr) continue;
+            const auto block = index * zeroBlockBytes;
+            const auto from = (std::max(address, block) - block) >> 12;
+            const auto to = (std::min(end, block + zeroBlockBytes) - 1 - block) >> 12;
+            const auto wanted = ((std::uint32_t{2} << to) - 1) & ~((std::uint32_t{1} << from) - 1);
+            if (((*leaf)[index % zeroLeafBlocks].load() & wanted) != 0) return true;
+        }
+        return false;
+    }
+
+    bool enterUnlockedWrite(std::uintptr_t address, std::size_t bytes) {
+        constexpr auto limit = std::uintptr_t{1} << 47;
+        if (!unlockedHostWrites() || bytes == 0 || bytes > unlockedWriteBytes || address >= limit || bytes > limit - address) return false;
+        const auto end = address + bytes;
+        for (auto block = address & ~(ownedBlockBytes - 1); block < end; block += ownedBlockBytes) writerSlot(block).fetch_add(1);
+        if (viewsTakeUnlockedWrite(address, end) && !ownedIn(address, end) && !zeroIn(address, end) && track.HoldOpen(address, end)) return true;
+        for (auto block = address & ~(ownedBlockBytes - 1); block < end; block += ownedBlockBytes) writerSlot(block).fetch_sub(1);
+        return false;
+    }
+
+    void leaveUnlockedWrite(std::uintptr_t address, std::size_t bytes) {
+        const auto end = address + bytes;
+        track.ReleaseOpen(address, end);
+        for (auto block = address & ~(ownedBlockBytes - 1); block < end; block += ownedBlockBytes) writerSlot(block).fetch_sub(1);
+    }
+
+    void publishZero(std::uintptr_t chunk, std::uintptr_t block, std::uint64_t word) {
+        const auto index = block / zeroBlockBytes;
+        if (index / zeroLeafBlocks >= zeroLeaves) return;
+        auto& slot = zeroMasks[index / zeroLeafBlocks];
+        auto* leaf = slot.load();
+        if (leaf == nullptr) {
+            leaf = new ZeroMaskLeaf();
+            slot.store(leaf);
+        }
+        (*leaf)[index % zeroLeafBlocks].store(static_cast<std::uint16_t>(word >> (((block - chunk) >> 12) & 63)));
     }
 
     void retireView(std::uintptr_t base) {
@@ -1100,7 +1246,7 @@ private:
 
     bool ownable(std::uintptr_t block, unsigned flags) {
         const auto end = block + ownedBlockBytes;
-        if (overlapsOwnedRange(ownedPins, block, end) || overlapsOwnedRange(ownedHostAccess, block, end)) return false;
+        if (overlapsOwnedRange(ownedPins, block, end) || overlapsOwnedRange(ownedHostAccess, block, end) || writersIn(block, end)) return false;
         const bool guarded = track.Protected(block);
         for (auto cursor = block; cursor < end;) {
             const auto memory = query(cursor);
@@ -1144,6 +1290,7 @@ private:
                 if (added == 0) continue;
                 if (auto* count = zeroCount(block, true)) count->fetch_add(static_cast<std::uint8_t>(std::popcount(added)));
                 word |= added;
+                publishZero(chunk, block, word);
             }
             start = stop;
         }
@@ -1196,6 +1343,7 @@ private:
             const auto removed = zeroBlockMask(chunk, block, from, to) & word;
             if (removed == 0) continue;
             word &= ~removed;
+            publishZero(chunk, block, word);
             if (auto* count = zeroCount(block, false)) count->fetch_sub(static_cast<std::uint8_t>(std::popcount(removed)));
             cleared = true;
         }
@@ -1652,6 +1800,9 @@ private:
     static constexpr std::size_t viewLeaves = std::size_t{1} << 17;
     static_assert(pageBytes * viewLeafPages * viewLeaves == std::size_t{1} << 47, "the published view protections cover the user address range");
     static constexpr std::uint32_t viewUnpublished = UINT32_MAX;
+    static constexpr std::uint32_t viewResident = std::uint32_t{1} << 31;
+    static constexpr std::uint64_t unlockedWriteToken = 1;
+    static constexpr std::size_t unlockedWriteBytes = 0x10000;
     using ViewLeaf = std::array<std::atomic<std::uint32_t>, viewLeafPages>;
     static constexpr std::size_t chunkBytes = 0x200000;
     static constexpr std::size_t zeroBlockBytes = 0x10000;
@@ -1662,6 +1813,9 @@ private:
     using ZeroLeaf = std::array<std::atomic<std::uint8_t>, zeroLeafBlocks>;
     static_assert(ownedBlockBytes == zeroBlockBytes, "the published owned words are laid out like the known zero counts");
     using OwnedLeaf = std::array<std::atomic<std::uint64_t>, zeroLeafBlocks>;
+    static_assert(zeroBlockBytes / 4096 == 16, "the published known zero mask of a block holds one bit per page");
+    using ZeroMaskLeaf = std::array<std::atomic<std::uint16_t>, zeroLeafBlocks>;
+    using WriterLeaf = std::array<std::atomic<std::uint32_t>, zeroLeafBlocks>;
     struct SharedPage {
         std::array<std::uint64_t, subpages> generation = [] {
             std::array<std::uint64_t, subpages> initial{};
@@ -1723,6 +1877,7 @@ private:
         std::uint32_t hostImports = 0;
         bool aliasDemoted = false;
         std::uint8_t unreported = 0;
+        std::uint64_t born = 0;
     };
     struct Run {
         std::uintptr_t end;
@@ -1928,6 +2083,7 @@ private:
         const auto run = std::prev(residentRuns.upper_bound(address));
         const auto start = run->first;
         const auto stop = run->second.end;
+        for (auto page = start; page < stop; page += pageBytes) fenceView(page);
         disown(start, stop);
         track.Forget(start, stop);
         forgetOwnedPending(start, stop);
@@ -1968,6 +2124,7 @@ private:
             view.slot = std::move(slot);
             view.slot->stored = true;
             view.resident = false;
+            publishView(page, view.protection, false);
             view.aliasDemoted = alias;
             view.unreported = view.page->comparedWhenShared ? allSubpages : std::uint8_t{0};
             view.seen.fill(0);
@@ -2559,6 +2716,10 @@ private:
     std::array<std::atomic<ZeroLeaf*>, zeroLeaves> zeroCounts{};
     std::array<std::atomic<OwnedLeaf*>, zeroLeaves> ownedTable{};
     std::array<std::atomic<ViewLeaf*>, viewLeaves> viewTable{};
+    std::array<std::atomic<ZeroMaskLeaf*>, zeroLeaves> zeroMasks{};
+    std::array<std::atomic<WriterLeaf*>, zeroLeaves> writerTable{};
+    std::uint64_t viewSerial = 0;
+    std::atomic<std::uint64_t> unlockedWrites{0};
     std::atomic<std::uint64_t> unlockedAnswers{0};
     std::atomic<bool> anyCompared{false};
     WindowsPageTrack& track = WindowsPageTrack::Get();

@@ -229,11 +229,11 @@ public:
         if (state != State::Unarmed && state != State::Written) return false;
         if (word >= TokenLimit - SerialStep) return false;
         const auto next = word + SerialStep;
-        entry.word.store(with(next, State::Arming), std::memory_order_release);
+        entry.word.store(with(next, State::Arming));
         transitions.fetch_add(1, std::memory_order_acq_rel);
         armed.fetch_add(1, std::memory_order_acq_rel);
         DWORD previous;
-        if (!VirtualProtect(reinterpret_cast<void*>(block), BlockBytes, PAGE_READONLY, &previous)) {
+        if (entry.holds.load() != 0 || !VirtualProtect(reinterpret_cast<void*>(block), BlockBytes, PAGE_READONLY, &previous)) {
             armed.fetch_sub(1, std::memory_order_acq_rel);
             entry.word.store(with(next, state), std::memory_order_release);
             transitions.fetch_add(1, std::memory_order_acq_rel);
@@ -453,6 +453,36 @@ public:
         forEach(first, end, false, [](std::uintptr_t, Block& entry) {
             if (entry.holds != 0) --entry.holds;
         });
+    }
+
+    bool HoldOpen(std::uintptr_t first, std::uintptr_t end) {
+        if (!enabled || end <= first) return true;
+        const auto start = first & ~(BlockBytes - 1);
+        const auto last = (end - 1) & ~(BlockBytes - 1);
+        for (auto block = start;; block += BlockBytes) {
+            auto* entry = find(block);
+            bool held = false;
+            if (entry != nullptr && entry->holds.load() < UINT16_MAX / 2) {
+                entry->holds.fetch_add(1);
+                const auto state = stateOf(entry->word.load());
+                held = state == State::Unarmed || state == State::Written;
+                if (!held) entry->holds.fetch_sub(1);
+            }
+            if (!held) {
+                for (auto taken = start; taken < block; taken += BlockBytes) find(taken)->holds.fetch_sub(1);
+                return false;
+            }
+            if (block == last) return true;
+        }
+    }
+
+    void ReleaseOpen(std::uintptr_t first, std::uintptr_t end) {
+        if (!enabled || end <= first) return;
+        const auto last = (end - 1) & ~(BlockBytes - 1);
+        for (auto block = first & ~(BlockBytes - 1);; block += BlockBytes) {
+            find(block)->holds.fetch_sub(1);
+            if (block == last) return;
+        }
     }
 
     void Import(std::uintptr_t first, std::uintptr_t end) {
