@@ -129,6 +129,7 @@ public:
                 if (memory.State != MEM_COMMIT) throw std::runtime_error("guest memory is not committed");
                 for (auto mapped = views.lower_bound(cursor & ~(pageBytes - 1)); mapped != views.end() && mapped->first < stop; ++mapped) {
                     mapped->second.protection = protection;
+                    publishView(mapped->first, protection);
                     mapped->second.armed = 0;
                     invalidate(mapped->first, mapped->second);
                 }
@@ -255,7 +256,8 @@ public:
                         compared = slot.comparedWhenShared;
                         physical.erase(found);
                     }
-                    views.emplace(base + at, View{nullptr, protection, {}, 0, compared, 0, owned, offset + done + at, 0, 0, true});
+                    const auto placed = views.emplace(base + at, View{nullptr, protection, {}, 0, compared, 0, owned, offset + done + at, 0, 0, true}).first;
+                    publishView(placed->first, placed->second.protection);
                 }
                 forgetClean(base, base + runBytes);
                 remember(freshRanges, base, base + runBytes);
@@ -276,6 +278,7 @@ public:
                 slot->stored = true;
                 shared->aliases.push_back(base);
                 const auto created = views.emplace(base, View{shared, protection, {}, 0, false, 0, owned, offset + done, 0, 0, false, slot, hostPages(viewBytes)}).first;
+                publishView(created->first, created->second.protection);
                 if (shared->comparedWhenShared) created->second.unreported = allSubpages;
                 remember(freshRanges, base, base + pageBytes);
                 invalidate(*shared);
@@ -305,6 +308,7 @@ public:
                 shared->aliases.push_back(base + at);
                 invalidate(*shared);
                 const auto created = views.emplace(base + at, View{std::move(shared), protection, {}, 0, false, 0, owned, offset + done + at, 0, 0, false, std::move(slot)}).first;
+                publishView(created->first, created->second.protection);
                 if (created->second.page->comparedWhenShared) created->second.unreported = allSubpages;
             }
             remember(freshRanges, base, base + runBytes);
@@ -320,6 +324,7 @@ public:
         collectableRanges.clear();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
+            publishView(it->first, protection);
             it->second.armed = 0;
             invalidate(it->first, it->second);
         }
@@ -575,6 +580,16 @@ public:
     }
 
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
+        if (const auto index = address / pageBytes; unlockedReads() && index / viewLeafPages < viewLeaves) {
+            const auto* leaf = viewTable[index / viewLeafPages].load();
+            const auto published = leaf == nullptr ? std::uint32_t{0} : (*leaf)[index % viewLeafPages].load();
+            if (published != viewUnpublished) {
+                unlockedAnswers.fetch_add(1, std::memory_order_relaxed);
+                if (published == 0) return false;
+                *protection = published;
+                return true;
+            }
+        }
         std::lock_guard lock(mutex);
         const auto found = views.find(address & ~(pageBytes - 1));
         if (found == views.end()) return false;
@@ -1029,6 +1044,27 @@ private:
             const auto page = reinterpret_cast<std::uintptr_t>(written[index]) & ~std::uintptr_t{4095};
             forgetZero(page, page + 4096);
         }
+    }
+
+    std::atomic<std::uint32_t>* viewSlot(std::uintptr_t base, bool create) {
+        const auto index = base / pageBytes;
+        if (base % pageBytes != 0 || index / viewLeafPages >= viewLeaves) return nullptr;
+        auto& slot = viewTable[index / viewLeafPages];
+        auto* leaf = slot.load();
+        if (leaf == nullptr) {
+            if (!create) return nullptr;
+            leaf = new ViewLeaf();
+            slot.store(leaf);
+        }
+        return &(*leaf)[index % viewLeafPages];
+    }
+
+    void publishView(std::uintptr_t base, DWORD protection) {
+        if (auto* slot = viewSlot(base, true)) slot->store(protection == 0 || protection >= viewUnpublished ? viewUnpublished : static_cast<std::uint32_t>(protection));
+    }
+
+    void retireView(std::uintptr_t base) {
+        if (auto* slot = viewSlot(base, false)) slot->store(0);
     }
 
     static UINT timedWatch(DWORD flags, void* address, std::size_t bytes, void** pages, ULONG_PTR* count, DWORD* granularity) {
@@ -1580,6 +1616,11 @@ private:
     static_assert(subpageBytes == 4096, "Collect reports one page per subpage");
     static constexpr std::size_t subpages = pageBytes / subpageBytes;
     static constexpr std::uint8_t allSubpages = (1u << subpages) - 1;
+    static constexpr std::size_t viewLeafPages = std::size_t{1} << 16;
+    static constexpr std::size_t viewLeaves = std::size_t{1} << 17;
+    static_assert(pageBytes * viewLeafPages * viewLeaves == std::size_t{1} << 47, "the published view protections cover the user address range");
+    static constexpr std::uint32_t viewUnpublished = UINT32_MAX;
+    using ViewLeaf = std::array<std::atomic<std::uint32_t>, viewLeafPages>;
     static constexpr std::size_t chunkBytes = 0x200000;
     static constexpr std::size_t zeroBlockBytes = 0x10000;
     static constexpr std::size_t zeroLeafBlocks = std::size_t{1} << 16;
@@ -1956,6 +1997,7 @@ private:
                     slot->savedOffset = page - start;
                 }
             }
+            retireView(page);
             views.erase(found);
         }
         if (indexed) residentIndex.erase(entry);
@@ -2155,6 +2197,7 @@ private:
                 if (!unmap(GetCurrentProcess(), reinterpret_cast<void*>(cursor), MEM_PRESERVE_PLACEHOLDER)) fail("unmap shared guest page");
                 for (auto found = views.lower_bound(cursor); found != views.end() && found->first < allocationEnd;) {
                     if (found->second.page != nullptr) std::erase(found->second.page->aliases, found->first);
+                    retireView(found->first);
                     found = views.erase(found);
                 }
                 forget(freshRanges, cursor, allocationEnd);
@@ -2401,6 +2444,7 @@ private:
     std::array<std::atomic<std::uint64_t>, MappingForgetOutcomes> forgetOutcomes{};
     std::array<std::atomic<ZeroLeaf*>, zeroLeaves> zeroCounts{};
     std::array<std::atomic<OwnedLeaf*>, zeroLeaves> ownedTable{};
+    std::array<std::atomic<ViewLeaf*>, viewLeaves> viewTable{};
     std::atomic<std::uint64_t> unlockedAnswers{0};
     WindowsPageTrack& track = WindowsPageTrack::Get();
     HANDLE zeroSection = nullptr;

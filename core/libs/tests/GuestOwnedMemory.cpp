@@ -307,6 +307,39 @@ static void CheckUnlockedReads() {
     Require(!mappings.OwnedUnchanged(address + blockBytes, blockBytes, &words[1], 1));
 }
 
+static void CheckUnlockedProtection() {
+    const bool unlocked = std::getenv("APS5_NO_UNLOCKED_MAPPING_READS") == nullptr;
+    const auto other = static_cast<std::size_t>(Mappings::LockSite::Other);
+    auto& mappings = Mappings::Get();
+    const auto taken = [&] { return mappings.LockCounted().sites[other].acquisitions; };
+    const auto answered = [&] { return mappings.LockCounted().unlocked; };
+    std::uint32_t protection = 0;
+    std::uintptr_t released = 0;
+    {
+        Memory memory(2 * blockBytes);
+        released = memory.Address();
+        auto locks = taken();
+        auto answers = answered();
+        Require(mappings.Protection(memory.Address() + blockBytes + 4097, &protection) && protection == PAGE_READWRITE);
+        Require(taken() == locks + (unlocked ? 0u : 1u) && answered() == answers + (unlocked ? 1u : 0u));
+        mappings.SetProtection(memory.Address(), blockBytes, PAGE_READONLY);
+        Require(mappings.Protection(memory.Address() + blockBytes - 1, &protection) && protection == PAGE_READONLY);
+        Require(mappings.Protection(memory.Address() + blockBytes, &protection) && protection == PAGE_READWRITE);
+        mappings.SetProtection(memory.Address(), blockBytes, PAGE_READWRITE);
+        Require(mappings.Protection(memory.Address(), &protection) && protection == PAGE_READWRITE);
+    }
+    protection = 7;
+    auto locks = taken();
+    auto answers = answered();
+    Require(!mappings.Protection(released, &protection) && protection == 7);
+    Require(taken() == locks + (unlocked ? 0u : 1u) && answered() == answers + (unlocked ? 1u : 0u));
+    Memory plain(blockBytes, false);
+    Require(!mappings.Protection(plain.Address(), &protection) && protection == 7);
+    Require(!mappings.Protection(std::uintptr_t{1} << 47, &protection) && protection == 7);
+    Memory again(blockBytes);
+    Require(mappings.Protection(again.Address() + blockBytes - 1, &protection) && protection == PAGE_READWRITE);
+}
+
 static void CheckUnlockedProofRaces() {
     Memory memory;
     memory.Collect(true);
@@ -376,6 +409,7 @@ int main() {
         CheckRefusals();
         CheckWriterAndCollector();
         CheckUnlockedReads();
+        CheckUnlockedProtection();
         CheckUnlockedProofRaces();
 #endif
         CheckExports();
