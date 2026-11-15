@@ -132,13 +132,10 @@ inline constexpr std::uint64_t ArmedBlockBytes = 65536;
 std::size_t ArmedBlocks(std::uint64_t address, std::size_t bytes);
 bool ArmedTokens(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens);
 bool ArmedCleanSince(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> tokens);
-using ArmReason = GuestArena::PageTrackReason;
-constexpr ArmReason ArmReasonOf(std::uint64_t reason) { return static_cast<ArmReason>(reason & GuestArena::PageTrackReasonMask); }
-constexpr std::uint32_t ArmReasonFrames(std::uint64_t reason) { return static_cast<std::uint32_t>(reason >> GuestArena::PageTrackReasonFramesShift); }
-bool ArmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens, std::span<std::uint64_t> reasons = {});
-bool ArmedReasons(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> reasons);
-inline constexpr std::uint16_t EveryArmedPage = 0xffffu;
-bool RearmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written, std::span<std::uint64_t> reasons = {});
+bool ArmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens);
+bool RearmWritten(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> since, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written);
+enum class Unarmed : std::uint8_t { No = 0, Held = 1, Imported = 2, Barred = 3, Resting = 4, Edge = 5, Other = 6 };
+std::uint8_t UnarmedReason(std::uint64_t address);
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::span<std::uint64_t> tokens = {});
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);
 // Returns the generation the blocks were stamped with (0 when the arena is not write-watched):

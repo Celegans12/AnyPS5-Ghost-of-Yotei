@@ -2720,12 +2720,10 @@ bool ArmedCleanSince(std::uint64_t address, std::size_t bytes, std::span<const s
 #endif
 }
 
-bool ArmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens, std::span<std::uint64_t> reasons) {
+bool ArmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens) {
     std::fill(tokens.begin(), tokens.end(), std::uint64_t{0});
-    std::fill(reasons.begin(), reasons.end(), static_cast<std::uint64_t>(ArmReason::Disabled));
-    if (!reasons.empty() && reasons.size() != tokens.size()) return false;
 #ifdef _WIN32
-    return GuestArena::GuestPageTrackArm_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, tokens.data(), reasons.empty() ? nullptr : reasons.data(), tokens.size());
+    return GuestArena::GuestPageTrackArm_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, tokens.data(), nullptr, tokens.size());
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
@@ -2733,28 +2731,55 @@ bool ArmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t
 #endif
 }
 
-bool ArmedReasons(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> reasons) {
-    std::fill(reasons.begin(), reasons.end(), static_cast<std::uint64_t>(ArmReason::Disabled));
+bool RearmWritten(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> since, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written) {
+    std::fill(written.begin(), written.end(), std::uint16_t{0xffff});
 #ifdef _WIN32
-    return GuestArena::GuestPageTrackReasons_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, reasons.data(), reasons.size());
+    if (since.size() == tokens.size() && written.size() == tokens.size()) {
+        std::copy(since.begin(), since.end(), tokens.begin());
+        return GuestArena::GuestPageTrackRearm_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, tokens.data(), written.data(), nullptr, tokens.size());
+    }
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
-    return false;
-#endif
-}
-
-bool RearmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written, std::span<std::uint64_t> reasons) {
-    std::fill(written.begin(), written.end(), EveryArmedPage);
-    std::fill(reasons.begin(), reasons.end(), static_cast<std::uint64_t>(ArmReason::Disabled));
-#ifdef _WIN32
-    if (written.size() == tokens.size() && (reasons.empty() || reasons.size() == tokens.size())) return GuestArena::GuestPageTrackRearm_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, tokens.data(), written.data(), reasons.empty() ? nullptr : reasons.data(), tokens.size());
-#else
-    static_cast<void>(address);
-    static_cast<void>(bytes);
+    static_cast<void>(since);
 #endif
     std::fill(tokens.begin(), tokens.end(), std::uint64_t{0});
     return false;
+}
+
+std::uint8_t UnarmedReason(std::uint64_t address) {
+    auto reason = Unarmed::Other;
+#ifdef _WIN32
+    std::uint64_t word = 0;
+    if (GuestArena::GuestPageTrackReasons_nid_no_patch(static_cast<std::uintptr_t>(address), 1, &word, 1)) {
+        switch (static_cast<GuestArena::PageTrackReason>(word & GuestArena::PageTrackReasonMask)) {
+        case GuestArena::PageTrackReason::Armable:
+        case GuestArena::PageTrackReason::Armed:
+            reason = Unarmed::No;
+            break;
+        case GuestArena::PageTrackReason::Held:
+            reason = Unarmed::Held;
+            break;
+        case GuestArena::PageTrackReason::Imported:
+            reason = Unarmed::Imported;
+            break;
+        case GuestArena::PageTrackReason::Barred:
+            reason = Unarmed::Barred;
+            break;
+        case GuestArena::PageTrackReason::Resting:
+            reason = Unarmed::Resting;
+            break;
+        case GuestArena::PageTrackReason::Edge:
+            reason = Unarmed::Edge;
+            break;
+        default:
+            break;
+        }
+    }
+#else
+    static_cast<void>(address);
+#endif
+    return static_cast<std::uint8_t>(reason);
 }
 
 std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::span<std::uint64_t> tokens) {

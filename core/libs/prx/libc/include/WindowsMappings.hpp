@@ -691,7 +691,7 @@ public:
             const bool since = held != 0 && state == WindowsPageTrack::State::Written && WindowsPageTrack::SameArming(word, held);
             std::uint16_t pages = 0;
             const auto reason = armOnRequest(block, now, &tokens[index], &pages);
-            if (tokens[index] != 0 && since) written[index] = pages;
+            if (tokens[index] != 0 && since && pages != 0) written[index] = pages;
             if (reasons != nullptr) reasons[index] = reason;
             if (tokens[index] == 0) every = false;
         }
