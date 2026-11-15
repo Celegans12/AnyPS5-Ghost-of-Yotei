@@ -20,8 +20,6 @@ constexpr std::int64_t kRedZoneBytes = 0x80;
 constexpr std::int64_t kStackAlignment = 16;
 constexpr std::uint8_t kJumpBack[] = {0xe9, 0x00, 0x00, 0x00, 0x00};
 
-// A return thunk's gap holds the leaf's whole frame: at most this many bytes, so that the stack
-// touches it adds stay within a guard page of the caller's.
 constexpr std::int64_t kThunkGapLimit = 0x800;
 constexpr std::int64_t kJumpTableEntryLimit = 4096;
 
@@ -95,7 +93,6 @@ struct MemoryUse {
     bool Address = false;
 };
 
-// A register among rax, rcx, rdx and rbx that a ModRM memory operand does not name as base or index.
 std::optional<std::uint8_t> scratchBesideOperand(const std::uint8_t* code, const Insn& insn) {
     const auto& info = insn.Info;
     if (!info.HasModRm || (info.ModRmByte >> 6) == 3) return std::nullopt;
@@ -114,7 +111,6 @@ std::optional<std::uint8_t> scratchBesideOperand(const std::uint8_t* code, const
     return std::nullopt;
 }
 
-// The instruction with its ModRM reg field set to reg (below 8, so REX.R stays clear).
 std::vector<std::uint8_t> withRegField(const std::uint8_t* code, const Insn& insn, const std::uint8_t reg) {
     std::vector<std::uint8_t> bytes(code, code + insn.Length);
     bytes[insn.Info.ModRmOffset] = static_cast<std::uint8_t>((bytes[insn.Info.ModRmOffset] & 0xc7) | ((reg & 7) << 3));
@@ -265,7 +261,6 @@ MemoryUse memoryUse(const std::uint8_t* code, const Insn& insn) {
     const auto reg = static_cast<std::uint8_t>((modrm >> 3) & 7);
     const auto rm = static_cast<std::uint8_t>(modrm & 7);
     const bool vex = info.RexPrefix == 0 && (code[info.OpcodeOffset] == 0xc4 || code[info.OpcodeOffset] == 0xc5 || code[info.OpcodeOffset] == 0x62 || xopPrefixed(code, insn));
-    // Register 4 of a byte operand without a REX prefix is AH, not rsp.
     const auto op = info.Opcode;
     const bool ah = info.RexPrefix == 0 && !vex;
     const bool byteOneByte = !info.IsTwoByteOpcode && ((op <= 0x3f && (op & 7) <= 3 && (op & 1) == 0) || op == 0x80 || op == 0x82 || op == 0x84 || op == 0x86 || op == 0x88 || op == 0x8a || op == 0xc0 || op == 0xc6 || op == 0xd0 || op == 0xd2 || op == 0xf6 || op == 0xfe);
@@ -334,7 +329,6 @@ std::optional<std::vector<std::uint8_t>> movedDisplacement(const MemoryUse& use,
     return std::nullopt;
 }
 
-// With wide the displacement is always 32 bits: an EVEX disp8 would be scaled.
 std::optional<std::vector<std::uint8_t>> withDisplacement(const std::uint8_t* code, const Insn& insn, const MemoryUse& use, const std::int64_t disp, const bool wide = false) {
     if (disp < std::numeric_limits<std::int32_t>::min() || disp > std::numeric_limits<std::int32_t>::max()) return std::nullopt;
     const std::size_t oldBytes = use.Mod == 1 ? 1 : use.Mod == 2 ? 4 : 0;
@@ -348,8 +342,6 @@ std::optional<std::vector<std::uint8_t>> withDisplacement(const std::uint8_t* co
     return bytes;
 }
 
-// The reg and rm fields (with REX) of a one-byte-opcode instruction with this opcode, or nothing.
-// With registerForm the instruction must name two registers (mod 3), else a memory operand.
 std::optional<std::pair<std::uint8_t, std::uint8_t>> modRmFields(const std::uint8_t* code, const Insn& insn, const std::uint8_t opcode, const bool wide, const bool registerForm) {
     const auto& info = insn.Info;
     if (info.IsTwoByteOpcode || info.Opcode != opcode || code[info.OpcodeOffset] != opcode || !info.HasModRm) return std::nullopt;
@@ -360,10 +352,6 @@ std::optional<std::pair<std::uint8_t, std::uint8_t>> modRmFields(const std::uint
     return std::pair{reg, rm};
 }
 
-// A switch's dispatch: `lea base, [rip+table]` ... `movsxd target, [base+index*4]` ...
-// `add target, base` ... `jmp target`, the base possibly copied by movs. Returns the table's
-// segment offset from the lea, or no table when the base was set further back (a lea hoisted
-// out of a loop): the caller then takes every table the function's RIP-relative leas address.
 struct JumpTableDispatch {
     std::optional<std::int64_t> Table;
 };
@@ -379,7 +367,6 @@ std::optional<JumpTableDispatch> jumpTableDispatch(const std::vector<Insn>& body
     bool loaded = false;
     bool sameBase = false;
     std::set<std::uint8_t> holders;
-    // VEX vector instructions that write no general register do not count toward the window.
     const auto vectorOnly = [&](const std::uint8_t* code, const Insn& insn) {
         const auto at = insn.Info.OpcodeOffset;
         const auto lead = code[at];
@@ -435,12 +422,10 @@ std::optional<JumpTableDispatch> jumpTableDispatch(const std::vector<Insn>& body
             return JumpTableDispatch{static_cast<std::int64_t>(insn.Offset + insn.Length) + disp};
         }
     }
-    // The load and the add use one base register, set before the window.
     if (loaded && sameBase) return JumpTableDispatch{std::nullopt};
     return std::nullopt;
 }
 
-// `jmp [base+index*8]`: a jump through a table of absolute addresses.
 bool absoluteTableJump(const std::uint8_t* code, const Insn& insn) {
     const auto& info = insn.Info;
     if (info.FlowKind != ControlFlowKind::IndirectJump || info.IsTwoByteOpcode || info.Opcode != 0xff || !info.HasModRm || ((info.ModRmByte >> 3) & 7) != 4) return false;
@@ -452,7 +437,6 @@ bool absoluteTableJump(const std::uint8_t* code, const Insn& insn) {
     return mod == 0 || (info.ModRmOffset + 2 < insn.Length && code[info.ModRmOffset + 2] == 0);
 }
 
-// `op reg, [base+disp]` with REX.W, or without REX when the opcode takes no register size.
 std::vector<std::uint8_t> memoryOperand(const std::uint8_t opcode, const std::uint8_t reg, const std::uint8_t base, const std::int32_t disp, const bool rexW = true) {
     const bool narrow = disp >= std::numeric_limits<std::int8_t>::min() && disp <= std::numeric_limits<std::int8_t>::max();
     std::vector<std::uint8_t> out;
@@ -466,11 +450,8 @@ std::vector<std::uint8_t> memoryOperand(const std::uint8_t opcode, const std::ui
     return out;
 }
 
-// A relocated leaf runs this far below the rsp it keeps: the red zone's size.
 constexpr std::int64_t kRelocatedShift = kRedZoneBytes;
 
-// A RIP-relative instruction copied into a stub: Offset and End are within the copied bytes,
-// Target is the segment offset it addresses.
 struct CopiedRip {
     std::size_t Offset;
     std::size_t End;
@@ -518,7 +499,6 @@ struct ExitSite {
     std::size_t End;
     Copied Lead;
     std::size_t Operands = 0;
-    // The pops and the ret, or the pops and the tail call with its target relocated.
     Copied Trail;
 };
 
@@ -541,8 +521,6 @@ void frameSegment(
     const X64InstructionDecoder decoder;
 
     std::set<std::size_t> targets;
-    // Every branch as (target, source), by target: a relocated leaf checks that no branch from
-    // outside it lands inside it.
     std::vector<std::pair<std::uint32_t, std::uint32_t>> edges;
     for (const auto& match : scanner->ScanCodeSection(seg, 0, seg.size())) {
         const auto info = decoder.DecodeInstruction(seg.data() + match.Offset, match.Length);
@@ -581,8 +559,6 @@ void frameSegment(
             if (const auto value = read(segment)) return value;
         return std::nullopt;
     };
-    // A tail call's target: another function's start, or code outside every function (a PLT stub).
-    // A jump into the middle of another function (a cold part) may come back, so it is not one.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
     for (const auto& function : functions) spans.emplace_back(function.Begin, function.End);
     std::sort(spans.begin(), spans.end());
@@ -608,14 +584,9 @@ void frameSegment(
         }
         if (body.size() < 3) continue;
         const auto at = [&](const std::size_t k) { return seg.data() + body[k].Offset; };
-        // Jump tables: entries are read until one does not land on an instruction of this function.
-        // The real entries come first and all land, so every case is taken, and at worst a few
-        // words past the table: those only add branch targets and paths to check.
         std::map<std::size_t, std::size_t> indexOf;
         for (std::size_t k = 0; k < body.size(); ++k) indexOf[body[k].Offset] = k;
         std::map<std::size_t, std::vector<std::size_t>> tables;
-        // The scan stops at the first int3: an entry landing between it and the FDE end may be a
-        // case the scan never saw, so that table is not resolved (returns false).
         const auto bodyEnd = static_cast<std::int64_t>(body.back().Offset + body.back().Length);
         const auto tableCases = [&](const std::int64_t table, std::set<std::size_t>& cases) {
             for (std::int64_t entry = 0; entry < kJumpTableEntryLimit; ++entry) {
@@ -630,8 +601,6 @@ void frameSegment(
             }
             return true;
         };
-        // Every table the function's RIP-relative leas address, for a dispatch whose base was set
-        // before its window: the real table is among them, the others only add cases.
         std::vector<std::int64_t> leaTables;
         for (std::size_t k = 0; k < body.size(); ++k)
             if (const auto lea = modRmFields(at(k), body[k], 0x8d, true, false); lea && body[k].Info.HasRipRelativeDisp) {
@@ -651,14 +620,6 @@ void frameSegment(
             for (const auto c : cases) targets.insert(body[c].Offset);
             tables.emplace(k, std::move(cases));
         }
-        // A leaf whose frame cannot be patched in place is relocated whole into a stub that runs it
-        // with rsp kRelocatedShift lower than the leaf keeps it. Every rsp operand moves up by the
-        // shift and every push and pop is rewritten to keep its slot, so the leaf's stack data stays
-        // at its addresses, which are now above rsp. Every way out raises rsp first, so code outside
-        // the stub sees the stack as before. The leaf's start jumps to the stub, and each case of a
-        // jump table gets a jump into it. Returns why the leaf could not be relocated, or nothing.
-        // A branch from outside the leaf (another function, or code past its first int3) into
-        // [begin, end).
         const auto enteredFromOutside = [&](const std::size_t begin, const std::size_t end) {
             auto edge = std::lower_bound(edges.begin(), edges.end(), std::pair<std::uint32_t, std::uint32_t>{static_cast<std::uint32_t>(begin), 0});
             for (; edge != edges.end() && edge->first < end; ++edge)
@@ -676,16 +637,12 @@ void frameSegment(
                 if (found == indexOf.end()) return std::nullopt;
                 return found->second;
             };
-            // Jump tables: relative ones as resolved above, and tables of absolute addresses, read
-            // from the relocations that fill them (or the file) for every table a lea addresses.
             std::set<std::size_t> dispatches;
             std::set<std::size_t> cases;
             for (const auto& [k, found] : tables) {
                 dispatches.insert(k);
                 cases.insert(found.begin(), found.end());
             }
-            // A table of other functions' starts (threaded code: each handler jumps to the next) makes
-            // its jump a tail call, like a jump through a function pointer.
             std::set<std::size_t> tailJumps;
             for (std::size_t k = 0; k < body.size(); ++k) {
                 if (!absoluteTableJump(at(k), body[k])) continue;
@@ -700,14 +657,12 @@ void frameSegment(
                             value = static_cast<std::uint32_t>(*low) | (static_cast<std::uint64_t>(static_cast<std::uint32_t>(*high)) << 32);
                         if (!value) break;
                         const auto offset = static_cast<std::int64_t>(*value) - static_cast<std::int64_t>(ph.MappedAddress);
-                        // The leaf's own start is entered like a call, through its entry jump.
                         const auto c = offset == static_cast<std::int64_t>(start) ? std::nullopt : inside(offset);
                         if (c) found.insert(*c);
                         else if (offset >= 0 && static_cast<std::size_t>(offset) < seg.size() && (offset <= static_cast<std::int64_t>(start) || offset >= static_cast<std::int64_t>(limit)) && tailCallTarget(offset)) ++starts;
                         else break;
                     }
                 if (found.empty() && starts > 0) tailJumps.insert(k);
-                // A table with both cases and other functions' starts would need rsp both ways.
                 if (!found.empty() && starts > 0) return "jump table of both cases and functions";
                 if (found.empty()) continue;
                 dispatches.insert(k);
@@ -776,13 +731,10 @@ void frameSegment(
                     continue;
                 }
                 if (flow == ControlFlowKind::IndirectJump || flow == ControlFlowKind::UnconditionalJump) {
-                    // A jump table's dispatch lands on a case's jump into the stub; any other indirect
-                    // jump leaves, its rsp operand read with rsp raised as in the leaf.
                     if (dispatches.contains(k)) {
                         if (use.RspBased) return "jump table through an rsp operand";
                     } else {
                         append(raise);
-                        // Through memory without an index: a function pointer, so a tail call.
                         bool pointer = info.HasModRm && (info.ModRmByte >> 6) != 3 && !use.RspBased;
                         if (pointer && (info.ModRmByte & 7) == 4 && info.ModRmOffset + 1 < insn.Length) pointer = ((code[info.ModRmOffset + 1] >> 3) & 7) == 4 && (info.RexPrefix & 2) == 0;
                         if (!pointer && !tailJumps.contains(k)) openJump = true;
@@ -792,7 +744,6 @@ void frameSegment(
                 }
                 if (flow != ControlFlowKind::Sequential && flow != ControlFlowKind::Trap) return "call in a relocated leaf";
                 if (!info.IsTwoByteOpcode && info.Opcode == 0xc9 && code[info.OpcodeOffset] == 0xc9) {
-                    // leave: rsp from rbp, then pop rbp.
                     append(memoryOperand(0x8d, kRegRsp, kRegRbp, static_cast<std::int32_t>(-shift)));
                     append(memoryOperand(0x8b, kRegRbp, kRegRsp, static_cast<std::int32_t>(shift)));
                     append(raiseRsp(8));
@@ -811,9 +762,6 @@ void frameSegment(
                         continue;
                     }
                     const auto op = info.Opcode;
-                    // pop rsp (a realigned frame restoring its saved rsp): the saved value sits at the
-                    // real slot, rsp + shift. It is loaded into a scratch pushed below rsp, lowered by
-                    // the shift and popped into rsp, so rsp is never above the leaf's lowered rsp.
                     if (!info.IsTwoByteOpcode && code[info.OpcodeOffset] == 0x5c && (info.RexPrefix & 1) == 0 && info.OpcodeOffset + 1 == insn.Length) {
                         append({0x50});
                         append(memoryOperand(0x8b, 0, kRegRsp, static_cast<std::int32_t>(8 + shift)));
@@ -824,8 +772,6 @@ void frameSegment(
                     }
                     if (use.RegisterRsp) return "push or pop of rsp in a relocated leaf";
                     const bool pop = info.IsTwoByteOpcode ? (op == 0xa1 || op == 0xa9) : ((op >= 0x58 && op <= 0x5f) || op == 0x9d || op == 0x8f);
-                    // Any other push or pop runs as itself through a slot at rsp, then moves the value:
-                    // a push's address is taken before it lowers rsp, a pop's after it raises it.
                     Copied moved;
                     if (use.RspBased) {
                         const auto bytes = withDisplacement(code, insn, use, use.RspDisp + shift + (pop ? 8 : 0));
@@ -856,7 +802,6 @@ void frameSegment(
                         appendOriginal(k);
                         continue;
                     }
-                    // mov reg, rsp reads the leaf's rsp; mov rsp, reg sets it.
                     const auto fromRsp = [&]() -> std::optional<std::uint8_t> {
                         if (const auto mov = modRmFields(code, insn, 0x89, true, true); mov && mov->first == kRegRsp && mov->second != kRegRsp) return mov->second;
                         if (const auto mov = modRmFields(code, insn, 0x8b, true, true); mov && mov->second == kRegRsp && mov->first != kRegRsp) return mov->first;
@@ -875,7 +820,6 @@ void frameSegment(
                         append(memoryOperand(0x8d, kRegRsp, *reg, static_cast<std::int32_t>(-shift)));
                         continue;
                     }
-                    // and rsp, -2^n keeps the shift when 2^n divides it.
                     if (insn.Length == 4 && code[0] == 0x48 && code[1] == 0x83 && code[2] == 0xe4) {
                         const auto mask = -static_cast<std::int64_t>(static_cast<std::int8_t>(code[3]));
                         if (mask > 0 && (mask & (mask - 1)) == 0 && shift % mask == 0) {
@@ -883,11 +827,6 @@ void frameSegment(
                             continue;
                         }
                     }
-                    // mov rsp, [mem] (longjmp) loads an rsp the leaf does not keep, and mov [mem], rsp
-                    // stores the leaf's rsp, which is rsp + shift. Both go through a scratch pushed
-                    // below rsp (free: the leaf's slots are at rsp and above), so no flags change and
-                    // rsp never rises above the leaf's lowered rsp. An rsp operand moves by the shift
-                    // and the push.
                     const auto load = modRmFields(code, insn, 0x8b, true, false);
                     const auto store = modRmFields(code, insn, 0x89, true, false);
                     if (((load && load->first == kRegRsp) || (store && store->first == kRegRsp)) && !info.HasRipRelativeDisp) {
@@ -940,8 +879,6 @@ void frameSegment(
                 for (const auto field : fields) patch(field, label);
             }
             for (const auto& [field, k] : internal) patch(field, labelAt[k]);
-            // A case's jump assumes rsp is already lowered: only the stub may reach it, so the original
-            // code must not run (no branch from outside into it, nothing in the stub going back to it).
             std::vector<std::size_t> pads;
             for (const auto c : cases) pads.push_back(body[c].Offset);
             if (!pads.empty()) {
@@ -984,9 +921,6 @@ void frameSegment(
             if (openJump) ++report.RelocatedOpenJumps;
             return nullptr;
         };
-        // A leaf without a frame pointer whose frame cannot be patched in place (a short exit, a
-        // branch into one) is tried again as a return thunk, its pushes and allocation taken as
-        // part of the body. If that fails too, the first reason is reported.
         const char* firstReason = nullptr;
         for (bool asThunk = false;; asThunk = true) {
             const bool rbpPrologue = body[0].Length == 1 && at(0)[0] == 0x55 && body[1].Length == 3 && std::memcmp(at(1), "\x48\x89\xe5", 3) == 0;
@@ -997,9 +931,6 @@ void frameSegment(
             std::int64_t allocation = 0;
             if (!rbpPrologue && p < body.size())
                 if (const auto adjustment = rspAdjustment(at(p), body[p]); adjustment && *adjustment < 0) { allocation = -*adjustment; ++p; }
-            // A frame-pointer leaf that allocates with `sub rsp, N` after its pushes keeps [rbp-x] inside
-            // that allocation, provided rsp only goes back up in epilogues: instructions that move rsp
-            // up to a ret. Such slots are not below rsp.
             std::int64_t rbpAllocation = 0;
             if (rbpPrologue && p < body.size())
                 if (const auto adjustment = rspAdjustment(at(p), body[p]); adjustment && *adjustment < 0) {
@@ -1007,7 +938,6 @@ void frameSegment(
                     const auto raisesRsp = [&](const std::size_t k) {
                         return at(k)[body[k].Info.OpcodeOffset] == 0xc9 || poppedRegister(at(k), body[k]).has_value() || memoryUse(at(k), body[k]).RegisterRsp;
                     };
-                    // An epilogue ends in a ret or in a tail call: a jump out of the function.
                     const auto leaves = [&](const std::size_t k) {
                         const auto& insn = body[k];
                         if (insn.Info.FlowKind == ControlFlowKind::Return || insn.Info.FlowKind == ControlFlowKind::IndirectJump) return true;
@@ -1045,11 +975,6 @@ void frameSegment(
                 for (std::size_t k = p; k < body.size(); ++k)
                     if (body[k].Info.FlowKind == ControlFlowKind::Return || leavesByTailCall(k))
                         if (const auto q = popsBefore(k); q && *q > p && rspAdjustment(at(*q - 1), body[*q - 1]) == allocation) frees.insert(*q - 1);
-            // A leaf that moves rsp anywhere but its prologue allocation and the frees before its exits
-            // returns through a thunk, its pushes and allocations taken as part of the body.
-            // A jmp through memory without an index ([reg+disp], [rip+disp]) loads a function
-            // pointer: a tail call even in a leaf without pushes.
-            // So is `mov reg, [base+disp]; jmp reg`.
             const auto pointerJumpAt = [&](const std::size_t k) {
                 const auto& insn = body[k];
                 if (insn.Info.FlowKind != ControlFlowKind::IndirectJump || !insn.Info.HasModRm) return false;
@@ -1069,7 +994,6 @@ void frameSegment(
                 const auto sib = at(k)[insn.Info.ModRmOffset + 1];
                 return ((sib >> 3) & 7) == 4 && (insn.Info.RexPrefix & 0x02) == 0;
             };
-            // A tail call's jmp copied into a stub, its direct or RIP-relative target relocated.
             const auto copiedJump = [&](const std::size_t k) -> std::optional<Copied> {
                 const auto& insn = body[k];
                 if (insn.Info.FlowKind == ControlFlowKind::UnconditionalJump)
@@ -1084,8 +1008,6 @@ void frameSegment(
                 }
                 return jump;
             };
-            // In a thunk, a tail call: a jmp to another function's start, through a function
-            // pointer, or through a register once a leaf that had pushes has popped them.
             const bool prologueFrame = !pushed.empty() || allocation > 0;
             const auto thunkTailCall = [&](const std::size_t k) {
                 if (!leavesByTailCall(k)) return false;
@@ -1116,7 +1038,6 @@ void frameSegment(
             bool redZone = false;
             bool called = false;
             bool redZoneBeforeCall = false;
-            // Exits through `leave` (frame pointer, nothing else pushed): `pop rbp`s to rewrite.
             const bool leaveExits = rbpPrologue && pushed.empty() && !asThunk;
             std::vector<std::size_t> leaves;
             std::size_t leaveExitCount = 0;
@@ -1126,8 +1047,6 @@ void frameSegment(
             std::map<std::size_t, std::pair<std::size_t, std::vector<std::uint8_t>>> moves;
             std::vector<std::size_t> stubbed;
             std::vector<std::size_t> stackMoves;
-            // Branches are checked against the scanned code: one past the first int3 reaches code
-            // the scan never saw.
             const auto functionEnd = static_cast<std::size_t>(bodyEnd);
             std::int64_t depth = 0;
             bool wholeRedZone = rbpPrologue;
@@ -1138,22 +1057,15 @@ void frameSegment(
                 if (use.Indexed || (use.Address && use.RspDisp < 0)) wholeRedZone = true;
             }
             auto shift = wholeRedZone ? kRedZoneBytes : std::min(kRedZoneBytes, (depth + kStackAlignment - 1) / kStackAlignment * kStackAlignment);
-            // A leaf without pushes, allocation or frame pointer whose exits cannot be patched returns
-            // through a thunk instead: the entry stub lowers rsp and calls the rest of itself, so every
-            // ret lands on `lea rsp, [rsp+shift]; ret`. Its rsp operands also move over that slot.
             const bool frameless = !rbpPrologue && p == 0;
             const char* exitReason = nullptr;
             bool sawRet = false;
             std::int64_t bodyShift = shift;
             std::vector<std::size_t> rspOperands;
-            // An instruction moved into a stub: rsp operands move with the shift, RIP-relative ones are
-            // relocated to the stub.
             const auto copy = [&](const std::size_t k) -> std::optional<Copied> {
                 const auto& insn = body[k];
                 Copied out;
                 if (insn.Info.FlowKind == ControlFlowKind::ConditionalBranch) {
-                    // A jcc goes into the stub as its rel32 form, relocated to its target in the
-                    // function; jcxz and loop have no rel32 form.
                     if (!insn.Info.HasBranchTarget || insn.Info.HasRipRelativeDisp || insn.Info.OpcodeOffset != 0) return std::nullopt;
                     const auto op = insn.Info.Opcode;
                     const bool shortForm = !insn.Info.IsTwoByteOpcode && op >= 0x70 && op <= 0x7f;
@@ -1181,10 +1093,6 @@ void frameSegment(
                 }
                 return out;
             };
-            // Inline assembly calls helpers inside its own function (AES key expansion: `call 1f` per
-            // round): straight-line code after a jmp or ret, entered only by calls, ending in a ret
-            // without touching the stack. Such calls keep the function a leaf, and the helper's ret is
-            // not an exit; a lowered rsp only moves the return address further from the red zone.
             std::set<std::size_t> helperCalls;
             std::set<std::size_t> helperRets;
             for (std::size_t k = p; k < body.size(); ++k) {
@@ -1207,28 +1115,19 @@ void frameSegment(
                 const auto* code = at(k);
                 const auto flow = insn.Info.FlowKind;
                 if (helperCalls.contains(k) || helperRets.contains(k)) continue;
-                // A function that calls is scanned on: some keep values below rsp before their calls
-                // (libc's bounds-checked copies compare a slot at [rbp-8] with their own frame).
                 if (flow == ControlFlowKind::Call || flow == ControlFlowKind::IndirectCall) { leaf = false; called = true; continue; }
                 if (frees.contains(k)) continue;
                 const auto use = memoryUse(code, insn);
                 if (use.RbpBased && rbpPrologue && use.RbpDisp < -static_cast<std::int64_t>(8 * pushed.size()) - rbpAllocation) redZone = true;
                 if (use.RspBased && use.RspDisp < 0) redZone = true;
-                // For a function that calls, only a slot below the frame built so far (pushes and every
-                // `sub rsp` before the first call) counts: after a call, nothing can live below rsp.
                 if (!called) {
-                    // `and rsp, -N` realigns the frame by an unknown amount: rbp slots are inside it.
                     if (insn.Length == 4 && code[0] == 0x48 && code[1] == 0x83 && code[2] == 0xe4) frameBeforeCall = std::numeric_limits<std::int64_t>::max() / 2;
                     else if (const auto adjustment = rspAdjustment(code, insn)) { if (*adjustment < 0) frameBeforeCall += -*adjustment; }
-                    // An indexed operand ([rsp+rdx-0x10]) addresses an array in the frame: its
-                    // displacement says nothing about the red zone. An `lea` stores nothing: below rsp
-                    // it is an alloca's new rsp, or an array base biased below its first element.
                     else if (!use.Indexed && !(!insn.Info.IsTwoByteOpcode && insn.Info.Opcode == 0x8d) && ((use.RbpBased && rbpPrologue && use.RbpDisp < -frameBeforeCall) || (use.RspBased && use.RspDisp < 0))) {
                         redZoneBeforeCall = true;
                     }
                 }
                 if (reason != nullptr) continue;
-                // With only rbp pushed, `leave` restores rsp from rbp however far rsp was lowered.
                 if (code[insn.Info.OpcodeOffset] == 0xc9 && insn.Length == 1 && leaveExits) continue;
                 if (code[insn.Info.OpcodeOffset] == 0xc9 || code[insn.Info.OpcodeOffset] == 0xc8) { reason = "leave or enter"; continue; }
                 if (frameless && pushesOrPops(code, insn) && exitReason == nullptr) exitReason = "push or pop in a leaf without pushes";
@@ -1247,10 +1146,6 @@ void frameSegment(
                         rspOperands.push_back(k);
                     }
                 }
-                // A tail call: a jmp to another function's start (or to code outside every function,
-                // such as a PLT stub), or an indirect jmp right after the pops that undo the prologue;
-                // an indirect jmp in a leaf without pushes may be a jump table and is refused.
-                // A jump table's cases are branch targets inside the leaf, like a jcc's.
                 if (flow == ControlFlowKind::IndirectJump && tables.contains(k)) continue;
                 const bool pointerJump = pointerJumpAt(k);
                 bool tailCall = false;
@@ -1270,16 +1165,12 @@ void frameSegment(
                     if (flow == ControlFlowKind::Return && (insn.Length != 1 || code[0] != 0xc3)) { reason = "ret with an immediate"; continue; }
                     if (flow == ControlFlowKind::Return) sawRet = true;
                     if (exitReason != nullptr) continue;
-                    // A frame-pointer function that pushes only rbp leaves through `leave`: its 1-byte
-                    // `pop rbp` becomes one, and an exit that already has one needs nothing.
                     if (leaveExits && k > p && body[k - 1].Length == 1 && body[k - 1].Offset + 1 == insn.Offset) {
                         const auto prior = at(k - 1)[0];
                         if (prior == 0xc9) { ++leaveExitCount; continue; }
                         if (prior == 0x5d) { leaves.push_back(k - 1); ++leaveExitCount; continue; }
                     }
                     const auto pops = popsBefore(k);
-                    // A jump that does not undo the prologue first is not a tail call: a jump table, or
-                    // a jump to a part that still uses the frame.
                     if (!pops) { reason = !tailCall ? "exit does not pop the prologue's registers" : flow == ControlFlowKind::IndirectJump ? "indirect jump" : "branch leaves the function"; continue; }
                     auto q = *pops;
                     if (allocation > 0) {
@@ -1316,17 +1207,10 @@ void frameSegment(
             }
             if (!redZone || (!leaf && !redZoneBeforeCall)) break;
             if (!asThunk) ++report.RedZoneFunctions;
-            // A function that calls is framed only with a frame pointer: its unwind data finds the
-            // caller's frame through rbp, and its callees build their frames below whatever rsp is.
-            // Without one, outgoing stack arguments and unwinding are both relative to rsp.
             if (!leaf && !rbpPrologue) {
                 skip("function with calls keeps values below rsp without a frame pointer");
                 break;
             }
-            // The thunk's slot sits where the leaf's own pushes go: they must balance on every path, so
-            // that each ret finds the thunk's address (a fragment popping its caller's pushes would not).
-            // The stack below the entry at each instruction, from the entry down: pushed slots and
-            // allocated bytes.
             struct Slot {
                 bool Pushed;
                 std::int64_t Bytes;
@@ -1353,7 +1237,6 @@ void frameSegment(
                     const auto& insn = body[k];
                     auto layout = layoutAt.at(k);
                     if (pushesOrPops(at(k), insn)) {
-                        // A 16-bit push or pop (66 prefix) moves rsp by 2: the slots would not add up.
                         if (std::find(at(k), at(k) + insn.Info.OpcodeOffset, 0x66) != at(k) + insn.Info.OpcodeOffset) return false;
                         const auto op = insn.Info.Opcode;
                         const bool pop = insn.Info.IsTwoByteOpcode ? (op == 0xa1 || op == 0xa9) : ((op >= 0x58 && op <= 0x5f) || op == 0x9d || op == 0x8f);
@@ -1362,7 +1245,6 @@ void frameSegment(
                         else layout.pop_back();
                     } else if (const auto adjustment = rspAdjustment(at(k), insn)) {
                         if (*adjustment < 0) layout.push_back({false, -*adjustment});
-                        // An add frees whole slots, a pushed one included (`push rax` as a slot).
                         for (auto left = *adjustment; left > 0;) {
                             if (layout.empty() || layout.back().Bytes > left) return false;
                             left -= layout.back().Bytes;
@@ -1370,7 +1252,6 @@ void frameSegment(
                         }
                     }
                     const auto flow = insn.Info.FlowKind;
-                    // A ret, or a tail call that leaves through its own exit stub, with the frame undone.
                     if (flow == ControlFlowKind::Return || thunkTailCall(k)) {
                         if (!layout.empty()) return false;
                         continue;
@@ -1398,9 +1279,6 @@ void frameSegment(
             if (frameless && reason == nullptr && exitReason != nullptr && !thunk) reason = rspArithmetic ? "rsp arithmetic that does not balance" : exitReason;
             if (thunk) {
                 exits.clear();
-                // The leaf's pushes and allocations now go below the thunk's slot while its rsp operands
-                // keep their addresses, so the gap must hold every frame address an operand reaches,
-                // and no operand may read a pushed slot: the push went below the gap.
                 std::int64_t need = 0;
                 std::int64_t deepest = 0;
                 for (const auto& [k, layout] : layoutAt) deepest = std::max(deepest, bytesOf(layout));
@@ -1426,8 +1304,6 @@ void frameSegment(
                 shift = std::max(shift, (need + kStackAlignment - 1) / kStackAlignment * kStackAlignment);
                 if (reason == nullptr && shift > kThunkGapLimit) reason = "frame too deep for a thunk";
                 bodyShift = shift + 8;
-                // A tail call leaves through an exit stub that raises rsp over the gap and the
-                // thunk's slot, so the callee finds the caller's return address and stack arguments.
                 for (const auto& [k, layout] : layoutAt) {
                     if (reason != nullptr) break;
                     if (!thunkTailCall(k)) continue;
@@ -1476,8 +1352,6 @@ void frameSegment(
             }
             if (reason == nullptr && entryEnd - start < kJumpBytes) reason = "prologue shorter than a jump";
             if (reason == nullptr && targetInside(start, entryEnd)) reason = entryEnd == prologueEnd ? "branch into the prologue" : "branch into the instructions after a short prologue";
-            // A jump from another function to the start enters like a call and runs the stub; only a
-            // branch from inside the leaf would lower rsp a second time.
             const bool loopsToStart = std::any_of(body.begin(), body.end(), [&](const Insn& insn) {
                 return insn.Info.HasBranchTarget && !insn.Info.HasRipRelativeDisp && insn.Info.FlowKind != ControlFlowKind::Call && static_cast<std::int64_t>(insn.Offset + insn.Length) + insn.Info.BranchDisp == static_cast<std::int64_t>(start);
             });
@@ -1527,11 +1401,8 @@ void frameSegment(
                 if (stub.End - stub.Begin < kJumpBytes || targetInside(stub.Begin, stub.End) || overlapsSite(stub.Begin, stub.End) || overlapsExisting(stub.Begin, stub.End)) reason = "rsp operand that cannot move and has no room for a stub";
                 else stubs.push_back(std::move(stub));
             }
-            // Code entered from outside its start runs there with rsp as the leaf keeps it, so the
-            // leaf's own code must stay as it is: it is relocated whole instead.
             if (reason == nullptr && enteredFromOutside(start + 1, static_cast<std::size_t>(bodyEnd))) reason = "entered from outside its start";
             if (reason != nullptr) {
-                // Relocation refuses calls: a function that calls reports why it was not framed in place.
                 if (!leaf) {
                     skip(reason);
                     break;
@@ -1565,7 +1436,6 @@ void frameSegment(
             auto entry = original(start, prologueEnd);
             entry.Append(Copied{lowerRsp(shift), {}});
             if (thunk) {
-                // call over the thunk: pushes the thunk's address as the leaf's return address.
                 const auto raise = raiseRsp(shift);
                 const auto over = static_cast<std::uint32_t>(raise.size() + 1);
                 entry.Append(Copied{{0xe8, static_cast<std::uint8_t>(over), static_cast<std::uint8_t>(over >> 8), static_cast<std::uint8_t>(over >> 16), static_cast<std::uint8_t>(over >> 24)}, {}});
@@ -1603,8 +1473,6 @@ void frameSegment(
     }
 }
 
-// Decodes code outside every function's bounds one instruction at a time: visit(offset, length),
-// with length 0 for a byte that does not decode (data), which is then stepped over.
 template<typename TVisit>
 void walkUncovered(const std::vector<std::uint8_t>& code, TVisit&& visit) {
     const X64InstructionDecoder decoder;
@@ -1620,8 +1488,6 @@ void walkUncovered(const std::vector<std::uint8_t>& code, TVisit&& visit) {
     }
 }
 
-// Padding between functions: int3, bytes that do not decode, and `add [rax], al` (zero fill) end
-// a function; a nop does not start one (functions align loops with nops, so it ends none).
 enum class UncoveredKind { Code, Nop, Break };
 
 UncoveredKind uncoveredKind(const X64InstructionDecoder& decoder, const std::vector<std::uint8_t>& code, const std::size_t at, const std::size_t length) {
@@ -1631,8 +1497,6 @@ UncoveredKind uncoveredKind(const X64InstructionDecoder& decoder, const std::vec
     return UncoveredKind::Code;
 }
 
-// Code-segment bytes that no function's bounds cover, padding trimmed: the framer never examines
-// them, so a red-zone leaf there would stay unframed.
 void measureUncovered(const std::vector<std::uint8_t>& fileBytes, const Domain::ProgramHeader& ph, const std::vector<RedZoneFunction>& functions, RedZoneFrameReport& report) {
     const auto segOffset = static_cast<std::size_t>(ph.Offset);
     const auto segSize = static_cast<std::size_t>(ph.FileSize);
@@ -1702,12 +1566,8 @@ std::vector<RedZoneFunction> SplitUncoveredCode(const std::vector<std::uint8_t>&
         std::sort(spans.begin(), spans.end());
         const auto gap = [&](const std::size_t begin, const std::size_t end) {
             const std::vector<std::uint8_t> code(seg.begin() + static_cast<std::ptrdiff_t>(begin), seg.begin() + static_cast<std::ptrdiff_t>(end));
-            // A piece runs from its first instruction that is not padding to the end of its last one
-            // that is not a nop.
             std::optional<std::size_t> start;
             std::size_t last = 0;
-            // The furthest direct branch target in the piece so far, and whether it has an indirect
-            // jump (a jump table's cases can sit anywhere after it).
             std::optional<std::int64_t> reach;
             bool opaque = false;
             const auto close = [&]() {
@@ -1716,9 +1576,6 @@ std::vector<RedZoneFunction> SplitUncoveredCode(const std::vector<std::uint8_t>&
                 reach.reset();
                 opaque = false;
             };
-            // Functions follow each other with no padding (16-byte ones always do): after a ret, jmp
-            // or ud2, a `push rbp; mov rbp, rsp` prologue starts the next one, and so does any code no
-            // branch before it reaches (a shrink-wrapped function tests before it pushes).
             bool afterExit = false;
             walkUncovered(code, [&](const std::size_t at, const std::size_t length) {
                 const auto kind = uncoveredKind(decoder, code, at, length);

@@ -196,9 +196,7 @@ struct Leaf {
     std::vector<std::uint8_t> Code;
     std::uint64_t Expected;
     bool HostRuns = true;
-    // Data placed right after the leaf, outside its function bounds (a jump table).
     std::vector<std::uint8_t> Data = {};
-    // False for code that is only a branch target of another leaf: not run, not expected framed.
     bool Framed = true;
 };
 
@@ -241,14 +239,10 @@ std::vector<Leaf> framedLeaves() {
             0xff, 0xc9, 0x75, 0xed, 0x48, 0x8b, 0x54, 0x24, 0x38,
             0x48, 0x83, 0xc4, 0x40, 0x5b, 0x41, 0x5c, 0x41, 0x5d, 0x41, 0x5e, 0x41, 0x5f, 0x5d, 0xc3,
         }, 4 * (kB + 2 * kA)},
-        // libc's bounds-checked copy: a frame-pointer function that keeps [rbp-8] below rsp before
-        // its call (to a ret just past its end) and leaves by `pop rbp`, rewritten to `leave`.
         {"frame-pointer function using the red zone before a call", {
             0x55, 0x48, 0x89, 0xe5, 0x48, 0x89, 0x7d, 0xf8, 0x48, 0x8b, 0x45, 0xf8, 0x48, 0x01, 0xf0,
             0xe8, 0x02, 0x00, 0x00, 0x00, 0x5d, 0xc3,
         }, kA + kB, true, {0xc3}},
-        // Inline-assembly AES key expansion: a leaf calling a helper inside its own bounds, with a
-        // value below rsp live across the call; the helper's ret is not an exit.
         {"leaf calling its own helper", {
             0x53, 0x48, 0x89, 0x7c, 0x24, 0xf0, 0xe8, 0x0a, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x44, 0x24, 0xf0,
             0x48, 0x01, 0xf0, 0x5b, 0xc3, 0x31, 0xc9, 0xc3,
@@ -349,8 +343,6 @@ std::vector<Leaf> widenedLeaves() {
             0x48, 0x83, 0xec, 0x08, 0x48, 0x89, 0x7c, 0x24, 0xf0, 0x31, 0xc0, 0x48, 0x03, 0x44, 0x24, 0xf0,
             0x48, 0x83, 0xc4, 0x08, 0xc3,
         }, kA},
-        // The lea in the exit is copied into the exit's stub: unrelocated, it would address the stub
-        // instead of the leaf's start and the two leas would no longer cancel.
         {"leaf without pushes whose short ret exit is widened over a rip-relative lea", {
             0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8d, 0x0d, 0xf4, 0xff, 0xff, 0xff, 0x48, 0x8b, 0x44, 0x24, 0xf8,
             0x48, 0x01, 0xc8, 0x48, 0x8d, 0x15, 0xe5, 0xff, 0xff, 0xff, 0x48, 0x29, 0xd0, 0xc3,
@@ -364,36 +356,27 @@ std::vector<Leaf> widenedLeaves() {
 
 std::vector<Leaf> thunkLeaves() {
     return {
-        // jne lands on the ret, inside the exit a stub would need: the leaf returns through a thunk.
         {"leaf without pushes whose ret is a branch target right after a load from below rsp", {
             0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x89, 0x74, 0x24, 0xf0, 0x48, 0x8b, 0x44, 0x24, 0xf8,
             0x48, 0x39, 0xf7, 0x75, 0x05, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0xc3,
         }, kA},
-        // The body's push sits below the slot it spilled to, so the rsp operand after it moves too.
         {"leaf without prologue pushes pushing and popping rbx around a load from below rsp", {
             0x48, 0x89, 0x7c, 0x24, 0xe8, 0x53, 0x48, 0x89, 0xf3, 0x48, 0x8b, 0x44, 0x24, 0xf0,
             0x48, 0x01, 0xd8, 0x5b, 0xc3,
         }, kA + kB},
-        // AoM's crc32 shape: an early-out ret before the pushes, so the pushes go below the thunk's
-        // slot and the gap must cover them as well as the spill below them.
         {"leaf pushing after an early-out ret and spilling below its pushes", {
             0x48, 0x85, 0xf6, 0x74, 0x15, 0x52, 0x52, 0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x8b, 0x44, 0x24, 0xf0,
             0x59, 0x5a, 0x48, 0x01, 0xd0, 0x48, 0x01, 0xc8, 0xc3, 0x31, 0xc0, 0xc3,
         }, kA + 2 * kC},
-        // The allocation follows an early-out ret, so it is part of the body: the thunk's gap holds
-        // the allocation and the spill below it.
         {"leaf allocating after an early-out ret and spilling below its allocation", {
             0x48, 0x85, 0xf6, 0x74, 0x1d, 0x48, 0x83, 0xec, 0x20, 0x48, 0x89, 0x54, 0x24, 0x08,
             0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0x48, 0x03, 0x44, 0x24, 0x08,
             0x48, 0x83, 0xc4, 0x20, 0xc3, 0x31, 0xc0, 0xc3,
         }, kA + kC},
-        // Pushes rbx, and a je lands on its pop inside the short exit: no exit stub can be placed,
-        // so the leaf is retried as a thunk.
         {"leaf pushing rbx whose short exit a branch lands in", {
             0x53, 0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x89, 0xf3, 0x48, 0x8b, 0x44, 0x24, 0xf0,
             0x85, 0xff, 0x74, 0x03, 0x48, 0x01, 0xd8, 0x5b, 0xc3,
         }, kA + kB},
-        // `push rax` as a slot freed by an add: the gap is deeper than 128 bytes.
         {"leaf with a push rax slot and a 0x100 allocation spilling below it", {
             0x53, 0x50, 0x48, 0x81, 0xec, 0x00, 0x01, 0x00, 0x00, 0x48, 0x89, 0x7c, 0x24, 0xf0, 0x48, 0x89, 0xf3,
             0x48, 0x8b, 0x44, 0x24, 0xf0, 0x48, 0x01, 0xd8, 0x48, 0x81, 0xc4, 0x00, 0x01, 0x00, 0x00,
@@ -402,8 +385,6 @@ std::vector<Leaf> thunkLeaves() {
     };
 }
 
-// A switch on rdi & 1 through a table of offsets after an int3: each case's exit starts at
-// the case label, which the widened exits must not cover.
 std::vector<Leaf> jumpTableLeaves() {
     return {
         {"leaf without pushes spilling below rsp and dispatching through a jump table", {
@@ -412,8 +393,6 @@ std::vector<Leaf> jumpTableLeaves() {
             0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3,
             0x48, 0x8b, 0x44, 0x24, 0xf8, 0x48, 0x01, 0xd0, 0xc3, 0xcc,
         }, kB + kC, true, {0xf0, 0xff, 0xff, 0xff, 0xf6, 0xff, 0xff, 0xff}},
-        // The same switch with its lea 19 instructions before the dispatch, as when hoisted out of
-        // a loop: the table is found from the function's RIP-relative leas.
         {"leaf without pushes dispatching through a jump table whose lea is far before", {
             0x48, 0x8d, 0x0d, 0x32, 0x00, 0x00, 0x00, 0x48, 0x89, 0x74, 0x24, 0xf8, 0x83, 0xe7, 0x01,
             0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
@@ -424,7 +403,6 @@ std::vector<Leaf> jumpTableLeaves() {
     };
 }
 
-// The first leaf ends in a tail call to the second: place() puts them at 0x40 and 0x70.
 std::vector<Leaf> tailCallLeaves() {
     return {
         {"leaf pushing rbx and spilling below rsp that pops and tail-calls the next leaf", {
@@ -437,8 +415,6 @@ std::vector<Leaf> tailCallLeaves() {
     };
 }
 
-// The first leaf's 3-byte `xor eax, eax; ret` cannot take an exit stub, so it is a thunk; its
-// tail call to the second leaf (at 0x70) leaves through a stub that raises rsp over the gap.
 std::vector<Leaf> thunkTailCallLeaves() {
     return {
         {"thunk leaf without pushes spilling below rsp that tail-calls the next leaf", {
@@ -451,8 +427,6 @@ std::vector<Leaf> thunkTailCallLeaves() {
     };
 }
 
-// Leaves whose frames cannot be patched in place, relocated whole into a stub. The first jumps
-// into the middle of the function after it (at 0x70), which is not a leaf.
 std::vector<Leaf> relocatedLeaves() {
     return {
         {"leaf spilling below rsp whose jne lands in the middle of another function", {
@@ -460,12 +434,10 @@ std::vector<Leaf> relocatedLeaves() {
             0x0f, 0x85, 0x22, 0x00, 0x00, 0x00, 0xc3,
         }, kA + kB},
         {"function with a call whose middle adds rsi", {0xe8, 0x00, 0x00, 0x00, 0x00, 0x48, 0x01, 0xf0, 0xc3}, 0, false, {}, false},
-        // `push rax` as a slot written and read at [rsp], freed by an add: no thunk can hold it.
         {"leaf using its push rax slot at rsp beside a spill below rsp", {
             0x53, 0x50, 0x48, 0x89, 0x3c, 0x24, 0x48, 0x89, 0x74, 0x24, 0xf8, 0x48, 0x8b, 0x04, 0x24,
             0x48, 0x03, 0x44, 0x24, 0xf8, 0x48, 0x83, 0xc4, 0x08, 0x5b, 0xc3,
         }, kA + kB},
-        // add rax, [rsp] sits between a loop head and a je target: no room for an operand stub.
         {"leaf with an [rsp] operand between two branch targets", {
             0x53, 0x48, 0x83, 0xec, 0x10, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x89, 0x34, 0x24,
             0x31, 0xc0, 0xb9, 0x02, 0x00, 0x00, 0x00, 0x48, 0x85, 0xd2, 0x74, 0x04,
@@ -480,27 +452,20 @@ std::vector<Leaf> relocatedLeaves() {
             0x48, 0x39, 0xd6, 0x74, 0x0a, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x89, 0xd6, 0xeb, 0xf1,
             0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3,
         }, kA},
-        // The same loop through a switch whose cases jump back to the start: each case enters the
-        // stub through a jump of its own.
         {"leaf looping to its start through a jump table", {
             0x48, 0x39, 0xd6, 0x74, 0x25, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x89, 0xd6, 0x83, 0xe7, 0x01,
             0x48, 0x8d, 0x0d, 0x1a, 0x00, 0x00, 0x00, 0x48, 0x63, 0x04, 0xb9, 0x48, 0x01, 0xc8, 0xff, 0xe0,
             0xe9, 0xdb, 0xff, 0xff, 0xff, 0xe9, 0xd6, 0xff, 0xff, 0xff,
             0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3, 0xcc,
         }, kA, true, {0xef, 0xff, 0xff, 0xff, 0xf4, 0xff, 0xff, 0xff}},
-        // longjmp-shaped: rsp saved to a buffer after the code and reloaded from it (libc's
-        // `mov rsp, [rdx+0x10]`, here +0x8 so the buffer fits before the next leaf); the spill below rsp, written before the reload, is read after it,
-        // so rsp must never rise above the leaf's lowered rsp in between.
         {"leaf reloading rsp from a buffer", {
             0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x89, 0xe0, 0x48, 0x8d, 0x15, 0x11, 0x00, 0x00, 0x00,
             0x48, 0x89, 0x42, 0x08, 0x48, 0x8b, 0x62, 0x08, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0x48, 0x01, 0xf0, 0xc3,
         }, kA + kB, true, std::vector<std::uint8_t>(16, 0)},
-        // A realigned frame: rsp saved by `push rax` after `and rsp, -16`, restored by `pop rsp`.
         {"leaf realigning rsp and restoring it with pop rsp", {
             0x48, 0x89, 0xe0, 0x48, 0x83, 0xe4, 0xf0, 0x50, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf8,
             0x48, 0x01, 0xf0, 0x5c, 0xc3,
         }, kA + kB},
-        // `mov [rsp-0x10], rsp` stores the leaf's rsp, compared against `mov rcx, rsp`.
         {"leaf storing rsp below rsp", {
             0x48, 0x89, 0x64, 0x24, 0xf0, 0x48, 0x89, 0x7c, 0x24, 0xf8, 0x48, 0x8b, 0x44, 0x24, 0xf0, 0x48, 0x89, 0xe1,
             0x48, 0x29, 0xc8, 0x48, 0x03, 0x44, 0x24, 0xf8, 0x48, 0x01, 0xf0, 0xc3,
@@ -718,7 +683,6 @@ int main() {
         const auto backward = runLeaves(backwardStubbedLeaves());
         require(backward.OperandStubs == 2 && backward.StubbedOperands == 3 && backward.MovedOperands == 5, "the leaves comparing at rsp before a branch were framed with " + std::to_string(backward.OperandStubs) + " operand stubs carrying " + std::to_string(backward.StubbedOperands) + " rsp operands and " + std::to_string(backward.MovedOperands) + " moved in place, not 2 carrying 3 and 5");
         const auto widened = runLeaves(widenedLeaves());
-        // Two frame-pointer leaves that push only rbp leave through `leave` instead of widened exits.
         require(widened.WidenedPrologues == 9 && widened.WidenedExits == 8 && widened.LeaveExits == 2 && widened.WidenedOperands == 13, "the leaves with short prologues and exits were framed with " + std::to_string(widened.WidenedPrologues) + " widened prologues, " + std::to_string(widened.WidenedExits) + " widened exits, " + std::to_string(widened.LeaveExits) + " leave exits and " + std::to_string(widened.WidenedOperands) + " rsp operands in them, not 9, 8, 2 and 13");
         const auto thunked = runLeaves(thunkLeaves());
         require(thunked.ReturnThunks == 6 && thunked.Exits == 0, "the leaves whose exits cannot be patched were framed with " + std::to_string(thunked.ReturnThunks) + " return thunks and " + std::to_string(thunked.Exits) + " exit stubs, not 6 and 0");

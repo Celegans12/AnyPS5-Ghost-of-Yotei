@@ -23,9 +23,6 @@ constexpr DWORD TrapFlag = 0x100;
 constexpr DWORD64 SingleStepStatus = 0x4000;
 
 std::atomic<bool> g_active{false};
-// The thread being stepped, one at a time, and the steps left in its burst: each landing in guest
-// code steps that many instructions in a row, so a red-zone leaf it runs through faults at every
-// instruction instead of being hit by chance.
 std::atomic<DWORD> g_pending{0};
 std::atomic<unsigned> g_remaining{0};
 unsigned g_burst = 1;
@@ -35,9 +32,6 @@ constexpr std::size_t RedZoneBytes = 0x80;
 std::atomic<unsigned long long> g_delivered{0};
 std::atomic<unsigned long long> g_stray{0};
 
-// APS5_FAULT_STORM_CLOBBER_RANGE=<image>:<begin>-<end> (hex offsets into the image named, e.g.
-// game.exe or libc.prx.guest.prx): overwrite the red zone only at steps there, to bisect a leaf
-// the framer missed.
 std::wstring g_clobberImage;
 std::uintptr_t g_clobberBegin = 0;
 std::uintptr_t g_clobberEnd = 0;
@@ -49,7 +43,6 @@ struct Range {
     std::uintptr_t End;
 };
 
-// The executable and every converted guest module (*.guest.prx): the code the relinker framed.
 std::vector<Range> GuestCode() {
     std::vector<Range> ranges;
     HMODULE modules[2048];
@@ -85,8 +78,6 @@ bool Inside(const std::vector<Range>& ranges, const std::uintptr_t address) {
     return std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return address >= range.Begin && address < range.End; });
 }
 
-// The guest code ranges for the exception handler: published by the storm thread, never freed
-// (a handful of small vectors per run), so the handler reads them without a lock.
 std::atomic<const std::vector<Range>*> g_guestCode{nullptr};
 
 long long Now() {
@@ -107,8 +98,6 @@ DWORD WINAPI Run(LPVOID parameter) {
     std::map<DWORD, HANDLE> threads;
     std::map<DWORD, ULONG64> cycles;
     std::vector<std::pair<DWORD, HANDLE>> list;
-    // Threads are picked by the CPU cycles they used since the last refresh: most threads wait in
-    // host code, and only running ones can be stopped in guest code.
     std::vector<ULONG64> weights;
     ULONG64 totalWeight = 0;
     std::vector<Range> code;
@@ -116,8 +105,6 @@ DWORD WINAPI Run(LPVOID parameter) {
     long long nextModules = 0, nextThreads = 0, nextReport = Now() + 10 * second, nextStep = Now();
     for (;;) {
         const auto now = Now();
-        // Module and thread lists are read while no thread is suspended (both take loader or
-        // process locks a suspended thread may hold).
         if (now >= nextModules) {
             const auto before = code.size();
             code = GuestCode();
@@ -199,16 +186,12 @@ DWORD WINAPI Run(LPVOID parameter) {
         ResumeThread(handle);
         if (!stepped) {
             ++outside;
-            // While no guest code runs (loading), back off instead of stopping threads nonstop.
             if (++misses % 256 == 0) Sleep(1);
             continue;
         }
         misses = 0;
         ++injected;
-        // The rate counts injected steps; tries that miss guest code are retried at once.
         nextStep = std::max(nextStep + period, Now() - second);
-        // The thread was in guest code, so it is in user mode and takes the step as soon as it
-        // runs. Never inject again before it has, or a step could arrive unclaimed.
         const auto deadline = Now() + second;
         bool counted = false;
         while (g_pending.load(std::memory_order_acquire) != 0) {
@@ -228,11 +211,6 @@ bool Handle(EXCEPTION_POINTERS* info) {
     auto* context = info->ContextRecord;
     if (g_pending.load(std::memory_order_acquire) == GetCurrentThreadId()) {
         g_delivered.fetch_add(1, std::memory_order_relaxed);
-        // The worst case of a real dispatch: with the XSAVE area's top component in use (AVX-512
-        // Hi16 state on CPUs that have it, AVX state on those that do not) the frame reaches up to
-        // rsp itself. Without it, as on most guest steps here, a 9800X3D's frame stops 0x658 bytes
-        // below rsp and never touches the red zone, so the storm writes the red zone itself. Host
-        // code keeps nothing below rsp (Windows x64 ABI).
         const auto* guest = g_guestCode.load(std::memory_order_acquire);
         const auto rip = static_cast<std::uintptr_t>(context->Rip);
         const bool inRange = g_clobberImage.empty() || (rip >= g_clobberLow.load(std::memory_order_relaxed) && rip < g_clobberHigh.load(std::memory_order_acquire));
@@ -245,7 +223,6 @@ bool Handle(EXCEPTION_POINTERS* info) {
         }
         return true;
     }
-    // An injected trap flag saved by pushfq and restored by popfq steps again later.
     if ((context->Dr6 & SingleStepStatus) != 0 && (context->Dr7 & 0xff) == 0) {
         context->EFlags &= ~TrapFlag;
         g_stray.fetch_add(1, std::memory_order_relaxed);
@@ -262,10 +239,7 @@ void Start() {
     if (rate == 1) rate = 2000;
     if (const char* burst = std::getenv("APS5_FAULT_STORM_BURST"); burst != nullptr && burst[0] >= '0' && burst[0] <= '9') g_burst = std::max(1u, static_cast<unsigned>(std::strtoul(burst, nullptr, 10)));
     else g_burst = 256;
-    // APS5_FAULT_STORM_NO_CLOBBER=1: real frames only (on an AVX-512 CPU they rarely reach the red zone).
     g_clobber = std::getenv("APS5_FAULT_STORM_NO_CLOBBER") == nullptr;
-    // APS5_FAULT_STORM_GUEST_CLOBBER=1: overwrite the red zone only at steps in guest code (the
-    // relinker's framed images), not in host code the guest calls.
     g_clobberGuestOnly = std::getenv("APS5_FAULT_STORM_GUEST_CLOBBER") != nullptr;
     if (const char* range = std::getenv("APS5_FAULT_STORM_CLOBBER_RANGE")) {
         const char* colon = std::strchr(range, ':');

@@ -518,7 +518,6 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             }
         }
         if (frameRedZone) {
-            // After the syscall traps, as for the executable: framing sees the final bytes.
             const auto prefix = "Red-zone framing (" + Io::Utf8Path(image.SourcePath.filename()) + ")";
             auto framing = FrameRedZoneImage(image.Bytes, image.Headers, image.Dynamic.RelaData, image.Trampolines, prefix, [&](std::string_view text) { progress.Message(text); });
             if (!framing.HasBounds) {

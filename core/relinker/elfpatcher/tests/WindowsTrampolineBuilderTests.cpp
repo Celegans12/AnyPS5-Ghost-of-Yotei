@@ -99,7 +99,6 @@ void run() {
     requireRejected(image, {site(0x1002)}, fresh, endRva - SectionAlignment, "Windows trampoline section overlaps preceding section");
     requireRejected(image, {site(0x1002)}, sections, nextRva, "Duplicate Windows trampoline section");
 
-    // A join site jumps into the stub of the site JoinBack entries before it, JoinOffset bytes in.
     auto join = site(0x1010);
     join.Body.clear();
     join.ReturnBranchOffset = 0;

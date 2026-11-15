@@ -19,15 +19,11 @@ RedZoneFramingResult FrameRedZoneImage(std::vector<std::uint8_t>& bytes, const s
     std::vector<Codegen::RedZoneFunction> functions;
     for (const auto& region : UnusedNidFilter::ReadExceptionFunctions(bytes, headers, {}, {})) functions.push_back({region.Begin, region.End});
     result.HasBounds = !functions.empty();
-    // Code no FDE covers (FF's eboot: 94 % of its code) is split into functions at int3 padding and
-    // direct call targets, and framed like the rest; the framer's own checks (branches into a leaf
-    // from outside it, exits that leave it) hold for these bounds too.
     const auto pieces = Codegen::SplitUncoveredCode(bytes, codeSegments, functions);
     result.SplitFunctions = pieces.size();
     if (!pieces.empty()) message(prefix + ": " + std::to_string(pieces.size()) + " functions taken from code outside .eh_frame bounds, split at int3 padding and call targets\n");
     functions.insert(functions.end(), pieces.begin(), pieces.end());
     if (functions.empty()) return result;
-    // R_X86_64_RELATIVE addends: tables of absolute addresses are zero in the file.
     std::map<std::uint64_t, std::uint64_t> relativeAddends;
     for (std::size_t at = 0; at + 24 <= relaData.size(); at += 24) {
         std::uint64_t offset = 0;
