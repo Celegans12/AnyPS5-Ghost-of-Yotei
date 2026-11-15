@@ -425,11 +425,10 @@ public:
         // trap open its import group: Age of Mythology walked and armed memory again each frame.
         DWORD previous;
         if (!VirtualProtect(reinterpret_cast<void*>(first), last - first, PAGE_NOACCESS, &previous)) return false;
-        // The trapped pages count as armed (not clean: their stores since the last walk are still
-        // in the write watch), so an import group holding them can be armed as a whole. A group
-        // with a page that cannot be armed is opened at every submission.
-        remember(armedRanges, first, last);
-        noteUneven(first, last);
+        // Nothing else changes: the armed record of the pages stays as it was, and their import
+        // group is not marked for another look (arming works around trapped pages). Marking it
+        // made the tracker open Age of Mythology's 272 MiB group at every trap, because one block
+        // of it is written often.
         traps.emplace(begin, end);
         longestTrap = std::max(longestTrap, end - begin);
         remember(everTrapped, first, last);

@@ -1136,8 +1136,8 @@ void CheckReadTraps() {
     mappings.Commit(memory, Total, PAGE_READWRITE, Total, true);
     const auto address = reinterpret_cast<std::uintptr_t>(memory);
     const auto protection = [&](std::size_t offset) { return RegionAt(memory + offset).Protect; };
-    // A page whose trap went without a store is armed: read-only until the first store.
-    const auto open = [&](std::size_t offset) { return protection(offset) == PAGE_READONLY; };
+    // A page whose trap went without a store is as before the trap: read-only where it was armed.
+    const auto open = [&](std::size_t offset) { return protection(offset) == PAGE_READONLY || protection(offset) == PAGE_READWRITE; };
     const auto load = [&](std::size_t offset) { return static_cast<const volatile unsigned char*>(memory)[offset]; };
     const auto trappedBytes = [&] {
         std::size_t bytes = 0;
