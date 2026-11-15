@@ -35,6 +35,9 @@ struct MappingLockCounts {
 enum class PageTrackReason : std::uint64_t { Armable = 0, Armed, Disabled, Edge, Held, Imported, Barred, Resting, Faulted, Busy, GpuWritten };
 inline constexpr std::uint64_t PageTrackReasonMask = 0xffffffffu;
 inline constexpr unsigned PageTrackReasonFramesShift = 32;
+enum class PageTrackOrigin : std::uint8_t { None = 0, Commit, Recommit, Protect, KeepOpen, Resident, SetProtection, Import, Unwatch, MarkWritten, RecorderWrite, RecorderBatch, VerifyClean, Announced, Count };
+inline constexpr std::size_t PageTrackOrigins = static_cast<std::size_t>(PageTrackOrigin::Count);
+inline constexpr std::size_t PageTrackOriginFields = 5;
 
 #ifndef _WIN32
 using SharedBackingResolver = bool (*)(std::uintptr_t address, std::size_t bytes, int* file, std::uint64_t* offset);

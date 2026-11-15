@@ -2720,12 +2720,70 @@ bool ArmedCleanSince(std::uint64_t address, std::size_t bytes, std::span<const s
 #endif
 }
 
-void AnnounceGpuWrite(std::uint64_t address, std::size_t bytes) {
+void AnnounceGpuWrite(std::uint64_t address, std::size_t bytes, GuestArena::PageTrackOrigin origin) {
 #ifdef _WIN32
-    GuestArena::GuestPageTrackGpuWrite_nid_no_patch(static_cast<std::uintptr_t>(address), bytes);
+    GuestArena::GuestPageTrackGpuWrite_nid_no_patch(static_cast<std::uintptr_t>(address), bytes, static_cast<std::uint8_t>(origin));
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
+    static_cast<void>(origin);
+#endif
+}
+
+void ReportPageOrigins() {
+#ifdef _WIN32
+    constexpr auto origins = GuestArena::PageTrackOrigins;
+    constexpr auto fields = GuestArena::PageTrackOriginFields;
+    constexpr std::array<const char*, origins> names{"none", "commit", "recommit", "protect", "keep-open", "resident", "set-protection", "import", "unwatch", "mark-written", "recorder-write", "recorder-batch", "verify-clean", "announced"};
+    static std::array<std::uint64_t, origins * fields + 2> reported{};
+    std::array<std::uint64_t, origins * fields + 2> now{};
+    GuestArena::GuestPageTrackOrigins_nid_no_patch(now.data(), now.size());
+    std::string text;
+    for (std::size_t origin = 0; origin < origins; ++origin) {
+        const auto* at = now.data() + origin * fields;
+        const auto* was = reported.data() + origin * fields;
+        if (at[0] == was[0] && at[1] == 0 && at[2] == was[2]) continue;
+        char item[224];
+        std::snprintf(item, sizeof(item), " %s %llu left (%llu blocks marked first in all), %llu announces of %.2f MiB over %llu blocks;", names[origin], static_cast<unsigned long long>(at[0] - was[0]), static_cast<unsigned long long>(at[1]), static_cast<unsigned long long>(at[2] - was[2]), static_cast<double>(at[3] - was[3]) / 1048576.0, static_cast<unsigned long long>(at[4] - was[4]));
+        text += item;
+    }
+    const auto extra = origins * fields;
+    AgcDriver::ProfilePrint_nid_no_patch("[page-origins] (10 s) clean blocks left on the write watch as imported, barred or written by the GPU, by the site that first marked them:%s blocks left as written by the GPU: %llu announced in this frame or the one before, %llu not since\n", text.c_str(), static_cast<unsigned long long>(now[extra] - reported[extra]), static_cast<unsigned long long>(now[extra + 1] - reported[extra + 1]));
+    reported = now;
+    constexpr std::array<const char*, GuestArena::MappingLockRoles> roleNames{"game", "committer", "finisher", "queue-worker", "walker", "presenter"};
+    constexpr std::array<const char*, GuestArena::MappingLockCallers> callerNames{"other", "forget-known-zero", "collect", "commit", "keep-open", "query-opened", "reset", "map-zero", "map", "set-protection", "pin", "unpin", "compare-when-shared", "compared-pages", "handle-write", "handle-read", "resident-span", "forget-section", "begin-host-write", "end-host-write", "map-alias", "unmap-alias", "protection", "collect-work", "arm-owned", "owned-unchanged", "gpu-write", "arm-blocks", "rearm-blocks"};
+    static std::array<std::uint64_t, GuestArena::MappingLockShares> reportedShares{};
+    std::array<std::uint64_t, GuestArena::MappingLockShares> shares{};
+    GuestArena::GuestMappingLockShares_nid_no_patch(shares.data(), shares.size());
+    const auto delta = [&](std::size_t index) { return shares[index] - reportedShares[index]; };
+    const auto ms = [](std::uint64_t ns) { return static_cast<double>(ns) / 1e6; };
+    std::string lockText;
+    char lockItem[192];
+    for (std::size_t role = 0; role < GuestArena::MappingLockRoles; ++role) {
+        const auto base = role * GuestArena::MappingLockRoleFields;
+        if (delta(base) == 0 && delta(base + 1) == 0) continue;
+        std::snprintf(lockItem, sizeof(lockItem), " %s %llu acquired, %llu waited %.2f ms", roleNames[role], static_cast<unsigned long long>(delta(base)), static_cast<unsigned long long>(delta(base + 1)), ms(delta(base + 2)));
+        lockText += lockItem;
+        if (delta(base + 1) != 0) {
+            lockText += " (behind";
+            for (std::size_t holder = 0; holder < GuestArena::MappingLockRoles; ++holder) {
+                if (delta(base + 3 + holder) == 0) continue;
+                std::snprintf(lockItem, sizeof(lockItem), " %s %.2f ms", roleNames[holder], ms(delta(base + 3 + holder)));
+                lockText += lockItem;
+            }
+            lockText += ")";
+        }
+        lockText += ";";
+    }
+    lockText += " by caller:";
+    for (std::size_t caller = 0; caller < GuestArena::MappingLockCallers; ++caller) {
+        const auto base = GuestArena::MappingLockRoles * GuestArena::MappingLockRoleFields + caller * GuestArena::MappingLockCallerFields;
+        if (delta(base) == 0 && delta(base + 1) == 0 && delta(base + 3) == 0) continue;
+        std::snprintf(lockItem, sizeof(lockItem), " %s %llu acquired, %llu waited %.2f ms, kept others waiting %.2f ms;", callerNames[caller], static_cast<unsigned long long>(delta(base)), static_cast<unsigned long long>(delta(base + 1)), ms(delta(base + 2)), ms(delta(base + 3)));
+        lockText += lockItem;
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[mapping-lock-shares] (10 s) mapping lock by thread role:%s\n", lockText.c_str());
+    reportedShares = shares;
 #endif
 }
 
@@ -3179,7 +3237,7 @@ void beforeUnwatchUnproven(std::uint64_t address, std::size_t bytes) {
 }
 
 void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t bytes) {
-    AnnounceGpuWrite(address, bytes);
+    AnnounceGpuWrite(address, bytes, GuestArena::PageTrackOrigin::Unwatch);
     if (!tracker.watched) return;
 #ifdef _WIN32
     tracker.startHints(address, bytes);
@@ -3671,7 +3729,7 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
 }
 
 static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
-    AnnounceGpuWrite(address, bytes);
+    AnnounceGpuWrite(address, bytes, GuestArena::PageTrackOrigin::MarkWritten);
     breakLegacyProofs(ProofBreak::Marked);
     const StoreBump storeBump{address, bytes};
     noteDriverStore(address, bytes);

@@ -3,12 +3,14 @@
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/general/ThreadName.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <optional>
+#include <string_view>
 #include <vector>
 
 #ifdef _WIN32
@@ -41,6 +43,9 @@ std::uint64_t WorkerAffinityMask() {
 
 void NameDriverThread(const char* name) {
 #ifdef _WIN32
+    const std::string_view named(name);
+    const auto role = named == "draw-commit" ? GuestArena::MappingLockRole::Committer : named.starts_with("draw-finish") ? GuestArena::MappingLockRole::Finisher : named.starts_with("qworker") ? GuestArena::MappingLockRole::QueueWorker : named == "collect-walk" ? GuestArena::MappingLockRole::Walker : named == "presenter" ? GuestArena::MappingLockRole::Presenter : GuestArena::MappingLockRole::Game;
+    GuestArena::GuestMappingLockRole_nid_no_patch(static_cast<std::uint8_t>(role));
     const HRESULT nameResult = ThreadName::SetCurrent(name);
     if (FAILED(nameResult)) std::fprintf(stderr, "[thread-name] could not name %s (0x%08lx)\n", name, static_cast<unsigned long>(nameResult));
 #elif defined(__APPLE__)

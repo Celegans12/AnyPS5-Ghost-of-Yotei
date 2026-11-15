@@ -5,6 +5,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include <windows.h>
 #include "prx/libc/include/WindowsPageTrack.hpp"
+#include "prx/libc/include/GuestPageTrack.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -65,6 +66,14 @@ public:
         return mutex.Flights();
     }
 
+    static void SetLockRole(MappingLockRole role) {
+        SiteMutex::SetRole(role);
+    }
+
+    void LockShares(std::uint64_t* counts, std::size_t capacity) const {
+        mutex.Shares(counts, capacity);
+    }
+
     MappingLockCounts LockCounted() const {
         auto counts = mutex.Counted();
         for (std::size_t outcome = 0; outcome < MappingForgetOutcomes; ++outcome) counts.forgets[outcome] = forgetOutcomes[outcome].load(std::memory_order_relaxed);
@@ -79,7 +88,7 @@ public:
     std::vector<std::pair<std::uintptr_t, std::size_t>> Commit(void* address, std::size_t bytes, DWORD protection, std::size_t granule, bool watched) {
         if (granule == 0) throw std::invalid_argument("guest memory commit granule is zero");
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::Commit);
         collectableRanges.clear();
         disown(reinterpret_cast<std::uintptr_t>(address), reinterpret_cast<std::uintptr_t>(address) + bytes);
         const DWORD flags = MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | (watched ? MEM_WRITE_WATCH : 0);
@@ -89,7 +98,7 @@ public:
         const auto replace = [&](std::uintptr_t at, std::size_t size) {
             if (!allocate(GetCurrentProcess(), reinterpret_cast<void*>(at), size, flags, protection, nullptr, 0)) fail("replace guest placeholder with private memory");
             privateAllocations.emplace(at, at + size);
-            if (protection != PAGE_READWRITE) track.Bar(at, at + size);
+            if (protection != PAGE_READWRITE) track.Bar(at, at + size, PageTrackOrigin::Commit);
             if (watched) markZero(at, at + size);
             if (!created.empty() && created.back().first + created.back().second == at) created.back().second += size;
             else created.emplace_back(at, size);
@@ -133,7 +142,7 @@ public:
                     mapped->second.armed = 0;
                     invalidate(mapped->first, mapped->second);
                 }
-                if (protection != PAGE_READWRITE) track.Bar(cursor, stop);
+                if (protection != PAGE_READWRITE) track.Bar(cursor, stop, PageTrackOrigin::Recommit);
                 else track.Open(cursor, stop);
                 DWORD previous;
                 if (!VirtualProtect(reinterpret_cast<void*>(cursor), stop - cursor, protection, &previous)) fail("protect guest memory");
@@ -147,7 +156,7 @@ public:
         std::unique_lock lock(mutex, std::defer_lock);
         if (track.Enabled()) lock.lock();
         const auto end = address + bytes;
-        if (protection != PAGE_READWRITE) track.Bar(address, end);
+        if (protection != PAGE_READWRITE) track.Bar(address, end, PageTrackOrigin::Protect);
         else track.Open(address, end);
         for (auto cursor = address; cursor < end;) {
             const auto memory = query(cursor);
@@ -164,13 +173,13 @@ public:
     }
 
     void KeepOpen(std::uintptr_t address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
-        track.Bar(address, address + bytes);
+        const SiteLock lock(mutex, MappingLockCaller::KeepOpen);
+        track.Bar(address, address + bytes, PageTrackOrigin::KeepOpen);
     }
 
     bool QueryOpened(std::uintptr_t address, MEMORY_BASIC_INFORMATION* memory) {
         if (!track.Enabled()) return VirtualQuery(reinterpret_cast<const void*>(address), memory, sizeof(*memory)) == sizeof(*memory);
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::QueryOpened);
         const auto run = residentRuns.upper_bound(address);
         if (run != residentRuns.begin() && std::prev(run)->second.end > address) {
             track.Open(std::prev(run)->first, std::prev(run)->second.end);
@@ -181,12 +190,12 @@ public:
     }
 
     void Reset(void* address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::Reset);
         reset(reinterpret_cast<std::uintptr_t>(address), bytes);
     }
 
     void MapZero(void* address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::MapZero);
         if (zeroSection == nullptr && (zeroSection = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READONLY, 0, static_cast<DWORD>(pageBytes), nullptr)) == nullptr) fail("create the read-only zero guest page");
         const auto start = reinterpret_cast<std::uintptr_t>(address);
         reset(start, bytes);
@@ -198,7 +207,7 @@ public:
 
     void Map(void* address, std::size_t bytes, HANDLE section, std::uint64_t offset, DWORD protection, bool watched = false, bool resident = false, DWORD viewProtection = PAGE_EXECUTE_READWRITE, std::size_t sectionBytes = SIZE_MAX, std::vector<std::pair<std::uintptr_t, std::size_t>>* createdPrivate = nullptr) {
         if (sectionBytes < bytes && (resident || sectionBytes == 0 || bytes - sectionBytes >= pageBytes)) throw std::runtime_error("shared guest mapping extends a whole page past its section");
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::Map);
         collectableRanges.clear();
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         if (createdPrivate != nullptr) createdPrivate->reserve(createdPrivate->size() + bytes / pageBytes);
@@ -262,7 +271,7 @@ public:
                 forgetClean(base, base + runBytes);
                 remember(freshRanges, base, base + runBytes);
                 DWORD previous;
-                if (protection != PAGE_READWRITE) track.Bar(base, base + runBytes);
+                if (protection != PAGE_READWRITE) track.Bar(base, base + runBytes, PageTrackOrigin::Resident);
                 if (protection != PAGE_READWRITE && !VirtualProtect(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect resident guest pages");
                 done += runBytes;
                 continue;
@@ -317,9 +326,9 @@ public:
     }
 
     void SetProtection(std::uintptr_t address, std::size_t bytes, DWORD protection) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::SetProtection);
         disown(address, address + bytes);
-        if (protection != PAGE_READWRITE) track.Bar(address, address + bytes);
+        if (protection != PAGE_READWRITE) track.Bar(address, address + bytes, PageTrackOrigin::SetProtection);
         else track.Open(address, address + bytes);
         collectableRanges.clear();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
@@ -331,7 +340,7 @@ public:
     }
 
     void Pin(std::uintptr_t address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::Pin);
         disown(address, address + bytes);
         ownedPins.emplace(address, address + bytes);
         track.Hold(address, address + bytes);
@@ -354,7 +363,7 @@ public:
     }
 
     void Unpin(std::uintptr_t address, std::size_t bytes) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::Unpin);
         disown(address, address + bytes);
         eraseOwnedRange(ownedPins, address, address + bytes);
         track.Release(address, address + bytes);
@@ -366,7 +375,7 @@ public:
     }
 
     void CompareWhenShared(std::uintptr_t address, std::size_t bytes, bool residentOnly = false) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::CompareWhenShared);
         collectableRanges.clear();
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             if (residentOnly && !it->second.resident && !it->second.aliasDemoted) continue;
@@ -396,7 +405,7 @@ public:
             *count = 0;
             return;
         }
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::ComparedPages);
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -415,7 +424,7 @@ public:
     }
 
     bool HandleWrite(std::uintptr_t address) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::HandleWrite);
         const auto base = address & ~(pageBytes - 1);
         const auto found = views.find(base);
         if (found == views.end() || !writable(found->second.protection)) return false;
@@ -432,14 +441,14 @@ public:
     }
 
     bool HandleRead(std::uintptr_t address) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::HandleRead);
         if (!views.contains(address & ~(pageBytes - 1))) return false;
         const auto memory = query(address);
         return memory.State == MEM_COMMIT && (memory.Protect & (PAGE_NOACCESS | PAGE_GUARD)) == 0;
     }
 
     bool ResidentSpan(std::uintptr_t address, std::size_t bytes, std::uintptr_t* start, std::uintptr_t* end) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::ResidentSpan);
         auto run = residentRuns.upper_bound(address);
         if (run != residentRuns.begin() && std::prev(run)->second.end > address) --run;
         if (run == residentRuns.end() || run->first >= address + bytes) return false;
@@ -449,7 +458,7 @@ public:
     }
 
     bool ForgetSection(HANDLE section) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::ForgetSection);
         const auto key = reinterpret_cast<std::uintptr_t>(section);
         const auto first = physical.lower_bound(std::make_pair(key, std::uint64_t{0}));
         const auto last = physical.lower_bound(std::make_pair(key + 1, std::uint64_t{0}));
@@ -461,7 +470,7 @@ public:
 
     bool BeginHostWrite(std::uintptr_t address, std::size_t bytes, bool store = true) {
         const bool ranged = rangedHostWrites();
-        const SiteLock lock(mutex, LockSite::Other, ranged ? address : 0, ranged ? address + bytes : UINTPTR_MAX);
+        const SiteLock lock(mutex, LockSite::Other, ranged ? address : 0, ranged ? address + bytes : UINTPTR_MAX, MappingLockCaller::BeginHostWrite);
         const auto first = views.lower_bound(address & ~(pageBytes - 1));
         const auto end = address + bytes;
         for (auto it = first; it != views.end() && it->first < end; ++it) {
@@ -492,7 +501,7 @@ public:
 
     void EndHostWrite(std::uintptr_t address, std::size_t bytes, bool store = true) {
         const bool ranged = rangedHostWrites();
-        const SiteLock lock(mutex, LockSite::Other, ranged ? address : 0, ranged ? address + bytes : UINTPTR_MAX);
+        const SiteLock lock(mutex, LockSite::Other, ranged ? address : 0, ranged ? address + bytes : UINTPTR_MAX, MappingLockCaller::EndHostWrite);
         const auto end = address + bytes;
         disown(address, end);
         eraseOwnedRange(ownedHostAccess, address, end);
@@ -522,7 +531,7 @@ public:
     }
 
     void* MapAlias(std::uintptr_t address, std::size_t bytes, bool* boundsRefused = nullptr) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::MapAlias);
         if (boundsRefused != nullptr) *boundsRefused = false;
         const auto refuse = [&](const char* reason) {
             char text[192];
@@ -573,7 +582,7 @@ public:
     void UnmapAlias(void* alias) {
         if (alias == nullptr) return;
         {
-            std::lock_guard lock(mutex);
+            const SiteLock lock(mutex, MappingLockCaller::UnmapAlias);
             if (const auto found = splitAliases.find(reinterpret_cast<std::uintptr_t>(alias)); found != splitAliases.end()) {
                 const auto error = releaseAlias(found->first, found->second);
                 splitAliases.erase(found);
@@ -598,7 +607,7 @@ public:
                 return true;
             }
         }
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::Protection);
         const auto found = views.find(address & ~(pageBytes - 1));
         if (found == views.end()) return false;
         *protection = found->second.protection;
@@ -607,7 +616,7 @@ public:
 
 #ifdef APS5_COUNT_MAPPING_QUERIES
     void CollectWork(std::uint64_t* systemCalls, std::uint64_t* pieces) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::CollectWork);
         *systemCalls = collectSystemCalls;
         *pieces = collectPieces;
     }
@@ -622,7 +631,7 @@ public:
     static constexpr unsigned OwnedPrivate = 1;
 
     bool ArmOwned(std::uintptr_t address, std::size_t bytes, std::uint64_t* words, std::size_t count, unsigned flags = 0) {
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::ArmOwned);
         if (words == nullptr || (flags & ~OwnedPrivate) != 0 || !ownedRange(address, bytes, count)) return false;
         if (nextOwned == 0 || count > UINT64_MAX - nextOwned + 1) return false;
         const auto first = address & ~(ownedBlockBytes - 1);
@@ -666,7 +675,7 @@ public:
         const auto first = address & ~(ownedBlockBytes - 1);
         const auto end = (address + bytes - 1) | (ownedBlockBytes - 1);
         if (!unlockedReads()) {
-            std::lock_guard lock(mutex);
+            const SiteLock lock(mutex, MappingLockCaller::OwnedUnchanged);
             for (auto block = first; block < end; block += ownedBlockBytes) {
                 const auto found = ownedWords.find(block);
                 if (found == ownedWords.end() || found->second != words[(block - first) / ownedBlockBytes]) return false;
@@ -703,11 +712,12 @@ public:
         return held;
     }
 
-    void GpuWrite(std::uintptr_t address, std::size_t bytes) {
+    void GpuWrite(std::uintptr_t address, std::size_t bytes, PageTrackOrigin origin) {
         if (!track.ArmsImports() || bytes == 0 || address >= (std::uintptr_t{1} << 47) || bytes > (std::uintptr_t{1} << 47) - address) return;
+        track.NoteAnnounce(address, address + bytes, origin);
         if (track.MarkedGpuWrites(address, address + bytes)) return;
-        std::lock_guard lock(mutex);
-        track.GpuWrite(address, address + bytes);
+        const SiteLock lock(mutex, MappingLockCaller::GpuWrite);
+        track.GpuWrite(address, address + bytes, origin);
     }
 
     bool ArmBlocks(std::uintptr_t address, std::size_t bytes, std::uint64_t* tokens, std::uint64_t* reasons, std::size_t count) {
@@ -715,7 +725,7 @@ public:
         std::fill_n(tokens, count, std::uint64_t{0});
         if (reasons != nullptr) std::fill_n(reasons, count, WindowsPageTrack::Reason(PageTrackReason::Disabled));
         if (!track.Enabled() || !WindowsPageTrack::Spans(address, bytes, count)) return false;
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::ArmBlocks);
         const auto now = track.Period();
         bool every = true;
         auto block = address & ~(WindowsPageTrack::BlockBytes - 1);
@@ -735,7 +745,7 @@ public:
             std::fill_n(tokens, count, std::uint64_t{0});
             return false;
         }
-        std::lock_guard lock(mutex);
+        const SiteLock lock(mutex, MappingLockCaller::RearmBlocks);
         const auto now = track.Period();
         bool every = true;
         auto block = address & ~(WindowsPageTrack::BlockBytes - 1);
@@ -1357,7 +1367,7 @@ private:
         std::snprintf(text, sizeof(text), "page tracking: the %sblock 0x%llx is armed and clean, but %s (APS5_VERIFY_PAGE_TRACK)", imported ? "imported " : "", static_cast<unsigned long long>(block), result != 0 ? "its write watch cannot be read" : found != 0 ? "the write watch reports written pages" : imported ? "its bytes changed without a fault: a GPU write was not announced" : "its bytes changed without a fault");
         std::fprintf(stderr, "%s\n", text);
         if (imported) {
-            track.GpuWrite(block, block + WindowsPageTrack::BlockBytes);
+            track.GpuWrite(block, block + WindowsPageTrack::BlockBytes, PageTrackOrigin::VerifyClean);
             return;
         }
         throw std::runtime_error(text);
@@ -1442,6 +1452,9 @@ private:
         constexpr auto blockBytes = WindowsPageTrack::BlockBytes;
         const auto now = track.Period();
         std::array<std::uint64_t, WindowsPageTrack::LeftReasons> left{};
+        std::array<std::uint64_t, PageTrackOrigins> origins{};
+        std::uint64_t fresh = 0;
+        std::uint64_t stale = 0;
         ULONG_PTR index = 0;
         for (auto block = first & ~(blockBytes - 1); block < end; block += blockBytes) {
             bool written = false;
@@ -1455,12 +1468,18 @@ private:
                 continue;
             }
             auto& entry = track.Touch(block);
-            if (!written) ++left[static_cast<std::size_t>(WindowsPageTrack::LeftBecause(entry))];
+            if (!written) {
+                const auto reason = WindowsPageTrack::LeftBecause(entry);
+                ++left[static_cast<std::size_t>(reason)];
+                if (reason == WindowsPageTrack::Left::Imported || reason == WindowsPageTrack::Left::Barred || reason == WindowsPageTrack::Left::GpuWritten) ++origins[WindowsPageTrack::OriginOf(entry)];
+                if (reason == WindowsPageTrack::Left::GpuWritten) ++(WindowsPageTrack::FreshGpuWrite(entry, now) ? fresh : stale);
+            }
             if (!WindowsPageTrack::Free(entry)) continue;
             if (written) WindowsPageTrack::NoteWritten(entry, now);
             else WindowsPageTrack::NoteClean(entry, now);
         }
         track.NoteLeft(left);
+        track.NoteLeftOrigins(origins, fresh, stale);
     }
 
     UINT collectTracked(bool clear, std::uintptr_t lower, std::uintptr_t upper, bool armable, void* address, std::size_t bytes, void** pages, ULONG_PTR* count, DWORD* granularity) {
@@ -2321,6 +2340,10 @@ private:
     public:
         static constexpr std::size_t Grounded = SIZE_MAX;
 
+        static void SetRole(MappingLockRole value) {
+            role = static_cast<std::uint8_t>(value);
+        }
+
         void lock() {
             Lock(LockSite::Other, 0, UINTPTR_MAX);
         }
@@ -2331,7 +2354,7 @@ private:
                 inner.unlock();
                 return false;
             }
-            entered(LockSite::Other);
+            entered(LockSite::Other, MappingLockCaller::Other);
             return true;
         }
 
@@ -2340,16 +2363,27 @@ private:
         }
 
         void Lock(LockSite site, std::uintptr_t first, std::uintptr_t end) {
+            Lock(site, first, end, static_cast<MappingLockCaller>(site));
+        }
+
+        void Lock(LockSite site, std::uintptr_t first, std::uintptr_t end, MappingLockCaller caller) {
             std::unique_lock held(inner, std::try_to_lock);
             std::optional<std::chrono::steady_clock::time_point> start;
             auto behind = static_cast<std::uint8_t>(LockSite::Collect);
+            auto behindRole = static_cast<std::uint8_t>(MappingLockRole::Game);
+            auto behindCaller = static_cast<std::uint8_t>(MappingLockCaller::Collect);
             if (!held.owns_lock()) {
                 behind = holder.load(std::memory_order_relaxed);
+                behindRole = holderRole.load(std::memory_order_relaxed);
+                behindCaller = holderCaller.load(std::memory_order_relaxed);
                 start = std::chrono::steady_clock::now();
                 held.lock();
             }
             if (flightOver(first, end)) {
-                if (!start) start = std::chrono::steady_clock::now();
+                if (!start) {
+                    start = std::chrono::steady_clock::now();
+                    behindRole = flightRole(first, end);
+                }
                 const bool everything = first == 0 && end == UINTPTR_MAX;
                 if (everything) ++waitingForAll;
                 landed.wait(held, [&] { return !flightOver(first, end); });
@@ -2362,8 +2396,16 @@ private:
                 add(counts.waits, 1);
                 add(counts.waitNs, waited);
                 add(counts.behindNs[behind], waited);
+                const auto self = static_cast<std::size_t>(role);
+                const auto by = static_cast<std::size_t>(caller);
+                add(roles[self].waits, 1);
+                add(roles[self].waitNs, waited);
+                add(roles[self].behindNs[behindRole], waited);
+                add(callers[by].waits, 1);
+                add(callers[by].waitNs, waited);
+                add(callers[behindCaller].heldNs, waited);
             }
-            entered(site);
+            entered(site, caller);
         }
 
         std::size_t TakeOff(std::uintptr_t first, std::uintptr_t end) {
@@ -2372,6 +2414,7 @@ private:
             for (std::size_t slot = 0; slot < flights.size(); ++slot) {
                 if (flights[slot].second != 0) continue;
                 flights[slot] = {first & ~(flightBlockBytes - 1), ((end - 1) | (flightBlockBytes - 1)) + 1};
+                flightRoles[slot] = role;
                 if (++aloft > 1) add(overlapped, 1);
                 add(flown, 1);
                 inner.unlock();
@@ -2389,6 +2432,27 @@ private:
 
         std::pair<std::uint64_t, std::uint64_t> Flights() const {
             return {flown.load(std::memory_order_relaxed), overlapped.load(std::memory_order_relaxed)};
+        }
+
+        void Shares(std::uint64_t* counts, std::size_t capacity) const {
+            std::fill_n(counts, capacity, std::uint64_t{0});
+            std::size_t index = 0;
+            const auto put = [&](const std::atomic<std::uint64_t>& value) {
+                if (index < capacity) counts[index] = value.load(std::memory_order_relaxed);
+                ++index;
+            };
+            for (const auto& entry : roles) {
+                put(entry.acquisitions);
+                put(entry.waits);
+                put(entry.waitNs);
+                for (const auto& behindNs : entry.behindNs) put(behindNs);
+            }
+            for (const auto& entry : callers) {
+                put(entry.acquisitions);
+                put(entry.waits);
+                put(entry.waitNs);
+                put(entry.heldNs);
+            }
         }
 
         MappingLockCounts Counted() const {
@@ -2409,14 +2473,37 @@ private:
             std::atomic<std::uint64_t> waitNs{0};
             std::array<std::atomic<std::uint64_t>, MappingLockSites> behindNs{};
         };
+        struct RoleShare {
+            std::atomic<std::uint64_t> acquisitions{0};
+            std::atomic<std::uint64_t> waits{0};
+            std::atomic<std::uint64_t> waitNs{0};
+            std::array<std::atomic<std::uint64_t>, MappingLockRoles> behindNs{};
+        };
+        struct CallerShare {
+            std::atomic<std::uint64_t> acquisitions{0};
+            std::atomic<std::uint64_t> waits{0};
+            std::atomic<std::uint64_t> waitNs{0};
+            std::atomic<std::uint64_t> heldNs{0};
+        };
 
         static void add(std::atomic<std::uint64_t>& counter, std::uint64_t amount) {
             counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
         }
 
-        void entered(LockSite site) {
+        void entered(LockSite site, MappingLockCaller caller) {
             add(sites[static_cast<std::size_t>(site)].acquisitions, 1);
+            add(roles[role].acquisitions, 1);
+            add(callers[static_cast<std::size_t>(caller)].acquisitions, 1);
             holder.store(static_cast<std::uint8_t>(site), std::memory_order_relaxed);
+            holderRole.store(role, std::memory_order_relaxed);
+            holderCaller.store(static_cast<std::uint8_t>(caller), std::memory_order_relaxed);
+        }
+
+        std::uint8_t flightRole(std::uintptr_t first, std::uintptr_t end) const {
+            for (std::size_t slot = 0; slot < flights.size(); ++slot) {
+                if (flights[slot].second != 0 && flights[slot].first < end && first < flights[slot].second) return flightRoles[slot];
+            }
+            return static_cast<std::uint8_t>(MappingLockRole::Game);
         }
 
         bool flightOver(std::uintptr_t first, std::uintptr_t end) const {
@@ -2426,6 +2513,7 @@ private:
 
         static constexpr std::uintptr_t flightBlockBytes = 0x10000;
         std::array<std::pair<std::uintptr_t, std::uintptr_t>, 8> flights{};
+        std::array<std::uint8_t, 8> flightRoles{};
         std::size_t aloft = 0;
         std::size_t waitingForAll = 0;
         std::condition_variable landed;
@@ -2433,13 +2521,26 @@ private:
         std::atomic<std::uint64_t> overlapped{0};
         std::mutex inner;
         std::atomic<std::uint8_t> holder{0};
+        std::atomic<std::uint8_t> holderRole{0};
+        std::atomic<std::uint8_t> holderCaller{0};
         std::array<Site, MappingLockSites> sites{};
+        std::array<RoleShare, MappingLockRoles> roles{};
+        std::array<CallerShare, MappingLockCallers> callers{};
+        static inline thread_local std::uint8_t role = 0;
     };
 
     class SiteLock {
     public:
         SiteLock(SiteMutex& mutex, LockSite site, std::uintptr_t first, std::uintptr_t end) : mutex(mutex) {
             mutex.Lock(site, first, end);
+        }
+
+        SiteLock(SiteMutex& mutex, MappingLockCaller caller) : mutex(mutex) {
+            mutex.Lock(LockSite::Other, 0, UINTPTR_MAX, caller);
+        }
+
+        SiteLock(SiteMutex& mutex, LockSite site, std::uintptr_t first, std::uintptr_t end, MappingLockCaller caller) : mutex(mutex) {
+            mutex.Lock(site, first, end, caller);
         }
 
         ~SiteLock() {

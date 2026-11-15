@@ -43,6 +43,8 @@ public:
         std::uint32_t wait = 0;
         std::atomic<std::uint32_t> frameFaults{0};
         std::atomic<std::uint8_t> edge{0};
+        std::uint8_t origin = 0;
+        std::atomic<std::uint16_t> gpuStamp{0};
     };
     struct Counts {
         std::uint64_t armed = 0;
@@ -88,13 +90,28 @@ public:
         return true;
     }
 
-    void GpuWrite(std::uintptr_t first, std::uintptr_t end) {
+    void GpuWrite(std::uintptr_t first, std::uintptr_t end, PageTrackOrigin origin) {
         if (!armImports || end <= first) return;
+        const auto stamp = static_cast<std::uint16_t>(Period());
         forEach(first, end, true, [&](std::uintptr_t block, Block& entry) {
             if ((entry.flags & GpuWrites) == 0) gpuMarks.fetch_add(1, std::memory_order_relaxed);
+            noteOrigin(entry, GpuWrites, origin);
             entry.flags |= GpuWrites;
+            entry.gpuStamp.store(stamp, std::memory_order_relaxed);
             open(block, entry);
         });
+    }
+
+    void NoteAnnounce(std::uintptr_t first, std::uintptr_t end, PageTrackOrigin origin) {
+        if (!armImports || end <= first) return;
+        const auto index = static_cast<std::size_t>(origin);
+        announces[index].fetch_add(1, std::memory_order_relaxed);
+        announcedBytes[index].fetch_add(end - first, std::memory_order_relaxed);
+        announcedBlocks[index].fetch_add(((end - 1) >> 16) - (first >> 16) + 1, std::memory_order_relaxed);
+        const auto stamp = static_cast<std::uint16_t>(Period());
+        for (auto block = first & ~(BlockBytes - 1); block < end; block += BlockBytes) {
+            if (auto* entry = find(block); entry != nullptr && (entry->flags & GpuWrites) != 0) entry->gpuStamp.store(stamp, std::memory_order_relaxed);
+        }
     }
 
     bool HandleWrite(std::uintptr_t address) {
@@ -439,11 +456,11 @@ public:
     }
 
     void Import(std::uintptr_t first, std::uintptr_t end) {
-        mark(first, end, armImports ? ReadImport : Imported);
+        mark(first, end, armImports ? ReadImport : Imported, PageTrackOrigin::Import);
     }
 
-    void Bar(std::uintptr_t first, std::uintptr_t end) {
-        mark(first, end, Barred);
+    void Bar(std::uintptr_t first, std::uintptr_t end, PageTrackOrigin origin) {
+        mark(first, end, Barred, origin);
     }
 
     void Forget(std::uintptr_t first, std::uintptr_t end) {
@@ -452,6 +469,8 @@ public:
             open(block, entry);
             entry.word.store(with(entry.word.load(std::memory_order_acquire), State::Unarmed), std::memory_order_release);
             entry.flags = 0;
+            entry.origin = 0;
+            entry.gpuStamp = 0;
             entry.edge = 0;
             entry.frameFaults = 0;
             entry.cleanPeriod = 0;
@@ -471,6 +490,36 @@ public:
     void NoteLeft(const std::array<std::uint64_t, LeftReasons>& blocks) {
         for (std::size_t reason = 0; reason < left.size(); ++reason) {
             if (blocks[reason] != 0) left[reason].store(left[reason].load(std::memory_order_relaxed) + blocks[reason], std::memory_order_relaxed);
+        }
+    }
+
+    void NoteLeftOrigins(const std::array<std::uint64_t, PageTrackOrigins>& blocks, std::uint64_t fresh, std::uint64_t stale) {
+        for (std::size_t origin = 0; origin < PageTrackOrigins; ++origin) {
+            if (blocks[origin] != 0) leftOrigins[origin].fetch_add(blocks[origin], std::memory_order_relaxed);
+        }
+        if (fresh != 0) freshGpu.fetch_add(fresh, std::memory_order_relaxed);
+        if (stale != 0) staleGpu.fetch_add(stale, std::memory_order_relaxed);
+    }
+
+    static std::size_t OriginOf(const Block& entry) {
+        const auto origin = static_cast<std::size_t>(entry.origin);
+        return origin < PageTrackOrigins ? origin : static_cast<std::size_t>(PageTrackOrigin::None);
+    }
+
+    static bool FreshGpuWrite(const Block& entry, std::uint32_t now) {
+        return static_cast<std::uint16_t>(static_cast<std::uint16_t>(now) - entry.gpuStamp.load(std::memory_order_relaxed)) <= 1;
+    }
+
+    void Origins(std::uint64_t* counts, std::size_t capacity) const {
+        for (std::size_t index = 0; index < capacity; ++index) {
+            const auto origin = index / PageTrackOriginFields;
+            if (origin >= PageTrackOrigins) {
+                const auto extra = index - PageTrackOrigins * PageTrackOriginFields;
+                counts[index] = extra == 0 ? freshGpu.load(std::memory_order_relaxed) : extra == 1 ? staleGpu.load(std::memory_order_relaxed) : 0;
+                continue;
+            }
+            const std::array<const std::array<std::atomic<std::uint64_t>, PageTrackOrigins>*, PageTrackOriginFields> fields{&leftOrigins, &originMarks, &announces, &announcedBytes, &announcedBlocks};
+            counts[index] = (*fields[index % PageTrackOriginFields])[origin].load(std::memory_order_relaxed);
         }
     }
 
@@ -599,9 +648,16 @@ private:
         }
     }
 
-    void mark(std::uintptr_t first, std::uintptr_t end, std::uint8_t flag) {
+    void noteOrigin(Block& entry, std::uint8_t flag, PageTrackOrigin origin) {
+        if ((flag & Blocking) == 0 || (entry.flags & Blocking) != 0) return;
+        entry.origin = static_cast<std::uint8_t>(origin);
+        originMarks[static_cast<std::size_t>(origin)].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void mark(std::uintptr_t first, std::uintptr_t end, std::uint8_t flag, PageTrackOrigin origin) {
         if (!enabled || end <= first) return;
         forEach(first, end, true, [&](std::uintptr_t block, Block& entry) {
+            noteOrigin(entry, flag, origin);
             entry.flags |= flag;
             open(block, entry);
         });
@@ -621,6 +677,13 @@ private:
     std::atomic<std::uint64_t> importArms{0};
     std::atomic<std::uint64_t> gpuMarks{0};
     std::array<std::atomic<std::uint64_t>, LeftReasons> left{};
+    std::array<std::atomic<std::uint64_t>, PageTrackOrigins> leftOrigins{};
+    std::array<std::atomic<std::uint64_t>, PageTrackOrigins> originMarks{};
+    std::array<std::atomic<std::uint64_t>, PageTrackOrigins> announces{};
+    std::array<std::atomic<std::uint64_t>, PageTrackOrigins> announcedBytes{};
+    std::array<std::atomic<std::uint64_t>, PageTrackOrigins> announcedBlocks{};
+    std::atomic<std::uint64_t> freshGpu{0};
+    std::atomic<std::uint64_t> staleGpu{0};
     std::atomic<std::uint32_t> period{1};
     std::unordered_map<std::uintptr_t, std::uint64_t> digests;
 };

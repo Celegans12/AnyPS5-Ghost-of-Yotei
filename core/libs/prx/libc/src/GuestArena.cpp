@@ -706,6 +706,18 @@ void GuestPageTrackCounts_nid_no_patch(std::uint64_t* counts, std::size_t capaci
     for (std::size_t index = 0; index < capacity; ++index) counts[index] = index < std::size(values) ? values[index] : 0;
 }
 
+void GuestPageTrackOrigins_nid_no_patch(std::uint64_t* counts, std::size_t capacity) {
+    WindowsPageTrack::Get().Origins(counts, capacity);
+}
+
+void GuestMappingLockRole_nid_no_patch(std::uint8_t role) {
+    WindowsMappings::SetLockRole(static_cast<std::size_t>(role) < MappingLockRoles ? static_cast<MappingLockRole>(role) : MappingLockRole::Game);
+}
+
+void GuestMappingLockShares_nid_no_patch(std::uint64_t* counts, std::size_t capacity) {
+    WindowsMappings::Get().LockShares(counts, capacity);
+}
+
 void GuestPageTrackKeepOpen_nid_no_patch(const void* pointer, std::size_t bytes) {
     if (!WindowsPageTrack::Get().Enabled()) return;
     WindowsMappings::Get().KeepOpen(reinterpret_cast<std::uintptr_t>(pointer), bytes);
@@ -727,8 +739,8 @@ bool GuestPageTrackArmsImports_nid_no_patch() {
     return WindowsPageTrack::Get().ArmsImports();
 }
 
-void GuestPageTrackGpuWrite_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
-    WindowsMappings::Get().GpuWrite(address, bytes);
+void GuestPageTrackGpuWrite_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint8_t origin) {
+    WindowsMappings::Get().GpuWrite(address, bytes, static_cast<std::size_t>(origin) < PageTrackOrigins ? static_cast<PageTrackOrigin>(origin) : PageTrackOrigin::Announced);
 }
 
 bool GuestPageTrackReasons_nid_no_patch(std::uintptr_t address, std::size_t bytes, std::uint64_t* reasons, std::size_t count) {

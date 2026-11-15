@@ -4271,7 +4271,7 @@ void Recorder::OnComplete(std::function<void()> action) {
 bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, std::int64_t word) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
-    GuestMemory::AnnounceGpuWrite(address, bytes);
+    GuestMemory::AnnounceGpuWrite(address, bytes, GuestArena::PageTrackOrigin::RecorderWrite);
     BufferCache::EndDrawRun();
     GuestMemory::ForgetKnownZero(address, bytes);
     ensureOpen();
@@ -4308,7 +4308,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     // An in-flight batch: its range joins the snapshot at once (the completion that stores it runs
     // when the batch finishes, and the hook must sync for a CPU read until then). The generation
     // moves as well, so a poller re-consults the label table for a completion label.
-    GuestMemory::AnnounceGpuWrite(address, bytes);
+    GuestMemory::AnnounceGpuWrite(address, bytes, GuestArena::PageTrackOrigin::RecorderBatch);
     BufferCache::EndDrawRun();
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
