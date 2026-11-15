@@ -16,6 +16,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
+#include "prx/libSceAgcDriver/Execution/include/RecycledBlocks.hpp"
 #include <atomic>
 #include <array>
 #include <algorithm>
@@ -318,6 +319,24 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
 std::atomic<std::uint64_t> laterLookups{0}, laterLookupsUnknown{0}, laterLookupHits{0}, laterLookupsVerified{0}, laterLookupsDiffering{0};
 std::atomic<std::uint64_t> laterLookupsEver{0}, laterLookupsVerifiedEver{0}, laterLookupsDifferingEver{0};
 
+struct DrawTailBlocks {};
+
+bool RecycledDrawTails() {
+    static const bool enabled = std::getenv("APS5_NO_RECYCLED_DRAW_TAILS") == nullptr;
+    return enabled;
+}
+
+void noteDrawTails() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!stats) return;
+    static std::atomic<std::int64_t> reportedAt{0};
+    static std::atomic<std::uint64_t> reusedBefore{0}, freshBefore{0}, releasedBefore{0};
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    const auto counts = RecycledBlockStore<DrawTailBlocks>::Counted();
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-tails] (10 s): %llu draw jobs built in a recycled block, %llu in a fresh one, %llu blocks released beyond a thread's store\n", static_cast<unsigned long long>(counts.reused - reusedBefore.exchange(counts.reused)), static_cast<unsigned long long>(counts.fresh - freshBefore.exchange(counts.fresh)), static_cast<unsigned long long>(counts.released - releasedBefore.exchange(counts.released)));
+}
+
 bool FinisherLookup() {
     static const bool enabled = std::getenv("APS5_FINISHER_LOOKUP") != nullptr;
     return enabled;
@@ -466,7 +485,8 @@ std::pair<std::uint64_t, std::shared_ptr<DrawEntry>> shapeRecipeDonor(const std:
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    auto tailHolder = std::make_shared<DrawTail>();
+    auto tailHolder = RecycledDrawTails() ? std::allocate_shared<DrawTail>(RecycledBlocks<DrawTail, DrawTailBlocks>{}) : std::make_shared<DrawTail>();
+    if (RecycledDrawTails()) noteDrawTails();
     auto& tail = *tailHolder;
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
