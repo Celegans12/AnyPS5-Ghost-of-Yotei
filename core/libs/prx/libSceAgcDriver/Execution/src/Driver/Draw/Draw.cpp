@@ -31,11 +31,13 @@
 #include <unordered_map>
 #include <atomic>
 #include <exception>
+#include <functional>
 #include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
 #include <typeinfo>
+#include <utility>
 
 namespace AgcDriver::DriverDetail {
 
@@ -195,6 +197,11 @@ struct DrawTail {
     VulkanDevice::DrawTraceContext trace{};
     std::string ownRejected;
     DrawSiteOutcome site;
+    std::vector<DrawUserPatch> userPatches;
+    std::uint64_t drawIdentity = 0;
+    std::uint64_t drawAlias = 0;
+    bool resolveLater = false;
+    std::shared_ptr<DrawTail> lookupShadow;
     GpuLock* gpuLock = nullptr;
     GpuLock ownLock{GuestMemory::GpuMutex(), std::defer_lock};
 };
@@ -306,6 +313,103 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
     held.writes = DrawWriteRanges(tail.decode->state, {}, ExactDrawWrites());
     held.unknown = false;
     return held;
+}
+
+std::atomic<std::uint64_t> laterLookups{0}, laterLookupsUnknown{0}, laterLookupHits{0}, laterLookupsVerified{0}, laterLookupsDiffering{0};
+std::atomic<std::uint64_t> laterLookupsEver{0}, laterLookupsVerifiedEver{0}, laterLookupsDifferingEver{0};
+
+bool FinisherLookup() {
+    static const bool enabled = std::getenv("APS5_FINISHER_LOOKUP") != nullptr;
+    return enabled;
+}
+
+bool VerifyFinisherLookup() {
+    static const bool enabled = std::getenv("APS5_VERIFY_FINISHER_LOOKUP") != nullptr;
+    return enabled;
+}
+
+void noteLaterLookup() {
+    static std::atomic<std::int64_t> reportedAt{0};
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!stats) return;
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[finisher-lookup] (10 s): %llu draws looked up on the draw finisher, %llu of them hits, %llu queued without the ranges they write because a program stores to memory; %llu lookups repeated on the finisher (APS5_VERIFY_FINISHER_LOOKUP), %llu differing\n", static_cast<unsigned long long>(laterLookups.exchange(0)), static_cast<unsigned long long>(laterLookupHits.exchange(0)), static_cast<unsigned long long>(laterLookupsUnknown.exchange(0)), static_cast<unsigned long long>(laterLookupsVerified.exchange(0)), static_cast<unsigned long long>(laterLookupsDiffering.exchange(0)));
+}
+
+DrawFinisher::Pending heldWritesAhead(const DrawTail& tail) {
+    DrawFinisher::Pending held;
+    held.key = tail.drawKey;
+    held.shape = tail.shapeKey;
+    if (tail.decode == nullptr) {
+        noteHeld(HeldReason::NoDecode);
+        return held;
+    }
+    const auto& roles = tail.decode->roles;
+    for (std::size_t i = 0; i < tail.programs->size(); ++i) {
+        if (i < roles.size() && roles[i] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
+        const auto& program = (*tail.programs)[i];
+        if (program.snapshot != nullptr && !ProgramWritesMemory(*program.snapshot, program.codeOffset) && (program.tailContinuation == nullptr || !ProgramWritesMemory(*program.tailContinuation, 0))) continue;
+        laterLookupsUnknown.fetch_add(1, std::memory_order_relaxed);
+        const auto stage = program.binary.stage;
+        noteHeld(stage == ShaderRecompiler::ShaderStage::Fragment ? HeldReason::NullFragment : stage == ShaderRecompiler::ShaderStage::Vertex ? HeldReason::NullVertex : HeldReason::NullOther);
+        return held;
+    }
+    noteHeld(HeldReason::Known);
+    held.writes = DrawWriteRanges(tail.decode->state, {}, ExactDrawWrites());
+    held.unknown = false;
+    return held;
+}
+
+std::shared_ptr<DrawTail> LookupShadow(const DrawTail& tail) {
+    auto shadow = std::make_shared<DrawTail>();
+    shadow->localDevice = tail.localDevice;
+    shadow->registerKey = tail.registerKey;
+    shadow->drawKey = tail.drawKey;
+    shadow->shapeKey = tail.shapeKey;
+    shadow->entry = tail.entry;
+    shadow->decode = tail.decode;
+    shadow->dataEntry = tail.dataEntry;
+    shadow->dataEntries = tail.dataEntries;
+    shadow->pixel = tail.pixel;
+    shadow->writablePrograms = tail.writablePrograms;
+    shadow->programs = tail.programs == &tail.writablePrograms ? &shadow->writablePrograms : tail.programs;
+    shadow->vertexInfos = tail.vertexInfos;
+    shadow->decodeReads = tail.decodeReads;
+    shadow->vertexDecoded = tail.vertexDecoded;
+    shadow->stageCaptures.resize(tail.stageCaptures.size());
+    shadow->matched.resize(tail.matched.size());
+    shadow->matchedRegions.resize(tail.matchedRegions.size());
+    shadow->dataCandidates.resize(tail.dataCandidates.size());
+    shadow->stageData.resize(tail.stageData.size());
+    shadow->shapeMisses = tail.shapeMisses;
+    shadow->shapeWords = tail.shapeWords;
+    shadow->stageEntries = tail.stageEntries;
+    shadow->userPatches = tail.userPatches;
+    shadow->drawIdentity = tail.drawIdentity;
+    shadow->drawAlias = tail.drawAlias;
+    shadow->reg207 = tail.reg207;
+    shadow->packetOffset = tail.packetOffset;
+    return shadow;
+}
+
+bool SameLookup(const DrawTail& first, const DrawTail& second) {
+    if (first.drawHit != second.drawHit || first.matched.size() != second.matched.size() || first.dataCandidates.size() != second.dataCandidates.size() || first.stageData.size() != second.stageData.size()) return false;
+    for (std::size_t i = 0; i < first.matched.size(); ++i) {
+        const auto& a = first.matched[i];
+        const auto& b = second.matched[i];
+        if ((a == nullptr) != (b == nullptr)) return false;
+        if (a != nullptr && (a->runs != b->runs || a->words != b->words)) return false;
+        if (i < first.stageData.size() && ((first.stageData[i].compiled == nullptr) != (second.stageData[i].compiled == nullptr) || first.stageData[i].words != second.stageData[i].words)) return false;
+        if (i >= first.dataCandidates.size()) continue;
+        const auto& kept = first.dataCandidates[i];
+        const auto& again = second.dataCandidates[i];
+        if (kept.size() != again.size()) return false;
+        for (std::size_t rank = 0; rank < kept.size(); ++rank) {
+            if (kept[rank].remembered != again[rank].remembered || kept[rank].key != again[rank].key || kept[rank].kind != again[rank].kind || kept[rank].variant->runs != again[rank].variant->runs || kept[rank].variant->words != again[rank].variant->words) return false;
+        }
+    }
+    return true;
 }
 
 bool EmptyIndirectSkip() {
@@ -452,8 +556,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto& dataEntry = tail.dataEntry;
     auto& dataEntries = tail.dataEntries;
     auto& shapeKey = tail.shapeKey;
-    std::uint64_t drawIdentity = 0, drawAlias = 0;
-    std::vector<DrawUserPatch> userPatches;
+    auto& drawIdentity = tail.drawIdentity;
+    auto& drawAlias = tail.drawAlias;
+    auto& userPatches = tail.userPatches;
     std::uint64_t siteKey = 0, siteShape = 0;
     if (registerKey && DrawSiteAccess::Enabled()) {
         tail.site.eligible = pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !TraceDrawPrograms() && traceToken == 0 && !verifyDrawDataHits() && !verifyDrawEntries() && deferredLabels().labels.empty();
@@ -703,16 +808,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
         phaseTiming.Phase(DrawRowDecode);
     }
-    const std::function<bool(std::size_t)> redecodeVertexInfo = [&](std::size_t i) {
-        if (tail.vertexDecoded[i]) return true;
-        try {
-            decodeVertexInfo(i);
-        } catch (const std::exception&) {
-            return false;
-        }
-        tail.vertexDecoded[i] = true;
-        return true;
-    };
     auto& shaderMemory = tail.shaderMemory;
     shaderMemory = std::make_unique<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
     auto& results = tail.results;
@@ -746,9 +841,164 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     tail.shapeMisses.assign(programs.size(), DrawShapeMiss::NoStage);
     tail.shapeWords.assign(programs.size(), DrawShapeWord::Count);
     auto& drawHit = tail.drawHit;
-    auto& verifyHit = tail.verifyHit;
     tail.stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
     const bool stageEntries = tail.stageEntries;
+    tail.reg207 = readRegister(queue.context, 0x207);
+    tail.packetOffset = packetOffset;
+    tail.traceToken = traceToken;
+    const auto handsOff = [&] { return pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !dumpGraphics && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled(); };
+    const bool laterEligible = (FinisherLookup() || VerifyFinisherLookup()) && registerKey && stageEntries && traceToken == 0 && DrawFinisher::Threads() == 1 && !verifyDrawEntries() && !verifyDrawRecipe() && handsOff();
+    tail.resolveLater = laterEligible && !VerifyFinisherLookup();
+    if (laterEligible && VerifyFinisherLookup()) tail.lookupShadow = LookupShadow(tail);
+    if (!tail.resolveLater) resolveDrawTail(tail, submission);
+    std::uint64_t stageDataVerified = 0;
+    const auto target = graphics.hasColorTarget ? graphics.color.address : 0;
+    const VulkanDevice::DrawTraceContext trace{traceToken, submission.serial, submission.queue, packetOffset, target};
+    const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
+    tail.traceToken = traceToken;
+    tail.trace = trace;
+    if (trace.token != 0) {
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            const auto& program = programs[i];
+            AgcDriver::CaptureTrace::LogBestEffort("draw-selected token=%llu submission=%llu queue=%x offset=%zu snapshot=0x%llx code=%llx entryOffset=%zu entry=%llx stage=%u role=%u drawCacheHit=%u variantHit=%u target=%llx",
+                    static_cast<unsigned long long>(trace.token), static_cast<unsigned long long>(submission.serial), submission.queue, packetOffset,
+                    static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(program.snapshot.get())), static_cast<unsigned long long>(program.snapshot->codeAddress), program.codeOffset,
+                    static_cast<unsigned long long>(program.snapshot->codeAddress + program.codeOffset), static_cast<unsigned>(program.binary.stage), static_cast<unsigned>(roles[i]),
+                    drawHit ? 1u : 0u, matched[i] != nullptr ? 1u : 0u, static_cast<unsigned long long>(target));
+        }
+    }
+
+    tail.submission = &submission;
+    tail.submissionQueue = submission.queue;
+    tail.packetOpcode = (packet[0] >> 8u) & 0xffu;
+    tail.dumpTarget = dumpTarget;
+    tail.dumpSlot1 = dumpSlot1;
+    tail.packetOffset = packetOffset;
+    const bool handOff = tail.resolveLater || handsOff();
+    if (handOff) {
+        tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        tail.submissionSerial = submission.serial;
+        if (DrawFinisher::RelaysSubmissionEnd()) {
+            tail.handed.serial = submission.serial;
+            tail.handed.queue = submission.queue;
+            tail.handed.shaders = submission.shaders;
+            tail.submission = &tail.handed;
+        }
+        tail.packetOffset = static_cast<std::size_t>(packet.data() - submission.commands.data());
+        noteFinisherHandOff(true);
+        DrawFinisher::Pending held;
+        if (DrawFinisher::Overlap()) held = tail.resolveLater ? heldWritesAhead(tail) : heldWrites(tail);
+        if (tail.resolveLater) {
+            laterLookups.fetch_add(1, std::memory_order_relaxed);
+            laterLookupsEver.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (tail.resolveLater || tail.lookupShadow != nullptr) noteLaterLookup();
+        DrawFinisher::Get().Enqueue([this, tailHolder] {
+            auto& job = *tailHolder;
+            DrawPipeline::FollowEpoch(job.epoch);
+            GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
+            PerformanceTimer finishTiming("Driver.DrawFinish");
+            try {
+                if (job.resolveLater || job.lookupShadow != nullptr) {
+                    struct PipelineScope {
+                        bool previous;
+                        PipelineScope() : previous(std::exchange(DrawPipeline::Active(), true)) {}
+                        ~PipelineScope() { DrawPipeline::Active() = previous; }
+                    } pipelineScope;
+                    if (job.resolveLater) {
+                        resolveDrawTail(job, *job.submission);
+                        if (job.drawHit) laterLookupHits.fetch_add(1, std::memory_order_relaxed);
+                    } else {
+                        const auto shadow = std::exchange(job.lookupShadow, nullptr);
+                        resolveDrawTail(*shadow, *job.submission);
+                        laterLookupsVerified.fetch_add(1, std::memory_order_relaxed);
+                        laterLookupsVerifiedEver.fetch_add(1, std::memory_order_relaxed);
+                        if (!SameLookup(job, *shadow)) {
+                            laterLookupsDiffering.fetch_add(1, std::memory_order_relaxed);
+                            if (laterLookupsDifferingEver.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[finisher-lookup] verify: the lookup of the draw at submission %llu offset %zu (key 0x%llx, shape 0x%llx) differs on the draw finisher: hit %u / %u\n", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, static_cast<unsigned long long>(job.drawKey), static_cast<unsigned long long>(job.shapeKey), job.drawHit ? 1u : 0u, shadow->drawHit ? 1u : 0u);
+                        }
+                    }
+                    finishTiming.Mark("lookup");
+                }
+                if (finishDraw(job, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(job.ownRejected);
+            } catch (const RefusedDraw& refused) {
+                CaptureTrace::Log("draw-refused submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, refused.what());
+                ReportRefusedDraw(refused);
+            } catch (const std::exception& error) {
+                CaptureTrace::Log("draw-error submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, error.what());
+                throw std::runtime_error("draw at submission " + std::to_string(job.submissionSerial) + " offset " + std::to_string(job.packetOffset) + " (finished on the draw finisher): " + error.what());
+            }
+        }, std::move(held));
+        timing.Mark("draw_handed_off");
+        return drawn();
+    }
+    noteFinisherHandOff(false);
+    if (DrawFinisher::Busy()) {
+        DrawFinisher::Get().Drain();
+        if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Kept, true);
+    }
+    tail.queue = &queue;
+    tail.packet = packet;
+    tail.rejected = &rejected;
+    tail.gpuLock = &gpuLock;
+    return finishDraw(tail, timing);
+}
+
+FinisherLookupCounts Driver::FinisherLookupCounted() {
+    return {laterLookupsEver.load(std::memory_order_relaxed), laterLookupsVerifiedEver.load(std::memory_order_relaxed), laterLookupsDifferingEver.load(std::memory_order_relaxed)};
+}
+
+void Driver::resolveDrawTail(DrawTail& tail, const Submission& submission) {
+    using Stage = ShaderRecompiler::ShaderStage;
+    using Role = ShaderRecompiler::ProgramRole;
+    const bool profile = tail.profile;
+    const auto traceToken = tail.traceToken;
+    const auto packetOffset = tail.packetOffset;
+    auto& phaseMs = tail.phaseMs;
+    auto& phaseTiming = tail.phaseTiming;
+    auto& localDevice = tail.localDevice;
+    const bool registerKey = tail.registerKey;
+    auto& drawKey = tail.drawKey;
+    auto& entry = tail.entry;
+    auto& decode = tail.decode;
+    auto& dataEntries = tail.dataEntries;
+    const auto& graphics = decode->state;
+    auto& pixel = tail.pixel;
+    const auto& programs = *tail.programs;
+    const std::vector<Role>& roles = decode->roles;
+    auto& vertexInfos = tail.vertexInfos;
+    auto& decodeReads = tail.decodeReads;
+    auto& stageCaptures = tail.stageCaptures;
+    auto& matched = tail.matched;
+    auto& matchedRegions = tail.matchedRegions;
+    auto& dataCandidates = tail.dataCandidates;
+    auto& stageData = tail.stageData;
+    auto& drawHit = tail.drawHit;
+    auto& verifyHit = tail.verifyHit;
+    const bool stageEntries = tail.stageEntries;
+    const auto& userPatches = tail.userPatches;
+    const auto drawIdentity = tail.drawIdentity;
+    const auto drawAlias = tail.drawAlias;
+    const auto decodeVertexInfo = [&](std::size_t i) {
+        const auto& program = programs[i];
+        if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
+        vertexInfos[i] = DecodeOrderedVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, decodeReads[i], 8u - program.firstUserSgpr);
+        if (vertexInfos[i]) {
+            vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports;
+            vertexInfos[i]->depthRemapMode = graphics.depthRemap.mode;
+            Graphics::ApplyPointSize(graphics, *vertexInfos[i]);
+        }
+    };
+    const std::function<bool(std::size_t)> redecodeVertexInfo = [&](std::size_t i) {
+        if (tail.vertexDecoded[i]) return true;
+        try {
+            decodeVertexInfo(i);
+        } catch (const std::exception&) {
+            return false;
+        }
+        tail.vertexDecoded[i] = true;
+        return true;
+    };
     try {
         lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntries, dataCandidates, stageData, tail.shapeMisses, decodeReads, redecodeVertexInfo, tail.shapeWords);
     } catch (...) {
@@ -785,23 +1035,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     }
     tail.patchedStages = std::any_of(stageData.begin(), stageData.end(), [](const StageDataHit& hit) { return hit.compiled != nullptr; });
     tail.relocatedDecode = relocatedDecode;
-    std::uint64_t stageDataVerified = 0;
-    const auto target = graphics.hasColorTarget ? graphics.color.address : 0;
-    const VulkanDevice::DrawTraceContext trace{traceToken, submission.serial, submission.queue, packetOffset, target};
-    const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
-    tail.traceToken = traceToken;
-    tail.trace = trace;
-    if (trace.token != 0) {
-        for (std::size_t i = 0; i < programs.size(); ++i) {
-            const auto& program = programs[i];
-            AgcDriver::CaptureTrace::LogBestEffort("draw-selected token=%llu submission=%llu queue=%x offset=%zu snapshot=0x%llx code=%llx entryOffset=%zu entry=%llx stage=%u role=%u drawCacheHit=%u variantHit=%u target=%llx",
-                    static_cast<unsigned long long>(trace.token), static_cast<unsigned long long>(submission.serial), submission.queue, packetOffset,
-                    static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(program.snapshot.get())), static_cast<unsigned long long>(program.snapshot->codeAddress), program.codeOffset,
-                    static_cast<unsigned long long>(program.snapshot->codeAddress + program.codeOffset), static_cast<unsigned>(program.binary.stage), static_cast<unsigned>(roles[i]),
-                    drawHit ? 1u : 0u, matched[i] != nullptr ? 1u : 0u, static_cast<unsigned long long>(target));
-        }
-    }
-
     if (registerKey) {
 
         for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -825,55 +1058,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         phaseTiming.Phase(DrawRowDecode);
     }
 
-    tail.submission = &submission;
-    tail.submissionQueue = submission.queue;
-    tail.packetOpcode = (packet[0] >> 8u) & 0xffu;
-    tail.reg207 = readRegister(queue.context, 0x207);
-    tail.dumpTarget = dumpTarget;
-    tail.dumpSlot1 = dumpSlot1;
-    tail.packetOffset = packetOffset;
-    const bool handOff = pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !dumpGraphics && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled();
-    if (handOff) {
-        tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-        tail.submissionSerial = submission.serial;
-        if (DrawFinisher::RelaysSubmissionEnd()) {
-            tail.handed.serial = submission.serial;
-            tail.handed.queue = submission.queue;
-            tail.handed.shaders = submission.shaders;
-            tail.submission = &tail.handed;
-        }
-        tail.packetOffset = static_cast<std::size_t>(packet.data() - submission.commands.data());
-        noteFinisherHandOff(true);
-        DrawFinisher::Pending held;
-        if (DrawFinisher::Overlap()) held = heldWrites(tail);
-        DrawFinisher::Get().Enqueue([this, tailHolder] {
-            auto& job = *tailHolder;
-            DrawPipeline::FollowEpoch(job.epoch);
-            GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
-            PerformanceTimer finishTiming("Driver.DrawFinish");
-            try {
-                if (finishDraw(job, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(job.ownRejected);
-            } catch (const RefusedDraw& refused) {
-                CaptureTrace::Log("draw-refused submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, refused.what());
-                ReportRefusedDraw(refused);
-            } catch (const std::exception& error) {
-                CaptureTrace::Log("draw-error submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, error.what());
-                throw std::runtime_error("draw at submission " + std::to_string(job.submissionSerial) + " offset " + std::to_string(job.packetOffset) + " (finished on the draw finisher): " + error.what());
-            }
-        }, std::move(held));
-        timing.Mark("draw_handed_off");
-        return drawn();
-    }
-    noteFinisherHandOff(false);
-    if (DrawFinisher::Busy()) {
-        DrawFinisher::Get().Drain();
-        if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Kept, true);
-    }
-    tail.queue = &queue;
-    tail.packet = packet;
-    tail.rejected = &rejected;
-    tail.gpuLock = &gpuLock;
-    return finishDraw(tail, timing);
 }
 
 DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {

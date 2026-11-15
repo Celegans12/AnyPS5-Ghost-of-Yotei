@@ -144,6 +144,16 @@ unsigned BrightestColorByte() {
     return brightest;
 }
 
+void RepeatedLookupsAgree() {
+    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    Submit(32.0f, {1.0f, 1.0f, 1.0f});
+    const auto shaped = Submit(32.0f, {2.0f, 3.0f, 4.0f});
+    Require(shaped.lookups - before.lookups == 6, "six draws made " + std::to_string(shaped.lookups - before.lookups) + " draw-cache lookups under APS5_VERIFY_FINISHER_LOOKUP, expected 6");
+    Require(BrightestColorByte() != 0, "the draws whose lookups were repeated on the draw finisher wrote nothing");
+}
+
 void ThirdDrawHitsTheCache(bool libraries) {
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
@@ -498,6 +508,8 @@ int main(int argc, char** argv) {
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
         if (std::getenv("APS5_VERIFY_DRAW_ENTRIES") != nullptr) {
             RefreshedStageDataVerifies();
+        } else if (std::getenv("APS5_VERIFY_FINISHER_LOOKUP") != nullptr) {
+            RepeatedLookupsAgree();
         } else {
             ThirdDrawHitsTheCache(libraries);
             UserDataDrawsReuseTheirShape(libraries);
@@ -508,6 +520,17 @@ int main(int argc, char** argv) {
             RecordsKeepThePacketsFragmentWord(libraries);
             RecordWordsReachTheShader(libraries);
             IndirectPointsKeepTheirPointSize(libraries);
+        }
+        const auto lookups = AgcDriver::DriverDetail::Driver::FinisherLookupCounted();
+        const bool pipelined = std::getenv("APS5_DRAW_PIPELINE") != nullptr && std::getenv("APS5_VERIFY_DRAW_ENTRIES") == nullptr;
+        if (std::getenv("APS5_VERIFY_FINISHER_LOOKUP") != nullptr) {
+            Require(lookups.later == 0, "APS5_VERIFY_FINISHER_LOOKUP left " + std::to_string(lookups.later) + " draw lookups to the draw finisher alone");
+            Require(!pipelined || lookups.verified != 0, "APS5_VERIFY_FINISHER_LOOKUP repeated no draw lookup on the draw finisher");
+            Require(lookups.differing == 0, std::to_string(lookups.differing) + " of " + std::to_string(lookups.verified) + " draw lookups repeated on the draw finisher differed from the queue worker's");
+        } else if (std::getenv("APS5_FINISHER_LOOKUP") != nullptr) {
+            Require(!pipelined || lookups.later != 0, "APS5_FINISHER_LOOKUP looked no pipelined draw up on the draw finisher");
+        } else {
+            Require(lookups.later == 0 && lookups.verified == 0, "a draw was looked up on the draw finisher without APS5_FINISHER_LOOKUP");
         }
         AgcDriverShutdown_nid_postfix();
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "the driver's shutdown left the pipeline library worker running");

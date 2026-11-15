@@ -250,6 +250,10 @@ struct DrawRelocation {
     std::vector<std::uint32_t> banned;
 };
 
+struct FinisherLookupCounts {
+    std::uint64_t later = 0, verified = 0, differing = 0;
+};
+
 struct DrawUserPatch {
     std::size_t program;
     std::uint32_t index, value;

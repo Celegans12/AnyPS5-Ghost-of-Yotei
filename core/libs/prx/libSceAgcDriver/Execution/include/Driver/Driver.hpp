@@ -129,6 +129,7 @@ public:
     static std::string dumpRequest(std::uint64_t address, const ShaderRecompiler::RecompileRequest& request, std::string_view suffix = {});
     static void reportSkip(const char* kind, const std::string& what);
     DrawEntryCounters DrawCacheCounters();
+    static FinisherLookupCounts FinisherLookupCounted();
     OverlayDriverCounters OverlayCounters();
     EntryCounters DispatchCacheCounters();
     struct DispatchCacheFootprint {
@@ -267,6 +268,7 @@ private:
     std::optional<DrawVerdict> precheckDraw(const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect);
     static std::uint32_t drawUserWord(const DrawProgram& program, std::int32_t sgpr);
     DrawVerdict draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected);
+    void resolveDrawTail(DrawTail& tail, const Submission& submission);
     DrawVerdict finishDraw(DrawTail& tail, PerformanceTimer& timing);
     void restartFinishedDraw(DrawTail& tail);
     void addDriverPhases(DispatchClass which, const std::array<double, DriverPhaseCount>& ms, bool hit, bool validated);
