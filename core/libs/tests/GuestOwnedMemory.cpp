@@ -336,6 +336,14 @@ static void CheckUnlockedProtection() {
     Memory plain(blockBytes, false);
     Require(!mappings.Protection(plain.Address(), &protection) && protection == 7);
     Require(!mappings.Protection(std::uintptr_t{1} << 47, &protection) && protection == 7);
+    std::array<void*, 4> compared{};
+    std::size_t count = compared.size();
+    locks = taken();
+    mappings.ComparedPages(plain.Address(), blockBytes, compared.data(), &count, false);
+    Require(count == 0 && taken() == locks + (unlocked ? 0u : 1u));
+    count = compared.size();
+    mappings.ComparedPages(plain.Address(), blockBytes, compared.data(), &count, true);
+    Require(count == 0);
     Memory again(blockBytes);
     Require(mappings.Protection(again.Address() + blockBytes - 1, &protection) && protection == PAGE_READWRITE);
 }

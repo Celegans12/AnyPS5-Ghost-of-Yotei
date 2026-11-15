@@ -370,6 +370,7 @@ public:
         collectableRanges.clear();
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             if (residentOnly && !it->second.resident && !it->second.aliasDemoted) continue;
+            anyCompared.store(true);
             if (it->second.resident) {
                 it->second.comparedWhenShared = true;
                 continue;
@@ -390,6 +391,11 @@ public:
     }
 
     void ComparedPages(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool unreported) {
+        if (unlockedReads() && !anyCompared.load()) {
+            unlockedAnswers.fetch_add(1, std::memory_order_relaxed);
+            *count = 0;
+            return;
+        }
         std::lock_guard lock(mutex);
         const auto capacity = *count;
         *count = 0;
@@ -2453,6 +2459,7 @@ private:
     std::array<std::atomic<OwnedLeaf*>, zeroLeaves> ownedTable{};
     std::array<std::atomic<ViewLeaf*>, viewLeaves> viewTable{};
     std::atomic<std::uint64_t> unlockedAnswers{0};
+    std::atomic<bool> anyCompared{false};
     WindowsPageTrack& track = WindowsPageTrack::Get();
     HANDLE zeroSection = nullptr;
     AllocateFunction allocate = nullptr;
