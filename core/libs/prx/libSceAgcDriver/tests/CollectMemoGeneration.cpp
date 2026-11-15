@@ -663,7 +663,7 @@ void CheckTrackerWaitsCounted() {
             marker = std::thread([&] {
                 MarkProofThread();
                 started.store(true);
-                MarkWritten(address + Block, Page);
+                MarkWritten(address + 2 * Page, Page);
             });
             while (!started.load()) std::this_thread::yield();
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -828,6 +828,51 @@ void CheckStampedBlockWaitsForItsWalk() {
     Require(!trusted, "a store a walk stamped was read as unchanged");
 }
 
+void CheckWalkAloft() {
+    BumpCollectEpoch();
+    const auto walked = Base + 96 * Block;
+    const auto other = Base + 98 * Block;
+    Require(CollectWritesUncached(walked, Block) != 0 && CollectWritesUncached(other, Block) != 0, "the blocks were not collected");
+    const auto page = walked + 5 * Page;
+    Store(page);
+    std::uint64_t aloftGeneration = 0;
+    std::uint64_t otherCollected = 0;
+    std::uint64_t otherMarked = 0;
+    std::uint64_t late = 0;
+    bool otherStored = false;
+    std::atomic<bool> elsewhereAnswered{false};
+    std::atomic<bool> sameAnswered{false};
+    {
+        PausedWalk walker(1, [&] { CollectWritesUncached(walked, Block); });
+        std::thread elsewhere([&] {
+            aloftGeneration = TrackerGeneration();
+            Store(other + 3 * Page);
+            otherCollected = CollectWritesUncached(other, Block);
+            otherStored = !UnchangedSince(other + 3 * Page, Page, aloftGeneration);
+            otherMarked = MarkWritten(other + 8 * Page, Page);
+            elsewhereAnswered.store(true);
+        });
+        std::thread same([&] {
+            CollectWritesUncached(walked + 9 * Page, Page);
+            sameAnswered.store(true);
+        });
+        const bool free = AnsweredWithin(elsewhereAnswered, std::chrono::seconds(5));
+        const bool early = AnsweredWithin(sameAnswered, std::chrono::milliseconds(150));
+        if (free) {
+            elsewhere.join();
+            late = TrackerGeneration();
+        }
+        walker.Release();
+        if (elsewhere.joinable()) elsewhere.join();
+        same.join();
+        Require(free, "a walk, a store mark and a generation read of another block waited for a walk in the air");
+        Require(!early, "a walk of a block started while another walk of it was in the air");
+    }
+    Require(otherCollected != 0 && otherMarked > otherCollected && otherStored, "updates of another block made while a walk was in the air were lost");
+    Require(!UnchangedSince(page & ~(Page - 1), Page, aloftGeneration), "a walk stamped a store with a generation handed out while it was in the air");
+    Require(late >= otherMarked && !UnchangedSince(page & ~(Page - 1), Page, late), "a landed walk stamped its store no newer than the generation of the updates made while it was in the air");
+}
+
 void CheckUnlockedReadsUnderWalks() {
     constexpr std::size_t Readers = 3;
     constexpr int Rounds = 1500;
@@ -987,6 +1032,7 @@ int main(int argc, char** argv) {
 #ifdef _WIN32
         CheckUnlockedReadsDuringWalk();
         CheckStampedBlockWaitsForItsWalk();
+        CheckWalkAloft();
         CheckUnlockedReadsUnderWalks();
         CheckUnlockedReadsAcrossRewatch();
 #endif
