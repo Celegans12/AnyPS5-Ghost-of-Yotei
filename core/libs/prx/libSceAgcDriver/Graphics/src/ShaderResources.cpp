@@ -3802,7 +3802,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
-        surface.collected = GuestMemory::CollectWrites(address, bytes);
+        surface.collected = GuestMemory::CollectWritesArmed(surface.armed, address, bytes);
         if (surface.collected == 0 && surface.generation == 0 && surface.committedGeneration != 0 && surface.source == nullptr && !RuntimeSwitches::Set(RuntimeSwitch::NoExtendedFastProofs)) {
             struct CommittedTag {};
             auto& ranges = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, CommittedTag>();
@@ -3860,6 +3860,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             queries.push_back({address, bytes, surface.generation});
         }
     }
+    if (withStorage && storageArmed.size() != storageTextures.size()) storageArmed.assign(storageTextures.size(), GuestMemory::ArmedProof{});
     for (std::size_t i = 0; withStorage && i < storageTextures.size(); ++i) {
         if (storageTextures[i] != nullptr && (i >= storageKeys.size() || !StorageImageServesKeys(*storageTextures[i], storageKeys[i]))) return fail(FastFail::StorageKeys);
         if (i != 0 && storageTextures[i] == storageTextures[i - 1]) continue;
@@ -3872,7 +3873,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             if (!indexProof) depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);
         }
-        if (GuestMemory::CollectWrites(address, bytes) == 0) {
+        if (GuestMemory::CollectWritesArmed(storageArmed[i], address, bytes) == 0) {
             countCollectRefusal(true, address, bytes);
             return fail(FastFail::Collect);
         }
