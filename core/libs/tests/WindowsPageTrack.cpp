@@ -498,6 +498,47 @@ void CheckVerify(bool resident) {
     expectDivergence("bytes that changed in an armed block without the write watch seeing them were not reported");
 }
 
+void CheckHot(bool resident) {
+    constexpr std::size_t Blocks = 8;
+    auto& track = Track::Get();
+    const std::string kind = resident ? "resident" : "private";
+    Guest memory(resident, Blocks * BlockBytes);
+    const auto all = [&] { return memory.Collect(0, Blocks * BlockPages); };
+    Settle(memory, Blocks);
+    Require(all().empty() && track.Counted().armed == Blocks, kind + ": the blocks were not armed");
+    const auto rests = track.Counted().rests;
+    const auto frame = [&](bool write) {
+        if (write) memory.Write(3, 0, 1);
+        all();
+        track.AdvancePeriod();
+    };
+    for (std::size_t round = 0; round < 3; ++round) {
+        all();
+        Require(track.Clean(memory.Block(3)), kind + ": the block was not armed before round " + std::to_string(round));
+        frame(true);
+        frame(false);
+    }
+    Require(track.Faults(memory.Block(3)) == Track::HotFrames && track.Counted().rests == rests + 1, kind + ": a block that faulted in 3 of 8 frames was not put to rest");
+    for (std::size_t later = 0; later < 20; ++later) frame(later % 2 == 0);
+    Require(track.Faults(memory.Block(3)) == Track::HotFrames && !track.Clean(memory.Block(3)) && track.Clean(memory.Block(2)) && track.Clean(memory.Block(4)), kind + ": a resting block was armed again, or its neighbours were not kept armed");
+    for (std::size_t later = 0; later < Track::RestFrames; ++later) frame(false);
+    all();
+    Require(track.Clean(memory.Block(3)), kind + ": a block was not armed again after its rest");
+    frame(true);
+    Require(track.Faults(memory.Block(3)) == Track::HotFrames + 1, kind + ": a block armed after its rest did not fault on a write");
+
+    const auto before = track.Faults(memory.Block(5));
+    for (std::size_t round = 0; round < 12; ++round) {
+        frame(false);
+        frame(false);
+        frame(false);
+        frame(false);
+        memory.Write(5, 1, 2);
+    }
+    all();
+    Require(track.Faults(memory.Block(5)) - before >= 10 && track.Counted().rests == rests + 1, kind + ": a block written once in four frames was put to rest or stopped being armed");
+}
+
 void CheckRace() {
     constexpr std::size_t Writers = 8;
     constexpr std::size_t Blocks = 32;
@@ -584,6 +625,9 @@ int main(int argc, char** argv) {
         } else if (mode == "collect") {
             CheckCollect(false);
             CheckCollect(true);
+        } else if (mode == "hot") {
+            CheckHot(false);
+            CheckHot(true);
         } else if (mode == "collect-race") {
             CheckCollectRace(false);
             CheckCollectRace(true);
@@ -597,7 +641,7 @@ int main(int argc, char** argv) {
                 Require(Track::Get().Counted().divergences == 0, "verified collects diverged under concurrent writers");
             }
         } else {
-            std::fprintf(stderr, "usage: %s table|race|guards|collect|collect-race|verify|verify-race\n", argv[0]);
+            std::fprintf(stderr, "usage: %s table|race|guards|collect|hot|collect-race|verify|verify-race\n", argv[0]);
             result = 2;
         }
         if (result == 0) std::printf("page tracking %.*s tests passed\n", static_cast<int>(mode.size()), mode.data());

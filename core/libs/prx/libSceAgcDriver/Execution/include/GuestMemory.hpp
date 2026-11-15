@@ -203,7 +203,7 @@ struct CollectCounts {
     std::uint64_t pageArms = 0;
     std::uint64_t pageFaults = 0;
     std::uint64_t pageQuiet = 0;
-    std::uint64_t pageResting = 0;
+    std::uint64_t pageRests = 0;
     std::uint64_t pageDivergences = 0;
 };
 CollectCounts CollectCounted();

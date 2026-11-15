@@ -18,13 +18,16 @@ namespace GuestArena {
 class WindowsPageTrack {
 public:
     static constexpr std::size_t BlockBytes = 0x10000;
+    static constexpr unsigned HistoryFrames = 8;
+    static constexpr unsigned HotFrames = 3;
+    static constexpr std::uint64_t RestFrames = 64;
     enum class State : std::uint64_t { Unarmed = 0, Arming = 1, Armed = 2, Opening = 3, Written = 4 };
     struct Counts {
         std::uint64_t armed = 0;
         std::uint64_t arms = 0;
         std::uint64_t faults = 0;
         std::uint64_t quiet = 0;
-        std::uint64_t resting = 0;
+        std::uint64_t rests = 0;
         std::uint64_t divergences = 0;
     };
 
@@ -184,9 +187,24 @@ public:
         at(block).writtenPeriod = Period();
     }
 
+    void NoteFault(std::uintptr_t block) {
+        auto& entry = at(block);
+        const auto now = Period();
+        entry.writtenPeriod = now;
+        if (entry.faultPeriod == now) return;
+        const auto gap = now - entry.faultPeriod;
+        entry.history = static_cast<std::uint8_t>((gap >= HistoryFrames ? 0u : static_cast<unsigned>(entry.history) << gap) | 1u);
+        entry.faultPeriod = now;
+        if (static_cast<unsigned>(__builtin_popcount(entry.history)) < HotFrames) return;
+        entry.history = 0;
+        entry.restUntil = now + RestFrames;
+        rests.fetch_add(1, std::memory_order_relaxed);
+    }
+
     bool Cold(std::uintptr_t block) const {
         const auto* entry = find(block);
-        return entry != nullptr && entry->holds == 0 && entry->flags == 0 && entry->cleanPeriod > entry->writtenPeriod && Period() > entry->cleanPeriod;
+        const auto now = Period();
+        return entry != nullptr && entry->holds == 0 && entry->flags == 0 && entry->cleanPeriod > entry->writtenPeriod && now > entry->cleanPeriod && now >= entry->restUntil;
     }
 
     void SetDigest(std::uintptr_t block, std::uint64_t digest) {
@@ -244,6 +262,9 @@ public:
             entry.flags = 0;
             entry.cleanPeriod = 0;
             entry.writtenPeriod = 0;
+            entry.faultPeriod = 0;
+            entry.restUntil = 0;
+            entry.history = 0;
         });
     }
 
@@ -252,7 +273,7 @@ public:
     }
 
     Counts Counted() const {
-        return {armed.load(std::memory_order_relaxed), arms.load(std::memory_order_relaxed), faults.load(std::memory_order_relaxed), quiet.load(std::memory_order_relaxed), resting.load(std::memory_order_relaxed), divergences.load(std::memory_order_relaxed)};
+        return {armed.load(std::memory_order_relaxed), arms.load(std::memory_order_relaxed), faults.load(std::memory_order_relaxed), quiet.load(std::memory_order_relaxed), rests.load(std::memory_order_relaxed), divergences.load(std::memory_order_relaxed)};
     }
 
 private:
@@ -272,6 +293,9 @@ private:
         std::uint64_t cleanPeriod = 0;
         std::uint64_t writtenPeriod = 0;
         std::uint64_t digest = 0;
+        std::uint64_t faultPeriod = 0;
+        std::uint64_t restUntil = 0;
+        std::uint8_t history = 0;
     };
 
     WindowsPageTrack() {
@@ -385,7 +409,7 @@ private:
     std::atomic<std::uint64_t> arms{0};
     std::atomic<std::uint64_t> faults{0};
     std::atomic<std::uint64_t> quiet{0};
-    std::atomic<std::uint64_t> resting{0};
+    std::atomic<std::uint64_t> rests{0};
     std::atomic<std::uint64_t> divergences{0};
     std::atomic<std::uint64_t> period{1};
 };

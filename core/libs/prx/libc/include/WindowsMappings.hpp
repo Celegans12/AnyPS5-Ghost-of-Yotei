@@ -1225,7 +1225,7 @@ private:
                 cursor = std::min(end, blockEnd);
                 continue;
             }
-            if (clear && track.TakeWritten(block)) track.NoteWritten(block);
+            if (clear && track.TakeWritten(block)) track.NoteFault(block);
             if (clear && capacity - total >= (std::min(end, blockEnd) - (cursor & ~std::uintptr_t{4095}) + 4095) / 4096 && inside(block) && track.Cold(block) && armBlock(block)) {
                 disown(block, blockEnd);
                 std::array<void*, blockBytes / 4096> local{};
@@ -1250,7 +1250,7 @@ private:
             }
             auto stop = std::min(end, blockEnd);
             while (stop < end && !track.Clean(stop) && !(clear && inside(stop) && track.Cold(stop))) {
-                if (clear && track.TakeWritten(stop)) track.NoteWritten(stop);
+                if (clear && track.TakeWritten(stop)) track.NoteFault(stop);
                 stop = std::min(end, stop + blockBytes);
             }
             ULONG_PTR found = capacity - total;
