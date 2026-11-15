@@ -185,6 +185,7 @@ std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 // imported); see GuestBufferMemory.cpp.
 struct ImageMirror;
 struct InputTwin;
+struct ResidentShadow;
 class Recorder;
 
 template<typename TRange>
@@ -256,6 +257,27 @@ void OutdateStoredInputTwins(std::uint64_t address, std::size_t bytes);
 std::uint64_t ReleaseInputTwins(std::uint64_t bytes);
 void ClearInputTwins(VkDevice device);
 void ReportInputTwins();
+struct ResidentStagingCounts {
+    std::uint64_t made = 0;
+    std::uint64_t shared = 0;
+    std::uint64_t skipped = 0;
+    std::uint64_t skippedBytes = 0;
+    std::uint64_t partial = 0;
+    std::uint64_t partialBytes = 0;
+    std::uint64_t partialSavedBytes = 0;
+    std::uint64_t full = 0;
+    std::uint64_t fullBytes = 0;
+    std::uint64_t untracked = 0;
+    std::uint64_t blocked = 0;
+    std::uint64_t sealed = 0;
+    std::uint64_t outdated = 0;
+    std::uint64_t verified = 0;
+    std::uint64_t differing = 0;
+    std::uint64_t live = 0;
+};
+ResidentStagingCounts ResidentStagingCounters();
+bool ResidentStagingEnabled();
+void SetResidentStagingForTests(bool enabled, bool verified);
 
 // Identity of the read-only image mirror serving [address, address + bytes) (the counterpart of
 // HostImportSerial for main-image ranges, which no import serves): a serial unique for the life of
@@ -489,6 +511,20 @@ public:
         for (const auto& region : regions) if (region.twin != nullptr && region.end > region.begin) ranges.emplace_back(region.begin, region.end);
     }
     void MarkStagedWrites() const;
+    class OwnWriteScope {
+    public:
+        explicit OwnWriteScope(const GuestBufferMemory& memory);
+        ~OwnWriteScope();
+        OwnWriteScope(const OwnWriteScope&) = delete;
+        OwnWriteScope& operator=(const OwnWriteScope&) = delete;
+        static bool Exempts(const ResidentShadow* shadow, std::uint64_t begin, std::uint64_t end);
+
+    private:
+        std::vector<const ResidentShadow*> shadows;
+        const std::vector<std::pair<std::uint64_t, std::uint64_t>>* writes = nullptr;
+        const OwnWriteScope* previous = nullptr;
+        bool entered = false;
+    };
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
@@ -592,6 +628,8 @@ private:
         bool unstaged = false;
         bool overlay = false;
         bool adaptiveInPlace = false;
+        std::shared_ptr<ResidentShadow> resident;
+        std::uint64_t residentSerial = 0;
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -655,6 +693,8 @@ private:
     bool twinCurrent(const Region& region) const;
     void recordTwinCopies(std::span<Region* const> twins, Recorder& recorder);
     std::shared_ptr<Buffer> stagingShadow(Region& region, VkBufferUsageFlags usage) const;
+    static bool usesResident(const Region& region);
+    static void sealResident(Region& region);
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenWithin(std::uint64_t begin, std::uint64_t end) const;
     void takeHeapReferences();
     void releaseHeapReferences() noexcept;
