@@ -3948,7 +3948,19 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::span<const std::byte> so
     });
 }
 
-static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr) {
+static_assert(MarkBlockBytes == WriteBlockBytes);
+
+static std::atomic<std::uint64_t> collectedMarksSkipped{0}, collectedMarksVerified{0}, collectedMarksFresh{0};
+
+static bool verifyCollectedMarks() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_VERIFY_LABEL_MARKS");
+        return text != nullptr && text[0] != '\0' && !(text[0] == '0' && text[1] == '\0');
+    }();
+    return enabled;
+}
+
+static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool complete, std::uint64_t* order = nullptr, bool blockCollected = false) {
     AnnounceGpuWrite(address, bytes, GuestArena::PageTrackOrigin::MarkWritten);
     breakLegacyProofs(ProofBreak::Marked);
     const StoreBump storeBump{address, bytes};
@@ -3965,7 +3977,10 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
         if (order != nullptr) *order = tracker.generation.load(std::memory_order_relaxed);
         return 0;
     }
-    {
+    const bool skipCollect = blockCollected && bytes <= WriteBlockBytes - (address & (std::uint64_t{WriteBlockBytes} - 1));
+    if (skipCollect && !verifyCollectedMarks()) {
+        collectedMarksSkipped.fetch_add(1, std::memory_order_relaxed);
+    } else {
         const auto blockFirst = address & ~(std::uint64_t{WriteBlockBytes} - 1);
         const auto blockStop = (address + bytes + WriteBlockBytes - 1) & ~(std::uint64_t{WriteBlockBytes} - 1);
         StampRuns runs{tracker, StampKind::Fresh};
@@ -3985,6 +4000,10 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
             if (order != nullptr) *order = tracker.generation.load(std::memory_order_relaxed);
             return 0;
         }
+        if (skipCollect) {
+            collectedMarksVerified.fetch_add(1, std::memory_order_relaxed);
+            if (runs.stamped != 0) collectedMarksFresh.fetch_add(1, std::memory_order_relaxed);
+        }
         if (runs.stamped != 0) ++tracker.generation;
     }
     const auto first = tracker.blockOf(address);
@@ -4001,6 +4020,15 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes) {
     ForgetKnownZero(address, bytes);
     return markWritten(address, bytes, true);
+}
+
+std::uint64_t MarkWrittenInCollectedBlock(std::uint64_t address, std::size_t bytes) {
+    ForgetKnownZero(address, bytes);
+    return markWritten(address, bytes, true, nullptr, true);
+}
+
+CollectedMarkCounts CollectedMarkCounted() {
+    return CollectedMarkCounts{collectedMarksSkipped.load(std::memory_order_relaxed), collectedMarksVerified.load(std::memory_order_relaxed), collectedMarksFresh.load(std::memory_order_relaxed)};
 }
 
 std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes) {

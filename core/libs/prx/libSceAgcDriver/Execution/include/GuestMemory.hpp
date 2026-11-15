@@ -177,6 +177,12 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
 // Returns the generation the blocks were stamped with (0 when the arena is not write-watched):
 // UnchangedSince(range, it) holds until the next store over the range.
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes);
+constexpr std::size_t MarkBlockBytes = 65536;
+std::uint64_t MarkWrittenInCollectedBlock(std::uint64_t address, std::size_t bytes);
+struct CollectedMarkCounts {
+    std::uint64_t skipped, verified, fresh;
+};
+CollectedMarkCounts CollectedMarkCounted();
 std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes);
 std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes, std::uint64_t& order);
 void ForgetKnownZero(std::uint64_t address, std::size_t bytes);

@@ -4865,6 +4865,16 @@ void Recorder::NoteLabel(std::uint64_t address, std::span<const std::byte> bytes
     noteWriteOn(*open, address, bytes.size(), true);
 }
 
+bool Recorder::LabelBlockMarked(std::uint64_t address, std::size_t bytes) {
+    if (open == nullptr || bytes == 0) return false;
+    const auto block = address / GuestMemory::MarkBlockBytes;
+    if ((address + bytes - 1) / GuestMemory::MarkBlockBytes != block) return false;
+    auto& blocks = open->labelMarkBlocks;
+    if (std::find(blocks.begin(), blocks.end(), block) != blocks.end()) return true;
+    blocks.push_back(block);
+    return false;
+}
+
 std::optional<Recorder::LabelHit> Recorder::PendingLabel(std::uint64_t address, std::size_t bytes, std::uint64_t afterStamp, LabelRefusal* refusal) const {
     // Under the GPU mutex; the table mutex is taken too so this one path serves both lock regimes.
     std::lock_guard tableLock(labelTableMutex);

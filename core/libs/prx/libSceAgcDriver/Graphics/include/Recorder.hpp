@@ -538,6 +538,7 @@ public:
     // as the label's own so it does not count as an overwrite of the entry.
     static constexpr std::size_t LabelTableBytes = 64;
     void NoteLabel(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue);
+    bool LabelBlockMarked(std::uint64_t address, std::size_t bytes);
     // Late rule: an entry whose stamp is not newer than the wait's submission is still the value
     // memory will hold, unless a CPU store touched the dword since it was recorded (the table
     // cannot see CPU stores; the title recycles label slots by CPU writes) or a later recorded
@@ -903,6 +904,7 @@ private:
             bool counted;
         };
         std::vector<CompletionLabel> completionLabelRanges;
+        std::vector<std::uint64_t> labelMarkBlocks;
         // The store run in progress (RecordStore): whether its leading barrier was recorded and
         // the trailing one is still owed, the store not yet recorded (joined by contiguous ones),
         // and the [buffer, offset, end) of the stores already recorded (the WAW check).
