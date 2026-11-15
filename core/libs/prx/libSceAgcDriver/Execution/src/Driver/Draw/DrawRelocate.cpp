@@ -302,6 +302,28 @@ void Driver::learnRelocation(const DrawRelocationPending& pending) {
     drawAliases[pending.alias] = pending.key;
 }
 
+bool Driver::valueWordMoves(const DispatchVariant& variant, std::uint32_t index, std::uint32_t from, std::uint32_t to) {
+    if (variant.compiled == nullptr || from == 0 || to == 0) return false;
+    const auto& bindings = variant.compiled->bindings;
+    bool slots = false;
+    for (const auto& [word, binding, slot] : variant.valueSlots) {
+        if (word != index) continue;
+        if (binding >= bindings.size() || slot >= bindings[binding].guestDescriptor.size()) return false;
+        const auto& descriptor = bindings[binding].guestDescriptor;
+        if (slot % 4u == 0) {
+            if (((from ^ to) & 3u) != 0) return false;
+        } else if (slot % 4u == 2) {
+            const auto stride = (descriptor[slot - 1u] >> 16u) & 0x3fffu;
+            const auto tail = [&](std::uint32_t records) { return (stride == 0 ? records : stride * records) & 3u; };
+            if (tail(from) != tail(to)) return false;
+        } else {
+            return false;
+        }
+        slots = true;
+    }
+    return slots;
+}
+
 void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches) {
     auto& counters = drawRelocationCounters;
     ++counters.lookups;
@@ -342,7 +364,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
         }
         for (const auto& variant : donor->stages[i]) {
             if (variant == nullptr || variant->compiled == nullptr) continue;
-            const bool allowed = variant->decodeRuns == 0 && std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program != i || (move.index < 64 && move.from != 0 && move.to != 0 && ((((variant->relocatableWords | variant->calleeWords) >> move.index & 1u) != 0 && ((move.from ^ move.to) & 3u) == 0) || (variant->valueWords >> move.index & 1u) != 0)); });
+            const bool allowed = variant->decodeRuns == 0 && std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program != i || (move.index < 64 && move.from != 0 && move.to != 0 && ((((variant->relocatableWords | variant->calleeWords) >> move.index & 1u) != 0 && ((move.from ^ move.to) & 3u) == 0) || ((variant->valueWords >> move.index & 1u) != 0 && valueWordMoves(*variant, move.index, move.from, move.to)))); });
             if (!allowed) {
                 ++counters.refused;
                 continue;
@@ -451,23 +473,7 @@ std::optional<DrawShapeReuse> Driver::shapeUserWordMoves(const DispatchVariant& 
         if ((variant.relocatableWords & bit) != 0) {
             if (((from ^ to) & 3u) != 0) return refuse();
         } else if ((variant.valueWords & bit) != 0) {
-            bool slots = false;
-            for (const auto& [word, binding, slot] : variant.valueSlots) {
-                if (word != index) continue;
-                if (binding >= compiled.bindings.size() || slot >= compiled.bindings[binding].guestDescriptor.size()) return refuse();
-                const auto& descriptor = compiled.bindings[binding].guestDescriptor;
-                if (slot % 4u == 0) {
-                    if (((from ^ to) & 3u) != 0) return refuse();
-                } else if (slot % 4u == 2) {
-                    const auto stride = (descriptor[slot - 1u] >> 16u) & 0x3fffu;
-                    const auto tail = [&](std::uint32_t records) { return (stride == 0 ? records : stride * records) & 3u; };
-                    if (tail(from) != tail(to)) return refuse();
-                } else {
-                    return refuse();
-                }
-                slots = true;
-            }
-            if (!slots) return refuse();
+            if (!valueWordMoves(variant, index, from, to)) return refuse();
         } else {
             return refuse();
         }

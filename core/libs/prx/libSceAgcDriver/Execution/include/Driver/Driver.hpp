@@ -116,6 +116,7 @@ public:
     static void tagUserValueWords(DispatchVariant& variant, const DrawProgram& program);
     static void tagUserLeafWords(DispatchVariant& variant, const ShaderRecompiler::IrResourcePlan& plan, const DrawProgram& program);
     static std::optional<DrawShapeReuse> shapeUserWordMoves(const DispatchVariant& variant, std::span<const std::uint32_t> was, std::span<const std::uint32_t> now, std::vector<UserWordMove>& moves, std::uint32_t* refused = nullptr);
+    static bool valueWordMoves(const DispatchVariant& variant, std::uint32_t index, std::uint32_t from, std::uint32_t to);
     static std::shared_ptr<DispatchVariant> movedShapeVariant(const std::shared_ptr<DispatchVariant>& variant, std::span<const UserWordMove> moves);
     static bool shapeVertexInputStages();
     static std::uint64_t vertexTableMask(const ShaderRecompiler::ShaderVertexStageInfo& vertex, std::uint32_t firstUserSgpr);
