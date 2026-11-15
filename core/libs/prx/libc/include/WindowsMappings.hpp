@@ -9,6 +9,7 @@
 #include <atomic>
 #include <bit>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstddef>
 #include <cstdint>
@@ -17,6 +18,7 @@
 #include <mutex>
 #include <map>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 #include <stdexcept>
@@ -47,6 +49,10 @@ public:
     enum class LockSite : std::uint8_t { Other, Forget, Collect, Count };
     enum class ForgetOutcome : std::uint8_t { Empty, Absent, Kept, Cleared, Count };
     static_assert(static_cast<std::size_t>(LockSite::Count) == MappingLockSites && static_cast<std::size_t>(ForgetOutcome::Count) == MappingForgetOutcomes);
+
+    std::pair<std::uint64_t, std::uint64_t> CollectFlights() const {
+        return mutex.Flights();
+    }
 
     MappingLockCounts LockCounted() const {
         auto counts = mutex.Counted();
@@ -591,7 +597,7 @@ public:
             forgetOutcomes[static_cast<std::size_t>(ForgetOutcome::Absent)].fetch_add(1, std::memory_order_relaxed);
             return;
         }
-        const SiteLock lock(mutex, LockSite::Forget);
+        const SiteLock lock(mutex, LockSite::Forget, address, address + bytes);
         const auto outcome = zeroPages.empty() ? ForgetOutcome::Empty : !zeroChunkIn(address, address + bytes) ? ForgetOutcome::Absent : forgetZero(address, address + bytes) ? ForgetOutcome::Cleared : ForgetOutcome::Kept;
         forgetOutcomes[static_cast<std::size_t>(outcome)].fetch_add(1, std::memory_order_relaxed);
     }
@@ -651,7 +657,7 @@ public:
     }
 
     bool Collect(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool clear, Collection collection = Collection::All) {
-        const SiteLock lock(mutex, LockSite::Collect);
+        const SiteLock lock(mutex, LockSite::Collect, address, address + bytes);
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
@@ -1019,9 +1025,11 @@ private:
         return std::all_of(bytes.begin(), bytes.end(), [](std::uint64_t word) { return word == 0; });
     }
 
-    UINT watchWrites(DWORD flags, void* address, std::size_t bytes, void** pages, ULONG_PTR* count, DWORD* granularity, bool dropZero = false) {
+    UINT watchWrites(DWORD flags, void* address, std::size_t bytes, void** pages, ULONG_PTR* count, DWORD* granularity, bool dropZero = false, bool aloft = false) {
         const auto capacity = *count;
+        const auto flight = aloft ? mutex.TakeOff(reinterpret_cast<std::uintptr_t>(address), reinterpret_cast<std::uintptr_t>(address) + bytes) : SiteMutex::Grounded;
         const auto result = GetWriteWatch(flags, address, bytes, pages, count, granularity);
+        if (flight != SiteMutex::Grounded) mutex.Land(flight);
         if (result != 0 || zeroPages.empty()) return result;
         const auto first = reinterpret_cast<std::uintptr_t>(address) & ~std::uintptr_t{4095};
         const auto last = (reinterpret_cast<std::uintptr_t>(address) + bytes + 4095) & ~std::uintptr_t{4095};
@@ -1073,7 +1081,7 @@ private:
     UINT collectOwnedWrites(DWORD flags, void* address, std::size_t bytes, void** pages, ULONG_PTR* count, DWORD* granularity) {
         const auto capacity = *count;
         collectWatchCalls.fetch_add(1, std::memory_order_relaxed);
-        const auto result = watchWrites(flags, address, bytes, pages, count, granularity);
+        const auto result = watchWrites(flags, address, bytes, pages, count, granularity, false, true);
         if (result != 0 || ownedPending.empty()) return result;
         std::sort(pages, pages + *count);
         const auto reported = *count;
@@ -1804,12 +1812,18 @@ private:
 #endif
     class SiteMutex {
     public:
+        static constexpr std::size_t Grounded = SIZE_MAX;
+
         void lock() {
-            Lock(LockSite::Other);
+            Lock(LockSite::Other, 0, UINTPTR_MAX);
         }
 
         bool try_lock() {
             if (!inner.try_lock()) return false;
+            if (aloft != 0) {
+                inner.unlock();
+                return false;
+            }
             entered(LockSite::Other);
             return true;
         }
@@ -1818,18 +1832,56 @@ private:
             inner.unlock();
         }
 
-        void Lock(LockSite site) {
-            if (!inner.try_lock()) {
-                const auto behind = holder.load(std::memory_order_relaxed);
-                const auto start = std::chrono::steady_clock::now();
-                inner.lock();
-                const auto waited = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+        void Lock(LockSite site, std::uintptr_t first, std::uintptr_t end) {
+            std::unique_lock held(inner, std::try_to_lock);
+            std::optional<std::chrono::steady_clock::time_point> start;
+            auto behind = static_cast<std::uint8_t>(LockSite::Collect);
+            if (!held.owns_lock()) {
+                behind = holder.load(std::memory_order_relaxed);
+                start = std::chrono::steady_clock::now();
+                held.lock();
+            }
+            if (flightOver(first, end)) {
+                if (!start) start = std::chrono::steady_clock::now();
+                const bool everything = first == 0 && end == UINTPTR_MAX;
+                if (everything) ++waitingForAll;
+                landed.wait(held, [&] { return !flightOver(first, end); });
+                if (everything) --waitingForAll;
+            }
+            held.release();
+            if (start) {
+                const auto waited = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - *start).count());
                 auto& counts = sites[static_cast<std::size_t>(site)];
                 add(counts.waits, 1);
                 add(counts.waitNs, waited);
                 add(counts.behindNs[behind], waited);
             }
             entered(site);
+        }
+
+        std::size_t TakeOff(std::uintptr_t first, std::uintptr_t end) {
+            static const bool unlocked = std::getenv("APS5_NO_UNLOCKED_COLLECT") == nullptr;
+            if (!unlocked || waitingForAll != 0 || end <= first) return Grounded;
+            for (std::size_t slot = 0; slot < flights.size(); ++slot) {
+                if (flights[slot].second != 0) continue;
+                flights[slot] = {first & ~(flightBlockBytes - 1), ((end - 1) | (flightBlockBytes - 1)) + 1};
+                if (++aloft > 1) add(overlapped, 1);
+                add(flown, 1);
+                inner.unlock();
+                return slot;
+            }
+            return Grounded;
+        }
+
+        void Land(std::size_t slot) {
+            inner.lock();
+            flights[slot] = {};
+            --aloft;
+            landed.notify_all();
+        }
+
+        std::pair<std::uint64_t, std::uint64_t> Flights() const {
+            return {flown.load(std::memory_order_relaxed), overlapped.load(std::memory_order_relaxed)};
         }
 
         MappingLockCounts Counted() const {
@@ -1860,6 +1912,18 @@ private:
             holder.store(static_cast<std::uint8_t>(site), std::memory_order_relaxed);
         }
 
+        bool flightOver(std::uintptr_t first, std::uintptr_t end) const {
+            if (aloft == 0) return false;
+            return std::any_of(flights.begin(), flights.end(), [&](const auto& flight) { return flight.second != 0 && flight.first < end && first < flight.second; });
+        }
+
+        static constexpr std::uintptr_t flightBlockBytes = 0x10000;
+        std::array<std::pair<std::uintptr_t, std::uintptr_t>, 8> flights{};
+        std::size_t aloft = 0;
+        std::size_t waitingForAll = 0;
+        std::condition_variable landed;
+        std::atomic<std::uint64_t> flown{0};
+        std::atomic<std::uint64_t> overlapped{0};
         std::mutex inner;
         std::atomic<std::uint8_t> holder{0};
         std::array<Site, MappingLockSites> sites{};
@@ -1867,8 +1931,8 @@ private:
 
     class SiteLock {
     public:
-        SiteLock(SiteMutex& mutex, LockSite site) : mutex(mutex) {
-            mutex.Lock(site);
+        SiteLock(SiteMutex& mutex, LockSite site, std::uintptr_t first, std::uintptr_t end) : mutex(mutex) {
+            mutex.Lock(site, first, end);
         }
 
         ~SiteLock() {

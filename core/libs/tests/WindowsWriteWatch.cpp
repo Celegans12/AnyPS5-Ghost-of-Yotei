@@ -2,6 +2,7 @@
 #include "prx/libc/include/WindowsMappings.hpp"
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <set>
@@ -1202,6 +1203,79 @@ void CheckKnownZeroFilterRaces(bool filtered) {
     for (auto* memory : regions) VirtualFree(memory, 0, MEM_RELEASE);
 }
 
+void CheckCollectsAloft(bool unlocked) {
+    auto& mappings = Mappings::Get();
+    constexpr std::size_t Workers = 3;
+    constexpr std::size_t Span = 4 * Bytes;
+    constexpr std::size_t SpanPages = Span / Small;
+    constexpr int Rounds = 800;
+    std::array<unsigned char*, Workers + 2> regions{};
+    for (auto& region : regions) {
+        region = static_cast<unsigned char*>(mappings.Reserve(nullptr, Span));
+        Require(region != nullptr, "collect flight reservation failed");
+        mappings.Commit(region, Span, PAGE_READWRITE, Span, true);
+    }
+    const auto before = mappings.CollectFlights();
+    std::array<const char*, Workers + 1> failures{};
+    std::atomic<bool> stop{false};
+    std::vector<std::thread> threads;
+    for (std::size_t worker = 0; worker < Workers; ++worker) {
+        threads.emplace_back([&, worker] {
+            auto* memory = regions[worker];
+            const auto address = reinterpret_cast<std::uintptr_t>(memory);
+            std::array<void*, 2 * SpanPages> written{};
+            std::size_t count = written.size();
+            if (!mappings.Collect(address, Span, written.data(), &count, true)) failures[worker] = "a first collect of a private range failed";
+            for (int round = 0; round < Rounds && failures[worker] == nullptr; ++round) {
+                const auto page = (static_cast<std::size_t>(round) * 5 + worker) % SpanPages;
+                static_cast<volatile unsigned char*>(memory)[page * Small] = static_cast<unsigned char>(round + 1);
+                if (round % 16 == 0) mappings.ForgetKnownZero(address + ((page + 7) % SpanPages) * Small, Small);
+                count = written.size();
+                if (!mappings.Collect(address, Span, written.data(), &count, true)) failures[worker] = "a collect racing collects of other ranges failed";
+                else if (count != 1 || written[0] != memory + page * Small) failures[worker] = "a collect racing collects of other ranges did not report exactly the page stored since its last collect";
+            }
+        });
+    }
+    auto* shared = regions[Workers];
+    const auto sharedAddress = reinterpret_cast<std::uintptr_t>(shared);
+    std::array<std::atomic<std::uint32_t>, SpanPages> reports{};
+    for (int collector = 0; collector < 2; ++collector) {
+        threads.emplace_back([&] {
+            std::array<void*, 2 * SpanPages> written{};
+            while (!stop.load(std::memory_order_acquire)) {
+                std::size_t count = written.size();
+                if (!mappings.Collect(sharedAddress, Span, written.data(), &count, true)) continue;
+                for (std::size_t index = 0; index < count; ++index) reports[(static_cast<unsigned char*>(written[index]) - shared) / Small].fetch_add(1);
+            }
+        });
+    }
+    threads.emplace_back([&] {
+        auto* memory = regions[Workers + 1];
+        while (!stop.load(std::memory_order_acquire)) {
+            mappings.Reset(memory, Span);
+            mappings.Commit(memory, Span, PAGE_READWRITE, Span, true);
+        }
+    });
+    for (int round = 0; round < Rounds && failures[Workers] == nullptr; ++round) {
+        const auto page = static_cast<std::size_t>(round) % SpanPages;
+        const auto reported = reports[page].load();
+        static_cast<volatile unsigned char*>(shared)[page * Small] = static_cast<unsigned char>(round + 1);
+        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        while (reports[page].load() == reported && std::chrono::steady_clock::now() < until) std::this_thread::yield();
+        if (reports[page].load() == reported) failures[Workers] = "a store was lost between two threads collecting one range";
+    }
+    for (std::size_t worker = 0; worker < Workers; ++worker) threads[worker].join();
+    stop.store(true, std::memory_order_release);
+    for (std::size_t index = Workers; index < threads.size(); ++index) threads[index].join();
+    for (const auto* failure : failures) Require(failure == nullptr, failure != nullptr ? failure : "");
+    const auto after = mappings.CollectFlights();
+    Require(unlocked ? after.first > before.first : after.first == before.first, unlocked ? "no collect released the mapping lock around its write-watch call" : "a collect released the mapping lock with the switch set");
+    for (auto* region : regions) {
+        mappings.Reset(region, Span);
+        VirtualFree(region, 0, MEM_RELEASE);
+    }
+}
+
 void CheckKnownZeroShared() {
     Region region;
     Require(KnownZeroPages(region.first, Bytes).empty(), "shared memory is known zero");
@@ -1211,6 +1285,15 @@ int main(int argc, char** argv) {
     auto* handler = AddVectoredExceptionHandler(1, HandleWrite);
     try {
         Require(handler != nullptr, "cannot install test handler");
+        if (argc > 1 && std::string(argv[1]) == "--no-unlocked-collect") {
+            Require(_putenv_s("APS5_NO_UNLOCKED_COLLECT", "1") == 0, "cannot set APS5_NO_UNLOCKED_COLLECT");
+            CheckPrivate();
+            CheckKnownZeroPrivate();
+            CheckCollectsAloft(false);
+            std::cout << "Windows collect tests without unlocked write-watch calls passed\n";
+            RemoveVectoredExceptionHandler(handler);
+            return 0;
+        }
         if (argc > 1 && std::string(argv[1]) == "--no-known-zero-filter") {
             Require(_putenv_s("APS5_NO_KNOWN_ZERO_FILTER", "1") == 0, "cannot set APS5_NO_KNOWN_ZERO_FILTER");
             CheckKnownZeroPrivate();
@@ -1258,6 +1341,7 @@ int main(int argc, char** argv) {
         CheckLockCounts();
         CheckKnownZeroFilter(true);
         CheckKnownZeroFilterRaces(true);
+        CheckCollectsAloft(true);
         std::cout << "Windows deferred write-watch tests passed\n";
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
