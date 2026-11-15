@@ -21,6 +21,7 @@ namespace {
 
 constexpr DWORD TrapFlag = 0x100;
 constexpr DWORD64 SingleStepStatus = 0x4000;
+constexpr DWORD64 EnabledBreakpoints = 0xff;
 
 std::atomic<bool> g_active{false};
 std::atomic<DWORD> g_pending{0};
@@ -31,6 +32,7 @@ bool g_clobberGuestOnly = false;
 constexpr std::size_t RedZoneBytes = 0x80;
 std::atomic<unsigned long long> g_delivered{0};
 std::atomic<unsigned long long> g_stray{0};
+std::atomic<unsigned long long> g_endedAtArmedReturn{0};
 
 std::wstring g_clobberImage;
 std::uintptr_t g_clobberBegin = 0;
@@ -101,7 +103,7 @@ DWORD WINAPI Run(LPVOID parameter) {
     std::vector<ULONG64> weights;
     ULONG64 totalWeight = 0;
     std::vector<Range> code;
-    unsigned long long tries = 0, injected = 0, outside = 0, slow = 0, misses = 0;
+    unsigned long long tries = 0, injected = 0, outside = 0, slow = 0, misses = 0, armedReturns = 0;
     long long nextModules = 0, nextThreads = 0, nextReport = Now() + 10 * second, nextStep = Now();
     for (;;) {
         const auto now = Now();
@@ -153,10 +155,10 @@ DWORD WINAPI Run(LPVOID parameter) {
             nextThreads = now + second / 5;
         }
         if (now >= nextReport) {
-            std::fprintf(stderr, "[fault-storm] 10 s: %llu tries, %llu landings in guest code (%llu tries elsewhere), %llu steps taken, %llu stray steps, %llu slow bursts; %zu running threads\n",
-                tries, injected, outside, g_delivered.exchange(0), g_stray.exchange(0), slow, list.size());
+            std::fprintf(stderr, "[fault-storm] 10 s: %llu tries, %llu landings in guest code (%llu tries elsewhere), %llu steps taken, %llu stray steps, %llu slow bursts, %llu skipped armed-return threads, %llu bursts ended at an armed return; %zu running threads\n",
+                tries, injected, outside, g_delivered.exchange(0), g_stray.exchange(0), slow, armedReturns, g_endedAtArmedReturn.exchange(0), list.size());
             std::fflush(stderr);
-            tries = injected = outside = slow = 0;
+            tries = injected = outside = slow = armedReturns = 0;
             nextReport += 10 * second;
         }
         if (now < nextStep) {
@@ -174,16 +176,27 @@ DWORD WINAPI Run(LPVOID parameter) {
         ++tries;
         if (SuspendThread(handle) == static_cast<DWORD>(-1)) continue;
         alignas(16) CONTEXT context{};
-        context.ContextFlags = CONTEXT_CONTROL;
+        context.ContextFlags = CONTEXT_CONTROL | CONTEXT_DEBUG_REGISTERS;
         bool stepped = false;
+        bool armedReturn = false;
         if (GetThreadContext(handle, &context) && Inside(code, static_cast<std::uintptr_t>(context.Rip)) && (context.EFlags & TrapFlag) == 0) {
-            g_remaining.store(g_burst, std::memory_order_relaxed);
-            g_pending.store(id, std::memory_order_release);
-            context.EFlags |= TrapFlag;
-            stepped = SetThreadContext(handle, &context) != 0;
-            if (!stepped) g_pending.store(0, std::memory_order_release);
+            if ((context.Dr7 & EnabledBreakpoints) != 0) {
+                armedReturn = true;
+            } else {
+                g_remaining.store(g_burst, std::memory_order_relaxed);
+                g_pending.store(id, std::memory_order_release);
+                context.EFlags |= TrapFlag;
+                context.ContextFlags = CONTEXT_CONTROL;
+                stepped = SetThreadContext(handle, &context) != 0;
+                if (!stepped) g_pending.store(0, std::memory_order_release);
+            }
         }
         ResumeThread(handle);
+        if (armedReturn) {
+            ++armedReturns;
+            if (++misses % 256 == 0) Sleep(1);
+            continue;
+        }
         if (!stepped) {
             ++outside;
             if (++misses % 256 == 0) Sleep(1);
@@ -211,6 +224,12 @@ bool Handle(EXCEPTION_POINTERS* info) {
     auto* context = info->ContextRecord;
     if (g_pending.load(std::memory_order_acquire) == GetCurrentThreadId()) {
         g_delivered.fetch_add(1, std::memory_order_relaxed);
+        if ((context->Dr7 & EnabledBreakpoints) != 0) {
+            context->EFlags &= ~TrapFlag;
+            g_endedAtArmedReturn.fetch_add(1, std::memory_order_relaxed);
+            g_pending.store(0, std::memory_order_release);
+            return true;
+        }
         const auto* guest = g_guestCode.load(std::memory_order_acquire);
         const auto rip = static_cast<std::uintptr_t>(context->Rip);
         const bool inRange = g_clobberImage.empty() || (rip >= g_clobberLow.load(std::memory_order_relaxed) && rip < g_clobberHigh.load(std::memory_order_acquire));
