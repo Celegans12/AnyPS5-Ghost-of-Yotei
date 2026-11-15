@@ -3,6 +3,7 @@
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <vulkan/vulkan.h>
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -27,6 +28,13 @@ public:
     static constexpr std::size_t DerivedEntries = 8192;
     static constexpr std::uint64_t StreamRest = 128;
     static constexpr std::uint64_t StreamSpan = 4 * GranuleBytes;
+    static constexpr std::size_t RingChunkBytes = std::size_t{4} << 20u;
+    static constexpr std::size_t RingChunks = 64;
+    static constexpr std::size_t RingEntries = 1024;
+    static constexpr std::size_t RingReach = RingChunkBytes / 4;
+    static constexpr std::size_t LooseEntries = 16;
+    static constexpr std::uint64_t ArmRest = 128;
+    static constexpr std::uint64_t CopyIds = std::uint64_t{1} << 62u;
 
     class Source {
     public:
@@ -35,6 +43,11 @@ public:
         virtual bool Poll(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written) = 0;
         virtual bool Quiet(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> tokens) = 0;
         virtual bool Volatile(std::uint64_t) { return false; }
+        virtual bool Holds(std::uint64_t, std::size_t, std::span<const std::uint64_t>) { return false; }
+        virtual void Arm(std::uint64_t, std::size_t, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written) {
+            std::fill(tokens.begin(), tokens.end(), std::uint64_t{0});
+            std::fill(written.begin(), written.end(), std::uint16_t{0xffffu});
+        }
     };
 
     enum class Unarmed : std::uint8_t { Armed, Held, Imported, Barred, Resting, Edge, Other, GpuWritten, Count };
@@ -61,6 +74,16 @@ public:
     enum class Refusal : std::uint8_t { Range, Alignment, GpuWrite, Untracked, Unmapped, Busy, Span, Budget, Allocation, Raced, Streamed, Label, Count };
     static constexpr std::size_t Refusals = static_cast<std::size_t>(Refusal::Count);
 
+    enum class Served : std::uint8_t { Tracked, Copied, Repeated, Kept, Clean };
+
+    struct Input {
+        std::size_t alignment = 1;
+        bool apart = false;
+        bool fresh = false;
+        bool partialHead = false;
+        bool partialTail = false;
+    };
+
     struct View {
         VkBuffer handle = VK_NULL_HANDLE;
         VkDeviceSize offset = 0;
@@ -69,6 +92,7 @@ public:
         std::uint64_t mirror = 0;
         std::uint64_t sequence = 0;
         bool streamed = false;
+        Served served = Served::Tracked;
         explicit operator bool() const { return handle != VK_NULL_HANDLE; }
     };
 
@@ -107,6 +131,24 @@ public:
         std::uint64_t heldBytes = 0;
         std::array<std::uint64_t, Refusals> refused{};
         std::array<std::uint64_t, UnarmedReasons> unarmed{};
+        std::uint64_t inputs = 0;
+        std::uint64_t inputClean = 0;
+        std::uint64_t inputKept = 0;
+        std::uint64_t inputUploads = 0;
+        std::uint64_t inputUploadBytes = 0;
+        std::uint64_t inputRing = 0;
+        std::uint64_t inputRingBytes = 0;
+        std::uint64_t inputLoose = 0;
+        std::uint64_t inputLooseBytes = 0;
+        std::uint64_t inputRepeats = 0;
+        std::uint64_t inputRefused = 0;
+        std::uint64_t inputVerified = 0;
+        std::uint64_t inputRaces = 0;
+        std::uint64_t inputRunDiffers = 0;
+        std::uint64_t ringChunks = 0;
+        std::uint64_t ringLaps = 0;
+        std::uint64_t ringFull = 0;
+        std::uint64_t drawRuns = 0;
     };
 
     BufferCache(Allocate allocate, Executed executed, Source& source);
@@ -116,6 +158,12 @@ public:
 
     static bool Enabled();
     static bool Verifying();
+    static bool DirtyFirst();
+    static bool VerifyingDirtyFirst();
+    static std::size_t RingLimit();
+    static void BreakDrawRun();
+    static void EndDrawRun();
+    static std::uint64_t DrawRun();
     static bool Arming();
     static bool Streaming();
     static void NoteStreamed(std::size_t bytes);
@@ -130,6 +178,8 @@ public:
     static std::string Report();
 
     View Acquire(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial, bool partialHead = false, bool partialTail = false);
+    View AcquireInput(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial, const Input& input);
+    void VerifyInput(const View& view, std::uint64_t address, std::size_t bytes, std::size_t from);
     View Refuse(Refusal reason);
     void Invalidate(std::uint64_t address, std::size_t bytes);
     void Verify(const View& view, std::uint64_t address, std::size_t bytes, std::size_t from);
@@ -143,6 +193,8 @@ private:
         std::atomic<std::uint64_t> token{0};
         std::uint64_t sequence = 0;
         std::uint64_t streamUntil = 0;
+        std::atomic<std::uint64_t> run{0};
+        std::uint64_t armAfter = 0;
         std::uint16_t valid = 0;
         std::uint16_t hot = 0;
     };
@@ -164,6 +216,27 @@ private:
         std::uint32_t kind = 0;
         Derived value;
     };
+    struct RingChunk {
+        Backing backing;
+        std::uint64_t serial = 0;
+        std::uint64_t lap = 0;
+    };
+    struct RingEntry {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t from = 0;
+        std::uint64_t run = 0;
+        std::uint64_t lap = 0;
+        std::uint64_t id = 0;
+        RingChunk* chunk = nullptr;
+        VkDeviceSize offset = 0;
+    };
+    struct LooseEntry {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t from = 0;
+        View view;
+    };
     using Slot = std::atomic<Mirror*>;
     static constexpr unsigned ChunkShift = 30;
     static constexpr unsigned ZoneShift = 21;
@@ -176,6 +249,12 @@ private:
     bool evict(std::span<Mirror* const> spared);
     void drop(Mirror* mirror);
     bool pending(std::uint64_t serial);
+    View acquire(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial, bool partialHead, bool partialTail, bool dirtyFirst);
+    View cleanInput(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial);
+    View ringInput(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial, std::uint64_t run, const Input& input);
+    View looseInput(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t run, const Input& input);
+    bool nextRingChunk();
+    static std::size_t ringIndex(std::uint64_t address, std::size_t bytes, std::size_t from);
     static std::size_t derivedIndex(std::uint64_t address, std::size_t bytes, std::uint32_t kind);
 
     Allocate allocate;
@@ -189,6 +268,13 @@ private:
     std::vector<std::uint64_t> tokens;
     std::vector<std::uint16_t> written;
     std::vector<Mirror*> absorbed;
+    std::vector<std::unique_ptr<RingChunk>> ring;
+    std::vector<RingEntry> ringEntries;
+    std::vector<LooseEntry> loose;
+    std::size_t ringAt = 0;
+    std::size_t ringUsed = 0;
+    std::uint64_t looseRun = 0;
+    std::uint64_t copyIds = 0;
     std::atomic<std::uint64_t> invalidations{0};
     std::uint64_t total = 0;
     std::uint64_t tick = 0;
@@ -203,6 +289,7 @@ class Recorder;
 
 BufferCache::View CachedRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t from, std::size_t alignment);
 BufferCache::View CachedStageRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment);
+BufferCache::View DirtyFirstRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::size_t from, std::size_t alignment);
 
 }
 

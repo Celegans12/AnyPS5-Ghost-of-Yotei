@@ -43,7 +43,26 @@ struct Counters {
     std::atomic<std::uint64_t> heldBytes{0};
     std::array<std::atomic<std::uint64_t>, BufferCache::Refusals> refused{};
     std::array<std::atomic<std::uint64_t>, BufferCache::UnarmedReasons> unarmed{};
+    std::atomic<std::uint64_t> inputs{0};
+    std::atomic<std::uint64_t> inputClean{0};
+    std::atomic<std::uint64_t> inputKept{0};
+    std::atomic<std::uint64_t> inputUploads{0};
+    std::atomic<std::uint64_t> inputUploadBytes{0};
+    std::atomic<std::uint64_t> inputRing{0};
+    std::atomic<std::uint64_t> inputRingBytes{0};
+    std::atomic<std::uint64_t> inputLoose{0};
+    std::atomic<std::uint64_t> inputLooseBytes{0};
+    std::atomic<std::uint64_t> inputRepeats{0};
+    std::atomic<std::uint64_t> inputRefused{0};
+    std::atomic<std::uint64_t> inputVerified{0};
+    std::atomic<std::uint64_t> inputRaces{0};
+    std::atomic<std::uint64_t> inputRunDiffers{0};
+    std::atomic<std::uint64_t> ringChunks{0};
+    std::atomic<std::uint64_t> ringLaps{0};
+    std::atomic<std::uint64_t> ringFull{0};
 };
+
+std::atomic<std::uint64_t> drawRun{1};
 
 Counters& counters() {
     static Counters held;
@@ -218,6 +237,50 @@ public:
         return code == static_cast<std::uint8_t>(BufferCache::Unarmed::Resting) || code == static_cast<std::uint8_t>(BufferCache::Unarmed::Edge);
     }
 
+    bool Holds(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> tokens) override {
+        const auto clean = armedCleanSince.load(std::memory_order_acquire);
+        if (clean == nullptr || tokens.empty() || !std::all_of(tokens.begin(), tokens.end(), armed)) return false;
+        Scratch<std::uint64_t> words(tokens.size());
+        for (std::size_t block = 0; block < tokens.size(); ++block) words.view[block] = tokens[block] & ~BufferCache::ArmedToken;
+        return clean(address, bytes, words.view);
+    }
+
+    void Arm(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written) override {
+        const auto count = tokens.size();
+        std::fill(written.begin(), written.end(), std::uint16_t{0xffffu});
+        const auto arm = armBlocks.load(std::memory_order_acquire);
+        const auto rearm = rearmBlocks.load(std::memory_order_acquire);
+        if (count == 0 || written.size() < count || !BufferCache::Arming() || (arm == nullptr && rearm == nullptr)) {
+            std::fill(tokens.begin(), tokens.end(), std::uint64_t{0});
+            return;
+        }
+        Scratch<std::uint64_t> words(count);
+        if (rearm != nullptr) {
+            Scratch<std::uint64_t> since(count);
+            Scratch<std::uint16_t> masks(count, BufferCache::EveryPage);
+            for (std::size_t block = 0; block < count; ++block) since.view[block] = armed(tokens[block]) ? tokens[block] & ~BufferCache::ArmedToken : 0;
+            static_cast<void>(rearm(address, bytes, since.view, words.view, masks.view));
+            for (std::size_t block = 0; block < count; ++block) {
+                if (words.view[block] != 0 && since.view[block] != 0) written[block] = masks.view[block];
+            }
+        } else {
+            static_cast<void>(arm(address, bytes, words.view));
+        }
+        const auto reason = unarmedReason.load(std::memory_order_acquire);
+        auto& counted = counters();
+        for (std::size_t block = 0; block < count; ++block) {
+            add(counted.armsRequested);
+            if (words.view[block] != 0) {
+                add(counted.armsGranted);
+                tokens[block] = words.view[block] | BufferCache::ArmedToken;
+                continue;
+            }
+            tokens[block] = 0;
+            const auto code = reason != nullptr ? static_cast<std::size_t>(reason(address + block * BufferCache::GranuleBytes)) : static_cast<std::size_t>(BufferCache::Unarmed::Other);
+            add(counted.unarmed[code < BufferCache::UnarmedReasons ? code : static_cast<std::size_t>(BufferCache::Unarmed::Other)]);
+        }
+    }
+
 private:
     static void armRun(std::uint64_t firstBlock, std::size_t from, std::size_t to, std::span<const std::uint64_t> held, std::span<std::uint64_t> current, std::span<std::uint16_t> written) {
         const auto arm = armBlocks.load(std::memory_order_acquire);
@@ -258,7 +321,7 @@ private:
 
 }
 
-BufferCache::BufferCache(Allocate allocate, Executed executed, Source& source) : allocate(std::move(allocate)), executed(std::move(executed)), source(source), chunks(std::make_unique<std::atomic<Slot*>[]>(Chunks)), derived(DerivedEntries) {}
+BufferCache::BufferCache(Allocate allocate, Executed executed, Source& source) : allocate(std::move(allocate)), executed(std::move(executed)), source(source), chunks(std::make_unique<std::atomic<Slot*>[]>(Chunks)), derived(DerivedEntries), ringEntries(RingEntries) {}
 
 BufferCache::~BufferCache() {
     counters().heldBytes.fetch_sub(total, std::memory_order_relaxed);
@@ -266,8 +329,39 @@ BufferCache::~BufferCache() {
 }
 
 bool BufferCache::Enabled() {
-    static const bool enabled = std::getenv("APS5_BUFFER_CACHE") != nullptr;
+    static const bool enabled = std::getenv("APS5_BUFFER_CACHE") != nullptr || DirtyFirst();
     return enabled;
+}
+
+bool BufferCache::DirtyFirst() {
+    static const bool dirtyFirst = std::getenv("APS5_DIRTY_FIRST_INPUTS") != nullptr;
+    return dirtyFirst;
+}
+
+bool BufferCache::VerifyingDirtyFirst() {
+    static const bool verifying = std::getenv("APS5_VERIFY_DIRTY_FIRST_INPUTS") != nullptr;
+    return verifying;
+}
+
+std::size_t BufferCache::RingLimit() {
+    static const std::size_t limit = [] {
+        const char* value = std::getenv("APS5_DIRTY_FIRST_RING_MAX");
+        const unsigned long long bytes = value != nullptr ? std::strtoull(value, nullptr, 10) : 16384ull;
+        return static_cast<std::size_t>(std::min(bytes, static_cast<unsigned long long>(RingChunkBytes)));
+    }();
+    return limit;
+}
+
+void BufferCache::BreakDrawRun() {
+    drawRun.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void BufferCache::EndDrawRun() {
+    if (DirtyFirst()) BreakDrawRun();
+}
+
+std::uint64_t BufferCache::DrawRun() {
+    return drawRun.load(std::memory_order_acquire);
 }
 
 bool BufferCache::Verifying() {
@@ -354,6 +448,24 @@ BufferCache::Counts BufferCache::Counted() {
     counts.heldBytes = held.heldBytes.load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < Refusals; ++reason) counts.refused[reason] = held.refused[reason].load(std::memory_order_relaxed);
     for (std::size_t reason = 0; reason < UnarmedReasons; ++reason) counts.unarmed[reason] = held.unarmed[reason].load(std::memory_order_relaxed);
+    counts.inputs = held.inputs.load(std::memory_order_relaxed);
+    counts.inputClean = held.inputClean.load(std::memory_order_relaxed);
+    counts.inputKept = held.inputKept.load(std::memory_order_relaxed);
+    counts.inputUploads = held.inputUploads.load(std::memory_order_relaxed);
+    counts.inputUploadBytes = held.inputUploadBytes.load(std::memory_order_relaxed);
+    counts.inputRing = held.inputRing.load(std::memory_order_relaxed);
+    counts.inputRingBytes = held.inputRingBytes.load(std::memory_order_relaxed);
+    counts.inputLoose = held.inputLoose.load(std::memory_order_relaxed);
+    counts.inputLooseBytes = held.inputLooseBytes.load(std::memory_order_relaxed);
+    counts.inputRepeats = held.inputRepeats.load(std::memory_order_relaxed);
+    counts.inputRefused = held.inputRefused.load(std::memory_order_relaxed);
+    counts.inputVerified = held.inputVerified.load(std::memory_order_relaxed);
+    counts.inputRaces = held.inputRaces.load(std::memory_order_relaxed);
+    counts.inputRunDiffers = held.inputRunDiffers.load(std::memory_order_relaxed);
+    counts.ringChunks = held.ringChunks.load(std::memory_order_relaxed);
+    counts.ringLaps = held.ringLaps.load(std::memory_order_relaxed);
+    counts.ringFull = held.ringFull.load(std::memory_order_relaxed);
+    counts.drawRuns = drawRun.load(std::memory_order_relaxed);
     return counts;
 }
 
@@ -408,6 +520,17 @@ std::string BufferCache::Report() {
         char stage[192];
         std::snprintf(stage, sizeof(stage), "[buffer-cache] stage (10 s): %llu stage buffers bound to a mirror, %llu of them moved, %llu left to draw snapshots; refused:", since(now.stageViews, reported.stageViews), since(now.movedViews, reported.movedViews), since(now.stageLeft, reported.stageLeft));
         text += stage + reasons + "\n";
+    }
+    if (now.inputs != reported.inputs) {
+        const auto mib = [](std::uint64_t current, std::uint64_t before) { return static_cast<double>(current - before) / 1048576.0; };
+        char inputs[640];
+        std::snprintf(inputs, sizeof(inputs), "[buffer-cache] dirty-first (10 s): %llu draw inputs asked without a collect, %llu answered by armed blocks alone, %llu by pages uploaded earlier in the run of draws, %llu uploaded to a mirror (%.1f MiB), %llu copied to the ring (%.1f MiB), %llu copied apart (%.1f MiB), %llu repeated from the run of draws, %llu refused; %llu runs of draws; ring: %llu chunks made, %llu taken again, %llu times full\n", since(now.inputs, reported.inputs), since(now.inputClean, reported.inputClean), since(now.inputKept, reported.inputKept), since(now.inputUploads, reported.inputUploads), mib(now.inputUploadBytes, reported.inputUploadBytes), since(now.inputRing, reported.inputRing), mib(now.inputRingBytes, reported.inputRingBytes), since(now.inputLoose, reported.inputLoose), mib(now.inputLooseBytes, reported.inputLooseBytes), since(now.inputRepeats, reported.inputRepeats), since(now.inputRefused, reported.inputRefused), since(now.drawRuns, reported.drawRuns), since(now.ringChunks, reported.ringChunks), since(now.ringLaps, reported.ringLaps), since(now.ringFull, reported.ringFull));
+        text += inputs;
+        if (now.inputVerified != reported.inputVerified) {
+            char verified[256];
+            std::snprintf(verified, sizeof(verified), "[buffer-cache] dirty-first verification (10 s): %llu inputs served without a copy compared with guest memory, %llu of them behind a later write, %llu differing inside a run of draws\n", since(now.inputVerified, reported.inputVerified), since(now.inputRaces, reported.inputRaces), since(now.inputRunDiffers, reported.inputRunDiffers));
+            text += verified;
+        }
     }
     reported = now;
     return text;
@@ -532,6 +655,10 @@ bool BufferCache::pending(std::uint64_t serial) {
 }
 
 BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial, bool partialHead, bool partialTail) {
+    return acquire(address, bytes, from, serial, partialHead, partialTail, false);
+}
+
+BufferCache::View BufferCache::acquire(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial, bool partialHead, bool partialTail, bool dirtyFirst) {
     auto& counted = counters();
     add(counted.lookups);
     if (bytes == 0 || from >= bytes || address >= AddressLimit || bytes > AddressLimit - address) return Refuse(Refusal::Range);
@@ -544,7 +671,10 @@ BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes,
     mirror->used = ++tick;
     if (const auto layout = source.Layout(); mirror->layout != layout) {
         const auto granules = static_cast<std::size_t>((mirror->end - mirror->begin) / GranuleBytes);
-        for (std::size_t index = 0; index < granules; ++index) mirror->granules[index].token.store(0, std::memory_order_release);
+        for (std::size_t index = 0; index < granules; ++index) {
+            mirror->granules[index].token.store(0, std::memory_order_release);
+            mirror->granules[index].run.store(0, std::memory_order_release);
+        }
         mirror->layout = layout;
     }
     const auto raced = invalidations.load(std::memory_order_acquire);
@@ -567,44 +697,80 @@ BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes,
         return (granule.hot & ((1u << high) - 1u) & ~((1u << low) - 1u)) != 0;
     };
     held.resize(blocks);
-    bool streamed = false;
-    for (std::size_t block = 0; block < blocks; ++block) {
-        auto& granule = mirror->granules[firstGranule + block];
-        held[block] = granule.token.load(std::memory_order_acquire);
-        if (granule.streamUntil == 0) continue;
-        if (serial < granule.streamUntil) {
-            streamed = streamed || rewritten(granule, block);
-            continue;
+    const auto drawn = drawRun.load(std::memory_order_acquire);
+    if (dirtyFirst) {
+        tokens.assign(blocks, 0);
+        written.assign(blocks, EveryPage);
+        for (std::size_t block = 0; block < blocks; ++block) {
+            held[block] = mirror->granules[firstGranule + block].token.load(std::memory_order_acquire);
+            if ((held[block] & ArmedToken) == 0) continue;
+            if (!source.Holds(mirror->begin + (firstGranule + block) * GranuleBytes, static_cast<std::size_t>(GranuleBytes), std::span<const std::uint64_t>(&held[block], 1))) continue;
+            tokens[block] = held[block];
+            written[block] = 0;
         }
-        granule.streamUntil = 0;
-        granule.hot = 0;
-        add(counted.streamReturns);
+        const auto asked = [&](std::size_t block) { return written[block] != 0 && serial >= mirror->granules[firstGranule + block].armAfter; };
+        for (std::size_t block = 0; block < blocks;) {
+            if (!asked(block)) {
+                ++block;
+                continue;
+            }
+            auto last = block + 1;
+            while (last < blocks && asked(last)) ++last;
+            const auto count = last - block;
+            for (auto index = block; index < last; ++index) tokens[index] = held[index];
+            source.Arm(mirror->begin + (firstGranule + block) * GranuleBytes, count * static_cast<std::size_t>(GranuleBytes), std::span<std::uint64_t>(tokens).subspan(block, count), std::span<std::uint16_t>(written).subspan(block, count));
+            for (auto index = block; index < last; ++index) {
+                if (tokens[index] != 0) continue;
+                written[index] = EveryPage;
+                mirror->granules[firstGranule + index].armAfter = serial + ArmRest;
+            }
+            block = last;
+        }
+    } else {
+        bool streamed = false;
+        for (std::size_t block = 0; block < blocks; ++block) {
+            auto& granule = mirror->granules[firstGranule + block];
+            held[block] = granule.token.load(std::memory_order_acquire);
+            if (granule.streamUntil == 0) continue;
+            if (serial < granule.streamUntil) {
+                streamed = streamed || rewritten(granule, block);
+                continue;
+            }
+            granule.streamUntil = 0;
+            granule.hot = 0;
+            add(counted.streamReturns);
+        }
+        if (streamed) return leave();
+        tokens = held;
+        written.assign(blocks, EveryPage);
+        if (!source.Poll(first, static_cast<std::size_t>(stop - first), tokens, written)) return Refuse(Refusal::Untracked);
+        for (std::size_t block = 0; block < blocks; ++block) {
+            auto& granule = mirror->granules[firstGranule + block];
+            if ((held[block] & ArmedToken) != 0 && written[block] != 0 && written[block] != EveryPage) granule.hot = static_cast<std::uint16_t>(granule.hot | written[block]);
+            if (!Streaming() || granule.streamUntil != 0) continue;
+            if ((written[block] == 0 && held[block] != 0) || (tokens[block] & ArmedToken) != 0) continue;
+            if (!source.Volatile(mirror->begin + (firstGranule + block) * GranuleBytes)) continue;
+            granule.streamUntil = serial + StreamRest;
+            add(counted.streamSwitches);
+            streamed = streamed || rewritten(granule, block);
+        }
+        if (streamed) return leave();
     }
-    if (streamed) return leave();
-    tokens = held;
-    written.assign(blocks, EveryPage);
-    if (!source.Poll(first, static_cast<std::size_t>(stop - first), tokens, written)) return Refuse(Refusal::Untracked);
-    for (std::size_t block = 0; block < blocks; ++block) {
-        auto& granule = mirror->granules[firstGranule + block];
-        if ((held[block] & ArmedToken) != 0 && written[block] != 0 && written[block] != EveryPage) granule.hot = static_cast<std::uint16_t>(granule.hot | written[block]);
-        if (!Streaming() || granule.streamUntil != 0) continue;
-        if ((written[block] == 0 && held[block] != 0) || (tokens[block] & ArmedToken) != 0) continue;
-        if (!source.Volatile(mirror->begin + (firstGranule + block) * GranuleBytes)) continue;
-        granule.streamUntil = serial + StreamRest;
-        add(counted.streamSwitches);
-        streamed = streamed || rewritten(granule, block);
-    }
-    if (streamed) return leave();
     pendingFloor = std::numeric_limits<std::uint64_t>::max();
     const auto shared = [&](std::uint64_t page) { return (partialHead && page == first) || (partialTail && page + PageBytes == stop); };
     std::uint64_t newest = 0;
     std::uint64_t copiedPages = 0;
+    std::uint64_t copiedBytes = 0;
+    bool everyArmed = true;
     for (std::size_t block = 0; block < blocks; ++block) {
         auto& granule = mirror->granules[firstGranule + block];
         const auto base = mirror->begin + (firstGranule + block) * GranuleBytes;
         const auto firstPage = static_cast<unsigned>((std::max(first, base) - base) / PageBytes);
         const auto stopPage = static_cast<unsigned>((std::min(stop, base + GranuleBytes) - base) / PageBytes);
-        granule.valid = held[block] == 0 ? std::uint16_t{0} : static_cast<std::uint16_t>(granule.valid & ~written[block]);
+        const bool kept = dirtyFirst && held[block] == 0 && tokens[block] == 0 && granule.run.load(std::memory_order_acquire) == drawn;
+        if (!kept) granule.valid = held[block] == 0 ? std::uint16_t{0} : static_cast<std::uint16_t>(granule.valid & ~written[block]);
+        if (dirtyFirst) granule.run.store(drawn, std::memory_order_release);
+        everyArmed = everyArmed && (tokens[block] & ArmedToken) != 0;
         bool copied = false;
         for (auto page = firstPage; page < stopPage;) {
             if (((granule.valid >> page) & 1u) != 0) {
@@ -624,6 +790,7 @@ BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes,
                     if (pending(mirror->bound[index])) return Refuse(Refusal::Busy);
                     if (GuestMemory::CopyMapped(low, std::span<std::byte>(part, length)) != GuestMemory::Compare::Equal) return Refuse(Refusal::Unmapped);
                     add(counted.bytes, length);
+                    copiedBytes += length;
                     ++copiedPages;
                     copied = true;
                 }
@@ -648,6 +815,7 @@ BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes,
             for (auto bit = page; bit < run; ++bit) granule.valid = static_cast<std::uint16_t>(granule.valid | (1u << bit));
             add(counted.pages, run - page);
             add(counted.bytes, length);
+            copiedBytes += length;
             copiedPages += run - page;
             copied = true;
             page = run;
@@ -676,7 +844,229 @@ BufferCache::View BufferCache::Acquire(std::uint64_t address, std::size_t bytes,
     view.owner = mirror->backing.owner;
     view.mirror = mirror->id;
     view.sequence = newest;
+    if (dirtyFirst) {
+        view.served = copiedPages != 0 ? Served::Copied : everyArmed ? Served::Clean : Served::Kept;
+        add(copiedPages != 0 ? counted.inputUploads : everyArmed ? counted.inputClean : counted.inputKept);
+        add(counted.inputUploadBytes, copiedBytes);
+    }
     return view;
+}
+
+BufferCache::View BufferCache::AcquireInput(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial, const Input& input) {
+    auto& counted = counters();
+    add(counted.inputs);
+    if (bytes == 0 || from >= bytes || address >= AddressLimit || bytes > AddressLimit - address) {
+        add(counted.inputRefused);
+        return Refuse(Refusal::Range);
+    }
+    const auto drawn = drawRun.load(std::memory_order_acquire);
+    if (drawn != looseRun) {
+        loose.clear();
+        looseRun = drawn;
+    }
+    if (!input.apart) {
+        if (auto view = cleanInput(address, bytes, from, serial)) return view;
+    }
+    if (bytes - from <= RingLimit() && from <= RingReach && bytes <= RingChunkBytes) {
+        if (auto view = ringInput(address, bytes, from, serial, drawn, input)) return view;
+    } else if (!input.apart) {
+        if (auto view = acquire(address, bytes, from, serial, input.partialHead, input.partialTail, true)) return view;
+    }
+    if (auto view = looseInput(address, bytes, from, input)) return view;
+    add(counted.inputRefused);
+    return {};
+}
+
+BufferCache::View BufferCache::cleanInput(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial) {
+    const auto end = address + bytes;
+    auto* mirror = find(address);
+    if (mirror == nullptr || end > mirror->end || mirror->layout != source.Layout()) return {};
+    const auto first = (address + from) & ~(PageBytes - 1);
+    const auto stop = (end + PageBytes - 1) & ~(PageBytes - 1);
+    const auto firstGranule = static_cast<std::size_t>((first - mirror->begin) / GranuleBytes);
+    const auto blocks = static_cast<std::size_t>((stop - 1 - mirror->begin) / GranuleBytes) - firstGranule + 1;
+    held.resize(blocks);
+    std::uint64_t newest = 0;
+    for (std::size_t block = 0; block < blocks; ++block) {
+        const auto& granule = mirror->granules[firstGranule + block];
+        held[block] = granule.token.load(std::memory_order_acquire);
+        if ((held[block] & ArmedToken) == 0) return {};
+        const auto base = mirror->begin + (firstGranule + block) * GranuleBytes;
+        const auto low = static_cast<unsigned>((std::max(first, base) - base) / PageBytes);
+        const auto high = static_cast<unsigned>((std::min(stop, base + GranuleBytes) - base) / PageBytes);
+        const auto wanted = static_cast<std::uint16_t>(((1u << high) - 1u) & ~((1u << low) - 1u));
+        if ((granule.valid & wanted) != wanted) return {};
+        newest = std::max(newest, granule.sequence);
+    }
+    if (!source.Holds(first, static_cast<std::size_t>(stop - first), held)) return {};
+    mirror->used = ++tick;
+    const auto firstIndex = static_cast<std::size_t>((first - mirror->begin) / PageBytes);
+    const auto stopIndex = static_cast<std::size_t>((stop - mirror->begin) / PageBytes);
+    for (auto index = firstIndex; index < stopIndex; ++index) {
+        if (mirror->bound[index] != serial) mirror->bound[index] = serial;
+    }
+    add(counters().inputClean);
+    View view;
+    view.handle = mirror->backing.handle;
+    view.offset = address - mirror->begin;
+    view.bytes = mirror->backing.bytes + view.offset;
+    view.owner = mirror->backing.owner;
+    view.mirror = mirror->id;
+    view.sequence = newest;
+    view.served = Served::Clean;
+    return view;
+}
+
+std::size_t BufferCache::ringIndex(std::uint64_t address, std::size_t bytes, std::size_t from) {
+    auto hash = address * 0x9E3779B97F4A7C15ull;
+    hash ^= static_cast<std::uint64_t>(bytes) + 0x9E3779B97F4A7C15ull + (hash << 6u) + (hash >> 2u);
+    hash ^= static_cast<std::uint64_t>(from) + 0x9E3779B97F4A7C15ull + (hash << 6u) + (hash >> 2u);
+    return static_cast<std::size_t>((hash >> 32u) % RingEntries);
+}
+
+bool BufferCache::nextRingChunk() {
+    auto& counted = counters();
+    if (!ring.empty()) {
+        const auto next = (ringAt + 1) % ring.size();
+        auto& candidate = *ring[next];
+        if (candidate.serial == 0 || executed(candidate.serial)) {
+            ++candidate.lap;
+            candidate.serial = 0;
+            ringAt = next;
+            ringUsed = 0;
+            add(counted.ringLaps);
+            return true;
+        }
+        if (ring.size() >= RingChunks) return false;
+    }
+    auto created = std::make_unique<RingChunk>();
+    try {
+        created->backing = allocate(RingChunkBytes);
+    } catch (const std::exception&) {
+        return false;
+    }
+    if (created->backing.bytes == nullptr || created->backing.handle == VK_NULL_HANDLE) return false;
+    const auto at = ring.empty() ? std::size_t{0} : ringAt + 1;
+    ring.insert(ring.begin() + static_cast<std::ptrdiff_t>(at), std::move(created));
+    ringAt = at;
+    ringUsed = 0;
+    add(counted.ringChunks);
+    return true;
+}
+
+BufferCache::View BufferCache::ringInput(std::uint64_t address, std::size_t bytes, std::size_t from, std::uint64_t serial, std::uint64_t run, const Input& input) {
+    auto& counted = counters();
+    const auto span = bytes - from;
+    const auto alignment = std::max<std::size_t>(input.alignment, 1);
+    auto& entry = ringEntries[ringIndex(address, bytes, from)];
+    const auto serve = [&](Served served) {
+        View view;
+        view.handle = entry.chunk->backing.handle;
+        view.offset = entry.offset;
+        view.bytes = entry.chunk->backing.bytes + entry.offset;
+        view.owner = entry.chunk->backing.owner;
+        view.mirror = entry.id;
+        view.served = served;
+        return view;
+    };
+    if (!input.fresh && entry.chunk != nullptr && entry.run == run && entry.address == address && entry.bytes == bytes && entry.from == from && entry.lap == entry.chunk->lap && entry.offset % alignment == 0) {
+        entry.chunk->serial = std::max(entry.chunk->serial, serial);
+        add(counted.inputRepeats);
+        return serve(Served::Repeated);
+    }
+    const auto place = [&](std::size_t used) {
+        const auto least = std::max(used, from);
+        const auto past = (least - from) % alignment;
+        return past == 0 ? least : least + (alignment - past);
+    };
+    auto position = ring.empty() ? RingChunkBytes : place(ringUsed);
+    if (position > RingChunkBytes || span > RingChunkBytes - position) {
+        if (!nextRingChunk()) {
+            add(counted.ringFull);
+            return {};
+        }
+        position = from;
+    }
+    auto& chunk = *ring[ringAt];
+    if (GuestMemory::CopyMapped(address + from, std::span<std::byte>(chunk.backing.bytes + position, span)) != GuestMemory::Compare::Equal) return Refuse(Refusal::Unmapped);
+    ringUsed = position + span;
+    chunk.serial = std::max(chunk.serial, serial);
+    entry.address = address;
+    entry.bytes = bytes;
+    entry.from = from;
+    entry.run = run;
+    entry.lap = chunk.lap;
+    entry.id = CopyIds | ++copyIds;
+    entry.chunk = &chunk;
+    entry.offset = position - from;
+    add(counted.inputRing);
+    add(counted.inputRingBytes, span);
+    return serve(Served::Copied);
+}
+
+BufferCache::View BufferCache::looseInput(std::uint64_t address, std::size_t bytes, std::size_t from, const Input& input) {
+    auto& counted = counters();
+    const auto same = [&](const LooseEntry& entry) { return entry.address == address && entry.bytes == bytes && entry.from == from; };
+    const auto found = std::find_if(loose.begin(), loose.end(), same);
+    if (found != loose.end()) {
+        if (!input.fresh) {
+            add(counted.inputRepeats);
+            auto view = found->view;
+            view.served = Served::Repeated;
+            return view;
+        }
+        loose.erase(found);
+    }
+    Backing backing;
+    try {
+        backing = allocate(bytes);
+    } catch (const std::exception&) {
+        return Refuse(Refusal::Allocation);
+    }
+    if (backing.bytes == nullptr || backing.handle == VK_NULL_HANDLE) return Refuse(Refusal::Allocation);
+    if (GuestMemory::CopyMapped(address + from, std::span<std::byte>(backing.bytes + from, bytes - from)) != GuestMemory::Compare::Equal) return Refuse(Refusal::Unmapped);
+    View view;
+    view.handle = backing.handle;
+    view.bytes = backing.bytes;
+    view.owner = std::move(backing.owner);
+    view.mirror = CopyIds | ++copyIds;
+    view.served = Served::Copied;
+    add(counted.inputLoose);
+    add(counted.inputLooseBytes, bytes - from);
+    if (loose.size() >= LooseEntries) loose.erase(loose.begin());
+    LooseEntry kept;
+    kept.address = address;
+    kept.bytes = bytes;
+    kept.from = from;
+    kept.view = view;
+    loose.push_back(std::move(kept));
+    return view;
+}
+
+void BufferCache::VerifyInput(const View& view, std::uint64_t address, std::size_t bytes, std::size_t from) {
+    if (!view || from >= bytes || view.served == Served::Tracked || view.served == Served::Copied) return;
+    auto& counted = counters();
+    add(counted.inputVerified);
+    if (GuestMemory::CompareMapped(address + from, std::span<const std::byte>(view.bytes + from, bytes - from)) != GuestMemory::Compare::Differs) return;
+    if (view.served == Served::Clean) {
+        const auto* mirror = find(address);
+        if (mirror != nullptr && mirror->id == view.mirror && address + bytes <= mirror->end) {
+            const auto first = (address + from) & ~(PageBytes - 1);
+            const auto stop = (address + bytes + PageBytes - 1) & ~(PageBytes - 1);
+            const auto firstGranule = static_cast<std::size_t>((first - mirror->begin) / GranuleBytes);
+            const auto blocks = static_cast<std::size_t>((stop - 1 - mirror->begin) / GranuleBytes) - firstGranule + 1;
+            std::vector<std::uint64_t> stamps(blocks);
+            for (std::size_t block = 0; block < blocks; ++block) stamps[block] = mirror->granules[firstGranule + block].token.load(std::memory_order_acquire);
+            if (source.Holds(first, static_cast<std::size_t>(stop - first), stamps)) {
+                char text[192];
+                std::snprintf(text, sizeof(text), "APS5_VERIFY_DIRTY_FIRST_INPUTS: the mirror of 0x%llx+0x%zx differs from guest memory while its blocks are armed and unwritten", static_cast<unsigned long long>(address), bytes);
+                throw std::runtime_error(text);
+            }
+        }
+        add(counted.inputRaces);
+        return;
+    }
+    if (counted.inputRunDiffers.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[buffer-cache] APS5_VERIFY_DIRTY_FIRST_INPUTS: 0x%llx+0x%zx served again inside a run of draws differs from guest memory\n", static_cast<unsigned long long>(address), bytes);
 }
 
 void BufferCache::Invalidate(std::uint64_t address, std::size_t bytes) {
@@ -684,12 +1074,16 @@ void BufferCache::Invalidate(std::uint64_t address, std::size_t bytes) {
     const auto end = address + std::min<std::uint64_t>(bytes, AddressLimit - address);
     const std::lock_guard lock(mutex);
     invalidations.fetch_add(1, std::memory_order_acq_rel);
+    BreakDrawRun();
     add(counters().invalidations);
     for (const auto& mirror : mirrors) {
         if (mirror->end <= address || end <= mirror->begin) continue;
         const auto first = static_cast<std::size_t>((std::max(address, mirror->begin) - mirror->begin) / GranuleBytes);
         const auto last = static_cast<std::size_t>((std::min(end, mirror->end) - 1 - mirror->begin) / GranuleBytes);
-        for (auto index = first; index <= last; ++index) mirror->granules[index].token.store(0, std::memory_order_release);
+        for (auto index = first; index <= last; ++index) {
+            mirror->granules[index].token.store(0, std::memory_order_release);
+            mirror->granules[index].run.store(0, std::memory_order_release);
+        }
     }
 }
 
