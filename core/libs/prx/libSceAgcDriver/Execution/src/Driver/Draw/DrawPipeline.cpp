@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileCounter.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -22,6 +23,8 @@
 #include <cstring>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <utility>
 
 namespace AgcDriver::DriverDetail {
 
@@ -360,6 +363,122 @@ void DrawFinisher::ReleaseRan() {
     std::swap(done, ran);
 }
 
+CollectWalker& CollectWalker::Get() {
+    static CollectWalker* walker = new CollectWalker();
+    return *walker;
+}
+
+bool CollectWalker::Enabled() {
+    static const bool enabled = std::getenv("APS5_NO_COLLECT_WALKER") == nullptr;
+    return enabled;
+}
+
+bool CollectWalker::Offer(std::uint64_t epoch, std::uint64_t address, std::uint64_t bytes) {
+    if (closed.load(std::memory_order_acquire)) {
+        rethrowFailure();
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    const auto at = tail.load(std::memory_order_relaxed);
+    if (at - knownHead >= Capacity) knownHead = head.load(std::memory_order_acquire);
+    if (at - knownHead >= Capacity) {
+        dropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    ring[at % Capacity] = {address, bytes, epoch};
+    tail.store(at + 1, std::memory_order_seq_cst);
+    handed.fetch_add(1, std::memory_order_relaxed);
+    if (!started.load(std::memory_order_acquire)) start();
+    if (parked.load(std::memory_order_seq_cst) != 0) {
+        parked.store(0, std::memory_order_seq_cst);
+        WakeOne(parked);
+    }
+    return true;
+}
+
+bool CollectWalker::Idle() const {
+    return closed.load(std::memory_order_acquire) || head.load(std::memory_order_acquire) == tail.load(std::memory_order_acquire);
+}
+
+CollectWalker::Counts CollectWalker::Counted() const {
+    return {handed.load(std::memory_order_relaxed), collected.load(std::memory_order_relaxed), dropped.load(std::memory_order_relaxed), collectNs.load(std::memory_order_relaxed), sleeps.load(std::memory_order_relaxed)};
+}
+
+void CollectWalker::start() {
+    std::lock_guard lock(lifecycle);
+    if (started.load(std::memory_order_relaxed) || closed.load(std::memory_order_relaxed)) return;
+    try {
+        thread = Libc::StartHostThread([this] { run(); });
+        started.store(true, std::memory_order_release);
+    } catch (const std::system_error& error) {
+        closed.store(true, std::memory_order_seq_cst);
+        std::fprintf(stderr, "[collects] no host thread for the collect walker, the committer keeps its walks: %s\n", error.what());
+    }
+}
+
+void CollectWalker::run() {
+    NameDriverThread("collect-walk");
+    PerformanceTrace::BindThread("collect walker");
+    static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    std::exception_ptr error;
+    try {
+        while (!closed.load(std::memory_order_acquire)) {
+            const auto at = head.load(std::memory_order_relaxed);
+            if (tail.load(std::memory_order_acquire) == at) {
+                if (SpinUntil(HandoffSpinWindow(), [&] { return tail.load(std::memory_order_acquire) != at || closed.load(std::memory_order_acquire); })) continue;
+                parked.store(1u, std::memory_order_seq_cst);
+                if (tail.load(std::memory_order_seq_cst) == at && !closed.load(std::memory_order_seq_cst)) {
+                    sleeps.fetch_add(1, std::memory_order_relaxed);
+                    WaitWhile(parked, 1u);
+                }
+                parked.store(0u, std::memory_order_seq_cst);
+                continue;
+            }
+            const auto entry = ring[at % Capacity];
+            GuestMemory::AdoptCollectEpoch(entry.epoch);
+            const auto began = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            GuestMemory::CollectWrites(entry.address, static_cast<std::size_t>(entry.bytes));
+            if (timed) collectNs.fetch_add(elapsedNs(began), std::memory_order_relaxed);
+            collected.fetch_add(1, std::memory_order_relaxed);
+            head.store(at + 1, std::memory_order_release);
+        }
+    } catch (const ProcessShutdown&) {
+    } catch (const std::exception& cause) {
+        error = std::make_exception_ptr(std::runtime_error(std::string("collect walker: ") + cause.what()));
+    } catch (...) {
+        error = std::current_exception();
+    }
+    if (error != nullptr) {
+        std::lock_guard lock(lifecycle);
+        failure = error;
+        failed.store(true, std::memory_order_release);
+    }
+    closed.store(true, std::memory_order_seq_cst);
+}
+
+void CollectWalker::rethrowFailure() {
+    if (!failed.load(std::memory_order_acquire)) return;
+    std::exception_ptr error;
+    {
+        std::lock_guard lock(lifecycle);
+        error = std::exchange(failure, nullptr);
+        failed.store(false, std::memory_order_release);
+    }
+    if (error != nullptr) std::rethrow_exception(error);
+}
+
+void CollectWalker::Stop() {
+    std::thread walker;
+    {
+        std::lock_guard lock(lifecycle);
+        closed.store(true, std::memory_order_seq_cst);
+        walker = std::move(thread);
+    }
+    parked.store(0, std::memory_order_seq_cst);
+    WakeOne(parked);
+    if (walker.joinable()) walker.join();
+}
+
 DrawPipeline& DrawPipeline::Queue0() {
     static DrawPipeline* pipeline = new DrawPipeline();
     return *pipeline;
@@ -583,8 +702,12 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     static EpochBumps reportedBumps{};
     const auto bumps = EpochBumpsCounted();
     AgcDriver::ProfilePrint_nid_no_patch("[collects] (10 s): %llu GetWriteWatch calls, %llu of them on the committer; %llu collect epochs; %llu collect-memo hits; %llu epochs with a memoized collect that walked; epoch bumps by reason: submissions %llu, waits %llu (%llu more ordered by an earlier wait), drains %llu, interrupts %llu, queued label interrupts %llu, reaps %llu, packets %llu\n", static_cast<unsigned long long>(collects.watchCalls - reportedCollects.watchCalls), static_cast<unsigned long long>(collects.committerWatchCalls - reportedCollects.committerWatchCalls), static_cast<unsigned long long>(collects.epochBumps - reportedCollects.epochBumps), static_cast<unsigned long long>(collects.memoHits - reportedCollects.memoHits), static_cast<unsigned long long>(collects.walkedEpochs - reportedCollects.walkedEpochs), static_cast<unsigned long long>(bumps.submissions - reportedBumps.submissions), static_cast<unsigned long long>(bumps.waits - reportedBumps.waits), static_cast<unsigned long long>(bumps.waitsOrdered - reportedBumps.waitsOrdered), static_cast<unsigned long long>(bumps.drains - reportedBumps.drains), static_cast<unsigned long long>(bumps.interrupts - reportedBumps.interrupts), static_cast<unsigned long long>(bumps.queuedInterrupts - reportedBumps.queuedInterrupts), static_cast<unsigned long long>(bumps.reaps - reportedBumps.reaps), static_cast<unsigned long long>(bumps.packets - reportedBumps.packets));
+    static CollectWalker::Counts reportedWalker{};
+    const auto walker = CollectWalker::Get().Counted();
+    AgcDriver::ProfilePrint_nid_no_patch("[collect-walker] (10 s): %llu ranges handed over, %llu collected by it in %.1f ms, %llu left to the committer, %llu sleeps\n", static_cast<unsigned long long>(walker.handed - reportedWalker.handed), static_cast<unsigned long long>(walker.collected - reportedWalker.collected), static_cast<double>(walker.collectNs - reportedWalker.collectNs) / 1e6, static_cast<unsigned long long>(walker.dropped - reportedWalker.dropped), static_cast<unsigned long long>(walker.sleeps - reportedWalker.sleeps));
     reportedCollects = collects;
     reportedBumps = bumps;
+    reportedWalker = walker;
     const auto dirty = GuestMemory::TakeDirtyBlockCounts();
     const auto share = [](std::uint64_t part, std::uint64_t whole) { return whole == 0 ? 0.0 : 100.0 * static_cast<double>(part) / static_cast<double>(whole); };
     AgcDriver::ProfilePrint_nid_no_patch("[dirty] (10 s): %llu distinct 64 KiB blocks found written by the CPU, %llu of them in more than one collect epoch, %llu (block, epoch) findings; collects %.1f MiB, %.1f %% in blocks written in this or the previous 10 s; variant validations %.1f MiB, %.1f %% in such blocks\n", static_cast<unsigned long long>(dirty.distinct), static_cast<unsigned long long>(dirty.recurrent), static_cast<unsigned long long>(dirty.findings), static_cast<double>(dirty.collectBytes) / 1048576.0, share(dirty.collectDirtyBytes, dirty.collectBytes), static_cast<double>(dirty.variantBytes) / 1048576.0, share(dirty.variantDirtyBytes, dirty.variantBytes));

@@ -1574,12 +1574,18 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
         if (DrawFinisher::OnFinisherThread() && FinisherPrecollect() && GuestMemory::CollectEpoch() != 0) {
+            const auto walkEpoch = GuestMemory::HeldCollectEpoch();
+            const bool handsOver = CollectWalker::Enabled();
+            const auto precollect = [&](std::uint64_t address, std::uint64_t bytes) {
+                if (handsOver) CollectWalker::Get().Offer(walkEpoch, address, bytes);
+                else GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes));
+            };
             if (recipe != nullptr) {
-                for (const auto& [address, bytes] : recipe->surfaces) GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes));
+                for (const auto& [address, bytes] : recipe->surfaces) precollect(address, bytes);
             }
             if (FinisherInputPrecollect()) {
                 for (const auto& [begin, end] : reads) {
-                    if (end - begin <= FinisherInputPrecollectBytes) GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin));
+                    if (end - begin <= FinisherInputPrecollectBytes) precollect(begin, end - begin);
                 }
             }
         }

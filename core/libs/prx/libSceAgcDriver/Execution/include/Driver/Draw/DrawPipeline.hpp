@@ -197,6 +197,52 @@ private:
     std::thread thread;
 };
 
+class CollectWalker {
+public:
+    struct Counts {
+        std::uint64_t handed = 0;
+        std::uint64_t collected = 0;
+        std::uint64_t dropped = 0;
+        std::uint64_t collectNs = 0;
+        std::uint64_t sleeps = 0;
+    };
+    static constexpr std::size_t Capacity = 1024;
+    static CollectWalker& Get();
+    static bool Enabled();
+    bool Offer(std::uint64_t epoch, std::uint64_t address, std::uint64_t bytes);
+    bool Idle() const;
+    Counts Counted() const;
+    void Stop();
+
+private:
+    struct Entry {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        std::uint64_t epoch = 0;
+    };
+    CollectWalker() = default;
+    void start();
+    void run();
+    void rethrowFailure();
+
+    std::array<Entry, Capacity> ring{};
+    alignas(64) std::atomic<std::uint64_t> tail{0};
+    std::uint64_t knownHead = 0;
+    std::atomic<std::uint64_t> handed{0};
+    std::atomic<std::uint64_t> dropped{0};
+    alignas(64) std::atomic<std::uint64_t> head{0};
+    std::atomic<std::uint64_t> collected{0};
+    std::atomic<std::uint64_t> collectNs{0};
+    std::atomic<std::uint64_t> sleeps{0};
+    alignas(64) std::atomic<std::uint32_t> parked{0};
+    std::atomic<bool> closed{false};
+    std::atomic<bool> started{false};
+    std::atomic<bool> failed{false};
+    std::mutex lifecycle;
+    std::exception_ptr failure;
+    std::thread thread;
+};
+
 }
 
 #endif

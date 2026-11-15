@@ -194,6 +194,7 @@ void Driver::stop() {
         DrawFinisher::Get().Drain();
     } catch (...) {
     }
+    CollectWalker::Get().Stop();
     DrawPipeline::Queue0().Stop();
     DrawPipeline::Queue0().ReleaseRetired();
     DrawFinisher::Get().ReleaseRan();
