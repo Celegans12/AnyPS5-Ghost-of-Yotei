@@ -3,6 +3,8 @@
 #define NOMINMAX
 #include <windows.h>
 #endif
+#include <codegen/IAmd64OnlyConverter.hpp>
+#include <codegen/x86/IAmd64OnlyInstructionMatcher.hpp>
 #include <codegen/x86/RedZoneFramer.hpp>
 #include <codegen/x86/StubBodyBuilder.hpp>
 #include <algorithm>
@@ -557,6 +559,64 @@ struct Framing {
     std::vector<Codegen::RedZoneDisplacement> Displacements;
 };
 
+// Intel substitution sites in front of a red-zone operand: the Intel pass stubs each vrcpps or
+// sha256msg1, and the framer can only relocate these leaves whole, carrying the site.
+std::vector<Leaf> intelLeaves() {
+    return {
+        // Yotei's shape: a 4-byte vrcpps widened over the red-zone store after it.
+        {"leaf storing below rsp right after a 4-byte vrcpps", {
+            0xc4, 0xe1, 0xf9, 0x6e, 0xe7, 0xc5, 0xf8, 0x5b, 0xe4, 0xc5, 0xf8, 0x53, 0xe4, 0x48, 0x89, 0x74, 0x24, 0xf0,
+            0xc5, 0xf9, 0x7e, 0xe0, 0x48, 0x03, 0x44, 0x24, 0xf0, 0xc3,
+        }, 0},
+        {"leaf whose sha256msg1 reads its operand below rsp", {
+            0xc4, 0xe1, 0xf9, 0x6e, 0xe7, 0xc5, 0xf8, 0x11, 0x64, 0x24, 0xe0, 0x48, 0x89, 0x74, 0x24, 0xd0, 0xc4, 0xe1, 0xf9, 0x6e, 0xea,
+            0x0f, 0x38, 0xcc, 0x6c, 0x24, 0xe0, 0xc4, 0xe3, 0x79, 0x16, 0xe8, 0x03, 0x48, 0x03, 0x44, 0x24, 0xd0, 0xc3,
+        }, 0},
+    };
+}
+
+void prepare(const std::vector<std::uint8_t>& bytes) {
+    std::fill_n(arena, kArenaBytes, 0xcc);
+    std::copy(bytes.begin(), bytes.end(), arena);
+#ifdef _WIN32
+    const auto runner = windowsRunner();
+    steppingReturn = reinterpret_cast<std::uintptr_t>(arena + kRunnerBase + runner.size() - Runner.size() + RunnerEntry.size());
+#else
+    const auto& runner = Runner;
+#endif
+    require(runner.size() <= kArenaBytes - kRunnerBase, "the runner does not fit in the executable arena");
+    std::copy(runner.begin(), runner.end(), arena + kRunnerBase);
+}
+
+void install(const std::vector<Codegen::TrampolineSite>& sites) {
+    const auto base = reinterpret_cast<std::uint64_t>(arena);
+    std::size_t cursor = kStubBase;
+    std::vector<std::uint64_t> stubs(sites.size(), 0);
+    for (std::size_t index = 0; index < sites.size(); ++index) {
+        const auto& site = sites[index];
+        const auto at = static_cast<std::size_t>(site.Address - base);
+        require(std::equal(site.OriginalBytes.begin(), site.OriginalBytes.end(), arena + at), "a site's bytes changed before it was patched");
+        if (site.JoinBack != 0) {
+            require(site.JoinBack <= index && site.Body.empty() && stubs[index - site.JoinBack] != 0, "a join site does not follow the stub it jumps into");
+            std::fill_n(arena + at, site.Length, 0x90);
+            arena[at] = 0xe9;
+            writeRel32(arena + at + 1, stubs[index - site.JoinBack] + site.JoinOffset, site.Address + 5);
+            continue;
+        }
+        cursor = (cursor + 15) / 16 * 16;
+        stubs[index] = base + cursor;
+        require(cursor + site.Body.size() <= kProbeBase, "the stubs do not fit before the calibration probe");
+        auto* stub = arena + cursor;
+        std::copy(site.Body.begin(), site.Body.end(), stub);
+        Codegen::ApplyStubRelocations(std::span<std::uint8_t>(stub, site.ReturnBranchOffset), site.Relocations, site.Address, base + cursor, site.Offset);
+        writeRel32(stub + site.ReturnBranchOffset + 1, site.Address + site.Length, base + cursor + site.ReturnBranchOffset + 5);
+        std::fill_n(arena + at, site.Length, 0x90);
+        arena[at] = 0xe9;
+        writeRel32(arena + at + 1, base + cursor, site.Address + 5);
+        cursor += site.Body.size();
+    }
+}
+
 Framing load(const Image& image, const bool frame) {
     std::fill_n(arena, kArenaBytes, 0xcc);
     std::copy(image.Bytes.begin(), image.Bytes.end(), arena);
@@ -688,6 +748,48 @@ Codegen::RedZoneFrameReport runLeaves(const std::vector<Leaf>& leaves) {
     return framing.Report;
 }
 
+// The Intel pass alone gives each leaf's result and loses its red-zone value under the clobber; the
+// leaves relocated with their Intel sites carried must give the same result under the clobber.
+Codegen::RedZoneFrameReport runIntelLeaves(const std::vector<Leaf>& leaves) {
+    const auto image = place(leaves);
+    const auto base = reinterpret_cast<std::uint64_t>(arena);
+    const std::vector<Domain::ProgramHeader> segments{{1, 5, 0, base, base, image.Bytes.size(), image.Bytes.size(), 16}};
+    std::vector<Codegen::RedZoneFunction> functions;
+    for (std::size_t index = 0; index < image.Starts.size(); ++index) functions.push_back({base + image.Starts[index], base + image.Ends[index]});
+    const auto converted = Codegen::MakeAmd64OnlyConverter()->Convert(image.Bytes, segments);
+    require(converted.Trampolines.size() == leaves.size(), "the Intel pass made " + std::to_string(converted.Trampolines.size()) + " stubs, not one per leaf");
+    prepare(converted.Bytes);
+    install(converted.Trampolines);
+    std::vector<std::uint64_t> expected;
+    std::vector<Run> clobbered;
+    for (std::size_t index = 0; index < leaves.size(); ++index) {
+        expected.push_back(run(image.Starts[index], false).Result);
+        clobbered.push_back(clobberedRun(image.Starts[index]));
+        require(clobbered.back().Steps > 0, std::string(leaves[index].Name) + ": the clobber did not run");
+        require(clobbered.back().Result != expected.back(), std::string(leaves[index].Name) + ": the Intel-converted leaf survived writes below rsp, so the case proves nothing");
+    }
+    Framing framing;
+    const auto lowering = Codegen::MakeAmd64OnlyInstructionMatcher();
+    framing.Sites = Codegen::FrameRedZoneFunctions(converted.Bytes, segments, functions, converted.Trampolines, framing.Report, framing.Displacements, {}, {}, lowering.get());
+    prepare(converted.Bytes);
+    for (const auto& moved : framing.Displacements) std::copy(moved.Bytes.begin(), moved.Bytes.end(), arena + moved.Offset);
+    std::vector<Codegen::TrampolineSite> sites;
+    for (std::size_t index = 0; index < converted.Trampolines.size(); ++index)
+        if (std::find(framing.Report.CarriedSites.begin(), framing.Report.CarriedSites.end(), index) == framing.Report.CarriedSites.end()) sites.push_back(converted.Trampolines[index]);
+    sites.insert(sites.end(), framing.Sites.begin(), framing.Sites.end());
+    install(sites);
+    require(framing.Report.Framed == leaves.size(), "only " + std::to_string(framing.Report.Framed) + " of " + std::to_string(leaves.size()) + " leaves were framed");
+    for (std::size_t index = 0; index < leaves.size(); ++index) {
+        const auto calm = run(image.Starts[index], false);
+        const auto framed = clobberedRun(image.Starts[index]);
+        require(calm.Result == expected[index], std::string(leaves[index].Name) + ": the framed leaf returned " + hex(calm.Result) + " without the clobber, not the Intel pass's " + hex(expected[index]));
+        require(framed.Steps > 0, std::string(leaves[index].Name) + ": the clobber did not run over the framed leaf");
+        require(framed.Result == expected[index], std::string(leaves[index].Name) + ": the framed leaf returned " + hex(framed.Result) + " under writes below rsp, not " + hex(expected[index]));
+        std::cout << leaves[index].Name << ": Intel pass " << hex(expected[index]) << " alone and " << hex(clobbered[index].Result) << " under the clobber (" << clobbered[index].Steps << " steps); framed " << hex(framed.Result) << " under the clobber (" << framed.Steps << " steps)\n";
+    }
+    return framing.Report;
+}
+
 void verifySkippedLeaves(const std::vector<Leaf>& leaves) {
     const auto image = place(leaves);
     const auto framing = load(image, true);
@@ -730,6 +832,8 @@ int main() {
         require(switched.Exits == 4 && switched.WidenedExits == 4, "the leaves with jump tables were framed with " + std::to_string(switched.Exits) + " exits, " + std::to_string(switched.WidenedExits) + " widened, not 4 and 4");
         const auto relocated = runLeaves(relocatedLeaves());
         require(relocated.Relocated == 9 && relocated.RelocatedCases == 2 && relocated.RelocatedOpenJumps == 0 && relocated.Skipped.empty(), "the leaves that cannot be framed in place were relocated " + std::to_string(relocated.Relocated) + " times with " + std::to_string(relocated.RelocatedCases) + " case jumps and " + std::to_string(relocated.RelocatedOpenJumps) + " open jumps and " + std::to_string(relocated.Skipped.size()) + " skip reasons, not 9, 2, 0 and 0");
+        const auto carried = runIntelLeaves(intelLeaves());
+        require(carried.Relocated == 2 && carried.RelocatedWithIntelSites == 2 && carried.CarriedSites.size() == 2 && carried.Skipped.empty(), "the leaves over Intel stubs were relocated " + std::to_string(carried.Relocated) + " times carrying " + std::to_string(carried.CarriedSites.size()) + " Intel sites with " + std::to_string(carried.Skipped.size()) + " skip reasons, not 2, 2 and 0");
         verifySkippedLeaves(skippedDirectRspLeaves());
         std::cout << "red-zone framer execution tests passed\n";
         return 0;

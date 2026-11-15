@@ -2,11 +2,13 @@
 #define RELINKER_PIPELINE_REDZONEFRAMING_HPP
 
 #include <codegen/CodegenTypes.hpp>
+#include <codegen/x86/Amd64OnlySubstitutionTypes.hpp>
 #include <codegen/x86/RedZoneFramer.hpp>
 #include <domain/Types.hpp>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -14,7 +16,8 @@
 namespace Relinker {
 
 struct RedZoneFramingResult {
-    // Sites appended to the trampoline list, starting at this index.
+    // Sites appended to the trampoline list, starting at this index, after the Intel sites that
+    // relocated leaves carried were removed from it.
     std::size_t FirstSite = 0;
     std::vector<Codegen::RedZoneDisplacement> Displacements;
     // Leaves that keep values below RSP and were not framed; zero is the phase 1 gate.
@@ -27,8 +30,9 @@ struct RedZoneFramingResult {
 
 // Frames the red-zone leaves of one image (the executable or a guest module). The image's
 // displacements are applied to bytes, and the framing sites are appended to trampolines. Messages
-// start with prefix ("Red-zone framing" or "Red-zone framing (<module>)").
-RedZoneFramingResult FrameRedZoneImage(std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<std::uint8_t>& relaData, std::vector<Codegen::TrampolineSite>& trampolines, const std::string& prefix, const std::function<void(std::string_view)>& message);
+// start with prefix ("Red-zone framing" or "Red-zone framing (<module>)"). With intel, trampolines
+// holds the Intel pass's sites for that target: a leaf relocated whole lowers the ones inside it.
+RedZoneFramingResult FrameRedZoneImage(std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<std::uint8_t>& relaData, std::vector<Codegen::TrampolineSite>& trampolines, const std::string& prefix, const std::function<void(std::string_view)>& message, std::optional<Codegen::Amd64OnlyTarget> intel = std::nullopt);
 
 }
 

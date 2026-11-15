@@ -1,5 +1,9 @@
 #include <codegen/x86/RedZoneFramer.hpp>
+#include <codegen/CodegenException.hpp>
 #include <codegen/IInstructionScanner.hpp>
+#include <codegen/x86/Amd64OnlySubstitutionTable.hpp>
+#include <codegen/x86/IAmd64OnlyInstructionMatcher.hpp>
+#include <codegen/x86/StubBodyBuilder.hpp>
 #include <codegen/x86/X64InstructionDecoder.hpp>
 #include <algorithm>
 #include <cstring>
@@ -531,7 +535,8 @@ void frameSegment(
     std::vector<RedZoneDisplacement>& displacements,
     RedZoneFrameReport& report,
     const std::vector<Domain::ProgramHeader>& loadSegments,
-    const std::map<std::uint64_t, std::uint64_t>& relativeAddends
+    const std::map<std::uint64_t, std::uint64_t>& relativeAddends,
+    const IAmd64OnlyInstructionMatcher* lowering
 ) {
     const auto segOffset = static_cast<std::size_t>(ph.Offset);
     const auto segSize = static_cast<std::size_t>(ph.FileSize);
@@ -555,10 +560,14 @@ void frameSegment(
     }
     std::sort(edges.begin(), edges.end());
     std::vector<std::pair<std::size_t, std::size_t>> taken;
-    for (const auto& site : existing) {
+    // The other pass's sites in this segment, by index into existing: a relocated leaf may carry them.
+    std::vector<std::pair<std::pair<std::size_t, std::size_t>, std::size_t>> existingRanges;
+    for (std::size_t index = 0; index < existing.size(); ++index) {
+        const auto& site = existing[index];
         if (site.Address < ph.MappedAddress || site.Address >= ph.MappedAddress + segSize) continue;
         const auto at = static_cast<std::size_t>(site.Address - ph.MappedAddress);
         taken.emplace_back(at, at + site.Length);
+        existingRanges.push_back({{at, at + site.Length}, index});
     }
     const auto overlapsExisting = [&](const std::size_t begin, const std::size_t end) {
         return std::any_of(taken.begin(), taken.end(), [&](const auto& range) { return begin < range.second && range.first < end; });
@@ -668,7 +677,54 @@ void frameSegment(
         const auto relocate = [&]() -> const char* {
             constexpr std::int64_t shift = kRelocatedShift;
             if (bodyEnd - static_cast<std::int64_t>(start) < static_cast<std::int64_t>(kJumpBytes)) return "leaf shorter than a jump";
-            if (overlapsExisting(start, static_cast<std::size_t>(bodyEnd))) return "overlaps another stub";
+            // Intel substitution sites inside the leaf are carried: each AMD-only instruction is
+            // lowered from its original bytes inside the copy, where there is room, and the site is
+            // dropped, as the original body is dead behind the entry jump. Any other stub, or a site
+            // reaching past the leaf, still refuses the leaf.
+            std::vector<std::size_t> carried;
+            std::vector<std::pair<std::size_t, std::size_t>> carriedRanges;
+            std::set<std::size_t> lowered;
+            const auto overlapsUncarried = [&](const std::size_t begin, const std::size_t end) {
+                return std::any_of(taken.begin(), taken.end(), [&](const auto& range) { return begin < range.second && range.first < end && std::find(carriedRanges.begin(), carriedRanges.end(), range) == carriedRanges.end(); });
+            };
+            if (overlapsExisting(start, static_cast<std::size_t>(bodyEnd))) {
+                if (lowering == nullptr) return "overlaps another stub";
+                for (const auto& [range, index] : existingRanges) {
+                    if (range.second <= start || range.first >= static_cast<std::size_t>(bodyEnd)) continue;
+                    const auto& site = existing[index];
+                    if (range.first < start || range.second > static_cast<std::size_t>(bodyEnd) || site.JoinBack != 0 || site.Body.empty()) return "overlaps another stub";
+                    if (site.OriginalBytes.size() != range.second - range.first || !std::equal(site.OriginalBytes.begin(), site.OriginalBytes.end(), seg.begin() + static_cast<std::ptrdiff_t>(range.first))) return "overlaps another stub";
+                    if (!indexOf.contains(range.first) || (range.second != static_cast<std::size_t>(bodyEnd) && !indexOf.contains(range.second))) return "overlaps another stub";
+                    std::size_t amdOnly = 0;
+                    for (auto k = indexOf.at(range.first); k < body.size() && body[k].Offset < range.second; ++k) {
+                        std::optional<Amd64OnlyMatch> match;
+                        try {
+                            match = lowering->Match(site.OriginalBytes.data() + (body[k].Offset - range.first), body[k].Length);
+                        } catch (const CodegenException&) {
+                            return "Intel substitution site that cannot be carried into a relocated leaf";
+                        }
+                        if (!match) continue;
+                        lowered.insert(k);
+                        ++amdOnly;
+                    }
+                    if (amdOnly == 0) return "overlaps another stub";
+                    carried.push_back(index);
+                    carriedRanges.push_back(range);
+                }
+                if (overlapsUncarried(start, static_cast<std::size_t>(bodyEnd))) return "overlaps another stub";
+                // The original body stays reachable from a branch from outside it or from an indirect
+                // jump that leaves the copy: its AMD-only instructions would run unlowered there.
+                if (enteredFromOutside(start + 1, static_cast<std::size_t>(bodyEnd))) return "branch from outside into a relocated leaf with Intel sites";
+            }
+            // A branch into another stub that the leaf does not carry (an Intel island's hop): the
+            // copy would run the island's moved instructions, not the leaf's.
+            const auto intoOtherStub = [&](const std::int64_t target) {
+                if (carried.empty() || target < 0) return false;
+                const auto at = static_cast<std::size_t>(target);
+                return std::any_of(existingRanges.begin(), existingRanges.end(), [&](const auto& entry) {
+                    return entry.first.first <= at && at < entry.first.second && std::find(carried.begin(), carried.end(), entry.second) == carried.end();
+                });
+            };
             if (enteredFromOutside(start + 1, start + kJumpBytes)) return "branch from outside into the start of a relocated leaf";
             const auto inside = [&](const std::int64_t target) -> std::optional<std::size_t> {
                 if (target < static_cast<std::int64_t>(start) || target >= bodyEnd) return std::nullopt;
@@ -743,6 +799,60 @@ void frameSegment(
                     if (target >= static_cast<std::int64_t>(start) && target < static_cast<std::int64_t>(limit)) leavesIntoFunction = true;
                 }
             };
+            // The lowerings' constants, placed after the copy's jump back at the stub alignment, and
+            // the RIP-relative fields in the copy that address them.
+            struct PoolUse {
+                std::size_t Field;
+                std::size_t End;
+                std::size_t Pool;
+                std::size_t Offset;
+            };
+            std::vector<std::vector<std::uint8_t>> pools;
+            std::vector<PoolUse> poolUses;
+            const auto lower = [&](const std::size_t k, const MemoryUse& use) -> const char* {
+                const auto& insn = body[k];
+                const auto* code = at(k);
+                std::vector<std::uint8_t> instruction(code, code + insn.Length);
+                if (use.RegisterRsp) return "other use of rsp in a relocated leaf";
+                if (use.RspBased) {
+                    const bool evex = insn.Info.RexPrefix == 0 && code[insn.Info.OpcodeOffset] == 0x62;
+                    if (evex && use.Mod == 1) return "EVEX rsp operand with a scaled displacement";
+                    if (insn.Info.AddressSize32) return "32-bit rsp operand";
+                    const auto bytes = withDisplacement(code, insn, use, use.RspDisp + shift, evex);
+                    if (!bytes) return "rsp operand that cannot move";
+                    instruction = *bytes;
+                }
+                StubBodyBuilder builder;
+                try {
+                    lowering->EmitOutOfLine(builder, instruction, true);
+                } catch (const CodegenException&) {
+                    return "Intel substitution that cannot be lowered in a relocated leaf";
+                }
+                const auto stub = builder.Finish();
+                const auto codeEnd = stub.ReturnBranchOffset;
+                Copied part{std::vector<std::uint8_t>(stub.Bytes.begin(), stub.Bytes.begin() + static_cast<std::ptrdiff_t>(codeEnd)), {}};
+                std::set<std::size_t> relocated;
+                for (const auto& relocation : stub.Relocations) {
+                    if (relocation.InstructionEnd > codeEnd) return "Intel substitution that cannot be lowered in a relocated leaf";
+                    part.Rips.push_back({relocation.DisplacementOffset, relocation.InstructionEnd, static_cast<std::int64_t>(insn.Offset) + relocation.SiteTarget, relocation.AddressSize32});
+                    relocated.insert(relocation.DisplacementOffset);
+                }
+                const auto poolBegin = (codeEnd + Amd64OnlySubstitutionTable::kJmpRel32.Size + Amd64OnlySubstitutionTable::kStubAlignment - 1) / Amd64OnlySubstitutionTable::kStubAlignment * Amd64OnlySubstitutionTable::kStubAlignment;
+                const auto field = out.Bytes.size();
+                for (const auto& match : scanner->ScanCodeSection(part.Bytes, 0, part.Bytes.size())) {
+                    const auto decoded = decoder.DecodeInstruction(part.Bytes.data() + match.Offset, match.Length);
+                    if (!decoded.HasRipRelativeDisp || relocated.contains(match.Offset + decoded.RipRelativeDispOffset)) continue;
+                    std::int32_t disp = 0;
+                    std::memcpy(&disp, part.Bytes.data() + match.Offset + decoded.RipRelativeDispOffset, 4);
+                    const auto constant = static_cast<std::int64_t>(match.Offset + match.Length) + disp;
+                    if (constant < static_cast<std::int64_t>(poolBegin) || constant >= static_cast<std::int64_t>(stub.Bytes.size())) return "Intel substitution that cannot be lowered in a relocated leaf";
+                    poolUses.push_back({field + match.Offset + decoded.RipRelativeDispOffset, field + match.Offset + match.Length, pools.size(), static_cast<std::size_t>(constant) - poolBegin});
+                }
+                if (poolBegin < stub.Bytes.size()) pools.emplace_back(stub.Bytes.begin() + static_cast<std::ptrdiff_t>(poolBegin), stub.Bytes.end());
+                else pools.emplace_back();
+                out.Append(part);
+                return nullptr;
+            };
             for (std::size_t k = 0; k < body.size(); ++k) {
                 labelAt[k] = out.Bytes.size();
                 const auto& insn = body[k];
@@ -751,6 +861,11 @@ void frameSegment(
                 const auto flow = info.FlowKind;
                 const auto use = memoryUse(code, insn);
                 const auto target = static_cast<std::int64_t>(insn.Offset + insn.Length) + info.BranchDisp;
+                if (lowered.contains(k)) {
+                    if (const auto failure = lower(k, use)) return failure;
+                    continue;
+                }
+                if (info.HasBranchTarget && !info.HasRipRelativeDisp && intoOtherStub(target)) return "branch into another stub from a relocated leaf with Intel sites";
                 if (flow == ControlFlowKind::ConditionalBranch) {
                     const auto op = info.Opcode;
                     const bool shortForm = !info.IsTwoByteOpcode && op >= 0x70 && op <= 0x7f;
@@ -940,6 +1055,7 @@ void frameSegment(
                 for (const auto field : fields) patch(field, label);
             }
             for (const auto& [field, k] : internal) patch(field, labelAt[k]);
+            if (!carried.empty() && openJump) return "indirect jump in a relocated leaf with Intel sites";
             // A case's jump assumes rsp is already lowered: only the stub may reach it, so the original
             // code must not run (no branch from outside into it, nothing in the stub going back to it).
             std::vector<std::size_t> pads;
@@ -951,7 +1067,7 @@ void frameSegment(
                 for (std::size_t index = 0; index < pads.size(); ++index) {
                     const auto begin = pads[index];
                     if (begin < start + kJumpBytes || begin + kJumpBytes > limit || (index + 1 < pads.size() && pads[index + 1] < begin + kJumpBytes)) return "jump table cases closer than a jump";
-                    if (overlapsExisting(begin, begin + kJumpBytes)) return "overlaps another stub";
+                    if (overlapsUncarried(begin, begin + kJumpBytes)) return "overlaps another stub";
                 }
             }
             TrampolineSite site;
@@ -962,7 +1078,19 @@ void frameSegment(
             site.ReturnBranchOffset = out.Bytes.size();
             for (const auto& rip : out.Rips) site.Relocations.push_back({rip.Offset, rip.End, rip.Target - static_cast<std::int64_t>(start), rip.AddressSize32});
             out.Bytes.insert(out.Bytes.end(), std::begin(kJumpBack), std::end(kJumpBack));
+            std::vector<std::size_t> poolAt;
+            for (const auto& pool : pools) {
+                if (!pool.empty())
+                    while (out.Bytes.size() % Amd64OnlySubstitutionTable::kStubAlignment != 0) out.Bytes.push_back(Amd64OnlySubstitutionTable::kTrapFill);
+                poolAt.push_back(out.Bytes.size());
+                out.Bytes.insert(out.Bytes.end(), pool.begin(), pool.end());
+            }
+            for (const auto& use : poolUses) {
+                const auto value = static_cast<std::uint32_t>(static_cast<std::int32_t>(static_cast<std::int64_t>(poolAt[use.Pool] + use.Offset) - static_cast<std::int64_t>(use.End)));
+                for (std::size_t index = 0; index < 4; ++index) out.Bytes[use.Field + index] = static_cast<std::uint8_t>(value >> (8 * index));
+            }
             site.Body = std::move(out.Bytes);
+            for (const auto& range : carriedRanges) taken.erase(std::find(taken.begin(), taken.end(), range));
             taken.emplace_back(start, start + kJumpBytes);
             const auto main = sites.size();
             sites.push_back(std::move(site));
@@ -980,6 +1108,8 @@ void frameSegment(
             }
             ++report.Relocated;
             ++report.Framed;
+            if (!carried.empty()) ++report.RelocatedWithIntelSites;
+            report.CarriedSites.insert(report.CarriedSites.end(), carried.begin(), carried.end());
             report.RelocatedCases += pads.size();
             if (openJump) ++report.RelocatedOpenJumps;
             return nullptr;
@@ -1757,11 +1887,12 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     RedZoneFrameReport& report,
     std::vector<RedZoneDisplacement>& displacements,
     const std::vector<Domain::ProgramHeader>& loadSegments,
-    const std::map<std::uint64_t, std::uint64_t>& relativeAddends
+    const std::map<std::uint64_t, std::uint64_t>& relativeAddends,
+    const IAmd64OnlyInstructionMatcher* lowering
 ) {
     std::vector<TrampolineSite> sites;
     for (const auto& ph : codeSegments) {
-        frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, loadSegments, relativeAddends);
+        frameSegment(fileBytes, ph, functions, existing, sites, displacements, report, loadSegments, relativeAddends, lowering);
         measureUncovered(fileBytes, ph, functions, report);
     }
     return sites;

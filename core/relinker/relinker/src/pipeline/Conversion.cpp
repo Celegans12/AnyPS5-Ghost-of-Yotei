@@ -114,12 +114,13 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
             throw Domain::RelinkerException("Relinker patch exceeds source image", patch.Offset);
         for (std::size_t index = 0; index < patch.Bytes.size(); ++index) sourceBytes[patch.Offset + index] = patch.Bytes[index];
     }
-    const auto intelSites = trampolines.size();
+    auto intelSites = trampolines.size();
     std::vector<Codegen::RedZoneDisplacement> displacements;
     std::size_t redZoneSkipped = 0;
     if (options.FrameRedZone) {
         const auto headers = Relinker::ElfReader(sourceBytes).ReadProgramHeaders();
-        auto framing = Relinker::FrameRedZoneImage(sourceBytes, headers, result.DynamicSection.RelaData, trampolines, "Red-zone framing", [&](std::string_view text) { inputProgress.Message(text); });
+        auto framing = Relinker::FrameRedZoneImage(sourceBytes, headers, result.DynamicSection.RelaData, trampolines, "Red-zone framing", [&](std::string_view text) { inputProgress.Message(text); }, options.ToIntel ? std::optional(Codegen::Amd64OnlyTargetFor(options.ToRosetta, options.ToAvx)) : std::nullopt);
+        intelSites = framing.FirstSite;
         if (!framing.HasBounds) inputProgress.Message("Red-zone framing: the executable has no .eh_frame function bounds; all its functions come from splitting\n");
         displacements = std::move(framing.Displacements);
         redZoneSkipped = framing.Skipped;

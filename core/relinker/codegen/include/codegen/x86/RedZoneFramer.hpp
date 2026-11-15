@@ -11,6 +11,8 @@
 
 namespace Codegen {
 
+class IAmd64OnlyInstructionMatcher;
+
 struct RedZoneFunction {
     std::uint64_t Begin = 0;
     std::uint64_t End = 0;
@@ -36,6 +38,10 @@ struct RedZoneFrameReport {
     std::size_t RelocatedCases = 0;
     // Relocated leaves with an indirect jump of unknown target, which leaves the stub.
     std::size_t RelocatedOpenJumps = 0;
+    // Relocated leaves that carry Intel substitution sites, lowered inside the copy, and those
+    // sites, by index into the existing sites: they are dropped, as the original body is dead.
+    std::size_t RelocatedWithIntelSites = 0;
+    std::vector<std::size_t> CarriedSites;
     std::map<std::string, std::size_t> Skipped;
     // Frame-pointer functions that call and keep values below rsp before a call, framed like leaves.
     std::size_t FramedWithCalls = 0;
@@ -70,7 +76,10 @@ std::vector<TrampolineSite> FrameRedZoneFunctions(
     // Every loaded segment, to read the jump tables of switch statements from.
     const std::vector<Domain::ProgramHeader>& loadSegments = {},
     // The addends of R_X86_64_RELATIVE relocations by address: tables of absolute addresses.
-    const std::map<std::uint64_t, std::uint64_t>& relativeAddends = {}
+    const std::map<std::uint64_t, std::uint64_t>& relativeAddends = {},
+    // The Intel pass's lowering when existing holds its sites: a leaf relocated whole carries the
+    // sites inside it. Without it, a leaf over another stub is skipped.
+    const IAmd64OnlyInstructionMatcher* lowering = nullptr
 );
 
 }

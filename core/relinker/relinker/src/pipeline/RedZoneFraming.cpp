@@ -1,6 +1,7 @@
 #include <relinker/pipeline/RedZoneFraming.hpp>
 #include <relinker/analysis/UnusedNidFilter.hpp>
 #include <relinker/analysis/UnusedNidFilter/EhFrameReader.hpp>
+#include <codegen/x86/IAmd64OnlyInstructionMatcher.hpp>
 #include <algorithm>
 #include <cstring>
 #include <iterator>
@@ -9,7 +10,7 @@
 
 namespace Relinker {
 
-RedZoneFramingResult FrameRedZoneImage(std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<std::uint8_t>& relaData, std::vector<Codegen::TrampolineSite>& trampolines, const std::string& prefix, const std::function<void(std::string_view)>& message) {
+RedZoneFramingResult FrameRedZoneImage(std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<std::uint8_t>& relaData, std::vector<Codegen::TrampolineSite>& trampolines, const std::string& prefix, const std::function<void(std::string_view)>& message, const std::optional<Codegen::Amd64OnlyTarget> intel) {
     RedZoneFramingResult result;
     result.FirstSite = trampolines.size();
     std::vector<Domain::ProgramHeader> codeSegments;
@@ -39,7 +40,8 @@ RedZoneFramingResult FrameRedZoneImage(std::vector<std::uint8_t>& bytes, const s
         if ((info & 0xffffffffu) == 8) relativeAddends.emplace(offset, addend);
     }
     Codegen::RedZoneFrameReport report;
-    auto framed = Codegen::FrameRedZoneFunctions(bytes, codeSegments, functions, trampolines, report, result.Displacements, loadSegments, relativeAddends);
+    const auto lowering = intel ? Codegen::MakeAmd64OnlyInstructionMatcher(*intel) : nullptr;
+    auto framed = Codegen::FrameRedZoneFunctions(bytes, codeSegments, functions, trampolines, report, result.Displacements, loadSegments, relativeAddends, lowering.get());
     for (const auto& moved : result.Displacements) {
         if (moved.Offset > bytes.size() || moved.Bytes.size() > bytes.size() - moved.Offset)
             throw Domain::RelinkerException("Red-zone displacement exceeds source image", moved.Offset);
@@ -51,6 +53,7 @@ RedZoneFramingResult FrameRedZoneImage(std::vector<std::uint8_t>& bytes, const s
     if (report.FramedWithCalls != 0) { std::ostringstream text; text << prefix << ": " << report.FramedWithCalls << " frame-pointer functions that call keep values below RSP and are framed too\n"; say(text); }
     if (report.ReturnThunks != 0) { std::ostringstream text; text << prefix << ": " << report.ReturnThunks << " leaves return through a thunk, as their exits could not be patched\n"; say(text); }
     if (report.Relocated != 0) { std::ostringstream text; text << prefix << ": " << report.Relocated << " leaves relocated whole into a stub, as their frames could not be patched in place (" << report.RelocatedCases << " jump-table cases enter through a jump; " << report.RelocatedOpenJumps << " leaves have an indirect jump that leaves the stub)\n"; say(text); }
+    if (report.RelocatedWithIntelSites != 0) { std::ostringstream text; text << prefix << ": " << report.RelocatedWithIntelSites << " relocated leaves carry " << report.CarriedSites.size() << " Intel substitution sites, lowered inside the copy; those sites are dropped\n"; say(text); }
     if (report.WidenedPrologues != 0 || report.WidenedExits != 0) { std::ostringstream text; text << prefix << ": " << report.WidenedPrologues << " prologues widened over the instructions after them and " << report.WidenedExits << " exits over the instructions before them, as they were shorter than a jump (" << report.WidenedOperands << " rsp operands moved into their stubs)\n"; say(text); }
     if (report.UncoveredRanges != 0) {
         std::ostringstream text;
@@ -64,6 +67,10 @@ RedZoneFramingResult FrameRedZoneImage(std::vector<std::uint8_t>& bytes, const s
         result.Skipped += count;
         std::ostringstream text; text << prefix << ": skipped " << count << ": " << reason << '\n'; say(text);
     }
+    auto carried = report.CarriedSites;
+    std::sort(carried.begin(), carried.end());
+    for (auto index = carried.rbegin(); index != carried.rend(); ++index) trampolines.erase(trampolines.begin() + static_cast<std::ptrdiff_t>(*index));
+    result.FirstSite = trampolines.size();
     trampolines.insert(trampolines.end(), std::make_move_iterator(framed.begin()), std::make_move_iterator(framed.end()));
     return result;
 }

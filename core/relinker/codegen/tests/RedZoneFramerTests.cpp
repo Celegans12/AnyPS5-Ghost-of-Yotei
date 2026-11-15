@@ -1,3 +1,5 @@
+#include <codegen/IAmd64OnlyConverter.hpp>
+#include <codegen/x86/IAmd64OnlyInstructionMatcher.hpp>
 #include <codegen/x86/RedZoneFramer.hpp>
 #include <algorithm>
 #include <cstdint>
@@ -932,6 +934,82 @@ void skipsSitesTakenByOtherStubs() {
     require(sites.empty() && report.Skipped.at("overlaps another stub") == 1, "a site over another stub was framed");
 }
 
+void skipsOtherStubsWithTheIntelLowering() {
+    const auto input = image({leaf(StoreBelowPushes)});
+    Codegen::TrampolineSite other{};
+    other.Address = Base + 0x40;
+    other.Length = 5;
+    other.OriginalBytes.assign(input.bytes.begin() + 0x40, input.bytes.begin() + 0x45);
+    other.Body = {0xe9, 0, 0, 0, 0};
+    const auto lowering = Codegen::MakeAmd64OnlyInstructionMatcher();
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {other}, report, displacements, {}, {}, lowering.get());
+    require(sites.empty() && report.Skipped.at("overlaps another stub") == 1 && report.CarriedSites.empty(), "a stub without an AMD-only instruction was carried into a relocated leaf");
+}
+
+const std::vector<std::uint8_t> Vrcpps{0xc5, 0xf8, 0x53, 0xe4};
+const std::vector<std::uint8_t> MovdEaxXmm4{0xc5, 0xf9, 0x7e, 0xe0};
+const std::vector<std::uint8_t> AddBelowRsp{0x48, 0x03, 0x44, 0x24, 0xf0};
+
+bool contains(const std::vector<std::uint8_t>& bytes, const std::vector<std::uint8_t>& part) {
+    return std::search(bytes.begin(), bytes.end(), part.begin(), part.end()) != bytes.end();
+}
+
+void carriesAWidenedIntelSiteIntoARelocatedLeaf() {
+    std::vector<std::uint8_t> code = Vrcpps;
+    append(code, StoreBelowRsp);
+    append(code, MovdEaxXmm4);
+    append(code, AddBelowRsp);
+    code.push_back(0xc3);
+    const auto input = image({code});
+    const auto converted = Codegen::MakeAmd64OnlyConverter()->Convert(input.bytes, input.segments);
+    require(converted.Trampolines.size() == 1 && converted.Trampolines[0].Address == Base + 0x40 && converted.Trampolines[0].Length == Vrcpps.size() + StoreBelowRsp.size(), "the Intel pass did not widen vrcpps over the red-zone store");
+
+    Codegen::RedZoneFrameReport unlowered;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto skipped = Codegen::FrameRedZoneFunctions(converted.Bytes, input.segments, input.functions, converted.Trampolines, unlowered, displacements);
+    require(skipped.empty() && unlowered.Skipped.at("overlaps another stub") == 1, "a leaf over an Intel stub was framed without the lowering");
+
+    const auto lowering = Codegen::MakeAmd64OnlyInstructionMatcher();
+    Codegen::RedZoneFrameReport report;
+    const auto sites = Codegen::FrameRedZoneFunctions(converted.Bytes, input.segments, input.functions, converted.Trampolines, report, displacements, {}, {}, lowering.get());
+    require(report.RedZoneFunctions == 1 && report.Framed == 1 && report.Relocated == 1 && report.Skipped.empty(), "a leaf with a red-zone store widened into an Intel stub was not relocated");
+    require(report.RelocatedWithIntelSites == 1 && report.CarriedSites == std::vector<std::size_t>{0}, "the relocated leaf did not carry the Intel site");
+    require(sites.size() == 1 && sites[0].Address == Base + 0x40 && sites[0].Length == 5 && displacements.empty(), "the relocated leaf needs only its entry jump");
+    const auto& stub = sites[0].Body;
+    require(!contains(stub, Vrcpps), "the relocated copy kept vrcpps instead of lowering it");
+    require(contains(stub, {0x48, 0x89, 0x7c, 0x24, 0x70}) && contains(stub, {0x48, 0x03, 0x44, 0x24, 0x70}), "the red-zone operands did not move up by the shift in the copy");
+
+    Codegen::StubBodyBuilder alone;
+    lowering->EmitOutOfLine(alone, Vrcpps);
+    const auto expected = alone.Finish();
+    require(stub.size() > sites[0].ReturnBranchOffset + 5 || expected.Bytes.size() == expected.ReturnBranchOffset + 5, "the lowering's constants were not placed after the copy's jump back");
+    require(sites[0].ReturnBranchOffset == 5 + expected.ReturnBranchOffset + StoreBelowRsp.size() + MovdEaxXmm4.size() + AddBelowRsp.size() + 8 + 1, "the copy is not the lowering inline between the moved instructions");
+}
+
+void carriesAnIntelSiteOverAnRspOperand() {
+    std::vector<std::uint8_t> code{0xc5, 0xf8, 0x11, 0x64, 0x24, 0xe0};
+    const std::vector<std::uint8_t> msg1BelowRsp{0x0f, 0x38, 0xcc, 0x6c, 0x24, 0xe0};
+    append(code, msg1BelowRsp);
+    append(code, {0xc5, 0xf9, 0x7e, 0xe8, 0xc3});
+    const auto input = image({code});
+    const auto converted = Codegen::MakeAmd64OnlyConverter()->Convert(input.bytes, input.segments);
+    require(converted.Trampolines.size() == 1 && converted.Trampolines[0].Length == msg1BelowRsp.size(), "the Intel pass did not stub sha256msg1 alone");
+    const auto lowering = Codegen::MakeAmd64OnlyInstructionMatcher();
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(converted.Bytes, input.segments, input.functions, converted.Trampolines, report, displacements, {}, {}, lowering.get());
+    require(report.Relocated == 1 && report.CarriedSites == std::vector<std::size_t>{0} && report.Skipped.empty() && sites.size() == 1, "a leaf whose Intel site reads below rsp was not relocated with the site carried");
+    require(!contains(sites[0].Body, msg1BelowRsp), "the relocated copy kept sha256msg1 instead of lowering it");
+
+    Codegen::StubBodyBuilder moved;
+    lowering->EmitOutOfLine(moved, std::vector<std::uint8_t>{0x0f, 0x38, 0xcc, 0x6c, 0x24, 0x60});
+    const auto expected = moved.Finish();
+    require(sites[0].ReturnBranchOffset == 5 + 6 + expected.ReturnBranchOffset + 4 + 8 + 1, "the copy is not the lowering of the moved operand inline");
+    require(contains(sites[0].Body, {0xc5, 0xf8, 0x11, 0x64, 0x24, 0x60}), "the store below rsp did not move up by the shift in the copy");
+}
+
 void framesAPointerOnlyFunctionByItsOwnBounds() {
     const auto first = leaf(StoreBelowPushes);
     std::vector<std::uint8_t> secondBody = StoreBelowPushes;
@@ -1111,6 +1189,9 @@ int main() {
         leavesOtherFunctions();
         framesLeavesCallingTheirOwnHelper();
         skipsSitesTakenByOtherStubs();
+        skipsOtherStubsWithTheIntelLowering();
+        carriesAWidenedIntelSiteIntoARelocatedLeaf();
+        carriesAnIntelSiteOverAnRspOperand();
         framesLeafWithoutFramePointer();
         shiftsByTheDeepestOperandBelowRsp();
         movesPositiveOperandsThatFitAfterTheShift();
