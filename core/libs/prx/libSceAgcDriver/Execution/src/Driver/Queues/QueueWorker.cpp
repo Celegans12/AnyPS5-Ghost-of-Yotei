@@ -19,6 +19,28 @@ namespace {
 
 constexpr auto IdleResultsQuietPeriod = std::chrono::milliseconds(50);
 
+bool SubmitGroup() {
+    static const bool enabled = [] {
+        const char* text = std::getenv("APS5_SUBMIT_GROUP");
+        return text != nullptr && text[0] != '\0' && !(text[0] == '0' && text[1] == '\0');
+    }();
+    return enabled;
+}
+
+std::uint64_t SubmitGroupWork() {
+    static const std::uint64_t value = [] {
+        const char* text = std::getenv("APS5_SUBMIT_GROUP_WORK");
+        return text ? std::strtoull(text, nullptr, 10) : 64ull;
+    }();
+    return value;
+}
+
+std::atomic<std::uint64_t> submitsHeld{0}, heldSubmittedLast{0}, heldSubmittedDue{0}, heldSubmittedWork{0}, heldSubmittedElsewhere{0};
+
+std::chrono::steady_clock::time_point HeldSubmitSince(std::chrono::steady_clock::rep since) {
+    return std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(since));
+}
+
 }
 
 FrameTiming* Driver::frameTiming() {
@@ -79,9 +101,48 @@ void Driver::deferCompletion(const Submission& submission) {
     }, {});
 }
 
-void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress) {
+bool Driver::holdSubmit() {
+    if (!SubmitGroup() || !DrawPipeline::Active() || DrawPipeline::Queue0().Outstanding() <= 1) return false;
+    if (Graphics::Recorder::RecordedWorkSinceSubmit() >= SubmitGroupWork()) return false;
+    const auto now = std::chrono::steady_clock::now();
+    const auto pending = Graphics::Recorder::PendingLabelSince();
+    if (pending.has_value() && now - *pending >= labelFlushDeadline()) return false;
+    if (!heldSubmit.load(std::memory_order_acquire)) {
+        heldSince.store(now.time_since_epoch().count(), std::memory_order_release);
+        heldSubmit.store(true, std::memory_order_release);
+    } else if (now - HeldSubmitSince(heldSince.load(std::memory_order_acquire)) >= labelFlushDeadline()) {
+        return false;
+    }
+    submitsHeld.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void Driver::SubmitHeldWork(bool last) {
+    const bool work = !deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
+    if (!work) {
+        if (heldSubmit.exchange(false, std::memory_order_acq_rel)) heldSubmittedElsewhere.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const bool due = std::chrono::steady_clock::now() - HeldSubmitSince(heldSince.load(std::memory_order_acquire)) >= labelFlushDeadline();
+    const bool full = Graphics::Recorder::RecordedWorkSinceSubmit() >= SubmitGroupWork();
+    if (!last && !due && !full) return;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    const auto localDevice = device.Load();
+    recordDeferredLabels(localDevice.get(), 0);
+    if (localDevice != nullptr) localDevice->SubmitRecorded(true);
+    heldSubmit.store(false, std::memory_order_release);
+    (due ? heldSubmittedDue : full ? heldSubmittedWork : heldSubmittedLast).fetch_add(1, std::memory_order_relaxed);
+}
+
+Driver::SubmitGroupCounts Driver::SubmitGroupCounted() {
+    return SubmitGroupCounts{submitsHeld.load(std::memory_order_relaxed), heldSubmittedLast.load(std::memory_order_relaxed), heldSubmittedDue.load(std::memory_order_relaxed), heldSubmittedWork.load(std::memory_order_relaxed), heldSubmittedElsewhere.load(std::memory_order_relaxed)};
+}
+
+void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress, bool mayHold) {
     const bool work = !deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     if (!work && !progress) return;
+    if (mayHold && work && !progress && holdSubmit()) return;
     ++submissionCosts(0).endSubmits;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -89,6 +150,7 @@ void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress)
     if (work) {
         recordDeferredLabels(localDevice.get(), 0);
         if (localDevice != nullptr) localDevice->SubmitRecorded(true);
+        if (mayHold) heldSubmit.store(false, std::memory_order_release);
     }
     if (progress) progress->Publish(localDevice, localDevice ? localDevice->SubmittedEpoch() : 0);
 }
@@ -126,7 +188,7 @@ void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, st
         }
     } complete{*this, serial, received, labelWrites};
     if (flipWork != nullptr) finishFlipWork(flipWork, submitFlipWork(0));
-    else submitOpenWork(progress);
+    else submitOpenWork(progress, true);
 }
 
 const std::atomic<std::uint64_t>*& Driver::workerQueued() {

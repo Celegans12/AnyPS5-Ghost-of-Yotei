@@ -71,6 +71,12 @@ public:
     void SetAheadAdoptHook(void (*hook)());
     void CheckFailure();
     void ReportFailure(std::exception_ptr error);
+    static bool HoldsSubmit() { return heldSubmit.load(std::memory_order_acquire); }
+    void SubmitHeldWork(bool last);
+    struct SubmitGroupCounts {
+        std::uint64_t held, submittedLast, submittedDue, submittedWork, submittedElsewhere;
+    };
+    static SubmitGroupCounts SubmitGroupCounted();
     void Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip = false);
     void SubmitFlip(const FlipInfo& info);
     void SuspendPoint();
@@ -188,7 +194,10 @@ private:
     static void forgetUnfinishedWrites(QueueWorker& worker, std::span<const std::uint64_t> labelWrites);
     static bool& completionDeferred();
     void deferCompletion(const Submission& submission);
-    void submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress = {});
+    void submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress = {}, bool mayHold = false);
+    bool holdSubmit();
+    inline static std::atomic<bool> heldSubmit{false};
+    inline static std::atomic<std::chrono::steady_clock::rep> heldSince{0};
     void wakeQueueZeroForCompletions();
     void completeSubmission(std::uint64_t serial, std::uint64_t received, std::span<const std::uint64_t> labelWrites, const std::shared_ptr<SubmissionProgress>& progress, const std::shared_ptr<FlipWork>& flipWork);
     static bool waitFree(const Submission& submission);

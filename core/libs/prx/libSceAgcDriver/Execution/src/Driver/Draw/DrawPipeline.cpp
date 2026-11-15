@@ -1129,6 +1129,7 @@ void DrawPipeline::run() {
             if (VerifiesOrder() && !committed.Accept(order)) throw std::runtime_error("draw pipeline: the committer reached an item its thread queued before one already committed (APS5_VERIFY_PIPELINE_ORDER)");
             if (commit != nullptr) (*commit)();
             if (!isDraw) breakProofsAfter(kind, *writes);
+            if (Driver::HoldsSubmit()) Driver::Get().SubmitHeldWork(outstanding.load(std::memory_order_acquire) <= 1);
         } catch (const std::exception&) {
             failed = true;
             fatal = std::current_exception();
