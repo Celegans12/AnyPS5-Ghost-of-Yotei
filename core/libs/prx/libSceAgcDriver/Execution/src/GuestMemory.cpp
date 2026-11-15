@@ -2158,6 +2158,29 @@ struct WriteTracker {
         return true;
     }
 
+    void cpuWritten(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written) const {
+        const auto end = address + bytes;
+        const auto add = [&](std::uint64_t from, std::uint64_t to) {
+            from = std::max(from, address);
+            to = std::min(to, end);
+            if (from >= to) return;
+            if (!written.empty() && written.back().second >= from) written.back().second = std::max(written.back().second, to);
+            else written.emplace_back(from, to);
+        };
+        for (auto block = blockOf(address); block <= blockOf(end - 1u); ++block) {
+            const auto begin = blockBegin(block);
+            if (const auto found = cpuPages.find(block); found != cpuPages.end()) {
+                const auto from = std::max(address, begin) - begin;
+                const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin;
+                for (auto page = from / WritePageBytes; page <= (to - 1u) / WritePageBytes; ++page) {
+                    if (found->second.pages[page] > generation) add(begin + page * WritePageBytes, begin + (page + 1u) * WritePageBytes);
+                }
+            } else if (cpuStampOf(block) > generation) {
+                add(begin, begin + WriteBlockBytes);
+            }
+        }
+    }
+
     void stamp(std::uint64_t block, std::uint64_t stampGeneration, StampKind kind) {
         const bool cpu = kind == StampKind::Cpu || kind == StampKind::ImportWindow;
         const bool stored = kind != StampKind::ImportWindow;
@@ -4130,6 +4153,18 @@ bool CpuWroteSince(std::uint64_t address, std::size_t bytes, std::uint64_t gener
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker, TrackerLockSite::Unchanged, address, rangeStop(address, bytes));
     return tracker.watched && tracker.covers(address, bytes) && !tracker.cpuUnchanged(address, bytes, generation);
+}
+
+bool CpuWrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::uint64_t& collected) {
+    written.clear();
+    collected = 0;
+    if (generation == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || CollectWritesUncached(address, bytes) == 0) return false;
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker, TrackerLockSite::Unchanged, address, rangeStop(address, bytes));
+    if (!tracker.watched || !tracker.covers(address, bytes)) return false;
+    tracker.cpuWritten(address, bytes, generation, written);
+    collected = tracker.generation.load(std::memory_order_relaxed);
+    return true;
 }
 
 bool UnchangedSinceLastCollect(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
