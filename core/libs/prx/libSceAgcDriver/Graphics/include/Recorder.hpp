@@ -726,6 +726,10 @@ public:
         std::uint64_t refused, fenceQueries, late, early;
     };
     static SerialReapStatistics SerialReapCounts();
+    struct SubmitStatistics {
+        std::uint64_t submits, queueSubmitNs;
+    };
+    static SubmitStatistics SubmitCounts();
     // APS5_PROFILE_GPU=1: GPU time of recorded work by key (a guest program address), from timestamp
     // queries around each timed range; the totals per key are reported every 10 s. Begin returns the
     // range index to pass to End, or NoTiming when timing is off or the batch's queries are used up.

@@ -188,6 +188,7 @@ std::atomic<std::uint64_t> unlockedWaits{0}, unlockedWaitedUs{0};
 // vkQueueSubmit calls and their time (APS5_PROFILE_DRAW; Submit runs under the GpuMutex).
 std::uint64_t submitCount = 0;
 double submitUs = 0, submitMaxUs = 0;
+std::atomic<std::uint64_t> submitsDone{0}, queueSubmitNs{0};
 // Threads inside a timeline wait with the GpuMutex released (WaitSerial, syncThroughUnlocked): a
 // recorder's teardown, after its Sync() made every wait satisfiable, waits until they left the
 // semaphore before destroying it. Counted per recorder id (a small fixed array; the waiter cannot
@@ -4590,6 +4591,10 @@ bool Recorder::fenceSignaled(const Batch& batch) const {
     return fence;
 }
 
+Recorder::SubmitStatistics Recorder::SubmitCounts() {
+    return SubmitStatistics{submitsDone.load(std::memory_order_relaxed), queueSubmitNs.load(std::memory_order_relaxed)};
+}
+
 Recorder::SerialReapStatistics Recorder::SerialReapCounts() {
     return SerialReapStatistics{ReapBySerial(), serialRefusals.load(std::memory_order_relaxed), serialFenceQueries.load(std::memory_order_relaxed), serialLate.load(std::memory_order_relaxed), serialEarly.load(std::memory_order_relaxed)};
 }
@@ -5298,6 +5303,8 @@ void Recorder::Submit() {
     batch->submitted = true;
     batch->serial = ++submissions;
     batch->submittedAt = std::chrono::steady_clock::now();
+    submitsDone.fetch_add(1, std::memory_order_relaxed);
+    queueSubmitNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(batch->submittedAt - submitStart).count()), std::memory_order_relaxed);
     CaptureTrace::Log("submit-confirmed batch=%llu tokens=%s", static_cast<unsigned long long>(batch->serial), tokensStr.c_str());
     if (DrawProfiled()) {
         const auto us = std::chrono::duration<double, std::micro>(batch->submittedAt - submitStart).count();
