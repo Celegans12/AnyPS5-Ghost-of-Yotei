@@ -144,7 +144,7 @@ slower on FF and AoM, so only part of the FF and AoM change is real (see "Since 
 |---|---|---|---|---|---|
 | FF Resonance | in game, bench scene | 31 to 33 ms | **51 to 54 %** | CPU: worker 0 (97 % busy when last profiled, on `libs\c8`) | 4 step 4 (slot memo and table mirror validity; carries the walk and epoch target) |
 | LEGO | in game, bench scene | 47 to 49 ms | **34 to 36 %** | GPU: about 40 ms per frame, one compute program on top | 5 (translation) |
-| 007 | title screen and menus only; crashes after "continue" (device lost in the first cutscene, or a RenderThread read of 0x40), which predates phases 3 and 4 | 68 to 80 ms once warm; 75 to 100 ms in the first minute | **21 to 25 %** warm | CPU: about 48 ms of dispatch per frame on the main worker, plus the draw committer. GPU is 38 ms per present, of which 22 ms is storage write-back, upload and staging | 4 step 3 (staging); the surface exchange from pool reuse (storage-image sharing, parked); then 5. The crashes are open and set aside |
+| 007 | title screen and menus only; crashes after "continue" (device lost in the first cutscene, or a RenderThread read of 0x40), which predates phases 3 and 4 | 60 to 62 ms after the first minute (two runs on `libs\m4`; 68 to 80 before the shared staging shadows) | **27 to 28 %** | CPU: about 48 ms of dispatch per frame on the main worker, plus the draw committer. GPU is 38 ms per present, of which 22 ms is storage write-back, upload and staging | 4 step 3 (staging); the surface exchange from pool reuse (storage-image sharing, parked); then 5. The crashes are open and set aside |
 | AoM | title screen and the scene after the pad press | 142 to 148 ms | **11 to 12 %** | Title screen: CPU and GPU close. The worker spends about 165 ms per frame in packets (dispatch 95, draws 70) and the GPU 85 to 90 ms per present (profiled) | 5 and 6; phase 4 has little left for it (label stores are gone) |
 
 CPU and GPU cost per unit of work, in microseconds (one profiled scene per title on
@@ -399,6 +399,26 @@ buffer regions often span two mappings and no single import served them. Found a
 - f8e0ee64d4: eight `thread_local` caches of the direct path had destructors; the draw committer
   crashed in one at thread exit (`agc_driver_village_draw_cost` hung in 9 of 120 runs with
   section A off). They use `ThreadScratch` now; 150 of 150 runs pass.
+
+- Step 3, first half (2026-11-15, `libs\m4`, f04805da70): the staging copy-in is skipped while
+  the shadow still holds what the import holds. Three pieces, each measured on a profiled 007
+  scene (copy-ins skipped per 10 s, of about 6 GiB staged in):
+  - Skip inside a reused build (664335bba5): 75 MiB. Most copy-ins come from builds made anew
+    (about 4.5 GiB per 10 s), which had no shadow to compare.
+  - The generation is kept for uses inside a run, whose copy-back is recorded after the run:
+    475 MiB.
+  - One shadow per guest range and usage, shared by every build that stages the range while
+    one of them lives, carrying the generation: 11 GiB. More regions are staged than before
+    (sharing frees room under the shadow limit), so 6.3 GiB per 10 s is still copied in: 2.7 GiB
+    by new builds whose shadow was not left current, 3.5 GiB over ranges stamped since.
+  007 profiled: GPU time 2.5 to 2.7 s per 10 s (4.1 to 4.4 before), 133 to 135 presents per
+  10 s (104 to 110). 007 unprofiled, alternating, shared shadow off / on
+  (`APS5_NO_SHARED_STAGING_SHADOW=1`), frame p50 after the first minute: 74.0 / 61.9 and
+  73.9 / 59.9 ms. FF 33.4, LEGO 52.1, AoM 144.2 ms, one run each and each the first after the
+  build (cold); not compared back to back. Pictures complete on all four; tests 1,809 of 1,809
+  in both tracking modes. Switches: `APS5_NO_STAGING_COPY_IN_SKIP=1` (the step),
+  `APS5_NO_SHARED_STAGING_SHADOW=1` (the piece; goes when step 3 is complete). Not built yet:
+  the copy-back half.
 
 Build plan that follows from this, in order:
 
