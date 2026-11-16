@@ -169,7 +169,7 @@ struct DecoderSeat {
     std::uint64_t (*call)(void* target, const Core::DecodedOp& op) = nullptr;
     Core::DecoderRing ring;
     Core::Decoder decoder;
-    std::atomic<std::uint64_t> runs{0}, draws{0}, packets{0}, batches{0}, runNs{0}, enqueueNs{0}, heldKnown{0}, heldUnknown{0}, heldDecoded{0};
+    std::atomic<std::uint64_t> runs{0}, draws{0}, packets{0}, batches{0}, runNs{0}, enqueueNs{0}, heldKnown{0}, heldUnknown{0}, heldDecoded{0}, shapesKept{0}, statesKept{0};
     struct Held {
         bool unknown = true;
         std::vector<DrawFinisher::Range> writes;
@@ -199,6 +199,17 @@ bool decoderEnabled() {
 
 constexpr std::uint32_t DecoderBatchDraws = 12;
 
+bool decoderKeepsState(std::uint32_t header, std::uint32_t opcode) {
+    switch (opcode) {
+        case 0x3c: case 0x93: case 0x42: case 0x46: case 0x49: case 0x58: return true;
+        case 0x10: {
+            const auto operation = (header >> 2u) & 0x3fu;
+            return operation == 0 || operation == 0x0b || operation == 0x0c;
+        }
+        default: return false;
+    }
+}
+
 void decoderReport() {
     static std::atomic<std::int64_t> lastReport{0};
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -209,7 +220,7 @@ void decoderReport() {
     const auto decoded = seat.decoder.Counted();
     const auto ring = seat.ring.Counted();
     const auto draws = seat.draws.load(std::memory_order_relaxed);
-    std::fprintf(stderr, "[decoder] run (cumulative): %llu runs, %llu packets decoded, %llu draws posted in %llu batches; %.2f us per draw in the runs, %.2f us of them handing batches to the draw finisher; snapshots: shader %llu, context %llu, user configuration %llu; %llu waits for a snapshot, %llu for room in the ring; batches queued with their target ranges %llu, without %llu, %llu draw shapes decoded for their ranges%c", value(seat.runs), value(seat.packets), value(seat.draws), value(seat.batches), draws != 0 ? static_cast<double>(seat.runNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(draws) : 0.0, draws != 0 ? static_cast<double>(seat.enqueueNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(draws) : 0.0, static_cast<unsigned long long>(decoded.shaderSnapshots), static_cast<unsigned long long>(decoded.contextSnapshots), static_cast<unsigned long long>(decoded.userConfigSnapshots), static_cast<unsigned long long>(decoded.snapshotWaits), static_cast<unsigned long long>(ring.roomWaits), value(seat.heldKnown), value(seat.heldUnknown), value(seat.heldDecoded), 10);
+    std::fprintf(stderr, "[decoder] run (cumulative): %llu runs, %llu packets decoded, %llu draws posted in %llu batches; %.2f us per draw in the runs, %.2f us of them handing batches to the draw finisher; snapshots: shader %llu, context %llu, user configuration %llu; %llu waits for a snapshot, %llu for room in the ring; batches queued with their target ranges %llu, without %llu, %llu draw shapes decoded for their ranges, %llu draws kept the shape of the draw before, %llu runs kept the register state of the run before%c", value(seat.runs), value(seat.packets), value(seat.draws), value(seat.batches), draws != 0 ? static_cast<double>(seat.runNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(draws) : 0.0, draws != 0 ? static_cast<double>(seat.enqueueNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(draws) : 0.0, static_cast<unsigned long long>(decoded.shaderSnapshots), static_cast<unsigned long long>(decoded.contextSnapshots), static_cast<unsigned long long>(decoded.userConfigSnapshots), static_cast<unsigned long long>(decoded.snapshotWaits), static_cast<unsigned long long>(ring.roomWaits), value(seat.heldKnown), value(seat.heldUnknown), value(seat.heldDecoded), value(seat.shapesKept), value(seat.statesKept), 10);
 }
 
 void laneReport() {
@@ -464,6 +475,9 @@ void Driver::execute(Submission& submission) {
     };
     static const bool decoderOn = decoderEnabled();
     std::shared_ptr<Submission> decoderCopy;
+    bool decoderStale = true;
+    bool decoderShaped = false;
+    std::uint64_t decoderShape = 0;
     const auto decoderRun = [&](std::size_t& cursor, std::size_t end) {
         std::size_t at = cursor;
         while (at < end && Pm4::FillerPacket(submission.commands[at])) ++at;
@@ -478,11 +492,21 @@ void Driver::execute(Submission& submission) {
         bool batchUnknown = false;
         std::uint64_t batchShape = 0;
         std::vector<DrawFinisher::Range> batchWrites;
-        const auto heldOf = [&](std::uint64_t& shape) -> const DecoderSeat::Held& {
+        const auto heldOf = [&](std::uint64_t& shape, std::uint32_t runBits) -> const DecoderSeat::Held& {
             static const DecoderSeat::Held unknown;
+            if (decoderShaped && (runBits & (Core::RunMask::State | Core::RunMask::Other)) == 0) {
+                if (const auto kept = seat.held.find(decoderShape); kept != seat.held.end()) {
+                    shape = decoderShape;
+                    laneBump(seat.shapesKept);
+                    return kept->second;
+                }
+            }
+            decoderShaped = false;
             const auto localDevice = device.Load();
             if (localDevice == nullptr) return unknown;
             drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shape);
+            decoderShape = shape;
+            decoderShaped = true;
             if (const auto found = seat.held.find(shape); found != seat.held.end()) return found->second;
             if (seat.held.size() >= 8192) seat.held.clear();
             DecoderSeat::Held fresh;
@@ -566,7 +590,7 @@ void Driver::execute(Submission& submission) {
             drawnSinceSeal() = true;
             Graphics::Recorder::CountRecordedWork();
             std::uint64_t shape = 0;
-            const auto& heldDraw = heldOf(shape);
+            const auto& heldDraw = heldOf(shape, op.state.runBits);
             if (heldDraw.unknown != batchUnknown && pending != 0) closeBatch();
             batchUnknown = heldDraw.unknown;
             if (!heldDraw.unknown && (pending == 0 || shape != batchShape)) {
@@ -587,8 +611,14 @@ void Driver::execute(Submission& submission) {
             std::shared_lock deviceUse(deviceReplacement);
             GuestMemory::SetCurrentPacket((submission.commands[at] >> 8u) & 0xffu, submission.queue);
             flushBetweenPackets(submission.queue, submission.commands[at], false);
-            Pm4::RefreshDigests(queue);
-            seat.decoder.Touch(Core::DecoderEvery);
+            if (decoderStale) {
+                Pm4::RefreshDigests(queue);
+                seat.decoder.Touch(Core::DecoderEvery);
+                decoderShaped = false;
+                decoderStale = false;
+            } else {
+                laneBump(seat.statesKept);
+            }
             seat.target = const_cast<void*>(static_cast<const void*>(&postDraw));
             seat.call = [](void* target, const Core::DecodedOp& op) { return (*static_cast<decltype(postDraw)*>(target))(op); };
             Core::Decoder::Input input;
@@ -642,6 +672,7 @@ void Driver::execute(Submission& submission) {
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
         if (decoderShadow != nullptr) decoderShadow->Step(submission.commands, cursor, submission.registerLists, queue, false);
+        if (decoderOn && !decoderKeepsState(header, opcode)) decoderStale = true;
         if (opcode != 0x10 || (((header >> 2u) & 0x3fu) != 0 && ((header >> 2u) & 0x3fu) != 0x0b && ((header >> 2u) & 0x3fu) != 0x0c)) queue.runMask.Packet(opcode);
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
