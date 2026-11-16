@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
@@ -334,7 +335,7 @@ void NoteReplay(ReplayDraw* draw, const ReplayDraw& targets, bool fallback, bool
     }
     if (nowMs - last < 5000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto front = Front::Counted();
-    std::fprintf(stderr, "%s%c", meter.TakeReport(front.draws, front.committed, proof.TokensLive(), static_cast<double>(nowMs - last) / 1000.0).c_str(), 10);
+    AgcDriver::ProfilePrint_nid_no_patch("%s%c", meter.TakeReport(front.draws, front.committed, proof.TokensLive(), static_cast<double>(nowMs - last) / 1000.0).c_str(), 10);
 }
 
 BackMode BackModeNow() {
@@ -402,8 +403,12 @@ void ReportBack() {
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = lastReport.load(std::memory_order_relaxed);
     if (nowMs - last < 5000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
-    if (Graphics::CoreRunStats()) std::fprintf(stderr, "%s%c", BackReport().c_str(), 10);
-    if (replay) std::fprintf(stderr, "%s%c", BackReplayReport().c_str(), 10);
+    if (Graphics::CoreRunStats()) {
+        AgcDriver::ProfilePrint_nid_no_patch("%s%c", BackReport().c_str(), 10);
+        const auto starts = Graphics::CoreRunStartsCounted();
+        AgcDriver::ProfilePrint_nid_no_patch("[core-run-starts] (cumulative) runs of core draws begun after an ordinary draw: %llu in the pass of the draw before, %llu in a new pass; after another committer item: %llu in the same pass, %llu in a new pass; after a move of the proof stamp alone: %llu in the same pass, %llu in a new pass%c", static_cast<unsigned long long>(starts[0]), static_cast<unsigned long long>(starts[1]), static_cast<unsigned long long>(starts[2]), static_cast<unsigned long long>(starts[3]), static_cast<unsigned long long>(starts[4]), static_cast<unsigned long long>(starts[5]), 10);
+    }
+    if (replay) AgcDriver::ProfilePrint_nid_no_patch("%s%c", BackReplayReport().c_str(), 10);
 }
 
 std::span<const Graphics::CompiledShader> PrepareBack(CoreDraw& record) {

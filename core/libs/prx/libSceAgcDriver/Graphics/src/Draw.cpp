@@ -1624,7 +1624,7 @@ InputTokenArm& inputTokenArm() {
 }
 
 bool InputTokenCache() {
-    static const bool enabled = std::getenv("APS5_INPUT_TOKEN_CACHE") != nullptr;
+    static const bool enabled = std::getenv("APS5_NO_INPUT_TOKEN_CACHE") == nullptr;
     return enabled;
 }
 
@@ -2084,7 +2084,7 @@ void reportInputCosts() {
     if (nowMs - last < 5000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto at = [](InputCost kind) { return static_cast<unsigned long long>(inputCosts()[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed)); };
     const auto each = [&](InputCost total, InputCost count) { return at(count) == 0 ? 0.0 : static_cast<double>(at(total)) / static_cast<double>(at(count)); };
-    std::fprintf(stderr, "[draw-input-cost] (cumulative) %llu copied inputs, %llu bytes, %llu of them indices; reused unchanged %llu (%llu bytes, %.0f ns each); copied anew %llu (%llu bytes, %.0f ns each): first view of the range %llu (%llu bytes), range seen before and changed %llu (%llu bytes), unwatched %llu (%llu bytes); time per input: flush %.0f ns, collect %.0f ns, lookup %.0f ns, allocation %.0f ns per new copy, read %.0f ns per new copy; new copies by size: up to 1 KiB %llu (%llu bytes), up to 16 KiB %llu (%llu bytes), up to 256 KiB %llu (%llu bytes), larger %llu (%llu bytes)%c",
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-input-cost] (cumulative) %llu copied inputs, %llu bytes, %llu of them indices; reused unchanged %llu (%llu bytes, %.0f ns each); copied anew %llu (%llu bytes, %.0f ns each): first view of the range %llu (%llu bytes), range seen before and changed %llu (%llu bytes), unwatched %llu (%llu bytes); time per input: flush %.0f ns, collect %.0f ns, lookup %.0f ns, allocation %.0f ns per new copy, read %.0f ns per new copy; new copies by size: up to 1 KiB %llu (%llu bytes), up to 16 KiB %llu (%llu bytes), up to 256 KiB %llu (%llu bytes), larger %llu (%llu bytes)%c",
         at(InputCost::Calls), at(InputCost::Bytes), at(InputCost::Indices), at(InputCost::Reused), at(InputCost::ReusedBytes), each(InputCost::ReusedNanoseconds, InputCost::Reused), at(InputCost::Fresh), at(InputCost::FreshBytes), each(InputCost::FreshNanoseconds, InputCost::Fresh), at(InputCost::New), at(InputCost::NewBytes), at(InputCost::Rewritten), at(InputCost::RewrittenBytes), at(InputCost::Untracked), at(InputCost::UntrackedBytes),
         each(InputCost::FlushNanoseconds, InputCost::Calls), each(InputCost::CollectNanoseconds, InputCost::Calls), each(InputCost::LookupNanoseconds, InputCost::Calls), each(InputCost::AllocateNanoseconds, InputCost::Fresh), each(InputCost::ReadNanoseconds, InputCost::Fresh),
         at(InputCost::Small), at(InputCost::SmallBytes), at(InputCost::Medium), at(InputCost::MediumBytes), at(InputCost::Large), at(InputCost::LargeBytes), at(InputCost::Huge), at(InputCost::HugeBytes), 10);
@@ -2656,6 +2656,18 @@ struct CoreCommit {
 enum class CoreBackCount : std::size_t { Draws, Continued, Proofs, Verified, Mismatches, Misses, Inputs, InputsHeld, InputsInPlace, Bindings, Notes, Marks, Count };
 
 enum class CoreReplayCount : std::size_t { Replayed, Captured, Unstorable, Verified, Mismatches, KeptOnce, Lean, Recaptured, Refreshed, Count };
+
+enum class RunStart : std::size_t { AfterDrawPassKept, AfterDrawPassBegun, AfterItemPassKept, AfterItemPassBegun, StampPassKept, StampPassBegun, Count };
+
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RunStart::Count)>& runStarts() {
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(RunStart::Count)> held{};
+    return held;
+}
+
+std::uint32_t& ordinaryDrawsSinceCore() {
+    static std::uint32_t count = 0;
+    return count;
+}
 
 enum class LeanRefusal : std::size_t { Shape, Run, Targets, Depth, Template, Proof, Stores, Summary, Pass, Objects, Moved, Inputs, Count };
 
@@ -5964,6 +5976,7 @@ void drawTessellationGeometry(const Context& context, const State& state, const 
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::shared_ptr<const DrawRecipe>* recipeOut, const DrawTraceContext* trace, std::uint64_t shape) {
     const DepthCopySourceScope depthCopySource(state.depthCopySource);
     PassState::Break();
+    ++ordinaryDrawsSinceCore();
     if (state.stages.tessellationGeometry) {
         drawTessellationGeometry(context, state, draw, shaders, snapshots, trace);
         return;
@@ -6347,12 +6360,17 @@ DrawRecipeOutcome drawRecipe(const Context& context, const State& state, const P
     const bool verifyState = PassState::Verifies() || (core != nullptr && core->verify);
     auto* run = passState ? &drawRunState() : nullptr;
     bool runCurrent = false;
+    auto runStart = RunStart::Count;
     if (passState) {
         PassState::CountDraw();
         if (drawSiteStats()) reportPassState();
         const auto gate = PassState::Gate();
         const auto stamp = DrawProofStamp::Now();
         runCurrent = run->begun && run->gate == gate && run->device == context.device && run->stamp == stamp;
+        if (core != nullptr) {
+            if (!runCurrent && run->begun) runStart = run->gate == gate && run->device == context.device ? RunStart::StampPassKept : ordinaryDrawsSinceCore() != 0 ? RunStart::AfterDrawPassKept : RunStart::AfterItemPassKept;
+            ordinaryDrawsSinceCore() = 0;
+        }
         if (!runCurrent) {
             if (run->begun) PassState::Count(run->gate != gate || run->device != context.device ? PassState::Refusal::Gate : PassState::Refusal::Stamp);
             PassState::CountRun();
@@ -6522,6 +6540,7 @@ DrawRecipeOutcome drawRecipe(const Context& context, const State& state, const P
     record.depthLocations = passDepthLocations(context, state, *record.pipeline);
     const auto keptBefore = recorder->OpenKeptObjects();
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, trace);
+    if (runStart != RunStart::Count) runStarts()[static_cast<std::size_t>(runStart) + (outcome.passContinued ? 0u : 1u)].fetch_add(1, std::memory_order_relaxed);
     vectors.targets = std::move(record.targets);
     vectors.slices = std::move(record.targetSlices);
     if (verifyRefresh) {
@@ -6882,6 +6901,12 @@ std::array<std::uint64_t, 12> CoreReplayLeanRefusals() {
 std::array<std::uint64_t, 9> CoreReplayCounted() {
     std::array<std::uint64_t, 9> counts{};
     for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = coreReplayCounters()[index].load(std::memory_order_relaxed);
+    return counts;
+}
+
+std::array<std::uint64_t, 6> CoreRunStartsCounted() {
+    std::array<std::uint64_t, 6> counts{};
+    for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = runStarts()[index].load(std::memory_order_relaxed);
     return counts;
 }
 

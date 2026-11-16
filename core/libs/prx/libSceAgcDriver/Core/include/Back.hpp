@@ -15,6 +15,7 @@ namespace AgcDriver::Graphics {
 
 DrawRecipeOutcome DrawCoreWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, bool verify);
 std::array<std::uint64_t, 12> CoreBackCounted();
+std::array<std::uint64_t, 6> CoreRunStartsCounted();
 struct CoreReplay;
 DrawRecipeOutcome DrawCoreReplayed(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const std::shared_ptr<const DrawRecipe>& recipe, bool verify, CoreReplay& replay, bool inputsCurrent, bool verifyReplay, std::uint64_t identity);
 CoreReplay* NewCoreReplay();
