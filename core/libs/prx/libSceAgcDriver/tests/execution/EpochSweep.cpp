@@ -250,6 +250,51 @@ void ColdBlocksLeaveTheSweep(std::uint64_t base) {
     Require(GuestMemory::StillCurrent(address, Page, token), "a token over a cold block nothing wrote did not hold once the block was observed again");
 }
 
+void PartlyWatchedBlockKeepsItsMemo(std::uint64_t base) {
+    const auto block = base + 30 * Block;
+    constexpr std::uint64_t Ranges = 13;
+    GuestMemory::Unwatch(block + 15 * Page, Page);
+    if (GuestMemory::Watched(block, Block) || !GuestMemory::Watched(block, 15 * Page)) {
+        std::cout << "epoch sweep tests: the partly watched block case was skipped, one page could not leave the write watch\n";
+        return;
+    }
+    const auto askAll = [&] {
+        for (std::uint64_t index = 0; index < Ranges; ++index) {
+            Require(GuestMemory::CollectWrites(block + index * Page, Page) != 0, "a collect inside a partly watched block failed");
+            Require(GuestMemory::CollectWrites(block + index * Page, 2 * Page) != 0, "a collect of two pages inside a partly watched block failed");
+        }
+    };
+    GuestMemory::BumpCollectEpoch();
+    askAll();
+    const auto walks = osWalks.load();
+    askAll();
+    Require(osWalks.load() == walks, "ranges of a partly watched block were walked again in the epoch that had observed them");
+    Require(GuestMemory::CollectWrites(block + 14 * Page, 2 * Page) == 0, "a range that reaches an unwatched page was collected");
+    const auto generation = GuestMemory::CollectWrites(block + 3 * Page, Page);
+    const auto token = GuestMemory::TokenFor(block + 3 * Page, Page);
+    Require(token.content != 0 && GuestMemory::StillCurrent(block + 3 * Page, Page, token), "a range of a partly watched block observed in the epoch got no token");
+    Store(block + 3 * Page + 21);
+    GuestMemory::BumpCollectEpoch();
+    Require(!GuestMemory::StillCurrent(block + 3 * Page, Page, token), "a token over a partly watched block held in an epoch that had not observed it");
+    const auto before = osWalks.load();
+    Require(GuestMemory::CollectWrites(block + 3 * Page, Page) != 0 && osWalks.load() > before, "a range of a partly watched block was not walked in the next epoch");
+    Require(!GuestMemory::UnchangedSince(block + 3 * Page, Page, generation), "a store into a partly watched block made before the epoch advance was not reported");
+    Require(!GuestMemory::StillCurrent(block + 3 * Page, Page, token), "a token held across a store into a partly watched block");
+    std::thread([&] { Store(block + 5 * Page + 2); }).join();
+    bool unchanged = true;
+    GuestMemory::BumpCollectEpoch();
+    const auto epoch = GuestMemory::HeldCollectEpoch();
+    Require(GuestMemory::CollectWrites(block + 5 * Page, Page) != 0, "a collect inside a partly watched block failed");
+    std::thread([&] {
+        GuestMemory::MarkProofThread();
+        GuestMemory::AdoptCollectEpoch(epoch);
+        const auto walked = osWalks.load();
+        const bool collected = GuestMemory::CollectWrites(block + 5 * Page, Page) != 0;
+        unchanged = !collected || osWalks.load() != walked || GuestMemory::UnchangedSince(block + 5 * Page, Page, generation);
+    }).join();
+    Require(!unchanged, "another thread of the epoch did not get the answer of the walk that observed a partly watched range, or missed its store");
+}
+
 void UnwatchedRangeHoldsNoToken(std::uint64_t base) {
     const auto address = base + 28 * Block;
     GuestMemory::BumpCollectEpoch();
@@ -304,6 +349,7 @@ int main(int argc, char** argv) {
             HookTakesTheSweepOver(base);
             ColdBlocksLeaveTheSweep(base);
             UnwatchedRangeHoldsNoToken(base);
+            PartlyWatchedBlockKeepsItsMemo(base);
             CountsAddUp();
         }
         std::cout << "epoch sweep tests passed\n";

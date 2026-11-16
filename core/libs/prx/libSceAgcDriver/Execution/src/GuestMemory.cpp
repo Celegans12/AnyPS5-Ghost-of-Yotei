@@ -383,6 +383,7 @@ void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
 }
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
+std::atomic<std::uint64_t> exactMemoHits{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> collectWalkedEpochs{0};
 std::atomic<std::uint64_t> committerWatchCalls{0};
@@ -1816,6 +1817,49 @@ struct WriteTracker {
     };
     std::array<ExactObservation, 16> exactObservations{};
     std::size_t nextExactObservation = 0;
+    struct ExactSlot {
+        std::atomic<std::uint64_t> version{0};
+        std::atomic<std::uint64_t> key{0};
+        std::atomic<std::uint64_t> tick{0};
+    };
+    static constexpr std::size_t ExactSlots = std::size_t{1} << 16;
+    std::unique_ptr<ExactSlot[]> exactSlots;
+    std::atomic<const ExactSlot*> exactTable{nullptr};
+
+    static bool exactKey(std::uint64_t first, std::uint64_t stop, std::uint64_t& key) {
+        if (stop <= first || ((first | stop) & 4095u) != 0 || (first >> 48u) != 0) return false;
+        const auto pages = (stop - first) >> 12u;
+        if (pages >= (std::uint64_t{1} << 28u)) return false;
+        key = (first >> 12u) | (pages << 36u);
+        return true;
+    }
+
+    static std::size_t exactIndex(std::uint64_t key) {
+        return static_cast<std::size_t>((key * 0x9E3779B97F4A7C15ull) >> 48u);
+    }
+
+    void publishExact(std::uint64_t first, std::uint64_t stop, std::uint64_t tick) {
+        std::uint64_t key = 0;
+        if (exactSlots == nullptr || !exactKey(first, stop, key)) return;
+        auto& slot = exactSlots[exactIndex(key)];
+        const auto version = slot.version.load();
+        slot.version.store(version + 1);
+        slot.key.store(key);
+        slot.tick.store(tick);
+        slot.version.store(version + 2);
+    }
+
+    bool exactObservedSince(std::uint64_t first, std::uint64_t stop, std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t mapping) const {
+        const auto* table = exactTable.load(std::memory_order_acquire);
+        std::uint64_t key = 0;
+        if (table == nullptr || observationUnwatched.load(std::memory_order_acquire) != unwatched || observationMapping.load(std::memory_order_acquire) != mapping || !exactKey(first, stop, key)) return false;
+        const auto need = std::max(epoch, observationFloor.load(std::memory_order_acquire));
+        const auto& slot = table[exactIndex(key)];
+        const auto version = slot.version.load();
+        if ((version & 1u) != 0) return false;
+        const bool observed = slot.key.load() == key && slot.tick.load() >= need;
+        return observed && slot.version.load() == version;
+    }
     std::array<std::uint64_t, 8> walkedEpochs{};
     std::size_t nextWalkedEpoch = 0;
 
@@ -1845,6 +1889,8 @@ struct WriteTracker {
         observationLeafCount = leafCount;
         observationLeaves = std::make_unique<std::atomic<ObservationLeaf*>[]>(observationLeafCount);
         observationTable.store(observationLeaves.get(), std::memory_order_release);
+        exactSlots = std::make_unique<ExactSlot[]>(ExactSlots);
+        exactTable.store(exactSlots.get(), std::memory_order_release);
         ready.store(true, std::memory_order_release);
     }
 
@@ -2735,6 +2781,32 @@ bool walkObserved(WriteTracker& tracker, TrackerLock& lock, std::uint64_t first,
     return walkWrites(tracker, first, stop, StampKind::Cpu);
 }
 
+bool exactlyAnswered(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t first, std::uint64_t stop, std::uint64_t epoch, std::uint64_t unwatched, std::uint64_t mapping) {
+#ifdef _WIN32
+    if (!EpochSweeps() || !tracker.exactObservedSince(first, stop, epoch, unwatched, mapping)) return false;
+    const auto covered = tracker.coveredUnlocked(address, bytes);
+    if (!covered || !*covered) return false;
+    exactMemoHits.fetch_add(1, std::memory_order_relaxed);
+    return true;
+#else
+    static_cast<void>(tracker);
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    static_cast<void>(first);
+    static_cast<void>(stop);
+    static_cast<void>(epoch);
+    static_cast<void>(unwatched);
+    static_cast<void>(mapping);
+    return false;
+#endif
+}
+
+bool observedInEpoch(const WriteTracker& tracker, std::uint64_t address, std::size_t bytes, std::uint64_t first, std::uint64_t stop, std::uint64_t epoch) {
+    const auto unwatched = unwatchSerial.load(std::memory_order_acquire);
+    const auto mapping = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    return tracker.observedSince(first, stop, epoch, unwatched, mapping) || exactlyAnswered(tracker, address, bytes, first, stop, epoch, unwatched, mapping);
+}
+
 Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     using Status = Observation::Status;
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return {Status::Uncovered, 0};
@@ -2747,7 +2819,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     const ObserveCost observed;
     const auto epoch = currentCollectEpoch();
     const bool shared = memoized && collectMemoEnabled() && HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() != 0;
-    if (shared && tracker.observedSince(first, stop, epoch, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix())) {
+    if (shared && observedInEpoch(tracker, address, bytes, first, stop, epoch)) {
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
         observed.Memo();
         const auto settled = tracker.stable.load(std::memory_order_acquire);
@@ -2830,7 +2902,10 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
         const auto end = tracker.blockOf(runs[index].stop);
         if (end > from) tracker.publishObserved(from, end - 1, tick);
     }
-    if (shared && EpochSweeps()) tracker.markAsked(first, stop, askedSerial());
+    if (shared && EpochSweeps()) {
+        tracker.markAsked(first, stop, askedSerial());
+        if (status == Status::Complete) tracker.publishExact(first, stop, std::max(epoch, tracker.observationFloor.load(std::memory_order_relaxed)));
+    }
     if (status != Status::Complete) return {status, 0};
     return {Status::Complete, generation};
 }
@@ -3224,6 +3299,10 @@ void ReportCollectCosts() {
                                              since(counts.missed[static_cast<std::size_t>(TokenMiss::Busy)], reported.missed[static_cast<std::size_t>(TokenMiss::Busy)]), since(counts.verified, reported.verified), since(counts.late, reported.late));
         reported = counts;
         reportedTicks = sweepTicks;
+        static std::uint64_t reportedExact = 0;
+        const auto exactHits = exactMemoHits.load(std::memory_order_relaxed);
+        AgcDriver::ProfilePrint_nid_no_patch("[exact-memo] (10 s): %llu questions over partly watched blocks answered without the tracker lock\n", static_cast<unsigned long long>(exactHits - reportedExact));
+        reportedExact = exactHits;
         if (tokenBreaksCounted()) {
             auto& breaks = tokenBreaks();
             const auto taken = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
@@ -3473,7 +3552,7 @@ std::optional<TokenMiss> readContent(std::uint64_t first, std::uint64_t stop, st
         generation = tracker.generation.load();
     }
     tracker.markAsked(first, stop, askedSerial());
-    if (!tracker.observedSince(first, stop, epoch, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix())) return TokenMiss::Unobserved;
+    if (!observedInEpoch(tracker, first, static_cast<std::size_t>(stop - first), first, stop, epoch)) return TokenMiss::Unobserved;
     content = contentSum(first, stop);
     if (tracker.generation.load() != generation) return TokenMiss::Busy;
     return std::nullopt;
