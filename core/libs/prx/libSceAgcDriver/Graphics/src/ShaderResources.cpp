@@ -5038,6 +5038,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
             for (const auto& region : directRegions) regions.push_back({region.begin, region.end, nullptr, nullptr, false});
             for (const auto& [begin, end] : guestMemory.Writes()) regions.push_back({begin, end, nullptr, nullptr, false});
             StorageTexture::ScanPending(regions);
+            const GuestBufferMemory::StagedFlushScope staged(guestMemory);
             // A region over a unit shadow's fresh results (a retile bumped the serial) is
             // published by the flush, as one over a pending image is stored.
             for (const auto& region : regions) {
