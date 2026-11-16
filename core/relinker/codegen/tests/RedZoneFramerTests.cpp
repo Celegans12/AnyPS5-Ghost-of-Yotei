@@ -1,4 +1,5 @@
 #include <codegen/x86/RedZoneFramer.hpp>
+#include <algorithm>
 #include <cstdint>
 #include <iostream>
 #include <stdexcept>
@@ -253,7 +254,7 @@ void stubsVexOperandsAtRsp() {
     require(sites[2].OriginalBytes == VexStoreAtRsp && sites[2].Body == stubBody({0xc5, 0xf8, 0x11, 0x44, 0x24, 0x10}), "the VEX store at rsp was not re-encoded with an 8-bit displacement moved by the shift");
 }
 
-void stubsOperandsAtRspWithTheInstructionsBeforeThem() {
+void stubsOperandsAtRspOverARipRelativeInstruction() {
     std::vector<std::uint8_t> body = StoreBelowRsp;
     append(body, LoadAtRsp);
     append(body, LoadRipRelative);
@@ -261,10 +262,12 @@ void stubsOperandsAtRspWithTheInstructionsBeforeThem() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(report.Framed == 1 && report.MovedOperands == 0 && report.OperandStubs == 1 && report.StubbedOperands == 2 && sites.size() == 3 && displacements.empty(), "a leaf whose short operand at rsp sits before a rip-relative instruction was not framed with a stub over the instruction before it");
-    const auto store = Base + 0x40 + FramelessPrologue.size();
-    require(sites[2].Address == store && sites[2].Length == StoreBelowRsp.size() + LoadAtRsp.size(), "the stub site does not start at the store before the operand at rsp");
-    require(sites[2].Body == stubBody({0x48, 0x89, 0x7c, 0x24, 0x00, 0x48, 0x8b, 0x44, 0x24, 0x10}), "the store before the operand and the operand at rsp were not both moved by the shift");
+    require(report.Framed == 1 && report.MovedOperands == 1 && report.OperandStubs == 1 && report.StubbedOperands == 1 && sites.size() == 3 && displacements.size() == 1, "a leaf whose short operand at rsp sits before a rip-relative instruction was not framed with a stub over that instruction");
+    const auto load = 0x40 + FramelessPrologue.size() + StoreBelowRsp.size();
+    require(sites[2].Address == Base + load && sites[2].Length == LoadAtRsp.size() + LoadRipRelative.size(), "the stub site does not run on over the rip-relative instruction");
+    require(sites[2].Body == stubBody({0x48, 0x8b, 0x44, 0x24, 0x10, 0x48, 0x8b, 0x05, 0x00, 0x00, 0x00, 0x00}), "the operand at rsp was not moved by the shift ahead of the copied rip-relative load");
+    const auto& relocations = sites[2].Relocations;
+    require(relocations.size() == 1 && relocations[0].DisplacementOffset == 8 && relocations[0].InstructionEnd == 12 && relocations[0].SiteTarget == static_cast<std::int64_t>(LoadAtRsp.size() + LoadRipRelative.size()) && !relocations[0].AddressSize32, "the copied rip-relative load does not carry a relocation to the address it read at its site");
 }
 
 void skipsLeavesWithOperandsThatCannotMove() {
@@ -275,16 +278,15 @@ void skipsLeavesWithOperandsThatCannotMove() {
     std::vector<std::uint8_t> beforeTarget = StoreBelowRsp;
     append(beforeTarget, LoadAtRsp);
     append(beforeTarget, {0xff, 0xc0, 0x3b, 0x44, 0x24, 0xf0, 0x72, 0xf8});
-    std::vector<std::uint8_t> afterShortPrologue = LoadRipRelative;
+    std::vector<std::uint8_t> afterShortPrologue{0xeb, 0x00};
     append(afterShortPrologue, StoreBelowRsp);
     const auto input = image({framelessLeaf(FramelessPrologue, evex, FramelessExit), framelessLeaf(FramelessPrologue, beforeExit, FramelessExit), framelessLeaf(FramelessPrologue, beforeTarget, FramelessExit), framelessLeaf({0x41, 0x56, 0x41, 0x57}, afterShortPrologue, {0x41, 0x5f, 0x41, 0x5e, 0xc3})});
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 4, "a leaf whose rsp operands can neither move nor be stubbed, or whose prologue is too short, was framed");
-    require(report.Skipped.at("rsp operand that cannot move with rsp") == 1, "an EVEX operand, whose 8-bit displacement is scaled, was not refused");
-    require(report.Skipped.at("rsp operand that cannot move and has no room for a stub") == 2, "an operand at rsp followed by an exit or a branch target was not refused for want of room");
-    require(report.Skipped.at("prologue shorter than a jump") == 1, "the leaf whose short prologue is followed by a rip-relative instruction was not reported with its reason");
+    require(sites.size() == 3 && displacements.empty() && report.RedZoneFunctions == 4 && report.Relocated == 3, "a leaf whose rsp operands can neither move nor be stubbed in place, or whose prologue is too short, was not relocated whole");
+    require(std::all_of(sites.begin(), sites.end(), [](const Codegen::TrampolineSite& site) { return site.Length == 5 && site.JoinBack == 0; }), "a relocated leaf was given more than its entry jump");
+    require(report.Skipped.at("EVEX rsp operand with a scaled displacement") == 1 && report.Skipped.size() == 1, "an EVEX operand, whose 8-bit displacement is scaled, was not refused");
 }
 
 const std::vector<std::uint8_t> PushRbx{0x53};
@@ -322,15 +324,13 @@ void widensAShortFramePointerPrologue() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(report.Framed == 1 && report.FramedWithoutFramePointer == 0 && report.WidenedPrologues == 1 && report.WidenedExits == 1 && report.WidenedOperands == 0 && sites.size() == 2 && displacements.empty(), "a frame-pointer leaf without other pushes was not framed by widening its 4-byte prologue and 2-byte exit");
+    const auto pop = 0x40 + framePrologue.size() + body.size();
+    require(report.Framed == 1 && report.FramedWithoutFramePointer == 0 && report.WidenedPrologues == 1 && report.WidenedExits == 0 && report.LeaveExits == 1 && report.WidenedOperands == 0 && sites.size() == 1, "a frame-pointer leaf without other pushes was not framed by widening its 4-byte prologue and leaving through `leave`");
+    require(displacements.size() == 1 && displacements[0].Offset == pop && displacements[0].Bytes == std::vector<std::uint8_t>{0xc9}, "the leaf's `pop rbp` was not rewritten to `leave`");
     std::vector<std::uint8_t> entryBody = framePrologue;
     append(entryBody, {0x48, 0x8d, 0x64, 0x24, 0x80});
     append(entryBody, StoreBelowPushes);
     require(sites[0].OriginalBytes.size() == framePrologue.size() + StoreBelowPushes.size() && sites[0].Body == stubBody(entryBody), "the store through rbp was not copied unchanged after rsp is lowered by the whole red zone");
-    std::vector<std::uint8_t> exitBody = LoadBelowPushes;
-    append(exitBody, {0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00});
-    append(exitBody, popRbpExit);
-    require(sites[1].OriginalBytes.size() == LoadBelowPushes.size() + popRbpExit.size() && sites[1].Body == stubBody(exitBody), "the load through rbp was not copied unchanged ahead of raising rsp and popping rbp");
 }
 
 void framesLeavesWithoutPushes() {
@@ -355,7 +355,43 @@ void skipsFragmentsThatPopWithoutPushing() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(sites.empty() && displacements.empty() && report.Skipped.at("push or pop in a leaf without pushes") == 1, "a fragment without pushes that pops a register its caller pushed was framed");
+    require(sites.size() == 1 && sites[0].Length == 5 && displacements.empty() && report.Relocated == 1 && report.Skipped.empty(), "a fragment without pushes that pops a register its caller pushed was framed in place, not relocated whole");
+}
+
+void framesLeavesEnteredByATailJump() {
+    std::vector<std::uint8_t> body = StoreBelowRsp;
+    append(body, LoadBelowRsp);
+    const auto input = image({framelessLeaf({}, body, Ret), {0xe9, 0xdb, 0xff, 0xff, 0xff}});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.Framed == 1 && report.WidenedPrologues == 1 && sites.size() == 2 && sites[0].Address == Base + 0x40, "a leaf whose widened prologue another function jumps to was not framed");
+}
+
+void framesLeavesReadingAh() {
+    std::vector<std::uint8_t> body = StoreBelowRsp;
+    append(body, {0x0f, 0xb6, 0xcc, 0x88, 0x66, 0x01});
+    append(body, LoadBelowRsp);
+    const auto input = image({framelessLeaf({}, body, Ret)});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.Framed == 1 && report.Skipped.empty(), "a leaf reading AH was refused as using rsp");
+}
+
+void ignoresFramePointerLeavesInsideTheirAllocation() {
+    const std::vector<std::uint8_t> prologue{0x55, 0x48, 0x89, 0xe5, 0x53, 0x48, 0x83, 0xec, 0x10};
+    const std::vector<std::uint8_t> body{0x89, 0x7d, 0xec, 0x8b, 0x45, 0xec, 0x85, 0xc0, 0x75, 0x0b};
+    const std::vector<std::uint8_t> tailCall{0x48, 0x83, 0xc4, 0x10, 0x5b, 0x5d, 0xe9, 0x00, 0x01, 0x00, 0x00};
+    const std::vector<std::uint8_t> exit{0x48, 0x83, 0xc4, 0x10, 0x5b, 0x5d, 0xc3};
+    std::vector<std::uint8_t> inside = body;
+    append(inside, tailCall);
+    std::vector<std::uint8_t> early{0x89, 0x7d, 0xec, 0x48, 0x83, 0xc4, 0x10, 0x8b, 0x45, 0xec, 0x48, 0x83, 0xec, 0x10};
+    const auto input = image({framelessLeaf(prologue, inside, exit), framelessLeaf(prologue, early, exit)});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.RedZoneFunctions == 1, "a frame-pointer leaf whose slots lie in its allocation was counted as using the red zone, or one freeing it early was not");
 }
 
 void skipsWideningOverBranchTargets() {
@@ -367,9 +403,8 @@ void skipsWideningOverBranchTargets() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 2, "a leaf with a branch into a widened site was framed");
-    require(report.Skipped.at("branch to the start of a widened prologue") == 1, "a leaf without pushes whose loop branches back to its first instruction was not refused");
-    require(report.Skipped.at("branch into the instructions before a short exit") == 1, "a short exit that a branch reaches past the add before it was not refused");
+    require(report.RedZoneFunctions == 2 && report.Framed == 2 && report.Relocated == 1 && report.Skipped.empty() && sites.size() == 2 && sites[0].Address == Base + 0x40 && sites[0].Length == 5, "a leaf with a branch into a widened site was framed with an exit stub, or a loop to its start was not relocated whole");
+    require(report.ReturnThunks == 1 && report.Exits == 0 && sites[1].Address == Base + 0x60, "a short exit that a branch reaches past the add before it was not framed as a return thunk");
 }
 
 void skipsBranchesIntoTheInstructionsAfterAShortPrologue() {
@@ -380,8 +415,7 @@ void skipsBranchesIntoTheInstructionsAfterAShortPrologue() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 1, "a leaf whose loop branches to the store the widened prologue borrows was framed");
-    require(report.Skipped.at("branch into the instructions after a short prologue") == 1, "a loop to the instruction after a 1-byte push was not refused with its reason");
+    require(sites.size() == 1 && sites[0].Length == 5 && displacements.empty() && report.RedZoneFunctions == 1 && report.Relocated == 1 && report.Skipped.empty(), "a leaf whose loop branches to the store the widened prologue borrows was framed in place, not relocated whole");
 }
 
 void widensAShortPrologueThatAllocates() {
@@ -453,12 +487,11 @@ void framesFramePointerLeavesThatPushInTheirBody() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(report.Framed == 1 && report.FramedWithoutFramePointer == 0 && report.WidenedPrologues == 1 && report.WidenedExits == 1 && report.WidenedOperands == 0 && sites.size() == 2 && displacements.empty() && report.Skipped.empty(), "a frame-pointer leaf that pushes and pops rbx in its body was not framed");
+    require(report.Framed == 1 && report.FramedWithoutFramePointer == 0 && report.WidenedPrologues == 1 && report.WidenedExits == 0 && report.LeaveExits == 1 && report.WidenedOperands == 0 && sites.size() == 1 && displacements.size() == 1 && displacements[0].Bytes == std::vector<std::uint8_t>{0xc9} && report.Skipped.empty(), "a frame-pointer leaf that pushes and pops rbx in its body was not framed with a `leave` exit");
     std::vector<std::uint8_t> entryBody = framePrologue;
     append(entryBody, {0x48, 0x8d, 0x64, 0x24, 0x80});
     append(entryBody, StoreBelowPushes);
     require(sites[0].Body == stubBody(entryBody), "the store through rbp was not copied unchanged after rsp is lowered by the whole red zone");
-    require(sites[1].Body == stubBody({0x48, 0x01, 0xd0, 0x48, 0x8d, 0xa4, 0x24, 0x80, 0x00, 0x00, 0x00, 0x5d, 0xc3}), "the add before pop rbp was not copied ahead of raising rsp");
 }
 
 void skipsOpcodeEncodedRspUses() {
@@ -482,8 +515,8 @@ void skipsOpcodeEncodedRspUses() {
         Codegen::RedZoneFrameReport report;
         std::vector<Codegen::RedZoneDisplacement> displacements;
         const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-        require(sites.empty() && displacements.empty() && report.Skipped.at("other use of rsp") == 1,
-                "an opcode-encoded rsp use was framed");
+        require(sites.empty() && displacements.empty() && report.Relocated == 0 && report.Skipped.size() == 1,
+                "an opcode-encoded rsp use starting " + std::to_string(use[0]) + " " + std::to_string(use[1]) + " was framed" + (report.Skipped.empty() ? std::string() : ": " + report.Skipped.begin()->first));
     }
 }
 
@@ -510,7 +543,7 @@ void skipsLeavesThatCopyRsp() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(sites.empty() && displacements.empty() && report.Skipped.at("other use of rsp") == 2, "a leaf that copies rsp into another register was framed");
+    require(sites.empty() && displacements.empty() && report.Skipped.at("other use of rsp in a relocated leaf") == 2, "a leaf that copies rsp into another register was framed");
 }
 
 void tellsPopsWithoutRexFromXop() {
@@ -524,8 +557,8 @@ void tellsPopsWithoutRexFromXop() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(pops.bytes, pops.segments, pops.functions, {}, report, displacements);
-    require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 3, "a pop without REX to an rsp operand or into rsp, read as an XOP prefix, was framed");
-    require(report.Skipped.at("other use of rsp") == 3, "a pop without REX to an rsp operand or into rsp was not reported as another use of rsp");
+    require(sites.size() == 1 && sites[0].Address == pops.functions[0].Begin && displacements.empty() && report.RedZoneFunctions == 3 && report.Relocated == 1, "a pop without REX to an rsp operand or into rsp, read as an XOP prefix, was framed in place, or a pop into rsp was relocated");
+    require(report.Skipped.at("push or pop of rsp in a relocated leaf") == 2, "a pop without REX into rsp was not reported as a pop of rsp");
 
     std::vector<std::uint8_t> xopAtR12 = StoreBelowRsp;
     append(xopAtR12, {0x8f, 0xc8, 0x78, 0xc0, 0x04, 0x24, 0x01});
@@ -625,7 +658,7 @@ void skipsShortOperandsAtRspWhoseWidenedStubCoversABranchTarget() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 1 && report.Skipped.at("rsp operand that cannot move and has no room for a stub") == 1, "a cmp at rsp whose loop branches back to it was framed with a stub that starts at the add before it");
+    require(sites.size() == 1 && sites[0].Address == Base + 0x40 && sites[0].Length == 5 && displacements.empty() && report.RedZoneFunctions == 1 && report.Relocated == 1 && report.Skipped.empty(), "a cmp at rsp whose loop branches back to it was framed with a stub that starts at the add before it, not relocated whole");
 }
 
 void framesLeavesThatAllocateBelowTheirPushes() {
@@ -680,9 +713,7 @@ void skipsAllocatingLeavesWithoutAMatchingFree() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 3, "an allocating leaf without a matching free, or with more rsp arithmetic, was framed");
-    require(report.Skipped.at("exit does not free the prologue's allocation") == 1, "an exit that does not free the allocation was not reported with its own reason");
-    require(report.Skipped.at("other use of rsp") == 2, "an add of another size before the pops, or more rsp arithmetic in the body, was not reported as another use of rsp");
+    require(sites.size() == 3 && displacements.empty() && report.RedZoneFunctions == 3 && report.Relocated == 3 && report.Skipped.empty(), "an allocating leaf without a matching free, or with more rsp arithmetic, was not relocated whole");
 }
 
 void skipsLeavesWithoutFramePointerThatPushOrPop() {
@@ -708,9 +739,9 @@ void skipsLeavesWithoutFramePointerThatPushOrPop() {
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(report.RedZoneFunctions == functions.size() && report.FramedWithoutFramePointer == 0 && displacements.empty(), "a leaf without a frame pointer that pushes or pops between its prologue and its exits was framed, so its rsp operands after a push were moved past the pushed slot");
-    require(report.Skipped.at("push or pop inside the body") == moves.size(), "a leaf without a frame pointer that pushes or pops between its prologue and its exits was not reported with its reason");
-    require(report.Framed == 1 && sites.size() == 2, "a leaf with a frame pointer, whose rsp operands are refused anyway, was not framed because it pushes and pops");
+    require(report.RedZoneFunctions == functions.size() && report.FramedWithoutFramePointer == 2 && report.ReturnThunks == 2, "a leaf without a frame pointer that pushes or pops in its body was not retried as a thunk, or one touching the pushed slot was framed");
+    require(report.Relocated == moves.size() - 3 && report.Skipped.size() == 1 && report.Skipped.at("16-bit push or pop in a relocated leaf") == 1, "a leaf without a frame pointer that touches its pushed slot was not relocated whole, or a 16-bit push was");
+    require(report.Framed == 3 + report.Relocated, "a leaf with a frame pointer, whose rsp operands are refused anyway, was not framed because it pushes and pops");
 }
 
 Image calledThenUncalled(const std::vector<std::uint8_t>& called, const std::vector<std::uint8_t>& uncalled) {
@@ -741,17 +772,29 @@ void framesEachFunctionFromItsOwnFde() {
 }
 
 void treatsATailCallPastTheFdeEndAsLeaving() {
-    std::vector<std::uint8_t> called = FramelessPrologue;
-    append(called, StoreBelowRsp);
-    append(called, {0x85, 0xff, 0x75, 0x06});
-    append(called, FramelessExit);
-    append(called, {0x41, 0x5f, 0x41, 0x5e, 0x5b, 0xe9, 0x02, 0x00, 0x00, 0x00});
-    const auto input = calledThenUncalled(called, framelessLeaf(FramelessPrologue, StoreBelowRsp, FramelessExit));
+    const auto tailCalling = [](const std::int32_t past) {
+        std::vector<std::uint8_t> called = FramelessPrologue;
+        append(called, StoreBelowRsp);
+        append(called, {0x85, 0xff, 0x75, 0x06});
+        append(called, FramelessExit);
+        append(called, {0x41, 0x5f, 0x41, 0x5e, 0x5b, 0xe9});
+        const auto disp = static_cast<std::uint32_t>(0x60 + past - static_cast<std::int32_t>(0x40 + called.size() + 4));
+        for (int index = 0; index < 4; ++index) called.push_back(static_cast<std::uint8_t>(disp >> (index * 8)));
+        return calledThenUncalled(called, framelessLeaf(FramelessPrologue, StoreBelowRsp, FramelessExit));
+    };
+    const auto tail = tailCalling(0);
+    Codegen::RedZoneFrameReport tailReport;
+    std::vector<Codegen::RedZoneDisplacement> tailDisplacements;
+    const auto tailSites = Codegen::FrameRedZoneFunctions(tail.bytes, tail.segments, tail.functions, {}, tailReport, tailDisplacements);
+    require(tailReport.Framed == 2 && tailReport.Exits == 3 && tailReport.Skipped.empty(), "a leaf whose pops end in a tail call to another function's start was not framed with that tail call as an exit");
+    const auto exitSite = std::find_if(tailSites.begin(), tailSites.end(), [](const Codegen::TrampolineSite& site) { return site.OriginalBytes.size() >= 5 && site.OriginalBytes[site.OriginalBytes.size() - 5] == 0xe9; });
+    require(exitSite != tailSites.end() && exitSite->Relocations.size() == 1 && exitSite->Relocations[0].SiteTarget + static_cast<std::int64_t>(exitSite->Address - Base) == 0x60, "the tail call's stub does not jump to the next function's start");
+
+    const auto input = tailCalling(static_cast<std::int32_t>(FramelessPrologue.size()));
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(report.Skipped.at("branch leaves the function") == 1, "the tail call past the FDE end was not reported as leaving the function");
-    require(report.Framed == 1 && sites.size() == 2 && sites[0].Address == Base + 0x60, "the tail-called function was not framed from its own FDE start");
+    require(report.Framed == 2 && report.Relocated == 2 && report.Skipped.empty() && sites.size() == 2 && sites[0].Address == Base + 0x40 && sites[1].Address == Base + 0x60 && sites[1].Length == 5 && displacements.empty(), "a jump into the middle of another function did not relocate both whole, the second from its own FDE start");
 }
 
 void framesALeafAfterAJumpWithoutInt3FromItsOwnFde() {
@@ -802,15 +845,50 @@ void keepsLoopsAlignedAfterAJump() {
 }
 
 void leavesOtherFunctions() {
-    std::vector<std::uint8_t> nonLeaf = Prologue;
-    append(nonLeaf, StoreBelowPushes);
-    append(nonLeaf, {0xff, 0xd0});
-    append(nonLeaf, Exit);
-    const auto input = image({leaf(LoadAbovePushes), nonLeaf});
+    std::vector<std::uint8_t> afterCall = Prologue;
+    append(afterCall, {0xff, 0xd0});
+    append(afterCall, StoreBelowPushes);
+    append(afterCall, Exit);
+    const auto input = image({leaf(LoadAbovePushes), afterCall});
     Codegen::RedZoneFrameReport report;
     std::vector<Codegen::RedZoneDisplacement> displacements;
     const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-    require(sites.empty() && report.RedZoneFunctions == 0, "a leaf without red-zone use or a function that calls was framed");
+    require(sites.empty() && report.RedZoneFunctions == 0, "a leaf without red-zone use, or a function using the red zone only after a call, was framed");
+    std::vector<std::uint8_t> beforeCall = Prologue;
+    append(beforeCall, StoreBelowPushes);
+    append(beforeCall, LoadBelowPushes);
+    append(beforeCall, {0xff, 0xd0});
+    append(beforeCall, Exit);
+    const auto framed = image({beforeCall});
+    Codegen::RedZoneFrameReport framedReport;
+    std::vector<Codegen::RedZoneDisplacement> framedDisplacements;
+    const auto framedSites = Codegen::FrameRedZoneFunctions(framed.bytes, framed.segments, framed.functions, {}, framedReport, framedDisplacements);
+    require(framedReport.RedZoneFunctions == 1 && framedReport.Framed == 1 && framedReport.FramedWithCalls == 1 && !framedSites.empty(), "a frame-pointer function using the red zone before its first call was not framed");
+    std::vector<std::uint8_t> leaBeforeCall = Prologue;
+    append(leaBeforeCall, {0x48, 0x8d, 0x45, 0xe0, 0xff, 0xd0});
+    append(leaBeforeCall, Exit);
+    const auto addressed = image({leaBeforeCall});
+    Codegen::RedZoneFrameReport addressedReport;
+    std::vector<Codegen::RedZoneDisplacement> addressedDisplacements;
+    const auto addressedSites = Codegen::FrameRedZoneFunctions(addressed.bytes, addressed.segments, addressed.functions, {}, addressedReport, addressedDisplacements);
+    require(addressedSites.empty() && addressedReport.RedZoneFunctions == 0, "a function taking an address below its frame before a call was framed");
+}
+
+void framesLeavesCallingTheirOwnHelper() {
+    std::vector<std::uint8_t> function = FramelessPrologue;
+    append(function, StoreBelowRsp);
+    const auto call = function.size();
+    const auto helper = call + 5 + LoadBelowRsp.size() + FramelessExit.size();
+    append(function, callTo(call, helper));
+    append(function, LoadBelowRsp);
+    append(function, FramelessExit);
+    append(function, {0x48, 0x01, 0xd0, 0xc3});
+    const auto input = image({function});
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
+    require(report.Framed == 1 && report.FramedWithCalls == 0 && report.Exits == 1 && sites.size() == 2, "a leaf calling its own helper was not framed with one exit");
+    require(sites[1].Address + sites[1].Length == Base + 0x40 + helper, "the leaf's exit is not the ret before its helper");
 }
 
 void skipsSitesTakenByOtherStubs() {
@@ -927,7 +1005,7 @@ void skipsModRmAndVectorRspOperands() {
         Codegen::RedZoneFrameReport report;
         std::vector<Codegen::RedZoneDisplacement> displacements;
         const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {}, report, displacements);
-        require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 2 && report.Framed == 0 && report.Skipped.at("other use of rsp") == 2,
+        require(sites.empty() && displacements.empty() && report.RedZoneFunctions == 2 && report.Framed == 0 && (report.Skipped.contains("other use of rsp") ? report.Skipped.at("other use of rsp") : 0) + (report.Skipped.contains("other use of rsp in a relocated leaf") ? report.Skipped.at("other use of rsp in a relocated leaf") : 0) == 2,
                 "direct rsp operand case " + std::to_string(index) + " was framed");
     }
 }
@@ -965,10 +1043,39 @@ void framesModRmAndVectorNonStackOperands() {
 
 }
 
+void splitsCodeOutsideFunctionBounds() {
+    std::vector<std::uint8_t> bytes = padTo({0xc3}, 0x10);
+    append(bytes, callTo(0x10, 0x30));
+    append(bytes, callTo(0x15, 0x3e));
+    bytes.push_back(0xc3);
+    bytes = padTo(bytes, 0x20);
+    append(bytes, {0x0f, 0x1f, 0x44, 0x00, 0x00, 0x66, 0x90});
+    bytes = padTo(bytes, 0x30);
+    append(bytes, {0x48, 0x89, 0x7c, 0x24, 0xf8, 0x0f, 0x1f, 0x00, 0x48, 0x8b, 0x44, 0x24, 0xf8, 0xc3});
+    append(bytes, {0x31, 0xc0, 0xc3});
+    bytes = padTo(bytes, 0x50);
+    const std::vector<Domain::ProgramHeader> segments{{1, 5, 0, Base, Base, bytes.size(), bytes.size(), 16}};
+    const auto pieces = Codegen::SplitUncoveredCode(bytes, segments, {{Base, Base + 1}});
+    require(pieces.size() == 3, "code outside function bounds split into " + std::to_string(pieces.size()) + " functions, not 3");
+    require(pieces[0].Begin == Base + 0x10 && pieces[0].End == Base + 0x1b, "the caller outside function bounds was not split at its int3 padding");
+    require(pieces[1].Begin == Base + 0x30 && pieces[1].End == Base + 0x3e, "a function with a nop inside was split at the nop, or nop padding made a function");
+    require(pieces[2].Begin == Base + 0x3e && pieces[2].End == Base + 0x41, "a call target right after a ret was not split off");
+    bytes.resize(0x50);
+    append(bytes, {0x85, 0xc0, 0x74, 0x01, 0xc3, 0x31, 0xc0, 0xc3, 0x8b, 0x07, 0x85, 0xc0, 0xc3});
+    bytes = padTo(bytes, 0x70);
+    const std::vector<Domain::ProgramHeader> longer{{1, 5, 0, Base, Base, bytes.size(), bytes.size(), 16}};
+    const auto split = Codegen::SplitUncoveredCode(bytes, longer, {{Base, Base + 1}});
+    require(split.size() == 5, "code after a ret split into " + std::to_string(split.size() - 3) + " functions, not 2");
+    require(split[3].Begin == Base + 0x50 && split[3].End == Base + 0x58, "a cold block after a ret was split off its function");
+    require(split[4].Begin == Base + 0x58 && split[4].End == Base + 0x5d, "code no branch reaches after a ret did not start a function");
+}
+
 int main() {
     try {
+        splitsCodeOutsideFunctionBounds();
         framesRedZoneLeaf();
         leavesOtherFunctions();
+        framesLeavesCallingTheirOwnHelper();
         skipsSitesTakenByOtherStubs();
         framesLeafWithoutFramePointer();
         shiftsByTheDeepestOperandBelowRsp();
@@ -982,7 +1089,7 @@ int main() {
         stubsOperandsWhoseDisplacementOverflows();
         stubsOperandsAtRspWithTheInstructionsAfterThem();
         stubsVexOperandsAtRsp();
-        stubsOperandsAtRspWithTheInstructionsBeforeThem();
+        stubsOperandsAtRspOverARipRelativeInstruction();
         stubsShortOperandsAtRspBeforeABranchWithTheInstructionsBeforeThem();
         skipsShortOperandsAtRspWhoseWidenedStubCoversABranchTarget();
         skipsLeavesWithOperandsThatCannotMove();
@@ -990,6 +1097,9 @@ int main() {
         widensAShortFramePointerPrologue();
         framesLeavesWithoutPushes();
         skipsFragmentsThatPopWithoutPushing();
+        framesLeavesEnteredByATailJump();
+        framesLeavesReadingAh();
+        ignoresFramePointerLeavesInsideTheirAllocation();
         skipsWideningOverBranchTargets();
         skipsBranchesIntoTheInstructionsAfterAShortPrologue();
         widensAShortPrologueThatAllocates();

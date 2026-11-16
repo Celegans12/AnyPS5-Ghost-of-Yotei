@@ -3,6 +3,7 @@
 
 #ifdef _WIN32
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/RedZoneGate.hpp"
 #include <windows.h>
 #include <algorithm>
 #include <array>
@@ -295,6 +296,7 @@ public:
     }
 
     bool Arm(std::uintptr_t block) {
+        if (!RedZoneGate::Open()) return false;
         auto& entry = at(block);
         const auto word = entry.word.load(std::memory_order_acquire);
         const auto state = stateOf(word);
@@ -668,6 +670,7 @@ private:
     WindowsPageTrack() {
         verifying = set("APS5_VERIFY_PAGE_TRACK", std::getenv("APS5_VERIFY_PAGE_TRACK"));
         enabled = set("APS5_PAGE_TRACK", std::getenv("APS5_PAGE_TRACK")) || verifying;
+        if (enabled && !RedZoneGate::Open()) enabled = verifying = false;
         armImports = set("APS5_ARM_READ_IMPORTS", std::getenv("APS5_ARM_READ_IMPORTS")) && enabled;
         expireGpuMarks = !set("APS5_NO_GPU_WRITE_MARK_EXPIRY", std::getenv("APS5_NO_GPU_WRITE_MARK_EXPIRY")) && armImports;
         if (enabled) chunks = std::make_unique<std::atomic<Block*>[]>(Chunks);

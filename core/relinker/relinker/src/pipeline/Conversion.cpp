@@ -19,10 +19,12 @@
 #include <relinker/guest/GuestImage.hpp>
 #include <codegen/IAmd64OnlyConverter.hpp>
 #include <codegen/x86/RedZoneFramer.hpp>
+#include <relinker/pipeline/RedZoneFraming.hpp>
 #include <relinker/analysis/UnusedNidFilter/EhFrameReader.hpp>
 #include <map>
 #include <codegen/CodegenException.hpp>
 #include <algorithm>
+#include <cstring>
 #include <filesystem>
 #include <memory>
 #include <string>
@@ -114,24 +116,15 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
     }
     const auto intelSites = trampolines.size();
     std::vector<Codegen::RedZoneDisplacement> displacements;
+    bool redZoneComplete = false;
+    std::size_t redZoneLeft = 0;
     if (options.FrameRedZone) {
         const auto headers = Relinker::ElfReader(sourceBytes).ReadProgramHeaders();
-        std::vector<Domain::ProgramHeader> codeSegments;
-        for (const auto& header : headers) if (header.Type == 1 && (header.Flags & 1) != 0) codeSegments.push_back(header);
-        std::vector<Codegen::RedZoneFunction> functions;
-        for (const auto& region : Relinker::UnusedNidFilter::ReadExceptionFunctions(sourceBytes, headers, {}, {})) functions.push_back({region.Begin, region.End});
-        if (functions.empty()) throw Domain::RelinkerException("Red-zone framing needs function bounds from the executable's .eh_frame, and it has none");
-        Codegen::RedZoneFrameReport report;
-        auto framed = Codegen::FrameRedZoneFunctions(sourceBytes, codeSegments, functions, trampolines, report, displacements);
-        for (const auto& moved : displacements) {
-            if (moved.Offset > sourceBytes.size() || moved.Bytes.size() > sourceBytes.size() - moved.Offset)
-                throw Domain::RelinkerException("Red-zone displacement exceeds source image", moved.Offset);
-            std::copy(moved.Bytes.begin(), moved.Bytes.end(), sourceBytes.begin() + static_cast<std::ptrdiff_t>(moved.Offset));
-        }
-        { std::ostringstream message; message << "Red-zone framing: " << report.Functions << " functions, " << report.RedZoneFunctions << " leaf functions keep values below RSP, " << report.Framed << " framed (" << report.FramedWithoutFramePointer << " without a frame pointer, " << report.MovedOperands << " rsp operands moved, " << report.StubbedOperands << " in " << report.OperandStubs << " operand stubs; " << report.Exits << " exits)\n"; inputProgress.Message(message.str()); }
-        if (report.WidenedPrologues != 0 || report.WidenedExits != 0) { std::ostringstream message; message << "Red-zone framing: " << report.WidenedPrologues << " prologues widened over the instructions after them and " << report.WidenedExits << " exits over the instructions before them, as they were shorter than a jump (" << report.WidenedOperands << " rsp operands moved into their stubs)\n"; inputProgress.Message(message.str()); }
-        for (const auto& [reason, count] : report.Skipped) { std::ostringstream message; message << "Red-zone framing: skipped " << count << ": " << reason << '\n'; inputProgress.Message(message.str()); }
-        trampolines.insert(trampolines.end(), std::make_move_iterator(framed.begin()), std::make_move_iterator(framed.end()));
+        auto framing = Relinker::FrameRedZoneImage(sourceBytes, headers, result.DynamicSection.RelaData, trampolines, "Red-zone framing", [&](std::string_view text) { inputProgress.Message(text); });
+        if (!framing.HasBounds) inputProgress.Message("Red-zone framing: the executable has no .eh_frame function bounds; all its functions come from splitting\n");
+        redZoneComplete = Relinker::RedZoneFramingComplete(framing);
+        redZoneLeft = framing.Skipped + framing.Unexamined;
+        displacements = std::move(framing.Displacements);
     }
     GamePatch::CheckOverlaps(options.TargetName, patchedRanges, {.RelinkPatches = result.Patches, .RelaData = result.DynamicSection.RelaData, .RelaPltData = result.DynamicSection.RelaPltData, .RedZoneSites = std::span<const Codegen::TrampolineSite>(trampolines).subspan(intelSites), .RedZoneDisplacements = displacements});
 
@@ -148,7 +141,7 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
 
     std::vector<Relinker::GuestArtifact> guestArtifacts;
     if (!input.Modules.empty()) {
-        guestArtifacts = Relinker::GuestModuleBuilder().Build(input.InputPath, input.OutputPath, result.DynamicSection, windows, macos, options.ToIntel, Codegen::Amd64OnlyTargetFor(options.ToRosetta, options.ToAvx), *syscallScanner, options.LazyBinding, options.OmitUnavailableDependencies, options.RunPath, options.ExcludedModules, input.ModuleRoot, input.RuntimeDirectories, std::move(input.Modules), inputProgress, options.FunctionSymbolRoots);
+        guestArtifacts = Relinker::GuestModuleBuilder().Build(input.InputPath, input.OutputPath, result.DynamicSection, windows, macos, options.ToIntel, Codegen::Amd64OnlyTargetFor(options.ToRosetta, options.ToAvx), *syscallScanner, options.LazyBinding, options.OmitUnavailableDependencies, options.RunPath, options.ExcludedModules, input.ModuleRoot, input.RuntimeDirectories, std::move(input.Modules), inputProgress, options.FunctionSymbolRoots, options.FrameRedZone);
     }
 
     auto byteWriter = std::make_shared<Io::ByteWriter>();
@@ -186,6 +179,14 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
         throw;
     }
 
+    if (options.FrameRedZone) {
+        const bool marked = windows && redZoneComplete && Relinker::MarkRedZoneFramed(executableBytes);
+        const auto unmarkedModules = static_cast<std::size_t>(std::count_if(guestArtifacts.begin(), guestArtifacts.end(), [](const Relinker::GuestArtifact& artifact) { return !artifact.RedZoneFramed; }));
+        std::ostringstream message;
+        message << "Red-zone framing: the executable is " << (marked ? "marked as framed" : "not marked as framed") << " (" << redZoneLeft << " leaves or code ranges left); " << unmarkedModules << " of " << guestArtifacts.size() << " guest modules are not marked\n";
+        if (!marked || unmarkedModules != 0) message << "Red-zone framing: the title keeps values below RSP that a fault can overwrite; libc arms no page tracking block and sets no read trap while an unmarked image is loaded\n";
+        inputProgress.Message(message.str());
+    }
     if (!windows) inputProgress.Report({Domain::ProgressStage::Image, Io::Utf8Path(input.InputPath), 1, 1});
     std::string diagnostics;
     if (windows) diagnostics = std::static_pointer_cast<Elfpatcher::Windows::WindowsPePatcher>(patcher)->GetDiagnostics();

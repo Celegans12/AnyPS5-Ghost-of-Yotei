@@ -206,6 +206,7 @@ public:
 
     bool TrapReads(std::uintptr_t address, std::size_t bytes) {
         if (bytes == 0 || address % subpageBytes != 0 || bytes % subpageBytes != 0 || bytes > UINTPTR_MAX - address || trapResolver.load(std::memory_order_acquire) == nullptr) return false;
+        if (!RedZoneGate::Open()) return false;
         std::lock_guard lock(mutex);
         const auto end = address + bytes;
         const auto first = address & ~(pageBytes - 1);

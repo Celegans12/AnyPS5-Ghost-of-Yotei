@@ -1,0 +1,82 @@
+#include <relinker/pipeline/RedZoneFraming.hpp>
+#include <relinker/analysis/UnusedNidFilter.hpp>
+#include <relinker/analysis/UnusedNidFilter/EhFrameReader.hpp>
+#include <io/BufferUtils.hpp>
+#include <algorithm>
+#include <cstring>
+#include <iterator>
+#include <map>
+#include <sstream>
+
+namespace Relinker {
+
+RedZoneFramingResult FrameRedZoneImage(std::vector<std::uint8_t>& bytes, const std::vector<Domain::ProgramHeader>& headers, const std::vector<std::uint8_t>& relaData, std::vector<Codegen::TrampolineSite>& trampolines, const std::string& prefix, const std::function<void(std::string_view)>& message) {
+    RedZoneFramingResult result;
+    result.FirstSite = trampolines.size();
+    std::vector<Domain::ProgramHeader> codeSegments;
+    std::vector<Domain::ProgramHeader> loadSegments;
+    for (const auto& header : headers) if (header.Type == 1 && (header.Flags & 1) != 0) codeSegments.push_back(header);
+    for (const auto& header : headers) if (header.Type == 1) loadSegments.push_back(header);
+    std::vector<Codegen::RedZoneFunction> functions;
+    for (const auto& region : UnusedNidFilter::ReadExceptionFunctions(bytes, headers, {}, {})) functions.push_back({region.Begin, region.End});
+    result.HasBounds = !functions.empty();
+    const auto pieces = Codegen::SplitUncoveredCode(bytes, codeSegments, functions);
+    result.SplitFunctions = pieces.size();
+    if (!pieces.empty()) message(prefix + ": " + std::to_string(pieces.size()) + " functions taken from code outside .eh_frame bounds, split at int3 padding and call targets\n");
+    functions.insert(functions.end(), pieces.begin(), pieces.end());
+    if (functions.empty()) return result;
+    std::map<std::uint64_t, std::uint64_t> relativeAddends;
+    for (std::size_t at = 0; at + 24 <= relaData.size(); at += 24) {
+        std::uint64_t offset = 0;
+        std::uint64_t info = 0;
+        std::uint64_t addend = 0;
+        std::memcpy(&offset, relaData.data() + at, 8);
+        std::memcpy(&info, relaData.data() + at + 8, 8);
+        std::memcpy(&addend, relaData.data() + at + 16, 8);
+        if ((info & 0xffffffffu) == 8) relativeAddends.emplace(offset, addend);
+    }
+    Codegen::RedZoneFrameReport report;
+    auto framed = Codegen::FrameRedZoneFunctions(bytes, codeSegments, functions, trampolines, report, result.Displacements, loadSegments, relativeAddends);
+    for (const auto& moved : result.Displacements) {
+        if (moved.Offset > bytes.size() || moved.Bytes.size() > bytes.size() - moved.Offset)
+            throw Domain::RelinkerException("Red-zone displacement exceeds source image", moved.Offset);
+        std::copy(moved.Bytes.begin(), moved.Bytes.end(), bytes.begin() + static_cast<std::ptrdiff_t>(moved.Offset));
+    }
+    const auto say = [&](const std::ostringstream& text) { message(text.str()); };
+    { std::ostringstream text; text << prefix << ": " << report.Functions << " functions, " << report.RedZoneFunctions << " leaf functions keep values below RSP, " << report.Framed << " framed (" << report.FramedWithoutFramePointer << " without a frame pointer, " << report.MovedOperands << " rsp operands moved, " << report.StubbedOperands << " in " << report.OperandStubs << " operand stubs; " << report.Exits << " exits)\n"; say(text); }
+    if (report.LeaveExits != 0) { std::ostringstream text; text << prefix << ": " << report.LeaveExits << " exits leave through `leave` instead of an exit stub (frame pointer, nothing else pushed)\n"; say(text); }
+    if (report.FramedWithCalls != 0) { std::ostringstream text; text << prefix << ": " << report.FramedWithCalls << " frame-pointer functions that call keep values below RSP and are framed too\n"; say(text); }
+    if (report.ReturnThunks != 0) { std::ostringstream text; text << prefix << ": " << report.ReturnThunks << " leaves return through a thunk, as their exits could not be patched\n"; say(text); }
+    if (report.Relocated != 0) { std::ostringstream text; text << prefix << ": " << report.Relocated << " leaves relocated whole into a stub, as their frames could not be patched in place (" << report.RelocatedCases << " jump-table cases enter through a jump; " << report.RelocatedOpenJumps << " leaves have an indirect jump that leaves the stub)\n"; say(text); }
+    if (report.WidenedPrologues != 0 || report.WidenedExits != 0) { std::ostringstream text; text << prefix << ": " << report.WidenedPrologues << " prologues widened over the instructions after them and " << report.WidenedExits << " exits over the instructions before them, as they were shorter than a jump (" << report.WidenedOperands << " rsp operands moved into their stubs)\n"; say(text); }
+    if (report.UncoveredRanges != 0) {
+        std::ostringstream text;
+        text << prefix << ": " << report.UncoveredRanges << " code ranges (" << report.UncoveredBytes << " bytes) outside every function's .eh_frame bounds, not examined; " << report.UncoveredPltRanges << " hold PLT-style jumps, " << report.UncoveredBelowRsp << " access memory below rsp";
+        for (std::size_t index = 0; index < report.UncoveredBelowRspAddresses.size() && index < 8; ++index) text << (index == 0 ? " (at 0x" : ", 0x") << std::hex << report.UncoveredBelowRspAddresses[index] << std::dec;
+        if (!report.UncoveredBelowRspAddresses.empty()) text << (report.UncoveredBelowRspAddresses.size() > 8 ? ", ...)" : ")");
+        text << '\n';
+        say(text);
+    }
+    result.Unexamined = report.UncoveredBelowRsp;
+    for (const auto& [reason, count] : report.Skipped) {
+        result.Skipped += count;
+        std::ostringstream text; text << prefix << ": skipped " << count << ": " << reason << '\n'; say(text);
+    }
+    trampolines.insert(trampolines.end(), std::make_move_iterator(framed.begin()), std::make_move_iterator(framed.end()));
+    return result;
+}
+
+bool RedZoneFramingComplete(const RedZoneFramingResult& result) {
+    return result.Skipped == 0 && result.Unexamined == 0;
+}
+
+bool MarkRedZoneFramed(std::vector<std::uint8_t>& image) {
+    constexpr std::size_t dosHeaderBytes = 0x40;
+    if (image.size() < dosHeaderBytes || image[0] != 'M' || image[1] != 'Z' || Io::ReadU32(image, 0x3c) < dosHeaderBytes) return false;
+    const auto mark = image.begin() + static_cast<std::ptrdiff_t>(RedZoneMarkOffset);
+    if (!std::all_of(mark, mark + static_cast<std::ptrdiff_t>(RedZoneMark.size()), [](const std::uint8_t value) { return value == 0; })) return false;
+    std::copy(RedZoneMark.begin(), RedZoneMark.end(), mark);
+    return true;
+}
+
+}

@@ -78,6 +78,7 @@ struct GuestArtifact {
     std::vector<Domain::CallRegistryEntry> Imports;
     std::filesystem::path SourcePath;
     std::vector<std::string> NeededLibraries;
+    bool RedZoneFramed = false;
 };
 
 struct GuestModuleInput {
@@ -90,7 +91,7 @@ std::vector<std::pair<std::filesystem::path, std::filesystem::path>> RemoveBacku
 
 class GuestModuleBuilder {
 public:
-    std::vector<GuestArtifact> Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, bool windows, bool macos, bool toIntel, Codegen::Amd64OnlyTarget target, ISyscallScanner& syscallScanner, bool lazyBinding, bool omitUnavailableDependencies, const std::string& runPath, const std::set<std::string>& excludedModules, const std::filesystem::path& root, const std::vector<std::filesystem::path>& runtimeDirectories, std::vector<GuestModuleInput> modules, Domain::IProgress& progress, bool functionSymbolRoots = false) const;
+    std::vector<GuestArtifact> Build(const std::filesystem::path& inputPath, const std::filesystem::path& outputPath, Domain::SysVDynamicSection& dynamic, bool windows, bool macos, bool toIntel, Codegen::Amd64OnlyTarget target, ISyscallScanner& syscallScanner, bool lazyBinding, bool omitUnavailableDependencies, const std::string& runPath, const std::set<std::string>& excludedModules, const std::filesystem::path& root, const std::vector<std::filesystem::path>& runtimeDirectories, std::vector<GuestModuleInput> modules, Domain::IProgress& progress, bool functionSymbolRoots = false, bool frameRedZone = false) const;
 };
 
 }
