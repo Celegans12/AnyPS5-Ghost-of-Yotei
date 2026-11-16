@@ -367,6 +367,48 @@ void gpuTimingKeyTests() {
     Require(Recorder::TimingKeyLabel(Recorder::DrawTimingKey(0x123456789abcdefull)) == "draw 0x123456789abcdef", "a wide variant id was cut in the label");
 }
 
+void emptyScissorTests() {
+    using namespace CommandStateLog;
+    const auto hooks = stateFunctions();
+    Context context{};
+    context.functions = &hooks;
+    stateLog.clear();
+    const auto commands = reinterpret_cast<VkCommandBuffer>(static_cast<std::uintptr_t>(0x5c000));
+    const VkRect2D area{{1, 2}, {30, 20}};
+    const VkRect2D moved{{4, 0}, {8, 8}};
+    for (const bool suppress : {true, false}) {
+        for (const bool empty : {false, true}) {
+            const std::string what = std::string(empty ? "a graphics state measuring an empty scissor" : "a graphics state recording the draw's scissor") + (suppress ? "" : " without suppression");
+            const auto line = [&](const VkRect2D& rect) { return empty ? stateLine("scissor", 0, 0, 0u, 0u) : stateLine("scissor", rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height); };
+            CommandState state;
+            state.Begin(commands, suppress, empty);
+            Require(state.EmptyScissor() == empty, what + " did not keep the measure it was begun with");
+            state.SetScissor(context, area);
+            state.SetScissor(context, area);
+            state.SetScissor(context, moved);
+            expectStateLog(suppress ? std::vector<std::string>{line(area), line(moved)} : std::vector<std::string>{line(area), line(area), line(moved)}, what);
+            Require(state.Known(CommandState::Scissor) == suppress, what + " lost track of the scissor it was asked for");
+            state.SetScissor(context, moved);
+            expectStateLog(suppress ? std::vector<std::string>{} : std::vector<std::string>{line(moved)}, what + " repeating the scissor it was asked for");
+            state.Invalidate();
+            Require(state.EmptyScissor() == empty, what + " dropped its measure on invalidation");
+            state.SetScissor(context, moved);
+            expectStateLog({line(moved)}, what + " after invalidation");
+            state.Begin(commands, suppress);
+            Require(!state.EmptyScissor(), what + " kept measuring an empty scissor in a recording begun without it");
+            state.SetScissor(context, area);
+            expectStateLog({stateLine("scissor", 1, 2, 30u, 20u)}, what + " begun again without the measure");
+        }
+    }
+    CommandState plain;
+    plain.Begin(commands);
+    Require(!plain.EmptyScissor(), "a graphics state begun with the defaults measures an empty scissor");
+    plain.SetScissor(context, area);
+    expectStateLog({stateLine("scissor", 1, 2, 30u, 20u)}, "a graphics state begun with the defaults");
+    Require(Recorder::EmptyScissorMeasured() == (std::getenv("APS5_MEASURE_EMPTY_SCISSOR") != nullptr), "Recorder::EmptyScissorMeasured does not follow APS5_MEASURE_EMPTY_SCISSOR");
+    stateLog.clear();
+}
+
 void deviceSelectionTests() {
     const auto properties = [](const char* name, VkPhysicalDeviceType type) {
         VkPhysicalDeviceProperties result{};
@@ -12811,14 +12853,23 @@ void graphicsStateTests(const Device& device) {
     context.functions = &hooks;
     statePipelines.clear();
     stateLog.clear();
+    const bool measured = Recorder::EmptyScissorMeasured();
     const auto drawn = [&](Recorder& recorder, VkPipeline pipeline) {
         recorder.Commands();
+        Require(recorder.GraphicsState().EmptyScissor() == measured, "the recorder's graphics state does not follow APS5_MEASURE_EMPTY_SCISSOR");
         stateTrackedDraw(recorder.GraphicsState(), context, pipeline);
+    };
+    const auto drawLines = [&](VkPipeline pipeline) {
+        auto lines = stateTrackedDrawLines(pipeline);
+        const auto asked = std::find(lines.begin(), lines.end(), stateLine("scissor", 1, 2, 30u, 20u));
+        Require(asked != lines.end(), "the tracked draw does not set its scissor");
+        if (measured) *asked = stateLine("scissor", 0, 0, 0u, 0u);
+        return lines;
     };
     const auto first = stateFakePipeline(0);
     const auto second = stateFakePipeline(1);
-    const auto full = stateTrackedDrawLines(first);
-    const auto none = [&](VkPipeline pipeline) { return suppressing ? std::vector<std::string>{} : stateTrackedDrawLines(pipeline); };
+    const auto full = drawLines(first);
+    const auto none = [&](VkPipeline pipeline) { return suppressing ? std::vector<std::string>{} : drawLines(pipeline); };
     {
         CommandBufferReuse reuse(context);
         Recorder recorder(context);
@@ -12868,7 +12919,7 @@ void graphicsStateTests(const Device& device) {
         drawn(one, first);
         expectStateLog(none(first), "the first recorder's repeated draw after the second recorder's first");
         drawn(other, second);
-        expectStateLog(suppressing ? std::vector<std::string>{stateLine("bind", 0u, second)} : stateTrackedDrawLines(second), "the second recorder binding another pipeline");
+        expectStateLog(suppressing ? std::vector<std::string>{stateLine("bind", 0u, second)} : drawLines(second), "the second recorder binding another pipeline");
         drawn(one, first);
         expectStateLog(none(first), "the first recorder's draw after the second recorder bound another pipeline");
         drawn(other, second);
@@ -12928,7 +12979,7 @@ void graphicsStateTests(const Device& device) {
     }
     statePipelines.clear();
     stateLog.clear();
-    std::cout << "graphics state through the recorder passed (" << (suppressing ? "suppressing" : "unsuppressed") << ")\n";
+    std::cout << "graphics state through the recorder passed (" << (suppressing ? "suppressing" : "unsuppressed") << (measured ? ", empty scissor measured" : "") << ")\n";
 }
 
 void cmaskPassTests(const Device& device, Recorder& recorder) {
@@ -17066,7 +17117,8 @@ int main(int argc, char** argv) {
         }
         if (argc == 2 && std::string_view(argv[1]) == "--gpu-timing-key-only") {
             gpuTimingKeyTests();
-            std::cout << "gpu timing key tests passed\n";
+            emptyScissorTests();
+            std::cout << "gpu timing key tests passed (" << (Recorder::EmptyScissorMeasured() ? "empty scissor measured" : "draw scissor") << ")\n";
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--device-selection-only") {

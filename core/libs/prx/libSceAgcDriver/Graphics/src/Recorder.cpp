@@ -1713,9 +1713,10 @@ std::uint32_t CommandState::DynamicSlots(std::span<const VkDynamicState> states)
     return slots;
 }
 
-void CommandState::Begin(VkCommandBuffer recording, bool suppress) {
+void CommandState::Begin(VkCommandBuffer recording, bool suppress, bool empty) {
     commands = recording;
     trackable = suppress ? ~0u : 0u;
+    emptyScissor = empty;
     Invalidate();
 }
 
@@ -1767,7 +1768,10 @@ void CommandState::SetViewport(const Context& context, const VkViewport& value) 
 }
 
 void CommandState::SetScissor(const Context& context, const VkRect2D& value) {
-    apply(Scissor, &CommandState::scissor, value, [](const auto& left, const auto& right) { return sameBits(left, right); }, [&] { context.tracked(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &value); });
+    apply(Scissor, &CommandState::scissor, value, [](const auto& left, const auto& right) { return sameBits(left, right); }, [&] {
+        const VkRect2D emitted = emptyScissor ? VkRect2D{} : value;
+        context.tracked(&DeviceFunctions::cmdSetScissor, "vkCmdSetScissor")(commands, 0, 1, &emitted);
+    });
 }
 
 void CommandState::SetDepthBias(const Context& context, float constant, float clamp, float slope) {
@@ -2320,6 +2324,11 @@ bool Recorder::DispatchOverlapEnabled() {
     return enabled;
 }
 
+bool Recorder::EmptyScissorMeasured() {
+    static const bool enabled = std::getenv("APS5_MEASURE_EMPTY_SCISSOR") != nullptr;
+    return enabled;
+}
+
 void Recorder::SetDispatchOrder(std::uint32_t queueKey, bool unordered) {
     nextDispatchOrder = {queueKey, unordered};
 }
@@ -2655,7 +2664,7 @@ void Recorder::ensureOpen() {
             begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
             Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(batch->commands, &begin), "vkBeginCommandBuffer recorder");
             static const bool suppress = std::getenv("APS5_NO_STATE_SUPPRESSION") == nullptr;
-            batch->graphicsState.Begin(batch->commands, suppress);
+            batch->graphicsState.Begin(batch->commands, suppress, EmptyScissorMeasured());
         } catch (...) {
             release(*batch);
             throw;

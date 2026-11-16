@@ -65,9 +65,10 @@ public:
     CommandState(const CommandState&) = delete;
     CommandState& operator=(const CommandState&) = delete;
 
-    void Begin(VkCommandBuffer commands, bool suppress = true);
+    void Begin(VkCommandBuffer commands, bool suppress = true, bool emptyScissor = false);
     void Invalidate() noexcept;
     VkCommandBuffer Commands() const { return commands; }
+    bool EmptyScissor() const { return emptyScissor; }
     bool Known(Slot slot) const { return (valid & Mask(slot)) != 0; }
     VkPipeline BoundPipeline() const { return pipelineKnown ? pipeline : VK_NULL_HANDLE; }
     void BindPipeline(const Context& context, VkPipeline pipeline, std::uint32_t dynamicSlots);
@@ -113,6 +114,7 @@ private:
     std::uint32_t dynamicSlots = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
     bool pipelineKnown = false;
+    bool emptyScissor = false;
     VkViewport viewport{};
     VkRect2D scissor{};
     std::array<float, 3> depthBias{};
@@ -167,6 +169,7 @@ public:
     void MarkCovered(VkAccessFlags access);
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
     static bool DispatchOverlapEnabled();
+    static bool EmptyScissorMeasured();
     static void SetDispatchOrder(std::uint32_t queueKey, bool unordered);
     static std::uint32_t TakeDispatchOrder(bool& unordered);
     static constexpr std::uint64_t RunAccessWritten = 1, RunAccessImage = 2;
