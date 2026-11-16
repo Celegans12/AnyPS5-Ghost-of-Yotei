@@ -7,13 +7,18 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include <algorithm>
 #include <array>
-#include <exception>
-#ifdef __APPLE__
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
-#endif
+#include <exception>
+#include <mutex>
+#include <optional>
+#include <vector>
 
 namespace AgcDriver::Graphics {
 void WriteCheckpointSentinel(const Context& context, VkCommandBuffer commands);
@@ -52,16 +57,213 @@ VkBuffer BindExactBuffer(const Context& context, std::size_t size, VkBufferUsage
     return buffer;
 }
 
+constexpr VkMemoryPropertyFlags HostDefault = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+constexpr VkMemoryPropertyFlags HostCard = HostDefault | VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+
+int DrawInputsDevice() {
+    static const int mode = [] {
+        const char* text = std::getenv("APS5_DRAW_INPUTS_DEVICE");
+        if (text == nullptr) return 0;
+        if (std::strcmp(text, "1") == 0) return 1;
+        if (std::strcmp(text, "2") == 0) return 2;
+        return 0;
+    }();
+    return mode;
 }
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : Buffer(context, size, usage, properties, false) {}
+bool OnCard(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) {
+    return DrawInputsDevice() != 0 && properties == HostDefault && (usage == VK_BUFFER_USAGE_VERTEX_BUFFER_BIT || usage == VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+}
+
+VkBufferUsageFlags StagingUsage(VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) {
+    return DrawInputsDevice() == 2 && OnCard(usage, properties) ? usage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT : usage;
+}
+
+struct CardCounters {
+    std::atomic<std::uint64_t> placed{0};
+    std::atomic<std::uint64_t> placedBytes{0};
+    std::atomic<std::uint64_t> refused{0};
+    std::atomic<std::uint64_t> uploads{0};
+    std::atomic<std::uint64_t> uploadBytes{0};
+    std::atomic<std::uint64_t> rewrites{0};
+    std::atomic<std::uint64_t> runs{0};
+    std::atomic<std::uint64_t> fromCard{0};
+    std::atomic<std::uint64_t> fromHost{0};
+    std::atomic<std::int64_t> reportAt{0};
+};
+
+CardCounters& cardCounters() {
+    static auto* counters = new CardCounters();
+    return *counters;
+}
+
+void tally(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
+    counter.fetch_add(amount, std::memory_order_relaxed);
+}
+
+void reportCard() {
+    auto& counters = cardCounters();
+    constexpr std::int64_t interval = 10'000'000'000;
+    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto at = counters.reportAt.load(std::memory_order_relaxed);
+    if (at == 0) {
+        counters.reportAt.compare_exchange_strong(at, now + interval, std::memory_order_relaxed);
+        return;
+    }
+    if (now < at || !counters.reportAt.compare_exchange_strong(at, now + interval, std::memory_order_relaxed)) return;
+    const auto take = [](std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.exchange(0, std::memory_order_relaxed)); };
+    const auto placed = take(counters.placed);
+    const auto placedBytes = take(counters.placedBytes);
+    const auto refused = take(counters.refused);
+    const auto uploads = take(counters.uploads);
+    const auto uploadBytes = take(counters.uploadBytes);
+    const auto rewrites = take(counters.rewrites);
+    const auto runs = take(counters.runs);
+    const auto fromCard = take(counters.fromCard);
+    const auto fromHost = take(counters.fromHost);
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-inputs-device] (10 s) mode %d: %llu inputs placed on the card (%.1f MiB), %llu kept in system memory (no room); %llu uploads (%.1f MiB, %llu of them rewrites) in %llu copy runs; binds %llu from the card, %llu from system memory\n", DrawInputsDevice(), placed, static_cast<double>(placedBytes) / 1048576.0, refused, uploads, static_cast<double>(uploadBytes) / 1048576.0, rewrites, runs, fromCard, fromHost);
+}
+
+}
+
+struct CardInput {
+    std::shared_ptr<Buffer> target;
+    VkBuffer source = VK_NULL_HANDLE;
+    std::size_t bytes = 0;
+    std::atomic<bool> dirty{true};
+    bool uploaded = false;
+    bool queued = false;
+    std::optional<BufferAllocation> staging;
+    std::shared_ptr<BufferPool> pool;
+    ~CardInput() {
+        if (staging && pool) pool->Put(*staging);
+    }
+};
+
+namespace {
+
+struct CardQueue {
+    std::mutex mutex;
+    std::vector<std::weak_ptr<CardInput>> owed;
+};
+
+CardQueue& cardQueue() {
+    static auto* queue = new CardQueue();
+    return *queue;
+}
+
+void owe(const std::shared_ptr<CardInput>& input) {
+    auto& queue = cardQueue();
+    std::lock_guard lock(queue.mutex);
+    if (input->queued) return;
+    input->queued = true;
+    queue.owed.push_back(input);
+}
+
+void flushCardInputs(const Context& context) {
+    auto* recorder = context.recorder;
+    std::vector<std::shared_ptr<CardInput>> items;
+    {
+        auto& queue = cardQueue();
+        std::lock_guard lock(queue.mutex);
+        if (queue.owed.empty()) return;
+        items.reserve(queue.owed.size());
+        for (auto& owed : queue.owed) {
+            auto item = owed.lock();
+            if (item == nullptr) continue;
+            item->queued = false;
+            if (item->dirty.load(std::memory_order_relaxed)) items.push_back(std::move(item));
+        }
+        queue.owed.clear();
+    }
+    if (items.empty()) return;
+    const bool rewrite = std::any_of(items.begin(), items.end(), [](const auto& item) { return item->uploaded; });
+    const Recorder::CopyBackReach reach{0, true, false, {}};
+    const auto commands = recorder->CommandsKeeping(reach);
+    const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::DrawInputCopy);
+    if (rewrite) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        Recorder::CountBarriers(Recorder::CommandClass::DrawInputCopy);
+    }
+    auto& counters = cardCounters();
+    std::uint64_t copied = 0;
+    for (auto& item : items) {
+        item->dirty.store(false, std::memory_order_relaxed);
+        CopyBuffer(context, commands, item->source, 0, item->target->Handle(), 0, item->bytes);
+        if (item->uploaded) tally(counters.rewrites);
+        item->uploaded = true;
+        copied += item->bytes;
+        recorder->Keep(item);
+    }
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_VERTEX_INPUT_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT);
+    Recorder::CountBarriers(Recorder::CommandClass::DrawInputCopy);
+    recorder->EndGpuTiming(timing, copied);
+    tally(counters.uploads, items.size());
+    tally(counters.uploadBytes, copied);
+    tally(counters.runs);
+    reportCard();
+}
+
+VkBuffer cardHandle(const Context& context, const std::shared_ptr<CardInput>& input, VkBuffer staging, const void* mapping) {
+    auto& counters = cardCounters();
+    if (DrawInputsDevice() == 1) {
+        if (input->dirty.exchange(false, std::memory_order_relaxed)) {
+            std::memcpy(input->target->Bytes().data(), mapping, input->bytes);
+            if (input->uploaded) tally(counters.rewrites);
+            input->uploaded = true;
+            tally(counters.uploads);
+            tally(counters.uploadBytes, input->bytes);
+        }
+    } else if (input->dirty.load(std::memory_order_relaxed) || !input->uploaded) {
+        owe(input);
+        auto* recorder = context.recorder;
+        if (recorder != nullptr && GuestMemory::GpuMutex().HeldByThisThread() && !recorder->RenderPassOpen()) flushCardInputs(context);
+        if (input->dirty.load(std::memory_order_relaxed) || !input->uploaded) {
+            if ((counters.fromHost.fetch_add(1, std::memory_order_relaxed) & 4095u) == 0) reportCard();
+            return staging;
+        }
+    }
+    if ((counters.fromCard.fetch_add(1, std::memory_order_relaxed) & 4095u) == 0) reportCard();
+    return input->target->Handle();
+}
+
+}
+
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties) : Buffer(context, size, usage, properties, false) {
+    if (ready && OnCard(usage, properties)) attachCard(usage);
+}
+
+void Buffer::attachCard(VkBufferUsageFlags requested) {
+    auto& counters = cardCounters();
+    try {
+        auto input = std::make_shared<CardInput>();
+        input->bytes = size;
+        input->source = buffer;
+        if (DrawInputsDevice() == 1) {
+            std::shared_ptr<Buffer> target(new Buffer(context, size, requested, HostCard, true));
+            if (target->ready && target->mapping != nullptr) input->target = std::move(target);
+        } else {
+            input->target = WithinDeviceLocalHeadroom(context, size, requested | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        }
+        if (input->target == nullptr) {
+            tally(counters.refused);
+            return;
+        }
+        card = std::move(input);
+        tally(counters.placed);
+        tally(counters.placedBytes, size);
+    } catch (const std::exception&) {
+        tally(counters.refused);
+    }
+    reportCard();
+}
 
 std::shared_ptr<Buffer> Buffer::WithinDeviceLocalHeadroom(const Context& context, std::size_t size, VkBufferUsageFlags usage) {
     std::shared_ptr<Buffer> buffer(new Buffer(context, size, usage, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT, true));
     return buffer->ready ? buffer : nullptr;
 }
 
-Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool headroom) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(BufferPool::Usage(usage, properties)), properties(properties) {
+Buffer::Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool headroom) : context(context), size(size), capacity(BufferPool::Capacity(size)), usage(BufferPool::Usage(StagingUsage(usage, properties), properties)), properties(properties) {
     Require(size != 0, "zero-sized GPU buffer");
     const bool addressable = (usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
     Require(!addressable || context.bufferDeviceAddress, "buffer device address is not enabled");
@@ -147,7 +349,13 @@ Buffer::~Buffer() {
 
 void Buffer::release() noexcept {
     if (ready && cache) {
-        cache->Put({buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size});
+        const BufferAllocation allocation{buffer, memory, mapping, deviceAddress, allocationBytes, capacity, usage, properties, offset, slab, size};
+        if (card != nullptr) {
+            card->pool = cache;
+            card->staging = allocation;
+            return;
+        }
+        cache->Put(allocation);
         return;
     }
     if (slab) {
@@ -161,11 +369,13 @@ void Buffer::release() noexcept {
 }
 
 VkBuffer Buffer::Handle() const {
-    return buffer;
+    if (card == nullptr) return buffer;
+    return cardHandle(context, card, buffer, mapping);
 }
 
 std::span<std::byte> Buffer::Bytes() {
     Require(mapping != nullptr, "device-local buffer has no host mapping");
+    if (card != nullptr) card->dirty.store(true, std::memory_order_relaxed);
     return {static_cast<std::byte*>(mapping), size};
 }
 
