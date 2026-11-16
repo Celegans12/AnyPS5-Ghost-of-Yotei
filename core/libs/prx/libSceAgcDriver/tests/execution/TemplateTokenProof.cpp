@@ -84,6 +84,7 @@ void Require(bool condition, const std::string& message) {
 }
 
 std::atomic<std::uint64_t> osWalks{0};
+bool sweeps = false;
 
 void Hook(int point) {
     if (point == 1) osWalks.fetch_add(1);
@@ -121,13 +122,22 @@ struct Template {
     std::vector<GuestMemory::ContentToken> tokens;
     std::uint64_t taken = 0;
 
-    void Take() {
+    void Collect() const {
         for (const auto& [begin, end] : ranges) Require(GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin)) != 0, "a collect of a template range failed");
+    }
+
+    void Take() {
+        Collect();
         Require(AgcDriver::Graphics::TakeTemplateTokens(ranges, words, tokens, taken), "a template over collected ranges got no content tokens");
         Require(Holds(), "a template token proof just taken does not hold");
     }
 
     bool Holds() const { return AgcDriver::Graphics::TemplateTokensHold(ranges, words, tokens, taken); }
+
+    void Advance() const {
+        GuestMemory::BumpCollectEpoch();
+        if (!sweeps) Collect();
+    }
 };
 
 void RangesProveATemplate(std::uint64_t base) {
@@ -140,22 +150,26 @@ void RangesProveATemplate(std::uint64_t base) {
     GuestMemory::BumpCollectEpoch();
     proof.Take();
     GuestMemory::BumpCollectEpoch();
+    if (!sweeps) {
+        Require(!proof.Holds(), "a template was proved in an epoch in which nothing observed its ranges");
+        proof.Collect();
+    }
     auto walks = osWalks.load();
     Require(proof.Holds(), "a template whose ranges nothing wrote was refused in the next epoch");
     Require(osWalks.load() == walks, "the token proof of an unwritten template walked the write watch");
     auto other = proof;
     other.words[5] ^= 1u;
     Require(!other.Holds(), "a template was proved for other descriptor words");
-    std::puts("an unwritten template is proved by its tokens without a sweep");
+    std::puts(sweeps ? "an unwritten template is proved by its tokens after the sweep of the next epoch" : "an unwritten template is proved by its tokens once the next epoch observed its ranges");
 
     Store(surface.first + 7);
-    GuestMemory::BumpCollectEpoch();
+    proof.Advance();
     Require(!proof.Holds(), "a template was reused after a store into one of its ranges");
     proof.Take();
-    GuestMemory::BumpCollectEpoch();
+    proof.Advance();
     Require(proof.Holds(), "a template retaken after the store did not hold in the next epoch");
     Store(storage.second + Block);
-    GuestMemory::BumpCollectEpoch();
+    proof.Advance();
     Require(proof.Holds(), "a store outside the template's blocks refused the template");
     std::puts("a store into a range refuses the template");
 
@@ -170,7 +184,7 @@ void RangesProveATemplate(std::uint64_t base) {
     GuestMemory::MarkWritten(keys.first, static_cast<std::size_t>(keys.second - keys.first));
     Require(!proof.Holds(), "a template was reused after the GPU reported the fill of its DCC keys");
     proof.Take();
-    GuestMemory::BumpCollectEpoch();
+    proof.Advance();
     Require(proof.Holds(), "a template retaken after the DCC fill did not hold in the next epoch");
     std::puts("a fill of the DCC keys refuses the template");
 
@@ -279,7 +293,7 @@ void TemplateProvesByTokens(const AgcDriver::VulkanDevice& device) {
     GuestMemory::BumpCollectEpoch();
     proved = Prove(*resources, shader);
     Require(proved.current && proved.report.path == ShaderResources::ProofPath::Fast && proved.byToken == Textures && proved.byTracker == 0, "the proof of an unwritten template in the next epoch proved " + std::to_string(proved.byToken) + " of its " + std::to_string(Textures) + " surfaces by their tokens");
-    Require(proved.walks == 0, "the token proof of an unwritten template walked the write watch");
+    Require(!sweeps || proved.walks == 0, "the token proof of an unwritten template walked the write watch after the sweep");
     std::puts("an unwritten template is proved by its tokens in the next epoch");
 
     const auto target = static_cast<std::size_t>(Textures / 3u) * SurfaceSpacing;
@@ -307,15 +321,26 @@ void TemplateProvesByTokens(const AgcDriver::VulkanDevice& device) {
 }
 
 int main(int argc, char** argv) {
-    const bool verify = argc == 2 && std::string(argv[1]) == "--verify";
+    bool verify = false;
+    for (int argument = 1; argument < argc; ++argument) {
+        const std::string mode = argv[argument];
+        if (mode == "--verify") verify = true;
+        else if (mode == "--sweep") sweeps = true;
+        else {
+            std::cerr << "unknown argument " << mode << '\n';
+            return 2;
+        }
+    }
 #ifdef _WIN32
     _putenv_s("APS5_EPOCH_SWEEP", "1");
+    if (sweeps) _putenv_s("APS5_EPOCH_SWEEP_SPAN", "64");
     _putenv_s("APS5_TEMPLATE_TOKEN_PROOF", "1");
     if (verify) _putenv_s("APS5_VERIFY_TEMPLATE_TOKEN_PROOF", "1");
     _putenv_s("APS5_TEMPLATE_AUDIT_MS", "0");
     _putenv_s("APS5_TABLE_INDEX", "0");
 #else
     setenv("APS5_EPOCH_SWEEP", "1", 1);
+    if (sweeps) setenv("APS5_EPOCH_SWEEP_SPAN", "64", 1);
     setenv("APS5_TEMPLATE_TOKEN_PROOF", "1", 1);
     if (verify) setenv("APS5_VERIFY_TEMPLATE_TOKEN_PROOF", "1", 1);
     setenv("APS5_TEMPLATE_AUDIT_MS", "0", 1);
