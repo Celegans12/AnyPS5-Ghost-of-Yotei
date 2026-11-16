@@ -28,6 +28,7 @@ struct DrawReads {
     ShaderRecompiler::BlockWordReader read = nullptr;
     bool (*resolve)(void* context, const BufferRequest& request, BufferAnswer& answer) = nullptr;
     void* context = nullptr;
+    bool keyed = true;
 };
 
 struct DrawWritten {
@@ -35,6 +36,7 @@ struct DrawWritten {
     std::array<std::uint32_t, 4> section{};
     std::uint64_t deferred = 0;
     std::array<std::uint64_t, 2> images{};
+    std::array<std::uint64_t, 4> variant{};
     std::uint32_t extra = 0;
     DrawLeft left = DrawLeft::None;
     std::uint32_t stage = 0;

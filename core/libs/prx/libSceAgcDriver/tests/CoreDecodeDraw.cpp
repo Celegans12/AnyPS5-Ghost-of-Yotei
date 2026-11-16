@@ -496,7 +496,15 @@ void testVariant() {
     const auto reads = draw.Reads();
     auto stages = draw.Stages();
 
+    const auto keyed = WriteDraw(stages, reads, 0u, ring);
+    Expect(keyed.left == DrawLeft::None && keyed.variant[0] == stages[0].variantKey && keyed.variant[1] == stages[1].variantKey, "a written draw reports the variant key of each stage");
+    draw.host.resolved = 0;
     stages[1].variantKey ^= 1u;
+    auto unkeyed = reads;
+    unkeyed.keyed = false;
+    const auto free = WriteDraw(stages, unkeyed, 0u, ring);
+    Expect(free.left == DrawLeft::None && free.variant[1] == (stages[1].variantKey ^ 1u) && free.images == keyed.images, "a draw written without a key to compare reports the key its words give");
+    draw.host.resolved = 0;
     Expect(leftWith(WriteDraw(stages, reads, 0u, ring), DrawLeft::Variant, 1u) && draw.host.resolved == 2u, "another variant key on the second stage leaves the draw as a variant of stage 1");
     draw.host.resolved = 0;
     stages = draw.Stages();

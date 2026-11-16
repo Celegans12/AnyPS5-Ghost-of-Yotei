@@ -118,7 +118,9 @@ DrawWritten WriteDraw(std::span<const DrawStage> stages, const DrawReads& reads,
         auto* section = reinterpret_cast<std::uint32_t*>(part.bytes);
         const std::span<std::uint32_t> words(section, layout.words);
         if (stage.tape->RunInto(*stage.plan, stage.userData, stage.shaderBase, reads.read, reads.context, words) != ShaderRecompiler::BlockWalk::Done) return leftAt(DrawLeft::Walk, index);
-        if (ShaderRecompiler::BlockVariantKey(layout, words, stage.userData) != stage.variantKey) return leftAt(DrawLeft::Variant, index);
+        const auto variant = ShaderRecompiler::BlockVariantKey(layout, words, stage.userData);
+        if (reads.keyed && variant != stage.variantKey) return leftAt(DrawLeft::Variant, index);
+        written.variant[index] = variant;
         const auto count = static_cast<std::uint32_t>(layout.buffers.size());
         for (std::uint32_t buffer = 0; buffer < count; ++buffer, ++rank) {
             const auto request = DecodeBuffer(layout, words, buffer);
