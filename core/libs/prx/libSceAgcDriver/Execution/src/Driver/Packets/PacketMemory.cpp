@@ -679,14 +679,16 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();
     recordDeferredLabels(localDevice.get(), queue);
+    static const bool earlyInterrupt = std::getenv("APS5_EARLY_EOP_INTERRUPT") != nullptr;
+    const bool early = earlyInterrupt && interrupt.has_value();
     bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
         if (localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
-        reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
+        reason = early ? 4 : localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
         if (reason != 0 && reason != 5 && reason != 6) {
-            if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+            if (!early && reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(address, bytes, 4);
         }
         noteLabelStore(address, bytes, stamp, queue);
@@ -700,7 +702,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
         const auto context = *interrupt;
         bool deferred = false;
         if (bytes.empty() && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("interrupt") != 0) workOpen = true;
-        if (localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
+        if (!early && localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
             deferred = localDevice->AfterRecordedWork([this, queue, context] { deliverGuestEopInterrupt(queue, context); }, queue == 0);
             if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0);
         }
