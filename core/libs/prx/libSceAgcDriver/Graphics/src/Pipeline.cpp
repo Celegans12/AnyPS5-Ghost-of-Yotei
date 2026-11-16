@@ -1582,8 +1582,6 @@ bool PipelineStoreCanGrow() {
     return storeBound(store) < PipelineStore::MaximumEntries && !store.fixedCapacity;
 }
 
-void ReleaseDrawInputSlots(VkDevice device);
-
 void ClearCachedPipelines(VkDevice device) {
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
@@ -1605,7 +1603,6 @@ void ClearCachedPipelines(VkDevice device) {
     ClearPipelineLibraries(device);
     ReleasePixelFunctionLds(device);
     ReleaseMeshWindow(device);
-    ReleaseDrawInputSlots(device);
 }
 
 }
