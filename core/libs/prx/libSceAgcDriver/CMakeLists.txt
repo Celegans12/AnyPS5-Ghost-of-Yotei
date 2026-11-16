@@ -469,6 +469,9 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/OpQueue.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/OpHost.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DecodeLane.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/Decoder.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DecoderRing.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DecoderShadow.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DecodeDraw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/FrontMemo.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/CoarseClock.cpp
