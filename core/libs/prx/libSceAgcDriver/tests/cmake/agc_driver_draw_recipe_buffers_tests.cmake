@@ -36,3 +36,8 @@ target_include_directories(agc_driver_core_back_tests PRIVATE ${agcTestShaderGen
 if(BUILD_TESTING)
     set_tests_properties(agc_driver_core_back PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endif()
+target_sources(agc_driver_core_replay_tests PRIVATE ${agcCoverShaderHeaders} ${agcVertexRangeHeaders})
+target_include_directories(agc_driver_core_replay_tests PRIVATE ${agcTestShaderGeneratedRoot})
+if(BUILD_TESTING)
+    set_tests_properties(agc_driver_core_replay PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+endif()
