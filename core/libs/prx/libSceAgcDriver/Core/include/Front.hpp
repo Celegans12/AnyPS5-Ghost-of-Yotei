@@ -1,10 +1,13 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_CORE_INCLUDE_FRONT_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_CORE_INCLUDE_FRONT_HPP
 
+#include "prx/libSceAgcDriver/Core/include/BlockRing.hpp"
+#include "prx/libSceAgcDriver/Core/include/Op.hpp"
 #include "prx/libSceAgcDriver/Core/include/RunKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
+#include "Optimization/BlockLayout.hpp"
 #include "Recompiler.hpp"
 #include <array>
 #include <atomic>
@@ -25,7 +28,7 @@ class SrtTape;
 
 namespace AgcDriver::Core {
 
-enum class FrontLeft : std::uint32_t { Entry, NoPlan, Programs, UserWords, Walk, NoVariant, VariantKey, Views, Vertex, Queued, Pending, Moved, Stale, Finisher, Count };
+enum class FrontLeft : std::uint32_t { Entry, NoPlan, Programs, UserWords, Walk, NoVariant, VariantKey, Views, Vertex, Queued, Pending, Moved, Stale, Finisher, Nothing, Precheck, Ring, Ranges, Count };
 enum class TeachRefusal : std::uint32_t { None, Path, Program, Stage, Plan, Tape, Walk, Words, Buffers, Forwarded, Vertex, Writes, PlanDiffers, Count };
 
 const char* FrontLeftName(FrontLeft reason);
@@ -45,6 +48,7 @@ struct PlanStage {
     std::vector<std::uint8_t> keyResult;
     std::uint32_t userWords = 0;
     bool vertexInputs = false;
+    std::uint32_t flatWords = 0;
 };
 
 struct RunPlanData {
@@ -52,6 +56,7 @@ struct RunPlanData {
     std::array<PlanStage, 4> stages;
     std::uint32_t stageCount = 0;
     std::uint64_t id = 0;
+    mutable std::uint8_t precheck = 0;
 };
 
 struct VariantStage {
@@ -95,6 +100,31 @@ struct FrontOutcome {
     bool teach = false;
     StateKey key;
     std::shared_ptr<CoreDraw> candidate;
+    bool looked = false;
+    const std::byte* op = nullptr;
+    FrontVariant* variant = nullptr;
+    std::span<const std::pair<std::uint64_t, std::uint64_t>> reads;
+};
+
+struct FlatInputs {
+    const QueueState* queue = nullptr;
+    const DriverDetail::ShaderRegistry* shaders = nullptr;
+    std::span<const std::uint32_t> packet;
+    const Pm4::DrawParameters* parameters = nullptr;
+    std::uint64_t device = 0;
+    std::uint64_t epoch = 0;
+    bool verifyOnly = false;
+    bool (*plain)(void* context, const QueueState& queue, const Pm4::DrawParameters& parameters) = nullptr;
+    void* context = nullptr;
+};
+
+struct FlatDraw {
+    Op op;
+    FrontVariant* variant = nullptr;
+    std::array<std::span<const std::uint32_t>, 4> section;
+    std::array<std::span<const std::uint32_t>, 4> buffers;
+    std::array<std::span<const std::uint32_t>, 4> userData;
+    std::span<const std::uint32_t> vertex;
 };
 
 struct TeachInputs {
@@ -124,6 +154,12 @@ struct FrontCounts {
     std::uint64_t frontNs = 0;
     std::uint64_t backNs = 0;
     std::uint64_t retries = 0;
+    std::uint64_t flatTaken = 0;
+    std::uint64_t flatSame = 0;
+    std::uint64_t flatNs = 0;
+    std::uint64_t flatBytes = 0;
+    std::uint64_t flatLost = 0;
+    std::uint64_t flatTimed = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(FrontLeft::Count)> left{};
     std::array<std::uint64_t, static_cast<std::size_t>(TeachRefusal::Count)> refused{};
 };
@@ -143,6 +179,11 @@ public:
     [[nodiscard]] std::string Compare(const CoreDraw& candidate, const DriverDetail::DrawDecode& decode, std::span<const Graphics::CompiledShader> stages, const DrawRecipe* recipe) const;
     void NoteVerified(bool mismatch);
     void Release(std::shared_ptr<CoreDraw> record);
+    [[nodiscard]] FrontOutcome Flat(const FlatInputs& inputs);
+    void FlatPosted(const std::byte* op);
+    [[nodiscard]] static FlatDraw FlatRead(const std::byte* op);
+    void FlatEmitted(const FlatDraw& draw);
+    static void FlatPatch(const FlatDraw& draw, std::size_t stage, ShaderRecompiler::RecompileResult& out);
 
     static void Patch(const RunPlanData& plan, std::size_t stage, const VariantStage& taught, const StageWalk& walk, std::span<const std::uint32_t> userData, const ShaderRecompiler::ShaderVertexStageInfo* vertex, ShaderRecompiler::RecompileResult& out);
 

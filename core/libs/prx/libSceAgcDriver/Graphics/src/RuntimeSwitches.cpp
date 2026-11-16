@@ -197,11 +197,20 @@ struct BlockSwitches {
     bool stats = false;
     bool coreRun = false;
     bool verifyCoreRun = false;
+    bool flatDraw = false;
+    bool lightLane = false;
+    bool verifyLightLane = false;
+    std::uint32_t clockPeriod = 64;
     std::size_t ringMax = 16384;
     BlockSwitches() {
         verify = std::getenv("APS5_VERIFY_DRAW_BLOCK") != nullptr;
         verifyCoreRun = std::getenv("APS5_VERIFY_CORE_RUN") != nullptr;
         coreRun = verifyCoreRun || std::getenv("APS5_CORE_RUN") != nullptr;
+        flatDraw = coreRun && std::getenv("APS5_CORE_FLAT_DRAW") != nullptr;
+        verifyLightLane = std::getenv("APS5_VERIFY_CORE_LIGHT_LANE") != nullptr;
+        lightLane = !verifyLightLane && std::getenv("APS5_CORE_LIGHT_LANE") != nullptr;
+        if (const char* text = std::getenv("APS5_CORE_CLOCK_PERIOD")) clockPeriod = static_cast<std::uint32_t>(std::min<unsigned long long>(std::strtoull(text, nullptr, 10), 65536ull));
+        if (verifyLightLane || verifyCoreRun) clockPeriod = 1;
         blocks = verify || coreRun || std::getenv("APS5_DRAW_BLOCK") != nullptr;
         stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
         if (const char* text = std::getenv("APS5_CORE_RING_MAX")) ringMax = static_cast<std::size_t>(std::min<unsigned long long>(std::strtoull(text, nullptr, 10), 4194304ull));
@@ -245,6 +254,22 @@ bool VerifyCoreRun() {
 
 bool CoreRunStats() {
     return Blocks().stats;
+}
+
+bool CoreFlatDraw() {
+    return Blocks().flatDraw;
+}
+
+bool CoreLightLane() {
+    return Blocks().lightLane;
+}
+
+bool VerifyCoreLightLane() {
+    return Blocks().verifyLightLane;
+}
+
+std::uint32_t CoreClockPeriod() {
+    return Blocks().clockPeriod;
 }
 
 void ForceDrawBlocks(bool blocks, bool verify) {

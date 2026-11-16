@@ -71,6 +71,10 @@ bool DrawBlockStats();
 bool CoreRun();
 bool VerifyCoreRun();
 bool CoreRunStats();
+bool CoreFlatDraw();
+bool CoreLightLane();
+bool VerifyCoreLightLane();
+std::uint32_t CoreClockPeriod();
 void ForceDrawBlocks(bool blocks, bool verify);
 void UnforceDrawBlocks();
 

@@ -1843,7 +1843,7 @@ DrawPipeline::Watch DrawPipeline::WatchWrites() {
     return watch;
 }
 
-bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& reads) {
+bool DrawPipeline::WrittenSince(const Watch& watch, std::span<const Range> reads) {
     const auto overlaps = [&reads](const std::vector<Range>& writes) {
         return std::any_of(reads.begin(), reads.end(), [&writes](const Range& read) {
             return std::any_of(writes.begin(), writes.end(), [&read](const Range& write) { return read.first < write.second && write.first < read.second; });
@@ -1863,7 +1863,7 @@ bool DrawPipeline::WrittenSince(const Watch& watch, const std::vector<Range>& re
     return retiredNow - watch.retired > watch.items || overlaps(watch.writes);
 }
 
-std::optional<bool> DrawPipeline::WrittenWhileQueued(std::uint64_t retiredBefore, const std::vector<Range>& reads) {
+std::optional<bool> DrawPipeline::WrittenWhileQueued(std::uint64_t retiredBefore, std::span<const Range> reads) {
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
     if (flat != nullptr) return flat->Ledger().OverlapsUnretired(retiredBefore, reads);
     std::lock_guard lock(mutex);

@@ -486,8 +486,19 @@ std::pair<std::uint64_t, std::shared_ptr<DrawEntry>> shapeRecipeDonor(const std:
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
-    PerformanceTimer timing("Driver.Draw");
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool flatEarly = Graphics::CoreFlatDraw() && !profile && std::getenv("APS5_DUMP_GRAPHICS_SHADERS") == nullptr && std::getenv("APS5_DUMP_DRAW_SHADERS") == nullptr && std::getenv("APS5_DUMP_DRAW_SLOT1") == nullptr && std::getenv("APS5_LOCKED_DRAW_PREPARE") == nullptr && drawEntries() && registerKeyEnabled() && !TraceDrawPrograms() && !TraceShaderCorrelation() && !verifyDrawDataHits() && !verifyDrawEntries() && !verifyDrawRecipe() && DrawFinisher::Enabled();
+    Core::FrontOutcome early;
+    if (flatEarly && submission.queue == 0 && queue.predication.operation == 0 && DrawPipeline::Active() && !Pm4::IndirectDrawOpcode((packet[0] >> 8u) & 0xffu) && deferredLabels().labels.empty() && !ShaderRecompiler::DebugProbeActive()) {
+        if (const auto earlyDevice = device.Load()) {
+            const auto earlyParameters = Pm4::ResolveDraw(packet, queue);
+            if (tryFlatDraw(queue, packet, submission, earlyParameters, earlyDevice->Serial(), early)) {
+                queue.runMask.Drawn();
+                return DrawVerdict::Drawn;
+            }
+        }
+    }
+    PerformanceTimer timing("Driver.Draw");
     auto tailHolder = RecycledDrawTails() ? std::allocate_shared<DrawTail>(RecycledBlocks<DrawTail, DrawTailBlocks>{}) : std::make_shared<DrawTail>();
     if (RecycledDrawTails()) noteDrawTails();
     auto& tail = *tailHolder;
@@ -575,7 +586,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     static const bool coreRun = Graphics::CoreRun();
     if (coreRun) {
         const bool eligible = registerKey && pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !TraceDrawPrograms() && traceToken == 0 && !verifyDrawDataHits() && !verifyDrawEntries() && !verifyDrawRecipe() && deferredLabels().labels.empty() && DrawFinisher::Enabled() && submission.queue == 0 && queue.predication.operation == 0;
-        const bool taken = eligible && tryCoreDraw(queue, packet, submission, drawParameters, localDevice->Serial(), tail.core);
+        static const bool flatDraw = Graphics::CoreFlatDraw();
+        bool taken = false;
+        if (early.looked) tail.core = std::move(early);
+        else taken = eligible && (flatDraw ? tryFlatDraw(queue, packet, submission, drawParameters, localDevice->Serial(), tail.core) : tryCoreDraw(queue, packet, submission, drawParameters, localDevice->Serial(), tail.core));
         queue.runMask.Drawn();
         if (tail.core.candidate != nullptr && !taken) {
             const auto full = decodeDraw(queue, submission, localDevice->graphicsContext());

@@ -465,6 +465,12 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/RunPlan.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/ResourceCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/Front.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/Op.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DecodeLane.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DecodeDraw.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/FrontMemo.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/CoarseClock.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/TailMeter.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/Back.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DrawBlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp

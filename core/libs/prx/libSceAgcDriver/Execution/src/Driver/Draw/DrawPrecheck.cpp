@@ -53,6 +53,35 @@ bool Driver::drawPrecheck() {
     return precheck;
 }
 
+bool Driver::precheckPlain(const QueueState& queue, const Pm4::DrawParameters& drawParameters) {
+    if (Graphics::DecodeColorMetadataPass(queue) || Graphics::DecodeDepthExpandPass(queue) || Graphics::DecodeDepthCopyPass(queue)) return false;
+    if (const auto control = Graphics::DecodeDepthRenderControl(queue); control && control->samples != 1u) return false;
+    if (Graphics::DepthResummarizeDrawsNothing(queue) || !Graphics::DepthMaintenanceRejection(queue).empty()) return false;
+    {
+        const auto targetMask = queue.context.find(0x8e);
+        const auto shaderMask = queue.context.find(0x8f);
+        const bool colorWrites = targetMask != queue.context.end() && shaderMask != queue.context.end() && Graphics::ColorWriteMask(queue.context) != 0;
+        if (!colorWrites && !queue.shader.contains(0x8)) {
+            const auto word = [&](std::uint32_t offset) { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0u : it->second; };
+            if ((word(0x200) & 3u) == 0 || ((word(0x010) & 3u) == 0 && (word(0x011) & 1u) == 0)) return false;
+        }
+    }
+    if (drawParameters.indexed) {
+        const auto restart = queue.userConfig.find(0x24b);
+        if (restart != queue.userConfig.end() && restart->second != 0) {
+            const auto resetIndex = queue.context.find(0x103);
+            const auto primitive = queue.userConfig.find(0x242);
+            const std::uint32_t allOnes = drawParameters.indexSize == 2 ? 0xffffu : 0xffffffffu;
+            const auto type = primitive == queue.userConfig.end() ? 0u : primitive->second & 0x3fu;
+            const bool strip = type == 3 || type == 5 || type == 6 || type == 21;
+            const bool list = type == 1 || type == 2 || type == 4;
+            if (!strip && !list) return false;
+            if (resetIndex == queue.context.end() || (resetIndex->second & allOnes) != allOnes) return false;
+        }
+    }
+    return !drawPrecheck() || Graphics::DrawRejection(queue, drawParameters.indexed).empty();
+}
+
 std::optional<DrawVerdict> Driver::precheckDraw(const QueueState& queue, const Submission& submission, std::size_t packetOffset, std::span<const std::uint32_t> packet, const Pm4::DrawParameters& drawParameters, std::string& rejected, bool& traceIndirect) {
     if (!drawParameters.indirect && !drawParameters.indexed && (drawParameters.indexCount == 0 || drawParameters.instanceCount == 0)) return DrawVerdict::Nothing;
     const auto metadata = Graphics::DecodeColorMetadataPass(queue);

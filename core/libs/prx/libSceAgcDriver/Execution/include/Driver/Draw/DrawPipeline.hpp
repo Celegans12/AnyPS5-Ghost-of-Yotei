@@ -86,8 +86,8 @@ public:
     bool Overlaps(std::uint64_t address, std::size_t bytes);
     bool OverlapsAny(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     Watch WatchWrites();
-    bool WrittenSince(const Watch& watch, const std::vector<Range>& reads);
-    std::optional<bool> WrittenWhileQueued(std::uint64_t retiredBefore, const std::vector<Range>& reads);
+    bool WrittenSince(const Watch& watch, std::span<const Range> reads);
+    std::optional<bool> WrittenWhileQueued(std::uint64_t retiredBefore, std::span<const Range> reads);
     std::uint64_t Retired() const;
     void NoteDecodeDrain() { decodeDrains.fetch_add(1, std::memory_order_relaxed); }
     std::uint64_t DecodeDrains() const { return decodeDrains.load(std::memory_order_relaxed); }

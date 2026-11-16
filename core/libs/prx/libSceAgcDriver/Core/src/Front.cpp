@@ -1,4 +1,6 @@
 #include "prx/libSceAgcDriver/Core/include/Front.hpp"
+#include "prx/libSceAgcDriver/Core/include/Back.hpp"
+#include "prx/libSceAgcDriver/Core/include/CoarseClock.hpp"
 #include "prx/libSceAgcDriver/Core/include/ResourceCache.hpp"
 #include "prx/libSceAgcDriver/Core/include/RunPlan.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -11,20 +13,26 @@
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DrawBlock.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include "Optimization/BlockLayout.hpp"
+#include "Optimization/ShaderStageInputInfo.hpp"
 #include "Optimization/SrtWalker/SrtTape.hpp"
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <stdexcept>
 
 namespace AgcDriver::Core {
 
@@ -37,7 +45,7 @@ constexpr std::uint32_t NoBinding = 0xffffffffu;
 constexpr std::uint64_t EveryProgram = 1;
 
 struct Counters {
-    std::atomic<std::uint64_t> draws{0}, continued{0}, plans{0}, taken{0}, takenContinued{0}, taught{0}, verified{0}, mismatches{0}, digests{0}, committed{0}, restarted{0}, walkNs{0}, frontNs{0}, backNs{0}, retries{0};
+    std::atomic<std::uint64_t> draws{0}, continued{0}, plans{0}, taken{0}, takenContinued{0}, taught{0}, verified{0}, mismatches{0}, digests{0}, committed{0}, restarted{0}, walkNs{0}, frontNs{0}, backNs{0}, retries{0}, flatTaken{0}, flatSame{0}, flatNs{0}, flatBytes{0}, flatLost{0}, flatTimed{0};
     std::array<std::atomic<std::uint64_t>, 8> sections{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrontLeft::Count)> left{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TeachRefusal::Count)> refused{};
@@ -140,6 +148,93 @@ bool sameBinding(const ShaderRecompiler::DescriptorBinding& a, const ShaderRecom
     return a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.guestDescriptor == b.guestDescriptor;
 }
 
+void bump(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
+    counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+
+constexpr std::uint32_t OpWords = static_cast<std::uint32_t>(sizeof(Op) / sizeof(std::uint32_t));
+constexpr std::uint32_t DrawIndex8 = 4u;
+constexpr std::size_t MostRanges = 96;
+constexpr std::size_t MostReads = 160;
+constexpr std::size_t MostUserWords = 4u * 64u;
+
+struct FlatReader {
+    std::array<Range, MostRanges> ranges;
+    std::size_t count = 0;
+    std::array<Range, MostReads> reads;
+    std::size_t readCount = 0;
+    bool overflow = false;
+
+    bool Note(std::uint64_t begin, std::uint64_t end) {
+        if (count != 0 && ranges[count - 1].second == begin) {
+            ranges[count - 1].second = end;
+            return true;
+        }
+        if (count == ranges.size()) {
+            overflow = true;
+            return false;
+        }
+        ranges[count++] = {begin, end};
+        return true;
+    }
+
+    bool Reads(std::uint64_t begin, std::uint64_t bytes) {
+        if (begin == 0 || bytes == 0 || bytes > ~std::uint64_t{0} - begin) return true;
+        if (readCount == reads.size()) {
+            overflow = true;
+            return false;
+        }
+        reads[readCount++] = {begin, begin + bytes};
+        return true;
+    }
+};
+
+bool flatReadWord(void* context, std::uint64_t address, std::uint32_t* value) {
+    auto& reader = *static_cast<FlatReader*>(context);
+    if (!ReadGuestBytes(address, std::as_writable_bytes(std::span<std::uint32_t>(value, 1)))) return false;
+    return reader.Note(address, address + sizeof(std::uint32_t));
+}
+
+RingChunk plainChunk(void* context, std::size_t bytes) {
+    static_cast<void>(context);
+    auto* memory = static_cast<std::byte*>(std::malloc(bytes));
+    if (memory == nullptr) return {};
+    RingChunk chunk;
+    chunk.bytes = memory;
+    chunk.deviceAddress = reinterpret_cast<std::uintptr_t>(memory);
+    chunk.owner = std::shared_ptr<void>(memory, [](void* held) { std::free(held); });
+    return chunk;
+}
+
+std::uint64_t steadyNanoseconds(void* context) {
+    static_cast<void>(context);
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
+std::uint32_t flatWords(const RunPlanData& data, const FrontVariant& variant) {
+    std::uint32_t words = OpWords;
+    for (std::uint32_t stage = 0; stage < data.stageCount; ++stage) {
+        words += data.stages[stage].flatWords + static_cast<std::uint32_t>(data.stages[stage].bufferResult.size()) * 4u + data.stages[stage].userWords;
+        if (variant.stages[stage].vertexInfo) words += static_cast<std::uint32_t>(variant.stages[stage].base->vertexAttributes.size()) * 4u;
+    }
+    return words;
+}
+
+struct FlatState {
+    BlockRing ring{RingSource{&plainChunk, nullptr, nullptr}};
+    std::vector<std::shared_ptr<FrontVariant>> kept;
+    std::shared_ptr<const RunPlanData> plan;
+    StateKey key;
+    std::shared_ptr<FrontVariant> variant;
+    std::array<StageWalk, 4> walks;
+    std::array<std::uint64_t, 2> digest{};
+    FlatReader reader;
+    std::vector<Graphics::DecodeRead> decodeReads;
+    std::array<std::uint32_t, MostUserWords> userData{};
+    std::array<ShaderRecompiler::ShaderVertexStageInfo, 4> vertex{};
+    CoarseClock clock{&steadyNanoseconds, nullptr, Graphics::CoreClockPeriod()};
+};
+
 struct Pool {
     std::mutex mutex;
     std::vector<std::shared_ptr<CoreDraw>> spare;
@@ -153,7 +248,7 @@ Pool& pool() {
 }
 
 const char* FrontLeftName(FrontLeft reason) {
-    static constexpr std::array<const char*, static_cast<std::size_t>(FrontLeft::Count)> names{"entry", "no plan", "programs", "user words", "walk", "no variant", "variant key", "views", "vertex", "queued", "pending", "moved", "stale", "finisher"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(FrontLeft::Count)> names{"entry", "no plan", "programs", "user words", "walk", "no variant", "variant key", "views", "vertex", "queued", "pending", "moved", "stale", "finisher", "nothing to draw", "precheck", "ring", "ranges"};
     return names[static_cast<std::size_t>(reason)];
 }
 
@@ -174,6 +269,44 @@ struct Front::State {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> registers;
     std::vector<std::uint64_t> teaching;
     std::uint64_t walked = 0;
+    FlatState flat;
+
+    void Arrive() {
+        auto& held = counters();
+        teaching.clear();
+        std::vector<std::pair<StateKey, std::shared_ptr<FrontVariant>>> arrived;
+        {
+            const std::lock_guard inboxLock(inboxMutex);
+            arrived.swap(inbox);
+        }
+        for (auto& [key, variant] : arrived) {
+            const auto* known = plans.Find(key);
+            if (known == nullptr) {
+                RunPlan plan;
+                plan.key = key;
+                plan.stageCount = variant->plan->stageCount;
+                plan.resources = std::const_pointer_cast<RunPlanData>(variant->plan);
+                known = plans.Teach(std::move(plan));
+                std::const_pointer_cast<RunPlanData>(variant->plan)->id = known->id;
+            } else {
+                const auto data = std::static_pointer_cast<const RunPlanData>(known->resources);
+                bool same = data->stageCount == variant->plan->stageCount;
+                for (std::uint32_t stage = 0; same && stage < data->stageCount; ++stage) same = data->stages[stage].plan == variant->plan->stages[stage].plan;
+                if (!same) {
+                    add(held.refused[static_cast<std::size_t>(TeachRefusal::PlanDiffers)]);
+                    continue;
+                }
+                variant->plan = data;
+            }
+            ImageSetValue value;
+            value.owner = variant;
+            variants.Keep(ImageSetKey{variant->plan->id, variant->digest}, Proof{}, value);
+            add(held.taught);
+            flat.kept.push_back(variant);
+        }
+        flat.plan = nullptr;
+        flat.variant = nullptr;
+    }
 };
 
 Front::Front() : state(std::make_unique<State>()) {}
@@ -202,6 +335,12 @@ FrontCounts Front::Counted() {
     counts.frontNs = load(held.frontNs);
     counts.backNs = load(held.backNs);
     counts.retries = load(held.retries);
+    counts.flatTaken = load(held.flatTaken);
+    counts.flatSame = load(held.flatSame);
+    counts.flatNs = load(held.flatNs);
+    counts.flatBytes = load(held.flatBytes);
+    counts.flatLost = load(held.flatLost);
+    counts.flatTimed = load(held.flatTimed);
     for (std::size_t index = 0; index < counts.left.size(); ++index) counts.left[index] = load(held.left[index]);
     for (std::size_t index = 0; index < counts.refused.size(); ++index) counts.refused[index] = load(held.refused[index]);
     return counts;
@@ -227,6 +366,11 @@ std::string Front::Report() {
     text += "; not taught:";
     for (std::size_t index = 1; index < counts.refused.size(); ++index) {
         if (counts.refused[index] != 0) text += " " + std::string(TeachRefusalName(static_cast<TeachRefusal>(index))) + " " + std::to_string(counts.refused[index]) + ";";
+    }
+    if (counts.flatTaken != 0 || counts.flatLost != 0) {
+        char flat[256];
+        std::snprintf(flat, sizeof(flat), " flat draws: %llu taken (%llu on the variant of the draw before) at %.2f us at the front (%llu timed), %llu ring bytes, %llu slices dropped", static_cast<unsigned long long>(counts.flatTaken), static_cast<unsigned long long>(counts.flatSame), per(counts.flatNs, counts.flatTimed), static_cast<unsigned long long>(counts.flatTimed), static_cast<unsigned long long>(counts.flatBytes), static_cast<unsigned long long>(counts.flatLost));
+        text += flat;
     }
     return text;
 }
@@ -336,38 +480,7 @@ FrontOutcome Front::Walk(const QueueState& queue, const DriverDetail::ShaderRegi
         return outcome;
     };
     if ((++state->walked & 0xfffu) == 0) state->teaching.clear();
-    if (state->inboxed.exchange(false, std::memory_order_acq_rel)) {
-        state->teaching.clear();
-        std::vector<std::pair<StateKey, std::shared_ptr<FrontVariant>>> arrived;
-        {
-            const std::lock_guard inboxLock(state->inboxMutex);
-            arrived.swap(state->inbox);
-        }
-        for (auto& [key, variant] : arrived) {
-            const auto* known = state->plans.Find(key);
-            if (known == nullptr) {
-                RunPlan plan;
-                plan.key = key;
-                plan.stageCount = variant->plan->stageCount;
-                plan.resources = std::const_pointer_cast<RunPlanData>(variant->plan);
-                known = state->plans.Teach(std::move(plan));
-                std::const_pointer_cast<RunPlanData>(variant->plan)->id = known->id;
-            } else {
-                const auto data = std::static_pointer_cast<const RunPlanData>(known->resources);
-                bool same = data->stageCount == variant->plan->stageCount;
-                for (std::uint32_t stage = 0; same && stage < data->stageCount; ++stage) same = data->stages[stage].plan == variant->plan->stages[stage].plan;
-                if (!same) {
-                    add(held.refused[static_cast<std::size_t>(TeachRefusal::PlanDiffers)]);
-                    continue;
-                }
-                variant->plan = data;
-            }
-            ImageSetValue value;
-            value.owner = variant;
-            state->variants.Keep(ImageSetKey{variant->plan->id, variant->digest}, Proof{}, std::move(value));
-            add(held.taught);
-        }
-    }
+    if (state->inboxed.exchange(false, std::memory_order_acq_rel)) state->Arrive();
     outcome.key = KeyOf(queue, parameters, opcode, device);
     const auto* plan = state->plans.Find(outcome.key);
     if (plan == nullptr) return left(FrontLeft::NoPlan, true);
@@ -494,6 +607,329 @@ FrontOutcome Front::Walk(const QueueState& queue, const DriverDetail::ShaderRegi
     return outcome;
 }
 
+FrontOutcome Front::Flat(const FlatInputs& inputs) {
+    using DriverDetail::DrawFinisher;
+    using DriverDetail::DrawPipeline;
+    auto& held = counters();
+    auto& flat = state->flat;
+    FrontOutcome outcome;
+    outcome.looked = true;
+    const auto& queue = *inputs.queue;
+    const auto& parameters = *inputs.parameters;
+    const auto opcode = (inputs.packet[0] >> 8u) & 0xffu;
+    const bool timed = flat.clock.Tick();
+    const auto started = flat.clock.Now();
+    const bool continued = queue.runMask.Continues();
+    bump(held.draws);
+    if (continued) bump(held.continued);
+    const auto left = [&](FrontLeft reason, bool teach) {
+        bump(held.left[static_cast<std::size_t>(reason)]);
+        if (teach) {
+            const auto asked = outcome.key.Hash();
+            if (std::find(state->teaching.begin(), state->teaching.end(), asked) != state->teaching.end()) teach = false;
+            else state->teaching.push_back(asked);
+        }
+        outcome.teach = teach;
+        outcome.candidate = nullptr;
+        return outcome;
+    };
+    if ((++state->walked & 0xfffu) == 0) state->teaching.clear();
+    if (state->inboxed.load(std::memory_order_acquire) && state->inboxed.exchange(false, std::memory_order_acq_rel)) state->Arrive();
+    outcome.key = KeyOf(queue, parameters, opcode, inputs.device);
+    if (flat.plan == nullptr || !(outcome.key == flat.key)) {
+        const auto* plan = state->plans.Find(outcome.key);
+        if (plan == nullptr) {
+            flat.plan = nullptr;
+            flat.variant = nullptr;
+            return left(FrontLeft::NoPlan, true);
+        }
+        auto found = std::static_pointer_cast<const RunPlanData>(plan->resources);
+        if (found != flat.plan) {
+            flat.plan = std::move(found);
+            flat.variant = nullptr;
+        }
+        flat.key = outcome.key;
+    }
+    const auto& data = *flat.plan;
+    if (!DriverDetail::DecodeProgramsCurrent(*data.decode, *inputs.shaders)) {
+        state->plans.Forget(EveryProgram);
+        flat.plan = nullptr;
+        flat.variant = nullptr;
+        return left(FrontLeft::Programs, true);
+    }
+    if (!parameters.indexed && (parameters.indexCount == 0 || parameters.instanceCount == 0)) return left(FrontLeft::Nothing, false);
+    if (data.precheck == 0) data.precheck = inputs.plain(inputs.context, queue, parameters) ? 1 : 2;
+    if (data.precheck == 2) return left(FrontLeft::Precheck, false);
+    bump(held.plans);
+    const auto& programs = data.decode->programs;
+    std::array<std::span<const std::uint32_t>, 4> userData;
+    std::uint32_t userWords = 0;
+    for (std::uint32_t stage = 0; stage < data.stageCount; ++stage) {
+        const auto& program = programs[stage];
+        const auto count = userWordCount(queue, program);
+        if (count != data.stages[stage].userWords || userWords + count > flat.userData.size()) return left(FrontLeft::UserWords, false);
+        auto* words = flat.userData.data() + userWords;
+        for (std::uint32_t index = 0; index < count; ++index) words[index] = DriverDetail::readUserData(queue.shader, program.userDataBase + index);
+        userData[stage] = std::span<const std::uint32_t>(words, count);
+        userWords += count;
+    }
+    auto& pipeline = DrawPipeline::Queue0();
+    auto& reader = flat.reader;
+    FrontVariant* variant = nullptr;
+    std::shared_ptr<FrontVariant> fetched;
+    std::array<std::uint64_t, 2> digest{};
+    bool same = false;
+    for (int pass = 0;; ++pass) {
+        const bool watched = pass != 0;
+        reader.count = 0;
+        reader.readCount = 0;
+        reader.overflow = false;
+        DrawPipeline::Watch watch;
+        if (watched) watch = pipeline.WatchWrites();
+        const auto retired = pipeline.Retired();
+        const auto publish = Graphics::Recorder::PublishGeneration();
+        const auto pendingSerial = Graphics::StorageTexture::PendingSerial();
+        const auto forget = GuestMemory::ForgetSerial();
+        if ((forget & 1u) != 0) return left(FrontLeft::Moved, false);
+        digest = {0x6a09e667f3bcc908ull, 0xbb67ae8584caa73bull};
+        {
+            const GuestMemory::ReadSiteScope readSite(GuestMemory::ReadSite::DrawCache);
+            for (std::uint32_t stage = 0; stage < data.stageCount; ++stage) {
+                ShaderRecompiler::SrtRuntime runtime;
+                runtime.userData = userData[stage];
+                runtime.shaderBase = programs[stage].binary.codeAddress;
+                runtime.userContext = &reader;
+                runtime.readMemory = &flatReadWord;
+                runtime.readSpecializationMemory = &flatReadWord;
+                auto& walk = flat.walks[stage];
+                if (!data.stages[stage].tape->Run(*data.stages[stage].plan, runtime, walk.results, walk.flat, walk.active)) return left(reader.overflow ? FrontLeft::Ranges : FrontLeft::Walk, false);
+                mixWalk(digest, data.stages[stage], walk);
+            }
+        }
+        same = flat.variant != nullptr && digest == flat.digest;
+        if (same) {
+            variant = flat.variant.get();
+        } else {
+            ImageSetValue found;
+            if (state->variants.Find(ImageSetKey{data.id, digest}, Proof{}, found) != Hit::Fresh) return left(FrontLeft::NoVariant, true);
+            fetched = std::static_pointer_cast<FrontVariant>(found.owner);
+            variant = fetched.get();
+            if (variant->plan.get() != &data) return left(FrontLeft::NoVariant, true);
+        }
+        for (std::uint32_t stage = 0; stage < data.stageCount; ++stage) {
+            if (!sameKey(data.stages[stage], variant->stages[stage].taught, flat.walks[stage])) return left(FrontLeft::NoVariant, true);
+        }
+        if (variant->stale.load(std::memory_order_acquire)) return left(FrontLeft::Stale, true);
+        if (parameters.indexed && parameters.indexSize != 0 && parameters.indexCount != 0 && !reader.Reads(parameters.indexAddress, static_cast<std::uint64_t>(parameters.indexCount) * parameters.indexSize)) return left(FrontLeft::Ranges, false);
+        for (std::uint32_t stage = 0; stage < data.stageCount; ++stage) {
+            const auto& taught = variant->stages[stage];
+            const auto& planStage = data.stages[stage];
+            const auto& walk = flat.walks[stage];
+            if (walk.flat.size() < planStage.flatWords) return left(FrontLeft::Walk, false);
+            if (ShaderRecompiler::BlockVariantKey(taught.base->blockLayout, walk.flat, userData[stage]) != taught.variantKey) return left(FrontLeft::VariantKey, false);
+            for (std::size_t element = 0; element < planStage.bufferResult.size(); ++element) {
+                const auto slot = planStage.bufferResult[element];
+                if (slot < 0) continue;
+                const auto& raw = walk.results[static_cast<std::size_t>(slot)].dwords;
+                const ShaderRecompiler::ShaderBufferResource descriptor{{raw[0], raw[1], (planStage.bufferMask[element] & 4u) != 0u ? raw[2] : 0u, 0u}};
+                if (!reader.Reads(descriptor.Base48(), descriptor.GetSize())) return left(FrontLeft::Ranges, false);
+            }
+            if (taught.registeredViews != nullptr && !DriverDetail::CaptureRegisteredViewsCurrent(*taught.registeredViews)) return left(FrontLeft::Views, true);
+            if (!taught.vertexInfo) continue;
+            auto& fresh = flat.vertex[stage];
+            if (!decodeVertex(programs[stage], userData[stage], *taught.vertexInfo, flat.decodeReads, fresh)) return left(FrontLeft::Vertex, false);
+            if (flat.decodeReads.empty() || !DriverDetail::Driver::CoreVertexInputsMatch(*taught.vertexInfo, fresh)) return left(FrontLeft::Vertex, false);
+            for (const auto& attribute : taught.base->vertexAttributes) {
+                if (attribute.location >= fresh.resourcesNum) return left(FrontLeft::Vertex, false);
+                auto bound = attribute;
+                bound.resource = fresh.resources[attribute.location];
+                if (Graphics::NullVertexDescriptor(bound)) continue;
+                std::uint64_t bytes = 0;
+                try {
+                    if (Graphics::VertexFetchOutOfRange(bound)) continue;
+                    bytes = Graphics::VertexBufferExtent(bound);
+                } catch (const std::runtime_error&) {
+                    continue;
+                }
+                if (!reader.Reads(bound.resource.fields[0] | (static_cast<std::uint64_t>(bound.resource.fields[1] & 0xffffu) << 32u), bytes)) return left(FrontLeft::Ranges, false);
+            }
+            for (const auto& read : flat.decodeReads) {
+                if (!reader.Note(read.address, read.address + read.size)) return left(FrontLeft::Ranges, false);
+            }
+        }
+        const std::span<const Range> ranges(reader.ranges.data(), reader.count);
+        if (DrawFinisher::Busy() && DrawFinisher::Get().PendingOverlapsAny(ranges)) return left(FrontLeft::Finisher, false);
+        if (!watched) {
+            const auto queued = pipeline.WrittenWhileQueued(retired, ranges);
+            if (!queued.has_value()) {
+                add(held.retries);
+                continue;
+            }
+            if (*queued) return left(FrontLeft::Queued, false);
+        } else if (!(watch.items == 0 && !pipeline.Busy() && pipeline.Retired() == watch.retired) && pipeline.WrittenSince(watch, ranges)) {
+            return left(FrontLeft::Queued, false);
+        }
+        DriverDetail::PendingView pending;
+        pending.Load();
+        for (const auto& [begin, end] : ranges) {
+            if (pending.Overlaps(begin, static_cast<std::size_t>(end - begin))) return left(FrontLeft::Pending, false);
+        }
+        if (Graphics::StorageTexture::AnyPendingOverlaps(ranges) || Graphics::AnyShadowedOverlaps(ranges)) return left(FrontLeft::Pending, false);
+        if (Graphics::Recorder::PublishGeneration() != publish || Graphics::StorageTexture::PendingSerial() != pendingSerial || GuestMemory::ForgetSerial() != forget) return left(FrontLeft::Moved, false);
+        break;
+    }
+    if (!same) {
+        flat.variant = std::move(fetched);
+        flat.digest = digest;
+    }
+    outcome.variant = variant;
+    outcome.reads = std::span<const Range>(reader.reads.data(), reader.readCount);
+    if (inputs.verifyOnly) {
+        auto record = std::make_shared<CoreDraw>();
+        record->variant = flat.variant;
+        record->parameters = parameters;
+        record->opcode = opcode;
+        for (std::uint32_t stage = 0; stage < data.stageCount; ++stage) {
+            record->userData[stage].assign(userData[stage].begin(), userData[stage].end());
+            record->walks[stage] = flat.walks[stage];
+            if (variant->stages[stage].vertexInfo) record->vertex[stage] = flat.vertex[stage];
+        }
+        outcome.candidate = std::move(record);
+        return outcome;
+    }
+    const auto words = flatWords(data, *variant);
+    const auto slice = flat.ring.Take(static_cast<std::size_t>(words) * sizeof(std::uint32_t), 16);
+    if (slice.bytes == nullptr) return left(FrontLeft::Ring, false);
+    auto* const first = reinterpret_cast<std::uint32_t*>(slice.bytes);
+    auto* out = first + OpWords;
+    Op op = MakeOp(OpKind::Draw);
+    op.stages = static_cast<std::uint8_t>(data.stageCount);
+    op.epoch = static_cast<std::uint32_t>(inputs.epoch);
+    op.order = inputs.epoch;
+    for (std::uint32_t stage = 0; stage < data.stageCount; ++stage) {
+        const auto& planStage = data.stages[stage];
+        const auto& walk = flat.walks[stage];
+        op.draw.section[stage] = static_cast<std::uint32_t>((out - first) * sizeof(std::uint32_t));
+        std::copy_n(walk.flat.begin(), planStage.flatWords, out);
+        out += planStage.flatWords;
+        for (std::size_t element = 0; element < planStage.bufferResult.size(); ++element, out += 4) {
+            const auto slot = planStage.bufferResult[element];
+            for (std::uint32_t dword = 0; dword < 4; ++dword) out[dword] = slot < 0 ? 0u : walk.results[static_cast<std::size_t>(slot)].dwords[dword];
+        }
+        std::copy(userData[stage].begin(), userData[stage].end(), out);
+        out += userData[stage].size();
+    }
+    for (std::uint32_t stage = 0; stage < data.stageCount; ++stage) {
+        const auto& taught = variant->stages[stage];
+        if (!taught.vertexInfo) continue;
+        for (const auto& attribute : taught.base->vertexAttributes) {
+            for (std::uint32_t field = 0; field < 4; ++field) out[field] = flat.vertex[stage].resources[attribute.location].fields[field];
+            out += 4;
+        }
+    }
+    op.draw.variant = variant;
+    op.draw.slice = slice;
+    op.draw.indexAddress = parameters.indexAddress;
+    op.draw.indexBytes = parameters.indexSize;
+    op.draw.indexCount = parameters.indexCount;
+    op.draw.firstIndex = parameters.flags;
+    op.draw.baseVertex = static_cast<std::int32_t>(parameters.firstVertex);
+    op.draw.instances = parameters.instanceCount;
+    op.draw.firstInstance = parameters.firstInstance;
+    op.draw.extra = 0;
+    op.draw.extraWords = static_cast<std::uint32_t>(out - first);
+    op.draw.opcode = opcode;
+    op.draw.drawFlags = (parameters.indexed ? DrawIndexed : 0u) | (parameters.indexSize == 4u ? DrawIndex32 : parameters.indexSize == 1u ? DrawIndex8 : 0u);
+    std::memcpy(first, &op, sizeof(op));
+    outcome.op = slice.bytes;
+    outcome.taken = true;
+    bump(held.taken);
+    bump(held.flatTaken);
+    if (continued) bump(held.takenContinued);
+    if (same) bump(held.flatSame);
+    bump(held.flatBytes, static_cast<std::uint64_t>(words) * sizeof(std::uint32_t));
+    if (timed) {
+        bump(held.flatNs, steadyNanoseconds(nullptr) - started);
+        bump(held.flatTimed);
+    }
+    return outcome;
+}
+
+void Front::FlatPosted(const std::byte* at) {
+    Op op = MakeOp(OpKind::None);
+    std::memcpy(&op, at, sizeof(op));
+    state->flat.ring.Posted(op.draw.slice);
+}
+
+FlatDraw Front::FlatRead(const std::byte* at) {
+    FlatDraw draw{MakeOp(OpKind::None)};
+    std::memcpy(&draw.op, at, sizeof(Op));
+    draw.variant = static_cast<FrontVariant*>(const_cast<void*>(draw.op.draw.variant));
+    const auto& data = *draw.variant->plan;
+    const auto* begin = reinterpret_cast<const std::uint32_t*>(at);
+    const auto* words = begin + OpWords;
+    for (std::uint32_t stage = 0; stage < data.stageCount; ++stage) {
+        const auto& planStage = data.stages[stage];
+        draw.section[stage] = std::span<const std::uint32_t>(words, planStage.flatWords);
+        words += planStage.flatWords;
+        draw.buffers[stage] = std::span<const std::uint32_t>(words, planStage.bufferResult.size() * 4u);
+        words += planStage.bufferResult.size() * 4u;
+        draw.userData[stage] = std::span<const std::uint32_t>(words, planStage.userWords);
+        words += planStage.userWords;
+    }
+    draw.vertex = std::span<const std::uint32_t>(words, begin + draw.op.draw.extraWords);
+    return draw;
+}
+
+void Front::FlatEmitted(const FlatDraw& draw) {
+    state->flat.ring.Emitted(draw.op.draw.slice, 0);
+}
+
+void Front::FlatPatch(const FlatDraw& draw, std::size_t stage, ShaderRecompiler::RecompileResult& out) {
+    const auto& variant = *draw.variant;
+    const auto& data = *variant.plan;
+    const auto& taught = variant.stages[stage];
+    const auto& base = *taught.base;
+    const auto& planStage = data.stages[stage];
+    const auto section = draw.section[stage];
+    const auto buffers = draw.buffers[stage];
+    const auto userData = draw.userData[stage];
+    if (taught.flatBinding != NoBinding) {
+        auto& words = out.bindings[taught.flatBinding].guestDescriptor;
+        const auto count = std::min<std::size_t>({words.size(), section.size(), base.blockLayout.words});
+        std::copy_n(section.begin(), count, words.begin());
+    }
+    if (taught.buffersBinding != NoBinding) {
+        auto& words = out.bindings[taught.buffersBinding].guestDescriptor;
+        for (std::size_t element = 0; element < planStage.bufferResult.size() && (element + 1u) * 4u <= words.size(); ++element) {
+            if (planStage.bufferResult[element] < 0) continue;
+            for (std::uint32_t dword = 0; dword < 4; ++dword) {
+                if ((planStage.bufferMask[element] >> dword & 1u) != 0u) words[element * 4u + dword] = buffers[element * 4u + dword];
+            }
+        }
+    }
+    const auto& forwarded = base.shaderDataUserWords;
+    for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
+        if (forwarded[slot] >= userData.size() || (base.blockModule && slot - base.blockAddressDword < 2u)) continue;
+        const auto value = userData[forwarded[slot]];
+        const auto at = static_cast<std::size_t>(slot) * sizeof(std::uint32_t);
+        if (at + sizeof(std::uint32_t) <= out.pushConstants.size()) std::memcpy(out.pushConstants.data() + at, &value, sizeof(value));
+        for (auto& binding : out.bindings) {
+            if (binding.role == Role::ShaderData && slot < binding.guestDescriptor.size()) binding.guestDescriptor[slot] = value;
+        }
+    }
+    if (!taught.vertexInfo) return;
+    std::size_t at = 0;
+    for (std::size_t before = 0; before < stage; ++before) {
+        if (variant.stages[before].vertexInfo) at += variant.stages[before].base->vertexAttributes.size() * 4u;
+    }
+    for (auto& attribute : out.vertexAttributes) {
+        if (at + 4u > draw.vertex.size()) break;
+        for (std::uint32_t field = 0; field < 4; ++field) attribute.resource.fields[field] = draw.vertex[at + field];
+        at += 4u;
+    }
+}
+
 void Front::Release(std::shared_ptr<CoreDraw> record) {
     if (record == nullptr) return;
     record->variant = nullptr;
@@ -584,6 +1020,7 @@ void Front::Teach(const TeachInputs& inputs) {
                 planStage.keyResult[slot] = 0u;
             }
         }
+        planStage.flatWords = layout.words;
         const auto& forwarded = result.shaderDataUserWords;
         for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
             if (forwarded[slot] >= program.userData.size() || slot - result.blockAddressDword < 2u) continue;
@@ -663,6 +1100,95 @@ std::string Front::Compare(const CoreDraw& candidate, const DriverDetail::DrawDe
 }
 
 namespace AgcDriver::DriverDetail {
+
+bool Driver::tryFlatDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, const Pm4::DrawParameters& drawParameters, std::uint64_t deviceSerial, Core::FrontOutcome& outcome) {
+    static const bool verify = Graphics::VerifyCoreRun();
+    static const bool stats = Graphics::CoreRunStats();
+    auto& front = Core::Front::Get();
+    Pm4::RefreshDigests(queue);
+    if (verify) front.VerifyDigests(queue);
+    Core::FlatInputs inputs;
+    inputs.queue = &queue;
+    inputs.shaders = submission.shaders.get();
+    inputs.packet = packet;
+    inputs.parameters = &drawParameters;
+    inputs.device = deviceSerial;
+    inputs.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+    inputs.verifyOnly = verify;
+    inputs.plain = [](void* context, const QueueState& state, const Pm4::DrawParameters& parameters) { return static_cast<Driver*>(context)->precheckPlain(state, parameters); };
+    inputs.context = this;
+    outcome = front.Flat(inputs);
+    if (stats) {
+        static thread_local std::uint32_t since = 0;
+        if ((++since & 0x3ffu) == 0) {
+            static std::atomic<std::int64_t> lastReport{0};
+            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+            auto last = lastReport.load(std::memory_order_relaxed);
+            if (nowMs - last >= 5000 && lastReport.compare_exchange_strong(last, nowMs)) std::fprintf(stderr, "%s%c", Core::Front::Report().c_str(), 10);
+        }
+    }
+    if (!outcome.taken) return false;
+    auto* const variant = outcome.variant;
+    const auto* const at = outcome.op;
+    const auto epoch = inputs.epoch;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> reads(outcome.reads.begin(), outcome.reads.end());
+    front.FlatPosted(at);
+    if (DrawFinisher::Busy()) {
+        DrawFinisher::Pending held;
+        held.unknown = false;
+        held.writes = variant->writes;
+        DrawFinisher::Get().Enqueue([this, at, variant, epoch, reads = std::move(reads)]() mutable {
+            DrawPipeline::FollowEpoch(epoch);
+            precollectCoreDraw(*variant->recipe, reads);
+            DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [this, at] { commitFlatDraw(at); }, variant->writes, 0, {}, std::move(reads), true);
+        }, std::move(held));
+    } else {
+        DrawPipeline::FollowEpoch(epoch);
+        precollectCoreDraw(*variant->recipe, reads);
+        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [this, at] { commitFlatDraw(at); }, variant->writes, 0, {}, std::move(reads), true);
+    }
+    return true;
+}
+
+void Driver::commitFlatDraw(const std::byte* at) {
+    const auto started = std::chrono::steady_clock::now();
+    const auto draw = Core::Front::FlatRead(at);
+    struct Emitted {
+        const Core::FlatDraw& draw;
+        ~Emitted() { Core::Front::Get().FlatEmitted(draw); }
+    } emitted{draw};
+    DrawPipeline::FollowEpoch(draw.op.order);
+    GuestMemory::SetCurrentPacket(draw.op.draw.opcode, 0);
+    auto& variant = *draw.variant;
+    for (std::uint32_t stage = 0; stage < variant.plan->stageCount; ++stage) Core::Front::FlatPatch(draw, stage, variant.backResults[stage]);
+    const std::span<const Graphics::CompiledShader> stages(variant.backStages);
+    Pm4::DrawParameters parameters{draw.op.draw.indexAddress, draw.op.draw.indexCount, draw.op.draw.indexBytes, draw.op.draw.instances, draw.op.draw.firstIndex, (draw.op.draw.drawFlags & Core::DrawIndexed) != 0u, static_cast<std::uint32_t>(draw.op.draw.baseVertex), draw.op.draw.firstInstance};
+    const auto& graphics = variant.plan->decode->state;
+    bool restarted = false;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
+        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        const auto localDevice = device.Load();
+        struct SubmitDue {
+            Driver& driver;
+            const std::shared_ptr<VulkanDevice>& device;
+            ~SubmitDue() noexcept(false) {
+                if (std::uncaught_exceptions() == 0) driver.submitDueAfterCommit(device.get());
+            }
+        } submitDue{*this, localDevice};
+        recordLabelsForPacket(localDevice.get(), 0);
+        noteDrawWriters(stages, 0);
+        if (!Core::RecordBack(*localDevice, graphics, parameters, stages, variant.recipe)) {
+            restarted = true;
+            variant.stale.store(true, std::memory_order_release);
+            VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
+            localDevice->Draw(graphics, parameters, stages, {}, nullptr, nullptr, variant.shape);
+        }
+        Graphics::NoteDrawSite(variant.shape);
+    }
+    Core::Front::NoteCommitted(restarted, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
+    Core::ReportBack();
+}
 
 bool Driver::tryCoreDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, const Pm4::DrawParameters& drawParameters, std::uint64_t deviceSerial, Core::FrontOutcome& outcome) {
     static const bool verify = Graphics::VerifyCoreRun();
