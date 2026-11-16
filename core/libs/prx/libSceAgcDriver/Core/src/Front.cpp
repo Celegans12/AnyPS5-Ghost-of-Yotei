@@ -1542,7 +1542,7 @@ bool Driver::tryFlatDraw(QueueState& queue, std::span<const std::uint32_t> packe
         std::memcpy(&op, at, sizeof(op));
         front.FlatPosted(at);
         DrawPipeline::FollowEpoch(epoch);
-        precollectCoreDraw(*variant->recipe, outcome.reads);
+        if (!busy) precollectCoreDraw(*variant->recipe, outcome.reads);
         if (!ops->Post(op, variant->writes, outcome.reads, GuestMemory::HeldCollectEpoch())) {
             DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [this, at] { commitFlatDraw(at); }, variant->writes, 0, {}, std::vector<std::pair<std::uint64_t, std::uint64_t>>(outcome.reads.begin(), outcome.reads.end()), true);
             return true;
