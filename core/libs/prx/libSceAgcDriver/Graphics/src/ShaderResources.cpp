@@ -3544,6 +3544,204 @@ bool SameKeySurface(const StorageTexture* source, const GuestTextureResource& re
     return own.dccAddress == resource.dccAddress && source->GuestBytes() == guestBytes && own.format == resource.format && own.dccAlphaOnMsb == resource.dccAlphaOnMsb;
 }
 
+bool TemplateTokenProofs() {
+    static const bool enabled = std::getenv("APS5_TEMPLATE_TOKEN_PROOF") != nullptr && GuestMemory::EpochSweeps();
+    return enabled;
+}
+
+bool TemplateTokenProofsVerified() {
+    static const bool enabled = std::getenv("APS5_VERIFY_TEMPLATE_TOKEN_PROOF") != nullptr;
+    return enabled;
+}
+
+struct TemplateTokenCounters {
+    std::atomic<std::uint64_t> held{0};
+    std::atomic<std::uint64_t> collected{0};
+    std::atomic<std::uint64_t> missed{0};
+    std::atomic<std::uint64_t> taken{0};
+    std::atomic<std::uint64_t> sweepsSkipped{0};
+    std::atomic<std::uint64_t> sweepsMissed{0};
+    std::atomic<std::uint64_t> verified{0};
+};
+
+TemplateTokenCounters& templateTokenCounters() {
+    static TemplateTokenCounters counters;
+    return counters;
+}
+
+struct RangeToken {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::uint64_t generation = 0;
+    GuestMemory::ContentToken token{};
+};
+
+struct SweptTokens {
+    std::weak_ptr<GuestMemory::WriteSubscription> subscription;
+    std::vector<GuestMemory::ContentToken> tokens;
+    std::uint64_t words = 0;
+    bool held = false;
+};
+
+struct TemplateTokens {
+    std::vector<RangeToken> sampled;
+    std::vector<RangeToken> storage;
+    SweptTokens version;
+    SweptTokens index;
+};
+
+struct TemplateTokenTable {
+    std::mutex mutex;
+    std::unordered_map<const void*, std::unique_ptr<TemplateTokens>> entries;
+};
+
+TemplateTokenTable& templateTokenTable() {
+    static TemplateTokenTable table;
+    return table;
+}
+
+TemplateTokens* templateTokens(const void* owner) {
+    if (!TemplateTokenProofs() || GuestMemory::CollectEpoch() == 0) return nullptr;
+    auto& table = templateTokenTable();
+    std::lock_guard lock(table.mutex);
+    auto& entry = table.entries[owner];
+    if (entry == nullptr) entry = std::make_unique<TemplateTokens>();
+    return entry.get();
+}
+
+void dropTemplateTokens(const void* owner) noexcept {
+    if (!TemplateTokenProofs()) return;
+    auto& table = templateTokenTable();
+    std::lock_guard lock(table.mutex);
+    table.entries.erase(owner);
+}
+
+[[noreturn]] void templateTokenDiffers(const char* what, std::uint64_t address, std::size_t bytes) {
+    std::fprintf(stderr, "[template-tokens] APS5_VERIFY_TEMPLATE_TOKEN_PROOF: %s over %#llx+%zu although its content token held\n", what, static_cast<unsigned long long>(address), bytes);
+    std::fflush(stderr);
+    throw std::logic_error(std::string("a template token proof differs from the sweep: ") + what);
+}
+
+struct TokenCandidate {
+    std::size_t element = 0;
+    bool storage = false;
+    bool current = false;
+    bool skipped = false;
+    RangeToken slot{};
+};
+
+struct TokenCollect {
+    std::uint64_t collected = 0;
+    bool current = false;
+    bool skipped = false;
+    GuestMemory::ContentToken token{};
+};
+
+TokenCollect collectByToken(const std::vector<RangeToken>* slots, std::size_t index, GuestMemory::ArmedProof& armed, std::uint64_t address, std::size_t bytes, bool usable) {
+    TokenCollect result;
+    const RangeToken* slot = slots != nullptr && usable && index < slots->size() ? &(*slots)[index] : nullptr;
+    const bool fits = slot != nullptr && slot->token.content != 0 && slot->generation != 0 && slot->address == address && slot->bytes == bytes;
+    if (fits && GuestMemory::StillCurrent(address, bytes, slot->token)) {
+        result.collected = slot->generation;
+        result.current = true;
+        result.skipped = true;
+        result.token = slot->token;
+        return result;
+    }
+    result.collected = GuestMemory::CollectWritesArmed(armed, address, bytes);
+    if (slots == nullptr || !usable || result.collected == 0) return result;
+    if (fits && GuestMemory::StillCurrent(address, bytes, slot->token)) {
+        result.current = true;
+        result.token = slot->token;
+        return result;
+    }
+    result.token = GuestMemory::TokenFor(address, bytes);
+    return result;
+}
+
+bool queryByToken(const std::vector<RangeToken>* slots, std::vector<TokenCandidate>& candidates, std::size_t index, bool storage, const TokenCollect& collect, std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    if (slots == nullptr || collect.token.content == 0 || generation == 0) return false;
+    candidates.push_back({index, storage, collect.current, collect.skipped, {address, bytes, generation, collect.token}});
+    if (!collect.current || index >= slots->size() || (*slots)[index].generation != generation) {
+        templateTokenCounters().missed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    (collect.skipped ? templateTokenCounters().held : templateTokenCounters().collected).fetch_add(1, std::memory_order_relaxed);
+    if (TemplateTokenProofsVerified()) {
+        const bool same = GuestMemory::CollectWrites(address, bytes) != 0 && GuestMemory::UnchangedSince(address, bytes, generation);
+        if (!same && GuestMemory::StillCurrent(address, bytes, collect.token)) templateTokenDiffers("the write tracker reports a write", address, bytes);
+        templateTokenCounters().verified.fetch_add(1, std::memory_order_relaxed);
+        if (!same) return false;
+    }
+    return true;
+}
+
+constexpr std::uint64_t TemplateWordsSeed = 0x9E3779B97F4A7C15ull;
+
+std::uint64_t mixTemplateWords(std::uint64_t hash, std::span<const std::uint32_t> words) {
+    hash = (hash ^ words.size()) * 0x100000001B3ull;
+    for (const auto word : words) hash = (hash ^ word) * 0x100000001B3ull;
+    return hash;
+}
+
+std::uint64_t templateTokenWords(std::span<const CompiledShader> shaders) {
+    auto hash = TemplateWordsSeed;
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) continue;
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::GuestImages) hash = mixTemplateWords(hash, binding.guestDescriptor);
+        }
+    }
+    return hash;
+}
+
+bool takeRangeTokens(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::vector<GuestMemory::ContentToken>& tokens) {
+    tokens.resize(ranges.size());
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        if (ranges[i].second <= ranges[i].first) return false;
+        tokens[i] = GuestMemory::TokenFor(ranges[i].first, static_cast<std::size_t>(ranges[i].second - ranges[i].first));
+        if (tokens[i].content == 0) return false;
+    }
+    return true;
+}
+
+bool rangeTokensHold(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::span<const GuestMemory::ContentToken> tokens) {
+    if (ranges.size() != tokens.size()) return false;
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        if (ranges[i].second <= ranges[i].first || !GuestMemory::StillCurrent(ranges[i].first, static_cast<std::size_t>(ranges[i].second - ranges[i].first), tokens[i])) return false;
+    }
+    return true;
+}
+
+bool sweptByTokens(SweptTokens& swept, const std::shared_ptr<GuestMemory::WriteSubscription>& subscription, std::uint64_t words) {
+    if (!swept.held || subscription == nullptr || swept.words != words || swept.subscription.owner_before(subscription) || subscription.owner_before(swept.subscription)) return false;
+    const auto spans = GuestMemory::SubscriptionSpans(*subscription);
+    if (!rangeTokensHold(spans, swept.tokens)) {
+        templateTokenCounters().sweepsMissed.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (TemplateTokenProofsVerified()) {
+        const auto before = GuestMemory::SubscriptionGeneration(*subscription);
+        const bool same = GuestMemory::SweepSubscription(*subscription) && GuestMemory::SubscriptionGeneration(*subscription) == before;
+        if (!same) {
+            if (!rangeTokensHold(spans, swept.tokens)) return false;
+            templateTokenDiffers("the sweep of a subscription failed or stamped a write", spans.empty() ? 0 : spans.front().first, spans.empty() ? 0 : static_cast<std::size_t>(spans.front().second - spans.front().first));
+        }
+        templateTokenCounters().verified.fetch_add(1, std::memory_order_relaxed);
+    }
+    templateTokenCounters().sweepsSkipped.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void takeSweptTokens(SweptTokens& swept, const std::shared_ptr<GuestMemory::WriteSubscription>& subscription, std::uint64_t words) {
+    swept.held = false;
+    if (subscription == nullptr) return;
+    if (!takeRangeTokens(GuestMemory::SubscriptionSpans(*subscription), swept.tokens)) return;
+    swept.subscription = subscription;
+    swept.words = words;
+    swept.held = true;
+}
+
 void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point start) {
     auto& profile = Revalidations();
     const auto now = std::chrono::steady_clock::now();
@@ -3582,6 +3780,25 @@ void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point s
         profile.refusedSurfaces.clear();
     }
     AgcDriver::ProfilePrint_nid_no_patch("[rescache] revalidate (10 s): %llu calls %.1f ms: fast %llu, full %llu, failed %llu; fast-fail by reason:%s; full walks: T1 refreshed %llu (%llu storage images, %llu view sources, %llu views served by their own pending source, %llu overlaps left by the refresh accepted), full by reason:%s, T1 fallback by reason:%s, proofs verified %llu; fast-fail pending image: own 0 (the query excepts the own object), foreign %llu, snapshot %llu, T1 eligible %llu; keys proven: %llu sampled, %llu storage; epoch gate: %llu registry scans skipped, %llu import loops skipped; lookup log: %llu builds and full walks kept their records past the bound; full walk ms by reason:%s; collect refusals: sampled %llu, storage %llu (uncommitted pages %llu, unwatched %llu, other %llu) over %llu surfaces, %.1f MiB\n", static_cast<unsigned long long>(profile.calls.exchange(0, std::memory_order_relaxed)), profile.nanoseconds.exchange(0, std::memory_order_relaxed) / 1e6, static_cast<unsigned long long>(profile.fast.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.full.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.failed.exchange(0, std::memory_order_relaxed)), reasons.c_str(), static_cast<unsigned long long>(profile.ownRefreshed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownStorageRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownViewRefreshes.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.ownSourceViews.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refreshedOverlaps.exchange(0, std::memory_order_relaxed)), fullReasons.c_str(), fallbacks.c_str(), static_cast<unsigned long long>(profile.proofsVerified.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingForeign.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingSnapshot.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.pendingT1Eligible.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.keysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.storageKeysProven.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.serialSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.importSkips.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(lookupBuildsPastBound.exchange(0, std::memory_order_relaxed)), walkMs.c_str(), static_cast<unsigned long long>(profile.refusedSampled.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedStorage.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUncommitted.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedUnwatched.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(profile.refusedOther.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(refusedSurfaces), static_cast<double>(refusedBytes) / 1048576.0);
+    if (TemplateTokenProofs()) {
+        auto& tokens = templateTokenCounters();
+        static std::array<std::uint64_t, 7> reported{};
+        std::size_t column = 0;
+        const auto take = [&](const std::atomic<std::uint64_t>& count) {
+            const auto now = count.load(std::memory_order_relaxed);
+            const auto since = now - reported[column];
+            reported[column++] = now;
+            return static_cast<unsigned long long>(since);
+        };
+        const auto held = take(tokens.held);
+        const auto collected = take(tokens.collected);
+        const auto missed = take(tokens.missed);
+        const auto taken = take(tokens.taken);
+        const auto sweepsSkipped = take(tokens.sweepsSkipped);
+        const auto sweepsMissed = take(tokens.sweepsMissed);
+        const auto verified = take(tokens.verified);
+        AgcDriver::ProfilePrint_nid_no_patch("[template-tokens] (10 s): surfaces proved by a held token %llu, by a token after a collect %llu, by the write tracker %llu, tokens taken %llu; subscription sweeps answered by tokens %llu, swept %llu; verified %llu\n", held, collected, missed, taken, sweepsSkipped, sweepsMissed, verified);
+    }
     if (!GuestMemory::WriteIndexEnabled()) return;
     const auto index = GuestMemory::WriteIndexCounted();
     GuestMemory::ResetWriteIndexCounts();
@@ -3707,6 +3924,20 @@ void ShaderResources::captureValidation() {
     trim(indices);
 }
 
+bool TakeTemplateTokens(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::span<const std::uint32_t> words, std::vector<GuestMemory::ContentToken>& tokens, std::uint64_t& taken) {
+    taken = mixTemplateWords(TemplateWordsSeed, words);
+    return takeRangeTokens(ranges, tokens);
+}
+
+bool TemplateTokensHold(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::span<const std::uint32_t> words, std::span<const GuestMemory::ContentToken> tokens, std::uint64_t taken) {
+    return mixTemplateWords(TemplateWordsSeed, words) == taken && rangeTokensHold(ranges, tokens);
+}
+
+std::array<std::uint64_t, 7> TemplateTokenProofTotals() {
+    const auto& tokens = templateTokenCounters();
+    return {tokens.held.load(std::memory_order_relaxed), tokens.collected.load(std::memory_order_relaxed), tokens.missed.load(std::memory_order_relaxed), tokens.taken.load(std::memory_order_relaxed), tokens.sweepsSkipped.load(std::memory_order_relaxed), tokens.sweepsMissed.load(std::memory_order_relaxed), tokens.verified.load(std::memory_order_relaxed)};
+}
+
 ShaderResources::CollectRefusals ShaderResources::CollectRefusalCounts() {
     auto& profile = Revalidations();
     CollectRefusals counts;
@@ -3787,6 +4018,11 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     owners.clear();
     images.clear();
     scannedKeys.assign(textures.size(), DccKeys::Uncompressed);
+    auto* tokens = templateTokens(this);
+    struct CandidatesTag {};
+    auto& candidates = ThreadScratch<std::vector<TokenCandidate>, CandidatesTag>();
+    candidates.clear();
+    std::size_t tokenProved = 0;
     const auto query = [&](std::uint64_t begin, std::uint64_t end, const StorageTexture* except, const StorageTexture* identity, PendingOverlap owner) {
         pending.push_back({begin, end, except, identity, false});
         owners.push_back(owner);
@@ -3804,7 +4040,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         if (!FlushDepthPlanes(address, bytes).empty()) return fail(FastFail::Changed);
-        surface.collected = GuestMemory::CollectWritesArmed(surface.armed, address, bytes);
+        const auto collect = collectByToken(tokens != nullptr ? &tokens->sampled : nullptr, i, surface.armed, address, bytes, surface.source != nullptr || surface.generation != 0);
+        surface.collected = collect.skipped && surface.source == nullptr ? surface.generation : collect.collected;
         if (surface.collected == 0 && surface.generation == 0 && surface.committedGeneration != 0 && surface.source == nullptr && !RuntimeSwitches::Set(RuntimeSwitch::NoExtendedFastProofs)) {
             struct CommittedTag {};
             auto& ranges = ThreadScratch<std::vector<std::pair<std::uint64_t, std::uint64_t>>, CommittedTag>();
@@ -3856,10 +4093,13 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         if (source != nullptr) {
             if (!source->Cached()) return fail(FastFail::Evicted);
-            queries.push_back({address, bytes, source->GenerationFor(address, bytes)});
+            const auto generation = source->GenerationFor(address, bytes);
+            if (queryByToken(tokens != nullptr ? &tokens->sampled : nullptr, candidates, i, false, collect, address, bytes, generation)) ++tokenProved;
+            else queries.push_back({address, bytes, generation});
             images.push_back(source);
         } else if (!surface.committedProved) {
-            queries.push_back({address, bytes, surface.generation});
+            if (queryByToken(tokens != nullptr ? &tokens->sampled : nullptr, candidates, i, false, collect, address, bytes, surface.generation)) ++tokenProved;
+            else queries.push_back({address, bytes, surface.generation});
         }
     }
     if (withStorage && storageArmed.size() != storageTextures.size()) storageArmed.assign(storageTextures.size(), GuestMemory::ArmedProof{});
@@ -3875,7 +4115,8 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             if (!indexProof) depthGuardRefusals.fetch_add(1, std::memory_order_relaxed);
             return fail(FastFail::Depth);
         }
-        if (GuestMemory::CollectWritesArmed(storageArmed[i], address, bytes) == 0) {
+        const auto collect = collectByToken(tokens != nullptr ? &tokens->storage : nullptr, i, storageArmed[i], address, bytes, true);
+        if (collect.collected == 0) {
             countCollectRefusal(true, address, bytes);
             return fail(FastFail::Collect);
         }
@@ -3888,7 +4129,9 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         }
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
         if (!image->Cached()) return fail(FastFail::Evicted);
-        queries.push_back({address, bytes, image->GenerationFor(address, bytes)});
+        const auto generation = image->GenerationFor(address, bytes);
+        if (queryByToken(tokens != nullptr ? &tokens->storage : nullptr, candidates, i, true, collect, address, bytes, generation)) ++tokenProved;
+        else queries.push_back({address, bytes, generation});
         images.push_back(image);
     }
     if (!pending.empty()) {
@@ -3931,7 +4174,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
     } else if (unchanged && BuildProfiled()) {
         Revalidations().serialSkips.fetch_add(1, std::memory_order_relaxed);
     }
-    if (!GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
+    if (!(queries.empty() && tokenProved != 0) && !GuestMemory::UnchangedSinceAll(queries)) return fail(FastFail::Changed);
     if (!StorageImagesCached(context, images)) return fail(FastFail::Evicted);
     for (const auto* image : images) image->NoteProved();
     for (std::size_t k = 0; k < elementCount; ++k) {
@@ -3942,6 +4185,16 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             else surface.generation = surface.collected;
         }
         surface.keys = scannedKeys[i];
+    }
+    if (tokens != nullptr) {
+        if (tokens->sampled.size() != textures.size()) tokens->sampled.resize(textures.size());
+        if (tokens->storage.size() != storageTextures.size()) tokens->storage.resize(storageTextures.size());
+        for (const auto& candidate : candidates) {
+            auto& slot = candidate.storage ? tokens->storage[candidate.element] : tokens->sampled[candidate.element];
+            slot = candidate.slot;
+            if (!candidate.storage && validatedTextures[candidate.element].source == nullptr) slot.generation = validatedTextures[candidate.element].generation;
+            if (!candidate.current) templateTokenCounters().taken.fetch_add(1, std::memory_order_relaxed);
+        }
     }
     return true;
 }
@@ -4517,7 +4770,12 @@ ShaderResources::IndexOutcome ShaderResources::indexRevalidate(std::span<const C
     for (const auto& [begin, end] : GuestMemory::SubscriptionSpans(subscription)) {
         if (!FlushDepthPlanes(begin, static_cast<std::size_t>(end - begin)).empty()) return fallback();
     }
-    if (!GuestMemory::SweepSubscription(subscription)) return fallback();
+    auto* tokens = templateTokens(this);
+    const auto words = tokens != nullptr ? templateTokenWords(shaders) : 0;
+    if (tokens == nullptr || !sweptByTokens(tokens->index, writeSubscription, words)) {
+        if (!GuestMemory::SweepSubscription(subscription)) return fallback();
+        if (tokens != nullptr) takeSweptTokens(tokens->index, writeSubscription, words);
+    }
     if ((subscribedPendingSerial == 0 || subscribedPendingSerial != serialBefore) && !IndexBroken("pending")) {
         thread_local std::vector<StorageTexture::PendingQuery>* regionsSlot = nullptr;
         auto& regions = ShaderRecompiler::ThreadOwned(regionsSlot);
@@ -4738,7 +4996,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     if (proofHeld) {
         auto miss = proofMiss(now);
         if (miss == DrawProofMiss::None && provedStamp.versioned) {
+            auto* tokens = versions.subscription != nullptr && versions.sweptEpoch != now.epoch ? templateTokens(this) : nullptr;
+            const auto words = tokens != nullptr ? templateTokenWords(shaders) : 0;
+            const bool byTokens = tokens != nullptr && sweptByTokens(tokens->version, versions.subscription, words);
+            if (byTokens) versions.sweptEpoch = now.epoch;
             const auto generation = GuestMemory::CurrentVersion(versions, now.epoch);
+            if (tokens != nullptr && !byTokens && generation != 0) takeSweptTokens(tokens->version, versions.subscription, words);
             if (generation == 0) miss = DrawProofMiss::Sweep;
             else if (generation != provedGeneration) miss = DrawProofMiss::Versions;
         }
@@ -4782,6 +5045,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         if (takeProof(now)) {
             provedGeneration = generation;
             touchedEpoch = now.epoch;
+            if (auto* tokens = templateTokens(this); tokens != nullptr) takeSweptTokens(tokens->version, versions.subscription, templateTokenWords(shaders));
             NoteDrawProofProved(DrawProofKind::Resources);
         }
         return ok;
@@ -7199,6 +7463,7 @@ std::vector<PresyncSurface> ShaderResources::PresyncSurfaces() const {
 }
 
 ShaderResources::~ShaderResources() {
+    dropTemplateTokens(this);
     release();
 }
 
