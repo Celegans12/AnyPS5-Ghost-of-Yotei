@@ -477,6 +477,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/LabelBatch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/Back.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/ReplayMeter.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DrawMemo.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DrawBlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeferredDestruction.cpp
