@@ -1725,6 +1725,289 @@ void KeepTokenDrawInput(VkDevice device, std::uint64_t address, std::size_t byte
     countInputToken(InputTokenCount::Kept);
 }
 
+namespace {
+
+enum class InputSlotCount : std::size_t { Lookups, Held, Reused, Absent, Registry, Changed, Pending, Kept, Evicted, Untracked, Filled, Verified, Mismatches, CopiedBytes, Refilled, SmallLookups, MediumLookups, SmallKept, MediumKept, Count };
+
+constexpr std::size_t InputSlotCounts = static_cast<std::size_t>(InputSlotCount::Count);
+constexpr std::uint64_t InputSlotReportEvery = std::uint64_t{1} << 19u;
+constexpr std::size_t SmallInputBytes = 1024;
+constexpr std::size_t MediumInputBytes = 16384;
+
+std::array<std::atomic<std::uint64_t>, InputSlotCounts>& inputSlotCounters() {
+    static std::array<std::atomic<std::uint64_t>, InputSlotCounts> held{};
+    return held;
+}
+
+void countInputSlot(InputSlotCount kind, std::uint64_t amount = 1) {
+    inputSlotCounters()[static_cast<std::size_t>(kind)].fetch_add(amount, std::memory_order_relaxed);
+}
+
+struct DrawInputSlot {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::size_t from = 0;
+    Recorder::SnapshotUse use = Recorder::SnapshotUse::Vertex;
+    VkDevice device = VK_NULL_HANDLE;
+    std::shared_ptr<Buffer> buffer;
+    std::uint32_t derived = 0;
+    std::uint32_t lowest = 0;
+    std::uint64_t generation = 0;
+    std::uint64_t registryGeneration = 0;
+    std::uint64_t run = 0;
+    std::uint64_t used = 0;
+};
+
+struct DrawInputSlotTable {
+    static constexpr std::size_t Ways = 4;
+    static constexpr std::size_t Sets = 8192;
+    static constexpr std::size_t Budget = std::size_t{1024} << 20u;
+    std::vector<DrawInputSlot> slots = std::vector<DrawInputSlot>(Ways * Sets);
+    std::size_t bytes = 0;
+    std::size_t cursor = 0;
+    std::uint64_t tick = 0;
+    std::uint64_t run = 1;
+    bool tagged = false;
+    DrawProofStamp stamp{};
+    VkDevice device = VK_NULL_HANDLE;
+    bool armed = false;
+    std::uint64_t armedAddress = 0;
+    std::size_t armedBytes = 0;
+    Recorder::SnapshotUse armedUse = Recorder::SnapshotUse::Vertex;
+    std::uint64_t armedRun = 0;
+
+    void Follow(VkDevice current) {
+        const auto stampNow = DrawProofStamp::Now();
+        if (tagged && device == current && stamp == stampNow) return;
+        ++run;
+        tagged = true;
+        stamp = stampNow;
+        device = current;
+    }
+    DrawInputSlot* Set(std::uint64_t address, std::size_t length, Recorder::SnapshotUse use) {
+        std::uint64_t key = (address >> 2u) * 0x9E3779B97F4A7C15ull;
+        key ^= ((use == Recorder::SnapshotUse::Vertex ? 0u : static_cast<std::uint64_t>(length)) + static_cast<std::uint64_t>(use) * 0x100000001B3ull) * 0xC2B2AE3D27D4EB4Full;
+        return slots.data() + (static_cast<std::size_t>(key >> 40u) % Sets) * Ways;
+    }
+    static bool Same(const DrawInputSlot& slot, std::uint64_t address, Recorder::SnapshotUse use, VkDevice current) {
+        return slot.buffer != nullptr && slot.address == address && slot.use == use && slot.device == current;
+    }
+    DrawInputSlot* Find(std::uint64_t address, std::size_t length, Recorder::SnapshotUse use, VkDevice current) {
+        auto* set = Set(address, length, use);
+        for (std::size_t way = 0; way < Ways; ++way) {
+            auto& slot = set[way];
+            if (Same(slot, address, use, current) && (use == Recorder::SnapshotUse::Vertex ? slot.bytes >= length : slot.bytes == length)) return &slot;
+        }
+        return nullptr;
+    }
+    void Release(DrawInputSlot& slot) {
+        if (slot.buffer == nullptr) return;
+        bytes -= slot.bytes;
+        slot = DrawInputSlot{};
+    }
+    void MakeRoom(std::size_t length) {
+        for (std::size_t scanned = 0; bytes + length > Budget && scanned < slots.size(); ++scanned) {
+            auto& slot = slots[cursor];
+            cursor = (cursor + 1) % slots.size();
+            if (slot.buffer == nullptr || slot.run == run) continue;
+            Release(slot);
+            countInputSlot(InputSlotCount::Evicted);
+        }
+        if (bytes + length <= Budget) return;
+        for (auto& slot : slots) {
+            if (slot.buffer == nullptr) continue;
+            Release(slot);
+            countInputSlot(InputSlotCount::Evicted);
+        }
+    }
+    DrawInputSlot& Place(std::uint64_t address, std::size_t length, Recorder::SnapshotUse use, VkDevice current) {
+        auto* set = Set(address, length, use);
+        DrawInputSlot* victim = nullptr;
+        for (std::size_t way = 0; way < Ways; ++way) {
+            auto& slot = set[way];
+            if (Same(slot, address, use, current) && (use == Recorder::SnapshotUse::Vertex || slot.bytes == length)) {
+                Release(slot);
+                victim = &slot;
+                break;
+            }
+        }
+        if (victim == nullptr) {
+            victim = set;
+            for (std::size_t way = 0; way < Ways; ++way) {
+                auto& slot = set[way];
+                if (slot.buffer == nullptr) {
+                    victim = &slot;
+                    break;
+                }
+                if (slot.used < victim->used) victim = &slot;
+            }
+            if (victim->buffer != nullptr) {
+                Release(*victim);
+                countInputSlot(InputSlotCount::Evicted);
+            }
+        }
+        return *victim;
+    }
+};
+
+DrawInputSlotTable& drawInputSlots() {
+    static auto* table = new DrawInputSlotTable;
+    return *table;
+}
+
+bool VerifyDrawInputSlots() {
+    static const bool verify = std::getenv("APS5_VERIFY_DRAW_INPUT_SLOTS") != nullptr;
+    return verify;
+}
+
+bool DrawInputSlots() {
+    static const bool enabled = std::getenv("APS5_DRAW_INPUT_SLOTS") != nullptr || VerifyDrawInputSlots();
+    return enabled;
+}
+
+void reportInputSlots() {
+    static std::array<std::uint64_t, InputSlotCounts> reported{};
+    std::array<std::uint64_t, InputSlotCounts> n{};
+    for (std::size_t index = 0; index < n.size(); ++index) {
+        const auto now = inputSlotCounters()[index].load(std::memory_order_relaxed);
+        n[index] = now - reported[index];
+        reported[index] = now;
+    }
+    const auto at = [&](InputSlotCount kind) { return static_cast<unsigned long long>(n[static_cast<std::size_t>(kind)]); };
+    const auto& table = drawInputSlots();
+    AgcDriver::ProfilePrint_nid_no_patch("[input-slots] since the last line: %llu lookups (%llu of at most 1 KiB, %llu of at most 16 KiB), %llu served by the slot its run already proved, %llu served by a slot unchanged since its generation; refused: %llu no slot, %llu registry moved, %llu written since, %llu behind a pending GPU write or label; %llu copies kept (%llu bytes, %llu of at most 1 KiB, %llu of at most 16 KiB, %llu into the buffer of the copy they replace), %llu slots evicted, %llu ranges untracked, %llu prefixes filled; verified %llu, mismatches %llu; %.1f MiB held\n", at(InputSlotCount::Lookups), at(InputSlotCount::SmallLookups), at(InputSlotCount::MediumLookups), at(InputSlotCount::Held), at(InputSlotCount::Reused), at(InputSlotCount::Absent), at(InputSlotCount::Registry), at(InputSlotCount::Changed), at(InputSlotCount::Pending), at(InputSlotCount::Kept), at(InputSlotCount::CopiedBytes), at(InputSlotCount::SmallKept), at(InputSlotCount::MediumKept), at(InputSlotCount::Refilled), at(InputSlotCount::Evicted), at(InputSlotCount::Untracked), at(InputSlotCount::Filled), at(InputSlotCount::Verified), at(InputSlotCount::Mismatches), static_cast<double>(table.bytes) / 1048576.0);
+}
+
+void verifySlotInput(std::uint64_t address, std::size_t bytes, std::size_t alignment, std::size_t from, Buffer& held) {
+    GuestMemory::FlushGpuWrites(address, bytes);
+    GuestMemory::CollectWrites(address, bytes);
+    static thread_local std::vector<std::byte> fresh;
+    fresh.resize(bytes - from);
+    GuestMemory::Read(address + from, std::span<std::byte>(fresh), alignment);
+    countInputSlot(InputSlotCount::Verified);
+    if (std::memcmp(fresh.data(), held.Bytes().data() + from, bytes - from) == 0) return;
+    countInputSlot(InputSlotCount::Mismatches);
+    char message[192];
+    std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_INPUT_SLOTS: the draw input of 0x%zx bytes at 0x%llx served by its slot differs from guest memory", bytes, static_cast<unsigned long long>(address));
+    throw std::runtime_error(message);
+}
+
+}
+
+std::array<std::uint64_t, 19> DrawInputSlotCounted() {
+    std::array<std::uint64_t, 19> counts{};
+    static_assert(InputSlotCounts == 19);
+    for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = inputSlotCounters()[index].load(std::memory_order_relaxed);
+    return counts;
+}
+
+std::shared_ptr<Buffer> HeldSlotDrawInput(const Recorder* recorder, VkDevice device, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::size_t from, std::uint32_t* derived, std::uint32_t* lowest) {
+    const auto lookups = inputSlotCounters()[static_cast<std::size_t>(InputSlotCount::Lookups)].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (lookups % InputSlotReportEvery == 0 && drawSiteStats()) reportInputSlots();
+    if (bytes <= SmallInputBytes) countInputSlot(InputSlotCount::SmallLookups);
+    else if (bytes <= MediumInputBytes) countInputSlot(InputSlotCount::MediumLookups);
+    auto& table = drawInputSlots();
+    table.armed = false;
+    table.Follow(device);
+    auto* slot = table.Find(address, bytes, use, device);
+    if (slot == nullptr || slot->run != table.run || slot->from > from) return {};
+    if (slot->registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return {};
+    if (recorder != nullptr && (recorder->PendingWriteOverlaps(address, bytes) || recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes) || recorder->QueuedKeyStoreOverlaps(address, bytes))) {
+        countInputSlot(InputSlotCount::Pending);
+        return {};
+    }
+    slot->used = ++table.tick;
+    if (derived != nullptr) *derived = slot->derived;
+    if (lowest != nullptr) *lowest = slot->lowest;
+    countInputSlot(InputSlotCount::Held);
+    return slot->buffer;
+}
+
+std::shared_ptr<Buffer> ReusableSlotDrawInput(VkDevice device, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::size_t from, std::uint32_t* derived, std::uint32_t* lowest, std::shared_ptr<Buffer>* refill) {
+    auto& table = drawInputSlots();
+    table.Follow(device);
+    table.armed = true;
+    table.armedAddress = address;
+    table.armedBytes = bytes;
+    table.armedUse = use;
+    table.armedRun = table.run;
+    auto* slot = table.Find(address, bytes, use, device);
+    if (slot == nullptr) {
+        countInputSlot(InputSlotCount::Absent);
+        return {};
+    }
+    if (slot->registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+        table.Release(*slot);
+        countInputSlot(InputSlotCount::Registry);
+        return {};
+    }
+    const auto held = std::max(from, slot->from);
+    if (held < bytes && !GuestMemory::UnchangedSince(address + held, bytes - held, slot->generation)) {
+        auto taken = slot->bytes == bytes ? std::move(slot->buffer) : std::shared_ptr<Buffer>{};
+        if (taken != nullptr) {
+            table.bytes -= slot->bytes;
+            *slot = DrawInputSlot{};
+        } else {
+            table.Release(*slot);
+        }
+        if (refill != nullptr && taken != nullptr && taken.use_count() == 1) *refill = std::move(taken);
+        countInputSlot(InputSlotCount::Changed);
+        return {};
+    }
+    if (slot->from > from) {
+        const auto start = from - std::min(from, slot->bytes - slot->from);
+        GuestMemory::Read(address + start, slot->buffer->Bytes().subspan(start, slot->from - start), 1);
+        slot->from = start;
+        countInputSlot(InputSlotCount::Filled);
+    }
+    table.armed = false;
+    slot->run = table.run;
+    slot->used = ++table.tick;
+    if (derived != nullptr) *derived = slot->derived;
+    if (lowest != nullptr) *lowest = slot->lowest;
+    countInputSlot(InputSlotCount::Reused);
+    return slot->buffer;
+}
+
+void KeepSlotDrawInput(VkDevice device, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::size_t from, const std::shared_ptr<Buffer>& buffer, std::uint32_t derived, std::uint32_t lowest, std::uint64_t generation, std::uint64_t registryGeneration) {
+    auto& table = drawInputSlots();
+    const bool armed = table.armed && table.armedAddress == address && table.armedBytes == bytes && table.armedUse == use;
+    table.armed = false;
+    if (buffer == nullptr || bytes == 0) return;
+    if (generation == 0 || bytes > DrawInputSlotTable::Budget) {
+        countInputSlot(InputSlotCount::Untracked);
+        return;
+    }
+    auto& slot = table.Place(address, bytes, use, device);
+    table.MakeRoom(bytes);
+    slot.address = address;
+    slot.bytes = bytes;
+    slot.from = from;
+    slot.use = use;
+    slot.device = device;
+    slot.buffer = buffer;
+    slot.derived = derived;
+    slot.lowest = lowest;
+    slot.generation = generation;
+    slot.registryGeneration = registryGeneration;
+    slot.run = armed ? table.armedRun : 0;
+    slot.used = ++table.tick;
+    table.bytes += bytes;
+    countInputSlot(InputSlotCount::Kept);
+    countInputSlot(InputSlotCount::CopiedBytes, bytes - from);
+    if (bytes <= SmallInputBytes) countInputSlot(InputSlotCount::SmallKept);
+    else if (bytes <= MediumInputBytes) countInputSlot(InputSlotCount::MediumKept);
+}
+
+void ReleaseDrawInputSlots(VkDevice device) {
+    auto& table = drawInputSlots();
+    for (auto& slot : table.slots) {
+        if (slot.buffer != nullptr && slot.device == device) table.Release(slot);
+    }
+    table.armed = false;
+    table.tagged = false;
+}
+
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t from) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     Require(from == 0 || (use == Recorder::SnapshotUse::Vertex && from < bytes), "only a vertex input starts past its address");
@@ -1737,6 +2020,16 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         pendingSerial = StorageTexture::PendingSerial();
         if (auto held = ReusableTokenDrawInput(recorder, context.device, address, bytes, use, from, &copy.derived, &copy.lowest)) {
             if (VerifyInputTokenCache()) verifyTokenInput(address, bytes, alignment, from, *held);
+            copy.buffer = std::move(held);
+            copy.reused = true;
+            return copy;
+        }
+    }
+    const bool slots = recorder != nullptr && bytes != 0 && !BufferCache::DirtyFirst() && DrawInputSlots();
+    std::shared_ptr<Buffer> refill;
+    if (slots) {
+        if (auto held = HeldSlotDrawInput(recorder, context.device, address, bytes, use, from, &copy.derived, &copy.lowest)) {
+            if (VerifyDrawInputSlots()) verifySlotInput(address, bytes, alignment, from, *held);
             copy.buffer = std::move(held);
             copy.reused = true;
             return copy;
@@ -1759,16 +2052,22 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
         const auto token = tokens && copy.generation != 0 ? GuestMemory::TokenFor(address, bytes) : GuestMemory::ContentToken{};
-        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, nullptr, from, &copy.lowest);
+        if (copy.generation != 0) copy.buffer = slots ? ReusableSlotDrawInput(context.device, address, bytes, use, from, &copy.derived, &copy.lowest, &refill) : recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, nullptr, from, &copy.lowest);
         else if (owned) copy.owned = recorder->ArmOwnedDrawInput(address, bytes);
         if (copy.buffer != nullptr) {
             copy.reused = true;
+            if (slots && VerifyDrawInputSlots()) verifySlotInput(address, bytes, alignment, from, *copy.buffer);
             if (tokens) KeepTokenDrawInput(context.device, address, bytes, use, from, copy.buffer, copy.derived, copy.lowest, token, pendingSerial, copy.registryGeneration);
             return copy;
         }
         if (tokens && copy.generation != 0) inputTokenArm() = InputTokenArm{true, address, bytes, from, use, context.device, token, pendingSerial, copy.registryGeneration};
     }
-    copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    if (refill != nullptr) {
+        copy.buffer = std::move(refill);
+        countInputSlot(InputSlotCount::Refilled);
+    } else {
+        copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
+    }
     static const bool poisonPrefix = std::getenv("APS5_POISON_VERTEX_PREFIX") != nullptr;
     const auto held = copy.buffer->Bytes();
     if (poisonPrefix) std::fill(held.begin(), held.begin() + static_cast<std::ptrdiff_t>(from), std::byte{0x7f});
@@ -1813,7 +2112,8 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
         if (!copy.owned.words.empty() && !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawInputs)) recorder->KeepOwnedDrawInput(address, copy.buffer->Bytes().size(), copy.owned, copy.buffer, use, derived, copy.from, lowest);
         return;
     }
-    recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived, copy.from, lowest);
+    if (DrawInputSlots() && !BufferCache::DirtyFirst() && use != Recorder::SnapshotUse::PaddedVertex) KeepSlotDrawInput(recorder->Device(), address, copy.buffer->Bytes().size(), use, copy.from, copy.buffer, derived, lowest, copy.generation, copy.registryGeneration);
+    else recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived, copy.from, lowest);
     auto& arm = inputTokenArm();
     if (!arm.armed) return;
     arm.armed = false;
@@ -1968,6 +2268,121 @@ struct DrawInputs {
     std::uint32_t expandedIndexCount = 0;
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
+
+struct InputPlanScratch {
+    VertexCopyPlan plan;
+    std::vector<std::size_t> order;
+    std::vector<std::size_t> starts;
+    std::vector<VkBuffer> soloHandles;
+
+    void clear() noexcept {
+        plan.copies.clear();
+        plan.copyOf.clear();
+        plan.offsets.clear();
+        plan.alignments.clear();
+        order.clear();
+        starts.clear();
+        soloHandles.clear();
+    }
+};
+
+struct InputPlanTag {};
+
+using InputPlanLease = AgcDriver::ExclusiveScratch<InputPlanScratch, InputPlanTag>;
+
+struct InputVectorScratch {
+    std::vector<std::shared_ptr<Buffer>> vertexBuffers;
+    std::vector<std::shared_ptr<void>> mirrors;
+    std::vector<VkBuffer> vertexHandles;
+    std::vector<VkDeviceSize> vertexOffsets;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> inPlaceReads;
+};
+
+struct InputVectorTag {};
+
+void takeInputVectors(DrawInputs& inputs) {
+    auto& home = ThreadScratch<InputVectorScratch, InputVectorTag>();
+    inputs.vertexBuffers = std::move(home.vertexBuffers);
+    inputs.mirrors = std::move(home.mirrors);
+    inputs.vertexHandles = std::move(home.vertexHandles);
+    inputs.vertexOffsets = std::move(home.vertexOffsets);
+    inputs.inPlaceReads = std::move(home.inPlaceReads);
+    inputs.vertexBuffers.clear();
+    inputs.mirrors.clear();
+    inputs.vertexHandles.clear();
+    inputs.vertexOffsets.clear();
+    inputs.inPlaceReads.clear();
+}
+
+void returnInputVectors(DrawInputs& inputs) {
+    if (!DrawInputSlots()) return;
+    auto& home = ThreadScratch<InputVectorScratch, InputVectorTag>();
+    inputs.vertexBuffers.clear();
+    inputs.mirrors.clear();
+    inputs.vertexHandles.clear();
+    inputs.vertexOffsets.clear();
+    inputs.inPlaceReads.clear();
+    if (inputs.vertexBuffers.capacity() > home.vertexBuffers.capacity()) home.vertexBuffers = std::move(inputs.vertexBuffers);
+    if (inputs.mirrors.capacity() > home.mirrors.capacity()) home.mirrors = std::move(inputs.mirrors);
+    if (inputs.vertexHandles.capacity() > home.vertexHandles.capacity()) home.vertexHandles = std::move(inputs.vertexHandles);
+    if (inputs.vertexOffsets.capacity() > home.vertexOffsets.capacity()) home.vertexOffsets = std::move(inputs.vertexOffsets);
+    if (inputs.inPlaceReads.capacity() > home.inPlaceReads.capacity()) home.inPlaceReads = std::move(inputs.inPlaceReads);
+}
+
+void planVertexCopiesInto(std::span<const VertexFetch> fetches, VertexCopyPlan& plan, std::vector<std::size_t>& order) {
+    plan.copies.clear();
+    plan.alignments.clear();
+    plan.copyOf.assign(fetches.size(), 0);
+    plan.offsets.assign(fetches.size(), 0);
+    order.resize(fetches.size());
+    const auto before = [&](std::size_t a, std::size_t b) {
+        const auto& x = fetches[a];
+        const auto& y = fetches[b];
+        if (x.stride != y.stride) return x.stride < y.stride;
+        if (x.fetchIndex != y.fetchIndex) return x.fetchIndex < y.fetchIndex;
+        return x.begin < y.begin;
+    };
+    for (std::size_t i = 0; i < order.size(); ++i) {
+        auto at = i;
+        for (; at > 0 && before(i, order[at - 1]); --at) order[at] = order[at - 1];
+        order[at] = i;
+    }
+    std::size_t lead = fetches.size();
+    for (const auto i : order) {
+        const auto& fetch = fetches[i];
+        Require(fetch.begin < fetch.end && fetch.alignment != 0, "empty vertex fetch range");
+        const bool joins = lead != fetches.size() && fetch.stride != 0 && fetches[lead].stride == fetch.stride && fetches[lead].fetchIndex == fetch.fetchIndex && fetch.begin - fetches[lead].begin < fetch.stride && (fetch.begin - fetches[lead].begin) % fetch.alignment == 0;
+        if (!joins) {
+            lead = i;
+            plan.copies.emplace_back(fetch.begin, fetch.end);
+            plan.alignments.push_back(fetch.alignment);
+        }
+        plan.alignments.back() = std::max(plan.alignments.back(), fetch.alignment);
+        auto& copy = plan.copies.back();
+        copy.second = std::max(copy.second, fetch.end);
+        plan.copyOf[i] = plan.copies.size() - 1;
+        plan.offsets[i] = fetch.begin - copy.first;
+    }
+}
+
+void vertexCopyStartsInto(const VertexCopyPlan& plan, std::span<const VertexFetch> fetches, std::uint32_t minIndex, std::uint32_t firstInstance, std::vector<std::size_t>& starts) {
+    Require(plan.copyOf.size() == fetches.size(), "vertex copy plan does not match its fetches");
+    starts.assign(plan.copies.size(), 0);
+    for (std::size_t i = 0; i < fetches.size(); ++i) {
+        const auto& fetch = fetches[i];
+        Require(fetch.fetchIndex <= 1, "unsupported vertex fetch index");
+        starts[plan.copyOf[i]] = static_cast<std::size_t>(static_cast<std::uint64_t>(fetch.stride) * (fetch.fetchIndex == 0 ? minIndex : firstInstance));
+    }
+    for (std::size_t range = 0; range < starts.size(); ++range) Require(starts[range] < plan.copies[range].second - plan.copies[range].first, "vertex copy starts past its range");
+}
+
+void requireSameVertexPlan(const VertexCopyPlan& lean, std::span<const std::size_t> leanStarts, std::span<const VertexFetch> fetches, bool started, std::uint32_t minIndex, std::uint32_t firstInstance) {
+    const auto plan = PlanVertexCopies(fetches);
+    const auto starts = started ? VertexCopyStarts(plan, fetches, minIndex, firstInstance) : std::vector<std::size_t>(plan.copies.size(), 0);
+    if (plan.copies == lean.copies && plan.copyOf == lean.copyOf && plan.offsets == lean.offsets && plan.alignments == lean.alignments && std::ranges::equal(starts, leanStarts)) return;
+    countInputSlot(InputSlotCount::Mismatches);
+    throw std::runtime_error("APS5_VERIFY_DRAW_INPUT_SLOTS: the vertex copy plan built in place differs from the planned one");
+}
 
 bool StripPatches(const State& state, std::span<const CompiledShader> shaders) {
     return state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP && BarycentricPatches(state, shaders);
@@ -2134,6 +2549,52 @@ struct DrawPlan {
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
 
+void noteKeylessDraw(std::span<const CompiledShader> shaders, bool candidate) {
+    static std::atomic<std::uint64_t> draws{0};
+    static std::atomic<std::uint64_t> variants{0};
+    static std::atomic<std::uint64_t> storing{0};
+    static std::atomic<std::uint64_t> tables{0};
+    static std::atomic<std::uint64_t> guarded{0};
+    static std::array<std::atomic<std::uint64_t>, 8> storingStage{};
+    static std::array<std::atomic<std::uint64_t>, 8> variantStage{};
+    static std::atomic<std::uint64_t> variantNull{0};
+    const auto has = [&](ShaderRecompiler::DescriptorRole role, bool stores) {
+        for (const auto& shader : shaders) {
+            if (shader.program == nullptr) continue;
+            const bool bound = std::any_of(shader.program->bindings.begin(), shader.program->bindings.end(), [&](const ShaderRecompiler::DescriptorBinding& binding) { return binding.role == role; });
+            if (bound && (!stores || ShaderStoresThroughAddresses(shader.program->spirv))) return static_cast<std::size_t>(shader.stage) + 1;
+        }
+        return std::size_t{0};
+    };
+    if (!candidate) {
+        variants.fetch_add(1, std::memory_order_relaxed);
+        for (const auto& shader : shaders) {
+            if (shader.program == nullptr) variantNull.fetch_add(1, std::memory_order_relaxed);
+            else if (shader.program->PipelineVariantId() == 0)
+                variantStage[std::min(static_cast<std::size_t>(shader.stage), variantStage.size() - 1)].fetch_add(1, std::memory_order_relaxed);
+        }
+    } else if (const auto stage = has(ShaderRecompiler::DescriptorRole::BdaPagetable, true); stage != 0) {
+        storing.fetch_add(1, std::memory_order_relaxed);
+        storingStage[std::min(stage - 1, storingStage.size() - 1)].fetch_add(1, std::memory_order_relaxed);
+    } else if (has(ShaderRecompiler::DescriptorRole::BdaPagetable, false) != 0) tables.fetch_add(1, std::memory_order_relaxed);
+    else guarded.fetch_add(1, std::memory_order_relaxed);
+    const auto total = draws.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (total % 8192 != 0) return;
+    std::string stages;
+    for (std::size_t index = 0; index < storingStage.size(); ++index) {
+        const auto count = storingStage[index].load(std::memory_order_relaxed);
+        if (count != 0) stages += " stage " + std::to_string(index) + " x" + std::to_string(count);
+    }
+    std::string variantStages;
+    for (std::size_t index = 0; index < variantStage.size(); ++index) {
+        const auto count = variantStage[index].load(std::memory_order_relaxed);
+        if (count != 0) variantStages += " stage " + std::to_string(index) + " x" + std::to_string(count);
+    }
+    variantStages += " no program x" + std::to_string(variantNull.load(std::memory_order_relaxed));
+    AgcDriver::ProfilePrint_nid_no_patch("[keyless-draws] such stages:%s\n", variantStages.c_str());
+    AgcDriver::ProfilePrint_nid_no_patch("[keyless-draws] cumulative: %llu draws without a template key: %llu with a stage that has no pipeline variant id, %llu with a stage that stores through its address table (first such stage:%s), %llu with an address table while space reuse is off, %llu with a fault buffer under the loop guard\n", static_cast<unsigned long long>(total), static_cast<unsigned long long>(variants.load(std::memory_order_relaxed)), static_cast<unsigned long long>(storing.load(std::memory_order_relaxed)), stages.c_str(), static_cast<unsigned long long>(tables.load(std::memory_order_relaxed)), static_cast<unsigned long long>(guarded.load(std::memory_order_relaxed)));
+}
+
 DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe* recipe, DrawOutcome& outcome, DrawTimer& timer, std::uint8_t coreMode = 0) {
     DrawPlan plan;
     plan.coreMode = coreMode;
@@ -2207,7 +2668,7 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     timer.phase(PhaseValidate);
     const auto layoutStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto& attributes = shaders.front().program->vertexAttributes;
-    if (recipe != nullptr && coreMode != 0) {
+    if (recipe != nullptr && (coreMode != 0 || DrawInputSlots())) {
         plan.retainedVertexInput = std::shared_ptr<const VertexInputLayout>(std::shared_ptr<const VertexInputLayout>(), &recipe->vertexInput);
     } else if (recipe != nullptr) {
         plan.vertexInput = recipe->vertexInput;
@@ -2219,6 +2680,7 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     const bool trimKey = DrawKeysTrimmed();
     plan.candidate = recipe == nullptr && DrawTemplatesKeyed() && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; });
     plan.keyed = plan.candidate && !ShaderResources::NeverReusable(shaders);
+    if (recipe == nullptr && !plan.keyed && DrawTemplatesKeyed() && drawSiteStats()) noteKeylessDraw(shaders, plan.candidate);
     if (plan.keyed) {
         const auto keyStart = timer.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         plan.contentKey = DrawResourceKey(context, shaders, state.color, static_cast<std::uint32_t>(state.colors.size()), draw.indexAddress, indexBytes, !trimKey);
@@ -2250,6 +2712,8 @@ void requireDrawPlanRepeats(const Context& context, const State& state, const Pm
 
 DrawInputs prepareDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawPlan& drawPlan, DrawTimer& timer, PerformanceTimer& timing) {
     DrawInputs inputs;
+    const bool leanPlan = DrawInputSlots();
+    if (leanPlan) takeInputVectors(inputs);
     if (auto* recorder = context.recorder; recorder != nullptr && recorder->OwesDrawInputCopies() && !recorder->RenderPassOpen()) RefreshDrawInputCopies(context, true);
     inputs.indexBytes = drawPlan.indexBytes;
     inputs.fragmentOutputs = drawPlan.fragmentOutputs;
@@ -2531,8 +2995,16 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         plannedOf[f] = plannedFetches.size();
         plannedFetches.push_back(fetches[f]);
     }
-    const auto plan = PlanVertexCopies(plannedFetches);
-    const auto rangeFrom = args == nullptr && !state.stages.mesh ? VertexCopyStarts(plan, plannedFetches, inputs.minIndex, draw.firstInstance) : std::vector<std::size_t>(plan.copies.size(), 0);
+    const InputPlanLease inputPlan;
+    const bool startedCopies = args == nullptr && !state.stages.mesh;
+    const auto plannedCopies = leanPlan ? VertexCopyPlan{} : PlanVertexCopies(plannedFetches);
+    if (leanPlan) planVertexCopiesInto(plannedFetches, inputPlan->plan, inputPlan->order);
+    const auto& plan = leanPlan ? inputPlan->plan : plannedCopies;
+    const auto plannedStarts = leanPlan ? std::vector<std::size_t>{} : startedCopies ? VertexCopyStarts(plan, plannedFetches, inputs.minIndex, draw.firstInstance) : std::vector<std::size_t>(plan.copies.size(), 0);
+    if (leanPlan && startedCopies) vertexCopyStartsInto(plan, plannedFetches, inputs.minIndex, draw.firstInstance, inputPlan->starts);
+    else if (leanPlan) inputPlan->starts.assign(plan.copies.size(), 0);
+    const auto& rangeFrom = leanPlan ? inputPlan->starts : plannedStarts;
+    if (leanPlan && VerifyDrawInputSlots()) requireSameVertexPlan(plan, rangeFrom, plannedFetches, startedCopies, inputs.minIndex, draw.firstInstance);
     auto& rangeHandles = planLease->rangeHandles;
     auto& rangeOffsets = planLease->rangeOffsets;
     rangeHandles.reserve(plan.copies.size());
@@ -2582,7 +3054,9 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
     }
-    std::vector<VkBuffer> soloHandles(fetches.size(), VK_NULL_HANDLE);
+    std::vector<VkBuffer> soloOwned;
+    auto& soloHandles = leanPlan ? inputPlan->soloHandles : soloOwned;
+    soloHandles.assign(fetches.size(), VK_NULL_HANDLE);
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
@@ -5616,6 +6090,7 @@ DrawRecipeOutcome drawRecipe(const Context& context, const State& state, const P
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, trace);
     vectors.targets = std::move(record.targets);
     vectors.slices = std::move(record.targetSlices);
+    returnInputVectors(inputs);
     if (allocationsCounted) {
         const auto keptAfter = recorder->OpenKeptObjects();
         noteDrawAllocations(allocationsAfterInputs - allocationsBefore, HostAllocationsOnThread() - allocationsAfterInputs, keptAfter >= keptBefore ? keptAfter - keptBefore : 0);
