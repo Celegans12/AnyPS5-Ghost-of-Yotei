@@ -1,4 +1,7 @@
 #include "prx/libc/include/GuestWriteWatch.hpp"
+#if defined(__linux__)
+#include "prx/libc/include/specifics/linux/WriteWatchOracle.hpp"
+#endif
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -13,6 +16,7 @@
 #include <vector>
 
 #if defined(__linux__)
+#include <atomic>
 #include <cerrno>
 #include <cstring>
 #include <fcntl.h>
@@ -22,6 +26,37 @@
 #include <sys/mman.h>
 #include <sys/syscall.h>
 #include <unistd.h>
+#ifndef UFFD_FEATURE_WP_UNPOPULATED
+#define UFFD_FEATURE_WP_UNPOPULATED (1 << 13)
+#endif
+#ifndef UFFD_FEATURE_WP_ASYNC
+#define UFFD_FEATURE_WP_ASYNC (1 << 15)
+#endif
+#ifndef PAGEMAP_SCAN
+struct page_region {
+    __u64 start;
+    __u64 end;
+    __u64 categories;
+};
+struct pm_scan_arg {
+    __u64 size;
+    __u64 flags;
+    __u64 start;
+    __u64 end;
+    __u64 walk_end;
+    __u64 vec;
+    __u64 vec_len;
+    __u64 max_pages;
+    __u64 category_inverted;
+    __u64 category_mask;
+    __u64 category_anyof_mask;
+    __u64 return_mask;
+};
+#define PAGE_IS_WRITTEN (1 << 1)
+#define PM_SCAN_WP_MATCHING (1 << 0)
+#define PM_SCAN_CHECK_WPASYNC (1 << 1)
+#define PAGEMAP_SCAN _IOWR('f', 16, struct pm_scan_arg)
+#endif
 #endif
 
 #if defined(__APPLE__)
@@ -57,7 +92,16 @@ public:
     }
 
     bool Available() const {
-        return _pagemap >= 0;
+        return _pagemap >= 0 || _reported;
+    }
+
+    void Note(std::uintptr_t begin, std::uintptr_t end) {
+        if ((!_reported && !_verified) || end <= begin) return;
+        begin &= ~(PageBytes - 1);
+        end = (end + PageBytes - 1) & ~(PageBytes - 1);
+        const std::lock_guard lock(_notedLock);
+        remove(_noted, begin, end);
+        insert(_noted, begin, end);
     }
 
     void Register(std::uintptr_t begin, std::uintptr_t end) {
@@ -70,7 +114,7 @@ public:
         registration.range.start = begin;
         registration.range.len = end - begin;
         registration.mode = UFFDIO_REGISTER_MODE_WP;
-        if (ioctl(_uffd, UFFDIO_REGISTER, &registration) != 0) {
+        if (!_reported && ioctl(_uffd, UFFDIO_REGISTER, &registration) != 0) {
             static bool reported = false;
             if (!reported) {
                 reported = true;
@@ -320,7 +364,36 @@ private:
         return true;
     }
 
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> takeNoted(std::uintptr_t begin, std::uintptr_t end) const {
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> taken;
+        const std::lock_guard lock(_notedLock);
+        auto it = _noted.upper_bound(begin);
+        if (it != _noted.begin()) --it;
+        for (; it != _noted.end() && it->first < end; ++it) {
+            const auto from = std::max(it->first, begin);
+            const auto to = std::min(it->second, end);
+            if (from < to) taken.emplace_back(from, to);
+        }
+        for (const auto& [from, to] : taken) remove(_noted, from, to);
+        return taken;
+    }
+
+    void verifyNoted(std::uintptr_t begin, std::uintptr_t end, const page_region* regions, long count) const {
+        const auto noted = takeNoted(begin, end);
+        for (long i = 0; i < count; ++i) {
+            for (auto page = static_cast<std::uintptr_t>(regions[i].start); page < regions[i].end; page += PageBytes) {
+                if (std::any_of(noted.begin(), noted.end(), [&](const auto& range) { return range.first <= page && page < range.second; })) continue;
+                const auto missed = _unreported.fetch_add(1, std::memory_order_relaxed) + 1;
+                if (missed <= 32 || (missed & (missed - 1)) == 0) std::fprintf(stderr, "[memory] write watch: page 0x%llx was written without a report from the host (%llu so far)\n", static_cast<unsigned long long>(page), static_cast<unsigned long long>(missed));
+            }
+        }
+    }
+
     bool scanWritten(std::uintptr_t begin, std::uintptr_t end, void (*written)(void*, std::uintptr_t, std::uintptr_t), void* context) const {
+        if (_reported) {
+            for (const auto& [from, to] : takeNoted(begin, end)) written(context, from, to);
+            return true;
+        }
         std::array<page_region, 256> regions;
         auto cursor = begin;
         while (cursor < end) {
@@ -339,6 +412,7 @@ private:
                 return false;
             }
             for (long i = 0; i < count; ++i) written(context, regions[i].start, regions[i].end);
+            if (_verified) verifyNoted(cursor, scan.walk_end > cursor ? std::min<std::uintptr_t>(scan.walk_end, end) : end, regions.data(), count);
             if (scan.walk_end <= cursor || scan.walk_end >= end) break;
             cursor = scan.walk_end;
         }
@@ -347,7 +421,16 @@ private:
 
 private:
     Watch() {
-        if (std::getenv("APS5_NO_WRITE_WATCH") == nullptr) open();
+        if (std::getenv("APS5_NO_WRITE_WATCH") != nullptr) return;
+        const char* oracle = std::getenv("APS5_WRITE_WATCH_ORACLE");
+        if (oracle != nullptr && std::strcmp(oracle, "verify") != 0) {
+            _reported = true;
+            std::fprintf(stderr, "[memory] write watch: writes are reported by the host (APS5_WRITE_WATCH_ORACLE); the system does not track guest writes\n");
+            return;
+        }
+        open();
+        _verified = oracle != nullptr && _pagemap >= 0;
+        if (_verified) std::fprintf(stderr, "[memory] write watch: every written page is checked against the reports of the host (APS5_WRITE_WATCH_ORACLE=verify)\n");
     }
 
     void open() {
@@ -375,6 +458,7 @@ private:
     }
 
     bool protect(std::uintptr_t begin, std::uintptr_t end) const {
+        if (_reported) return true;
         uffdio_writeprotect protection{};
         protection.range.start = begin;
         protection.range.len = end - begin;
@@ -461,6 +545,11 @@ private:
 
     int _uffd = -1;
     int _pagemap = -1;
+    bool _reported = false;
+    bool _verified = false;
+    mutable std::mutex _notedLock;
+    mutable std::map<std::uintptr_t, std::uintptr_t> _noted;
+    mutable std::atomic<std::uint64_t> _unreported{0};
     std::shared_mutex _lock;
     std::map<std::uintptr_t, std::uintptr_t> _ranges;
     std::map<std::uintptr_t, std::uintptr_t> _fresh;
@@ -1220,6 +1309,13 @@ bool GuestWriteWatchAlias_nid_postfix(const void* first, const void* second, std
     return false;
 #endif
 }
+
+#if defined(__linux__)
+void GuestWriteWatchNoteWritten_nid_postfix(const void* pointer, std::size_t bytes) {
+    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    Watch::Get().Note(begin, begin + bytes);
+}
+#endif
 
 bool GuestWriteWatchCovers_nid_postfix(std::uintptr_t address, std::size_t bytes) {
 #ifdef APS5_GUEST_WRITE_WATCH
