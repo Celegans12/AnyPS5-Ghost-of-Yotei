@@ -899,6 +899,7 @@ The code reads environment names through `getenv`, `IsEnvironmentSet`, `kibSetti
 | `APS5_WATCH_ADDR` | integer | `core/libs/prx/libc/src/specifics/windows/CrashReport.cpp` |  | absolute hex address whose writes are reported after its page is committed |
 | `APS5_WATCH_WRITE` | integer | `core/libs/prx/libc/src/specifics/windows/CrashReport.cpp` |  | guest ELF vaddr whose 8-byte writes are reported by single-stepping the protected page |
 | `APS5_WRITE_WATCH_FAULT_AHEAD` | integer | `core/libs/prx/libc/src/GuestWriteWatch.cpp` | 32 | on macOS, at most this many pages, up to the end of the faulting page's 64 KiB block, that a write fault unprotects and records as written when the two pages before it were written since the last collection; 0 or 1 unprotects only the faulting page |
+| `APS5_WRITE_WATCH_ORACLE` | string | `core/libs/prx/libc/src/GuestWriteWatch.cpp` |  | on Linux, any value but `verify` makes the write watch ask nothing of the system: the host program (`agc_frame_replay`) reports every guest write it makes, before and after it, and only the reported pages read as written, which also works where `userfaultfd` is refused (a Docker container); `verify` keeps the system's tracking and looks every page it finds written up in the host's reports |
 
 ### libkernel
 
