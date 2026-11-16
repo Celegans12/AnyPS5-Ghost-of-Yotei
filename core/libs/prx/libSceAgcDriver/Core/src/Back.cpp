@@ -4,14 +4,19 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Recipe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <mutex>
+#include <optional>
 
 namespace AgcDriver::Core {
 
@@ -22,6 +27,144 @@ std::atomic<int>& testedMode() {
     return mode;
 }
 
+class GuestReplayProof final : public ReplayProof {
+public:
+    std::uint64_t Generation() override {
+        return GuestMemory::SettledGeneration();
+    }
+
+    bool PagesUnchanged(std::span<const ReplayQuery> queries) override {
+        for (const auto& query : queries) {
+            if (!GuestMemory::UnchangedSince(query.address, static_cast<std::size_t>(query.bytes), query.since)) return false;
+        }
+        return true;
+    }
+
+    bool BlockWritten(const ReplayQuery& query) override {
+        return GuestMemory::WrittenSince(query.address, static_cast<std::size_t>(query.bytes), query.since);
+    }
+
+    bool TokensLive() override {
+        return GuestMemory::EpochSweeps();
+    }
+
+    ReplayToken TokenFor(const ReplayRange& range) override {
+        const auto token = GuestMemory::TokenFor(range.address, static_cast<std::size_t>(range.bytes));
+        return {token.content, token.context};
+    }
+
+    bool StillCurrent(const ReplayRange& range, const ReplayToken& token) override {
+        return GuestMemory::StillCurrent(range.address, static_cast<std::size_t>(range.bytes), GuestMemory::ContentToken{token.content, token.context});
+    }
+};
+
+GuestReplayProof& replayProof() {
+    static GuestReplayProof proof;
+    return proof;
+}
+
+ReplayMeter& replayMeter() {
+    static ReplayMeter meter(16, 16, 12, 3);
+    return meter;
+}
+
+std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point started) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+}
+
+}
+
+bool ReplayTimedNext() {
+    thread_local std::uint32_t tick = 0;
+    return (++tick & 15u) == 0;
+}
+
+bool ReplayStats() {
+    static const bool enabled = std::getenv("APS5_CORE_REPLAY_STATS") != nullptr;
+    return enabled;
+}
+
+ReplayDraw ReplayDrawOf(const CoreDraw& record, const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
+    const auto& variant = *record.variant;
+    ReplayDraw draw;
+    draw.plan = variant.plan->id;
+    draw.digest = variant.digest;
+    draw.variant = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(&variant));
+    draw.recipe = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(variant.recipe.get()));
+    const auto& parameters = record.parameters;
+    const std::uint64_t indexBytes = parameters.indexed ? static_cast<std::uint64_t>(parameters.indexCount) * parameters.indexSize : 0u;
+    auto inputs = ReplayMix(0x452821e638d01377ull, indexBytes != 0 ? parameters.indexAddress : 0u);
+    inputs = ReplayMix(inputs, indexBytes);
+    if (indexBytes != 0) AddReplayRange(draw, parameters.indexAddress, indexBytes);
+    if (!stages.empty() && stages.front().program != nullptr) {
+        for (const auto& attribute : stages.front().program->vertexAttributes) {
+            for (const auto field : attribute.resource.fields) inputs = ReplayMix(inputs, field);
+            inputs = ReplayMix(inputs, attribute.location | (static_cast<std::uint64_t>(attribute.fetchIndex) << 32u));
+            if (Graphics::NullVertexDescriptor(attribute)) continue;
+            const auto address = attribute.resource.fields[0] | (static_cast<std::uint64_t>(attribute.resource.fields[1] & 0xffffu) << 32u);
+            try {
+                if (Graphics::VertexFetchOutOfRange(attribute)) continue;
+                AddReplayRange(draw, address, Graphics::VertexBufferExtent(attribute));
+            } catch (const std::exception&) {
+                draw.rangesComplete = false;
+            }
+        }
+    }
+    draw.inputs = inputs;
+    auto targets = ReplayMix(0xbe5466cf34e90c6cull, graphics.colors.size() | (graphics.hasColorTarget ? 1ull << 32u : 0u));
+    const auto color = [&](const Graphics::ColorTarget& target) {
+        targets = ReplayMix(targets, target.address);
+        targets = ReplayMix(targets, target.bytes);
+        targets = ReplayMix(targets, target.dccAddress);
+        targets = ReplayMix(targets, target.cmaskAddress);
+        targets = ReplayMix(targets, target.cmaskBytes);
+        targets = ReplayMix(targets, target.fmaskAddress);
+        targets = ReplayMix(targets, target.arraySlice | (static_cast<std::uint64_t>(target.arrayLastSlice) << 32u));
+        targets = ReplayMix(targets, static_cast<std::uint64_t>(target.format) | (static_cast<std::uint64_t>(target.extent.width) << 32u));
+        targets = ReplayMix(targets, target.extent.height);
+        if (target.dccAddress != 0) AddReplayMetadata(draw, target.dccAddress, Graphics::DccKeyBytes(target.bytes));
+        if (target.cmaskAddress != 0) AddReplayMetadata(draw, target.cmaskAddress, target.cmaskBytes);
+    };
+    if (graphics.hasColorTarget) color(graphics.color);
+    for (const auto& target : graphics.colors) color(target);
+    if (graphics.depth) {
+        const auto& depth = *graphics.depth;
+        targets = ReplayMix(targets, depth.address);
+        targets = ReplayMix(targets, depth.stencilAddress);
+        targets = ReplayMix(targets, depth.htileAddress);
+        targets = ReplayMix(targets, static_cast<std::uint64_t>(depth.extent.width) | (static_cast<std::uint64_t>(depth.extent.height) << 32u));
+        if (depth.htileAddress != 0) AddReplayMetadata(draw, depth.htileAddress, Graphics::HtileMetadataBytes(depth.extent));
+    }
+    draw.targets = targets;
+    auto drawn = ReplayMix(0x3f84d5b5b5470917ull, parameters.indexCount);
+    drawn = ReplayMix(drawn, parameters.indexSize | (static_cast<std::uint64_t>(parameters.indexed ? 1u : 0u) << 32u));
+    drawn = ReplayMix(drawn, parameters.instanceCount | (static_cast<std::uint64_t>(parameters.flags) << 32u));
+    drawn = ReplayMix(drawn, parameters.firstVertex | (static_cast<std::uint64_t>(parameters.firstInstance) << 32u));
+    draw.parameters = drawn;
+    return draw;
+}
+
+bool ReplayFilled(const ReplayDraw& draw) {
+    return replayMeter().Filled(draw, replayProof());
+}
+
+void NoteReplay(const ReplayDraw& draw, bool fallback, bool filled, bool timed, std::uint64_t spentNanoseconds) {
+    auto& meter = replayMeter();
+    auto& proof = replayProof();
+    const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    static_cast<void>(meter.Commit(draw, fallback, filled, proof));
+    if (timed) meter.NoteCost(spentNanoseconds + nanosecondsSince(started));
+    if ((meter.Counted().draws & 63u) != 0) return;
+    static std::atomic<std::int64_t> lastReport{0};
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (last == 0) {
+        lastReport.compare_exchange_strong(last, nowMs);
+        return;
+    }
+    if (nowMs - last < 5000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto front = Front::Counted();
+    std::fprintf(stderr, "%s%c", meter.TakeReport(front.draws, front.committed, proof.TokensLive(), static_cast<double>(nowMs - last) / 1000.0).c_str(), 10);
 }
 
 BackMode BackModeNow() {
@@ -78,6 +221,15 @@ void Driver::commitCoreDraw(const std::shared_ptr<Core::CoreDraw>& record) {
     auto& variant = *record->variant;
     const auto stages = Core::PrepareBack(*record);
     const auto& graphics = variant.plan->decode->state;
+    std::optional<Core::ReplayDraw> replay;
+    bool replayTimed = false;
+    std::uint64_t replaySpent = 0;
+    if (Core::ReplayStats()) {
+        replayTimed = Core::ReplayTimedNext();
+        const auto replayStarted = replayTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        replay.emplace(Core::ReplayDrawOf(*record, graphics, stages));
+        if (replayTimed) replaySpent = Core::nanosecondsSince(replayStarted);
+    }
     bool restarted = false;
     {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
@@ -92,12 +244,16 @@ void Driver::commitCoreDraw(const std::shared_ptr<Core::CoreDraw>& record) {
         } submitDue{*this, localDevice};
         recordLabelsForPacket(localDevice.get(), record->queue);
         noteDrawWriters(stages, record->queue);
+        const auto fillStarted = replayTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const bool filled = replay.has_value() && Core::ReplayFilled(*replay);
+        if (replayTimed) replaySpent += Core::nanosecondsSince(fillStarted);
         if (!Core::RecordBack(*localDevice, graphics, record->parameters, stages, variant.recipe)) {
             restarted = true;
             variant.stale.store(true, std::memory_order_release);
             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
             localDevice->Draw(graphics, record->parameters, stages, {}, nullptr, nullptr, variant.shape);
         }
+        if (replay.has_value()) Core::NoteReplay(*replay, restarted, filled, replayTimed, replaySpent);
         Graphics::NoteDrawSite(variant.shape);
     }
     Core::Front::NoteCommitted(restarted, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
