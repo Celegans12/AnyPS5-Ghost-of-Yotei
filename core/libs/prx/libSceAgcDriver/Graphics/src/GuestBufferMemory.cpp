@@ -7813,6 +7813,10 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                 region.pending = true;
                 continue;
             }
+            if (!addressable && !region.sparse && region.end - region.begin <= Recorder::FinishedReadBytes && Recorder::EarlyEndOfPipe() && !(region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) && !Recorder::SnapshotWriteOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
+                region.direct = nullptr;
+                continue;
+            }
             // An import found when the lease was acquired is reused while none was dropped since.
             const HostImport* entry = region.direct != nullptr && state.epoch == importsEpoch ? region.direct : nullptr;
             region.direct = nullptr;
