@@ -431,6 +431,18 @@ public:
     };
     std::optional<PendingReadInfo> DescribePendingRead(std::uint64_t address, std::size_t bytes) const;
     std::optional<std::uint64_t> NewestGuestWork() const;
+    struct InPlaceRead {
+        std::uint64_t begin;
+        std::uint64_t end;
+        ReadKind kind;
+        std::uint64_t serial = 0;
+    };
+    static constexpr std::size_t FinishedReadBytes = 4096;
+    static constexpr std::size_t FinishedReadCapacity = 16384;
+    void NoteEndOfPipe(bool early);
+    bool TakeEarlyEndOfPipe();
+    std::size_t UnexecutedReads(std::vector<InPlaceRead>& reads) const;
+    bool TakeFinishedReads(std::vector<InPlaceRead>& reads, std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes);
     // Counters of the read tracking (cumulative, for the [recorder] line): ranges noted, overlap
     // queries, hits by reader kind, and hits ignored because the reader's fence had signaled.
     struct ReadStatistics {
@@ -1201,6 +1213,14 @@ private:
     std::uint64_t holdKeptSerial = 0;
     std::size_t keptHint = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;
+    void noteFinishedReads(const Batch& batch);
+    std::mutex finishedReadsMutex;
+    std::vector<InPlaceRead> finishedReads;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> finishedWrites;
+    bool finishedReadsLost = false;
+    std::atomic<bool> finishedReadsWanted{false};
+    std::uint64_t endOfPipeSerial = 0;
+    bool endOfPipeEarly = false;
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;

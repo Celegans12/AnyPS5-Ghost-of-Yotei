@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include <chrono>
@@ -107,6 +108,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     timing.Mark("validate");
     try {
         static const auto completion = VulkanDevice::ConfiguredFlipCompletion();
+        bool beforeGpu = completion != VulkanDevice::FlipCompletion::Gpu;
         bool submitted = false;
         bool presentable = false;
         bool trailing = false;
@@ -121,6 +123,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             timing.Mark("gpu_mutex_wait");
             require(device != nullptr && device->Window() == window.context, "presentation window is not attached to the device");
             presenting = device;
+            if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr && recorder->TakeEarlyEndOfPipe()) beforeGpu = true;
             timing.Mark("device_setup");
             std::uint32_t drawableWidth = 0;
             std::uint32_t drawableHeight = 0;
@@ -170,7 +173,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                     timing.Mark("queue_present");
                 }
                 trailing = !syncFlip;
-                early = trailing && plane == nullptr && completion != VulkanDevice::FlipCompletion::Gpu;
+                early = trailing && plane == nullptr && beforeGpu;
                 if (early && completion == VulkanDevice::FlipCompletion::Guest) {
                     const auto newest = presenting->GuestWorkSerial();
                     early = newest.has_value();
@@ -209,7 +212,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             }
             timing.Mark("queue_present");
         }
-        if (!blitted && completion != VulkanDevice::FlipCompletion::Gpu) {
+        if (!blitted && beforeGpu) {
             waitedMs += presenting->RetirePresents(0);
             timing.Mark("render_fence_wait");
         }

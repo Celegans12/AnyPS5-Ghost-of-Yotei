@@ -5202,6 +5202,62 @@ std::optional<std::uint64_t> Recorder::NewestGuestWork() const {
     return std::uint64_t{0};
 }
 
+void Recorder::NoteEndOfPipe(bool early) {
+    endOfPipeEarly = early;
+    endOfPipeSerial = open != nullptr ? submissions + 1 : submissions;
+}
+
+bool Recorder::TakeEarlyEndOfPipe() {
+    return std::exchange(endOfPipeEarly, false) && submissions <= endOfPipeSerial + 1;
+}
+
+std::size_t Recorder::UnexecutedReads(std::vector<InPlaceRead>& reads) const {
+    reads.clear();
+    const auto collect = [&](const Batch& batch, std::uint64_t serial) {
+        for (const auto& read : batch.reads) reads.push_back({read.begin, read.end, read.kind, serial});
+        for (const auto& note : batch.readLists) {
+            if (note.ranges->empty()) continue;
+            if (note.kind == ReadKind::AddressBased || note.kind == ReadKind::AddressBasedReadOnly) {
+                reads.push_back({note.ranges->front().first, note.ranges->back().second, note.kind, serial});
+                continue;
+            }
+            for (const auto& [begin, end] : *note.ranges) reads.push_back({begin, end, note.kind, serial});
+        }
+    };
+    if (open != nullptr) collect(*open, submissions + 1);
+    const auto opened = reads.size();
+    for (const auto& batch : inFlight) {
+        if (!signaled(*batch)) collect(*batch, batch->serial);
+    }
+    return opened;
+}
+
+bool Recorder::TakeFinishedReads(std::vector<InPlaceRead>& reads, std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes) {
+    reads.clear();
+    writes.clear();
+    finishedReadsWanted.store(true, std::memory_order_relaxed);
+    std::lock_guard lock(finishedReadsMutex);
+    reads.swap(finishedReads);
+    writes.swap(finishedWrites);
+    return std::exchange(finishedReadsLost, false);
+}
+
+void Recorder::noteFinishedReads(const Batch& batch) {
+    std::lock_guard lock(finishedReadsMutex);
+    const auto keep = [&](std::uint64_t begin, std::uint64_t end, ReadKind kind) {
+        if (end - begin > FinishedReadBytes) return;
+        if (finishedReads.size() >= FinishedReadCapacity) finishedReadsLost = true;
+        else finishedReads.push_back({begin, end, kind});
+    };
+    for (const auto& read : batch.reads) keep(read.begin, read.end, read.kind);
+    for (const auto& note : batch.readLists) {
+        if (note.kind == ReadKind::AddressBased || note.kind == ReadKind::AddressBasedReadOnly) continue;
+        for (const auto& [begin, end] : *note.ranges) keep(begin, end, note.kind);
+    }
+    if (finishedWrites.size() + batch.writes.size() > FinishedReadCapacity) finishedReadsLost = true;
+    else finishedWrites.insert(finishedWrites.end(), batch.writes.begin(), batch.writes.end());
+}
+
 Recorder::ReadStatistics Recorder::ReadCounts() {
     ReadStatistics counts{readsNoted.Sum(), readQueries.Sum(), readStaleIgnored.Sum(), {}};
     for (std::size_t kind = 0; kind < ReadKinds; ++kind) counts.hits[kind] = readHits[kind].Sum();
@@ -6239,6 +6295,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
     readGpuTiming(*batch);
     readTwinTiming(*batch);
     readSamples(*batch);
+    if (finishedReadsWanted.load(std::memory_order_relaxed)) noteFinishedReads(*batch);
     if (batch->serial != 0) {
         std::lock_guard ringLock(completedMutex);
         auto& entry = completed[batch->serial % completed.size()];
