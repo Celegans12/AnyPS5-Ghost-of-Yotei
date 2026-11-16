@@ -34,6 +34,7 @@ struct DrawReads {
 struct DrawWritten {
     RingSlice slice;
     std::array<std::uint32_t, 4> section{};
+    std::array<std::uint32_t, 4> driver{};
     std::uint64_t deferred = 0;
     std::array<std::uint64_t, 2> images{};
     std::array<std::uint64_t, 4> variant{};
@@ -44,6 +45,9 @@ struct DrawWritten {
 
 [[nodiscard]] std::uint32_t DrawBytes(std::span<const DrawStage> stages, std::uint32_t extraWords);
 [[nodiscard]] DrawWritten WriteDraw(std::span<const DrawStage> stages, const DrawReads& reads, std::uint32_t extraWords, BlockRing& ring);
+[[nodiscard]] std::uint32_t DrawDriverWords(const DrawStage& stage);
+[[nodiscard]] std::span<const std::uint32_t> DrawDriverZone(const DrawStage& stage, const DrawWritten& written, std::uint32_t index);
+void CompleteDrawBuffer(const DrawStage& stage, const DrawWritten& written, std::uint32_t index, std::uint32_t buffer, const BufferAnswer& answer);
 [[nodiscard]] const char* DrawLeftName(DrawLeft left);
 
 }

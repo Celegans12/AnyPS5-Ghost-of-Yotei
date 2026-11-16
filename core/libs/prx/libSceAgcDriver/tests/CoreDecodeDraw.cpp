@@ -261,6 +261,89 @@ struct Draw {
     }
 };
 
+constexpr std::uint32_t DrivenBuffers = 2;
+constexpr std::uint32_t DrivenZoneWords = 21;
+constexpr std::uint32_t DrivenSectionBytes = 32;
+constexpr std::uint32_t DrivenBytes = 128;
+constexpr std::uint32_t FilterWord = 4;
+constexpr std::uint32_t PictureUserWord = 8;
+constexpr std::uint64_t DrivenDirect = 0x00000abe22446682ull;
+constexpr std::uint64_t DrivenTabled = 0x0000000400003001ull;
+
+struct Driven {
+    Values values;
+    IrResourcePlan plan;
+    BlockLayout layout;
+    std::array<std::uint32_t, 16> userData{};
+    const Detail::SrtTape* tape = nullptr;
+
+    explicit Driven(Host& host) {
+        plan.srtPlanComplete = true;
+        plan.resourceTrackingComplete = true;
+        MemoryInfo memory;
+        memory.kind = ResourceKind::ScalarAddress;
+        plan.memoryInfo.push_back(memory);
+        auto& pointer = values.Make(IrOpcode::CompositeConstructU64, IrType::U64, {&values.UserData(4), &values.UserData(5)});
+        const auto load = [&](std::uint32_t word) -> IrValue* {
+            auto& read = values.Make(IrOpcode::LoadAddressU32, IrType::U32);
+            read.SetFlags(MemoryFlags{0, 0});
+            read.AddArgument(&pointer);
+            read.AddArgument(&values.Constant(word * 4u));
+            return &read;
+        };
+        DescriptorSource direct;
+        DescriptorSource tabled;
+        DescriptorSource picture;
+        DescriptorSource filter;
+        direct.dwordCount = tabled.dwordCount = filter.dwordCount = 4u;
+        picture.dwordCount = 8u;
+        for (std::uint32_t word = 0; word < 4u; ++word) {
+            direct.dwords[word] = &values.UserData(word);
+            tabled.dwords[word] = load(word);
+            filter.dwords[word] = load(FilterWord + word);
+        }
+        for (std::uint32_t word = 0; word < 8u; ++word) picture.dwords[word] = &values.UserData(PictureUserWord + word);
+        plan.descriptorSources = {direct, tabled, picture, filter};
+        plan.materializationSources = {0u, 1u, 2u, 3u};
+        plan.info.buffers.resize(DrivenBuffers);
+        plan.info.buffers[Direct].source = 0u;
+        plan.info.buffers[Tabled].source = 1u;
+        plan.info.images.resize(1);
+        plan.info.images[0].source = 2u;
+        plan.info.runtimeImageModes.resize(1);
+        plan.info.samplers.resize(1);
+        plan.info.samplers[0].source = 3u;
+        tape = Detail::SrtTape::For(plan);
+        layout = BuildBlockLayout(plan);
+
+        userData[0] = static_cast<std::uint32_t>(DrivenDirect);
+        userData[1] = static_cast<std::uint32_t>(DrivenDirect >> 32u) | (12u << 16u);
+        userData[2] = 5u;
+        userData[3] = 0xfacu;
+        userData[4] = static_cast<std::uint32_t>(TableAddress);
+        userData[5] = static_cast<std::uint32_t>(TableAddress >> 32u);
+        for (std::uint32_t word = 0; word < 8u; ++word) userData[PictureUserWord + word] = 0x70000000u + word;
+        host.table[0] = static_cast<std::uint32_t>(DrivenTabled);
+        host.table[1] = static_cast<std::uint32_t>(DrivenTabled >> 32u);
+        host.table[2] = 0x240u;
+        host.table[3] = 0xbeefu;
+        for (std::uint32_t word = 0; word < 4u; ++word) host.table[FilterWord + word] = 0x5a000000u + word;
+    }
+
+    Driven(const Driven&) = delete;
+    Driven& operator=(const Driven&) = delete;
+
+    DrawStage Stage() const {
+        DrawStage stage;
+        stage.plan = &plan;
+        stage.layout = &layout;
+        stage.tape = tape;
+        stage.userData = userData;
+        stage.variantKey = BlockVariantKey(layout, {}, userData);
+        return stage;
+    }
+};
+
 std::span<const std::uint32_t> sectionOf(const DrawWritten& written, std::uint32_t stage, std::size_t words) {
     return {reinterpret_cast<const std::uint32_t*>(written.slice.bytes + written.section[stage]), words};
 }
@@ -638,6 +721,100 @@ void testEmpty() {
     Expect(loose.left == DrawLeft::None && loose.slice.bytes != nullptr && loose.extra == 0u, "a draw with no stage still takes its free words");
 }
 
+void testDriver() {
+    Host host;
+    Driven driven(host);
+    Expect(driven.tape != nullptr, "the driven plan compiles to a tape");
+    if (driven.tape == nullptr) return;
+    Expect(driven.layout.Eligible() && driven.layout.words == 0u && driven.layout.buffers.size() == DrivenBuffers && driven.layout.buffers[Direct].descriptorWords[0] == 0xffffffffu && driven.layout.buffers[Tabled].descriptorWords[2] == 0xffffffffu, "a shader that reads no descriptor word has a block with no word and buffers the block does not locate");
+    Expect(driven.tape->Driver().complete && driven.tape->Driver().words == DrivenZoneWords, "the tape counts the V#, T# and S# words and the active word for the driver");
+    Arena arena;
+    BlockRing ring(sourceOf(arena));
+    DrawReads reads;
+    reads.read = readWords;
+    reads.resolve = resolveBuffer;
+    reads.context = &host;
+    const std::array<DrawStage, 1> stages{driven.Stage()};
+    Expect(DrawDriverWords(stages[0]) == DrivenZoneWords && DrawBytes(stages, 0u) == DrivenBytes && DrawBytes(stages, 1u) == DrivenBytes + 16u, "the bytes of a driven draw count its driver zone, rounded up to 16 bytes");
+
+    const auto written = WriteDraw(stages, reads, 3u, ring);
+    Expect(written.left == DrawLeft::None && written.deferred == 0u && written.slice.bytes != nullptr, "a draw whose buffers only the driver reads is written");
+    if (written.slice.bytes == nullptr) return;
+    Expect(written.section[0] == 0u && written.driver[0] == DrivenSectionBytes && written.extra == DrivenBytes && ring.Counted().bytes == DrivenBytes + 16u, "the driver zone follows the sections and the free words follow the zone");
+    const auto section = sectionOf(written, 0, DrivenSectionBytes / sizeof(std::uint32_t));
+    Expect(host.resolved == 2u && host.requests[0].buffer == Direct && host.requests[0].address == DrivenDirect && host.requests[0].bytes == 60u && host.requests[0].misalignment == 2u && host.requests[0].present, "a V# in user data is decoded from the driver zone");
+    Expect(host.requests[1].buffer == Tabled && host.requests[1].address == DrivenTabled && host.requests[1].bytes == 0x240u && host.requests[1].misalignment == 1u && host.requests[1].present, "a V# behind a pointer is decoded from the driver zone");
+    Expect(entryIs(section, 0u, Direct, MirrorBase + DrivenDirect, 60u, 2u) && entryIs(section, 0u, Tabled, MirrorBase + DrivenTabled, 0x240u, 1u), "the entries of driven buffers hold the answers");
+    const auto zone = DrawDriverZone(stages[0], written, 0u);
+    const std::array<std::uint32_t, DrivenZoneWords> expected{driven.userData[0], driven.userData[1], driven.userData[2], driven.userData[3], host.table[0], host.table[1], host.table[2], host.table[3], 0x70000000u, 0x70000001u, 0x70000002u, 0x70000003u, 0x70000004u, 0x70000005u, 0x70000006u, 0x70000007u, 0x5a000000u, 0x5a000001u, 0x5a000002u, 0x5a000003u, 0x1fu};
+    bool held = zone.size() == DrivenZoneWords;
+    for (std::uint32_t word = 0; held && word < DrivenZoneWords; ++word) held = zone[word] == expected[word];
+    Expect(held, "the driver zone holds the words of every buffer, image and sampler, then the active sources");
+    Expect(driven.tape->Driver().Active(zone, driven.tape->Driver().imageBase), "the image of the driven draw is active");
+
+    const auto again = WriteDraw(stages, reads, 0u, ring);
+    Expect(again.left == DrawLeft::None && again.images == written.images && again.variant[0] == stages[0].variantKey, "the same driven draw has the same image digest and its variant key");
+    driven.userData[PictureUserWord + 5u] ^= 1u;
+    const auto pictured = WriteDraw(stages, reads, 0u, ring);
+    Expect(pictured.left == DrawLeft::None && pictured.images != written.images, "an image word only the driver reads changes the image digest");
+    driven.userData[PictureUserWord + 5u] ^= 1u;
+    host.table[FilterWord + 3u] ^= 1u;
+    const auto filtered = WriteDraw(stages, reads, 0u, ring);
+    Expect(filtered.left == DrawLeft::None && filtered.images != written.images && filtered.images != pictured.images, "a sampler word only the driver reads changes the image digest");
+    host.table[FilterWord + 3u] ^= 1u;
+    driven.userData[2] ^= 1u;
+    host.table[2] ^= 4u;
+    const auto resized = WriteDraw(stages, reads, 0u, ring);
+    Expect(resized.left == DrawLeft::None && resized.images == written.images, "the buffer words of the driver zone keep the image digest");
+    driven.userData[2] ^= 1u;
+    host.table[2] ^= 4u;
+
+    host.deferred = {DrivenTabled, 0u};
+    const auto deferred = WriteDraw(stages, reads, 0u, ring);
+    Expect(deferred.left == DrawLeft::None && deferred.deferred == std::uint64_t{1} << Tabled, "a deferred driven buffer sets the bit of its rank");
+    if (deferred.slice.bytes != nullptr) {
+        const auto late = sectionOf(deferred, 0, DrivenSectionBytes / sizeof(std::uint32_t));
+        Expect(entryIs(late, 0u, Tabled, 0u, 0u, 0u) && entryIs(late, 0u, Direct, MirrorBase + DrivenDirect, 60u, 2u), "a deferred driven entry is left at zero beside the written one");
+        BufferAnswer answer;
+        answer.deviceAddress = 0x0000007f00020000ull;
+        answer.bytes = 0x200u;
+        CompleteDrawBuffer(stages[0], deferred, 0u, Tabled, answer);
+        Expect(entryIs(late, 0u, Tabled, 0x0000007f00020000ull, 0x200u, 1u) && entryIs(late, 0u, Direct, MirrorBase + DrivenDirect, 60u, 2u), "a deferred driven entry is completed from the driver zone of its draw");
+    }
+    host.deferred = {};
+
+    driven.userData[0] = 0u;
+    driven.userData[1] &= 0xffff0000u;
+    const auto absent = WriteDraw(stages, reads, 0u, ring);
+    Expect(absent.left == DrawLeft::None && absent.slice.bytes != nullptr, "a driven draw with a null V# is written");
+    if (absent.slice.bytes != nullptr) Expect(entryIs(sectionOf(absent, 0, DrivenSectionBytes / sizeof(std::uint32_t)), 0u, Direct, 0u, 0u, BlockAbi::ServiceAbsent), "a null V# in the driver zone is an absent entry");
+    driven.userData[0] = static_cast<std::uint32_t>(DrivenDirect);
+    driven.userData[1] |= static_cast<std::uint32_t>(DrivenDirect >> 32u);
+
+    Draw draw;
+    if (!draw.Ready()) return;
+    Driven second(draw.host);
+    const std::array<DrawStage, 2> mixed{draw.second.Stage(draw.host), second.Stage()};
+    const auto both = WriteDraw(mixed, draw.Reads(), 0u, ring);
+    Expect(both.left == DrawLeft::None && both.section[1] == SceneBytes && both.driver[0] == SceneBytes + DrivenSectionBytes && both.driver[1] == SceneBytes + DrivenSectionBytes && both.extra == SceneBytes + DrivenBytes, "a stage with no driver zone takes none before the zone of the next stage");
+    Expect(DrawDriverZone(mixed[0], both, 0u).empty() && DrawDriverZone(mixed[1], both, 1u).size() == DrivenZoneWords && DrawBytes(mixed, 0u) == SceneBytes + DrivenBytes, "each stage names its own driver zone");
+
+    const auto before = allocations;
+    const auto plain = WriteDraw(stages, reads, 0u, ring);
+    host.unreadableFrom = TableAddress;
+    const auto unreadable = WriteDraw(stages, reads, 0u, ring);
+    host.unreadableFrom = ~std::uint64_t{0};
+    Expect(allocations == before, "writing a driven draw, or leaving one, allocates nothing");
+    Expect(plain.left == DrawLeft::None && leftWith(unreadable, DrawLeft::Walk, 0u), "a driver word the reader refuses leaves the draw as a walk");
+
+    Driven loose(host);
+    loose.plan.materializationSources = {1u, 2u, 3u};
+    loose.plan.tapeSlot = std::make_shared<SrtTapeSlot>();
+    loose.tape = Detail::SrtTape::For(loose.plan);
+    const auto stage = loose.Stage();
+    Expect(loose.tape != nullptr && !loose.tape->Driver().complete && leftWith(WriteDraw(std::span<const DrawStage>(&stage, 1), reads, 0u, ring), DrawLeft::Walk, 0u), "a buffer neither the block nor the driver zone locates leaves the draw as a walk");
+}
+
 void testAllocations() {
     Draw draw;
     if (!draw.Ready()) return;
@@ -688,6 +865,7 @@ int main() {
     testBuffers();
     testImages();
     testEmpty();
+    testDriver();
     testAllocations();
     if (failures != 0) {
         std::fprintf(stderr, "%d decode draw check(s) failed\n", failures);
