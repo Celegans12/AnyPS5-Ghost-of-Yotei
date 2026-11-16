@@ -25,7 +25,8 @@ void CoreReplayRange(const CoreReplay& replay, std::uint32_t index, std::uint64_
 bool CoreReplayMatches(const CoreReplay& replay, VkDevice device, std::uint64_t identity, const DrawRecipe* recipe, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
 bool CoreReplayRecaptured(const CoreReplay& replay);
 bool CoreReplayLean(const CoreReplay& replay);
-std::array<std::uint64_t, 8> CoreReplayCounted();
+void ClearCoreReplay(CoreReplay& replay);
+std::array<std::uint64_t, 9> CoreReplayCounted();
 std::array<std::uint64_t, 12> CoreReplayLeanRefusals();
 
 }

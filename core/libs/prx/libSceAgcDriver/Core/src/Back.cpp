@@ -79,7 +79,7 @@ std::atomic<int>& testedReplay() {
     return mode;
 }
 
-enum class ReplayCount : std::size_t { Draws, Replayed, Captured, Stored, Absent, Unmatched, Token, Pending, Unstorable, Failed, TimedReplayed, ReplayedNanoseconds, TimedOther, OtherNanoseconds, TimedLean, LeanNanoseconds, Count };
+enum class ReplayCount : std::size_t { Draws, Replayed, Captured, Stored, Absent, Unmatched, Token, Pending, Unstorable, Failed, TimedReplayed, ReplayedNanoseconds, TimedOther, OtherNanoseconds, TimedLean, LeanNanoseconds, TimedRefreshed, RefreshedNanoseconds, Refreshed, Count };
 
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ReplayCount::Count)>& replayCounters() {
     static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ReplayCount::Count)> held{};
@@ -166,10 +166,12 @@ bool replayBack(const Graphics::Context& context, const Graphics::State& graphic
         if (held == nullptr) {
             if (spare == nullptr) spare = Graphics::NewCoreReplay();
             held = spare;
+            Graphics::ClearCoreReplay(*held);
         }
-        recorded = Graphics::DrawCoreReplayed(context, graphics, parameters, stages, recipe, verifyBack, *held, false, false, identity).recorded;
+        recorded = Graphics::DrawCoreReplayed(context, graphics, parameters, stages, recipe, verifyBack || verifyReplay, *held, false, verifyReplay, identity).recorded;
     }
-    countReplay(recorded ? ReplayCount::Captured : ReplayCount::Failed);
+    const bool refreshed = recorded && Graphics::CoreReplayLean(*held);
+    countReplay(!recorded ? ReplayCount::Failed : refreshed ? ReplayCount::Refreshed : ReplayCount::Captured);
     const auto ranges = Graphics::CoreReplayRanges(*held);
     bool storable = recorded && Graphics::CoreReplayStorable(*held) && ranges <= DrawProof{}.ranges.size();
     DrawProof proof;
@@ -192,8 +194,8 @@ bool replayBack(const Graphics::Context& context, const Graphics::State& graphic
         countReplay(ReplayCount::Unstorable);
     }
     if (timed) {
-        countReplay(ReplayCount::TimedOther);
-        countReplay(ReplayCount::OtherNanoseconds, nanosecondsSince(started));
+        countReplay(refreshed ? ReplayCount::TimedRefreshed : ReplayCount::TimedOther);
+        countReplay(refreshed ? ReplayCount::RefreshedNanoseconds : ReplayCount::OtherNanoseconds, nanosecondsSince(started));
     }
     return recorded;
 }
@@ -343,8 +345,8 @@ std::string BackReplayReport() {
     const auto each = [&](ReplayCount total, ReplayCount samples) { return at(samples) == 0 ? 0.0 : static_cast<double>(at(total)) / static_cast<double>(at(samples)); };
     const auto lean = Graphics::CoreReplayLeanRefusals();
     char text[1792];
-    const auto wrote = std::snprintf(text, sizeof(text), "[core-replay-back] (cumulative) %llu draws offered, %llu replayed (%.1f %%) of which %llu emitted directly, %llu taken by the full path (%.1f %%): absent %llu, unmatched %llu, token %llu, pending GPU write %llu, in-place input gone %llu; %llu stored, %llu not storable, %llu left to the driver; kept once by the batch %llu; verified %llu, mismatches %llu; memo evicted %llu, replaced %llu; %.0f ns per draw emitted directly (%llu timed), %.0f ns per other replayed draw (%llu timed), %.0f ns per other draw (%llu timed)",
-        at(ReplayCount::Draws), at(ReplayCount::Replayed), share(ReplayCount::Replayed), static_cast<unsigned long long>(back[6]), at(ReplayCount::Captured), share(ReplayCount::Captured), at(ReplayCount::Absent), at(ReplayCount::Unmatched), at(ReplayCount::Token), at(ReplayCount::Pending), static_cast<unsigned long long>(back[7]), at(ReplayCount::Stored), at(ReplayCount::Unstorable), at(ReplayCount::Failed),
+    const auto wrote = std::snprintf(text, sizeof(text), "[core-replay-back] (cumulative) %llu draws offered, %llu replayed (%.1f %%) of which %llu emitted directly, %llu emitted directly with refreshed inputs (%.1f %%, %.0f ns each, %llu timed), %llu taken by the full path (%.1f %%): absent %llu, unmatched %llu, token %llu, pending GPU write %llu, in-place input gone %llu; %llu stored, %llu not storable, %llu left to the driver; kept once by the batch %llu; verified %llu, mismatches %llu; memo evicted %llu, replaced %llu; %.0f ns per draw emitted directly (%llu timed), %.0f ns per other replayed draw (%llu timed), %.0f ns per other draw (%llu timed)",
+        at(ReplayCount::Draws), at(ReplayCount::Replayed), share(ReplayCount::Replayed), static_cast<unsigned long long>(back[6] - back[8]), at(ReplayCount::Refreshed), share(ReplayCount::Refreshed), each(ReplayCount::RefreshedNanoseconds, ReplayCount::TimedRefreshed), at(ReplayCount::TimedRefreshed), at(ReplayCount::Captured), share(ReplayCount::Captured), at(ReplayCount::Absent), at(ReplayCount::Unmatched), at(ReplayCount::Token), at(ReplayCount::Pending), static_cast<unsigned long long>(back[7]), at(ReplayCount::Stored), at(ReplayCount::Unstorable), at(ReplayCount::Failed),
         static_cast<unsigned long long>(back[5]), static_cast<unsigned long long>(back[3]), static_cast<unsigned long long>(back[4]), static_cast<unsigned long long>(memo.evicted), static_cast<unsigned long long>(memo.replaced), each(ReplayCount::LeanNanoseconds, ReplayCount::TimedLean), at(ReplayCount::TimedLean), each(ReplayCount::ReplayedNanoseconds, ReplayCount::TimedReplayed), at(ReplayCount::TimedReplayed), each(ReplayCount::OtherNanoseconds, ReplayCount::TimedOther), at(ReplayCount::TimedOther));
     if (wrote > 0 && static_cast<std::size_t>(wrote) < sizeof(text)) {
         std::snprintf(text + wrote, sizeof(text) - static_cast<std::size_t>(wrote), "; not emitted directly: shape %llu, run %llu, targets %llu, depth %llu, template %llu, proof %llu, queued stores %llu, summary %llu, pass %llu, objects %llu, moved buffers %llu, inputs %llu",
