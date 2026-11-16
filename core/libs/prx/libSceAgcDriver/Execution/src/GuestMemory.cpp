@@ -44,6 +44,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 #ifdef _WIN32
@@ -144,6 +145,38 @@ constexpr std::uint32_t IndexSources = sourceBit(WriteBumpSource::Cpu) | sourceB
 constexpr std::uint32_t VersionSources = (sourceBit(WriteBumpSource::Count) - 1u) & ~sourceBit(WriteBumpSource::Pending);
 constexpr std::uint32_t NotedSources = sourceBit(WriteBumpSource::Break) | sourceBit(WriteBumpSource::Registry) | sourceBit(WriteBumpSource::Unwatch) | sourceBit(WriteBumpSource::Forget) | sourceBit(WriteBumpSource::Import);
 
+constexpr std::size_t ContentSlots = std::size_t{1} << 20;
+constexpr std::uint64_t ContentWideBlocks = 4096;
+
+struct ContentCounters {
+    std::array<std::atomic<std::uint64_t>, ContentSlots> blocks{};
+    std::atomic<std::uint64_t> wide{0};
+};
+
+ContentCounters& contentCounters() {
+    static auto* counters = new ContentCounters;
+    return *counters;
+}
+
+void bumpContent(std::uint64_t address, std::uint64_t bytes) {
+    if (bytes == 0 || !EpochSweeps()) return;
+    auto& counters = contentCounters();
+    const auto first = address / IndexBlockBytes;
+    const auto last = (bytes - 1 > ~address ? ~std::uint64_t{0} : address + (bytes - 1)) / IndexBlockBytes;
+    if (last - first >= ContentWideBlocks) {
+        counters.wide.fetch_add(1);
+        return;
+    }
+    for (auto block = first; block <= last; ++block) counters.blocks[block % ContentSlots].fetch_add(1);
+}
+
+std::uint64_t contentSum(std::uint64_t first, std::uint64_t stop) {
+    auto& counters = contentCounters();
+    std::uint64_t sum = 1;
+    for (auto block = first / IndexBlockBytes; block <= (stop - 1) / IndexBlockBytes; ++block) sum += counters.blocks[block % ContentSlots].load();
+    return sum == 0 ? 1 : sum;
+}
+
 struct WriteIndex {
     AgcDriver::Mutex mutex;
     std::atomic<std::uint64_t> live{0};
@@ -180,6 +213,7 @@ bool brokenSource(WriteBumpSource source) {
 }
 
 void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source) {
+    bumpContent(address, bytes);
     auto& index = Index();
     if (bytes == 0 || index.liveBySource[static_cast<std::size_t>(source)].load(std::memory_order_acquire) == 0 || brokenSource(source)) return;
     static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
@@ -1602,6 +1636,57 @@ void countCollectedBytes(std::uint64_t address, std::size_t bytes) {
     dirty.collectDirtyBytes.fetch_add(dirty.dirtyBytes(address, bytes), std::memory_order_relaxed);
 }
 
+constexpr std::size_t TokenMissCount = static_cast<std::size_t>(TokenMiss::Count);
+constexpr std::uint64_t SweepRunBlocks = 32;
+
+struct EpochSweepState {
+    std::atomic<std::uint64_t> serial{0};
+    std::atomic<std::uint64_t> wanted{0};
+    std::atomic<std::uint64_t> done{0};
+    std::atomic<bool> sweeping{false};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pieces;
+    std::unordered_set<std::uint64_t> barredBlocks;
+    std::atomic<std::uint64_t> sweeps{0};
+    std::atomic<std::uint64_t> abandoned{0};
+    std::atomic<std::uint64_t> walkedRuns{0};
+    std::atomic<std::uint64_t> walkedBlocks{0};
+    std::atomic<std::uint64_t> hot{0};
+    std::atomic<std::uint64_t> barred{0};
+    std::atomic<std::uint64_t> ticks{0};
+    std::atomic<std::uint64_t> tokens{0};
+    std::atomic<std::uint64_t> held{0};
+    std::atomic<std::uint64_t> verified{0};
+    std::atomic<std::uint64_t> late{0};
+    std::array<std::atomic<std::uint64_t>, TokenMissCount> refused{};
+    std::array<std::atomic<std::uint64_t>, TokenMissCount> missed{};
+};
+
+EpochSweepState& epochSweep() {
+    static auto* state = new EpochSweepState;
+    return *state;
+}
+
+std::uint64_t askedSerial() {
+    return epochSweep().serial.load(std::memory_order_relaxed) + 1;
+}
+
+std::uint64_t hotEpochs() {
+    static const std::uint64_t span = [] {
+        const char* text = std::getenv("APS5_EPOCH_SWEEP_SPAN");
+        const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0;
+        return value != 0 ? value : std::uint64_t{64};
+    }();
+    return span;
+}
+
+bool epochSweepVerified() {
+    static const bool verified = std::getenv("APS5_VERIFY_EPOCH_SWEEP") != nullptr;
+    return verified;
+}
+
+void verifyEpochAnswer(std::uint64_t address, std::size_t bytes);
+
 struct WriteTracker {
     AgcDriver::Mutex mutex;
     bool initialized = false;
@@ -1694,6 +1779,9 @@ struct WriteTracker {
     struct ObservationLeaf {
         std::array<std::atomic<std::uint64_t>, LeafBlocks> ticks{};
         std::array<std::atomic<std::uint64_t>, LeafBlocks / CoarseBlocks> coarse{};
+        std::array<std::atomic<std::uint64_t>, LeafBlocks> asked{};
+        std::array<std::atomic<std::uint64_t>, LeafBlocks / CoarseBlocks> askedAny{};
+        std::array<std::atomic<std::uint64_t>, LeafBlocks / CoarseBlocks> askedWhole{};
     };
     std::unique_ptr<std::atomic<ObservationLeaf*>[]> observationLeaves;
     std::size_t observationLeafCount = 0;
@@ -1778,6 +1866,34 @@ struct WriteTracker {
             }
         }
         return true;
+    }
+
+    void markAsked(std::uint64_t first, std::uint64_t stop, std::uint64_t serial) const {
+        const auto* table = observationTable.load(std::memory_order_acquire);
+        if (table == nullptr || stop <= first || !inObservationRange(first, stop)) return;
+        const auto raise = [serial](std::atomic<std::uint64_t>& slot) {
+            if (slot.load(std::memory_order_relaxed) != serial) slot.store(serial, std::memory_order_relaxed);
+        };
+        const auto last = blockOf(stop - 1);
+        auto block = blockOf(first);
+        while (block <= last) {
+            const auto index = block / LeafBlocks;
+            if (index >= observationLeafCount) return;
+            auto* leaf = table[index].load(std::memory_order_acquire);
+            const auto end = std::min<std::uint64_t>(last + 1, (index + 1) * LeafBlocks);
+            if (leaf == nullptr) {
+                block = end;
+                continue;
+            }
+            while (block < end) {
+                const auto group = (block % LeafBlocks) / CoarseBlocks;
+                const auto groupEnd = std::min<std::uint64_t>(end, (block / CoarseBlocks + 1) * CoarseBlocks);
+                raise(leaf->askedAny[group]);
+                if (groupEnd - block == CoarseBlocks) raise(leaf->askedWhole[group]);
+                else for (auto at = block; at < groupEnd; ++at) raise(leaf->asked[at % LeafBlocks]);
+                block = groupEnd;
+            }
+        }
     }
 
     void publishObserved(std::uint64_t first, std::uint64_t last, std::uint64_t tick) {
@@ -2184,6 +2300,7 @@ struct WriteTracker {
     void stamp(std::uint64_t block, std::uint64_t stampGeneration, StampKind kind) {
         const bool cpu = kind == StampKind::Cpu || kind == StampKind::ImportWindow;
         const bool stored = kind != StampKind::ImportWindow;
+        bumpContent(blockBegin(block), WriteBlockBytes);
         auto& leaf = leafFor(block);
         if (stored) {
             leaf.blocks[block % LeafBlocks].store(stampGeneration, std::memory_order_relaxed);
@@ -2613,7 +2730,12 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
     if (shared && tracker.observedSince(first, stop, epoch, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix())) {
         collectMemoHits.fetch_add(1, std::memory_order_relaxed);
         observed.Memo();
-        return {Status::Complete, tracker.stable.load(std::memory_order_acquire)};
+        const auto settled = tracker.stable.load(std::memory_order_acquire);
+        if (EpochSweeps()) {
+            tracker.markAsked(first, stop, askedSerial());
+            if (epochSweepVerified()) verifyEpochAnswer(address, bytes);
+        }
+        return {Status::Complete, settled};
     }
     const auto lockStart = collectTimed() ? collectTicks() : 0;
     auto lock = lockTracker(tracker, TrackerLockSite::Collect, first, stop);
@@ -2688,6 +2810,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
         const auto end = tracker.blockOf(runs[index].stop);
         if (end > from) tracker.publishObserved(from, end - 1, tick);
     }
+    if (shared && EpochSweeps()) tracker.markAsked(first, stop, askedSerial());
     if (status != Status::Complete) return {status, 0};
     return {Status::Complete, generation};
 }
@@ -2988,29 +3111,8 @@ bool EpochSweeps() {
     return enabled;
 }
 
-ContentToken TokenFor(std::uint64_t address, std::size_t bytes) {
-    static_cast<void>(address);
-    static_cast<void>(bytes);
-    return {};
-}
-
-bool StillCurrent(std::uint64_t address, std::size_t bytes, const ContentToken& token) {
-    static_cast<void>(address);
-    static_cast<void>(bytes);
-    static_cast<void>(token);
-    return false;
-}
-
-void SweepHot(std::uint64_t epoch) {
-    static_cast<void>(epoch);
-}
-
 void SetEpochHook(void (*hook)(std::uint64_t epoch)) {
     epochHook.store(hook, std::memory_order_release);
-}
-
-EpochSweepCounts EpochSweepCounted() {
-    return {};
 }
 
 void BumpCollectEpoch() {
@@ -3021,7 +3123,9 @@ void BumpCollectEpoch() {
     while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
     if (!EpochSweeps()) return;
+    epochSweep().serial.fetch_add(1, std::memory_order_relaxed);
     if (const auto hook = epochHook.load(std::memory_order_acquire)) hook(epoch);
+    else if (!proofThread) SweepHot(epoch);
 }
 
 std::uint64_t ThreadCollectEpoch() {
@@ -3085,6 +3189,21 @@ void ReportCollectCosts() {
             AgcDriver::ProfilePrint_nid_no_patch("%s %s: %llu of %.0f KiB taking %.2f ms, %.2f ms of it in GetWriteWatch, of which %llu found nothing written and took %.2f ms, %.2f ms of it in GetWriteWatch", size == 0 ? "" : ";", sizes[size], static_cast<unsigned long long>(walks), walks == 0 ? 0.0 : static_cast<double>(walkBytes) / 1024.0 / static_cast<double>(walks), ms(walkTicks), ms(walkWatchTicks), static_cast<unsigned long long>(cleanWalks), ms(cleanTicks), ms(cleanWatchTicks));
         }
         AgcDriver::ProfilePrint_nid_no_patch("\n");
+    }
+    if (EpochSweeps()) {
+        static EpochSweepCounts reported;
+        static std::uint64_t reportedTicks = 0;
+        const auto counts = EpochSweepCounted();
+        const auto sweepTicks = epochSweep().ticks.load(std::memory_order_relaxed);
+        const auto sweeps = counts.sweeps - reported.sweeps;
+        const auto since = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
+        AgcDriver::ProfilePrint_nid_no_patch("[epoch-sweep] (10 s): %llu sweeps taking %.2f ms, %llu abandoned for a newer epoch; %llu runs of %llu blocks walked, %.0f hot blocks a sweep, %llu blocks barred after a refused walk; tokens: %llu taken, refused %llu unobserved, %llu busy; %llu held, broken %llu unobserved, %llu written, %llu context, %llu busy; verified: %llu held tokens checked against the tracker, %llu late writes found by a walk after a memo answer\n",
+                                             since(counts.sweeps, reported.sweeps), ms(sweepTicks - reportedTicks), since(counts.abandoned, reported.abandoned), since(counts.runs, reported.runs), since(counts.blocks, reported.blocks), sweeps == 0 ? 0.0 : static_cast<double>(counts.hot - reported.hot) / static_cast<double>(sweeps), since(counts.barred, reported.barred), since(counts.tokens, reported.tokens),
+                                             since(counts.refused[static_cast<std::size_t>(TokenMiss::Unobserved)], reported.refused[static_cast<std::size_t>(TokenMiss::Unobserved)]), since(counts.refused[static_cast<std::size_t>(TokenMiss::Busy)], reported.refused[static_cast<std::size_t>(TokenMiss::Busy)]), since(counts.held, reported.held),
+                                             since(counts.missed[static_cast<std::size_t>(TokenMiss::Unobserved)], reported.missed[static_cast<std::size_t>(TokenMiss::Unobserved)]), since(counts.missed[static_cast<std::size_t>(TokenMiss::Written)], reported.missed[static_cast<std::size_t>(TokenMiss::Written)]), since(counts.missed[static_cast<std::size_t>(TokenMiss::Context)], reported.missed[static_cast<std::size_t>(TokenMiss::Context)]),
+                                             since(counts.missed[static_cast<std::size_t>(TokenMiss::Busy)], reported.missed[static_cast<std::size_t>(TokenMiss::Busy)]), since(counts.verified, reported.verified), since(counts.late, reported.late));
+        reported = counts;
+        reportedTicks = sweepTicks;
     }
 #ifdef _WIN32
     static std::uint64_t reportedCalls = 0;
@@ -3295,6 +3414,243 @@ void MarkProofThread() {
 
 std::uint64_t CollectEpoch() {
     return collectMemoEnabled() ? HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() : 0;
+}
+
+namespace {
+
+bool tokenRange(std::uint64_t address, std::size_t bytes, std::uint64_t& first, std::uint64_t& stop) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
+    constexpr std::uint64_t page = 4096;
+    first = address & ~(page - 1);
+    stop = (address + bytes + page - 1) & ~(page - 1);
+    return stop > first && (stop - first) / IndexBlockBytes < ContentWideBlocks;
+}
+
+std::uint64_t tokenContext() {
+    return 1 + wideProofSerial.load() + contentCounters().wide.load();
+}
+
+std::optional<TokenMiss> readContent(std::uint64_t first, std::uint64_t stop, std::uint64_t& content, std::uint64_t& generation) {
+    auto& tracker = Tracker();
+    const auto epoch = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get();
+    if (epoch == 0 || !collectMemoEnabled() || !tracker.ready.load(std::memory_order_acquire)) return TokenMiss::Unobserved;
+    generation = tracker.generation.load();
+    for (int attempt = 0; tracker.stable.load() != generation; ++attempt) {
+        if (attempt == 64) return TokenMiss::Busy;
+        AgcDriver::SpinPause();
+        generation = tracker.generation.load();
+    }
+    tracker.markAsked(first, stop, askedSerial());
+    if (!tracker.observedSince(first, stop, epoch, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix())) return TokenMiss::Unobserved;
+    content = contentSum(first, stop);
+    if (tracker.generation.load() != generation) return TokenMiss::Busy;
+    return std::nullopt;
+}
+
+struct VerifiedToken {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    ContentToken token;
+    std::uint64_t generation = 0;
+};
+struct VerifiedTokenSlot {};
+thread_local bool verifyingEpochAnswer = false;
+thread_local std::uint32_t verifiedEpochAnswers = 0;
+
+void verifyEpochAnswer(std::uint64_t address, std::size_t bytes) {
+    if (verifyingEpochAnswer) return;
+    std::uint64_t first = 0;
+    std::uint64_t stop = 0;
+    if (!tokenRange(address, bytes, first, stop)) return;
+    struct Busy {
+        Busy() { verifyingEpochAnswer = true; }
+        ~Busy() { verifyingEpochAnswer = false; }
+        Busy(const Busy&) = delete;
+        Busy& operator=(const Busy&) = delete;
+    } busy;
+    auto& sweep = epochSweep();
+    auto& taken = ThreadScratch<std::unordered_map<std::uint64_t, VerifiedToken>, VerifiedTokenSlot>();
+    if (taken.size() > 65536) taken.clear();
+    const auto key = (address * 0x9E3779B97F4A7C15ull) ^ bytes;
+    if (const auto found = taken.find(key); found != taken.end() && found->second.address == address && found->second.bytes == bytes && StillCurrent(address, bytes, found->second.token)) {
+        sweep.verified.fetch_add(1, std::memory_order_relaxed);
+        if (!UnchangedSince(address, bytes, found->second.generation)) {
+            char text[256];
+            std::snprintf(text, sizeof(text), "epoch sweep: a content token holds over 0x%llx+0x%llx although the write tracker reports a write since generation %llu", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(found->second.generation));
+            throw std::runtime_error(text);
+        }
+    }
+    VerifiedToken entry{address, bytes, {}, 0};
+    entry.token.context = tokenContext();
+    if (readContent(first, stop, entry.token.content, entry.generation)) {
+        taken.erase(key);
+        return;
+    }
+    taken[key] = entry;
+    if (verifiedEpochAnswers++ % 16 != 0) return;
+    if (observe(address, bytes, false).status == Observation::Status::Complete && contentSum(first, stop) != entry.token.content) sweep.late.fetch_add(1, std::memory_order_relaxed);
+}
+
+void collectHotRuns(const WriteTracker& tracker, EpochSweepState& sweep, std::uint64_t epoch) {
+    sweep.runs.clear();
+    const auto* table = tracker.observationTable.load(std::memory_order_acquire);
+    if (table == nullptr) return;
+    const auto serial = askedSerial();
+    const auto horizon = serial > hotEpochs() ? serial - hotEpochs() : 1;
+    const auto need = std::max(epoch, tracker.observationFloor.load(std::memory_order_acquire));
+    constexpr std::size_t Groups = WriteTracker::LeafBlocks / WriteTracker::CoarseBlocks;
+    std::uint64_t hot = 0;
+    for (std::size_t index = 0; index < tracker.observationLeafCount; ++index) {
+        const auto* leaf = table[index].load(std::memory_order_acquire);
+        if (leaf == nullptr) continue;
+        for (std::size_t group = 0; group < Groups; ++group) {
+            if (leaf->askedAny[group].load(std::memory_order_relaxed) < horizon) continue;
+            const bool whole = leaf->askedWhole[group].load(std::memory_order_relaxed) >= horizon;
+            for (std::size_t at = group * WriteTracker::CoarseBlocks; at < (group + 1) * WriteTracker::CoarseBlocks; ++at) {
+                if (!whole && leaf->asked[at].load(std::memory_order_relaxed) < horizon) continue;
+                ++hot;
+                if (leaf->ticks[at].load(std::memory_order_relaxed) >= need) continue;
+                const auto block = static_cast<std::uint64_t>(index) * WriteTracker::LeafBlocks + at;
+                if (!sweep.barredBlocks.empty() && sweep.barredBlocks.contains(block)) continue;
+                if (!sweep.runs.empty() && sweep.runs.back().second == block && block - sweep.runs.back().first < SweepRunBlocks) ++sweep.runs.back().second;
+                else sweep.runs.emplace_back(block, block + 1);
+            }
+        }
+    }
+    sweep.hot.fetch_add(hot, std::memory_order_relaxed);
+}
+
+bool sweepRun(WriteTracker& tracker, EpochSweepState& sweep, std::uint64_t fromBlock, std::uint64_t endBlock, std::uint64_t epoch) {
+    const auto first = tracker.blockBegin(fromBlock);
+    const auto stop = tracker.blockBegin(endBlock);
+    auto lock = lockTracker(tracker, TrackerLockSite::Collect, first, stop);
+    if (!tracker.watched) return true;
+    syncObservationContext(tracker, unwatchSerial.load(std::memory_order_acquire), GuestAllocations::GuestAllocationsGeneration_nid_postfix());
+    const auto tick = nextCollectEpoch.load(std::memory_order_acquire);
+    const auto need = std::max(epoch, tracker.observationFloor.load(std::memory_order_relaxed));
+    const bool whole = tracker.covers(first, static_cast<std::size_t>(stop - first));
+    auto& pieces = sweep.pieces;
+    pieces.clear();
+    for (auto block = fromBlock; block < endBlock; ++block) {
+        if (tracker.observedTick(block) >= need) continue;
+        if (!whole && !tracker.covers(tracker.blockBegin(block), static_cast<std::size_t>(WriteBlockBytes))) continue;
+        if (!pieces.empty() && pieces.back().second == block) ++pieces.back().second;
+        else pieces.emplace_back(block, block + 1);
+    }
+    std::size_t done = 0;
+    std::uint64_t blocks = 0;
+    bool complete = true;
+    for (const auto& [from, to] : pieces) {
+        if (!walkObserved(tracker, lock, tracker.blockBegin(from), tracker.blockBegin(to))) {
+            complete = false;
+            break;
+        }
+        blocks += to - from;
+        ++done;
+    }
+    lock.Stabilize();
+    for (std::size_t index = 0; index < done; ++index) tracker.publishObserved(pieces[index].first, pieces[index].second - 1, tick);
+    sweep.walkedRuns.fetch_add(done, std::memory_order_relaxed);
+    sweep.walkedBlocks.fetch_add(blocks, std::memory_order_relaxed);
+    return complete;
+}
+
+bool sweepEpoch(WriteTracker& tracker, EpochSweepState& sweep, std::uint64_t epoch) {
+    collectHotRuns(tracker, sweep, epoch);
+    for (std::size_t index = 0; index < sweep.runs.size(); ++index) {
+        if (sweep.wanted.load(std::memory_order_acquire) > epoch) return false;
+        const auto [from, to] = sweep.runs[index];
+        if (sweepRun(tracker, sweep, from, to, epoch)) continue;
+        for (auto block = from; block < to; ++block) sweep.barredBlocks.insert(block);
+        sweep.barred.fetch_add(to - from, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+}
+
+ContentToken TokenFor(std::uint64_t address, std::size_t bytes) {
+    if (!EpochSweeps()) return {};
+    std::uint64_t first = 0;
+    std::uint64_t stop = 0;
+    if (!tokenRange(address, bytes, first, stop)) return {};
+    auto& sweep = epochSweep();
+    ContentToken token;
+    token.context = tokenContext();
+    std::uint64_t generation = 0;
+    if (const auto miss = readContent(first, stop, token.content, generation)) {
+        sweep.refused[static_cast<std::size_t>(*miss)].fetch_add(1, std::memory_order_relaxed);
+        return {};
+    }
+    sweep.tokens.fetch_add(1, std::memory_order_relaxed);
+    return token;
+}
+
+bool StillCurrent(std::uint64_t address, std::size_t bytes, const ContentToken& token) {
+    if (token.content == 0 || !EpochSweeps()) return false;
+    std::uint64_t first = 0;
+    std::uint64_t stop = 0;
+    if (!tokenRange(address, bytes, first, stop)) return false;
+    auto& sweep = epochSweep();
+    const auto missed = [&sweep](TokenMiss cause) {
+        sweep.missed[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (token.context != tokenContext()) return missed(TokenMiss::Context);
+    std::uint64_t content = 0;
+    std::uint64_t generation = 0;
+    if (const auto miss = readContent(first, stop, content, generation)) return missed(*miss);
+    if (content != token.content) return missed(TokenMiss::Written);
+    sweep.held.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+void SweepHot(std::uint64_t epoch) {
+    if (!EpochSweeps()) return;
+    auto& sweep = epochSweep();
+    auto wanted = sweep.wanted.load(std::memory_order_relaxed);
+    while (wanted < epoch && !sweep.wanted.compare_exchange_weak(wanted, epoch, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+    auto& tracker = Tracker();
+    if (!tracker.ready.load(std::memory_order_acquire)) return;
+    while (sweep.wanted.load(std::memory_order_acquire) > sweep.done.load(std::memory_order_acquire)) {
+        if (sweep.sweeping.exchange(true, std::memory_order_acq_rel)) return;
+        struct Release {
+            std::atomic<bool>& flag;
+            ~Release() { flag.store(false, std::memory_order_release); }
+        } release{sweep.sweeping};
+        const auto start = collectTimed() ? collectTicks() : 0;
+        for (;;) {
+            const auto target = sweep.wanted.load(std::memory_order_acquire);
+            if (target <= sweep.done.load(std::memory_order_relaxed)) break;
+            if (sweepEpoch(tracker, sweep, target)) {
+                sweep.done.store(target, std::memory_order_release);
+                sweep.sweeps.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                sweep.abandoned.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (collectTimed()) sweep.ticks.fetch_add(collectTicks() - start, std::memory_order_relaxed);
+    }
+}
+
+EpochSweepCounts EpochSweepCounted() {
+    auto& sweep = epochSweep();
+    EpochSweepCounts counts;
+    counts.sweeps = sweep.sweeps.load(std::memory_order_relaxed);
+    counts.abandoned = sweep.abandoned.load(std::memory_order_relaxed);
+    counts.runs = sweep.walkedRuns.load(std::memory_order_relaxed);
+    counts.blocks = sweep.walkedBlocks.load(std::memory_order_relaxed);
+    counts.hot = sweep.hot.load(std::memory_order_relaxed);
+    counts.barred = sweep.barred.load(std::memory_order_relaxed);
+    counts.tokens = sweep.tokens.load(std::memory_order_relaxed);
+    counts.held = sweep.held.load(std::memory_order_relaxed);
+    counts.verified = sweep.verified.load(std::memory_order_relaxed);
+    counts.late = sweep.late.load(std::memory_order_relaxed);
+    for (std::size_t cause = 0; cause < TokenMissCount; ++cause) {
+        counts.refused[cause] = sweep.refused[cause].load(std::memory_order_relaxed);
+        counts.missed[cause] = sweep.missed[cause].load(std::memory_order_relaxed);
+    }
+    return counts;
 }
 
 namespace {
