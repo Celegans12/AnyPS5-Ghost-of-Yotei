@@ -36,6 +36,7 @@
 #include <functional>
 #include <map>
 #include <mutex>
+#include <shared_mutex>
 #include <stdexcept>
 #include <unordered_map>
 
@@ -216,8 +217,11 @@ bool sameBinding(const ShaderRecompiler::DescriptorBinding& a, const ShaderRecom
     return a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.guestDescriptor == b.guestDescriptor;
 }
 
+std::atomic<bool> severalLanes{false};
+
 void bump(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
-    counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+    if (severalLanes.load(std::memory_order_relaxed)) counter.fetch_add(amount, std::memory_order_relaxed);
+    else counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
 }
 
 constexpr std::uint32_t OpWords = static_cast<std::uint32_t>(sizeof(Op) / sizeof(std::uint32_t));
@@ -333,8 +337,8 @@ struct VertexMemo {
 struct FlatState {
     std::array<VertexMemo, 256> vertexMemo;
     BlockRing ring{RingSource{&plainChunk, nullptr, nullptr}};
-    std::vector<std::shared_ptr<FrontVariant>> kept;
-    ImageSetCache zoned{std::size_t{1} << 16u};
+    std::uint64_t arrived = 0;
+    std::uint32_t walked = 0;
     std::shared_ptr<const RunPlanData> plan;
     StateKey key;
     std::shared_ptr<FrontVariant> variant;
@@ -381,13 +385,32 @@ struct Front::State {
     std::vector<std::pair<std::uint32_t, std::uint32_t>> registers;
     std::vector<std::uint64_t> teaching;
     std::uint64_t walked = 0;
-    FlatState flat;
+    std::array<std::unique_ptr<FlatState>, Front::Lanes> flats;
+    std::mutex lanesMutex;
+    std::shared_mutex tables;
+    std::mutex teachMutex;
+    std::atomic<std::uint64_t> arrivals{1};
+    std::vector<std::shared_ptr<FrontVariant>> kept;
+    ImageSetCache zoned{std::size_t{1} << 16u};
     TeachFilter filter;
     RefusalMemory refusals;
     std::vector<std::shared_ptr<FrontVariant>> leaving;
     std::vector<std::shared_ptr<void>> trash;
 
+    FlatState& Lane(std::uint32_t lane) {
+        if (lane >= flats.size()) throw std::logic_error("core front: a flat draw was walked on a lane past the last one");
+        auto* held = flats[lane].get();
+        if (held != nullptr) return *held;
+        const std::lock_guard lock(lanesMutex);
+        if (flats[lane] == nullptr) {
+            if (lane != 0) severalLanes.store(true, std::memory_order_relaxed);
+            flats[lane] = std::make_unique<FlatState>();
+        }
+        return *flats[lane];
+    }
+
     bool Wanted(std::uint64_t asked, std::uint64_t salt) {
+        const std::lock_guard teachLock(teachMutex);
         if (teachBounds()) {
             if (filter.Ask(asked ^ salt, walked)) return true;
             add(counters().filtered);
@@ -400,6 +423,7 @@ struct Front::State {
 
     void Forgotten() {
         if (!teachBounds()) return;
+        const std::lock_guard teachLock(teachMutex);
         filter.Clear();
         refusals.Clear();
     }
@@ -420,8 +444,12 @@ struct Front::State {
         auto& held = counters();
         const bool bounded = teachBounds();
         std::vector<std::shared_ptr<void>> gone;
+        const std::unique_lock tablesLock(tables);
         if (bounded) Sweep(gone);
-        teaching.clear();
+        {
+            const std::lock_guard teachLock(teachMutex);
+            teaching.clear();
+        }
         std::vector<std::pair<StateKey, std::shared_ptr<FrontVariant>>> arrived;
         {
             const std::lock_guard inboxLock(inboxMutex);
@@ -455,18 +483,17 @@ struct Front::State {
             };
             keep(variants, ImageSetKey{variant->plan->id, variant->digest});
             add(held.taught);
-            if (!bounded) flat.kept.push_back(variant);
+            if (!bounded) kept.push_back(variant);
             const auto& data = *variant->plan;
             if (!variant->zoned) {
                 data.zoned = 2;
             } else {
-                keep(flat.zoned, ImageSetKey{data.id, variant->zoneDigest});
+                keep(zoned, ImageSetKey{data.id, variant->zoneDigest});
                 if (data.zoned == 0) data.zoned = 1;
             }
             if (bounded) gone.push_back(std::move(variant));
         }
-        flat.plan = nullptr;
-        flat.variant = nullptr;
+        arrivals.fetch_add(1, std::memory_order_release);
         if (gone.empty()) return;
         const std::lock_guard inboxLock(inboxMutex);
         for (auto& item : gone) trash.push_back(std::move(item));
@@ -667,7 +694,10 @@ FrontOutcome Front::Walk(const QueueState& queue, const DriverDetail::ShaderRegi
         outcome.candidate = nullptr;
         return outcome;
     };
-    if ((++state->walked & 0xfffu) == 0) state->teaching.clear();
+    if ((++state->walked & 0xfffu) == 0) {
+        const std::lock_guard teachLock(state->teachMutex);
+        state->teaching.clear();
+    }
     if (state->inboxed.exchange(false, std::memory_order_acq_rel)) state->Arrive();
     outcome.key = KeyOf(queue, parameters, opcode, device);
     const auto* plan = state->plans.Find(outcome.key);
@@ -801,7 +831,7 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
     using DriverDetail::DrawFinisher;
     using DriverDetail::DrawPipeline;
     auto& held = counters();
-    auto& flat = state->flat;
+    auto& flat = state->Lane(inputs.lane);
     FrontOutcome outcome;
     outcome.looked = true;
     const auto& queue = *inputs.queue;
@@ -821,17 +851,30 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
         outcome.candidate = nullptr;
         return outcome;
     };
-    if ((++state->walked & 0xfffu) == 0) state->teaching.clear();
+    if ((++flat.walked & 0x3fu) == 0) {
+        const std::lock_guard teachLock(state->teachMutex);
+        const auto before = state->walked;
+        state->walked += 0x40u;
+        if ((before >> 12u) != (state->walked >> 12u)) state->teaching.clear();
+    }
     if (state->inboxed.load(std::memory_order_acquire) && state->inboxed.exchange(false, std::memory_order_acq_rel)) state->Arrive();
+    if (const auto arrivals = state->arrivals.load(std::memory_order_acquire); arrivals != flat.arrived) {
+        flat.arrived = arrivals;
+        flat.plan = nullptr;
+        flat.variant = nullptr;
+    }
     outcome.key = KeyOf(queue, parameters, opcode, inputs.device);
     if (flat.plan == nullptr || !(outcome.key == flat.key)) {
-        const auto* plan = state->plans.Find(outcome.key);
-        if (plan == nullptr) {
+        std::shared_ptr<const RunPlanData> found;
+        {
+            const std::shared_lock tablesLock(state->tables);
+            if (const auto* plan = state->plans.Find(outcome.key)) found = std::static_pointer_cast<const RunPlanData>(plan->resources);
+        }
+        if (found == nullptr) {
             flat.plan = nullptr;
             flat.variant = nullptr;
             return left(FrontLeft::NoPlan, true);
         }
-        auto found = std::static_pointer_cast<const RunPlanData>(plan->resources);
         if (found != flat.plan) {
             flat.plan = std::move(found);
             flat.variant = nullptr;
@@ -840,7 +883,11 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
     }
     const auto& data = *flat.plan;
     if (!DriverDetail::DecodeProgramsCurrent(*data.decode, *inputs.shaders)) {
-        state->plans.Forget(EveryProgram);
+        {
+            const std::unique_lock tablesLock(state->tables);
+            state->plans.Forget(EveryProgram);
+            state->arrivals.fetch_add(1, std::memory_order_release);
+        }
         state->Forgotten();
         flat.plan = nullptr;
         flat.variant = nullptr;
@@ -917,7 +964,12 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
             variant = flat.variant.get();
         } else {
             ImageSetValue found;
-            if ((zoned ? flat.zoned : state->variants).Find(ImageSetKey{data.id, digest}, Proof{}, found) != Hit::Fresh) return left(FrontLeft::NoVariant, true);
+            Hit hit;
+            {
+                const std::shared_lock tablesLock(state->tables);
+                hit = (zoned ? state->zoned : state->variants).Find(ImageSetKey{data.id, digest}, Proof{}, found);
+            }
+            if (hit != Hit::Fresh) return left(FrontLeft::NoVariant, true);
             fetched = std::static_pointer_cast<FrontVariant>(found.owner);
             variant = fetched.get();
             if (variant->plan.get() != &data || (zoned && !variant->zoned)) return left(FrontLeft::NoVariant, true);
@@ -1048,6 +1100,7 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
     auto* const first = reinterpret_cast<std::uint32_t*>(slice.bytes);
     auto* out = first + OpWords;
     Op op = MakeOp(OpKind::Draw);
+    op.flags = static_cast<std::uint16_t>(inputs.lane);
     op.stages = static_cast<std::uint8_t>(data.stageCount);
     op.epoch = static_cast<std::uint32_t>(inputs.epoch);
     op.order = inputs.epoch;
@@ -1106,7 +1159,7 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
 void Front::FlatPosted(const std::byte* at) {
     Op op = MakeOp(OpKind::None);
     std::memcpy(&op, at, sizeof(op));
-    state->flat.ring.Posted(op.draw.slice);
+    state->Lane(op.flags).ring.Posted(op.draw.slice);
 }
 
 FlatDraw Front::FlatRead(const std::byte* at) {
@@ -1130,7 +1183,7 @@ FlatDraw Front::FlatRead(const std::byte* at) {
 }
 
 void Front::FlatEmitted(const FlatDraw& draw) {
-    state->flat.ring.Emitted(draw.op.draw.slice, 0);
+    state->Lane(draw.op.flags).ring.Emitted(draw.op.draw.slice, 0);
     draw.variant->pending.fetch_sub(1, std::memory_order_release);
 }
 
@@ -1503,6 +1556,7 @@ bool Driver::tryFlatDraw(QueueState& queue, std::span<const std::uint32_t> packe
     inputs.parameters = &drawParameters;
     inputs.device = deviceSerial;
     inputs.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+    inputs.lane = DrawFinisher::OnFinisherThread() ? 1u + DrawFinisher::ThreadIndex() : 0u;
     inputs.verifyOnly = verify;
     inputs.plain = [](void* context, const QueueState& state, const Pm4::DrawParameters& parameters) { return static_cast<Driver*>(context)->precheckPlain(state, parameters); };
     inputs.context = this;

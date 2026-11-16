@@ -511,6 +511,10 @@ bool DrawFinisher::OnFinisherThread() {
     return finisherThread;
 }
 
+unsigned DrawFinisher::ThreadIndex() {
+    return finisherIndex;
+}
+
 void DrawFinisher::Enqueue(Job job) {
     Enqueue(std::move(job), Pending{});
 }

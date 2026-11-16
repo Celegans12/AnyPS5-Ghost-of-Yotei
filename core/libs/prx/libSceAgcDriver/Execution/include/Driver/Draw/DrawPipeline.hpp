@@ -219,6 +219,7 @@ public:
     static DrawFinisher& Get();
     static bool Enabled();
     static bool OnFinisherThread();
+    static unsigned ThreadIndex();
     static bool Busy() { return outstanding.load(std::memory_order_acquire) != 0; }
     static constexpr unsigned MaxThreads = 16;
     static constexpr std::size_t QueueDepth = 16;

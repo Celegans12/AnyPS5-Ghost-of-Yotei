@@ -120,6 +120,7 @@ struct FlatInputs {
     const Pm4::DrawParameters* parameters = nullptr;
     std::uint64_t device = 0;
     std::uint64_t epoch = 0;
+    std::uint32_t lane = 0;
     bool verifyOnly = false;
     bool (*plain)(void* context, const QueueState& queue, const Pm4::DrawParameters& parameters) = nullptr;
     void* context = nullptr;
@@ -180,6 +181,7 @@ struct FrontCounts {
 
 class Front {
 public:
+    static constexpr std::uint32_t Lanes = 17;
     static Front& Get();
     static FrontCounts Counted();
     static std::string Report();
