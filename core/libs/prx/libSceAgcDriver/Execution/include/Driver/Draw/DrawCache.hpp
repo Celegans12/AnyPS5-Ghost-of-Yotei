@@ -5,8 +5,10 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderInputState.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -83,6 +85,188 @@ std::shared_ptr<const DrawRecipe> FindContentRecipe(const DrawContentKey& key);
 void AttachContentRecipe(const std::shared_ptr<const DrawContentKey>& key, std::shared_ptr<const DrawRecipe> recipe);
 ContentRecipeCounts ContentRecipesHeld();
 
+template<typename TValue>
+class Relaxed {
+public:
+    constexpr Relaxed() noexcept = default;
+    constexpr Relaxed(TValue initial) noexcept : value(initial) {}
+    Relaxed(const Relaxed& other) noexcept : value(other.Load()) {}
+    Relaxed& operator=(const Relaxed& other) noexcept {
+        value.store(other.Load(), std::memory_order_relaxed);
+        return *this;
+    }
+    Relaxed& operator=(TValue next) noexcept {
+        value.store(next, std::memory_order_relaxed);
+        return *this;
+    }
+    operator TValue() const noexcept { return Load(); }
+    TValue operator++() noexcept { return value.fetch_add(1, std::memory_order_relaxed) + 1; }
+    TValue operator--() noexcept { return value.fetch_sub(1, std::memory_order_relaxed) - 1; }
+    TValue operator+=(TValue added) noexcept { return value.fetch_add(added, std::memory_order_relaxed) + added; }
+    [[nodiscard]] TValue Load() const noexcept { return value.load(std::memory_order_relaxed); }
+
+private:
+    std::atomic<TValue> value{};
+};
+
+class DrawCacheEpochs {
+public:
+    static constexpr std::size_t MaxReaders = 256;
+
+    class Reading {
+    public:
+        Reading();
+        ~Reading();
+        Reading(const Reading&) = delete;
+        Reading& operator=(const Reading&) = delete;
+    };
+
+    static std::size_t ThreadIndex();
+    static std::size_t ThreadsSeen();
+    static void Retire(void* object, void (*release)(void*));
+    static std::size_t Collect();
+    [[nodiscard]] static std::size_t Retired();
+    [[nodiscard]] static std::uint64_t Released();
+};
+
+template<typename TValue>
+class DrawCacheTable {
+public:
+    explicit DrawCacheTable(std::size_t expected = 16) : slots(new Slots(Capacity(expected))) {}
+    ~DrawCacheTable() {
+        auto* table = slots.load(std::memory_order_relaxed);
+        for (std::size_t at = 0; at <= table->mask; ++at) {
+            auto* node = table->cells[at].load(std::memory_order_relaxed);
+            if (node != nullptr && node != Tombstone()) delete node;
+        }
+        delete table;
+    }
+    DrawCacheTable(const DrawCacheTable&) = delete;
+    DrawCacheTable& operator=(const DrawCacheTable&) = delete;
+
+    [[nodiscard]] bool Find(std::uint64_t key, TValue& value) const {
+        const DrawCacheEpochs::Reading reading;
+        const auto* table = slots.load(std::memory_order_seq_cst);
+        auto at = Home(key, table->mask);
+        for (std::size_t probes = 0; probes <= table->mask; ++probes, at = (at + 1) & table->mask) {
+            const auto* node = table->cells[at].load(std::memory_order_seq_cst);
+            if (node == nullptr) return false;
+            if (node == Tombstone() || node->key != key) continue;
+            value = node->value;
+            return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool Contains(std::uint64_t key) const {
+        const DrawCacheEpochs::Reading reading;
+        const auto* table = slots.load(std::memory_order_seq_cst);
+        auto at = Home(key, table->mask);
+        for (std::size_t probes = 0; probes <= table->mask; ++probes, at = (at + 1) & table->mask) {
+            const auto* node = table->cells[at].load(std::memory_order_seq_cst);
+            if (node == nullptr) return false;
+            if (node != Tombstone() && node->key == key) return true;
+        }
+        return false;
+    }
+
+    template<typename TVisit>
+    void Each(TVisit&& visit) const {
+        const DrawCacheEpochs::Reading reading;
+        const auto* table = slots.load(std::memory_order_seq_cst);
+        for (std::size_t at = 0; at <= table->mask; ++at) {
+            const auto* node = table->cells[at].load(std::memory_order_seq_cst);
+            if (node != nullptr && node != Tombstone()) visit(node->key, node->value);
+        }
+    }
+
+    void Publish(std::uint64_t key, TValue value) {
+        auto* table = slots.load(std::memory_order_relaxed);
+        auto at = Home(key, table->mask);
+        std::atomic<Node*>* free = nullptr;
+        bool freeWasEmpty = false;
+        for (std::size_t probes = 0; probes <= table->mask; ++probes, at = (at + 1) & table->mask) {
+            auto* node = table->cells[at].load(std::memory_order_relaxed);
+            if (node == nullptr) {
+                if (free == nullptr) {
+                    free = &table->cells[at];
+                    freeWasEmpty = true;
+                }
+                break;
+            }
+            if (node == Tombstone()) {
+                if (free == nullptr) free = &table->cells[at];
+                continue;
+            }
+            if (node->key != key) continue;
+            if (node->value == value) return;
+            table->cells[at].store(new Node{key, std::move(value)}, std::memory_order_seq_cst);
+            DrawCacheEpochs::Retire(node, [](void* retired) { delete static_cast<Node*>(retired); });
+            return;
+        }
+        free->store(new Node{key, std::move(value)}, std::memory_order_seq_cst);
+        ++live;
+        if (freeWasEmpty) ++used;
+        if (used * 4 > (table->mask + 1) * 3) rebuild(table);
+    }
+
+    bool Erase(std::uint64_t key) {
+        auto* table = slots.load(std::memory_order_relaxed);
+        auto at = Home(key, table->mask);
+        for (std::size_t probes = 0; probes <= table->mask; ++probes, at = (at + 1) & table->mask) {
+            auto* node = table->cells[at].load(std::memory_order_relaxed);
+            if (node == nullptr) return false;
+            if (node == Tombstone() || node->key != key) continue;
+            table->cells[at].store(Tombstone(), std::memory_order_seq_cst);
+            --live;
+            DrawCacheEpochs::Retire(node, [](void* retired) { delete static_cast<Node*>(retired); });
+            return true;
+        }
+        return false;
+    }
+
+    [[nodiscard]] std::size_t Size() const { return live; }
+    [[nodiscard]] std::size_t Cells() const { return slots.load(std::memory_order_relaxed)->mask + 1; }
+    [[nodiscard]] std::uint64_t Rebuilds() const { return rebuilds; }
+
+private:
+    struct Node {
+        std::uint64_t key;
+        TValue value;
+    };
+    struct Slots {
+        explicit Slots(std::size_t count) : mask(count - 1), cells(new std::atomic<Node*>[count]) {
+            for (std::size_t at = 0; at < count; ++at) cells[at].store(nullptr, std::memory_order_relaxed);
+        }
+        std::size_t mask;
+        std::unique_ptr<std::atomic<Node*>[]> cells;
+    };
+
+    static Node* Tombstone() { return reinterpret_cast<Node*>(std::uintptr_t{1}); }
+    static std::size_t Capacity(std::size_t entries) { return std::bit_ceil(std::max<std::size_t>(entries, 4) * 4); }
+    static std::size_t Home(std::uint64_t key, std::size_t mask) { return static_cast<std::size_t>(((key ^ (key >> 32u)) * 0x9e3779b97f4a7c15ull) >> 32u) & mask; }
+
+    void rebuild(Slots* old) {
+        auto* next = new Slots(Capacity(live));
+        for (std::size_t from = 0; from <= old->mask; ++from) {
+            auto* node = old->cells[from].load(std::memory_order_relaxed);
+            if (node == nullptr || node == Tombstone()) continue;
+            auto at = Home(node->key, next->mask);
+            while (next->cells[at].load(std::memory_order_relaxed) != nullptr) at = (at + 1) & next->mask;
+            next->cells[at].store(node, std::memory_order_relaxed);
+        }
+        used = live;
+        ++rebuilds;
+        slots.store(next, std::memory_order_seq_cst);
+        DrawCacheEpochs::Retire(old, [](void* retired) { delete static_cast<Slots*>(retired); });
+    }
+
+    std::atomic<Slots*> slots;
+    std::size_t live = 0;
+    std::size_t used = 0;
+    std::uint64_t rebuilds = 0;
+};
+
 struct DrawRecipeRecord {
     std::vector<std::weak_ptr<const DispatchVariant>> stages;
     std::shared_ptr<const DrawRecipe> recipe;
@@ -97,7 +281,7 @@ struct DrawEntry {
     std::vector<std::vector<std::shared_ptr<DispatchVariant>>> stages;
 
     AtomicSharedPtr<const std::vector<DrawRecipeRecord>> recipes;
-    std::uint64_t touched = 0;
+    Relaxed<std::uint64_t> touched;
     std::list<std::uint64_t>::iterator order;
     std::uint64_t shape = 0;
     std::shared_ptr<DrawEntry> donor;
@@ -212,6 +396,8 @@ struct DrawEntryCounters {
     std::array<std::uint64_t, static_cast<std::size_t>(DrawShapeWord::Count)> shapeVertexWords{};
     std::uint64_t shapeVertexReused = 0, shapeVertexRebased = 0, shapeVertexCaptured = 0, shapeVertexVerified = 0, shapeVertexDiffered = 0;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+
+    void Add(const DrawEntryCounters& other);
 };
 
 struct DrawLookupOverflow {
@@ -276,8 +462,54 @@ struct DrawRelocationPending {
 
 struct DrawRelocationTrial {
     static constexpr std::uint32_t Window = 1024, MinimumHitShare = 16, IdleDraws = 16384, ProbationAdmissions = 2;
-    std::uint32_t lookups = 0, hits = 0, idle = 0, admissions = 0;
-    bool productive = false;
+    Relaxed<std::uint32_t> lookups, hits, idle, admissions;
+    Relaxed<bool> productive;
+};
+
+struct DrawShapeRemembered {
+    std::array<std::uint64_t, MaxDispatchVariants> keys{};
+    std::uint8_t count = 0;
+    bool operator==(const DrawShapeRemembered&) const = default;
+};
+
+struct DrawRelocationKnown {
+    std::shared_ptr<const DrawRelocation> relocation;
+    DrawRelocationTrial* trial = nullptr;
+    bool operator==(const DrawRelocationKnown&) const = default;
+};
+
+class Driver;
+
+class DrawCacheAccess {
+public:
+    explicit DrawCacheAccess(Driver& driver);
+    ~DrawCacheAccess();
+    DrawCacheAccess(const DrawCacheAccess&) = delete;
+    DrawCacheAccess& operator=(const DrawCacheAccess&) = delete;
+
+    void Exclusive();
+    bool TryExclusive();
+    void Unlock();
+    void Lock();
+    [[nodiscard]] bool Held() const { return held; }
+    [[nodiscard]] DrawEntryCounters& Counters();
+    [[nodiscard]] std::shared_ptr<DrawEntry> Find(std::uint64_t key);
+    [[nodiscard]] bool Contains(std::uint64_t key);
+    [[nodiscard]] DrawShapeRemembered Shape(std::uint64_t shape);
+    [[nodiscard]] DrawRelocationKnown Relocation(std::uint64_t identity);
+    void NoteShapeReuse(std::uint64_t shape, std::uint64_t key);
+    void Report(bool profile);
+
+private:
+    void lockMutex();
+    void takeShard();
+    void leaveShard();
+
+    Driver& driver;
+    const bool lockFree;
+    bool held = false;
+    bool paused = false;
+    bool shard = false;
 };
 
 struct DrawRelocationCounters {

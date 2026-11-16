@@ -411,8 +411,10 @@ bool Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
         }
         insertDrawEntry(drawKey, fresh, registerKey ? decode : nullptr, registerKey && drawDataHits() ? shapeKey : 0, replaceShape);
         if (relocation.key != 0) {
-            const ContendedLock cacheLock(drawCacheMutex);
+            DrawCacheAccess access(*this);
+            access.Exclusive();
             learnRelocation(relocation);
+            publishDrawRelocation(relocation.identity);
         }
         std::uint64_t dataInserts = 0, dataPositions = 0;
         for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -421,14 +423,15 @@ bool Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             dataPositions += fresh[i]->dataPositions.size();
         }
         if (unstable != 0 || mismatches != 0 || differingSameRuns != 0 || differingRunsChanged != 0 || dataInserts != 0) {
-            const ContendedLock cacheLock(drawCacheMutex);
-            drawEntryCounters.stageDataInserts += dataInserts;
-            drawEntryCounters.stageDataPositions += dataPositions;
-            drawEntryCounters.unstable += unstable;
-            drawEntryCounters.verifyMismatches += mismatches;
-            drawEntryCounters.differingSameRuns += differingSameRuns;
-            drawEntryCounters.differingWords += differingWords;
-            drawEntryCounters.differingRunsChanged += differingRunsChanged;
+            DrawCacheAccess access(*this);
+            auto& counters = access.Counters();
+            counters.stageDataInserts += dataInserts;
+            counters.stageDataPositions += dataPositions;
+            counters.unstable += unstable;
+            counters.verifyMismatches += mismatches;
+            counters.differingSameRuns += differingSameRuns;
+            counters.differingWords += differingWords;
+            counters.differingRunsChanged += differingRunsChanged;
         }
         phaseTiming.Phase(DrawRowKeyLookupValidate);
     }

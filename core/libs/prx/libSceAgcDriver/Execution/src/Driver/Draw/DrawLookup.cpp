@@ -150,12 +150,11 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             mix(static_cast<std::uint64_t>(pixel.positionLocation));
             for (const auto location : pixel.sampleLocations) mix(location);
             for (const auto order : pixel.sampleOrder) mix(order);
-            std::lock_guard cacheLock(drawCacheMutex);
-            ++drawEntryCounters.lookups;
-            const auto found = drawCache.find(drawKey);
-            if (found != drawCache.end()) entry = found->second;
-            else ++drawEntryCounters.absent;
-            maybeReportDrawCache(profile);
+            DrawCacheAccess access(*this);
+            ++access.Counters().lookups;
+            if (auto found = access.Find(drawKey)) entry = std::move(found);
+            else ++access.Counters().absent;
+            access.Report(profile);
         }
         if (entry != nullptr) {
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
@@ -248,37 +247,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (matched[i] != nullptr && ranks[i] != 0) rotate = true;
                 }
             }
-            std::unique_lock cacheLock(drawCacheMutex, std::try_to_lock);
-            if (!cacheLock.owns_lock() && (profile || !unblockedDrawHits() || verifyDrawEntries() || verifyDrawDataHits())) {
-                const auto waitFrom = std::chrono::steady_clock::now();
-                cacheLock.lock();
-                DrawFinisher::NoteCacheWait(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitFrom).count()));
-            }
-            if (!cacheLock.owns_lock()) {
-                auto& overflow = drawLookupOverflow;
-                const auto add = [](std::atomic<std::uint64_t>& counter, std::uint64_t value) { counter.fetch_add(value, std::memory_order_relaxed); };
-                add(overflow.stageValidations, stageValidations);
-                add(overflow.stageEqual, stageEqual);
-                add(overflow.variantsCompared, compared);
-                if (drawHit) {
-                    add(overflow.hits, 1);
-                    add(overflow.stageDataHits, dataStages);
-                    add(overflow.stageDataWords, dataWords);
-                    if (registerKey) add(overflow.registerKeyHits, 1);
-                    add(overflow.cacheHits, 1);
-                    drawCacheUseful().fetch_add(1, std::memory_order_relaxed);
-                    for (std::size_t i = 0; i < programs.size(); ++i) {
-                        if (matched[i] != nullptr) add(overflow.variantHitsByRank[ranks[i]], 1);
-                    }
-                } else {
-                    add(overflow.misses[static_cast<std::size_t>(*miss)], 1);
-                    if (registerKey && entry->decode != nullptr) add(overflow.decodePartial, 1);
-                }
-                overflow.pending.fetch_add(1, std::memory_order_release);
-                DrawFinisher::NoteUnlockedHit();
-            } else {
-                foldDrawLookupOverflow();
-                auto& counters = drawEntryCounters;
+            const auto tally = [&](DrawEntryCounters& counters, bool exclusive) {
                 counters.stageValidations += stageValidations;
                 counters.stageEqual += stageEqual;
                 counters.variantsCompared += compared;
@@ -294,8 +263,8 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                         ++counters.variantHitsByRank[ranks[i]];
                     }
 
-                    const auto again = drawCache.find(drawKey);
-                    if (again != drawCache.end() && again->second == entry) {
+                    const auto again = exclusive ? drawCache.find(drawKey) : drawCache.end();
+                    if (exclusive && again != drawCache.end() && again->second == entry) {
                         if (rotate) {
                             auto rotated = std::make_shared<DrawEntry>();
                             rotated->decode = entry->decode;
@@ -311,6 +280,7 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                             rotated->touched = entry->touched;
                             rotated->order = entry->order;
                             again->second = std::move(rotated);
+                            publishDrawEntry(drawKey);
                         }
                         if (drawCacheHits - again->second->touched > drawCacheEntries() / 8) {
                             drawOrder.splice(drawOrder.begin(), drawOrder, again->second->order);
@@ -341,6 +311,47 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     phaseMs[DrawRowKeyLookupValidate] -= waited;
                     phaseMs[DrawRowValidateWait] += waited;
                     counters.validateUs += phaseMs[DrawRowKeyLookupValidate] * 1000;
+                }
+            };
+            if (lockFreeDrawCache()) {
+                DrawCacheAccess access(*this);
+                auto& counters = access.Counters();
+                const bool refresh = drawHit && (rotate || drawCacheHits + 1 - entry->touched > drawCacheEntries() / 8);
+                const bool exclusive = refresh && access.TryExclusive();
+                if (!access.Held()) DrawFinisher::NoteUnlockedHit();
+                tally(counters, exclusive);
+            } else {
+                std::unique_lock cacheLock(drawCacheMutex, std::try_to_lock);
+                if (!cacheLock.owns_lock() && (profile || !unblockedDrawHits() || verifyDrawEntries() || verifyDrawDataHits())) {
+                    const auto waitFrom = std::chrono::steady_clock::now();
+                    cacheLock.lock();
+                    DrawFinisher::NoteCacheWait(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - waitFrom).count()));
+                }
+                if (!cacheLock.owns_lock()) {
+                    auto& overflow = drawLookupOverflow;
+                    const auto add = [](std::atomic<std::uint64_t>& counter, std::uint64_t value) { counter.fetch_add(value, std::memory_order_relaxed); };
+                    add(overflow.stageValidations, stageValidations);
+                    add(overflow.stageEqual, stageEqual);
+                    add(overflow.variantsCompared, compared);
+                    if (drawHit) {
+                        add(overflow.hits, 1);
+                        add(overflow.stageDataHits, dataStages);
+                        add(overflow.stageDataWords, dataWords);
+                        if (registerKey) add(overflow.registerKeyHits, 1);
+                        add(overflow.cacheHits, 1);
+                        drawCacheUseful().fetch_add(1, std::memory_order_relaxed);
+                        for (std::size_t i = 0; i < programs.size(); ++i) {
+                            if (matched[i] != nullptr) add(overflow.variantHitsByRank[ranks[i]], 1);
+                        }
+                    } else {
+                        add(overflow.misses[static_cast<std::size_t>(*miss)], 1);
+                        if (registerKey && entry->decode != nullptr) add(overflow.decodePartial, 1);
+                    }
+                    overflow.pending.fetch_add(1, std::memory_order_release);
+                    DrawFinisher::NoteUnlockedHit();
+                } else {
+                    foldDrawLookupOverflow();
+                    tally(drawEntryCounters, true);
                 }
             }
         } else if (drawShapeUserWords() && !dataEntries.empty() && graphics.stages.path == Graphics::ShaderPath::Vertex) {

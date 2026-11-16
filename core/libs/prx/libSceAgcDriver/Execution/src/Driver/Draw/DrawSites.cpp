@@ -525,11 +525,7 @@ void DrawSiteAccess::Retain(Driver& driver, std::uint64_t shape, const DrawSiteO
     }
     if (roots.size() != programs.size() || std::any_of(roots.begin(), roots.end(), [](const std::shared_ptr<DispatchVariant>& root) { return root == nullptr; })) return exclude(DrawSiteExclusion::Holder);
     auto holder = recipeDonor;
-    if (holder == nullptr) {
-        std::lock_guard cacheLock(driver.drawCacheMutex);
-        const auto found = driver.drawCache.find(recipeKey);
-        if (found != driver.drawCache.end()) holder = found->second;
-    }
+    if (holder == nullptr) holder = driver.findDrawEntry(recipeKey);
     if (holder == nullptr) return exclude(DrawSiteExclusion::Holder);
     retained->roots = roots;
     retained->holder = std::move(holder);

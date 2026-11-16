@@ -278,15 +278,16 @@ void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submis
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: the entry's decode differs from a fresh decode (key 0x%llx, target 0x%llx)\n", static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(fresh->state.color.address));
             }
-            std::lock_guard cacheLock(drawCacheMutex);
-            drawEntryCounters.facadeMismatches += facadeMismatches;
-            if (decode != nullptr) ++drawEntryCounters.verifyDecodes;
-            drawEntryCounters.verifyDecodeMismatches += decodeMismatches;
+            DrawCacheAccess access(*this);
+            auto& counters = access.Counters();
+            counters.facadeMismatches += facadeMismatches;
+            if (decode != nullptr) ++counters.verifyDecodes;
+            counters.verifyDecodeMismatches += decodeMismatches;
         }
         decode = std::move(fresh);
     } else if (profile) {
-        std::lock_guard cacheLock(drawCacheMutex);
-        ++drawEntryCounters.decodeSkipped;
+        DrawCacheAccess access(*this);
+        ++access.Counters().decodeSkipped;
     }
 }
 

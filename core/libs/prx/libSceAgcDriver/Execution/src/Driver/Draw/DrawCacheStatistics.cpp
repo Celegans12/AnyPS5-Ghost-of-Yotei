@@ -21,6 +21,7 @@ bool Driver::unblockedDrawHits() {
 }
 
 void Driver::foldDrawLookupOverflow() {
+    foldDrawCacheShards();
     auto& overflow = drawLookupOverflow;
     if (overflow.pending.load(std::memory_order_acquire) == 0) return;
     overflow.pending.store(0, std::memory_order_release);

@@ -170,6 +170,7 @@ private:
     friend struct PacketTimer;
     friend struct DriverTestAccess;
     friend struct DrawSiteAccess;
+    friend class DrawCacheAccess;
     friend class Core::Front;
     void stop();
     Driver();
@@ -232,6 +233,14 @@ private:
     void verifyDataHit(const ShaderSnapshot& snapshot, std::size_t codeOffset, ShaderRecompiler::RecompileRequest request, std::span<const ShaderRecompiler::MemoryRegion> memory, std::uint64_t address, const DispatchVariant& variant, std::span<const std::uint32_t> liveWords, const ShaderRecompiler::RecompileResult& patched);
     static bool unblockedDrawHits();
     void foldDrawLookupOverflow();
+    static bool lockFreeDrawCache();
+    static bool verifyLockFreeDrawCache();
+    std::shared_ptr<DrawEntry> findDrawEntry(std::uint64_t key);
+    void publishDrawEntry(std::uint64_t key);
+    void publishDrawShape(std::uint64_t shape);
+    void publishDrawRelocation(std::uint64_t identity);
+    void foldDrawCacheNotes();
+    void foldDrawCacheShards();
     static bool drawEntries();
     bool drawEntriesThisDraw();
     static std::atomic<std::uint64_t>& drawCacheUseful();
@@ -531,7 +540,11 @@ private:
     std::unordered_map<std::uint64_t, DrawRelocationTrial> drawRelocationTrials;
     DrawRelocationCounters drawRelocationCounters;
     AgcDriver::Mutex drawCacheMutex;
-    std::uint64_t drawCacheHits = 0, drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
+    Relaxed<std::uint64_t> drawCacheHits;
+    std::uint64_t drawCacheEvictions = 0, drawCacheVariants = 0, drawCacheVariantBytes = 0;
+    DrawCacheTable<std::shared_ptr<DrawEntry>> drawCacheIndex;
+    DrawCacheTable<DrawShapeRemembered> drawShapeIndex;
+    DrawCacheTable<DrawRelocationKnown> drawRelocationIndex;
     std::optional<DrawKeySightings> drawKeySightings;
     std::optional<DrawKeySightings> drawShapeSightings;
     std::optional<DrawKeySightings> drawStageSightings;
