@@ -1,3 +1,4 @@
+#ifdef _WIN32
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
@@ -277,3 +278,4 @@ void Start() {
 }
 
 }
+#endif
