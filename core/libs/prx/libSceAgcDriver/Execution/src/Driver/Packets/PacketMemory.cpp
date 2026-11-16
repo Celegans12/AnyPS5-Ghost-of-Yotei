@@ -597,6 +597,11 @@ struct EopGuardCounts {
     std::uint64_t heldBehind = 0;
     std::uint64_t heldAddress = 0;
     std::uint64_t heldUnknown = 0;
+    std::uint64_t heldLinear = 0;
+    std::uint64_t heldCopyBack = 0;
+    std::uint64_t heldStore = 0;
+    std::uint64_t storeBegin = 0;
+    std::uint64_t storeEnd = 0;
     std::uint64_t judged = 0;
     std::uint64_t risky = 0;
     std::uint64_t gpuWritten = 0;
@@ -679,7 +684,7 @@ bool eopGuardRisky(EopGuard& guard, Graphics::Recorder& recorder, const Graphics
     return guard.label < note.quietFrom;
 }
 
-bool eopGuardSettled() {
+bool eopGuardSettled(bool linearStored) {
     auto& guard = eopGuard();
     auto& counts = guard.counts;
     const auto start = std::chrono::steady_clock::now();
@@ -717,6 +722,17 @@ bool eopGuardSettled() {
         (index < opened ? open : flight) = true;
     }
     if (guard.label % EopGuardKept == 0) std::erase_if(guard.notes, [&](const auto& note) { return note.second.seen + EopGuardKept < guard.label; });
+    const bool copyBack = recorder->HasPendingCopyBacks() || recorder->HasQueuedStores();
+    bool store = false;
+    if (!linearStored && !copyBack) {
+        for (const auto& write : recorder->PendingWritesOver(0, std::numeric_limits<std::size_t>::max())) {
+            if (write.value == Graphics::Recorder::ReachValue || recorder->PendingWriteSettled(write.begin, static_cast<std::size_t>(write.end - write.begin))) continue;
+            store = true;
+            counts.storeBegin = write.begin;
+            counts.storeEnd = write.end;
+            break;
+        }
+    }
     const auto judged = std::chrono::steady_clock::now();
     counts.guardMs += std::chrono::duration<double, std::milli>(judged - start).count();
     if (lost || !Graphics::Recorder::ReadTracking()) {
@@ -725,6 +741,18 @@ bool eopGuardSettled() {
     }
     if (address) {
         ++counts.heldAddress;
+        return false;
+    }
+    if (linearStored) {
+        ++counts.heldLinear;
+        return false;
+    }
+    if (copyBack) {
+        ++counts.heldCopyBack;
+        return false;
+    }
+    if (store) {
+        ++counts.heldStore;
         return false;
     }
     if (open) {
@@ -875,7 +903,7 @@ void reportEopProbe(EopProbe& probe) {
         if (guard.riskyKinds[kind] != 0) changed += (changed.empty() ? "" : ", ") + std::string(EopProbeKindNames[kind]) + " " + std::to_string(guard.riskyKinds[kind]);
     }
     if (changed.empty()) changed = "none";
-    AgcDriver::ProfilePrint_nid_no_patch("[eop-guard] %llu end-of-pipe interrupt labels: %llu delivered at the label, held behind the recorded work: %llu for a changed or new range read by the open batch, %llu for one read by a batch in flight, %llu for an address-based read, %llu without the reads of the frame; per label %.1f in-place reads judged, %.1f of them under a GPU write of the frame, %.2f unexecuted on a changed or new range (%s; last %llx+%llu), %llu changes published to the draw path, %.3f ms\n", value(guard.labels), value(guard.early), value(guard.heldOpen), value(guard.heldBehind), value(guard.heldAddress), value(guard.heldUnknown), static_cast<double>(guard.judged) * perGuard, static_cast<double>(guard.gpuWritten) * perGuard, static_cast<double>(guard.risky) * perGuard, changed.c_str(), value(guard.lastBegin), value(guard.lastEnd - guard.lastBegin), value(guard.published), guard.guardMs * perGuard);
+    AgcDriver::ProfilePrint_nid_no_patch("[eop-guard] %llu end-of-pipe interrupt labels: %llu delivered at the label, held behind the recorded work: %llu for a changed or new range read by the open batch, %llu for one read by a batch in flight, %llu for an address-based read, %llu without the reads of the frame; per label %.1f in-place reads judged, %.1f of them under a GPU write of the frame, %.2f unexecuted on a changed or new range (%s; last %llx+%llu), %llu changes published to the draw path, %.3f ms; held for a GPU write to guest memory that had not run: %llu for a drawn linear target stored at the label, %llu for a pending copy-back or queued store, %llu for a recorded store (last %llx+%llu)\n", value(guard.labels), value(guard.early), value(guard.heldOpen), value(guard.heldBehind), value(guard.heldAddress), value(guard.heldUnknown), static_cast<double>(guard.judged) * perGuard, static_cast<double>(guard.gpuWritten) * perGuard, static_cast<double>(guard.risky) * perGuard, changed.c_str(), value(guard.lastBegin), value(guard.lastEnd - guard.lastBegin), value(guard.published), guard.guardMs * perGuard, value(guard.heldLinear), value(guard.heldCopyBack), value(guard.heldStore), value(guard.storeBegin), value(guard.storeEnd - guard.storeBegin));
     guard = {};
     probe.examples.clear();
     probe.counts = {};
@@ -1113,12 +1141,14 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     recordDeferredLabels(localDevice.get(), queue);
     static const bool probed = Graphics::Recorder::FlipReadCheck();
     static const bool earlyInterrupt = Graphics::Recorder::EarlyEndOfPipe();
-    const bool early = earlyInterrupt && interrupt.has_value() && eopGuardSettled();
-    bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
+    const bool judged = earlyInterrupt && interrupt.has_value();
+    const bool linearStored = judged && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear(bytes.empty() ? "interrupt" : "label") != 0;
+    const bool early = judged && eopGuardSettled(linearStored);
+    bool workOpen = linearStored || Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
-        if (localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
+        if (!judged && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
         reason = early ? 4 : localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
         if (reason != 0 && reason != 5 && reason != 6) {
             if (!early && reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
@@ -1134,7 +1164,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     if (interrupt.has_value()) {
         const auto context = *interrupt;
         bool deferred = false;
-        if (bytes.empty() && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("interrupt") != 0) workOpen = true;
+        if (!judged && bytes.empty() && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("interrupt") != 0) workOpen = true;
         if (probed && queue == 0 && localDevice != nullptr) {
             if (const auto frame = beginEopProbe(early); frame != nullptr && !localDevice->AfterRecordedWork([frame] { endEopProbe(frame); }, false)) endEopProbe(frame);
         }

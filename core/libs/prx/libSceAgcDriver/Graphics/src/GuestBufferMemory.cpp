@@ -7813,7 +7813,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                 region.pending = true;
                 continue;
             }
-            if (!addressable && !region.sparse && region.end - region.begin <= Recorder::FinishedReadBytes && Recorder::EarlyEndOfPipe() && !(region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) && !Recorder::SnapshotWriteOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
+            if (!addressable && !region.sparse && region.end - region.begin <= Recorder::FinishedReadBytes && Recorder::EarlyEndOfPipe() && !DepthPlanesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin)) && !(region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) && !Recorder::SnapshotWriteOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
                 region.direct = nullptr;
                 continue;
             }

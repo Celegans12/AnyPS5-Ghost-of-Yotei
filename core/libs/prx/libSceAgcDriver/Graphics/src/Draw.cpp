@@ -1969,7 +1969,7 @@ const HostImport* inPlaceDrawInput(const Context& context, std::uint64_t address
     if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
     const auto drawWriters = DrawCopiedWriters();
     if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
-    if (copies && !behind && bytes <= Recorder::FinishedReadBytes && Recorder::EarlyEndOfPipe() && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) {
+    if (copies && !behind && bytes <= Recorder::FinishedReadBytes && Recorder::EarlyEndOfPipe() && !DepthPlanesOverlap(address, bytes) && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) {
         thread_local HostImport* slot = nullptr;
         auto& copied = ShaderRecompiler::ThreadOwned(slot);
         auto slice = recorder->DrawInputUpload(bytes);
