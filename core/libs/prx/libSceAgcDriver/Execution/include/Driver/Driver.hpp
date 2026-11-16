@@ -241,6 +241,7 @@ private:
     void publishDrawRelocation(std::uint64_t identity);
     void foldDrawCacheNotes();
     void foldDrawCacheShards();
+    void prepareDrawSightings();
     static bool drawEntries();
     bool drawEntriesThisDraw();
     static std::atomic<std::uint64_t>& drawCacheUseful();
@@ -548,6 +549,7 @@ private:
     std::optional<DrawKeySightings> drawKeySightings;
     std::optional<DrawKeySightings> drawShapeSightings;
     std::optional<DrawKeySightings> drawStageSightings;
+    std::once_flag drawSightingsOnce;
     std::uint64_t drawCacheByteEvictions = 0;
 
     DrawEntryCounters drawEntryCounters;

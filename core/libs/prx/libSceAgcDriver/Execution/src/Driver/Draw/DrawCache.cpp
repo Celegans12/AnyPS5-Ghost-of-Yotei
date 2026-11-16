@@ -9,6 +9,7 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
 #include <iterator>
 #include <limits>
 #include <mutex>
@@ -131,9 +132,14 @@ void Driver::accountDrawVariant(const DispatchVariant& variant, bool added) {
 DrawKeySightings::DrawKeySightings(std::size_t keyCount) {
     Graphics::Require(keyCount >= Ways, "draw key sightings need at least one bucket");
     const auto buckets = std::bit_ceil(keyCount / Ways);
-    keys.assign(buckets * Ways, 0);
-    filled.assign(buckets, 0);
-    next.assign(buckets, 0);
+    keys.reset(new std::atomic<std::uint64_t>[buckets * Ways]);
+    filled.reset(new std::atomic<std::uint8_t>[buckets]);
+    next.reset(new std::atomic<std::uint8_t>[buckets]);
+    for (std::size_t at = 0; at < buckets * Ways; ++at) keys[at].store(0, std::memory_order_relaxed);
+    for (std::size_t at = 0; at < buckets; ++at) {
+        filled[at].store(0, std::memory_order_relaxed);
+        next[at].store(0, std::memory_order_relaxed);
+    }
     bucketMask = buckets - 1;
 }
 
@@ -143,11 +149,15 @@ bool DrawKeySightings::SeenBefore(std::uint64_t key) {
     mixed = (mixed ^ (mixed >> 27u)) * 0x94d049bb133111ebull;
     mixed ^= mixed >> 31u;
     const auto bucket = static_cast<std::size_t>(mixed) & bucketMask;
-    auto* ways = keys.data() + bucket * Ways;
-    if (std::find(ways, ways + filled[bucket], key) != ways + filled[bucket]) return true;
-    ways[next[bucket]] = key;
-    next[bucket] = static_cast<std::uint8_t>((next[bucket] + 1u) % Ways);
-    if (filled[bucket] < Ways) ++filled[bucket];
+    auto* ways = keys.get() + bucket * Ways;
+    const auto held = std::min<std::size_t>(filled[bucket].load(std::memory_order_relaxed), Ways);
+    for (std::size_t way = 0; way < held; ++way) {
+        if (ways[way].load(std::memory_order_relaxed) == key) return true;
+    }
+    const auto at = next[bucket].load(std::memory_order_relaxed) % Ways;
+    ways[at].store(key, std::memory_order_relaxed);
+    next[bucket].store(static_cast<std::uint8_t>((at + 1u) % Ways), std::memory_order_relaxed);
+    if (held < Ways) filled[bucket].store(static_cast<std::uint8_t>(held + 1u), std::memory_order_relaxed);
     return false;
 }
 
@@ -195,6 +205,8 @@ bool Driver::drawEntriesThisDraw() {
 namespace {
 
 constexpr std::size_t CollectEvery = 64;
+constexpr std::size_t CollectAtMost = 4096;
+constexpr std::uint32_t LockSpins = 512;
 
 struct alignas(64) EpochSlot {
     std::atomic<std::uint64_t> reading{0};
@@ -313,7 +325,7 @@ void DrawCacheEpochs::Retire(void* object, void (*release)(void*)) {
         std::lock_guard lock(state.mutex);
         state.retired.push_back({object, release, epoch});
         state.retiredCount.store(state.retired.size(), std::memory_order_relaxed);
-        collect = state.retired.size() >= CollectEvery;
+        collect = state.retired.size() >= CollectAtMost;
     }
     if (collect) Collect();
 }
@@ -431,14 +443,21 @@ DrawCacheAccess::DrawCacheAccess(Driver& owner) : driver(owner), lockFree(Driver
 
 DrawCacheAccess::~DrawCacheAccess() {
     if (shard) leaveShard();
-    if (held) driver.drawCacheMutex.unlock();
+    if (!held) return;
+    driver.drawCacheMutex.unlock();
+    if (lockFree && DrawCacheEpochs::Retired() >= CollectEvery) DrawCacheEpochs::Collect();
 }
 
 void DrawCacheAccess::lockMutex() {
     auto& mutex = driver.drawCacheMutex;
     if (!mutex.try_lock()) {
         const auto from = std::chrono::steady_clock::now();
-        mutex.lock();
+        bool taken = false;
+        for (std::uint32_t spin = 0; lockFree && !taken && spin < LockSpins; ++spin) {
+            SpinPause();
+            taken = mutex.try_lock();
+        }
+        if (!taken) mutex.lock();
         DrawFinisher::NoteCacheWait(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count()));
     }
     held = true;
@@ -642,9 +661,37 @@ void Driver::publishDrawRelocation(std::uint64_t identity) {
     else drawRelocationIndex.Publish(identity, DrawRelocationKnown{found->second, &drawRelocationTrials[identity]});
 }
 
+void Driver::prepareDrawSightings() {
+    std::call_once(drawSightingsOnce, [&] {
+        if (!drawKeySightings) drawKeySightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
+        if (!drawShapeSightings) drawShapeSightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
+        if (!drawStageSightings) drawStageSightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
+    });
+}
+
 bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape, const DrawRelocationPending& pending) {
+    prepareDrawSightings();
     DrawCacheAccess access(*this);
-    access.Exclusive();
+    if (access.LockFree()) {
+        if (access.Contains(key)) return true;
+        bool seen = drawKeySightings->SeenBefore(key);
+        if (pending.key == key && pending.identity != 0) {
+            const auto known = access.Relocation(pending.identity);
+            if (pending.alias != 0) {
+                if (drawKeySightings->SeenBefore(pending.alias ^ 0x9e3779b97f4a7c15ull) && known.trial != nullptr) {
+                    auto& state = *known.trial;
+                    if (state.productive || state.hits != 0 || state.admissions < DrawRelocationTrial::ProbationAdmissions) {
+                        if (!state.productive && state.hits == 0) ++state.admissions;
+                        seen = true;
+                    }
+                }
+            } else if (known.relocation == nullptr) {
+                if (drawKeySightings->SeenBefore(pending.identity ^ 0xc2b2ae3d27d4eb4full)) seen = true;
+            }
+        }
+        if (seen || shape == 0 || access.Shape(shape).count != 0) return seen;
+        return drawShapeSightings->SeenBefore(shape);
+    }
     if (drawCache.contains(key)) return true;
     if (!drawKeySightings) drawKeySightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
     bool seen = drawKeySightings->SeenBefore(key);
@@ -797,7 +844,7 @@ void Driver::noteShapeReuse(std::uint64_t shape, std::uint64_t key) {
 }
 
 bool Driver::stageIdentitySeen(std::uint64_t identity) {
-    if (!drawStageSightings) drawStageSightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
+    prepareDrawSightings();
     return drawStageSightings->SeenBefore(identity);
 }
 

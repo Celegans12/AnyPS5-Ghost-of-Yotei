@@ -413,9 +413,9 @@ public:
     bool SeenBefore(std::uint64_t key);
 
 private:
-    std::vector<std::uint64_t> keys;
-    std::vector<std::uint8_t> filled;
-    std::vector<std::uint8_t> next;
+    std::unique_ptr<std::atomic<std::uint64_t>[]> keys;
+    std::unique_ptr<std::atomic<std::uint8_t>[]> filled;
+    std::unique_ptr<std::atomic<std::uint8_t>[]> next;
     std::size_t bucketMask = 0;
 };
 
@@ -489,6 +489,7 @@ public:
 
     void Exclusive();
     bool TryExclusive();
+    [[nodiscard]] bool LockFree() const { return lockFree; }
     void Unlock();
     void Lock();
     [[nodiscard]] bool Held() const { return held; }
