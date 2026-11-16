@@ -2086,7 +2086,7 @@ const char* Recorder::LandingSiteName(LandingSite site) {
 
 bool Recorder::ReadTrapEnabled() {
 #ifdef _WIN32
-    static const bool enabled = (std::getenv("APS5_STAGING_READ_TRAP") != nullptr || std::getenv("APS5_VERIFY_STAGING_READ_TRAP") != nullptr) && std::getenv("APS5_RESIDENT_STAGING") != nullptr;
+    static const bool enabled = (std::getenv("APS5_STAGING_READ_TRAP") != nullptr || std::getenv("APS5_VERIFY_STAGING_READ_TRAP") != nullptr) && ResidentStagingEnabled();
     const auto forced = readTrapForTests.load(std::memory_order_relaxed);
     return forced >= 0 ? forced != 0 : enabled;
 #else
