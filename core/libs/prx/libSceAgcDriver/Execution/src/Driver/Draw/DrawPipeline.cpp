@@ -436,7 +436,6 @@ std::string DrawFinisher::LookupText() {
     std::snprintf(item, sizeof(item), " other threads waited %llu times for the draw cache lock in %.2f ms and counted %llu lookups without it", since(others.cacheWaits, reported[OtherThreads].cacheWaits), milliseconds(others.cacheWaitNs, reported[OtherThreads].cacheWaitNs), since(others.unlockedHits, reported[OtherThreads].unlockedHits));
     text += item;
     reported[OtherThreads] = others;
-    text += ShapeStageIndex::ReportText();
     return text;
 }
 

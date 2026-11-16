@@ -2,42 +2,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/MovedRead.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <bit>
-#include <cstdlib>
-#include <mutex>
-#include <optional>
-#include <span>
-#include <unordered_map>
 
 namespace AgcDriver::DriverDetail {
-
-namespace {
-
-constexpr std::uint8_t ShapeIndexRank = 0xff;
-
-std::uint64_t shapeIndexBound(const void* draw, const ShapeStageIndex& index) {
-    static const bool verify = std::getenv("APS5_VERIFY_FINISHER_LOOKUP") != nullptr;
-    if (!verify) return ShapeStageIndex::NoBound;
-    static std::mutex mutex;
-    static std::unordered_map<const void*, std::uint64_t> bounds;
-    std::lock_guard lock(mutex);
-    if (!DrawFinisher::OnFinisherThread()) {
-        if (bounds.size() > 65536u) bounds.clear();
-        const auto serial = index.Serial();
-        bounds[draw] = serial;
-        return serial;
-    }
-    const auto found = bounds.find(draw);
-    if (found == bounds.end()) return ShapeStageIndex::NoBound;
-    const auto bound = found->second;
-    bounds.erase(found);
-    return bound;
-}
-
-}
 
 void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<VulkanDevice>& localDevice, const Graphics::State& graphics, const ShaderRecompiler::ShaderPixelStageInfo& pixel, const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, bool useDrawEntries, bool registerKey, bool profile, std::uint64_t& drawKey, std::shared_ptr<DrawEntry>& entry, std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::vector<ShaderRecompiler::MemoryRegion>>& matchedRegions, bool& drawHit, bool& verifyHit, DrawPhaseTiming& phaseTiming, std::array<double, DrawDriverPhaseCount>& phaseMs, const std::vector<std::pair<std::uint64_t, std::shared_ptr<DrawEntry>>>& dataEntries, DrawDataCandidates& dataCandidates, std::vector<StageDataHit>& stageData, std::vector<DrawShapeMiss>& shapeMisses, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, const std::function<bool(std::size_t)>& decodeVertexInfo, std::vector<DrawShapeWord>& shapeWords) {
     using Role = ShaderRecompiler::ProgramRole;
@@ -361,11 +330,6 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
             std::optional<SampledReadScope> sampling;
             std::vector<UserWordMove> moves;
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveBuffers;
-            const auto shape = dataEntries.front().second->shape;
-            auto* index = ShapeStageIndex::Enabled() && shape != 0 ? &ShapeStageIndex::Shared() : nullptr;
-            const auto bound = index != nullptr ? shapeIndexBound(&graphics, *index) : ShapeStageIndex::NoBound;
-            std::vector<ShapeStageFound> found;
-            const ShapeStageReader readMoved = [](std::uint64_t address, std::span<std::uint32_t> out) { return CopyMoved(address, std::as_writable_bytes(out)) == GuestMemory::Compare::Equal; };
             for (std::size_t i = 0; i < programs.size(); ++i) {
                 if (roles[i] == Role::GeometryBack) continue;
                 const auto& now = programs[i].userData;
@@ -373,62 +337,6 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 auto miss = DrawShapeMiss::NoStage;
                 std::size_t refusals = 0;
                 std::optional<bool> redecoded;
-                const auto consider = [&](const std::shared_ptr<DispatchVariant>& variant, std::span<const std::uint32_t> was, std::uint64_t key, std::uint8_t rank) {
-                    if (variant->registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*variant->registeredViews)) return;
-                    if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const DrawDataCandidate& candidate) { return candidate.variant->pushOffset == variant->pushOffset; })) return;
-                    std::uint32_t refused = 0;
-                    const auto kind = shapeUserWordMoves(*variant, was, now, moves, &refused);
-                    if (!kind) {
-                        const bool vertexInputs = variant->vertexInfo != nullptr && variant->vertexInfo->resourcesNum != 0;
-                        miss = std::max(miss, vertexInputs && variant->decodeRuns == 0 ? DrawShapeMiss::VertexInputs : DrawShapeMiss::UserWord);
-                        if (vertexInputs && shapeWords[i] == DrawShapeWord::Count) shapeWords[i] = shapeWordKind(*variant, refused, vertexTableMask(*variant->vertexInfo, programs[i].firstUserSgpr));
-                        return;
-                    }
-                    const bool tables = *kind == DrawShapeReuse::VertexTables;
-                    if (tables) {
-                        if (!redecoded) redecoded = decodeVertexInfo(i);
-                        if (!*redecoded || !vertexInfos[i]) {
-                            miss = std::max(miss, DrawShapeMiss::VertexDecode);
-                            return;
-                        }
-                        if (variant->vertexInfo == nullptr || !shapeVertexInputsMatch(*variant->vertexInfo, *vertexInfos[i])) {
-                            miss = std::max(miss, DrawShapeMiss::VertexLayout);
-                            return;
-                        }
-                    }
-                    if (!movedRunsReadEqual(*variant, moves, tables, ShaderRecompiler::DescriptorLeaves() ? &liveBuffers : nullptr)) {
-                        miss = std::max(miss, DrawShapeMiss::Memory);
-                        return;
-                    }
-                    auto reused = moves.empty() && liveBuffers.empty() ? variant : movedShapeVariant(variant, moves);
-                    if (!liveBuffers.empty()) {
-                        const bool patched = patchBufferWords(*reused, liveBuffers);
-                        NoteBufferWordReuse(liveBuffers.size(), patched);
-                        if (!patched) {
-                            miss = std::max(miss, DrawShapeMiss::Memory);
-                            return;
-                        }
-                    }
-                    bool rebased = false;
-                    if (tables) {
-                        if (!rebaseVertexInputs(*reused, *vertexInfos[i], decodeReads[i])) {
-                            miss = std::max(miss, DrawShapeMiss::VertexLayout);
-                            return;
-                        }
-                        rebased = !reused->vertexPatches.empty();
-                    }
-                    std::vector<ShaderRecompiler::MemoryRegion> regions;
-                    appendEntryRegions(*reused, regions);
-                    auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *reused, regions, imagesFlushed, runsSynced, sampling);
-                    if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *reused, regions, imagesFlushed, runsSynced, sampling);
-                    if (result != EntryOutcome::Equal) {
-                        miss = std::max(miss, DrawShapeMiss::Validation);
-                        ++refusals;
-                        return;
-                    }
-                    if (reused != variant) applyShaderDataPatches(*reused);
-                    candidates.push_back({std::move(reused), std::move(regions), key, rank, *kind, rebased, variant.get()});
-                };
                 for (std::size_t rank = 0; rank < dataEntries.size() && refusals < MaxRefusals; ++rank) {
                     const auto& remembered = *dataEntries[rank].second;
                     if (remembered.stages.size() != programs.size() || remembered.decode->programs.size() != programs.size()) continue;
@@ -436,17 +344,60 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                     if (was.size() != now.size()) continue;
                     for (const auto& variant : remembered.stages[i]) {
                         if (refusals >= MaxRefusals) break;
-                        consider(variant, was, dataEntries[rank].first, static_cast<std::uint8_t>(rank));
-                    }
-                }
-                if (index != nullptr && candidates.empty() && refusals < MaxRefusals) {
-                    index->Find(shape, i, now, bound, readMoved, found);
-                    for (const auto& hit : found) {
-                        if (refusals >= MaxRefusals) break;
-                        if (hit.variant->shader != programs[i].snapshot || hit.was->size() != now.size()) continue;
-                        const auto before = candidates.size();
-                        consider(hit.variant, *hit.was, hit.key, ShapeIndexRank);
-                        index->NoteOutcome(candidates.size() != before);
+                        if (variant->registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*variant->registeredViews)) continue;
+                        if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const DrawDataCandidate& candidate) { return candidate.variant->pushOffset == variant->pushOffset; })) continue;
+                        std::uint32_t refused = 0;
+                        const auto kind = shapeUserWordMoves(*variant, was, now, moves, &refused);
+                        if (!kind) {
+                            const bool vertexInputs = variant->vertexInfo != nullptr && variant->vertexInfo->resourcesNum != 0;
+                            miss = std::max(miss, vertexInputs && variant->decodeRuns == 0 ? DrawShapeMiss::VertexInputs : DrawShapeMiss::UserWord);
+                            if (vertexInputs && shapeWords[i] == DrawShapeWord::Count) shapeWords[i] = shapeWordKind(*variant, refused, vertexTableMask(*variant->vertexInfo, programs[i].firstUserSgpr));
+                            continue;
+                        }
+                        const bool tables = *kind == DrawShapeReuse::VertexTables;
+                        if (tables) {
+                            if (!redecoded) redecoded = decodeVertexInfo(i);
+                            if (!*redecoded || !vertexInfos[i]) {
+                                miss = std::max(miss, DrawShapeMiss::VertexDecode);
+                                continue;
+                            }
+                            if (variant->vertexInfo == nullptr || !shapeVertexInputsMatch(*variant->vertexInfo, *vertexInfos[i])) {
+                                miss = std::max(miss, DrawShapeMiss::VertexLayout);
+                                continue;
+                            }
+                        }
+                        if (!movedRunsReadEqual(*variant, moves, tables, ShaderRecompiler::DescriptorLeaves() ? &liveBuffers : nullptr)) {
+                            miss = std::max(miss, DrawShapeMiss::Memory);
+                            continue;
+                        }
+                        auto reused = moves.empty() && liveBuffers.empty() ? variant : movedShapeVariant(variant, moves);
+                        if (!liveBuffers.empty()) {
+                            const bool patched = patchBufferWords(*reused, liveBuffers);
+                            NoteBufferWordReuse(liveBuffers.size(), patched);
+                            if (!patched) {
+                                miss = std::max(miss, DrawShapeMiss::Memory);
+                                continue;
+                            }
+                        }
+                        bool rebased = false;
+                        if (tables) {
+                            if (!rebaseVertexInputs(*reused, *vertexInfos[i], decodeReads[i])) {
+                                miss = std::max(miss, DrawShapeMiss::VertexLayout);
+                                continue;
+                            }
+                            rebased = !reused->vertexPatches.empty();
+                        }
+                        std::vector<ShaderRecompiler::MemoryRegion> regions;
+                        appendEntryRegions(*reused, regions);
+                        auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *reused, regions, imagesFlushed, runsSynced, sampling);
+                        if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *reused, regions, imagesFlushed, runsSynced, sampling);
+                        if (result != EntryOutcome::Equal) {
+                            miss = std::max(miss, DrawShapeMiss::Validation);
+                            ++refusals;
+                            continue;
+                        }
+                        if (reused != variant) applyShaderDataPatches(*reused);
+                        candidates.push_back({std::move(reused), std::move(regions), dataEntries[rank].first, static_cast<std::uint8_t>(rank), *kind, rebased, variant.get()});
                     }
                 }
                 shapeMisses[i] = miss;

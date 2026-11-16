@@ -12,14 +12,9 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
-#include <functional>
 #include <list>
 #include <memory>
-#include <mutex>
-#include <optional>
 #include <span>
-#include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
@@ -515,99 +510,6 @@ private:
 
 struct DrawRelocationCounters {
     std::uint64_t lookups = 0, donors = 0, refused = 0, hits = 0, evicted = 0;
-};
-
-using ShapeStageReader = std::function<bool(std::uint64_t, std::span<std::uint32_t>)>;
-
-struct ShapeStagePlan {
-    struct Run {
-        std::int8_t base = -1;
-        std::uint64_t at = 0;
-        std::uint32_t words = 0;
-        bool operator==(const Run&) const = default;
-    };
-    std::uint32_t pushOffset = 0;
-    std::uint32_t userWords = 0;
-    std::uint32_t decodeRuns = 0;
-    std::uint64_t userDataMask = 0, relocatableWords = 0, valueWords = 0, calleeWords = 0, forwardedWords = 0, vertexTableWords = 0;
-    std::uint64_t fixedWords = 0, alignedWords = 0;
-    std::vector<Run> runs;
-    std::vector<std::uint32_t> masked;
-    bool operator==(const ShapeStagePlan&) const = default;
-
-    static std::optional<ShapeStagePlan> Of(const DispatchVariant& variant, std::span<const std::uint32_t> was);
-    [[nodiscard]] std::optional<std::uint64_t> HashRead(std::span<const std::uint32_t> now, const ShapeStageReader& read) const;
-    [[nodiscard]] std::uint64_t HashKept(const DispatchVariant& variant, std::span<const std::uint32_t> was) const;
-};
-
-struct ShapeStageFound {
-    std::shared_ptr<DispatchVariant> variant;
-    std::shared_ptr<const std::vector<std::uint32_t>> was;
-    std::uint64_t key = 0;
-};
-
-struct ShapeIndexCounts {
-    std::uint64_t lookups = 0, layoutsRead = 0, unreadable = 0, found = 0, accepted = 0, refused = 0, inserted = 0, present = 0, unplanned = 0, layoutsDropped = 0, evicted = 0, held = 0, nodes = 0;
-    std::uint64_t layoutsSkipped = 0, newPush = 0, newWords = 0, newRuns = 0, newMoved = 0, newFixed = 0, newMasked = 0;
-};
-
-class ShapeStageIndex {
-public:
-    static constexpr std::size_t MaxLayouts = 8;
-    static constexpr std::size_t MaxFound = 4;
-    static constexpr std::size_t MaxRead = 3;
-    static constexpr std::size_t MaxProven = 2;
-    static constexpr std::uint64_t NoBound = ~std::uint64_t{0};
-
-    explicit ShapeStageIndex(std::size_t capacity);
-    static bool Enabled();
-    static ShapeStageIndex& Shared();
-    static std::string ReportText();
-
-    bool Insert(std::uint64_t shape, std::size_t stage, std::uint64_t key, const std::shared_ptr<DispatchVariant>& variant, std::span<const std::uint32_t> was);
-    void Find(std::uint64_t shape, std::size_t stage, std::span<const std::uint32_t> now, std::uint64_t bound, const ShapeStageReader& read, std::vector<ShapeStageFound>& found);
-    void NoteOutcome(bool accepted);
-    [[nodiscard]] std::uint64_t Serial() const;
-    [[nodiscard]] ShapeIndexCounts Counted() const;
-
-private:
-    struct Layout;
-    struct NodeKey {
-        std::uint64_t shape = 0;
-        std::size_t stage = 0;
-        bool operator==(const NodeKey&) const = default;
-    };
-    struct NodeHash {
-        std::size_t operator()(const NodeKey& key) const { return static_cast<std::size_t>((key.shape ^ (key.shape >> 29u)) * 0x9e3779b97f4a7c15ull + key.stage); }
-    };
-    struct Slot {
-        NodeKey node;
-        Layout* layout = nullptr;
-        std::uint64_t hash = 0;
-        std::shared_ptr<DispatchVariant> variant;
-        std::shared_ptr<const std::vector<std::uint32_t>> was;
-        std::uint64_t key = 0;
-        std::uint64_t serial = 0;
-        bool used = false;
-    };
-    struct Layout {
-        ShapeStagePlan plan;
-        std::unordered_multimap<std::uint64_t, std::list<Slot>::iterator> slots;
-        std::uint64_t lastUse = 0;
-        std::uint64_t lastFound = 0;
-    };
-    using Node = std::vector<std::shared_ptr<Layout>>;
-
-    void dropLayout(Layout& layout);
-    void evictOne();
-
-    mutable std::mutex mutex;
-    std::size_t capacity;
-    std::unordered_map<NodeKey, Node, NodeHash> nodes;
-    std::list<Slot> order;
-    std::uint64_t serial = 0;
-    std::uint64_t clock = 0;
-    ShapeIndexCounts counts;
 };
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry& registry);
