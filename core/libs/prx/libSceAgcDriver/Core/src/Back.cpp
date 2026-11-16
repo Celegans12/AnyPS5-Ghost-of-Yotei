@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
 #include <array>
@@ -71,6 +72,125 @@ ReplayMeter& replayMeter() {
 
 std::uint64_t nanosecondsSince(std::chrono::steady_clock::time_point started) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
+}
+
+std::atomic<int>& testedReplay() {
+    static std::atomic<int> mode{-1};
+    return mode;
+}
+
+enum class ReplayCount : std::size_t { Draws, Replayed, Captured, Stored, Absent, Unmatched, Token, Pending, Unstorable, Failed, TimedReplayed, ReplayedNanoseconds, TimedOther, OtherNanoseconds, Count };
+
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ReplayCount::Count)>& replayCounters() {
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ReplayCount::Count)> held{};
+    return held;
+}
+
+void countReplay(ReplayCount kind, std::uint64_t amount = 1) {
+    auto& counter = replayCounters()[static_cast<std::size_t>(kind)];
+    counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+
+void releaseReplay(void*, const ReplayEntry& entry) noexcept {
+    Graphics::DeleteCoreReplay(reinterpret_cast<Graphics::CoreReplay*>(static_cast<std::uintptr_t>(entry.resolved[0])));
+}
+
+DrawMemo& drawMemo() {
+    static auto* memo = new DrawMemo(ReplayRelease{&releaseReplay, nullptr});
+    return *memo;
+}
+
+bool replayStillCurrent(void*, std::uint64_t address, std::size_t bytes, const GuestMemory::ContentToken& token) {
+    return GuestMemory::StillCurrent(address, bytes, token);
+}
+
+bool replayPendingGpuWrite(void* context, std::uint64_t address, std::size_t bytes) {
+    const auto* recorder = static_cast<const Graphics::Recorder*>(context);
+    return recorder->PendingWriteOverlaps(address, bytes) || recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes) || recorder->QueuedKeyStoreOverlaps(address, bytes);
+}
+
+std::uint64_t replayInputsKey(const Pm4::DrawParameters& parameters, std::span<const Graphics::CompiledShader> stages) {
+    auto hash = ReplayMix(0x452821e638d01377ull, parameters.indexAddress);
+    hash = ReplayMix(hash, parameters.indexCount | (static_cast<std::uint64_t>(parameters.indexSize) << 32u));
+    hash = ReplayMix(hash, parameters.instanceCount | (static_cast<std::uint64_t>(parameters.flags) << 32u));
+    hash = ReplayMix(hash, parameters.firstVertex | (static_cast<std::uint64_t>(parameters.firstInstance) << 32u));
+    hash = ReplayMix(hash, parameters.indexed ? 1u : 0u);
+    if (!stages.empty() && stages.front().program != nullptr) {
+        for (const auto& attribute : stages.front().program->vertexAttributes) {
+            hash = ReplayMix(hash, attribute.resource.fields[0] | (static_cast<std::uint64_t>(attribute.resource.fields[1]) << 32u));
+            hash = ReplayMix(hash, attribute.resource.fields[2] | (static_cast<std::uint64_t>(attribute.resource.fields[3]) << 32u));
+        }
+    }
+    return hash;
+}
+
+bool replayBack(const Graphics::Context& context, const Graphics::State& graphics, const Pm4::DrawParameters& parameters, std::span<const Graphics::CompiledShader> stages, const std::shared_ptr<const DrawRecipe>& recipe, std::uint64_t identity, bool verifyBack, bool verifyReplay) {
+    static Graphics::CoreReplay* spare = nullptr;
+    thread_local std::uint32_t tick = 0;
+    const bool timed = (++tick & 15u) == 0;
+    const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    countReplay(ReplayCount::Draws);
+    auto& memo = drawMemo();
+    const ReplayKey key{identity, static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(recipe.get())), replayInputsKey(parameters, stages), 0};
+    auto* entry = memo.Find(key);
+    auto* held = entry != nullptr ? reinterpret_cast<Graphics::CoreReplay*>(static_cast<std::uintptr_t>(entry->resolved[0])) : nullptr;
+    bool current = false;
+    if (entry == nullptr) {
+        countReplay(ReplayCount::Absent);
+    } else if (!Graphics::CoreReplayMatches(*held, context.device, identity, recipe.get(), parameters, stages)) {
+        countReplay(ReplayCount::Unmatched);
+    } else {
+        ReplayNow now;
+        now.device = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(context.device));
+        now.stillCurrent = &replayStillCurrent;
+        now.pendingGpuWrite = &replayPendingGpuWrite;
+        now.context = context.recorder;
+        const auto miss = memo.Fresh(*entry, now);
+        current = miss == ReplayMiss::None;
+        if (miss == ReplayMiss::PendingGpuWrite) countReplay(ReplayCount::Pending);
+        else if (!current) countReplay(ReplayCount::Token);
+    }
+    if (current) {
+        const bool recorded = Graphics::DrawCoreReplayed(context, graphics, parameters, stages, recipe, verifyBack, *held, true, verifyReplay, identity).recorded;
+        countReplay(recorded ? ReplayCount::Replayed : ReplayCount::Failed);
+        if (timed) {
+            countReplay(ReplayCount::TimedReplayed);
+            countReplay(ReplayCount::ReplayedNanoseconds, nanosecondsSince(started));
+        }
+        return recorded;
+    }
+    if (held == nullptr) {
+        if (spare == nullptr) spare = Graphics::NewCoreReplay();
+        held = spare;
+    }
+    const bool recorded = Graphics::DrawCoreReplayed(context, graphics, parameters, stages, recipe, verifyBack, *held, false, false, identity).recorded;
+    countReplay(recorded ? ReplayCount::Captured : ReplayCount::Failed);
+    const auto ranges = Graphics::CoreReplayRanges(*held);
+    bool storable = recorded && Graphics::CoreReplayStorable(*held) && ranges <= DrawProof{}.ranges.size();
+    DrawProof proof;
+    proof.device = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(context.device));
+    for (std::uint32_t index = 0; storable && index < ranges; ++index) {
+        std::uint64_t address = 0;
+        std::uint64_t bytes = 0;
+        Graphics::CoreReplayRange(*held, index, address, bytes, proof.ranges[index]);
+        if (bytes == 0 || bytes > 0xffffffffull) storable = false;
+        proof.rangeAddress[index] = address;
+        proof.rangeBytes[index] = static_cast<std::uint32_t>(bytes);
+    }
+    if (storable) {
+        const std::uint64_t word = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(held));
+        if (memo.Store(key, proof, std::span<const std::uint64_t>(&word, 1), 0) != nullptr) {
+            countReplay(ReplayCount::Stored);
+            if (held == spare) spare = nullptr;
+        }
+    } else if (recorded) {
+        countReplay(ReplayCount::Unstorable);
+    }
+    if (timed) {
+        countReplay(ReplayCount::TimedOther);
+        countReplay(ReplayCount::OtherNanoseconds, nanosecondsSince(started));
+    }
+    return recorded;
 }
 
 }
@@ -199,6 +319,30 @@ void SetBackModeForTest(int mode) {
     testedMode().store(mode, std::memory_order_relaxed);
 }
 
+BackReplay BackReplayNow() {
+    const auto forced = testedReplay().load(std::memory_order_relaxed);
+    if (forced >= 0) return static_cast<BackReplay>(forced);
+    static const BackReplay configured = !GuestMemory::EpochSweeps() ? BackReplay::Off : std::getenv("APS5_VERIFY_CORE_REPLAY") != nullptr ? BackReplay::Verify : std::getenv("APS5_CORE_REPLAY") != nullptr ? BackReplay::On : BackReplay::Off;
+    return configured;
+}
+
+void SetBackReplayForTest(int mode) {
+    testedReplay().store(mode, std::memory_order_relaxed);
+}
+
+std::string BackReplayReport() {
+    const auto at = [](ReplayCount kind) { return static_cast<unsigned long long>(replayCounters()[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed)); };
+    const auto back = Graphics::CoreReplayCounted();
+    const auto memo = drawMemo().Counted();
+    const auto share = [&](ReplayCount kind) { return at(ReplayCount::Draws) == 0 ? 0.0 : 100.0 * static_cast<double>(at(kind)) / static_cast<double>(at(ReplayCount::Draws)); };
+    const auto each = [&](ReplayCount total, ReplayCount samples) { return at(samples) == 0 ? 0.0 : static_cast<double>(at(total)) / static_cast<double>(at(samples)); };
+    char text[1024];
+    std::snprintf(text, sizeof(text), "[core-replay-back] (cumulative) %llu draws offered, %llu replayed (%.1f %%), %llu taken by the full path (%.1f %%): absent %llu, unmatched %llu, token %llu, pending GPU write %llu; %llu stored, %llu not storable, %llu left to the driver; kept once by the batch %llu; verified %llu, mismatches %llu; memo evicted %llu, replaced %llu; %.0f ns per replayed draw (%llu timed), %.0f ns per other draw (%llu timed)",
+        at(ReplayCount::Draws), at(ReplayCount::Replayed), share(ReplayCount::Replayed), at(ReplayCount::Captured), share(ReplayCount::Captured), at(ReplayCount::Absent), at(ReplayCount::Unmatched), at(ReplayCount::Token), at(ReplayCount::Pending), at(ReplayCount::Stored), at(ReplayCount::Unstorable), at(ReplayCount::Failed),
+        static_cast<unsigned long long>(back[5]), static_cast<unsigned long long>(back[3]), static_cast<unsigned long long>(back[4]), static_cast<unsigned long long>(memo.evicted), static_cast<unsigned long long>(memo.replaced), each(ReplayCount::ReplayedNanoseconds, ReplayCount::TimedReplayed), at(ReplayCount::TimedReplayed), each(ReplayCount::OtherNanoseconds, ReplayCount::TimedOther), at(ReplayCount::TimedOther));
+    return text;
+}
+
 std::string BackReport() {
     const auto counts = Graphics::CoreBackCounted();
     char text[768];
@@ -206,19 +350,26 @@ std::string BackReport() {
     return text;
 }
 
-bool RecordBack(VulkanDevice& device, const Graphics::State& graphics, const Pm4::DrawParameters& parameters, std::span<const Graphics::CompiledShader> stages, const std::shared_ptr<const DrawRecipe>& recipe, std::uint64_t) {
+bool RecordBack(VulkanDevice& device, const Graphics::State& graphics, const Pm4::DrawParameters& parameters, std::span<const Graphics::CompiledShader> stages, const std::shared_ptr<const DrawRecipe>& recipe, std::uint64_t identity) {
     const auto mode = BackModeNow();
     if (mode == BackMode::Recipe) return device.DrawFromRecipe(graphics, parameters, stages, {}, recipe) == RecipeOutcome::Recorded;
     const auto context = device.graphicsContext();
-    return recipe->device == context.device && Graphics::DrawCoreWithRecipe(context, graphics, parameters, stages, *recipe, mode == BackMode::Verify).recorded;
+    if (recipe->device != context.device) return false;
+    const auto replay = BackReplayNow();
+    if (replay == BackReplay::Off || identity == 0 || context.recorder == nullptr || parameters.indirect.has_value()) return Graphics::DrawCoreWithRecipe(context, graphics, parameters, stages, *recipe, mode == BackMode::Verify).recorded;
+    return replayBack(context, graphics, parameters, stages, recipe, identity, mode == BackMode::Verify, replay == BackReplay::Verify);
 }
 
 void ReportBack() {
-    if (BackModeNow() == BackMode::Recipe || !Graphics::CoreRunStats()) return;
+    if (BackModeNow() == BackMode::Recipe) return;
+    const bool replay = BackReplayNow() != BackReplay::Off;
+    if (!replay && !Graphics::CoreRunStats()) return;
     static std::atomic<std::int64_t> lastReport{0};
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = lastReport.load(std::memory_order_relaxed);
-    if (nowMs - last >= 5000 && lastReport.compare_exchange_strong(last, nowMs)) std::fprintf(stderr, "%s%c", BackReport().c_str(), 10);
+    if (nowMs - last < 5000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
+    if (Graphics::CoreRunStats()) std::fprintf(stderr, "%s%c", BackReport().c_str(), 10);
+    if (replay) std::fprintf(stderr, "%s%c", BackReplayReport().c_str(), 10);
 }
 
 std::span<const Graphics::CompiledShader> PrepareBack(CoreDraw& record) {
@@ -274,7 +425,7 @@ void Driver::commitCoreDraw(const std::shared_ptr<Core::CoreDraw>& record) {
             filled = replay.has_value() && Core::ReplayFilled(*replayTargets);
             if (replayTimed) replaySpent += Core::nanosecondsSince(fillStarted);
         }
-        if (!Core::RecordBack(*localDevice, graphics, record->parameters, stages, variant.recipe)) {
+        if (!Core::RecordBack(*localDevice, graphics, record->parameters, stages, variant.recipe, variant.serial)) {
             restarted = true;
             variant.stale.store(true, std::memory_order_release);
             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);

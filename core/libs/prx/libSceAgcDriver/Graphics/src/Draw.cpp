@@ -2264,6 +2264,59 @@ InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std:
     return indices;
 }
 
+struct CoreReplay {
+    struct Range {
+        std::uint64_t address = 0;
+        std::size_t bytes = 0;
+        std::size_t from = 0;
+        std::size_t alignment = 1;
+        Recorder::SnapshotUse use = Recorder::SnapshotUse::Vertex;
+        std::shared_ptr<Buffer> buffer;
+        GuestMemory::ContentToken token;
+        std::uint64_t forget = ~std::uint64_t{0};
+    };
+    static constexpr std::size_t MaxRanges = 6;
+    std::uint64_t registryGeneration = 0;
+    bool storable = false;
+    bool refused = false;
+    std::uint64_t identity = 0;
+    std::shared_ptr<const DrawRecipe> recipe;
+    VkDevice device = VK_NULL_HANDLE;
+    Pm4::DrawParameters draw{};
+    std::vector<std::uint32_t> attributeWords;
+    std::vector<Range> ranges;
+    std::shared_ptr<Buffer> indices;
+    VkBuffer indexHandle = VK_NULL_HANDLE;
+    VkDeviceSize indexOffset = 0;
+    std::vector<std::shared_ptr<Buffer>> vertexBuffers;
+    std::vector<VkBuffer> vertexHandles;
+    std::vector<VkDeviceSize> vertexOffsets;
+    std::uint64_t keptBatch = 0;
+    void Reset() {
+        storable = false;
+        refused = false;
+        identity = 0;
+        recipe.reset();
+        device = VK_NULL_HANDLE;
+        attributeWords.clear();
+        ranges.clear();
+        indices.reset();
+        indexHandle = VK_NULL_HANDLE;
+        indexOffset = 0;
+        vertexBuffers.clear();
+        vertexHandles.clear();
+        vertexOffsets.clear();
+        keptBatch = 0;
+    }
+    void Add(std::uint64_t address, std::size_t bytes, std::size_t from, std::size_t alignment, Recorder::SnapshotUse use, const std::shared_ptr<Buffer>& buffer, const GuestMemory::ContentToken& token) {
+        if (ranges.size() >= MaxRanges || buffer == nullptr) {
+            refused = true;
+            return;
+        }
+        ranges.push_back({address, bytes, from, alignment, use, buffer, token, ~std::uint64_t{0}});
+    }
+};
+
 namespace {
 
 // The draw's inputs before its resources (prepareDrawInputs): the validated parameters, the index
@@ -2328,6 +2381,8 @@ struct InputVectorScratch {
 };
 
 struct InputVectorTag {};
+
+struct CoreReplayVectorTag {};
 
 void takeInputVectors(DrawInputs& inputs) {
     auto& home = ThreadScratch<InputVectorScratch, InputVectorTag>();
@@ -2468,9 +2523,30 @@ InPlaceIndices cachedIndexRange(BufferCache& cache, const BufferCache::View& vie
 
 struct CoreCommit {
     bool verify = false;
+    CoreReplay* replay = nullptr;
+    bool inputs = false;
+    bool verifyReplay = false;
+    std::uint64_t identity = 0;
+    const std::shared_ptr<const DrawRecipe>* kept = nullptr;
 };
 
 enum class CoreBackCount : std::size_t { Draws, Continued, Proofs, Verified, Mismatches, Misses, Inputs, InputsHeld, InputsInPlace, Bindings, Notes, Marks, Count };
+
+enum class CoreReplayCount : std::size_t { Replayed, Captured, Unstorable, Verified, Mismatches, KeptOnce, Count };
+
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CoreReplayCount::Count)>& coreReplayCounters() {
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CoreReplayCount::Count)> held{};
+    return held;
+}
+
+void countCoreReplay(CoreReplayCount kind) {
+    coreReplayCounters()[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+}
+
+[[noreturn]] void failCoreReplay(const char* what) {
+    countCoreReplay(CoreReplayCount::Mismatches);
+    throw std::runtime_error(std::string("APS5_VERIFY_CORE_REPLAY: a replayed draw differs from the full path in ") + what);
+}
 
 std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CoreBackCount::Count)>& coreBackCounters() {
     static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(CoreBackCount::Count)> held{};
@@ -2495,6 +2571,7 @@ struct CoreInputMemo {
         std::shared_ptr<Buffer> buffer;
         std::uint32_t derived = 0;
         std::uint32_t lowest = 0;
+        GuestMemory::ContentToken token;
     };
     static constexpr std::size_t Limit = 64;
     bool tagged = false;
@@ -2518,9 +2595,9 @@ struct CoreInputMemo {
         }
         return nullptr;
     }
-    void Keep(std::uint64_t address, std::size_t bytes, std::size_t from, Recorder::SnapshotUse use, const std::shared_ptr<Buffer>& buffer, std::uint32_t derived, std::uint32_t lowest) {
+    void Keep(std::uint64_t address, std::size_t bytes, std::size_t from, Recorder::SnapshotUse use, const std::shared_ptr<Buffer>& buffer, std::uint32_t derived, std::uint32_t lowest, const GuestMemory::ContentToken& token = {}) {
         if (buffer == nullptr || entries.size() >= Limit) return;
-        entries.push_back({address, bytes, from, use, buffer, derived, lowest});
+        entries.push_back({address, bytes, from, use, buffer, derived, lowest, token});
     }
 };
 
@@ -2574,6 +2651,7 @@ struct DrawPlan {
     bool candidate = false;
     bool keyed = false;
     std::uint8_t coreMode = 0;
+    CoreReplay* capture = nullptr;
     ResourceCache::Key contentKey;
     const VertexInputLayout& VertexLayout() const { return retainedVertexInput != nullptr ? *retainedVertexInput : vertexInput; }
 };
@@ -2756,6 +2834,8 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     const auto indexBytes = inputs.indexBytes;
     auto* memo = drawPlan.coreMode != 0 && context.recorder != nullptr && !BufferCache::DirtyFirst() ? &coreInputMemo() : nullptr;
     if (memo != nullptr) memo->Follow(context.device);
+    auto* capture = drawPlan.capture;
+    if (capture != nullptr && (memo == nullptr || args != nullptr || state.stages.mesh)) capture->refused = true;
     const bool fewReads = drawPlan.coreMode != 0 && args == nullptr && static_cast<std::uint64_t>(draw.indexCount) * draw.instanceCount <= CoreInPlaceReads;
     if (draw.indexed) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
     APS5_LOG_CHARS_OUT_DEBUG("Index buffer range OK");
@@ -2845,6 +2925,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         }
         inputs.maxIndex = draw.indexed ? maxIdx : maxIdx + draw.firstVertex;
         Require(inputs.maxIndex <= context.limits.maxDrawIndexedIndexValue, "index exceeds the device's indexed draw limit");
+        if (capture != nullptr) capture->refused = true;
         inputs.indexHandle = indexCopy->Handle();
         inputs.indexOffset = 0;
         inputs.expandedIndexCount = outputIndexCount;
@@ -2878,6 +2959,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.minIndex = bounds->lowest;
         inputs.indexCount = count;
         inputs.listRestartPrimitive = primitiveSize;
+        if (capture != nullptr) capture->refused = true;
         inputs.indices = std::move(compacted);
         inputs.indexHandle = inputs.indices->Handle();
         inputs.indexOffset = 0;
@@ -2891,6 +2973,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto* held = import == nullptr && memo != nullptr ? memo->Find(draw.indexAddress, static_cast<std::size_t>(indexBytes), 0, use) : nullptr;
         auto cached = import == nullptr && held == nullptr ? cachedDrawInput(context, draw.indexAddress, static_cast<std::size_t>(indexBytes), 0, draw.indexSize) : BufferCache::View{};
         DrawInputCopy copy;
+        auto indexToken = held != nullptr ? held->token : GuestMemory::ContentToken{};
         if (held != nullptr) {
             countCoreBack(CoreBackCount::InputsHeld);
             if (drawPlan.coreMode == 2) verifyHeldInput(context, *held, draw.indexSize);
@@ -2898,7 +2981,10 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             copy.reused = true;
             copy.derived = held->derived;
             copy.lowest = held->lowest;
-        } else if (import == nullptr && !cached) copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        } else if (import == nullptr && !cached) {
+            if (memo != nullptr && capture != nullptr) indexToken = GuestMemory::TokenFor(draw.indexAddress, static_cast<std::size_t>(indexBytes));
+            copy = CopyDrawInput(context, context.recorder, draw.indexAddress, static_cast<std::size_t>(indexBytes), draw.indexSize, use);
+        }
         else if (import != nullptr) GuestMemory::CheckRange(reinterpret_cast<const void*>(draw.indexAddress), static_cast<std::size_t>(indexBytes), draw.indexSize);
         std::optional<std::uint32_t> highest;
         std::uint32_t lowest = 0;
@@ -2916,12 +3002,12 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 lowest = bounds->lowest;
             }
             KeepDrawInput(context.recorder, draw.indexAddress, copy, use, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u), lowest);
-            if (memo != nullptr) memo->Keep(draw.indexAddress, static_cast<std::size_t>(indexBytes), 0, use, copy.buffer, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u), lowest);
+            if (memo != nullptr) memo->Keep(draw.indexAddress, static_cast<std::size_t>(indexBytes), 0, use, copy.buffer, skipRestart ? (highest ? *highest + 1u : 0u) : highest.value_or(0u), lowest, indexToken);
         } else {
             lowest = copy.lowest;
             if (!skipRestart) highest = copy.derived;
             else if (copy.derived != 0) highest = copy.derived - 1u;
-            if (memo != nullptr && held == nullptr) memo->Keep(draw.indexAddress, static_cast<std::size_t>(indexBytes), 0, use, copy.buffer, copy.derived, copy.lowest);
+            if (memo != nullptr && held == nullptr) memo->Keep(draw.indexAddress, static_cast<std::size_t>(indexBytes), 0, use, copy.buffer, copy.derived, copy.lowest, indexToken);
         }
         if (!highest) {
             inputs.nothing = true;
@@ -2939,6 +3025,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
                 import = nullptr;
                 cached = BufferCache::View{};
                 copy = DrawInputCopy{};
+                if (capture != nullptr) capture->refused = true;
                 copy.buffer = std::move(clamped);
                 if (!clampedBounds) {
                     inputs.nothing = true;
@@ -2956,14 +3043,17 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
             inputs.restartTable = MeshRestartTable(indexSpan, draw.indexSize);
         }
         if (import != nullptr) {
+            if (capture != nullptr) capture->refused = true;
             inputs.indexHandle = import->buffer;
             inputs.indexOffset = HostImportOffset(*import, draw.indexAddress);
             inputs.inPlaceReads.emplace_back(draw.indexAddress, draw.indexAddress + indexBytes);
         } else if (cached) {
+            if (capture != nullptr) capture->refused = true;
             inputs.indexHandle = cached.handle;
             inputs.indexOffset = cached.offset;
             inputs.mirrors.push_back(std::move(cached.owner));
         } else {
+            if (capture != nullptr && !capture->refused) capture->Add(draw.indexAddress, static_cast<std::size_t>(indexBytes), 0, draw.indexSize, use, copy.buffer, indexToken);
             inputs.indices = std::move(copy.buffer);
             inputs.indexHandle = inputs.indices->Handle();
         }
@@ -3046,6 +3136,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (drawPlan.coreMode != 0) countCoreBack(CoreBackCount::Inputs);
         if (const auto* import = inPlaceDrawInput(context, begin, bytes, plan.alignments[range], &inputs.vertexInputBehindGpuWrite, fewReads && bytes - std::min(rangeFrom[range], bytes) <= CoreInPlaceBytes)) {
             if (!context.drawInputsInPlace) countCoreBack(CoreBackCount::InputsInPlace);
+            if (capture != nullptr) capture->refused = true;
             rangeHandles.push_back(import->buffer);
             rangeOffsets.push_back(HostImportOffset(*import, begin));
             inputs.inPlaceReads.emplace_back(begin, end);
@@ -3054,6 +3145,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         if (const auto* held = memo != nullptr ? memo->Find(begin, bytes, rangeFrom[range], Recorder::SnapshotUse::Vertex) : nullptr) {
             countCoreBack(CoreBackCount::InputsHeld);
             if (drawPlan.coreMode == 2) verifyHeldInput(context, *held, 1);
+            if (capture != nullptr && !capture->refused) capture->Add(begin, bytes, rangeFrom[range], 1, Recorder::SnapshotUse::Vertex, held->buffer, held->token);
             rangeHandles.push_back(held->buffer->Handle());
             rangeOffsets.push_back(0);
             inputs.vertexBuffers.push_back(held->buffer);
@@ -3063,6 +3155,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const bool behind = dirtyFirst && context.recorder->PendingWriteOverlaps(begin, bytes);
         const auto served = [&](BufferCache::View cached) {
             if (!cached) return false;
+            if (capture != nullptr) capture->refused = true;
             rangeHandles.push_back(cached.handle);
             rangeOffsets.push_back(cached.offset);
             inputs.mirrors.push_back(std::move(cached.owner));
@@ -3070,15 +3163,18 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         };
         if (!behind && served(cachedDrawInput(context, begin, bytes, rangeFrom[range], plan.alignments[range]))) continue;
         if (auto copied = !dirtyFirst || behind ? GpuCopiedDrawInput(context, begin, bytes, rangeFrom[range]) : std::shared_ptr<Buffer>{}) {
+            if (capture != nullptr) capture->refused = true;
             rangeHandles.push_back(copied->Handle());
             rangeOffsets.push_back(0);
             inputs.vertexBuffers.push_back(std::move(copied));
             continue;
         }
         if (behind && served(cachedDrawInput(context, begin, bytes, rangeFrom[range], plan.alignments[range]))) continue;
+        const auto rangeToken = memo != nullptr && capture != nullptr ? GuestMemory::TokenFor(begin, bytes) : GuestMemory::ContentToken{};
         auto copy = CopyDrawInput(context, context.recorder, begin, bytes, 1, Recorder::SnapshotUse::Vertex, rangeFrom[range]);
         KeepDrawInput(context.recorder, begin, copy, Recorder::SnapshotUse::Vertex, 0);
-        if (memo != nullptr) memo->Keep(begin, bytes, rangeFrom[range], Recorder::SnapshotUse::Vertex, copy.buffer, 0, 0);
+        if (memo != nullptr) memo->Keep(begin, bytes, rangeFrom[range], Recorder::SnapshotUse::Vertex, copy.buffer, 0, 0, rangeToken);
+        if (capture != nullptr && !capture->refused) capture->Add(begin, bytes, rangeFrom[range], 1, Recorder::SnapshotUse::Vertex, copy.buffer, rangeToken);
         rangeHandles.push_back(copy.buffer->Handle());
         rangeOffsets.push_back(0);
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
@@ -3089,6 +3185,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
     for (const auto f : soloFetches) {
         const auto begin = fetches[f].begin;
         const auto bytes = static_cast<std::size_t>(fetches[f].end - begin);
+        if (capture != nullptr) capture->refused = true;
         auto copy = CopyZeroPaddedDrawInput(context, begin, bytes, fetchValid[f], fetches[f].stride);
         soloHandles[f] = copy.buffer->Handle();
         inputs.vertexBuffers.push_back(std::move(copy.buffer));
@@ -3109,6 +3206,15 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         const auto j = plannedOf[f];
         inputs.vertexHandles.push_back(rangeHandles[plan.copyOf[j]]);
         inputs.vertexOffsets[i] = rangeOffsets[plan.copyOf[j]] + plan.offsets[j];
+    }
+    if (capture != nullptr && !capture->refused && inputs.mirrors.empty() && inputs.inPlaceReads.empty() && inputs.restartTable.empty() && !inputs.indexCount.has_value() && inputs.expandedIndexCount == 0 && !inputs.vertexInputBehindGpuWrite) {
+        capture->indices = inputs.indices;
+        capture->indexHandle = inputs.indexHandle;
+        capture->indexOffset = inputs.indexOffset;
+        capture->vertexBuffers = inputs.vertexBuffers;
+        capture->vertexHandles = inputs.vertexHandles;
+        capture->vertexOffsets = inputs.vertexOffsets;
+        capture->storable = true;
     }
     timer.phase(PhaseVertex);
     timing.Mark("vertex_upload");
@@ -5880,6 +5986,74 @@ struct RecipeVectors {
     std::vector<ShaderResources::MovedBuffer> moved;
 };
 
+void replayDrawInputs(const Context& context, const State& state, const Pm4::DrawParameters& draw, const DrawRecipe& recipe, const CoreReplay& held, DrawInputs& inputs) {
+    auto* recorder = context.recorder;
+    if (recorder != nullptr && recorder->OwesDrawInputCopies() && !recorder->RenderPassOpen()) RefreshDrawInputCopies(context, true);
+    if (state.pixelKill && !state.pixelEarlyZ && std::ranges::any_of(state.colors, [](const ColorTarget& color) { return color.partialWriteMask != 0; })) {
+        const auto* active = Recorder::Active();
+        Require(active == nullptr || !active->CountingSamples(), "a partial write of a packed color target merges inside the pixel shader after early depth and stencil tests, which a shader that kills pixels under late tests cannot use while occlusion queries count samples: the early tests would count the pixels it kills");
+    }
+    auto& home = ThreadScratch<InputVectorScratch, CoreReplayVectorTag>();
+    inputs.vertexBuffers = std::move(home.vertexBuffers);
+    inputs.vertexHandles = std::move(home.vertexHandles);
+    inputs.vertexOffsets = std::move(home.vertexOffsets);
+    inputs.vertexBuffers.clear();
+    inputs.indexBytes = static_cast<std::uint64_t>(draw.indexCount) * draw.indexSize;
+    inputs.fragmentOutputs = recipe.fragmentOutputs;
+    inputs.shaderStages = recipe.shaderStages;
+    inputs.retainedVertexInput = std::shared_ptr<const VertexInputLayout>(std::shared_ptr<const VertexInputLayout>(), &recipe.vertexInput);
+    inputs.indexHandle = held.indexHandle;
+    inputs.indexOffset = held.indexOffset;
+    inputs.vertexHandles.assign(held.vertexHandles.begin(), held.vertexHandles.end());
+    inputs.vertexOffsets.assign(held.vertexOffsets.begin(), held.vertexOffsets.end());
+    if (recorder != nullptr && held.keptBatch != 0 && held.keptBatch == recorder->OpenBatchId()) {
+        countCoreReplay(CoreReplayCount::KeptOnce);
+        return;
+    }
+    inputs.indices = held.indices;
+    inputs.vertexBuffers.assign(held.vertexBuffers.begin(), held.vertexBuffers.end());
+}
+
+void returnReplayVectors(DrawInputs& inputs) {
+    auto& home = ThreadScratch<InputVectorScratch, CoreReplayVectorTag>();
+    inputs.vertexBuffers.clear();
+    inputs.vertexHandles.clear();
+    inputs.vertexOffsets.clear();
+    home.vertexBuffers = std::move(inputs.vertexBuffers);
+    home.vertexHandles = std::move(inputs.vertexHandles);
+    home.vertexOffsets = std::move(inputs.vertexOffsets);
+}
+
+void verifyReplayedInputs(const Context& context, const CoreReplay& held, const DrawInputs& fresh) {
+    countCoreReplay(CoreReplayCount::Verified);
+    if (fresh.nothing) failCoreReplay("a draw the full path finds empty");
+    if (fresh.vertexHandles.size() != held.vertexHandles.size()) failCoreReplay("the count of its vertex buffers");
+    if (fresh.indexCount.has_value() || fresh.expandedIndexCount != 0) failCoreReplay("the count of its indices");
+    if (fresh.inPlaceReads.empty() && fresh.mirrors.empty() && (fresh.indexOffset != held.indexOffset || fresh.vertexOffsets != held.vertexOffsets)) failCoreReplay("the offsets of its inputs");
+    for (const auto& range : held.ranges) {
+        const auto copy = CopyDrawInput(context, context.recorder, range.address, range.bytes, range.alignment, range.use, range.from);
+        if (copy.buffer == nullptr || std::memcmp(copy.buffer->Bytes().data() + range.from, range.buffer->Bytes().data() + range.from, range.bytes - range.from) != 0) failCoreReplay("the bytes of an input");
+    }
+}
+
+void finishCoreCapture(const Context& context, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const CoreCommit& core, CoreReplay& replay) {
+    if (!replay.storable || core.kept == nullptr || core.identity == 0) {
+        replay.storable = false;
+        return;
+    }
+    replay.identity = core.identity;
+    replay.recipe = *core.kept;
+    replay.device = context.device;
+    replay.draw = draw;
+    for (const auto& attribute : shaders.front().program->vertexAttributes) {
+        for (const auto field : attribute.resource.fields) replay.attributeWords.push_back(field);
+        replay.attributeWords.push_back(attribute.location);
+        replay.attributeWords.push_back(attribute.fetchIndex);
+    }
+    if (replay.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return;
+    for (auto& range : replay.ranges) range.forget = GuestMemory::ForgetStamp(range.address, range.bytes);
+}
+
 }
 
 namespace {
@@ -5904,6 +6078,7 @@ DrawRecipeOutcome drawRecipe(const Context& context, const State& state, const P
         result.miss = reason;
         PassState::Break();
         if (core != nullptr) countCoreBack(CoreBackCount::Misses);
+        if (core != nullptr && core->replay != nullptr && !core->inputs) core->replay->storable = false;
         if (profile) {
             auto& stats = Profile();
             std::lock_guard lock(stats.mutex);
@@ -5922,10 +6097,23 @@ DrawRecipeOutcome drawRecipe(const Context& context, const State& state, const P
     ValidateVertexAddresses(attributes);
     const bool allocationsCounted = drawSiteStats() && HostAllocationsCounted();
     const auto allocationsBefore = allocationsCounted ? HostAllocationsOnThread() : 0;
-    const auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer, core == nullptr ? 0 : core->verify ? 2 : 1);
+    auto* replay = core != nullptr ? core->replay : nullptr;
+    const bool replayed = replay != nullptr && core->inputs;
     DrawInputs inputs;
-    if (plan.nothing) inputs.nothing = true;
-    else inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
+    if (replayed && !core->verifyReplay) {
+        replayDrawInputs(context, state, draw, recipe, *replay, inputs);
+    } else {
+        auto plan = planDraw(context, state, draw, shaders, &recipe, outcome, timer, core == nullptr ? 0 : core->verify ? 2 : 1);
+        if (replay != nullptr && !replayed) {
+            replay->Reset();
+            replay->registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+            plan.capture = replay;
+        }
+        if (plan.nothing) inputs.nothing = true;
+        else inputs = prepareDrawInputs(context, state, draw, shaders, plan, timer, timing);
+        if (replayed) verifyReplayedInputs(context, *replay, inputs);
+        else if (replay != nullptr) finishCoreCapture(context, draw, shaders, *core, *replay);
+    }
     if (inputs.nothing) {
         result.recorded = true;
         return result;
@@ -6119,7 +6307,12 @@ DrawRecipeOutcome drawRecipe(const Context& context, const State& state, const P
     recordDraw(context, state, draw, shaders, inputs, record, outcome, timer, ownWaitedMs, trace);
     vectors.targets = std::move(record.targets);
     vectors.slices = std::move(record.targetSlices);
-    returnInputVectors(inputs);
+    if (replay != nullptr) {
+        replay->keptBatch = replay->storable ? recorder->OpenBatchId() : 0;
+        countCoreReplay(replayed ? CoreReplayCount::Replayed : replay->storable ? CoreReplayCount::Captured : CoreReplayCount::Unstorable);
+    }
+    if (replayed && !core->verifyReplay) returnReplayVectors(inputs);
+    else returnInputVectors(inputs);
     if (allocationsCounted) {
         const auto keptAfter = recorder->OpenKeptObjects();
         noteDrawAllocations(allocationsAfterInputs - allocationsBefore, HostAllocationsOnThread() - allocationsAfterInputs, keptAfter >= keptBefore ? keptAfter - keptBefore : 0);
@@ -6146,6 +6339,61 @@ DrawRecipeOutcome DrawWithRecipe(const Context& context, const State& state, con
 DrawRecipeOutcome DrawCoreWithRecipe(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const DrawRecipe& recipe, bool verify) {
     const CoreCommit core{verify};
     return drawRecipe(context, state, draw, shaders, {}, recipe, nullptr, &core);
+}
+
+DrawRecipeOutcome DrawCoreReplayed(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, const std::shared_ptr<const DrawRecipe>& recipe, bool verify, CoreReplay& replay, bool inputsCurrent, bool verifyReplay, std::uint64_t identity) {
+    const CoreCommit core{verify, &replay, inputsCurrent, verifyReplay, identity, &recipe};
+    return drawRecipe(context, state, draw, shaders, {}, *recipe, nullptr, &core);
+}
+
+CoreReplay* NewCoreReplay() {
+    return new CoreReplay;
+}
+
+void DeleteCoreReplay(CoreReplay* replay) noexcept {
+    delete replay;
+}
+
+bool CoreReplayStorable(const CoreReplay& replay) {
+    return replay.storable;
+}
+
+std::uint32_t CoreReplayRanges(const CoreReplay& replay) {
+    return static_cast<std::uint32_t>(replay.ranges.size());
+}
+
+void CoreReplayRange(const CoreReplay& replay, std::uint32_t index, std::uint64_t& address, std::uint64_t& bytes, GuestMemory::ContentToken& token) {
+    const auto& range = replay.ranges[index];
+    address = range.address;
+    bytes = range.bytes;
+    token = range.token;
+}
+
+bool CoreReplayMatches(const CoreReplay& replay, VkDevice device, std::uint64_t identity, const DrawRecipe* recipe, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    if (!replay.storable || replay.identity != identity || replay.device != device || replay.recipe.get() != recipe || draw.indirect.has_value()) return false;
+    const auto& held = replay.draw;
+    if (held.indexAddress != draw.indexAddress || held.indexCount != draw.indexCount || held.indexSize != draw.indexSize || held.instanceCount != draw.instanceCount || held.flags != draw.flags || held.indexed != draw.indexed || held.firstVertex != draw.firstVertex || held.firstInstance != draw.firstInstance) return false;
+    if (shaders.empty() || shaders.front().program == nullptr) return false;
+    const auto& attributes = shaders.front().program->vertexAttributes;
+    if (replay.attributeWords.size() != attributes.size() * 6u) return false;
+    const auto* word = replay.attributeWords.data();
+    for (const auto& attribute : attributes) {
+        if (word[0] != attribute.resource.fields[0] || word[1] != attribute.resource.fields[1] || word[2] != attribute.resource.fields[2] || word[3] != attribute.resource.fields[3] || word[4] != attribute.location || word[5] != attribute.fetchIndex) return false;
+        word += 6;
+    }
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    if (replay.registryGeneration == registry) return true;
+    if (!(GuestMemory::ResourceVersions() || GuestMemory::WriteIndexEnabled()) || (GuestMemory::ForgetSerial() & 1u) != 0) return false;
+    for (const auto& range : replay.ranges) {
+        if (range.forget == ~std::uint64_t{0} || GuestMemory::ForgetStamp(range.address, range.bytes) != range.forget) return false;
+    }
+    return true;
+}
+
+std::array<std::uint64_t, 6> CoreReplayCounted() {
+    std::array<std::uint64_t, 6> counts{};
+    for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = coreReplayCounters()[index].load(std::memory_order_relaxed);
+    return counts;
 }
 
 std::array<std::uint64_t, 12> CoreBackCounted() {
