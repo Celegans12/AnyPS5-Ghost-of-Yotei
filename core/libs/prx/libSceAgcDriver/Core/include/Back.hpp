@@ -26,6 +26,8 @@ bool CoreReplayMatches(const CoreReplay& replay, VkDevice device, std::uint64_t 
 bool CoreReplayRecaptured(const CoreReplay& replay);
 bool CoreReplayLean(const CoreReplay& replay);
 void ClearCoreReplay(CoreReplay& replay);
+void SeedCoreReplay(CoreReplay& replay, std::uint64_t passKey);
+bool CoreReplayShape(const CoreReplay& replay, std::uint64_t& passKey);
 std::array<std::uint64_t, 9> CoreReplayCounted();
 std::array<std::uint64_t, 12> CoreReplayLeanRefusals();
 

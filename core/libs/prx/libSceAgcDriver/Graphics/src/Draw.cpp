@@ -6702,6 +6702,17 @@ void ClearCoreReplay(CoreReplay& replay) {
     replay.Reset();
 }
 
+void SeedCoreReplay(CoreReplay& replay, std::uint64_t passKey) {
+    replay.Reset();
+    replay.lean = true;
+    replay.passKey = passKey;
+}
+
+bool CoreReplayShape(const CoreReplay& replay, std::uint64_t& passKey) {
+    passKey = replay.passKey;
+    return replay.lean;
+}
+
 bool CoreReplayRecaptured(const CoreReplay& replay) {
     return replay.recaptured;
 }
