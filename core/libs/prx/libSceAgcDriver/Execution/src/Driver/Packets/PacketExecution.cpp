@@ -2,6 +2,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Core/include/CoarseClock.hpp"
 #include "prx/libSceAgcDriver/Core/include/DecodeLane.hpp"
+#include "prx/libSceAgcDriver/Core/include/Decoder.hpp"
+#include "prx/libSceAgcDriver/Core/include/DecoderRing.hpp"
 #include "prx/libSceAgcDriver/Core/include/DecoderShadow.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
@@ -157,6 +159,49 @@ bool lanePacket(const Submission& submission, std::size_t cursor, std::uint32_t 
         }
     }
     return true;
+}
+
+struct DecoderSeat {
+    void* target = nullptr;
+    std::uint64_t (*call)(void* target, const Core::DecodedOp& op) = nullptr;
+    Core::DecoderRing ring;
+    Core::Decoder decoder;
+    std::atomic<std::uint64_t> runs{0}, draws{0}, packets{0}, batches{0}, runNs{0}, enqueueNs{0};
+
+    DecoderSeat() : ring(Core::DecoderRing::Settings{1024, 8, false, 0}), decoder(Core::Decoder::Settings{512}, Core::DecoderHost{this, &DecoderSeat::draw, &DecoderSeat::heavy, &DecoderSeat::retired, &DecoderSeat::await}) {}
+
+    static std::uint64_t draw(void* context, const Core::DecodedOp& op) {
+        auto& seat = *static_cast<DecoderSeat*>(context);
+        return seat.call(seat.target, op);
+    }
+    static Core::DecoderHeavy heavy(void*, std::size_t cursor, std::span<const std::uint32_t>, QueueState&) { return {cursor, 0, true}; }
+    static std::uint64_t retired(void* context) { return static_cast<DecoderSeat*>(context)->ring.Retired(); }
+    static void await(void* context, std::uint64_t count) { static_cast<DecoderSeat*>(context)->ring.AwaitRetired(count); }
+};
+
+DecoderSeat& decoderSeat() {
+    static DecoderSeat seat;
+    return seat;
+}
+
+bool decoderEnabled() {
+    static const bool enabled = std::getenv("APS5_DECODER") != nullptr && DrawPipeline::OpsAtExit() && DrawFinisher::Overlap();
+    return enabled;
+}
+
+constexpr std::uint32_t DecoderBatchDraws = 12;
+
+void decoderReport() {
+    static std::atomic<std::int64_t> lastReport{0};
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (nowMs - last < 5000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
+    auto& seat = decoderSeat();
+    const auto value = [](const std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.load(std::memory_order_relaxed)); };
+    const auto decoded = seat.decoder.Counted();
+    const auto ring = seat.ring.Counted();
+    const auto draws = seat.draws.load(std::memory_order_relaxed);
+    std::fprintf(stderr, "[decoder] run (cumulative): %llu runs, %llu packets decoded, %llu draws posted in %llu batches; %.2f us per draw in the runs, %.2f us of them handing batches to the draw finisher; snapshots: shader %llu, context %llu, user configuration %llu; %llu waits for a snapshot, %llu for room in the ring%c", value(seat.runs), value(seat.packets), value(seat.draws), value(seat.batches), draws != 0 ? static_cast<double>(seat.runNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(draws) : 0.0, draws != 0 ? static_cast<double>(seat.enqueueNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(draws) : 0.0, static_cast<unsigned long long>(decoded.shaderSnapshots), static_cast<unsigned long long>(decoded.contextSnapshots), static_cast<unsigned long long>(decoded.userConfigSnapshots), static_cast<unsigned long long>(decoded.snapshotWaits), static_cast<unsigned long long>(ring.roomWaits), 10);
 }
 
 void laneReport() {
@@ -409,22 +454,133 @@ void Driver::execute(Submission& submission) {
         cursor = at;
         return true;
     };
+    static const bool decoderOn = decoderEnabled();
+    std::shared_ptr<Submission> decoderCopy;
+    const auto decoderRun = [&](std::size_t& cursor, std::size_t end) {
+        std::size_t at = cursor;
+        while (at < end && Pm4::FillerPacket(submission.commands[at])) ++at;
+        if (at >= end || !lanePacket(submission, at, submission.commands[at], (submission.commands[at] >> 8u) & 0xffu)) return false;
+        if (const auto flip = submission.flips.lower_bound(at); flip != submission.flips.end()) end = std::min(end, flip->first);
+        if (at >= end) return false;
+        auto& seat = decoderSeat();
+        const auto started = std::chrono::steady_clock::now();
+        std::uint64_t enqueueNs = 0;
+        std::uint32_t pending = 0;
+        std::uint64_t posted = 0;
+        const auto closeBatch = [&] {
+            if (pending == 0) return;
+            const auto batch = seat.ring.TryClaim(pending);
+            if (batch.count != pending) throw std::logic_error("APS5_DECODER: the draws posted for a batch are not the ones the ring hands back");
+            pending = 0;
+            if (decoderCopy == nullptr) {
+                decoderCopy = std::make_shared<Submission>();
+                decoderCopy->serial = submission.serial;
+                decoderCopy->queue = submission.queue;
+                decoderCopy->shaders = submission.shaders;
+                decoderCopy->commands = submission.commands;
+            }
+            const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+            const auto from = std::chrono::steady_clock::now();
+            DrawFinisher::Get().Enqueue([this, batch, epoch, copy = decoderCopy] {
+                auto& ringSeat = decoderSeat();
+                struct Done {
+                    DecoderSeat& seat;
+                    Core::DecoderRing::Batch batch;
+                    ~Done() { seat.ring.Complete(batch, nullptr, nullptr); }
+                } done{ringSeat, batch};
+                struct PipelineScope {
+                    bool previous;
+                    PipelineScope() : previous(std::exchange(DrawPipeline::Active(), true)) {}
+                    ~PipelineScope() { DrawPipeline::Active() = previous; }
+                } pipelineScope;
+                thread_local Core::DecodedView* viewSlot = nullptr;
+                auto& view = ShaderRecompiler::ThreadOwned(viewSlot);
+                DrawPipeline::FollowEpoch(epoch);
+                for (std::uint32_t index = 0; index < batch.count; ++index) {
+                    const auto& op = ringSeat.ring.At(batch.first + index);
+                    Core::ApplyDecoded(op.state, view);
+                    if (index == 0) view.queue.runMask.bits |= Core::RunMask::State | Core::RunMask::Other;
+                    GuestMemory::SetCurrentPacket(op.opcode, copy->queue);
+                    const auto words = std::span<const std::uint32_t>(copy->commands).subspan(op.offset, op.words);
+                    try {
+                        std::string rejected;
+                        if (draw(view.queue, words, *copy, op.offset, rejected) == DrawVerdict::Rejected) throw std::runtime_error(rejected);
+                    } catch (const RefusedDraw& refused) {
+                        ReportRefusedDraw(refused);
+                    }
+                }
+            }, DrawFinisher::Pending{});
+            enqueueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
+            laneBump(seat.batches);
+        };
+        const auto postDraw = [&](const Core::DecodedOp& op) -> std::uint64_t {
+            if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(op.offset + 1) << 8u) | op.opcode, std::memory_order_relaxed);
+            recent.Record(op.offset);
+            GuestMemory::SetCurrentPacket(op.opcode, submission.queue);
+            landPendingWaits(submission.queue);
+            packetCounters.CountDraw();
+            drawnSinceSeal() = true;
+            Graphics::Recorder::CountRecordedWork();
+            const auto order = seat.ring.Post(op);
+            ++pending;
+            ++posted;
+            if (pending == DecoderBatchDraws) closeBatch();
+            return order;
+        };
+        const auto before = seat.decoder.Counted().packets;
+        Core::Decoder::Result result;
+        {
+            std::shared_lock deviceUse(deviceReplacement);
+            GuestMemory::SetCurrentPacket((submission.commands[at] >> 8u) & 0xffu, submission.queue);
+            flushBetweenPackets(submission.queue, submission.commands[at], false);
+            Pm4::RefreshDigests(queue);
+            seat.decoder.Touch(Core::DecoderEvery);
+            seat.target = const_cast<void*>(static_cast<const void*>(&postDraw));
+            seat.call = [](void* target, const Core::DecodedOp& op) { return (*static_cast<decltype(postDraw)*>(target))(op); };
+            Core::Decoder::Input input;
+            input.commands = submission.commands;
+            input.cursor = at;
+            input.limit = end;
+            input.lists = &submission.registerLists;
+            input.submission = submission.serial;
+            struct Progress {
+                Driver& driver;
+                ~Progress() { --driver.packetsInFlight; }
+            } progress{*this};
+            ++packetsInFlight;
+            result = seat.decoder.Decode(queue, input);
+            closeBatch();
+        }
+        const auto done = seat.decoder.Counted().packets - before;
+        packetsDone += done;
+        laneBump(seat.runs);
+        laneBump(seat.packets, done);
+        laneBump(seat.draws, posted);
+        laneBump(seat.enqueueNs, enqueueNs);
+        laneBump(seat.runNs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));
+        if ((seat.runs.load(std::memory_order_relaxed) & 0xffu) == 0) decoderReport();
+        if (result.cursor == at) return false;
+        cursor = result.cursor;
+        return true;
+    };
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
         while (nextSegment < submission.indirectSegments.size() && submission.indirectSegments[nextSegment].start <= cursor) {
             if (submission.indirectSegments[nextSegment].start == cursor && refreshIndirectSegment(submission, nextSegment)) {
                 recent.commands = submission.commands;
+                decoderCopy.reset();
                 continue;
             }
             ++nextSegment;
         }
         if (cursor >= submission.commands.size()) break;
         const bool laneNow = laneOpen && queue.predication.operation == 0 && deferredLabels().labels.empty();
-        if (laneNow && lightLane) {
+        if (laneNow && (lightLane || decoderOn)) {
+            const bool decodes = decoderOn && submission.queue == 0 && decoderShadow == nullptr;
             const auto limit = nextSegment < submission.indirectSegments.size() ? std::min<std::size_t>(submission.indirectSegments[nextSegment].start, submission.commands.size()) : submission.commands.size();
-            const auto run = Core::ScanLane(submission.commands, cursor, limit, 64);
-            if (run.packets != 0 && lightRun(cursor, run.end)) continue;
+            const auto run = Core::ScanLane(submission.commands, cursor, limit, decodes ? 4096 : 64);
+            if (run.packets != 0 && (decodes ? decoderRun(cursor, run.end) : lightLane && lightRun(cursor, run.end))) continue;
         }
         const auto header = submission.commands[cursor];
         if (Pm4::FillerPacket(header)) { ++cursor; continue; }
