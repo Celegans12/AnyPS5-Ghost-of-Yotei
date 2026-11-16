@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
@@ -26,13 +27,17 @@
 #include "Optimization/SrtWalker/SrtTape.hpp"
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <functional>
+#include <map>
 #include <mutex>
 #include <stdexcept>
+#include <unordered_map>
 
 namespace AgcDriver::Core {
 
@@ -45,7 +50,7 @@ constexpr std::uint32_t NoBinding = 0xffffffffu;
 constexpr std::uint64_t EveryProgram = 1;
 
 struct Counters {
-    std::atomic<std::uint64_t> draws{0}, continued{0}, plans{0}, taken{0}, takenContinued{0}, taught{0}, verified{0}, mismatches{0}, digests{0}, committed{0}, restarted{0}, walkNs{0}, frontNs{0}, backNs{0}, retries{0}, flatTaken{0}, flatSame{0}, flatNs{0}, flatBytes{0}, flatTimed{0}, flatVertexKnown{0}, flatZoned{0};
+    std::atomic<std::uint64_t> draws{0}, continued{0}, plans{0}, taken{0}, takenContinued{0}, taught{0}, verified{0}, mismatches{0}, digests{0}, committed{0}, restarted{0}, walkNs{0}, frontNs{0}, backNs{0}, retries{0}, flatTaken{0}, flatSame{0}, flatNs{0}, flatBytes{0}, flatTimed{0}, flatVertexKnown{0}, flatZoned{0}, filtered{0}, released{0};
     std::array<std::atomic<std::uint64_t>, 8> sections{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrontLeft::Count)> left{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TeachRefusal::Count)> refused{};
@@ -89,6 +94,69 @@ void mix(std::array<std::uint64_t, 2>& digest, std::uint64_t value) {
     digest[0] ^= digest[0] >> 29u;
     digest[1] = (digest[1] ^ (value + 0x7f4a7c159e3779b9ull)) * 0xc2b2ae3d27d4eb4full;
     digest[1] ^= digest[1] >> 31u;
+}
+
+bool teachBounds() {
+    static const bool bounded = std::getenv("APS5_NO_CORE_TEACH_BOUNDS") == nullptr;
+    return bounded;
+}
+
+std::uint64_t pairOf(std::span<const DriverDetail::DrawProgram> programs, std::span<const Graphics::CompiledShader> stages) {
+    if (programs.empty() || programs.size() != stages.size()) return 0;
+    std::array<std::uint64_t, 2> digest{0x6a09e667f3bcc908ull, 0xbb67ae8584caa73bull};
+    for (std::size_t index = 0; index < programs.size(); ++index) {
+        if (stages[index].program == nullptr) return 0;
+        mix(digest, programs[index].binary.codeAddress);
+        mix(digest, reinterpret_cast<std::uintptr_t>(programs[index].snapshot.get()));
+        mix(digest, programs[index].codeOffset);
+        mix(digest, stages[index].program->variantId);
+        mix(digest, static_cast<std::uint64_t>(stages[index].stage));
+    }
+    const auto hash = digest[0] ^ std::rotl(digest[1], 31);
+    return hash == 0 ? 1 : hash;
+}
+
+struct PlanRefusals {
+    std::mutex mutex;
+    std::map<std::pair<std::uint64_t, std::uint32_t>, std::uint64_t> counts;
+    std::uint64_t total = 0;
+};
+
+void notePlanRefusal(std::uint64_t program, std::uint32_t stage, std::uint32_t reason) {
+    static const bool enabled = std::getenv("APS5_CORE_PLAN_DIAG") != nullptr;
+    if (!enabled) return;
+    static PlanRefusals held;
+    const std::lock_guard lock(held.mutex);
+    ++held.counts[{program, stage * 4u + reason}];
+    ++held.total;
+    if (held.total % 100000u != 0 && held.total != 1000u && held.total != 10000u) return;
+    std::vector<std::pair<std::uint64_t, std::pair<std::uint64_t, std::uint32_t>>> top;
+    for (const auto& [key, count] : held.counts) top.emplace_back(count, key);
+    std::sort(top.begin(), top.end(), std::greater<>());
+    static constexpr std::array<const char*, 4> names{"no variant", "variant without a plan", "incomplete plan", "uncacheable capture"};
+    std::string text = "[core-plan] (cumulative) " + std::to_string(held.total) + " draws refused for plan, " + std::to_string(held.counts.size()) + " program and reason pairs;";
+    for (std::size_t index = 0; index < top.size() && index < 10; ++index) {
+        char item[128];
+        std::snprintf(item, sizeof(item), " 0x%llx stage %u %s %llu;", static_cast<unsigned long long>(top[index].second.first), top[index].second.second / 4u, names[top[index].second.second % 4u], static_cast<unsigned long long>(top[index].first));
+        text += item;
+    }
+    std::fprintf(stderr, "%s%c", text.c_str(), 10);
+}
+
+struct KeyDiagState {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::vector<std::pair<std::uint32_t, std::uint32_t>>> last;
+    std::map<std::uint32_t, std::uint64_t> differed;
+    std::uint64_t compared = 0;
+    std::uint64_t first = 0;
+    std::uint64_t equal = 0;
+    std::uint64_t registers = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+std::atomic<std::uint64_t>& variantSerial() {
+    static std::atomic<std::uint64_t> held{0};
+    return held;
 }
 
 void mixWalk(std::array<std::uint64_t, 2>& digest, const PlanStage& stage, const StageWalk& walk) {
@@ -255,7 +323,7 @@ std::uint32_t flatWords(const RunPlanData& data, const FrontVariant& variant) {
 }
 
 struct VertexMemo {
-    const FrontVariant* variant = nullptr;
+    std::uint64_t variant = 0;
     std::uint32_t stage = 0;
     std::vector<std::uint32_t> userData;
     std::vector<Graphics::DecodeRead> reads;
@@ -297,7 +365,7 @@ const char* FrontLeftName(FrontLeft reason) {
 }
 
 const char* TeachRefusalName(TeachRefusal reason) {
-    static constexpr std::array<const char*, static_cast<std::size_t>(TeachRefusal::Count)> names{"none", "path", "program", "stage", "plan", "tape", "walk", "words", "buffers", "forwarded", "vertex", "writes", "plan differs", "driver zone"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(TeachRefusal::Count)> names{"none", "path", "program", "stage", "plan", "tape", "walk", "words", "buffers", "forwarded", "vertex", "writes", "plan differs", "driver zone", "remembered"};
     return names[static_cast<std::size_t>(reason)];
 }
 
@@ -314,9 +382,45 @@ struct Front::State {
     std::vector<std::uint64_t> teaching;
     std::uint64_t walked = 0;
     FlatState flat;
+    TeachFilter filter;
+    RefusalMemory refusals;
+    std::vector<std::shared_ptr<FrontVariant>> leaving;
+    std::vector<std::shared_ptr<void>> trash;
+
+    bool Wanted(std::uint64_t asked, std::uint64_t salt) {
+        if (teachBounds()) {
+            if (filter.Ask(asked ^ salt, walked)) return true;
+            add(counters().filtered);
+            return false;
+        }
+        if (std::find(teaching.begin(), teaching.end(), asked) != teaching.end()) return false;
+        teaching.push_back(asked);
+        return true;
+    }
+
+    void Forgotten() {
+        if (!teachBounds()) return;
+        filter.Clear();
+        refusals.Clear();
+    }
+
+    void Sweep(std::vector<std::shared_ptr<void>>& gone) {
+        std::vector<std::shared_ptr<FrontVariant>> staying;
+        for (auto& variant : leaving) {
+            if (variant->pending.load(std::memory_order_acquire) == 0) gone.push_back(std::move(variant));
+            else staying.push_back(std::move(variant));
+        }
+        leaving.swap(staying);
+        add(counters().released, gone.size());
+        auto plansGone = plans.Collect();
+        if (!plansGone.empty()) gone.push_back(std::make_shared<std::vector<std::unique_ptr<RunPlan>>>(std::move(plansGone)));
+    }
 
     void Arrive() {
         auto& held = counters();
+        const bool bounded = teachBounds();
+        std::vector<std::shared_ptr<void>> gone;
+        if (bounded) Sweep(gone);
         teaching.clear();
         std::vector<std::pair<StateKey, std::shared_ptr<FrontVariant>>> arrived;
         {
@@ -338,25 +442,34 @@ struct Front::State {
                 for (std::uint32_t stage = 0; same && stage < data->stageCount; ++stage) same = data->stages[stage].plan == variant->plan->stages[stage].plan;
                 if (!same) {
                     add(held.refused[static_cast<std::size_t>(TeachRefusal::PlanDiffers)]);
+                    if (bounded) gone.push_back(std::move(variant));
                     continue;
                 }
                 variant->plan = data;
             }
             ImageSetValue value;
             value.owner = variant;
-            variants.Keep(ImageSetKey{variant->plan->id, variant->digest}, Proof{}, value);
+            const auto keep = [&](ImageSetCache& cache, const ImageSetKey& slot) {
+                auto displaced = cache.Keep(slot, Proof{}, value);
+                if (bounded && displaced.owner != nullptr && displaced.owner != value.owner) leaving.push_back(std::static_pointer_cast<FrontVariant>(std::move(displaced.owner)));
+            };
+            keep(variants, ImageSetKey{variant->plan->id, variant->digest});
             add(held.taught);
-            flat.kept.push_back(variant);
+            if (!bounded) flat.kept.push_back(variant);
             const auto& data = *variant->plan;
             if (!variant->zoned) {
                 data.zoned = 2;
             } else {
-                flat.zoned.Keep(ImageSetKey{data.id, variant->zoneDigest}, Proof{}, value);
+                keep(flat.zoned, ImageSetKey{data.id, variant->zoneDigest});
                 if (data.zoned == 0) data.zoned = 1;
             }
+            if (bounded) gone.push_back(std::move(variant));
         }
         flat.plan = nullptr;
         flat.variant = nullptr;
+        if (gone.empty()) return;
+        const std::lock_guard inboxLock(inboxMutex);
+        for (auto& item : gone) trash.push_back(std::move(item));
     }
 };
 
@@ -393,6 +506,8 @@ FrontCounts Front::Counted() {
     counts.flatTimed = load(held.flatTimed);
     counts.flatVertexKnown = load(held.flatVertexKnown);
     counts.flatZoned = load(held.flatZoned);
+    counts.filtered = load(held.filtered);
+    counts.released = load(held.released);
     for (std::size_t index = 0; index < counts.left.size(); ++index) counts.left[index] = load(held.left[index]);
     for (std::size_t index = 0; index < counts.refused.size(); ++index) counts.refused[index] = load(held.refused[index]);
     return counts;
@@ -418,6 +533,11 @@ std::string Front::Report() {
     text += "; not taught:";
     for (std::size_t index = 1; index < counts.refused.size(); ++index) {
         if (counts.refused[index] != 0) text += " " + std::string(TeachRefusalName(static_cast<TeachRefusal>(index))) + " " + std::to_string(counts.refused[index]) + ";";
+    }
+    if (teachBounds()) {
+        char bounds[160];
+        std::snprintf(bounds, sizeof(bounds), " teach bounds: %llu asks held back by the filter, %llu variants and plan sets released;", static_cast<unsigned long long>(counts.filtered), static_cast<unsigned long long>(counts.released));
+        text += bounds;
     }
     if (counts.flatTaken != 0) {
         char flat[256];
@@ -520,14 +640,12 @@ FrontOutcome Front::Walk(const QueueState& queue, const DriverDetail::ShaderRegi
     const bool continued = queue.runMask.Continues();
     add(held.draws);
     if (continued) add(held.continued);
+    std::uint64_t leftSalt = 0;
     const auto left = [&](FrontLeft reason, bool teach) {
         add(held.left[static_cast<std::size_t>(reason)]);
-        if (teach) {
-            const auto asked = outcome.key.Hash();
-            if (std::find(state->teaching.begin(), state->teaching.end(), asked) != state->teaching.end()) teach = false;
-            else state->teaching.push_back(asked);
-        }
+        if (teach) teach = state->Wanted(outcome.key.Hash(), leftSalt);
         outcome.teach = teach;
+        outcome.left = reason;
         outcome.candidate = nullptr;
         return outcome;
     };
@@ -539,6 +657,7 @@ FrontOutcome Front::Walk(const QueueState& queue, const DriverDetail::ShaderRegi
     const auto data = std::static_pointer_cast<const RunPlanData>(plan->resources);
     if (!DriverDetail::DecodeProgramsCurrent(*data->decode, shaders)) {
         state->plans.Forget(EveryProgram);
+        state->Forgotten();
         return left(FrontLeft::Programs, true);
     }
     add(held.plans);
@@ -593,6 +712,7 @@ FrontOutcome Front::Walk(const QueueState& queue, const DriverDetail::ShaderRegi
     }
     add(held.walkNs, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - walkStarted).count()));
     lap(2);
+    leftSalt = digest[0] ^ std::rotl(digest[1], 23);
     ImageSetValue found;
     if (state->variants.Find(ImageSetKey{data->id, digest}, Proof{}, found) != Hit::Fresh) { leftReason = FrontLeft::NoVariant; leftTeach = true; return 1; }
     variant = std::static_pointer_cast<FrontVariant>(found.owner);
@@ -674,14 +794,12 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
     const bool continued = queue.runMask.Continues();
     bump(held.draws);
     if (continued) bump(held.continued);
+    std::uint64_t leftSalt = 0;
     const auto left = [&](FrontLeft reason, bool teach) {
         bump(held.left[static_cast<std::size_t>(reason)]);
-        if (teach) {
-            const auto asked = outcome.key.Hash();
-            if (std::find(state->teaching.begin(), state->teaching.end(), asked) != state->teaching.end()) teach = false;
-            else state->teaching.push_back(asked);
-        }
+        if (teach) teach = state->Wanted(outcome.key.Hash(), leftSalt);
         outcome.teach = teach;
+        outcome.left = reason;
         outcome.candidate = nullptr;
         return outcome;
     };
@@ -705,12 +823,18 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
     const auto& data = *flat.plan;
     if (!DriverDetail::DecodeProgramsCurrent(*data.decode, *inputs.shaders)) {
         state->plans.Forget(EveryProgram);
+        state->Forgotten();
         flat.plan = nullptr;
         flat.variant = nullptr;
         return left(FrontLeft::Programs, true);
     }
     if (!parameters.indexed && (parameters.indexCount == 0 || parameters.instanceCount == 0)) return left(FrontLeft::Nothing, false);
-    if (data.precheck == 0) data.precheck = inputs.plain(inputs.context, queue, parameters) ? 1 : 2;
+    if (data.precheck == 0) {
+        data.precheck = inputs.plain(inputs.context, queue, parameters) ? 1 : 2;
+    } else if (inputs.verifyOnly && (inputs.plain(inputs.context, queue, parameters) ? 1 : 2) != data.precheck) {
+        add(held.mismatches);
+        throw std::runtime_error("APS5_VERIFY_CORE_RUN: the precheck of a draw differs from the precheck kept by the plan of its state key");
+    }
     if (data.precheck == 2) return left(FrontLeft::Precheck, false);
     bump(held.plans);
     const auto& programs = data.decode->programs;
@@ -769,6 +893,7 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
                 mixWalk(digest, data.stages[stage], walk);
             }
         }
+        leftSalt = digest[0] ^ std::rotl(digest[1], 23);
         same = flat.variant != nullptr && digest == flat.digest;
         if (same) {
             variant = flat.variant.get();
@@ -802,7 +927,7 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
             auto& fresh = flat.vertex[stage];
             auto& memo = flat.vertexMemo[((reinterpret_cast<std::uintptr_t>(variant) >> 6u) ^ stage) % flat.vertexMemo.size()];
             const std::vector<Graphics::DecodeRead>* vertexReads = &flat.decodeReads;
-            bool known = memo.variant == variant && memo.stage == stage && memo.userData.size() == userData[stage].size() && std::equal(memo.userData.begin(), memo.userData.end(), userData[stage].begin());
+            bool known = memo.variant == variant->serial && memo.stage == stage && memo.userData.size() == userData[stage].size() && std::equal(memo.userData.begin(), memo.userData.end(), userData[stage].begin());
             for (std::size_t index = 0; known && index < memo.reads.size(); ++index) {
                 const auto& read = memo.reads[index];
                 std::array<std::byte, 16> now{};
@@ -813,14 +938,14 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
                 vertexReads = &memo.reads;
                 bump(held.flatVertexKnown);
             } else {
-                memo.variant = nullptr;
+                memo.variant = 0;
                 if (!decodeVertex(programs[stage], userData[stage], *taught.vertexInfo, flat.decodeReads, fresh)) return left(FrontLeft::Vertex, false);
                 if (flat.decodeReads.empty() || !DriverDetail::Driver::CoreVertexInputsMatch(*taught.vertexInfo, fresh)) return left(FrontLeft::Vertex, false);
                 memo.stage = stage;
                 memo.userData.assign(userData[stage].begin(), userData[stage].end());
                 memo.reads = flat.decodeReads;
                 memo.fresh = fresh;
-                memo.variant = variant;
+                memo.variant = variant->serial;
             }
             for (const auto& attribute : taught.base->vertexAttributes) {
                 if (attribute.location >= fresh.resourcesNum) return left(FrontLeft::Vertex, false);
@@ -931,6 +1056,7 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
         }
     }
     op.draw.variant = variant;
+    variant->pending.fetch_add(1, std::memory_order_relaxed);
     op.draw.slice = slice;
     op.draw.indexAddress = parameters.indexAddress;
     op.draw.indexBytes = parameters.indexSize;
@@ -987,6 +1113,7 @@ FlatDraw Front::FlatRead(const std::byte* at) {
 
 void Front::FlatEmitted(const FlatDraw& draw) {
     state->flat.ring.Emitted(draw.op.draw.slice, 0);
+    draw.variant->pending.fetch_sub(1, std::memory_order_release);
 }
 
 void Front::FlatPatch(const FlatDraw& draw, std::size_t stage, ShaderRecompiler::RecompileResult& out) {
@@ -1047,22 +1174,97 @@ void Front::NoteVerified(bool mismatch) {
     if (mismatch) add(counters().mismatches);
 }
 
+bool Front::TeachBounds() {
+    return teachBounds();
+}
+
+bool Front::KeyDiagEnabled() {
+    static const bool enabled = std::getenv("APS5_CORE_KEY_DIAG") != nullptr;
+    return enabled;
+}
+
+void Front::KeyDiag(const QueueState& queue, std::uint64_t shape, bool noPlan) {
+    static KeyDiagState held;
+    std::vector<std::pair<std::uint32_t, std::uint32_t>> now;
+    const auto take = [&](const Registers& bank, Bank kind) {
+        bank.ForEach([&](std::uint32_t offset, std::uint32_t value) {
+            if (KeyRegister(kind, offset)) now.emplace_back((static_cast<std::uint32_t>(kind) << 24u) | offset, value);
+        });
+    };
+    take(queue.shader, Bank::Shader);
+    take(queue.context, Bank::Context);
+    take(queue.userConfig, Bank::UserConfig);
+    const std::lock_guard lock(held.mutex);
+    if (held.last.size() >= 65536 && !held.last.contains(shape)) held.last.clear();
+    const auto [at, inserted] = held.last.try_emplace(shape);
+    if (noPlan && inserted) ++held.first;
+    if (noPlan && !inserted) {
+        ++held.compared;
+        const auto& was = at->second;
+        std::size_t a = 0, b = 0;
+        std::uint64_t differing = 0;
+        while (a < was.size() || b < now.size()) {
+            std::uint32_t which = 0;
+            if (b == now.size() || (a < was.size() && was[a].first < now[b].first)) which = was[a++].first;
+            else if (a == was.size() || now[b].first < was[a].first) which = now[b++].first;
+            else {
+                const bool equal = was[a].second == now[b].second;
+                which = was[a].first;
+                ++a;
+                ++b;
+                if (equal) continue;
+            }
+            ++held.differed[which];
+            ++differing;
+        }
+        held.registers += differing;
+        if (differing == 0) ++held.equal;
+    }
+    at->second = std::move(now);
+    const auto current = std::chrono::steady_clock::now();
+    if (current - held.reported < std::chrono::seconds(10)) return;
+    held.reported = current;
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> top;
+    for (const auto& [which, count] : held.differed) top.emplace_back(count, which);
+    std::sort(top.begin(), top.end(), std::greater<>());
+    char head[320];
+    std::snprintf(head, sizeof(head), "[core-key] (cumulative) %llu draws without a plan compared with the draw before of their shape (%llu more were the first of their shape, %llu had equal key registers, %.2f registers differing per draw, %zu shapes); registers that differed:", static_cast<unsigned long long>(held.compared), static_cast<unsigned long long>(held.first), static_cast<unsigned long long>(held.equal), held.compared != 0 ? static_cast<double>(held.registers) / static_cast<double>(held.compared) : 0.0, held.last.size());
+    std::string text = head;
+    static constexpr std::array<const char*, 3> names{"shader", "context", "user-config"};
+    for (std::size_t index = 0; index < top.size() && index < 16; ++index) {
+        char item[96];
+        std::snprintf(item, sizeof(item), " %s 0x%x %llu (%.1f%%);", names[(top[index].second >> 24u) % names.size()], top[index].second & 0xffffffu, static_cast<unsigned long long>(top[index].first), held.compared != 0 ? 100.0 * static_cast<double>(top[index].first) / static_cast<double>(held.compared) : 0.0);
+        text += item;
+    }
+    std::fprintf(stderr, "%s%c", text.c_str(), 10);
+}
+
+bool Front::Refused(std::span<const DriverDetail::DrawProgram> programs, std::span<const Graphics::CompiledShader> stages) const {
+    const auto pair = pairOf(programs, stages);
+    if (pair == 0 || !state->refusals.Holds(pair)) return false;
+    add(counters().refused[static_cast<std::size_t>(TeachRefusal::Known)]);
+    return true;
+}
+
 void Front::Teach(const TeachInputs& inputs) {
     auto& held = counters();
-    const auto refuse = [&](TeachRefusal reason) { add(held.refused[static_cast<std::size_t>(reason)]); };
+    const bool bounded = teachBounds();
+    std::vector<std::shared_ptr<void>> gone;
+    if (bounded) {
+        const std::lock_guard lock(state->inboxMutex);
+        gone.swap(state->trash);
+    }
+    std::uint64_t pair = 0;
+    const auto refuse = [&](TeachRefusal reason, bool lasting = true) {
+        add(held.refused[static_cast<std::size_t>(reason)]);
+        if (bounded && lasting && pair != 0 && (reason == TeachRefusal::Program || reason == TeachRefusal::Stage || reason == TeachRefusal::Plan || reason == TeachRefusal::Tape || reason == TeachRefusal::Writes)) state->refusals.Keep(pair);
+    };
     using Stage = ShaderRecompiler::ShaderStage;
     const auto count = inputs.stages.size();
     if (inputs.recipe == nullptr || inputs.decode == nullptr || count == 0 || count > 4 || count != inputs.programs.size() || count != inputs.served.size()) return refuse(TeachRefusal::Path);
-    auto data = std::make_shared<RunPlanData>();
-    data->decode = inputs.decode;
-    data->stageCount = static_cast<std::uint32_t>(count);
-    auto variant = std::make_shared<FrontVariant>();
-    variant->recipe = inputs.recipe;
-    variant->writes = inputs.writes;
-    variant->shape = inputs.shape;
-    variant->digest = {0x6a09e667f3bcc908ull, 0xbb67ae8584caa73bull};
-    std::vector<Range> ranges;
-    std::vector<Graphics::DecodeRead> decodeReads;
+    pair = pairOf(inputs.programs, inputs.stages);
+    std::array<std::shared_ptr<const ShaderRecompiler::IrResourcePlan>, 4> plans;
+    std::array<const ShaderRecompiler::Detail::SrtTape*, 4> tapes{};
     for (std::size_t index = 0; index < count; ++index) {
         const auto& program = inputs.programs[index];
         const auto& shader = inputs.stages[index];
@@ -1077,17 +1279,37 @@ void Front::Teach(const TeachInputs& inputs) {
         }
         if (!result.imageTableRanges.empty()) return refuse(TeachRefusal::Stage);
         const auto& served = inputs.served[index];
-        const auto plan = served == nullptr ? nullptr : served->plan != nullptr ? served->plan : served->donor != nullptr ? served->donor->plan : nullptr;
-        if (plan == nullptr || !plan->srtPlanComplete) return refuse(TeachRefusal::Plan);
+        std::shared_ptr<const ShaderRecompiler::IrResourcePlan> plan;
+        if (served != nullptr) plan = served->plan != nullptr ? served->plan : served->donor != nullptr ? served->donor->plan : nullptr;
+        if (plan == nullptr && index < inputs.plans.size()) plan = inputs.plans[index];
+        if (plan == nullptr || !plan->srtPlanComplete) {
+            const bool uncacheable = ((inputs.uncacheable >> index) & 1u) != 0u;
+            notePlanRefusal(program.binary.codeAddress, static_cast<std::uint32_t>(shader.stage), uncacheable ? 3u : served == nullptr ? 0u : plan == nullptr ? 1u : 2u);
+            return refuse(TeachRefusal::Plan, served != nullptr || uncacheable);
+        }
+        tapes[index] = ShaderRecompiler::Detail::SrtTape::For(*plan);
+        if (tapes[index] == nullptr) return refuse(TeachRefusal::Tape);
+        plans[index] = std::move(plan);
+    }
+    auto data = std::make_shared<RunPlanData>();
+    data->decode = inputs.decode;
+    data->stageCount = static_cast<std::uint32_t>(count);
+    auto variant = std::make_shared<FrontVariant>();
+    variant->serial = variantSerial().fetch_add(1, std::memory_order_relaxed) + 1;
+    variant->digest = {0x6a09e667f3bcc908ull, 0xbb67ae8584caa73bull};
+    std::vector<Range> ranges;
+    std::vector<Graphics::DecodeRead> decodeReads;
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto& program = inputs.programs[index];
+        const auto& shader = inputs.stages[index];
+        const auto& result = *shader.program;
+        const auto& plan = plans[index];
         auto& planStage = data->stages[index];
         planStage.plan = plan;
-        planStage.tape = ShaderRecompiler::Detail::SrtTape::For(*plan);
-        if (planStage.tape == nullptr) return refuse(TeachRefusal::Tape);
+        planStage.tape = tapes[index];
         planStage.userWords = static_cast<std::uint32_t>(program.userData.size());
         auto& taught = variant->stages[index];
-        taught.base = std::make_shared<ShaderRecompiler::RecompileResult>(result);
         taught.pushOffset = shader.pushConstantOffset;
-        if (shader.registeredImageViews != nullptr) taught.registeredViews = std::make_shared<const std::vector<ShaderRecompiler::RegisteredImageView>>(*shader.registeredImageViews);
         taught.flatBinding = bindingOf(result, Role::FlattenedSrt);
         taught.buffersBinding = bindingOf(result, Role::GuestBuffers);
         if (!walkStage(planStage, program.userData, program.binary.codeAddress, ranges, taught.taught)) return refuse(TeachRefusal::Walk);
@@ -1135,9 +1357,11 @@ void Front::Teach(const TeachInputs& inputs) {
             if (pushed != program.userData[forwarded[slot]]) return refuse(TeachRefusal::Forwarded);
         }
         if (!result.vertexAttributes.empty()) {
-            if (served->vertexInfo == nullptr) return refuse(TeachRefusal::Vertex);
+            const auto& served = inputs.served[index];
+            const ShaderRecompiler::ShaderVertexStageInfo* was = served != nullptr && served->vertexInfo != nullptr ? served->vertexInfo.get() : index < inputs.vertexInfos.size() && inputs.vertexInfos[index] ? &*inputs.vertexInfos[index] : nullptr;
+            if (was == nullptr) return refuse(TeachRefusal::Vertex);
             ShaderRecompiler::ShaderVertexStageInfo fresh{};
-            if (!decodeVertex(program, program.userData, *served->vertexInfo, decodeReads, fresh) || decodeReads.empty()) return refuse(TeachRefusal::Vertex);
+            if (!decodeVertex(program, program.userData, *was, decodeReads, fresh) || decodeReads.empty()) return refuse(TeachRefusal::Vertex);
             for (const auto& attribute : result.vertexAttributes) {
                 if (attribute.location >= fresh.resourcesNum || attribute.resource.fields != fresh.resources[attribute.location].fields) return refuse(TeachRefusal::Vertex);
             }
@@ -1146,7 +1370,25 @@ void Front::Teach(const TeachInputs& inputs) {
         }
         taught.variantKey = ShaderRecompiler::BlockVariantKey(layout, walk.flat, program.userData);
         mixWalk(variant->digest, planStage, walk);
-        variant->frontResults[index] = result;
+    }
+    variant->recipe = inputs.recipe;
+    variant->writes = inputs.writes;
+    variant->shape = inputs.shape;
+    const bool fronts = !bounded || !Graphics::CoreFlatDraw();
+    for (std::size_t index = 0; index < count; ++index) {
+        const auto& shader = inputs.stages[index];
+        const auto& result = *shader.program;
+        auto& taught = variant->stages[index];
+        if (bounded) {
+            for (const auto& owner : inputs.owners) {
+                if (owner.get() != shader.program) continue;
+                taught.base = owner;
+                break;
+            }
+        }
+        if (taught.base == nullptr) taught.base = std::make_shared<ShaderRecompiler::RecompileResult>(result);
+        if (shader.registeredImageViews != nullptr) taught.registeredViews = std::make_shared<const std::vector<ShaderRecompiler::RegisteredImageView>>(*shader.registeredImageViews);
+        if (fronts) variant->frontResults[index] = result;
         variant->backResults[index] = result;
     }
     variant->plan = data;
@@ -1231,6 +1473,8 @@ namespace AgcDriver::DriverDetail {
 bool Driver::tryFlatDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, const Pm4::DrawParameters& drawParameters, std::uint64_t deviceSerial, Core::FrontOutcome& outcome) {
     static const bool verify = Graphics::VerifyCoreRun();
     static const bool stats = Graphics::CoreRunStats();
+    static const bool shaped = InstallCoreKeyRegisters();
+    static_cast<void>(shaped);
     auto& front = Core::Front::Get();
     Pm4::RefreshDigests(queue);
     if (verify) front.VerifyDigests(queue);
@@ -1320,6 +1564,8 @@ void Driver::commitFlatDraw(const std::byte* at) {
 bool Driver::tryCoreDraw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, const Pm4::DrawParameters& drawParameters, std::uint64_t deviceSerial, Core::FrontOutcome& outcome) {
     static const bool verify = Graphics::VerifyCoreRun();
     static const bool stats = Graphics::CoreRunStats();
+    static const bool shaped = InstallCoreKeyRegisters();
+    static_cast<void>(shaped);
     auto& front = Core::Front::Get();
     Pm4::RefreshDigests(queue);
     if (verify) front.VerifyDigests(queue);

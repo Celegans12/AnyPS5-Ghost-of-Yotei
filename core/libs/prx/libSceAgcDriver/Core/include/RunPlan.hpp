@@ -9,6 +9,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <vector>
 
 namespace ShaderRecompiler::Detail {
 
@@ -48,7 +49,8 @@ public:
     [[nodiscard]] const RunPlan* Find(const StateKey& key) const;
     const RunPlan* Teach(RunPlan plan);
     void Forget(std::uint64_t program);
-    struct Counts { std::uint64_t finds = 0, hits = 0, taught = 0, evicted = 0, forgotten = 0; };
+    [[nodiscard]] std::vector<std::unique_ptr<RunPlan>> Collect();
+    struct Counts { std::uint64_t finds = 0, hits = 0, taught = 0, evicted = 0, forgotten = 0, collected = 0; };
     [[nodiscard]] Counts Counted() const;
 
 private:

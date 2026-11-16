@@ -76,6 +76,14 @@ void RunPlans::Forget(std::uint64_t program) {
     }
 }
 
+std::vector<std::unique_ptr<RunPlan>> RunPlans::Collect() {
+    State& table = *state;
+    std::vector<std::unique_ptr<RunPlan>> gone;
+    gone.swap(table.retired);
+    table.counts.collected += gone.size();
+    return gone;
+}
+
 RunPlans::Counts RunPlans::Counted() const {
     return state->counts;
 }

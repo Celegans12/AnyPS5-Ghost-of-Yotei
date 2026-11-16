@@ -230,6 +230,37 @@ void testForget() {
     Expect(!held.expired(), "a forgotten plan still holds its pipeline");
 }
 
+void testCollect() {
+    std::weak_ptr<void> evictedHeld;
+    std::weak_ptr<void> forgottenHeld;
+    RunPlans plans(1);
+    Expect(plans.Collect().empty(), "a table that retired nothing collects nothing");
+    {
+        std::shared_ptr<void> pipeline = token(1);
+        evictedHeld = pipeline;
+        static_cast<void>(plans.Teach(runPlan(stateKey(1), std::move(pipeline))));
+    }
+    const RunPlan* current = plans.Teach(runPlan(stateKey(2, {0x7000, 0, 0, 0}), token(2)));
+    if (!Present(current, "the evicting plan is returned")) return;
+    forgottenHeld = current->pipeline;
+    const std::uint64_t firstId = current->id;
+    Expect(!evictedHeld.expired(), "an evicted plan is held until it is collected");
+    {
+        const auto gone = plans.Collect();
+        Expect(gone.size() == 1 && gone.front() != nullptr && gone.front()->key == stateKey(1), "collecting hands over the evicted plan");
+        Expect(!evictedHeld.expired(), "a collected plan lives as long as its collector holds it");
+    }
+    Expect(evictedHeld.expired(), "a collected plan is released by its collector");
+    Expect(plans.Find(stateKey(2, {0x7000, 0, 0, 0})) == current && current->id == firstId, "collecting leaves the plans of the table in place");
+    plans.Forget(0x7000);
+    Expect(!forgottenHeld.expired(), "a forgotten plan is held until it is collected");
+    const std::size_t forgotten = plans.Collect().size();
+    Expect(forgotten == 1 && forgottenHeld.expired(), "collecting releases the forgotten plan");
+    Expect(plans.Collect().empty(), "plans are collected once");
+    const RunPlans::Counts counts = plans.Counted();
+    Expect(counts.collected == 2 && counts.evicted == 1 && counts.forgotten == 1, "collected plans are counted");
+}
+
 void testSlotCounts() {
     RunPlans none(0);
     const RunPlan* kept = none.Teach(runPlan(stateKey(1), token(1)));
@@ -255,6 +286,7 @@ int main() {
     testWholeKey();
     testEvictedStaysValid();
     testForget();
+    testCollect();
     testSlotCounts();
     if (failures != 0) {
         std::fprintf(stderr, "%d run plan checks failed\n", failures);

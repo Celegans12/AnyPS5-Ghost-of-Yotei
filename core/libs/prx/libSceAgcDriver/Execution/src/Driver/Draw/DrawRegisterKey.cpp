@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
+#include "prx/libSceAgcDriver/Core/include/RunKey.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -83,6 +84,26 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
     return exact;
 }
 
+
+bool InstallCoreKeyRegisters() {
+    if (std::getenv("APS5_CORE_KEY_SHAPE") == nullptr) return false;
+    std::array<std::vector<std::uint64_t>, 3> bits;
+    const auto set = [&](Core::Bank bank, std::uint32_t offset) {
+        auto& words = bits[static_cast<std::size_t>(bank)];
+        if (words.size() <= offset / 64u) words.resize(offset / 64u + 1u);
+        words[offset / 64u] |= std::uint64_t{1} << (offset % 64u);
+    };
+    for (const auto& range : Graphics::DrawKeyRegisters) {
+        const auto bank = range.bank == Graphics::RegisterBank::Shader ? Core::Bank::Shader : range.bank == Graphics::RegisterBank::Context ? Core::Bank::Context : Core::Bank::UserConfig;
+        for (auto offset = range.first; offset < range.first + range.count; ++offset) {
+            if (bank == Core::Bank::Shader && Core::RuntimeRegister(offset)) continue;
+            set(bank, offset);
+        }
+    }
+    set(Core::Bank::Context, 0x103u);
+    for (const auto bank : {Core::Bank::Shader, Core::Bank::Context, Core::Bank::UserConfig}) Core::SetKeyRegisters(bank, bits[static_cast<std::size_t>(bank)]);
+    return true;
+}
 
 std::uint64_t DrawShaderSetKey(const QueueState& queue, const ShaderRegistry& registry) {
     std::uint64_t key = 0xcbf29ce484222325ull;

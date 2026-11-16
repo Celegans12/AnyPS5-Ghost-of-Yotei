@@ -146,7 +146,7 @@ void noteRegisterWrite(QueueState& queue, const Registers& bank, Core::Bank kind
     const auto before = had ? bank.at(offset) : 0u;
     if (had && before == value) return;
     queue.runMask.Register(kind, offset);
-    if (Core::UserDataRegister(kind, offset) || (queue.staleDigests & (1u << static_cast<unsigned>(kind))) != 0) return;
+    if ((queue.staleDigests & (1u << static_cast<unsigned>(kind))) != 0 || !Core::KeyRegister(kind, offset)) return;
     Core::DigestWrite(kind == Core::Bank::Shader ? queue.shaderDigest : kind == Core::Bank::Context ? queue.contextDigest : queue.userConfigDigest, offset, had, before, value);
 }
 

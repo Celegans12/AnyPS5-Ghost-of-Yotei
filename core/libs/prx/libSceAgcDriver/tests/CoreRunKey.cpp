@@ -431,9 +431,81 @@ void testStateKeyHash() {
     Expect(lowUsed > 3200 && highUsed > 3200, "4096 keys that differ in small fields spread over a table of 16384 slots");
 }
 
+void testKeyRegisters() {
+    ClearKeyRegisters();
+    bool same = true;
+    for (std::uint32_t offset = 0; offset < 0x400u; ++offset) {
+        same = same && KeyRegister(Bank::Shader, offset) == !UserDataRegister(Bank::Shader, offset);
+        same = same && KeyRegister(Bank::Context, offset) && KeyRegister(Bank::UserConfig, offset);
+    }
+    Expect(same, "without a key set every register but a user word is a key register");
+    Expect(RuntimeRegister(0x00cu) && RuntimeRegister(0x02bu) && !RuntimeRegister(0x02cu) && RuntimeRegister(0x04cu) && RuntimeRegister(0x05bu) && !RuntimeRegister(0x05cu) && RuntimeRegister(0x08cu) && RuntimeRegister(0x10cu) && RuntimeRegister(0x12bu), "the user words of the four stage banks are runtime registers");
+    Expect(RuntimeRegister(0x082u) && RuntimeRegister(0x083u) && RuntimeRegister(0x102u) && RuntimeRegister(0x103u) && !RuntimeRegister(0x084u) && !RuntimeRegister(0x008u) && !RuntimeRegister(0x00bu), "the user pointers are runtime registers and the program addresses are not");
+    const std::array<std::pair<std::uint32_t, std::uint32_t>, 4> registers{{{0x008u, 1u}, {0x040u, 2u}, {0x200u, 3u}, {0x00cu, 4u}}};
+    const BankDigest whole = DigestOf(registers, Bank::Shader);
+    const std::array<std::uint64_t, 2> bits{std::uint64_t{1} << 8u, std::uint64_t{1} << 0u};
+    SetKeyRegisters(Bank::Shader, bits);
+    Expect(KeyRegister(Bank::Shader, 0x008u) && KeyRegister(Bank::Shader, 0x040u) && !KeyRegister(Bank::Shader, 0x200u) && !KeyRegister(Bank::Shader, 0x009u) && !KeyRegister(Bank::Shader, 0x00cu), "a key set names the key registers of its bank");
+    Expect(!KeyRegister(Bank::Context, 0x008u) && !KeyRegister(Bank::UserConfig, 0x040u), "a bank without bits has no key register once a set is installed");
+    const BankDigest shaped = DigestOf(registers, Bank::Shader);
+    const std::array<std::pair<std::uint32_t, std::uint32_t>, 2> kept{{{0x008u, 1u}, {0x040u, 2u}}};
+    std::array<std::pair<std::uint32_t, std::uint32_t>, 4> moved = registers;
+    moved[2].second = 0x99u;
+    moved[3].second = 0x77u;
+    Expect(!(shaped == whole) && shaped == DigestOf(kept, Bank::Shader) && shaped == DigestOf(moved, Bank::Shader), "the digest of a bank covers its key registers only");
+    moved[1].second = 0x55u;
+    Expect(!(shaped == DigestOf(moved, Bank::Shader)), "a key register still changes the digest");
+    ClearKeyRegisters();
+    Expect(DigestOf(registers, Bank::Shader) == whole && KeyRegister(Bank::Context, 0x008u), "clearing the key set restores the whole bank digest");
+}
+
+void testTeachFilter() {
+    TeachFilter filter(16);
+    Expect(!filter.Ask(0x1001u, 0), "a key seen once is not taught");
+    Expect(filter.Ask(0x1001u, 1), "a key seen twice is taught");
+    Expect(!filter.Ask(0x1001u, 2) && !filter.Ask(0x1001u, TeachFilter::Wait), "a key asked is not asked again before its wait");
+    Expect(filter.Ask(0x1001u, 1 + TeachFilter::Wait), "a key is asked again after its wait");
+    Expect(!filter.Ask(0x1001u, 1 + TeachFilter::Wait + 2 * TeachFilter::Wait - 1), "the wait doubles after each ask");
+    Expect(filter.Ask(0x1001u, 1 + TeachFilter::Wait + 2 * TeachFilter::Wait), "the doubled wait ends");
+    Expect(!filter.Ask(0x2001u, 10) && !filter.Ask(0x1001u, 1u << 30u), "a key pushed out of its slot starts over");
+    Expect(filter.Ask(0x1001u, (1u << 30u) + 1u), "a key that starts over is taught at its second sighting");
+    Expect(!filter.Ask(0x1002u, 20) && filter.Ask(0x1002u, 21) && !filter.Ask(0x1001u, (1u << 30u) + 2u), "keys in different slots do not disturb each other");
+    TeachFilter waiting(4);
+    std::uint64_t now = 0;
+    static_cast<void>(waiting.Ask(7, now));
+    std::uint64_t wait = 0;
+    for (std::uint32_t ask = 0; ask < TeachFilter::MostDoublings + 3u; ++ask) {
+        Expect(waiting.Ask(7, now), "a key is asked when its wait ends");
+        wait = TeachFilter::Wait << (ask < TeachFilter::MostDoublings ? ask : TeachFilter::MostDoublings);
+        Expect(!waiting.Ask(7, now + wait - 1), "a key is not asked one draw before the end of its wait");
+        now += wait;
+    }
+    Expect(wait == TeachFilter::Wait << TeachFilter::MostDoublings, "the wait stops doubling");
+    filter.Clear();
+    Expect(!filter.Ask(0x1002u, 22) && filter.Ask(0x1002u, 23), "a cleared filter forgets its keys");
+    TeachFilter zero(0);
+    Expect(!zero.Ask(0, 0) && zero.Ask(0, 1), "a filter asked for no slot keeps one key, the null hash included");
+}
+
+void testRefusalMemory() {
+    RefusalMemory memory(16);
+    Expect(!memory.Holds(0x31u) && !memory.Holds(0), "an empty memory holds nothing");
+    memory.Keep(0x31u);
+    Expect(memory.Holds(0x31u) && !memory.Holds(0x32u) && !memory.Holds(0x41u), "a kept refusal is held and no other");
+    memory.Keep(0x41u);
+    Expect(memory.Holds(0x41u) && !memory.Holds(0x31u), "a refusal pushed out of its slot is forgotten, never mistaken");
+    memory.Keep(0);
+    Expect(memory.Holds(0), "the null hash can be kept");
+    memory.Clear();
+    Expect(!memory.Holds(0x41u) && !memory.Holds(0), "a cleared memory holds nothing");
+}
+
 }
 
 int main() {
+    testKeyRegisters();
+    testTeachFilter();
+    testRefusalMemory();
     testUserDataRegisters();
     testDigestProperties();
     testIncrementalDigest();

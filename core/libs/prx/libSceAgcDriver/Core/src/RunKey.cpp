@@ -1,7 +1,14 @@
 #include "prx/libSceAgcDriver/Core/include/RunKey.hpp"
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <bit>
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <span>
 #include <utility>
+#include <vector>
 
 namespace AgcDriver::Core {
 
@@ -52,6 +59,43 @@ void toggle(BankDigest& digest, std::uint32_t offset, std::uint32_t value) {
     digest.high ^= murmurMix(key);
 }
 
+struct KeySet {
+    std::array<std::vector<std::uint64_t>, 3> bits;
+    bool shaped = false;
+};
+
+KeySet& keySet() {
+    static KeySet held;
+    return held;
+}
+
+std::size_t tableSlots(std::size_t slots) {
+    return std::bit_ceil(std::clamp<std::size_t>(slots, 1, std::size_t{1} << 30u));
+}
+
+}
+
+bool RuntimeRegister(std::uint32_t offset) {
+    return offset - PixelUserData < UserDataWords || offset - 0x04cu < 16u || offset - GeometryUserData < UserDataWords || offset - HullUserData < UserDataWords || offset == 0x082u || offset == 0x083u || offset == 0x102u || offset == 0x103u;
+}
+
+bool KeyRegister(Bank bank, std::uint32_t offset) {
+    const auto& set = keySet();
+    if (!set.shaped) return !UserDataRegister(bank, offset);
+    const auto& bits = set.bits[static_cast<std::size_t>(bank)];
+    return offset / 64u < bits.size() && ((bits[offset / 64u] >> (offset % 64u)) & 1u) != 0u;
+}
+
+void SetKeyRegisters(Bank bank, std::span<const std::uint64_t> bits) {
+    auto& set = keySet();
+    set.bits[static_cast<std::size_t>(bank)].assign(bits.begin(), bits.end());
+    set.shaped = true;
+}
+
+void ClearKeyRegisters() {
+    auto& set = keySet();
+    for (auto& bits : set.bits) bits.clear();
+    set.shaped = false;
 }
 
 bool UserDataRegister(Bank bank, std::uint32_t offset) {
@@ -69,7 +113,7 @@ void DigestWrite(BankDigest& digest, std::uint32_t offset, bool had, std::uint32
 BankDigest DigestOf(std::span<const std::pair<std::uint32_t, std::uint32_t>> registers, Bank bank) {
     BankDigest digest;
     for (const auto& [offset, value] : registers) {
-        if (!UserDataRegister(bank, offset)) toggle(digest, offset, value);
+        if (KeyRegister(bank, offset)) toggle(digest, offset, value);
     }
     return digest;
 }
@@ -118,6 +162,43 @@ std::uint64_t StateKey::Hash() const {
     mix((static_cast<std::uint64_t>(indexType) << 32u) | topology);
     mix(device);
     return hash;
+}
+
+TeachFilter::TeachFilter(std::size_t slots) : entries(tableSlots(slots)) {}
+
+bool TeachFilter::Ask(std::uint64_t hash, std::uint64_t now) {
+    if (hash == 0) hash = 1;
+    Entry& entry = entries[static_cast<std::size_t>(hash) & (entries.size() - 1u)];
+    if (entry.hash != hash) {
+        entry = Entry{hash, 0, 0};
+        return false;
+    }
+    if (now < entry.until) return false;
+    entry.until = now + (Wait << std::min(entry.asks, MostDoublings));
+    ++entry.asks;
+    return true;
+}
+
+void TeachFilter::Clear() {
+    std::fill(entries.begin(), entries.end(), Entry{});
+}
+
+RefusalMemory::RefusalMemory(std::size_t count) : slots(std::make_unique<std::atomic<std::uint64_t>[]>(tableSlots(count))), mask(tableSlots(count) - 1u) {
+    Clear();
+}
+
+bool RefusalMemory::Holds(std::uint64_t hash) const {
+    if (hash == 0) hash = 1;
+    return slots[static_cast<std::size_t>(hash) & mask].load(std::memory_order_relaxed) == hash;
+}
+
+void RefusalMemory::Keep(std::uint64_t hash) {
+    if (hash == 0) hash = 1;
+    slots[static_cast<std::size_t>(hash) & mask].store(hash, std::memory_order_relaxed);
+}
+
+void RefusalMemory::Clear() {
+    for (std::size_t index = 0; index <= mask; ++index) slots[index].store(0, std::memory_order_relaxed);
 }
 
 }

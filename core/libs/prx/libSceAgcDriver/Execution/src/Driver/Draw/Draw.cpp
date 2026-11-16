@@ -653,6 +653,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
         }
         DrawPipeline::NoteDrawKey(drawKey, shapeKey);
+        if (tail.core.left != Core::FrontLeft::Entry && Core::Front::KeyDiagEnabled()) Core::Front::KeyDiag(queue, shapeKey, tail.core.left == Core::FrontLeft::NoPlan);
         if (DrawFinisher::Busy()) {
             bool shapeMatters = false;
             if (DrawFinisher::Overlap() && drawDataHits()) {
@@ -1823,15 +1824,37 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         phaseTiming.Phase(DrawRowVectors);
         if (tail.core.candidate != nullptr) {
             auto& front = Core::Front::Get();
-            const auto difference = front.Compare(*tail.core.candidate, *decode, stages, recipe.get());
+            std::optional<DrawDecode> patchedDecode;
+            if (!tail.userPatches.empty()) {
+                patchedDecode.emplace(*decode);
+                patchedDecode->programs = programs;
+            }
+            const auto difference = front.Compare(*tail.core.candidate, patchedDecode ? *patchedDecode : *decode, stages, recipe.get());
             front.NoteVerified(!difference.empty());
             front.Release(std::move(tail.core.candidate));
             if (!difference.empty()) throw std::runtime_error("APS5_VERIFY_CORE_RUN: a draw the core would take differs from the classic path in " + difference);
         }
-        if (tail.core.teach && recipe != nullptr && !patchedStages && tail.userPatches.empty() && !drawParameters.indirect) {
+        if (tail.core.teach && recipe != nullptr && !patchedStages && tail.userPatches.empty() && !drawParameters.indirect && !(Core::Front::TeachBounds() && Core::Front::Get().Refused(programs, stages))) {
             std::vector<std::shared_ptr<DispatchVariant>> served(programs.size());
             for (std::size_t i = 0; i < programs.size(); ++i) served[i] = drawHit || reused[i] ? matched[i] : fresh[i];
+            std::vector<std::shared_ptr<const ShaderRecompiler::IrResourcePlan>> lentPlans(programs.size());
+            std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> owners;
             Core::TeachInputs inputs;
+            if (Core::Front::TeachBounds()) {
+                for (std::size_t i = 0; i < programs.size(); ++i) {
+                    const auto& capture = stageCaptures[i];
+                    if (served[i] == nullptr && capture.capture != nullptr && capture.compiled != nullptr) {
+                        if (CacheableResult(*capture.compiled)) lentPlans[i] = capture.capture->plan;
+                        else if (i < 32) inputs.uncacheable |= 1u << i;
+                    }
+                    if (matched[i] != nullptr && matched[i]->compiled != nullptr) owners.push_back(matched[i]->compiled);
+                    if (capture.compiled != nullptr) owners.push_back(capture.compiled);
+                }
+                owners.insert(owners.end(), compiledStages.begin(), compiledStages.end());
+                inputs.plans = lentPlans;
+                inputs.vertexInfos = vertexInfos;
+                inputs.owners = owners;
+            }
             inputs.key = tail.core.key;
             inputs.decode = decode;
             inputs.programs = programs;

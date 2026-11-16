@@ -221,6 +221,17 @@ void testImageSetReplacement() {
     Expect(cache.Find(second, proofAt(), value) == Hit::Fresh && value.set == 0x99u && value.lastSerial == 7u, "the replacing image set is fresh");
     cache.Keep(second, proofAt(), {0xaau, nullptr, 8u});
     Expect(cache.Find(second, proofAt(), value) == Hit::Fresh && value.set == 0xaau && value.lastSerial == 8u, "keeping the same image set key again replaces its value");
+    ImageSetCache handing(1);
+    std::shared_ptr<void> held = std::make_shared<int>(3);
+    const std::weak_ptr<void> heldAlive = held;
+    ImageSetValue displaced = handing.Keep(imageSetKey(), proofAt(), {0x11u, std::move(held), 1u});
+    Expect(displaced.owner == nullptr && displaced.set == 0u, "keeping into an empty slot displaces nothing");
+    displaced = handing.Keep(second, proofAt(), {0x22u, nullptr, 2u});
+    Expect(displaced.set == 0x11u && displaced.lastSerial == 1u && displaced.owner != nullptr && !heldAlive.expired(), "keeping over another key hands its value back");
+    displaced = {};
+    Expect(heldAlive.expired(), "a displaced owner is released by whoever was handed it");
+    displaced = handing.Keep(second, proofAt(), {0x33u, nullptr, 3u});
+    Expect(displaced.set == 0x22u && displaced.lastSerial == 2u, "keeping the same key again hands back its earlier value");
     ImageSetCache empty(0);
     empty.Keep(imageSetKey(), proofAt(), {0x77u, nullptr, 5u});
     Expect(empty.Find(imageSetKey(), proofAt(), value) == Hit::Fresh && value.set == 0x77u, "a zero slot count still keeps one image set");

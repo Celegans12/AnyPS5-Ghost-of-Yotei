@@ -67,12 +67,14 @@ public:
         return entry.proof == now ? Hit::Fresh : Hit::Stale;
     }
 
-    void Keep(const Key& key, const Proof& proof, Value value) {
+    Value Keep(const Key& key, const Proof& proof, Value value) {
         Entry& entry = entries[slotOf(key)];
+        Value displaced = std::move(entry.value);
         entry.key = key;
         entry.proof = proof;
         entry.value = std::move(value);
         entry.used = true;
+        return displaced;
     }
 
 private:
@@ -133,8 +135,8 @@ Hit ImageSetCache::Find(const ImageSetKey& key, const Proof& now, ImageSetValue&
     return state->table.Find(key, now, value);
 }
 
-void ImageSetCache::Keep(const ImageSetKey& key, const Proof& proof, ImageSetValue value) {
-    state->table.Keep(key, proof, std::move(value));
+ImageSetValue ImageSetCache::Keep(const ImageSetKey& key, const Proof& proof, ImageSetValue value) {
+    return state->table.Keep(key, proof, std::move(value));
 }
 
 }

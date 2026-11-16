@@ -44,7 +44,7 @@ public:
     ImageSetCache(const ImageSetCache&) = delete;
     ImageSetCache& operator=(const ImageSetCache&) = delete;
     [[nodiscard]] Hit Find(const ImageSetKey& key, const Proof& now, ImageSetValue& value) const;
-    void Keep(const ImageSetKey& key, const Proof& proof, ImageSetValue value);
+    ImageSetValue Keep(const ImageSetKey& key, const Proof& proof, ImageSetValue value);
 
 private:
     struct State;

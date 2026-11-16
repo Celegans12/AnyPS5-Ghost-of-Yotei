@@ -29,7 +29,7 @@ class SrtTape;
 namespace AgcDriver::Core {
 
 enum class FrontLeft : std::uint32_t { Entry, NoPlan, Programs, UserWords, Walk, NoVariant, VariantKey, Views, Vertex, Queued, Pending, Moved, Stale, Finisher, Nothing, Precheck, Ring, Ranges, Count };
-enum class TeachRefusal : std::uint32_t { None, Path, Program, Stage, Plan, Tape, Walk, Words, Buffers, Forwarded, Vertex, Writes, PlanDiffers, Zone, Count };
+enum class TeachRefusal : std::uint32_t { None, Path, Program, Stage, Plan, Tape, Walk, Words, Buffers, Forwarded, Vertex, Writes, PlanDiffers, Zone, Known, Count };
 
 const char* FrontLeftName(FrontLeft reason);
 const char* TeachRefusalName(TeachRefusal reason);
@@ -82,6 +82,8 @@ struct FrontVariant {
     std::atomic<bool> stale{false};
     std::array<std::uint64_t, 2> zoneDigest{};
     bool zoned = false;
+    std::uint64_t serial = 0;
+    std::atomic<std::uint32_t> pending{0};
     std::array<ShaderRecompiler::RecompileResult, 4> frontResults;
     std::array<ShaderRecompiler::RecompileResult, 4> backResults;
     std::vector<Graphics::CompiledShader> frontStages;
@@ -105,6 +107,7 @@ struct FrontOutcome {
     StateKey key;
     std::shared_ptr<CoreDraw> candidate;
     bool looked = false;
+    FrontLeft left = FrontLeft::Entry;
     const std::byte* op = nullptr;
     FrontVariant* variant = nullptr;
     std::span<const std::pair<std::uint64_t, std::uint64_t>> reads;
@@ -137,6 +140,10 @@ struct TeachInputs {
     std::span<const DriverDetail::DrawProgram> programs;
     std::span<const Graphics::CompiledShader> stages;
     std::span<const std::shared_ptr<DriverDetail::DispatchVariant>> served;
+    std::span<const std::shared_ptr<const ShaderRecompiler::IrResourcePlan>> plans;
+    std::span<const std::optional<ShaderRecompiler::ShaderVertexStageInfo>> vertexInfos;
+    std::span<const std::shared_ptr<const ShaderRecompiler::RecompileResult>> owners;
+    std::uint32_t uncacheable = 0;
     std::shared_ptr<const DrawRecipe> recipe;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
     std::uint64_t shape = 0;
@@ -165,6 +172,8 @@ struct FrontCounts {
     std::uint64_t flatTimed = 0;
     std::uint64_t flatVertexKnown = 0;
     std::uint64_t flatZoned = 0;
+    std::uint64_t filtered = 0;
+    std::uint64_t released = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(FrontLeft::Count)> left{};
     std::array<std::uint64_t, static_cast<std::size_t>(TeachRefusal::Count)> refused{};
 };
@@ -176,11 +185,15 @@ public:
     static std::string Report();
     static void NoteCommitted(bool restarted, std::uint64_t nanoseconds);
     static void NoteEnqueued(std::uint64_t nanoseconds);
+    [[nodiscard]] static bool TeachBounds();
+    [[nodiscard]] static bool KeyDiagEnabled();
+    static void KeyDiag(const QueueState& queue, std::uint64_t shape, bool noPlan);
 
     [[nodiscard]] StateKey KeyOf(const QueueState& queue, const Pm4::DrawParameters& parameters, std::uint32_t opcode, std::uint64_t device);
     void VerifyDigests(const QueueState& queue);
     [[nodiscard]] FrontOutcome Walk(const QueueState& queue, const DriverDetail::ShaderRegistry& shaders, const Pm4::DrawParameters& parameters, std::uint32_t opcode, std::uint64_t device, bool verifyOnly);
     void Teach(const TeachInputs& inputs);
+    [[nodiscard]] bool Refused(std::span<const DriverDetail::DrawProgram> programs, std::span<const Graphics::CompiledShader> stages) const;
     [[nodiscard]] std::string Compare(const CoreDraw& candidate, const DriverDetail::DrawDecode& decode, std::span<const Graphics::CompiledShader> stages, const DrawRecipe* recipe) const;
     void NoteVerified(bool mismatch);
     void Release(std::shared_ptr<CoreDraw> record);
