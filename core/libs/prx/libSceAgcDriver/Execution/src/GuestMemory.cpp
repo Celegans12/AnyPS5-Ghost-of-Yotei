@@ -3274,7 +3274,7 @@ std::atomic<void (*)(std::uint64_t)> epochHook{nullptr};
 }
 
 bool EpochSweeps() {
-    static const bool enabled = std::getenv("APS5_EPOCH_SWEEP") != nullptr;
+    static const bool enabled = std::getenv("APS5_NO_EPOCH_SWEEP") == nullptr;
     return enabled;
 }
 
