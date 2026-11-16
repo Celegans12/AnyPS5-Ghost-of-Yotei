@@ -2240,7 +2240,7 @@ std::uint64_t Recorder::VerifyStagingHandover() {
     static const std::uint64_t every = [] {
         const char* value = std::getenv("APS5_VERIFY_STAGING_DIFF_HANDOVER");
         if (value == nullptr) return std::uint64_t{0};
-        const auto parsed = std::strtoull(value, nullptr, 10);
+        const std::uint64_t parsed = std::strtoull(value, nullptr, 10);
         return parsed != 0 ? parsed : std::uint64_t{1};
     }();
     return every;
