@@ -638,6 +638,16 @@ bool LabelRunsPerBatch() {
     static const bool perBatch = LabelRunsEnabled() && std::getenv("APS5_LABEL_RUNS_INLINE") == nullptr;
     return perBatch;
 }
+
+bool CopyBacksPastLabels() {
+    static const bool past = LabelRunsPerBatch() && std::getenv("APS5_COPY_BACKS_PAST_LABELS") != nullptr;
+    return past;
+}
+
+bool DispatchRunsPastLabels() {
+    static const bool past = LabelRunsPerBatch() && std::getenv("APS5_DISPATCH_RUNS_PAST_LABELS") != nullptr;
+    return past;
+}
 std::atomic<std::uint64_t> storeRunsAtSubmit{0}, storeRunsForced{0};
 
 // APS5_NO_JOIN_WAW_CHECK=1: a contiguous store joins the pending one without the check against
@@ -2739,13 +2749,13 @@ void Recorder::ensureOpen() {
 void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address) {
     if (bytes.empty()) return;
     ensureOpen();
-    flushDeferredDispatch();
+    if (!DispatchRunsPastLabels() || ReadTrapEnabled()) flushDeferredDispatch();
     if (!open->copyBacks.empty() && ReadTrapEnabled()) {
         const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> stored{{{address, address + bytes.size()}}};
         const CopyBackReach reach{0, true, false, stored};
         flushCopyBacks(LandingSite::Overlap, &reach);
     }
-    flushCopyBacks(LandingSite::LabelStore);
+    if (!CopyBacksPastLabels()) flushCopyBacks(LandingSite::LabelStore);
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
