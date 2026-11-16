@@ -1327,7 +1327,7 @@ bool DrawKeysTrimmed() {
 }
 
 bool KeyGeneratedStages() {
-    static const bool enabled = std::getenv("APS5_KEY_GENERATED_STAGES") != nullptr;
+    static const bool enabled = std::getenv("APS5_NO_KEY_GENERATED_STAGES") == nullptr;
     return enabled;
 }
 
