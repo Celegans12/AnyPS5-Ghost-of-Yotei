@@ -487,7 +487,7 @@ static void CheckVerifiedMappingReads() {
 }
 
 static void CheckReservedHoles() {
-    const bool partial = std::getenv("APS5_PARTIAL_COLLECT") != nullptr;
+    const bool partial = std::getenv("APS5_NO_PARTIAL_COLLECT") == nullptr;
     constexpr std::size_t page = 0x4000;
     auto& mappings = Mappings::Get();
     const auto bytes = 2 * blockBytes;

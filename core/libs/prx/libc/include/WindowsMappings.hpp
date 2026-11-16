@@ -1982,7 +1982,7 @@ private:
     }
 
     static bool partialCollect() {
-        static const bool partial = std::getenv("APS5_PARTIAL_COLLECT") != nullptr;
+        static const bool partial = std::getenv("APS5_NO_PARTIAL_COLLECT") == nullptr;
         return partial;
     }
 
