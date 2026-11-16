@@ -210,6 +210,8 @@ public:
         std::lock_guard lock(mutex);
         const auto end = address + bytes;
         const auto first = address & ~(pageBytes - 1);
+        if (const auto mapped = views.lower_bound(first); mapped == views.end() || mapped->first >= end) return trapPrivate(address, end);
+        if (!privateTraps.empty() && privateTrapped(address, end)) return false;
         for (auto base = first; base < end; base += pageBytes) {
             const auto found = views.find(base);
             if (found == views.end()) return false;
@@ -2387,8 +2389,60 @@ private:
         protectSubpages(base, static_cast<std::uint8_t>(mask & ~view.trapped), protection, operation, view.viewBytes);
     }
 
+    bool privateTrapped(std::uintptr_t address, std::uintptr_t end) const {
+        auto next = privateTraps.upper_bound(address);
+        if (next != privateTraps.begin() && std::prev(next)->second > address) return true;
+        return next != privateTraps.end() && next->first < end;
+    }
+
+    bool trapPrivate(std::uintptr_t address, std::uintptr_t end) {
+        if (track.Enabled() || overlapsOwnedRange(ownedHostAccess, address, end) || overlapsOwnedRange(ownedPins, address, end)) return false;
+        if (const auto same = privateTraps.find(address); same != privateTraps.end() && same->second == end) return true;
+        if (privateTrapped(address, end)) return false;
+        for (auto cursor = address; cursor < end;) {
+            MEMORY_BASIC_INFORMATION memory{};
+            if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) return false;
+            if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE || memory.Protect != PAGE_READWRITE) return false;
+            cursor = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+        }
+        DWORD previous;
+        if (!VirtualProtect(reinterpret_cast<void*>(address), end - address, PAGE_NOACCESS, &previous)) return false;
+        privateTraps.emplace(address, end);
+        trappedViews.fetch_add(1, std::memory_order_release);
+        return true;
+    }
+
+    void releasePrivateTraps(std::uintptr_t address, std::uintptr_t end) {
+        auto trap = privateTraps.upper_bound(address);
+        if (trap != privateTraps.begin() && std::prev(trap)->second > address) --trap;
+        while (trap != privateTraps.end() && trap->first < end) {
+            const auto [from, to] = *trap;
+            const auto opened = std::max(from, address & ~(subpageBytes - 1));
+            const auto stop = std::min(to, (end + subpageBytes - 1) & ~(subpageBytes - 1));
+            trap = privateTraps.erase(trap);
+            trappedViews.fetch_sub(1, std::memory_order_release);
+            if (from < opened) {
+                privateTraps.emplace(from, opened);
+                trappedViews.fetch_add(1, std::memory_order_release);
+            }
+            if (stop < to) {
+                trap = std::next(privateTraps.emplace(stop, to).first);
+                trappedViews.fetch_add(1, std::memory_order_release);
+            }
+            for (auto cursor = opened; cursor < stop;) {
+                MEMORY_BASIC_INFORMATION memory{};
+                if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory)) fail("query trapped private guest memory");
+                const auto regionEnd = std::min(stop, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+                DWORD previous;
+                if (memory.State == MEM_COMMIT && memory.Protect == PAGE_NOACCESS && !VirtualProtect(reinterpret_cast<void*>(cursor), regionEnd - cursor, PAGE_READWRITE, &previous)) fail("release a read trap on private guest memory");
+                cursor = regionEnd;
+            }
+        }
+    }
+
     bool anyTrapped(std::uintptr_t address, std::uintptr_t end) const {
         if (trappedViews.load(std::memory_order_acquire) == 0) return false;
+        if (!privateTraps.empty() && privateTrapped(address, end)) return true;
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
             if ((subpagesOf(it->first, address, end) & it->second.trapped) != 0) return true;
         }
@@ -2397,6 +2451,7 @@ private:
 
     void releaseTraps(std::uintptr_t address, std::uintptr_t end) {
         if (trappedViews.load(std::memory_order_acquire) == 0) return;
+        if (!privateTraps.empty()) releasePrivateTraps(address, end);
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
             auto& view = it->second;
             const auto mask = static_cast<std::uint8_t>(subpagesOf(it->first, address, end) & view.trapped);
@@ -2425,6 +2480,11 @@ private:
                     else runs.emplace_back(from, from + subpageBytes);
                 }
             }
+            if (!privateTraps.empty()) {
+                auto trap = privateTraps.upper_bound(address);
+                if (trap != privateTraps.begin() && std::prev(trap)->second > address) --trap;
+                for (; trap != privateTraps.end() && trap->first < end; ++trap) runs.emplace_back(std::max(trap->first, address & ~(subpageBytes - 1)), std::min(trap->second, (end + subpageBytes - 1) & ~(subpageBytes - 1)));
+            }
         }
         const auto resolver = trapResolver.load(std::memory_order_acquire);
         if (resolver == nullptr) return;
@@ -2435,7 +2495,13 @@ private:
         if (trappedViews.load(std::memory_order_acquire) == 0 || memory->State != MEM_COMMIT || memory->Protect != PAGE_NOACCESS) return;
         const auto base = address & ~(pageBytes - 1);
         const auto found = views.find(base);
-        if (found == views.end()) return;
+        if (found == views.end()) {
+            if (privateTraps.empty() || !privateTrapped(address, address + 1)) return;
+            memory->BaseAddress = reinterpret_cast<void*>(address & ~(subpageBytes - 1));
+            memory->RegionSize = subpageBytes;
+            memory->Protect = PAGE_READWRITE;
+            return;
+        }
         const auto& view = found->second;
         const auto bit = subpagesOf(base, address, address + 1);
         if ((view.trapped & bit) == 0) return;
@@ -2870,6 +2936,7 @@ private:
 
     SiteMutex mutex;
     std::atomic<std::uint64_t> trappedViews{0};
+    std::map<std::uintptr_t, std::uintptr_t> privateTraps;
     std::atomic<TrapResolver> trapResolver{nullptr};
     std::array<std::atomic<std::uint64_t>, MappingForgetOutcomes> forgetOutcomes{};
     std::array<std::atomic<ZeroLeaf*>, zeroLeaves> zeroCounts{};
