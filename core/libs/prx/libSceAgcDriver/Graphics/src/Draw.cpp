@@ -6508,7 +6508,8 @@ bool replayCoreDraw(const Context& context, const State& state, const Pm4::DrawP
     if (recorder->HasQueuedStores() && (resources->HoldsLease() || recorder->AnyQueuedStore(std::cref(touches)))) recorder->FlushStores();
     const auto* summary = resources->PassAccessSummary();
     if (summary == nullptr) return refuseLean(LeanRefusal::Summary);
-    if (!recorder->PassAccepts(held.passKey, summary->id)) return refuseLean(LeanRefusal::Pass);
+    const bool known = recorder->PassAccepts(held.passKey, summary->id);
+    if (!known && std::any_of(targets.begin(), targets.end(), [&](const std::shared_ptr<StorageTexture>& target) { return resources->ReadsImage(target.get()); })) return refuseLean(LeanRefusal::Pass);
     auto pipeline = recipe.pipeline.lock();
     if (pipeline == nullptr || pipeline->SplitsFaces() || pipeline->SplitsSecondChannel()) return refuseLean(LeanRefusal::Objects);
     auto framebuffer = recipe.framebuffer.lock();
@@ -6561,8 +6562,11 @@ bool replayCoreDraw(const Context& context, const State& state, const Pm4::DrawP
     CheckBufferAliases(shaders, state.color, draw.indexAddress, inputs.indexBytes);
     if (recipe.hasDepth && writesDepthTarget(state)) NoteDepthSurfaceWrite(context, *state.depth);
     noteRecordedDrawSite(resources.get(), pipeline.get(), framebuffer.get());
+    if (!known) PassState::Count(PassState::Refusal::Unaccepted);
     auto& passReads = scratch.reads;
-    passReads.assign(summary->reads.begin(), summary->reads.end());
+    passReads.clear();
+    if (known) passReads.assign(summary->reads.begin(), summary->reads.end());
+    else resources->DeviceReads(passReads);
     const auto deviceReads = passReads.size();
     passReads.insert(passReads.end(), inputs.inPlaceReads.begin(), inputs.inPlaceReads.end());
     for (const auto& entry : moved) {
@@ -6585,19 +6589,25 @@ bool replayCoreDraw(const Context& context, const State& state, const Pm4::DrawP
     auto& passAttachments = scratch.attachments;
     passImages.clear();
     passAttachments.clear();
-    PassAccess passAccess{GuestRangeList(passReads).subspan(deviceReads), passWrites, passImages, passAttachments, unknownMemory, unknownWrites, {}};
+    const auto fillPassImages = [&] {
+        resources->StorageImages(passImages);
+        passAttachments.clear();
+        for (const auto& target : targets) {
+            if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
+        }
+    };
+    if (!known) fillPassImages();
+    PassAccess passAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, {}};
+    if (known) passAccess.reads = GuestRangeList(passReads).subspan(deviceReads);
     const bool fenced = state.depth.has_value();
     resources->RequireGuestBuffers();
     const auto start = recorder->StartDrawPass(held.passKey, false, fenced, passAccess);
     const bool continued = start.continued;
-    if (continued) {
+    if (known && continued) {
         PassState::Count(PassState::Served::Access);
-    } else {
+    } else if (known) {
         PassState::Count(PassState::Refusal::PassBroken);
-        resources->StorageImages(passImages);
-        for (const auto& target : targets) {
-            if (target != nullptr) passAttachments.emplace_back(target->Image(), true);
-        }
+        fillPassImages();
         passAccess = PassAccess{passReads, passWrites, passImages, passAttachments, unknownMemory, unknownWrites, {}};
     }
     const auto commands = start.commands;
@@ -6643,7 +6653,7 @@ bool replayCoreDraw(const Context& context, const State& state, const Pm4::DrawP
     std::uint32_t subdraw = 0;
     recordDrawCommands(context, commands, state, draw, inputs, nullptr, VK_NULL_HANDLE, 0, nullptr, subdraw);
     recorder->LeaveRenderPassOpen(held.passKey, drawTiming, fenced, passAccess, {});
-    if (!continued) recorder->AcceptInPass(held.passKey, summary->id);
+    if (!(known && continued)) recorder->AcceptInPass(held.passKey, summary->id);
     auto& slices = scratch.slices;
     slices.clear();
     for (const auto& color : state.colors) slices.emplace_back(color.arraySlice, color.arrayLastSlice != 0 ? color.layers : 1u);

@@ -318,7 +318,7 @@ void NoteReplay(ReplayDraw* draw, const ReplayDraw& targets, bool fallback, bool
 BackMode BackModeNow() {
     const auto forced = testedMode().load(std::memory_order_relaxed);
     if (forced >= 0) return static_cast<BackMode>(forced);
-    static const BackMode configured = std::getenv("APS5_VERIFY_CORE_BACK") != nullptr ? BackMode::Verify : std::getenv("APS5_CORE_BACK") != nullptr ? BackMode::Light : BackMode::Recipe;
+    static const BackMode configured = std::getenv("APS5_VERIFY_CORE_BACK") != nullptr ? BackMode::Verify : std::getenv("APS5_CORE_BACK") != nullptr || Graphics::CoreDefault() ? BackMode::Light : BackMode::Recipe;
     return configured;
 }
 
