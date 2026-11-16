@@ -2984,14 +2984,6 @@ bool OpportunisticReap() {
     return enabled;
 }
 
-bool LabelMarksPerBatch() {
-    static const bool enabled = [] {
-        const char* text = std::getenv("APS5_LABEL_MARKS_PER_BATCH");
-        return text != nullptr && text[0] != '\0' && !(text[0] == '0' && text[1] == '\0');
-    }();
-    return enabled;
-}
-
 struct OpenGpuLoadState {
     const Graphics::Recorder* recorder = nullptr;
     std::uint64_t serial = 0;
@@ -3294,7 +3286,6 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     {
         const Graphics::BufferCache::LabelMark marked;
         if (offDraw) offDrawMark(recorder, address, bytes.size());
-        else if (LabelMarksPerBatch() && recorder.LabelBlockMarked(address, bytes.size())) GuestMemory::MarkWrittenInCollectedBlock(address, bytes.size());
         else GuestMemory::MarkWritten(address, bytes.size());
     }
     // No submit per label: the batch goes out at the queue worker's next non-label packet, at a
