@@ -57,17 +57,19 @@ void NameDriverThread(const char* name) {
 #endif
 }
 
-#ifdef __linux__
 namespace {
+#ifdef __linux__
 void NoteWorkerThread();
-}
 #endif
+void ReserveDecodeCore(const char* role);
+}
 
 void PinWorkerThread(const char* role) {
     TracyZone::NameThread(role);
 #ifdef __linux__
     NoteWorkerThread();
 #endif
+    ReserveDecodeCore(role);
     const auto mask = WorkerAffinityMask();
     if (mask == 0) return;
     static std::once_flag summary;
@@ -95,9 +97,10 @@ struct Reservation {
 constexpr std::size_t CommitterSlot = 0;
 constexpr std::size_t FinisherSlot = 1;
 constexpr std::size_t PoolSlots = 15;
+constexpr std::size_t DecodeSlot = 2 + PoolSlots;
 
 std::mutex reservationMutex;
-std::array<std::optional<Reservation>, 2 + PoolSlots> reservations;
+std::array<std::optional<Reservation>, 3 + PoolSlots> reservations;
 #ifdef __linux__
 std::vector<unsigned long> workerThreads;
 std::vector<std::uint32_t> pipelineCpus;
@@ -206,7 +209,17 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
     if (slot >= FinisherSlot && !reservations[CommitterSlot].has_value() && Switches().committer) {
         if (const auto ahead = CpuTopology::ChooseReservedCore(sets, taken, Switches().logical)) taken.push_back(ahead->chosen);
     }
-    const auto reservation = CpuTopology::ChooseReservedCore(sets, taken, logical);
+    auto reservation = CpuTopology::ChooseReservedCore(sets, taken, logical);
+    static const bool othersAway = std::getenv("APS5_GAME_OFF_PIPELINE_CACHE") != nullptr;
+    if (othersAway && reservation.has_value()) {
+        const auto& home = reservation->chosen;
+        std::vector<std::uint32_t> away;
+        for (const auto& set : sets) {
+            if (set.parked || (set.group == home.group && set.lastLevelCache == home.lastLevelCache)) continue;
+            away.push_back(set.id);
+        }
+        if (!away.empty()) reservation->others = std::move(away);
+    }
     if (!reservation.has_value()) {
         if (logical.has_value()) std::fprintf(stderr, "[affinity] %s: APS5_COMMITTER_CPU=%u names no free logical processor of the process, no core reserved\n", role, *logical);
         return;
@@ -268,6 +281,18 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
 
 }
 #endif
+
+namespace {
+void ReserveDecodeCore(const char* role) {
+#if defined(_WIN32) || defined(__linux__)
+    static const bool decodes = std::getenv("APS5_DECODE_CORE") != nullptr;
+    if (!decodes || std::strcmp(role, "queue worker 0x0") != 0 || !Switches().finisher) return;
+    Reserve(DecodeSlot, "queue worker 0", std::nullopt);
+#else
+    static_cast<void>(role);
+#endif
+}
+}
 
 void ReserveCommitterCore() {
 #if defined(_WIN32) || defined(__linux__)
