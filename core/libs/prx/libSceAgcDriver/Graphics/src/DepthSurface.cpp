@@ -28,6 +28,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include "ThreadOwned.hpp"
 #include <bit>
 #include <cmath>
 #include <limits>
@@ -3703,7 +3704,52 @@ VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, 
     return DepthSurfaceViewWithStencilWriteIntent(context, target, depthWritten, stencilTested, true);
 }
 
+namespace {
+
+struct DepthViewMemo {
+    bool held = false;
+    VkDevice device = VK_NULL_HANDLE;
+    DepthTarget target{};
+    bool depthWritten = false;
+    bool stencilTested = false;
+    bool stencilWritten = false;
+    bool expanded = false;
+    std::optional<std::uint8_t> overwrittenStencil;
+    DrawSuite suite{};
+    std::uint64_t views = 0;
+    DepthSurface* surface = nullptr;
+    std::shared_ptr<std::atomic<bool>> active;
+    VkImageView view = VK_NULL_HANDLE;
+};
+
+DepthViewMemo& depthViewMemo() {
+    thread_local DepthViewMemo* slot = nullptr;
+    return ShaderRecompiler::ThreadOwned(slot);
+}
+
+bool sameDepthCall(const DepthTarget& a, const DepthTarget& b) {
+    return a.address == b.address && a.stencilAddress == b.stencilAddress && a.extent.width == b.extent.width && a.extent.height == b.extent.height && a.format == b.format && std::bit_cast<std::uint32_t>(a.clearDepth) == std::bit_cast<std::uint32_t>(b.clearDepth) && a.clearStencil == b.clearStencil && a.htileAddress == b.htileAddress && a.htileStencil == b.htileStencil && a.samples == b.samples && a.depthSwizzle == b.depthSwizzle && a.pipeBankXor == b.pipeBankXor && a.firstSlice == b.firstSlice && a.lastSlice == b.lastSlice && a.iterate256 == b.iterate256 && a.htilePipeAligned == b.htilePipeAligned && a.htileVrsEncoding == b.htileVrsEncoding && a.htileDepthOnly == b.htileDepthOnly && a.gcn == b.gcn && a.depthPartiallyResident == b.depthPartiallyResident && a.stencilPartiallyResident == b.stencilPartiallyResident;
+}
+
+}
+
 VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten, std::optional<std::uint8_t> overwrittenStencil) {
+    const bool suited = DrawSuite::Enabled() && depthViewProofs();
+    bool memoHeld = false;
+    if (suited) {
+        auto& memo = depthViewMemo();
+        if (memo.held && memo.device == context.device && memo.views == PassState::DepthViews() && memo.depthWritten == depthWritten && memo.stencilTested == stencilTested && memo.stencilWritten == stencilWritten && memo.overwrittenStencil == overwrittenStencil && sameDepthCall(memo.target, target) && memo.suite == DrawSuite::Now()) {
+            std::unique_lock lock(surfacesMutex());
+            memoHeld = memo.active != nullptr && memo.active->load(std::memory_order_acquire) && drawnDepth == memo.surface && memo.surface->written == depthWrites && memo.surface->pendingClear == 0u && !memo.surface->clearPending && !memo.surface->retired && memo.surface->expanded == memo.expanded && memo.surface->view == memo.view && findClearedHtile(target) == clearedHtiles().end();
+        }
+        if (memoHeld && !DrawProofVerifyDue()) {
+            depthViewCounters().calls.fetch_add(1, std::memory_order_relaxed);
+            NoteDrawProofReused(DrawProofKind::Depth);
+            DrawSuite::Note(DrawSuite::Count::DepthServed);
+            return memo.view;
+        }
+        memo.held = false;
+    }
     PassState::NoteDepthView();
     const auto planeBytes = [&](std::uint32_t bytesPerTexel) { return target.samples == 1u ? DepthSliceBytes(target.extent, bytesPerTexel) : MultisampledDepthBytes_nid_no_patch(target.extent, bytesPerTexel, target.samples); };
     if (target.depthPartiallyResident) Require(resident(target.address, planeBytes(target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D16_UNORM_S8_UINT ? 2u : 4u)) && (target.htileAddress == 0u || resident(target.htileAddress, HtileMetadataBytes(target.extent))), "partially resident depth (DB_Z_INFO) with pages that are not mapped is unsupported");
@@ -3886,6 +3932,26 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     }
     if (stencilWritten || created || stencilRebound) surface->MarkStencilStale(stencilWritten);
     drawnDepth = surface;
+    if (memoHeld && (surface->view != depthViewMemo().view || cleared || htileCleared != 0u || created)) call.Differ("the depth view kept for the suite missed a clear or another surface");
+    if (suited) {
+        DrawSuite::Note(DrawSuite::Count::DepthFull);
+        if (call.eligible && !created && !cleared && htileCleared == 0u && surface->pendingClear == 0u && !surface->clearPending) {
+            auto& memo = depthViewMemo();
+            memo.device = context.device;
+            memo.target = target;
+            memo.depthWritten = depthWritten;
+            memo.stencilTested = stencilTested;
+            memo.stencilWritten = stencilWritten;
+            memo.overwrittenStencil = overwrittenStencil;
+            memo.expanded = surface->expanded;
+            memo.suite = DrawSuite::Now();
+            memo.views = PassState::DepthViews();
+            memo.surface = surface;
+            memo.active = surface->active;
+            memo.view = surface->view;
+            memo.held = true;
+        }
+    }
     if (!call.eligible) {
         NoteDrawProofMissed(DrawProofKind::Depth, DrawProofMiss::None);
     } else if (call.verify && call.skipped && !call.ran) {

@@ -447,6 +447,7 @@ public:
         TextureDimension dimension;
         std::uint32_t format;
         std::uint64_t serial;
+        const void* writer = nullptr;
     };
     static std::optional<WriteRecord> LastWrite(std::uint64_t address);
     // How a buffer fill of [address, address + bytes) (Driver.cpp's fill HLE) meets the storage
@@ -717,6 +718,19 @@ private:
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);
+    void markLayersPendingNow(std::uint32_t first, std::uint32_t count);
+    struct PendingMark {
+        bool held = false;
+        bool drawing = false;
+        std::uint32_t first = 0;
+        std::uint32_t count = 0;
+        std::uint64_t version = 0;
+        std::uint64_t settled = 0;
+        std::uint64_t flip = 0;
+        std::uint64_t aliases = 0;
+        std::array<std::uint64_t, 11> suite{};
+    };
+    PendingMark pendingMark;
     // Registers or unregisters the image as its pending layers say (after a write-back).
     void reconcilePending();
     // Pending images whose surface shares one of the 64 KiB write-stamp blocks firstBlock..lastBlock

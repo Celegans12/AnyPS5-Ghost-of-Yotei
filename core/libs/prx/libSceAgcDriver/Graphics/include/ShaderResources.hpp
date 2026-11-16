@@ -136,6 +136,19 @@ void NoteDrawProofVerified(DrawProofKind kind, bool differing, bool stored, cons
 DrawProofCounts DrawProofCounted();
 std::string DrawProofText(const DrawProofCounts& now, const DrawProofCounts& seen);
 
+struct DrawSuite {
+    enum class Count : std::size_t { SetsReused, SetsWritten, SetsTemplate, SetsUnprepared, DepthServed, DepthFull, MarksServed, MarksFull, MovedServed, MovedFull, Count };
+    std::uint64_t gate = 0;
+    std::uint64_t registry = 0;
+    DrawProofStamp stamp{};
+    static bool Enabled();
+    static void SetForTest(int mode);
+    static DrawSuite Now();
+    static void Note(Count what);
+    static std::uint64_t Counted(Count what);
+    bool operator==(const DrawSuite&) const = default;
+};
+
 struct PipelineSetLayouts {
     VkDescriptorSetLayout main = VK_NULL_HANDLE;
     VkDescriptorSetLayout fragment = VK_NULL_HANDLE;
@@ -307,6 +320,8 @@ public:
     std::shared_ptr<DrawUse> BeginDrawUse(Recorder& recorder) const;
     void CompleteDrawUse(const DrawUse& use) const;
     void BindDrawUse(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
+    bool DynamicDrawSets() const { return dynamicLayout; }
+    std::uint32_t DynamicDrawBuffers(std::size_t set) const { return static_cast<std::uint32_t>(dynamicSets[set].order.size()); }
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}, bool movedOnly = false, const BdaResources* faultRecord = nullptr) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, bool* patchedData = nullptr) const;
     bool CollectMovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder, const ColorTarget* target, std::vector<MovedBuffer>& moved, bool* patchedData = nullptr) const;
@@ -816,6 +831,38 @@ private:
     std::vector<FaultDescriptor> faultDescriptors;
     void prepareFaultSlot() const;
     void writeDrawSets(DrawBindings& result, std::span<const std::size_t> selected, const BdaResources* faultRecord) const;
+    struct DynamicSet {
+        static constexpr std::uint32_t None = std::numeric_limits<std::uint32_t>::max();
+        std::vector<std::uint32_t> order;
+        std::vector<std::uint32_t> buffers;
+        std::vector<std::uint32_t> allocationsOf;
+        std::vector<std::pair<std::uint32_t, std::uint32_t>> images;
+        std::vector<std::size_t> writes;
+        mutable std::shared_ptr<DrawBindings> holder;
+        mutable std::vector<VkDescriptorBufferInfo> heldBuffers;
+        mutable std::vector<VkDescriptorImageInfo> heldImages;
+        mutable std::vector<std::weak_ptr<void>> heldOwners;
+        mutable std::uint64_t heldImports = 0;
+        mutable std::uint64_t heldEpoch = 0;
+        mutable const void* keptRecorder = nullptr;
+        mutable std::uint64_t keptSerial = 0;
+    };
+    std::array<DynamicSet, 2> dynamicSets;
+    std::vector<std::uint8_t> bufferDynamic;
+    bool dynamicLayout = false;
+    mutable bool dynamicUnmoved = false;
+    mutable std::uint64_t descriptorEpoch = 1;
+    void describeDynamicSets();
+    void prepareDynamicSets(Recorder& recorder, std::span<const std::size_t> selected, std::span<const DrawBindings::Snapshot> snapshots, std::span<const std::weak_ptr<void>> owners, const BdaResources* faultRecord) const;
+    void bindDynamicSets(VkCommandBuffer commands, VkPipelineLayout layout, const DrawUse* use) const;
+    struct MovedMemo {
+        const void* program = nullptr;
+        std::uint32_t binding = 0;
+        std::size_t kept = 0;
+        std::uint64_t target = 0;
+        std::vector<std::uint32_t> words;
+    };
+    mutable std::vector<MovedMemo> movedMemos;
     mutable std::unique_ptr<AccessSummary> accessSummary;
     std::uint64_t accessEpoch = 0;
     std::shared_ptr<std::atomic<bool>> ownRecordBusy = std::make_shared<std::atomic<bool>>(false);

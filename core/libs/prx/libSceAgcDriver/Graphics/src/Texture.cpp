@@ -4622,6 +4622,11 @@ std::optional<StorageTexture::WriteRecord> StorageTexture::LastWrite(std::uint64
 namespace {
 std::atomic<std::uint64_t> flipSerial{0};
 std::atomic<std::uint64_t> occasionalLabelStores{0};
+std::atomic<std::uint64_t> aliasMarks{0};
+
+std::array<std::uint64_t, 11> suiteWords(const DrawSuite& suite) {
+    return {suite.gate, suite.registry, suite.stamp.epoch, suite.stamp.proof, suite.stamp.pending, suite.stamp.depthSurfaces, suite.stamp.unwatch, suite.stamp.wide, suite.stamp.forget, suite.stamp.imports, suite.stamp.versioned ? 1u : 0u};
+}
 }
 
 void StorageTexture::NoteFlip() {
@@ -4633,12 +4638,44 @@ std::uint64_t StorageTexture::OccasionalLabelStores() {
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
+    static const bool eager = std::getenv("APS5_EAGER_WRITEBACK") != nullptr || std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
+    if (eager || count == 0 || !DrawSuite::Enabled()) {
+        pendingMark.held = false;
+        markLayersPendingNow(first, count);
+        return;
+    }
+    auto& mark = pendingMark;
+    if (mark.held && mark.first == first && mark.count == count && mark.version == version && mark.drawing == drawingTarget && !lent && handedOver.empty() && handedUnits.empty() && mark.aliases == aliasMarks.load(std::memory_order_acquire) && mark.flip == flipSerial.load(std::memory_order_relaxed) && mark.settled == GuestMemory::SettledGeneration() && layerPending.AllIn(first, count) && !(borrowedUnits.size() == trackedLayers && borrowedUnits.AnyIn(first, count)) && mark.suite == suiteWords(DrawSuite::Now())) {
+        DrawSuite::Note(DrawSuite::Count::MarksServed);
+        return;
+    }
+    mark.held = false;
+    markLayersPendingNow(first, count);
+    DrawSuite::Note(DrawSuite::Count::MarksFull);
+    if (!layerPending.AllIn(first, count)) return;
+    mark.first = first;
+    mark.count = count;
+    mark.version = version;
+    mark.drawing = drawingTarget;
+    mark.aliases = aliasMarks.load(std::memory_order_acquire);
+    mark.flip = flipSerial.load(std::memory_order_relaxed);
+    mark.settled = GuestMemory::SettledGeneration();
+    mark.suite = suiteWords(DrawSuite::Now());
+    mark.held = true;
+}
+
+void StorageTexture::markLayersPendingNow(std::uint32_t first, std::uint32_t count) {
     if (count != 0) GuestMemory::ForgetKnownZero(layerBegin(first), static_cast<std::size_t>(layerBegin(first + count - 1) + layerBytes(first + count - 1) - layerBegin(first)));
     {
         auto& records = LayoutWrites();
         std::lock_guard lock(records.mutex);
-        if (records.byAddress.size() >= 65536u) records.byAddress.clear();
-        records.byAddress[descriptor.baseAddress] = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial};
+        if (records.byAddress.size() >= 65536u) {
+            records.byAddress.clear();
+            aliasMarks.fetch_add(1, std::memory_order_acq_rel);
+        }
+        auto& record = records.byAddress[descriptor.baseAddress];
+        if (record.writer != nullptr && record.writer != this) aliasMarks.fetch_add(1, std::memory_order_acq_rel);
+        record = {descriptor.width, descriptor.height, descriptor.tileMode, descriptor.dimension, descriptor.format, ++records.serial, this};
     }
     GuestMemory::NoteGpuPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     CaptureTrace::Log("image-write image=%llx first=%u count=%u generation=%llu", static_cast<unsigned long long>(descriptor.baseAddress), first, count, static_cast<unsigned long long>(generation));
