@@ -1,5 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Core/include/CoarseClock.hpp"
+#include "prx/libSceAgcDriver/Core/include/DecodeLane.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -123,6 +125,46 @@ bool sealsWriteOnly(std::span<const std::uint32_t> packet, std::uint32_t opcode)
 bool& drawnSinceSeal() {
     static thread_local bool drawn = false;
     return drawn;
+}
+
+struct LaneCounts {
+    std::atomic<std::uint64_t> runs{0}, packets{0}, draws{0}, refused{0}, cut{0}, lists{0}, flips{0}, verified{0}, listed{0}, listDrains{0};
+};
+
+LaneCounts& laneCounts() {
+    static LaneCounts counts;
+    return counts;
+}
+
+void laneBump(std::atomic<std::uint64_t>& counter, std::uint64_t amount = 1) {
+    counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
+}
+
+bool lanePacket(const Submission& submission, std::size_t cursor, std::uint32_t header, std::uint32_t opcode) {
+    const auto lane = Core::LaneOf(header);
+    if (lane == Core::Lane::Heavy || lane == Core::Lane::Skip) return false;
+    if (!keepsDrawFinisher(header, opcode) && DrawFinisher::Busy() && !DrawFinisher::Overlap()) {
+        laneBump(laneCounts().lists);
+        return false;
+    }
+    if (lane == Core::Lane::RegisterList) {
+        const auto listed = submission.registerLists.find(cursor);
+        if (listed == submission.registerLists.end() || !Pm4::IndirectRegistersValid(listed->second)) {
+            laneBump(laneCounts().lists);
+            return false;
+        }
+    }
+    return true;
+}
+
+void laneReport() {
+    static std::atomic<std::int64_t> lastReport{0};
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (nowMs - last < 5000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto& counts = laneCounts();
+    const auto value = [](const std::atomic<std::uint64_t>& counter) { return static_cast<unsigned long long>(counter.load(std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[core-lane] (cumulative) %llu light runs, %llu packets (%llu draws) taken by the light lane, %llu runs ended by a packet the lane leaves, %llu by the run limit, %llu register lists or indexed registers left, %llu flips left, %llu register lists taken, %llu light packets verified on the heavy path, %llu of them register lists the heavy path drains the pipeline for%c", value(counts.runs), value(counts.packets), value(counts.draws), value(counts.refused), value(counts.cut), value(counts.lists), value(counts.flips), value(counts.listed), value(counts.verified), value(counts.listDrains), 10);
 }
 
 }
@@ -287,6 +329,79 @@ void Driver::execute(Submission& submission) {
     } settleFinisher{submission.queue == 0};
     std::size_t nextSegment = 0;
     auto* const executingPacket = workerPacket();
+    static const bool lightLane = Graphics::CoreLightLane();
+    static const bool verifyLane = Graphics::VerifyCoreLightLane();
+    static const bool laneStats = Graphics::CoreRunStats();
+    const bool laneOpen = (lightLane || verifyLane) && pipelined && !profilePackets && !traceGpu && !packetEpoch() && !CaptureTrace::Enabled() && static_cast<long>(submission.queue) != dumpQueue;
+    const auto lightRun = [&](std::size_t& cursor, std::size_t end) {
+        std::size_t at = cursor;
+        while (at < end && Pm4::FillerPacket(submission.commands[at])) ++at;
+        if (at >= end || !lanePacket(submission, at, submission.commands[at], (submission.commands[at] >> 8u) & 0xffu) || submission.flips.contains(at)) return false;
+        std::uint64_t done = 0, draws = 0;
+        {
+            std::shared_lock deviceUse(deviceReplacement);
+            GuestMemory::SetCurrentPacket((submission.commands[at] >> 8u) & 0xffu, submission.queue);
+            flushBetweenPackets(submission.queue, submission.commands[at], false);
+            struct Progress {
+                Driver& driver;
+                std::uint64_t& done;
+                ~Progress() {
+                    --driver.packetsInFlight;
+                    driver.packetsDone += done;
+                }
+            } progress{*this, done};
+            ++packetsInFlight;
+            while (at < end) {
+                const auto header = submission.commands[at];
+                if (Pm4::FillerPacket(header)) {
+                    ++at;
+                    continue;
+                }
+                const auto opcode = (header >> 8u) & 0xffu;
+                if (!lanePacket(submission, at, header, opcode)) {
+                    laneBump(laneCounts().refused);
+                    break;
+                }
+                if (!submission.flips.empty() && submission.flips.contains(at)) {
+                    laneBump(laneCounts().flips);
+                    break;
+                }
+                const auto count = Pm4::PacketWords(header);
+                const auto packet = std::span(submission.commands).subspan(at, count);
+                queue.runMask.Packet(opcode);
+                if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(at + 1) << 8u) | opcode, std::memory_order_relaxed);
+                recent.Record(at);
+                if (Pm4::DrawOpcode(opcode)) {
+                    GuestMemory::SetCurrentPacket(opcode, submission.queue);
+                    landPendingWaits(submission.queue);
+                    packetCounters.CountDraw();
+                    drawnSinceSeal() = true;
+                    try {
+                        std::string rejected;
+                        if (draw(queue, packet, submission, at, rejected) == DrawVerdict::Rejected) throw std::runtime_error(rejected);
+                    } catch (const RefusedDraw& refused) {
+                        ReportRefusedDraw(refused);
+                    }
+                    Graphics::Recorder::CountRecordedWork();
+                    ++draws;
+                } else if (Pm4::IndirectRegisterOpcode(opcode)) {
+                    Pm4::ExecuteIndirectRegisters(packet, submission.registerLists.at(at), queue);
+                    laneBump(laneCounts().listed);
+                } else {
+                    Pm4::Execute(packet, queue);
+                }
+                ++done;
+                at += count;
+            }
+        }
+        if (at >= end && end < submission.commands.size()) laneBump(laneCounts().cut);
+        laneBump(laneCounts().runs);
+        laneBump(laneCounts().packets, done);
+        laneBump(laneCounts().draws, draws);
+        if (laneStats && (laneCounts().runs.load(std::memory_order_relaxed) & 0xffu) == 0) laneReport();
+        cursor = at;
+        return true;
+    };
     for (std::size_t cursor = 0; cursor < submission.commands.size();) {
         if (packetEpoch()) bumpEpoch(&EpochBumps::packets);
         CheckFailure();
@@ -298,6 +413,12 @@ void Driver::execute(Submission& submission) {
             ++nextSegment;
         }
         if (cursor >= submission.commands.size()) break;
+        const bool laneNow = laneOpen && queue.predication.operation == 0 && deferredLabels().labels.empty();
+        if (laneNow && lightLane) {
+            const auto limit = nextSegment < submission.indirectSegments.size() ? std::min<std::size_t>(submission.indirectSegments[nextSegment].start, submission.commands.size()) : submission.commands.size();
+            const auto run = Core::ScanLane(submission.commands, cursor, limit, 64);
+            if (run.packets != 0 && lightRun(cursor, run.end)) continue;
+        }
         const auto header = submission.commands[cursor];
         if (Pm4::FillerPacket(header)) { ++cursor; continue; }
         const auto count = Pm4::PacketWords(header);
@@ -307,6 +428,11 @@ void Driver::execute(Submission& submission) {
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        const bool laneChecked = verifyLane && laneNow && !predicated && lanePacket(submission, cursor, header, opcode) && !submission.flips.contains(cursor);
+        const auto laneDiffers = [&](const char* what) {
+            throw std::runtime_error(std::string("APS5_VERIFY_CORE_LIGHT_LANE: a packet the light lane would take (") + Pm4::Name(header) + ") " + what);
+        };
+        if (laneChecked && submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode) && !(DrawFinisher::Overlap() && keepsDrawPipeline(packet, header, opcode)) && !Pm4::IndirectRegisterOpcode(opcode)) laneDiffers("drains the draw finisher on the heavy path");
         if (submission.queue == 0 && DrawFinisher::Busy() && !keepsDrawFinisher(header, opcode)) {
             const bool queuesLabel = pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && labelPacketQueues(packet, opcode);
             const bool heldLabelWait = pipelined && !predicated && orderedWaits && (opcode == 0x3c || opcode == 0x93) && header != RenderingWaitPacketHeader && waitTakesPendingLabel(packet);
@@ -318,11 +444,14 @@ void Driver::execute(Submission& submission) {
             }
         }
         if (APS5_ENABLE_TIMING_LOG && submission.queue == 0 && pendingFrameTiming == nullptr) includeTimingSubmission(submission, false);
-        PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
+        static thread_local Core::CoarseClock packetClock{nullptr, nullptr, Graphics::CoreClockPeriod()};
+        const bool timedPacket = !lightLane || header == FlipPacketHeader || submission.flips.contains(cursor) || packetClock.Tick();
+        PerformanceContext timingContext(!timedPacket ? nullptr : submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         if (submission.queue != 0 && Graphics::Recorder::DispatchOverlapEnabled()) noteRingPacket(submission.queue, submission.serial, opcode, header);
         PerformanceTimer timing("Driver.Packet");
         if (!predicated) noteLabelIssue(packet, submission.queue);
         if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor) && (enqueueLabelPacket(packet, opcode, submission.queue, releaseInterrupt(packet, opcode, false)) || enqueueDmaPacket(packet, opcode, submission.queue, queue) || enqueueConstantRamDump(packet, opcode, submission.queue, queue) || enqueueSampleDumpPacket(packet, opcode, submission.queue))) {
+            if (laneChecked) laneDiffers("is queued as a label, a copy or a dump on the heavy path");
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
             cursor = nextCursor;
@@ -351,6 +480,10 @@ void Driver::execute(Submission& submission) {
             }
         }
         timing.Mark("pipeline_prepare");
+        if (laneChecked && !keepsDrawPipeline(packet, header, opcode)) {
+            if (!Pm4::IndirectRegisterOpcode(opcode)) laneDiffers("drains the draw pipeline on the heavy path");
+            laneBump(laneCounts().listDrains);
+        }
         if (pipelined && DrawPipeline::Queue0().Busy() && !keepsDrawPipeline(packet, header, opcode)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, header == FlipPacketHeader ? 0xffu : opcode);
         if (pipelined && predicated && DrawPipeline::Queue0().Busy() && DrawPipeline::Queue0().Overlaps(queue.predication.address, queue.predication.operation == 3 ? 8 : 4)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, opcode);
         timing.Mark("pipeline_drain");
@@ -415,6 +548,13 @@ void Driver::execute(Submission& submission) {
         bool wroteOnGpu = false, endOfPipeInterrupt = false, interruptDeferred = false, drawPacket = false, sampleDump = false;
         const bool drains = preparePacketMemory(submission, queue, packet, header, opcode, releaseInterrupt(packet, opcode, submission.flips.contains(cursor)), wroteOnGpu, endOfPipeInterrupt, interruptDeferred, drawPacket, sampleDump);
         traceLabel(packet, submission.queue);
+        if (laneChecked) {
+            if (drains || wroteOnGpu || endOfPipeInterrupt || interruptDeferred || sampleDump) laneDiffers("writes, drains or interrupts in its memory preparation on the heavy path");
+            if (drawPacket != (Core::LaneOf(header) == Core::Lane::Draw)) laneDiffers("is classed differently by the heavy path");
+            if (!drawPacket && (opcode == 0x15 || opcode == 0x16 || opcode == 0x3c || opcode == 0x93 || opcode == 0x22 || opcode == 0x91 || opcode == 0x3f || sealsWriteOnly(packet, opcode) || opcode == 0x42 || opcode == 0x46 || opcode == 0x58)) laneDiffers("takes a branch of the heavy path the lane does not have");
+            laneBump(laneCounts().verified);
+            if (laneStats && (laneCounts().verified.load(std::memory_order_relaxed) & 0xfffu) == 0) laneReport();
+        }
         timing.Mark("prepare_memory");
 
         const bool waitPacket = opcode == 0x3c || opcode == 0x93 || header == RenderingWaitPacketHeader;
