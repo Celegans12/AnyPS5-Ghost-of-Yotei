@@ -1687,6 +1687,26 @@ bool epochSweepVerified() {
 
 void verifyEpochAnswer(std::uint64_t address, std::size_t bytes);
 
+bool tokenBreaksCounted() {
+    static const bool counted = std::getenv("APS5_EPOCH_SWEEP_BREAKS") != nullptr;
+    return counted;
+}
+
+struct TokenBreaks {
+    std::atomic<std::uint64_t> exact{0};
+    std::atomic<std::uint64_t> exactCpu{0};
+    std::atomic<std::uint64_t> pages{0};
+    std::atomic<std::uint64_t> neighbour{0};
+    std::atomic<std::uint64_t> unknown{0};
+    std::atomic<std::uint64_t> exactBytes{0};
+    std::atomic<std::uint64_t> neighbourBytes{0};
+};
+
+TokenBreaks& tokenBreaks() {
+    static auto* breaks = new TokenBreaks;
+    return *breaks;
+}
+
 struct WriteTracker {
     AgcDriver::Mutex mutex;
     bool initialized = false;
@@ -3204,6 +3224,18 @@ void ReportCollectCosts() {
                                              since(counts.missed[static_cast<std::size_t>(TokenMiss::Busy)], reported.missed[static_cast<std::size_t>(TokenMiss::Busy)]), since(counts.verified, reported.verified), since(counts.late, reported.late));
         reported = counts;
         reportedTicks = sweepTicks;
+        if (tokenBreaksCounted()) {
+            auto& breaks = tokenBreaks();
+            const auto taken = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+            const auto exact = taken(breaks.exact);
+            const auto exactCpu = taken(breaks.exactCpu);
+            const auto pages = taken(breaks.pages);
+            const auto neighbour = taken(breaks.neighbour);
+            const auto unknown = taken(breaks.unknown);
+            const auto exactBytes = taken(breaks.exactBytes);
+            const auto neighbourBytes = taken(breaks.neighbourBytes);
+            AgcDriver::ProfilePrint_nid_no_patch("[token-breaks] (10 s): of the tokens broken by a write, %llu had a write the tracker places in their own range (%llu of them by the CPU, %.0f bytes a range), %llu only in the 4 KiB pages around the range, %llu only elsewhere in their 64 KiB blocks (%.0f bytes a range), %llu were taken by another thread\n", exact, exactCpu, exact == 0 ? 0.0 : static_cast<double>(exactBytes) / static_cast<double>(exact), pages, neighbour, neighbour == 0 ? 0.0 : static_cast<double>(neighbourBytes) / static_cast<double>(neighbour), unknown);
+        }
     }
 #ifdef _WIN32
     static std::uint64_t reportedCalls = 0;
@@ -3491,6 +3523,47 @@ void verifyEpochAnswer(std::uint64_t address, std::size_t bytes) {
     if (observe(address, bytes, false).status == Observation::Status::Complete && contentSum(first, stop) != entry.token.content) sweep.late.fetch_add(1, std::memory_order_relaxed);
 }
 
+struct TakenToken {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint64_t content = 0;
+    std::uint64_t generation = 0;
+};
+struct TakenTokenSlot {};
+
+std::uint64_t takenKey(std::uint64_t address, std::uint64_t bytes) {
+    return (address * 0x9E3779B97F4A7C15ull) ^ bytes;
+}
+
+void noteTakenToken(std::uint64_t address, std::size_t bytes, std::uint64_t content, std::uint64_t generation) {
+    auto& taken = ThreadScratch<std::unordered_map<std::uint64_t, TakenToken>, TakenTokenSlot>();
+    if (taken.size() > 262144) taken.clear();
+    taken[takenKey(address, bytes)] = {address, bytes, content, generation};
+}
+
+void countTokenBreak(std::uint64_t address, std::size_t bytes, std::uint64_t first, std::uint64_t stop, const ContentToken& token) {
+    auto& breaks = tokenBreaks();
+    auto& taken = ThreadScratch<std::unordered_map<std::uint64_t, TakenToken>, TakenTokenSlot>();
+    const auto found = taken.find(takenKey(address, bytes));
+    if (found == taken.end() || found->second.address != address || found->second.bytes != bytes || found->second.content != token.content) {
+        breaks.unknown.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    const auto generation = found->second.generation;
+    if (!UnchangedSince(address, bytes, generation)) {
+        breaks.exact.fetch_add(1, std::memory_order_relaxed);
+        breaks.exactBytes.fetch_add(bytes, std::memory_order_relaxed);
+        if (CpuWroteSince(address, bytes, generation)) breaks.exactCpu.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    if (!UnchangedSince(first, static_cast<std::size_t>(stop - first), generation)) {
+        breaks.pages.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    breaks.neighbour.fetch_add(1, std::memory_order_relaxed);
+    breaks.neighbourBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
 void collectHotRuns(const WriteTracker& tracker, EpochSweepState& sweep, std::uint64_t epoch) {
     sweep.runs.clear();
     const auto* table = tracker.observationTable.load(std::memory_order_acquire);
@@ -3584,6 +3657,7 @@ ContentToken TokenFor(std::uint64_t address, std::size_t bytes) {
         return {};
     }
     sweep.tokens.fetch_add(1, std::memory_order_relaxed);
+    if (tokenBreaksCounted()) noteTakenToken(address, bytes, token.content, generation);
     return token;
 }
 
@@ -3601,7 +3675,10 @@ bool StillCurrent(std::uint64_t address, std::size_t bytes, const ContentToken& 
     std::uint64_t content = 0;
     std::uint64_t generation = 0;
     if (const auto miss = readContent(first, stop, content, generation)) return missed(*miss);
-    if (content != token.content) return missed(TokenMiss::Written);
+    if (content != token.content) {
+        if (tokenBreaksCounted()) countTokenBreak(address, bytes, first, stop, token);
+        return missed(TokenMiss::Written);
+    }
     sweep.held.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
