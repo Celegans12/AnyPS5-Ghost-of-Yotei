@@ -6715,6 +6715,11 @@ struct ResidentStats {
     std::atomic<std::uint64_t> partialSavedBytes{0};
     std::atomic<std::uint64_t> full{0};
     std::atomic<std::uint64_t> fullBytes{0};
+    std::atomic<std::uint64_t> fresh{0};
+    std::atomic<std::uint64_t> stale{0};
+    std::atomic<std::uint64_t> moved{0};
+    std::atomic<std::uint64_t> rewritten{0};
+    std::atomic<std::uint64_t> unsealed{0};
     std::atomic<std::uint64_t> untracked{0};
     std::atomic<std::uint64_t> blocked{0};
     std::atomic<std::uint64_t> sealed{0};
@@ -6734,7 +6739,7 @@ constexpr std::uint64_t ResidentIdleFrames = 2;
 thread_local const GuestBufferMemory::OwnWriteScope* ownWriteScope = nullptr;
 
 bool residentStagingEnabled() {
-    static const bool enabled = std::getenv("APS5_RESIDENT_STAGING") != nullptr;
+    static const bool enabled = ResidentStagingDefault(std::getenv("APS5_NO_RESIDENT_STAGING"));
     const auto forced = residentForTests.load(std::memory_order_relaxed);
     return forced >= 0 ? forced != 0 : enabled;
 }
@@ -6794,6 +6799,7 @@ std::shared_ptr<ResidentShadow> acquireResident(const Context& context, std::uin
         if (auto found = liveResident(registry, context.device, begin, end, usage)) {
             holdResident(registry, found, frame);
             ResidentCounters().shared.fetch_add(1, std::memory_order_relaxed);
+            sharedShadowHits.fetch_add(1, std::memory_order_relaxed);
             return found;
         }
     }
@@ -6815,6 +6821,7 @@ std::shared_ptr<ResidentShadow> acquireResident(const Context& context, std::uin
     }
     if (raced != nullptr) {
         ResidentCounters().shared.fetch_add(1, std::memory_order_relaxed);
+        sharedShadowHits.fetch_add(1, std::memory_order_relaxed);
         return raced;
     }
     ResidentCounters().made.fetch_add(1, std::memory_order_relaxed);
@@ -6856,8 +6863,7 @@ void clearResidents(VkDevice device) {
 }
 
 struct ResidentUse {
-    enum class Kind : std::uint8_t { Full, Partial, Skip };
-    Kind kind = Kind::Full;
+    ResidentCopyIn kind = ResidentCopyIn::Whole;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
     std::uint64_t serial = 0;
 };
@@ -6869,25 +6875,32 @@ ResidentUse beginResidentUse(const Context& context, ResidentShadow& shadow, VkB
     const auto bytes = static_cast<std::size_t>(shadow.end - shadow.begin);
     const auto registered = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto frame = inputTwinFrames.load(std::memory_order_relaxed);
-    bool current = false;
-    std::uint64_t held = 0;
+    ResidentShadowState state;
     std::uint64_t serial = 0;
+    bool filled = false;
     {
         std::lock_guard lock(registry.mutex);
-        current = !blocked && shadow.current && shadow.source == source && shadow.sourceBase == sourceBase && shadow.registryGeneration == registered;
-        held = shadow.generation;
+        filled = shadow.source != VK_NULL_HANDLE;
+        state.current = shadow.current;
+        state.blocked = blocked;
+        state.sameSource = shadow.source == source && shadow.sourceBase == sourceBase;
+        state.sameRegistry = shadow.registryGeneration == registered;
+        state.generation = shadow.generation;
         serial = shadow.serial;
         shadow.current = false;
         shadow.frame = frame;
     }
     if (blocked) stats.blocked.fetch_add(1, std::memory_order_relaxed);
     std::uint64_t collected = 0;
-    if (current && GuestMemory::CpuWrittenSince(shadow.begin, bytes, held, use.ranges, collected)) {
-        std::uint64_t dirty = 0;
-        for (const auto& [from, to] : use.ranges) dirty += to - from;
-        use.kind = dirty == 0 ? ResidentUse::Kind::Skip : dirty <= bytes / 2u ? ResidentUse::Kind::Partial : ResidentUse::Kind::Full;
+    if (ResidentShadowKept(state)) {
+        const bool tracked = GuestMemory::CpuWrittenSince(shadow.begin, bytes, state.generation, use.ranges, collected);
+        use.kind = ResidentCopyInFor(state, tracked, use.ranges, shadow.begin, shadow.end);
+        if (tracked && use.kind == ResidentCopyIn::Whole) stats.rewritten.fetch_add(1, std::memory_order_relaxed);
+    } else if (!blocked) {
+        auto& reason = !filled ? stats.fresh : !state.sameSource || !state.sameRegistry ? stats.moved : stats.stale;
+        reason.fetch_add(1, std::memory_order_relaxed);
     }
-    if (use.kind == ResidentUse::Kind::Full) {
+    if (use.kind == ResidentCopyIn::Whole) {
         use.ranges.clear();
         collected = GuestMemory::CollectWritesUncached(shadow.begin, bytes);
         if (collected == 0 && WatchedAfterSettle(context, shadow.begin, bytes)) collected = GuestMemory::CollectWritesUncached(shadow.begin, bytes);
@@ -6901,11 +6914,11 @@ ResidentUse beginResidentUse(const Context& context, ResidentShadow& shadow, VkB
         shadow.sourceBase = sourceBase;
         shadow.registryGeneration = registered;
         if (raced) shadow.generation = 0;
-        else if (use.kind != ResidentUse::Kind::Skip) shadow.generation = collected;
+        else if (use.kind != ResidentCopyIn::Skipped) shadow.generation = collected;
         use.serial = shadow.generation != 0 ? shadow.serial : 0;
     }
     if (raced) {
-        use.kind = ResidentUse::Kind::Full;
+        use.kind = ResidentCopyIn::Whole;
         use.ranges.clear();
     }
     return use;
@@ -6921,12 +6934,12 @@ std::uint64_t continueResidentUse(ResidentShadow& shadow, VkBuffer source, std::
     return current ? shadow.serial : 0;
 }
 
-void noteResidentEntry(ResidentUse::Kind kind, std::uint64_t bytes, std::uint64_t refreshed) {
+void noteResidentEntry(ResidentCopyIn kind, std::uint64_t bytes, std::uint64_t refreshed) {
     auto& stats = ResidentCounters();
-    if (kind == ResidentUse::Kind::Skip) {
+    if (kind == ResidentCopyIn::Skipped) {
         stats.skipped.fetch_add(1, std::memory_order_relaxed);
         stats.skippedBytes.fetch_add(bytes, std::memory_order_relaxed);
-    } else if (kind == ResidentUse::Kind::Partial) {
+    } else if (kind == ResidentCopyIn::Limited) {
         stats.partial.fetch_add(1, std::memory_order_relaxed);
         stats.partialBytes.fetch_add(refreshed, std::memory_order_relaxed);
         stats.partialSavedBytes.fetch_add(bytes - refreshed, std::memory_order_relaxed);
@@ -7025,7 +7038,7 @@ void reportStaging() {
     AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging landings: %s; %llu shadows shared with an earlier build, %llu MiB in live shadows\n", landings.empty() ? "none" : landings.c_str(), static_cast<unsigned long long>(sharedShadowHits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(liveShadowBytes.load(std::memory_order_relaxed) >> 20u));
     if (residentStagingEnabled()) {
         const auto resident = ResidentStagingCounters();
-        AgcDriver::ProfilePrint_nid_no_patch("[buffers] resident staging (cumulative): %llu shadows made, %llu taken from another build, %llu live; copy-ins: %llu skipped (%.0f KiB not read from imports), %llu limited to the pages the CPU wrote (%.0f KiB copied, %.0f KiB not), %llu whole (%.0f KiB; %llu untracked, %llu under a label or queued store); %llu uses left the shadow current, %llu shadows outdated by recorded writes or driver stores; verified %llu, differing %llu\n", static_cast<unsigned long long>(resident.made), static_cast<unsigned long long>(resident.shared), static_cast<unsigned long long>(resident.live), static_cast<unsigned long long>(resident.skipped), resident.skippedBytes / 1024.0, static_cast<unsigned long long>(resident.partial), resident.partialBytes / 1024.0, resident.partialSavedBytes / 1024.0, static_cast<unsigned long long>(resident.full), resident.fullBytes / 1024.0, static_cast<unsigned long long>(resident.untracked), static_cast<unsigned long long>(resident.blocked), static_cast<unsigned long long>(resident.sealed), static_cast<unsigned long long>(resident.outdated), static_cast<unsigned long long>(resident.verified), static_cast<unsigned long long>(resident.differing));
+        AgcDriver::ProfilePrint_nid_no_patch("[buffers] resident staging (cumulative): %llu shadows made, %llu taken from another build, %llu live; copy-ins: %llu skipped (%.0f KiB not read from imports), %llu limited to the pages the CPU wrote (%.0f KiB copied, %.0f KiB not), %llu whole (%.0f KiB; %llu first uses, %llu of a shadow not left current, %llu after a changed import or registry, %llu with more than half written by the CPU, %llu untracked, %llu under a label or queued store); %llu uses left the shadow current, %llu did not after a write recorded during the use, %llu shadows outdated by recorded writes or driver stores; verified %llu, differing %llu\n", static_cast<unsigned long long>(resident.made), static_cast<unsigned long long>(resident.shared), static_cast<unsigned long long>(resident.live), static_cast<unsigned long long>(resident.skipped), resident.skippedBytes / 1024.0, static_cast<unsigned long long>(resident.partial), resident.partialBytes / 1024.0, resident.partialSavedBytes / 1024.0, static_cast<unsigned long long>(resident.full), resident.fullBytes / 1024.0, static_cast<unsigned long long>(resident.fresh), static_cast<unsigned long long>(resident.stale), static_cast<unsigned long long>(resident.moved), static_cast<unsigned long long>(resident.rewritten), static_cast<unsigned long long>(resident.untracked), static_cast<unsigned long long>(resident.blocked), static_cast<unsigned long long>(resident.sealed), static_cast<unsigned long long>(resident.unsealed), static_cast<unsigned long long>(resident.outdated), static_cast<unsigned long long>(resident.verified), static_cast<unsigned long long>(resident.differing));
     }
     if (Recorder::ReadTrapEnabled()) {
         const auto trap = Recorder::ReadTrapCounts();
@@ -7462,7 +7475,10 @@ void GuestBufferMemory::sealResident(Region& region) {
     if (serial == 0 || !usesResident(region)) return;
     auto& shadow = *region.resident;
     std::lock_guard lock(Residents().mutex);
-    if (shadow.serial != serial || shadow.generation == 0) return;
+    if (shadow.serial != serial || shadow.generation == 0) {
+        ResidentCounters().unsealed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
     shadow.current = true;
     ResidentCounters().sealed.fetch_add(1, std::memory_order_relaxed);
 }
@@ -8259,7 +8275,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
         residentUses[index] = beginResidentUse(context, *region->resident, region->copySource, region->copySourceBase, residentBlocked[index] != 0);
         region->residentSerial = residentUses[index].serial;
-        if (residentUses[index].kind != ResidentUse::Kind::Skip) everySkipped = false;
+        if (residentUses[index].kind != ResidentCopyIn::Skipped) everySkipped = false;
     }
     if (everySkipped && !verifyResident && !capture) {
         for (auto* region : copies) {
@@ -8267,7 +8283,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             region->shadowCopy = nullptr;
             recorder->Keep(region->buffer);
             traceStaged(region->begin, region->end, region->atomic);
-            noteResidentEntry(ResidentUse::Kind::Skip, region->end - region->begin, 0);
+            noteResidentEntry(ResidentCopyIn::Skipped, region->end - region->begin, 0);
             if (profile) {
                 Copies().staged.fetch_add(1, std::memory_order_relaxed);
                 if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
@@ -8330,7 +8346,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         if (usesResident(*region)) {
             const auto& use = residentUses[index];
             std::uint64_t refreshed = 0;
-            if (use.kind != ResidentUse::Kind::Full) {
+            if (use.kind != ResidentCopyIn::Whole) {
                 recorder->Keep(region->buffer);
                 for (const auto& [from, to] : use.ranges) {
                     CopyBuffer(context, commands, region->copySource, from - region->copySourceBase, region->buffer->Handle(), from - region->begin, to - from);
@@ -8339,7 +8355,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 }
             }
             noteResidentEntry(use.kind, bytes, refreshed);
-            if (use.kind != ResidentUse::Kind::Full) {
+            if (use.kind != ResidentCopyIn::Whole) {
                 copiedBytes += refreshed;
                 region->snapshot.clear();
                 traceStaged(region->begin, region->end, region->atomic);
@@ -8381,6 +8397,10 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 region->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(context, addressable), copyBufferProperties(false));
             }
             if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
+            if (usesResident(*region)) {
+                region->residentSerial = beginResidentUse(context, *region->resident, region->copySource, region->copySourceBase, false).serial;
+                noteResidentEntry(ResidentCopyIn::Whole, bytes, 0);
+            }
         }
         std::vector<std::byte> expected;
         const auto address = region->begin;
@@ -9275,6 +9295,11 @@ ResidentStagingCounts ResidentStagingCounters() {
     counts.partialSavedBytes = stats.partialSavedBytes.load(std::memory_order_relaxed);
     counts.full = stats.full.load(std::memory_order_relaxed);
     counts.fullBytes = stats.fullBytes.load(std::memory_order_relaxed);
+    counts.fresh = stats.fresh.load(std::memory_order_relaxed);
+    counts.stale = stats.stale.load(std::memory_order_relaxed);
+    counts.moved = stats.moved.load(std::memory_order_relaxed);
+    counts.rewritten = stats.rewritten.load(std::memory_order_relaxed);
+    counts.unsealed = stats.unsealed.load(std::memory_order_relaxed);
     counts.untracked = stats.untracked.load(std::memory_order_relaxed);
     counts.blocked = stats.blocked.load(std::memory_order_relaxed);
     counts.sealed = stats.sealed.load(std::memory_order_relaxed);
@@ -9283,6 +9308,27 @@ ResidentStagingCounts ResidentStagingCounters() {
     counts.differing = stats.differing.load(std::memory_order_relaxed);
     counts.live = liveResidents.load(std::memory_order_relaxed);
     return counts;
+}
+
+bool ResidentShadowKept(const ResidentShadowState& state) {
+    return state.current && !state.blocked && state.sameSource && state.sameRegistry && state.generation != 0;
+}
+
+ResidentCopyIn ResidentCopyInFor(const ResidentShadowState& state, bool tracked, std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::uint64_t begin, std::uint64_t end) {
+    if (!ResidentShadowKept(state) || !tracked || begin >= end) return ResidentCopyIn::Whole;
+    std::uint64_t dirty = 0;
+    auto at = begin;
+    for (const auto& [from, to] : written) {
+        if (from < at || from >= to || to > end) return ResidentCopyIn::Whole;
+        dirty += to - from;
+        at = to;
+    }
+    if (dirty == 0) return ResidentCopyIn::Skipped;
+    return dirty <= (end - begin) / 2u ? ResidentCopyIn::Limited : ResidentCopyIn::Whole;
+}
+
+bool ResidentStagingDefault(const char* disabled) {
+    return disabled == nullptr;
 }
 
 bool ResidentStagingEnabled() {

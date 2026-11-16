@@ -267,6 +267,11 @@ struct ResidentStagingCounts {
     std::uint64_t partialSavedBytes = 0;
     std::uint64_t full = 0;
     std::uint64_t fullBytes = 0;
+    std::uint64_t fresh = 0;
+    std::uint64_t stale = 0;
+    std::uint64_t moved = 0;
+    std::uint64_t rewritten = 0;
+    std::uint64_t unsealed = 0;
     std::uint64_t untracked = 0;
     std::uint64_t blocked = 0;
     std::uint64_t sealed = 0;
@@ -276,6 +281,17 @@ struct ResidentStagingCounts {
     std::uint64_t live = 0;
 };
 ResidentStagingCounts ResidentStagingCounters();
+enum class ResidentCopyIn : std::uint8_t { Whole, Limited, Skipped };
+struct ResidentShadowState {
+    bool current = false;
+    bool blocked = false;
+    bool sameSource = false;
+    bool sameRegistry = false;
+    std::uint64_t generation = 0;
+};
+bool ResidentShadowKept(const ResidentShadowState& state);
+ResidentCopyIn ResidentCopyInFor(const ResidentShadowState& state, bool tracked, std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::uint64_t begin, std::uint64_t end);
+bool ResidentStagingDefault(const char* disabled);
 bool ResidentStagingEnabled();
 void SetResidentStagingForTests(bool enabled, bool verified);
 
