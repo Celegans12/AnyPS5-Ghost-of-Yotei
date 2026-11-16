@@ -20,6 +20,21 @@
 
 namespace AgcDriver::DriverDetail {
 
+std::atomic<std::uint32_t>& BlockedReaders() {
+    static std::atomic<std::uint32_t> readers{0};
+    return readers;
+}
+
+bool CoreOffDraw() {
+    static const bool enabled = std::getenv("APS5_CORE_OFF_DRAW") != nullptr;
+    return enabled;
+}
+
+bool VerifyCoreOffDraw() {
+    static const bool enabled = std::getenv("APS5_VERIFY_CORE_OFF_DRAW") != nullptr;
+    return enabled;
+}
+
 void PollSleep() {
 #ifdef _WIN32
     thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -352,7 +367,13 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     struct BlockedWait {
         Driver& driver;
         std::uint32_t queue;
-        ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
+        BlockedWait(Driver& driver, std::uint32_t queue) : driver(driver), queue(queue) { BlockedReaders().fetch_add(1, std::memory_order_acq_rel); }
+        ~BlockedWait() {
+            BlockedReaders().fetch_sub(1, std::memory_order_acq_rel);
+            driver.noteWaitBlocked(queue, 0, false);
+        }
+        BlockedWait(const BlockedWait&) = delete;
+        BlockedWait& operator=(const BlockedWait&) = delete;
     } blocked{*this, queue};
     static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
     static const bool storeHeldResults = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") == nullptr;

@@ -235,6 +235,10 @@ public:
         std::uint64_t checked, exact, moved, refused, filtered, rebuilt, kept, served;
     };
     static DispatchMoveCount DispatchMoveCounts();
+    struct OffDrawCount {
+        std::uint64_t labels, firstMarks, repeatedMarks, overflowedMarks, verifiedMarks, marksOverWrites, reapsSkipped, reapsVerified, reapsLate;
+    };
+    static OffDrawCount OffDrawCounts();
     void ResolveMemory(std::uint64_t address, std::size_t bytes, bool writable);
     void* Window() const;
     void Resize(std::uint32_t width, std::uint32_t height);

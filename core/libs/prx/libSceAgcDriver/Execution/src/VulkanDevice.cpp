@@ -73,6 +73,8 @@
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureFormat.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
+#include "prx/libSceAgcDriver/Core/include/LabelBatch.hpp"
 #include "prx/libc/include/General.hpp"
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libc/include/RunReportComponent.hpp"
@@ -2990,6 +2992,66 @@ bool LabelMarksPerBatch() {
     return enabled;
 }
 
+struct OffDrawLabels {
+    Core::LabelBatch batch;
+    const Graphics::Recorder* recorder = nullptr;
+    std::uint64_t markSerial = 0;
+    std::uint64_t reapSerial = 0;
+};
+
+OffDrawLabels& offDrawLabels() {
+    static OffDrawLabels labels;
+    return labels;
+}
+
+std::atomic<std::uint64_t> offDrawVerifiedMarks{0}, offDrawMarksOverWrites{0}, offDrawReapsSkipped{0}, offDrawReapsVerified{0}, offDrawReapsLate{0};
+std::atomic<std::uint64_t> offDrawLabelCount{0}, offDrawFirstMarks{0}, offDrawRepeatedMarks{0}, offDrawOverflowedMarks{0};
+
+bool offDrawReapOwed(Graphics::Recorder& recorder) {
+    auto& labels = offDrawLabels();
+    const auto serial = recorder.OpenBatchSerial();
+    const bool sameBatch = labels.recorder == &recorder && serial != 0 && serial == labels.reapSerial;
+    labels.recorder = &recorder;
+    labels.reapSerial = serial;
+    if (!sameBatch) return true;
+    return Graphics::Recorder::PendingCompletionLabels() != 0 || Graphics::Recorder::PendingCompletionStores() != 0 || Graphics::Recorder::PendingWriteBackCompletions() != 0;
+}
+
+void offDrawMark(Graphics::Recorder& recorder, std::uint64_t address, std::size_t bytes) {
+    auto& labels = offDrawLabels();
+    const auto serial = recorder.OpenBatchSerial();
+    if (labels.recorder != &recorder || labels.markSerial != serial) {
+        labels.batch.Close();
+        labels.recorder = &recorder;
+        labels.markSerial = serial;
+    }
+    const auto before = labels.batch.Counted();
+    const bool first = labels.batch.First(address, bytes);
+    const auto after = labels.batch.Counted();
+    offDrawLabelCount.fetch_add(1, std::memory_order_relaxed);
+    if (after.overflowed != before.overflowed) offDrawOverflowedMarks.fetch_add(1, std::memory_order_relaxed);
+    if (first) {
+        offDrawFirstMarks.fetch_add(1, std::memory_order_relaxed);
+        GuestMemory::MarkWritten(address, bytes);
+        return;
+    }
+    offDrawRepeatedMarks.fetch_add(1, std::memory_order_relaxed);
+    if (DriverDetail::VerifyCoreOffDraw()) {
+        const auto block = address & ~(std::uint64_t{GuestMemory::MarkBlockBytes} - 1);
+        const auto span = ((address + bytes - 1) & ~(std::uint64_t{GuestMemory::MarkBlockBytes} - 1)) + GuestMemory::MarkBlockBytes - block;
+        const auto generation = GuestMemory::TrackerGeneration();
+        static_cast<void>(GuestMemory::CollectWrites(block, static_cast<std::size_t>(span)));
+        offDrawVerifiedMarks.fetch_add(1, std::memory_order_relaxed);
+        if (GuestMemory::NewestStamp(block, static_cast<std::size_t>(span)) > generation) offDrawMarksOverWrites.fetch_add(1, std::memory_order_relaxed);
+    }
+    GuestMemory::MarkWrittenInCollectedBlock(address, bytes);
+}
+
+}
+
+VulkanDevice::OffDrawCount VulkanDevice::OffDrawCounts() {
+    const auto read = [](const std::atomic<std::uint64_t>& value) { return value.load(std::memory_order_relaxed); };
+    return OffDrawCount{read(offDrawLabelCount), read(offDrawFirstMarks), read(offDrawRepeatedMarks), read(offDrawOverflowedMarks), read(offDrawVerifiedMarks), read(offDrawMarksOverWrites), read(offDrawReapsSkipped), read(offDrawReapsVerified), read(offDrawReapsLate)};
 }
 
 void VulkanDevice::StoreIdleResults(bool reapFirst, const std::function<bool()>& stop) {
@@ -3098,7 +3160,19 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     // against queue 0; its label goes behind a completion instead (reason 5, still no wait).
     // Debug aid: APS5_LABEL_REAP_ALL_QUEUES=1 reaps on every queue as before.
     static const bool reapAllQueues = std::getenv("APS5_LABEL_REAP_ALL_QUEUES") != nullptr;
-    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) recorder.Reap();
+    const bool offDraw = DriverDetail::CoreOffDraw();
+    if (reapFirst && (queue == 0 || reapAllQueues) && OpportunisticReap()) {
+        if (!offDraw || offDrawReapOwed(recorder)) {
+            recorder.Reap();
+        } else if (DriverDetail::VerifyCoreOffDraw()) {
+            const auto inFlight = recorder.InFlightBatches();
+            recorder.Reap();
+            offDrawReapsVerified.fetch_add(1, std::memory_order_relaxed);
+            if (recorder.InFlightBatches() != inFlight) offDrawReapsLate.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            offDrawReapsSkipped.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
     if (recorder.Idle()) return 1;
     static const bool drain = std::getenv("APS5_DRAIN_COMPLETION_LABELS") != nullptr;
     const auto context = graphicsContext();
@@ -3177,7 +3251,8 @@ int VulkanDevice::WriteLabelOnGpu(std::uint64_t address, std::span<const std::by
     recorder.NoteLabel(address, bytes, stamp, queue);
     {
         const Graphics::BufferCache::LabelMark marked;
-        if (LabelMarksPerBatch() && recorder.LabelBlockMarked(address, bytes.size())) GuestMemory::MarkWrittenInCollectedBlock(address, bytes.size());
+        if (offDraw) offDrawMark(recorder, address, bytes.size());
+        else if (LabelMarksPerBatch() && recorder.LabelBlockMarked(address, bytes.size())) GuestMemory::MarkWrittenInCollectedBlock(address, bytes.size());
         else GuestMemory::MarkWritten(address, bytes.size());
     }
     // No submit per label: the batch goes out at the queue worker's next non-label packet, at a

@@ -9,9 +9,16 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Core/include/SubmitPolicy.hpp"
 #include <algorithm>
 #include <chrono>
+#include <array>
+#include <atomic>
 #include <cstdlib>
+#include <limits>
+#include <string>
 
 namespace AgcDriver::DriverDetail {
 
@@ -39,6 +46,65 @@ std::atomic<std::uint64_t> submitsHeld{0}, heldSubmittedLast{0}, heldSubmittedDu
 
 std::chrono::steady_clock::time_point HeldSubmitSince(std::chrono::steady_clock::rep since) {
     return std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(since));
+}
+
+constexpr std::size_t SubmitCauses = static_cast<std::size_t>(Core::SubmitCause::Count);
+std::array<std::atomic<std::uint64_t>, SubmitCauses> endCauses{}, heldCauses{};
+std::atomic<std::uint64_t> heldLongestNs{0}, heldOverdue{0}, heldCheckedNs{0};
+
+std::uint64_t PolicyNs(std::chrono::steady_clock::time_point time) {
+    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
+    return ns > 0 ? static_cast<std::uint64_t>(ns) : 1u;
+}
+
+Core::SubmitState PolicyState(std::chrono::steady_clock::time_point now, bool held, std::chrono::steady_clock::rep heldSince, std::size_t queued) {
+    Core::SubmitState state;
+    state.now = PolicyNs(now);
+    if (const auto pending = Graphics::Recorder::PendingLabelSince(); pending.has_value()) state.oldestLabel = PolicyNs(*pending);
+    if (held) state.heldSince = PolicyNs(HeldSubmitSince(heldSince));
+    state.work = static_cast<std::uint32_t>(std::min<std::uint64_t>(Graphics::Recorder::RecordedWorkSinceSubmit(), std::numeric_limits<std::uint32_t>::max()));
+    state.queued = static_cast<std::uint32_t>(std::min<std::size_t>(queued, std::numeric_limits<std::uint32_t>::max()));
+    state.waiter = BlockedReaders().load(std::memory_order_acquire) != 0;
+    return state;
+}
+
+Core::SubmitLimits PolicyLimits(std::chrono::microseconds deadline, std::uint64_t cap) {
+    Core::SubmitLimits limits;
+    limits.deadline = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(deadline).count());
+    limits.groupWork = static_cast<std::uint32_t>(std::min<std::uint64_t>(SubmitGroupWork(), std::numeric_limits<std::uint32_t>::max()));
+    limits.workCap = static_cast<std::uint32_t>(std::min<std::uint64_t>(cap, std::numeric_limits<std::uint32_t>::max()));
+    return limits;
+}
+
+void ReportOffDraw(std::chrono::steady_clock::time_point now) {
+    static const bool reported = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr || VerifyCoreOffDraw();
+    if (!reported) return;
+    static std::chrono::steady_clock::time_point last = now;
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    static std::array<std::uint64_t, SubmitCauses> reportedEnds{}, reportedHeld{};
+    static VulkanDevice::OffDrawCount reportedCounts{};
+    static std::uint64_t reportedOverdue = 0;
+    std::string ends;
+    std::string held;
+    for (std::size_t i = 0; i < SubmitCauses; ++i) {
+        const auto name = Core::SubmitCauseName(static_cast<Core::SubmitCause>(i));
+        const auto end = endCauses[i].load(std::memory_order_relaxed);
+        const auto later = heldCauses[i].load(std::memory_order_relaxed);
+        if (end != reportedEnds[i]) ends += " " + std::string(name) + " " + std::to_string(end - reportedEnds[i]);
+        if (later != reportedHeld[i]) held += " " + std::string(name) + " " + std::to_string(later - reportedHeld[i]);
+        reportedEnds[i] = end;
+        reportedHeld[i] = later;
+    }
+    const auto counts = VulkanDevice::OffDrawCounts();
+    const auto overdue = heldOverdue.load(std::memory_order_relaxed);
+    const auto since = [](std::uint64_t current, std::uint64_t before) { return static_cast<unsigned long long>(current - before); };
+    AgcDriver::ProfilePrint_nid_no_patch("[core-off-draw] (10 s): submission ends by cause:%s; held batches submitted by cause:%s; longest hold %.1f us, %llu kept by a check past the deadline; labels %llu, %llu first in a block of their batch, %llu repeated, %llu past the table; verify: %llu repeated marks collected, %llu over a CPU write; label reaps skipped %llu, verify: %llu made anyway, %llu retired a batch\n",
+                                         ends.empty() ? " none" : ends.c_str(), held.empty() ? " none" : held.c_str(), static_cast<double>(heldLongestNs.exchange(0, std::memory_order_relaxed)) / 1e3, since(overdue, reportedOverdue),
+                                         since(counts.labels, reportedCounts.labels), since(counts.firstMarks, reportedCounts.firstMarks), since(counts.repeatedMarks, reportedCounts.repeatedMarks), since(counts.overflowedMarks, reportedCounts.overflowedMarks),
+                                         since(counts.verifiedMarks, reportedCounts.verifiedMarks), since(counts.marksOverWrites, reportedCounts.marksOverWrites), since(counts.reapsSkipped, reportedCounts.reapsSkipped), since(counts.reapsVerified, reportedCounts.reapsVerified), since(counts.reapsLate, reportedCounts.reapsLate));
+    reportedCounts = counts;
+    reportedOverdue = overdue;
 }
 
 }
@@ -102,7 +168,24 @@ void Driver::deferCompletion(const Submission& submission) {
 }
 
 bool Driver::holdSubmit() {
-    if (!SubmitGroup() || !DrawPipeline::Active() || DrawPipeline::Queue0().Outstanding() <= 1) return false;
+    if (CoreOffDraw()) {
+        if (DrawPipeline::Flat()) return false;
+        const auto now = std::chrono::steady_clock::now();
+        const bool held = heldSubmit.load(std::memory_order_acquire);
+        const auto outstanding = DrawPipeline::Queue0().Outstanding();
+        const auto cause = Core::AtSubmissionEnd(PolicyState(now, held, heldSince.load(std::memory_order_acquire), outstanding > 1 ? outstanding - 1 : 0), PolicyLimits(labelFlushDeadline(), batchCap()));
+        endCauses[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+        ReportOffDraw(now);
+        if (cause != Core::SubmitCause::Held) return false;
+        if (!held) {
+            heldCheckedNs.store(0, std::memory_order_relaxed);
+            heldSince.store(now.time_since_epoch().count(), std::memory_order_release);
+            heldSubmit.store(true, std::memory_order_release);
+        }
+        submitsHeld.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    if (!SubmitGroup() || DrawPipeline::Queue0().Outstanding() <= 1) return false;
     if (Graphics::Recorder::RecordedWorkSinceSubmit() >= SubmitGroupWork()) return false;
     const auto now = std::chrono::steady_clock::now();
     const auto pending = Graphics::Recorder::PendingLabelSince();
@@ -123,9 +206,26 @@ void Driver::SubmitHeldWork(bool last) {
         if (heldSubmit.exchange(false, std::memory_order_acq_rel)) heldSubmittedElsewhere.fetch_add(1, std::memory_order_relaxed);
         return;
     }
-    const bool due = std::chrono::steady_clock::now() - HeldSubmitSince(heldSince.load(std::memory_order_acquire)) >= labelFlushDeadline();
-    const bool full = Graphics::Recorder::RecordedWorkSinceSubmit() >= SubmitGroupWork();
-    if (!last && !due && !full) return;
+    const auto now = std::chrono::steady_clock::now();
+    const auto since = HeldSubmitSince(heldSince.load(std::memory_order_acquire));
+    bool due = now - since >= labelFlushDeadline();
+    bool full = Graphics::Recorder::RecordedWorkSinceSubmit() >= SubmitGroupWork();
+    if (CoreOffDraw()) {
+        const auto cause = Core::AfterOp(PolicyState(now, true, heldSince.load(std::memory_order_acquire), last ? 0 : 1), PolicyLimits(labelFlushDeadline(), batchCap()));
+        const auto heldNs = static_cast<std::uint64_t>(std::max<std::chrono::nanoseconds::rep>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(now - since).count()));
+        const auto deadlineNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(labelFlushDeadline()).count());
+        if (cause == Core::SubmitCause::Held) {
+            heldCheckedNs.store(heldNs, std::memory_order_relaxed);
+            return;
+        }
+        if (heldCheckedNs.exchange(0, std::memory_order_relaxed) >= deadlineNs) heldOverdue.fetch_add(1, std::memory_order_relaxed);
+        heldCauses[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+        due = cause == Core::SubmitCause::Deadline;
+        full = cause == Core::SubmitCause::Work || cause == Core::SubmitCause::Cap;
+        if (heldNs > heldLongestNs.load(std::memory_order_relaxed)) heldLongestNs.store(heldNs, std::memory_order_relaxed);
+    } else if (!last && !due && !full) {
+        return;
+    }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();

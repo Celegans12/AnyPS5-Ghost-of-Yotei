@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/LabelStores.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -49,6 +50,10 @@ struct EpochBumps {
 EpochBumps EpochBumpsCounted();
 
 void PollSleep();
+
+std::atomic<std::uint32_t>& BlockedReaders();
+bool CoreOffDraw();
+bool VerifyCoreOffDraw();
 
 bool OwnStoreRejects(std::span<const std::uint32_t> packet, std::uint64_t awaited, std::size_t bytes, std::uint32_t queue);
 
