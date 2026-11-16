@@ -279,6 +279,10 @@ struct ResidentStagingCounts {
     std::uint64_t verified = 0;
     std::uint64_t differing = 0;
     std::uint64_t live = 0;
+    std::uint64_t shadowFed = 0;
+    std::uint64_t shadowFedBytes = 0;
+    std::uint64_t shadowReturned = 0;
+    std::uint64_t shadowReturnedBytes = 0;
 };
 ResidentStagingCounts ResidentStagingCounters();
 enum class ResidentCopyIn : std::uint8_t { Whole, Limited, Skipped };
@@ -294,6 +298,7 @@ ResidentCopyIn ResidentCopyInFor(const ResidentShadowState& state, bool tracked,
 bool ResidentStagingDefault(const char* disabled);
 bool ResidentStagingEnabled();
 void SetResidentStagingForTests(bool enabled, bool verified);
+bool StagedFlushCovers(std::uint64_t address, std::size_t bytes);
 
 // Identity of the read-only image mirror serving [address, address + bytes) (the counterpart of
 // HostImportSerial for main-image ranges, which no import serves): a serial unique for the life of
@@ -541,6 +546,17 @@ public:
         const OwnWriteScope* previous = nullptr;
         bool entered = false;
     };
+    class StagedFlushScope {
+    public:
+        explicit StagedFlushScope(const GuestBufferMemory& memory);
+        ~StagedFlushScope();
+        StagedFlushScope(const StagedFlushScope&) = delete;
+        StagedFlushScope& operator=(const StagedFlushScope&) = delete;
+        static bool Covers(std::uint64_t address, std::size_t bytes);
+
+    private:
+        const GuestBufferMemory* previous = nullptr;
+    };
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
@@ -646,6 +662,8 @@ private:
         bool adaptiveInPlace = false;
         std::shared_ptr<ResidentShadow> resident;
         std::uint64_t residentSerial = 0;
+        bool shadowStamped = false;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> importReturned {};
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -711,6 +729,8 @@ private:
     std::shared_ptr<Buffer> stagingShadow(Region& region, VkBufferUsageFlags usage) const;
     static bool usesResident(const Region& region);
     static void sealResident(Region& region);
+    const HostImport* stagingImport(const Region& region) const;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> returnToShadow(Recorder& recorder, Region& region, std::vector<std::pair<std::uint64_t, std::uint64_t>> written) const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenWithin(std::uint64_t begin, std::uint64_t end) const;
     void takeHeapReferences();
     void releaseHeapReferences() noexcept;

@@ -72,6 +72,7 @@ struct Statistics {
     std::atomic<std::uint64_t> detiledShadow{0}, detiledShadowBytes{0}, detiledImport{0}, detiledImportBytes{0}, tailPublishes{0};
     std::array<std::atomic<std::uint64_t>, ReasonCount> published{}, publishedBytes{};
     std::atomic<std::uint64_t> staleDroppedCpu{0}, staleDroppedDriver{0}, skippedInCompletion{0}, evictions{0}, lostOnRetire{0}, droppedOnRetire{0}, slabLost{0}, verified{0}, mismatches{0};
+    std::atomic<std::uint64_t> stagingFed{0}, stagingFedBytes{0}, stagingReturned{0}, stagingReturnedBytes{0}, stagingPublishesSkipped{0};
 };
 
 Statistics& Stats() {
@@ -526,6 +527,38 @@ bool UnitShadowEnabled() {
     return enabled;
 }
 
+std::atomic<int> stagingFromShadowForTests{-1};
+
+bool StagingFromUnitShadow() {
+    static const bool enabled = std::getenv("APS5_NO_STAGING_FROM_UNIT_SHADOW") == nullptr;
+    const auto forced = stagingFromShadowForTests.load(std::memory_order_relaxed);
+    return (forced >= 0 ? forced != 0 : enabled) && UnitShadowEnabled();
+}
+
+void SetStagingFromUnitShadowForTests(int forced) {
+    stagingFromShadowForTests.store(forced, std::memory_order_relaxed);
+}
+
+bool UnitFresh(std::uint64_t generation, std::uint8_t changed, bool slab) {
+    return generation != 0 && changed == GuestMemory::BlockUnchanged && slab;
+}
+
+std::vector<UnitRun> UnitRuns(std::uint64_t base, std::uint64_t begin, std::uint64_t end, std::span<const std::uint64_t> generations, std::span<const std::uint8_t> changed, std::span<const std::uint8_t> slabs) {
+    std::vector<UnitRun> runs;
+    if (end <= begin || begin < base) return runs;
+    const auto first = (begin - base) / UnitBytes;
+    const auto last = (end - 1 - base) / UnitBytes;
+    for (auto unit = first; unit <= last; ++unit) {
+        const auto k = static_cast<std::size_t>(unit - first);
+        const bool fresh = k < generations.size() && k < changed.size() && k < slabs.size() && UnitFresh(generations[k], changed[k], slabs[k] != 0);
+        const auto from = std::max(begin, base + unit * UnitBytes);
+        const auto to = std::min(end, base + (unit + 1) * UnitBytes);
+        if (!runs.empty() && runs.back().fresh == fresh) runs.back().end = to;
+        else runs.push_back({from, to, fresh});
+    }
+    return runs;
+}
+
 bool ShadowVerify() {
     static const bool verify = std::getenv("APS5_SHADOW_VERIFY") != nullptr;
     return verify;
@@ -579,6 +612,10 @@ PublishOnCpuScope::~PublishOnCpuScope() {
 
 std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope scope, PublishReason reason, bool waited) {
     if (!UnitShadowEnabled() || scope == PublishScope::None || bytes == 0) return 0;
+    if (reason == PublishReason::Region && !waited && StagedFlushCovers(address, bytes)) {
+        Stats().stagingPublishesSkipped.fetch_add(1, std::memory_order_relaxed);
+        return 0;
+    }
     if (!waited && Recorder::InCompletion() && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::Store) {
         // The store's own stamp makes the unit stale; a publish recorded now would land over the
         // store when the batch runs (the completion is not waited for).
@@ -778,7 +815,7 @@ std::vector<ShadowRun> ShadowSources(const Context& context, const HostImport& i
         for (auto unit = first; unit <= last; ++unit) {
             const auto k = static_cast<std::size_t>(unit - first);
             const auto& slab = shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())];
-            fresh[k] = shadow->generation[unit] != 0 && changed[k] == 0 && slab != nullptr ? 1 : 0;
+            fresh[k] = UnitFresh(shadow->generation[unit], changed[k], slab != nullptr) ? 1 : 0;
         }
         slabs = shadow->slabs;
     }
@@ -842,7 +879,29 @@ std::vector<ShadowRun> ShadowSources(const Context& context, const HostImport& i
     return result;
 }
 
-void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation) {
+std::vector<ShadowRun> StagingSources(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end) {
+    if (!StagingFromUnitShadow() || end <= begin || begin < import.base || end > import.base + import.bytes) return {};
+    {
+        auto& registry = Registry();
+        std::lock_guard lock(registry.mutex);
+        const auto shadow = find(registry, import);
+        if (shadow == nullptr || shadow->context.device != context.device) return {};
+        bool any = false;
+        for (auto unit = shadow->UnitOf(begin); !any && unit <= shadow->UnitOf(end - 1); ++unit) any = shadow->generation[unit] != 0 && shadow->slabs[static_cast<std::size_t>(unit / SlabUnits())] != nullptr;
+        if (!any) return {};
+    }
+    const std::pair<std::uint64_t, std::uint64_t> run{0, end - begin};
+    auto sources = ShadowSources(context, import, begin, std::span(&run, 1), {}, false);
+    if (std::none_of(sources.begin(), sources.end(), [](const ShadowRun& source) { return source.shadow; })) sources.clear();
+    return sources;
+}
+
+void NoteStagingFed(std::uint64_t bytes) {
+    Stats().stagingFed.fetch_add(1, std::memory_order_relaxed);
+    Stats().stagingFedBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation, bool staged) {
     if (!UnitShadowEnabled() || ranges.empty() || generation == 0) return;
     auto& registry = Registry();
     std::uint64_t bytes = 0;
@@ -875,8 +934,8 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
         static std::atomic<int> reports{0};
         if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[shadow] %llu retiled units of import 0x%llx lost their slab before they were marked\n", static_cast<unsigned long long>(lost), static_cast<unsigned long long>(import.base));
     }
-    Stats().retiled.fetch_add(1, std::memory_order_relaxed);
-    Stats().retiledBytes.fetch_add(bytes, std::memory_order_relaxed);
+    (staged ? Stats().stagingReturned : Stats().retiled).fetch_add(1, std::memory_order_relaxed);
+    (staged ? Stats().stagingReturnedBytes : Stats().retiledBytes).fetch_add(bytes, std::memory_order_relaxed);
     // The resource cache's pending memos (fastRevalidate) must see the change of the surface's
     // source, as they see a write-back.
     for (const auto& range : ranges) {
@@ -997,6 +1056,10 @@ std::string ShadowReport() {
     }
     std::snprintf(text, sizeof(text), " %llu/%.1f by reason {%s }, stale-dropped %llu (cpu %llu, driver %llu), skipped-in-completion %llu, slabs %llu live %.1f MiB / peak %.1f MiB, evictions %llu, slab lost %llu, retired %llu, dropped on retire %llu, lost on retire %llu", publishedTotal, mib(publishedBytesTotal), reasons.c_str(), cpuDropped + driverDropped, cpuDropped, driverDropped, take(statistics.skippedInCompletion), liveSlabs, mib(liveBytes), mib(peakBytes), take(statistics.evictions), take(statistics.slabLost), retired, take(statistics.droppedOnRetire), take(statistics.lostOnRetire));
     line += text;
+    if (StagingFromUnitShadow()) {
+        std::snprintf(text, sizeof(text), ", staging fed from shadow %llu/%.1f, returned to shadow %llu/%.1f, publishes left to the staging use %llu", take(statistics.stagingFed), mib(take(statistics.stagingFedBytes)), take(statistics.stagingReturned), mib(take(statistics.stagingReturnedBytes)), take(statistics.stagingPublishesSkipped));
+        line += text;
+    }
     if (ShadowVerify()) {
         std::snprintf(text, sizeof(text), ", verified %llu, mismatches %llu", take(statistics.verified), take(statistics.mismatches));
         line += text;
