@@ -5202,6 +5202,11 @@ std::optional<std::uint64_t> Recorder::NewestGuestWork() const {
     return std::uint64_t{0};
 }
 
+bool Recorder::EarlyEndOfPipe() {
+    static const bool enabled = std::getenv("APS5_EARLY_EOP_INTERRUPT") != nullptr;
+    return enabled;
+}
+
 void Recorder::NoteEndOfPipe(bool early) {
     endOfPipeEarly = early;
     endOfPipeSerial = open != nullptr ? submissions + 1 : submissions;

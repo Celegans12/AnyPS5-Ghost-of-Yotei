@@ -439,6 +439,7 @@ public:
     };
     static constexpr std::size_t FinishedReadBytes = 4096;
     static constexpr std::size_t FinishedReadCapacity = 16384;
+    static bool EarlyEndOfPipe();
     void NoteEndOfPipe(bool early);
     bool TakeEarlyEndOfPipe();
     std::size_t UnexecutedReads(std::vector<InPlaceRead>& reads) const;

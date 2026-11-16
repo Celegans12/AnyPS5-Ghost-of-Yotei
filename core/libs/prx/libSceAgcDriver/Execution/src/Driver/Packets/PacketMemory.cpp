@@ -1244,7 +1244,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     const auto localDevice = device.Load();
     recordDeferredLabels(localDevice.get(), queue);
     static const bool probed = Graphics::Recorder::FlipReadCheck();
-    static const bool earlyInterrupt = std::getenv("APS5_EARLY_EOP_INTERRUPT") != nullptr;
+    static const bool earlyInterrupt = Graphics::Recorder::EarlyEndOfPipe();
     const bool early = earlyInterrupt && interrupt.has_value() && eopGuardSettled();
     bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     int reason = localDevice != nullptr ? 0 : 1;

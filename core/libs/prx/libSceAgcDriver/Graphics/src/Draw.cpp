@@ -2256,20 +2256,19 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
 
 namespace {
 
-const HostImport* inPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite, bool small);
+const HostImport* inPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite, bool small, bool copies = true);
 
 }
 
 const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite) {
-    return inPlaceDrawInput(context, address, bytes, alignment, behindGpuWrite, false);
+    return inPlaceDrawInput(context, address, bytes, alignment, behindGpuWrite, false, false);
 }
 
 namespace {
 
-const HostImport* inPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite, bool small) {
+const HostImport* inPlaceDrawInput(const Context& context, std::uint64_t address, std::size_t bytes, std::size_t alignment, bool* behindGpuWrite, bool small, bool copies) {
     auto* recorder = context.recorder;
     if (recorder == nullptr || bytes == 0 || (!context.drawInputsInPlace && !small)) return nullptr;
-    if (recorder->ChangingRead(address, bytes)) return nullptr;
     bool behind = false;
     if (behindGpuWrite == nullptr) {
         GuestMemory::FlushGpuWrites(address, bytes);
@@ -2283,6 +2282,18 @@ const HostImport* inPlaceDrawInput(const Context& context, std::uint64_t address
     if (context.copiedWriters != nullptr && std::any_of(context.copiedWriters->begin(), context.copiedWriters->end(), overlaps)) return nullptr;
     const auto drawWriters = DrawCopiedWriters();
     if (std::any_of(drawWriters->begin(), drawWriters->end(), overlaps)) return nullptr;
+    if (copies && !behind && bytes <= Recorder::FinishedReadBytes && Recorder::EarlyEndOfPipe() && GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) {
+        thread_local HostImport* slot = nullptr;
+        auto& copied = ShaderRecompiler::ThreadOwned(slot);
+        auto slice = recorder->DrawInputUpload(bytes);
+        GuestMemory::Read(address, std::span<std::byte>(slice.bytes, bytes), 1);
+        copied.base = address - slice.offset;
+        copied.bytes = slice.offset + bytes;
+        copied.buffer = slice.buffer->Handle();
+        recorder->Keep(std::move(slice.buffer));
+        return &copied;
+    }
+    if (recorder->ChangingRead(address, bytes)) return nullptr;
     const auto* import = HostImportFor(context, address, bytes);
     if (import == nullptr || HostImportOffset(*import, address) % alignment != 0) return nullptr;
     recorder->NotePendingRead(address, bytes, Recorder::ReadKind::DrawInput);
