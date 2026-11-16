@@ -28,11 +28,14 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 
 using AgcDriver::Graphics::Require;
+using AgcDriver::Graphics::ResidentCopyIn;
+using AgcDriver::Graphics::ResidentShadowState;
 using AgcDriver::Graphics::ResidentStagingCounts;
 using ShaderRecompiler::ShaderStage;
 
@@ -145,6 +148,11 @@ struct Counts {
         now.partialSavedBytes -= before.partialSavedBytes;
         now.full -= before.full;
         now.fullBytes -= before.fullBytes;
+        now.fresh -= before.fresh;
+        now.stale -= before.stale;
+        now.moved -= before.moved;
+        now.rewritten -= before.rewritten;
+        now.unsealed -= before.unsealed;
         now.untracked -= before.untracked;
         now.blocked -= before.blocked;
         now.sealed -= before.sealed;
@@ -156,7 +164,7 @@ struct Counts {
 };
 
 std::string Text(const ResidentStagingCounts& counts) {
-    return std::to_string(counts.skipped) + " skipped, " + std::to_string(counts.partial) + " partial, " + std::to_string(counts.full) + " whole, " + std::to_string(counts.sealed) + " left current, " + std::to_string(counts.outdated) + " outdated, " + std::to_string(counts.untracked) + " untracked";
+    return std::to_string(counts.skipped) + " skipped, " + std::to_string(counts.partial) + " partial, " + std::to_string(counts.full) + " whole (" + std::to_string(counts.fresh) + " first uses, " + std::to_string(counts.stale) + " not left current, " + std::to_string(counts.moved) + " moved, " + std::to_string(counts.rewritten) + " rewritten), " + std::to_string(counts.sealed) + " left current, " + std::to_string(counts.unsealed) + " not after a write, " + std::to_string(counts.outdated) + " outdated, " + std::to_string(counts.untracked) + " untracked";
 }
 
 enum class Probe { Unstaged, Untracked, Resident };
@@ -306,6 +314,64 @@ void SwitchedOff(AgcDriver::VulkanDevice& device) {
     Require(since.made + since.shared + since.skipped + since.partial + since.full == 0, "resident staging: a build made with the switch off counted " + Text(since));
 }
 
+using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+
+const char* Name(ResidentCopyIn kind) {
+    return kind == ResidentCopyIn::Skipped ? "skipped" : kind == ResidentCopyIn::Limited ? "limited" : "whole";
+}
+
+void ExpectDecision(const ResidentShadowState& state, bool tracked, const Ranges& written, std::uint64_t begin, std::uint64_t end, ResidentCopyIn expected, const std::string& what) {
+    const auto found = AgcDriver::Graphics::ResidentCopyInFor(state, tracked, written, begin, end);
+    Require(found == expected, "resident staging decision, " + what + ": " + Name(found) + ", expected " + Name(expected));
+}
+
+void Decisions() {
+    constexpr std::uint64_t begin = 0x200000000ull + 0x340u;
+    constexpr std::uint64_t pages = 16;
+    constexpr std::uint64_t end = begin + pages * PageBytes;
+    const ResidentShadowState kept{true, false, true, true, 7};
+    const auto page = [&](std::uint64_t first, std::uint64_t count) { return std::pair<std::uint64_t, std::uint64_t>{begin + first * PageBytes, begin + (first + count) * PageBytes}; };
+    Require(AgcDriver::Graphics::ResidentShadowKept(kept), "resident staging decision: a current shadow of the same import and registry is not kept");
+    ExpectDecision(kept, true, {}, begin, end, ResidentCopyIn::Skipped, "a kept shadow no CPU store touched");
+    ExpectDecision(kept, true, {page(3, 1)}, begin, end, ResidentCopyIn::Limited, "one page written");
+    ExpectDecision(kept, true, {page(0, 1), page(5, 2), page(15, 1)}, begin, end, ResidentCopyIn::Limited, "three runs of written pages");
+    ExpectDecision(kept, true, {page(0, 8)}, begin, end, ResidentCopyIn::Limited, "exactly half of the range written");
+    ExpectDecision(kept, true, {page(0, 8), {begin + 8 * PageBytes, begin + 8 * PageBytes + 1}}, begin, end, ResidentCopyIn::Whole, "one byte more than half of the range written");
+    ExpectDecision(kept, true, {page(0, 16)}, begin, end, ResidentCopyIn::Whole, "the whole range written");
+    ExpectDecision(kept, true, {{begin, begin + 1}}, begin, begin + 1, ResidentCopyIn::Whole, "a one-byte range written");
+    ExpectDecision(kept, true, {}, begin, begin + 1, ResidentCopyIn::Skipped, "a one-byte range left alone");
+    ExpectDecision(kept, false, {}, begin, end, ResidentCopyIn::Whole, "a range the write tracking does not cover");
+    ExpectDecision(kept, false, {page(3, 1)}, begin, end, ResidentCopyIn::Whole, "an untracked range with a page listed");
+    ExpectDecision(kept, true, {}, begin, begin, ResidentCopyIn::Whole, "an empty range");
+    ExpectDecision(kept, true, {}, end, begin, ResidentCopyIn::Whole, "a reversed range");
+    ExpectDecision(kept, true, {{begin - PageBytes, begin + PageBytes}}, begin, end, ResidentCopyIn::Whole, "a written run starting before the range");
+    ExpectDecision(kept, true, {{end - PageBytes, end + 1}}, begin, end, ResidentCopyIn::Whole, "a written run ending past the range");
+    ExpectDecision(kept, true, {page(5, 1), page(2, 1)}, begin, end, ResidentCopyIn::Whole, "written runs out of order");
+    ExpectDecision(kept, true, {page(2, 2), page(3, 2)}, begin, end, ResidentCopyIn::Whole, "written runs that overlap");
+    ExpectDecision(kept, true, {{begin + PageBytes, begin + PageBytes}}, begin, end, ResidentCopyIn::Whole, "an empty written run");
+    struct Lost {
+        ResidentShadowState state;
+        const char* what;
+    };
+    const std::array<Lost, 5> lost{{
+        {{false, false, true, true, 7}, "a shadow no use left current"},
+        {{true, true, true, true, 7}, "a shadow under a label or queued store"},
+        {{true, false, false, true, 7}, "a shadow filled from another import"},
+        {{true, false, true, false, 7}, "a shadow filled under another registry"},
+        {{true, false, true, true, 0}, "a shadow holding no tracking generation"},
+    }};
+    for (const auto& [state, what] : lost) {
+        Require(!AgcDriver::Graphics::ResidentShadowKept(state), std::string("resident staging decision: ") + what + " is kept");
+        ExpectDecision(state, true, {}, begin, end, ResidentCopyIn::Whole, std::string(what) + " with no CPU store");
+        ExpectDecision(state, true, {page(3, 1)}, begin, end, ResidentCopyIn::Whole, std::string(what) + " with one page written");
+    }
+    Require(!AgcDriver::Graphics::ResidentShadowKept({}), "resident staging decision: a shadow never filled is kept");
+    Require(AgcDriver::Graphics::ResidentStagingDefault(nullptr), "resident staging: off without APS5_NO_RESIDENT_STAGING");
+    Require(!AgcDriver::Graphics::ResidentStagingDefault(""), "resident staging: on with APS5_NO_RESIDENT_STAGING set empty");
+    Require(!AgcDriver::Graphics::ResidentStagingDefault("1"), "resident staging: on with APS5_NO_RESIDENT_STAGING=1");
+    Require(AgcDriver::Graphics::ResidentStagingEnabled() == (std::getenv("APS5_NO_RESIDENT_STAGING") == nullptr), "resident staging: the default does not follow APS5_NO_RESIDENT_STAGING");
+}
+
 void SetEnvironment(const char* name, const char* value) {
 #ifdef _WIN32
     Require(_putenv_s(name, value) == 0, std::string("resident staging: cannot set ") + name);
@@ -318,6 +384,8 @@ void SetEnvironment(const char* name, const char* value) {
 
 int main() {
     try {
+        Decisions();
+        std::puts("resident staging: the copy-in decision is whole, limited or skipped as the shadow state and the written pages say");
         SetEnvironment("APS5_WRITTEN_SHADOW_MIN_KIB", "0");
         SetEnvironment("APS5_NO_CHANGED_COPY_BACK", "1");
         SetEnvironment("APS5_NO_ADAPTIVE_STAGING", "1");
