@@ -28,50 +28,36 @@ public:
         std::array<std::uint64_t, Refusals> refused{};
     };
 
-    static Mode Current() {
-        const auto forced = tested.load(std::memory_order_relaxed);
-        if (forced != Mode::Environment) return forced;
-        static const Mode configured = std::getenv("APS5_VERIFY_PASS_STATE") != nullptr ? Mode::Verify : std::getenv("APS5_PASS_STATE") != nullptr ? Mode::On : Mode::Off;
-        return configured;
-    }
-    static bool Enabled() { return Current() != Mode::Off; }
-    static bool Verifies() { return Current() == Mode::Verify; }
-    static void SetForTest(Mode mode) { tested.store(mode, std::memory_order_relaxed); }
+    static Mode Current();
+    static bool Enabled();
+    static bool Verifies();
+    static void SetForTest(Mode mode);
 
-    static void Break() { gate.fetch_add(1, std::memory_order_acq_rel); }
-    static std::uint64_t Gate() { return gate.load(std::memory_order_acquire); }
-    static void NoteDepthView() { depthViews.fetch_add(1, std::memory_order_acq_rel); }
-    static std::uint64_t DepthViews() { return depthViews.load(std::memory_order_acquire); }
-    static std::uint64_t NextId() { return ids.fetch_add(1, std::memory_order_relaxed) + 1; }
+    static void Break();
+    static std::uint64_t Gate();
+    static void NoteDepthView();
+    static std::uint64_t DepthViews();
+    static std::uint64_t NextId();
 
-    static void CountDraw() { draws.fetch_add(1, std::memory_order_relaxed); }
-    static void CountRun() { runs.fetch_add(1, std::memory_order_relaxed); }
-    static void CountVerified() { verified.fetch_add(1, std::memory_order_relaxed); }
-    static void CountMismatch() { mismatches.fetch_add(1, std::memory_order_relaxed); }
-    static void Count(Served kind) { served[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed); }
-    static void Count(Refusal reason) { refused[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed); }
-    static Counts Counted() {
-        Counts counts;
-        counts.draws = draws.load(std::memory_order_relaxed);
-        counts.runs = runs.load(std::memory_order_relaxed);
-        counts.verified = verified.load(std::memory_order_relaxed);
-        counts.mismatches = mismatches.load(std::memory_order_relaxed);
-        for (std::size_t index = 0; index < ServedKinds; ++index) counts.served[index] = served[index].load(std::memory_order_relaxed);
-        for (std::size_t index = 0; index < Refusals; ++index) counts.refused[index] = refused[index].load(std::memory_order_relaxed);
-        return counts;
-    }
+    static void CountDraw();
+    static void CountRun();
+    static void CountVerified();
+    static void CountMismatch();
+    static void Count(Served kind);
+    static void Count(Refusal reason);
+    static Counts Counted();
 
 private:
-    static inline std::atomic<Mode> tested{Mode::Environment};
-    static inline std::atomic<std::uint64_t> gate{0};
-    static inline std::atomic<std::uint64_t> depthViews{0};
-    static inline std::atomic<std::uint64_t> ids{0};
-    static inline std::atomic<std::uint64_t> draws{0};
-    static inline std::atomic<std::uint64_t> runs{0};
-    static inline std::atomic<std::uint64_t> verified{0};
-    static inline std::atomic<std::uint64_t> mismatches{0};
-    static inline std::array<std::atomic<std::uint64_t>, ServedKinds> served{};
-    static inline std::array<std::atomic<std::uint64_t>, Refusals> refused{};
+    static std::atomic<Mode> tested;
+    static std::atomic<std::uint64_t> gate;
+    static std::atomic<std::uint64_t> depthViews;
+    static std::atomic<std::uint64_t> ids;
+    static std::atomic<std::uint64_t> draws;
+    static std::atomic<std::uint64_t> runs;
+    static std::atomic<std::uint64_t> verified;
+    static std::atomic<std::uint64_t> mismatches;
+    static std::array<std::atomic<std::uint64_t>, ServedKinds> served;
+    static std::array<std::atomic<std::uint64_t>, Refusals> refused;
 };
 
 }
