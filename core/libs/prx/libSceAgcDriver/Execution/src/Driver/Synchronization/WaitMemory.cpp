@@ -26,7 +26,7 @@ std::atomic<std::uint32_t>& BlockedReaders() {
 }
 
 bool CoreOffDraw() {
-    static const bool enabled = std::getenv("APS5_CORE_OFF_DRAW") != nullptr;
+    static const bool enabled = std::getenv("APS5_NO_CORE_OFF_DRAW") == nullptr;
     return enabled;
 }
 
@@ -36,7 +36,7 @@ bool VerifyCoreOffDraw() {
 }
 
 bool SubmitEarly() {
-    static const bool enabled = std::getenv("APS5_SUBMIT_EARLY") != nullptr;
+    static const bool enabled = std::getenv("APS5_NO_SUBMIT_EARLY") == nullptr;
     return enabled;
 }
 
