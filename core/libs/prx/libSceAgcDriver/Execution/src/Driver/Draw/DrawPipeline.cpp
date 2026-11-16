@@ -1539,7 +1539,8 @@ void DrawPipeline::push(Item item) {
     if (items.size() >= Depth()) {
         if (GuestMemory::GpuMutex().HeldByThisThread()) throw std::runtime_error("draw pipeline full while the enqueuing thread holds the GPU lock");
         const auto start = std::chrono::steady_clock::now();
-        resumeAt = Depth() - 1;
+        static const std::size_t room = std::getenv("APS5_NO_BATCHED_ROOM_WAKE") != nullptr ? std::size_t{1} : std::max<std::size_t>(Depth() / 2, 1);
+        resumeAt = Depth() - room;
         ++idleWaiters;
         idle.wait(lock, [&] { return items.size() <= resumeAt; });
         --idleWaiters;
