@@ -2979,6 +2979,40 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
     return tracker.generation.load(std::memory_order_relaxed);
 }
 
+namespace {
+std::atomic<void (*)(std::uint64_t)> epochHook{nullptr};
+}
+
+bool EpochSweeps() {
+    static const bool enabled = std::getenv("APS5_EPOCH_SWEEP") != nullptr;
+    return enabled;
+}
+
+ContentToken TokenFor(std::uint64_t address, std::size_t bytes) {
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return {};
+}
+
+bool StillCurrent(std::uint64_t address, std::size_t bytes, const ContentToken& token) {
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    static_cast<void>(token);
+    return false;
+}
+
+void SweepHot(std::uint64_t epoch) {
+    static_cast<void>(epoch);
+}
+
+void SetEpochHook(void (*hook)(std::uint64_t epoch)) {
+    epochHook.store(hook, std::memory_order_release);
+}
+
+EpochSweepCounts EpochSweepCounted() {
+    return {};
+}
+
 void BumpCollectEpoch() {
     HostThreadSlot<std::uint64_t, CollectEpochStartSlot>::Set(Tracker().stable.load(std::memory_order_acquire));
     const auto epoch = nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1;
@@ -2986,6 +3020,8 @@ void BumpCollectEpoch() {
     auto last = lastBumpedEpoch.load(std::memory_order_relaxed);
     while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+    if (!EpochSweeps()) return;
+    if (const auto hook = epochHook.load(std::memory_order_acquire)) hook(epoch);
 }
 
 std::uint64_t ThreadCollectEpoch() {
