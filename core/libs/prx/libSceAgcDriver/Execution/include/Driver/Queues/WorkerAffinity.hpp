@@ -13,6 +13,8 @@ void ReserveCommitterCore();
 
 void ReserveFinisherCore();
 
+void ReserveFinisherPoolCore(unsigned index);
+
 void NameDriverThread(const char* name);
 
 }

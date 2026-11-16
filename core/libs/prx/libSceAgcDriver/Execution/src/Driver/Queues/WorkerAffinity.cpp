@@ -94,9 +94,10 @@ struct Reservation {
 
 constexpr std::size_t CommitterSlot = 0;
 constexpr std::size_t FinisherSlot = 1;
+constexpr std::size_t PoolSlots = 15;
 
 std::mutex reservationMutex;
-std::array<std::optional<Reservation>, 2> reservations;
+std::array<std::optional<Reservation>, 2 + PoolSlots> reservations;
 #ifdef __linux__
 std::vector<unsigned long> workerThreads;
 std::vector<std::uint32_t> pipelineCpus;
@@ -202,7 +203,7 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
     for (const auto& held : reservations) {
         if (held.has_value()) taken.push_back(held->set);
     }
-    if (slot == FinisherSlot && !reservations[CommitterSlot].has_value() && Switches().committer) {
+    if (slot >= FinisherSlot && !reservations[CommitterSlot].has_value() && Switches().committer) {
         if (const auto ahead = CpuTopology::ChooseReservedCore(sets, taken, Switches().logical)) taken.push_back(ahead->chosen);
     }
     const auto reservation = CpuTopology::ChooseReservedCore(sets, taken, logical);
@@ -277,6 +278,16 @@ void ReserveCommitterCore() {
 void ReserveFinisherCore() {
 #if defined(_WIN32) || defined(__linux__)
     if (Switches().finisher) Reserve(FinisherSlot, "draw finisher", std::nullopt);
+#endif
+}
+
+void ReserveFinisherPoolCore(unsigned index) {
+#if defined(_WIN32) || defined(__linux__)
+    static const bool pooled = std::getenv("APS5_FINISHER_POOL_CORES") != nullptr;
+    if (!pooled || index == 0 || index > PoolSlots || !Switches().finisher) return;
+    Reserve(FinisherSlot + index, "draw finisher of the pool", std::nullopt);
+#else
+    static_cast<void>(index);
 #endif
 }
 

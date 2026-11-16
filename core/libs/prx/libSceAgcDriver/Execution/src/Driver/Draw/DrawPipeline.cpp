@@ -832,6 +832,8 @@ void DrawFinisher::work(unsigned index) {
     if (index == 0) {
         ReserveFinisherCore();
         StartFinisherSampler();
+    } else {
+        ReserveFinisherPoolCore(index);
     }
     std::unique_lock lock(mutex, std::defer_lock);
     const bool timed = Timed();
