@@ -40,7 +40,7 @@ FLOOR_KEYS = {
 def build(args):
     os.makedirs(OUT, exist_ok=True)
     compiler = os.path.join(TOOLCHAIN, "g++.exe")
-    command = [compiler, "-std=c++20", "-O2", "-Wall", "-Wextra", "-Wno-missing-field-initializers", "-shared", "-static", "-I", os.path.join(TREE, "3rdparty", "Vulkan-Headers", "include"),
+    command = [compiler, "-std=c++20", "-O2", "-Wall", "-Wextra", "-Wno-missing-field-initializers", "-shared", "-static", "-Wl,--exclude-libs,ALL", "-I", os.path.join(TREE, "3rdparty", "Vulkan-Headers", "include"),
                os.path.join(HERE, "DrawFloorLayer.cpp"), "-o", os.path.join(OUT, "DrawFloorLayer.dll")]
     env = dict(os.environ)
     env["PATH"] = TOOLCHAIN + os.pathsep + env.get("PATH", "")
