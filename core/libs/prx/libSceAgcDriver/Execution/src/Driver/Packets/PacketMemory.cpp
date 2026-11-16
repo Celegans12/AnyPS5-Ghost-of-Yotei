@@ -14,7 +14,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
-#include "ThreadOwned.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -498,52 +497,6 @@ void Driver::commitStore(std::uint32_t queue, std::uint64_t address, std::span<c
     Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
 }
 
-namespace {
-
-constexpr std::size_t LabelRunLabels = 32;
-constexpr std::size_t LabelRunBytes = 256;
-
-struct RunLabel {
-    std::uint64_t address = 0;
-    std::array<std::byte, 8> bytes{};
-    std::uint32_t size = 0;
-    std::uint32_t opcode = 0;
-};
-
-struct LabelRun {
-    std::vector<RunLabel> labels;
-    std::uint64_t begin = 0;
-    std::uint64_t end = 0;
-    std::uint32_t queue = 0;
-    std::function<void(LabelRun&)> flush;
-};
-
-LabelRun& labelRun() {
-    static thread_local LabelRun* run = nullptr;
-    return ShaderRecompiler::ThreadOwned(run);
-}
-
-std::atomic<std::uint64_t> labelRuns{0}, labelsInRuns{0}, labelsAlone{0};
-
-}
-
-bool LabelsInBatch() {
-    static const bool enabled = std::getenv("APS5_LABELS_IN_BATCH") != nullptr && CoreOffDraw();
-    return enabled;
-}
-
-void FlushLabelRun() {
-    if (!LabelsInBatch()) return;
-    auto& run = labelRun();
-    if (run.labels.empty()) return;
-    run.flush(run);
-    run.labels.clear();
-}
-
-LabelRunCount LabelRunCounts() {
-    return LabelRunCount{labelRuns.load(std::memory_order_relaxed), labelsInRuns.load(std::memory_order_relaxed), labelsAlone.load(std::memory_order_relaxed)};
-}
-
 bool Driver::labelPacketQueues(std::span<const std::uint32_t> packet, std::uint32_t opcode) {
     static const bool ordered = std::getenv("APS5_PIPELINE_DRAIN_LABELS") == nullptr;
     if (!ordered || !DeferLabels() || (opcode != 0x49 && opcode != 0x37) || !deferredLabels().labels.empty()) return false;
@@ -552,100 +505,15 @@ bool Driver::labelPacketQueues(std::span<const std::uint32_t> packet, std::uint3
 }
 
 bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint32_t opcode, std::uint32_t queue, std::optional<std::uint32_t> interrupt) {
-    if (!labelPacketQueues(packet, opcode)) {
-        FlushLabelRun();
-        return false;
-    }
+    if (!labelPacketQueues(packet, opcode)) return false;
     const bool endOfPipeInterrupt = interrupt.has_value();
     const auto label = Pm4::DecodeLabelWrite(packet);
     if (!label.has_value()) {
-        if (opcode != 0x49) {
-            FlushLabelRun();
-            return false;
-        }
+        if (opcode != 0x49) return false;
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
-        if (!storesNothing) {
-            FlushLabelRun();
-            return false;
-        }
+        if (!storesNothing) return false;
         if (!endOfPipeInterrupt) {
             ++noOpLabels;
-            return true;
-        }
-    }
-    if (LabelsInBatch()) {
-        auto& run = labelRun();
-        const auto stored = label.has_value() ? label->Bytes() : std::span<const std::byte>{};
-        const bool groups = !endOfPipeInterrupt && label.has_value() && !stored.empty() && stored.size() <= 8;
-        const auto labelEnd = label.has_value() ? label->address + stored.size() : 0;
-        const bool joins = groups && !run.labels.empty() && run.queue == queue && run.labels.size() < LabelRunLabels && label->address <= run.end && labelEnd >= run.begin
-            && std::max(run.end, labelEnd) - std::min(run.begin, label->address) <= LabelRunBytes;
-        if (!joins) FlushLabelRun();
-        if (groups) {
-            if (run.labels.empty()) {
-                run.begin = label->address;
-                run.end = labelEnd;
-                run.queue = queue;
-                run.flush = [this](LabelRun& flushed) {
-                    const auto flushedQueue = flushed.queue;
-                    const auto begin = flushed.begin;
-                    std::vector<std::byte> merged(static_cast<std::size_t>(flushed.end - flushed.begin));
-                    std::vector<DrawPipeline::Range> ranges;
-                    ranges.reserve(flushed.labels.size());
-                    for (const auto& item : flushed.labels) {
-                        std::memcpy(merged.data() + (item.address - begin), item.bytes.data(), item.size);
-                        ranges.emplace_back(item.address, item.address + item.size);
-                    }
-                    labelRuns.fetch_add(1, std::memory_order_relaxed);
-                    (flushed.labels.size() > 1 ? labelsInRuns : labelsAlone).fetch_add(flushed.labels.size(), std::memory_order_relaxed);
-                    auto relayedRanges = ranges;
-                    auto relayedBytes = merged;
-                    auto enqueueRun = [this, flushedQueue, begin, labels = flushed.labels, ranges = std::move(ranges), merged = std::move(merged)]() mutable {
-                        DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::EndOfPipe, [this, flushedQueue, labels = std::move(labels)] {
-                            GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
-                            std::lock_guard gpuLock(GuestMemory::GpuMutex());
-                            const auto localDevice = device.Load();
-                            recordDeferredLabels(localDevice.get(), flushedQueue);
-                            bool first = true;
-                            for (const auto& item : labels) {
-                                GuestMemory::SetCurrentPacket(item.opcode, flushedQueue);
-                                const auto bytes = std::span<const std::byte>(item.bytes).first(item.size);
-                                const auto stamp = ++eventSerial;
-                                const int reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(item.address, bytes, stamp, flushedQueue, first) : 4;
-                                first = false;
-                                if (reason != 0 && reason != 5 && reason != 6) {
-                                    if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
-                                    GuestMemory::Write(item.address, bytes, 4);
-                                }
-                                noteLabelStore(item.address, bytes, stamp, flushedQueue);
-                                countLabelOutcome(reason);
-                                ++immediateLabels;
-                            }
-                            Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
-                            submitDueAfterCommit(localDevice.get());
-                        }, std::move(ranges), begin, std::move(merged));
-                    };
-                    if (flushedQueue == 0 && DrawFinisher::Overlap() && DrawFinisher::Busy()) {
-                        DrawFinisher::Pending held;
-                        held.unknown = false;
-                        held.writes = std::move(relayedRanges);
-                        held.labelAddress = begin;
-                        held.labelBytes = std::move(relayedBytes);
-                        DrawFinisher::Get().Enqueue(std::move(enqueueRun), std::move(held));
-                        return;
-                    }
-                    enqueueRun();
-                };
-            } else {
-                run.begin = std::min(run.begin, label->address);
-                run.end = std::max(run.end, labelEnd);
-            }
-            RunLabel item;
-            item.address = label->address;
-            std::memcpy(item.bytes.data(), stored.data(), stored.size());
-            item.size = static_cast<std::uint32_t>(stored.size());
-            item.opcode = opcode;
-            run.labels.push_back(item);
             return true;
         }
     }

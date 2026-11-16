@@ -98,15 +98,12 @@ void ReportOffDraw(std::chrono::steady_clock::time_point now) {
         reportedHeld[i] = later;
     }
     const auto counts = VulkanDevice::OffDrawCounts();
-    static LabelRunCount reportedRuns{};
-    const auto runs = LabelRunCounts();
     const auto overdue = heldOverdue.load(std::memory_order_relaxed);
     const auto since = [](std::uint64_t current, std::uint64_t before) { return static_cast<unsigned long long>(current - before); };
-    AgcDriver::ProfilePrint_nid_no_patch("[core-off-draw] (10 s): submission ends by cause:%s; held batches submitted by cause:%s; longest hold %.1f us, %llu kept by a check past the deadline; labels %llu, %llu first in a block of their batch, %llu repeated, %llu past the table; verify: %llu repeated marks collected, %llu over a CPU write; label reaps skipped %llu, verify: %llu made anyway, %llu retired a batch; %llu batches submitted early to an idle GPU; label runs %llu, %llu labels in runs of several, %llu alone\n",
+    AgcDriver::ProfilePrint_nid_no_patch("[core-off-draw] (10 s): submission ends by cause:%s; held batches submitted by cause:%s; longest hold %.1f us, %llu kept by a check past the deadline; labels %llu, %llu first in a block of their batch, %llu repeated, %llu past the table; verify: %llu repeated marks collected, %llu over a CPU write; label reaps skipped %llu, verify: %llu made anyway, %llu retired a batch; %llu batches submitted early to an idle GPU\n",
                                          ends.empty() ? " none" : ends.c_str(), held.empty() ? " none" : held.c_str(), static_cast<double>(heldLongestNs.exchange(0, std::memory_order_relaxed)) / 1e3, since(overdue, reportedOverdue),
                                          since(counts.labels, reportedCounts.labels), since(counts.firstMarks, reportedCounts.firstMarks), since(counts.repeatedMarks, reportedCounts.repeatedMarks), since(counts.overflowedMarks, reportedCounts.overflowedMarks),
-                                         since(counts.verifiedMarks, reportedCounts.verifiedMarks), since(counts.marksOverWrites, reportedCounts.marksOverWrites), since(counts.reapsSkipped, reportedCounts.reapsSkipped), since(counts.reapsVerified, reportedCounts.reapsVerified), since(counts.reapsLate, reportedCounts.reapsLate), static_cast<unsigned long long>(EarlySubmits().exchange(0, std::memory_order_relaxed)), since(runs.runs, reportedRuns.runs), since(runs.labels, reportedRuns.labels), since(runs.alone, reportedRuns.alone));
-    reportedRuns = runs;
+                                         since(counts.verifiedMarks, reportedCounts.verifiedMarks), since(counts.marksOverWrites, reportedCounts.marksOverWrites), since(counts.reapsSkipped, reportedCounts.reapsSkipped), since(counts.reapsVerified, reportedCounts.reapsVerified), since(counts.reapsLate, reportedCounts.reapsLate), static_cast<unsigned long long>(EarlySubmits().exchange(0, std::memory_order_relaxed)));
     reportedCounts = counts;
     reportedOverdue = overdue;
 }
