@@ -206,7 +206,7 @@ std::string BackReport() {
     return text;
 }
 
-bool RecordBack(VulkanDevice& device, const Graphics::State& graphics, const Pm4::DrawParameters& parameters, std::span<const Graphics::CompiledShader> stages, const std::shared_ptr<const DrawRecipe>& recipe) {
+bool RecordBack(VulkanDevice& device, const Graphics::State& graphics, const Pm4::DrawParameters& parameters, std::span<const Graphics::CompiledShader> stages, const std::shared_ptr<const DrawRecipe>& recipe, std::uint64_t) {
     const auto mode = BackModeNow();
     if (mode == BackMode::Recipe) return device.DrawFromRecipe(graphics, parameters, stages, {}, recipe) == RecipeOutcome::Recorded;
     const auto context = device.graphicsContext();
