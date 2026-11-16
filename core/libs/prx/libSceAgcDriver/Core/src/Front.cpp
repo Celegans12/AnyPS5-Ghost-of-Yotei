@@ -50,7 +50,7 @@ constexpr std::uint32_t NoBinding = 0xffffffffu;
 constexpr std::uint64_t EveryProgram = 1;
 
 struct Counters {
-    std::atomic<std::uint64_t> draws{0}, continued{0}, plans{0}, taken{0}, takenContinued{0}, taught{0}, verified{0}, mismatches{0}, digests{0}, committed{0}, restarted{0}, walkNs{0}, frontNs{0}, backNs{0}, retries{0}, flatTaken{0}, flatSame{0}, flatNs{0}, flatBytes{0}, flatTimed{0}, flatVertexKnown{0}, flatZoned{0}, filtered{0}, released{0};
+    std::atomic<std::uint64_t> draws{0}, continued{0}, plans{0}, taken{0}, takenContinued{0}, taught{0}, verified{0}, mismatches{0}, digests{0}, committed{0}, restarted{0}, walkNs{0}, frontNs{0}, backNs{0}, retries{0}, flatTaken{0}, flatSame{0}, flatNs{0}, flatBytes{0}, flatTimed{0}, flatVertexKnown{0}, flatZoned{0}, filtered{0}, released{0}, flatPostNs{0}, flatPostTimed{0}, flatPostBusy{0};
     std::array<std::atomic<std::uint64_t>, 8> sections{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrontLeft::Count)> left{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TeachRefusal::Count)> refused{};
@@ -514,6 +514,7 @@ FrontCounts Front::Counted() {
 }
 
 std::string Front::Report() {
+    const auto& held = counters();
     const auto counts = Counted();
     const auto per = [](std::uint64_t nanoseconds, std::uint64_t count) { return count != 0 ? static_cast<double>(nanoseconds) / 1000.0 / static_cast<double>(count) : 0.0; };
     char head[768];
@@ -543,8 +544,25 @@ std::string Front::Report() {
         char flat[256];
         std::snprintf(flat, sizeof(flat), " flat draws: %llu taken (%llu on the variant of the draw before) at %.2f us at the front (%llu timed), %llu ring bytes, %llu vertex decodes answered by the memo, %llu walked into the driver zone", static_cast<unsigned long long>(counts.flatTaken), static_cast<unsigned long long>(counts.flatSame), per(counts.flatNs, counts.flatTimed), static_cast<unsigned long long>(counts.flatTimed), static_cast<unsigned long long>(counts.flatBytes), static_cast<unsigned long long>(counts.flatVertexKnown), static_cast<unsigned long long>(counts.flatZoned));
         text += flat;
+        const auto postTimed = held.flatPostTimed.load(std::memory_order_relaxed);
+        char post[192];
+        std::snprintf(post, sizeof(post), ", posted to the committer at %.2f us (%llu timed, %llu of them while the finisher was busy)", per(held.flatPostNs.load(std::memory_order_relaxed), postTimed), static_cast<unsigned long long>(postTimed), static_cast<unsigned long long>(held.flatPostBusy.load(std::memory_order_relaxed)));
+        text += post;
+        if (const auto* const ops = DriverDetail::DrawPipeline::Ops()) {
+            const auto counted = ops->Counted();
+            char line[320];
+            std::snprintf(line, sizeof(line), "; ops: %llu posted, %llu retired, %llu elements of the old path ordered against them (%llu passed), %llu waits for room, %llu wakes of the committer, %llu records wider than a flat one", static_cast<unsigned long long>(counted.posted), static_cast<unsigned long long>(counted.retired), static_cast<unsigned long long>(counted.gates), static_cast<unsigned long long>(counted.passed), static_cast<unsigned long long>(counted.roomWaits), static_cast<unsigned long long>(counted.wakes), static_cast<unsigned long long>(counted.wide));
+            text += line;
+        }
     }
     return text;
+}
+
+void Front::NoteFlatPosted(bool busy, std::uint64_t nanoseconds) {
+    auto& held = counters();
+    add(held.flatPostNs, nanoseconds);
+    add(held.flatPostTimed);
+    if (busy) add(held.flatPostBusy);
 }
 
 void Front::NoteEnqueued(std::uint64_t nanoseconds) {
@@ -1502,9 +1520,40 @@ bool Driver::tryFlatDraw(QueueState& queue, std::span<const std::uint32_t> packe
     auto* const variant = outcome.variant;
     const auto* const at = outcome.op;
     const auto epoch = inputs.epoch;
+    static thread_local std::uint32_t posts = 0;
+    const bool timedPost = stats && (++posts & 63u) == 0;
+    const auto postStarted = timedPost ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const bool busy = DrawFinisher::Busy();
+    static auto* const ops = DrawPipeline::Ops();
+    if (ops != nullptr && !ops->Closed()) {
+        static const bool runs = [] {
+            DrawPipeline::RunOpsWith([](const Core::Op& op, bool skipped) {
+                const auto* const record = reinterpret_cast<const std::byte*>(op.draw.slice.bytes);
+                if (skipped) {
+                    Core::Front::Get().FlatEmitted(Core::Front::FlatRead(record));
+                    return;
+                }
+                Driver::Get().commitFlatDraw(record);
+            });
+            return true;
+        }();
+        static_cast<void>(runs);
+        Core::Op op = Core::MakeOp(Core::OpKind::None);
+        std::memcpy(&op, at, sizeof(op));
+        front.FlatPosted(at);
+        DrawPipeline::FollowEpoch(epoch);
+        precollectCoreDraw(*variant->recipe, outcome.reads);
+        if (!ops->Post(op, variant->writes, outcome.reads, GuestMemory::HeldCollectEpoch())) {
+            DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [this, at] { commitFlatDraw(at); }, variant->writes, 0, {}, std::vector<std::pair<std::uint64_t, std::uint64_t>>(outcome.reads.begin(), outcome.reads.end()), true);
+            return true;
+        }
+        DrawPipeline::Queue0().WakeForOps();
+        if (timedPost) Core::Front::NoteFlatPosted(busy, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - postStarted).count()));
+        return true;
+    }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> reads(outcome.reads.begin(), outcome.reads.end());
     front.FlatPosted(at);
-    if (DrawFinisher::Busy()) {
+    if (busy) {
         DrawFinisher::Pending held;
         held.unknown = false;
         held.writes = variant->writes;
@@ -1518,6 +1567,7 @@ bool Driver::tryFlatDraw(QueueState& queue, std::span<const std::uint32_t> packe
         precollectCoreDraw(*variant->recipe, reads);
         DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [this, at] { commitFlatDraw(at); }, variant->writes, 0, {}, std::move(reads), true);
     }
+    if (timedPost) Core::Front::NoteFlatPosted(busy, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - postStarted).count()));
     return true;
 }
 
@@ -1549,7 +1599,7 @@ void Driver::commitFlatDraw(const std::byte* at) {
         } submitDue{*this, localDevice};
         recordLabelsForPacket(localDevice.get(), 0);
         noteDrawWriters(stages, 0);
-        if (!Core::RecordBack(*localDevice, graphics, parameters, stages, variant.recipe)) {
+        if (!Core::RecordBack(*localDevice, graphics, parameters, stages, variant.recipe, variant.serial)) {
             restarted = true;
             variant.stale.store(true, std::memory_order_release);
             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);

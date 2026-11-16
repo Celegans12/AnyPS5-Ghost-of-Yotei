@@ -18,6 +18,7 @@
 #include <string>
 #include <utility>
 #include <vector>
+#include "prx/libSceAgcDriver/Core/include/OpHost.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/FlatTransport.hpp"
 
 namespace AgcDriver::DriverDetail {
@@ -32,7 +33,9 @@ public:
         std::uint64_t retired = 0;
         std::size_t items = 0;
         std::vector<Range> writes;
+        std::uint64_t ops = 0;
     };
+    using OpRunner = void (*)(const Core::Op& op, bool skipped);
     enum class DrainReason : std::uint8_t { Packet, Flush, Labels, Capture, Indirect, Submission, Count };
     enum class QueuedWrite : std::uint8_t { None, Stored, Unknown };
     enum class CommitKind : std::uint8_t { Other, Draw, IndirectDraw, ColorMetadata, Dispatch, SampleDump, DmaFill, DmaWrite, DmaCopy, Store, EndOfPipe, Seal, SubmitEnd, Completion, BufferFill, Count };
@@ -57,6 +60,9 @@ public:
     static bool VerifiesOrder();
     static unsigned Committers();
     static bool Flat();
+    static Core::OpHost* Ops();
+    static void RunOpsWith(OpRunner runner);
+    void WakeForOps();
     static std::size_t WakeBatch(std::size_t depth);
     struct TransportCounts {
         std::uint64_t elements = 0;
@@ -113,6 +119,7 @@ private:
         CommitKind kind = CommitKind::Other;
         std::uint64_t collectEpoch = 0;
         Order order;
+        Core::OpHost::Gate gate;
     };
     DrawPipeline() = default;
     void enqueue(Item item);
@@ -123,6 +130,7 @@ private:
     void runFlat();
     void rethrowFailure();
     void rethrowFlatFailure();
+    void startCommitter();
     void report(std::chrono::steady_clock::time_point now);
     void countWrites(const std::vector<Range>& writes, bool added);
     static void breakProofsAfter(CommitKind kind, const std::vector<Range>& writes);
@@ -169,6 +177,7 @@ private:
     std::unique_ptr<FlatQueue<Item>> flat;
     std::atomic<bool> flatFailed{false};
     std::atomic<bool> flatStarted{false};
+    std::atomic<bool> opsStarted{false};
     std::atomic<std::uint64_t> flatCommits{0};
     std::atomic<std::uint64_t> flatCommitNs{0};
     std::atomic<std::uint64_t> flatCommitErrors{0};
@@ -259,6 +268,10 @@ public:
 
 private:
     friend class DrawPipeline;
+    struct Stamp {
+        Core::OpHost::Gate gate;
+        std::uint64_t bound = Core::OpHost::Every;
+    };
     struct Work {
         Job job;
         DrawPipeline::Item relayed;
@@ -298,6 +311,7 @@ private:
     std::deque<std::uint64_t> epochs;
     std::deque<DrawPipeline::Order> orders;
     std::deque<Pending> pending;
+    std::deque<Stamp> stamps;
     std::deque<std::unique_ptr<Slot>> slots;
     std::vector<Job> ran;
     std::exception_ptr failure;

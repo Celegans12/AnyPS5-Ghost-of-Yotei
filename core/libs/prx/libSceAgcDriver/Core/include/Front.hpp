@@ -185,6 +185,7 @@ public:
     static std::string Report();
     static void NoteCommitted(bool restarted, std::uint64_t nanoseconds);
     static void NoteEnqueued(std::uint64_t nanoseconds);
+    static void NoteFlatPosted(bool busy, std::uint64_t nanoseconds);
     [[nodiscard]] static bool TeachBounds();
     [[nodiscard]] static bool KeyDiagEnabled();
     static void KeyDiag(const QueueState& queue, std::uint64_t shape, bool noPlan);

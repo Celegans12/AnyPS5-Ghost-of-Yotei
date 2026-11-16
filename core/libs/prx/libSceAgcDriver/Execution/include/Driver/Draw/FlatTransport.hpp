@@ -22,11 +22,12 @@
 
 namespace AgcDriver::DriverDetail {
 
-class PendingLedger {
+template<std::size_t TInlineWrites, std::size_t TInlineReads>
+class RangeLedger {
 public:
     using Range = std::pair<std::uint64_t, std::uint64_t>;
-    static constexpr std::size_t InlineWrites = 6;
-    static constexpr std::size_t InlineReads = 12;
+    static constexpr std::size_t InlineWrites = TInlineWrites;
+    static constexpr std::size_t InlineReads = TInlineReads;
     static constexpr std::size_t InlineLabel = 16;
     static constexpr std::uint64_t Every = std::numeric_limits<std::uint64_t>::max();
     enum class Held : std::uint8_t { None, Value, Unknown };
@@ -54,11 +55,11 @@ public:
         std::uint64_t scanned = 0;
     };
 
-    PendingLedger(std::size_t depth, bool verifiesAnswers, bool countsQueries)
+    RangeLedger(std::size_t depth, bool verifiesAnswers, bool countsQueries)
         : capacity(std::bit_ceil(std::max<std::size_t>(depth, 1))), mask(capacity - 1), verifies(verifiesAnswers), counted(countsQueries), records(std::make_unique<Record[]>(capacity)) {}
 
-    PendingLedger(const PendingLedger&) = delete;
-    PendingLedger& operator=(const PendingLedger&) = delete;
+    RangeLedger(const RangeLedger&) = delete;
+    RangeLedger& operator=(const RangeLedger&) = delete;
 
     std::size_t Capacity() const { return capacity; }
     std::uint64_t Published() const { return published.load(); }
@@ -146,6 +147,26 @@ public:
         const bool answer = overlapsFlat(ranges, before, seen);
         tally(seen);
         if (verifies && answer != overlapsListed(ranges, before)) disagree("whether a queued write overlaps a range");
+        return answer;
+    }
+
+    bool OverlapsSince(std::uint64_t first, std::span<const Range> ranges, std::uint64_t before = Every) const {
+        Seen seen;
+        bool answer = false;
+        const auto last = std::min(published.load(), before);
+        for (auto position = first; position < last && !answer; ++position) {
+            if (!load(position, BoundsPart, seen)) {
+                answer = true;
+                break;
+            }
+            if (seen.Unknown()) {
+                answer = true;
+                break;
+            }
+            if (std::none_of(ranges.begin(), ranges.end(), [&](const Range& range) { return seen.Bounded(range.first, range.second); })) continue;
+            answer = !load(position, WritesPart, seen) || std::any_of(ranges.begin(), ranges.end(), [&](const Range& range) { return seen.Writes(range.first, range.second); });
+        }
+        tally(seen);
         return answer;
     }
 
@@ -525,6 +546,9 @@ private:
     mutable std::atomic<std::uint64_t> lockedQueryCount{0};
     mutable std::atomic<std::uint64_t> scannedCount{0};
 };
+
+using PendingLedger = RangeLedger<6, 12>;
+using WideLedger = RangeLedger<12, 48>;
 
 template<typename TPayload>
 class FlatQueue {
