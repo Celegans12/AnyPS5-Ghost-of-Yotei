@@ -345,6 +345,7 @@ struct TraceSummary {
     double gpuBusyMs = 0;
     std::uint64_t ownedDrawUnbound = 0;
     std::optional<std::uint64_t> draws;
+    std::optional<bool> timers;
     std::string trace;
     std::optional<std::pair<double, double>> interval;
     std::optional<TraceHost> host;
@@ -385,12 +386,19 @@ public:
 
 class TracePresentsOnly {
 public:
-    static bool Parse(const char* presentsOnly, bool summaryEvery, bool window) {
-        if (presentsOnly == nullptr) return false;
-        if (std::string_view(presentsOnly) != "1") throw std::invalid_argument("APS5_TRACE_PRESENTS_ONLY=" + std::string(presentsOnly) + " is not 1");
-        if (!summaryEvery) throw std::invalid_argument("APS5_TRACE_PRESENTS_ONLY=1 needs APS5_TRACE_SUMMARY_EVERY");
-        if (window) throw std::invalid_argument("APS5_TRACE_PRESENTS_ONLY=1 cannot record a trace window");
-        return true;
+    enum class Timers { On, Off, Alternate };
+
+    static Timers Parse(const char* presentsOnly, bool summaryEvery, bool window) {
+        if (presentsOnly == nullptr) return Timers::On;
+        const std::string_view text = presentsOnly;
+        if (text != "1" && text != "alternate") throw std::invalid_argument("APS5_TRACE_PRESENTS_ONLY=" + std::string(text) + " is not 1 or alternate");
+        if (!summaryEvery) throw std::invalid_argument("APS5_TRACE_PRESENTS_ONLY=" + std::string(text) + " needs APS5_TRACE_SUMMARY_EVERY");
+        if (window) throw std::invalid_argument("APS5_TRACE_PRESENTS_ONLY=" + std::string(text) + " cannot record a trace window");
+        return text == "1" ? Timers::Off : Timers::Alternate;
+    }
+
+    static bool IntervalTimed(Timers timers, std::uint64_t interval) {
+        return timers == Timers::On || (timers == Timers::Alternate && interval % 2 == 0);
     }
 };
 
@@ -698,6 +706,7 @@ public:
         if (summary.interval) output += ",\"interval_start_s\":" + number(summary.interval->first) + ",\"interval_end_s\":" + number(summary.interval->second);
         output += ",\"presents\":" + std::to_string(count);
         if (summary.draws) output += ",\"draws\":" + std::to_string(*summary.draws);
+        if (summary.timers) output += std::string(",\"timers\":") + (*summary.timers ? "true" : "false");
         output += ",\"frame_ms\":{\"p50\":" + number(percentile(0.5)) + ",\"p90\":" + number(percentile(0.9)) + ",\"p99\":" + number(percentile(0.99)) + ",\"max\":" + number(frames.empty() ? 0.0 : frames.back()) + "}";
         output += ",\"gpu_busy_ms_per_present\":" + number(summary.gpuBusyMs * perPresent);
 
