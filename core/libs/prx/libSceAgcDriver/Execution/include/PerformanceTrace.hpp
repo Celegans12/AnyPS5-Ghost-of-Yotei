@@ -344,6 +344,7 @@ struct TraceSummary {
     std::uint64_t firstPresent = 0;
     double gpuBusyMs = 0;
     std::uint64_t ownedDrawUnbound = 0;
+    std::optional<std::uint64_t> draws;
     std::string trace;
     std::optional<std::pair<double, double>> interval;
     std::optional<TraceHost> host;
@@ -378,6 +379,17 @@ public:
         if (bench == nullptr) return false;
         if (std::string_view(bench) != "1") throw std::invalid_argument("APS5_TRACE_BENCH=" + std::string(bench) + " is not 1");
         if (!summaryEvery) throw std::invalid_argument("APS5_TRACE_BENCH=1 needs APS5_TRACE_SUMMARY_EVERY");
+        return true;
+    }
+};
+
+class TracePresentsOnly {
+public:
+    static bool Parse(const char* presentsOnly, bool summaryEvery, bool window) {
+        if (presentsOnly == nullptr) return false;
+        if (std::string_view(presentsOnly) != "1") throw std::invalid_argument("APS5_TRACE_PRESENTS_ONLY=" + std::string(presentsOnly) + " is not 1");
+        if (!summaryEvery) throw std::invalid_argument("APS5_TRACE_PRESENTS_ONLY=1 needs APS5_TRACE_SUMMARY_EVERY");
+        if (window) throw std::invalid_argument("APS5_TRACE_PRESENTS_ONLY=1 cannot record a trace window");
         return true;
     }
 };
@@ -685,6 +697,7 @@ public:
         output += ",\"ms\":" + number(milliseconds(span)) + "}";
         if (summary.interval) output += ",\"interval_start_s\":" + number(summary.interval->first) + ",\"interval_end_s\":" + number(summary.interval->second);
         output += ",\"presents\":" + std::to_string(count);
+        if (summary.draws) output += ",\"draws\":" + std::to_string(*summary.draws);
         output += ",\"frame_ms\":{\"p50\":" + number(percentile(0.5)) + ",\"p90\":" + number(percentile(0.9)) + ",\"p99\":" + number(percentile(0.99)) + ",\"max\":" + number(frames.empty() ? 0.0 : frames.back()) + "}";
         output += ",\"gpu_busy_ms_per_present\":" + number(summary.gpuBusyMs * perPresent);
 

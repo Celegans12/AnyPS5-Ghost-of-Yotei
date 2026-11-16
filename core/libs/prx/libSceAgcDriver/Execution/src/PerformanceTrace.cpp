@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TraceFile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
+#include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/TraceRevision.hpp"
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 #include <array>
@@ -42,8 +43,11 @@ struct Session {
     bool started = false;
     std::optional<TraceWindow> window;
     bool windowOpen = false;
+    bool presentsOnly = false;
     std::vector<std::vector<TraceThread::Total>> windowBase;
     std::uint64_t windowOwnedUnbound = 0;
+    std::uint64_t windowDraws = 0;
+    std::uint64_t intervalDraws = 0;
     std::optional<TraceInterval> interval;
     bool intervalOpen = false;
     std::uint64_t intervalFirstPresent = 0;
@@ -212,6 +216,10 @@ double seconds(Clock::duration elapsed) {
     return std::chrono::duration<double>(elapsed).count();
 }
 
+std::uint64_t drawsSoFar() {
+    return PacketCounters::Sum().draws;
+}
+
 }
 
 void PerformanceTrace::BindThread(const char* name, std::size_t capacity) {
@@ -269,6 +277,7 @@ void PerformanceTrace::OpenInterval(Clock::time_point now, std::uint64_t present
     state.intervalFirstPresent = present;
     state.intervalGpuBusy = VulkanDevice::PresentCounts().gpuBusyMs;
     state.intervalOwnedUnbound = OwnedDrawUnbound();
+    state.intervalDraws = drawsSoFar();
     state.intervalPresents.assign(1, now);
     if (summaryWriter()) return;
     summaryWriter() = std::make_unique<ProfileOutput>([directory = traceDirectory()](std::string_view text) {
@@ -281,7 +290,7 @@ void PerformanceTrace::OpenInterval(Clock::time_point now, std::uint64_t present
             throw;
         }
     }, std::numeric_limits<std::size_t>::max());
-    ProfilePrint_nid_no_patch("[trace] summarizing %s from present %llu\n", state.interval->Describe().c_str(), static_cast<unsigned long long>(present));
+    ProfilePrint_nid_no_patch("[trace] summarizing %s from present %llu%s\n", state.interval->Describe().c_str(), static_cast<unsigned long long>(present), state.presentsOnly ? ", presents and draws only: timers stay off" : "");
 }
 
 void PerformanceTrace::FlushInterval(Clock::time_point now, std::uint32_t width, std::uint32_t height, const VulkanDevice* device) {
@@ -298,6 +307,7 @@ void PerformanceTrace::FlushInterval(Clock::time_point now, std::uint32_t width,
     }
     auto summary = identity(width, height, device);
     summary.ownedDrawUnbound = OwnedDrawUnbound() - state.intervalOwnedUnbound;
+    summary.draws = drawsSoFar() - state.intervalDraws;
     summary.window = state.interval->Describe();
     summary.firstPresent = state.intervalFirstPresent;
     summary.gpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs - state.intervalGpuBusy;
@@ -331,6 +341,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
         state.window = TraceWindow::FromEnvironment();
         state.interval = TraceInterval::Parse(std::getenv("APS5_TRACE_SUMMARY_EVERY"));
         state.bench = TraceBench::Parse(std::getenv("APS5_TRACE_BENCH"), state.interval.has_value());
+        state.presentsOnly = TracePresentsOnly::Parse(std::getenv("APS5_TRACE_PRESENTS_ONLY"), state.interval.has_value(), state.window.has_value());
         state.first = now;
         state.started = true;
     }
@@ -351,6 +362,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
         state.windowOpen = true;
         state.windowBase = totalsOf(state.threads);
         state.windowOwnedUnbound = OwnedDrawUnbound();
+        state.windowDraws = drawsSoFar();
         state.firstPresent = present;
         state.gpuBusyAtOpen = VulkanDevice::PresentCounts().gpuBusyMs;
         TraceClockSample clock;
@@ -371,7 +383,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     if (!state.windowOpen) {
         if (!state.interval) return;
         presentCount.fetch_add(1, std::memory_order_relaxed);
-        recording.store(true, std::memory_order_relaxed);
+        if (!state.presentsOnly) recording.store(true, std::memory_order_relaxed);
         return;
     }
     state.presents.push_back(now);
@@ -399,6 +411,7 @@ void PerformanceTrace::Present(std::uint32_t width, std::uint32_t height, const 
     const auto process = processId();
     auto summary = identity(width, height, device);
     summary.ownedDrawUnbound = OwnedDrawUnbound() - state.windowOwnedUnbound;
+    summary.draws = drawsSoFar() - state.windowDraws;
     summary.window = state.window->Describe();
     summary.firstPresent = state.firstPresent;
     summary.gpuBusyMs = VulkanDevice::PresentCounts().gpuBusyMs - state.gpuBusyAtOpen;

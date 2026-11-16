@@ -11,6 +11,7 @@
 #include <iostream>
 #include <iterator>
 #include <mutex>
+#include <tuple>
 
 namespace {
 
@@ -704,6 +705,33 @@ void BenchSwitch() {
     }
 }
 
+void PresentsOnlySwitch() {
+    Check(!AgcDriver::TracePresentsOnly::Parse(nullptr, true, false), "presents-only summaries were enabled without their switch");
+    Check(AgcDriver::TracePresentsOnly::Parse("1", true, false), "APS5_TRACE_PRESENTS_ONLY=1 was not accepted");
+    for (const auto& [text, every, window] : {std::tuple{"1", false, false}, std::tuple{"1", true, true}, std::tuple{"0", true, false}, std::tuple{"yes", true, false}, std::tuple{"", true, false}}) {
+        bool rejected = false;
+        try { AgcDriver::TracePresentsOnly::Parse(text, every, window); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        Check(rejected, "a malformed or unsupported APS5_TRACE_PRESENTS_ONLY was accepted");
+    }
+}
+
+void SummaryDraws() {
+    const auto origin = Clock::now();
+    AgcDriver::TraceSummary summary;
+    summary.commit = "abc";
+    summary.environment = {{"APS5_TRACE_PRESENTS_ONLY", "1"}, {"APS5_TRACE_SUMMARY_EVERY", "5"}};
+    summary.window = "summary_every 5";
+    summary.draws = 2100;
+    const std::vector<TraceThread::Snapshot> threads{{"queue worker 0x0", {}, {}, false}};
+    const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16), origin + milliseconds(40)};
+    const auto line = TraceFormat::Summary(summary, threads, presents);
+    Check(line.find("\"presents\":2,\"draws\":2100,\"frame_ms\":") != std::string::npos, "the summary line did not carry its draw count after the presents");
+    Check(line.find("\"phase_totals_ms\":{}") != std::string::npos && line.find("\"worker_busy_pct\":{\"queue worker 0x0\":0.000}") != std::string::npos, "a presents-only summary reported timer phases");
+    summary.draws.reset();
+    Check(TraceFormat::Summary(summary, threads, presents).find("\"draws\"") == std::string::npos, "a summary without a draw count printed one");
+}
+
 void CaptureOwnsSnapshots() {
     auto capture = std::make_shared<AgcDriver::TraceCapture>();
     const auto origin = Clock::now();
@@ -872,6 +900,8 @@ int main() {
         BenchWriterKeepsNewest();
         BenchWriterStopWrites();
         BenchSwitch();
+        PresentsOnlySwitch();
+        SummaryDraws();
         CaptureOwnsSnapshots();
         CaptureWriterDrainAndFailure();
         GzipFile();
