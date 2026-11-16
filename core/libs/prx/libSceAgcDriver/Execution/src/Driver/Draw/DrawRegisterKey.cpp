@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
 #include "prx/libSceAgcDriver/Core/include/RunKey.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -86,7 +87,7 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
 
 
 bool InstallCoreKeyRegisters() {
-    if (std::getenv("APS5_CORE_KEY_SHAPE") == nullptr) return false;
+    if (std::getenv("APS5_CORE_KEY_SHAPE") == nullptr && !Graphics::CoreDefault()) return false;
     std::array<std::vector<std::uint64_t>, 3> bits;
     const auto set = [&](Core::Bank bank, std::uint32_t offset) {
         auto& words = bits[static_cast<std::size_t>(bank)];

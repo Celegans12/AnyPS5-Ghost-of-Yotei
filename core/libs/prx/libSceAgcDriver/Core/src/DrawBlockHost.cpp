@@ -66,7 +66,7 @@ constexpr std::array<std::pair<VkMemoryPropertyFlags, const char*>, 4> FlagNames
 bool systemRingForced() {
     static const bool forced = [] {
         const char* text = std::getenv("APS5_CORE_RING_SYSTEM");
-        return text != nullptr && std::strcmp(text, "0") != 0;
+        return text != nullptr ? std::strcmp(text, "0") != 0 : Graphics::CoreDefault();
     }();
     return forced;
 }
@@ -79,7 +79,7 @@ std::optional<std::uint32_t> cardRingType(const Graphics::Context& context) {
 }
 
 const char* systemRingReason(const Graphics::Context& context, std::size_t bytes) {
-    if (systemRingForced()) return "APS5_CORE_RING_SYSTEM is set";
+    if (systemRingForced()) return "APS5_CORE_RING_SYSTEM is set or left to the default of the core";
     const auto type = cardRingType(context);
     if (!type) return "the device has no device-local host-visible coherent memory type";
     const auto heap = context.memory.memoryTypes[*type].heapIndex;
