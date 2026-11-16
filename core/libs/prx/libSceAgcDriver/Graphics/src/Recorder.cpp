@@ -4077,6 +4077,83 @@ void Recorder::Keep(std::shared_ptr<void> object, std::size_t bytes) {
     open->keptBytes += bytes;
 }
 
+namespace {
+
+constexpr VkDeviceSize TwinGapBytes = 64;
+std::atomic<std::uint64_t> twinBatches{0}, twinRanges{0}, twinBytes{0}, twinTimedBatches{0}, twinNanoseconds{0};
+std::atomic<std::int64_t> twinReportedMs{0};
+
+void reportTwins() {
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = twinReportedMs.load(std::memory_order_relaxed);
+    if (nowMs - last < 5000 || !twinReportedMs.compare_exchange_strong(last, nowMs)) return;
+    std::fprintf(stderr, "[ring-twin] cumulative: %llu batches copied %llu ranges, %llu bytes; GPU time of the copies %.3f ms over %llu timed batches%c",
+            static_cast<unsigned long long>(twinBatches.load(std::memory_order_relaxed)), static_cast<unsigned long long>(twinRanges.load(std::memory_order_relaxed)), static_cast<unsigned long long>(twinBytes.load(std::memory_order_relaxed)),
+            static_cast<double>(twinNanoseconds.load(std::memory_order_relaxed)) / 1e6, static_cast<unsigned long long>(twinTimedBatches.load(std::memory_order_relaxed)), 10);
+}
+
+}
+
+bool Recorder::RingTwin() {
+    static const bool enabled = std::getenv("APS5_CORE_RING_TWIN") != nullptr;
+    return enabled;
+}
+
+void Recorder::NoteTwinCopy(VkBuffer source, VkBuffer twin, VkDeviceSize offset, VkDeviceSize bytes) {
+    if (bytes == 0) return;
+    ensureOpen();
+    auto& copies = open->twinCopies;
+    if (!copies.empty() && copies.back().twin == twin && offset >= copies.back().end && offset - copies.back().end <= TwinGapBytes) {
+        copies.back().end = offset + bytes;
+        return;
+    }
+    copies.push_back({source, twin, offset, offset + bytes});
+}
+
+void Recorder::recordTwinCopies(Batch& batch) {
+    VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    allocation.commandPool = context.pool;
+    allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    allocation.commandBufferCount = 1;
+    Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &batch.twinCommands), "vkAllocateCommandBuffers ring twin");
+    VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    const auto commands = batch.twinCommands;
+    Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer ring twin");
+    if (GpuTimingEnabled()) {
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = 2;
+        if (context.Function<PFN_vkCreateQueryPool>("vkCreateQueryPool")(context.device, &info, nullptr, &batch.twinQueries) != VK_SUCCESS) batch.twinQueries = VK_NULL_HANDLE;
+    }
+    if (batch.twinQueries != VK_NULL_HANDLE) {
+        function(cmdResetQueryPool, "vkCmdResetQueryPool")(commands, batch.twinQueries, 0, 2);
+        context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, batch.twinQueries, 0);
+    }
+    std::uint64_t bytes = 0;
+    for (const auto& copy : batch.twinCopies) {
+        CopyBuffer(context, commands, copy.source, copy.begin, copy.twin, copy.begin, copy.end - copy.begin);
+        bytes += copy.end - copy.begin;
+    }
+    recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT);
+    if (batch.twinQueries != VK_NULL_HANDLE) context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, batch.twinQueries, 1);
+    Check(function(endCommandBuffer, "vkEndCommandBuffer")(commands), "vkEndCommandBuffer ring twin");
+    twinBatches.fetch_add(1, std::memory_order_relaxed);
+    twinRanges.fetch_add(batch.twinCopies.size(), std::memory_order_relaxed);
+    twinBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void Recorder::readTwinTiming(Batch& batch) {
+    if (batch.twinQueries == VK_NULL_HANDLE || !batch.submitted) return;
+    std::array<std::uint64_t, 2> stamps{};
+    const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.twinQueries, 0, 2, sizeof(stamps), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT);
+    if (result == VK_SUCCESS && stamps[1] >= stamps[0]) {
+        twinNanoseconds.fetch_add(static_cast<std::uint64_t>(static_cast<double>(stamps[1] - stamps[0]) * context.limits.timestampPeriod), std::memory_order_relaxed);
+        twinTimedBatches.fetch_add(1, std::memory_order_relaxed);
+    }
+    reportTwins();
+}
+
 void Recorder::KeepDrawArena(std::shared_ptr<void> arena) {
     ensureOpen();
     open->kept.push_back(arena);
@@ -5604,9 +5681,11 @@ void Recorder::Submit() {
     } discardUnsubmitted{*this, batch};
     Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
     if (injectedSubmitFailures.load(std::memory_order_relaxed) != 0 && injectedSubmitFailures.fetch_sub(1, std::memory_order_relaxed) != 0) throw std::runtime_error("vkQueueSubmit recorder: injected failure");
+    if (!batch->twinCopies.empty()) recordTwinCopies(*batch);
+    const std::array<VkCommandBuffer, 2> ordered{batch->twinCommands, batch->commands};
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submission.commandBufferCount = 1;
-    submission.pCommandBuffers = &batch->commands;
+    submission.commandBufferCount = batch->twinCommands != VK_NULL_HANDLE ? 2 : 1;
+    submission.pCommandBuffers = batch->twinCommands != VK_NULL_HANDLE ? ordered.data() : &batch->commands;
     // The timeline reaches this batch's serial when it completes (see WaitSerial).
     const std::uint64_t serial = submissions + 1;
     if (CheckpointMarkersEnabled() && batch->queue == 0 && batch->predictedSerial != 0) {
@@ -6158,6 +6237,7 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         }
     }
     readGpuTiming(*batch);
+    readTwinTiming(*batch);
     readSamples(*batch);
     if (batch->serial != 0) {
         std::lock_guard ringLock(completedMutex);
@@ -6291,6 +6371,11 @@ void Recorder::release(Batch& batch) noexcept {
         if (profile) commandBuffersFreed.fetch_add(1, std::memory_order_relaxed);
     }
     batch.commands = VK_NULL_HANDLE;
+    if (batch.twinCommands != VK_NULL_HANDLE) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &batch.twinCommands);
+    batch.twinCommands = VK_NULL_HANDLE;
+    if (batch.twinQueries != VK_NULL_HANDLE) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, batch.twinQueries, nullptr);
+    batch.twinQueries = VK_NULL_HANDLE;
+    batch.twinCopies.clear();
     if (batch.fence != VK_NULL_HANDLE && spare.size() < 64 && function(resetFences, "vkResetFences")(context.device, 1, &batch.fence) == VK_SUCCESS) {
         try {
             spare.push_back(batch.fence);

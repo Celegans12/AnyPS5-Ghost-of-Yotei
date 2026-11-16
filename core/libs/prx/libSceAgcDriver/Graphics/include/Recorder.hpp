@@ -287,6 +287,8 @@ public:
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
+    static bool RingTwin();
+    void NoteTwinCopy(VkBuffer source, VkBuffer twin, VkDeviceSize offset, VkDeviceSize bytes);
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
     static bool LeanCommit();
@@ -854,8 +856,17 @@ private:
         bool overwritten = false;
         const Batch* batch = nullptr;
     };
+    struct TwinCopy {
+        VkBuffer source;
+        VkBuffer twin;
+        VkDeviceSize begin;
+        VkDeviceSize end;
+    };
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
+        VkCommandBuffer twinCommands = VK_NULL_HANDLE;
+        VkQueryPool twinQueries = VK_NULL_HANDLE;
+        std::vector<TwinCopy> twinCopies;
         CommandState graphicsState;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
@@ -1094,6 +1105,8 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
+    void recordTwinCopies(Batch& batch);
+    void readTwinTiming(Batch& batch);
     void flushDeferredDispatch();
     void flushCopyBacks(LandingSite site, const CopyBackReach* reach = nullptr);
     VkCommandBuffer openCommands(VkAccessFlags* coveredAccess);
