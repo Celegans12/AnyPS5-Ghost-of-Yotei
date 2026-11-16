@@ -2037,11 +2037,101 @@ void ReleaseDrawInputSlots(VkDevice device) {
     table.tagged = false;
 }
 
+namespace {
+
+enum class InputCost : std::size_t { Calls, Bytes, Reused, ReusedBytes, ReusedNanoseconds, Fresh, FreshBytes, FreshNanoseconds, New, NewBytes, Rewritten, RewrittenBytes, Untracked, UntrackedBytes, FlushNanoseconds, CollectNanoseconds, LookupNanoseconds, AllocateNanoseconds, ReadNanoseconds, Small, SmallBytes, Medium, MediumBytes, Large, LargeBytes, Huge, HugeBytes, Indices, Count };
+
+std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(InputCost::Count)>& inputCosts() {
+    static std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(InputCost::Count)> held{};
+    return held;
+}
+
+bool InputCostStats() {
+    static const bool enabled = std::getenv("APS5_DRAW_INPUT_COST") != nullptr;
+    return enabled;
+}
+
+void addInputCost(InputCost kind, std::uint64_t amount = 1) {
+    inputCosts()[static_cast<std::size_t>(kind)].fetch_add(amount, std::memory_order_relaxed);
+}
+
+struct InputCostClock {
+    bool on = false;
+    std::chrono::steady_clock::time_point last{};
+    explicit InputCostClock(bool enabled) : on(enabled) {
+        if (on) last = std::chrono::steady_clock::now();
+    }
+    std::uint64_t Lap() {
+        if (!on) return 0;
+        const auto now = std::chrono::steady_clock::now();
+        const auto spent = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - last).count());
+        last = now;
+        return spent;
+    }
+};
+
+bool inputSeenBefore(std::uint64_t address, std::size_t bytes) {
+    static auto* seen = new std::vector<std::atomic<std::uint64_t>>(65536);
+    const auto key = address ^ (static_cast<std::uint64_t>(bytes) << 48u);
+    auto& slot = (*seen)[static_cast<std::size_t>((address * 0x9e3779b97f4a7c15ull) >> 48u)];
+    return slot.exchange(key, std::memory_order_relaxed) == key;
+}
+
+void reportInputCosts() {
+    static std::atomic<std::int64_t> lastReport{0};
+    const auto nowMs = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (nowMs - last < 5000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
+    const auto at = [](InputCost kind) { return static_cast<unsigned long long>(inputCosts()[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed)); };
+    const auto each = [&](InputCost total, InputCost count) { return at(count) == 0 ? 0.0 : static_cast<double>(at(total)) / static_cast<double>(at(count)); };
+    std::fprintf(stderr, "[draw-input-cost] (cumulative) %llu copied inputs, %llu bytes, %llu of them indices; reused unchanged %llu (%llu bytes, %.0f ns each); copied anew %llu (%llu bytes, %.0f ns each): first view of the range %llu (%llu bytes), range seen before and changed %llu (%llu bytes), unwatched %llu (%llu bytes); time per input: flush %.0f ns, collect %.0f ns, lookup %.0f ns, allocation %.0f ns per new copy, read %.0f ns per new copy; new copies by size: up to 1 KiB %llu (%llu bytes), up to 16 KiB %llu (%llu bytes), up to 256 KiB %llu (%llu bytes), larger %llu (%llu bytes)%c",
+        at(InputCost::Calls), at(InputCost::Bytes), at(InputCost::Indices), at(InputCost::Reused), at(InputCost::ReusedBytes), each(InputCost::ReusedNanoseconds, InputCost::Reused), at(InputCost::Fresh), at(InputCost::FreshBytes), each(InputCost::FreshNanoseconds, InputCost::Fresh), at(InputCost::New), at(InputCost::NewBytes), at(InputCost::Rewritten), at(InputCost::RewrittenBytes), at(InputCost::Untracked), at(InputCost::UntrackedBytes),
+        each(InputCost::FlushNanoseconds, InputCost::Calls), each(InputCost::CollectNanoseconds, InputCost::Calls), each(InputCost::LookupNanoseconds, InputCost::Calls), each(InputCost::AllocateNanoseconds, InputCost::Fresh), each(InputCost::ReadNanoseconds, InputCost::Fresh),
+        at(InputCost::Small), at(InputCost::SmallBytes), at(InputCost::Medium), at(InputCost::MediumBytes), at(InputCost::Large), at(InputCost::LargeBytes), at(InputCost::Huge), at(InputCost::HugeBytes), 10);
+}
+
+void noteInputCost(const DrawInputCopy& copy, std::uint64_t address, std::size_t bytes, std::size_t from, Recorder::SnapshotUse use, std::uint64_t spent, bool anew) {
+    const auto read = static_cast<std::uint64_t>(bytes - from);
+    addInputCost(InputCost::Calls);
+    addInputCost(InputCost::Bytes, read);
+    if (use != Recorder::SnapshotUse::Vertex) addInputCost(InputCost::Indices);
+    const bool seen = inputSeenBefore(address, bytes);
+    if (!anew) {
+        addInputCost(InputCost::Reused);
+        addInputCost(InputCost::ReusedBytes, read);
+        addInputCost(InputCost::ReusedNanoseconds, spent);
+    } else {
+        addInputCost(InputCost::Fresh);
+        addInputCost(InputCost::FreshBytes, read);
+        addInputCost(InputCost::FreshNanoseconds, spent);
+        if (copy.generation == 0) {
+            addInputCost(InputCost::Untracked);
+            addInputCost(InputCost::UntrackedBytes, read);
+        } else if (seen) {
+            addInputCost(InputCost::Rewritten);
+            addInputCost(InputCost::RewrittenBytes, read);
+        } else {
+            addInputCost(InputCost::New);
+            addInputCost(InputCost::NewBytes, read);
+        }
+        const auto size = read <= 1024 ? InputCost::Small : read <= 16384 ? InputCost::Medium : read <= 262144 ? InputCost::Large : InputCost::Huge;
+        addInputCost(size);
+        addInputCost(static_cast<InputCost>(static_cast<std::size_t>(size) + 1u), read);
+    }
+    if ((inputCosts()[static_cast<std::size_t>(InputCost::Calls)].load(std::memory_order_relaxed) & 1023u) == 0) reportInputCosts();
+}
+
+}
+
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t from) {
     Require(use != Recorder::SnapshotUse::Storage, "a draw input is a vertex or index buffer");
     Require(from == 0 || (use == Recorder::SnapshotUse::Vertex && from < bytes), "only a vertex input starts past its address");
     DrawInputCopy copy;
     copy.from = from;
+    const bool costed = InputCostStats() && recorder != nullptr && bytes != 0;
+    const auto costStart = costed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto costSpent = [&] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - costStart).count()); };
+    InputCostClock costClock(costed);
     const bool tokens = recorder != nullptr && bytes != 0 && !BufferCache::DirtyFirst() && InputTokenCache();
     std::uint64_t pendingSerial = 0;
     if (tokens) {
@@ -2051,6 +2141,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             if (VerifyInputTokenCache()) verifyTokenInput(address, bytes, alignment, from, *held);
             copy.buffer = std::move(held);
             copy.reused = true;
+            if (costed) noteInputCost(copy, address, bytes, from, use, costSpent(), false);
             return copy;
         }
     }
@@ -2061,13 +2152,16 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
             if (VerifyDrawInputSlots()) verifySlotInput(address, bytes, alignment, from, *held);
             copy.buffer = std::move(held);
             copy.reused = true;
+            if (costed) noteInputCost(copy, address, bytes, from, use, costSpent(), false);
             return copy;
         }
     }
     if (recorder != nullptr && bytes != 0 && BufferCache::DirtyFirst()) {
         GuestMemory::FlushGpuWrites(address, bytes);
     } else if (recorder != nullptr && bytes != 0) {
+        static_cast<void>(costClock.Lap());
         GuestMemory::FlushGpuWrites(address, bytes);
+        if (costed) addInputCost(InputCost::FlushNanoseconds, costClock.Lap());
 #ifdef _WIN32
         const bool owned = !RuntimeSwitches::Set(RuntimeSwitch::NoOwnedDrawInputs);
 #else
@@ -2076,15 +2170,20 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         if (owned && recorder->OwnedDrawInputEntries() != 0) copy.buffer = recorder->ReusableOwnedDrawInput(address, bytes, use, &copy.derived, from, &copy.lowest);
         if (copy.buffer != nullptr) {
             copy.reused = true;
+            if (costed) noteInputCost(copy, address, bytes, from, use, costSpent(), false);
             return copy;
         }
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+        static_cast<void>(costClock.Lap());
         copy.generation = GuestMemory::CollectWrites(address, bytes);
+        if (costed) addInputCost(InputCost::CollectNanoseconds, costClock.Lap());
         const auto token = tokens && copy.generation != 0 ? GuestMemory::TokenFor(address, bytes) : GuestMemory::ContentToken{};
         if (copy.generation != 0) copy.buffer = slots ? ReusableSlotDrawInput(context.device, address, bytes, use, from, &copy.derived, &copy.lowest, &refill) : recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, nullptr, from, &copy.lowest);
         else if (owned) copy.owned = recorder->ArmOwnedDrawInput(address, bytes);
+        if (costed) addInputCost(InputCost::LookupNanoseconds, costClock.Lap());
         if (copy.buffer != nullptr) {
             copy.reused = true;
+            if (costed) noteInputCost(copy, address, bytes, from, use, costSpent(), false);
             if (slots && VerifyDrawInputSlots()) verifySlotInput(address, bytes, alignment, from, *copy.buffer);
             if (tokens) KeepTokenDrawInput(context.device, address, bytes, use, from, copy.buffer, copy.derived, copy.lowest, token, pendingSerial, copy.registryGeneration);
             return copy;
@@ -2099,8 +2198,13 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     }
     static const bool poisonPrefix = std::getenv("APS5_POISON_VERTEX_PREFIX") != nullptr;
     const auto held = copy.buffer->Bytes();
+    if (costed) addInputCost(InputCost::AllocateNanoseconds, costClock.Lap());
     if (poisonPrefix) std::fill(held.begin(), held.begin() + static_cast<std::ptrdiff_t>(from), std::byte{0x7f});
     GuestMemory::Read(address + from, held.subspan(from), alignment);
+    if (costed) {
+        addInputCost(InputCost::ReadNanoseconds, costClock.Lap());
+        noteInputCost(copy, address, bytes, from, use, costSpent(), true);
+    }
     return copy;
 }
 
