@@ -981,19 +981,20 @@ public:
         const auto capacity = *count;
         *count = 0;
         const auto end = address + bytes;
+        if (countRefusals()) noteCollect();
         if (clear) disown(address, end);
         if (collection == Collection::Fresh) {
             const auto fresh = freshRanges.upper_bound(address);
             if ((fresh == freshRanges.begin() || std::prev(fresh)->second <= address) && (fresh == freshRanges.end() || fresh->first >= end)) return true;
             for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
                 if (it->second.resident) {
-                    if (!watchResident) return false;
+                    if (!watchResident) return refuse(Refusal::ResidentUnwatched, it->first);
                     continue;
                 }
-                if (it->second.page->comparedWhenShared) return false;
+                if (it->second.page->comparedWhenShared) return refuse(Refusal::Compared, it->first);
                 if (it->second.protection != PAGE_NOACCESS) continue;
                 for (auto at = std::max(address, it->first); at < std::min(end, it->first + pageBytes); at += 4096) {
-                    if ((it->second.collected & (1u << ((at - it->first) / 4096))) == 0) return false;
+                    if ((it->second.collected & (1u << ((at - it->first) / 4096))) == 0) return refuse(Refusal::NoAccess, at);
                 }
             }
         } else if (clear && !collectable(address, end)) return false;
@@ -1017,7 +1018,7 @@ public:
             const auto found = viewAt(base, position);
             if (found != views.end() && found->second.resident) {
                 flushClean();
-                if (!watchResident) return false;
+                if (!watchResident) return refuse(Refusal::ResidentUnwatched, cursor);
                 const auto available = capacity - *count;
                 if (available == 0) return true;
                 const auto run = std::prev(residentRuns.upper_bound(cursor));
@@ -1044,7 +1045,7 @@ public:
                 }
                 if (view.protection == PAGE_NOACCESS) {
                     flushClean();
-                    return false;
+                    return refuse(Refusal::NoAccess, cursor);
                 }
                 const bool pinned = view.page->pins != 0;
                 std::uint8_t settled = 0;
@@ -1113,7 +1114,7 @@ public:
                     continue;
                 }
                 const auto allocationEnd = privateAllocationEnd(cursor);
-                if (allocationEnd == 0) return false;
+                if (allocationEnd == 0) return refuse(Refusal::OutsidePrivate, cursor);
                 if (capacity == *count) return true;
                 const auto stop = ownedPending.empty() ? std::min(end, allocationEnd) : std::min({end, allocationEnd, (cursor & ~std::uintptr_t{4095}) + (capacity - *count) * 4096});
                 const auto touched = (((stop + 4095) & ~static_cast<std::uintptr_t>(4095)) - (cursor & ~static_cast<std::uintptr_t>(4095))) / 4096;
@@ -1126,7 +1127,7 @@ public:
                 const bool committed = !verifyDirect() || committedPrivate(cursor, stop);
                 if (collectTracked(clear, privateAllocationStart(cursor), allocationEnd, true, reinterpret_cast<void*>(cursor), stop - cursor, pages + *count, &available, &granularity) != 0) {
                     const auto memory = query(cursor);
-                    if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return false;
+                    if (memory.State != MEM_COMMIT || memory.Type != MEM_PRIVATE) return refuse(Refusal::Uncommitted, cursor);
                     fail("collect private guest writes");
                 }
                 if (!committed) staleProof(cursor, stop);
@@ -1841,16 +1842,109 @@ private:
         for (auto cursor = address; cursor < end;) {
             const auto base = cursor & ~(pageBytes - 1);
             if (const auto found = viewAt(base, position); found != views.end()) {
-                if (found->second.protection == PAGE_NOACCESS || (found->second.resident ? !watchResident : found->second.page->comparedWhenShared)) return false;
+                if (found->second.protection == PAGE_NOACCESS) return refuse(Refusal::NoAccess, cursor);
+                if (found->second.resident ? !watchResident : found->second.page->comparedWhenShared) return refuse(found->second.resident ? Refusal::ResidentUnwatched : Refusal::Compared, cursor);
                 cursor = std::min(end, base + pageBytes);
                 continue;
             }
             const auto allocationEnd = privateAllocationEnd(cursor);
-            if (allocationEnd == 0) return false;
+            if (allocationEnd == 0) return refuse(Refusal::OutsidePrivate, cursor);
             cursor = std::min(end, allocationEnd);
         }
         remember(collectableRanges, address, end);
         return true;
+    }
+
+    enum class Refusal : std::uint8_t { NoAccess, Compared, ResidentUnwatched, OutsidePrivate, Uncommitted, Count };
+    static constexpr std::size_t refusals = static_cast<std::size_t>(Refusal::Count);
+    static constexpr std::array<const char*, refusals> refusalNames{"no-access view", "compared page", "unwatched resident", "outside private allocations", "uncommitted private"};
+    struct RefusalTally {
+        std::uint64_t collects = 0;
+        std::array<std::array<std::uint64_t, refusals>, MappingLockRoles> causes{};
+        std::map<std::uintptr_t, std::array<std::uint64_t, refusals>> blocks;
+        std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+    };
+
+    static bool countRefusals() {
+        static const bool counted = std::getenv("APS5_COLLECT_REFUSALS") != nullptr;
+        return counted;
+    }
+
+    void noteCollect() {
+        ++refusalTally.collects;
+        if ((refusalTally.collects & 1023) != 0) return;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - refusalTally.reported < std::chrono::seconds(10)) return;
+        reportRefusals();
+        refusalTally = {};
+        refusalTally.reported = now;
+    }
+
+    bool refuse(Refusal cause, std::uintptr_t at) {
+        if (!countRefusals()) return false;
+        const auto index = static_cast<std::size_t>(cause);
+        ++refusalTally.causes[SiteMutex::Role()][index];
+        ++refusalTally.blocks[at & ~(ownedBlockBytes - 1)][index];
+        return false;
+    }
+
+    void reportRefusals() const {
+        static constexpr std::array<const char*, MappingLockRoles> roleNames{"game", "committer", "finisher", "queue-worker", "walker", "presenter"};
+        std::string text = "[collect-refusals] (10 s): " + std::to_string(refusalTally.collects) + " collects;";
+        for (std::size_t cause = 0; cause < refusals; ++cause) {
+            std::uint64_t total = 0;
+            std::string shares;
+            for (std::size_t role = 0; role < MappingLockRoles; ++role) {
+                const auto count = refusalTally.causes[role][cause];
+                if (count == 0) continue;
+                total += count;
+                shares += std::string(shares.empty() ? "" : ", ") + roleNames[role] + " " + std::to_string(count);
+            }
+            text += std::string(" ") + refusalNames[cause] + " " + std::to_string(total) + (shares.empty() ? ";" : " (" + shares + ");");
+        }
+        std::vector<std::pair<std::uint64_t, std::uintptr_t>> ranked;
+        for (const auto& [block, causes] : refusalTally.blocks) {
+            std::uint64_t total = 0;
+            for (const auto count : causes) total += count;
+            ranked.emplace_back(total, block);
+        }
+        std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) { return left.first != right.first ? left.first > right.first : left.second < right.second; });
+        text += " " + std::to_string(ranked.size()) + " blocks refused, first:";
+        for (std::size_t index = 0; index < ranked.size() && index < 16; ++index) {
+            const auto block = ranked[index].second;
+            const auto& causes = refusalTally.blocks.at(block);
+            char item[32];
+            std::snprintf(item, sizeof(item), " 0x%llx", static_cast<unsigned long long>(block));
+            text += item;
+            for (std::size_t cause = 0; cause < refusals; ++cause) {
+                if (causes[cause] != 0) text += std::string(" ") + refusalNames[cause] + " " + std::to_string(causes[cause]);
+            }
+            text += describeBlock(block) + ";";
+        }
+        std::fprintf(stderr, "%s\n", text.c_str());
+    }
+
+    std::string describeBlock(std::uintptr_t block) const {
+        std::size_t resident = 0;
+        std::size_t shared = 0;
+        std::size_t compared = 0;
+        std::size_t aliased = 0;
+        std::size_t barred = 0;
+        for (auto it = views.lower_bound(block); it != views.end() && it->first < block + ownedBlockBytes; ++it) {
+            const auto& view = it->second;
+            if (view.protection == PAGE_NOACCESS) ++barred;
+            if (view.resident) {
+                ++resident;
+                if (view.comparedWhenShared) ++compared;
+                continue;
+            }
+            ++shared;
+            if (view.page->comparedWhenShared) ++compared;
+            if (view.page->aliases.size() > 1) ++aliased;
+        }
+        char text[160];
+        std::snprintf(text, sizeof(text), " [views: %zu resident, %zu shared, %zu compared, %zu aliased, %zu no-access; %s]", resident, shared, compared, aliased, barred, privateAllocationEnd(block) != 0 ? "private" : "not private");
+        return text;
     }
 
     static bool verifyDirect() {
@@ -2724,6 +2818,10 @@ private:
             role = static_cast<std::uint8_t>(value);
         }
 
+        static std::uint8_t Role() {
+            return role;
+        }
+
         void lock() {
             Lock(LockSite::Other, 0, UINTPTR_MAX);
         }
@@ -2948,6 +3046,7 @@ private:
     std::atomic<std::uint64_t> unlockedWrites{0};
     std::atomic<std::uint64_t> unlockedAnswers{0};
     std::atomic<bool> anyCompared{false};
+    RefusalTally refusalTally;
     WindowsPageTrack& track = WindowsPageTrack::Get();
     HANDLE zeroSection = nullptr;
     AllocateFunction allocate = nullptr;
