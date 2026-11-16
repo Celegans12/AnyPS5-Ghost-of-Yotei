@@ -29,7 +29,7 @@ class SrtTape;
 namespace AgcDriver::Core {
 
 enum class FrontLeft : std::uint32_t { Entry, NoPlan, Programs, UserWords, Walk, NoVariant, VariantKey, Views, Vertex, Queued, Pending, Moved, Stale, Finisher, Nothing, Precheck, Ring, Ranges, Count };
-enum class TeachRefusal : std::uint32_t { None, Path, Program, Stage, Plan, Tape, Walk, Words, Buffers, Forwarded, Vertex, Writes, PlanDiffers, Count };
+enum class TeachRefusal : std::uint32_t { None, Path, Program, Stage, Plan, Tape, Walk, Words, Buffers, Forwarded, Vertex, Writes, PlanDiffers, Zone, Count };
 
 const char* FrontLeftName(FrontLeft reason);
 const char* TeachRefusalName(TeachRefusal reason);
@@ -38,6 +38,7 @@ struct StageWalk {
     std::vector<ShaderRecompiler::DescriptorValue> results;
     std::vector<std::uint32_t> flat;
     std::vector<std::uint8_t> active;
+    std::vector<std::uint32_t> zone;
 };
 
 struct PlanStage {
@@ -57,6 +58,7 @@ struct RunPlanData {
     std::uint32_t stageCount = 0;
     std::uint64_t id = 0;
     mutable std::uint8_t precheck = 0;
+    mutable std::uint8_t zoned = 0;
 };
 
 struct VariantStage {
@@ -78,6 +80,8 @@ struct FrontVariant {
     std::uint64_t shape = 0;
     std::array<std::uint64_t, 2> digest{};
     std::atomic<bool> stale{false};
+    std::array<std::uint64_t, 2> zoneDigest{};
+    bool zoned = false;
     std::array<ShaderRecompiler::RecompileResult, 4> frontResults;
     std::array<ShaderRecompiler::RecompileResult, 4> backResults;
     std::vector<Graphics::CompiledShader> frontStages;
@@ -160,6 +164,7 @@ struct FrontCounts {
     std::uint64_t flatBytes = 0;
     std::uint64_t flatTimed = 0;
     std::uint64_t flatVertexKnown = 0;
+    std::uint64_t flatZoned = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(FrontLeft::Count)> left{};
     std::array<std::uint64_t, static_cast<std::size_t>(TeachRefusal::Count)> refused{};
 };

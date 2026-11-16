@@ -45,7 +45,7 @@ constexpr std::uint32_t NoBinding = 0xffffffffu;
 constexpr std::uint64_t EveryProgram = 1;
 
 struct Counters {
-    std::atomic<std::uint64_t> draws{0}, continued{0}, plans{0}, taken{0}, takenContinued{0}, taught{0}, verified{0}, mismatches{0}, digests{0}, committed{0}, restarted{0}, walkNs{0}, frontNs{0}, backNs{0}, retries{0}, flatTaken{0}, flatSame{0}, flatNs{0}, flatBytes{0}, flatTimed{0}, flatVertexKnown{0};
+    std::atomic<std::uint64_t> draws{0}, continued{0}, plans{0}, taken{0}, takenContinued{0}, taught{0}, verified{0}, mismatches{0}, digests{0}, committed{0}, restarted{0}, walkNs{0}, frontNs{0}, backNs{0}, retries{0}, flatTaken{0}, flatSame{0}, flatNs{0}, flatBytes{0}, flatTimed{0}, flatVertexKnown{0}, flatZoned{0};
     std::array<std::atomic<std::uint64_t>, 8> sections{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrontLeft::Count)> left{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TeachRefusal::Count)> refused{};
@@ -189,6 +189,40 @@ struct FlatReader {
     }
 };
 
+bool flatReadWords(void* context, std::uint64_t address, std::uint32_t* out, std::uint32_t count) {
+    auto& reader = *static_cast<FlatReader*>(context);
+    const auto words = std::span<std::uint32_t>(out, count);
+    if (!ReadGuestBytes(address, std::as_writable_bytes(words))) return false;
+    return reader.Note(address, address + words.size_bytes());
+}
+
+void mixZone(std::array<std::uint64_t, 2>& digest, const PlanStage& stage, std::span<const std::uint32_t> zone) {
+    const auto& zoneOf = stage.tape->Driver();
+    mix(digest, zoneOf.sources.size());
+    for (std::size_t index = 0; index < zoneOf.sources.size(); ++index) {
+        if (index >= stage.keyResult.size() || stage.keyResult[index] == 0u) continue;
+        const auto& source = zoneOf.sources[index];
+        for (std::uint32_t dword = 0; dword < source.dwords; ++dword) mix(digest, zone[source.word + dword]);
+    }
+    const auto activeEnd = std::min<std::size_t>(zone.size(), std::size_t{zoneOf.activeWord} + (zoneOf.activeBits + 31u) / 32u);
+    for (std::size_t word = zoneOf.activeWord; word < activeEnd; ++word) mix(digest, zone[word]);
+}
+
+bool sameZone(const PlanStage& stage, std::span<const std::uint32_t> a, std::span<const std::uint32_t> b) {
+    const auto& zoneOf = stage.tape->Driver();
+    if (a.size() != b.size() || a.size() != zoneOf.words) return false;
+    for (std::size_t index = 0; index < zoneOf.sources.size(); ++index) {
+        if (index >= stage.keyResult.size() || stage.keyResult[index] == 0u) continue;
+        const auto& source = zoneOf.sources[index];
+        if (!std::equal(a.begin() + source.word, a.begin() + source.word + source.dwords, b.begin() + source.word)) return false;
+    }
+    const auto activeEnd = std::min<std::size_t>(a.size(), std::size_t{zoneOf.activeWord} + (zoneOf.activeBits + 31u) / 32u);
+    for (std::size_t word = zoneOf.activeWord; word < activeEnd; ++word) {
+        if (a[word] != b[word]) return false;
+    }
+    return true;
+}
+
 bool flatReadWord(void* context, std::uint64_t address, std::uint32_t* value) {
     auto& reader = *static_cast<FlatReader*>(context);
     if (!ReadGuestBytes(address, std::as_writable_bytes(std::span<std::uint32_t>(value, 1)))) return false;
@@ -232,6 +266,7 @@ struct FlatState {
     std::array<VertexMemo, 256> vertexMemo;
     BlockRing ring{RingSource{&plainChunk, nullptr, nullptr}};
     std::vector<std::shared_ptr<FrontVariant>> kept;
+    ImageSetCache zoned{std::size_t{1} << 16u};
     std::shared_ptr<const RunPlanData> plan;
     StateKey key;
     std::shared_ptr<FrontVariant> variant;
@@ -262,7 +297,7 @@ const char* FrontLeftName(FrontLeft reason) {
 }
 
 const char* TeachRefusalName(TeachRefusal reason) {
-    static constexpr std::array<const char*, static_cast<std::size_t>(TeachRefusal::Count)> names{"none", "path", "program", "stage", "plan", "tape", "walk", "words", "buffers", "forwarded", "vertex", "writes", "plan differs"};
+    static constexpr std::array<const char*, static_cast<std::size_t>(TeachRefusal::Count)> names{"none", "path", "program", "stage", "plan", "tape", "walk", "words", "buffers", "forwarded", "vertex", "writes", "plan differs", "driver zone"};
     return names[static_cast<std::size_t>(reason)];
 }
 
@@ -312,6 +347,13 @@ struct Front::State {
             variants.Keep(ImageSetKey{variant->plan->id, variant->digest}, Proof{}, value);
             add(held.taught);
             flat.kept.push_back(variant);
+            const auto& data = *variant->plan;
+            if (!variant->zoned) {
+                data.zoned = 2;
+            } else {
+                flat.zoned.Keep(ImageSetKey{data.id, variant->zoneDigest}, Proof{}, value);
+                if (data.zoned == 0) data.zoned = 1;
+            }
         }
         flat.plan = nullptr;
         flat.variant = nullptr;
@@ -350,6 +392,7 @@ FrontCounts Front::Counted() {
     counts.flatBytes = load(held.flatBytes);
     counts.flatTimed = load(held.flatTimed);
     counts.flatVertexKnown = load(held.flatVertexKnown);
+    counts.flatZoned = load(held.flatZoned);
     for (std::size_t index = 0; index < counts.left.size(); ++index) counts.left[index] = load(held.left[index]);
     for (std::size_t index = 0; index < counts.refused.size(); ++index) counts.refused[index] = load(held.refused[index]);
     return counts;
@@ -378,7 +421,7 @@ std::string Front::Report() {
     }
     if (counts.flatTaken != 0) {
         char flat[256];
-        std::snprintf(flat, sizeof(flat), " flat draws: %llu taken (%llu on the variant of the draw before) at %.2f us at the front (%llu timed), %llu ring bytes, %llu vertex decodes answered by the memo", static_cast<unsigned long long>(counts.flatTaken), static_cast<unsigned long long>(counts.flatSame), per(counts.flatNs, counts.flatTimed), static_cast<unsigned long long>(counts.flatTimed), static_cast<unsigned long long>(counts.flatBytes), static_cast<unsigned long long>(counts.flatVertexKnown));
+        std::snprintf(flat, sizeof(flat), " flat draws: %llu taken (%llu on the variant of the draw before) at %.2f us at the front (%llu timed), %llu ring bytes, %llu vertex decodes answered by the memo, %llu walked into the driver zone", static_cast<unsigned long long>(counts.flatTaken), static_cast<unsigned long long>(counts.flatSame), per(counts.flatNs, counts.flatTimed), static_cast<unsigned long long>(counts.flatTimed), static_cast<unsigned long long>(counts.flatBytes), static_cast<unsigned long long>(counts.flatVertexKnown), static_cast<unsigned long long>(counts.flatZoned));
         text += flat;
     }
     return text;
@@ -684,6 +727,8 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
     }
     auto& pipeline = DrawPipeline::Queue0();
     auto& reader = flat.reader;
+    static const bool zoneWalk = std::getenv("APS5_CORE_TAPE_ZONE") != nullptr;
+    const bool zoned = zoneWalk && data.zoned == 1;
     FrontVariant* variant = nullptr;
     std::shared_ptr<FrontVariant> fetched;
     std::array<std::uint64_t, 2> digest{};
@@ -704,6 +749,15 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
         {
             const GuestMemory::ReadSiteScope readSite(GuestMemory::ReadSite::DrawCache);
             for (std::uint32_t stage = 0; stage < data.stageCount; ++stage) {
+                if (zoned) {
+                    const auto& planStage = data.stages[stage];
+                    auto& walk = flat.walks[stage];
+                    walk.flat.resize(planStage.plan->srtReads.size());
+                    walk.zone.resize(planStage.tape->Driver().words);
+                    if (planStage.tape->RunInto(*planStage.plan, userData[stage], programs[stage].binary.codeAddress, &flatReadWords, &reader, walk.flat, walk.zone) != ShaderRecompiler::BlockWalk::Done) return left(reader.overflow ? FrontLeft::Ranges : FrontLeft::Walk, false);
+                    mixZone(digest, planStage, walk.zone);
+                    continue;
+                }
                 ShaderRecompiler::SrtRuntime runtime;
                 runtime.userData = userData[stage];
                 runtime.shaderBase = programs[stage].binary.codeAddress;
@@ -720,13 +774,13 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
             variant = flat.variant.get();
         } else {
             ImageSetValue found;
-            if (state->variants.Find(ImageSetKey{data.id, digest}, Proof{}, found) != Hit::Fresh) return left(FrontLeft::NoVariant, true);
+            if ((zoned ? flat.zoned : state->variants).Find(ImageSetKey{data.id, digest}, Proof{}, found) != Hit::Fresh) return left(FrontLeft::NoVariant, true);
             fetched = std::static_pointer_cast<FrontVariant>(found.owner);
             variant = fetched.get();
-            if (variant->plan.get() != &data) return left(FrontLeft::NoVariant, true);
+            if (variant->plan.get() != &data || (zoned && !variant->zoned)) return left(FrontLeft::NoVariant, true);
         }
         for (std::uint32_t stage = 0; stage < data.stageCount; ++stage) {
-            if (!sameKey(data.stages[stage], variant->stages[stage].taught, flat.walks[stage])) return left(FrontLeft::NoVariant, true);
+            if (zoned ? !sameZone(data.stages[stage], variant->stages[stage].taught.zone, flat.walks[stage].zone) : !sameKey(data.stages[stage], variant->stages[stage].taught, flat.walks[stage])) return left(FrontLeft::NoVariant, true);
         }
         if (variant->stale.load(std::memory_order_acquire)) return left(FrontLeft::Stale, true);
         if (parameters.indexed && parameters.indexSize != 0 && parameters.indexCount != 0 && !reader.Reads(parameters.indexAddress, static_cast<std::uint64_t>(parameters.indexCount) * parameters.indexSize)) return left(FrontLeft::Ranges, false);
@@ -739,7 +793,7 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
             for (std::size_t element = 0; element < planStage.bufferResult.size(); ++element) {
                 const auto slot = planStage.bufferResult[element];
                 if (slot < 0) continue;
-                const auto& raw = walk.results[static_cast<std::size_t>(slot)].dwords;
+                const auto* raw = zoned ? walk.zone.data() + planStage.tape->Driver().sources[static_cast<std::size_t>(slot)].word : walk.results[static_cast<std::size_t>(slot)].dwords.data();
                 const ShaderRecompiler::ShaderBufferResource descriptor{{raw[0], raw[1], (planStage.bufferMask[element] & 4u) != 0u ? raw[2] : 0u, 0u}};
                 if (!reader.Reads(descriptor.Base48(), descriptor.GetSize())) return left(FrontLeft::Ranges, false);
             }
@@ -814,6 +868,25 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
     outcome.variant = variant;
     outcome.reads = std::span<const Range>(reader.reads.data(), reader.readCount);
     if (inputs.verifyOnly) {
+        if (zoned) {
+            std::array<std::uint64_t, 2> classic{0x6a09e667f3bcc908ull, 0xbb67ae8584caa73bull};
+            for (std::uint32_t stage = 0; stage < data.stageCount; ++stage) {
+                ShaderRecompiler::SrtRuntime runtime;
+                runtime.userData = userData[stage];
+                runtime.shaderBase = programs[stage].binary.codeAddress;
+                runtime.userContext = &reader;
+                runtime.readMemory = &flatReadWord;
+                runtime.readSpecializationMemory = &flatReadWord;
+                auto& walk = flat.walks[stage];
+                if (!data.stages[stage].tape->Run(*data.stages[stage].plan, runtime, walk.results, walk.flat, walk.active)) return left(FrontLeft::Walk, false);
+                mixWalk(classic, data.stages[stage], walk);
+            }
+            ImageSetValue found;
+            if (state->variants.Find(ImageSetKey{data.id, classic}, Proof{}, found) == Hit::Fresh && found.owner.get() != variant && !static_cast<FrontVariant*>(found.owner.get())->stale.load(std::memory_order_acquire)) {
+                add(held.mismatches);
+                throw std::runtime_error("APS5_VERIFY_CORE_RUN: the variant chosen from the driver zone of the tape differs from the variant chosen from the walk results");
+            }
+        }
         auto record = std::make_shared<CoreDraw>();
         record->variant = flat.variant;
         record->parameters = parameters;
@@ -843,7 +916,8 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
         out += planStage.flatWords;
         for (std::size_t element = 0; element < planStage.bufferResult.size(); ++element, out += 4) {
             const auto slot = planStage.bufferResult[element];
-            for (std::uint32_t dword = 0; dword < 4; ++dword) out[dword] = slot < 0 ? 0u : walk.results[static_cast<std::size_t>(slot)].dwords[dword];
+            const auto* raw = slot < 0 ? nullptr : zoned ? walk.zone.data() + planStage.tape->Driver().sources[static_cast<std::size_t>(slot)].word : walk.results[static_cast<std::size_t>(slot)].dwords.data();
+            for (std::uint32_t dword = 0; dword < 4; ++dword) out[dword] = raw == nullptr ? 0u : raw[dword];
         }
         std::copy(userData[stage].begin(), userData[stage].end(), out);
         out += userData[stage].size();
@@ -876,6 +950,7 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
     bump(held.flatTaken);
     if (continued) bump(held.takenContinued);
     if (same) bump(held.flatSame);
+    if (zoned) bump(held.flatZoned);
     bump(held.flatBytes, static_cast<std::uint64_t>(words) * sizeof(std::uint32_t));
     if (timed) {
         bump(held.flatNs, steadyNanoseconds(nullptr) - started);
@@ -1075,6 +1150,29 @@ void Front::Teach(const TeachInputs& inputs) {
         variant->backResults[index] = result;
     }
     variant->plan = data;
+    variant->zoned = true;
+    variant->zoneDigest = {0x6a09e667f3bcc908ull, 0xbb67ae8584caa73bull};
+    for (std::size_t index = 0; index < count && variant->zoned; ++index) {
+        const auto& planStage = data->stages[index];
+        const auto& zoneOf = planStage.tape->Driver();
+        auto& taught = variant->stages[index].taught;
+        variant->zoned = zoneOf.complete && zoneOf.sources.size() == taught.results.size();
+        for (std::size_t element = 0; variant->zoned && element < planStage.bufferResult.size(); ++element) {
+            const auto slot = planStage.bufferResult[element];
+            variant->zoned = slot < 0 || zoneOf.sources[static_cast<std::size_t>(slot)].dwords >= 4u;
+        }
+        if (!variant->zoned) break;
+        std::vector<std::uint32_t> again(planStage.plan->srtReads.size());
+        taught.zone.assign(zoneOf.words, 0u);
+        const auto reader = std::make_unique<FlatReader>();
+        variant->zoned = planStage.tape->RunInto(*planStage.plan, inputs.programs[index].userData, inputs.programs[index].binary.codeAddress, &flatReadWords, reader.get(), again, taught.zone) == ShaderRecompiler::BlockWalk::Done && again.size() >= planStage.flatWords && taught.flat.size() >= planStage.flatWords && std::equal(again.begin(), again.begin() + planStage.flatWords, taught.flat.begin());
+        for (std::size_t source = 0; variant->zoned && source < zoneOf.sources.size(); ++source) {
+            const auto& value = taught.results[source];
+            for (std::uint32_t dword = 0; dword < zoneOf.sources[source].dwords && dword < value.dwordCount && dword < value.dwords.size(); ++dword) variant->zoned = variant->zoned && taught.zone[zoneOf.sources[source].word + dword] == value.dwords[dword];
+        }
+        if (variant->zoned) mixZone(variant->zoneDigest, planStage, taught.zone);
+    }
+    if (!variant->zoned) refuse(TeachRefusal::Zone);
     variant->frontStages.reserve(count);
     variant->backStages.reserve(count);
     for (std::size_t index = 0; index < count; ++index) {
