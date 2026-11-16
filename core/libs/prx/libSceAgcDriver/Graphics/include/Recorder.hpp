@@ -210,6 +210,12 @@ public:
     static bool ReadTrapVerified();
     static ReadTrapStatistics ReadTrapCounts();
     static void SetReadTrapForTests(bool enabled, bool verified);
+    enum class CopyBackStep : std::uint8_t { Lands, Stays, StaysCopied };
+    enum class CopyBackLanding : std::uint8_t { Copied, CopiedForAccess, CopiedForReader, Compared };
+    static bool KeepsCopyBacks(LandingSite site);
+    static CopyBackStep StepCopyBack(LandingSite site, bool scoped, bool reached, bool guarded, bool underQueuedStore, bool verified, bool landed);
+    static CopyBackLanding LandingOf(LandingSite site, bool guarded, bool landed);
+    static bool ReplacedUncopied(bool guarded, bool landed);
     bool LandGuardedOver(std::uint64_t address, std::size_t bytes);
     struct StagedClaim {
         std::uint64_t begin = 0;

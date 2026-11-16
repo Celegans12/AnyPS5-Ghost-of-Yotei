@@ -2111,6 +2111,26 @@ Recorder::ReadTrapStatistics Recorder::ReadTrapCounts() {
     return {trapGuarded.load(std::memory_order_relaxed), trapGuardedBytes.load(std::memory_order_relaxed), trapUnguarded.load(std::memory_order_relaxed), trapUnguardedBytes.load(std::memory_order_relaxed), trapKept.load(std::memory_order_relaxed), trapReplaced.load(std::memory_order_relaxed), trapReplacedBytes.load(std::memory_order_relaxed), trapFaults.load(std::memory_order_relaxed), trapNestedFaults.load(std::memory_order_relaxed), trapForcedReleases.load(std::memory_order_relaxed), trapFaultLanded.load(std::memory_order_relaxed), trapFaultLandedBytes.load(std::memory_order_relaxed), trapReaderLanded.load(std::memory_order_relaxed), trapReaderLandedBytes.load(std::memory_order_relaxed), trapVerified.load(std::memory_order_relaxed), trapDiffering.load(std::memory_order_relaxed), ReadTraps().count.load(std::memory_order_relaxed)};
 }
 
+bool Recorder::KeepsCopyBacks(LandingSite site) {
+    return site == LandingSite::LabelStore || site == LandingSite::StoreRun || site == LandingSite::Submit || site == LandingSite::KeptBytes;
+}
+
+Recorder::CopyBackStep Recorder::StepCopyBack(LandingSite site, bool scoped, bool reached, bool guarded, bool underQueuedStore, bool verified, bool landed) {
+    if (scoped) return reached ? CopyBackStep::Lands : CopyBackStep::Stays;
+    if (!KeepsCopyBacks(site) || !guarded || underQueuedStore) return CopyBackStep::Lands;
+    return verified && !landed ? CopyBackStep::StaysCopied : CopyBackStep::Stays;
+}
+
+Recorder::CopyBackLanding Recorder::LandingOf(LandingSite site, bool guarded, bool landed) {
+    if (!guarded) return CopyBackLanding::Copied;
+    if (landed) return CopyBackLanding::Compared;
+    return site == LandingSite::ReadTrap ? CopyBackLanding::CopiedForAccess : CopyBackLanding::CopiedForReader;
+}
+
+bool Recorder::ReplacedUncopied(bool guarded, bool landed) {
+    return guarded && !landed;
+}
+
 bool Recorder::guardedOverlaps(std::uint64_t address, std::uint64_t end) const {
     if (carried.empty() && (open == nullptr || open->copyBacks.empty())) return false;
     const auto overlapping = [&](const StagedCopyBack& held) { return held.guard != nullptr && std::any_of(held.written.begin(), held.written.end(), [&](const auto& range) { return address < range.second && range.first < end; }); };
@@ -2163,16 +2183,17 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
     if (open == nullptr || open->copyBacks.empty()) return;
     auto& pending = open->copyBacks;
     std::vector<StagedCopyBack> landing;
-    const bool keeps = reach == nullptr && (site == LandingSite::LabelStore || site == LandingSite::StoreRun || site == LandingSite::Submit || site == LandingSite::KeptBytes);
-    if (keeps) {
+    if (reach == nullptr && KeepsCopyBacks(site)) {
         const bool verified = ReadTrapVerified();
         for (auto held = pending.begin(); held != pending.end();) {
-            if (held->guard == nullptr || underQueuedStore(*held)) {
+            const bool guarded = held->guard != nullptr;
+            const auto step = StepCopyBack(site, false, false, guarded, guarded && underQueuedStore(*held), verified, held->landed);
+            if (step == CopyBackStep::Lands) {
                 landing.push_back(std::move(*held));
                 held = pending.erase(held);
                 continue;
             }
-            if (verified && !held->landed) {
+            if (step == CopyBackStep::StaysCopied) {
                 held->landed = true;
                 landing.push_back(*held);
                 landing.back().guard = nullptr;
@@ -2184,7 +2205,7 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
         landing = std::move(pending);
         pending.clear();
     } else {
-        const auto kept = std::stable_partition(pending.begin(), pending.end(), [&](const StagedCopyBack& held) { return !landsFor(held, reach); });
+        const auto kept = std::stable_partition(pending.begin(), pending.end(), [&](const StagedCopyBack& held) { return StepCopyBack(site, true, landsFor(held, reach), held.guard != nullptr, false, false, held.landed) != CopyBackStep::Lands; });
         landing.assign(std::make_move_iterator(kept), std::make_move_iterator(pending.end()));
         pending.erase(kept, pending.end());
     }
@@ -2203,7 +2224,8 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
     std::uint64_t bytes = 0;
     std::uint64_t copied = 0;
     for (auto& entry : landing) {
-        if (entry.guard != nullptr && entry.landed) {
+        const auto kind = LandingOf(site, entry.guard != nullptr, entry.landed);
+        if (kind == CopyBackLanding::Compared) {
             const auto size = static_cast<std::size_t>(RangeBytes(entry.written));
             auto staged = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             auto imported = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -2239,9 +2261,9 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
         bytes += entryBytes;
         ++copied;
         copy(commands, entry.shadow->Handle(), entry.target, static_cast<std::uint32_t>(regions.size()), regions.data());
-        if (entry.guard == nullptr) continue;
-        (site == LandingSite::ReadTrap ? trapFaultLanded : trapReaderLanded).fetch_add(1, std::memory_order_relaxed);
-        (site == LandingSite::ReadTrap ? trapFaultLandedBytes : trapReaderLandedBytes).fetch_add(entryBytes, std::memory_order_relaxed);
+        if (kind == CopyBackLanding::Copied) continue;
+        (kind == CopyBackLanding::CopiedForAccess ? trapFaultLanded : trapReaderLanded).fetch_add(1, std::memory_order_relaxed);
+        (kind == CopyBackLanding::CopiedForAccess ? trapFaultLandedBytes : trapReaderLandedBytes).fetch_add(entryBytes, std::memory_order_relaxed);
         open->completions.push_back([hold = std::move(entry.guard)]() mutable { hold.reset(); });
     }
     if (BarrierValidate()) NoteAccess(CommandClass::StagingOut, Access{{}, landed, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -2278,7 +2300,7 @@ void Recorder::DeferCopyBack(StagedCopyBack entry) {
     if (same != pending.end() && RangesCover(entry.written, same->written)) {
         handoverElided.fetch_add(1, std::memory_order_relaxed);
         handoverElidedBytes.fetch_add(RangeBytes(same->written), std::memory_order_relaxed);
-        if (same->guard != nullptr && !same->landed) {
+        if (ReplacedUncopied(same->guard != nullptr, same->landed)) {
             trapReplaced.fetch_add(1, std::memory_order_relaxed);
             trapReplacedBytes.fetch_add(RangeBytes(same->written), std::memory_order_relaxed);
         }
