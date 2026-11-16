@@ -289,6 +289,7 @@ private:
         std::chrono::steady_clock::time_point finished{};
         std::uint64_t epoch = 0;
         std::uint64_t sequence = 0;
+        Stamp stamp;
         bool alone = false;
         bool done = false;
         bool shutdown = false;
@@ -366,6 +367,7 @@ public:
     static bool Enabled();
     static bool SweepsEpochs();
     bool Offer(std::uint64_t epoch, std::uint64_t address, std::uint64_t bytes);
+    void OfferAll(std::uint64_t epoch, std::span<const std::pair<std::uint64_t, std::uint64_t>> spans, bool ends, std::uint64_t most);
     bool Idle() const;
     Counts Counted() const;
     void Stop();

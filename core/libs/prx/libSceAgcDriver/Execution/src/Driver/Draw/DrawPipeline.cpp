@@ -727,6 +727,10 @@ void DrawFinisher::enqueuePooled(Job job, Pending held) {
     const bool draw = held.key != 0 || held.shape != 0;
     slot->job = std::move(job);
     slot->held = std::move(held);
+    if (auto* const ops = DrawPipeline::Ops(); ops != nullptr && ops->Producing()) {
+        slot->stamp.bound = ops->Posted();
+        if (!relaying) slot->stamp.gate = ops->Queue();
+    }
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Job>, ReclaimStorage>();
     const ClearOnExit<Job> clearReclaim{reclaim};
@@ -809,6 +813,7 @@ void DrawFinisher::work(unsigned index) {
         if (DrawPipeline::SharedCollectEpoch()) GuestMemory::AdoptCollectEpoch(slot.epoch);
         deferredOutputs = &slot.outputs;
         deferredReads = &slot.reads;
+        opsBound = slot.stamp.bound;
         try {
             if (misplaced) throw std::runtime_error("draw finisher: a job started beside one that runs alone, or a job that runs alone started before the jobs queued ahead of it reached the committer (APS5_VERIFY_PIPELINE_ORDER)");
             if (!failed) slot.job();
@@ -820,6 +825,7 @@ void DrawFinisher::work(unsigned index) {
         }
         deferredOutputs = nullptr;
         deferredReads = nullptr;
+        opsBound = Core::OpHost::Every;
         runningSequence = 0;
         poolBusyNs[index].fetch_add(elapsedNs(began), std::memory_order_relaxed);
         lock.lock();
@@ -843,6 +849,8 @@ void DrawFinisher::retire(std::unique_lock<std::mutex>& lock) {
         bool shutdown = !dropped && slot.shutdown;
         auto outputs = std::move(slot.outputs);
         const auto order = slot.order;
+        const auto gate = slot.stamp.gate;
+        const auto epoch = slot.epoch;
         if (slot.finished != std::chrono::steady_clock::time_point{}) {
             poolReordered.fetch_add(1, std::memory_order_relaxed);
             poolReorderNs.fetch_add(elapsedNs(slot.finished), std::memory_order_relaxed);
@@ -865,6 +873,24 @@ void DrawFinisher::retire(std::unique_lock<std::mutex>& lock) {
             }
         }
         outputs.clear();
+        if (gate.number != 0) {
+            runningOrder = order;
+            try {
+                DrawPipeline::Item passed;
+                passed.commit = [] {};
+                passed.draw = true;
+                passed.collectEpoch = epoch;
+                passed.gate = gate;
+                DrawPipeline::Queue0().push(std::move(passed));
+            } catch (const ProcessShutdown&) {
+                if (error == nullptr) {
+                    shutdown = true;
+                    error = std::current_exception();
+                }
+            } catch (...) {
+                if (error == nullptr) error = std::current_exception();
+            }
+        }
         if (Timed()) ownTally().outputNs.fetch_add(elapsedNs(outputFrom), std::memory_order_relaxed);
         if (error != nullptr && !shutdown && RelaysSubmissionEnd()) Driver::Get().ReportFailure(error);
         lock.lock();
@@ -1001,9 +1027,45 @@ bool CollectWalker::Enabled() {
     return enabled;
 }
 
+void CollectWalker::OfferAll(std::uint64_t epoch, std::span<const std::pair<std::uint64_t, std::uint64_t>> spans, bool ends, std::uint64_t most) {
+    if (spans.empty()) return;
+    std::unique_lock producer(producers, std::defer_lock);
+    if (DrawFinisher::Threads() > 1 || DrawPipeline::Ops() != nullptr) producer.lock();
+    if (closed.load(std::memory_order_acquire)) {
+        rethrowFailure();
+        dropped.fetch_add(spans.size(), std::memory_order_relaxed);
+        return;
+    }
+    if (sweeping.load(std::memory_order_relaxed)) {
+        filtered.fetch_add(spans.size(), std::memory_order_relaxed);
+        return;
+    }
+    const auto first = tail.load(std::memory_order_relaxed);
+    auto at = first;
+    for (const auto& [begin, second] : spans) {
+        const auto bytes = ends ? second - begin : second;
+        if (bytes > most) continue;
+        if (at - knownHead >= Capacity) knownHead = head.load(std::memory_order_acquire);
+        if (at - knownHead >= Capacity) {
+            dropped.fetch_add(1, std::memory_order_relaxed);
+            continue;
+        }
+        ring[at % Capacity] = {begin, bytes, epoch};
+        ++at;
+    }
+    if (at == first) return;
+    tail.store(at, std::memory_order_seq_cst);
+    handed.fetch_add(at - first, std::memory_order_relaxed);
+    if (!started.load(std::memory_order_acquire)) start();
+    if (parked.load(std::memory_order_seq_cst) != 0) {
+        parked.store(0, std::memory_order_seq_cst);
+        WakeOne(parked);
+    }
+}
+
 bool CollectWalker::Offer(std::uint64_t epoch, std::uint64_t address, std::uint64_t bytes) {
     std::unique_lock producer(producers, std::defer_lock);
-    if (DrawFinisher::Threads() > 1) producer.lock();
+    if (DrawFinisher::Threads() > 1 || DrawPipeline::Ops() != nullptr) producer.lock();
     if (closed.load(std::memory_order_acquire)) {
         rethrowFailure();
         dropped.fetch_add(1, std::memory_order_relaxed);
@@ -1147,7 +1209,7 @@ Core::OpHost* DrawPipeline::Ops() {
     static Core::OpHost* const host = []() -> Core::OpHost* {
         const bool verifies = std::getenv("APS5_VERIFY_CORE_OPS") != nullptr;
         if (!verifies && std::getenv("APS5_CORE_OPS") == nullptr) return nullptr;
-        if (Flat() || DrawFinisher::Threads() > 1 || Depth() == 0) return nullptr;
+        if (Flat() || Depth() == 0) return nullptr;
         Core::OpHost::Settings settings;
         if (const char* text = std::getenv("APS5_CORE_OP_DEPTH")) settings.depth = static_cast<std::size_t>(std::clamp<unsigned long long>(std::strtoull(text, nullptr, 10), 8, 4096));
         settings.verifies = verifies;

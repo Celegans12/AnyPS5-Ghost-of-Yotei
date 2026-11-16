@@ -1010,11 +1010,9 @@ void Driver::precollectCoreDraw(const DrawRecipe& recipe, std::span<const std::p
     if (!FinisherPrecollect() || GuestMemory::CollectEpoch() == 0 || !CollectWalker::Enabled()) return;
     const auto walkEpoch = GuestMemory::HeldCollectEpoch();
     auto& walker = CollectWalker::Get();
-    for (const auto& [address, bytes] : recipe.surfaces) walker.Offer(walkEpoch, address, bytes);
+    walker.OfferAll(walkEpoch, recipe.surfaces, false, std::numeric_limits<std::uint64_t>::max());
     if (!FinisherInputPrecollect()) return;
-    for (const auto& [begin, end] : reads) {
-        if (end - begin <= FinisherInputPrecollectBytes) walker.Offer(walkEpoch, begin, end - begin);
-    }
+    walker.OfferAll(walkEpoch, reads, true, FinisherInputPrecollectBytes);
 }
 
 FinisherLookupCounts Driver::FinisherLookupCounted() {
