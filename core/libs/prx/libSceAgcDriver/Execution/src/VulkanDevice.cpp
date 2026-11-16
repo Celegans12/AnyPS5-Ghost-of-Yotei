@@ -5751,6 +5751,9 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     runAccesses.clear();
     if (overlapCapable) resources.RunAccesses(runAccesses);
     if (overlapCapable && record.shader->program->bindlessHeap) runAccesses.push_back({0, std::numeric_limits<std::uint64_t>::max(), Graphics::Recorder::RunAccessImage | Graphics::Recorder::RunAccessWritten});
+    const auto handoverToken = argumentImport != nullptr && recorder.PendingCopyBackOverlaps(arguments, 12) ? std::uint64_t{0} : resources.HandoverToken();
+    std::optional<Graphics::Recorder::ClaimKeep> keepClaims;
+    if (handoverToken != 0) keepClaims.emplace(recorder, handoverToken);
     auto commands = overlapCapable && unordered ? recorder.OverlapCommands(overlapQueue, runOwners, &covered, overlapped, runAccesses) : recorder.Commands(&covered);
     const Graphics::Recorder::CommandInHand commandInHand;
     if (timer.profile && overlapped) recorder.CheckRunConflicts(record.programAddress, runAccesses);
@@ -5975,6 +5978,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         }
     }
     recorder.EndGpuTiming(gpuTiming);
+    recorder.MarkClaimsDispatched(handoverToken);
     if (marker != 0) state->bufferMarker(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, state->markerBuffer, sizeof(std::uint32_t), marker);
     if (overlapCapable) {
         // Recorded by the next command that is not an unordered dispatch of this ring.
@@ -5989,6 +5993,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.EndGpuTiming(trailingTiming);
         recorder.MarkCovered(dispatchedAccess);
     }
+    keepClaims.reset();
     recordStep(PhaseRecordBind);
     if (record.htileClear.has_value()) Graphics::ArmHtileDepthClear(record.htileClear->first, record.htileClear->second);
     if (overlapCapable) resources.MarkGpuWritesInRun(recorder, record.resources);

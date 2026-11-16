@@ -5485,6 +5485,27 @@ void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
     std::fprintf(stderr, "[staging] 0x%llx+0x%llx (%.1f KiB)%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), (end - begin) / 1024.0, atomic ? " atomic" : "");
 }
 
+bool rangesCover(std::span<const std::pair<std::uint64_t, std::uint64_t>> outer, std::span<const std::pair<std::uint64_t, std::uint64_t>> inner) {
+    return std::all_of(inner.begin(), inner.end(), [&](const auto& range) { return std::any_of(outer.begin(), outer.end(), [&](const auto& cover) { return cover.first <= range.first && range.second <= cover.second; }); });
+}
+
+void reportHandovers() {
+    static std::atomic<std::int64_t> lastReport{0};
+    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto previous = lastReport.load();
+    if (nowMs - previous < 10000 || !lastReport.compare_exchange_strong(previous, nowMs)) return;
+    if (!Recorder::StagingDiffHandover() && Recorder::HandoverCounts().deferred == 0) return;
+    static Recorder::HandoverStatistics last{};
+    const auto now = Recorder::HandoverCounts();
+    std::string misses;
+    for (std::size_t index = 0; index < now.misses.size(); ++index) misses += std::string(index == 0 ? "" : ", ") + Recorder::HandoverMissName(static_cast<Recorder::HandoverMiss>(index)) + " " + std::to_string(now.misses[index] - last.misses[index]);
+    std::string refused;
+    for (std::size_t index = 0; index < now.notDeferred.size(); ++index) refused += std::string(index == 0 ? "" : ", ") + Recorder::DeferMissName(static_cast<Recorder::DeferMiss>(index)) + " " + std::to_string(now.notDeferred[index] - last.notDeferred[index]);
+    AgcDriver::ProfilePrint_nid_no_patch("[staging-handover] (APS5_STAGING_DIFF_HANDOVER %s) last 10 s: %llu copy-backs deferred (%.0f KiB written), %llu handovers taken (%llu same shadow, %llu other shadow), %.0f KiB not copied in from imports, %.0f KiB copied shadow to shadow instead, %llu deferred copy-backs merged into the next use's (%.0f KiB), %llu landed (%.0f KiB), %llu claimed ones landed alone; misses: %s; not deferred: %s; verify: %llu checked, %llu skipped, %llu input dwords and %llu final dwords disagree (cumulative %llu checked, %llu + %llu disagree)\n", Recorder::StagingDiffHandover() ? "set" : "unset", static_cast<unsigned long long>(now.deferred - last.deferred), (now.deferredBytes - last.deferredBytes) / 1024.0, static_cast<unsigned long long>(now.taken - last.taken), static_cast<unsigned long long>(now.sameBuffer - last.sameBuffer), static_cast<unsigned long long>(now.otherBuffer - last.otherBuffer), (now.notCopiedBytes - last.notCopiedBytes) / 1024.0, (now.forwardedBytes - last.forwardedBytes) / 1024.0, static_cast<unsigned long long>(now.merged - last.merged), (now.mergedBytes - last.mergedBytes) / 1024.0, static_cast<unsigned long long>(now.landed - last.landed), (now.landedBytes - last.landedBytes) / 1024.0, static_cast<unsigned long long>(now.refreshed - last.refreshed), misses.c_str(), refused.c_str(), static_cast<unsigned long long>(now.verified - last.verified), static_cast<unsigned long long>(now.verifySkipped - last.verifySkipped), static_cast<unsigned long long>(now.inputDisagreements - last.inputDisagreements), static_cast<unsigned long long>(now.finalDisagreements - last.finalDisagreements), static_cast<unsigned long long>(now.verified), static_cast<unsigned long long>(now.inputDisagreements), static_cast<unsigned long long>(now.finalDisagreements));
+    last = now;
+    AgcDriver::ProfilePrint_nid_no_patch("[staging-handover] landed by site (last 10 s, entries): %s\n", Recorder::TakeLandingSites(12).c_str());
+}
+
 void reportStaging() {
     auto& stats = Copies();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -5494,7 +5515,7 @@ void reportStaging() {
     static std::uint64_t lastStaged = 0, lastIn = 0, lastOut = 0;
     const auto staged = stats.staged.load();
     const auto in = stats.stagedInBytes.load();
-    const auto out = stats.stagedOutBytes.load();
+    const auto out = stats.stagedOutBytes.load() + Recorder::HandoverCounts().landedBytes;
     AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused; last 10 s: %llu regions, %.0f KiB in, %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0);
     lastStaged = staged;
     lastIn = in;
@@ -6497,6 +6518,86 @@ void GuestBufferMemory::ReportGpuSources() {
     AgcDriver::ProfilePrint_nid_no_patch("[gpu-sourced] last 10 s (APS5_GPU_SOURCED_DRAW_BUFFERS %s, APS5_IMPORT_SOURCED_COPY_IN %s): draw buffers %llu bound GPU-side (%.0f KiB not compared or copied), %llu taken by the CPU path (%.0f KiB, copied or reused, see [draw-snapshots]; misses: %s); copy-ins %llu from a GPU source (%.0f KiB not memcpy'd), %llu CPU snapshots (%.0f KiB; misses: %s); sources registered %llu, refused %llu stored since the copy-in, %llu writer pending on the other lane at the copy-in, %llu after a same-lane writer (APS5_NO_GPU_SOURCE_AFTER_WRITER %s), %llu backing off; owned words armed %llu, refused %llu; cross-lane orders %llu; %zu live; verify %llu checked, %llu differing\n", RuntimeSwitches::Set(RuntimeSwitch::GpuSourcedDrawBuffers) ? "set" : "unset", RuntimeSwitches::Set(RuntimeSwitch::ImportSourcedCopyIn) ? "set" : "unset", delta[DrawGpu], kib(delta[DrawGpuBytes]), delta[DrawCopied], kib(delta[DrawCopiedBytes]), draws.c_str(), delta[CopyGpu], kib(delta[CopyGpuBytes]), delta[CopyCpu], kib(delta[CopyCpuBytes]), copies.c_str(), delta[Registered], delta[RefusedStored], delta[RefusedPending], delta[AfterWriter], RuntimeSwitches::Set(RuntimeSwitch::NoGpuSourceAfterWriter) ? "set" : "unset", delta[BackingOff], delta[Armed], delta[ArmRefused], delta[CrossLane], GpuSourceEntries(), delta[Verified], delta[Differing]);
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::writtenWithin(std::uint64_t begin, std::uint64_t end) const {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> clipped;
+    for (const auto& [first, last] : writes) {
+        const auto from = std::max(first, begin);
+        const auto to = std::min(last, end);
+        if (from < to) clipped.emplace_back(from, to);
+    }
+    std::sort(clipped.begin(), clipped.end());
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
+    for (const auto& range : clipped) {
+        if (!merged.empty() && range.first < merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
+        else merged.push_back(range);
+    }
+    return merged;
+}
+
+std::uint64_t GuestBufferMemory::claimHandovers(std::span<Region* const> copies, Recorder& recorder, std::vector<std::uint8_t>& claimed) {
+    claimed.assign(copies.size(), 0);
+    if (!recorder.HasPendingCopyBacks()) return 0;
+    const bool build = copyBackHandover && !ImportSourcedCopyIn() && !GpuSourcedDrawBuffers();
+    std::uint64_t token = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> taken;
+    for (std::size_t index = 0; index < copies.size(); ++index) {
+        auto* region = copies[index];
+        const auto bytes = static_cast<std::size_t>(region->end - region->begin);
+        if (!recorder.PendingCopyBackOverlaps(region->begin, bytes)) continue;
+        if (!build) {
+            Recorder::CountHandoverMiss(copyBackHandover ? Recorder::HandoverMiss::Region : Recorder::HandoverMiss::Storage);
+            continue;
+        }
+        if (!region->deviceLocal || region->buffer == nullptr || region->resident || region->overlay || region->sparse || region->unstaged || region->copySourceAddress == 0 || region->buffer->DeviceAddress() == 0 || region->begin % 4u != 0 || region->copySourceBase % 4u != 0 || region->copySourceAddress % 4u != 0) {
+            Recorder::CountHandoverMiss(Recorder::HandoverMiss::Region);
+            continue;
+        }
+        if (baseOverlap(region->begin, region->end, nullptr) != BaseOverlap::None) {
+            Recorder::CountHandoverMiss(Recorder::HandoverMiss::Reach);
+            continue;
+        }
+        auto* entry = recorder.PendingCopyBack(region->begin, region->end, region->copySource, region->copySourceBase);
+        if (entry == nullptr) {
+            Recorder::CountHandoverMiss(Recorder::HandoverMiss::Range);
+            continue;
+        }
+        if (!rangesCover(writtenWithin(region->begin, region->end), entry->written)) {
+            Recorder::CountHandoverMiss(Recorder::HandoverMiss::Written);
+            continue;
+        }
+        const bool same = entry->shadow == region->buffer && entry->pristine == region->pristine;
+        if (!same) {
+            if (region->pristine == nullptr) region->pristine = stagingBuffer(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+            if (region->pristine == nullptr || region->pristine->DeviceAddress() == 0) {
+                region->pristine.reset();
+                Recorder::CountHandoverMiss(Recorder::HandoverMiss::Region);
+                continue;
+            }
+        }
+        if (token == 0) token = recorder.NewClaimToken();
+        entry->claim = token;
+        claimed[index] = same ? 1 : 2;
+        taken.emplace_back(region->begin, region->end);
+    }
+    if (token == 0) return 0;
+    const auto isClaimed = [&](const Region& region) {
+        for (std::size_t index = 0; index < copies.size(); ++index) {
+            if (claimed[index] != 0 && copies[index] == &region) return true;
+        }
+        return false;
+    };
+    const bool reached = std::any_of(regions.begin(), regions.end(), [&](const Region& region) {
+        return !isClaimed(region) && std::any_of(taken.begin(), taken.end(), [&](const auto& range) { return region.begin < range.second && range.first < region.end; });
+    });
+    if (reached) {
+        recorder.ReleaseClaims(token);
+        for (std::size_t index = 0; index < taken.size(); ++index) Recorder::CountHandoverMiss(Recorder::HandoverMiss::Reach);
+        claimed.assign(copies.size(), 0);
+        return 0;
+    }
+    return token;
+}
+
 void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool addressable) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool capture = std::getenv("APS5_CAPTURE_GPU_COPIES") != nullptr;
@@ -6520,7 +6621,19 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     auto& runAccesses = ShaderRecompiler::ThreadOwned(runAccessesSlot);
     runAccesses.clear();
     if (recorder->RunOpen()) RunAccesses(runAccesses);
+    const bool handover = Recorder::StagingDiffHandover() && !capture && !Recorder::BarrierValidate() && stagingDiffEnabled(context);
+    std::optional<Recorder::ClaimKeep> keepClaims;
+    if (handover) keepClaims.emplace(*recorder, Recorder::KeepAllClaims);
     auto commands = Recorder::DispatchOverlapEnabled() && Recorder::StagedOverlapEnabled() ? recorder->RunCommands(Recorder::PeekUnorderedDispatch(), this, inRun, &covered, runAccesses) : recorder->Commands(&covered);
+    std::vector<std::uint8_t> claimed;
+    handoverToken = 0;
+    if (handover && !inRun) {
+        handoverToken = claimHandovers(copies, *recorder, claimed);
+        keepClaims->Set(handoverToken);
+        recorder->NoteLandingSite();
+        recorder->LandCopyBacks(&covered);
+    }
+    if (claimed.size() != copies.size()) claimed.assign(copies.size(), 0);
     // Batched staging (Recorder::SplitForRun): a joining dispatch's copies go to the run's prelude,
     // submitted ahead of the run's dispatches, whose barriers it records once for the whole run.
     // Not with the capture's read-backs or the hazard validator (both work per copy).
@@ -6546,8 +6659,58 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     std::uint64_t copiedBytes = 0;
     const bool importSourced = ImportSourcedCopyIn();
     const bool sourcesOn = importSourced || GpuSourcedDrawBuffers();
-    for (auto* region : copies) {
+    for (std::size_t copyIndex = 0; copyIndex < copies.size(); ++copyIndex) {
+        auto* region = copies[copyIndex];
         const auto bytes = region->end - region->begin;
+        if (claimed[copyIndex] != 0) {
+            auto* entry = recorder->ClaimedCopyBack(handoverToken, region->begin, region->end);
+            Require(entry != nullptr, "a claimed staging copy-back left the batch before its handover");
+            const bool same = claimed[copyIndex] == 1;
+            if (const auto every = Recorder::VerifyStagingHandover(); every != 0) {
+                static std::atomic<std::uint64_t> verifyTurn{0};
+                if (verifyTurn.fetch_add(1, std::memory_order_relaxed) % every == 0) {
+                    const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::GuestStaging);
+                    auto verify = std::make_shared<Recorder::HandoverVerify>();
+                    verify->begin = region->begin;
+                    verify->end = region->end;
+                    const auto host = [&] { return std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_DST_BIT); };
+                    verify->import = host();
+                    verify->first = host();
+                    verify->pristine = host();
+                    verify->result = host();
+                    verify->before = host();
+                    verify->after = host();
+                    CopyBuffer(context, commands, region->copySource, region->begin - region->copySourceBase, verify->import->Handle(), 0, bytes);
+                    CopyBuffer(context, commands, entry->shadow->Handle(), 0, verify->first->Handle(), 0, bytes);
+                    CopyBuffer(context, commands, entry->pristine->Handle(), 0, verify->pristine->Handle(), 0, bytes);
+                    entry->verify = std::move(verify);
+                }
+            }
+            if (!same) {
+                CopyBuffer(context, commands, entry->shadow->Handle(), 0, region->buffer->Handle(), 0, bytes);
+                CopyBuffer(context, commands, entry->pristine->Handle(), 0, region->pristine->Handle(), 0, bytes);
+                recorder->Keep(entry->shadow);
+                recorder->Keep(entry->pristine);
+                entry->shadow = region->buffer;
+                entry->pristine = region->pristine;
+                copiedBytes += bytes;
+            }
+            recorder->Keep(region->buffer);
+            recorder->Keep(region->pristine);
+            recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+            region->gpuSourceSince = 0;
+            if (!region->gpuSourceWords.empty()) region->gpuSourceWords.clear();
+            region->snapshot.clear();
+            region->diffUse = true;
+            traceStaged(region->begin, region->end, region->atomic);
+            Recorder::CountHandover(same, bytes);
+            if (profile) {
+                stagedAny = true;
+                Copies().staged.fetch_add(1, std::memory_order_relaxed);
+                if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
+            }
+            continue;
+        }
         copiedBytes += bytes;
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
@@ -6683,7 +6846,9 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         // The pristine copies of the staged shadows (APS5_STAGING_DIFF), after the copy-ins.
         std::vector<Region*> diffed;
         const bool active = stagingDiffActive();
-        for (auto* region : copies) {
+        for (std::size_t copyIndex = 0; copyIndex < copies.size(); ++copyIndex) {
+            auto* region = copies[copyIndex];
+            if (claimed[copyIndex] != 0) continue;
             region->diffUse = false;
             if (!active) continue;
             if (!region->deviceLocal || region->buffer == nullptr || region->buffer->DeviceAddress() == 0 || region->copySourceAddress == 0) {
@@ -6715,6 +6880,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
     }
     if (stagedAny) reportStaging();
+    reportHandovers();
     // The copied bytes are visible to the shaders bound to the buffers, which may also store into
     // them. Every stage: dispatches and draws share this path, and draws run mesh, task and
     // tessellation shaders too (the batch's own barriers around dispatches are as wide). A
@@ -6728,6 +6894,18 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
 }
 
 void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
+    auto claims = recorder.TakeClaims(std::exchange(handoverToken, 0));
+    struct LeftClaims {
+        Recorder& recorder;
+        std::vector<Recorder::StagedCopyBack>& claims;
+        ~LeftClaims() {
+            for (auto& claim : claims) {
+                if (claim.shadow == nullptr) continue;
+                claim.verify.reset();
+                recorder.DeferCopyBack(std::move(claim));
+            }
+        }
+    } leftClaims{recorder, claims};
     if (!uploaded || committed) return;
     if (ResidencyActive()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
@@ -6793,8 +6971,43 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
             copiedBytes += to - from;
         }
     }
+    const bool handover = Recorder::StagingDiffHandover() && diff && !Recorder::BarrierValidate();
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
+        std::shared_ptr<Recorder::HandoverVerify> verify;
+        for (auto& claim : claims) {
+            if (claim.shadow == nullptr || claim.begin != region.begin || claim.end != region.end) continue;
+            verify = std::move(claim.verify);
+            claim.shadow.reset();
+        }
+        if (handover && region.deviceLocal) {
+            auto miss = Recorder::DeferMiss::Count;
+            if (merging) miss = Recorder::DeferMiss::Merging;
+            else if (region.resident) miss = Recorder::DeferMiss::Resident;
+            else if (region.overlay) miss = Recorder::DeferMiss::Overlay;
+            else if (!region.diffUse || region.pristine == nullptr || region.buffer == nullptr || region.copySourceAddress == 0 || region.buffer->DeviceAddress() == 0 || region.pristine->DeviceAddress() == 0) miss = Recorder::DeferMiss::NoDiff;
+            else if (region.begin % 4u != 0 || region.copySourceBase % 4u != 0 || region.copySourceAddress % 4u != 0) miss = Recorder::DeferMiss::Unaligned;
+            if (miss == Recorder::DeferMiss::Count) {
+                auto written = writtenWithin(region.begin, region.end);
+                if (!written.empty()) {
+                    Recorder::StagedCopyBack entry;
+                    entry.begin = region.begin;
+                    entry.end = region.end;
+                    entry.target = region.copySource;
+                    entry.targetBase = region.copySourceBase;
+                    entry.targetAddress = region.copySourceAddress;
+                    entry.shadow = region.buffer;
+                    entry.pristine = region.pristine;
+                    entry.written = std::move(written);
+                    entry.verify = std::move(verify);
+                    recorder.DeferCopyBack(std::move(entry));
+                }
+                region.copiedBack = true;
+                continue;
+            }
+            Recorder::CountDeferMiss(miss);
+        }
+        if (verify != nullptr) recorder.FinishHandoverVerify(VK_NULL_HANDLE, std::move(verify), {}, false);
         for (const auto& [begin, end] : merged) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);

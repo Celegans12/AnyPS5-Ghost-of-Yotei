@@ -105,6 +105,7 @@ enum class RuntimeSwitch : std::size_t {
     NoSpacePresync,
     TextureKeep,
     TextureShareByUse,
+    StagingDiffHandover,
     Count,
 };
 

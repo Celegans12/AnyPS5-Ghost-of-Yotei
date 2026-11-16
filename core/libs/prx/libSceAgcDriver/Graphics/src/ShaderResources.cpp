@@ -3795,6 +3795,7 @@ void ShaderResources::buildComplete() {
         if (depthWrites.size() > 1) ValidateStorageDepthWrites(context, depthWrites);
         if (imagesProfiled) noteCompleteImages(outcomesBefore, deferredCount, deferredMs, storageTablesMs, imageTablesMs, lapImages());
         timing.bindingsMs += phase(BuildPhase::Images);
+        guestMemory.AllowCopyBackHandover(std::none_of(storageWritten.begin(), storageWritten.end(), [](bool written) { return written; }));
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);

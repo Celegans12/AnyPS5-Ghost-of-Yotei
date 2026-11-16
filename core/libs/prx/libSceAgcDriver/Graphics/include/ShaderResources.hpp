@@ -323,6 +323,7 @@ public:
     // The guest memory whose staged shadows this object's uses fill (a dispatch run member, see
     // Recorder::RunCommands).
     const void* MemoryOwner() const { return &guestMemory; }
+    std::uint64_t HandoverToken() const { return guestMemory.HandoverToken(); }
     // Whether the build copies buffer regions on the GPU (staged shadows among them).
     bool HasGpuCopies() const { return guestMemory.HasGpuCopies(); }
     void WriteBackBuffers(std::uint64_t shaderAddress = 0);

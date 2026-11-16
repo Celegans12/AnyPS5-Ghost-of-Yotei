@@ -2171,6 +2171,352 @@ bool Recorder::AfterRunWrite(std::uint64_t begin, std::uint64_t end) {
     return overlaps;
 }
 
+namespace {
+
+struct HandoverCounters {
+    std::atomic<std::uint64_t> deferred{0}, deferredBytes{0}, taken{0}, sameBuffer{0}, otherBuffer{0}, notCopiedBytes{0}, forwardedBytes{0}, merged{0}, mergedBytes{0}, landed{0}, landedBytes{0}, refreshed{0};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::HandoverMiss::Count)> misses{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(Recorder::DeferMiss::Count)> notDeferred{};
+    std::atomic<std::uint64_t> verified{0}, verifySkipped{0}, inputDisagreements{0}, finalDisagreements{0};
+};
+
+AgcDriver::Mutex landingSiteMutex;
+std::map<std::string, std::uint64_t> landingSites;
+
+HandoverCounters& Handovers() {
+    static HandoverCounters counters;
+    return counters;
+}
+
+std::uint64_t WrittenBytes(const std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) {
+    std::uint64_t bytes = 0;
+    for (const auto& [begin, end] : ranges) bytes += end - begin;
+    return bytes;
+}
+
+void CompareHandover(const Recorder::HandoverVerify& verify) {
+    const auto words = static_cast<std::size_t>((verify.end - verify.begin) / 4u);
+    const auto load = [](const std::shared_ptr<Buffer>& buffer, std::size_t index) {
+        std::uint32_t word = 0;
+        std::memcpy(&word, buffer->Bytes().data() + index * 4u, 4);
+        return word;
+    };
+    std::uint64_t input = 0;
+    for (std::size_t index = 0; index < words; ++index) {
+        const auto first = load(verify.first, index);
+        if (first == load(verify.pristine, index) && load(verify.import, index) != first) ++input;
+    }
+    std::uint64_t final = 0;
+    for (const auto& [from, to] : verify.written) {
+        const auto alignedFrom = (from + 3u) & ~std::uint64_t{3};
+        const auto alignedTo = to & ~std::uint64_t{3};
+        for (auto at = alignedFrom; at < alignedTo; at += 4u) {
+            const auto index = static_cast<std::size_t>((at - verify.begin) / 4u);
+            const auto first = load(verify.first, index);
+            const auto pristine = load(verify.pristine, index);
+            const auto changedFirst = first != pristine;
+            const auto oldInput = changedFirst ? first : load(verify.import, index);
+            const auto result = load(verify.result, index);
+            const auto oldFinal = result != oldInput ? result : (changedFirst ? first : load(verify.before, index));
+            if (oldFinal != load(verify.after, index)) ++final;
+        }
+    }
+    auto& counters = Handovers();
+    counters.verified.fetch_add(1, std::memory_order_relaxed);
+    counters.inputDisagreements.fetch_add(input, std::memory_order_relaxed);
+    counters.finalDisagreements.fetch_add(final, std::memory_order_relaxed);
+    if ((input != 0 || final != 0) && counters.inputDisagreements.load(std::memory_order_relaxed) + counters.finalDisagreements.load(std::memory_order_relaxed) <= 4096u) {
+        std::fprintf(stderr, "[staging-handover] verify 0x%llx-0x%llx: %llu input dwords and %llu final dwords differ from the copy-back sequence\n", static_cast<unsigned long long>(verify.begin), static_cast<unsigned long long>(verify.end), static_cast<unsigned long long>(input), static_cast<unsigned long long>(final));
+    }
+}
+
+}
+
+bool Recorder::StagingDiffHandover() {
+    return RuntimeSwitches::Set(RuntimeSwitch::StagingDiffHandover);
+}
+
+std::uint64_t Recorder::VerifyStagingHandover() {
+    static const std::uint64_t every = [] {
+        const char* value = std::getenv("APS5_VERIFY_STAGING_DIFF_HANDOVER");
+        if (value == nullptr) return std::uint64_t{0};
+        const auto parsed = std::strtoull(value, nullptr, 10);
+        return parsed != 0 ? parsed : std::uint64_t{1};
+    }();
+    return every;
+}
+
+Recorder::HandoverStatistics Recorder::HandoverCounts() {
+    auto& counters = Handovers();
+    HandoverStatistics statistics{};
+    statistics.deferred = counters.deferred.load(std::memory_order_relaxed);
+    statistics.deferredBytes = counters.deferredBytes.load(std::memory_order_relaxed);
+    statistics.taken = counters.taken.load(std::memory_order_relaxed);
+    statistics.sameBuffer = counters.sameBuffer.load(std::memory_order_relaxed);
+    statistics.otherBuffer = counters.otherBuffer.load(std::memory_order_relaxed);
+    statistics.notCopiedBytes = counters.notCopiedBytes.load(std::memory_order_relaxed);
+    statistics.forwardedBytes = counters.forwardedBytes.load(std::memory_order_relaxed);
+    statistics.merged = counters.merged.load(std::memory_order_relaxed);
+    statistics.mergedBytes = counters.mergedBytes.load(std::memory_order_relaxed);
+    statistics.landed = counters.landed.load(std::memory_order_relaxed);
+    statistics.landedBytes = counters.landedBytes.load(std::memory_order_relaxed);
+    statistics.refreshed = counters.refreshed.load(std::memory_order_relaxed);
+    for (std::size_t index = 0; index < statistics.misses.size(); ++index) statistics.misses[index] = counters.misses[index].load(std::memory_order_relaxed);
+    for (std::size_t index = 0; index < statistics.notDeferred.size(); ++index) statistics.notDeferred[index] = counters.notDeferred[index].load(std::memory_order_relaxed);
+    statistics.verified = counters.verified.load(std::memory_order_relaxed);
+    statistics.verifySkipped = counters.verifySkipped.load(std::memory_order_relaxed);
+    statistics.inputDisagreements = counters.inputDisagreements.load(std::memory_order_relaxed);
+    statistics.finalDisagreements = counters.finalDisagreements.load(std::memory_order_relaxed);
+    return statistics;
+}
+
+void Recorder::CountHandover(bool sameBuffer, std::uint64_t bytes) {
+    auto& counters = Handovers();
+    counters.taken.fetch_add(1, std::memory_order_relaxed);
+    (sameBuffer ? counters.sameBuffer : counters.otherBuffer).fetch_add(1, std::memory_order_relaxed);
+    (sameBuffer ? counters.notCopiedBytes : counters.forwardedBytes).fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void Recorder::CountHandoverMiss(HandoverMiss reason) {
+    Handovers().misses[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void Recorder::CountDeferMiss(DeferMiss reason) {
+    Handovers().notDeferred[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
+}
+
+void Recorder::CountVerifySkipped() {
+    Handovers().verifySkipped.fetch_add(1, std::memory_order_relaxed);
+}
+
+const char* Recorder::HandoverMissName(HandoverMiss reason) {
+    constexpr std::array<const char*, static_cast<std::size_t>(HandoverMiss::Count)> names{"range", "written", "region", "reach", "storage", "run", "early", "late"};
+    return names[static_cast<std::size_t>(reason)];
+}
+
+const char* Recorder::DeferMissName(DeferMiss reason) {
+    constexpr std::array<const char*, static_cast<std::size_t>(DeferMiss::Count)> names{"merging", "lease", "resident", "overlay", "no-diff", "unaligned", "validate"};
+    return names[static_cast<std::size_t>(reason)];
+}
+
+void Recorder::DeferCopyBack(StagedCopyBack entry) {
+    GuestMemory::AssertGpuLockHeld("Recorder::DeferCopyBack");
+    Require(entry.shadow != nullptr && entry.pristine != nullptr && !entry.written.empty() && entry.targetAddress != 0, "a deferred copy-back has no shadow, pristine copy, written range or target address");
+    ensureOpen();
+    Keep(entry.shadow);
+    Keep(entry.pristine);
+    auto& counters = Handovers();
+    counters.deferred.fetch_add(1, std::memory_order_relaxed);
+    counters.deferredBytes.fetch_add(WrittenBytes(entry.written), std::memory_order_relaxed);
+    entry.claim = 0;
+    entry.dispatched = false;
+    open->copyBacks.push_back(std::move(entry));
+}
+
+bool Recorder::PendingCopyBackOverlaps(std::uint64_t address, std::size_t bytes) const {
+    if (open == nullptr || bytes == 0) return false;
+    const auto end = address + bytes;
+    return std::any_of(open->copyBacks.begin(), open->copyBacks.end(), [&](const StagedCopyBack& held) { return address < held.end && held.begin < end; });
+}
+
+Recorder::StagedCopyBack* Recorder::PendingCopyBack(std::uint64_t begin, std::uint64_t end, VkBuffer target, std::uint64_t targetBase) {
+    if (open == nullptr) return nullptr;
+    for (auto& held : open->copyBacks) {
+        if (held.claim == 0 && held.begin == begin && held.end == end && held.target == target && held.targetBase == targetBase) return &held;
+    }
+    return nullptr;
+}
+
+Recorder::StagedCopyBack* Recorder::ClaimedCopyBack(std::uint64_t token, std::uint64_t begin, std::uint64_t end) {
+    if (open == nullptr || token == 0) return nullptr;
+    for (auto& held : open->copyBacks) {
+        if (held.claim == token && held.begin == begin && held.end == end) return &held;
+    }
+    return nullptr;
+}
+
+void Recorder::ReleaseClaims(std::uint64_t token) {
+    if (open == nullptr || token == 0) return;
+    for (auto& held : open->copyBacks) {
+        if (held.claim != token) continue;
+        held.claim = 0;
+        held.dispatched = false;
+        if (held.verify != nullptr) {
+            held.verify.reset();
+            CountVerifySkipped();
+        }
+    }
+}
+
+void Recorder::MarkClaimsDispatched(std::uint64_t token) {
+    if (open == nullptr || token == 0) return;
+    for (auto& held : open->copyBacks) {
+        if (held.claim == token) held.dispatched = true;
+    }
+}
+
+std::vector<Recorder::StagedCopyBack> Recorder::TakeClaims(std::uint64_t token) {
+    std::vector<StagedCopyBack> taken;
+    if (open == nullptr || token == 0) return taken;
+    auto& pending = open->copyBacks;
+    const auto kept = std::stable_partition(pending.begin(), pending.end(), [&](const StagedCopyBack& held) { return held.claim != token; });
+    taken.assign(std::make_move_iterator(kept), std::make_move_iterator(pending.end()));
+    pending.erase(kept, pending.end());
+    auto& counters = Handovers();
+    for (const auto& held : taken) {
+        counters.merged.fetch_add(1, std::memory_order_relaxed);
+        counters.mergedBytes.fetch_add(WrittenBytes(held.written), std::memory_order_relaxed);
+    }
+    return taken;
+}
+
+void Recorder::flushCopyBacks(const std::source_location& where) {
+    if (open == nullptr || open->copyBacks.empty() || open->landingCopyBacks || keptClaims[static_cast<std::size_t>(currentLane())] == KeepAllClaims) return;
+    NoteLandingSite(where);
+    LandCopyBacks();
+}
+
+void Recorder::NoteLandingSite(const std::source_location& where) {
+    if (open == nullptr || open->copyBacks.empty()) return;
+    std::string_view file = where.file_name();
+    if (const auto slash = file.find_last_of("/\\"); slash != std::string_view::npos) file.remove_prefix(slash + 1);
+    std::lock_guard lock(landingSiteMutex);
+    landingSites[std::string(file) + ":" + std::to_string(where.line())] += open->copyBacks.size();
+}
+
+std::string Recorder::TakeLandingSites(std::size_t limit) {
+    std::vector<std::pair<std::uint64_t, std::string>> sorted;
+    {
+        std::lock_guard lock(landingSiteMutex);
+        for (const auto& [site, count] : landingSites) sorted.emplace_back(count, site);
+        landingSites.clear();
+    }
+    std::sort(sorted.rbegin(), sorted.rend());
+    std::string text;
+    for (std::size_t index = 0; index < sorted.size() && index < limit; ++index) text += (text.empty() ? "" : ", ") + sorted[index].second + " " + std::to_string(sorted[index].first);
+    return text;
+}
+
+void Recorder::LandCopyBacks(VkAccessFlags* coveredAccess) {
+    if (open == nullptr || open->copyBacks.empty() || open->landingCopyBacks) return;
+    auto& pending = open->copyBacks;
+    std::vector<StagedCopyBack> landing;
+    const auto kept = keptClaims[static_cast<std::size_t>(currentLane())];
+    if (kept == 0 || kept == KeepAllClaims) {
+        landing = std::move(pending);
+        pending.clear();
+    } else {
+        const auto held = std::stable_partition(pending.begin(), pending.end(), [&](const StagedCopyBack& entry) { return entry.claim != 0 && entry.claim == kept; });
+        landing.assign(std::make_move_iterator(held), std::make_move_iterator(pending.end()));
+        pending.erase(held, pending.end());
+    }
+    landCopyBacks(std::move(landing), coveredAccess);
+}
+
+void Recorder::landCopyBacks(std::vector<StagedCopyBack> landing, VkAccessFlags* coveredAccess) {
+    if (landing.empty()) return;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    struct Landing {
+        Batch& batch;
+        explicit Landing(Batch& landingBatch) : batch(landingBatch) { batch.landingCopyBacks = true; }
+        ~Landing() { batch.landingCopyBacks = false; }
+    } guard{*open};
+    if (open->renderPass.open) endOpenRenderPass();
+    const auto commands = open->commands;
+    const auto timing = beginTiming(ClassKey(CommandClass::StagingOut));
+    const VkAccessFlags covered = coveredAccess != nullptr ? *coveredAccess : open->coveredAccess;
+    constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT};
+    if (!ElideCovered(CommandClass::StagingOut, leading, covered)) {
+        recordBarrier(commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
+        CountBarriers(CommandClass::StagingOut);
+    }
+    auto& counters = Handovers();
+    for (auto& entry : landing) {
+        if (entry.claim == 0 || entry.verify == nullptr) continue;
+        entry.verify.reset();
+        CountVerifySkipped();
+    }
+    for (const auto& entry : landing) {
+        if (entry.verify == nullptr) continue;
+        CopyBuffer(context, commands, entry.shadow->Handle(), 0, entry.verify->result->Handle(), 0, entry.end - entry.begin);
+        CopyBuffer(context, commands, entry.target, entry.begin - entry.targetBase, entry.verify->before->Handle(), 0, entry.end - entry.begin);
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> landed;
+    bool diffed = false;
+    bool refresh = false;
+    std::uint64_t bytes = 0;
+    for (const auto& entry : landing) {
+        if (std::any_of(landed.begin(), landed.end(), [&](const auto& range) { return entry.begin < range.second && range.first < entry.end; })) {
+            recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+            CountBarriers(CommandClass::StagingOut);
+            landed.clear();
+        }
+        for (const auto& [from, to] : entry.written) {
+            Checkpoint(commands, CheckpointKind::CopyBack, from);
+            const auto alignedFrom = (from + 3u) & ~std::uint64_t{3};
+            const auto alignedTo = to & ~std::uint64_t{3};
+            bool whole = true;
+            if (alignedFrom < alignedTo && (alignedTo - alignedFrom) / 4u <= std::numeric_limits<std::uint32_t>::max()) {
+                const auto at = alignedFrom - entry.begin;
+                if (RecordStagingDiff(commands, entry.shadow->DeviceAddress() + at, entry.pristine->DeviceAddress() + at, entry.targetAddress + (alignedFrom - entry.targetBase), static_cast<std::uint32_t>((alignedTo - alignedFrom) / 4u), profile)) {
+                    diffed = true;
+                    whole = false;
+                    if (from < alignedFrom) CopyBuffer(context, commands, entry.shadow->Handle(), from - entry.begin, entry.target, from - entry.targetBase, alignedFrom - from);
+                    if (alignedTo < to) CopyBuffer(context, commands, entry.shadow->Handle(), alignedTo - entry.begin, entry.target, alignedTo - entry.targetBase, to - alignedTo);
+                }
+            }
+            if (whole) CopyBuffer(context, commands, entry.shadow->Handle(), from - entry.begin, entry.target, from - entry.targetBase, to - from);
+            bytes += to - from;
+        }
+        Keep(entry.shadow);
+        Keep(entry.pristine);
+        landed.emplace_back(entry.begin, entry.end);
+        if (entry.claim != 0) {
+            refresh = true;
+            CountHandoverMiss(entry.dispatched ? HandoverMiss::Late : HandoverMiss::Early);
+        }
+    }
+    if (refresh) {
+        recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, VK_ACCESS_TRANSFER_WRITE_BIT);
+        CountBarriers(CommandClass::StagingOut);
+        for (const auto& entry : landing) {
+            if (entry.claim == 0) continue;
+            for (const auto& [from, to] : entry.written) CopyBuffer(context, commands, entry.shadow->Handle(), from - entry.begin, entry.pristine->Handle(), from - entry.begin, to - from);
+            counters.refreshed.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    recordBarrier(commands, VK_PIPELINE_STAGE_TRANSFER_BIT | (diffed ? VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT : 0u), VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | (diffed ? VK_ACCESS_SHADER_WRITE_BIT : 0u), copiedAccess);
+    CountBarriers(CommandClass::StagingOut);
+    for (auto& entry : landing) {
+        if (entry.verify == nullptr) continue;
+        CopyBuffer(context, commands, entry.target, entry.begin - entry.targetBase, entry.verify->after->Handle(), 0, entry.end - entry.begin);
+        FinishHandoverVerify(commands, std::move(entry.verify), entry, true);
+    }
+    if (coveredAccess != nullptr) *coveredAccess = copiedAccess;
+    else open->coveredAccess = copiedAccess;
+    EndGpuTiming(timing, bytes);
+    counters.landed.fetch_add(landing.size(), std::memory_order_relaxed);
+    counters.landedBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+void Recorder::FinishHandoverVerify(VkCommandBuffer commands, std::shared_ptr<HandoverVerify> verify, const StagedCopyBack& entry, bool landed) {
+    static_cast<void>(commands);
+    if (verify == nullptr) return;
+    if (!landed) {
+        CountVerifySkipped();
+        return;
+    }
+    verify->written = entry.written;
+    Keep(verify->import);
+    Keep(verify->first);
+    Keep(verify->pristine);
+    Keep(verify->result);
+    Keep(verify->before);
+    Keep(verify->after);
+    OnComplete([verify] { CompareHandover(*verify); });
+}
+
 void Recorder::SetDispatchOrder(std::uint32_t queueKey, bool unordered) {
     nextDispatchOrder = {queueKey, unordered};
 }
@@ -2286,6 +2632,7 @@ VkCommandBuffer Recorder::Commands(VkAccessFlags* coveredAccess, std::source_loc
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(0, where);
+    flushCopyBacks(where);
     // Work recorded after a draw's render pass or an inline store run must see their writes: the
     // pass's end and the run's trailing barrier go in first (a per-batch run waits for Submit, or
     // for a caller whose ranges overlap a queued store: FlushStores).
@@ -2305,6 +2652,7 @@ Recorder::DrawPassStart Recorder::StartDrawPass(std::uint64_t key, bool forced, 
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(1, where);
+    flushCopyBacks(where);
     auto& pass = open->renderPass;
     if (!pass.open || forced || (countingSamples && segmentMode() && !segmentSlotReady(*open))) {
         const auto commands = Commands();
@@ -2394,6 +2742,7 @@ bool Recorder::AnyQueuedKeyStore(const std::function<bool(std::uint64_t, std::ui
 void Recorder::FlushKeyStores(std::source_location where) {
     if (open == nullptr || open->keyStores.empty()) return;
     flushDeferredDispatch(2, where);
+    flushCopyBacks(where);
     recordKeyStores(true);
 }
 
@@ -2490,6 +2839,7 @@ void Recorder::RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const
     takeOwedEdge();
     open->handedOut = true;
     flushDeferredDispatch(3, where);
+    flushCopyBacks(where);
     auto& run = open->run;
     const VkDeviceSize end = offset + bytes.size();
     storeCount.fetch_add(1, std::memory_order_relaxed);
@@ -2703,6 +3053,7 @@ bool Recorder::AnyQueuedStore(const std::function<bool(std::uint64_t, std::uint6
 void Recorder::FlushStores(std::source_location where) {
     if (open == nullptr || open->run.queued.empty()) return;
     flushDeferredDispatch(4, where);
+    flushCopyBacks(where);
     closeStoreRun(false);
 }
 
@@ -3225,6 +3576,7 @@ void Recorder::PrepareSampleSlot() {
     if (!countingSamples || !segmentMode()) return;
     ensureOpen();
     flushDeferredDispatch(5);
+    flushCopyBacks();
     Require(!open->renderPass.open, "a sample slot is prepared inside a render pass");
     if (!segmentSlotReady(*open)) takeSegmentPool(*open);
 }
@@ -3430,6 +3782,7 @@ bool Recorder::DumpSamples(VkDeviceAddress target, std::uint64_t address) {
     if (target == 0 || !gpuSampleCounter()) return false;
     countingSamples = true;
     flushDeferredDispatch(5);
+    flushCopyBacks();
     if (segmentMode()) {
         ensureOpen();
         if (address != 0 && LabelRunsPerBatch() && pendingSamples.size() < SegmentFoldCapacity && open->queuedDumps < DumpFoldCapacity) {
@@ -5002,6 +5355,11 @@ void Recorder::Submit() {
     if (open == nullptr) return;
     GuestMemory::AssertGpuLockHeld("Recorder::Submit");
     flushDeferredDispatch(6);
+    if (!open->copyBacks.empty()) {
+        const ClaimKeep all(*this, 0);
+        NoteLandingSite();
+        LandCopyBacks();
+    }
     sealPrelude();
     if (!open->keyStores.empty()) recordKeyStores(false);
     if (open->renderPass.open) endOpenRenderPass();
