@@ -1326,6 +1326,18 @@ bool DrawKeysTrimmed() {
     return trimmed;
 }
 
+bool KeyGeneratedStages() {
+    static const bool enabled = std::getenv("APS5_KEY_GENERATED_STAGES") != nullptr;
+    return enabled;
+}
+
+bool NamedForDrawKeys(const CompiledShader& shader) {
+    using Stage = ShaderRecompiler::ShaderStage;
+    if (shader.program == nullptr) return false;
+    if (shader.program->PipelineVariantId() != 0) return true;
+    return KeyGeneratedStages() && (shader.stage == Stage::TessellationControl || shader.stage == Stage::TessellationEvaluation) && !shader.program->Identity().Empty();
+}
+
 ResourceCache::Key DrawResourceKey(const Context& context, std::span<const CompiledShader> shaders, const ColorTarget& target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::uint64_t indexBytes, bool ranges) {
     ResourceCache::Key key;
     key.reserve(256);
@@ -1340,6 +1352,11 @@ ResourceCache::Key DrawResourceKey(const Context& context, std::span<const Compi
         const auto words = StageKeyWords(shader);
         key.push_back(static_cast<std::uint32_t>(words->size()));
         key.insert(key.end(), words->begin(), words->end());
+        if (shader.program->PipelineVariantId() == 0) {
+            const auto identity = shader.program->Identity();
+            append64(identity.low);
+            append64(identity.high);
+        }
     }
     key.push_back(colorAttachments);
     if (ranges) {
@@ -1727,7 +1744,7 @@ void KeepTokenDrawInput(VkDevice device, std::uint64_t address, std::size_t byte
 
 namespace {
 
-enum class InputSlotCount : std::size_t { Lookups, Held, Reused, Absent, Registry, Changed, Pending, Kept, Evicted, Untracked, Filled, Verified, Mismatches, CopiedBytes, Refilled, SmallLookups, MediumLookups, SmallKept, MediumKept, Count };
+enum class InputSlotCount : std::size_t { Lookups, Held, Reused, Absent, Registry, Changed, Pending, Kept, Evicted, Untracked, Filled, Verified, Mismatches, CopiedBytes, Refilled, SmallLookups, MediumLookups, SmallKept, MediumKept, Moved, Count };
 
 constexpr std::size_t InputSlotCounts = static_cast<std::size_t>(InputSlotCount::Count);
 constexpr std::uint64_t InputSlotReportEvery = std::uint64_t{1} << 19u;
@@ -1754,6 +1771,7 @@ struct DrawInputSlot {
     std::uint32_t lowest = 0;
     std::uint64_t generation = 0;
     std::uint64_t registryGeneration = 0;
+    std::uint64_t forget = 0;
     std::uint64_t run = 0;
     std::uint64_t used = 0;
 };
@@ -1875,7 +1893,7 @@ void reportInputSlots() {
     }
     const auto at = [&](InputSlotCount kind) { return static_cast<unsigned long long>(n[static_cast<std::size_t>(kind)]); };
     const auto& table = drawInputSlots();
-    AgcDriver::ProfilePrint_nid_no_patch("[input-slots] since the last line: %llu lookups (%llu of at most 1 KiB, %llu of at most 16 KiB), %llu served by the slot its run already proved, %llu served by a slot unchanged since its generation; refused: %llu no slot, %llu registry moved, %llu written since, %llu behind a pending GPU write or label; %llu copies kept (%llu bytes, %llu of at most 1 KiB, %llu of at most 16 KiB, %llu into the buffer of the copy they replace), %llu slots evicted, %llu ranges untracked, %llu prefixes filled; verified %llu, mismatches %llu; %.1f MiB held\n", at(InputSlotCount::Lookups), at(InputSlotCount::SmallLookups), at(InputSlotCount::MediumLookups), at(InputSlotCount::Held), at(InputSlotCount::Reused), at(InputSlotCount::Absent), at(InputSlotCount::Registry), at(InputSlotCount::Changed), at(InputSlotCount::Pending), at(InputSlotCount::Kept), at(InputSlotCount::CopiedBytes), at(InputSlotCount::SmallKept), at(InputSlotCount::MediumKept), at(InputSlotCount::Refilled), at(InputSlotCount::Evicted), at(InputSlotCount::Untracked), at(InputSlotCount::Filled), at(InputSlotCount::Verified), at(InputSlotCount::Mismatches), static_cast<double>(table.bytes) / 1048576.0);
+    AgcDriver::ProfilePrint_nid_no_patch("[input-slots] since the last line: %llu lookups (%llu of at most 1 KiB, %llu of at most 16 KiB), %llu served by the slot its run already proved, %llu served by a slot unchanged since its generation, %llu served although the registry moved elsewhere; refused: %llu no slot, %llu registry moved, %llu written since, %llu behind a pending GPU write or label; %llu copies kept (%llu bytes, %llu of at most 1 KiB, %llu of at most 16 KiB, %llu into the buffer of the copy they replace), %llu slots evicted, %llu ranges untracked, %llu prefixes filled; verified %llu, mismatches %llu; %.1f MiB held\n", at(InputSlotCount::Lookups), at(InputSlotCount::SmallLookups), at(InputSlotCount::MediumLookups), at(InputSlotCount::Held), at(InputSlotCount::Reused), at(InputSlotCount::Moved), at(InputSlotCount::Absent), at(InputSlotCount::Registry), at(InputSlotCount::Changed), at(InputSlotCount::Pending), at(InputSlotCount::Kept), at(InputSlotCount::CopiedBytes), at(InputSlotCount::SmallKept), at(InputSlotCount::MediumKept), at(InputSlotCount::Refilled), at(InputSlotCount::Evicted), at(InputSlotCount::Untracked), at(InputSlotCount::Filled), at(InputSlotCount::Verified), at(InputSlotCount::Mismatches), static_cast<double>(table.bytes) / 1048576.0);
 }
 
 void verifySlotInput(std::uint64_t address, std::size_t bytes, std::size_t alignment, std::size_t from, Buffer& held) {
@@ -1892,11 +1910,21 @@ void verifySlotInput(std::uint64_t address, std::size_t bytes, std::size_t align
     throw std::runtime_error(message);
 }
 
+constexpr std::uint64_t NoForgetStamp = ~std::uint64_t{0};
+
+bool slotMappingHolds(const DrawInputSlot& slot) {
+    if (slot.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return true;
+    if (slot.forget == NoForgetStamp || !(GuestMemory::ResourceVersions() || GuestMemory::WriteIndexEnabled())) return false;
+    if ((GuestMemory::ForgetSerial() & 1u) != 0 || GuestMemory::ForgetStamp(slot.address, slot.bytes) != slot.forget) return false;
+    countInputSlot(InputSlotCount::Moved);
+    return true;
 }
 
-std::array<std::uint64_t, 19> DrawInputSlotCounted() {
-    std::array<std::uint64_t, 19> counts{};
-    static_assert(InputSlotCounts == 19);
+}
+
+std::array<std::uint64_t, 20> DrawInputSlotCounted() {
+    std::array<std::uint64_t, 20> counts{};
+    static_assert(InputSlotCounts == 20);
     for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = inputSlotCounters()[index].load(std::memory_order_relaxed);
     return counts;
 }
@@ -1911,7 +1939,7 @@ std::shared_ptr<Buffer> HeldSlotDrawInput(const Recorder* recorder, VkDevice dev
     table.Follow(device);
     auto* slot = table.Find(address, bytes, use, device);
     if (slot == nullptr || slot->run != table.run || slot->from > from) return {};
-    if (slot->registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return {};
+    if (!slotMappingHolds(*slot)) return {};
     if (recorder != nullptr && (recorder->PendingWriteOverlaps(address, bytes) || recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes) || recorder->QueuedKeyStoreOverlaps(address, bytes))) {
         countInputSlot(InputSlotCount::Pending);
         return {};
@@ -1936,7 +1964,7 @@ std::shared_ptr<Buffer> ReusableSlotDrawInput(VkDevice device, std::uint64_t add
         countInputSlot(InputSlotCount::Absent);
         return {};
     }
-    if (slot->registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+    if (!slotMappingHolds(*slot)) {
         table.Release(*slot);
         countInputSlot(InputSlotCount::Registry);
         return {};
@@ -1990,6 +2018,7 @@ void KeepSlotDrawInput(VkDevice device, std::uint64_t address, std::size_t bytes
     slot.lowest = lowest;
     slot.generation = generation;
     slot.registryGeneration = registryGeneration;
+    slot.forget = registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix() ? GuestMemory::ForgetStamp(address, bytes) : NoForgetStamp;
     slot.run = armed ? table.armedRun : 0;
     slot.used = ++table.tick;
     table.bytes += bytes;
@@ -2678,7 +2707,7 @@ DrawPlan planDraw(const Context& context, const State& state, const Pm4::DrawPar
     }
     timer.charge(PhaseVertex, layoutStart);
     const bool trimKey = DrawKeysTrimmed();
-    plan.candidate = recipe == nullptr && DrawTemplatesKeyed() && std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; });
+    plan.candidate = recipe == nullptr && DrawTemplatesKeyed() && std::all_of(shaders.begin(), shaders.end(), NamedForDrawKeys);
     plan.keyed = plan.candidate && !ShaderResources::NeverReusable(shaders);
     if (recipe == nullptr && !plan.keyed && DrawTemplatesKeyed() && drawSiteStats()) noteKeylessDraw(shaders, plan.candidate);
     if (plan.keyed) {
@@ -5741,7 +5770,7 @@ void verifyDrawRecipe(const Context& context, const State& state, const Pm4::Dra
 
 bool AppendDrawContentKey(std::span<const CompiledShader> shaders, const Pm4::DrawParameters& draw, std::vector<std::uint32_t>& key) {
     if (shaders.empty() || draw.indirect || !DrawTemplatesKeyed()) return false;
-    if (!std::all_of(shaders.begin(), shaders.end(), [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->PipelineVariantId() != 0; }) || ShaderResources::NeverReusable(shaders)) return false;
+    if (!std::all_of(shaders.begin(), shaders.end(), NamedForDrawKeys) || ShaderResources::NeverReusable(shaders)) return false;
     key.push_back(static_cast<std::uint32_t>(shaders.size()));
     key.push_back(static_cast<std::uint32_t>(PushConstantStages(shaders)));
     for (const auto& shader : shaders) {

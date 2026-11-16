@@ -22,7 +22,7 @@
 
 namespace AgcDriver::Graphics {
 
-std::array<std::uint64_t, 19> DrawInputSlotCounted();
+std::array<std::uint64_t, 20> DrawInputSlotCounted();
 std::shared_ptr<Buffer> HeldSlotDrawInput(const Recorder* recorder, VkDevice device, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::size_t from, std::uint32_t* derived, std::uint32_t* lowest);
 std::shared_ptr<Buffer> ReusableSlotDrawInput(VkDevice device, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::size_t from, std::uint32_t* derived, std::uint32_t* lowest, std::shared_ptr<Buffer>* refill);
 void KeepSlotDrawInput(VkDevice device, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::size_t from, const std::shared_ptr<Buffer>& buffer, std::uint32_t derived, std::uint32_t lowest, std::uint64_t generation, std::uint64_t registryGeneration);
@@ -46,6 +46,8 @@ constexpr std::uint64_t Blocks = 8;
 constexpr std::size_t Held = 1;
 constexpr std::size_t Reused = 2;
 constexpr std::size_t Absent = 3;
+constexpr std::size_t Registry = 4;
+constexpr std::size_t Moved = 19;
 constexpr std::size_t Changed = 5;
 constexpr std::size_t Kept = 7;
 constexpr std::size_t Untracked = 9;
@@ -225,6 +227,27 @@ void ReplacedCopyGivesItsBuffer(std::uint64_t base) {
     Require(ReusableSlotDrawInput(device, range.address, range.bytes, range.use, range.from, nullptr, nullptr, nullptr) == nullptr, "the slot kept a buffer it handed over");
 }
 
+void RegistryMoveElsewhereKeepsTheSlot(std::uint64_t base) {
+    const auto device = Device(0x1000);
+    const Range range{base + 4 * Block, 4096, Use::Index16, 0};
+    const auto kept = Copy(range, device, 12, 4);
+    const auto registry = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
+    { const GuestAllocations::Mutation idle; }
+    Require(GuestAllocations::GuestAllocationsGeneration_nid_postfix() != registry, "an ended mutation did not move the registry generation");
+    auto moved = Counted(Moved);
+    Require(InRun(range, device) == kept && Counted(Moved) == moved + 1, "a registry move that changed no mapping took the copy from its run");
+    AllocateWatched(static_cast<std::size_t>(Block));
+    GuestMemory::BumpCollectEpoch();
+    moved = Counted(Moved);
+    Require(Proved(range, device) == kept && Counted(Moved) == moved + 1, "a mapping added elsewhere took the copy of an untouched range");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(range.address), range.bytes);
+    Require(InRun(range, device) == nullptr, "a range whose mapping was invalidated was served inside its run");
+    GuestMemory::BumpCollectEpoch();
+    const auto refused = Counted(Registry);
+    Require(Proved(range, device) == nullptr && Counted(Registry) == refused + 1, "a range whose mapping was invalidated was served by its old copy");
+    Require(kept.use_count() == 1, "the slot of an invalidated range kept its copy");
+}
+
 void DeviceReleaseEmptiesItsSlots(std::uint64_t base) {
     const auto device = Device(0x3000);
     const auto other = Device(0x4000);
@@ -259,6 +282,7 @@ int main() {
         OtherFormatIsRefused(base);
         VertexRangeServesItsPrefix(base);
         ReplacedCopyGivesItsBuffer(base);
+        RegistryMoveElsewhereKeepsTheSlot(base);
         DeviceReleaseEmptiesItsSlots(base);
         std::cout << "draw input slot tests passed\n";
         return 0;
