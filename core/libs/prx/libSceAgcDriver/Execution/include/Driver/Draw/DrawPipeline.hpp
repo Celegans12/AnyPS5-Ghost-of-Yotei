@@ -252,6 +252,10 @@ public:
         std::uint64_t cacheWaits = 0;
         std::uint64_t cacheWaitNs = 0;
         std::uint64_t unlockedHits = 0;
+        std::uint64_t finisherLockWaits = 0;
+        std::uint64_t finisherLockNs = 0;
+        std::uint64_t queueLockWaits = 0;
+        std::uint64_t queueLockNs = 0;
     };
     static constexpr unsigned OtherThreads = MaxThreads;
     static ThreadCounts ThreadCounted(unsigned index);

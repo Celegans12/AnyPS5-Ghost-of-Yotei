@@ -1417,7 +1417,6 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 }
                 const auto& capture = stageCaptures[i];
                 if (drawParameters.indirect || capture.compiled == nullptr || !CacheableResult(*capture.compiled)) continue;
-                cacheAccess.Exclusive();
                 if (stageIdentitySeen(stageIdentity(shapeKey, i, programs[i], capture, vertexInfos[i]))) stageSeenBefore = true;
             }
             if (stageSeenBefore) {
