@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
@@ -30,6 +31,14 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace AgcDriver {
+
+struct VulkanDeviceTestAccess {
+    static Graphics::Context ContextOf(const VulkanDevice& device) { return device.graphicsContext(); }
+};
+
+}
 
 namespace {
 
@@ -159,6 +168,10 @@ struct Counts {
         now.outdated -= before.outdated;
         now.verified -= before.verified;
         now.differing -= before.differing;
+        now.shadowFed -= before.shadowFed;
+        now.shadowFedBytes -= before.shadowFedBytes;
+        now.shadowReturned -= before.shadowReturned;
+        now.shadowReturnedBytes -= before.shadowReturnedBytes;
         return now;
     }
 };
@@ -314,6 +327,105 @@ void SwitchedOff(AgcDriver::VulkanDevice& device) {
     Require(since.made + since.shared + since.skipped + since.partial + since.full == 0, "resident staging: a build made with the switch off counted " + Text(since));
 }
 
+constexpr std::uint32_t ShadowWord = 0x00500000u;
+
+bool ShadowBlock(AgcDriver::VulkanDevice& device, const Block& block) {
+    using namespace AgcDriver::Graphics;
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+    const auto* import = HostImportFor(context, block.Address(), BlockBytes);
+    auto* recorder = Recorder::Active();
+    if (import == nullptr || recorder == nullptr || !AgcDriver::GuestMemory::Watched(block.Address(), BlockBytes)) return false;
+    AgcDriver::GuestMemory::CollectWritesUncached(block.Address(), BlockBytes);
+    const auto destination = ShadowDestinationFor(context, *import, block.Address(), block.Address() + BlockBytes);
+    if (!destination.has_value()) return false;
+    const auto commands = recorder->Commands();
+    recorder->Keep(destination->slab);
+    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, destination->buffer, destination->offset, BlockBytes, ShadowWord);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    recorder->MarkCovered(VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    AgcDriver::GuestMemory::MarkWritten(block.Address(), BlockBytes);
+    const ShadowedRange range{block.Address(), block.Address() + BlockBytes, destination->slab};
+    MarkShadowed(*import, std::span(&range, 1), AgcDriver::GuestMemory::TrackerGeneration());
+    return AnyShadowedOverlaps(block.Address(), BlockBytes);
+}
+
+void PublishBlock(AgcDriver::VulkanDevice& device, const Block& block) {
+    {
+        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+        AgcDriver::Graphics::PublishShadow(block.Address(), BlockBytes, AgcDriver::Graphics::PublishScope::Whole, AgcDriver::Graphics::PublishReason::Address);
+    }
+    device.WaitIdle();
+}
+
+bool FromUnitShadow(AgcDriver::VulkanDevice& device, bool verified) {
+    using namespace AgcDriver::Graphics;
+    if (!StagingFromUnitShadow()) return false;
+    AgcDriver::Graphics::SetResidentStagingForTests(true, verified);
+    const auto& block = NewBlock();
+    const auto addOne = Compile(device, AddOne, block.Address(), BufferBytes);
+    Run(device, addOne, AddOne);
+    device.WaitIdle();
+    Expect(block, 1, "the use before the unit is shadowed");
+    if (!ShadowBlock(device, block)) {
+        AgcDriver::Graphics::SetResidentStagingForTests(true, false);
+        return false;
+    }
+    const Counts counts;
+    Run(device, addOne, AddOne);
+    device.WaitIdle();
+    const auto first = counts.Since();
+    Require(first.shadowFed == 1 && first.shadowFedBytes == BufferBytes, "resident staging from a unit shadow: the use over a fresh unit took " + std::to_string(first.shadowFedBytes) + " bytes from the shadow in " + std::to_string(first.shadowFed) + " copy-ins");
+    Require(first.shadowReturned == 1 && first.shadowReturnedBytes == BufferBytes, "resident staging from a unit shadow: the use over a fresh unit left " + std::to_string(first.shadowReturnedBytes) + " bytes in the shadow in " + std::to_string(first.shadowReturned) + " copy-backs");
+    Require(AnyShadowedOverlaps(block.Address(), BufferBytes), "resident staging from a unit shadow: the unit is not shadowed after the copy-back");
+    Run(device, addOne, AddOne);
+    device.WaitIdle();
+    PublishBlock(device, block);
+    Expect(block, ShadowWord + 2, "two uses over a fresh unit, published");
+    Require(block.Words()[Lanes] == ShadowWord && block.Words()[BlockBytes / 4u - 1u] == ShadowWord, "resident staging from a unit shadow: the bytes of the unit outside the staged range are not the shadow's");
+    block.Words()[Lanes + 8u] = 7;
+    block.Words()[3] = 100;
+    const Counts afterStore;
+    Run(device, addOne, AddOne);
+    device.WaitIdle();
+    const auto stale = afterStore.Since();
+    Require(stale.shadowFed == 0 && stale.shadowReturned == 0, "resident staging from a unit shadow: the use after a CPU store into the unit still used the shadow");
+    Require(block.Words()[3] == 101 && block.Words()[Lanes + 8u] == 7, "resident staging from a unit shadow: the use after a CPU store lost the store");
+    Expect(block, ShadowWord + 3, "the use after a CPU store into the unit", 3);
+    const auto since = counts.Since();
+    Require(since.differing == 0, "resident staging from a unit shadow: " + std::to_string(since.differing) + " of " + std::to_string(since.verified) + " verified copies differed");
+    if (verified) Require(since.verified >= 2, "resident staging from a unit shadow: the verified uses compared " + std::to_string(since.verified) + " copies");
+    AgcDriver::Graphics::SetResidentStagingForTests(true, false);
+    return true;
+}
+
+void UnitShadowSwitchedOff(AgcDriver::VulkanDevice& device) {
+    using namespace AgcDriver::Graphics;
+    SetStagingFromUnitShadowForTests(0);
+    const auto& block = NewBlock();
+    const auto addOne = Compile(device, AddOne, block.Address(), BufferBytes);
+    Run(device, addOne, AddOne);
+    device.WaitIdle();
+    const bool shadowed = ShadowBlock(device, block);
+    const Counts counts;
+    Run(device, addOne, AddOne);
+    device.WaitIdle();
+    SetStagingFromUnitShadowForTests(-1);
+    const auto since = counts.Since();
+    Require(since.shadowFed == 0 && since.shadowReturned == 0, "resident staging from a unit shadow: a use with the switch off used the shadow");
+    if (shadowed) Expect(block, ShadowWord + 1, "a use over a shadowed unit with the switch off");
+}
+
+void UnitRunsDecisions() {
+    using namespace AgcDriver::Graphics;
+    constexpr std::uint64_t base = 0x300000000ull;
+    const std::vector<std::uint64_t> generations{9, 9, 0};
+    const std::vector<std::uint8_t> changed{AgcDriver::GuestMemory::BlockUnchanged, AgcDriver::GuestMemory::BlockWritten, AgcDriver::GuestMemory::BlockUnchanged};
+    const std::vector<std::uint8_t> slabs{1, 1, 1};
+    const auto runs = UnitRuns(base, base, base + 3 * BlockBytes, generations, changed, slabs);
+    Require(runs.size() == 2 && runs[0].fresh && runs[0].end == base + BlockBytes && !runs[1].fresh && runs[1].end == base + 3 * BlockBytes, "resident staging from a unit shadow: a fresh unit, a stamped one and one never shadowed did not split in two runs");
+}
+
 using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
 
 const char* Name(ResidentCopyIn kind) {
@@ -386,6 +498,8 @@ int main() {
     try {
         Decisions();
         std::puts("resident staging: the copy-in decision is whole, limited or skipped as the shadow state and the written pages say");
+        UnitRunsDecisions();
+        std::puts("resident staging: a range splits into fresh and stale unit runs as the stamps say");
         SetEnvironment("APS5_WRITTEN_SHADOW_MIN_KIB", "0");
         SetEnvironment("APS5_NO_CHANGED_COPY_BACK", "1");
         SetEnvironment("APS5_NO_ADAPTIVE_STAGING", "1");
@@ -427,6 +541,12 @@ int main() {
         std::puts("resident staging: two half-overlapping regions kept every increment");
         Verified(*device, strict);
         std::puts("resident staging: verified shadows matched their imports");
+        if (!strict) std::puts("resident staging: staging from a unit shadow is not checked on this device");
+        else if (FromUnitShadow(*device, false)) std::puts("resident staging: a fresh unit fed the copy-in and kept the copy-back, a CPU store sent both back to the import");
+        else std::puts("resident staging: no unit shadow was made over the staged region, so staging from it is not checked");
+        if (strict && FromUnitShadow(*device, true)) std::puts("resident staging: verified copies from and to a unit shadow matched");
+        UnitShadowSwitchedOff(*device);
+        std::puts("resident staging: with the unit shadow switch off the import is copied both ways");
         SwitchedOff(*device);
         std::puts("resident staging: a build made with the switch off kept the per-use copy-in");
         device->WaitIdle();
