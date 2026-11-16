@@ -154,7 +154,8 @@ void testRandomStreams() {
         Expect(counts.unchanged != 0, "writes of the value a register already holds are counted");
         for (std::size_t index = 0; index < harness.ops.size(); ++index) {
             const auto& op = harness.ops[index];
-            if (op.kind != DecodedKind::Draw || op.packet != stream.words.data() + op.offset || op.words != LaneWords(op.packet[0]) || op.opcode != ((op.packet[0] >> 8u) & 0xffu) || LaneOf(op.packet[0]) != Lane::Draw) {
+            const auto carried = op.Words();
+            if (carried.data() != op.inlineWords.data() || !std::equal(carried.begin(), carried.end(), stream.words.begin() + op.offset) || op.kind != DecodedKind::Draw || op.packet != stream.words.data() + op.offset || op.words != LaneWords(op.packet[0]) || op.opcode != ((op.packet[0] >> 8u) & 0xffu) || LaneOf(op.packet[0]) != Lane::Draw) {
                 ExpectAt(false, seed, index, "an operation does not name its draw packet");
                 break;
             }

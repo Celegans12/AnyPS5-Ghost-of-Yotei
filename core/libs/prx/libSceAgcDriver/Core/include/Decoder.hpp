@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Core/include/RunKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -42,6 +43,7 @@ struct DecodedState {
 };
 
 inline constexpr std::uint32_t DecodedAlone = 1u;
+inline constexpr std::size_t DecodedInlineWords = 6;
 
 struct alignas(64) DecodedOp {
     std::uint64_t order;
@@ -55,6 +57,9 @@ struct alignas(64) DecodedOp {
     std::uint32_t flags;
     DecodedKind kind;
     DecodedState state;
+    std::array<std::uint32_t, DecodedInlineWords> inlineWords;
+
+    [[nodiscard]] std::span<const std::uint32_t> Words() const { return words <= DecodedInlineWords ? std::span<const std::uint32_t>(inlineWords.data(), words) : std::span<const std::uint32_t>(packet, words); }
 };
 
 static_assert(sizeof(DecodedOp) == 256);

@@ -290,6 +290,7 @@ Decoder::Result Decoder::Decode(QueueState& live, const Input& input) {
                 op.kind = DecodedKind::Draw;
                 op.packet = packet.data();
                 op.words = static_cast<std::uint32_t>(words);
+                if (words <= DecodedInlineWords) std::copy(packet.begin(), packet.end(), op.inlineWords.begin());
                 op.offset = static_cast<std::uint32_t>(cursor);
                 op.opcode = opcode;
                 op.submission = input.submission;
