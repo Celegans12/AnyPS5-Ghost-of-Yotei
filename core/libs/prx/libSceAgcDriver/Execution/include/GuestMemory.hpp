@@ -224,7 +224,6 @@ bool EpochSweeps();
 ContentToken TokenFor(std::uint64_t address, std::size_t bytes);
 bool StillCurrent(std::uint64_t address, std::size_t bytes, const ContentToken& token);
 void SweepHot(std::uint64_t epoch);
-void SetEpochHook(void (*hook)(std::uint64_t epoch));
 enum class TokenMiss : std::uint8_t { Unobserved, Written, Context, Busy, Count };
 struct EpochSweepCounts {
     std::uint64_t sweeps = 0;

@@ -565,7 +565,6 @@ std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> collectWalkedEpochs{0};
 std::atomic<std::uint64_t> committerWatchCalls{0};
 thread_local bool proofThread = false;
-thread_local bool sweepThread = false;
 std::atomic<std::uint64_t> unwatchSerial{0};
 
 std::uint64_t collectTicks() {
@@ -1856,7 +1855,7 @@ std::uint64_t hotEpochs() {
     static const std::uint64_t span = [] {
         const char* text = std::getenv("APS5_EPOCH_SWEEP_SPAN");
         const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0;
-        return value != 0 || std::getenv("APS5_EPOCH_SWEEP_THREAD") == nullptr ? value : std::uint64_t{32};
+        return value;
     }();
     return span;
 }
@@ -3049,7 +3048,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
         observed.Memo();
         const auto settled = tracker.stable.load(std::memory_order_acquire);
         if (EpochSweeps()) {
-            if (!sweepThread) tracker.markAsked(first, stop, askedSerial());
+            tracker.markAsked(first, stop, askedSerial());
             if (epochSweepVerified()) verifyEpochAnswer(address, bytes);
         }
         return {Status::Complete, settled};
@@ -3136,7 +3135,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
         if (end > from) tracker.publishObserved(from, end - 1, tick);
     }
     if (shared && EpochSweeps()) {
-        if (!sweepThread) tracker.markAsked(first, stop, askedSerial());
+        tracker.markAsked(first, stop, askedSerial());
         if (status == Status::Complete) tracker.publishExact(first, stop, std::max(epoch, tracker.observationFloor.load(std::memory_order_relaxed)));
     }
     if (status != Status::Complete) return {status, 0};
@@ -3430,17 +3429,9 @@ std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std
     return tracker.generation.load(std::memory_order_relaxed);
 }
 
-namespace {
-std::atomic<void (*)(std::uint64_t)> epochHook{nullptr};
-}
-
 bool EpochSweeps() {
     static const bool enabled = std::getenv("APS5_NO_EPOCH_SWEEP") == nullptr;
     return enabled;
-}
-
-void SetEpochHook(void (*hook)(std::uint64_t epoch)) {
-    epochHook.store(hook, std::memory_order_release);
 }
 
 void BumpCollectEpoch() {
@@ -3453,12 +3444,7 @@ void BumpCollectEpoch() {
     if (!EpochSweeps()) return;
     auto& sweep = epochSweep();
     sweep.serial.fetch_add(1, std::memory_order_relaxed);
-    if (const auto hook = epochHook.load(std::memory_order_acquire)) {
-        auto wanted = sweep.wanted.load(std::memory_order_relaxed);
-        while (wanted < epoch && !sweep.wanted.compare_exchange_weak(wanted, epoch, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
-        hook(epoch);
-    }
-    else if (!proofThread && hotEpochs() != 0) SweepHot(epoch);
+    if (!proofThread && hotEpochs() != 0) SweepHot(epoch);
 }
 
 std::uint64_t ThreadCollectEpoch() {
@@ -3805,7 +3791,7 @@ std::optional<TokenMiss> readContent(std::uint64_t first, std::uint64_t stop, st
         AgcDriver::SpinPause();
         generation = tracker.generation.load();
     }
-    if (!sweepThread) tracker.markAsked(first, stop, askedSerial());
+    tracker.markAsked(first, stop, askedSerial());
     if (!observedInEpoch(tracker, first, static_cast<std::size_t>(stop - first), first, stop, epoch)) return TokenMiss::Unobserved;
     content = contentSum(first, stop);
     if (tracker.generation.load() != generation) return TokenMiss::Busy;
@@ -4027,7 +4013,6 @@ bool StillCurrent(std::uint64_t address, std::size_t bytes, const ContentToken& 
 
 void SweepHot(std::uint64_t epoch) {
     if (!EpochSweeps()) return;
-    if (epochHook.load(std::memory_order_acquire) != nullptr) sweepThread = true;
     auto& sweep = epochSweep();
     auto wanted = sweep.wanted.load(std::memory_order_relaxed);
     while (wanted < epoch && !sweep.wanted.compare_exchange_weak(wanted, epoch, std::memory_order_acq_rel, std::memory_order_relaxed)) {}

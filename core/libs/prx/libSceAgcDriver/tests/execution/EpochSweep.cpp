@@ -1,4 +1,3 @@
-#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -13,7 +12,6 @@
 #endif
 #include <array>
 #include <atomic>
-#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -37,33 +35,10 @@ void Require(bool condition, const char* message) {
 }
 
 std::atomic<std::uint64_t> osWalks{0};
-std::atomic<std::uint64_t> hookedEpoch{0};
-std::atomic<std::uint64_t> hookCalls{0};
-
-std::atomic<bool> pauseArmed{false};
-std::atomic<bool> pauseReached{false};
-std::atomic<bool> pauseReleased{false};
-
-bool Within(std::chrono::seconds patience, const std::atomic<bool>& flag) {
-    const auto until = std::chrono::steady_clock::now() + patience;
-    while (!flag.load()) {
-        if (std::chrono::steady_clock::now() >= until) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return true;
-}
 
 void Hook(int point) {
     if (point != 1) return;
     osWalks.fetch_add(1);
-    if (!pauseArmed.exchange(false)) return;
-    pauseReached.store(true);
-    Within(std::chrono::seconds(10), pauseReleased);
-}
-
-void EpochHook(std::uint64_t epoch) {
-    hookedEpoch.store(epoch);
-    hookCalls.fetch_add(1);
 }
 
 std::uint64_t AllocateWatched(std::size_t bytes) {
@@ -227,29 +202,6 @@ void WriteBeforeASubmissionIsSeenByTheDrawThatReads(std::uint64_t base) {
     Require(!heldAtNew, "a store made after the token and before the next submission was hidden from that submission");
 }
 
-void HookTakesTheSweepOver(std::uint64_t base) {
-    const auto address = base + 21 * Block;
-    GuestMemory::BumpCollectEpoch();
-    const auto token = Take(address, Page);
-    GuestMemory::SetEpochHook(&EpochHook);
-    const auto calls = hookCalls.load();
-    const auto walks = osWalks.load();
-    Store(address + 3);
-    GuestMemory::BumpCollectEpoch();
-    const auto epoch = GuestMemory::HeldCollectEpoch();
-    Require(hookCalls.load() == calls + 1 && hookedEpoch.load() == epoch, "the epoch hook was not called with the new epoch");
-    Require(osWalks.load() == walks, "the epoch advance swept although a hook had taken the sweep over");
-    Require(!GuestMemory::StillCurrent(address, Page, token), "a token held in an epoch nothing had observed its range in");
-    GuestMemory::SweepHot(epoch);
-    const auto swept = osWalks.load();
-    Require(swept > walks, "a sweep asked for by the hook's owner walked nothing");
-    Require(!GuestMemory::StillCurrent(address, Page, token), "a token held across a store the sweep collected");
-    Require(GuestMemory::CollectWrites(address, Page) != 0 && osWalks.load() == swept, "a collect after the sweep walked the block again");
-    GuestMemory::SweepHot(epoch);
-    Require(osWalks.load() == swept, "a second sweep of the same epoch walked again");
-    GuestMemory::SetEpochHook(nullptr);
-}
-
 void ColdBlocksLeaveTheSweep(std::uint64_t base) {
     const auto address = base + 24 * Block + Page;
     GuestMemory::BumpCollectEpoch();
@@ -395,62 +347,6 @@ void UnwatchedRangeHoldsNoToken(std::uint64_t base) {
     Require(GuestMemory::TokenFor(address, Page).content == 0, "an unwatched range got a content token");
 }
 
-bool WalkerSwept(std::uint64_t sweeps) {
-    using AgcDriver::DriverDetail::CollectWalker;
-    const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(10);
-    while (CollectWalker::Get().Counted().sweeps <= sweeps || !CollectWalker::Get().Idle()) {
-        if (std::chrono::steady_clock::now() >= until) return false;
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    }
-    return true;
-}
-
-void WalkerThreadSweeps(std::uint64_t base) {
-    using AgcDriver::DriverDetail::CollectWalker;
-    Require(CollectWalker::SweepsEpochs(), "the sweep thread switch was not read");
-    auto& walker = CollectWalker::Get();
-    const auto address = base + 2 * Block + Page;
-    const auto other = base + 6 * Block;
-    GuestMemory::BumpCollectEpoch();
-    const auto token = Take(address, 2 * Page);
-    const auto generation = GuestMemory::CollectWrites(address, 2 * Page);
-    Store(address + 5);
-    auto sweeps = walker.Counted().sweeps;
-    const auto walks = osWalks.load();
-    GuestMemory::BumpCollectEpoch();
-    Require(WalkerSwept(sweeps), "the walker did not sweep the epoch it was woken for");
-    const auto swept = osWalks.load();
-    Require(swept > walks, "the walker's sweep walked nothing");
-    Require(GuestMemory::CollectWrites(address, 2 * Page) != 0 && osWalks.load() == swept, "a collect after the walker's sweep walked the block again");
-    Require(!GuestMemory::StillCurrent(address, 2 * Page, token), "a token held across a store the walker's sweep collected");
-    Require(!GuestMemory::UnchangedSince(address, 2 * Page, generation), "the walker's sweep did not stamp the store it collected");
-    const auto retaken = Take(address, 2 * Page);
-    sweeps = walker.Counted().sweeps;
-    pauseReleased.store(false);
-    pauseReached.store(false);
-    pauseArmed.store(true);
-    GuestMemory::BumpCollectEpoch();
-    const auto epoch = GuestMemory::HeldCollectEpoch();
-    Require(Within(std::chrono::seconds(10), pauseReached), "the walker did not start the sweep of the next epoch");
-    const auto counted = walker.Counted();
-    const bool taken = walker.Offer(epoch, other, Page);
-    const auto after = walker.Counted();
-    const auto before = osWalks.load();
-    const bool collected = GuestMemory::CollectWrites(other, Page) != 0;
-    const bool walkedItself = osWalks.load() > before;
-    pauseReleased.store(true);
-    Require(!taken && after.filtered == counted.filtered + 1 && after.handed == counted.handed, "the walker took a range while it swept");
-    Require(collected && walkedItself, "a collect made while the walker swept did not walk its own range");
-    Require(WalkerSwept(sweeps), "the walker did not finish the sweep a collect ran beside");
-    Require(GuestMemory::StillCurrent(address, 2 * Page, retaken), "a token broke across a sweep that found no store");
-    Require(walker.Offer(GuestMemory::HeldCollectEpoch(), other, Page), "the walker refused a range once its sweep was over");
-    walker.Stop();
-    const auto stopped = osWalks.load();
-    GuestMemory::BumpCollectEpoch();
-    Require(osWalks.load() == stopped, "an epoch advance swept on the advancing thread although the walker owns the sweep");
-    Require(GuestMemory::CollectWrites(address, 2 * Page) != 0 && osWalks.load() > stopped, "a collect after the walker stopped did not walk");
-}
-
 void CountsAddUp() {
     const auto counts = GuestMemory::EpochSweepCounted();
     Require(counts.sweeps != 0 && counts.runs != 0 && counts.blocks >= counts.runs, "the sweep counts show no sweep");
@@ -463,14 +359,12 @@ void CountsAddUp() {
 int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
-        const bool thread = argc == 2 && std::string(argv[1]) == "--thread";
         _putenv_s("APS5_EPOCH_SWEEP", "1");
-        _putenv_s(thread ? "APS5_EPOCH_SWEEP_THREAD" : "APS5_EPOCH_SWEEP_SPAN", thread ? "1" : "64");
+        _putenv_s("APS5_EPOCH_SWEEP_SPAN", "64");
         if (argc == 2 && std::string(argv[1]) == "--verify") _putenv_s("APS5_VERIFY_EPOCH_SWEEP", "1");
 #else
-        const bool thread = argc == 2 && std::string(argv[1]) == "--thread";
         setenv("APS5_EPOCH_SWEEP", "1", 1);
-        setenv(thread ? "APS5_EPOCH_SWEEP_THREAD" : "APS5_EPOCH_SWEEP_SPAN", thread ? "1" : "64", 1);
+        setenv("APS5_EPOCH_SWEEP_SPAN", "64", 1);
         if (argc == 2 && std::string(argv[1]) == "--verify") setenv("APS5_VERIFY_EPOCH_SWEEP", "1", 1);
 #endif
         if (!GuestMemory::WriteWatched()) {
@@ -484,9 +378,7 @@ int main(int argc, char** argv) {
         }
         Require(GuestMemory::EpochSweeps(), "the epoch sweep switch was not read");
         GuestMemory::SetObservationHookForTest(&Hook);
-        if (thread) {
-            WalkerThreadSweeps(base);
-        } else if (argc == 2 && std::string(argv[1]) == "--verify") {
+        if (argc == 2 && std::string(argv[1]) == "--verify") {
             NoStoreIsMissed(base);
             DriverWritesBreakATokenAtOnce(base);
             WriteBeforeASubmissionIsSeenByTheDrawThatReads(base);
@@ -497,7 +389,6 @@ int main(int argc, char** argv) {
             DriverWritesBreakATokenAtOnce(base);
             WriteBeforeASubmissionIsSeenByTheDrawThatReads(base);
             ManyDriverStoresInABlockKeepPageGrain(base);
-            HookTakesTheSweepOver(base);
             ColdBlocksLeaveTheSweep(base);
             NeighbourPagesLeaveATokenStanding(base);
             UnwatchedRangeHoldsNoToken(base);
