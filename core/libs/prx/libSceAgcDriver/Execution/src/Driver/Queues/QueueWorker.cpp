@@ -26,14 +26,6 @@ namespace {
 
 constexpr auto IdleResultsQuietPeriod = std::chrono::milliseconds(50);
 
-bool SubmitGroup() {
-    static const bool enabled = [] {
-        const char* text = std::getenv("APS5_SUBMIT_GROUP");
-        return text != nullptr && text[0] != '\0' && !(text[0] == '0' && text[1] == '\0');
-    }();
-    return enabled;
-}
-
 std::uint64_t SubmitGroupWork() {
     static const std::uint64_t value = [] {
         const char* text = std::getenv("APS5_SUBMIT_GROUP_WORK");
@@ -180,35 +172,20 @@ void Driver::deferCompletion(const Submission& submission) {
 }
 
 bool Driver::holdSubmit() {
-    if (CoreOffDraw()) {
-        if (DrawPipeline::Flat()) return false;
-        const auto now = std::chrono::steady_clock::now();
-        const bool held = heldSubmit.load(std::memory_order_acquire);
-        const auto outstanding = DrawPipeline::Queue0().Outstanding();
-        auto state = PolicyState(now, held, heldSince.load(std::memory_order_acquire), outstanding > 1 ? outstanding - 1 : 0);
-        AddGpuState(state, device.Load());
-        const auto cause = Core::AtSubmissionEnd(state, PolicyLimits(labelFlushDeadline(), batchCap()));
-        endCauses[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
-        ReportOffDraw(now);
-        if (cause != Core::SubmitCause::Held) return false;
-        if (!held) {
-            heldCheckedNs.store(0, std::memory_order_relaxed);
-            heldSince.store(now.time_since_epoch().count(), std::memory_order_release);
-            heldSubmit.store(true, std::memory_order_release);
-        }
-        submitsHeld.fetch_add(1, std::memory_order_relaxed);
-        return true;
-    }
-    if (!SubmitGroup() || DrawPipeline::Queue0().Outstanding() <= 1) return false;
-    if (Graphics::Recorder::RecordedWorkSinceSubmit() >= SubmitGroupWork()) return false;
+    if (!CoreOffDraw() || DrawPipeline::Flat()) return false;
     const auto now = std::chrono::steady_clock::now();
-    const auto pending = Graphics::Recorder::PendingLabelSince();
-    if (pending.has_value() && now - *pending >= labelFlushDeadline()) return false;
-    if (!heldSubmit.load(std::memory_order_acquire)) {
+    const bool held = heldSubmit.load(std::memory_order_acquire);
+    const auto outstanding = DrawPipeline::Queue0().Outstanding();
+    auto state = PolicyState(now, held, heldSince.load(std::memory_order_acquire), outstanding > 1 ? outstanding - 1 : 0);
+    AddGpuState(state, device.Load());
+    const auto cause = Core::AtSubmissionEnd(state, PolicyLimits(labelFlushDeadline(), batchCap()));
+    endCauses[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+    ReportOffDraw(now);
+    if (cause != Core::SubmitCause::Held) return false;
+    if (!held) {
+        heldCheckedNs.store(0, std::memory_order_relaxed);
         heldSince.store(now.time_since_epoch().count(), std::memory_order_release);
         heldSubmit.store(true, std::memory_order_release);
-    } else if (now - HeldSubmitSince(heldSince.load(std::memory_order_acquire)) >= labelFlushDeadline()) {
-        return false;
     }
     submitsHeld.fetch_add(1, std::memory_order_relaxed);
     return true;
@@ -222,26 +199,20 @@ void Driver::SubmitHeldWork(bool last) {
     }
     const auto now = std::chrono::steady_clock::now();
     const auto since = HeldSubmitSince(heldSince.load(std::memory_order_acquire));
-    bool due = now - since >= labelFlushDeadline();
-    bool full = Graphics::Recorder::RecordedWorkSinceSubmit() >= SubmitGroupWork();
-    if (CoreOffDraw()) {
-        auto state = PolicyState(now, true, heldSince.load(std::memory_order_acquire), last ? 0 : 1);
-        AddGpuState(state, device.Load());
-        const auto cause = Core::AfterOp(state, PolicyLimits(labelFlushDeadline(), batchCap()));
-        const auto heldNs = static_cast<std::uint64_t>(std::max<std::chrono::nanoseconds::rep>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(now - since).count()));
-        const auto deadlineNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(labelFlushDeadline()).count());
-        if (cause == Core::SubmitCause::Held) {
-            heldCheckedNs.store(heldNs, std::memory_order_relaxed);
-            return;
-        }
-        if (heldCheckedNs.exchange(0, std::memory_order_relaxed) >= deadlineNs) heldOverdue.fetch_add(1, std::memory_order_relaxed);
-        heldCauses[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
-        due = cause == Core::SubmitCause::Deadline;
-        full = cause == Core::SubmitCause::Work || cause == Core::SubmitCause::Cap;
-        if (heldNs > heldLongestNs.load(std::memory_order_relaxed)) heldLongestNs.store(heldNs, std::memory_order_relaxed);
-    } else if (!last && !due && !full) {
+    auto state = PolicyState(now, true, heldSince.load(std::memory_order_acquire), last ? 0 : 1);
+    AddGpuState(state, device.Load());
+    const auto cause = Core::AfterOp(state, PolicyLimits(labelFlushDeadline(), batchCap()));
+    const auto heldNs = static_cast<std::uint64_t>(std::max<std::chrono::nanoseconds::rep>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(now - since).count()));
+    const auto deadlineNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(labelFlushDeadline()).count());
+    if (cause == Core::SubmitCause::Held) {
+        heldCheckedNs.store(heldNs, std::memory_order_relaxed);
         return;
     }
+    if (heldCheckedNs.exchange(0, std::memory_order_relaxed) >= deadlineNs) heldOverdue.fetch_add(1, std::memory_order_relaxed);
+    heldCauses[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+    const bool due = cause == Core::SubmitCause::Deadline;
+    const bool full = cause == Core::SubmitCause::Work || cause == Core::SubmitCause::Cap;
+    if (heldNs > heldLongestNs.load(std::memory_order_relaxed)) heldLongestNs.store(heldNs, std::memory_order_relaxed);
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();
