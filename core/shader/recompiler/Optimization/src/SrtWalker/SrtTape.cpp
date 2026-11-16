@@ -7,8 +7,10 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -30,6 +32,8 @@ constexpr std::size_t InlineNodes = 512;
 constexpr std::size_t InlineBlocks = 512;
 constexpr std::size_t InlineFlatSlots = 4096;
 constexpr std::size_t SlotBits = 64;
+constexpr std::size_t InlineActive = 2048;
+constexpr std::uint32_t ActiveWordBits = 32;
 
 struct FlatReader {
     BlockWordReader read = nullptr;
@@ -45,6 +49,22 @@ bool readFlatWord(void* user, std::uint64_t address, std::uint32_t* value) {
 }
 
 bool slotActive(const std::uint64_t* bits, std::size_t slot) { return (bits[slot / SlotBits] >> (slot % SlotBits) & 1u) != 0u; }
+
+struct DriverCounters {
+    std::atomic<std::uint64_t> plans{0}, complete{0}, walks{0}, served{0}, differed{0};
+};
+
+DriverCounters& driverCounters() {
+    static DriverCounters held;
+    return held;
+}
+
+std::uint32_t rankOf(const std::vector<BlockDriverSource>& sources, std::uint32_t source) {
+    for (std::size_t rank = 0; rank < sources.size(); ++rank) {
+        if (sources[rank].source == source) return static_cast<std::uint32_t>(rank);
+    }
+    return NoDriverWord;
+}
 
 }
 
@@ -64,6 +84,7 @@ public:
             if (source.dwordCount > source.dwords.size()) return false;
             for (std::uint32_t dword = 0; dword < source.dwordCount; ++dword) tape.sourceDwords[index][dword] = compile(source.dwords[dword], MainContext, 0);
         }
+        buildDriver();
         tape.flatRoots.resize(plan.srtReads.size());
         for (std::size_t slot = 0; slot < plan.srtReads.size(); ++slot) {
             const auto& read = plan.srtReads[slot];
@@ -86,6 +107,33 @@ private:
         bool cleanSlots;
     };
     static constexpr std::uint32_t Building = 0xfffffffeu;
+
+    void buildDriver() {
+        auto& zone = tape.driver;
+        std::uint32_t word = 0;
+        for (const auto index : plan.materializationSources) {
+            const auto dwords = plan.descriptorSources[index].dwordCount;
+            zone.sources.push_back({word, dwords, index});
+            word += dwords;
+        }
+        zone.imageBase = static_cast<std::uint32_t>(plan.descriptorSources.size());
+        zone.activeBits = static_cast<std::uint32_t>(plan.descriptorSources.size() + plan.info.images.size());
+        zone.activeWord = word;
+        zone.words = word + (zone.activeBits + ActiveWordBits - 1u) / ActiveWordBits;
+        zone.complete = true;
+        for (const auto& buffer : plan.info.buffers) {
+            zone.buffers.push_back(rankOf(zone.sources, buffer.source));
+            zone.complete = zone.complete && zone.buffers.back() != NoDriverWord;
+        }
+        for (const auto& image : plan.info.images) {
+            zone.images.push_back(image.table != NoTable ? NoDriverWord : rankOf(zone.sources, image.source));
+            zone.complete = zone.complete && zone.images.back() != NoDriverWord;
+        }
+        for (const auto& sampler : plan.info.samplers) {
+            zone.samplers.push_back(sampler.table != NoTable ? NoDriverWord : rankOf(zone.sources, sampler.source));
+            zone.complete = zone.complete && zone.samplers.back() != NoDriverWord;
+        }
+    }
 
     std::uint32_t emit(const Node& node) {
         tape.nodes.push_back(node);
@@ -321,6 +369,11 @@ std::shared_ptr<const SrtTape> SrtTape::Compile(const IrResourcePlan& plan) {
     auto tape = std::make_shared<SrtTape>();
     SrtTapeCompiler compiler(plan, *tape);
     if (!compiler.Build()) return nullptr;
+    if (Verified()) {
+        auto& counters = driverCounters();
+        counters.plans.fetch_add(1, std::memory_order_relaxed);
+        if (tape->driver.complete && tape->nodes.size() <= InlineNodes) counters.complete.fetch_add(1, std::memory_order_relaxed);
+    }
     return tape;
 }
 
@@ -732,30 +785,88 @@ bool SrtTape::Run(const IrResourcePlan& plan, const SrtRuntime& runtime, std::ve
     results.swap(evaluated);
     activeSources.swap(active);
     flat.assign(flattened.begin(), flattened.end());
+    if (Verified() && trace == nullptr && use == nullptr && runtime.descriptorScope == nullptr && runtime.accessible == nullptr && runtime.readMemory != nullptr && runtime.readSpecializationMemory != nullptr) verifyDriver(plan, runtime, results, flat, activeSources);
     return true;
 }
 
+void SrtTape::verifyDriver(const IrResourcePlan& plan, const SrtRuntime& runtime, const std::vector<DescriptorValue>& results, const std::vector<std::uint32_t>& flat, const std::vector<std::uint8_t>& activeSources) const {
+    auto& counters = driverCounters();
+    std::vector<std::uint32_t> out(plan.srtReads.size(), 0u);
+    std::vector<std::uint32_t> zone(driver.words, 0u);
+    const auto walk = walkInto(plan, runtime, nullptr, out, zone, true);
+    const auto walked = counters.walks.fetch_add(1, std::memory_order_relaxed) + 1u;
+    const char* difference = nullptr;
+    if (walk == BlockWalk::Done) {
+        counters.served.fetch_add(1, std::memory_order_relaxed);
+        if (out != flat) difference = "flat slots";
+        else if (results.size() != driver.sources.size() || activeSources.size() != driver.activeBits) difference = "counts";
+        for (std::size_t rank = 0; difference == nullptr && rank < driver.sources.size(); ++rank) {
+            const auto& entry = driver.sources[rank];
+            if (results[rank].dwordCount != entry.dwords) difference = "descriptor widths";
+            for (std::uint32_t dword = 0; difference == nullptr && dword < entry.dwords; ++dword) {
+                if (zone[entry.word + dword] != results[rank].dwords[dword]) difference = "descriptors";
+            }
+        }
+        for (std::uint32_t bit = 0; difference == nullptr && bit < driver.activeBits; ++bit) {
+            if (driver.Active(zone, bit) != (activeSources[bit] != 0u)) difference = "active sources";
+        }
+    }
+    if (difference != nullptr && counters.differed.fetch_add(1, std::memory_order_relaxed) < 20u) std::fprintf(stderr, "[srt-tape] driver zone: shader %016llx: RunInto differs from Run in its %s\n", static_cast<unsigned long long>(plan.shaderHash), difference);
+    bool decade = walked >= 10u;
+    for (auto rest = walked; decade && rest >= 10u; rest /= 10u) decade = rest % 10u == 0u;
+    if (decade) std::fprintf(stderr, "[srt-tape] driver zone: %llu walks, %llu served, %llu differed, %llu plans, %llu with every resource in the zone\n", static_cast<unsigned long long>(walked), static_cast<unsigned long long>(counters.served.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.differed.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.plans.load(std::memory_order_relaxed)), static_cast<unsigned long long>(counters.complete.load(std::memory_order_relaxed)));
+}
+
 BlockWalk SrtTape::RunInto(const IrResourcePlan& plan, std::span<const std::uint32_t> userData, std::uint64_t shaderBase, BlockWordReader read, void* context, std::span<std::uint32_t> out) const {
-    if (!plan.srtPlanComplete || read == nullptr || nodes.size() > InlineNodes) return BlockWalk::Unsupported;
-    if (out.size() != plan.srtReads.size() || flatRoots.size() != plan.srtReads.size() || conditionRoots.size() != plan.controlFlow.size()) return BlockWalk::Unsupported;
-    const bool guarded = !plan.controlFlow.empty();
-    if (guarded && (plan.controlFlow.size() > InlineBlocks || out.size() > InlineFlatSlots)) return BlockWalk::Unsupported;
+    if (read == nullptr) return BlockWalk::Unsupported;
     FlatReader reader {read, context};
     SrtRuntime runtime {userData, shaderBase};
     runtime.readMemory = readFlatWord;
     runtime.userContext = &reader;
     runtime.readSpecializationMemory = readFlatWord;
+    return walkInto(plan, runtime, &reader.refused, out, {}, false);
+}
+
+BlockWalk SrtTape::RunInto(const IrResourcePlan& plan, std::span<const std::uint32_t> userData, std::uint64_t shaderBase, BlockWordReader read, void* context, std::span<std::uint32_t> out, std::span<std::uint32_t> zone) const {
+    if (read == nullptr) return BlockWalk::Unsupported;
+    FlatReader reader {read, context};
+    SrtRuntime runtime {userData, shaderBase};
+    runtime.readMemory = readFlatWord;
+    runtime.userContext = &reader;
+    runtime.readSpecializationMemory = readFlatWord;
+    return walkInto(plan, runtime, &reader.refused, out, zone, true);
+}
+
+BlockWalk SrtTape::walkInto(const IrResourcePlan& plan, const SrtRuntime& runtime, const bool* refused, std::span<std::uint32_t> out, std::span<std::uint32_t> zone, bool driven) const {
+    if (!plan.srtPlanComplete || nodes.size() > InlineNodes) return BlockWalk::Unsupported;
+    if (out.size() != plan.srtReads.size() || flatRoots.size() != plan.srtReads.size() || conditionRoots.size() != plan.controlFlow.size()) return BlockWalk::Unsupported;
+    const bool guarded = !plan.controlFlow.empty();
+    if (guarded && (plan.controlFlow.size() > InlineBlocks || out.size() > InlineFlatSlots)) return BlockWalk::Unsupported;
+    if (driven && (zone.size() != driver.words || sourceDwords.size() != plan.descriptorSources.size() || driver.activeBits != plan.descriptorSources.size() + plan.info.images.size())) return BlockWalk::Unsupported;
+    const bool guardedSources = driven && guarded;
+    if (guardedSources && driver.activeBits > InlineActive) return BlockWalk::Unsupported;
     std::array<std::uint64_t, InlineNodes> values;
     std::array<std::uint8_t, InlineNodes> states;
     std::fill_n(states.data(), nodes.size(), std::uint8_t {0});
     Frame frame {runtime, values.data(), states.data()};
     std::array<std::uint64_t, InlineFlatSlots / SlotBits> activeFlat;
+    std::array<std::uint8_t, InlineActive> active;
     if (guarded) {
         std::fill_n(activeFlat.data(), (out.size() + SlotBits - 1u) / SlotBits, ~std::uint64_t {0});
+        if (guardedSources) std::fill_n(active.data(), driver.activeBits, std::uint8_t {1});
         for (const auto& block : plan.controlFlow) {
             for (const auto slot : block.flatSlots) {
                 if (slot >= out.size()) return BlockWalk::Unsupported;
                 activeFlat[slot / SlotBits] &= ~(std::uint64_t {1} << (slot % SlotBits));
+            }
+            if (!guardedSources) continue;
+            for (const auto source : block.sources) {
+                if (source >= driver.activeBits) return BlockWalk::Unsupported;
+                active[source] = 0u;
+            }
+            for (const auto image : block.images) {
+                if (image >= plan.info.images.size()) return BlockWalk::Unsupported;
+                active[driver.imageBase + image] = 0u;
             }
         }
         std::array<std::uint8_t, InlineBlocks> queued;
@@ -776,6 +887,10 @@ BlockWalk SrtTape::RunInto(const IrResourcePlan& plan, std::span<const std::uint
             const auto index = pending[--pendingCount];
             const auto& block = plan.controlFlow[index];
             for (const auto slot : block.flatSlots) activeFlat[slot / SlotBits] |= std::uint64_t {1} << (slot % SlotBits);
+            if (guardedSources) {
+                for (const auto source : block.sources) active[source] = 1u;
+                for (const auto image : block.images) active[driver.imageBase + image] = 1u;
+            }
             std::uint64_t condition = 0;
             bool cleanEvaluable = false;
             {
@@ -791,6 +906,26 @@ BlockWalk SrtTape::RunInto(const IrResourcePlan& plan, std::span<const std::uint
                 }
             }
         }
+        if (guardedSources && !ApplySourceBlockGuards(plan, std::span<const std::uint8_t>(queued.data(), plan.controlFlow.size()), std::span<std::uint8_t>(active.data(), driver.activeBits))) return BlockWalk::Unsupported;
+    }
+    const auto failed = [&] {
+        if (refused != nullptr && *refused) return BlockWalk::Unreadable;
+        return frame.nullRoot ? BlockWalk::Poisoned : BlockWalk::Unsupported;
+    };
+    if (driven) {
+        for (const auto& entry : driver.sources) {
+            if (entry.source >= sourceDwords.size() || entry.dwords > sourceDwords[entry.source].size()) return BlockWalk::Unsupported;
+            const bool live = !guarded || active[entry.source] != 0u;
+            for (std::uint32_t dword = 0; dword < entry.dwords; ++dword) {
+                std::uint64_t word = 0;
+                if (live && !evaluate(frame, sourceDwords[entry.source][dword], word)) return failed();
+                zone[entry.word + dword] = static_cast<std::uint32_t>(word);
+            }
+        }
+        std::fill(zone.begin() + driver.activeWord, zone.end(), 0u);
+        for (std::uint32_t bit = 0; bit < driver.activeBits; ++bit) {
+            if (!guarded || active[bit] != 0u) zone[driver.activeWord + bit / ActiveWordBits] |= std::uint32_t {1} << (bit % ActiveWordBits);
+        }
     }
     std::fill(out.begin(), out.end(), 0u);
     for (std::size_t slot = 0; slot < plan.srtReads.size(); ++slot) {
@@ -798,10 +933,7 @@ BlockWalk SrtTape::RunInto(const IrResourcePlan& plan, std::span<const std::uint
         if (offset >= out.size()) return BlockWalk::Unsupported;
         if (guarded && !slotActive(activeFlat.data(), offset)) continue;
         std::uint64_t word = 0;
-        if (!evaluate(frame, flatRoots[slot], word)) {
-            if (reader.refused) return BlockWalk::Unreadable;
-            return frame.nullRoot ? BlockWalk::Poisoned : BlockWalk::Unsupported;
-        }
+        if (!evaluate(frame, flatRoots[slot], word)) return failed();
         out[offset] = static_cast<std::uint32_t>(word);
     }
     return BlockWalk::Done;
