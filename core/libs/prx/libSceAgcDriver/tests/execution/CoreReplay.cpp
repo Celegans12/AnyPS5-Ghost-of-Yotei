@@ -125,7 +125,7 @@ ShaderRecompiler::RecompileResult Program(const TSpirv& spirv, std::uint64_t var
     return result;
 }
 
-enum Counted : std::size_t { Replayed, Captured, Unstorable, Verified, Mismatches, KeptOnce };
+enum Counted : std::size_t { Replayed, Captured, Unstorable, Verified, Mismatches, KeptOnce, Lean, Recaptured, Refreshed };
 
 std::vector<std::byte> Pixels(const ColorTarget& target) {
     std::vector<std::byte> pixels(64 * 64 * 4);
@@ -244,7 +244,7 @@ void CheckBack(AgcDriver::VulkanDevice& device, const Block& block) {
         }
         const auto after = CoreReplayCounted();
         Require(after[Mismatches] == before[Mismatches], "the back end replayed a draw that differs from the full path");
-        Require(after[Replayed] + after[Captured] + after[Unstorable] == before[Replayed] + before[Captured] + before[Unstorable] + 6, "the back end did not offer each draw to the replay");
+        Require(after[Replayed] + after[Captured] + after[Unstorable] + after[Refreshed] == before[Replayed] + before[Captured] + before[Unstorable] + before[Refreshed] + 6, "the back end did not offer each draw to the replay");
         Require(Pixels(state.color) == full, "the replaying back end and the full path drew different pixels");
     }
     AgcDriver::Core::SetBackReplayForTest(-1);
