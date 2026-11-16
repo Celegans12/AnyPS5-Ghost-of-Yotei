@@ -654,7 +654,9 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         DrawPipeline::NoteDrawKey(drawKey, shapeKey);
         if (tail.core.left != Core::FrontLeft::Entry && Core::Front::KeyDiagEnabled()) Core::Front::KeyDiag(queue, shapeKey, tail.core.left == Core::FrontLeft::NoPlan);
-        if (DrawFinisher::Busy()) {
+        if (DrawFinisher::OnFinisherThread()) {
+            DrawFinisher::Get().TakeTurn();
+        } else if (DrawFinisher::Busy()) {
             bool shapeMatters = false;
             if (DrawFinisher::Overlap() && drawDataHits()) {
                 DrawCacheAccess peek(*this);
@@ -955,7 +957,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             laterLookupsEver.fetch_add(1, std::memory_order_relaxed);
         }
         if (tail.resolveLater || tail.lookupShadow != nullptr) noteLaterLookup();
-        DrawFinisher::Get().Enqueue([this, tailHolder] {
+        auto finish = [this, tailHolder] {
             auto& job = *tailHolder;
             DrawPipeline::FollowEpoch(job.epoch);
             GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
@@ -995,12 +997,16 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 CaptureTrace::Log("draw-error submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, error.what());
                 throw std::runtime_error("draw at submission " + std::to_string(job.submissionSerial) + " offset " + std::to_string(job.packetOffset) + " (finished on the draw finisher): " + error.what());
             }
-        }, std::move(held));
+        };
+        if (DrawFinisher::OnFinisherThread()) finish();
+        else DrawFinisher::Get().Enqueue(std::move(finish), std::move(held));
         timing.Mark("draw_handed_off");
         return drawn();
     }
     noteFinisherHandOff(false);
-    if (DrawFinisher::Busy()) {
+    if (DrawFinisher::OnFinisherThread()) {
+        DrawFinisher::Get().TakeTurn();
+    } else if (DrawFinisher::Busy()) {
         DrawFinisher::Get().Drain();
         if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Kept, true);
     }
