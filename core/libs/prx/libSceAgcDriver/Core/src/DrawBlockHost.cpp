@@ -23,6 +23,7 @@
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace AgcDriver::Core {
 
@@ -128,6 +129,64 @@ std::shared_ptr<Graphics::Buffer> ringBuffer(const Graphics::Context& context, s
     return buffer;
 }
 
+struct TwinEntry {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    VkBuffer source = VK_NULL_HANDLE;
+    VkBuffer twin = VK_NULL_HANDLE;
+};
+
+struct TwinTable {
+    std::mutex mutex;
+    std::vector<TwinEntry> entries;
+};
+
+TwinTable& twins() {
+    static TwinTable* kept = new TwinTable();
+    return *kept;
+}
+
+struct TwinChunk {
+    std::shared_ptr<Graphics::Buffer> system;
+    std::shared_ptr<Graphics::Buffer> card;
+    ~TwinChunk() {
+        auto& table = twins();
+        const std::lock_guard lock(table.mutex);
+        std::erase_if(table.entries, [&](const TwinEntry& entry) { return entry.address == card->DeviceAddress(); });
+    }
+};
+
+bool twinChunk(const Graphics::Context& context, std::size_t bytes, RingChunk& chunk) {
+    auto card = Graphics::Buffer::WithinDeviceLocalHeadroom(context, bytes, RingUsage | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    if (card == nullptr || card->DeviceAddress() == 0) return false;
+    auto held = std::make_shared<TwinChunk>();
+    held->system = std::make_shared<Graphics::Buffer>(context, bytes, RingUsage | VK_BUFFER_USAGE_TRANSFER_SRC_BIT, SystemRing);
+    held->card = std::move(card);
+    {
+        auto& table = twins();
+        const std::lock_guard lock(table.mutex);
+        table.entries.push_back({held->card->DeviceAddress(), bytes, held->system->Handle(), held->card->Handle()});
+    }
+    chunk.bytes = held->system->Bytes().data();
+    chunk.deviceAddress = held->card->DeviceAddress();
+    chunk.owner = std::move(held);
+    return true;
+}
+
+void noteTwin(Graphics::Recorder& recorder, std::uint64_t deviceAddress, std::size_t bytes) {
+    TwinEntry found;
+    {
+        auto& table = twins();
+        const std::lock_guard lock(table.mutex);
+        for (const auto& entry : table.entries) {
+            if (deviceAddress < entry.address || deviceAddress - entry.address >= entry.bytes) continue;
+            found = entry;
+            break;
+        }
+    }
+    if (found.twin != VK_NULL_HANDLE) recorder.NoteTwinCopy(found.source, found.twin, deviceAddress - found.address, bytes);
+}
+
 }
 
 const char* DrawBlockRefusalName(DrawBlockRefusal refusal) {
@@ -172,8 +231,9 @@ RingChunk DrawBlockHost::allocate(void* context, std::size_t bytes) {
     auto& host = *static_cast<DrawBlockHost*>(context);
     if (!host.context.bufferDeviceAddress) return {};
     try {
-        auto buffer = ringBuffer(host.context, bytes);
         RingChunk chunk;
+        if (Graphics::Recorder::RingTwin() && twinChunk(host.context, bytes, chunk)) return chunk;
+        auto buffer = ringBuffer(host.context, bytes);
         chunk.bytes = buffer->Bytes().data();
         chunk.deviceAddress = buffer->DeviceAddress();
         chunk.owner = std::move(buffer);
@@ -272,6 +332,7 @@ std::byte* DrawBlockHost::Draw::take(std::size_t bytes, std::uint64_t& deviceAdd
     if (recorder != nullptr && bytes <= BlockRing::ChunkBytes && heldCount < held.size()) {
         const auto slice = host.ring.Take(bytes, ShaderRecompiler::BlockAbi::SectionAlignmentBytes);
         if (hold(slice)) {
+            if (Graphics::Recorder::RingTwin()) noteTwin(*recorder, slice.deviceAddress, bytes);
             ringed = true;
             deviceAddress = slice.deviceAddress;
             return slice.bytes;
