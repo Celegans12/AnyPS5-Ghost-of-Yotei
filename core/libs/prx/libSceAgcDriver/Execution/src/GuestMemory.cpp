@@ -1675,7 +1675,7 @@ std::uint64_t hotEpochs() {
     static const std::uint64_t span = [] {
         const char* text = std::getenv("APS5_EPOCH_SWEEP_SPAN");
         const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0;
-        return value != 0 ? value : std::uint64_t{64};
+        return value;
     }();
     return span;
 }
@@ -3125,7 +3125,7 @@ void BumpCollectEpoch() {
     if (!EpochSweeps()) return;
     epochSweep().serial.fetch_add(1, std::memory_order_relaxed);
     if (const auto hook = epochHook.load(std::memory_order_acquire)) hook(epoch);
-    else if (!proofThread) SweepHot(epoch);
+    else if (!proofThread && hotEpochs() != 0) SweepHot(epoch);
 }
 
 std::uint64_t ThreadCollectEpoch() {
@@ -3496,7 +3496,8 @@ void collectHotRuns(const WriteTracker& tracker, EpochSweepState& sweep, std::ui
     const auto* table = tracker.observationTable.load(std::memory_order_acquire);
     if (table == nullptr) return;
     const auto serial = askedSerial();
-    const auto horizon = serial > hotEpochs() ? serial - hotEpochs() : 1;
+    const auto span = std::max<std::uint64_t>(hotEpochs(), 1);
+    const auto horizon = serial > span ? serial - span : 1;
     const auto need = std::max(epoch, tracker.observationFloor.load(std::memory_order_acquire));
     constexpr std::size_t Groups = WriteTracker::LeafBlocks / WriteTracker::CoarseBlocks;
     std::uint64_t hot = 0;

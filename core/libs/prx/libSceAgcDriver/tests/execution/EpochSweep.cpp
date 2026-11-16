@@ -274,9 +274,11 @@ int main(int argc, char** argv) {
     try {
 #ifdef _WIN32
         _putenv_s("APS5_EPOCH_SWEEP", "1");
+        _putenv_s("APS5_EPOCH_SWEEP_SPAN", "64");
         if (argc == 2 && std::string(argv[1]) == "--verify") _putenv_s("APS5_VERIFY_EPOCH_SWEEP", "1");
 #else
         setenv("APS5_EPOCH_SWEEP", "1", 1);
+        setenv("APS5_EPOCH_SWEEP_SPAN", "64", 1);
         if (argc == 2 && std::string(argv[1]) == "--verify") setenv("APS5_VERIFY_EPOCH_SWEEP", "1", 1);
 #endif
         if (!GuestMemory::WriteWatched()) {
