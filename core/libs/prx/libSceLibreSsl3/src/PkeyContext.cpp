@@ -467,6 +467,7 @@
 
 #include "prx/libSceLibreSsl3/include/PkeyContext.hpp"
 
+#include <cerrno>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -611,19 +612,36 @@ bool SetupTemporaryBuffer(LibreSsl3RsaKeyContext* keyContext, const LibreSsl3Rsa
 }
 
 std::optional<int> CheckAutomaticLength(LibreSsl3PkeyContext* context, const LibreSsl3PkeyMethod* method,
-    const unsigned char* output, std::size_t* outputLength, const char* function) {
-    if (!outputLength) Reject(std::string(function) + " without an output length");
+    const unsigned char* output, std::size_t& outputLength) {
     if ((method->flags & LibreSsl3PkeyMethodFlagAutomaticArgumentLength) == 0) return std::nullopt;
     const auto keySize = static_cast<std::size_t>(EVP_PKEY_size_nid_postfix(static_cast<LibreSsl3EvpPkey*>(context->key)));
     if (!output) {
-        *outputLength = keySize;
+        outputLength = keySize;
         return 1;
     }
-    if (*outputLength < keySize) {
+    if (outputLength < keySize) {
         QueueEvpError(ReasonBufferTooSmall);
         return 0;
     }
     return std::nullopt;
+}
+
+template<typename TOperation>
+int WithOutputLength(std::size_t* outputLength, const char* function, TOperation operation) {
+    if (!outputLength) Reject(std::string(function) + " without an output length");
+    std::size_t length = 0;
+    int saved = errno;
+    const bool readable = GuestCopyIn_nid_no_patch(&length, outputLength, sizeof(length));
+    errno = saved;
+    if (!readable) Reject(std::string(function) + " with an unreadable output length");
+    const std::size_t incoming = length;
+    const int result = operation(length);
+    if (length == incoming) return result;
+    saved = errno;
+    const bool writable = GuestCopyOut_nid_no_patch(outputLength, &length, sizeof(length));
+    errno = saved;
+    if (!writable) Reject(std::string(function) + " with an unwritable output length");
+    return result;
 }
 
 int APS5_VABI RsaSign(LibreSsl3PkeyContext* context, unsigned char* signature, std::size_t* signatureLength,
@@ -1369,18 +1387,25 @@ bool IsNativePkeyMethod_nid_no_patch(const void* method) {
     return method == &RsaAsn1Method || method == &RsaPssAsn1Method;
 }
 
-extern "C" {
+namespace {
 
-LibreSsl3PkeyContext* APS5_VABI EVP_PKEY_CTX_new_nid_postfix(LibreSsl3EvpPkey* key, void* engine) {
-    (void) engine;
-    if (!key || (!key->method && key->type != LibreSsl3PkeyEc)) return nullptr;
-    const auto* asn1Method = static_cast<const LibreSsl3PkeyAsn1Method*>(key->method);
-    const auto* method = key->type == LibreSsl3PkeyEc ? &EcMethod :
-        FindNativePkeyMethod_nid_no_patch(asn1Method->keyType);
-    if (!method) {
-        QueueEvpError(ReasonUnsupportedAlgorithm);
-        return nullptr;
+constexpr std::int32_t PkeyCmac = 894;
+constexpr std::int32_t PkeyDh = 28;
+constexpr std::int32_t PkeyDsa = 116;
+constexpr std::int32_t PkeyEd25519 = 952;
+constexpr std::int32_t PkeyHkdf = 1022;
+constexpr std::int32_t PkeyTls1Prf = 1055;
+constexpr std::int32_t PkeyX25519 = 950;
+
+bool IsLibreSslOnlyPkeyMethod(int keyType) {
+    for (const auto supported : {PkeyCmac, PkeyDh, PkeyDsa, PkeyEd25519, PkeyHkdf, LibreSsl3PkeyHmac, PkeyTls1Prf,
+             PkeyX25519}) {
+        if (keyType == supported) return true;
     }
+    return false;
+}
+
+LibreSsl3PkeyContext* NewPkeyContext(LibreSsl3EvpPkey* key, const LibreSsl3PkeyMethod* method) {
     auto* context = static_cast<LibreSsl3PkeyContext*>(calloc_nid_postfix(1, sizeof(LibreSsl3PkeyContext)));
     if (!context) {
         QueueEvpError(AllocationFailure);
@@ -1394,6 +1419,35 @@ LibreSsl3PkeyContext* APS5_VABI EVP_PKEY_CTX_new_nid_postfix(LibreSsl3EvpPkey* k
         return nullptr;
     }
     return context;
+}
+
+} // namespace
+
+extern "C" {
+
+LibreSsl3PkeyContext* APS5_VABI EVP_PKEY_CTX_new_nid_postfix(LibreSsl3EvpPkey* key, void* engine) {
+    (void) engine;
+    if (!key || (!key->method && key->type != LibreSsl3PkeyEc)) return nullptr;
+    const auto* asn1Method = static_cast<const LibreSsl3PkeyAsn1Method*>(key->method);
+    const auto* method = key->type == LibreSsl3PkeyEc ? &EcMethod :
+        FindNativePkeyMethod_nid_no_patch(asn1Method->keyType);
+    if (!method) {
+        QueueEvpError(ReasonUnsupportedAlgorithm);
+        return nullptr;
+    }
+    return NewPkeyContext(key, method);
+}
+
+LibreSsl3PkeyContext* APS5_VABI EVP_PKEY_CTX_new_id_nid_postfix(int keyType, void* engine) {
+    (void) engine;
+    if (keyType == -1) return nullptr;
+    const auto* method = FindNativePkeyMethod_nid_no_patch(keyType);
+    if (!method) {
+        if (IsLibreSslOnlyPkeyMethod(keyType)) NotImplemented_nid_no_patch(__func__);
+        QueueEvpError(ReasonUnsupportedAlgorithm);
+        return nullptr;
+    }
+    return NewPkeyContext(nullptr, method);
 }
 
 int APS5_VABI EVP_PKEY_derive_init_nid_postfix(LibreSsl3PkeyContext* context) {
@@ -1511,10 +1565,10 @@ int APS5_VABI EVP_PKEY_encrypt_nid_postfix(LibreSsl3PkeyContext* context, unsign
         QueueEvpError(ReasonOperationNotInitialized);
         return -1;
     }
-    if (const auto result = CheckAutomaticLength(context, method, output, outputLength, "EVP_PKEY_encrypt")) {
-        return *result;
-    }
-    return method->encryption(context, output, outputLength, input, inputLength);
+    return WithOutputLength(outputLength, "EVP_PKEY_encrypt", [&](std::size_t& length) {
+        if (const auto result = CheckAutomaticLength(context, method, output, length)) return *result;
+        return method->encryption(context, output, &length, input, inputLength);
+    });
 }
 
 int APS5_VABI EVP_PKEY_decrypt_init_nid_postfix(LibreSsl3PkeyContext* context) {
@@ -1538,10 +1592,10 @@ int APS5_VABI EVP_PKEY_decrypt_nid_postfix(LibreSsl3PkeyContext* context, unsign
         QueueEvpError(ReasonOperationNotInitialized);
         return -1;
     }
-    if (const auto result = CheckAutomaticLength(context, method, output, outputLength, "EVP_PKEY_decrypt")) {
-        return *result;
-    }
-    return method->decryption(context, output, outputLength, input, inputLength);
+    return WithOutputLength(outputLength, "EVP_PKEY_decrypt", [&](std::size_t& length) {
+        if (const auto result = CheckAutomaticLength(context, method, output, length)) return *result;
+        return method->decryption(context, output, &length, input, inputLength);
+    });
 }
 
 int APS5_VABI EVP_PKEY_sign_init_nid_postfix(LibreSsl3PkeyContext* context) {
@@ -1568,10 +1622,10 @@ int APS5_VABI EVP_PKEY_sign_nid_postfix(LibreSsl3PkeyContext* context, unsigned 
         QueueEvpError(ReasonOperationNotInitialized);
         return -1;
     }
-    if (const auto result = CheckAutomaticLength(context, method, signature, signatureLength, "EVP_PKEY_sign")) {
-        return *result;
-    }
-    return method->signature(context, signature, signatureLength, content, contentLength);
+    return WithOutputLength(signatureLength, "EVP_PKEY_sign", [&](std::size_t& length) {
+        if (const auto result = CheckAutomaticLength(context, method, signature, length)) return *result;
+        return method->signature(context, signature, &length, content, contentLength);
+    });
 }
 
 int APS5_VABI EVP_PKEY_verify_init_nid_postfix(LibreSsl3PkeyContext* context) {
