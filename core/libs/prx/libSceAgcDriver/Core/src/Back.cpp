@@ -17,6 +17,7 @@
 #include <exception>
 #include <mutex>
 #include <optional>
+#include <vector>
 
 namespace AgcDriver::Core {
 
@@ -64,7 +65,7 @@ GuestReplayProof& replayProof() {
 }
 
 ReplayMeter& replayMeter() {
-    static ReplayMeter meter(16, 16, 12, 3);
+    static ReplayMeter meter(13, 13, 12, 0, 3);
     return meter;
 }
 
@@ -84,7 +85,11 @@ bool ReplayStats() {
     return enabled;
 }
 
-ReplayDraw ReplayDrawOf(const CoreDraw& record, const Graphics::State& graphics, std::span<const Graphics::CompiledShader> stages) {
+bool ReplaySampled(const FrontVariant& variant) {
+    return replayMeter().Sampled(variant.plan->id, variant.digest);
+}
+
+ReplayDraw ReplayDrawOf(const CoreDraw& record, std::span<const Graphics::CompiledShader> stages) {
     const auto& variant = *record.variant;
     ReplayDraw draw;
     draw.plan = variant.plan->id;
@@ -111,6 +116,21 @@ ReplayDraw ReplayDrawOf(const CoreDraw& record, const Graphics::State& graphics,
         }
     }
     draw.inputs = inputs;
+    auto drawn = ReplayMix(0x3f84d5b5b5470917ull, parameters.indexCount);
+    drawn = ReplayMix(drawn, parameters.indexSize | (static_cast<std::uint64_t>(parameters.indexed ? 1u : 0u) << 32u));
+    drawn = ReplayMix(drawn, parameters.instanceCount | (static_cast<std::uint64_t>(parameters.flags) << 32u));
+    drawn = ReplayMix(drawn, parameters.firstVertex | (static_cast<std::uint64_t>(parameters.firstInstance) << 32u));
+    draw.parameters = drawn;
+    return draw;
+}
+
+const ReplayDraw& ReplayTargetsOf(const FrontVariant& variant, const Graphics::State& graphics) {
+    static std::vector<ReplayDraw> cache(1024);
+    const auto plan = variant.plan->id;
+    auto& draw = cache[plan & 1023u];
+    if (plan != 0 && draw.plan == plan) return draw;
+    draw = ReplayDraw{};
+    draw.plan = plan;
     auto targets = ReplayMix(0xbe5466cf34e90c6cull, graphics.colors.size() | (graphics.hasColorTarget ? 1ull << 32u : 0u));
     const auto color = [&](const Graphics::ColorTarget& target) {
         targets = ReplayMix(targets, target.address);
@@ -136,25 +156,26 @@ ReplayDraw ReplayDrawOf(const CoreDraw& record, const Graphics::State& graphics,
         if (depth.htileAddress != 0) AddReplayMetadata(draw, depth.htileAddress, Graphics::HtileMetadataBytes(depth.extent));
     }
     draw.targets = targets;
-    auto drawn = ReplayMix(0x3f84d5b5b5470917ull, parameters.indexCount);
-    drawn = ReplayMix(drawn, parameters.indexSize | (static_cast<std::uint64_t>(parameters.indexed ? 1u : 0u) << 32u));
-    drawn = ReplayMix(drawn, parameters.instanceCount | (static_cast<std::uint64_t>(parameters.flags) << 32u));
-    drawn = ReplayMix(drawn, parameters.firstVertex | (static_cast<std::uint64_t>(parameters.firstInstance) << 32u));
-    draw.parameters = drawn;
     return draw;
 }
 
-bool ReplayFilled(const ReplayDraw& draw) {
-    return replayMeter().Filled(draw, replayProof());
+bool ReplayFilled(const ReplayDraw& targets) {
+    return replayMeter().Filled(targets, replayProof());
 }
 
-void NoteReplay(const ReplayDraw& draw, bool fallback, bool filled, bool timed, std::uint64_t spentNanoseconds) {
+void NoteReplay(ReplayDraw* draw, const ReplayDraw& targets, bool fallback, bool filled, bool timed, std::uint64_t spentNanoseconds) {
     auto& meter = replayMeter();
     auto& proof = replayProof();
     const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    static_cast<void>(meter.Commit(draw, fallback, filled, proof));
+    if (draw != nullptr) {
+        draw->targets = targets.targets;
+        static_cast<void>(meter.Commit(*draw, fallback, filled, proof));
+    } else {
+        meter.NoteUnsampled();
+    }
+    meter.NoteTargets(targets, proof.Generation());
     if (timed) meter.NoteCost(spentNanoseconds + nanosecondsSince(started));
-    if ((meter.Counted().draws & 63u) != 0) return;
+    if (((meter.Counted().draws + meter.Counted().unsampled) & 63u) != 0) return;
     static std::atomic<std::int64_t> lastReport{0};
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = lastReport.load(std::memory_order_relaxed);
@@ -221,13 +242,14 @@ void Driver::commitCoreDraw(const std::shared_ptr<Core::CoreDraw>& record) {
     auto& variant = *record->variant;
     const auto stages = Core::PrepareBack(*record);
     const auto& graphics = variant.plan->decode->state;
+    const bool replayOn = Core::ReplayStats();
     std::optional<Core::ReplayDraw> replay;
     bool replayTimed = false;
     std::uint64_t replaySpent = 0;
-    if (Core::ReplayStats()) {
+    if (replayOn) {
         replayTimed = Core::ReplayTimedNext();
         const auto replayStarted = replayTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        replay.emplace(Core::ReplayDrawOf(*record, graphics, stages));
+        if (Core::ReplaySampled(variant)) replay.emplace(Core::ReplayDrawOf(*record, stages));
         if (replayTimed) replaySpent = Core::nanosecondsSince(replayStarted);
     }
     bool restarted = false;
@@ -244,16 +266,21 @@ void Driver::commitCoreDraw(const std::shared_ptr<Core::CoreDraw>& record) {
         } submitDue{*this, localDevice};
         recordLabelsForPacket(localDevice.get(), record->queue);
         noteDrawWriters(stages, record->queue);
-        const auto fillStarted = replayTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const bool filled = replay.has_value() && Core::ReplayFilled(*replay);
-        if (replayTimed) replaySpent += Core::nanosecondsSince(fillStarted);
+        const Core::ReplayDraw* replayTargets = nullptr;
+        bool filled = false;
+        if (replayOn) {
+            const auto fillStarted = replayTimed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            replayTargets = &Core::ReplayTargetsOf(variant, graphics);
+            filled = replay.has_value() && Core::ReplayFilled(*replayTargets);
+            if (replayTimed) replaySpent += Core::nanosecondsSince(fillStarted);
+        }
         if (!Core::RecordBack(*localDevice, graphics, record->parameters, stages, variant.recipe)) {
             restarted = true;
             variant.stale.store(true, std::memory_order_release);
             VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
             localDevice->Draw(graphics, record->parameters, stages, {}, nullptr, nullptr, variant.shape);
         }
-        if (replay.has_value()) Core::NoteReplay(*replay, restarted, filled, replayTimed, replaySpent);
+        if (replayTargets != nullptr) Core::NoteReplay(replay.has_value() ? &*replay : nullptr, *replayTargets, restarted, filled, replayTimed, replaySpent);
         Graphics::NoteDrawSite(variant.shape);
     }
     Core::Front::NoteCommitted(restarted, static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()));

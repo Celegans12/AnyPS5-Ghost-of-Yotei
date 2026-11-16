@@ -128,7 +128,9 @@ std::uint64_t Miss(const ReplayMeter& meter, ReplayTokenMiss miss) {
 
 ReplayCause Run(ReplayMeter& meter, FakeProof& proof, const ReplayDraw& draw, bool fallback = false) {
     const bool filled = meter.Filled(draw, proof);
-    return meter.Commit(draw, fallback, filled, proof);
+    const auto cause = meter.Commit(draw, fallback, filled, proof);
+    meter.NoteTargets(draw, proof.Generation());
+    return cause;
 }
 
 void TestSameKey() {
@@ -329,8 +331,8 @@ void TestReport() {
     static_cast<void>(Run(meter, proof, draw));
     for (int index = 0; index < 3; ++index) static_cast<void>(Run(meter, proof, draw));
     const auto first = meter.TakeReport(10, 8, false, 5.0);
-    Expect(Contains(first, "[core-replay] (cumulative) 4 draws metered at the core commit, 3 replayable (75.0 %)"), "report heads with the draws and the replayable share");
-    Expect(Contains(first, "front: 10 draws looked at, 8 committed by the core (80.0 %), replayable per draw looked at 30.0 %"), "report gives the front's share");
+    Expect(Contains(first, "[core-replay] (cumulative) 4 draws committed by the core, 4 metered (1 in 1 variants by key hash, 65536-slot tables), 3 replayable (75.0 % of the metered)"), "report heads with the draws and the replayable share");
+    Expect(Contains(first, "front: 10 draws looked at, 8 committed by the core (80.0 %), replayable per draw looked at 60.0 %"), "report scales the share to the draws the front looked at");
     Expect(Contains(first, "last window 5.0 s: 3 of 4 metered draws replayable (75.0 %), front 10 draws looked at, 8 committed by the core"), "first window covers everything");
     Expect(Contains(first, "write tracker at the 64 KiB block grain (T1 off)"), "report names the proof");
     Expect(Contains(first, "meter cost 0 ns per metered draw (0 timed)"), "report gives no cost before any timed draw");
@@ -372,6 +374,38 @@ void TestSampling() {
     Expect(Contains(report, "not replayable: new 500,"), "report keeps the exact causes");
 }
 
+void TestVariantSampling() {
+    ReplayMeter meter(13, 13, 12, 0, 3);
+    FakeProof proof;
+    std::uint64_t sampled = 0;
+    constexpr std::uint64_t Variants = 4000;
+    for (std::uint64_t plan = 1; plan <= Variants; ++plan) {
+        const auto draw = Draw(plan, 0x80000 + plan * 64);
+        if (!meter.Sampled(draw.plan, draw.digest)) {
+            meter.NoteUnsampled();
+            meter.NoteTargets(draw, proof.Generation());
+            continue;
+        }
+        ++sampled;
+        static_cast<void>(Run(meter, proof, draw));
+        Expect(meter.Sampled(draw.plan, draw.digest), "a variant stays sampled");
+        Expect(Run(meter, proof, draw) != ReplayCause::Unproved, "every same-key draw of a sampled variant is proved");
+    }
+    Expect(sampled * 16 > Variants && sampled * 4 < Variants, "about one variant in eight is sampled");
+    Expect(meter.Counted().unsampled == Variants - sampled, "unsampled draws counted");
+    const auto report = meter.TakeReport(10000, 10000, false, 1.0);
+    Expect(Contains(report, "1 in 8 variants by key hash, 8192-slot tables"), "report names the variant sample and the table size");
+    std::uint64_t unsampledPlan = Variants + 1;
+    while (meter.Sampled(Draw(unsampledPlan).plan, Draw(unsampledPlan).digest)) ++unsampledPlan;
+    const auto other = Draw(unsampledPlan, 0x1);
+    std::uint64_t sampledPlan = 1;
+    while (!meter.Sampled(Draw(sampledPlan).plan, Draw(sampledPlan).digest)) ++sampledPlan;
+    const auto metered = Draw(sampledPlan, 0x80000 + sampledPlan * 64);
+    proof.Store(DccAddress, 64);
+    meter.NoteTargets(other, proof.Generation());
+    Expect(!meter.Filled(metered, proof), "an unsampled draw on the target saw the fill first");
+}
+
 void TestCost() {
     ReplayMeter meter;
     FakeProof proof;
@@ -405,6 +439,7 @@ int main() {
     TestNames();
     TestReport();
     TestSampling();
+    TestVariantSampling();
     TestCost();
     if (failures != 0) {
         std::fprintf(stderr, "%d failure(s)\n", failures);

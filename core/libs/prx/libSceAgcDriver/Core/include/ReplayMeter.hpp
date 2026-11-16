@@ -60,6 +60,7 @@ struct ReplayDraw {
 
 struct ReplayCounts {
     std::uint64_t draws = 0;
+    std::uint64_t unsampled = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(ReplayCause::Count)> causes{};
     std::array<std::uint64_t, static_cast<std::size_t>(ReplayTokenMiss::Count)> tokenMisses{};
     std::uint64_t sameKey = 0;
@@ -78,12 +79,15 @@ void AddReplayMetadata(ReplayDraw& draw, std::uint64_t address, std::uint64_t by
 
 class ReplayMeter {
 public:
-    explicit ReplayMeter(std::uint32_t replayBits = 16, std::uint32_t variantBits = 16, std::uint32_t targetBits = 12, std::uint32_t proofShift = 0);
+    explicit ReplayMeter(std::uint32_t replayBits = 16, std::uint32_t variantBits = 16, std::uint32_t targetBits = 12, std::uint32_t proofShift = 0, std::uint32_t variantShift = 0);
     ~ReplayMeter();
     ReplayMeter(const ReplayMeter&) = delete;
     ReplayMeter& operator=(const ReplayMeter&) = delete;
-    [[nodiscard]] bool Filled(const ReplayDraw& draw, ReplayProof& proof) const;
+    [[nodiscard]] bool Sampled(std::uint64_t plan, const std::array<std::uint64_t, 2>& digest) const;
+    [[nodiscard]] bool Filled(const ReplayDraw& targets, ReplayProof& proof) const;
     ReplayCause Commit(const ReplayDraw& draw, bool fallback, bool filled, ReplayProof& proof);
+    void NoteUnsampled();
+    void NoteTargets(const ReplayDraw& targets, std::uint64_t generation);
     void NoteCost(std::uint64_t nanoseconds);
     [[nodiscard]] const ReplayCounts& Counted() const;
     [[nodiscard]] std::string TakeReport(std::uint64_t frontDraws, std::uint64_t frontCommitted, bool tokensLive, double windowSeconds);
