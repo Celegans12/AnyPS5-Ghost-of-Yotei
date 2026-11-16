@@ -4994,8 +4994,52 @@ bool ShaderResources::takeProof(const DrawProofStamp& stamp) {
     return true;
 }
 
+namespace {
+
+bool ProofsPastImports() {
+    static const bool enabled = std::getenv("APS5_PROOFS_PAST_IMPORTS") != nullptr;
+    return enabled;
+}
+
+enum class StructureMove : std::size_t { Unwatch, Forget, Imports, Audited, Passed, Count };
+
+void noteStructureMove(StructureMove move) {
+    constexpr auto Kinds = static_cast<std::size_t>(StructureMove::Count);
+    static std::array<std::atomic<std::uint64_t>, Kinds> counts{};
+    static std::atomic<std::uint64_t> notes{0};
+    static std::atomic<std::int64_t> lastReport{0};
+    static const bool reported = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    counts[static_cast<std::size_t>(move)].fetch_add(1, std::memory_order_relaxed);
+    if (!reported || (notes.fetch_add(1, std::memory_order_relaxed) & 255u) != 0) return;
+    const auto nowMs = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+    auto last = lastReport.load(std::memory_order_relaxed);
+    if (nowMs - last < 10000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
+    static std::array<std::atomic<std::uint64_t>, Kinds> printed{};
+    std::array<unsigned long long, Kinds> since{};
+    for (std::size_t kind = 0; kind < Kinds; ++kind) {
+        const auto total = counts[kind].load(std::memory_order_relaxed);
+        since[kind] = static_cast<unsigned long long>(total - printed[kind].exchange(total, std::memory_order_relaxed));
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[proof-structure] (10 s): held template proofs met by a move of the unwatch serial %llu, by a forget in progress %llu, by a move of the host import set alone %llu; of the last, %llu left to the import audit and %llu kept%c", since[0], since[1], since[2], since[3], since[4], 10);
+}
+
+}
+
 DrawProofMiss ShaderResources::proofMiss(const DrawProofStamp& now) const {
-    if (const auto miss = DrawProofStampMiss(provedStamp, now); miss != DrawProofMiss::None) return miss;
+    if (const auto miss = DrawProofStampMiss(provedStamp, now); miss != DrawProofMiss::None) {
+        if (miss != DrawProofMiss::Structure) return miss;
+        if (now.unwatch != provedStamp.unwatch || (now.forget & 1u) != 0) {
+            noteStructureMove(now.unwatch != provedStamp.unwatch ? StructureMove::Unwatch : StructureMove::Forget);
+            return miss;
+        }
+        noteStructureMove(StructureMove::Imports);
+        if (!ProofsPastImports()) return miss;
+        if (TemplateAuditDue(lastFullWalk) && walkImportGeneration != HostImportSetGeneration()) {
+            noteStructureMove(StructureMove::Audited);
+            return miss;
+        }
+        noteStructureMove(StructureMove::Passed);
+    }
     if (provedStamp.versioned && AuditEveryInterval() && TemplateAuditDue(lastFullWalk)) return DrawProofMiss::Audit;
     for (const auto& texture : textures) {
         if (texture != nullptr && texture->Released()) return DrawProofMiss::Images;
