@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DispatchIoTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchLater.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -16,13 +17,16 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include "ThreadOwned.hpp"
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <optional>
 #include <stdexcept>
 #include <utility>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -81,6 +85,135 @@ bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, c
     return true;
 }
 
+struct LateDispatch {
+    Registers shader;
+    std::array<std::uint32_t, 5> packet{};
+    Submission handed{};
+    std::shared_ptr<const ShaderSnapshot> registeredShader;
+    std::uint64_t epoch = 0;
+    std::shared_ptr<ShaderMemory> shadowMemory;
+    std::vector<ShaderRecompiler::MemoryRegion> shadow;
+    bool shadowed = false;
+    bool compared = false;
+};
+
+LateDispatch*& RunningLate() {
+    static thread_local LateDispatch* running = nullptr;
+    return running;
+}
+
+std::atomic<std::uint64_t> laterHanded{0}, laterKept{0}, laterKeptKernels{0}, laterQueued{0}, laterInlined{0}, laterVerified{0}, laterDiffering{0}, laterUnverified{0}, laterNs{0};
+
+bool LaterSwitches() {
+    static const bool allowed = DispatchLater() && std::getenv("APS5_PROFILE_DRAW") == nullptr && std::getenv("APS5_NO_DISPATCH_CACHE") == nullptr && std::getenv("APS5_PROBE_DISPATCH") == nullptr && std::getenv("APS5_TRACE_DISPATCH_CACHE") == nullptr && std::getenv("APS5_DUMP_SHADERS") == nullptr && std::getenv("APS5_NO_DISPATCH_KEY_HYGIENE") == nullptr;
+    return allowed;
+}
+
+void ReportDispatchLater() {
+    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!stats) return;
+    static std::atomic<std::int64_t> reportedAt{0};
+    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
+    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
+    static DispatchLaterCounts reported;
+    const auto counted = DispatchLaterCounted();
+    const auto since = [](std::uint64_t now, std::uint64_t before) { return static_cast<unsigned long long>(now - before); };
+    const auto handed = counted.handed - reported.handed;
+    AgcDriver::ProfilePrint_nid_no_patch("[dispatch-later] (10 s): %llu direct dispatches handed to the draw finisher with their lookup and capture, %llu kept on the worker (%llu of them by a kernel the worker handles itself); on the finisher %llu queued as commit items, %llu dispatched there after a drain of the committer, %.2f ms resolving (%.1f us each); %llu captures repeated on the worker (APS5_VERIFY_DISPATCH_LATER), %llu differing, %llu not repeated\n",
+                                         static_cast<unsigned long long>(handed), since(counted.kept, reported.kept), since(counted.keptKernels, reported.keptKernels), since(counted.queued, reported.queued), since(counted.inlined, reported.inlined),
+                                         static_cast<double>(counted.finisherNs - reported.finisherNs) / 1e6, handed != 0 ? static_cast<double>(counted.finisherNs - reported.finisherNs) / 1e3 / static_cast<double>(handed) : 0.0,
+                                         since(counted.verified, reported.verified), since(counted.differing, reported.differing), since(counted.unverified, reported.unverified));
+    reported = counted;
+}
+
+bool InCodeOf(const ShaderRecompiler::MemoryRegion& region, const ShaderSnapshot& code) {
+    const auto address = region.guestAddress;
+    return (address >= code.codeAddress && address < code.codeAddress + code.code.size() * sizeof(std::uint32_t)) || (!code.header.empty() && address >= code.headerAddress && address < code.headerAddress + code.header.size());
+}
+
+struct ByteRun {
+    std::uint64_t begin = 0;
+    std::vector<std::byte> bytes;
+};
+
+std::vector<ByteRun> ByteRuns(std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderSnapshot& code) {
+    std::vector<const ShaderRecompiler::MemoryRegion*> sorted;
+    sorted.reserve(regions.size());
+    for (const auto& region : regions) {
+        if (!region.bytes.empty() && !InCodeOf(region, code)) sorted.push_back(&region);
+    }
+    std::sort(sorted.begin(), sorted.end(), [](const auto* first, const auto* second) { return first->guestAddress < second->guestAddress; });
+    std::vector<ByteRun> runs;
+    for (const auto* region : sorted) {
+        if (runs.empty() || region->guestAddress > runs.back().begin + runs.back().bytes.size()) {
+            runs.push_back({region->guestAddress, std::vector<std::byte>(region->bytes.begin(), region->bytes.end())});
+            continue;
+        }
+        auto& run = runs.back();
+        const auto offset = static_cast<std::size_t>(region->guestAddress - run.begin);
+        if (offset + region->bytes.size() > run.bytes.size()) run.bytes.insert(run.bytes.end(), region->bytes.begin() + static_cast<std::ptrdiff_t>(run.bytes.size() - offset), region->bytes.end());
+    }
+    return runs;
+}
+
+struct ShadowMismatch {
+    std::uint64_t address = 0;
+    bool covered = false;
+};
+
+std::optional<ShadowMismatch> ShadowDiffers(const std::vector<ByteRun>& shadow, const std::vector<ByteRun>& seen) {
+    for (const auto& run : shadow) {
+        for (std::size_t at = 0; at < run.bytes.size();) {
+            const auto address = run.begin + at;
+            auto found = std::upper_bound(seen.begin(), seen.end(), address, [](std::uint64_t value, const ByteRun& candidate) { return value < candidate.begin; });
+            if (found == seen.begin()) return ShadowMismatch{address, false};
+            --found;
+            const auto offset = static_cast<std::size_t>(address - found->begin);
+            if (offset >= found->bytes.size()) return ShadowMismatch{address, false};
+            const auto length = std::min(run.bytes.size() - at, found->bytes.size() - offset);
+            for (std::size_t i = 0; i < length; ++i) {
+                if (run.bytes[at + i] != found->bytes[offset + i]) return ShadowMismatch{address + i, true};
+            }
+            at += length;
+        }
+    }
+    return std::nullopt;
+}
+
+void CompareShadow(LateDispatch& late, std::span<const ShaderRecompiler::MemoryRegion> captured, const ShaderSnapshot& code, std::uint64_t address) {
+    if (!late.shadowed || std::exchange(late.compared, true)) return;
+    laterVerified.fetch_add(1, std::memory_order_relaxed);
+    const auto mismatch = ShadowDiffers(ByteRuns(late.shadow, code), ByteRuns(captured, code));
+    if (!mismatch) return;
+    static std::atomic<std::uint64_t> printed{0};
+    laterDiffering.fetch_add(1, std::memory_order_relaxed);
+    if (printed.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[dispatch-later] verify: the dispatch of compute shader 0x%llx at submission %llu read 0x%llx on the worker, which the draw finisher %s\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(late.handed.serial), static_cast<unsigned long long>(mismatch->address), mismatch->covered ? "read with another value" : "did not read");
+}
+
+}
+
+bool DispatchLater() {
+    static const bool enabled = std::getenv("APS5_DISPATCH_LATER") != nullptr || VerifyDispatchLater();
+    return enabled;
+}
+
+bool VerifyDispatchLater() {
+    static const bool enabled = std::getenv("APS5_VERIFY_DISPATCH_LATER") != nullptr;
+    return enabled;
+}
+
+DispatchLaterCounts DispatchLaterCounted() {
+    DispatchLaterCounts counts;
+    counts.handed = laterHanded.load(std::memory_order_relaxed);
+    counts.kept = laterKept.load(std::memory_order_relaxed);
+    counts.keptKernels = laterKeptKernels.load(std::memory_order_relaxed);
+    counts.queued = laterQueued.load(std::memory_order_relaxed);
+    counts.inlined = laterInlined.load(std::memory_order_relaxed);
+    counts.verified = laterVerified.load(std::memory_order_relaxed);
+    counts.differing = laterDiffering.load(std::memory_order_relaxed);
+    counts.unverified = laterUnverified.load(std::memory_order_relaxed);
+    counts.finisherNs = laterNs.load(std::memory_order_relaxed);
+    return counts;
 }
 
 bool Driver::pipelineDispatch() {
@@ -89,9 +222,11 @@ bool Driver::pipelineDispatch() {
 
 void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::uint64_t indirectArguments) {
     PerformanceTimer timing("Driver.Dispatch");
+    auto* const late = RunningLate();
+    const bool direct = indirectArguments == 0;
     const auto address = (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20c)) << 8u) | (static_cast<std::uint64_t>(readRegister(queue.shader, 0x20d) & 0xffu) << 40u);
     if (SkippedShader(address) || RefusedDispatch(address)) return;
-    auto registeredShader = RegisteredProgram(*submission.shaders, address, {0});
+    auto registeredShader = late != nullptr ? late->registeredShader : RegisteredProgram(*submission.shaders, address, {0});
     if (!registeredShader) registeredShader = ReadRawShader(address);
     const auto& snapshot = *registeredShader;
     require(snapshot.type == 0, "compute program refers to a non-compute shader");
@@ -118,7 +253,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     ResolvedDispatch ahead;
     bool fromAhead = false;
     auto& groupStats = groupCaptureStats();
-    if (!resolving) {
+    if (!resolving && late == nullptr) {
         auto& parked = resolvedAhead();
         if (const auto found = parked.find(currentPacketOffset()); found != parked.end()) {
             ahead = std::move(found->second);
@@ -145,6 +280,40 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
     }
     const bool pipelineCandidate = !resolving && !fromAhead && DispatchItemsEnabled() && DrawPipeline::Active() && indirectArguments == 0 && deferredLabels().labels.empty() && !matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesTableCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) && !MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute);
     const bool partialLastGroup = partialGroups != std::array<std::uint32_t, 3>{};
+    const bool laterCandidate = late == nullptr && direct && submission.queue == 0 && DispatchLater();
+    const bool handLater = laterCandidate && pipelineCandidate && queue.predication.operation == 0 && LaterSwitches() && DispatchMissItemsEnabled() && !stampValidate() && !verifyDataHits() && DrawFinisher::Enabled() && [&] {
+        const auto program = std::span(snapshot.code).subspan(codeOffset);
+        bool kernel = static_cast<bool>(Graphics::MatchMultisampledSingleClear(program, userData, compute.numThreads));
+        kernel = kernel || ((packet[4] & 0x20u) == 0 && static_cast<bool>(Graphics::MatchMemoryValueFill(program, userData, compute.numThreads, {packet[1], packet[2], packet[3]})));
+        kernel = kernel || (!partialLastGroup && (MatchDwordPatternFill(packet, program, userData, compute) || MatchConstantDwordFill(packet, program, userData, compute) || MatchClampedGlobalFill(packet, program, userData, compute) || MatchMemoryValueBufferFill(packet, program, userData, compute) || matchesFillKernel(program, userData, compute)));
+        kernel = kernel || Graphics::HtileDepthClearAddress(program, userData, compute.numThreads) != 0 || static_cast<bool>(Graphics::MatchHtileBufferMaskClear(program, userData, compute, packet, indirectArguments));
+        if (!kernel && !partialLastGroup) {
+            auto shaped = compute;
+            std::array<std::uint32_t, 3> groups{packet[1], packet[2], packet[3]};
+            if ((packet[4] & 0x20u) != 0) {
+                for (std::uint32_t axis = 0; axis < 3; ++axis) {
+                    if (packet[1 + axis] % compute.numThreads[axis] != 0) shaped.partialThreads = {packet[1], packet[2], packet[3]};
+                    groups[axis] = ThreadDimensionGroups(groups[axis], std::max(readRegister(queue.shader, 0x207 + axis) & 0xffffu, 1u));
+                }
+            }
+            kernel = static_cast<bool>(MatchSgprPatternFill(packet, program, userData, shaped));
+            if (!kernel) {
+                if (const auto clear = Graphics::MatchStorageImageClear(program, userData, shaped, groups)) {
+                    const auto clearAddress = Graphics::StorageImageClearAddress(*clear);
+                    kernel = clearAddress != 0 && Graphics::DepthSurfaceAt(clearAddress);
+                }
+            }
+        }
+        if (kernel) laterKeptKernels.fetch_add(1, std::memory_order_relaxed);
+        return !kernel;
+    }();
+    if (laterCandidate && !handLater) {
+        laterKept.fetch_add(1, std::memory_order_relaxed);
+        if (DrawFinisher::Busy() && !DrawFinisher::OnFinisherThread()) {
+            DrawFinisher::Get().Drain();
+            if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Packet, true);
+        }
+    }
     std::optional<std::pair<std::uint64_t, std::size_t>> htileClearCompletion;
     Graphics::HtileMaskClear htileMask;
     if (resolving) {
@@ -152,6 +321,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         if (!partialLastGroup && matchesFillKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute)) return;
         if (!partialLastGroup && indirectArguments == 0 && (MatchDwordPatternFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchConstantDwordFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchClampedGlobalFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchMemoryValueBufferFill(packet, std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
         if (!partialLastGroup && indirectArguments == 0 && (matchesCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesStreamCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesIndexedCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute) || MatchesTableCopyKernel(std::span(snapshot.code).subspan(codeOffset), userData, compute))) return;
+    } else if (late != nullptr || handLater) {
+        if (DrawPipeline::Active() && !pipelineCandidate) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Packet, 0x15);
     } else {
         if (indirectArguments == 0 && Graphics::TakeMultisampledSingleClear(std::span(snapshot.code).subspan(codeOffset), userData, compute.numThreads)) {
             pendingDispatchPhases().outcome = DispatchOutcome::FillHle;
@@ -195,12 +366,72 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         for (std::uint32_t axis = 0; axis < 3; ++axis) threadGroup[axis] = std::max(readRegister(queue.shader, 0x207 + axis) & 0xffffu, 1u);
         compute.partialThreads = {~0u, ~0u, ~0u};
     }
-    ShaderRecompiler::RecompileRequest request{
-        {ShaderRecompiler::ShaderStage::Compute, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header},
-        {(packet[4] & 0x8000u) != 0 ? 32u : 64u, 0, userData, compute, std::nullopt, std::nullopt, memory, DispatchFloatMode(snapshot, queue.shader)},
-        localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u),
-        {0, 0, 0, threadGroup != std::array<std::uint32_t, 3>{} ? 0u : 128u}
+    const auto makeRequest = [&] {
+        return ShaderRecompiler::RecompileRequest{
+            {ShaderRecompiler::ShaderStage::Compute, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header},
+            {(packet[4] & 0x8000u) != 0 ? 32u : 64u, 0, userData, compute, std::nullopt, std::nullopt, memory, DispatchFloatMode(snapshot, queue.shader)},
+            localDevice->ComputeTarget((packet[4] & 0x8000u) != 0 ? 32u : 64u),
+            {0, 0, 0, threadGroup != std::array<std::uint32_t, 3>{} ? 0u : 128u}
+        };
     };
+    if (handLater) {
+        auto handed = std::make_shared<LateDispatch>();
+        handed->shader = queue.shader;
+        std::copy_n(packet.begin(), std::min(packet.size(), handed->packet.size()), handed->packet.begin());
+        handed->handed.serial = submission.serial;
+        handed->handed.queue = submission.queue;
+        handed->handed.shaders = submission.shaders;
+        handed->registeredShader = registeredShader;
+        handed->epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        if (VerifyDispatchLater()) {
+            const auto shadowCapture = [&] {
+                auto shadowRequest = makeRequest();
+                handed->shadowMemory = std::make_shared<ShaderMemory>(memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
+                auto invocation = InvocationFor(snapshot, codeOffset, shadowRequest);
+                const SampledReadScope sampling(evidenceReads);
+                static_cast<void>(CaptureInvocation(*handed->shadowMemory, snapshot, codeOffset, shadowRequest, invocation));
+                handed->shadow = handed->shadowMemory->Regions();
+            };
+            try {
+                shadowCapture();
+                if (std::any_of(handed->shadow.begin(), handed->shadow.end(), [&](const auto& region) { return !region.bytes.empty() && !InCodeOf(region, snapshot) && DrawPipeline::Queue0().Overlaps(region.guestAddress, region.bytes.size()); })) {
+                    DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Capture, 0x15);
+                    shadowCapture();
+                }
+                handed->shadowed = true;
+            } catch (const std::exception&) {
+                laterUnverified.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        laterHanded.fetch_add(1, std::memory_order_relaxed);
+        DrawFinisher::Get().Enqueue([this, handed] {
+            const struct Spent {
+                std::chrono::steady_clock::time_point from = std::chrono::steady_clock::now();
+                ~Spent() { laterNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count()), std::memory_order_relaxed); }
+            } spent;
+            DrawPipeline::FollowEpoch(handed->epoch);
+            GuestMemory::SetCurrentPacket(0x15, handed->handed.queue);
+            struct LateScope {
+                bool active;
+                LateDispatch* outer;
+                explicit LateScope(LateDispatch* running) : active(std::exchange(DrawPipeline::Active(), true)), outer(std::exchange(RunningLate(), running)) {}
+                ~LateScope() {
+                    DrawPipeline::Active() = active;
+                    RunningLate() = outer;
+                }
+                LateScope(const LateScope&) = delete;
+                LateScope& operator=(const LateScope&) = delete;
+            } scope{handed.get()};
+            static thread_local QueueState* scratchSlot = nullptr;
+            auto& scratch = ShaderRecompiler::ThreadOwned(scratchSlot);
+            scratch.shader = std::move(handed->shader);
+            dispatch(scratch, handed->packet, handed->handed);
+        });
+        ReportDispatchLater();
+        timing.Mark("dispatch_handed_off");
+        return;
+    }
+    auto request = makeRequest();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static std::atomic<double> captureMs{0}, keyMs{0}, recompileMs{0}, deviceMs{0};
     static std::atomic<std::uint64_t> cacheHits{0};
@@ -485,6 +716,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         return;
     }
+    if (late != nullptr) CompareShadow(*late, captured, snapshot, address);
     if (verifyDataHits() && dataHit) verifyDataHit(snapshot, codeOffset, request, memory, address, *keepVariant, liveWords, *compiledResult);
 
     if (recordQueuedLabelsAfterCapture(submission.queue, captured)) {
@@ -574,9 +806,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         const auto recipe = keepVariant != nullptr ? keepVariant->recipe.load(std::memory_order_acquire) : nullptr;
         const auto attach = stampValidate() ? nullptr : keepVariant != nullptr ? keepVariant : attachVariant;
         const std::uint64_t prepareThreads = lateItem || recipeLess ? dispatchThreads : 0;
-        const auto epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        const auto epoch = late != nullptr ? late->epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         const auto queueId = submission.queue;
         itemCommits.fetch_add(1, std::memory_order_relaxed);
+        if (late != nullptr) laterQueued.fetch_add(1, std::memory_order_relaxed);
         DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Dispatch, [this, ioHeader = ioTrace ? ioTrace->Detach() : std::string{}, localDevice = std::move(localDevice), result = compiledResult, capture, registeredViews, snapshots = std::move(snapshots), liveWords = std::move(liveWords), groups, address, queueId, recipe, keepVariant, attach, prepareThreads, dataHit, epoch, htileClearCompletion, htileMask] {
             DrawPipeline::FollowEpoch(epoch);
             std::optional<DispatchIoTrace> commitTrace;
@@ -748,6 +981,7 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         break;
     }
     phaseTiming.Phase(PhaseDevice);
+    if (late != nullptr) laterInlined.fetch_add(1, std::memory_order_relaxed);
     if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
     if (profile) deviceMs.fetch_add(phaseTiming.Elapsed(), std::memory_order_relaxed);
     phaseTiming.Phase(PhaseTail);
