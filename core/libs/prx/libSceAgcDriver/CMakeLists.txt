@@ -1166,7 +1166,7 @@ endif()
 
 target_sources(agc_driver_scattered_runs_tests PRIVATE tests/AllocationFailure.cpp)
 if(BUILD_TESTING)
-    foreach(agcClassicPathTest IN ITEMS agc_driver_draw_cache_relocation_draw_pipeline agc_driver_draw_cache_relocation_plan_verify agc_driver_draw_shape_user_words_draw_pipeline agc_driver_draw_shape_user_words_plan_verify agc_driver_draw_shape_user_words_frozen_buffer_words_draw_pipeline agc_driver_draw_shape_user_words_sites_finisher agc_driver_lazy_resolved_abi agc_driver_lazy_resolved_abi_switch_set agc_driver_prepared_shaders_abi_deferred_undecodable_state)
+    foreach(agcClassicPathTest IN ITEMS agc_driver_draw_cache_relocation_draw_pipeline agc_driver_draw_cache_relocation_plan_verify agc_driver_draw_shape_user_words_draw_pipeline agc_driver_draw_shape_user_words_plan_verify agc_driver_draw_shape_user_words_frozen_buffer_words_draw_pipeline agc_driver_draw_shape_user_words_sites_finisher)
         if(TEST ${agcClassicPathTest})
             set_property(TEST ${agcClassicPathTest} APPEND PROPERTY ENVIRONMENT "APS5_NO_CORE=1")
         endif()
