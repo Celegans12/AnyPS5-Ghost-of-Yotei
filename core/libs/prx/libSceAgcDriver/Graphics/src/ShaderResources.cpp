@@ -4543,6 +4543,9 @@ void DrawSuite::Note(Count what) {
         seen[index] = value;
     }
     std::fprintf(stderr, "[dynamic-sets] sets reused %llu written %llu template %llu unprepared %llu, depth views served %llu full %llu, layer marks served %llu full %llu, moved bindings served %llu full %llu%c", delta[0], delta[1], delta[2], delta[3], delta[4], delta[5], delta[6], delta[7], delta[8], delta[9], 10);
+    const auto at = [&](Count what) { return delta[static_cast<std::size_t>(what)]; };
+    const auto word = [&](std::size_t index) { return delta[static_cast<std::size_t>(Count::MarkSuite) + index]; };
+    std::fprintf(stderr, "[dynamic-sets] misses: sets first %llu epoch %llu imports %llu buffer %llu owner %llu image %llu; depth new %llu call %llu suite %llu state %llu; marks new %llu range %llu version %llu alias %llu flip %llu settled %llu state %llu, suite gate %llu registry %llu epoch %llu proof %llu pending %llu depth surfaces %llu unwatch %llu wide %llu forget %llu imports %llu versioned %llu%c", at(Count::SetFirst), at(Count::SetEpoch), at(Count::SetImports), at(Count::SetBuffer), at(Count::SetOwner), at(Count::SetImage), at(Count::DepthNew), at(Count::DepthArgs), at(Count::DepthSuite), at(Count::DepthState), at(Count::MarkNew), at(Count::MarkRange), at(Count::MarkVersion), at(Count::MarkAlias), at(Count::MarkFlip), at(Count::MarkSettled), at(Count::MarkState), word(0), word(1), word(2), word(3), word(4), word(5), word(6), word(7), word(8), word(9), word(10), 10);
 }
 
 bool DrawProofsEnabled() {
@@ -7949,7 +7952,8 @@ void ShaderResources::describeDynamicSets() {
         set.allocationsOf.clear();
         set.images.clear();
         set.writes.clear();
-        set.holder.reset();
+        for (auto& held : set.held) held = {};
+        set.last = 0;
     }
     bufferDynamic.assign(descriptorBuffers.size(), 0);
     std::array<std::vector<std::pair<std::uint32_t, std::uint32_t>>, 2> ordered;
@@ -8039,22 +8043,39 @@ void ShaderResources::prepareDynamicSets(Recorder& recorder, std::span<const std
             continue;
         }
         for (std::size_t position = 0; position < set.order.size(); ++position) stash.offsets[index][position] = offsets[set.order[position]];
-        bool same = faultRecord == nullptr && set.holder != nullptr && set.heldEpoch == descriptorEpoch && set.heldImports == imports && set.heldBuffers.size() == set.buffers.size();
-        for (std::size_t slot = 0; same && slot < set.buffers.size(); ++slot) {
-            const auto& now = buffers[set.buffers[slot]];
-            const auto& held = set.heldBuffers[slot];
-            same = now.buffer == held.buffer && now.offset == held.offset && now.range == held.range && !slotOwners[slot].owner_before(set.heldOwners[slot]) && !set.heldOwners[slot].owner_before(slotOwners[slot]);
+        DynamicSet::Held* kept = nullptr;
+        auto miss = DrawSuite::Count::SetFirst;
+        for (std::size_t way = 0; faultRecord == nullptr && way < set.held.size() && kept == nullptr; ++way) {
+            const auto position = (set.last + way) % set.held.size();
+            auto& held = set.held[position];
+            if (held.holder == nullptr || held.fault) continue;
+            auto reason = DrawSuite::Count::SetsReused;
+            if (held.epoch != descriptorEpoch) reason = DrawSuite::Count::SetEpoch;
+            else if (held.imports != imports || held.buffers.size() != set.buffers.size()) reason = DrawSuite::Count::SetImports;
+            for (std::size_t slot = 0; reason == DrawSuite::Count::SetsReused && slot < set.buffers.size(); ++slot) {
+                const auto& now = buffers[set.buffers[slot]];
+                const auto& was = held.buffers[slot];
+                if (now.buffer != was.buffer || now.offset != was.offset || now.range != was.range) reason = DrawSuite::Count::SetBuffer;
+                else if ((slotOwners[slot].owner_before(held.owners[slot]) || held.owners[slot].owner_before(slotOwners[slot])) && held.owners[slot].expired()) reason = DrawSuite::Count::SetOwner;
+            }
+            std::size_t imagesSeen = 0;
+            for (const auto& [first, count] : set.images) {
+                if (reason != DrawSuite::Count::SetsReused) break;
+                if (imagesSeen + count > held.images.size() || !std::equal(descriptorImages.begin() + first, descriptorImages.begin() + first + count, held.images.begin() + static_cast<std::ptrdiff_t>(imagesSeen), [](const VkDescriptorImageInfo& a, const VkDescriptorImageInfo& b) { return a.sampler == b.sampler && a.imageView == b.imageView && a.imageLayout == b.imageLayout; })) reason = DrawSuite::Count::SetImage;
+                imagesSeen += count;
+            }
+            if (reason == DrawSuite::Count::SetsReused && imagesSeen != held.images.size()) reason = DrawSuite::Count::SetImage;
+            if (reason == DrawSuite::Count::SetsReused) {
+                kept = &held;
+                set.last = position;
+            } else if (way == 0) {
+                miss = reason;
+            }
         }
-        std::size_t imagesSeen = 0;
-        for (const auto& [first, count] : set.images) {
-            if (!same) break;
-            same = imagesSeen + count <= set.heldImages.size() && std::equal(descriptorImages.begin() + first, descriptorImages.begin() + first + count, set.heldImages.begin() + static_cast<std::ptrdiff_t>(imagesSeen), [](const VkDescriptorImageInfo& a, const VkDescriptorImageInfo& b) { return a.sampler == b.sampler && a.imageView == b.imageView && a.imageLayout == b.imageLayout; });
-            imagesSeen += count;
-        }
-        same = same && imagesSeen == set.heldImages.size();
-        if (same) {
+        if (kept != nullptr) {
             DrawSuite::Note(DrawSuite::Count::SetsReused);
         } else {
+            DrawSuite::Note(miss);
             sizes.clear();
             for (const auto& binding : bindings) {
                 if (setOf(binding) != index) continue;
@@ -8081,18 +8102,21 @@ void ShaderResources::prepareDynamicSets(Recorder& recorder, std::span<const std
                 writes.push_back(write);
             }
             if (!writes.empty()) context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
-            set.heldBuffers.clear();
-            for (const auto buffer : set.buffers) set.heldBuffers.push_back(buffers[buffer]);
-            set.heldImages.clear();
-            for (const auto& [first, count] : set.images) set.heldImages.insert(set.heldImages.end(), descriptorImages.begin() + first, descriptorImages.begin() + first + count);
-            set.heldOwners.assign(slotOwners.begin(), slotOwners.end());
-            set.heldImports = imports;
-            set.heldEpoch = faultRecord == nullptr ? descriptorEpoch : 0u;
-            set.holder = std::move(holder);
+            set.last = (set.last + set.held.size() - 1) % set.held.size();
+            kept = &set.held[set.last];
+            kept->buffers.clear();
+            for (const auto buffer : set.buffers) kept->buffers.push_back(buffers[buffer]);
+            kept->images.clear();
+            for (const auto& [first, count] : set.images) kept->images.insert(kept->images.end(), descriptorImages.begin() + first, descriptorImages.begin() + first + count);
+            kept->owners.assign(slotOwners.begin(), slotOwners.end());
+            kept->imports = imports;
+            kept->epoch = descriptorEpoch;
+            kept->fault = faultRecord != nullptr;
+            kept->holder = std::move(holder);
             DrawSuite::Note(DrawSuite::Count::SetsWritten);
         }
-        recorder.Keep(set.holder);
-        stash.sets[index] = index == 0 ? set.holder->allocation.set : set.holder->fragmentAllocation.set;
+        recorder.Keep(kept->holder);
+        stash.sets[index] = index == 0 ? kept->holder->allocation.set : kept->holder->fragmentAllocation.set;
     }
 }
 

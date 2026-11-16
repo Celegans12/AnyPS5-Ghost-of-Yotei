@@ -137,7 +137,7 @@ DrawProofCounts DrawProofCounted();
 std::string DrawProofText(const DrawProofCounts& now, const DrawProofCounts& seen);
 
 struct DrawSuite {
-    enum class Count : std::size_t { SetsReused, SetsWritten, SetsTemplate, SetsUnprepared, DepthServed, DepthFull, MarksServed, MarksFull, MovedServed, MovedFull, Count };
+    enum class Count : std::size_t { SetsReused, SetsWritten, SetsTemplate, SetsUnprepared, DepthServed, DepthFull, MarksServed, MarksFull, MovedServed, MovedFull, MarkNew, MarkRange, MarkVersion, MarkAlias, MarkFlip, MarkSettled, MarkState, SetFirst, SetEpoch, SetImports, SetBuffer, SetOwner, SetImage, DepthNew, DepthArgs, DepthSuite, DepthState, MarkSuite, MarkSuiteEnd = MarkSuite + 10, Count };
     std::uint64_t gate = 0;
     std::uint64_t registry = 0;
     DrawProofStamp stamp{};
@@ -838,14 +838,17 @@ private:
         std::vector<std::uint32_t> allocationsOf;
         std::vector<std::pair<std::uint32_t, std::uint32_t>> images;
         std::vector<std::size_t> writes;
-        mutable std::shared_ptr<DrawBindings> holder;
-        mutable std::vector<VkDescriptorBufferInfo> heldBuffers;
-        mutable std::vector<VkDescriptorImageInfo> heldImages;
-        mutable std::vector<std::weak_ptr<void>> heldOwners;
-        mutable std::uint64_t heldImports = 0;
-        mutable std::uint64_t heldEpoch = 0;
-        mutable const void* keptRecorder = nullptr;
-        mutable std::uint64_t keptSerial = 0;
+        struct Held {
+            std::shared_ptr<DrawBindings> holder;
+            std::vector<VkDescriptorBufferInfo> buffers;
+            std::vector<VkDescriptorImageInfo> images;
+            std::vector<std::weak_ptr<void>> owners;
+            std::uint64_t imports = 0;
+            std::uint64_t epoch = 0;
+            bool fault = false;
+        };
+        mutable std::array<Held, 8> held;
+        mutable std::size_t last = 0;
     };
     std::array<DynamicSet, 2> dynamicSets;
     std::vector<std::uint8_t> bufferDynamic;

@@ -3738,10 +3738,14 @@ VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const
     bool memoHeld = false;
     if (suited) {
         auto& memo = depthViewMemo();
-        if (memo.held && memo.device == context.device && memo.views == PassState::DepthViews() && memo.depthWritten == depthWritten && memo.stencilTested == stencilTested && memo.stencilWritten == stencilWritten && memo.overwrittenStencil == overwrittenStencil && sameDepthCall(memo.target, target) && memo.suite == DrawSuite::Now()) {
+        const bool sameCall = memo.held && memo.device == context.device && memo.views == PassState::DepthViews() && memo.depthWritten == depthWritten && memo.stencilTested == stencilTested && memo.stencilWritten == stencilWritten && memo.overwrittenStencil == overwrittenStencil && sameDepthCall(memo.target, target);
+        const bool sameSuite = sameCall && memo.suite == DrawSuite::Now();
+        if (!sameSuite) DrawSuite::Note(!memo.held ? DrawSuite::Count::DepthNew : !sameCall ? DrawSuite::Count::DepthArgs : DrawSuite::Count::DepthSuite);
+        if (sameSuite) {
             std::unique_lock lock(surfacesMutex());
             memoHeld = memo.active != nullptr && memo.active->load(std::memory_order_acquire) && drawnDepth == memo.surface && memo.surface->written == depthWrites && memo.surface->pendingClear == 0u && !memo.surface->clearPending && !memo.surface->retired && memo.surface->expanded == memo.expanded && memo.surface->view == memo.view && findClearedHtile(target) == clearedHtiles().end();
         }
+        if (sameSuite && !memoHeld) DrawSuite::Note(DrawSuite::Count::DepthState);
         if (memoHeld && !DrawProofVerifyDue()) {
             depthViewCounters().calls.fetch_add(1, std::memory_order_relaxed);
             NoteDrawProofReused(DrawProofKind::Depth);

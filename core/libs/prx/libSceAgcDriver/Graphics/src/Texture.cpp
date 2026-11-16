@@ -4645,10 +4645,27 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         return;
     }
     auto& mark = pendingMark;
-    if (mark.held && mark.first == first && mark.count == count && mark.version == version && mark.drawing == drawingTarget && !lent && handedOver.empty() && handedUnits.empty() && mark.aliases == aliasMarks.load(std::memory_order_acquire) && mark.flip == flipSerial.load(std::memory_order_relaxed) && mark.settled == GuestMemory::SettledGeneration() && layerPending.AllIn(first, count) && !(borrowedUnits.size() == trackedLayers && borrowedUnits.AnyIn(first, count)) && mark.suite == suiteWords(DrawSuite::Now())) {
+    if (mark.held && mark.first == first && mark.count == count && mark.version == version && mark.drawing == drawingTarget && !lent && handedOver.empty() && handedUnits.empty() && mark.aliases == aliasMarks.load(std::memory_order_acquire) && mark.flip == flipSerial.load(std::memory_order_relaxed) && layerPending.AllIn(first, count) && !(borrowedUnits.size() == trackedLayers && borrowedUnits.AnyIn(first, count)) && mark.suite == suiteWords(DrawSuite::Now())) {
+        if (const auto settled = GuestMemory::SettledGeneration(); settled != mark.settled) {
+            StampUnkeptUnits(keptAtUnwatch, {descriptor.baseAddress, trackedLayerBytes, guestBytes}, layerGeneration, layerPendingSince, first, count, settled);
+            mark.settled = settled;
+            DrawSuite::Note(DrawSuite::Count::MarkSettled);
+        }
         DrawSuite::Note(DrawSuite::Count::MarksServed);
         return;
     }
+    if (!mark.held) DrawSuite::Note(DrawSuite::Count::MarkNew);
+    else if (mark.first != first || mark.count != count) DrawSuite::Note(DrawSuite::Count::MarkRange);
+    else if (mark.version != version) DrawSuite::Note(DrawSuite::Count::MarkVersion);
+    else if (mark.aliases != aliasMarks.load(std::memory_order_acquire)) DrawSuite::Note(DrawSuite::Count::MarkAlias);
+    else if (mark.flip != flipSerial.load(std::memory_order_relaxed)) DrawSuite::Note(DrawSuite::Count::MarkFlip);
+    else if (const auto words = suiteWords(DrawSuite::Now()); words != mark.suite) {
+        for (std::size_t index = 0; index < words.size(); ++index) {
+            if (words[index] == mark.suite[index]) continue;
+            DrawSuite::Note(static_cast<DrawSuite::Count>(static_cast<std::size_t>(DrawSuite::Count::MarkSuite) + index));
+            break;
+        }
+    } else DrawSuite::Note(DrawSuite::Count::MarkState);
     mark.held = false;
     markLayersPendingNow(first, count);
     DrawSuite::Note(DrawSuite::Count::MarksFull);
