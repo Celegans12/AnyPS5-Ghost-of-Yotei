@@ -129,6 +129,27 @@ void StateMachine() {
     Hold(AgcDriver::Graphics::Recorder::ReplacedUncopied(true, false) && !AgcDriver::Graphics::Recorder::ReplacedUncopied(true, true) && !AgcDriver::Graphics::Recorder::ReplacedUncopied(false, false) && !AgcDriver::Graphics::Recorder::ReplacedUncopied(false, true), "only a guarded result not yet copied counts as replaced without a copy");
 
     {
+        using Ranges = std::vector<std::pair<std::uint64_t, std::uint64_t>>;
+        const auto whole = [](const Ranges& written) { return AgcDriver::Graphics::Recorder::WholePages(written); };
+        const auto edges = [](const Ranges& written) { return AgcDriver::Graphics::Recorder::PageEdges(written); };
+        Hold(whole({{zone, zone + 0x3000}}) == Ranges{{zone, zone + 0x3000}} && edges({{zone, zone + 0x3000}}).empty(), "a result on whole pages has edges or is not kept whole");
+        Hold(whole({{zone + 0x1e0, zone + 0x4e08}}) == Ranges{{zone + 0x1000, zone + 0x4000}} && edges({{zone + 0x1e0, zone + 0x4e08}}) == Ranges{{zone + 0x1e0, zone + 0x1000}, {zone + 0x4000, zone + 0x4e08}}, "a result off page bounds does not keep its whole pages and land its two edges");
+        Hold(whole({{zone + 0x10, zone + 0x1ff0}}).empty() && edges({{zone + 0x10, zone + 0x1ff0}}) == Ranges{{zone + 0x10, zone + 0x1ff0}}, "a result holding no whole page is not all edge");
+        Hold(whole({{zone, zone + 0x1800}}) == Ranges{{zone, zone + 0x1000}} && edges({{zone, zone + 0x1800}}) == Ranges{{zone + 0x1000, zone + 0x1800}}, "a result starting on a page bound has a leading edge or loses its tail");
+        Hold(whole({{zone + 0x800, zone + 0x2000}, {other + 4, other + 8}}) == Ranges{{zone + 0x1000, zone + 0x2000}} && edges({{zone + 0x800, zone + 0x2000}, {other + 4, other + 8}}) == Ranges{{zone + 0x800, zone + 0x1000}, {other + 4, other + 8}}, "several written ranges are not split one by one");
+        for (const Ranges& written : {Ranges{{zone + 0x1e0, zone + 0x4e08}}, Ranges{{zone + 1, zone + 2}}, Ranges{{zone, zone + 0x1000}, {other + 0xfff, other + 0x2001}}}) {
+            std::uint64_t total = 0, split = 0;
+            for (const auto& [begin, end] : written) total += end - begin;
+            for (const auto& [begin, end] : whole(written)) {
+                Hold(begin % 4096 == 0 && end % 4096 == 0 && begin < end, "a kept range is not whole pages");
+                split += end - begin;
+            }
+            for (const auto& [begin, end] : edges(written)) split += end - begin;
+            Hold(split == total, "the kept pages and the edges do not add up to the written bytes");
+        }
+    }
+
+    {
         FakeRecorder recorder;
         for (std::uint32_t use = 1; use <= 4; ++use) {
             recorder.Defer(zone, true, use);

@@ -202,6 +202,8 @@ public:
         std::shared_ptr<void> guard;
         bool landed = false;
         bool carriedOver = false;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> kept;
+        bool edgesLanded = false;
     };
     struct ReadTrapStatistics {
         std::uint64_t guarded, guardedBytes, unguarded, unguardedBytes, kept, replaced, replacedBytes, faults, nestedFaults, forcedReleases, faultLanded, faultLandedBytes, readerLanded, readerLandedBytes, verified, differing, held;
@@ -216,6 +218,8 @@ public:
     static CopyBackStep StepCopyBack(LandingSite site, bool scoped, bool reached, bool guarded, bool underQueuedStore, bool verified, bool landed);
     static CopyBackLanding LandingOf(LandingSite site, bool guarded, bool landed);
     static bool ReplacedUncopied(bool guarded, bool landed);
+    static std::vector<std::pair<std::uint64_t, std::uint64_t>> WholePages(std::span<const std::pair<std::uint64_t, std::uint64_t>> written);
+    static std::vector<std::pair<std::uint64_t, std::uint64_t>> PageEdges(std::span<const std::pair<std::uint64_t, std::uint64_t>> written);
     bool LandGuardedOver(std::uint64_t address, std::size_t bytes);
     struct StagedClaim {
         std::uint64_t begin = 0;

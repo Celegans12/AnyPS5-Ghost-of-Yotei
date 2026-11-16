@@ -2131,6 +2131,31 @@ bool Recorder::ReplacedUncopied(bool guarded, bool landed) {
     return guarded && !landed;
 }
 
+std::vector<std::pair<std::uint64_t, std::uint64_t>> Recorder::WholePages(std::span<const std::pair<std::uint64_t, std::uint64_t>> written) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> pages;
+    for (const auto& [begin, end] : written) {
+        const auto first = (begin + ReadTrapPage - 1) / ReadTrapPage * ReadTrapPage;
+        const auto last = end / ReadTrapPage * ReadTrapPage;
+        if (first < last) pages.emplace_back(first, last);
+    }
+    return pages;
+}
+
+std::vector<std::pair<std::uint64_t, std::uint64_t>> Recorder::PageEdges(std::span<const std::pair<std::uint64_t, std::uint64_t>> written) {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> edges;
+    for (const auto& [begin, end] : written) {
+        const auto first = (begin + ReadTrapPage - 1) / ReadTrapPage * ReadTrapPage;
+        const auto last = end / ReadTrapPage * ReadTrapPage;
+        if (first >= last) {
+            if (begin < end) edges.emplace_back(begin, end);
+            continue;
+        }
+        if (begin < first) edges.emplace_back(begin, first);
+        if (last < end) edges.emplace_back(last, end);
+    }
+    return edges;
+}
+
 bool Recorder::guardedOverlaps(std::uint64_t address, std::uint64_t end) const {
     if (carried.empty() && (open == nullptr || open->copyBacks.empty())) return false;
     const auto overlapping = [&](const StagedCopyBack& held) { return held.guard != nullptr && std::any_of(held.written.begin(), held.written.end(), [&](const auto& range) { return address < range.second && range.first < end; }); };
@@ -2143,15 +2168,16 @@ bool Recorder::underQueuedStore(const StagedCopyBack& held) const {
 }
 
 void Recorder::guardCopyBack(StagedCopyBack& entry) {
-    const auto bytes = RangeBytes(entry.written);
-    auto hold = HoldReadTraps(entry.written);
+    entry.kept = WholePages(entry.written);
+    auto hold = HoldReadTraps(entry.kept);
     if (hold == nullptr) {
+        entry.kept.clear();
         trapUnguarded.fetch_add(1, std::memory_order_relaxed);
-        trapUnguardedBytes.fetch_add(bytes, std::memory_order_relaxed);
+        trapUnguardedBytes.fetch_add(RangeBytes(entry.written), std::memory_order_relaxed);
         return;
     }
     trapGuarded.fetch_add(1, std::memory_order_relaxed);
-    trapGuardedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    trapGuardedBytes.fetch_add(RangeBytes(entry.kept), std::memory_order_relaxed);
     entry.guard = std::move(hold);
 }
 
@@ -2195,8 +2221,16 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
             }
             if (step == CopyBackStep::StaysCopied) {
                 held->landed = true;
+                held->edgesLanded = true;
                 landing.push_back(*held);
                 landing.back().guard = nullptr;
+            } else if (!held->edgesLanded) {
+                held->edgesLanded = true;
+                if (auto edges = PageEdges(held->written); !edges.empty()) {
+                    landing.push_back(*held);
+                    landing.back().guard = nullptr;
+                    landing.back().written = std::move(edges);
+                }
             }
             if (site == LandingSite::LabelStore) trapKept.fetch_add(1, std::memory_order_relaxed);
             ++held;
@@ -2226,7 +2260,7 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
     for (auto& entry : landing) {
         const auto kind = LandingOf(site, entry.guard != nullptr, entry.landed);
         if (kind == CopyBackLanding::Compared) {
-            const auto size = static_cast<std::size_t>(RangeBytes(entry.written));
+            const auto size = static_cast<std::size_t>(RangeBytes(entry.kept));
             auto staged = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             auto imported = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             Keep(staged, size);
@@ -2234,7 +2268,7 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
             std::vector<VkBufferCopy> fromShadow;
             std::vector<VkBufferCopy> fromImport;
             VkDeviceSize at = 0;
-            for (const auto& [begin, end] : entry.written) {
+            for (const auto& [begin, end] : entry.kept) {
                 fromShadow.push_back({begin - entry.begin, at, end - begin});
                 fromImport.push_back({begin - entry.targetBase, at, end - begin});
                 renoted.emplace_back(begin, end);
@@ -2250,9 +2284,10 @@ void Recorder::flushCopyBacks(LandingSite site, const CopyBackReach* reach) {
             continue;
         }
         std::vector<VkBufferCopy> regions;
-        regions.reserve(entry.written.size());
+        const auto& ranges = entry.guard != nullptr && entry.edgesLanded ? entry.kept : entry.written;
+        regions.reserve(ranges.size());
         std::uint64_t entryBytes = 0;
-        for (const auto& [begin, end] : entry.written) {
+        for (const auto& [begin, end] : ranges) {
             regions.push_back({begin - entry.begin, begin - entry.targetBase, end - begin});
             landed.emplace_back(begin, end);
             entryBytes += end - begin;
@@ -2294,6 +2329,8 @@ void Recorder::DeferCopyBack(StagedCopyBack entry) {
     entry.guard = nullptr;
     entry.landed = false;
     entry.carriedOver = false;
+    entry.kept.clear();
+    entry.edgesLanded = false;
     if (entry.guardable && ReadTrapEnabled()) guardCopyBack(entry);
     auto& pending = open->copyBacks;
     const auto same = std::find_if(pending.begin(), pending.end(), [&](const StagedCopyBack& held) { return held.begin == entry.begin && held.end == entry.end && held.target == entry.target && held.targetBase == entry.targetBase; });
