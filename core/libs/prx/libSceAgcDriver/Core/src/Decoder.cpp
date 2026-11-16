@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Core/include/RunKey.hpp"
 #include "prx/libSceAgcDriver/Execution/include/QueueState.hpp"
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -78,6 +79,8 @@ struct Decoder::State {
     const QueueState* live = nullptr;
     std::uint64_t retired = 0;
     DecoderCounts counts;
+    std::array<DecodedPatch, DecodedPatches> patch{};
+    std::uint8_t patches = 0;
 
     void touch(std::uint8_t banks) {
         if ((banks & DecoderShader) != 0) shader.dirty = true;
@@ -113,6 +116,19 @@ struct Decoder::State {
         ring.dirty = false;
         ++ring.version;
         ++snapshots;
+        if (&ring == &userConfig) patches = 0;
+    }
+
+    bool patched(std::uint32_t offset, std::uint32_t value) {
+        if (userConfig.dirty) return false;
+        for (std::uint8_t index = 0; index < patches; ++index) {
+            if (patch[index].offset != offset) continue;
+            patch[index].value = value;
+            return true;
+        }
+        if (patches == DecodedPatches) return false;
+        patch[patches++] = {offset, value};
+        return true;
     }
 
     bool write(QueueState& queue, Bank kind, std::uint32_t offset, std::uint32_t value) {
@@ -128,7 +144,7 @@ struct Decoder::State {
         if ((queue.staleDigests & (1u << static_cast<unsigned>(kind))) == 0 && KeyRegister(kind, offset)) DigestWrite(kind == Bank::Shader ? queue.shaderDigest : kind == Bank::Context ? queue.contextDigest : queue.userConfigDigest, offset, had, before, value);
         bank.insert_or_assign(offset, value);
         ++counts.registers;
-        return true;
+        return !(kind == Bank::UserConfig && had && patched(offset, value));
     }
 
     void mark(Bank kind) {
@@ -206,6 +222,9 @@ struct Decoder::State {
         out.staleDigests = queue.staleDigests;
         out.hasIndexBufferSize = queue.indexBufferSize.has_value() ? 1 : 0;
         out.predicationExecuteWhenSet = queue.predication.executeWhenSet ? 1 : 0;
+        out.userConfigPatches = patches;
+        out.userConfigPatch = patch;
+        if (patches != 0) ++counts.userConfigPatched;
         return out;
     }
 
@@ -344,6 +363,7 @@ void ApplyDecoded(const DecodedState& decoded, DecodedView& view) {
         view.userConfigVersion = decoded.userConfigVersion;
         ++view.copies;
     }
+    for (std::uint8_t index = 0; index < decoded.userConfigPatches; ++index) queue.userConfig.insert_or_assign(decoded.userConfigPatch[index].offset, decoded.userConfigPatch[index].value);
     queue.indexBase = decoded.indexBase;
     queue.drawIndirectBase = decoded.drawIndirectBase;
     queue.dispatchIndirectBase = decoded.dispatchIndirectBase;
@@ -368,7 +388,15 @@ bool SameDecoded(const DecodedState& decoded, const QueueState& queue) {
     if ((decoded.staleDigests & 1u) == 0 && !(decoded.shaderDigest == queue.shaderDigest)) return false;
     if ((decoded.staleDigests & 2u) == 0 && !(decoded.contextDigest == queue.contextDigest)) return false;
     if ((decoded.staleDigests & 4u) == 0 && !(decoded.userConfigDigest == queue.userConfigDigest)) return false;
-    return *decoded.shader == queue.shader && *decoded.context == queue.context && *decoded.userConfig == queue.userConfig;
+    if (!(*decoded.shader == queue.shader) || !(*decoded.context == queue.context)) return false;
+    if (decoded.userConfigPatches == 0) return *decoded.userConfig == queue.userConfig;
+    return DecodedUserConfig(decoded) == queue.userConfig;
+}
+
+Registers DecodedUserConfig(const DecodedState& decoded) {
+    Registers registers = *decoded.userConfig;
+    for (std::uint8_t index = 0; index < decoded.userConfigPatches; ++index) registers.insert_or_assign(decoded.userConfigPatch[index].offset, decoded.userConfigPatch[index].value);
+    return registers;
 }
 
 }

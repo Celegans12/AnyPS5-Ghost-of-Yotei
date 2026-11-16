@@ -368,6 +368,47 @@ void testListsAndEdges() {
     static_cast<void>(indexed);
 }
 
+void testUserConfigPatches() {
+    Stream stream;
+    const std::uint32_t one[] = {1u};
+    const std::uint32_t pair[] = {21u, 22u};
+    stream.Set(0x79, 0x250, pair);
+    stream.Set(0x79, 0x260, pair);
+    stream.DrawAuto(3);
+    for (std::uint32_t index = 0; index < 5; ++index) {
+        const std::uint32_t value[] = {100u + index};
+        stream.Set(0x79, 0x24a, value);
+        stream.DrawAuto(3);
+    }
+    stream.Set(0x79, 0x250, one);
+    stream.Set(0x79, 0x251, one);
+    stream.DrawAuto(3);
+    stream.Set(0x79, 0x260, one);
+    stream.DrawAuto(3);
+    stream.Set(0x79, 0x270, one);
+    stream.DrawAuto(3);
+    const auto expected = ReferenceDraws(stream, freshQueue());
+    Harness harness;
+    harness.expected = &expected;
+    Decoder decoder({8}, hostOf(harness));
+    auto live = freshQueue();
+    const auto result = decoder.Decode(live, inputOf(stream));
+    Expect(!result.stopped && harness.ops.size() == 9, "nine draws are posted");
+    if (harness.ops.size() != 9) return;
+    const auto& ops = harness.ops;
+    Expect(ops[0].state.userConfigPatches == 0, "a register written for the first time is copied with its bank");
+    Expect(ops[5].state.userConfigVersion == ops[0].state.userConfigVersion && ops[5].state.userConfigPatches == 1 && ops[5].state.userConfigPatch[0].offset == 0x24a && ops[5].state.userConfigPatch[0].value == 104u, "a register rewritten at each draw travels in the operation");
+    Expect(ops[6].state.userConfigVersion == ops[0].state.userConfigVersion && ops[6].state.userConfigPatches == 3, "three changed registers still travel in the operation");
+    Expect(ops[7].state.userConfigVersion != ops[6].state.userConfigVersion && ops[7].state.userConfigPatches == 0, "a fourth changed register copies the bank and empties the patches");
+    Expect(ops[8].state.userConfigVersion != ops[7].state.userConfigVersion && ops[8].state.userConfigPatches == 0, "a new register copies the bank");
+    const auto counts = decoder.Counted();
+    Expect(counts.userConfigSnapshots == 3 && counts.userConfigPatched == 6, "the bank is copied three times and six draws carry patches");
+    DecodedView skipping;
+    ApplyDecoded(ops[0].state, skipping);
+    ApplyDecoded(ops[6].state, skipping);
+    Expect(skipping.queue.userConfig == expected[6].first.userConfig && skipping.copies == 3, "a view that skipped draws gets every patch since the snapshot");
+}
+
 void testAdoptAndCapture() {
     Stream stream;
     const std::uint32_t one[] = {1u};
@@ -433,6 +474,7 @@ int main() {
     testSnapshotWithoutWait();
     testHeavyContract();
     testListsAndEdges();
+    testUserConfigPatches();
     testAdoptAndCapture();
     testViewCopiesOnlyChanges();
     if (failures != 0) {

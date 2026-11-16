@@ -43,7 +43,7 @@ std::string bankDifference(const char* name, const Registers& decoded, const Reg
 std::string DescribeDecodedDifference(const DecodedState& decoded, const QueueState& queue) {
     if (auto found = bankDifference("shader", *decoded.shader, queue.shader); !found.empty()) return found;
     if (auto found = bankDifference("context", *decoded.context, queue.context); !found.empty()) return found;
-    if (auto found = bankDifference("user configuration", *decoded.userConfig, queue.userConfig); !found.empty()) return found;
+    if (auto found = bankDifference("user configuration", DecodedUserConfig(decoded), queue.userConfig); !found.empty()) return found;
     char text[200];
     if (decoded.indexBase != queue.indexBase) {
         std::snprintf(text, sizeof(text), "index base: the decoder holds 0x%llx, the packet path 0x%llx", static_cast<unsigned long long>(decoded.indexBase), static_cast<unsigned long long>(queue.indexBase));

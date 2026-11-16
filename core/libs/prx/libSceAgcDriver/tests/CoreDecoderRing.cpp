@@ -236,7 +236,7 @@ struct Pipeline {
 std::uint64_t postDraw(void* context, const DecodedOp& op) {
     auto& pipeline = *static_cast<Pipeline*>(context);
     auto posted = op;
-    posted.host = HashState(*op.state.shader, *op.state.context, *op.state.userConfig) ^ op.state.indexBase ^ (static_cast<std::uint64_t>(op.state.instanceCount) << 40u);
+    posted.host = HashState(*op.state.shader, *op.state.context, DecodedUserConfig(op.state)) ^ op.state.indexBase ^ (static_cast<std::uint64_t>(op.state.instanceCount) << 40u);
     return pipeline.ring->Post(posted);
 }
 

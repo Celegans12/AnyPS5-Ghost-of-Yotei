@@ -17,6 +17,10 @@ namespace AgcDriver::Core {
 
 enum class DecodedKind : std::uint8_t { None, Draw, Packet, Count };
 
+struct DecodedPatch { std::uint32_t offset; std::uint32_t value; };
+
+inline constexpr std::size_t DecodedPatches = 3;
+
 struct DecodedState {
     const Registers* shader;
     const Registers* context;
@@ -39,7 +43,8 @@ struct DecodedState {
     std::uint8_t staleDigests;
     std::uint8_t hasIndexBufferSize;
     std::uint8_t predicationExecuteWhenSet;
-    std::uint8_t reserved;
+    std::uint8_t userConfigPatches;
+    std::array<DecodedPatch, DecodedPatches> userConfigPatch;
 };
 
 inline constexpr std::uint32_t DecodedAlone = 1u;
@@ -76,6 +81,7 @@ struct DecodedView {
 
 void ApplyDecoded(const DecodedState& state, DecodedView& view);
 [[nodiscard]] bool SameDecoded(const DecodedState& state, const QueueState& queue);
+[[nodiscard]] Registers DecodedUserConfig(const DecodedState& state);
 
 inline constexpr std::uint8_t DecoderShader = 1u, DecoderContext = 2u, DecoderUserConfig = 4u, DecoderEvery = 7u;
 
@@ -105,6 +111,7 @@ struct DecoderCounts {
     std::uint64_t shaderSnapshots = 0;
     std::uint64_t contextSnapshots = 0;
     std::uint64_t userConfigSnapshots = 0;
+    std::uint64_t userConfigPatched = 0;
     std::uint64_t snapshotWaits = 0;
 };
 
