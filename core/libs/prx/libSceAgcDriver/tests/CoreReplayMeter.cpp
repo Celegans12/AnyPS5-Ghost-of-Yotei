@@ -43,6 +43,7 @@ public:
     bool tokensBroken = false;
     std::uint64_t pageAsks = 0;
     std::uint64_t blockAsks = 0;
+    std::uint64_t tokensTaken = 0;
 
     void Store(std::uint64_t address, std::uint64_t bytes) {
         stores.push_back({address, bytes, ++generation});
@@ -77,6 +78,7 @@ public:
     }
 
     ReplayToken TokenFor(const ReplayRange& range) override {
+        ++tokensTaken;
         return {range.address ^ range.bytes, generation};
     }
 
@@ -280,12 +282,20 @@ void TestContentToken() {
     proof.live = true;
     const auto draw = Draw();
     static_cast<void>(Run(meter, proof, draw));
-    Expect(Run(meter, proof, draw) == ReplayCause::Replayed, "a still current token proves the inputs");
+    Expect(proof.tokensTaken == 2, "a first draw takes one token per input range");
+    const bool filled = meter.Filled(draw, proof);
+    const auto pageAsks = proof.pageAsks;
+    const auto blockAsks = proof.blockAsks;
+    Expect(meter.Commit(draw, false, filled, proof) == ReplayCause::Replayed, "a still current token proves the inputs");
+    meter.NoteTargets(draw, proof.Generation());
     Expect(meter.Counted().tokensTrue == 1, "still current tokens counted");
+    Expect(proof.tokensTaken == 2, "still current tokens are kept rather than taken again");
+    Expect(proof.pageAsks == pageAsks && proof.blockAsks == blockAsks, "a still current token spares the write tracker");
     proof.Store(VertexAddress, 16);
     Expect(Run(meter, proof, draw) == ReplayCause::Token, "a token no longer current is a token miss");
     Expect(meter.Counted().tokensFalse == 1, "tokens no longer current counted");
     Expect(Miss(meter, ReplayTokenMiss::Written) == 1, "the tracker names why the token failed");
+    Expect(proof.tokensTaken == 3, "only the inputs from the first stale token on are taken again");
     proof.tokensBroken = true;
     Expect(Run(meter, proof, draw) == ReplayCause::Token, "a false token with clean inputs is still a token miss");
     Expect(Miss(meter, ReplayTokenMiss::TokenOnly) == 1, "a miss only the token sees counted");
@@ -335,13 +345,14 @@ void TestReport() {
     Expect(Contains(first, "front: 10 draws looked at, 8 committed by the core (80.0 %), replayable per draw looked at 60.0 %"), "report scales the share to the draws the front looked at");
     Expect(Contains(first, "last window 5.0 s: 3 of 4 metered draws replayable (75.0 %), front 10 draws looked at, 8 committed by the core"), "first window covers everything");
     Expect(Contains(first, "write tracker at the 64 KiB block grain (T1 off)"), "report names the proof");
-    Expect(Contains(first, "meter cost 0 ns per metered draw (0 timed)"), "report gives no cost before any timed draw");
-    meter.NoteCost(100);
-    meter.NoteCost(200);
-    Expect(Contains(meter.TakeReport(10, 8, false, 0.1), "meter cost 150 ns per metered draw (2 timed)"), "report averages the timed draws");
+    Expect(Contains(first, "meter cost 0 ns per core draw (0 timed: 0 ns per metered draw, 0 ns per unmetered draw)"), "report gives no cost before any timed draw");
+    meter.NoteCost(100, true);
+    meter.NoteCost(200, false);
+    meter.NoteCost(300, false);
+    Expect(Contains(meter.TakeReport(10, 8, false, 0.1), "meter cost 200 ns per core draw (3 timed: 100 ns per metered draw, 250 ns per unmetered draw)"), "report averages the timed draws, metered or not");
     static_cast<void>(Run(meter, proof, draw));
     const auto second = meter.TakeReport(14, 9, true, 5.2);
-    Expect(Contains(second, "4 replayable (80.0 %)"), "cumulative share moves");
+    Expect(Contains(second, "4 replayable (80.0 % of the metered)"), "cumulative share moves");
     Expect(Contains(second, "last window 5.2 s: 1 of 1 metered draws replayable (100.0 %), front 4 draws looked at, 1 committed by the core"), "window restarts at the last report");
     Expect(Contains(second, "proof: T1 content token"), "report names the token when it is live");
 }

@@ -277,6 +277,7 @@ ReplayCause ReplayMeter::Commit(const ReplayDraw& draw, bool fallback, bool fill
         return (held.sampler & held.proofMask) == 0;
     };
     ReplayCause cause = ReplayCause::New;
+    std::uint32_t kept = 0;
     if (fallback) {
         cause = ReplayCause::Fallback;
     } else if (same && filled) {
@@ -284,14 +285,17 @@ ReplayCause ReplayMeter::Commit(const ReplayDraw& draw, bool fallback, bool fill
     } else if (same && !sampled()) {
         cause = ReplayCause::Unproved;
     } else if (same) {
-        const auto inputs = inputsOf(draw, slot.generation, proof);
         bool current = true;
         if (live) {
             const auto& tokens = held.tokens[replayKey & held.replayMask];
             if (tokens.key != replayKey || tokens.count != draw.rangeCount || !draw.rangesComplete) current = false;
-            for (std::uint32_t index = 0; current && index < draw.rangeCount; ++index) current = proof.StillCurrent(draw.ranges[index], tokens.tokens[index]);
+            while (current && kept < draw.rangeCount) {
+                if (proof.StillCurrent(draw.ranges[kept], tokens.tokens[kept])) ++kept;
+                else current = false;
+            }
             ++(current ? counts.tokensTrue : counts.tokensFalse);
         }
+        const auto inputs = live && current ? Inputs::Clean : inputsOf(draw, slot.generation, proof);
         const bool proved = live ? current : inputs == Inputs::Clean;
         if (!proved) {
             cause = ReplayCause::Token;
@@ -320,14 +324,17 @@ ReplayCause ReplayMeter::Commit(const ReplayDraw& draw, bool fallback, bool fill
         auto& tokens = held.tokens[replayKey & held.replayMask];
         tokens.key = replayKey;
         tokens.count = draw.rangeCount;
-        for (std::uint32_t index = 0; index < draw.rangeCount; ++index) tokens.tokens[index] = proof.TokenFor(draw.ranges[index]);
+        for (std::uint32_t index = kept; index < draw.rangeCount; ++index) tokens.tokens[index] = proof.TokenFor(draw.ranges[index]);
     }
     return cause;
 }
 
-void ReplayMeter::NoteCost(std::uint64_t nanoseconds) {
+void ReplayMeter::NoteCost(std::uint64_t nanoseconds, bool metered) {
     state->counts.costNanoseconds += nanoseconds;
     ++state->counts.costSamples;
+    if (!metered) return;
+    state->counts.meteredCostNanoseconds += nanoseconds;
+    ++state->counts.meteredCostSamples;
 }
 
 const ReplayCounts& ReplayMeter::Counted() const {
@@ -354,15 +361,16 @@ std::string ReplayMeter::TakeReport(std::uint64_t frontDraws, std::uint64_t fron
     const auto windowFront = frontDraws >= state->reportedFrontDraws ? frontDraws - state->reportedFrontDraws : 0u;
     const auto windowCommitted = frontCommitted >= state->reportedFrontCommitted ? frontCommitted - state->reportedFrontCommitted : 0u;
     const auto percent = [](double part, std::uint64_t whole) { return whole == 0 ? 0.0 : 100.0 * part / static_cast<double>(whole); };
+    const auto average = [](std::uint64_t total, std::uint64_t samples) { return samples == 0 ? 0.0 : static_cast<double>(total) / static_cast<double>(samples); };
     const auto perLooked = counts.draws == 0 || frontDraws == 0 ? 0.0 : 100.0 * replayable / static_cast<double>(counts.draws) * static_cast<double>(frontCommitted) / static_cast<double>(frontDraws);
     char text[1792];
-    std::snprintf(text, sizeof(text), "[core-replay] (cumulative) %llu draws committed by the core, %llu metered (1 in %llu variants by key hash, %llu-slot tables), %.0f replayable (%.1f %% of the metered); front: %llu draws looked at, %llu committed by the core (%.1f %%), replayable per draw looked at %.1f %%; last window %.1f s: %.0f of %llu metered draws replayable (%.1f %%), front %llu draws looked at, %llu committed by the core; not replayable: new %llu, evicted %llu, recipe %llu, input range %llu, target %llu, parameters %llu, fallback %llu, fill %llu, token %.0f; input proof on 1 in %llu same-key draws: %llu proved, %llu replayable, %llu token misses (grain %llu, written %llu, unwatched %llu, ranges %llu, token only %llu); same key %llu; after a keys or HTILE fill %llu; proof: %s; T1 tokens %llu still current, %llu not; meter cost %.0f ns per metered draw (%llu timed)",
+    std::snprintf(text, sizeof(text), "[core-replay] (cumulative) %llu draws committed by the core, %llu metered (1 in %llu variants by key hash, %llu-slot tables), %.0f replayable (%.1f %% of the metered); front: %llu draws looked at, %llu committed by the core (%.1f %%), replayable per draw looked at %.1f %%; last window %.1f s: %.0f of %llu metered draws replayable (%.1f %%), front %llu draws looked at, %llu committed by the core; not replayable: new %llu, evicted %llu, recipe %llu, input range %llu, target %llu, parameters %llu, fallback %llu, fill %llu, token %.0f; input proof on 1 in %llu same-key draws: %llu proved, %llu replayable, %llu token misses (grain %llu, written %llu, unwatched %llu, ranges %llu, token only %llu); same key %llu; after a keys or HTILE fill %llu; proof: %s; T1 tokens %llu still current, %llu not; meter cost %.0f ns per core draw (%llu timed: %.0f ns per metered draw, %.0f ns per unmetered draw)",
         wide(counts.draws + counts.unsampled), wide(counts.draws), wide(std::uint64_t{1} << state->variantShift), wide(state->replay.size()), replayable, percent(replayable, counts.draws), wide(frontDraws), wide(frontCommitted), share(frontCommitted, frontDraws), perLooked,
         windowSeconds, windowReplayable, wide(windowDraws), percent(windowReplayable, windowDraws), wide(windowFront), wide(windowCommitted),
         wide(cause(counts, ReplayCause::New)), wide(cause(counts, ReplayCause::Evicted)), wide(cause(counts, ReplayCause::Recipe)), wide(cause(counts, ReplayCause::Input)), wide(cause(counts, ReplayCause::Target)), wide(cause(counts, ReplayCause::Parameters)), wide(cause(counts, ReplayCause::Fallback)), wide(cause(counts, ReplayCause::Fill)), tokenMissed,
         wide(std::uint64_t{1} << state->proofShift), wide(replayed + token), wide(replayed), wide(token), miss(ReplayTokenMiss::Grain), miss(ReplayTokenMiss::Written), miss(ReplayTokenMiss::Unwatched), miss(ReplayTokenMiss::Ranges), miss(ReplayTokenMiss::TokenOnly),
         wide(counts.sameKey), wide(counts.afterFill), tokensLive ? "T1 content token" : "write tracker at the 64 KiB block grain (T1 off)", wide(counts.tokensTrue), wide(counts.tokensFalse),
-        counts.costSamples == 0 ? 0.0 : static_cast<double>(counts.costNanoseconds) / static_cast<double>(counts.costSamples), wide(counts.costSamples));
+        average(counts.costNanoseconds, counts.costSamples), wide(counts.costSamples), average(counts.meteredCostNanoseconds, counts.meteredCostSamples), average(counts.costNanoseconds - counts.meteredCostNanoseconds, counts.costSamples - counts.meteredCostSamples));
     state->reported = counts;
     state->reportedFrontDraws = frontDraws;
     state->reportedFrontCommitted = frontCommitted;

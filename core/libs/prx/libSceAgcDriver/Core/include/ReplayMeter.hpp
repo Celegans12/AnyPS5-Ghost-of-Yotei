@@ -69,6 +69,8 @@ struct ReplayCounts {
     std::uint64_t tokensFalse = 0;
     std::uint64_t costNanoseconds = 0;
     std::uint64_t costSamples = 0;
+    std::uint64_t meteredCostNanoseconds = 0;
+    std::uint64_t meteredCostSamples = 0;
 };
 
 [[nodiscard]] std::uint64_t ReplayMix(std::uint64_t hash, std::uint64_t value);
@@ -88,7 +90,7 @@ public:
     ReplayCause Commit(const ReplayDraw& draw, bool fallback, bool filled, ReplayProof& proof);
     void NoteUnsampled();
     void NoteTargets(const ReplayDraw& targets, std::uint64_t generation);
-    void NoteCost(std::uint64_t nanoseconds);
+    void NoteCost(std::uint64_t nanoseconds, bool metered);
     [[nodiscard]] const ReplayCounts& Counted() const;
     [[nodiscard]] std::string TakeReport(std::uint64_t frontDraws, std::uint64_t frontCommitted, bool tokensLive, double windowSeconds);
 

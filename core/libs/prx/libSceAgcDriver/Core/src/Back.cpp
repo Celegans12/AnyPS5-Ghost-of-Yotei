@@ -174,7 +174,7 @@ void NoteReplay(ReplayDraw* draw, const ReplayDraw& targets, bool fallback, bool
         meter.NoteUnsampled();
     }
     meter.NoteTargets(targets, proof.Generation());
-    if (timed) meter.NoteCost(spentNanoseconds + nanosecondsSince(started));
+    if (timed) meter.NoteCost(spentNanoseconds + nanosecondsSince(started), draw != nullptr);
     if (((meter.Counted().draws + meter.Counted().unsampled) & 63u) != 0) return;
     static std::atomic<std::int64_t> lastReport{0};
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
