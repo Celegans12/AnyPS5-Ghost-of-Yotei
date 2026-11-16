@@ -343,10 +343,14 @@ public:
         std::uint64_t dropped = 0;
         std::uint64_t collectNs = 0;
         std::uint64_t sleeps = 0;
+        std::uint64_t sweeps = 0;
+        std::uint64_t sweepNs = 0;
+        std::uint64_t filtered = 0;
     };
     static constexpr std::size_t Capacity = 1024;
     static CollectWalker& Get();
     static bool Enabled();
+    static bool SweepsEpochs();
     bool Offer(std::uint64_t epoch, std::uint64_t address, std::uint64_t bytes);
     bool Idle() const;
     Counts Counted() const;
@@ -362,6 +366,7 @@ private:
     void start();
     void run();
     void rethrowFailure();
+    static void wakeForEpoch(std::uint64_t epoch);
 
     std::array<Entry, Capacity> ring{};
     std::mutex producers;
@@ -373,6 +378,12 @@ private:
     std::atomic<std::uint64_t> collected{0};
     std::atomic<std::uint64_t> collectNs{0};
     std::atomic<std::uint64_t> sleeps{0};
+    std::atomic<std::uint64_t> sweepWanted{0};
+    std::atomic<std::uint64_t> sweepDone{0};
+    std::atomic<std::uint64_t> sweepsRun{0};
+    std::atomic<std::uint64_t> sweepNs{0};
+    std::atomic<std::uint64_t> filtered{0};
+    std::atomic<bool> sweeping{false};
     alignas(64) std::atomic<std::uint32_t> parked{0};
     std::atomic<bool> closed{false};
     std::atomic<bool> started{false};

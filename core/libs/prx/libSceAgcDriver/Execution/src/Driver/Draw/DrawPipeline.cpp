@@ -939,8 +939,29 @@ void DrawFinisher::ReleaseRan() {
 }
 
 CollectWalker& CollectWalker::Get() {
-    static CollectWalker* walker = new CollectWalker();
+    static CollectWalker* walker = [] {
+        auto* made = new CollectWalker();
+        if (SweepsEpochs()) GuestMemory::SetEpochHook(&CollectWalker::wakeForEpoch);
+        return made;
+    }();
     return *walker;
+}
+
+bool CollectWalker::SweepsEpochs() {
+    static const bool enabled = Enabled() && GuestMemory::EpochSweeps() && std::getenv("APS5_EPOCH_SWEEP_THREAD") != nullptr;
+    return enabled;
+}
+
+void CollectWalker::wakeForEpoch(std::uint64_t epoch) {
+    auto& walker = Get();
+    if (walker.closed.load(std::memory_order_acquire)) return;
+    auto wanted = walker.sweepWanted.load(std::memory_order_relaxed);
+    while (wanted < epoch && !walker.sweepWanted.compare_exchange_weak(wanted, epoch, std::memory_order_seq_cst, std::memory_order_relaxed)) {}
+    if (!walker.started.load(std::memory_order_acquire)) walker.start();
+    if (walker.parked.load(std::memory_order_seq_cst) != 0) {
+        walker.parked.store(0, std::memory_order_seq_cst);
+        WakeOne(walker.parked);
+    }
 }
 
 bool CollectWalker::Enabled() {
@@ -954,6 +975,10 @@ bool CollectWalker::Offer(std::uint64_t epoch, std::uint64_t address, std::uint6
     if (closed.load(std::memory_order_acquire)) {
         rethrowFailure();
         dropped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (sweeping.load(std::memory_order_relaxed)) {
+        filtered.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
     const auto at = tail.load(std::memory_order_relaxed);
@@ -974,11 +999,11 @@ bool CollectWalker::Offer(std::uint64_t epoch, std::uint64_t address, std::uint6
 }
 
 bool CollectWalker::Idle() const {
-    return closed.load(std::memory_order_acquire) || head.load(std::memory_order_acquire) == tail.load(std::memory_order_acquire);
+    return closed.load(std::memory_order_acquire) || (head.load(std::memory_order_acquire) == tail.load(std::memory_order_acquire) && sweepDone.load(std::memory_order_acquire) >= sweepWanted.load(std::memory_order_acquire));
 }
 
 CollectWalker::Counts CollectWalker::Counted() const {
-    return {handed.load(std::memory_order_relaxed), collected.load(std::memory_order_relaxed), dropped.load(std::memory_order_relaxed), collectNs.load(std::memory_order_relaxed), sleeps.load(std::memory_order_relaxed)};
+    return {handed.load(std::memory_order_relaxed), collected.load(std::memory_order_relaxed), dropped.load(std::memory_order_relaxed), collectNs.load(std::memory_order_relaxed), sleeps.load(std::memory_order_relaxed), sweepsRun.load(std::memory_order_relaxed), sweepNs.load(std::memory_order_relaxed), filtered.load(std::memory_order_relaxed)};
 }
 
 void CollectWalker::start() {
@@ -997,14 +1022,28 @@ void CollectWalker::run() {
     NameDriverThread("collect-walk");
     PerformanceTrace::BindThread("collect walker");
     static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    const bool sweeps = SweepsEpochs();
     std::exception_ptr error;
     try {
         while (!closed.load(std::memory_order_acquire)) {
+            if (sweeps) {
+                const auto wanted = sweepWanted.load(std::memory_order_acquire);
+                if (wanted > sweepDone.load(std::memory_order_relaxed)) {
+                    sweeping.store(true, std::memory_order_relaxed);
+                    const auto began = std::chrono::steady_clock::now();
+                    GuestMemory::SweepHot(wanted);
+                    sweepNs.fetch_add(elapsedNs(began), std::memory_order_relaxed);
+                    sweepsRun.fetch_add(1, std::memory_order_relaxed);
+                    sweepDone.store(wanted, std::memory_order_release);
+                    sweeping.store(false, std::memory_order_relaxed);
+                    continue;
+                }
+            }
             const auto at = head.load(std::memory_order_relaxed);
             if (tail.load(std::memory_order_acquire) == at) {
-                if (SpinUntil(HandoffSpinWindow(), [&] { return tail.load(std::memory_order_acquire) != at || closed.load(std::memory_order_acquire); })) continue;
+                if (!sweeps && SpinUntil(HandoffSpinWindow(), [&] { return tail.load(std::memory_order_acquire) != at || closed.load(std::memory_order_acquire); })) continue;
                 parked.store(1u, std::memory_order_seq_cst);
-                if (tail.load(std::memory_order_seq_cst) == at && !closed.load(std::memory_order_seq_cst)) {
+                if (tail.load(std::memory_order_seq_cst) == at && !closed.load(std::memory_order_seq_cst) && sweepWanted.load(std::memory_order_seq_cst) <= sweepDone.load(std::memory_order_relaxed)) {
                     sleeps.fetch_add(1, std::memory_order_relaxed);
                     WaitWhile(parked, 1u);
                 }
@@ -1030,6 +1069,7 @@ void CollectWalker::run() {
         failure = error;
         failed.store(true, std::memory_order_release);
     }
+    sweeping.store(false, std::memory_order_relaxed);
     closed.store(true, std::memory_order_seq_cst);
 }
 
@@ -1060,6 +1100,7 @@ DrawPipeline& DrawPipeline::Queue0() {
     static DrawPipeline* pipeline = [] {
         auto* made = new DrawPipeline();
         if (Flat() && Depth() != 0) made->flat = std::make_unique<FlatQueue<Item>>(Depth(), WakeBatch(Depth()), VerifiesOrder(), DrawFinisher::Timed());
+        if (CollectWalker::SweepsEpochs()) CollectWalker::Get();
         return made;
     }();
     return *pipeline;
@@ -1511,7 +1552,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     GuestMemory::ReportPageOrigins();
     static CollectWalker::Counts reportedWalker{};
     const auto walker = CollectWalker::Get().Counted();
-    AgcDriver::ProfilePrint_nid_no_patch("[collect-walker] (10 s): %llu ranges handed over, %llu collected by it in %.1f ms, %llu left to the committer, %llu sleeps\n", static_cast<unsigned long long>(walker.handed - reportedWalker.handed), static_cast<unsigned long long>(walker.collected - reportedWalker.collected), static_cast<double>(walker.collectNs - reportedWalker.collectNs) / 1e6, static_cast<unsigned long long>(walker.dropped - reportedWalker.dropped), static_cast<unsigned long long>(walker.sleeps - reportedWalker.sleeps));
+    AgcDriver::ProfilePrint_nid_no_patch("[collect-walker] (10 s): %llu ranges handed over, %llu collected by it in %.1f ms, %llu left to the committer, %llu sleeps; %llu epoch sweeps on its thread in %.1f ms, %llu ranges not taken while it swept\n", static_cast<unsigned long long>(walker.handed - reportedWalker.handed), static_cast<unsigned long long>(walker.collected - reportedWalker.collected), static_cast<double>(walker.collectNs - reportedWalker.collectNs) / 1e6, static_cast<unsigned long long>(walker.dropped - reportedWalker.dropped), static_cast<unsigned long long>(walker.sleeps - reportedWalker.sleeps), static_cast<unsigned long long>(walker.sweeps - reportedWalker.sweeps), static_cast<double>(walker.sweepNs - reportedWalker.sweepNs) / 1e6, static_cast<unsigned long long>(walker.filtered - reportedWalker.filtered));
     reportedCollects = collects;
     reportedBumps = bumps;
     reportedWalker = walker;

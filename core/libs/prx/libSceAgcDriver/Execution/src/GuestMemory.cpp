@@ -148,8 +148,14 @@ constexpr std::uint32_t NotedSources = sourceBit(WriteBumpSource::Break) | sourc
 constexpr std::size_t ContentSlots = std::size_t{1} << 20;
 constexpr std::uint64_t ContentWideBlocks = 4096;
 
+constexpr std::size_t ContentPageSlots = std::size_t{1} << 21;
+constexpr std::uint64_t ContentPageBytes = 4096;
+constexpr std::uint64_t ContentPreciseBlocks = 64;
+
 struct ContentCounters {
     std::array<std::atomic<std::uint64_t>, ContentSlots> blocks{};
+    std::array<std::atomic<std::uint64_t>, ContentSlots> edges{};
+    std::array<std::atomic<std::uint64_t>, ContentPageSlots> pages{};
     std::atomic<std::uint64_t> wide{0};
 };
 
@@ -158,22 +164,45 @@ ContentCounters& contentCounters() {
     return *counters;
 }
 
-void bumpContent(std::uint64_t address, std::uint64_t bytes) {
+void bumpContentRange(std::uint64_t address, std::uint64_t bytes, bool precise) {
     if (bytes == 0 || !EpochSweeps()) return;
     auto& counters = contentCounters();
+    const auto end = bytes - 1 > ~address ? ~std::uint64_t{0} : address + (bytes - 1);
     const auto first = address / IndexBlockBytes;
-    const auto last = (bytes - 1 > ~address ? ~std::uint64_t{0} : address + (bytes - 1)) / IndexBlockBytes;
+    const auto last = end / IndexBlockBytes;
     if (last - first >= ContentWideBlocks) {
         counters.wide.fetch_add(1);
         return;
     }
     for (auto block = first; block <= last; ++block) counters.blocks[block % ContentSlots].fetch_add(1);
+    if (precise && last - first < ContentPreciseBlocks) {
+        for (auto page = address / ContentPageBytes; page <= end / ContentPageBytes; ++page) counters.pages[page % ContentPageSlots].fetch_add(1);
+        return;
+    }
+    for (auto block = first; block <= last; ++block) counters.edges[block % ContentSlots].fetch_add(1);
+}
+
+void bumpContent(std::uint64_t address, std::uint64_t bytes) {
+    bumpContentRange(address, bytes, true);
+}
+
+void bumpContentCoarse(std::uint64_t address, std::uint64_t bytes) {
+    bumpContentRange(address, bytes, false);
 }
 
 std::uint64_t contentSum(std::uint64_t first, std::uint64_t stop) {
     auto& counters = contentCounters();
     std::uint64_t sum = 1;
-    for (auto block = first / IndexBlockBytes; block <= (stop - 1) / IndexBlockBytes; ++block) sum += counters.blocks[block % ContentSlots].load();
+    for (auto block = first / IndexBlockBytes; block <= (stop - 1) / IndexBlockBytes; ++block) {
+        const auto begin = block * IndexBlockBytes;
+        const auto end = begin + IndexBlockBytes;
+        if (begin >= first && end <= stop) {
+            sum += counters.blocks[block % ContentSlots].load();
+            continue;
+        }
+        sum += counters.edges[block % ContentSlots].load();
+        for (auto page = std::max(first, begin) / ContentPageBytes; page <= (std::min(stop, end) - 1) / ContentPageBytes; ++page) sum += counters.pages[page % ContentPageSlots].load();
+    }
     return sum == 0 ? 1 : sum;
 }
 
@@ -212,8 +241,8 @@ bool brokenSource(WriteBumpSource source) {
     return broken[static_cast<std::size_t>(source)];
 }
 
-void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source) {
-    bumpContent(address, bytes);
+void bumpSubscriptions(std::uint64_t address, std::uint64_t bytes, WriteBumpSource source, bool content = true) {
+    if (content) bumpContent(address, bytes);
     auto& index = Index();
     if (bytes == 0 || index.liveBySource[static_cast<std::size_t>(source)].load(std::memory_order_acquire) == 0 || brokenSource(source)) return;
     static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
@@ -388,6 +417,7 @@ std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> collectWalkedEpochs{0};
 std::atomic<std::uint64_t> committerWatchCalls{0};
 thread_local bool proofThread = false;
+thread_local bool sweepThread = false;
 std::atomic<std::uint64_t> unwatchSerial{0};
 
 std::uint64_t collectTicks() {
@@ -1676,7 +1706,7 @@ std::uint64_t hotEpochs() {
     static const std::uint64_t span = [] {
         const char* text = std::getenv("APS5_EPOCH_SWEEP_SPAN");
         const auto value = text != nullptr ? std::strtoull(text, nullptr, 10) : 0;
-        return value;
+        return value != 0 || std::getenv("APS5_EPOCH_SWEEP_THREAD") == nullptr ? value : std::uint64_t{32};
     }();
     return span;
 }
@@ -2119,7 +2149,8 @@ struct WriteTracker {
             const auto first = std::max(address, blockBegin(block));
             const auto stop = std::min<std::uint64_t>(end, blockBegin(block) + WriteBlockBytes);
             if (!blockPartWatched(first, stop)) continue;
-            stamp(block, stampGeneration, StampKind::Driver);
+            bumpContent(first, stop - first);
+            stamp(block, stampGeneration, StampKind::Driver, true);
             noteDriverStore(block, address, end, stampGeneration, complete);
         }
     }
@@ -2363,10 +2394,10 @@ struct WriteTracker {
         }
     }
 
-    void stamp(std::uint64_t block, std::uint64_t stampGeneration, StampKind kind) {
+    void stamp(std::uint64_t block, std::uint64_t stampGeneration, StampKind kind, bool counted = false) {
         const bool cpu = kind == StampKind::Cpu || kind == StampKind::ImportWindow;
         const bool stored = kind != StampKind::ImportWindow;
-        bumpContent(blockBegin(block), WriteBlockBytes);
+        if (!counted) bumpContentCoarse(blockBegin(block), WriteBlockBytes);
         auto& leaf = leafFor(block);
         if (stored) {
             leaf.blocks[block % LeafBlocks].store(stampGeneration, std::memory_order_relaxed);
@@ -2375,7 +2406,7 @@ struct WriteTracker {
         }
         if (cpu) leaf.cpuBlocks[block % LeafBlocks] = stampGeneration;
         if (pipelineStats() && (kind == StampKind::Cpu || kind == StampKind::Fresh)) dirtyBlocks().note(blockBegin(block) / WriteBlockBytes, statsEpoch());
-        if (stored && kind != StampKind::Driver) bumpSubscriptions(blockBegin(block), WriteBlockBytes, WriteBumpSource::Cpu);
+        if (stored && kind != StampKind::Driver) bumpSubscriptions(blockBegin(block), WriteBlockBytes, WriteBumpSource::Cpu, false);
     }
 };
 
@@ -2595,7 +2626,8 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
     else {
         const auto generation = tracker.generation.load(std::memory_order_relaxed);
         noteWrittenRun(runs, begin, end, generation);
-        for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, runs.kind);
+        bumpContent(begin, end - begin);
+        for (auto block = tracker.blockOf(begin); block <= tracker.blockOf(end - 1); ++block) tracker.stamp(block, generation, runs.kind, true);
     }
 #ifndef _WIN32
     collectDirtyRuns.fetch_add(1, std::memory_order_relaxed);
@@ -2617,7 +2649,8 @@ void stampWindowRuns(StampRuns& runs) {
         for (auto page = begin; page < end; page += WritePageBytes) {
             const bool kept = held[index++] != 0;
             if (!kept) tracker.notePages(tracker.windowPages, page, page + WritePageBytes, generation);
-            tracker.stamp(tracker.blockOf(page), generation, kept ? runs.window->held : runs.kind);
+            bumpContent(page, WritePageBytes);
+            tracker.stamp(tracker.blockOf(page), generation, kept ? runs.window->held : runs.kind, true);
         }
     }
 }
@@ -2824,7 +2857,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
         observed.Memo();
         const auto settled = tracker.stable.load(std::memory_order_acquire);
         if (EpochSweeps()) {
-            tracker.markAsked(first, stop, askedSerial());
+            if (!sweepThread) tracker.markAsked(first, stop, askedSerial());
             if (epochSweepVerified()) verifyEpochAnswer(address, bytes);
         }
         return {Status::Complete, settled};
@@ -2903,7 +2936,7 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
         if (end > from) tracker.publishObserved(from, end - 1, tick);
     }
     if (shared && EpochSweeps()) {
-        tracker.markAsked(first, stop, askedSerial());
+        if (!sweepThread) tracker.markAsked(first, stop, askedSerial());
         if (status == Status::Complete) tracker.publishExact(first, stop, std::max(epoch, tracker.observationFloor.load(std::memory_order_relaxed)));
     }
     if (status != Status::Complete) return {status, 0};
@@ -3218,8 +3251,13 @@ void BumpCollectEpoch() {
     while (last < epoch && !lastBumpedEpoch.compare_exchange_weak(last, epoch, std::memory_order_release, std::memory_order_relaxed)) {}
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
     if (!EpochSweeps()) return;
-    epochSweep().serial.fetch_add(1, std::memory_order_relaxed);
-    if (const auto hook = epochHook.load(std::memory_order_acquire)) hook(epoch);
+    auto& sweep = epochSweep();
+    sweep.serial.fetch_add(1, std::memory_order_relaxed);
+    if (const auto hook = epochHook.load(std::memory_order_acquire)) {
+        auto wanted = sweep.wanted.load(std::memory_order_relaxed);
+        while (wanted < epoch && !sweep.wanted.compare_exchange_weak(wanted, epoch, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+        hook(epoch);
+    }
     else if (!proofThread && hotEpochs() != 0) SweepHot(epoch);
 }
 
@@ -3551,7 +3589,7 @@ std::optional<TokenMiss> readContent(std::uint64_t first, std::uint64_t stop, st
         AgcDriver::SpinPause();
         generation = tracker.generation.load();
     }
-    tracker.markAsked(first, stop, askedSerial());
+    if (!sweepThread) tracker.markAsked(first, stop, askedSerial());
     if (!observedInEpoch(tracker, first, static_cast<std::size_t>(stop - first), first, stop, epoch)) return TokenMiss::Unobserved;
     content = contentSum(first, stop);
     if (tracker.generation.load() != generation) return TokenMiss::Busy;
@@ -3764,6 +3802,7 @@ bool StillCurrent(std::uint64_t address, std::size_t bytes, const ContentToken& 
 
 void SweepHot(std::uint64_t epoch) {
     if (!EpochSweeps()) return;
+    if (epochHook.load(std::memory_order_acquire) != nullptr) sweepThread = true;
     auto& sweep = epochSweep();
     auto wanted = sweep.wanted.load(std::memory_order_relaxed);
     while (wanted < epoch && !sweep.wanted.compare_exchange_weak(wanted, epoch, std::memory_order_acq_rel, std::memory_order_relaxed)) {}
@@ -4440,8 +4479,9 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, bool imaged, co
             if (tracker.watched) tracker.stampWatchedPart(stored.first, stored.second, tracker.generation, complete);
             return 0;
         }
+        bumpContent(stored.first, stored.second - stored.first);
         for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
-            tracker.stamp(block, tracker.generation, StampKind::Driver);
+            tracker.stamp(block, tracker.generation, StampKind::Driver, true);
             tracker.noteDriverStore(block, stored.first, stored.second, tracker.generation, complete);
         }
         return tracker.generation;
@@ -4557,8 +4597,9 @@ static std::uint64_t markWritten(std::uint64_t address, std::size_t bytes, bool 
     }
     const auto first = tracker.blockOf(address);
     const auto last = tracker.blockOf(address + bytes - 1);
+    bumpContent(address, bytes);
     for (auto block = first; block <= last; ++block) {
-        tracker.stamp(block, tracker.generation, StampKind::Driver);
+        tracker.stamp(block, tracker.generation, StampKind::Driver, true);
         tracker.noteDriverStore(block, address, address + bytes, tracker.generation, complete);
     }
     const auto generation = tracker.generation.load(std::memory_order_relaxed);
