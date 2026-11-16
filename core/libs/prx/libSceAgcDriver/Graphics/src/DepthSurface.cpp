@@ -2258,12 +2258,20 @@ private:
 struct DepthPlaneSlice {
     VkImage image = VK_NULL_HANDLE;
     std::uint64_t written = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t samples = 1;
+    VkExtent2D extent{};
 };
 
 bool DepthPlaneReuse() {
     static const bool enabled = std::getenv("APS5_NO_DEPTH_PLANE_REUSE") == nullptr;
     return enabled;
 }
+
+std::atomic<std::uint64_t> depthPlaneReadsSkipped{0};
+std::atomic<std::uint64_t> depthPlaneReadsDirect{0};
+std::atomic<std::uint64_t> depthPlaneReadsStaged{0};
+std::atomic<std::uint64_t> depthPlaneReadsUploaded{0};
 
 class DepthPlaneCopy {
 public:
@@ -2312,14 +2320,26 @@ public:
         std::vector<std::shared_ptr<Buffer>> uploads;
         std::vector<std::uint32_t> uploadLayers;
         std::vector<std::uint32_t> copiedLayers;
+        std::vector<std::uint32_t> directLayers;
+        const DepthPlaneTargetState targetState{format, extent, DepthPlaneViews()};
         for (std::uint32_t layer = 0; layer < requested; ++layer) {
             auto& held = guestLayers[layer];
             auto& surface = surfaceLayers[layer];
             if (slices[layer].image != VK_NULL_HANDLE) {
                 held = {};
-                if (slices[layer].written != 0 && surface.image == slices[layer].image && surface.written == slices[layer].written) continue;
+                const auto read = ChooseDepthPlaneRead({true, surface.image == slices[layer].image, slices[layer].written, surface.written, slices[layer].format, slices[layer].samples, slices[layer].extent}, targetState);
+                if (read == DepthPlaneRead::Skipped) {
+                    depthPlaneReadsSkipped.fetch_add(1, std::memory_order_relaxed);
+                    continue;
+                }
                 surface = slices[layer];
-                copiedLayers.push_back(layer);
+                if (read == DepthPlaneRead::Direct) {
+                    depthPlaneReadsDirect.fetch_add(1, std::memory_order_relaxed);
+                    directLayers.push_back(layer);
+                } else {
+                    depthPlaneReadsStaged.fetch_add(1, std::memory_order_relaxed);
+                    copiedLayers.push_back(layer);
+                }
                 continue;
             }
             surface = {};
@@ -2334,11 +2354,14 @@ public:
             GuestMemory::ReadCommitted(current.address, upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
             uploads.push_back(std::move(upload));
             uploadLayers.push_back(layer);
+            depthPlaneReadsUploaded.fetch_add(1, std::memory_order_relaxed);
             held = current;
         }
         if (!copiedLayers.empty() || !uploads.empty()) {
             if (staging == nullptr || stagingBytes > staging->Size()) staging = std::make_shared<DeviceBuffer>(context, stagingBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
-            record(slices, resource, geometry, copiedLayers, uploads, uploadLayers, staging);
+            record(slices, resource, geometry, copiedLayers, directLayers, uploads, uploadLayers, staging);
+        } else if (!directLayers.empty()) {
+            record(slices, resource, geometry, copiedLayers, directLayers, uploads, uploadLayers, nullptr);
         }
         const auto viewLayers = viewType == VK_IMAGE_VIEW_TYPE_2D ? 1u : requested - baseLayer;
         const std::array<std::uint32_t, 7> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType), baseLayer, viewLayers};
@@ -2378,7 +2401,7 @@ private:
     std::vector<DepthPlaneSlice> surfaceLayers;
     bool filled = false;
 
-    void record(std::span<const DepthPlaneSlice> slices, const GuestTextureResource& resource, const SurfaceGeometry& geometry, std::span<const std::uint32_t> copiedLayers, std::span<const std::shared_ptr<Buffer>> uploads, std::span<const std::uint32_t> uploadLayers, const std::shared_ptr<DeviceBuffer>& staging) {
+    void record(std::span<const DepthPlaneSlice> slices, const GuestTextureResource& resource, const SurfaceGeometry& geometry, std::span<const std::uint32_t> copiedLayers, std::span<const std::uint32_t> directLayers, std::span<const std::shared_ptr<Buffer>> uploads, std::span<const std::uint32_t> uploadLayers, const std::shared_ptr<DeviceBuffer>& staging) {
         if (!uploads.empty()) {
             Require(context.detiler != nullptr, "depth plane copy requires a texture detiler");
             context.detiler->BeginBatch();
@@ -2425,9 +2448,16 @@ private:
         toTransfer.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
         toTransfer.image = image;
         toTransfer.subresourceRange = {aspect(), 0, 1, 0, layers};
-        const VkBufferMemoryBarrier staged{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, staging->Handle(), 0, VK_WHOLE_SIZE};
-        barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 1, &staged, 1, &toTransfer);
-        context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+        const VkBufferMemoryBarrier staged{VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER, nullptr, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, staging != nullptr ? staging->Handle() : VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
+        barrier(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, staging != nullptr ? 1u : 0u, &staged, 1, &toTransfer);
+        for (const auto layer : directLayers) {
+            VkImageCopy copy{};
+            copy.srcSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+            copy.dstSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, layer, 1};
+            copy.extent = {extent.width, extent.height, 1};
+            context.Function<PFN_vkCmdCopyImage>("vkCmdCopyImage")(commands, slices[layer].image, VK_IMAGE_LAYOUT_GENERAL, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy);
+        }
+        if (!regions.empty()) context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
         VkImageMemoryBarrier toGeneral = toTransfer;
         toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
         toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
@@ -2439,7 +2469,7 @@ private:
         if (batch) batch->SubmitAndWait();
         else {
             Recorder::CountBarriers(Recorder::CommandClass::Draw, 3);
-            recorder->Keep(staging, staging->Size());
+            if (staging != nullptr) recorder->Keep(staging, staging->Size());
             if (owned != nullptr) recorder->Keep(owned);
         }
     }
@@ -4299,6 +4329,23 @@ std::optional<VkExtent2D> ActiveDepthExtent(VkDevice device, std::uint64_t addre
     return std::nullopt;
 }
 
+bool DepthPlaneViews() {
+    static const bool enabled = std::getenv("APS5_NO_DEPTH_PLANE_VIEWS") == nullptr;
+    return enabled;
+}
+
+DepthPlaneRead ChooseDepthPlaneRead(const DepthPlaneSourceState& source, const DepthPlaneTargetState& target) {
+    if (!source.held) return DepthPlaneRead::Upload;
+    if (source.written != 0 && source.sameImage && source.written == source.copied) return DepthPlaneRead::Skipped;
+    const bool depth = target.format == VK_FORMAT_D16_UNORM || target.format == VK_FORMAT_D32_SFLOAT;
+    if (target.direct && depth && source.format == target.format && source.samples == 1u && target.extent.width != 0 && target.extent.height != 0 && target.extent.width <= source.extent.width && target.extent.height <= source.extent.height) return DepthPlaneRead::Direct;
+    return DepthPlaneRead::Staged;
+}
+
+DepthPlaneReadCounts TakeDepthPlaneReadCounts() {
+    return {depthPlaneReadsSkipped.exchange(0, std::memory_order_relaxed), depthPlaneReadsDirect.exchange(0, std::memory_order_relaxed), depthPlaneReadsStaged.exchange(0, std::memory_order_relaxed), depthPlaneReadsUploaded.exchange(0, std::memory_order_relaxed)};
+}
+
 std::size_t DepthPlaneCopyCount() {
     return planeCopies().size();
 }
@@ -4398,7 +4445,7 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         auto* slice = depthSlice(context.device, address, base);
         if (slice != nullptr) slice->ApplyFastClear();
         if (slice == nullptr) slices.push_back({});
-        else slices.push_back({slice->image, slice == drawnDepth ? 0u : slice->written});
+        else slices.push_back({slice->image, slice == drawnDepth ? 0u : slice->written, slice->hostFormat, slice->target.samples, slice->target.extent});
     }
     const auto imageFormat = integer ? VK_FORMAT_R16_UINT : d16 ? VK_FORMAT_D16_UNORM : VK_FORMAT_D32_SFLOAT;
     const VkExtent2D extent{resource.width, resource.height};
@@ -4414,6 +4461,25 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     }
     evictPlaneCopies(copyKey);
     return texture;
+}
+
+std::uint64_t DepthPlaneSourceGeneration(const Context& context, const GuestTextureResource& resource) {
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    std::lock_guard lock(surfacesMutex());
+    const auto* found = planeSurface(context.device, resource.baseAddress);
+    if (found == nullptr || found->target.address != resource.baseAddress || found->target.samples != 1u) return 0;
+    const bool cube = resource.dimension == TextureDimension::kCube;
+    const bool layered = cube || (resource.dimension == TextureDimension::k2DArray && resource.depthOrLastArray != 0);
+    const auto layers = cube ? std::max(resource.depthOrLastArray + 1u, 6u) : layered ? resource.depthOrLastArray + 1u : 1u;
+    const auto geometry = DescribeSurface(resource);
+    if (geometry.levelMajor) return 0;
+    std::uint64_t generation = 0;
+    for (std::uint32_t layer = 0; layer < layers; ++layer) {
+        const auto* slice = depthSlice(context.device, found->target.address + geometry.GuestLayerOffset(layer), found->target);
+        if (slice == nullptr || slice == drawnDepth || slice->pendingClear != 0 || slice->written == 0) return 0;
+        generation = std::max(generation, slice->written);
+    }
+    return generation;
 }
 
 bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resource, const Texture* texture) {

@@ -46,6 +46,7 @@ constexpr int Skipped = 77;
 PFN_vkGetDeviceProcAddr realDeviceProc = nullptr;
 PFN_vkCmdCopyImageToBuffer realCopyImageToBuffer = nullptr;
 PFN_vkCmdCopyBufferToImage realCopyBufferToImage = nullptr;
+PFN_vkCmdCopyImage realCopyImage = nullptr;
 std::atomic<std::uint32_t> imageToBufferCopies{0};
 std::atomic<std::uint32_t> bufferToImageCopies{0};
 std::atomic<VkImage> lastFilledImage{VK_NULL_HANDLE};
@@ -67,9 +68,14 @@ VKAPI_ATTR void VKAPI_CALL CountImageToBuffer(VkCommandBuffer commands, VkImage 
 }
 
 VKAPI_ATTR void VKAPI_CALL CountBufferToImage(VkCommandBuffer commands, VkBuffer buffer, VkImage image, VkImageLayout layout, std::uint32_t count, const VkBufferImageCopy* regions) {
-    bufferToImageCopies.fetch_add(1);
-    lastFilledImage = image;
+    if (lastFilledImage.exchange(image) != image) bufferToImageCopies.fetch_add(1);
     realCopyBufferToImage(commands, buffer, image, layout, count, regions);
+}
+
+VKAPI_ATTR void VKAPI_CALL CountImageToImage(VkCommandBuffer commands, VkImage source, VkImageLayout sourceLayout, VkImage image, VkImageLayout layout, std::uint32_t count, const VkImageCopy* regions) {
+    imageToBufferCopies.fetch_add(1);
+    if (lastFilledImage.exchange(image) != image) bufferToImageCopies.fetch_add(1);
+    realCopyImage(commands, source, sourceLayout, image, layout, count, regions);
 }
 
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL CountingDeviceProc(VkDevice device, const char* name) {
@@ -78,6 +84,10 @@ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL CountingDeviceProc(VkDevice device, con
     if (std::strcmp(name, "vkCmdCopyImageToBuffer") == 0) {
         realCopyImageToBuffer = reinterpret_cast<PFN_vkCmdCopyImageToBuffer>(function);
         return reinterpret_cast<PFN_vkVoidFunction>(&CountImageToBuffer);
+    }
+    if (std::strcmp(name, "vkCmdCopyImage") == 0) {
+        realCopyImage = reinterpret_cast<PFN_vkCmdCopyImage>(function);
+        return reinterpret_cast<PFN_vkVoidFunction>(&CountImageToImage);
     }
     if (std::strcmp(name, "vkAllocateMemory") == 0) {
         realAllocateMemory = reinterpret_cast<PFN_vkAllocateMemory>(function);
@@ -363,6 +373,7 @@ void Run(const Context& context, const WatchedBlock& block) {
         const auto copies = [&](const char* when, std::uint32_t fromSlices, std::uint32_t intoCopy) {
             imageToBufferCopies = 0;
             bufferToImageCopies = 0;
+            lastFilledImage = VK_NULL_HANDLE;
             sample(when);
             if (imageToBufferCopies.load() != fromSlices || bufferToImageCopies.load() != intoCopy) {
                 throw std::runtime_error(std::string("sampling the depth planes ") + when + " recorded " + std::to_string(imageToBufferCopies.load()) + " depth surface copies and " + std::to_string(bufferToImageCopies.load()) + " plane copy fills, expected " + std::to_string(fromSlices) + " and " + std::to_string(intoCopy));
@@ -508,6 +519,7 @@ void SharedLayerRanges(const Context& context, const WatchedBlock& block) {
         range.baseArray = baseArray;
         imageToBufferCopies = 0;
         bufferToImageCopies = 0;
+        lastFilledImage = VK_NULL_HANDLE;
         const auto texture = DepthSurfaceTexture(context, words, range, components);
         const auto when = "layers " + std::to_string(baseArray) + "-" + std::to_string(lastArray);
         Require(texture != nullptr, "the 2D array over depth surfaces was not sampled through its depth planes for " + when);
@@ -552,6 +564,7 @@ void RunCubeGather(const Context& base, const WatchedBlock& block) {
     }
     imageToBufferCopies = 0;
     bufferToImageCopies = 0;
+    lastFilledImage = VK_NULL_HANDLE;
     const auto texture = DepthSurfaceTexture(context, words, resource, components);
     Require(texture != nullptr, "a cube over six depth surfaces at the descriptor's layer offsets was not sampled through their depth planes");
     if (imageToBufferCopies.load() != 6 || bufferToImageCopies.load() != 1) {
@@ -588,6 +601,7 @@ void RunCubeTiledSlice(const Context& base, const WatchedBlock& block) {
     }
     imageToBufferCopies = 0;
     bufferToImageCopies = 0;
+    lastFilledImage = VK_NULL_HANDLE;
     const auto texture = DepthSurfaceTexture(context, words, resource, components);
     Require(texture != nullptr, "a tiled cube whose linear layer footprint differs from a depth slice was not sampled through its depth planes");
     if (imageToBufferCopies.load() != 6 || bufferToImageCopies.load() != 1) {
@@ -625,6 +639,7 @@ void RunCubeArrayGather(const Context& base, const WatchedBlock& block) {
     }
     imageToBufferCopies = 0;
     bufferToImageCopies = 0;
+    lastFilledImage = VK_NULL_HANDLE;
     const auto texture = DepthSurfaceTexture(context, words, resource, components);
     Require(texture != nullptr, "a cube array of two cubes over twelve depth surfaces was not sampled through their depth planes");
     if (imageToBufferCopies.load() != faces || bufferToImageCopies.load() != 1) {

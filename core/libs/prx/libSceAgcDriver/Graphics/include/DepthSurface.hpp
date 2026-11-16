@@ -113,6 +113,31 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
 std::optional<VkExtent2D> ActiveDepthExtent(VkDevice device, std::uint64_t address);
 std::shared_ptr<Texture> DepthSurfaceFirstSample(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components);
 std::size_t DepthPlaneCopyCount();
+enum class DepthPlaneRead : std::uint8_t { Skipped, Direct, Staged, Upload };
+struct DepthPlaneSourceState {
+    bool held = false;
+    bool sameImage = false;
+    std::uint64_t written = 0;
+    std::uint64_t copied = 0;
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    std::uint32_t samples = 1;
+    VkExtent2D extent{};
+};
+struct DepthPlaneTargetState {
+    VkFormat format = VK_FORMAT_UNDEFINED;
+    VkExtent2D extent{};
+    bool direct = true;
+};
+DepthPlaneRead ChooseDepthPlaneRead(const DepthPlaneSourceState& source, const DepthPlaneTargetState& target);
+bool DepthPlaneViews();
+struct DepthPlaneReadCounts {
+    std::uint64_t skipped = 0;
+    std::uint64_t direct = 0;
+    std::uint64_t staged = 0;
+    std::uint64_t uploaded = 0;
+};
+DepthPlaneReadCounts TakeDepthPlaneReadCounts();
+std::uint64_t DepthPlaneSourceGeneration(const Context& context, const GuestTextureResource& resource);
 VkDeviceSize DepthPlaneCopyBytes();
 VkFormat HostDepthFormat(const Context& context, VkFormat format);
 float HostDepthBiasConstant(const Context& context, VkFormat format, float constant);

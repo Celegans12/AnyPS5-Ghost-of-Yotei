@@ -75,6 +75,7 @@ constexpr std::size_t LargeCubeOffset = 0x200000;
 constexpr std::size_t GuestDepthBitsOffset = 0x480000;
 constexpr std::size_t FrameCopiesOffset = 0x520000;
 constexpr std::size_t ReloadOffset = 0x700000;
+constexpr std::size_t GenerationOffset = 0x720000;
 constexpr float DrawnDepth = 0.25f;
 constexpr float DrawnD16Depth = 0.2f;
 constexpr std::uint32_t DrawnD16Bits = 13107;
@@ -285,10 +286,17 @@ void ArrayCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std
     FillSlice(base + 2u * SliceBytes, SliceBytes, Bits(0.75f), 4u);
     const Shape shape{Format32Float, 128, 128, Type2DArray, 2, Swizzle64KbZX};
     const std::array<float, 3> expected{DrawnDepth, 0.5f, 0.75f};
+    AgcDriver::Graphics::TakeDepthPlaneReadCounts();
     for (std::uint32_t slice = 0; slice < 3u; ++slice) {
         Load(device, base, shape, slice, output);
         Expect(output, Bits(expected[slice]), "D32 2D array slice " + std::to_string(slice));
     }
+    const auto counts = AgcDriver::Graphics::TakeDepthPlaneReadCounts();
+    const bool direct = AgcDriver::Graphics::DepthPlaneViews();
+    Require(counts.uploaded == 2, "the two guest slices of a D32 array were uploaded " + std::to_string(counts.uploaded) + " times over three reads, expected once each");
+    Require(direct ? counts.direct >= 1 && counts.staged == 0 : counts.staged >= 1 && counts.direct == 0, "the drawn slice of a D32 array was read " + std::to_string(counts.direct) + " times directly and " + std::to_string(counts.staged) + " times through the staging buffer" + (direct ? ", expected only direct copies" : " under APS5_NO_DEPTH_PLANE_VIEWS, expected only staged copies"));
+    const auto words = TextureDescriptor(base, shape);
+    Require(AgcDriver::Graphics::DepthPlaneSourceGeneration(AgcDriver::VulkanDeviceTestAccess::ContextOf(device), AgcDriver::Graphics::DecodeTextureResource(words)) == 0, "a depth plane array with slices in guest memory reported a source generation");
 }
 
 // A cube over six square D32 slices: face 0 from the live surface, faces 1-5 from guest memory.
@@ -307,8 +315,11 @@ void CubeCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std:
 void IntegerCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
     auto* base = block.At(IntegerOffset);
     DrawDepth(device, reinterpret_cast<std::uintptr_t>(base), {256, 128}, VK_FORMAT_D16_UNORM, DrawnD16Depth);
+    AgcDriver::Graphics::TakeDepthPlaneReadCounts();
     Load(device, base, {Format16Uint, 256, 128, Type2D, 0, Swizzle64KbS}, 0, output);
     Expect(output, DrawnD16Bits, "D16 plane as R16_UINT");
+    const auto counts = AgcDriver::Graphics::TakeDepthPlaneReadCounts();
+    Require(counts.staged >= 1 && counts.direct == 0, "a D16 plane read as R16_UINT was copied " + std::to_string(counts.direct) + " times directly and " + std::to_string(counts.staged) + " times through the staging buffer, expected only staged copies");
 }
 
 // A D16 2D array whose R16_UINT T# has a depth swizzle (flagged as depth bits): both slices' raw values.
@@ -459,6 +470,81 @@ void ReuseCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std
     Expect(output, Bits(0.625f), "D32 2D array slice 0 drawn again after the first lookup");
 }
 
+void GenerationCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
+    auto* base = block.At(GenerationOffset);
+    auto* other = block.At(OneSliceOffset);
+    const auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
+    const Shape shape{Format32Float, 128, 128, Type2DArray, 1, Swizzle64KbZX};
+    const auto words = TextureDescriptor(base, shape);
+    const auto resource = AgcDriver::Graphics::DecodeTextureResource(words);
+    const auto generation = [&] { return AgcDriver::Graphics::DepthPlaneSourceGeneration(context, resource); };
+    DrawDepth(device, reinterpret_cast<std::uintptr_t>(base), {128, 128}, VK_FORMAT_D32_SFLOAT, 0.125f);
+    DrawDepth(device, reinterpret_cast<std::uintptr_t>(base + SliceBytes), {128, 128}, VK_FORMAT_D32_SFLOAT, 0.375f);
+    Require(generation() == 0, "a depth plane array whose last slice is the bound depth target reported a source generation");
+    DrawDepth(device, reinterpret_cast<std::uintptr_t>(other), {128, 128}, VK_FORMAT_D32_SFLOAT, DrawnDepth);
+    const auto first = generation();
+    Require(first != 0, "a depth plane array whose two slices are settled surfaces reported no source generation");
+    AgcDriver::Graphics::TakeDepthPlaneReadCounts();
+    Load(device, base, shape, 0, output);
+    Expect(output, Bits(0.125f), "two drawn D32 slices, slice 0");
+    Load(device, base, shape, 1, output);
+    Expect(output, Bits(0.375f), "two drawn D32 slices, slice 1");
+    const auto counts = AgcDriver::Graphics::TakeDepthPlaneReadCounts();
+    const bool direct = AgcDriver::Graphics::DepthPlaneViews();
+    Require(counts.uploaded == 0 && (direct ? counts.direct == 2 && counts.staged == 0 : counts.staged == 2 && counts.direct == 0) && counts.skipped >= 2, "two settled slices read twice were copied " + std::to_string(counts.direct) + " times directly, " + std::to_string(counts.staged) + " times staged, uploaded " + std::to_string(counts.uploaded) + " times and skipped " + std::to_string(counts.skipped) + " times, expected one copy each and the repeats skipped");
+    Require(generation() == first, "the source generation of a depth plane array moved without a write to its slices");
+    DrawDepth(device, reinterpret_cast<std::uintptr_t>(base + SliceBytes), {128, 128}, VK_FORMAT_D32_SFLOAT, 0.625f);
+    Require(generation() == 0, "a depth plane array whose slice is drawn again still reported a settled source generation");
+    DrawDepth(device, reinterpret_cast<std::uintptr_t>(other), {128, 128}, VK_FORMAT_D32_SFLOAT, DrawnDepth);
+    const auto second = generation();
+    Require(second > first, "the source generation of a depth plane array did not advance after one slice was drawn again");
+    Load(device, base, shape, 1, output);
+    Expect(output, Bits(0.625f), "two drawn D32 slices, slice 1 drawn again");
+    Load(device, base, shape, 0, output);
+    Expect(output, Bits(0.125f), "two drawn D32 slices, slice 0 after slice 1 was drawn again");
+    const auto after = AgcDriver::Graphics::TakeDepthPlaneReadCounts();
+    Require(after.direct + after.staged == 1, "one slice drawn again caused " + std::to_string(after.direct + after.staged) + " slice copies, expected 1");
+}
+
+void DecisionCase() {
+    using AgcDriver::Graphics::ChooseDepthPlaneRead;
+    using AgcDriver::Graphics::DepthPlaneRead;
+    using AgcDriver::Graphics::DepthPlaneSourceState;
+    using AgcDriver::Graphics::DepthPlaneTargetState;
+    const DepthPlaneTargetState d32{VK_FORMAT_D32_SFLOAT, {1024, 1024}, true};
+    const DepthPlaneSourceState face{true, true, 7, 5, VK_FORMAT_D32_SFLOAT, 1, {1024, 1024}};
+    Require(ChooseDepthPlaneRead(face, d32) == DepthPlaneRead::Direct, "a rewritten D32 face of the copy's size and format is not copied directly");
+    auto source = face;
+    source.copied = 7;
+    Require(ChooseDepthPlaneRead(source, d32) == DepthPlaneRead::Skipped, "a face not written since its copy is copied again");
+    source.sameImage = false;
+    Require(ChooseDepthPlaneRead(source, d32) == DepthPlaneRead::Direct, "a face held by another image with the same write number is skipped");
+    source = face;
+    source.written = 0;
+    source.copied = 0;
+    Require(ChooseDepthPlaneRead(source, d32) == DepthPlaneRead::Direct, "the bound depth target, whose write number is 0, is skipped");
+    source = face;
+    source.held = false;
+    Require(ChooseDepthPlaneRead(source, d32) == DepthPlaneRead::Upload, "a slice no surface holds is not uploaded from guest memory");
+    source = face;
+    source.samples = 4;
+    Require(ChooseDepthPlaneRead(source, d32) == DepthPlaneRead::Staged, "a multisampled source is copied directly");
+    source = face;
+    source.format = VK_FORMAT_D32_SFLOAT_S8_UINT;
+    Require(ChooseDepthPlaneRead(source, d32) == DepthPlaneRead::Staged, "a source the device stores in another depth format is copied directly");
+    source = face;
+    source.extent = {1024, 1023};
+    Require(ChooseDepthPlaneRead(source, d32) == DepthPlaneRead::Staged, "a source smaller than the copy is copied directly");
+    source.extent = {1024, 1088};
+    Require(ChooseDepthPlaneRead(source, d32) == DepthPlaneRead::Direct, "a cropped view of a larger source is not copied directly");
+    Require(ChooseDepthPlaneRead(face, {VK_FORMAT_D32_SFLOAT, {1024, 1024}, false}) == DepthPlaneRead::Staged, "APS5_NO_DEPTH_PLANE_VIEWS does not bring the staged copy back");
+    Require(ChooseDepthPlaneRead(face, {VK_FORMAT_D32_SFLOAT, {0, 1024}, true}) == DepthPlaneRead::Staged, "an empty copy is copied directly");
+    const DepthPlaneSourceState d16{true, true, 7, 5, VK_FORMAT_D16_UNORM, 1, {256, 128}};
+    Require(ChooseDepthPlaneRead(d16, {VK_FORMAT_D16_UNORM, {256, 128}, true}) == DepthPlaneRead::Direct, "a D16 slice read as D16 is not copied directly");
+    Require(ChooseDepthPlaneRead(d16, {VK_FORMAT_R16_UINT, {256, 128}, true}) == DepthPlaneRead::Staged, "a D16 slice read as R16_UINT, a depth to colour conversion, is copied directly");
+    Require(ChooseDepthPlaneRead(d16, {VK_FORMAT_D32_SFLOAT, {256, 128}, true}) == DepthPlaneRead::Staged, "a D16 slice is copied directly into a D32 copy");
+}
+
 void FrameCopiesCase(AgcDriver::VulkanDevice& device, GuestBlock& block, std::span<std::uint32_t> output) {
     constexpr VkExtent2D extent{128, 256};
     constexpr VkDeviceSize budget = 1u << 20u;
@@ -519,6 +605,11 @@ void RefusalCase(AgcDriver::VulkanDevice& device, GuestBlock& block) {
 int main(int argc, char** argv) {
     try {
         const bool evicting = argc > 1 && std::string(argv[1]) == "--evicting";
+        DecisionCase();
+        if (argc > 1 && std::string(argv[1]) == "--decision") {
+            std::puts("depth plane read decision tests passed");
+            return 0;
+        }
         GuestBlock block;
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
@@ -552,6 +643,7 @@ int main(int argc, char** argv) {
         present();
         BaseSliceCase(*device, block, output);
         ReuseCase(*device, block, output);
+        GenerationCase(*device, block, output);
         RefusalCase(*device, block);
         if (evicting) {
             const auto kept = AgcDriver::Graphics::DepthPlaneCopyCount();
