@@ -23,7 +23,10 @@ bool CoreReplayStorable(const CoreReplay& replay);
 std::uint32_t CoreReplayRanges(const CoreReplay& replay);
 void CoreReplayRange(const CoreReplay& replay, std::uint32_t index, std::uint64_t& address, std::uint64_t& bytes, GuestMemory::ContentToken& token);
 bool CoreReplayMatches(const CoreReplay& replay, VkDevice device, std::uint64_t identity, const DrawRecipe* recipe, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders);
-std::array<std::uint64_t, 6> CoreReplayCounted();
+bool CoreReplayRecaptured(const CoreReplay& replay);
+bool CoreReplayLean(const CoreReplay& replay);
+std::array<std::uint64_t, 8> CoreReplayCounted();
+std::array<std::uint64_t, 12> CoreReplayLeanRefusals();
 
 }
 
