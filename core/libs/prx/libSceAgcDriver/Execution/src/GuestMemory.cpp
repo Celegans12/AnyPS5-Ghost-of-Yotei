@@ -151,17 +151,94 @@ constexpr std::uint64_t ContentWideBlocks = 4096;
 constexpr std::size_t ContentPageSlots = std::size_t{1} << 21;
 constexpr std::uint64_t ContentPageBytes = 4096;
 constexpr std::uint64_t ContentPreciseBlocks = 64;
+constexpr std::size_t ContentSuperSlots = std::size_t{1} << 16;
+constexpr std::uint64_t ContentSuperBlocks = 16;
+constexpr std::uint64_t ContentSuperBytes = IndexBlockBytes * ContentSuperBlocks;
 
 struct ContentCounters {
     std::array<std::atomic<std::uint64_t>, ContentSlots> blocks{};
     std::array<std::atomic<std::uint64_t>, ContentSlots> edges{};
     std::array<std::atomic<std::uint64_t>, ContentPageSlots> pages{};
+    std::array<std::atomic<std::uint64_t>, ContentSuperSlots> supers{};
     std::atomic<std::uint64_t> wide{0};
 };
 
 ContentCounters& contentCounters() {
     static auto* counters = new ContentCounters;
     return *counters;
+}
+
+bool contentSuperBlocks() {
+    static const bool enabled = std::getenv("APS5_NO_CONTENT_SUPER_BLOCKS") == nullptr;
+    return enabled;
+}
+
+bool contentSuperBlocksVerified() {
+    static const bool verified = contentSuperBlocks() && std::getenv("APS5_VERIFY_CONTENT_SUPER_BLOCKS") != nullptr;
+    return verified;
+}
+
+struct ContentShadow {
+    struct Seen {
+        std::uint64_t first = 0;
+        std::uint64_t stop = 0;
+        std::uint64_t sum = 0;
+        std::uint64_t full = 0;
+    };
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::uint64_t> blocks;
+    std::unordered_map<std::uint64_t, std::uint64_t> edges;
+    std::unordered_map<std::uint64_t, std::uint64_t> pages;
+    std::unordered_map<std::uint64_t, Seen> seen;
+    std::uint64_t marks = 0;
+    std::uint64_t compared = 0;
+    std::uint64_t moved = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+ContentShadow& contentShadow() {
+    static auto* shadow = new ContentShadow;
+    return *shadow;
+}
+
+void bumpContentFine(ContentCounters& counters, std::uint64_t address, std::uint64_t end, bool precise) {
+    const auto first = address / IndexBlockBytes;
+    const auto last = end / IndexBlockBytes;
+    for (auto block = first; block <= last; ++block) counters.blocks[block % ContentSlots].fetch_add(1);
+    if (precise) {
+        for (auto page = address / ContentPageBytes; page <= end / ContentPageBytes; ++page) counters.pages[page % ContentPageSlots].fetch_add(1);
+        return;
+    }
+    for (auto block = first; block <= last; ++block) counters.edges[block % ContentSlots].fetch_add(1);
+}
+
+void bumpContentCounters(ContentCounters& counters, std::uint64_t address, std::uint64_t end, bool precise) {
+    if (!contentSuperBlocks()) {
+        bumpContentFine(counters, address, end, precise);
+        return;
+    }
+    const auto firstSuper = address / ContentSuperBytes + (address % ContentSuperBytes != 0 ? 1u : 0u);
+    const bool tail = end % ContentSuperBytes != ContentSuperBytes - 1;
+    const auto stopSuper = end / ContentSuperBytes + (tail ? 0u : 1u);
+    if (firstSuper >= stopSuper) {
+        bumpContentFine(counters, address, end, precise);
+        return;
+    }
+    for (auto super = firstSuper; super < stopSuper; ++super) counters.supers[super % ContentSuperSlots].fetch_add(1);
+    if (address % ContentSuperBytes != 0) bumpContentFine(counters, address, firstSuper * ContentSuperBytes - 1, precise);
+    if (tail) bumpContentFine(counters, stopSuper * ContentSuperBytes, end, precise);
+}
+
+void bumpContentShadow(ContentShadow& shadow, std::uint64_t address, std::uint64_t end, bool precise) {
+    const auto first = address / IndexBlockBytes;
+    const auto last = end / IndexBlockBytes;
+    ++shadow.marks;
+    for (auto block = first; block <= last; ++block) ++shadow.blocks[block];
+    if (precise) {
+        for (auto page = address / ContentPageBytes; page <= end / ContentPageBytes; ++page) ++shadow.pages[page];
+        return;
+    }
+    for (auto block = first; block <= last; ++block) ++shadow.edges[block];
 }
 
 void bumpContentRange(std::uint64_t address, std::uint64_t bytes, bool precise) {
@@ -174,12 +251,15 @@ void bumpContentRange(std::uint64_t address, std::uint64_t bytes, bool precise) 
         counters.wide.fetch_add(1);
         return;
     }
-    for (auto block = first; block <= last; ++block) counters.blocks[block % ContentSlots].fetch_add(1);
-    if (precise && last - first < ContentPreciseBlocks) {
-        for (auto page = address / ContentPageBytes; page <= end / ContentPageBytes; ++page) counters.pages[page % ContentPageSlots].fetch_add(1);
+    const bool pages = precise && last - first < ContentPreciseBlocks;
+    if (!contentSuperBlocksVerified()) {
+        bumpContentCounters(counters, address, end, pages);
         return;
     }
-    for (auto block = first; block <= last; ++block) counters.edges[block % ContentSlots].fetch_add(1);
+    auto& shadow = contentShadow();
+    std::lock_guard lock(shadow.mutex);
+    bumpContentCounters(counters, address, end, pages);
+    bumpContentShadow(shadow, address, end, pages);
 }
 
 void bumpContent(std::uint64_t address, std::uint64_t bytes) {
@@ -190,8 +270,7 @@ void bumpContentCoarse(std::uint64_t address, std::uint64_t bytes) {
     bumpContentRange(address, bytes, false);
 }
 
-std::uint64_t contentSum(std::uint64_t first, std::uint64_t stop) {
-    auto& counters = contentCounters();
+std::uint64_t contentCounted(ContentCounters& counters, std::uint64_t first, std::uint64_t stop) {
     std::uint64_t sum = 1;
     for (auto block = first / IndexBlockBytes; block <= (stop - 1) / IndexBlockBytes; ++block) {
         const auto begin = block * IndexBlockBytes;
@@ -203,7 +282,57 @@ std::uint64_t contentSum(std::uint64_t first, std::uint64_t stop) {
         sum += counters.edges[block % ContentSlots].load();
         for (auto page = std::max(first, begin) / ContentPageBytes; page <= (std::min(stop, end) - 1) / ContentPageBytes; ++page) sum += counters.pages[page % ContentPageSlots].load();
     }
+    if (contentSuperBlocks()) {
+        for (auto super = first / ContentSuperBytes; super <= (stop - 1) / ContentSuperBytes; ++super) sum += counters.supers[super % ContentSuperSlots].load();
+    }
     return sum == 0 ? 1 : sum;
+}
+
+std::uint64_t contentShadowed(const ContentShadow& shadow, std::uint64_t first, std::uint64_t stop) {
+    const auto counted = [](const std::unordered_map<std::uint64_t, std::uint64_t>& counts, std::uint64_t key) {
+        const auto found = counts.find(key);
+        return found == counts.end() ? std::uint64_t{0} : found->second;
+    };
+    std::uint64_t sum = 0;
+    for (auto block = first / IndexBlockBytes; block <= (stop - 1) / IndexBlockBytes; ++block) {
+        const auto begin = block * IndexBlockBytes;
+        const auto end = begin + IndexBlockBytes;
+        if (begin >= first && end <= stop) {
+            sum += counted(shadow.blocks, block);
+            continue;
+        }
+        sum += counted(shadow.edges, block);
+        for (auto page = std::max(first, begin) / ContentPageBytes; page <= (std::min(stop, end) - 1) / ContentPageBytes; ++page) sum += counted(shadow.pages, page);
+    }
+    return sum;
+}
+
+std::uint64_t contentSum(std::uint64_t first, std::uint64_t stop) {
+    auto& counters = contentCounters();
+    if (!contentSuperBlocksVerified()) return contentCounted(counters, first, stop);
+    auto& shadow = contentShadow();
+    std::lock_guard lock(shadow.mutex);
+    const auto sum = contentCounted(counters, first, stop);
+    const auto full = contentShadowed(shadow, first, stop);
+    if (shadow.seen.size() >= (std::size_t{1} << 18)) shadow.seen.clear();
+    auto& seen = shadow.seen[(first * 0x9E3779B97F4A7C15ull) ^ stop];
+    if (seen.first == first && seen.stop == stop && seen.sum != 0) {
+        ++shadow.compared;
+        if (seen.full != full) {
+            ++shadow.moved;
+            if (seen.sum == sum) {
+                char text[256];
+                std::snprintf(text, sizeof(text), "content super blocks: the sum over 0x%llx..0x%llx held although the full marking moved from %llu to %llu", static_cast<unsigned long long>(first), static_cast<unsigned long long>(stop), static_cast<unsigned long long>(seen.full), static_cast<unsigned long long>(full));
+                throw std::runtime_error(text);
+            }
+        }
+    }
+    seen = {first, stop, sum, full};
+    if (const auto now = std::chrono::steady_clock::now(); now - shadow.reported >= std::chrono::seconds(10)) {
+        shadow.reported = now;
+        std::fprintf(stderr, "[content-super-blocks] verified: %llu marks redone in full, %llu sums compared, %llu of them after the full marking moved, 0 held wrongly\n", static_cast<unsigned long long>(shadow.marks), static_cast<unsigned long long>(shadow.compared), static_cast<unsigned long long>(shadow.moved));
+    }
+    return sum;
 }
 
 struct WriteIndex {
@@ -360,7 +489,25 @@ void TrimSubscriptionBumps(WriteSubscription& subscription, std::uint64_t genera
 }
 
 void NoteGpuPending(std::uint64_t address, std::size_t bytes) {
+    static const bool timed = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    if (!timed) {
+        bumpSubscriptions(address, bytes, WriteBumpSource::Pending);
+        return;
+    }
+    static std::atomic<std::uint64_t> marks{0};
+    static std::atomic<std::uint64_t> nanoseconds{0};
+    static std::atomic<std::uint64_t> marked{0};
+    static std::atomic<std::int64_t> reported{0};
+    const auto start = std::chrono::steady_clock::now();
     bumpSubscriptions(address, bytes, WriteBumpSource::Pending);
+    const auto stop = std::chrono::steady_clock::now();
+    marks.fetch_add(1, std::memory_order_relaxed);
+    nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(stop - start).count()), std::memory_order_relaxed);
+    marked.fetch_add(bytes, std::memory_order_relaxed);
+    const auto now = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::seconds>(stop.time_since_epoch()).count());
+    auto last = reported.load(std::memory_order_relaxed);
+    if (now - last < 10 || !reported.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::fprintf(stderr, "[target-marks] %llu pending marks of render targets, %llu ns in them, %llu bytes marked, content super blocks %s\n", static_cast<unsigned long long>(marks.load(std::memory_order_relaxed)), static_cast<unsigned long long>(nanoseconds.load(std::memory_order_relaxed)), static_cast<unsigned long long>(marked.load(std::memory_order_relaxed)), contentSuperBlocks() ? "on" : "off");
 }
 
 void NoteTextureReleased(std::uint64_t address) {
