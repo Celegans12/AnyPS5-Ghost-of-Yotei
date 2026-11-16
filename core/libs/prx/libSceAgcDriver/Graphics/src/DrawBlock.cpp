@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Core/include/BlockVerify.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "BlockAbi.hpp"
 #include <algorithm>
@@ -80,7 +81,7 @@ void report() {
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = lastReport.load(std::memory_order_relaxed);
     if (nowMs - last < 5000 || !lastReport.compare_exchange_strong(last, nowMs)) return;
-    std::fprintf(stderr, "%s%c", Core::DrawBlockHost::Report().c_str(), 10);
+    AgcDriver::ProfilePrint_nid_no_patch("%s%c", Core::DrawBlockHost::Report().c_str(), 10);
     std::string stages = "[draw-block] stages with buffers or words left to descriptors, by reason (vertex/fragment):";
     for (std::size_t index = 0; index < RefusalCount; ++index) {
         const auto vertex = classicStages()[index * StageKinds].load(std::memory_order_relaxed);
@@ -89,14 +90,14 @@ void report() {
         const auto name = ShaderRecompiler::BlockRefusalName(static_cast<ShaderRecompiler::BlockRefusal>(index));
         stages += " " + std::string(index == 0 ? "not a block module" : name) + " " + std::to_string(vertex) + "/" + std::to_string(fragment) + ";";
     }
-    std::fprintf(stderr, "%s%c", stages.c_str(), 10);
+    AgcDriver::ProfilePrint_nid_no_patch("%s%c", stages.c_str(), 10);
     const auto& times = commitTimes();
     const auto microseconds = [&](DrawBlockClass kind) {
         const auto commits = times.commits[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed);
         return commits != 0 ? static_cast<double>(times.nanoseconds[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(commits) : 0.0;
     };
     const auto commits = [&](DrawBlockClass kind) { return static_cast<unsigned long long>(times.commits[static_cast<std::size_t>(kind)].load(std::memory_order_relaxed)); };
-    std::fprintf(stderr, "[draw-block] recipe commits (cumulative, us per commit): every stage by block %llu at %.2f, block and descriptor stages %llu at %.2f, descriptors only %llu at %.2f%c", commits(DrawBlockClass::Block), microseconds(DrawBlockClass::Block), commits(DrawBlockClass::Mixed), microseconds(DrawBlockClass::Mixed), commits(DrawBlockClass::Classic), microseconds(DrawBlockClass::Classic), 10);
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-block] recipe commits (cumulative, us per commit): every stage by block %llu at %.2f, block and descriptor stages %llu at %.2f, descriptors only %llu at %.2f%c", commits(DrawBlockClass::Block), microseconds(DrawBlockClass::Block), commits(DrawBlockClass::Mixed), microseconds(DrawBlockClass::Mixed), commits(DrawBlockClass::Classic), microseconds(DrawBlockClass::Classic), 10);
 }
 
 struct StageTruth {
