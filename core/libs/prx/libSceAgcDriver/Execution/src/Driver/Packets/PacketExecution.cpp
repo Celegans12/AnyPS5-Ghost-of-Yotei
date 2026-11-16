@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Dispatch/DispatchLater.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -29,7 +30,9 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -166,7 +169,12 @@ struct DecoderSeat {
     std::uint64_t (*call)(void* target, const Core::DecodedOp& op) = nullptr;
     Core::DecoderRing ring;
     Core::Decoder decoder;
-    std::atomic<std::uint64_t> runs{0}, draws{0}, packets{0}, batches{0}, runNs{0}, enqueueNs{0};
+    std::atomic<std::uint64_t> runs{0}, draws{0}, packets{0}, batches{0}, runNs{0}, enqueueNs{0}, heldKnown{0}, heldUnknown{0}, heldDecoded{0};
+    struct Held {
+        bool unknown = true;
+        std::vector<DrawFinisher::Range> writes;
+    };
+    std::unordered_map<std::uint64_t, Held> held;
 
     DecoderSeat() : ring(Core::DecoderRing::Settings{1024, 8, false, 0}), decoder(Core::Decoder::Settings{512}, Core::DecoderHost{this, &DecoderSeat::draw, &DecoderSeat::heavy, &DecoderSeat::retired, &DecoderSeat::await}) {}
 
@@ -201,7 +209,7 @@ void decoderReport() {
     const auto decoded = seat.decoder.Counted();
     const auto ring = seat.ring.Counted();
     const auto draws = seat.draws.load(std::memory_order_relaxed);
-    std::fprintf(stderr, "[decoder] run (cumulative): %llu runs, %llu packets decoded, %llu draws posted in %llu batches; %.2f us per draw in the runs, %.2f us of them handing batches to the draw finisher; snapshots: shader %llu, context %llu, user configuration %llu; %llu waits for a snapshot, %llu for room in the ring%c", value(seat.runs), value(seat.packets), value(seat.draws), value(seat.batches), draws != 0 ? static_cast<double>(seat.runNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(draws) : 0.0, draws != 0 ? static_cast<double>(seat.enqueueNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(draws) : 0.0, static_cast<unsigned long long>(decoded.shaderSnapshots), static_cast<unsigned long long>(decoded.contextSnapshots), static_cast<unsigned long long>(decoded.userConfigSnapshots), static_cast<unsigned long long>(decoded.snapshotWaits), static_cast<unsigned long long>(ring.roomWaits), 10);
+    std::fprintf(stderr, "[decoder] run (cumulative): %llu runs, %llu packets decoded, %llu draws posted in %llu batches; %.2f us per draw in the runs, %.2f us of them handing batches to the draw finisher; snapshots: shader %llu, context %llu, user configuration %llu; %llu waits for a snapshot, %llu for room in the ring; batches queued with their target ranges %llu, without %llu, %llu draw shapes decoded for their ranges%c", value(seat.runs), value(seat.packets), value(seat.draws), value(seat.batches), draws != 0 ? static_cast<double>(seat.runNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(draws) : 0.0, draws != 0 ? static_cast<double>(seat.enqueueNs.load(std::memory_order_relaxed)) / 1000.0 / static_cast<double>(draws) : 0.0, static_cast<unsigned long long>(decoded.shaderSnapshots), static_cast<unsigned long long>(decoded.contextSnapshots), static_cast<unsigned long long>(decoded.userConfigSnapshots), static_cast<unsigned long long>(decoded.snapshotWaits), static_cast<unsigned long long>(ring.roomWaits), value(seat.heldKnown), value(seat.heldUnknown), value(seat.heldDecoded), 10);
 }
 
 void laneReport() {
@@ -467,8 +475,44 @@ void Driver::execute(Submission& submission) {
         std::uint64_t enqueueNs = 0;
         std::uint32_t pending = 0;
         std::uint64_t posted = 0;
+        bool batchUnknown = false;
+        std::uint64_t batchShape = 0;
+        std::vector<DrawFinisher::Range> batchWrites;
+        const auto heldOf = [&](std::uint64_t& shape) -> const DecoderSeat::Held& {
+            static const DecoderSeat::Held unknown;
+            const auto localDevice = device.Load();
+            if (localDevice == nullptr) return unknown;
+            drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shape);
+            if (const auto found = seat.held.find(shape); found != seat.held.end()) return found->second;
+            if (seat.held.size() >= 8192) seat.held.clear();
+            DecoderSeat::Held fresh;
+            try {
+                const auto decoded = decodeDraw(queue, submission, localDevice->graphicsContext());
+                bool stores = false;
+                for (std::size_t index = 0; index < decoded->programs.size() && !stores; ++index) {
+                    if (index < decoded->roles.size() && decoded->roles[index] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
+                    const auto& program = decoded->programs[index];
+                    stores = program.snapshot == nullptr || ProgramWritesMemory(*program.snapshot, program.codeOffset) || (program.tailContinuation != nullptr && ProgramWritesMemory(*program.tailContinuation, 0));
+                }
+                if (!stores) {
+                    fresh.writes = DrawWriteRanges(decoded->state, {}, ExactDrawWrites());
+                    fresh.unknown = false;
+                }
+            } catch (const std::exception&) {
+                fresh = DecoderSeat::Held{};
+            }
+            laneBump(seat.heldDecoded);
+            return seat.held.emplace(shape, std::move(fresh)).first->second;
+        };
         const auto closeBatch = [&] {
             if (pending == 0) return;
+            DrawFinisher::Pending heldBatch;
+            heldBatch.unknown = batchUnknown;
+            if (!batchUnknown) heldBatch.writes = std::move(batchWrites);
+            laneBump(batchUnknown ? seat.heldUnknown : seat.heldKnown);
+            batchUnknown = false;
+            batchShape = 0;
+            batchWrites.clear();
             const auto batch = seat.ring.TryClaim(pending);
             if (batch.count != pending) throw std::logic_error("APS5_DECODER: the draws posted for a batch are not the ones the ring hands back");
             pending = 0;
@@ -509,7 +553,7 @@ void Driver::execute(Submission& submission) {
                         ReportRefusedDraw(refused);
                     }
                 }
-            }, DrawFinisher::Pending{});
+            }, std::move(heldBatch));
             enqueueNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count());
             laneBump(seat.batches);
         };
@@ -521,10 +565,20 @@ void Driver::execute(Submission& submission) {
             packetCounters.CountDraw();
             drawnSinceSeal() = true;
             Graphics::Recorder::CountRecordedWork();
+            std::uint64_t shape = 0;
+            const auto& heldDraw = heldOf(shape);
+            if (heldDraw.unknown != batchUnknown && pending != 0) closeBatch();
+            batchUnknown = heldDraw.unknown;
+            if (!heldDraw.unknown && (pending == 0 || shape != batchShape)) {
+                for (const auto& range : heldDraw.writes) {
+                    if (std::find(batchWrites.begin(), batchWrites.end(), range) == batchWrites.end()) batchWrites.push_back(range);
+                }
+                batchShape = shape;
+            }
             const auto order = seat.ring.Post(op);
             ++pending;
             ++posted;
-            if (pending == DecoderBatchDraws) closeBatch();
+            if (pending == DecoderBatchDraws || batchUnknown) closeBatch();
             return order;
         };
         const auto before = seat.decoder.Counted().packets;
