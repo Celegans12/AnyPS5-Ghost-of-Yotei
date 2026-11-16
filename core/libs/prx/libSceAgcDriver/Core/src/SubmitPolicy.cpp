@@ -16,6 +16,10 @@ bool capped(const SubmitState& state, const SubmitLimits& limits) {
     return limits.workCap != 0 && state.work >= limits.workCap;
 }
 
+bool idle(const SubmitState& state, const SubmitLimits& limits) {
+    return limits.idleLoad != 0 && state.gpuIdle && state.gpuLoad >= limits.idleLoad;
+}
+
 }
 
 SubmitCause AtSubmissionEnd(const SubmitState& state, const SubmitLimits& limits) {
@@ -26,6 +30,7 @@ SubmitCause AtSubmissionEnd(const SubmitState& state, const SubmitLimits& limits
     if (capped(state, limits)) return SubmitCause::Cap;
     if (state.work >= limits.groupWork) return SubmitCause::Work;
     if (reached(state.now, state.oldestLabel, limits.deadline) || reached(state.now, state.heldSince, limits.deadline)) return SubmitCause::Deadline;
+    if (idle(state, limits)) return SubmitCause::Idle;
     return SubmitCause::Held;
 }
 
@@ -33,6 +38,7 @@ SubmitCause AfterOp(const SubmitState& state, const SubmitLimits& limits) {
     if (state.heldSince != 0) return AtSubmissionEnd(state, limits);
     if (capped(state, limits)) return SubmitCause::Cap;
     if (reached(state.now, state.oldestLabel, limits.deadline)) return SubmitCause::Deadline;
+    if (idle(state, limits)) return SubmitCause::Idle;
     return SubmitCause::Held;
 }
 
@@ -46,6 +52,7 @@ const char* SubmitCauseName(SubmitCause cause) {
         case SubmitCause::Work: return "work";
         case SubmitCause::Deadline: return "deadline";
         case SubmitCause::Cap: return "cap";
+        case SubmitCause::Idle: return "idle";
         case SubmitCause::Count: break;
     }
     return "unknown";

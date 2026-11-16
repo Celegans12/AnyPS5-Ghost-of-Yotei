@@ -2992,6 +2992,34 @@ bool LabelMarksPerBatch() {
     return enabled;
 }
 
+struct OpenGpuLoadState {
+    const Graphics::Recorder* recorder = nullptr;
+    std::uint64_t serial = 0;
+    std::uint64_t threads = 0;
+};
+
+OpenGpuLoadState& openGpuLoad() {
+    static OpenGpuLoadState load;
+    return load;
+}
+
+std::atomic<std::uint64_t> openGpuLoadHint{0};
+
+void noteOpenGpuLoad(Graphics::Recorder& recorder, std::uint64_t groups, const std::array<std::uint32_t, 3>& threadGroup) {
+    auto& load = openGpuLoad();
+    const auto serial = recorder.OpenBatchSerial();
+    if (load.recorder != &recorder || load.serial != serial) {
+        load.recorder = &recorder;
+        load.serial = serial;
+        load.threads = 0;
+    }
+    std::uint64_t perGroup = 1;
+    for (const auto axis : threadGroup) perGroup *= axis != 0 ? axis : 4u;
+    const auto threads = groups > std::numeric_limits<std::uint64_t>::max() / perGroup ? std::numeric_limits<std::uint64_t>::max() : groups * perGroup;
+    load.threads = threads > std::numeric_limits<std::uint64_t>::max() - load.threads ? std::numeric_limits<std::uint64_t>::max() : load.threads + threads;
+    openGpuLoadHint.store(load.threads, std::memory_order_relaxed);
+}
+
 struct OffDrawLabels {
     Core::LabelBatch batch;
     const Graphics::Recorder* recorder = nullptr;
@@ -3047,6 +3075,20 @@ void offDrawMark(Graphics::Recorder& recorder, std::uint64_t address, std::size_
     GuestMemory::MarkWrittenInCollectedBlock(address, bytes);
 }
 
+}
+
+std::uint64_t VulkanDevice::OpenGpuLoad() {
+    if (!state->recorder) return 0;
+    const auto& load = openGpuLoad();
+    return load.recorder == state->recorder.get() && load.serial != 0 && load.serial == state->recorder->OpenBatchSerial() ? load.threads : 0;
+}
+
+std::uint64_t VulkanDevice::OpenGpuLoadHint() {
+    return openGpuLoadHint.load(std::memory_order_relaxed);
+}
+
+bool VulkanDevice::GpuIdle() {
+    return state->recorder && state->recorder->Reap();
 }
 
 VulkanDevice::OffDrawCount VulkanDevice::OffDrawCounts() {
@@ -6827,6 +6869,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::recordCompletedDispatch(const Shader
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
     recordDispatch(record);
+    if (record.arguments == 0 && DriverDetail::SubmitEarly()) noteOpenGpuLoad(*state->recorder, std::uint64_t{record.x} * record.y * record.z, record.threadGroup);
     timing.Mark("command_record");
     timer.phase(PhaseRecord);
     APS5_LOG_OUT_DEBUG("Dispatch recorded groups=%s", groupsText);
@@ -6998,6 +7041,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     recordDispatch(record);
+    if (record.arguments == 0 && DriverDetail::SubmitEarly()) noteOpenGpuLoad(*state->recorder, std::uint64_t{record.x} * record.y * record.z, record.threadGroup);
     if (profile) counters.recordNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - recordStart).count()), std::memory_order_relaxed);
     timing.Mark("command_record");
     timer.phase(PhaseRecord);

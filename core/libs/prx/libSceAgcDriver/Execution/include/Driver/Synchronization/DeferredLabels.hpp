@@ -32,6 +32,13 @@ bool QueuedLabelTable();
 
 bool LabelBatchSubmit();
 
+bool LabelsInBatch();
+void FlushLabelRun();
+struct LabelRunCount {
+    std::uint64_t runs, labels, alone;
+};
+LabelRunCount LabelRunCounts();
+
 std::size_t& queuedLabelsNoted();
 
 bool NeedsRecordedLabels(std::uint32_t header);

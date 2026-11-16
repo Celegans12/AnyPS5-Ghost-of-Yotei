@@ -35,6 +35,25 @@ bool VerifyCoreOffDraw() {
     return enabled;
 }
 
+bool SubmitEarly() {
+    static const bool enabled = std::getenv("APS5_SUBMIT_EARLY") != nullptr;
+    return enabled;
+}
+
+std::uint64_t SubmitEarlyLoad() {
+    static const std::uint64_t value = [] {
+        const char* text = std::getenv("APS5_SUBMIT_EARLY_LOAD");
+        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
+        return parsed != 0 ? parsed : 1048576ull;
+    }();
+    return value;
+}
+
+std::atomic<std::uint64_t>& EarlySubmits() {
+    static std::atomic<std::uint64_t> submits{0};
+    return submits;
+}
+
 void PollSleep() {
 #ifdef _WIN32
     thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);

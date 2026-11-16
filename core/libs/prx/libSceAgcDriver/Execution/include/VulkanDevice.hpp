@@ -131,6 +131,9 @@ public:
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.
     void ReapRecorded();
+    std::uint64_t OpenGpuLoad();
+    static std::uint64_t OpenGpuLoadHint();
+    bool GpuIdle();
     // Records a store of `bytes` at a guest address behind the recorded work, so the value appears
     // once that work completed; the batch is submitted by the queue worker's flush rules (or at once
     // with APS5_LABEL_SUBMIT_NOW=1). `stamp` is the record-order stamp and `queue` the recording

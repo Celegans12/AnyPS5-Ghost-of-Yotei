@@ -168,6 +168,10 @@ void testTruthTable() {
     Expect(combinations == 512, "the truth table covers 128 combinations of causes, with and without a hold, in two forms each");
     Expect(atEndWrong == 0, "AtSubmissionEnd follows flip, interrupt, waiter, empty queue, cap, work, deadline, in that order, over the whole table");
     Expect(afterWrong == 0, "AfterOp follows the same order during a hold, and only cap then deadline without one, over the whole table");
+    const std::size_t idleCause = static_cast<std::size_t>(SubmitCause::Idle);
+    Expect(!atEndSeen[idleCause] && !afterSeen[idleCause], "without an idle load no cause of the table is the idle GPU");
+    atEndSeen[idleCause] = true;
+    afterSeen[idleCause] = true;
     Expect(std::all_of(atEndSeen.begin(), atEndSeen.end(), [](bool seen) { return seen; }), "AtSubmissionEnd returns every cause of the table");
     Expect(std::all_of(afterSeen.begin(), afterSeen.end(), [](bool seen) { return seen; }), "AfterOp returns every cause of the table");
 }
@@ -274,6 +278,34 @@ void testWorkEdges() {
     holding.work = MostWork;
     Expect(AtSubmissionEnd(state, limits) == SubmitCause::Work && AfterOp(state, limits) == SubmitCause::Held, "a cap of zero never submits");
     Expect(AfterOp(holding, limits) == SubmitCause::Work, "a cap of zero leaves the group work to end a hold");
+}
+
+void testIdleGpu() {
+    SubmitLimits limits = limitsOf(Late, 64, 0);
+    limits.idleLoad = 100;
+    SubmitState state = base();
+    state.gpuIdle = true;
+    state.gpuLoad = 100;
+    Expect(both(state, limits, SubmitCause::Idle), "a load at the idle load is submitted to an idle GPU at a submission end and after an operation without a hold");
+    SubmitState holding = state;
+    holding.heldSince = Now;
+    Expect(both(holding, limits, SubmitCause::Idle), "an idle GPU ends a hold once the load is reached");
+    state.gpuLoad = 99;
+    Expect(both(state, limits, SubmitCause::Held), "one unit short of the idle load is held");
+    state.gpuLoad = Most;
+    state.gpuIdle = false;
+    Expect(both(state, limits, SubmitCause::Held), "a busy GPU takes no early batch whatever the load");
+    state.gpuIdle = true;
+    Expect(both(state, limitsOf(Late, 64, 0), SubmitCause::Held), "an idle load of zero never submits early");
+    state.oldestLabel = Now - Late;
+    Expect(both(state, limits, SubmitCause::Deadline), "the deadline is named before the idle GPU");
+    state.oldestLabel = 0;
+    state.flip = true;
+    Expect(AtSubmissionEnd(state, limits) == SubmitCause::Flip && AfterOp(holding, limits) == SubmitCause::Idle, "a flip is named before the idle GPU");
+    state.flip = false;
+    state.queued = 0;
+    Expect(AtSubmissionEnd(state, limits) == SubmitCause::Empty && AfterOp(state, limits) == SubmitCause::Idle, "without a hold an empty queue is not a cause after an operation and the idle GPU still submits");
+    Expect(std::string_view(SubmitCauseName(SubmitCause::Idle)) == "idle", "the idle GPU cause is named idle");
 }
 
 void testDefaults() {
@@ -425,6 +457,7 @@ int main() {
     testEachCause();
     testDeadlineEdges();
     testWorkEdges();
+    testIdleGpu();
     testDefaults();
     testClockExample();
     testRandomScenarios();

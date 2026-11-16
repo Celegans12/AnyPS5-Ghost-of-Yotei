@@ -54,6 +54,9 @@ void PollSleep();
 std::atomic<std::uint32_t>& BlockedReaders();
 bool CoreOffDraw();
 bool VerifyCoreOffDraw();
+bool SubmitEarly();
+std::uint64_t SubmitEarlyLoad();
+std::atomic<std::uint64_t>& EarlySubmits();
 
 bool OwnStoreRejects(std::span<const std::uint32_t> packet, std::uint64_t awaited, std::size_t bytes, std::uint32_t queue);
 

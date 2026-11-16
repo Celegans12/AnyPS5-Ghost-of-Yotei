@@ -428,6 +428,7 @@ void Driver::execute(Submission& submission) {
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (!(pipelined && !predicated && (opcode == 0x49 || opcode == 0x37) && header != FlipPacketHeader && header != RenderingWaitPacketHeader && !submission.flips.contains(cursor))) FlushLabelRun();
         const bool laneChecked = verifyLane && laneNow && !predicated && lanePacket(submission, cursor, header, opcode) && !submission.flips.contains(cursor);
         const auto laneDiffers = [&](const char* what) {
             throw std::runtime_error(std::string("APS5_VERIFY_CORE_LIGHT_LANE: a packet the light lane would take (") + Pm4::Name(header) + ") " + what);
@@ -763,6 +764,7 @@ void Driver::execute(Submission& submission) {
         cursor = nextCursor;
     }
 
+    FlushLabelRun();
     const bool queuesEnd = pipelined && orderedCompletion && deferredLabels().labels.empty();
     const bool relaysEnd = queuesEnd && DrawFinisher::RelaysSubmissionEnd();
     const auto rewindReleased = [&] { return submission.rewindTail != nullptr && (std::atomic_ref<std::uint32_t>(*const_cast<std::uint32_t*>(submission.rewindTail - 1)).load(std::memory_order_acquire) & 0x80000000u) != 0; };
