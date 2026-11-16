@@ -315,6 +315,42 @@ bool Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
     const bool cacheable = useDrawEntries && !drawHit && (drawCacheIndirect() || !(drawParameters.indirect && indirectCpu));
     const bool admitted = cacheable && (verifyHit || admitDrawKey(drawKey, registerKey && drawDataHits() ? shapeKey : 0, relocation));
     const bool replaceShape = cacheable && !admitted && shapeNeedsEntry;
+    const bool indexed = ShapeStageIndex::Enabled() && cacheable && registerKey && shapeKey != 0 && drawDataHits() && drawShapeUserWords() && !drawParameters.indirect && decode != nullptr && decode->state.stages.path == Graphics::ShaderPath::Vertex;
+    const auto build = [&](std::size_t i) {
+        const auto& stageCapture = stageCaptures[i];
+        auto variant = std::make_shared<DispatchVariant>();
+        variant->compiled = stageCapture.compiled;
+        if (stageCapture.capture != nullptr) variant->plan = stageCapture.capture->plan;
+        variant->registeredViews = stageCapture.registeredViews;
+        if (programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh) {
+            std::copy_n(programs[i].userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord, variant->meshIndexDescriptor.size(), variant->meshIndexDescriptor.begin());
+        }
+        variant->shader = programs[i].snapshot;
+        variant->forgetSerial = stageCapture.forgetSerial;
+        variant->pushOffset = stageCapture.pushOffset;
+        variant->userDataMask = stageCapture.userDataMask;
+        variant->forwardedWords = stageCapture.forwardedWords;
+        if (vertexInfos[i]) variant->vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(*vertexInfos[i]);
+
+        const bool vertexInputs = !decodeReads[i].empty() || (vertexInfos[i] && vertexInfos[i]->resourcesNum != 0);
+        const bool tailed = vertexInputs && shapeVertexInputStages() && stageCapture.vertexTableWords != 0 && !decodeReads[i].empty() && std::all_of(decodeReads[i].begin(), decodeReads[i].end(), [](const Graphics::DecodeRead& read) { return read.size % sizeof(std::uint32_t) == 0; });
+        std::vector<ShaderRecompiler::MemoryRegion> regions(stageCapture.regions.begin(), stageCapture.regions.end());
+        if (!tailed) {
+            for (const auto& read : decodeReads[i]) regions.push_back({read.address, read.Bytes()});
+        }
+        std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
+        const bool relocatable = !vertexInputs || tailed;
+        tagVariantRuns(*variant, regions, stageCapture.userDataUse, relocatable, programs[i].hiddenUserWords, stageCapture.supplied);
+        if (drawStageDataHits() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) recordStageDataPositions(*variant, *stageCapture.capture, decodeReads[i]);
+        if (stageCapture.capture != nullptr && stageCapture.capture->plan != nullptr && !stageCapture.capture->readTrace.descriptorLeaves.empty()) recordStageBufferPositions(*variant, *stageCapture.capture, decodeReads[i]);
+        if (tailed) {
+            appendDecodeRuns(*variant, decodeReads[i]);
+            variant->vertexTableWords = stageCapture.vertexTableWords;
+        }
+        if (relocatable && stageCapture.capture != nullptr && stageCapture.capture->plan != nullptr) tagUserLeafWords(*variant, *stageCapture.capture->plan, programs[i]);
+        if (relocatable) tagUserValueWords(*variant, programs[i]);
+        return variant;
+    };
     if (admitted || replaceShape) {
         phaseTiming.Phase(DrawRowVectors);
         std::uint64_t unstable = 0, mismatches = 0, differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
@@ -325,37 +361,7 @@ bool Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
                 continue;
             }
             if (stageCapture.compiled == nullptr || !CacheableResult(*stageCapture.compiled)) continue;
-            auto variant = std::make_shared<DispatchVariant>();
-            variant->compiled = stageCapture.compiled;
-            if (stageCapture.capture != nullptr) variant->plan = stageCapture.capture->plan;
-            variant->registeredViews = stageCapture.registeredViews;
-            if (programs[i].binary.stage == ShaderRecompiler::ShaderStage::Mesh) {
-                std::copy_n(programs[i].userData.begin() + ShaderRecompiler::MeshIndexBufferUserWord, variant->meshIndexDescriptor.size(), variant->meshIndexDescriptor.begin());
-            }
-            variant->shader = programs[i].snapshot;
-            variant->forgetSerial = stageCapture.forgetSerial;
-            variant->pushOffset = stageCapture.pushOffset;
-            variant->userDataMask = stageCapture.userDataMask;
-            variant->forwardedWords = stageCapture.forwardedWords;
-            if (vertexInfos[i]) variant->vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(*vertexInfos[i]);
-
-            const bool vertexInputs = !decodeReads[i].empty() || (vertexInfos[i] && vertexInfos[i]->resourcesNum != 0);
-            const bool tailed = vertexInputs && shapeVertexInputStages() && stageCapture.vertexTableWords != 0 && !decodeReads[i].empty() && std::all_of(decodeReads[i].begin(), decodeReads[i].end(), [](const Graphics::DecodeRead& read) { return read.size % sizeof(std::uint32_t) == 0; });
-            std::vector<ShaderRecompiler::MemoryRegion> regions(stageCapture.regions.begin(), stageCapture.regions.end());
-            if (!tailed) {
-                for (const auto& read : decodeReads[i]) regions.push_back({read.address, read.Bytes()});
-            }
-            std::stable_sort(regions.begin(), regions.end(), [](const ShaderRecompiler::MemoryRegion& a, const ShaderRecompiler::MemoryRegion& b) { return a.guestAddress < b.guestAddress; });
-            const bool relocatable = !vertexInputs || tailed;
-            tagVariantRuns(*variant, regions, stageCapture.userDataUse, relocatable, programs[i].hiddenUserWords, stageCapture.supplied);
-            if (drawStageDataHits() && stageCapture.capture != nullptr && !stageCapture.capture->readTrace.leaves.empty()) recordStageDataPositions(*variant, *stageCapture.capture, decodeReads[i]);
-            if (stageCapture.capture != nullptr && stageCapture.capture->plan != nullptr && !stageCapture.capture->readTrace.descriptorLeaves.empty()) recordStageBufferPositions(*variant, *stageCapture.capture, decodeReads[i]);
-            if (tailed) {
-                appendDecodeRuns(*variant, decodeReads[i]);
-                variant->vertexTableWords = stageCapture.vertexTableWords;
-            }
-            if (relocatable && stageCapture.capture != nullptr && stageCapture.capture->plan != nullptr) tagUserLeafWords(*variant, *stageCapture.capture->plan, programs[i]);
-            if (relocatable) tagUserValueWords(*variant, programs[i]);
+            auto variant = build(i);
             if (traceDrawCache() && entry != nullptr && matched[i] == nullptr && i < entry->stages.size()) {
                 const auto& variants = entry->stages[i];
                 const auto front = std::find_if(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& kept) { return kept->pushOffset == variant->pushOffset; });
@@ -425,6 +431,23 @@ bool Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             drawEntryCounters.differingRunsChanged += differingRunsChanged;
         }
         phaseTiming.Phase(DrawRowKeyLookupValidate);
+    }
+    if (indexed) {
+        auto& index = ShapeStageIndex::Shared();
+        for (std::size_t i = 0; i < programs.size(); ++i) {
+            if (reused[i]) continue;
+            auto variant = admitted || replaceShape ? fresh[i] : nullptr;
+            if (variant == nullptr && !(admitted || replaceShape)) {
+                const auto& stageCapture = stageCaptures[i];
+                if (stageCapture.compiled == nullptr || !CacheableResult(*stageCapture.compiled)) continue;
+                if (insertCompare()) {
+                    const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);
+                    if (!captureStable(stageCapture.regions)) continue;
+                }
+                variant = build(i);
+            }
+            if (variant != nullptr) index.Insert(shapeKey, i, drawKey, variant, programs[i].userData);
+        }
     }
     return admitted || replaceShape;
 }
