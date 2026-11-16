@@ -1716,21 +1716,17 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
     }
     AgcDriver::ProfilePrint_nid_no_patch("[commits] by kind (10 s):%s\n", kindText.c_str());
     static Graphics::Recorder::SubmitStatistics reportedSubmits{};
-    static Graphics::Recorder::SerialReapStatistics reportedReaps{};
     static GuestMemory::CollectedMarkCounts reportedMarks{};
     static Driver::SubmitGroupCounts reportedHolds{};
     const auto submits = Graphics::Recorder::SubmitCounts();
-    const auto reaps = Graphics::Recorder::SerialReapCounts();
     const auto marks = GuestMemory::CollectedMarkCounted();
     const auto holds = Driver::SubmitGroupCounted();
     const auto submitted = submits.submits - reportedSubmits.submits;
-    AgcDriver::ProfilePrint_nid_no_patch("[off-draw] (10 s): %llu commits other than draws in %.1f ms on the committer; %llu vkQueueSubmit calls at %.1f us each; batch fence status: %llu answered by the timeline serial, %llu asked of the fence behind it (%llu fences already signaled where the serial refused, %llu unsignaled where it agreed); label marks: %llu without a collect, %llu collected to verify (%llu found a write); submission ends held %llu, held batches submitted at an empty queue %llu, at the deadline %llu, at the work count %llu, by another submit %llu\n",
+    AgcDriver::ProfilePrint_nid_no_patch("[off-draw] (10 s): %llu commits other than draws in %.1f ms on the committer; %llu vkQueueSubmit calls at %.1f us each; label marks: %llu without a collect, %llu collected to verify (%llu found a write); submission ends held %llu, held batches submitted at an empty queue %llu, at the deadline %llu, at the work count %llu, by another submit %llu\n",
                                          static_cast<unsigned long long>(offDrawCommits), static_cast<double>(offDrawNs) / 1e6, static_cast<unsigned long long>(submitted), submitted == 0 ? 0.0 : static_cast<double>(submits.queueSubmitNs - reportedSubmits.queueSubmitNs) / 1e3 / static_cast<double>(submitted),
-                                         static_cast<unsigned long long>(reaps.refused - reportedReaps.refused), static_cast<unsigned long long>(reaps.fenceQueries - reportedReaps.fenceQueries), static_cast<unsigned long long>(reaps.late - reportedReaps.late), static_cast<unsigned long long>(reaps.early - reportedReaps.early),
                                          static_cast<unsigned long long>(marks.skipped - reportedMarks.skipped), static_cast<unsigned long long>(marks.verified - reportedMarks.verified), static_cast<unsigned long long>(marks.fresh - reportedMarks.fresh),
                                          static_cast<unsigned long long>(holds.held - reportedHolds.held), static_cast<unsigned long long>(holds.submittedLast - reportedHolds.submittedLast), static_cast<unsigned long long>(holds.submittedDue - reportedHolds.submittedDue), static_cast<unsigned long long>(holds.submittedWork - reportedHolds.submittedWork), static_cast<unsigned long long>(holds.submittedElsewhere - reportedHolds.submittedElsewhere));
     reportedSubmits = submits;
-    reportedReaps = reaps;
     reportedMarks = marks;
     reportedHolds = holds;
     if (Flat()) {

@@ -763,11 +763,6 @@ public:
         std::uint64_t runsAtSubmit, runsForced;
     };
     static StoreStatistics StoreCounts();
-    struct SerialReapStatistics {
-        bool enabled;
-        std::uint64_t refused, fenceQueries, late, early;
-    };
-    static SerialReapStatistics SerialReapCounts();
     struct SubmitStatistics {
         std::uint64_t submits, queueSubmitNs;
     };
