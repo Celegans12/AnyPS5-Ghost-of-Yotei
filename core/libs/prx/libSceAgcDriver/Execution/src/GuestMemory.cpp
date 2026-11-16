@@ -462,6 +462,8 @@ struct CollectCost {
     std::array<std::atomic<std::uint64_t>, 3> walkTicks{};
     std::array<std::atomic<std::uint64_t>, 3> walkWatchTicks{};
     std::array<std::atomic<std::uint64_t>, 3> walkBytes{};
+    std::array<std::atomic<std::uint64_t>, 6> missCause{};
+    std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(ReadSite::Count)> missSite{};
     std::array<std::atomic<std::uint64_t>, 3> cleanWalks{};
     std::array<std::atomic<std::uint64_t>, 3> cleanTicks{};
     std::array<std::atomic<std::uint64_t>, 3> cleanWatchTicks{};
@@ -2632,8 +2634,12 @@ struct ThreadCollectMemo {
     std::size_t next = 0;
 };
 
+std::atomic<std::uint64_t> floorRaisesUnwatched{0};
+std::atomic<std::uint64_t> floorRaisesMapping{0};
+
 void syncObservationContext(WriteTracker& tracker, std::uint64_t unwatched, std::uint64_t mapping) {
     if (tracker.observationUnwatched.load(std::memory_order_relaxed) == unwatched && tracker.observationMapping.load(std::memory_order_relaxed) == mapping) return;
+    (tracker.observationUnwatched.load(std::memory_order_relaxed) != unwatched ? floorRaisesUnwatched : floorRaisesMapping).fetch_add(1, std::memory_order_relaxed);
     tracker.observationFloor.store(nextCollectEpoch.fetch_add(1, std::memory_order_acq_rel) + 1, std::memory_order_release);
     tracker.observationUnwatched.store(unwatched, std::memory_order_release);
     tracker.observationMapping.store(mapping, std::memory_order_release);
@@ -2928,8 +2934,16 @@ Observation observe(std::uint64_t address, std::size_t bytes, bool memoized) {
         };
         bool open = false;
         std::uint64_t from = 0;
+        bool noted = !collectTimed();
         for (auto block = tracker.blockOf(first); block <= lastBlock; ++block) {
-            if (tracker.observedTick(block) < need) {
+            if (const auto seen = tracker.observedTick(block); seen < need) {
+                if (!noted) {
+                    noted = true;
+                    auto& cost = collectCost();
+                    const std::size_t cause = seen == 0 ? 0 : seen >= epoch ? 1 : epoch - seen <= 2 ? 2 : epoch - seen <= 16 ? 3 : epoch - seen <= 128 ? 4 : 5;
+                    cost.missCause[cause].fetch_add(1, std::memory_order_relaxed);
+                    cost.missSite[static_cast<std::size_t>(CurrentReadSite())].fetch_add(1, std::memory_order_relaxed);
+                }
                 if (!open) from = block;
                 open = true;
             } else if (open) {
@@ -3397,6 +3411,18 @@ void ReportCollectCosts() {
             AgcDriver::ProfilePrint_nid_no_patch("[token-breaks] (10 s): of the tokens broken by a write, %llu had a write the tracker places in their own range (%llu of them by the CPU, %.0f bytes a range), %llu only in the 4 KiB pages around the range, %llu only elsewhere in their 64 KiB blocks (%.0f bytes a range), %llu were taken by another thread\n", exact, exactCpu, exact == 0 ? 0.0 : static_cast<double>(exactBytes) / static_cast<double>(exact), pages, neighbour, neighbour == 0 ? 0.0 : static_cast<double>(neighbourBytes) / static_cast<double>(neighbour), unknown);
         }
     }
+    for (std::size_t index = 0; index < collectCosts.size(); ++index) {
+        auto& cost = collectCosts[index];
+        std::array<unsigned long long, 6> causes{};
+        for (std::size_t cause = 0; cause < causes.size(); ++cause) causes[cause] = take(cost.missCause[cause]);
+        std::string sites;
+        for (std::size_t site = 0; site < cost.missSite.size(); ++site) {
+            const auto count = take(cost.missSite[site]);
+            if (count != 0) sites += " " + std::string(ReadSiteName(static_cast<ReadSite>(site))) + " " + std::to_string(count) + ";";
+        }
+        AgcDriver::ProfilePrint_nid_no_patch("[collect-miss] (10 s) %s: memoized collects that walked, by the first block that missed: never observed %llu; observed in this epoch but under a floor raised since %llu; observed 1 to 2 epochs earlier %llu, 3 to 16 %llu, 17 to 128 %llu, older %llu; by read site:%s\n", names[index], causes[0], causes[1], causes[2], causes[3], causes[4], causes[5], sites.c_str());
+    }
+    AgcDriver::ProfilePrint_nid_no_patch("[collect-miss] (10 s) floor raised %llu times by an unwatch and %llu times by a change of the guest allocations\n", static_cast<unsigned long long>(floorRaisesUnwatched.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(floorRaisesMapping.exchange(0, std::memory_order_relaxed)));
 #ifdef _WIN32
     static std::uint64_t reportedCalls = 0;
     static std::uint64_t reportedTicks = 0;
