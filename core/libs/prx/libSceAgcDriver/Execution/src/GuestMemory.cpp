@@ -413,6 +413,7 @@ void raiseForgetSlot(std::atomic<std::uint64_t>& slot, std::uint64_t serial) {
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
 std::atomic<std::uint64_t> exactMemoHits{0};
+std::atomic<std::uint64_t> verifiedCoarse{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> collectWalkedEpochs{0};
 std::atomic<std::uint64_t> committerWatchCalls{0};
@@ -1966,7 +1967,7 @@ struct WriteTracker {
 
     void markAsked(std::uint64_t first, std::uint64_t stop, std::uint64_t serial) const {
         const auto* table = observationTable.load(std::memory_order_acquire);
-        if (table == nullptr || stop <= first || !inObservationRange(first, stop)) return;
+        if (table == nullptr || stop <= first || stop - first > SweepRunBlocks * WriteBlockBytes || !inObservationRange(first, stop)) return;
         const auto raise = [serial](std::atomic<std::uint64_t>& slot) {
             if (slot.load(std::memory_order_relaxed) != serial) slot.store(serial, std::memory_order_relaxed);
         };
@@ -2313,6 +2314,44 @@ struct WriteTracker {
             }
         }
         return false;
+    }
+
+    struct Change {
+        const char* reason = nullptr;
+        bool placed = false;
+    };
+
+    Change changeSince(std::uint64_t address, std::uint64_t end, std::uint64_t generation) const {
+        if (refusedSince(address, end, generation)) return {"a refused walk of the block", false};
+        for (auto block = blockOf(address); block <= blockOf(end - 1); ++block) {
+            if (stampOf(block) <= generation) continue;
+            const auto begin = blockBegin(block);
+            const auto from = std::max(address, begin) - begin;
+            const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin;
+            const auto newerPage = [&](const std::unordered_map<std::uint64_t, CpuPages>& pages) {
+                const auto found = pages.find(block);
+                if (found == pages.end()) return false;
+                for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) {
+                    if (found->second.pages[page] > generation) return true;
+                }
+                return false;
+            };
+            if (cpuPages.find(block) == cpuPages.end() && cpuStampOf(block) > generation) return {"a CPU stamp of the block with no page record", true};
+            if (newerPage(cpuPages)) return {"a CPU store into its pages", true};
+            if (newerPage(walkPages)) return {"a store found by a driver walk in its pages", true};
+            const auto found = driverPieces.find(block);
+            if (found == driverPieces.end()) continue;
+            const auto& entry = found->second;
+            if (entry.whole > generation || entry.possibleWhole > generation) return {"a driver store over the whole block", true};
+            for (const auto& piece : entry.pieces) {
+                if (piece.generation > generation && piece.begin < to && from < piece.end) return {"a driver store into its bytes", true};
+            }
+            for (const auto& piece : entry.possiblePieces) {
+                if (piece.generation > generation && piece.begin < to && from < piece.end) return {"a possible driver store into its bytes", true};
+            }
+            if (entry.dropped > generation || entry.possibleDropped > generation) return {"driver stores of the block the tracker no longer places", false};
+        }
+        return {"nothing it can name", false};
     }
 
     bool refusedSince(std::uint64_t address, std::uint64_t end, std::uint64_t since) const {
@@ -3337,6 +3376,10 @@ void ReportCollectCosts() {
                                              since(counts.missed[static_cast<std::size_t>(TokenMiss::Busy)], reported.missed[static_cast<std::size_t>(TokenMiss::Busy)]), since(counts.verified, reported.verified), since(counts.late, reported.late));
         reported = counts;
         reportedTicks = sweepTicks;
+        static std::uint64_t reportedCoarse = 0;
+        const auto coarse = verifiedCoarse.load(std::memory_order_relaxed);
+        if (epochSweepVerified()) AgcDriver::ProfilePrint_nid_no_patch("[epoch-sweep] (10 s) verified: %llu held tokens stood over a block where the tracker only knows that some store happened (a refused walk, or driver stores it no longer places)\n", static_cast<unsigned long long>(coarse - reportedCoarse));
+        reportedCoarse = coarse;
         static std::uint64_t reportedExact = 0;
         const auto exactHits = exactMemoHits.load(std::memory_order_relaxed);
         AgcDriver::ProfilePrint_nid_no_patch("[exact-memo] (10 s): %llu questions over partly watched blocks answered without the tracker lock\n", static_cast<unsigned long long>(exactHits - reportedExact));
@@ -3624,9 +3667,18 @@ void verifyEpochAnswer(std::uint64_t address, std::size_t bytes) {
     if (const auto found = taken.find(key); found != taken.end() && found->second.address == address && found->second.bytes == bytes && StillCurrent(address, bytes, found->second.token)) {
         sweep.verified.fetch_add(1, std::memory_order_relaxed);
         if (!UnchangedSince(address, bytes, found->second.generation)) {
-            char text[256];
-            std::snprintf(text, sizeof(text), "epoch sweep: a content token holds over 0x%llx+0x%llx although the write tracker reports a write since generation %llu", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(found->second.generation));
-            throw std::runtime_error(text);
+            WriteTracker::Change change;
+            {
+                auto& tracker = Tracker();
+                const auto lock = lockTracker(tracker, TrackerLockSite::Unchanged, address, rangeStop(address, bytes));
+                if (tracker.watched && tracker.covers(address, bytes)) change = tracker.changeSince(address, address + bytes, found->second.generation);
+            }
+            if (change.reason != nullptr && change.placed) {
+                char text[320];
+                std::snprintf(text, sizeof(text), "epoch sweep: a content token holds over 0x%llx+0x%llx although the write tracker reports %s since generation %llu", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), change.reason, static_cast<unsigned long long>(found->second.generation));
+                throw std::runtime_error(text);
+            }
+            verifiedCoarse.fetch_add(1, std::memory_order_relaxed);
         }
     }
     VerifiedToken entry{address, bytes, {}, 0};

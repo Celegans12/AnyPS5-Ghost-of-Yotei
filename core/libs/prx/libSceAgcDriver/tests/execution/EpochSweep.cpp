@@ -19,6 +19,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <iostream>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -308,6 +309,36 @@ void NeighbourPagesLeaveATokenStanding(std::uint64_t base) {
     Require(GuestMemory::CollectWrites(inside, InsideBytes) != 0 && GuestMemory::StillCurrent(inside, InsideBytes, token), "a page leaving the write watch three blocks away broke a token for good");
 }
 
+void ManyDriverStoresInABlockKeepPageGrain(std::uint64_t base) {
+    const auto block = base + 23 * Block;
+    const auto address = block + 10 * Page + 4;
+    constexpr std::size_t Bytes = 0xacc;
+    GuestMemory::BumpCollectEpoch();
+    auto token = Take(address, Bytes);
+    const auto generation = GuestMemory::CollectWrites(address, Bytes);
+    const std::array<std::byte, 16> bytes{};
+    for (std::uint64_t page = 0; page < 6; ++page) GuestMemory::StoreOwnBytes(block + page * Page + 32 * page, bytes);
+    Require(!GuestMemory::UnchangedSince(address, Bytes, generation), "the tracker still places every driver store of a block that took six of them");
+    for (int ask = 0; ask < 4; ++ask) {
+        Require(GuestMemory::CollectWrites(address, Bytes) != 0, "a collect of the test block failed");
+        Require(GuestMemory::StillCurrent(address, Bytes, token), "driver stores into other pages of the block broke a token");
+    }
+    GuestMemory::StoreOwnBytes(block + 10 * Page + 0x800, bytes);
+    Require(!GuestMemory::StillCurrent(address, Bytes, token), "a driver store into the range left its token standing after the block had taken many stores");
+    token = Take(address, Bytes);
+    GuestMemory::StoreOwnBytes(block + 10 * Page, std::span<const std::byte>(bytes).first(4));
+    Require(!GuestMemory::StillCurrent(address, Bytes, token), "a driver store into the first page of a range, before its first byte, left its token standing");
+    token = Take(address, Bytes);
+    GuestMemory::NoteRegistryChange(block, Block);
+    Require(!GuestMemory::StillCurrent(address, Bytes, token), "a note over the whole block left a token of two of its pages standing");
+    token = Take(address, Bytes);
+    GuestMemory::NoteGpuPending(block - Block, 3 * Block);
+    Require(!GuestMemory::StillCurrent(address, Bytes, token), "a recorded GPU write over three blocks left a token inside the middle one standing");
+    token = Take(address, Bytes);
+    GuestMemory::NoteRegistryChange(block - 8 * Block, 80 * Block);
+    Require(!GuestMemory::StillCurrent(address, Bytes, token), "a note over eighty blocks left a token inside them standing");
+}
+
 void PartlyWatchedBlockKeepsItsMemo(std::uint64_t base) {
     const auto block = base + 30 * Block;
     constexpr std::uint64_t Ranges = 13;
@@ -459,11 +490,13 @@ int main(int argc, char** argv) {
             NoStoreIsMissed(base);
             DriverWritesBreakATokenAtOnce(base);
             WriteBeforeASubmissionIsSeenByTheDrawThatReads(base);
+            ManyDriverStoresInABlockKeepPageGrain(base);
         } else {
             SweepSeesAWriteMadeBeforeTheEpoch(base);
             NoStoreIsMissed(base);
             DriverWritesBreakATokenAtOnce(base);
             WriteBeforeASubmissionIsSeenByTheDrawThatReads(base);
+            ManyDriverStoresInABlockKeepPageGrain(base);
             HookTakesTheSweepOver(base);
             ColdBlocksLeaveTheSweep(base);
             NeighbourPagesLeaveATokenStanding(base);
