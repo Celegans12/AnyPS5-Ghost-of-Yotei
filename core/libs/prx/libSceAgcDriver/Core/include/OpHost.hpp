@@ -16,7 +16,7 @@ class OpHost {
 public:
     using Range = std::pair<std::uint64_t, std::uint64_t>;
     static constexpr std::uint64_t Every = std::numeric_limits<std::uint64_t>::max();
-    struct Settings { std::size_t depth = 256; bool verifies = false; bool counts = false; };
+    struct Settings { std::size_t depth = 256; bool verifies = false; bool counts = false; bool turns = false; };
     struct Gate { std::uint64_t number = 0; std::uint64_t ops = 0; };
     struct Counts { std::uint64_t posted = 0, retired = 0, gates = 0, passed = 0, roomWaits = 0, wakes = 0, wide = 0, queries = 0, scanned = 0; };
 

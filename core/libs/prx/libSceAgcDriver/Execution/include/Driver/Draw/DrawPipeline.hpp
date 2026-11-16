@@ -61,7 +61,9 @@ public:
     static unsigned Committers();
     static bool Flat();
     static Core::OpHost* Ops();
+    static bool OpsAtExit();
     static void RunOpsWith(OpRunner runner);
+    bool PostOp(const Core::Op& op, std::span<const Range> writes, std::span<const Range> reads, std::uint64_t collectEpoch);
     void WakeForOps();
     static std::size_t WakeBatch(std::size_t depth);
     struct TransportCounts {

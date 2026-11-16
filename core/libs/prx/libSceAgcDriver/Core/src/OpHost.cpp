@@ -34,13 +34,15 @@ struct OpHost::State {
     explicit State(Settings settings)
         : depth(std::max<std::size_t>(settings.depth, 2)),
           verifies(settings.verifies),
-          queue(OpQueue::Settings{depth, std::max<std::size_t>(depth / 4, 1), 0, settings.verifies}),
+          turns(settings.turns),
+          queue(OpQueue::Settings{depth, std::max<std::size_t>(depth / 4, 1), 0, settings.verifies && !settings.turns}),
           ledger(depth, settings.verifies, settings.counts),
           mask(std::bit_ceil(depth) - 1),
           metas(std::make_unique<Meta[]>(mask + 1)) {}
 
     const std::size_t depth;
     const bool verifies;
+    const bool turns;
     OpQueue queue;
     Ledger ledger;
     const std::uint64_t mask;
@@ -64,10 +66,12 @@ OpHost::~OpHost() = default;
 
 bool OpHost::Post(const Op& op, std::span<const Range> writes, std::span<const Range> reads, std::uint64_t collectEpoch) {
     auto& host = *state;
-    const auto me = self();
-    auto owner = host.producer.load(std::memory_order_relaxed);
-    if (owner != me) {
-        if (owner != 0 || !host.producer.compare_exchange_strong(owner, me, std::memory_order_acq_rel)) throw std::logic_error("op host: a second thread posts operations (APS5_CORE_OPS)");
+    if (!host.turns) {
+        const auto me = self();
+        auto owner = host.producer.load(std::memory_order_relaxed);
+        if (owner != me) {
+            if (owner != 0 || !host.producer.compare_exchange_strong(owner, me, std::memory_order_acq_rel)) throw std::logic_error("op host: a second thread posts operations (APS5_CORE_OPS)");
+        }
     }
     Op* slot = host.queue.Stage();
     while (slot == nullptr) {

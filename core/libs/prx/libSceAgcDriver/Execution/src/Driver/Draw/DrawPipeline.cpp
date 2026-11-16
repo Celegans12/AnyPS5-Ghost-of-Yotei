@@ -72,6 +72,7 @@ thread_local std::uint64_t opsBound = Core::OpHost::Every;
 thread_local std::uint64_t opsWatched = 0;
 thread_local bool relaying = false;
 thread_local bool committingOp = false;
+thread_local bool exitTurn = false;
 std::atomic<DrawPipeline::OpRunner> opRunner{nullptr};
 
 DrawPipeline::Order nextOrder() {
@@ -826,6 +827,7 @@ void DrawFinisher::work(unsigned index) {
         deferredOutputs = nullptr;
         deferredReads = nullptr;
         opsBound = Core::OpHost::Every;
+        exitTurn = false;
         runningSequence = 0;
         poolBusyNs[index].fetch_add(elapsedNs(began), std::memory_order_relaxed);
         lock.lock();
@@ -860,6 +862,10 @@ void DrawFinisher::retire(std::unique_lock<std::mutex>& lock) {
         const auto outputFrom = Timed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         if (!dropped) {
             runningOrder = order;
+            exitTurn = DrawPipeline::OpsAtExit();
+            struct Turned {
+                ~Turned() { exitTurn = false; }
+            } turned;
             try {
                 if (misordered) throw std::runtime_error("draw finisher: a job reached the committer out of the order it was queued in (APS5_VERIFY_PIPELINE_ORDER)");
                 for (const auto& output : outputs) output();
@@ -922,6 +928,7 @@ void DrawFinisher::TakeTurn() {
     ownTally().turns.fetch_add(1, std::memory_order_relaxed);
     if (Timed()) ownTally().turnNs.fetch_add(elapsedNs(turnFrom), std::memory_order_relaxed);
     deferredOutputs = nullptr;
+    exitTurn = DrawPipeline::OpsAtExit();
     const auto outputs = std::exchange(stashed, {});
     for (const auto& output : outputs) output();
 }
@@ -1214,9 +1221,43 @@ Core::OpHost* DrawPipeline::Ops() {
         if (const char* text = std::getenv("APS5_CORE_OP_DEPTH")) settings.depth = static_cast<std::size_t>(std::clamp<unsigned long long>(std::strtoull(text, nullptr, 10), 8, 4096));
         settings.verifies = verifies;
         settings.counts = DrawFinisher::Timed();
+        settings.turns = DrawFinisher::Threads() > 1 && std::getenv("APS5_DECODER") != nullptr;
         return new Core::OpHost(settings);
     }();
     return host;
+}
+
+bool DrawPipeline::OpsAtExit() {
+    static const bool atExit = Ops() != nullptr && DrawFinisher::Threads() > 1 && std::getenv("APS5_DECODER") != nullptr;
+    return atExit;
+}
+
+bool DrawPipeline::PostOp(const Core::Op& op, std::span<const Range> writes, std::span<const Range> reads, std::uint64_t collectEpoch) {
+    if (DrawFinisher::Defers()) {
+        struct Held {
+            Core::Op op;
+            std::vector<Range> writes;
+            std::vector<Range> reads;
+            std::uint64_t collectEpoch;
+        };
+        auto held = std::make_shared<Held>(Held{op, {writes.begin(), writes.end()}, {reads.begin(), reads.end()}, collectEpoch});
+        DrawFinisher::Defer([this, held] {
+            if (PostOp(held->op, held->writes, held->reads, held->collectEpoch)) return;
+            const auto runner = opRunner.load(std::memory_order_acquire);
+            Item item;
+            item.commit = [runner, held] { runner(held->op, false); };
+            item.writes = held->writes;
+            item.reads = held->reads;
+            item.draw = true;
+            item.kind = CommitKind::Draw;
+            item.collectEpoch = held->collectEpoch;
+            push(std::move(item));
+        }, {reads.begin(), reads.end()});
+        return true;
+    }
+    if (!Ops()->Post(op, writes, reads, collectEpoch)) return false;
+    WakeForOps();
+    return true;
 }
 
 void DrawPipeline::RunOpsWith(OpRunner runner) {
@@ -1419,6 +1460,7 @@ void DrawPipeline::push(Item item) {
         pushFlat(std::move(item));
         return;
     }
+    if (exitTurn && item.gate.number == 0) item.gate = Ops()->Queue();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     struct ReclaimStorage {};
     auto& reclaim = HostThreadLocal<std::vector<Item>, ReclaimStorage>();
