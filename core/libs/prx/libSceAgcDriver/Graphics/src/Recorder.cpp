@@ -5232,6 +5232,26 @@ std::size_t Recorder::UnexecutedReads(std::vector<InPlaceRead>& reads) const {
     return opened;
 }
 
+void Recorder::NoteChangingRead(std::uint64_t begin, std::uint64_t end) {
+    const auto found = changingReads.find(begin);
+    if (found != changingReads.end()) {
+        found->second = std::max(found->second, end);
+        return;
+    }
+    if (changingReads.size() >= ChangingReadCapacity) changingReads.erase(changingReads.begin());
+    changingReads.emplace(begin, end);
+}
+
+bool Recorder::ChangingRead(std::uint64_t address, std::size_t bytes) const {
+    if (changingReads.empty()) return false;
+    auto next = changingReads.lower_bound(address + bytes);
+    for (int step = 0; step < 2 && next != changingReads.begin(); ++step) {
+        --next;
+        if (next->second > address) return true;
+    }
+    return false;
+}
+
 bool Recorder::TakeFinishedReads(std::vector<InPlaceRead>& reads, std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes) {
     reads.clear();
     writes.clear();

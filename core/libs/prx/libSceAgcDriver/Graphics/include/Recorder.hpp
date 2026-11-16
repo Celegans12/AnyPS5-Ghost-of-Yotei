@@ -443,6 +443,9 @@ public:
     bool TakeEarlyEndOfPipe();
     std::size_t UnexecutedReads(std::vector<InPlaceRead>& reads) const;
     bool TakeFinishedReads(std::vector<InPlaceRead>& reads, std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes);
+    static constexpr std::size_t ChangingReadCapacity = 65536;
+    void NoteChangingRead(std::uint64_t begin, std::uint64_t end);
+    bool ChangingRead(std::uint64_t address, std::size_t bytes) const;
     // Counters of the read tracking (cumulative, for the [recorder] line): ranges noted, overlap
     // queries, hits by reader kind, and hits ignored because the reader's fence had signaled.
     struct ReadStatistics {
@@ -1218,6 +1221,7 @@ private:
     std::vector<InPlaceRead> finishedReads;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> finishedWrites;
     bool finishedReadsLost = false;
+    std::map<std::uint64_t, std::uint64_t> changingReads;
     std::atomic<bool> finishedReadsWanted{false};
     std::uint64_t endOfPipeSerial = 0;
     bool endOfPipeEarly = false;

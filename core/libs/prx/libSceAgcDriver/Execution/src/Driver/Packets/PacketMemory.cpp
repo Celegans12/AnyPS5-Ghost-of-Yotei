@@ -28,7 +28,6 @@
 #include <mutex>
 #include <optional>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <utility>
 #include <chrono>
@@ -702,7 +701,6 @@ constexpr std::size_t EopGuardWindow = 64;
 constexpr std::size_t EopGuardWindows = 14;
 constexpr std::uint64_t EopGuardQuietLimit = 256;
 constexpr std::uint64_t EopGuardKept = 64;
-constexpr auto EopGuardWait = std::chrono::milliseconds(1);
 
 struct EopGuardKey {
     std::uint64_t begin = 0;
@@ -727,20 +725,18 @@ struct EopGuardNote {
 struct EopGuardCounts {
     std::uint64_t labels = 0;
     std::uint64_t early = 0;
-    std::uint64_t waited = 0;
     std::uint64_t heldOpen = 0;
     std::uint64_t heldBehind = 0;
     std::uint64_t heldAddress = 0;
     std::uint64_t heldUnknown = 0;
-    std::uint64_t heldTimeout = 0;
     std::uint64_t judged = 0;
     std::uint64_t risky = 0;
     std::uint64_t gpuWritten = 0;
+    std::uint64_t published = 0;
     std::array<std::uint64_t, EopProbeKinds> riskyKinds{};
     std::uint64_t lastBegin = 0;
     std::uint64_t lastEnd = 0;
     double guardMs = 0;
-    double waitMs = 0;
 };
 
 struct EopGuard {
@@ -749,7 +745,6 @@ struct EopGuard {
     std::vector<Graphics::Recorder::InPlaceRead> pending;
     std::vector<EopProbeRange> writes;
     std::vector<EopProbeRange> finishedWrites;
-    std::vector<EopGuardKey> risky;
     std::uint64_t label = 0;
     EopGuardCounts counts;
 };
@@ -785,7 +780,7 @@ std::uint64_t eopGuardPrint(std::uint64_t begin, std::size_t bytes) {
     return eopGuardMix(hash, data + bytes - EopGuardEdge, EopGuardEdge);
 }
 
-bool eopGuardRisky(EopGuard& guard, const Graphics::Recorder::InPlaceRead& read) {
+bool eopGuardRisky(EopGuard& guard, Graphics::Recorder& recorder, const Graphics::Recorder::InPlaceRead& read) {
     auto& note = guard.notes[{read.begin, read.end}];
     if (note.seen != guard.label) {
         const bool consecutive = note.seen + 1 == guard.label;
@@ -801,9 +796,13 @@ bool eopGuardRisky(EopGuard& guard, const Graphics::Recorder::InPlaceRead& read)
             note.quietFrom = guard.label + 1;
         } else {
             const auto print = eopGuardPrint(read.begin, bytes);
-            if (note.printed && consecutive && print != note.print) {
+            if (note.printed && (consecutive || note.changes != 0) && print != note.print) {
                 note.changes = std::min<std::uint32_t>(note.changes + 1, 6);
                 note.quietFrom = guard.label + std::min<std::uint64_t>(EopGuardQuietLimit, std::uint64_t{4} << note.changes);
+                recorder.NoteChangingRead(read.begin, read.end);
+                ++guard.counts.published;
+            } else if (!note.printed || !consecutive) {
+                note.quietFrom = std::max(note.quietFrom, guard.label + 2);
             }
             note.print = print;
             note.printed = true;
@@ -834,28 +833,20 @@ bool eopGuardSettled() {
         else guard.writes[merged++] = write;
     }
     guard.writes.resize(merged);
-    for (const auto& read : guard.finished) static_cast<void>(eopGuardRisky(guard, read));
-    bool address = false, open = false;
-    std::uint64_t newestRisky = 0, oldestPending = std::numeric_limits<std::uint64_t>::max();
-    guard.risky.clear();
+    for (const auto& read : guard.finished) static_cast<void>(eopGuardRisky(guard, *recorder, read));
+    bool address = false, open = false, flight = false;
     for (std::size_t index = 0; index < guard.pending.size(); ++index) {
         const auto& read = guard.pending[index];
-        if (index >= opened) oldestPending = std::min(oldestPending, read.serial);
         if (read.kind == Graphics::Recorder::ReadKind::AddressBased || read.kind == Graphics::Recorder::ReadKind::AddressBasedReadOnly) {
             address = true;
             continue;
         }
-        if (!eopGuardRisky(guard, read)) continue;
+        if (!eopGuardRisky(guard, *recorder, read)) continue;
         ++counts.risky;
         ++counts.riskyKinds[static_cast<std::size_t>(read.kind)];
         counts.lastBegin = read.begin;
         counts.lastEnd = read.end;
-        if (index < opened) {
-            open = true;
-        } else {
-            newestRisky = std::max(newestRisky, read.serial);
-            guard.risky.push_back({read.begin, read.end});
-        }
+        (index < opened ? open : flight) = true;
     }
     if (guard.label % EopGuardKept == 0) std::erase_if(guard.notes, [&](const auto& note) { return note.second.seen + EopGuardKept < guard.label; });
     const auto judged = std::chrono::steady_clock::now();
@@ -872,26 +863,12 @@ bool eopGuardSettled() {
         ++counts.heldOpen;
         return false;
     }
-    if (guard.risky.empty()) {
-        ++counts.early;
-        return true;
-    }
-    if (newestRisky != oldestPending) {
+    if (flight) {
         ++counts.heldBehind;
         return false;
     }
-    for (;;) {
-        std::this_thread::yield();
-        const auto still = recorder->UnexecutedReads(guard.pending);
-        bool found = false;
-        for (std::size_t index = still; index < guard.pending.size() && !found; ++index) found = std::find(guard.risky.begin(), guard.risky.end(), EopGuardKey{guard.pending[index].begin, guard.pending[index].end}) != guard.risky.end();
-        const auto now = std::chrono::steady_clock::now();
-        if (!found || now - judged > EopGuardWait) {
-            counts.waitMs += std::chrono::duration<double, std::milli>(now - judged).count();
-            ++(found ? counts.heldTimeout : counts.waited);
-            return !found;
-        }
-    }
+    ++counts.early;
+    return true;
 }
 
 struct EopProbeRun {
@@ -1030,7 +1007,7 @@ void reportEopProbe(EopProbe& probe) {
         if (guard.riskyKinds[kind] != 0) changed += (changed.empty() ? "" : ", ") + std::string(EopProbeKindNames[kind]) + " " + std::to_string(guard.riskyKinds[kind]);
     }
     if (changed.empty()) changed = "none";
-    AgcDriver::ProfilePrint_nid_no_patch("[eop-guard] %llu end-of-pipe interrupt labels: %llu delivered at the label, %llu once the batches that read a changed range had run (%.2f ms each), held behind the recorded work: %llu for a changed range read by the open batch, %llu for one read by a batch behind another unexecuted one, %llu for an address-based read, %llu without the reads of the frame, %llu after the wait limit; per label %.1f in-place reads judged, %.1f of them under a GPU write of the frame, %.2f unexecuted on a changed range (%s; last %llx+%llu), %.3f ms\n", value(guard.labels), value(guard.early), value(guard.waited), guard.waited != 0 ? guard.waitMs / static_cast<double>(guard.waited) : 0.0, value(guard.heldOpen), value(guard.heldBehind), value(guard.heldAddress), value(guard.heldUnknown), value(guard.heldTimeout), static_cast<double>(guard.judged) * perGuard, static_cast<double>(guard.gpuWritten) * perGuard, static_cast<double>(guard.risky) * perGuard, changed.c_str(), value(guard.lastBegin), value(guard.lastEnd - guard.lastBegin), guard.guardMs * perGuard);
+    AgcDriver::ProfilePrint_nid_no_patch("[eop-guard] %llu end-of-pipe interrupt labels: %llu delivered at the label, held behind the recorded work: %llu for a changed or new range read by the open batch, %llu for one read by a batch in flight, %llu for an address-based read, %llu without the reads of the frame; per label %.1f in-place reads judged, %.1f of them under a GPU write of the frame, %.2f unexecuted on a changed or new range (%s; last %llx+%llu), %llu changes published to the draw path, %.3f ms\n", value(guard.labels), value(guard.early), value(guard.heldOpen), value(guard.heldBehind), value(guard.heldAddress), value(guard.heldUnknown), static_cast<double>(guard.judged) * perGuard, static_cast<double>(guard.gpuWritten) * perGuard, static_cast<double>(guard.risky) * perGuard, changed.c_str(), value(guard.lastBegin), value(guard.lastEnd - guard.lastBegin), value(guard.published), guard.guardMs * perGuard);
     guard = {};
     probe.examples.clear();
     probe.counts = {};
