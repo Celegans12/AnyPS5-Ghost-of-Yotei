@@ -133,6 +133,7 @@ struct PreparedShaderState {
         std::shared_ptr<const ShaderRecompiler::SourceHandle> handle;
         bool fromDeferredAbi = false;
         bool matched = false;
+        bool block = false;
     };
     struct Rectangle {
         std::uint64_t vertexId;

@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "CacheKey.hpp"
@@ -933,6 +934,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
     ReportPreparedAtUse(snapshot, request);
     auto handle = PrepareShaderWithDiagnostics(request);
     snapshot.prepared->entries.push_back({codeOffset, handle});
+    snapshot.prepared->entries.back().block = request.target.blockAccess;
     return handle;
 }
 
@@ -1196,6 +1198,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
     auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
     if (!invocation.has_value()) throw std::runtime_error("AGC driver: an artifact prepared at use does not match its invocation");
     snapshot.prepared->entries.push_back({codeOffset, std::move(handle)});
+    snapshot.prepared->entries.back().block = source.target.blockAccess;
     return std::move(*invocation);
 }
 
@@ -1455,6 +1458,12 @@ void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Gra
     }, program);
 }
 
+bool BlockVariantEligible(const ShaderRecompiler::RecompileRequest& request) {
+    using Stage = ShaderRecompiler::ShaderStage;
+    if (!Graphics::DrawBlocks() || (request.shader.stage != Stage::Vertex && request.shader.stage != Stage::Fragment)) return false;
+    return !request.graphics || (!request.graphics->mesh && !request.graphics->tessellation);
+}
+
 std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& plan) {
     auto& request = *plan.request;
     std::vector<PreparedShaders::Entry> entries;
@@ -1462,21 +1471,33 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
     const auto append = [&] {
         PerformanceTimer timing("Shader.PrepareArtifact");
         entries.push_back({plan.codeOffset, PrepareShaderWithDiagnostics(request, &preparation)});
+        entries.back().block = request.target.blockAccess;
     };
-    append();
-    if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Fragment && !LibraryPrebuildDisabled()) {
-        try {
-            PrebuildStageLibrary(plan.prebuildDevice, {Graphics::ShaderPath::Vertex, 0u, 32u, request.context.waveSize, {}, {}}, request.shader.stage, ShaderRecompiler::RegistrationResult(request, *entries.front().handle), request.layout.pushConstantOffsetBytes, plan.program);
-        } catch (const std::exception& error) {
-            APS5_LOG_OUT("shader library prebuild skipped: %s", error.what());
+    const bool block = BlockVariantEligible(request);
+    const auto pushSize = request.layout.pushConstantSizeBytes;
+    const auto prepare = [&] {
+        const auto first = entries.size();
+        append();
+        if (plan.prebuildDevice != nullptr && request.target.registrationModules && request.shader.stage == ShaderRecompiler::ShaderStage::Fragment && !LibraryPrebuildDisabled()) {
+            try {
+                PrebuildStageLibrary(plan.prebuildDevice, {Graphics::ShaderPath::Vertex, 0u, 32u, request.context.waveSize, {}, {}}, request.shader.stage, ShaderRecompiler::RegistrationResult(request, *entries[first].handle), request.layout.pushConstantOffsetBytes, plan.program);
+            } catch (const std::exception& error) {
+                APS5_LOG_OUT("shader library prebuild skipped: %s", error.what());
+            }
         }
-    }
-    if (request.context.compute) {
-        request.context.compute->partialThreads = {1, 1, 1};
-        append();
-    } else if (request.context.pixel) {
-        request.layout.pushConstantSizeBytes = 0;
-        append();
+        if (request.context.compute) {
+            request.context.compute->partialThreads = {1, 1, 1};
+            append();
+        } else if (request.context.pixel) {
+            request.layout.pushConstantSizeBytes = 0;
+            append();
+        }
+    };
+    prepare();
+    if (block) {
+        request.target.blockAccess = true;
+        request.layout.pushConstantSizeBytes = pushSize;
+        prepare();
     }
     if (plan.registration) {
         for (const auto& entry : entries) {
@@ -2155,6 +2176,7 @@ std::vector<PreparedGraphicsStage> PrepareGraphicsStages(const DrawDecode& decod
             }
         }
         prepared.push_back({program.snapshot, {program.codeOffset, handle}, program.binary.stage, offset, std::move(registration)});
+        prepared.back().entry.block = target.blockAccess;
         pushOffset += bytes;
     }
     transaction.Commit();
@@ -2247,16 +2269,27 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
         return;
     }
     auto prepared = PrepareGraphicsStages(decoded, localDevice->Target(), true);
+    std::vector<PreparedGraphicsStage> blocks;
+    const auto& routed = decoded.state.stages;
+    if (Graphics::DrawBlocks() && !routed.tessellation && !routed.tessellationGeometry && !routed.mesh && decoded.programs.size() == 2u && std::ranges::all_of(prepared, [](const auto& stage) { return stage.entry.handle != nullptr; })) {
+        auto target = localDevice->Target();
+        target.blockAccess = true;
+        blocks = PrepareGraphicsStages(decoded, target, true);
+    }
     if (decoded.state.stages.path == Graphics::ShaderPath::Vertex) {
-        for (const auto& stage : prepared) {
-            if (stage.registration != nullptr) PrebuildStageLibrary(localDevice, decoded.state.stages, stage.stage, stage.registration, stage.pushOffset, stage.snapshot->codeAddress + stage.entry.codeOffset * sizeof(std::uint32_t));
+        for (const auto* list : {&prepared, &blocks}) {
+            for (const auto& stage : *list) {
+                if (stage.registration != nullptr) PrebuildStageLibrary(localDevice, decoded.state.stages, stage.stage, stage.registration, stage.pushOffset, stage.snapshot->codeAddress + stage.entry.codeOffset * sizeof(std::uint32_t));
+            }
         }
     }
-    for (auto& stage : prepared) {
-        if (stage.entry.handle == nullptr) continue;
-        const auto& entries = transaction.Read(*stage.snapshot).entries;
-        const auto duplicate = std::ranges::any_of(entries, [&](const auto& existing) { return existing.codeOffset == stage.entry.codeOffset && existing.handle->artifact == stage.entry.handle->artifact; });
-        if (!duplicate) transaction.Edit(*stage.snapshot).entries.push_back(std::move(stage.entry));
+    for (auto* list : {&prepared, &blocks}) {
+        for (auto& stage : *list) {
+            if (stage.entry.handle == nullptr) continue;
+            const auto& entries = transaction.Read(*stage.snapshot).entries;
+            const auto duplicate = std::ranges::any_of(entries, [&](const auto& existing) { return existing.codeOffset == stage.entry.codeOffset && existing.handle->artifact == stage.entry.handle->artifact; });
+            if (!duplicate) transaction.Edit(*stage.snapshot).entries.push_back(std::move(stage.entry));
+        }
     }
     for (const auto& stage : prepared) {
         if (stage.snapshot->type == 1) continue;
@@ -2593,6 +2626,7 @@ void ResolvePreparedGraphics(const ShaderSnapshot& front, const std::shared_ptr<
                 const auto& vertexEntry = prepared.entries[vertexIndex];
                 for (std::size_t fragmentIndex = vertexIndex < vertexCount ? fragmentCount : 0u; fragmentIndex < pixelPrepared.entries.size(); ++fragmentIndex) {
                     const auto& fragmentEntry = pixelPrepared.entries[fragmentIndex];
+                    if (vertexEntry.block != fragmentEntry.block) continue;
                     const auto& vertexArtifact = ShaderRecompiler::GetPreparedArtifact(*vertexEntry.handle);
                     const auto& fragmentArtifact = ShaderRecompiler::GetPreparedArtifact(*fragmentEntry.handle);
                     const auto exists = [&](const auto& entry) { return entry.vertexId == vertexArtifact.variantId && entry.fragmentId == fragmentArtifact.variantId; };
