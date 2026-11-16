@@ -313,6 +313,7 @@ static void CheckUnlockedProtection() {
     auto& mappings = Mappings::Get();
     const auto taken = [&] { return mappings.LockCounted().sites[other].acquisitions; };
     const auto answered = [&] { return mappings.LockCounted().unlocked; };
+    const bool counted = std::getenv("APS5_VERIFY_MAPPING_READS") == nullptr;
     std::uint32_t protection = 0;
     std::uintptr_t released = 0;
     {
@@ -321,7 +322,7 @@ static void CheckUnlockedProtection() {
         auto locks = taken();
         auto answers = answered();
         Require(mappings.Protection(memory.Address() + blockBytes + 4097, &protection) && protection == PAGE_READWRITE);
-        Require(taken() == locks + (unlocked ? 0u : 1u) && answered() == answers + (unlocked ? 1u : 0u));
+        Require(!counted || (taken() == locks + (unlocked ? 0u : 1u) && answered() == answers + (unlocked ? 1u : 0u)));
         mappings.SetProtection(memory.Address(), blockBytes, PAGE_READONLY);
         Require(mappings.Protection(memory.Address() + blockBytes - 1, &protection) && protection == PAGE_READONLY);
         Require(mappings.Protection(memory.Address() + blockBytes, &protection) && protection == PAGE_READWRITE);
@@ -332,7 +333,7 @@ static void CheckUnlockedProtection() {
     auto locks = taken();
     auto answers = answered();
     Require(!mappings.Protection(released, &protection) && protection == 7);
-    Require(taken() == locks + (unlocked ? 0u : 1u) && answered() == answers + (unlocked ? 1u : 0u));
+    Require(!counted || (taken() == locks + (unlocked ? 0u : 1u) && answered() == answers + (unlocked ? 1u : 0u)));
     Memory plain(blockBytes, false);
     Require(!mappings.Protection(plain.Address(), &protection) && protection == 7);
     Require(!mappings.Protection(std::uintptr_t{1} << 47, &protection) && protection == 7);
@@ -340,12 +341,188 @@ static void CheckUnlockedProtection() {
     std::size_t count = compared.size();
     locks = taken();
     mappings.ComparedPages(plain.Address(), blockBytes, compared.data(), &count, false);
-    Require(count == 0 && taken() == locks + (unlocked ? 0u : 1u));
+    Require(count == 0 && (!counted || taken() == locks + (unlocked ? 0u : 1u)));
     count = compared.size();
     mappings.ComparedPages(plain.Address(), blockBytes, compared.data(), &count, true);
     Require(count == 0);
     Memory again(blockBytes);
     Require(mappings.Protection(again.Address() + blockBytes - 1, &protection) && protection == PAGE_READWRITE);
+}
+
+struct Alias {
+    Mappings& mappings = Mappings::Get();
+    unsigned char* base;
+    std::size_t bytes;
+
+    explicit Alias(const Memory& memory) : bytes(memory.bytes) {
+        base = static_cast<unsigned char*>(mappings.Reserve(nullptr, bytes));
+        Require(base != nullptr);
+        mappings.Map(base, bytes, memory.section, 0, PAGE_READWRITE);
+    }
+
+    ~Alias() {
+        mappings.Reset(base, bytes);
+        VirtualFree(base, 0, MEM_RELEASE);
+    }
+
+    std::uintptr_t Address() const { return reinterpret_cast<std::uintptr_t>(base); }
+};
+
+static std::vector<void*> ComparedPages(std::uintptr_t address, std::size_t bytes, bool unreported, std::size_t capacity = 64) {
+    std::vector<void*> pages(capacity);
+    auto count = pages.size();
+    Mappings::Get().ComparedPages(address, bytes, pages.data(), &count, unreported);
+    Require(count <= capacity);
+    pages.resize(count);
+    return pages;
+}
+
+static void CheckUnlockedComparedPages(bool counted) {
+    const bool unlocked = std::getenv("APS5_NO_UNLOCKED_MAPPING_READS") == nullptr;
+    const auto other = static_cast<std::size_t>(Mappings::LockSite::Other);
+    auto& mappings = Mappings::Get();
+    const auto taken = [&] { return mappings.LockCounted().sites[other].acquisitions; };
+    const auto answered = [&] { return mappings.LockCounted().unlocked; };
+    const auto listedUnlocked = [&](std::uint64_t locks, std::uint64_t answers) { return !counted || (taken() == locks + (unlocked ? 0u : 1u) && answered() == answers + (unlocked ? 1u : 0u)); };
+    constexpr std::size_t page = 0x4000;
+    std::uintptr_t released = 0;
+    std::uintptr_t unmapped = 0;
+    {
+        Memory memory;
+        Memory plain(blockBytes, false);
+        released = memory.Address();
+        const auto at = [&](std::size_t offset) { return reinterpret_cast<void*>(memory.Address() + offset); };
+        {
+            Alias alias(memory);
+            unmapped = alias.Address();
+            Require(ComparedPages(memory.Address(), blockBytes, false).empty() && ComparedPages(alias.Address(), blockBytes, false).empty());
+            mappings.CompareWhenShared(memory.Address() + page, 2 * page);
+            auto locks = taken();
+            auto answers = answered();
+            const auto compared = ComparedPages(memory.Address(), blockBytes, false);
+            Require(listedUnlocked(locks, answers));
+            Require(compared.size() == 8 && compared.front() == at(page) && compared.back() == at(3 * page - 4096));
+            Require(ComparedPages(alias.Address(), blockBytes, false).size() == 8);
+            Require(ComparedPages(memory.Address() + page + 4097, 8191, false) == std::vector<void*>({at(page + 4096), at(page + 8192)}));
+            Require(ComparedPages(memory.Address(), blockBytes, false, 3) == std::vector<void*>({at(page), at(page + 4096), at(page + 8192)}));
+            Require(ComparedPages(memory.Address(), blockBytes, false, 0).empty());
+            locks = taken();
+            answers = answered();
+            Require(ComparedPages(plain.Address(), blockBytes, false).empty() && ComparedPages(memory.Address(), page, true).empty());
+            Require(!counted || (taken() == locks + (unlocked ? 0u : 2u) && answered() == answers + (unlocked ? 2u : 0u)));
+            locks = taken();
+            Require(ComparedPages(memory.Address(), blockBytes, true, 3) == std::vector<void*>({at(page), at(page + 4096), at(page + 8192)}));
+            Require(ComparedPages(memory.Address(), blockBytes, true).size() == 5);
+            Require(!counted || taken() == locks + 2);
+            locks = taken();
+            answers = answered();
+            Require(ComparedPages(memory.Address(), blockBytes, true).empty());
+            Require(listedUnlocked(locks, answers));
+            Require(ComparedPages(alias.Address(), blockBytes, true).size() == 8 && ComparedPages(alias.Address(), blockBytes, true).empty());
+            Require(ComparedPages(memory.Address(), blockBytes, false) == compared);
+            mappings.SetProtection(memory.Address() + page, page, PAGE_READONLY);
+            std::uint32_t protection = 0;
+            Require(mappings.Protection(memory.Address() + page, &protection) && protection == PAGE_READONLY);
+            Require(ComparedPages(memory.Address(), blockBytes, false) == compared);
+            mappings.SetProtection(memory.Address() + page, page, PAGE_READWRITE);
+            Require(mappings.Protection(memory.Address() + page, &protection) && protection == PAGE_READWRITE);
+        }
+        Require(ComparedPages(unmapped, blockBytes, false).empty());
+        Require(ComparedPages(memory.Address(), blockBytes, false).size() == 8);
+    }
+    const auto locks = taken();
+    const auto answers = answered();
+    Require(ComparedPages(released, blockBytes, false).empty());
+    Require(listedUnlocked(locks, answers));
+}
+
+static void CheckComparedPageRaces() {
+    constexpr std::size_t page = 0x4000;
+    Memory memory;
+    Memory steady;
+    Alias kept(steady);
+    auto& mappings = memory.mappings;
+    mappings.CompareWhenShared(steady.Address(), 2 * page);
+    std::atomic<bool> stop{false};
+    std::thread mapper([&] {
+        for (unsigned round = 0; !stop.load(std::memory_order_acquire); ++round) {
+            {
+                Alias alias(memory);
+                mappings.CompareWhenShared(memory.Address() + (round % 4) * page, page);
+                mappings.SetProtection(alias.Address(), page, round % 2 == 0 ? PAGE_READONLY : PAGE_READWRITE);
+                ComparedPages(alias.Address(), blockBytes, true, 5);
+            }
+            mappings.Reset(memory.base, memory.bytes);
+            mappings.Map(memory.base, memory.bytes, memory.section, 0, PAGE_READWRITE, true, true);
+        }
+    });
+    bool exact = true;
+    const auto until = std::chrono::steady_clock::now() + std::chrono::milliseconds(1000);
+    for (unsigned round = 0; round % 64 != 0 || std::chrono::steady_clock::now() < until; ++round) {
+        ComparedPages(memory.Address(), blockBytes, round % 3 == 0);
+        std::uint32_t protection = 0;
+        mappings.Protection(memory.Address() + (round % 4) * page, &protection);
+        exact &= ComparedPages(steady.Address(), blockBytes, false).size() == 8;
+        exact &= ComparedPages(steady.Address() + page, blockBytes, false, 2).size() == 2;
+    }
+    stop.store(true, std::memory_order_release);
+    mapper.join();
+    Require(exact);
+}
+
+static void CheckVerifiedMappingReads() {
+    auto& mappings = Mappings::Get();
+    std::uint64_t matched = 0;
+    std::uint64_t differing = 0;
+    std::uint64_t skipped = 0;
+    mappings.MappingReadChecks(&matched, &differing, &skipped);
+    const auto before = matched;
+    Mappings::VerifyMappingReads(true);
+    CheckUnlockedComparedPages(false);
+    CheckComparedPageRaces();
+    Mappings::VerifyMappingReads(std::getenv("APS5_VERIFY_MAPPING_READS") != nullptr);
+    mappings.MappingReadChecks(&matched, &differing, &skipped);
+    Require(differing == 0);
+    Require((matched != before) == (std::getenv("APS5_NO_UNLOCKED_MAPPING_READS") == nullptr));
+}
+
+static void CheckReservedHoles() {
+    const bool partial = std::getenv("APS5_PARTIAL_COLLECT") != nullptr;
+    constexpr std::size_t page = 0x4000;
+    auto& mappings = Mappings::Get();
+    const auto bytes = 2 * blockBytes;
+    auto* base = static_cast<unsigned char*>(mappings.Reserve(nullptr, bytes));
+    Require(base != nullptr);
+    const auto address = reinterpret_cast<std::uintptr_t>(base);
+    mappings.Commit(base + page, 2 * page, PAGE_READWRITE, 2 * page, true);
+    const auto collect = [&](std::uintptr_t from, std::size_t size, bool clear, std::vector<void*>* written) {
+        written->assign(bytes / 4096, nullptr);
+        auto count = written->size();
+        const bool collected = mappings.Collect(from, size, written->data(), &count, clear);
+        written->resize(collected ? count : 0);
+        return collected;
+    };
+    std::vector<void*> written;
+    Require(collect(address + page, 2 * page, true, &written));
+    base[page + 4096] = 5;
+    base[3 * page - 1] = 6;
+    for (const bool clear : {false, true}) {
+        Require(collect(address, bytes, clear, &written) == partial);
+        Require(!partial || written == std::vector<void*>({base + page + 4096, base + 3 * page - 4096}));
+    }
+    Require(collect(address + page, 2 * page, true, &written) && written.size() == (partial ? 0u : 2u));
+    Require(collect(address, page, true, &written) == partial && written.empty());
+    Require(collect(address + 3 * page + 1, blockBytes, false, &written) == partial && written.empty());
+    mappings.Commit(base + blockBytes, page, PAGE_READWRITE, page, true);
+    Require(collect(address, bytes, true, &written) == partial);
+    base[blockBytes + 4096] = 7;
+    Require(collect(address, bytes, true, &written) == partial);
+    Require(!partial || written == std::vector<void*>({base + blockBytes + 4096}));
+    Memory resident;
+    Require(collect(resident.Address(), resident.bytes, true, &written));
+    mappings.Reset(base, bytes);
+    Require(collect(address, bytes, true, &written) == partial && written.empty());
+    VirtualFree(base, 0, MEM_RELEASE);
 }
 
 static void CheckRangedHostWrites() {
@@ -611,6 +788,10 @@ int main() {
         CheckWriterAndCollector();
         CheckUnlockedReads();
         CheckUnlockedProtection();
+        CheckUnlockedComparedPages(std::getenv("APS5_VERIFY_MAPPING_READS") == nullptr);
+        CheckComparedPageRaces();
+        CheckVerifiedMappingReads();
+        CheckReservedHoles();
         CheckUnlockedProofRaces();
         CheckRangedHostWrites();
         CheckUnlockedHostWrites(true);

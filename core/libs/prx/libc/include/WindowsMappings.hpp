@@ -90,7 +90,7 @@ public:
         if (granule == 0) throw std::invalid_argument("guest memory commit granule is zero");
         std::vector<std::pair<std::uintptr_t, std::size_t>> created;
         const SiteLock lock(mutex, MappingLockCaller::Commit);
-        collectableRanges.clear();
+        forgetCollectable();
         disown(reinterpret_cast<std::uintptr_t>(address), reinterpret_cast<std::uintptr_t>(address) + bytes);
         const DWORD flags = MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER | (watched ? MEM_WRITE_WATCH : 0);
         const auto cut = [](std::uintptr_t at, std::size_t size, const char* operation) {
@@ -139,7 +139,7 @@ public:
                 if (memory.State != MEM_COMMIT) throw std::runtime_error("guest memory is not committed");
                 for (auto mapped = views.lower_bound(cursor & ~(pageBytes - 1)); mapped != views.end() && mapped->first < stop; ++mapped) {
                     mapped->second.protection = protection;
-                    publishView(mapped->first, protection, mapped->second.resident);
+                    publishView(mapped->first, mapped->second);
                     mapped->second.armed = 0;
                     invalidate(mapped->first, mapped->second);
                 }
@@ -225,6 +225,7 @@ public:
             protectSubpages(base, mask, PAGE_NOACCESS, "trap reads of shared guest memory", view.viewBytes);
             if (view.trapped == 0) trappedViews.fetch_add(1, std::memory_order_release);
             view.trapped |= mask;
+            publishView(base, view);
         }
         return true;
     }
@@ -280,7 +281,7 @@ public:
         if (sectionBytes < bytes && (resident || sectionBytes == 0 || bytes - sectionBytes >= pageBytes)) throw std::runtime_error("shared guest mapping extends a whole page past its section");
         settleTraps(reinterpret_cast<std::uintptr_t>(address), bytes);
         const SiteLock lock(mutex, MappingLockCaller::Map);
-        collectableRanges.clear();
+        forgetCollectable();
         auto cursor = reinterpret_cast<std::uintptr_t>(address);
         if (createdPrivate != nullptr) createdPrivate->reserve(createdPrivate->size() + bytes / pageBytes);
         reset(cursor, bytes);
@@ -339,7 +340,7 @@ public:
                     }
                     const auto placed = views.emplace(base + at, View{nullptr, protection, {}, 0, compared, 0, owned, offset + done + at, 0, 0, true}).first;
                     placed->second.born = ++viewSerial;
-                    publishView(placed->first, placed->second.protection, true);
+                    publishView(placed->first, placed->second);
                 }
                 forgetClean(base, base + runBytes);
                 remember(freshRanges, base, base + runBytes);
@@ -361,8 +362,8 @@ public:
                 shared->aliases.push_back(base);
                 const auto created = views.emplace(base, View{shared, protection, {}, 0, false, 0, owned, offset + done, 0, 0, false, slot, hostPages(viewBytes)}).first;
                 created->second.born = ++viewSerial;
-                publishView(created->first, created->second.protection, false);
                 if (shared->comparedWhenShared) created->second.unreported = allSubpages;
+                publishView(created->first, created->second);
                 remember(freshRanges, base, base + pageBytes);
                 invalidate(*shared);
                 done += pageBytes;
@@ -384,7 +385,7 @@ public:
             mapRun(base, runBytes, section, offset + done);
             DWORD previous;
             if (!VirtualProtect(reinterpret_cast<void*>(base), runBytes, protection, &previous)) fail("protect shared guest pages");
-            collectableRanges.clear();
+            forgetCollectable();
             for (std::size_t at = 0; at < runBytes; at += pageBytes) {
                 auto& [slot, shared] = pages[at / pageBytes];
                 slot->stored = true;
@@ -392,8 +393,8 @@ public:
                 invalidate(*shared);
                 const auto created = views.emplace(base + at, View{std::move(shared), protection, {}, 0, false, 0, owned, offset + done + at, 0, 0, false, std::move(slot)}).first;
                 created->second.born = ++viewSerial;
-                publishView(created->first, created->second.protection, false);
                 if (created->second.page->comparedWhenShared) created->second.unreported = allSubpages;
+                publishView(created->first, created->second);
             }
             remember(freshRanges, base, base + runBytes);
             done += runBytes;
@@ -407,10 +408,10 @@ public:
         disown(address, address + bytes);
         if (protection != PAGE_READWRITE) track.Bar(address, address + bytes, PageTrackOrigin::SetProtection);
         else track.Open(address, address + bytes);
-        collectableRanges.clear();
+        forgetCollectable();
         for (auto it = views.lower_bound(address); it != views.end() && it->first < address + bytes; ++it) {
             it->second.protection = protection;
-            publishView(it->first, protection, it->second.resident);
+            publishView(it->first, it->second);
             it->second.armed = 0;
             invalidate(it->first, it->second);
         }
@@ -457,7 +458,7 @@ public:
         settleTraps(address, bytes);
         const SiteLock lock(mutex, MappingLockCaller::CompareWhenShared);
         releaseTraps(address, address + bytes);
-        collectableRanges.clear();
+        forgetCollectable();
         for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < address + bytes; ++it) {
             if (residentOnly && !it->second.resident && !it->second.aliasDemoted) continue;
             anyCompared.store(true);
@@ -473,6 +474,7 @@ public:
                 auto& view = views.at(alias);
                 if (view.resident) continue;
                 if (!marked) view.unreported = allSubpages;
+                publishView(alias, view);
                 if (view.armed == 0) continue;
                 protectView(alias, view, view.armed, view.protection, "stop arming a compared shared page");
                 view.armed = 0;
@@ -481,27 +483,32 @@ public:
     }
 
     void ComparedPages(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool unreported) {
-        if (unlockedReads() && !anyCompared.load()) {
-            unlockedAnswers.fetch_add(1, std::memory_order_relaxed);
-            *count = 0;
-            return;
-        }
-        const SiteLock lock(mutex, MappingLockCaller::ComparedPages);
         const auto capacity = *count;
-        *count = 0;
-        const auto end = address + bytes;
-        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
-            auto& view = it->second;
-            if (view.resident || !view.page->comparedWhenShared) continue;
-            const auto listed = static_cast<std::uint8_t>(subpagesOf(it->first, address, end) & (unreported ? view.unreported : allSubpages) & ~view.trapped);
-            for (std::size_t sub = 0; sub < subpages; ++sub) {
-                const auto bit = static_cast<std::uint8_t>(1u << sub);
-                if ((listed & bit) == 0) continue;
-                if (*count == capacity) return;
-                pages[(*count)++] = reinterpret_cast<void*>(it->first + sub * subpageBytes);
-                if (unreported) view.unreported &= static_cast<std::uint8_t>(~bit);
+        if (unlockedReads()) {
+            std::uint64_t serial = 0;
+            if (!anyCompared.load()) {
+                unlockedAnswers.fetch_add(1, std::memory_order_relaxed);
+                *count = 0;
+                return;
+            }
+            if (comparedUnlocked(address, bytes, pages, count, unreported, &serial)) {
+                unlockedAnswers.fetch_add(1, std::memory_order_relaxed);
+                if (verifyingReads.load(std::memory_order_relaxed)) verifyCompared(address, bytes, pages, *count, capacity, unreported, serial);
+                return;
             }
         }
+        const SiteLock lock(mutex, MappingLockCaller::ComparedPages);
+        *count = listCompared(address, address + bytes, pages, capacity, unreported, true);
+    }
+
+    static void VerifyMappingReads(bool verified) {
+        verifyingReads.store(verified, std::memory_order_relaxed);
+    }
+
+    void MappingReadChecks(std::uint64_t* matched, std::uint64_t* differing, std::uint64_t* skipped) const {
+        *matched = readChecks.load(std::memory_order_relaxed);
+        *differing = readDifferences.load(std::memory_order_relaxed);
+        *skipped = readChecksSkipped.load(std::memory_order_relaxed);
     }
 
     bool HandleWrite(std::uintptr_t address) {
@@ -671,7 +678,7 @@ public:
         if (fenced && writersIn(address, address + bytes)) {
             for (std::size_t done = 0; done < bytes; done += pageBytes) {
                 const auto found = views.find(address + done);
-                if (found != views.end() && found->second.resident) publishView(found->first, found->second.protection, true);
+                if (found != views.end() && found->second.resident) publishView(found->first, found->second);
             }
             return nullptr;
         }
@@ -722,12 +729,15 @@ public:
 
     bool Protection(std::uintptr_t address, std::uint32_t* protection) {
         if (const auto index = address / pageBytes; unlockedReads() && index / viewLeafPages < viewLeaves) {
+            const bool verified = verifyingReads.load(std::memory_order_relaxed);
+            const auto serial = verified ? mutex.Serial() : 0;
             const auto* leaf = viewTable[index / viewLeafPages].load();
             const auto published = leaf == nullptr ? std::uint32_t{0} : (*leaf)[index % viewLeafPages].load();
             if (published != viewUnpublished) {
                 unlockedAnswers.fetch_add(1, std::memory_order_relaxed);
+                if (verified) verifyProtection(address, published, serial);
                 if (published == 0) return false;
-                *protection = published & ~viewResident;
+                *protection = published & viewProtection;
                 return true;
             }
         }
@@ -1114,7 +1124,12 @@ public:
                     continue;
                 }
                 const auto allocationEnd = privateAllocationEnd(cursor);
-                if (allocationEnd == 0) return refuse(Refusal::OutsidePrivate, cursor);
+                if (allocationEnd == 0) {
+                    const auto reserved = reservedEnd(cursor);
+                    if (reserved == 0) return refuse(Refusal::OutsidePrivate, cursor);
+                    cursor = std::min(end, reserved);
+                    continue;
+                }
                 if (capacity == *count) return true;
                 const auto stop = ownedPending.empty() ? std::min(end, allocationEnd) : std::min({end, allocationEnd, (cursor & ~std::uintptr_t{4095}) + (capacity - *count) * 4096});
                 const auto touched = (((stop + 4095) & ~static_cast<std::uintptr_t>(4095)) - (cursor & ~static_cast<std::uintptr_t>(4095))) / 4096;
@@ -1225,11 +1240,8 @@ private:
         return &(*leaf)[index % viewLeafPages];
     }
 
-    void publishView(std::uintptr_t base, DWORD protection, bool resident) {
-        if (auto* slot = viewSlot(base, true)) slot->store(protection == 0 || protection >= viewResident ? viewUnpublished : static_cast<std::uint32_t>(protection) | (resident ? viewResident : std::uint32_t{0}));
-    }
-
     void fenceView(std::uintptr_t base) {
+        mutex.Publishing();
         if (auto* slot = viewSlot(base, true)) slot->store(viewUnpublished);
     }
 
@@ -1271,7 +1283,7 @@ private:
             const auto* leaf = viewTable[index / viewLeafPages].load();
             const auto published = leaf == nullptr ? std::uint32_t{0} : (*leaf)[index % viewLeafPages].load();
             if (published == 0) continue;
-            if (published == viewUnpublished || (published & viewResident) == 0 || !writable(published & ~viewResident)) return false;
+            if (published == viewUnpublished || (published & viewResident) == 0 || !writable(published & viewProtection)) return false;
         }
         return true;
     }
@@ -1328,6 +1340,7 @@ private:
     }
 
     void retireView(std::uintptr_t base) {
+        mutex.Publishing();
         if (auto* slot = viewSlot(base, false)) slot->store(0);
     }
 
@@ -1848,7 +1861,12 @@ private:
                 continue;
             }
             const auto allocationEnd = privateAllocationEnd(cursor);
-            if (allocationEnd == 0) return refuse(Refusal::OutsidePrivate, cursor);
+            if (allocationEnd == 0) {
+                const auto reserved = reservedEnd(cursor);
+                if (reserved == 0) return refuse(Refusal::OutsidePrivate, cursor);
+                cursor = std::min(end, reserved);
+                continue;
+            }
             cursor = std::min(end, allocationEnd);
         }
         remember(collectableRanges, address, end);
@@ -1858,10 +1876,16 @@ private:
     enum class Refusal : std::uint8_t { NoAccess, Compared, ResidentUnwatched, OutsidePrivate, Uncommitted, Count };
     static constexpr std::size_t refusals = static_cast<std::size_t>(Refusal::Count);
     static constexpr std::array<const char*, refusals> refusalNames{"no-access view", "compared page", "unwatched resident", "outside private allocations", "uncommitted private"};
+    struct RefusedBlock {
+        std::array<std::uint64_t, refusals> causes{};
+        std::uintptr_t first = 0;
+        DWORD state = 0;
+        DWORD type = 0;
+    };
     struct RefusalTally {
         std::uint64_t collects = 0;
         std::array<std::array<std::uint64_t, refusals>, MappingLockRoles> causes{};
-        std::map<std::uintptr_t, std::array<std::uint64_t, refusals>> blocks;
+        std::map<std::uintptr_t, RefusedBlock> blocks;
         std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
     };
 
@@ -1884,13 +1908,22 @@ private:
         if (!countRefusals()) return false;
         const auto index = static_cast<std::size_t>(cause);
         ++refusalTally.causes[SiteMutex::Role()][index];
-        ++refusalTally.blocks[at & ~(ownedBlockBytes - 1)][index];
+        auto& block = refusalTally.blocks[at & ~(ownedBlockBytes - 1)];
+        if (block.first == 0) {
+            MEMORY_BASIC_INFORMATION memory{};
+            if (VirtualQuery(reinterpret_cast<const void*>(at), &memory, sizeof(memory)) == sizeof(memory)) {
+                block.state = memory.State;
+                block.type = memory.Type;
+            }
+            block.first = at;
+        }
+        ++block.causes[index];
         return false;
     }
 
     void reportRefusals() const {
         static constexpr std::array<const char*, MappingLockRoles> roleNames{"game", "committer", "finisher", "queue-worker", "walker", "presenter"};
-        std::string text = "[collect-refusals] (10 s): " + std::to_string(refusalTally.collects) + " collects;";
+        std::string text = "[collect-refusals] (10 s): " + std::to_string(refusalTally.collects) + " collects, " + std::to_string(reservedSkips.load(std::memory_order_relaxed)) + " reserved holes skipped since start;";
         for (std::size_t cause = 0; cause < refusals; ++cause) {
             std::uint64_t total = 0;
             std::string shares;
@@ -1903,18 +1936,19 @@ private:
             text += std::string(" ") + refusalNames[cause] + " " + std::to_string(total) + (shares.empty() ? ";" : " (" + shares + ");");
         }
         std::vector<std::pair<std::uint64_t, std::uintptr_t>> ranked;
-        for (const auto& [block, causes] : refusalTally.blocks) {
+        for (const auto& [block, refused] : refusalTally.blocks) {
             std::uint64_t total = 0;
-            for (const auto count : causes) total += count;
+            for (const auto count : refused.causes) total += count;
             ranked.emplace_back(total, block);
         }
         std::sort(ranked.begin(), ranked.end(), [](const auto& left, const auto& right) { return left.first != right.first ? left.first > right.first : left.second < right.second; });
         text += " " + std::to_string(ranked.size()) + " blocks refused, first:";
         for (std::size_t index = 0; index < ranked.size() && index < 16; ++index) {
             const auto block = ranked[index].second;
-            const auto& causes = refusalTally.blocks.at(block);
-            char item[32];
-            std::snprintf(item, sizeof(item), " 0x%llx", static_cast<unsigned long long>(block));
+            const auto& refused = refusalTally.blocks.at(block);
+            const auto& causes = refused.causes;
+            char item[96];
+            std::snprintf(item, sizeof(item), " 0x%llx (first at 0x%llx, state 0x%lx, type 0x%lx)", static_cast<unsigned long long>(block), static_cast<unsigned long long>(refused.first), refused.state, refused.type);
             text += item;
             for (std::size_t cause = 0; cause < refusals; ++cause) {
                 if (causes[cause] != 0) text += std::string(" ") + refusalNames[cause] + " " + std::to_string(causes[cause]);
@@ -1945,6 +1979,51 @@ private:
         char text[160];
         std::snprintf(text, sizeof(text), " [views: %zu resident, %zu shared, %zu compared, %zu aliased, %zu no-access; %s]", resident, shared, compared, aliased, barred, privateAllocationEnd(block) != 0 ? "private" : "not private");
         return text;
+    }
+
+    static bool partialCollect() {
+        static const bool partial = std::getenv("APS5_PARTIAL_COLLECT") != nullptr;
+        return partial;
+    }
+
+    void forgetCollectable() {
+        collectableRanges.clear();
+        reservedRanges.clear();
+    }
+
+    std::uintptr_t reservedEnd(std::uintptr_t cursor) {
+        if (!partialCollect()) return 0;
+        const auto next = reservedRanges.upper_bound(cursor);
+        if (next != reservedRanges.begin() && std::prev(next)->second > cursor) {
+            const auto known = std::prev(next)->second;
+            if (verifyDirect() && !reservedOnly(cursor, known)) staleHole(cursor, known);
+            reservedSkips.fetch_add(1, std::memory_order_relaxed);
+            return known;
+        }
+        const auto memory = query(cursor);
+        if (memory.State != MEM_RESERVE || memory.Type == MEM_MAPPED || memory.Type == MEM_IMAGE) return 0;
+        auto stop = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+        if (const auto view = views.upper_bound(cursor); view != views.end()) stop = std::min(stop, view->first);
+        if (const auto allocation = privateAllocations.upper_bound(cursor); allocation != privateAllocations.end()) stop = std::min(stop, allocation->first);
+        if (stop <= cursor) return 0;
+        remember(reservedRanges, cursor, stop);
+        reservedSkips.fetch_add(1, std::memory_order_relaxed);
+        return stop;
+    }
+
+    static bool reservedOnly(std::uintptr_t address, std::uintptr_t end) {
+        for (auto cursor = address; cursor < end;) {
+            const auto memory = query(cursor);
+            if (memory.State != MEM_RESERVE) return false;
+            cursor = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+        }
+        return true;
+    }
+
+    [[noreturn]] static void staleHole(std::uintptr_t address, std::uintptr_t end) {
+        char text[192];
+        std::snprintf(text, sizeof(text), "a collect of guest writes skipped 0x%llx+0x%llx as reserved address space, which now holds memory (APS5_VERIFY_DIRECT_COLLECT)", static_cast<unsigned long long>(address), static_cast<unsigned long long>(end - address));
+        throw std::runtime_error(text);
     }
 
     static bool verifyDirect() {
@@ -1991,6 +2070,11 @@ private:
     static_assert(pageBytes * viewLeafPages * viewLeaves == std::size_t{1} << 47, "the published view protections cover the user address range");
     static constexpr std::uint32_t viewUnpublished = UINT32_MAX;
     static constexpr std::uint32_t viewResident = std::uint32_t{1} << 31;
+    static constexpr std::uint32_t viewCompared = std::uint32_t{1} << 30;
+    static constexpr unsigned viewTrappedShift = 26;
+    static constexpr unsigned viewUnreportedShift = 22;
+    static constexpr std::uint32_t viewProtection = (std::uint32_t{1} << viewUnreportedShift) - 1;
+    static_assert(viewTrappedShift == viewUnreportedShift + subpages && viewTrappedShift + subpages == 30, "a published view holds one unreported and one trapped bit per subpage below its compared bit");
     static constexpr std::uint64_t unlockedWriteToken = 1;
     static constexpr std::size_t unlockedWriteBytes = 0x10000;
     using ViewLeaf = std::array<std::atomic<std::uint32_t>, viewLeafPages>;
@@ -2085,6 +2169,118 @@ private:
         unsigned char* bytes = nullptr;
     };
     using Ranges = std::map<std::uintptr_t, std::uintptr_t>;
+
+    void publishView(std::uintptr_t base, const View& view) {
+        auto* slot = viewSlot(base, true);
+        if (slot == nullptr) return;
+        mutex.Publishing();
+        if (view.protection == 0 || view.protection > viewProtection) {
+            slot->store(viewUnpublished);
+            return;
+        }
+        auto word = static_cast<std::uint32_t>(view.protection);
+        if (view.resident) word |= viewResident;
+        else if (view.page != nullptr && view.page->comparedWhenShared) word |= viewCompared | static_cast<std::uint32_t>(view.unreported) << viewUnreportedShift | static_cast<std::uint32_t>(view.trapped) << viewTrappedShift;
+        slot->store(word);
+    }
+
+    std::size_t listCompared(std::uintptr_t address, std::uintptr_t end, void** pages, std::size_t capacity, bool unreported, bool take) {
+        std::size_t count = 0;
+        for (auto it = views.lower_bound(address & ~(pageBytes - 1)); it != views.end() && it->first < end; ++it) {
+            auto& view = it->second;
+            if (view.resident || !view.page->comparedWhenShared) continue;
+            const auto listed = static_cast<std::uint8_t>(subpagesOf(it->first, address, end) & (unreported ? view.unreported : allSubpages) & ~view.trapped);
+            std::uint8_t taken = 0;
+            for (std::size_t sub = 0; sub < subpages && count < capacity; ++sub) {
+                const auto bit = static_cast<std::uint8_t>(1u << sub);
+                if ((listed & bit) == 0) continue;
+                pages[count++] = reinterpret_cast<void*>(it->first + sub * subpageBytes);
+                taken |= bit;
+            }
+            if (unreported && take && taken != 0) {
+                view.unreported &= static_cast<std::uint8_t>(~taken);
+                publishView(it->first, view);
+            }
+            if (count == capacity && (listed & ~taken) != 0) return count;
+        }
+        return count;
+    }
+
+    bool comparedUnlocked(std::uintptr_t address, std::size_t bytes, void** pages, std::size_t* count, bool unreported, std::uint64_t* serial) const {
+        constexpr auto limit = std::uintptr_t{1} << 47;
+        if (address >= limit || bytes > limit - address) return false;
+        *serial = mutex.Serial();
+        if ((*serial & 1) != 0) return false;
+        const auto capacity = *count;
+        const auto end = address + bytes;
+        std::size_t listed = 0;
+        bool full = false;
+        for (auto base = address & ~(pageBytes - 1); base < end && !full;) {
+            const auto index = base / pageBytes;
+            const auto* leaf = viewTable[index / viewLeafPages].load();
+            if (leaf == nullptr) {
+                base = (index / viewLeafPages + 1) * viewLeafPages * pageBytes;
+                continue;
+            }
+            const auto word = (*leaf)[index % viewLeafPages].load();
+            if (word == viewUnpublished) return false;
+            if ((word & viewCompared) != 0 && (word & viewResident) == 0) {
+                const auto mask = subpagesOf(base, address, end);
+                if (unreported) {
+                    if ((mask & (word >> viewUnreportedShift) & ~(word >> viewTrappedShift) & allSubpages) != 0) return false;
+                } else {
+                    const auto shown = static_cast<std::uint8_t>(mask & ~(word >> viewTrappedShift) & allSubpages);
+                    for (std::size_t sub = 0; sub < subpages; ++sub) {
+                        if ((shown & (1u << sub)) == 0) continue;
+                        if (listed == capacity) {
+                            full = true;
+                            break;
+                        }
+                        pages[listed++] = reinterpret_cast<void*>(base + sub * subpageBytes);
+                    }
+                }
+            }
+            base += pageBytes;
+        }
+        if (mutex.Serial() != *serial) return false;
+        *count = listed;
+        return true;
+    }
+
+    void noteReadCheck(bool same) {
+        (same ? readChecks : readDifferences).fetch_add(1, std::memory_order_relaxed);
+        const auto now = std::chrono::steady_clock::now();
+        if (now - readChecksReported < std::chrono::seconds(10)) return;
+        readChecksReported = now;
+        std::fprintf(stderr, "[mapping-reads] since start: %llu answers given without the mapping lock matched the answer under it, %llu differed, %llu were not compared because a mapping changed in between (APS5_VERIFY_MAPPING_READS)\n", static_cast<unsigned long long>(readChecks.load(std::memory_order_relaxed)), static_cast<unsigned long long>(readDifferences.load(std::memory_order_relaxed)),
+                     static_cast<unsigned long long>(readChecksSkipped.load(std::memory_order_relaxed)));
+    }
+
+    void verifyCompared(std::uintptr_t address, std::size_t bytes, void* const* pages, std::size_t count, std::size_t capacity, bool unreported, std::uint64_t serial) {
+        const SiteLock lock(mutex, MappingLockCaller::ComparedPages);
+        if (mutex.Serial() != serial) {
+            readChecksSkipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        std::vector<void*> expected(capacity);
+        const auto listed = listCompared(address, address + bytes, expected.data(), capacity, unreported, false);
+        const bool same = listed == count && std::equal(pages, pages + count, expected.begin());
+        if (!same) std::fprintf(stderr, "mapping reads: the %s pages of 0x%llx+0x%llx listed without the mapping lock are %zu, and %zu under it (APS5_VERIFY_MAPPING_READS)\n", unreported ? "unreported compared" : "compared", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), count, listed);
+        noteReadCheck(same);
+    }
+
+    void verifyProtection(std::uintptr_t address, std::uint32_t published, std::uint64_t serial) {
+        const SiteLock lock(mutex, MappingLockCaller::Protection);
+        if ((serial & 1) != 0 || mutex.Serial() != serial) {
+            readChecksSkipped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+        const auto found = views.find(address & ~(pageBytes - 1));
+        const auto expected = found == views.end() ? std::uint32_t{0} : static_cast<std::uint32_t>(found->second.protection);
+        const bool same = (published == 0 ? std::uint32_t{0} : published & viewProtection) == expected && (published == 0) == (found == views.end());
+        if (!same) std::fprintf(stderr, "mapping reads: the protection of 0x%llx read without the mapping lock is 0x%x, and 0x%x under it (APS5_VERIFY_MAPPING_READS)\n", static_cast<unsigned long long>(address), published == 0 ? 0u : published & viewProtection, expected);
+        noteReadCheck(same);
+    }
 
     static bool runCollected(const Run& run, std::size_t bit) {
         return (run.collected[bit >> 6] >> (bit & 63) & 1) != 0;
@@ -2315,9 +2511,9 @@ private:
             view.slot = std::move(slot);
             view.slot->stored = true;
             view.resident = false;
-            publishView(page, view.protection, false);
             view.aliasDemoted = alias;
             view.unreported = view.page->comparedWhenShared ? allSubpages : std::uint8_t{0};
+            publishView(page, view);
             view.seen.fill(0);
             view.armed = 0;
             view.collected = 0;
@@ -2551,6 +2747,7 @@ private:
             const auto mask = static_cast<std::uint8_t>(subpagesOf(it->first, address, end) & view.trapped);
             if (mask == 0) continue;
             view.trapped &= static_cast<std::uint8_t>(~mask);
+            publishView(it->first, view);
             if (view.trapped == 0) trappedViews.fetch_sub(1, std::memory_order_release);
             const auto armed = static_cast<std::uint8_t>(mask & view.armed);
             const auto opened = static_cast<std::uint8_t>(mask & ~view.armed);
@@ -2661,7 +2858,7 @@ private:
         track.Forget(address, address + bytes);
         forgetOwnedPending(address, address + bytes);
         forgetZero(address, address + bytes);
-        collectableRanges.clear();
+        forgetCollectable();
         const auto end = address + bytes;
         privateAllocations.erase(privateAllocations.lower_bound(address), privateAllocations.lower_bound(end));
         forgetClean(address, end);
@@ -2766,6 +2963,8 @@ private:
     std::uint64_t nextOwned = 1;
     Ranges cleanRanges;
     Ranges collectableRanges;
+    Ranges reservedRanges;
+    std::atomic<std::uint64_t> reservedSkips{0};
     Ranges privateAllocations;
 #ifdef APS5_COUNT_MAPPING_QUERIES
     std::uint64_t collectSystemCalls = 0;
@@ -2837,7 +3036,16 @@ private:
         }
 
         void unlock() {
+            settle();
             inner.unlock();
+        }
+
+        void Publishing() {
+            if (const auto serial = published.load(std::memory_order_relaxed); (serial & 1) == 0) published.store(serial + 1);
+        }
+
+        std::uint64_t Serial() const {
+            return published.load();
         }
 
         void Lock(LockSite site, std::uintptr_t first, std::uintptr_t end) {
@@ -2895,6 +3103,7 @@ private:
                 flightRoles[slot] = role;
                 if (++aloft > 1) add(overlapped, 1);
                 add(flown, 1);
+                settle();
                 inner.unlock();
                 return slot;
             }
@@ -2964,6 +3173,10 @@ private:
             std::atomic<std::uint64_t> heldNs{0};
         };
 
+        void settle() {
+            if (const auto serial = published.load(std::memory_order_relaxed); (serial & 1) != 0) published.store(serial + 1);
+        }
+
         static void add(std::atomic<std::uint64_t>& counter, std::uint64_t amount) {
             counter.store(counter.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
         }
@@ -2998,6 +3211,7 @@ private:
         std::atomic<std::uint64_t> flown{0};
         std::atomic<std::uint64_t> overlapped{0};
         std::mutex inner;
+        std::atomic<std::uint64_t> published{0};
         std::atomic<std::uint8_t> holder{0};
         std::atomic<std::uint8_t> holderRole{0};
         std::atomic<std::uint8_t> holderCaller{0};
@@ -3046,6 +3260,11 @@ private:
     std::atomic<std::uint64_t> unlockedWrites{0};
     std::atomic<std::uint64_t> unlockedAnswers{0};
     std::atomic<bool> anyCompared{false};
+    static inline std::atomic<bool> verifyingReads{std::getenv("APS5_VERIFY_MAPPING_READS") != nullptr};
+    std::atomic<std::uint64_t> readChecks{0};
+    std::atomic<std::uint64_t> readDifferences{0};
+    std::atomic<std::uint64_t> readChecksSkipped{0};
+    std::chrono::steady_clock::time_point readChecksReported = std::chrono::steady_clock::now();
     RefusalTally refusalTally;
     WindowsPageTrack& track = WindowsPageTrack::Get();
     HANDLE zeroSection = nullptr;
