@@ -210,16 +210,6 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
         if (const auto ahead = CpuTopology::ChooseReservedCore(sets, taken, Switches().logical)) taken.push_back(ahead->chosen);
     }
     auto reservation = CpuTopology::ChooseReservedCore(sets, taken, logical);
-    static const bool othersAway = std::getenv("APS5_GAME_OFF_PIPELINE_CACHE") != nullptr;
-    if (othersAway && reservation.has_value()) {
-        const auto& home = reservation->chosen;
-        std::vector<std::uint32_t> away;
-        for (const auto& set : sets) {
-            if (set.parked || (set.group == home.group && set.lastLevelCache == home.lastLevelCache)) continue;
-            away.push_back(set.id);
-        }
-        if (!away.empty()) reservation->others = std::move(away);
-    }
     if (!reservation.has_value()) {
         if (logical.has_value()) std::fprintf(stderr, "[affinity] %s: APS5_COMMITTER_CPU=%u names no free logical processor of the process, no core reserved\n", role, *logical);
         return;
