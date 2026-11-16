@@ -285,7 +285,7 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
 namespace {
 void ReserveDecodeCore(const char* role) {
 #if defined(_WIN32) || defined(__linux__)
-    static const bool decodes = std::getenv("APS5_DECODE_CORE") != nullptr;
+    static const bool decodes = std::getenv("APS5_NO_DECODE_CORE") == nullptr;
     if (!decodes || std::strcmp(role, "queue worker 0x0") != 0 || !Switches().finisher) return;
     Reserve(DecodeSlot, "queue worker 0", std::nullopt);
 #else
@@ -308,7 +308,7 @@ void ReserveFinisherCore() {
 
 void ReserveFinisherPoolCore(unsigned index) {
 #if defined(_WIN32) || defined(__linux__)
-    static const bool pooled = std::getenv("APS5_FINISHER_POOL_CORES") != nullptr;
+    static const bool pooled = std::getenv("APS5_NO_FINISHER_POOL_CORES") == nullptr;
     if (!pooled || index == 0 || index > PoolSlots || !Switches().finisher) return;
     Reserve(FinisherSlot + index, "draw finisher of the pool", std::nullopt);
 #else
