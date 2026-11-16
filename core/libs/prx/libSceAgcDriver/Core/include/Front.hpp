@@ -158,8 +158,8 @@ struct FrontCounts {
     std::uint64_t flatSame = 0;
     std::uint64_t flatNs = 0;
     std::uint64_t flatBytes = 0;
-    std::uint64_t flatLost = 0;
     std::uint64_t flatTimed = 0;
+    std::uint64_t flatVertexKnown = 0;
     std::array<std::uint64_t, static_cast<std::size_t>(FrontLeft::Count)> left{};
     std::array<std::uint64_t, static_cast<std::size_t>(TeachRefusal::Count)> refused{};
 };

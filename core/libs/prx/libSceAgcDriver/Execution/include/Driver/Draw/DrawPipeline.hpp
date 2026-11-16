@@ -136,6 +136,10 @@ private:
     std::exception_ptr failure;
     std::atomic<std::size_t> outstanding{0};
     std::atomic<std::uint64_t> retiredItems{0};
+    std::array<std::pair<std::uint64_t, Range>, 512> writeLog{};
+    std::size_t writeLogAt = 0;
+    std::uint64_t writeLogDropped = 0;
+    std::uint64_t pushedItems = 0;
     std::atomic<std::uint64_t> decodeDrains{0};
     std::uint64_t reportedDecodeDrains = 0;
     std::uint32_t idleWaiters = 0;

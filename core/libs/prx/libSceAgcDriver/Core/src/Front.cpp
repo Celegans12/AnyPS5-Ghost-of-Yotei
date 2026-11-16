@@ -45,7 +45,7 @@ constexpr std::uint32_t NoBinding = 0xffffffffu;
 constexpr std::uint64_t EveryProgram = 1;
 
 struct Counters {
-    std::atomic<std::uint64_t> draws{0}, continued{0}, plans{0}, taken{0}, takenContinued{0}, taught{0}, verified{0}, mismatches{0}, digests{0}, committed{0}, restarted{0}, walkNs{0}, frontNs{0}, backNs{0}, retries{0}, flatTaken{0}, flatSame{0}, flatNs{0}, flatBytes{0}, flatLost{0}, flatTimed{0};
+    std::atomic<std::uint64_t> draws{0}, continued{0}, plans{0}, taken{0}, takenContinued{0}, taught{0}, verified{0}, mismatches{0}, digests{0}, committed{0}, restarted{0}, walkNs{0}, frontNs{0}, backNs{0}, retries{0}, flatTaken{0}, flatSame{0}, flatNs{0}, flatBytes{0}, flatTimed{0}, flatVertexKnown{0};
     std::array<std::atomic<std::uint64_t>, 8> sections{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(FrontLeft::Count)> left{};
     std::array<std::atomic<std::uint64_t>, static_cast<std::size_t>(TeachRefusal::Count)> refused{};
@@ -220,7 +220,16 @@ std::uint32_t flatWords(const RunPlanData& data, const FrontVariant& variant) {
     return words;
 }
 
+struct VertexMemo {
+    const FrontVariant* variant = nullptr;
+    std::uint32_t stage = 0;
+    std::vector<std::uint32_t> userData;
+    std::vector<Graphics::DecodeRead> reads;
+    ShaderRecompiler::ShaderVertexStageInfo fresh{};
+};
+
 struct FlatState {
+    std::array<VertexMemo, 256> vertexMemo;
     BlockRing ring{RingSource{&plainChunk, nullptr, nullptr}};
     std::vector<std::shared_ptr<FrontVariant>> kept;
     std::shared_ptr<const RunPlanData> plan;
@@ -339,8 +348,8 @@ FrontCounts Front::Counted() {
     counts.flatSame = load(held.flatSame);
     counts.flatNs = load(held.flatNs);
     counts.flatBytes = load(held.flatBytes);
-    counts.flatLost = load(held.flatLost);
     counts.flatTimed = load(held.flatTimed);
+    counts.flatVertexKnown = load(held.flatVertexKnown);
     for (std::size_t index = 0; index < counts.left.size(); ++index) counts.left[index] = load(held.left[index]);
     for (std::size_t index = 0; index < counts.refused.size(); ++index) counts.refused[index] = load(held.refused[index]);
     return counts;
@@ -367,9 +376,9 @@ std::string Front::Report() {
     for (std::size_t index = 1; index < counts.refused.size(); ++index) {
         if (counts.refused[index] != 0) text += " " + std::string(TeachRefusalName(static_cast<TeachRefusal>(index))) + " " + std::to_string(counts.refused[index]) + ";";
     }
-    if (counts.flatTaken != 0 || counts.flatLost != 0) {
+    if (counts.flatTaken != 0) {
         char flat[256];
-        std::snprintf(flat, sizeof(flat), " flat draws: %llu taken (%llu on the variant of the draw before) at %.2f us at the front (%llu timed), %llu ring bytes, %llu slices dropped", static_cast<unsigned long long>(counts.flatTaken), static_cast<unsigned long long>(counts.flatSame), per(counts.flatNs, counts.flatTimed), static_cast<unsigned long long>(counts.flatTimed), static_cast<unsigned long long>(counts.flatBytes), static_cast<unsigned long long>(counts.flatLost));
+        std::snprintf(flat, sizeof(flat), " flat draws: %llu taken (%llu on the variant of the draw before) at %.2f us at the front (%llu timed), %llu ring bytes, %llu vertex decodes answered by the memo", static_cast<unsigned long long>(counts.flatTaken), static_cast<unsigned long long>(counts.flatSame), per(counts.flatNs, counts.flatTimed), static_cast<unsigned long long>(counts.flatTimed), static_cast<unsigned long long>(counts.flatBytes), static_cast<unsigned long long>(counts.flatVertexKnown));
         text += flat;
     }
     return text;
@@ -737,8 +746,28 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
             if (taught.registeredViews != nullptr && !DriverDetail::CaptureRegisteredViewsCurrent(*taught.registeredViews)) return left(FrontLeft::Views, true);
             if (!taught.vertexInfo) continue;
             auto& fresh = flat.vertex[stage];
-            if (!decodeVertex(programs[stage], userData[stage], *taught.vertexInfo, flat.decodeReads, fresh)) return left(FrontLeft::Vertex, false);
-            if (flat.decodeReads.empty() || !DriverDetail::Driver::CoreVertexInputsMatch(*taught.vertexInfo, fresh)) return left(FrontLeft::Vertex, false);
+            auto& memo = flat.vertexMemo[((reinterpret_cast<std::uintptr_t>(variant) >> 6u) ^ stage) % flat.vertexMemo.size()];
+            const std::vector<Graphics::DecodeRead>* vertexReads = &flat.decodeReads;
+            bool known = memo.variant == variant && memo.stage == stage && memo.userData.size() == userData[stage].size() && std::equal(memo.userData.begin(), memo.userData.end(), userData[stage].begin());
+            for (std::size_t index = 0; known && index < memo.reads.size(); ++index) {
+                const auto& read = memo.reads[index];
+                std::array<std::byte, 16> now{};
+                known = read.size <= now.size() && ReadGuestBytes(read.address, std::span<std::byte>(now.data(), read.size)) && std::memcmp(now.data(), read.data.data(), read.size) == 0;
+            }
+            if (known) {
+                fresh = memo.fresh;
+                vertexReads = &memo.reads;
+                bump(held.flatVertexKnown);
+            } else {
+                memo.variant = nullptr;
+                if (!decodeVertex(programs[stage], userData[stage], *taught.vertexInfo, flat.decodeReads, fresh)) return left(FrontLeft::Vertex, false);
+                if (flat.decodeReads.empty() || !DriverDetail::Driver::CoreVertexInputsMatch(*taught.vertexInfo, fresh)) return left(FrontLeft::Vertex, false);
+                memo.stage = stage;
+                memo.userData.assign(userData[stage].begin(), userData[stage].end());
+                memo.reads = flat.decodeReads;
+                memo.fresh = fresh;
+                memo.variant = variant;
+            }
             for (const auto& attribute : taught.base->vertexAttributes) {
                 if (attribute.location >= fresh.resourcesNum) return left(FrontLeft::Vertex, false);
                 auto bound = attribute;
@@ -753,12 +782,12 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
                 }
                 if (!reader.Reads(bound.resource.fields[0] | (static_cast<std::uint64_t>(bound.resource.fields[1] & 0xffffu) << 32u), bytes)) return left(FrontLeft::Ranges, false);
             }
-            for (const auto& read : flat.decodeReads) {
+            for (const auto& read : *vertexReads) {
                 if (!reader.Note(read.address, read.address + read.size)) return left(FrontLeft::Ranges, false);
             }
         }
         const std::span<const Range> ranges(reader.ranges.data(), reader.count);
-        if (DrawFinisher::Busy() && DrawFinisher::Get().PendingOverlapsAny(ranges)) return left(FrontLeft::Finisher, false);
+        if (DrawFinisher::Busy() && !DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(ranges)) return left(FrontLeft::Finisher, false);
         if (!watched) {
             const auto queued = pipeline.WrittenWhileQueued(retired, ranges);
             if (!queued.has_value()) {

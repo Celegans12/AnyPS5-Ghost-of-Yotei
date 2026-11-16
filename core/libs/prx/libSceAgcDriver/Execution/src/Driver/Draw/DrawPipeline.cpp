@@ -1265,6 +1265,12 @@ void DrawPipeline::push(Item item) {
     ++enqueued;
     heldReadRanges.Add(item.reads.size());
     countWrites(item.writes, true);
+    ++pushedItems;
+    for (const auto& write : item.writes) {
+        auto& slot = writeLog[writeLogAt++ % writeLog.size()];
+        writeLogDropped = std::max(writeLogDropped, slot.first);
+        slot = {pushedItems, write};
+    }
     items.push_back(std::move(item));
     outstanding.fetch_add(1, std::memory_order_release);
     if (!thread.joinable()) {
@@ -1867,7 +1873,17 @@ std::optional<bool> DrawPipeline::WrittenWhileQueued(std::uint64_t retiredBefore
     if (DrawFinisher::Overlap() && DrawFinisher::Get().PendingOverlapsAny(reads)) return true;
     if (flat != nullptr) return flat->Ledger().OverlapsUnretired(retiredBefore, reads);
     std::lock_guard lock(mutex);
-    if (retiredItems.load(std::memory_order_relaxed) != retiredBefore) return std::nullopt;
+    if (retiredItems.load(std::memory_order_relaxed) != retiredBefore) {
+        if (writeLogDropped > retiredBefore) return std::nullopt;
+        for (std::size_t back = 0; back < writeLog.size() && back < writeLogAt; ++back) {
+            const auto& [index, range] = writeLog[(writeLogAt - 1 - back) % writeLog.size()];
+            if (index <= retiredBefore) break;
+            for (const auto& read : reads) {
+                if (read.first < range.second && range.first < read.second) return true;
+            }
+        }
+        return false;
+    }
     for (const auto& [range, count] : queuedWrites) {
         for (const auto& read : reads) {
             if (read.first < range.second && range.first < read.second) return true;
