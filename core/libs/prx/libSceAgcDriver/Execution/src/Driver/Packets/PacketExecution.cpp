@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Core/include/CoarseClock.hpp"
 #include "prx/libSceAgcDriver/Core/include/DecodeLane.hpp"
+#include "prx/libSceAgcDriver/Core/include/DecoderShadow.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ThreadScratch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -333,6 +334,10 @@ void Driver::execute(Submission& submission) {
     static const bool lightLane = Graphics::CoreLightLane();
     static const bool verifyLane = Graphics::VerifyCoreLightLane();
     static const bool laneStats = Graphics::CoreRunStats();
+    static const bool verifyDecoder = Core::DecoderShadow::Enabled();
+    thread_local Core::DecoderShadow* decoderShadowSlot = nullptr;
+    auto* const decoderShadow = verifyDecoder ? &ShaderRecompiler::ThreadOwned(decoderShadowSlot) : nullptr;
+    if (decoderShadow != nullptr) decoderShadow->Begin(queue);
     const bool laneOpen = (lightLane || verifyLane) && pipelined && !profilePackets && !traceGpu && !packetEpoch() && !CaptureTrace::Enabled() && static_cast<long>(submission.queue) != dumpQueue;
     const auto lightRun = [&](std::size_t& cursor, std::size_t end) {
         std::size_t at = cursor;
@@ -369,6 +374,7 @@ void Driver::execute(Submission& submission) {
                 }
                 const auto count = Pm4::PacketWords(header);
                 const auto packet = std::span(submission.commands).subspan(at, count);
+                if (decoderShadow != nullptr) decoderShadow->Step(submission.commands, at, submission.registerLists, queue, false);
                 queue.runMask.Packet(opcode);
                 if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(at + 1) << 8u) | opcode, std::memory_order_relaxed);
                 recent.Record(at);
@@ -425,6 +431,7 @@ void Driver::execute(Submission& submission) {
         const auto count = Pm4::PacketWords(header);
         const auto packet = std::span(submission.commands).subspan(cursor, count);
         const auto opcode = (header >> 8u) & 0xffu;
+        if (decoderShadow != nullptr) decoderShadow->Step(submission.commands, cursor, submission.registerLists, queue, false);
         if (opcode != 0x10 || (((header >> 2u) & 0x3fu) != 0 && ((header >> 2u) & 0x3fu) != 0x0b && ((header >> 2u) & 0x3fu) != 0x0c)) queue.runMask.Packet(opcode);
         if (executingPacket != nullptr) executingPacket->store((static_cast<std::uint64_t>(cursor + 1) << 8u) | opcode, std::memory_order_relaxed);
         auto nextCursor = cursor + count;
@@ -765,6 +772,7 @@ void Driver::execute(Submission& submission) {
         cursor = nextCursor;
     }
 
+    if (decoderShadow != nullptr && decoderShadow->ReportDue()) std::fprintf(stderr, "%s%c", decoderShadow->Report().c_str(), 10);
     FlushLabelRun();
     const bool queuesEnd = pipelined && orderedCompletion && deferredLabels().labels.empty();
     const bool relaysEnd = queuesEnd && DrawFinisher::RelaysSubmissionEnd();
