@@ -1553,6 +1553,176 @@ void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResou
     reportDraw(timer.us, built, outcome);
 }
 
+enum class InputTokenCount : std::size_t { Lookups, Hits, Absent, Shorter, Moved, Collected, Images, GpuWrites, Labels, Expired, Kept, Untracked, Verified, Mismatches, Count };
+
+constexpr std::size_t InputTokenCounts = static_cast<std::size_t>(InputTokenCount::Count);
+constexpr std::size_t InputTokenSlots = 4096;
+constexpr std::uint64_t InputTokenReportEvery = std::uint64_t{1} << 16u;
+
+std::array<std::atomic<std::uint64_t>, InputTokenCounts>& inputTokenCounters() {
+    static std::array<std::atomic<std::uint64_t>, InputTokenCounts> held{};
+    return held;
+}
+
+void countInputToken(InputTokenCount kind) {
+    inputTokenCounters()[static_cast<std::size_t>(kind)].fetch_add(1, std::memory_order_relaxed);
+}
+
+struct InputTokenSlot {
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::size_t from = 0;
+    Recorder::SnapshotUse use = Recorder::SnapshotUse::Vertex;
+    VkDevice device = VK_NULL_HANDLE;
+    std::weak_ptr<Buffer> buffer;
+    std::uint32_t derived = 0;
+    std::uint32_t lowest = 0;
+    GuestMemory::ContentToken token{};
+    std::uint64_t pendingSerial = 0;
+    std::uint64_t registryGeneration = 0;
+};
+
+struct InputTokenArm {
+    bool armed = false;
+    std::uint64_t address = 0;
+    std::size_t bytes = 0;
+    std::size_t from = 0;
+    Recorder::SnapshotUse use = Recorder::SnapshotUse::Vertex;
+    VkDevice device = VK_NULL_HANDLE;
+    GuestMemory::ContentToken token{};
+    std::uint64_t pendingSerial = 0;
+    std::uint64_t registryGeneration = 0;
+};
+
+InputTokenSlot& inputTokenSlot(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use) {
+    static thread_local std::vector<InputTokenSlot> slots(InputTokenSlots);
+    std::uint64_t key = (address >> 2u) * 0x9E3779B97F4A7C15ull;
+    key ^= (static_cast<std::uint64_t>(bytes) + static_cast<std::uint64_t>(use) * 0x100000001B3ull) * 0xC2B2AE3D27D4EB4Full;
+    return slots[static_cast<std::size_t>(key >> 40u) % InputTokenSlots];
+}
+
+InputTokenArm& inputTokenArm() {
+    static thread_local InputTokenArm arm;
+    return arm;
+}
+
+bool InputTokenCache() {
+    static const bool enabled = std::getenv("APS5_INPUT_TOKEN_CACHE") != nullptr;
+    return enabled;
+}
+
+bool VerifyInputTokenCache() {
+    static const bool verify = std::getenv("APS5_VERIFY_INPUT_TOKEN_CACHE") != nullptr;
+    return verify;
+}
+
+void reportInputTokens() {
+    std::array<std::uint64_t, InputTokenCounts> n{};
+    for (std::size_t index = 0; index < n.size(); ++index) n[index] = inputTokenCounters()[index].load(std::memory_order_relaxed);
+    const auto at = [&](InputTokenCount kind) { return static_cast<unsigned long long>(n[static_cast<std::size_t>(kind)]); };
+    AgcDriver::ProfilePrint_nid_no_patch("[input-token] cumulative: %llu lookups, %llu served by a content token (%llu of them after a collect of the range); refused: %llu no entry, %llu entry starting past the request, %llu token moved, %llu pending image or unit shadow, %llu pending GPU write, %llu pending label or queued store, %llu copy released; %llu entries kept, %llu ranges without a token; verified %llu, mismatches %llu\n", at(InputTokenCount::Lookups), at(InputTokenCount::Hits), at(InputTokenCount::Collected), at(InputTokenCount::Absent), at(InputTokenCount::Shorter), at(InputTokenCount::Moved), at(InputTokenCount::Images), at(InputTokenCount::GpuWrites), at(InputTokenCount::Labels), at(InputTokenCount::Expired), at(InputTokenCount::Kept), at(InputTokenCount::Untracked), at(InputTokenCount::Verified), at(InputTokenCount::Mismatches));
+}
+
+void verifyTokenInput(std::uint64_t address, std::size_t bytes, std::size_t alignment, std::size_t from, Buffer& held) {
+    GuestMemory::FlushGpuWrites(address, bytes);
+    GuestMemory::CollectWrites(address, bytes);
+    static thread_local std::vector<std::byte> fresh;
+    fresh.resize(bytes - from);
+    GuestMemory::Read(address + from, std::span<std::byte>(fresh), alignment);
+    countInputToken(InputTokenCount::Verified);
+    if (std::memcmp(fresh.data(), held.Bytes().data() + from, bytes - from) == 0) return;
+    countInputToken(InputTokenCount::Mismatches);
+    char message[192];
+    std::snprintf(message, sizeof(message), "APS5_VERIFY_INPUT_TOKEN_CACHE: the draw input of 0x%zx bytes at 0x%llx served by its content token differs from guest memory", bytes, static_cast<unsigned long long>(address));
+    throw std::runtime_error(message);
+}
+
+}
+
+std::array<std::uint64_t, 14> DrawInputTokenCounted() {
+    std::array<std::uint64_t, 14> counts{};
+    static_assert(InputTokenCounts == 14);
+    for (std::size_t index = 0; index < counts.size(); ++index) counts[index] = inputTokenCounters()[index].load(std::memory_order_relaxed);
+    return counts;
+}
+
+std::shared_ptr<Buffer> ReusableTokenDrawInput(const Recorder* recorder, VkDevice device, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::size_t from, std::uint32_t* derived, std::uint32_t* lowest) {
+    const auto lookups = inputTokenCounters()[static_cast<std::size_t>(InputTokenCount::Lookups)].fetch_add(1, std::memory_order_relaxed) + 1;
+    if (lookups % InputTokenReportEvery == 0) reportInputTokens();
+    auto& slot = inputTokenSlot(address, bytes, use);
+    if (slot.token.content == 0 || slot.address != address || slot.bytes != bytes || slot.use != use || slot.device != device) {
+        countInputToken(InputTokenCount::Absent);
+        return {};
+    }
+    if (slot.from > from) {
+        countInputToken(InputTokenCount::Shorter);
+        return {};
+    }
+    if (slot.registryGeneration != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) {
+        slot = InputTokenSlot{};
+        countInputToken(InputTokenCount::Moved);
+        return {};
+    }
+    bool collected = false;
+    if (!GuestMemory::StillCurrent(address, bytes, slot.token)) {
+        collected = GuestMemory::CollectWrites(address, bytes) != 0 && GuestMemory::StillCurrent(address, bytes, slot.token);
+        if (!collected) {
+            slot = InputTokenSlot{};
+            countInputToken(InputTokenCount::Moved);
+            return {};
+        }
+    }
+    const auto serial = StorageTexture::PendingSerial();
+    if (serial != slot.pendingSerial) {
+        const std::pair<std::uint64_t, std::uint64_t> range{address, address + bytes};
+        if (StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>>(&range, 1)) || AnyShadowedOverlaps(address, bytes)) {
+            countInputToken(InputTokenCount::Images);
+            return {};
+        }
+        slot.pendingSerial = serial;
+    }
+    if (recorder != nullptr) {
+        if (recorder->PendingWriteOverlaps(address, bytes)) {
+            countInputToken(InputTokenCount::GpuWrites);
+            return {};
+        }
+        if (recorder->PendingLabelIn(address, bytes) || recorder->QueuedStoreOverlaps(address, bytes) || recorder->QueuedKeyStoreOverlaps(address, bytes)) {
+            countInputToken(InputTokenCount::Labels);
+            return {};
+        }
+    }
+    auto held = slot.buffer.lock();
+    if (held == nullptr) {
+        slot = InputTokenSlot{};
+        countInputToken(InputTokenCount::Expired);
+        return {};
+    }
+    if (derived != nullptr) *derived = slot.derived;
+    if (lowest != nullptr) *lowest = slot.lowest;
+    countInputToken(InputTokenCount::Hits);
+    if (collected) countInputToken(InputTokenCount::Collected);
+    return held;
+}
+
+void KeepTokenDrawInput(VkDevice device, std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, std::size_t from, const std::shared_ptr<Buffer>& buffer, std::uint32_t derived, std::uint32_t lowest, const GuestMemory::ContentToken& token, std::uint64_t pendingSerial, std::uint64_t registryGeneration) {
+    if (buffer == nullptr || bytes == 0) return;
+    if (token.content == 0) {
+        countInputToken(InputTokenCount::Untracked);
+        return;
+    }
+    auto& slot = inputTokenSlot(address, bytes, use);
+    slot.address = address;
+    slot.bytes = bytes;
+    slot.from = from;
+    slot.use = use;
+    slot.device = device;
+    slot.buffer = buffer;
+    slot.derived = derived;
+    slot.lowest = lowest;
+    slot.token = token;
+    slot.pendingSerial = pendingSerial;
+    slot.registryGeneration = registryGeneration;
+    countInputToken(InputTokenCount::Kept);
 }
 
 DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uint64_t address, std::size_t bytes, std::size_t alignment, Recorder::SnapshotUse use, std::size_t from) {
@@ -1560,6 +1730,18 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
     Require(from == 0 || (use == Recorder::SnapshotUse::Vertex && from < bytes), "only a vertex input starts past its address");
     DrawInputCopy copy;
     copy.from = from;
+    const bool tokens = recorder != nullptr && bytes != 0 && !BufferCache::DirtyFirst() && InputTokenCache();
+    std::uint64_t pendingSerial = 0;
+    if (tokens) {
+        inputTokenArm().armed = false;
+        pendingSerial = StorageTexture::PendingSerial();
+        if (auto held = ReusableTokenDrawInput(recorder, context.device, address, bytes, use, from, &copy.derived, &copy.lowest)) {
+            if (VerifyInputTokenCache()) verifyTokenInput(address, bytes, alignment, from, *held);
+            copy.buffer = std::move(held);
+            copy.reused = true;
+            return copy;
+        }
+    }
     if (recorder != nullptr && bytes != 0 && BufferCache::DirtyFirst()) {
         GuestMemory::FlushGpuWrites(address, bytes);
     } else if (recorder != nullptr && bytes != 0) {
@@ -1576,12 +1758,15 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         }
         copy.registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
         copy.generation = GuestMemory::CollectWrites(address, bytes);
+        const auto token = tokens && copy.generation != 0 ? GuestMemory::TokenFor(address, bytes) : GuestMemory::ContentToken{};
         if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, nullptr, from, &copy.lowest);
         else if (owned) copy.owned = recorder->ArmOwnedDrawInput(address, bytes);
         if (copy.buffer != nullptr) {
             copy.reused = true;
+            if (tokens) KeepTokenDrawInput(context.device, address, bytes, use, from, copy.buffer, copy.derived, copy.lowest, token, pendingSerial, copy.registryGeneration);
             return copy;
         }
+        if (tokens && copy.generation != 0) inputTokenArm() = InputTokenArm{true, address, bytes, from, use, context.device, token, pendingSerial, copy.registryGeneration};
     }
     copy.buffer = std::make_shared<Buffer>(context, bytes, use == Recorder::SnapshotUse::Vertex ? VK_BUFFER_USAGE_VERTEX_BUFFER_BIT : VK_BUFFER_USAGE_INDEX_BUFFER_BIT);
     static const bool poisonPrefix = std::getenv("APS5_POISON_VERTEX_PREFIX") != nullptr;
@@ -1629,6 +1814,11 @@ void KeepDrawInput(Recorder* recorder, std::uint64_t address, const DrawInputCop
         return;
     }
     recorder->KeepDrawSnapshot(address, copy.buffer->Bytes().size(), copy.generation, copy.registryGeneration, copy.buffer, use, derived, copy.from, lowest);
+    auto& arm = inputTokenArm();
+    if (!arm.armed) return;
+    arm.armed = false;
+    if (arm.address != address || arm.bytes != copy.buffer->Bytes().size() || arm.from != copy.from || arm.use != use || arm.registryGeneration != copy.registryGeneration) return;
+    KeepTokenDrawInput(arm.device, address, arm.bytes, use, arm.from, copy.buffer, derived, lowest, arm.token, arm.pendingSerial, arm.registryGeneration);
 }
 
 namespace {
