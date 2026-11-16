@@ -3636,8 +3636,6 @@ struct SweptTokens {
     std::vector<GuestMemory::ContentToken> tokens;
     std::uint64_t words = 0;
     std::uint64_t generation = 0;
-    std::uint64_t noted = 0;
-    std::uint64_t renewals = 0;
     bool held = false;
 };
 
@@ -3646,7 +3644,6 @@ struct TemplateTokens {
     std::vector<RangeToken> storage;
     SweptTokens version;
     SweptTokens index;
-    SweptTokens proved;
 };
 
 struct TemplateTokenTable {
@@ -3802,14 +3799,19 @@ void takeSweptTokens(SweptTokens& swept, const std::shared_ptr<GuestMemory::Writ
     swept.held = true;
 }
 
-enum class VersionMove : std::size_t { Noted, Beside, Within, Unknown, Kept, Count };
+enum class VersionMove : std::size_t { Noted, Beside, Within, Unknown, Count };
 
-void countVersionMove(VersionMove move) {
+void noteVersionMove(const SweptTokens& swept, const std::shared_ptr<GuestMemory::WriteSubscription>& subscription) {
     constexpr auto Kinds = static_cast<std::size_t>(VersionMove::Count);
     static std::array<std::atomic<std::uint64_t>, Kinds> counts{};
     static std::atomic<std::uint64_t> notes{0};
     static std::atomic<std::int64_t> lastReport{0};
     static const bool reported = std::getenv("APS5_PIPELINE_STATS") != nullptr;
+    auto move = VersionMove::Unknown;
+    if (swept.held && subscription != nullptr && !swept.subscription.owner_before(subscription) && !subscription.owner_before(swept.subscription)) {
+        if (GuestMemory::SubscriptionGeneration(*subscription) == swept.generation) move = VersionMove::Noted;
+        else move = rangeTokensHold(GuestMemory::SubscriptionSpans(*subscription), swept.tokens) ? VersionMove::Beside : VersionMove::Within;
+    }
     counts[static_cast<std::size_t>(move)].fetch_add(1, std::memory_order_relaxed);
     if (!reported || (notes.fetch_add(1, std::memory_order_relaxed) & 255u) != 0) return;
     const auto nowMs = static_cast<std::int64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
@@ -3821,38 +3823,7 @@ void countVersionMove(VersionMove move) {
         const auto total = counts[kind].load(std::memory_order_relaxed);
         since[kind] = static_cast<unsigned long long>(total - printed[kind].exchange(total, std::memory_order_relaxed));
     }
-    AgcDriver::ProfilePrint_nid_no_patch("[proof-versions] (10 s): held template proofs whose version moved: %llu by the noted ranges alone, %llu by a store beside the swept pages whose tokens held, %llu by a store in the swept pages or an unanswered token, %llu without tokens; %llu kept past a store beside their pages%c", since[0], since[1], since[2], since[3], since[4], 10);
-}
-
-void noteVersionMove(const SweptTokens& swept, const std::shared_ptr<GuestMemory::WriteSubscription>& subscription) {
-    auto move = VersionMove::Unknown;
-    if (swept.held && subscription != nullptr && !swept.subscription.owner_before(subscription) && !subscription.owner_before(swept.subscription)) {
-        if (GuestMemory::SubscriptionGeneration(*subscription) == swept.generation) move = VersionMove::Noted;
-        else move = rangeTokensHold(GuestMemory::SubscriptionSpans(*subscription), swept.tokens) ? VersionMove::Beside : VersionMove::Within;
-    }
-    countVersionMove(move);
-}
-
-bool ProofsPastNeighbours() {
-    static const bool enabled = std::getenv("APS5_PROOFS_PAST_NEIGHBOURS") != nullptr;
-    return enabled;
-}
-
-void takeProvedTokens(SweptTokens& proved, const GuestMemory::ResourceVersion& version, std::uint64_t words) {
-    proved.held = false;
-    if (version.subscription == nullptr) return;
-    if (!takeRangeTokens(GuestMemory::SubscriptionSpans(*version.subscription), proved.tokens)) return;
-    proved.subscription = version.subscription;
-    proved.words = words;
-    proved.noted = version.notedSubscription != nullptr ? GuestMemory::SubscriptionGeneration(*version.notedSubscription) : 0;
-    proved.renewals = version.renewals;
-    proved.held = true;
-}
-
-bool provedPagesHold(const SweptTokens& proved, const GuestMemory::ResourceVersion& version, std::uint64_t words) {
-    if (!proved.held || version.subscription == nullptr || proved.words != words || proved.renewals != version.renewals || proved.subscription.owner_before(version.subscription) || version.subscription.owner_before(proved.subscription)) return false;
-    const auto noted = version.notedSubscription != nullptr ? GuestMemory::SubscriptionGeneration(*version.notedSubscription) : 0;
-    return noted == proved.noted && rangeTokensHold(GuestMemory::SubscriptionSpans(*version.subscription), proved.tokens);
+    AgcDriver::ProfilePrint_nid_no_patch("[proof-versions] (10 s): held template proofs whose version moved: %llu by the noted ranges alone, %llu by a store beside the swept pages whose tokens held, %llu by a store in the swept pages or an unanswered token, %llu without tokens%c", since[0], since[1], since[2], since[3], 10);
 }
 
 void countRevalidate(bool fast, bool ok, std::chrono::steady_clock::time_point start) {
@@ -5210,13 +5181,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             if (byTokens) versions.sweptEpoch = now.epoch;
             const auto generation = GuestMemory::CurrentVersion(versions, now.epoch);
             if (generation != 0 && generation != provedGeneration) {
-                if (const auto* held = tokens != nullptr ? tokens : templateTokens(this); held != nullptr) {
-                    noteVersionMove(held->version, versions.subscription);
-                    if (ProofsPastNeighbours() && provedPagesHold(held->proved, versions, tokens != nullptr ? words : templateTokenWords(shaders))) {
-                        provedGeneration = generation;
-                        countVersionMove(VersionMove::Kept);
-                    }
-                }
+                if (const auto* held = tokens != nullptr ? tokens : templateTokens(this); held != nullptr) noteVersionMove(held->version, versions.subscription);
             }
             if (tokens != nullptr && !byTokens && generation != 0) takeSweptTokens(tokens->version, versions.subscription, words);
             if (generation == 0) miss = DrawProofMiss::Sweep;
@@ -5252,10 +5217,6 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         if (GuestMemory::HoldVersion(versions, swept, noted)) generation = GuestMemory::CurrentVersion(versions, now.epoch);
         renewals = versions.renewals;
     }
-    struct EarlyTag {};
-    auto& early = ThreadScratch<SweptTokens, EarlyTag>();
-    early.held = false;
-    if (generation != 0 && ProofsPastNeighbours() && templateTokens(this) != nullptr) takeProvedTokens(early, versions, templateTokenWords(shaders));
     ProofReport local;
     auto* out = report != nullptr ? report : &local;
     const bool ok = revalidateFull(shaders, out);
@@ -5266,12 +5227,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
         if (takeProof(now)) {
             provedGeneration = generation;
             touchedEpoch = now.epoch;
-            if (auto* tokens = templateTokens(this); tokens != nullptr) {
-                takeSweptTokens(tokens->version, versions.subscription, templateTokenWords(shaders));
-                const bool same = early.held && early.renewals == versions.renewals && !early.subscription.owner_before(versions.subscription) && !versions.subscription.owner_before(early.subscription);
-                if (same) tokens->proved = early;
-                else tokens->proved.held = false;
-            }
+            if (auto* tokens = templateTokens(this); tokens != nullptr) takeSweptTokens(tokens->version, versions.subscription, templateTokenWords(shaders));
             NoteDrawProofProved(DrawProofKind::Resources);
         }
         return ok;
