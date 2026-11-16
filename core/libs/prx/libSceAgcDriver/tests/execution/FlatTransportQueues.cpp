@@ -120,19 +120,21 @@ void QueriesFollowTheCommitterQueue() {
     Require(DrawPipeline::HeldReads(0x400f, 4), "a range a queued draw reads was not held");
     Require(!DrawPipeline::HeldReads(0x4010, 4), "a range that starts where a queued read ends was held");
 
+    const std::array<DrawPipeline::Range, 1> writtenRange{{{0x1000, 0x1004}}};
+    const std::array<DrawPipeline::Range, 1> clearRange{{{0x9000, 0x9004}}};
     const auto watch = pipeline.WatchWrites();
     Require(watch.retired == retired && watch.items == 5 && watch.writes.size() == 12, "the writes of the queued items were not all copied");
-    Require(pipeline.WrittenSince(watch, {{0x1000, 0x1004}}), "a queued write was not reported as written since the copy");
-    Require(!pipeline.WrittenSince(watch, {{0x9000, 0x9004}}), "a range no queued item writes was reported as written since the copy");
-    Require(pipeline.WrittenWhileQueued(retired, {{0x1000, 0x1004}}) == std::optional<bool>(true), "a queued write was not reported while nothing was retired");
-    Require(pipeline.WrittenWhileQueued(retired, {{0x9000, 0x9004}}) == std::optional<bool>(false), "a clear range was reported as written while nothing was retired");
+    Require(pipeline.WrittenSince(watch, writtenRange), "a queued write was not reported as written since the copy");
+    Require(!pipeline.WrittenSince(watch, clearRange), "a range no queued item writes was reported as written since the copy");
+    Require(pipeline.WrittenWhileQueued(retired, writtenRange) == std::optional<bool>(true), "a queued write was not reported while nothing was retired");
+    Require(pipeline.WrittenWhileQueued(retired, clearRange) == std::optional<bool>(false), "a clear range was reported as written while nothing was retired");
 
     gate.Open();
     Settle();
     Require(pipeline.Retired() == retired + 5 && pipeline.Outstanding() == 0, "the committed items were not all retired");
     Require(!pipeline.Overlaps(0x1000, 0x100) && !DrawPipeline::HeldReads(0x4000, 4), "a committed item was still reported as queued");
-    Require(!pipeline.WrittenWhileQueued(retired, {{0x9000, 0x9004}}).has_value(), "items retired since the count was taken went unnoticed");
-    Require(pipeline.WrittenSince(watch, {{0x1000, 0x1004}}), "a write committed since the copy was not reported");
+    Require(!pipeline.WrittenWhileQueued(retired, clearRange).has_value(), "items retired since the count was taken went unnoticed");
+    Require(pipeline.WrittenSince(watch, writtenRange), "a write committed since the copy was not reported");
     if (DrawPipeline::Flat() && DrawFinisher::Timed()) {
         const auto after = DrawPipeline::Transported();
         Require(after.elements == counted.elements + 5, "the items of the committer's queue were not counted");
