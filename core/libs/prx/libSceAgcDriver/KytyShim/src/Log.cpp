@@ -35,8 +35,12 @@ std::FILE* Open(const std::filesystem::path& path, const char* what) {
     std::error_code error;
     if (path.has_parent_path()) std::filesystem::create_directories(path.parent_path(), error);
     const bool relaunched = std::getenv(RelaunchedVariable) != nullptr;
+#ifdef _WIN32
+    std::FILE* file = _wfopen(path.c_str(), relaunched ? L"ab" : L"wb");
+#else
     std::FILE* file = std::fopen(path.c_str(), relaunched ? "ab" : "wb");
-    if (file == nullptr) EXIT("KytyShim: cannot open the %s %s (%s)\n", what, path.c_str(), std::strerror(errno));
+#endif
+    if (file == nullptr) EXIT("KytyShim: cannot open the %s %s (%s)\n", what, path.string().c_str(), std::strerror(errno));
     std::setvbuf(file, nullptr, _IOFBF, static_cast<std::size_t>(64) * 1024);
     return file;
 }
@@ -71,7 +75,11 @@ void Initialize() {
         g_session = Open(session, "session log");
         const std::time_t now = std::time(nullptr);
         std::tm local{};
+#ifdef _WIN32
+        localtime_s(&local, &now);
+#else
         localtime_r(&now, &local);
+#endif
         char started[32] = "";
         std::strftime(started, sizeof(started), "%Y-%m-%d %H:%M:%S", &local);
         const auto header = fmt::format("--- {} {} ---\n{}\n", std::getenv(RelaunchedVariable) != nullptr ? "Relaunched" : "Session", started, KYTY_BUILD_LABEL);

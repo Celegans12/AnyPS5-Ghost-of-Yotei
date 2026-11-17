@@ -37,7 +37,18 @@
 #include <system_error>
 #include <utility>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/mman.h>
+#endif
+
+#ifdef _WIN32
+namespace {
+constexpr int PROT_READ = 1;
+constexpr int PROT_WRITE = 2;
+}
+#endif
 
 namespace KytyShim {
 

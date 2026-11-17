@@ -46,7 +46,7 @@ At a comparable draw count (911 against 863 per frame), every Kyty stage is 12 t
 
 - Tested in game on Linux: Subnautica, Balatro and TCG Card Shop Simulator.
 - Known issue, inherited from Kyty: the street of TCG Card Shop Simulator stays almost black, as it does on native Kyty. Rendering differences against the default backend are being collected and will be fixed after performance work.
-- The Kyty backend has only been built and run on Linux. Windows is untested.
+- The Kyty backend is built and run on Linux. On Windows it builds, and an open-world AAA title reaches the prologue in game on an NVIDIA GPU; nothing else has been tested there.
 
 ## Building AnyKyty
 
@@ -55,6 +55,8 @@ Follow [BUILD](docs/dev/BUILD.md), then configure with:
 ```
 cmake -B build -DANYPS5_GPU_BACKEND=kyty
 ```
+
+On Windows the rest of AnyPS5 is built with MinGW-w64 GCC as usual, and `clang`, `clang++` of an LLVM release (tested with 21.1.8) must be on `PATH`: they compile the Kyty core for the `x86_64-w64-windows-gnu` target against the headers and libstdc++ of that GCC (`ANYPS5_KYTY_SYSROOT`, by default the directory above the `bin` of `g++`). ThinLTO is off there, since lld cannot pre-link Windows objects, and Kyty's pipeline helper processes are not used.
 
 The Kyty core does not build with GCC, so it is compiled by Clang in a sub-project, against the same libstdc++ as the rest of AnyPS5. It needs `clang`, `clang++` and an `ld.lld` of the same major version (tested with 21). It is built with ThinLTO and pre-linked into one object by default; `-DANYPS5_KYTY_THIN_LTO=OFF` turns that off.
 
