@@ -83,6 +83,7 @@ struct CpuSet {
     std::uint8_t efficiencyClass = 0;
     std::uint8_t lastLevelCache = 0;
     bool parked = false;
+    std::uint32_t lastLevelCacheKib = 0;
 };
 
 struct CoreReservation {
@@ -118,7 +119,9 @@ inline std::optional<CoreReservation> ChooseReservedCore(const std::vector<CpuSe
         const CpuSet* home = nullptr;
         for (const auto& set : sets) {
             if (set.efficiencyClass != highest || set.parked) continue;
-            if (home == nullptr || set.group < home->group || (set.group == home->group && set.logical < home->logical)) home = &set;
+            const bool larger = home != nullptr && set.lastLevelCacheKib > home->lastLevelCacheKib;
+            const bool sameSize = home != nullptr && set.lastLevelCacheKib == home->lastLevelCacheKib;
+            if (home == nullptr || larger || (sameSize && (set.group < home->group || (set.group == home->group && set.logical < home->logical)))) home = &set;
         }
         if (home == nullptr) return std::nullopt;
         const auto candidate = [&](const CpuSet& set) {
@@ -169,6 +172,18 @@ inline std::optional<unsigned long> ReadSysfsNumber(const std::string& path) {
     return std::nullopt;
 }
 
+inline std::uint32_t ReadSysfsKib(const std::string& path) {
+    std::ifstream file(path);
+    unsigned long long value = 0;
+    if (!(file >> value)) return 0;
+    char unit = 'K';
+    file >> unit;
+    if (unit == 'M') value *= 1024ull;
+    else if (unit == 'G') value *= 1024ull * 1024ull;
+    else if (unit != 'K') return 0;
+    return value > 0xffffffffull ? 0xffffffffu : static_cast<std::uint32_t>(value);
+}
+
 inline std::vector<CpuSet> SysfsCpuSets(const std::string& root, std::uint64_t process, std::uint64_t efficient) {
     std::vector<CpuSet> sets;
     std::vector<std::pair<unsigned long, unsigned long>> cores;
@@ -188,6 +203,7 @@ inline std::vector<CpuSet> SysfsCpuSets(const std::string& root, std::uint64_t p
         const auto coreIndex = indexOf(cores, std::pair{*package, *core});
         unsigned long level = 0;
         unsigned long cacheId = 0;
+        std::uint32_t cacheKib = 0;
         for (unsigned index = 0; index < 8; ++index) {
             const auto cacheBase = base + "/cache/index" + std::to_string(index);
             const auto cacheLevel = ReadSysfsNumber(cacheBase + "/level");
@@ -195,11 +211,12 @@ inline std::vector<CpuSet> SysfsCpuSets(const std::string& root, std::uint64_t p
             if (!cacheLevel.has_value() || !id.has_value() || *cacheLevel < level) continue;
             level = *cacheLevel;
             cacheId = *id;
+            cacheKib = ReadSysfsKib(cacheBase + "/size");
         }
         const auto cacheIndex = indexOf(caches, std::pair{*package, cacheId});
         if (coreIndex > 0xffu || cacheIndex > 0xffu) return {};
         const bool efficientCore = ((efficient >> cpu) & 1u) != 0;
-        sets.push_back({cpu, 0, static_cast<std::uint8_t>(cpu), static_cast<std::uint8_t>(coreIndex), static_cast<std::uint8_t>(efficientCore ? 0u : 1u), static_cast<std::uint8_t>(cacheIndex), false});
+        sets.push_back({cpu, 0, static_cast<std::uint8_t>(cpu), static_cast<std::uint8_t>(coreIndex), static_cast<std::uint8_t>(efficientCore ? 0u : 1u), static_cast<std::uint8_t>(cacheIndex), false, cacheKib});
     }
     return sets;
 }

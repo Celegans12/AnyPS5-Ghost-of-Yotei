@@ -1149,6 +1149,7 @@ void CollectWalker::start() {
 void CollectWalker::run() {
     NameDriverThread("collect-walk");
     PerformanceTrace::BindThread("collect walker");
+    ReserveWalkerCore();
     static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
     std::exception_ptr error;
     try {

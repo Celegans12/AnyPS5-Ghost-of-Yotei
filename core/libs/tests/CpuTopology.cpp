@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <fstream>
 #include <random>
+#include <string>
+#include <vector>
 
 static void Require(bool value, const char* what) {
     if (value) return;
@@ -135,7 +137,12 @@ static void WriteNumber(const std::filesystem::path& path, unsigned long value) 
     std::ofstream(path, std::ios::trunc) << value << "\n";
 }
 
-static std::filesystem::path FakeSysfs(unsigned packages, unsigned cachesPerPackage, unsigned coresPerCache, bool smt) {
+static void WriteText(const std::filesystem::path& path, const std::string& text) {
+    std::filesystem::create_directories(path.parent_path());
+    std::ofstream(path, std::ios::trunc) << text << "\n";
+}
+
+static std::filesystem::path FakeSysfs(unsigned packages, unsigned cachesPerPackage, unsigned coresPerCache, bool smt, const std::vector<std::string>& cacheSizes = {}) {
     const auto root = std::filesystem::temp_directory_path() / ("anyps5_cpu_topology_sysfs-" + std::to_string(std::random_device{}()));
     const unsigned cores = packages * cachesPerPackage * coresPerCache;
     const unsigned logicals = smt ? cores * 2 : cores;
@@ -150,6 +157,7 @@ static std::filesystem::path FakeSysfs(unsigned packages, unsigned cachesPerPack
         WriteNumber(base / "cache" / "index2" / "id", core);
         WriteNumber(base / "cache" / "index3" / "level", 3);
         WriteNumber(base / "cache" / "index3" / "id", 100 + core / coresPerCache);
+        if (core / coresPerCache < cacheSizes.size()) WriteText(base / "cache" / "index3" / "size", cacheSizes[core / coresPerCache]);
     }
     return root;
 }
@@ -183,6 +191,27 @@ static void SysfsTests() {
     const auto workers = CpuTopology::PipelineCacheSet(dualSets, {first->chosen, second->chosen});
     Require(workers == std::vector<std::uint32_t>{0, 1, 2, 3, 4, 5, 16, 17, 18, 19, 20, 21}, "queue workers keep the other processors of the reserved cache");
     std::filesystem::remove_all(dual);
+
+    const auto stacked = FakeSysfs(1, 2, 8, true, {"98304K", "32768K"});
+    const auto stackedSets = CpuTopology::SysfsCpuSets(stacked.string(), 0xffffffffull, 0);
+    Require(stackedSets[0].lastLevelCacheKib == 98304 && stackedSets[24].lastLevelCacheKib == 32768, "the size of the last-level cache is read");
+    std::vector<CpuTopology::CpuSet> held;
+    for (const unsigned expected : {7u, 6u, 5u, 4u}) {
+        const auto next = CpuTopology::ChooseReservedCore(stackedSets, held, std::nullopt);
+        Require(next.has_value() && next->chosen.logical == expected && next->chosen.lastLevelCache == 0, "four reservations take four cores of the larger cache");
+        Require(next->others.size() == 30 - 2 * held.size(), "each reservation leaves both of its logical processors");
+        held.push_back(next->chosen);
+    }
+    Require(CpuTopology::PipelineCacheSet(stackedSets, held) == std::vector<std::uint32_t>{0, 1, 2, 3, 16, 17, 18, 19}, "queue workers keep the free cores of the larger cache");
+    std::filesystem::remove_all(stacked);
+
+    const auto stackedSecond = FakeSysfs(1, 2, 8, true, {"32M", "96M"});
+    const auto secondSets = CpuTopology::SysfsCpuSets(stackedSecond.string(), 0xffffffffull, 0);
+    Require(secondSets[8].lastLevelCacheKib == 98304 && secondSets[0].lastLevelCacheKib == 32768, "a size in mebibytes is read");
+    const auto larger = CpuTopology::ChooseReservedCore(secondSets, {}, std::nullopt);
+    Require(larger.has_value() && larger->chosen.logical == 15 && larger->chosen.lastLevelCache == 1, "the larger cache wins over the cache of processor 0");
+    Require(CpuTopology::PipelineCacheSet(secondSets, {larger->chosen}) == std::vector<std::uint32_t>{8, 9, 10, 11, 12, 13, 14, 24, 25, 26, 27, 28, 29, 30}, "queue workers follow the larger cache");
+    std::filesystem::remove_all(stackedSecond);
 
     const auto sockets = FakeSysfs(2, 1, 8, false);
     const auto socketSets = CpuTopology::SysfsCpuSets(sockets.string(), 0xffffull, 0);

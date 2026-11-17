@@ -86,6 +86,7 @@ namespace {
 struct CoreSwitches {
     bool committer = false;
     bool finisher = false;
+    bool walker = false;
     std::optional<unsigned> logical;
 };
 
@@ -98,9 +99,10 @@ constexpr std::size_t CommitterSlot = 0;
 constexpr std::size_t FinisherSlot = 1;
 constexpr std::size_t PoolSlots = 15;
 constexpr std::size_t DecodeSlot = 2 + PoolSlots;
+constexpr std::size_t WalkerSlot = 3 + PoolSlots;
 
 std::mutex reservationMutex;
-std::array<std::optional<Reservation>, 3 + PoolSlots> reservations;
+std::array<std::optional<Reservation>, 4 + PoolSlots> reservations;
 #ifdef __linux__
 std::vector<unsigned long> workerThreads;
 std::vector<std::uint32_t> pipelineCpus;
@@ -115,6 +117,9 @@ const CoreSwitches& Switches() {
         const bool workersPinned = WorkerAffinityMask() != 0;
         result.committer = result.logical.has_value() || !workersPinned;
         result.finisher = !workersPinned && std::getenv("APS5_NO_FINISHER_CORE") == nullptr;
+#ifdef __linux__
+        result.walker = !workersPinned && std::getenv("APS5_NO_WALKER_CORE") == nullptr;
+#endif
         return result;
     }();
     return switches;
@@ -259,7 +264,7 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
     if (!pipelineCpus.empty()) {
         std::size_t kept = 0;
         for (const auto worker : workerThreads) {
-            if (!OwnThread(worker)) continue;
+            if (!OwnThread(worker) || HoldsReservation(worker)) continue;
             kept += PinTo(static_cast<pid_t>(worker), pipelineCpus) ? 1u : 0u;
         }
         std::fprintf(stderr, "[affinity] %zu queue workers kept on the %zu other CPUs of the reserved cores' last-level cache\n", kept, pipelineCpus.size());
@@ -293,6 +298,17 @@ void ReserveCommitterCore() {
 void ReserveFinisherCore() {
 #if defined(_WIN32) || defined(__linux__)
     if (Switches().finisher) Reserve(FinisherSlot, "draw finisher", std::nullopt);
+#endif
+}
+
+void ReserveWalkerCore() {
+#ifdef __linux__
+    if (Switches().walker) Reserve(WalkerSlot, "collect walker", std::nullopt);
+    {
+        std::lock_guard lock(reservationMutex);
+        if (HoldsReservation(CurrentThread())) return;
+    }
+    if (const auto unreserved = CpuTopology::UnreservedMask().load(std::memory_order_acquire); unreserved != 0) CpuTopology::PinTraced("collect walker", nullptr, unreserved);
 #endif
 }
 
