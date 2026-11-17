@@ -1,4 +1,4 @@
-if(BUILD_TESTING)
+if(BUILD_TESTING AND NOT ANYPS5_GPU_BACKEND STREQUAL "kyty")
     add_test_executable(agc_preparation_inputs_tests
             tests/PreparationInputs.cpp
             Execution/src/Driver/Shaders/ShaderDiagnostics.cpp
@@ -51,6 +51,56 @@ function(ensure_agc_glslang)
 endfunction()
 
 ensure_agc_glslang()
+
+if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
+    find_package(Git QUIET)
+    set(agcTraceRevisionHeader ${CMAKE_CURRENT_BINARY_DIR}/generated/prx/libSceAgcDriver/TraceRevision.hpp)
+    add_custom_target(agc_trace_revision
+            COMMAND ${CMAKE_COMMAND} -DGIT=${GIT_EXECUTABLE} -DSOURCE=${CMAKE_SOURCE_DIR} -DOUTPUT=${agcTraceRevisionHeader} -P ${CMAKE_CURRENT_SOURCE_DIR}/trace_revision.cmake
+            BYPRODUCTS ${agcTraceRevisionHeader}
+            VERBATIM
+    )
+    file(GLOB kytyShimSources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/src/*.cpp)
+    list(FILTER kytyShimSources EXCLUDE REGEX "Tests\\.cpp$")
+    add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
+            ${CMAKE_CURRENT_SOURCE_DIR}/Export.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Event.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Eq/src/Query.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Lifecycle.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Resource/src/Registration.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/State/src/Configuration.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/State/src/Status.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Submit/src/Acb.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Submit/src/CommandBuffer.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Submit/src/Dcb.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AspectFit.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostHdr.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
+            ${kytyShimSources}
+    )
+    target_include_directories(libSceAgcDriver PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+    target_link_libraries(libSceAgcDriver PRIVATE $<IF:$<TARGET_EXISTS:Kyty::gpu>,Kyty::gpu,kyty_gpu> SDL2-static libc libkernel ${CMAKE_DL_LIBS})
+    target_link_options(libSceAgcDriver PRIVATE LINKER:--undefined=SDL_ShowMessageBox)
+    set_source_files_properties(${kytyShimSources} PROPERTIES COMPILE_OPTIONS "-march=x86-64-v3;-fno-strict-aliasing;-ffp-contract=off")
+    set_target_properties(libSceAgcDriver PROPERTIES CXX_EXTENSIONS OFF)
+    add_shader_recompiler(shader_recompiler_agc_driver libc)
+    if(BUILD_TESTING)
+        add_test_executable(kyty_shim_entry_tests
+                KytyShim/src/EntryTests.cpp
+                KytyShim/src/EntryPure.cpp
+                Execution/src/DisplayFormat.cpp)
+        target_include_directories(kyty_shim_entry_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+        set_target_properties(kyty_shim_entry_tests PROPERTIES CXX_EXTENSIONS OFF)
+        add_test(NAME kyty_shim_entry COMMAND kyty_shim_entry_tests)
+        set_tests_properties(kyty_shim_entry PROPERTIES TIMEOUT 20)
+        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/tests/CMakeLists.txt)
+            add_subdirectory(KytyShim/tests)
+        endif()
+    endif()
+    return()
+endif()
 
 if(BUILD_TESTING AND WIN32)
     add_test_executable(agc_process_sampler_stack_tests tests/ProcessSamplerStack.cpp Execution/src/WorkerSampler.cpp)
@@ -580,7 +630,7 @@ file(GLOB_RECURSE agcShaderCacheGuardSources CONFIGURE_DEPENDS RELATIVE "${CMAKE
         "${CMAKE_CURRENT_SOURCE_DIR}/*.hpp"
         "${CMAKE_CURRENT_SOURCE_DIR}/*.h"
 )
-list(FILTER agcShaderCacheGuardSources EXCLUDE REGEX "^(tests|tools)/")
+list(FILTER agcShaderCacheGuardSources EXCLUDE REGEX "^(tests|tools|KytyShim)/")
 add_shader_recompiler(shader_recompiler_agc_driver libc
         GUARD_SOURCES
         ${agcShaderCacheGuardSources}
