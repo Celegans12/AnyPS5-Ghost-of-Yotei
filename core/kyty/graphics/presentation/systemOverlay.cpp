@@ -1,3 +1,4 @@
+#if !defined(ANYPS5_KYTY)
 #include "graphics/presentation/systemOverlay.h"
 
 #include "common/assert.h"
@@ -1942,3 +1943,4 @@ void SystemOverlay::ReleaseVulkan() {
 }
 
 }
+#endif

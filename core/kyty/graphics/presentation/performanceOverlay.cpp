@@ -1,3 +1,4 @@
+#if !defined(ANYPS5_KYTY)
 #include "graphics/presentation/performanceOverlay.h"
 
 #include "common/debugCounters.h"
@@ -887,3 +888,4 @@ float DrawPerformanceOverlay(const GraphicContext& graphics, vk::Extent2D extent
 }
 
 }
+#endif
