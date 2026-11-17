@@ -107,6 +107,9 @@ uint64_t DrawStateKey(uint64_t resource_key, uint64_t context_key, uint64_t user
 static int DrawTemplatesMode() {
 	static const int mode = [] {
 		const char* value = std::getenv("KYTY_DRAW_TEMPLATES");
+#if defined(ANYPS5_KYTY)
+		if (value == nullptr || value[0] == 0) return 2;
+#endif
 		return value == nullptr || value[0] == 0 || value[0] == '0' ? 0 : value[0] == '2' ? 2 : 1;
 	}();
 	return mode;
@@ -123,6 +126,9 @@ bool DrawStateTemplatesEnabled() {
 bool DrawBuffersEnabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_DRAW_BUFFERS");
+#if defined(ANYPS5_KYTY)
+		if (value == nullptr || value[0] == 0) return true;
+#endif
 		return value != nullptr && value[0] == '1';
 	}();
 	return enabled;
