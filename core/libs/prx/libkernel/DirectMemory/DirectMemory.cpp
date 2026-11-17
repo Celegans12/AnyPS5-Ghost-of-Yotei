@@ -258,6 +258,7 @@ static void MapDirectView(HANDLE section, std::uint64_t physical, std::size_t by
     std::vector<Kept> kept;
     auto spanStart = start;
     auto spanEnd = end;
+    bool replaced = false;
     for (auto older = view.directViews.begin(); older != view.directViews.end();) {
         if (older->second.end <= start || older->first >= end) {
             ++older;
@@ -270,8 +271,9 @@ static void MapDirectView(HANDLE section, std::uint64_t physical, std::size_t by
         spanStart = std::min(spanStart, older->first);
         spanEnd = std::max(spanEnd, older->second.end);
         older = view.directViews.erase(older);
+        replaced = true;
     }
-    if (!kept.empty() || spanStart != start || spanEnd != end) CoalesceDirectView(view, spanStart, spanEnd);
+    if (replaced) CoalesceDirectView(view, spanStart, spanEnd);
     for (const auto& piece : kept) PlaceDirectView(view, piece.start, piece.end, piece.section, piece.offset);
     PlaceDirectView(view, start, end, section, 0);
 }
