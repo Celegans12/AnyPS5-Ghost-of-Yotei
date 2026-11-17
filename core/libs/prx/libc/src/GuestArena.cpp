@@ -32,6 +32,9 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
+#if defined(ANYPS5_KYTY) && !defined(_WIN32)
+#include <array>
+#endif
 
 namespace GuestArena {
 namespace {
@@ -43,10 +46,88 @@ std::atomic<void (*)(std::uintptr_t, std::size_t)> hostReadHook{nullptr};
 #if defined(ANYPS5_KYTY)
 std::atomic<bool (*)(std::uintptr_t, std::size_t)> hostWritePreparer{nullptr};
 
+#ifndef _WIN32
+std::atomic<bool (*)(std::uintptr_t, std::size_t)> hostWriteFilter{nullptr};
+
+constexpr unsigned ProtectedPageShift = 12;
+constexpr unsigned ProtectedBucketShift = 30;
+constexpr std::size_t ProtectedBucketWords = (std::size_t{1} << (ProtectedBucketShift - ProtectedPageShift)) / 64;
+constexpr std::uintptr_t ProtectedSpaceEnd = (std::uintptr_t{1} << 44) + GuestAddressOffset;
+constexpr std::size_t ProtectedBuckets = ProtectedSpaceEnd >> ProtectedBucketShift;
+
+std::array<std::atomic<std::atomic<std::uint64_t>*>, ProtectedBuckets> protectedPages{};
+std::atomic<bool> protectionsNoted{false};
+std::atomic<bool> protectedBeyondTable{false};
+
+template <class TVisit>
+void forEachProtectedWord(std::uintptr_t first, std::uintptr_t last, TVisit visit) {
+    for (auto page = first >> ProtectedPageShift; page <= (last >> ProtectedPageShift);) {
+        const auto bucket = page >> (ProtectedBucketShift - ProtectedPageShift);
+        const auto indexInBucket = page & ((std::uintptr_t{1} << (ProtectedBucketShift - ProtectedPageShift)) - 1);
+        const auto word = indexInBucket / 64;
+        const auto bit = indexInBucket % 64;
+        const auto lastPage = last >> ProtectedPageShift;
+        const auto pagesInWord = std::min<std::uintptr_t>(64 - bit, lastPage - page + 1);
+        const auto mask = (pagesInWord == 64 ? ~std::uint64_t{0} : ((std::uint64_t{1} << pagesInWord) - 1)) << bit;
+        if (!visit(static_cast<std::size_t>(bucket), static_cast<std::size_t>(word), mask)) return;
+        page += pagesInWord;
+    }
+}
+
+std::atomic<std::uint64_t>* protectedBucket(std::size_t bucket, bool create) {
+    auto* words = protectedPages[bucket].load(std::memory_order_acquire);
+    if (words != nullptr || !create) return words;
+    auto* created = new std::atomic<std::uint64_t>[ProtectedBucketWords]{};
+    if (protectedPages[bucket].compare_exchange_strong(words, created, std::memory_order_acq_rel)) return created;
+    delete[] created;
+    return words;
+}
+
+void noteHostProtection(std::uintptr_t address, std::size_t bytes, bool writable) {
+    if (bytes == 0) return;
+    const auto end = bytes - 1 > std::numeric_limits<std::uintptr_t>::max() - address ? std::numeric_limits<std::uintptr_t>::max() : address + (bytes - 1);
+    if (!writable) {
+        if (end >= ProtectedSpaceEnd) protectedBeyondTable.store(true, std::memory_order_seq_cst);
+        protectionsNoted.store(true, std::memory_order_seq_cst);
+    }
+    if (address >= ProtectedSpaceEnd) return;
+    const auto last = std::min<std::uintptr_t>(ProtectedSpaceEnd - 1, end);
+    forEachProtectedWord(address, last, [writable](std::size_t bucket, std::size_t word, std::uint64_t mask) {
+        auto* words = protectedBucket(bucket, !writable);
+        if (words == nullptr) return true;
+        if (writable) words[word].fetch_and(~mask, std::memory_order_release);
+        else words[word].fetch_or(mask, std::memory_order_release);
+        return true;
+    });
+}
+
+bool mayBeHostProtected(std::uintptr_t address, std::size_t bytes) {
+    if (!protectionsNoted.load(std::memory_order_acquire)) {
+        const auto filter = hostWriteFilter.load(std::memory_order_acquire);
+        return filter == nullptr || filter(address, bytes);
+    }
+    const auto last = address + (bytes - 1);
+    if (last >= ProtectedSpaceEnd && protectedBeyondTable.load(std::memory_order_acquire)) return true;
+    if (address >= ProtectedSpaceEnd) return false;
+    bool found = false;
+    forEachProtectedWord(address, std::min<std::uintptr_t>(last, ProtectedSpaceEnd - 1), [&found](std::size_t bucket, std::size_t word, std::uint64_t mask) {
+        const auto* words = protectedPages[bucket].load(std::memory_order_acquire);
+        if (words != nullptr && (words[word].load(std::memory_order_acquire) & mask) != 0) found = true;
+        return !found;
+    });
+    return found;
+}
+#endif
+
 void prepareHostWrite(const void* pointer, std::size_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return;
-    if (const auto prepare = hostWritePreparer.load(std::memory_order_acquire)) static_cast<void>(prepare(address, bytes));
+    const auto prepare = hostWritePreparer.load(std::memory_order_acquire);
+    if (prepare == nullptr) return;
+#ifndef _WIN32
+    if (!mayBeHostProtected(address, bytes)) return;
+#endif
+    static_cast<void>(prepare(address, bytes));
 }
 #endif
 
@@ -1089,6 +1170,21 @@ void GuestArenaSetHostReadHook_nid_no_patch(void (*hook)(std::uintptr_t, std::si
 void GuestArenaSetHostWritePreparer_nid_no_patch(bool (*prepare)(std::uintptr_t, std::size_t)) {
     hostWritePreparer.store(prepare, std::memory_order_release);
 }
+
+#ifndef _WIN32
+void GuestArenaNoteHostProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool writable) {
+    noteHostProtection(address, bytes, writable);
+}
+
+bool GuestArenaMayBeHostProtected_nid_no_patch(std::uintptr_t address, std::size_t bytes) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return bytes != 0;
+    return mayBeHostProtected(address, bytes);
+}
+
+void GuestArenaSetHostWriteFilter_nid_no_patch(bool (*filter)(std::uintptr_t, std::size_t)) {
+    hostWriteFilter.store(filter, std::memory_order_release);
+}
+#endif
 #endif
 
 void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t bytes) {
