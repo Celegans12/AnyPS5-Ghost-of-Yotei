@@ -571,6 +571,18 @@ constexpr std::size_t EopGuardWindows = 14;
 constexpr std::uint64_t EopGuardQuietLimit = 256;
 constexpr std::uint64_t EopGuardKept = 64;
 
+constexpr std::uint32_t EopHeldLinear = 1u << 0u;
+constexpr std::uint32_t EopHeldCopyBack = 1u << 1u;
+constexpr std::uint32_t EopHeldQueuedStore = 1u << 2u;
+constexpr std::uint32_t EopHeldWriteBack = 1u << 3u;
+constexpr std::uint32_t EopHeldCompletionStore = 1u << 4u;
+constexpr std::uint32_t EopHeldCopiedWriter = 1u << 5u;
+constexpr std::uint32_t EopHeldStore = 1u << 6u;
+constexpr std::uint32_t EopHeldOpenWriter = 1u << 7u;
+constexpr std::uint32_t EopHeldRead = 1u << 8u;
+constexpr std::uint32_t EopHeldAddress = 1u << 9u;
+constexpr std::array<const char*, 10> EopHeldNames{"linear-target", "copy-back", "queued-store", "write-back", "completion-store", "copied-writer", "recorded-store", "store-in-open-batch", "changed-read", "address-read"};
+
 struct EopGuardKey {
     std::uint64_t begin = 0;
     std::uint64_t end = 0;
@@ -600,12 +612,15 @@ struct EopGuardCounts {
     std::uint64_t heldUnknown = 0;
     std::uint64_t heldLinear = 0;
     std::uint64_t heldCopyBack = 0;
+    std::uint64_t heldWriteBack = 0;
+    std::map<std::uint32_t, std::uint64_t> reasons;
     std::uint64_t heldStore = 0;
     std::uint64_t storeBegin = 0;
     std::uint64_t storeEnd = 0;
     std::uint64_t storeRanges = 0;
     std::uint64_t storeBytes = 0;
     std::uint64_t storeFills = 0;
+    std::uint64_t storeLabels = 0;
     std::uint64_t judged = 0;
     std::uint64_t risky = 0;
     std::uint64_t gpuWritten = 0;
@@ -636,13 +651,25 @@ void reportEopGuard() {
     auto& guard = eopGuard().counts;
     const auto value = [](std::uint64_t count) { return static_cast<unsigned long long>(count); };
     const double perGuard = guard.labels != 0 ? 1.0 / static_cast<double>(guard.labels) : 0.0;
-    const double perStore = guard.heldStore != 0 ? 1.0 / static_cast<double>(guard.heldStore) : 0.0;
+    const double perStore = guard.storeLabels != 0 ? 1.0 / static_cast<double>(guard.storeLabels) : 0.0;
     std::string changed;
     for (std::size_t kind = 0; kind < EopProbeKinds; ++kind) {
         if (guard.riskyKinds[kind] != 0) changed += (changed.empty() ? "" : ", ") + std::string(EopProbeKindNames[kind]) + " " + std::to_string(guard.riskyKinds[kind]);
     }
     if (changed.empty()) changed = "none";
-    AgcDriver::ProfilePrint_nid_no_patch("[eop-guard] %llu end-of-pipe interrupt labels: %llu delivered at the label, held behind the recorded work: %llu for a changed or new range read by the open batch, %llu for one read by a batch in flight, %llu for an address-based read, %llu without the reads of the frame; per label %.1f in-place reads judged, %.1f of them under a GPU write of the frame, %.2f unexecuted on a changed or new range (%s; last %llx+%llu), %llu changes published to the draw path, %.3f ms; held for a GPU write to guest memory that had not run: %llu for a drawn linear target stored at the label, %llu for a pending copy-back or queued store, %llu for a recorded store (last %llx+%llu; %.1f unexecuted write ranges per such label, %.0f KiB, %.1f of them fills)\n", value(guard.labels), value(guard.early), value(guard.heldOpen), value(guard.heldBehind), value(guard.heldAddress), value(guard.heldUnknown), static_cast<double>(guard.judged) * perGuard, static_cast<double>(guard.gpuWritten) * perGuard, static_cast<double>(guard.risky) * perGuard, changed.c_str(), value(guard.lastBegin), value(guard.lastEnd - guard.lastBegin), value(guard.published), guard.guardMs * perGuard, value(guard.heldLinear), value(guard.heldCopyBack), value(guard.heldStore), value(guard.storeBegin), value(guard.storeEnd - guard.storeBegin), perStore * static_cast<double>(guard.storeRanges), perStore * static_cast<double>(guard.storeBytes) / 1024.0, perStore * static_cast<double>(guard.storeFills));
+    std::vector<std::pair<std::uint64_t, std::uint32_t>> ranked;
+    for (const auto& [set, count] : guard.reasons) ranked.emplace_back(count, set);
+    std::sort(ranked.rbegin(), ranked.rend());
+    std::string sets;
+    for (std::size_t index = 0; index < ranked.size() && index < 6; ++index) {
+        std::string names;
+        for (std::size_t bit = 0; bit < EopHeldNames.size(); ++bit) {
+            if ((ranked[index].second & (1u << bit)) != 0) names += (names.empty() ? "" : "+") + std::string(EopHeldNames[bit]);
+        }
+        sets += " " + (names.empty() ? std::string("none") : names) + " " + std::to_string(ranked[index].first);
+    }
+    if (sets.empty()) sets = " none";
+    AgcDriver::ProfilePrint_nid_no_patch("[eop-guard] %llu end-of-pipe interrupt labels: %llu delivered at the label, held behind the recorded work: %llu for a changed or new range read by the open batch, %llu for one read by a batch in flight, %llu for an address-based read, %llu without the reads of the frame; per label %.1f in-place reads judged, %.1f of them under a GPU write of the frame, %.2f unexecuted on a changed or new range (%s; last %llx+%llu), %llu changes published to the draw path, %.3f ms; held for a GPU write to guest memory that had not run: %llu for a drawn linear target stored at the label, %llu for a pending copy-back or queued store, %llu for a CPU write-back or completion store, %llu for a recorded store (last %llx+%llu; %.1f unexecuted write ranges per label that has any, %.0f KiB, %.1f of them fills); labels by the set of reasons that would hold them:%s\n", value(guard.labels), value(guard.early), value(guard.heldOpen), value(guard.heldBehind), value(guard.heldAddress), value(guard.heldUnknown), static_cast<double>(guard.judged) * perGuard, static_cast<double>(guard.gpuWritten) * perGuard, static_cast<double>(guard.risky) * perGuard, changed.c_str(), value(guard.lastBegin), value(guard.lastEnd - guard.lastBegin), value(guard.published), guard.guardMs * perGuard, value(guard.heldLinear), value(guard.heldCopyBack), value(guard.heldWriteBack), value(guard.heldStore), value(guard.storeBegin), value(guard.storeEnd - guard.storeBegin), perStore * static_cast<double>(guard.storeRanges), perStore * static_cast<double>(guard.storeBytes) / 1024.0, perStore * static_cast<double>(guard.storeFills), sets.c_str());
     guard = {};
 }
 
@@ -741,19 +768,25 @@ bool eopGuardSettled(bool linearStored) {
         (index < opened ? open : flight) = true;
     }
     if (guard.label % EopGuardKept == 0) std::erase_if(guard.notes, [&](const auto& note) { return note.second.seen + EopGuardKept < guard.label; });
-    const bool copyBack = recorder->HasPendingCopyBacks() || recorder->HasQueuedStores() || Graphics::Recorder::PendingWriteBackCompletions() != 0 || Graphics::Recorder::PendingCompletionStores() != 0 || !Graphics::DrawCopiedWriters()->empty();
+    const bool copyBack = recorder->HasPendingCopyBacks() || recorder->HasQueuedStores();
+    const bool writeBack = Graphics::Recorder::PendingWriteBackCompletions() != 0 || Graphics::Recorder::PendingCompletionStores() != 0 || !Graphics::DrawCopiedWriters()->empty();
     bool store = false;
-    if (!linearStored && !copyBack) {
-        for (const auto& write : recorder->PendingWritesOver(0, std::numeric_limits<std::size_t>::max())) {
-            if (write.value == Graphics::Recorder::ReachValue || recorder->PendingWriteSettled(write.begin, static_cast<std::size_t>(write.end - write.begin))) continue;
-            store = true;
-            counts.storeBegin = write.begin;
-            counts.storeEnd = write.end;
-            ++counts.storeRanges;
-            counts.storeBytes += write.end - write.begin;
-            if (write.value >= 0) ++counts.storeFills;
-        }
+    for (const auto& write : recorder->PendingWritesOver(0, std::numeric_limits<std::size_t>::max())) {
+        if (write.value == Graphics::Recorder::ReachValue || recorder->PendingWriteSettled(write.begin, static_cast<std::size_t>(write.end - write.begin))) continue;
+        store = true;
+        counts.storeBegin = write.begin;
+        counts.storeEnd = write.end;
+        ++counts.storeRanges;
+        counts.storeBytes += write.end - write.begin;
+        if (write.value >= 0) ++counts.storeFills;
     }
+    if (store) ++counts.storeLabels;
+    const auto writer = recorder->NewestGuestWriter();
+    const std::uint32_t reasons = (linearStored ? EopHeldLinear : 0u) | (recorder->HasPendingCopyBacks() ? EopHeldCopyBack : 0u) | (recorder->HasQueuedStores() ? EopHeldQueuedStore : 0u) |
+        (Graphics::Recorder::PendingWriteBackCompletions() != 0 ? EopHeldWriteBack : 0u) | (Graphics::Recorder::PendingCompletionStores() != 0 ? EopHeldCompletionStore : 0u) |
+        (!Graphics::DrawCopiedWriters()->empty() ? EopHeldCopiedWriter : 0u) | (store ? EopHeldStore : 0u) | (writer != 0 && writer == recorder->OpenSerial() ? EopHeldOpenWriter : 0u) |
+        (open || flight ? EopHeldRead : 0u) | (address ? EopHeldAddress : 0u);
+    ++counts.reasons[reasons];
     const auto judged = std::chrono::steady_clock::now();
     counts.guardMs += std::chrono::duration<double, std::milli>(judged - start).count();
     if (!Graphics::Recorder::FlipReadCheck() && judged - guard.lastReport > std::chrono::seconds(10)) {
@@ -774,6 +807,10 @@ bool eopGuardSettled(bool linearStored) {
     }
     if (copyBack) {
         ++counts.heldCopyBack;
+        return false;
+    }
+    if (writeBack) {
+        ++counts.heldWriteBack;
         return false;
     }
     if (store) {
