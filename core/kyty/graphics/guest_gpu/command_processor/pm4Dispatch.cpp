@@ -93,6 +93,10 @@ constexpr auto MakeCustomOpcodeDispatchTable() {
 	table[Pm4::R_POP_MARKER]     = CpOpPopMarker;
 	table[Pm4::R_CONTEXT_STATE]  = CpOpContextState;
 	table[Pm4::R_PSSR]           = CpOpPssr;
+#if defined(ANYPS5_KYTY)
+	table[0x17] = CpOpAnyPs5Flip;
+	table[0x06] = CpOpAnyPs5RenderingWait;
+#endif
 
 	return table;
 }
