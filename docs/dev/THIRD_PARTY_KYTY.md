@@ -152,3 +152,12 @@ resolve helper) keeps to the logical CPUs that share the largest last-level cach
 threads it creates afterwards inherit that set. Measured on Subnautica: +7 % to +22 % frames per second, 25-35 % less CPU
 time per draw on each stage (`notes/au-dela-p4-placement.md`). `KYTY_GPU_THREAD_CPUS=off` turns it off. An explicit list
 pins each stage to that Linux logical CPU, without core reservation; threads a stage creates afterwards inherit its CPU.
+
+Images the game reads after the GPU writes them: KytyPS5 copies a GPU-written linear image back to guest memory at the
+next suspend point, unless `KYTY_READBACK_STORAGE_IMAGES=1`. A game that waits for the label of a `RELEASE_MEM` with GL2
+write-back and then reads the image reads stale memory: in TCG Card Shop Simulator (PPSA36301) a 64×64 RGBA32F image is
+read that way and the street stays almost black. Under `ANYPS5_KYTY`, the write-back half of that setting is on by
+default: at each `ACQUIRE_MEM` or `RELEASE_MEM` with GL2 write-back and at each flip, the images already queued for
+readback are copied back, and their pages stay read-protected until the copy lands. No other image is copied: the copy
+of every storage image on its first write still needs `KYTY_READBACK_STORAGE_IMAGES=1`. `KYTY_WRITE_BACK_IMAGES=0`
+restores KytyPS5's behaviour.
