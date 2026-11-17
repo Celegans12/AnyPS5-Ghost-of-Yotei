@@ -2,6 +2,7 @@
 
 #include "MemoryShim.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/include/Api.hpp"
@@ -311,6 +312,21 @@ void TestHeapCommitSecondView() {
     std::printf("libc arena commit 0x%llx: second view from the guest memory file, dropped on reset, zeroed on recommit, never probed\n", static_cast<unsigned long long>(address));
 }
 
+void TestHeapBlockEvicted() {
+    constexpr std::size_t bytes = Page * 16;
+    void* block = GuestHeap::GuestHeapAllocate_nid_postfix(bytes);
+    Require(block != nullptr);
+    const auto address = Address(block);
+    Require(Memory::IsBackingReadable(address, bytes) && Memory::FindBackingPointer(address, bytes) != nullptr);
+    g_hooks = HookLog{};
+    Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(&OnMap, &OnUnmap);
+    GuestHeap::GuestHeapFree_nid_postfix(block);
+    Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(nullptr, nullptr);
+    Require(Covers(g_hooks.unmapped, address, bytes) && g_hooks.backedWhenUnmapped);
+    Require(!Memory::IsBackingReadable(address, bytes));
+    std::printf("guest heap block 0x%llx: second view while allocated; evicted from the heap cache, GPU unmap seen first with the backing, then no second view\n", static_cast<unsigned long long>(address));
+}
+
 void TestHostView() {
     constexpr std::uint64_t fixed = 0xfe0000000ull + GuestArena::GuestAddressOffset;
     constexpr std::size_t bytes = Page * 8;
@@ -519,6 +535,7 @@ void TestNoCrossWaitWithGpuThread() {
 }
 
 int main() {
+    setenv("APS5_HEAP_CACHE_MIB", "0", 1);
     Require(Libs::LibKernel::Memory::Shim::ViewEnabled());
     TestFlexible();
     TestDirect();
@@ -527,6 +544,7 @@ int main() {
     TestHostProtectionTable();
     TestRuntimeMemory();
     TestHeapCommitSecondView();
+    TestHeapBlockEvicted();
     TestHostView();
     TestUnreportedPrivateMemory();
     TestNoCrossWaitWithGpuThread();

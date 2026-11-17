@@ -201,6 +201,10 @@ private:
         }
 
         void Put(void* raw, std::size_t bytes) {
+#if defined(ANYPS5_KYTY)
+            std::vector<Entry> evicted;
+            {
+#endif
             std::lock_guard lock(_lock);
             _order.push_back({raw, bytes});
             _bySize[bytes].push_back(std::prev(_order.end()));
@@ -211,8 +215,16 @@ private:
                 same.erase(std::find(same.begin(), same.end(), _order.begin()));
                 _order.pop_front();
                 _cachedBytes -= oldest.bytes;
+#if defined(ANYPS5_KYTY)
+                evicted.push_back(oldest);
+#else
                 release(oldest.raw, oldest.bytes);
+#endif
             }
+#if defined(ANYPS5_KYTY)
+            }
+            for (const auto& entry : evicted) release(entry.raw, entry.bytes);
+#endif
         }
 
     private:
