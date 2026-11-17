@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MapImportGate.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PendingPages.hpp"
 // For the declaration of PendingStorageOverlaps, defined below.
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "ShaderCacheDirectory.hpp"
@@ -1876,6 +1877,10 @@ public:
     iterator end() { return textures.end(); }
     void push_back(StorageTexture* texture) {
         textures.push_back(texture);
+        if (PendingPages::Armed()) {
+            const std::array range{PendingPages::Range{texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes()}};
+            PendingPages::Track(PendingPages::Layer::Storage, range);
+        }
         changed();
     }
     iterator erase(iterator it) {
@@ -1890,6 +1895,7 @@ public:
         if (indexed != version) rebuild();
         return !textures.empty() && Overlaps(ranges, address, bytes);
     }
+    std::uint64_t Version() const { return version; }
     bool SurelyClear(std::uint64_t address, std::size_t bytes) const {
         const auto current = published.load(std::memory_order_acquire);
         return current != nullptr && current->version == changes.load(std::memory_order_acquire) && !Overlaps(current->ranges, address, bytes);
@@ -1953,6 +1959,29 @@ struct PendingWrites {
 PendingWrites& Pending() {
     static PendingWrites pending;
     return pending;
+}
+
+void syncStoragePages(PendingWrites& pending) {
+    if (!PendingPages::Armed()) return;
+    std::vector<PendingPages::Range> ranges;
+    ranges.reserve(pending.flushing.size() + 16);
+    for (const auto* texture : pending.textures) ranges.emplace_back(texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes());
+    for (const auto* texture : pending.flushing) ranges.emplace_back(texture->Descriptor().baseAddress, texture->Descriptor().baseAddress + texture->GuestBytes());
+    PendingPages::Replace(PendingPages::Layer::Storage, ranges);
+}
+
+bool pendingOverlapsLocked(PendingWrites& pending, std::uint64_t address, std::size_t bytes) {
+    const auto overlaps = [&](const StorageTexture* texture) { return address < texture->Descriptor().baseAddress + texture->GuestBytes() && texture->Descriptor().baseAddress < address + bytes; };
+    return std::any_of(pending.textures.begin(), pending.textures.end(), overlaps) || std::any_of(pending.flushing.begin(), pending.flushing.end(), overlaps);
+}
+
+void verifyStoragePages(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    const auto sequence = PendingPages::Sequence(PendingPages::Layer::Storage);
+    const bool clear = PendingPages::Clear(PendingPages::Layer::Storage, address, bytes);
+    PendingPages::Compare(PendingPages::Layer::Storage, sequence, clear, pendingOverlapsLocked(pending, address, bytes), address, bytes);
 }
 
 DrawnPending drawnPending() {
@@ -4808,6 +4837,7 @@ void StorageTexture::reconcilePending() {
     if (any) pending.textures.push_back(this);
     else pending.textures.remove(this);
     BumpPendingSerial(descriptor.baseAddress, guestBytes);
+    if (!any) syncStoragePages(pending);
 }
 
 bool StorageTexture::Dirty() const {
@@ -5042,6 +5072,7 @@ void StorageTexture::Flush(const char* reason) {
         dirty = false;
         pending.textures.remove(this);
         BumpPendingSerial(descriptor.baseAddress, guestBytes);
+        syncStoragePages(pending);
     }
     std::lock_guard gpu(GuestMemory::GpuMutex());
     const auto previous = std::exchange(flushReason, reason);
@@ -5157,7 +5188,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     const auto nothingToStore = [&] {
         auto& pending = Pending();
         if (pending.flushingCount.load(std::memory_order_acquire) != 0) return false;
-        if (!pending.textures.SurelyClear(address, bytes)) {
+        if (!PendingPages::Rejects(PendingPages::Layer::Storage, address, bytes) && !pending.textures.SurelyClear(address, bytes)) {
             std::lock_guard lock(pending.mutex);
             const auto* exempt = Refreshing::Get();
             if (pending.textures.MayOverlap(address, bytes) && std::any_of(pending.textures.begin(), pending.textures.end(), [&](const StorageTexture* texture) { return texture != except && texture != exempt && texture->overlaps(address, bytes) && texture->pendingUnitInside(address, bytes); })) return false;
@@ -5189,6 +5220,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
+        const auto listed = pending.textures.Version();
         const auto* exempt = Refreshing::Get();
         for (auto it = pending.textures.MayOverlap(address, bytes) ? pending.textures.begin() : pending.textures.end(); it != pending.textures.end();) {
             auto* texture = *it;
@@ -5232,6 +5264,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
         for (const auto& texture : flush) {
             if (texture->drawnListed) ownNotes.insert(ownNotes.end(), texture->storeNotes.begin(), texture->storeNotes.end());
         }
+        if (pending.textures.Version() != listed) syncStoragePages(pending);
     }
     if (flush.empty()) {
         if (drawnHold.owns_lock()) drawnHold.unlock();
@@ -5250,6 +5283,7 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
             for (const auto& texture : flush) std::erase(pending.flushing, texture.get());
             pending.flushingCount.store(pending.flushing.size(), std::memory_order_release);
             for (const auto& texture : flush) BumpPendingSerial(texture->descriptor.baseAddress, texture->guestBytes);
+            syncStoragePages(pending);
         }
     } unregister{flush};
     // Debug aid: APS5_TRACE_FLUSH names what forces pending results to guest memory.
@@ -5977,7 +6011,7 @@ std::uint64_t StorageTexture::StampKeepingNewerResults(std::uint64_t address, st
 }
 
 bool StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
-    if (ranges.empty()) return false;
+    if (ranges.empty() || PendingPages::Rejects(PendingPages::Layer::Storage, ranges)) return false;
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     const auto overlapsAny = [&](const StorageTexture* texture) {
@@ -5986,15 +6020,22 @@ bool StorageTexture::AnyPendingOverlaps(std::span<const std::pair<std::uint64_t,
         }
         return false;
     };
-    if (std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.second > range.first && pending.textures.MayOverlap(range.first, static_cast<std::size_t>(range.second - range.first)); })) {
-        for (const auto* texture : pending.textures) {
+    const bool answer = [&] {
+        if (std::any_of(ranges.begin(), ranges.end(), [&](const auto& range) { return range.second > range.first && pending.textures.MayOverlap(range.first, static_cast<std::size_t>(range.second - range.first)); })) {
+            for (const auto* texture : pending.textures) {
+                if (overlapsAny(texture)) return true;
+            }
+        }
+        for (const auto* texture : pending.flushing) {
             if (overlapsAny(texture)) return true;
         }
+        return false;
+    }();
+    if (PendingPages::Verifying()) {
+        const auto sequence = PendingPages::Sequence(PendingPages::Layer::Storage);
+        PendingPages::Compare(PendingPages::Layer::Storage, sequence, PendingPages::Clear(PendingPages::Layer::Storage, ranges), answer, ranges.front().first, static_cast<std::size_t>(ranges.front().second - ranges.front().first));
     }
-    for (const auto* texture : pending.flushing) {
-        if (overlapsAny(texture)) return true;
-    }
-    return false;
+    return answer;
 }
 
 bool StorageTexture::AnyPendingUnitsOverlap(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
@@ -6042,6 +6083,8 @@ void StorageTexture::NoteProved() const {
 std::vector<std::shared_ptr<StorageTexture>> StorageTexture::overlappingPending(std::uint64_t address, std::size_t bytes) {
     // FlushPending's listing; the images stay alive across the caller's scan as there.
     std::vector<std::shared_ptr<StorageTexture>> overlapping;
+    if (PendingPages::Verifying()) verifyStoragePages(address, bytes);
+    if (PendingPages::Rejects(PendingPages::Layer::Storage, address, bytes)) return overlapping;
     auto& pending = Pending();
     if (pending.textures.SurelyClear(address, bytes)) return overlapping;
     std::lock_guard lock(pending.mutex);
@@ -6286,7 +6329,10 @@ std::size_t StorageTexture::DiscardPendingInside(std::uint64_t address, std::siz
             ++it;
         }
     }
-    if (discarded != 0) BumpPendingSerial(address, bytes);
+    if (discarded != 0) {
+        BumpPendingSerial(address, bytes);
+        syncStoragePages(pending);
+    }
     return discarded;
 }
 
@@ -6445,6 +6491,7 @@ bool StorageTexture::clearByKeysFill(DccKeys keys, std::uint8_t key) {
             dirty = false;
             pending.textures.remove(this);
             BumpPendingSerial(descriptor.baseAddress, guestBytes);
+            syncStoragePages(pending);
         }
     }
     const auto commands = recorder->Commands();
@@ -7833,6 +7880,7 @@ StorageTexture::~StorageTexture() {
             dirty = false;
             pending.textures.remove(this);
             BumpPendingSerial(descriptor.baseAddress, guestBytes);
+            syncStoragePages(pending);
             static std::atomic<int> reports{0};
             if (reports.fetch_add(1) < 4) std::fprintf(stderr, "[gpu] storage image 0x%llx destroyed with GPU results pending\n", static_cast<unsigned long long>(descriptor.baseAddress));
         }

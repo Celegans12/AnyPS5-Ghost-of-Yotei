@@ -853,6 +853,7 @@ void Driver::execute(Submission& submission) {
                     abLines = Graphics::AbAtPresent(flipsCounted.load(), std::chrono::duration<double>(std::chrono::steady_clock::now() - abClock).count());
                 }
                 for (const auto& line : abLines) AgcDriver::ProfilePrint_nid_no_patch("%s", line.c_str());
+                if (!abLines.empty()) AgcDriver::ProfilePrint_nid_no_patch("[ab-cpu] present %llu: the queue worker that ran the flip has used %.6f s of CPU\n", static_cast<unsigned long long>(flipsCounted.load()), Graphics::RuntimeSwitches::CallingThreadCpuSeconds());
             }
 
             timing.Mark("flip_flush");

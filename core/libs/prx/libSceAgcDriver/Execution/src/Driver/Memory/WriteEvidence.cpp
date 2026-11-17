@@ -3,7 +3,9 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PendingPages.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -259,6 +261,19 @@ bool PendingView::Overlaps(std::uint64_t address, std::size_t bytes) const {
     const bool legacy = Driver::validateLegacy();
     const bool overlaps = viewOverlaps(*this, legacy, address, bytes);
     if (writeBlocksStats() && bytes != 0) noteViewRead(reinterpret_cast<std::uintptr_t>(__builtin_return_address(0)), *this, legacy, address, bytes, overlaps);
+    return overlaps;
+}
+
+bool PendingView::AnyOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    using Graphics::PendingPages::Layer;
+    if (!writeBlocksStats() && Graphics::PendingPages::Rejects(Layer::Recorder, ranges)) return false;
+    const bool verify = Graphics::PendingPages::Verifying();
+    const auto sequence = verify ? Graphics::PendingPages::Sequence(Layer::Recorder) : 0;
+    const bool clear = verify && Graphics::PendingPages::Clear(Layer::Recorder, ranges);
+    Load();
+    const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return Overlaps(range.first, static_cast<std::size_t>(range.second - range.first)); });
+    const bool overlaps = found != ranges.end();
+    if (verify) Graphics::PendingPages::Compare(Layer::Recorder, sequence, clear, overlaps, overlaps ? found->first : 0, overlaps ? static_cast<std::size_t>(found->second - found->first) : 0);
     return overlaps;
 }
 

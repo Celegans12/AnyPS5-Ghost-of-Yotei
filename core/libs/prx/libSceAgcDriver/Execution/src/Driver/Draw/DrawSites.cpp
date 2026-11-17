@@ -429,11 +429,7 @@ void DrawSiteAccess::Walk(Driver& driver, const QueueState& queue, std::uint64_t
             count(counters.retries);
             continue;
         }
-        PendingView pending;
-        pending.Load();
-        for (const auto& [begin, end] : work.ranges) {
-            if (pending.Overlaps(begin, static_cast<std::size_t>(end - begin))) return refuse(hit, DrawSiteRefusal::Pending);
-        }
+        if (PendingView{}.AnyOverlaps(work.ranges)) return refuse(hit, DrawSiteRefusal::Pending);
         if (Graphics::StorageTexture::AnyPendingOverlaps(work.ranges) || Graphics::AnyShadowedOverlaps(work.ranges)) return refuse(hit, DrawSiteRefusal::Pending);
         if (Graphics::Recorder::PublishGeneration() != publish || Graphics::StorageTexture::PendingSerial() != pendingSerial || GuestMemory::ForgetSerial() != forget) return refuse(hit, DrawSiteRefusal::Moved);
         hit.recipe = driver.findDrawRecipe(chosen->recipeKey, chosen->roots, chosen->holder);

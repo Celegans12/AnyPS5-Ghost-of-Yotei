@@ -9,6 +9,14 @@
 #include <mutex>
 #include <stdexcept>
 #include <utility>
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <time.h>
+#endif
 
 namespace AgcDriver::Graphics {
 
@@ -24,6 +32,7 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_PIPELINE_DISPATCH_MISSES",
     "APS5_NO_EXTENDED_FAST_PROOFS",
     "APS5_NO_REAP_ON_FENCE",
+    "APS5_PENDING_PAGES",
 };
 
 struct SwitchValues {
@@ -37,6 +46,7 @@ struct SwitchValues {
             std::getenv("APS5_PIPELINE_DISPATCH_MISSES") != nullptr,
             std::getenv("APS5_NO_EXTENDED_FAST_PROOFS") != nullptr,
             std::getenv("APS5_NO_REAP_ON_FENCE") != nullptr,
+            std::getenv("APS5_PENDING_PAGES") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }
@@ -70,6 +80,19 @@ std::string FlippableList() {
 }
 
 namespace RuntimeSwitches {
+
+double CallingThreadCpuSeconds() {
+#ifdef _WIN32
+    FILETIME creation{}, exited{}, kernel{}, user{};
+    if (GetThreadTimes(GetCurrentThread(), &creation, &exited, &kernel, &user) == 0) return -1.0;
+    const auto ticks = [](const FILETIME& time) { return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32u) | time.dwLowDateTime; };
+    return static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
+#else
+    timespec now{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) return -1.0;
+    return static_cast<double>(now.tv_sec) + static_cast<double>(now.tv_nsec) / 1e9;
+#endif
+}
 
 const char* Name(RuntimeSwitch id) {
     return SwitchNames.at(static_cast<std::size_t>(id));

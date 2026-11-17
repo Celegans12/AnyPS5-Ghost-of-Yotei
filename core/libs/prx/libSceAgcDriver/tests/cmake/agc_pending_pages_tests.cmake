@@ -1,0 +1,12 @@
+if(BUILD_TESTING)
+    add_test_executable(agc_pending_pages_tests tests/PendingPages.cpp Graphics/src/PendingPages.cpp Graphics/src/RuntimeSwitches.cpp)
+    target_include_directories(agc_pending_pages_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_pending_pages_tests PRIVATE libc)
+    configure_windows_unwind(agc_pending_pages_tests)
+    add_test(NAME agc_pending_pages COMMAND agc_pending_pages_tests)
+    set_tests_properties(agc_pending_pages PROPERTIES TIMEOUT 60)
+    if(WIN32)
+        set_tests_properties(agc_pending_pages PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()

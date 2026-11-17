@@ -750,11 +750,7 @@ FrontOutcome Front::Walk(const QueueState& queue, const DriverDetail::ShaderRegi
         leftTeach = false;
         return 1;
     }
-    DriverDetail::PendingView pending;
-    pending.Load();
-    for (const auto& [begin, end] : ranges) {
-        if (pending.Overlaps(begin, static_cast<std::size_t>(end - begin))) { leftReason = FrontLeft::Pending; leftTeach = false; return 1; }
-    }
+    if (DriverDetail::PendingView{}.AnyOverlaps(ranges)) { leftReason = FrontLeft::Pending; leftTeach = false; return 1; }
     if (Graphics::StorageTexture::AnyPendingOverlaps(ranges) || Graphics::AnyShadowedOverlaps(ranges)) { leftReason = FrontLeft::Pending; leftTeach = false; return 1; }
     if (Graphics::Recorder::PublishGeneration() != publish || Graphics::StorageTexture::PendingSerial() != pendingSerial || GuestMemory::ForgetSerial() != forget) { leftReason = FrontLeft::Moved; leftTeach = false; return 1; }
     lap(5);
@@ -993,11 +989,7 @@ FrontOutcome Front::Flat(const FlatInputs& inputs) {
         } else if (!(watch.items == 0 && !pipeline.Busy() && pipeline.Retired() == watch.retired) && pipeline.WrittenSince(watch, ranges)) {
             return left(FrontLeft::Queued, false);
         }
-        DriverDetail::PendingView pending;
-        pending.Load();
-        for (const auto& [begin, end] : ranges) {
-            if (pending.Overlaps(begin, static_cast<std::size_t>(end - begin))) return left(FrontLeft::Pending, false);
-        }
+        if (DriverDetail::PendingView{}.AnyOverlaps(ranges)) return left(FrontLeft::Pending, false);
         if (Graphics::StorageTexture::AnyPendingOverlaps(ranges) || Graphics::AnyShadowedOverlaps(ranges)) return left(FrontLeft::Pending, false);
         if (Graphics::Recorder::PublishGeneration() != publish || Graphics::StorageTexture::PendingSerial() != pendingSerial || GuestMemory::ForgetSerial() != forget) return left(FrontLeft::Moved, false);
         break;

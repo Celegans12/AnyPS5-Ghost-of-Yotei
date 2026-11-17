@@ -2,6 +2,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PendingPages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
@@ -145,6 +146,25 @@ bool anyOverlapping(const Shadows& registry, std::uint64_t address, std::uint64_
     return false;
 }
 
+void refreshShadowPages(const Shadows& registry, std::uint64_t begin, std::uint64_t end) {
+    if (!PendingPages::Armed() || end <= begin) return;
+    std::vector<PendingPages::Range> live;
+    anyOverlapping(registry, begin, end, [&](const std::shared_ptr<UnitShadow>& shadow) {
+        const auto from = std::max(begin, shadow->importBase);
+        const auto to = std::min(end, shadow->ImportEnd());
+        if (to <= from) return false;
+        for (auto unit = shadow->UnitOf(from); unit <= shadow->UnitOf(to - 1); ++unit) {
+            if (!shadow->Live(unit)) continue;
+            const auto [unitBegin, unitEnd] = shadow->UnitRange(unit);
+            if (unitEnd <= unitBegin) continue;
+            if (!live.empty() && live.back().second == unitBegin) live.back().second = unitEnd;
+            else live.emplace_back(unitBegin, unitEnd);
+        }
+        return false;
+    });
+    PendingPages::Restrict(PendingPages::Layer::Shadow, begin, end, live);
+}
+
 std::vector<std::shared_ptr<UnitShadow>> overlapping(const Shadows& registry, std::uint64_t address, std::uint64_t end) {
     std::vector<std::shared_ptr<UnitShadow>> result;
     anyOverlapping(registry, address, end, [&](const std::shared_ptr<UnitShadow>& shadow) {
@@ -171,7 +191,10 @@ std::shared_ptr<UnitShadow> findOrCreate(Shadows& registry, const Context& conte
             registry.liveBytes -= SlabBytes(*slab);
             --registry.liveSlabs;
         }
+        const auto staleBegin = found->second->importBase;
+        const auto staleEnd = found->second->ImportEnd();
         registry.byBase.erase(found);
+        refreshShadowPages(registry, staleBegin, staleEnd);
     }
     auto shadow = std::make_shared<UnitShadow>();
     shadow->context = context;
@@ -439,6 +462,7 @@ std::size_t publishUnits(const std::shared_ptr<UnitShadow>& shadow, std::uint64_
             ++units;
         }
         shadow->liveUnits -= ended;
+        if (ended != 0) refreshShadowPages(registry, std::max(shadow->UnitBegin(first), shadow->importBase), std::min(shadow->UnitBegin(last + 1), shadow->ImportEnd()));
     }
     if (units == 0) return 0;
     Stats().published[static_cast<std::size_t>(reason)].fetch_add(1, std::memory_order_relaxed);
@@ -505,6 +529,7 @@ bool evictOne(Shadows& registry) {
         victim->published[unit] = 0;
     }
     victim->Recount();
+    refreshShadowPages(registry, std::max(victim->UnitBegin(firstUnit), victim->importBase), std::min(victim->UnitBegin(lastUnit + 1), victim->ImportEnd()));
     registry.liveBytes -= SlabBytes(*slab);
     --registry.liveSlabs;
     slab.reset();
@@ -657,20 +682,29 @@ bool AnyPublishInProgress() {
 }
 
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes) {
-    if (!UnitShadowEnabled() || bytes == 0) return false;
+    if (!UnitShadowEnabled() || bytes == 0 || PendingPages::Rejects(PendingPages::Layer::Shadow, address, bytes)) return false;
     auto& registry = Registry();
     std::lock_guard lock(registry.mutex);
-    return anyShadowedLocked(registry, address, bytes);
+    const bool answer = anyShadowedLocked(registry, address, bytes);
+    if (PendingPages::Verifying()) {
+        const auto sequence = PendingPages::Sequence(PendingPages::Layer::Shadow);
+        PendingPages::Compare(PendingPages::Layer::Shadow, sequence, PendingPages::Clear(PendingPages::Layer::Shadow, address, bytes), answer, address, bytes);
+    }
+    return answer;
 }
 
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
-    if (!UnitShadowEnabled() || ranges.empty()) return false;
+    if (!UnitShadowEnabled() || ranges.empty() || PendingPages::Rejects(PendingPages::Layer::Shadow, ranges)) return false;
     auto& registry = Registry();
     std::lock_guard lock(registry.mutex);
-    for (const auto& [begin, end] : ranges) {
-        if (end > begin && anyShadowedLocked(registry, begin, static_cast<std::size_t>(end - begin))) return true;
+    const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const std::pair<std::uint64_t, std::uint64_t>& range) { return range.second > range.first && anyShadowedLocked(registry, range.first, static_cast<std::size_t>(range.second - range.first)); });
+    const bool answer = found != ranges.end();
+    if (PendingPages::Verifying()) {
+        const auto sequence = PendingPages::Sequence(PendingPages::Layer::Shadow);
+        const auto& logged = answer ? *found : ranges.front();
+        PendingPages::Compare(PendingPages::Layer::Shadow, sequence, PendingPages::Clear(PendingPages::Layer::Shadow, ranges), answer, logged.first, logged.second > logged.first ? static_cast<std::size_t>(logged.second - logged.first) : 0);
     }
-    return false;
+    return answer;
 }
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> LiveShadowedRanges(std::uint64_t address, std::size_t bytes, PublishScope scope) {
@@ -928,6 +962,9 @@ void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> range
                 current->lastUse = present;
             }
         }
+        for (const auto& [begin, end, slab] : ranges) {
+            if (end > begin) refreshShadowPages(registry, std::max(shadow->UnitBegin(shadow->UnitOf(begin)), shadow->importBase), std::min(shadow->UnitBegin(shadow->UnitOf(end - 1) + 1), shadow->ImportEnd()));
+        }
     }
     if (lost != 0) {
         Stats().slabLost.fetch_add(lost, std::memory_order_relaxed);
@@ -969,6 +1006,7 @@ void RetireShadow(VkDevice device, const HostImport& import, const std::function
             }
         }
         shadow->Recount();
+        if (dropped != 0) refreshShadowPages(registry, shadow->importBase, shadow->ImportEnd());
     }
     if (dropped != 0) Stats().droppedOnRetire.fetch_add(dropped, std::memory_order_relaxed);
     std::size_t published = 0;
@@ -992,6 +1030,7 @@ void RetireShadow(VkDevice device, const HostImport& import, const std::function
     ++registry.retired;
     if (TraceEnabled()) std::fprintf(stderr, "[shadow] retire import 0x%llx+0x%llx: %zu units published, %llu dropped (memory no longer registered)\n", static_cast<unsigned long long>(import.base), static_cast<unsigned long long>(import.bytes), published, static_cast<unsigned long long>(dropped));
     registry.byBase.erase(found);
+    refreshShadowPages(registry, shadow->importBase, shadow->ImportEnd());
 }
 
 void PublishAllShadows(const Context& context, PublishReason reason) {
@@ -1020,7 +1059,10 @@ void DestroyShadows(VkDevice device) {
             registry.liveBytes -= SlabBytes(*slab);
             --registry.liveSlabs;
         }
+        const auto erasedBegin = it->second->importBase;
+        const auto erasedEnd = it->second->ImportEnd();
         it = registry.byBase.erase(it);
+        refreshShadowPages(registry, erasedBegin, erasedEnd);
     }
 }
 

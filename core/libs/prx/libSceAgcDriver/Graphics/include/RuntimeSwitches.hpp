@@ -18,11 +18,13 @@ enum class RuntimeSwitch : std::size_t {
     PipelineDispatchMisses,
     NoExtendedFastProofs,
     NoReapOnFence,
+    PendingPages,
     Count,
 };
 
 namespace RuntimeSwitches {
 
+double CallingThreadCpuSeconds();
 const char* Name(RuntimeSwitch id);
 bool Set(RuntimeSwitch id);
 void Assign(RuntimeSwitch id, bool set);

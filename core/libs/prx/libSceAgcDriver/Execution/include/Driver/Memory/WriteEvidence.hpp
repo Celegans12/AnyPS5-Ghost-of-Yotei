@@ -8,6 +8,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace AgcDriver::DriverDetail {
@@ -47,6 +49,7 @@ struct PendingView {
 
     void Load();
     bool Overlaps(std::uint64_t address, std::size_t bytes) const;
+    bool AnyOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 };
 
 }

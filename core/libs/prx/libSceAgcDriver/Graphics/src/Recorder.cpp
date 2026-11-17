@@ -14,6 +14,7 @@
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PendingPages.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
@@ -767,7 +768,15 @@ bool SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::s
 }
 
 bool SnapshotOverlaps(std::uint64_t address, std::size_t bytes) {
-    if (bytes == 0) return false;
+    if (bytes == 0 || PendingPages::Rejects(PendingPages::Layer::Recorder, address, bytes)) return false;
+    if (PendingPages::Verifying()) {
+        const auto sequence = PendingPages::Sequence(PendingPages::Layer::Recorder);
+        const bool clear = PendingPages::Clear(PendingPages::Layer::Recorder, address, bytes);
+        const auto snapshot = pendingWrites.load(std::memory_order_acquire);
+        const bool overlaps = SnapshotOverlaps(snapshot.get(), address, bytes);
+        PendingPages::Compare(PendingPages::Layer::Recorder, sequence, clear, overlaps, address, bytes);
+        return overlaps;
+    }
     const auto snapshot = pendingWrites.load(std::memory_order_acquire);
     return SnapshotOverlaps(snapshot.get(), address, bytes);
 }
@@ -1832,7 +1841,9 @@ Recorder::~Recorder() {
     holdKept.clear();
     if (activeRecorder == this) {
         activeRecorder = nullptr;
-        pendingWrites.store(nullptr, std::memory_order_release);
+        const auto forget = [] { pendingWrites.store(nullptr, std::memory_order_release); };
+        if (PendingPages::Armed()) PendingPages::Replace(PendingPages::Layer::Recorder, std::span<const PendingPages::Range>{}, forget);
+        else forget();
         publishGeneration.fetch_add(1, std::memory_order_release);
         pendingLabelSince.store(NoPendingLabel, std::memory_order_release);
         completionLabels.store(0, std::memory_order_release);
@@ -5253,7 +5264,15 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
     publishedWriteRangesValid = std::all_of(merged->begin(), merged->end(), [](const auto& range) { return range.second > range.first; });
     publishedWriteRanges = merged;
     published = merged;
-    pendingWrites.store(std::move(merged), std::memory_order_release);
+    const auto store = [&] { pendingWrites.store(std::move(merged), std::memory_order_release); };
+    if (!PendingPages::Armed()) {
+        store();
+    } else if (extend) {
+        PendingPages::Track(PendingPages::Layer::Recorder, additions);
+        store();
+    } else {
+        PendingPages::Replace(PendingPages::Layer::Recorder, std::span<const PendingPages::Range>(*published), store);
+    }
     publishGeneration.fetch_add(1, std::memory_order_release);
     ++snapshotRebuilds;
     if (DrawProfiled()) snapshotRebuildMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
