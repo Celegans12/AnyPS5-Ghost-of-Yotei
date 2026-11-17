@@ -58,4 +58,22 @@ void DuplicateJitSharedMemory(int from, int to);
 bool IsJitSharedMemory(int descriptor);
 void GuestPageTableUsage(std::uint64_t granularity, std::uint64_t* cpu_entries, std::uint64_t* gpu_entries);
 
+#if defined(ANYPS5_KYTY)
+inline constexpr std::uint64_t DirectMemoryViewUnmapped = ~std::uint64_t{0};
+inline constexpr std::uint64_t DirectMemoryViewPrivate = ~std::uint64_t{0} - 1;
+inline constexpr std::uint64_t DirectMemoryViewReplacing = ~std::uint64_t{0} - 2;
+
+extern "C" {
+using DirectMemoryViewObserver = void (*)(std::uintptr_t address, std::size_t bytes, std::uint64_t viewOffset);
+bool DirectMemoryEnableView_nid_no_patch(DirectMemoryViewObserver observer, std::uint8_t** view, std::size_t* guestBytes, std::size_t* viewBytes);
+using DirectMemoryProtectionObserver = void (*)(std::uintptr_t address, std::size_t bytes, int protection);
+void DirectMemoryWatchProtections_nid_no_patch(DirectMemoryProtectionObserver observer);
+std::size_t DirectMemorySize_nid_no_patch();
+bool DirectMemoryFind_nid_no_patch(std::int64_t offset, bool findNext, std::int64_t* start, std::int64_t* end, int* memoryType);
+void GuestPageTableUsage_nid_no_patch(std::uint64_t granularity, std::uint64_t* cpuEntries, std::uint64_t* gpuEntries);
+int DoMapAnon_nid_no_patch(void** addr, std::size_t len, int prot, int flags, std::size_t alignment, bool exclusive);
+int DoMunmap_nid_no_patch(void* addr, std::size_t len);
+}
+#endif
+
 #endif
