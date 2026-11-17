@@ -333,6 +333,18 @@ void FlipRequest::Fail(std::exception_ptr error) noexcept {
     queue->changed.NotifyAll();
 }
 
+#if defined(ANYPS5_KYTY)
+std::optional<AgcDriver::DisplayBuffer> FlipRequest::Source() {
+    std::lock_guard lock(cfg->mutex);
+    if (cfg->failure || cfg->Closed() || terminal || ready || cfg->generation != generation || index < 0) return std::nullopt;
+    const auto& registered = cfg->buffers[index];
+    if (!registered.Occupied() || registered.groupIndex >= VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX || registered.dataAddress == 0) return std::nullopt;
+    const auto& source = groupCaptured ? group : cfg->groups[registered.groupIndex];
+    if (!source.occupied) return std::nullopt;
+    return DescribeVideoOutBuffer(registered, source);
+}
+#endif
+
 VideoOutDriver& VideoOutDriver::Get() {
     static VideoOutDriver instance;
     return instance;

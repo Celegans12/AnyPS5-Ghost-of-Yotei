@@ -47,6 +47,12 @@ void RemoveFaultChain();
 
 }
 
+namespace KytyShim::Present {
+
+void SubmitCpuFlip(Libs::Graphics::GuestGpu& gpu, const AgcDriver::FlipInfo& info);
+
+}
+
 namespace KytyShim::Entry {
 
 namespace {
@@ -403,7 +409,7 @@ extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info)
     std::shared_lock gate(s.gate);
     KytyShim::Entry::CheckStopping();
     KytyShim::Entry::RequireOutput(info.handle, "flip references an unregistered video output");
-    KytyShim::Entry::SubmitFlipPacket(KytyShim::Entry::Gpu(), info);
+    KytyShim::Present::SubmitCpuFlip(KytyShim::Entry::Gpu(), info);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }

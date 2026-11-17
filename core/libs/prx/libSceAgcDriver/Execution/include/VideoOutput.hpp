@@ -5,6 +5,10 @@
 #include <exception>
 #include <memory>
 #include <stdexcept>
+#if defined(ANYPS5_KYTY)
+#include <optional>
+#include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
+#endif
 
 namespace AgcDriver {
 
@@ -42,6 +46,11 @@ public:
     virtual ~IFlipRequest() = default;
     virtual void GpuReady(const std::shared_ptr<FrameTiming>& timing) = 0;
     virtual void Fail(std::exception_ptr error) noexcept = 0;
+#if defined(ANYPS5_KYTY)
+    virtual std::optional<DisplayBuffer> Source() {
+        throw std::runtime_error("VideoOut: this flip request does not describe its display buffer");
+    }
+#endif
 };
 
 class IVideoOutput {
