@@ -2,6 +2,7 @@
 
 #if defined(ANYPS5_KYTY)
 
+#include "common/assert.h"
 #include "common/profiler.h"
 #include "common/spscQueue.h"
 #include "kernel/memory.h"
@@ -70,9 +71,16 @@ struct Stats {
 
 std::chrono::seconds Period() {
 	static const auto period = [] {
-		const char* value   = std::getenv("KYTY_LOCK_STATS_PERIOD");
-		const auto  seconds = value != nullptr ? std::strtoul(value, nullptr, 10) : 0ul;
-		return std::chrono::seconds(seconds != 0 ? seconds : 5);
+		const char* value = std::getenv("KYTY_LOCK_STATS_PERIOD");
+		if (value == nullptr || value[0] == '\0') {
+			return std::chrono::seconds(5);
+		}
+		char*      end     = nullptr;
+		const auto seconds = std::strtoul(value, &end, 10);
+		if (end == value || *end != '\0' || seconds == 0 || seconds > 3600) {
+			EXIT("invalid KYTY_LOCK_STATS_PERIOD: %s (whole seconds, 1 to 3600)\n", value);
+		}
+		return std::chrono::seconds(seconds);
 	}();
 	return period;
 }
@@ -314,6 +322,10 @@ void StartReporter() {
 }
 
 void Backoff(uint32_t& rounds) {
+	if (!Narrow()) {
+		Common::SpinPause();
+		return;
+	}
 	if (rounds < SpinRounds) {
 		rounds++;
 		for (uint32_t i = 0; i < 4; i++) {
@@ -345,7 +357,13 @@ void Blame(Stats& stats, uint32_t holder, uint64_t ns) {
 bool Enabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_LOCK_STATS");
-		return value != nullptr && value[0] != '\0' && value[0] != '0';
+		if (value == nullptr || value[0] == '\0' || std::string_view(value) == "0") {
+			return false;
+		}
+		if (std::string_view(value) != "1") {
+			EXIT("invalid KYTY_LOCK_STATS: %s (0 or 1)\n", value);
+		}
+		return true;
 	}();
 	return enabled;
 }
@@ -353,7 +371,13 @@ bool Enabled() {
 bool Narrow() {
 	static const bool narrow = [] {
 		const char* value = std::getenv("KYTY_PROGRAM_LOCK");
-		return value == nullptr || std::string_view(value) != "wide";
+		if (value == nullptr || value[0] == '\0' || std::string_view(value) == "narrow") {
+			return true;
+		}
+		if (std::string_view(value) != "wide") {
+			EXIT("invalid KYTY_PROGRAM_LOCK: %s (narrow or wide)\n", value);
+		}
+		return false;
 	}();
 	return narrow;
 }
