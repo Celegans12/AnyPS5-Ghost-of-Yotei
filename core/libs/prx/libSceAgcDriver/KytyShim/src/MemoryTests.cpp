@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "MemoryShim.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/include/Api.hpp"
@@ -183,6 +184,28 @@ void TestRuntimeMemory() {
     std::printf("runtime memory 0x%llx: allocated with a backing, freed\n", static_cast<unsigned long long>(address));
 }
 
+void TestUnreportedPrivateMemory() {
+    constexpr std::size_t bytes = Page * 2;
+    void* heap = GuestArena::GuestArenaAllocate_nid_postfix(bytes, Page);
+    Require(heap != nullptr);
+    GuestArena::GuestArenaCommit_nid_postfix(heap, bytes, 0x04, bytes);
+    std::vector<std::uint8_t> written(bytes);
+    Fill(written, 41);
+    std::memcpy(heap, written.data(), bytes);
+    const auto address = Address(heap);
+    std::vector<std::uint8_t> read(bytes, 0xcc);
+    Require(!Memory::IsBackingReadable(address, bytes));
+    Require(!Memory::TryReadBacking(address, read.data(), bytes));
+    Require(Memory::FindBackingPointer(address, bytes) == nullptr);
+    Require(!Memory::TryReadSparseBacking(address, read.data(), bytes));
+    Require(!Libs::LibKernel::Memory::Shim::TryWriteBackedRuns(address, written.data(), bytes));
+    Require(Memory::IsFullyMapped(address, bytes));
+    Require(Memory::CopySparseMemory(address, read.data(), bytes) && read == written);
+    GuestArena::GuestArenaReset_nid_postfix(heap, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(heap, bytes);
+    std::printf("arena memory 0x%llx committed outside libkernel: no second view, read as private memory\n", static_cast<unsigned long long>(address));
+}
+
 }
 
 int main() {
@@ -191,6 +214,7 @@ int main() {
     TestDirect();
     TestGpuHooks();
     TestRuntimeMemory();
+    TestUnreportedPrivateMemory();
     std::printf("KytyShim memory: all checks passed\n");
     return 0;
 }
