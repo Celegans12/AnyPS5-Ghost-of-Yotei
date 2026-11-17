@@ -476,6 +476,7 @@ public:
         const auto result = mach_vm_map(mach_task_self(), &target, bytes, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, entry, offset, FALSE, protection, VM_PROT_ALL, VM_INHERIT_SHARE);
         if (result != KERN_SUCCESS) throw std::runtime_error(std::string("map direct memory backing: ") + mach_error_string(result));
 #else
+        GuestWriteWatch::GuestWriteWatchOpenReads_nid_postfix(reinterpret_cast<void*>(address), bytes);
         if (::mmap(reinterpret_cast<void*>(address), bytes, protection, MAP_SHARED | MAP_FIXED, file, static_cast<off_t>(fileOffset + offset)) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map direct memory backing");
 #endif
     }
@@ -875,6 +876,7 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
             GuestArena::GuestArenaReset_nid_postfix(addr, len);
             GuestArena::GuestArenaCommit_nid_postfix(addr, len, 0x04, PS5_PAGE_SIZE);
 #else
+            GuestWriteWatch::GuestWriteWatchOpenReads_nid_postfix(addr, len);
             if (::mmap(addr, len, nativeProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
             GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(addr, len);
 #endif
@@ -893,6 +895,7 @@ void* ArenaCommit(void* addr, size_t len, int prot) {
     GuestArena::GuestArenaCommit_nid_postfix(addr, len, 0x04, PS5_PAGE_SIZE);
     return addr;
 #else
+    GuestWriteWatch::GuestWriteWatchOpenReads_nid_postfix(addr, len);
     return mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 #endif
 }
@@ -1153,6 +1156,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     ValidateOutput(addr);
     ValidateAlignment(alignment);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
+    if (*addr != nullptr) GuestWriteWatch::GuestWriteWatchSettleReads_nid_postfix(*addr, len);
     if (physStart < 0 || (static_cast<std::uint64_t>(physStart) & (PS5_PAGE_SIZE - 1)) != 0 || static_cast<std::uint64_t>(physStart) >= DIRECT_MEMORY_SIZE || len > DIRECT_MEMORY_SIZE - static_cast<std::uint64_t>(physStart)) {
         return SCE_KERNEL_ERROR_EINVAL;
     }
@@ -1191,6 +1195,7 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
 }
 
 static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t alignment, bool exclusive, bool zero) {
+    if (*addr != nullptr && len != 0) GuestWriteWatch::GuestWriteWatchSettleReads_nid_postfix(*addr, len);
     GuestAllocations::Mutation mutation;
     if (exclusive && mutation.Overlaps(*addr, len)) return SCE_KERNEL_ERROR_ENOMEM;
     flags = PlaceHintInReservation(*addr, len, flags);
@@ -1286,6 +1291,7 @@ int DoMapZero(void** addr, size_t len, int prot, int flags) {
 
 int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, int descriptor, std::uint64_t offset, size_t alignment) {
     ValidateOutput(addr);
+    if (*addr != nullptr && len != 0) GuestWriteWatch::GuestWriteWatchSettleReads_nid_postfix(*addr, len);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || (offset & (PS5_PAGE_SIZE - 1)) != 0 || len > static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max()) || offset > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - len) return SCE_KERNEL_ERROR_EINVAL;
 #if defined(__linux__) || defined(__APPLE__)
     const bool shared = (flags & 3) == 1;
@@ -1385,6 +1391,7 @@ int DoMapShared(void** addr, size_t len, int prot, HostSharedMemory object) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
     const auto nativeProtection = LinuxProtFromSce(prot);
+    if (*addr != nullptr) GuestWriteWatch::GuestWriteWatchSettleReads_nid_postfix(*addr, len);
     GuestAllocations::Mutation mutation;
     void* mapped = MapPlaced(*addr, len, PROT_NONE, 0, PS5_PAGE_SIZE);
     try {
@@ -1475,6 +1482,7 @@ static int FindImagesOverlapping(dl_phdr_info* image, std::size_t, void* data) {
 
 int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart) {
     Trace("protect %p+0x%zx prot=0x%x", addr, len, prot);
+    if (addr != nullptr && len != 0) GuestWriteWatch::GuestWriteWatchSettleReads_nid_postfix(addr, len);
     const auto address = reinterpret_cast<std::uintptr_t>(addr);
     constexpr auto pageMask = static_cast<std::uintptr_t>(PS5_PAGE_SIZE - 1);
     const auto limit = std::numeric_limits<std::uintptr_t>::max();
@@ -1519,6 +1527,9 @@ int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart) 
         if (error != 0) errno = error;
         const bool protectedPages = error == 0;
 #else
+#if defined(__linux__)
+        GuestWriteWatch::GuestWriteWatchOpenReads_nid_postfix(insidePointer, insideBytes);
+#endif
         bool protectedPages = mprotect(insidePointer, insideBytes, nativeProtection) == 0;
 #if defined(__linux__)
         if (!protectedPages && errno == ENOMEM) {
@@ -1564,7 +1575,7 @@ int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart) 
     for (const auto& [span, spanBytes] : spans) mutation.RequireUnpinned(span, spanBytes);
     for (const auto& [span, spanBytes] : spans) {
         mutation.Protect(span, spanBytes, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
-#ifdef __APPLE__
+#if defined(__APPLE__) || defined(__linux__)
             if (const int error = GuestWriteWatch::GuestWriteWatchProtect_nid_postfix(const_cast<void*>(span), spanBytes, nativeProtection); error != 0)
                 throw std::system_error(error, std::generic_category(), "mprotect failed");
 #else
@@ -1607,6 +1618,7 @@ int DoMtypeprotect(const void* addr, size_t len, int type, int prot, bool requir
 int DoMunmap(void* addr, size_t len) {
     Trace("unmap %p+0x%zx", addr, len);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0 || !addr) return SCE_KERNEL_ERROR_EINVAL;
+    GuestWriteWatch::GuestWriteWatchSettleReads_nid_postfix(addr, len);
     GuestAllocations::Mutation mutation;
     if (!mutation.Overlaps(addr, len)) return 0;
     UnmapRegistered(mutation, addr, len);
@@ -1616,6 +1628,7 @@ int DoMunmap(void* addr, size_t len) {
 int DoReserveVirtual(void** addr, size_t len, int flags, size_t alignment) {
     ValidateOutput(addr);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
+    if (*addr != nullptr) GuestWriteWatch::GuestWriteWatchSettleReads_nid_postfix(*addr, len);
     GuestAllocations::Mutation mutation;
     const bool fixed = *addr != nullptr && (flags & GuestMapFixedFlag) != 0;
     if (fixed) {
@@ -1807,6 +1820,7 @@ std::vector<DirectMemoryView> DirectMemoryViews(int64_t start, size_t len) {
 
 void UnmapDirectMemoryViews(const std::vector<DirectMemoryView>& views) {
     if (views.empty()) return;
+    for (const auto& view : views) GuestWriteWatch::GuestWriteWatchSettleReads_nid_postfix(reinterpret_cast<void*>(view.address), view.bytes);
     GuestAllocations::Mutation mutation;
     for (const auto& view : views) {
         Trace("unmap released view %p+0x%zx", reinterpret_cast<void*>(view.address), view.bytes);
