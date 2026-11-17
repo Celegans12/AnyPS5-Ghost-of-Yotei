@@ -16,6 +16,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 #include "libs/errno.h"
 
+#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -51,6 +52,7 @@
 namespace KytyShim::Entry {
 
 Libs::Graphics::RenderContext& Renderer();
+void JoinPrestart(bool rethrow);
 std::shared_ptr<AgcDriver::IVideoOutput> VideoOutput(std::uint32_t handle);
 
 }
@@ -158,20 +160,86 @@ void WaitRunningUrgentCommands(std::function<void()> blocking) {
     waiting.get();
 }
 
-PFN_vkGetInstanceProcAddr LoadVulkanLoader() {
+struct LoaderLock {
+    LoaderLock() { AgcDriverLockVulkanLoader_nid_postfix(); }
+    ~LoaderLock() { AgcDriverUnlockVulkanLoader_nid_postfix(); }
+    LoaderLock(const LoaderLock&) = delete;
+    LoaderLock& operator=(const LoaderLock&) = delete;
+};
+
+PFN_vkGetInstanceProcAddr LoaderGetInstanceProcAddr() {
+    static const PFN_vkGetInstanceProcAddr proc = [] {
+        const LoaderLock lock;
 #ifdef _WIN32
-    static const HMODULE library = LoadLibraryW(L"vulkan-1.dll");
-    if (library == nullptr) EXIT("kyty presentation: cannot load vulkan-1.dll: error %lu\n", static_cast<unsigned long>(GetLastError()));
-    const auto proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(reinterpret_cast<void*>(GetProcAddress(library, "vkGetInstanceProcAddr")));
-    if (proc == nullptr) EXIT("kyty presentation: vulkan-1.dll has no vkGetInstanceProcAddr\n");
-    return proc;
+        const HMODULE library = LoadLibraryW(L"vulkan-1.dll");
+        if (library == nullptr) EXIT("kyty presentation: cannot load vulkan-1.dll: error %lu\n", static_cast<unsigned long>(GetLastError()));
+        const auto found = reinterpret_cast<PFN_vkGetInstanceProcAddr>(reinterpret_cast<void*>(GetProcAddress(library, "vkGetInstanceProcAddr")));
+        if (found == nullptr) EXIT("kyty presentation: vulkan-1.dll has no vkGetInstanceProcAddr\n");
 #else
-    static void* const library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (library == nullptr) EXIT("kyty presentation: cannot load libvulkan.so.1: %s\n", dlerror());
-    const auto proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr"));
-    if (proc == nullptr) EXIT("kyty presentation: libvulkan.so.1 has no vkGetInstanceProcAddr\n");
-    return proc;
+        void* const library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (library == nullptr) EXIT("kyty presentation: cannot load libvulkan.so.1: %s\n", dlerror());
+        const auto found = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr"));
+        if (found == nullptr) EXIT("kyty presentation: libvulkan.so.1 has no vkGetInstanceProcAddr\n");
 #endif
+        return found;
+    }();
+    return proc;
+}
+
+template <typename Function>
+Function LoaderGlobal(const char* name) {
+    const auto function = reinterpret_cast<Function>(LoaderGetInstanceProcAddr()(VK_NULL_HANDLE, name));
+    if (function == nullptr) EXIT("kyty presentation: the Vulkan loader has no %s\n", name);
+    return function;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LockedCreateInstance(const VkInstanceCreateInfo* info, const VkAllocationCallbacks* allocator, VkInstance* instance) {
+    const LoaderLock lock;
+    return LoaderGlobal<PFN_vkCreateInstance>("vkCreateInstance")(info, allocator, instance);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LockedEnumerateInstanceExtensionProperties(const char* layer, std::uint32_t* count, VkExtensionProperties* properties) {
+    const LoaderLock lock;
+    return LoaderGlobal<PFN_vkEnumerateInstanceExtensionProperties>("vkEnumerateInstanceExtensionProperties")(layer, count, properties);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LockedEnumerateInstanceLayerProperties(std::uint32_t* count, VkLayerProperties* properties) {
+    const LoaderLock lock;
+    return LoaderGlobal<PFN_vkEnumerateInstanceLayerProperties>("vkEnumerateInstanceLayerProperties")(count, properties);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LockedEnumerateInstanceVersion(std::uint32_t* version) {
+    const LoaderLock lock;
+    return LoaderGlobal<PFN_vkEnumerateInstanceVersion>("vkEnumerateInstanceVersion")(version);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LockedEnumeratePhysicalDevices(VkInstance instance, std::uint32_t* count, VkPhysicalDevice* devices) {
+    const LoaderLock lock;
+    const auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(LoaderGetInstanceProcAddr()(instance, "vkEnumeratePhysicalDevices"));
+    if (enumerate == nullptr) EXIT("kyty presentation: the Vulkan loader has no vkEnumeratePhysicalDevices\n");
+    return enumerate(instance, count, devices);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL LockedGetInstanceProcAddr(VkInstance instance, const char* name) {
+    const auto loader = LoaderGetInstanceProcAddr();
+    if (name != nullptr && std::strcmp(name, "vkGetInstanceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedGetInstanceProcAddr);
+    if (name != nullptr && instance != VK_NULL_HANDLE && std::strcmp(name, "vkEnumeratePhysicalDevices") == 0) {
+        return loader(instance, name) == nullptr ? nullptr : reinterpret_cast<PFN_vkVoidFunction>(&LockedEnumeratePhysicalDevices);
+    }
+    if (instance == VK_NULL_HANDLE && name != nullptr) {
+        if (std::strcmp(name, "vkCreateInstance") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedCreateInstance);
+        if (std::strcmp(name, "vkEnumerateInstanceExtensionProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedEnumerateInstanceExtensionProperties);
+        if (std::strcmp(name, "vkEnumerateInstanceLayerProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedEnumerateInstanceLayerProperties);
+        if (std::strcmp(name, "vkEnumerateInstanceVersion") == 0) {
+            return loader(VK_NULL_HANDLE, name) == nullptr ? nullptr : reinterpret_cast<PFN_vkVoidFunction>(&LockedEnumerateInstanceVersion);
+        }
+    }
+    return loader(instance, name);
+}
+
+PFN_vkGetInstanceProcAddr LoadVulkanLoader() {
+    LoaderGetInstanceProcAddr();
+    return &LockedGetInstanceProcAddr;
 }
 
 std::vector<const char*> SurfaceInstanceExtensions(PFN_vkGetInstanceProcAddr proc) {
@@ -547,6 +615,7 @@ void OpenXrQueueEyeSource(Graphics::CommandBuffer&, const Graphics::VulkanImage&
 
 extern "C" void AgcDriverAttachWindow_nid_postfix(const AgcDriver::PresentationWindow& window) {
     if (window.context == nullptr || window.createSurface == nullptr || window.getDrawableSize == nullptr) throw std::runtime_error("kyty presentation: incomplete presentation window");
+    KytyShim::Entry::JoinPrestart(true);
     if (!KytyShim::Entry::Renderer().GetGpu().Pipelined()) throw std::runtime_error("kyty presentation: the Kyty GPU must run pipelined (GPU pipeline stages must include the command processor)");
     auto& state = KytyShim::Present::State();
     Libs::Graphics::WindowContext* host = nullptr;

@@ -16,6 +16,8 @@ namespace KytyShim::Entry {
 Libs::Graphics::RenderContext& Renderer();
 Libs::Graphics::GuestGpu& Gpu();
 bool GpuStarted();
+void PrestartGpu();
+void JoinPrestart(bool rethrow);
 std::shared_ptr<AgcDriver::IVideoOutput> VideoOutput(std::uint32_t handle);
 bool OwnsFlipPacket(const std::uint32_t* packet);
 void ReleaseFlipPacket(const std::uint32_t* packet);

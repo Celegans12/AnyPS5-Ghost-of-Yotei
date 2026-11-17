@@ -352,6 +352,9 @@ VideoOutDriver& VideoOutDriver::Get() {
 }
 
 VideoOutDriver::VideoOutDriver() {
+#if defined(ANYPS5_KYTY)
+    AgcDriverPrestartGpu_nid_postfix();
+#endif
     OnMainThread([] {
         SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
 #ifdef _WIN32
