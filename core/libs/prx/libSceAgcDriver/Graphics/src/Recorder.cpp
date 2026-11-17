@@ -69,6 +69,65 @@ bool DrawProfiled() {
     return profiled;
 }
 
+bool ReapDelayReported() {
+    static const bool reported = std::getenv("APS5_PIPELINE_STATS") != nullptr || DrawProfiled();
+    return reported;
+}
+
+std::int64_t SteadyNs() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+struct ReapDelays {
+    static constexpr std::int64_t BucketNs = 25'000;
+    std::array<std::atomic<std::uint64_t>, 201> buckets{};
+    std::atomic<std::uint64_t> unseen{0}, totalNs{0}, maxNs{0};
+    std::atomic<std::int64_t> reportedAt{0};
+
+    void Note(std::optional<std::int64_t> delayNs, std::int64_t now) {
+        if (!delayNs.has_value()) {
+            unseen.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            const auto ns = static_cast<std::uint64_t>(std::max<std::int64_t>(0, *delayNs));
+            buckets[std::min<std::size_t>(ns / BucketNs, buckets.size() - 1)].fetch_add(1, std::memory_order_relaxed);
+            totalNs.fetch_add(ns, std::memory_order_relaxed);
+            if (ns > maxNs.load(std::memory_order_relaxed)) maxNs.store(ns, std::memory_order_relaxed);
+        }
+        auto last = reportedAt.load(std::memory_order_relaxed);
+        if (last == 0) {
+            reportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed);
+            return;
+        }
+        if (now - last < 10'000'000'000ll || !reportedAt.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+        std::array<std::uint64_t, 201> counts{};
+        std::uint64_t seen = 0;
+        for (std::size_t i = 0; i < buckets.size(); ++i) {
+            counts[i] = buckets[i].exchange(0, std::memory_order_relaxed);
+            seen += counts[i];
+        }
+        const auto quantile = [&](double fraction) {
+            const auto wanted = static_cast<std::uint64_t>(fraction * static_cast<double>(seen));
+            std::uint64_t below = 0;
+            for (std::size_t i = 0; i < counts.size(); ++i) {
+                below += counts[i];
+                if (below > wanted) return static_cast<double>((i + 1) * BucketNs) / 1e3;
+            }
+            return static_cast<double>(counts.size() * BucketNs) / 1e3;
+        };
+        const auto total = totalNs.exchange(0, std::memory_order_relaxed);
+        const auto longest = maxNs.exchange(0, std::memory_order_relaxed);
+        const auto missed = unseen.exchange(0, std::memory_order_relaxed);
+        AgcDriver::ProfilePrint_nid_no_patch("[reap-delay] (10 s): %llu batches with completion labels reaped, %llu of them before the GPU progress watcher saw them end; from the watcher's sight to the reap: mean %.0f us, p50 under %.0f us, p90 under %.0f us, max %.0f us\n",
+                                             static_cast<unsigned long long>(seen + missed), static_cast<unsigned long long>(missed), seen != 0 ? static_cast<double>(total) / static_cast<double>(seen) / 1e3 : 0.0,
+                                             seen != 0 ? quantile(0.5) : 0.0, seen != 0 ? quantile(0.9) : 0.0, static_cast<double>(longest) / 1e3);
+    }
+};
+
+ReapDelays& ReapDelaysOf() {
+    static ReapDelays delays;
+    return delays;
+}
+
 std::uint64_t syncCounts[5] = {};
 // Fence wait time by sync source (APS5_PROFILE_DRAW), and the source CountSync announced for the
 // Sync/SyncThrough that follows it on this thread.
@@ -548,6 +607,7 @@ std::atomic<std::uint64_t> publishGeneration{0};
 std::atomic<std::uint64_t> completionLabels{0};
 std::atomic<std::uint64_t> completionStores{0};
 std::atomic<std::uint64_t> writeBackCompletions{0};
+std::atomic<void (*)()> reapWake{nullptr};
 std::atomic<std::uint64_t> completionStoresSkipped{0};
 std::atomic<std::uint64_t> completionStoresRun{0};
 std::atomic<std::uint64_t> commandBuffersFreed{0};
@@ -1452,6 +1512,11 @@ struct Recorder::ProgressWatcher {
     std::atomic<std::uint64_t> submitted{0};
     std::atomic<bool> stop{false};
     std::atomic<std::uint32_t> wakes{0};
+    std::mutex watchMutex;
+    std::vector<std::uint64_t> watched;
+    static constexpr std::size_t ReachedSlots = 4096;
+    std::array<std::atomic<std::uint64_t>, ReachedSlots> reachedSerial{};
+    std::array<std::atomic<std::int64_t>, ReachedSlots> reachedNs{};
     std::thread thread;
 
     ProgressWatcher(VkDevice device, VkSemaphore timeline, PFN_vkWaitSemaphoresKHR waitSemaphores, PFN_vkGetSemaphoreCounterValueKHR counterValue) {
@@ -1461,6 +1526,7 @@ struct Recorder::ProgressWatcher {
             for (;;) {
                 const auto token = wakes.load(std::memory_order_acquire);
                 if (stop.load(std::memory_order_acquire)) return;
+                WakeReached(seen);
                 if (submitted.load(std::memory_order_acquire) <= seen) {
                     wakes.wait(token, std::memory_order_acquire);
                     continue;
@@ -1478,7 +1544,9 @@ struct Recorder::ProgressWatcher {
                 }
                 std::uint64_t value = target;
                 if (counterValue(device, timeline, &value) != VK_SUCCESS) value = target;
+                const auto previous = seen;
                 seen = std::max(target, value);
+                if (ReapDelayReported()) NoteReached(previous, seen);
                 KernelWakeSleepers_nid_no_patch();
             }
         });
@@ -1488,6 +1556,42 @@ struct Recorder::ProgressWatcher {
         submitted.store(serial, std::memory_order_release);
         wakes.fetch_add(1, std::memory_order_release);
         wakes.notify_one();
+    }
+
+    void Watch(std::uint64_t serial) {
+        {
+            std::lock_guard lock(watchMutex);
+            if (std::find(watched.begin(), watched.end(), serial) != watched.end()) return;
+            watched.push_back(serial);
+        }
+        wakes.fetch_add(1, std::memory_order_release);
+        wakes.notify_one();
+    }
+
+    void NoteReached(std::uint64_t previous, std::uint64_t seen) {
+        const auto now = SteadyNs();
+        for (auto serial = std::max(previous + 1, seen >= ReachedSlots ? seen - ReachedSlots + 1 : 1); serial <= seen; ++serial) {
+            reachedNs[serial % ReachedSlots].store(now, std::memory_order_relaxed);
+            reachedSerial[serial % ReachedSlots].store(serial, std::memory_order_release);
+        }
+    }
+
+    std::optional<std::int64_t> ReachedAt(std::uint64_t serial) const {
+        const auto slot = serial % ReachedSlots;
+        if (reachedSerial[slot].load(std::memory_order_acquire) != serial) return std::nullopt;
+        return reachedNs[slot].load(std::memory_order_relaxed);
+    }
+
+    void WakeReached(std::uint64_t seen) {
+        const auto wake = reapWake.load(std::memory_order_acquire);
+        if (wake == nullptr) return;
+        {
+            std::lock_guard lock(watchMutex);
+            const auto reached = std::remove_if(watched.begin(), watched.end(), [seen](std::uint64_t serial) { return serial <= seen; });
+            if (reached == watched.end()) return;
+            watched.erase(reached, watched.end());
+        }
+        wake();
     }
 
     ~ProgressWatcher() {
@@ -5600,6 +5704,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
         ++batch.completionStoreCount;
         completionStores.fetch_add(1, std::memory_order_acq_rel);
         GuestMemory::BreakProofs(GuestMemory::ProofBreak::Label, address, bytes.size());
+        if (&batch != open.get()) watchReap(batch);
     }
     // The table entry before the write note: the note bumps the generation a poller watches, and a
     // poller that sees the bump then finds the label without the GPU mutex.
@@ -5610,12 +5715,23 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
     }
 }
 
+void Recorder::SetReapWake(void (*wake)()) {
+    reapWake.store(wake, std::memory_order_release);
+}
+
+void Recorder::watchReap(const Batch& batch) {
+    if (progressWatcher == nullptr || !batch.submitted || reapWake.load(std::memory_order_acquire) == nullptr) return;
+    if (batch.completionLabelCount == 0 && batch.writeBackCompletionCount == 0) return;
+    progressWatcher->Watch(batch.serial);
+}
+
 bool Recorder::AfterRecordedWork(std::function<void()> action) {
     if (Idle()) return false;
     Batch& batch = open != nullptr ? *open : *inFlight.back();
     batch.completions.push_back(std::move(action));
     ++batch.completionLabelCount;
     completionLabels.fetch_add(1, std::memory_order_acq_rel);
+    if (&batch != open.get()) watchReap(batch);
     GuestMemory::BreakProofs(GuestMemory::ProofBreak::RecordedWork);
     if (&batch == open.get() && activeRecorder == this && pendingLabelSince.load(std::memory_order_relaxed) == NoPendingLabel) {
         pendingLabelSince.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_release);
@@ -5639,8 +5755,10 @@ void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
     // in `finishing` run their own completions in the same finish(), so only open and in-flight
     // ones are scanned.
     const auto count = [&](Batch& batch) {
+        bool counted = false;
         for (auto& label : batch.completionLabelRanges) {
             if (label.counted || label.begin >= end || address >= label.end) continue;
+            counted = true;
             label.counted = true;
             ++batch.completionLabelCount;
             completionLabels.fetch_add(1, std::memory_order_acq_rel);
@@ -5650,9 +5768,12 @@ void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
             completionStores.fetch_add(1, std::memory_order_acq_rel);
             recorder->markBehindCompletion(batch, label.begin, label.end);
         }
+        return counted;
     };
     if (recorder->open != nullptr) count(*recorder->open);
-    for (auto& batch : recorder->inFlight) count(*batch);
+    for (auto& batch : recorder->inFlight) {
+        if (count(*batch)) recorder->watchReap(*batch);
+    }
 }
 
 bool Recorder::writtenBackSince(std::uint64_t sequence, std::uint64_t begin, std::uint64_t end) {
@@ -5798,6 +5919,7 @@ void Recorder::Submit() {
             progressWatcher = std::make_unique<ProgressWatcher>(context.device, timeline, context.Function<PFN_vkWaitSemaphoresKHR>("vkWaitSemaphoresKHR"),
                                                                 context.Function<PFN_vkGetSemaphoreCounterValueKHR>("vkGetSemaphoreCounterValueKHR"));
         }
+        watchReap(*batch);
         progressWatcher->Submitted(batch->serial);
     }
     inFlight.push_back(std::move(batch));
@@ -6328,6 +6450,14 @@ void Recorder::finish(std::unique_ptr<Batch> batch, bool wait, int source, bool 
         }
     }
     if (!batch->completions.empty()) KernelWakeSleepers_nid_no_patch();
+    if (batch->completionLabelCount != 0 && batch->serial != 0 && ReapDelayReported()) {
+        const auto now = SteadyNs();
+        std::optional<std::int64_t> delay;
+        if (progressWatcher != nullptr) {
+            if (const auto reached = progressWatcher->ReachedAt(batch->serial)) delay = now - *reached;
+        }
+        ReapDelaysOf().Note(delay, now);
+    }
     if (profile) holdCounters.completions += batch->completions.size();
     const auto keptStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     // Deferred only from inside a hold: the unlock that releases the list is this thread's own, and

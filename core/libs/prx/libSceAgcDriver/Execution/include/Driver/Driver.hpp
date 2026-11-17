@@ -485,6 +485,7 @@ private:
     static const std::atomic<std::uint64_t>*& workerQueued();
     static std::atomic<std::uint64_t>*& workerPacket();
     void reapCompletionLabels();
+    static void wakeAtFence();
     void run(std::uint32_t id) noexcept;
 
     std::mutex mutex;

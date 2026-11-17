@@ -19,12 +19,37 @@
 #include <cstdlib>
 #include <limits>
 #include <string>
+#include <thread>
 
 namespace AgcDriver::DriverDetail {
 
 namespace {
 
 constexpr auto IdleResultsQuietPeriod = std::chrono::milliseconds(50);
+
+bool ReapOnFence() {
+#ifdef _WIN32
+    return false;
+#else
+    static const bool value = std::getenv("APS5_REAP_ON_FENCE") != nullptr;
+    return value;
+#endif
+}
+
+std::atomic<Driver*> fenceWaker{nullptr};
+std::atomic<std::uint64_t> fenceWakes{0};
+std::atomic<std::uint64_t> fenceWakesSent{0}, reapsAfterFence{0}, reapsAfterFenceEmpty{0}, reapsAfterTimeout{0};
+
+void ReportFenceReaps(std::chrono::steady_clock::time_point now) {
+    static const bool reported = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!reported) return;
+    static std::chrono::steady_clock::time_point last = now;
+    if (now - last < std::chrono::seconds(10)) return;
+    last = now;
+    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
+    AgcDriver::ProfilePrint_nid_no_patch("[reap-on-fence] (10 s): %llu fence wakes sent; queue 0 reaped %llu times after a wake (%llu of them left the pending completion count unchanged or higher) and %llu times after the 1 ms poll timeout\n",
+                                         take(fenceWakesSent), take(reapsAfterFence), take(reapsAfterFenceEmpty), take(reapsAfterTimeout));
+}
 
 std::uint64_t SubmitGroupWork() {
     static const std::uint64_t value = [] {
@@ -298,6 +323,19 @@ void Driver::reapCompletionLabels() {
     if (const auto localDevice = device.Load()) localDevice->ReapRecorded();
 }
 
+void Driver::wakeAtFence() {
+    auto* driver = fenceWaker.load(std::memory_order_acquire);
+    if (driver == nullptr) return;
+    fenceWakes.fetch_add(1, std::memory_order_seq_cst);
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        std::unique_lock lock(driver->mutex, std::try_to_lock);
+        if (lock.owns_lock()) break;
+        std::this_thread::yield();
+    }
+    fenceWakesSent.fetch_add(1, std::memory_order_relaxed);
+    driver->changed.notify_all();
+}
+
 void Driver::run(std::uint32_t id) noexcept {
     onWorkerThread() = true;
     char role[32];
@@ -312,6 +350,12 @@ void Driver::run(std::uint32_t id) noexcept {
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool idleStore = std::getenv("APS5_NO_IDLE_STORE") == nullptr;
+    const bool fenceWake = id == 0 && ReapOnFence();
+    if (fenceWake) {
+        fenceWaker.store(this, std::memory_order_release);
+        Graphics::Recorder::SetReapWake(&Driver::wakeAtFence);
+    }
+    std::uint64_t fenceWakesSeen = 0;
     auto& costs = submissionCosts(id);
     try {
         PerformanceTrace::BindThread(role);
@@ -395,6 +439,24 @@ void Driver::run(std::uint32_t id) noexcept {
                         const auto idleEpochAtWait = idleEpoch.load(std::memory_order_acquire);
                         changed.wait(lock, [&] { return ready() || (id == 0 && (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait || completionsPending())); });
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
+                        continue;
+                    }
+                    if (fenceWake) {
+                        const auto seen = fenceWakesSeen;
+                        const bool woken = changed.wait_for(lock, std::chrono::milliseconds(1), [&] { return ready() || fenceWakes.load(std::memory_order_seq_cst) != seen; });
+                        if (ready()) break;
+                        fenceWakesSeen = fenceWakes.load(std::memory_order_seq_cst);
+                        lock.unlock();
+                        const auto pendingBefore = Graphics::Recorder::PendingCompletionLabels() + Graphics::Recorder::PendingWriteBackCompletions();
+                        reapCompletionLabels();
+                        if (woken) {
+                            reapsAfterFence.fetch_add(1, std::memory_order_relaxed);
+                            if (Graphics::Recorder::PendingCompletionLabels() + Graphics::Recorder::PendingWriteBackCompletions() >= pendingBefore) reapsAfterFenceEmpty.fetch_add(1, std::memory_order_relaxed);
+                        } else {
+                            reapsAfterTimeout.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        ReportFenceReaps(std::chrono::steady_clock::now());
+                        lock.lock();
                         continue;
                     }
                     if (poll(ready)) break;
