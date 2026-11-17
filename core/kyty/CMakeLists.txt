@@ -161,6 +161,10 @@ file(GLOB_RECURSE KYTY_COMMON_SOURCES CONFIGURE_DEPENDS "${KYTY_DIR}/common/*.cp
 list(TRANSFORM KYTY_GPU_EXCEPTIONS PREPEND "${KYTY_DIR}/")
 set_source_files_properties(${KYTY_COMMON_SOURCES} ${KYTY_GPU_EXCEPTIONS} PROPERTIES COMPILE_OPTIONS -fexceptions)
 
+set(KYTY_STB_IMAGE_SOURCE "${KYTY_GENERATED_DIR}/stb_image.c")
+file(CONFIGURE OUTPUT "${KYTY_STB_IMAGE_SOURCE}" CONTENT "#define STB_IMAGE_IMPLEMENTATION\n#include <stb_image.h>\n")
+list(APPEND KYTY_GPU_SOURCES "${KYTY_STB_IMAGE_SOURCE}")
+
 add_library(kyty_gpu STATIC ${KYTY_GPU_SOURCES})
 add_dependencies(kyty_gpu kyty_gpu_shaders)
 target_include_directories(kyty_gpu
