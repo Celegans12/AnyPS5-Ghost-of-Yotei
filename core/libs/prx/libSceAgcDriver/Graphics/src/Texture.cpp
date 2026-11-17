@@ -516,7 +516,23 @@ VkDeviceSize ImageAllocationOverhead(VkDeviceSize bytes) {
     return (granularity - bytes % granularity) % granularity;
 }
 
-Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, bool hostMemory) : context(context) {
+namespace {
+VkMemoryPropertyFlags SnapshotStagingProperties(const Context& context, bool cached) {
+    constexpr VkMemoryPropertyFlags coherent = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+    if (!cached) return coherent;
+    for (std::uint32_t type = 0; type < std::min<std::uint32_t>(context.memory.memoryTypeCount, VK_MAX_MEMORY_TYPES); ++type) {
+        const auto flags = context.memory.memoryTypes[type].propertyFlags;
+        if ((flags & (coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT)) == (coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT) && (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == 0) return coherent | VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
+    }
+    return coherent;
+}
+}
+
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare, bool hostMemory)
+    : Texture(context, detiler, descriptor, components, snapshot.size(), [snapshot](std::span<std::byte> staging) { std::memcpy(staging.data(), snapshot.data(), snapshot.size()); }, depthCompare, hostMemory) {
+}
+
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::size_t snapshotBytes, const std::function<void(std::span<std::byte>)>& fill, bool depthCompare, bool hostMemory, bool cachedStaging) : context(context) {
     const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::SampledTexture);
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -541,7 +557,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         for (const auto& mip : mips) AGC_LOG_DEFERRED(stdout, "  mip %ux%u tiled=0x%llx+0x%llx linear=0x%llx+0x%llx blocksPerRow=%u pitch=%u tail=%d", mip.width, mip.height, static_cast<unsigned long long>(mip.tiledOffset), static_cast<unsigned long long>(mip.tiledSize), static_cast<unsigned long long>(mip.linearOffset), static_cast<unsigned long long>(mip.linearSize), mip.blocksPerRow, mip.pitchBytes, mip.tail ? 1 : 0);
 
         const auto guestBytes = geometry.guestBytes;
-        Require(snapshot.size() == guestBytes, "texture snapshot size mismatch");
+        Require(snapshotBytes == guestBytes, "texture snapshot size mismatch");
         if (geometry.imageLevels < descriptor.mipCount) {
             static std::atomic<int> reported{0};
             if (reported.fetch_add(1, std::memory_order_relaxed) < 8) std::fprintf(stderr, "[texture] 0x%llx (%ux%u, %u layers) names %u mip levels, more than the %u its extent holds: levels %u-%u are not uploaded\n", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, arrayLayers, descriptor.mipCount, geometry.imageLevels, geometry.imageLevels, descriptor.mipCount - 1u);
@@ -653,8 +669,8 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
                 dumpWanted = dumpList.find(address) != std::string::npos || dumpList.find(extent) != std::string::npos;
             }
             const MemoryStats::OwnerScope memStatsOwner(MemoryStats::Owner::TextureUpload);
-            auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(staging->Bytes().data(), snapshot.data(), snapshot.size());
+            auto staging = std::make_shared<Buffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT, SnapshotStagingProperties(context, cachedStaging));
+            fill(staging->Bytes().first(static_cast<std::size_t>(guestBytes)));
             auto tiled = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(guestBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             auto linear = std::make_shared<DeviceBuffer>(context, static_cast<std::size_t>(linearBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
             if (profile) Profile().allocate += timer.lap();

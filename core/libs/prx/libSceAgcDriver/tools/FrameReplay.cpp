@@ -1378,7 +1378,11 @@ int main(int argc, char** argv) {
         const FrameCaptureReader reader(options.directory);
         // A captured range on one of this process's host regions cannot be mapped: start again (a new process gets a
         // new random layout), at most 4 times. Before the watchdog, so a waiting parent is never killed by it.
+#ifdef _WIN32
         auto collisions = HostCollisions(reader, [](std::uint64_t address, std::uint64_t bytes) { return GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes)); });
+#else
+        auto collisions = HostCollisions(reader, [](std::uint64_t address, std::uint64_t bytes) { return GuestArena::GuestArenaOverlapsHostRegion_nid_no_patch(static_cast<std::uintptr_t>(address), static_cast<std::size_t>(bytes)); });
+#endif
         const char* attemptText = std::getenv("APS5_REPLAY_ATTEMPT");
         const int attempt = attemptText != nullptr ? std::atoi(attemptText) : 1;
         // APS5_REPLAY_TEST_COLLISIONS=<n> (tests): starts 1..n report the first captured range as a collision.

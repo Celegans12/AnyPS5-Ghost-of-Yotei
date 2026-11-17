@@ -478,6 +478,33 @@ void AwaitedRegistrationPreparation() {
     Require(fast.load(std::memory_order_acquire), "the later preparation did not run");
 }
 
+void AwaitedBoundPrograms() {
+    constexpr std::uint64_t slowCode = 0x8012340000ull;
+    constexpr std::uint64_t fastCode = 0x8056780000ull;
+    constexpr std::uint64_t codeBytes = 0x400;
+    std::atomic<bool> slow{false};
+    std::atomic<bool> fast{false};
+    AgcDriver::DriverDetail::SubmitRegistrationPreparation([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+        slow.store(true, std::memory_order_release);
+    }, nullptr, slowCode, codeBytes);
+    AgcDriver::DriverDetail::SubmitRegistrationPreparation([&] { fast.store(true, std::memory_order_release); }, nullptr, fastCode, codeBytes);
+    const bool queued = !slow.load(std::memory_order_acquire);
+    Require(!queued || AgcDriver::DriverDetail::RegistrationPreparationPending(), "queued program preparations were not reported as pending");
+    const std::array<std::uint64_t, 1> unbound{fastCode + codeBytes};
+    AgcDriver::DriverDetail::AwaitRegistrationPreparation(unbound);
+    Require(!queued || !slow.load(std::memory_order_acquire), "a submission that binds no pending program waited for the preparation backlog");
+    const std::array<std::uint64_t, 1> boundFast{fastCode + 0x100};
+    AgcDriver::DriverDetail::AwaitRegistrationPreparation(boundFast);
+    Require(fast.load(std::memory_order_acquire), "a submission did not wait for the preparation of a program it binds");
+    Require(!queued || !slow.load(std::memory_order_acquire), "a submission waited for the preparation of a program it does not bind");
+    const std::array<std::uint64_t, 1> boundSlow{(slowCode & ((std::uint64_t{1} << 40u) - 1u)) + codeBytes - 4};
+    AgcDriver::DriverDetail::AwaitRegistrationPreparation(boundSlow);
+    Require(slow.load(std::memory_order_acquire), "a submission did not wait for a program bound through its low address register");
+    AgcDriver::DriverDetail::AwaitRegistrationPreparation();
+    Require(!AgcDriver::DriverDetail::RegistrationPreparationPending(), "finished program preparations were still reported as pending");
+}
+
 void PendingRegistrationPreparation(AgcDriver::VulkanDevice& device) {
     alignas(256) const std::array<std::uint32_t, 1> code{0xbf810000u};
     std::array<std::uint32_t, 4> users{};
@@ -1829,6 +1856,7 @@ int main(int argc, char** argv) {
         FailureCapture(*device, argc == 2 && std::string_view(argv[1]) == "--indirect");
         PendingRegistrationPreparation(*device);
         AwaitedRegistrationPreparation();
+        AwaitedBoundPrograms();
         Require(argc != 2 || std::string_view(argv[1]) != "--fail-before-registration", "injected failure before registration");
         PrepareMultisampledStorage(*device);
         device.reset();

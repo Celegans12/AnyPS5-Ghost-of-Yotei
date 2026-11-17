@@ -461,7 +461,7 @@ private:
     std::atomic<std::uint64_t> packetsDone{0};
 
     std::atomic<std::uint64_t> eventSerial{0};
-    alignas(64) std::shared_ptr<ShaderRegistry> shaders = std::make_shared<ShaderRegistry>();
+    alignas(64) SharedShaderRegistry shaders;
 
     std::unordered_map<std::uint64_t, std::shared_ptr<DispatchEntry>> dispatchCache;
 

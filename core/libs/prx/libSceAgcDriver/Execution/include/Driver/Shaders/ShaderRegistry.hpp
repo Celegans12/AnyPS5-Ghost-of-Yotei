@@ -235,9 +235,24 @@ std::optional<ShaderRecompiler::ShaderFloatMode> DispatchFloatMode(const ShaderS
 std::shared_ptr<const ShaderSnapshot> RegisteredHeader(const ShaderRegistry& registry, const Shader* shader);
 std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& registry, std::uint64_t address, std::initializer_list<std::uint8_t> types);
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot);
-void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared = nullptr);
+
+class SharedShaderRegistry {
+public:
+    const ShaderRegistry* operator->() const { return registry.get(); }
+    const ShaderRegistry& operator*() const { return *registry; }
+    bool operator==(std::nullptr_t) const { return registry == nullptr; }
+    std::shared_ptr<const ShaderRegistry> Share();
+    void Publish(const std::shared_ptr<const ShaderSnapshot>& snapshot);
+
+private:
+    std::shared_ptr<ShaderRegistry> registry = std::make_shared<ShaderRegistry>();
+    bool shared = false;
+};
+void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared = nullptr, std::uint64_t codeBegin = 0, std::uint64_t codeBytes = 0);
 void PrioritizeRegistrationPreparation(PreparedShaders& prepared);
 void AwaitRegistrationPreparation();
+bool RegistrationPreparationPending();
+void AwaitRegistrationPreparation(std::span<const std::uint64_t> programs);
 void SubmitLibraryPrebuild(std::function<void()> task);
 void AwaitLibraryPrebuilds();
 void PrebuildStageLibrary(const std::shared_ptr<VulkanDevice>& device, const Graphics::ShaderStages& stages, ShaderRecompiler::ShaderStage stage, std::shared_ptr<const ShaderRecompiler::RecompileResult> result, std::uint32_t pushOffset);
