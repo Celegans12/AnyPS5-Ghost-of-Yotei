@@ -46,8 +46,9 @@ set(ALLOW_EXTERNAL_SPIRV_TOOLS OFF)
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}/glslang" "${CMAKE_BINARY_DIR}/3rdparty/glslang" EXCLUDE_FROM_ALL)
 
 set(KYTY_FLAGS "-fno-rtti -fno-exceptions -fcolor-diagnostics -finput-charset=UTF-8 -fexec-charset=UTF-8 -g -fno-strict-aliasing -fno-omit-frame-pointer -Wall -fmessage-length=0 -march=x86-64-v3 -ffp-contract=off")
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${KYTY_FLAGS}")
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${KYTY_FLAGS}")
+set(KYTY_SHARED_LIBRARY_FLAGS "-mtls-dialect=gnu2")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${KYTY_FLAGS} ${KYTY_SHARED_LIBRARY_FLAGS}")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${KYTY_FLAGS} ${KYTY_SHARED_LIBRARY_FLAGS}")
 
 set(FMT_DOC OFF)
 set(FMT_INSTALL OFF)
@@ -210,8 +211,10 @@ if(KYTY_THIN_LTO)
     set_target_properties(kyty_gpu PROPERTIES OUTPUT_NAME kyty_gpu_bitcode)
     string(TOUPPER "${CMAKE_BUILD_TYPE}" kytyConfig)
     separate_arguments(kytyPrelinkFlags UNIX_COMMAND "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${kytyConfig}}")
+    string(SHA256 kytyPrelinkKey "${CMAKE_CXX_COMPILER};${CMAKE_CXX_COMPILER_VERSION};${kytyPrelinkFlags}")
+    string(SUBSTRING "${kytyPrelinkKey}" 0 16 kytyPrelinkKey)
     set(kytyPrelinkOptions -flto=thin -fuse-ld=lld -nostdlib -r
-        "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache"
+        "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache/${kytyPrelinkKey}"
         "-Wl,--thinlto-cache-policy=prune_after=72h:cache_size_bytes=8g")
     if(NOT KYTY_THIN_LTO_JOBS STREQUAL "0")
         list(APPEND kytyPrelinkOptions "-Wl,--thinlto-jobs=${KYTY_THIN_LTO_JOBS}")
