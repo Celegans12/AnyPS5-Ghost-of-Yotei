@@ -182,15 +182,15 @@ void StopGpu() {
         return;
     }
     std::exception_ptr failure;
-    auto thread = Libc::StartHostThread([&failure] {
+    auto* renderer = s.renderer.load(std::memory_order_acquire);
+    auto thread = Libc::StartHostThread([&failure, renderer] {
         try {
-            Libs::Graphics::Shutdown();
+            renderer->ShutdownGpu();
         } catch (...) {
             failure = std::current_exception();
         }
     });
     thread.join();
-    s.renderer.store(nullptr, std::memory_order_release);
     if (failure) std::rethrow_exception(failure);
 }
 
