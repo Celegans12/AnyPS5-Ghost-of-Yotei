@@ -69,6 +69,26 @@ glslang (with the optimizer, for `glslangValidator -Os` on upstream's utility sh
 target that links the resulting archives into AnyPS5. `core/kyty/KytyGpuSources.cmake` lists the imported sources left
 out of `kyty_gpu`, and `core/kyty/tools/kyty_frontier.py` lists the symbols `kyty_gpu` still needs from the shim.
 
+### Windows
+
+On Windows AnyPS5 is built with MinGW-w64 GCC and `kyty_gpu` with the `clang` and `clang++` of an LLVM release found on
+`PATH`, for the `x86_64-w64-windows-gnu` target, with `--sysroot` set to the MinGW-w64 installation of that GCC
+(`ANYPS5_KYTY_SYSROOT`). Three options make its objects link with GCC's: `-femulated-tls` (GCC's thread-local storage
+model on MinGW, which libstdc++ uses), `-fno-zero-initialized-in-bss` (GCC puts every inline variable in a `.data$`
+section, and GNU ld only merges sections of one name) and `-mno-red-zone`. The shim is compiled with
+`-fno-extern-tls-init`, and `MemoryTracker::s_deferred` is declared without `inline` for GCC there, because GCC on
+MinGW emits the initialisation function of an inline `thread_local` variable once per translation unit. ThinLTO is off:
+lld cannot pre-link COFF objects with `-r`. `pipelineHelpers.cpp` is compiled with `-fexceptions`, as its Windows part
+uses `try`.
+
+The second view of guest memory (`DirectMemoryEnableView`) is a reserved range. Anonymous guest memory in the arena is
+mapped from pagefile-backed sections of 1 GiB, each created and mapped into the view when memory is first committed in
+its range, and each direct memory backing is mapped at its physical offset after the guest range. A section page cannot
+be given back to the system, so a page that held data is zeroed when it is unmapped and stays committed. Access
+violations reach `KytyShim::HandleHostFault` from libc's vectored exception handler through
+`GuestArenaSetGpuFaultHandler`. KytyPS5's pipeline helper processes are not used (`PipelineHelperProcesses` returns 0):
+a helper is the executable started again with `--pipeline-helper`, and here the executable is the converted title.
+
 ## Third-party code
 
 The dependencies of `graphics/` and `common/` that AnyPS5 did not have are submodules at the revisions Kyty

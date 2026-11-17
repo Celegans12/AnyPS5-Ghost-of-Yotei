@@ -132,7 +132,11 @@ void GuestArenaSetHostReadHook_nid_no_patch(void (*hook)(std::uintptr_t address,
 void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t bytes);
 #if defined(ANYPS5_KYTY)
 void GuestArenaSetHostWritePreparer_nid_no_patch(bool (*prepare)(std::uintptr_t address, std::size_t bytes));
-#ifndef _WIN32
+#ifdef _WIN32
+void GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(void* exceptionPointers));
+bool GuestArenaHandleGpuFault_nid_no_patch(void* exceptionPointers);
+#endif
+#if defined(ANYPS5_KYTY)
 void GuestArenaNoteHostProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool writable);
 bool GuestArenaMayBeHostProtected_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaSetHostWriteFilter_nid_no_patch(bool (*filter)(std::uintptr_t address, std::size_t bytes));

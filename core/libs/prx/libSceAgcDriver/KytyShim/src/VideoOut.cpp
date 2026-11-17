@@ -21,7 +21,11 @@
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <dlfcn.h>
+#endif
 
 #include <atomic>
 #include <chrono>
@@ -155,11 +159,19 @@ void WaitRunningUrgentCommands(std::function<void()> blocking) {
 }
 
 PFN_vkGetInstanceProcAddr LoadVulkanLoader() {
+#ifdef _WIN32
+    static const HMODULE library = LoadLibraryW(L"vulkan-1.dll");
+    if (library == nullptr) EXIT("kyty presentation: cannot load vulkan-1.dll: error %lu\n", static_cast<unsigned long>(GetLastError()));
+    const auto proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(reinterpret_cast<void*>(GetProcAddress(library, "vkGetInstanceProcAddr")));
+    if (proc == nullptr) EXIT("kyty presentation: vulkan-1.dll has no vkGetInstanceProcAddr\n");
+    return proc;
+#else
     static void* const library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
     if (library == nullptr) EXIT("kyty presentation: cannot load libvulkan.so.1: %s\n", dlerror());
     const auto proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr"));
     if (proc == nullptr) EXIT("kyty presentation: libvulkan.so.1 has no vkGetInstanceProcAddr\n");
     return proc;
+#endif
 }
 
 std::vector<const char*> SurfaceInstanceExtensions(PFN_vkGetInstanceProcAddr proc) {
@@ -170,7 +182,11 @@ std::vector<const char*> SurfaceInstanceExtensions(PFN_vkGetInstanceProcAddr pro
     std::vector<VkExtensionProperties> available(count);
     if (enumerate(nullptr, &count, available.data()) != VK_SUCCESS) EXIT("kyty presentation: cannot list the Vulkan instance extensions\n");
     available.resize(count);
+#ifdef _WIN32
+    static constexpr const char* Candidates[] = {VK_KHR_SURFACE_EXTENSION_NAME, "VK_KHR_win32_surface"};
+#else
     static constexpr const char* Candidates[] = {VK_KHR_SURFACE_EXTENSION_NAME, "VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface"};
+#endif
     std::vector<const char*> enabled;
     for (const char* name : Candidates) {
         for (const auto& extension : available) {
@@ -180,7 +196,7 @@ std::vector<const char*> SurfaceInstanceExtensions(PFN_vkGetInstanceProcAddr pro
             }
         }
     }
-    if (enabled.empty() || enabled.front() != Candidates[0] || enabled.size() == 1) EXIT("kyty presentation: the Vulkan loader offers no window surface extension (xlib, xcb or wayland)\n");
+    if (enabled.empty() || enabled.front() != Candidates[0] || enabled.size() == 1) EXIT("kyty presentation: the Vulkan loader offers no window surface extension (win32 on Windows; xlib, xcb or wayland on Linux)\n");
     return enabled;
 }
 

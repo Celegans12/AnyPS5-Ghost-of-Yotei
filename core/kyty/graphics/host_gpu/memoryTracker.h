@@ -355,7 +355,11 @@ private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
 
 	inline static thread_local bool                         s_upload_takes_protections = false;
+#if defined(ANYPS5_KYTY) && defined(_WIN32) && !defined(__clang__)
+	static thread_local std::vector<DeferredProtect> s_deferred;
+#else
 	inline static thread_local std::vector<DeferredProtect> s_deferred;
+#endif
 	[[nodiscard]] static bool DeferProtections() noexcept { return s_upload_takes_protections && AsyncReprotect(); }
 	struct DeferScope {
 		RegionManager*                          manager = nullptr;
