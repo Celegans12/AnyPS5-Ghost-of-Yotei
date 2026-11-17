@@ -8,6 +8,7 @@ set(KYTY_GPU_EXCLUDED
     graphics/host_gpu/renderer/upscaler/dlss.cpp
     graphics/host_gpu/renderer/upscaler/fsr.cpp
     graphics/presentation/ddsImage.cpp
+    graphics/presentation/frameStepHack.cpp
     graphics/presentation/openxrHeadset.cpp
     graphics/presentation/performanceOverlay.cpp
     graphics/presentation/precompileNotice.cpp
