@@ -1,3 +1,4 @@
+#if !defined(ANYPS5_KYTY)
 #include "graphics/presentation/openxrHeadset.h"
 
 #include "common/emulatorConfig.h"
@@ -745,3 +746,4 @@ void OpenXrQueueEyeSource(CommandBuffer& command, const VulkanImage& source) {
 }
 
 }
+#endif

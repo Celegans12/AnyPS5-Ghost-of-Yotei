@@ -50,6 +50,22 @@ add_library(libSceAgcVsh SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/../libSceAgc/Shader/src/ShaderUtils.cpp
 )
 
+if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
+    get_target_property(libSceAgcVshSources libSceAgcVsh SOURCES)
+    list(REMOVE_ITEM libSceAgcVshSources
+            ${CMAKE_CURRENT_SOURCE_DIR}/../libSceAgc/Misc/src/ShaderFusion.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../libSceAgc/Shader/src/PrimState.cpp
+    )
+    set_target_properties(libSceAgcVsh PROPERTIES SOURCES "${libSceAgcVshSources}")
+    target_sources(libSceAgcVsh PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../libSceAgc/Kyty/src/InterpolantMapping.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../libSceAgc/Kyty/src/PrimState.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../libSceAgc/Kyty/src/RegisterDefaults.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../libSceAgc/Kyty/src/ShaderFusion.cpp
+    )
+    target_compile_definitions(libSceAgcVsh PRIVATE ANYPS5_KYTY=1)
+endif()
+
 target_include_directories(libSceAgcVsh PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(libSceAgcVsh PRIVATE libSceAgcDriver libc)
 

@@ -38,6 +38,9 @@ public:
 	void                         Present(std::span<const Layer> layers);
 	void                         ClearLayer(int bus);
 	void                         Discard(Frame& frame);
+#if defined(ANYPS5_KYTY)
+	void AttachSurface();
+#endif
 
 private:
 	struct Impl;

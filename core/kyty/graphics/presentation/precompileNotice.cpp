@@ -1,3 +1,4 @@
+#if !defined(ANYPS5_KYTY)
 #include "graphics/presentation/precompileNotice.h"
 
 #include "imgui.h"
@@ -342,3 +343,4 @@ void DrawPrecompileNotice(vk::Extent2D extent) {
 }
 
 }
+#endif

@@ -14,8 +14,6 @@ set(KYTY_GPU_EXCLUDED
     graphics/presentation/renderDoc.cpp
     graphics/presentation/systemOverlay.cpp
     graphics/presentation/window/hostInput.cpp
-    graphics/presentation/window/swapchain.cpp
-    graphics/presentation/window/vulkanWindow.cpp
     graphics/presentation/window/window.cpp
 )
 set(KYTY_GPU_EXCEPTIONS

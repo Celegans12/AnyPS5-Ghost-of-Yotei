@@ -1,3 +1,4 @@
+#if !defined(ANYPS5_KYTY)
 #include "graphics/presentation/ddsImage.h"
 
 #include "common/assert.h"
@@ -135,3 +136,4 @@ ImTextureRef DdsImage::Texture() const {
 }
 
 }
+#endif

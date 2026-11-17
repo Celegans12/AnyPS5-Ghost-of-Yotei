@@ -287,6 +287,11 @@ struct Presenter::Impl {
 	explicit Impl(WindowContext& owner)
 	    : renderer(*owner.render_context), window(owner), swapchain(owner),
 	      present_scheduler(renderer, owner.graphic_ctx), frames(owner, present_scheduler) {
+#if defined(ANYPS5_KYTY)
+		if (owner.surface == nullptr) {
+			return;
+		}
+#endif
 		swapchain.Create();
 		frames.Initialize(swapchain.ImageCount(), swapchain.Format());
 	}
@@ -918,6 +923,15 @@ Swapchain::Status Swapchain::Present() {
 Presenter::Presenter(WindowContext& window): m_impl(std::make_unique<Impl>(window)) {}
 
 Presenter::~Presenter() = default;
+
+#if defined(ANYPS5_KYTY)
+void Presenter::AttachSurface() {
+	Common::LockGuard lock(m_impl->present_mutex);
+	EXIT_IF(m_impl->window.surface == nullptr || m_impl->swapchain.ImageCount() != 0);
+	m_impl->swapchain.Create();
+	m_impl->frames.Initialize(m_impl->swapchain.ImageCount(), m_impl->swapchain.Format());
+}
+#endif
 
 Presenter::Frame& Presenter::PrepareFrame(CommandBuffer& buffer, const ImageInfo& info, bool hdr,
                                           bool headset) {

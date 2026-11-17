@@ -1,4 +1,5 @@
-﻿#include "graphics/presentation/window.h"
+﻿#if !defined(ANYPS5_KYTY)
+#include "graphics/presentation/window.h"
 
 #include "common/assert.h"
 #include "common/common.h"
@@ -980,3 +981,4 @@ void WindowContext::UpdateTitle(uint64_t frame_num, uint64_t host_frames, double
 }
 
 }
+#endif

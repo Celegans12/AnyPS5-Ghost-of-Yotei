@@ -1,7 +1,13 @@
 #ifndef EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_WINDOWINTERNAL_H_
 #define EMULATOR_SRC_GRAPHICS_PRESENTATION_WINDOW_WINDOWINTERNAL_H_
 
+#if defined(ANYPS5_KYTY)
+struct SDL_Window;
+struct SDL_WindowEvent;
+struct SDL_DisplayEvent;
+#else
 #include <SDL3/SDL.h>
+#endif
 
 #include "common/threads.h"
 #include "graphics/host_gpu/graphicContext.h"
@@ -24,7 +30,9 @@ struct SurfaceCapabilities {
 };
 
 struct WindowLoopState {
+#if !defined(ANYPS5_KYTY)
 	SDL_Event             event {};
+#endif
 	bool                  need_exit = false;
 	std::atomic<uint64_t> presented_frames {0};
 };
@@ -58,6 +66,12 @@ struct WindowContext {
 	WindowLoopState                loop;
 
 	Common::Mutex mutex;
+#if defined(ANYPS5_KYTY)
+	PFN_vkGetInstanceProcAddr host_get_instance_proc_addr = nullptr;
+	std::vector<const char*>  host_extensions;
+	void*                     host_context = nullptr;
+	VkSurfaceKHR (*host_create_surface)(void* context, VkInstance instance) = nullptr;
+#endif
 };
 
 }
