@@ -224,6 +224,39 @@ void TestReleaseWhileMapped() {
     std::printf("direct memory released while mapped at 0x%llx and 0x%llx: GPU unmap seen first with the backing, then no second view and not mapped\n", static_cast<unsigned long long>(Address(surface)), static_cast<unsigned long long>(Address(metadata)));
 }
 
+bool MayBeHostProtected(std::uint64_t address, std::size_t bytes) {
+    return GuestArena::GuestArenaMayBeHostProtected_nid_no_patch(address, bytes);
+}
+
+void TestHostProtectionTable() {
+    void* flexible = nullptr;
+    Require(sceKernelMapFlexibleMemory(&flexible, Page * 4, CpuReadWrite, 0) == 0 && flexible != nullptr);
+    const auto address = Address(flexible);
+    Require(Memory::ProtectGuestHostMemory(address, Page * 4, Common::VirtualMemory::Mode::Read));
+    Require(MayBeHostProtected(address, 1) && MayBeHostProtected(address + Page * 4 - 1, 1));
+    Require(Memory::ProtectGuestHostMemory(address, Page * 2, Common::VirtualMemory::Mode::ReadWrite));
+    Require(!MayBeHostProtected(address, Page * 2));
+    Require(MayBeHostProtected(address + Page * 2, Page * 2));
+
+    void* replaced = flexible;
+    Require(sceKernelMapFlexibleMemory(&replaced, Page * 4, CpuReadWrite, MapFixed) == 0 && replaced == flexible);
+    Require(!MayBeHostProtected(address, Page * 4));
+
+    Require(Memory::ProtectGuestHostMemory(address + Page, Page, Common::VirtualMemory::Mode::NoAccess));
+    Require(MayBeHostProtected(address + Page, Page) && !MayBeHostProtected(address, Page) && !MayBeHostProtected(address + Page * 2, Page * 2));
+    Require(sceKernelMunmap(address, Page * 4) == 0);
+    Require(!MayBeHostProtected(address, Page * 4));
+
+    void* hole = GuestArena::GuestArenaAllocate_nid_postfix(Page, Page);
+    Require(hole != nullptr);
+    Require(Memory::ProtectGuestHostMemory(Address(hole), Page, Common::VirtualMemory::Mode::Read));
+    Require(MayBeHostProtected(Address(hole), Page));
+    Require(Memory::ProtectGuestHostMemory(Address(hole), Page, Common::VirtualMemory::Mode::ReadWrite));
+    Require(!MayBeHostProtected(Address(hole), Page));
+    GuestArena::GuestArenaRelease_nid_postfix(hole, Page);
+    std::printf("host protection table 0x%llx: noted before write access goes, cleared when it returns, on MAP_FIXED replacement and on unmap\n", static_cast<unsigned long long>(address));
+}
+
 void TestRuntimeMemory() {
     const auto address = Memory::AllocateRuntimeMemory(0, Page * 2, Common::VirtualMemory::Mode::ReadWrite, "kyty shim test");
     Require(address != 0 && Memory::IsBackingReadable(address, Page * 2));
@@ -404,6 +437,7 @@ int main() {
     TestDirect();
     TestGpuHooks();
     TestReleaseWhileMapped();
+    TestHostProtectionTable();
     TestRuntimeMemory();
     TestUnreportedPrivateMemory();
     TestNoCrossWaitWithGpuThread();
