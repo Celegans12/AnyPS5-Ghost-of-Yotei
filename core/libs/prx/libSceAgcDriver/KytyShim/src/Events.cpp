@@ -1,7 +1,6 @@
 #include "prx/libSceAgcDriver/KytyShim/src/Runtime.hpp"
 
 #include "common/assert.h"
-#include "graphics/host_gpu/renderer/renderContext.h"
 #include "kernel/eventQueue.h"
 #include "libs/errno.h"
 
@@ -131,15 +130,6 @@ int KYTY_SYSV_ABI KernelTriggerEvent(KernelEqueue eq, uintptr_t ident, int16_t f
 int KYTY_SYSV_ABI KernelDeleteEvent(KernelEqueue eq, uintptr_t ident, int16_t filter) {
     if (eq == KytyShim::InterruptRoute) EXIT("KytyShim: event %llu deleted from the GPU interrupt route, which is never deleted\n", static_cast<unsigned long long>(ident));
     return EqueueDeleteEvent_nid_postfix(eq, ident, filter);
-}
-
-}
-
-namespace KytyShim {
-
-void RouteInterrupts(Libs::Graphics::RenderContext& renderer) {
-    renderer.AddInterruptEq(InterruptRoute, GraphicsInterruptEvent);
-    for (int event = FirstComputeInterruptEvent; event < FirstComputeInterruptEvent + ComputeInterruptEvents; ++event) renderer.AddInterruptEq(InterruptRoute, event);
 }
 
 }

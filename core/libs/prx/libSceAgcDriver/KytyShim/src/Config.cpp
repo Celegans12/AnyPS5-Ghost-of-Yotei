@@ -4,6 +4,7 @@
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
 #include "common/threads.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <magic_enum.hpp>
 
@@ -171,6 +172,11 @@ void StartRuntime() {
         Log::Initialize();
         std::fprintf(stderr, "[kyty] runtime started, settings: %s\n", applied.empty() ? "Kyty's defaults" : applied.c_str());
     });
+}
+
+void RouteInterrupts(Libs::Graphics::RenderContext& renderer) {
+    renderer.AddInterruptEq(InterruptRoute, GraphicsInterruptEvent);
+    for (int event = FirstComputeInterruptEvent; event < FirstComputeInterruptEvent + ComputeInterruptEvents; ++event) renderer.AddInterruptEq(InterruptRoute, event);
 }
 
 }
