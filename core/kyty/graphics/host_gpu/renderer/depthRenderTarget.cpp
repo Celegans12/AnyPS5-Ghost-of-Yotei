@@ -1,0 +1,550 @@
+#include "graphics/host_gpu/renderer/depthRenderTarget.h"
+
+#include "common/assert.h"
+#include "common/common.h"
+#include "common/logging/log.h"
+#include "common/profiler.h"
+#include "common/stringUtils.h"
+#include "common/threads.h"
+#include "graphics/guest_gpu/gpu_defs.h"
+#include "graphics/guest_gpu/hardwareContext.h"
+#include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/debug.h"
+#include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/host_gpu/vulkanCommon.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cmath>
+#include <cstdarg>
+#include <cstdio>
+#include <cstring>
+#include <limits>
+#include <string>
+
+namespace Libs::Graphics {
+
+[[noreturn]] static void DepthFatal(const char* format, ...) {
+	char    text[1024];
+	va_list args;
+	va_start(args, format);
+	std::vsnprintf(text, sizeof(text), format, args);
+	va_end(args);
+	std::fprintf(stderr, "Depth target fatal: %s\n", text);
+	std::fflush(stderr);
+	Log::WriteToSessionLog(std::string("Depth target fatal: ") + text + "\n");
+	EXIT("unsupported render state; details were printed above\n");
+}
+
+static vk::StencilOp ConvertStencilOp(uint8_t value, uint8_t write_mask, uint8_t op_value) {
+	if (write_mask == 0) {
+		return vk::StencilOp::eKeep;
+	}
+	switch (static_cast<Prospero::StencilOp>(value)) {
+		case Prospero::StencilOp::kKeep: return vk::StencilOp::eKeep;
+		case Prospero::StencilOp::kZero: return vk::StencilOp::eZero;
+		case Prospero::StencilOp::kReplaceTest: return vk::StencilOp::eReplace;
+		case Prospero::StencilOp::kReplaceOp:
+			if ((op_value & write_mask) == 0) {
+				return vk::StencilOp::eZero;
+			}
+			return vk::StencilOp::eReplace;
+		case Prospero::StencilOp::kAddClamp: return vk::StencilOp::eIncrementAndClamp;
+		case Prospero::StencilOp::kSubClamp: return vk::StencilOp::eDecrementAndClamp;
+		case Prospero::StencilOp::kInvert: return vk::StencilOp::eInvert;
+		case Prospero::StencilOp::kAddWrap: return vk::StencilOp::eIncrementAndWrap;
+		case Prospero::StencilOp::kSubWrap: return vk::StencilOp::eDecrementAndWrap;
+		case Prospero::StencilOp::kXor:
+			if ((write_mask & op_value) == 0) {
+				return vk::StencilOp::eKeep;
+			}
+			if ((write_mask & ~op_value) != 0) {
+				DepthFatal("unsupported stencil XOR operands: write mask=0x%02" PRIx8
+				           ", operation value=0x%02" PRIx8,
+				           write_mask, op_value);
+			}
+			return vk::StencilOp::eInvert;
+		default: DepthFatal("unsupported stencil operation: 0x%02" PRIx8, value);
+	}
+}
+
+static vk::StencilOpState ConvertStencilState(
+    uint8_t compare, const std::array<uint8_t, 3>& operations, uint8_t op_value,
+    const vk::StencilOpState& state) {
+	const auto test_value = state.reference;
+	auto reference       = test_value;
+	auto required_bits   = state.compareMask;
+	if (compare == static_cast<uint8_t>(vk::CompareOp::eAlways) ||
+	    compare == static_cast<uint8_t>(vk::CompareOp::eNever)) {
+		required_bits = 0;
+	}
+	std::array<vk::StencilOp, 3> converted {};
+	for (size_t i = 0; i < operations.size(); i++) {
+		converted[i] = ConvertStencilOp(operations[i], state.writeMask, op_value);
+		if (converted[i] != vk::StencilOp::eReplace) {
+			continue;
+		}
+		auto replacement = test_value;
+		if (static_cast<Prospero::StencilOp>(operations[i]) == Prospero::StencilOp::kReplaceOp) {
+			replacement = op_value;
+		}
+		if (((reference ^ replacement) & required_bits & state.writeMask) != 0) {
+			DepthFatal("unsupported stencil replacement: compare=%u, compare mask=0x%02" PRIx32
+			           ", write mask=0x%02" PRIx32 ", operation value=0x%02" PRIx8
+			           ", test value=0x%02" PRIx32,
+			           compare, state.compareMask, state.writeMask, op_value, test_value);
+		}
+		reference = (reference & ~state.writeMask) | (replacement & state.writeMask);
+		required_bits |= state.writeMask;
+	}
+	return {converted[0], converted[1], converted[2], static_cast<vk::CompareOp>(compare),
+	        state.compareMask, state.writeMask, reference};
+}
+
+[[nodiscard]] static vk::Format ResolveHostDepthAttachmentFormat(const CommandBuffer&     buffer,
+                                                                 const DepthFormatPolicy& policy,
+                                                                 bool     has_stencil,
+                                                                 uint32_t samples) {
+	auto&      graphics         = buffer.GetGraphics();
+	const auto required_samples = vulkan_sample_count(samples);
+	const auto supports         = [&](vk::Format format) {
+		vk::ImageFormatProperties properties {};
+		return format != vk::Format::eUndefined &&
+		       graphics.GetImageFormatProperties(
+		           format, vk::ImageType::e2D, vk::ImageTiling::eOptimal, DepthTargetImageUsage(),
+		           vk::ImageCreateFlags {}, &properties) == vk::Result::eSuccess &&
+		       static_cast<bool>(properties.sampleCounts & required_samples);
+	};
+	if (!has_stencil) {
+		return supports(policy.depth_attachment_format) ? policy.depth_attachment_format
+		                                                : vk::Format::eUndefined;
+	}
+	for (const auto format: policy.stencil_attachment_formats) {
+		if (supports(format)) {
+			return format;
+		}
+	}
+	return vk::Format::eUndefined;
+}
+
+static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
+                                                  const HW::DepthRenderTarget& z,
+                                                  bool write_buffer = false) {
+	const bool has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	const auto depth_address = write_buffer ? z.z_write_base_addr : z.z_read_base_addr;
+	const auto stencil_address =
+	    write_buffer ? z.stencil_write_base_addr : z.stencil_read_base_addr;
+	if (!z.z_info.HasValidTextureCompatibility() ||
+	    !z.stencil_info.HasValidTextureCompatibility()) {
+		DepthFatal("invalid PS5 depth texture-compatibility encoding");
+	}
+	const bool has_htile = z.z_info.htile_acceleration;
+	const bool unsupported_shading_rate_encoding =
+	    z.shading_rate_encoding > 1 || (z.shading_rate_encoding != 0 && !has_htile);
+	const auto samples   = render_sample_count(z.z_info.num_samples);
+	if (samples == 0) {
+		DepthFatal("unsupported depth fragment count: %u", z.z_info.num_samples);
+	}
+	if (z.depth_view.slice_start > z.depth_view.slice_max) {
+		DepthFatal("invalid depth view: base=%u last=%u", z.depth_view.slice_start,
+		           z.depth_view.slice_max);
+	}
+	const auto view = ResolveTargetViewInfo(z.depth_view.slice_start, z.depth_view.slice_max);
+	if (z.z_info.format == Prospero::DepthFormat::kInvalid) {
+		DepthFatal("unsupported target without a Z buffer (stencil only): stencil_format=%u "
+		           "stencil_read=0x%016" PRIx64 " stencil_write=0x%016" PRIx64
+		           " extent=%ux%u slices=%u..%u htile=%d",
+		           static_cast<uint32_t>(z.stencil_info.format), z.stencil_read_base_addr,
+		           z.stencil_write_base_addr, z.size.x_max + 1u, z.size.y_max + 1u,
+		           z.depth_view.slice_start, z.depth_view.slice_max, has_htile);
+	}
+	if (z.z_info.max_mip_level != 0 || unsupported_shading_rate_encoding || depth_address == 0 ||
+	    (depth_address & 0xffffu) != 0) {
+		DepthFatal("unsupported depth register state:%s%s%s%s format=%u samples=%u "
+		           "max_mip=%u mip=%u slices=%u..%u extent=%ux%u htile=%d expclear=%d "
+		           "shading_rate=%u %s=0x%016" PRIx64 " z_read=0x%016" PRIx64
+		           " z_write=0x%016" PRIx64 " stencil_format=%u",
+		           z.z_info.max_mip_level != 0 ? " mip chain" : "",
+		           unsupported_shading_rate_encoding ? " shading rate encoding" : "",
+		           depth_address == 0 ? " no depth address" : "",
+		           depth_address != 0 && (depth_address & 0xffffu) != 0
+		               ? " depth address not 64 KiB aligned"
+		               : "",
+		           static_cast<uint32_t>(z.z_info.format), z.z_info.num_samples,
+		           z.z_info.max_mip_level, z.depth_view.current_mip_level,
+		           z.depth_view.slice_start, z.depth_view.slice_max, z.size.x_max + 1u,
+		           z.size.y_max + 1u, has_htile, z.z_info.expclear_enabled,
+		           z.shading_rate_encoding, write_buffer ? "write" : "read", depth_address,
+		           z.z_read_base_addr, z.z_write_base_addr,
+		           static_cast<uint32_t>(z.stencil_info.format));
+	}
+	if (has_stencil) {
+		if (z.stencil_info.format != Prospero::StencilFormat::k8UInt || stencil_address == 0 ||
+		    (stencil_address & 0xffffu) != 0) {
+			DepthFatal("unsupported stencil attachment state");
+		}
+	} else if (z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0) {
+		DepthFatal("stencil state without an active stencil attachment");
+	}
+	if (has_htile) {
+		if (z.htile_data_base_addr == 0 || (z.htile_data_base_addr & 0x7fffu) != 0) {
+			DepthFatal("invalid HTile metadata address");
+		}
+	}
+	if (!z.size.valid) {
+		DepthFatal("missing depth extent");
+	}
+	const auto     mip    = z.depth_view.current_mip_level;
+	const uint32_t width  = std::max((static_cast<uint32_t>(z.size.x_max) + 1u) >> mip, 1u);
+	const uint32_t height = std::max((static_cast<uint32_t>(z.size.y_max) + 1u) >> mip, 1u);
+	if (width > 16384 || height > 16384) {
+		DepthFatal("invalid depth extent");
+	}
+	const auto* policy = FindDepthFormatPolicy(z.z_info.format);
+	if (policy == nullptr) {
+		DepthFatal("unsupported depth/stencil format pair");
+	}
+	const auto ideal_format = DepthAttachmentFormat(*policy, has_stencil);
+	const auto format = ResolveHostDepthAttachmentFormat(buffer, *policy, has_stencil, samples);
+	if (format == vk::Format::eUndefined) {
+		DepthFatal("no host depth/stencil format supports required usage for %s",
+		           vk::to_string(ideal_format).c_str());
+	}
+	const auto     guest_format = policy->guest_format;
+	const uint32_t bytes        = policy->bytes_per_element;
+	const auto     pitch        = TileGetRenderTargetPitch(width, bytes, z.z_info.num_samples);
+	TileSizeAlign depth_size {};
+	TileSizeAlign stencil_size {};
+	TileSizeAlign htile_size {};
+	if (!TileGetDepthSize(width, height, z.z_info.format, z.stencil_info.format, has_htile,
+	                      stencil_size, htile_size, depth_size, z.z_info.num_samples) ||
+	    depth_size.align != 65536 || depth_size.size == 0 ||
+	    (has_stencil != (stencil_size.align == 65536 && stencil_size.size != 0)) ||
+	    (has_htile != (htile_size.align == 32768 && htile_size.size != 0))) {
+		DepthFatal("unsupported depth/stencil/HTile footprint");
+	}
+	if (depth_size.size > UINT64_MAX / view.image_layers ||
+	    stencil_size.size > UINT64_MAX / view.image_layers ||
+	    htile_size.size > UINT64_MAX / view.image_layers) {
+		DepthFatal("layered depth footprint overflow");
+	}
+	const auto depth_backing_size   = depth_size.size * view.image_layers;
+	const auto stencil_backing_size = stencil_size.size * view.image_layers;
+	const auto htile_backing_size   = htile_size.size * view.image_layers;
+	if (!GuestRange {depth_address, depth_backing_size}.Valid() ||
+	    (has_stencil && !GuestRange {stencil_address, stencil_backing_size}.Valid()) ||
+	    (has_htile && !GuestRange {z.htile_data_base_addr, htile_backing_size}.Valid())) {
+		DepthFatal("layered depth backing range is invalid");
+	}
+	TextureCache::ImageDesc desc {};
+	desc.type                 = TextureCache::BindingType::DepthTarget;
+	desc.info.data            = {depth_address, depth_backing_size};
+	desc.info.stencil =
+	    has_stencil ? GuestRange {stencil_address, stencil_backing_size} : GuestRange {};
+	desc.info.pixel_format    = format;
+	desc.info.guest_format    = guest_format;
+	desc.info.type            = Prospero::ImageType::kColor2D;
+	desc.info.extent          = {width, height, 1};
+	desc.info.resources       = {1, view.image_layers};
+	desc.info.pitch           = pitch;
+	desc.info.bytes_per_block = bytes;
+	desc.info.samples         = samples;
+	desc.info.tile_mode       = Prospero::TileMode::kDepth;
+	desc.info.UpdateSize();
+	desc.info.metadata.range =
+	    has_htile ? GuestRange {z.htile_data_base_addr, htile_backing_size} : GuestRange {};
+	desc.info.metadata.kind   = has_htile ? ImageMetadataKind::Htile : ImageMetadataKind::None;
+	desc.info.metadata.stencil_compressed =
+	    has_stencil && has_htile && !z.stencil_info.htile_stencil_disabled;
+	desc.view_info.format = format;
+	desc.view_info.type =
+	    view.layer_count == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	desc.view_info.aspect      = ImageViewOps::DepthAspectMask(format);
+	desc.view_info.base_level  = 0;
+	desc.view_info.level_count = 1;
+	desc.view_info.base_layer  = view.base_layer;
+	desc.view_info.layer_count = view.layer_count;
+	desc.view_info.usage       = vk::ImageUsageFlagBits::eDepthStencilAttachment;
+	return desc;
+}
+
+struct RenderExecutor::DepthTargetMemo {
+	struct Entry {
+		HW::DepthRenderTarget   registers {};
+		TextureCache::ImageDesc desc;
+		bool                    valid = false;
+	};
+	static constexpr uint32_t Ways = 2;
+	std::array<Entry, Ways>   entries {};
+	uint32_t                  next = 0;
+};
+
+bool DepthStencilTargetWanted(const HW::Context& hw) {
+	const auto& z           = hw.GetDepthRenderTarget();
+	const auto& rc          = hw.GetRenderControl();
+	const auto& dc          = hw.GetDepthControl();
+	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	const bool  depth_active =
+	    dc.z_enable || dc.depth_bounds_enable || rc.depth_clear_enable || rc.copy_depth_to_color;
+	const bool stencil_active =
+	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
+	return depth_active || stencil_active;
+}
+
+void ApplyDepthStencilTestState(const HW::Context& hw, RenderDepthInfo& r) {
+	const auto& z           = hw.GetDepthRenderTarget();
+	const auto& rc          = hw.GetRenderControl();
+	const auto& dc          = hw.GetDepthControl();
+	const auto& sc          = hw.GetStencilControl();
+	const auto& sm          = hw.GetStencilMask();
+	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	if (dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways)) {
+		DepthFatal("unsupported depth register state");
+	}
+	r.depth_test_enable  = dc.z_enable;
+	r.depth_write_enable = r.depth_test_enable && dc.z_write_enable &&
+	                       !z.depth_view.depth_write_disable && !r.depth_clear_enable;
+	r.depth_compare_op   = static_cast<vk::CompareOp>(dc.zfunc);
+
+	r.depth_bounds_test_enable = dc.depth_bounds_enable;
+
+	r.stencil_test_enable = has_stencil && dc.stencil_enable;
+	if (r.stencil_test_enable) {
+		const bool stencil_ops_disabled =
+		    rc.stencil_clear_enable || z.depth_view.stencil_write_disable;
+		const uint8_t front_write_mask = stencil_ops_disabled ? 0 : sm.stencil_writemask;
+		const uint8_t back_write_mask  = stencil_ops_disabled ? 0 : sm.stencil_writemask_bf;
+		if (dc.stencilfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
+		    (dc.backface_enable &&
+		     dc.stencilfunc_bf > static_cast<uint8_t>(vk::CompareOp::eAlways))) {
+			DepthFatal("unsupported stencil compare state");
+		}
+		r.stencil_front = ConvertStencilState(
+		    dc.stencilfunc, {sc.stencil_fail, sc.stencil_zpass, sc.stencil_zfail},
+		    sm.stencil_opval, {.compareMask = sm.stencil_mask, .writeMask = front_write_mask,
+		                       .reference = sm.stencil_testval});
+		if (dc.backface_enable) {
+			r.stencil_back = ConvertStencilState(
+			    dc.stencilfunc_bf, {sc.stencil_fail_bf, sc.stencil_zpass_bf, sc.stencil_zfail_bf},
+			    sm.stencil_opval_bf, {.compareMask = sm.stencil_mask_bf, .writeMask = back_write_mask,
+			                          .reference = sm.stencil_testval_bf});
+		} else {
+			r.stencil_back = r.stencil_front;
+		}
+	}
+}
+
+void RenderExecutor::ResolveRenderDepthTarget(CommandBuffer& buffer, RenderDepthInfo& r) {
+	KYTY_PROFILER_FUNCTION();
+	r = {};
+
+	const auto& hw          = buffer.GetRegisters();
+	const auto& z           = hw.GetDepthRenderTarget();
+	const auto& rc          = hw.GetRenderControl();
+	const auto& dc          = hw.GetDepthControl();
+	const bool  has_stencil = z.stencil_info.format != Prospero::StencilFormat::kInvalid;
+	const bool depth_tested = dc.z_enable || dc.depth_bounds_enable || rc.depth_clear_enable ||
+	                          rc.copy_depth_to_color;
+	const bool stencil_active =
+	    has_stencil && (dc.stencil_enable || rc.stencil_clear_enable || rc.copy_stencil_to_color);
+	const bool expand_only = !depth_tested && !stencil_active && rc.depth_compress_disable &&
+	                         z.z_info.htile_acceleration;
+	if (!depth_tested && !stencil_active && !expand_only) {
+		return;
+	}
+	const bool attachment_unbound =
+	    z.z_info.format == Prospero::DepthFormat::kInvalid &&
+	    z.stencil_info.format == Prospero::StencilFormat::kInvalid && z.z_info.num_samples == 0 &&
+	    z.z_info.texture_compatibility == Prospero::TextureCompatiblePlaneCompression::kDisable &&
+	    !z.z_info.expclear_enabled && !z.z_info.partially_resident && z.z_info.max_mip_level == 0 &&
+	    z.stencil_info.texture_compatibility == Prospero::TextureCompatibleStencil::kDisable &&
+	    !z.stencil_info.expclear_enabled && !z.stencil_info.partially_resident &&
+	    z.depth_view.slice_start == 0 && z.depth_view.slice_max == 0 &&
+	    z.depth_view.current_mip_level == 0 && !z.depth_view.depth_write_disable &&
+	    !z.depth_view.stencil_write_disable && z.z_read_base_addr == 0 && z.z_write_base_addr == 0 &&
+	    z.stencil_read_base_addr == 0 && z.stencil_write_base_addr == 0 &&
+	    z.htile_data_base_addr == 0 &&
+	    !z.z_info.htile_acceleration && z.shading_rate_encoding == 0 && z.size.x_max == 0 &&
+	    z.size.y_max == 0;
+	if (attachment_unbound) {
+		static std::atomic_bool logged = false;
+		if (!logged.exchange(true, std::memory_order_relaxed)) {
+			LOGF("DepthTarget: ignoring enabled depth/stencil state without a bound attachment\n");
+		}
+		return;
+	}
+	if (rc.copy_stencil_to_color ||
+	    dc.zfunc > static_cast<uint8_t>(vk::CompareOp::eAlways) ||
+	    (!z.depth_view.depth_write_disable && z.z_write_base_addr != z.z_read_base_addr) ||
+	    (has_stencil && !z.depth_view.stencil_write_disable &&
+	     z.stencil_write_base_addr != z.stencil_read_base_addr)) {
+		DepthFatal("unsupported depth register state");
+	}
+	if (rc.copy_depth_to_color &&
+	    (z.z_info.num_samples != 0 || rc.copy_sample != 0 ||
+	     z.z_info.format != Prospero::DepthFormat::kZ32F ||
+	     dc.z_enable || dc.z_write_enable || dc.depth_bounds_enable || dc.stencil_enable ||
+	     rc.depth_clear_enable || rc.stencil_clear_enable)) {
+		DepthFatal("unsupported depth-to-color copy state");
+	}
+	if (m_depth_target_memo == nullptr) {
+		m_depth_target_memo = {new DepthTargetMemo {}, [](DepthTargetMemo* memo) { delete memo; }};
+	}
+	auto&                   memo  = *m_depth_target_memo;
+	DepthTargetMemo::Entry* entry = nullptr;
+	for (auto& candidate: memo.entries) {
+		if (candidate.valid && std::memcmp(&candidate.registers, &z, sizeof(z)) == 0) {
+			entry = &candidate;
+			break;
+		}
+	}
+	if (entry == nullptr) {
+		entry        = &memo.entries[memo.next];
+		memo.next    = (memo.next + 1u) % DepthTargetMemo::Ways;
+		entry->valid = false;
+		entry->desc  = MakeDepthTargetDesc(buffer, z);
+		std::memcpy(&entry->registers, &z, sizeof(z));
+		entry->valid = true;
+	}
+	if (expand_only) {
+		const auto& metadata = entry->desc.info.metadata;
+		if (metadata.kind != ImageMetadataKind::Htile ||
+		    !m_context.GetTextureCache().IsMetaCleared(metadata.range.address,
+		                                               entry->desc.view_info.base_layer)) {
+			return;
+		}
+	}
+	r.desc                    = entry->desc;
+	r.depth_clear_enable      = rc.depth_clear_enable;
+	r.depth_clear_value       = hw.GetDepthClearValue();
+	r.stencil_clear_enable =
+	    has_stencil && rc.stencil_clear_enable && !z.depth_view.stencil_write_disable;
+	r.stencil_clear_value = hw.GetStencilClearValue();
+	ApplyDepthStencilTestState(hw, r);
+	auto& cache = m_context.GetTextureCache();
+	r.image_id = cache.FindImage(r.desc);
+	BindRenderTarget(r.image_id);
+}
+
+bool RenderExecutor::DepthStencilCopy(CommandBuffer& buffer) {
+	const auto& hw       = buffer.GetRegisters();
+	const auto& z        = hw.GetDepthRenderTarget();
+	const auto& override = hw.GetDepthRenderOverride();
+	if (hw.GetColorControl().mode != 0) {
+		return false;
+	}
+	const bool depth_copy = override.force_z_dirty && override.force_z_valid &&
+	                        z.z_info.format != Prospero::DepthFormat::kInvalid &&
+	                        z.z_read_base_addr != 0 && z.z_write_base_addr != 0 &&
+	                        z.z_read_base_addr != z.z_write_base_addr;
+	const bool stencil_copy = override.force_stencil_dirty && override.force_stencil_valid &&
+	                          z.stencil_info.format != Prospero::StencilFormat::kInvalid &&
+	                          z.stencil_read_base_addr != 0 && z.stencil_write_base_addr != 0 &&
+	                          z.stencil_read_base_addr != z.stencil_write_base_addr;
+	if (!depth_copy && !stencil_copy) {
+		return false;
+	}
+
+	auto  read_desc  = MakeDepthTargetDesc(buffer, z);
+	auto  write_desc = MakeDepthTargetDesc(buffer, z, true);
+	auto& cache      = m_context.GetTextureCache();
+	const auto read_id = cache.FindImage(read_desc);
+	BindRenderTarget(read_id);
+	const auto write_id = cache.FindImage(write_desc);
+	BindRenderTarget(write_id);
+	cache.UpdateImage(read_id);
+	cache.UpdateImage(write_id);
+	cache.MarkGpuWritten(write_id);
+	auto& source      = cache.GetImage(read_id);
+	auto& destination = cache.GetImage(write_id);
+	EXIT_IF(read_id == write_id || source.backing.format != destination.backing.format);
+
+	buffer.EndRendering();
+	const auto command = buffer.Handle();
+
+	const ImageSubresourceRange range {read_desc.view_info.base_level, 1,
+	                                  read_desc.view_info.base_layer,
+	                                  read_desc.view_info.layer_count};
+	source.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead,
+	               range, command);
+	destination.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite,
+	                    range, command);
+	std::array<vk::ImageCopy, 2> regions {};
+	uint32_t                   count = 0;
+	for (const auto aspect: {vk::ImageAspectFlagBits::eDepth, vk::ImageAspectFlagBits::eStencil}) {
+		if ((aspect == vk::ImageAspectFlagBits::eDepth && !depth_copy) ||
+		    (aspect == vk::ImageAspectFlagBits::eStencil && !stencil_copy)) {
+			continue;
+		}
+		auto& region = regions[count++];
+		region.srcSubresource = {aspect, range.base_level, range.base_layer,
+		                         range.layer_count};
+		region.dstSubresource = region.srcSubresource;
+		region.extent = write_desc.info.extent;
+	}
+	command.copyImage(source.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+	                  destination.backing.image, vk::ImageLayout::eTransferDstOptimal,
+	                  count, regions.data());
+	return true;
+}
+
+vk::ImageAspectFlags RenderDepthInfo::AttachmentWriteAspects() const {
+	const auto format = desc.view_info.format;
+	if (format == vk::Format::eUndefined) {
+		return {};
+	}
+
+	const auto           available = ImageViewOps::DepthAspectMask(format);
+	vk::ImageAspectFlags writes = load_clear_aspects & available;
+	if ((available & vk::ImageAspectFlagBits::eDepth) &&
+	    depth_write_enable) {
+		writes |= vk::ImageAspectFlagBits::eDepth;
+	}
+	if (!(available & vk::ImageAspectFlagBits::eStencil)) {
+		return writes;
+	}
+
+	const auto face_writes = [&](const vk::StencilOpState& state) {
+		if (state.writeMask == 0) {
+			return false;
+		}
+		bool can_pass = state.compareOp != vk::CompareOp::eNever;
+		bool can_fail = state.compareOp != vk::CompareOp::eAlways;
+		if (state.compareMask == 0) {
+			switch (state.compareOp) {
+				case vk::CompareOp::eEqual:
+				case vk::CompareOp::eLessOrEqual:
+				case vk::CompareOp::eGreaterOrEqual:
+				case vk::CompareOp::eAlways:
+					can_pass = true;
+					can_fail = false;
+					break;
+				case vk::CompareOp::eNever:
+				case vk::CompareOp::eLess:
+				case vk::CompareOp::eGreater:
+				case vk::CompareOp::eNotEqual:
+					can_pass = false;
+					can_fail = true;
+					break;
+				default: break;
+			}
+		}
+		const bool depth_pass = !depth_test_enable || depth_compare_op != vk::CompareOp::eNever;
+		const bool depth_fail = depth_test_enable && depth_compare_op != vk::CompareOp::eAlways;
+		return (can_fail && state.failOp != vk::StencilOp::eKeep) ||
+		       (can_pass && depth_pass && state.passOp != vk::StencilOp::eKeep) ||
+		       (can_pass && depth_fail && state.depthFailOp != vk::StencilOp::eKeep);
+	};
+	if (stencil_test_enable && (face_writes(stencil_front) || face_writes(stencil_back))) {
+		writes |= vk::ImageAspectFlagBits::eStencil;
+	}
+	return writes;
+}
+
+}

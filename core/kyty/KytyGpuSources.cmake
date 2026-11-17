@@ -1,0 +1,2 @@
+set(KYTY_GPU_EXCLUDED
+)

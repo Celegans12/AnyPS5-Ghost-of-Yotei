@@ -1,0 +1,232 @@
+#ifndef KYTY_COMMON_EMULATOR_CONFIG_H_
+#define KYTY_COMMON_EMULATOR_CONFIG_H_
+
+#include "common/common.h"
+
+#include <cstddef>
+#include <array>
+#include <filesystem>
+#include <limits>
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace Config {
+
+void Initialize();
+void Shutdown();
+
+struct Lifecycle {
+	static constexpr const char* name       = "Config";
+	static constexpr auto        initialize = Config::Initialize;
+	static constexpr auto        shutdown   = Config::Shutdown;
+};
+
+enum class LogDirection { Silent, Console, File };
+
+enum class PresentMode { Fifo, Mailbox, Immediate };
+
+enum class PssrUpscaler { Linear, DLSS, FSR };
+
+enum class PipelinePrecompile { Ask, Wait, Play };
+
+using Keymap = std::vector<std::string>;
+using ControllerColor = std::array<uint8_t, 3>;
+
+enum GpuPipelineStage : uint32_t {
+	GPU_PIPELINE_RECORDING = 1u << 0u,
+	GPU_PIPELINE_COMMAND_PROCESSOR = 1u << 1u,
+	GPU_PIPELINE_RESOLVE = 1u << 2u,
+	GPU_PIPELINE_ALL =
+	    GPU_PIPELINE_RECORDING | GPU_PIPELINE_COMMAND_PROCESSOR | GPU_PIPELINE_RESOLVE,
+};
+
+constexpr uint32_t DEFAULT_CONSOLE_LANGUAGE = 1;
+constexpr uint32_t MAX_CONSOLE_LANGUAGE     = 29;
+constexpr std::size_t MAX_USER_NAME_LENGTH = 16;
+constexpr int32_t DEFAULT_USER_ID           = 1000;
+
+constexpr int     MAX_PLAYERS         = 4;
+constexpr int32_t PLAYER_USER_ID_STEP = 0x100;
+constexpr int32_t MAX_USER_ID =
+    std::numeric_limits<int32_t>::max() - (MAX_PLAYERS - 1) * PLAYER_USER_ID_STEP;
+
+constexpr bool IsConfiguredUserIdValid(int32_t user_id) {
+	constexpr int32_t USER_ID_EVERYONE = 0xfe;
+	constexpr int32_t USER_ID_SYSTEM   = 0xff;
+	return user_id >= 0 && user_id <= MAX_USER_ID && user_id != USER_ID_EVERYONE &&
+	       user_id != USER_ID_SYSTEM;
+}
+
+struct ConfigOptions {
+	uint32_t               screen_width                = 1280;
+	uint32_t               screen_height               = 720;
+	std::string            user_name                   = "Kyty";
+	int32_t                user_id                     = DEFAULT_USER_ID;
+	std::string            audio_input_device;
+	std::optional<ControllerColor> controller_color;
+	uint32_t               controller_speaker_volume      = 50;
+	uint32_t               controller_vibration_intensity = 100;
+	uint32_t               keyboard_player                = 0;
+	bool                   pad_haptic_rumble           = false;
+	PresentMode            present_mode                = PresentMode::Mailbox;
+	int32_t                gpu_index                   = -1;
+	bool                   fullscreen_enabled          = false;
+	bool                   hdr_enabled                 = false;
+	bool                   hide_cursor_enabled         = false;
+	bool                   stretch_enabled             = false;
+	bool                   splash_enabled              = true;
+	bool                   vr_enabled                  = false;
+	bool                   pro_enabled                 = false;
+	PssrUpscaler           pssr_upscaler               = PssrUpscaler::Linear;
+	std::filesystem::path  dlss_folder;
+	uint32_t               dlss_preset                 = 0;
+	std::filesystem::path  fsr_folder;
+	bool                   amd_cpu_enabled             = false;
+	bool                   guest_tsc_enabled           = true;
+	bool                   network_connected           = false;
+	bool                   psn_emulation_enabled       = false;
+	uint32_t               vblank_frequency            = 60;
+	uint32_t               console_language            = DEFAULT_CONSOLE_LANGUAGE;
+	bool                   vulkan_validation_enabled   = false;
+	bool                   shader_validation_enabled   = false;
+	bool                   shader_cache_enabled        = false;
+	bool                   pipeline_manifest_enabled   = true;
+	bool                   pipeline_manifest_record    = false;
+	bool                   pipeline_manifest_strict    = KYTY_STRICT_PIPELINE_MANIFEST_DEFAULT != 0;
+	PipelinePrecompile     pipeline_precompile         = PipelinePrecompile::Ask;
+	LogDirection           shader_log_direction        = LogDirection::Silent;
+	std::filesystem::path  shader_log_folder           = "_Shaders";
+	bool                   command_buffer_dump_enabled = false;
+	std::filesystem::path  command_buffer_dump_folder  = "_Buffers";
+	bool                   graphics_debug_dump_enabled = false;
+	LogDirection           printf_direction            = LogDirection::Silent;
+	std::filesystem::path  printf_output_file          = "_kyty.txt";
+	std::filesystem::path  session_log_file;
+	bool                   profiler_enabled            = false;
+	bool                   spirv_debug_printf_enabled  = false;
+	bool                   gpu_assisted_validation_enabled = false;
+	bool                   renderdoc_enabled           = false;
+	bool                   readback_linear_images      = true;
+	bool                   readback_tiled_images       = false;
+	bool                   readback_storage_images     = false;
+	bool                   sync_raw_image_buffers      = false;
+	uint32_t               flush_draws                 = 0;
+	bool                   tessellation_enabled        = true;
+	bool                   occlusion_queries_enabled   = true;
+	bool                   relaxed_shader_float        = false;
+	bool                   native_rt                   = false;
+	bool                   async_pipelines_enabled     = true;
+	bool                   rt_stats_enabled            = false;
+	bool                   trophy_enabled              = true;
+	uint32_t               trophy_duration_seconds     = 6;
+	bool                   perf_overlay_enabled            = false;
+	bool                   playgo_hack_enabled         = false;
+	bool                   skip_notice_screen          = false;
+	uint32_t               gpu_pipeline_stages         = GPU_PIPELINE_ALL;
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+	bool red_zone_protection_enabled = true;
+#endif
+	Keymap keymap;
+	std::vector<std::string> guest_arguments {""};
+};
+
+void Load(const ConfigOptions& cfg);
+
+uint32_t GetScreenWidth();
+uint32_t GetScreenHeight();
+const std::string& GetUserName();
+int32_t  GetUserId();
+const std::string& GetAudioInputDevice();
+const std::optional<ControllerColor>& GetControllerColor();
+uint32_t GetControllerSpeakerVolume();
+uint32_t GetControllerVibrationIntensity();
+uint32_t GetKeyboardPlayer();
+int32_t  GetPlayerUserId(int player);
+int      GetPlayerFromUserId(int32_t user_id);
+bool     IsGuestUserId(int32_t user_id);
+bool     PadHapticRumbleEnabled();
+PresentMode GetPresentMode();
+int32_t GetGpuIndex();
+bool     FullscreenEnabled();
+bool     HdrEnabled();
+bool     HideCursorEnabled();
+bool     StretchEnabled();
+bool     VrEnabled();
+bool     Ps5ProEnabled();
+PssrUpscaler GetPssrUpscaler();
+const std::filesystem::path& GetDlssFolder();
+uint32_t GetDlssPreset();
+const std::filesystem::path& GetFsrFolder();
+bool     AmdCpuEnabled();
+bool     GuestTscEnabled();
+bool     IsNetworkConnected();
+bool     PsnEmulationEnabled();
+uint32_t GetVblankFrequency();
+uint32_t GetConsoleLanguage();
+bool     VulkanValidationEnabled();
+
+bool                   ShaderValidationEnabled();
+bool                   ShaderCacheEnabled();
+bool                   PipelineManifestEnabled();
+bool                   PipelineManifestRecord();
+bool                   PipelineManifestStrict();
+PipelinePrecompile     GetPipelinePrecompile();
+LogDirection           GetShaderLogDirection();
+std::filesystem::path  GetShaderLogFolder();
+
+bool                  CommandBufferDumpEnabled();
+std::filesystem::path GetCommandBufferDumpFolder();
+
+bool GraphicsDebugDumpEnabled();
+
+LogDirection          GetPrintfDirection();
+std::filesystem::path GetPrintfOutputFile();
+std::filesystem::path GetSessionLogFile();
+
+bool ProfilerEnabled();
+
+bool SpirvDebugPrintfEnabled();
+
+bool GpuAssistedValidationEnabled();
+
+bool RenderDocEnabled();
+bool ReadbackLinearImagesEnabled();
+bool ReadbackTiledImagesEnabled();
+bool ReadbackStorageImagesEnabled();
+bool SyncRawImageBuffersEnabled();
+uint32_t GetFlushDraws();
+bool TessellationEnabled();
+bool OcclusionQueriesEnabled();
+bool RelaxedShaderFloatEnabled();
+bool NativeRtEnabled();
+bool AsyncPipelinesEnabled();
+bool NativeRayTracingEnabled();
+bool RayTracingStatsEnabled();
+bool TrophyEnabled();
+uint32_t GetTrophyDurationSeconds();
+bool PlayGoHackEnabled();
+bool SkipNoticeScreen();
+uint32_t GpuPipelineStages();
+uint32_t ParseGpuPipelineStages(const char* value);
+
+enum class GpuStageThread : uint32_t {
+	CommandProcessor = 0,
+	Execution        = 1,
+	Recording        = 2,
+	Resolve          = 3,
+	HostCopy         = 4,
+	ResolveHelper    = 5
+};
+bool ResolveHelperEnabled();
+void ConfigureGpuStageThread(GpuStageThread stage);
+#if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
+bool RedZoneProtectionEnabled();
+#endif
+
+const Keymap& GetKeymap();
+const std::vector<std::string>& GetGuestArguments();
+
+}
+
+#endif

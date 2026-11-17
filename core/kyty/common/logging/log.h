@@ -1,0 +1,64 @@
+#ifndef KYTY_COMMON_LOGGING_LOG_H_
+#define KYTY_COMMON_LOGGING_LOG_H_
+
+#include "common/common.h"
+
+#include <fmt/color.h>
+#include <fmt/printf.h>
+#include <string_view>
+
+namespace Log {
+
+void Initialize();
+void Flush();
+
+struct Lifecycle {
+	static constexpr const char* name               = "Log";
+	static constexpr auto        initialize         = Log::Initialize;
+	static constexpr auto        shutdown           = Log::Flush;
+	static constexpr auto        emergency_shutdown = Log::Flush;
+};
+
+inline constexpr const char* RelaunchedVariable = "KYTY_RELAUNCHED";
+
+bool IsSilent();
+void Write(fmt::text_style style, std::string_view text);
+void WriteToConsoleAndLog(std::string_view text);
+void WriteToSessionLog(std::string_view text);
+
+namespace Color {
+
+inline constexpr auto Default       = fmt::text_style {};
+inline constexpr auto Red           = fmt::fg(fmt::terminal_color::red);
+inline constexpr auto Green         = fmt::fg(fmt::terminal_color::green);
+inline constexpr auto Yellow        = fmt::fg(fmt::terminal_color::yellow);
+inline constexpr auto Cyan          = fmt::fg(fmt::terminal_color::cyan);
+inline constexpr auto White         = fmt::fg(fmt::terminal_color::white);
+inline constexpr auto BrightRed     = fmt::fg(fmt::terminal_color::bright_red);
+inline constexpr auto BrightYellow  = fmt::fg(fmt::terminal_color::bright_yellow);
+inline constexpr auto BrightMagenta = fmt::fg(fmt::terminal_color::bright_magenta);
+inline constexpr auto BrightWhite   = fmt::fg(fmt::terminal_color::bright_white);
+
+}
+
+template <typename... Args>
+[[gnu::noinline]] void Printf(fmt::text_style style, const char* format, const Args&... args) {
+	Write(style, fmt::sprintf(format, args...));
+}
+
+}
+
+#define LOGF(...)                                                                                  \
+	do {                                                                                           \
+		if (!::Log::IsSilent()) {                                                                  \
+			::Log::Printf({}, __VA_ARGS__);                                                        \
+		}                                                                                          \
+	} while (false)
+#define LOGF_COLOR(style, ...)                                                                     \
+	do {                                                                                           \
+		if (!::Log::IsSilent()) {                                                                  \
+			::Log::Printf((style), __VA_ARGS__);                                                   \
+		}                                                                                          \
+	} while (false)
+
+#endif

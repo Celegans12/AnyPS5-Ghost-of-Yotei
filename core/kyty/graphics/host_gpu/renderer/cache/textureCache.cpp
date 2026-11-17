@@ -1,0 +1,3313 @@
+#include "graphics/host_gpu/renderer/cache/textureCache.h"
+
+#include "common/alignment.h"
+#include "common/assert.h"
+#include "common/debugCounters.h"
+#include "common/emulatorConfig.h"
+#include "common/logging/log.h"
+#include "common/profiler.h"
+#include "graphics/guest_gpu/gpu_format.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/guest_gpu/tile.h"
+#include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#include "graphics/host_gpu/renderer/commandScheduler.h"
+#include "graphics/host_gpu/renderer/image/imageView.h"
+#include "graphics/host_gpu/renderer/image/textureCommon.h"
+#include "graphics/host_gpu/renderer/image/tiler.h"
+#include "graphics/host_gpu/renderer/render.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
+#include "kernel/memory.h"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cinttypes>
+#include <cstring>
+#include <limits>
+#include <mutex>
+#include <span>
+#include <tuple>
+#include <utility>
+#include <vulkan/vulkan_format_traits.hpp>
+
+namespace Libs::Graphics {
+
+namespace {
+
+constexpr uint64_t NumFramesBeforeRemoval = 16;
+constexpr size_t   MaxParkedImages  = 8;
+constexpr uint64_t ParkedImageTicks = 2048;
+constexpr uint64_t SmallTiledReadbackTexels = 64 * 64;
+constexpr uint64_t LazyReadbackBytes = 256 * 1024;
+constexpr uint64_t PartialDirtyMinSize = uint64_t {8} << 20;
+constexpr uint64_t PartialDirtyGranule = uint64_t {256} << 10;
+constexpr uint64_t PartialUploadMaxShare = 2;
+constexpr uint64_t PartialUploadChunk = uint64_t {64} << 20;
+
+[[nodiscard]] bool DecodeColorClear(const TextureCache::ImageDesc& desc, uint8_t code,
+                                  vk::ClearColorValue& clear) {
+	const auto& metadata = desc.info.metadata;
+	const auto  format   = desc.info.IsDepth()
+	                           ? TextureGetSurfaceFormatInfo(desc.info.guest_format).vk_format
+	                           : desc.view_info.format;
+	const bool  cmask    = metadata.kind == ImageMetadataKind::Cmask;
+	if (cmask ? code == 0 : (code == 0x20 || code == 0x10)) {
+		return desc.type == TextureCache::BindingType::RenderTarget &&
+		       metadata.clear_register_valid &&
+		       DecodePackedColorClear(format, metadata.clear_word, clear);
+	}
+	if (cmask) {
+		return false;
+	}
+	switch (code) {
+		case 0x00:
+		case 0x40:
+		case 0x80:
+		case 0xc0: break;
+		default: return false;
+	}
+	clear = {};
+	if (code == 0x00) {
+		return true;
+	}
+	switch (format) {
+		case vk::Format::eR8Unorm:
+		case vk::Format::eR8G8Unorm:
+		case vk::Format::eR8G8B8A8Unorm:
+		case vk::Format::eR8G8B8A8Srgb:
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2B10G10R10UnormPack32:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eR5G6B5UnormPack16:
+		case vk::Format::eA1R5G5B5UnormPack16:
+		case vk::Format::eR4G4B4A4UnormPack16:
+		case vk::Format::eR16Unorm:
+		case vk::Format::eR16G16Unorm:
+		case vk::Format::eR16G16B16A16Unorm:
+		case vk::Format::eR16Sfloat:
+		case vk::Format::eR16G16Sfloat:
+		case vk::Format::eR16G16B16A16Sfloat:
+		case vk::Format::eR32Sfloat:
+		case vk::Format::eR32G32Sfloat:
+		case vk::Format::eR32G32B32A32Sfloat:
+		case vk::Format::eB10G11R11UfloatPack32: break;
+		default: return false;
+	}
+	const float          rgb   = (code & 0x80u) != 0 ? 1.0f : 0.0f;
+	const float          alpha = (code & 0x40u) != 0 ? 1.0f : 0.0f;
+	std::array<float, 4> channels {rgb, rgb, rgb, alpha};
+	if (!metadata.dcc_alpha_msb) {
+		std::swap(channels[0], channels[3]);
+	}
+	const auto components = vk::componentCount(format);
+	if (components == 1) {
+		channels[0] = channels[3];
+	} else if (components == 2) {
+		channels[1] = channels[3];
+	}
+	switch (format) {
+		case vk::Format::eB8G8R8A8Unorm:
+		case vk::Format::eB8G8R8A8Srgb:
+		case vk::Format::eA2R10G10B10UnormPack32:
+		case vk::Format::eA1R5G5B5UnormPack16:
+		case vk::Format::eR5G6B5UnormPack16: std::swap(channels[0], channels[2]); break;
+		case vk::Format::eR4G4B4A4UnormPack16:
+			std::reverse(channels.begin(), channels.end());
+			break;
+		default: break;
+	}
+	clear.float32 = channels;
+	return true;
+}
+
+}
+
+TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler,
+                           PageManager& page_manager, BufferCache& buffer_cache)
+    : m_graphics(graphics), m_scheduler(scheduler), m_page_manager(page_manager),
+      m_blit_helper(graphics, scheduler),
+      m_tiler(graphics, scheduler, buffer_cache.GetUtilityBuffer(MemoryUsage::Stream)),
+      m_buffer_cache(buffer_cache), m_readback_linear_images(Config::ReadbackLinearImagesEnabled()),
+      m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
+      m_readback_storage_images(Config::ReadbackStorageImagesEnabled()) {
+	if (m_graphics.CanReportMemoryUsage()) {
+		constexpr int64_t GiB = 1024ll * 1024 * 1024;
+		const auto        budget =
+		    static_cast<int64_t>(std::min<uint64_t>(m_graphics.GetTotalMemoryBudget(), INT64_MAX));
+		const auto threshold = std::min<int64_t>(budget, 8 * GiB);
+		m_pressure_gc_memory = static_cast<uint64_t>(
+		    std::max<int64_t>(std::min(budget - 6 * threshold / 10, budget - GiB), GiB + GiB / 2));
+		m_critical_gc_memory = static_cast<uint64_t>(
+		    std::max<int64_t>(std::min(budget - 2 * threshold / 10, budget - GiB / 2), 3 * GiB));
+		m_trigger_gc_memory = static_cast<uint64_t>(std::max<int64_t>((budget - threshold) / 2, 0));
+	}
+}
+
+TextureCache::~TextureCache() {
+	m_slot_images.ForEach([&](ImageId id, const Image& image) {
+		if (image.registered) {
+			UnregisterImage(id);
+		}
+	});
+}
+
+bool TextureCache::SameBacking(const ImageInfo& cached, const ImageInfo& requested,
+                               bool exact_format) {
+	if (cached.data.address != requested.data.address) {
+		return false;
+	}
+	if (cached.data.size != requested.data.size) {
+		return false;
+	}
+	if (cached.extent != requested.extent) {
+		return false;
+	}
+	if (cached.resources.levels < requested.resources.levels ||
+	    cached.resources.layers < requested.resources.layers) {
+		return false;
+	}
+	if (cached.samples != requested.samples) {
+		return false;
+	}
+	if (cached.bytes_per_block != requested.bytes_per_block) {
+		return false;
+	}
+	if (cached.tile_mode != requested.tile_mode) {
+		return false;
+	}
+	if (cached.GetColorTransform() != requested.GetColorTransform()) {
+		return false;
+	}
+	if (!ImageViewOps::FormatsCompatible(cached.pixel_format, requested.pixel_format) ||
+	    cached.type != requested.type) {
+		return false;
+	}
+	if (exact_format && cached.pixel_format != requested.pixel_format) {
+		return false;
+	}
+	return true;
+}
+
+TextureCache::BindingType TextureCache::UploadBinding(const Image& image) {
+	if (image.info.IsDepth()) {
+		if (image.info.tile_mode == Prospero::TileMode::kDepth ||
+		    image.info.tile_mode == Prospero::TileMode::kLinear) {
+			return BindingType::DepthTarget;
+		}
+		return BindingType::Texture;
+	}
+	if (image.usage.render_target) {
+		return BindingType::RenderTarget;
+	}
+	if (image.usage.video_out) {
+		return BindingType::VideoOut;
+	}
+	return BindingType::Texture;
+}
+
+ImageId TextureCache::InsertImage(const ImageInfo& info) {
+	const auto id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	AttachImageVersion(id);
+	RegisterImage(id);
+	return id;
+}
+
+TextureCache::ImageVersions::~ImageVersions() {
+	for (auto& chunk: m_chunks) {
+		delete chunk.load(std::memory_order_relaxed);
+	}
+}
+
+std::atomic<uint32_t>& TextureCache::ImageVersions::Counter(uint32_t index) {
+	EXIT_IF((index >> kChunkBits) >= kMaxChunks);
+	auto& slot  = m_chunks[index >> kChunkBits];
+	auto* chunk = slot.load(std::memory_order_acquire);
+	if (chunk == nullptr) {
+		auto* created = new Chunk {};
+		if (slot.compare_exchange_strong(chunk, created, std::memory_order_acq_rel)) {
+			chunk = created;
+		} else {
+			delete created;
+		}
+	}
+	return (*chunk)[index & (kChunkSize - 1)];
+}
+
+void TextureCache::AttachImageVersion(ImageId id) {
+	auto& image   = m_slot_images[id];
+	image.version = &m_image_versions.Counter(id.index);
+	image.StateChanged();
+}
+
+TextureCache::RegisteredPageCounts::~RegisteredPageCounts() {
+	for (auto& leaf: m_leaves) {
+		delete leaf.load(std::memory_order_relaxed);
+	}
+}
+
+void TextureCache::RegisteredPageCounts::Add(size_t page, int32_t delta) {
+	auto& slot = m_leaves[page >> kLeafBits];
+	auto* leaf = slot.load(std::memory_order_relaxed);
+	if (leaf == nullptr) {
+		leaf = new Leaf {};
+		slot.store(leaf, std::memory_order_release);
+	}
+	(*leaf)[page & (kLeafSize - 1)].fetch_add(static_cast<uint32_t>(delta),
+	                                          std::memory_order_release);
+}
+
+bool TextureCache::RegisteredPageCounts::Any(size_t first, size_t last_exclusive) const noexcept {
+	for (auto page = first; page < last_exclusive; page++) {
+		const auto* leaf = m_leaves[page >> kLeafBits].load(std::memory_order_acquire);
+		if (leaf != nullptr &&
+		    (*leaf)[page & (kLeafSize - 1)].load(std::memory_order_acquire) != 0) {
+			return true;
+		}
+	}
+	return false;
+}
+
+bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc) {
+	std::scoped_lock lock {m_lock};
+	if (m_scheduler.Current().IsInvalid() || desc.type != BindingType::Texture ||
+	    desc.info.data.Empty() || desc.info.IsDepth() || desc.info.HasMetadata() ||
+	    desc.info.HasStencil() || desc.info.tile_mode == Prospero::TileMode::kDepth) {
+		return false;
+	}
+	auto* image = m_slot_images.try_get(id);
+	if (image == nullptr || !image->registered || image->depth_id || image->binding.needs_rebind ||
+	    image->info.IsDepth() || image->info.HasMetadata() || image->info.HasStencil() ||
+	    !SameBacking(image->info, desc.info, true) || !(image->info.resources == desc.info.resources)) {
+		return false;
+	}
+	TouchImage(*image);
+	return true;
+}
+
+bool TextureCache::IsSampledImageCurrent(ImageId id, const ImageDesc& desc, bool storage_dcc) {
+	std::scoped_lock lock {m_lock};
+	const bool dcc = (desc.type == BindingType::Texture || (storage_dcc && desc.type == BindingType::Storage)) &&
+	                 desc.info.metadata.kind == ImageMetadataKind::Dcc;
+	if (m_scheduler.Current().IsInvalid() || (desc.type != BindingType::Texture && desc.type != BindingType::Storage) ||
+	    desc.info.data.Empty() || desc.info.IsDepth() || (desc.info.HasMetadata() && !dcc) || desc.info.HasStencil() ||
+	    desc.info.tile_mode == Prospero::TileMode::kDepth) {
+		return false;
+	}
+	auto* image = m_slot_images.try_get(id);
+	if (image == nullptr || !image->registered || image->depth_id || image->binding.needs_rebind || image->info.IsDepth() ||
+	    (image->info.HasMetadata() && !dcc) || image->info.HasStencil() || !SameBacking(image->info, desc.info, true) ||
+	    !(image->info.resources == desc.info.resources)) {
+		return false;
+	}
+	if (dcc) {
+		const auto& held = image->info.metadata;
+		const auto& want = desc.info.metadata;
+		if (held.kind != want.kind || !(held.range == want.range) || held.compression != want.compression) {
+			return false;
+		}
+		if (!ColorClearSettled(desc)) {
+			return false;
+		}
+	}
+	TouchImage(*image);
+	return true;
+}
+
+bool TextureCache::ColorClearSettled(const ImageDesc& desc) {
+	const auto  range = desc.info.metadata.range;
+	const auto& view  = desc.view_info;
+	if ((desc.info.metadata.kind != ImageMetadataKind::Dcc && desc.info.metadata.kind != ImageMetadataKind::Cmask) ||
+	    range.size == 0 || view.level_count != 1) {
+		return true;
+	}
+	const auto         layers            = desc.info.TransferLayers();
+	constexpr uint64_t MetadataBlockSize = 0x1000;
+	if (!range.Valid() || range.address % MetadataBlockSize != 0 || layers == 0 || range.size % layers != 0 ||
+	    (range.size / layers) % MetadataBlockSize != 0) {
+		return false;
+	}
+	const bool volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
+	const auto first          = volume_texture ? 0u : view.base_layer;
+	const auto count = volume_texture ? std::max(desc.info.extent.depth >> view.base_level, 1u) : view.layer_count;
+	if (first >= layers || count > layers - first) {
+		return false;
+	}
+	const auto     slice_size = range.size / layers;
+	TileSizeOffset mip {.size = static_cast<uint32_t>(slice_size)};
+	if (desc.info.metadata.kind == ImageMetadataKind::Dcc && desc.info.resources.levels > 1) {
+		std::array<TileSizeOffset, 16> mips {};
+		TileSizeAlign                  total {};
+		(void)TileGetDccSize(desc.info.extent.width, desc.info.extent.height, layers, desc.info.bytes_per_block,
+		                     desc.info.resources.levels, desc.info.tile_mode, total, 0, mips.data());
+		mip = mips[view.base_level];
+	}
+	if (mip.size == 0) {
+		return true;
+	}
+	const GuestRange viewed {range.address + slice_size * first + mip.offset, slice_size * (count - 1) + mip.size};
+	vk::ClearColorValue clear {};
+	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
+		uint32_t keys = 0;
+		for (uint32_t key = 0; key < TileManager::ColorClearSlots; key++) {
+			if (DecodeColorClear(desc, static_cast<uint8_t>(key << 4u), clear)) {
+				keys |= 1u << key;
+			}
+		}
+		for (uint32_t slice = 0; slice < count; slice++) {
+			if (!m_buffer_cache.IsColorMetadataChecked(viewed.address + slice_size * slice, mip.size, keys)) {
+				return false;
+			}
+		}
+		NoteSettledMetadata(viewed);
+		return true;
+	}
+	for (uint32_t slice = 0; slice < count; slice++) {
+		uint8_t code = 0;
+		if (!LibKernel::Memory::TryReadBacking(viewed.address + slice_size * slice, &code, sizeof(code)) ||
+		    DecodeColorClear(desc, code, clear)) {
+			return false;
+		}
+	}
+	NoteSettledMetadata(viewed);
+	return true;
+}
+
+void TextureCache::NoteSettledMetadata(GuestRange range) {
+	std::scoped_lock lock {m_settled_lock};
+	for (const auto& held: m_settled_ranges) {
+		if (held.address <= range.address && range.End() <= held.End()) return;
+	}
+	if (m_settled_ranges.size() >= MaxSettledMetadata) {
+		m_settled_ranges.clear();
+		m_settled_begin.store(UINT64_MAX, std::memory_order_release);
+		m_settled_end.store(0, std::memory_order_release);
+		for (auto& word: m_settled_granules) word.store(0, std::memory_order_relaxed);
+		m_color_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
+	}
+	for (auto granule = range.address >> SettledGranuleBits; granule <= (range.End() - 1) >> SettledGranuleBits; ++granule) {
+		const auto bit = granule & 4095u;
+		m_settled_granules[bit >> 6u].fetch_or(uint64_t {1} << (bit & 63u), std::memory_order_release);
+	}
+	m_settled_ranges.push_back(range);
+	if (range.address < m_settled_begin.load(std::memory_order_relaxed))
+		m_settled_begin.store(range.address, std::memory_order_release);
+	if (range.End() > m_settled_end.load(std::memory_order_relaxed))
+		m_settled_end.store(range.End(), std::memory_order_release);
+}
+
+void TextureCache::ForgetSettledMetadata(uint64_t vaddr, uint64_t size) {
+	std::scoped_lock lock {m_settled_lock};
+	const auto before = m_settled_ranges.size();
+	std::erase_if(m_settled_ranges, [&](const GuestRange& held) { return held.address < vaddr + size && vaddr < held.End(); });
+	if (m_settled_ranges.size() == before) return;
+	uint64_t begin = UINT64_MAX;
+	uint64_t end   = 0;
+	for (const auto& held: m_settled_ranges) {
+		begin = std::min(begin, held.address);
+		end   = std::max(end, held.End());
+	}
+	m_settled_begin.store(begin, std::memory_order_release);
+	m_settled_end.store(end, std::memory_order_release);
+	m_color_clear_epoch.fetch_add(1, std::memory_order_acq_rel);
+	m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool TextureCache::IsTargetCurrent(ImageId id, const ImageInfo& requested) {
+	std::scoped_lock lock {m_lock};
+	ImageId last {};
+	ForEachImageInRegion(requested.data.address, requested.data.size, [&](ImageId candidate, Image& image) {
+		if (SameBacking(image.info, requested, false)) {
+			last = candidate;
+		}
+	});
+	const auto* target = m_slot_images.try_get(id);
+	if (target == nullptr || !target->registered) {
+		return false;
+	}
+	return last == (SameBacking(target->info, requested, false) ? id : ImageId {});
+}
+
+bool TextureCache::HasImageStartingAt(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	bool found = false;
+	ForEachImageInRegion(address, 1, [&](ImageId, Image& image) {
+		found = found || (image.registered && image.info.data.address == address);
+	});
+	return found;
+}
+
+void TextureCache::RegisterImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	const auto& data  = image.info.data;
+	if (image.registered || data.Empty()) {
+		EXIT("TextureCache: invalid image registration\n");
+	}
+	if (data.size > UINT32_MAX) {
+		EXIT("TextureCache: image larger than 4 GiB\n");
+	}
+	const BucketEntry entry {
+	    .address = data.address, .size = static_cast<uint32_t>(data.size), .id = id};
+	ForEachPage(data.address, data.size, [this, &entry](uint64_t page) {
+		m_image_page_table[page].entries.push_back(entry);
+		m_registered_pages.Add(page, 1);
+	});
+	image.registered = true;
+	++image.registrations;
+	if (PartialDirtyCandidate(image)) {
+		image.partial_candidate = true;
+		m_partial_candidates.fetch_add(1, std::memory_order_relaxed);
+	}
+	image.StateChanged();
+	image.lru_id     = m_lru_cache.Insert(id, m_gc_tick);
+	image.lru_tick   = m_gc_tick;
+	const auto epoch = ++m_image_set_epoch;
+	m_image_set_changes[epoch % ImageSetChangeHistory] = {image.info.data.address,
+	                                                      image.info.data.size};
+	ForEachPage(image.info.data.address, image.info.data.size,
+	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
+	m_total_used_memory += image.AccountedSize();
+}
+
+void TextureCache::UnregisterImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	image.HeapChanged();
+	UntrackImage(id);
+	if (image.partial_candidate) {
+		image.partial_candidate = false;
+		m_partial_candidates.fetch_sub(1, std::memory_order_relaxed);
+	}
+	ForEachPage(image.info.data.address, image.info.data.size, [this, id](uint64_t page) {
+		auto* bucket = m_image_page_table.Find(page);
+		if (bucket == nullptr) {
+			EXIT("TextureCache: image missing from page owner index\n");
+		}
+		auto&      entries = bucket->entries;
+		const auto entry   = std::ranges::find(entries, id, &BucketEntry::id);
+		if (entry == entries.end()) {
+			EXIT("TextureCache: image missing from page owner index\n");
+		}
+		entries.erase(entry);
+		m_registered_pages.Add(page, -1);
+	});
+	m_lru_cache.Free(image.lru_id);
+	m_total_used_memory -= image.AccountedSize();
+	image.registered = false;
+	const auto epoch = ++m_image_set_epoch;
+	m_image_set_changes[epoch % ImageSetChangeHistory] = {image.info.data.address,
+	                                                      image.info.data.size};
+	ForEachPage(image.info.data.address, image.info.data.size,
+	            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
+}
+
+uint64_t TextureCache::ImageEpochInRegion(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	return ImageEpochInRegionUnlocked(address, size);
+}
+
+uint64_t TextureCache::ImageEpochInRegionUnlocked(uint64_t address, uint64_t size) const {
+	ImagePageTable::PageRange pages {};
+	if (!ImagePageTable::TryGetPageRange(address, size, pages)) {
+		return UINT64_MAX;
+	}
+	uint64_t epoch = 0;
+	ForEachPage(address, size, [&](uint64_t page) {
+		if (const auto* page_epoch = m_image_page_epochs.Find(page)) {
+			epoch = std::max(epoch, *page_epoch);
+		}
+	});
+	return epoch;
+}
+
+size_t TextureCache::ExactLookupSlot(const ImageInfo& info) noexcept {
+	uint64_t hash = info.data.address * 0x9e3779b97f4a7c15ull;
+	hash ^= (info.data.size + static_cast<uint64_t>(info.pixel_format)) * 0xc2b2ae3d27d4eb4full;
+	hash ^= (static_cast<uint64_t>(info.extent.width) << 32u | info.extent.height) *
+	        0x165667b19e3779f9ull;
+	return static_cast<size_t>(hash >> 32u) % ExactLookupWays;
+}
+
+void TextureCache::DeleteImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	if (!image.registered) {
+		return;
+	}
+	DisarmLazyReadback(image);
+	ReleaseDepthCopies(id);
+	ReleaseStencilCopies(id);
+	ReleaseDepthFeedbackCopy(id);
+	if (image.depth_id) {
+		std::erase(m_slot_images[image.depth_id].stencil_ids, id);
+	} else {
+		for (const auto association: std::exchange(image.stencil_ids, {})) {
+			FreeImage(association);
+		}
+	}
+	m_download_images.erase(id);
+	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
+		const auto metadata = m_surface_metas.find(image.info.metadata.range.address);
+		if (metadata != m_surface_metas.end() && metadata->second.owner == id) {
+			m_surface_metas.erase(metadata);
+			m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	UnregisterImage(id);
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferHostOperation([this, id] { m_slot_images.erase(id); });
+	} else {
+		m_slot_images.erase(id);
+	}
+}
+
+void TextureCache::ReleaseDepthFeedbackCopy(ImageId depth_id) {
+	const auto found = m_depth_feedback_copies.find(depth_id);
+	if (found == m_depth_feedback_copies.end()) {
+		return;
+	}
+	const auto copy_id = found->second;
+	m_depth_feedback_copies.erase(found);
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferHostOperation([this, copy_id] { m_slot_images.erase(copy_id); });
+	} else {
+		m_slot_images.erase(copy_id);
+	}
+}
+
+ImageId TextureCache::CopyDepthForFeedback(ImageId depth_id, const ImageSubresourceRange& range,
+                                           vk::ImageAspectFlags aspects) {
+	if (const auto found = m_depth_feedback_copies.find(depth_id);
+	    found != m_depth_feedback_copies.end()) {
+		const auto& depth = m_slot_images[depth_id].backing;
+		const auto& copy  = m_slot_images[found->second].backing;
+		if (copy.format != depth.format || copy.extent != depth.extent ||
+		    copy.mip_levels != depth.mip_levels || copy.layers != depth.layers ||
+		    copy.samples != depth.samples) {
+			ReleaseDepthFeedbackCopy(depth_id);
+		}
+	}
+	auto [entry, inserted] = m_depth_feedback_copies.try_emplace(depth_id);
+	if (inserted) {
+		auto info     = m_slot_images[depth_id].info;
+		info.data     = {};
+		info.stencil  = {};
+		info.metadata = {};
+		entry->second = m_slot_images.insert(m_graphics, m_scheduler, info);
+		AttachImageVersion(entry->second);
+	}
+	auto& depth = m_slot_images[depth_id];
+	auto& copy  = m_slot_images[entry->second];
+	EXIT_IF(range.base_level + range.level_count > depth.backing.mip_levels ||
+	        range.base_layer + range.layer_count > depth.backing.layers);
+	m_scheduler.EndRendering();
+	auto command = m_scheduler.Current().Handle();
+	depth.Transit(vk::ImageLayout::eTransferSrcOptimal, vk::AccessFlagBits2::eTransferRead, range,
+	              command);
+	copy.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, range,
+	             command);
+	std::vector<vk::ImageCopy> copies;
+	for (const auto aspect: {vk::ImageAspectFlagBits::eDepth, vk::ImageAspectFlagBits::eStencil}) {
+		if (!(aspects & aspect)) {
+			continue;
+		}
+		for (uint32_t level = range.base_level; level < range.base_level + range.level_count;
+		     level++) {
+			vk::ImageCopy region {};
+			region.srcSubresource = {aspect, level, range.base_layer, range.layer_count};
+			region.dstSubresource = region.srcSubresource;
+			region.extent = vk::Extent3D {std::max(depth.backing.extent.width >> level, 1u),
+			                              std::max(depth.backing.extent.height >> level, 1u), 1u};
+			copies.push_back(region);
+		}
+	}
+	if (!copies.empty()) {
+		command.copyImage(depth.backing.image, vk::ImageLayout::eTransferSrcOptimal,
+		                  copy.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		                  static_cast<uint32_t>(copies.size()), copies.data());
+	}
+	return entry->second;
+}
+
+void TextureCache::FreeImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	if (image.IsGpuModified()) {
+		NoteDiscardedTarget(id, image);
+		for (const auto association: image.stencil_ids) {
+			NoteDiscardedTarget(association, m_slot_images[association]);
+		}
+	}
+	image.ClearGpuModified();
+	DeleteImage(id);
+}
+
+void TextureCache::NoteDiscardedTarget(ImageId id, const Image& image) {
+	if (!IsTargetImage(image) || image.info.data.Empty() || m_download_images.contains(id) ||
+	    m_readback_consumers.contains(ReadbackConsumerKey(image.info))) {
+		return;
+	}
+	m_discarded_targets[m_discarded_next] = {image.info.data.address, image.info.data.End(),
+	                                         m_gc_tick};
+	m_discarded_next                      = (m_discarded_next + 1) % DiscardedTargetCount;
+}
+
+bool TextureCache::IsTargetImage(const Image& image) noexcept {
+	return image.usage.render_target || image.info.IsDepth() ||
+	       image.info.pixel_format == vk::Format::eS8Uint;
+}
+
+bool TextureCache::WasDiscardedTarget(const Image& image) const {
+	constexpr uint64_t MaxAgeTicks = 4;
+	const auto         begin       = image.info.data.address;
+	const auto         end         = image.info.data.End();
+	return std::ranges::any_of(m_discarded_targets, [&](const DiscardedTarget& target) {
+		return target.end != 0 && target.begin <= begin && end <= target.end &&
+		       target.tick + MaxAgeTicks >= m_gc_tick;
+	});
+}
+
+void TextureCache::PinImage(ImageId id) {
+	if (auto* image = m_slot_images.try_get(id); image != nullptr) {
+		image->table_pins++;
+	}
+}
+
+void TextureCache::UnpinImage(ImageId id) {
+	if (auto* image = m_slot_images.try_get(id); image != nullptr && image->table_pins != 0) {
+		image->table_pins--;
+	}
+}
+
+void TextureCache::TouchImage(Image& image) {
+	if (image.registered && image.lru_tick < m_gc_tick) {
+		image.lru_tick = m_gc_tick;
+		m_lru_cache.Touch(image.lru_id, m_gc_tick);
+	}
+}
+
+void TextureCache::MarkAsMaybeDirty(ImageId id, Image& image) {
+	image.MarkMaybeCpuDirty();
+	UntrackImage(id);
+}
+
+void TextureCache::TrackImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	if (!image.registered) {
+		return;
+	}
+	RetrackHoles(image);
+	const auto image_begin = image.info.data.address;
+	const auto image_end   = image.info.data.End();
+	if (image_begin == image.track_addr && image_end == image.track_addr_end) {
+		return;
+	}
+	if (!image.IsTracked()) {
+		image.track_addr     = image_begin;
+		image.track_addr_end = image_end;
+		image.StateChanged();
+		m_page_manager.UpdatePageWatchers<true>(image_begin, image.info.data.size);
+		return;
+	}
+	if (image_begin < image.track_addr) {
+		TrackImageHead(id);
+	}
+	if (image.track_addr_end < image_end) {
+		TrackImageTail(id);
+	}
+}
+
+void TextureCache::TrackImageHead(ImageId id) {
+	auto& image = m_slot_images[id];
+	if (!image.registered) {
+		return;
+	}
+	const auto image_begin = image.info.data.address;
+	if (image_begin == image.track_addr) {
+		return;
+	}
+	if (!image.IsTracked() || image_begin > image.track_addr) {
+		EXIT("TextureCache: invalid image head tracking range\n");
+	}
+	const auto size  = image.track_addr - image_begin;
+	image.track_addr = image_begin;
+	image.StateChanged();
+	m_page_manager.UpdatePageWatchers<true>(image_begin, size);
+}
+
+void TextureCache::TrackImageTail(ImageId id) {
+	auto& image = m_slot_images[id];
+	if (!image.registered) {
+		return;
+	}
+	const auto image_end = image.info.data.End();
+	if (image_end == image.track_addr_end) {
+		return;
+	}
+	if (!image.IsTracked() || image.track_addr_end > image_end) {
+		EXIT("TextureCache: invalid image tail tracking range\n");
+	}
+	const auto address   = image.track_addr_end;
+	const auto size      = image_end - address;
+	image.track_addr_end = image_end;
+	image.StateChanged();
+	m_page_manager.UpdatePageWatchers<true>(address, size);
+}
+
+void TextureCache::UntrackImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	image.DropPartialDirty();
+	if (!image.IsTracked()) {
+		return;
+	}
+	const auto address   = image.track_addr;
+	const auto size      = image.track_addr_end - image.track_addr;
+	image.track_addr     = 0;
+	image.track_addr_end = 0;
+	image.StateChanged();
+	if (!image.untracked_holes.empty()) {
+		const auto holes = std::move(image.untracked_holes);
+		image.untracked_holes.clear();
+		auto       cursor = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+		const auto end    = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+		for (const auto& [hole_begin, hole_end]: holes) {
+			if (cursor < hole_begin) {
+				m_page_manager.UpdatePageWatchers<false>(cursor, hole_begin - cursor);
+			}
+			cursor = std::max(cursor, hole_end);
+		}
+		if (cursor < end) {
+			m_page_manager.UpdatePageWatchers<false>(cursor, end - cursor);
+		}
+		return;
+	}
+	if (size != 0) {
+		m_page_manager.UpdatePageWatchers<false>(address, size);
+	}
+}
+
+void TextureCache::UntrackImagePages(Image& image, uint64_t begin, uint64_t end) {
+	const auto tracked_begin = Common::AlignDown(image.track_addr, TRACKER_PAGE_SIZE);
+	const auto tracked_end   = Common::AlignUp(image.track_addr_end, TRACKER_PAGE_SIZE);
+	begin = std::max(begin, tracked_begin);
+	end   = std::min(end, tracked_end);
+	if (begin >= end) {
+		return;
+	}
+	auto cursor = begin;
+	for (const auto& [hole_begin, hole_end]: image.untracked_holes) {
+		if (hole_end <= cursor) {
+			continue;
+		}
+		if (hole_begin >= end) {
+			break;
+		}
+		if (cursor < hole_begin) {
+			m_page_manager.UpdatePageWatchers<false>(cursor, hole_begin - cursor);
+		}
+		cursor = std::max(cursor, hole_end);
+	}
+	if (cursor < end) {
+		m_page_manager.UpdatePageWatchers<false>(cursor, end - cursor);
+	}
+	Image::AddRange(image.untracked_holes, begin, end);
+	image.StateChanged();
+}
+
+void TextureCache::RetrackHoles(Image& image) {
+	if (image.untracked_holes.empty()) {
+		return;
+	}
+	if (!image.IsTracked()) {
+		EXIT("TextureCache: untracked image keeps page holes\n");
+	}
+	for (const auto& [hole_begin, hole_end]: image.untracked_holes) {
+		m_page_manager.UpdatePageWatchers<true>(hole_begin, hole_end - hole_begin);
+	}
+	image.untracked_holes.clear();
+	image.StateChanged();
+}
+
+bool TextureCache::PartialDirtyCandidate(const Image& image) {
+	const auto& info = image.info;
+	return info.data.size >= PartialDirtyMinSize && !image.depth_id &&
+	       image.backing.image != nullptr &&
+	       info.metadata.compression == VideoOutCompression::Uncompressed &&
+	       !image.usage.render_target && !image.usage.video_out &&
+	       (!info.IsDepth() || (info.resources.levels == 1 &&
+	                            DepthAspectTransferBytes(info.pixel_format) == info.bytes_per_block &&
+	                            Prospero::NumBytesPerElement(info.guest_format) == info.bytes_per_block)) &&
+	       info.LayersTransferable();
+}
+
+bool TextureCache::TryInvalidatePartial(Image& image, uint64_t address, uint64_t size,
+                                        uint64_t granule) {
+	const auto& info = image.info;
+	if (!PartialDirtyCandidate(image) || !image.registered || !image.IsTracked() ||
+	    image.track_addr != info.data.address || image.track_addr_end != info.data.End() ||
+	    !image.CanTakePartialDirty() || image.IsBufferModified() || image.IsGpuModified()) {
+		return false;
+	}
+	const auto base  = info.data.address;
+	const auto first = std::max(address, base) - base;
+	const auto last  = std::min(address + size, info.data.End()) - base;
+	if (first >= last || last - first > info.data.size / PartialUploadMaxShare) {
+		return false;
+	}
+	const auto granule_begin = base + first / granule * granule;
+	const auto granule_end =
+	    base + std::min(info.data.size, ((last - 1) / granule + 1) * granule);
+	const auto page_begin = Common::AlignDown(granule_begin, TRACKER_PAGE_SIZE);
+	const auto page_end   = Common::AlignUp(granule_end, TRACKER_PAGE_SIZE);
+	image.InvalidateCpuWritePartial(std::max(page_begin, base), std::min(page_end, info.data.End()));
+	UntrackImagePages(image, page_begin, page_end);
+	return true;
+}
+
+void TextureCache::UntrackImageHead(ImageId id) {
+	auto&      image = m_slot_images[id];
+	const auto begin = image.info.data.address;
+	if (!image.IsTracked() || begin < image.track_addr) {
+		return;
+	}
+	if (!image.untracked_holes.empty()) {
+		UntrackImage(id);
+		return;
+	}
+	const auto address = Common::AlignDown(begin + TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE);
+	const auto size    = address - begin;
+	image.track_addr   = address;
+	image.HeapChanged();
+	if (image.track_addr == image.track_addr_end) {
+		MarkAsMaybeDirty(id, image);
+	}
+	if (size != 0) {
+		m_page_manager.UpdatePageWatchers<false>(begin, size);
+	}
+}
+
+void TextureCache::UntrackImageTail(ImageId id) {
+	auto&      image = m_slot_images[id];
+	const auto end   = image.info.data.End();
+	if (!image.IsTracked() || image.track_addr_end < end) {
+		return;
+	}
+	if (!image.untracked_holes.empty()) {
+		UntrackImage(id);
+		return;
+	}
+	const auto address   = Common::AlignDown(end, TRACKER_PAGE_SIZE);
+	const auto size      = end - address;
+	image.track_addr_end = address;
+	image.HeapChanged();
+	if (image.track_addr == image.track_addr_end) {
+		MarkAsMaybeDirty(id, image);
+	}
+	if (size != 0) {
+		m_page_manager.UpdatePageWatchers<false>(address, size);
+	}
+}
+
+void TextureCache::TrackImageDownload(ImageId id, Image& image) {
+	const auto& info   = image.info;
+	const auto  texels = static_cast<uint64_t>(info.extent.width) * info.extent.height *
+	                     info.extent.depth * info.resources.layers;
+	if (info.IsTiled() ? m_readback_tiled_images && texels <= SmallTiledReadbackTexels
+	                   : m_readback_linear_images) {
+		if (!info.IsTiled() && info.data.size >= LazyReadbackBytes &&
+		    !m_readback_consumers.contains(ReadbackConsumerKey(info))) {
+			ArmLazyReadback(image);
+			return;
+		}
+		m_download_images.insert(id);
+	}
+}
+
+uint64_t TextureCache::ReadbackConsumerKey(const ImageInfo& info) noexcept {
+	return info.data.address ^ (info.data.size * 0x9e3779b97f4a7c15ull);
+}
+
+void TextureCache::ArmLazyReadback(Image& image) {
+	if (image.readback_begin != 0) {
+		return;
+	}
+	const auto begin     = Common::AlignDown(image.info.data.address, TRACKER_PAGE_SIZE);
+	const auto end       = Common::AlignUp(image.info.data.End(), TRACKER_PAGE_SIZE);
+	image.readback_begin = begin;
+	image.readback_end   = end;
+	m_lazy_images.fetch_add(1, std::memory_order_relaxed);
+	m_page_manager.UpdatePageWatchers<true, true>(begin, end - begin);
+}
+
+void TextureCache::DisarmLazyReadback(Image& image) {
+	if (image.readback_begin == 0) {
+		return;
+	}
+	const auto begin     = image.readback_begin;
+	const auto end       = image.readback_end;
+	image.readback_begin = 0;
+	image.readback_end   = 0;
+	m_lazy_images.fetch_sub(1, std::memory_order_relaxed);
+	m_page_manager.UpdatePageWatchers<false, true>(begin, end - begin);
+}
+
+void TextureCache::FlushLazyReadback(uint64_t address, uint64_t size) {
+	if (m_lazy_images.load(std::memory_order_relaxed) == 0) {
+		return;
+	}
+	std::vector<std::pair<ImageId, uint64_t>> armed;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+		const auto page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+		ForEachImageInRegion(page_begin, page_end - page_begin, [&](ImageId id, Image& image) {
+			if (image.readback_begin != 0 && image.readback_begin < address + size &&
+			    address < image.readback_end) {
+				armed.emplace_back(id, image.serial);
+			}
+		});
+	}
+	if (armed.empty()) {
+		return;
+	}
+	m_scheduler.Context().GetGpu().SendUrgentCommandSync(
+	    [this, armed = std::move(armed)] { FlushLazyImages(armed); }, false);
+}
+
+void TextureCache::FlushLazyImages(std::span<const std::pair<ImageId, uint64_t>> images) {
+	bool downloaded = false;
+	{
+		std::scoped_lock lock {m_lock};
+		for (const auto& [id, serial]: images) {
+			auto* image = m_slot_images.try_get(id);
+			if (image == nullptr || image->serial != serial || image->readback_begin == 0) {
+				continue;
+			}
+			m_readback_consumers.insert(ReadbackConsumerKey(image->info));
+			if (image->IsGpuModified() && DownloadImageMemory(id)) {
+				downloaded = true;
+			}
+		}
+	}
+	if (downloaded) {
+		const auto tick = m_scheduler.CurrentTick();
+		m_scheduler.Wait(tick);
+		m_scheduler.WaitPriorityOperations(tick);
+	}
+	std::scoped_lock lock {m_lock};
+	for (const auto& [id, serial]: images) {
+		if (auto* image = m_slot_images.try_get(id); image != nullptr && image->serial == serial) {
+			DisarmLazyReadback(*image);
+		}
+	}
+}
+
+void TextureCache::ValidateImageViewDesc(const ImageDesc& desc) const {
+	if (desc.view_info.format == vk::Format::eUndefined || desc.view_info.level_count == 0 ||
+	    desc.view_info.layer_count == 0 ||
+	    desc.view_info.base_level >= desc.info.resources.levels ||
+	    desc.view_info.level_count > desc.info.resources.levels - desc.view_info.base_level ||
+	    (!desc.info.IsVolume() &&
+	     (desc.view_info.base_layer >= desc.info.resources.layers ||
+	      desc.view_info.layer_count > desc.info.resources.layers - desc.view_info.base_layer))) {
+		EXIT("TextureCache: invalid image view description\n");
+	}
+	if (desc.type == BindingType::DepthTarget && !IsSupportedDepthTargetFormat(desc.info)) {
+		EXIT("TextureCache: unsupported depth image description\n");
+	}
+	if (desc.type == BindingType::VideoOut && !IsSupportedVideoOutFormat(desc.info)) {
+		EXIT("TextureCache: unsupported video-out image description\n");
+	}
+	if (desc.type == BindingType::VideoOut &&
+	    desc.info.metadata.compression == VideoOutCompression::Unsupported) {
+		EXIT("TextureCache: unsupported compressed video-out description\n");
+	}
+}
+
+void TextureCache::RefreshCopySource(ImageId id) {
+	auto& image = m_slot_images[id];
+	RefreshImage(id);
+	if (image.IsDefinitelyCpuDirty()) {
+		EXIT("TextureCache: image copy source remained CPU-dirty after refresh\n");
+	}
+}
+
+static bool DepthColorCopyCompatible(vk::Format depth, vk::Format color) {
+	switch (depth) {
+		case vk::Format::eD16Unorm:
+		case vk::Format::eD16UnormS8Uint:
+			return color == vk::Format::eR16Sfloat || color == vk::Format::eR16Unorm ||
+			       color == vk::Format::eR16Snorm || color == vk::Format::eR16Uint ||
+			       color == vk::Format::eR16Sint;
+		case vk::Format::eD32Sfloat:
+		case vk::Format::eD32SfloatS8Uint:
+			return color == vk::Format::eR32Sfloat || color == vk::Format::eR32Uint ||
+			       color == vk::Format::eR32Sint;
+		default: return false;
+	}
+}
+
+bool TextureCache::CopyDepthColor(Image& destination, Image& source) {
+	if (!m_graphics.maintenance8_enabled || source.backing.samples != destination.backing.samples ||
+	    source.info.IsDepth() == destination.info.IsDepth()) {
+		return false;
+	}
+	auto& depth = source.info.IsDepth() ? source : destination;
+	auto& color = source.info.IsDepth() ? destination : source;
+	if (!DepthColorCopyCompatible(depth.backing.format, color.backing.format)) {
+		return false;
+	}
+	if (BlitHelper::CanCopyDepthColor(depth, color)) {
+		if (destination.info.IsDepth()) {
+			m_blit_helper.CopyColorToDepth(color, depth);
+		} else {
+			m_blit_helper.CopyDepthToColor(depth, color);
+		}
+		return true;
+	}
+	destination.CopyImage(source);
+	return true;
+}
+
+bool TextureCache::CopyD16(Image& destination, Image& source) {
+	const bool source_wide = DepthAspectTransferBytes(source.backing.format) == sizeof(uint32_t);
+	if (source_wide == (DepthAspectTransferBytes(destination.backing.format) == sizeof(uint32_t))) {
+		return false;
+	}
+	auto& depth  = source_wide ? source : destination;
+	auto& narrow = source_wide ? destination : source;
+	if (depth.info.bytes_per_block != sizeof(uint16_t) ||
+	    narrow.info.bytes_per_block != sizeof(uint16_t)) {
+		return false;
+	}
+	EXIT_IF(source.backing.samples != 1 || destination.backing.samples != 1 ||
+	        source.info.resources.levels != 1 || destination.info.resources.levels != 1 ||
+	        source.info.extent != destination.info.extent ||
+	        source.info.resources.layers != destination.info.resources.layers);
+
+	const auto     layers = depth.info.resources.layers;
+	const uint64_t depth_slice =
+	    static_cast<uint64_t>(depth.info.pitch) * depth.info.extent.height * sizeof(uint32_t);
+	const uint64_t narrow_slice =
+	    static_cast<uint64_t>(narrow.info.pitch) * narrow.info.extent.height * sizeof(uint16_t);
+	EXIT_IF(layers == 0 || depth_slice > UINT64_MAX / layers || narrow_slice > UINT64_MAX / layers);
+	const std::array depth_copies {
+	    vk::BufferImageCopy {0,
+	                         depth.info.pitch,
+	                         depth.info.extent.height,
+	                         {vk::ImageAspectFlagBits::eDepth, 0, 0, layers},
+	                         {},
+	                         depth.info.extent}};
+	const std::array narrow_copies {
+	    vk::BufferImageCopy {0,
+	                         narrow.info.pitch,
+	                         narrow.info.extent.height,
+	                         {narrow.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
+	                                                : vk::ImageAspectFlagBits::eColor,
+	                          0, 0, layers},
+	                         {},
+	                         narrow.info.extent}};
+
+	auto depth_buffer  = m_tiler.GetScratchBuffer(depth_slice * layers);
+	auto narrow_buffer = m_tiler.GetScratchBuffer(narrow_slice * layers, depth_buffer.buffer);
+	const TileManager::D16Layout promote_layout {
+	    .width               = depth.info.extent.width,
+	    .height              = depth.info.extent.height,
+	    .layers              = layers,
+	    .source_row_stride   = static_cast<uint64_t>(narrow.info.pitch) * sizeof(uint16_t),
+	    .target_row_stride   = static_cast<uint64_t>(depth.info.pitch) * sizeof(uint32_t),
+	    .source_slice_stride = narrow_slice,
+	    .target_slice_stride = depth_slice,
+	};
+	const bool d32 = DepthAspectTransferFormat(depth.backing.format) == vk::Format::eD32Sfloat;
+	if (source_wide) {
+		source.Download(depth_copies, depth_buffer.buffer, depth_buffer.offset, depth_buffer.size);
+		m_tiler.ConvertD16(depth_buffer, narrow_buffer, TileManager::D16Direction::Demote, d32,
+		                   {.width               = promote_layout.width,
+		                    .height              = promote_layout.height,
+		                    .layers              = promote_layout.layers,
+		                    .source_row_stride   = promote_layout.target_row_stride,
+		                    .target_row_stride   = promote_layout.source_row_stride,
+		                    .source_slice_stride = promote_layout.target_slice_stride,
+		                    .target_slice_stride = promote_layout.source_slice_stride});
+		destination.Upload(narrow_copies, narrow_buffer.buffer, narrow_buffer.offset,
+		                   narrow_buffer.size);
+	} else {
+		source.Download(narrow_copies, narrow_buffer.buffer, narrow_buffer.offset,
+		                narrow_buffer.size);
+		m_tiler.ConvertD16(narrow_buffer, depth_buffer, TileManager::D16Direction::Promote, d32,
+		                   promote_layout);
+		destination.Upload(depth_copies, depth_buffer.buffer, depth_buffer.offset,
+		                   depth_buffer.size);
+	}
+	return true;
+}
+
+void TextureCache::CopyImage(ImageId destination_id, ImageId source_id) {
+	RefreshCopySource(source_id);
+	auto& destination = m_slot_images[destination_id];
+	auto& source      = m_slot_images[source_id];
+	TrackImage(destination_id);
+	if (source.backing.samples != destination.backing.samples) {
+		EXIT("TextureCache: cannot issue an unequal-sample image copy\n");
+	}
+	destination.RefreshComplete();
+	if (source.IsBufferModified()) {
+		if (source.info.data == destination.info.data) {
+			destination.MarkBufferModified();
+		}
+		return;
+	}
+	const bool source_depth = source.info.IsDepth();
+	const bool dest_depth   = destination.info.IsDepth();
+	const bool direct_copy =
+	    source.info.GetColorTransform() == destination.info.GetColorTransform() &&
+	    (source.backing.format == destination.backing.format ||
+	     (!source_depth && !dest_depth &&
+	      vk::blockSize(source.backing.format) == vk::blockSize(destination.backing.format)));
+	if (direct_copy) {
+		destination.CopyImage(source);
+	} else if (!CopyD16(destination, source) && !CopyDepthColor(destination, source)) {
+		if (source.backing.samples != 1 || destination.backing.samples != 1) {
+			EXIT("TextureCache: cross-format multisample image copy is unsupported\n");
+		}
+		auto& copy_buffer = m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal);
+		destination.CopyImageWithBuffer(source, copy_buffer, m_tiler);
+	}
+	if (source.IsGpuModified()) {
+		destination.MarkGpuModified();
+	}
+	destination.ClearBufferModified();
+}
+
+void TextureCache::CopyImageMip(ImageId destination_id, ImageId source_id, uint32_t mip,
+                                uint32_t layer) {
+	RefreshCopySource(source_id);
+	if (m_slot_images[destination_id].IsBufferModified()) {
+		RefreshImage(destination_id);
+	}
+	auto& destination = m_slot_images[destination_id];
+	auto& source      = m_slot_images[source_id];
+	TrackImage(destination_id);
+	if (source.IsBufferModified() || source.backing.samples != destination.backing.samples) {
+		EXIT("TextureCache: invalid mip-copy ownership or sample count\n");
+	}
+	destination.CopyMip(source, mip, layer);
+	if (source.IsGpuModified()) {
+		destination.MarkGpuModified();
+	}
+}
+
+static bool RetainsCachedDepthLayout(const ImageInfo& requested, const Image& cached) {
+	return
+	    requested.samples == 1 && cached.info.samples == 1 && cached.backing.samples == 1 &&
+	    requested.bytes_per_block == cached.info.bytes_per_block &&
+	    requested.data.address == cached.info.data.address &&
+	    requested.data.size < cached.info.data.size && requested.extent == cached.info.extent &&
+	    requested.resources.levels == 1 && cached.info.resources.levels == 1 &&
+	    requested.resources.layers != 0 && cached.info.resources.layers != 0 &&
+	    requested.resources.layers < cached.info.resources.layers &&
+	    requested.type == cached.info.type && requested.pitch == cached.info.pitch &&
+	    requested.mip_layout[0].offset == 0 &&
+	    cached.info.mip_layout[0].offset == 0 &&
+	    requested.mip_layout[0].size == requested.data.size &&
+	    cached.info.mip_layout[0].size == cached.info.data.size &&
+	    requested.data.size % requested.resources.layers == 0 &&
+	    cached.info.data.size % cached.info.resources.layers == 0 &&
+	    requested.data.size / requested.resources.layers ==
+	        cached.info.data.size / cached.info.resources.layers &&
+	    !requested.HasStencil() && !cached.info.HasStencil() && !requested.HasMetadata() &&
+	    (cached.info.metadata.kind == ImageMetadataKind::None ||
+	     cached.info.metadata.kind == ImageMetadataKind::Htile);
+}
+
+static bool DepthTargetOutgrows(const ImageInfo& requested, const Image& cached) {
+	return requested.extent.width > cached.info.extent.width ||
+	       requested.extent.height > cached.info.extent.height;
+}
+
+bool TextureCache::DepthOverlapNeedsRecreate(const ImageInfo& requested, BindingType binding,
+                                             const Image& cached) {
+	if ((!cached.info.IsDepth() && !requested.IsDepth()) ||
+	    cached.info.tile_mode != requested.tile_mode) {
+		return false;
+	}
+	const bool stencil_match = requested.HasStencil() == cached.info.HasStencil();
+	const bool bpp_match     = requested.bytes_per_block == cached.info.bytes_per_block;
+	const bool retain_cached_layout = RetainsCachedDepthLayout(requested, cached);
+	const bool raw_depth_texture =
+	    cached.info.IsDepth() && !requested.IsDepth() && !cached.info.HasStencil() &&
+	    !requested.HasMetadata() && cached.backing.samples == 1 && requested.samples == 1 &&
+	    requested.pitch == cached.info.pitch &&
+	    (requested.resources == cached.info.resources || retain_cached_layout) &&
+	    !IsSupportedSampledDepthFormat(cached.info.pixel_format, requested.pixel_format);
+	bool recreate = cached.info.resources < requested.resources ||
+	                requested.IsVolume() != cached.info.IsVolume();
+	switch (binding) {
+		case BindingType::Texture:
+			recreate |= requested.IsDepth() && !cached.info.IsDepth();
+			recreate |= raw_depth_texture;
+			break;
+		case BindingType::Storage: recreate |= cached.info.IsDepth(); break;
+		case BindingType::RenderTarget: recreate |= cached.info.IsDepth(); break;
+		case BindingType::DepthTarget:
+			recreate |= !cached.info.IsDepth();
+			recreate |= cached.info.IsDepth() && !(stencil_match && bpp_match);
+			recreate |= DepthTargetOutgrows(requested, cached);
+			break;
+		case BindingType::VideoOut: recreate |= cached.info.IsDepth(); break;
+	}
+	return recreate;
+}
+
+ImageId TextureCache::ResolveDepthOverlap(const ImageInfo& requested, BindingType binding,
+                                          ImageId cached_id) {
+	auto& cached = m_slot_images[cached_id];
+	if ((!cached.info.IsDepth() && !requested.IsDepth()) ||
+	    cached.info.tile_mode != requested.tile_mode) {
+		return {};
+	}
+	const bool retain_cached_layout = RetainsCachedDepthLayout(requested, cached);
+	if (!DepthOverlapNeedsRecreate(requested, binding, cached)) {
+		return cached_id;
+	}
+	const bool outgrown = binding == BindingType::DepthTarget && cached.info.IsDepth() &&
+	                      DepthTargetOutgrows(requested, cached);
+	RefreshImage(cached_id);
+	auto info = requested;
+	if (retain_cached_layout) {
+		info.data       = cached.info.data;
+		info.resources  = cached.info.resources;
+		info.mip_layout          = cached.info.mip_layout;
+		info.tiling              = cached.info.tiling;
+		info.tiled_slice_stride  = cached.info.tiled_slice_stride;
+		info.linear_slice_stride = cached.info.linear_slice_stride;
+		info.first_tail_level    = cached.info.first_tail_level;
+	}
+	info.htile_initial_clear  = false;
+	auto replacement_id = UnparkImage(info);
+	if (!replacement_id) {
+		replacement_id = InsertImage(info);
+	}
+	auto&      replacement    = m_slot_images[replacement_id];
+	replacement.usage         = cached.usage;
+	replacement.StateChanged();
+	if (cached.binding.is_bound || cached.binding.is_target) {
+		cached.binding.needs_rebind = true;
+		cached.StateChanged();
+	}
+	if (cached.backing.samples == replacement.backing.samples) {
+		const bool copy_supported =
+		    cached.backing.samples == 1 || cached.backing.format == replacement.backing.format ||
+		    (!cached.info.IsDepth() && !replacement.info.IsDepth() &&
+		     ImageViewOps::FormatsCompatible(cached.backing.format, replacement.backing.format));
+		if (copy_supported) {
+			CopyImage(replacement_id, cached_id);
+		} else {
+			LOGF_COLOR(Log::Color::BrightYellow,
+			           "TextureCache: unsupported cross-format multisample depth copy\n");
+		}
+	} else if (cached.backing.samples == 1 && replacement.backing.samples > 1 &&
+	           replacement.info.IsDepth()) {
+		RefreshCopySource(cached_id);
+		if (cached.IsBufferModified() || cached.IsDefinitelyCpuDirty()) {
+			EXIT("TextureCache: multisample depth conversion source is not native-current\n");
+		}
+		m_blit_helper.ReinterpretColorAsMsDepth(cached, replacement);
+		CommitGpuWrite(replacement);
+	} else {
+		LOGF_COLOR(Log::Color::BrightYellow,
+		           "TextureCache: unsupported unequal-sample depth overlap copy (%u -> %u)\n",
+		           cached.backing.samples, replacement.backing.samples);
+	}
+	if (cached.depth_id || cached.backing.samples != 1 || replacement.backing.samples != 1 ||
+	    outgrown) {
+		FreeImage(cached_id);
+	} else {
+		ParkImage(cached_id);
+	}
+	return replacement_id;
+}
+
+namespace BcAlias {
+
+bool Matches(const ImageInfo& requested, const ImageInfo& cached) {
+	return requested.guest_format != cached.guest_format &&
+	       requested.IsBlock() != cached.IsBlock() &&
+	       requested.tile_mode == cached.tile_mode &&
+	       requested.bytes_per_block == cached.bytes_per_block &&
+	       requested.samples == 1 && cached.samples == 1 &&
+	       (requested.data != cached.data || requested.resources != cached.resources ||
+	        requested.BlockExtent() != cached.BlockExtent()) &&
+	       !TextureCache::SameBacking(cached, requested, false);
+}
+
+bool Publish(TextureCache& cache, Image& image) {
+	if (!cache.CanDownload(image)) {
+		return false;
+	}
+	auto [buffer, offset] =
+	    cache.m_buffer_cache.ObtainBuffer(image.info.data.address, image.info.data.size, true);
+	cache.DownloadImage(image, *buffer, offset, image.info.data.size, image.info.resources.levels);
+	image.ClearGpuModified();
+	image.MarkBufferModified();
+	return true;
+}
+
+void Resolve(TextureCache& cache, ImageId cached_id, ImageId merged_id) {
+	auto& cached = cache.m_slot_images[cached_id];
+	auto* merged = merged_id ? &cache.m_slot_images[merged_id] : nullptr;
+	if (cached.SafeToDownload()) {
+		if (merged && merged->SafeToDownload() && !Publish(cache, *merged)) {
+			return;
+		}
+		if (!Publish(cache, cached)) {
+			return;
+		}
+		if (merged) {
+			merged->MarkBufferModified();
+		}
+	}
+	cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+	cached.StateChanged();
+	cache.FreeImage(cached_id);
+}
+
+}
+
+TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& requested,
+                                                         BindingType binding, ImageId cached_id,
+                                                         ImageId merged_id, bool speculative,
+                                                         bool candidate) {
+	auto& cached = m_slot_images[cached_id];
+	if (!cached.registered) {
+		return {merged_id};
+	}
+	const bool raw_view = binding == BindingType::Texture && !requested.IsBlock() &&
+	                      requested.type == cached.info.type &&
+	                      requested.data.address == cached.info.data.address &&
+	                      requested.BlockExtent() == cached.info.BlockExtent() &&
+	                      requested.resources.levels == cached.info.resources.levels &&
+	                      requested.resources.layers < cached.info.resources.layers;
+	if (!raw_view && BcAlias::Matches(requested, cached.info) && !cached.IsMaybeCpuDirty()) {
+		BcAlias::Resolve(*this, cached_id, merged_id);
+		return {merged_id};
+	}
+	const bool safe_to_delete = cached.table_pins == 0 &&
+	                            m_gc_tick - cached.tick_accessed_last > NumFramesBeforeRemoval &&
+	                            cached.heap_refs.load(std::memory_order_relaxed) == 0u;
+
+	const uint32_t requested_block = requested.bytes_per_block * requested.samples;
+	const uint32_t cached_block    = cached.info.bytes_per_block * cached.info.samples;
+	if (requested.data.address == cached.info.data.address &&
+	    requested.BlockExtent() == cached.info.BlockExtent() && requested_block == cached_block) {
+		if (speculative && (cached.info.IsDepth() || requested.IsDepth()) &&
+		    DepthOverlapNeedsRecreate(requested, binding, cached)) {
+			const bool depth_copy =
+			    binding == BindingType::Texture && requested.IsDepth() && !cached.info.IsDepth() &&
+			    requested.type == cached.info.type &&
+			    requested.IsVolume() == cached.info.IsVolume() && requested.samples == 1 &&
+			    cached.info.samples == 1 && !requested.HasStencil() && !requested.HasMetadata() &&
+			    requested.resources.levels <= cached.info.resources.levels &&
+			    requested.resources.layers <= cached.info.resources.layers;
+			return {.rejected = true, .depth_source = depth_copy ? cached_id : ImageId {}};
+		}
+		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
+			return {depth_id};
+		}
+		if (requested.tile_mode != cached.info.tile_mode ||
+		    (requested.resources == cached.info.resources &&
+		     !std::equal(requested.mip_layout.begin(), requested.mip_layout.end(),
+		                 cached.info.mip_layout.begin(),
+		                 [](const ImageMipInfo& left, const ImageMipInfo& right) {
+			                 return left.offset == right.offset && left.size == right.size &&
+			                        left.pitch == right.pitch && left.height == right.height &&
+			                        left.tail_x == right.tail_x && left.tail_y == right.tail_y &&
+			                        left.surface_z == right.surface_z;
+		                 }))) {
+			if (safe_to_delete) {
+				FreeImage(cached_id);
+			}
+			return {merged_id};
+		}
+		if (requested.GetColorTransform() != cached.info.GetColorTransform()) {
+			return {ExpandImage(requested, cached_id)};
+		}
+		if (requested.IsBlock() && !cached.info.IsBlock()) {
+			return {ExpandImage(requested, cached_id)};
+		}
+		if ((requested.IsVolume() || cached.info.IsVolume()) &&
+		    (requested.data.size == cached.info.data.size ||
+		     (requested.type == cached.info.type && requested.resources == cached.info.resources &&
+		      requested.extent.depth > cached.info.extent.depth))) {
+			return {ExpandImage(requested, cached_id)};
+		}
+		if (requested.data.size == cached.info.data.size &&
+		    requested.resources == cached.info.resources &&
+		    ImageViewOps::FormatsCompatible(cached.info.pixel_format, requested.pixel_format) &&
+		    (requested.type != cached.info.type
+		         ? requested.extent == cached.info.extent
+		         : requested.extent.width > cached.info.extent.width &&
+		               requested.extent.height >= cached.info.extent.height &&
+		               requested.extent.depth >= cached.info.extent.depth)) {
+			return {ExpandImage(requested, cached_id)};
+		}
+		if (requested.pixel_format == cached.info.pixel_format &&
+		    requested.type == cached.info.type && requested.resources > cached.info.resources &&
+		    (requested.data.size > cached.info.data.size ||
+		     (requested.data.size == cached.info.data.size &&
+		      requested.extent == cached.info.extent &&
+		      cached.info.resources.levels > 1 &&
+		      requested.resources.layers == cached.info.resources.layers))) {
+			return {ExpandImage(requested, cached_id)};
+		}
+		if (requested.type != cached.info.type) {
+			return {merged_id};
+		}
+		if (requested.pixel_format != cached.info.pixel_format ||
+		    requested.data.size <= cached.info.data.size) {
+			const auto result_id = merged_id ? merged_id : cached_id;
+			return {ImageViewOps::FormatsCompatible(m_slot_images[result_id].info.pixel_format,
+			                                        requested.pixel_format)
+			            ? result_id
+			            : ImageId {}};
+		}
+		if (candidate) {
+			static std::atomic_bool reported {false};
+			if (!reported.exchange(true, std::memory_order_relaxed)) {
+				LOGF("TextureCache: a T# candidate that overlaps another image at its address "
+				     "(%ux%u over %ux%u at 0x%016" PRIx64 ") is bound as a null image\n",
+				     requested.resources.levels, requested.resources.layers,
+				     cached.info.resources.levels, cached.info.resources.layers,
+				     requested.data.address);
+			}
+			return {.rejected = true};
+		}
+		EXIT("TextureCache: unresolvable equal-address image overlap, address=0x%016" PRIx64
+		     " requested=%ux%u "
+		     "cached=%ux%u requested_size=0x%016" PRIx64 " cached_size=0x%016" PRIx64
+		     " type=%u/%u tile=%u/%u\n",
+		     requested.data.address, requested.resources.levels, requested.resources.layers,
+		     cached.info.resources.levels, cached.info.resources.layers, requested.data.size,
+		     cached.info.data.size, static_cast<uint32_t>(requested.type),
+		     static_cast<uint32_t>(cached.info.type), static_cast<uint32_t>(requested.tile_mode),
+		     static_cast<uint32_t>(cached.info.tile_mode));
+	}
+
+	const int32_t requested_mip = requested.MipOf(cached.info);
+	if (requested_mip >= 0) {
+		const int32_t layer = requested.SliceOf(cached.info, requested_mip);
+		return {cached_id, requested_mip, layer};
+	}
+
+	const int32_t mip = cached.info.MipOf(requested);
+	if (mip >= 0) {
+		const int32_t layer = cached.info.SliceOf(requested, mip);
+		if (!merged_id) {
+			return {ExpandImage(requested, cached_id)};
+		}
+		cached.binding.needs_rebind |= cached.binding.is_bound || cached.binding.is_target;
+		m_slot_images[merged_id].binding.is_target |= cached.binding.is_target;
+		cached.StateChanged();
+		m_slot_images[merged_id].StateChanged();
+		CopyImageMip(merged_id, cached_id, static_cast<uint32_t>(mip),
+		             static_cast<uint32_t>(layer));
+		FreeImage(cached_id);
+		return {merged_id};
+	}
+	if (requested.data.address >= cached.info.data.address && safe_to_delete) {
+		FreeImage(cached_id);
+	}
+	return {merged_id};
+}
+
+ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId source_id) {
+	RefreshCopySource(source_id);
+	const auto expanded_id = InsertImage(info);
+	auto&      source      = m_slot_images[source_id];
+	if (source.binding.is_bound || source.binding.is_target) {
+		source.binding.needs_rebind = true;
+		source.StateChanged();
+	}
+	InitializeImage(expanded_id);
+	const int32_t mip = source.info.MipOf(info);
+	const int32_t layer = source.info.SliceOf(info, mip);
+	if (layer >= 0) {
+		CopyImageMip(expanded_id, source_id, static_cast<uint32_t>(mip),
+		             static_cast<uint32_t>(layer));
+	} else {
+		CopyImage(expanded_id, source_id);
+	}
+	FreeImage(source_id);
+	return expanded_id;
+}
+
+bool TextureCache::CanDownload(const Image& image) const {
+	const auto& info = image.info;
+	if (info.samples != 1 || image.backing.samples != 1 || info.resources.layers == 0 ||
+	    info.data.size % info.resources.layers != 0) {
+		return false;
+	}
+	if (UploadBinding(image) == BindingType::DepthTarget) {
+		return IsSupportedDepthPlaneReadback(info) &&
+		       Prospero::NumBytesPerElement(info.guest_format) == info.bytes_per_block;
+	}
+	return info.metadata.compression == VideoOutCompression::Uncompressed &&
+	       (!info.IsTiled() || !Prospero::IsFmaskTextureFormat(info.guest_format)) &&
+	       info.LinearSize() != 0;
+}
+
+void TextureCache::UploadImage(Image& image, Buffer& source, uint64_t source_offset) {
+	auto& destination = image.depth_id ? m_slot_images[image.depth_id] : image;
+	const auto& info        = image.info;
+	const auto  binding     = image.depth_id ? BindingType::DepthTarget : UploadBinding(image);
+	if (binding != BindingType::DepthTarget) {
+		if ((binding == BindingType::RenderTarget || binding == BindingType::VideoOut) &&
+		    (info.resources.layers == 0 || info.data.size % info.resources.layers != 0 ||
+		     image.backing.samples != 1)) {
+			EXIT("TextureCache: invalid color-attachment upload\n");
+		}
+		const auto linear = m_tiler.Detile(source.Handle(), source_offset, info);
+		const auto copies = info.BufferCopies(linear.offset);
+		destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
+		return;
+	}
+
+	if (destination.backing.samples != 1 || info.resources.layers == 0 ||
+	    info.data.size % info.resources.layers != 0 ||
+	    Prospero::NumBytesPerElement(info.guest_format) != info.bytes_per_block) {
+		EXIT("TextureCache: invalid depth upload\n");
+	}
+	const auto layers          = info.resources.layers;
+	const auto full_slice_size = info.linear_slice_stride;
+	auto       linear          = m_tiler.Detile(source.Handle(), source_offset, info);
+	auto       copies          = info.BufferCopies(linear.offset);
+	if (image.depth_id) {
+		for (auto& copy: copies) {
+			copy.imageSubresource.baseArrayLayer += image.stencil_subresources.base_layer;
+		}
+	}
+	const auto transfer_bytes = image.depth_id ? 1u : DepthAspectTransferBytes(info.pixel_format);
+	if (transfer_bytes != info.bytes_per_block) {
+		const uint64_t texels_per_slice = static_cast<uint64_t>(info.pitch) * info.extent.height;
+		EXIT_NOT_IMPLEMENTED(info.bytes_per_block != sizeof(uint16_t) ||
+		                     transfer_bytes != sizeof(uint32_t) || texels_per_slice > UINT32_MAX ||
+		                     texels_per_slice > UINT64_MAX / transfer_bytes);
+		const uint64_t transfer_slice = texels_per_slice * transfer_bytes;
+		EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
+		auto promoted = m_tiler.GetScratchBuffer(transfer_slice * layers, linear.buffer);
+		m_tiler.ConvertD16(
+		    linear, promoted, TileManager::D16Direction::Promote,
+		    info.pixel_format == vk::Format::eD32SfloatS8Uint,
+		    {.width               = info.extent.width,
+		     .height              = info.extent.height,
+		     .layers              = layers,
+		     .source_row_stride   = static_cast<uint64_t>(info.pitch) * sizeof(uint16_t),
+		     .target_row_stride   = static_cast<uint64_t>(info.pitch) * sizeof(uint32_t),
+		     .source_slice_stride = full_slice_size,
+		     .target_slice_stride = transfer_slice});
+		linear = promoted;
+		copies.resize(1);
+		copies[0].bufferOffset      = linear.offset;
+		copies[0].bufferRowLength   = info.pitch;
+		copies[0].bufferImageHeight = info.extent.height;
+		copies[0].imageSubresource  = {vk::ImageAspectFlagBits::eDepth, 0, 0, layers};
+		copies[0].imageExtent       = info.extent;
+	}
+	destination.Upload(copies, linear.buffer, linear.offset, linear.size);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
+}
+
+void TextureCache::InitializeImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	TrackImage(id);
+	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
+		image.RefreshComplete();
+		return;
+	}
+	if (image.info.samples > 1) {
+		return;
+	}
+	const bool upload = image.IsBufferModified() || image.IsCpuDirty();
+	if (upload && !image.IsBufferModified() && image.write_count == 0 && IsTargetImage(image) &&
+	    WasDiscardedTarget(image)) {
+		image.RefreshComplete();
+		return;
+	}
+	if (upload && image.IsPartiallyCpuDirty() && UploadImageLayers(image)) {
+		image.RefreshComplete();
+		return;
+	}
+	if (upload) {
+		const auto [source, source_offset] =
+		    m_buffer_cache.ObtainBufferForImage(image.info.data.address, image.info.data.size);
+		if (source == nullptr) {
+			EXIT("TextureCache: failed to obtain image upload source\n");
+		}
+		UploadImage(image, *source, source_offset);
+		image.ClearBufferModified();
+	}
+	image.RefreshComplete();
+}
+
+bool TextureCache::UploadImageLayers(Image& image) {
+	const auto& info = image.info;
+	if (!image.IsPartiallyCpuDirty() || image.IsMaybeCpuDirty() || image.IsBufferModified() ||
+	    image.depth_id || !PartialDirtyCandidate(image)) {
+		return false;
+	}
+	const uint32_t       layers = info.resources.layers;
+	const uint64_t       slice  = info.tiled_slice_stride;
+	const uint64_t       base   = info.data.address;
+	std::vector<uint8_t> dirty(layers, 0);
+	uint32_t             dirty_layers = 0;
+	for (const auto& [begin, end]: image.CpuDirtyRanges()) {
+		if (begin >= end || begin < base || end > info.data.End()) {
+			return false;
+		}
+		const auto first = static_cast<uint32_t>((begin - base) / slice);
+		const auto last  = static_cast<uint32_t>((end - 1 - base) / slice);
+		for (auto layer = first; layer <= last && layer < layers; layer++) {
+			dirty_layers += dirty[layer] == 0 ? 1u : 0u;
+			dirty[layer] = 1;
+		}
+	}
+	if (static_cast<uint64_t>(dirty_layers) * slice > info.data.size / PartialUploadMaxShare) {
+		return false;
+	}
+	const auto chunk_layers =
+	    static_cast<uint32_t>(std::max<uint64_t>(1, PartialUploadChunk / slice));
+	for (uint32_t layer = 0; layer < layers;) {
+		if (dirty[layer] == 0) {
+			layer++;
+			continue;
+		}
+		uint32_t count = 1;
+		while (layer + count < layers && dirty[layer + count] != 0 && count < chunk_layers) {
+			count++;
+		}
+		const auto [source, source_offset] =
+		    m_buffer_cache.ObtainBufferForImage(base + slice * layer, slice * count);
+		if (source == nullptr) {
+			EXIT("TextureCache: failed to obtain image upload source\n");
+		}
+		const auto linear =
+		    m_tiler.DetileLayers(source->Handle(), source_offset, info, layer, count);
+		const auto copies = info.BufferCopiesLayers(layer, count, linear.offset);
+		image.Upload(copies, linear.buffer, linear.offset, linear.size);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureUploadBytes, linear.size);
+		layer += count;
+	}
+	return true;
+}
+
+void TextureCache::MaterializeColorClear(ImageId id, const ImageDesc& desc,
+                                       uint32_t metadata_base_layer) {
+	if (desc.info.metadata.kind != ImageMetadataKind::Dcc &&
+	    desc.info.metadata.kind != ImageMetadataKind::Cmask) {
+		return;
+	}
+	const auto  range = desc.info.metadata.range;
+	const auto& view  = desc.view_info;
+	{
+		std::scoped_lock lock {m_lock};
+		auto& image         = m_slot_images[id];
+		image.info.metadata = desc.info.metadata;
+		m_surface_metas.erase(range.address);
+		m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
+		if (range.size == 0 || view.level_count != 1) {
+			return;
+		}
+	}
+	const auto layers = desc.info.TransferLayers();
+	constexpr uint64_t MetadataBlockSize = 0x1000;
+	if (!range.Valid() || range.address % MetadataBlockSize != 0 || layers == 0 ||
+	    range.size % layers != 0 || (range.size / layers) % MetadataBlockSize != 0) {
+		EXIT("TextureCache: color metadata slices must contain aligned 4 KiB blocks\n");
+	}
+	const bool volume_texture = desc.info.IsVolume() && view.type == vk::ImageViewType::e3D;
+	const auto first          = volume_texture ? 0u : metadata_base_layer;
+	const auto image_first    = volume_texture ? 0u : view.base_layer;
+	const auto count =
+	    volume_texture ? std::max(desc.info.extent.depth >> view.base_level, 1u) : view.layer_count;
+	if (first >= layers || count > layers - first) {
+		EXIT("TextureCache: color view exceeds its native metadata slices\n");
+	}
+	const auto slice_size = range.size / layers;
+	TileSizeOffset mip {.size = static_cast<uint32_t>(slice_size)};
+	if (desc.info.metadata.kind == ImageMetadataKind::Dcc && desc.info.resources.levels > 1) {
+		std::array<TileSizeOffset, 16> mips {};
+		TileSizeAlign                  total {};
+		(void)TileGetDccSize(desc.info.extent.width, desc.info.extent.height, layers,
+		                     desc.info.bytes_per_block, desc.info.resources.levels,
+		                     desc.info.tile_mode, total, 0, mips.data());
+		mip = mips[view.base_level];
+	}
+	if (mip.size == 0) {
+		return;
+	}
+	const GuestRange viewed {range.address + slice_size * first + mip.offset,
+	                         slice_size * (count - 1) + mip.size};
+	const auto run = [&](uint32_t slice) { return viewed.address + slice_size * slice; };
+	if (m_buffer_cache.IsRegionGpuModified(viewed.address, viewed.size)) {
+		std::array<vk::ClearAttachment, TileManager::ColorClearSlots> clears {};
+		uint32_t keys = 0;
+		for (uint32_t key = 0; key < clears.size(); key++) {
+			clears[key].aspectMask = vk::ImageAspectFlagBits::eColor;
+			if (DecodeColorClear(desc, static_cast<uint8_t>(key << 4u),
+			                     clears[key].clearValue.color)) {
+				keys |= 1u << key;
+			}
+		}
+		bool checked = true;
+		for (uint32_t slice = 0; slice < count && checked; slice++) {
+			checked = m_buffer_cache.IsColorMetadataChecked(run(slice), mip.size, keys);
+		}
+		if (checked) {
+			return;
+		}
+		{
+			std::scoped_lock lock {m_lock};
+			auto&            image = m_slot_images[id];
+			const bool native_current = (image.usage.render_target || image.IsGpuModified()) &&
+			                            !image.IsBufferModified() && !image.IsCpuDirty();
+			if (m_graphics.conditional_rendering_enabled &&
+			    count <= m_graphics.GetPhysicalDeviceProperties().limits.maxFramebufferLayers &&
+			    (image.backing.usage & vk::ImageUsageFlagBits::eColorAttachment) &&
+			    (m_graphics.GetFormatProperties(view.format).optimalTilingFeatures &
+			     vk::FormatFeatureFlagBits::eColorAttachment) &&
+			    (desc.info.metadata.compression == VideoOutCompression::Uncompressed ||
+			     native_current)) {
+				Common::DebugCounters::Add(Common::DebugCounters::Counter::ColorMetadataChecks);
+				InitializeImage(id);
+				const bool expand = desc.type != BindingType::VideoOut;
+				const auto [buffer, offset] =
+				    m_buffer_cache.ObtainBuffer(viewed.address, viewed.size, expand);
+				const auto predicates = m_tiler.CheckColorClear(
+				    {buffer->Handle(), offset, viewed.size}, slice_size, count, keys, expand);
+				for (uint32_t slice = 0; slice < count && expand; slice++) {
+					m_buffer_cache.MarkColorMetadataChecked(run(slice), mip.size, keys);
+				}
+				const auto command = m_scheduler.Current().Handle();
+				const auto area    = BeginColorRendering(image, view.format, view.base_level,
+				                                         image_first, count, nullptr, command);
+				vk::ClearRect rect {.rect = area, .layerCount = 1};
+				for (uint32_t slice = 0; slice < count; slice++) {
+					rect.baseArrayLayer = slice;
+					for (uint32_t key = 0; key < clears.size(); key++) {
+						if ((keys & (1u << key)) != 0) {
+							const vk::ConditionalRenderingBeginInfoEXT predicate {
+							    .buffer = predicates,
+							    .offset = (slice * clears.size() + key) * sizeof(uint32_t)};
+							command.beginConditionalRenderingEXT(&predicate);
+							command.clearAttachments(1, &clears[key], 1, &rect);
+							command.endConditionalRenderingEXT();
+						}
+					}
+				}
+				command.endRendering();
+				CommitGpuWrite(image);
+				return;
+			}
+		}
+		Common::DebugCounters::ScopedTimer timer(
+		    Common::DebugCounters::Counter::ColorMetadataReadbacks,
+		    Common::DebugCounters::Counter::ColorMetadataReadbackNs);
+		m_buffer_cache.ReadMemory(viewed.address, viewed.size, false);
+	}
+	uint64_t candidate_keys = 0;
+	if (desc.candidate) {
+		candidate_keys = viewed.address ^ (uint64_t {count} << 48u);
+		for (uint32_t slice = 0; slice < count; slice++) {
+			uint8_t code = 0;
+			(void)LibKernel::Memory::TryReadBacking(run(slice), &code, sizeof(code));
+			candidate_keys = (candidate_keys ^ code) * 0x100000001b3ull;
+		}
+		std::scoped_lock lock {m_lock};
+		const auto&      image = m_slot_images[id];
+		if (image.candidate_clear_key == ((candidate_keys ^ image.write_count) * 0x9e3779b97f4a7c15ull | 1u)) {
+			return;
+		}
+	}
+	for (uint32_t slice = 0; slice < count; slice++) {
+		const auto address = run(slice);
+		uint8_t code = 0;
+		if (!LibKernel::Memory::TryReadBacking(address, &code, sizeof(code))) {
+			EXIT("TextureCache: failed to read color metadata backing\n");
+		}
+		vk::ClearValue clear {};
+		if (!DecodeColorClear(desc, code, clear.color)) {
+			continue;
+		}
+		std::vector<uint8_t> bytes(mip.size);
+		if (!LibKernel::Memory::TryReadBacking(address, bytes.data(), bytes.size())) {
+			EXIT("TextureCache: failed to read color metadata slice\n");
+		}
+		if (!std::all_of(bytes.begin(), bytes.end(), [code](uint8_t byte) { return byte == code; })) {
+			continue;
+		}
+		{
+			std::scoped_lock lock {m_lock};
+			const auto& image = m_slot_images[id];
+			const bool depth = image.info.IsDepth();
+			if (depth) {
+				const auto value = clear.color.float32[0];
+				clear.depthStencil = {value, 0u};
+			}
+			ClearImage(m_scheduler.Current(), id, depth ? image.backing.format : view.format,
+			           {depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
+			            view.base_level, view.level_count,
+			            image_first + slice, 1}, clear);
+		}
+		if (desc.type != BindingType::VideoOut && !desc.candidate) {
+			std::fill(bytes.begin(), bytes.end(), uint8_t {0xff});
+			m_buffer_cache.InvalidateMemory(address, bytes.size());
+			LibKernel::Memory::WriteBacking(address, bytes.data(), bytes.size());
+		}
+	}
+	if (desc.candidate) {
+		std::scoped_lock lock {m_lock};
+		auto&            image = m_slot_images[id];
+		image.candidate_clear_key = (candidate_keys ^ image.write_count) * 0x9e3779b97f4a7c15ull | 1u;
+	}
+}
+
+void TextureCache::RefreshImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	if (image.depth_id &&
+	    (m_slot_images[image.depth_id].info.metadata.stencil_compressed ||
+	     m_slot_images[image.depth_id].info.samples != 1)) {
+		return;
+	}
+	TrackImage(id);
+	if (image.IsMaybeCpuDirty()) {
+		image.ResolveMaybeCpuHash(image.HashGuestEdges());
+	}
+	bool cpu_dirty = image.IsBufferModified() || image.IsDefinitelyCpuDirty();
+	if (image.info.metadata.compression != VideoOutCompression::Uncompressed) {
+		if (cpu_dirty) {
+			EXIT("TextureCache: compressed guest image refresh is unsupported\n");
+		}
+		return;
+	}
+	if (!cpu_dirty) {
+		return;
+	}
+	InitializeImage(id);
+}
+
+ImageId TextureCache::FindStencilPlane(const Image& depth, GuestRange range) const {
+	for (const auto id: depth.stencil_ids) {
+		if (m_slot_images[id].info.data == range) {
+			return id;
+		}
+	}
+	return {};
+}
+
+ImageId TextureCache::AssociateStencil(ImageId depth_id, GuestRange stencil) {
+	if (!stencil.Valid()) {
+		EXIT("TextureCache: invalid stencil association range\n");
+	}
+	auto& depth = m_slot_images[depth_id];
+	if (!depth.info.IsDepth() || !depth.info.HasStencil()) {
+		EXIT("TextureCache: stencil association requires a depth/stencil image\n");
+	}
+
+	ImageId association = FindStencilPlane(depth, stencil);
+	if (!association) {
+		ForEachImageWithAddress(stencil.address, [&](ImageId id, Image& owner) {
+			if (owner.info.data == stencil && owner.info.extent == depth.info.extent) {
+				association = id;
+			}
+		});
+	}
+	if (!association) {
+		ImageInfo info {};
+		info.data   = stencil;
+		info.extent = depth.info.extent;
+		association = InsertImage(info);
+	}
+	auto& record = m_slot_images[association];
+	TouchImage(record);
+	if (record.depth_id != depth_id || record.stencil_subresources != depth.stencil_subresources) {
+		ReleaseStencilCopies(association);
+		ImageInfo plane {};
+		plane.data         = stencil;
+		plane.pixel_format = vk::Format::eS8Uint;
+		plane.guest_format = Prospero::BufferFormat::k8UInt;
+		plane.type         = depth.info.type;
+		plane.extent       = depth.info.extent;
+		plane.resources    = {depth.stencil_subresources.level_count,
+		                      depth.stencil_subresources.layer_count};
+		plane.tile_mode    = depth.info.tile_mode;
+		plane.pitch =
+		    plane.IsTiled() ? TileGetRenderTargetPitch(plane.extent.width, 1) : depth.info.pitch;
+		plane.bytes_per_block = 1;
+		plane.UpdateSize();
+		if (record.depth_id != depth_id) {
+			if (record.depth_id) {
+				std::erase(m_slot_images[record.depth_id].stencil_ids, association);
+			}
+			depth.stencil_ids.push_back(association);
+		}
+		record.info                 = plane;
+		record.depth_id             = depth_id;
+		record.stencil_subresources = depth.stencil_subresources;
+		record.StateChanged();
+	}
+
+	return association;
+}
+
+ImageId TextureCache::FindImage(ImageDesc& desc, bool exact_format) {
+	return FindImageImpl(desc, exact_format, false);
+}
+
+ImageId TextureCache::FindImageSpeculative(ImageDesc& desc, bool exact_format,
+                                           ImageId* depth_source) {
+	return FindImageImpl(desc, exact_format, true, depth_source);
+}
+
+ImageId TextureCache::FindDepthCopy(ImageId color_id, const ImageInfo& requested) {
+	std::scoped_lock lock {m_lock};
+	auto&            copies = m_depth_copies[color_id];
+	for (const auto copy_id: copies) {
+		if (m_slot_images[copy_id].info.pixel_format == requested.pixel_format) {
+			return copy_id;
+		}
+	}
+	auto info         = m_slot_images[color_id].info;
+	info.pixel_format = requested.pixel_format;
+	info.data         = {};
+	info.stencil      = {};
+	info.metadata     = {};
+	const auto copy_id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	AttachImageVersion(copy_id);
+	auto&      copy    = m_slot_images[copy_id];
+	copy.is_depth_copy     = true;
+	copy.depth_copy_source = color_id;
+	copies.push_back(copy_id);
+	return copy_id;
+}
+
+bool TextureCache::DepthCopyStale(const Image& image) const {
+	if (!image.is_depth_copy || !image.depth_copy_source) {
+		return false;
+	}
+	const auto* source = m_slot_images.try_get(image.depth_copy_source);
+	return source == nullptr || source->write_count != image.depth_copy_writes ||
+	       source->IsCpuDirty() || source->IsBufferModified();
+}
+
+bool TextureCache::DepthCopyCurrent(const Image& image) const {
+	if (!image.is_depth_copy || !image.depth_copy_source || DepthCopyStale(image)) {
+		return false;
+	}
+	const auto& source = *m_slot_images.try_get(image.depth_copy_source);
+	return !source.registered || (source.track_addr == source.info.data.address &&
+	                              source.track_addr_end == source.info.data.End());
+}
+
+void TextureCache::RefreshDepthCopy(ImageId copy_id) {
+	const auto source_id = m_slot_images[copy_id].depth_copy_source;
+	if (!source_id) {
+		return;
+	}
+	RefreshCopySource(source_id);
+	auto& source = m_slot_images[source_id];
+	auto& copy   = m_slot_images[copy_id];
+	if (source.write_count == copy.depth_copy_writes) {
+		return;
+	}
+	if (!CopyD16(copy, source) && !CopyDepthColor(copy, source)) {
+		copy.CopyImageWithBuffer(source, m_buffer_cache.GetUtilityBuffer(MemoryUsage::DeviceLocal),
+		                         m_tiler);
+	}
+	copy.depth_copy_writes = source.write_count;
+}
+
+void TextureCache::ReleaseDepthCopies(ImageId color_id) {
+	const auto found = m_depth_copies.find(color_id);
+	if (found == m_depth_copies.end()) {
+		return;
+	}
+	for (const auto copy_id: found->second) {
+		auto& copy             = m_slot_images[copy_id];
+		copy.depth_copy_source = {};
+		copy.binding.needs_rebind = true;
+		copy.StateChanged();
+		if (m_scheduler.Active()) {
+			m_scheduler.DeferHostOperation([this, copy_id] { m_slot_images.erase(copy_id); });
+		} else {
+			m_slot_images.erase(copy_id);
+		}
+	}
+	m_depth_copies.erase(found);
+}
+
+static bool SameParkedLayout(const ImageInfo& parked, const ImageInfo& wanted) {
+	return parked.data == wanted.data && parked.stencil == wanted.stencil &&
+	       parked.metadata.kind == wanted.metadata.kind &&
+	       parked.metadata.range == wanted.metadata.range &&
+	       parked.pixel_format == wanted.pixel_format &&
+	       parked.guest_format == wanted.guest_format && parked.type == wanted.type &&
+	       parked.extent == wanted.extent && parked.resources == wanted.resources &&
+	       parked.pitch == wanted.pitch && parked.bytes_per_block == wanted.bytes_per_block &&
+	       parked.samples == wanted.samples && parked.tile_mode == wanted.tile_mode &&
+	       parked.bgra16 == wanted.bgra16;
+}
+
+void TextureCache::ParkImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	if (image.IsGpuModified()) {
+		NoteDiscardedTarget(id, image);
+	}
+	image.ClearGpuModified();
+	DisarmLazyReadback(image);
+	ReleaseDepthCopies(id);
+	ReleaseDepthFeedbackCopy(id);
+	m_download_images.erase(id);
+	if (image.info.metadata.kind == ImageMetadataKind::Htile) {
+		const auto meta = m_surface_metas.find(image.info.metadata.range.address);
+		if (meta != m_surface_metas.end() && (!meta->second.owner || meta->second.owner == id)) {
+			m_surface_metas.erase(meta);
+			m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
+		}
+	}
+	UnregisterImage(id);
+	StencilPlanesChanged(image);
+	image.binding.needs_rebind = true;
+	image.StateChanged();
+	m_parked_images.emplace_back(id, m_scheduler.CurrentTick());
+	if (m_parked_images.size() > MaxParkedImages) {
+		DiscardParkedImage(m_parked_images.front().first);
+		m_parked_images.erase(m_parked_images.begin());
+	}
+}
+
+ImageId TextureCache::UnparkImage(const ImageInfo& info) {
+	for (auto it = m_parked_images.begin(); it != m_parked_images.end(); ++it) {
+		const auto id    = it->first;
+		auto&      image = m_slot_images[id];
+		if (!SameParkedLayout(image.info, info)) {
+			continue;
+		}
+		m_parked_images.erase(it);
+		image.info    = info;
+		image.binding = {};
+		RegisterImage(id);
+		StencilPlanesChanged(image);
+		WriteBackStencilCopies(id);
+		return id;
+	}
+	return {};
+}
+
+void TextureCache::StencilPlanesChanged(const Image& depth) {
+	for (const auto association: depth.stencil_ids) {
+		const auto& plane = m_slot_images[association].info.data;
+		const auto  epoch = ++m_image_set_epoch;
+		m_image_set_changes[epoch % ImageSetChangeHistory] = {plane.address, plane.size};
+		ForEachPage(plane.address, plane.size,
+		            [this, epoch](uint64_t page) { m_image_page_epochs[page] = epoch; });
+	}
+}
+
+void TextureCache::DiscardParkedImage(ImageId id) {
+	auto& image = m_slot_images[id];
+	for (const auto association: std::exchange(image.stencil_ids, {})) {
+		FreeImage(association);
+	}
+	if (m_scheduler.Active()) {
+		m_scheduler.DeferHostOperation([this, id] { m_slot_images.erase(id); });
+	} else {
+		m_slot_images.erase(id);
+	}
+}
+
+void TextureCache::DiscardParkedImages(uint64_t address, uint64_t size) {
+	const auto tick = m_scheduler.CurrentTick();
+	std::erase_if(m_parked_images, [&](const std::pair<ImageId, uint64_t>& parked) {
+		const auto& data = m_slot_images[parked.first].info.data;
+		const bool  discard =
+		    size == 0 ? tick - std::min(tick, parked.second) > ParkedImageTicks
+		              : data.address < address + size && address < data.End();
+		if (discard) {
+			DiscardParkedImage(parked.first);
+		}
+		return discard;
+	});
+}
+
+ImageId TextureCache::FindStencilCopy(ImageId association, const ImageInfo& requested) {
+	auto& copies = m_stencil_copies[association];
+	for (const auto copy_id: copies) {
+		const auto& copy = m_slot_images[copy_id].info;
+		if (copy.pixel_format == requested.pixel_format && copy.type == requested.type &&
+		    copy.extent == requested.extent && copy.resources == requested.resources) {
+			return copy_id;
+		}
+	}
+	auto info     = requested;
+	info.data     = {};
+	info.stencil  = {};
+	info.metadata = {};
+	const auto copy_id = m_slot_images.insert(m_graphics, m_scheduler, info);
+	AttachImageVersion(copy_id);
+	auto& copy             = m_slot_images[copy_id];
+	copy.is_stencil_copy   = true;
+	copy.depth_copy_source = association;
+	copies.push_back(copy_id);
+	return copy_id;
+}
+
+void TextureCache::RefreshStencilCopy(ImageId copy_id) {
+	const auto  association_id = m_slot_images[copy_id].depth_copy_source;
+	const auto* association = association_id ? m_slot_images.try_get(association_id) : nullptr;
+	if (association == nullptr || !association->depth_id) {
+		return;
+	}
+	RefreshImage(association_id);
+	const auto range = association->stencil_subresources;
+	auto&      depth = m_slot_images[association->depth_id];
+	auto&      copy  = m_slot_images[copy_id];
+	if (depth.write_count == copy.depth_copy_writes ||
+	    copy.write_count != copy.stencil_copy_writes) {
+		return;
+	}
+	const auto levels = std::min(copy.backing.mip_levels, range.level_count);
+	const auto layers = std::min(copy.backing.layers, range.layer_count);
+	EXIT_IF(levels == 0 || layers == 0 || depth.backing.samples != 1 || copy.backing.samples != 1);
+	std::vector<vk::BufferImageCopy> stencil_copies;
+	std::vector<vk::BufferImageCopy> color_copies;
+	uint64_t                         size = 0;
+	for (uint32_t level = 0; level < levels; level++) {
+		const vk::Extent3D extent {
+		    std::min(std::max(depth.backing.extent.width >> level, 1u),
+		             std::max(copy.backing.extent.width >> level, 1u)),
+		    std::min(std::max(depth.backing.extent.height >> level, 1u),
+		             std::max(copy.backing.extent.height >> level, 1u)),
+		    1u};
+		vk::BufferImageCopy region {};
+		region.bufferOffset     = size;
+		region.imageSubresource = {vk::ImageAspectFlagBits::eStencil, level, range.base_layer,
+		                           layers};
+		region.imageExtent      = extent;
+		stencil_copies.push_back(region);
+		region.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, layers};
+		color_copies.push_back(region);
+		size += Common::AlignUp(uint64_t {extent.width} * extent.height * layers, uint64_t {4});
+	}
+	const auto scratch = m_tiler.GetScratchBuffer(size);
+	for (auto& region: stencil_copies) {
+		region.bufferOffset += scratch.offset;
+	}
+	for (auto& region: color_copies) {
+		region.bufferOffset += scratch.offset;
+	}
+	depth.Download(stencil_copies, scratch.buffer, scratch.offset, size);
+	copy.Upload(color_copies, scratch.buffer, scratch.offset, size);
+	copy.depth_copy_writes   = depth.write_count;
+	copy.stencil_copy_writes = copy.write_count;
+}
+
+void TextureCache::WriteBackStencilCopies(ImageId depth_id) {
+	for (const auto association_id: m_slot_images[depth_id].stencil_ids) {
+		const auto found = m_stencil_copies.find(association_id);
+		if (found == m_stencil_copies.end()) {
+			continue;
+		}
+		const auto range = m_slot_images[association_id].stencil_subresources;
+		for (const auto copy_id: found->second) {
+			auto& depth = m_slot_images[depth_id];
+			auto& copy  = m_slot_images[copy_id];
+			if (copy.write_count == copy.stencil_copy_writes) {
+				continue;
+			}
+			const auto levels = std::min(copy.backing.mip_levels, range.level_count);
+			const auto layers = std::min(copy.backing.layers, range.layer_count);
+			EXIT_IF(levels == 0 || layers == 0 || depth.backing.samples != 1 ||
+			        copy.backing.samples != 1);
+			std::vector<vk::BufferImageCopy> stencil_copies;
+			std::vector<vk::BufferImageCopy> color_copies;
+			uint64_t                         size = 0;
+			for (uint32_t level = 0; level < levels; level++) {
+				const vk::Extent3D extent {
+				    std::min(std::max(depth.backing.extent.width >> level, 1u),
+				             std::max(copy.backing.extent.width >> level, 1u)),
+				    std::min(std::max(depth.backing.extent.height >> level, 1u),
+				             std::max(copy.backing.extent.height >> level, 1u)),
+				    1u};
+				vk::BufferImageCopy region {};
+				region.bufferOffset     = size;
+				region.imageSubresource = {vk::ImageAspectFlagBits::eColor, level, 0, layers};
+				region.imageExtent      = extent;
+				color_copies.push_back(region);
+				region.imageSubresource = {vk::ImageAspectFlagBits::eStencil, level,
+				                           range.base_layer, layers};
+				stencil_copies.push_back(region);
+				size += Common::AlignUp(uint64_t {extent.width} * extent.height * layers,
+				                        uint64_t {4});
+			}
+			const auto scratch = m_tiler.GetScratchBuffer(size);
+			for (auto& region: stencil_copies) {
+				region.bufferOffset += scratch.offset;
+			}
+			for (auto& region: color_copies) {
+				region.bufferOffset += scratch.offset;
+			}
+			copy.Download(color_copies, scratch.buffer, scratch.offset, size);
+			depth.Upload(stencil_copies, scratch.buffer, scratch.offset, size);
+			copy.stencil_copy_writes = copy.write_count;
+			copy.depth_copy_writes   = depth.write_count;
+		}
+	}
+}
+
+void TextureCache::ReleaseStencilCopies(ImageId association) {
+	const auto found = m_stencil_copies.find(association);
+	if (found == m_stencil_copies.end()) {
+		return;
+	}
+	for (const auto copy_id: found->second) {
+		auto& copy                = m_slot_images[copy_id];
+		copy.depth_copy_source    = {};
+		copy.binding.needs_rebind = true;
+		copy.StateChanged();
+		if (m_scheduler.Active()) {
+			m_scheduler.DeferHostOperation([this, copy_id] { m_slot_images.erase(copy_id); });
+		} else {
+			m_slot_images.erase(copy_id);
+		}
+	}
+	m_stencil_copies.erase(found);
+}
+
+ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool speculative,
+                                    ImageId* depth_source) {
+	ValidateImageViewDesc(desc);
+	EXIT_IF(desc.info.data.Empty());
+	const auto metadata_base_layer = desc.view_info.base_layer;
+
+	ImageId result {};
+	{
+		std::scoped_lock lock {m_lock};
+		auto& exact = (*m_exact_lookups)[ExactLookupSlot(desc.info)];
+		if (exact.valid && exact.exact_format == exact_format &&
+		    desc.type != BindingType::VideoOut &&
+		    std::memcmp(&exact.info, &desc.info, sizeof(ImageInfo)) == 0 &&
+		    (exact.epoch == m_image_set_epoch ||
+		     ImageEpochInRegionUnlocked(desc.info.data.address, desc.info.data.size) <=
+		         exact.epoch)) {
+			exact.epoch              = m_image_set_epoch;
+			auto& image              = m_slot_images[exact.id];
+			image.tick_accessed_last = m_gc_tick;
+			TouchImage(image);
+			result = exact.id;
+		}
+	}
+	if (result) {
+		MaterializeColorClear(result, desc, metadata_base_layer);
+		return result;
+	}
+	ImageOps::Validate(desc.info);
+	{
+		std::scoped_lock lock {m_lock};
+		Common::SmallVector<ImageId, 8> candidates;
+		ForEachImageInRegion(desc.info.data.address, desc.info.data.size,
+		                     [&](ImageId id, Image&) { candidates.push_back(id); });
+		bool block_alias = false;
+		ImageId stencil_copy {};
+
+		for (const auto id: candidates) {
+			const auto& image = m_slot_images[id];
+			if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+			    image.depth_id && image.info.data == desc.info.data &&
+			    m_slot_images[image.depth_id].info.samples == desc.info.samples &&
+			    image.info.extent == desc.info.extent && image.info.type == desc.info.type &&
+			    image.info.resources.levels >= desc.info.resources.levels &&
+			    image.info.resources.layers >= desc.info.resources.layers &&
+			    desc.info.bytes_per_block == 1 &&
+			    desc.info.guest_format == Prospero::BufferFormat::k8UInt) {
+				if (!m_slot_images[image.depth_id].registered) {
+					if ((desc.type == BindingType::Texture || desc.type == BindingType::Storage) &&
+					    !desc.heap) {
+						stencil_copy = FindStencilCopy(id, desc.info);
+						break;
+					}
+					const auto depth_id = image.depth_id;
+					std::erase_if(m_parked_images,
+					              [depth_id](const std::pair<ImageId, uint64_t>& parked) {
+						              return parked.first == depth_id;
+					              });
+					DiscardParkedImage(depth_id);
+					continue;
+				}
+				result = id;
+				break;
+			}
+			if (SameBacking(image.info, desc.info, exact_format)) {
+				result = id;
+			} else if (image.SafeToDownload() &&
+			           BcAlias::Matches(desc.info, image.info)) {
+				block_alias = true;
+			}
+		}
+		if (stencil_copy) {
+			return stencil_copy;
+		}
+		const bool same_backing = static_cast<bool>(result);
+
+		int32_t view_mip   = -1;
+		int32_t view_layer = -1;
+		if (!result) {
+			for (const auto candidate: candidates) {
+				view_mip                = -1;
+				view_layer              = -1;
+				const auto& merged_info = result ? m_slot_images[result].info : desc.info;
+				const auto  overlap =
+				    ResolveOverlap(merged_info, desc.type, candidate, result, speculative,
+				                   desc.candidate);
+				if (overlap.rejected) {
+					if (depth_source != nullptr) {
+						*depth_source = overlap.depth_source;
+					}
+					return {};
+				}
+				if (overlap.image) {
+					result     = overlap.image;
+					view_mip   = overlap.mip;
+					view_layer = overlap.layer;
+				}
+			}
+			if (!result && desc.heap &&
+			    std::any_of(candidates.begin(), candidates.end(), [&](ImageId id) {
+				    const auto* image = m_slot_images.try_get(id);
+				    return image != nullptr && image->registered &&
+					       image->heap_refs.load(std::memory_order_relaxed) != 0u &&
+					       image->info.data.address == desc.info.data.address &&
+					       image->info.type == desc.info.type &&
+					       image->info.extent != desc.info.extent;
+			    })) {
+				return {};
+			}
+		} else if (block_alias) {
+			for (const auto candidate: candidates) {
+				const auto& owner = m_slot_images[candidate];
+				if (candidate != result && owner.registered && !owner.IsCpuDirty() &&
+				    BcAlias::Matches(m_slot_images[result].info, owner.info)) {
+					BcAlias::Resolve(*this, candidate, result);
+				}
+			}
+		}
+
+		if (result && !m_slot_images[result].depth_id) {
+			auto& resolved = m_slot_images[result];
+			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
+				result = {};
+			} else if (resolved.info.resources < desc.info.resources) {
+				FreeImage(result);
+				result = {};
+			}
+		}
+		if (result && same_backing && desc.type != BindingType::VideoOut) {
+			auto& exact = (*m_exact_lookups)[ExactLookupSlot(desc.info)];
+			std::memcpy(&exact.info, &desc.info, sizeof(ImageInfo));
+			exact.id           = result;
+			exact.epoch        = m_image_set_epoch;
+			exact.exact_format = exact_format;
+			exact.valid        = true;
+		}
+		if (!result) {
+			result         = InsertImage(desc.info);
+			auto& inserted = m_slot_images[result];
+			if (m_buffer_cache.HasGpuDirtyBytes(inserted.info.data.address,
+			                                    inserted.info.data.size)) {
+				inserted.MarkBufferModified();
+			}
+		}
+		auto& image = m_slot_images[result];
+		if (view_mip >= 0) {
+			desc.view_info.base_level = static_cast<uint32_t>(view_mip);
+		}
+		if (view_layer >= 0) {
+			desc.view_info.base_layer = static_cast<uint32_t>(view_layer);
+		}
+		image.tick_accessed_last = m_gc_tick;
+		TouchImage(image);
+	}
+	MaterializeColorClear(result, desc, metadata_base_layer);
+	if (desc.type == BindingType::VideoOut &&
+	    desc.info.metadata.compression != VideoOutCompression::Uncompressed) {
+		std::scoped_lock lock {m_lock};
+		const auto& image = m_slot_images[result];
+		const bool guest_dirty = image.IsBufferModified() || image.IsCpuDirty();
+		const bool native_current =
+		    (image.usage.render_target || image.IsGpuModified()) && !guest_dirty;
+		if (!native_current) {
+			EXIT("TextureCache: compressed video-out read requires clean native GPU "
+			     "contents\n");
+		}
+	}
+	return result;
+}
+
+void TextureCache::UpdateImage(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	TouchImage(image);
+	RefreshImage(id);
+}
+
+ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool ensure_valid) {
+	std::scoped_lock lock {m_lock};
+	Common::SmallVector<ImageId, 4> matches;
+	ForEachImageWithAddress(address, [&](ImageId id, Image& image) {
+		const auto* owner = &image;
+		if (ensure_valid && owner->depth_id) {
+			owner = &m_slot_images[owner->depth_id];
+			if (!owner->registered) {
+				return;
+			}
+		}
+		if (ensure_valid && !owner->SafeToDownload()) {
+			return;
+		}
+		matches.push_back(id);
+	});
+	ImageId selected {};
+	if (matches.size() == 1) {
+		selected = matches.front();
+	} else {
+		for (const auto id: matches) {
+			const auto& image = m_slot_images[id];
+			if (image.info.data.size == size) {
+				selected = id;
+				break;
+			}
+		}
+	}
+	if (selected && ensure_valid && m_slot_images[selected].depth_id) {
+		selected = m_slot_images[selected].depth_id;
+	}
+	return selected;
+}
+
+vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	std::scoped_lock lock {m_lock};
+	if (m_slot_images[id].is_depth_copy && desc.type == BindingType::Texture) {
+		RefreshDepthCopy(id);
+		return m_slot_images[id].FindView(desc.view_info);
+	}
+	if (m_slot_images[id].is_stencil_copy &&
+	    (desc.type == BindingType::Texture || desc.type == BindingType::Storage)) {
+		RefreshStencilCopy(id);
+		return m_slot_images[id].FindView(desc.view_info);
+	}
+	auto&            image = m_slot_images[id];
+	TouchImage(image);
+	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+		EXIT("TextureCache: texture requires rediscovery before final acquisition\n");
+	}
+	const bool first_write =
+	    m_readback_storage_images && (!image.IsGpuModified() || image.IsDefinitelyCpuDirty()) &&
+	    !m_buffer_cache.HasOnlyGpuDirtyBytes(image.info.data.address, image.info.data.size);
+	RefreshImage(id);
+	if (image.info.HasStencil() &&
+	    desc.info.data.address >= image.info.stencil.address &&
+	    desc.info.data.End() <= image.info.stencil.End()) {
+		if (const auto stencil_id = FindStencilPlane(image, image.info.stencil)) {
+			RefreshImage(stencil_id);
+		}
+	}
+	switch (desc.type) {
+		case BindingType::Texture: break;
+		case BindingType::Storage:
+			CommitGpuWrite(image);
+			TrackImageDownload(id, image);
+			if (first_write) {
+				m_download_images.insert(id);
+			}
+			break;
+		default: EXIT("TextureCache: invalid texture binding\n");
+	}
+	return image.FindView(desc.view_info);
+}
+
+vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+		EXIT("TextureCache: color target requires rediscovery before final acquisition\n");
+	}
+	TouchImage(image);
+	if (!image.usage.render_target) {
+		image.usage.render_target = true;
+		image.StateChanged();
+	}
+	RefreshImage(id);
+	CommitGpuWrite(image);
+	TrackImageDownload(id, image);
+	return image.FindView(desc.view_info);
+}
+
+vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, ImageId* stencil) {
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
+		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
+	}
+	TouchImage(image);
+	if (desc.info.HasStencil()) {
+		const auto layers = image.info.resources.layers;
+		EXIT_IF(layers == 0 || image.info.data.size % layers != 0 ||
+		        desc.info.data.address < image.info.data.address);
+		const auto slice_size = image.info.data.size / layers;
+		const auto offset     = desc.info.data.address - image.info.data.address;
+		EXIT_IF(slice_size == 0 || offset % slice_size != 0 || offset / slice_size >= layers ||
+		        desc.info.resources.layers > layers - offset / slice_size);
+		image.stencil_subresources = {0, desc.info.resources.levels,
+		                             static_cast<uint32_t>(offset / slice_size),
+		                             desc.info.resources.layers};
+	}
+	image.info.stencil = desc.info.stencil;
+	image.info.metadata = desc.info.metadata;
+	if (desc.info.HasMetadata()) {
+		const auto [metadata, inserted] = m_surface_metas.try_emplace(desc.info.metadata.range.address);
+		if (inserted && image.info.htile_initial_clear) {
+			metadata->second.clear_mask.set();
+		}
+		metadata->second.owner = id;
+		m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
+	}
+	RefreshImage(id);
+	CommitGpuWrite(image);
+	if (desc.info.HasStencil()) {
+		const auto association = AssociateStencil(id, desc.info.stencil);
+		RefreshImage(association);
+		if (stencil != nullptr) {
+			*stencil = association;
+		}
+	}
+	return image.FindView(desc.view_info);
+}
+
+void TextureCache::MarkGpuWritten(ImageId id) {
+	std::scoped_lock lock {m_lock};
+	auto&            image = m_slot_images[id];
+	if (!image.registered || image.depth_id) {
+		EXIT("TextureCache: cannot mark an unavailable image GPU-written\n");
+	}
+	TrackImage(id);
+	CommitGpuWrite(image);
+	if (image.info.HasStencil()) {
+		const auto stencil_id = AssociateStencil(id, image.info.stencil);
+		TrackImage(stencil_id);
+		CommitGpuWrite(m_slot_images[stencil_id]);
+	}
+}
+
+void TextureCache::CommitGpuWrite(Image& image) {
+	if (!image.depth_id && image.backing.image == nullptr) {
+		EXIT("TextureCache: GPU writes require a native image or stencil association\n");
+	}
+	image.ClearBufferModified();
+	image.RefreshComplete();
+	image.MarkGpuModified();
+}
+
+bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
+                                        uint32_t packed_clear) {
+	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
+		EXIT("TextureCache: invalid image clear\n");
+	}
+	std::scoped_lock      lock {m_lock};
+	ImageId               selected {};
+	ImageId               stencil_id {};
+	vk::ImageAspectFlags  aspect {};
+	ImageSubresourceRange subresources;
+	Common::SmallVector<ImageId, 8> image_ids;
+	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { image_ids.push_back(id); });
+	for (const auto id: image_ids) {
+		const auto&          owner = m_slot_images[id];
+		vk::ImageAspectFlags candidate {};
+		ImageId              candidate_id = id;
+		ImageSubresourceRange candidate_subresources {
+		    0, owner.info.resources.levels, 0, owner.info.TransferLayers()};
+		if (owner.depth_id && owner.info.data.address == address &&
+		    owner.info.data.size == size) {
+			candidate              = vk::ImageAspectFlagBits::eStencil;
+			candidate_id           = owner.depth_id;
+			candidate_subresources = owner.stencil_subresources;
+			const auto& depth      = m_slot_images[candidate_id];
+			if (depth.backing.image == nullptr || !depth.info.HasStencil()) {
+				continue;
+			}
+		} else if (!owner.depth_id && owner.info.data.address == address &&
+		           owner.info.data.size == size) {
+			candidate = owner.info.IsDepth() ? vk::ImageAspectFlagBits::eDepth
+			                                 : vk::ImageAspectFlagBits::eColor;
+		}
+		if (!candidate) {
+			continue;
+		}
+		if (selected && (selected != candidate_id || subresources != candidate_subresources)) {
+			return false;
+		}
+		selected     = candidate_id;
+		stencil_id   = candidate == vk::ImageAspectFlagBits::eStencil ? id : ImageId {};
+		aspect       = candidate;
+		subresources = candidate_subresources;
+	}
+	if (!selected) {
+		return false;
+	}
+	auto&          image = m_slot_images[selected];
+	vk::ClearValue clear {};
+	if (aspect == vk::ImageAspectFlagBits::eColor) {
+		if (!DecodeColorDwordFill(image.info.pixel_format, packed_clear, clear.color)) {
+			return false;
+		}
+	} else {
+		uint8_t stencil_clear = 0;
+		if ((aspect == vk::ImageAspectFlagBits::eDepth &&
+		     !DecodePackedDepthClear(image.info.pixel_format, packed_clear, clear.depthStencil.depth)) ||
+		    (aspect == vk::ImageAspectFlagBits::eStencil &&
+		     !DecodePackedStencilClear(packed_clear, stencil_clear))) {
+			return false;
+		}
+		clear.depthStencil.stencil = stencil_clear;
+	}
+	ClearImage(command, selected, image.backing.format,
+	           {aspect, subresources.base_level, subresources.level_count,
+	            subresources.base_layer, subresources.layer_count}, clear);
+	if (stencil_id) {
+		TrackImage(stencil_id);
+		CommitGpuWrite(m_slot_images[stencil_id]);
+	}
+	return true;
+}
+
+void TextureCache::ClearImage(CommandBuffer& command, ImageId id, vk::Format format,
+                              const vk::ImageSubresourceRange& range, const vk::ClearValue& clear) {
+	auto& image = m_slot_images[id];
+	const auto aspects = image.info.IsDepth() ? ImageViewOps::DepthAspectMask(image.backing.format)
+	                                          : vk::ImageAspectFlagBits::eColor;
+	EXIT_IF(range.baseMipLevel >= image.info.resources.levels);
+	const auto layers = image.info.IsVolume()
+	                        ? std::max(image.info.extent.depth >> range.baseMipLevel, 1u)
+	                        : image.backing.layers;
+	EXIT_IF(command.IsInvalid() || image.depth_id || !range.aspectMask || range.levelCount == 0 ||
+	        range.levelCount > image.info.resources.levels - range.baseMipLevel ||
+	        range.layerCount == 0 || range.baseArrayLayer >= layers ||
+	        range.layerCount > layers - range.baseArrayLayer ||
+	        (range.aspectMask & aspects) != range.aspectMask);
+	const bool full_subresources = range.baseMipLevel == 0 &&
+	                               range.levelCount == image.info.resources.levels &&
+	                               range.baseArrayLayer == 0 && range.layerCount == layers;
+	const bool full_image = range.aspectMask == aspects && full_subresources;
+	TrackImage(id);
+	if (!full_image && (image.IsBufferModified() || image.IsCpuDirty())) {
+		InitializeImage(id);
+		if (image.info.samples == 1 && (image.IsBufferModified() || image.IsCpuDirty())) {
+			EXIT("TextureCache: image clear retained guest ownership\n");
+		}
+	}
+	if (image.info.HasStencil() && (range.aspectMask & vk::ImageAspectFlagBits::eStencil)) {
+		const auto stencil_id = AssociateStencil(id, image.info.stencil);
+		if (!full_subresources) {
+			RefreshImage(stencil_id);
+		} else {
+			TrackImage(stencil_id);
+			CommitGpuWrite(m_slot_images[stencil_id]);
+		}
+	}
+	command.EndRendering();
+	if (format != image.backing.format || (image.info.IsVolume() && !full_image)) {
+		EXIT_NOT_IMPLEMENTED(range.aspectMask != vk::ImageAspectFlagBits::eColor ||
+		                     range.levelCount != 1);
+		BeginColorRendering(image, format, range.baseMipLevel, range.baseArrayLayer,
+		                    range.layerCount, &clear, command.Handle());
+		command.Handle().endRendering();
+		CommitGpuWrite(image);
+		return;
+	}
+	image.Transit(vk::ImageLayout::eTransferDstOptimal, vk::AccessFlagBits2::eTransferWrite, {},
+	              command.Handle());
+	auto native_range = range;
+	if (image.info.IsVolume()) {
+		native_range.baseArrayLayer = 0;
+		native_range.layerCount     = 1;
+	}
+	if (range.aspectMask == vk::ImageAspectFlagBits::eColor) {
+		command.Handle().clearColorImage(image.backing.image, vk::ImageLayout::eTransferDstOptimal,
+		                                 &clear.color, 1, &native_range);
+	} else {
+		command.Handle().clearDepthStencilImage(image.backing.image,
+		                                        vk::ImageLayout::eTransferDstOptimal,
+		                                        &clear.depthStencil, 1, &native_range);
+	}
+	CommitGpuWrite(image);
+}
+
+vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, uint32_t level,
+                                             uint32_t layer, uint32_t layers,
+                                             const vk::ClearValue* clear,
+                                             const CommandRecorder& command) {
+	ImageViewInfo view {};
+	view.format      = format;
+	view.type        = layers == 1 ? vk::ImageViewType::e2D : vk::ImageViewType::e2DArray;
+	view.base_level  = level;
+	view.base_layer  = layer;
+	view.layer_count = layers;
+	view.usage       = vk::ImageUsageFlagBits::eColorAttachment;
+	image.Transit(vk::ImageLayout::eColorAttachmentOptimal,
+	              vk::AccessFlagBits2::eColorAttachmentRead |
+	                  vk::AccessFlagBits2::eColorAttachmentWrite,
+	              {}, command);
+	vk::RenderingAttachmentInfo attachment {};
+	attachment.imageView   = image.FindView(view);
+	attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	attachment.loadOp      = vk::AttachmentLoadOp::eLoad;
+	attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+	if (clear != nullptr) {
+		attachment.loadOp     = vk::AttachmentLoadOp::eClear;
+		attachment.clearValue = *clear;
+	}
+	vk::RenderingInfo rendering {};
+	rendering.renderArea.extent    = {std::max(image.info.extent.width >> level, 1u),
+	                                  std::max(image.info.extent.height >> level, 1u)};
+	rendering.layerCount           = layers;
+	rendering.colorAttachmentCount = 1;
+	rendering.pColorAttachments    = &attachment;
+	command.beginRendering(&rendering);
+	return rendering.renderArea;
+}
+
+void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
+	const auto&    info             = image.info;
+	const auto     layers           = info.resources.layers;
+	const auto     full_slice_size  = info.linear_slice_stride;
+	const auto     transfer_bytes   = DepthAspectTransferBytes(info.pixel_format);
+	const uint64_t texels_per_slice = static_cast<uint64_t>(info.pitch) * info.extent.height;
+	EXIT_NOT_IMPLEMENTED(transfer_bytes == 0 || texels_per_slice > UINT32_MAX ||
+	                     texels_per_slice > UINT64_MAX / transfer_bytes ||
+	                     texels_per_slice > UINT64_MAX / info.bytes_per_block);
+	const uint64_t transfer_slice = texels_per_slice * transfer_bytes;
+	const uint64_t guest_slice    = texels_per_slice * info.bytes_per_block;
+	EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
+	const uint64_t transfer_size = transfer_slice * layers;
+	EXIT_NOT_IMPLEMENTED(guest_slice > full_slice_size);
+	if (transfer_bytes == info.bytes_per_block) {
+		if (!info.IsTiled()) {
+			const auto copies = info.BufferCopies(destination_offset);
+			image.Download(copies, destination.Handle(), destination_offset, info.data.size);
+		} else {
+			const auto copies = info.BufferCopies();
+			m_tiler.TileImage(image, copies, destination.Handle(), destination_offset,
+			                  info.data.size);
+		}
+		return;
+	}
+	EXIT_NOT_IMPLEMENTED(info.bytes_per_block != sizeof(uint16_t) ||
+	                     transfer_bytes != sizeof(uint32_t));
+	const std::array copies {vk::BufferImageCopy {0,
+	                                              info.pitch,
+	                                              info.extent.height,
+	                                              {vk::ImageAspectFlagBits::eDepth, 0, 0, layers},
+	                                              {},
+	                                              info.extent}};
+	auto host_linear = m_tiler.GetScratchBuffer(transfer_size);
+	image.Download(copies, host_linear.buffer, 0, host_linear.size);
+	const bool tiled        = info.IsTiled();
+	auto guest_linear = tiled ? m_tiler.GetScratchBuffer(info.LinearSize(), host_linear.buffer)
+	                          : TileManager::Result {destination.Handle(), destination_offset,
+	                                                 destination.Size() - destination_offset};
+	m_tiler.ConvertD16(host_linear, guest_linear, TileManager::D16Direction::Demote,
+	                   DepthAspectTransferFormat(info.pixel_format) == vk::Format::eD32Sfloat,
+	                   {.width               = info.extent.width,
+	                    .height              = info.extent.height,
+	                    .layers              = layers,
+	                    .source_row_stride   = static_cast<uint64_t>(info.pitch) * sizeof(uint32_t),
+	                    .target_row_stride   = static_cast<uint64_t>(info.pitch) * sizeof(uint16_t),
+	                    .source_slice_stride = transfer_slice,
+	                    .target_slice_stride = full_slice_size});
+	if (tiled) {
+		m_tiler.Tile(guest_linear.buffer, guest_linear.offset, guest_linear.size,
+		             destination.Handle(), destination_offset, info.data.size, info);
+	}
+}
+
+void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t destination_offset,
+                                 uint64_t destination_size, uint32_t levels) {
+	if (UploadBinding(image) == BindingType::DepthTarget) {
+		EXIT_IF(destination_size != image.info.data.size || levels != image.info.resources.levels);
+		DownloadDepth(image, destination, destination_offset);
+		return;
+	}
+
+	const auto& info      = image.info;
+	const auto  transform = info.GetColorTransform();
+	if (info.IsTiled()) {
+		const auto copies = info.BufferCopies(0, levels);
+		m_tiler.TileImage(image, copies, destination.Handle(), destination_offset, destination_size,
+		                  levels);
+	} else if (transform != ColorTransform::None) {
+		auto       linear = m_tiler.GetScratchBuffer(destination_size);
+		const auto copies = info.BufferCopies(0, levels);
+		image.Download(copies, linear.buffer, 0, linear.size);
+		m_tiler.TransformColor(linear, {destination.Handle(), destination_offset, destination_size},
+		                       transform, false);
+	} else {
+		const auto copies = info.BufferCopies(destination_offset, levels);
+		image.Download(copies, destination.Handle(), destination_offset, destination_size);
+	}
+}
+
+bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uint64_t size) {
+	const auto selected = m_texture_cache.FindImageFromRange(vaddr, size);
+	if (!selected) {
+		return false;
+	}
+
+	std::scoped_lock lock {m_texture_cache.m_lock};
+	auto& image = m_texture_cache.m_slot_images[selected];
+	if (!image.SafeToDownload()) {
+		return false;
+	}
+	if (!buffer.IsInBounds(image.info.data.address, 1)) {
+		return false;
+	}
+	const auto buf_offset = buffer.Offset(image.info.data.address);
+	const auto available  = buffer.Size() - buf_offset;
+	uint32_t   levels     = 0;
+	uint64_t   copy_size  = 0;
+	if (buffer.IsInBounds(image.info.data.address, image.info.data.size)) {
+		levels    = image.info.resources.levels;
+		copy_size = image.info.data.size;
+	} else if (image.info.IsVolume() || image.info.resources.layers > 1) {
+		return false;
+	} else {
+		for (; levels < image.info.resources.levels; ++levels) {
+			const auto& mip = image.info.mip_layout[levels];
+			if (mip.size == 0 || mip.offset > available || mip.size > available - mip.offset) {
+				break;
+			}
+			copy_size = std::max(copy_size, mip.offset + mip.size);
+		}
+	}
+	if (copy_size == 0) {
+		return false;
+	}
+	if (!m_texture_cache.CanDownload(image) ||
+	    (TextureCache::UploadBinding(image) == TextureCache::BindingType::DepthTarget &&
+	     copy_size != image.info.data.size)) {
+		return false;
+	}
+	ForgetColorMetadataChecks(image.info.data.address, copy_size);
+	InvalidateCopyFeedback(image.info.data.address, copy_size);
+	m_texture_cache.DownloadImage(image, buffer, buf_offset, copy_size, levels);
+	return true;
+}
+
+bool TextureCache::DownloadImageMemory(ImageId id) {
+	auto& image = m_slot_images[id];
+	if (image.depth_id) {
+		return false;
+	}
+	if (!image.SafeToDownload() || !CanDownload(image)) {
+		return false;
+	}
+	const auto range = image.info.data;
+	auto download = m_buffer_cache.GetUtilityBuffer(MemoryUsage::Download)
+	                    .MapDownload(range.size, std::max<uint64_t>(image.info.bytes_per_block, 4));
+	if (!LibKernel::Memory::TryReadBacking(range.address, download.mapped, range.size)) {
+		return false;
+	}
+	download.buffer->Flush(download.offset, range.size);
+
+	DownloadImage(image, *download.buffer, download.offset, range.size,
+	              image.info.resources.levels);
+	Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureDownloadBytes, range.size);
+	vk::BufferMemoryBarrier barrier {};
+	barrier.srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eTransferWrite |
+	                        vk::AccessFlagBits::eShaderWrite;
+	barrier.dstAccessMask = vk::AccessFlagBits::eHostRead;
+	barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+	barrier.buffer              = download.buffer->Handle();
+	barrier.offset              = download.offset;
+	barrier.size                = range.size;
+	m_scheduler.EndRendering();
+	m_scheduler.Current().Handle().pipelineBarrier(vk::PipelineStageFlagBits::eAllCommands,
+	                                               vk::PipelineStageFlagBits::eHost, {}, 0, nullptr,
+	                                               1, &barrier, 0, nullptr);
+	const WriteBack write_back {range, m_scheduler.CurrentTick()};
+	if (m_readback_storage_images) {
+		{
+			std::scoped_lock write_back_lock {m_write_back_mutex};
+			m_write_backs.push_back(write_back);
+		}
+		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
+	}
+	m_scheduler.DeferPriorityOperation(
+	    [this, download = std::move(download), write_back, trapped = m_readback_storage_images] {
+		    download.buffer->Invalidate(download.offset, write_back.range.size);
+		    LibKernel::Memory::WriteBacking(write_back.range.address, download.mapped,
+		                                    write_back.range.size);
+		    if (trapped) {
+			    m_page_manager.UpdatePageWatchers<false, true>(write_back.range.address,
+			                                                   write_back.range.size);
+			    std::scoped_lock write_back_lock {m_write_back_mutex};
+			    m_write_backs.erase(std::ranges::find_if(
+			        m_write_backs, [&](const WriteBack& pending) { return pending == write_back; }));
+		    }
+	    },
+	    range.address, range.size);
+	return true;
+}
+
+uint64_t TextureCache::WriteBackTick(uint64_t address, uint64_t size) {
+	if (!m_readback_storage_images) {
+		return 0;
+	}
+	const auto begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	uint64_t   tick  = 0;
+
+	std::scoped_lock write_back_lock {m_write_back_mutex};
+	for (const auto& write_back: m_write_backs) {
+		if (write_back.range.address < end && begin < write_back.range.End()) {
+			tick = std::max(tick, write_back.tick);
+		}
+	}
+	return tick;
+}
+
+void TextureCache::InvalidateMemoryFromGPU(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
+		if (image.info.data.address != address) {
+			return;
+		}
+		image.ClearGpuModified();
+		image.MarkBufferModified();
+	});
+}
+
+bool TextureCache::CopyToImage(uint64_t address, uint64_t source, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	Common::SmallVector<ImageId, 8> targets;
+	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { targets.push_back(id); });
+	if (targets.size() != 1) {
+		return false;
+	}
+	auto&       image           = m_slot_images[targets.front()];
+	const auto& info            = image.info;
+	bool        source_modified = false;
+	ForEachImageInRegion(source, size, [&](ImageId, Image& owner) {
+		source_modified = owner.IsGpuModified();
+		return source_modified;
+	});
+	if (image.depth_id || !image.SafeToDownload() || !CanDownload(image) || !info.IsTiled() ||
+	    info.IsVolume() || info.IsDepth() || info.HasMetadata() || address < info.data.address ||
+	    source_modified) {
+		return false;
+	}
+	const auto layers  = info.resources.layers;
+	const auto stride  = info.data.size / layers;
+	const auto offset  = address - info.data.address;
+	const auto begin   = offset % stride;
+	const auto end     = begin + size;
+	uint64_t   covered = begin;
+	uint32_t   first   = 0;
+	uint32_t   count   = 0;
+	for (uint32_t level = info.resources.levels; level-- > 0;) {
+		const auto& mip     = info.mip_layout[level];
+		const auto  mip_end = mip.offset + mip.size / layers;
+		if (mip_end <= begin || mip.offset >= end) {
+			continue;
+		}
+		if (mip.offset < begin) {
+			return false;
+		}
+		covered = mip_end;
+		first   = level;
+		count++;
+	}
+	if (covered != end) {
+		return false;
+	}
+	ImageInfo  part   = info;
+	const auto extent = info.MipExtent(first);
+	part.data.size    = size;
+	part.extent       = {extent.width, extent.height, 1};
+	part.resources    = {count, 1};
+	part.first_tail_level -= std::min(first, info.first_tail_level);
+	uint64_t linear = 0;
+	for (uint32_t level = 0; level < count; level++) {
+		auto& mip = part.mip_layout[level] = info.mip_layout[first + level];
+		mip.offset -= begin;
+		mip.size /= layers;
+		mip.linear_offset = Common::AlignUp<uint64_t>(linear, std::max(info.bytes_per_block, 4u));
+		linear            = mip.linear_offset + mip.linear_size;
+	}
+	const auto [buffer, source_offset] = m_buffer_cache.ObtainBuffer(source, size, false);
+	const auto texels = m_tiler.Detile(buffer->Handle(), source_offset, part);
+	auto       copies = part.BufferCopies(texels.offset);
+	for (auto& copy: copies) {
+		copy.imageSubresource.mipLevel += first;
+		copy.imageSubresource.baseArrayLayer = static_cast<uint32_t>(offset / stride);
+	}
+	image.Upload(copies, texels.buffer, texels.offset, texels.size);
+	return true;
+}
+
+bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
+	if (!GuestRange {address, size}.Valid()) {
+		return false;
+	}
+	std::scoped_lock lock {m_lock};
+	bool             modified = false;
+	ForEachImageInRegion(address, size, [&](ImageId, Image& image) {
+		modified = !image.depth_id && image.IsGpuModified() && !image.IsDefinitelyCpuDirty();
+		return modified;
+	});
+	return modified;
+}
+
+void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
+	ImagePageTable::PageRange pages {};
+	if (ImagePageTable::TryGetPageRange(address, size, pages) &&
+	    !m_registered_pages.Any(pages.first, pages.last_exclusive)) {
+		return;
+	}
+	FlushLazyReadback(address, size);
+	std::scoped_lock lock {m_lock};
+	const auto       page_begin = Common::AlignDown(address, TRACKER_PAGE_SIZE);
+	const auto       page_end   = Common::AlignUp(address + size, TRACKER_PAGE_SIZE);
+	Common::SmallVector<ImageId, 8> image_ids;
+	ForEachImageInRegion(page_begin, page_end - page_begin,
+	                     [&](ImageId id, Image&) { image_ids.push_back(id); });
+	for (const auto id: image_ids) {
+		auto& owner = m_slot_images[id];
+		if (owner.Overlaps(address, size)) {
+			if (TryInvalidatePartial(owner, address, size, PartialDirtyGranule)) {
+				continue;
+			}
+			owner.MarkCpuDirty();
+			UntrackImage(id);
+			continue;
+		}
+		const auto image_begin = owner.info.data.address;
+		const auto image_end   = owner.info.data.End();
+		if (page_end < image_end) {
+			UntrackImageHead(id);
+		} else if (image_begin < page_begin) {
+			UntrackImageTail(id);
+		} else {
+			MarkAsMaybeDirty(id, owner);
+		}
+	}
+}
+
+bool TextureCache::IsMeta(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	return found != m_surface_metas.end();
+}
+
+bool TextureCache::IsMetaCleared(uint64_t address, uint32_t slice) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
+		return false;
+	}
+	return found->second.clear_mask.test(slice);
+}
+
+bool TextureCache::ClearMeta(uint64_t address) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	found->second.clear_mask.set();
+	m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+bool TextureCache::CoversMeta(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end()) {
+		return false;
+	}
+	const auto* owner = m_slot_images.try_get(found->second.owner);
+	if (owner == nullptr || owner->info.metadata.range.address != address) {
+		return true;
+	}
+	const auto& info = owner->info;
+	return size >= info.metadata.range.size / std::max(info.resources.layers, 1u);
+}
+
+bool TextureCache::TouchMeta(uint64_t address, uint32_t slice, bool is_clear) {
+	std::scoped_lock lock {m_lock};
+	const auto       found = m_surface_metas.find(address);
+	if (found == m_surface_metas.end() || slice >= found->second.clear_mask.size()) {
+		return false;
+	}
+	found->second.clear_mask.set(slice, is_clear);
+	m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
+	return true;
+}
+
+bool TextureCache::HasGpuWrittenImages(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	bool             written = false;
+	ForEachImageInRegion(address, size, [&](ImageId id, Image& image) {
+		written = image.IsGpuModified() || image.readback_begin != 0 ||
+		          m_download_images.contains(id);
+		return written;
+	});
+	return written;
+}
+
+bool TextureCache::IsRegionRegistered(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	bool             registered = false;
+	ForEachImageInRegion(address, size, [&](ImageId, Image&) {
+		registered = true;
+		return true;
+	});
+	return registered;
+}
+
+void TextureCache::UnmapMemory(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	DiscardParkedImages(address, size);
+	m_surface_metas.erase(m_surface_metas.lower_bound(address),
+	                      m_surface_metas.lower_bound(address + size));
+	m_meta_epoch.fetch_add(1, std::memory_order_relaxed);
+	Common::SmallVector<ImageId, 16> deleted_images;
+	ForEachImageInRegion(address, size, [&](ImageId id, Image&) { deleted_images.push_back(id); });
+	for (const auto id: deleted_images) {
+		auto owner = m_slot_images.try_get(id);
+		if (owner == nullptr) {
+			continue;
+		}
+		if (owner->Overlaps(address, size) &&
+		    (address > owner->info.data.address || address + size < owner->info.data.End()) &&
+		    TryInvalidatePartial(*owner, address, size, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		FreeImage(id);
+	}
+}
+
+void TextureCache::MapMemory(uint64_t address, uint64_t size) {
+	std::scoped_lock lock {m_lock};
+	Common::SmallVector<ImageId, 8> mapped_images;
+	ForEachImageInRegion(address, size, [&](ImageId id, Image& image) {
+		if (image.partial_candidate && image.Overlaps(address, size)) {
+			mapped_images.push_back(id);
+		}
+	});
+	for (const auto id: mapped_images) {
+		auto& owner = m_slot_images[id];
+		if (TryInvalidatePartial(owner, address, size, TRACKER_PAGE_SIZE)) {
+			continue;
+		}
+		owner.MarkCpuDirty();
+		UntrackImage(id);
+	}
+}
+
+void TextureCache::RunGarbageCollector() {
+	std::scoped_lock lock {m_lock};
+	const uint64_t   tick = m_gc_tick++;
+	DiscardParkedImages(0, 0);
+	if (m_graphics.CanReportMemoryUsage()) {
+		m_total_used_memory = m_graphics.GetDeviceMemoryUsage();
+	}
+	if (m_total_used_memory < m_trigger_gc_memory) {
+		return;
+	}
+	const auto collect = [&](bool allow_aggressive) {
+		bool     pressured  = m_total_used_memory >= m_pressure_gc_memory;
+		bool     aggressive = allow_aggressive && m_total_used_memory >= m_critical_gc_memory;
+		uint64_t age        = 16;
+		size_t   deletions  = 10;
+		if (aggressive) {
+			age       = 160;
+			deletions = 40;
+		} else if (pressured) {
+			age       = 80;
+			deletions = 20;
+		}
+		age = std::min(age, tick);
+		std::vector<ImageId> candidates;
+		m_lru_cache.ForEachItemBelow(tick - age, [&](ImageId id) { candidates.push_back(id); });
+		for (const auto id: candidates) {
+			if (deletions == 0) {
+				break;
+			}
+			auto owner = m_slot_images.try_get(id);
+			if (owner == nullptr || !owner->registered || owner->depth_id) {
+				continue;
+			}
+			if (owner->heap_refs.load(std::memory_order_relaxed) != 0u || owner->table_pins != 0) {
+				TouchImage(*owner);
+				continue;
+			}
+			if (owner->usage.render_target && owner->info.extent.width <= 1024 &&
+			    owner->info.extent.height <= 1024) {
+				continue;
+			}
+			if (owner->SafeToDownload() &&
+			    (!pressured || owner->info.HasStencil() || !DownloadImageMemory(id))) {
+				continue;
+			}
+			--deletions;
+			FreeImage(id);
+			Common::DebugCounters::Add(Common::DebugCounters::Counter::TextureEvictions);
+			if (m_total_used_memory < m_critical_gc_memory && aggressive) {
+				deletions >>= 2;
+				aggressive = false;
+			}
+			if (m_total_used_memory < m_pressure_gc_memory && pressured) {
+				deletions >>= 1;
+				pressured = false;
+			}
+		}
+	};
+	collect(false);
+	if (m_total_used_memory >= m_critical_gc_memory) {
+		collect(true);
+	}
+}
+
+void TextureCache::ProcessDownloadImages() {
+	if (!m_readback_linear_images && !m_readback_tiled_images) {
+		return;
+	}
+	(void)DownloadQueuedImages();
+}
+
+bool TextureCache::WriteBackImages() {
+	return m_readback_storage_images && DownloadQueuedImages();
+}
+
+bool TextureCache::DownloadQueuedImages() {
+	std::scoped_lock lock {m_lock};
+	bool             downloaded = false;
+	for (const auto id: m_download_images) {
+		if (m_slot_images[id].IsGpuModified()) {
+			downloaded |= DownloadImageMemory(id);
+		}
+	}
+	m_download_images.clear();
+	return downloaded;
+}
+
+}

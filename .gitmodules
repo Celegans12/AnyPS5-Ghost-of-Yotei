@@ -110,3 +110,18 @@
 [submodule "3rdparty/libpng"]
 	path = 3rdparty/libpng
 	url = https://github.com/pnggroup/libpng.git
+[submodule "3rdparty/fmt"]
+	path = 3rdparty/fmt
+	url = https://github.com/fmtlib/fmt.git
+[submodule "3rdparty/xxHash"]
+	path = 3rdparty/xxHash
+	url = https://github.com/Cyan4973/xxHash.git
+[submodule "3rdparty/magic_enum"]
+	path = 3rdparty/magic_enum
+	url = https://github.com/Neargye/magic_enum.git
+[submodule "3rdparty/xbyak"]
+	path = 3rdparty/xbyak
+	url = https://github.com/herumi/xbyak.git
+[submodule "3rdparty/zydis"]
+	path = 3rdparty/zydis
+	url = https://github.com/zyantific/zydis.git
