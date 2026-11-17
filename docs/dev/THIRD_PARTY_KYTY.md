@@ -161,3 +161,15 @@ default: at each `ACQUIRE_MEM` or `RELEASE_MEM` with GL2 write-back and at each 
 readback are copied back, and their pages stay read-protected until the copy lands. No other image is copied: the copy
 of every storage image on its first write still needs `KYTY_READBACK_STORAGE_IMAGES=1`. `KYTY_WRITE_BACK_IMAGES=0`
 restores KytyPS5's behaviour.
+
+`m_program_lock`, the spin lock of `graphics/host_gpu/renderer/pipeline/pipelineCache.cpp` that guards the program
+cache, has a narrower scope than upstream's in this build (`programLock.cpp`). The resolve thread always runs upstream's
+unlocked ahead mode, which upstream only uses with `KYTY_RESOLVE_HELPER=1`, and the execute thread releases the lock
+while it materializes the resources of a cached program, which can wait for the GPU when it reads GPU-written buffers.
+A waiter spins briefly, then yields. Three variables, read once:
+
+| Variables | Values |
+|---|---|
+| `KYTY_PROGRAM_LOCK` | `narrow` (default) or `wide`: upstream's scope and upstream's endless spin |
+| `KYTY_LOCK_STATS` | `0` (default) or `1`: every period, `[lock-stats]` lines on stderr with the wait and hold times of the lock per thread and per acquisition site, the time other threads waited on each site, and the guest reads of `GetProgram` inside and outside the lock |
+| `KYTY_LOCK_STATS_PERIOD` | seconds between two reports, 1 to 3600, 5 by default |

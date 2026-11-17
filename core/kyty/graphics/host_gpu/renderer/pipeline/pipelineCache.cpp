@@ -17,6 +17,9 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/pipeline/programLock.h"
+#endif
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/BufferFormat.h"
@@ -298,6 +301,16 @@ void RecordAheadLoads(void* userdata, std::span<const uint64_t> loads) {
 
 class ProgramLockGuard {
 public:
+#if defined(ANYPS5_KYTY)
+	explicit ProgramLockGuard(std::atomic_flag& flag, bool take = true,
+	                          std::source_location where = std::source_location::current())
+	    : m_flag(take ? &flag : nullptr) {
+		if (m_flag != nullptr) ProgramLock::Acquire(*m_flag, where);
+	}
+	~ProgramLockGuard() {
+		if (m_flag != nullptr) ProgramLock::Release(*m_flag);
+	}
+#else
 	explicit ProgramLockGuard(std::atomic_flag& flag, bool take = true): m_flag(take ? &flag : nullptr) {
 		if (m_flag == nullptr) return;
 		while (m_flag->test_and_set(std::memory_order_acquire)) {
@@ -309,6 +322,7 @@ public:
 	~ProgramLockGuard() {
 		if (m_flag != nullptr) m_flag->clear(std::memory_order_release);
 	}
+#endif
 	ProgramLockGuard(const ProgramLockGuard&)            = delete;
 	ProgramLockGuard& operator=(const ProgramLockGuard&) = delete;
 
@@ -317,8 +331,16 @@ private:
 };
 
 thread_local bool t_ahead_unlocked = false;
+#if defined(ANYPS5_KYTY)
+thread_local bool t_execute_unlocked = false;
+#endif
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
+#if defined(ANYPS5_KYTY)
+	if (ProgramLock::Enabled()) {
+		return !values.empty() && ProgramLock::TimedGuestRead(address, values);
+	}
+#endif
 	return !values.empty() &&
 	       Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes());
 }
@@ -1004,6 +1026,13 @@ ShaderModule* PipelineCache::Program::FindModule(const ShaderRecompiler::IR::Srt
 	if (failed) {
 		return nullptr;
 	}
+#if defined(ANYPS5_KYTY)
+	return MatchModule<HasCalls>(push_data_cursor);
+}
+
+template <bool HasCalls>
+ShaderModule* PipelineCache::Program::MatchModule(uint32_t push_data_cursor) {
+#endif
 	const auto matches = [&](const ShaderModule& candidate) {
 		const auto& layout = candidate.info.bindings;
 		if (layout.push_data_start_dword != ShaderRecompiler::IR::PushData::StartFor(
@@ -1112,6 +1141,17 @@ void PipelineCache::AddedModule(const ProgramKey& key, const Program& program,
                                 const ShaderRecompiler::CompileOptions& options,
                                 std::span<const uint32_t> code, uint32_t push_data_cursor) {
 	m_compiled[static_cast<size_t>(key.stage)]++;
+#if defined(ANYPS5_KYTY)
+	if (ProgramLock::Narrow()) {
+		ProgramLock::DeferLine(fmt::format(
+		    "Shaders: VS {} | PS {} | CS {} | GS {} | LS {} | HS {} | TES {}\n",
+		    m_compiled[static_cast<size_t>(ShaderType::Vertex)], m_compiled[static_cast<size_t>(ShaderType::Pixel)],
+		    m_compiled[static_cast<size_t>(ShaderType::Compute)], m_compiled[static_cast<size_t>(ShaderType::Mesh)],
+		    m_compiled[static_cast<size_t>(ShaderType::Local)],
+		    m_compiled[static_cast<size_t>(ShaderType::TessellationControl)],
+		    m_compiled[static_cast<size_t>(ShaderType::TessellationEvaluation)]));
+	} else
+#endif
 	std::printf("Shaders: VS %u | PS %u | CS %u | GS %u | LS %u | HS %u | TES %u\n",
 	            m_compiled[static_cast<size_t>(ShaderType::Vertex)],
 	            m_compiled[static_cast<size_t>(ShaderType::Pixel)],
@@ -1203,6 +1243,36 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		auto& cached = entry->second;
 		if (cached.skip_dispatch) return nullptr;
 		ShaderModule* module = nullptr;
+#if defined(ANYPS5_KYTY)
+		if (t_execute_unlocked) {
+			const auto& key          = entry->first;
+			bool        materialized = true;
+			UnlockPrograms();
+			if (cached.call_source) {
+				source_changed     = cached.RefreshCallSource(runtime);
+				runtime.call_words = cached.call_source->call_words;
+				materialized       = !source_changed && !cached.call_source->refresh_failed;
+			}
+			if (materialized) {
+				failed = !ShaderRecompiler::IR::MaterializeResources(cached.resource_plan, runtime, cached.resources,
+				                                                     cached.specialization);
+			}
+			LockPrograms();
+			entry = m_program_cache.find(key);
+			if (cached.call_source && cached.call_source->refresh_failed) {
+				SkipCallExpansionFailure(params.hash, *cached.call_source);
+				cached.skip_dispatch = true;
+				return nullptr;
+			}
+			if (materialized && !failed) {
+				module = cached.call_source ? cached.MatchModule<true>(push_data_cursor)
+				                            : cached.MatchModule<false>(push_data_cursor);
+			}
+			if (!failed && module == nullptr) {
+				m_lookup_key = key;
+			}
+		} else
+#endif
 		if (cached.call_source) {
 			source_changed = cached.RefreshCallSource(runtime);
 			if (cached.call_source->refresh_failed) {
@@ -1610,6 +1680,11 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 	     db.shader_execute_on_noop || sh.AlphaToMask());
 	state.ps_active = pixel_active;
 	const bool tess_active = user_config.GetPrimType() == Prospero::PrimitiveType::kPatch;
+#if defined(ANYPS5_KYTY)
+	if (ahead != nullptr && !t_ahead_unlocked && ProgramLock::Narrow()) {
+		SyncAheadWrites(AheadWritesSequence());
+	}
+#endif
 	const ShaderGuestReaderScope reader(ahead != nullptr ? ReadAheadShaderState : nullptr,
 	                                    ahead != nullptr ? &ahead->reads : nullptr);
 	std::array<ShaderParams, 3> vertex_params;
@@ -1963,6 +2038,15 @@ struct PipelineCache::CompileJob {
 	TableVariant*                                               table = nullptr;
 };
 
+#if defined(ANYPS5_KYTY)
+void PipelineCache::LockPrograms(std::source_location where) {
+	ProgramLock::Acquire(m_program_lock, where);
+}
+
+void PipelineCache::UnlockPrograms() {
+	ProgramLock::Release(m_program_lock);
+}
+#else
 void PipelineCache::LockPrograms() {
 	while (m_program_lock.test_and_set(std::memory_order_acquire)) {
 		while (m_program_lock.test(std::memory_order_relaxed)) {
@@ -1974,6 +2058,7 @@ void PipelineCache::LockPrograms() {
 void PipelineCache::UnlockPrograms() {
 	m_program_lock.clear(std::memory_order_release);
 }
+#endif
 
 template <typename InputInfo>
 void PipelineCache::QueueCompile(const ProgramKey& key, const ShaderParams& params,
@@ -2615,6 +2700,21 @@ void PipelineCache::BeginAheadThread(uint32_t slot) {
 	t_ahead_unlocked = true;
 }
 
+#if defined(ANYPS5_KYTY)
+bool PipelineCache::NarrowProgramLock() {
+	return ProgramLock::Narrow();
+}
+
+void PipelineCache::BeginExecuteThread() {
+	static std::atomic_flag claimed;
+	if (!ProgramLock::Narrow() || claimed.test_and_set(std::memory_order_relaxed)) {
+		return;
+	}
+	ShaderRecompiler::IR::UsePlanScratchSlot(2);
+	t_execute_unlocked = true;
+}
+#endif
+
 uint64_t PipelineCache::AheadWritesSequence() {
 	return g_ahead_writes_sequence.load(std::memory_order_relaxed);
 }
@@ -2658,6 +2758,11 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t push_data_cursor =
 	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
+#if defined(ANYPS5_KYTY)
+	if (!t_ahead_unlocked && ProgramLock::Narrow()) {
+		SyncAheadWrites(AheadWritesSequence());
+	}
+#endif
 	const ProgramLockGuard lock(m_program_lock, !t_ahead_unlocked);
 	return GetAhead(params, input_info, push_data_cursor, ahead);
 }

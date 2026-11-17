@@ -365,6 +365,9 @@ void GuestGpu::ExecutionThread() {
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Execution);
 	g_gpu_thread    = true;
 	g_executing_gpu = this;
+#if defined(ANYPS5_KYTY)
+	PipelineCache::BeginExecuteThread();
+#endif
 	BdaDirtyRegions::g_translating = true;
 	constexpr uint32_t NotifyInterval = 16;
 	uint32_t           unnotified     = 0;
@@ -500,10 +503,19 @@ void GuestGpu::ResolveThread() {
 	Config::ConfigureGpuStageThread(Config::GpuStageThread::Resolve);
 	auto& executor = m_renderer.GetRenderExecutor();
 	std::optional<ResolveHelper> helper;
+#if defined(ANYPS5_KYTY)
+	if (Config::ResolveHelperEnabled() || PipelineCache::NarrowProgramLock()) {
+		PipelineCache::BeginAheadThread(0);
+	}
+	if (Config::ResolveHelperEnabled()) {
+		helper.emplace(executor);
+	}
+#else
 	if (Config::ResolveHelperEnabled()) {
 		PipelineCache::BeginAheadThread(0);
 		helper.emplace(executor);
 	}
+#endif
 	for (;;) {
 		auto operation = m_operations.TryPop();
 		if (!operation) {
