@@ -239,6 +239,20 @@ void SetHeapMirrorBudget(std::uint64_t bytes) {
 }
 
 namespace {
+
+bool CopyChangingSource(const Context& context, VkCommandBuffer commands, Recorder& recorder, std::uint64_t address, std::size_t bytes, VkBuffer destination, VkDeviceSize offset) {
+    if (bytes == 0 || !Recorder::EarlyEndOfPipe() || !recorder.ChangingRead(address, bytes) || recorder.PendingWriteOverlaps(address, bytes)) return false;
+    auto slice = recorder.DrawUpload(bytes);
+    GuestMemory::Read(address, std::span<std::byte>(slice.bytes, bytes), 1);
+    CopyBuffer(context, commands, slice.buffer->Handle(), slice.offset, destination, offset, bytes);
+    recorder.Keep(std::move(slice.buffer));
+    Recorder::CountChangingCopy(bytes);
+    return true;
+}
+
+}
+
+namespace {
 struct RefreshBlock;
 static thread_local GuestBufferMemory* buildingBufferMemory = nullptr;
 static thread_local std::vector<RefreshBlock>* buildingBlocks = nullptr;
@@ -7434,8 +7448,10 @@ void GuestBufferMemory::recordTwinCopies(std::span<Region* const> twins, Recorde
         auto* region = fill.region;
         const auto bytes = region->end - region->begin;
         recorder.Keep(region->buffer);
-        CopyBuffer(context, commands, region->copySource, region->begin - region->copySourceBase, region->buffer->Handle(), 0, bytes);
-        recorder.NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+        if (!CopyChangingSource(context, commands, recorder, region->begin, static_cast<std::size_t>(bytes), region->buffer->Handle(), 0)) {
+            CopyBuffer(context, commands, region->copySource, region->begin - region->copySourceBase, region->buffer->Handle(), 0, bytes);
+            recorder.NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+        }
         region->snapshot.clear();
         region->twinChecked = noteTwinFilled(region->twin, region->copySource, fill.generation, registryGeneration);
         copied += bytes;
@@ -8457,14 +8473,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         }
         if (sources.empty()) {
             const auto bytes = static_cast<std::size_t>(to - from);
-            if (Recorder::EarlyEndOfPipe() && recorder->ChangingRead(from, bytes) && !recorder->PendingWriteOverlaps(from, bytes)) {
-                auto slice = recorder->DrawUpload(bytes);
-                GuestMemory::Read(from, std::span<std::byte>(slice.bytes, bytes), 1);
-                CopyBuffer(context, commands, slice.buffer->Handle(), slice.offset, region.buffer->Handle(), from - region.begin, to - from);
-                recorder->Keep(std::move(slice.buffer));
-                Recorder::CountChangingCopy(bytes);
-                return to - from;
-            }
+            if (CopyChangingSource(context, commands, *recorder, from, bytes, region.buffer->Handle(), from - region.begin)) return to - from;
             CopyBuffer(context, commands, region.copySource, from - region.copySourceBase, region.buffer->Handle(), from - region.begin, to - from);
             recorder->NotePendingRead(from, bytes, Recorder::ReadKind::GpuCopy);
             return to - from;
@@ -8605,8 +8614,9 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         recorder->Keep(region->buffer);
         const bool viaShadow = inputSnapshot == nullptr && expected.empty() && usesResident(*region);
         auto importedBytes = bytes;
+        const bool copiedChanging = !viaShadow && inputSnapshot == nullptr && CopyChangingSource(context, commands, *recorder, region->begin, static_cast<std::size_t>(bytes), region->buffer->Handle(), 0);
         if (viaShadow) importedBytes = copyGuest(*region, region->begin, region->end, true);
-        else CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        else if (!copiedChanging) CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
         if (viaShadow && verifyResident && importedBytes != bytes) verifyAgainstImport(*region);
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -8625,7 +8635,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 CaptureTrace::Log("copy-input-result batch=%llu address=%llx bytes=%zu changed=%zu", batch, static_cast<unsigned long long>(address), expected.size(), changed);
             });
         }
-        if (inputSnapshot == nullptr && !viaShadow) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+        if (inputSnapshot == nullptr && !viaShadow && !copiedChanging) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
         region->snapshot.clear();
         if (region->deviceLocal) traceStaged(region->begin, region->end, region->atomic);
         if (profile) {
