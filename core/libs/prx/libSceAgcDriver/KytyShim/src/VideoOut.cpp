@@ -16,6 +16,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 #include "libs/errno.h"
 
+#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -155,12 +156,69 @@ void WaitRunningUrgentCommands(std::function<void()> blocking) {
     waiting.get();
 }
 
-PFN_vkGetInstanceProcAddr LoadVulkanLoader() {
-    static void* const library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (library == nullptr) EXIT("kyty presentation: cannot load libvulkan.so.1: %s\n", dlerror());
-    const auto proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr"));
-    if (proc == nullptr) EXIT("kyty presentation: libvulkan.so.1 has no vkGetInstanceProcAddr\n");
+struct LoaderLock {
+    LoaderLock() { AgcDriverLockVulkanLoader_nid_postfix(); }
+    ~LoaderLock() { AgcDriverUnlockVulkanLoader_nid_postfix(); }
+    LoaderLock(const LoaderLock&) = delete;
+    LoaderLock& operator=(const LoaderLock&) = delete;
+};
+
+PFN_vkGetInstanceProcAddr LoaderGetInstanceProcAddr() {
+    static const PFN_vkGetInstanceProcAddr proc = [] {
+        const LoaderLock lock;
+        void* const library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
+        if (library == nullptr) EXIT("kyty presentation: cannot load libvulkan.so.1: %s\n", dlerror());
+        const auto found = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr"));
+        if (found == nullptr) EXIT("kyty presentation: libvulkan.so.1 has no vkGetInstanceProcAddr\n");
+        return found;
+    }();
     return proc;
+}
+
+template <typename Function>
+Function LoaderGlobal(const char* name) {
+    const auto function = reinterpret_cast<Function>(LoaderGetInstanceProcAddr()(VK_NULL_HANDLE, name));
+    if (function == nullptr) EXIT("kyty presentation: the Vulkan loader has no %s\n", name);
+    return function;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LockedCreateInstance(const VkInstanceCreateInfo* info, const VkAllocationCallbacks* allocator, VkInstance* instance) {
+    const LoaderLock lock;
+    return LoaderGlobal<PFN_vkCreateInstance>("vkCreateInstance")(info, allocator, instance);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LockedEnumerateInstanceExtensionProperties(const char* layer, std::uint32_t* count, VkExtensionProperties* properties) {
+    const LoaderLock lock;
+    return LoaderGlobal<PFN_vkEnumerateInstanceExtensionProperties>("vkEnumerateInstanceExtensionProperties")(layer, count, properties);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LockedEnumerateInstanceLayerProperties(std::uint32_t* count, VkLayerProperties* properties) {
+    const LoaderLock lock;
+    return LoaderGlobal<PFN_vkEnumerateInstanceLayerProperties>("vkEnumerateInstanceLayerProperties")(count, properties);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL LockedEnumerateInstanceVersion(std::uint32_t* version) {
+    const LoaderLock lock;
+    return LoaderGlobal<PFN_vkEnumerateInstanceVersion>("vkEnumerateInstanceVersion")(version);
+}
+
+VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL LockedGetInstanceProcAddr(VkInstance instance, const char* name) {
+    const auto loader = LoaderGetInstanceProcAddr();
+    if (instance == VK_NULL_HANDLE && name != nullptr) {
+        if (std::strcmp(name, "vkGetInstanceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedGetInstanceProcAddr);
+        if (std::strcmp(name, "vkCreateInstance") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedCreateInstance);
+        if (std::strcmp(name, "vkEnumerateInstanceExtensionProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedEnumerateInstanceExtensionProperties);
+        if (std::strcmp(name, "vkEnumerateInstanceLayerProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedEnumerateInstanceLayerProperties);
+        if (std::strcmp(name, "vkEnumerateInstanceVersion") == 0) {
+            return loader(VK_NULL_HANDLE, name) == nullptr ? nullptr : reinterpret_cast<PFN_vkVoidFunction>(&LockedEnumerateInstanceVersion);
+        }
+    }
+    return loader(instance, name);
+}
+
+PFN_vkGetInstanceProcAddr LoadVulkanLoader() {
+    LoaderGetInstanceProcAddr();
+    return &LockedGetInstanceProcAddr;
 }
 
 std::vector<const char*> SurfaceInstanceExtensions(PFN_vkGetInstanceProcAddr proc) {
