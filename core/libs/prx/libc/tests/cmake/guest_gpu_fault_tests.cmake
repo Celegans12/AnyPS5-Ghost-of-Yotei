@@ -1,0 +1,7 @@
+if(BUILD_TESTING AND ANYPS5_GPU_BACKEND STREQUAL "kyty" AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    add_test_executable(guest_gpu_fault_tests tests/GuestGpuFault.cpp)
+    target_include_directories(guest_gpu_fault_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_gpu_fault_tests PRIVATE libkernel libc)
+    add_test(NAME guest_gpu_fault COMMAND guest_gpu_fault_tests)
+    set_tests_properties(guest_gpu_fault PROPERTIES TIMEOUT 60)
+endif()
