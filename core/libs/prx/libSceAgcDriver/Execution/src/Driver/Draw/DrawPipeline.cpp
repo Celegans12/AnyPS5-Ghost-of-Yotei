@@ -154,7 +154,7 @@ std::string transportText(const char* name, const DrawPipeline::TransportCounts&
 unsigned DrawFinisher::Threads() {
     static const unsigned threads = [] {
         const char* text = std::getenv("APS5_FINISHER_THREADS");
-        if (text == nullptr) return 1u;
+        if (text == nullptr) return DriverDetail::DefaultFinisherThreads();
         return static_cast<unsigned>(std::clamp<unsigned long long>(std::strtoull(text, nullptr, 10), 1, MaxThreads));
     }();
     return threads;

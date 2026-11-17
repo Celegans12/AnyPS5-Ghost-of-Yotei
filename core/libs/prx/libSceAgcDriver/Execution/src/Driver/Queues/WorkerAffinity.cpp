@@ -4,6 +4,7 @@
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/general/ThreadName.hpp"
 #include "prx/libc/include/GuestPageTrack.hpp"
+#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -333,6 +334,33 @@ void ReserveFinisherPoolCore(unsigned index) {
     Reserve(FinisherSlot + index, "draw finisher of the pool", std::nullopt);
 #else
     static_cast<void>(index);
+#endif
+}
+
+unsigned DefaultFinisherThreads() {
+#ifdef __linux__
+    static const unsigned threads = [] {
+        constexpr std::size_t pipelineCores = 8;
+        constexpr std::size_t titleCores = 4;
+        if (!Switches().finisher || std::getenv("APS5_NO_FINISHER_POOL_CORES") != nullptr) return 1u;
+        const auto sets = SystemCpuSets();
+        std::vector<CpuTopology::CpuSet> taken;
+        while (taken.size() < pipelineCores) {
+            const auto reservation = CpuTopology::ChooseReservedCore(sets, taken, std::nullopt);
+            if (!reservation.has_value()) return 1u;
+            taken.push_back(reservation->chosen);
+        }
+        std::vector<CpuTopology::CpuSet> spare;
+        const auto sameCore = [](const CpuTopology::CpuSet& left, const CpuTopology::CpuSet& right) { return left.group == right.group && left.core == right.core; };
+        for (const auto& set : sets) {
+            const auto matches = [&](const CpuTopology::CpuSet& other) { return sameCore(other, set); };
+            if (std::none_of(taken.begin(), taken.end(), matches) && std::none_of(spare.begin(), spare.end(), matches)) spare.push_back(set);
+        }
+        return spare.size() >= titleCores ? 4u : 1u;
+    }();
+    return threads;
+#else
+    return 1;
 #endif
 }
 

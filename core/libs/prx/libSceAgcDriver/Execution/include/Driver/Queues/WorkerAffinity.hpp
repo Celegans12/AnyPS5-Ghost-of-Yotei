@@ -15,6 +15,8 @@ void ReserveFinisherCore();
 
 void ReserveFinisherPoolCore(unsigned index);
 
+unsigned DefaultFinisherThreads();
+
 void ReserveWalkerCore();
 
 void ReserveEncoderCore();
