@@ -10,6 +10,7 @@
 #include "prx/libkernel/include/Api.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <csignal>
 #include <condition_variable>
@@ -28,6 +29,7 @@
 #include <vector>
 
 #include <sys/mman.h>
+#include <unistd.h>
 
 namespace Memory = Libs::LibKernel::Memory;
 
@@ -637,6 +639,172 @@ void TestNoCrossWaitWithGpuThread() {
     std::printf("projection hooks under the locks of libkernel: %d synchronous GPU-thread reads of unreported, unmapped and code pages finished\n", g_crossWait.jobs);
 }
 
+bool SparseReadsOn() {
+    const char* value = std::getenv("ANYPS5_KYTY_SPARSE_READS");
+    return value == nullptr || *value == '\0' || std::strcmp(value, "1") == 0;
+}
+
+std::size_t ResidentPages(std::uint64_t address, std::size_t bytes) {
+    std::vector<unsigned char> pages((bytes + 0xfff) / 0x1000);
+    Require(mincore(reinterpret_cast<void*>(address), bytes, pages.data()) == 0);
+    return static_cast<std::size_t>(std::count_if(pages.begin(), pages.end(), [](unsigned char page) { return (page & 1u) != 0; }));
+}
+
+bool FileHole(int file, std::uint64_t offset, std::uint64_t bytes) {
+    const auto data = ::lseek(file, static_cast<off_t>(offset), SEEK_DATA);
+    if (data < 0) {
+        Require(errno == ENXIO);
+        return true;
+    }
+    return static_cast<std::uint64_t>(data) >= offset + bytes;
+}
+
+std::uint64_t SwapKib(std::uint64_t address) {
+    FILE* smaps = std::fopen("/proc/self/smaps", "r");
+    Require(smaps != nullptr);
+    char line[512];
+    bool inside = false;
+    std::uint64_t swap = 0;
+    while (std::fgets(line, sizeof(line), smaps) != nullptr) {
+        unsigned long long start = 0;
+        unsigned long long end = 0;
+        if (std::sscanf(line, "%llx-%llx", &start, &end) == 2) {
+            inside = start <= address && address < end;
+            continue;
+        }
+        unsigned long long kib = 0;
+        if (inside && std::sscanf(line, "Swap: %llu kB", &kib) == 1) swap = kib;
+    }
+    std::fclose(smaps);
+    return swap;
+}
+
+void ViewFiles(int* guestFile, int* directFile) {
+    Require(DirectMemoryViewFiles_nid_no_patch(guestFile, directFile) && *guestFile >= 0 && *directFile >= 0 && *guestFile != *directFile);
+}
+
+void RequireSparseReads(std::uint64_t address, const std::vector<std::uint8_t>& expected, std::size_t offset, std::size_t bytes) {
+    std::vector<std::uint8_t> read(bytes, 0xcc);
+    Require(Memory::TryReadBacking(address + offset, read.data(), bytes));
+    Require(std::memcmp(read.data(), expected.data() + offset, bytes) == 0);
+    std::fill(read.begin(), read.end(), 0xcc);
+    Require(Memory::TryReadSparseBacking(address + offset, read.data(), bytes));
+    Require(std::memcmp(read.data(), expected.data() + offset, bytes) == 0);
+    std::fill(read.begin(), read.end(), 0xcc);
+    Require(Memory::CopySparseMemory(address + offset, read.data(), bytes));
+    Require(std::memcmp(read.data(), expected.data() + offset, bytes) == 0);
+}
+
+void Put(std::uint8_t* guest, std::vector<std::uint8_t>& expected, std::size_t offset, std::size_t bytes, std::uint8_t seed) {
+    for (std::size_t i = 0; i < bytes; ++i) {
+        const auto value = static_cast<std::uint8_t>((seed + i * 13u) | 1u);
+        guest[offset + i] = value;
+        expected[offset + i] = value;
+    }
+}
+
+constexpr std::size_t KiB = 1024;
+
+void TestSparseReadsGuestFile() {
+    constexpr std::size_t bytes = 1024 * KiB;
+    int guestFile = -1;
+    int directFile = -1;
+    ViewFiles(&guestFile, &directFile);
+    const bool sparse = SparseReadsOn();
+    void* flexible = nullptr;
+    Require(sceKernelMapFlexibleMemory(&flexible, bytes, CpuReadWrite, 0) == 0 && flexible != nullptr);
+    const auto address = Address(flexible);
+    std::vector<std::uint8_t> expected(bytes, 0);
+    Require(ResidentPages(address, bytes) == 0 && FileHole(guestFile, address, bytes));
+    RequireSparseReads(address, expected, 0, bytes);
+    RequireSparseReads(address, expected, 3, bytes - 5);
+    if (sparse) Require(ResidentPages(address, bytes) == 0 && FileHole(guestFile, address, bytes));
+
+    auto* guest = static_cast<std::uint8_t*>(flexible);
+    Put(guest, expected, 4 * 0x1000 - 1, 2, 0x41);
+    Put(guest, expected, 64 * KiB - 100, 200, 0x52);
+    Put(guest, expected, 320 * KiB, Page, 0x63);
+    Put(guest, expected, 900 * KiB + 7, 3, 0x74);
+    Require(!FileHole(guestFile, address + 320 * KiB, Page) && !FileHole(guestFile, address + 900 * KiB, 0x1000));
+    const std::pair<std::size_t, std::size_t> ranges[] = {
+        {0, bytes}, {1, bytes - 2}, {4 * 0x1000 - 1, 2}, {4 * 0x1000 - 2, 4}, {60 * KiB, 200 * KiB}, {128 * KiB + 5, 600 * KiB},
+        {320 * KiB - 1, Page + 2}, {320 * KiB + 1, Page - 2}, {bytes - 128 * KiB, 128 * KiB}, {400 * KiB, 496 * KiB}};
+    for (const auto& [offset, size] : ranges) RequireSparseReads(address, expected, offset, size);
+    if (sparse) Require(ResidentPages(address + 400 * KiB, 496 * KiB) == 0 && FileHole(guestFile, address + 400 * KiB, 496 * KiB));
+    Require(sceKernelMunmap(address, bytes) == 0);
+    std::printf("guest memory file 0x%llx: holes read as zeros%s, data at page edges and across 64 KiB steps read back exactly\n", static_cast<unsigned long long>(address),
+        sparse ? " without being filled" : " (plain reads)");
+}
+
+void TestSparseReadsDirectFile() {
+    constexpr std::size_t half = 256 * KiB;
+    int guestFile = -1;
+    int directFile = -1;
+    ViewFiles(&guestFile, &directFile);
+    const bool sparse = SparseReadsOn();
+    const auto directSize = static_cast<int64_t>(sceKernelGetDirectMemorySize());
+    const int64_t top = directSize - 64 * 1024 * 1024;
+    int64_t low = -1;
+    int64_t high = -1;
+    Require(sceKernelAllocateDirectMemory(top, directSize, half, 0, 0, &low) == 0 && low >= top);
+    Require(sceKernelAllocateDirectMemory(top, directSize, half, 0, 0, &high) == 0 && high >= top && high != low);
+    Require(FileHole(directFile, static_cast<std::uint64_t>(low), half) && FileHole(directFile, static_cast<std::uint64_t>(high), half));
+    void* place = nullptr;
+    Require(sceKernelReserveVirtualRange(&place, 2 * half, 0, 0) == 0 && place != nullptr);
+    void* first = place;
+    void* second = static_cast<std::uint8_t*>(place) + half;
+    Require(sceKernelMapDirectMemory(&first, half, CpuReadWrite | GpuReadWrite, MapFixed, high, 0) == 0 && first == place);
+    Require(sceKernelMapDirectMemory(&second, half, CpuReadWrite | GpuReadWrite, MapFixed, low, 0) == 0 && second == static_cast<std::uint8_t*>(place) + half);
+    const auto address = Address(place);
+    Require(Memory::IsBackingReadable(address, 2 * half) && Memory::FindBackingPointer(address, 2 * half) == nullptr);
+    std::vector<std::uint8_t> expected(2 * half, 0);
+    Require(ResidentPages(address, 2 * half) == 0);
+    RequireSparseReads(address, expected, 0, 2 * half);
+    if (sparse) Require(ResidentPages(address, 2 * half) == 0 && FileHole(directFile, static_cast<std::uint64_t>(low), half) && FileHole(directFile, static_cast<std::uint64_t>(high), half));
+
+    auto* guest = static_cast<std::uint8_t*>(place);
+    Put(guest, expected, half - 1, 2, 0x35);
+    Put(guest, expected, half + 100 * KiB, 0x1000, 0x46);
+    const std::pair<std::size_t, std::size_t> ranges[] = {
+        {0, 2 * half}, {7, 2 * half - 9}, {half - 1, 2}, {half - 70 * KiB, 140 * KiB}, {half + 99 * KiB, 66 * KiB}, {half + 200 * KiB, 56 * KiB}};
+    for (const auto& [offset, size] : ranges) RequireSparseReads(address, expected, offset, size);
+    if (sparse) Require(FileHole(directFile, static_cast<std::uint64_t>(high), half - 64 * KiB) && ResidentPages(address, half - 64 * KiB) == 0);
+    Require(sceKernelMunmap(address, 2 * half) == 0);
+    Require(sceKernelReleaseDirectMemory(low, half) == 0 && sceKernelReleaseDirectMemory(high, half) == 0);
+    std::printf("direct memory file 0x%llx (two backings out of order): holes read as zeros%s, data across the backings read back exactly\n", static_cast<unsigned long long>(address),
+        sparse ? " without being filled" : " (plain reads)");
+}
+
+void TestSparseReadsSwappedPage() {
+    constexpr std::size_t bytes = 256 * KiB;
+    int guestFile = -1;
+    int directFile = -1;
+    ViewFiles(&guestFile, &directFile);
+    void* flexible = nullptr;
+    Require(sceKernelMapFlexibleMemory(&flexible, bytes, CpuReadWrite, 0) == 0 && flexible != nullptr);
+    const auto address = Address(flexible);
+    auto* guest = static_cast<std::uint8_t*>(flexible);
+    std::vector<std::uint8_t> expected(bytes, 0);
+    Put(guest, expected, 64 * KiB, Page, 0x27);
+    const auto before = SwapKib(address + 64 * KiB);
+    bool swapped = false;
+    for (int attempt = 0; attempt < 20 && !swapped; ++attempt) {
+        (void)madvise(guest + 64 * KiB, Page, MADV_PAGEOUT);
+        swapped = SwapKib(address + 64 * KiB) >= before + Page / KiB;
+        if (!swapped) std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    Require(!FileHole(guestFile, address + 64 * KiB, Page));
+    RequireSparseReads(address, expected, 0, bytes);
+    RequireSparseReads(address, expected, 64 * KiB - 3, Page + 6);
+    Require(sceKernelMunmap(address, bytes) == 0);
+    if (swapped) {
+        std::printf("page 0x%llx written then paged out to swap: still data for SEEK_DATA, read back exactly\n", static_cast<unsigned long long>(address + 64 * KiB));
+    } else {
+        std::printf("page 0x%llx written: MADV_PAGEOUT did not move it to swap (no free swap), read back exactly from memory; the swapped case was not exercised\n",
+            static_cast<unsigned long long>(address + 64 * KiB));
+    }
+}
+
 }
 
 int main() {
@@ -654,6 +822,9 @@ int main() {
     TestUnreportedPrivateMemory();
     TestGuestCopyOut();
     TestNoCrossWaitWithGpuThread();
+    TestSparseReadsGuestFile();
+    TestSparseReadsDirectFile();
+    TestSparseReadsSwappedPage();
     std::printf("KytyShim memory: all checks passed\n");
     return 0;
 }

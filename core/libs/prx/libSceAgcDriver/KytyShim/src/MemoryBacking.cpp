@@ -15,6 +15,7 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -35,6 +36,9 @@ constexpr uint32_t PrivateEntry = ~uint32_t {0};
 constexpr uint64_t HostPageSize = 0x1000;
 constexpr uint64_t HostPageMask = HostPageSize - 1u;
 constexpr size_t ProbeBatch = 512;
+constexpr uint64_t SeekMinBytes = uint64_t {64} << 10u;
+constexpr uint64_t SeekFirstChunk = uint64_t {64} << 10u;
+constexpr uint64_t SeekLastChunk = uint64_t {1} << 20u;
 
 class PageTable {
 public:
@@ -209,6 +213,8 @@ struct ViewState {
 	uint64_t arena_start = 0;
 	uint64_t arena_end = 0;
 	pid_t pid = 0;
+	int guest_file = -1;
+	int direct_file = -1;
 	std::atomic<bool> enabled {false};
 };
 
@@ -253,6 +259,48 @@ Shim::RangeHook g_unmap_hook = nullptr;
 
 bool ValidRange(uint64_t vaddr, uint64_t size) {
 	return size != 0 && UINT64_MAX - vaddr >= size;
+}
+
+bool SparseReadsEnabled() {
+	const char* value = std::getenv("ANYPS5_KYTY_SPARSE_READS");
+	if (value == nullptr || *value == '\0') return true;
+	const std::string_view text(value);
+	if (text != "0" && text != "1") Shim::Fail("KytyShim memory: ANYPS5_KYTY_SPARSE_READS=%s is neither 0 nor 1\n", value);
+	return text == "1";
+}
+
+void CopyFromView(uint8_t* destination, uint64_t offset, uint64_t bytes) {
+	const auto& state = State();
+	if (bytes < SeekMinBytes || state.guest_file < 0) {
+		std::memcpy(destination, state.base + offset, bytes);
+		return;
+	}
+	const auto end = offset + bytes;
+	auto chunk = SeekFirstChunk;
+	for (auto cursor = offset; cursor < end;) {
+		const bool guest = cursor < state.guest_bytes;
+		const auto file = guest ? state.guest_file : state.direct_file;
+		const auto file_start = guest ? 0 : state.guest_bytes;
+		const auto file_stop = guest ? std::min(end, state.guest_bytes) : end;
+		auto* out = destination + (cursor - offset);
+		const auto data = ::lseek(file, static_cast<off_t>(cursor - file_start), SEEK_DATA);
+		if (data < 0 && errno != ENXIO) {
+			std::memcpy(out, state.base + cursor, file_stop - cursor);
+			cursor = file_stop;
+			continue;
+		}
+		const auto hole_end = data < 0 ? file_stop : std::min(file_stop, file_start + static_cast<uint64_t>(data));
+		if (hole_end > cursor) {
+			std::memset(out, 0, hole_end - cursor);
+			cursor = hole_end;
+			chunk = SeekFirstChunk;
+			continue;
+		}
+		const auto copy_end = std::min(file_stop, (cursor & ~(chunk - 1u)) + chunk);
+		std::memcpy(out, state.base + cursor, copy_end - cursor);
+		cursor = copy_end;
+		chunk = std::min(chunk * 2u, SeekLastChunk);
+	}
 }
 
 template <typename Region, typename Gap>
@@ -484,6 +532,15 @@ void EnableViewOnce() {
 	state.base = view;
 	state.guest_bytes = guest_bytes;
 	state.view_bytes = view_bytes;
+	if (SparseReadsEnabled()) {
+		int guest_file = -1;
+		int direct_file = -1;
+		if (!DirectMemoryViewFiles_nid_no_patch(&guest_file, &direct_file) || guest_file < 0 || direct_file < 0) {
+			Shim::Fail("KytyShim memory: libkernel did not give the files behind the second view of guest memory\n");
+		}
+		state.guest_file = guest_file;
+		state.direct_file = direct_file;
+	}
 	DirectMemoryWatchProtections_nid_no_patch(&OnProtectionChange);
 	state.enabled.store(true, std::memory_order_release);
 }
@@ -589,10 +646,9 @@ uint64_t DirectMappedBytes() {
 bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 	if (data == nullptr || !Shim::IsBacked(vaddr, size)) return false;
 	auto* destination = static_cast<uint8_t*>(data);
-	const auto* base = State().base;
 	ForEachRun(
 	    vaddr, size,
-	    [&](uint64_t offset, uint64_t start, uint64_t bytes) { std::memcpy(destination + (start - vaddr), base + offset, bytes); },
+	    [&](uint64_t offset, uint64_t start, uint64_t bytes) { CopyFromView(destination + (start - vaddr), offset, bytes); },
 	    [&](uint64_t start, uint64_t bytes) { std::memset(destination + (start - vaddr), 0, bytes); });
 	return true;
 }
@@ -683,10 +739,9 @@ static bool CopySparse(uint64_t vaddr, void* data, uint64_t size) {
 		if (Shim::OverlapsPrivate(vaddr, size)) return false;
 	}
 	auto* destination = static_cast<uint8_t*>(data);
-	const auto* base = State().base;
 	ForEachRun(
 	    vaddr, size,
-	    [&](uint64_t offset, uint64_t start, uint64_t bytes) { std::memcpy(destination + (start - vaddr), base + offset, bytes); },
+	    [&](uint64_t offset, uint64_t start, uint64_t bytes) { CopyFromView(destination + (start - vaddr), offset, bytes); },
 	    [&](uint64_t start, uint64_t bytes) {
 		    if constexpr (CopyPrivate) {
 			    CopyGuestPages(start, destination + (start - vaddr), bytes);
