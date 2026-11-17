@@ -143,3 +143,12 @@ stops the emulator with a message naming the variable.
 KytyPS5's log (`LOGF`) is silent by default; `KYTY_PRINTF_DIRECTION=Console` sends it to stderr, beside AnyPS5's own
 lines. `KYTY_GPU_PIPELINE`, `KYTY_GPU_THREAD_CPUS`, `KYTY_GPU_THREAD_PRIORITY` and `KYTY_RESOLVE_HELPER` are read by
 `common/emulatorConfig.cpp` itself.
+
+GPU stage threads on Linux: KytyPS5 places them only on Windows (`{4, 6, 8, 10, 2, 0}` counts SMT siblings as adjacent
+logical processors, and its core reservation uses Windows CPU sets). Under `ANYPS5_KYTY` on Linux, with
+`KYTY_GPU_THREAD_CPUS` unset or empty, each stage thread (command processor, execution, recording, resolve, host copy,
+resolve helper) keeps to the logical CPUs that share the largest last-level cache (`/sys/devices/system/cpu`: on a Ryzen
+9 7950X3D, CPUs 0-7 and 16-23, the 3D V-Cache CCD), intersected with its current affinity. No core is reserved, and the
+threads it creates afterwards inherit that set. Measured on Subnautica: +7 % to +22 % frames per second, 25-35 % less CPU
+time per draw on each stage (`notes/au-dela-p4-placement.md`). `KYTY_GPU_THREAD_CPUS=off` turns it off. An explicit list
+pins each stage to that Linux logical CPU, without core reservation; threads a stage creates afterwards inherit its CPU.

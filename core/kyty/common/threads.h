@@ -30,6 +30,10 @@ void PinCurrent(int logical_cpu);
 void ReserveCores(std::span<const int> logical_cpus);
 bool HasReservedCore();
 
+#if defined(ANYPS5_KYTY) && KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+void KeepCurrentOnLargestCache();
+#endif
+
 }
 
 class Mutex {
