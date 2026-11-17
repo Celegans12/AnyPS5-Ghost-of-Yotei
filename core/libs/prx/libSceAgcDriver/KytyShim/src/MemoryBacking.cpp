@@ -538,6 +538,7 @@ void EnableViewOnce() {
 	state.base = view;
 	state.guest_bytes = guest_bytes;
 	state.view_bytes = view_bytes;
+	std::fprintf(stderr, "[kyty] second view of guest memory at %p: guest range 0x%zx bytes, direct memory after it, 0x%zx bytes in all\n", static_cast<void*>(view), guest_bytes, view_bytes);
 	DirectMemoryWatchProtections_nid_no_patch(&OnProtectionChange);
 	state.enabled.store(true, std::memory_order_release);
 }
