@@ -40,6 +40,16 @@ std::atomic<void (*)(std::uintptr_t, std::size_t)> hostWriteHook{nullptr};
 
 std::atomic<void (*)(std::uintptr_t, std::size_t)> hostReadHook{nullptr};
 
+#if defined(ANYPS5_KYTY)
+std::atomic<bool (*)(std::uintptr_t, std::size_t)> hostWritePreparer{nullptr};
+
+void prepareHostWrite(const void* pointer, std::size_t bytes) {
+    const auto address = reinterpret_cast<std::uintptr_t>(pointer);
+    if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return;
+    if (const auto prepare = hostWritePreparer.load(std::memory_order_acquire)) static_cast<void>(prepare(address, bytes));
+}
+#endif
+
 #ifdef _WIN32
 std::atomic<std::uint64_t> commitGeneration{1};
 std::atomic<void (*)(std::uintptr_t, std::size_t, std::uint64_t)> privateMappingObserver{nullptr};
@@ -1075,6 +1085,12 @@ void GuestArenaSetHostReadHook_nid_no_patch(void (*hook)(std::uintptr_t, std::si
     hostReadHook.store(hook, std::memory_order_release);
 }
 
+#if defined(ANYPS5_KYTY)
+void GuestArenaSetHostWritePreparer_nid_no_patch(bool (*prepare)(std::uintptr_t, std::size_t)) {
+    hostWritePreparer.store(prepare, std::memory_order_release);
+}
+#endif
+
 void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t bytes) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     if (address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return;
@@ -1088,6 +1104,9 @@ bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
     if (const auto hook = hostWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #ifdef _WIN32
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+#elif defined(ANYPS5_KYTY)
+    prepareHostWrite(pointer, bytes);
+    return true;
 #else
     GuestWriteWatch::GuestWriteWatchBeginHostWrite_nid_postfix(pointer, bytes);
     return true;
@@ -1107,6 +1126,9 @@ void GuestArenaEndHostImport_nid_no_patch(void* pointer, std::size_t bytes) {
 void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 #ifdef _WIN32
     WindowsMappings::Get().EndHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+#elif defined(ANYPS5_KYTY)
+    static_cast<void>(pointer);
+    static_cast<void>(bytes);
 #else
     GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(pointer, bytes);
 #endif
@@ -1116,6 +1138,9 @@ std::uint64_t GuestArenaOpenHostWrite_nid_no_patch(void* pointer, std::size_t by
     if (const auto hook = hostWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #ifdef _WIN32
     return WindowsMappings::Get().OpenHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
+#elif defined(ANYPS5_KYTY)
+    prepareHostWrite(pointer, bytes);
+    return 1;
 #else
     GuestWriteWatch::GuestWriteWatchBeginHostWrite_nid_postfix(pointer, bytes);
     return 1;
@@ -1126,6 +1151,9 @@ void GuestArenaCloseHostWrite_nid_no_patch(void* pointer, std::size_t bytes, std
     if (token == 0) return;
 #ifdef _WIN32
     WindowsMappings::Get().CloseHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes, token);
+#elif defined(ANYPS5_KYTY)
+    static_cast<void>(pointer);
+    static_cast<void>(bytes);
 #else
     GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(pointer, bytes);
 #endif
