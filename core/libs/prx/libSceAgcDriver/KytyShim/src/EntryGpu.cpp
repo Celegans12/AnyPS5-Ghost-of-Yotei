@@ -446,7 +446,8 @@ extern "C" void* AgcDriverStaticTable_nid_postfix() {
 }
 
 extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address, std::size_t bytes) {
-    const GuestArena::HostWrite prepared(reinterpret_cast<void*>(address), bytes);
+    static_cast<void>(address);
+    static_cast<void>(bytes);
 }
 
 extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std::uint64_t value) {
