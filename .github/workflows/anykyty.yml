@@ -1,0 +1,300 @@
+name: AnyKyty
+
+on:
+  push:
+    branches: [AnyKyty]
+    paths-ignore:
+      - '**.md'
+      - LICENSE
+  pull_request:
+    branches: [AnyKyty]
+    types: [opened, synchronize, reopened]
+    paths-ignore:
+      - '**.md'
+      - LICENSE
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: Pull request number to build merged into its base (empty builds the selected branch)
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: anykyty-${{ github.event.pull_request.number || inputs.pr || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  conventions:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.pr && format('refs/pull/{0}/merge', inputs.pr) || '' }}
+          fetch-depth: 0
+          filter: blob:none
+          persist-credentials: false
+      - name: Check the conventions of the new commits
+        env:
+          EVENT: ${{ github.event_name }}
+          PR: ${{ inputs.pr }}
+          BEFORE: ${{ github.event.before }}
+        run: |
+          if [ "$EVENT" = push ] && [ -n "$BEFORE" ] && ! [[ "$BEFORE" =~ ^0+$ ]] && ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            git fetch -q --no-tags origin "$BEFORE" || echo "::warning::$BEFORE is not reachable; checking the last commit only"
+          fi
+          if [ "$EVENT" = pull_request ] || [ -n "$PR" ]; then
+            base=HEAD^1; head=HEAD^2
+          elif [ "$EVENT" = push ] && [ -n "$BEFORE" ] && ! [[ "$BEFORE" =~ ^0+$ ]]; then
+            if git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then base=$BEFORE; else base=HEAD^1; fi
+            head=HEAD
+          else
+            base=origin/AnyKyty; head=HEAD
+          fi
+          echo "Checking $(git rev-parse --short "$base")..$(git rev-parse --short "$head")"
+          python3 -I tools/check_conventions.py --base "$base" --head "$head"
+
+  linux:
+    name: Linux ${{ matrix.name }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: normal
+            backend: anyps5
+            testing: 'OFF'
+            targets: libs relinker agc_frame_replay
+          - name: kyty
+            backend: kyty
+            testing: 'ON'
+            targets: kyty_gpu libs relinker
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.pr && format('refs/pull/{0}/merge', inputs.pr) || '' }}
+          persist-credentials: false
+      - id: submodules
+        name: Key the submodules on their commits
+        run: |
+          echo "key=$(git ls-files -s | awk '$1 == "160000" { print $2, $4 }' | cat - .gitmodules | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg=$(git rev-parse HEAD:3rdparty/ffmpeg-core)" >> "$GITHUB_OUTPUT"
+      - id: submodule-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Check out the submodules
+        run: |
+          if [ -f "$RUNNER_TEMP/submodule-gitdirs.tar" ]; then tar -xf "$RUNNER_TEMP/submodule-gitdirs.tar"; fi
+          git submodule update --init --recursive --depth 1 --jobs 8
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        run: tar -cf "$RUNNER_TEMP/submodule-gitdirs.tar" .git/modules
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - id: apt-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: apt-${{ runner.os }}-${{ matrix.backend }}-${{ hashFiles('.github/workflows/anykyty.yml') }}
+          restore-keys: apt-${{ runner.os }}-${{ matrix.backend }}-
+      - name: Install the build dependencies
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          packages=(gcc-14 g++-14 ninja-build pkg-config ccache
+            libx11-dev libxext-dev libxrandr-dev libxkbcommon-dev libwayland-dev libegl-dev libdecor-0-dev
+            libxcursor-dev libxi-dev libxfixes-dev libxinerama-dev libxss-dev libxxf86vm-dev libudev-dev libdrm-dev libgbm-dev
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libvulkan1 libvulkan-dev mesa-vulkan-drivers)
+          if [ "$BACKEND" = kyty ]; then
+            sudo curl -fsSL --retry 3 -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key
+            echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+            packages+=(clang-21 lld-21 llvm-21)
+            echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+          fi
+          mkdir -p "$RUNNER_TEMP/apt-archives/partial"
+          apt=(sudo apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Dir::Cache::Archives="$RUNNER_TEMP/apt-archives" -o APT::Keep-Downloaded-Packages=true)
+          start=$SECONDS
+          "${apt[@]}" update
+          echo "apt-get update: $((SECONDS - start)) s"
+          start=$SECONDS
+          "${apt[@]}" install -y -q --no-install-recommends "${packages[@]}"
+          echo "apt-get install: $((SECONDS - start)) s"
+          sudo rm -rf "$RUNNER_TEMP/apt-archives/partial" "$RUNNER_TEMP/apt-archives/lock"
+          du -sh "$RUNNER_TEMP/apt-archives"
+      - if: steps.apt-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: ${{ steps.apt-cache.outputs.cache-primary-key }}
+      - name: Show the toolchain
+        env:
+          BACKEND: ${{ matrix.backend }}
+        run: |
+          g++-14 --version | head -1
+          cmake --version | head -1
+          if [ "$BACKEND" = kyty ]; then command -v clang++; clang++ --version | head -1; ld.lld --version; fi
+      - id: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: linux-${{ matrix.name }}
+          max-size: 3G
+          evict-old-files: job
+      - id: ffmpeg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: build/externals
+          key: ffmpeg-${{ runner.os }}-${{ steps.submodules.outputs.ffmpeg }}
+      - name: Configure
+        env:
+          BACKEND: ${{ matrix.backend }}
+          TESTING: ${{ matrix.testing }}
+        run: |
+          options=()
+          if [ "$BACKEND" = kyty ]; then options+=(-DANYPS5_KYTY_JOBS="$(nproc)"); fi
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING="$TESTING" \
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DANYPS5_GPU_BACKEND="$BACKEND" "${options[@]}"
+      - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: build/externals
+          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
+      - name: Build
+        env:
+          TARGETS: ${{ matrix.targets }}
+          TESTING: ${{ matrix.testing }}
+        run: |
+          read -ra targets <<< "$TARGETS"
+          if [ "$TESTING" = ON ]; then
+            mapfile -t tests < <(ninja -C build -t targets all | grep -oE '^(kyty_shim_[A-Za-z0-9_]+_tests|guest_gpu_fault_tests|guest_host_write_filter_tests|agc_kyty_shaders_tests):' | tr -d ':' | sort -u)
+            echo "Shim test targets: ${tests[*]}"
+            targets+=("${tests[@]}")
+          fi
+          cmake --build build --target "${targets[@]}" --parallel "$(nproc)"
+      - name: Run the shim tests
+        if: matrix.testing == 'ON'
+        run: |
+          echo "core_pattern was $(cat /proc/sys/kernel/core_pattern), core limit $(ulimit -c)"
+          sudo sysctl -w vm.unprivileged_userfaultfd=1 vm.max_map_count=2147483642 kernel.core_pattern=core
+          ulimit -c 0
+          ctest --test-dir build -R '^(kyty_shim_.*|guest_gpu_fault|guest_host_write_filter|agc_kyty_shaders)$' --output-on-failure --timeout 300 --no-tests=error
+      - name: Show the ccache statistics
+        if: ${{ !cancelled() && steps.ccache.outcome == 'success' }}
+        run: ccache -s
+
+  windows:
+    name: Windows kyty
+    runs-on: windows-latest
+    timeout-minutes: 150
+    env:
+      WINLIBS_RELEASE: 15.2.0posix-14.0.0-ucrt-r7
+      WINLIBS_ZIP: winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip
+      WINLIBS_SHA256: cb2fbad6162540cdf5e1facdce08d4dac359e8cf64f7f696a99274291763b815
+      LLVM_VERSION: 21.1.8
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.pr && format('refs/pull/{0}/merge', inputs.pr) || '' }}
+          persist-credentials: false
+      - id: submodules
+        name: Key the submodules on their commits
+        run: |
+          echo "key=$(git ls-files -s | awk '$1 == "160000" { print $2, $4 }' | cat - .gitmodules | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg=$(git rev-parse HEAD:3rdparty/ffmpeg-core)" >> "$GITHUB_OUTPUT"
+      - id: submodule-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Check out the submodules
+        run: |
+          if [ -f "$RUNNER_TEMP/submodule-gitdirs.tar" ]; then tar --force-local -xf "$RUNNER_TEMP/submodule-gitdirs.tar"; fi
+          git submodule update --init --recursive --depth 1 --jobs 8
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        run: tar --force-local -cf "$RUNNER_TEMP/submodule-gitdirs.tar" .git/modules
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Point the WinLibs CMake at the CA bundle of Git for Windows
+        run: |
+          for prefix in ucrt64 mingw64; do
+            bundle="C:/Program Files/Git/$prefix/etc/ssl/certs/ca-bundle.crt"
+            if [ -f "$bundle" ]; then echo "SSL_CERT_FILE=$bundle" >> "$GITHUB_ENV"; exit 0; fi
+          done
+          echo "::error::No CA bundle found in Git for Windows"; exit 1
+      - id: toolchain
+        uses: actions/cache@v6
+        with:
+          path: |
+            C:\winlibs
+            C:\llvm
+          key: toolchain-${{ env.WINLIBS_ZIP }}-llvm-${{ env.LLVM_VERSION }}
+      - name: Download WinLibs GCC and LLVM
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        run: |
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/winlibs.zip" "https://github.com/brechtsanders/winlibs_mingw/releases/download/$WINLIBS_RELEASE/$WINLIBS_ZIP"
+          echo "$WINLIBS_SHA256  $RUNNER_TEMP/winlibs.zip" | sha256sum -c -
+          7z x "$RUNNER_TEMP/winlibs.zip" -oC:/winlibs > /dev/null
+          curl -sSfL --retry 3 -o "$RUNNER_TEMP/llvm.exe" "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/LLVM-$LLVM_VERSION-win64.exe"
+          7z x "$RUNNER_TEMP/llvm.exe" -o"$RUNNER_TEMP/llvm" > /dev/null
+          mkdir -p C:/llvm/bin C:/llvm/lib
+          for tool in clang clang++ llvm-ar llvm-ranlib; do
+            if [ -f "$RUNNER_TEMP/llvm/bin/$tool.exe" ]; then cp "$RUNNER_TEMP/llvm/bin/$tool.exe" C:/llvm/bin/; fi
+          done
+          if [ ! -f C:/llvm/bin/clang++.exe ]; then cp C:/llvm/bin/clang.exe C:/llvm/bin/clang++.exe; fi
+          cp -r "$RUNNER_TEMP/llvm/lib/clang" C:/llvm/lib/
+          rm -rf "$RUNNER_TEMP/llvm" "$RUNNER_TEMP/llvm.exe" "$RUNNER_TEMP/winlibs.zip"
+      - name: Put WinLibs GCC and LLVM first on the path
+        run: |
+          echo 'C:\winlibs\mingw64\bin' >> "$GITHUB_PATH"
+          echo 'C:\llvm\bin' >> "$GITHUB_PATH"
+      - name: Show the toolchain
+        run: |
+          command -v g++ clang clang++ cmake ninja
+          g++ --version | head -1
+          clang++ --version | head -1
+          cmake --version | head -1
+      - id: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: windows-kyty
+          max-size: 3G
+          evict-old-files: job
+      - id: ffmpeg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: build/externals
+          key: ffmpeg-${{ runner.os }}-winlibs-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.ffmpeg }}
+      - name: Configure
+        shell: cmd
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DANYPS5_GPU_BACKEND=kyty -DANYPS5_KYTY_JOBS=%NUMBER_OF_PROCESSORS%
+      - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: build/externals
+          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
+      - name: Build
+        shell: cmd
+        run: cmake --build build --target kyty_gpu libs relinker --parallel %NUMBER_OF_PROCESSORS%
+      - name: Show the ccache statistics
+        if: ${{ !cancelled() && steps.ccache.outcome == 'success' }}
+        run: ccache -s
