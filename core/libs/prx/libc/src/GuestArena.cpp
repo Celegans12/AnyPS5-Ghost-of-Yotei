@@ -1212,6 +1212,10 @@ void GuestArenaSetHostWriteFilter_nid_no_patch(bool (*filter)(std::uintptr_t, st
 void GuestArenaSetViewPlacer_nid_no_patch(void* (*placer)(void* pointer, std::size_t bytes, int protection)) {
     viewPlacer.store(placer, std::memory_order_release);
 }
+
+bool GuestArenaPreparingHostWrite_nid_no_patch() {
+    return preparingHostWrite.load(std::memory_order_relaxed) != 0;
+}
 #endif
 #endif
 

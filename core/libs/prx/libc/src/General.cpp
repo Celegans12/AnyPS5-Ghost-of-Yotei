@@ -95,7 +95,11 @@ bool CopyGuestBytes(void* destination, const void* source, std::size_t bytes, bo
     return ReadProcessMemory(GetCurrentProcess(), source, destination, bytes, &copied) != 0 && copied == bytes;
 #elif defined(__linux__)
 #ifdef __x86_64__
+#if defined(ANYPS5_KYTY)
+    if (GuardedCopy::Ready() && !GuestArena::GuestArenaPreparingHostWrite_nid_no_patch()) return GuardedCopy::Copy(destination, source, bytes);
+#else
     if (GuardedCopy::Ready()) return GuardedCopy::Copy(destination, source, bytes);
+#endif
 #endif
     iovec local{destination, bytes};
     iovec remote{const_cast<void*>(source), bytes};
@@ -904,6 +908,9 @@ extern "C" bool GuestCopyOut_nid_no_patch(void* destination, const void* source,
     std::memcpy(destination, source, bytes);
     return true;
 #elif defined(__linux__)
+#if defined(ANYPS5_KYTY) && defined(__x86_64__)
+    if (GuardedCopy::Ready() && !GuestArena::GuestArenaPreparingHostWrite_nid_no_patch()) return GuardedCopy::Copy(destination, source, bytes);
+#endif
     iovec local{const_cast<void*>(source), bytes};
     iovec remote{destination, bytes};
     const int saved = errno;
