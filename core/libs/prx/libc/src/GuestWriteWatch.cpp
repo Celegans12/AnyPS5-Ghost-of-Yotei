@@ -94,6 +94,12 @@ namespace GuestWriteWatch {
 namespace {
 
 #if defined(__linux__)
+#if defined(ANYPS5_KYTY)
+constexpr bool GpuOwnsFaults = true;
+#else
+constexpr bool GpuOwnsFaults = false;
+#endif
+
 class ReadTrapTable {
 public:
     static ReadTrapTable& Get() {
@@ -1257,7 +1263,7 @@ private:
 
 private:
     Watch() {
-        if (std::getenv("APS5_NO_WRITE_WATCH") != nullptr) return;
+        if (GpuOwnsFaults || std::getenv("APS5_NO_WRITE_WATCH") != nullptr) return;
         const char* oracle = std::getenv("APS5_WRITE_WATCH_ORACLE");
         if (oracle != nullptr && std::strcmp(oracle, "verify") != 0) {
             _reported = true;
@@ -2104,6 +2110,26 @@ private:
 const bool g_opened = (Watch::Get(), true);
 #endif
 
+#if defined(__linux__) && defined(ANYPS5_KYTY)
+std::atomic<GpuFaultHandler> gpuFaultHandler{nullptr};
+
+bool ResolveGpuFault(int signal, siginfo_t* info, void* context) {
+    if ((signal != SIGSEGV && signal != SIGBUS) || info == nullptr || info->si_code <= 0 || context == nullptr) return false;
+    const auto handler = gpuFaultHandler.load(std::memory_order_acquire);
+    if (handler == nullptr) return false;
+    sigset_t asynchronous;
+    sigfillset(&asynchronous);
+    for (const int synchronous : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGABRT}) sigdelset(&asynchronous, synchronous);
+    sigset_t interrupted;
+    pthread_sigmask(SIG_BLOCK, &asynchronous, &interrupted);
+    const int savedErrno = errno;
+    const bool handled = handler(signal, info, context);
+    errno = savedErrno;
+    if (!handled) pthread_sigmask(SIG_SETMASK, &interrupted, nullptr);
+    return handled;
+}
+#endif
+
 }
 
 bool GuestWriteWatchAvailable_nid_postfix() {
@@ -2116,7 +2142,7 @@ bool GuestWriteWatchAvailable_nid_postfix() {
 
 void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes) {
 #if defined(__linux__)
-    if (bytes != 0) ReadTrapTable::Get().Register(reinterpret_cast<std::uintptr_t>(pointer), reinterpret_cast<std::uintptr_t>(pointer) + bytes);
+    if (!GpuOwnsFaults && bytes != 0) ReadTrapTable::Get().Register(reinterpret_cast<std::uintptr_t>(pointer), reinterpret_cast<std::uintptr_t>(pointer) + bytes);
 #endif
 #ifdef APS5_GUEST_WRITE_WATCH
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
@@ -2301,7 +2327,7 @@ bool GuestWriteWatchSetReadTrapResolver_nid_postfix(void (*resolve)(std::uintptr
 #if defined(__APPLE__)
     return Watch::Get().SetReadTrapResolver(resolve);
 #elif defined(__linux__) && defined(__x86_64__)
-    if (resolve != nullptr && !GuardedCopy::FaultsCaught()) return false;
+    if (resolve != nullptr && (GpuOwnsFaults || !GuardedCopy::FaultsCaught())) return false;
     return ReadTrapTable::Get().SetResolver(resolve);
 #else
     static_cast<void>(resolve);
@@ -2445,7 +2471,17 @@ std::size_t GuestWriteWatchReadTrapFaults_nid_postfix(ReadTrapFault* faults, std
 
 #if defined(__linux__)
 bool GuestWriteWatchHandleReadTrap_nid_postfix(int signal, siginfo_t* info, void* context) {
+#if defined(ANYPS5_KYTY)
+    return ResolveGpuFault(signal, info, context);
+#else
     return ReadTrapTable::Get().HandleFault(signal, info, context);
+#endif
+}
+#endif
+
+#if defined(__linux__) && defined(ANYPS5_KYTY)
+void GuestWriteWatchSetGpuFaultHandler_nid_no_patch(GpuFaultHandler handler) {
+    gpuFaultHandler.store(handler, std::memory_order_release);
 }
 #endif
 

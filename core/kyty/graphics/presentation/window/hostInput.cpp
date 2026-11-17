@@ -1,3 +1,4 @@
+#if !defined(ANYPS5_KYTY)
 #include "graphics/presentation/window/hostInput.h"
 
 #include <SDL3/SDL.h>
@@ -1034,3 +1035,4 @@ bool HostInputWaitEvent(SDL_Event* event, int max_wait_ms) {
 }
 
 }
+#endif

@@ -1,4 +1,4 @@
-if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+if(BUILD_TESTING AND NOT ANYPS5_GPU_BACKEND STREQUAL "kyty" AND CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
     add_test_executable(guest_read_trap_tests tests/GuestReadTrap.cpp)
     target_include_directories(guest_read_trap_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(guest_read_trap_tests PRIVATE libkernel libc)

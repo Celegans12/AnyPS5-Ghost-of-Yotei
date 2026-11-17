@@ -57,6 +57,24 @@ add_library(libSceAgc SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/ShaderUtils.cpp
 )
 
+if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
+    get_target_property(libSceAgcSources libSceAgc SOURCES)
+    list(REMOVE_ITEM libSceAgcSources
+            ${CMAKE_CURRENT_SOURCE_DIR}/Misc/src/ShaderFusion.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/GsOversubscription.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Shader/src/PrimState.cpp
+    )
+    set_target_properties(libSceAgc PROPERTIES SOURCES "${libSceAgcSources}")
+    target_sources(libSceAgc PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/GsOversubscription.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/InterpolantMapping.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/PrimState.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/RegisterDefaults.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Kyty/src/ShaderFusion.cpp
+    )
+    target_compile_definitions(libSceAgc PRIVATE ANYPS5_KYTY=1)
+endif()
+
 target_include_directories(libSceAgc PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(libSceAgc PRIVATE libSceAgcDriver libc)
 
@@ -343,7 +361,7 @@ target_link_libraries(agc_shader_fusion_tests PRIVATE libSceAgc libSceAgcDriver 
 set_target_properties(agc_shader_fusion_tests PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_shader_fusion_tests)
 
-if(BUILD_TESTING)
+if(BUILD_TESTING AND NOT ANYPS5_GPU_BACKEND STREQUAL "kyty")
     set_target_properties(agc_shader_fusion_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_shader_fusion COMMAND agc_shader_fusion_tests)
     set_tests_properties(agc_shader_fusion PROPERTIES SKIP_RETURN_CODE 77)
@@ -571,6 +589,26 @@ if(BUILD_TESTING)
     set_tests_properties(agc_shader_helpers PROPERTIES TIMEOUT 30)
     if(WIN32)
         set_tests_properties(agc_shader_helpers PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
+add_test_executable(agc_kyty_shaders_tests EXCLUDE_FROM_ALL
+        tests/KytyShaders.cpp
+        Kyty/src/GsOversubscription.cpp
+        Kyty/src/InterpolantMapping.cpp
+        Kyty/src/PrimState.cpp
+        Kyty/src/ShaderFusion.cpp
+)
+target_include_directories(agc_kyty_shaders_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(agc_kyty_shaders_tests PRIVATE libc)
+configure_windows_unwind(agc_kyty_shaders_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_kyty_shaders_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
+    add_test(NAME agc_kyty_shaders COMMAND agc_kyty_shaders_tests)
+    set_tests_properties(agc_kyty_shaders PROPERTIES TIMEOUT 30)
+    if(WIN32)
+        set_tests_properties(agc_kyty_shaders PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

@@ -1,3 +1,4 @@
+#if !defined(ANYPS5_KYTY)
 #include "graphics/presentation/renderDoc.h"
 
 #include "common/logging/log.h"
@@ -176,3 +177,4 @@ void RenderDocOnGuestFlip(RenderContext& renderer) {
 }
 
 }
+#endif

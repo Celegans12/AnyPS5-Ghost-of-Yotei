@@ -18,7 +18,6 @@ CONTRACT = (
     "kernel/pthread.h",
     "libs/agc.h",
     "libs/controller.h",
-    "libs/dialog.h",
     "libs/errno.h",
     "libs/hmd2.h",
     "libs/ime.h",
