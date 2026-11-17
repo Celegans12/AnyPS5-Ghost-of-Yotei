@@ -9,8 +9,8 @@ these files.
 ## Licence
 
 Kyty is distributed under the GNU General Public License version 2, copied in
-[core/kyty/LICENSE](../core/kyty/LICENSE). The original Kyty code by InoriRus was published under the MIT licence, copied
-in [core/kyty/LICENSES/Kyty-MIT.txt](../core/kyty/LICENSES/Kyty-MIT.txt). Two files carry a notice of their own, kept
+[core/kyty/LICENSE](../../core/kyty/LICENSE). The original Kyty code by InoriRus was published under the MIT licence, copied
+in [core/kyty/LICENSES/Kyty-MIT.txt](../../core/kyty/LICENSES/Kyty-MIT.txt). Two files carry a notice of their own, kept
 verbatim at their top:
 
 | File | Notice |
@@ -37,9 +37,21 @@ library and loader functions that `graphics/` and `common/` call, and the shim i
 - Every comment is removed, except the two notices above. `core/kyty/tools/kyty_import.py` does it with a C++ lexer
   that keeps string, character and raw string literals and digit separators intact, and checks each file: the token
   stream that `g++ -fpreprocessed` produces is the same before and after, preprocessor line ends included.
-- Nothing else is changed in the imported files. Adaptations to AnyPS5 go in the shim, or under `#if` in `core/kyty/`.
-- The build is `core/kyty/CMakeLists.txt` (target `kyty_gpu`), not upstream's. `core/kyty/KytyGpuSources.cmake` lists the
-  imported sources left out of `kyty_gpu`.
+- Nothing else is changed in the imported files. Adaptations to AnyPS5 go in the shim, or under
+  `#if defined(ANYPS5_KYTY)` in `core/kyty/`. `ANYPS5_KYTY=1` is defined for every target of a
+  `-DANYPS5_GPU_BACKEND=kyty` build and never otherwise.
+
+## Build
+
+Kyty builds with Clang only (GCC rejects its Vulkan-Hpp aggregate assignments and `__builtin_memcpy_inline`).
+`core/kyty/CMakeLists.txt` is therefore a project of its own, which `core/kyty/cmake/KytyBackend.cmake` builds with
+`clang` and `clang++` as the external project `kyty_gpu` when `-DANYPS5_GPU_BACKEND=kyty` is set; the rest of AnyPS5 stays
+on GCC. Clang is given `--gcc-install-dir` of the GCC that builds AnyPS5, so both sides use the same libstdc++ headers.
+The sub-build uses upstream's compiler options (`-march=x86-64-v3 -ffp-contract=off -fno-rtti -fno-exceptions -g`,
+`-fexceptions` for `common/`, `descriptors.cpp` and `pipelineCache.cpp`), Tracy on demand, and its own SPIRV-Tools and
+glslang (with the optimizer, for `glslangValidator -Os` on upstream's utility shaders). `Kyty::gpu` is the interface
+target that links the resulting archives into AnyPS5. `core/kyty/KytyGpuSources.cmake` lists the imported sources left
+out of `kyty_gpu`, and `core/kyty/tools/kyty_frontier.py` lists the symbols `kyty_gpu` still needs from the shim.
 
 ## Third-party code
 
@@ -56,7 +68,8 @@ The dependencies of `graphics/` and `common/` that AnyPS5 did not have are submo
 
 `zydis` is used by the KytyPS5 loader (`x64InstructionEmulator.cpp`, `guestInstructionPatcher.cpp`), not by
 `graphics/` or `common/`: `kyty_gpu` does not build it. Vulkan-Headers, VulkanMemoryAllocator, SPIRV-Headers,
-SPIRV-Tools, glslang, tracy, stb, zstd and ZArchive are AnyPS5's own submodules.
+SPIRV-Tools, glslang, tracy, stb, zstd and ZArchive are AnyPS5's own submodules, built a second time by the Clang
+sub-build.
 
 ## Updating
 
