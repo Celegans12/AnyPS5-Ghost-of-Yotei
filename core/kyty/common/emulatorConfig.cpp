@@ -353,6 +353,16 @@ void ConfigureGpuStageThread(GpuStageThread stage) {
 	if (high_priority) {
 		Common::Thread::RaiseCurrentPriority();
 	}
+#if defined(ANYPS5_KYTY) && KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+	static const bool listed = [] {
+		const char* value = std::getenv("KYTY_GPU_THREAD_CPUS");
+		return value != nullptr && value[0] != '\0';
+	}();
+	if (!listed) {
+		Common::Thread::KeepCurrentOnLargestCache();
+		return;
+	}
+#endif
 	static std::once_flag reserved;
 	std::call_once(reserved, [] {
 		Common::Thread::ReserveCores(std::span {cpus}.first(ResolveHelperEnabled() ? 6 : 5));

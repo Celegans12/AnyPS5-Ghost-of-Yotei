@@ -10,6 +10,13 @@
 #include <thread>
 #include <vector>
 
+#if defined(ANYPS5_KYTY) && KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+#include "common/cacheTopology.h"
+
+#include <pthread.h>
+#include <sched.h>
+#endif
+
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 #include <windows.h>
 #include <tlhelp32.h>
@@ -118,10 +125,38 @@ void Thread::PinCurrent(int logical_cpu) {
 		const auto unreserved = g_unreserved_processors.load(std::memory_order_acquire);
 		t_reserved_core = unreserved != 0 && (unreserved & mask) == 0;
 	}
+#elif defined(ANYPS5_KYTY)
+	if (logical_cpu >= 0 && logical_cpu < CPU_SETSIZE) {
+		cpu_set_t set;
+		CPU_ZERO(&set);
+		CPU_SET(logical_cpu, &set);
+		(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+	}
 #else
 	(void)logical_cpu;
 #endif
 }
+
+#if defined(ANYPS5_KYTY) && KYTY_PLATFORM != KYTY_PLATFORM_WINDOWS
+void Thread::KeepCurrentOnLargestCache() {
+	static const std::vector<int> cache_cpus = LargestCacheCpus("/sys/devices/system/cpu");
+	cpu_set_t                     allowed;
+	CPU_ZERO(&allowed);
+	if (cache_cpus.empty() || sched_getaffinity(0, sizeof(allowed), &allowed) != 0) {
+		return;
+	}
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	for (const int cpu: cache_cpus) {
+		if (cpu < CPU_SETSIZE && CPU_ISSET(cpu, &allowed)) {
+			CPU_SET(cpu, &set);
+		}
+	}
+	if (CPU_COUNT(&set) != 0 && !CPU_EQUAL(&set, &allowed)) {
+		(void)pthread_setaffinity_np(pthread_self(), sizeof(set), &set);
+	}
+}
+#endif
 
 bool Thread::HasReservedCore() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
