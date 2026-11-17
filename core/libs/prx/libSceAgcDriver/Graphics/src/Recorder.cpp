@@ -2801,7 +2801,7 @@ void Recorder::ensureOpen() {
         auto batch = std::make_unique<Batch>();
         try {
             batch->gpuFlight = GuestMemory::BeginGpuFlight();
-            batch->commands = OffThreadEncoding::Acquire(context.queueFamily);
+            batch->commands = OffThreadEncoding::Acquire(context.device, context.queueFamily);
             batch->encoded = batch->commands != VK_NULL_HANDLE;
             if (!batch->encoded) {
                 VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};

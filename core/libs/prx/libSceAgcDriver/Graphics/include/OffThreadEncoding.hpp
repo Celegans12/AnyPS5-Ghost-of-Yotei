@@ -15,7 +15,7 @@ PFN_vkGetDeviceProcAddr Wrap(VkDevice device, PFN_vkGetDeviceProcAddr resolver);
 
 bool Active();
 
-VkCommandBuffer Acquire(std::uint32_t queueFamily);
+VkCommandBuffer Acquire(VkDevice device, std::uint32_t queueFamily);
 
 void Begin(VkCommandBuffer commands, VkCommandBufferUsageFlags flags);
 

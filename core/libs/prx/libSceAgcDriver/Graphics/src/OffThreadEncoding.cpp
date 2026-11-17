@@ -730,8 +730,8 @@ bool Active() {
     return active != nullptr && !active->disabled.load(std::memory_order_relaxed) && !PlacementOnly();
 }
 
-VkCommandBuffer Acquire(std::uint32_t queueFamily) {
-    if (!Active()) return VK_NULL_HANDLE;
+VkCommandBuffer Acquire(VkDevice device, std::uint32_t queueFamily) {
+    if (!Active() || active->device != device) return VK_NULL_HANDLE;
     auto& state = *active;
     if (state.current.load(std::memory_order_relaxed) != VK_NULL_HANDLE || state.detached != VK_NULL_HANDLE) return VK_NULL_HANDLE;
     std::lock_guard lock(state.poolMutex);
