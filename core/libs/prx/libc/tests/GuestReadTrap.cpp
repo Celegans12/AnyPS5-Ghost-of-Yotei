@@ -448,6 +448,15 @@ void RequireDormantHolds() {
     FinishWork();
     Release(12, 1);
     Require(GuestCopyIn_nid_no_patch(buffer.data(), guest + 12 * Page, buffer.size()));
+    StartWork();
+    Require(Trap(12, 1));
+    Require(GuestWriteWatch::GuestWriteWatchOpenIdleReads_nid_postfix(guest + 12 * Page, Page) < 0);
+    FinishWork();
+    Release(12, 1);
+    const auto idle = Counts();
+    Require(GuestWriteWatch::GuestWriteWatchOpenIdleReads_nid_postfix(guest + 12 * Page, Page) == 1);
+    Require(GuestWriteWatch::GuestWriteWatchOpenIdleReads_nid_postfix(guest + 12 * Page, Page) == 0);
+    Require(ReadWord(12, 0) == 82 && Counts().faults == idle.faults);
     for (int sweep = 0; sweep < 4; ++sweep) GuestWriteWatch::GuestWriteWatchSweepReadTraps_nid_postfix();
     Require(Counts().dormant == 0);
 }

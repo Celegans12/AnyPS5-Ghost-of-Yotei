@@ -65,6 +65,7 @@ void GuestWriteWatchReleaseWrites_nid_postfix(std::uintptr_t address, std::size_
 void GuestWriteWatchSweepReadTraps_nid_postfix();
 void GuestWriteWatchSettleReads_nid_postfix(const void* pointer, std::size_t bytes);
 void GuestWriteWatchOpenReads_nid_postfix(const void* pointer, std::size_t bytes);
+int GuestWriteWatchOpenIdleReads_nid_postfix(const void* pointer, std::size_t bytes);
 bool GuestWriteWatchReadTrapsHeld_nid_postfix();
 std::uint64_t GuestWriteWatchReadTrapEpoch_nid_postfix();
 void GuestWriteWatchReadTrapCounts_nid_postfix(ReadTrapCounts* counts);

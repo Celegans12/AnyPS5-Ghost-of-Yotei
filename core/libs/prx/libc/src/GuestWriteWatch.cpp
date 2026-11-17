@@ -323,6 +323,22 @@ public:
         if (found != _hostWrites.end()) _hostWrites.erase(found);
     }
 
+    int OpenIdle(std::uintptr_t begin, std::uintptr_t end) {
+        if (end <= begin || !Active()) return 0;
+        const auto first = pageStart(begin);
+        const auto last = pageEnd(end);
+        const Guard lock(_lock);
+        if (activeOverlap(first, last)) return -1;
+        int opened = 0;
+        forEachPage(first, last, [&](std::uintptr_t page, std::uint8_t& state) {
+            if ((state & (Armed | ArmedWrites)) == 0) return;
+            openPage(page, state);
+            _counts.dormantOpens.fetch_add(1, std::memory_order_relaxed);
+            ++opened;
+        });
+        return opened;
+    }
+
     void Open(std::uintptr_t begin, std::uintptr_t end) {
         if (end <= begin || !Active()) return;
         const Guard lock(_lock);
@@ -2379,6 +2395,17 @@ void GuestWriteWatchOpenReads_nid_postfix(const void* pointer, std::size_t bytes
 #else
     static_cast<void>(pointer);
     static_cast<void>(bytes);
+#endif
+}
+
+int GuestWriteWatchOpenIdleReads_nid_postfix(const void* pointer, std::size_t bytes) {
+#if defined(__linux__)
+    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    return bytes != 0 && begin + bytes > begin ? ReadTrapTable::Get().OpenIdle(begin, begin + bytes) : 0;
+#else
+    static_cast<void>(pointer);
+    static_cast<void>(bytes);
+    return 0;
 #endif
 }
 

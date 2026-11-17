@@ -2563,6 +2563,13 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
 #else
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes), true)) return failedImport();
+    const bool readTraps = GuestWriteWatch::GuestWriteWatchReadTrapsHeld_nid_postfix();
+    const auto trappedImport = [&]() -> const HostImport* {
+        static std::atomic<std::uint64_t> putOff{0};
+        if (const auto count = putOff.fetch_add(1, std::memory_order_relaxed) + 1; (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx put off: read traps armed on it, requested by %s (%llu so far)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), ImportRequesterName(requester), static_cast<unsigned long long>(count));
+        return nullptr;
+    };
+    if (readTraps && GuestWriteWatch::GuestWriteWatchOpenIdleReads_nid_postfix(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes)) < 0) return trappedImport();
 #endif
     VkResult result = VK_SUCCESS;
     const char* step = nullptr;
@@ -2643,6 +2650,9 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
 #endif
     entry.unwatched = step == nullptr && !(entry.dmaBuf ? watchedDmaBuf : watchedHostPointer);
+#ifndef _WIN32
+    if (step != nullptr && (readTraps || GuestWriteWatch::GuestWriteWatchReadTrapsHeld_nid_postfix()) && GuestWriteWatch::GuestWriteWatchOpenIdleReads_nid_postfix(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes)) != 0) return trappedImport();
+#endif
     if (step != nullptr) {
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(std::exchange(entry.alias, nullptr));
