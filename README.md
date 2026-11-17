@@ -33,7 +33,7 @@ Capped at 60 Hz:
 | AnyKyty (`e6dfd952b5`, before the fixes below) | 59.8 | 6.7 to 7.7 µs per draw (`kytyGpuExecute`) | 6.5 ms |
 | Kyty, native | 59.4 | 5.7 µs per draw | 5.7 ms |
 
-Uncapped (`ANYPS5_VBLANK_HZ=360`, native Kyty with `KYTY_VBLANK_FREQUENCY=360`), two sessions each. Both sides ran with Kyty's default settings (its Original mode): these measurements predate the Experiment settings above.
+Uncapped (`ANYPS5_VBLANK_HZ=360`, native Kyty with `KYTY_VBLANK_FREQUENCY=360`), two sessions each. Both sides ran with Kyty's default settings (its Original mode): these measurements predate the Experiment settings above, and native ray tracing was off on both sides, which makes no difference in Subnautica since it has no ray tracing pass.
 
 | | FPS | Execute | Resolve | Record | GPU per frame |
 |---|---|---|---|---|---|
