@@ -53,14 +53,6 @@ extern "C" void AgcDriverUseGcnShaders_nid_postfix() {
     throw std::runtime_error("PS4 (GNM) titles are not supported by the kyty GPU backend (ANYPS5_GPU_BACKEND=kyty): build without the option to run them");
 }
 
-extern "C" void AgcDriverSetSystemOverlay_nid_postfix(const ImeKeyboardView* view) {
-    if (view != nullptr) throw std::runtime_error("the kyty GPU backend does not draw the system keyboard overlay yet (AgcDriverSetSystemOverlay, KytyShim/src/EntryHost.cpp)");
-}
-
-extern "C" void AgcDriverSetSystemDialog_nid_postfix(const ModalDialogView* view) {
-    if (view != nullptr) throw std::runtime_error("the kyty GPU backend does not draw system dialogs yet (AgcDriverSetSystemDialog, KytyShim/src/EntryHost.cpp)");
-}
-
 extern "C" void AgcDriverTogglePerformanceOverlay_nid_postfix() {
     Note("the performance overlay");
 }

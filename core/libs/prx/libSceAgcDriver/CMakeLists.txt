@@ -78,6 +78,7 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
             ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AspectFit.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostHdr.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/KeyboardOverlay.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
             ${kytyShimSources}
     )
