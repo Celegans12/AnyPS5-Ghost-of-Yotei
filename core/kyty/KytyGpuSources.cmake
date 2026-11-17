@@ -1,2 +1,24 @@
 set(KYTY_GPU_EXCLUDED
+    common/additionalContent.cpp
+    common/localization.cpp
+    common/logging/log.cpp
+    common/systemInfo.cpp
+    common/trophies.cpp
+    graphics/host_gpu/renderer/pipeline/pipelineManifest.cpp
+    graphics/host_gpu/renderer/upscaler/dlss.cpp
+    graphics/host_gpu/renderer/upscaler/fsr.cpp
+    graphics/presentation/ddsImage.cpp
+    graphics/presentation/openxrHeadset.cpp
+    graphics/presentation/performanceOverlay.cpp
+    graphics/presentation/precompileNotice.cpp
+    graphics/presentation/renderDoc.cpp
+    graphics/presentation/systemOverlay.cpp
+    graphics/presentation/window/hostInput.cpp
+    graphics/presentation/window/swapchain.cpp
+    graphics/presentation/window/vulkanWindow.cpp
+    graphics/presentation/window/window.cpp
+)
+set(KYTY_GPU_EXCEPTIONS
+    graphics/host_gpu/renderer/pipeline/descriptors.cpp
+    graphics/host_gpu/renderer/pipeline/pipelineCache.cpp
 )
