@@ -2,6 +2,7 @@
 
 #include "MemoryShim.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestHeap.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/include/Api.hpp"
@@ -17,9 +18,13 @@
 #include <functional>
 #include <mutex>
 #include <source_location>
+#include <stdexcept>
+#include <system_error>
 #include <thread>
 #include <utility>
 #include <vector>
+
+#include <sys/mman.h>
 
 namespace Memory = Libs::LibKernel::Memory;
 
@@ -272,26 +277,124 @@ void TestRuntimeMemory() {
     std::printf("runtime memory 0x%llx: allocated with a backing, freed; code 0x%llx executable until freed\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(code));
 }
 
+void* MapUnreported(void* place, std::size_t bytes) {
+    void* mapped = mmap(place, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    Require(mapped == place);
+    return mapped;
+}
+
+void TestHeapCommitSecondView() {
+    constexpr std::size_t bytes = Page * 4;
+    void* heap = GuestArena::GuestArenaAllocate_nid_postfix(bytes, Page);
+    Require(heap != nullptr);
+    const auto address = Address(heap);
+    const auto epoch = Memory::BackingEpoch();
+    GuestArena::GuestArenaCommit_nid_postfix(heap, bytes, 0x04, bytes);
+    Require(Memory::BackingEpoch() > epoch);
+    const auto probes = Libs::LibKernel::Memory::Shim::ProbeCalls();
+    RequireSecondView(heap, bytes, 23);
+    Require(Libs::LibKernel::Memory::Shim::ProbeCalls() == probes);
+
+    const auto beforeReset = Memory::BackingEpoch();
+    GuestArena::GuestArenaReset_nid_postfix(heap, bytes);
+    Require(!Memory::IsBackingReadable(address, bytes));
+    Require(Memory::FindBackingPointer(address, bytes) == nullptr);
+    Require(!Memory::IsFullyMapped(address, bytes));
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> changes;
+    Require(Memory::BackingChangesSince(beforeReset, changes) && Covers(changes, address, bytes));
+
+    GuestArena::GuestArenaCommit_nid_postfix(heap, bytes, 0x04, bytes);
+    std::vector<std::uint8_t> zeros(bytes);
+    std::vector<std::uint8_t> read(bytes, 0xcc);
+    Require(Memory::TryReadBacking(address, read.data(), bytes) && read == zeros);
+    GuestArena::GuestArenaReset_nid_postfix(heap, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(heap, bytes);
+    std::printf("libc arena commit 0x%llx: second view from the guest memory file, dropped on reset, zeroed on recommit, never probed\n", static_cast<unsigned long long>(address));
+}
+
+void TestHeapBlockEvicted() {
+    constexpr std::size_t bytes = Page * 16;
+    void* block = GuestHeap::GuestHeapAllocate_nid_postfix(bytes);
+    Require(block != nullptr);
+    const auto address = Address(block);
+    Require(Memory::IsBackingReadable(address, bytes) && Memory::FindBackingPointer(address, bytes) != nullptr);
+    g_hooks = HookLog{};
+    Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(&OnMap, &OnUnmap);
+    GuestHeap::GuestHeapFree_nid_postfix(block);
+    Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(nullptr, nullptr);
+    Require(Covers(g_hooks.unmapped, address, bytes) && g_hooks.backedWhenUnmapped);
+    Require(!Memory::IsBackingReadable(address, bytes));
+    std::printf("guest heap block 0x%llx: second view while allocated; evicted from the heap cache, GPU unmap seen first with the backing, then no second view\n", static_cast<unsigned long long>(address));
+}
+
+void TestHostView() {
+    constexpr std::uint64_t fixed = 0xfe0000000ull + GuestArena::GuestAddressOffset;
+    constexpr std::size_t bytes = Page * 8;
+    const auto probes = Libs::LibKernel::Memory::Shim::ProbeCalls();
+    void* mapped = DirectMemoryMapHostView_nid_no_patch(fixed, bytes, PROT_READ | PROT_WRITE);
+    Require(Address(mapped) == fixed);
+    RequireSecondView(mapped, bytes, 61);
+    Require(Libs::LibKernel::Memory::Shim::ProbeCalls() == probes);
+
+    bool refused = false;
+    try {
+        (void)DirectMemoryMapHostView_nid_no_patch(fixed, bytes, PROT_READ | PROT_WRITE);
+    } catch (const std::system_error&) {
+        refused = true;
+    }
+    Require(refused);
+
+    void* guest = GuestArena::GuestArenaAllocate_nid_postfix(Page, Page);
+    Require(guest != nullptr);
+    refused = false;
+    try {
+        (void)DirectMemoryMapHostView_nid_no_patch(Address(guest), Page, PROT_READ | PROT_WRITE);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    Require(refused && !Memory::IsBackingReadable(Address(guest), Page));
+    GuestArena::GuestArenaRelease_nid_postfix(guest, Page);
+    std::printf("host memory 0x%llx in the arena's reserved host region: second view from the guest memory file, never probed; mapped once; refused in guest space\n", static_cast<unsigned long long>(fixed));
+}
+
 void TestUnreportedPrivateMemory() {
     constexpr std::size_t bytes = Page * 2;
     void* heap = GuestArena::GuestArenaAllocate_nid_postfix(bytes, Page);
     Require(heap != nullptr);
-    GuestArena::GuestArenaCommit_nid_postfix(heap, bytes, 0x04, bytes);
+    MapUnreported(heap, bytes);
     std::vector<std::uint8_t> written(bytes);
     Fill(written, 41);
     std::memcpy(heap, written.data(), bytes);
     const auto address = Address(heap);
     std::vector<std::uint8_t> read(bytes, 0xcc);
+    const auto firstProbe = Libs::LibKernel::Memory::Shim::ProbeCalls();
     Require(!Memory::IsBackingReadable(address, bytes));
     Require(!Memory::TryReadBacking(address, read.data(), bytes));
     Require(Memory::FindBackingPointer(address, bytes) == nullptr);
     Require(!Memory::TryReadSparseBacking(address, read.data(), bytes));
     Require(!Libs::LibKernel::Memory::Shim::TryWriteBackedRuns(address, written.data(), bytes));
     Require(Memory::IsFullyMapped(address, bytes));
+    const auto probed = Libs::LibKernel::Memory::Shim::ProbeCalls();
+    Require(probed > firstProbe);
+    for (int i = 0; i < 8; ++i) {
+        Require(Memory::IsFullyMapped(address, bytes));
+        Require(Memory::ClampRangeSize(address, bytes) == bytes);
+        Require(!Libs::LibKernel::Memory::Shim::TryWriteBackedRuns(address, written.data(), bytes));
+    }
+    Require(Libs::LibKernel::Memory::Shim::ProbeCalls() == probed);
     Require(Memory::CopySparseMemory(address, read.data(), bytes) && read == written);
+
+    GuestArena::GuestArenaCommit_nid_postfix(heap, bytes, 0x04, bytes);
+    Require(Memory::IsBackingReadable(address, bytes) && Memory::IsFullyMapped(address, bytes));
     GuestArena::GuestArenaReset_nid_postfix(heap, bytes);
-    GuestArena::GuestArenaRelease_nid_postfix(heap, bytes);
-    std::printf("arena memory 0x%llx committed outside libkernel: no second view, read as private memory\n", static_cast<unsigned long long>(address));
+    const auto afterReset = Libs::LibKernel::Memory::Shim::ProbeCalls();
+    Require(!Memory::IsFullyMapped(address, bytes));
+    const auto reprobed = Libs::LibKernel::Memory::Shim::ProbeCalls();
+    Require(reprobed > afterReset);
+    for (int i = 0; i < 8; ++i) Require(!Memory::IsFullyMapped(address, bytes));
+    Require(Libs::LibKernel::Memory::Shim::ProbeCalls() == reprobed);
+    std::printf("arena memory 0x%llx mapped without telling libkernel: no second view, read as private memory, probed %llu time(s) then remembered until libkernel reports a change\n",
+        static_cast<unsigned long long>(address), static_cast<unsigned long long>(probed - firstProbe));
 }
 
 class GpuThread {
@@ -388,7 +491,7 @@ void OnCrossWaitRange(std::uint64_t, std::uint64_t) {
 void TestNoCrossWaitWithGpuThread() {
     void* block = GuestArena::GuestArenaAllocate_nid_postfix(Page * 3, Page);
     Require(block != nullptr);
-    GuestArena::GuestArenaCommit_nid_postfix(block, Page, 0x04, Page);
+    MapUnreported(block, Page);
     g_crossWait.heap = static_cast<std::uint8_t*>(block);
     g_crossWait.hole = Address(block) + Page * 2;
     g_crossWait.heapBytes.resize(Page);
@@ -432,6 +535,7 @@ void TestNoCrossWaitWithGpuThread() {
 }
 
 int main() {
+    setenv("APS5_HEAP_CACHE_MIB", "0", 1);
     Require(Libs::LibKernel::Memory::Shim::ViewEnabled());
     TestFlexible();
     TestDirect();
@@ -439,6 +543,9 @@ int main() {
     TestReleaseWhileMapped();
     TestHostProtectionTable();
     TestRuntimeMemory();
+    TestHeapCommitSecondView();
+    TestHeapBlockEvicted();
+    TestHostView();
     TestUnreportedPrivateMemory();
     TestNoCrossWaitWithGpuThread();
     std::printf("KytyShim memory: all checks passed\n");

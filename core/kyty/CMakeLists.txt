@@ -46,7 +46,7 @@ set(ALLOW_EXTERNAL_SPIRV_TOOLS OFF)
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}/glslang" "${CMAKE_BINARY_DIR}/3rdparty/glslang" EXCLUDE_FROM_ALL)
 
 set(KYTY_FLAGS "-fno-rtti -fno-exceptions -fcolor-diagnostics -finput-charset=UTF-8 -fexec-charset=UTF-8 -g -fno-strict-aliasing -fno-omit-frame-pointer -Wall -fmessage-length=0 -march=x86-64-v3 -ffp-contract=off")
-set(KYTY_SHARED_LIBRARY_FLAGS "-mtls-dialect=gnu2")
+set(KYTY_SHARED_LIBRARY_FLAGS "-mtls-dialect=gnu2 -ftls-model=initial-exec -fvisibility=hidden")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${KYTY_FLAGS} ${KYTY_SHARED_LIBRARY_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${KYTY_FLAGS} ${KYTY_SHARED_LIBRARY_FLAGS}")
 
@@ -73,6 +73,7 @@ set(TRACY_ON_DEMAND ON)
 set(TRACY_DELAYED_INIT ON)
 set(TRACY_MANUAL_LIFETIME ON)
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}/tracy" "${CMAKE_BINARY_DIR}/3rdparty/tracy" EXCLUDE_FROM_ALL)
+target_compile_options(TracyClient PRIVATE -fvisibility=default)
 
 set(ZSTD_BUILD_PROGRAMS OFF)
 set(ZSTD_BUILD_TESTS OFF)
@@ -165,6 +166,12 @@ set_source_files_properties(${KYTY_COMMON_SOURCES} ${KYTY_GPU_EXCEPTIONS} PROPER
 set(KYTY_STB_IMAGE_SOURCE "${KYTY_GENERATED_DIR}/stb_image.c")
 file(CONFIGURE OUTPUT "${KYTY_STB_IMAGE_SOURCE}" CONTENT "#define STB_IMAGE_IMPLEMENTATION\n#include <stb_image.h>\n")
 list(APPEND KYTY_GPU_SOURCES "${KYTY_STB_IMAGE_SOURCE}")
+
+set(KYTY_SHIM_SOURCE_DIR "${ANYPS5_SOURCE_DIR}/core/libs/prx/libSceAgcDriver/KytyShim/src")
+set(KYTY_SHIM_MEMORY_SOURCES "${KYTY_SHIM_SOURCE_DIR}/MemoryBacking.cpp" "${KYTY_SHIM_SOURCE_DIR}/MemoryGpu.cpp")
+set_source_files_properties(${KYTY_SHIM_MEMORY_SOURCES} PROPERTIES INCLUDE_DIRECTORIES "${ANYPS5_SOURCE_DIR}/core/libs")
+set_source_files_properties("${KYTY_SHIM_SOURCE_DIR}/MemoryBacking.cpp" PROPERTIES COMPILE_OPTIONS -fexceptions)
+list(APPEND KYTY_GPU_SOURCES ${KYTY_SHIM_MEMORY_SOURCES})
 
 add_library(kyty_gpu STATIC ${KYTY_GPU_SOURCES})
 add_dependencies(kyty_gpu kyty_gpu_shaders)

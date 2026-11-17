@@ -8,6 +8,7 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libc/include/Shutdown.hpp"
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 
 #include "common/emulatorConfig.h"
@@ -158,8 +159,7 @@ void CheckStopping() {
 }
 
 void MapDriverMemory() {
-    void* mapped = mmap(reinterpret_cast<void*>(DriverMemoryAddress), DriverMemoryBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-    if (mapped == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map the AGC driver memory");
+    void* mapped = DirectMemoryMapHostView_nid_no_patch(DriverMemoryAddress, DriverMemoryBytes, PROT_READ | PROT_WRITE);
     if (reinterpret_cast<std::uint64_t>(mapped) != DriverMemoryAddress) throw std::runtime_error("the AGC driver memory was not mapped at its fixed address");
     auto* routineTable = reinterpret_cast<std::uint64_t*>(FsRoutineTableAddress);
     for (std::uint64_t record = 0; record < FsRoutineRecords; ++record) {

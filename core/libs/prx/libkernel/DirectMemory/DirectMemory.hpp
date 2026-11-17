@@ -73,6 +73,7 @@ bool DirectMemoryFind_nid_no_patch(std::int64_t offset, bool findNext, std::int6
 void GuestPageTableUsage_nid_no_patch(std::uint64_t granularity, std::uint64_t* cpuEntries, std::uint64_t* gpuEntries);
 int DoMapAnon_nid_no_patch(void** addr, std::size_t len, int prot, int flags, std::size_t alignment, bool exclusive);
 int DoMunmap_nid_no_patch(void* addr, std::size_t len);
+void* DirectMemoryMapHostView_nid_no_patch(std::uintptr_t address, std::size_t bytes, int prot);
 }
 #endif
 

@@ -3,21 +3,18 @@
 #include "MemoryShim.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
-#include "prx/libkernel/include/Api.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
 #include <cinttypes>
-#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -121,6 +118,56 @@ public:
 		return bits != nullptr && (bits[page % BucketPages].load(std::memory_order_relaxed) & (1u << ((vaddr >> 12u) & 3u))) != 0;
 	}
 
+	[[nodiscard]] uint8_t Probed(uint64_t host) const {
+		const auto page = host >> PageBits;
+		if (page / BucketPages >= BucketCount) return ProbeUnknown;
+		const auto* bits = m_probe[page / BucketPages].load(std::memory_order_acquire);
+		if (bits == nullptr) return ProbeUnknown;
+		return static_cast<uint8_t>((bits[page % BucketPages].load(std::memory_order_acquire) >> ProbeShift(host)) & ProbeMask);
+	}
+
+	void StoreProbe(uint64_t host, bool readable) {
+		const auto page = host >> PageBits;
+		if (page / BucketPages >= BucketCount) return;
+		auto& bucket = m_probe[page / BucketPages];
+		auto* bits = bucket.load(std::memory_order_acquire);
+		if (bits == nullptr) {
+			auto* created = new std::atomic<uint8_t>[BucketPages] {};
+			if (bucket.compare_exchange_strong(bits, created, std::memory_order_acq_rel)) {
+				bits = created;
+			} else {
+				delete[] created;
+			}
+		}
+		const auto shift = ProbeShift(host);
+		const auto value = static_cast<uint8_t>((readable ? ProbeReadable : ProbeUnreadable) << shift);
+		auto& slot = bits[page % BucketPages];
+		auto current = slot.load(std::memory_order_relaxed);
+		while (!slot.compare_exchange_weak(current, static_cast<uint8_t>((current & ~(ProbeMask << shift)) | value), std::memory_order_acq_rel)) {}
+	}
+
+	void ClearProbes(uint64_t start, uint64_t end) {
+		for (auto host = start & ~HostPageMask; host < end; host += HostPageSize) {
+			const auto page = host >> PageBits;
+			if (page / BucketPages >= BucketCount) return;
+			auto* bits = m_probe[page / BucketPages].load(std::memory_order_acquire);
+			if (bits == nullptr) {
+				host = (((page / BucketPages + 1u) * BucketPages) << PageBits) - HostPageSize;
+				continue;
+			}
+			if ((host & PageMask) == 0 && end - host >= PageSize) {
+				bits[page % BucketPages].store(0, std::memory_order_release);
+				host += PageSize - HostPageSize;
+				continue;
+			}
+			bits[page % BucketPages].fetch_and(static_cast<uint8_t>(~(ProbeMask << ProbeShift(host))), std::memory_order_acq_rel);
+		}
+	}
+
+	static constexpr uint8_t ProbeUnknown = 0;
+	static constexpr uint8_t ProbeUnreadable = 1;
+	static constexpr uint8_t ProbeReadable = 3;
+
 	template <typename Run>
 	void ForEachMappedRun(Run&& run) const {
 		uint64_t start = 0;
@@ -144,8 +191,15 @@ public:
 	}
 
 private:
+	static constexpr uint8_t ProbeMask = 3;
+
+	[[nodiscard]] static unsigned ProbeShift(uint64_t host) {
+		return static_cast<unsigned>(((host >> 12u) & 3u) * 2u);
+	}
+
 	std::array<std::atomic<std::atomic<uint32_t>*>, BucketCount> m_buckets {};
 	std::array<std::atomic<std::atomic<uint8_t>*>, BucketCount> m_exec {};
+	std::array<std::atomic<std::atomic<uint8_t>*>, BucketCount> m_probe {};
 };
 
 struct ViewState {
@@ -168,6 +222,15 @@ ViewState& State() {
 	return *state;
 }
 
+std::atomic<uint64_t> g_probe_epoch {0};
+std::atomic<uint64_t> g_probe_calls {0};
+std::atomic<bool> g_any_probe {false};
+
+void ForgetProbes(uint64_t start, uint64_t size) {
+	g_probe_epoch.fetch_add(1, std::memory_order_seq_cst);
+	if (g_any_probe.load(std::memory_order_seq_cst)) Pages().ClearProbes(start, start + size);
+}
+
 std::atomic<uint64_t> g_backing_epoch {0};
 constexpr uint64_t BackingChangeHistory = 4096;
 std::mutex g_backing_changes_mutex;
@@ -180,7 +243,11 @@ void BumpBackingEpoch(uint64_t start, uint64_t size) noexcept {
 	g_backing_epoch.store(epoch, std::memory_order_release);
 }
 
-std::recursive_mutex g_hook_mutex;
+std::recursive_mutex& HookMutex() {
+	static auto* mutex = new std::recursive_mutex;
+	return *mutex;
+}
+
 Shim::RangeHook g_map_hook = nullptr;
 Shim::RangeHook g_unmap_hook = nullptr;
 
@@ -219,17 +286,31 @@ size_t ReadOwnMemory(const iovec& local, const iovec* remote, size_t count) {
 }
 
 uint64_t ReadablePrefix(uint64_t start, uint64_t end) {
+	auto& pages = Pages();
 	for (auto cursor = start; cursor < end;) {
+		const auto known = pages.Probed(cursor);
+		if (known == PageTable::ProbeUnreadable) return cursor - start;
+		if (known == PageTable::ProbeReadable) {
+			cursor = (cursor | HostPageMask) + 1u;
+			continue;
+		}
 		std::array<iovec, ProbeBatch> remote {};
 		std::array<char, ProbeBatch> sink {};
 		size_t count = 0;
-		for (auto page = cursor; page < end && count < ProbeBatch; page = (page | HostPageMask) + 1u) {
+		for (auto page = cursor; page < end && count < ProbeBatch && (count == 0 || pages.Probed(page) == PageTable::ProbeUnknown); page = (page | HostPageMask) + 1u) {
 			remote[count++] = {reinterpret_cast<void*>(static_cast<std::uintptr_t>(page)), 1};
 		}
+		const auto epoch = g_probe_epoch.load(std::memory_order_seq_cst);
+		g_any_probe.store(true, std::memory_order_seq_cst);
+		g_probe_calls.fetch_add(1, std::memory_order_relaxed);
 		const iovec local {sink.data(), count};
 		const auto read = ReadOwnMemory(local, remote.data(), count);
+		const auto known_end = std::min(read + 1u, count);
+		for (size_t i = 0; i < known_end; ++i) pages.StoreProbe(reinterpret_cast<std::uintptr_t>(remote[i].iov_base), i < read);
+		const auto probed_end = (reinterpret_cast<std::uintptr_t>(remote[known_end - 1u].iov_base) | HostPageMask) + 1u;
+		if (g_probe_epoch.load(std::memory_order_seq_cst) != epoch) pages.ClearProbes(cursor, probed_end);
 		if (read < count) return reinterpret_cast<std::uintptr_t>(remote[read].iov_base) - start;
-		cursor = (reinterpret_cast<std::uintptr_t>(remote[count - 1u].iov_base) | HostPageMask) + 1u;
+		cursor = probed_end;
 	}
 	return end - start;
 }
@@ -340,8 +421,9 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 	if (((address | bytes) & PageMask) != 0) {
 		Shim::Fail("KytyShim memory: libkernel reported a view change 0x%016" PRIx64 "+0x%zx that is not 16 KiB aligned\n", static_cast<uint64_t>(address), bytes);
 	}
-	std::lock_guard lock(g_hook_mutex);
+	std::lock_guard lock(HookMutex());
 	auto& pages = Pages();
+	ForgetProbes(address, bytes);
 	if (offset == DirectMemoryViewReplacing) {
 		if (pages.AnyMapped(address, bytes)) {
 			if (g_unmap_hook != nullptr) g_unmap_hook(address, bytes);
@@ -378,72 +460,10 @@ void OnProtectionChange(std::uintptr_t address, std::size_t bytes, int protectio
 		Shim::Fail("KytyShim memory: libkernel reported a protection change 0x%016" PRIx64 "+0x%zx past the address space\n", static_cast<uint64_t>(address), bytes);
 	}
 	Pages().StoreExecutable(address, address + bytes, protection >= 0 && (protection & 0x04) != 0);
+	ForgetProbes(address, bytes);
 }
 
-struct KernelStats {
-	uint64_t direct_allocated = 0;
-	uint64_t flexible_total = 0;
-	uint64_t flexible_used = 0;
-	uint64_t cpu_page_entries = 0;
-	uint64_t gpu_page_entries = 0;
-};
-
-KernelStats SampleKernelStats() {
-	KernelStats stats;
-	int64_t start = 0;
-	int64_t end = 0;
-	int type = 0;
-	for (int64_t offset = 0; DirectMemoryFind_nid_no_patch(offset, true, &start, &end, &type) && end > offset; offset = end) {
-		stats.direct_allocated += static_cast<uint64_t>(end - start);
-	}
-	size_t configured = 0;
-	size_t available = 0;
-	if (sceKernelConfiguredFlexibleMemorySize(&configured) != 0 || sceKernelAvailableFlexibleMemorySize(&available) != 0) {
-		Shim::Fail("KytyShim memory: libkernel did not report the flexible memory sizes\n");
-	}
-	stats.flexible_total = configured;
-	stats.flexible_used = configured - std::min(configured, available);
-	constexpr uint64_t TableGranularity = 2ull * 1024ull * 1024ull;
-	GuestPageTableUsage_nid_no_patch(TableGranularity, &stats.cpu_page_entries, &stats.gpu_page_entries);
-	return stats;
-}
-
-class KernelStatsSampler {
-public:
-	KernelStats Request() {
-		std::call_once(m_started, [this] { std::thread([this] { Run(); }).detach(); });
-		std::lock_guard lock(m_mutex);
-		m_requested = true;
-		m_wake.notify_one();
-		return m_latest;
-	}
-
-private:
-	[[noreturn]] void Run() {
-		std::unique_lock lock(m_mutex);
-		for (;;) {
-			m_wake.wait(lock, [this] { return m_requested; });
-			m_requested = false;
-			lock.unlock();
-			const auto sample = SampleKernelStats();
-			lock.lock();
-			m_latest = sample;
-		}
-	}
-
-	std::once_flag m_started;
-	std::mutex m_mutex;
-	std::condition_variable m_wake;
-	bool m_requested = false;
-	KernelStats m_latest;
-};
-
-KernelStatsSampler& StatsSampler() {
-	static auto* sampler = new KernelStatsSampler;
-	return *sampler;
-}
-
-void EnableView() {
+void EnableViewOnce() {
 	auto& state = State();
 	uint8_t* view = nullptr;
 	std::size_t guest_bytes = 0;
@@ -467,8 +487,6 @@ void EnableView() {
 	DirectMemoryWatchProtections_nid_no_patch(&OnProtectionChange);
 	state.enabled.store(true, std::memory_order_release);
 }
-
-[[maybe_unused]] const bool g_view_enabled = (EnableView(), true);
 
 }
 
@@ -540,10 +558,30 @@ bool TryWriteBackedQwords(uint64_t vaddr, const uint64_t* values, uint32_t count
 }
 
 void SetGpuRangeHooks(RangeHook map, RangeHook unmap) {
-	std::lock_guard lock(g_hook_mutex);
+	std::lock_guard lock(HookMutex());
 	g_map_hook = map;
 	g_unmap_hook = unmap;
 	if (map != nullptr) Pages().ForEachMappedRun([&](uint64_t start, uint64_t size) { map(start, size); });
+}
+
+uint64_t ProbeCalls() {
+	return g_probe_calls.load(std::memory_order_relaxed);
+}
+
+void EnableView() {
+	EnableViewOnce();
+}
+
+uint64_t DirectMappedBytes() {
+	uint64_t bytes = 0;
+	const auto guest_bytes = State().guest_bytes;
+	Pages().ForEachMappedRun([&](uint64_t run_start, uint64_t run_size) {
+		for (auto page = run_start; page < run_start + run_size; page += PageSize) {
+			const auto entry = Pages().LoadBacking(page >> PageBits);
+			if (entry != 0 && (uint64_t {entry - 1u} << PageBits) >= guest_bytes) bytes += PageSize;
+		}
+	});
+	return bytes;
 }
 
 }
@@ -722,23 +760,5 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-DebugStats GetDebugStats() {
-	DebugStats stats {};
-	stats.direct_total = DirectMemorySize_nid_no_patch();
-	const auto kernel = StatsSampler().Request();
-	stats.direct_allocated = kernel.direct_allocated;
-	stats.flexible_total = kernel.flexible_total;
-	stats.flexible_used = kernel.flexible_used;
-	stats.cpu_page_entries = kernel.cpu_page_entries;
-	stats.gpu_page_entries = kernel.gpu_page_entries;
-	const auto guest_bytes = State().guest_bytes;
-	Pages().ForEachMappedRun([&](uint64_t run_start, uint64_t run_size) {
-		for (auto page = run_start; page < run_start + run_size; page += PageSize) {
-			const auto entry = Pages().LoadBacking(page >> PageBits);
-			if (entry != 0 && (uint64_t {entry - 1u} << PageBits) >= guest_bytes) stats.direct_mapped += PageSize;
-		}
-	});
-	return stats;
-}
 
 }
