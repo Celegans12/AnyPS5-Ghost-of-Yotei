@@ -32,7 +32,7 @@
 #ifdef _WIN32
 #include <windows.h>
 #endif
-#if defined(ANYPS5_KYTY) && !defined(_WIN32)
+#if defined(ANYPS5_KYTY)
 #include <array>
 #endif
 
@@ -46,7 +46,11 @@ std::atomic<void (*)(std::uintptr_t, std::size_t)> hostReadHook{nullptr};
 #if defined(ANYPS5_KYTY)
 std::atomic<bool (*)(std::uintptr_t, std::size_t)> hostWritePreparer{nullptr};
 
-#ifndef _WIN32
+#ifdef _WIN32
+std::atomic<bool (*)(void*)> gpuFaultHandler{nullptr};
+#endif
+
+#if defined(ANYPS5_KYTY)
 std::atomic<bool (*)(std::uintptr_t, std::size_t)> hostWriteFilter{nullptr};
 std::atomic<void* (*)(void*, std::size_t, int)> viewPlacer{nullptr};
 
@@ -140,7 +144,7 @@ void prepareHostWrite(const void* pointer, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return;
     const auto prepare = hostWritePreparer.load(std::memory_order_acquire);
     if (prepare == nullptr) return;
-#ifndef _WIN32
+#if defined(ANYPS5_KYTY)
     if (preparingHostWrite.load(std::memory_order_relaxed) != 0) return;
     const HostWritePreparation preparation;
     if (!mayBeHostProtected(address, bytes)) return;
@@ -304,7 +308,11 @@ private:
 #elif defined(__linux__) || defined(__APPLE__)
         SeedHostUsedRanges();
 #elif defined(_WIN32)
+#if defined(ANYPS5_KYTY)
+        _writeWatched = false;
+#else
         _writeWatched = std::getenv("APS5_NO_WRITE_WATCH") == nullptr;
+#endif
         SYSTEM_INFO system{};
         GetSystemInfo(&system);
         const std::uintptr_t granularity = system.dwAllocationGranularity;
@@ -589,7 +597,7 @@ void GuestArenaMarkUsed_nid_postfix(const void* pointer, std::size_t bytes) {
 
 void GuestArenaRelease_nid_postfix(const void* pointer, std::size_t bytes) {
     Arena::Get().Release(pointer, bytes);
-#if defined(ANYPS5_KYTY) && !defined(_WIN32)
+#if defined(ANYPS5_KYTY)
     if (protectionsNoted.load(std::memory_order_acquire)) noteHostProtection(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
 #endif
 }
@@ -1004,7 +1012,11 @@ void GuestArenaMapDirect_nid_postfix(void* pointer, std::size_t bytes, void* sec
     std::vector<std::pair<std::uintptr_t, std::size_t>> created;
     std::exception_ptr failure;
     try {
+#if defined(ANYPS5_KYTY)
+        WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, false, false, PAGE_EXECUTE_READWRITE, SIZE_MAX, &created);
+#else
         WindowsMappings::Get().Map(pointer, bytes, section, offset, protection, Arena::Get().WriteWatched(), true, PAGE_EXECUTE_READWRITE, SIZE_MAX, &created);
+#endif
     } catch (...) {
         failure = std::current_exception();
     }
@@ -1195,7 +1207,18 @@ void GuestArenaSetHostWritePreparer_nid_no_patch(bool (*prepare)(std::uintptr_t,
     hostWritePreparer.store(prepare, std::memory_order_release);
 }
 
-#ifndef _WIN32
+#ifdef _WIN32
+void GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(void*)) {
+    gpuFaultHandler.store(handler, std::memory_order_release);
+}
+
+bool GuestArenaHandleGpuFault_nid_no_patch(void* exceptionPointers) {
+    const auto handler = gpuFaultHandler.load(std::memory_order_acquire);
+    return handler != nullptr && handler(exceptionPointers);
+}
+#endif
+
+#if defined(ANYPS5_KYTY)
 void GuestArenaNoteHostProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool writable) {
     noteHostProtection(address, bytes, writable);
 }
@@ -1231,6 +1254,9 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
     if (const auto hook = hostWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #ifdef _WIN32
+#if defined(ANYPS5_KYTY)
+    prepareHostWrite(pointer, bytes);
+#endif
     return WindowsMappings::Get().BeginHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #elif defined(ANYPS5_KYTY)
     prepareHostWrite(pointer, bytes);
@@ -1265,6 +1291,9 @@ void GuestArenaEndHostWrite_nid_postfix(void* pointer, std::size_t bytes) {
 std::uint64_t GuestArenaOpenHostWrite_nid_no_patch(void* pointer, std::size_t bytes) {
     if (const auto hook = hostWriteHook.load(std::memory_order_acquire); hook != nullptr && bytes != 0) hook(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #ifdef _WIN32
+#if defined(ANYPS5_KYTY)
+    prepareHostWrite(pointer, bytes);
+#endif
     return WindowsMappings::Get().OpenHostWrite(reinterpret_cast<std::uintptr_t>(pointer), bytes);
 #elif defined(ANYPS5_KYTY)
     prepareHostWrite(pointer, bytes);

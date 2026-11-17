@@ -69,6 +69,26 @@ glslang (with the optimizer, for `glslangValidator -Os` on upstream's utility sh
 target that links the resulting archives into AnyPS5. `core/kyty/KytyGpuSources.cmake` lists the imported sources left
 out of `kyty_gpu`, and `core/kyty/tools/kyty_frontier.py` lists the symbols `kyty_gpu` still needs from the shim.
 
+### Windows
+
+On Windows AnyPS5 is built with MinGW-w64 GCC and `kyty_gpu` with the `clang` and `clang++` of an LLVM release found on
+`PATH`, for the `x86_64-w64-windows-gnu` target, with `--sysroot` set to the MinGW-w64 installation of that GCC
+(`ANYPS5_KYTY_SYSROOT`). Three options make its objects link with GCC's: `-femulated-tls` (GCC's thread-local storage
+model on MinGW, which libstdc++ uses), `-fno-zero-initialized-in-bss` (GCC puts every inline variable in a `.data$`
+section, and GNU ld only merges sections of one name) and `-mno-red-zone`. The shim is compiled with
+`-fno-extern-tls-init`, and `MemoryTracker::s_deferred` is declared without `inline` for GCC there, because GCC on
+MinGW emits the initialisation function of an inline `thread_local` variable once per translation unit. ThinLTO is off:
+lld cannot pre-link COFF objects with `-r`. `pipelineHelpers.cpp` is compiled with `-fexceptions`, as its Windows part
+uses `try`.
+
+The second view of guest memory (`DirectMemoryEnableView`) is a reserved range. Anonymous guest memory in the arena is
+mapped from pagefile-backed sections of 1 GiB, each created and mapped into the view when memory is first committed in
+its range, and each direct memory backing is mapped at its physical offset after the guest range. A section page cannot
+be given back to the system, so a page that held data is zeroed when it is unmapped and stays committed. Access
+violations reach `KytyShim::HandleHostFault` from libc's vectored exception handler through
+`GuestArenaSetGpuFaultHandler`. KytyPS5's pipeline helper processes are not used (`PipelineHelperProcesses` returns 0):
+a helper is the executable started again with `--pipeline-helper`, and here the executable is the converted title.
+
 ## Third-party code
 
 The dependencies of `graphics/` and `common/` that AnyPS5 did not have are submodules at the revisions Kyty
@@ -124,6 +144,24 @@ stops the emulator with a message naming the variable.
 KytyPS5's log (`LOGF`) is silent by default; `KYTY_PRINTF_DIRECTION=Console` sends it to stderr, beside AnyPS5's own
 lines. `KYTY_GPU_PIPELINE`, `KYTY_GPU_THREAD_CPUS`, `KYTY_GPU_THREAD_PRIORITY` and `KYTY_RESOLVE_HELPER` are read by
 `common/emulatorConfig.cpp` itself.
+
+GPU stage threads on Linux: KytyPS5 places them only on Windows (`{4, 6, 8, 10, 2, 0}` counts SMT siblings as adjacent
+logical processors, and its core reservation uses Windows CPU sets). Under `ANYPS5_KYTY` on Linux, with
+`KYTY_GPU_THREAD_CPUS` unset or empty, each stage thread (command processor, execution, recording, resolve, host copy,
+resolve helper) keeps to the logical CPUs that share the largest last-level cache (`/sys/devices/system/cpu`: on a Ryzen
+9 7950X3D, CPUs 0-7 and 16-23, the 3D V-Cache CCD), intersected with its current affinity. No core is reserved, and the
+threads it creates afterwards inherit that set. Measured on Subnautica: +7 % to +22 % frames per second, 25-35 % less CPU
+time per draw on each stage (`notes/au-dela-p4-placement.md`). `KYTY_GPU_THREAD_CPUS=off` turns it off. An explicit list
+pins each stage to that Linux logical CPU, without core reservation; threads a stage creates afterwards inherit its CPU.
+
+Images the game reads after the GPU writes them: KytyPS5 copies a GPU-written linear image back to guest memory at the
+next suspend point, unless `KYTY_READBACK_STORAGE_IMAGES=1`. A game that waits for the label of a `RELEASE_MEM` with GL2
+write-back and then reads the image reads stale memory: in TCG Card Shop Simulator (PPSA36301) a 64×64 RGBA32F image is
+read that way and the street stays almost black. Under `ANYPS5_KYTY`, the write-back half of that setting is on by
+default: at each `ACQUIRE_MEM` or `RELEASE_MEM` with GL2 write-back and at each flip, the images already queued for
+readback are copied back, and their pages stay read-protected until the copy lands. No other image is copied: the copy
+of every storage image on its first write still needs `KYTY_READBACK_STORAGE_IMAGES=1`. `KYTY_WRITE_BACK_IMAGES=0`
+restores KytyPS5's behaviour.
 
 KytyPS5's `native_rt` is off by default and its launcher's recommended settings turn it on; under `ANYPS5_KYTY` the
 shim turns it on unless `KYTY_NATIVE_RT=0`, and Kyty enables the ray query extensions only on a device that has them.

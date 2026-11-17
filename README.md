@@ -15,7 +15,7 @@ AnyPS5 keeps everything it does today: the relinker, `libkernel`, every system l
 | GPU view of game memory | AnyPS5 imports and write tracking | Kyty model: every guest page has a second view, writes are tracked by page faults |
 | Presentation | AnyPS5 presentation | Kyty presenter and swapchain, on AnyPS5's window; AnyPS5's VideoOut still reserves, paces and presents the flips |
 
-The default build is AnyPS5 as before: it compiles none of the Kyty files. The Kyty core lives in `core/kyty/`, taken from Kyty at `40ddebbe`; the glue between it and AnyPS5 (memory, faults, entry points, presentation, events) lives in `core/libs/prx/libSceAgcDriver/KytyShim/`. Changes to shared AnyPS5 files are under `ANYPS5_KYTY`, except the optional `ANYPS5_VBLANK_HZ` setting, which leaves behaviour unchanged when it is not set. Kyty's general shortcuts are kept as they are, for example skipping a draw while its pipeline compiles in the background. Its title-specific hooks (Demon's Souls page freeing, ASTRO BOT, Oodle) are not ported. AnyKyty also turns on by default two Kyty settings that native Kyty only enables in its launcher's Experiment mode, draw templates and grouped draw buffers (`KYTY_DRAW_TEMPLATES=2`, `KYTY_DRAW_BUFFERS=1`); setting either variable keeps the user's value. Native ray tracing, which native Kyty's launcher turns on in its recommended settings, is on by default when the GPU supports it (`KYTY_NATIVE_RT`, see the runtime settings below).
+The default build is AnyPS5 as before: it compiles none of the Kyty files. The Kyty core lives in `core/kyty/`, taken from Kyty at `40ddebbe`; the glue between it and AnyPS5 (memory, faults, entry points, presentation, events) lives in `core/libs/prx/libSceAgcDriver/KytyShim/`. Changes to shared AnyPS5 files are under `ANYPS5_KYTY`, except the optional `ANYPS5_VBLANK_HZ` setting, which leaves behaviour unchanged when it is not set. Kyty's general shortcuts are kept as they are, for example skipping a draw while its pipeline compiles in the background. Its title-specific hooks (Demon's Souls page freeing, ASTRO BOT, Oodle) are not ported. AnyKyty also turns on by default two Kyty settings that native Kyty only enables in its launcher's Experiment mode, draw templates and grouped draw buffers (`KYTY_DRAW_TEMPLATES=2`, `KYTY_DRAW_BUFFERS=1`); setting either variable keeps the user's value. It also copies GPU-written images back at the GL2 write-backs the game requests rather than at the next suspend point (`KYTY_WRITE_BACK_IMAGES=0` restores KytyPS5's behaviour; see `docs/dev/THIRD_PARTY_KYTY.md`). Native ray tracing, which native Kyty's launcher turns on in its recommended settings, is on by default when the GPU supports it (`KYTY_NATIVE_RT`, see the runtime settings below).
 
 ## Why
 
@@ -46,7 +46,7 @@ At a comparable draw count (911 against 863 per frame), every Kyty stage is 12 t
 
 - Tested in game on Linux: Subnautica, Balatro and TCG Card Shop Simulator.
 - Known issue, inherited from Kyty: the street of TCG Card Shop Simulator stays almost black, as it does on native Kyty. Rendering differences against the default backend are being collected and will be fixed after performance work.
-- The Kyty backend has only been built and run on Linux. Windows is untested.
+- The Kyty backend is built and run on Linux. On Windows it builds, and an open-world AAA title reaches the prologue in game on an NVIDIA GPU; nothing else has been tested there.
 
 ## Building AnyKyty
 
@@ -55,6 +55,8 @@ Follow [BUILD](docs/dev/BUILD.md), then configure with:
 ```
 cmake -B build -DANYPS5_GPU_BACKEND=kyty
 ```
+
+On Windows the rest of AnyPS5 is built with MinGW-w64 GCC as usual, and `clang`, `clang++` of an LLVM release (tested with 21.1.8) must be on `PATH`: they compile the Kyty core for the `x86_64-w64-windows-gnu` target against the headers and libstdc++ of that GCC (`ANYPS5_KYTY_SYSROOT`, by default the directory above the `bin` of `g++`). ThinLTO is off there, since lld cannot pre-link Windows objects, and Kyty's pipeline helper processes are not used.
 
 The Kyty core does not build with GCC, so it is compiled by Clang in a sub-project, against the same libstdc++ as the rest of AnyPS5. It needs `clang`, `clang++` and an `ld.lld` of the same major version (tested with 21). It is built with ThinLTO and pre-linked into one object by default; `-DANYPS5_KYTY_THIN_LTO=OFF` turns that off.
 

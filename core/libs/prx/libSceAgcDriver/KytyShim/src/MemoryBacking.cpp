@@ -18,13 +18,24 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <sys/uio.h>
 #include <unistd.h>
+#endif
 
 namespace Libs::LibKernel::Memory {
 
 namespace {
+
+#ifdef _WIN32
+constexpr int PROT_NONE = 0;
+constexpr int PROT_READ = 1;
+constexpr int PROT_WRITE = 2;
+constexpr int PROT_EXEC = 4;
+#endif
 
 constexpr uint64_t PageBits = 14;
 constexpr uint64_t PageSize = uint64_t {1} << PageBits;
@@ -208,7 +219,9 @@ struct ViewState {
 	uint64_t view_bytes = 0;
 	uint64_t arena_start = 0;
 	uint64_t arena_end = 0;
+#ifndef _WIN32
 	pid_t pid = 0;
+#endif
 	std::atomic<bool> enabled {false};
 };
 
@@ -278,6 +291,42 @@ void ForEachRun(uint64_t vaddr, uint64_t size, Region&& region, Gap&& gap) {
 	}
 }
 
+#ifdef _WIN32
+bool HostReadable(const MEMORY_BASIC_INFORMATION& memory) {
+	constexpr DWORD Readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+	return memory.State == MEM_COMMIT && (memory.Protect & PAGE_GUARD) == 0 && (memory.Protect & Readable) != 0;
+}
+
+uint64_t ReadablePrefix(uint64_t start, uint64_t end) {
+	for (auto cursor = start; cursor < end;) {
+		MEMORY_BASIC_INFORMATION memory {};
+		if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), &memory, sizeof(memory)) != sizeof(memory) || !HostReadable(memory)) {
+			return cursor - start;
+		}
+		cursor = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+	}
+	return end - start;
+}
+
+void CopyReadable(uint64_t start, uint8_t* destination, uint64_t bytes) {
+	const auto end = start + bytes;
+	const HANDLE process = GetCurrentProcess();
+	for (auto cursor = start; cursor < end;) {
+		SIZE_T read = 0;
+		const bool complete = ReadProcessMemory(process, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), destination + (cursor - start), end - cursor, &read) != 0;
+		if (complete) return;
+		cursor += read;
+		if (cursor < end) {
+			const auto page_end = std::min(end, (cursor | HostPageMask) + 1u);
+			SIZE_T page_read = 0;
+			if (ReadProcessMemory(process, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), destination + (cursor - start), page_end - cursor, &page_read) == 0) {
+				std::memset(destination + (cursor - start), 0, page_end - cursor);
+			}
+			cursor = page_end;
+		}
+	}
+}
+#else
 size_t ReadOwnMemory(const iovec& local, const iovec* remote, size_t count) {
 	const auto read = ::process_vm_readv(State().pid, &local, 1, remote, count, 0);
 	if (read >= 0) return static_cast<size_t>(read);
@@ -314,6 +363,7 @@ uint64_t ReadablePrefix(uint64_t start, uint64_t end) {
 	}
 	return end - start;
 }
+#endif
 
 uint64_t UnreportedMappedPrefix(uint64_t start, uint64_t end) {
 	const auto& state = State();
@@ -330,6 +380,7 @@ bool AnyUnreportedMapped(uint64_t start, uint64_t end) {
 	return false;
 }
 
+#ifndef _WIN32
 void CopyReadable(uint64_t start, uint8_t* destination, uint64_t bytes) {
 	const auto end = start + bytes;
 	for (auto cursor = start; cursor < end;) {
@@ -350,6 +401,7 @@ void CopyReadable(uint64_t start, uint8_t* destination, uint64_t bytes) {
 		}
 	}
 }
+#endif
 
 void CopyUnreported(uint64_t start, uint8_t* destination, uint64_t bytes) {
 	const auto& state = State();
@@ -480,10 +532,13 @@ void EnableViewOnce() {
 	GuestArena::GuestArenaRange_nid_postfix(&arena_base, &arena_bytes);
 	state.arena_start = arena_base;
 	state.arena_end = arena_base + arena_bytes;
+#ifndef _WIN32
 	state.pid = ::getpid();
+#endif
 	state.base = view;
 	state.guest_bytes = guest_bytes;
 	state.view_bytes = view_bytes;
+	std::fprintf(stderr, "[kyty] second view of guest memory at %p: guest range 0x%zx bytes, direct memory after it, 0x%zx bytes in all\n", static_cast<void*>(view), guest_bytes, view_bytes);
 	DirectMemoryWatchProtections_nid_no_patch(&OnProtectionChange);
 	state.enabled.store(true, std::memory_order_release);
 }
@@ -709,6 +764,36 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 	if (!ValidRange(vaddr, size)) return false;
 	const auto protection = HostProtection(mode);
 	const bool writable = (protection & PROT_WRITE) != 0;
+#ifdef _WIN32
+	const DWORD host_protection = protection == PROT_NONE                               ? PAGE_NOACCESS
+	                              : (protection & PROT_EXEC) != 0 && writable             ? PAGE_EXECUTE_READWRITE
+	                              : (protection & PROT_EXEC) != 0 && (protection & PROT_READ) != 0 ? PAGE_EXECUTE_READ
+	                              : (protection & PROT_EXEC) != 0                         ? PAGE_EXECUTE
+	                              : writable                                              ? PAGE_READWRITE
+	                                                                                      : PAGE_READONLY;
+	if (!writable) GuestArena::GuestArenaNoteHostProtection_nid_no_patch(vaddr, size, false);
+	const auto& mapped_pages = Pages();
+	const auto host_first = vaddr & ~uint64_t {0xfff};
+	const auto host_end = (vaddr + size + 0xfff) & ~uint64_t {0xfff};
+	for (auto start = host_first; start < host_end;) {
+		auto stop = std::min(host_end, (start | PageMask) + 1u);
+		if (mapped_pages.Load(start >> PageBits) != 0) {
+			DWORD previous = 0;
+			if (VirtualProtect(reinterpret_cast<void*>(static_cast<std::uintptr_t>(start)), stop - start, host_protection, &previous) == 0) {
+				for (auto cursor = start; cursor < stop;) {
+					MEMORY_BASIC_INFORMATION memory {};
+					if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), &memory, sizeof(memory)) != sizeof(memory)) return false;
+					const auto region_end = std::min<uint64_t>(stop, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
+					if (memory.State == MEM_COMMIT && VirtualProtect(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cursor)), region_end - cursor, host_protection, &previous) == 0) return false;
+					cursor = region_end;
+				}
+			}
+		}
+		start = stop;
+	}
+	if (writable) GuestArena::GuestArenaNoteHostProtection_nid_no_patch(vaddr, size, true);
+	return true;
+#else
 	if (!writable) GuestArena::GuestArenaNoteHostProtection_nid_no_patch(vaddr, size, false);
 	const auto& pages = Pages();
 	const auto first = vaddr & ~uint64_t {0xfff};
@@ -724,6 +809,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 	}
 	if (writable) GuestArena::GuestArenaNoteHostProtection_nid_no_patch(vaddr, size, true);
 	return true;
+#endif
 }
 
 bool IsGuestExecutable(uint64_t vaddr) {

@@ -7,8 +7,12 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 namespace KytyShim::Entry {
 
@@ -151,16 +155,31 @@ void CheckMappedRange(const void* pointer, std::size_t bytes, std::size_t alignm
     require(alignment != 0, "zero guest memory alignment");
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     require(address != 0 && address % alignment == 0, "null or misaligned address");
+#ifdef _WIN32
+    const std::uintptr_t page = 0x1000;
+#else
     const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+#endif
     require(bytes <= std::numeric_limits<std::uintptr_t>::max() - address - page, "address range overflow");
     if (bytes == 0) return;
     const auto begin = address & ~(page - 1u);
     const auto end = (address + bytes + page - 1u) & ~(page - 1u);
+    char text[160];
+#ifdef _WIN32
+    for (auto cursor = begin; cursor < end;) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_COMMIT) {
+            std::snprintf(text, sizeof(text), "guest memory is not mapped in 0x%llx+0x%zx (first unmapped page 0x%llx)", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(cursor));
+            throw std::runtime_error(text);
+        }
+        cursor = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+    }
+#else
     if (msync(reinterpret_cast<void*>(begin), end - begin, MS_ASYNC) == 0) return;
     const int error = errno;
-    char text[160];
     std::snprintf(text, sizeof(text), "guest memory is not mapped in 0x%llx+0x%zx (%s)", static_cast<unsigned long long>(address), bytes, std::strerror(error));
     throw std::runtime_error(text);
+#endif
 }
 
 }

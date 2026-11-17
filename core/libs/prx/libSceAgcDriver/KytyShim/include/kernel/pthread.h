@@ -7,6 +7,12 @@
 #include <cstdint>
 #include <vector>
 
+#if defined(ANYPS5_KYTY) && defined(_WIN32)
+#include <pthread.h>
+#undef pthread_attr_getguardsize
+#undef pthread_attr_setguardsize
+#endif
+
 extern "C" {
 struct sched_param;
 }

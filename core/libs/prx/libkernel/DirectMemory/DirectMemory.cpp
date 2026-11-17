@@ -82,7 +82,225 @@ struct KernelArena {
     void Release(const void* pointer, size_t len) { GuestArena::GuestArenaRelease_nid_postfix(pointer, len); }
 };
 
+#if defined(ANYPS5_KYTY)
+static constexpr std::size_t GuestChunkBytes = std::size_t{1} << 30;
+
+struct GuestView {
+    std::atomic<bool> enabled{false};
+    std::atomic<DirectMemoryViewObserver> observer{nullptr};
+    std::atomic<DirectMemoryProtectionObserver> protectionObserver{nullptr};
+    std::vector<HANDLE> chunks;
+    std::size_t guestBytes = 0;
+    std::size_t viewBytes = 0;
+    std::uint8_t* view = nullptr;
+    std::mutex lock;
+    std::vector<std::uint64_t> used;
+    struct DirectView {
+        std::uintptr_t end;
+        HANDLE section;
+        std::uint64_t offset;
+    };
+    std::map<std::uintptr_t, DirectView> directViews;
+};
+
+static GuestView& View() {
+    static auto* view = new GuestView;
+    return *view;
+}
+
+static bool InGuestFile(std::uintptr_t address, std::size_t bytes) {
+    auto& view = View();
+    return view.enabled.load(std::memory_order_acquire) && address < view.guestBytes && bytes <= view.guestBytes - address;
+}
+
+static void NoteView(std::uintptr_t address, std::size_t bytes, std::uint64_t offset) {
+    if (bytes == 0) return;
+    if (const auto observer = View().observer.load(std::memory_order_acquire)) observer(address, bytes, offset);
+}
+
+static void DiscardGuestFile(std::uintptr_t address, std::size_t bytes) {
+    if (bytes == 0 || !InGuestFile(address, bytes)) return;
+    auto& view = View();
+    std::lock_guard lock(view.lock);
+    for (auto page = address / PS5_PAGE_SIZE; page < (address + bytes + PS5_PAGE_SIZE - 1) / PS5_PAGE_SIZE; ++page) {
+        auto& word = view.used[page / 64];
+        const auto bit = std::uint64_t{1} << (page % 64);
+        if ((word & bit) == 0) continue;
+        std::memset(view.view + page * PS5_PAGE_SIZE, 0, PS5_PAGE_SIZE);
+        word &= ~bit;
+    }
+}
+
+static void MarkGuestFileUsed(std::uintptr_t address, std::size_t bytes) {
+    auto& view = View();
+    std::lock_guard lock(view.lock);
+    for (auto page = address / PS5_PAGE_SIZE; page < (address + bytes + PS5_PAGE_SIZE - 1) / PS5_PAGE_SIZE; ++page) view.used[page / 64] |= std::uint64_t{1} << (page % 64);
+}
+
+static void NoteReplacing(const void* addr, std::size_t len) {
+    const auto address = reinterpret_cast<std::uintptr_t>(addr);
+    if (InGuestFile(address, len)) NoteView(address, len, DirectMemoryViewReplacing);
+}
+
+static void NotePrivate(const void* addr, std::size_t len) {
+    const auto address = reinterpret_cast<std::uintptr_t>(addr);
+    if (!InGuestFile(address, len)) return;
+    DiscardGuestFile(address, len);
+    NoteView(address, len, DirectMemoryViewPrivate);
+}
+
+static void NoteUnmapped(const void* addr, std::size_t len) {
+    const auto address = reinterpret_cast<std::uintptr_t>(addr);
+    if (!InGuestFile(address, len)) return;
+    DiscardGuestFile(address, len);
+    NoteView(address, len, DirectMemoryViewUnmapped);
+}
+
+static HANDLE GuestChunk(std::uintptr_t address) {
+    using MapFunction = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
+    static const auto map = reinterpret_cast<MapFunction>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "MapViewOfFile3"));
+    auto& view = View();
+    const auto index = address / GuestChunkBytes;
+    std::lock_guard lock(view.lock);
+    if (view.chunks[index] != nullptr) return view.chunks[index];
+    const auto chunkStart = index * GuestChunkBytes;
+    const auto bytes = std::min<std::uint64_t>(GuestChunkBytes, view.guestBytes - chunkStart);
+    const HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, static_cast<DWORD>(bytes >> 32), static_cast<DWORD>(bytes), nullptr);
+    if (section == nullptr) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "create a guest memory section");
+    auto* target = view.view + chunkStart;
+    MEMORY_BASIC_INFORMATION memory{};
+    const bool queried = VirtualQuery(target, &memory, sizeof(memory)) == sizeof(memory);
+    if (queried && memory.State == MEM_RESERVE) VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    if (!queried || memory.State != MEM_RESERVE ||
+        map(section, GetCurrentProcess(), target, 0, bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr) {
+        const auto error = static_cast<int>(GetLastError());
+        CloseHandle(section);
+        throw std::system_error(error, std::system_category(), "map a guest memory section into the view");
+    }
+    view.chunks[index] = section;
+    return section;
+}
+
+static bool CommitGuestFile(void* addr, std::size_t len, DWORD winProt) {
+    const auto start = reinterpret_cast<std::uintptr_t>(addr);
+    if (!InGuestFile(start, len) || ((start | len) & (PS5_PAGE_SIZE - 1)) != 0) return false;
+    const auto end = start + len;
+    for (auto cursor = start; cursor < end;) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &memory, sizeof(memory)) != sizeof(memory))
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "query guest memory to commit");
+        const auto regionEnd = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
+        auto stop = std::min(end, regionEnd);
+        if (memory.State == MEM_RESERVE) {
+            stop = std::min(end, (stop + PS5_PAGE_SIZE - 1) & ~static_cast<std::uintptr_t>(PS5_PAGE_SIZE - 1));
+            stop = std::min(stop, (cursor / GuestChunkBytes + 1) * GuestChunkBytes);
+            auto* piece = reinterpret_cast<void*>(cursor);
+            const auto bytes = static_cast<std::size_t>(stop - cursor);
+            const HANDLE section = GuestChunk(cursor);
+            NoteView(cursor, bytes, DirectMemoryViewReplacing);
+            DiscardGuestFile(cursor, bytes);
+            GuestArena::GuestArenaMap_nid_postfix(piece, bytes, section, cursor % GuestChunkBytes, winProt);
+            MarkGuestFileUsed(cursor, bytes);
+            NoteView(cursor, bytes, cursor);
+        } else {
+            GuestArena::GuestArenaCommit_nid_postfix(reinterpret_cast<void*>(cursor), stop - cursor, winProt, PS5_PAGE_SIZE);
+        }
+        cursor = stop;
+    }
+    return true;
+}
+
+static std::uint8_t* DirectViewAddress(std::uint64_t physical) {
+    return View().view + View().guestBytes + physical;
+}
+
+static void CoalesceDirectView(GuestView& view, std::uintptr_t start, std::uintptr_t end) {
+    const auto regionStart = reinterpret_cast<std::uintptr_t>(DirectViewAddress(0));
+    const auto after = view.directViews.lower_bound(end);
+    auto before = view.directViews.lower_bound(start);
+    const auto freeStart = before == view.directViews.begin() ? regionStart : std::prev(before)->second.end;
+    const auto freeEnd = after == view.directViews.end() ? regionStart + (view.viewBytes - view.guestBytes) : after->first;
+    VirtualFree(reinterpret_cast<void*>(freeStart), freeEnd - freeStart, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+}
+
+static void PlaceDirectView(GuestView& view, std::uintptr_t start, std::uintptr_t end, HANDLE section, std::uint64_t offset) {
+    using MapFunction = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
+    static const auto map = reinterpret_cast<MapFunction>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "MapViewOfFile3"));
+    if (map == nullptr) throw std::runtime_error("MapViewOfFile3 is not available: the kyty GPU backend needs Windows 10 version 1803 or later");
+    auto* address = reinterpret_cast<void*>(start);
+    const auto bytes = static_cast<std::size_t>(end - start);
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory)) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "query the direct memory view");
+    if (memory.State != MEM_RESERVE || reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize < end) throw std::runtime_error("the direct memory view has no free range for a backing");
+    VirtualFree(address, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    if (map(section, GetCurrentProcess(), address, offset, bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr) {
+        const auto error = static_cast<int>(GetLastError());
+        char message[160];
+        std::snprintf(message, sizeof(message), "map a direct memory backing into the view at physical 0x%llx+0x%zx, section offset 0x%llx", static_cast<unsigned long long>(start - reinterpret_cast<std::uintptr_t>(DirectViewAddress(0))), bytes, static_cast<unsigned long long>(offset));
+        throw std::system_error(error, std::system_category(), message);
+    }
+    view.directViews.emplace(start, GuestView::DirectView{end, section, offset});
+}
+static void MapDirectView(HANDLE section, std::uint64_t physical, std::size_t bytes) {
+    using UnmapFunction = BOOL(WINAPI*)(HANDLE, PVOID, ULONG);
+    static const auto unmap = reinterpret_cast<UnmapFunction>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "UnmapViewOfFile2"));
+    auto& view = View();
+    if (view.view == nullptr || bytes == 0) return;
+    const auto start = reinterpret_cast<std::uintptr_t>(DirectViewAddress(physical));
+    const auto end = start + bytes;
+    std::lock_guard lock(view.lock);
+    struct Kept {
+        std::uintptr_t start;
+        std::uintptr_t end;
+        HANDLE section;
+        std::uint64_t offset;
+    };
+    std::vector<Kept> kept;
+    auto spanStart = start;
+    auto spanEnd = end;
+    for (auto older = view.directViews.begin(); older != view.directViews.end();) {
+        if (older->second.end <= start || older->first >= end) {
+            ++older;
+            continue;
+        }
+        if (unmap == nullptr || !unmap(GetCurrentProcess(), reinterpret_cast<void*>(older->first), MEM_PRESERVE_PLACEHOLDER))
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "replace a direct memory backing in the view");
+        if (older->first < start) kept.push_back({older->first, start, older->second.section, older->second.offset});
+        if (older->second.end > end) kept.push_back({end, older->second.end, older->second.section, older->second.offset + (end - older->first)});
+        spanStart = std::min(spanStart, older->first);
+        spanEnd = std::max(spanEnd, older->second.end);
+        older = view.directViews.erase(older);
+    }
+    if (!kept.empty() || spanStart != start || spanEnd != end) CoalesceDirectView(view, spanStart, spanEnd);
+    for (const auto& piece : kept) PlaceDirectView(view, piece.start, piece.end, piece.section, piece.offset);
+    PlaceDirectView(view, start, end, section, 0);
+}
+
+static void UnmapDirectView(HANDLE section, std::uint64_t physical, std::size_t bytes) {
+    using UnmapFunction = BOOL(WINAPI*)(HANDLE, PVOID, ULONG);
+    static const auto unmap = reinterpret_cast<UnmapFunction>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "UnmapViewOfFile2"));
+    auto& view = View();
+    if (view.view == nullptr || bytes == 0 || unmap == nullptr) return;
+    const auto start = reinterpret_cast<std::uintptr_t>(DirectViewAddress(physical));
+    const auto end = start + bytes;
+    std::lock_guard lock(view.lock);
+    for (auto piece = view.directViews.lower_bound(start); piece != view.directViews.end() && piece->first < end;) {
+        if (piece->second.section != section || !unmap(GetCurrentProcess(), reinterpret_cast<void*>(piece->first), MEM_PRESERVE_PLACEHOLDER)) {
+            ++piece;
+            continue;
+        }
+        const auto pieceStart = piece->first;
+        const auto pieceEnd = piece->second.end;
+        piece = view.directViews.erase(piece);
+        CoalesceDirectView(view, pieceStart, pieceEnd);
+    }
+}
+#endif
+
 static void CommitArenaRange(void* addr, size_t len, DWORD winProt) {
+#if defined(ANYPS5_KYTY)
+    if (CommitGuestFile(addr, len, winProt)) return;
+#endif
     GuestArena::GuestArenaCommit_nid_postfix(addr, len, winProt, PS5_PAGE_SIZE);
 }
 
@@ -125,8 +343,14 @@ static void* mmap(void* addr, size_t len, int prot, int flags, int, int) {
 
 static int munmap(void* addr, size_t len) {
     auto& arena = KernelArena::Get();
+#if defined(ANYPS5_KYTY)
+    NoteReplacing(addr, len);
+#endif
     if (arena.Contains(addr, len)) GuestArena::GuestArenaReset_nid_postfix(addr, len);
     else if (!VirtualFree(addr, len, MEM_DECOMMIT)) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "VirtualFree decommit failed");
+#if defined(ANYPS5_KYTY)
+    NoteUnmapped(addr, len);
+#endif
     if (arena.Contains(addr, len)) arena.Release(addr, len);
     return 0;
 }
@@ -485,7 +709,11 @@ public:
 #if defined(__EMSCRIPTEN__)
         static_cast<void>(start);
 #elif defined(_WIN32)
+#if defined(ANYPS5_KYTY)
+        fileOffset = start;
+#else
         static_cast<void>(start);
+#endif
         const auto size = static_cast<std::uint64_t>(bytes);
         if (SectionPoolEnabled()) section = SectionPool::Get().Take(bytes);
         if (!section) section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE | SEC_RESERVE, static_cast<DWORD>(size >> 32), static_cast<DWORD>(size), nullptr);
@@ -495,6 +723,14 @@ public:
             std::snprintf(message, sizeof(message), "create direct memory backing of 0x%llx bytes (%llu MiB)", static_cast<unsigned long long>(size), static_cast<unsigned long long>((size + 0xFFFFF) >> 20));
             throw std::system_error(error, std::system_category(), message);
         }
+#if defined(ANYPS5_KYTY)
+        try {
+            MapDirectView(section, fileOffset, bytes);
+        } catch (...) {
+            CloseHandle(section);
+            throw;
+        }
+#endif
 #elif defined(__APPLE__)
         static_cast<void>(start);
         memory_object_size_t size = bytes;
@@ -522,10 +758,17 @@ public:
     }
     std::uint64_t FileOffset() const { return fileOffset; }
 #endif
+#if defined(_WIN32) && defined(ANYPS5_KYTY)
+    std::uint64_t FileOffset() const { return fileOffset; }
+    void MapIntoView() const { MapDirectView(section, fileOffset, bytes); }
+#endif
 
     ~PhysicalBacking() {
 #if defined(__EMSCRIPTEN__)
 #elif defined(_WIN32)
+#if defined(ANYPS5_KYTY)
+        UnmapDirectView(section, fileOffset, bytes);
+#endif
         if (!SectionPoolEnabled()) {
             GuestArena::GuestArenaForgetSection_nid_postfix(section);
             CloseHandle(section);
@@ -565,6 +808,9 @@ private:
 #if defined(__EMSCRIPTEN__)
 #elif defined(_WIN32)
     HANDLE section = nullptr;
+#if defined(ANYPS5_KYTY)
+    std::uint64_t fileOffset = 0;
+#endif
 #elif defined(__APPLE__)
     mach_port_t entry = MACH_PORT_NULL;
 #else
@@ -962,8 +1208,18 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
         } else {
             EraseMappings(address, address + len);
 #ifdef _WIN32
-            if (zero) GuestArena::GuestArenaMapZero_nid_postfix(addr, len);
-            else {
+            if (zero) {
+#if defined(ANYPS5_KYTY)
+                NoteReplacing(addr, len);
+#endif
+                GuestArena::GuestArenaMapZero_nid_postfix(addr, len);
+#if defined(ANYPS5_KYTY)
+                NotePrivate(addr, len);
+#endif
+            } else {
+#if defined(ANYPS5_KYTY)
+                NoteReplacing(addr, len);
+#endif
                 GuestArena::GuestArenaReset_nid_postfix(addr, len);
                 if (nativeProtection != PROT_NONE) CommitArenaRange(addr, len, WinProtFromPosix(nativeProtection));
             }
@@ -1330,7 +1586,12 @@ static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t ali
     void* mapped = MapAligned(*addr, len, zero ? PROT_NONE : LinuxProtFromSce(prot), flags, alignment);
     try {
 #ifdef _WIN32
-        if (zero) GuestArena::GuestArenaMapZero_nid_postfix(mapped, len);
+        if (zero) {
+            GuestArena::GuestArenaMapZero_nid_postfix(mapped, len);
+#if defined(ANYPS5_KYTY)
+            NotePrivate(mapped, len);
+#endif
+        }
 #endif
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0);
         if ((prot & GuestProtGpuReadWrite) != 0) mutation.NoteGpuMapping(mapped, len);
@@ -1496,6 +1757,9 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
         }
         ReplaceFixedOverlap(mutation, *addr, len, flags);
         mapped = MapPlaced(*addr, len, PROT_NONE, flags, alignment);
+#if defined(ANYPS5_KYTY)
+        NoteReplacing(mapped, len);
+#endif
         GuestArena::GuestArenaMapFile_nid_postfix(mapped, len, section, offset, WinProtFromPosix(LinuxProtFromSce(prot)), viewProtection, static_cast<std::size_t>(std::min<std::uint64_t>(len, fileEnd - offset)));
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, false);
     } catch (...) {
@@ -1506,6 +1770,9 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
     }
     GuestArena::GuestArenaForgetSection_nid_postfix(section);
     CloseHandle(section);
+#if defined(ANYPS5_KYTY)
+    NotePrivate(mapped, len);
+#endif
     *addr = mapped;
     EraseReservations(mapped, len);
     RecordProtection(mapped, len, prot);
@@ -1523,6 +1790,9 @@ int DoMapShared(void** addr, size_t len, int prot, HostSharedMemory object) {
     void* mapped = MapPlaced(*addr, len, PROT_NONE, 0, PS5_PAGE_SIZE);
     try {
 #if defined(_WIN32)
+#if defined(ANYPS5_KYTY)
+        NoteReplacing(mapped, len);
+#endif
         GuestArena::GuestArenaMap_nid_postfix(mapped, len, object, 0, WinProtFromPosix(nativeProtection));
 #elif defined(__APPLE__)
         if (::mmap(mapped, len, nativeProtection & ~PROT_EXEC, MAP_SHARED | MAP_FIXED, object, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map shared memory");
@@ -1971,6 +2241,31 @@ bool DirectMemoryEnableView_nid_no_patch(DirectMemoryViewObserver observer, std:
         std::size_t bytes = 0;
         GuestArena::GuestArenaRange_nid_postfix(&base, &bytes);
         const auto guestEnd = (base + bytes + PS5_PAGE_SIZE - 1) & ~static_cast<std::uintptr_t>(PS5_PAGE_SIZE - 1);
+#ifdef _WIN32
+        using AllocateFunction = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, void*, ULONG);
+        const auto module = GetModuleHandleW(L"kernelbase.dll");
+        const auto allocate = reinterpret_cast<AllocateFunction>(GetProcAddress(module, "VirtualAlloc2"));
+        if (allocate == nullptr || GetProcAddress(module, "MapViewOfFile3") == nullptr) throw std::runtime_error("VirtualAlloc2 and MapViewOfFile3 are not available: the kyty GPU backend needs Windows 10 version 1803 or later");
+        const auto total = guestEnd + DIRECT_MEMORY_SIZE;
+        auto* bytesView = static_cast<std::uint8_t*>(allocate(GetCurrentProcess(), nullptr, total, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+        if (bytesView == nullptr) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "reserve the guest memory view");
+        if (!VirtualFree(bytesView, guestEnd, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
+            const auto error = static_cast<int>(GetLastError());
+            VirtualFree(bytesView, 0, MEM_RELEASE);
+            throw std::system_error(error, std::system_category(), "split the guest memory view");
+        }
+        guestView.chunks.assign((guestEnd + GuestChunkBytes - 1) / GuestChunkBytes, nullptr);
+        guestView.used.assign((guestEnd / PS5_PAGE_SIZE + 63) / 64, 0);
+        guestView.guestBytes = guestEnd;
+        guestView.viewBytes = total;
+        guestView.view = bytesView;
+        std::vector<const PhysicalBacking*> mappedBackings;
+        for (const auto& [start, block] : g_physBlocks) {
+            if (!block.backing || std::find(mappedBackings.begin(), mappedBackings.end(), block.backing.get()) != mappedBackings.end()) continue;
+            block.backing->MapIntoView();
+            mappedBackings.push_back(block.backing.get());
+        }
+#else
         const int file = memfd_create("guest memory", MFD_CLOEXEC);
         if (file < 0) throw std::system_error(errno, std::generic_category(), "create the guest memory file");
         if (ftruncate(file, static_cast<off_t>(guestEnd)) != 0) {
@@ -1997,9 +2292,12 @@ bool DirectMemoryEnableView_nid_no_patch(DirectMemoryViewObserver observer, std:
         guestView.guestBytes = guestEnd;
         guestView.viewBytes = total;
         guestView.view = bytesView;
+#endif
     }
     guestView.observer.store(observer, std::memory_order_release);
+#ifndef _WIN32
     GuestArena::GuestArenaSetViewPlacer_nid_no_patch(&PlaceArenaRange);
+#endif
     guestView.enabled.store(true, std::memory_order_release);
     for (const auto& [address, mapping] : g_directMappings) {
         const auto page = g_physPages.find(mapping.phys - mapping.phys % PS5_PAGE_SIZE);
@@ -2039,6 +2337,15 @@ void* DirectMemoryMapHostView_nid_no_patch(std::uintptr_t address, std::size_t b
     if (bytes == 0 || ((address | bytes) & (PS5_PAGE_SIZE - 1)) != 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address)
         throw std::invalid_argument("host memory with a second view must be a non-empty range of whole 16 KiB pages");
     if (!InGuestFile(address, bytes)) throw std::runtime_error("host memory with a second view must lie inside the guest memory file, with the view enabled");
+#ifdef _WIN32
+    void* const wanted = reinterpret_cast<void*>(address);
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(wanted, &memory, sizeof(memory)) != sizeof(memory) || memory.State != MEM_RESERVE || reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize < address + bytes)
+        throw std::system_error(EEXIST, std::generic_category(), "map host memory from the guest memory sections");
+    if (!CommitGuestFile(wanted, bytes, WinProtFromPosix(prot))) throw std::runtime_error("host memory with a second view could not be mapped from the guest memory sections");
+    Trace("map host view %p+0x%zx prot=0x%x", wanted, bytes, prot);
+    return wanted;
+#else
     std::uintptr_t usedStart = 0;
     std::uintptr_t usedEnd = 0;
     if (!GuestArena::GuestArenaNextUsed_nid_no_patch(address, &usedStart, &usedEnd) || usedStart > address || usedEnd < address + bytes ||
@@ -2055,6 +2362,7 @@ void* DirectMemoryMapHostView_nid_no_patch(std::uintptr_t address, std::size_t b
     NoteView(address, bytes, address);
     Trace("map host view %p+0x%zx prot=0x%x", mapped, bytes, prot);
     return mapped;
+#endif
 }
 
 int DoMunmap_nid_no_patch(void* addr, std::size_t len) {
