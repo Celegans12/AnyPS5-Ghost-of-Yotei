@@ -62,6 +62,7 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
     )
     file(GLOB kytyShimSources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/src/*.cpp)
     list(FILTER kytyShimSources EXCLUDE REGEX "Tests\\.cpp$")
+    list(FILTER kytyShimSources EXCLUDE REGEX "/(MemoryBacking|MemoryGpu)\\.cpp$")
     add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
             ${CMAKE_CURRENT_SOURCE_DIR}/Export.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
@@ -109,7 +110,7 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/src/MemoryTests.cpp)
             add_test_executable(kyty_shim_memory_tests
                     KytyShim/src/MemoryTests.cpp
-                    KytyShim/src/MemoryBacking.cpp
+                    KytyShim/src/MemoryView.cpp
                     KytyShim/src/Log.cpp)
             target_include_directories(kyty_shim_memory_tests PRIVATE ${LIBS_INCLUDE_DIR} ${LIBS_INCLUDE_DIR}/nid/include)
             target_link_libraries(kyty_shim_memory_tests PRIVATE $<IF:$<TARGET_EXISTS:Kyty::gpu>,Kyty::gpu,kyty_gpu> libkernel libc)

@@ -3,21 +3,18 @@
 #include "MemoryShim.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
-#include "prx/libkernel/include/Api.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <cerrno>
 #include <cinttypes>
-#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -246,7 +243,11 @@ void BumpBackingEpoch(uint64_t start, uint64_t size) noexcept {
 	g_backing_epoch.store(epoch, std::memory_order_release);
 }
 
-std::recursive_mutex g_hook_mutex;
+std::recursive_mutex& HookMutex() {
+	static auto* mutex = new std::recursive_mutex;
+	return *mutex;
+}
+
 Shim::RangeHook g_map_hook = nullptr;
 Shim::RangeHook g_unmap_hook = nullptr;
 
@@ -420,7 +421,7 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 	if (((address | bytes) & PageMask) != 0) {
 		Shim::Fail("KytyShim memory: libkernel reported a view change 0x%016" PRIx64 "+0x%zx that is not 16 KiB aligned\n", static_cast<uint64_t>(address), bytes);
 	}
-	std::lock_guard lock(g_hook_mutex);
+	std::lock_guard lock(HookMutex());
 	auto& pages = Pages();
 	ForgetProbes(address, bytes);
 	if (offset == DirectMemoryViewReplacing) {
@@ -462,70 +463,7 @@ void OnProtectionChange(std::uintptr_t address, std::size_t bytes, int protectio
 	ForgetProbes(address, bytes);
 }
 
-struct KernelStats {
-	uint64_t direct_allocated = 0;
-	uint64_t flexible_total = 0;
-	uint64_t flexible_used = 0;
-	uint64_t cpu_page_entries = 0;
-	uint64_t gpu_page_entries = 0;
-};
-
-KernelStats SampleKernelStats() {
-	KernelStats stats;
-	int64_t start = 0;
-	int64_t end = 0;
-	int type = 0;
-	for (int64_t offset = 0; DirectMemoryFind_nid_no_patch(offset, true, &start, &end, &type) && end > offset; offset = end) {
-		stats.direct_allocated += static_cast<uint64_t>(end - start);
-	}
-	size_t configured = 0;
-	size_t available = 0;
-	if (sceKernelConfiguredFlexibleMemorySize(&configured) != 0 || sceKernelAvailableFlexibleMemorySize(&available) != 0) {
-		Shim::Fail("KytyShim memory: libkernel did not report the flexible memory sizes\n");
-	}
-	stats.flexible_total = configured;
-	stats.flexible_used = configured - std::min(configured, available);
-	constexpr uint64_t TableGranularity = 2ull * 1024ull * 1024ull;
-	GuestPageTableUsage_nid_no_patch(TableGranularity, &stats.cpu_page_entries, &stats.gpu_page_entries);
-	return stats;
-}
-
-class KernelStatsSampler {
-public:
-	KernelStats Request() {
-		std::call_once(m_started, [this] { std::thread([this] { Run(); }).detach(); });
-		std::lock_guard lock(m_mutex);
-		m_requested = true;
-		m_wake.notify_one();
-		return m_latest;
-	}
-
-private:
-	[[noreturn]] void Run() {
-		std::unique_lock lock(m_mutex);
-		for (;;) {
-			m_wake.wait(lock, [this] { return m_requested; });
-			m_requested = false;
-			lock.unlock();
-			const auto sample = SampleKernelStats();
-			lock.lock();
-			m_latest = sample;
-		}
-	}
-
-	std::once_flag m_started;
-	std::mutex m_mutex;
-	std::condition_variable m_wake;
-	bool m_requested = false;
-	KernelStats m_latest;
-};
-
-KernelStatsSampler& StatsSampler() {
-	static auto* sampler = new KernelStatsSampler;
-	return *sampler;
-}
-
-void EnableView() {
+void EnableViewOnce() {
 	auto& state = State();
 	uint8_t* view = nullptr;
 	std::size_t guest_bytes = 0;
@@ -549,8 +487,6 @@ void EnableView() {
 	DirectMemoryWatchProtections_nid_no_patch(&OnProtectionChange);
 	state.enabled.store(true, std::memory_order_release);
 }
-
-[[maybe_unused]] const bool g_view_enabled = (EnableView(), true);
 
 }
 
@@ -622,7 +558,7 @@ bool TryWriteBackedQwords(uint64_t vaddr, const uint64_t* values, uint32_t count
 }
 
 void SetGpuRangeHooks(RangeHook map, RangeHook unmap) {
-	std::lock_guard lock(g_hook_mutex);
+	std::lock_guard lock(HookMutex());
 	g_map_hook = map;
 	g_unmap_hook = unmap;
 	if (map != nullptr) Pages().ForEachMappedRun([&](uint64_t start, uint64_t size) { map(start, size); });
@@ -630,6 +566,22 @@ void SetGpuRangeHooks(RangeHook map, RangeHook unmap) {
 
 uint64_t ProbeCalls() {
 	return g_probe_calls.load(std::memory_order_relaxed);
+}
+
+void EnableView() {
+	EnableViewOnce();
+}
+
+uint64_t DirectMappedBytes() {
+	uint64_t bytes = 0;
+	const auto guest_bytes = State().guest_bytes;
+	Pages().ForEachMappedRun([&](uint64_t run_start, uint64_t run_size) {
+		for (auto page = run_start; page < run_start + run_size; page += PageSize) {
+			const auto entry = Pages().LoadBacking(page >> PageBits);
+			if (entry != 0 && (uint64_t {entry - 1u} << PageBits) >= guest_bytes) bytes += PageSize;
+		}
+	});
+	return bytes;
 }
 
 }
@@ -808,23 +760,5 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	}
 }
 
-DebugStats GetDebugStats() {
-	DebugStats stats {};
-	stats.direct_total = DirectMemorySize_nid_no_patch();
-	const auto kernel = StatsSampler().Request();
-	stats.direct_allocated = kernel.direct_allocated;
-	stats.flexible_total = kernel.flexible_total;
-	stats.flexible_used = kernel.flexible_used;
-	stats.cpu_page_entries = kernel.cpu_page_entries;
-	stats.gpu_page_entries = kernel.gpu_page_entries;
-	const auto guest_bytes = State().guest_bytes;
-	Pages().ForEachMappedRun([&](uint64_t run_start, uint64_t run_size) {
-		for (auto page = run_start; page < run_start + run_size; page += PageSize) {
-			const auto entry = Pages().LoadBacking(page >> PageBits);
-			if (entry != 0 && (uint64_t {entry - 1u} << PageBits) >= guest_bytes) stats.direct_mapped += PageSize;
-		}
-	});
-	return stats;
-}
 
 }

@@ -166,6 +166,12 @@ set(KYTY_STB_IMAGE_SOURCE "${KYTY_GENERATED_DIR}/stb_image.c")
 file(CONFIGURE OUTPUT "${KYTY_STB_IMAGE_SOURCE}" CONTENT "#define STB_IMAGE_IMPLEMENTATION\n#include <stb_image.h>\n")
 list(APPEND KYTY_GPU_SOURCES "${KYTY_STB_IMAGE_SOURCE}")
 
+set(KYTY_SHIM_SOURCE_DIR "${ANYPS5_SOURCE_DIR}/core/libs/prx/libSceAgcDriver/KytyShim/src")
+set(KYTY_SHIM_MEMORY_SOURCES "${KYTY_SHIM_SOURCE_DIR}/MemoryBacking.cpp" "${KYTY_SHIM_SOURCE_DIR}/MemoryGpu.cpp")
+set_source_files_properties(${KYTY_SHIM_MEMORY_SOURCES} PROPERTIES INCLUDE_DIRECTORIES "${ANYPS5_SOURCE_DIR}/core/libs")
+set_source_files_properties("${KYTY_SHIM_SOURCE_DIR}/MemoryBacking.cpp" PROPERTIES COMPILE_OPTIONS -fexceptions)
+list(APPEND KYTY_GPU_SOURCES ${KYTY_SHIM_MEMORY_SOURCES})
+
 add_library(kyty_gpu STATIC ${KYTY_GPU_SOURCES})
 add_dependencies(kyty_gpu kyty_gpu_shaders)
 target_include_directories(kyty_gpu
