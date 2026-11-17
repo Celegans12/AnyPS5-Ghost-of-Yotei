@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/KytyShim/src/Runtime.hpp"
+#include "prx/libSceVideoOut/include/VblankSchedule.hpp"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
@@ -13,6 +14,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -139,6 +141,11 @@ Options OptionsFromEnvironment(std::string& applied) {
         std::uint32_t parsed = 0;
         if (!ParseInteger(value, parsed) || parsed < number.minimum || parsed > number.maximum) EXIT("KytyShim: %s=%s is not a whole number from %u to %u\n", number.variable, value, number.minimum, number.maximum);
         options.*number.field = parsed;
+    }
+    try {
+        if (const auto hertz = VideoOutVblank::ConfiguredVblankHz()) options.vblank_frequency = *hertz;
+    } catch (const std::runtime_error& error) {
+        EXIT("KytyShim: %s\n", error.what());
     }
     for (const auto& path : Paths) {
         if (const char* value = Read(path.variable, applied)) options.*path.field = std::filesystem::path(value);
