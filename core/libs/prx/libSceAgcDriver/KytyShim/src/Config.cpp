@@ -3,7 +3,6 @@
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
-#include "common/threads.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <magic_enum.hpp>
@@ -164,7 +163,6 @@ Options OptionsFromEnvironment(std::string& applied) {
 void StartRuntime() {
     static std::once_flag started;
     std::call_once(started, [] {
-        Common::InitializeThreads();
         std::string applied;
         const auto options = OptionsFromEnvironment(applied);
         Config::Initialize();
