@@ -1,6 +1,7 @@
 #if defined(__linux__) && defined(__x86_64__)
 #include "prx/libc/include/CallTrace.hpp"
 #include "prx/libc/include/LogFile.hpp"
+#include "prx/libc/include/specifics/linux/GuardedCopy.hpp"
 
 #include <atomic>
 #include <cerrno>
@@ -274,6 +275,7 @@ void ReportCallTrace() {
 }
 
 void OnFatalSignal(int signal, siginfo_t* info, void* context) {
+    if (GuestCopyRecoverFault_nid_no_patch(signal, info, context)) return;
     const int savedErrno = errno;
     if (!g_reporting.exchange(true, std::memory_order_acq_rel)) {
         Report(signal, info, static_cast<const ucontext_t*>(context));
@@ -302,38 +304,52 @@ void OnFatalSignal(int signal, siginfo_t* info, void* context) {
     if (info->si_code <= 0) raise(signal);
 }
 
-const bool g_installed = [] {
-    stack_t alternate{};
-    if (sigaltstack(nullptr, &alternate) != 0) {
-        constexpr char message[] = "[libc] crash report: cannot query alternate signal stack\n";
-        write(STDERR_FILENO, message, sizeof(message) - 1);
-        return false;
-    }
-    if ((alternate.ss_flags & SS_DISABLE) != 0) {
-        alternate.ss_sp = g_alternateStack;
-        alternate.ss_size = sizeof(g_alternateStack);
-        alternate.ss_flags = 0;
-        if (sigaltstack(&alternate, nullptr) != 0) {
-            constexpr char message[] = "[libc] crash report: cannot install alternate signal stack\n";
+bool g_caught[std::size(FatalSignals)]{};
+static_assert(FatalSignals[0] == SIGSEGV && FatalSignals[1] == SIGBUS);
+
+bool Install() {
+    static const bool installed = [] {
+        stack_t alternate{};
+        if (sigaltstack(nullptr, &alternate) != 0) {
+            constexpr char message[] = "[libc] crash report: cannot query alternate signal stack\n";
             write(STDERR_FILENO, message, sizeof(message) - 1);
             return false;
         }
-    }
-    for (std::size_t slot = 0; slot < std::size(FatalSignals); ++slot) {
-        if (sigaction(FatalSignals[slot], nullptr, &g_previous[slot]) != 0) continue;
-        const auto& previous = g_previous[slot];
-        if (previous.sa_handler == SIG_IGN) continue;
-        struct sigaction action{};
-        action.sa_sigaction = OnFatalSignal;
-        action.sa_flags = SA_SIGINFO | SA_ONSTACK | (previous.sa_flags & (SA_RESTART | SA_NODEFER | SA_RESETHAND));
-        action.sa_mask = previous.sa_mask;
-        if (sigaction(FatalSignals[slot], &action, nullptr) != 0) {
-            constexpr char message[] = "[libc] crash report: cannot install signal handler\n";
-            write(STDERR_FILENO, message, sizeof(message) - 1);
+        if ((alternate.ss_flags & SS_DISABLE) != 0) {
+            alternate.ss_sp = g_alternateStack;
+            alternate.ss_size = sizeof(g_alternateStack);
+            alternate.ss_flags = 0;
+            if (sigaltstack(&alternate, nullptr) != 0) {
+                constexpr char message[] = "[libc] crash report: cannot install alternate signal stack\n";
+                write(STDERR_FILENO, message, sizeof(message) - 1);
+                return false;
+            }
         }
-    }
-    return true;
-}();
+        for (std::size_t slot = 0; slot < std::size(FatalSignals); ++slot) {
+            if (sigaction(FatalSignals[slot], nullptr, &g_previous[slot]) != 0) continue;
+            const auto& previous = g_previous[slot];
+            if (previous.sa_handler == SIG_IGN) continue;
+            struct sigaction action{};
+            action.sa_sigaction = OnFatalSignal;
+            action.sa_flags = SA_SIGINFO | SA_ONSTACK | (previous.sa_flags & (SA_RESTART | SA_NODEFER | SA_RESETHAND));
+            action.sa_mask = previous.sa_mask;
+            if (sigaction(FatalSignals[slot], &action, nullptr) != 0) {
+                constexpr char message[] = "[libc] crash report: cannot install signal handler\n";
+                write(STDERR_FILENO, message, sizeof(message) - 1);
+                continue;
+            }
+            g_caught[slot] = (action.sa_flags & SA_RESETHAND) == 0;
+        }
+        return true;
+    }();
+    return installed;
+}
 
+const bool g_installed = Install();
+
+}
+
+bool GuardedCopy::FaultsCaught() {
+    return Install() && g_caught[0] && g_caught[1];
 }
 #endif
