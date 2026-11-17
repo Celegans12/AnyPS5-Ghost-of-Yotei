@@ -184,7 +184,11 @@ static void ReleaseFinishedStack(const FinishedStack& stack) {
 static bool DiscardFinishedStackPages(const FinishedStack& stack) {
     auto* usable = static_cast<std::byte*>(stack.address) + GUEST_STACK_GUARD;
     const auto bytes = stack.bytes - GUEST_STACK_GUARD;
+#if defined(ANYPS5_KYTY)
+    return madvise(usable, bytes, MADV_REMOVE) == 0;
+#else
     return madvise(usable, bytes, MADV_DONTNEED) == 0;
+#endif
 }
 
 static void CollectFinishedStack(void* address, std::size_t bytes) {
