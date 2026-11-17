@@ -5352,6 +5352,15 @@ std::optional<std::uint64_t> Recorder::NewestGuestWork() const {
     return std::uint64_t{0};
 }
 
+std::uint64_t Recorder::NewestGuestWriter() const {
+    const auto writes = [](const Batch& batch) { return std::any_of(batch.writeValues.begin(), batch.writeValues.end(), [](std::int16_t value) { return value != ReachValue; }); };
+    if (open != nullptr && writes(*open)) return submissions + 1;
+    for (auto it = inFlight.rbegin(); it != inFlight.rend(); ++it) {
+        if (!signaled(**it) && writes(**it)) return (*it)->serial;
+    }
+    return 0;
+}
+
 bool Recorder::EarlyEndOfPipe() {
     static const bool enabled = std::getenv("APS5_EARLY_EOP_INTERRUPT") != nullptr;
     return enabled;

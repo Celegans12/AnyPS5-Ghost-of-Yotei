@@ -1,0 +1,1 @@
+target_link_libraries(agc_driver_early_end_of_pipe_tests PRIVATE libkernel)

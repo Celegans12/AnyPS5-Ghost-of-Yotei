@@ -9,6 +9,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -602,6 +603,9 @@ struct EopGuardCounts {
     std::uint64_t heldStore = 0;
     std::uint64_t storeBegin = 0;
     std::uint64_t storeEnd = 0;
+    std::uint64_t storeRanges = 0;
+    std::uint64_t storeBytes = 0;
+    std::uint64_t storeFills = 0;
     std::uint64_t judged = 0;
     std::uint64_t risky = 0;
     std::uint64_t gpuWritten = 0;
@@ -620,11 +624,26 @@ struct EopGuard {
     std::vector<EopProbeRange> finishedWrites;
     std::uint64_t label = 0;
     EopGuardCounts counts;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
 };
 
 EopGuard& eopGuard() {
     static EopGuard guard;
     return guard;
+}
+
+void reportEopGuard() {
+    auto& guard = eopGuard().counts;
+    const auto value = [](std::uint64_t count) { return static_cast<unsigned long long>(count); };
+    const double perGuard = guard.labels != 0 ? 1.0 / static_cast<double>(guard.labels) : 0.0;
+    const double perStore = guard.heldStore != 0 ? 1.0 / static_cast<double>(guard.heldStore) : 0.0;
+    std::string changed;
+    for (std::size_t kind = 0; kind < EopProbeKinds; ++kind) {
+        if (guard.riskyKinds[kind] != 0) changed += (changed.empty() ? "" : ", ") + std::string(EopProbeKindNames[kind]) + " " + std::to_string(guard.riskyKinds[kind]);
+    }
+    if (changed.empty()) changed = "none";
+    AgcDriver::ProfilePrint_nid_no_patch("[eop-guard] %llu end-of-pipe interrupt labels: %llu delivered at the label, held behind the recorded work: %llu for a changed or new range read by the open batch, %llu for one read by a batch in flight, %llu for an address-based read, %llu without the reads of the frame; per label %.1f in-place reads judged, %.1f of them under a GPU write of the frame, %.2f unexecuted on a changed or new range (%s; last %llx+%llu), %llu changes published to the draw path, %.3f ms; held for a GPU write to guest memory that had not run: %llu for a drawn linear target stored at the label, %llu for a pending copy-back or queued store, %llu for a recorded store (last %llx+%llu; %.1f unexecuted write ranges per such label, %.0f KiB, %.1f of them fills)\n", value(guard.labels), value(guard.early), value(guard.heldOpen), value(guard.heldBehind), value(guard.heldAddress), value(guard.heldUnknown), static_cast<double>(guard.judged) * perGuard, static_cast<double>(guard.gpuWritten) * perGuard, static_cast<double>(guard.risky) * perGuard, changed.c_str(), value(guard.lastBegin), value(guard.lastEnd - guard.lastBegin), value(guard.published), guard.guardMs * perGuard, value(guard.heldLinear), value(guard.heldCopyBack), value(guard.heldStore), value(guard.storeBegin), value(guard.storeEnd - guard.storeBegin), perStore * static_cast<double>(guard.storeRanges), perStore * static_cast<double>(guard.storeBytes) / 1024.0, perStore * static_cast<double>(guard.storeFills));
+    guard = {};
 }
 
 std::uint64_t eopGuardMix(std::uint64_t hash, const std::byte* data, std::size_t bytes) {
@@ -722,7 +741,7 @@ bool eopGuardSettled(bool linearStored) {
         (index < opened ? open : flight) = true;
     }
     if (guard.label % EopGuardKept == 0) std::erase_if(guard.notes, [&](const auto& note) { return note.second.seen + EopGuardKept < guard.label; });
-    const bool copyBack = recorder->HasPendingCopyBacks() || recorder->HasQueuedStores();
+    const bool copyBack = recorder->HasPendingCopyBacks() || recorder->HasQueuedStores() || Graphics::Recorder::PendingWriteBackCompletions() != 0 || Graphics::Recorder::PendingCompletionStores() != 0 || !Graphics::DrawCopiedWriters()->empty();
     bool store = false;
     if (!linearStored && !copyBack) {
         for (const auto& write : recorder->PendingWritesOver(0, std::numeric_limits<std::size_t>::max())) {
@@ -730,11 +749,17 @@ bool eopGuardSettled(bool linearStored) {
             store = true;
             counts.storeBegin = write.begin;
             counts.storeEnd = write.end;
-            break;
+            ++counts.storeRanges;
+            counts.storeBytes += write.end - write.begin;
+            if (write.value >= 0) ++counts.storeFills;
         }
     }
     const auto judged = std::chrono::steady_clock::now();
     counts.guardMs += std::chrono::duration<double, std::milli>(judged - start).count();
+    if (!Graphics::Recorder::FlipReadCheck() && judged - guard.lastReport > std::chrono::seconds(10)) {
+        guard.lastReport = judged;
+        reportEopGuard();
+    }
     if (lost || !Graphics::Recorder::ReadTracking()) {
         ++counts.heldUnknown;
         return false;
@@ -778,6 +803,7 @@ struct EopProbeFrame {
     std::uint64_t done = 0;
     std::uint64_t last = 0;
     std::uint64_t guest = 0;
+    std::uint64_t writer = 0;
     bool early = false;
     std::chrono::steady_clock::time_point at;
     std::vector<EopProbeRun> runs;
@@ -822,6 +848,8 @@ struct EopProbeCounts {
     std::uint64_t noMoved = 0;
     std::uint64_t noRewritten = 0;
     std::uint64_t noGuest = 0;
+    std::uint64_t noWriter = 0;
+    std::uint64_t noTouch = 0;
     std::uint64_t earlyLabels = 0;
     std::uint64_t earlyChecked = 0;
     std::uint64_t earlyRewritten = 0;
@@ -839,6 +867,8 @@ struct EopProbeCounts {
     double leftMoved = 0;
     double leftRewritten = 0;
     double leftGuest = 0;
+    double leftWriter = 0;
+    double leftTouch = 0;
 };
 
 struct EopProbe {
@@ -895,16 +925,8 @@ void reportEopProbe(EopProbe& probe) {
     const double perEnd = counts.ended != 0 ? 1.0 / static_cast<double>(counts.ended) : 0.0;
     const double perStamped = counts.stamped != 0 ? 1.0 / static_cast<double>(counts.stamped) : 0.0;
     const auto value = [](std::uint64_t count) { return static_cast<unsigned long long>(count); };
-    AgcDriver::ProfilePrint_nid_no_patch("[eop] %llu end-of-pipe interrupt labels over 10 s; unfinished at the label: %.1f batches (%llu without a completion record), %.1f recorded GPU write ranges, %.1f in-place reads (%.0f KiB); in-place reads compared by bytes with their copy made at the label once the recorded work finished, %.2f ms later: %llu rewritten of %llu (%llu of %llu bytes), of which %llu of %llu at the %llu labels whose interrupt was delivered at the label, and %llu of %llu on reads of at most 4 KiB copied exactly; by reader, rewritten/compared:%s; not compared: %llu outside the pages copied, %llu under a recorded GPU write, %llu over 8 MiB, %llu inaccessible, %llu followed pages left out of a copy by its budget; changed since the previous label: %llu of %llu; GPU time left of the %.2f ms after the label once the newest unfinished batch has finished that reads in place %.2f ms (%llu labels with none), that reads a range changed since the previous label %.2f ms (%llu with none), that reads a rewritten range %.2f ms (%llu with none), that touches guest memory %.2f ms (%llu with none), over %llu labels with stamped batches; copy at the label: %.1f runs, %.0f KiB, %.3f ms; rewritten ranges:%s\n", value(counts.labels), static_cast<double>(counts.batches) * perEnd, value(counts.missing), static_cast<double>(counts.writes) * perLabel, static_cast<double>(counts.noted) * perEnd, static_cast<double>(counts.notedBytes) * perEnd / 1024.0, counts.tailMs * perEnd, value(rewritten), value(checked), value(counts.rewrittenBytes), value(counts.checkedBytes), value(counts.earlyRewritten), value(counts.earlyChecked), value(counts.earlyLabels), value(counts.smallRewritten), value(counts.smallChecked), kinds.c_str(), value(counts.uncovered), value(gpuWritten), value(counts.large), value(counts.inaccessible), value(counts.overBudget), value(moved), value(aged), counts.stampedTailMs * perStamped, counts.leftReads * perStamped, value(counts.noReads), counts.leftMoved * perStamped, value(counts.noMoved), counts.leftRewritten * perStamped, value(counts.noRewritten), counts.leftGuest * perStamped, value(counts.noGuest), value(counts.stamped), static_cast<double>(counts.shotRuns) * perLabel, static_cast<double>(counts.shotBytes) * perLabel / 1024.0, counts.shotMs * perLabel, examples.empty() ? " none" : examples.c_str());
-    auto& guard = eopGuard().counts;
-    const double perGuard = guard.labels != 0 ? 1.0 / static_cast<double>(guard.labels) : 0.0;
-    std::string changed;
-    for (std::size_t kind = 0; kind < EopProbeKinds; ++kind) {
-        if (guard.riskyKinds[kind] != 0) changed += (changed.empty() ? "" : ", ") + std::string(EopProbeKindNames[kind]) + " " + std::to_string(guard.riskyKinds[kind]);
-    }
-    if (changed.empty()) changed = "none";
-    AgcDriver::ProfilePrint_nid_no_patch("[eop-guard] %llu end-of-pipe interrupt labels: %llu delivered at the label, held behind the recorded work: %llu for a changed or new range read by the open batch, %llu for one read by a batch in flight, %llu for an address-based read, %llu without the reads of the frame; per label %.1f in-place reads judged, %.1f of them under a GPU write of the frame, %.2f unexecuted on a changed or new range (%s; last %llx+%llu), %llu changes published to the draw path, %.3f ms; held for a GPU write to guest memory that had not run: %llu for a drawn linear target stored at the label, %llu for a pending copy-back or queued store, %llu for a recorded store (last %llx+%llu)\n", value(guard.labels), value(guard.early), value(guard.heldOpen), value(guard.heldBehind), value(guard.heldAddress), value(guard.heldUnknown), static_cast<double>(guard.judged) * perGuard, static_cast<double>(guard.gpuWritten) * perGuard, static_cast<double>(guard.risky) * perGuard, changed.c_str(), value(guard.lastBegin), value(guard.lastEnd - guard.lastBegin), value(guard.published), guard.guardMs * perGuard, value(guard.heldLinear), value(guard.heldCopyBack), value(guard.heldStore), value(guard.storeBegin), value(guard.storeEnd - guard.storeBegin));
-    guard = {};
+    AgcDriver::ProfilePrint_nid_no_patch("[eop] %llu end-of-pipe interrupt labels over 10 s; unfinished at the label: %.1f batches (%llu without a completion record), %.1f recorded GPU write ranges, %.1f in-place reads (%.0f KiB); in-place reads compared by bytes with their copy made at the label once the recorded work finished, %.2f ms later: %llu rewritten of %llu (%llu of %llu bytes), of which %llu of %llu at the %llu labels whose interrupt was delivered at the label, and %llu of %llu on reads of at most 4 KiB copied exactly; by reader, rewritten/compared:%s; not compared: %llu outside the pages copied, %llu under a recorded GPU write, %llu over 8 MiB, %llu inaccessible, %llu followed pages left out of a copy by its budget; changed since the previous label: %llu of %llu; GPU time left of the %.2f ms after the label once the newest unfinished batch has finished that reads in place %.2f ms (%llu labels with none), that reads a range changed since the previous label %.2f ms (%llu with none), that reads a rewritten range %.2f ms (%llu with none), that touches guest memory %.2f ms (%llu with none), that writes guest memory %.2f ms (%llu with none), that writes guest memory or reads it in place %.2f ms (%llu with none), over %llu labels with stamped batches; copy at the label: %.1f runs, %.0f KiB, %.3f ms; rewritten ranges:%s\n", value(counts.labels), static_cast<double>(counts.batches) * perEnd, value(counts.missing), static_cast<double>(counts.writes) * perLabel, static_cast<double>(counts.noted) * perEnd, static_cast<double>(counts.notedBytes) * perEnd / 1024.0, counts.tailMs * perEnd, value(rewritten), value(checked), value(counts.rewrittenBytes), value(counts.checkedBytes), value(counts.earlyRewritten), value(counts.earlyChecked), value(counts.earlyLabels), value(counts.smallRewritten), value(counts.smallChecked), kinds.c_str(), value(counts.uncovered), value(gpuWritten), value(counts.large), value(counts.inaccessible), value(counts.overBudget), value(moved), value(aged), counts.stampedTailMs * perStamped, counts.leftReads * perStamped, value(counts.noReads), counts.leftMoved * perStamped, value(counts.noMoved), counts.leftRewritten * perStamped, value(counts.noRewritten), counts.leftGuest * perStamped, value(counts.noGuest), counts.leftWriter * perStamped, value(counts.noWriter), counts.leftTouch * perStamped, value(counts.noTouch), value(counts.stamped), static_cast<double>(counts.shotRuns) * perLabel, static_cast<double>(counts.shotBytes) * perLabel / 1024.0, counts.shotMs * perLabel, examples.empty() ? " none" : examples.c_str());
+    reportEopGuard();
     probe.examples.clear();
     probe.counts = {};
 }
@@ -927,6 +949,7 @@ std::shared_ptr<EopProbeFrame> beginEopProbe(bool early) {
     frame->last = recorder->Recording() ? recorder->OpenSerial() : recorder->Submissions();
     const auto guest = recorder->NewestGuestWork();
     frame->guest = guest.has_value() ? *guest : frame->last;
+    frame->writer = recorder->NewestGuestWriter();
     recorder->PendingWriteRanges(frame->writes);
     static_cast<void>(recorder->UnexecutedReads(probe.pending));
     std::sort(probe.pending.begin(), probe.pending.end(), [](const auto& a, const auto& b) { return a.begin != b.begin ? a.begin < b.begin : a.end < b.end; });
@@ -992,11 +1015,12 @@ void endEopProbe(const std::shared_ptr<EopProbeFrame>& frame) {
     counts.batches += tail.size();
     const auto* previous = frame->previous.get();
     bool stamped = !tail.empty();
-    double lastEnd = 0, readsEnd = 0, movedEnd = 0, rewrittenEnd = 0, guestEnd = 0;
+    double lastEnd = 0, readsEnd = 0, movedEnd = 0, rewrittenEnd = 0, guestEnd = 0, writerEnd = 0;
     for (const auto& batch : tail) {
         if (batch.gpuEndNs <= batch.gpuStartNs) stamped = false;
         lastEnd = std::max(lastEnd, batch.gpuEndNs);
         if (batch.serial <= frame->guest) guestEnd = std::max(guestEnd, batch.gpuEndNs);
+        if (batch.serial <= frame->writer) writerEnd = std::max(writerEnd, batch.gpuEndNs);
         bool moved = false, rewritten = false;
         for (const auto& [begin, end] : batch.reads) {
             const auto bytes = static_cast<std::size_t>(end - begin);
@@ -1097,10 +1121,14 @@ void endEopProbe(const std::shared_ptr<EopProbeFrame>& frame) {
         counts.leftMoved += left(movedEnd);
         counts.leftRewritten += left(rewrittenEnd);
         counts.leftGuest += left(guestEnd);
+        counts.leftWriter += left(writerEnd);
+        counts.leftTouch += left(std::max(writerEnd, readsEnd));
         if (readsEnd == 0) ++counts.noReads;
         if (movedEnd == 0) ++counts.noMoved;
         if (rewrittenEnd == 0) ++counts.noRewritten;
         if (guestEnd == 0) ++counts.noGuest;
+        if (writerEnd == 0) ++counts.noWriter;
+        if (writerEnd == 0 && readsEnd == 0) ++counts.noTouch;
     }
     if (auto older = std::move(frame->previous); older != nullptr && older.use_count() == 1 && probe.spare.size() < 4) probe.spare.push_back(std::move(older->bytes));
     ++probe.frame;
@@ -1142,6 +1170,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     static const bool probed = Graphics::Recorder::FlipReadCheck();
     static const bool earlyInterrupt = Graphics::Recorder::EarlyEndOfPipe();
     const bool judged = earlyInterrupt && interrupt.has_value();
+    if (judged && localDevice != nullptr) Graphics::StorageTexture::StoreReadbackBeforeLabel(bytes.empty() ? "readback before interrupt" : "readback before label");
     const bool linearStored = judged && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear(bytes.empty() ? "interrupt" : "label") != 0;
     const bool early = judged && eopGuardSettled(linearStored);
     bool workOpen = linearStored || Graphics::Recorder::RecordedWorkSinceSubmit() != 0;

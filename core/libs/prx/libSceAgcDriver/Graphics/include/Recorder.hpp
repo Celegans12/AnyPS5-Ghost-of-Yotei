@@ -443,6 +443,7 @@ public:
     };
     std::optional<PendingReadInfo> DescribePendingRead(std::uint64_t address, std::size_t bytes) const;
     std::optional<std::uint64_t> NewestGuestWork() const;
+    std::uint64_t NewestGuestWriter() const;
     struct InPlaceRead {
         std::uint64_t begin;
         std::uint64_t end;
