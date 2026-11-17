@@ -46,6 +46,13 @@ library and loader functions that `graphics/` and `common/` call, and the shim i
 - Nothing else is changed in the imported files. Adaptations to AnyPS5 go in the shim, or under
   `#if defined(ANYPS5_KYTY)` in `core/kyty/`. `ANYPS5_KYTY=1` is defined for every target of a
   `-DANYPS5_GPU_BACKEND=kyty` build and never otherwise.
+- `graphics/` calls four functions of SDL3 (`SDL_LoadObject`, `SDL_LoadFunction`, `SDL_UnloadObject` to open the
+  DLSS and FSR libraries when the user supplies them, `SDL_GetBasePath` to find shipped pipeline manifests). AnyPS5 has
+  SDL2, so `core/libs/prx/libSceAgcDriver/KytyShim/compat/SDL3/` gives `kyty_gpu` these four over `dlopen` and
+  `/proc/self/exe`; nothing else of SDL3 is declared there.
+- `pipelineManifest.cpp` calls `stbi_zlib_decode_buffer`, whose implementation upstream compiles in
+  `src/libs/libJpegDec.cpp`, which is not imported; AnyPS5 compiles `stb_image` as `static` in its own decoders, so
+  `kyty_gpu` compiles one `STB_IMAGE_IMPLEMENTATION` unit of its own (generated `stb_image.c`).
 
 ## Build
 
@@ -71,6 +78,10 @@ The dependencies of `graphics/` and `common/` that AnyPS5 did not have are submo
 | `3rdparty/magic_enum` | `1384769c66bd16ec9bb1353f45fe8ec8ccc12dbd` (v0.9.8) | MIT |
 | `3rdparty/xbyak` | `44a72f369268f7d552650891b296693e91db86bb` | BSD-3-Clause |
 | `3rdparty/zydis` | `120e0e705f8e3b507dc49377ac2879979f0d545c` (with `dependencies/zycore`) | MIT |
+
+`3rdparty/ffx-api` holds the four AMD FidelityFX API headers Kyty `v24` vendors in `3rdparty/ffx-api`
+(FidelityFX-SDK v2.4.0, `Kits/FidelityFX`, unmodified, MIT licence in `3rdparty/ffx-api/LICENSE.txt`); `fsr.cpp` only
+declares the API with them and loads AMD's libraries at run time.
 
 `zydis` is used by the KytyPS5 loader (`x64InstructionEmulator.cpp`, `guestInstructionPatcher.cpp`), not by
 `graphics/` or `common/`: `kyty_gpu` does not build it. Vulkan-Headers, VulkanMemoryAllocator, SPIRV-Headers,

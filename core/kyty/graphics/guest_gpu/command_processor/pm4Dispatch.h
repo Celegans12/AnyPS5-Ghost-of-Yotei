@@ -72,6 +72,10 @@ uint32_t CpOpPushMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, 
 uint32_t CpOpPopMarker(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpWaitRegMem64(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpPssr(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+#if defined(ANYPS5_KYTY)
+uint32_t CpOpAnyPs5Flip(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+uint32_t CpOpAnyPs5RenderingWait(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+#endif
 
 }
 
