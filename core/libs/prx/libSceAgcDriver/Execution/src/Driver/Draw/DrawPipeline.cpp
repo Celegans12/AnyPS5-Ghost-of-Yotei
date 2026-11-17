@@ -47,6 +47,16 @@ std::uint64_t elapsedNs(std::chrono::steady_clock::time_point since) {
     return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - since).count());
 }
 
+std::chrono::nanoseconds CommitterSpinWindow() {
+    static const auto window = HandoffSpinWindowOr(std::getenv("APS5_COMMITTER_SPIN_US"), HandoffSpinWindow());
+    return window;
+}
+
+std::chrono::nanoseconds WalkerSpinWindow() {
+    static const auto window = HandoffSpinWindowOr(std::getenv("APS5_WALKER_SPIN_US"), HandoffSpinWindow());
+    return window;
+}
+
 ProfileCounter heldReadRanges;
 ProfileCounter heldReadQueries;
 ProfileCounter heldReadHits;
@@ -1156,7 +1166,7 @@ void CollectWalker::run() {
         while (!closed.load(std::memory_order_acquire)) {
             const auto at = head.load(std::memory_order_relaxed);
             if (tail.load(std::memory_order_acquire) == at) {
-                if (SpinUntil(HandoffSpinWindow(), [&] { return tail.load(std::memory_order_acquire) != at || closed.load(std::memory_order_acquire); })) continue;
+                if (SpinUntil(WalkerSpinWindow(), [&] { return tail.load(std::memory_order_acquire) != at || closed.load(std::memory_order_acquire); })) continue;
                 parked.store(1u, std::memory_order_seq_cst);
                 if (tail.load(std::memory_order_seq_cst) == at && !closed.load(std::memory_order_seq_cst)) {
                     sleeps.fetch_add(1, std::memory_order_relaxed);
@@ -1606,7 +1616,7 @@ void DrawPipeline::runFlat() {
     for (;;) {
         const bool starved = timed && queue.Queued() == 0;
         const auto idleStart = starved ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        SpinUntil(HandoffSpinWindow(), [&] { return queue.Queued() != 0; });
+        SpinUntil(CommitterSpinWindow(), [&] { return queue.Queued() != 0; });
         Item* item = queue.Front();
         while (item == nullptr) {
             if (queue.Closed()) {
@@ -1892,7 +1902,7 @@ void DrawPipeline::run() {
         Core::OpHost::Gate gate;
         const bool starved = timed && outstanding.load(std::memory_order_acquire) == 0 && (ops == nullptr || !ops->Runnable());
         const auto idleStart = starved ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        SpinUntil(HandoffSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0 || (ops != nullptr && ops->Runnable()); });
+        SpinUntil(CommitterSpinWindow(), [&] { return outstanding.load(std::memory_order_acquire) != 0 || (ops != nullptr && ops->Runnable()); });
         {
             std::unique_lock lock(mutex, std::defer_lock);
             lockTallied(lock, Waited::Queue);
