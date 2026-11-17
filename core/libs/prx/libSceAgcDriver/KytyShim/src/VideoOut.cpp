@@ -197,7 +197,8 @@ void UpdateDrawableSize(Libs::Graphics::WindowContext& host, const AgcDriver::Pr
 }
 
 Libs::Graphics::ImageInfo DisplayImageInfo(const AgcDriver::DisplayBuffer& buffer) {
-    if (buffer.dccAddress != 0 || buffer.dccClearColor != 0) throw std::runtime_error("kyty presentation: DCC-compressed display buffers are not supported (AgcDriver::DisplayBuffer carries no DCC control word)");
+    const auto compression = Libs::Graphics::ClassifyVideoOutCompression(buffer.dccAddress != 0, buffer.dccAddress, buffer.dccControl, buffer.dccClearColor);
+    if (compression == Libs::Graphics::VideoOutCompression::Unsupported) throw std::runtime_error("kyty presentation: unsupported DCC display buffer, metadata " + std::to_string(buffer.dccAddress) + ", control " + std::to_string(buffer.dccControl) + ", clear color " + std::to_string(buffer.dccClearColor));
     if (buffer.tilingMode != 0 || buffer.pitchInPixel != 0) throw std::runtime_error("kyty presentation: only render-target tiled display buffers are supported, tiling " + std::to_string(buffer.tilingMode) + ", pitch " + std::to_string(buffer.pitchInPixel));
     if (buffer.width == 0 || buffer.height == 0 || buffer.width > 16384 || buffer.height > 16384) throw std::runtime_error("kyty presentation: invalid display buffer extent");
     if (buffer.address == 0 || (buffer.address & 65535u) != 0) throw std::runtime_error("kyty presentation: display buffer address is not 64 KiB aligned");
@@ -216,6 +217,13 @@ Libs::Graphics::ImageInfo DisplayImageInfo(const AgcDriver::DisplayBuffer& buffe
     info.bgra16 = format.bgra16;
     info.UpdateSize();
     if (info.data.size == 0 || info.tiling.block.block_size != 65536) throw std::runtime_error("kyty presentation: invalid display buffer footprint");
+    if (compression != Libs::Graphics::VideoOutCompression::Uncompressed) {
+        Libs::Graphics::TileSizeAlign dccSize{};
+        if (!Libs::Graphics::TileGetDccSize(buffer.width, buffer.height, 1, format.bytes_per_element, 1, Libs::Graphics::Prospero::TileMode::kRenderTarget, dccSize)) throw std::runtime_error("kyty presentation: invalid DCC footprint for the display buffer");
+        info.metadata.range = {buffer.dccAddress, dccSize.size};
+        info.metadata.kind = Libs::Graphics::ImageMetadataKind::Dcc;
+        info.metadata.compression = compression;
+    }
     Libs::Graphics::ImageOps::Validate(info);
     if (!Libs::Graphics::IsSupportedVideoOutFormat(info)) throw std::runtime_error("kyty presentation: unsupported normalized display format");
     return info;
