@@ -128,6 +128,7 @@ target_include_directories(kyty_gpu SYSTEM
 )
 target_link_libraries(kyty_gpu PUBLIC fmt::fmt xxhash xbyak::xbyak kyty_magic_enum PRIVATE zarchive)
 target_compile_features(kyty_gpu PUBLIC cxx_std_20)
+target_compile_definitions(kyty_gpu PUBLIC ANYPS5_KYTY=1)
 target_compile_options(kyty_gpu PRIVATE
     $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>
     -finput-charset=UTF-8 -fexec-charset=UTF-8 -fno-strict-aliasing -fno-omit-frame-pointer
