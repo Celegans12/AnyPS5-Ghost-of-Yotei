@@ -12,6 +12,7 @@
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/systemOverlay.h"
 #include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window.h"
 #include "graphics/presentation/window/windowInternal.h"
 #include "libs/errno.h"
 
@@ -22,71 +23,48 @@
 
 #include <dlfcn.h>
 
-#include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <exception>
 #include <future>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <semaphore>
-#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
+#include <vector>
 
-namespace KytyShim {
+namespace KytyShim::Entry {
+
+Libs::Graphics::RenderContext& Renderer();
+std::shared_ptr<AgcDriver::IVideoOutput> VideoOutput(std::uint32_t handle);
+
+}
+
+namespace KytyShim::Present {
+
+void WaitRendering(std::uint32_t handle, std::uint32_t index);
 
 namespace {
 
-constexpr std::uint32_t OutputHandleLimit = 8;
-constexpr int BufferLimit = 16;
-
-struct TrackedFlip {
-    std::shared_ptr<AgcDriver::IFlipRequest> request;
-    std::uint32_t handle = 0;
-    int index = 0;
-};
-
 struct PresentationState {
     std::mutex mutex;
-    std::condition_variable attached;
-    std::map<std::uint32_t, std::shared_ptr<AgcDriver::IVideoOutput>> outputs;
-    std::array<std::array<std::uint64_t, BufferLimit>, OutputHandleLimit> labels{};
-    std::map<std::uint64_t, TrackedFlip> flips;
-    std::set<std::uint64_t> cancelled;
-    std::uint64_t nextFlip = 1;
     std::unique_ptr<Libs::Graphics::WindowContext> window;
     std::unique_ptr<Libs::VideoOut::VideoOutDriver> driver;
+    std::map<std::uint64_t, std::shared_ptr<AgcDriver::IFlipRequest>> flips;
+    std::uint64_t nextFlip = 1;
     void* windowHandle = nullptr;
     VkSurfaceKHR (*createSurface)(void* context, VkInstance instance) = nullptr;
-    bool released = false;
 };
 
 PresentationState& State() {
     static auto* state = new PresentationState;
     return *state;
-}
-
-std::shared_ptr<AgcDriver::IVideoOutput> FindOutput(std::uint32_t handle) {
-    auto& state = State();
-    std::lock_guard lock(state.mutex);
-    const auto found = state.outputs.find(handle);
-    return found != state.outputs.end() ? found->second : nullptr;
-}
-
-void FailOutputs(std::exception_ptr error) noexcept {
-    std::map<std::uint32_t, std::shared_ptr<AgcDriver::IVideoOutput>> outputs;
-    {
-        auto& state = State();
-        std::lock_guard lock(state.mutex);
-        outputs = state.outputs;
-    }
-    for (const auto& [handle, output] : outputs) output->Fail(error);
 }
 
 [[noreturn]] void Stop(const char* where, std::exception_ptr error) noexcept {
@@ -98,14 +76,12 @@ void FailOutputs(std::exception_ptr error) noexcept {
         } catch (...) {
         }
         std::fprintf(stderr, "[kyty-videoout] %s: process shutdown outside an exit\n", where);
-        LibcTerminate_nid_no_patch(1);
     } catch (const std::exception& failure) {
         std::fprintf(stderr, "[kyty-videoout] %s: %s\n", where, failure.what());
     } catch (...) {
         std::fprintf(stderr, "[kyty-videoout] %s: unknown failure\n", where);
     }
     std::fflush(stderr);
-    FailOutputs(error);
     LibcTerminate_nid_no_patch(1);
 }
 
@@ -120,10 +96,32 @@ void WaitRunningUrgentCommands(Blocking&& blocking) {
 
 PFN_vkGetInstanceProcAddr LoadVulkanLoader() {
     static void* const library = dlopen("libvulkan.so.1", RTLD_NOW | RTLD_LOCAL);
-    if (library == nullptr) throw std::runtime_error(std::string("kyty presentation: cannot load libvulkan.so.1: ") + dlerror());
+    if (library == nullptr) EXIT("kyty presentation: cannot load libvulkan.so.1: %s\n", dlerror());
     const auto proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(library, "vkGetInstanceProcAddr"));
-    if (proc == nullptr) throw std::runtime_error("kyty presentation: libvulkan.so.1 has no vkGetInstanceProcAddr");
+    if (proc == nullptr) EXIT("kyty presentation: libvulkan.so.1 has no vkGetInstanceProcAddr\n");
     return proc;
+}
+
+std::vector<const char*> SurfaceInstanceExtensions(PFN_vkGetInstanceProcAddr proc) {
+    const auto enumerate = reinterpret_cast<PFN_vkEnumerateInstanceExtensionProperties>(proc(VK_NULL_HANDLE, "vkEnumerateInstanceExtensionProperties"));
+    if (enumerate == nullptr) EXIT("kyty presentation: the Vulkan loader has no vkEnumerateInstanceExtensionProperties\n");
+    std::uint32_t count = 0;
+    if (enumerate(nullptr, &count, nullptr) != VK_SUCCESS) EXIT("kyty presentation: cannot list the Vulkan instance extensions\n");
+    std::vector<VkExtensionProperties> available(count);
+    if (enumerate(nullptr, &count, available.data()) != VK_SUCCESS) EXIT("kyty presentation: cannot list the Vulkan instance extensions\n");
+    available.resize(count);
+    static constexpr const char* Candidates[] = {VK_KHR_SURFACE_EXTENSION_NAME, "VK_KHR_xlib_surface", "VK_KHR_xcb_surface", "VK_KHR_wayland_surface"};
+    std::vector<const char*> enabled;
+    for (const char* name : Candidates) {
+        for (const auto& extension : available) {
+            if (std::strcmp(extension.extensionName, name) == 0) {
+                enabled.push_back(name);
+                break;
+            }
+        }
+    }
+    if (enabled.empty() || enabled.front() != Candidates[0] || enabled.size() == 1) EXIT("kyty presentation: the Vulkan loader offers no window surface extension (xlib, xcb or wayland)\n");
+    return enabled;
 }
 
 VkSurfaceKHR CreateHostSurface(void* context, VkInstance instance) {
@@ -142,7 +140,7 @@ VkSurfaceKHR CreateHostSurface(void* context, VkInstance instance) {
 Libs::Graphics::WindowContext& AttachedWindow(const AgcDriver::PresentationWindow& window) {
     auto& state = State();
     std::lock_guard lock(state.mutex);
-    if (state.window == nullptr || state.windowHandle != window.context) throw std::runtime_error("kyty presentation: the presentation window is not attached");
+    if (state.window == nullptr || state.windowHandle == nullptr || state.windowHandle != window.context) throw std::runtime_error("kyty presentation: the presentation window is not attached");
     return *state.window;
 }
 
@@ -182,52 +180,13 @@ Libs::Graphics::ImageInfo DisplayImageInfo(const AgcDriver::DisplayBuffer& buffe
     return info;
 }
 
-void PresentFrame(Libs::Graphics::WindowContext& host, Libs::Graphics::Presenter::Frame& frame, void (*gpuReady)(void*), void* context) {
-    host.presenter->Present(frame);
-    gpuReady(context);
 }
 
-}
-
-Libs::Graphics::RenderContext& Renderer() {
-    auto& state = State();
-    std::unique_lock lock(state.mutex);
-    state.attached.wait(lock, [&] { return state.driver != nullptr || state.released; });
-    if (state.released) throw std::runtime_error("kyty presentation: the renderer was released with its window");
-    return *state.window->render_context;
-}
-
-std::shared_ptr<AgcDriver::IVideoOutput> VideoOutput(std::uint32_t handle) {
-    return FindOutput(handle);
-}
-
-std::uint64_t TrackFlip(std::uint32_t handle, int index, std::shared_ptr<AgcDriver::IFlipRequest> request) {
-    if (request == nullptr) throw std::runtime_error("kyty presentation: null flip request");
-    auto& state = State();
-    std::lock_guard lock(state.mutex);
-    const auto id = state.nextFlip++;
-    state.flips.emplace(id, TrackedFlip{std::move(request), handle, index});
-    return id;
-}
-
-void ShutdownPresentation() {
-    std::unique_ptr<Libs::Graphics::WindowContext> window;
-    std::unique_ptr<Libs::VideoOut::VideoOutDriver> driver;
-    {
-        auto& state = State();
-        std::lock_guard lock(state.mutex);
-        if (state.window == nullptr) return;
-        state.released = true;
-        state.windowHandle = nullptr;
-        window = std::move(state.window);
-        driver = std::move(state.driver);
-        state.flips.clear();
-        state.cancelled.clear();
-        state.attached.notify_all();
-    }
-    window->render_context->ShutdownGpu();
-    driver.reset();
-    window.reset();
+void WaitRendering(std::uint32_t handle, std::uint32_t index) {
+    const auto output = Entry::VideoOutput(handle);
+    if (output == nullptr) throw std::runtime_error("kyty presentation: rendering wait on unregistered output " + std::to_string(handle));
+    const auto wait = output->CaptureRenderingWait(index);
+    WaitRunningUrgentCommands([wait] { wait->Wait(); });
 }
 
 }
@@ -249,21 +208,24 @@ VideoOutDriver::Impl& VideoOutDriver::State() noexcept {
 
 int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer&, int handle, int index, int flip_mode, int64_t flip_arg, uint64_t& request_id) {
     try {
-        const auto output = KytyShim::FindOutput(static_cast<std::uint32_t>(handle));
+        const auto output = KytyShim::Entry::VideoOutput(static_cast<std::uint32_t>(handle));
         if (output == nullptr) return VIDEO_OUT_ERROR_INVALID_HANDLE;
         auto request = output->TryReserve(AgcDriver::FlipInfo{static_cast<std::uint32_t>(handle), index, static_cast<std::uint32_t>(flip_mode), flip_arg});
         if (request == nullptr) return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
-        request_id = KytyShim::TrackFlip(static_cast<std::uint32_t>(handle), index, std::move(request));
+        auto& state = KytyShim::Present::State();
+        std::lock_guard lock(state.mutex);
+        request_id = state.nextFlip++;
+        state.flips.emplace(request_id, std::move(request));
         return OK;
     } catch (...) {
-        KytyShim::Stop("GPU flip submission", std::current_exception());
+        KytyShim::Present::Stop("GPU flip submission", std::current_exception());
     }
 }
 
 void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer&) {
-    auto& state = KytyShim::State();
+    auto& state = KytyShim::Present::State();
     std::lock_guard lock(state.mutex);
-    if (state.flips.contains(request_id) || state.cancelled.contains(request_id) || state.released) return;
+    if (state.flips.contains(request_id)) return;
     std::fprintf(stderr, "[kyty-videoout] flip preparation for an unknown request %llu\n", static_cast<unsigned long long>(request_id));
     std::fflush(stderr);
     LibcTerminate_nid_no_patch(1);
@@ -271,71 +233,88 @@ void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer&) 
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
     try {
-        KytyShim::TrackedFlip flip;
+        std::shared_ptr<AgcDriver::IFlipRequest> request;
         {
-            auto& state = KytyShim::State();
+            auto& state = KytyShim::Present::State();
             std::lock_guard lock(state.mutex);
             const auto found = state.flips.find(request_id);
-            if (found == state.flips.end()) {
-                if (state.cancelled.erase(request_id) != 0 || state.released) return;
-                throw std::runtime_error("flip completion for an unknown request " + std::to_string(request_id));
-            }
-            flip = std::move(found->second);
+            if (found == state.flips.end()) throw std::runtime_error("flip completion for an unknown request " + std::to_string(request_id));
+            request = std::move(found->second);
             state.flips.erase(found);
         }
-        flip.request->GpuReady(std::make_shared<AgcDriver::FrameTiming>(request_id));
+        request->GpuReady(std::make_shared<AgcDriver::FrameTiming>(request_id));
     } catch (const ProcessShutdown&) {
     } catch (...) {
-        KytyShim::Stop("GPU flip completion", std::current_exception());
+        KytyShim::Present::Stop("GPU flip completion", std::current_exception());
     }
 }
 
 void VideoOutDriver::WaitForSubmitSlot(int handle) {
     try {
-        const auto output = KytyShim::FindOutput(static_cast<std::uint32_t>(handle));
+        const auto output = KytyShim::Entry::VideoOutput(static_cast<std::uint32_t>(handle));
         if (output == nullptr) throw std::runtime_error("flip slot wait on unregistered output " + std::to_string(handle));
-        KytyShim::WaitRunningUrgentCommands([output] { output->WaitForFlipRoom(); });
+        KytyShim::Present::WaitRunningUrgentCommands([output] { output->WaitForFlipRoom(); });
     } catch (...) {
-        KytyShim::Stop("flip slot wait", std::current_exception());
+        KytyShim::Present::Stop("flip slot wait", std::current_exception());
     }
 }
 
-void VideoOutDriver::WaitFlipDone(const uint64_t* label) {
-    try {
-        auto& state = KytyShim::State();
-        std::shared_ptr<AgcDriver::IVideoOutput> output;
-        std::uint32_t index = 0;
-        {
-            std::lock_guard lock(state.mutex);
-            for (std::uint32_t handle = 0; handle < KytyShim::OutputHandleLimit && output == nullptr; ++handle) {
-                const auto& labels = state.labels[handle];
-                const auto* first = labels.data();
-                if (label < first || label >= first + labels.size()) continue;
-                const auto found = state.outputs.find(handle);
-                if (found == state.outputs.end()) throw std::runtime_error("flip wait on unregistered output " + std::to_string(handle));
-                output = found->second;
-                index = static_cast<std::uint32_t>(label - first);
-            }
-            if (output == nullptr) throw std::runtime_error("flip wait on a label the video outputs do not own");
-        }
-        const auto wait = output->CaptureRenderingWait(index);
-        KytyShim::WaitRunningUrgentCommands([wait] { wait->Wait(); });
-    } catch (...) {
-        KytyShim::Stop("flip done wait", std::current_exception());
-    }
+void VideoOutDriver::WaitFlipDone(const uint64_t*) {
+    std::fprintf(stderr, "[kyty-videoout] Kyty's wait-flip-done packet reached the kyty backend, but AnyPS5's libSceAgc emits the rendering wait packet instead\n");
+    std::fflush(stderr);
+    LibcTerminate_nid_no_patch(1);
 }
 
-uint64_t* VideoOutGetBufferLabels(int handle, int* bus) {
-    auto& state = KytyShim::State();
+VideoOutDriver& VideoOutInit(uint32_t width, uint32_t height, Graphics::Presenter& presenter) {
+    auto& state = KytyShim::Present::State();
     std::lock_guard lock(state.mutex);
-    if (handle <= 0 || static_cast<std::uint32_t>(handle) >= KytyShim::OutputHandleLimit || !state.outputs.contains(static_cast<std::uint32_t>(handle))) return nullptr;
-    *bus = handle - 1;
-    return state.labels[static_cast<std::size_t>(handle)].data();
+    EXIT_IF(state.driver != nullptr);
+    state.driver = std::make_unique<VideoOutDriver>(width, height, presenter);
+    return *state.driver;
+}
+
+void VideoOutShutdown() {
+    std::unique_ptr<VideoOutDriver> driver;
+    {
+        auto& state = KytyShim::Present::State();
+        std::lock_guard lock(state.mutex);
+        driver = std::move(state.driver);
+        state.flips.clear();
+    }
 }
 
 }
 
 namespace Libs::Graphics {
+
+Presenter& WindowInit(uint32_t width, uint32_t height) {
+    auto& state = KytyShim::Present::State();
+    {
+        std::lock_guard lock(state.mutex);
+        EXIT_IF(state.window != nullptr);
+    }
+    auto host = std::make_unique<WindowContext>();
+    host->graphic_ctx.screen_width = width;
+    host->graphic_ctx.screen_height = height;
+    host->host_get_instance_proc_addr = KytyShim::Present::LoadVulkanLoader();
+    host->host_extensions = KytyShim::Present::SurfaceInstanceExtensions(host->host_get_instance_proc_addr);
+    host->host_create_surface = &KytyShim::Present::CreateHostSurface;
+    host->CreateVulkan();
+    auto& presenter = *host->presenter;
+    std::lock_guard lock(state.mutex);
+    state.window = std::move(host);
+    return presenter;
+}
+
+void WindowShutdown() {
+    std::unique_ptr<WindowContext> window;
+    {
+        auto& state = KytyShim::Present::State();
+        std::lock_guard lock(state.mutex);
+        window = std::move(state.window);
+        state.windowHandle = nullptr;
+    }
+}
 
 struct SystemOverlay::Impl {};
 
@@ -413,73 +392,40 @@ void OpenXrQueueEyeSource(Graphics::CommandBuffer&, const Graphics::VulkanImage&
 
 }
 
-extern "C" void AgcDriverRegisterVideoOutput_nid_postfix(std::uint32_t handle, const std::shared_ptr<AgcDriver::IVideoOutput>& output) {
-    if (output == nullptr) throw std::runtime_error("kyty presentation: null video output");
-    if (handle == 0 || handle >= KytyShim::OutputHandleLimit) throw std::runtime_error("kyty presentation: video output handle " + std::to_string(handle) + " is out of range");
-    auto& state = KytyShim::State();
-    std::lock_guard lock(state.mutex);
-    if (!state.outputs.emplace(handle, output).second) throw std::runtime_error("kyty presentation: video output already registered");
-    state.labels[handle].fill(0);
-}
-
-extern "C" void AgcDriverUnregisterVideoOutput_nid_postfix(std::uint32_t handle, const std::shared_ptr<AgcDriver::IVideoOutput>& output) {
-    auto& state = KytyShim::State();
-    std::lock_guard lock(state.mutex);
-    const auto found = state.outputs.find(handle);
-    if (found == state.outputs.end() || found->second != output) throw std::runtime_error("kyty presentation: video output registration mismatch");
-    for (auto it = state.flips.begin(); it != state.flips.end();) {
-        if (it->second.handle != handle) {
-            ++it;
-            continue;
-        }
-        state.cancelled.insert(it->first);
-        it = state.flips.erase(it);
-    }
-    state.outputs.erase(found);
-}
-
 extern "C" void AgcDriverAttachWindow_nid_postfix(const AgcDriver::PresentationWindow& window) {
-    auto& state = KytyShim::State();
+    if (window.context == nullptr || window.createSurface == nullptr || window.getDrawableSize == nullptr) throw std::runtime_error("kyty presentation: incomplete presentation window");
+    if (!KytyShim::Entry::Renderer().GetGpu().Pipelined()) throw std::runtime_error("kyty presentation: the Kyty GPU must run pipelined (GPU pipeline stages must include the command processor)");
+    auto& state = KytyShim::Present::State();
+    Libs::Graphics::WindowContext* host = nullptr;
     {
         std::lock_guard lock(state.mutex);
-        if (state.window != nullptr) throw std::runtime_error("kyty presentation: a window is already attached; the Kyty renderer cannot move to another window");
-        if (state.released) throw std::runtime_error("kyty presentation: the Kyty renderer cannot be created again after its window was released");
-        if (window.context == nullptr || window.createSurface == nullptr || window.getDrawableSize == nullptr) throw std::runtime_error("kyty presentation: incomplete presentation window");
+        if (state.window == nullptr) throw std::runtime_error("kyty presentation: the Kyty GPU started without its window context");
+        if (state.windowHandle != nullptr || state.window->surface != nullptr) throw std::runtime_error("kyty presentation: the Kyty presenter is already bound to a window and cannot move to another one");
+        for (const char* needed : window.extensions) {
+            bool enabled = false;
+            for (const char* name : state.window->host_extensions) enabled = enabled || std::strcmp(name, needed) == 0;
+            if (!enabled) throw std::runtime_error(std::string("kyty presentation: the window needs the Vulkan instance extension ") + needed + ", which the Kyty instance did not enable");
+        }
         state.createSurface = window.createSurface;
+        host = state.window.get();
     }
-    std::uint32_t width = window.width;
-    std::uint32_t height = window.height;
-    window.getDrawableSize(window.context, &width, &height);
-    if (width == 0 || height == 0) {
-        width = window.width;
-        height = window.height;
-    }
-    auto host = std::make_unique<Libs::Graphics::WindowContext>();
-    host->graphic_ctx.screen_width = width;
-    host->graphic_ctx.screen_height = height;
     host->window = static_cast<SDL_Window*>(window.context);
     host->host_context = window.context;
-    host->host_extensions.assign(window.extensions.begin(), window.extensions.end());
-    host->host_create_surface = &KytyShim::CreateHostSurface;
-    host->host_get_instance_proc_addr = KytyShim::LoadVulkanLoader();
-    Common::InitializeThreads();
-    host->CreateVulkan();
-    auto driver = std::make_unique<Libs::VideoOut::VideoOutDriver>(window.width, window.height, *host->presenter);
-    host->render_context->InitializeGpu(driver.get());
-    if (!host->render_context->GetGpu().Pipelined()) throw std::runtime_error("kyty presentation: the GPU must run pipelined (KYTY GPU pipeline stages must include the command processor)");
+    host->RecreateSurface();
+    vk::Bool32 supported = VK_FALSE;
+    if (host->graphic_ctx.physical_device.getSurfaceSupportKHR(host->graphic_ctx.queue_family, host->surface, &supported) != vk::Result::eSuccess || supported != VK_TRUE) throw std::runtime_error("kyty presentation: the Vulkan queue the Kyty renderer selected cannot present to this window");
+    KytyShim::Present::UpdateDrawableSize(*host, window);
+    host->presenter->AttachSurface();
     std::lock_guard lock(state.mutex);
-    state.window = std::move(host);
-    state.driver = std::move(driver);
     state.windowHandle = window.context;
-    state.attached.notify_all();
 }
 
 extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::PresentationWindow& window, const AgcDriver::DisplayBuffer& buffer, const AgcDriver::DisplayBuffer* plane, void (*gpuReady)(void*), void* context) {
     if (gpuReady == nullptr || context == nullptr) throw std::runtime_error("kyty presentation: missing GPU completion callback");
     if (plane != nullptr) throw std::runtime_error("kyty presentation: the overlay video plane is not presented with ANYPS5_GPU_BACKEND=kyty");
-    auto& host = KytyShim::AttachedWindow(window);
-    KytyShim::UpdateDrawableSize(host, window);
-    const auto info = KytyShim::DisplayImageInfo(buffer);
+    auto& host = KytyShim::Present::AttachedWindow(window);
+    KytyShim::Present::UpdateDrawableSize(host, window);
+    const auto info = KytyShim::Present::DisplayImageInfo(buffer);
     const bool hdr = Libs::Graphics::IsHdrVideoOutPixelFormat(buffer.pixelFormat);
     struct Prepared {
         std::binary_semaphore done{0};
@@ -495,40 +441,23 @@ extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::Presentation
         scheduler.Flush();
     });
     prepared->done.acquire();
-    KytyShim::PresentFrame(host, *prepared->frame, gpuReady, context);
+    presenter.Present(*prepared->frame);
+    gpuReady(context);
 }
 
 extern "C" void AgcDriverPresentClear_nid_postfix(const AgcDriver::PresentationWindow& window, bool opaque, const AgcDriver::DisplayBuffer* plane, void (*gpuReady)(void*), void* context) {
     if (gpuReady == nullptr || context == nullptr) throw std::runtime_error("kyty presentation: missing GPU completion callback");
     if (plane != nullptr) throw std::runtime_error("kyty presentation: the overlay video plane is not presented with ANYPS5_GPU_BACKEND=kyty");
     if (window.width == 0 || window.height == 0) throw std::runtime_error("kyty presentation: invalid output extent");
-    auto& host = KytyShim::AttachedWindow(window);
-    KytyShim::UpdateDrawableSize(host, window);
-    auto& frame = host.presenter->PrepareBlankFrame(window.width, window.height, opaque);
-    KytyShim::PresentFrame(host, frame, gpuReady, context);
+    auto& host = KytyShim::Present::AttachedWindow(window);
+    KytyShim::Present::UpdateDrawableSize(host, window);
+    auto& presenter = *host.presenter;
+    presenter.Present(presenter.PrepareBlankFrame(window.width, window.height, opaque));
+    gpuReady(context);
 }
 
 extern "C" void AgcDriverReleaseWindow_nid_postfix(void* window) {
-    {
-        auto& state = KytyShim::State();
-        std::lock_guard lock(state.mutex);
-        if (state.window == nullptr || state.windowHandle != window) return;
-    }
-    KytyShim::ShutdownPresentation();
-}
-
-extern "C" void AgcDriverTogglePerformanceOverlay_nid_postfix() {
-    static std::atomic<bool> told{false};
-    if (!told.exchange(true)) {
-        std::fprintf(stderr, "[kyty-videoout] the performance overlay is not built with ANYPS5_GPU_BACKEND=kyty\n");
-        std::fflush(stderr);
-    }
-}
-
-extern "C" void AgcDriverSetSystemOverlay_nid_postfix(const ImeKeyboardView* view) {
-    if (view != nullptr) throw std::runtime_error("kyty presentation: the on-screen keyboard is not drawn with ANYPS5_GPU_BACKEND=kyty");
-}
-
-extern "C" void AgcDriverSetSystemDialog_nid_postfix(const ModalDialogView* view) {
-    if (view != nullptr) throw std::runtime_error("kyty presentation: system dialogs are not drawn with ANYPS5_GPU_BACKEND=kyty");
+    auto& state = KytyShim::Present::State();
+    std::lock_guard lock(state.mutex);
+    if (window != nullptr && state.windowHandle == window) state.windowHandle = nullptr;
 }

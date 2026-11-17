@@ -121,7 +121,9 @@ static bool CheckFormat(vk::PhysicalDevice device, vk::Format format,
 
 static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR surface) {
 	EXIT_IF(device == nullptr);
+#if !defined(ANYPS5_KYTY)
 	EXIT_IF(surface == nullptr);
+#endif
 
 	uint32_t queue_family_count = 0;
 	device.getQueueFamilyProperties(&queue_family_count, nullptr);
@@ -132,6 +134,11 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 	for (uint32_t family = 0; family < queue_family_count; family++) {
 		const auto& properties             = queue_families[family];
 		vk::Bool32  presentation_supported = VK_FALSE;
+#if defined(ANYPS5_KYTY)
+		if (surface == nullptr) {
+			presentation_supported = VK_TRUE;
+		} else
+#endif
 		RequireVulkanSuccess(device.getSurfaceSupportKHR(family, surface, &presentation_supported),
 		                     "vkGetPhysicalDeviceSurfaceSupportKHR");
 
@@ -152,7 +159,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
                                      vk::PhysicalDevice& out_device, uint32_t& out_queue_family,
                                      std::string& out_rejections) {
 	EXIT_IF(instance == nullptr);
+#if !defined(ANYPS5_KYTY)
 	EXIT_IF(surface == nullptr);
+#endif
 
 	auto devices = EnumerateVulkan<vk::PhysicalDevice>(
 	    "vkEnumeratePhysicalDevices", [&](uint32_t* count, vk::PhysicalDevice* values) {
@@ -904,7 +913,9 @@ static void VulkanCheckInstanceVersion() {
 }
 
 void WindowContext::CreateVulkan() {
+#if !defined(ANYPS5_KYTY)
 	EXIT_IF(window == nullptr);
+#endif
 	EXIT_IF(graphic_ctx.instance != nullptr);
 	EXIT_IF(graphic_ctx.physical_device != nullptr);
 	EXIT_IF(graphic_ctx.device != nullptr);
@@ -1007,7 +1018,9 @@ void WindowContext::CreateVulkan() {
 		}
 	}
 
+#if !defined(ANYPS5_KYTY)
 	RecreateSurface();
+#endif
 
 	auto device_extensions = RequiredDeviceExtensions();
 
