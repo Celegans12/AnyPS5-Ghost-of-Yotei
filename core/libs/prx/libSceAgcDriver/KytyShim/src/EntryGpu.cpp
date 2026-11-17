@@ -1,0 +1,460 @@
+#include "prx/libSceAgcDriver/KytyShim/src/EntryApi.hpp"
+#include "prx/libSceAgcDriver/KytyShim/src/EntryPure.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
+#include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/HostThread.hpp"
+#include "prx/libc/include/Shutdown.hpp"
+#include "prx/libkernel/Time/include/SleepWake.hpp"
+
+#include "common/emulatorConfig.h"
+#include "common/threads.h"
+#include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/presentation/presenter.h"
+#include "graphics/presentation/videoOut.h"
+#include "graphics/presentation/window.h"
+#include "kernel/memory.h"
+#include "libs/agc.h"
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cerrno>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <map>
+#include <mutex>
+#include <shared_mutex>
+#include <span>
+#include <stdexcept>
+#include <string>
+#include <system_error>
+#include <utility>
+#include <vector>
+#include <sys/mman.h>
+
+namespace KytyShim {
+
+void StartRuntime();
+void RouteInterrupts(Libs::Graphics::RenderContext& renderer);
+void InstallFaultChain();
+void RemoveFaultChain();
+
+}
+
+namespace KytyShim::Entry {
+
+namespace {
+
+Libs::Graphics::RenderContext* g_renderer = nullptr;
+
+}
+
+}
+
+namespace Libs::Graphics {
+
+using KytyShim::Entry::g_renderer;
+
+void Initialize() {
+    if (g_renderer != nullptr) throw std::runtime_error("kyty GPU backend: Libs::Graphics::Initialize called twice");
+    KytyShim::InstallFaultChain();
+    const auto width = Config::GetScreenWidth();
+    const auto height = Config::GetScreenHeight();
+    auto& presenter = WindowInit(width, height);
+    auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
+    g_renderer = &presenter.Renderer();
+    g_renderer->InitializeGpu(&video_out);
+    KytyShim::RouteInterrupts(*g_renderer);
+}
+
+void Shutdown() {
+    if (g_renderer == nullptr) throw std::runtime_error("kyty GPU backend: Libs::Graphics::Shutdown without Initialize");
+    g_renderer->ShutdownGpu();
+    VideoOut::VideoOutShutdown();
+    WindowShutdown();
+    KytyShim::RemoveFaultChain();
+    g_renderer = nullptr;
+}
+
+}
+
+namespace KytyShim::Entry {
+
+namespace {
+
+constexpr std::uint32_t ComputeQueueBase = 0x20;
+constexpr std::uint32_t ComputeQueueCount = 7 * 8;
+constexpr std::uint64_t DriverMemoryAddress = 0xfe0000000ull + GuestArena::GuestAddressOffset;
+constexpr std::size_t DriverMemoryBytes = 2u << 20u;
+constexpr std::uint64_t FsTableAddress = DriverMemoryAddress + 0x40000ull;
+constexpr std::uint64_t FsTableSlots = 6u;
+constexpr std::uint64_t FsTableSlotBytes = 16u;
+constexpr std::uint64_t FsRoutineRecords = 8u;
+constexpr std::uint64_t FsRoutineRecordBytes = 16u;
+constexpr std::uint64_t FsRoutineTableAddress = FsTableAddress + FsTableSlots * FsTableSlotBytes;
+constexpr std::uint64_t FsRoutineAddress = FsRoutineTableAddress + FsRoutineRecords * FsRoutineRecordBytes;
+constexpr std::uint32_t ScalarSetpcB64LinkS14 = 0xbe80200eu;
+constexpr std::uint32_t ScalarEndProgram = 0xbf810000u;
+constexpr std::uint64_t FsTableDword3 = 0x5204u;
+constexpr std::size_t FlipSlotCount = 1024;
+constexpr auto StopGateTimeout = std::chrono::seconds(2);
+
+void require(bool condition, const char* reason) {
+    if (!condition) throw std::runtime_error(reason);
+}
+
+struct FlipSlots {
+    alignas(64) std::array<std::array<std::uint32_t, AgcDriver::FlipPacketWords>, FlipSlotCount> words{};
+    std::array<std::atomic<bool>, FlipSlotCount> busy{};
+    std::atomic<std::size_t> next{0};
+    std::mutex mutex;
+    std::condition_variable freed;
+};
+
+struct PendingEopFlip {
+    std::uint32_t token = 0;
+    AgcDriver::FlipInfo info{};
+};
+
+struct State {
+    std::mutex startMutex;
+    std::atomic<Libs::Graphics::RenderContext*> renderer{nullptr};
+    std::atomic<bool> stopped{false};
+    std::shared_timed_mutex gate;
+    std::mutex outputsMutex;
+    std::map<std::uint32_t, std::shared_ptr<AgcDriver::IVideoOutput>> outputs;
+    std::mutex eopMutex;
+    std::uint32_t nextEopToken = AgcDriver::EopFlipTokenBase;
+    std::vector<PendingEopFlip> eopFlips;
+    FlipSlots flipSlots;
+    std::mutex vulkanLoader;
+};
+
+State& state() {
+    static auto* instance = new State();
+    return *instance;
+}
+
+void CheckStopping() {
+    if (state().stopped.load(std::memory_order_acquire) || LibcShutdownToken_nid_postfix().stop_requested()) throw ProcessShutdown{};
+}
+
+void MapDriverMemory() {
+    void* mapped = mmap(reinterpret_cast<void*>(DriverMemoryAddress), DriverMemoryBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+    if (mapped == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map the AGC driver memory");
+    if (reinterpret_cast<std::uint64_t>(mapped) != DriverMemoryAddress) throw std::runtime_error("the AGC driver memory was not mapped at its fixed address");
+    auto* routineTable = reinterpret_cast<std::uint64_t*>(FsRoutineTableAddress);
+    for (std::uint64_t record = 0; record < FsRoutineRecords; ++record) {
+        routineTable[record * 2u] = FsRoutineAddress;
+        routineTable[record * 2u + 1u] = 0u;
+    }
+    auto* routine = reinterpret_cast<std::uint32_t*>(FsRoutineAddress);
+    routine[0] = ScalarSetpcB64LinkS14;
+    routine[1] = ScalarEndProgram;
+    auto* slot = reinterpret_cast<std::uint64_t*>(FsTableAddress);
+    slot[0] = (FsRoutineTableAddress & 0xffffffffffffull) | 16ull << 48u;
+    slot[1] = FsTableDword3 << 32u | FsRoutineRecords;
+    GuestAllocations::Mutation mutation;
+    mutation.Add(mapped, DriverMemoryBytes, true, true, true);
+}
+
+void EnsureDriverMemory() {
+    static std::once_flag once;
+    std::call_once(once, MapDriverMemory);
+}
+
+void StopGpu() {
+    auto& s = state();
+    std::unique_lock gate(s.gate, std::defer_lock);
+    const bool exclusive = gate.try_lock_for(StopGateTimeout);
+    s.stopped.store(true, std::memory_order_release);
+    std::lock_guard start(s.startMutex);
+    if (s.renderer.load(std::memory_order_acquire) == nullptr) return;
+    if (!exclusive) {
+        std::fprintf(stderr, "[kyty] GPU shutdown: a submission was still inside the GPU 2 s into the shutdown; leaving the Kyty GPU running until the process exits\n");
+        std::fflush(stderr);
+        return;
+    }
+    std::exception_ptr failure;
+    auto thread = Libc::StartHostThread([&failure] {
+        try {
+            Libs::Graphics::Shutdown();
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    thread.join();
+    s.renderer.store(nullptr, std::memory_order_release);
+    if (failure) std::rethrow_exception(failure);
+}
+
+void StopGpuAtExit() {
+    try {
+        StopGpu();
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[kyty] GPU shutdown failed: %s\n", error.what());
+        std::fflush(stderr);
+    }
+}
+
+std::uint32_t* AcquireFlipSlot() {
+    auto& slots = state().flipSlots;
+    for (;;) {
+        const auto start = slots.next.fetch_add(1, std::memory_order_relaxed);
+        for (std::size_t probe = 0; probe < FlipSlotCount; ++probe) {
+            const auto index = (start + probe) % FlipSlotCount;
+            bool expected = false;
+            if (slots.busy[index].compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return slots.words[index].data();
+        }
+        CheckStopping();
+        std::unique_lock lock(slots.mutex);
+        slots.freed.wait_for(lock, std::chrono::milliseconds(100));
+    }
+}
+
+void SubmitWords(Libs::Graphics::GuestGpu& gpu, std::span<const std::uint32_t> commands, std::uint32_t queue) {
+    if (commands.empty()) return;
+    if (queue == 0) gpu.Submit(commands);
+    else gpu.SubmitCompute(queue, commands);
+}
+
+void SubmitFlipPacket(Libs::Graphics::GuestGpu& gpu, const AgcDriver::FlipInfo& info) {
+    auto* words = AcquireFlipSlot();
+    const auto packet = EncodeFlipPacket(info);
+    std::copy(packet.begin(), packet.end(), words);
+    gpu.Submit(std::span<const std::uint32_t>(words, packet.size()));
+}
+
+void RequireOutput(std::uint32_t handle, const char* reason) {
+    auto& s = state();
+    std::lock_guard lock(s.outputsMutex);
+    require(s.outputs.contains(handle), reason);
+}
+
+void Submit(std::span<const std::uint32_t> commands, std::uint32_t queue) {
+    auto& s = state();
+    std::shared_lock gate(s.gate);
+    CheckStopping();
+    std::vector<EopFlipPoint> points;
+    std::vector<AgcDriver::FlipInfo> flips;
+    {
+        std::lock_guard lock(s.eopMutex);
+        if (!s.eopFlips.empty()) {
+            std::vector<std::uint32_t> tokens;
+            tokens.reserve(s.eopFlips.size());
+            for (const auto& flip : s.eopFlips) tokens.push_back(flip.token);
+            points = FindEopFlipPoints(commands, tokens);
+            require(queue == 0 || points.empty(), "EOP flips on async queues are not implemented");
+            if (points.empty()) {
+                if (const auto inner = FindIndirectEopToken(commands, tokens)) {
+                    char text[200];
+                    std::snprintf(text, sizeof(text), "kyty GPU backend: the end-of-pipe release of EOP flip token 0x%08x is inside an indirect buffer; only releases in the submitted command buffer itself are supported", *inner);
+                    throw std::runtime_error(text);
+                }
+            }
+            for (const auto& point : points) {
+                const auto found = std::find_if(s.eopFlips.begin(), s.eopFlips.end(), [&](const PendingEopFlip& flip) { return flip.token == point.token; });
+                flips.push_back(found->info);
+                s.eopFlips.erase(found);
+            }
+        }
+    }
+    auto& gpu = Gpu();
+    std::size_t begin = 0;
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        SubmitWords(gpu, commands.subspan(begin, points[i].end - begin), queue);
+        SubmitFlipPacket(gpu, flips[i]);
+        begin = points[i].end;
+    }
+    SubmitWords(gpu, commands.subspan(begin), queue);
+}
+
+}
+
+Libs::Graphics::RenderContext& Renderer() {
+    auto& s = state();
+    if (auto* renderer = s.renderer.load(std::memory_order_acquire)) return *renderer;
+    std::lock_guard lock(s.startMutex);
+    if (auto* renderer = s.renderer.load(std::memory_order_acquire)) return *renderer;
+    CheckStopping();
+    EnsureDriverMemory();
+    std::exception_ptr failure;
+    Libs::Graphics::RenderContext* started = nullptr;
+    auto thread = Libc::StartHostThread([&failure, &started] {
+        try {
+            KytyShim::StartRuntime();
+            Common::InitializeThreads();
+            Libs::Graphics::Initialize();
+            started = g_renderer;
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    thread.join();
+    if (failure) std::rethrow_exception(failure);
+    static std::once_flag registered;
+    std::call_once(registered, [] { LibcRegisterShutdown_nid_postfix(&StopGpuAtExit); });
+    s.renderer.store(started, std::memory_order_release);
+    return *started;
+}
+
+Libs::Graphics::GuestGpu& Gpu() {
+    return Renderer().GetGpu();
+}
+
+bool GpuStarted() {
+    return state().renderer.load(std::memory_order_acquire) != nullptr;
+}
+
+std::shared_ptr<AgcDriver::IVideoOutput> VideoOutput(std::uint32_t handle) {
+    auto& s = state();
+    std::lock_guard lock(s.outputsMutex);
+    const auto found = s.outputs.find(handle);
+    return found == s.outputs.end() ? nullptr : found->second;
+}
+
+bool OwnsFlipPacket(const std::uint32_t* packet) {
+    const auto& words = state().flipSlots.words;
+    const auto* first = words.front().data();
+    const auto* end = words.back().data() + AgcDriver::FlipPacketWords;
+    return packet >= first && packet < end && (packet - first) % AgcDriver::FlipPacketWords == 0;
+}
+
+void ReleaseFlipPacket(const std::uint32_t* packet) {
+    auto& slots = state().flipSlots;
+    const auto index = static_cast<std::size_t>(packet - slots.words.front().data()) / AgcDriver::FlipPacketWords;
+    slots.busy[index].store(false, std::memory_order_release);
+    std::lock_guard lock(slots.mutex);
+    slots.freed.notify_one();
+}
+
+}
+
+namespace AgcDriver {
+
+void Submit(const Packet* packet, std::uint32_t queue) try {
+    KernelNoteGpuSubmit_nid_no_patch();
+    KytyShim::Entry::CheckMappedRange(packet, sizeof(Packet), alignof(Packet));
+    const auto descriptor = *packet;
+    if (descriptor.flags != 0) throw std::runtime_error("nonzero submission flags are not implemented");
+    if (queue != 0 && (queue < KytyShim::Entry::ComputeQueueBase || queue >= KytyShim::Entry::ComputeQueueBase + KytyShim::Entry::ComputeQueueCount)) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "kyty GPU backend: queue 0x%x is outside Kyty's graphics queue and its 56 compute queues (0x20-0x57)", queue);
+        throw std::runtime_error(text);
+    }
+    if (descriptor.dw_num == 0) return;
+    if (descriptor.addr == nullptr) throw std::runtime_error("null command buffer");
+    KytyShim::Entry::CheckMappedRange(descriptor.addr, std::size_t{descriptor.dw_num} * sizeof(std::uint32_t), alignof(std::uint32_t));
+    KytyShim::Entry::Submit(std::span<const std::uint32_t>(descriptor.addr, descriptor.dw_num), queue);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
+}
+
+}
+
+extern "C" void AgcDriverSubmitGraphics_nid_postfix(std::uint32_t* commands, std::uint32_t dwords) {
+    const Packet packet{commands, dwords, 0, {}};
+    AgcDriver::Submit(&packet, 0);
+}
+
+extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
+    auto& s = KytyShim::Entry::state();
+    std::shared_lock gate(s.gate);
+    KytyShim::Entry::CheckStopping();
+    KytyShim::Entry::Gpu().SuspendPoint();
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
+}
+
+extern "C" void AgcDriverWaitIdle_nid_postfix() try {
+    auto& s = KytyShim::Entry::state();
+    std::shared_lock gate(s.gate);
+    KytyShim::Entry::CheckStopping();
+    if (!KytyShim::Entry::GpuStarted()) return;
+    auto& renderer = KytyShim::Entry::Renderer();
+    auto& gpu = renderer.GetGpu();
+    gpu.WaitForIdle();
+    gpu.SendCommandSync([&renderer] {
+        auto& scheduler = renderer.GetCommandScheduler();
+        if (scheduler.Active()) scheduler.Finish();
+    });
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
+}
+
+extern "C" void AgcDriverShutdown_nid_postfix() {
+    KytyShim::Entry::StopGpu();
+}
+
+extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info) try {
+    auto& s = KytyShim::Entry::state();
+    std::shared_lock gate(s.gate);
+    KytyShim::Entry::CheckStopping();
+    KytyShim::Entry::RequireOutput(info.handle, "flip references an unregistered video output");
+    KytyShim::Entry::SubmitFlipPacket(KytyShim::Entry::Gpu(), info);
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
+}
+
+extern "C" std::uint32_t AgcDriverReserveEopFlip_nid_postfix(const AgcDriver::FlipInfo& info) {
+    auto& s = KytyShim::Entry::state();
+    KytyShim::Entry::CheckStopping();
+    KytyShim::Entry::RequireOutput(info.handle, "EOP flip references an unregistered video output");
+    std::lock_guard lock(s.eopMutex);
+    if (s.eopFlips.size() >= KytyShim::Entry::PendingEopFlipLimit) return 0;
+    KytyShim::Entry::require(s.nextEopToken <= AgcDriver::EopFlipTokenLimit, "EOP flip token space exhausted");
+    const auto token = s.nextEopToken++;
+    s.eopFlips.push_back({token, info});
+    return token;
+}
+
+extern "C" void AgcDriverRegisterVideoOutput_nid_postfix(std::uint32_t handle, const std::shared_ptr<AgcDriver::IVideoOutput>& output) {
+    KytyShim::Entry::require(output != nullptr, "null video output");
+    KytyShim::Entry::CheckStopping();
+    auto& s = KytyShim::Entry::state();
+    std::lock_guard lock(s.outputsMutex);
+    KytyShim::Entry::require(s.outputs.emplace(handle, output).second, "video output already registered");
+}
+
+extern "C" void AgcDriverUnregisterVideoOutput_nid_postfix(std::uint32_t handle, const std::shared_ptr<AgcDriver::IVideoOutput>& output) {
+    auto& s = KytyShim::Entry::state();
+    {
+        std::lock_guard lock(s.outputsMutex);
+        const auto found = s.outputs.find(handle);
+        KytyShim::Entry::require(found != s.outputs.end() && found->second == output, "video output registration mismatch");
+        s.outputs.erase(found);
+    }
+    std::lock_guard lock(s.eopMutex);
+    std::erase_if(s.eopFlips, [handle](const KytyShim::Entry::PendingEopFlip& flip) { return flip.info.handle == handle; });
+}
+
+extern "C" void* AgcDriverStaticTable_nid_postfix() {
+    KytyShim::Entry::EnsureDriverMemory();
+    return reinterpret_cast<void*>(KytyShim::Entry::FsTableAddress);
+}
+
+extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address, std::size_t bytes) {
+    if (Libs::LibKernel::Memory::GuestRangeWatched(address, bytes)) static_cast<void>(Libs::LibKernel::Memory::TryPrepareHostWrite(address, bytes));
+}
+
+extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std::uint64_t value) {
+    KytyShim::Entry::CheckMappedRange(pointer, sizeof(*pointer), std::atomic_ref<std::uint64_t>::required_alignment);
+    const auto address = reinterpret_cast<std::uint64_t>(pointer);
+    if (Libs::LibKernel::Memory::GuestRangeWatched(address, sizeof(*pointer))) static_cast<void>(Libs::LibKernel::Memory::TryPrepareHostWrite(address, sizeof(*pointer)));
+    std::atomic_ref(*pointer).store(value, std::memory_order_release);
+    Libs::LibKernel::Memory::NoteEmulatorWrite(address, sizeof(*pointer));
+}
+
+extern "C" void AgcDriverLockVulkanLoader_nid_postfix() {
+    KytyShim::Entry::state().vulkanLoader.lock();
+}
+
+extern "C" void AgcDriverUnlockVulkanLoader_nid_postfix() {
+    KytyShim::Entry::state().vulkanLoader.unlock();
+}
