@@ -62,7 +62,7 @@
 #ifdef __linux__
 #include <dlfcn.h>
 #endif
-#include "prx/libc/include/general/AtomicSharedPtr.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ProtectedSnapshot.hpp"
 
 namespace AgcDriver::Graphics {
 
@@ -752,7 +752,10 @@ using WriteRanges = Recorder::WriteRanges;
 // work. A range leaves the snapshot only after its batch's completions (CPU write-backs) ran, so a
 // reader that sees no overlap either precedes the note (the queues are unordered then, as on the
 // GPU) or follows the write-back.
-AtomicSharedPtr<const WriteRanges> pendingWrites;
+ProtectedSnapshot<WriteRanges>& PendingWrites() {
+    static auto* snapshot = new ProtectedSnapshot<WriteRanges>();
+    return *snapshot;
+}
 
 bool HookSnapshotEnabled() {
     // Debug aid: APS5_NO_HOOK_SNAPSHOT=1 takes the GpuMutex on every access as before.
@@ -772,13 +775,11 @@ bool SnapshotOverlaps(std::uint64_t address, std::size_t bytes) {
     if (PendingPages::Verifying()) {
         const auto sequence = PendingPages::Sequence(PendingPages::Layer::Recorder);
         const bool clear = PendingPages::Clear(PendingPages::Layer::Recorder, address, bytes);
-        const auto snapshot = pendingWrites.load(std::memory_order_acquire);
-        const bool overlaps = SnapshotOverlaps(snapshot.get(), address, bytes);
+        const bool overlaps = PendingWrites().Read([&](const WriteRanges* snapshot) { return SnapshotOverlaps(snapshot, address, bytes); });
         PendingPages::Compare(PendingPages::Layer::Recorder, sequence, clear, overlaps, address, bytes);
         return overlaps;
     }
-    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
-    return SnapshotOverlaps(snapshot.get(), address, bytes);
+    return PendingWrites().Read([&](const WriteRanges* snapshot) { return SnapshotOverlaps(snapshot, address, bytes); });
 }
 
 // Whether one merged range of the snapshot contains [address, end) entirely.
@@ -789,8 +790,7 @@ bool SnapshotCovers(const WriteRanges* snapshot, std::uint64_t address, std::uin
 }
 
 bool SnapshotCovers(std::uint64_t address, std::uint64_t end) {
-    const auto snapshot = pendingWrites.load(std::memory_order_acquire);
-    return SnapshotCovers(snapshot.get(), address, end);
+    return PendingWrites().Read([&](const WriteRanges* snapshot) { return SnapshotCovers(snapshot, address, end); });
 }
 
 // Attribution of the pending-write syncs the hook makes (the [hooksync] line every 10 s, under
@@ -1841,7 +1841,7 @@ Recorder::~Recorder() {
     holdKept.clear();
     if (activeRecorder == this) {
         activeRecorder = nullptr;
-        const auto forget = [] { pendingWrites.store(nullptr, std::memory_order_release); };
+        const auto forget = [] { PendingWrites().Store(nullptr); };
         if (PendingPages::Armed()) PendingPages::Replace(PendingPages::Layer::Recorder, std::span<const PendingPages::Range>{}, forget);
         else forget();
         publishGeneration.fetch_add(1, std::memory_order_release);
@@ -2784,7 +2784,7 @@ bool Recorder::SnapshotWriteOverlaps(std::uint64_t address, std::size_t bytes) {
 }
 
 std::shared_ptr<const Recorder::WriteRanges> Recorder::PendingWriteSnapshot() {
-    return pendingWrites.load(std::memory_order_acquire);
+    return PendingWrites().Load();
 }
 
 bool Recorder::SnapshotOverlaps(const WriteRanges* snapshot, std::uint64_t address, std::size_t bytes) {
@@ -5224,7 +5224,7 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
         return;
     }
     const auto started = DrawProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    const auto previous = pendingWrites.load(std::memory_order_acquire);
+    const auto previous = PendingWrites().Load();
     const auto owned = publishedWriteRanges.lock();
     const bool extend = !additions.empty() && previous != nullptr && previous == owned && publishedWriteRangesValid &&
         std::all_of(additions.begin(), additions.end(), [](const auto& range) { return range.second > range.first; });
@@ -5264,7 +5264,7 @@ void Recorder::publishPendingWrites(std::span<const std::pair<std::uint64_t, std
     publishedWriteRangesValid = std::all_of(merged->begin(), merged->end(), [](const auto& range) { return range.second > range.first; });
     publishedWriteRanges = merged;
     published = merged;
-    const auto store = [&] { pendingWrites.store(std::move(merged), std::memory_order_release); };
+    const auto store = [&] { PendingWrites().Store(std::move(merged)); };
     if (!PendingPages::Armed()) {
         store();
     } else if (extend) {

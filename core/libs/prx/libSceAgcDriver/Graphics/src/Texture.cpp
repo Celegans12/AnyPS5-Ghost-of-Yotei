@@ -8,7 +8,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/SlimMutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libc/include/General.hpp"
-#include "prx/libc/include/general/AtomicSharedPtr.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/ProtectedSnapshot.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DeviceFault.hpp"
 #include "prx/libc/include/HostThreadSlot.hpp"
@@ -1897,8 +1897,7 @@ public:
     }
     std::uint64_t Version() const { return version; }
     bool SurelyClear(std::uint64_t address, std::size_t bytes) const {
-        const auto current = published.load(std::memory_order_acquire);
-        return current != nullptr && current->version == changes.load(std::memory_order_acquire) && !Overlaps(current->ranges, address, bytes);
+        return published.Read([&](const Snapshot* current) { return current != nullptr && current->version == changes.load(std::memory_order_acquire) && !Overlaps(current->ranges, address, bytes); });
     }
 
 private:
@@ -1930,14 +1929,14 @@ private:
         }
         ranges.resize(merged);
         indexed = version;
-        published.store(std::make_shared<const Snapshot>(Snapshot{version, ranges}), std::memory_order_release);
+        published.Store(std::make_shared<const Snapshot>(Snapshot{version, ranges}));
     }
     std::vector<StorageTexture*> textures;
     Ranges ranges;
     std::uint64_t version = 0;
     std::uint64_t indexed = ~std::uint64_t{0};
     std::atomic<std::uint64_t> changes{0};
-    AtomicSharedPtr<const Snapshot> published;
+    ProtectedSnapshot<Snapshot> published;
 };
 
 // Storage images whose results have not reached guest memory yet.

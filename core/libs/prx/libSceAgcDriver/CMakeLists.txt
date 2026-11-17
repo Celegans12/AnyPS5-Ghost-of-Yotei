@@ -457,6 +457,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineJournal.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/RuntimeSwitches.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PendingPages.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ProtectedSnapshot.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/BlockRing.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/BlockWriter.cpp
