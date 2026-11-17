@@ -7,12 +7,17 @@
 #include "prx/libkernel/include/Api.hpp"
 
 #include <algorithm>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <source_location>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -146,9 +151,14 @@ void TestDirect() {
     Require(Memory::TryReadBacking(Address(alias) + 77, &byte, 1) && byte == 0x5a);
     Require(static_cast<std::uint8_t*>(alias)[77] == 0x5a);
 
-    const auto stats = Memory::GetDebugStats();
+    auto stats = Memory::GetDebugStats();
+    for (int attempt = 0; attempt < 500 && stats.direct_allocated < bytes; ++attempt) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        stats = Memory::GetDebugStats();
+    }
     Require(stats.direct_total == sceKernelGetDirectMemorySize());
     Require(stats.direct_allocated >= bytes && stats.direct_mapped >= 2 * bytes);
+    Require(stats.flexible_total != 0);
 
     Require(sceKernelMunmap(Address(alias), bytes) == 0);
     Require(!Memory::IsBackingReadable(Address(alias), bytes));
@@ -179,9 +189,16 @@ void TestGpuHooks() {
 void TestRuntimeMemory() {
     const auto address = Memory::AllocateRuntimeMemory(0, Page * 2, Common::VirtualMemory::Mode::ReadWrite, "kyty shim test");
     Require(address != 0 && Memory::IsBackingReadable(address, Page * 2));
+    Require(!Memory::IsGuestExecutable(address));
     Require(Memory::FreeGuestMemory(address, Page * 2));
     Require(!Memory::IsBackingReadable(address, Page * 2));
-    std::printf("runtime memory 0x%llx: allocated with a backing, freed\n", static_cast<unsigned long long>(address));
+
+    const auto code = Memory::AllocateRuntimeMemory(0, Page * 2, Common::VirtualMemory::Mode::ExecuteReadWrite, "kyty shim code");
+    Require(code != 0 && Memory::IsGuestExecutable(code) && Memory::IsGuestExecutable(code + Page * 2 - 1));
+    Require(!Memory::IsGuestExecutable(code + Page * 2));
+    Require(Memory::FreeGuestMemory(code, Page * 2));
+    Require(!Memory::IsGuestExecutable(code));
+    std::printf("runtime memory 0x%llx: allocated with a backing, freed; code 0x%llx executable until freed\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(code));
 }
 
 void TestUnreportedPrivateMemory() {
@@ -206,6 +223,141 @@ void TestUnreportedPrivateMemory() {
     std::printf("arena memory 0x%llx committed outside libkernel: no second view, read as private memory\n", static_cast<unsigned long long>(address));
 }
 
+class GpuThread {
+public:
+    GpuThread() : m_thread([this] { Run(); }) {}
+
+    GpuThread(const GpuThread&) = delete;
+    GpuThread& operator=(const GpuThread&) = delete;
+
+    ~GpuThread() {
+        {
+            std::lock_guard lock(m_mutex);
+            m_stop = true;
+        }
+        m_wake.notify_all();
+        m_thread.join();
+    }
+
+    bool RunSync(std::function<void()> job, std::chrono::seconds limit) {
+        std::unique_lock lock(m_mutex);
+        m_job = std::move(job);
+        m_done = false;
+        m_wake.notify_all();
+        return m_finished.wait_for(lock, limit, [this] { return m_done; });
+    }
+
+private:
+    void Run() {
+        std::unique_lock lock(m_mutex);
+        for (;;) {
+            m_wake.wait(lock, [this] { return m_stop || m_job != nullptr; });
+            if (m_job == nullptr) return;
+            auto job = std::move(m_job);
+            m_job = nullptr;
+            lock.unlock();
+            job();
+            lock.lock();
+            m_done = true;
+            m_finished.notify_all();
+        }
+    }
+
+    std::mutex m_mutex;
+    std::condition_variable m_wake;
+    std::condition_variable m_finished;
+    std::function<void()> m_job;
+    bool m_done = false;
+    bool m_stop = false;
+    std::thread m_thread;
+};
+
+struct CrossWait {
+    GpuThread* gpu = nullptr;
+    std::uint8_t* heap = nullptr;
+    std::uint64_t hole = 0;
+    std::uint64_t code = 0;
+    std::vector<std::uint8_t> heapBytes;
+    int jobs = 0;
+};
+
+CrossWait g_crossWait;
+
+void ReadOnGpuThread() {
+    const auto& wait = g_crossWait;
+    const auto heap = Address(wait.heap);
+    std::vector<std::uint8_t> read(Page * 2, 0xcc);
+    Require(Memory::IsFullyMapped(heap, Page));
+    Require(!Memory::IsFullyMapped(wait.hole, Page));
+    Require(!Memory::IsFullyMapped(heap, Page * 2));
+    Require(Memory::ClampRangeSize(heap, Page) == Page);
+    Require(Memory::ClampRangeSize(heap, Page * 2) == Page);
+    Require(Memory::CopySparseMemory(heap, read.data(), Page * 2));
+    Require(std::memcmp(read.data(), wait.heapBytes.data(), Page) == 0);
+    Require(std::all_of(read.begin() + Page, read.end(), [](std::uint8_t byte) { return byte == 0; }));
+    Require(!Memory::TryReadSparseBacking(heap, read.data(), Page));
+    Require(Memory::TryReadSparseBacking(wait.hole, read.data(), Page));
+    Require(std::all_of(read.begin(), read.begin() + Page, [](std::uint8_t byte) { return byte == 0; }));
+    std::vector<std::pair<const std::uint8_t*, std::uint64_t>> pieces;
+    Require(!Memory::TryGetSparseBackingPieces(heap, Page, pieces));
+    Require(!Libs::LibKernel::Memory::Shim::TryWriteBackedRuns(heap, read.data(), Page));
+    Require(Memory::IsGuestExecutable(wait.code) && !Memory::IsGuestExecutable(heap));
+    (void)Memory::GetDebugStats();
+}
+
+void OnCrossWaitRange(std::uint64_t, std::uint64_t) {
+    if (g_crossWait.gpu == nullptr) return;
+    if (!g_crossWait.gpu->RunSync(&ReadOnGpuThread, std::chrono::seconds(10))) {
+        std::fprintf(stderr, "KytyShim memory: the GPU thread stayed blocked for 10 s while a projection hook waited for it under the locks of libkernel\n");
+        std::abort();
+    }
+    ++g_crossWait.jobs;
+}
+
+void TestNoCrossWaitWithGpuThread() {
+    void* block = GuestArena::GuestArenaAllocate_nid_postfix(Page * 3, Page);
+    Require(block != nullptr);
+    GuestArena::GuestArenaCommit_nid_postfix(block, Page, 0x04, Page);
+    g_crossWait.heap = static_cast<std::uint8_t*>(block);
+    g_crossWait.hole = Address(block) + Page * 2;
+    g_crossWait.heapBytes.resize(Page);
+    Fill(g_crossWait.heapBytes, 57);
+    std::memcpy(g_crossWait.heap, g_crossWait.heapBytes.data(), Page);
+    g_crossWait.code = Memory::AllocateRuntimeMemory(0, Page, Common::VirtualMemory::Mode::ExecuteReadWrite, "kyty shim cross wait");
+    Require(g_crossWait.code != 0);
+
+    GpuThread gpu;
+    Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(&OnCrossWaitRange, &OnCrossWaitRange);
+    g_crossWait.gpu = &gpu;
+
+    constexpr std::size_t bytes = 1024 * 1024;
+    int64_t phys = -1;
+    Require(sceKernelAllocateDirectMemory(0, static_cast<int64_t>(sceKernelGetDirectMemorySize()), bytes, 0, 0, &phys) == 0 && phys >= 0);
+    void* direct = nullptr;
+    const auto beforeDirect = g_crossWait.jobs;
+    Require(sceKernelMapDirectMemory(&direct, bytes, CpuReadWrite | GpuReadWrite, 0, phys, 0) == 0 && direct != nullptr);
+    Require(g_crossWait.jobs > beforeDirect);
+    const auto beforeUnmap = g_crossWait.jobs;
+    Require(sceKernelMunmap(Address(direct), bytes) == 0);
+    Require(g_crossWait.jobs > beforeUnmap);
+    Require(sceKernelReleaseDirectMemory(phys, bytes) == 0);
+
+    void* flexible = nullptr;
+    Require(sceKernelMapFlexibleMemory(&flexible, Page * 2, CpuReadWrite, 0) == 0 && flexible != nullptr);
+    const auto beforeReplace = g_crossWait.jobs;
+    void* replaced = flexible;
+    Require(sceKernelMapFlexibleMemory(&replaced, Page * 2, CpuReadWrite, MapFixed) == 0 && replaced == flexible);
+    Require(g_crossWait.jobs >= beforeReplace + 2);
+    Require(sceKernelMunmap(Address(flexible), Page * 2) == 0);
+
+    g_crossWait.gpu = nullptr;
+    Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(nullptr, nullptr);
+    Require(Memory::FreeGuestMemory(g_crossWait.code, Page));
+    GuestArena::GuestArenaReset_nid_postfix(block, Page * 3);
+    GuestArena::GuestArenaRelease_nid_postfix(block, Page * 3);
+    std::printf("projection hooks under the locks of libkernel: %d synchronous GPU-thread reads of unreported, unmapped and code pages finished\n", g_crossWait.jobs);
+}
+
 }
 
 int main() {
@@ -215,6 +367,7 @@ int main() {
     TestGpuHooks();
     TestRuntimeMemory();
     TestUnreportedPrivateMemory();
+    TestNoCrossWaitWithGpuThread();
     std::printf("KytyShim memory: all checks passed\n");
     return 0;
 }

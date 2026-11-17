@@ -358,6 +358,7 @@ void ZeroReusedPhysical(std::uint64_t start, std::size_t bytes) {
 struct GuestView {
     std::atomic<bool> enabled{false};
     std::atomic<DirectMemoryViewObserver> observer{nullptr};
+    std::atomic<DirectMemoryProtectionObserver> protectionObserver{nullptr};
     int file = -1;
     std::size_t guestBytes = 0;
     std::size_t viewBytes = 0;
@@ -1176,6 +1177,9 @@ void RecordProtection(const void* addr, size_t len, int prot) {
     std::lock_guard lock(g_protectionLock);
     EraseProtections(start, start + len);
     if (prot >= 0) g_protections.emplace(start, ProtectedRange{start + len, ReportedProtection(prot)});
+#if defined(ANYPS5_KYTY)
+    if (const auto observer = View().protectionObserver.load(std::memory_order_acquire)) observer(start, len, prot >= 0 ? ReportedProtection(prot) : -1);
+#endif
 }
 
 void* MapAligned(void* addr, size_t len, int prot, int flags, size_t alignment) {
@@ -1981,5 +1985,32 @@ bool DirectMemoryEnableView_nid_no_patch(DirectMemoryViewObserver observer, std:
     *guestBytes = guestView.guestBytes;
     *viewBytes = guestView.viewBytes;
     return true;
+}
+
+void DirectMemoryWatchProtections_nid_no_patch(DirectMemoryProtectionObserver observer) {
+    std::lock_guard lock(g_protectionLock);
+    View().protectionObserver.store(observer, std::memory_order_release);
+    if (observer == nullptr) return;
+    for (const auto& [start, range] : g_protections) observer(start, range.end - start, range.prot);
+}
+
+std::size_t DirectMemorySize_nid_no_patch() {
+    return DirectMemorySize();
+}
+
+bool DirectMemoryFind_nid_no_patch(std::int64_t offset, bool findNext, std::int64_t* start, std::int64_t* end, int* memoryType) {
+    return DirectMemoryFind(offset, findNext, start, end, memoryType);
+}
+
+void GuestPageTableUsage_nid_no_patch(std::uint64_t granularity, std::uint64_t* cpuEntries, std::uint64_t* gpuEntries) {
+    GuestPageTableUsage(granularity, cpuEntries, gpuEntries);
+}
+
+int DoMapAnon_nid_no_patch(void** addr, std::size_t len, int prot, int flags, std::size_t alignment, bool exclusive) {
+    return DoMapAnon(addr, len, prot, flags, alignment, exclusive);
+}
+
+int DoMunmap_nid_no_patch(void* addr, std::size_t len) {
+    return DoMunmap(addr, len);
 }
 #endif

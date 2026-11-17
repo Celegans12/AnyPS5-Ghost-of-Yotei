@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "MemoryShim.hpp"
+#include "prx/libc/include/GuestArena.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/include/Api.hpp"
 
@@ -9,16 +10,20 @@
 #include <atomic>
 #include <cerrno>
 #include <cinttypes>
+#include <condition_variable>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <thread>
 #include <utility>
 #include <vector>
 
 #include <sys/mman.h>
+#include <sys/uio.h>
+#include <unistd.h>
 
 namespace Libs::LibKernel::Memory {
 
@@ -30,6 +35,9 @@ constexpr uint64_t PageMask = PageSize - 1u;
 constexpr uint64_t BucketPages = uint64_t {1} << 16u;
 constexpr uint64_t BucketCount = ((kExtendedMemoryBase + kExtendedMemorySize) >> PageBits) / BucketPages;
 constexpr uint32_t PrivateEntry = ~uint32_t {0};
+constexpr uint64_t HostPageSize = 0x1000;
+constexpr uint64_t HostPageMask = HostPageSize - 1u;
+constexpr size_t ProbeBatch = 512;
 
 class PageTable {
 public:
@@ -79,6 +87,40 @@ public:
 		return false;
 	}
 
+	void StoreExecutable(uint64_t start, uint64_t end, bool executable) {
+		for (auto host = start & ~HostPageMask; host < end; host += HostPageSize) {
+			const auto page = host >> PageBits;
+			if (page / BucketPages >= BucketCount) return;
+			auto& bucket = m_exec[page / BucketPages];
+			auto* bits = bucket.load(std::memory_order_acquire);
+			if (bits == nullptr) {
+				if (!executable) {
+					host = (((page / BucketPages + 1u) * BucketPages) << PageBits) - HostPageSize;
+					continue;
+				}
+				auto* created = new std::atomic<uint8_t>[BucketPages] {};
+				if (bucket.compare_exchange_strong(bits, created, std::memory_order_acq_rel)) {
+					bits = created;
+				} else {
+					delete[] created;
+				}
+			}
+			const auto bit = static_cast<uint8_t>(1u << ((host >> 12u) & 3u));
+			if (executable) {
+				bits[page % BucketPages].fetch_or(bit, std::memory_order_relaxed);
+			} else {
+				bits[page % BucketPages].fetch_and(static_cast<uint8_t>(~bit), std::memory_order_relaxed);
+			}
+		}
+	}
+
+	[[nodiscard]] bool Executable(uint64_t vaddr) const {
+		const auto page = vaddr >> PageBits;
+		if (page / BucketPages >= BucketCount) return false;
+		const auto* bits = m_exec[page / BucketPages].load(std::memory_order_acquire);
+		return bits != nullptr && (bits[page % BucketPages].load(std::memory_order_relaxed) & (1u << ((vaddr >> 12u) & 3u))) != 0;
+	}
+
 	template <typename Run>
 	void ForEachMappedRun(Run&& run) const {
 		uint64_t start = 0;
@@ -103,12 +145,16 @@ public:
 
 private:
 	std::array<std::atomic<std::atomic<uint32_t>*>, BucketCount> m_buckets {};
+	std::array<std::atomic<std::atomic<uint8_t>*>, BucketCount> m_exec {};
 };
 
 struct ViewState {
 	uint8_t* base = nullptr;
 	uint64_t guest_bytes = 0;
 	uint64_t view_bytes = 0;
+	uint64_t arena_start = 0;
+	uint64_t arena_end = 0;
+	pid_t pid = 0;
 	std::atomic<bool> enabled {false};
 };
 
@@ -165,28 +211,110 @@ void ForEachRun(uint64_t vaddr, uint64_t size, Region&& region, Gap&& gap) {
 	}
 }
 
-bool PageGuestMapped(uint64_t page_address) {
-	const auto entry = Pages().Load(page_address >> PageBits);
-	if (entry != 0) return true;
-	try {
-		return GuestRangeMapped(page_address, page_address + PageSize);
-	} catch (const std::exception&) {
-		return false;
+size_t ReadOwnMemory(const iovec& local, const iovec* remote, size_t count) {
+	const auto read = ::process_vm_readv(State().pid, &local, 1, remote, count, 0);
+	if (read >= 0) return static_cast<size_t>(read);
+	if (errno != EFAULT) Shim::Fail("KytyShim memory: process_vm_readv on guest memory failed: %s\n", std::strerror(errno));
+	return 0;
+}
+
+uint64_t ReadablePrefix(uint64_t start, uint64_t end) {
+	for (auto cursor = start; cursor < end;) {
+		std::array<iovec, ProbeBatch> remote {};
+		std::array<char, ProbeBatch> sink {};
+		size_t count = 0;
+		for (auto page = cursor; page < end && count < ProbeBatch; page = (page | HostPageMask) + 1u) {
+			remote[count++] = {reinterpret_cast<void*>(static_cast<std::uintptr_t>(page)), 1};
+		}
+		const iovec local {sink.data(), count};
+		const auto read = ReadOwnMemory(local, remote.data(), count);
+		if (read < count) return reinterpret_cast<std::uintptr_t>(remote[read].iov_base) - start;
+		cursor = (reinterpret_cast<std::uintptr_t>(remote[count - 1u].iov_base) | HostPageMask) + 1u;
+	}
+	return end - start;
+}
+
+uint64_t UnreportedMappedPrefix(uint64_t start, uint64_t end) {
+	const auto& state = State();
+	if (start < state.arena_start || start >= state.arena_end) return 0;
+	return ReadablePrefix(start, std::min(end, state.arena_end));
+}
+
+bool AnyUnreportedMapped(uint64_t start, uint64_t end) {
+	const auto& state = State();
+	end = std::min(end, state.arena_end);
+	for (auto cursor = std::max(start, state.arena_start); cursor < end; cursor = (cursor | HostPageMask) + 1u) {
+		if (ReadablePrefix(cursor, end) != 0) return true;
+	}
+	return false;
+}
+
+void CopyReadable(uint64_t start, uint8_t* destination, uint64_t bytes) {
+	const auto end = start + bytes;
+	for (auto cursor = start; cursor < end;) {
+		std::array<iovec, ProbeBatch> remote {};
+		size_t count = 0;
+		auto stop = cursor;
+		while (stop < end && count < ProbeBatch) {
+			const auto next = std::min(end, (stop | HostPageMask) + 1u);
+			remote[count++] = {reinterpret_cast<void*>(static_cast<std::uintptr_t>(stop)), next - stop};
+			stop = next;
+		}
+		const iovec local {destination + (cursor - start), stop - cursor};
+		cursor += ReadOwnMemory(local, remote.data(), count);
+		if (cursor < stop) {
+			const auto skipped = std::min(end, (cursor | HostPageMask) + 1u);
+			std::memset(destination + (cursor - start), 0, skipped - cursor);
+			cursor = skipped;
+		}
 	}
 }
 
+void CopyUnreported(uint64_t start, uint8_t* destination, uint64_t bytes) {
+	const auto& state = State();
+	const auto end = start + bytes;
+	const auto low = std::max(start, state.arena_start);
+	const auto high = std::min(end, state.arena_end);
+	if (low >= high) {
+		std::memset(destination, 0, bytes);
+		return;
+	}
+	std::memset(destination, 0, low - start);
+	CopyReadable(low, destination + (low - start), high - low);
+	std::memset(destination + (high - start), 0, end - high);
+}
+
 void CopyGuestPages(uint64_t start, uint8_t* destination, uint64_t bytes) {
+	const auto& pages = Pages();
 	const auto end = start + bytes;
 	for (auto cursor = start; cursor < end;) {
-		const auto page = cursor & ~PageMask;
-		const auto stop = std::min(end, page + PageSize);
-		if (PageGuestMapped(page)) {
+		const bool reported = pages.Load(cursor >> PageBits) == PrivateEntry;
+		auto stop = std::min(end, (cursor | PageMask) + 1u);
+		while (stop < end && (pages.Load(stop >> PageBits) == PrivateEntry) == reported) stop = std::min(end, stop + PageSize);
+		if (reported) {
 			std::memcpy(destination + (cursor - start), reinterpret_cast<const void*>(cursor), stop - cursor);
 		} else {
-			std::memset(destination + (cursor - start), 0, stop - cursor);
+			CopyUnreported(cursor, destination + (cursor - start), stop - cursor);
 		}
 		cursor = stop;
 	}
+}
+
+uint64_t MappedPrefix(uint64_t vaddr, uint64_t size) {
+	const auto& pages = Pages();
+	const auto end = vaddr + size;
+	auto cursor = vaddr;
+	while (cursor < end) {
+		if (pages.Load(cursor >> PageBits) != 0) {
+			cursor = std::min(end, (cursor | PageMask) + 1u);
+			continue;
+		}
+		auto stop = std::min(end, (cursor | PageMask) + 1u);
+		while (stop < end && pages.Load(stop >> PageBits) == 0) stop = std::min(end, stop + PageSize);
+		cursor += UnreportedMappedPrefix(cursor, stop);
+		if (cursor < stop) break;
+	}
+	return cursor - vaddr;
 }
 
 int HostProtection(Common::VirtualMemory::Mode mode) {
@@ -242,6 +370,76 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 	if (g_map_hook != nullptr) g_map_hook(address, bytes);
 }
 
+void OnProtectionChange(std::uintptr_t address, std::size_t bytes, int protection) {
+	if (UINT64_MAX - address < bytes) {
+		Shim::Fail("KytyShim memory: libkernel reported a protection change 0x%016" PRIx64 "+0x%zx past the address space\n", static_cast<uint64_t>(address), bytes);
+	}
+	Pages().StoreExecutable(address, address + bytes, protection >= 0 && (protection & 0x04) != 0);
+}
+
+struct KernelStats {
+	uint64_t direct_allocated = 0;
+	uint64_t flexible_total = 0;
+	uint64_t flexible_used = 0;
+	uint64_t cpu_page_entries = 0;
+	uint64_t gpu_page_entries = 0;
+};
+
+KernelStats SampleKernelStats() {
+	KernelStats stats;
+	int64_t start = 0;
+	int64_t end = 0;
+	int type = 0;
+	for (int64_t offset = 0; DirectMemoryFind_nid_no_patch(offset, true, &start, &end, &type) && end > offset; offset = end) {
+		stats.direct_allocated += static_cast<uint64_t>(end - start);
+	}
+	size_t configured = 0;
+	size_t available = 0;
+	if (sceKernelConfiguredFlexibleMemorySize(&configured) != 0 || sceKernelAvailableFlexibleMemorySize(&available) != 0) {
+		Shim::Fail("KytyShim memory: libkernel did not report the flexible memory sizes\n");
+	}
+	stats.flexible_total = configured;
+	stats.flexible_used = configured - std::min(configured, available);
+	constexpr uint64_t TableGranularity = 2ull * 1024ull * 1024ull;
+	GuestPageTableUsage_nid_no_patch(TableGranularity, &stats.cpu_page_entries, &stats.gpu_page_entries);
+	return stats;
+}
+
+class KernelStatsSampler {
+public:
+	KernelStats Request() {
+		std::call_once(m_started, [this] { std::thread([this] { Run(); }).detach(); });
+		std::lock_guard lock(m_mutex);
+		m_requested = true;
+		m_wake.notify_one();
+		return m_latest;
+	}
+
+private:
+	[[noreturn]] void Run() {
+		std::unique_lock lock(m_mutex);
+		for (;;) {
+			m_wake.wait(lock, [this] { return m_requested; });
+			m_requested = false;
+			lock.unlock();
+			const auto sample = SampleKernelStats();
+			lock.lock();
+			m_latest = sample;
+		}
+	}
+
+	std::once_flag m_started;
+	std::mutex m_mutex;
+	std::condition_variable m_wake;
+	bool m_requested = false;
+	KernelStats m_latest;
+};
+
+KernelStatsSampler& StatsSampler() {
+	static auto* sampler = new KernelStatsSampler;
+	return *sampler;
+}
+
 void EnableView() {
 	auto& state = State();
 	uint8_t* view = nullptr;
@@ -254,9 +452,16 @@ void EnableView() {
 	} catch (const std::exception& error) {
 		Shim::Fail("KytyShim memory: enabling the second view of guest memory failed: %s\n", error.what());
 	}
+	std::uintptr_t arena_base = 0;
+	std::size_t arena_bytes = 0;
+	GuestArena::GuestArenaRange_nid_postfix(&arena_base, &arena_bytes);
+	state.arena_start = arena_base;
+	state.arena_end = arena_base + arena_bytes;
+	state.pid = ::getpid();
 	state.base = view;
 	state.guest_bytes = guest_bytes;
 	state.view_bytes = view_bytes;
+	DirectMemoryWatchProtections_nid_no_patch(&OnProtectionChange);
 	state.enabled.store(true, std::memory_order_release);
 }
 
@@ -298,7 +503,7 @@ bool OverlapsPrivate(uint64_t vaddr, uint64_t size) {
 	for (auto page = vaddr & ~PageMask; page < end; page += PageSize) {
 		const auto entry = pages.Load(page >> PageBits);
 		if (entry == PrivateEntry) return true;
-		if (entry == 0 && PageGuestMapped(page)) return true;
+		if (entry == 0 && AnyUnreportedMapped(std::max(page, vaddr & ~HostPageMask), std::min(page + PageSize, (end + HostPageMask) & ~HostPageMask))) return true;
 	}
 	return false;
 }
@@ -411,30 +616,9 @@ bool BackingChangesSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_
 	return true;
 }
 
-static uint64_t MappedPrefix(uint64_t vaddr, uint64_t size) {
-	const auto end = vaddr + size;
-	auto cursor = vaddr;
-	while (cursor < end) {
-		const auto page = cursor & ~PageMask;
-		if (!PageGuestMapped(page)) break;
-		cursor = std::min(end, page + PageSize);
-	}
-	return cursor - vaddr;
-}
-
-static bool GuestMapped(uint64_t vaddr, uint64_t size) {
-	try {
-		return GuestRangeMapped(vaddr, vaddr + size);
-	} catch (const std::exception&) {
-		return false;
-	}
-}
-
 bool IsFullyMapped(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) return size == 0;
-	if (Shim::IsBacked(vaddr, size)) return true;
-	if (!Pages().AnyMapped(vaddr, size) && GuestMapped(vaddr, size)) return true;
-	return MappedPrefix(vaddr, size) == size;
+	return Shim::IsBacked(vaddr, size) || MappedPrefix(vaddr, size) == size;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
@@ -499,8 +683,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 }
 
 bool IsGuestExecutable(uint64_t vaddr) {
-	int protection = 0;
-	return GuestProtection(static_cast<std::uintptr_t>(vaddr), &protection) && (protection & 0x04) != 0;
+	return Pages().Executable(vaddr);
 }
 
 uint64_t WaitForTransientUnmap(uint64_t) noexcept {
@@ -516,7 +699,7 @@ uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size, Common::Virt
 	if (size == 0 || size > UINT64_MAX - PageMask || name == nullptr || (fixed && (search_addr == 0 || (search_addr & PageMask) != 0))) return 0;
 	void* address = reinterpret_cast<void*>(static_cast<std::uintptr_t>(search_addr));
 	try {
-		if (DoMapAnon(&address, (size + PageMask) & ~PageMask, GuestProtectionBits(mode), fixed ? GuestMapFixed : 0, PageSize, fixed) != 0) return 0;
+		if (DoMapAnon_nid_no_patch(&address, (size + PageMask) & ~PageMask, GuestProtectionBits(mode), fixed ? GuestMapFixed : 0, PageSize, fixed) != 0) return 0;
 	} catch (const std::exception& error) {
 		std::fprintf(stderr, "KytyShim memory: runtime memory \"%s\" of 0x%" PRIx64 " bytes not mapped: %s\n", name, size, error.what());
 		return 0;
@@ -527,7 +710,7 @@ uint64_t AllocateRuntimeMemory(uint64_t search_addr, uint64_t size, Common::Virt
 bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 	if (vaddr == 0 || size == 0 || size > UINT64_MAX - PageMask) return false;
 	try {
-		return DoMunmap(reinterpret_cast<void*>(static_cast<std::uintptr_t>(vaddr)), (size + PageMask) & ~PageMask) == 0;
+		return DoMunmap_nid_no_patch(reinterpret_cast<void*>(static_cast<std::uintptr_t>(vaddr)), (size + PageMask) & ~PageMask) == 0;
 	} catch (const std::exception& error) {
 		Shim::Fail("KytyShim memory: freeing runtime memory 0x%016" PRIx64 "+0x%" PRIx64 " failed: %s\n", vaddr, size, error.what());
 	}
@@ -535,13 +718,13 @@ bool FreeGuestMemory(uint64_t vaddr, uint64_t size) {
 
 DebugStats GetDebugStats() {
 	DebugStats stats {};
-	stats.direct_total = DirectMemorySize();
-	int64_t start = 0;
-	int64_t end = 0;
-	int type = 0;
-	for (int64_t offset = 0; DirectMemoryFind(offset, true, &start, &end, &type) && end > offset; offset = end) {
-		stats.direct_allocated += static_cast<uint64_t>(end - start);
-	}
+	stats.direct_total = DirectMemorySize_nid_no_patch();
+	const auto kernel = StatsSampler().Request();
+	stats.direct_allocated = kernel.direct_allocated;
+	stats.flexible_total = kernel.flexible_total;
+	stats.flexible_used = kernel.flexible_used;
+	stats.cpu_page_entries = kernel.cpu_page_entries;
+	stats.gpu_page_entries = kernel.gpu_page_entries;
 	const auto guest_bytes = State().guest_bytes;
 	Pages().ForEachMappedRun([&](uint64_t run_start, uint64_t run_size) {
 		for (auto page = run_start; page < run_start + run_size; page += PageSize) {
@@ -549,14 +732,6 @@ DebugStats GetDebugStats() {
 			if (entry != 0 && (uint64_t {entry - 1u} << PageBits) >= guest_bytes) stats.direct_mapped += PageSize;
 		}
 	});
-	size_t configured = 0;
-	size_t available = 0;
-	if (sceKernelConfiguredFlexibleMemorySize(&configured) == 0 && sceKernelAvailableFlexibleMemorySize(&available) == 0) {
-		stats.flexible_total = configured;
-		stats.flexible_used = configured - std::min(configured, available);
-	}
-	constexpr uint64_t TableGranularity = 2ull * 1024ull * 1024ull;
-	GuestPageTableUsage(TableGranularity, &stats.cpu_page_entries, &stats.gpu_page_entries);
 	return stats;
 }
 
