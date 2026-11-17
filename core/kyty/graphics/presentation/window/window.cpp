@@ -1,5 +1,5 @@
-#if !defined(ANYPS5_KYTY)
-﻿#include "graphics/presentation/window.h"
+﻿#if !defined(ANYPS5_KYTY)
+#include "graphics/presentation/window.h"
 
 #include "common/assert.h"
 #include "common/common.h"

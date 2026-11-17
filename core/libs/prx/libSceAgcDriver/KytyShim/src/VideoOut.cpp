@@ -25,10 +25,13 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <deque>
 #include <exception>
+#include <functional>
 #include <future>
 #include <map>
 #include <memory>
@@ -36,6 +39,7 @@
 #include <semaphore>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -59,6 +63,7 @@ struct PresentationState {
     std::map<std::uint64_t, std::shared_ptr<AgcDriver::IFlipRequest>> flips;
     std::uint64_t nextFlip = 1;
     void* windowHandle = nullptr;
+    bool attaching = false;
     VkSurfaceKHR (*createSurface)(void* context, VkInstance instance) = nullptr;
 };
 
@@ -85,9 +90,45 @@ PresentationState& State() {
     LibcTerminate_nid_no_patch(1);
 }
 
-template <typename Blocking>
-void WaitRunningUrgentCommands(Blocking&& blocking) {
-    auto waiting = std::async(std::launch::async, std::forward<Blocking>(blocking));
+class BlockingWaiter {
+public:
+    BlockingWaiter() {
+        std::thread([this] { run(); }).detach();
+    }
+
+    std::future<void> Start(std::function<void()> blocking) {
+        std::packaged_task<void()> task(std::move(blocking));
+        auto done = task.get_future();
+        {
+            std::lock_guard lock(mutex);
+            tasks.push_back(std::move(task));
+        }
+        ready.notify_one();
+        return done;
+    }
+
+private:
+    void run() {
+        for (;;) {
+            std::packaged_task<void()> task;
+            {
+                std::unique_lock lock(mutex);
+                ready.wait(lock, [this] { return !tasks.empty(); });
+                task = std::move(tasks.front());
+                tasks.pop_front();
+            }
+            task();
+        }
+    }
+
+    std::mutex mutex;
+    std::condition_variable ready;
+    std::deque<std::packaged_task<void()>> tasks;
+};
+
+void WaitRunningUrgentCommands(std::function<void()> blocking) {
+    static auto* const waiter = new BlockingWaiter;
+    auto waiting = waiter->Start(std::move(blocking));
     while (waiting.wait_for(std::chrono::microseconds(200)) != std::future_status::ready) {
         Libs::Graphics::GuestGpu::RunUrgentCommandsWhileWaiting();
     }
@@ -400,13 +441,14 @@ extern "C" void AgcDriverAttachWindow_nid_postfix(const AgcDriver::PresentationW
     {
         std::lock_guard lock(state.mutex);
         if (state.window == nullptr) throw std::runtime_error("kyty presentation: the Kyty GPU started without its window context");
-        if (state.windowHandle != nullptr || state.window->surface != nullptr) throw std::runtime_error("kyty presentation: the Kyty presenter is already bound to a window and cannot move to another one");
+        if (state.attaching || state.windowHandle != nullptr || state.window->surface != nullptr) throw std::runtime_error("kyty presentation: the Kyty presenter is already bound to a window and cannot move to another one");
         for (const char* needed : window.extensions) {
             bool enabled = false;
             for (const char* name : state.window->host_extensions) enabled = enabled || std::strcmp(name, needed) == 0;
             if (!enabled) throw std::runtime_error(std::string("kyty presentation: the window needs the Vulkan instance extension ") + needed + ", which the Kyty instance did not enable");
         }
         state.createSurface = window.createSurface;
+        state.attaching = true;
         host = state.window.get();
     }
     host->window = static_cast<SDL_Window*>(window.context);
@@ -418,6 +460,7 @@ extern "C" void AgcDriverAttachWindow_nid_postfix(const AgcDriver::PresentationW
     host->presenter->AttachSurface();
     std::lock_guard lock(state.mutex);
     state.windowHandle = window.context;
+    state.attaching = false;
 }
 
 extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::PresentationWindow& window, const AgcDriver::DisplayBuffer& buffer, const AgcDriver::DisplayBuffer* plane, void (*gpuReady)(void*), void* context) {
