@@ -1,14 +1,17 @@
 #include "kernel/memory.h"
 
 #include "MemoryShim.hpp"
+#include "prx/libc/include/General.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestHeap.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/include/Api.hpp"
 
 #include <algorithm>
 #include <chrono>
+#include <csignal>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -308,6 +311,17 @@ void TestHeapCommitSecondView() {
     std::vector<std::uint8_t> read(bytes, 0xcc);
     Require(Memory::TryReadBacking(address, read.data(), bytes) && read == zeros);
     GuestArena::GuestArenaReset_nid_postfix(heap, bytes);
+
+    const auto beforePartial = Memory::BackingEpoch();
+    bool refused = false;
+    try {
+        GuestArena::GuestArenaCommit_nid_postfix(heap, 0x1000, 0x04, 0x1000);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    Require(refused && Memory::BackingEpoch() == beforePartial && !Memory::IsBackingReadable(address, 0x1000));
+    std::uint8_t byte = 0;
+    Require(!GuestCopyIn_nid_no_patch(&byte, heap, 1));
     GuestArena::GuestArenaRelease_nid_postfix(heap, bytes);
     std::printf("libc arena commit 0x%llx: second view from the guest memory file, dropped on reset, zeroed on recommit, never probed\n", static_cast<unsigned long long>(address));
 }
@@ -395,6 +409,97 @@ void TestUnreportedPrivateMemory() {
     Require(Libs::LibKernel::Memory::Shim::ProbeCalls() == reprobed);
     std::printf("arena memory 0x%llx mapped without telling libkernel: no second view, read as private memory, probed %llu time(s) then remembered until libkernel reports a change\n",
         static_cast<unsigned long long>(address), static_cast<unsigned long long>(probed - firstProbe));
+}
+
+struct CopyFaults {
+    std::uint64_t owned = 0;
+    std::uint64_t sealed = 0;
+    bool raiseDuringPreparation = false;
+    bool openOnPreparation = true;
+    int faults = 0;
+    bool reentered = false;
+    bool nestedOut = true;
+    bool nestedIn = true;
+};
+
+CopyFaults g_copyFaults;
+thread_local bool t_holdsRegion = false;
+
+bool CopyFaultHandler(int, siginfo_t* info, void*) {
+    const auto page = reinterpret_cast<std::uintptr_t>(info->si_addr) & ~std::uintptr_t{Page - 1};
+    if (page != g_copyFaults.owned && page != g_copyFaults.sealed) return false;
+    if (t_holdsRegion) {
+        g_copyFaults.reentered = true;
+        return false;
+    }
+    ++g_copyFaults.faults;
+    return mprotect(reinterpret_cast<void*>(page), Page, PROT_READ | PROT_WRITE) == 0;
+}
+
+void NestedCopies(int) {
+    const std::uint64_t value = 0x5151;
+    g_copyFaults.nestedOut = GuestCopyOut_nid_no_patch(reinterpret_cast<void*>(g_copyFaults.owned + 64), &value, sizeof(value));
+    std::uint64_t read = 0;
+    g_copyFaults.nestedIn = GuestCopyIn_nid_no_patch(&read, reinterpret_cast<const void*>(g_copyFaults.sealed), sizeof(read));
+}
+
+bool CopyPreparer(std::uintptr_t, std::size_t) {
+    t_holdsRegion = true;
+    if (g_copyFaults.raiseDuringPreparation) raise(SIGUSR2);
+    if (g_copyFaults.openOnPreparation) Require(mprotect(reinterpret_cast<void*>(g_copyFaults.owned), Page, PROT_READ | PROT_WRITE) == 0);
+    t_holdsRegion = false;
+    return true;
+}
+
+void ProtectOwned(int protection) {
+    Require(mprotect(reinterpret_cast<void*>(g_copyFaults.owned), Page, protection) == 0);
+    GuestArena::GuestArenaNoteHostProtection_nid_no_patch(g_copyFaults.owned, Page, false);
+}
+
+void TestGuestCopyOut() {
+    void* owned = nullptr;
+    void* sealed = nullptr;
+    Require(sceKernelMapFlexibleMemory(&owned, Page, CpuReadWrite, 0) == 0 && owned != nullptr);
+    Require(sceKernelMapFlexibleMemory(&sealed, Page, CpuReadWrite, 0) == 0 && sealed != nullptr);
+    g_copyFaults = CopyFaults{};
+    g_copyFaults.owned = Address(owned);
+    g_copyFaults.sealed = Address(sealed);
+    Require(mprotect(sealed, Page, PROT_NONE) == 0);
+    struct sigaction nested{};
+    nested.sa_handler = &NestedCopies;
+    sigemptyset(&nested.sa_mask);
+    struct sigaction previous{};
+    Require(sigaction(SIGUSR2, &nested, &previous) == 0);
+    GuestWriteWatch::GuestWriteWatchSetGpuFaultHandler_nid_no_patch(&CopyFaultHandler);
+    GuestArena::GuestArenaSetHostWritePreparer_nid_no_patch(&CopyPreparer);
+
+    g_copyFaults.openOnPreparation = false;
+    ProtectOwned(PROT_READ);
+    const std::uint64_t first = 0x1122334455667788ull;
+    Require(GuestCopyOut_nid_no_patch(static_cast<std::uint8_t*>(owned) + 8, &first, sizeof(first)));
+    Require(g_copyFaults.faults == 1 && std::memcmp(static_cast<std::uint8_t*>(owned) + 8, &first, sizeof(first)) == 0);
+
+    g_copyFaults.openOnPreparation = true;
+    g_copyFaults.raiseDuringPreparation = true;
+    ProtectOwned(PROT_READ);
+    const std::uint64_t second = 0x8877665544332211ull;
+    Require(GuestCopyOut_nid_no_patch(static_cast<std::uint8_t*>(owned) + 16, &second, sizeof(second)));
+    Require(!g_copyFaults.nestedOut && !g_copyFaults.nestedIn && !g_copyFaults.reentered && g_copyFaults.faults == 1);
+    Require(std::memcmp(static_cast<std::uint8_t*>(owned) + 16, &second, sizeof(second)) == 0);
+
+    g_copyFaults.raiseDuringPreparation = false;
+    g_copyFaults.sealed = 0;
+    std::uint64_t value = 7;
+    Require(!GuestCopyOut_nid_no_patch(sealed, &value, sizeof(value)) && !GuestCopyIn_nid_no_patch(&value, sealed, sizeof(value)));
+    Require(g_copyFaults.faults == 1 && !g_copyFaults.reentered);
+
+    GuestArena::GuestArenaSetHostWritePreparer_nid_no_patch(nullptr);
+    GuestWriteWatch::GuestWriteWatchSetGpuFaultHandler_nid_no_patch(nullptr);
+    Require(sigaction(SIGUSR2, &previous, nullptr) == 0);
+    GuestArena::GuestArenaNoteHostProtection_nid_no_patch(g_copyFaults.owned, Page, true);
+    Require(sceKernelMunmap(Address(owned), Page) == 0 && sceKernelMunmap(Address(sealed), Page) == 0);
+    std::printf("GuestCopyOut 0x%llx: direct write reopened by the GPU fault path; nested in a preparation, writes and reads fall back to the system call without faulting; a sealed page returns false\n",
+        static_cast<unsigned long long>(g_copyFaults.owned));
 }
 
 class GpuThread {
@@ -547,6 +652,7 @@ int main() {
     TestHeapBlockEvicted();
     TestHostView();
     TestUnreportedPrivateMemory();
+    TestGuestCopyOut();
     TestNoCrossWaitWithGpuThread();
     std::printf("KytyShim memory: all checks passed\n");
     return 0;

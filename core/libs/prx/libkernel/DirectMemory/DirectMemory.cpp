@@ -413,7 +413,12 @@ bool ViewPlaceable(std::uintptr_t address, std::size_t len) {
 
 void* PlaceArenaRange(void* addr, std::size_t len, int prot) {
     const auto address = reinterpret_cast<std::uintptr_t>(addr);
-    if (!ViewPlaceable(address, len)) return ::mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (!InGuestFile(address, len)) return ::mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (!ViewPlaceable(address, len)) {
+        char message[192];
+        std::snprintf(message, sizeof(message), "guest arena range %p+0x%zx is not made of whole 16 KiB pages, which the second view of guest memory needs", addr, len);
+        throw std::invalid_argument(message);
+    }
     if (prot != PROT_NONE) return MapGuestFile(addr, len, prot);
     NoteView(address, len, DirectMemoryViewReplacing);
     void* placed = ::mmap(addr, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
