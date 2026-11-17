@@ -144,7 +144,7 @@ public:
 
 	void Execute(GpuOperation& operation);
 
-	void WaitForRewind(bool valid);
+	void WaitForRewind(bool valid, const uint32_t* control);
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op);

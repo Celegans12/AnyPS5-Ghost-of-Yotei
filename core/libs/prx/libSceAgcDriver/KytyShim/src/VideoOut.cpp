@@ -16,6 +16,7 @@
 #include "graphics/presentation/window/windowInternal.h"
 #include "libs/errno.h"
 
+#include "prx/libSceAgcDriver/KytyShim/src/Replay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -307,6 +308,10 @@ void WaitRendering(std::uint32_t handle, std::uint32_t index) {
     if (output == nullptr) throw std::runtime_error("kyty presentation: rendering wait on unregistered output " + std::to_string(handle));
     const auto wait = output->CaptureRenderingWait(index);
     WaitRunningUrgentCommands([wait] { wait->Wait(); });
+}
+
+Libs::Graphics::ImageInfo DisplayBufferImage(const AgcDriver::DisplayBuffer& buffer) {
+    return DisplayImageInfo(buffer);
 }
 
 }

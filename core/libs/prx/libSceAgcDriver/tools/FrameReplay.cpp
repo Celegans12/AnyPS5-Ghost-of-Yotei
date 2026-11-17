@@ -31,6 +31,7 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -41,6 +42,7 @@
 #endif
 #ifdef __linux__
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
+#include <pthread.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
@@ -82,6 +84,56 @@ struct Options {
     bool coldPipelines = false;
 };
 
+struct ThreadSample {
+    std::string name;
+    std::uint64_t ns = 0;
+};
+
+std::map<long, ThreadSample> sampleThreads() {
+    std::map<long, ThreadSample> samples;
+#ifdef __linux__
+    std::error_code error;
+    for (const auto& entry : std::filesystem::directory_iterator("/proc/self/task", error)) {
+        std::ifstream comm(entry.path() / "comm");
+        std::ifstream schedstat(entry.path() / "schedstat");
+        ThreadSample sample;
+        if (!std::getline(comm, sample.name) || !(schedstat >> sample.ns)) continue;
+        samples[std::strtol(entry.path().filename().c_str(), nullptr, 10)] = std::move(sample);
+    }
+#endif
+    return samples;
+}
+
+std::map<std::string, std::uint64_t> threadCpu(const std::map<long, ThreadSample>& before, const std::map<long, ThreadSample>& after) {
+    std::map<std::string, std::uint64_t> byName;
+    for (const auto& [thread, sample] : after) {
+        const auto earlier = before.find(thread);
+        const auto start = earlier != before.end() && earlier->second.name == sample.name ? earlier->second.ns : 0;
+        byName[sample.name] += sample.ns > start ? sample.ns - start : 0;
+    }
+    return byName;
+}
+
+constexpr std::array<std::string_view, 8> CounterNames{"draws", "dispatches", "queue_submits", "texture_upload_mib", "buffer_upload_mib", "texture_download_mib", "buffer_download_mib", "gpu_faults"};
+using Counters = std::array<std::uint64_t, CounterNames.size()>;
+
+Counters countersNow() {
+    Counters values{};
+#if defined(ANYPS5_KYTY)
+    static_cast<void>(AgcDriverReplayCounters_nid_postfix(values.data(), values.size()));
+#endif
+    return values;
+}
+
+struct Sample {
+    std::map<long, ThreadSample> threads;
+    Counters counters{};
+};
+
+Sample sampleNow() {
+    return {sampleThreads(), countersNow()};
+}
+
 class Frames {
 public:
     void SetSize(std::uint32_t displayWidth, std::uint32_t displayHeight) {
@@ -91,8 +143,17 @@ public:
 
     void MarkReady() {
         AgcDriverTracePresent_nid_postfix(width, height);
-        std::lock_guard lock(mutex);
-        ready.push_back(Clock::now());
+        {
+            std::lock_guard lock(mutex);
+            ready.push_back(Clock::now());
+        }
+        wake.notify_one();
+    }
+
+    std::vector<Sample> Samples() const {
+        std::unique_lock lock(mutex);
+        sampled.wait_for(lock, std::chrono::seconds(5), [this] { return samples.size() >= ready.size(); });
+        return samples;
     }
 
     void Failed(std::exception_ptr error) {
@@ -111,11 +172,29 @@ public:
     }
 
 private:
+    void sampleLoop(const std::stop_token& stop) {
+#ifdef __linux__
+        pthread_setname_np(pthread_self(), "replaySampler");
+#endif
+        std::unique_lock lock(mutex);
+        while (wake.wait(lock, stop, [this] { return samples.size() < ready.size(); })) {
+            lock.unlock();
+            auto sample = sampleNow();
+            lock.lock();
+            samples.push_back(std::move(sample));
+            sampled.notify_all();
+        }
+    }
+
     mutable std::mutex mutex;
+    std::condition_variable_any wake;
+    mutable std::condition_variable sampled;
     std::vector<Clock::time_point> ready;
+    std::vector<Sample> samples;
     std::exception_ptr failure;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
+    std::jthread sampler{[this](const std::stop_token& stop) { sampleLoop(stop); }};
 };
 
 class ReplayFlip final : public AgcDriver::IFlipRequest {
@@ -123,6 +202,9 @@ public:
     explicit ReplayFlip(Frames& frames) : frames(frames) {}
     void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override { frames.MarkReady(); }
     void Fail(std::exception_ptr error) noexcept override { frames.Failed(error); }
+#if defined(ANYPS5_KYTY)
+    std::optional<AgcDriver::DisplayBuffer> Source() override { return std::nullopt; }
+#endif
 
 private:
     Frames& frames;
@@ -886,6 +968,7 @@ void writeDump(const Dump& dump) {
 
 struct FrameCheck {
     std::size_t compared = 0;
+    std::size_t written = 0;
     double identical = 1.0;
     int maxDifference = 0;
 };
@@ -912,9 +995,15 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
         buffer.dccClearColor = call.values[7];
         buffer.alignment = static_cast<std::uint32_t>(call.values[8]);
         const auto chunk = std::find_if(reader.Chunks().begin(), reader.Chunks().end(), [&](const FrameMemoryChunk& candidate) { return candidate.kind == FrameMemoryKind::Reference && candidate.group == call.values[0]; });
-        if (chunk == reader.Chunks().end()) continue;
+        if (chunk == reader.Chunks().end()) {
+            if (options.frames.empty()) continue;
+            writeFrame(options.frames / ("replay-" + std::to_string(call.values[0]) + ".bmp"), buffer, AgcDriver::ReadDisplayBuffer(buffer));
+            ++check.written;
+            continue;
+        }
         const auto reference = reader.Read(*chunk);
         const auto replayed = AgcDriver::ReadDisplayBuffer(buffer);
+        ++check.written;
         ++check.compared;
         std::size_t same = 0;
         const auto pixels = std::min(reference.size(), replayed.size()) / 4;
@@ -1207,6 +1296,51 @@ struct Pass {
     double seconds = 0.0;
     std::uint64_t paceTimeouts = 0;
     std::uint64_t synthesized = 0;
+    Sample begin;
+    Sample end;
+};
+
+struct Window {
+    std::map<std::string, std::uint64_t> threadNs;
+    Counters counters{};
+    std::size_t frames = 0;
+
+    void Add(const Sample& from, const Sample& to, std::size_t frameCount) {
+        for (const auto& [name, ns] : threadCpu(from.threads, to.threads)) threadNs[name] += ns;
+        for (std::size_t index = 0; index < counters.size(); ++index) counters[index] += to.counters[index] > from.counters[index] ? to.counters[index] - from.counters[index] : 0;
+        frames += frameCount;
+    }
+
+    [[nodiscard]] std::uint64_t Draws() const { return counters[0]; }
+
+    [[nodiscard]] std::string Stages() const {
+        std::vector<std::pair<std::uint64_t, std::string>> busiest;
+        for (const auto& [name, ns] : threadNs) busiest.emplace_back(ns, name);
+        std::sort(busiest.rbegin(), busiest.rend());
+        std::string list;
+        for (std::size_t index = 0; index < std::min<std::size_t>(busiest.size(), 12); ++index) {
+            std::string name;
+            for (const char c : busiest[index].second) name += c == '"' || c == '\\' || static_cast<unsigned char>(c) < 0x20 ? '_' : c;
+            const auto ms = static_cast<double>(busiest[index].first) / 1e6;
+            char entry[256];
+            std::snprintf(entry, sizeof(entry), "%s{\"name\":\"%s\",\"ms_per_frame\":%.3f,\"us_per_draw\":%.3f}", list.empty() ? "" : ",", name.c_str(), frames > 0 ? ms / static_cast<double>(frames) : 0.0,
+                          Draws() > 0 ? ms * 1000.0 / static_cast<double>(Draws()) : 0.0);
+            list += entry;
+        }
+        return list;
+    }
+
+    [[nodiscard]] std::string PerFrame() const {
+        std::string list;
+        for (std::size_t index = 0; index < counters.size(); ++index) {
+            const auto mib = CounterNames[index].ends_with("_mib");
+            const auto value = static_cast<double>(counters[index]) / (mib ? 1024.0 * 1024.0 : 1.0);
+            char entry[96];
+            std::snprintf(entry, sizeof(entry), "%s\"%.*s\":%.1f", list.empty() ? "" : ",", static_cast<int>(CounterNames[index].size()), CounterNames[index].data(), frames > 0 ? value / static_cast<double>(frames) : 0.0);
+            list += entry;
+        }
+        return list;
+    }
 };
 
 double percentile(std::vector<double> values, double fraction) {
@@ -1217,6 +1351,9 @@ double percentile(std::vector<double> values, double fraction) {
 
 int run(const Options& options) {
     const auto loadStart = Clock::now();
+#if defined(ANYPS5_KYTY)
+    AgcDriverTrackSerials_nid_postfix();
+#endif
     const FrameCaptureReader reader(options.directory);
 #ifdef _WIN32
     relaunchIfHostRegionBlocks(reader);
@@ -1237,6 +1374,7 @@ int run(const Options& options) {
     const auto journalStart = Clock::now();
     AgcDriverWaitForPipelineJournal_nid_postfix();
     const auto journalSeconds = std::chrono::duration<double>(Clock::now() - journalStart).count();
+    static_cast<void>(countersNow());
     std::set<std::uint32_t> initialOutputs;
     for (const auto& [handle, output] : replay.outputs) initialOutputs.insert(handle);
     std::vector<Pass> passes;
@@ -1264,11 +1402,13 @@ int run(const Options& options) {
             }
         }
         Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load()};
+        measured.begin = sampleNow();
         replay.recording = true;
         replay.startedAt = Clock::now();
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
         else AgcDriverWaitIdle_nid_postfix();
         replay.endedAt = Clock::now();
+        measured.end = sampleNow();
         if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
         measured.frames = replay.frames.Times().size() - measured.firstFrame;
         measured.seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
@@ -1290,6 +1430,9 @@ int run(const Options& options) {
     std::string passList;
     double seconds = 0.0;
     std::size_t frames = 0;
+    const auto samples = replay.frames.Samples();
+    Window whole;
+    Window steady;
     for (std::size_t index = 0; index < passes.size(); ++index) {
         const auto& measured = passes[index];
         std::vector<double> passMs;
@@ -1303,16 +1446,20 @@ int run(const Options& options) {
         frameMs.insert(frameMs.end(), passMs.begin(), passMs.end());
         seconds += measured.seconds;
         frames += measured.frames;
+        whole.Add(measured.begin, measured.end, measured.frames);
+        for (auto frame = measured.firstFrame + 1; frame < measured.firstFrame + measured.frames && frame < samples.size(); ++frame) steady.Add(samples[frame - 1], samples[frame], 1);
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"park_restores\":%llu,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f}\n",
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"park_restores\":%llu,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f,\"draws\":%llu,\"draws_per_frame\":%.1f,\"frames_written\":%zu,\"stages\":[%s],\"counters_per_frame\":{%s},\"steady\":{\"frames\":%zu,\"draws_per_frame\":%.1f,\"counters_per_frame\":{%s},\"stages\":[%s]}}\n",
                 frames, seconds, seconds > 0 ? static_cast<double>(frames) / seconds : 0.0, percentile(frameMs, 0.5), percentile(frameMs, 0.9), slowest, frameList.c_str(), passList.c_str(),
                 static_cast<unsigned long long>(replay.keptReservations.load()),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.parkRestores.load()), static_cast<unsigned long long>(replay.paceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
-                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds);
+                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds,
+                static_cast<unsigned long long>(whole.Draws()), frames > 0 ? static_cast<double>(whole.Draws()) / static_cast<double>(frames) : 0.0, check.written, whole.Stages().c_str(), whole.PerFrame().c_str(),
+                steady.frames, steady.frames > 0 ? static_cast<double>(steady.Draws()) / static_cast<double>(steady.frames) : 0.0, steady.PerFrame().c_str(), steady.Stages().c_str());
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;
 }
