@@ -5,6 +5,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libkernel/Equeue/Equeue.hpp"
 #include "VulkanTestDevice.hpp"
 #ifdef _WIN32
@@ -56,6 +57,7 @@ std::uint32_t* NewBlock() {
     check(block != nullptr, "cannot allocate a guest block");
     std::memset(block, 0, BlockBytes);
     GuestAllocations::Mutation().Add(block, BlockBytes, true, true, false);
+    if (std::getenv("APS5_EARLY_EOP_READ_TRAP") != nullptr) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(block, BlockBytes);
     return block;
 }
 
@@ -132,6 +134,16 @@ int main() {
             AgcDriverWaitIdle_nid_postfix();
         }
 
+        if (std::getenv("APS5_EARLY_EOP_READ_TRAP") != nullptr && GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
+            check(AgcDriver::Graphics::Recorder::EopReadTrap(), "APS5_EARLY_EOP_READ_TRAP did not install the read traps");
+            const auto traps = AgcDriver::Graphics::Recorder::EopTrapCounts();
+            GuestWriteWatch::ReadTrapCounts host{};
+            GuestWriteWatch::GuestWriteWatchReadTrapCounts_nid_postfix(&host);
+            std::printf("read traps: %llu labels trapped, %llu refused, %llu faults waited, %llu opened under the GPU lock, %llu forced open\n", static_cast<unsigned long long>(traps.trapped), static_cast<unsigned long long>(traps.refused), static_cast<unsigned long long>(host.faults), static_cast<unsigned long long>(host.bypassOpens), static_cast<unsigned long long>(host.forcedOpens));
+            check(traps.trapped != 0, "no end-of-pipe label was delivered early behind read traps");
+            check(host.faults != 0, "no read of the dispatch's result waited on a read trap");
+            check(host.forcedOpens == 0, "a read trap was forced open");
+        }
         check(sceAgcDriverDeleteEqEvent(eq, 0) == 0, "graphics event deletion failed");
         owner.reset();
         check(sceKernelDeleteEqueue(eq) == 0, "event queue deletion failed");

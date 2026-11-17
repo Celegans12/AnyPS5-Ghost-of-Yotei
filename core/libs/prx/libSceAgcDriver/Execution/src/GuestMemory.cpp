@@ -64,12 +64,12 @@
 #include <pthread.h>
 #include <sstream>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <unistd.h>
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
 #ifdef __APPLE__
 #include <mach/mach.h>
 #include <mach/mach_vm.h>
-#include <sys/mman.h>
 #endif
 #endif
 
@@ -1391,6 +1391,7 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
             pages.record(cursor & ~mask, (next + mask) & ~mask, readable, writable, generation, access);
         };
         if (const int fd = HostMapping::QueryFd(); fd >= 0) {
+            const auto trapEpoch = GuestWriteWatch::GuestWriteWatchReadTrapEpoch_nid_postfix();
             procmap_query query{};
             query.size = sizeof(query);
             query.query_flags = PROCMAP_QUERY_COVERING_OR_NEXT_VMA;
@@ -1404,9 +1405,22 @@ bool describePages(std::uintptr_t address, std::size_t bytes, Emit&& emit) {
                     cursor = gapEnd;
                     continue;
                 }
-                const bool readable = (query.vma_flags & PROCMAP_QUERY_VMA_READABLE) != 0;
-                const bool writable = readable && (query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) != 0;
-                const auto next = std::min<std::uintptr_t>(end, query.vma_end);
+                bool readable = (query.vma_flags & PROCMAP_QUERY_VMA_READABLE) != 0;
+                bool writable = readable && (query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) != 0;
+                auto next = std::min<std::uintptr_t>(end, query.vma_end);
+                if (!readable && trapEpoch != 0) {
+                    std::uintptr_t trappedEnd = next;
+                    const int logical = GuestWriteWatch::GuestWriteWatchProtection_nid_postfix(cursor, next, &trappedEnd);
+                    if (logical >= 0) {
+                        readable = (logical & PROT_READ) != 0;
+                        writable = readable && (logical & PROT_WRITE) != 0;
+                        next = std::max(cursor + 1, trappedEnd);
+                    } else if (GuestWriteWatch::GuestWriteWatchReadTrapEpoch_nid_postfix() != trapEpoch) {
+                        continue;
+                    } else if (trappedEnd > cursor && trappedEnd < next) {
+                        next = trappedEnd;
+                    }
+                }
                 recordRun(next, readable, writable);
                 if (!emit(PageRun{cursor, next, readable, writable})) return true;
                 cursor = next;
@@ -4765,6 +4779,18 @@ std::uint64_t StoreOwnBytes(std::uint64_t address, std::size_t bytes, const std:
     });
 }
 
+static bool readTrapped(std::uint64_t address, std::size_t bytes) {
+#ifdef __linux__
+    if (!GuestWriteWatch::GuestWriteWatchReadTrapsHeld_nid_postfix()) return false;
+    std::uintptr_t end = 0;
+    return GuestWriteWatch::GuestWriteWatchProtection_nid_postfix(static_cast<std::uintptr_t>(address), static_cast<std::uintptr_t>(address + bytes), &end) >= 0 || end < address + bytes;
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    return false;
+#endif
+}
+
 static void copyOwnBytes(std::uint64_t address, std::span<const std::byte> source) {
 #ifndef _WIN32
     if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix() && GuestArena::GuestArenaWriteSharedBacking_nid_no_patch(address, source.data(), source.size())) return;
@@ -5935,7 +5961,7 @@ void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
     StoreOwnBytes(address, source.size(), [&](std::span<std::byte> image) {
         CheckRange(destination, source.size(), alignment, true);
-        if (source.size() >= PageBytes) copyOwnBytes(address, source);
+        if (source.size() >= PageBytes || readTrapped(address, source.size())) copyOwnBytes(address, source);
         else std::memcpy(destination, source.data(), source.size());
         if (!image.empty()) std::memcpy(image.data(), source.data(), source.size());
     });

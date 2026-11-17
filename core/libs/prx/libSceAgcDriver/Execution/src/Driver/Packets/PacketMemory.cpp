@@ -15,6 +15,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -628,6 +629,7 @@ struct EopGuardCounts {
     std::array<std::uint64_t, EopProbeKinds> riskyKinds{};
     std::uint64_t lastBegin = 0;
     std::uint64_t lastEnd = 0;
+    std::uint64_t trapHeld = 0;
     double guardMs = 0;
 };
 
@@ -647,7 +649,30 @@ EopGuard& eopGuard() {
     return guard;
 }
 
+void reportEopTraps(std::uint64_t labels, std::uint64_t early, std::uint64_t held) {
+    struct Seen {
+        Graphics::Recorder::EopTrapStatistics driver{};
+        GuestWriteWatch::ReadTrapCounts traps{};
+    };
+    static Seen seen;
+    const auto driver = Graphics::Recorder::EopTrapCounts();
+    GuestWriteWatch::ReadTrapCounts traps{};
+    GuestWriteWatch::GuestWriteWatchReadTrapCounts_nid_postfix(&traps);
+    const auto value = [](std::uint64_t count) { return static_cast<unsigned long long>(count); };
+    const auto trapped = driver.trapped - seen.driver.trapped;
+    const auto faults = traps.faults - seen.traps.faults;
+    const auto resolved = traps.resolved - seen.traps.resolved;
+    const double perTrapped = trapped != 0 ? 1.0 / static_cast<double>(trapped) : 0.0;
+    AgcDriver::ProfilePrint_nid_no_patch("[eop-trap] %llu end-of-pipe labels: %llu delivered at the label, %llu held; read traps set for %llu labels (%.1f page runs, %.0f KiB each), %llu refused by the host, %llu refused for the label's own page, %llu released after the GPU; setting %.3f ms and releasing %.3f ms per trapped label; host: %llu faults waited %.3f ms each (%llu resolutions, %.3f ms each), %llu pages opened under the GPU lock, %llu by the resolving thread, %llu forced open after 5 s, %llu retried after a release, %llu settles before a host access (%llu opened), %llu holds active, %llu traps refused; %llu changing GPU copy sources copied at record (%.0f KiB); verify: %llu CPU write-backs checked, %llu outside the trapped pages\n",
+        value(labels), value(early), value(held), value(trapped), perTrapped * static_cast<double>(driver.ranges - seen.driver.ranges), perTrapped * static_cast<double>(driver.bytes - seen.driver.bytes) / 1024.0, value(driver.refused - seen.driver.refused), value(driver.labelPage - seen.driver.labelPage), value(driver.released - seen.driver.released), perTrapped * static_cast<double>(driver.setNs - seen.driver.setNs) / 1e6, driver.released != seen.driver.released ? static_cast<double>(driver.releaseNs - seen.driver.releaseNs) / 1e6 / static_cast<double>(driver.released - seen.driver.released) : 0.0,
+        value(faults), faults != 0 ? static_cast<double>(traps.waitNs - seen.traps.waitNs) / 1e6 / static_cast<double>(faults) : 0.0, value(resolved), resolved != 0 ? static_cast<double>(traps.resolveNs - seen.traps.resolveNs) / 1e6 / static_cast<double>(resolved) : 0.0,
+        value(traps.bypassOpens - seen.traps.bypassOpens), value(traps.ownOpens - seen.traps.ownOpens), value(traps.forcedOpens - seen.traps.forcedOpens), value(traps.retries - seen.traps.retries), value(traps.settles - seen.traps.settles), value(traps.settleOpens - seen.traps.settleOpens), value(traps.holds), value(traps.refused - seen.traps.refused), value(driver.changingCopies - seen.driver.changingCopies), static_cast<double>(driver.changingCopyBytes - seen.driver.changingCopyBytes) / 1024.0, value(driver.checked - seen.driver.checked), value(driver.uncovered - seen.driver.uncovered));
+    seen.driver = driver;
+    seen.traps = traps;
+}
+
 void reportEopGuard() {
+    if (Graphics::Recorder::EopReadTrap()) reportEopTraps(eopGuard().counts.labels, eopGuard().counts.early, eopGuard().counts.labels - eopGuard().counts.early);
     auto& guard = eopGuard().counts;
     const auto value = [](std::uint64_t count) { return static_cast<unsigned long long>(count); };
     const double perGuard = guard.labels != 0 ? 1.0 / static_cast<double>(guard.labels) : 0.0;
@@ -730,7 +755,7 @@ bool eopGuardRisky(EopGuard& guard, Graphics::Recorder& recorder, const Graphics
     return guard.label < note.quietFrom;
 }
 
-bool eopGuardSettled(bool linearStored) {
+bool eopGuardSettled(bool linearStored, std::vector<EopProbeRange>* trapped) {
     auto& guard = eopGuard();
     auto& counts = guard.counts;
     const auto start = std::chrono::steady_clock::now();
@@ -800,6 +825,22 @@ bool eopGuardSettled(bool linearStored) {
     if (address) {
         ++counts.heldAddress;
         return false;
+    }
+    if (trapped != nullptr && !recorder->HasPendingCopyBacks()) {
+        if (open) {
+            ++counts.heldOpen;
+            return false;
+        }
+        if (flight) {
+            ++counts.heldBehind;
+            return false;
+        }
+        trapped->clear();
+        for (const auto& write : recorder->PendingWritesOver(0, std::numeric_limits<std::size_t>::max())) {
+            if (write.value != Graphics::Recorder::ReachValue) trapped->emplace_back(write.begin, write.end);
+        }
+        ++counts.early;
+        return true;
     }
     if (linearStored) {
         ++counts.heldLinear;
@@ -1209,7 +1250,17 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     const bool judged = earlyInterrupt && interrupt.has_value();
     if (judged && localDevice != nullptr) Graphics::StorageTexture::StoreReadbackBeforeLabel(bytes.empty() ? "readback before interrupt" : "readback before label");
     const bool linearStored = judged && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear(bytes.empty() ? "interrupt" : "label") != 0;
-    const bool early = judged && eopGuardSettled(linearStored);
+    const bool trapping = judged && Graphics::Recorder::EopReadTrap();
+    static std::vector<EopProbeRange> trapRanges;
+    bool early = judged && eopGuardSettled(linearStored, trapping && localDevice != nullptr ? &trapRanges : nullptr);
+    if (early && trapping && localDevice != nullptr) {
+        auto* recorder = Graphics::Recorder::Active();
+        early = recorder != nullptr && recorder->TrapPendingWrites(trapRanges, address, bytes.size());
+        if (!early) {
+            --eopGuard().counts.early;
+            ++eopGuard().counts.trapHeld;
+        }
+    }
     bool workOpen = linearStored || Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
@@ -1239,6 +1290,7 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
             if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0);
         }
         if (auto* recorder = earlyInterrupt ? Graphics::Recorder::Active() : nullptr) recorder->NoteEndOfPipe(early);
+        if (early && trapping && workOpen && localDevice != nullptr) localDevice->SubmitRecorded(queue == 0);
         if (!deferred) deliverGuestEopInterrupt(queue, context);
     }
     submitDueAfterCommit(localDevice.get());

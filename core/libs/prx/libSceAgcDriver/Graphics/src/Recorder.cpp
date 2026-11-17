@@ -34,6 +34,7 @@
 #include "prx/libc/include/RunReport.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/DispatchArguments_spv.h"
 #include <algorithm>
 #include <array>
@@ -1132,6 +1133,8 @@ ReadTrapRegistry& ReadTraps() {
 bool TrapGuestReads(std::uint64_t begin, std::uint64_t end) {
 #ifdef _WIN32
     return GuestArena::GuestArenaTrapReads_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
+#elif defined(__linux__)
+    return GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
 #else
     static_cast<void>(begin);
     static_cast<void>(end);
@@ -1142,6 +1145,8 @@ bool TrapGuestReads(std::uint64_t begin, std::uint64_t end) {
 void ReleaseGuestReads(std::uint64_t begin, std::uint64_t end) {
 #ifdef _WIN32
     GuestArena::GuestArenaReleaseReads_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
+#elif defined(__linux__)
+    GuestWriteWatch::GuestWriteWatchReleaseReads_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
 #else
     static_cast<void>(begin);
     static_cast<void>(end);
@@ -1323,6 +1328,129 @@ bool ResolveReadTrap(std::uintptr_t begin, std::uintptr_t end) {
     return true;
 }
 #endif
+
+bool EopReadTrapRequested() {
+    static const bool requested = std::getenv("APS5_EARLY_EOP_READ_TRAP") != nullptr;
+    return requested;
+}
+
+std::atomic<std::uint64_t> eopTrapLabels{0}, eopTrapTrapped{0}, eopTrapRefused{0}, eopTrapLabelPage{0}, eopTrapRanges{0}, eopTrapBytes{0}, eopTrapReleased{0}, eopTrapFaults{0}, eopTrapNested{0}, eopTrapChecked{0}, eopTrapUncovered{0}, eopTrapSetNs{0}, eopTrapReleaseNs{0}, eopChangingCopies{0}, eopChangingCopyBytes{0};
+std::atomic<bool> guestReadTrapsReady{false};
+
+bool EopReadTrapVerified() {
+    static const bool verified = std::getenv("APS5_VERIFY_EARLY_EOP_READ_TRAP") != nullptr;
+    return verified;
+}
+
+struct EopTrapSpans {
+    std::mutex mutex;
+    std::multimap<std::uint64_t, std::uint64_t> spans;
+    std::uint64_t longest = 0;
+};
+
+EopTrapSpans& ActiveEopTrapSpans() {
+    static auto* spans = new EopTrapSpans;
+    return *spans;
+}
+
+void CheckEopTrapCovers(std::uint64_t address, std::size_t bytes) {
+    if (!EopReadTrapVerified() || bytes == 0) return;
+    auto& active = ActiveEopTrapSpans();
+    std::lock_guard lock(active.mutex);
+    if (active.spans.empty()) return;
+    eopTrapChecked.fetch_add(1, std::memory_order_relaxed);
+    auto cursor = address;
+    const auto end = address + bytes;
+    bool advanced = true;
+    while (cursor < end && advanced) {
+        advanced = false;
+        for (auto it = active.spans.lower_bound(cursor > active.longest ? cursor - active.longest : 0); it != active.spans.end() && it->first <= cursor; ++it) {
+            if (it->second > cursor) {
+                cursor = it->second;
+                advanced = true;
+            }
+        }
+    }
+    if (cursor >= end) return;
+    if (eopTrapUncovered.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[eop-trap] verify: a CPU write-back to 0x%llx+0x%zx landed while a frame was delivered early, outside its trapped pages (first byte left uncovered 0x%llx)\n", static_cast<unsigned long long>(address), bytes, static_cast<unsigned long long>(cursor));
+}
+
+#ifdef __linux__
+void ResolveGuestReadTrap(std::uintptr_t begin, std::uintptr_t end) {
+    eopTrapFaults.fetch_add(1, std::memory_order_relaxed);
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    if (GuestMemory::GpuMutex().HeldByThisThread()) {
+        eopTrapNested.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+    FlushForAccess(begin, bytes);
+    if (ReadTrapOverlaps(begin, bytes)) {
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+            recorder->LandGuardedOver(begin, bytes);
+            recorder->Sync();
+        }
+        return;
+    }
+    for (int round = 0; round < 8; ++round) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        auto* recorder = Recorder::Active();
+        if (recorder == nullptr || !recorder->PendingWriteOverlaps(begin, bytes)) return;
+        Recorder::CountSync(1);
+        recorder->SyncThrough(begin, bytes, true);
+    }
+}
+
+bool InstallGuestReadTraps() {
+    static const bool installed = [] {
+        if (!GuestWriteWatch::GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveGuestReadTrap)) return false;
+        GuestWriteWatch::GuestWriteWatchSetReadTrapBypass_nid_postfix(+[] { return GuestMemory::GpuMutex().HeldByThisThread(); });
+        return true;
+    }();
+    return installed;
+}
+#endif
+
+struct EopTrapHold {
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    bool noted = false;
+    EopTrapHold() = default;
+    EopTrapHold(const EopTrapHold&) = delete;
+    EopTrapHold& operator=(const EopTrapHold&) = delete;
+    void Note() {
+        if (!EopReadTrapVerified()) return;
+        auto& active = ActiveEopTrapSpans();
+        std::lock_guard lock(active.mutex);
+        for (const auto& [begin, end] : ranges) {
+            active.spans.emplace(begin, end);
+            active.longest = std::max(active.longest, end - begin);
+        }
+        noted = true;
+    }
+    void Release() {
+        const auto start = std::chrono::steady_clock::now();
+        if (noted) {
+            auto& active = ActiveEopTrapSpans();
+            std::lock_guard lock(active.mutex);
+            for (const auto& range : ranges) {
+                auto [first, last] = active.spans.equal_range(range.first);
+                while (first != last && first->second != range.second) ++first;
+                if (first != last) active.spans.erase(first);
+            }
+            noted = false;
+        }
+        for (const auto& [begin, end] : ranges) ReleaseGuestReads(begin, end);
+        if (!ranges.empty()) {
+            eopTrapReleased.fetch_add(1, std::memory_order_relaxed);
+            eopTrapReleaseNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
+        }
+        ranges.clear();
+    }
+    ~EopTrapHold() {
+        Release();
+    }
+};
 
 }
 
@@ -1955,6 +2083,8 @@ void Recorder::Activate() {
     GuestMemory::SetStoreHook(&NoteDriverStore);
 #ifdef _WIN32
     if (ReadTrapEnabled()) GuestArena::GuestArenaSetReadTrapResolver_nid_no_patch(&ResolveReadTrap);
+#elif defined(__linux__)
+    if (EopReadTrapRequested() && InstallGuestReadTraps()) guestReadTrapsReady.store(true, std::memory_order_release);
 #endif
 }
 
@@ -5366,6 +5496,77 @@ bool Recorder::EarlyEndOfPipe() {
     return enabled;
 }
 
+bool Recorder::EopReadTrap() {
+#ifdef __linux__
+    return EopReadTrapRequested() && EarlyEndOfPipe() && guestReadTrapsReady.load(std::memory_order_acquire);
+#else
+    return false;
+#endif
+}
+
+Recorder::EopTrapStatistics Recorder::EopTrapCounts() {
+    return {eopTrapLabels.load(std::memory_order_relaxed), eopTrapTrapped.load(std::memory_order_relaxed), eopTrapRefused.load(std::memory_order_relaxed), eopTrapLabelPage.load(std::memory_order_relaxed), eopTrapRanges.load(std::memory_order_relaxed), eopTrapBytes.load(std::memory_order_relaxed), eopTrapReleased.load(std::memory_order_relaxed), eopTrapFaults.load(std::memory_order_relaxed), eopTrapNested.load(std::memory_order_relaxed), eopTrapChecked.load(std::memory_order_relaxed), eopTrapUncovered.load(std::memory_order_relaxed), eopTrapSetNs.load(std::memory_order_relaxed), eopTrapReleaseNs.load(std::memory_order_relaxed), eopChangingCopies.load(std::memory_order_relaxed), eopChangingCopyBytes.load(std::memory_order_relaxed)};
+}
+
+void Recorder::CountChangingCopy(std::size_t bytes) {
+    eopChangingCopies.fetch_add(1, std::memory_order_relaxed);
+    eopChangingCopyBytes.fetch_add(bytes, std::memory_order_relaxed);
+}
+
+bool Recorder::TrapPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::uint64_t label, std::size_t labelBytes) {
+    eopTrapLabels.fetch_add(1, std::memory_order_relaxed);
+    if (writes.empty()) return true;
+    const auto start = std::chrono::steady_clock::now();
+    const struct SetTimer {
+        std::chrono::steady_clock::time_point start;
+        ~SetTimer() { eopTrapSetNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed); }
+    } timer{start};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    spans.reserve(writes.size());
+    for (const auto& [begin, end] : writes) {
+        if (begin < end) spans.emplace_back(begin & ~(ReadTrapPage - 1), (end + ReadTrapPage - 1) & ~(ReadTrapPage - 1));
+    }
+    std::sort(spans.begin(), spans.end());
+    std::size_t merged = 0;
+    for (const auto& span : spans) {
+        if (merged != 0 && span.first <= spans[merged - 1].second) spans[merged - 1].second = std::max(spans[merged - 1].second, span.second);
+        else spans[merged++] = span;
+    }
+    spans.resize(merged);
+    if (labelBytes != 0) {
+        const auto labelBegin = label & ~(ReadTrapPage - 1);
+        const auto labelEnd = (label + labelBytes + ReadTrapPage - 1) & ~(ReadTrapPage - 1);
+        int file = -1;
+        std::uint64_t offset = 0;
+        const bool crossing = std::any_of(spans.begin(), spans.end(), [&](const auto& span) { return span.first < labelEnd && labelBegin < span.second; });
+        if (crossing && !GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(label), labelBytes, &file, &offset)) {
+            eopTrapLabelPage.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    auto hold = std::make_shared<EopTrapHold>();
+    hold->ranges.reserve(spans.size());
+    std::uint64_t bytes = 0;
+    for (const auto& [begin, end] : spans) {
+        if (!TrapGuestReads(begin, end)) {
+            eopTrapRefused.fetch_add(1, std::memory_order_relaxed);
+            hold->Release();
+            return false;
+        }
+        hold->ranges.emplace_back(begin, end);
+        bytes += end - begin;
+    }
+    hold->Note();
+    if (!AfterRecordedWork([hold] { hold->Release(); })) {
+        hold->Release();
+        return false;
+    }
+    eopTrapTrapped.fetch_add(1, std::memory_order_relaxed);
+    eopTrapRanges.fetch_add(spans.size(), std::memory_order_relaxed);
+    eopTrapBytes.fetch_add(bytes, std::memory_order_relaxed);
+    return true;
+}
+
 void Recorder::NoteEndOfPipe(bool early) {
     endOfPipeEarly = early;
     endOfPipeSerial = open != nullptr ? submissions + 1 : submissions;
@@ -5821,6 +6022,7 @@ bool Recorder::AfterRecordedWork(std::function<void()> action) {
 }
 
 void Recorder::NoteWrittenBack(std::uint64_t address, std::size_t bytes) {
+    CheckEopTrapCovers(address, bytes);
     Recorder* recorder = activeRecorder;
     if (recorder == nullptr || bytes == 0) return;
     GuestMemory::AssertGpuLockHeld("Recorder::NoteWrittenBack");

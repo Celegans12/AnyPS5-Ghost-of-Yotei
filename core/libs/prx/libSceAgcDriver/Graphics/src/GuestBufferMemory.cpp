@@ -8456,8 +8456,17 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         if (sources.empty()) {
+            const auto bytes = static_cast<std::size_t>(to - from);
+            if (Recorder::EarlyEndOfPipe() && recorder->ChangingRead(from, bytes) && !recorder->PendingWriteOverlaps(from, bytes)) {
+                auto slice = recorder->DrawUpload(bytes);
+                GuestMemory::Read(from, std::span<std::byte>(slice.bytes, bytes), 1);
+                CopyBuffer(context, commands, slice.buffer->Handle(), slice.offset, region.buffer->Handle(), from - region.begin, to - from);
+                recorder->Keep(std::move(slice.buffer));
+                Recorder::CountChangingCopy(bytes);
+                return to - from;
+            }
             CopyBuffer(context, commands, region.copySource, from - region.copySourceBase, region.buffer->Handle(), from - region.begin, to - from);
-            recorder->NotePendingRead(from, static_cast<std::size_t>(to - from), Recorder::ReadKind::GpuCopy);
+            recorder->NotePendingRead(from, bytes, Recorder::ReadKind::GpuCopy);
             return to - from;
         }
         std::uint64_t imported = 0;

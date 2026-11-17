@@ -454,6 +454,13 @@ public:
     static constexpr std::size_t FinishedReadCapacity = 16384;
     static bool EarlyEndOfPipe();
     void NoteEndOfPipe(bool early);
+    struct EopTrapStatistics {
+        std::uint64_t labels, trapped, refused, labelPage, ranges, bytes, released, faults, nested, checked, uncovered, setNs, releaseNs, changingCopies, changingCopyBytes;
+    };
+    static void CountChangingCopy(std::size_t bytes);
+    static bool EopReadTrap();
+    static EopTrapStatistics EopTrapCounts();
+    bool TrapPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::uint64_t label, std::size_t labelBytes);
     bool TakeEarlyEndOfPipe();
     std::size_t UnexecutedReads(std::vector<InPlaceRead>& reads) const;
     bool TakeFinishedReads(std::vector<InPlaceRead>& reads, std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes);

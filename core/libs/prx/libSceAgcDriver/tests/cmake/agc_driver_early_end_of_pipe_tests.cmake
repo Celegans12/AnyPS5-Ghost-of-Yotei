@@ -1,1 +1,5 @@
 target_link_libraries(agc_driver_early_end_of_pipe_tests PRIVATE libkernel)
+if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_test(NAME agc_driver_early_end_of_pipe_read_trap COMMAND agc_driver_early_end_of_pipe_tests)
+    set_tests_properties(agc_driver_early_end_of_pipe_read_trap PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EARLY_EOP_READ_TRAP=1;APS5_VERIFY_EARLY_EOP_READ_TRAP=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+endif()
