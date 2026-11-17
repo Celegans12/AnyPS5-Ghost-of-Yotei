@@ -6280,7 +6280,8 @@ void drawInputReuseTests(const Device& device, Recorder& recorder) {
     Require(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).derived == 0xdead, "the new copy was not kept");
     MarkWritten(address + 128, 4);
     const auto marked = CopyDrawInput(context, &recorder, address, size, 4, Use::Index32);
-    Require(!marked.reused && equalsGuest(marked), "a draw input outlived a stamped GPU store");
+    Require(equalsGuest(marked), "a draw input outlived a stamped GPU store");
+    Require(marked.reused == Recorder::DrawInputCompare(), Recorder::DrawInputCompare() ? "a stamped GPU store that left the bytes equal copied the draw input anew" : "a draw input outlived a stamped GPU store");
     KeepDrawInput(&recorder, address, marked, Use::Index32, 1);
     Require(CopyDrawInput(context, &recorder, address, size, 4, Use::Index32).reused, "the copy after the GPU store was not kept");
     alignas(64) static std::byte other[64];
