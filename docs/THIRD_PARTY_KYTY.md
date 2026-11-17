@@ -29,6 +29,12 @@ verbatim at their top:
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/libs/` | `src/libs/` | `agc.h`, `controller.h`, `dialog.h`, `errno.h`, `hmd2.h`, `ime.h`, `imeCommon.h`, `imeDialog.h`, `libs.h` |
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/loader/` | `src/loader/` | `demonsSoulsPageFree.h`, `demonsSoulsTitle.h`, `guestOodle.h`, `systemContent.h`, `timer.h` |
 
+Outside those folders, code adapted from Kyty is built only with `-DANYPS5_GPU_BACKEND=kyty`:
+
+| AnyPS5 path | Kyty path at `40ddebbe` | What |
+|---|---|---|
+| `core/libs/prx/libSceAgc/Kyty/` | `src/libs/agc.cpp` | `AgcGetFusedShaderSize`, `AgcFuseShaderHalves_0200`, `AgcFuseShaderHalves`, `AgcCreatePrimState`, `AgcUpdatePrimState`, `AgcGetGsOversubscription`, `AgcCreateInterpolantMapping`, `AgcCreateInterpolantMapping2`, `AgcGetRegisterDefaults2`, `AgcGetRegisterDefaults2Internal`, as AnyPS5's `sceAgc…` exports of the same NIDs; a missing register throws instead of dereferencing null |
+
 The headers under `KytyShim/include/` are the contract of the shim: they are the declarations of the KytyPS5 kernel,
 library and loader functions that `graphics/` and `common/` call, and the shim implements them on top of AnyPS5.
 
