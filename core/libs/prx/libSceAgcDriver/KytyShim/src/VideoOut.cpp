@@ -67,6 +67,7 @@ struct PendingFlip {
     int index = 0;
     std::optional<AgcDriver::DisplayBuffer> source;
     Libs::Graphics::Presenter::Frame* frame = nullptr;
+    bool dropped = false;
 };
 
 struct ReadyFlip {
@@ -271,6 +272,14 @@ void PrepareSource(PendingFlip& flip, Libs::Graphics::Presenter& presenter, Libs
     flip.frame = &presenter.PrepareFrame(buffer, info, Libs::Graphics::IsHdrVideoOutPixelFormat(flip.source->pixelFormat), false);
 }
 
+std::uint64_t DropFlip(std::uint32_t handle, int index) {
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    const auto id = state.nextFlip++;
+    state.flips.emplace(id, PendingFlip{nullptr, handle, index, std::nullopt, nullptr, true});
+    return id;
+}
+
 std::optional<ReadyFlip> TakeReadyFlip(const void* context, Libs::Graphics::Presenter& presenter) {
     std::optional<ReadyFlip> taken;
     std::vector<Libs::Graphics::Presenter::Frame*> abandoned;
@@ -355,6 +364,9 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
         request_id = state.nextFlip++;
         state.flips.emplace(request_id, std::move(pending));
         return OK;
+    } catch (const ProcessShutdown&) {
+        request_id = KytyShim::Present::DropFlip(static_cast<std::uint32_t>(handle), index);
+        return OK;
     } catch (...) {
         KytyShim::Present::Stop("GPU flip submission", std::current_exception());
     }
@@ -390,6 +402,10 @@ void VideoOutDriver::CompleteFlip(uint64_t request_id) {
             const auto found = state.flips.find(request_id);
             if (found == state.flips.end()) throw std::runtime_error("flip completion for an unknown request " + std::to_string(request_id));
             auto& pending = found->second;
+            if (pending.dropped) {
+                state.flips.erase(found);
+                return;
+            }
             request = std::move(pending.request);
             state.ready.push_back({request, dynamic_cast<const void*>(request.get()), pending.handle, pending.index, std::move(pending.source), pending.frame});
             state.flips.erase(found);
@@ -406,6 +422,7 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
         const auto output = KytyShim::Entry::VideoOutput(static_cast<std::uint32_t>(handle));
         if (output == nullptr) throw std::runtime_error("flip slot wait on unregistered output " + std::to_string(handle));
         KytyShim::Present::WaitRunningUrgentCommands([output] { output->WaitForFlipRoom(); });
+    } catch (const ProcessShutdown&) {
     } catch (...) {
         KytyShim::Present::Stop("flip slot wait", std::current_exception());
     }
