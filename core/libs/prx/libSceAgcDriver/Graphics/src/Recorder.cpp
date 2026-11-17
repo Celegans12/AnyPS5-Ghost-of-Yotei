@@ -4362,7 +4362,54 @@ void Recorder::NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t byte
     unwrittenBytes += bytes;
 }
 
-std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, VkDeviceSize* offset, std::size_t from, std::uint32_t* lowest) {
+namespace {
+
+std::atomic<std::uint64_t> drawInputsPublished{0}, drawInputsLocked{0}, drawInputsEqual{0}, drawInputsEqualBytes{0}, drawInputsDiffer{0}, drawInputsRefused{0};
+
+bool snapshotUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, Recorder::SnapshotUse use) {
+    if (use == Recorder::SnapshotUse::Storage || !Recorder::DrawInputEpochProof()) return GuestMemory::UnchangedSince(address, bytes, generation);
+    if (GuestMemory::UnchangedSincePublished(address, bytes, generation)) {
+        drawInputsPublished.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    drawInputsLocked.fetch_add(1, std::memory_order_relaxed);
+    return GuestMemory::UnchangedSince(address, bytes, generation);
+}
+
+}
+
+bool Recorder::DrawInputCompare() {
+    static const bool enabled = std::getenv("APS5_DRAW_INPUT_COMPARE") != nullptr;
+    return enabled;
+}
+
+bool Recorder::DrawInputEpochProof() {
+    static const bool enabled = std::getenv("APS5_DRAW_INPUT_EPOCH_PROOF") != nullptr;
+    return enabled;
+}
+
+Recorder::DrawInputReuseStatistics Recorder::DrawInputReuseCounts() {
+    DrawInputReuseStatistics counts;
+    counts.published = drawInputsPublished.load(std::memory_order_relaxed);
+    counts.locked = drawInputsLocked.load(std::memory_order_relaxed);
+    counts.equal = drawInputsEqual.load(std::memory_order_relaxed);
+    counts.equalBytes = drawInputsEqualBytes.load(std::memory_order_relaxed);
+    counts.differs = drawInputsDiffer.load(std::memory_order_relaxed);
+    counts.refused = drawInputsRefused.load(std::memory_order_relaxed);
+    return counts;
+}
+
+Recorder::SnapshotCompare Recorder::compareDrawSnapshot(const DrawSnapshot& entry, std::uint64_t address, std::size_t bytes, std::size_t held) const {
+    const auto start = entry.from;
+    if (held != bytes || entry.buffer == nullptr || entry.buffer->Bytes().size() < bytes || start >= bytes || !entry.owned.words.empty()) return SnapshotCompare::Refused;
+    const auto length = bytes - start;
+    const auto source = address + start;
+    GuestMemory::GuardRead(source, length);
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(source), length)) return SnapshotCompare::Refused;
+    return std::memcmp(entry.buffer->Bytes().data() + start, reinterpret_cast<const void*>(source), length) == 0 ? SnapshotCompare::Equal : SnapshotCompare::Differs;
+}
+
+std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::uint64_t generation, VkDeviceSize* offset, std::size_t from, std::uint32_t* lowest, SnapshotCompare* compare) {
     Require(from == 0 || (use == SnapshotUse::Vertex && from < bytes), "only a vertex snapshot starts past its address");
     auto found = use == SnapshotUse::Vertex ? drawSnapshots.lower_bound({address, use, bytes}) : drawSnapshots.find({address, use, bytes});
     if (found == drawSnapshots.end() || std::get<0>(found->first) != address || std::get<1>(found->first) != use) {
@@ -4377,8 +4424,19 @@ std::shared_ptr<Buffer> Recorder::ReusableDrawSnapshot(std::uint64_t address, st
     const bool sameRegistry = found->second.registryGeneration == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
     const auto guestBytes = use == SnapshotUse::PaddedVertex ? static_cast<std::size_t>(found->second.derived) : bytes;
     const auto held = std::max(from, found->second.from);
-    if (!sameRegistry || (held < guestBytes && !GuestMemory::UnchangedSince(address + held, guestBytes - held, found->second.generation))) {
-        if (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes)) {
+    if (!sameRegistry || (held < guestBytes && !snapshotUnchangedSince(address + held, guestBytes - held, found->second.generation, use))) {
+        auto compared = SnapshotCompare::None;
+        if (compare != nullptr && sameRegistry && generation != 0 && use != SnapshotUse::Storage && use != SnapshotUse::PaddedVertex) {
+            compared = compareDrawSnapshot(found->second, address, bytes, std::get<2>(found->first));
+            *compare = compared;
+            if (compared == SnapshotCompare::Equal) {
+                drawInputsEqual.fetch_add(1, std::memory_order_relaxed);
+                drawInputsEqualBytes.fetch_add(bytes - found->second.from, std::memory_order_relaxed);
+            } else {
+                (compared == SnapshotCompare::Differs ? drawInputsDiffer : drawInputsRefused).fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+        if (compared != SnapshotCompare::Equal && (!sameRegistry || generation == 0 || use != SnapshotUse::Storage || !refreshDrawSnapshot(found->second, address, bytes))) {
             eraseDrawSnapshot(found);
             return {};
         }

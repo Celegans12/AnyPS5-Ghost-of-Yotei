@@ -1611,11 +1611,50 @@ struct InputTokenArm {
     std::uint64_t registryGeneration = 0;
 };
 
-InputTokenSlot& inputTokenSlot(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use) {
-    static thread_local std::vector<InputTokenSlot> slots(InputTokenSlots);
+constexpr std::size_t InputTokenSets = 8192;
+constexpr std::size_t InputTokenWays = 2;
+
+bool InputEpochProof() {
+    static const bool enabled = Recorder::DrawInputEpochProof();
+    return enabled;
+}
+
+struct InputTokenTable {
+    std::vector<InputTokenSlot> slots;
+    std::vector<std::uint8_t> recent;
+};
+
+InputTokenTable& inputTokenTable() {
+    static thread_local InputTokenTable table = [] {
+        InputTokenTable made;
+        made.slots.resize(InputEpochProof() ? InputTokenSets * InputTokenWays : InputTokenSlots);
+        if (InputEpochProof()) made.recent.resize(InputTokenSets);
+        return made;
+    }();
+    return table;
+}
+
+InputTokenSlot& inputTokenSlot(std::uint64_t address, std::size_t bytes, Recorder::SnapshotUse use, bool keeping = false) {
+    auto& table = inputTokenTable();
     std::uint64_t key = (address >> 2u) * 0x9E3779B97F4A7C15ull;
     key ^= (static_cast<std::uint64_t>(bytes) + static_cast<std::uint64_t>(use) * 0x100000001B3ull) * 0xC2B2AE3D27D4EB4Full;
-    return slots[static_cast<std::size_t>(key >> 40u) % InputTokenSlots];
+    if (!InputEpochProof()) return table.slots[static_cast<std::size_t>(key >> 40u) % InputTokenSlots];
+    const auto set = static_cast<std::size_t>(key >> 40u) % InputTokenSets;
+    auto* ways = table.slots.data() + set * InputTokenWays;
+    for (std::size_t way = 0; way < InputTokenWays; ++way) {
+        if (ways[way].token.content != 0 && ways[way].address == address && ways[way].bytes == bytes && ways[way].use == use) {
+            table.recent[set] = static_cast<std::uint8_t>(way);
+            return ways[way];
+        }
+    }
+    if (!keeping) return ways[table.recent[set]];
+    std::size_t victim = InputTokenWays;
+    for (std::size_t way = 0; way < InputTokenWays && victim == InputTokenWays; ++way) {
+        if (ways[way].token.content == 0) victim = way;
+    }
+    if (victim == InputTokenWays) victim = (table.recent[set] + 1u) % InputTokenWays;
+    table.recent[set] = static_cast<std::uint8_t>(victim);
+    return ways[victim];
 }
 
 InputTokenArm& inputTokenArm() {
@@ -1633,10 +1672,55 @@ bool VerifyInputTokenCache() {
     return verify;
 }
 
+enum class ReusePath : std::size_t { Token, Snapshot, Compared, Count };
+
+constexpr std::size_t ReusePaths = static_cast<std::size_t>(ReusePath::Count);
+
+struct ReuseVerifyCounters {
+    std::array<std::atomic<std::uint64_t>, ReusePaths> verified{};
+    std::array<std::atomic<std::uint64_t>, ReusePaths> mismatches{};
+};
+
+ReuseVerifyCounters& reuseVerifyCounters() {
+    static auto* counters = new ReuseVerifyCounters;
+    return *counters;
+}
+
+bool VerifyDrawInputReuse() {
+    static const bool verify = std::getenv("APS5_VERIFY_DRAW_INPUT_REUSE") != nullptr;
+    return verify;
+}
+
+void verifyReusedInput(std::uint64_t address, std::size_t bytes, std::size_t alignment, std::size_t from, Recorder::SnapshotUse use, Buffer& held, ReusePath path) {
+    if (bytes <= from || held.Bytes().size() < bytes) return;
+    static thread_local std::vector<std::byte> fresh;
+    fresh.resize(bytes - from);
+    GuestMemory::Read(address + from, std::span<std::byte>(fresh), alignment);
+    auto& counters = reuseVerifyCounters();
+    const auto index = static_cast<std::size_t>(path);
+    counters.verified[index].fetch_add(1, std::memory_order_relaxed);
+    if (std::memcmp(fresh.data(), held.Bytes().data() + from, bytes - from) == 0) return;
+    const auto mismatches = counters.mismatches[index].fetch_add(1, std::memory_order_relaxed);
+    constexpr std::array<const char*, ReusePaths> names{"its content token", "its snapshot", "a compare before a copy"};
+    if (mismatches < 16) std::fprintf(stderr, "[draw-input-reuse] mismatch: the %s input of 0x%zx bytes at 0x%llx (from 0x%zx) served by %s differs from guest memory\n", use == Recorder::SnapshotUse::Vertex ? "vertex" : "index", bytes, static_cast<unsigned long long>(address), from, names[index]);
+}
+
+void reportDrawInputReuse() {
+    const bool verify = VerifyDrawInputReuse();
+    if (!Recorder::DrawInputCompare() && !Recorder::DrawInputEpochProof() && !verify) return;
+    const auto counts = Recorder::DrawInputReuseCounts();
+    auto& counters = reuseVerifyCounters();
+    const auto at = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
+    AgcDriver::ProfilePrint_nid_no_patch("[draw-input-reuse] cumulative: epoch proof %s, compare %s, verify %s; input snapshot stamps read as published %llu, at the tracker lock %llu; compared before a copy: %llu equal (%llu bytes not copied), %llu different, %llu refused; verified: token %llu (%llu mismatches), snapshot %llu (%llu mismatches), compared %llu (%llu mismatches)\n",
+                                         Recorder::DrawInputEpochProof() ? "on" : "off", Recorder::DrawInputCompare() ? "on" : "off", verify ? "on" : "off", static_cast<unsigned long long>(counts.published), static_cast<unsigned long long>(counts.locked), static_cast<unsigned long long>(counts.equal), static_cast<unsigned long long>(counts.equalBytes), static_cast<unsigned long long>(counts.differs), static_cast<unsigned long long>(counts.refused),
+                                         at(counters.verified[0]), at(counters.mismatches[0]), at(counters.verified[1]), at(counters.mismatches[1]), at(counters.verified[2]), at(counters.mismatches[2]));
+}
+
 void reportInputTokens() {
     std::array<std::uint64_t, InputTokenCounts> n{};
     for (std::size_t index = 0; index < n.size(); ++index) n[index] = inputTokenCounters()[index].load(std::memory_order_relaxed);
     const auto at = [&](InputTokenCount kind) { return static_cast<unsigned long long>(n[static_cast<std::size_t>(kind)]); };
+    reportDrawInputReuse();
     AgcDriver::ProfilePrint_nid_no_patch("[input-token] cumulative: %llu lookups, %llu served by a content token (%llu of them after a collect of the range); refused: %llu no entry, %llu entry starting past the request, %llu token moved, %llu pending image or unit shadow, %llu pending GPU write, %llu pending label or queued store, %llu copy released; %llu entries kept, %llu ranges without a token; verified %llu, mismatches %llu\n", at(InputTokenCount::Lookups), at(InputTokenCount::Hits), at(InputTokenCount::Collected), at(InputTokenCount::Absent), at(InputTokenCount::Shorter), at(InputTokenCount::Moved), at(InputTokenCount::Images), at(InputTokenCount::GpuWrites), at(InputTokenCount::Labels), at(InputTokenCount::Expired), at(InputTokenCount::Kept), at(InputTokenCount::Untracked), at(InputTokenCount::Verified), at(InputTokenCount::Mismatches));
 }
 
@@ -1681,8 +1765,9 @@ std::shared_ptr<Buffer> ReusableTokenDrawInput(const Recorder* recorder, VkDevic
         return {};
     }
     bool collected = false;
-    if (!GuestMemory::StillCurrent(address, bytes, slot.token)) {
-        collected = GuestMemory::CollectWrites(address, bytes) != 0 && GuestMemory::StillCurrent(address, bytes, slot.token);
+    const auto stillCurrent = [&] { return InputEpochProof() ? GuestMemory::StillCurrentPublished(address, bytes, slot.token) : GuestMemory::StillCurrent(address, bytes, slot.token); };
+    if (!stillCurrent()) {
+        collected = GuestMemory::CollectWrites(address, bytes) != 0 && stillCurrent();
         if (!collected) {
             slot = InputTokenSlot{};
             countInputToken(InputTokenCount::Moved);
@@ -1727,7 +1812,7 @@ void KeepTokenDrawInput(VkDevice device, std::uint64_t address, std::size_t byte
         countInputToken(InputTokenCount::Untracked);
         return;
     }
-    auto& slot = inputTokenSlot(address, bytes, use);
+    auto& slot = inputTokenSlot(address, bytes, use, true);
     slot.address = address;
     slot.bytes = bytes;
     slot.from = from;
@@ -1844,6 +1929,7 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         pendingSerial = StorageTexture::PendingSerial();
         if (auto held = ReusableTokenDrawInput(recorder, context.device, address, bytes, use, from, &copy.derived, &copy.lowest)) {
             if (VerifyInputTokenCache()) verifyTokenInput(address, bytes, alignment, from, *held);
+            if (VerifyDrawInputReuse()) verifyReusedInput(address, bytes, alignment, from, use, *held, ReusePath::Token);
             copy.buffer = std::move(held);
             copy.reused = true;
             if (costed) noteInputCost(copy, address, bytes, from, use, costSpent(), false);
@@ -1872,11 +1958,14 @@ DrawInputCopy CopyDrawInput(const Context& context, Recorder* recorder, std::uin
         copy.generation = GuestMemory::CollectWrites(address, bytes);
         if (costed) addInputCost(InputCost::CollectNanoseconds, costClock.Lap());
         const auto token = tokens && copy.generation != 0 ? GuestMemory::TokenFor(address, bytes) : GuestMemory::ContentToken{};
-        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, 0, nullptr, from, &copy.lowest);
+        auto compared = Recorder::SnapshotCompare::None;
+        const bool compare = Recorder::DrawInputCompare();
+        if (copy.generation != 0) copy.buffer = recorder->ReusableDrawSnapshot(address, bytes, use, &copy.derived, compare ? copy.generation : 0, nullptr, from, &copy.lowest, compare ? &compared : nullptr);
         else if (owned) copy.owned = recorder->ArmOwnedDrawInput(address, bytes);
         if (costed) addInputCost(InputCost::LookupNanoseconds, costClock.Lap());
         if (copy.buffer != nullptr) {
             copy.reused = true;
+            if (VerifyDrawInputReuse()) verifyReusedInput(address, bytes, alignment, from, use, *copy.buffer, compared == Recorder::SnapshotCompare::Equal ? ReusePath::Compared : ReusePath::Snapshot);
             if (costed) noteInputCost(copy, address, bytes, from, use, costSpent(), false);
             if (tokens) KeepTokenDrawInput(context.device, address, bytes, use, from, copy.buffer, copy.derived, copy.lowest, token, pendingSerial, copy.registryGeneration);
             return copy;

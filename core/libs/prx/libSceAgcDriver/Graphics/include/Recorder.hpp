@@ -313,7 +313,19 @@ public:
     static constexpr std::size_t DrawInputEntries = 16384;
     std::shared_ptr<Buffer> UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset = nullptr);
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset = 0);
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr, std::size_t from = 0, std::uint32_t* lowest = nullptr);
+    enum class SnapshotCompare : std::uint8_t { None, Equal, Differs, Refused };
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr, std::size_t from = 0, std::uint32_t* lowest = nullptr, SnapshotCompare* compare = nullptr);
+    static bool DrawInputCompare();
+    static bool DrawInputEpochProof();
+    struct DrawInputReuseStatistics {
+        std::uint64_t published = 0;
+        std::uint64_t locked = 0;
+        std::uint64_t equal = 0;
+        std::uint64_t equalBytes = 0;
+        std::uint64_t differs = 0;
+        std::uint64_t refused = 0;
+    };
+    static DrawInputReuseStatistics DrawInputReuseCounts();
     struct OwnedDrawInputProof {
         std::vector<std::uint64_t> words;
         std::uint64_t since = 0;
@@ -1305,6 +1317,7 @@ private:
     void outdateDrawInputCopies(std::uint64_t address, std::uint64_t end);
     void outdateDrawInputCopies();
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
+    SnapshotCompare compareDrawSnapshot(const DrawSnapshot& entry, std::uint64_t address, std::size_t bytes, std::size_t held) const;
     std::shared_ptr<Buffer> containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset);
     mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
     mutable bool publishedWriteRangesValid = false;

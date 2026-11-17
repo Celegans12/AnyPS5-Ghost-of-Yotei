@@ -2513,7 +2513,6 @@ struct WriteTracker {
         return false;
     }
 
-#ifdef _WIN32
     bool unchangedUnlocked(std::span<const UnchangedQuery> queries) const {
         if (!ready.load(std::memory_order_acquire)) return false;
         const auto changes = coverageChanges.load(std::memory_order_acquire);
@@ -2521,12 +2520,13 @@ struct WriteTracker {
         const auto settled = stable.load(std::memory_order_acquire);
         const auto refusal = newestRefusal.load(std::memory_order_acquire);
         for (const auto& [address, bytes, since] : queries) {
-            if (since == 0 || since > settled || refusal > since || bytes == 0 || !covers(address, bytes)) return false;
+            if (since == 0 || since > settled || refusal > since || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !covers(address, bytes)) return false;
             if (!unchanged(blockOf(address), blockOf(address + bytes - 1), since)) return false;
         }
         return coverageChanges.load(std::memory_order_acquire) == changes;
     }
 
+#ifdef _WIN32
     std::optional<bool> coveredUnlocked(std::uint64_t address, std::size_t bytes) const {
         if (!ready.load(std::memory_order_acquire)) return std::nullopt;
         const auto changes = coverageChanges.load(std::memory_order_acquire);
@@ -3992,6 +3992,30 @@ ContentToken TokenFor(std::uint64_t address, std::size_t bytes) {
     return token;
 }
 
+bool StillCurrentPublished(std::uint64_t address, std::size_t bytes, const ContentToken& token) {
+    if (token.content == 0 || !EpochSweeps()) return false;
+    std::uint64_t first = 0;
+    std::uint64_t stop = 0;
+    if (!tokenRange(address, bytes, first, stop)) return false;
+    auto& sweep = epochSweep();
+    const auto missed = [&sweep](TokenMiss cause) {
+        sweep.missed[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
+        return false;
+    };
+    if (token.context != tokenContext()) return missed(TokenMiss::Context);
+    auto& tracker = Tracker();
+    const auto epoch = HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get();
+    if (epoch == 0 || !collectMemoEnabled() || !tracker.ready.load(std::memory_order_acquire)) return missed(TokenMiss::Unobserved);
+    if (hotEpochs() != 0) tracker.markAsked(first, stop, askedSerial());
+    if (!observedInEpoch(tracker, first, static_cast<std::size_t>(stop - first), first, stop, epoch)) return missed(TokenMiss::Unobserved);
+    if (contentSum(first, stop) != token.content) {
+        if (tokenBreaksCounted()) countTokenBreak(address, bytes, first, stop, token);
+        return missed(TokenMiss::Written);
+    }
+    sweep.held.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
 bool StillCurrent(std::uint64_t address, std::size_t bytes, const ContentToken& token) {
     if (token.content == 0 || !EpochSweeps()) return false;
     std::uint64_t first = 0;
@@ -4600,6 +4624,11 @@ bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t gene
     tracker.initialize();
     if (!tracker.watched || generation == 0 || bytes == 0 || !tracker.covers(address, bytes)) return false;
     return tracker.rangeUnchanged(address, bytes, generation);
+}
+
+bool UnchangedSincePublished(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
+    const UnchangedQuery query{address, bytes, generation};
+    return Tracker().unchangedUnlocked({&query, 1});
 }
 
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {

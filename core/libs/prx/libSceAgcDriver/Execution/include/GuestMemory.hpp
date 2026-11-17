@@ -156,6 +156,7 @@ struct UnchangedQuery {
 };
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
+bool UnchangedSincePublished(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 std::uint64_t WriteGeneration();
 inline constexpr std::uint64_t ArmedBlockBytes = 65536;
@@ -223,6 +224,7 @@ struct ContentToken {
 bool EpochSweeps();
 ContentToken TokenFor(std::uint64_t address, std::size_t bytes);
 bool StillCurrent(std::uint64_t address, std::size_t bytes, const ContentToken& token);
+bool StillCurrentPublished(std::uint64_t address, std::size_t bytes, const ContentToken& token);
 void SweepHot(std::uint64_t epoch);
 enum class TokenMiss : std::uint8_t { Unobserved, Written, Context, Busy, Count };
 struct EpochSweepCounts {
