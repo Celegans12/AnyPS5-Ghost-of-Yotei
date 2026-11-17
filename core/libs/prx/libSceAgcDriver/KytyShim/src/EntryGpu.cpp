@@ -42,6 +42,8 @@ namespace KytyShim {
 
 void StartRuntime();
 void RouteInterrupts(Libs::Graphics::RenderContext& renderer);
+void InstallFaultChain();
+void RemoveFaultChain();
 
 }
 
@@ -61,6 +63,7 @@ using KytyShim::Entry::g_renderer;
 
 void Initialize() {
     if (g_renderer != nullptr) throw std::runtime_error("kyty GPU backend: Libs::Graphics::Initialize called twice");
+    KytyShim::InstallFaultChain();
     const auto width = Config::GetScreenWidth();
     const auto height = Config::GetScreenHeight();
     auto& presenter = WindowInit(width, height);
@@ -75,6 +78,7 @@ void Shutdown() {
     g_renderer->ShutdownGpu();
     VideoOut::VideoOutShutdown();
     WindowShutdown();
+    KytyShim::RemoveFaultChain();
     g_renderer = nullptr;
 }
 
