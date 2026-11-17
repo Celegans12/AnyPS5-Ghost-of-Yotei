@@ -32,7 +32,7 @@ bool ReapOnFence() {
 #ifdef _WIN32
     return false;
 #else
-    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ReapOnFence);
+    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoReapOnFence);
 #endif
 }
 
