@@ -4,9 +4,11 @@ if(BUILD_TESTING)
     target_link_libraries(agc_pending_pages_tests PRIVATE libc)
     configure_windows_unwind(agc_pending_pages_tests)
     add_test(NAME agc_pending_pages COMMAND agc_pending_pages_tests)
-    set_tests_properties(agc_pending_pages PROPERTIES TIMEOUT 60)
+    add_test(NAME agc_pending_pages_turned_off COMMAND agc_pending_pages_tests off)
+    add_test(NAME agc_pending_pages_ab COMMAND agc_pending_pages_tests ab)
+    set_tests_properties(agc_pending_pages agc_pending_pages_turned_off agc_pending_pages_ab PROPERTIES TIMEOUT 60)
     if(WIN32)
-        set_tests_properties(agc_pending_pages PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_pending_pages agc_pending_pages_turned_off agc_pending_pages_ab PROPERTIES ENVIRONMENT_MODIFICATION
                 "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()

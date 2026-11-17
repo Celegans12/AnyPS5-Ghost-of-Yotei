@@ -247,21 +247,25 @@ private:
 }
 
 bool Armed() {
+#ifdef _WIN32
+    return false;
+#else
     static const bool armed = [] {
-        if (std::getenv("APS5_PENDING_PAGES") != nullptr || std::getenv("APS5_PENDING_PAGES_VERIFY") != nullptr) return true;
+        if (std::getenv("APS5_NO_PENDING_PAGES") == nullptr || std::getenv("APS5_PENDING_PAGES_VERIFY") != nullptr) return true;
         const char* ab = std::getenv("APS5_AB");
-        return ab != nullptr && std::strstr(ab, "APS5_PENDING_PAGES") != nullptr;
+        return ab != nullptr && std::strstr(ab, "APS5_NO_PENDING_PAGES") != nullptr;
     }();
     return armed;
+#endif
 }
 
 bool Verifying() {
-    static const bool verifying = std::getenv("APS5_PENDING_PAGES_VERIFY") != nullptr;
+    static const bool verifying = Armed() && std::getenv("APS5_PENDING_PAGES_VERIFY") != nullptr;
     return verifying;
 }
 
 bool Rejecting() {
-    return Armed() && !Verifying() && RuntimeSwitches::Set(RuntimeSwitch::PendingPages);
+    return Armed() && !Verifying() && !RuntimeSwitches::Set(RuntimeSwitch::NoPendingPages);
 }
 
 bool Clear(Layer layer, std::uint64_t address, std::size_t bytes) {

@@ -39,7 +39,6 @@ void SetEnvironment(const char* name, const char* value) {
 
 void basics() {
     PendingPages::ResetForTest();
-    Require(PendingPages::Armed(), "APS5_PENDING_PAGES did not arm the maps");
     Require(PendingPages::Clear(Layer::Recorder, 0x10000, 64), "an empty map reported a marked page");
     const std::vector<Range> written{{0x10010, 0x10020}};
     PendingPages::Track(Layer::Recorder, written);
@@ -189,22 +188,58 @@ void rejecting() {
     PendingPages::ResetForTest();
     const std::vector<Range> written{{0x800000, 0x800100}};
     PendingPages::Track(Layer::Storage, written);
-    Require(PendingPages::Rejecting(), "APS5_PENDING_PAGES did not start rejecting");
+    Require(RuntimeSwitches::Find("APS5_NO_PENDING_PAGES") == RuntimeSwitch::NoPendingPages, "APS5_NO_PENDING_PAGES is not a runtime switch");
+#ifdef _WIN32
+    Require(!PendingPages::Armed() && !PendingPages::Rejecting() && !PendingPages::Rejects(Layer::Storage, 0x900000, 64), "the maps are kept on Windows");
+#else
+    Require(PendingPages::Armed(), "the maps are not kept by default");
+    Require(PendingPages::Rejecting(), "the maps do not answer by default");
     Require(PendingPages::Rejects(Layer::Storage, 0x900000, 64), "a clear read was not rejected");
     Require(!PendingPages::Rejects(Layer::Storage, 0x800080, 64), "a marked read was rejected");
-    RuntimeSwitches::Assign(RuntimeSwitch::PendingPages, false);
+    RuntimeSwitches::Assign(RuntimeSwitch::NoPendingPages, true);
     Require(!PendingPages::Rejecting() && !PendingPages::Rejects(Layer::Storage, 0x900000, 64), "the switch turned off still rejected");
-    RuntimeSwitches::Assign(RuntimeSwitch::PendingPages, true);
-    Require(RuntimeSwitches::Find("APS5_PENDING_PAGES") == RuntimeSwitch::PendingPages, "APS5_PENDING_PAGES is not a runtime switch");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoPendingPages, false);
+    Require(PendingPages::Rejecting(), "the switch turned back on did not reject");
+#endif
+}
+
+void turnedOff() {
+    Require(RuntimeSwitches::Set(RuntimeSwitch::NoPendingPages), "APS5_NO_PENDING_PAGES did not start set");
+    Require(!PendingPages::Armed() && !PendingPages::Rejecting(), "APS5_NO_PENDING_PAGES kept the maps");
+    Require(!PendingPages::Rejects(Layer::Recorder, 0x900000, 64), "APS5_NO_PENDING_PAGES still rejected");
+}
+
+void flippedByAb() {
+    Require(RuntimeSwitches::Set(RuntimeSwitch::NoPendingPages), "APS5_NO_PENDING_PAGES did not start set");
+#ifdef _WIN32
+    Require(!PendingPages::Armed(), "the maps are kept on Windows");
+#else
+    Require(PendingPages::Armed(), "APS5_AB naming APS5_NO_PENDING_PAGES did not keep the maps from the start");
+    Require(!PendingPages::Rejecting(), "the maps answered while APS5_NO_PENDING_PAGES is set");
+    RuntimeSwitches::Assign(RuntimeSwitch::NoPendingPages, false);
+    Require(PendingPages::Rejecting() && PendingPages::Rejects(Layer::Recorder, 0x900000, 64), "the maps did not answer once the A/B turned the switch off");
+#endif
 }
 
 }
 
-int main() {
+int main(int argc, char** argv) {
     try {
-        SetEnvironment("APS5_PENDING_PAGES", "1");
+        const std::string mode = argc > 1 ? argv[1] : "";
         SetEnvironment("APS5_PENDING_PAGES_VERIFY", nullptr);
-        SetEnvironment("APS5_AB", nullptr);
+        SetEnvironment("APS5_NO_PENDING_PAGES", mode.empty() ? nullptr : "1");
+        SetEnvironment("APS5_AB", mode == "ab" ? "10:APS5_NO_PENDING_PAGES" : nullptr);
+        if (mode == "off") {
+            turnedOff();
+            std::printf("pending pages tests passed (APS5_NO_PENDING_PAGES)\n");
+            return 0;
+        }
+        if (mode == "ab") {
+            flippedByAb();
+            std::printf("pending pages tests passed (APS5_AB)\n");
+            return 0;
+        }
+        if (!mode.empty()) throw std::runtime_error("unknown mode '" + mode + "'");
         basics();
         replaceOrder();
         restrictWindow();
