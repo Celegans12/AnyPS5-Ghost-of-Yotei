@@ -108,7 +108,8 @@ stops the emulator with a message naming the variable.
 
 | Variables | Values |
 |---|---|
-| `KYTY_FULLSCREEN`, `KYTY_HDR`, `KYTY_HIDE_CURSOR`, `KYTY_STRETCH`, `KYTY_VR`, `KYTY_TRINITY`, `KYTY_VULKAN_VALIDATION`, `KYTY_GPU_ASSISTED_VALIDATION`, `KYTY_SHADER_VALIDATION`, `KYTY_SHADER_CACHE`, `KYTY_PIPELINE_MANIFEST`, `KYTY_RECORD_PIPELINE_MANIFEST`, `KYTY_STRICT_PIPELINE_MANIFEST`, `KYTY_TESSELLATION`, `KYTY_OCCLUSION_QUERIES`, `KYTY_RELAXED_SHADER_FLOAT`, `KYTY_NATIVE_RT`, `KYTY_ASYNC_PIPELINES`, `KYTY_RT_STATS`, `KYTY_COMMAND_BUFFER_DUMP`, `KYTY_GRAPHICS_DEBUG_DUMP`, `KYTY_PROFILE`, `KYTY_SPIRV_DEBUG_PRINTF`, `KYTY_RENDERDOC`, `KYTY_READBACK_LINEAR_IMAGES`, `KYTY_READBACK_TILED_IMAGES`, `KYTY_READBACK_STORAGE_IMAGES`, `KYTY_SYNC_RAW_IMAGE_BUFFERS`, `KYTY_PERF_OVERLAY`, `KYTY_TROPHY_NOTIFICATIONS` | `0` or `1` |
+| `KYTY_FULLSCREEN`, `KYTY_HDR`, `KYTY_HIDE_CURSOR`, `KYTY_STRETCH`, `KYTY_VR`, `KYTY_TRINITY`, `KYTY_VULKAN_VALIDATION`, `KYTY_GPU_ASSISTED_VALIDATION`, `KYTY_SHADER_VALIDATION`, `KYTY_SHADER_CACHE`, `KYTY_PIPELINE_MANIFEST`, `KYTY_RECORD_PIPELINE_MANIFEST`, `KYTY_STRICT_PIPELINE_MANIFEST`, `KYTY_TESSELLATION`, `KYTY_OCCLUSION_QUERIES`, `KYTY_RELAXED_SHADER_FLOAT`, `KYTY_ASYNC_PIPELINES`, `KYTY_RT_STATS`, `KYTY_COMMAND_BUFFER_DUMP`, `KYTY_GRAPHICS_DEBUG_DUMP`, `KYTY_PROFILE`, `KYTY_SPIRV_DEBUG_PRINTF`, `KYTY_RENDERDOC`, `KYTY_READBACK_LINEAR_IMAGES`, `KYTY_READBACK_TILED_IMAGES`, `KYTY_READBACK_STORAGE_IMAGES`, `KYTY_SYNC_RAW_IMAGE_BUFFERS`, `KYTY_PERF_OVERLAY`, `KYTY_TROPHY_NOTIFICATIONS` | `0` or `1` |
+| `KYTY_NATIVE_RT` | unset: native ray tracing when the Vulkan device has `VK_KHR_acceleration_structure`, `VK_KHR_ray_query` and `VK_KHR_deferred_host_operations` with their features, emulated otherwise; `1`: native, and a stop with a message when the device cannot; `0`: emulated |
 | `KYTY_SCREEN_WIDTH`, `KYTY_SCREEN_HEIGHT` | 1 or more |
 | `KYTY_VBLANK_FREQUENCY`, `KYTY_FLUSH_DRAWS`, `KYTY_TROPHY_DURATION` | whole number |
 | `KYTY_CONSOLE_LANGUAGE` | 0 to 29 |
@@ -123,3 +124,12 @@ stops the emulator with a message naming the variable.
 KytyPS5's log (`LOGF`) is silent by default; `KYTY_PRINTF_DIRECTION=Console` sends it to stderr, beside AnyPS5's own
 lines. `KYTY_GPU_PIPELINE`, `KYTY_GPU_THREAD_CPUS`, `KYTY_GPU_THREAD_PRIORITY` and `KYTY_RESOLVE_HELPER` are read by
 `common/emulatorConfig.cpp` itself.
+
+KytyPS5's `native_rt` is off by default and its launcher's recommended settings turn it on; under `ANYPS5_KYTY` the
+shim turns it on unless `KYTY_NATIVE_RT=0`, and Kyty enables the ray query extensions only on a device that has them.
+Once the device exists, `KytyShim::ReportNativeRayTracing()` prints one `[kyty] native ray tracing` line on stderr:
+on, off by `KYTY_NATIVE_RT=0`, or unavailable with the missing extension or feature named, in which case ray tracing
+runs emulated as with `0`; with `KYTY_NATIVE_RT=1` that last case stops the emulator instead. `KYTY_RT_STATS` takes
+effect whenever native ray tracing is on. `KYTY_RT_ARENA_MB` (MiB) replaces the limit of the memory the native BLASes
+take, a quarter of the largest device-local heap clamped to 512 MiB to 4 GiB; it is read by
+`graphics/host_gpu/renderer/rayTracingSlots.cpp`.
