@@ -46,7 +46,7 @@ set(ALLOW_EXTERNAL_SPIRV_TOOLS OFF)
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}/glslang" "${CMAKE_BINARY_DIR}/3rdparty/glslang" EXCLUDE_FROM_ALL)
 
 set(KYTY_FLAGS "-fno-rtti -fno-exceptions -fcolor-diagnostics -finput-charset=UTF-8 -fexec-charset=UTF-8 -g -fno-strict-aliasing -fno-omit-frame-pointer -Wall -fmessage-length=0 -march=x86-64-v3 -ffp-contract=off")
-set(KYTY_SHARED_LIBRARY_FLAGS "-mtls-dialect=gnu2")
+set(KYTY_SHARED_LIBRARY_FLAGS "-mtls-dialect=gnu2 -ftls-model=initial-exec -fvisibility=hidden")
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${KYTY_FLAGS} ${KYTY_SHARED_LIBRARY_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${KYTY_FLAGS} ${KYTY_SHARED_LIBRARY_FLAGS}")
 
@@ -73,6 +73,7 @@ set(TRACY_ON_DEMAND ON)
 set(TRACY_DELAYED_INIT ON)
 set(TRACY_MANUAL_LIFETIME ON)
 add_subdirectory("${KYTY_THIRD_PARTY_DIR}/tracy" "${CMAKE_BINARY_DIR}/3rdparty/tracy" EXCLUDE_FROM_ALL)
+target_compile_options(TracyClient PRIVATE -fvisibility=default)
 
 set(ZSTD_BUILD_PROGRAMS OFF)
 set(ZSTD_BUILD_TESTS OFF)
