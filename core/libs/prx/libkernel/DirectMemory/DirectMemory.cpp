@@ -95,7 +95,12 @@ struct GuestView {
     std::uint8_t* view = nullptr;
     std::mutex lock;
     std::vector<std::uint64_t> used;
-    std::map<std::uintptr_t, std::uintptr_t> directViews;
+    struct DirectView {
+        std::uintptr_t end;
+        HANDLE section;
+        std::uint64_t offset;
+    };
+    std::map<std::uintptr_t, DirectView> directViews;
 };
 
 static GuestView& View() {
@@ -165,8 +170,8 @@ static HANDLE GuestChunk(std::uintptr_t address) {
     auto* target = view.view + chunkStart;
     MEMORY_BASIC_INFORMATION memory{};
     const bool queried = VirtualQuery(target, &memory, sizeof(memory)) == sizeof(memory);
-    const bool whole = queried && memory.BaseAddress == target && memory.RegionSize == bytes;
-    if (!queried || memory.State != MEM_RESERVE || (!whole && !VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) ||
+    if (queried && memory.State == MEM_RESERVE) VirtualFree(target, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    if (!queried || memory.State != MEM_RESERVE ||
         map(section, GetCurrentProcess(), target, 0, bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr) {
         const auto error = static_cast<int>(GetLastError());
         CloseHandle(section);
@@ -209,63 +214,86 @@ static std::uint8_t* DirectViewAddress(std::uint64_t physical) {
     return View().view + View().guestBytes + physical;
 }
 
-static void MapDirectView(HANDLE section, std::uint64_t physical, std::size_t bytes) {
-    using MapFunction = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
-    static const auto map = reinterpret_cast<MapFunction>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "MapViewOfFile3"));
-    auto& view = View();
-    if (view.view == nullptr || bytes == 0) return;
-    if (map == nullptr) throw std::runtime_error("MapViewOfFile3 is not available: the kyty GPU backend needs Windows 10 version 1803 or later");
-    auto* address = DirectViewAddress(physical);
-    const auto start = reinterpret_cast<std::uintptr_t>(address);
-    std::lock_guard lock(view.lock);
-    using UnmapFunction = BOOL(WINAPI*)(HANDLE, PVOID, ULONG);
-    static const auto unmap = reinterpret_cast<UnmapFunction>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "UnmapViewOfFile2"));
-    bool replaced = false;
-    for (auto stale = view.directViews.begin(); stale != view.directViews.end();) {
-        if (stale->second <= start || stale->first >= start + bytes) {
-            ++stale;
-            continue;
-        }
-        if (unmap == nullptr || !unmap(GetCurrentProcess(), reinterpret_cast<void*>(stale->first), MEM_PRESERVE_PLACEHOLDER))
-            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "replace a direct memory backing in the view");
-        stale = view.directViews.erase(stale);
-        replaced = true;
-    }
-    if (replaced) {
-        const auto after = view.directViews.lower_bound(start);
-        const auto regionStart = reinterpret_cast<std::uintptr_t>(DirectViewAddress(0));
-        const auto freeStart = after == view.directViews.begin() ? regionStart : std::prev(after)->second;
-        const auto freeEnd = after == view.directViews.end() ? regionStart + (view.viewBytes - view.guestBytes) : after->first;
-        VirtualFree(reinterpret_cast<void*>(freeStart), freeEnd - freeStart, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
-    }
-    MEMORY_BASIC_INFORMATION memory{};
-    if (VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory)) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "query the direct memory view");
-    const auto regionEnd = reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize;
-    if (memory.State != MEM_RESERVE || regionEnd < start + bytes) throw std::runtime_error("the direct memory view already maps a backing at this physical range");
-    if ((reinterpret_cast<std::uintptr_t>(memory.BaseAddress) != start || regionEnd != start + bytes) && !VirtualFree(address, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER))
-        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "split the direct memory view");
-    if (map(section, GetCurrentProcess(), address, 0, bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr)
-        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "map a direct memory backing into the view");
-    view.directViews.emplace(start, start + bytes);
+static void CoalesceDirectView(GuestView& view, std::uintptr_t start, std::uintptr_t end) {
+    const auto regionStart = reinterpret_cast<std::uintptr_t>(DirectViewAddress(0));
+    const auto after = view.directViews.lower_bound(end);
+    auto before = view.directViews.lower_bound(start);
+    const auto freeStart = before == view.directViews.begin() ? regionStart : std::prev(before)->second.end;
+    const auto freeEnd = after == view.directViews.end() ? regionStart + (view.viewBytes - view.guestBytes) : after->first;
+    VirtualFree(reinterpret_cast<void*>(freeStart), freeEnd - freeStart, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
 }
 
-static void UnmapDirectView(std::uint64_t physical, std::size_t bytes) {
+static void PlaceDirectView(GuestView& view, std::uintptr_t start, std::uintptr_t end, HANDLE section, std::uint64_t offset) {
+    using MapFunction = PVOID(WINAPI*)(HANDLE, HANDLE, PVOID, ULONG64, SIZE_T, ULONG, ULONG, void*, ULONG);
+    static const auto map = reinterpret_cast<MapFunction>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "MapViewOfFile3"));
+    if (map == nullptr) throw std::runtime_error("MapViewOfFile3 is not available: the kyty GPU backend needs Windows 10 version 1803 or later");
+    auto* address = reinterpret_cast<void*>(start);
+    const auto bytes = static_cast<std::size_t>(end - start);
+    MEMORY_BASIC_INFORMATION memory{};
+    if (VirtualQuery(address, &memory, sizeof(memory)) != sizeof(memory)) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "query the direct memory view");
+    if (memory.State != MEM_RESERVE || reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize < end) throw std::runtime_error("the direct memory view has no free range for a backing");
+    VirtualFree(address, bytes, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER);
+    if (map(section, GetCurrentProcess(), address, offset, bytes, MEM_REPLACE_PLACEHOLDER, PAGE_READWRITE, nullptr, 0) == nullptr) {
+        const auto error = static_cast<int>(GetLastError());
+        char message[160];
+        std::snprintf(message, sizeof(message), "map a direct memory backing into the view at physical 0x%llx+0x%zx, section offset 0x%llx", static_cast<unsigned long long>(start - reinterpret_cast<std::uintptr_t>(DirectViewAddress(0))), bytes, static_cast<unsigned long long>(offset));
+        throw std::system_error(error, std::system_category(), message);
+    }
+    view.directViews.emplace(start, GuestView::DirectView{end, section, offset});
+}
+static void MapDirectView(HANDLE section, std::uint64_t physical, std::size_t bytes) {
+    using UnmapFunction = BOOL(WINAPI*)(HANDLE, PVOID, ULONG);
+    static const auto unmap = reinterpret_cast<UnmapFunction>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "UnmapViewOfFile2"));
+    auto& view = View();
+    if (view.view == nullptr || bytes == 0) return;
+    const auto start = reinterpret_cast<std::uintptr_t>(DirectViewAddress(physical));
+    const auto end = start + bytes;
+    std::lock_guard lock(view.lock);
+    struct Kept {
+        std::uintptr_t start;
+        std::uintptr_t end;
+        HANDLE section;
+        std::uint64_t offset;
+    };
+    std::vector<Kept> kept;
+    auto spanStart = start;
+    auto spanEnd = end;
+    for (auto older = view.directViews.begin(); older != view.directViews.end();) {
+        if (older->second.end <= start || older->first >= end) {
+            ++older;
+            continue;
+        }
+        if (unmap == nullptr || !unmap(GetCurrentProcess(), reinterpret_cast<void*>(older->first), MEM_PRESERVE_PLACEHOLDER))
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "replace a direct memory backing in the view");
+        if (older->first < start) kept.push_back({older->first, start, older->second.section, older->second.offset});
+        if (older->second.end > end) kept.push_back({end, older->second.end, older->second.section, older->second.offset + (end - older->first)});
+        spanStart = std::min(spanStart, older->first);
+        spanEnd = std::max(spanEnd, older->second.end);
+        older = view.directViews.erase(older);
+    }
+    if (!kept.empty() || spanStart != start || spanEnd != end) CoalesceDirectView(view, spanStart, spanEnd);
+    for (const auto& piece : kept) PlaceDirectView(view, piece.start, piece.end, piece.section, piece.offset);
+    PlaceDirectView(view, start, end, section, 0);
+}
+
+static void UnmapDirectView(HANDLE section, std::uint64_t physical, std::size_t bytes) {
     using UnmapFunction = BOOL(WINAPI*)(HANDLE, PVOID, ULONG);
     static const auto unmap = reinterpret_cast<UnmapFunction>(GetProcAddress(GetModuleHandleW(L"kernelbase.dll"), "UnmapViewOfFile2"));
     auto& view = View();
     if (view.view == nullptr || bytes == 0 || unmap == nullptr) return;
-    auto* address = DirectViewAddress(physical);
-    const auto start = reinterpret_cast<std::uintptr_t>(address);
+    const auto start = reinterpret_cast<std::uintptr_t>(DirectViewAddress(physical));
+    const auto end = start + bytes;
     std::lock_guard lock(view.lock);
-    const auto found = view.directViews.find(start);
-    if (found == view.directViews.end() || found->second != start + bytes) return;
-    const auto end = found->second;
-    if (!unmap(GetCurrentProcess(), address, MEM_PRESERVE_PLACEHOLDER)) return;
-    const auto next = view.directViews.erase(found);
-    const auto regionStart = reinterpret_cast<std::uintptr_t>(DirectViewAddress(0));
-    const auto freeStart = next == view.directViews.begin() ? regionStart : std::prev(next)->second;
-    const auto freeEnd = next == view.directViews.end() ? regionStart + (view.viewBytes - view.guestBytes) : next->first;
-    if (freeStart != start || freeEnd != end) VirtualFree(reinterpret_cast<void*>(freeStart), freeEnd - freeStart, MEM_RELEASE | MEM_COALESCE_PLACEHOLDERS);
+    for (auto piece = view.directViews.lower_bound(start); piece != view.directViews.end() && piece->first < end;) {
+        if (piece->second.section != section || !unmap(GetCurrentProcess(), reinterpret_cast<void*>(piece->first), MEM_PRESERVE_PLACEHOLDER)) {
+            ++piece;
+            continue;
+        }
+        const auto pieceStart = piece->first;
+        const auto pieceEnd = piece->second.end;
+        piece = view.directViews.erase(piece);
+        CoalesceDirectView(view, pieceStart, pieceEnd);
+    }
 }
 #endif
 
@@ -739,7 +767,7 @@ public:
 #if defined(__EMSCRIPTEN__)
 #elif defined(_WIN32)
 #if defined(ANYPS5_KYTY)
-        UnmapDirectView(fileOffset, bytes);
+        UnmapDirectView(section, fileOffset, bytes);
 #endif
         if (!SectionPoolEnabled()) {
             GuestArena::GuestArenaForgetSection_nid_postfix(section);
