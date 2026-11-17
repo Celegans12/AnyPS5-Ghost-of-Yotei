@@ -108,6 +108,13 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         set_target_properties(kyty_shim_system_content_tests PROPERTIES CXX_EXTENSIONS OFF)
         add_test(NAME kyty_shim_system_content COMMAND kyty_shim_system_content_tests)
         set_tests_properties(kyty_shim_system_content PROPERTIES TIMEOUT 20)
+        add_test_executable(kyty_shim_native_rt_tests
+                KytyShim/src/NativeRtTests.cpp
+                KytyShim/src/NativeRt.cpp)
+        target_include_directories(kyty_shim_native_rt_tests PRIVATE ${LIBS_INCLUDE_DIR})
+        set_target_properties(kyty_shim_native_rt_tests PROPERTIES CXX_EXTENSIONS OFF)
+        add_test(NAME kyty_shim_native_rt COMMAND kyty_shim_native_rt_tests)
+        set_tests_properties(kyty_shim_native_rt PROPERTIES TIMEOUT 20)
         if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/tests/CMakeLists.txt)
             add_subdirectory(KytyShim/tests)
         endif()
