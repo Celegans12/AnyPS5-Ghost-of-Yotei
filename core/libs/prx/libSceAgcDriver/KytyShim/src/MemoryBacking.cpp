@@ -47,9 +47,11 @@ constexpr uint32_t PrivateEntry = ~uint32_t {0};
 constexpr uint64_t HostPageSize = 0x1000;
 constexpr uint64_t HostPageMask = HostPageSize - 1u;
 constexpr size_t ProbeBatch = 512;
+#ifndef _WIN32
 constexpr uint64_t SeekMinBytes = uint64_t {64} << 10u;
 constexpr uint64_t SeekFirstChunk = uint64_t {64} << 10u;
 constexpr uint64_t SeekLastChunk = uint64_t {1} << 20u;
+#endif
 
 class PageTable {
 public:
@@ -225,9 +227,9 @@ struct ViewState {
 	uint64_t arena_end = 0;
 #ifndef _WIN32
 	pid_t pid = 0;
-#endif
 	int guest_file = -1;
 	int direct_file = -1;
+#endif
 	std::atomic<bool> enabled {false};
 };
 
@@ -274,6 +276,7 @@ bool ValidRange(uint64_t vaddr, uint64_t size) {
 	return size != 0 && UINT64_MAX - vaddr >= size;
 }
 
+#ifndef _WIN32
 bool SparseReadsEnabled() {
 	const char* value = std::getenv("ANYPS5_KYTY_SPARSE_READS");
 	if (value == nullptr || *value == '\0') return true;
@@ -281,9 +284,13 @@ bool SparseReadsEnabled() {
 	if (text != "0" && text != "1") Shim::Fail("KytyShim memory: ANYPS5_KYTY_SPARSE_READS=%s is neither 0 nor 1\n", value);
 	return text == "1";
 }
+#endif
 
 void CopyFromView(uint8_t* destination, uint64_t offset, uint64_t bytes) {
 	const auto& state = State();
+#ifdef _WIN32
+	std::memcpy(destination, state.base + offset, bytes);
+#else
 	if (bytes < SeekMinBytes || state.guest_file < 0) {
 		std::memcpy(destination, state.base + offset, bytes);
 		return;
@@ -314,6 +321,7 @@ void CopyFromView(uint8_t* destination, uint64_t offset, uint64_t bytes) {
 		cursor = copy_end;
 		chunk = std::min(chunk * 2u, SeekLastChunk);
 	}
+#endif
 }
 
 template <typename Region, typename Gap>
@@ -587,6 +595,7 @@ void EnableViewOnce() {
 	state.guest_bytes = guest_bytes;
 	state.view_bytes = view_bytes;
 	std::fprintf(stderr, "[kyty] second view of guest memory at %p: guest range 0x%zx bytes, direct memory after it, 0x%zx bytes in all\n", static_cast<void*>(view), guest_bytes, view_bytes);
+#ifndef _WIN32
 	if (SparseReadsEnabled()) {
 		int guest_file = -1;
 		int direct_file = -1;
@@ -596,6 +605,7 @@ void EnableViewOnce() {
 		state.guest_file = guest_file;
 		state.direct_file = direct_file;
 	}
+#endif
 	DirectMemoryWatchProtections_nid_no_patch(&OnProtectionChange);
 	state.enabled.store(true, std::memory_order_release);
 }
