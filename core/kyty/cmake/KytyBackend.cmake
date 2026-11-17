@@ -82,3 +82,6 @@ target_compile_definitions(anyps5_kyty_gpu
         TRACY_MANUAL_LIFETIME
 )
 target_link_libraries(anyps5_kyty_gpu INTERFACE ${ANYPS5_KYTY_ARCHIVES} ${CMAKE_DL_LIBS} pthread)
+if(ANYPS5_KYTY_THIN_LTO)
+    target_link_options(anyps5_kyty_gpu INTERFACE "$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:LINKER:--gc-sections>")
+endif()

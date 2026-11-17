@@ -5,6 +5,7 @@ set(KYTY_GPU_EXCLUDED
     common/systemInfo.cpp
     common/trophies.cpp
     graphics/presentation/ddsImage.cpp
+    graphics/presentation/frameStepHack.cpp
     graphics/presentation/openxrHeadset.cpp
     graphics/presentation/performanceOverlay.cpp
     graphics/presentation/precompileNotice.cpp
