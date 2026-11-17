@@ -325,7 +325,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 
 		SurfaceCapabilities candidate_capabilities;
+#if defined(ANYPS5_KYTY)
+		if (!skip_device && surface != nullptr) {
+#else
 		if (!skip_device) {
+#endif
 			GetSurfaceCapabilities(device, surface, candidate_capabilities);
 
 			if (!(candidate_capabilities.capabilities.supportedUsageFlags &

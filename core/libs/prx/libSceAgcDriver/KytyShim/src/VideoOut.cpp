@@ -456,6 +456,8 @@ extern "C" void AgcDriverAttachWindow_nid_postfix(const AgcDriver::PresentationW
     host->RecreateSurface();
     vk::Bool32 supported = VK_FALSE;
     if (host->graphic_ctx.physical_device.getSurfaceSupportKHR(host->graphic_ctx.queue_family, host->surface, &supported) != vk::Result::eSuccess || supported != VK_TRUE) throw std::runtime_error("kyty presentation: the Vulkan queue the Kyty renderer selected cannot present to this window");
+    host->RefreshSurfaceCapabilities();
+    if (!(host->surface_capabilities.capabilities.supportedUsageFlags & vk::ImageUsageFlagBits::eTransferDst)) throw std::runtime_error("kyty presentation: the window surface cannot be a blit destination");
     KytyShim::Present::UpdateDrawableSize(*host, window);
     host->presenter->AttachSurface();
     std::lock_guard lock(state.mutex);
