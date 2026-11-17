@@ -47,6 +47,7 @@
 namespace KytyShim::Entry {
 
 Libs::Graphics::RenderContext& Renderer();
+void JoinPrestart(bool rethrow);
 std::shared_ptr<AgcDriver::IVideoOutput> VideoOutput(std::uint32_t handle);
 
 }
@@ -531,6 +532,7 @@ void OpenXrQueueEyeSource(Graphics::CommandBuffer&, const Graphics::VulkanImage&
 
 extern "C" void AgcDriverAttachWindow_nid_postfix(const AgcDriver::PresentationWindow& window) {
     if (window.context == nullptr || window.createSurface == nullptr || window.getDrawableSize == nullptr) throw std::runtime_error("kyty presentation: incomplete presentation window");
+    KytyShim::Entry::JoinPrestart(true);
     if (!KytyShim::Entry::Renderer().GetGpu().Pipelined()) throw std::runtime_error("kyty presentation: the Kyty GPU must run pipelined (GPU pipeline stages must include the command processor)");
     auto& state = KytyShim::Present::State();
     Libs::Graphics::WindowContext* host = nullptr;
