@@ -64,7 +64,6 @@
 #include <pthread.h>
 #include <sstream>
 #include <sys/ioctl.h>
-#include <sys/uio.h>
 #include <unistd.h>
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
 #ifdef __APPLE__
@@ -1536,10 +1535,10 @@ bool readableWithoutQuery(std::uintptr_t address, std::size_t bytes) {
     constexpr std::size_t limit = 4096;
     if (bytes > limit || HostMapping::QueryFd() >= 0 || pageStateRecorded(address, bytes)) return false;
     thread_local std::array<std::byte, limit> scratch;
-    iovec local{scratch.data(), bytes};
-    iovec remote{reinterpret_cast<void*>(address), bytes};
-    static const pid_t self = getpid();
-    return ::process_vm_readv(self, &local, 1, &remote, 1, 0) == static_cast<ssize_t>(bytes);
+    const int savedErrno = errno;
+    const bool copied = GuestCopyInUnsynced_nid_no_patch(scratch.data(), reinterpret_cast<const void*>(address), bytes);
+    errno = savedErrno;
+    return copied;
 }
 #endif
 
