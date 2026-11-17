@@ -53,6 +53,10 @@ namespace {
 
 Libs::Graphics::RenderContext* g_renderer = nullptr;
 
+bool HostWriteWatched(std::uintptr_t address, std::size_t bytes) {
+    return Libs::LibKernel::Memory::GuestRangeWatched(address, bytes);
+}
+
 }
 
 }
@@ -64,6 +68,7 @@ using KytyShim::Entry::g_renderer;
 void Initialize() {
     if (g_renderer != nullptr) throw std::runtime_error("kyty GPU backend: Libs::Graphics::Initialize called twice");
     KytyShim::InstallFaultChain();
+    GuestArena::GuestArenaSetHostWriteFilter_nid_no_patch(&KytyShim::Entry::HostWriteWatched);
     const auto width = Config::GetScreenWidth();
     const auto height = Config::GetScreenHeight();
     auto& presenter = WindowInit(width, height);
@@ -79,6 +84,7 @@ void Shutdown() {
     VideoOut::VideoOutShutdown();
     WindowShutdown();
     KytyShim::RemoveFaultChain();
+    GuestArena::GuestArenaSetHostWriteFilter_nid_no_patch(nullptr);
     g_renderer = nullptr;
 }
 
