@@ -186,6 +186,77 @@ void TestGpuHooks() {
     std::printf("projection hooks: replayed at install, map and unmap reported, unmap seen before the backing goes\n");
 }
 
+void TestReleaseWhileMapped() {
+    constexpr std::size_t surfaceBytes = Page * 8;
+    constexpr std::size_t metadataBytes = 0x50000;
+    constexpr std::size_t metadataSlice = 0x28000;
+    const auto directSize = static_cast<int64_t>(sceKernelGetDirectMemorySize());
+    int64_t surfacePhys = -1;
+    int64_t metadataPhys = -1;
+    Require(sceKernelAllocateDirectMemory(0, directSize, surfaceBytes, 0, 0, &surfacePhys) == 0 && surfacePhys >= 0);
+    Require(sceKernelAllocateDirectMemory(0, directSize, metadataBytes, 0, 0, &metadataPhys) == 0 && metadataPhys >= 0);
+    void* surface = nullptr;
+    void* metadata = nullptr;
+    Require(sceKernelMapDirectMemory(&surface, surfaceBytes, CpuReadWrite | GpuReadWrite, 0, surfacePhys, 0) == 0 && surface != nullptr);
+    Require(sceKernelMapDirectMemory(&metadata, metadataBytes, CpuReadWrite | GpuReadWrite, 0, metadataPhys, 0) == 0 && metadata != nullptr);
+    const auto slice = Address(metadata) + metadataSlice;
+    static_cast<std::uint8_t*>(metadata)[metadataSlice] = 0x10;
+    std::uint8_t code = 0;
+    Require(Memory::TryReadBacking(slice, &code, 1) && code == 0x10);
+
+    g_hooks = HookLog{};
+    Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(&OnMap, &OnUnmap);
+    const auto epoch = Memory::BackingEpoch();
+    Require(sceKernelReleaseDirectMemory(metadataPhys, metadataBytes) == 0);
+    Require(sceKernelReleaseDirectMemory(surfacePhys, surfaceBytes) == 0);
+    Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(nullptr, nullptr);
+
+    Require(Covers(g_hooks.unmapped, Address(metadata), metadataBytes));
+    Require(Covers(g_hooks.unmapped, Address(surface), surfaceBytes));
+    Require(g_hooks.backedWhenUnmapped);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> changes;
+    Require(Memory::BackingChangesSince(epoch, changes) && Covers(changes, Address(metadata), metadataBytes) && Covers(changes, Address(surface), surfaceBytes));
+    Require(!Memory::TryReadBacking(slice, &code, 1));
+    Require(!Memory::IsBackingReadable(Address(metadata), metadataBytes));
+    Require(Memory::FindBackingPointer(slice, 1) == nullptr);
+    Require(!Memory::IsFullyMapped(Address(metadata), metadataBytes));
+    Require(!Memory::IsFullyMapped(Address(surface), surfaceBytes));
+    std::printf("direct memory released while mapped at 0x%llx and 0x%llx: GPU unmap seen first with the backing, then no second view and not mapped\n", static_cast<unsigned long long>(Address(surface)), static_cast<unsigned long long>(Address(metadata)));
+}
+
+bool MayBeHostProtected(std::uint64_t address, std::size_t bytes) {
+    return GuestArena::GuestArenaMayBeHostProtected_nid_no_patch(address, bytes);
+}
+
+void TestHostProtectionTable() {
+    void* flexible = nullptr;
+    Require(sceKernelMapFlexibleMemory(&flexible, Page * 4, CpuReadWrite, 0) == 0 && flexible != nullptr);
+    const auto address = Address(flexible);
+    Require(Memory::ProtectGuestHostMemory(address, Page * 4, Common::VirtualMemory::Mode::Read));
+    Require(MayBeHostProtected(address, 1) && MayBeHostProtected(address + Page * 4 - 1, 1));
+    Require(Memory::ProtectGuestHostMemory(address, Page * 2, Common::VirtualMemory::Mode::ReadWrite));
+    Require(!MayBeHostProtected(address, Page * 2));
+    Require(MayBeHostProtected(address + Page * 2, Page * 2));
+
+    void* replaced = flexible;
+    Require(sceKernelMapFlexibleMemory(&replaced, Page * 4, CpuReadWrite, MapFixed) == 0 && replaced == flexible);
+    Require(!MayBeHostProtected(address, Page * 4));
+
+    Require(Memory::ProtectGuestHostMemory(address + Page, Page, Common::VirtualMemory::Mode::NoAccess));
+    Require(MayBeHostProtected(address + Page, Page) && !MayBeHostProtected(address, Page) && !MayBeHostProtected(address + Page * 2, Page * 2));
+    Require(sceKernelMunmap(address, Page * 4) == 0);
+    Require(!MayBeHostProtected(address, Page * 4));
+
+    void* hole = GuestArena::GuestArenaAllocate_nid_postfix(Page, Page);
+    Require(hole != nullptr);
+    Require(Memory::ProtectGuestHostMemory(Address(hole), Page, Common::VirtualMemory::Mode::Read));
+    Require(MayBeHostProtected(Address(hole), Page));
+    Require(Memory::ProtectGuestHostMemory(Address(hole), Page, Common::VirtualMemory::Mode::ReadWrite));
+    Require(!MayBeHostProtected(Address(hole), Page));
+    GuestArena::GuestArenaRelease_nid_postfix(hole, Page);
+    std::printf("host protection table 0x%llx: noted before write access goes, cleared when it returns, on MAP_FIXED replacement and on unmap\n", static_cast<unsigned long long>(address));
+}
+
 void TestRuntimeMemory() {
     const auto address = Memory::AllocateRuntimeMemory(0, Page * 2, Common::VirtualMemory::Mode::ReadWrite, "kyty shim test");
     Require(address != 0 && Memory::IsBackingReadable(address, Page * 2));
@@ -365,6 +436,8 @@ int main() {
     TestFlexible();
     TestDirect();
     TestGpuHooks();
+    TestReleaseWhileMapped();
+    TestHostProtectionTable();
     TestRuntimeMemory();
     TestUnreportedPrivateMemory();
     TestNoCrossWaitWithGpuThread();

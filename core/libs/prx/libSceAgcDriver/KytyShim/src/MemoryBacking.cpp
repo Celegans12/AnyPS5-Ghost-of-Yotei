@@ -343,10 +343,12 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 	std::lock_guard lock(g_hook_mutex);
 	auto& pages = Pages();
 	if (offset == DirectMemoryViewReplacing) {
-		if (!pages.AnyMapped(address, bytes)) return;
-		if (g_unmap_hook != nullptr) g_unmap_hook(address, bytes);
-		pages.Store(address, bytes, 0, false);
-		BumpBackingEpoch(address, bytes);
+		if (pages.AnyMapped(address, bytes)) {
+			if (g_unmap_hook != nullptr) g_unmap_hook(address, bytes);
+			pages.Store(address, bytes, 0, false);
+			BumpBackingEpoch(address, bytes);
+		}
+		GuestArena::GuestArenaNoteHostProtection_nid_no_patch(address, bytes, true);
 		return;
 	}
 	if (offset == DirectMemoryViewUnmapped) {
@@ -354,6 +356,7 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 		if (mapped && g_unmap_hook != nullptr) g_unmap_hook(address, bytes);
 		pages.Store(address, bytes, 0, false);
 		BumpBackingEpoch(address, bytes);
+		GuestArena::GuestArenaNoteHostProtection_nid_no_patch(address, bytes, true);
 		return;
 	}
 	uint32_t first = PrivateEntry;
@@ -667,6 +670,8 @@ bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) {
 	if (!ValidRange(vaddr, size)) return false;
 	const auto protection = HostProtection(mode);
+	const bool writable = (protection & PROT_WRITE) != 0;
+	if (!writable) GuestArena::GuestArenaNoteHostProtection_nid_no_patch(vaddr, size, false);
 	const auto& pages = Pages();
 	const auto first = vaddr & ~uint64_t {0xfff};
 	const auto end = (vaddr + size + 0xfff) & ~uint64_t {0xfff};
@@ -679,6 +684,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 		if (mapped && ::mprotect(reinterpret_cast<void*>(start), stop - start, protection) != 0) return false;
 		start = stop;
 	}
+	if (writable) GuestArena::GuestArenaNoteHostProtection_nid_no_patch(vaddr, size, true);
 	return true;
 }
 
