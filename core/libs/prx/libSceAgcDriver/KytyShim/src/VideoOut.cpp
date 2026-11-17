@@ -80,7 +80,6 @@ struct PresentationState {
     std::unique_ptr<Libs::VideoOut::VideoOutDriver> driver;
     std::map<std::uint64_t, PendingFlip> flips;
     std::vector<ReadyFlip> ready;
-    std::map<std::pair<std::uint32_t, int>, AgcDriver::DisplayBuffer> sources;
     std::uint64_t nextFlip = 1;
     void* windowHandle = nullptr;
     bool attaching = false;
@@ -249,13 +248,11 @@ Libs::Graphics::ImageInfo DisplayImageInfo(const AgcDriver::DisplayBuffer& buffe
     return info;
 }
 
-std::optional<AgcDriver::DisplayBuffer> PresentedSource(std::uint32_t handle, int index) {
-    if (index < 0) return std::nullopt;
-    auto& state = State();
-    std::lock_guard lock(state.mutex);
-    const auto found = state.sources.find({handle, index});
-    if (found == state.sources.end()) return std::nullopt;
-    return found->second;
+void PrepareSource(PendingFlip& flip, Libs::Graphics::Presenter& presenter, Libs::Graphics::CommandBuffer& buffer) {
+    flip.source = flip.request->Source();
+    if (!flip.source.has_value()) return;
+    const auto info = DisplayImageInfo(*flip.source);
+    flip.frame = &presenter.PrepareFrame(buffer, info, Libs::Graphics::IsHdrVideoOutPixelFormat(flip.source->pixelFormat), false);
 }
 
 std::optional<ReadyFlip> TakeReadyFlip(const void* context, Libs::Graphics::Presenter& presenter) {
@@ -287,12 +284,22 @@ std::optional<ReadyFlip> TakeReadyFlip(const void* context, Libs::Graphics::Pres
     return taken;
 }
 
-void RememberSource(const ReadyFlip& flip, const AgcDriver::DisplayBuffer& buffer) {
-    auto& state = State();
-    std::lock_guard lock(state.mutex);
-    state.sources.insert_or_assign(std::pair{flip.handle, flip.index}, buffer);
 }
 
+void SubmitCpuFlip(Libs::Graphics::GuestGpu& gpu, const AgcDriver::FlipInfo& info) {
+    const auto output = Entry::VideoOutput(info.handle);
+    if (output == nullptr) throw std::runtime_error("kyty presentation: CPU flip on unregistered output " + std::to_string(info.handle));
+    output->WaitForFlipRoom();
+    PendingFlip pending{output->Reserve(info), info.handle, info.index, std::nullopt, nullptr};
+    if (pending.request == nullptr) throw std::runtime_error("kyty presentation: the video output refused a CPU flip reservation");
+    std::uint64_t id = 0;
+    {
+        auto& state = State();
+        std::lock_guard lock(state.mutex);
+        id = state.nextFlip++;
+        state.flips.emplace(id, std::move(pending));
+    }
+    gpu.SubmitFlipPreparation(id);
 }
 
 void WaitRendering(std::uint32_t handle, std::uint32_t index) {
@@ -325,11 +332,8 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
         if (output == nullptr) return VIDEO_OUT_ERROR_INVALID_HANDLE;
         auto request = output->TryReserve(AgcDriver::FlipInfo{static_cast<std::uint32_t>(handle), index, static_cast<std::uint32_t>(flip_mode), flip_arg});
         if (request == nullptr) return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
-        KytyShim::Present::PendingFlip pending{std::move(request), static_cast<std::uint32_t>(handle), index, KytyShim::Present::PresentedSource(static_cast<std::uint32_t>(handle), index), nullptr};
-        if (pending.source.has_value()) {
-            const auto info = KytyShim::Present::DisplayImageInfo(*pending.source);
-            pending.frame = &State().presenter.PrepareFrame(buffer, info, Graphics::IsHdrVideoOutPixelFormat(pending.source->pixelFormat), false);
-        }
+        KytyShim::Present::PendingFlip pending{std::move(request), static_cast<std::uint32_t>(handle), index, std::nullopt, nullptr};
+        KytyShim::Present::PrepareSource(pending, State().presenter, buffer);
         auto& state = KytyShim::Present::State();
         std::lock_guard lock(state.mutex);
         request_id = state.nextFlip++;
@@ -340,13 +344,25 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
     }
 }
 
-void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer&) {
-    auto& state = KytyShim::Present::State();
-    std::lock_guard lock(state.mutex);
-    if (state.flips.contains(request_id)) return;
-    std::fprintf(stderr, "[kyty-videoout] flip preparation for an unknown request %llu\n", static_cast<unsigned long long>(request_id));
-    std::fflush(stderr);
-    LibcTerminate_nid_no_patch(1);
+void VideoOutDriver::PrepareFlip(uint64_t request_id, Graphics::CommandBuffer& buffer) {
+    try {
+        KytyShim::Present::PendingFlip pending;
+        auto& state = KytyShim::Present::State();
+        {
+            std::lock_guard lock(state.mutex);
+            const auto found = state.flips.find(request_id);
+            if (found == state.flips.end()) throw std::runtime_error("flip preparation for an unknown request " + std::to_string(request_id));
+            if (found->second.frame != nullptr || found->second.source.has_value()) throw std::runtime_error("flip request " + std::to_string(request_id) + " prepared twice");
+            pending.request = found->second.request;
+        }
+        KytyShim::Present::PrepareSource(pending, State().presenter, buffer);
+        std::lock_guard lock(state.mutex);
+        auto& flip = state.flips.at(request_id);
+        flip.source = std::move(pending.source);
+        flip.frame = pending.frame;
+    } catch (...) {
+        KytyShim::Present::Stop("CPU flip preparation", std::current_exception());
+    }
 }
 
 void VideoOutDriver::CompleteFlip(uint64_t request_id) {
@@ -401,7 +417,6 @@ void VideoOutShutdown() {
         driver = std::move(state.driver);
         state.flips.clear();
         state.ready.clear();
-        state.sources.clear();
     }
 }
 
@@ -574,7 +589,6 @@ extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::Presentation
         scheduler.Flush();
     });
     prepared->done.acquire();
-    if (flip.has_value()) KytyShim::Present::RememberSource(*flip, buffer);
     presenter.Present(*prepared->frame);
     gpuReady(context);
 }
