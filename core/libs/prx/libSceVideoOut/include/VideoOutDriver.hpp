@@ -248,8 +248,8 @@ public:
 private:
     bool close(int handle);
     void presentLoop(std::stop_token token, std::promise<void>& started);
-    void vblankLoop(std::stop_token token);
-    void vblankEnd(std::uint64_t tick);
+    void vblankLoop(std::stop_token token, std::optional<std::uint32_t> hertz);
+    void vblankEnd(bool standard, bool high);
     void updateDisplayRefreshRate();
     void processFlip(FlipRequest& req);
     std::optional<AgcDriver::DisplayBuffer> overlayPlane();

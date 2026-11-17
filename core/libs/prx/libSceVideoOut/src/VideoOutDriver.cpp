@@ -28,6 +28,7 @@
 #include "prx/libkernel/Time/include/Time.hpp"
 #include "prx/libkernel/Time/include/SleepWake.hpp"
 #include "prx/libSceVideoOut/include/VideoOutDriver.hpp"
+#include "prx/libSceVideoOut/include/VblankSchedule.hpp"
 #if APS5_ENABLE_TIMING_LOG
 #include "prx/libSceVideoOut/include/FrameTimingLog.hpp"
 #endif
@@ -353,6 +354,8 @@ VideoOutDriver::VideoOutDriver() {
         }
     });
     try {
+        const auto vblankHz = VideoOutVblank::ConfiguredVblankHz();
+        if (vblankHz) std::fprintf(stderr, "[videoout] vblank at %u Hz, %u Hz on 119.88 Hz outputs\n", *vblankHz, VideoOutVblank::HighVblankHz(*vblankHz));
         AgcDriverWaitIdle_nid_postfix();
         std::promise<void> started;
         auto attached = started.get_future();
@@ -366,7 +369,7 @@ VideoOutDriver::VideoOutDriver() {
             presentLoop(token, started);
         });
         attached.get();
-        vblankThread = Libc::StartHostJThread([this](std::stop_token token) { vblankLoop(token); });
+        vblankThread = Libc::StartHostJThread([this, vblankHz](std::stop_token token) { vblankLoop(token, vblankHz); });
         LibcRegisterShutdown_nid_postfix([] { VideoOutDriver::Get().Shutdown(); });
     } catch (...) {
         if (vblankThread.joinable()) {
@@ -611,13 +614,13 @@ void VideoOutDriver::pollHostHdr() {
     }
 }
 
-void VideoOutDriver::vblankEnd(std::uint64_t tick) {
+void VideoOutDriver::vblankEnd(bool standard, bool high) {
     std::lock_guard lock(mutex);
     for (const auto& cfg : contexts) {
         if (!cfg) continue;
         std::lock_guard cfgLock(cfg->mutex);
         if (!cfg->opened || cfg->failure) continue;
-        if (cfg->outputMode != VIDEO_OUT_OUTPUT_MODE_119_88HZ && tick % 2 != 0) continue;
+        if (!(cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ ? high : standard)) continue;
         require(cfg->vblankStatus.count != std::numeric_limits<uint64_t>::max(), "vblank counter overflow");
         ++cfg->preVblankStatus.count;
         cfg->preVblankStatus.processTime = sceKernelGetProcessTime();
@@ -908,19 +911,20 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
     });
 }
 
-void VideoOutDriver::vblankLoop(std::stop_token token) {
-    using Frame = std::chrono::duration<int64_t, std::ratio<1001, 120000>>;
+void VideoOutDriver::vblankLoop(std::stop_token token, std::optional<std::uint32_t> hertz) {
+    VideoOutVblank::VblankSchedule schedule(hertz);
     const auto start = std::chrono::steady_clock::now();
     try {
-        for (int64_t frame = 1; !token.stop_requested(); ++frame) {
-            const auto next = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(Frame(frame));
+        while (!token.stop_requested()) {
+            const auto next = start + std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::nanoseconds(schedule.NextNanos()));
             const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(next - std::chrono::steady_clock::now()).count();
             if (remaining > 0) PreciseSleepUs(static_cast<unsigned long long>(remaining));
             {
                 std::lock_guard lock(flipQueue->mutex);
                 if (token.stop_requested() || flipQueue->failure) return;
             }
-            vblankEnd(static_cast<std::uint64_t>(frame));
+            const auto due = schedule.Advance();
+            vblankEnd(due.standard, due.high);
         }
     } catch (const std::exception& error) {
         std::fprintf(stderr, "[videoout] vblank failed: %s\n", error.what());

@@ -1059,7 +1059,9 @@ void testUnpacedFlips(bool unpaced) {
     flip();
     flip();
     constexpr std::uint64_t flips = 24;
-    constexpr double vblankMs = 1001.0 / 60.0;
+    constexpr double ntscVblankMs = 1001.0 / 60.0;
+    const char* configuredHz = std::getenv("ANYPS5_VBLANK_HZ");
+    const double vblankMs = configuredHz != nullptr ? 1000.0 / std::stod(configuredHz) : ntscVblankMs;
     const auto presentsBefore = AgcDriver::VulkanDevice::PresentCounts();
     const auto flippedBefore = flippedAt;
     const auto vblanksBefore = vblanks();
@@ -1073,7 +1075,8 @@ void testUnpacedFlips(bool unpaced) {
         check(vblanksDuring < flips / 2 && flippedAt - flippedBefore < flips / 2 && elapsedMs < static_cast<double>(flips / 2) * vblankMs, "unpaced flips still completed about once per vblank");
     } else {
         check(flippedAt - flippedBefore >= flips, "paced flips completed more than once per vblank");
-        check(elapsedMs >= static_cast<double>(flips - 2) * vblankMs - 5.0, "paced flips completed faster than the 59.94 Hz vblank");
+        check(elapsedMs >= static_cast<double>(flips - 2) * vblankMs - 5.0, "paced flips completed faster than the vblank");
+        if (configuredHz != nullptr) check(elapsedMs < static_cast<double>(flips) * ntscVblankMs / 2.0, "flips under ANYPS5_VBLANK_HZ stayed held to the 59.94 Hz vblank");
     }
     std::vector<std::int64_t> delivered;
     std::array<KernelEvent, 16> events{};
@@ -1093,7 +1096,8 @@ void testUnpacedFlips(bool unpaced) {
     for (int count = 0; count < 6; ++count) check(sceVideoOutWaitVblank(handle) == 0, "the vblank wait failed");
     const double waitedMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitFirst).count();
     check(vblanks() - vblankBefore >= 7, "a vblank wait returned before the next vblank");
-    check(waitedMs >= 80.0, "six vblank waits took less than six periods of 59.94 Hz");
+    check(waitedMs >= 4.8 * vblankMs, "six vblank waits took less than five vblank periods");
+    if (configuredHz != nullptr) check(waitedMs < 3.0 * ntscVblankMs, "six vblank waits under ANYPS5_VBLANK_HZ stayed held to the 59.94 Hz vblank");
     std::printf("seven vblank waits took %.1f ms, six of them %.1f ms\n", std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitBegin).count(), waitedMs);
     check(sceVideoOutDeleteFlipEvent(queue, handle) == 0, "flip event unsubscription failed");
     check(sceKernelDeleteEqueue(queue) == 0, "the event queue was not deleted");
