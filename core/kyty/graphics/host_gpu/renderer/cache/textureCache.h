@@ -471,6 +471,9 @@ private:
 	bool             m_readback_linear_images = false;
 	bool             m_readback_tiled_images  = false;
 	bool             m_readback_storage_images = false;
+#if defined(ANYPS5_KYTY)
+	bool             m_readback_first_writes   = false;
+#endif
 	struct ExactLookup {
 		ImageInfo info;
 		ImageId   id;
