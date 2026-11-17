@@ -215,6 +215,22 @@ void StopGpu() {
     if (failure) std::rethrow_exception(failure);
 }
 
+void ReportPrestartFailure() {
+    auto& s = state();
+    std::lock_guard lock(s.prestartMutex);
+    if (s.prestart.joinable() || !s.prestartFailure) return;
+    try {
+        std::rethrow_exception(s.prestartFailure);
+    } catch (const ProcessShutdown&) {
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[kyty] GPU start failed: %s\n", error.what());
+        std::fflush(stderr);
+    } catch (...) {
+        std::fprintf(stderr, "[kyty] GPU start failed\n");
+        std::fflush(stderr);
+    }
+}
+
 void StopGpuAtExit() {
     try {
         StopGpu();
@@ -222,6 +238,12 @@ void StopGpuAtExit() {
         std::fprintf(stderr, "[kyty] GPU shutdown failed: %s\n", error.what());
         std::fflush(stderr);
     }
+    ReportPrestartFailure();
+}
+
+void RegisterStopAtExit() {
+    static std::once_flag registered;
+    std::call_once(registered, [] { LibcRegisterShutdown_nid_postfix(&StopGpuAtExit); });
 }
 
 std::uint32_t* AcquireFlipSlot() {
@@ -306,6 +328,7 @@ Libs::Graphics::RenderContext& Renderer() {
     if (s.startFailure) std::rethrow_exception(s.startFailure);
     CheckStopping();
     EnsureDriverMemory();
+    RegisterStopAtExit();
     std::exception_ptr failure;
     Libs::Graphics::RenderContext* started = nullptr;
     auto thread = Libc::StartHostThread([&failure, &started] {
@@ -323,8 +346,6 @@ Libs::Graphics::RenderContext& Renderer() {
         s.startFailure = failure;
         std::rethrow_exception(failure);
     }
-    static std::once_flag registered;
-    std::call_once(registered, [] { LibcRegisterShutdown_nid_postfix(&StopGpuAtExit); });
     s.renderer.store(started, std::memory_order_release);
     return *started;
 }
@@ -347,15 +368,6 @@ bool PrestartEnabled() {
     return text == "1";
 }
 
-void JoinPrestartAtExit() {
-    try {
-        JoinPrestart(false);
-    } catch (const std::exception& error) {
-        std::fprintf(stderr, "[kyty] GPU start at exit: %s\n", error.what());
-        std::fflush(stderr);
-    }
-}
-
 }
 
 void PrestartGpu() {
@@ -363,8 +375,8 @@ void PrestartGpu() {
     auto& s = state();
     std::lock_guard lock(s.prestartMutex);
     if (s.prestart.joinable() || s.prestartFailure || GpuStarted()) return;
-    static std::once_flag registered;
-    std::call_once(registered, [] { LibcRegisterShutdown_nid_postfix(&JoinPrestartAtExit); });
+    CheckStopping();
+    RegisterStopAtExit();
     s.prestart = Libc::StartHostThread([&s] {
         try {
             Renderer();
@@ -479,8 +491,10 @@ extern "C" void AgcDriverWaitIdle_nid_postfix() try {
     LibcAwaitExit_nid_postfix();
 }
 
-extern "C" void AgcDriverPrestartGpu_nid_postfix() {
+extern "C" void AgcDriverPrestartGpu_nid_postfix() try {
     KytyShim::Entry::PrestartGpu();
+} catch (const ProcessShutdown&) {
+    LibcAwaitExit_nid_postfix();
 }
 
 extern "C" void AgcDriverShutdown_nid_postfix() {
