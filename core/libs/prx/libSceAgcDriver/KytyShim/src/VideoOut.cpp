@@ -36,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <semaphore>
 #include <stdexcept>
 #include <string>
@@ -56,11 +57,30 @@ void WaitRendering(std::uint32_t handle, std::uint32_t index);
 
 namespace {
 
+struct PendingFlip {
+    std::shared_ptr<AgcDriver::IFlipRequest> request;
+    std::uint32_t handle = 0;
+    int index = 0;
+    std::optional<AgcDriver::DisplayBuffer> source;
+    Libs::Graphics::Presenter::Frame* frame = nullptr;
+};
+
+struct ReadyFlip {
+    std::weak_ptr<AgcDriver::IFlipRequest> request;
+    const void* owner = nullptr;
+    std::uint32_t handle = 0;
+    int index = 0;
+    std::optional<AgcDriver::DisplayBuffer> source;
+    Libs::Graphics::Presenter::Frame* frame = nullptr;
+};
+
 struct PresentationState {
     std::mutex mutex;
     std::unique_ptr<Libs::Graphics::WindowContext> window;
     std::unique_ptr<Libs::VideoOut::VideoOutDriver> driver;
-    std::map<std::uint64_t, std::shared_ptr<AgcDriver::IFlipRequest>> flips;
+    std::map<std::uint64_t, PendingFlip> flips;
+    std::vector<ReadyFlip> ready;
+    std::map<std::pair<std::uint32_t, int>, AgcDriver::DisplayBuffer> sources;
     std::uint64_t nextFlip = 1;
     void* windowHandle = nullptr;
     bool attaching = false;
@@ -197,7 +217,8 @@ void UpdateDrawableSize(Libs::Graphics::WindowContext& host, const AgcDriver::Pr
 }
 
 Libs::Graphics::ImageInfo DisplayImageInfo(const AgcDriver::DisplayBuffer& buffer) {
-    if (buffer.dccAddress != 0 || buffer.dccClearColor != 0) throw std::runtime_error("kyty presentation: DCC-compressed display buffers are not supported (AgcDriver::DisplayBuffer carries no DCC control word)");
+    const auto compression = Libs::Graphics::ClassifyVideoOutCompression(buffer.dccAddress != 0, buffer.dccAddress, buffer.dccControl, buffer.dccClearColor);
+    if (compression == Libs::Graphics::VideoOutCompression::Unsupported) throw std::runtime_error("kyty presentation: unsupported DCC display buffer, metadata " + std::to_string(buffer.dccAddress) + ", control " + std::to_string(buffer.dccControl) + ", clear color " + std::to_string(buffer.dccClearColor));
     if (buffer.tilingMode != 0 || buffer.pitchInPixel != 0) throw std::runtime_error("kyty presentation: only render-target tiled display buffers are supported, tiling " + std::to_string(buffer.tilingMode) + ", pitch " + std::to_string(buffer.pitchInPixel));
     if (buffer.width == 0 || buffer.height == 0 || buffer.width > 16384 || buffer.height > 16384) throw std::runtime_error("kyty presentation: invalid display buffer extent");
     if (buffer.address == 0 || (buffer.address & 65535u) != 0) throw std::runtime_error("kyty presentation: display buffer address is not 64 KiB aligned");
@@ -216,9 +237,60 @@ Libs::Graphics::ImageInfo DisplayImageInfo(const AgcDriver::DisplayBuffer& buffe
     info.bgra16 = format.bgra16;
     info.UpdateSize();
     if (info.data.size == 0 || info.tiling.block.block_size != 65536) throw std::runtime_error("kyty presentation: invalid display buffer footprint");
+    if (compression != Libs::Graphics::VideoOutCompression::Uncompressed) {
+        Libs::Graphics::TileSizeAlign dccSize{};
+        if (!Libs::Graphics::TileGetDccSize(buffer.width, buffer.height, 1, format.bytes_per_element, 1, Libs::Graphics::Prospero::TileMode::kRenderTarget, dccSize)) throw std::runtime_error("kyty presentation: invalid DCC footprint for the display buffer");
+        info.metadata.range = {buffer.dccAddress, dccSize.size};
+        info.metadata.kind = Libs::Graphics::ImageMetadataKind::Dcc;
+        info.metadata.compression = compression;
+    }
     Libs::Graphics::ImageOps::Validate(info);
     if (!Libs::Graphics::IsSupportedVideoOutFormat(info)) throw std::runtime_error("kyty presentation: unsupported normalized display format");
     return info;
+}
+
+std::optional<AgcDriver::DisplayBuffer> PresentedSource(std::uint32_t handle, int index) {
+    if (index < 0) return std::nullopt;
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    const auto found = state.sources.find({handle, index});
+    if (found == state.sources.end()) return std::nullopt;
+    return found->second;
+}
+
+std::optional<ReadyFlip> TakeReadyFlip(const void* context, Libs::Graphics::Presenter& presenter) {
+    std::optional<ReadyFlip> taken;
+    std::vector<Libs::Graphics::Presenter::Frame*> abandoned;
+    {
+        auto& state = State();
+        std::lock_guard lock(state.mutex);
+        for (auto flip = state.ready.begin(); flip != state.ready.end();) {
+            if (flip->request.expired()) {
+                if (flip->frame != nullptr) abandoned.push_back(flip->frame);
+                flip = state.ready.erase(flip);
+            } else if (!taken.has_value() && flip->owner == context) {
+                taken = std::move(*flip);
+                flip = state.ready.erase(flip);
+            } else {
+                ++flip;
+            }
+        }
+    }
+    for (auto* frame : abandoned) presenter.Discard(*frame);
+    if (!taken.has_value()) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) {
+            std::fprintf(stderr, "[kyty-videoout] a presentation matches no flip request of the Kyty GPU: the frame is prepared now, out of the flip's command buffer\n");
+            std::fflush(stderr);
+        }
+    }
+    return taken;
+}
+
+void RememberSource(const ReadyFlip& flip, const AgcDriver::DisplayBuffer& buffer) {
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    state.sources.insert_or_assign(std::pair{flip.handle, flip.index}, buffer);
 }
 
 }
@@ -247,16 +319,21 @@ VideoOutDriver::Impl& VideoOutDriver::State() noexcept {
     return *m_impl;
 }
 
-int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer&, int handle, int index, int flip_mode, int64_t flip_arg, uint64_t& request_id) {
+int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handle, int index, int flip_mode, int64_t flip_arg, uint64_t& request_id) {
     try {
         const auto output = KytyShim::Entry::VideoOutput(static_cast<std::uint32_t>(handle));
         if (output == nullptr) return VIDEO_OUT_ERROR_INVALID_HANDLE;
         auto request = output->TryReserve(AgcDriver::FlipInfo{static_cast<std::uint32_t>(handle), index, static_cast<std::uint32_t>(flip_mode), flip_arg});
         if (request == nullptr) return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
+        KytyShim::Present::PendingFlip pending{std::move(request), static_cast<std::uint32_t>(handle), index, KytyShim::Present::PresentedSource(static_cast<std::uint32_t>(handle), index), nullptr};
+        if (pending.source.has_value()) {
+            const auto info = KytyShim::Present::DisplayImageInfo(*pending.source);
+            pending.frame = &State().presenter.PrepareFrame(buffer, info, Graphics::IsHdrVideoOutPixelFormat(pending.source->pixelFormat), false);
+        }
         auto& state = KytyShim::Present::State();
         std::lock_guard lock(state.mutex);
         request_id = state.nextFlip++;
-        state.flips.emplace(request_id, std::move(request));
+        state.flips.emplace(request_id, std::move(pending));
         return OK;
     } catch (...) {
         KytyShim::Present::Stop("GPU flip submission", std::current_exception());
@@ -280,7 +357,9 @@ void VideoOutDriver::CompleteFlip(uint64_t request_id) {
             std::lock_guard lock(state.mutex);
             const auto found = state.flips.find(request_id);
             if (found == state.flips.end()) throw std::runtime_error("flip completion for an unknown request " + std::to_string(request_id));
-            request = std::move(found->second);
+            auto& pending = found->second;
+            request = std::move(pending.request);
+            state.ready.push_back({request, dynamic_cast<const void*>(request.get()), pending.handle, pending.index, std::move(pending.source), pending.frame});
             state.flips.erase(found);
         }
         request->GpuReady(std::make_shared<AgcDriver::FrameTiming>(request_id));
@@ -321,6 +400,8 @@ void VideoOutShutdown() {
         std::lock_guard lock(state.mutex);
         driver = std::move(state.driver);
         state.flips.clear();
+        state.ready.clear();
+        state.sources.clear();
     }
 }
 
@@ -470,6 +551,14 @@ extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::Presentation
     if (plane != nullptr) throw std::runtime_error("kyty presentation: the overlay video plane is not presented with ANYPS5_GPU_BACKEND=kyty");
     auto& host = KytyShim::Present::AttachedWindow(window);
     KytyShim::Present::UpdateDrawableSize(host, window);
+    auto& presenter = *host.presenter;
+    const auto flip = KytyShim::Present::TakeReadyFlip(context, presenter);
+    if (flip.has_value() && flip->frame != nullptr && flip->source == buffer) {
+        presenter.Present(*flip->frame);
+        gpuReady(context);
+        return;
+    }
+    if (flip.has_value() && flip->frame != nullptr) presenter.Discard(*flip->frame);
     const auto info = KytyShim::Present::DisplayImageInfo(buffer);
     const bool hdr = Libs::Graphics::IsHdrVideoOutPixelFormat(buffer.pixelFormat);
     struct Prepared {
@@ -478,7 +567,6 @@ extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::Presentation
     };
     auto prepared = std::make_shared<Prepared>();
     auto& renderer = *host.render_context;
-    auto& presenter = *host.presenter;
     renderer.GetGpu().SendUrgentCommandSync([&renderer, &presenter, info, hdr, prepared] {
         auto& scheduler = renderer.GetCommandScheduler();
         prepared->frame = &presenter.PrepareFrame(scheduler.Current(), info, hdr, false);
@@ -486,6 +574,7 @@ extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::Presentation
         scheduler.Flush();
     });
     prepared->done.acquire();
+    if (flip.has_value()) KytyShim::Present::RememberSource(*flip, buffer);
     presenter.Present(*prepared->frame);
     gpuReady(context);
 }
@@ -497,6 +586,7 @@ extern "C" void AgcDriverPresentClear_nid_postfix(const AgcDriver::PresentationW
     auto& host = KytyShim::Present::AttachedWindow(window);
     KytyShim::Present::UpdateDrawableSize(host, window);
     auto& presenter = *host.presenter;
+    if (const auto flip = KytyShim::Present::TakeReadyFlip(context, presenter); flip.has_value() && flip->frame != nullptr) presenter.Discard(*flip->frame);
     presenter.Present(presenter.PrepareBlankFrame(window.width, window.height, opaque));
     gpuReady(context);
 }

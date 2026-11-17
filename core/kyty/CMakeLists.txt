@@ -194,19 +194,16 @@ option(KYTY_THIN_LTO "Optimize kyty_gpu across translation units with ThinLTO, a
 set(KYTY_THIN_LTO_JOBS "0" CACHE STRING "Parallel ThinLTO back-end jobs of the lld pre-link, 0 for lld's default")
 set(KYTY_BUNDLE_TARGETS kyty_gpu fmt xxhash TracyClient zarchive libzstd_static SPIRV-Tools-opt SPIRV-Tools-static)
 if(KYTY_THIN_LTO)
-    get_filename_component(kytyCompilerPath "${CMAKE_CXX_COMPILER}" REALPATH)
-    get_filename_component(kytyCompilerDir "${kytyCompilerPath}" DIRECTORY)
     string(REGEX MATCH "^[0-9]+" kytyClangMajor "${CMAKE_CXX_COMPILER_VERSION}")
-    find_program(KYTY_LLD NAMES ld.lld HINTS "${kytyCompilerDir}" NO_DEFAULT_PATH)
-    find_program(KYTY_LLD NAMES "ld.lld-${kytyClangMajor}" ld.lld)
-    if(NOT KYTY_LLD)
-        message(FATAL_ERROR "KYTY_THIN_LTO pre-links kyty_gpu with lld, but no ld.lld was found beside ${kytyCompilerPath}: install lld-${kytyClangMajor}, or configure AnyPS5 with -DANYPS5_KYTY_THIN_LTO=OFF")
+    execute_process(COMMAND "${CMAKE_CXX_COMPILER}" -fuse-ld=lld -Wl,--version RESULT_VARIABLE kytyLldResult OUTPUT_VARIABLE kytyLldVersion ERROR_VARIABLE kytyLldError OUTPUT_STRIP_TRAILING_WHITESPACE)
+    if(NOT kytyLldResult EQUAL 0 OR NOT kytyLldVersion MATCHES "LLD")
+        message(FATAL_ERROR "KYTY_THIN_LTO pre-links kyty_gpu with lld, but ${CMAKE_CXX_COMPILER} -fuse-ld=lld finds no lld (${kytyLldError}): install lld-${kytyClangMajor}, or configure AnyPS5 with -DANYPS5_KYTY_THIN_LTO=OFF")
     endif()
     set_target_properties(kyty_gpu fmt xxhash TracyClient zarchive libzstd_static PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
     set_target_properties(kyty_gpu PROPERTIES OUTPUT_NAME kyty_gpu_bitcode)
     string(TOUPPER "${CMAKE_BUILD_TYPE}" kytyConfig)
     separate_arguments(kytyPrelinkFlags UNIX_COMMAND "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${kytyConfig}}")
-    set(kytyPrelinkOptions -flto=thin -fuse-ld=lld "--ld-path=${KYTY_LLD}" -nostdlib -r
+    set(kytyPrelinkOptions -flto=thin -fuse-ld=lld -nostdlib -r
         "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache"
         "-Wl,--thinlto-cache-policy=prune_after=72h:cache_size_bytes=8g")
     if(NOT KYTY_THIN_LTO_JOBS STREQUAL "0")

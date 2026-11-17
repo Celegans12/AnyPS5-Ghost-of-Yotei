@@ -42,9 +42,9 @@ void FullTitle() {
         "applicationCategoryType": 0,
         "attribute": 4,
         "attribute3": 4194304,
-        "contentId": "EP5426-PPSA02453_00-5534558887319441",
+        "contentId": "EP0000-TEST00453_00-0000000000000001",
         "contentVersion": "01.022.394",
-        "titleId": "PPSA02453",
+        "titleId": "TEST00453",
         "userDefinedParam1": -1,
         "userDefinedParam2": 4294967295,
         "userDefinedParam3": 1.5,
@@ -57,8 +57,8 @@ void FullTitle() {
     })");
     Expect(parsed.has_value(), "a PS5 param.json parses");
     if (!parsed.has_value()) return;
-    ExpectText(*parsed, "TITLE_ID", "PPSA02453", "titleId is TITLE_ID");
-    ExpectText(*parsed, "CONTENT_ID", "EP5426-PPSA02453_00-5534558887319441", "contentId is CONTENT_ID");
+    ExpectText(*parsed, "TITLE_ID", "TEST00453", "titleId is TITLE_ID");
+    ExpectText(*parsed, "CONTENT_ID", "EP0000-TEST00453_00-0000000000000001", "contentId is CONTENT_ID");
     ExpectText(*parsed, "APP_VER", "01.022.394", "contentVersion is APP_VER");
     ExpectNumber(*parsed, "ATTRIBUTE", 4, "attribute is ATTRIBUTE");
     ExpectNumber(*parsed, "ATTRIBUTE3", 4194304, "attribute3 is ATTRIBUTE3");
@@ -71,11 +71,11 @@ void FullTitle() {
 }
 
 void Defaults() {
-    const auto parsed = ParseParamJson("\xEF\xBB\xBF{\"titleId\": \"CUSA00001\", \"contentVersion\": \"01.000\", \"appVersion\": \"02.000\", \"titleId\": \"PPSA00002\","
+    const auto parsed = ParseParamJson("\xEF\xBB\xBF{\"titleId\": \"TEST00001\", \"contentVersion\": \"01.000\", \"appVersion\": \"02.000\", \"titleId\": \"TEST00002\","
                                        " \"localizedParameters\": {\"de-DE\": {\"titleName\": \"Erster\"}, \"en-US\": {\"titleName\": \"English\"}}}");
     Expect(parsed.has_value(), "a param.json with a byte order mark parses");
     if (!parsed.has_value()) return;
-    ExpectText(*parsed, "TITLE_ID", "PPSA00002", "a repeated key keeps its last value");
+    ExpectText(*parsed, "TITLE_ID", "TEST00002", "a repeated key keeps its last value");
     ExpectText(*parsed, "APP_VER", "02.000", "appVersion overrides contentVersion");
     ExpectNumber(*parsed, "ATTRIBUTE", 0, "ATTRIBUTE defaults to 0");
     Expect(Find(*parsed, "ATTRIBUTE3") == nullptr, "a missing attribute3 is absent");
@@ -94,8 +94,8 @@ void Defaults() {
 void Invalid() {
     Expect(!ParseParamJson("").has_value(), "an empty file is not a param.json");
     Expect(!ParseParamJson("[1, 2]").has_value(), "an array is not a param.json");
-    Expect(!ParseParamJson(R"({"titleId": "PPSA00001",})").has_value(), "a trailing comma is rejected");
-    Expect(!ParseParamJson(R"({"titleId": "PPSA00001"} x)").has_value(), "text after the document is rejected");
+    Expect(!ParseParamJson(R"({"titleId": "TEST00001",})").has_value(), "a trailing comma is rejected");
+    Expect(!ParseParamJson(R"({"titleId": "TEST00001"} x)").has_value(), "text after the document is rejected");
     Expect(!ParseParamJson(R"({"titleId": "\ud800"})").has_value(), "a lone surrogate is rejected");
     Expect(!ParseParamJson(R"({"attribute": 01})").has_value(), "a leading zero is rejected");
     Expect(!ParseParamJson("{\"titleId\": \"a\nb\"}").has_value(), "a raw control character in a string is rejected");
