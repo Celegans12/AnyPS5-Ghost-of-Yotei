@@ -218,6 +218,11 @@ void RequireLogicalProtection() {
     Require(GuestWriteWatch::GuestWriteWatchReadTrapsHeld_nid_postfix());
     FinishWork();
     Release(5, 2);
+    Require(GuestWriteWatch::GuestWriteWatchProtection_nid_postfix(Address(5), Address(8), &runEnd) == (PROT_READ | PROT_WRITE));
+    const auto asleep = Counts();
+    Require(ReadWord(5, 0) == ReadWord(5, 0));
+    Require(Counts().faults == asleep.faults && Counts().dormantOpens == asleep.dormantOpens + 1);
+    for (int sweep = 0; sweep < 4; ++sweep) GuestWriteWatch::GuestWriteWatchSweepReadTraps_nid_postfix();
     Require(GuestWriteWatch::GuestWriteWatchProtection_nid_postfix(Address(5), Address(8), &runEnd) == -1);
     Require(!GuestWriteWatch::GuestWriteWatchReadTrapsHeld_nid_postfix());
 }
@@ -356,6 +361,97 @@ void RequireRefusals() {
     Require(!GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(unaligned, 64));
 }
 
+void RequireWriteTraps() {
+    GuestWord(13, 0) = 70;
+    GuestWord(13, 1) = 71;
+    StartWork();
+    Require(GuestWriteWatch::GuestWriteWatchTrapWrites_nid_postfix(Address(13), 8));
+    const auto before = Counts();
+    Require(ReadWord(13, 0) == 70);
+    Require(ReadWord(13, 1) == 71);
+    Require(Counts().faults == before.faults);
+    std::uintptr_t runEnd = 0;
+    Require(GuestWriteWatch::GuestWriteWatchProtection_nid_postfix(Address(13), Address(14), &runEnd) == (PROT_READ | PROT_WRITE));
+    auto landing = LandLater(13, 0, 72, std::chrono::milliseconds(20));
+    const auto start = std::chrono::steady_clock::now();
+    reinterpret_cast<volatile std::uint32_t*>(guest + 13 * Page)[1] = 73;
+    Require(Milliseconds(start) >= 10.0);
+    landing.join();
+    Require(Counts().faults == before.faults + 1);
+    Require(ReadWord(13, 0) == 72);
+    Require(ReadWord(13, 1) == 73);
+    GuestWriteWatch::GuestWriteWatchReleaseWrites_nid_postfix(Address(13), 8);
+
+    StartWork();
+    Require(GuestWriteWatch::GuestWriteWatchTrapWrites_nid_postfix(Address(13), 8));
+    Require(Trap(13, 1, 64, 64));
+    const auto both = Counts();
+    std::uint32_t seen = 0;
+    auto reader = std::thread([&] { seen = ReadWord(13, 0); });
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    GpuWord(13, 0) = 74;
+    FinishWork();
+    reader.join();
+    Require(seen == 74);
+    Require(Counts().faults == both.faults + 1);
+    Release(13, 1, 64, 64);
+    StartWork();
+    Require(GuestWriteWatch::GuestWriteWatchTrapWrites_nid_postfix(Address(13), 8));
+    Require(Trap(13, 1, 64, 64));
+    Release(13, 1, 64, 64);
+    const auto readable = Counts();
+    Require(ReadWord(13, 0) == 74);
+    Require(Counts().faults == readable.faults);
+    auto last = LandLater(13, 0, 75, std::chrono::milliseconds(20));
+    reinterpret_cast<volatile std::uint32_t*>(guest + 13 * Page)[3] = 76;
+    last.join();
+    Require(ReadWord(13, 0) == 75 && ReadWord(13, 3) == 76);
+    GuestWriteWatch::GuestWriteWatchReleaseWrites_nid_postfix(Address(13), 8);
+    GuestWriteWatch::GuestWriteWatchReleaseWrites_nid_postfix(Address(13), 8);
+    Require(Counts().holds == 0);
+}
+
+void RequireDormantHolds() {
+    GuestWord(12, 0) = 80;
+    const auto start = Counts();
+    StartWork();
+    Require(Trap(12, 1));
+    FinishWork();
+    Release(12, 1);
+    const auto before = Counts();
+    Require(before.dormant == start.dormant + 1);
+    StartWork();
+    Require(Trap(12, 1));
+    Require(Counts().revived == before.revived + 1);
+    auto landing = LandLater(12, 0, 81, std::chrono::milliseconds(20));
+    Require(ReadWord(12, 0) == 81);
+    landing.join();
+    Require(Counts().faults == before.faults + 1);
+    Release(12, 1);
+    StartWork();
+    Require(Trap(12, 1));
+    FinishWork();
+    Release(12, 1);
+    const auto opened = Counts();
+    Require(ReadWord(12, 0) == 81);
+    Require(Counts().faults == opened.faults && Counts().dormantOpens == opened.dormantOpens + 1);
+    StartWork();
+    Require(Trap(12, 1));
+    Require(Counts().revived == opened.revived);
+    auto again = LandLater(12, 0, 82, std::chrono::milliseconds(20));
+    Require(ReadWord(12, 0) == 82);
+    again.join();
+    Release(12, 1);
+    std::vector<std::byte> buffer(16);
+    StartWork();
+    Require(Trap(12, 1));
+    FinishWork();
+    Release(12, 1);
+    Require(GuestCopyIn_nid_no_patch(buffer.data(), guest + 12 * Page, buffer.size()));
+    for (int sweep = 0; sweep < 4; ++sweep) GuestWriteWatch::GuestWriteWatchSweepReadTraps_nid_postfix();
+    Require(Counts().dormant == 0);
+}
+
 void RequireUnregister() {
     GuestWord(14, 0) = 60;
     StartWork();
@@ -393,6 +489,8 @@ int main() {
     RequireThreads();
     RequireSystemCalls();
     RequireRefusals();
+    RequireWriteTraps();
+    RequireDormantHolds();
     RequireUnregister();
     const auto counts = Counts();
     Require(counts.forcedOpens == 0);
