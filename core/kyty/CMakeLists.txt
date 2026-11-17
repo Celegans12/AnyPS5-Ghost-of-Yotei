@@ -177,6 +177,8 @@ target_include_directories(kyty_gpu SYSTEM
     PRIVATE
         "${KYTY_THIRD_PARTY_DIR}/stb"
         "${KYTY_THIRD_PARTY_DIR}/zstd/lib"
+        "${KYTY_THIRD_PARTY_DIR}/ffx-api"
+        "${ANYPS5_SOURCE_DIR}/core/libs/prx/libSceAgcDriver/KytyShim/compat"
 )
 target_link_libraries(kyty_gpu
     PUBLIC fmt::fmt xxhash xbyak::xbyak kyty_magic_enum TracyClient
