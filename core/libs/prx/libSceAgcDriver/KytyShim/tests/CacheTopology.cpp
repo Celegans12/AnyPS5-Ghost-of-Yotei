@@ -71,32 +71,27 @@ int main() {
     Require(Common::ParseCacheSize("512") == 512, "size in bytes");
     Require(Common::ParseCacheSize("") == 0 && Common::ParseCacheSize("12Q") == 0, "bad sizes");
 
-    // Ryzen 9 7950X3D: the 96 MiB L3 of CPUs 0-7,16-23 wins over the 32 MiB one.
     auto root = Fresh("x3d");
     TwoCcds(root, "98304K", "32768K");
-    Require(Common::LargestCacheCpus(root) == Join(Range(0, 7), Range(16, 23)), "7950X3D: L3 with the 3D cache");
+    Require(Common::LargestCacheCpus(root) == Join(Range(0, 7), Range(16, 23)), "7950X3D: the 96 MiB L3 of CPUs 0-7,16-23 wins over the 32 MiB one");
 
-    // The 3D cache on the second CCD.
     root = Fresh("x3d_second");
     TwoCcds(root, "32768K", "98304K");
-    Require(Common::LargestCacheCpus(root) == Join(Range(8, 15), Range(24, 31)), "3D cache on the second CCD");
+    Require(Common::LargestCacheCpus(root) == Join(Range(8, 15), Range(24, 31)), "3D cache on the second CCD: its CPUs 8-15,24-31 win");
 
-    // Equal L3 (7950X): the one holding the lowest CPU.
     root = Fresh("equal");
     TwoCcds(root, "32M", "32768K");
-    Require(Common::LargestCacheCpus(root) == Join(Range(0, 7), Range(16, 23)), "equal L3: lowest CPU");
+    Require(Common::LargestCacheCpus(root) == Join(Range(0, 7), Range(16, 23)), "equal L3 (7950X): the one holding the lowest CPU wins");
 
-    // One L3 for every CPU: that whole set.
     root = Fresh("single");
     for (int cpu = 0; cpu < 8; ++cpu) Cache(root, cpu, 3, 3, "32768K", "0-7");
-    Require(Common::LargestCacheCpus(root) == Range(0, 7), "single L3");
+    Require(Common::LargestCacheCpus(root) == Range(0, 7), "one L3 for every CPU: that whole set");
 
-    // No cache description, or none readable: no placement.
     root = Fresh("none");
     std::filesystem::create_directories(root / "cpu0");
     Write(root / "cpu1" / "cache" / "index3" / "level", "3");
-    Require(Common::LargestCacheCpus(root).empty(), "no cache description");
-    Require(Common::LargestCacheCpus(root / "missing").empty(), "missing sysfs root");
+    Require(Common::LargestCacheCpus(root).empty(), "no readable cache description: no placement");
+    Require(Common::LargestCacheCpus(root / "missing").empty(), "missing sysfs root: no placement");
 
     for (const char* name : {"x3d", "x3d_second", "equal", "single", "none"}) {
         std::filesystem::remove_all(std::filesystem::temp_directory_path() / ("kyty_cache_topology_" + std::to_string(::getpid()) + "_" + name));
