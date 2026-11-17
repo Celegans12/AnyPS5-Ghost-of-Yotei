@@ -100,9 +100,10 @@ constexpr std::size_t FinisherSlot = 1;
 constexpr std::size_t PoolSlots = 15;
 constexpr std::size_t DecodeSlot = 2 + PoolSlots;
 constexpr std::size_t WalkerSlot = 3 + PoolSlots;
+constexpr std::size_t EncoderSlot = 4 + PoolSlots;
 
 std::mutex reservationMutex;
-std::array<std::optional<Reservation>, 4 + PoolSlots> reservations;
+std::array<std::optional<Reservation>, 5 + PoolSlots> reservations;
 #ifdef __linux__
 std::vector<unsigned long> workerThreads;
 std::vector<std::uint32_t> pipelineCpus;
@@ -185,7 +186,7 @@ bool HoldsReservation(unsigned long thread) {
     return false;
 }
 
-void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical) {
+void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical, bool lowest = false) {
 #ifdef _WIN32
     using SetCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
     static const auto setDefault = ThreadName::Resolve<SetCpuSets>("SetProcessDefaultCpuSets");
@@ -214,7 +215,7 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
     if (slot >= FinisherSlot && !reservations[CommitterSlot].has_value() && Switches().committer) {
         if (const auto ahead = CpuTopology::ChooseReservedCore(sets, taken, Switches().logical)) taken.push_back(ahead->chosen);
     }
-    auto reservation = CpuTopology::ChooseReservedCore(sets, taken, logical);
+    auto reservation = CpuTopology::ChooseReservedCore(sets, taken, logical, lowest);
     if (!reservation.has_value()) {
         if (logical.has_value()) std::fprintf(stderr, "[affinity] %s: APS5_COMMITTER_CPU=%u names no free logical processor of the process, no core reserved\n", role, *logical);
         return;
@@ -309,6 +310,19 @@ void ReserveWalkerCore() {
         if (HoldsReservation(CurrentThread())) return;
     }
     if (const auto unreserved = CpuTopology::UnreservedMask().load(std::memory_order_acquire); unreserved != 0) CpuTopology::PinTraced("collect walker", nullptr, unreserved);
+#endif
+}
+
+void ReserveEncoderCore() {
+#if defined(_WIN32) || defined(__linux__)
+    if (Switches().finisher) Reserve(EncoderSlot, "draw encoder", std::nullopt, true);
+#endif
+#ifdef __linux__
+    {
+        std::lock_guard lock(reservationMutex);
+        if (HoldsReservation(CurrentThread())) return;
+    }
+    if (const auto unreserved = CpuTopology::UnreservedMask().load(std::memory_order_acquire); unreserved != 0) CpuTopology::PinTraced("draw encoder", nullptr, unreserved);
 #endif
 }
 

@@ -12,6 +12,7 @@
 #endif
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/OffThreadEncoding.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Float16ConversionProbe.hpp"
@@ -1267,6 +1268,7 @@ struct VulkanDevice::State {
                 destroyPool(device, pool, nullptr);
             }
             if (settlePool != VK_NULL_HANDLE) destroyPool(device, settlePool, nullptr);
+            Graphics::OffThreadEncoding::Forget(device);
             Graphics::DestroyDeferredObjects(device);
             destroyDevice(device, nullptr);
             Graphics::MemoryAccounting::ForgetDevice(device);
@@ -2535,6 +2537,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     state->shaderProfile = std::move(shaderProfile);
     if (compileOnly) return;
+    state->deviceProc = Graphics::OffThreadEncoding::Wrap(state->device, state->deviceProc);
     if (state->deferDestruction) state->contextDeviceProc = Graphics::DeferDestructionToIdle(state->device, state->deviceProc);
     if (calibratedTimestamps != nullptr) {
         const bool khr = std::strcmp(calibratedTimestamps, VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME) == 0;

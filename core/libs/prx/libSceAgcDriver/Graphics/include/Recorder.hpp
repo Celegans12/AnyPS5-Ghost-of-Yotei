@@ -875,6 +875,7 @@ private:
     };
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
+        bool encoded = false;
         VkCommandBuffer twinCommands = VK_NULL_HANDLE;
         VkQueryPool twinQueries = VK_NULL_HANDLE;
         std::vector<TwinCopy> twinCopies;

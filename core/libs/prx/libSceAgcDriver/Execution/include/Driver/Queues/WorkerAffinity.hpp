@@ -17,6 +17,8 @@ void ReserveFinisherPoolCore(unsigned index);
 
 void ReserveWalkerCore();
 
+void ReserveEncoderCore();
+
 void NameDriverThread(const char* name);
 
 }

@@ -91,7 +91,7 @@ struct CoreReservation {
     std::vector<std::uint32_t> others;
 };
 
-inline std::optional<CoreReservation> ChooseReservedCore(const std::vector<CpuSet>& sets, const std::vector<CpuSet>& reserved, std::optional<unsigned> logical) {
+inline std::optional<CoreReservation> ChooseReservedCore(const std::vector<CpuSet>& sets, const std::vector<CpuSet>& reserved, std::optional<unsigned> logical, bool lowest = false) {
     constexpr std::size_t minimumCores = 6;
     const auto sameCore = [](const CpuSet& left, const CpuSet& right) { return left.group == right.group && left.core == right.core; };
     const auto held = [&](const CpuSet& set) {
@@ -137,7 +137,7 @@ inline std::optional<CoreReservation> ChooseReservedCore(const std::vector<CpuSe
         if (cores.size() < minimumCores) return std::nullopt;
         for (const auto& set : sets) {
             if (!candidate(set) || held(set) || parked(set)) continue;
-            if (chosen == nullptr || set.core > chosen->core || (set.core == chosen->core && set.logical < chosen->logical)) chosen = &set;
+            if (chosen == nullptr || (lowest ? set.core < chosen->core : set.core > chosen->core) || (set.core == chosen->core && set.logical < chosen->logical)) chosen = &set;
         }
     }
     if (chosen == nullptr || held(*chosen)) return std::nullopt;

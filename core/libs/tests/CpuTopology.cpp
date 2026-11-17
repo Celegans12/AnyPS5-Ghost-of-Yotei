@@ -61,6 +61,11 @@ static void ReservedCoreTests() {
         if (set.logical == set.core) everyCore.push_back(set);
     }
     Require(!ChooseReservedCore(eight, everyCore, std::nullopt).has_value(), "no core is left once every core is reserved");
+    const auto bottom = ChooseReservedCore(eight, {committer->chosen}, std::nullopt, true);
+    Require(bottom.has_value() && bottom->chosen.logical == 0 && bottom->chosen.core == 0, "a lowest-first reservation takes the first logical processor of the lowest-numbered core");
+    Require(bottom->others == IdsExcept(eight, {0, 1, 14, 15}), "a lowest-first reservation keeps the earlier one out of the other CPU sets");
+    const auto afterBottom = ChooseReservedCore(eight, {committer->chosen, bottom->chosen}, std::nullopt);
+    Require(afterBottom.has_value() && afterBottom->chosen.logical == 12, "a lowest-first reservation leaves the next highest core to the following reservation");
 
     auto parked = eight;
     parked[15].parked = true;

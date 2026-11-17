@@ -17,6 +17,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DeferredDestruction.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/OffThreadEncoding.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
@@ -2800,11 +2801,15 @@ void Recorder::ensureOpen() {
         auto batch = std::make_unique<Batch>();
         try {
             batch->gpuFlight = GuestMemory::BeginGpuFlight();
-            VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-            allocation.commandPool = context.pool;
-            allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            allocation.commandBufferCount = 1;
-            Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &batch->commands), "vkAllocateCommandBuffers recorder");
+            batch->commands = OffThreadEncoding::Acquire(context.queueFamily);
+            batch->encoded = batch->commands != VK_NULL_HANDLE;
+            if (!batch->encoded) {
+                VkCommandBufferAllocateInfo allocation{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                allocation.commandPool = context.pool;
+                allocation.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                allocation.commandBufferCount = 1;
+                Check(context.Function<PFN_vkAllocateCommandBuffers>("vkAllocateCommandBuffers")(context.device, &allocation, &batch->commands), "vkAllocateCommandBuffers recorder");
+            }
             if (!spare.empty()) {
                 batch->fence = spare.back();
                 spare.pop_back();
@@ -2814,7 +2819,8 @@ void Recorder::ensureOpen() {
             }
             VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
             begin.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-            Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(batch->commands, &begin), "vkBeginCommandBuffer recorder");
+            if (batch->encoded) OffThreadEncoding::Begin(batch->commands, begin.flags);
+            else Check(function(beginCommandBuffer, "vkBeginCommandBuffer")(batch->commands, &begin), "vkBeginCommandBuffer recorder");
             static const bool suppress = std::getenv("APS5_NO_STATE_SUPPRESSION") == nullptr;
             batch->graphicsState.Begin(batch->commands, suppress, EmptyScissorMeasured());
         } catch (...) {
@@ -5845,7 +5851,7 @@ void Recorder::Submit() {
             if (batch != nullptr && !batch->submitted) recorder.discard(std::move(batch));
         }
     } discardUnsubmitted{*this, batch};
-    Check(function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
+    Check(batch->encoded ? OffThreadEncoding::End(batch->commands) : function(endCommandBuffer, "vkEndCommandBuffer")(batch->commands), "vkEndCommandBuffer recorder");
     if (injectedSubmitFailures.load(std::memory_order_relaxed) != 0 && injectedSubmitFailures.fetch_sub(1, std::memory_order_relaxed) != 0) throw std::runtime_error("vkQueueSubmit recorder: injected failure");
     if (!batch->twinCopies.empty()) recordTwinCopies(*batch);
     const std::array<VkCommandBuffer, 2> ordered{batch->twinCommands, batch->commands};
@@ -6542,7 +6548,9 @@ void Recorder::release(Batch& batch) noexcept {
     batch.segments = VK_NULL_HANDLE;
     batch.segmentPool.reset();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (batch.commands != VK_NULL_HANDLE) {
+    if (batch.commands != VK_NULL_HANDLE && batch.encoded) {
+        OffThreadEncoding::Retire(batch.commands);
+    } else if (batch.commands != VK_NULL_HANDLE) {
         context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &batch.commands);
         if (profile) commandBuffersFreed.fetch_add(1, std::memory_order_relaxed);
     }
