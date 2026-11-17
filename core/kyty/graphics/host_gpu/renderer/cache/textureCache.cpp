@@ -25,6 +25,7 @@
 #include <cinttypes>
 #if defined(ANYPS5_KYTY)
 #include <cstdlib>
+#include <string_view>
 #endif
 #include <cstring>
 #include <limits>
@@ -136,9 +137,13 @@ TextureCache::TextureCache(GraphicContext& graphics, CommandScheduler& scheduler
       m_readback_tiled_images(Config::ReadbackTiledImagesEnabled()),
       m_readback_storage_images(Config::ReadbackStorageImagesEnabled()) {
 #if defined(ANYPS5_KYTY)
-	const char* write_back    = std::getenv("KYTY_WRITE_BACK_IMAGES");
+	const char*            write_back = std::getenv("KYTY_WRITE_BACK_IMAGES");
+	const std::string_view write_back_value {write_back == nullptr ? "" : write_back};
+	if (!write_back_value.empty() && write_back_value != "0" && write_back_value != "1") {
+		EXIT("invalid KYTY_WRITE_BACK_IMAGES: %s (0 or 1)\n", write_back);
+	}
 	m_readback_first_writes   = m_readback_storage_images;
-	m_readback_storage_images = m_readback_storage_images || write_back == nullptr || write_back[0] != '0';
+	m_readback_storage_images = m_readback_storage_images || write_back_value != "0";
 #endif
 	if (m_graphics.CanReportMemoryUsage()) {
 		constexpr int64_t GiB = 1024ll * 1024 * 1024;

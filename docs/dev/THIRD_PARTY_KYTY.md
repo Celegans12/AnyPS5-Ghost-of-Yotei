@@ -160,4 +160,5 @@ read that way and the street stays almost black. Under `ANYPS5_KYTY`, the write-
 default: at each `ACQUIRE_MEM` or `RELEASE_MEM` with GL2 write-back and at each flip, the images already queued for
 readback are copied back, and their pages stay read-protected until the copy lands. No other image is copied: the copy
 of every storage image on its first write still needs `KYTY_READBACK_STORAGE_IMAGES=1`. `KYTY_WRITE_BACK_IMAGES=0`
-restores KytyPS5's behaviour.
+restores KytyPS5's behaviour; any value other than empty, `0` or `1` stops the emulator with a message naming the
+variable.
