@@ -1,6 +1,7 @@
 #include "prx/libSceVideoOut/include/DisplayWindow.hpp"
 #include "prx/libSceVideoOut/include/Telemetry.hpp"
 
+#include <cstdlib>
 #include <chrono>
 #include <cstdio>
 #ifdef _WIN32
@@ -135,6 +136,9 @@ void contractPadAndPresentLines() {
 }
 
 int frameNumberMatchesCaption() {
+#ifndef _WIN32
+    setenv("APS5_TITLE_EVERY_FRAME", "1", 1);
+#endif
     const auto directory = freshDirectory("caption");
     std::filesystem::create_directories(directory / "app0" / "sce_sys");
     std::ofstream(directory / "app0" / "sce_sys" / "param.json") << R"({"titleId":"PPSA00000","localizedParameters":{"defaultLanguage":"en-US","en-US":{"titleName":"Telemetry Test"}}})";

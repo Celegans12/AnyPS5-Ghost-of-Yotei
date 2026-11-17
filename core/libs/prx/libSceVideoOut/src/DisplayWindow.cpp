@@ -158,12 +158,24 @@ void DisplayWindow::DrawableSize(std::uint32_t& width, std::uint32_t& height) co
     height = drawableHeight > 0 ? static_cast<std::uint32_t>(drawableHeight) : 0;
 }
 
+namespace {
+bool TitleEveryFrame() {
+#ifdef _WIN32
+    return true;
+#else
+    return std::getenv("APS5_TITLE_EVERY_FRAME") != nullptr;
+#endif
+}
+}
+
 void DisplayWindow::UpdateTitle() {
     require(window != nullptr, "window must exist before updating title");
     static const AppTitle title = GetAppTitle_nid_postfix();
     static auto fpsStart = std::chrono::steady_clock::now();
     static std::uint64_t fpsFrames = 0;
     static double currentFps = 0.0;
+    static const bool everyFrame = TitleEveryFrame();
+    static auto titleSet = std::chrono::steady_clock::time_point{};
     const auto now = std::chrono::steady_clock::now();
     frameNum++;
     fpsFrames++;
@@ -173,9 +185,12 @@ void DisplayWindow::UpdateTitle() {
         fpsStart = now;
         fpsFrames = 0;
     }
-    char text[160];
-    std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu)", title.value, currentFps, static_cast<unsigned long long>(frameNum));
-    SDL_SetWindowTitle(window, text);
+    if (everyFrame || frameNum == 1 || now - titleSet >= std::chrono::seconds(1)) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "%s | FPS: %.2f (%llu)", title.value, currentFps, static_cast<unsigned long long>(frameNum));
+        SDL_SetWindowTitle(window, text);
+        titleSet = now;
+    }
     if (fullscreen) fullscreen->Refresh(MouseIsOpen_nid_no_patch());
     if (auto* telemetry = VideoOutTelemetry::Instance(); telemetry != nullptr && (frameNum == 1 || frameNum % 30 == 0)) telemetry->EmitPresent(frameNum, currentFps);
 }
