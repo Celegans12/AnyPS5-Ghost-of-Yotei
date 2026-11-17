@@ -311,6 +311,17 @@ void TestHeapCommitSecondView() {
     std::vector<std::uint8_t> read(bytes, 0xcc);
     Require(Memory::TryReadBacking(address, read.data(), bytes) && read == zeros);
     GuestArena::GuestArenaReset_nid_postfix(heap, bytes);
+
+    const auto beforePartial = Memory::BackingEpoch();
+    bool refused = false;
+    try {
+        GuestArena::GuestArenaCommit_nid_postfix(heap, 0x1000, 0x04, 0x1000);
+    } catch (const std::invalid_argument&) {
+        refused = true;
+    }
+    Require(refused && Memory::BackingEpoch() == beforePartial && !Memory::IsBackingReadable(address, 0x1000));
+    std::uint8_t byte = 0;
+    Require(!GuestCopyIn_nid_no_patch(&byte, heap, 1));
     GuestArena::GuestArenaRelease_nid_postfix(heap, bytes);
     std::printf("libc arena commit 0x%llx: second view from the guest memory file, dropped on reset, zeroed on recommit, never probed\n", static_cast<unsigned long long>(address));
 }
