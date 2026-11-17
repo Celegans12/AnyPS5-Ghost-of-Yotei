@@ -25,6 +25,8 @@ struct DisplayBuffer {
     std::uint32_t alignment = 65536;
 #if defined(ANYPS5_KYTY)
     std::uint32_t dccControl = 0;
+
+    bool operator==(const DisplayBuffer&) const = default;
 #endif
 };
 
