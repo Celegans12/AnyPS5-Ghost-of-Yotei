@@ -13,9 +13,9 @@ AnyPS5 keeps everything it does today: the relinker, `libkernel`, every system l
 | Vulkan rendering and caches | AnyPS5 renderer | Kyty renderer, buffer, texture and pipeline caches, recorder thread |
 | Shader recompiler | AnyPS5 recompiler (`core/shader/recompiler`) | Kyty recompiler (`core/kyty/graphics/shader/recompiler`) |
 | GPU view of game memory | AnyPS5 imports and write tracking | Kyty model: every guest page has a second view, writes are tracked by page faults |
-| Presentation | AnyPS5 presentation | Kyty swapchain and flip queue, on AnyPS5's window |
+| Presentation | AnyPS5 presentation | Kyty presenter and swapchain, on AnyPS5's window; AnyPS5's VideoOut still reserves, paces and presents the flips |
 
-The default build is AnyPS5 as before: it compiles none of the Kyty files. The Kyty core lives in `core/kyty/`, taken from Kyty at `40ddebbe`; the glue between it and AnyPS5 (memory, faults, entry points, presentation, events) lives in `core/libs/prx/libSceAgcDriver/KytyShim/`. Changes to shared AnyPS5 files are under `ANYPS5_KYTY`, except the optional `ANYPS5_VBLANK_HZ` setting, which leaves behaviour unchanged when it is not set. All of Kyty's shortcuts are kept as they are, for example skipping a draw while its pipeline compiles in the background.
+The default build is AnyPS5 as before: it compiles none of the Kyty files. The Kyty core lives in `core/kyty/`, taken from Kyty at `40ddebbe`; the glue between it and AnyPS5 (memory, faults, entry points, presentation, events) lives in `core/libs/prx/libSceAgcDriver/KytyShim/`. Changes to shared AnyPS5 files are under `ANYPS5_KYTY`, except the optional `ANYPS5_VBLANK_HZ` setting, which leaves behaviour unchanged when it is not set. Kyty's general shortcuts are kept as they are, for example skipping a draw while its pipeline compiles in the background. Its title-specific hooks (Demon's Souls page freeing, ASTRO BOT, Oodle) are not ported.
 
 ## Why
 
