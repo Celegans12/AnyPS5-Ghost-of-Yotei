@@ -23,6 +23,9 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+#if defined(ANYPS5_KYTY)
+#include <atomic>
+#endif
 
 #if defined(__linux__)
 #include <fcntl.h>
@@ -350,6 +353,60 @@ void ZeroReusedPhysical(std::uint64_t start, std::size_t bytes) {
         page += run;
     }
 }
+
+#if defined(ANYPS5_KYTY)
+struct GuestView {
+    std::atomic<bool> enabled{false};
+    std::atomic<DirectMemoryViewObserver> observer{nullptr};
+    std::atomic<DirectMemoryProtectionObserver> protectionObserver{nullptr};
+    int file = -1;
+    std::size_t guestBytes = 0;
+    std::size_t viewBytes = 0;
+    std::uint8_t* view = nullptr;
+};
+
+GuestView& View() {
+    static auto* view = new GuestView;
+    return *view;
+}
+
+bool InGuestFile(std::uintptr_t address, std::size_t bytes) {
+    auto& view = View();
+    return view.enabled.load(std::memory_order_acquire) && address < view.guestBytes && bytes <= view.guestBytes - address;
+}
+
+void NoteView(std::uintptr_t address, std::size_t bytes, std::uint64_t offset) {
+    if (bytes == 0) return;
+    if (const auto observer = View().observer.load(std::memory_order_acquire)) observer(address, bytes, offset);
+}
+
+void DiscardGuestFile(std::uintptr_t address, std::size_t bytes) {
+    if (bytes == 0 || !InGuestFile(address, bytes)) return;
+    if (fallocate(View().file, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, static_cast<off_t>(address), static_cast<off_t>(bytes)) != 0)
+        throw std::system_error(errno, std::generic_category(), "discard guest memory pages");
+}
+
+void* MapGuestFile(void* addr, std::size_t len, int prot) {
+    const auto address = reinterpret_cast<std::uintptr_t>(addr);
+    NoteView(address, len, DirectMemoryViewReplacing);
+    DiscardGuestFile(address, len);
+    void* mapped = ::mmap(addr, len, prot, MAP_SHARED | MAP_FIXED, View().file, static_cast<off_t>(address));
+    if (mapped != MAP_FAILED) NoteView(address, len, address);
+    return mapped;
+}
+
+void NoteReplacing(const void* addr, std::size_t len) {
+    const auto address = reinterpret_cast<std::uintptr_t>(addr);
+    if (InGuestFile(address, len)) NoteView(address, len, DirectMemoryViewReplacing);
+}
+
+void NotePrivate(const void* addr, std::size_t len) {
+    const auto address = reinterpret_cast<std::uintptr_t>(addr);
+    if (!InGuestFile(address, len)) return;
+    DiscardGuestFile(address, len);
+    NoteView(address, len, DirectMemoryViewPrivate);
+}
+#endif
 #endif
 
 #ifdef _WIN32
@@ -646,6 +703,14 @@ void ErasePhysMappings(std::uint64_t first, std::uint64_t last) {
         const auto mappingLast = mapping.phys + (mapping.end - base);
         if (mapping.phys >= last || mappingLast <= first) continue;
         RemoveMapping(it);
+#if defined(ANYPS5_KYTY)
+        const auto erasedStart = base + (std::max(first, mapping.phys) - mapping.phys);
+        const auto erasedEnd = base + (std::min(last, mappingLast) - mapping.phys);
+        if (InGuestFile(erasedStart, erasedEnd - erasedStart)) {
+            NoteView(erasedStart, erasedEnd - erasedStart, DirectMemoryViewReplacing);
+            NoteView(erasedStart, erasedEnd - erasedStart, DirectMemoryViewPrivate);
+        }
+#endif
         if (mapping.phys < first) {
             const auto keep = first - mapping.phys;
             InsertMapping(base, DirectMapping{base + keep, mapping.phys, mapping.memoryType, mapping.nativeProtection, mapping.backing});
@@ -803,8 +868,17 @@ void AddMapping(std::uintptr_t address, std::size_t len, std::uint64_t phys, int
     for (auto cursor = phys; cursor < last; ++it) {
         const auto runEnd = std::min(last, it->second.end);
         const auto bytes = static_cast<std::size_t>(runEnd - cursor);
+#if defined(ANYPS5_KYTY)
+        NoteReplacing(reinterpret_cast<const void*>(address + (cursor - phys)), bytes);
+#endif
         it->second.backing->Map(address + (cursor - phys), bytes, cursor - it->second.base, nativeProt);
         if (records) InsertMapping(address + (cursor - phys), DirectMapping{address + (cursor - phys) + bytes, cursor, it->second.backing->MemoryType(), nativeProt, it->second.backing});
+#if defined(ANYPS5_KYTY)
+        if (InGuestFile(address + (cursor - phys), bytes)) {
+            DiscardGuestFile(address + (cursor - phys), bytes);
+            NoteView(address + (cursor - phys), bytes, View().guestBytes + it->second.backing->FileOffset() + (cursor - it->second.base));
+        }
+#endif
         cursor = runEnd;
     }
 #if defined(__linux__) || defined(__APPLE__)
@@ -877,7 +951,15 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
             GuestArena::GuestArenaCommit_nid_postfix(addr, len, 0x04, PS5_PAGE_SIZE);
 #else
             GuestWriteWatch::GuestWriteWatchOpenReads_nid_postfix(addr, len);
+#if defined(ANYPS5_KYTY)
+            if (InGuestFile(address, len)) {
+                if (MapGuestFile(addr, len, nativeProtection) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
+            } else if (::mmap(addr, len, nativeProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) {
+                throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
+            }
+#else
             if (::mmap(addr, len, nativeProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
+#endif
             GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(addr, len);
 #endif
         }
@@ -896,6 +978,9 @@ void* ArenaCommit(void* addr, size_t len, int prot) {
     return addr;
 #else
     GuestWriteWatch::GuestWriteWatchOpenReads_nid_postfix(addr, len);
+#if defined(ANYPS5_KYTY)
+    if (InGuestFile(reinterpret_cast<std::uintptr_t>(addr), len)) return MapGuestFile(addr, len, prot);
+#endif
     return mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 #endif
 }
@@ -907,9 +992,18 @@ void ArenaForget(void* addr, size_t len) {
 
 void Unmap(void* addr, size_t len) {
 #if defined(__linux__) || defined(__EMSCRIPTEN__) || defined(__APPLE__)
+#if defined(ANYPS5_KYTY)
+    NoteReplacing(addr, len);
+#endif
     if (ArenaAvailable() && GuestArena::GuestArenaContains_nid_postfix(addr, len))
         GuestArena::GuestArenaReset_nid_postfix(addr, len);
     else if (munmap(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
+#if defined(ANYPS5_KYTY)
+    if (InGuestFile(reinterpret_cast<std::uintptr_t>(addr), len)) {
+        DiscardGuestFile(reinterpret_cast<std::uintptr_t>(addr), len);
+        NoteView(reinterpret_cast<std::uintptr_t>(addr), len, DirectMemoryViewUnmapped);
+    }
+#endif
     ArenaForget(addr, len);
     GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(addr, len);
 #else
@@ -1083,6 +1177,9 @@ void RecordProtection(const void* addr, size_t len, int prot) {
     std::lock_guard lock(g_protectionLock);
     EraseProtections(start, start + len);
     if (prot >= 0) g_protections.emplace(start, ProtectedRange{start + len, ReportedProtection(prot)});
+#if defined(ANYPS5_KYTY)
+    if (const auto observer = View().protectionObserver.load(std::memory_order_acquire)) observer(start, len, prot >= 0 ? ReportedProtection(prot) : -1);
+#endif
 }
 
 void* MapAligned(void* addr, size_t len, int prot, int flags, size_t alignment) {
@@ -1309,6 +1406,9 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
 #else
     const int mappedProtection = nativeProtection;
 #endif
+#if defined(ANYPS5_KYTY)
+    NoteReplacing(mapped, len);
+#endif
     if (::mmap(mapped, len, mappedProtection, nativeFlags, descriptor, static_cast<off_t>(offset)) == MAP_FAILED) {
         const int error = errno;
         Unmap(mapped, len);
@@ -1325,6 +1425,9 @@ int DoMapFileBacked_nid_no_patch(void** addr, size_t len, int prot, int flags, i
         Unmap(mapped, len);
         throw;
     }
+#if defined(ANYPS5_KYTY)
+    NotePrivate(mapped, len);
+#endif
     *addr = mapped;
     EraseReservations(mapped, len);
     RecordProtection(mapped, len, prot);
@@ -1404,6 +1507,9 @@ int DoMapShared(void** addr, size_t len, int prot, HostSharedMemory object) {
         static_cast<void>(object);
         throw std::system_error(ENOTSUP, std::generic_category(), "shared memory mappings are not supported in WebAssembly");
 #else
+#if defined(ANYPS5_KYTY)
+        NoteReplacing(mapped, len);
+#endif
         if (::mmap(mapped, len, nativeProtection, MAP_SHARED | MAP_FIXED, object, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map shared memory");
 #endif
         mutation.Add(mapped, len, (prot & 3) != 0, (prot & 2) != 0, false);
@@ -1411,6 +1517,9 @@ int DoMapShared(void** addr, size_t len, int prot, HostSharedMemory object) {
         Unmap(mapped, len);
         throw;
     }
+#if defined(ANYPS5_KYTY)
+    NotePrivate(mapped, len);
+#endif
     *addr = mapped;
     RecordProtection(mapped, len, prot);
     Trace("map shared %p+0x%zx prot=0x%x", mapped, len, prot);
@@ -1827,3 +1936,81 @@ void UnmapDirectMemoryViews(const std::vector<DirectMemoryView>& views) {
         UnmapRegistered(mutation, reinterpret_cast<void*>(view.address), view.bytes);
     }
 }
+
+#if defined(ANYPS5_KYTY)
+bool DirectMemoryEnableView_nid_no_patch(DirectMemoryViewObserver observer, std::uint8_t** view, std::size_t* guestBytes, std::size_t* viewBytes) {
+    auto& guestView = View();
+    std::lock_guard lock(g_directLock);
+    if (guestView.view == nullptr) {
+        if (!GuestArena::GuestArenaAvailable_nid_postfix()) return false;
+        std::uintptr_t base = 0;
+        std::size_t bytes = 0;
+        GuestArena::GuestArenaRange_nid_postfix(&base, &bytes);
+        const auto guestEnd = (base + bytes + PS5_PAGE_SIZE - 1) & ~static_cast<std::uintptr_t>(PS5_PAGE_SIZE - 1);
+        const int file = memfd_create("guest memory", MFD_CLOEXEC);
+        if (file < 0) throw std::system_error(errno, std::generic_category(), "create the guest memory file");
+        if (ftruncate(file, static_cast<off_t>(guestEnd)) != 0) {
+            const int error = errno;
+            ::close(file);
+            throw std::system_error(error, std::generic_category(), "size the guest memory file");
+        }
+        const auto total = guestEnd + DIRECT_MEMORY_SIZE;
+        void* reserved = ::mmap(nullptr, total, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (reserved == MAP_FAILED) {
+            const int error = errno;
+            ::close(file);
+            throw std::system_error(error, std::generic_category(), "reserve the guest memory view");
+        }
+        auto* bytesView = static_cast<std::uint8_t*>(reserved);
+        if (::mmap(bytesView, guestEnd, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_NORESERVE, file, 0) == MAP_FAILED ||
+            ::mmap(bytesView + guestEnd, DIRECT_MEMORY_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_NORESERVE, PhysicalFile(), 0) == MAP_FAILED) {
+            const int error = errno;
+            ::munmap(reserved, total);
+            ::close(file);
+            throw std::system_error(error, std::generic_category(), "map the guest memory view");
+        }
+        guestView.file = file;
+        guestView.guestBytes = guestEnd;
+        guestView.viewBytes = total;
+        guestView.view = bytesView;
+    }
+    guestView.observer.store(observer, std::memory_order_release);
+    guestView.enabled.store(true, std::memory_order_release);
+    for (const auto& [address, mapping] : g_directMappings) {
+        const auto page = g_physPages.find(mapping.phys - mapping.phys % PS5_PAGE_SIZE);
+        if (page == g_physPages.end() || page->second.backing != mapping.backing || !InGuestFile(address, mapping.end - address)) continue;
+        NoteView(address, mapping.end - address, guestView.guestBytes + mapping.backing->FileOffset() + page->second.offset + mapping.phys % PS5_PAGE_SIZE);
+    }
+    *view = guestView.view;
+    *guestBytes = guestView.guestBytes;
+    *viewBytes = guestView.viewBytes;
+    return true;
+}
+
+void DirectMemoryWatchProtections_nid_no_patch(DirectMemoryProtectionObserver observer) {
+    std::lock_guard lock(g_protectionLock);
+    View().protectionObserver.store(observer, std::memory_order_release);
+    if (observer == nullptr) return;
+    for (const auto& [start, range] : g_protections) observer(start, range.end - start, range.prot);
+}
+
+std::size_t DirectMemorySize_nid_no_patch() {
+    return DirectMemorySize();
+}
+
+bool DirectMemoryFind_nid_no_patch(std::int64_t offset, bool findNext, std::int64_t* start, std::int64_t* end, int* memoryType) {
+    return DirectMemoryFind(offset, findNext, start, end, memoryType);
+}
+
+void GuestPageTableUsage_nid_no_patch(std::uint64_t granularity, std::uint64_t* cpuEntries, std::uint64_t* gpuEntries) {
+    GuestPageTableUsage(granularity, cpuEntries, gpuEntries);
+}
+
+int DoMapAnon_nid_no_patch(void** addr, std::size_t len, int prot, int flags, std::size_t alignment, bool exclusive) {
+    return DoMapAnon(addr, len, prot, flags, alignment, exclusive);
+}
+
+int DoMunmap_nid_no_patch(void* addr, std::size_t len) {
+    return DoMunmap(addr, len);
+}
+#endif

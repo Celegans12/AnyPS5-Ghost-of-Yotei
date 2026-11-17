@@ -4,9 +4,6 @@ set(KYTY_GPU_EXCLUDED
     common/logging/log.cpp
     common/systemInfo.cpp
     common/trophies.cpp
-    graphics/host_gpu/renderer/pipeline/pipelineManifest.cpp
-    graphics/host_gpu/renderer/upscaler/dlss.cpp
-    graphics/host_gpu/renderer/upscaler/fsr.cpp
     graphics/presentation/ddsImage.cpp
     graphics/presentation/frameStepHack.cpp
     graphics/presentation/openxrHeadset.cpp

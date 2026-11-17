@@ -6,10 +6,22 @@
 #include <common/TracyVersion.hpp>
 #include <cstdio>
 #include <tracy/Tracy.hpp>
+#if defined(ANYPS5_KYTY)
+#include <cstring>
+#include <pthread.h>
+#endif
 
 namespace Profiler {
 
 void SetThreadName(const char* name) {
+#if defined(ANYPS5_KYTY)
+	if (name != nullptr) {
+		const char* tail = std::strncmp(name, "Thread_", 7) == 0 ? name + 7 : name;
+		char host_name[16] = "kyty";
+		std::strncat(host_name, tail, sizeof(host_name) - 1 - std::strlen(host_name));
+		pthread_setname_np(pthread_self(), host_name);
+	}
+#endif
 	if (tracy::ProfilerAvailable() && name != nullptr) {
 		tracy::SetThreadName(name);
 	}

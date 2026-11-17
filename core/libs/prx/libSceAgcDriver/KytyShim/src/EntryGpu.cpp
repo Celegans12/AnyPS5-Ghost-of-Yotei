@@ -59,6 +59,10 @@ namespace {
 
 Libs::Graphics::RenderContext* g_renderer = nullptr;
 
+bool HostWriteWatched(std::uintptr_t address, std::size_t bytes) {
+    return Libs::LibKernel::Memory::GuestRangeWatched(address, bytes);
+}
+
 }
 
 }
@@ -70,6 +74,7 @@ using KytyShim::Entry::g_renderer;
 void Initialize() {
     if (g_renderer != nullptr) throw std::runtime_error("kyty GPU backend: Libs::Graphics::Initialize called twice");
     KytyShim::InstallFaultChain();
+    GuestArena::GuestArenaSetHostWriteFilter_nid_no_patch(&KytyShim::Entry::HostWriteWatched);
     const auto width = Config::GetScreenWidth();
     const auto height = Config::GetScreenHeight();
     auto& presenter = WindowInit(width, height);
@@ -85,6 +90,7 @@ void Shutdown() {
     VideoOut::VideoOutShutdown();
     WindowShutdown();
     KytyShim::RemoveFaultChain();
+    GuestArena::GuestArenaSetHostWriteFilter_nid_no_patch(nullptr);
     g_renderer = nullptr;
 }
 
@@ -188,15 +194,15 @@ void StopGpu() {
         return;
     }
     std::exception_ptr failure;
-    auto thread = Libc::StartHostThread([&failure] {
+    auto* renderer = s.renderer.load(std::memory_order_acquire);
+    auto thread = Libc::StartHostThread([&failure, renderer] {
         try {
-            Libs::Graphics::Shutdown();
+            renderer->ShutdownGpu();
         } catch (...) {
             failure = std::current_exception();
         }
     });
     thread.join();
-    s.renderer.store(nullptr, std::memory_order_release);
     if (failure) std::rethrow_exception(failure);
 }
 
@@ -446,14 +452,17 @@ extern "C" void* AgcDriverStaticTable_nid_postfix() {
 }
 
 extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address, std::size_t bytes) {
-    if (Libs::LibKernel::Memory::GuestRangeWatched(address, bytes)) static_cast<void>(Libs::LibKernel::Memory::TryPrepareHostWrite(address, bytes));
+    static_cast<void>(address);
+    static_cast<void>(bytes);
 }
 
 extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std::uint64_t value) {
     KytyShim::Entry::CheckMappedRange(pointer, sizeof(*pointer), std::atomic_ref<std::uint64_t>::required_alignment);
     const auto address = reinterpret_cast<std::uint64_t>(pointer);
-    if (Libs::LibKernel::Memory::GuestRangeWatched(address, sizeof(*pointer))) static_cast<void>(Libs::LibKernel::Memory::TryPrepareHostWrite(address, sizeof(*pointer)));
-    std::atomic_ref(*pointer).store(value, std::memory_order_release);
+    {
+        const GuestArena::HostWrite prepared(pointer, sizeof(*pointer));
+        std::atomic_ref(*pointer).store(value, std::memory_order_release);
+    }
     Libs::LibKernel::Memory::NoteEmulatorWrite(address, sizeof(*pointer));
 }
 

@@ -38,6 +38,10 @@ struct ReadTrapFault {
     bool write = false;
 };
 
+#if defined(__linux__) && defined(ANYPS5_KYTY)
+using GpuFaultHandler = bool (*)(int signal, siginfo_t* info, void* context);
+#endif
+
 extern "C" {
 
 bool GuestWriteWatchAvailable_nid_postfix();
@@ -72,6 +76,9 @@ void GuestWriteWatchReadTrapCounts_nid_postfix(ReadTrapCounts* counts);
 std::size_t GuestWriteWatchReadTrapFaults_nid_postfix(ReadTrapFault* faults, std::size_t capacity);
 #if defined(__linux__)
 bool GuestWriteWatchHandleReadTrap_nid_postfix(int signal, siginfo_t* info, void* context);
+#endif
+#if defined(__linux__) && defined(ANYPS5_KYTY)
+void GuestWriteWatchSetGpuFaultHandler_nid_no_patch(GpuFaultHandler handler);
 #endif
 
 }
