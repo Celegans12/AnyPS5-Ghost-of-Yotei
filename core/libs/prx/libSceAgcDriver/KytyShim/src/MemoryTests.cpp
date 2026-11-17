@@ -186,6 +186,44 @@ void TestGpuHooks() {
     std::printf("projection hooks: replayed at install, map and unmap reported, unmap seen before the backing goes\n");
 }
 
+void TestReleaseWhileMapped() {
+    constexpr std::size_t surfaceBytes = Page * 8;
+    constexpr std::size_t metadataBytes = 0x50000;
+    constexpr std::size_t metadataSlice = 0x28000;
+    const auto directSize = static_cast<int64_t>(sceKernelGetDirectMemorySize());
+    int64_t surfacePhys = -1;
+    int64_t metadataPhys = -1;
+    Require(sceKernelAllocateDirectMemory(0, directSize, surfaceBytes, 0, 0, &surfacePhys) == 0 && surfacePhys >= 0);
+    Require(sceKernelAllocateDirectMemory(0, directSize, metadataBytes, 0, 0, &metadataPhys) == 0 && metadataPhys >= 0);
+    void* surface = nullptr;
+    void* metadata = nullptr;
+    Require(sceKernelMapDirectMemory(&surface, surfaceBytes, CpuReadWrite | GpuReadWrite, 0, surfacePhys, 0) == 0 && surface != nullptr);
+    Require(sceKernelMapDirectMemory(&metadata, metadataBytes, CpuReadWrite | GpuReadWrite, 0, metadataPhys, 0) == 0 && metadata != nullptr);
+    const auto slice = Address(metadata) + metadataSlice;
+    static_cast<std::uint8_t*>(metadata)[metadataSlice] = 0x10;
+    std::uint8_t code = 0;
+    Require(Memory::TryReadBacking(slice, &code, 1) && code == 0x10);
+
+    g_hooks = HookLog{};
+    Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(&OnMap, &OnUnmap);
+    const auto epoch = Memory::BackingEpoch();
+    Require(sceKernelReleaseDirectMemory(metadataPhys, metadataBytes) == 0);
+    Require(sceKernelReleaseDirectMemory(surfacePhys, surfaceBytes) == 0);
+    Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(nullptr, nullptr);
+
+    Require(Covers(g_hooks.unmapped, Address(metadata), metadataBytes));
+    Require(Covers(g_hooks.unmapped, Address(surface), surfaceBytes));
+    Require(g_hooks.backedWhenUnmapped);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> changes;
+    Require(Memory::BackingChangesSince(epoch, changes) && Covers(changes, Address(metadata), metadataBytes) && Covers(changes, Address(surface), surfaceBytes));
+    Require(!Memory::TryReadBacking(slice, &code, 1));
+    Require(!Memory::IsBackingReadable(Address(metadata), metadataBytes));
+    Require(Memory::FindBackingPointer(slice, 1) == nullptr);
+    Require(!Memory::IsFullyMapped(Address(metadata), metadataBytes));
+    Require(!Memory::IsFullyMapped(Address(surface), surfaceBytes));
+    std::printf("direct memory released while mapped at 0x%llx and 0x%llx: GPU unmap seen first with the backing, then no second view and not mapped\n", static_cast<unsigned long long>(Address(surface)), static_cast<unsigned long long>(Address(metadata)));
+}
+
 void TestRuntimeMemory() {
     const auto address = Memory::AllocateRuntimeMemory(0, Page * 2, Common::VirtualMemory::Mode::ReadWrite, "kyty shim test");
     Require(address != 0 && Memory::IsBackingReadable(address, Page * 2));
@@ -365,6 +403,7 @@ int main() {
     TestFlexible();
     TestDirect();
     TestGpuHooks();
+    TestReleaseWhileMapped();
     TestRuntimeMemory();
     TestUnreportedPrivateMemory();
     TestNoCrossWaitWithGpuThread();
