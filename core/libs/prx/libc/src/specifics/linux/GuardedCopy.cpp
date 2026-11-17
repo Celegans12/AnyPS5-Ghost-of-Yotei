@@ -6,8 +6,8 @@
 #include <ucontext.h>
 
 extern "C" {
-__attribute__((visibility("hidden"))) bool GuestGuardedCopy(void* destination, const void* source, std::size_t bytes);
-__attribute__((visibility("hidden"))) extern const char GuestGuardedCopyFault[];
+bool GuestGuardedCopy(void* destination, const void* source, std::size_t bytes);
+extern const char GuestGuardedCopyFault[];
 }
 
 asm(".pushsection .text\n"
