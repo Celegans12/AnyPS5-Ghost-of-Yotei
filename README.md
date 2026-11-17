@@ -30,17 +30,17 @@ Capped at 60 Hz:
 | | FPS | Busiest stage | GPU per frame |
 |---|---|---|---|
 | AnyPS5, default backend | 45.7 | 15.5 µs per draw (committer) | 12.2 ms |
-| AnyKyty | 59.8 | 6.7 to 7.7 µs per draw (`kytyGpuExecute`) | 6.5 ms |
+| AnyKyty (`e6dfd952b5`, before the fixes below) | 59.8 | 6.7 to 7.7 µs per draw (`kytyGpuExecute`) | 6.5 ms |
 | Kyty, native | 59.4 | 5.7 µs per draw | 5.7 ms |
 
 Uncapped (`ANYPS5_VBLANK_HZ=360`, native Kyty with `KYTY_VBLANK_FREQUENCY=360`), two sessions each:
 
 | | FPS | Execute | Resolve | Record | GPU per frame |
 |---|---|---|---|---|---|
-| AnyKyty | 139.8 (126.4, 153.1) | 7.02 µs per draw | 6.07 µs | 3.89 µs | 4.6 ms |
+| AnyKyty (`6155614613`) | 159.0 (157.2, 160.8) | 5.73 µs per draw | 5.14 µs | 3.54 µs | 3.9 ms |
 | Kyty, native | 112.4 (106.3, 118.6) | 7.23 µs | 6.26 µs | 4.00 µs | 5.0 ms |
 
-Subnautica loads a slightly different world on each launch, so draw counts differ between sessions (733 against 863 draws per frame on average here). Most of the FPS lead comes from that; per draw, AnyKyty and native Kyty are within run-to-run noise. Loading the game from the Creative menu takes 3.5 s on AnyKyty, 4.0 s on native Kyty and 8.3 to 13.9 s on the default backend, with warm caches.
+At a comparable draw count (911 against 863 per frame), every Kyty stage is 12 to 21 % lighter per draw on AnyKyty and the GPU 22 % lighter per frame. The latest gains come from the glue: guest memory copies without system calls, no `msync` per submission, the memory shim inside the ThinLTO object, and initial-exec TLS. Why AnyKyty now beats native Kyty is not fully attributed yet. Subnautica loads a slightly different world on each launch, and per-draw costs vary by about ±20 % between sessions; both sessions show the same trend. Loading the game from the Creative menu takes 3.5 s on AnyKyty, 4.0 s on native Kyty and 8.3 to 13.9 s on the default backend, with warm caches.
 
 ## Status
 
