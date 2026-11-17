@@ -2310,6 +2310,15 @@ bool DirectMemoryEnableView_nid_no_patch(DirectMemoryViewObserver observer, std:
     return true;
 }
 
+bool DirectMemoryViewFiles_nid_no_patch(int* guestFile, int* directFile) {
+    auto& guestView = View();
+    std::lock_guard lock(g_directLock);
+    if (guestView.view == nullptr) return false;
+    *guestFile = guestView.file;
+    *directFile = PhysicalFile();
+    return true;
+}
+
 void DirectMemoryWatchProtections_nid_no_patch(DirectMemoryProtectionObserver observer) {
     std::lock_guard lock(g_protectionLock);
     View().protectionObserver.store(observer, std::memory_order_release);
