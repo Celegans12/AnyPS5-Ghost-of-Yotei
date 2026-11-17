@@ -23,8 +23,10 @@
 #include "libs/controller.h"
 #include "loader/systemContent.h"
 
+#if !defined(ANYPS5_KYTY)
 #include <SDL3/SDL.h>
 #include <SDL3/SDL_vulkan.h>
+#endif
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -119,7 +121,9 @@ static bool CheckFormat(vk::PhysicalDevice device, vk::Format format,
 
 static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR surface) {
 	EXIT_IF(device == nullptr);
+#if !defined(ANYPS5_KYTY)
 	EXIT_IF(surface == nullptr);
+#endif
 
 	uint32_t queue_family_count = 0;
 	device.getQueueFamilyProperties(&queue_family_count, nullptr);
@@ -130,6 +134,11 @@ static uint32_t VulkanFindQueueFamily(vk::PhysicalDevice device, vk::SurfaceKHR 
 	for (uint32_t family = 0; family < queue_family_count; family++) {
 		const auto& properties             = queue_families[family];
 		vk::Bool32  presentation_supported = VK_FALSE;
+#if defined(ANYPS5_KYTY)
+		if (surface == nullptr) {
+			presentation_supported = VK_TRUE;
+		} else
+#endif
 		RequireVulkanSuccess(device.getSurfaceSupportKHR(family, surface, &presentation_supported),
 		                     "vkGetPhysicalDeviceSurfaceSupportKHR");
 
@@ -150,7 +159,9 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
                                      vk::PhysicalDevice& out_device, uint32_t& out_queue_family,
                                      std::string& out_rejections) {
 	EXIT_IF(instance == nullptr);
+#if !defined(ANYPS5_KYTY)
 	EXIT_IF(surface == nullptr);
+#endif
 
 	auto devices = EnumerateVulkan<vk::PhysicalDevice>(
 	    "vkEnumeratePhysicalDevices", [&](uint32_t* count, vk::PhysicalDevice* values) {
@@ -314,7 +325,11 @@ static void VulkanFindPhysicalDevice(vk::Instance instance, vk::SurfaceKHR surfa
 		}
 
 		SurfaceCapabilities candidate_capabilities;
+#if defined(ANYPS5_KYTY)
+		if (!skip_device && surface != nullptr) {
+#else
 		if (!skip_device) {
+#endif
 			GetSurfaceCapabilities(device, surface, candidate_capabilities);
 
 			if (!(candidate_capabilities.capabilities.supportedUsageFlags &
@@ -724,12 +739,16 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 }
 
 static void VulkanGetExtensions(VulkanExtensions& r) {
+#if defined(ANYPS5_KYTY)
+	EXIT_NOT_IMPLEMENTED(r.required_extensions.empty());
+#else
 	uint32_t required_extensions_count = 0;
 
 	const char* const* extensions = SDL_Vulkan_GetInstanceExtensions(&required_extensions_count);
 	EXIT_NOT_IMPLEMENTED(extensions == nullptr);
 	EXIT_NOT_IMPLEMENTED(required_extensions_count == 0);
 	r.required_extensions.assign(extensions, extensions + required_extensions_count);
+#endif
 
 	r.available_extensions =
 	    EnumerateVulkan<vk::ExtensionProperties>(
@@ -898,17 +917,26 @@ static void VulkanCheckInstanceVersion() {
 }
 
 void WindowContext::CreateVulkan() {
+#if !defined(ANYPS5_KYTY)
 	EXIT_IF(window == nullptr);
+#endif
 	EXIT_IF(graphic_ctx.instance != nullptr);
 	EXIT_IF(graphic_ctx.physical_device != nullptr);
 	EXIT_IF(graphic_ctx.device != nullptr);
 	EXIT_IF(surface != nullptr);
 
+#if defined(ANYPS5_KYTY)
+	auto get_instance_proc_addr = host_get_instance_proc_addr;
+	if (get_instance_proc_addr == nullptr) {
+		EXIT("Could not load Vulkan\n");
+	}
+#else
 	auto get_instance_proc_addr =
 	    reinterpret_cast<PFN_vkGetInstanceProcAddr>(SDL_Vulkan_GetVkGetInstanceProcAddr());
 	if (get_instance_proc_addr == nullptr) {
 		EXIT("Could not load Vulkan: %s\n", SDL_GetError());
 	}
+#endif
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(get_instance_proc_addr);
 
 	Vr::OpenXrInit();
@@ -916,6 +944,9 @@ void WindowContext::CreateVulkan() {
 	Fsr::Load();
 
 	VulkanExtensions r;
+#if defined(ANYPS5_KYTY)
+	r.required_extensions = host_extensions;
+#endif
 	VulkanGetExtensions(r);
 	Vr::OpenXrAppendExtensions(r.required_extensions, r.available_extensions, false);
 	Dlss::AppendExtensions(r.required_extensions, r.available_extensions, false);
@@ -991,7 +1022,9 @@ void WindowContext::CreateVulkan() {
 		}
 	}
 
+#if !defined(ANYPS5_KYTY)
 	RecreateSurface();
+#endif
 
 	auto device_extensions = RequiredDeviceExtensions();
 
@@ -1153,11 +1186,19 @@ void WindowContext::RecreateSurface() {
 		graphic_ctx.instance.destroySurfaceKHR(surface, nullptr);
 		surface = nullptr;
 	}
+#if defined(ANYPS5_KYTY)
+	vk::SurfaceKHR::CType native_surface =
+	    host_create_surface(host_context, static_cast<vk::Instance::CType>(graphic_ctx.instance));
+	if (native_surface == VK_NULL_HANDLE) {
+		EXIT("Could not create the Vulkan surface\n");
+	}
+#else
 	vk::SurfaceKHR::CType native_surface = VK_NULL_HANDLE;
 	if (!SDL_Vulkan_CreateSurface(window, static_cast<vk::Instance::CType>(graphic_ctx.instance),
 	                              nullptr, &native_surface)) {
 		EXIT("Could not create the Vulkan surface: %s\n", SDL_GetError());
 	}
+#endif
 	surface = native_surface;
 }
 
@@ -1190,11 +1231,13 @@ WindowContext::~WindowContext() {
 		graphic_ctx.instance        = nullptr;
 		graphic_ctx.physical_device = nullptr;
 	}
+#if !defined(ANYPS5_KYTY)
 	if (window != nullptr) {
 		SDL_DestroyWindow(window);
 		window = nullptr;
 	}
 	SDL_QuitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMEPAD);
+#endif
 }
 
 }

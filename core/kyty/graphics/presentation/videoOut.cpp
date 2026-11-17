@@ -1,3 +1,4 @@
+#if !defined(ANYPS5_KYTY)
 #include "graphics/presentation/videoOut.h"
 
 #include "common/abi.h"
@@ -1919,3 +1920,4 @@ KYTY_SYSV_ABI int VideoOutAdjustColor(int handle, const VideoOutColorSettings* s
 }
 
 }
+#endif
