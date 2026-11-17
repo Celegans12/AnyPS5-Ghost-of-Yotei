@@ -13,18 +13,23 @@ get_filename_component(ANYPS5_KYTY_GCC_INSTALL_DIR "${anyps5KytyLibgcc}" DIRECTO
 cmake_host_system_information(RESULT anyps5KytyCores QUERY NUMBER_OF_LOGICAL_CORES)
 math(EXPR anyps5KytyJobs "(${anyps5KytyCores} + 1) / 2")
 set(ANYPS5_KYTY_JOBS "${anyps5KytyJobs}" CACHE STRING "Parallel jobs of the kyty_gpu sub-build")
+option(ANYPS5_KYTY_THIN_LTO "Build kyty_gpu with ThinLTO and pre-link it with lld into one native object" ON)
 
 set(ANYPS5_KYTY_BINARY_DIR "${CMAKE_BINARY_DIR}/core/kyty")
-set(ANYPS5_KYTY_ARCHIVES
-    "${ANYPS5_KYTY_BINARY_DIR}/libkyty_gpu.a"
-    "${ANYPS5_KYTY_BINARY_DIR}/libzarchive.a"
-    "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/fmt/libfmt.a"
-    "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/xxHash/libxxhash.a"
-    "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/tracy/libTracyClient.a"
-    "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/zstd/lib/libzstd.a"
-    "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/SPIRV-Tools/source/opt/libSPIRV-Tools-opt.a"
-    "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/SPIRV-Tools/source/libSPIRV-Tools.a"
-)
+if(ANYPS5_KYTY_THIN_LTO)
+    set(ANYPS5_KYTY_ARCHIVES "${ANYPS5_KYTY_BINARY_DIR}/libkyty_gpu.a")
+else()
+    set(ANYPS5_KYTY_ARCHIVES
+        "${ANYPS5_KYTY_BINARY_DIR}/libkyty_gpu.a"
+        "${ANYPS5_KYTY_BINARY_DIR}/libzarchive.a"
+        "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/fmt/libfmt.a"
+        "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/xxHash/libxxhash.a"
+        "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/tracy/libTracyClient.a"
+        "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/zstd/lib/libzstd.a"
+        "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/SPIRV-Tools/source/opt/libSPIRV-Tools-opt.a"
+        "${ANYPS5_KYTY_BINARY_DIR}/3rdparty/SPIRV-Tools/source/libSPIRV-Tools.a"
+    )
+endif()
 ExternalProject_Add(kyty_gpu
     SOURCE_DIR "${PROJECT_SOURCE_DIR}/core/kyty"
     BINARY_DIR "${ANYPS5_KYTY_BINARY_DIR}"
@@ -37,6 +42,8 @@ ExternalProject_Add(kyty_gpu
         -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
         -DANYPS5_SOURCE_DIR=${PROJECT_SOURCE_DIR}
         -DKYTY_GCC_INSTALL_DIR=${ANYPS5_KYTY_GCC_INSTALL_DIR}
+        -DKYTY_THIN_LTO=${ANYPS5_KYTY_THIN_LTO}
+        -DKYTY_THIN_LTO_JOBS=${ANYPS5_KYTY_JOBS}
     BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target kyty_gpu_bundle --parallel ${ANYPS5_KYTY_JOBS}
     INSTALL_COMMAND ""
     BUILD_ALWAYS ON

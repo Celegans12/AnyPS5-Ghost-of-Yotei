@@ -190,5 +190,45 @@ target_link_libraries(kyty_gpu
 target_compile_features(kyty_gpu PUBLIC cxx_std_20)
 target_compile_definitions(kyty_gpu PUBLIC ANYPS5_KYTY=1)
 
-add_custom_target(kyty_gpu_bundle ALL
-    DEPENDS kyty_gpu fmt xxhash TracyClient zarchive libzstd_static SPIRV-Tools-opt SPIRV-Tools-static)
+option(KYTY_THIN_LTO "Optimize kyty_gpu across translation units with ThinLTO, and pre-link it with lld into one native object" ON)
+set(KYTY_THIN_LTO_JOBS "0" CACHE STRING "Parallel ThinLTO back-end jobs of the lld pre-link, 0 for lld's default")
+set(KYTY_BUNDLE_TARGETS kyty_gpu fmt xxhash TracyClient zarchive libzstd_static SPIRV-Tools-opt SPIRV-Tools-static)
+if(KYTY_THIN_LTO)
+    get_filename_component(kytyCompilerPath "${CMAKE_CXX_COMPILER}" REALPATH)
+    get_filename_component(kytyCompilerDir "${kytyCompilerPath}" DIRECTORY)
+    string(REGEX MATCH "^[0-9]+" kytyClangMajor "${CMAKE_CXX_COMPILER_VERSION}")
+    find_program(KYTY_LLD NAMES ld.lld HINTS "${kytyCompilerDir}" NO_DEFAULT_PATH)
+    find_program(KYTY_LLD NAMES "ld.lld-${kytyClangMajor}" ld.lld)
+    if(NOT KYTY_LLD)
+        message(FATAL_ERROR "KYTY_THIN_LTO pre-links kyty_gpu with lld, but no ld.lld was found beside ${kytyCompilerPath}: install lld-${kytyClangMajor}, or configure AnyPS5 with -DANYPS5_KYTY_THIN_LTO=OFF")
+    endif()
+    set_target_properties(${KYTY_BUNDLE_TARGETS} PROPERTIES INTERPROCEDURAL_OPTIMIZATION ON)
+    set_target_properties(kyty_gpu PROPERTIES OUTPUT_NAME kyty_gpu_bitcode)
+    string(TOUPPER "${CMAKE_BUILD_TYPE}" kytyConfig)
+    separate_arguments(kytyPrelinkFlags UNIX_COMMAND "${CMAKE_CXX_FLAGS} ${CMAKE_CXX_FLAGS_${kytyConfig}}")
+    set(kytyPrelinkOptions -flto=thin -fuse-ld=lld "--ld-path=${KYTY_LLD}" -nostdlib -r
+        "-Wl,--thinlto-cache-dir=${CMAKE_BINARY_DIR}/thinlto-cache"
+        "-Wl,--thinlto-cache-policy=prune_after=72h:cache_size_bytes=8g")
+    if(NOT KYTY_THIN_LTO_JOBS STREQUAL "0")
+        list(APPEND kytyPrelinkOptions "-Wl,--thinlto-jobs=${KYTY_THIN_LTO_JOBS}")
+    endif()
+    set(kytyPrelinkObject "${CMAKE_BINARY_DIR}/kyty_gpu_prelinked.o")
+    set(kytyPrelinkArchive "${CMAKE_BINARY_DIR}/${CMAKE_STATIC_LIBRARY_PREFIX}kyty_gpu${CMAKE_STATIC_LIBRARY_SUFFIX}")
+    add_custom_command(
+        OUTPUT "${kytyPrelinkArchive}"
+        COMMAND "${CMAKE_CXX_COMPILER}" ${kytyPrelinkFlags} ${kytyPrelinkOptions} -o "${kytyPrelinkObject}"
+                -Wl,--whole-archive "$<TARGET_FILE:kyty_gpu>" "$<TARGET_FILE:fmt>" "$<TARGET_FILE:xxhash>" "$<TARGET_FILE:TracyClient>" -Wl,--no-whole-archive
+                "$<TARGET_FILE:zarchive>" "$<TARGET_FILE:libzstd_static>" "$<TARGET_FILE:SPIRV-Tools-opt>" "$<TARGET_FILE:SPIRV-Tools-static>"
+        COMMAND "${CMAKE_COMMAND}" -E rm -f "${kytyPrelinkArchive}"
+        COMMAND "${CMAKE_AR}" qcD "${kytyPrelinkArchive}" "${kytyPrelinkObject}"
+        COMMAND "${CMAKE_RANLIB}" -D "${kytyPrelinkArchive}"
+        DEPENDS ${KYTY_BUNDLE_TARGETS}
+        BYPRODUCTS "${kytyPrelinkObject}"
+        COMMENT "Pre-linking kyty_gpu with ThinLTO into one native object"
+        VERBATIM
+    )
+    add_custom_target(kyty_gpu_prelinked DEPENDS "${kytyPrelinkArchive}")
+    add_custom_target(kyty_gpu_bundle ALL DEPENDS kyty_gpu_prelinked)
+else()
+    add_custom_target(kyty_gpu_bundle ALL DEPENDS ${KYTY_BUNDLE_TARGETS})
+endif()
