@@ -15,7 +15,9 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <set>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -262,6 +264,13 @@ void BumpBackingEpoch(uint64_t start, uint64_t size) noexcept {
 	const auto epoch = g_backing_epoch.load(std::memory_order_relaxed) + 1;
 	g_backing_changes[epoch % BackingChangeHistory] = {start, size};
 	g_backing_epoch.store(epoch, std::memory_order_release);
+}
+
+bool FirstClamp(uint64_t vaddr, uint64_t size, uint64_t clamped) {
+	static std::mutex mutex;
+	static std::set<std::tuple<uint64_t, uint64_t, uint64_t>> reported;
+	std::lock_guard lock(mutex);
+	return reported.emplace(vaddr, size, clamped).second;
 }
 
 std::recursive_mutex& HookMutex() {
@@ -792,7 +801,7 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	if (clamped == 0) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
 	}
-	std::fprintf(stderr, "KytyShim memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64 " to 0x%016" PRIx64 "\n", vaddr, size, clamped);
+	if (FirstClamp(vaddr, size, clamped)) std::fprintf(stderr, "KytyShim memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64 " to 0x%016" PRIx64 "\n", vaddr, size, clamped);
 	return clamped;
 }
 
