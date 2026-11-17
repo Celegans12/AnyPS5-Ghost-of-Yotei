@@ -680,17 +680,18 @@ void RegisterAll(State& state) {
 }
 
 bool Enabled() {
-    static const bool enabled = std::getenv("APS5_ENCODE_THREAD") != nullptr;
+#ifdef _WIN32
+    return false;
+#else
+    static const bool enabled = std::getenv("APS5_NO_ENCODE_THREAD") == nullptr;
     return enabled;
+#endif
 }
 
 namespace {
 
 bool PlacementOnly() {
-    static const bool placement = [] {
-        const char* value = std::getenv("APS5_ENCODE_THREAD");
-        return value != nullptr && std::string_view(value) == "place";
-    }();
+    static const bool placement = std::getenv("APS5_ENCODE_PLACE_ONLY") != nullptr;
     return placement;
 }
 
