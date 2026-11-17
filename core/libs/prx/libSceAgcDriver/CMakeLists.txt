@@ -101,7 +101,8 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/src/MemoryTests.cpp)
             add_test_executable(kyty_shim_memory_tests
                     KytyShim/src/MemoryTests.cpp
-                    KytyShim/src/MemoryBacking.cpp)
+                    KytyShim/src/MemoryBacking.cpp
+                    KytyShim/src/Log.cpp)
             target_include_directories(kyty_shim_memory_tests PRIVATE ${LIBS_INCLUDE_DIR} ${LIBS_INCLUDE_DIR}/nid/include)
             target_link_libraries(kyty_shim_memory_tests PRIVATE $<IF:$<TARGET_EXISTS:Kyty::gpu>,Kyty::gpu,kyty_gpu> libkernel libc)
             set_target_properties(kyty_shim_memory_tests PROPERTIES CXX_EXTENSIONS OFF)
