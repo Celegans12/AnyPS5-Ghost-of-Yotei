@@ -1319,6 +1319,13 @@ KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 		}
 	}
 
+#if defined(ANYPS5_KYTY)
+	if (KYTY_PM4_R(cmd_id) == 0u && buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2 &&
+	    Gen5::AgcIsInternalDataPacket(cmd_id | (1u << 2u), buffer)) {
+		return KYTY_PM4_LEN(cmd_id) - 1u;
+	}
+#endif
+
 	auto raw_cmd_offset = buffer[0];
 	auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
 
