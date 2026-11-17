@@ -28,6 +28,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <exception>
 #include <map>
 #include <mutex>
@@ -35,6 +36,7 @@
 #include <span>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <thread>
 #include <utility>
@@ -335,10 +337,34 @@ bool GpuStarted() {
     return state().renderer.load(std::memory_order_acquire) != nullptr;
 }
 
+namespace {
+
+bool PrestartEnabled() {
+    const char* value = std::getenv("ANYPS5_KYTY_PRESTART");
+    if (value == nullptr || *value == '\0') return true;
+    const std::string_view text(value);
+    if (text != "0" && text != "1") throw std::runtime_error(std::string("KytyShim: ANYPS5_KYTY_PRESTART=") + value + " is neither 0 nor 1");
+    return text == "1";
+}
+
+void JoinPrestartAtExit() {
+    try {
+        JoinPrestart(false);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[kyty] GPU start at exit: %s\n", error.what());
+        std::fflush(stderr);
+    }
+}
+
+}
+
 void PrestartGpu() {
+    if (!PrestartEnabled()) return;
     auto& s = state();
     std::lock_guard lock(s.prestartMutex);
     if (s.prestart.joinable() || s.prestartFailure || GpuStarted()) return;
+    static std::once_flag registered;
+    std::call_once(registered, [] { LibcRegisterShutdown_nid_postfix(&JoinPrestartAtExit); });
     s.prestart = Libc::StartHostThread([&s] {
         try {
             Renderer();
