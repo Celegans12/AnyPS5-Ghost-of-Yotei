@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/KytyShim/src/EntryApi.hpp"
 #include "prx/libSceAgcDriver/KytyShim/src/EntryPure.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
@@ -29,7 +30,7 @@ namespace GuestMemory {
 
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable) {
     static_cast<void>(writable);
-    KytyShim::Entry::CheckMappedRange(pointer, bytes, alignment);
+    KytyShim::Entry::CheckGuestRange(pointer, bytes, alignment);
 }
 
 }

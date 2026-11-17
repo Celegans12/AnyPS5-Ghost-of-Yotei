@@ -350,13 +350,13 @@ void ReleaseFlipPacket(const std::uint32_t* packet) {
 
 namespace KytyShim::Entry {
 
-namespace {
-
-void CheckSubmittedRange(const void* pointer, std::size_t bytes, std::size_t alignment) {
+void CheckGuestRange(const void* pointer, std::size_t bytes, std::size_t alignment) {
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     if (address != 0 && alignment != 0 && address % alignment == 0 && bytes != 0 && Libs::LibKernel::Memory::IsFullyMapped(address, bytes)) return;
     CheckMappedRange(pointer, bytes, alignment);
 }
+
+namespace {
 
 void SubmitDescriptor(const Packet& descriptor, std::uint32_t queue) {
     if (descriptor.flags != 0) throw std::runtime_error("nonzero submission flags are not implemented");
@@ -367,7 +367,7 @@ void SubmitDescriptor(const Packet& descriptor, std::uint32_t queue) {
     }
     if (descriptor.dw_num == 0) return;
     if (descriptor.addr == nullptr) throw std::runtime_error("null command buffer");
-    CheckSubmittedRange(descriptor.addr, std::size_t{descriptor.dw_num} * sizeof(std::uint32_t), alignof(std::uint32_t));
+    CheckGuestRange(descriptor.addr, std::size_t{descriptor.dw_num} * sizeof(std::uint32_t), alignof(std::uint32_t));
     Submit(std::span<const std::uint32_t>(descriptor.addr, descriptor.dw_num), queue);
 }
 
@@ -379,7 +379,7 @@ namespace AgcDriver {
 
 void Submit(const Packet* packet, std::uint32_t queue) try {
     KernelNoteGpuSubmit_nid_no_patch();
-    KytyShim::Entry::CheckSubmittedRange(packet, sizeof(Packet), alignof(Packet));
+    KytyShim::Entry::CheckGuestRange(packet, sizeof(Packet), alignof(Packet));
     KytyShim::Entry::SubmitDescriptor(*packet, queue);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
