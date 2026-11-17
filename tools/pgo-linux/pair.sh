@@ -2,7 +2,7 @@
 set -uo pipefail
 dev=${APS5_DEV:-$HOME/aps5}
 here=$(cd "$(dirname "$0")" && pwd)
-tree=${TREE:-src-w10}
+tree=${TREE:-$(basename "$(cd "$(dirname "$0")/../.." && pwd)")}
 cd "$dev"
 for pass in "$@"; do
   name=${pass%%=*}; bdir=${pass#*=}

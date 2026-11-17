@@ -2,7 +2,8 @@
 set -uo pipefail
 dev=${APS5_DEV:-$HOME/aps5}
 . "$dev/AnyPS5/linux-dev/env.sh"
-tree=${TREE:-src-w10}
+here=$(cd "$(dirname "$0")" && pwd)
+tree=${TREE:-$(basename "$(cd "$here/../.." && pwd)")}
 name=${1:?dossier de compilation relatif a l arbre, par exemple build-pgogen}; shift
 dir=$dev/$tree
 build=$dir/$name
