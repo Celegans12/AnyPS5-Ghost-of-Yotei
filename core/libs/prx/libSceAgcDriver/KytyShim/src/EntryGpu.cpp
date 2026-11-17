@@ -446,14 +446,17 @@ extern "C" void* AgcDriverStaticTable_nid_postfix() {
 }
 
 extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address, std::size_t bytes) {
-    if (Libs::LibKernel::Memory::GuestRangeWatched(address, bytes)) static_cast<void>(Libs::LibKernel::Memory::TryPrepareHostWrite(address, bytes));
+    static_cast<void>(address);
+    static_cast<void>(bytes);
 }
 
 extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std::uint64_t value) {
     KytyShim::Entry::CheckMappedRange(pointer, sizeof(*pointer), std::atomic_ref<std::uint64_t>::required_alignment);
     const auto address = reinterpret_cast<std::uint64_t>(pointer);
-    if (Libs::LibKernel::Memory::GuestRangeWatched(address, sizeof(*pointer))) static_cast<void>(Libs::LibKernel::Memory::TryPrepareHostWrite(address, sizeof(*pointer)));
-    std::atomic_ref(*pointer).store(value, std::memory_order_release);
+    {
+        const GuestArena::HostWrite prepared(pointer, sizeof(*pointer));
+        std::atomic_ref(*pointer).store(value, std::memory_order_release);
+    }
     Libs::LibKernel::Memory::NoteEmulatorWrite(address, sizeof(*pointer));
 }
 

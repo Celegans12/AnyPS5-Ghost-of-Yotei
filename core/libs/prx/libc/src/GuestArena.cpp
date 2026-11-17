@@ -58,6 +58,21 @@ constexpr std::size_t ProtectedBuckets = ProtectedSpaceEnd >> ProtectedBucketShi
 std::array<std::atomic<std::atomic<std::uint64_t>*>, ProtectedBuckets> protectedPages{};
 std::atomic<bool> protectionsNoted{false};
 std::atomic<bool> protectedBeyondTable{false};
+constinit thread_local std::atomic<unsigned> preparingHostWrite{0};
+
+class HostWritePreparation {
+public:
+    HostWritePreparation() {
+        preparingHostWrite.store(preparingHostWrite.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+    }
+    ~HostWritePreparation() {
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+        preparingHostWrite.store(preparingHostWrite.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
+    }
+    HostWritePreparation(const HostWritePreparation&) = delete;
+    HostWritePreparation& operator=(const HostWritePreparation&) = delete;
+};
 
 template <class TVisit>
 void forEachProtectedWord(std::uintptr_t first, std::uintptr_t last, TVisit visit) {
@@ -125,6 +140,8 @@ void prepareHostWrite(const void* pointer, std::size_t bytes) {
     const auto prepare = hostWritePreparer.load(std::memory_order_acquire);
     if (prepare == nullptr) return;
 #ifndef _WIN32
+    if (preparingHostWrite.load(std::memory_order_relaxed) != 0) return;
+    const HostWritePreparation preparation;
     if (!mayBeHostProtected(address, bytes)) return;
 #endif
     static_cast<void>(prepare(address, bytes));
@@ -571,6 +588,9 @@ void GuestArenaMarkUsed_nid_postfix(const void* pointer, std::size_t bytes) {
 
 void GuestArenaRelease_nid_postfix(const void* pointer, std::size_t bytes) {
     Arena::Get().Release(pointer, bytes);
+#if defined(ANYPS5_KYTY) && !defined(_WIN32)
+    if (protectionsNoted.load(std::memory_order_acquire)) noteHostProtection(reinterpret_cast<std::uintptr_t>(pointer), bytes, true);
+#endif
 }
 
 void GuestArenaRange_nid_postfix(std::uintptr_t* base, std::size_t* bytes) {
