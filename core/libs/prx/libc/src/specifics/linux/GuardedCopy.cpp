@@ -1,5 +1,6 @@
 #if defined(__linux__) && defined(__x86_64__)
 #include "prx/libc/include/specifics/linux/GuardedCopy.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 
 #include <cstdint>
 #include <cstdlib>
@@ -70,6 +71,7 @@ asm(".pushsection .text\n"
 
 extern "C" bool GuestCopyRecoverFault_nid_no_patch(int signal, siginfo_t* info, void* context) {
     if ((signal != SIGSEGV && signal != SIGBUS) || info == nullptr || info->si_code <= 0 || context == nullptr) return false;
+    if (GuestWriteWatch::GuestWriteWatchHandleReadTrap_nid_postfix(signal, info, context)) return true;
     auto& registers = static_cast<ucontext_t*>(context)->uc_mcontext.gregs;
     const auto rip = static_cast<std::uintptr_t>(registers[REG_RIP]);
     const auto begin = reinterpret_cast<std::uintptr_t>(&GuestGuardedCopy);

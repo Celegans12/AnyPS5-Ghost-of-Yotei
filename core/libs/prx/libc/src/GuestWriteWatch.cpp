@@ -2,6 +2,9 @@
 #if defined(__linux__)
 #include "prx/libc/include/specifics/linux/WriteWatchOracle.hpp"
 #endif
+#if defined(__linux__) && defined(__x86_64__)
+#include "prx/libc/include/specifics/linux/GuardedCopy.hpp"
+#endif
 #include <algorithm>
 #include <array>
 #include <cerrno>
@@ -16,12 +19,21 @@
 #include <vector>
 
 #if defined(__linux__)
+#include "prx/libc/include/specifics/linux/HostMapping.hpp"
 #include <atomic>
 #include <cerrno>
+#include <chrono>
+#include <climits>
+#include <csignal>
 #include <cstring>
+#include <ctime>
 #include <fcntl.h>
 #include <linux/fs.h>
+#include <linux/futex.h>
 #include <linux/userfaultfd.h>
+#include <pthread.h>
+#include <sched.h>
+#include <ucontext.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/syscall.h>
@@ -80,6 +92,675 @@ struct pm_scan_arg {
 
 namespace GuestWriteWatch {
 namespace {
+
+#if defined(__linux__)
+class ReadTrapTable {
+public:
+    static ReadTrapTable& Get() {
+        static auto* table = new ReadTrapTable;
+        return *table;
+    }
+
+    void Register(std::uintptr_t begin, std::uintptr_t end) {
+        begin = pageStart(begin);
+        end = pageEnd(end);
+        if (end <= begin) return;
+        const std::lock_guard lock(_lock);
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> gaps;
+        auto cursor = begin;
+        auto it = _ranges.upper_bound(begin);
+        if (it != _ranges.begin()) --it;
+        for (; it != _ranges.end() && it->first < end; ++it) {
+            if (it->second.end <= cursor) continue;
+            if (it->first > cursor) gaps.emplace_back(cursor, it->first);
+            cursor = std::max(cursor, it->second.end);
+        }
+        if (cursor < end) gaps.emplace_back(cursor, end);
+        for (const auto& [from, to] : gaps) _ranges.emplace(from, Range{to, std::vector<std::uint8_t>(static_cast<std::size_t>((to - from) / PageSize), 0)});
+        _registered.store(true, std::memory_order_release);
+    }
+
+    void Unregister(std::uintptr_t begin, std::uintptr_t end) {
+        begin = pageStart(begin);
+        end = pageEnd(end);
+        if (end <= begin || !_registered.load(std::memory_order_acquire)) return;
+        const std::lock_guard lock(_lock);
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> dropped;
+        for (auto it = _holds.begin(); it != _holds.end();) {
+            if (pageStart(it->begin) < end && begin < pageEnd(it->end)) {
+                dropped.emplace_back(it->begin, it->end);
+                it = _holds.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (const auto& [from, to] : dropped) untrap(from, to);
+        forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
+            if ((state & Armed) != 0) ::mprotect(reinterpret_cast<void*>(page), PageSize, state & ProtectionBits);
+        });
+        erase(begin, end);
+        noteHolds();
+    }
+
+    bool SetResolver(void (*resolver)(std::uintptr_t, std::uintptr_t)) {
+        if (resolver == nullptr) {
+            _resolver.store(nullptr, std::memory_order_release);
+            return true;
+        }
+        std::call_once(_resolverStarted, [this] { startResolver(); });
+        if (!_resolverRunning.load(std::memory_order_acquire)) return false;
+        _resolver.store(resolver, std::memory_order_release);
+        return true;
+    }
+
+    void SetBypass(bool (*bypass)()) {
+        _bypass.store(bypass, std::memory_order_release);
+    }
+
+    bool Trap(std::uintptr_t begin, std::uintptr_t end) {
+        if (end <= begin || _resolver.load(std::memory_order_acquire) == nullptr) return false;
+        const std::lock_guard lock(_lock);
+        const auto found = std::find_if(_holds.begin(), _holds.end(), [&](const Hold& hold) { return hold.begin == begin && hold.end == end; });
+        if (found != _holds.end() && found->state != HoldResolved) {
+            ++found->count;
+            ++found->generation;
+            bool rearmed = false;
+            forEachPage(pageStart(begin), pageEnd(end), [&](std::uintptr_t page, std::uint8_t& state) {
+                if ((state & (Held | Armed)) != Held) return;
+                ::mprotect(reinterpret_cast<void*>(page), PageSize, PROT_NONE);
+                state = static_cast<std::uint8_t>(state | Armed);
+                rearmed = true;
+            });
+            if (rearmed) _epoch.fetch_add(1, std::memory_order_acq_rel);
+            return true;
+        }
+        if (!arm(pageStart(begin), pageEnd(end))) {
+            _counts.refused.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        if (found != _holds.end()) {
+            ++found->count;
+            ++found->generation;
+            found->state = HoldArmed;
+        } else {
+            _holds.push_back({begin, end, 1, HoldArmed, 0, 0});
+        }
+        _counts.trapped.fetch_add(1, std::memory_order_relaxed);
+        noteHolds();
+        return true;
+    }
+
+    void Release(std::uintptr_t begin, std::uintptr_t end) {
+        if (end <= begin || !_registered.load(std::memory_order_acquire)) return;
+        const std::lock_guard lock(_lock);
+        const auto found = std::find_if(_holds.begin(), _holds.end(), [&](const Hold& hold) { return hold.begin == begin && hold.end == end; });
+        if (found == _holds.end() || --found->count != 0) return;
+        _holds.erase(found);
+        untrap(begin, end);
+        _counts.released.fetch_add(1, std::memory_order_relaxed);
+        noteHolds();
+    }
+
+    bool Active() const {
+        return _active.load(std::memory_order_acquire) != 0;
+    }
+
+    std::uint64_t Epoch() const {
+        return _epoch.load(std::memory_order_acquire);
+    }
+
+    int Protection(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* runEnd) {
+        *runEnd = limit;
+        if (!_registered.load(std::memory_order_acquire) || limit <= address) return -1;
+        const std::lock_guard lock(_lock);
+        const auto page = pageStart(address);
+        auto* state = pageState(page);
+        if (state != nullptr && (*state & Held) != 0) {
+            const int protection = *state & ProtectionBits;
+            auto end = page + PageSize;
+            while (end < limit) {
+                const auto* next = pageState(end);
+                if (next == nullptr || (*next & Held) == 0 || (*next & ProtectionBits) != protection) break;
+                end += PageSize;
+            }
+            *runEnd = std::min(end, limit);
+            return protection;
+        }
+        auto end = page + PageSize;
+        while (end < limit) {
+            const auto* next = pageState(end);
+            if (next != nullptr && (*next & Held) != 0) break;
+            end += PageSize;
+        }
+        *runEnd = std::min(end, limit);
+        return -1;
+    }
+
+    void Settle(std::uintptr_t begin, std::uintptr_t end) {
+        if (end <= begin || !Active()) return;
+        const auto first = pageStart(begin);
+        const auto last = pageEnd(end);
+        const auto self = currentThread();
+        const auto bypass = _bypass.load(std::memory_order_acquire);
+        {
+            const std::lock_guard lock(_lock);
+            if (!activeOverlap(first, last)) return;
+            _counts.settles.fetch_add(1, std::memory_order_relaxed);
+            if (self == _resolverThread.load(std::memory_order_acquire) || resolvingBy(first, last, self) || (bypass != nullptr && bypass())) {
+                forEachPage(first, last, [&](std::uintptr_t page, std::uint8_t& state) {
+                    if ((state & Armed) == 0) return;
+                    openPage(page, state);
+                    _counts.settleOpens.fetch_add(1, std::memory_order_relaxed);
+                });
+                return;
+            }
+        }
+        for (;;) {
+            if (resolve(first, last, self)) continue;
+            {
+                const std::lock_guard lock(_lock);
+                if (!resolvingOverlap(first, last)) {
+                    if (!activeOverlap(first, last)) restorePages(first, last);
+                    return;
+                }
+            }
+            sched_yield();
+        }
+    }
+
+    void BeginHostWrite(std::uintptr_t begin, std::uintptr_t end) {
+        if (end <= begin || _resolver.load(std::memory_order_acquire) == nullptr) return;
+        Settle(begin, end);
+        const std::lock_guard lock(_lock);
+        _hostWrites.emplace_back(pageStart(begin), pageEnd(end));
+    }
+
+    void EndHostWrite(std::uintptr_t begin, std::uintptr_t end) {
+        if (end <= begin || _resolver.load(std::memory_order_acquire) == nullptr) return;
+        const std::lock_guard lock(_lock);
+        const auto found = std::find(_hostWrites.begin(), _hostWrites.end(), std::pair{pageStart(begin), pageEnd(end)});
+        if (found != _hostWrites.end()) _hostWrites.erase(found);
+    }
+
+    void Open(std::uintptr_t begin, std::uintptr_t end) {
+        if (end <= begin || !Active()) return;
+        const std::lock_guard lock(_lock);
+        forEachPage(pageStart(begin), pageEnd(end), [&](std::uintptr_t page, std::uint8_t& state) {
+            if ((state & Armed) == 0) return;
+            openPage(page, state);
+            _counts.settleOpens.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+
+    int Protect(std::uintptr_t begin, std::uintptr_t end, int protection) {
+        const std::lock_guard lock(_lock);
+        forEachPage(pageStart(begin), pageEnd(end), [&](std::uintptr_t page, std::uint8_t& state) {
+            if ((state & Armed) == 0) return;
+            openPage(page, state);
+            _counts.settleOpens.fetch_add(1, std::memory_order_relaxed);
+        });
+        if (::mprotect(reinterpret_cast<void*>(begin), static_cast<std::size_t>(end - begin), protection) != 0) return errno;
+        forEachPage(pageStart(begin), pageEnd(end), [&](std::uintptr_t, std::uint8_t& state) { state = static_cast<std::uint8_t>((state & ~ProtectionBits) | Known | (protection & ProtectionBits)); });
+        return 0;
+    }
+
+    bool HandleFault(int signal, siginfo_t* info, void* context) {
+        if (signal != SIGSEGV || info == nullptr || info->si_code != SEGV_ACCERR || context == nullptr || !_registered.load(std::memory_order_acquire)) return false;
+        const int savedErrno = errno;
+        const auto page = pageStart(reinterpret_cast<std::uintptr_t>(info->si_addr));
+        const bool write = (static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_ERR] & 2) != 0;
+        const auto self = currentThread();
+        {
+            const std::lock_guard lock(_lock);
+            auto* state = pageState(page);
+            if (state == nullptr) {
+                errno = savedErrno;
+                return false;
+            }
+            if ((*state & Armed) == 0) {
+                const bool retry = retryOpen(page, *state, write, self);
+                errno = savedErrno;
+                return retry;
+            }
+            const bool own = self == _resolverThread.load(std::memory_order_acquire) || resolvingBy(page, page + PageSize, self);
+            const auto bypass = _bypass.load(std::memory_order_acquire);
+            if (own || (bypass != nullptr && bypass())) {
+                openPage(page, *state);
+                (own ? _counts.ownOpens : _counts.bypassOpens).fetch_add(1, std::memory_order_relaxed);
+                errno = savedErrno;
+                return true;
+            }
+        }
+        _counts.faults.fetch_add(1, std::memory_order_relaxed);
+        waitForResolution(page);
+        errno = savedErrno;
+        return true;
+    }
+
+    void Counts(ReadTrapCounts& counts) const {
+        counts.trapped = _counts.trapped.load(std::memory_order_relaxed);
+        counts.trappedPages = _counts.trappedPages.load(std::memory_order_relaxed);
+        counts.refused = _counts.refused.load(std::memory_order_relaxed);
+        counts.released = _counts.released.load(std::memory_order_relaxed);
+        counts.faults = _counts.faults.load(std::memory_order_relaxed);
+        counts.resolved = _counts.resolved.load(std::memory_order_relaxed);
+        counts.resolveNs = _counts.resolveNs.load(std::memory_order_relaxed);
+        counts.waitNs = _counts.waitNs.load(std::memory_order_relaxed);
+        counts.bypassOpens = _counts.bypassOpens.load(std::memory_order_relaxed);
+        counts.ownOpens = _counts.ownOpens.load(std::memory_order_relaxed);
+        counts.forcedOpens = _counts.forcedOpens.load(std::memory_order_relaxed);
+        counts.retries = _counts.retries.load(std::memory_order_relaxed);
+        counts.settles = _counts.settles.load(std::memory_order_relaxed);
+        counts.settleOpens = _counts.settleOpens.load(std::memory_order_relaxed);
+        counts.holds = _active.load(std::memory_order_relaxed);
+    }
+
+private:
+    static constexpr std::uintptr_t PageSize = 4096;
+    static constexpr std::uint8_t ProtectionBits = PROT_READ | PROT_WRITE | PROT_EXEC;
+    static constexpr std::uint8_t Known = 0x08;
+    static constexpr std::uint8_t Held = 0x10;
+    static constexpr std::uint8_t Armed = 0x20;
+    static constexpr std::size_t SlotCount = 64;
+    static constexpr std::size_t RetryCount = 64;
+    static constexpr unsigned RetryLimit = 16;
+    static constexpr std::int64_t WaitSliceNs = 50'000'000;
+    static constexpr std::int64_t ForcedOpenNs = 5'000'000'000;
+
+    enum SlotState : unsigned { Free, Claimed, Queued, Running, Done, Abandoned };
+    enum HoldState : std::uint8_t { HoldArmed, HoldResolving, HoldResolved };
+
+    struct Hold {
+        std::uintptr_t begin;
+        std::uintptr_t end;
+        std::uint32_t count;
+        HoldState state;
+        pid_t owner;
+        std::uint64_t generation;
+    };
+
+    struct Range {
+        std::uintptr_t end;
+        std::vector<std::uint8_t> pages;
+    };
+
+    struct Slot {
+        std::atomic<unsigned> state{Free};
+        std::uintptr_t page = 0;
+    };
+
+    struct Retry {
+        std::uintptr_t page = 0;
+        pid_t thread = 0;
+        std::uint64_t epoch = 0;
+        unsigned count = 0;
+        std::uint64_t used = 0;
+    };
+
+    struct Taken {
+        std::uintptr_t begin;
+        std::uintptr_t end;
+        std::uint64_t generation;
+    };
+
+    struct Counters {
+        std::atomic<std::uint64_t> trapped{0}, trappedPages{0}, refused{0}, released{0}, faults{0}, resolved{0}, resolveNs{0}, waitNs{0}, bypassOpens{0}, ownOpens{0}, forcedOpens{0}, retries{0}, settles{0}, settleOpens{0};
+    };
+
+    static_assert(sizeof(std::atomic<unsigned>) == sizeof(unsigned));
+
+    ReadTrapTable() {
+        _holds.reserve(4096);
+        _hostWrites.reserve(256);
+    }
+
+    static pid_t currentThread() {
+        return static_cast<pid_t>(syscall(SYS_gettid));
+    }
+
+    static std::int64_t now() {
+        timespec time{};
+        clock_gettime(CLOCK_MONOTONIC, &time);
+        return static_cast<std::int64_t>(time.tv_sec) * 1'000'000'000 + time.tv_nsec;
+    }
+
+    static void futexWait(std::atomic<unsigned>& word, unsigned expected, std::int64_t timeoutNs) {
+        timespec timeout{static_cast<time_t>(timeoutNs / 1'000'000'000), static_cast<long>(timeoutNs % 1'000'000'000)};
+        syscall(SYS_futex, reinterpret_cast<unsigned*>(&word), FUTEX_WAIT_PRIVATE, expected, timeoutNs > 0 ? &timeout : nullptr, nullptr, 0);
+    }
+
+    static void futexWake(std::atomic<unsigned>& word) {
+        syscall(SYS_futex, reinterpret_cast<unsigned*>(&word), FUTEX_WAKE_PRIVATE, INT_MAX, nullptr, nullptr, 0);
+    }
+
+    void noteHolds() {
+        const auto active = static_cast<std::size_t>(std::count_if(_holds.begin(), _holds.end(), [](const Hold& hold) { return hold.state != HoldResolved; }));
+        _active.store(active, std::memory_order_release);
+        _epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    bool arm(std::uintptr_t first, std::uintptr_t last) {
+        if (!covers(first, last)) return false;
+        for (const auto& [hostBegin, hostEnd] : _hostWrites)
+            if (hostBegin < last && first < hostEnd) return false;
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> unknown;
+        forEachPage(first, last, [&](std::uintptr_t page, std::uint8_t& state) {
+            if ((state & Armed) != 0) return;
+            if (!unknown.empty() && unknown.back().second == page) unknown.back().second = page + PageSize;
+            else unknown.emplace_back(page, page + PageSize);
+        });
+        std::vector<std::tuple<std::uintptr_t, std::uintptr_t, int>> protections;
+        for (const auto& [from, to] : unknown) {
+            if (!queryProtections(from, to, protections)) return false;
+        }
+        for (const auto& [from, to, protection] : protections)
+            if ((protection & PROT_READ) == 0) return false;
+        if (::mprotect(reinterpret_cast<void*>(first), static_cast<std::size_t>(last - first), PROT_NONE) != 0) return false;
+        for (const auto& [from, to, protection] : protections) {
+            forEachPage(from, to, [&](std::uintptr_t, std::uint8_t& state) { state = static_cast<std::uint8_t>((state & Held) | Known | (protection & ProtectionBits)); });
+        }
+        std::uint64_t pages = 0;
+        forEachPage(first, last, [&](std::uintptr_t, std::uint8_t& state) {
+            state = static_cast<std::uint8_t>(state | Held | Armed);
+            ++pages;
+        });
+        _counts.trappedPages.fetch_add(pages, std::memory_order_relaxed);
+        _epoch.fetch_add(1, std::memory_order_acq_rel);
+        return true;
+    }
+
+    void startResolver() {
+        pthread_attr_t attributes;
+        pthread_attr_init(&attributes);
+        pthread_attr_setdetachstate(&attributes, PTHREAD_CREATE_DETACHED);
+        pthread_t thread{};
+        const bool created = pthread_create(&thread, &attributes, [](void* table) -> void* {
+            static_cast<ReadTrapTable*>(table)->resolveLoop();
+            return nullptr;
+        }, this) == 0;
+        pthread_attr_destroy(&attributes);
+        if (!created) return;
+        while (_resolverThread.load(std::memory_order_acquire) == 0) sched_yield();
+        _resolverRunning.store(true, std::memory_order_release);
+    }
+
+    void resolveLoop() {
+        pthread_setname_np(pthread_self(), "read traps");
+        _resolverThread.store(currentThread(), std::memory_order_release);
+        const auto self = _resolverThread.load(std::memory_order_relaxed);
+        for (;;) {
+            const auto seen = _wake.load(std::memory_order_acquire);
+            bool served = false;
+            for (auto& slot : _slots) {
+                unsigned expected = Queued;
+                if (!slot.state.compare_exchange_strong(expected, Running, std::memory_order_acq_rel)) continue;
+                served = true;
+                const auto start = now();
+                const auto page = slot.page;
+                for (;;) {
+                    if (resolve(page, page + PageSize, self)) continue;
+                    {
+                        const std::lock_guard lock(_lock);
+                        if (!resolvingOverlap(page, page + PageSize)) {
+                            if (!activeOverlap(page, page + PageSize)) restorePages(page, page + PageSize);
+                            break;
+                        }
+                    }
+                    sched_yield();
+                }
+                _counts.resolved.fetch_add(1, std::memory_order_relaxed);
+                _counts.resolveNs.fetch_add(static_cast<std::uint64_t>(now() - start), std::memory_order_relaxed);
+                expected = Running;
+                if (slot.state.compare_exchange_strong(expected, Done, std::memory_order_acq_rel)) futexWake(slot.state);
+                else slot.state.store(Free, std::memory_order_release);
+            }
+            if (!served) futexWait(_wake, seen, 0);
+        }
+    }
+
+    bool resolve(std::uintptr_t first, std::uintptr_t last, pid_t self) {
+        std::vector<Taken> taken;
+        {
+            const std::lock_guard lock(_lock);
+            for (auto& hold : _holds) {
+                if (hold.state != HoldArmed || pageStart(hold.begin) >= last || first >= pageEnd(hold.end)) continue;
+                hold.state = HoldResolving;
+                hold.owner = self;
+                taken.push_back({hold.begin, hold.end, hold.generation});
+            }
+            if (taken.empty()) return false;
+            noteHolds();
+        }
+        const auto resolver = _resolver.load(std::memory_order_acquire);
+        for (const auto& hold : taken)
+            if (resolver != nullptr) resolver(hold.begin, hold.end);
+        const std::lock_guard lock(_lock);
+        for (const auto& entry : taken) {
+            const auto found = std::find_if(_holds.begin(), _holds.end(), [&](const Hold& hold) { return hold.begin == entry.begin && hold.end == entry.end; });
+            if (found == _holds.end() || found->state != HoldResolving || found->owner != self) continue;
+            found->state = found->generation == entry.generation ? HoldResolved : HoldArmed;
+            found->owner = 0;
+        }
+        for (const auto& entry : taken) untrap(entry.begin, entry.end);
+        noteHolds();
+        return true;
+    }
+
+    void waitForResolution(std::uintptr_t page) {
+        const auto start = now();
+        Slot* slot = nullptr;
+        while (slot == nullptr) {
+            for (auto& candidate : _slots) {
+                unsigned expected = Free;
+                if (candidate.state.compare_exchange_strong(expected, Claimed, std::memory_order_acq_rel)) {
+                    slot = &candidate;
+                    break;
+                }
+            }
+            if (slot == nullptr) sched_yield();
+        }
+        slot->page = page;
+        slot->state.store(Queued, std::memory_order_release);
+        _wake.fetch_add(1, std::memory_order_acq_rel);
+        futexWake(_wake);
+        for (;;) {
+            const auto state = slot->state.load(std::memory_order_acquire);
+            if (state == Done) break;
+            if (now() - start >= ForcedOpenNs) {
+                unsigned expected = Queued;
+                if (!slot->state.compare_exchange_strong(expected, Free, std::memory_order_acq_rel)) {
+                    expected = Running;
+                    if (!slot->state.compare_exchange_strong(expected, Abandoned, std::memory_order_acq_rel)) continue;
+                }
+                {
+                    const std::lock_guard lock(_lock);
+                    if (auto* pageEntry = pageState(page); pageEntry != nullptr && (*pageEntry & Armed) != 0) openPage(page, *pageEntry);
+                }
+                _counts.forcedOpens.fetch_add(1, std::memory_order_relaxed);
+                constexpr char message[] = "[read-trap] a trapped page was not resolved within 5 s; it is opened without waiting for the GPU\n";
+                static_cast<void>(::write(STDERR_FILENO, message, sizeof(message) - 1));
+                _counts.waitNs.fetch_add(static_cast<std::uint64_t>(now() - start), std::memory_order_relaxed);
+                return;
+            }
+            futexWait(slot->state, state, WaitSliceNs);
+        }
+        slot->state.store(Free, std::memory_order_release);
+        _counts.waitNs.fetch_add(static_cast<std::uint64_t>(now() - start), std::memory_order_relaxed);
+    }
+
+    bool retryOpen(std::uintptr_t page, std::uint8_t state, bool write, pid_t self) {
+        if ((state & Known) == 0 || (state & (write ? PROT_WRITE : PROT_READ)) == 0) return false;
+        const auto epoch = _epoch.load(std::memory_order_acquire);
+        auto found = std::find_if(_retries.begin(), _retries.end(), [&](const Retry& retry) { return retry.used != 0 && retry.page == page && retry.thread == self; });
+        if (found == _retries.end()) found = std::min_element(_retries.begin(), _retries.end(), [](const Retry& left, const Retry& right) { return left.used < right.used; });
+        if (found->used == 0 || found->page != page || found->thread != self || found->epoch != epoch) *found = {page, self, epoch, 0, 0};
+        found->used = ++_retryUses;
+        if (++found->count > RetryLimit) return false;
+        _counts.retries.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+
+    void openPage(std::uintptr_t page, std::uint8_t& state) {
+        ::mprotect(reinterpret_cast<void*>(page), PageSize, state & ProtectionBits);
+        state = static_cast<std::uint8_t>(state & ~Armed);
+        _epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    bool activeOverlap(std::uintptr_t first, std::uintptr_t last) const {
+        return std::any_of(_holds.begin(), _holds.end(), [&](const Hold& hold) { return hold.state != HoldResolved && pageStart(hold.begin) < last && first < pageEnd(hold.end); });
+    }
+
+    bool resolvingOverlap(std::uintptr_t first, std::uintptr_t last) const {
+        return std::any_of(_holds.begin(), _holds.end(), [&](const Hold& hold) { return hold.state == HoldResolving && pageStart(hold.begin) < last && first < pageEnd(hold.end); });
+    }
+
+    bool resolvingBy(std::uintptr_t first, std::uintptr_t last, pid_t self) const {
+        return std::any_of(_holds.begin(), _holds.end(), [&](const Hold& hold) { return hold.state == HoldResolving && hold.owner == self && pageStart(hold.begin) < last && first < pageEnd(hold.end); });
+    }
+
+    void untrap(std::uintptr_t begin, std::uintptr_t end) {
+        const auto first = pageStart(begin);
+        const auto last = pageEnd(end);
+        std::vector<std::pair<std::uintptr_t, std::uintptr_t>> remaining;
+        for (const auto& hold : _holds)
+            if (hold.state != HoldResolved && pageStart(hold.begin) < last && first < pageEnd(hold.end)) remaining.emplace_back(pageStart(hold.begin), pageEnd(hold.end));
+        if (remaining.empty()) {
+            restorePages(first, last);
+            return;
+        }
+        std::sort(remaining.begin(), remaining.end());
+        auto cursor = first;
+        for (const auto& [from, to] : remaining) {
+            if (from > cursor) restorePages(cursor, std::min(from, last));
+            cursor = std::max(cursor, to);
+            if (cursor >= last) return;
+        }
+        if (cursor < last) restorePages(cursor, last);
+    }
+
+    void restorePages(std::uintptr_t first, std::uintptr_t last) {
+        std::uintptr_t runStart = 0;
+        std::uintptr_t runEnd = 0;
+        int runProtection = -1;
+        const auto flush = [&] {
+            if (runProtection >= 0) ::mprotect(reinterpret_cast<void*>(runStart), static_cast<std::size_t>(runEnd - runStart), runProtection);
+            runProtection = -1;
+        };
+        bool changed = false;
+        forEachPage(first, last, [&](std::uintptr_t page, std::uint8_t& state) {
+            if ((state & Held) == 0) return;
+            const bool armed = (state & Armed) != 0;
+            const int protection = state & ProtectionBits;
+            state = static_cast<std::uint8_t>(state & ~(Held | Armed));
+            changed = true;
+            if (!armed) return;
+            if (runProtection != protection || runEnd != page) {
+                flush();
+                runStart = page;
+                runProtection = protection;
+            }
+            runEnd = page + PageSize;
+        });
+        flush();
+        if (changed) _epoch.fetch_add(1, std::memory_order_acq_rel);
+    }
+
+    bool queryProtections(std::uintptr_t first, std::uintptr_t last, std::vector<std::tuple<std::uintptr_t, std::uintptr_t, int>>& protections) const {
+        const int fd = HostMapping::QueryFd();
+        if (fd < 0) return false;
+        for (auto cursor = first; cursor < last;) {
+            procmap_query query{};
+            query.size = sizeof(query);
+            query.query_flags = PROCMAP_QUERY_COVERING_OR_NEXT_VMA;
+            query.query_addr = cursor;
+            if (ioctl(fd, PROCMAP_QUERY, &query) != 0 || query.vma_start > cursor || query.vma_end <= cursor) return false;
+            const int protection = ((query.vma_flags & PROCMAP_QUERY_VMA_READABLE) != 0 ? PROT_READ : 0) | ((query.vma_flags & PROCMAP_QUERY_VMA_WRITABLE) != 0 ? PROT_WRITE : 0) | ((query.vma_flags & PROCMAP_QUERY_VMA_EXECUTABLE) != 0 ? PROT_EXEC : 0);
+            const auto next = std::min<std::uintptr_t>(last, query.vma_end);
+            protections.emplace_back(cursor, next, protection);
+            cursor = next;
+        }
+        return true;
+    }
+
+    std::uint8_t* pageState(std::uintptr_t page) {
+        auto it = _ranges.upper_bound(page);
+        if (it == _ranges.begin()) return nullptr;
+        --it;
+        if (page >= it->second.end) return nullptr;
+        return &it->second.pages[static_cast<std::size_t>((page - it->first) / PageSize)];
+    }
+
+    template <typename TFunction>
+    void forEachPage(std::uintptr_t begin, std::uintptr_t end, TFunction function) {
+        auto it = _ranges.upper_bound(begin);
+        if (it != _ranges.begin()) --it;
+        for (; it != _ranges.end() && it->first < end; ++it) {
+            const auto first = std::max(begin, it->first);
+            const auto last = std::min(end, it->second.end);
+            for (auto page = first; page < last; page += PageSize) function(page, it->second.pages[static_cast<std::size_t>((page - it->first) / PageSize)]);
+        }
+    }
+
+    bool covers(std::uintptr_t begin, std::uintptr_t end) const {
+        auto it = _ranges.upper_bound(begin);
+        if (it == _ranges.begin()) return false;
+        --it;
+        auto cursor = begin;
+        for (; it != _ranges.end() && it->first <= cursor; ++it) {
+            if (it->second.end > cursor) cursor = it->second.end;
+            if (cursor >= end) return true;
+        }
+        return false;
+    }
+
+    void erase(std::uintptr_t begin, std::uintptr_t end) {
+        auto it = _ranges.upper_bound(begin);
+        if (it != _ranges.begin()) --it;
+        while (it != _ranges.end() && it->first < end) {
+            const auto rangeBegin = it->first;
+            const auto rangeEnd = it->second.end;
+            if (rangeEnd <= begin) {
+                ++it;
+                continue;
+            }
+            auto pages = std::move(it->second.pages);
+            it = _ranges.erase(it);
+            const auto cutBegin = std::max(begin, rangeBegin);
+            const auto cutEnd = std::min(end, rangeEnd);
+            if (rangeBegin < cutBegin) _ranges.emplace(rangeBegin, Range{cutBegin, std::vector<std::uint8_t>(pages.begin(), pages.begin() + static_cast<std::ptrdiff_t>((cutBegin - rangeBegin) / PageSize))});
+            if (cutEnd < rangeEnd) it = _ranges.emplace(cutEnd, Range{rangeEnd, std::vector<std::uint8_t>(pages.begin() + static_cast<std::ptrdiff_t>((cutEnd - rangeBegin) / PageSize), pages.end())}).first;
+        }
+    }
+
+    static std::uintptr_t pageStart(std::uintptr_t address) {
+        return address & ~(PageSize - 1);
+    }
+
+    static std::uintptr_t pageEnd(std::uintptr_t address) {
+        return (address + PageSize - 1) & ~(PageSize - 1);
+    }
+
+    std::mutex _lock;
+    std::map<std::uintptr_t, Range> _ranges;
+    std::vector<Hold> _holds;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _hostWrites;
+    std::array<Retry, RetryCount> _retries{};
+    std::uint64_t _retryUses = 0;
+    std::array<Slot, SlotCount> _slots;
+    std::atomic<unsigned> _wake{0};
+    std::atomic<bool> _registered{false};
+    std::atomic<std::size_t> _active{0};
+    std::atomic<std::uint64_t> _epoch{0};
+    std::atomic<void (*)(std::uintptr_t, std::uintptr_t)> _resolver{nullptr};
+    std::atomic<bool (*)()> _bypass{nullptr};
+    std::once_flag _resolverStarted;
+    std::atomic<bool> _resolverRunning{false};
+    std::atomic<pid_t> _resolverThread{0};
+    Counters _counts;
+};
+
+const bool g_readTrapsReady = (ReadTrapTable::Get(), true);
+#endif
 
 #if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)
 constexpr std::uintptr_t PageBytes = 4096;
@@ -1279,6 +1960,9 @@ bool GuestWriteWatchAvailable_nid_postfix() {
 }
 
 void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes) {
+#if defined(__linux__)
+    if (bytes != 0) ReadTrapTable::Get().Register(reinterpret_cast<std::uintptr_t>(pointer), reinterpret_cast<std::uintptr_t>(pointer) + bytes);
+#endif
 #ifdef APS5_GUEST_WRITE_WATCH
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     Watch::Get().Register(begin, begin + bytes);
@@ -1289,6 +1973,9 @@ void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes)
 }
 
 bool GuestWriteWatchUnregister_nid_postfix(const void* pointer, std::size_t bytes) {
+#if defined(__linux__)
+    if (bytes != 0) ReadTrapTable::Get().Unregister(reinterpret_cast<std::uintptr_t>(pointer), reinterpret_cast<std::uintptr_t>(pointer) + bytes);
+#endif
 #ifdef APS5_GUEST_WRITE_WATCH
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     return Watch::Get().Unregister(begin, begin + bytes);
@@ -1363,6 +2050,9 @@ void GuestWriteWatchBeginHostWrite_nid_postfix(const void* pointer, std::size_t 
 #if defined(__APPLE__)
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     Watch::Get().BeginHostWrite(begin, begin + bytes);
+#elif defined(__linux__)
+    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    if (bytes != 0 && begin + bytes > begin) ReadTrapTable::Get().BeginHostWrite(begin, begin + bytes);
 #else
     static_cast<void>(pointer);
     static_cast<void>(bytes);
@@ -1373,6 +2063,9 @@ void GuestWriteWatchEndHostWrite_nid_postfix(const void* pointer, std::size_t by
 #if defined(__APPLE__)
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     Watch::Get().EndHostWrite(begin, begin + bytes);
+#elif defined(__linux__)
+    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    if (bytes != 0 && begin + bytes > begin) ReadTrapTable::Get().EndHostWrite(begin, begin + bytes);
 #else
     static_cast<void>(pointer);
     static_cast<void>(bytes);
@@ -1394,6 +2087,9 @@ int GuestWriteWatchProtect_nid_postfix(void* pointer, std::size_t bytes, int pro
 #if defined(__APPLE__)
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
     return Watch::Get().Protect(begin, begin + bytes, protection);
+#elif defined(__linux__)
+    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    return ReadTrapTable::Get().Protect(begin, begin + bytes, protection);
 #else
     static_cast<void>(pointer);
     static_cast<void>(bytes);
@@ -1405,6 +2101,8 @@ int GuestWriteWatchProtect_nid_postfix(void* pointer, std::size_t bytes, int pro
 int GuestWriteWatchProtection_nid_postfix(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* runEnd) {
 #if defined(__APPLE__)
     return Watch::Get().Protection(address, limit, runEnd);
+#elif defined(__linux__)
+    return ReadTrapTable::Get().Protection(address, limit, runEnd);
 #else
     static_cast<void>(address);
     *runEnd = limit;
@@ -1447,6 +2145,9 @@ bool GuestWriteWatchCollectArmed_nid_postfix(std::uintptr_t address, std::size_t
 bool GuestWriteWatchSetReadTrapResolver_nid_postfix(void (*resolve)(std::uintptr_t begin, std::uintptr_t end)) {
 #if defined(__APPLE__)
     return Watch::Get().SetReadTrapResolver(resolve);
+#elif defined(__linux__) && defined(__x86_64__)
+    if (resolve != nullptr && !GuardedCopy::FaultsCaught()) return false;
+    return ReadTrapTable::Get().SetResolver(resolve);
 #else
     static_cast<void>(resolve);
     return false;
@@ -1456,6 +2157,8 @@ bool GuestWriteWatchSetReadTrapResolver_nid_postfix(void (*resolve)(std::uintptr
 void GuestWriteWatchSetReadTrapBypass_nid_postfix(bool (*bypass)()) {
 #if defined(__APPLE__)
     Watch::Get().SetReadTrapBypass(bypass);
+#elif defined(__linux__)
+    ReadTrapTable::Get().SetBypass(bypass);
 #else
     static_cast<void>(bypass);
 #endif
@@ -1464,6 +2167,8 @@ void GuestWriteWatchSetReadTrapBypass_nid_postfix(bool (*bypass)()) {
 bool GuestWriteWatchTrapReads_nid_postfix(std::uintptr_t address, std::size_t bytes) {
 #if defined(__APPLE__)
     return bytes != 0 && address + bytes > address && Watch::Get().TrapReads(address, address + bytes);
+#elif defined(__linux__)
+    return bytes != 0 && address + bytes > address && ReadTrapTable::Get().Trap(address, address + bytes);
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
@@ -1485,10 +2190,62 @@ void GuestWriteWatchReadTraps_nid_postfix(std::uintptr_t address, std::size_t by
 void GuestWriteWatchReleaseReads_nid_postfix(std::uintptr_t address, std::size_t bytes) {
 #if defined(__APPLE__)
     if (bytes != 0 && address + bytes > address) Watch::Get().ReleaseReads(address, address + bytes);
+#elif defined(__linux__)
+    if (bytes != 0 && address + bytes > address) ReadTrapTable::Get().Release(address, address + bytes);
 #else
     static_cast<void>(address);
     static_cast<void>(bytes);
 #endif
 }
+
+void GuestWriteWatchSettleReads_nid_postfix(const void* pointer, std::size_t bytes) {
+#if defined(__linux__)
+    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    if (bytes != 0 && begin + bytes > begin) ReadTrapTable::Get().Settle(begin, begin + bytes);
+#else
+    static_cast<void>(pointer);
+    static_cast<void>(bytes);
+#endif
+}
+
+void GuestWriteWatchOpenReads_nid_postfix(const void* pointer, std::size_t bytes) {
+#if defined(__linux__)
+    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    if (bytes != 0 && begin + bytes > begin) ReadTrapTable::Get().Open(begin, begin + bytes);
+#else
+    static_cast<void>(pointer);
+    static_cast<void>(bytes);
+#endif
+}
+
+bool GuestWriteWatchReadTrapsHeld_nid_postfix() {
+#if defined(__linux__)
+    return ReadTrapTable::Get().Active();
+#else
+    return false;
+#endif
+}
+
+std::uint64_t GuestWriteWatchReadTrapEpoch_nid_postfix() {
+#if defined(__linux__)
+    return ReadTrapTable::Get().Epoch();
+#else
+    return 0;
+#endif
+}
+
+void GuestWriteWatchReadTrapCounts_nid_postfix(ReadTrapCounts* counts) {
+    if (counts == nullptr) return;
+    *counts = {};
+#if defined(__linux__)
+    ReadTrapTable::Get().Counts(*counts);
+#endif
+}
+
+#if defined(__linux__)
+bool GuestWriteWatchHandleReadTrap_nid_postfix(int signal, siginfo_t* info, void* context) {
+    return ReadTrapTable::Get().HandleFault(signal, info, context);
+}
+#endif
 
 }

@@ -35,6 +35,7 @@
 #include <sys/stat.h>
 #ifdef __linux__
 #include <sys/uio.h>
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/specifics/linux/GuardedCopy.hpp"
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
 #elif defined(__APPLE__)
@@ -99,7 +100,11 @@ bool CopyGuestBytes(void* destination, const void* source, std::size_t bytes, bo
     iovec local{destination, bytes};
     iovec remote{const_cast<void*>(source), bytes};
     const int saved = errno;
-    const auto copied = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    auto copied = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    if (copied < 0 && errno == EFAULT && GuestWriteWatch::GuestWriteWatchReadTrapsHeld_nid_postfix()) {
+        GuestWriteWatch::GuestWriteWatchSettleReads_nid_postfix(source, bytes);
+        copied = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+    }
     if (copied < 0 && errno != EFAULT) throw std::runtime_error("guest path: process_vm_readv failed with errno " + std::to_string(errno));
     errno = saved;
     return copied >= 0 && static_cast<std::size_t>(copied) == bytes;

@@ -986,13 +986,8 @@ void* PlaceAt(void* pointer, std::size_t bytes, std::uint32_t protection) {
 #if defined(__linux__) || defined(__APPLE__)
 void GuestArenaSetProtection_nid_postfix(std::uintptr_t address, std::size_t bytes, std::uint32_t protection) {
     if (!Arena::Get().Contains(reinterpret_cast<void*>(address), bytes)) throw OutsideArena("set protection", reinterpret_cast<void*>(address), bytes);
-#ifdef __APPLE__
     if (const int error = GuestWriteWatch::GuestWriteWatchProtect_nid_postfix(reinterpret_cast<void*>(address), bytes, PosixProtection(protection)); error != 0)
         throw std::system_error(error, std::generic_category(), "guest arena protection failed");
-#else
-    if (mprotect(reinterpret_cast<void*>(address), bytes, PosixProtection(protection)) != 0)
-        throw std::system_error(errno, std::generic_category(), "guest arena protection failed");
-#endif
     noteAccess(reinterpret_cast<const void*>(address), bytes);
 }
 
@@ -1000,6 +995,7 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
     (void)granule;
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("commit", pointer, bytes);
     const bool marked = Arena::Get().MarkUsedForCommit(pointer, bytes);
+    GuestWriteWatch::GuestWriteWatchOpenReads_nid_postfix(pointer, bytes);
     try {
         if (PlaceAt(pointer, bytes, protection) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "guest arena commit failed");
     } catch (...) {
@@ -1011,6 +1007,7 @@ void GuestArenaCommit_nid_postfix(void* pointer, std::size_t bytes, std::uint32_
 
 void GuestArenaReset_nid_postfix(void* pointer, std::size_t bytes) {
     if (!Arena::Get().Contains(pointer, bytes)) throw OutsideArena("reset", pointer, bytes);
+    GuestWriteWatch::GuestWriteWatchOpenReads_nid_postfix(pointer, bytes);
     if (PlaceAt(pointer, bytes, 0x01) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "guest arena reset failed");
 }
 #elif defined(__EMSCRIPTEN__)
@@ -1082,6 +1079,9 @@ void GuestArenaPrepareHostRead_nid_no_patch(const void* pointer, std::size_t byt
     const auto address = reinterpret_cast<std::uintptr_t>(pointer);
     if (address == 0 || bytes == 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address) return;
     if (const auto hook = hostReadHook.load(std::memory_order_acquire)) hook(address, bytes);
+#ifndef _WIN32
+    GuestWriteWatch::GuestWriteWatchSettleReads_nid_postfix(pointer, bytes);
+#endif
 }
 
 bool GuestArenaBeginHostWrite_nid_postfix(void* pointer, std::size_t bytes) {

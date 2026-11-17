@@ -3,8 +3,29 @@
 
 #include <cstddef>
 #include <cstdint>
+#if defined(__linux__)
+#include <csignal>
+#endif
 
 namespace GuestWriteWatch {
+
+struct ReadTrapCounts {
+    std::uint64_t trapped = 0;
+    std::uint64_t trappedPages = 0;
+    std::uint64_t refused = 0;
+    std::uint64_t released = 0;
+    std::uint64_t faults = 0;
+    std::uint64_t resolved = 0;
+    std::uint64_t resolveNs = 0;
+    std::uint64_t waitNs = 0;
+    std::uint64_t bypassOpens = 0;
+    std::uint64_t ownOpens = 0;
+    std::uint64_t forcedOpens = 0;
+    std::uint64_t retries = 0;
+    std::uint64_t settles = 0;
+    std::uint64_t settleOpens = 0;
+    std::uint64_t holds = 0;
+};
 
 extern "C" {
 
@@ -28,6 +49,14 @@ void GuestWriteWatchSetReadTrapBypass_nid_postfix(bool (*bypass)());
 bool GuestWriteWatchTrapReads_nid_postfix(std::uintptr_t address, std::size_t bytes);
 void GuestWriteWatchReadTraps_nid_postfix(std::uintptr_t address, std::size_t bytes, void (*trapped)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context);
 void GuestWriteWatchReleaseReads_nid_postfix(std::uintptr_t address, std::size_t bytes);
+void GuestWriteWatchSettleReads_nid_postfix(const void* pointer, std::size_t bytes);
+void GuestWriteWatchOpenReads_nid_postfix(const void* pointer, std::size_t bytes);
+bool GuestWriteWatchReadTrapsHeld_nid_postfix();
+std::uint64_t GuestWriteWatchReadTrapEpoch_nid_postfix();
+void GuestWriteWatchReadTrapCounts_nid_postfix(ReadTrapCounts* counts);
+#if defined(__linux__)
+bool GuestWriteWatchHandleReadTrap_nid_postfix(int signal, siginfo_t* info, void* context);
+#endif
 
 }
 
