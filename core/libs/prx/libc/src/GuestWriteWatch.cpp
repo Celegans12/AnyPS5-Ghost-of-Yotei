@@ -105,7 +105,7 @@ public:
         begin = pageStart(begin);
         end = pageEnd(end);
         if (end <= begin) return;
-        const std::lock_guard lock(_lock);
+        const Guard lock(_lock);
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> gaps;
         auto cursor = begin;
         auto it = _ranges.upper_bound(begin);
@@ -124,7 +124,7 @@ public:
         begin = pageStart(begin);
         end = pageEnd(end);
         if (end <= begin || !_registered.load(std::memory_order_acquire)) return;
-        const std::lock_guard lock(_lock);
+        const Guard lock(_lock);
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> dropped;
         for (auto it = _holds.begin(); it != _holds.end();) {
             if (pageStart(it->begin) < end && begin < pageEnd(it->end)) {
@@ -157,7 +157,7 @@ public:
 
     bool Trap(std::uintptr_t begin, std::uintptr_t end, bool writes) {
         if (end <= begin || _resolver.load(std::memory_order_acquire) == nullptr) return false;
-        const std::lock_guard lock(_lock);
+        const Guard lock(_lock);
         const auto first = pageStart(begin);
         const auto last = pageEnd(end);
         const auto found = std::find_if(_holds.begin(), _holds.end(), [&](const Hold& hold) { return hold.begin == begin && hold.end == end && hold.writes == writes; });
@@ -213,7 +213,7 @@ public:
 
     void Release(std::uintptr_t begin, std::uintptr_t end, bool writes) {
         if (end <= begin || !_registered.load(std::memory_order_acquire)) return;
-        const std::lock_guard lock(_lock);
+        const Guard lock(_lock);
         const auto found = std::find_if(_holds.begin(), _holds.end(), [&](const Hold& hold) { return hold.begin == begin && hold.end == end && hold.writes == writes; });
         if (found == _holds.end() || found->state == HoldDormant || --found->count != 0) return;
         _counts.released.fetch_add(1, std::memory_order_relaxed);
@@ -231,7 +231,7 @@ public:
 
     void Sweep() {
         if (!_registered.load(std::memory_order_acquire)) return;
-        const std::lock_guard lock(_lock);
+        const Guard lock(_lock);
         ++_sweep;
         std::vector<std::pair<std::uintptr_t, std::uintptr_t>> dropped;
         for (auto it = _holds.begin(); it != _holds.end();) {
@@ -260,7 +260,7 @@ public:
     int Protection(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* runEnd) {
         *runEnd = limit;
         if (!_registered.load(std::memory_order_acquire) || limit <= address) return -1;
-        const std::lock_guard lock(_lock);
+        const Guard lock(_lock);
         const auto page = pageStart(address);
         auto* state = pageState(page);
         if (state != nullptr && (*state & Held) != 0) {
@@ -291,7 +291,7 @@ public:
         const auto self = currentThread();
         const auto bypass = _bypass.load(std::memory_order_acquire);
         {
-            const std::lock_guard lock(_lock);
+            const Guard lock(_lock);
             if (!activeOverlap(first, last)) {
                 openDormant(first, last);
                 return;
@@ -306,37 +306,26 @@ public:
                 return;
             }
         }
-        for (;;) {
-            if (resolve(first, last, self)) continue;
-            {
-                const std::lock_guard lock(_lock);
-                if (!resolvingOverlap(first, last)) {
-                    reconcile(first, last, false);
-                    openDormant(first, last);
-                    return;
-                }
-            }
-            sched_yield();
-        }
+        waitForResolution(first, last);
     }
 
     void BeginHostWrite(std::uintptr_t begin, std::uintptr_t end) {
         if (end <= begin || _resolver.load(std::memory_order_acquire) == nullptr) return;
         Settle(begin, end);
-        const std::lock_guard lock(_lock);
+        const Guard lock(_lock);
         _hostWrites.emplace_back(pageStart(begin), pageEnd(end));
     }
 
     void EndHostWrite(std::uintptr_t begin, std::uintptr_t end) {
         if (end <= begin || _resolver.load(std::memory_order_acquire) == nullptr) return;
-        const std::lock_guard lock(_lock);
+        const Guard lock(_lock);
         const auto found = std::find(_hostWrites.begin(), _hostWrites.end(), std::pair{pageStart(begin), pageEnd(end)});
         if (found != _hostWrites.end()) _hostWrites.erase(found);
     }
 
     void Open(std::uintptr_t begin, std::uintptr_t end) {
         if (end <= begin || !Active()) return;
-        const std::lock_guard lock(_lock);
+        const Guard lock(_lock);
         forEachPage(pageStart(begin), pageEnd(end), [&](std::uintptr_t page, std::uint8_t& state) {
             if ((state & (Armed | ArmedWrites)) == 0) return;
             openPage(page, state);
@@ -345,7 +334,7 @@ public:
     }
 
     int Protect(std::uintptr_t begin, std::uintptr_t end, int protection) {
-        const std::lock_guard lock(_lock);
+        const Guard lock(_lock);
         forEachPage(pageStart(begin), pageEnd(end), [&](std::uintptr_t page, std::uint8_t& state) {
             if ((state & (Armed | ArmedWrites)) == 0) return;
             openPage(page, state);
@@ -363,7 +352,7 @@ public:
         const bool write = (static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_ERR] & 2) != 0;
         const auto self = currentThread();
         {
-            const std::lock_guard lock(_lock);
+            const Guard lock(_lock);
             auto* state = pageState(page);
             if (state == nullptr) {
                 errno = savedErrno;
@@ -391,7 +380,7 @@ public:
         }
         _counts.faults.fetch_add(1, std::memory_order_relaxed);
         noteFault(page, static_cast<std::uintptr_t>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]), self, write);
-        waitForResolution(page);
+        waitForResolution(page, page + PageSize);
         errno = savedErrno;
         return true;
     }
@@ -464,7 +453,29 @@ private:
 
     struct Slot {
         std::atomic<unsigned> state{Free};
-        std::uintptr_t page = 0;
+        std::uintptr_t begin = 0;
+        std::uintptr_t end = 0;
+    };
+
+    class Guard {
+    public:
+        explicit Guard(std::mutex& mutex) : _mutex(mutex) {
+            sigset_t blocked;
+            sigfillset(&blocked);
+            for (const int synchronous : {SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGTRAP, SIGABRT}) sigdelset(&blocked, synchronous);
+            pthread_sigmask(SIG_BLOCK, &blocked, &_saved);
+            _mutex.lock();
+        }
+        ~Guard() {
+            _mutex.unlock();
+            pthread_sigmask(SIG_SETMASK, &_saved, nullptr);
+        }
+        Guard(const Guard&) = delete;
+        Guard& operator=(const Guard&) = delete;
+
+    private:
+        std::mutex& _mutex;
+        sigset_t _saved;
     };
 
     struct Retry {
@@ -654,14 +665,15 @@ private:
                 if (!slot.state.compare_exchange_strong(expected, Running, std::memory_order_acq_rel)) continue;
                 served = true;
                 const auto start = now();
-                const auto page = slot.page;
+                const auto first = slot.begin;
+                const auto last = slot.end;
                 for (;;) {
-                    if (resolve(page, page + PageSize, self)) continue;
+                    if (resolve(first, last, self)) continue;
                     {
-                        const std::lock_guard lock(_lock);
-                        if (!resolvingOverlap(page, page + PageSize)) {
-                            reconcile(page, page + PageSize, false);
-                            if (!activeOverlap(page, page + PageSize)) openDormant(page, page + PageSize);
+                        const Guard lock(_lock);
+                        if (!resolvingOverlap(first, last)) {
+                            reconcile(first, last, false);
+                            if (!activeOverlap(first, last)) openDormant(first, last);
                             break;
                         }
                     }
@@ -680,7 +692,7 @@ private:
     bool resolve(std::uintptr_t first, std::uintptr_t last, pid_t self) {
         std::vector<Taken> taken;
         {
-            const std::lock_guard lock(_lock);
+            const Guard lock(_lock);
             for (auto& hold : _holds) {
                 if (hold.state != HoldArmed || pageStart(hold.begin) >= last || first >= pageEnd(hold.end)) continue;
                 hold.state = HoldResolving;
@@ -693,7 +705,7 @@ private:
         const auto resolver = _resolver.load(std::memory_order_acquire);
         for (const auto& hold : taken)
             if (resolver != nullptr) resolver(hold.begin, hold.end);
-        const std::lock_guard lock(_lock);
+        const Guard lock(_lock);
         for (const auto& entry : taken) {
             const auto found = std::find_if(_holds.begin(), _holds.end(), [&](const Hold& hold) { return hold.begin == entry.begin && hold.end == entry.end; });
             if (found == _holds.end() || found->state != HoldResolving || found->owner != self) continue;
@@ -705,7 +717,7 @@ private:
         return true;
     }
 
-    void waitForResolution(std::uintptr_t page) {
+    void waitForResolution(std::uintptr_t first, std::uintptr_t last) {
         const auto start = now();
         Slot* slot = nullptr;
         while (slot == nullptr) {
@@ -718,7 +730,8 @@ private:
             }
             if (slot == nullptr) sched_yield();
         }
-        slot->page = page;
+        slot->begin = first;
+        slot->end = last;
         slot->state.store(Queued, std::memory_order_release);
         _wake.fetch_add(1, std::memory_order_acq_rel);
         futexWake(_wake);
@@ -732,8 +745,10 @@ private:
                     if (!slot->state.compare_exchange_strong(expected, Abandoned, std::memory_order_acq_rel)) continue;
                 }
                 {
-                    const std::lock_guard lock(_lock);
-                    if (auto* pageEntry = pageState(page); pageEntry != nullptr && (*pageEntry & (Armed | ArmedWrites)) != 0) openPage(page, *pageEntry);
+                    const Guard lock(_lock);
+                    forEachPage(first, last, [&](std::uintptr_t page, std::uint8_t& state) {
+                        if ((state & (Armed | ArmedWrites)) != 0) openPage(page, state);
+                    });
                 }
                 _counts.forcedOpens.fetch_add(1, std::memory_order_relaxed);
                 constexpr char message[] = "[read-trap] a trapped page was not resolved within 5 s; it is opened without waiting for the GPU\n";
