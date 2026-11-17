@@ -30,9 +30,10 @@ void Require(bool condition, const std::string& message) {
 
 void SetEnvironment(const char* name, const char* value) {
 #ifdef _WIN32
-    _putenv_s(name, value);
+    _putenv_s(name, value != nullptr ? value : "");
 #else
-    setenv(name, value, 1);
+    if (value != nullptr) setenv(name, value, 1);
+    else unsetenv(name);
 #endif
 }
 
@@ -202,6 +203,8 @@ void rejecting() {
 int main() {
     try {
         SetEnvironment("APS5_PENDING_PAGES", "1");
+        SetEnvironment("APS5_PENDING_PAGES_VERIFY", nullptr);
+        SetEnvironment("APS5_AB", nullptr);
         basics();
         replaceOrder();
         restrictWindow();
