@@ -66,3 +66,27 @@ python3 core/kyty/tools/kyty_import.py --ref <Kyty clone> --tag <tag> --dest .
 
 rewrites the folders above from the given tag and reports any file whose tokens changed. Each commit that brings
 Kyty code carries a `Ported-from: Kyty <folder>@<commit> (GPL-2.0)` line.
+
+## Settings of the kyty build
+
+`KytyShim::StartRuntime()` (`core/libs/prx/libSceAgcDriver/KytyShim/src/Config.cpp`) loads KytyPS5's `ConfigOptions` at
+their defaults, then reads these environment variables, named after KytyPS5's command-line options. An invalid value
+stops the emulator with a message naming the variable.
+
+| Variables | Values |
+|---|---|
+| `KYTY_FULLSCREEN`, `KYTY_HDR`, `KYTY_HIDE_CURSOR`, `KYTY_STRETCH`, `KYTY_VR`, `KYTY_TRINITY`, `KYTY_VULKAN_VALIDATION`, `KYTY_GPU_ASSISTED_VALIDATION`, `KYTY_SHADER_VALIDATION`, `KYTY_SHADER_CACHE`, `KYTY_PIPELINE_MANIFEST`, `KYTY_RECORD_PIPELINE_MANIFEST`, `KYTY_STRICT_PIPELINE_MANIFEST`, `KYTY_TESSELLATION`, `KYTY_OCCLUSION_QUERIES`, `KYTY_RELAXED_SHADER_FLOAT`, `KYTY_NATIVE_RT`, `KYTY_ASYNC_PIPELINES`, `KYTY_RT_STATS`, `KYTY_COMMAND_BUFFER_DUMP`, `KYTY_GRAPHICS_DEBUG_DUMP`, `KYTY_PROFILE`, `KYTY_SPIRV_DEBUG_PRINTF`, `KYTY_RENDERDOC`, `KYTY_READBACK_LINEAR_IMAGES`, `KYTY_READBACK_TILED_IMAGES`, `KYTY_READBACK_STORAGE_IMAGES`, `KYTY_SYNC_RAW_IMAGE_BUFFERS`, `KYTY_PERF_OVERLAY`, `KYTY_TROPHY_NOTIFICATIONS` | `0` or `1` |
+| `KYTY_SCREEN_WIDTH`, `KYTY_SCREEN_HEIGHT` | 1 or more |
+| `KYTY_VBLANK_FREQUENCY`, `KYTY_FLUSH_DRAWS`, `KYTY_TROPHY_DURATION` | whole number |
+| `KYTY_CONSOLE_LANGUAGE` | 0 to 29 |
+| `KYTY_GPU` | GPU index, -1 for the default |
+| `KYTY_DLSS_PRESET` | `A` to `O` |
+| `KYTY_PRESENT_MODE` | `Fifo`, `Mailbox`, `Immediate` |
+| `KYTY_PSSR_UPSCALER` | `Linear`, `DLSS`, `FSR` |
+| `KYTY_PIPELINE_PRECOMPILE` | `Ask`, `Wait`, `Play` |
+| `KYTY_SHADER_LOG_DIRECTION`, `KYTY_PRINTF_DIRECTION` | `Silent` (default), `Console`, `File` |
+| `KYTY_DLSS_FOLDER`, `KYTY_FSR_FOLDER`, `KYTY_SHADER_LOG_FOLDER`, `KYTY_COMMAND_BUFFER_DUMP_FOLDER`, `KYTY_PRINTF_OUTPUT_FILE`, `KYTY_SESSION_LOG` | path |
+
+KytyPS5's log (`LOGF`) is silent by default; `KYTY_PRINTF_DIRECTION=Console` sends it to stderr, beside AnyPS5's own
+lines. `KYTY_GPU_PIPELINE`, `KYTY_GPU_THREAD_CPUS`, `KYTY_GPU_THREAD_PRIORITY` and `KYTY_RESOLVE_HELPER` are read by
+`common/emulatorConfig.cpp` itself.

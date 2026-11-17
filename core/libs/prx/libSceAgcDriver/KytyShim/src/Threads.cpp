@@ -39,7 +39,7 @@ bool GuestPause::Supported() noexcept {
 }
 
 bool GuestPause::GuestStarted() {
-    return true;
+    return false;
 }
 
 void GuestPause::Poll() {
