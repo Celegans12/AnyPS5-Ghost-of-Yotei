@@ -202,10 +202,20 @@ VKAPI_ATTR VkResult VKAPI_CALL LockedEnumerateInstanceVersion(std::uint32_t* ver
     return LoaderGlobal<PFN_vkEnumerateInstanceVersion>("vkEnumerateInstanceVersion")(version);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL LockedEnumeratePhysicalDevices(VkInstance instance, std::uint32_t* count, VkPhysicalDevice* devices) {
+    const LoaderLock lock;
+    const auto enumerate = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(LoaderGetInstanceProcAddr()(instance, "vkEnumeratePhysicalDevices"));
+    if (enumerate == nullptr) EXIT("kyty presentation: the Vulkan loader has no vkEnumeratePhysicalDevices\n");
+    return enumerate(instance, count, devices);
+}
+
 VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL LockedGetInstanceProcAddr(VkInstance instance, const char* name) {
     const auto loader = LoaderGetInstanceProcAddr();
+    if (name != nullptr && std::strcmp(name, "vkGetInstanceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedGetInstanceProcAddr);
+    if (name != nullptr && instance != VK_NULL_HANDLE && std::strcmp(name, "vkEnumeratePhysicalDevices") == 0) {
+        return loader(instance, name) == nullptr ? nullptr : reinterpret_cast<PFN_vkVoidFunction>(&LockedEnumeratePhysicalDevices);
+    }
     if (instance == VK_NULL_HANDLE && name != nullptr) {
-        if (std::strcmp(name, "vkGetInstanceProcAddr") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedGetInstanceProcAddr);
         if (std::strcmp(name, "vkCreateInstance") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedCreateInstance);
         if (std::strcmp(name, "vkEnumerateInstanceExtensionProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedEnumerateInstanceExtensionProperties);
         if (std::strcmp(name, "vkEnumerateInstanceLayerProperties") == 0) return reinterpret_cast<PFN_vkVoidFunction>(&LockedEnumerateInstanceLayerProperties);
