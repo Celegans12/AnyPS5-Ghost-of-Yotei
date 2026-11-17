@@ -997,30 +997,56 @@ std::shared_ptr<const ShaderSnapshot> RegisteredProgram(const ShaderRegistry& re
     return result;
 }
 
+namespace {
+
+std::shared_ptr<const ShaderSnapshot> PublishedOver(const ShaderRegistry& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot) {
+    const auto found = registry.find(snapshot->codeAddress);
+    if (found == registry.end()) return snapshot;
+    for (const auto& current : found->second) {
+        if (current->headerAddress == snapshot->headerAddress && current->type == snapshot->type && current->code == snapshot->code && current->header == snapshot->header && !RegisteredPreparationFailed(*current)) {
+            return current == found->second.back() ? nullptr : current;
+        }
+    }
+    return snapshot;
+}
+
+void PlacePublished(ShaderRegistry& registry, const ShaderSnapshot& snapshot, std::shared_ptr<const ShaderSnapshot> published) {
+    auto& headers = registry[snapshot.codeAddress];
+    std::erase_if(headers, [&](const auto& current) { return current->headerAddress == snapshot.headerAddress || current->code != snapshot.code; });
+    headers.push_back(std::move(published));
+}
+
+}
+
 void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const std::shared_ptr<const ShaderSnapshot>& snapshot) {
     ShaderPreparationTransaction transaction;
     transaction.Hold();
-    auto published = snapshot;
-    if (registry != nullptr) {
-        const auto found = registry->find(snapshot->codeAddress);
-        if (found != registry->end()) {
-            for (const auto& current : found->second) {
-                if (current->headerAddress == snapshot->headerAddress && current->type == snapshot->type && current->code == snapshot->code && current->header == snapshot->header && !RegisteredPreparationFailed(*current)) {
-                    if (current == found->second.back()) {
-                        transaction.Commit();
-                        return;
-                    }
-                    published = current;
-                    break;
-                }
-            }
-        }
+    auto published = registry != nullptr ? PublishedOver(*registry, snapshot) : snapshot;
+    if (published == nullptr) {
+        transaction.Commit();
+        return;
     }
     auto next = registry != nullptr ? std::make_shared<ShaderRegistry>(*registry) : std::make_shared<ShaderRegistry>();
-    auto& headers = (*next)[snapshot->codeAddress];
-    std::erase_if(headers, [&](const auto& current) { return current->headerAddress == snapshot->headerAddress || current->code != snapshot->code; });
-    headers.push_back(published);
+    PlacePublished(*next, *snapshot, std::move(published));
     registry = std::move(next);
+    transaction.Commit();
+}
+
+std::shared_ptr<const ShaderRegistry> SharedShaderRegistry::Share() {
+    shared = true;
+    return registry;
+}
+
+void SharedShaderRegistry::Publish(const std::shared_ptr<const ShaderSnapshot>& snapshot) {
+    if (shared) {
+        const auto* previous = registry.get();
+        PublishRegisteredShader(registry, snapshot);
+        shared = registry.get() == previous;
+        return;
+    }
+    ShaderPreparationTransaction transaction;
+    transaction.Hold();
+    if (auto published = PublishedOver(*registry, snapshot)) PlacePublished(*registry, *snapshot, std::move(published));
     transaction.Commit();
 }
 
@@ -1813,14 +1839,16 @@ private:
 
 public:
 
-    void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr) {
+    void Submit(std::function<void()> task, const PreparedShaders* prepared = nullptr, std::uint64_t codeBegin = 0, std::uint64_t codeBytes = 0) {
         {
             std::unique_lock lock(mutex);
             if (threads != 0 && !closed) {
                 const auto sequence = ++submitted;
-                if (prepared != nullptr && prepared->demanded.load()) tasks.push_front({std::move(task), prepared, sequence});
-                else tasks.push_back({std::move(task), prepared, sequence});
+                const auto codeKey = codeBegin & ProgramAddressMask;
+                if (prepared != nullptr && prepared->demanded.load()) tasks.push_front({std::move(task), prepared, sequence, codeKey, codeBytes});
+                else tasks.push_back({std::move(task), prepared, sequence, codeKey, codeBytes});
                 unfinished.insert(sequence);
+                if (codeBytes != 0) programs.emplace(codeKey, Program{codeBytes, sequence});
                 lock.unlock();
                 ready.notify_one();
                 return;
@@ -1848,6 +1876,31 @@ public:
         idle.wait(lock, [&] { return unfinished.empty() || *unfinished.begin() > ticket; });
     }
 
+    bool ProgramsPending() {
+        std::lock_guard lock(mutex);
+        return !programs.empty();
+    }
+
+    void AwaitPrograms(std::span<const std::uint64_t> addresses) {
+        std::unique_lock lock(mutex);
+        if (programs.empty()) return;
+        std::vector<std::uint64_t> awaited;
+        for (const auto address : addresses) {
+            const auto key = address & ProgramAddressMask;
+            const auto next = programs.upper_bound(key);
+            if (next == programs.begin()) continue;
+            const auto [first, last] = programs.equal_range(std::prev(next)->first);
+            for (auto program = first; program != last; ++program) {
+                if (key - program->first < program->second.bytes) awaited.push_back(program->second.sequence);
+            }
+        }
+        if (awaited.empty()) return;
+        std::ranges::sort(awaited);
+        awaited.erase(std::unique(awaited.begin(), awaited.end()), awaited.end());
+        std::stable_partition(tasks.begin(), tasks.end(), [&](const Task& task) { return std::ranges::binary_search(awaited, task.sequence); });
+        idle.wait(lock, [&] { return std::ranges::none_of(awaited, [&](std::uint64_t sequence) { return unfinished.contains(sequence); }); });
+    }
+
     void Close(bool dropQueued) {
         std::vector<Worker> joined;
         std::deque<Task> dropped;
@@ -1856,7 +1909,10 @@ public:
             closed = true;
             if (dropQueued) {
                 dropped.swap(tasks);
-                for (const auto& task : dropped) unfinished.erase(task.sequence);
+                for (const auto& task : dropped) {
+                    unfinished.erase(task.sequence);
+                    forget(task.codeKey, task.codeBytes, task.sequence);
+                }
                 idle.notify_all();
             }
             idle.wait(lock, [&] { return tasks.empty() && running == 0; });
@@ -1938,6 +1994,8 @@ private:
                 ++pool.running;
             }
             const auto sequence = task.sequence;
+            const auto codeKey = task.codeKey;
+            const auto codeBytes = task.codeBytes;
             task.function();
             task = {};
             bool drained = false;
@@ -1945,6 +2003,7 @@ private:
                 std::lock_guard lock(pool.mutex);
                 --pool.running;
                 pool.unfinished.erase(sequence);
+                pool.forget(codeKey, codeBytes, sequence);
                 drained = pool.tasks.empty() && pool.running == 0;
                 pool.idle.notify_all();
             }
@@ -1959,7 +2018,23 @@ private:
         std::function<void()> function;
         const PreparedShaders* prepared = nullptr;
         std::uint64_t sequence = 0;
+        std::uint64_t codeKey = 0;
+        std::uint64_t codeBytes = 0;
     };
+
+    struct Program {
+        std::uint64_t bytes;
+        std::uint64_t sequence;
+    };
+
+    static constexpr std::uint64_t ProgramAddressMask = (std::uint64_t{1} << 40u) - 1u;
+
+    void forget(std::uint64_t codeKey, std::uint64_t codeBytes, std::uint64_t sequence) {
+        if (codeBytes == 0) return;
+        const auto [first, last] = programs.equal_range(codeKey);
+        const auto found = std::find_if(first, last, [&](const auto& program) { return program.second.sequence == sequence; });
+        if (found != last) programs.erase(found);
+    }
 
     std::mutex mutex;
     std::condition_variable ready;
@@ -1971,6 +2046,7 @@ private:
     unsigned running = 0;
     std::uint64_t submitted = 0;
     std::set<std::uint64_t> unfinished;
+    std::multimap<std::uint64_t, Program> programs;
     bool closed = false;
 };
 
@@ -1981,6 +2057,8 @@ bool AsyncRegistrationPrepare() {
 
 void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapshot, std::shared_ptr<RegisteredPreparation> plan) {
     const auto* preparedKey = snapshot->prepared.get();
+    const auto codeBegin = snapshot->codeAddress;
+    const auto codeBytes = static_cast<std::uint64_t>(snapshot->code.size()) * sizeof(std::uint32_t);
     SubmitRegistrationPreparation([snapshot = std::move(snapshot), plan = std::move(plan)] {
         PerformanceContext timingContext(FrameTiming::Preparation());
         std::vector<PreparedShaders::Entry> entries;
@@ -2002,13 +2080,13 @@ void PrepareRegisteredInBackground(std::shared_ptr<const ShaderSnapshot> snapsho
             prepared.pending = false;
         }
         prepared.settled.notify_all();
-    }, preparedKey);
+    }, preparedKey, codeBegin, codeBytes);
 }
 
 }
 
-void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared) {
-    RegistrationPreparePool::Instance().Submit(std::move(task), prepared);
+void SubmitRegistrationPreparation(std::function<void()> task, const PreparedShaders* prepared, std::uint64_t codeBegin, std::uint64_t codeBytes) {
+    RegistrationPreparePool::Instance().Submit(std::move(task), prepared, codeBegin, codeBytes);
 }
 
 void PrioritizeRegistrationPreparation(PreparedShaders& prepared) {
@@ -2018,6 +2096,15 @@ void PrioritizeRegistrationPreparation(PreparedShaders& prepared) {
 
 void AwaitRegistrationPreparation() {
     if (auto* pool = RegistrationPreparePool::Existing()) pool->AwaitSubmitted();
+}
+
+bool RegistrationPreparationPending() {
+    auto* pool = RegistrationPreparePool::Existing();
+    return pool != nullptr && pool->ProgramsPending();
+}
+
+void AwaitRegistrationPreparation(std::span<const std::uint64_t> programs) {
+    if (auto* pool = RegistrationPreparePool::Existing()) pool->AwaitPrograms(programs);
 }
 
 void SubmitLibraryPrebuild(std::function<void()> task) {
@@ -2148,7 +2235,7 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
     std::vector<std::shared_ptr<const ShaderSnapshot>> selectedStages;
     {
         std::lock_guard lock(mutex);
-        registry = shaders;
+        registry = shaders.Share();
         for (const auto* shader : stages) {
             const auto fields = GuestShaderFields(shader);
             const auto address = reinterpret_cast<std::uintptr_t>(const_cast<const void*>(fields.code));
@@ -2589,7 +2676,7 @@ ShaderSnapshot PrepareDepthCopyPixelProgram(bool multisampled) {
 
 std::shared_ptr<const ShaderRegistry> Driver::RegisteredShaders() {
     std::lock_guard lock(mutex);
-    return shaders;
+    return shaders.Share();
 }
 
 void Driver::RegisterShader(const Shader* shader) {
@@ -2624,7 +2711,7 @@ void Driver::RegisterShader(const Shader* shader) {
                 for (const auto& current : found->second) {
                     if (current->headerAddress == snapshot.headerAddress && current->type == snapshot.type && current->code == snapshot.code && current->header == snapshot.header && !RegisteredPreparationFailed(*current)) {
                         const auto identical = current;
-                        PublishRegisteredShader(shaders, identical);
+                        shaders.Publish(identical);
                         transaction.Commit();
                         return;
                     }
@@ -2697,17 +2784,17 @@ void Driver::RegisterShader(const Shader* shader) {
     const auto published = std::make_shared<const ShaderSnapshot>(std::move(snapshot));
     std::unique_lock lock(mutex);
     rethrowFailure();
-    PublishRegisteredShader(shaders, published);
+    shaders.Publish(published);
     if (shaders->find(NullPixelProgramAddress()) == shaders->end()) {
-        PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(PrepareNullPixelProgram(*localDevice)));
+        shaders.Publish(std::make_shared<const ShaderSnapshot>(PrepareNullPixelProgram(*localDevice)));
     }
     for (const bool multisampled : {false, true}) {
-        if (shaders->find(DepthCopyPixelProgramAddress(multisampled)) == shaders->end()) PublishRegisteredShader(shaders, std::make_shared<const ShaderSnapshot>(PrepareDepthCopyPixelProgram(multisampled)));
+        if (shaders->find(DepthCopyPixelProgramAddress(multisampled)) == shaders->end()) shaders.Publish(std::make_shared<const ShaderSnapshot>(PrepareDepthCopyPixelProgram(multisampled)));
     }
     transaction.Commit();
     if (preparation != nullptr) PrepareRegisteredInBackground(published, std::move(preparation));
     if (RegisteredShaderMemoryDue(shaders->size())) {
-        const auto registry = shaders;
+        const auto registry = shaders.Share();
         lock.unlock();
         ReportRegisteredShaderMemory(*registry, "registration");
     }
@@ -2725,7 +2812,7 @@ void Driver::AppendMemoryStats(std::string& line) {
     std::shared_ptr<const ShaderRegistry> registry;
     for (int attempt = 0; attempt < 50 && registry == nullptr; ++attempt) {
         std::unique_lock lock(driver.mutex, std::try_to_lock);
-        if (lock.owns_lock()) registry = driver.shaders;
+        if (lock.owns_lock()) registry = driver.shaders.Share();
         else std::this_thread::sleep_for(std::chrono::milliseconds(2));
     }
     if (registry != nullptr) {

@@ -9,13 +9,6 @@
 #include <string>
 #include <thread>
 
-extern "C" {
-int APS5_VABI scePadInit_nid_postfix(void);
-int APS5_VABI scePadOpen_nid_postfix(int, int, int, const void*);
-int APS5_VABI scePadRead_nid_postfix(int, PadData*, int);
-int APS5_VABI scePadReadState(int, PadData*);
-}
-
 static void Require(bool value) { if (!value) std::abort(); }
 
 constexpr std::uint32_t Options = 0x0008;

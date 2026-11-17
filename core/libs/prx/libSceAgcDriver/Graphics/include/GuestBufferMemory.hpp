@@ -89,8 +89,8 @@ ImportProbe ProbeDmaBufImportWriteProtection(const Context& context);
 ImportWatch PrepareImportWatch(const Context& context);
 void SetImportWatch(const Context& context, ImportWatch watch);
 
-enum class ImportRequester : std::uint8_t { Map, Build, Access, Join, Segment };
-inline constexpr std::size_t ImportRequesterCount = 5;
+enum class ImportRequester : std::uint8_t { Map, Build, Access, Join, Segment, ColorTarget };
+inline constexpr std::size_t ImportRequesterCount = 6;
 
 struct HostImportRequesterCounts {
     std::uint64_t made = 0;
@@ -354,6 +354,8 @@ public:
     // calls RecordCopyBacks (a dispatch), since a staged region's results reach guest memory by
     // that copy alone. Call before Upload.
     void AllowDeviceStaging() { stagingAllowed = true; }
+    void AllowCopyBackHandover(bool allowed) { copyBackHandover = allowed; }
+    std::uint64_t HandoverToken() const { return handoverToken; }
     // An address-based build whose dispatch is too small for its BDA overlays' copies to pay off
     // (see resolveOverlays): its written elements stay in the imports.
     void DisallowAddressStaging() { addressStaging = false; }
@@ -377,6 +379,7 @@ public:
     void Upload(bool addressable);
     void UploadPrepare(bool addressable);
     void UploadFinish(bool addressable);
+    bool PresyncSpaceWrites() const;
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
@@ -599,7 +602,7 @@ private:
     // drops the space: for a region that partially overlaps a base region, and for a build whose
     // imports changed under the space (`resolve`: the direct regions are re-resolved by UploadFinish).
     void dissolveSpace(bool resolve);
-    void completeSpaceWrites() const;
+    void completeSpaceWrites(bool waitUnlocked = false) const;
     // The region containing `address`: this build's own regions (sorted after UploadPrepare) or
     // the space's base regions, or null.
     const Region* owner(std::uint64_t address, std::uint64_t end) const;
@@ -651,9 +654,13 @@ private:
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenWithin(std::uint64_t begin, std::uint64_t end) const;
+    std::uint64_t claimHandovers(std::span<Region* const> copies, Recorder& recorder, std::vector<std::uint8_t>& claimed);
     void takeHeapReferences();
     Context context;
     bool stagingAllowed = false;
+    bool copyBackHandover = false;
+    std::uint64_t handoverToken = 0;
     bool addressStaging = true;
     bool bdaStaging = true;
     bool adjustedRegions = false;

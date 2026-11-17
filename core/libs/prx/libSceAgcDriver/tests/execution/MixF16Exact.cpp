@@ -10,6 +10,9 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <stdexcept>
+#include <sys/mman.h>
 #endif
 #include <array>
 #include <cmath>
@@ -101,7 +104,13 @@ int main(int argc, char** argv) {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         const std::size_t bytes = std::size_t{Lanes} * 16u;
+#ifdef _WIN32
         auto* input = static_cast<std::uint32_t*>(VirtualAlloc(nullptr, bytes * 2u + 0x10000u, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+        void* mapped = mmap(nullptr, bytes * 2u + 0x10000u, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapped == MAP_FAILED) throw std::runtime_error("cannot map the input and output block");
+        auto* input = static_cast<std::uint32_t*>(mapped);
+#endif
         auto* output = input + bytes / 4u;
         GuestAllocations::Mutation().Add(input, bytes * 2u, true, true, true);
         std::mt19937_64 random(12345);
@@ -169,7 +178,9 @@ int main(int argc, char** argv) {
         std::printf("MIX words=%zu lanes=%u nonzero=%u hash=%016llx\n", shader.spirv.size(), Lanes, nonzero, static_cast<unsigned long long>(hash));
         std::fflush(stdout);
         std::fflush(nullptr);
+#ifdef _WIN32
         TerminateProcess(GetCurrentProcess(), 0);  // no DLL detach: ExitProcess after APS5_PROFILE_GPU hung in teardown
+#endif
         std::_Exit(0);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';

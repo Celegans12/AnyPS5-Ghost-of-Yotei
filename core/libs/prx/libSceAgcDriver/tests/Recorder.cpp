@@ -711,6 +711,24 @@ void copiedDirectOrderingTests(const Device& device, Recorder& recorder) {
     update(direct, 2);
     recorder.Sync();
     Require(*block == 45, "direct consumers lost GPU-ordered updates");
+    for (const bool reuse : {false, true}) {
+        const auto* imported = HostImportFor(context, address, bytes);
+        Require(imported != nullptr, "the label-ordering input lost its import");
+        const auto commands = recorder.Commands();
+        context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, imported->buffer, HostImportOffset(*imported, address), 4, 43);
+        const std::uint32_t value = 43;
+        recorder.NoteLabel(address, std::as_bytes(std::span(&value, 1)), 1001, 0);
+        auto completed = std::make_shared<bool>(false);
+        Require(recorder.AfterRecordedWork([completed] { *completed = true; }), "the unrelated completion was not queued");
+        Require(recorder.PendingLabelIn(address, 4) && !recorder.CompletionLabelIn(address, 4), "the GPU label was classified as a CPU completion store");
+        Require(!CompletePendingCpuWrites(context, address, 4), "an unrelated completion forced a CPU wait for a GPU-ordered label");
+        if (reuse) Require(direct->Revalidate(std::span(&compute, 1)), "a GPU-only label prevented direct consumer reuse");
+        else direct = std::make_shared<ShaderResources>(context, compute);
+        Require(!*completed, "the GPU-only label consumer completed unrelated host work");
+        update(direct, 2);
+        recorder.Sync();
+        Require(*completed && *block == 45, "the GPU label consumer lost its value or completion");
+    }
     {
         std::array<std::uint32_t, 1024> unregistered{};
         struct Finish {
@@ -1201,6 +1219,40 @@ void spaceWriteSyncTests(const Device& device, Recorder& recorder) {
     });
     build();
     Require(noted && landed(rangeAt(1) + 0x80) && landed(rangeAt(3) + 0x80) && Recorder::PendingCompletionLabels() == 0, "a build over the address space missed a label a completion noted during its sync");
+    recorder.Sync();
+    {
+        GuestBufferMemory spaceless(context);
+        Require(!spaceless.PresyncSpaceWrites(), "a build without an address space pre-synced");
+    }
+    build();
+    {
+        GuestBufferMemory cached(context);
+        if (!cached.AcquireRegisteredCached()) {
+            std::cout << "the address space is not cached: the space pre-sync is not tested\n";
+        } else {
+            const auto spaceLabel = rangeAt(2) + 0x200;
+            const auto gapLabel = rangeAt(2) + bytes + 0x200;
+            static_cast<void>(recorder.Commands());
+            recorder.AfterCompletions(spaceLabel, value, 7006, 0, false);
+            recorder.Submit();
+            static_cast<void>(recorder.Commands());
+            recorder.AfterCompletions(gapLabel, value, 7007, 0, false);
+            recorder.Submit();
+            Require(!landed(spaceLabel) && !landed(gapLabel) && Recorder::PendingCompletionLabels() == 2, "the labels for the space pre-sync are not pending");
+            const auto depth = GpuMutex().DepthOnThisThread();
+            for (std::uint32_t level = 0; level < depth; ++level) GpuMutex().unlock();
+            const bool presynced = cached.PresyncSpaceWrites();
+            const bool released = !GpuMutex().HeldByThisThread();
+            for (std::uint32_t level = 0; level < depth; ++level) GpuMutex().lock();
+            Require(presynced, "a build holding the address space did not pre-sync its pending write-backs");
+            Require(released, "the space pre-sync left the GPU mutex held");
+            Require(landed(spaceLabel) && !landed(gapLabel) && Recorder::PendingCompletionLabels() == 1, "the space pre-sync did not complete exactly the label inside the space");
+            cached.AddReadable(rangeAt(0) + 64, 16);
+            cached.Upload(true);
+            cached.WriteBack();
+            Require(!landed(gapLabel), "the upload after the pre-sync completed a label outside the space");
+        }
+    }
     recorder.Sync();
     registry(false);
     ::operator delete(block, std::align_val_t{65536});
@@ -2864,6 +2916,83 @@ void remappedImportTests(const Device& device) {
     HostImportFor(context, address, bytes);
 }
 
+bool windowedImportRefreshTests(const Device& device) {
+    const auto& context = device.GetContext();
+    constexpr std::size_t window = 131072;
+    constexpr std::size_t unit = 65536;
+    if (context.hostImportAlignment == 0 || context.hostImportAlignment > unit) {
+        std::cout << "skipped, windowed import refresh requires host imports aligned within 64 KiB; alignment=" << context.hostImportAlignment << '\n';
+        return false;
+    }
+    constexpr std::size_t bytes = 5 * window;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(unit, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the windowed import refresh block");
+    const auto first = (reinterpret_cast<std::uint64_t>(block) + window - 1) / window * window;
+    auto* a = reinterpret_cast<void*>(first);
+    auto* neighbour = reinterpret_cast<void*>(first + unit);
+    auto* b = reinterpret_cast<void*>(first + 2 * window);
+    auto* spare = reinterpret_cast<void*>(first + 3 * window);
+    std::vector<void*> registered;
+    SetHostImportWindow(window);
+    struct Cleanup {
+        const Context& context;
+        void* block;
+        std::vector<void*>& registered;
+        std::uint64_t first;
+        ~Cleanup() {
+            {
+                GuestAllocations::Mutation mutation;
+                for (auto* range : registered) mutation.Remove(range);
+            }
+            HostImportFor(context, first, unit);
+            SetHostImportWindow(0);
+#ifdef _WIN32
+            VirtualFree(block, 0, MEM_RELEASE);
+#else
+            std::free(block);
+#endif
+        }
+    } cleanup{context, block, registered, first};
+    const auto add = [&](void* range) {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(range, unit, true, true, true);
+        registered.push_back(range);
+    };
+    const auto remove = [&](void* range) {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(range);
+        std::erase(registered, range);
+    };
+    const auto serial = [&](void* range) { return HostImportSerial(context, reinterpret_cast<std::uint64_t>(range), unit, true); };
+    add(a);
+    add(b);
+    if (HostImportFor(context, first, unit) == nullptr || HostImportFor(context, reinterpret_cast<std::uint64_t>(b), unit) == nullptr) {
+        std::cout << "skipped, host import of the windowed import refresh ranges refused\n";
+        return false;
+    }
+    const auto firstA = serial(a);
+    const auto firstB = serial(b);
+    Require(firstA != 0 && firstB != 0 && firstA != firstB, "the windowed import refresh ranges were not imported apart");
+    add(spare);
+    Require(serial(a) == firstA && serial(b) == firstB, "a range added in another import window retired an import");
+    add(neighbour);
+    Require(serial(b) == firstB, "a range added in another import window retired an import");
+    Require(serial(a) == 0, "an import whose window gained a continuing range was kept");
+    Require(HostImportFor(context, first, unit) != nullptr, "the grown run was not imported again");
+    const auto secondA = serial(a);
+    Require(secondA != 0 && serial(neighbour) == secondA, "the grown run was not imported as one");
+    remove(b);
+    add(b);
+    Require(serial(a) == secondA, "a range mapped again in another import window retired an import");
+    Require(serial(b) == 0, "the import of a range mapped again was kept");
+    std::cout << "Windowed import refresh tests passed\n";
+    return true;
+}
+
 void hostImportRetirementTests(const Device& device) {
     const auto& context = device.GetContext();
     constexpr std::size_t UnitBytes = 2 * 65536;
@@ -4010,6 +4139,210 @@ void stagingDiffTests(const Device& device, Recorder& recorder) {
     }
     HostImportFor(context, address, bytes);
     std::cout << "staging copy-back tests passed (" << (diff ? "diff" : "whole copies") << ")\n";
+}
+
+bool stagingHandoverTests(const Device& device, Recorder& recorder) {
+    const auto& context = device.GetContext();
+    if (context.hostImportAlignment == 0 || !context.bufferDeviceAddress || std::getenv("APS5_STAGING_DIFF") == nullptr) {
+        std::cout << "host imports, device addresses or APS5_STAGING_DIFF unavailable: staging handover not tested\n";
+        return false;
+    }
+    const bool on = Recorder::StagingDiffHandover();
+    const bool verifying = Recorder::VerifyStagingHandover() != 0;
+    constexpr std::size_t bytes = 4u << 20u;
+#ifdef _WIN32
+    void* block = VirtualAlloc(nullptr, bytes, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
+    void* block = std::aligned_alloc(65536, bytes);
+#endif
+    Require(block != nullptr, "cannot allocate the test block");
+    std::memset(block, 0x11, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(block);
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(block, bytes, true, true, true);
+    }
+    const auto* import = HostImportFor(context, address, bytes);
+    if (import == nullptr || import->address == 0) {
+        std::cout << "host import of the test block refused: staging handover not tested\n";
+        return false;
+    }
+    const auto importBuffer = import->buffer;
+    auto* words = static_cast<std::uint32_t*>(block);
+    const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+    const auto copy = context.Function<PFN_vkCmdCopyBuffer>("vkCmdCopyBuffer");
+    const auto element = address + 4096;
+    const auto readOffset = HostImportOffset(*import, element + 64 * 4);
+    const auto storeOffset = HostImportOffset(*import, element + 700 * 4);
+    constexpr std::size_t elementBytes = 256u << 10u;
+    constexpr std::size_t first = 4096 / 4;
+    const auto settle = [&](VkCommandBuffer commands) {
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    };
+    const auto dword = [](const VkDescriptorBufferInfo& view, std::uint32_t adjustment, std::size_t index) { return view.offset + adjustment + std::uint64_t{index} * 4u; };
+    const auto firstUse = [&](GuestBufferMemory& memory) {
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(element, elementBytes, adjustment);
+        auto commands = recorder.Commands();
+        fill(commands, view.buffer, dword(view, adjustment, 64), 64, 0x22222222u);
+        settle(commands);
+        memory.RecordCopyBacks(recorder);
+    };
+    const auto secondUse = [&](GuestBufferMemory& memory, bool record) {
+        const auto token = memory.HandoverToken();
+        std::uint32_t adjustment = 0;
+        const auto view = memory.Descriptor(element, elementBytes, adjustment);
+        if (!record) return token;
+        {
+            std::optional<Recorder::ClaimKeep> keep;
+            if (token != 0) keep.emplace(recorder, token);
+            auto commands = recorder.Commands();
+            const VkBufferCopy results{dword(view, adjustment, 64), dword(view, adjustment, 300), 64};
+            const VkBufferCopy input{dword(view, adjustment, 500), dword(view, adjustment, 600), 4};
+            const std::array<VkBufferCopy, 2> reads{results, input};
+            copy(commands, view.buffer, view.buffer, static_cast<std::uint32_t>(reads.size()), reads.data());
+            fill(commands, view.buffer, dword(view, adjustment, 400), 4, 0x66666666u);
+            settle(commands);
+            recorder.MarkClaimsDispatched(token);
+        }
+        memory.RecordCopyBacks(recorder);
+        return token;
+    };
+    const auto check = [&](const char* what, bool secondRan) {
+        std::size_t wrong = 0;
+        for (std::size_t index = 0; index < bytes / 4u; ++index) {
+            auto expected = 0x11111111u;
+            const auto at = index >= first ? index - first : bytes;
+            if (at >= 64 && at < 80) expected = 0x22222222u;
+            else if (secondRan && at >= 300 && at < 316) expected = 0x22222222u;
+            else if (secondRan && at == 400) expected = 0x66666666u;
+            else if (at == 500 || (secondRan && at == 600)) expected = 0x77777777u;
+            else if (at == 1000) expected = 0x33333333u;
+            if (words[index] != expected && wrong++ < 8) std::cout << what << ": dword " << index << " holds 0x" << std::hex << words[index] << ", expected 0x" << expected << std::dec << "\n";
+        }
+        Require(wrong == 0, std::string(what) + ": the guest bytes differ from the copy-back sequence");
+    };
+    const auto make = [&](std::unique_ptr<GuestBufferMemory>& memory) {
+        memory = std::make_unique<GuestBufferMemory>(context);
+        memory->AllowDeviceStaging();
+        memory->AllowCopyBackHandover(true);
+        memory->AddWritable(element, elementBytes, false, true);
+        memory->Upload(false);
+        Require(memory->InPlaceReads().empty(), "the 256 KiB element was not staged");
+    };
+    const auto cpuStores = [&] {
+        words[first + 500] = 0x77777777u;
+        words[first + 1000] = 0x33333333u;
+    };
+    const auto reset = [&] {
+        recorder.Sync();
+        std::memset(block, 0x11, bytes);
+    };
+    auto before = Recorder::HandoverCounts();
+    const auto expectTaken = [&](const char* what, std::uint64_t same, std::uint64_t other) {
+        const auto now = Recorder::HandoverCounts();
+        const auto sameTaken = now.sameBuffer - before.sameBuffer;
+        const auto otherTaken = now.otherBuffer - before.otherBuffer;
+        if (sameTaken != (on ? same : 0) || otherTaken != (on ? other : 0)) {
+            std::cout << what << ": " << sameTaken << " same-shadow and " << otherTaken << " other-shadow handovers\n";
+            Require(false, std::string(what) + ": unexpected handover count");
+        }
+        before = now;
+    };
+    {
+        std::unique_ptr<GuestBufferMemory> memory;
+        make(memory);
+        firstUse(*memory);
+        cpuStores();
+        memory->RecordStagingCopies(recorder);
+        secondUse(*memory, true);
+        recorder.Sync();
+        check("same build twice in a batch", true);
+        expectTaken("same build twice in a batch", 1, 0);
+        reset();
+    }
+    {
+        std::unique_ptr<GuestBufferMemory> firstMemory;
+        std::unique_ptr<GuestBufferMemory> secondMemory;
+        make(firstMemory);
+        firstUse(*firstMemory);
+        cpuStores();
+        make(secondMemory);
+        secondUse(*secondMemory, true);
+        recorder.Sync();
+        check("two builds of one range in a batch", true);
+        expectTaken("two builds of one range in a batch", 0, 1);
+        reset();
+    }
+    {
+        std::unique_ptr<GuestBufferMemory> memory;
+        make(memory);
+        firstUse(*memory);
+        cpuStores();
+        auto readback = std::make_shared<Buffer>(context, 64, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto commands = recorder.Commands();
+        const VkBufferCopy region{readOffset, 0, 64};
+        copy(commands, importBuffer, readback->Handle(), 1, &region);
+        settle(commands);
+        recorder.Keep(readback);
+        memory->RecordStagingCopies(recorder);
+        secondUse(*memory, true);
+        recorder.Sync();
+        const auto* read = reinterpret_cast<const std::uint32_t*>(readback->Bytes().data());
+        Require(std::all_of(read, read + 16, [](std::uint32_t value) { return value == 0x22222222u; }), "a reader recorded between two uses did not see the first use's results");
+        check("a reader between two uses", true);
+        expectTaken("a reader between two uses", 0, 0);
+        reset();
+    }
+    {
+        std::unique_ptr<GuestBufferMemory> memory;
+        make(memory);
+        firstUse(*memory);
+        cpuStores();
+        memory->RecordStagingCopies(recorder);
+        const auto token = secondUse(*memory, false);
+        Require(!on || token != 0, "a taker that records no work claimed nothing");
+        recorder.Sync();
+        check("a taker that recorded no work", false);
+        expectTaken("a taker that recorded no work", 1, 0);
+        if (on) {
+            const auto now = Recorder::HandoverCounts();
+            Require(now.misses[static_cast<std::size_t>(Recorder::HandoverMiss::Early)] > 0, "the claimed copy-back of a taker that recorded no work did not land alone");
+        }
+        memory->RecordStagingCopies(recorder);
+        secondUse(*memory, true);
+        recorder.Sync();
+        check("a use after a taker that recorded no work", true);
+        expectTaken("a use after a taker that recorded no work", 0, 0);
+        reset();
+    }
+    if (on && verifying) {
+        const auto verified = Recorder::HandoverCounts();
+        Require(verified.verified >= 2 && verified.inputDisagreements == 0 && verified.finalDisagreements == 0, "the handover verify found disagreements or checked nothing");
+        std::unique_ptr<GuestBufferMemory> memory;
+        make(memory);
+        firstUse(*memory);
+        {
+            const Recorder::ClaimKeep keep(recorder, Recorder::KeepAllClaims);
+            auto commands = recorder.Commands();
+            fill(commands, importBuffer, storeOffset, 4, 0x99999999u);
+            settle(commands);
+        }
+        memory->RecordStagingCopies(recorder);
+        secondUse(*memory, true);
+        recorder.Sync();
+        const auto after = Recorder::HandoverCounts();
+        Require(after.inputDisagreements > verified.inputDisagreements, "the handover verify missed an import store between the two uses");
+        reset();
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Remove(block);
+    }
+    HostImportFor(context, address, bytes);
+    const auto totals = Recorder::HandoverCounts();
+    std::cout << "staging handover tests passed (" << (on ? "handover" : "no handover") << "; " << totals.taken << " taken, " << totals.merged << " merged, " << totals.landed << " landed, " << totals.verified << " verified)\n";
+    return true;
 }
 
 // BDA overlays (GuestBufferMemory::resolveOverlays): a written element of an address-based build
@@ -12789,6 +13122,7 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--reimport-bench") return reimportBench(device);
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-cut-only") return hostImportCutTests(device);
 #endif
+        if (argc == 2 && std::string_view(argv[1]) == "--windowed-import-refresh-only") return windowedImportRefreshTests(device) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-retirement-only") {
             const auto alignment = device.GetContext().hostImportAlignment;
             if (alignment == 0 || alignment > 65536) {
@@ -12960,6 +13294,10 @@ int main(int argc, char** argv) {
         if (argc == 2 && std::string_view(argv[1]) == "--written-buffer-order-only") {
             if (!writtenBufferOrderTests(device, recorder)) return 77;
             std::cout << "written buffer order tests passed\n";
+            return 0;
+        }
+        if (argc == 2 && std::string_view(argv[1]) == "--staging-handover-only") {
+            if (!stagingHandoverTests(device, recorder)) return 77;
             return 0;
         }
         if (argc == 2 && std::string_view(argv[1]) == "--staging-diff-only") {

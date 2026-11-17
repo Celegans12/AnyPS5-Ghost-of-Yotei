@@ -224,6 +224,73 @@ public:
         std::uint64_t lostNoRun, lostOtherQueue, lostRenderPass, lostStoreRun, lostOwner;
     };
     static BatchedStagingStats BatchedStagingCounts();
+    struct HandoverVerify {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        std::shared_ptr<Buffer> import;
+        std::shared_ptr<Buffer> first;
+        std::shared_ptr<Buffer> pristine;
+        std::shared_ptr<Buffer> result;
+        std::shared_ptr<Buffer> before;
+        std::shared_ptr<Buffer> after;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+    };
+    struct StagedCopyBack {
+        std::uint64_t begin = 0;
+        std::uint64_t end = 0;
+        VkBuffer target = VK_NULL_HANDLE;
+        std::uint64_t targetBase = 0;
+        VkDeviceAddress targetAddress = 0;
+        std::shared_ptr<Buffer> shadow;
+        std::shared_ptr<Buffer> pristine;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
+        std::uint64_t claim = 0;
+        bool dispatched = false;
+        std::shared_ptr<HandoverVerify> verify;
+    };
+    enum class HandoverMiss : std::uint8_t { Range, Written, Region, Reach, Storage, Run, Early, Late, Count };
+    enum class DeferMiss : std::uint8_t { Merging, Lease, Resident, Overlay, NoDiff, Unaligned, Validate, Count };
+    struct HandoverStatistics {
+        std::uint64_t deferred, deferredBytes, taken, sameBuffer, otherBuffer, notCopiedBytes, forwardedBytes, merged, mergedBytes, landed, landedBytes, refreshed;
+        std::array<std::uint64_t, static_cast<std::size_t>(HandoverMiss::Count)> misses;
+        std::array<std::uint64_t, static_cast<std::size_t>(DeferMiss::Count)> notDeferred;
+        std::uint64_t verified, verifySkipped, inputDisagreements, finalDisagreements;
+    };
+    static constexpr std::uint64_t KeepAllClaims = ~std::uint64_t{0};
+    static bool StagingDiffHandover();
+    static std::uint64_t VerifyStagingHandover();
+    static HandoverStatistics HandoverCounts();
+    static void CountHandover(bool sameBuffer, std::uint64_t bytes);
+    static void CountHandoverMiss(HandoverMiss reason);
+    static void CountDeferMiss(DeferMiss reason);
+    static void CountVerifySkipped();
+    static const char* HandoverMissName(HandoverMiss reason);
+    static const char* DeferMissName(DeferMiss reason);
+    void DeferCopyBack(StagedCopyBack entry);
+    bool HasPendingCopyBacks() const { return open != nullptr && !open->copyBacks.empty(); }
+    bool PendingCopyBackOverlaps(std::uint64_t address, std::size_t bytes) const;
+    StagedCopyBack* PendingCopyBack(std::uint64_t begin, std::uint64_t end, VkBuffer target, std::uint64_t targetBase);
+    std::uint64_t NewClaimToken() { return ++claimTokens; }
+    StagedCopyBack* ClaimedCopyBack(std::uint64_t token, std::uint64_t begin, std::uint64_t end);
+    void ReleaseClaims(std::uint64_t token);
+    void MarkClaimsDispatched(std::uint64_t token);
+    std::vector<StagedCopyBack> TakeClaims(std::uint64_t token);
+    void LandCopyBacks(VkAccessFlags* coveredAccess = nullptr);
+    void NoteLandingSite(const std::source_location& where = std::source_location::current());
+    static std::string TakeLandingSites(std::size_t limit);
+    void FinishHandoverVerify(VkCommandBuffer commands, std::shared_ptr<HandoverVerify> verify, const StagedCopyBack& entry, bool landed);
+    class ClaimKeep {
+    public:
+        ClaimKeep(Recorder& recorder, std::uint64_t token) : recorder(recorder), lane(static_cast<std::size_t>(recorder.currentLane())), previous(std::exchange(recorder.keptClaims[lane], token)) {}
+        ~ClaimKeep() { recorder.keptClaims[lane] = previous; }
+        void Set(std::uint64_t token) { recorder.keptClaims[lane] = token; }
+        ClaimKeep(const ClaimKeep&) = delete;
+        ClaimKeep& operator=(const ClaimKeep&) = delete;
+    private:
+        Recorder& recorder;
+        std::size_t lane;
+        std::uint64_t previous;
+    };
     // APS5_PROFILE_DRAW: the call sites that closed open runs, cumulative, most frequent first: one
     // text per site (file:line, flush path, run ring, closing thread's ring) and its count.
     // `ring`: only runs of that guest queue (~0u: all).
@@ -1029,6 +1096,8 @@ private:
         bool afterRunMerging = false;
         bool afterRunWrote = false;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> afterRunWritten;
+        std::vector<StagedCopyBack> copyBacks;
+        bool landingCopyBacks = false;
         // The hazard tracker's accesses since its last simulated barrier (see NoteAccess).
         struct Tracker {
             struct Range {
@@ -1118,6 +1187,8 @@ private:
     std::unique_ptr<Buffer> stagingDiffCounter;
     std::uint64_t stagingDiffStored = 0;
     std::uint32_t stagingDiffSeen = 0;
+    std::uint64_t claimTokens = 0;
+    std::array<std::uint64_t, 2> keptClaims{};
     int sampleCounterState = 0;
     std::unique_ptr<Buffer> sampleCounter;
     VkPipelineLayout sampleLayout = VK_NULL_HANDLE;
@@ -1162,6 +1233,8 @@ private:
     // Records a deferred dispatch trailing barrier (see DeferDispatchBarrier), if any.
     // `where`: the caller that closes the run (APS5_PROFILE_DRAW: [run-close] counts by call site).
     void flushDeferredDispatch(std::size_t site, const std::source_location& where = std::source_location::current());
+    void flushCopyBacks(const std::source_location& where = std::source_location::current());
+    void landCopyBacks(std::vector<StagedCopyBack> landing, VkAccessFlags* coveredAccess);
     void dropStaleHoldKept();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();

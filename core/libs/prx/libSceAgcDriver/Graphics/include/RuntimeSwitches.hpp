@@ -106,6 +106,14 @@ enum class RuntimeSwitch : std::size_t {
     NoDeferKeepWriter,
     DeferOverLeases,
     NoLeaseGuard,
+    NoSnapshotScratch,
+    NoDirectSnapshotStaging,
+    NoFusedSnapshotHash,
+    NoParallelBlockHash,
+    NoSpacePresync,
+    TextureKeep,
+    TextureShareByUse,
+    StagingDiffHandover,
     Count,
 };
 

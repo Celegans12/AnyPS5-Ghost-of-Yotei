@@ -78,7 +78,27 @@ bool CheckMetadataCommit() {
     Require(queried.PrivateUsage < after.PrivateUsage + (4u << 20u), "queries allocated untouched tracking leaves");
     return true;
 }
+#endif
 
+void CheckForgetGuard() {
+    static std::array<std::uint8_t, 6 * Block> storage{};
+    const auto base = (reinterpret_cast<std::uint64_t>(storage.data()) + Block - 1) & ~std::uint64_t{Block - 1};
+    static_cast<void>(Accessible(storage.data(), 1));
+    const auto serial = ForgetSerial();
+    const auto guard = ForgetGuard(base, 2 * Block);
+    Require((guard & 1u) == 0, "a forget guard read with no forget in flight is odd");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(base + 3 * Block), Block);
+    if (ForgetSerial() == serial) return;
+    Require(ForgetSerial() == serial + 2, "a forget did not move the forget serial past itself");
+    Require(ForgetGuard(base, 2 * Block) == guard, "a forget of other memory moved a range's forget guard");
+    Require(ForgetGuard(base + 3 * Block, Block) == serial + 2, "a forget left the forget guard of the memory it covers");
+    GuestAllocations::GuestAllocationsInvalidate_nid_postfix(static_cast<std::uintptr_t>(base + 2 * Block - 4096), 8192);
+    Require(ForgetGuard(base, 2 * Block) == serial + 4, "a forget of a range's last page left its forget guard");
+    Require(ForgetGuard(base, Block) == guard, "a forget beyond a range's last block moved its forget guard");
+    Require(ForgetGuard(base + 4 * Block, Block) == guard, "a forget before a range's first block moved its forget guard");
+}
+
+#ifdef _WIN32
 void CheckSparseLeafBoundaries() {
     constexpr std::uintptr_t LeafBytes = std::uintptr_t{1} << 32;
     std::uintptr_t arena = 0;
@@ -1505,6 +1525,10 @@ void CheckContentHashes() {
     std::vector<Hash128> fromCopy(hashes.size());
     HashBlocksOf(address, copy, fromCopy);
     Require(fromCopy == hashes, "a host copy hashes unlike the guest bytes it copies");
+    std::vector<std::byte> hashedRead(bytes);
+    std::vector<Hash128> hashedReadHashes(hashes.size());
+    ReadCommittedHashed(address, hashedRead, hashedReadHashes);
+    Require(hashedRead == copy && hashedReadHashes == hashes, "a hashed read differs from a read and the hashes of what it read");
     Require(CommittedBlocksMatch(address, bytes, hashes), "unchanged bytes do not match their hashes");
     Require(CommittedBlocksMatch(blockBase + Block, Block, std::span<const Hash128>(hashes).subspan(1, 1)), "a whole block inside the range does not match its own hash");
     Require(!CommittedBlocksMatch(address, bytes, std::span<const Hash128>(hashes).first(3)), "a hash list of the wrong length matched");
@@ -1549,10 +1573,89 @@ void CheckContentHashes() {
     HashCommittedBlocks(sparse, sparseBytes, sparseHashes);
     HashBlocksOf(sparse, read, readHashes);
     Require(sparseHashes == readHashes && CommittedBlocksMatch(sparse, sparseBytes, readHashes), "uncommitted pages do not hash as the zeros ReadCommitted reads");
+    std::vector<std::byte> sparseHashedRead(sparseBytes);
+    std::vector<Hash128> sparseHashedReadHashes(sparseHashes.size());
+    ReadCommittedHashed(sparse, sparseHashedRead, sparseHashedReadHashes);
+    Require(sparseHashedRead == read && sparseHashedReadHashes == readHashes, "a hashed read over uncommitted pages differs from a read and the hashes of what it read");
     reserved[4096 + 5] = std::byte{0};
     Require(!CommittedBlocksMatch(sparse, sparseBytes, readHashes), "a changed committed byte next to uncommitted pages still matches");
     VirtualFree(reserved, 0, MEM_RELEASE);
 #endif
+}
+
+// Ranges of 512 KiB or more read, hash and check their blocks on the compare helpers; the results must
+// be the ones the calling thread alone computes (APS5_NO_PARALLEL_BLOCK_HASH), committed or not.
+void CheckParallelBlockHashes() {
+    using AgcDriver::ContentHash::Hash128;
+    using AgcDriver::Graphics::RuntimeSwitch;
+    namespace Switches = AgcDriver::Graphics::RuntimeSwitches;
+    std::vector<std::byte> storage(15 * Block);
+    for (std::size_t i = 0; i < storage.size(); ++i) storage[i] = static_cast<std::byte>((i * 131u + 7u) ^ (i >> 11));
+    const auto blockBase = (reinterpret_cast<std::uint64_t>(storage.data()) + Block - 1) / Block * Block;
+    const auto address = blockBase + 0x2345;
+    const std::size_t bytes = 12 * Block + 300;
+    const auto count = HashBlockCount(address, bytes);
+    Require(count == 13, "the parallel hash range has the wrong block count");
+    const auto readHashed = [&](std::uint64_t at, std::size_t length, bool parallel) {
+        Switches::Assign(RuntimeSwitch::NoParallelBlockHash, !parallel);
+        std::pair<std::vector<std::byte>, std::vector<Hash128>> result{std::vector<std::byte>(length), std::vector<Hash128>(HashBlockCount(at, length))};
+        ReadCommittedHashed(at, result.first, result.second);
+        return result;
+    };
+    const auto matches = [&](std::uint64_t at, std::size_t length, std::span<const Hash128> expected, bool parallel) {
+        Switches::Assign(RuntimeSwitch::NoParallelBlockHash, !parallel);
+        return CommittedBlocksMatch(at, length, expected);
+    };
+    std::vector<std::byte> copy(bytes);
+    ReadCommitted(address, copy);
+    std::vector<Hash128> hashes(count);
+    HashBlocksOf(address, copy, hashes);
+    for (int round = 0; round < 20; ++round) {
+        for (const bool parallel : {true, false}) {
+            const auto [read, readHashes] = readHashed(address, bytes, parallel);
+            Require(read == copy && readHashes == hashes, parallel ? "a parallel hashed read differs from a read and its hashes" : "a serial hashed read differs from a read and its hashes");
+            Require(matches(address, bytes, hashes, parallel), "unchanged bytes do not match their hashes in parallel");
+        }
+    }
+    auto* bytesAt = reinterpret_cast<std::uint8_t*>(address);
+    for (const std::size_t offset : {std::size_t{0}, std::size_t{Block}, bytes / 2, bytes - 1}) {
+        bytesAt[offset] ^= 0x10;
+        for (const bool parallel : {true, false}) Require(!matches(address, bytes, hashes, parallel), "a changed byte at +" + std::to_string(offset) + " still matches in parallel");
+        bytesAt[offset] ^= 0x10;
+    }
+    std::thread other([&] {
+        for (int round = 0; round < 30; ++round) Require(CommittedBlocksMatch(address, bytes, hashes), "a concurrent parallel check failed");
+    });
+    for (int round = 0; round < 30; ++round) {
+        std::vector<std::byte> read(bytes);
+        std::vector<Hash128> readHashes(count);
+        ReadCommittedHashed(address, read, readHashes);
+        Require(read == copy && readHashes == hashes, "a parallel hashed read next to another parallel caller differs");
+    }
+    other.join();
+#ifdef _WIN32
+    auto* reserved = static_cast<std::byte*>(VirtualAlloc(nullptr, 12 * Block, MEM_RESERVE, PAGE_NOACCESS));
+    Require(reserved != nullptr, "cannot reserve the sparse parallel range");
+    for (const std::size_t page : {std::size_t{1}, std::size_t{40}, std::size_t{150}}) {
+        Require(VirtualAlloc(reserved + page * 4096, 4096, MEM_COMMIT, PAGE_READWRITE) != nullptr, "cannot commit a page of the sparse parallel range");
+        std::memset(reserved + page * 4096, static_cast<int>(page), 4096);
+    }
+    const auto sparse = reinterpret_cast<std::uint64_t>(reserved) + 512;
+    const std::size_t sparseBytes = 12 * Block - 1024;
+    std::vector<std::byte> sparseRead(sparseBytes);
+    ReadCommitted(sparse, sparseRead);
+    std::vector<Hash128> sparseHashes(HashBlockCount(sparse, sparseBytes));
+    HashBlocksOf(sparse, sparseRead, sparseHashes);
+    for (const bool parallel : {true, false}) {
+        const auto [read, readHashes] = readHashed(sparse, sparseBytes, parallel);
+        Require(read == sparseRead && readHashes == sparseHashes, "a parallel hashed read over uncommitted pages differs");
+        Require(matches(sparse, sparseBytes, sparseHashes, parallel), "uncommitted pages do not match in parallel");
+    }
+    reserved[40 * 4096 + 9] = std::byte{0xEE};
+    for (const bool parallel : {true, false}) Require(!matches(sparse, sparseBytes, sparseHashes, parallel), "a changed committed byte among uncommitted pages still matches in parallel");
+    VirtualFree(reserved, 0, MEM_RELEASE);
+#endif
+    Switches::Assign(RuntimeSwitch::NoParallelBlockHash, false);
 }
 
 void CheckCollectBoundaries() {
@@ -3398,6 +3501,8 @@ int main(int argc, char** argv) {
             return 0;
         }
         CheckContentHashes();
+        CheckParallelBlockHashes();
+        CheckForgetGuard();
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";
             return 77;

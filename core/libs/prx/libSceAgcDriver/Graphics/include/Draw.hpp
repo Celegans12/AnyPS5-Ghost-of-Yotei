@@ -1,3 +1,4 @@
+#include <future>
 #include <string>
 #include <optional>
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_DRAW_HPP
@@ -26,6 +27,7 @@ struct AheadDraw {
 std::uint64_t AheadDrawUses();
 const AheadDraw* AheadDrawFor(const AheadDraw* ahead, const Context& context);
 std::shared_ptr<const AheadDraw> PrepareAheadDraw(const Context& context, const State& state, std::span<const CompiledShader> shaders);
+std::shared_future<void> PrebuildDrawPipeline(const Context& context, const State& state, std::span<const CompiledShader> shaders);
 struct DrawTraceContext {
     std::uint64_t token = 0;
     std::uint64_t submission = 0;
@@ -44,6 +46,7 @@ struct DrawTraceContext {
 // stamps taken before the preparation (ForgetSerial, the registry generation, the device) are
 // unchanged; otherwise it builds under the lock as before.
 struct PreparedDraw;
+void WaitForPreparedPipeline(const PreparedDraw* prepared);
 bool SplitDrawBuild();
 std::shared_ptr<PreparedDraw> PrepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {});
 void Draw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, PreparedDraw* prepared = nullptr, const AheadDraw* ahead = nullptr, const DrawTraceContext* trace = nullptr);
