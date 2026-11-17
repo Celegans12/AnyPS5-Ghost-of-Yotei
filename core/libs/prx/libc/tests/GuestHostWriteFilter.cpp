@@ -41,12 +41,25 @@ std::atomic<std::size_t> filteredBytes{0};
 std::atomic<bool> filterAnswer{false};
 std::atomic<int> reentries{0};
 thread_local bool holdingMappedRanges = false;
+thread_local bool holdingRegionLock = false;
+thread_local bool onMapper = false;
+std::atomic<bool> holdInPreparer{false};
+std::atomic<bool> holdReady{false};
+std::atomic<bool> handled{false};
+std::atomic<bool> stop{false};
 
 bool Prepare(std::uintptr_t address, std::size_t bytes) {
     prepared.fetch_add(1);
     preparedAddress.store(address);
     preparedBytes.store(bytes);
-    if (holdingMappedRanges) reentries.fetch_add(1);
+    if (holdingMappedRanges || holdingRegionLock) reentries.fetch_add(1);
+    if (onMapper && holdInPreparer.load()) {
+        holdingRegionLock = true;
+        holdReady.store(true);
+        while (!handled.load() && !stop.load()) std::this_thread::yield();
+        holdReady.store(false);
+        holdingRegionLock = false;
+    }
     return true;
 }
 
@@ -54,6 +67,7 @@ bool Filter(std::uintptr_t address, std::size_t bytes) {
     filtered.fetch_add(1);
     filteredAddress.store(address);
     filteredBytes.store(bytes);
+    if (holdingRegionLock) reentries.fetch_add(1);
     return filterAnswer.load();
 }
 
@@ -76,13 +90,11 @@ bool Protected(std::uintptr_t address, std::size_t bytes) {
     return GuestArena::GuestArenaMayBeHostProtected_nid_no_patch(address, bytes);
 }
 
-enum class Mode : int { Hold, Spin };
+enum class Mode : int { Hold, Spin, HostWriteHold };
 
 std::atomic<int> mode{static_cast<int>(Mode::Spin)};
-std::atomic<bool> stop{false};
-std::atomic<bool> holdReady{false};
+std::atomic<std::uintptr_t> guardedAddress{0};
 std::atomic<std::uint64_t> spinIterations{0};
-std::atomic<bool> handled{false};
 std::atomic<int> deliveries{0};
 std::atomic<int> maskFailures{0};
 std::atomic<bool> noteOwnMask{false};
@@ -98,7 +110,17 @@ void APS5_VABI Handler(int, void*) {
 }
 
 void* APS5_VABI MapperThread(void*) {
+    onMapper = true;
     while (!stop.load()) {
+        if (static_cast<Mode>(mode.load()) == Mode::HostWriteHold) {
+            holdInPreparer.store(true);
+            {
+                const GuestArena::HostWrite write(reinterpret_cast<void*>(guardedAddress.load()), 8);
+            }
+            holdInPreparer.store(false);
+            spinIterations.fetch_add(1);
+            continue;
+        }
         holdingMappedRanges = true;
         if (static_cast<Mode>(mode.load()) == Mode::Hold) {
             holdReady.store(true);
@@ -122,10 +144,10 @@ void RaiseAndWait(Pthread thread) {
     while (deliveries.load() < expected) std::this_thread::yield();
 }
 
-void RaiseWhileHolding(Pthread thread) {
+void RaiseWhileHolding(Pthread thread, Mode hold = Mode::Hold) {
     holdReady.store(false);
     handled.store(false);
-    mode.store(static_cast<int>(Mode::Hold));
+    mode.store(static_cast<int>(hold));
     while (!holdReady.load()) std::this_thread::yield();
     RaiseAndWait(thread);
     mode.store(static_cast<int>(Mode::Spin));
@@ -142,6 +164,16 @@ void RequireMapperSignals(Pthread thread, bool watched) {
     for (int raise = 0; raise < StressRaises; ++raise) RaiseAndWait(thread);
     Require(reentries.load() == 0);
     Require(prepared.load() == 0);
+    Require(maskFailures.load() == 0);
+}
+
+void RequireSignalInsidePreparation(Pthread thread, std::uintptr_t watched) {
+    reentries.store(0);
+    guardedAddress.store(watched);
+    const int before = prepared.load();
+    RaiseWhileHolding(thread, Mode::HostWriteHold);
+    Require(reentries.load() == 0);
+    Require(prepared.load() > before);
     Require(maskFailures.load() == 0);
 }
 
@@ -242,6 +274,7 @@ int main() {
     filterAnswer.store(true);
     RequireMapperSignals(mapper, true);
     Require(filteredAddress.load() == maskAddress.load() && filteredBytes.load() == sizeof(GuestSignalSet));
+    RequireSignalInsidePreparation(mapper, Base + 40);
     filterAnswer.store(false);
     RequireMapperSignals(mapper, false);
 
@@ -250,9 +283,21 @@ int main() {
     RequireMapperSignals(mapper, false);
     noteOwnMask.store(true);
     RequireMapperSignals(mapper, true);
+    Require(Protected(maskAddress.load(), sizeof(GuestSignalSet)));
+    const auto sameRegion = (maskAddress.load() & ~(Page - 1)) - 64 * Page;
+    Note(sameRegion, 8, false);
+    RequireSignalInsidePreparation(mapper, sameRegion);
+    Note(sameRegion, 8, true);
     noteOwnMask.store(false);
     Note(maskAddress.load(), sizeof(GuestSignalSet), true);
     RequireMapperSignals(mapper, false);
+    void* released = GuestArena::GuestArenaAllocate_nid_postfix(4 * Page, Page);
+    Require(released != nullptr);
+    const auto releasedAddress = reinterpret_cast<std::uintptr_t>(released);
+    Note(releasedAddress + Page, 2 * Page, false);
+    Require(Protected(releasedAddress, 4 * Page));
+    GuestArena::GuestArenaRelease_nid_postfix(released, 4 * Page);
+    Require(!Protected(releasedAddress, 4 * Page));
 
     stop.store(true);
     Require(scePthreadJoin(mapper, nullptr) == 0);
