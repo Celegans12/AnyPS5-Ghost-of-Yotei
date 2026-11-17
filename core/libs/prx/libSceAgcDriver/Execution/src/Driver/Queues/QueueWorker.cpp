@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Core/include/SubmitPolicy.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <chrono>
 #include <array>
@@ -31,8 +32,7 @@ bool ReapOnFence() {
 #ifdef _WIN32
     return false;
 #else
-    static const bool value = std::getenv("APS5_REAP_ON_FENCE") != nullptr;
-    return value;
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::ReapOnFence);
 #endif
 }
 
@@ -350,11 +350,7 @@ void Driver::run(std::uint32_t id) noexcept {
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool idleStore = std::getenv("APS5_NO_IDLE_STORE") == nullptr;
-    const bool fenceWake = id == 0 && ReapOnFence();
-    if (fenceWake) {
-        fenceWaker.store(this, std::memory_order_release);
-        Graphics::Recorder::SetReapWake(&Driver::wakeAtFence);
-    }
+    bool fenceWakeInstalled = false;
     std::uint64_t fenceWakesSeen = 0;
     auto& costs = submissionCosts(id);
     try {
@@ -440,6 +436,12 @@ void Driver::run(std::uint32_t id) noexcept {
                         changed.wait(lock, [&] { return ready() || (id == 0 && (idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait || completionsPending())); });
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
                         continue;
+                    }
+                    const bool fenceWake = id == 0 && ReapOnFence();
+                    if (fenceWake != fenceWakeInstalled) {
+                        fenceWakeInstalled = fenceWake;
+                        if (fenceWake) fenceWaker.store(this, std::memory_order_release);
+                        Graphics::Recorder::SetReapWake(fenceWake ? &Driver::wakeAtFence : nullptr);
                     }
                     if (fenceWake) {
                         const auto seen = fenceWakesSeen;
