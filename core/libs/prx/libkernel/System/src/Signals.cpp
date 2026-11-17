@@ -27,6 +27,9 @@
 #include <new>
 #include <typeinfo>
 #endif
+#if defined(__linux__) && defined(__x86_64__)
+#include "prx/libc/include/specifics/linux/GuardedCopy.hpp"
+#endif
 
 static_assert(sizeof(GuestSigaction) == 32 && offsetof(GuestSigaction, flags) == 8 && offsetof(GuestSigaction, mask) == 12);
 
@@ -212,10 +215,41 @@ int NativeSignal(int guest) {
         default: return 0;
     }
 }
+#if defined(__linux__) && defined(__x86_64__)
+std::atomic<void (*)(int)> faultDisposition{SIG_DFL};
+void HostFault(int native, siginfo_t* info, void* context) {
+    if (GuestCopyRecoverFault_nid_no_patch(native, info, context)) return;
+    const auto disposition = faultDisposition.load(std::memory_order_acquire);
+    if (disposition == SIG_IGN) {
+        if (info->si_code <= 0) return;
+    } else if (disposition != SIG_DFL) {
+        disposition(native);
+        return;
+    }
+    struct sigaction fallback{};
+    fallback.sa_handler = SIG_DFL;
+    sigemptyset(&fallback.sa_mask);
+    sigaction(native, &fallback, nullptr);
+    if (info->si_code <= 0) std::raise(native);
+}
+#endif
+bool SetHostHandler(int native, void (*handler)(int)) {
+#if defined(__linux__) && defined(__x86_64__)
+    if (native == SIGSEGV) {
+        faultDisposition.store(handler, std::memory_order_release);
+        struct sigaction action{};
+        action.sa_sigaction = HostFault;
+        action.sa_flags = SA_SIGINFO | SA_RESTART;
+        sigemptyset(&action.sa_mask);
+        return sigaction(native, &action, nullptr) == 0;
+    }
+#endif
+    return std::signal(native, handler) != SIG_ERR;
+}
 void ResetToDefault(int guest) {
     handlerReset[guest].store(true);
     handlers[guest].store(nullptr);
-    if (const int native = NativeSignal(guest)) std::signal(native, SIG_DFL);
+    if (const int native = NativeSignal(guest)) SetHostHandler(native, SIG_DFL);
 }
 void RunHandler(int guest, GuestHandler handler) {
     auto& self = CurrentSignals();
@@ -275,7 +309,7 @@ bool Install(int guest, const GuestSigaction& action) {
     if (!native) return true;
     const auto previous = handlers[guest].exchange(Delivered(action) ? reinterpret_cast<GuestHandler>(action.handler) : nullptr);
     auto hostHandler = action.handler == 1 ? SIG_IGN : Delivered(action) ? Dispatch : SIG_DFL;
-    if (std::signal(native, hostHandler) == SIG_ERR) {
+    if (!SetHostHandler(native, hostHandler)) {
         handlers[guest].store(previous);
         return false;
     }

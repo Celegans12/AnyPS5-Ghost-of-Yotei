@@ -41,6 +41,7 @@
 #include <string_view>
 #include <dlfcn.h>
 #include <link.h>
+#include "prx/libc/include/specifics/linux/GuardedCopy.hpp"
 #if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 35))
 #define LIBKERNEL_EXCEPTION_FIND_OBJECT 1
 #endif
@@ -1253,6 +1254,7 @@ void ChainFault(int hostSignal, siginfo_t* info, void* context) {
 }
 
 void DeliverFault(int hostSignal, siginfo_t* info, void* context) {
+    if (GuestCopyRecoverFault_nid_no_patch(hostSignal, info, context)) return;
     auto& host = static_cast<ucontext_t*>(context)->uc_mcontext;
     Fault fault{};
     const bool deliverable = info->si_code > 0 && Classify(hostSignal, host, fault);
