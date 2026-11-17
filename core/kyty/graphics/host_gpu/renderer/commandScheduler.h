@@ -17,6 +17,10 @@
 #include <utility>
 #include <vector>
 
+#if defined(ANYPS5_KYTY)
+#include <deque>
+#endif
+
 namespace Libs::Graphics {
 
 class CommandScheduler {
@@ -47,6 +51,9 @@ public:
 	void DeferPriorityOperation(Common::UniqueFunction<void>&&                     operation,
 	                            const std::vector<std::pair<uint64_t, uint64_t>>& ranges);
 	void DeferHostOperation(Common::UniqueFunction<void>&& operation, bool priority = false);
+#if defined(ANYPS5_KYTY)
+	void DeferFlipCompletion(Common::UniqueFunction<void>&& complete);
+#endif
 	[[nodiscard]] bool HasPendingPriorityOperations();
 	[[nodiscard]] static bool InDeferredOperation() noexcept;
 
@@ -121,6 +128,15 @@ private:
 	void QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit, uint64_t tick);
 	void PriorityOperationsThread(std::stop_token stop);
 	void RunOperation(Common::UniqueFunction<void>&& operation);
+#if defined(ANYPS5_KYTY)
+	struct FlipCompletion {
+		Common::UniqueFunction<void> complete;
+		uint64_t                     submitted_tick = 0;
+		uint64_t                     previous_tick  = 0;
+	};
+	void FlipCompletionThread(std::stop_token stop);
+	void DrainFlipCompletions();
+#endif
 
 	MasterSemaphore              m_master;
 	RenderContext&               m_context;
@@ -152,6 +168,16 @@ private:
 	std::unique_ptr<HostCopyQueue> m_host_copies;
 	SubmitHook                     m_submit_hook      = nullptr;
 	void*                          m_submit_hook_data = nullptr;
+#if defined(ANYPS5_KYTY)
+	std::mutex                  m_flip_mutex;
+	std::condition_variable_any m_flip_changed;
+	std::deque<FlipCompletion>  m_flip_completions;
+	std::atomic<bool>           m_flips_pending {false};
+	bool                        m_flip_running   = false;
+	uint64_t                    m_last_flip_tick = 0;
+	std::once_flag              m_flip_thread_once;
+	std::jthread                m_flip_thread;
+#endif
 	std::jthread m_recording_thread;
 };
 

@@ -164,6 +164,19 @@ of every storage image on its first write still needs `KYTY_READBACK_STORAGE_IMA
 restores KytyPS5's behaviour; any value other than empty, `0` or `1` stops the emulator with a message naming the
 variable.
 
+Guest flips: KytyPS5 completes a flip (`VideoOutDriver::CompleteFlip`, which makes the request ready for presentation;
+the title's flip event follows) on its priority thread, once the GPU has finished the command buffer that holds the
+presentation copy. The title then waits for the end of the GPU's work before it submits its next frame. Under
+`ANYPS5_KYTY`, `CommandScheduler::DeferFlipCompletion` completes the flip on a thread of its own, outside the
+scheduler's locks, once that command buffer has been submitted to the Vulkan queue and the GPU has finished the command
+buffer of the previous flip, with the priority operations queued before it. The present blit is submitted after the copy
+on the same queue and its barrier waits for the copy, so the presented image does not change; the title's next frame
+overlaps the end of the GPU's work on this one, with at most two frames in flight. The display buffer the flip frees is
+the one shown before, whose copy the GPU has finished, and a title that renders into a display buffer first waits for it
+on the GPU (rendering wait packet). Measured on Subnautica, in two sessions of 17 paired periods of 10 s: +1.7 % and
++4.8 % frames per second, the same images (`notes/au-dela-p9-bascule.md`). `KYTY_EARLY_FLIP=0` restores KytyPS5's behaviour; any value other than empty, `0` or
+`1` stops the emulator with a message naming the variable.
+
 `m_program_lock`, the spin lock of `graphics/host_gpu/renderer/pipeline/pipelineCache.cpp` that guards the program
 cache, has a narrower scope than upstream's in this build (`programLock.cpp`). The resolve thread always runs upstream's
 unlocked ahead mode, which upstream only uses with `KYTY_RESOLVE_HELPER=1`, and the execute thread releases the lock
