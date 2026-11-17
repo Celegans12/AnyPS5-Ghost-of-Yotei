@@ -58,6 +58,9 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#ifdef __linux__
+#include <dlfcn.h>
+#endif
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 
 namespace AgcDriver::Graphics {
@@ -1334,7 +1337,7 @@ bool EopReadTrapRequested() {
     return requested;
 }
 
-std::atomic<std::uint64_t> eopTrapLabels{0}, eopTrapTrapped{0}, eopTrapRefused{0}, eopTrapLabelPage{0}, eopTrapRanges{0}, eopTrapBytes{0}, eopTrapReleased{0}, eopTrapFaults{0}, eopTrapNested{0}, eopTrapChecked{0}, eopTrapUncovered{0}, eopTrapSetNs{0}, eopTrapReleaseNs{0}, eopChangingCopies{0}, eopChangingCopyBytes{0};
+std::atomic<std::uint64_t> eopTrapLabels{0}, eopTrapTrapped{0}, eopTrapRefused{0}, eopTrapLabelPage{0}, eopTrapRanges{0}, eopTrapBytes{0}, eopTrapReleased{0}, eopTrapFaults{0}, eopTrapNested{0}, eopTrapChecked{0}, eopTrapUncovered{0}, eopTrapSetNs{0}, eopTrapReleaseNs{0}, eopChangingCopies{0}, eopChangingCopyBytes{0}, eopTrapLabelRanges{0};
 std::atomic<bool> guestReadTrapsReady{false};
 
 bool EopReadTrapVerified() {
@@ -1376,6 +1379,47 @@ void CheckEopTrapCovers(std::uint64_t address, std::size_t bytes) {
 }
 
 #ifdef __linux__
+struct EopTrapSite {
+    int value = 0;
+    std::uintptr_t instruction = 0;
+    int thread = 0;
+    bool write = false;
+    std::uint64_t count = 0;
+};
+
+struct EopTrapSites {
+    std::mutex mutex;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, EopTrapSite> sites;
+};
+
+EopTrapSites& TrapSites() {
+    static auto* sites = new EopTrapSites;
+    return *sites;
+}
+
+void NoteEopTrapSite(std::uintptr_t begin, std::uintptr_t end) {
+    GuestWriteWatch::ReadTrapFault fault{};
+    if (GuestWriteWatch::GuestWriteWatchReadTrapFaults_nid_postfix(&fault, 1) != 1 || fault.page < (begin & ~(ReadTrapPage - 1)) || fault.page >= end) return;
+    std::pair<std::uint64_t, std::uint64_t> write{begin, end};
+    int value = Recorder::ReachValue;
+    {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Hook);
+        std::lock_guard gpu(GuestMemory::GpuMutex());
+        if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+            for (const auto& pending : recorder->PendingWritesOver(fault.page, ReadTrapPage)) {
+                if (pending.value == Recorder::ReachValue) continue;
+                write = {pending.begin, pending.end};
+                value = pending.value;
+                break;
+            }
+        }
+    }
+    auto& sites = TrapSites();
+    std::lock_guard lock(sites.mutex);
+    auto& site = sites.sites[write];
+    if (site.count++ == 0) site = {value, fault.instruction, fault.thread, fault.write, 1};
+}
+
 void ResolveGuestReadTrap(std::uintptr_t begin, std::uintptr_t end) {
     eopTrapFaults.fetch_add(1, std::memory_order_relaxed);
     const auto bytes = static_cast<std::size_t>(end - begin);
@@ -1383,6 +1427,7 @@ void ResolveGuestReadTrap(std::uintptr_t begin, std::uintptr_t end) {
         eopTrapNested.fetch_add(1, std::memory_order_relaxed);
         return;
     }
+    NoteEopTrapSite(begin, end);
     FlushForAccess(begin, bytes);
     if (ReadTrapOverlaps(begin, bytes)) {
         std::lock_guard gpu(GuestMemory::GpuMutex());
@@ -1414,6 +1459,7 @@ bool InstallGuestReadTraps() {
 
 struct EopTrapHold {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> labels;
     bool noted = false;
     EopTrapHold() = default;
     EopTrapHold(const EopTrapHold&) = delete;
@@ -1441,7 +1487,12 @@ struct EopTrapHold {
             noted = false;
         }
         for (const auto& [begin, end] : ranges) ReleaseGuestReads(begin, end);
-        if (!ranges.empty()) {
+#ifdef __linux__
+        for (const auto& [begin, end] : labels) GuestWriteWatch::GuestWriteWatchReleaseWrites_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin));
+#endif
+        const bool held = !ranges.empty() || !labels.empty();
+        labels.clear();
+        if (held) {
             eopTrapReleased.fetch_add(1, std::memory_order_relaxed);
             eopTrapReleaseNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed);
         }
@@ -5496,6 +5547,21 @@ bool Recorder::EarlyEndOfPipe() {
     return enabled;
 }
 
+bool Recorder::EopLabelWriteTrap() {
+    static const bool enabled = std::getenv("APS5_EARLY_EOP_LABEL_WRITE_TRAP") != nullptr;
+    return enabled && EopReadTrap();
+}
+
+bool Recorder::PendingLabelStore(std::uint64_t address, std::size_t bytes) const {
+    if (bytes == 0 || bytes > 8 || address % 4 != 0 || bytes % 4 != 0) return false;
+    std::lock_guard tableLock(labelTableMutex);
+    for (auto dword = address; dword < address + bytes; dword += 4) {
+        const auto found = labels.find(dword);
+        if (found == labels.end() || found->second.overwritten || found->second.batch == nullptr) return false;
+    }
+    return true;
+}
+
 bool Recorder::EopReadTrap() {
 #ifdef __linux__
     return EopReadTrapRequested() && EarlyEndOfPipe() && guestReadTrapsReady.load(std::memory_order_acquire);
@@ -5505,7 +5571,38 @@ bool Recorder::EopReadTrap() {
 }
 
 Recorder::EopTrapStatistics Recorder::EopTrapCounts() {
-    return {eopTrapLabels.load(std::memory_order_relaxed), eopTrapTrapped.load(std::memory_order_relaxed), eopTrapRefused.load(std::memory_order_relaxed), eopTrapLabelPage.load(std::memory_order_relaxed), eopTrapRanges.load(std::memory_order_relaxed), eopTrapBytes.load(std::memory_order_relaxed), eopTrapReleased.load(std::memory_order_relaxed), eopTrapFaults.load(std::memory_order_relaxed), eopTrapNested.load(std::memory_order_relaxed), eopTrapChecked.load(std::memory_order_relaxed), eopTrapUncovered.load(std::memory_order_relaxed), eopTrapSetNs.load(std::memory_order_relaxed), eopTrapReleaseNs.load(std::memory_order_relaxed), eopChangingCopies.load(std::memory_order_relaxed), eopChangingCopyBytes.load(std::memory_order_relaxed)};
+    return {eopTrapLabels.load(std::memory_order_relaxed), eopTrapTrapped.load(std::memory_order_relaxed), eopTrapRefused.load(std::memory_order_relaxed), eopTrapLabelPage.load(std::memory_order_relaxed), eopTrapRanges.load(std::memory_order_relaxed), eopTrapBytes.load(std::memory_order_relaxed), eopTrapReleased.load(std::memory_order_relaxed), eopTrapFaults.load(std::memory_order_relaxed), eopTrapNested.load(std::memory_order_relaxed), eopTrapChecked.load(std::memory_order_relaxed), eopTrapUncovered.load(std::memory_order_relaxed), eopTrapSetNs.load(std::memory_order_relaxed), eopTrapReleaseNs.load(std::memory_order_relaxed), eopChangingCopies.load(std::memory_order_relaxed), eopChangingCopyBytes.load(std::memory_order_relaxed), eopTrapLabelRanges.load(std::memory_order_relaxed)};
+}
+
+std::string Recorder::TakeEopTrapSites() {
+#ifdef __linux__
+    std::vector<std::pair<std::pair<std::uint64_t, std::uint64_t>, EopTrapSite>> taken;
+    {
+        auto& sites = TrapSites();
+        std::lock_guard lock(sites.mutex);
+        taken.assign(sites.sites.begin(), sites.sites.end());
+        sites.sites.clear();
+    }
+    std::sort(taken.begin(), taken.end(), [](const auto& left, const auto& right) { return left.second.count > right.second.count; });
+    std::string text;
+    for (std::size_t index = 0; index < taken.size() && index < 6; ++index) {
+        const auto& [range, site] = taken[index];
+        char name[32] = "?";
+        if (FILE* comm = std::fopen(("/proc/self/task/" + std::to_string(site.thread) + "/comm").c_str(), "r")) {
+            if (std::fgets(name, sizeof(name), comm) != nullptr) name[std::strcspn(name, "\n")] = '\0';
+            std::fclose(comm);
+        }
+        Dl_info info{};
+        const bool found = dladdr(reinterpret_cast<const void*>(site.instruction), &info) != 0 && info.dli_fname != nullptr;
+        const char* module = found ? std::strrchr(info.dli_fname, '/') : nullptr;
+        char line[320];
+        std::snprintf(line, sizeof(line), " %llx+%llu (value %d) %llu by %s %s at %s+0x%llx;", static_cast<unsigned long long>(range.first), static_cast<unsigned long long>(range.second - range.first), site.value, static_cast<unsigned long long>(site.count), name, site.write ? "writing" : "reading", found ? (module != nullptr ? module + 1 : info.dli_fname) : "?", static_cast<unsigned long long>(found ? site.instruction - reinterpret_cast<std::uintptr_t>(info.dli_fbase) : site.instruction));
+        text += line;
+    }
+    return text.empty() ? std::string(" none") : text;
+#else
+    return " none";
+#endif
 }
 
 void Recorder::CountChangingCopy(std::size_t bytes) {
@@ -5515,6 +5612,9 @@ void Recorder::CountChangingCopy(std::size_t bytes) {
 
 bool Recorder::TrapPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::uint64_t label, std::size_t labelBytes) {
     eopTrapLabels.fetch_add(1, std::memory_order_relaxed);
+#ifdef __linux__
+    GuestWriteWatch::GuestWriteWatchSweepReadTraps_nid_postfix();
+#endif
     if (writes.empty()) return true;
     const auto start = std::chrono::steady_clock::now();
     const struct SetTimer {
@@ -5522,10 +5622,19 @@ bool Recorder::TrapPendingWrites(std::span<const std::pair<std::uint64_t, std::u
         ~SetTimer() { eopTrapSetNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count()), std::memory_order_relaxed); }
     } timer{start};
     std::vector<std::pair<std::uint64_t, std::uint64_t>> spans;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> labelStores;
     spans.reserve(writes.size());
+    const bool labelWrites = EopLabelWriteTrap();
     for (const auto& [begin, end] : writes) {
-        if (begin < end) spans.emplace_back(begin & ~(ReadTrapPage - 1), (end + ReadTrapPage - 1) & ~(ReadTrapPage - 1));
+        if (begin >= end) continue;
+        if (labelWrites && PendingLabelStore(begin, static_cast<std::size_t>(end - begin))) {
+            labelStores.emplace_back(begin, end);
+            continue;
+        }
+        spans.emplace_back(begin & ~(ReadTrapPage - 1), (end + ReadTrapPage - 1) & ~(ReadTrapPage - 1));
     }
+    std::sort(labelStores.begin(), labelStores.end());
+    labelStores.erase(std::unique(labelStores.begin(), labelStores.end()), labelStores.end());
     std::sort(spans.begin(), spans.end());
     std::size_t merged = 0;
     for (const auto& span : spans) {
@@ -5538,7 +5647,7 @@ bool Recorder::TrapPendingWrites(std::span<const std::pair<std::uint64_t, std::u
         const auto labelEnd = (label + labelBytes + ReadTrapPage - 1) & ~(ReadTrapPage - 1);
         int file = -1;
         std::uint64_t offset = 0;
-        const bool crossing = std::any_of(spans.begin(), spans.end(), [&](const auto& span) { return span.first < labelEnd && labelBegin < span.second; });
+        const bool crossing = std::any_of(spans.begin(), spans.end(), [&](const auto& span) { return span.first < labelEnd && labelBegin < span.second; }) || std::any_of(labelStores.begin(), labelStores.end(), [&](const auto& store) { return store.first < labelEnd && labelBegin < store.second; });
         if (crossing && !GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(label), labelBytes, &file, &offset)) {
             eopTrapLabelPage.fetch_add(1, std::memory_order_relaxed);
             return false;
@@ -5556,6 +5665,17 @@ bool Recorder::TrapPendingWrites(std::span<const std::pair<std::uint64_t, std::u
         hold->ranges.emplace_back(begin, end);
         bytes += end - begin;
     }
+#ifdef __linux__
+    for (const auto& [begin, end] : labelStores) {
+        if (!GuestWriteWatch::GuestWriteWatchTrapWrites_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin))) {
+            eopTrapRefused.fetch_add(1, std::memory_order_relaxed);
+            hold->Release();
+            return false;
+        }
+        hold->labels.emplace_back(begin, end);
+    }
+#endif
+    eopTrapLabelRanges.fetch_add(labelStores.size(), std::memory_order_relaxed);
     hold->Note();
     if (!AfterRecordedWork([hold] { hold->Release(); })) {
         hold->Release();

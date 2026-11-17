@@ -455,10 +455,13 @@ public:
     static bool EarlyEndOfPipe();
     void NoteEndOfPipe(bool early);
     struct EopTrapStatistics {
-        std::uint64_t labels, trapped, refused, labelPage, ranges, bytes, released, faults, nested, checked, uncovered, setNs, releaseNs, changingCopies, changingCopyBytes;
+        std::uint64_t labels, trapped, refused, labelPage, ranges, bytes, released, faults, nested, checked, uncovered, setNs, releaseNs, changingCopies, changingCopyBytes, labelRanges;
     };
     static void CountChangingCopy(std::size_t bytes);
+    static std::string TakeEopTrapSites();
     static bool EopReadTrap();
+    static bool EopLabelWriteTrap();
+    bool PendingLabelStore(std::uint64_t address, std::size_t bytes) const;
     static EopTrapStatistics EopTrapCounts();
     bool TrapPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::uint64_t label, std::size_t labelBytes);
     bool TakeEarlyEndOfPipe();
