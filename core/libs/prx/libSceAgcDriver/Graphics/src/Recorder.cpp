@@ -4379,13 +4379,21 @@ bool snapshotUnchangedSince(std::uint64_t address, std::size_t bytes, std::uint6
 }
 
 bool Recorder::DrawInputCompare() {
-    static const bool enabled = std::getenv("APS5_DRAW_INPUT_COMPARE") != nullptr;
+#ifdef _WIN32
+    return false;
+#else
+    static const bool enabled = std::getenv("APS5_NO_DRAW_INPUT_COMPARE") == nullptr;
     return enabled;
+#endif
 }
 
 bool Recorder::DrawInputEpochProof() {
-    static const bool enabled = std::getenv("APS5_DRAW_INPUT_EPOCH_PROOF") != nullptr;
+#ifdef _WIN32
+    return false;
+#else
+    static const bool enabled = std::getenv("APS5_NO_DRAW_INPUT_EPOCH_PROOF") == nullptr;
     return enabled;
+#endif
 }
 
 Recorder::DrawInputReuseStatistics Recorder::DrawInputReuseCounts() {
