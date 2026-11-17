@@ -48,6 +48,7 @@ std::atomic<bool (*)(std::uintptr_t, std::size_t)> hostWritePreparer{nullptr};
 
 #ifndef _WIN32
 std::atomic<bool (*)(std::uintptr_t, std::size_t)> hostWriteFilter{nullptr};
+std::atomic<void* (*)(void*, std::size_t, int)> viewPlacer{nullptr};
 
 constexpr unsigned ProtectedPageShift = 12;
 constexpr unsigned ProtectedBucketShift = 30;
@@ -1089,6 +1090,9 @@ int PosixProtection(std::uint32_t windowsProtection) {
 }
 
 void* PlaceAt(void* pointer, std::size_t bytes, std::uint32_t protection) {
+#if defined(ANYPS5_KYTY) && defined(__linux__)
+    if (const auto placer = viewPlacer.load(std::memory_order_acquire)) return placer(pointer, bytes, PosixProtection(protection));
+#endif
     return mmap(pointer, bytes, PosixProtection(protection), MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
 }
 }
@@ -1203,6 +1207,10 @@ bool GuestArenaMayBeHostProtected_nid_no_patch(std::uintptr_t address, std::size
 
 void GuestArenaSetHostWriteFilter_nid_no_patch(bool (*filter)(std::uintptr_t, std::size_t)) {
     hostWriteFilter.store(filter, std::memory_order_release);
+}
+
+void GuestArenaSetViewPlacer_nid_no_patch(void* (*placer)(void* pointer, std::size_t bytes, int protection)) {
+    viewPlacer.store(placer, std::memory_order_release);
 }
 #endif
 #endif

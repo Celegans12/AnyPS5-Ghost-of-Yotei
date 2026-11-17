@@ -121,6 +121,56 @@ public:
 		return bits != nullptr && (bits[page % BucketPages].load(std::memory_order_relaxed) & (1u << ((vaddr >> 12u) & 3u))) != 0;
 	}
 
+	[[nodiscard]] uint8_t Probed(uint64_t host) const {
+		const auto page = host >> PageBits;
+		if (page / BucketPages >= BucketCount) return ProbeUnknown;
+		const auto* bits = m_probe[page / BucketPages].load(std::memory_order_acquire);
+		if (bits == nullptr) return ProbeUnknown;
+		return static_cast<uint8_t>((bits[page % BucketPages].load(std::memory_order_acquire) >> ProbeShift(host)) & ProbeMask);
+	}
+
+	void StoreProbe(uint64_t host, bool readable) {
+		const auto page = host >> PageBits;
+		if (page / BucketPages >= BucketCount) return;
+		auto& bucket = m_probe[page / BucketPages];
+		auto* bits = bucket.load(std::memory_order_acquire);
+		if (bits == nullptr) {
+			auto* created = new std::atomic<uint8_t>[BucketPages] {};
+			if (bucket.compare_exchange_strong(bits, created, std::memory_order_acq_rel)) {
+				bits = created;
+			} else {
+				delete[] created;
+			}
+		}
+		const auto shift = ProbeShift(host);
+		const auto value = static_cast<uint8_t>((readable ? ProbeReadable : ProbeUnreadable) << shift);
+		auto& slot = bits[page % BucketPages];
+		auto current = slot.load(std::memory_order_relaxed);
+		while (!slot.compare_exchange_weak(current, static_cast<uint8_t>((current & ~(ProbeMask << shift)) | value), std::memory_order_acq_rel)) {}
+	}
+
+	void ClearProbes(uint64_t start, uint64_t end) {
+		for (auto host = start & ~HostPageMask; host < end; host += HostPageSize) {
+			const auto page = host >> PageBits;
+			if (page / BucketPages >= BucketCount) return;
+			auto* bits = m_probe[page / BucketPages].load(std::memory_order_acquire);
+			if (bits == nullptr) {
+				host = (((page / BucketPages + 1u) * BucketPages) << PageBits) - HostPageSize;
+				continue;
+			}
+			if ((host & PageMask) == 0 && end - host >= PageSize) {
+				bits[page % BucketPages].store(0, std::memory_order_release);
+				host += PageSize - HostPageSize;
+				continue;
+			}
+			bits[page % BucketPages].fetch_and(static_cast<uint8_t>(~(ProbeMask << ProbeShift(host))), std::memory_order_acq_rel);
+		}
+	}
+
+	static constexpr uint8_t ProbeUnknown = 0;
+	static constexpr uint8_t ProbeUnreadable = 1;
+	static constexpr uint8_t ProbeReadable = 3;
+
 	template <typename Run>
 	void ForEachMappedRun(Run&& run) const {
 		uint64_t start = 0;
@@ -144,8 +194,15 @@ public:
 	}
 
 private:
+	static constexpr uint8_t ProbeMask = 3;
+
+	[[nodiscard]] static unsigned ProbeShift(uint64_t host) {
+		return static_cast<unsigned>(((host >> 12u) & 3u) * 2u);
+	}
+
 	std::array<std::atomic<std::atomic<uint32_t>*>, BucketCount> m_buckets {};
 	std::array<std::atomic<std::atomic<uint8_t>*>, BucketCount> m_exec {};
+	std::array<std::atomic<std::atomic<uint8_t>*>, BucketCount> m_probe {};
 };
 
 struct ViewState {
@@ -166,6 +223,15 @@ PageTable& Pages() {
 ViewState& State() {
 	static auto* state = new ViewState;
 	return *state;
+}
+
+std::atomic<uint64_t> g_probe_epoch {0};
+std::atomic<uint64_t> g_probe_calls {0};
+std::atomic<bool> g_any_probe {false};
+
+void ForgetProbes(uint64_t start, uint64_t size) {
+	g_probe_epoch.fetch_add(1, std::memory_order_seq_cst);
+	if (g_any_probe.load(std::memory_order_seq_cst)) Pages().ClearProbes(start, start + size);
 }
 
 std::atomic<uint64_t> g_backing_epoch {0};
@@ -219,17 +285,31 @@ size_t ReadOwnMemory(const iovec& local, const iovec* remote, size_t count) {
 }
 
 uint64_t ReadablePrefix(uint64_t start, uint64_t end) {
+	auto& pages = Pages();
 	for (auto cursor = start; cursor < end;) {
+		const auto known = pages.Probed(cursor);
+		if (known == PageTable::ProbeUnreadable) return cursor - start;
+		if (known == PageTable::ProbeReadable) {
+			cursor = (cursor | HostPageMask) + 1u;
+			continue;
+		}
 		std::array<iovec, ProbeBatch> remote {};
 		std::array<char, ProbeBatch> sink {};
 		size_t count = 0;
-		for (auto page = cursor; page < end && count < ProbeBatch; page = (page | HostPageMask) + 1u) {
+		for (auto page = cursor; page < end && count < ProbeBatch && (count == 0 || pages.Probed(page) == PageTable::ProbeUnknown); page = (page | HostPageMask) + 1u) {
 			remote[count++] = {reinterpret_cast<void*>(static_cast<std::uintptr_t>(page)), 1};
 		}
+		const auto epoch = g_probe_epoch.load(std::memory_order_seq_cst);
+		g_any_probe.store(true, std::memory_order_seq_cst);
+		g_probe_calls.fetch_add(1, std::memory_order_relaxed);
 		const iovec local {sink.data(), count};
 		const auto read = ReadOwnMemory(local, remote.data(), count);
+		const auto known_end = std::min(read + 1u, count);
+		for (size_t i = 0; i < known_end; ++i) pages.StoreProbe(reinterpret_cast<std::uintptr_t>(remote[i].iov_base), i < read);
+		const auto probed_end = (reinterpret_cast<std::uintptr_t>(remote[known_end - 1u].iov_base) | HostPageMask) + 1u;
+		if (g_probe_epoch.load(std::memory_order_seq_cst) != epoch) pages.ClearProbes(cursor, probed_end);
 		if (read < count) return reinterpret_cast<std::uintptr_t>(remote[read].iov_base) - start;
-		cursor = (reinterpret_cast<std::uintptr_t>(remote[count - 1u].iov_base) | HostPageMask) + 1u;
+		cursor = probed_end;
 	}
 	return end - start;
 }
@@ -342,6 +422,7 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 	}
 	std::lock_guard lock(g_hook_mutex);
 	auto& pages = Pages();
+	ForgetProbes(address, bytes);
 	if (offset == DirectMemoryViewReplacing) {
 		if (pages.AnyMapped(address, bytes)) {
 			if (g_unmap_hook != nullptr) g_unmap_hook(address, bytes);
@@ -378,6 +459,7 @@ void OnProtectionChange(std::uintptr_t address, std::size_t bytes, int protectio
 		Shim::Fail("KytyShim memory: libkernel reported a protection change 0x%016" PRIx64 "+0x%zx past the address space\n", static_cast<uint64_t>(address), bytes);
 	}
 	Pages().StoreExecutable(address, address + bytes, protection >= 0 && (protection & 0x04) != 0);
+	ForgetProbes(address, bytes);
 }
 
 struct KernelStats {
@@ -544,6 +626,10 @@ void SetGpuRangeHooks(RangeHook map, RangeHook unmap) {
 	g_map_hook = map;
 	g_unmap_hook = unmap;
 	if (map != nullptr) Pages().ForEachMappedRun([&](uint64_t start, uint64_t size) { map(start, size); });
+}
+
+uint64_t ProbeCalls() {
+	return g_probe_calls.load(std::memory_order_relaxed);
 }
 
 }

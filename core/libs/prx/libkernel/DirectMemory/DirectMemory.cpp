@@ -406,6 +406,22 @@ void NotePrivate(const void* addr, std::size_t len) {
     DiscardGuestFile(address, len);
     NoteView(address, len, DirectMemoryViewPrivate);
 }
+
+bool ViewPlaceable(std::uintptr_t address, std::size_t len) {
+    return ((address | len) & (PS5_PAGE_SIZE - 1)) == 0 && InGuestFile(address, len);
+}
+
+void* PlaceArenaRange(void* addr, std::size_t len, int prot) {
+    const auto address = reinterpret_cast<std::uintptr_t>(addr);
+    if (!ViewPlaceable(address, len)) return ::mmap(addr, len, prot, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (prot != PROT_NONE) return MapGuestFile(addr, len, prot);
+    NoteView(address, len, DirectMemoryViewReplacing);
+    void* placed = ::mmap(addr, len, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    if (placed == MAP_FAILED) return MAP_FAILED;
+    DiscardGuestFile(address, len);
+    NoteView(address, len, DirectMemoryViewUnmapped);
+    return placed;
+}
 #endif
 #endif
 
@@ -994,12 +1010,15 @@ void Unmap(void* addr, size_t len) {
 #if defined(__linux__) || defined(__EMSCRIPTEN__) || defined(__APPLE__)
 #if defined(ANYPS5_KYTY)
     NoteReplacing(addr, len);
-#endif
+    const bool arenaReset = ArenaAvailable() && GuestArena::GuestArenaContains_nid_postfix(addr, len);
+    if (arenaReset)
+#else
     if (ArenaAvailable() && GuestArena::GuestArenaContains_nid_postfix(addr, len))
+#endif
         GuestArena::GuestArenaReset_nid_postfix(addr, len);
     else if (munmap(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
 #if defined(ANYPS5_KYTY)
-    if (InGuestFile(reinterpret_cast<std::uintptr_t>(addr), len)) {
+    if (!(arenaReset && ViewPlaceable(reinterpret_cast<std::uintptr_t>(addr), len)) && InGuestFile(reinterpret_cast<std::uintptr_t>(addr), len)) {
         DiscardGuestFile(reinterpret_cast<std::uintptr_t>(addr), len);
         NoteView(reinterpret_cast<std::uintptr_t>(addr), len, DirectMemoryViewUnmapped);
     }
@@ -1975,6 +1994,7 @@ bool DirectMemoryEnableView_nid_no_patch(DirectMemoryViewObserver observer, std:
         guestView.view = bytesView;
     }
     guestView.observer.store(observer, std::memory_order_release);
+    GuestArena::GuestArenaSetViewPlacer_nid_no_patch(&PlaceArenaRange);
     guestView.enabled.store(true, std::memory_order_release);
     for (const auto& [address, mapping] : g_directMappings) {
         const auto page = g_physPages.find(mapping.phys - mapping.phys % PS5_PAGE_SIZE);
@@ -2008,6 +2028,28 @@ void GuestPageTableUsage_nid_no_patch(std::uint64_t granularity, std::uint64_t* 
 
 int DoMapAnon_nid_no_patch(void** addr, std::size_t len, int prot, int flags, std::size_t alignment, bool exclusive) {
     return DoMapAnon(addr, len, prot, flags, alignment, exclusive);
+}
+
+void* DirectMemoryMapHostView_nid_no_patch(std::uintptr_t address, std::size_t bytes, int prot) {
+    if (bytes == 0 || ((address | bytes) & (PS5_PAGE_SIZE - 1)) != 0 || bytes > std::numeric_limits<std::uintptr_t>::max() - address)
+        throw std::invalid_argument("host memory with a second view must be a non-empty range of whole 16 KiB pages");
+    if (!InGuestFile(address, bytes)) throw std::runtime_error("host memory with a second view must lie inside the guest memory file, with the view enabled");
+    std::uintptr_t usedStart = 0;
+    std::uintptr_t usedEnd = 0;
+    if (!GuestArena::GuestArenaNextUsed_nid_no_patch(address, &usedStart, &usedEnd) || usedStart > address || usedEnd < address + bytes ||
+        !GuestArena::GuestArenaOverlapsHostRegion_nid_no_patch(address, bytes))
+        throw std::invalid_argument("host memory with a second view must lie inside one host region of the guest arena, where no guest mapping can go");
+    DiscardGuestFile(address, bytes);
+    void* const wanted = reinterpret_cast<void*>(address);
+    void* mapped = ::mmap(wanted, bytes, prot, MAP_SHARED | MAP_FIXED_NOREPLACE, View().file, static_cast<off_t>(address));
+    if (mapped == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map host memory from the guest memory file");
+    if (mapped != wanted) {
+        ::munmap(mapped, bytes);
+        throw std::system_error(EEXIST, std::generic_category(), "map host memory from the guest memory file");
+    }
+    NoteView(address, bytes, address);
+    Trace("map host view %p+0x%zx prot=0x%x", mapped, bytes, prot);
+    return mapped;
 }
 
 int DoMunmap_nid_no_patch(void* addr, std::size_t len) {

@@ -136,6 +136,7 @@ void GuestArenaSetHostWritePreparer_nid_no_patch(bool (*prepare)(std::uintptr_t 
 void GuestArenaNoteHostProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool writable);
 bool GuestArenaMayBeHostProtected_nid_no_patch(std::uintptr_t address, std::size_t bytes);
 void GuestArenaSetHostWriteFilter_nid_no_patch(bool (*filter)(std::uintptr_t address, std::size_t bytes));
+void GuestArenaSetViewPlacer_nid_no_patch(void* (*placer)(void* pointer, std::size_t bytes, int protection));
 #endif
 #endif
 
