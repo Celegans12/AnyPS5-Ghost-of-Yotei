@@ -444,6 +444,14 @@ effect whenever native ray tracing is on. `KYTY_RT_ARENA_MB` (MiB) replaces the 
 take, a quarter of the largest device-local heap clamped to 512 MiB to 4 GiB; it is read by
 `graphics/host_gpu/renderer/rayTracingSlots.cpp`.
 
+A ray tracing pass whose BVH walk no form recognizes logs `walks a guest BVH no form recognizes` and its `[RT]`
+summaries name its compute shader. `kyty_rt_probe` (target of a `kyty` build with `BUILD_TESTING=ON`, not built by
+default) recompiles such a shader offline, from its raw machine code, as the driver does with native ray tracing on:
+`kyty_rt_probe [--wave 32|64] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--spirv out.spv] <shader.bin>...`
+prints, per file, its BVH intersections, how many of them trace with ray queries, and the TLAS source and instance
+record layout derived for them, and exits with 0 only when every intersection does. `--dump` adds the IR, `--off`
+compiles as with `KYTY_NATIVE_RT=0`.
+
 ### Adding a setting
 
 A pull request that makes the code under `core/` read a new `KYTY_*` name adds its row to the tables above, with its default taken from the code, and one that stops reading a name removes the row. `python3 tools/check_kyty_settings.py` lists what is missing or stale; the `conventions` job of [the AnyKyty workflow](../../.github/workflows/anykyty.yml) runs it. A new `ANYPS5_*` or `APS5_*` name also needs its row in [ENVIRONMENT](ENVIRONMENT.md).

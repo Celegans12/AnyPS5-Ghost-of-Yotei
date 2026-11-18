@@ -110,6 +110,10 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         set_target_properties(kyty_shim_system_content_tests PROPERTIES CXX_EXTENSIONS OFF)
         add_test(NAME kyty_shim_system_content COMMAND kyty_shim_system_content_tests)
         set_tests_properties(kyty_shim_system_content PROPERTIES TIMEOUT 20)
+        add_test_executable(kyty_rt_probe EXCLUDE_FROM_ALL KytyShim/tools/RtProbe.cpp KytyShim/src/Log.cpp)
+        target_include_directories(kyty_rt_probe PRIVATE ${LIBS_INCLUDE_DIR})
+        target_link_libraries(kyty_rt_probe PRIVATE Kyty::gpu libc)
+        set_target_properties(kyty_rt_probe PROPERTIES CXX_EXTENSIONS OFF)
         add_test_executable(kyty_shim_native_rt_tests
                 KytyShim/src/NativeRtTests.cpp
                 KytyShim/src/NativeRt.cpp)
