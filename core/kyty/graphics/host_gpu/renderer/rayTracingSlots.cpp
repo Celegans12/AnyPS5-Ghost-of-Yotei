@@ -881,6 +881,10 @@ void RayTracing::CreateBuffers() {
 	m_context_address = m_context_table->BufferDeviceAddress();
 }
 
+vk::Buffer RayTracing::ContextBuffer() const noexcept {
+	return m_context_table != nullptr ? m_context_table->Handle() : vk::Buffer {};
+}
+
 void RayTracing::CreateTlas(uint32_t capacity) {
 	auto device = m_graphics.device;
 	vk::AccelerationStructureGeometryKHR geometry {};

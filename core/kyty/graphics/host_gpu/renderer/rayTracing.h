@@ -130,6 +130,7 @@ public:
 	static void NoteOracle(uint64_t shader_hash, const OracleCounts& counts);
 
 	[[nodiscard]] uint64_t ContextAddress() const noexcept { return m_context_address; }
+	[[nodiscard]] vk::Buffer ContextBuffer() const noexcept;
 
 	static constexpr uint32_t MaxContexts = 4;
 	static constexpr uint64_t EvictFrames = 1800;

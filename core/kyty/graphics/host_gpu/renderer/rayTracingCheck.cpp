@@ -10,6 +10,7 @@
 #include "graphics/host_gpu/renderer/image/image.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <fmt/format.h>
@@ -33,6 +34,7 @@ constexpr uint32_t VerifiedAfter = 4;
 constexpr uint32_t SlowerAfter   = 16;
 constexpr uint32_t CompareGroups = 1024;
 constexpr size_t   KeptFractions = 4096;
+constexpr uint64_t ContextServed = 52;
 
 struct ComparePush {
 	uint32_t count = 0;
@@ -406,13 +408,23 @@ void RayTracingCheck::Before(const PreparedBindings& bindings) {
 	Barrier(scheduler.Current().Handle());
 }
 
-void RayTracingCheck::AfterOracle(const PreparedBindings&) {
+void RayTracingCheck::AfterOracle(const PreparedBindings&, bool counted) {
 	if (!m_active) {
 		return;
 	}
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
 	Barrier(scheduler.Current().Handle());
+	const auto context = m_context.GetRayTracing()->ContextBuffer();
+	counted            = counted && context;
+	if (counted) {
+		const vk::BufferCopy copy {ContextServed, uint64_t {m_slot} * ResultBytes + 8, 8};
+		scheduler.Current().Handle().copyBuffer(context, m_results->Handle(), 1, &copy);
+	}
+	{
+		std::lock_guard lock(m_mutex);
+		m_pending[m_slot].counted = counted;
+	}
 	Copy(scheduler.Current().Handle(), m_outputs, RegionBytes, false);
 	Barrier(scheduler.Current().Handle());
 	Copy(scheduler.Current().Handle(), m_outputs, 0, true);
@@ -504,8 +516,10 @@ void RayTracingCheck::AfterGuest(const PreparedBindings& bindings) {
 void RayTracingCheck::Finish(uint32_t slot) {
 	m_results->Invalidate(uint64_t {slot} * ResultBytes, ResultBytes);
 	const auto* words  = reinterpret_cast<const uint32_t*>(m_results->Mapped().data() + uint64_t {slot} * ResultBytes);
-	const auto  differ = words[0];
-	const auto  first  = words[1];
+	const auto  differ   = words[0];
+	const auto  first    = words[1];
+	const auto  served   = words[2];
+	const auto  returned = words[3];
 	std::lock_guard lock(m_mutex);
 	const auto pending     = m_pending[slot];
 	m_pending[slot].busy   = false;
@@ -520,9 +534,12 @@ void RayTracingCheck::Finish(uint32_t slot) {
 		program.fractions.push_back(fraction);
 	}
 	Note(fmt::format("[RT] check {}: dispatch {}: {} of {} output dwords differ ({:.3g}, threshold {:.3g}){}, {} "
-	                "output(s)",
+	                "output(s){}",
 	                Hash(pending.hash), pending.index, differ, pending.dwords, fraction, threshold,
-	                differ == 0 ? std::string() : fmt::format(", first at dword {}", first), pending.outputs));
+	                differ == 0 ? std::string() : fmt::format(", first at dword {}", first), pending.outputs,
+	                pending.counted ? fmt::format("; host: {} rays served, {} box calls handed back to the guest walk",
+	                                              served, returned)
+	                                : std::string()));
 	if (!program.verified && !over && program.clean >= VerifiedAfter) {
 		program.verified = true;
 		Note(fmt::format("[RT] check {}: verified on {} checked dispatches ({}); one dispatch in {} checked from now on",

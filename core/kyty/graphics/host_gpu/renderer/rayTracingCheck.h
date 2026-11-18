@@ -34,7 +34,7 @@ public:
 	[[nodiscard]] bool        FallsBack(uint64_t shader_hash);
 	[[nodiscard]] bool        Sample(const ShaderModule& module, const CommandBuffer& buffer);
 	void                      Before(const PreparedBindings& bindings);
-	void                      AfterOracle(const PreparedBindings& bindings);
+	void                      AfterOracle(const PreparedBindings& bindings, bool counted);
 	void                      AfterGuest(const PreparedBindings& bindings);
 	void                      KeepOracle(const char* reason);
 
@@ -65,6 +65,7 @@ private:
 		uint64_t dwords  = 0;
 		uint32_t outputs = 0;
 		uint64_t index   = 0;
+		bool     counted = false;
 	};
 
 	bool     Prepare();

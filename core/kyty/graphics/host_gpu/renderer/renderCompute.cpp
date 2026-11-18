@@ -73,11 +73,12 @@ static bool PrepareSelfSizedBuffers(RenderContext& context, const ShaderStageRun
 	return true;
 }
 
-static void PrepareNativeRayTracing(RenderContext& context, const CommandRecorder& command,
-                                    const HW::ComputeShaderInfo& cs_regs, const PreparedBindings& bindings) {
+static bool PrepareNativeRayTracing(RenderContext& context, const CommandRecorder& command,
+                                    const HW::ComputeShaderInfo& cs_regs, const PreparedBindings& bindings,
+                                    bool count_rays = false) {
 	auto& native_rt = *context.GetRayTracing();
 	if (!native_rt.Enabled()) {
-		return;
+		return false;
 	}
 	const auto& module = *bindings.runtime->module;
 	const auto& info   = module.info.info;
@@ -87,12 +88,15 @@ static void PrepareNativeRayTracing(RenderContext& context, const CommandRecorde
 		    source, uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u),
 		    [&](uint64_t address, uint64_t size) { return context.IsMapped(address, size); });
 		native_rt.Prepare(command, pointer, source, bindings.flattened_srt, context.GetGpu().GetFrameNum(),
-		                  module.info.shader_hash);
-	} else if (info.bvh) {
+		                  module.info.shader_hash, count_rays);
+		return true;
+	}
+	if (info.bvh) {
 		using Kind = RayTracing::GuestDispatch;
 		RayTracing::NoteGuestDispatch(module.guest_traversal ? Kind::NullTlas : Kind::Unrecognized,
 		                                    module.info.shader_hash);
 	}
+	return false;
 }
 
 static bool PrepareIndirectWriteTargets(RenderContext& context, const PreparedBindings& bindings) {
@@ -577,7 +581,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		m_context.GetOcclusionQueries().WriteForReaders();
 
 		const auto vk_buffer = buffer.Handle();
-		PrepareNativeRayTracing(m_context, vk_buffer, cs_regs, bindings);
+		const bool counted = PrepareNativeRayTracing(m_context, vk_buffer, cs_regs, bindings, rt_pass == 1);
 		if (rt_pass == 1) {
 			RtCheck().Before(bindings);
 		}
@@ -676,7 +680,7 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		}
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 		if (rt_pass == 1) {
-			RtCheck().AfterOracle(bindings);
+			RtCheck().AfterOracle(bindings, counted);
 		} else if (rt_pass == 2) {
 			RtCheck().AfterGuest(bindings);
 		}
@@ -975,7 +979,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		EXIT_IF((args_offset & 3u) != 0);
 		RebindBuffers(bindings);
 		m_context.GetOcclusionQueries().WriteForReaders();
-		PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings);
+		const bool counted = PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings, rt_pass == 1);
 		if (rt_pass == 1) {
 			RtCheck().Before(bindings);
 		}
@@ -1004,7 +1008,7 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
 		Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 		if (rt_pass == 1) {
-			RtCheck().AfterOracle(bindings);
+			RtCheck().AfterOracle(bindings, counted);
 		} else if (rt_pass == 2) {
 			RtCheck().AfterGuest(bindings);
 		}
