@@ -219,7 +219,7 @@ AnyKyty is a young fork and there is a lot to do: speed, rendering differences, 
 2. The CI runs on every pull request: the conventions check, a Linux build of the default backend, a Linux build of the Kyty backend with the shim tests, and a Windows build of the Kyty backend. Changes to documentation only skip it. See the [workflow](../../.github/workflows/anykyty.yml).
 3. Write commits and the pull request title as [Conventional Commits](https://www.conventionalcommits.org), for example `fix(kyty): ...`, `perf(kyty): ...` or `feat(kyty): ...`. The check rejects other subjects. You can run it before pushing: `python3 tools/check_conventions.py --base origin/AnyKyty`.
 4. Follow the [coding conventions](../dev/CONVENTIONS.md): no comments in code, no images or notes in the repository (attach them to the pull request), and a row in [ENVIRONMENT](../dev/ENVIRONMENT.md) for every new `APS5_*` or `ANYPS5_*` variable.
-5. Where the code goes: the Kyty core in `core/kyty/` is imported from Kyty with its comments stripped, so changes to it sit under `#if defined(ANYPS5_KYTY)`; the glue between it and AnyPS5 is in `core/libs/prx/libSceAgcDriver/KytyShim/`. The default backend must keep building unchanged.
+5. Where the code goes: the Kyty core in `core/kyty/` is maintained in this repository without comments, so changes to it sit under `#if defined(ANYPS5_KYTY)`; the glue between it and AnyPS5 is in `core/libs/prx/libSceAgcDriver/KytyShim/`. The default backend must keep building unchanged.
 6. Fill in the pull request template; the conventions check enforces it. For a performance change, give the numbers of the base and of your change from the same machine and scene, with the settings, as the [performance report](../../.github/ISSUE_TEMPLATE/performance.yml) form asks.
 
 **Report a game**
@@ -257,6 +257,6 @@ Pull requests from outside contributors are already merged: [#17](https://github
 
 The graphics core: `core/kyty` is maintained in this repository; it derives from [KytyPS5](https://github.com/KytyPS5/KytyPS5) (GPL-2.0), itself built on Kyty by InoriRus. Everything else is [AnyPS5](https://github.com/boykopovar/AnyPS5).
 
-AnyPS5 and Kyty are distributed under the GNU General Public License version 2 ([LICENSE](../../LICENSE), [core/kyty/LICENSE](../../core/kyty/LICENSE)); the original Kyty code is MIT ([core/kyty/LICENSES/Kyty-MIT.txt](../../core/kyty/LICENSES/Kyty-MIT.txt)). File by file origin, licences and the pinned Kyty commit: [Kyty code in AnyPS5](../dev/THIRD_PARTY_KYTY.md).
+AnyPS5 and the Kyty core are distributed under the GNU General Public License version 2 ([LICENSE](../../LICENSE), [core/kyty/LICENSE](../../core/kyty/LICENSE)); the original Kyty code is MIT ([core/kyty/LICENSES/Kyty-MIT.txt](../../core/kyty/LICENSES/Kyty-MIT.txt)). File by file origin and licences: [Kyty code in AnyPS5](../dev/THIRD_PARTY_KYTY.md).
 
 Back to the [README](../../README.md).

@@ -2,7 +2,7 @@
 
 ### Unknown function info
 
-- [Additional libSceFace exports](../../../core/libs/prx/libSceFace/Export.cpp) - the 28 name/NID pairs below are defined function exports recovered from the GTAVC-bundled `libSceFace.prx` export table (the 4.03 firmware dump does not ship this module; the GTAVC bundle is the only concrete binary evidence). Their signatures and behavior are unknown; parameterless `int` declarations are import placeholders, not verified ABI prototypes. Every call throws through `NotImplemented_nid_no_patch`. No detection, recognition, pose, shape, or attribute analysis is implemented.
+- [Additional libSceFace exports](../../../core/libs/prx/libSceFace/Export.cpp) - the 28 name/NID pairs below are defined function exports recovered from the title-bundled `libSceFace.prx` export table (the 4.03 firmware dump does not ship this module; that title's bundle is the only concrete binary evidence). Their signatures and behavior are unknown; parameterless `int` declarations are import placeholders, not verified ABI prototypes. Every call throws through `NotImplemented_nid_no_patch`. No detection, recognition, pose, shape, or attribute analysis is implemented.
 
 | Name | NID |
 | --- | --- |
@@ -37,7 +37,7 @@
 
 ### Implemented
 
-- [`sceFaceDetectionGetDefaultParam`](../../../core/libs/prx/libSceFace/Export.cpp) `(void *param)` - verified against the GTAVC module body (entry `0x1f80`, size `0x42`): null output returns `0x808b0002`; otherwise a 0x38-byte defaults block is written verbatim: `{u32 56, f32 1.0, f32 0.841 (0x3f574bc7), u32 13200}` at `+0x00`, `0` at `+0x10`, `{u32 0, 0, 2, 2}` at `+0x14`, `{u32 0, 0, f32 0.5, u32 1}` at `+0x24`, `0` at `+0x34`. Field semantics are not published; the bytes are copied exactly as the binary writes them.
+- [`sceFaceDetectionGetDefaultParam`](../../../core/libs/prx/libSceFace/Export.cpp) `(void *param)` - verified against the bundled module body (entry `0x1f80`, size `0x42`): null output returns `0x808b0002`; otherwise a 0x38-byte defaults block is written verbatim: `{u32 56, f32 1.0, f32 0.841 (0x3f574bc7), u32 13200}` at `+0x00`, `0` at `+0x10`, `{u32 0, 0, 2, 2}` at `+0x14`, `{u32 0, 0, f32 0.5, u32 1}` at `+0x24`, `0` at `+0x34`. Field semantics are not published; the bytes are copied exactly as the binary writes them.
 
 ### Partially decoded, not yet ported
 

@@ -18,11 +18,11 @@ AnyPS5 keeps everything it does today: the relinker, `libkernel`, every system l
 | GPU view of game memory | AnyPS5 imports and write tracking | Kyty model: every guest page has a second view, writes are tracked by page faults |
 | Presentation | AnyPS5 presentation | Kyty presenter and swapchain, on AnyPS5's window; AnyPS5's VideoOut still reserves, paces and presents the flips |
 
-The default build is AnyPS5 as before: it compiles none of the Kyty files. The Kyty core lives in `core/kyty/`, taken from Kyty at `40ddebbe`; the glue between it and AnyPS5 (memory, faults, entry points, presentation, events) lives in `core/libs/prx/libSceAgcDriver/KytyShim/`. Changes to shared AnyPS5 files are under `ANYPS5_KYTY`, except the optional `ANYPS5_VBLANK_HZ` setting, which leaves behaviour unchanged when it is not set. Kyty's general shortcuts are kept as they are, for example skipping a draw while its pipeline compiles in the background. Its title-specific hooks (Demon's Souls page freeing, ASTRO BOT, Oodle) are not ported. AnyKyty also turns on by default two Kyty settings that native Kyty only enables in its launcher's Experiment mode, draw templates and grouped draw buffers (`KYTY_DRAW_TEMPLATES=2`, `KYTY_DRAW_BUFFERS=1`); setting either variable keeps the user's value. It also copies GPU-written images back at the GL2 write-backs the game requests rather than at the next suspend point (`KYTY_WRITE_BACK_IMAGES=0` restores KytyPS5's behaviour; see `docs/dev/THIRD_PARTY_KYTY.md`). Native ray tracing, which native Kyty's launcher turns on in its recommended settings, is on by default when the GPU supports it (`KYTY_NATIVE_RT`, see the runtime settings below).
+The default build is AnyPS5 as before: it compiles none of the Kyty files. The Kyty core lives in `core/kyty/`, maintained in this repository and derived from [KytyPS5](https://github.com/KytyPS5/KytyPS5) (GPL-2.0); the glue between it and AnyPS5 (memory, faults, entry points, presentation, events) lives in `core/libs/prx/libSceAgcDriver/KytyShim/`. Changes to shared AnyPS5 files are under `ANYPS5_KYTY`, except the optional `ANYPS5_VBLANK_HZ` setting, which leaves behaviour unchanged when it is not set. Kyty's general shortcuts are kept as they are, for example skipping a draw while its pipeline compiles in the background. Its title-specific hooks (Demon's Souls page freeing, ASTRO BOT, Oodle) are not ported. AnyKyty also turns on by default two Kyty settings that native Kyty only enables in its launcher's Experiment mode, draw templates and grouped draw buffers (`KYTY_DRAW_TEMPLATES=2`, `KYTY_DRAW_BUFFERS=1`); setting either variable keeps the user's value. It also copies GPU-written images back at the GL2 write-backs the game requests rather than at the next suspend point (`KYTY_WRITE_BACK_IMAGES=0` restores KytyPS5's behaviour; see `docs/dev/THIRD_PARTY_KYTY.md`). Native ray tracing, which native Kyty's launcher turns on in its recommended settings, is on by default when the GPU supports it (`KYTY_NATIVE_RT`, see the runtime settings below).
 
 ## Why
 
-On the same PC and scene, Kyty spent about a third of AnyPS5's CPU time per draw and a fifth of its GPU time per frame. Reworking the AnyPS5 driver towards that design piece by piece did not close the gap, so the whole graphics core was transplanted instead.
+On the same PC and scene, native Kyty spent about a third of AnyPS5's CPU time per draw and a fifth of its GPU time per frame. Reworking the AnyPS5 driver towards that design piece by piece did not close the gap, so the whole graphics core was transplanted instead.
 
 ## Measurements
 
@@ -48,8 +48,8 @@ At a comparable draw count (911 against 863 per frame), every Kyty stage is 12 t
 ## Status
 
 - Tested in game on Linux: Subnautica, Balatro and TCG Card Shop Simulator.
-- Known issue, inherited from Kyty: the street of TCG Card Shop Simulator stays almost black, as it does on native Kyty. Rendering differences against the default backend are being collected and will be fixed after performance work.
-- The Kyty backend is built and run on Linux. On Windows it builds, and an open-world AAA title reaches the prologue in game on an NVIDIA GPU; nothing else has been tested there.
+- Known issue, inherited from the Kyty core: the street of TCG Card Shop Simulator stays almost black, as it does on native Kyty. Rendering differences against the default backend are being collected and will be fixed after performance work.
+- The Kyty backend is built and run on Linux. On Windows it builds, and an open-world AAA title reaches its prologue in game on an NVIDIA GPU; nothing else has been tested there.
 
 ## Building AnyKyty
 
@@ -63,7 +63,7 @@ On Windows the rest of AnyPS5 is built with MinGW-w64 GCC as usual, and `clang`,
 
 The Kyty core does not build with GCC, so it is compiled by Clang in a sub-project, against the same libstdc++ as the rest of AnyPS5. It needs `clang`, `clang++` and an `ld.lld` of the same major version (tested with 21). It is built with ThinLTO and pre-linked into one object by default; `-DANYPS5_KYTY_THIN_LTO=OFF` turns that off.
 
-Runtime settings: `ANYPS5_VBLANK_HZ` (30 to 360) sets the vblank rate, so `ANYPS5_VBLANK_HZ=240` lifts the 60 FPS cap of games that pace on vblank. The `KYTY_*` settings of Kyty are read from the environment, for example `KYTY_VBLANK_FREQUENCY` and `KYTY_PRESENT_MODE`.
+Runtime settings: `ANYPS5_VBLANK_HZ` (30 to 360) sets the vblank rate, so `ANYPS5_VBLANK_HZ=240` lifts the 60 FPS cap of games that pace on vblank. The `KYTY_*` settings of the Kyty core are read from the environment, for example `KYTY_VBLANK_FREQUENCY` and `KYTY_PRESENT_MODE`.
 
 Native ray tracing (Kyty's `--native-rt`) is on by default when the Vulkan device has `VK_KHR_acceleration_structure`, `VK_KHR_ray_query` and `VK_KHR_deferred_host_operations`: the ray tracing passes whose BVH walk Kyty recognizes trace with the GPU's ray tracing hardware, and the other ones run emulated in shaders as before. A `[kyty] native ray tracing` line on the console says which way it went; on a GPU without these extensions it names what is missing and ray tracing runs emulated. `KYTY_NATIVE_RT=0` emulates all ray tracing; `KYTY_NATIVE_RT=1` stops with a message when the GPU cannot trace natively. `KYTY_RT_STATS=1` prints a `[RT]` summary every 10 s of the work native ray tracing leaves to the game. The acceleration structures Kyty builds take at most a quarter of the video memory, between 512 MiB and 4 GiB (2 GiB on an 8 GB card), allocated as needed; `KYTY_RT_ARENA_MB` sets another limit.
 
@@ -75,7 +75,7 @@ Native ray tracing (Kyty's `--native-rt`) is on by default when the Vulkan devic
 
 ## Credits and licence
 
-The graphics core: `core/kyty` is maintained in this repository; it derives from [KytyPS5](https://github.com/KytyPS5/KytyPS5) (GPL-2.0); everything else is [AnyPS5](https://github.com/boykopovar/AnyPS5). Kyty is GPL-2.0 like AnyPS5; the original Kyty code by InoriRus is MIT. File by file origin, licences and the pinned commit: [docs/dev/THIRD_PARTY_KYTY.md](docs/dev/THIRD_PARTY_KYTY.md).
+The graphics core: `core/kyty` is maintained in this repository; it derives from [KytyPS5](https://github.com/KytyPS5/KytyPS5) (GPL-2.0), itself built on Kyty by InoriRus; everything else is [AnyPS5](https://github.com/boykopovar/AnyPS5). The Kyty core is GPL-2.0 like AnyPS5; the original Kyty code by InoriRus is MIT. File by file origin and licences: [docs/dev/THIRD_PARTY_KYTY.md](docs/dev/THIRD_PARTY_KYTY.md).
 
 ---
 

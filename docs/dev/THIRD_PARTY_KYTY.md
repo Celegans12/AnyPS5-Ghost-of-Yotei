@@ -1,14 +1,13 @@
 # Kyty code in AnyPS5
 
-`core/kyty/` and `core/libs/prx/libSceAgcDriver/KytyShim/include/` hold code taken from
-a fork of [KytyPS5](https://github.com/KytyPS5/KytyPS5), at tag
-`v24`, commit `40ddebbe21cd8a75f9da41fb66dad8104c341904`. It is the second GPU driver of plan B, built only with
+`core/kyty/` and `core/libs/prx/libSceAgcDriver/KytyShim/include/` hold the Kyty core. `core/kyty` is maintained in this repository; it derives from [KytyPS5](https://github.com/KytyPS5/KytyPS5) (GPL-2.0).
+It is the second GPU driver of plan B, built only with
 `-DANYPS5_GPU_BACKEND=kyty`; the default `-DANYPS5_GPU_BACKEND=anyps5` builds AnyPS5 exactly as before and reads none of
 these files.
 
 ## Licence
 
-Kyty is distributed under the GNU General Public License version 2, copied in
+The Kyty core is distributed under the GNU General Public License version 2, copied in
 [core/kyty/LICENSE](../../core/kyty/LICENSE). The original Kyty code by InoriRus was published under the MIT licence, copied
 in [core/kyty/LICENSES/Kyty-MIT.txt](../../core/kyty/LICENSES/Kyty-MIT.txt). Two files carry a notice of their own, kept
 verbatim at their top:
@@ -20,7 +19,7 @@ verbatim at their top:
 
 ## Folders
 
-| AnyPS5 path | Kyty path at `40ddebbe` | Files |
+| AnyPS5 path | Path in the imported tree | Files |
 |---|---|---|
 | `core/kyty/graphics/` | `src/graphics/` | every file |
 | `core/kyty/common/` | `src/common/` | every file except `CMakeLists.txt` |
@@ -29,9 +28,9 @@ verbatim at their top:
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/libs/` | `src/libs/` | `agc.h`, `controller.h`, `errno.h`, `hmd2.h`, `ime.h`, `imeCommon.h`, `imeDialog.h`, `libs.h` |
 | `core/libs/prx/libSceAgcDriver/KytyShim/include/loader/` | `src/loader/` | `demonsSoulsPageFree.h`, `demonsSoulsTitle.h`, `guestOodle.h`, `systemContent.h`, `timer.h` |
 
-Outside those folders, code adapted from Kyty is built only with `-DANYPS5_GPU_BACKEND=kyty`:
+Outside those folders, code adapted from the Kyty core is built only with `-DANYPS5_GPU_BACKEND=kyty`:
 
-| AnyPS5 path | Kyty path at `40ddebbe` | What |
+| AnyPS5 path | Path in the imported tree | What |
 |---|---|---|
 | `core/libs/prx/libSceAgc/Kyty/` | `src/libs/agc.cpp` | `AgcGetFusedShaderSize`, `AgcFuseShaderHalves_0200`, `AgcFuseShaderHalves`, `AgcCreatePrimState`, `AgcUpdatePrimState`, `AgcGetGsOversubscription`, `AgcCreateInterpolantMapping`, `AgcCreateInterpolantMapping2`, `AgcGetRegisterDefaults2`, `AgcGetRegisterDefaults2Internal`, as AnyPS5's `sceAgc…` exports of the same NIDs; a missing register throws instead of dereferencing null |
 
@@ -41,13 +40,13 @@ library and loader functions that `graphics/` and `common/` call, and the shim i
 it, and its `ErrorDialogOpen` and `ErrorDialogClose` would be second declarations of AnyPS5 exports for
 `core/libs/tests/test_public_headers.py`, which reads every header under `core/` without namespaces.
 
-## Changes from upstream
+## Changes from the import
 
 - Every comment is removed, except the two notices above. `core/kyty/tools/kyty_import.py` does it with a C++ lexer
   that keeps string, character and raw string literals and digit separators intact, and checks each file: the token
   stream that `g++ -fpreprocessed` produces is the same before and after, preprocessor line ends included.
-- Fixes made in [KytyPS5](https://github.com/KytyPS5/KytyPS5) after `v24`, merged on its `main` or open as pull
-  requests, are applied on top of `v24`, stripped of comments the same way, one commit each with a
+- Fixes made in [KytyPS5](https://github.com/KytyPS5/KytyPS5) after the imported revision, merged on its `main` or open as pull
+  requests, are applied on top of it, stripped of comments the same way, one commit each with a
   `Ported-from: KytyPS5 <commit>` line per upstream commit:
 
   | KytyPS5 commit | Pull request | Change |
@@ -55,7 +54,7 @@ it, and its `ErrorDialogOpen` and `ErrorDialogClose` would be second declaration
   | `174ec912` | — | `V_MSAD_U8` is translated |
   | `2f26870e` | — | the device enables `VK_KHR_compute_shader_derivatives`, whose capabilities the translator emits |
   | `a2ea94e9` | — | no swapchain is created while the window's surface has no area |
-  | `50c0c066`, `18809cb0`, `15c8c618` | — | the VideoOut output transfer applies to linear formats, unpremultiplied PQ overlays are clamped, the HDR attribute check is part of the `ATTRIBUTE` default; `50c0c066` as Kyty's `main` resolves it on `v24` |
+  | `50c0c066`, `18809cb0`, `15c8c618` | — | the VideoOut output transfer applies to linear formats, unpremultiplied PQ overlays are clamped, the HDR attribute check is part of the `ATTRIBUTE` default; `50c0c066` adapted to the imported revision |
   | `2086171a` | — | `pm4Handlers.cpp` only: a flip block on an async compute queue (`R = 0`) is recognised |
   | `85e775f0` | #2062 | `RenderContext` builds the image heap before the pipeline cache |
   | `8d2e4376` | #2245 | `LOAD_*_REG_INDEX` honour their `data_format` field |
@@ -64,7 +63,7 @@ it, and its `ErrorDialogOpen` and `ErrorDialogClose` would be second declaration
   | `d8fcae8e` | #1963 | `BASE_ARRAY` is ignored for 1D and 2D non-array views |
   | `bc553dca` | #1733 | depth-compare samples get a sampler variant of their own |
   | `222d8301` | #1405 | a lone last dword of a command buffer is consumed |
-  | `7ee598b4`, `f26b1d7e` | #1403 | a compute dispatch's scalar reads may overlap the start of its own sentinel write range (`FindBuffers`); `a9d34f70`'s `CommitBindings` check is not in `v24` |
+  | `7ee598b4`, `f26b1d7e` | #1403 | a compute dispatch's scalar reads may overlap the start of its own sentinel write range (`FindBuffers`); `a9d34f70`'s `CommitBindings` check is not in the imported revision |
   | `d6ad3c2b` | #1802 | a buffer allocation refused by VMA's budget is retried once without the budget limit |
 
   `Presenter::PrepareFrame` takes the VideoOut pixel format since `50c0c066`: the shim passes the display buffer's
@@ -82,7 +81,7 @@ it, and its `ErrorDialogOpen` and `ErrorDialogClose` would be second declaration
 
 ## Build
 
-Kyty builds with Clang only (GCC rejects its Vulkan-Hpp aggregate assignments and `__builtin_memcpy_inline`).
+The Kyty core builds with Clang only (GCC rejects its Vulkan-Hpp aggregate assignments and `__builtin_memcpy_inline`).
 `core/kyty/CMakeLists.txt` is therefore a project of its own, which `core/kyty/cmake/KytyBackend.cmake` builds with
 `clang` and `clang++` as the external project `kyty_gpu` when `-DANYPS5_GPU_BACKEND=kyty` is set; the rest of AnyPS5 stays
 on GCC. Clang is given `--gcc-install-dir` of the GCC that builds AnyPS5, so both sides use the same libstdc++ headers.
@@ -115,8 +114,8 @@ a helper is the executable started again with `--pipeline-helper`, and here the 
 
 ## Third-party code
 
-The dependencies of `graphics/` and `common/` that AnyPS5 did not have are submodules at the revisions Kyty
-`v24` pins:
+The dependencies of `graphics/` and `common/` that AnyPS5 did not have are submodules at the revisions the imported
+tree pinned:
 
 | Submodule | Revision | Licence |
 |---|---|---|
@@ -126,7 +125,7 @@ The dependencies of `graphics/` and `common/` that AnyPS5 did not have are submo
 | `3rdparty/xbyak` | `44a72f369268f7d552650891b296693e91db86bb` | BSD-3-Clause |
 | `3rdparty/zydis` | `120e0e705f8e3b507dc49377ac2879979f0d545c` (with `dependencies/zycore`) | MIT |
 
-`3rdparty/ffx-api` holds the four AMD FidelityFX API headers Kyty `v24` vendors in `3rdparty/ffx-api`
+`3rdparty/ffx-api` holds the four AMD FidelityFX API headers the imported tree vendored in `3rdparty/ffx-api`
 (FidelityFX-SDK v2.4.0, `Kits/FidelityFX`, unmodified, MIT licence in `3rdparty/ffx-api/LICENSE.txt`); `fsr.cpp` only
 declares the API with them and loads AMD's libraries at run time.
 
@@ -135,31 +134,28 @@ declares the API with them and loads AMD's libraries at run time.
 SPIRV-Tools, glslang, tracy, stb, zstd and ZArchive are AnyPS5's own submodules, built a second time by the Clang
 sub-build.
 
-## Updating
+## Import tool
 
-```
-python3 core/kyty/tools/kyty_import.py --ref <Kyty clone> --tag <tag> --dest .
-```
-
-rewrites the folders above from the given tag and reports any file whose tokens changed. Each commit that brings
-Kyty code carries a `Ported-from: Kyty <folder>@<commit> (GPL-2.0)` line.
+`core/kyty/tools/kyty_import.py` is historical: it made the first import of the folders above from a Kyty source tree,
+without comments, and reported any file whose tokens changed. `core/kyty` is maintained in this repository; fixes taken
+from [KytyPS5](https://github.com/KytyPS5/KytyPS5) carry a `Ported-from: KytyPS5 <commit>` line.
 
 ## Settings of the kyty build
 
 A build with `-DANYPS5_GPU_BACKEND=kyty` reads its settings from environment variables, once per process. The tables below list every `KYTY_*` name the code under `core/` reads, one row each, and `tools/check_kyty_settings.py` fails when a name read in `core/` has no row here or a row names something the code no longer reads. Three kinds of reader exist:
 
 - `KytyShim::StartRuntime()` (`core/libs/prx/libSceAgcDriver/KytyShim/src/Config.cpp`) loads KytyPS5's `ConfigOptions` at their defaults, then reads the variables named after KytyPS5's command-line options. An empty value counts as unset; an invalid value stops the emulator with a message naming the variable. Rows of this kind say "stops" in their values.
-- Code of `core/kyty/`, from Kyty or ours, reads `KYTY_*` names with `std::getenv` or with a small helper that takes the name as a string literal. Each is read once; most accept anything and fall back to the default, as their values column says.
+- Code of `core/kyty/`, imported or ours, reads `KYTY_*` names with `std::getenv` or with a small helper that takes the name as a string literal. Each is read once; most accept anything and fall back to the default, as their values column says.
 - `common/emulatorConfig.cpp` reads the thread and pipeline variables itself.
 
 A name built at run time from pieces is not supported, because nothing can find it: pass the whole name as a literal.
 
 How to read the columns:
 
-- **Default** is what the code does with the variable unset, in this build; where it differs from Kyty the effect says so.
+- **Default** is what the code does with the variable unset, in this build; where it differs from the imported Kyty core the effect says so.
 - **Category**: `perf` is a performance switch (the default says whether it is on), `compat` fixes or works around wrong output, `option` is a plain user option, `debug` is for debugging and measurement, `experimental` is unfinished, unproven or known to hurt, `inert` has no effect in this build because the code that reads it is not built or never runs.
 - **Platform** is `all` unless a part of the effect exists on one system only; `—` for `inert`.
-- **Origin** is `Kyty import` for what the import of `40ddebbe` brought with its name, `Kyty option` for a field of KytyPS5's `ConfigOptions` that `8a29429250` made readable from the environment, and an AnyKyty commit for what this fork added or changed.
+- **Origin** is `Kyty import` for what the import of the Kyty core brought with its name, `Kyty option` for a field of KytyPS5's `ConfigOptions` that `8a29429250` made readable from the environment, and an AnyKyty commit for what this fork added or changed.
 
 ### Window, display and upscaling
 

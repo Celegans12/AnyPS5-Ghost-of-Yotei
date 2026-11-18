@@ -273,7 +273,7 @@ foreach(target IN LISTS KYTY_PGO_TARGETS)
     target_compile_options(${target} PRIVATE ${kytyPgoCompileOptions})
 endforeach()
 
-option(KYTY_THIN_LTO "Optimize kyty_gpu across translation units with ThinLTO, and pre-link it with lld into one native object" ON)
+option(KYTY_THIN_LTO "Optimize kyty_gpu across translation units with ThinLTO and pre-link it with lld into one native object" ON)
 set(KYTY_THIN_LTO_JOBS "0" CACHE STRING "Parallel ThinLTO back-end jobs of the lld pre-link, 0 for lld's default")
 set(KYTY_BUNDLE_TARGETS kyty_gpu fmt xxhash TracyClient zarchive libzstd_static SPIRV-Tools-opt SPIRV-Tools-static)
 if(KYTY_THIN_LTO AND WIN32)

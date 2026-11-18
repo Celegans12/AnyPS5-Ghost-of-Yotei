@@ -76,7 +76,7 @@ struct Step {
 };
 
 const std::array<Step, 8> Steps{{
-    {"PA_SC_AA_MASK 0x0000ffff/0 with early Z (GTA V, X0Y0)", 0x0000ffffu, 0u, 0x10u, 0x1u},
+    {"PA_SC_AA_MASK 0x0000ffff/0 with early Z (title A, X0Y0)", 0x0000ffffu, 0u, 0x10u, 0x1u},
     {"PA_SC_AA_MASK 0x0000ffff/0", 0x0000ffffu, 0u, 0x800u, 0x1u},
     {"PA_SC_AA_MASK 0xffff0000/0 (X1Y0)", 0xffff0000u, 0u, 0x800u, 0x2u},
     {"PA_SC_AA_MASK 0/0xffff0000 (X1Y1)", 0u, 0xffff0000u, 0x800u, 0x8u},

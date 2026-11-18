@@ -369,7 +369,7 @@ def strip_cmake(text):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Import graphics/ and common/ of Kyty without comments")
+    parser = argparse.ArgumentParser(description="Historical tool: import graphics/ and common/ of a Kyty source tree without comments")
     parser.add_argument("--ref", required=True, type=Path)
     parser.add_argument("--tag", default="v24")
     parser.add_argument("--dest", required=True, type=Path)
