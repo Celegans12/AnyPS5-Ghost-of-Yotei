@@ -54,11 +54,16 @@ public:
 	void ReadDecisionMemory(const volatile void* address, void* value, size_t size);
 	void                   WaitForExecution(uint64_t sequence) { m_executed.WaitFor(sequence); }
 	void WaitForExecution() { m_executed.WaitFor(m_emitted); }
+#if defined(ANYPS5_KYTY)
 	void NoteBlockedWait(uint64_t address, uint64_t size, uint64_t reference, uint64_t mask,
 	                     uint32_t function);
 	void NoteBlockedRewind(uint64_t control);
+#else
+	void NoteBlockedWait(uint64_t address, uint64_t size);
+#endif
 	[[nodiscard]] bool OtherQueueWaitsOn(uint64_t address, uint64_t size) const;
 	[[nodiscard]] const GpuRegisterState& NeutralState() const noexcept { return m_neutral_state; }
+#if defined(ANYPS5_KYTY)
 
 	struct BlockedWait {
 		uint64_t address   = 0;
@@ -69,8 +74,9 @@ public:
 		uint32_t queue     = 0;
 	};
 	[[nodiscard]] size_t BlockedWaits(BlockedWait* waits, size_t capacity) const;
-	void                 HoldSubmissions();
+	[[nodiscard]] bool   HoldSubmissions(uint32_t timeout_ms);
 	void                 ReleaseSubmissions();
+#endif
 
 private:
 	static constexpr uint32_t ComputePipeCount     = 7;
@@ -134,8 +140,10 @@ private:
 	std::array<WaitRange, QueueCount> m_wait_ranges {};
 	uint32_t                          m_waiting_queues = 0;
 	uint32_t                          m_current_queue  = 0;
+#if defined(ANYPS5_KYTY)
 
 	struct BlockedSlot {
+		std::atomic_uint64_t sequence {0};
 		std::atomic_uint64_t address {0};
 		std::atomic_uint64_t reference {0};
 		std::atomic_uint64_t mask {0};
@@ -146,6 +154,7 @@ private:
 	bool                                m_in_submission = false;
 	void RecordBlockedWait(uint64_t address, uint64_t reference, uint64_t mask, uint32_t function,
 	                       uint32_t bytes);
+#endif
 
 	struct GuestWrite {
 		uint64_t sequence = 0;

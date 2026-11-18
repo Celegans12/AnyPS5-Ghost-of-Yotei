@@ -31,7 +31,9 @@
 #include <mutex>
 #include <optional>
 #include <stdexcept>
+#if defined(ANYPS5_KYTY)
 #include <stop_token>
+#endif
 #include <string>
 #include <string_view>
 #include <thread>
@@ -42,10 +44,12 @@
 #endif
 #ifdef __linux__
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
-#include <pthread.h>
 #include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
+#if defined(ANYPS5_KYTY)
+#include <pthread.h>
+#include <time.h>
+#endif
 #endif
 
 namespace {
@@ -84,6 +88,7 @@ struct Options {
     bool traceSerials = false;
     bool coldPipelines = false;
 };
+#if defined(ANYPS5_KYTY)
 
 struct ThreadSample {
     std::string name;
@@ -120,9 +125,7 @@ using Counters = std::array<std::uint64_t, CounterNames.size()>;
 
 Counters countersNow() {
     Counters values{};
-#if defined(ANYPS5_KYTY)
     static_cast<void>(AgcDriverReplayCounters_nid_postfix(values.data(), values.size()));
-#endif
     return values;
 }
 
@@ -157,6 +160,7 @@ Sample sampleNow() {
     const auto ended = endedThreadNs.load();
     return {sampleThreads(), countersNow(), ended};
 }
+#endif
 
 class Frames {
 public:
@@ -167,18 +171,25 @@ public:
 
     void MarkReady() {
         AgcDriverTracePresent_nid_postfix(width, height);
+#if defined(ANYPS5_KYTY)
         {
             std::lock_guard lock(mutex);
             ready.push_back(Clock::now());
         }
         wake.notify_one();
+#else
+        std::lock_guard lock(mutex);
+        ready.push_back(Clock::now());
+#endif
     }
+#if defined(ANYPS5_KYTY)
 
     std::vector<Sample> Samples() const {
         std::unique_lock lock(mutex);
         sampled.wait_for(lock, std::chrono::seconds(5), [this] { return samples.size() >= ready.size(); });
         return samples;
     }
+#endif
 
     void Failed(std::exception_ptr error) {
         std::lock_guard lock(mutex);
@@ -196,6 +207,7 @@ public:
     }
 
 private:
+#if defined(ANYPS5_KYTY)
     void sampleLoop(const std::stop_token& stop) {
 #ifdef __linux__
         pthread_setname_np(pthread_self(), "replaySampler");
@@ -210,15 +222,22 @@ private:
         }
     }
 
+#endif
     mutable std::mutex mutex;
+#if defined(ANYPS5_KYTY)
     std::condition_variable_any wake;
     mutable std::condition_variable sampled;
+#endif
     std::vector<Clock::time_point> ready;
+#if defined(ANYPS5_KYTY)
     std::vector<Sample> samples;
+#endif
     std::exception_ptr failure;
     std::uint32_t width = 0;
     std::uint32_t height = 0;
+#if defined(ANYPS5_KYTY)
     std::jthread sampler{[this](const std::stop_token& stop) { sampleLoop(stop); }};
+#endif
 };
 
 class ReplayFlip final : public AgcDriver::IFlipRequest {
@@ -833,7 +852,9 @@ struct Replay {
         sequenced.store(0);
         stalled.store(false);
         std::thread breaker([&] {
+#if defined(ANYPS5_KYTY)
             const EndedThreadCpu ended;
+#endif
             if (!options.release) return;
             auto lastSeen = progress();
             auto lastProgress = Clock::now();
@@ -854,7 +875,9 @@ struct Replay {
         std::vector<std::thread> workers;
         for (const auto& entry : byThread) {
             workers.emplace_back([&, &indices = entry.second] {
+#if defined(ANYPS5_KYTY)
                 const EndedThreadCpu ended;
+#endif
                 for (const auto index : indices) {
                     std::unique_lock lock(mutex);
                     turn.wait(lock, [&] { return started == index || failure != nullptr; });
@@ -994,7 +1017,9 @@ void writeDump(const Dump& dump) {
 
 struct FrameCheck {
     std::size_t compared = 0;
+#if defined(ANYPS5_KYTY)
     std::size_t written = 0;
+#endif
     double identical = 1.0;
     int maxDifference = 0;
 };
@@ -1021,15 +1046,21 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
         buffer.dccClearColor = call.values[7];
         buffer.alignment = static_cast<std::uint32_t>(call.values[8]);
         const auto chunk = std::find_if(reader.Chunks().begin(), reader.Chunks().end(), [&](const FrameMemoryChunk& candidate) { return candidate.kind == FrameMemoryKind::Reference && candidate.group == call.values[0]; });
+#if defined(ANYPS5_KYTY)
         if (chunk == reader.Chunks().end()) {
             if (options.frames.empty()) continue;
             writeFrame(options.frames / ("replay-" + std::to_string(call.values[0]) + ".bmp"), buffer, AgcDriver::ReadDisplayBuffer(buffer));
             ++check.written;
             continue;
         }
+#else
+        if (chunk == reader.Chunks().end()) continue;
+#endif
         const auto reference = reader.Read(*chunk);
         const auto replayed = AgcDriver::ReadDisplayBuffer(buffer);
+#if defined(ANYPS5_KYTY)
         ++check.written;
+#endif
         ++check.compared;
         std::size_t same = 0;
         const auto pixels = std::min(reference.size(), replayed.size()) / 4;
@@ -1322,9 +1353,12 @@ struct Pass {
     double seconds = 0.0;
     std::uint64_t paceTimeouts = 0;
     std::uint64_t synthesized = 0;
+#if defined(ANYPS5_KYTY)
     Sample begin;
     Sample end;
+#endif
 };
+#if defined(ANYPS5_KYTY)
 
 struct Window {
     std::map<std::string, std::uint64_t> threadNs;
@@ -1369,6 +1403,7 @@ struct Window {
         return list;
     }
 };
+#endif
 
 double percentile(std::vector<double> values, double fraction) {
     if (values.empty()) return 0.0;
@@ -1401,7 +1436,9 @@ int run(const Options& options) {
     const auto journalStart = Clock::now();
     AgcDriverWaitForPipelineJournal_nid_postfix();
     const auto journalSeconds = std::chrono::duration<double>(Clock::now() - journalStart).count();
+#if defined(ANYPS5_KYTY)
     static_cast<void>(countersNow());
+#endif
     std::set<std::uint32_t> initialOutputs;
     for (const auto& [handle, output] : replay.outputs) initialOutputs.insert(handle);
     std::vector<Pass> passes;
@@ -1429,15 +1466,19 @@ int run(const Options& options) {
             }
         }
         Pass measured{replay.frames.Times().size(), 0, 0.0, replay.paceTimeouts.load(), replay.syntheticReleases.load()};
+#if defined(ANYPS5_KYTY)
         measured.begin = sampleNow();
+#endif
         replay.recording = true;
         replay.startedAt = Clock::now();
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
         else AgcDriverWaitIdle_nid_postfix();
         replay.endedAt = Clock::now();
+#if defined(ANYPS5_KYTY)
         if (replay.unfinished == 0) AgcDriverWaitIdle_nid_postfix();
         static_cast<void>(replay.frames.Samples());
         measured.end = sampleNow();
+#endif
         if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
         measured.frames = replay.frames.Times().size() - measured.firstFrame;
         measured.seconds = std::chrono::duration<double>(replay.endedAt - replay.startedAt).count();
@@ -1459,9 +1500,11 @@ int run(const Options& options) {
     std::string passList;
     double seconds = 0.0;
     std::size_t frames = 0;
+#if defined(ANYPS5_KYTY)
     const auto samples = replay.frames.Samples();
     Window whole;
     Window steady;
+#endif
     for (std::size_t index = 0; index < passes.size(); ++index) {
         const auto& measured = passes[index];
         std::vector<double> passMs;
@@ -1475,20 +1518,30 @@ int run(const Options& options) {
         frameMs.insert(frameMs.end(), passMs.begin(), passMs.end());
         seconds += measured.seconds;
         frames += measured.frames;
+#if defined(ANYPS5_KYTY)
         whole.Add(measured.begin, measured.end, measured.frames, true);
         for (auto frame = measured.firstFrame + 1; frame < measured.firstFrame + measured.frames && frame < samples.size(); ++frame) steady.Add(samples[frame - 1], samples[frame], 1);
+#endif
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
+#if defined(ANYPS5_KYTY)
     std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"park_restores\":%llu,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f,\"draws\":%llu,\"draws_per_frame\":%.1f,\"frames_written\":%zu,\"stages\":[%s],\"counters_per_frame\":{%s},\"steady\":{\"frames\":%zu,\"draws_per_frame\":%.1f,\"counters_per_frame\":{%s},\"stages\":[%s]}}\n",
+#else
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"park_restores\":%llu,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f}\n",
+#endif
                 frames, seconds, seconds > 0 ? static_cast<double>(frames) / seconds : 0.0, percentile(frameMs, 0.5), percentile(frameMs, 0.9), slowest, frameList.c_str(), passList.c_str(),
                 static_cast<unsigned long long>(replay.keptReservations.load()),
                 static_cast<unsigned long long>(replay.submits.load()), static_cast<double>(replay.deltaBytes.load()) / (1024.0 * 1024.0), static_cast<unsigned long long>(replay.parkRestores.load()), static_cast<unsigned long long>(replay.paceTimeouts.load()),
                 replay.paceWaitedSeconds(), static_cast<unsigned long long>(replay.staleRegistrations.load()), static_cast<unsigned long long>(replay.failedRegistrations.load()),
                 static_cast<double>(replay.skipped.bytes) / (1024.0 * 1024.0), replay.threads, static_cast<unsigned long long>(replay.earlyReleases.load()), static_cast<unsigned long long>(replay.lateReleases.load()),
                 static_cast<unsigned long long>(replay.syntheticReleases.load()),
+#if defined(ANYPS5_KYTY)
                 static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds,
                 static_cast<unsigned long long>(whole.Draws()), frames > 0 ? static_cast<double>(whole.Draws()) / static_cast<double>(frames) : 0.0, check.written, whole.Stages().c_str(), whole.PerFrame().c_str(),
                 steady.frames, steady.frames > 0 ? static_cast<double>(steady.Draws()) / static_cast<double>(steady.frames) : 0.0, steady.PerFrame().c_str(), steady.Stages().c_str());
+#else
+                static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds);
+#endif
     std::fflush(stdout);
     return replay.unfinished == 0 ? 0 : 3;
 }

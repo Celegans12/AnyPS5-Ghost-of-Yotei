@@ -22,6 +22,7 @@
 #include <cstring>
 #include <deque>
 #include <exception>
+#include <limits>
 #include <mutex>
 #include <span>
 #include <stdexcept>
@@ -42,6 +43,7 @@ constexpr std::uint32_t BottomOfPipeEvent = 0x28u | (5u << 8u);
 constexpr std::uint32_t LabelData64 = 2u << 29u;
 constexpr std::uint64_t ParsedMargin = 64;
 constexpr std::size_t WaitCapacity = 64;
+constexpr std::int64_t HoldGraceMs = 1000;
 
 struct LabelPacket {
     std::uint64_t serial = 0;
@@ -59,7 +61,7 @@ struct State {
     std::atomic<bool> tracking{false};
     std::array<Queue, SerialQueues> queues;
     std::mutex holdMutex;
-    bool held = false;
+    std::atomic<bool> held{false};
 };
 
 State& state() {
@@ -114,6 +116,24 @@ bool Settled() {
     return true;
 }
 
+bool Readable(vk::Format format) {
+    switch (format) {
+    case vk::Format::eB8G8R8A8Unorm:
+    case vk::Format::eB8G8R8A8Srgb:
+    case vk::Format::eR8G8B8A8Unorm:
+    case vk::Format::eR8G8B8A8Srgb:
+    case vk::Format::eA2B10G10R10UnormPack32:
+    case vk::Format::eA2R10G10B10UnormPack32:
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::runtime_error Unreadable(vk::Format format) {
+    return std::runtime_error("kyty replay: reading a display image of Vulkan format " + vk::to_string(format) + " is not implemented (8-bit and 10-bit RGBA/BGRA only)");
+}
+
 std::array<std::byte, 4> Bgra(vk::Format format, const std::uint8_t* texel) {
     switch (format) {
     case vk::Format::eB8G8R8A8Unorm:
@@ -133,10 +153,14 @@ std::array<std::byte, 4> Bgra(vk::Format format, const std::uint8_t* texel) {
         return {low, green, high, std::byte{0xff}};
     }
     default:
-        throw std::runtime_error("kyty replay: reading a display image of Vulkan format " + vk::to_string(format) + " is not implemented (8-bit and 10-bit RGBA/BGRA only)");
+        throw Unreadable(format);
     }
 }
 
+}
+
+void RequireNotHeld(const char* what) {
+    if (state().held.load(std::memory_order_acquire)) throw std::runtime_error(std::string("kyty replay: ") + what + " waits for the GPU while the replay holds it settled (AgcDriverReleaseSettled first)");
 }
 
 void NoteSubmission(Libs::Graphics::GuestGpu& gpu, std::uint32_t queue) {
@@ -163,6 +187,7 @@ void NoteSubmission(Libs::Graphics::GuestGpu& gpu, std::uint32_t queue) {
 namespace AgcDriver {
 
 std::vector<std::byte> ReadDisplayBuffer(const DisplayBuffer& buffer) {
+    KytyShim::Replay::RequireNotHeld("ReadDisplayBuffer");
     AgcDriverWaitIdle_nid_postfix();
     const auto info = KytyShim::Present::DisplayBufferImage(buffer);
     auto& renderer = KytyShim::Entry::Renderer();
@@ -190,6 +215,7 @@ std::vector<std::byte> ReadDisplayBuffer(const DisplayBuffer& buffer) {
             auto& image = cache.GetImage(id);
             cache.UpdateImage(id);
             const auto format = image.backing.format;
+            if (!KytyShim::Replay::Readable(format)) throw KytyShim::Replay::Unreadable(format);
             if (image.backing.extent.width < buffer.width || image.backing.extent.height < buffer.height) throw std::runtime_error("kyty replay: the display image is smaller than the display buffer");
             const auto bytes = static_cast<std::uint64_t>(buffer.width) * buffer.height * 4;
             auto download = renderer.GetBufferCache().GetUtilityBuffer(Graphics::MemoryUsage::Download).MapDownload(bytes, 4);
@@ -244,7 +270,8 @@ extern "C" bool AgcDriverHoldSettled_nid_postfix(std::int64_t milliseconds) {
     auto& gpu = KytyShim::Entry::Gpu();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(std::max<std::int64_t>(0, milliseconds));
     for (;;) {
-        gpu.HoldSubmissions();
+        const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - std::chrono::steady_clock::now()).count();
+        if (!gpu.HoldSubmissions(static_cast<std::uint32_t>(std::clamp<std::int64_t>(left, KytyShim::Replay::HoldGraceMs, std::numeric_limits<std::uint32_t>::max())))) return false;
         if (KytyShim::Replay::Settled()) {
             s.held = true;
             return true;

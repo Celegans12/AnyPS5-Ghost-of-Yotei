@@ -497,6 +497,7 @@ extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
 }
 
 extern "C" void AgcDriverWaitIdle_nid_postfix() try {
+    KytyShim::Replay::RequireNotHeld("AgcDriverWaitIdle");
     auto& s = KytyShim::Entry::state();
     std::shared_lock gate(s.gate);
     KytyShim::Entry::CheckStopping();

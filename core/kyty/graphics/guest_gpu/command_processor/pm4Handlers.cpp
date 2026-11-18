@@ -515,7 +515,11 @@ KYTY_CP_OP_PARSER(CpOpRewind) {
 	EXIT_NOT_IMPLEMENTED(cmd_id != 0xc0005900);
 	EXIT_NOT_IMPLEMENTED((buffer[0] & ~0x81000000u) != 0);
 
+#if defined(ANYPS5_KYTY)
 	cp.WaitForRewind((buffer[0] & 0x80000000u) != 0, buffer);
+#else
+	cp.WaitForRewind((buffer[0] & 0x80000000u) != 0);
+#endif
 
 	return 1;
 }
