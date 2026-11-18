@@ -46,7 +46,7 @@ void main() {
 
 	const float c_edgeThreshold = 0.075;
 	if (deltaMax < c_edgeThreshold) {
-		color = colorCenter;
+		color = vec4(colorCenter.rgb, 1.0);
 		return;
 	}
 
@@ -58,7 +58,7 @@ void main() {
 	float corners = abs(lumaNW - lumaCenter) + abs(lumaNE - lumaCenter) +
 	                abs(lumaSW - lumaCenter) + abs(lumaSE - lumaCenter);
 	if (deltaMax < corners * 0.25) {
-		color = colorCenter;
+		color = vec4(colorCenter.rgb, 1.0);
 		return;
 	}
 
@@ -84,43 +84,50 @@ void main() {
 	}
 
 	const int c_maxSearch = 10;
-	float lenNeg = 0.0;
-	float lenPos = 0.0;
-
+	float lenNeg = float(c_maxSearch);
 	for (int i = 1; i <= c_maxSearch; ++i) {
 		ivec2 pC = pixel - searchDir * i;
 		ivec2 pO = pC + stepDir;
+		if (any(lessThan(pC, ivec2(0))) || any(greaterThanEqual(pC, parameters.size)) ||
+		    any(lessThan(pO, ivec2(0))) || any(greaterThanEqual(pO, parameters.size))) {
+			lenNeg = float(i - 1);
+			break;
+		}
 		float lC = LoadLuma(pC);
 		float lO = LoadLuma(pO);
 		float g = abs(lO - lC);
 		if (g < gradOpp * 0.25 || g > gradOpp * 2.5) {
-			lenNeg = float(i);
+			lenNeg = float(i - 1);
 			break;
 		}
-		if (i == c_maxSearch) lenNeg = float(c_maxSearch);
 	}
 
+	float lenPos = float(c_maxSearch);
 	for (int i = 1; i <= c_maxSearch; ++i) {
 		ivec2 pC = pixel + searchDir * i;
 		ivec2 pO = pC + stepDir;
+		if (any(lessThan(pC, ivec2(0))) || any(greaterThanEqual(pC, parameters.size)) ||
+		    any(lessThan(pO, ivec2(0))) || any(greaterThanEqual(pO, parameters.size))) {
+			lenPos = float(i - 1);
+			break;
+		}
 		float lC = LoadLuma(pC);
 		float lO = LoadLuma(pO);
 		float g = abs(lO - lC);
 		if (g < gradOpp * 0.25 || g > gradOpp * 2.5) {
-			lenPos = float(i);
+			lenPos = float(i - 1);
 			break;
 		}
-		if (i == c_maxSearch) lenPos = float(c_maxSearch);
 	}
 
 	float totalLen = lenNeg + lenPos;
 	if (totalLen < 2.0) {
-		color = colorCenter;
+		color = vec4(colorCenter.rgb, 1.0);
 		return;
 	}
 
 	float t = (lenNeg + 0.5) / (totalLen + 1.0);
 	float weight = clamp(0.5 - abs(t - 0.5), 0.0, 0.45);
 
-	color = mix(colorCenter, colorOpp, weight);
+	color = vec4(mix(colorCenter.rgb, colorOpp.rgb, weight), 1.0);
 }
