@@ -67,6 +67,8 @@ public:
 
 	[[nodiscard]] bool Counting() const noexcept { return !m_open.empty(); }
 
+	void MarkUncounted() noexcept { m_uncounted = true; }
+
 	[[nodiscard]] bool AllocateSlot(uint32_t& slot) {
 		if (m_next_slot - m_released >= m_capacity) {
 			m_uncounted = true;
@@ -131,6 +133,9 @@ public:
 	}
 #endif
 	[[nodiscard]] bool Counting() const noexcept { return Enabled() && m_segments.Counting(); }
+#if defined(ANYPS5_KYTY)
+	void CountSkippedDraw();
+#endif
 
 	[[nodiscard]] bool PrepareRead(uint64_t address, uint64_t size);
 	[[nodiscard]] bool MayPrepareRead(uint64_t address, uint64_t size) const;

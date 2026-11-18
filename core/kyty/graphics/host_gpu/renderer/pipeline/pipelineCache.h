@@ -161,6 +161,9 @@ struct ProgramResolution {
 };
 
 struct GraphicContext;
+#if defined(ANYPS5_KYTY)
+class RenderContext;
+#endif
 struct ShaderParams;
 struct ManifestModule;
 struct PipelineManifest;
@@ -386,6 +389,15 @@ public:
 	                              bool native_bindings = false);
 #if defined(ANYPS5_KYTY)
 	[[nodiscard]] bool PreparesGraphicsLibraries() const;
+	void SetRenderContext(RenderContext* context) { m_render = context; }
+	enum class AsyncDraw : uint8_t {
+		Off,
+		WritesMemory,
+		LinearTarget,
+		Occlusion,
+		SmallTarget,
+		Eligible,
+	};
 	void PrepareGraphicsLibraries(const HW::Context& context, const HW::UserConfig& user_config,
 	                              const DrawRenderState& state);
 #endif
@@ -609,7 +621,8 @@ private:
 	public:
 		explicit StallScope(PipelineCache& cache);
 #if defined(ANYPS5_KYTY)
-		StallScope(PipelineCache& cache, const char* what, uint64_t hash);
+		StallScope(PipelineCache& cache, const char* what, uint64_t hash, const char* why = nullptr);
+		StallScope(PipelineCache& cache, const char* what, const ShaderModule& module);
 #endif
 		~StallScope();
 		KYTY_CLASS_NO_COPY(StallScope);
@@ -620,6 +633,7 @@ private:
 		std::chrono::steady_clock::time_point m_started;
 		const char*                           m_what = nullptr;
 		uint64_t                              m_hash = 0;
+		const char*                           m_why  = nullptr;
 #endif
 	};
 	mutable std::mutex m_stall_mutex;
@@ -661,6 +675,12 @@ private:
 	std::vector<OptimizedGraphicsPipeline> m_optimized_deferred;
 	uint64_t                               m_optimized_seen = 0;
 	size_t                                 m_optimized_scanned = 0;
+	[[nodiscard]] AsyncDraw HeldDraw(const CommandBuffer& command, const DrawRenderState& state,
+	                                 const DrawTargets& targets) const;
+	[[nodiscard]] bool LiveTargets(const DrawTargets& targets) const;
+	RenderContext* m_render = nullptr;
+	bool CreateGraphicsPipelineNow(Pipeline& pipeline, const GraphicsPipelineKey& key,
+	                               const std::array<const ShaderModule*, 4>& stages);
 	bool CreateGraphicsPipelineFast(Pipeline& pipeline, const GraphicsPipelineKey& key,
 	                                const std::array<const ShaderModule*, 4>& stages);
 	void ApplyOptimizedPipelines();
@@ -671,8 +691,12 @@ private:
 	std::deque<std::unique_ptr<ChainJob>>   m_chain_jobs;
 	bool                                    m_chain_stopping = false;
 	std::vector<std::jthread>               m_chain_threads;
+	std::array<std::atomic<uint64_t>, 5> m_async_skipped {};
+	std::atomic<uint64_t> m_async_first_waits {0}, m_async_first_wait_ns {0}, m_async_first_ready {0},
+	    m_async_probes {0}, m_async_probe_ns {0}, m_async_created_now {0};
 	std::atomic<uint64_t> m_chain_queued {0}, m_chain_dropped {0}, m_chain_prepared {0}, m_chain_failed {0},
 	    m_chain_compiled {0}, m_chain_ns {0};
+	void NoteFirstWait(std::chrono::steady_clock::time_point started, bool ready);
 	void QueueChain(std::unique_ptr<ChainJob>&& job);
 	void ChainWorker();
 	void StopChains();

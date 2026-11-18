@@ -62,6 +62,9 @@ RenderContext::RenderContext(GraphicContext& graphics, const std::filesystem::pa
       m_image_heap(*this, m_page_manager), m_pipeline_cache(graphics, &m_image_heap, shader_store) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	m_ray_tracing = std::make_unique<RayTracing>(*this);
+#if defined(ANYPS5_KYTY)
+	m_pipeline_cache.SetRenderContext(this);
+#endif
 }
 
 RenderContext::~RenderContext() {

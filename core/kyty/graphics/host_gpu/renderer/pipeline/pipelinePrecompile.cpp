@@ -4,6 +4,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
+#include "graphics/host_gpu/renderer/renderContext.h"
 #endif
 #include "graphics/presentation/precompileNotice.h"
 #include "kernel/guestPause.h"
@@ -68,13 +69,29 @@ PipelineCache::StallScope::StallScope(PipelineCache& cache): m_cache(cache) {
 }
 
 #if defined(ANYPS5_KYTY)
-PipelineCache::StallScope::StallScope(PipelineCache& cache, const char* what, uint64_t hash)
+PipelineCache::StallScope::StallScope(PipelineCache& cache, const char* what, uint64_t hash, const char* why)
     : StallScope(cache) {
 	PipelineRouteNote() = nullptr;
 	m_started = std::chrono::steady_clock::now();
 	m_what    = what;
 	m_hash    = hash;
+	m_why     = why;
 }
+
+static const char* ComputeWrites(const ShaderModule& module) {
+	const auto& program = module.info;
+	if (program.has_address_writes ||
+	    std::ranges::any_of(program.info.buffers, [](const auto& buffer) { return buffer.written; })) {
+		return "writes-buffers";
+	}
+	if (std::ranges::any_of(program.info.images, [](const auto& image) { return image.written; })) {
+		return "writes-images";
+	}
+	return "writes-nothing";
+}
+
+PipelineCache::StallScope::StallScope(PipelineCache& cache, const char* what, const ShaderModule& module)
+    : StallScope(cache, what, module.info.shader_hash, ComputeWrites(module)) {}
 #endif
 
 PipelineCache::StallScope::~StallScope() {
@@ -103,8 +120,9 @@ PipelineCache::StallScope::~StallScope() {
 	}();
 	if (m_what != nullptr && ns >= log_ns) {
 		const char* route = PipelineRouteNote();
-		PrecompileLog("[kyty-gpl] stall {:.3f} s {} 0x{:016x} {} @{}", static_cast<double>(ns) / 1e9, m_what,
-		              m_hash, route != nullptr ? route : "", now.time_since_epoch().count());
+		PrecompileLog("[kyty-gpl] stall {:.3f} s {} 0x{:016x} {}{}{} @{}", static_cast<double>(ns) / 1e9, m_what,
+		              m_hash, route != nullptr ? route : "", m_why != nullptr ? " why=" : "",
+		              m_why != nullptr ? m_why : "", now.time_since_epoch().count());
 	}
 #else
 	std::scoped_lock lock(m_cache.m_stall_mutex);
@@ -129,6 +147,23 @@ void PipelineCache::LogStallStats(bool force) {
 	PrecompileLog("[kyty-gpl] stalls {} total {:.3f} s max {:.3f} s >=0.1s {} >=0.5s {}; driver pipelines {}",
 	              stats.count, static_cast<double>(stats.total_ns) / 1e9, static_cast<double>(stats.max_ns) / 1e9,
 	              stats.over_100ms, stats.over_500ms, stats.pipelines);
+	if (!m_async_threads.empty()) {
+		const auto waits = m_async_first_waits.load(std::memory_order_relaxed);
+		PrecompileLog("[kyty-async] mode {}: draws skipped kyty {} occlusion {} small-target {} small-program {} "
+		              "layer {}; first draws waited {} times for {:.3f} s, {} ready in time; probes {} for {:.3f} s, "
+		              "{} created at once; flips {}",
+		              Config::AsyncPipelinesSkipMore() ? 2 : 1, m_async_skipped[0].load(std::memory_order_relaxed),
+		              m_async_skipped[1].load(std::memory_order_relaxed),
+		              m_async_skipped[2].load(std::memory_order_relaxed),
+		              m_async_skipped[3].load(std::memory_order_relaxed),
+		              m_async_skipped[4].load(std::memory_order_relaxed), waits,
+		              static_cast<double>(m_async_first_wait_ns.load(std::memory_order_relaxed)) / 1e9,
+		              m_async_first_ready.load(std::memory_order_relaxed),
+		              m_async_probes.load(std::memory_order_relaxed),
+		              static_cast<double>(m_async_probe_ns.load(std::memory_order_relaxed)) / 1e9,
+		              m_async_created_now.load(std::memory_order_relaxed),
+		              m_render != nullptr ? m_render->FlipNumber() : 0u);
+	}
 	if (m_libraries != nullptr) {
 		m_libraries->LogStats();
 	}

@@ -3010,6 +3010,9 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 	EmitCallback([this, handle, index, flip_mode, flip_arg] {
 		auto& command = CurrentBuffer();
 		m_renderer.GetOcclusionQueries().OnFrame();
+#if defined(ANYPS5_KYTY)
+		m_renderer.NoteFlip();
+#endif
 		auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
 #if defined(ANYPS5_KYTY)
 		GetScheduler().DeferFlipCompletion(
@@ -3036,6 +3039,9 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		};
 		ProcessorScope processor_scope(*this);
 
+#if defined(ANYPS5_KYTY)
+		m_renderer.NoteFlip();
+#endif
 		m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
 #if defined(ANYPS5_KYTY)
 		GetScheduler().DeferFlipCompletion(

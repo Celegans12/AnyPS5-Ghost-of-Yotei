@@ -3408,6 +3408,98 @@ bool SmallColorTargetDraw(const HW::Context& context) {
 	return found;
 }
 
+#if defined(ANYPS5_KYTY)
+static const char* AsyncDrawName(PipelineCache::AsyncDraw async) {
+	using AsyncDraw = PipelineCache::AsyncDraw;
+	switch (async) {
+		case AsyncDraw::Off: return "off";
+		case AsyncDraw::WritesMemory: return "writes-memory";
+		case AsyncDraw::LinearTarget: return "linear-target";
+		case AsyncDraw::Occlusion: return "occlusion";
+		case AsyncDraw::SmallTarget: return "small-target";
+		case AsyncDraw::Eligible: return "eligible";
+	}
+	return "?";
+}
+
+constexpr std::array<const char*, 5> SkipClassHacks = {
+    "draw skipped while its pipeline compiles",
+    "draw counted by an occlusion query skipped while its pipeline compiles (KYTY_ASYNC_PIPELINES=2)",
+    "draw into a small colour target skipped while its pipeline compiles (KYTY_ASYNC_PIPELINES=2)",
+    "draw with a small pipeline skipped while it compiles (KYTY_ASYNC_PIPELINES=2)",
+    "draw without depth and with small vertex programs skipped while its pipeline compiles "
+    "(KYTY_ASYNC_PIPELINES=2)"};
+#endif
+
+#if defined(ANYPS5_KYTY)
+void PipelineCache::NoteFirstWait(std::chrono::steady_clock::time_point started, bool ready) {
+	const auto waited = std::chrono::steady_clock::now() - started;
+	m_async_first_waits.fetch_add(1, std::memory_order_relaxed);
+	m_async_first_wait_ns.fetch_add(
+	    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(waited).count()),
+	    std::memory_order_relaxed);
+	if (ready) {
+		m_async_first_ready.fetch_add(1, std::memory_order_relaxed);
+	}
+}
+#endif
+
+#if defined(ANYPS5_KYTY)
+PipelineCache::AsyncDraw PipelineCache::HeldDraw(const CommandBuffer& command, const DrawRenderState& state,
+                                                 const DrawTargets& targets) const {
+	if (!Config::AsyncPipelinesEnabled()) {
+		return AsyncDraw::Off;
+	}
+	const auto writes_memory = [](const ShaderStageRuntime& stage) {
+		if (stage.module == nullptr) {
+			return true;
+		}
+		const auto& program = stage.module->info;
+		return program.has_address_writes ||
+		       std::ranges::any_of(program.info.buffers, [](const auto& buffer) { return buffer.written; }) ||
+		       std::ranges::any_of(program.info.images, [](const auto& image) { return image.written; });
+	};
+	for (const auto& stage: state.VertexStages()) {
+		if (writes_memory(stage.stage)) {
+			return AsyncDraw::WritesMemory;
+		}
+	}
+	if (state.ps_active && writes_memory(state.ps_input_info.stage)) {
+		return AsyncDraw::WritesMemory;
+	}
+	for (uint32_t i = 0; i < targets.color_count; i++) {
+		if (!targets.colors[i].desc.info.IsTiled()) {
+			return AsyncDraw::LinearTarget;
+		}
+	}
+	if (static_cast<bool>(targets.depth.image_id) && !targets.depth.desc.info.IsTiled()) {
+		return AsyncDraw::LinearTarget;
+	}
+	if (m_render != nullptr && m_render->GetOcclusionQueries().Counting()) {
+		return AsyncDraw::Occlusion;
+	}
+	return SmallColorTargetDraw(command.GetRegisters()) ? AsyncDraw::SmallTarget : AsyncDraw::Off;
+}
+
+bool PipelineCache::LiveTargets(const DrawTargets& targets) const {
+	if (m_render == nullptr) {
+		return false;
+	}
+	const auto frame = m_render->FlipNumber();
+	const auto drawn = [&](ImageId id) {
+		const auto& stamps = m_render->GetTextureCache().GetImage(id).target_frames;
+		return (frame >= 1u && stamps[(frame - 1u) & 3u] == frame) ||
+		       (frame >= 2u && stamps[(frame - 2u) & 3u] == frame - 1u);
+	};
+	for (uint32_t i = 0; i < targets.color_count; i++) {
+		if (!drawn(targets.colors[i].image_id)) {
+			return false;
+		}
+	}
+	return !static_cast<bool>(targets.depth.image_id) || drawn(targets.depth.image_id);
+}
+#endif
+
 PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&   command,
                                                             const DrawRenderState& state,
                                                             const DrawTargets&     targets,
@@ -3634,6 +3726,15 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 		return &found->second;
 	}
+#if defined(ANYPS5_KYTY)
+	const AsyncDraw held      = allow_async ? AsyncDraw::Eligible : HeldDraw(command, state, targets);
+	const bool      skip_more = Config::AsyncPipelinesSkipMore() &&
+	                       (allow_async || held == AsyncDraw::Occlusion || held == AsyncDraw::SmallTarget) &&
+	                       LiveTargets(targets);
+	allow_async = allow_async || skip_more;
+	uint32_t    skip_class = held == AsyncDraw::Occlusion ? 1u : held == AsyncDraw::SmallTarget ? 2u : 0u;
+	const char* sync_why   = AsyncDrawName(held);
+#endif
 	if (allow_async) {
 		uint64_t vertex_words = 0;
 		for (uint32_t i = 0; i < 3u; i++) {
@@ -3645,19 +3746,43 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		    vertex_words + (stages[3] != nullptr ? stages[3]->spirv_words : 0u);
 		const bool layer_draw = !depth.depth_test_enable && !depth.depth_write_enable &&
 		                        vertex_words <= PipelineSyncUiVsWords;
-		allow_async = spirv_words > PipelineSyncWords && !layer_draw;
+		const bool small_program = spirv_words <= PipelineSyncWords;
+#if defined(ANYPS5_KYTY)
+		if (small_program || layer_draw) {
+			sync_why = small_program ? "small-program" : "layer";
+			if (skip_class == 0) {
+				skip_class = small_program ? 3u : 4u;
+			}
+		}
+		allow_async = (!small_program && !layer_draw) || skip_more;
+#else
+		allow_async = !small_program && !layer_draw;
+#endif
 	}
 	std::optional<StallScope> stall;
 #if defined(ANYPS5_KYTY)
 	const uint64_t stall_hash = stages[3] != nullptr ? stages[3]->info.shader_hash : stages[0]->info.shader_hash;
 #endif
 	if (m_async_handoff) {
+#if defined(ANYPS5_KYTY)
+		if (allow_async && m_async_threads.empty()) {
+			sync_why = "no-threads";
+		}
+#endif
 		allow_async = allow_async && !m_async_threads.empty();
 		std::unique_lock lock(m_async_mutex);
 		std::optional<std::chrono::steady_clock::time_point> wait_until;
+#if defined(ANYPS5_KYTY)
+		std::chrono::steady_clock::time_point wait_from;
+#endif
 		for (;;) {
 			if (auto node = m_async_ready.extract(key); !node.empty()) {
 				lock.unlock();
+#if defined(ANYPS5_KYTY)
+				if (wait_until) {
+					NoteFirstWait(wait_from, true);
+				}
+#endif
 				auto& ready              = m_graphics_pipelines.insert(std::move(node)).position->second;
 				m_last_graphics_key      = key;
 				m_last_graphics_pipeline = &ready;
@@ -3667,16 +3792,59 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			}
 			if (!m_async_pending_graphics.contains(key)) {
 				if (!allow_async || m_async_failed_graphics.contains(key)) {
+#if defined(ANYPS5_KYTY)
+					if (allow_async) {
+						sync_why = "failed";
+					}
+#endif
 					ClaimPipeline(key);
 					QueueSiblingPipeline(key, stages, ps_active ? ps_input_info.stage.module : nullptr);
 					break;
 				}
+#if defined(ANYPS5_KYTY)
+				const bool skip_now = skip_more;
+				if (skip_now) {
+					lock.unlock();
+					Pipeline   created;
+					const auto probe_started = std::chrono::steady_clock::now();
+					bool       made          = false;
+					{
+						const StallScope probe(*this, "graphics-probe", stall_hash, sync_why);
+						made = CreateGraphicsPipelineNow(created, key, stages);
+					}
+					m_async_probes.fetch_add(1, std::memory_order_relaxed);
+					m_async_probe_ns.fetch_add(
+					    static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+					                              std::chrono::steady_clock::now() - probe_started)
+					                              .count()),
+					    std::memory_order_relaxed);
+					lock.lock();
+					if (made) {
+						ClaimPipeline(key);
+						QueueSiblingPipeline(key, stages, ps_active ? ps_input_info.stage.module : nullptr);
+						lock.unlock();
+						m_async_created_now.fetch_add(1, std::memory_order_relaxed);
+						auto& ready              = m_graphics_pipelines.try_emplace(key, created).first->second;
+						m_last_graphics_key      = key;
+						m_last_graphics_pipeline = &ready;
+						StorePipeline(key);
+						NoteCreatedPipeline(probe_started);
+						NoteUse(ready, stages);
+						return &ready;
+					}
+				}
+#endif
 				m_async_pending_graphics.insert(key);
 				ClaimPipeline(key);
 				QueueSiblingPipeline(key, stages, ps_active ? ps_input_info.stage.module : nullptr);
 				lock.unlock();
 				QueueAsyncPipeline({.key = key, .stages = stages});
+#if defined(ANYPS5_KYTY)
+				wait_from  = std::chrono::steady_clock::now();
+				wait_until = skip_now ? wait_from : wait_from + PipelineWait;
+#else
 				wait_until = std::chrono::steady_clock::now() + PipelineWait;
+#endif
 				lock.lock();
 				continue;
 			}
@@ -3688,6 +3856,22 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 					m_async_available.notify_one();
 				}
 				if (!wait_until || std::chrono::steady_clock::now() >= *wait_until) {
+#if defined(ANYPS5_KYTY)
+					lock.unlock();
+					if (wait_until) {
+						NoteFirstWait(wait_from, false);
+					}
+					m_async_skipped[skip_class].fetch_add(1, std::memory_order_relaxed);
+					if (m_render != nullptr && m_render->GetOcclusionQueries().Counting()) {
+						m_render->GetOcclusionQueries().CountSkippedDraw();
+						Common::HackNotice::Report("occlusion query of a skipped draw reads visible",
+						                           "PipelineCache::GetGraphicsPipeline", stall_hash, skip_class);
+					}
+					if (skip_class != 0) {
+						Common::HackNotice::Report(SkipClassHacks[skip_class], "PipelineCache::GetGraphicsPipeline",
+						                           stall_hash, skip_class);
+					}
+#endif
 					return nullptr;
 				}
 				lock.unlock();
@@ -3704,7 +3888,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			}
 			if (!stall) {
 #if defined(ANYPS5_KYTY)
-				stall.emplace(*this, "graphics-wait", stall_hash);
+				stall.emplace(*this, "graphics-wait", stall_hash, sync_why);
 #else
 				stall.emplace(*this);
 #endif
@@ -3730,7 +3914,7 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		if (!stall) {
 #if defined(ANYPS5_KYTY)
-			stall.emplace(*this, "graphics-sync", stall_hash);
+			stall.emplace(*this, "graphics-sync", stall_hash, sync_why);
 #else
 			stall.emplace(*this);
 #endif
@@ -3750,6 +3934,31 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 }
 
 #if defined(ANYPS5_KYTY)
+bool PipelineCache::CreateGraphicsPipelineNow(Pipeline& pipeline, const GraphicsPipelineKey& key,
+                                              const std::array<const ShaderModule*, 4>& stages) {
+	const bool cached = m_graphics.pipeline_cache_lookup_enabled && m_driver_cache != nullptr;
+	const bool linked = m_libraries != nullptr && PipelineLibraries::Eligible(stages);
+	if (!cached && !linked) {
+		return false;
+	}
+	CreateGraphicsPipelineLayout(m_graphics, pipeline, key, stages);
+	if (cached && CreateGraphicsPipelineWhole(m_graphics, pipeline, key, stages, m_driver_cache,
+	                                          vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired,
+	                                          pipeline.pipeline) == vk::Result::eSuccess &&
+	    pipeline.pipeline) {
+		return true;
+	}
+	if (linked && m_libraries->Link(pipeline, key, stages, true)) {
+		m_libraries->QueueOptimized(pipeline, key, stages);
+		return true;
+	}
+	m_graphics.device.destroyPipeline(pipeline.pipeline, nullptr);
+	m_graphics.device.destroyPipelineLayout(pipeline.pipeline_layout, nullptr);
+	m_graphics.device.destroyDescriptorSetLayout(pipeline.descriptor_set_layout, nullptr);
+	pipeline = {};
+	return false;
+}
+
 bool PipelineCache::CreateGraphicsPipelineFast(Pipeline& pipeline, const GraphicsPipelineKey& key,
                                                const std::array<const ShaderModule*, 4>& stages) {
 	auto& route = PipelineRouteNote();
@@ -3953,7 +4162,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 			}
 			if (!stall) {
 #if defined(ANYPS5_KYTY)
-				stall.emplace(*this, "compute-wait", module.info.shader_hash);
+				stall.emplace(*this, "compute-wait", module);
 #else
 				stall.emplace(*this);
 #endif
@@ -3980,7 +4189,7 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		if (!stall) {
 #if defined(ANYPS5_KYTY)
-			stall.emplace(*this, "compute-sync", module.info.shader_hash);
+			stall.emplace(*this, "compute-sync", module);
 #else
 			stall.emplace(*this);
 #endif

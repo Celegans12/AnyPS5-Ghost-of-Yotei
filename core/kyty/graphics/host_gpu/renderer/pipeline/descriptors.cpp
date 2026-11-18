@@ -1821,6 +1821,10 @@ void RenderExecutor::BindImage(ImageId id, bool storage) {
 void RenderExecutor::BindRenderTarget(ImageId id) {
 	auto& image             = m_context.GetTextureCache().GetImage(id);
 	image.binding.is_target = true;
+#if defined(ANYPS5_KYTY)
+	const auto frame                 = m_context.FlipNumber();
+	image.target_frames[frame & 3u] = frame + 1u;
+#endif
 	m_bound_images.push_back(id);
 }
 

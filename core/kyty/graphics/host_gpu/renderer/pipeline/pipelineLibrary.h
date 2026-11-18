@@ -63,7 +63,8 @@ public:
 	KYTY_CLASS_NO_COPY(PipelineLibraries);
 
 	[[nodiscard]] static bool Eligible(const Stages& stages);
-	bool Link(PipelineCache::Pipeline& pipeline, const GraphicsPipelineKey& key, const Stages& stages);
+	bool Link(PipelineCache::Pipeline& pipeline, const GraphicsPipelineKey& key, const Stages& stages,
+	          bool ready_only = false);
 	void Prepare(const GraphicsPipelineKey& key, const Stages& stages, bool native);
 	void PrepareNow(const GraphicsPipelineKey& key, const Stages& stages, bool native);
 	void QueueOptimized(const PipelineCache::Pipeline& linked, const GraphicsPipelineKey& key,

@@ -135,6 +135,13 @@ void OcclusionQueries::EndQuery(const CommandRecorder& recorder) {
 	m_query_active = false;
 }
 
+#if defined(ANYPS5_KYTY)
+void OcclusionQueries::CountSkippedDraw() {
+	std::lock_guard lock(m_mutex);
+	m_segments.MarkUncounted();
+}
+#endif
+
 void OcclusionQueries::OnBeginRendering(const CommandRecorder& recorder) {
 	m_rendering = true;
 	if (m_pool != nullptr && m_segments.Counting()) {

@@ -282,6 +282,10 @@ bool AsyncPipelinesEnabled() {
 	return g_config->async_pipelines_enabled;
 }
 
+bool AsyncPipelinesSkipMore() {
+	return g_config->async_pipelines_skip_more;
+}
+
 bool NativeRayTracingEnabled() {
 	return g_config->native_rt;
 }

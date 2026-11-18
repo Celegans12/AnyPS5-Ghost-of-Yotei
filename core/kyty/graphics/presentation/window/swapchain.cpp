@@ -26,6 +26,9 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <fmt/format.h>
 #include <limits>
 #include <memory>
 #include <vector>
@@ -1479,6 +1482,43 @@ uint64_t Swapchain::Submit(CommandScheduler& scheduler) {
 	return tick;
 }
 
+[[gnu::noinline]] static void NotePresentGap() {
+	static const bool logged_stalls = std::getenv("KYTY_PIPELINE_STALL_LOG_MS") != nullptr;
+	if (!logged_stalls) {
+		return;
+	}
+	using Clock = std::chrono::steady_clock;
+	static Clock::time_point last;
+	static Clock::time_point logged;
+	static uint64_t          frames = 0, over_50 = 0, over_250 = 0, over_1000 = 0;
+	static double            lost = 0.0, worst = 0.0;
+	const auto               now = Clock::now();
+	if (last != Clock::time_point {}) {
+		const double ms = std::chrono::duration<double, std::milli>(now - last).count();
+		frames++;
+		if (ms > 50.0) {
+			over_50++;
+			lost += ms - 50.0;
+		}
+		over_250 += ms > 250.0 ? 1u : 0u;
+		over_1000 += ms > 1000.0 ? 1u : 0u;
+		worst = std::max(worst, ms);
+		if (ms > 250.0) {
+			Log::WriteToConsoleAndLog(fmt::format("[kyty-frames] gap {:.0f} ms @{}\n", ms,
+			                                      now.time_since_epoch().count()));
+		}
+	} else {
+		logged = now;
+	}
+	last = now;
+	if (now - logged >= std::chrono::seconds(10)) {
+		logged = now;
+		Log::WriteToConsoleAndLog(fmt::format("[kyty-frames] presents {} over 50 ms {} (lost {:.3f} s) over 250 ms {} "
+		                                      "over 1 s {} worst {:.0f} ms\n",
+		                                      frames, over_50, lost / 1000.0, over_250, over_1000, worst));
+	}
+}
+
 Swapchain::Status Swapchain::Present() {
 	const auto         ready = m_render_complete[m_image_index];
 	vk::PresentInfoKHR present {};
@@ -1507,6 +1547,7 @@ Swapchain::Status Swapchain::Present() {
 			return Status::SurfaceLost;
 		default: EXIT("vkQueuePresentKHR failed: %s\n", vk::to_string(result).c_str());
 	}
+	NotePresentGap();
 	m_frame_index = (m_frame_index + 1u) % static_cast<uint32_t>(m_images.size());
 	return Status::Success;
 }

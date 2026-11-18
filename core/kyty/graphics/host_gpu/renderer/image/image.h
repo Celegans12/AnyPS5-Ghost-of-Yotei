@@ -9,6 +9,7 @@
 #include "graphics/host_gpu/renderer/image/imageInfo.h"
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <compare>
 #include <limits>
@@ -244,6 +245,9 @@ public:
 	uint32_t         table_pins         = 0;
 	uint64_t         readback_begin     = 0;
 	uint64_t         readback_end       = 0;
+#if defined(ANYPS5_KYTY)
+	std::array<uint64_t, 4> target_frames {};
+#endif
 	std::atomic<uint32_t>* version = nullptr;
 
 private:

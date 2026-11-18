@@ -49,7 +49,6 @@ constexpr Flag Flags[] = {
     {"KYTY_TESSELLATION", &Options::tessellation_enabled},
     {"KYTY_OCCLUSION_QUERIES", &Options::occlusion_queries_enabled},
     {"KYTY_RELAXED_SHADER_FLOAT", &Options::relaxed_shader_float},
-    {"KYTY_ASYNC_PIPELINES", &Options::async_pipelines_enabled},
     {"KYTY_RT_STATS", &Options::rt_stats_enabled},
     {"KYTY_COMMAND_BUFFER_DUMP", &Options::command_buffer_dump_enabled},
     {"KYTY_GRAPHICS_DEBUG_DUMP", &Options::graphics_debug_dump_enabled},
@@ -137,6 +136,12 @@ Options OptionsFromEnvironment(std::string& applied) {
         options.*flag.field = text == "1";
     }
     options.shader_cache_enabled = ResolveShaderCacheEnabled(options.shader_cache_enabled, Read("ANYPS5_NO_SHADER_CACHE", applied));
+    if (const char* value = Read("KYTY_ASYNC_PIPELINES", applied)) {
+        const std::string_view text(value);
+        if (text != "0" && text != "1" && text != "2") EXIT("KytyShim: KYTY_ASYNC_PIPELINES=%s is not 0, 1 or 2\n", value);
+        options.async_pipelines_enabled = text != "0";
+        options.async_pipelines_skip_more = text == "2";
+    }
     const char* nativeRt = Read("KYTY_NATIVE_RT", applied);
     const auto mode = NativeRt::ParseMode(nativeRt);
     if (!mode.has_value()) EXIT("KytyShim: KYTY_NATIVE_RT=%s is neither 0 nor 1\n", nativeRt);

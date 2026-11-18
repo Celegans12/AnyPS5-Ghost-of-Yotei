@@ -305,7 +305,8 @@ void PipelineLibraries::Worker() {
 	}
 }
 
-bool PipelineLibraries::Link(PipelineCache::Pipeline& pipeline, const GraphicsPipelineKey& key, const Stages& stages) {
+bool PipelineLibraries::Link(PipelineCache::Pipeline& pipeline, const GraphicsPipelineKey& key, const Stages& stages,
+                             bool ready_only) {
 	if (!Eligible(stages) || pipeline.pipeline_layout == nullptr) {
 		return false;
 	}
@@ -340,6 +341,14 @@ bool PipelineLibraries::Link(PipelineCache::Pipeline& pipeline, const GraphicsPi
 		};
 		std::lock_guard lock(m_mutex);
 		link_note = Notes[state(*fragment_shader)][state(*pre_rasterization)];
+		if (ready_only &&
+		    std::ranges::any_of(std::array {vertex_input.get(), fragment_output.get(), fragment_shader.get(),
+		                                    pre_rasterization.get()},
+		                        [](const Library* library) {
+			                        return library != nullptr && library->state != Library::State::Ready;
+		                        })) {
+			return false;
+		}
 	}
 	std::array<vk::Pipeline, 4> libraries {};
 	uint32_t                    count = 0;
