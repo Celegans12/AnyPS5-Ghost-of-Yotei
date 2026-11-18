@@ -239,6 +239,12 @@ Real compile errors still fail. Syntax checks do not replace a full build and te
 
 Use each runtime's full compiled AGC commit, not the current source checkout's commit. On Linux omit `.exe`. Shared `environment` records GPU/driver selection, Vulkan layers and other declared `APS5_*`, `ANYPS5_*` or `VK_*` settings. Per-arm environments record experimental differences; GPU selection belongs in the shared environment. The runner clears inherited settings in those namespaces and loader overrides, stages the runtime files, sets its library paths, and forces `ANYPS5_REQUIRE_VULKAN=1`, `ANYPS5_HOST_REPORT=1` and its private `ANYPS5_SHADER_CACHE_DIR`. It does not change existing validation gates or infer a source build's cleanliness from a binary hash.
 
+For Kyty, set `KYTY_GPU` in the shared environment. The shared or per-arm environment also accepts
+`KYTY_GPU_PIPELINE`, `KYTY_GPU_SPIN_US`, `KYTY_NATIVE_RT`, `KYTY_PIPELINE_MANIFEST`, `KYTY_PRINTF_DIRECTION`,
+`KYTY_RT_CHECK`, `KYTY_RT_CHECK_PPM`, `KYTY_RT_CHECK_STRIKES`, `KYTY_RT_ORACLE`, `KYTY_RT_STATS` and
+`KYTY76_LDS_SYNC`. Move these controls from shell exports into the recipe. The runner clears inherited `KYTY_*`
+and `KYTY76_LDS_SYNC` settings before inspection and replay. Strict replay controls `KYTY_FALLBACKS`.
+
 Each invocation uses `--strict --no-synthesize --repeat 1`. Capture inspection rejects truncated or obsolete captures before GPU replay. Each arm warms its own application cache; the resulting seed is copied into a fresh cache directory for every measured trial. Zero warmups starts every trial with an empty application cache. Trials alternate baseline/candidate and candidate/baseline order. Capture and runtime hashes are checked before and after execution. Original logs, process receipts, host reports, cache contents and every attempt remain in the bundle. Commands have a timeout and per-stream log byte bound; their owned Windows job or POSIX process group is terminated on completion, timeout or interruption.
 
 `report.md` and `report.json` show per-arm observations, paired changes and repeatability when no known evidence problem prevents comparison. `python tools/frame_replay_compare.py report replay-results` verifies retained file hashes and regenerates the report from original logs; `--json` prints JSON. Exit 0 means the declared experiment completed without a recorded evidence problem, 2 means setup, execution or evidence was incomplete, and 130 means interrupted. None is a correctness or performance pass threshold.

@@ -149,7 +149,7 @@ class RecipeTests(ReplayFixture):
                 self.validate(recipe)
 
     def test_device_selection_is_shared_and_inherited_instrumentation_is_removed(self):
-        for key in ("ANYPS5_GPU", "VK_ICD_FILENAMES"):
+        for key in ("ANYPS5_GPU", "KYTY_GPU", "VK_ICD_FILENAMES"):
             recipe = copy.deepcopy(self.recipe)
             recipe["arms"]["baseline"]["environment"] = {key: "selection"}
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -169,6 +169,18 @@ class RecipeTests(ReplayFixture):
         self.assertEqual(env["ANYPS5_REQUIRE_VULKAN"], "1")
         self.assertEqual(env["ANYPS5_HOST_REPORT"], "1")
         self.assertEqual(env["ANYPS5_SHADER_CACHE_DIR"], str(self.root / "cache"))
+
+    def test_kyty_fallbacks_and_out_of_scope_settings_cannot_be_pinned(self):
+        for field in (self.recipe, self.recipe["arms"]["candidate"]):
+            for key, reason in (("KYTY_FALLBACKS", "controlled by the runner"),
+                                ("KYTY_DLSS_FOLDER", "unsupported environment key"),
+                                ("KYTY_PRINTF_OUTPUT_FILE", "unsupported environment key"),
+                                ("KYTY_VULKAN_VALIDATION", "unsupported environment key"),
+                                ("kyty_native_rt", "unsupported environment key")):
+                field["environment"] = {key: "1"}
+                with self.subTest(key=key, scope=field), self.assertRaisesRegex(ValueError, reason):
+                    self.validate()
+            del field["environment"]
 
     def test_stage_replay_runtime_copies_files_and_rejects_changed_bytes(self):
         source = self.root / "baseline"
@@ -264,6 +276,35 @@ class RunnerTests(ReplayFixture):
             self.assertEqual(runner.evidence.replay_tree_manifest(self.root / name), manifest)
         offline = runner._offline_report(self.root / "evidence")
         self.assertEqual(offline["observations"]["baseline"]["healthy_trials"], 2)
+
+    def test_kyty_recipe_settings_reach_inspectors_and_strict_replays(self):
+        self.recipe.update(warmups=0, trials=1)
+        shared = {"KYTY_GPU": "0", "KYTY_RT_CHECK": "256", "KYTY_GPU_SPIN_US": "0"}
+        candidate = {"KYTY_RT_ORACLE": "1", "KYTY_NATIVE_RT": "1", "KYTY76_LDS_SYNC": "0",
+                     "KYTY_GPU_SPIN_US": "2000"}
+        self.recipe["environment"] = shared
+        self.recipe["arms"]["candidate"]["environment"] = candidate
+        inherited = {"KYTY_GPU": "7", "kyty_native_rt": "invalid", "KYTY_RT_ORACLE": "7",
+                     "KyTy_Unknown": "1", "kyty76_lds_sync": "1", "KYTY_FALLBACKS": "1"}
+        with (mock.patch.object(os, "environ", {**os.environ, **inherited}),
+              mock.patch.object(runner, "execute_replay_trial", side_effect=self.execute) as execute):
+            report = runner.run_replay_comparison(self.validate(), self.root / "evidence")
+        self.assertTrue(report["complete"], report["issues"])
+        self.assertEqual(report["recipe"]["environment"], shared)
+        self.assertEqual(report["recipe"]["arms"]["candidate"]["environment"], candidate)
+        self.assertEqual(execute.call_count, 4)
+        for invocation in execute.call_args_list:
+            command, _, environment, _, _ = invocation.args
+            arm = Path(command[0]).parent.name
+            expected = {**shared, **candidate} if arm == "candidate" else shared
+            effective = {key: value for key, value in environment.items()
+                         if key.upper().startswith("KYTY_") or key.upper() == "KYTY76_LDS_SYNC"}
+            with self.subTest(arm=arm, command=command):
+                self.assertEqual(effective, expected)
+                self.assertEqual(environment["ANYPS5_REQUIRE_VULKAN"], "1")
+                self.assertEqual(environment["ANYPS5_HOST_REPORT"], "1")
+                if command[1] != "inspect":
+                    self.assertEqual(command[-4:], ["--strict", "--no-synthesize", "--repeat", "1"])
 
     def test_failed_and_build_mismatched_trials_remain_in_report(self):
         self.recipe["warmups"] = 0
