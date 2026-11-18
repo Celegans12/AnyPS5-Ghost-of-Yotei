@@ -2272,14 +2272,29 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 			if (format.buffer_format != Prospero::BufferFormat::k11_11_10UNorm) continue;
 			const auto mapping = pixel_info.target_export_mapping[export_index];
 			const auto shader_mask = render_target_mask_slot(pixel_info.target_shader_mask, slot);
+#if defined(ANYPS5_KYTY)
+			const auto& blend_control = context.GetBlendControl(slot);
+			const bool  replace       = blend_control.color_srcblend == 1u && blend_control.color_destblend == 0u &&
+			                            blend_control.color_comb_fcn == 0u;
+			const bool  blend         = blend_control.enable && !rt.info.blend_bypass && !replace;
+#else
 			const bool blend = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
+#endif
 			if (blend || (mapping.ApplyMask(target_mask) & 7u) != 7u ||
 			    (mapping.ApplyMask(shader_mask) & 7u) != 7u ||
 			    pixel_info.target_output_mode[export_index] != 9u) {
+#if defined(ANYPS5_KYTY)
+				EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
+				     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u src=%u dst=%u fcn=%u\n",
+				     slot, export_index, pixel_info.target_output_mode[export_index], target_mask,
+				     shader_mask, mapping.packed, static_cast<uint32_t>(blend), blend_control.color_srcblend,
+				     blend_control.color_destblend, blend_control.color_comb_fcn);
+#else
 				EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
 				     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u\n",
 				     slot, export_index, pixel_info.target_output_mode[export_index], target_mask,
 				     shader_mask, mapping.packed, static_cast<uint32_t>(blend));
+#endif
 			}
 			pixel_info.target_packed_unorm_mask |= 1u << export_index;
 			pixel_info.target_round_mode |= static_cast<uint8_t>(rt.info.round_mode) << export_index;
@@ -3766,6 +3781,11 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 			alpha_source = ps_input_info.alpha_blend_source;
 		}
 		static_params.blend_enable[slot] = bc.enable && !rt.info.blend_bypass;
+#if defined(ANYPS5_KYTY)
+		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
+			static_params.blend_enable[slot] = false;
+		}
+#endif
 		if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
 		    ClassifyBlendMapping(bc, colors[i].export_mapping) != BlendMappingSupport::Direct) {
 			static_params.blend_enable[slot] = false;
