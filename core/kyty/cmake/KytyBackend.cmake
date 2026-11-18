@@ -19,6 +19,26 @@ else()
     set(anyps5KytyThinLtoDefault ON)
 endif()
 option(ANYPS5_KYTY_THIN_LTO "Build kyty_gpu with ThinLTO and pre-link it with lld into one native object (Linux only)" ${anyps5KytyThinLtoDefault})
+set(ANYPS5_KYTY_PGO "" CACHE STRING "LLVM profile that optimizes kyty_gpu (-fprofile-use), text (.proftext) or indexed (.profdata), relative to the source tree or absolute; empty for none (docs/dev/KYTY_PGO.md)")
+option(ANYPS5_KYTY_PGO_GENERATE "Instrument kyty_gpu to record the profile of ANYPS5_KYTY_PGO, Linux only (docs/dev/KYTY_PGO.md)" OFF)
+set(anyps5KytyPgo "${ANYPS5_KYTY_PGO}")
+if(NOT anyps5KytyPgo STREQUAL "" AND NOT IS_ABSOLUTE "${anyps5KytyPgo}")
+    get_filename_component(anyps5KytyPgo "${anyps5KytyPgo}" ABSOLUTE BASE_DIR "${PROJECT_SOURCE_DIR}")
+endif()
+set(anyps5KytyPgoRuntime "")
+if(ANYPS5_KYTY_PGO_GENERATE)
+    if(NOT anyps5KytyPgo STREQUAL "")
+        message(FATAL_ERROR "ANYPS5_KYTY_PGO_GENERATE records a profile and ANYPS5_KYTY_PGO reads one: set only one of them")
+    endif()
+    if(WIN32)
+        message(FATAL_ERROR "ANYPS5_KYTY_PGO_GENERATE is Linux only")
+    endif()
+    execute_process(COMMAND "${ANYPS5_KYTY_CXX_COMPILER}" --rtlib=compiler-rt -print-libgcc-file-name OUTPUT_VARIABLE anyps5KytyBuiltins OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
+    string(REPLACE "libclang_rt.builtins" "libclang_rt.profile" anyps5KytyPgoRuntime "${anyps5KytyBuiltins}")
+    if(NOT EXISTS "${anyps5KytyPgoRuntime}")
+        message(FATAL_ERROR "ANYPS5_KYTY_PGO_GENERATE links the LLVM profile runtime ${anyps5KytyPgoRuntime}, which is missing: install libclang-rt-<major>-dev")
+    endif()
+endif()
 set(anyps5KytyPlatformArgs "")
 if(WIN32)
     if(ANYPS5_KYTY_THIN_LTO)
@@ -63,6 +83,8 @@ ExternalProject_Add(kyty_gpu
         -DKYTY_GCC_INSTALL_DIR=${ANYPS5_KYTY_GCC_INSTALL_DIR}
         -DKYTY_THIN_LTO=${ANYPS5_KYTY_THIN_LTO}
         -DKYTY_THIN_LTO_JOBS=${ANYPS5_KYTY_JOBS}
+        -DKYTY_PGO_PROFILE=${anyps5KytyPgo}
+        -DKYTY_PGO_GENERATE=${ANYPS5_KYTY_PGO_GENERATE}
         ${anyps5KytyPlatformArgs}
     BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target kyty_gpu_bundle --parallel ${ANYPS5_KYTY_JOBS}
     INSTALL_COMMAND ""
@@ -108,4 +130,8 @@ else()
 endif()
 if(ANYPS5_KYTY_THIN_LTO)
     target_link_options(anyps5_kyty_gpu INTERFACE "$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:LINKER:--gc-sections>")
+endif()
+if(ANYPS5_KYTY_PGO_GENERATE)
+    target_link_libraries(anyps5_kyty_gpu INTERFACE "${anyps5KytyPgoRuntime}")
+    target_link_options(anyps5_kyty_gpu INTERFACE "LINKER:-u,__llvm_profile_runtime" "LINKER:-u,kyty_pgo_dump_anchor")
 endif()
