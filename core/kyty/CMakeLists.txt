@@ -186,6 +186,8 @@ kyty_embed_shader(gpu_blit_shaders gpu_video_out_overlay gpu_video_out_overlay.f
 kyty_embed_shader(gpu_blit_shaders gpu_imgui_hdr gpu_video_out_overlay.frag -DIMGUI_HDR=1)
 kyty_embed_shader(gpu_blit_shaders gpu_pssr_linear gpu_pssr_linear.comp)
 kyty_embed_shader(gpu_blit_shaders gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
+kyty_embed_shader(gpu_blit_shaders gpu_fsr_easu gpu_fsr_easu.frag -I${ANYPS5_SOURCE_DIR}/3rdparty/FidelityFX-FSR/ffx-fsr)
+kyty_embed_shader(gpu_blit_shaders gpu_fsr_rcas gpu_fsr_rcas.frag -I${ANYPS5_SOURCE_DIR}/3rdparty/FidelityFX-FSR/ffx-fsr)
 add_custom_target(kyty_gpu_shaders DEPENDS ${KYTY_SHADER_HEADERS})
 
 file(GLOB_RECURSE KYTY_GPU_SOURCES CONFIGURE_DEPENDS "${KYTY_DIR}/graphics/*.cpp" "${KYTY_DIR}/common/*.cpp")
@@ -194,6 +196,7 @@ foreach(excluded IN LISTS KYTY_GPU_EXCLUDED)
     list(REMOVE_ITEM KYTY_GPU_SOURCES "${KYTY_DIR}/${excluded}")
 endforeach()
 file(GLOB_RECURSE KYTY_COMMON_SOURCES CONFIGURE_DEPENDS "${KYTY_DIR}/common/*.cpp")
+list(APPEND KYTY_GPU_EXCEPTIONS graphics/presentation/window/swapchain.cpp)
 if(WIN32)
     list(APPEND KYTY_GPU_EXCEPTIONS graphics/host_gpu/renderer/pipeline/pipelineHelpers.cpp)
 endif()
@@ -217,6 +220,7 @@ target_include_directories(kyty_gpu
         "${KYTY_DIR}"
         "${KYTY_SHIM_INCLUDE_DIR}"
         "${KYTY_GENERATED_DIR}"
+        "${ANYPS5_SOURCE_DIR}/core/libs"
 )
 target_include_directories(kyty_gpu SYSTEM
     PUBLIC
