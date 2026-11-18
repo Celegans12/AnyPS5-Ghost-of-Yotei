@@ -112,7 +112,7 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         set_tests_properties(kyty_shim_system_content PROPERTIES TIMEOUT 20)
         add_test_executable(kyty_rt_probe EXCLUDE_FROM_ALL KytyShim/tools/RtProbe.cpp KytyShim/tools/RtProbeCache.cpp KytyShim/src/Log.cpp)
         target_include_directories(kyty_rt_probe PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
-        target_link_libraries(kyty_rt_probe PRIVATE Kyty::gpu libc libzstd_static)
+        target_link_libraries(kyty_rt_probe PRIVATE Kyty::gpu libc)
         set_target_properties(kyty_rt_probe PROPERTIES CXX_EXTENSIONS OFF)
         add_test_executable(kyty_shim_rt_probe_cache_tests KytyShim/tests/RtProbeCache.cpp KytyShim/tools/RtProbeCache.cpp)
         target_include_directories(kyty_shim_rt_probe_cache_tests PRIVATE KytyShim/tools
