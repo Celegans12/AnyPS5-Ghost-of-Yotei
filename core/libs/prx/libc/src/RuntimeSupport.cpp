@@ -147,6 +147,10 @@ unsigned int APS5_VABI _ZSt14_Random_devicev_nid_postfix() {
     return value;
 }
 
+double APS5_VABI _ZSt22_Random_device_entropyv_nid_postfix() {
+    return 0.0;
+}
+
 static constexpr int ThrdNomem = 1;
 static constexpr int ThrdTimedout = 2;
 static constexpr int ThrdBusy = 3;
