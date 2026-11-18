@@ -4185,9 +4185,8 @@ bool MatchClosestWaveWalk(Program& program, PacketWalk& w) {
 	return true;
 }
 
-bool MatchClosestLeafWalk(const Program& program, PacketWalk& w) {
-	auto& s = w.shape;
-	if (!w.leaf || s.wave_node == nullptr) return false;
+bool OuterRounds(const Program& program, PacketWalk& w) {
+	auto&      s    = w.shape;
 	const auto from = [](const Inst& phi, const Block* block) { return IncomingValue(phi, block); };
 	w.outer_node    = w.header == s.header ? s.node : LoopPhi(from(*s.node, s.preheader), w.header);
 	if (w.outer_node == nullptr || Immediate(from(*w.outer_node, w.preheader)) != s.source.root) return false;
@@ -4208,11 +4207,70 @@ bool MatchClosestLeafWalk(const Program& program, PacketWalk& w) {
 	if (w.packet == nullptr && (w.lanes.IsEmpty() || !DefinedBefore(program, w.lanes, w.header))) return false;
 	const auto* exit = w.path.back();
 	const auto& term = exit->terminator;
-	if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
-	    !((term.true_block == w.merge && term.false_block == w.latch) ||
-	      (term.false_block == w.merge && term.true_block == w.latch)))
-		return false;
-	w.leaf_t = {};
+	return term.kind == CFG::TerminatorKind::ConditionalBranch &&
+	       ((term.true_block == w.merge && term.false_block == w.latch) ||
+	        (term.false_block == w.merge && term.true_block == w.latch));
+}
+
+bool MatchCandidateWalk(const Program& program, PacketWalk& w) {
+	const auto& s = w.shape;
+	if (s.blases.empty() || s.wave_header != nullptr || w.walked) return false;
+	return OuterRounds(program, w);
+}
+
+void RewriteCandidateWalk(Program& program, PacketWalk& w, uint32_t site) {
+	using Op         = ValueOpcode;
+	const auto flags = [site](auto variant) {
+		return RayQueryFlags(site, static_cast<uint32_t>(variant));
+	};
+	auto&          s     = w.shape;
+	const auto     lanes = w.packet != nullptr ? IncomingValue(*w.packet, w.preheader).Resolve() : w.lanes.Resolve();
+	const Inserter entry {w.preheader, w.preheader->end()};
+	const auto     native =
+	    entry(Op::RayQueryInit,
+	          {s.ray[0], s.ray[1], s.ray[2], s.ray[3], s.ray[4], s.ray[5], w.t_max, RayMask(s), s.tlas[0], s.tlas[1],
+	           Value(0u), lanes, Value(true), Value(false), Value(true)},
+	          flags(RayQueryInitBothFacings | RayQueryInitAllCandidates));
+	const auto ballot = entry(Op::Ballot, {native});
+	const auto any =
+	    entry(Op::INotEqual32,
+	          {entry(Op::BitwiseOr32, {entry(Op::CompositeExtractU32x4, {ballot, Value(0u)}),
+	                                   entry(Op::CompositeExtractU32x4, {ballot, Value(1u)})}),
+	           Value(0u)});
+	const auto round = [&](const Inserter& at, Block* from, bool first) {
+		const auto     next  = at(Op::RayQueryNext, {}, flags(0u));
+		const auto     match = at(Op::RayQueryMatch, {}, flags(0u));
+		const auto     has   = at(Op::INotEqual32, {at(Op::CompositeExtractU32x4, {next, Value(2u)}), Value(0u)});
+		const auto     node  = Incoming(*w.outer_node, from);
+		const Inserter end {from, from->end()};
+		const auto     taken = first ? end(Op::LogicalAnd, {any, has}) : any;
+		w.outer_node->SetArg(node, end(Op::SelectU32, {taken, at(Op::CompositeExtractU32x4, {next, Value(0u)}),
+		                                               w.outer_node->Arg(node)}));
+		if (w.packet != nullptr) {
+			const auto packet = Incoming(*w.packet, from);
+			w.packet->SetArg(packet, end(Op::SelectU1, {any, match, w.packet->Arg(packet)}));
+		}
+		return has;
+	};
+	(void)round(entry, w.preheader, true);
+	auto*          exit       = w.path.back();
+	const auto [ref, negated] = BranchCondition(*exit);
+	const Inserter at {exit, Position(*ref)};
+	at(Op::RayQueryMark, {}, flags(RayQueryMarkKind::Resolve));
+	const auto has            = round(at, w.latch, false);
+	const bool leaves_on_true = exit->terminator.true_block == w.merge;
+	ref->SetArg(0, at(Op::SelectU1, {any, leaves_on_true != negated ? at(Op::LogicalNot, {has}) : has, ref->Arg(0)}));
+	const Inserter after {w.merge, AfterPhis(*w.merge)};
+	after(Op::RayQueryMark, {}, flags(RayQueryMarkKind::Exit));
+	RewriteBlasWalks(program, s.blases, any, flags(0u));
+}
+
+bool MatchClosestLeafWalk(const Program& program, PacketWalk& w) {
+	auto& s = w.shape;
+	if (!w.leaf || s.wave_node == nullptr || !OuterRounds(program, w)) return false;
+	const auto  from = [](const Inst& phi, const Block* block) { return IncomingValue(phi, block); };
+	const auto* exit = w.path.back();
+	w.leaf_t         = {};
 	for (auto& inst: *w.header) {
 		if (inst.GetOpcode() != ValueOpcode::Phi || from(inst, w.preheader).Resolve() != w.t_max.Resolve()) continue;
 		const auto* kept = from(inst, w.latch).Resolve().TryInstruction();
@@ -5382,7 +5440,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 	const auto mark = [](Inst* bvh) {
 		bvh->SetFlags(bvh->Flags<uint32_t>() | BvhIntersectNative);
 	};
-	enum class Kind { Entry, ClosestLane, ClosestOpaque, ClosestLeaf, PacketLane, Flat, LaneMask };
+	enum class Kind { Entry, ClosestLane, ClosestOpaque, ClosestLeaf, PacketLane, Flat, LaneMask, Candidate };
 	struct Walk {
 		Kind         kind = Kind::LaneMask;
 		PacketWalk   packet;
@@ -5416,6 +5474,9 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 				found     = !walk.packet.leaf || MatchClosestLeafWalk(program, walk.packet);
 			} else if (MatchPacketLaneWalk(program, walk.packet) || MatchPacketWaveWalk(program, walk.packet)) {
 				walk.kind = Kind::PacketLane;
+				found     = true;
+			} else if (MatchCandidateWalk(program, walk.packet)) {
+				walk.kind = Kind::Candidate;
 				found     = true;
 			}
 		}
@@ -5488,6 +5549,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			case Kind::Flat: RewriteHitWalk(program, walk.packet, site, false); break;
 			case Kind::ClosestLane: RewriteClosestLaneWalk(program, walk.packet, site); break;
 			case Kind::ClosestLeaf: RewriteClosestLeafWalk(program, walk.packet, site); break;
+			case Kind::Candidate: RewriteCandidateWalk(program, walk.packet, site); break;
 			case Kind::LaneMask: RewriteLaneMaskWalk(program, walk.lane, site); break;
 		}
 		++result.sites;
