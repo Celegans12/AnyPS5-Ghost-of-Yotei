@@ -4247,9 +4247,23 @@ bool OuterRounds(const Program& program, PacketWalk& w, bool copies = false) {
 	if (w.packet == nullptr && (w.lanes.IsEmpty() || !DefinedBefore(program, w.lanes, w.header))) return false;
 	const auto* exit = w.path.back();
 	const auto& term = exit->terminator;
-	return term.kind == CFG::TerminatorKind::ConditionalBranch &&
-	       ((term.true_block == w.merge && term.false_block == w.latch) ||
-	        (term.false_block == w.merge && term.true_block == w.latch));
+	if (term.kind != CFG::TerminatorKind::ConditionalBranch || (term.true_block != w.merge && term.false_block != w.merge))
+		return false;
+	const auto* other = term.true_block == w.merge ? term.false_block : term.true_block;
+	if (other == w.latch) return true;
+	if (!copies) return false;
+	const auto last = BlockIndex(program, w.latch);
+	std::vector<const Block*> queue {other};
+	for (size_t at = 0; at < queue.size(); ++at) {
+		const auto index = BlockIndex(program, queue[at]);
+		if (index <= BlockIndex(program, exit) || index > last || queue.size() > 64) return false;
+		if (queue[at] == w.latch) continue;
+		for (const auto* next: queue[at]->ImmSuccessors()) {
+			if (BlockIndex(program, next) <= index) return false;
+			if (std::ranges::find(queue, next) == queue.end()) queue.push_back(next);
+		}
+	}
+	return std::ranges::find(queue, w.latch) != queue.end();
 }
 
 bool MatchCandidateWalk(const Program& program, PacketWalk& w) {
@@ -5534,9 +5548,6 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			} else if (MatchPacketLaneWalk(program, walk.packet) || MatchPacketWaveWalk(program, walk.packet)) {
 				walk.kind = Kind::PacketLane;
 				found     = true;
-			} else if (MatchCandidateWalk(program, walk.packet)) {
-				walk.kind = Kind::Candidate;
-				found     = true;
 			}
 		}
 		if (!found && MatchFlatWalk(program, *bvh, walk.packet = {})) {
@@ -5549,6 +5560,12 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			walk.kind   = Kind::LaneMask;
 			walk.header = walk.lane.header;
 			walk.latch  = walk.lane.latch;
+			found       = true;
+		}
+		if (!found && MatchPacketWalk(program, *bvh, walk.packet = {}) && MatchCandidateWalk(program, walk.packet)) {
+			walk.kind   = Kind::Candidate;
+			walk.header = walk.packet.header;
+			walk.latch  = walk.packet.latch;
 			found       = true;
 		}
 		if (found) walks.push_back(std::move(walk));
