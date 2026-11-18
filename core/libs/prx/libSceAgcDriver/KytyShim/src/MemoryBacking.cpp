@@ -962,7 +962,12 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 					MEMORY_BASIC_INFORMATION memory {};
 					if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(cursor)), &memory, sizeof(memory)) != sizeof(memory)) return false;
 					const auto region_end = std::min<uint64_t>(stop, reinterpret_cast<std::uintptr_t>(memory.BaseAddress) + memory.RegionSize);
-					if (memory.State == MEM_COMMIT && VirtualProtect(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cursor)), region_end - cursor, host_protection, &previous) == 0) return false;
+					const bool read_only_view = memory.Type == MEM_MAPPED && (memory.AllocationProtect == PAGE_READONLY || memory.AllocationProtect == PAGE_EXECUTE_READ);
+					const DWORD view_protection = !read_only_view ? host_protection
+					                              : host_protection == PAGE_READWRITE ? PAGE_READONLY
+					                              : host_protection == PAGE_EXECUTE_READWRITE ? PAGE_EXECUTE_READ
+					                                                                         : host_protection;
+					if (memory.State == MEM_COMMIT && VirtualProtect(reinterpret_cast<void*>(static_cast<std::uintptr_t>(cursor)), region_end - cursor, view_protection, &previous) == 0) return false;
 					cursor = region_end;
 				}
 			}
