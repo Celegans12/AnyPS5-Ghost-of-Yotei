@@ -2804,7 +2804,11 @@ vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, ui
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
-	const auto     full_slice_size  = info.linear_slice_stride;
+	// One layer of the guest's linear layout. ImageInfo sets linear_slice_stride for depth planes; a depth
+	// image laid out as a tiled mip chain (several levels, or a tile mode other than depth) leaves it at 0
+	// and describes its linear layout per level, which is how the tiler reads it too.
+	const auto     full_slice_size  = info.linear_slice_stride != 0 ? info.linear_slice_stride
+	                                                                : info.mip_layout[0].linear_size;
 	const auto     transfer_bytes   = DepthAspectTransferBytes(info.pixel_format);
 	const uint64_t texels_per_slice = static_cast<uint64_t>(info.pitch) * info.extent.height;
 	EXIT_NOT_IMPLEMENTED(transfer_bytes == 0 || texels_per_slice > UINT32_MAX ||
@@ -2814,7 +2818,13 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	const uint64_t guest_slice    = texels_per_slice * info.bytes_per_block;
 	EXIT_NOT_IMPLEMENTED(transfer_slice > UINT64_MAX / layers);
 	const uint64_t transfer_size = transfer_slice * layers;
-	EXIT_NOT_IMPLEMENTED(guest_slice > full_slice_size);
+	if (guest_slice > full_slice_size) {
+		EXIT("TextureCache: depth download of %ux%u (pitch %u, %u levels, %u layers, tile mode %u, format %d, "
+		     "%u bytes per block): guest slice %" PRIu64 " bytes > linear slice %" PRIu64 "\n",
+		     info.extent.width, info.extent.height, info.pitch, info.resources.levels, layers,
+		     static_cast<uint32_t>(info.tile_mode), static_cast<int>(info.pixel_format),
+		     info.bytes_per_block, guest_slice, static_cast<uint64_t>(full_slice_size));
+	}
 	if (transfer_bytes == info.bytes_per_block) {
 		if (!info.IsTiled()) {
 			const auto copies = info.BufferCopies(destination_offset);
