@@ -2804,9 +2804,6 @@ vk::Rect2D TextureCache::BeginColorRendering(Image& image, vk::Format format, ui
 void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t destination_offset) {
 	const auto&    info             = image.info;
 	const auto     layers           = info.resources.layers;
-	// One layer of the guest's linear layout. ImageInfo sets linear_slice_stride for depth planes; a depth
-	// image laid out as a tiled mip chain (several levels, or a tile mode other than depth) leaves it at 0
-	// and describes its linear layout per level, which is how the tiler reads it too.
 	const auto     full_slice_size  = info.linear_slice_stride != 0 ? info.linear_slice_stride
 	                                                                : info.mip_layout[0].linear_size;
 	const auto     transfer_bytes   = DepthAspectTransferBytes(info.pixel_format);

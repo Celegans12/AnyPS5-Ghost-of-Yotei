@@ -81,8 +81,6 @@ size_t Incoming(const Inst& phi, const Block* from) {
 	return phi.NumArgs();
 }
 
-// The value a phi takes when entered from `from`, or an empty value when `from` does not enter it: the matchers read
-// the phis of loops whose shape they are still checking, and a shape they do not know must fail the match, not stop.
 Value IncomingValue(const Inst& phi, const Block* from) {
 	const auto index = Incoming(phi, from);
 	return index < phi.NumArgs() ? phi.Arg(index) : Value {};
@@ -1911,8 +1909,6 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 				};
 				if (!bits || *bits == 0u ||
 				    (!above && std::ranges::none_of(test->Uses(), [&](const Use& u) {
-					     // Only the two-operand comparisons are read: the tested value may also feed a unary
-					     // instruction, or the third operand of a select, where 1 - operand is no operand.
 					     const auto op = u.user->GetOpcode();
 					     if (op != ValueOpcode::INotEqual32 && !(bit && op == ValueOpcode::IEqual32)) return false;
 					     const auto other = Immediate(u.user->Arg(1 - u.operand));

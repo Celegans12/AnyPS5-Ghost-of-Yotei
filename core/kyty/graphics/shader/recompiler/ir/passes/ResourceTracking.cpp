@@ -5510,10 +5510,6 @@ private:
 				} else if (m_program.stage == ShaderType::Compute && handle != nullptr &&
 				           memory.kind == ResourceKind::Buffer && memory.SupportsIndirectBufferWrite(op) &&
 				           DerivesFromMemory(*handle)) {
-					// A V# read from memory (for example a descriptor table read with vector loads and made
-					// uniform by a v_readlane loop) writes through its device address like a FLAT store: the
-					// written pages come back through the BDA write records. User-data bases, when the V#
-					// derives from them, only pre-cache its reach.
 					CollectDmaBase(*handle, true);
 					m_program.has_address_writes = true;
 				} else if (memory.kind != (op == ValueOpcode::ReadConstBuffer ? ResourceKind::ScalarBuffer
