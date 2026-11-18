@@ -1,3 +1,6 @@
+> **AnyKyty** is AnyPS5 with the Kyty graphics core: **182.9 FPS** in Subnautica uncapped, against 112.4 for native Kyty on the same PC (Ryzen 9 7950X3D, RTX 4080 SUPER).
+> Linux and Windows, built from source. Contributors and game reports are welcome: **[the AnyKyty page](docs/user/ANYKYTY.md)** has the numbers, the build commands, the settings and how to contribute.
+
 # AnyKyty
 
 **AnyKyty is this fork's branch: AnyPS5 running the Kyty graphics core as a second GPU backend.** It is experimental (v0). The upstream AnyPS5 README follows [below](#about).
