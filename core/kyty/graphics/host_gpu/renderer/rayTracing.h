@@ -8,11 +8,14 @@
 #include "graphics/host_gpu/vulkanCommon.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <map>
 #include <memory>
+#include <mutex>
+#include <optional>
 #include <span>
 #include <tuple>
 #include <unordered_map>
@@ -131,6 +134,13 @@ public:
 
 	[[nodiscard]] uint64_t ContextAddress() const noexcept { return m_context_address; }
 	[[nodiscard]] vk::Buffer ContextBuffer() const noexcept;
+	struct PreparationOutcome {
+		uint32_t missing;
+		bool     uncached;
+		bool     full;
+	};
+	[[nodiscard]] uint64_t LastPreparation() const noexcept { return m_preparations.load(std::memory_order_acquire); }
+	[[nodiscard]] std::optional<PreparationOutcome> Outcome(uint64_t preparation) const;
 
 	static constexpr uint32_t MaxContexts = 4;
 	static constexpr uint64_t EvictFrames = 1800;
@@ -248,6 +258,7 @@ private:
 		uint32_t                source_key  = 0;
 		uint64_t                frame       = 0;
 		uint64_t                shader_hash = 0;
+		uint64_t                preparation = 0;
 	};
 
 	void CreatePipelines();
@@ -310,6 +321,9 @@ private:
 
 	std::array<Readback, 32> m_readbacks;
 	uint32_t                m_readback_index = 0;
+	std::atomic<uint64_t>   m_preparations {0};
+	mutable std::mutex      m_outcome_mutex;
+	std::array<std::pair<uint64_t, PreparationOutcome>, 64> m_outcomes {};
 
 	Common::Mutex             m_mutex;
 	std::vector<PendingSlot>  m_new_slots;

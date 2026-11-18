@@ -54,6 +54,8 @@ private:
 		uint32_t            clean      = 0;
 		uint32_t            strikes    = 0;
 		uint32_t            skipped    = 0;
+		uint32_t            transient  = 0;
+		double              transient_max = 0.0;
 		bool                fallback   = false;
 		bool                verified   = false;
 		std::string         unreplayable;
@@ -66,6 +68,7 @@ private:
 		uint32_t outputs = 0;
 		uint64_t index   = 0;
 		bool     counted = false;
+		uint64_t preparation = 0;
 	};
 
 	bool     Prepare();
@@ -89,6 +92,7 @@ private:
 	uint64_t                               m_region   = 0;
 	uint64_t                               m_hash     = 0;
 	uint32_t                               m_slot     = UINT32_MAX;
+	uint64_t                               m_prepared = 0;
 	bool                                   m_active   = false;
 	bool                                   m_ready    = false;
 	bool                                   m_loaded   = false;

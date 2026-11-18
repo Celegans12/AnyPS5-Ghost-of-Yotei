@@ -123,6 +123,10 @@ void RayTracingCheck::Load() {
 		for (std::string token; fields >> token;) {
 			if (token.starts_with("checks=")) {
 				program.checks = static_cast<uint32_t>(std::strtoul(token.c_str() + 7, nullptr, 10));
+			} else if (token.starts_with("transient=")) {
+				char* rest            = nullptr;
+				program.transient     = static_cast<uint32_t>(std::strtoul(token.c_str() + 10, &rest, 10));
+				program.transient_max = rest != nullptr && *rest == '/' ? std::strtod(rest + 1, nullptr) : 0.0;
 			} else if (token.starts_with("reason=")) {
 				std::string rest;
 				std::getline(fields, rest);
@@ -158,7 +162,7 @@ void RayTracingCheck::Save() const {
 	}
 	std::vector<std::pair<uint64_t, const Program*>> rows;
 	for (const auto& [hash, program]: m_programs) {
-		if (program.fallback || program.verified || !program.unreplayable.empty()) {
+		if (program.fallback || program.verified || !program.unreplayable.empty() || program.transient != 0) {
 			rows.emplace_back(hash, &program);
 		}
 	}
@@ -170,10 +174,16 @@ void RayTracingCheck::Save() const {
 	{
 		std::ofstream out(temporary, std::ios::trunc);
 		for (const auto& [hash, program]: rows) {
-			const auto* state = program->fallback ? "fallback" : program->verified ? "verified" : "unreplayable";
+			const auto* state = program->fallback       ? "fallback"
+			                    : program->verified     ? "verified"
+			                    : !program->unreplayable.empty() ? "unreplayable"
+			                                                     : "checking";
 			auto        row   = fmt::format("{} {} checks={}", Hash(hash), state, program->checks);
 			if (!program->fractions.empty()) {
 				row += " fractions=" + Compact(program->fractions);
+			}
+			if (program->transient != 0) {
+				row += fmt::format(" transient={}/{:.3g}", program->transient, program->transient_max);
 			}
 			if (!program->unreplayable.empty() && !program->fallback && !program->verified) {
 				row += " reason=" + program->unreplayable;
@@ -284,6 +294,7 @@ bool RayTracingCheck::Sample(const ShaderModule& module, const CommandBuffer& bu
 	m_slot          = slot;
 	m_hash          = hash;
 	m_active        = true;
+	m_prepared      = m_context.GetRayTracing()->LastPreparation();
 	return true;
 }
 
@@ -423,8 +434,10 @@ void RayTracingCheck::AfterOracle(const PreparedBindings&, bool counted) {
 		scheduler.Current().Handle().copyBuffer(context, m_results->Handle(), 1, &copy);
 	}
 	{
+		const auto      preparation = m_context.GetRayTracing()->LastPreparation();
 		std::lock_guard lock(m_mutex);
-		m_pending[m_slot].counted = counted;
+		m_pending[m_slot].counted     = counted;
+		m_pending[m_slot].preparation = counted && preparation != m_prepared ? preparation : 0;
 	}
 	Copy(scheduler.Current().Handle(), m_outputs, RegionBytes, false);
 	Barrier(scheduler.Current().Handle());
@@ -531,6 +544,21 @@ void RayTracingCheck::Finish(uint32_t slot) {
 	const double fraction  = pending.dwords == 0 ? 0.0 : static_cast<double>(differ) / static_cast<double>(pending.dwords);
 	const double threshold = Config::RayTracingCheckPpm() / 1e6;
 	const bool   over      = fraction > threshold;
+	const auto   outcome   = pending.preparation == 0 ? std::nullopt
+	                                                  : m_context.GetRayTracing()->Outcome(pending.preparation);
+	if (outcome && (outcome->missing != 0 || outcome->uncached || outcome->full)) {
+		program.transient++;
+		program.transient_max = std::max(program.transient_max, fraction);
+		Note(fmt::format("[RT] check {}: dispatch {}: {} of {} output dwords differ ({:.3g}), transient: the host TLAS of "
+		                 "this dispatch was incomplete ({} instances without a BLAS{}{}), not judged; {} transient checks so "
+		                 "far, worst {:.3g}",
+		                 Hash(pending.hash), pending.index, differ, pending.dwords, fraction, outcome->missing,
+		                 outcome->uncached ? ", TLAS memory not cached yet" : "",
+		                 outcome->full ? ", more instances than the host holds" : "", program.transient,
+		                 program.transient_max));
+		Save();
+		return;
+	}
 	program.checks++;
 	program.strikes = over ? program.strikes + 1 : 0;
 	program.clean += over ? 0 : 1;

@@ -881,6 +881,15 @@ void RayTracing::CreateBuffers() {
 	m_context_address = m_context_table->BufferDeviceAddress();
 }
 
+std::optional<RayTracing::PreparationOutcome> RayTracing::Outcome(uint64_t preparation) const {
+	std::lock_guard lock(m_outcome_mutex);
+	const auto&     entry = m_outcomes[preparation % m_outcomes.size()];
+	if (preparation == 0 || entry.first != preparation) {
+		return std::nullopt;
+	}
+	return entry.second;
+}
+
 vk::Buffer RayTracing::ContextBuffer() const noexcept {
 	return m_context_table != nullptr ? m_context_table->Handle() : vk::Buffer {};
 }
@@ -1776,7 +1785,9 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 	              vk::PipelineStageFlagBits2::eAllCommands,
 	              vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
-	readback.tick = m_scheduler.CurrentTick();
+	readback.tick        = m_scheduler.CurrentTick();
+	readback.preparation = m_preparations.load(std::memory_order_relaxed) + 1;
+	m_preparations.store(readback.preparation, std::memory_order_release);
 	m_scheduler.DeferHostOperation([this, &readback] { ProcessReadback(readback); });
 	m_readback_index = (m_readback_index + 1) % m_readbacks.size();
 }
@@ -1787,6 +1798,13 @@ void RayTracing::ProcessReadback(Readback& readback) {
 	RtState     state {};
 	std::memcpy(&state, bytes, sizeof(state));
 	const auto               missing_count = std::min(state.missing_count, MissingCapacity);
+	{
+		std::lock_guard outcome(m_outcome_mutex);
+		m_outcomes[readback.preparation % m_outcomes.size()] = {
+		    readback.preparation,
+		    {state.missing_count, state.dispatch[1] != 0 && (state.overflow & StateUnmapped) != 0,
+		     (state.overflow & StateFull) != 0}};
+	}
 	std::vector<PendingSlot> pending;
 	std::vector<uint32_t>    retry;
 	Common::LockGuard        lock(m_mutex);
