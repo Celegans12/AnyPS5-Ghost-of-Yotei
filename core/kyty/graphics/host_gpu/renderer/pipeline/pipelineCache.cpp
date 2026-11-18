@@ -2916,7 +2916,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
 #if defined(ANYPS5_KYTY)
 	if (m_libraries != nullptr &&
-	    (m_libraries->OptimizedReady() != m_optimized_seen || !m_optimized_deferred.empty())) {
+	    (m_libraries->OptimizedReady() != m_optimized_seen ||
+	     (!m_optimized_deferred.empty() &&
+	      m_graphics_pipelines.size() + m_native_graphics_pipelines.size() != m_optimized_scanned))) {
 		ApplyOptimizedPipelines();
 	}
 #endif
@@ -3298,6 +3300,7 @@ void PipelineCache::ApplyOptimizedPipelines() {
 		found->second.pipeline = optimized.pipeline;
 		return true;
 	});
+	m_optimized_scanned = m_graphics_pipelines.size() + m_native_graphics_pipelines.size();
 }
 
 bool PipelineCache::PreparesGraphicsLibraries() const {

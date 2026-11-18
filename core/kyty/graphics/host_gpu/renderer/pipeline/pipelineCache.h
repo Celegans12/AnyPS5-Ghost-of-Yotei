@@ -641,6 +641,7 @@ private:
 	std::vector<vk::Pipeline>              m_retired_pipelines;
 	std::vector<OptimizedGraphicsPipeline> m_optimized_deferred;
 	uint64_t                               m_optimized_seen = 0;
+	size_t                                 m_optimized_scanned = 0;
 	bool CreateGraphicsPipelineFast(Pipeline& pipeline, const GraphicsPipelineKey& key,
 	                                const std::array<const ShaderModule*, 4>& stages);
 	void ApplyOptimizedPipelines();
