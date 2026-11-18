@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/KytyShim/src/Runtime.hpp"
 #include "prx/libSceAgcDriver/KytyShim/src/NativeRt.hpp"
+#include "prx/libSceAgcDriver/KytyShim/src/ShaderCachePolicy.hpp"
 #include "prx/libSceVideoOut/include/VblankSchedule.hpp"
 
 #include "common/assert.h"
@@ -132,6 +133,7 @@ Options OptionsFromEnvironment(std::string& applied) {
         if (text != "0" && text != "1") EXIT("KytyShim: %s=%s is neither 0 nor 1\n", flag.variable, value);
         options.*flag.field = text == "1";
     }
+    options.shader_cache_enabled = ResolveShaderCacheEnabled(options.shader_cache_enabled, Read("ANYPS5_NO_SHADER_CACHE", applied));
     const char* nativeRt = Read("KYTY_NATIVE_RT", applied);
     const auto mode = NativeRt::ParseMode(nativeRt);
     if (!mode.has_value()) EXIT("KytyShim: KYTY_NATIVE_RT=%s is neither 0 nor 1\n", nativeRt);
