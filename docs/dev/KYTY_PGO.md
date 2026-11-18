@@ -6,10 +6,11 @@ call targets the profile counted while titles ran. The profile is an input of th
 option, so the same step applies whatever builds the core.
 
 The repository keeps one, `core/kyty/pgo/kyty_gpu.proftext`, and the kyty build uses it by default. Its first line says what
-recorded it. Measured on Linux against the same commit without a profile, with a first profile recorded from Subnautica frame
-captures only, in Stray, a title that profile did not include: the execution, resolve and command processor threads spend 8 to
-11 % less CPU per draw, the recording thread 1 % less, the frames are the same, and the frame rate gains 2 %, as Stray is close
-to the GPU's limit in that scene. The profile kept adds a minute of Stray and of Subnautica played in game.
+recorded it. Measured on Linux against the same commit without a profile, one pass per arm, the same scene and the same machine
+for both arms of a pair, with the profile recorded from two frame replays and a minute in game of Stray, Subnautica and an
+open-world AAA title in both of its graphics modes: Stray runs at 84.25 frames per second instead of 78.04 (+7.96 %), and the
+busiest thread of the driver, the execution thread, spends 14.5 % less CPU per draw; the AAA title in its high fidelity mode runs at
+52.83 instead of 49.03 (+7.73 %), 5.7 % less CPU per draw on that thread.
 
 ## Building with the profile
 
