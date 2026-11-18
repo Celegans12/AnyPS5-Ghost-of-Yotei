@@ -81,6 +81,13 @@ size_t Incoming(const Inst& phi, const Block* from) {
 	return phi.NumArgs();
 }
 
+// The value a phi takes when entered from `from`, or an empty value when `from` does not enter it: the matchers read
+// the phis of loops whose shape they are still checking, and a shape they do not know must fail the match, not stop.
+Value IncomingValue(const Inst& phi, const Block* from) {
+	const auto index = Incoming(phi, from);
+	return index < phi.NumArgs() ? phi.Arg(index) : Value {};
+}
+
 void Collect(Value value, const Block* header, std::unordered_set<const Inst*>& reached) {
 	const auto* inst = value.Resolve().TryInstruction();
 	if (inst == nullptr || !reached.insert(inst).second) return;
@@ -185,11 +192,11 @@ struct Traversal: Loop {
 };
 
 Value Entry(const Loop& t, const Inst& phi) {
-	return phi.Arg(Incoming(phi, t.preheader));
+	return IncomingValue(phi, t.preheader);
 }
 
 Value Back(const Loop& t, const Inst& phi) {
-	return phi.Arg(Incoming(phi, t.latch));
+	return IncomingValue(phi, t.latch);
 }
 
 Inst* HeaderPhi(const Loop& t, Value value) {
@@ -1040,7 +1047,7 @@ bool MatchWalk(const Program& program, Inst& bvh, std::span<Inst* const> interse
 			Inst* exit = nullptr;
 			for (auto& inst: *vote) {
 				if (inst.GetOpcode() != ValueOpcode::Phi ||
-				    inst.Arg(Incoming(inst, enter)) != Value(value)) {
+				    IncomingValue(inst, enter) != Value(value)) {
 					continue;
 				}
 				if (exit != nullptr) return false;
@@ -1667,7 +1674,7 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 	const Inst* intersect = nullptr;
 	if (!w.blases.empty()) {
 		const auto& blas = w.blases.front();
-		root_value       = blas.node->Arg(Incoming(*blas.node, blas.preheader));
+		root_value       = IncomingValue(*blas.node, blas.preheader);
 		for (const auto& use: blas.node->Uses()) {
 			if (use.user->GetOpcode() == ValueOpcode::MakeImageAddress && use.operand == 0)
 				intersect = use.user;
@@ -1904,9 +1911,13 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 				};
 				if (!bits || *bits == 0u ||
 				    (!above && std::ranges::none_of(test->Uses(), [&](const Use& u) {
+					     // Only the two-operand comparisons are read: the tested value may also feed a unary
+					     // instruction, or the third operand of a select, where 1 - operand is no operand.
+					     const auto op = u.user->GetOpcode();
+					     if (op != ValueOpcode::INotEqual32 && !(bit && op == ValueOpcode::IEqual32)) return false;
 					     const auto other = Immediate(u.user->Arg(1 - u.operand));
-					     return ((u.user->GetOpcode() == ValueOpcode::INotEqual32 && other == 0u) ||
-					             (bit && u.user->GetOpcode() == ValueOpcode::IEqual32 && other == 1u)) &&
+					     return ((op == ValueOpcode::INotEqual32 && other == 0u) ||
+					             (bit && op == ValueOpcode::IEqual32 && other == 1u)) &&
 					            !in_leaf(u.user);
 				     }))) {
 					continue;
@@ -2022,7 +2033,7 @@ bool ReachingValues(Value value, const BranchFacts& facts, std::vector<Value>& f
 				edge.emplace_back(condition, value_there);
 				continue;
 			}
-			const auto [incoming, negated] = Literal(fact->Arg(Incoming(*fact, from)));
+			const auto [incoming, negated] = Literal(IncomingValue(*fact, from));
 			const auto decided             = Decided(incoming, {});
 			holds                          = holds && (!decided || *decided == (value_there != negated));
 			edge.emplace_back(incoming, value_there != negated);
@@ -2105,8 +2116,8 @@ bool MatchLaneMaskWalk(Program& program, Inst& bvh, LaneMaskWalk& w) {
 	w.bvh    = &bvh;
 	w.header = EnclosingLoop(program, bvh.Parent());
 	if (!LoopShape(w.header, w.preheader, w.latch, w.merge)) return false;
-	const auto entry = [&](const Inst& phi) { return phi.Arg(Incoming(phi, w.preheader)); };
-	const auto back  = [&](const Inst& phi) { return phi.Arg(Incoming(phi, w.latch)); };
+	const auto entry = [&](const Inst& phi) { return IncomingValue(phi, w.preheader); };
+	const auto back  = [&](const Inst& phi) { return IncomingValue(phi, w.latch); };
 	w.node          = LoopPhi(Canonical(address->Arg(0)), w.header);
 	const auto root = w.node != nullptr ? Immediate(entry(*w.node)) : std::nullopt;
 	if (!root) return false;
@@ -2179,7 +2190,7 @@ void RewriteBlasWalks(Program& program, std::vector<BlasWalk>& blases, Value any
 	using Op = ValueOpcode;
 	for (auto& b: blases) {
 		const Inserter pre {b.preheader, b.preheader->end()};
-		const auto     lanes = b.lanes.front()->Arg(Incoming(*b.lanes.front(), b.preheader));
+		const auto     lanes = IncomingValue(*b.lanes.front(), b.preheader);
 		const auto     index =
 		    pre(Op::ShiftRightLogical32, {pre(Op::RayQuerySelectedLeaf, {}, lane_leaf), Value(3u)});
 		const auto& guest = *Producer(b.load->Arg(0), ValueOpcode::GetBufferResource);
@@ -2365,7 +2376,7 @@ Value WaveRoot(const Program& program, const Inst* address, const Block* header,
 	if (node == nullptr) {
 		const auto* top   = Producer(nodes[0], ValueOpcode::ReadLane);
 		const auto* stack = top != nullptr ? LoopPhi(top->Arg(0), header) : nullptr;
-		const auto* push  = stack != nullptr ? Producer(stack->Arg(Incoming(*stack, pre)), ValueOpcode::WriteLane) : nullptr;
+		const auto* push  = stack != nullptr ? Producer(IncomingValue(*stack, pre), ValueOpcode::WriteLane) : nullptr;
 		const auto  low6  = [](Value value) {
 			const auto pair = Operands(value, ValueOpcode::BitwiseAnd32, [](Value side) { return Immediate(side) == 63u; });
 			return pair ? Canonical(pair->second) : Value {};
@@ -2374,7 +2385,7 @@ Value WaveRoot(const Program& program, const Inst* address, const Block* header,
 		const auto  below = !index.IsEmpty() ? Operands(index, ValueOpcode::IAdd32, [](Value side) { return Immediate(side) == ~0u; })
 		                                     : std::nullopt;
 		const auto* sp    = below ? LoopPhi(below->second, header) : nullptr;
-		const auto  above = sp != nullptr ? Operands(sp->Arg(Incoming(*sp, pre)), ValueOpcode::IAdd32,
+		const auto  above = sp != nullptr ? Operands(IncomingValue(*sp, pre), ValueOpcode::IAdd32,
 		                                             [](Value side) { return Immediate(side) == 1u; })
 		                                  : std::nullopt;
 		if (push == nullptr || !above || low6(push->Arg(2)).IsEmpty() || low6(push->Arg(2)) != Canonical(above->second))
@@ -2382,7 +2393,7 @@ Value WaveRoot(const Program& program, const Inst* address, const Block* header,
 		root = push->Arg(1).Resolve();
 	}
 	if (phi != nullptr) *phi = const_cast<Inst*>(node);
-	return node != nullptr ? node->Arg(Incoming(*node, pre)) : root;
+	return node != nullptr ? IncomingValue(*node, pre) : root;
 }
 
 bool MatchWaveBlas(const Program& program, std::span<Inst* const> tests, uint32_t box, LaneMaskWalk& s) {
@@ -2700,7 +2711,7 @@ bool MatchEntryWalk(Program& program, const NativeTraversalOptions& options, Pac
 	s.layout.flags_dword = 15;
 	s.layout.flags_shift = 0;
 	s.source.layout      = s.layout.Pack();
-	const auto record = LoadOf(program, Canonical(blas.node->Arg(Incoming(*blas.node, blas.preheader))));
+	const auto record = LoadOf(program, Canonical(IncomingValue(*blas.node, blas.preheader)));
 	if (!record) return false;
 	const auto kind_of = [&](const Inst* value) -> std::optional<RayQueryResultKind> {
 		if (value == record->low.TryInstruction()) return RayQueryResultKind::InstanceLo;
@@ -3317,7 +3328,7 @@ bool MatchClosestOpaqueWalk(Program& program, PacketWalk& w) {
 			}
 		}
 	}
-	const auto record = LoadOf(program, Canonical(blas.node->Arg(Incoming(*blas.node, blas.preheader))));
+	const auto record = LoadOf(program, Canonical(IncomingValue(*blas.node, blas.preheader)));
 	if (bvh == nullptr || !record) return false;
 	const auto kind_of = [&](const Inst* value) -> std::optional<RayQueryResultKind> {
 		if (value == record->low.TryInstruction()) return RayQueryResultKind::InstanceLo;
@@ -3953,7 +3964,7 @@ bool MatchClosestWaveWalk(Program& program, PacketWalk& w) {
 bool MatchClosestLeafWalk(const Program& program, PacketWalk& w) {
 	auto& s = w.shape;
 	if (!w.leaf || s.wave_node == nullptr) return false;
-	const auto from = [](const Inst& phi, const Block* block) { return phi.Arg(Incoming(phi, block)); };
+	const auto from = [](const Inst& phi, const Block* block) { return IncomingValue(phi, block); };
 	w.outer_node    = w.header == s.header ? s.node : LoopPhi(from(*s.node, s.preheader), w.header);
 	if (w.outer_node == nullptr || Immediate(from(*w.outer_node, w.preheader)) != s.source.root) return false;
 	const auto  popped = from(*w.outer_node, w.latch);
@@ -4010,7 +4021,7 @@ void RewriteClosestLeafWalk(Program& program, PacketWalk& w, uint32_t site) {
 		return RayQueryFlags(site, static_cast<uint32_t>(variant));
 	};
 	auto&      s     = w.shape;
-	const auto lanes = w.packet->Arg(Incoming(*w.packet, w.preheader)).Resolve();
+	const auto lanes = IncomingValue(*w.packet, w.preheader).Resolve();
 	const auto first = BlockIndex(program, w.header), last = BlockIndex(program, w.latch);
 	const auto in_walk = [&](const Block* block) {
 		const auto at = BlockIndex(program, block);
@@ -4216,7 +4227,7 @@ bool MatchPacketLaneWalk(Program& program, PacketWalk& w) {
 			tri = &inst;
 		}
 	}
-	const auto record = LoadOf(program, Canonical(blas.node->Arg(Incoming(*blas.node, blas.preheader))));
+	const auto record = LoadOf(program, Canonical(IncomingValue(*blas.node, blas.preheader)));
 	if (tri == nullptr || !record) return false;
 	const auto kind_of = [&](const Inst* value) -> std::optional<RayQueryResultKind> {
 		if (value == record->low.TryInstruction()) return RayQueryResultKind::InstanceLo;
@@ -4876,7 +4887,7 @@ void RewriteHitWalk(Program& program, PacketWalk& w, uint32_t site, bool entry_a
 bool MatchClosestLaneWalk(Program& program, const NativeTraversalOptions& options, PacketWalk& w) {
 	auto& s = w.shape;
 	if (options.wave_size != 32 || w.header == s.header || !s.masked || s.blases.empty()) return false;
-	const auto from = [](const Inst& phi, const Block* block) { return phi.Arg(Incoming(phi, block)); };
+	const auto from = [](const Inst& phi, const Block* block) { return IncomingValue(phi, block); };
 	w.outer_node = LoopPhi(from(*s.node, s.preheader), w.header);
 	if (w.outer_node == nullptr || Immediate(from(*w.outer_node, w.preheader)) != s.source.root)
 		return false;
