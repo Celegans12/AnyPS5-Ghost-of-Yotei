@@ -1024,8 +1024,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					const auto used = snapshot.flattened_srt.size() - mapping_offset - 1u;
 					snapshot.flattened_srt.resize(mapping_offset + 1u + std::bit_ceil(std::max<size_t>(used, 1u)), 0u);
 				}
-				if (std::is_same_v<Specialization, ResourceSpecialization::Buffer> &&
-				    g_stable_indirect_layouts.load(std::memory_order_relaxed)) {
+				if (g_stable_indirect_layouts.load(std::memory_order_relaxed)) {
 					const auto children = descriptors.size() - children_begin;
 					const auto total    = std::max<size_t>(
 					    program.stage == ShaderType::Compute ? g_compute_indirect_images.load(std::memory_order_relaxed) : 1u,
