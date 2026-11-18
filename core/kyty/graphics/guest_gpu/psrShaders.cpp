@@ -122,6 +122,7 @@ bool LibraryNamed() {
 }
 
 constexpr std::array NewerOpcodes {ShaderRecompiler::Decoder::Opcode::V_PERM_B32,
+                                   ShaderRecompiler::Decoder::Opcode::V_MSAD_U8,
                                    ShaderRecompiler::Decoder::Opcode::V_CMP_U_F16};
 
 int64_t TableOpcode(ShaderRecompiler::Decoder::Opcode opcode) {
