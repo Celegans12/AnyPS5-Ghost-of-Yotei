@@ -273,6 +273,29 @@ void CommandScheduler::DeferPriorityOperation(Common::UniqueFunction<void>&&    
 	QueuePriorityOperation(TrackGuestOperation(std::move(operation), ranges));
 }
 
+#if defined(ANYPS5_KYTY)
+void CommandScheduler::DeferPriorityOperationAfter(uint64_t tick, Common::UniqueFunction<void>&& operation,
+                                                   uint64_t address, uint64_t size) {
+	CheckActive();
+	EXIT_IF(tick == 0 || tick > CurrentTick());
+	auto tracked = TrackGuestOperation(std::move(operation), address, size);
+	{
+		std::unique_lock lock(m_operation_mutex);
+		if (m_operation_state == OperationState::Open) {
+			if (!m_priority_operations.empty()) {
+				tick = std::max(tick, m_priority_operations.back().tick);
+			}
+			tick = std::max(tick, m_priority_active_tick);
+			m_priority_operations.push({std::move(tracked), tick});
+			lock.unlock();
+			m_operation_available.notify_one();
+			return;
+		}
+	}
+	QueuePriorityOperation(std::move(tracked));
+}
+#endif
+
 void CommandScheduler::DeferHostOperation(Common::UniqueFunction<void>&& operation,
                                           bool                           priority) {
 	if (priority) {

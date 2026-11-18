@@ -124,6 +124,12 @@ public:
 		std::lock_guard lock(m_mutex);
 		return !m_pending.empty();
 	}
+#if defined(ANYPS5_KYTY)
+	[[nodiscard]] uint64_t LastPendingDumpTick() const {
+		std::lock_guard lock(m_mutex);
+		return m_pending.empty() ? 0 : m_pending.back().tick;
+	}
+#endif
 	[[nodiscard]] bool Counting() const noexcept { return Enabled() && m_segments.Counting(); }
 
 	[[nodiscard]] bool PrepareRead(uint64_t address, uint64_t size);

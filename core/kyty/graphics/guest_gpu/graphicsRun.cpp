@@ -38,6 +38,7 @@
 #include <memory>
 #include <mutex>
 #include <semaphore>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <type_traits>
@@ -1107,11 +1108,17 @@ void CommandProcessor::WriteReferenceClock(uint64_t dst_address, uint32_t num_by
 			void* address = reinterpret_cast<void*>(dst_address);
 			m_renderer.PrepareGpuWrite(address, num_bytes);
 			m_deferred_labels.fetch_add(1, std::memory_order_relaxed);
+#if defined(ANYPS5_KYTY)
+			s_deferred_labels.fetch_add(1, std::memory_order_relaxed);
+#endif
 			GetScheduler().DeferPriorityOperation(
 			    [this, address, num_bytes] {
 				    const auto value = Sync::ReadReferenceClock();
 				    m_renderer.WriteFromCompletion(address, &value, num_bytes);
 				    m_deferred_labels.fetch_sub(1, std::memory_order_release);
+#if defined(ANYPS5_KYTY)
+				    s_deferred_labels.fetch_sub(1, std::memory_order_release);
+#endif
 			    },
 			    dst_address, num_bytes);
 			GetScheduler().Flush();
@@ -2685,6 +2692,20 @@ void CommandProcessor::ReleaseMem(uint32_t data_sel, uint32_t interrupt_selector
 	}
 }
 
+#if defined(ANYPS5_KYTY)
+bool CommandProcessor::LabelsAfterDumps() {
+	static const bool enabled = [] {
+		const char*            value = std::getenv("KYTY_LABELS_AFTER_DUMPS");
+		const std::string_view text {value == nullptr ? "" : value};
+		if (!text.empty() && text != "0" && text != "1") {
+			EXIT("invalid KYTY_LABELS_AFTER_DUMPS: %s (0 or 1)\n", value);
+		}
+		return text != "0";
+	}();
+	return enabled;
+}
+
+#endif
 void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void* address,
                                          uint64_t data, uint32_t interrupt_context_id) {
 	(void)CurrentBuffer().Handle();
@@ -2700,32 +2721,55 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 			LibKernel::Memory::NoteEmulatorWrite(vaddr, size);
 		}
 	};
-	if (data_sel != 0 && (m_renderer.GetOcclusionQueries().HasPendingDumps() ||
-	                      m_deferred_labels.load(std::memory_order_acquire) != 0)) {
+#if defined(ANYPS5_KYTY)
+	const auto labels_pending = [this] {
+		return (m_labels_after_dumps ? s_deferred_labels : m_deferred_labels)
+		    .load(std::memory_order_acquire);
+	};
+#else
+	const auto labels_pending = [this] { return m_deferred_labels.load(std::memory_order_acquire); };
+#endif
+	if (data_sel != 0 &&
+	    (m_renderer.GetOcclusionQueries().HasPendingDumps() || labels_pending() != 0)) {
 		const auto     vaddr = reinterpret_cast<uint64_t>(address);
 		const uint64_t size  = data_sel == 1 ? sizeof(uint32_t) : sizeof(uint64_t);
 		if (data_sel <= 3 && GuestRange {vaddr, size}.Valid() &&
 		    !m_renderer.GetBufferCache().IsRegionGpuModified(vaddr, size)) {
 			m_renderer.PrepareGpuWrite(address, size);
 			m_deferred_labels.fetch_add(1, std::memory_order_relaxed);
-			GetScheduler().DeferPriorityOperation(
-			    [this, address, data, data_sel] {
-				    if (data_sel == 1) {
-					    const auto value = static_cast<uint32_t>(data);
-					    m_renderer.WriteFromCompletion(address, &value, sizeof(value));
-				    } else {
-					    const uint64_t value = data_sel == 3 ? Sync::ReadReferenceClock() : data;
-					    m_renderer.WriteFromCompletion(address, &value, sizeof(value));
-				    }
-				    m_deferred_labels.fetch_sub(1, std::memory_order_release);
-			    },
-			    vaddr, size);
+#if defined(ANYPS5_KYTY)
+			s_deferred_labels.fetch_add(1, std::memory_order_relaxed);
+#endif
+			auto write_deferred = [this, address, data, data_sel] {
+				if (data_sel == 1) {
+					const auto value = static_cast<uint32_t>(data);
+					m_renderer.WriteFromCompletion(address, &value, sizeof(value));
+				} else {
+					const uint64_t value = data_sel == 3 ? Sync::ReadReferenceClock() : data;
+					m_renderer.WriteFromCompletion(address, &value, sizeof(value));
+				}
+				m_deferred_labels.fetch_sub(1, std::memory_order_release);
+#if defined(ANYPS5_KYTY)
+				s_deferred_labels.fetch_sub(1, std::memory_order_release);
+#endif
+			};
+#if defined(ANYPS5_KYTY)
+			if (m_labels_after_dumps) {
+				GetScheduler().DeferPriorityOperationAfter(
+				    std::max<uint64_t>(m_renderer.GetOcclusionQueries().LastPendingDumpTick(), 1),
+				    std::move(write_deferred), vaddr, size);
+			} else {
+				GetScheduler().DeferPriorityOperation(std::move(write_deferred), vaddr, size);
+			}
+#else
+			GetScheduler().DeferPriorityOperation(std::move(write_deferred), vaddr, size);
+#endif
 			if (interrupt) {
 				DeferEopInterrupt(interrupt_context_id);
 			}
 			return;
 		}
-		if (m_deferred_labels.load(std::memory_order_acquire) != 0) {
+		if (labels_pending() != 0) {
 			auto&      scheduler = GetScheduler();
 			const auto tick      = scheduler.CurrentTick();
 			scheduler.Wait(tick);
