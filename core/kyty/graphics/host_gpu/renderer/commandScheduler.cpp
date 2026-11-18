@@ -11,6 +11,11 @@
 #include <optional>
 #include <tuple>
 
+#if defined(ANYPS5_KYTY)
+#include <cstdlib>
+#include <string_view>
+#endif
+
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
@@ -137,6 +142,13 @@ void CommandScheduler::Shutdown() {
 	}
 	PopPendingOperations();
 	DrainPriorityOperations();
+#if defined(ANYPS5_KYTY)
+	DrainFlipCompletions();
+	if (m_flip_thread.joinable()) {
+		m_flip_thread.request_stop();
+		m_flip_thread.join();
+	}
+#endif
 	m_priority_thread.request_stop();
 	m_operation_available.notify_all();
 	if (m_priority_thread.joinable()) {
@@ -269,6 +281,71 @@ void CommandScheduler::DeferHostOperation(Common::UniqueFunction<void>&& operati
 		QueueOperation(std::move(operation));
 	}
 }
+
+#if defined(ANYPS5_KYTY)
+static bool EarlyFlipEnabled() {
+	static const bool enabled = [] {
+		const char*            value = std::getenv("KYTY_EARLY_FLIP");
+		const std::string_view text {value == nullptr ? "" : value};
+		if (!text.empty() && text != "0" && text != "1") {
+			EXIT("invalid KYTY_EARLY_FLIP: %s (0 or 1)\n", value);
+		}
+		return text != "0";
+	}();
+	return enabled;
+}
+
+void CommandScheduler::DeferFlipCompletion(Common::UniqueFunction<void>&& complete) {
+	CheckActive();
+	EXIT_IF(!complete);
+	const uint64_t previous = std::exchange(m_last_flip_tick, CurrentTick());
+	if (!EarlyFlipEnabled()) {
+		QueuePriorityOperation(std::move(complete));
+		return;
+	}
+	std::call_once(m_flip_thread_once, [this] {
+		m_flip_thread =
+		    std::jthread([this](std::stop_token stop) { FlipCompletionThread(stop); });
+	});
+	std::lock_guard lock(m_flip_mutex);
+	m_flip_completions.push_back({std::move(complete), m_last_flip_tick, previous});
+	m_flips_pending.store(true, std::memory_order_release);
+}
+
+void CommandScheduler::FlipCompletionThread(std::stop_token stop) {
+	for (;;) {
+		FlipCompletion flip;
+		{
+			std::unique_lock lock(m_flip_mutex);
+			if (!m_flip_changed.wait(lock, stop, [this] {
+				    return !m_flip_completions.empty() &&
+				           SubmittedTick() >= m_flip_completions.front().submitted_tick;
+			    })) {
+				return;
+			}
+			flip = std::move(m_flip_completions.front());
+			m_flip_completions.pop_front();
+			m_flips_pending.store(!m_flip_completions.empty(), std::memory_order_release);
+			m_flip_running = true;
+		}
+		if (flip.previous_tick != 0) {
+			m_master.Wait(flip.previous_tick);
+			WaitPriorityOperations(flip.previous_tick);
+		}
+		RunOperation(std::move(flip.complete));
+		{
+			std::lock_guard lock(m_flip_mutex);
+			m_flip_running = false;
+		}
+		m_flip_changed.notify_all();
+	}
+}
+
+void CommandScheduler::DrainFlipCompletions() {
+	std::unique_lock lock(m_flip_mutex);
+	m_flip_changed.wait(lock, [this] { return m_flip_completions.empty() && !m_flip_running; });
+}
+#endif
 
 Common::UniqueFunction<void>
 CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&& operation, uint64_t address,
@@ -506,6 +583,14 @@ void CommandScheduler::QueueSubmit(vk::CommandBuffer buffer, SubmitInfo& submit,
 		EXIT("vkQueueSubmit failed: %s, tick=%" PRIu64 "\n", vk::to_string(result).c_str(), tick);
 	}
 	m_submitted_tick.store(tick, std::memory_order_release);
+#if defined(ANYPS5_KYTY)
+	if (m_flips_pending.load(std::memory_order_acquire)) {
+		{
+			std::lock_guard lock(m_flip_mutex);
+		}
+		m_flip_changed.notify_all();
+	}
+#endif
 }
 
 void CommandScheduler::RecordingThread() {

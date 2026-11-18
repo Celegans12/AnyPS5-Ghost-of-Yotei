@@ -2822,9 +2822,14 @@ void CommandProcessor::Flip(int handle, int index, int flip_mode, int64_t flip_a
 		auto& command = CurrentBuffer();
 		m_renderer.GetOcclusionQueries().OnFrame();
 		auto  request = Sync::PrepareVideoOutFlip(command, handle, index, flip_mode, flip_arg);
+#if defined(ANYPS5_KYTY)
+		GetScheduler().DeferFlipCompletion(
+		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); });
+#else
 		GetScheduler().DeferHostOperation(
 		    [&renderer = m_renderer, request] { renderer.GetVideoOut().CompleteFlip(request); },
 		    true);
+#endif
 		GetScheduler().Flush();
 	});
 }
@@ -2843,8 +2848,13 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 		ProcessorScope processor_scope(*this);
 
 		m_renderer.GetVideoOut().PrepareFlip(request_id, CurrentBuffer());
+#if defined(ANYPS5_KYTY)
+		GetScheduler().DeferFlipCompletion(
+		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); });
+#else
 		GetScheduler().DeferHostOperation(
 		    [this, request_id] { m_renderer.GetVideoOut().CompleteFlip(request_id); }, true);
+#endif
 		GetScheduler().Flush();
 	});
 }
