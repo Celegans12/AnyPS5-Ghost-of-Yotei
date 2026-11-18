@@ -23,6 +23,11 @@ typedef int32_t KytyDllStatus;
 #define KYTY_DLL_ERROR 1
 #define KYTY_DLL_EOP_FLIP_ALREADY_RESERVED 2
 #define KYTY_DLL_ABI_MISMATCH 3
+#define KYTY_DLL_PROCESS_SHUTDOWN 4
+
+#define KYTY_DLL_FILTER_TRIGGER 1u
+#define KYTY_DLL_FILTER_RESET 2u
+#define KYTY_DLL_FILTER_DELETE 4u
 
 typedef struct KytyDllVideoOutput KytyDllVideoOutput;
 typedef struct KytyDllFlipRequest KytyDllFlipRequest;
@@ -73,6 +78,7 @@ typedef struct KytyDllOverlayRect {
     int32_t y;
     int32_t width;
     int32_t height;
+    uint32_t color;
 } KytyDllOverlayRect;
 
 typedef struct KytyDllKernelEvent {
@@ -92,6 +98,7 @@ typedef struct KytyDllEqueueEvent {
     const KytyDllKernelEvent* pending;
     size_t pending_count;
     KytyDllEventFilter* filter;
+    uint32_t filter_functions;
 } KytyDllEqueueEvent;
 
 typedef struct KytyDllEqueueEventState {
@@ -129,8 +136,8 @@ typedef struct KytyDllHost {
     void (*guest_allocations_add)(void* mutation, void* pointer, size_t bytes, bool readable, bool writable, bool gpu);
     void (*guest_allocations_end)(void* mutation);
     void (*kernel_note_gpu_submit)(void);
-    size_t (*kernel_available_flexible_memory_size)(void);
-    size_t (*kernel_configured_flexible_memory_size)(void);
+    int (*kernel_available_flexible_memory_size)(size_t* size);
+    int (*kernel_configured_flexible_memory_size)(size_t* size);
     uint64_t (*kernel_read_tsc)(void);
     uint64_t (*kernel_tsc_frequency)(void);
     uint64_t (*kernel_process_time)(void);
@@ -143,6 +150,7 @@ typedef struct KytyDllHost {
     void (*equeue_unpin)(KytyDllEqueue* queue);
     void (*deliver_eop_interrupt)(uint32_t queue, uint32_t context);
 
+    FILE* (*standard_output_file)(void);
     FILE* (*standard_error_file)(void);
     void (*await_exit)(void);
     void (*register_shutdown)(void (*callback)(void));
@@ -163,7 +171,7 @@ typedef struct KytyDllHost {
     KytyDllStatus (*rendering_wait)(KytyDllRenderingWait* wait);
     void (*rendering_wait_release)(KytyDllRenderingWait* wait);
     KytyDllStatus (*flip_source)(KytyDllFlipRequest* request, KytyDllDisplayBuffer* source, bool* has_source);
-    KytyDllStatus (*flip_gpu_ready)(KytyDllFlipRequest* request, uint64_t timing_id);
+    KytyDllStatus (*flip_gpu_ready)(KytyDllFlipRequest* request);
     void (*flip_fail)(KytyDllFlipRequest* request, const char* message);
     void (*flip_release)(KytyDllFlipRequest* request);
 } KytyDllHost;

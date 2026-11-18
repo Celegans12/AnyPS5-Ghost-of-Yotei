@@ -380,7 +380,7 @@ private:
 	static_assert(TRACKER_REGION_SIZE % CommandBlocks::BlockSize == 0);
 
 	inline static thread_local bool                         s_upload_takes_protections = false;
-#if defined(ANYPS5_KYTY) && defined(_WIN32) && !defined(__clang__)
+#if defined(ANYPS5_KYTY) && defined(_WIN32) && (!defined(__clang__) || defined(ANYPS5_KYTY_DLL))
 	static thread_local std::vector<DeferredProtect> s_deferred;
 #else
 	inline static thread_local std::vector<DeferredProtect> s_deferred;
