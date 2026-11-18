@@ -1,13 +1,16 @@
 #include "prx/libSceAgcDriver/KytyShim/src/Runtime.hpp"
+#include "prx/libSceAgcDriver/KytyShim/src/NativeRt.hpp"
 #include "prx/libSceVideoOut/include/VblankSchedule.hpp"
 
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
+#include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include <magic_enum.hpp>
 
+#include <atomic>
 #include <charconv>
 #include <cstdint>
 #include <cstdio>
@@ -17,11 +20,14 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace KytyShim {
 namespace {
 
 using Options = Config::ConfigOptions;
+
+std::atomic<NativeRt::Mode> nativeRtMode{NativeRt::Mode::Auto};
 
 struct Flag {
     const char* variable;
@@ -45,7 +51,6 @@ constexpr Flag Flags[] = {
     {"KYTY_TESSELLATION", &Options::tessellation_enabled},
     {"KYTY_OCCLUSION_QUERIES", &Options::occlusion_queries_enabled},
     {"KYTY_RELAXED_SHADER_FLOAT", &Options::relaxed_shader_float},
-    {"KYTY_NATIVE_RT", &Options::native_rt},
     {"KYTY_ASYNC_PIPELINES", &Options::async_pipelines_enabled},
     {"KYTY_RT_STATS", &Options::rt_stats_enabled},
     {"KYTY_COMMAND_BUFFER_DUMP", &Options::command_buffer_dump_enabled},
@@ -135,6 +140,11 @@ Options OptionsFromEnvironment(std::string& applied) {
         if (text != "0" && text != "1") EXIT("KytyShim: %s=%s is neither 0 nor 1\n", flag.variable, value);
         options.*flag.field = text == "1";
     }
+    const char* nativeRt = Read("KYTY_NATIVE_RT", applied);
+    const auto mode = NativeRt::ParseMode(nativeRt);
+    if (!mode.has_value()) EXIT("KytyShim: KYTY_NATIVE_RT=%s is neither 0 nor 1\n", nativeRt);
+    options.native_rt = *mode != NativeRt::Mode::Off;
+    nativeRtMode.store(*mode, std::memory_order_relaxed);
     for (const auto& number : Numbers) {
         const char* value = Read(number.variable, applied);
         if (value == nullptr) continue;
@@ -165,6 +175,37 @@ Options OptionsFromEnvironment(std::string& applied) {
     return options;
 }
 
+bool HasExtension(const std::vector<vk::ExtensionProperties>& extensions, std::string_view name) {
+    for (const auto& extension : extensions) {
+        if (name == extension.extensionName.data()) return true;
+    }
+    return false;
+}
+
+NativeRt::DeviceSupport QueryDeviceSupport(vk::PhysicalDevice device) {
+    std::uint32_t count = 0;
+    auto result = device.enumerateDeviceExtensionProperties(nullptr, &count, nullptr);
+    std::vector<vk::ExtensionProperties> extensions(count);
+    if (result == vk::Result::eSuccess) result = device.enumerateDeviceExtensionProperties(nullptr, &count, extensions.data());
+    extensions.resize(count);
+    if (result != vk::Result::eSuccess) EXIT("KytyShim: vkEnumerateDeviceExtensionProperties failed (%s) while checking native ray tracing\n", vk::to_string(result).c_str());
+    NativeRt::DeviceSupport support;
+    support.deferredHostOperations = HasExtension(extensions, VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);
+    support.accelerationStructureExtension = HasExtension(extensions, VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME);
+    support.rayQueryExtension = HasExtension(extensions, VK_KHR_RAY_QUERY_EXTENSION_NAME);
+    if (support.deferredHostOperations && support.accelerationStructureExtension && support.rayQueryExtension) {
+        vk::PhysicalDeviceRayQueryFeaturesKHR rayQuery{};
+        vk::PhysicalDeviceAccelerationStructureFeaturesKHR accelerationStructure{};
+        accelerationStructure.pNext = &rayQuery;
+        vk::PhysicalDeviceFeatures2 features{};
+        features.pNext = &accelerationStructure;
+        device.getFeatures2(&features);
+        support.accelerationStructureFeature = accelerationStructure.accelerationStructure == VK_TRUE;
+        support.rayQueryFeature = rayQuery.rayQuery == VK_TRUE;
+    }
+    return support;
+}
+
 }
 
 void StartRuntime() {
@@ -177,6 +218,15 @@ void StartRuntime() {
         Log::Initialize();
         std::fprintf(stderr, "[kyty] runtime started, settings: %s\n", applied.empty() ? "Kyty's defaults" : applied.c_str());
     });
+}
+
+void ReportNativeRayTracing(const Libs::Graphics::GraphicContext& graphics) {
+    const auto mode = nativeRtMode.load(std::memory_order_relaxed);
+    const bool enabled = graphics.native_ray_tracing_enabled;
+    const auto support = mode != NativeRt::Mode::Off && !enabled ? QueryDeviceSupport(graphics.physical_device) : NativeRt::DeviceSupport{};
+    const auto outcome = NativeRt::Decide(mode, enabled, graphics.physical_device_properties.deviceName.data(), support);
+    if (outcome.verdict == NativeRt::Verdict::Refused) EXIT("%s", outcome.message.c_str());
+    std::fputs(outcome.message.c_str(), stderr);
 }
 
 void RouteInterrupts(Libs::Graphics::RenderContext& renderer) {

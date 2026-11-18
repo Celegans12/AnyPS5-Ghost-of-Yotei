@@ -17,10 +17,11 @@
 #include "libs/errno.h"
 
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
-#include "prx/libSceAgcDriver/KytyShim/src/Replay.hpp"
+#include "prx/libSceAgcDriver/Execution/include/KeyboardOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/KytyShim/src/Replay.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 
 #ifdef _WIN32
@@ -29,6 +30,8 @@
 #include <dlfcn.h>
 #endif
 
+#include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -44,6 +47,7 @@
 #include <mutex>
 #include <optional>
 #include <semaphore>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -70,6 +74,7 @@ struct PendingFlip {
     int index = 0;
     std::optional<AgcDriver::DisplayBuffer> source;
     Libs::Graphics::Presenter::Frame* frame = nullptr;
+    bool dropped = false;
 };
 
 struct ReadyFlip {
@@ -340,6 +345,14 @@ void PrepareSource(PendingFlip& flip, Libs::Graphics::Presenter& presenter, Libs
     flip.frame = &presenter.PrepareFrame(buffer, info, Libs::Graphics::IsHdrVideoOutPixelFormat(flip.source->pixelFormat), false);
 }
 
+std::uint64_t DropFlip(std::uint32_t handle, int index) {
+    auto& state = State();
+    std::lock_guard lock(state.mutex);
+    const auto id = state.nextFlip++;
+    state.flips.emplace(id, PendingFlip{nullptr, handle, index, std::nullopt, nullptr, true});
+    return id;
+}
+
 std::optional<ReadyFlip> TakeReadyFlip(const void* context, Libs::Graphics::Presenter& presenter) {
     std::optional<ReadyFlip> taken;
     std::vector<Libs::Graphics::Presenter::Frame*> abandoned;
@@ -428,6 +441,9 @@ int VideoOutDriver::SubmitFlipFromGpu(Graphics::CommandBuffer& buffer, int handl
         request_id = state.nextFlip++;
         state.flips.emplace(request_id, std::move(pending));
         return OK;
+    } catch (const ProcessShutdown&) {
+        request_id = KytyShim::Present::DropFlip(static_cast<std::uint32_t>(handle), index);
+        return OK;
     } catch (...) {
         KytyShim::Present::Stop("GPU flip submission", std::current_exception());
     }
@@ -463,6 +479,10 @@ void VideoOutDriver::CompleteFlip(uint64_t request_id) {
             const auto found = state.flips.find(request_id);
             if (found == state.flips.end()) throw std::runtime_error("flip completion for an unknown request " + std::to_string(request_id));
             auto& pending = found->second;
+            if (pending.dropped) {
+                state.flips.erase(found);
+                return;
+            }
             request = std::move(pending.request);
             state.ready.push_back({request, dynamic_cast<const void*>(request.get()), pending.handle, pending.index, std::move(pending.source), pending.frame});
             state.flips.erase(found);
@@ -479,6 +499,7 @@ void VideoOutDriver::WaitForSubmitSlot(int handle) {
         const auto output = KytyShim::Entry::VideoOutput(static_cast<std::uint32_t>(handle));
         if (output == nullptr) throw std::runtime_error("flip slot wait on unregistered output " + std::to_string(handle));
         KytyShim::Present::WaitRunningUrgentCommands([output] { output->WaitForFlipRoom(); });
+    } catch (const ProcessShutdown&) {
     } catch (...) {
         KytyShim::Present::Stop("flip slot wait", std::current_exception());
     }
@@ -542,26 +563,79 @@ void WindowShutdown() {
     }
 }
 
-struct SystemOverlay::Impl {};
+struct SystemOverlay::Impl {
+    vk::Extent2D extent;
+    AgcDriver::OverlayLayout layout;
+};
 
-SystemOverlay::SystemOverlay(GraphicContext&) {
-    EXIT("the system overlay is not built with ANYPS5_GPU_BACKEND=kyty\n");
-}
+SystemOverlay::SystemOverlay(GraphicContext&): m_impl(std::make_unique<Impl>()) {}
 
 SystemOverlay::~SystemOverlay() = default;
 
-bool SystemOverlay::PrepareFrame(vk::Extent2D, vk::Format, uint32_t) {
-    EXIT("the system overlay is not built with ANYPS5_GPU_BACKEND=kyty\n");
+bool SystemOverlay::PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t) {
+    try {
+        auto layout = AgcDriver::SystemOverlayLayout(VkExtent2D{extent.width, extent.height});
+        if (!layout.has_value()) return false;
+        if (format != vk::Format::eB8G8R8A8Unorm && format != vk::Format::eR8G8B8A8Unorm) throw std::runtime_error("kyty presentation: system dialogs and the system keyboard are drawn only into an 8-bit SDR swapchain");
+        m_impl->extent = extent;
+        m_impl->layout = std::move(*layout);
+        return true;
+    } catch (...) {
+        KytyShim::Present::Stop("system overlay", std::current_exception());
+    }
 }
 
-void SystemOverlay::Record(vk::CommandBuffer, vk::ImageView) {
-    EXIT("the system overlay is not built with ANYPS5_GPU_BACKEND=kyty\n");
+void SystemOverlay::Record(vk::CommandBuffer command, vk::ImageView target) {
+    try {
+        vk::RenderingAttachmentInfo attachment{};
+        attachment.imageView = target;
+        attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+        attachment.loadOp = vk::AttachmentLoadOp::eLoad;
+        attachment.storeOp = vk::AttachmentStoreOp::eStore;
+        vk::RenderingInfo rendering{};
+        rendering.renderArea.extent = m_impl->extent;
+        rendering.layerCount = 1;
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachments = &attachment;
+        command.beginRendering(&rendering);
+        std::vector<vk::ClearRect> run;
+        std::size_t runColor = AgcDriver::OverlayColorCount;
+        const auto flush = [&] {
+            if (run.empty()) return;
+            const auto& color = AgcDriver::OverlayBasePalette[runColor];
+            vk::ClearAttachment clear{};
+            clear.aspectMask = vk::ImageAspectFlagBits::eColor;
+            clear.colorAttachment = 0;
+            clear.clearValue.color = vk::ClearColorValue(std::array<float, 4>{color[0] * color[3], color[1] * color[3], color[2] * color[3], 1.0f});
+            command.clearAttachments(1, &clear, static_cast<uint32_t>(run.size()), run.data());
+            run.clear();
+        };
+        const auto width = static_cast<std::int64_t>(m_impl->extent.width);
+        const auto height = static_cast<std::int64_t>(m_impl->extent.height);
+        for (const auto& rect : m_impl->layout.rects) {
+            const auto left = std::clamp<std::int64_t>(rect.x, 0, width);
+            const auto top = std::clamp<std::int64_t>(rect.y, 0, height);
+            const auto right = std::clamp<std::int64_t>(static_cast<std::int64_t>(rect.x) + rect.width, 0, width);
+            const auto bottom = std::clamp<std::int64_t>(static_cast<std::int64_t>(rect.y) + rect.height, 0, height);
+            if (right <= left || bottom <= top) continue;
+            const std::size_t color = rect.color < AgcDriver::OverlayColorCount ? rect.color : 0;
+            if (color != runColor) {
+                flush();
+                runColor = color;
+            }
+            run.push_back(vk::ClearRect{vk::Rect2D{{static_cast<int32_t>(left), static_cast<int32_t>(top)}, {static_cast<uint32_t>(right - left), static_cast<uint32_t>(bottom - top)}}, 0, 1});
+        }
+        flush();
+        command.endRendering();
+    } catch (...) {
+        KytyShim::Present::Stop("system overlay", std::current_exception());
+    }
 }
 
 void SystemOverlay::ReleaseVulkan() {}
 
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
-    return {false, 0};
+    return {AgcDriver::SystemOverlayShown(), 0};
 }
 
 void ShutdownSystemOverlayInput() {}
@@ -651,47 +725,87 @@ extern "C" void AgcDriverAttachWindow_nid_postfix(const AgcDriver::PresentationW
     state.attaching = false;
 }
 
+namespace KytyShim::Present {
+namespace {
+
+constexpr int OverlayBus = 1;
+
+struct GuestImage {
+    Libs::Graphics::ImageInfo info;
+    bool hdr = false;
+};
+
+std::optional<GuestImage> DescribeGuestImage(const AgcDriver::DisplayBuffer* buffer) {
+    if (buffer == nullptr) return std::nullopt;
+    return GuestImage{DisplayImageInfo(*buffer), Libs::Graphics::IsHdrVideoOutPixelFormat(buffer->pixelFormat)};
+}
+
+struct PreparedFrames {
+    std::binary_semaphore done{0};
+    std::uint64_t tick = 0;
+    Libs::Graphics::Presenter::Frame* main = nullptr;
+    Libs::Graphics::Presenter::Frame* overlay = nullptr;
+};
+
+std::shared_ptr<PreparedFrames> PrepareGuestFrames(Libs::Graphics::RenderContext& renderer, Libs::Graphics::Presenter& presenter, const std::optional<GuestImage>& main, const std::optional<GuestImage>& overlay) {
+    auto prepared = std::make_shared<PreparedFrames>();
+    renderer.GetGpu().SendUrgentCommandSync([&renderer, &presenter, main, overlay, prepared] {
+        auto& scheduler = renderer.GetCommandScheduler();
+        if (main.has_value()) prepared->main = &presenter.PrepareFrame(scheduler.Current(), main->info, main->hdr, false);
+        if (overlay.has_value()) prepared->overlay = &presenter.PrepareFrame(scheduler.Current(), overlay->info, overlay->hdr, false);
+        if (main.has_value()) scheduler.DeferHostOperation([prepared] { prepared->done.release(); }, true);
+        prepared->tick = scheduler.CurrentTick();
+        scheduler.Flush();
+    });
+    if (main.has_value()) prepared->done.acquire();
+    else renderer.GetCommandScheduler().GetMasterSemaphore().Wait(prepared->tick);
+    return prepared;
+}
+
+void PresentLayers(Libs::Graphics::Presenter& presenter, Libs::Graphics::Presenter::Frame& main, Libs::Graphics::Presenter::Frame* overlay) {
+    if (overlay == nullptr) {
+        presenter.ClearLayer(OverlayBus);
+        presenter.Present(main);
+        return;
+    }
+    const std::array<Libs::Graphics::Presenter::Layer, 2> layers{{{&main, 0, false}, {overlay, OverlayBus, true}}};
+    presenter.Present(std::span(layers));
+}
+
+}
+}
+
 extern "C" void AgcDriverPresentBuffer_nid_postfix(const AgcDriver::PresentationWindow& window, const AgcDriver::DisplayBuffer& buffer, const AgcDriver::DisplayBuffer* plane, void (*gpuReady)(void*), void* context) {
     if (gpuReady == nullptr || context == nullptr) throw std::runtime_error("kyty presentation: missing GPU completion callback");
-    if (plane != nullptr) throw std::runtime_error("kyty presentation: the overlay video plane is not presented with ANYPS5_GPU_BACKEND=kyty");
     auto& host = KytyShim::Present::AttachedWindow(window);
     KytyShim::Present::UpdateDrawableSize(host, window);
     auto& presenter = *host.presenter;
+    auto& renderer = *host.render_context;
+    const auto overlayImage = KytyShim::Present::DescribeGuestImage(plane);
     const auto flip = KytyShim::Present::TakeReadyFlip(context, presenter);
     if (flip.has_value() && flip->frame != nullptr && flip->source == buffer) {
-        presenter.Present(*flip->frame);
+        const auto overlay = overlayImage.has_value() ? KytyShim::Present::PrepareGuestFrames(renderer, presenter, std::nullopt, overlayImage) : nullptr;
+        KytyShim::Present::PresentLayers(presenter, *flip->frame, overlay != nullptr ? overlay->overlay : nullptr);
         gpuReady(context);
         return;
     }
     if (flip.has_value() && flip->frame != nullptr) presenter.Discard(*flip->frame);
-    const auto info = KytyShim::Present::DisplayImageInfo(buffer);
-    const bool hdr = Libs::Graphics::IsHdrVideoOutPixelFormat(buffer.pixelFormat);
-    struct Prepared {
-        std::binary_semaphore done{0};
-        Libs::Graphics::Presenter::Frame* frame = nullptr;
-    };
-    auto prepared = std::make_shared<Prepared>();
-    auto& renderer = *host.render_context;
-    renderer.GetGpu().SendUrgentCommandSync([&renderer, &presenter, info, hdr, prepared] {
-        auto& scheduler = renderer.GetCommandScheduler();
-        prepared->frame = &presenter.PrepareFrame(scheduler.Current(), info, hdr, false);
-        scheduler.DeferHostOperation([prepared] { prepared->done.release(); }, true);
-        scheduler.Flush();
-    });
-    prepared->done.acquire();
-    presenter.Present(*prepared->frame);
+    const auto prepared = KytyShim::Present::PrepareGuestFrames(renderer, presenter, KytyShim::Present::DescribeGuestImage(&buffer), overlayImage);
+    KytyShim::Present::PresentLayers(presenter, *prepared->main, prepared->overlay);
     gpuReady(context);
 }
 
 extern "C" void AgcDriverPresentClear_nid_postfix(const AgcDriver::PresentationWindow& window, bool opaque, const AgcDriver::DisplayBuffer* plane, void (*gpuReady)(void*), void* context) {
     if (gpuReady == nullptr || context == nullptr) throw std::runtime_error("kyty presentation: missing GPU completion callback");
-    if (plane != nullptr) throw std::runtime_error("kyty presentation: the overlay video plane is not presented with ANYPS5_GPU_BACKEND=kyty");
     if (window.width == 0 || window.height == 0) throw std::runtime_error("kyty presentation: invalid output extent");
     auto& host = KytyShim::Present::AttachedWindow(window);
     KytyShim::Present::UpdateDrawableSize(host, window);
     auto& presenter = *host.presenter;
+    const auto overlayImage = KytyShim::Present::DescribeGuestImage(plane);
     if (const auto flip = KytyShim::Present::TakeReadyFlip(context, presenter); flip.has_value() && flip->frame != nullptr) presenter.Discard(*flip->frame);
-    presenter.Present(presenter.PrepareBlankFrame(window.width, window.height, opaque));
+    auto& blank = presenter.PrepareBlankFrame(window.width, window.height, opaque);
+    const auto overlay = overlayImage.has_value() ? KytyShim::Present::PrepareGuestFrames(*host.render_context, presenter, std::nullopt, overlayImage) : nullptr;
+    KytyShim::Present::PresentLayers(presenter, blank, overlay != nullptr ? overlay->overlay : nullptr);
     gpuReady(context);
 }
 

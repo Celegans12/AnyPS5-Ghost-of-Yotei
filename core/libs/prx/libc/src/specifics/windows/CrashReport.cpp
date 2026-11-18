@@ -368,7 +368,7 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
 #if defined(ANYPS5_KYTY)
-    if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && info->ExceptionRecord->NumberParameters >= 2 && GuestArena::GuestArenaHandleGpuFault_nid_no_patch(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if ((info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) && info->ExceptionRecord->NumberParameters >= 2 && GuestArena::GuestArenaHandleGpuFault_nid_no_patch(info)) return EXCEPTION_CONTINUE_EXECUTION;
 #endif
     if (GuestArena::GuestArenaRecoverRead_nid_no_patch(info)) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* fault = info->ExceptionRecord;

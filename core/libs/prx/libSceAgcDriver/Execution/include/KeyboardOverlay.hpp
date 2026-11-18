@@ -68,6 +68,7 @@ std::int32_t DialogScale(VkExtent2D extent, const ModalDialogView& view);
 OverlayLayout LayOutDialog(const ModalDialogView& view, VkExtent2D extent);
 std::optional<ModalDialogView> SystemDialogView();
 std::optional<OverlayLayout> SystemOverlayLayout(VkExtent2D extent);
+bool SystemOverlayShown();
 
 }
 

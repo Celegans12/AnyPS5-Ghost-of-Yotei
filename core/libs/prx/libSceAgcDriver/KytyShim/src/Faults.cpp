@@ -32,6 +32,13 @@ void CompleteWalkerLoad(FaultContext& context, std::uint32_t length, std::uint32
     context.Rax = value;
     context.Rip += length;
 }
+
+void RearmGuardPage(std::uintptr_t address) {
+    MEMORY_BASIC_INFORMATION page{};
+    if (VirtualQuery(reinterpret_cast<const void*>(address), &page, sizeof(page)) != sizeof(page) || page.State != MEM_COMMIT || (page.Protect & PAGE_GUARD) != 0) return;
+    DWORD previous = 0;
+    VirtualProtect(page.BaseAddress, 1, page.Protect | PAGE_GUARD, &previous);
+}
 #else
 using FaultContext = ucontext_t;
 
@@ -89,11 +96,13 @@ bool HandleHostFault(void* exceptionPointers) {
     auto* exception = static_cast<EXCEPTION_POINTERS*>(exceptionPointers);
     if (exception == nullptr || exception->ExceptionRecord == nullptr || exception->ContextRecord == nullptr) return false;
     const auto& record = *exception->ExceptionRecord;
-    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2) return false;
+    const bool guardPage = record.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION;
+    if ((record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION && !guardPage) || record.NumberParameters < 2) return false;
     const auto access = record.ExceptionInformation[0] == 8 ? GpuAccess::Execute : record.ExceptionInformation[0] == 1 ? GpuAccess::Write : GpuAccess::Read;
-    if (Common::ResumeGuardedCopy(exception->ContextRecord)) return true;
+    if (!guardPage && Common::ResumeGuardedCopy(exception->ContextRecord)) return true;
     const DWORD lastError = GetLastError();
     const bool handled = ResolveFault(*exception->ContextRecord, access, static_cast<std::uint64_t>(record.ExceptionInformation[1]), static_cast<std::uint64_t>(exception->ContextRecord->Rip));
+    if (handled && guardPage) RearmGuardPage(static_cast<std::uintptr_t>(record.ExceptionInformation[1]));
     SetLastError(lastError);
     return handled;
 }

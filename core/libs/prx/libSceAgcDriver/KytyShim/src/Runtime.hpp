@@ -5,6 +5,7 @@
 
 namespace Libs::Graphics {
 class RenderContext;
+struct GraphicContext;
 }
 
 namespace KytyShim {
@@ -15,6 +16,8 @@ inline constexpr int FirstComputeInterruptEvent = 0x20;
 inline constexpr int ComputeInterruptEvents = 7 * 8;
 
 void StartRuntime();
+
+void ReportNativeRayTracing(const Libs::Graphics::GraphicContext& graphics);
 
 void RouteInterrupts(Libs::Graphics::RenderContext& renderer);
 

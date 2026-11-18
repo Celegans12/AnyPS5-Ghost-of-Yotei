@@ -569,6 +569,11 @@ std::optional<ImeKeyboardView> SystemOverlayView() {
     return systemOverlay;
 }
 
+bool SystemOverlayShown() {
+    std::lock_guard lock(systemOverlayMutex);
+    return systemOverlay.has_value() || systemDialog.has_value();
+}
+
 }
 
 extern "C" void AgcDriverSetSystemOverlay_nid_postfix(const ImeKeyboardView* view) {

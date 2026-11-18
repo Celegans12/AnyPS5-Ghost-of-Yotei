@@ -58,6 +58,7 @@ constexpr int PROT_WRITE = 2;
 namespace KytyShim {
 
 void StartRuntime();
+void ReportNativeRayTracing(const Libs::Graphics::GraphicContext& graphics);
 void RouteInterrupts(Libs::Graphics::RenderContext& renderer);
 void InstallFaultChain();
 void RemoveFaultChain();
@@ -95,6 +96,7 @@ void Initialize() {
     const auto width = Config::GetScreenWidth();
     const auto height = Config::GetScreenHeight();
     auto& presenter = WindowInit(width, height);
+    KytyShim::ReportNativeRayTracing(presenter.Renderer().GetGraphics());
     auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
     g_renderer = &presenter.Renderer();
     g_renderer->InitializeGpu(&video_out);
