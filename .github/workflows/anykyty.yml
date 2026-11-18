@@ -144,7 +144,13 @@ jobs:
         run: |
           g++-14 --version | head -1
           cmake --version | head -1
-          if [ "$BACKEND" = kyty ]; then command -v clang++; clang++ --version | head -1; ld.lld --version; fi
+          if [ "$BACKEND" = kyty ]; then command -v clang++; clang++ --version | head -1; ld.lld --version; "$(clang++ -print-prog-name=llvm-profdata)" --version | head -2; fi
+      - name: Check the age of the Kyty PGO profile
+        if: matrix.backend == 'kyty'
+        run: |
+          if ! python3 -I tools/kyty_pgo.py check; then
+            echo "::warning file=core/kyty/pgo/kyty_gpu.proftext::The Kyty PGO profile is older than the Kyty sources listed above; it still applies to the unchanged functions. Record it again as docs/dev/KYTY_PGO.md explains."
+          fi
       - id: ccache
         uses: hendrikmuhs/ccache-action@v1.2.24
         with:
@@ -248,7 +254,7 @@ jobs:
           path: |
             C:\winlibs
             C:\llvm
-          key: toolchain-${{ env.WINLIBS_ZIP }}-llvm-${{ env.LLVM_VERSION }}
+          key: toolchain-${{ env.WINLIBS_ZIP }}-llvm-${{ env.LLVM_VERSION }}-profdata
       - name: Download WinLibs GCC and LLVM
         if: steps.toolchain.outputs.cache-hit != 'true'
         run: |
@@ -258,7 +264,7 @@ jobs:
           curl -sSfL --retry 3 -o "$RUNNER_TEMP/llvm.exe" "https://github.com/llvm/llvm-project/releases/download/llvmorg-$LLVM_VERSION/LLVM-$LLVM_VERSION-win64.exe"
           7z x "$RUNNER_TEMP/llvm.exe" -o"$RUNNER_TEMP/llvm" > /dev/null
           mkdir -p C:/llvm/bin C:/llvm/lib
-          for tool in clang clang++ llvm-ar llvm-ranlib; do
+          for tool in clang clang++ llvm-ar llvm-ranlib llvm-profdata; do
             if [ -f "$RUNNER_TEMP/llvm/bin/$tool.exe" ]; then cp "$RUNNER_TEMP/llvm/bin/$tool.exe" C:/llvm/bin/; fi
           done
           if [ ! -f C:/llvm/bin/clang++.exe ]; then cp C:/llvm/bin/clang.exe C:/llvm/bin/clang++.exe; fi
@@ -273,6 +279,7 @@ jobs:
           command -v g++ clang clang++ cmake ninja
           g++ --version | head -1
           clang++ --version | head -1
+          llvm-profdata --version | head -2 || echo "::warning::llvm-profdata is missing from the LLVM release: kyty_gpu is built without its PGO profile"
           cmake --version | head -1
       - id: ccache
         uses: hendrikmuhs/ccache-action@v1.2.24

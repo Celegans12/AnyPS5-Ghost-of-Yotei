@@ -50,19 +50,15 @@ def fingerprint(relative):
 def find_profdata(explicit):
     if explicit:
         return explicit
-    clang = shutil.which("clang++") or shutil.which("clang")
-    names = []
-    if clang:
-        version = subprocess.run([clang, "--version"], capture_output=True, text=True).stdout
-        major = re.search(r"version (\d+)", version)
-        if major:
-            names.append(f"llvm-profdata-{major.group(1)}")
-    names.append("llvm-profdata")
-    for name in names:
-        path = shutil.which(name)
-        if path:
-            return path
-    sys.exit("kyty_pgo: no llvm-profdata on the path (install llvm-<clang major>, or pass --llvm-profdata)")
+    for compiler in ("clang++", "clang"):
+        if shutil.which(compiler):
+            path = subprocess.run([compiler, "-print-prog-name=llvm-profdata"], capture_output=True, text=True).stdout.strip()
+            if os.path.isabs(path) and os.path.exists(path):
+                return path
+    path = shutil.which("llvm-profdata")
+    if path:
+        return path
+    sys.exit("kyty_pgo: no llvm-profdata beside clang or on the path (install llvm-<clang major>, or pass --llvm-profdata)")
 
 
 def raw_profiles(inputs):
@@ -84,7 +80,7 @@ def commit():
     result = subprocess.run(["git", "-C", str(ROOT), "rev-parse", "--short=10", "HEAD"], capture_output=True, text=True)
     if result.returncode != 0:
         return "unknown"
-    dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no", "--", "core/kyty", *EXTRA_SOURCES],
+    dirty = subprocess.run(["git", "-C", str(ROOT), "status", "--porcelain", "--untracked-files=no", "--", "core/kyty/graphics", "core/kyty/common", *EXTRA_SOURCES],
                            capture_output=True, text=True).stdout.strip()
     return result.stdout.strip() + ("+changes" if dirty else "")
 

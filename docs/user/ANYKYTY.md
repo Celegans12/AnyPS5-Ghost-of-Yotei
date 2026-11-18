@@ -120,14 +120,14 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF \
 cmake --build build --target kyty_gpu libs relinker --parallel "$(nproc)"
 ```
 
-`-DANYPS5_KYTY_THIN_LTO=OFF` turns off ThinLTO and the pre-link of the Kyty core, which is on by default. The CI also builds and runs the Kyty shim tests on Linux; the exact commands are in the `linux` job of the workflow.
+`-DANYPS5_KYTY_THIN_LTO=OFF` turns off ThinLTO and the pre-link of the Kyty core, which is on by default. The Kyty core is also optimized with the profile kept in `core/kyty/pgo/` (profile-guided optimization, which needs the `llvm-profdata` of the same LLVM beside `clang`); `-DANYPS5_KYTY_PGO=` builds it without, and [the PGO document](../dev/KYTY_PGO.md) explains how to record the profile again. The CI also builds and runs the Kyty shim tests on Linux; the exact commands are in the `linux` job of the workflow.
 
 ### Windows
 
 AnyPS5 is built with MinGW-w64 GCC as usual, and `clang` and `clang++` of an LLVM release compile the Kyty core for `x86_64-w64-windows-gnu` against the headers and libstdc++ of that GCC (`ANYPS5_KYTY_SYSROOT`, by default the directory above the `bin` of `g++`). The CI uses:
 
 - [WinLibs](https://github.com/brechtsanders/winlibs_mingw/releases/tag/15.2.0posix-14.0.0-ucrt-r7) GCC 15.2.0, `winlibs-x86_64-posix-seh-gcc-15.2.0-mingw-w64ucrt-14.0.0-r7.zip`;
-- [LLVM 21.1.8](https://github.com/llvm/llvm-project/releases/tag/llvmorg-21.1.8) for Windows: `clang`, `clang++`, `llvm-ar`, `llvm-ranlib` and its `lib/clang` directory;
+- [LLVM 21.1.8](https://github.com/llvm/llvm-project/releases/tag/llvmorg-21.1.8) for Windows: `clang`, `clang++`, `llvm-ar`, `llvm-ranlib`, `llvm-profdata` and its `lib/clang` directory;
 - Git for Windows with Bash, Python 3, CMake and Ninja.
 
 Put the WinLibs and LLVM `bin` directories first on `PATH`, then, from `cmd.exe` (in PowerShell write `$env:NUMBER_OF_PROCESSORS` for `%NUMBER_OF_PROCESSORS%`):

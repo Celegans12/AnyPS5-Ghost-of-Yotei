@@ -1,23 +1,32 @@
 # Profile-guided optimization of the Kyty core
 
-The Kyty core (`kyty_gpu`, built by Clang, see [Kyty code in AnyPS5](THIRD_PARTY_KYTY.md#build)) can be compiled with an
+The Kyty core (`kyty_gpu`, built by Clang, see [Kyty code in AnyPS5](THIRD_PARTY_KYTY.md#build)) is compiled with an
 LLVM instrumentation profile (`-fprofile-use`): Clang then lays out, inlines and promotes indirect calls after the branches and
 call targets the profile counted while titles ran. The profile is an input of the build like any source file, passed by one
 option, so the same step applies whatever builds the core.
+
+The repository keeps one, `core/kyty/pgo/kyty_gpu.proftext`, and the kyty build uses it by default. Its first line says what
+recorded it. Measured on Linux against the same commit without a profile, with a first profile recorded from Subnautica frame
+captures only, in Stray, a title that profile did not include: the execution, resolve and command processor threads spend 8 to
+11 % less CPU per draw, the recording thread 1 % less, the frames are the same, and the frame rate gains 2 %, as Stray is close
+to the GPU's limit in that scene. The profile kept adds a minute of Stray and of Subnautica played in game.
 
 ## Building with the profile
 
 | Option | Meaning |
 |---|---|
-| `ANYPS5_KYTY_PGO` | Profile that optimizes `kyty_gpu`: text (`.proftext`) or indexed (`.profdata`), absolute or relative to the source tree. Empty for none. |
-| `ANYPS5_KYTY_PGO_GENERATE` | `ON` builds an instrumented `kyty_gpu` that records a profile (Linux only). Excludes `ANYPS5_KYTY_PGO`. |
+| `ANYPS5_KYTY_PGO` | Profile that optimizes `kyty_gpu`: text (`.proftext`) or indexed (`.profdata`), absolute or relative to the source tree. `core/kyty/pgo/kyty_gpu.proftext` by default; empty for none. |
+| `ANYPS5_KYTY_PGO_GENERATE` | `ON` builds an instrumented `kyty_gpu` that records a profile, and reads none (Linux only). |
 
 The profile covers `kyty_gpu` and the libraries pre-linked with it (fmt, xxHash, Tracy, ZArchive, zstd), not SPIRV-Tools, whose
 static libraries also build `glslangValidator` during the build. A text profile is converted at configure time by the
-`llvm-profdata` of the compiler's LLVM major (`llvm-profdata-<major>`, then `llvm-profdata` next to the compiler or on the path), into `build/core/kyty/pgo/kyty_gpu.profdata`, so the indexed
-format is always one the compiler reads. An indexed profile is used as is and must come from the same LLVM major. When the file
-is missing or no matching `llvm-profdata` is found, the configure step warns and the core is built without the profile: a missing
-profile costs speed, never the build. Objects depend on the profile, so changing it rebuilds `kyty_gpu`.
+`llvm-profdata` installed beside the compiler (`clang++ -print-prog-name=llvm-profdata`), which must be of the same LLVM major,
+so the indexed format is always one the compiler reads; an indexed profile must come from the same LLVM major. Either way the
+indexed profile the compiler reads is `build/core/kyty/pgo/kyty_gpu-<hash>.profdata`, named after its content: a new profile
+changes the compile command, so every object of the core is compiled again and ccache cannot return one compiled with the
+previous profile (ThinLTO refuses to link modules whose profile summaries differ). When the file is missing or no matching
+`llvm-profdata` is found, the configure step warns and the core is built without the profile: a missing profile costs speed,
+never the build.
 
 Static and anonymous-namespace functions are named in the profile by their file name, without its directory
 (`-mllvm -static-func-full-module-prefix=false`, on both the instrumented and the optimized build), so a profile recorded in one

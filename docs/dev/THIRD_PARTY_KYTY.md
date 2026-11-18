@@ -91,6 +91,7 @@ The sub-build uses upstream's compiler options (`-march=x86-64-v3 -ffp-contract=
 glslang (with the optimizer, for `glslangValidator -Os` on upstream's utility shaders). `Kyty::gpu` is the interface
 target that links the resulting archives into AnyPS5. `core/kyty/KytyGpuSources.cmake` lists the imported sources left
 out of `kyty_gpu`, and `core/kyty/tools/kyty_frontier.py` lists the symbols `kyty_gpu` still needs from the shim.
+`kyty_gpu` is compiled with the profile of `core/kyty/pgo/` by default ([profile-guided optimization](KYTY_PGO.md)).
 
 ### Windows
 
