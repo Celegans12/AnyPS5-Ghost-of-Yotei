@@ -43,6 +43,9 @@ constexpr auto MakeOpcodeDispatchTable() {
 	std::array<cp_op_parser_func_t, 256> table {};
 
 	table[Pm4::IT_NOP]                       = CpOpNop;
+#if defined(ANYPS5_KYTY)
+	table[Pm4::IT_CONTEXT_CONTROL]           = CpOpContextControl;
+#endif
 	table[Pm4::IT_SET_BASE]                  = CpOpSetBase;
 	table[Pm4::IT_CLEAR_STATE]               = CpOpClearState;
 	table[Pm4::IT_INDEX_BASE]                = CpOpIndexBase;

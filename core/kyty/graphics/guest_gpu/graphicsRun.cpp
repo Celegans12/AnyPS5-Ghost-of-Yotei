@@ -2,6 +2,9 @@
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
+#if defined(ANYPS5_KYTY)
+#include "common/fallback.h"
+#endif
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -2913,6 +2916,13 @@ void CommandProcessor::ExecuteTriggerEvent(uint32_t event_type, uint32_t event_i
 			break;
 		}
 		default:
+#if defined(ANYPS5_KYTY)
+			if (Common::Fallback::Enabled()) {
+				Common::HackNotice::Report("GPU event ignored: Kyty does not know the event type",
+				                           "ExecuteTriggerEvent", 0, uint64_t {event_index} << 32u | event_type);
+				break;
+			}
+#endif
 			EXIT("unknown event type: 0x%08" PRIx32 ", 0x%08" PRIx32 "\n", event_type, event_index);
 	}
 }

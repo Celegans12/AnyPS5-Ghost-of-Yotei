@@ -1,4 +1,8 @@
 #include "common/assert.h"
+#if defined(ANYPS5_KYTY)
+#include "common/fallback.h"
+#include "common/hackNotice.h"
+#endif
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
@@ -877,6 +881,20 @@ KYTY_CP_OP_PARSER(CpOpContextState) {
 	return packet_size_dw - 1u;
 }
 
+#if defined(ANYPS5_KYTY)
+KYTY_CP_OP_PARSER(CpOpContextControl) {
+	KYTY_PROFILER_FUNCTION();
+
+	const auto packet_size_dw = KYTY_PM4_LEN(cmd_id);
+	if (packet_size_dw != 3u || (buffer[0] & 0x7fffffffu) != 0 || (buffer[1] & 0x7fffffffu) != 0) {
+		EXIT("CONTEXT_CONTROL register loading and shadowing are not implemented: size=%" PRIu32
+		     " load=0x%08" PRIx32 " shadow=0x%08" PRIx32 "\n",
+		     packet_size_dw, packet_size_dw > 1u ? buffer[0] : 0u, packet_size_dw > 2u ? buffer[1] : 0u);
+	}
+	return packet_size_dw - 1u;
+}
+#endif
+
 KYTY_CP_OP_PARSER(CpOpEventWrite) {
 	KYTY_PROFILER_FUNCTION();
 
@@ -1417,6 +1435,44 @@ KYTY_CP_OP_PARSER(CpOpWriteData) {
 
 	return 1 + dw_num;
 }
+
+#if defined(ANYPS5_KYTY)
+static void IgnoreUnknownRegister(const char* space, uint32_t cmd_offset, uint32_t value) {
+	if (!Common::Fallback::Enabled()) {
+		EXIT("unknown %s register 0x%05" PRIx32 " = 0x%08" PRIx32 "\n", space, cmd_offset, value);
+	}
+	Common::HackNotice::Report("register write ignored: Kyty does not know the register", space, 0,
+	                           cmd_offset);
+}
+
+static void UnknownContextRegister(CommandProcessor&, uint32_t cmd_offset, uint32_t value) {
+	if (cmd_offset == 0x24au && value == 0u) {
+		static std::atomic_flag logged = ATOMIC_FLAG_INIT;
+		if (!logged.test_and_set(std::memory_order_relaxed)) {
+			Log::WriteToConsoleAndLog("\t diagnostic: ignoring CX {0x24a, 0}; hardware effect unresolved\n");
+		}
+		return;
+	}
+	IgnoreUnknownRegister("context", cmd_offset, value);
+}
+
+static void UnknownShaderRegister(CommandProcessor&, uint32_t cmd_offset, uint32_t value) {
+	IgnoreUnknownRegister("shader", cmd_offset, value);
+}
+
+static void UnknownUconfigRegister(CommandProcessor&, uint32_t cmd_offset, uint32_t value) {
+	IgnoreUnknownRegister("uconfig", cmd_offset, value);
+}
+
+template <size_t Size>
+static constexpr void FillUnknownRegisters(std::array<hw_reg_func_t, Size>& table, hw_reg_func_t unknown) {
+	for (auto& entry: table) {
+		if (entry == nullptr) {
+			entry = unknown;
+		}
+	}
+}
+#endif
 
 static constexpr auto MakeContextIndirectTable() {
 	std::array<hw_reg_func_t, Pm4::CX_NUM> table {};
@@ -2182,6 +2238,9 @@ static constexpr auto MakeContextIndirectTable() {
 		cp.GetCtx().SetEqaaControl(ParseEqaaControl(value));
 	};
 
+#if defined(ANYPS5_KYTY)
+	FillUnknownRegisters(table, UnknownContextRegister);
+#endif
 	return table;
 }
 
@@ -2398,6 +2457,9 @@ static constexpr auto MakeShaderIndirectTable() {
 		cp.GetShCtx().SetPsShaderResource2(r2);
 	};
 
+#if defined(ANYPS5_KYTY)
+	FillUnknownRegisters(table, UnknownShaderRegister);
+#endif
 	return table;
 }
 
@@ -2445,6 +2507,9 @@ static constexpr auto MakeUconfigIndirectTable() {
 
 	table[Pm4::GE_INDX_OFFSET] = [](KYTY_HW_REG_ARGS) { cp.GetUcfg().SetIndexOffset(value); };
 
+#if defined(ANYPS5_KYTY)
+	FillUnknownRegisters(table, UnknownUconfigRegister);
+#endif
 	return table;
 }
 

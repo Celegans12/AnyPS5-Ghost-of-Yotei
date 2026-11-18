@@ -33,6 +33,9 @@ uint32_t HwShSetCsRegisters(CommandProcessor&, uint32_t, uint32_t, const uint32_
 
 uint32_t CpOpNop(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpContextState(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+#if defined(ANYPS5_KYTY)
+uint32_t CpOpContextControl(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
+#endif
 uint32_t CpOpSetBase(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpClearState(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);
 uint32_t CpOpIndexBase(CommandProcessor&, uint32_t, const uint32_t*, uint32_t, uint32_t);

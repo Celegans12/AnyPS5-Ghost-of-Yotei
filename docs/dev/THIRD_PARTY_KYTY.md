@@ -459,8 +459,16 @@ naming the stop and its source line: a shader the recompiler cannot decode, tran
 inputs cannot be prepared. A failed shader is remembered (the whole program when no variant of it ever compiled,
 otherwise that variant), so it is not translated again for each draw; the other variants of the program keep drawing.
 A background compile that stops is dropped, and the draw compiles it again. A pipeline manifest record that stops while
-it is replayed is dropped, as with exceptions enabled. A fallback only replaces a stop: nothing changes for a shader that
-compiles. `KYTY_FALLBACKS=0` restores every stop.
+it is replayed is dropped, as with exceptions enabled. The command processor ignores a write to a register it does not
+know (direct `SET_*_REG` packets and indirect register lists) and a GPU event type it does not know, with one `[HACK]`
+line per register or event; the packet lengths come from the headers, so the rest of the stream is read as before. The
+unknown registers are entries of the register tables, so the loops that apply known registers are unchanged. A fallback
+only replaces a stop: nothing changes for a shader that compiles or a register Kyty knows. `KYTY_FALLBACKS=0` restores
+every stop, except a write of 0 to context register `0x24a`, which Kyty already ignored in indirect lists and now also
+ignores in a direct `SET_CONTEXT_REG`.
+
+`CONTEXT_CONTROL` (PM4 opcode `0x28`) with register loading and shadowing off is accepted as the no-op it is on the
+console, as AnyPS5's driver does; with either on, it still stops with the two control words.
 
 ### Adding a setting
 
