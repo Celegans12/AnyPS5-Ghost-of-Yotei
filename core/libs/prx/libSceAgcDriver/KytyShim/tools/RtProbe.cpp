@@ -154,6 +154,15 @@ bool CompileVariant(const std::vector<uint32_t>& code, uint64_t hash, const Sett
 	options.rt_oracle          = native ? settings.oracle : 0u;
 	options.user_data          = user_data;
 	options.input_info.compute = &compute;
+	ShaderPixelInputInfo pixel {};
+	if (settings.pixel) {
+		pixel.wave_size           = settings.wave;
+		pixel.input_num           = settings.inputs;
+		pixel.ps_pos_x            = pixel.ps_pos_y = pixel.ps_pos_z = pixel.ps_pos_w = true;
+		pixel.scratch_size_dwords = settings.scratch;
+		options.stage             = ShaderType::Pixel;
+		options.input_info.pixel  = &pixel;
+	}
 	auto source = Recompiler::PrepareShaderSource(code, options);
 	if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) return false;
 	auto translated = Recompiler::TranslateProgram(source.decoded, options);
@@ -200,6 +209,7 @@ int Replay(const char* label, const std::vector<uint32_t>& code, uint64_t hash, 
 	const auto [guest_buffers, guest_images]   = written(guest.program);
 	const bool served_natively = served.program.info.bvh && served.program.info.ray_query;
 	const char* reason = !served_natively ? "not served natively"
+	                     : settings.pixel ? "draws are not played twice"
 	                     : served_buffers != guest_buffers || served_images != guest_images
 	                         ? "the two variants write different outputs"
 	                         : Libs::Graphics::RayTracingCheckUnreplayable(served.program);
