@@ -4,6 +4,7 @@ target_include_directories(kyty_shim_replay_sampling_tests PRIVATE ${CMAKE_CURRE
 add_test(NAME kyty_shim_replay_sampling COMMAND kyty_shim_replay_sampling_tests)
 set_tests_properties(kyty_shim_replay_sampling PROPERTIES TIMEOUT 20)
 
+if(NOT ANYPS5_KYTY_DLL)
 add_test_executable(kyty_shim_events_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/Events.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/Events.cpp
@@ -15,6 +16,7 @@ target_include_directories(kyty_shim_events_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(kyty_shim_events_tests PRIVATE Kyty::gpu libkernel libc)
 add_test(NAME kyty_shim_events COMMAND kyty_shim_events_tests)
 set_tests_properties(kyty_shim_events PROPERTIES TIMEOUT 20)
+endif()
 
 add_test_executable(kyty_shim_completion_invalidation_tests ${CMAKE_CURRENT_SOURCE_DIR}/CompletionInvalidation.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
