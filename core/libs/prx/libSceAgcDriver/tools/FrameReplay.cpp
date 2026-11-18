@@ -672,6 +672,7 @@ struct Replay {
         paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
     }
 
+#if !defined(ANYPS5_KYTY)
     void awaitTailsRead() {
         const auto began = Clock::now();
         while (AgcDriverRewindTailsUnread_nid_postfix()) {
@@ -685,6 +686,7 @@ struct Replay {
         }
         paceWaitedNs += std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - began).count();
     }
+#endif
 
     struct StagedWord {
         std::uint64_t address;
@@ -717,7 +719,9 @@ struct Replay {
         std::vector<StagedWord> staged;
         const auto found = groups.find(group);
         if (found == groups.end()) return staged;
+#if !defined(ANYPS5_KYTY)
         awaitTailsRead();
+#endif
         std::array<AgcDriver::AwaitedWait, 64> awaited{};
         const auto count = AgcDriverAwaitedWaits_nid_postfix(awaited.data(), awaited.size());
         std::vector<std::uint64_t> parked;
@@ -949,7 +953,9 @@ struct Replay {
         auto lastProgress = Clock::now();
         auto lastReport = lastProgress;
         while (true) {
+#if !defined(ANYPS5_KYTY)
             AgcDriverCheckFailure_nid_postfix();
+#endif
             const auto [accepted, completed] = progress();
             unfinished = accepted - completed;
             if (unfinished == 0) return;
@@ -1456,7 +1462,9 @@ int run(const Options& options) {
     relaunchIfHostRegionBlocks(reader);
 #endif
     if (reader.Truncated()) std::fprintf(stderr, "[frame-replay] the capture is truncated; replaying the complete records\n");
+#if !defined(ANYPS5_KYTY)
     AgcDriverTrackRewindTails_nid_postfix();
+#endif
     auto skipped = restoreMemory(reader);
     const auto loaded = Clock::now();
     Replay replay{options, reader};
