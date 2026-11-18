@@ -1666,6 +1666,14 @@ bool Expand(Value value, const std::array<Value, 6>& world, const Record& record
 	}
 }
 
+bool TestedNonZero(const Inst& value, bool written = false) {
+	return std::ranges::any_of(value.Uses(), [&](const Use& t) {
+		const auto op = t.user->GetOpcode();
+		if (op == ValueOpcode::INotEqual32) return Immediate(t.user->Arg(1 - t.operand)) == 0u;
+		return !written && op == ValueOpcode::SelectU32 && t.operand == 1 && TestedNonZero(*t.user, true);
+	});
+}
+
 bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 	auto& layout = w.layout;
 	Value       root_value;
@@ -1860,9 +1868,7 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 					const auto* both  = u.user;
 					const auto  value = both->GetOpcode() == ValueOpcode::BitwiseAnd32 ? both->Arg(1 - u.operand) : Value {};
 					if (!shift || *shift >= 32u || value.IsEmpty() || value.IsImmediate() ||
-					    !DefinedBefore(program, value, w.header) || std::ranges::none_of(both->Uses(), [](const Use& t) {
-						    return t.user->GetOpcode() == ValueOpcode::INotEqual32 && Immediate(t.user->Arg(1 - t.operand)) == 0u;
-					    })) {
+					    !DefinedBefore(program, value, w.header) || !TestedNonZero(*both)) {
 						continue;
 					}
 					if (masked && (layout.mask_dword != *dword || layout.mask_shift != *shift || w.mask_value != value.Resolve()))
@@ -3977,9 +3983,10 @@ bool MatchClosestLeafWalk(const Program& program, PacketWalk& w) {
 		if (w.packet != nullptr) return false;
 		w.packet = &inst;
 	}
+	if (w.packet == nullptr && (w.lanes.IsEmpty() || !DefinedBefore(program, w.lanes, w.header))) return false;
 	const auto* exit = w.path.back();
 	const auto& term = exit->terminator;
-	if (w.packet == nullptr || term.kind != CFG::TerminatorKind::ConditionalBranch ||
+	if (term.kind != CFG::TerminatorKind::ConditionalBranch ||
 	    !((term.true_block == w.merge && term.false_block == w.latch) ||
 	      (term.false_block == w.merge && term.true_block == w.latch)))
 		return false;
@@ -4017,7 +4024,7 @@ void RewriteClosestLeafWalk(Program& program, PacketWalk& w, uint32_t site) {
 		return RayQueryFlags(site, static_cast<uint32_t>(variant));
 	};
 	auto&      s     = w.shape;
-	const auto lanes = IncomingValue(*w.packet, w.preheader).Resolve();
+	const auto lanes = w.packet != nullptr ? IncomingValue(*w.packet, w.preheader).Resolve() : w.lanes.Resolve();
 	const auto first = BlockIndex(program, w.header), last = BlockIndex(program, w.latch);
 	const auto in_walk = [&](const Block* block) {
 		const auto at = BlockIndex(program, block);
@@ -4075,11 +4082,13 @@ void RewriteClosestLeafWalk(Program& program, PacketWalk& w, uint32_t site) {
 		const auto     next   = at(Op::RayQueryNext, {}, flags(0u));
 		const auto     match  = at(Op::RayQueryMatch, {}, flags(0u));
 		const auto     node   = Incoming(*w.outer_node, from);
-		const auto     packet = Incoming(*w.packet, from);
 		const Inserter end {from, from->end()};
 		w.outer_node->SetArg(node, end(Op::SelectU32, {any, at(Op::CompositeExtractU32x4, {next, Value(0u)}),
 		                                               w.outer_node->Arg(node)}));
-		w.packet->SetArg(packet, end(Op::SelectU1, {any, match, w.packet->Arg(packet)}));
+		if (w.packet != nullptr) {
+			const auto packet = Incoming(*w.packet, from);
+			w.packet->SetArg(packet, end(Op::SelectU1, {any, match, w.packet->Arg(packet)}));
+		}
 		return at(Op::INotEqual32, {at(Op::CompositeExtractU32x4, {next, Value(2u)}), Value(0u)});
 	};
 	(void)round(entry, w.preheader);
