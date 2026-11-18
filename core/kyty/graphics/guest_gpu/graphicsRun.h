@@ -122,8 +122,15 @@ private:
 	bool                                           m_accepting         = true;
 	bool                                           m_stopping          = false;
 	bool                                           m_shutdown_complete = false;
+#if defined(ANYPS5_KYTY)
+	static constexpr ptrdiff_t SuspendPointDepthMax = 64;
+	static ptrdiff_t           SuspendPointDepth();
+	std::shared_ptr<std::counting_semaphore<SuspendPointDepthMax>> m_suspend_point_ready =
+	    std::make_shared<std::counting_semaphore<SuspendPointDepthMax>>(SuspendPointDepth());
+#else
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
 	    std::make_shared<std::binary_semaphore>(1);
+#endif
 
 	std::unique_ptr<CommandProcessor>                                m_gfx_cp;
 	std::array<std::unique_ptr<CommandProcessor>, ComputeQueueCount> m_compute_cp;

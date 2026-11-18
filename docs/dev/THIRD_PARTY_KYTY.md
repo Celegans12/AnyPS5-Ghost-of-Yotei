@@ -200,6 +200,18 @@ on the GPU (rendering wait packet). Measured on Subnautica, in two sessions of 1
 +4.8 % frames per second, the same images (`notes/au-dela-p9-bascule.md`). `KYTY_EARLY_FLIP=0` restores KytyPS5's behaviour; any value other than empty, `0` or
 `1` stops the emulator with a message naming the variable.
 
+Suspend points: KytyPS5 makes `sceAgcSuspendPoint` (`GuestGpu::SuspendPoint`) acquire a binary semaphore that its
+priority thread releases once the GPU has finished the work queued before the previous suspend point, so a title can
+never queue work more than one suspend point ahead of the GPU. On the console, and in the AnyPS5 driver
+(`Driver::SuspendPoint`), a suspend point only marks a place where the system may suspend the title, and it returns at
+once. Under `ANYPS5_KYTY` the semaphore counts up to `KYTY_SUSPEND_POINT_DEPTH` suspend points in flight, 8 by default;
+the title's own fences, labels and flips still order its reuse of memory against the GPU. Stray calls it after each
+submission, about five times a frame: with one in flight it could not submit a frame before the GPU had finished the
+previous one, and the stages sat idle for the GPU's tail every frame. The depth has to cover a whole frame of suspend
+points: on Stray at 4,240 draws a frame, depths 1, 4, 8 and 16 give 56.2, 56.5, 71.6 and 71.9 frames per second, the same
+images; Subnautica gives 208.6 and 212.7 at depths 1 and 8 (`notes/stray-perf-cpu.md`). `KYTY_SUSPEND_POINT_DEPTH=1`
+restores KytyPS5's behaviour; a value outside 1 to 64 stops the emulator with a message naming the variable.
+
 `m_program_lock`, the spin lock of `graphics/host_gpu/renderer/pipeline/pipelineCache.cpp` that guards the program
 cache, has a narrower scope than upstream's in this build (`programLock.cpp`). The resolve thread always runs upstream's
 unlocked ahead mode, which upstream only uses with `KYTY_RESOLVE_HELPER=1`, and the execute thread releases the lock

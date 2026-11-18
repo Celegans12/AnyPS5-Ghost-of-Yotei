@@ -275,6 +275,25 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 	Enqueue(std::move(submission));
 }
 
+#if defined(ANYPS5_KYTY)
+ptrdiff_t GuestGpu::SuspendPointDepth() {
+	static const ptrdiff_t depth = [] {
+		constexpr ptrdiff_t DefaultDepth = 8;
+		const char*         value        = std::getenv("KYTY_SUSPEND_POINT_DEPTH");
+		if (value == nullptr || value[0] == '\0') {
+			return DefaultDepth;
+		}
+		char*      end    = nullptr;
+		const auto parsed = std::strtol(value, &end, 10);
+		if (end == value || *end != '\0' || parsed < 1 || parsed > SuspendPointDepthMax) {
+			EXIT("invalid KYTY_SUSPEND_POINT_DEPTH: %s (1 to %td)\n", value, SuspendPointDepthMax);
+		}
+		return static_cast<ptrdiff_t>(parsed);
+	}();
+	return depth;
+}
+#endif
+
 void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	m_suspend_point_ready->acquire();
