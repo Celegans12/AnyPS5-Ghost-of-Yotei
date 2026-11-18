@@ -1398,7 +1398,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		}
 		const auto raw_sint_format = RawSignedStorageFormat(base, format);
 		const bool raw_sint_storage = raw_sint_format != Prospero::BufferFormat::kInvalid;
-		if (raw_sint_format == Prospero::BufferFormat::k16UInt) image.conversion_format = format;
+		if (raw_sint_storage && raw_sint_format != Prospero::BufferFormat::k32UInt)
+			image.conversion_format = format;
 		if (storage && image.conversion_format == Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = CanonicalStorageSwizzle(image.shader_swizzle, format);
 		}
