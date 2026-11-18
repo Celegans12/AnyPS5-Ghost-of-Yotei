@@ -68,6 +68,8 @@ void WaitRendering(std::uint32_t handle, std::uint32_t index);
 
 namespace {
 
+constexpr std::array<std::array<float, 4>, AgcDriver::OverlayColorCount> OverlayBasePalette{{{0.0f, 0.0f, 0.0f, 0.6f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.35f, 0.8f, 0.35f, 1.0f}, {0.06f, 0.07f, 0.09f, 0.94f}, {0.22f, 0.24f, 0.29f, 1.0f}, {1.0f, 0.78f, 0.2f, 1.0f}, {0.0f, 0.0f, 0.0f, 1.0f}}};
+
 struct PendingFlip {
     std::shared_ptr<AgcDriver::IFlipRequest> request;
     std::uint32_t handle = 0;
@@ -602,7 +604,7 @@ void SystemOverlay::Record(vk::CommandBuffer command, vk::ImageView target) {
         std::size_t runColor = AgcDriver::OverlayColorCount;
         const auto flush = [&] {
             if (run.empty()) return;
-            const auto& color = AgcDriver::OverlayBasePalette[runColor];
+            const auto& color = KytyShim::Present::OverlayBasePalette[runColor];
             vk::ClearAttachment clear{};
             clear.aspectMask = vk::ImageAspectFlagBits::eColor;
             clear.colorAttachment = 0;
