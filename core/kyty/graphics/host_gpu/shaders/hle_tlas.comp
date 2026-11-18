@@ -22,14 +22,12 @@ const uint kMaxNodes     = 1365u;
 const uint kHeaderSize   = 256u;
 const uint kNodeSize     = 128u;
 const uint kBlasRoot     = 0x25u;
+const uint kMaxLevels    = 8u;
+const uint kLevelFirst   = kMaxLevels;
+const uint kLevelTotal   = 2u * kMaxLevels;
 
-shared uint s_keys[kMaxInstances];
+shared uint s_keys_or_metadata[kMaxInstances];
 shared uint s_order[kMaxInstances];
-shared uint s_scene[6];
-shared uint s_level_count[8];
-shared uint s_level_first[8];
-shared uint s_levels;
-shared uint s_nodes;
 
 layout(buffer_reference, std430, buffer_reference_align = 16) coherent buffer Bounds {
 	vec4 lo;
@@ -118,8 +116,8 @@ void main() {
 	const uint lid   = gl_LocalInvocationID.x;
 	const uint count = min(pc.count, kMaxInstances);
 	if (lid == 0) {
-		s_scene[0] = s_scene[1] = s_scene[2] = 0xffffffffu;
-		s_scene[3] = s_scene[4] = s_scene[5] = 0u;
+		s_keys_or_metadata[0] = s_keys_or_metadata[1] = s_keys_or_metadata[2] = 0xffffffffu;
+		s_keys_or_metadata[3] = s_keys_or_metadata[4] = s_keys_or_metadata[5] = 0u;
 	}
 	barrier();
 
@@ -171,12 +169,12 @@ void main() {
 		InstanceBounds(i).hi = vec4(world_hi, 0.0);
 		if (all(lessThanEqual(world_lo, world_hi))) {
 			const vec3 centre = (world_lo + world_hi) * 0.5;
-			atomicMin(s_scene[0], FloatKey(centre.x));
-			atomicMin(s_scene[1], FloatKey(centre.y));
-			atomicMin(s_scene[2], FloatKey(centre.z));
-			atomicMax(s_scene[3], FloatKey(centre.x));
-			atomicMax(s_scene[4], FloatKey(centre.y));
-			atomicMax(s_scene[5], FloatKey(centre.z));
+			atomicMin(s_keys_or_metadata[0], FloatKey(centre.x));
+			atomicMin(s_keys_or_metadata[1], FloatKey(centre.y));
+			atomicMin(s_keys_or_metadata[2], FloatKey(centre.z));
+			atomicMax(s_keys_or_metadata[3], FloatKey(centre.x));
+			atomicMax(s_keys_or_metadata[4], FloatKey(centre.y));
+			atomicMax(s_keys_or_metadata[5], FloatKey(centre.z));
 		}
 
 		const mat3     w2o    = inverse(r.o2w);
@@ -217,8 +215,11 @@ void main() {
 	memoryBarrierBuffer();
 	barrier();
 
-	const vec3 scene_lo = vec3(KeyFloat(s_scene[0]), KeyFloat(s_scene[1]), KeyFloat(s_scene[2]));
-	const vec3 scene_hi = vec3(KeyFloat(s_scene[3]), KeyFloat(s_scene[4]), KeyFloat(s_scene[5]));
+	const vec3 scene_lo = vec3(KeyFloat(s_keys_or_metadata[0]), KeyFloat(s_keys_or_metadata[1]),
+	                           KeyFloat(s_keys_or_metadata[2]));
+	const vec3 scene_hi = vec3(KeyFloat(s_keys_or_metadata[3]), KeyFloat(s_keys_or_metadata[4]),
+	                           KeyFloat(s_keys_or_metadata[5]));
+	barrier();
 	const vec3 extent   = max(scene_hi - scene_lo, vec3(1e-6));
 	uint       padded   = 1;
 	while (padded < count) {
@@ -235,8 +236,8 @@ void main() {
 		} else if (i < count) {
 			key = 0xfffffffeu;
 		}
-		s_keys[i]  = key;
-		s_order[i] = i;
+		s_keys_or_metadata[i] = key;
+		s_order[i]            = i;
 	}
 	barrier();
 	for (uint size = 2; size <= padded; size <<= 1) {
@@ -245,10 +246,10 @@ void main() {
 				const uint partner = i ^ stride;
 				if (partner > i) {
 					const bool ascending = (i & size) == 0;
-					const uint a = s_keys[i], b = s_keys[partner];
+					const uint a = s_keys_or_metadata[i], b = s_keys_or_metadata[partner];
 					if ((a > b) == ascending) {
-						s_keys[i]        = b;
-						s_keys[partner]  = a;
+						s_keys_or_metadata[i]       = b;
+						s_keys_or_metadata[partner] = a;
 						const uint t     = s_order[i];
 						s_order[i]       = s_order[partner];
 						s_order[partner] = t;
@@ -263,25 +264,24 @@ void main() {
 		uint n      = max((count + 3u) / 4u, 1u);
 		uint levels = 0;
 		for (;;) {
-			s_level_count[levels++] = n;
-			if (n == 1u || levels == 8u) {
+			s_keys_or_metadata[levels++] = n;
+			if (n == 1u || levels == kMaxLevels) {
 				break;
 			}
 			n = (n + 3u) / 4u;
 		}
-		s_levels   = levels;
+		s_keys_or_metadata[kLevelTotal] = levels;
 		uint first = 0;
 		for (int l = int(levels) - 1; l >= 0; l--) {
-			s_level_first[l] = first;
-			first += s_level_count[l];
+			s_keys_or_metadata[kLevelFirst + uint(l)] = first;
+			first += s_keys_or_metadata[l];
 		}
-		s_nodes = first;
 	}
 	barrier();
 
-	for (uint l = 0; l < s_levels; l++) {
-		const uint level_nodes = s_level_count[l];
-		const uint first       = s_level_first[l];
+	for (uint l = 0; l < s_keys_or_metadata[kLevelTotal]; l++) {
+		const uint level_nodes = s_keys_or_metadata[l];
+		const uint first       = s_keys_or_metadata[kLevelFirst + l];
 		for (uint j = lid; j < level_nodes; j += gl_WorkGroupSize.x) {
 			uint children[4];
 			vec3 lo[4], hi[4];
@@ -298,8 +298,8 @@ void main() {
 						lo[c]               = InstanceBounds(instance).lo.xyz;
 						hi[c]               = InstanceBounds(instance).hi.xyz;
 					}
-				} else if (k < s_level_count[l - 1]) {
-					const uint child_slot = s_level_first[l - 1] + k;
+				} else if (k < s_keys_or_metadata[l - 1u]) {
+					const uint child_slot = s_keys_or_metadata[kLevelFirst + (l - 1u)] + k;
 					children[c]           = NodePointer(child_slot);
 					lo[c]                 = NodeBounds(child_slot).lo.xyz;
 					hi[c]                 = NodeBounds(child_slot).hi.xyz;
