@@ -8,6 +8,7 @@
 #include "gpu_blit_shaders/gpu_blit_fs_triangle_spv.h"
 #include "gpu_blit_shaders/gpu_fsr_easu_spv.h"
 #include "gpu_blit_shaders/gpu_fsr_rcas_spv.h"
+#include "gpu_blit_shaders/gpu_cmaa2_spv.h"
 #include "gpu_blit_shaders/gpu_video_out_overlay_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "prx/libSceAgcDriver/Execution/include/UpscaleMode.hpp"
@@ -264,6 +265,10 @@ private:
 	void EnsureFsrPipelines();
 	void DrawFsr(vk::CommandBuffer command, Presenter::Frame* source,
 	             const vk::Rect2D& game_rect);
+	void DrawRcasNative(vk::CommandBuffer command, Presenter::Frame* source,
+	                    const vk::Rect2D& game_rect);
+	void DrawCmaa2(vk::CommandBuffer command, Presenter::Frame* source,
+	               const vk::Rect2D& game_rect);
 	void DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer,
 	               const vk::Rect2D& rect);
 
@@ -297,6 +302,8 @@ private:
 	vk::Pipeline                   m_easu_pipeline       = nullptr;
 	vk::PipelineLayout             m_rcas_layout         = nullptr;
 	vk::Pipeline                   m_rcas_pipeline       = nullptr;
+	vk::PipelineLayout             m_cmaa2_layout        = nullptr;
+	vk::Pipeline                   m_cmaa2_pipeline      = nullptr;
 	vk::Sampler                    m_fsr_sampler         = nullptr;
 	uint32_t                       m_image_index         = 0;
 	uint32_t                       m_frame_index         = 0;
@@ -476,6 +483,13 @@ void Swapchain::Create() {
 		LOGF("[present] ANYPS5_UPSCALE=fsr: FSR 1 EASU and RCAS when the window is larger than the "
 		     "display buffer, the normal scaler otherwise; RCAS sharpness %.2f\n",
 		     static_cast<double>(m_upscale_mode.sharpness));
+	} else if (m_upscale_mode.cmaa2) {
+		LOGF("[present] ANYPS5_UPSCALE=cmaa2: Intel CMAA2 conservative morphological anti-aliasing "
+		     "at native 1:1 resolution\n");
+	} else if (m_upscale_mode.rcas) {
+		LOGF("[present] ANYPS5_UPSCALE=rcas: 1:1 native RCAS contrast-adaptive sharpening; "
+		     "RCAS sharpness %.2f\n",
+		     static_cast<double>(m_upscale_mode.sharpness));
 	}
 
 	m_images = EnumerateVulkan<vk::Image>(
@@ -544,6 +558,8 @@ void Swapchain::Destroy() {
 	graphics.device.destroyPipelineLayout(m_easu_layout, nullptr);
 	graphics.device.destroyPipeline(m_rcas_pipeline, nullptr);
 	graphics.device.destroyPipelineLayout(m_rcas_layout, nullptr);
+	graphics.device.destroyPipeline(m_cmaa2_pipeline, nullptr);
+	graphics.device.destroyPipelineLayout(m_cmaa2_layout, nullptr);
 	graphics.device.destroyDescriptorSetLayout(m_fsr_descriptors, nullptr);
 	graphics.device.destroySampler(m_fsr_sampler, nullptr);
 	for (auto& slot: m_upscale_slots) {
@@ -566,6 +582,8 @@ void Swapchain::Destroy() {
 	m_easu_layout         = nullptr;
 	m_rcas_pipeline       = nullptr;
 	m_rcas_layout         = nullptr;
+	m_cmaa2_pipeline      = nullptr;
+	m_cmaa2_layout        = nullptr;
 	m_fsr_descriptors     = nullptr;
 	m_fsr_sampler         = nullptr;
 
@@ -725,9 +743,27 @@ void Swapchain::EnsureFsrPipelines() {
 	RequireVulkanSuccess(device.createPipelineLayout(&rcas_layout, nullptr, &m_rcas_layout),
 	                     "create FSR RCAS pipeline layout");
 
-	const auto vertex        = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, device);
-	const auto easu_fragment = CompileSPV(GPU_FSR_EASU_SPV, device);
-	const auto rcas_fragment = CompileSPV(GPU_FSR_RCAS_SPV, device);
+	struct Cmaa2Parameters {
+		int32_t x;
+		int32_t y;
+		int32_t width;
+		int32_t height;
+	};
+
+	const vk::PushConstantRange cmaa2_push {vk::ShaderStageFlagBits::eFragment, 0,
+	                                        sizeof(Cmaa2Parameters)};
+	vk::PipelineLayoutCreateInfo cmaa2_layout {};
+	cmaa2_layout.setLayoutCount         = 1;
+	cmaa2_layout.pSetLayouts            = &m_fsr_descriptors;
+	cmaa2_layout.pushConstantRangeCount = 1;
+	cmaa2_layout.pPushConstantRanges    = &cmaa2_push;
+	RequireVulkanSuccess(device.createPipelineLayout(&cmaa2_layout, nullptr, &m_cmaa2_layout),
+	                     "create CMAA2 pipeline layout");
+
+	const auto vertex         = CompileSPV(GPU_BLIT_FS_TRIANGLE_SPV, device);
+	const auto easu_fragment  = CompileSPV(GPU_FSR_EASU_SPV, device);
+	const auto rcas_fragment  = CompileSPV(GPU_FSR_RCAS_SPV, device);
+	const auto cmaa2_fragment = CompileSPV(GPU_CMAA2_SPV, device);
 
 	vk::PipelineVertexInputStateCreateInfo   vertex_input {};
 	vk::PipelineInputAssemblyStateCreateInfo assembly {};
@@ -793,6 +829,21 @@ void Swapchain::EnsureFsrPipelines() {
 	    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_rcas_pipeline),
 	    "create FSR RCAS pipeline");
 
+	std::array<vk::PipelineShaderStageCreateInfo, 2> cmaa2_stages {};
+	cmaa2_stages[0].stage  = vk::ShaderStageFlagBits::eVertex;
+	cmaa2_stages[0].module = vertex;
+	cmaa2_stages[0].pName  = "main";
+	cmaa2_stages[1].stage  = vk::ShaderStageFlagBits::eFragment;
+	cmaa2_stages[1].module = cmaa2_fragment;
+	cmaa2_stages[1].pName  = "main";
+	create.stageCount      = static_cast<uint32_t>(cmaa2_stages.size());
+	create.pStages         = cmaa2_stages.data();
+	create.layout          = m_cmaa2_layout;
+	RequireVulkanSuccess(
+	    device.createGraphicsPipelines(nullptr, 1, &create, nullptr, &m_cmaa2_pipeline),
+	    "create CMAA2 pipeline");
+
+	device.destroyShaderModule(cmaa2_fragment, nullptr);
 	device.destroyShaderModule(rcas_fragment, nullptr);
 	device.destroyShaderModule(easu_fragment, nullptr);
 	device.destroyShaderModule(vertex, nullptr);
@@ -993,6 +1044,140 @@ void Swapchain::DrawFsr(vk::CommandBuffer command, Presenter::Frame* source,
 	command.endRendering();
 }
 
+void Swapchain::DrawRcasNative(vk::CommandBuffer command, Presenter::Frame* source,
+                               const vk::Rect2D& game_rect) {
+	auto& graphics = m_window.graphic_ctx;
+	auto  device   = graphics.device;
+	EnsureFsrPipelines();
+
+	if (source->view == nullptr) {
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = source->image.image;
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = source->image.format;
+		view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		RequireVulkanSuccess(device.createImageView(&view_info, nullptr, &source->view),
+		                     "create video-out source image view for native RCAS");
+	}
+
+	vk::RenderingAttachmentInfo rcas_attachment {};
+	rcas_attachment.imageView   = m_image_views[m_image_index];
+	rcas_attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	rcas_attachment.loadOp      = (game_rect.extent == m_extent)
+	                                  ? vk::AttachmentLoadOp::eDontCare
+	                                  : vk::AttachmentLoadOp::eLoad;
+	rcas_attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+
+	vk::RenderingInfo rcas_rendering {};
+	rcas_rendering.renderArea.extent    = m_extent;
+	rcas_rendering.layerCount           = 1;
+	rcas_rendering.colorAttachmentCount = 1;
+	rcas_rendering.pColorAttachments    = &rcas_attachment;
+	command.beginRendering(&rcas_rendering);
+
+	const vk::Viewport rcas_viewport {0.0f, 0.0f,
+	                                  static_cast<float>(m_extent.width),
+	                                  static_cast<float>(m_extent.height),
+	                                  0.0f, 1.0f};
+	command.setViewport(0, 1, &rcas_viewport);
+	command.setScissor(0, 1, &game_rect);
+	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_rcas_pipeline);
+
+	const vk::DescriptorImageInfo rcas_source_desc {
+	    m_fsr_sampler, source->view, vk::ImageLayout::eShaderReadOnlyOptimal};
+	vk::WriteDescriptorSet rcas_write {};
+	rcas_write.dstBinding      = 0;
+	rcas_write.descriptorCount = 1;
+	rcas_write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
+	rcas_write.pImageInfo      = &rcas_source_desc;
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_rcas_layout, 0, 1,
+	                             &rcas_write);
+
+	const struct {
+		int32_t x;
+		int32_t y;
+		int32_t width;
+		int32_t height;
+		float   sharpness;
+	} rcas_params {
+		game_rect.offset.x,
+		game_rect.offset.y,
+		static_cast<int32_t>(game_rect.extent.width),
+		static_cast<int32_t>(game_rect.extent.height),
+		m_upscale_mode.sharpness
+	};
+	command.pushConstants(m_rcas_layout, vk::ShaderStageFlagBits::eFragment, 0,
+	                      sizeof(rcas_params), &rcas_params);
+	command.draw(3, 1, 0, 0);
+	command.endRendering();
+}
+
+void Swapchain::DrawCmaa2(vk::CommandBuffer command, Presenter::Frame* source,
+                          const vk::Rect2D& game_rect) {
+	auto& graphics = m_window.graphic_ctx;
+	auto  device   = graphics.device;
+	EnsureFsrPipelines();
+
+	if (source->view == nullptr) {
+		vk::ImageViewCreateInfo view_info {};
+		view_info.image            = source->image.image;
+		view_info.viewType         = vk::ImageViewType::e2D;
+		view_info.format           = source->image.format;
+		view_info.subresourceRange = {vk::ImageAspectFlagBits::eColor, 0, 1, 0, 1};
+		RequireVulkanSuccess(device.createImageView(&view_info, nullptr, &source->view),
+		                     "create video-out source image view for CMAA2");
+	}
+
+	vk::RenderingAttachmentInfo cmaa2_attachment {};
+	cmaa2_attachment.imageView   = m_image_views[m_image_index];
+	cmaa2_attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+	cmaa2_attachment.loadOp      = (game_rect.extent == m_extent)
+	                                   ? vk::AttachmentLoadOp::eDontCare
+	                                   : vk::AttachmentLoadOp::eLoad;
+	cmaa2_attachment.storeOp     = vk::AttachmentStoreOp::eStore;
+
+	vk::RenderingInfo cmaa2_rendering {};
+	cmaa2_rendering.renderArea.extent    = m_extent;
+	cmaa2_rendering.layerCount           = 1;
+	cmaa2_rendering.colorAttachmentCount = 1;
+	cmaa2_rendering.pColorAttachments    = &cmaa2_attachment;
+	command.beginRendering(&cmaa2_rendering);
+
+	const vk::Viewport cmaa2_viewport {0.0f, 0.0f,
+	                                   static_cast<float>(m_extent.width),
+	                                   static_cast<float>(m_extent.height),
+	                                   0.0f, 1.0f};
+	command.setViewport(0, 1, &cmaa2_viewport);
+	command.setScissor(0, 1, &game_rect);
+	command.bindPipeline(vk::PipelineBindPoint::eGraphics, m_cmaa2_pipeline);
+
+	const vk::DescriptorImageInfo cmaa2_source_desc {
+	    m_fsr_sampler, source->view, vk::ImageLayout::eShaderReadOnlyOptimal};
+	vk::WriteDescriptorSet cmaa2_write {};
+	cmaa2_write.dstBinding      = 0;
+	cmaa2_write.descriptorCount = 1;
+	cmaa2_write.descriptorType  = vk::DescriptorType::eCombinedImageSampler;
+	cmaa2_write.pImageInfo      = &cmaa2_source_desc;
+	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eGraphics, m_cmaa2_layout, 0, 1,
+	                             &cmaa2_write);
+
+	const struct {
+		int32_t x;
+		int32_t y;
+		int32_t width;
+		int32_t height;
+	} cmaa2_params {
+		game_rect.offset.x,
+		game_rect.offset.y,
+		static_cast<int32_t>(game_rect.extent.width),
+		static_cast<int32_t>(game_rect.extent.height)
+	};
+	command.pushConstants(m_cmaa2_layout, vk::ShaderStageFlagBits::eFragment, 0,
+	                      sizeof(cmaa2_params), &cmaa2_params);
+	command.draw(3, 1, 0, 0);
+	command.endRendering();
+}
+
 void Swapchain::DrawLayer(vk::CommandBuffer command, const Presenter::Layer& layer,
                           const vk::Rect2D& rect) {
 	auto device = m_window.graphic_ctx.device;
@@ -1137,14 +1322,21 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 	const bool  upscaled      = m_upscale_mode.fsr && source != nullptr && !convert_source &&
 	                            (game_rect.extent.width > source->image.extent.width ||
 	                             game_rect.extent.height > source->image.extent.height);
-	const bool blit_source     = source != nullptr && !convert_source && !upscaled;
+	const bool native_1_1 = source != nullptr && !convert_source &&
+	                        game_rect.extent.width == source->image.extent.width &&
+	                        game_rect.extent.height == source->image.extent.height;
+	const bool native_rcas     = m_upscale_mode.rcas && native_1_1;
+	const bool native_cmaa2    = m_upscale_mode.cmaa2 && native_1_1;
+	const bool filter_source   = upscaled || native_rcas || native_cmaa2;
+	const bool blit_source     = source != nullptr && !convert_source && !filter_source;
 	const bool draw_overlay    = overlay.frame != nullptr;
-	const bool draw_attachment = convert_source || draw_overlay || draw_system_overlay || upscaled;
+	const bool draw_attachment =
+	    convert_source || draw_overlay || draw_system_overlay || filter_source;
 	if (blit_source) {
 		source->Transit(vk_command, vk::ImageLayout::eTransferSrcOptimal,
 		                vk::AccessFlagBits2::eTransferRead);
 	}
-	if (convert_source || upscaled) {
+	if (convert_source || filter_source) {
 		source->Transit(vk_command, vk::ImageLayout::eShaderReadOnlyOptimal,
 		                vk::AccessFlagBits2::eShaderRead);
 	}
@@ -1240,6 +1432,16 @@ void Swapchain::RecordPresentCommands(CommandBuffer& command, Presenter::Frame* 
 		};
 		if (upscaled) {
 			DrawFsr(vk_command.Direct(), source, game_rect);
+			if (draw_overlay || draw_system_overlay) {
+				attachment_barrier();
+			}
+		} else if (native_rcas) {
+			DrawRcasNative(vk_command.Direct(), source, game_rect);
+			if (draw_overlay || draw_system_overlay) {
+				attachment_barrier();
+			}
+		} else if (native_cmaa2) {
+			DrawCmaa2(vk_command.Direct(), source, game_rect);
 			if (draw_overlay || draw_system_overlay) {
 				attachment_barrier();
 			}

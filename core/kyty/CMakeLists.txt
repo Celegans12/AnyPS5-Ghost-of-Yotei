@@ -188,6 +188,7 @@ kyty_embed_shader(gpu_blit_shaders gpu_pssr_linear gpu_pssr_linear.comp)
 kyty_embed_shader(gpu_blit_shaders gpu_mesh_indirect gpu_mesh_indirect.task --target-env spirv1.5)
 kyty_embed_shader(gpu_blit_shaders gpu_fsr_easu gpu_fsr_easu.frag -I${ANYPS5_SOURCE_DIR}/3rdparty/FidelityFX-FSR/ffx-fsr)
 kyty_embed_shader(gpu_blit_shaders gpu_fsr_rcas gpu_fsr_rcas.frag -I${ANYPS5_SOURCE_DIR}/3rdparty/FidelityFX-FSR/ffx-fsr)
+kyty_embed_shader(gpu_blit_shaders gpu_cmaa2 gpu_cmaa2.frag)
 add_custom_target(kyty_gpu_shaders DEPENDS ${KYTY_SHADER_HEADERS})
 
 file(GLOB_RECURSE KYTY_GPU_SOURCES CONFIGURE_DEPENDS "${KYTY_DIR}/graphics/*.cpp" "${KYTY_DIR}/common/*.cpp")
