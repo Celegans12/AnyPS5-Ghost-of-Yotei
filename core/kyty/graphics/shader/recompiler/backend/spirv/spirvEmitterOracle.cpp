@@ -27,6 +27,7 @@ constexpr uint32_t ContextCounting  = 60;
 constexpr uint32_t ContextRounds    = 64;
 constexpr uint32_t ContextWaves     = 68;
 constexpr uint32_t ContextProposed  = 72;
+constexpr uint32_t ContextFlags     = 76;
 constexpr uint32_t SlotBlas         = 40;
 constexpr uint32_t SlotRoot         = 48;
 constexpr uint32_t OracleFlags      = IR::BvhIntersectNative | IR::BvhIntersectOracle | IR::BvhIntersectOracleLane;
@@ -130,8 +131,8 @@ void DeclareOracleVariables(EmitterState& s) {
 		declare(wide, lane.blas);
 		declare(wide, lane.proposed_blas);
 	}
-	for (auto* variable: {&s.oracle.valid, &s.oracle.root, &s.oracle.counting, &s.oracle.served, &s.oracle.returned,
-	                      &s.oracle.proposed, &s.oracle.resumed}) {
+	for (auto* variable: {&s.oracle.valid, &s.oracle.root, &s.oracle.counting, &s.oracle.per_lane, &s.oracle.served,
+	                      &s.oracle.returned, &s.oracle.proposed, &s.oracle.resumed}) {
 		declare(u, *variable);
 	}
 	for (auto* variable: {&s.oracle.context, &s.oracle.header, &s.oracle.tlas, &s.oracle.nodes, &s.oracle.slots}) {
@@ -156,7 +157,8 @@ void InitializeOracleVariables(EmitterState& s) {
 		Store(s, variable, ConstantU64(s, 0));
 	}
 	Store(s, s.oracle.root, U32(s, None));
-	for (const auto variable: {s.oracle.counting, s.oracle.served, s.oracle.returned, s.oracle.proposed, s.oracle.resumed}) {
+	for (const auto variable:
+	     {s.oracle.counting, s.oracle.per_lane, s.oracle.served, s.oracle.returned, s.oracle.proposed, s.oracle.resumed}) {
 		Store(s, variable, U32(s, 0));
 	}
 	EmitIfCondition(s, present, [&] {
@@ -168,6 +170,7 @@ void InitializeOracleVariables(EmitterState& s) {
 		Store(s, s.oracle.nodes, LoadAddressU64(s, AddressPlus(s, context, ContextInstanceNodes)));
 		Store(s, s.oracle.slots, LoadAddressU64(s, AddressPlus(s, context, ContextSlots)));
 		Store(s, s.oracle.root, LoadAddressU32(s, AddressPlus(s, context, ContextRoot)));
+		Store(s, s.oracle.per_lane, And(s, LoadAddressU32(s, AddressPlus(s, context, ContextFlags)), 1u));
 	});
 	for (uint32_t half = 0; half < s.lane_count; half++) {
 		const auto& lane = s.oracle.lanes[half];
@@ -328,15 +331,15 @@ uint32_t EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst) {
 		for (uint32_t i = 0; i < 3; i++) {
 			shared[i] = GroupMin(s, pick[i]);
 		}
-		const auto has  = Binary(s, spv::OpINotEqual, b, leaf, none);
 		const auto blas = PackU64(s, shared[0], shared[1]);
+		const auto own  = Binary(s, spv::OpINotEqual, b, Load(s, u, s.oracle.per_lane), U32(s, 0));
 		for (uint32_t half = 0; half < s.lane_count; half++) {
 			auto& c = calls[half];
-			c.leaf  = leaf;
-			c.entry = entry;
-			c.blas  = blas;
-			c.root  = shared[2];
-			c.has   = has;
+			c.leaf  = Select(s, u, own, c.leaf, leaf);
+			c.entry = Select(s, u, own, c.entry, entry);
+			c.blas  = Select(s, wide, own, c.blas, blas);
+			c.root  = Select(s, u, own, c.root, shared[2]);
+			c.has   = Binary(s, spv::OpINotEqual, b, c.leaf, none);
 		}
 	} else {
 		for (uint32_t half = 0; half < s.lane_count; half++) {
@@ -422,7 +425,7 @@ void FlushOracleCounts(EmitterState& s) {
 			AtomicAdd(s, AddressPlus(s, context, ContextWaves), waves);
 			AtomicAdd(s, AddressPlus(s, context, ContextProposed), proposed);
 		});
-		if (!s.ray_stats) return;
+		if (!s.ray_stats || s.fault_buffer_variable == 0) return;
 		const auto marked = Binary(s, spv::OpINotEqual, b, Or(s, Or(s, rays, guest), proposed), U32(s, 0));
 		EmitIfCondition(s, LogicalAnd(s, elected, marked), [&] {
 			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_RETURNED, guest);

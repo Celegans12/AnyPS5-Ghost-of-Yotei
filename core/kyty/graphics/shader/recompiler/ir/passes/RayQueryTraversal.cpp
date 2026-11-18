@@ -5751,7 +5751,8 @@ const char* MatchUniversalWalk(Program& program, std::span<Inst* const> candidat
 
 NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOptions& options) {
 	NativeTraversals result;
-	if (program.stage != ShaderType::Compute) return result;
+	const bool       compute = program.stage == ShaderType::Compute;
+	if (!compute && (program.stage != ShaderType::Pixel || (options.oracle & OracleRemaining) == 0)) return result;
 	std::vector<Inst*> intersections;
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {
@@ -5778,7 +5779,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		});
 	};
 	for (auto* bvh: intersections) {
-		if (inside(bvh->Parent()) || (options.oracle & OracleOnly) != 0) continue;
+		if (inside(bvh->Parent()) || (options.oracle & OracleOnly) != 0 || !compute) continue;
 		Walk walk;
 		bool found = false;
 		if (MatchPacketWalk(program, *bvh, walk.packet)) {
@@ -5847,7 +5848,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 					walks.push_back(std::move(each));
 				}
 			} else {
-				LOGF("CS universal ray tracing: hash=0x%016llx keeps the guest walk: %s (%u)\n",
+				LOGF("%s universal ray tracing: hash=0x%016llx keeps the guest walk: %s (%u)\n", compute ? "CS" : "PS",
 				     static_cast<unsigned long long>(program.shader_hash), reason, walk.lane.refused);
 			}
 		}
@@ -5909,8 +5910,8 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 				if (InLoop(program, bvh->Parent(), walk.header, walk.latch)) served.push_back(bvh);
 			}
 			if (const auto flags = MarkOracleWalk(served); flags != 0) {
-				LOGF("CS universal ray tracing: hash=0x%016llx answers %zu intersections from the host query (%s mode)\n",
-				     static_cast<unsigned long long>(program.shader_hash), served.size(),
+				LOGF("%s universal ray tracing: hash=0x%016llx answers %zu intersections from the host query (%s mode)\n",
+				     compute ? "CS" : "PS", static_cast<unsigned long long>(program.shader_hash), served.size(),
 				     (flags & BvhIntersectOracleLane) != 0 ? "lane" : "wave");
 				++result.sites;
 				continue;

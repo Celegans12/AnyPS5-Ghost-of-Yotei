@@ -1441,7 +1441,7 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 
 void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
                                const TlasSource& source, const vk::DescriptorBufferInfo& flattened_srt,
-                               uint64_t frame, uint64_t shader_hash, bool count_rays) {
+                               uint64_t frame, uint64_t shader_hash, bool count_rays, bool per_lane) {
 	if (!m_enabled) {
 		return;
 	}
@@ -1695,7 +1695,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	    .instance_capacity = tlas_count,
 	    .table_mask        = TableEntries - 1,
 	    .prepare_id        = m_prepare_id,
-	    .verify            = (verify ? 1u : 0u) | (count_rays ? 2u : 0u),
+	    .verify            = (verify ? 1u : 0u) | (count_rays ? 2u : 0u) | (per_lane ? 4u : 0u),
 	    .layout            = source.layout,
 	};
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_tlas_pipeline);

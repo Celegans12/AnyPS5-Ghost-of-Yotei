@@ -658,7 +658,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	}
 	const auto*      tracked = &decoded;
 	Decoder::Program traced_source;
-	if (options.stage == ShaderType::Compute) {
+	if (options.stage == ShaderType::Compute ||
+	    (options.stage == ShaderType::Pixel && options.native_ray_tracing && options.rt_oracle != 0)) {
 		const auto traced = IR::TraceNativeTraversals(
 		    ir, {.wave_size = options.wave_size,
 		         .rewrite   = options.native_ray_tracing,

@@ -98,6 +98,7 @@ struct OracleVariables {
 	uint32_t                           slots    = 0;
 	uint32_t                           root     = 0;
 	uint32_t                           counting = 0;
+	uint32_t                           per_lane = 0;
 	uint32_t                           served   = 0;
 	uint32_t                           returned = 0;
 	uint32_t                           proposed = 0;

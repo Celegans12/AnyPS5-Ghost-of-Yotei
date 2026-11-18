@@ -448,6 +448,26 @@ static void UpdateGraphicsDynamicState(const CommandBuffer& buffer, DynamicState
 	}
 }
 
+static void PrepareDrawRayTracing(RenderContext& context, CommandBuffer& buffer, const PreparedBindings& bindings) {
+	auto* native_rt = context.GetRayTracing();
+	if (native_rt == nullptr || !native_rt->Enabled() || bindings.runtime == nullptr || bindings.runtime->module == nullptr) {
+		return;
+	}
+	const auto& module = *bindings.runtime->module;
+	const auto& info   = module.info.info;
+	RayTracing::TlasSource source;
+	if (!info.bvh || !RayTracing::FindTlasSource(info, source) || source.user_sgpr + 1 >= HW::UserSgprInfo::SGPRS_MAX) {
+		return;
+	}
+	const auto& user    = buffer.GetShaders().GetPs().ps_user_sgpr.value;
+	const auto  pointer = RayTracing::UserPointer(
+	    source, uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u),
+	    [&](uint64_t address, uint64_t size) { return context.IsMapped(address, size); });
+	buffer.EndRendering();
+	native_rt->Prepare(buffer.Handle(), pointer, source, bindings.flattened_srt, context.GetGpu().GetFrameNum(),
+	                   module.info.shader_hash);
+}
+
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {
 
 	const auto& vs = sh_ctx.GetVs();
@@ -2009,6 +2029,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
+	}
+	if (state.ps_active) {
+		PrepareDrawRayTracing(m_context, buffer, bindings.pixel);
 	}
 	if (shader_write_stages && !buffer.HasPendingShaderWrites()) {
 		buffer.EndRendering();

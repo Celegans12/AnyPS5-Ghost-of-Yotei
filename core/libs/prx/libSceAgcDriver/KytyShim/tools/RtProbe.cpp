@@ -18,6 +18,7 @@ namespace {
 
 namespace Recompiler = Libs::Graphics::ShaderRecompiler;
 using Libs::Graphics::ShaderComputeInputInfo;
+using Libs::Graphics::ShaderPixelInputInfo;
 using Libs::Graphics::ShaderType;
 
 struct Settings {
@@ -31,6 +32,8 @@ struct Settings {
 	bool     emit      = false;
 	bool     disabled  = false;
 	bool     stats     = false;
+	bool     pixel     = false;
+	uint32_t inputs    = 8;
 	uint32_t oracle    = 0;
 	std::string spirv;
 };
@@ -74,6 +77,15 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 	options.rt_oracle             = settings.disabled ? 0u : settings.oracle;
 	options.user_data             = user_data;
 	options.input_info.compute    = &compute;
+	ShaderPixelInputInfo pixel {};
+	if (settings.pixel) {
+		pixel.wave_size           = settings.wave;
+		pixel.input_num           = settings.inputs;
+		pixel.ps_pos_x            = pixel.ps_pos_y = pixel.ps_pos_z = pixel.ps_pos_w = true;
+		pixel.scratch_size_dwords = settings.scratch;
+		options.stage             = ShaderType::Pixel;
+		options.input_info.pixel  = &pixel;
+	}
 	auto source = Recompiler::PrepareShaderSource(code, options);
 	if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
 		std::printf("%s: calls\n", label);
@@ -118,7 +130,7 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 }
 
 int Usage() {
-	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-7] [--stats] (<shader.bin>... | --cache <file.code> --hash <hex>)\n");
+	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-7] [--stats] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex>)\n");
 	return 64;
 }
 
@@ -156,6 +168,12 @@ int main(int argc, char** argv) {
 			settings.emit = true;
 		} else if (arg == "--oracle" && i + 1 < argc) {
 			settings.oracle = static_cast<uint32_t>(std::atoi(argv[++i])) & 7u;
+		} else if (arg == "--stage" && i + 1 < argc) {
+			const std::string_view stage = argv[++i];
+			if (stage != "pixel" && stage != "compute") return Usage();
+			settings.pixel = stage == "pixel";
+		} else if (arg == "--inputs" && i + 1 < argc) {
+			settings.inputs = static_cast<uint32_t>(std::atoi(argv[++i]));
 		} else if (arg == "--stats") {
 			settings.stats = true;
 		} else if (arg == "--off") {

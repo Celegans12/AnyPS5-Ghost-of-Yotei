@@ -34,6 +34,7 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer ContextEntry
 	uint     rounds;
 	uint     waves;
 	uint     candidates;
+	uint     flags;
 };
 
 layout(push_constant, std430) uniform Push {
@@ -216,6 +217,7 @@ void main() {
 			ContextEntry(pc.context).rounds     = 0;
 			ContextEntry(pc.context).waves      = 0;
 			ContextEntry(pc.context).candidates = 0;
+			ContextEntry(pc.context).flags      = (pc.verify >> 2) & 1u;
 			if (psr) {
 				ContextEntry(pc.context).instance_count = ~0u;
 			}
@@ -451,6 +453,7 @@ void main() {
 			context.rounds         = 0;
 			context.waves          = 0;
 			context.candidates     = 0;
+			context.flags          = (pc.verify >> 2) & 1u;
 		}
 	}
 }

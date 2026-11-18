@@ -281,7 +281,7 @@ This build does not read KytyPS5's `KYTY_PIPELINE_PRECOMPILE`: stopping the game
 |---|---|---|---|---|---|---|
 | `KYTY_NATIVE_RT` | `0` or `1`, else stops | unset | Unset: native ray tracing when the device has `VK_KHR_acceleration_structure`, `VK_KHR_ray_query` and `VK_KHR_deferred_host_operations` with their features, emulated otherwise. `1`: native, and a stop when the device cannot. `0`: emulated. KytyPS5's own default is off | perf | all | Kyty option; on by default `8a29429250` |
 | `KYTY_RT_STATS` | `0` or `1`, else stops | `0` | With native ray tracing, shaders count their queries and an `[RT]` summary of the last 10 seconds is logged | debug | all | Kyty option |
-| `KYTY_RT_ORACLE` | `0` to `7`, else stops | `0` | With native ray tracing, bit 1: the BVH intersections of walks no form recognizes answer from a host ray query while the guest walk code runs as written; bit 2: the walks a form recognizes are served the same way instead of their rewrite; bit 4: no form is tried | perf | all | AnyKyty |
+| `KYTY_RT_ORACLE` | `0` to `7`, else stops | `0` | With native ray tracing, bit 1: the BVH intersections of walks no form recognizes answer from a host ray query while the guest walk code runs as written; bit 2: the walks a form recognizes are served the same way instead of their rewrite; bit 4: no form is tried. Bit 1 also serves the walks of pixel shaders, whose draws then build the host TLAS before their rendering pass | perf | all | AnyKyty |
 | `KYTY_RT_ARENA_MB` | MiB, empty counts as unset | a quarter of the largest device-local heap, 512 MiB to 4 GiB | Limit of the memory the native BLASes take; `0` means no limit | perf | all | Kyty import |
 
 ### Logs, dumps, validation and profiling
@@ -442,7 +442,8 @@ default) recompiles such a shader offline, from its raw machine code, as the dri
 prints, per file, its BVH intersections, how many of them trace with ray queries, and the TLAS source and instance
 record layout derived for them, and exits with 0 only when every intersection does. `--dump` adds the IR, `--off`
 compiles as with `KYTY_NATIVE_RT=0`, `--oracle 0-7` as with `KYTY_RT_ORACLE`, `--stats` as with `KYTY_RT_STATS=1`, and
-`--subgroup 32` translates a wave of 64 for a GPU with subgroups of 32, as the driver does there; the line then ends with
+`--subgroup 32` translates a wave of 64 for a GPU with subgroups of 32, as the driver does there, `--stage pixel` translates a
+pixel shader (`--inputs N` interpolated inputs, 8 by default) instead of a compute one; the line then ends with
 `oracle=N lane=M`, the intersections that answer from a host ray query and those of them that do it lane by lane.
 
 To probe directly from the game's local pipeline manifest code cache, use

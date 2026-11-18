@@ -588,6 +588,12 @@ void SkipCallExpansionFailure(uint64_t hash, const ShaderRecompiler::ShaderSourc
 }
 
 void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, bool native) {
+	if (native && stage == ShaderType::Pixel && RayTracing::NativeTraversals() && Config::RayTracingOracle() != 0) {
+		key.push_back(0x52544f00u | Config::RayTracingOracle());
+		if (Config::RayTracingStatsEnabled()) {
+			key.push_back(0x52545354u);
+		}
+	}
 	if (native && stage == ShaderType::Compute && RayTracing::NativeTraversals()) {
 		key.push_back(0x52545041u);
 		if (Config::RayTracingStatsEnabled()) {

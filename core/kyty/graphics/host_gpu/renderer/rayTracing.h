@@ -85,7 +85,7 @@ public:
 
 	void Prepare(const CommandRecorder& command, uint64_t user_pointer, const TlasSource& source,
 	             const vk::DescriptorBufferInfo& flattened_srt, uint64_t frame, uint64_t shader_hash,
-	             bool count_rays = false);
+	             bool count_rays = false, bool per_lane = false);
 
 	enum class HleTlasFormat : uint32_t {
 		Base460,
