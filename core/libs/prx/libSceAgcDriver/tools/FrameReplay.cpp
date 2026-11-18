@@ -10,6 +10,9 @@
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "SceTypes.hpp"
+#if defined(ANYPS5_KYTY)
+#include "FrameReplaySampling.hpp"
+#endif
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -154,11 +157,13 @@ struct Sample {
     std::map<long, ThreadSample> threads;
     Counters counters{};
     std::uint64_t endedNs = 0;
+    AgcDriver::FrameReplaySampleTiming timing;
 };
 
 Sample sampleNow() {
+    const auto start = Clock::now();
     const auto ended = endedThreadNs.load();
-    return {sampleThreads(), countersNow(), ended};
+    return {sampleThreads(), countersNow(), ended, {start, Clock::now()}};
 }
 #endif
 
@@ -1397,6 +1402,7 @@ struct Pass {
 #if defined(ANYPS5_KYTY)
     Sample begin;
     Sample end;
+    Clock::time_point sampleDeadline;
 #endif
 };
 #if defined(ANYPS5_KYTY)
@@ -1520,6 +1526,7 @@ int run(const Options& options) {
         replay.endedAt = Clock::now();
 #if defined(ANYPS5_KYTY)
         if (replay.unfinished == 0) AgcDriverWaitIdle_nid_postfix();
+        measured.sampleDeadline = Clock::now();
         static_cast<void>(replay.frames.Samples());
         measured.end = sampleNow();
 #endif
@@ -1548,6 +1555,9 @@ int run(const Options& options) {
     const auto samples = replay.frames.Samples();
     Window whole;
     Window steady;
+    std::size_t expectedIntervals = 0;
+    std::size_t missingIntervals = 0;
+    std::size_t lateIntervals = 0;
 #endif
     for (std::size_t index = 0; index < passes.size(); ++index) {
         const auto& measured = passes[index];
@@ -1564,12 +1574,31 @@ int run(const Options& options) {
         frames += measured.frames;
 #if defined(ANYPS5_KYTY)
         whole.Add(measured.begin, measured.end, measured.frames, true);
-        for (auto frame = measured.firstFrame + 1; frame < measured.firstFrame + measured.frames && frame < samples.size(); ++frame) steady.Add(samples[frame - 1], samples[frame], 1);
+        const auto passEnd = measured.firstFrame + measured.frames;
+        for (auto frame = measured.firstFrame + 1; frame < passEnd; ++frame) {
+            ++expectedIntervals;
+            if (frame >= samples.size()) {
+                ++missingIntervals;
+                continue;
+            }
+            const auto deadline = frame + 1 < passEnd ? ready[frame + 1] : measured.sampleDeadline;
+            if (AgcDriver::FrameReplaySamplesCoverInterval(samples[frame - 1].timing, samples[frame].timing,
+                                                           ready[frame - 1], ready[frame], deadline)) {
+                steady.Add(samples[frame - 1], samples[frame], 1);
+            } else {
+                ++lateIntervals;
+            }
+        }
 #endif
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
 #if defined(ANYPS5_KYTY)
-    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"park_restores\":%llu,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f,\"draws\":%llu,\"draws_per_frame\":%.1f,\"frames_written\":%zu,\"stages\":[%s],\"counters_per_frame\":{%s},\"steady\":{\"frames\":%zu,\"draws_per_frame\":%.1f,\"counters_per_frame\":{%s},\"stages\":[%s]}}\n",
+    char steadyDraws[64] = "null";
+    if (steady.frames) {
+        std::snprintf(steadyDraws, sizeof(steadyDraws), "%.1f", static_cast<double>(steady.Draws()) / static_cast<double>(steady.frames));
+    }
+    const auto steadyCounters = steady.frames ? "{" + steady.PerFrame() + "}" : "null";
+    std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"park_restores\":%llu,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f,\"draws\":%llu,\"draws_per_frame\":%.1f,\"frames_written\":%zu,\"stages\":[%s],\"counters_per_frame\":{%s},\"steady\":{\"frames\":%zu,\"draws_per_frame\":%s,\"counters_per_frame\":%s,\"stages\":[%s],\"sample_coverage\":{\"expected_intervals\":%zu,\"missing_intervals\":%zu,\"late_intervals\":%zu}}}\n",
 #else
     std::printf("{\"frames\":%zu,\"replay_s\":%.3f,\"fps\":%.3f,\"frame_ms\":{\"p50\":%.3f,\"p90\":%.3f,\"max\":%.3f,\"each\":[%s]},\"passes\":[%s],\"kept_reservations\":%llu,\"submits\":%llu,\"delta_mib\":%.1f,\"park_restores\":%llu,\"pace_timeouts\":%llu,\"pace_wait_s\":%.3f,\"stale_registrations\":%llu,\"failed_registrations\":%llu,\"skipped_mib\":%.1f,\"threads\":%zu,\"released_waits\":%llu,\"of_them_from_earlier_writes\":%llu,\"of_them_synthesized\":%llu,\"unfinished\":%llu,\"frames_compared\":%zu,\"pixels_identical\":%.6f,\"max_channel_diff\":%d,\"load_s\":%.3f,\"journal_s\":%.3f}\n",
 #endif
@@ -1582,7 +1611,7 @@ int run(const Options& options) {
 #if defined(ANYPS5_KYTY)
                 static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds,
                 static_cast<unsigned long long>(whole.Draws()), frames > 0 ? static_cast<double>(whole.Draws()) / static_cast<double>(frames) : 0.0, check.written, whole.Stages().c_str(), whole.PerFrame().c_str(),
-                steady.frames, steady.frames > 0 ? static_cast<double>(steady.Draws()) / static_cast<double>(steady.frames) : 0.0, steady.PerFrame().c_str(), steady.Stages().c_str());
+                steady.frames, steadyDraws, steadyCounters.c_str(), steady.Stages().c_str(), expectedIntervals, missingIntervals, lateIntervals);
 #else
                 static_cast<unsigned long long>(replay.unfinished), check.compared, check.identical, check.maxDifference, std::chrono::duration<double>(loaded - loadStart).count(), journalSeconds);
 #endif

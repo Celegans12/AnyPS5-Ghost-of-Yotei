@@ -1,3 +1,9 @@
+add_test_executable(kyty_shim_replay_sampling_tests ${CMAKE_CURRENT_SOURCE_DIR}/ReplaySampling.cpp)
+configure_host_test_executable(kyty_shim_replay_sampling_tests)
+target_include_directories(kyty_shim_replay_sampling_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../tools)
+add_test(NAME kyty_shim_replay_sampling COMMAND kyty_shim_replay_sampling_tests)
+set_tests_properties(kyty_shim_replay_sampling PROPERTIES TIMEOUT 20)
+
 add_test_executable(kyty_shim_events_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/Events.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../src/Events.cpp
