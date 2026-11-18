@@ -159,23 +159,14 @@ How to read the columns:
 
 ### Window, display and upscaling
 
-AnyPS5 opens the window, so Kyty's window options do nothing; `ANYPS5_FULLSCREEN`, `ANYPS5_DISPLAY_INDEX` and the others in [the AnyPS5 settings below](#anyps5-settings-that-an-anykyty-session-also-reads) apply.
+AnyPS5 opens the window, so Kyty's window options do nothing; `ANYPS5_FULLSCREEN`, `ANYPS5_DISPLAY_INDEX` and the others in [the AnyPS5 settings below](#anyps5-settings-that-an-anykyty-session-also-reads) apply. This build does not read KytyPS5's `KYTY_FULLSCREEN`, `KYTY_HIDE_CURSOR`, `KYTY_VR`, `KYTY_RENDERDOC`, `KYTY_SCREEN_WIDTH`, `KYTY_SCREEN_HEIGHT`, `KYTY_CONSOLE_LANGUAGE`, `KYTY_TROPHY_NOTIFICATIONS` or `KYTY_TROPHY_DURATION`: the code they drive is not built, and the initial window size gives way to AnyPS5's window before any swapchain exists, so setting one changes nothing.
 
 | Variable | Values | Default | Effect | Category | Platform | Origin |
 |---|---|---|---|---|---|---|
-| `KYTY_FULLSCREEN` | `0` or `1`, else stops | `0` | Kyty's fullscreen option; nothing reads it in this build, `ANYPS5_FULLSCREEN` does the job | inert | — | Kyty option |
-| `KYTY_HIDE_CURSOR` | `0` or `1`, else stops | `0` | Kyty's cursor hiding, in `hostInput.cpp`, which is not built | inert | — | Kyty option |
 | `KYTY_BORDERLESS` | any value | unset | Borderless window flag, set in `window.cpp`, which is not built | inert | — | KytyPS5 |
-| `KYTY_VR` | `0` or `1`, else stops | `0` | Kyty's OpenXR mode; `OpenXrInit` is an empty function in the shim | inert | — | Kyty option |
 | `KYTY_OPENXR` | `0` | unset | Skips OpenXR start-up; read in `openxrHeadset.cpp`, which is not built | inert | — | KytyPS5 |
-| `KYTY_RENDERDOC` | `0` or `1`, else stops | `0` | RenderDoc capture support, in `window.cpp` and `renderDoc.cpp`, which are not built | inert | — | Kyty option |
-| `KYTY_CONSOLE_LANGUAGE` | 0 to 29, else stops | `1` | Language of Kyty's system overlay, in `systemOverlay.cpp`, which is not built; the title's language comes from AnyPS5 | inert | — | Kyty option |
-| `KYTY_TROPHY_NOTIFICATIONS` | `0` or `1`, else stops | `1` | Trophy toasts of Kyty's system overlay; no code that is built reads the option | inert | — | Kyty option |
-| `KYTY_TROPHY_DURATION` | whole number, else stops | `6` | Seconds a trophy toast shows (5 to 10), in `systemOverlay.cpp`, which is not built | inert | — | Kyty option |
 | `KYTY_HDR` | `0` or `1`, else stops | `0` | Asks for an HDR10 swapchain format; without one the log says `HDR10 surface unavailable; using SDR output` | option | all | Kyty option |
 | `KYTY_STRETCH` | `0` or `1`, else stops | `0` | Fills the whole window with the game's image instead of fitting its aspect ratio | option | all | Kyty option |
-| `KYTY_SCREEN_WIDTH` | 1 or more, else stops | `1280` | Initial width of Kyty's window context; AnyPS5's window replaces it when it attaches, before any swapchain exists, so neither the resolution the title sees nor the render size depends on it (`APS5_OUTPUT_RESOLUTION` sets the former) | inert | — | Kyty option |
-| `KYTY_SCREEN_HEIGHT` | 1 or more, else stops | `720` | Initial height of the same | inert | — | Kyty option |
 | `KYTY_PRESENT_MODE` | `Fifo`, `Mailbox`, `Immediate`, any case, else stops | `Mailbox` | Vulkan present mode of the swapchain; `ANYPS5_PRESENT_MODE` is not read with this backend | option | all | Kyty option |
 | `KYTY_GPU` | whole number, else stops | `-1` | Index of the Vulkan physical device; `-1`, or an index with no device (the log says so), lets Kyty choose; `ANYPS5_GPU` is not read with this backend | option | all | Kyty option |
 | `KYTY_VBLANK_FREQUENCY` | whole number, clamped to 30 to 360, else stops | unset | Vblank rate when `ANYPS5_VBLANK_HZ` is unset or empty; it also becomes Kyty's own vblank frequency. Unset keeps the output's 59.94 Hz and 119.88 Hz | option | all | Kyty option; `bffccd0fbf` |
@@ -263,6 +254,8 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 
 ### Pipelines and shader store
 
+This build does not read KytyPS5's `KYTY_PIPELINE_PRECOMPILE`: stopping the game while the manifest's pipelines compile needs the helper processes and `GuestPause::Supported()`, and this build has neither, so the game never stops for them.
+
 | Variable | Values | Default | Effect | Category | Platform | Origin |
 |---|---|---|---|---|---|---|
 | `KYTY_ASYNC_PIPELINES` | `0` or `1`, else stops | `1` | For a draw that only changes the picture, and is not a small colour target, the pipeline is created on a background thread and the draw is skipped until it is ready; `0` always waits for it | perf | all | Kyty option |
@@ -275,7 +268,6 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 | `KYTY_PIPELINE_MANIFEST` | `0` or `1`, else stops | `1` | Warms the pipelines listed in the title's manifest (shipped with the assets, or recorded in an earlier session) at start | perf | all | Kyty option |
 | `KYTY_RECORD_PIPELINE_MANIFEST` | `0` or `1`, else stops | `0` | Records the pipelines of the session as a manifest even when the manifest is off; the shader store is not used while it records | debug | all | Kyty option |
 | `KYTY_STRICT_PIPELINE_MANIFEST` | `0` or `1`, else stops | `0` (the build's `KYTY_STRICT_PIPELINE_MANIFEST_DEFAULT`) | A pipeline of a shipped manifest that fails to build stops the emulator instead of being dropped | debug | all | Kyty option |
-| `KYTY_PIPELINE_PRECOMPILE` | `Ask`, `Wait`, `Play`, any case, else stops | `Ask` | Whether the game stops while the pipelines of the manifest compile. Stopping needs the helper processes, which this build never starts, and `GuestPause::Supported()`, which the shim answers with `false`; the notice that asks is not drawn either, so every value plays at once | inert | — | Kyty option |
 | `KYTY_PIPELINE_HELPERS` | number | unset | Number of helper processes that compile pipelines. They are never started in this build: `PipelineHelperProcesses` returns 0 on Linux and when `ANYPS5_KYTY` is defined | inert | — | Kyty import |
 | `KYTY_SHADER_CACHE` | `0` or `1`, else stops | `0` | Keeps recompiled shaders in `_PipelineCache/<title id>.shaders` and warms them up at start; a Release build only, and not while `KYTY_GRAPHICS_DEBUG_DUMP` or the manifest recording is on | perf | all | Kyty option |
 | `KYTY_SHADER_CACHE_STAMP` | integer in base 0, else ignored | the stamp the build computes from the shader recompiler's sources | Replaces the stamp written in the shader store's header; `0` turns the store off | debug | all | `4749ffc567` |
@@ -298,7 +290,7 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 | `KYTY_PRINTF_DIRECTION` | `Silent`, `Console`, `File`, any case, else stops | `Silent` | Where Kyty's log (`LOGF`) goes: nowhere, stderr beside AnyPS5's own lines, or `KYTY_PRINTF_OUTPUT_FILE` | debug | all | Kyty option |
 | `KYTY_PRINTF_OUTPUT_FILE` | path | `_kyty.txt` | File of the `File` direction | debug | all | Kyty option |
 | `KYTY_SESSION_LOG` | path | empty | Session log file, opened at start with a header | debug | all | Kyty option |
-| `KYTY_RELAUNCHED` | any value | unset | Makes the log files append instead of truncate. KytyPS5's launcher sets it when it starts the emulator again; nothing sets it here | debug | all | KytyPS5 |
+| `KYTY_RELAUNCHED` | any value | unset | KytyPS5's launcher sets it when it starts the emulator again, and KytyPS5's `common/logging/log.cpp`, which is not built, then appends to the log files. The shim's log does not read it: its files are truncated at each start | inert | — | KytyPS5 |
 | `KYTY_SHADER_LOG_DIRECTION` | `Silent`, `Console`, `File`, any case, else stops | `Silent` | Anything but `Silent` makes the recompiler dump its IR; the shader dumps go under `KYTY_SHADER_LOG_FOLDER` | debug | all | Kyty option |
 | `KYTY_SHADER_LOG_FOLDER` | path | `_Shaders` | Folder of the shader dumps | debug | all | Kyty option |
 | `KYTY_COMMAND_BUFFER_DUMP` | `0` or `1`, else stops | `0` | Writes each command buffer the title submits to a file under `KYTY_COMMAND_BUFFER_DUMP_FOLDER`, named by frame and number | debug | all | Kyty option |

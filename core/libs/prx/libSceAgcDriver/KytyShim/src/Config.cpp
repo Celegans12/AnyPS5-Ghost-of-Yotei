@@ -35,11 +35,8 @@ struct Flag {
 };
 
 constexpr Flag Flags[] = {
-    {"KYTY_FULLSCREEN", &Options::fullscreen_enabled},
     {"KYTY_HDR", &Options::hdr_enabled},
-    {"KYTY_HIDE_CURSOR", &Options::hide_cursor_enabled},
     {"KYTY_STRETCH", &Options::stretch_enabled},
-    {"KYTY_VR", &Options::vr_enabled},
     {"KYTY_TRINITY", &Options::pro_enabled},
     {"KYTY_VULKAN_VALIDATION", &Options::vulkan_validation_enabled},
     {"KYTY_GPU_ASSISTED_VALIDATION", &Options::gpu_assisted_validation_enabled},
@@ -57,13 +54,11 @@ constexpr Flag Flags[] = {
     {"KYTY_GRAPHICS_DEBUG_DUMP", &Options::graphics_debug_dump_enabled},
     {"KYTY_PROFILE", &Options::profiler_enabled},
     {"KYTY_SPIRV_DEBUG_PRINTF", &Options::spirv_debug_printf_enabled},
-    {"KYTY_RENDERDOC", &Options::renderdoc_enabled},
     {"KYTY_READBACK_LINEAR_IMAGES", &Options::readback_linear_images},
     {"KYTY_READBACK_TILED_IMAGES", &Options::readback_tiled_images},
     {"KYTY_READBACK_STORAGE_IMAGES", &Options::readback_storage_images},
     {"KYTY_SYNC_RAW_IMAGE_BUFFERS", &Options::sync_raw_image_buffers},
     {"KYTY_PERF_OVERLAY", &Options::perf_overlay_enabled},
-    {"KYTY_TROPHY_NOTIFICATIONS", &Options::trophy_enabled},
 };
 
 struct Number {
@@ -74,12 +69,8 @@ struct Number {
 };
 
 constexpr Number Numbers[] = {
-    {"KYTY_SCREEN_WIDTH", &Options::screen_width, 1, 0xffffffffu},
-    {"KYTY_SCREEN_HEIGHT", &Options::screen_height, 1, 0xffffffffu},
     {"KYTY_VBLANK_FREQUENCY", &Options::vblank_frequency, 0, 0xffffffffu},
     {"KYTY_FLUSH_DRAWS", &Options::flush_draws, 0, 0xffffffffu},
-    {"KYTY_TROPHY_DURATION", &Options::trophy_duration_seconds, 0, 0xffffffffu},
-    {"KYTY_CONSOLE_LANGUAGE", &Options::console_language, 0, Config::MAX_CONSOLE_LANGUAGE},
 };
 
 struct Path {
@@ -168,7 +159,6 @@ Options OptionsFromEnvironment(std::string& applied) {
     }
     ReadEnum("KYTY_PRESENT_MODE", options.present_mode, applied);
     ReadEnum("KYTY_PSSR_UPSCALER", options.pssr_upscaler, applied);
-    ReadEnum("KYTY_PIPELINE_PRECOMPILE", options.pipeline_precompile, applied);
     ReadEnum("KYTY_SHADER_LOG_DIRECTION", options.shader_log_direction, applied);
     ReadEnum("KYTY_PRINTF_DIRECTION", options.printf_direction, applied);
     if (options.gpu_assisted_validation_enabled) options.vulkan_validation_enabled = true;

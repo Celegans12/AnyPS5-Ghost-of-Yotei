@@ -164,7 +164,7 @@ All settings are environment variables, read once when the game starts. Most ref
 | `KYTY_VBLANK_FREQUENCY` | whole number, clamped to 30 to 360 | Kyty's name for the same setting, used when `ANYPS5_VBLANK_HZ` is unset |
 | `APS5_UNPACED_FLIPS` | `0`, `1` | Benchmark aid: a flip completes once presented instead of at the next vblank, so a game that renders faster than the vblank is not held to it. `KYTY_PRESENT_MODE` still decides what the display shows |
 | `KYTY_PRESENT_MODE` | `Fifo`, `Mailbox`, `Immediate` | Vulkan present mode (`Mailbox` by default) |
-| `ANYPS5_FULLSCREEN` | `0`, `1`, `windowed`, `borderless` | Opens the window fullscreen. Kyty's own `KYTY_FULLSCREEN` does nothing here |
+| `ANYPS5_FULLSCREEN` | `0`, `1`, `windowed`, `borderless` | Opens the window fullscreen. Kyty's own `KYTY_FULLSCREEN` is not read |
 | `KYTY_GPU` | GPU index, `-1` for Kyty's choice (default) | Picks the Vulkan device. `ANYPS5_GPU` is not read with Kyty |
 | `KYTY_HDR` | `0`, `1` | Asks for an HDR10 output when the display offers it |
 | `KYTY_STRETCH` | `0`, `1` | Fills the window instead of keeping the game's aspect ratio |
@@ -207,7 +207,7 @@ On by default unless the row says otherwise; set one to compare, or to work arou
 | `KYTY_VULKAN_VALIDATION` | `0`, `1` | Turns the Khronos validation layer on |
 | `KYTY_LOCK_STATS` | `0`, `1` | Prints how long threads wait on the program-cache lock |
 
-Kyty's window options (`KYTY_FULLSCREEN`, `KYTY_HIDE_CURSOR`, `KYTY_VR`, `KYTY_RENDERDOC`), its trophy and language options and a few experimental switches have no effect or are not meant for play: the full reference says which, in its category column.
+AnyKyty does not read Kyty's window options (`KYTY_FULLSCREEN`, `KYTY_HIDE_CURSOR`, `KYTY_VR`, `KYTY_RENDERDOC`, `KYTY_SCREEN_WIDTH`, `KYTY_SCREEN_HEIGHT`), its trophy and language options (`KYTY_TROPHY_NOTIFICATIONS`, `KYTY_TROPHY_DURATION`, `KYTY_CONSOLE_LANGUAGE`) or `KYTY_PIPELINE_PRECOMPILE`: setting them changes nothing. A few other switches have no effect or are not meant for play: the full reference says which, in its category column.
 
 ## Contributing
 
