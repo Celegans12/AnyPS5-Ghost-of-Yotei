@@ -52,3 +52,9 @@ target_include_directories(kyty_shim_rt_oracle_tests PRIVATE ${LIBS_INCLUDE_DIR}
 target_link_libraries(kyty_shim_rt_oracle_tests PRIVATE Kyty::gpu libkernel libc)
 add_test(NAME kyty_shim_rt_oracle COMMAND kyty_shim_rt_oracle_tests)
 set_tests_properties(kyty_shim_rt_oracle PROPERTIES TIMEOUT 20)
+
+add_test_executable(kyty_shim_rt_check_tests ${CMAKE_CURRENT_SOURCE_DIR}/RtCheck.cpp)
+target_include_directories(kyty_shim_rt_check_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(kyty_shim_rt_check_tests PRIVATE Kyty::gpu)
+add_test(NAME kyty_shim_rt_check COMMAND kyty_shim_rt_check_tests)
+set_tests_properties(kyty_shim_rt_check PROPERTIES TIMEOUT 20)
