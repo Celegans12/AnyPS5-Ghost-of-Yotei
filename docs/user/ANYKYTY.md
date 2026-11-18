@@ -225,6 +225,14 @@ AnyKyty is a young fork and there is a lot to do: speed, rendering differences, 
 
 Open an [issue](https://github.com/simnJS/AnyPS5/issues/new/choose) or start a [discussion](https://github.com/simnJS/AnyPS5/discussions), whether the game works or not: title ID and version, operating system, GPU and driver, the commit you built, the settings you used, and the log of the failure. [Game testing](../dev/GAME_TESTING.md) says what to capture. Reports from AMD and Intel GPUs, from Windows and from CPUs without a V-Cache are the ones we have the fewest of.
 
+To compare steady-state timings, build both backends from the same revision and use the same machine, scene, resolution, settings and cache state. Give each run a new `APS5_VIDEOOUT_TELEMETRY_DIR` and set `APS5_VIDEOOUT_FLIP_TIMING=FIRST:COUNT`. Choose the first flip after reaching the scene and use the same count on both backends. Exit each run after its window is complete.
+
+```sh
+python tools/videoout_flip_compare.py default/videoout.jsonl kyty/videoout.jsonl
+```
+
+The comparison checks the reported build revision and every flip in each declared window. It reports mean completed-flip FPS and the median and nearest-rank p99 of the intervals between flips. `--json` prints the same metrics for other tools. The drop count covers all telemetry events, including pad and caption updates. The report measures completed VideoOut flips. Scene equivalence, build cleanliness, unique rendered frames and display timing need separate evidence.
+
 **Open issues** where help is wanted ([all issues](https://github.com/simnJS/AnyPS5/issues)):
 
 - [#33](https://github.com/simnJS/AnyPS5/issues/33) shader and pipeline compile stalls on first play: precompile pipeline parts with `VK_EXT_graphics_pipeline_library` (labelled `help wanted`);
