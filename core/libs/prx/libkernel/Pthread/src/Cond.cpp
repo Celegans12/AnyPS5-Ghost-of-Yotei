@@ -108,8 +108,10 @@ struct WakingLock {
     PthreadMutex mutex;
     TNative& native;
     void lock() {
-        if (!MutexOperations::SpinAcquire(mutex, native))
-            native.lock();
+        if (MutexOperations::SpinAcquire(mutex, native))
+            return;
+        TimedWait::DeliverableWait wait;
+        native.lock();
     }
     void unlock() {
         native.unlock();

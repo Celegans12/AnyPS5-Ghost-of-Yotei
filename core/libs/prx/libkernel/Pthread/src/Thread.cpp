@@ -925,6 +925,9 @@ static void finishThread(PthreadPrivate* self, void* retval) {
         throw std::runtime_error("Finishing an unregistered guest thread");
     if (CurrentGuestState().finishing)
         throw std::runtime_error("Guest thread is already finishing");
+#ifndef _WIN32
+    DeliverDeferredGuestException();
+#endif
     CurrentGuestState().finishing = true;
     CurrentGuestState().exiting = true;
     UnregisterStack(self);

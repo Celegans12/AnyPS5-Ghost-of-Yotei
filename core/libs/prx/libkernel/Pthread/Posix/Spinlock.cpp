@@ -1,6 +1,7 @@
 #include "prx/libkernel/include/Api.hpp"
 #include "SceTypes.hpp"
 #include "Common.hpp"
+#include "prx/libkernel/Time/include/TimedWait.hpp"
 #include <atomic>
 #include <cerrno>
 #include <new>
@@ -71,6 +72,8 @@ int APS5_VABI pthread_spin_lock_nid_postfix(PthreadSpinlockPrivate** lock) {
     auto* spinlock = *lock;
     if (spinlock->owner.load(std::memory_order_relaxed) == std::this_thread::get_id())
         throw std::runtime_error("pthread_spin_lock: the calling thread already holds the lock and would spin forever");
+    if (tryAcquire(spinlock)) return 0;
+    TimedWait::DeliverableWait wait;
     int count = SPIN_COUNT;
     while (!tryAcquire(spinlock)) {
         while (spinlock->owner.load(std::memory_order_relaxed) != std::thread::id{}) {

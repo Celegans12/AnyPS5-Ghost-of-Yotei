@@ -529,11 +529,18 @@ namespace {
 
 constinit thread_local std::atomic<int> deferralDepth{0};
 constinit thread_local std::atomic<int> deferredSignal{0};
+constinit thread_local std::atomic<int> deliverableDepth{0};
 
 class DeliveryAllowance {
 public:
-    DeliveryAllowance() : depth(deferralDepth.exchange(0)) { DeliverDeferred(); }
-    ~DeliveryAllowance() { deferralDepth.store(depth); }
+    DeliveryAllowance() : depth(deferralDepth.exchange(0)) {
+        deliverableDepth.fetch_add(1);
+        DeliverDeferred();
+    }
+    ~DeliveryAllowance() {
+        deliverableDepth.fetch_sub(1);
+        deferralDepth.store(depth);
+    }
     DeliveryAllowance(const DeliveryAllowance&) = delete;
     DeliveryAllowance& operator=(const DeliveryAllowance&) = delete;
 
@@ -569,6 +576,22 @@ bool DeferDelivery(int signum) {
     if (deferralDepth.load() == 0) return false;
     deferredSignal.store(signum);
     return true;
+}
+
+bool DeliveryAllowed() {
+    return deliverableDepth.load() != 0;
+}
+
+bool DeliveryDeferred() {
+    return deferralDepth.load() != 0;
+}
+
+DeliverableWait::DeliverableWait() {
+    deliverableDepth.fetch_add(1);
+}
+
+DeliverableWait::~DeliverableWait() {
+    deliverableDepth.fetch_sub(1);
 }
 
 #ifdef __APPLE__

@@ -64,6 +64,24 @@ private:
     Hold hold;
     std::lock_guard<Mutex> lock;
 };
+
+bool DeliveryAllowed();
+bool DeliveryDeferred();
+
+class DeliverableWait {
+public:
+    DeliverableWait();
+    ~DeliverableWait();
+    DeliverableWait(const DeliverableWait&) = delete;
+    DeliverableWait& operator=(const DeliverableWait&) = delete;
+};
+#else
+class DeliverableWait {
+public:
+    DeliverableWait() = default;
+    DeliverableWait(const DeliverableWait&) = delete;
+    DeliverableWait& operator=(const DeliverableWait&) = delete;
+};
 #endif
 
 #ifdef _WIN32

@@ -41,10 +41,18 @@
 #include <string_view>
 #include <dlfcn.h>
 #include <link.h>
+#include <semaphore.h>
+#include <sys/syscall.h>
+#include <unwind.h>
 #include "prx/libc/include/specifics/linux/GuardedCopy.hpp"
 #if defined(__GLIBC__) && (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 35))
 #define LIBKERNEL_EXCEPTION_FIND_OBJECT 1
 #endif
+#endif
+
+#ifdef __linux__
+extern "C" __attribute__((visibility("hidden"))) void Aps5ReturnDeliveryStub();
+extern "C" __attribute__((visibility("hidden"))) bool Aps5ReturnSavesVectors;
 #endif
 
 #ifdef _WIN32
@@ -1152,8 +1160,288 @@ void ToHost(const GuestMcontext& m, mcontext_t& host) {
 }
 #endif
 
-void Deliver(int signum, siginfo_t*, void* context) {
+#ifdef __linux__
+bool GuestCode(std::uintptr_t rip);
+
+constexpr std::size_t RetrySlots = 1024;
+constexpr std::uint64_t ForceAfterNanos = 100000000;
+constexpr long QuickRetryNanos = 20000;
+constexpr long SlowRetryNanos = 200000;
+constexpr long IdleRetryNanos = 1000000;
+constexpr unsigned QuickRetryRounds = 64;
+constexpr unsigned SlowRetryRounds = 512;
+constexpr greg_t FutexCommandMask = 0x7f;
+constexpr greg_t FutexWait = 0;
+constexpr greg_t FutexWaitBitset = 9;
+constexpr greg_t FutexWaitRequeuePi = 11;
+constexpr greg_t ContendedLockWord = 2;
+constexpr std::uintptr_t PageMask = 0xfff;
+
+constexpr std::size_t YieldScanBytes = 32;
+constexpr std::size_t ReturnArmSlots = 4096;
+constexpr std::size_t ReturnFxsaveBytes = 512;
+constexpr int MaxArmFrames = 128;
+
+std::array<std::atomic<pid_t>, RetrySlots> retryThreads{};
+std::uintptr_t yieldReturn = 0;
+sem_t retryWake;
+const int retryMark = 0;
+constinit thread_local std::atomic<std::uint64_t> pendingSince{0};
+constinit thread_local std::atomic<bool> retryQueued{false};
+constinit thread_local std::atomic<bool> returnArmed{false};
+
+struct ReturnArm {
+    std::atomic<std::uintptr_t> slot;
+    std::atomic<std::uintptr_t> original;
+};
+
+std::array<ReturnArm, ReturnArmSlots> returnArms{};
+
+struct ReturnFrame {
+    std::uint64_t r15;
+    std::uint64_t r14;
+    std::uint64_t r13;
+    std::uint64_t r12;
+    std::uint64_t r11;
+    std::uint64_t r10;
+    std::uint64_t r9;
+    std::uint64_t r8;
+    std::uint64_t rdi;
+    std::uint64_t rsi;
+    std::uint64_t rbp;
+    std::uint64_t rbx;
+    std::uint64_t rdx;
+    std::uint64_t rcx;
+    std::uint64_t rax;
+    std::uint64_t rflags;
+    std::uint64_t target;
+};
+static_assert(sizeof(ReturnFrame) == 136 && offsetof(ReturnFrame, target) == 128, "Aps5ReturnDeliveryStub pushes the registers in this order below the return target");
+
+struct ArmSearch {
+    std::uintptr_t rip;
+    std::uintptr_t slot;
+    std::uintptr_t target;
+    int frames;
+    bool started;
+    bool armed;
+};
+
+bool SyscallAt(std::uintptr_t address) {
+    const auto* code = reinterpret_cast<const volatile unsigned char*>(address);
+    return code[0] == 0x0f && code[1] == 0x05;
+}
+
+bool WaitCall(greg_t number, const greg_t* g) {
+    switch (number) {
+    case SYS_futex: {
+        const greg_t command = g[REG_RSI] & FutexCommandMask;
+        if (command == FutexWait) return g[REG_RDX] != ContendedLockWord;
+        return command == FutexWaitBitset || command == FutexWaitRequeuePi;
+    }
+#ifdef SYS_futex_waitv
+    case SYS_futex_waitv:
+#endif
+#ifdef SYS_epoll_pwait2
+    case SYS_epoll_pwait2:
+#endif
+    case SYS_nanosleep:
+    case SYS_clock_nanosleep:
+    case SYS_poll:
+    case SYS_ppoll:
+    case SYS_select:
+    case SYS_pselect6:
+    case SYS_epoll_wait:
+    case SYS_epoll_pwait:
+    case SYS_rt_sigsuspend:
+    case SYS_rt_sigtimedwait:
+    case SYS_pause:
+    case SYS_wait4:
+    case SYS_waitid:
+    case SYS_recvfrom:
+    case SYS_recvmsg:
+    case SYS_recvmmsg:
+    case SYS_accept:
+    case SYS_accept4:
+    case SYS_connect:
+        return true;
+    default:
+        return false;
+    }
+}
+
+bool InterruptedWait(const mcontext_t& host) {
+    const auto* g = host.gregs;
+    const auto rip = static_cast<std::uintptr_t>(g[REG_RIP]);
+    if (rip == yieldReturn) return true;
+    if (SyscallAt(rip)) return WaitCall(g[REG_RAX], g);
+    return g[REG_RAX] == -EINTR && (rip & PageMask) >= 2 && SyscallAt(rip - 2);
+}
+
+bool QueueRetry() {
+    if (retryQueued.load()) return true;
+    const auto self = static_cast<pid_t>(syscall(SYS_gettid));
+    for (auto& slot : retryThreads) {
+        pid_t empty = 0;
+        if (!slot.compare_exchange_strong(empty, self, std::memory_order_acq_rel)) continue;
+        retryQueued.store(true);
+        sem_post(&retryWake);
+        return true;
+    }
+    return false;
+}
+
+_Unwind_Reason_Code ArmStep(_Unwind_Context* context, void* argument) {
+    auto& search = *static_cast<ArmSearch*>(argument);
+    if (++search.frames > MaxArmFrames) return _URC_END_OF_STACK;
+    int beforeInstruction = 0;
+    const auto ip = static_cast<std::uintptr_t>(_Unwind_GetIPInfo(context, &beforeInstruction));
+    if (!search.started) {
+        if (ip == search.rip && beforeInstruction != 0) search.started = true;
+        return _URC_NO_REASON;
+    }
+    if (ip == reinterpret_cast<std::uintptr_t>(&Aps5ReturnDeliveryStub)) {
+        search.armed = true;
+        return _URC_END_OF_STACK;
+    }
+    if (GuestCode(ip)) {
+        search.slot = static_cast<std::uintptr_t>(_Unwind_GetCFA(context)) - sizeof(std::uintptr_t);
+        search.target = ip;
+        return _URC_END_OF_STACK;
+    }
+    return _URC_NO_REASON;
+}
+
+bool ArmReturn(const mcontext_t& host) {
+    if (returnArmed.load()) return true;
+    ArmSearch search{static_cast<std::uintptr_t>(host.gregs[REG_RIP]), 0, 0, 0, false, false};
+    _Unwind_Backtrace(&ArmStep, &search);
+    if (search.armed) {
+        returnArmed.store(true);
+        return true;
+    }
+    if (search.slot == 0 || search.slot < static_cast<std::uintptr_t>(host.gregs[REG_RSP])) return false;
+    auto* slot = reinterpret_cast<std::uintptr_t*>(search.slot);
+    if (*slot != search.target) return false;
+    for (auto& arm : returnArms) {
+        if (arm.slot.load(std::memory_order_acquire) != search.slot) continue;
+        arm.original.store(0, std::memory_order_relaxed);
+        arm.slot.store(0, std::memory_order_release);
+    }
+    for (auto& arm : returnArms) {
+        std::uintptr_t empty = 0;
+        if (!arm.slot.compare_exchange_strong(empty, search.slot, std::memory_order_acq_rel)) continue;
+        arm.original.store(search.target, std::memory_order_release);
+        *slot = reinterpret_cast<std::uintptr_t>(&Aps5ReturnDeliveryStub);
+        returnArmed.store(true);
+        return true;
+    }
+    return false;
+}
+
+std::uintptr_t TakeArm(std::uintptr_t slot) {
+    for (auto& arm : returnArms) {
+        if (arm.slot.load(std::memory_order_acquire) != slot) continue;
+        const auto original = arm.original.load(std::memory_order_acquire);
+        arm.original.store(0, std::memory_order_relaxed);
+        arm.slot.store(0, std::memory_order_release);
+        return original;
+    }
+    return 0;
+}
+
+bool DeferUntilSafe(const mcontext_t& host) {
+    const auto rip = static_cast<std::uintptr_t>(host.gregs[REG_RIP]);
+    if (TimedWait::DeliveryAllowed() || GuestCode(rip) || InterruptedWait(host)) {
+        pendingSince.store(0);
+        returnArmed.store(false);
+        return false;
+    }
+    const std::uint64_t now = TimedWait::NowNanos();
+    std::uint64_t since = pendingSince.load();
+    if (since == 0) {
+        since = now;
+        pendingSince.store(now);
+    }
+    if (now - since >= ForceAfterNanos) {
+        pendingSince.store(0);
+        returnArmed.store(false);
+        return false;
+    }
+    ArmReturn(host);
+    if (!QueueRetry()) {
+        pendingSince.store(0);
+        returnArmed.store(false);
+        return false;
+    }
+    return true;
+}
+
+bool RetrySignal(const siginfo_t* info) {
+    return info != nullptr && info->si_code == SI_QUEUE && info->si_value.sival_ptr == &retryMark;
+}
+
+void RetryLoop() {
+    sigset_t blocked;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, HostSignal);
+    pthread_sigmask(SIG_BLOCK, &blocked, nullptr);
+    pthread_setname_np(pthread_self(), "aps5ExcRetry");
+    const pid_t process = getpid();
+    const uid_t user = getuid();
+    unsigned rounds = 0;
+    for (;;) {
+        if (sem_trywait(&retryWake) != 0) {
+            rounds = 0;
+            while (sem_wait(&retryWake) != 0) {}
+        }
+        while (sem_trywait(&retryWake) == 0) {}
+        timespec delay{0, rounds < QuickRetryRounds ? QuickRetryNanos : rounds < SlowRetryRounds ? SlowRetryNanos : IdleRetryNanos};
+        ++rounds;
+        while (nanosleep(&delay, &delay) != 0 && errno == EINTR) {}
+        for (auto& slot : retryThreads) {
+            const pid_t thread = slot.exchange(0, std::memory_order_acq_rel);
+            if (thread == 0) continue;
+            siginfo_t info{};
+            info.si_signo = HostSignal;
+            info.si_code = SI_QUEUE;
+            info.si_pid = process;
+            info.si_uid = user;
+            info.si_value.sival_ptr = const_cast<int*>(&retryMark);
+            syscall(SYS_rt_tgsigqueueinfo, process, thread, HostSignal, &info);
+        }
+    }
+}
+
+std::uintptr_t FindYieldReturn() {
+    const auto* code = reinterpret_cast<const unsigned char*>(dlsym(RTLD_DEFAULT, "sched_yield"));
+    if (code == nullptr) return 0;
+    for (std::size_t offset = 0; offset + 1 < YieldScanBytes; ++offset)
+        if (code[offset] == 0x0f && code[offset + 1] == 0x05) return reinterpret_cast<std::uintptr_t>(code + offset + 2);
+    return 0;
+}
+
+void StartRetries() {
+    yieldReturn = FindYieldReturn();
+    Aps5ReturnSavesVectors = __builtin_cpu_supports("avx") != 0;
+    if (sem_init(&retryWake, 0, 0) != 0) throw std::system_error(errno, std::generic_category(), "sceKernelRaiseException: cannot create the delivery retry semaphore");
+    std::thread(RetryLoop).detach();
+}
+#endif
+
+void Deliver(int signum, siginfo_t* info, void* context) {
+#ifdef __linux__
+    if (RetrySignal(info)) {
+        retryQueued.store(false);
+        if (pendingSince.load() == 0) return;
+    }
+#else
+    (void)info;
+#endif
     if (TimedWait::DeferDelivery(signum)) return;
+#ifdef __linux__
+    if (DeferUntilSafe(static_cast<ucontext_t*>(context)->uc_mcontext)) return;
+#endif
     const auto handler = Handler(RaisedSignal);
     if (handler == nullptr) {
         static constexpr char message[] = "sceKernelRaiseException: the handler was removed before the signal was delivered\n";
@@ -1287,6 +1575,9 @@ void InstallFaultDelivery() {
 
 void InstallDelivery() {
     static const bool installed = [] {
+#ifdef __linux__
+        StartRetries();
+#endif
         struct sigaction action{};
         action.sa_sigaction = Deliver;
         action.sa_flags = SA_SIGINFO | SA_RESTART;
@@ -1323,7 +1614,10 @@ private:
 
 bool RaiseOn(Pthread thread) {
     InstallDelivery();
-    if (thread == scePthreadSelf()) return Send(thread);
+    if (thread == scePthreadSelf()) {
+        TimedWait::DeliverableWait wait;
+        return Send(thread);
+    }
     HostSignalBlock block;
     const auto live = LockLiveGuestThread(thread);
     if (!live.owns_lock()) return false;
@@ -1334,6 +1628,220 @@ bool RaiseOn(Pthread thread) {
 #endif
 
 }
+
+#ifdef __linux__
+__attribute__((visibility("hidden"))) bool Aps5ReturnSavesVectors = false;
+
+namespace {
+
+[[noreturn]] void ReturnDeliveryFailure(const char* message, std::size_t length) {
+    const auto written = write(STDERR_FILENO, message, length);
+    (void)written;
+    std::abort();
+}
+
+void RunAtReturn(ReturnFrame& frame, unsigned char* fx) {
+    const auto handler = Handler(RaisedSignal);
+    if (handler == nullptr) {
+        static constexpr char message[] = "sceKernelRaiseException: the handler was removed before the signal was delivered\n";
+        ReturnDeliveryFailure(message, sizeof(message) - 1);
+    }
+    const std::uint64_t stack = reinterpret_cast<std::uintptr_t>(&frame) + sizeof(ReturnFrame);
+    std::uint16_t codeSegment = 0;
+    std::uint16_t stackSegment = 0;
+    asm volatile("mov %%cs, %0" : "=r"(codeSegment));
+    asm volatile("mov %%ss, %0" : "=r"(stackSegment));
+    GuestUcontext ucontext{};
+    auto& m = ucontext.mcontext;
+    m.rdi = frame.rdi;
+    m.rsi = frame.rsi;
+    m.rdx = frame.rdx;
+    m.rcx = frame.rcx;
+    m.r8 = frame.r8;
+    m.r9 = frame.r9;
+    m.rax = frame.rax;
+    m.rbx = frame.rbx;
+    m.rbp = frame.rbp;
+    m.r10 = frame.r10;
+    m.r11 = frame.r11;
+    m.r12 = frame.r12;
+    m.r13 = frame.r13;
+    m.r14 = frame.r14;
+    m.r15 = frame.r15;
+    m.rip = frame.target;
+    m.rsp = stack;
+    m.rflags = frame.rflags;
+    m.cs = codeSegment;
+    m.ss = stackSegment;
+    m.len = sizeof(GuestMcontext);
+    static_assert(ReturnFxsaveBytes <= sizeof(m.fpstate));
+    std::memcpy(m.fpstate, fx, ReturnFxsaveBytes);
+    CallHandler(handler, RaisedSignal, ucontext);
+    if (m.rsp != stack) {
+        static constexpr char message[] = "sceKernelRaiseException: a handler run at a return into guest code moved the stack pointer\n";
+        ReturnDeliveryFailure(message, sizeof(message) - 1);
+    }
+    frame.rdi = m.rdi;
+    frame.rsi = m.rsi;
+    frame.rdx = m.rdx;
+    frame.rcx = m.rcx;
+    frame.r8 = m.r8;
+    frame.r9 = m.r9;
+    frame.rax = m.rax;
+    frame.rbx = m.rbx;
+    frame.rbp = m.rbp;
+    frame.r10 = m.r10;
+    frame.r11 = m.r11;
+    frame.r12 = m.r12;
+    frame.r13 = m.r13;
+    frame.r14 = m.r14;
+    frame.r15 = m.r15;
+    frame.target = m.rip;
+    frame.rflags = m.rflags;
+    std::memcpy(fx, m.fpstate, FxsaveRegisterBytes);
+}
+
+}
+
+extern "C" __attribute__((visibility("hidden"), used)) void Aps5ReturnDelivery(ReturnFrame* frame, unsigned char* fx) {
+    const auto original = TakeArm(reinterpret_cast<std::uintptr_t>(frame) + offsetof(ReturnFrame, target));
+    if (original == 0) {
+        static constexpr char message[] = "sceKernelRaiseException: a return into guest code reached the delivery stub without a recorded return address\n";
+        ReturnDeliveryFailure(message, sizeof(message) - 1);
+    }
+    frame->target = original;
+    returnArmed.store(false);
+    if (pendingSince.load() == 0 || TimedWait::DeliveryDeferred()) return;
+    sigset_t blocked;
+    sigset_t previous;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, HostSignal);
+    pthread_sigmask(SIG_BLOCK, &blocked, &previous);
+    while (pendingSince.exchange(0) != 0) {
+        RunAtReturn(*frame, fx);
+        siginfo_t info{};
+        const timespec now{0, 0};
+        while (sigtimedwait(&blocked, &info, &now) == HostSignal) {
+            if (RetrySignal(&info)) {
+                retryQueued.store(false);
+                continue;
+            }
+            pendingSince.store(TimedWait::NowNanos());
+        }
+    }
+    pthread_sigmask(SIG_SETMASK, &previous, nullptr);
+}
+
+asm(".text\n"
+    ".globl Aps5ReturnDeliveryStub\n"
+    ".hidden Aps5ReturnDeliveryStub\n"
+    ".type Aps5ReturnDeliveryStub, @function\n"
+    "Aps5ReturnDeliveryStub:\n"
+    "    .cfi_startproc\n"
+    "    .cfi_undefined %rip\n"
+    "    subq $8, %rsp\n"
+    "    pushfq\n"
+    "    pushq %rax\n"
+    "    pushq %rcx\n"
+    "    pushq %rdx\n"
+    "    pushq %rbx\n"
+    "    pushq %rbp\n"
+    "    pushq %rsi\n"
+    "    pushq %rdi\n"
+    "    pushq %r8\n"
+    "    pushq %r9\n"
+    "    pushq %r10\n"
+    "    pushq %r11\n"
+    "    pushq %r12\n"
+    "    pushq %r13\n"
+    "    pushq %r14\n"
+    "    pushq %r15\n"
+    "    movq %rsp, %rbx\n"
+    "    .cfi_def_cfa %rbx, 136\n"
+    "    .cfi_offset %rip, -8\n"
+    "    .cfi_offset %rbx, -48\n"
+    "    .cfi_offset %rbp, -56\n"
+    "    .cfi_offset %r12, -112\n"
+    "    .cfi_offset %r13, -120\n"
+    "    .cfi_offset %r14, -128\n"
+    "    .cfi_offset %r15, -136\n"
+    "    subq $1088, %rsp\n"
+    "    andq $-64, %rsp\n"
+    "    fxsave64 (%rsp)\n"
+    "    cmpb $0, Aps5ReturnSavesVectors(%rip)\n"
+    "    je 1f\n"
+    "    vmovdqu %ymm0, 512(%rsp)\n"
+    "    vmovdqu %ymm1, 544(%rsp)\n"
+    "    vmovdqu %ymm2, 576(%rsp)\n"
+    "    vmovdqu %ymm3, 608(%rsp)\n"
+    "    vmovdqu %ymm4, 640(%rsp)\n"
+    "    vmovdqu %ymm5, 672(%rsp)\n"
+    "    vmovdqu %ymm6, 704(%rsp)\n"
+    "    vmovdqu %ymm7, 736(%rsp)\n"
+    "    vmovdqu %ymm8, 768(%rsp)\n"
+    "    vmovdqu %ymm9, 800(%rsp)\n"
+    "    vmovdqu %ymm10, 832(%rsp)\n"
+    "    vmovdqu %ymm11, 864(%rsp)\n"
+    "    vmovdqu %ymm12, 896(%rsp)\n"
+    "    vmovdqu %ymm13, 928(%rsp)\n"
+    "    vmovdqu %ymm14, 960(%rsp)\n"
+    "    vmovdqu %ymm15, 992(%rsp)\n"
+    "1:\n"
+    "    movq %rbx, %rdi\n"
+    "    movq %rsp, %rsi\n"
+    "    call Aps5ReturnDelivery\n"
+    "    cmpb $0, Aps5ReturnSavesVectors(%rip)\n"
+    "    je 2f\n"
+    "    vmovdqu 512(%rsp), %ymm0\n"
+    "    vmovdqu 544(%rsp), %ymm1\n"
+    "    vmovdqu 576(%rsp), %ymm2\n"
+    "    vmovdqu 608(%rsp), %ymm3\n"
+    "    vmovdqu 640(%rsp), %ymm4\n"
+    "    vmovdqu 672(%rsp), %ymm5\n"
+    "    vmovdqu 704(%rsp), %ymm6\n"
+    "    vmovdqu 736(%rsp), %ymm7\n"
+    "    vmovdqu 768(%rsp), %ymm8\n"
+    "    vmovdqu 800(%rsp), %ymm9\n"
+    "    vmovdqu 832(%rsp), %ymm10\n"
+    "    vmovdqu 864(%rsp), %ymm11\n"
+    "    vmovdqu 896(%rsp), %ymm12\n"
+    "    vmovdqu 928(%rsp), %ymm13\n"
+    "    vmovdqu 960(%rsp), %ymm14\n"
+    "    vmovdqu 992(%rsp), %ymm15\n"
+    "2:\n"
+    "    fxrstor64 (%rsp)\n"
+    "    movq %rbx, %rsp\n"
+    "    .cfi_undefined %rip\n"
+    "    popq %r15\n"
+    "    popq %r14\n"
+    "    popq %r13\n"
+    "    popq %r12\n"
+    "    popq %r11\n"
+    "    popq %r10\n"
+    "    popq %r9\n"
+    "    popq %r8\n"
+    "    popq %rdi\n"
+    "    popq %rsi\n"
+    "    popq %rbp\n"
+    "    popq %rbx\n"
+    "    popq %rdx\n"
+    "    popq %rcx\n"
+    "    popq %rax\n"
+    "    popfq\n"
+    "    ret\n"
+    "    .cfi_endproc\n"
+    "    .size Aps5ReturnDeliveryStub, .-Aps5ReturnDeliveryStub\n");
+#endif
+
+#ifndef _WIN32
+void DeliverDeferredGuestException() {
+#ifdef __linux__
+    if (pendingSince.load() == 0) return;
+    TimedWait::DeliverableWait wait;
+    pthread_kill(pthread_self(), HostSignal);
+#endif
+}
+#endif
 
 #ifdef _WIN32
 extern "C" [[noreturn]] void Aps5RedirectedEntry(void* delivery) {

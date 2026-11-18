@@ -213,6 +213,8 @@ std::unique_lock<std::mutex> LockLiveGuestThread(const PthreadPrivate* thread);
 extern "C" int ResumeGuestThread_nid_no_patch(PthreadPrivate* thread);
 #ifdef _WIN32
 extern "C" void DeliverPendingException_nid_no_patch(PthreadPrivate* thread);
+#else
+void DeliverDeferredGuestException();
 #endif
 extern "C" void ResumeAllGuestThreads_nid_no_patch();
 bool LiveGuestThreadExists(std::int64_t tid);

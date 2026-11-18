@@ -73,9 +73,13 @@ template<typename TNative>
 bool spinAcquire(PthreadMutex mutex, TNative& native) {
     static const bool multiprocessor = std::thread::hardware_concurrency() > 1;
     const int spins = multiprocessor ? mutex->_spinloops.load(std::memory_order_relaxed) : 0;
-    return MutexOperations::SpinAcquire(spins, mutex->_yieldloops.load(std::memory_order_relaxed), [&] {
+    const auto tryAcquire = [&] {
         return mutex->_owner.load(std::memory_order_relaxed) == std::thread::id{} && native.try_lock();
-    }, [] {
+    };
+    if (tryAcquire())
+        return true;
+    TimedWait::DeliverableWait wait;
+    return MutexOperations::SpinAcquire(spins, mutex->_yieldloops.load(std::memory_order_relaxed), tryAcquire, [] {
 #if defined(__x86_64__) || defined(_M_X64)
         _mm_pause();
 #endif
@@ -260,6 +264,7 @@ int APS5_VABI scePthreadMutexLock(PthreadMutex* mutex) {
         return TimedWait::ParkAcquire(current, [&] { return native.try_lock(); }, nullptr);
 #else
         static_cast<void>(current);
+        TimedWait::DeliverableWait wait;
         native.lock();
         return true;
 #endif
