@@ -31,6 +31,7 @@ constexpr uint64_t RegionBytes   = uint64_t {128} << 20u;
 constexpr uint64_t OutputAlign   = 256;
 constexpr uint32_t ResultBytes   = 32;
 constexpr uint32_t VerifiedAfter = 4;
+constexpr uint32_t HostFullAfter = 8;
 constexpr uint32_t SlowerAfter   = 16;
 constexpr uint32_t CompareGroups = 1024;
 constexpr size_t   KeptFractions = 4096;
@@ -123,6 +124,10 @@ void RayTracingCheck::Load() {
 		for (std::string token; fields >> token;) {
 			if (token.starts_with("checks=")) {
 				program.checks = static_cast<uint32_t>(std::strtoul(token.c_str() + 7, nullptr, 10));
+			} else if (token.starts_with("unknown=")) {
+				program.unknown = static_cast<uint32_t>(std::strtoul(token.c_str() + 8, nullptr, 10));
+			} else if (token.starts_with("full=")) {
+				program.full = static_cast<uint32_t>(std::strtoul(token.c_str() + 5, nullptr, 10));
 			} else if (token.starts_with("transient=")) {
 				char* rest            = nullptr;
 				program.transient     = static_cast<uint32_t>(std::strtoul(token.c_str() + 10, &rest, 10));
@@ -143,6 +148,9 @@ void RayTracingCheck::Load() {
 			fallback++;
 		} else if (state == "unreplayable" && !program.unreplayable.empty()) {
 			unreplayable++;
+		} else if (state == "unjudged-host-full") {
+			program.host_full = true;
+			program.unreplayable.clear();
 		} else {
 			program.unreplayable.clear();
 		}
@@ -162,7 +170,8 @@ void RayTracingCheck::Save() const {
 	}
 	std::vector<std::pair<uint64_t, const Program*>> rows;
 	for (const auto& [hash, program]: m_programs) {
-		if (program.fallback || program.verified || !program.unreplayable.empty() || program.transient != 0) {
+		if (program.fallback || program.verified || !program.unreplayable.empty() || program.transient != 0 ||
+		    program.unknown != 0 || program.full != 0) {
 			rows.emplace_back(hash, &program);
 		}
 	}
@@ -177,6 +186,7 @@ void RayTracingCheck::Save() const {
 			const auto* state = program->fallback       ? "fallback"
 			                    : program->verified     ? "verified"
 			                    : !program->unreplayable.empty() ? "unreplayable"
+			                    : program->host_full             ? "unjudged-host-full"
 			                                                     : "checking";
 			auto        row   = fmt::format("{} {} checks={}", Hash(hash), state, program->checks);
 			if (!program->fractions.empty()) {
@@ -184,6 +194,12 @@ void RayTracingCheck::Save() const {
 			}
 			if (program->transient != 0) {
 				row += fmt::format(" transient={}/{:.3g}", program->transient, program->transient_max);
+			}
+			if (program->unknown != 0) {
+				row += fmt::format(" unknown={}", program->unknown);
+			}
+			if (program->full != 0) {
+				row += fmt::format(" full={}", program->full);
 			}
 			if (!program->unreplayable.empty() && !program->fallback && !program->verified) {
 				row += " reason=" + program->unreplayable;
@@ -546,15 +562,38 @@ void RayTracingCheck::Finish(uint32_t slot) {
 	const bool   over      = fraction > threshold;
 	const auto   outcome   = pending.preparation == 0 ? std::nullopt
 	                                                  : m_context.GetRayTracing()->Outcome(pending.preparation);
-	if (outcome && (outcome->missing != 0 || outcome->uncached || outcome->full)) {
+	if (pending.preparation != 0 && !outcome) {
+		program.unknown++;
+		program.full_run = 0;
+		Note(fmt::format("[RT] check {}: dispatch {}: {} of {} output dwords differ ({:.3g}), the host readback of this "
+		                 "dispatch is gone, not judged; {} unknown so far",
+		                 Hash(pending.hash), pending.index, differ, pending.dwords, fraction, program.unknown));
+		Save();
+		return;
+	}
+	if (outcome && outcome->full) {
+		program.full++;
+		program.full_run++;
+		Note(fmt::format("[RT] check {}: dispatch {}: {} of {} output dwords differ ({:.3g}), the host structure was full "
+		                 "(more instances than it holds), not judged; {} so far",
+		                 Hash(pending.hash), pending.index, differ, pending.dwords, fraction, program.full));
+		if (!program.host_full && program.full_run >= HostFullAfter) {
+			program.host_full = true;
+			Note(fmt::format("[RT] check {}: unjudged-host-full: {} checks in a row on a full host structure",
+			                 Hash(pending.hash), program.full_run));
+		}
+		Save();
+		return;
+	}
+	program.full_run = 0;
+	if (outcome && (outcome->missing != 0 || outcome->uncached)) {
 		program.transient++;
 		program.transient_max = std::max(program.transient_max, fraction);
 		Note(fmt::format("[RT] check {}: dispatch {}: {} of {} output dwords differ ({:.3g}), transient: the host TLAS of "
-		                 "this dispatch was incomplete ({} instances without a BLAS{}{}), not judged; {} transient checks so "
+		                 "this dispatch was incomplete ({} instances without a BLAS{}), not judged; {} transient checks so "
 		                 "far, worst {:.3g}",
 		                 Hash(pending.hash), pending.index, differ, pending.dwords, fraction, outcome->missing,
-		                 outcome->uncached ? ", TLAS memory not cached yet" : "",
-		                 outcome->full ? ", more instances than the host holds" : "", program.transient,
+		                 outcome->uncached ? ", TLAS memory not cached yet" : "", program.transient,
 		                 program.transient_max));
 		Save();
 		return;

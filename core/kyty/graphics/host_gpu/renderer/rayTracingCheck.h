@@ -56,6 +56,10 @@ private:
 		uint32_t            skipped    = 0;
 		uint32_t            transient  = 0;
 		double              transient_max = 0.0;
+		uint32_t            unknown    = 0;
+		uint32_t            full       = 0;
+		uint32_t            full_run   = 0;
+		bool                host_full  = false;
 		bool                fallback   = false;
 		bool                verified   = false;
 		std::string         unreplayable;
