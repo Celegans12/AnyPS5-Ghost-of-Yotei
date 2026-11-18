@@ -159,6 +159,10 @@ std::array<std::byte, 4> Bgra(vk::Format format, const std::uint8_t* texel) {
 
 }
 
+bool Tracking() {
+    return state().tracking.load(std::memory_order_acquire);
+}
+
 void RequireNotHeld(const char* what) {
     if (state().held.load(std::memory_order_acquire)) throw std::runtime_error(std::string("kyty replay: ") + what + " waits for the GPU while the replay holds it settled (AgcDriverReleaseSettled first)");
 }
