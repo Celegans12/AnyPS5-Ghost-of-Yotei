@@ -754,7 +754,11 @@ void ReadElements(TextReader& r, std::string_view key, std::vector<Element>& ele
 	const auto text = r.Find(key);
 	if (!text) return;
 	const auto parts = Split(*text, ',');
+#if defined(ANYPS5_KYTY)
+	r.ok             = r.ok && parts.size() <= 16384;
+#else
 	r.ok             = r.ok && parts.size() <= 4096;
+#endif
 	elements.assign(r.ok ? parts.size() : 0, Element {});
 	for (size_t i = 0; r.ok && i < parts.size(); i++) {
 		ElementReader reader(parts[i]);
