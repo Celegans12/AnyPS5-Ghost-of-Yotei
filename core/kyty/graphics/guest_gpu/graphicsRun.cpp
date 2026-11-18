@@ -1538,6 +1538,19 @@ bool GuestGpu::Process(Submission& submission) {
 			if (submission.execution.MadeProgress() && !submission.yielded) {
 				cp.BufferFlush();
 			}
+#if defined(ANYPS5_KYTY)
+			if (submission.execution.MadeProgress()) {
+				submission.wait_flushed = false;
+			} else if (!complete && !submission.yielded && !submission.wait_flushed) {
+				const auto& range = m_wait_ranges[m_current_queue];
+				if (range.begin != range.end &&
+				    m_renderer.GetCommandScheduler().HasPendingGuestOperations(
+				        range.begin, range.end - range.begin)) {
+					cp.BufferFlush();
+					submission.wait_flushed = true;
+				}
+			}
+#endif
 			break;
 		}
 		case SubmissionType::FlipPreparation:

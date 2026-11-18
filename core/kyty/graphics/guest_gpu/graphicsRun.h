@@ -101,6 +101,7 @@ private:
 		uint64_t                  scout_sequence  = 0;
 #if defined(ANYPS5_KYTY)
 		bool                      frame_end       = false;
+		bool                      wait_flushed    = false;
 #endif
 	};
 
