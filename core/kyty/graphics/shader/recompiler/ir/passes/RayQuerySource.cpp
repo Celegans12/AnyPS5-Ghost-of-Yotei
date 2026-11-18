@@ -1758,6 +1758,7 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 				}
 			}
 		}
+		std::erase_if(masks, [](const MaskField& mask) { return !mask.variable && mask.shift < 8u; });
 		const auto variable = std::ranges::count_if(masks, [](const MaskField& mask) { return mask.variable; });
 		if (variable == 1) std::erase_if(masks, [](const MaskField& mask) { return !mask.variable; });
 		if (masks.size() == 1) {
