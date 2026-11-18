@@ -1116,6 +1116,7 @@ unsigned int APS5_VABI _Atomic_load_4_nid_postfix(volatile unsigned int* target,
 std::intmax_t APS5_VABI strtoimax_nid_postfix(const char* str, char** endptr, int base);
 std::uintmax_t APS5_VABI strtoumax_nid_postfix(const char* str, char** endptr, int base);
 unsigned int APS5_VABI _ZSt14_Random_devicev_nid_postfix();
+double APS5_VABI _ZSt22_Random_device_entropyv_nid_postfix();
 void APS5_VABI _Lockfilelock_nid_postfix(FileStream* stream);
 void APS5_VABI _Unlockfilelock_nid_postfix(FileStream* stream);
 void APS5_VABI flockfile_nid_postfix(FileStream* stream);
