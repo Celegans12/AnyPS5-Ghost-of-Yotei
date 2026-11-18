@@ -131,19 +131,19 @@ static auto& guestStackMappings = *new std::map<std::uintptr_t, GuestStackMappin
 
 static void ClaimGuestStackMapping(void* mapping, std::size_t bytes) {
     const auto mappingStart = reinterpret_cast<std::uintptr_t>(mapping);
-    std::lock_guard lock(guestStackMappingsLock);
+    TimedWait::DeferredDeliveryLock lock(guestStackMappingsLock);
     guestStackMappings[mappingStart] = {mappingStart + bytes, mappingStart, mappingStart, false};
 }
 
 static void RegisterGuestStackMapping(PthreadPrivate* thread) {
     const auto mappingStart = reinterpret_cast<std::uintptr_t>(thread->guestStack);
     const auto stackStart = reinterpret_cast<std::uintptr_t>(thread->stackAddress);
-    std::lock_guard lock(guestStackMappingsLock);
+    TimedWait::DeferredDeliveryLock lock(guestStackMappingsLock);
     guestStackMappings[mappingStart] = {mappingStart + thread->guestStackBytes, stackStart, stackStart + thread->stackSize, true};
 }
 
 static void UnregisterGuestStackMapping(void* mapping) {
-    std::lock_guard lock(guestStackMappingsLock);
+    TimedWait::DeferredDeliveryLock lock(guestStackMappingsLock);
     guestStackMappings.erase(reinterpret_cast<std::uintptr_t>(mapping));
 }
 
@@ -573,18 +573,27 @@ extern "C" void GuestThreadStackMappings_nid_no_patch(std::uintptr_t start, std:
     const auto mainLow = guestMainStackLow.load(std::memory_order_acquire);
     const auto mainHigh = guestMainStackHigh.load(std::memory_order_acquire);
     if (mainLow != 0 && mainLow - GUEST_STACK_GUARD < end && start < mainHigh) visit(context, mainLow - GUEST_STACK_GUARD, mainHigh);
-    std::lock_guard lock(guestStackMappingsLock);
+    TimedWait::DeferredDeliveryLock lock(guestStackMappingsLock);
     auto it = guestStackMappings.upper_bound(start);
     if (it != guestStackMappings.begin()) --it;
     for (; it != guestStackMappings.end() && it->first < end; ++it) {
         if (it->second.mappingEnd > start) visit(context, it->first, it->second.mappingEnd);
     }
 }
+
+extern "C" void GuestDeliveryHold_nid_no_patch() {
+    TimedWait::HoldDelivery();
+}
+
+extern "C" void GuestDeliveryRelease_nid_no_patch() {
+    TimedWait::ReleaseDelivery();
+    TimedWait::DeliverDeferred();
+}
 #endif
 
 bool GuestThreadStackHostRangeOverlaps(std::uintptr_t start, std::uintptr_t end) {
 #if defined(__linux__)
-    std::lock_guard lock(guestStackMappingsLock);
+    TimedWait::DeferredDeliveryLock lock(guestStackMappingsLock);
     auto it = guestStackMappings.upper_bound(start);
     if (it != guestStackMappings.begin()) --it;
     for (; it != guestStackMappings.end() && it->first < end; ++it) {

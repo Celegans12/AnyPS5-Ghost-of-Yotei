@@ -543,12 +543,20 @@ private:
 
 }
 
-DeliveryDeferral::DeliveryDeferral() {
+void HoldDelivery() {
     deferralDepth.fetch_add(1);
 }
 
-DeliveryDeferral::~DeliveryDeferral() {
+void ReleaseDelivery() {
     deferralDepth.fetch_sub(1);
+}
+
+DeliveryDeferral::DeliveryDeferral() {
+    HoldDelivery();
+}
+
+DeliveryDeferral::~DeliveryDeferral() {
+    ReleaseDelivery();
 }
 
 void DeliverDeferred() {

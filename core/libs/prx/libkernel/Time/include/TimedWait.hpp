@@ -39,6 +39,33 @@ public:
 
 void DeliverDeferred();
 
+#ifndef _WIN32
+void HoldDelivery();
+void ReleaseDelivery();
+
+template <class Mutex>
+class DeferredDeliveryLock {
+public:
+    explicit DeferredDeliveryLock(Mutex& mutex) : lock(mutex) {}
+    DeferredDeliveryLock(const DeferredDeliveryLock&) = delete;
+    DeferredDeliveryLock& operator=(const DeferredDeliveryLock&) = delete;
+
+private:
+    struct Hold {
+        Hold() { HoldDelivery(); }
+        ~Hold() {
+            ReleaseDelivery();
+            DeliverDeferred();
+        }
+        Hold(const Hold&) = delete;
+        Hold& operator=(const Hold&) = delete;
+    };
+
+    Hold hold;
+    std::lock_guard<Mutex> lock;
+};
+#endif
+
 #ifdef _WIN32
 void QueueForDeliveryDrain(unsigned long thread, const std::atomic<bool>* targetFinished, void (*run)(void*), void* argument);
 void ReapDeliveryDrain();

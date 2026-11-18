@@ -16,6 +16,7 @@
 #include <cstring>
 #include <exception>
 #include <mutex>
+#include <optional>
 #include <set>
 #include <string_view>
 #include <tuple>
@@ -54,6 +55,28 @@ constexpr size_t ProbeBatch = 512;
 constexpr uint64_t SeekMinBytes = uint64_t {64} << 10u;
 constexpr uint64_t SeekFirstChunk = uint64_t {64} << 10u;
 constexpr uint64_t SeekLastChunk = uint64_t {1} << 20u;
+#endif
+
+#if defined(__linux__)
+class GuestDeliveryLock {
+public:
+	explicit GuestDeliveryLock(std::mutex& mutex) : m_lock(mutex) {}
+	GuestDeliveryLock(const GuestDeliveryLock&) = delete;
+	GuestDeliveryLock& operator=(const GuestDeliveryLock&) = delete;
+
+private:
+	struct Hold {
+		Hold() { GuestDeliveryHold_nid_no_patch(); }
+		~Hold() { GuestDeliveryRelease_nid_no_patch(); }
+		Hold(const Hold&) = delete;
+		Hold& operator=(const Hold&) = delete;
+	};
+
+	Hold m_hold;
+	std::lock_guard<std::mutex> m_lock;
+};
+#else
+using GuestDeliveryLock = std::lock_guard<std::mutex>;
 #endif
 
 class PageTable {
@@ -261,7 +284,7 @@ std::mutex g_backing_changes_mutex;
 std::array<std::pair<uint64_t, uint64_t>, BackingChangeHistory> g_backing_changes {};
 
 void BumpBackingEpoch(uint64_t start, uint64_t size) noexcept {
-	std::lock_guard lock(g_backing_changes_mutex);
+	GuestDeliveryLock lock(g_backing_changes_mutex);
 	const auto epoch = g_backing_epoch.load(std::memory_order_relaxed) + 1;
 	g_backing_changes[epoch % BackingChangeHistory] = {start, size};
 	g_backing_epoch.store(epoch, std::memory_order_release);
@@ -270,7 +293,7 @@ void BumpBackingEpoch(uint64_t start, uint64_t size) noexcept {
 bool FirstClamp(uint64_t vaddr, uint64_t size, uint64_t clamped) {
 	static std::mutex mutex;
 	static std::set<std::tuple<uint64_t, uint64_t, uint64_t>> reported;
-	std::lock_guard lock(mutex);
+	GuestDeliveryLock lock(mutex);
 	return reported.emplace(vaddr, size, clamped).second;
 }
 
@@ -701,13 +724,13 @@ bool ViewEnabled() {
 
 #ifndef _WIN32
 void HoldHostWrite(std::uintptr_t address, std::size_t bytes) {
-	std::lock_guard lock(g_host_write_holds_mutex);
+	GuestDeliveryLock lock(g_host_write_holds_mutex);
 	g_host_write_holds.push_back({HostPages(address, bytes)});
 }
 
 bool ReleaseHostWrite(std::uintptr_t address, std::size_t bytes) {
 	const auto pages = HostPages(address, bytes);
-	std::lock_guard lock(g_host_write_holds_mutex);
+	GuestDeliveryLock lock(g_host_write_holds_mutex);
 	const auto hold = std::find_if(g_host_write_holds.begin(), g_host_write_holds.end(), [&pages](const auto& held) { return held.pages.first == pages.first && held.pages.end == pages.end; });
 	if (hold == g_host_write_holds.end()) return false;
 	const bool overridden = hold->overridden;
@@ -859,7 +882,7 @@ uint64_t BackingEpoch() noexcept {
 }
 
 bool BackingChangesSince(uint64_t epoch, std::vector<std::pair<uint64_t, uint64_t>>& changes) {
-	std::lock_guard lock(g_backing_changes_mutex);
+	GuestDeliveryLock lock(g_backing_changes_mutex);
 	const auto current = g_backing_epoch.load(std::memory_order_relaxed);
 	if (current - epoch > BackingChangeHistory) return false;
 	for (auto change = epoch + 1; change <= current; ++change) {
@@ -956,9 +979,9 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 #if defined(__linux__)
 	GuestThreadStackMappings_nid_no_patch(first, end, &KeepThreadStack, &kept);
 #endif
-	std::unique_lock<std::mutex> holds;
+	std::optional<GuestDeliveryLock> holds;
 	if (!writable) {
-		holds = std::unique_lock(g_host_write_holds_mutex);
+		holds.emplace(g_host_write_holds_mutex);
 		for (auto& hold : g_host_write_holds) {
 			if (hold.pages.first >= end || hold.pages.end <= first) continue;
 			hold.overridden = true;

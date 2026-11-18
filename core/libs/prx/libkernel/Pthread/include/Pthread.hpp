@@ -196,6 +196,8 @@ bool GuestThreadStackHostRangeOverlaps(std::uintptr_t start, std::uintptr_t end)
 #if defined(ANYPS5_KYTY) && defined(__linux__)
 using GuestStackVisitor = void (*)(void* context, std::uintptr_t first, std::uintptr_t end);
 extern "C" void GuestThreadStackMappings_nid_no_patch(std::uintptr_t start, std::uintptr_t end, GuestStackVisitor visit, void* context);
+extern "C" void GuestDeliveryHold_nid_no_patch();
+extern "C" void GuestDeliveryRelease_nid_no_patch();
 #endif
 void NoteGuestStackProtection(std::uintptr_t start, std::size_t bytes, bool readWrite);
 #ifdef _WIN32

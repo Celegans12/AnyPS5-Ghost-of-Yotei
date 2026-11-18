@@ -383,6 +383,89 @@ void TestThreadStackUnwatched() {
         static_cast<unsigned long long>(stack.first), static_cast<unsigned long long>(stack.second));
 }
 
+constexpr int GuestRaisedSignal = 30;
+
+struct RaisedHolder {
+    std::uint64_t page = 0;
+    std::atomic<bool> started{false};
+    std::atomic<bool> stop{false};
+    std::atomic<bool> parked{false};
+    std::atomic<bool> resume{false};
+};
+
+RaisedHolder* g_raisedHolder = nullptr;
+
+bool WaitFor(const std::atomic<bool>& flag, bool value, std::chrono::milliseconds limit) {
+    const auto deadline = std::chrono::steady_clock::now() + limit;
+    while (flag.load() != value) {
+        if (std::chrono::steady_clock::now() >= deadline) return false;
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+    return true;
+}
+
+void APS5_VABI ParkRaisedHolder(int signum, void*) {
+    Require(signum == GuestRaisedSignal);
+    auto& holder = *g_raisedHolder;
+    holder.parked.store(true);
+    while (!holder.resume.load()) std::this_thread::sleep_for(std::chrono::microseconds(50));
+    holder.resume.store(false);
+    holder.parked.store(false);
+}
+
+void* APS5_VABI HoldHostWrites(void* argument) {
+    auto& holder = *static_cast<RaisedHolder*>(argument);
+    holder.started.store(true);
+    while (!holder.stop.load()) {
+        Memory::Shim::HoldHostWrite(holder.page + 8, sizeof(std::uint64_t));
+        Require(!Memory::Shim::ReleaseHostWrite(holder.page + 8, sizeof(std::uint64_t)));
+        Require(Memory::ProtectGuestHostMemory(holder.page, Page, Common::VirtualMemory::Mode::Read));
+        Require(Memory::ProtectGuestHostMemory(holder.page, Page, Common::VirtualMemory::Mode::ReadWrite));
+    }
+    return nullptr;
+}
+
+void TestHostWriteHoldRaised() {
+    constexpr int Rounds = 300;
+    constexpr std::size_t OtherHolds = 1024;
+    void* flexible = nullptr;
+    Require(sceKernelMapFlexibleMemory(&flexible, Page, CpuReadWrite, 0) == 0 && flexible != nullptr);
+    const auto others = Address(flexible) + Page * 4;
+    for (std::size_t i = 0; i < OtherHolds; ++i) Memory::Shim::HoldHostWrite(others + i * 0x2000, sizeof(std::uint64_t));
+    RaisedHolder holder;
+    holder.page = Address(flexible);
+    g_raisedHolder = &holder;
+    Require(sceKernelInstallExceptionHandler(GuestRaisedSignal, reinterpret_cast<void*>(&ParkRaisedHolder)) == 0);
+    Pthread thread{};
+    Require(scePthreadCreate(&thread, nullptr, HoldHostWrites, &holder, "host write holder") == 0);
+    Require(WaitFor(holder.started, true, std::chrono::seconds(5)));
+    for (int round = 0; round < Rounds; ++round) {
+        Require(sceKernelRaiseException(thread, GuestRaisedSignal) == 0);
+        Require(WaitFor(holder.parked, true, std::chrono::seconds(5)));
+        std::atomic<bool> held{false};
+        std::thread collector([&held] {
+            Memory::Shim::HoldHostWrite(Address(&held), sizeof(held));
+            Require(!Memory::Shim::ReleaseHostWrite(Address(&held), sizeof(held)));
+            held.store(true);
+        });
+        const bool free = WaitFor(held, true, std::chrono::seconds(2));
+        holder.resume.store(true);
+        collector.join();
+        Require(WaitFor(holder.parked, false, std::chrono::seconds(5)));
+        if (!free) {
+            std::fprintf(stderr, "KytyShim memory: raise %d parked a guest thread that held the host write lock; another thread waited for it until the handler returned\n", round + 1);
+            std::abort();
+        }
+    }
+    holder.stop.store(true);
+    Require(scePthreadJoin(thread, nullptr) == 0);
+    Require(sceKernelRemoveExceptionHandler(GuestRaisedSignal) == 0);
+    g_raisedHolder = nullptr;
+    for (std::size_t i = 0; i < OtherHolds; ++i) Require(!Memory::Shim::ReleaseHostWrite(others + i * 0x2000, sizeof(std::uint64_t)));
+    Require(sceKernelMunmap(Address(flexible), Page) == 0);
+    std::printf("host write hold under raised exceptions: %d handlers that park a guest thread holding, releasing and protecting host writes left the hold lock free\n", Rounds);
+}
+
 void TestRuntimeMemory() {
     const auto address = Memory::AllocateRuntimeMemory(0, Page * 2, Common::VirtualMemory::Mode::ReadWrite, "kyty shim test");
     Require(address != 0 && Memory::IsBackingReadable(address, Page * 2));
@@ -943,6 +1026,7 @@ int main() {
     TestSparseReadsGuestFile();
     TestSparseReadsDirectFile();
     TestSparseReadsSwappedPage();
+    TestHostWriteHoldRaised();
     std::printf("KytyShim memory: all checks passed\n");
     return 0;
 }
