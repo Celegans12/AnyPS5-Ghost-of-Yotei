@@ -206,6 +206,11 @@ static int TestOfflineRequest(bool asynchronous, bool queued) {
     Require(sceHttp2DeleteRequest(aborted) == 0);
     const int orphan = sceHttp2CreateRequestWithURL(tmpl, "GET", "https://example.invalid/orphan", 0);
     Require(orphan > 0 && sceHttp2SendRequest(orphan, nullptr, 0) == networkError);
+    const int sized = sceHttp2CreateRequestWithURL(tmpl, "POST", "https://example.invalid/sized", 0);
+    const std::array<char, 2> shortBody{'o', 'k'};
+    Require(sized > 0 && sceHttp2SetRequestContentLength(sized, 4) == 0);
+    Require(sceHttp2SendRequest(sized, shortBody.data(), shortBody.size()) == networkError);
+    Require(sceHttp2DeleteRequest(sized) == 0);
     const int sibling = sceHttp2CreateTemplate(context, "offline-test", 3, 0);
     const int child = sceHttp2CreateRequestWithURL(sibling, "GET", "https://example.invalid/child", 0);
     Require(sibling > 0 && child > 0 && sceHttp2SendRequest(child, nullptr, 0) == networkError);
