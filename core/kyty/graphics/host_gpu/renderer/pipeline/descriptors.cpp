@@ -2377,11 +2377,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 			if (descriptor.NumRecords() == UINT32_MAX) {
 				if (program.info.buffers[resource].written) {
 					for (const auto* reader: stages) {
+						const bool own_compute_reads =
+						    reader == stage && program.stage == ShaderType::Compute;
 						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
 							if (read_size == 0) continue;
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
-							} else if (address - read_address < read_size) {
+							} else if (address - read_address < read_size && !own_compute_reads) {
 								EXIT("scalar resource reads overlap a shader buffer write\n");
 							}
 						}
