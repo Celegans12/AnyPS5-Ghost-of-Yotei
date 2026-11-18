@@ -1948,6 +1948,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 
 	m_context.GetOcclusionQueries().WriteForReaders();
+	if (state.ps_active) {
+		PrepareDrawRayTracing(m_context, buffer, bindings.pixel);
+	}
 	auto vk_buffer = buffer.Handle();
 	if (!mesh_active) {
 		CommitVertexBuffers(vk_buffer, vertex_bindings);
@@ -2029,9 +2032,6 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	if (state.ps_active && HasShaderBufferWrites(state.ps_input_info.stage)) {
 		shader_write_stages |= vk::PipelineStageFlagBits::eFragmentShader;
-	}
-	if (state.ps_active) {
-		PrepareDrawRayTracing(m_context, buffer, bindings.pixel);
 	}
 	if (shader_write_stages && !buffer.HasPendingShaderWrites()) {
 		buffer.EndRendering();
