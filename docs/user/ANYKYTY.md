@@ -154,24 +154,59 @@ The full procedure, with module folders and Windows output (`--windows`), is in 
 
 ## Settings
 
-All settings are environment variables read at start. An invalid value stops the emulator with a message that names the variable. Only the settings of this fork that matter most are listed; the whole set is in [the third-party document](../dev/THIRD_PARTY_KYTY.md#settings-of-the-kyty-build) and [ENVIRONMENT](../dev/ENVIRONMENT.md).
+All settings are environment variables, read once when the game starts. Most refuse a value they cannot read, with a message that names the variable; a few take any value and fall back to their default. [The full reference](../dev/THIRD_PARTY_KYTY.md#settings-of-the-kyty-build) lists all of the `KYTY_*` settings, one row each, with its values, default, effect, category and origin. These are the ones worth knowing, grouped by what you want to do.
+
+**Display and pacing**
 
 | Variable | Values | Effect |
 |---|---|---|
 | `ANYPS5_VBLANK_HZ` | 30 to 360 | Vblank rate. Raising it lifts the 60 FPS cap of games that pace on vblank. Wins over `KYTY_VBLANK_FREQUENCY` |
 | `KYTY_VBLANK_FREQUENCY` | whole number, clamped to 30 to 360 | Kyty's name for the same setting, used when `ANYPS5_VBLANK_HZ` is unset |
+| `APS5_UNPACED_FLIPS` | `0`, `1` | Benchmark aid: a flip completes once presented instead of at the next vblank, so a game that renders faster than the vblank is not held to it. `KYTY_PRESENT_MODE` still decides what the display shows |
 | `KYTY_PRESENT_MODE` | `Fifo`, `Mailbox`, `Immediate` | Vulkan present mode (`Mailbox` by default) |
+| `ANYPS5_FULLSCREEN` | `0`, `1`, `windowed`, `borderless` | Opens the window fullscreen. Kyty's own `KYTY_FULLSCREEN` does nothing here |
+| `KYTY_GPU` | GPU index, `-1` for Kyty's choice (default) | Picks the Vulkan device. `ANYPS5_GPU` is not read with Kyty |
+| `KYTY_HDR` | `0`, `1` | Asks for an HDR10 output when the display offers it |
+| `KYTY_STRETCH` | `0`, `1` | Fills the window instead of keeping the game's aspect ratio |
+
+**Speed**
+
+On by default unless the row says otherwise; set one to compare, or to work around a problem in a game.
+
+| Variable | Values | Effect |
+|---|---|---|
 | `KYTY_GPU_THREAD_CPUS` | unset, `off`, or a comma-separated list of logical CPUs | Unset: GPU stage threads keep to the CPUs sharing the largest L3 cache (Linux). `off`: no placement. A list pins the stages, in the order command processor, execute, record, resolve, host copy |
-| `KYTY_EARLY_FLIP` | `0`, `1` (default) | Hand flips back to the game as soon as the presentation copy is submitted. `0` restores Kyty's behaviour |
+| `KYTY_EARLY_FLIP` | `0`, `1` (default) | Hand flips back to the game as soon as the presentation copy is submitted |
+| `KYTY_SUSPEND_POINT_DEPTH` | 1 to 64, `8` by default | Suspend points the GPU may have in flight; `1` is Kyty's behaviour |
+| `KYTY_LABELS_AFTER_DUMPS` | `0`, `1` (default) | Deferred labels wait for the newest pending occlusion dump instead of their own command buffer |
 | `KYTY_DRAW_TEMPLATES`, `KYTY_DRAW_BUFFERS` | `2` and `1` by default; `0` turns off | Kyty's draw templates and grouped draw-buffer copies, on by default in AnyKyty |
-| `KYTY_WRITE_BACK_IMAGES` | `0`, `1` (default) | Copy GPU-written images back at the write-backs the game requests. `0` restores Kyty's behaviour |
-| `KYTY_TILE_VIA_VRAM` | `0`, `1` (default) | Read tiled images back to guest memory through VRAM: one copy to host memory instead of scattered writes across PCIe. `0` restores Kyty's behaviour |
+| `KYTY_WRITE_BACK_IMAGES` | `0`, `1` (default) | Copy GPU-written images back at the write-backs the game requests |
+| `KYTY_TILE_VIA_VRAM` | `0`, `1` (default) | Read tiled images back through VRAM: one copy to host memory instead of scattered writes across PCIe |
 | `KYTY_PROGRAM_LOCK` | `narrow` (default), `wide` | Scope of the program-cache lock. `wide` is Kyty's |
+| `KYTY_PIPELINE_LIBRARIES` | `0`, `1` (default) | Link graphics pipelines from per-stage pipeline libraries (`VK_EXT_graphics_pipeline_library`) |
+| `KYTY_ASYNC_PIPELINES` | `0`, `1` (default in this build) | Create the pipeline of a draw that only changes the picture in the background; the draw is skipped until it is ready |
+| `KYTY_SHADER_CACHE` | `0` (default), `1` | Keep recompiled shaders on disk and warm them up at the next start (Release builds) |
+| `ANYPS5_KYTY_PRESTART` | `0`, `1` (default) | `0` starts the Kyty GPU after the window exists instead of during its creation |
+
+**Ray tracing**
+
+| Variable | Values | Effect |
+|---|---|---|
 | `KYTY_NATIVE_RT` | unset, `0`, `1` | Unset: native ray tracing when the GPU supports it. `0`: ray tracing emulated in shaders. `1`: native, and a stop with a message when the GPU cannot |
 | `KYTY_RT_STATS` | `0`, `1` | Print a ray tracing summary every 10 s |
 | `KYTY_RT_ARENA_MB` | MiB | Limit of the memory the native ray tracing structures take |
-| `ANYPS5_KYTY_PRESTART` | `0`, `1` (default) | `0` starts the Kyty GPU after the window exists instead of during its creation |
+
+**Reporting a problem**
+
+| Variable | Values | Effect |
+|---|---|---|
 | `KYTY_PRINTF_DIRECTION` | `Silent` (default), `Console`, `File` | Where Kyty's log goes |
+| `KYTY_SESSION_LOG` | path | Writes a session log file |
+| `KYTY_PIPELINE_STALL_LOG_MS` | milliseconds, `100` by default | Logs `[kyty-gpl]` lines for pipeline stalls and shader translations that take this long |
+| `KYTY_VULKAN_VALIDATION` | `0`, `1` | Turns the Khronos validation layer on |
+| `KYTY_LOCK_STATS` | `0`, `1` | Prints how long threads wait on the program-cache lock |
+
+Kyty's window options (`KYTY_FULLSCREEN`, `KYTY_HIDE_CURSOR`, `KYTY_VR`, `KYTY_RENDERDOC`), its trophy and language options and a few experimental switches have no effect or are not meant for play: the full reference says which, in its category column.
 
 ## Contributing
 
