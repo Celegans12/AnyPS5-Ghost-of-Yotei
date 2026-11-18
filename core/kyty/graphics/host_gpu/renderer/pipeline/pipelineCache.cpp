@@ -2314,6 +2314,12 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	                    ? modules.begin() + static_cast<std::ptrdiff_t>(last)
 	                    : std::ranges::find_if(modules, matches);
 	if (module == modules.end()) {
+#if defined(ANYPS5_KYTY)
+		if (!program->failed_variants.empty() && program->Failed(specialization, push_data_cursor)) {
+			ahead.reads.Fail();
+			return nullptr;
+		}
+#endif
 		if (!ahead.reads.MayHaveReadGpuWrites() && !t_ahead_unread_load) {
 			QueueCompile(key, params, input_info, push_data_cursor, &specialization);
 #if defined(ANYPS5_KYTY)
