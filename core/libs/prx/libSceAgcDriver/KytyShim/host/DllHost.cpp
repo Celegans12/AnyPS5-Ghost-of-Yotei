@@ -339,6 +339,8 @@ const KytyDllApi& Api() {
     return *api;
 }
 
+[[maybe_unused]] const bool g_kyty_dll_loaded = (Api(), true);
+
 void Call(KytyDllStatus (*function)()) {
     Check(function());
 }

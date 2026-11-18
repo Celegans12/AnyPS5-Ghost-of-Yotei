@@ -234,7 +234,7 @@ private:
 };
 
 std::mutex g_outputs_mutex;
-std::unordered_map<KytyDllVideoOutput*, std::weak_ptr<HostVideoOutput>> g_outputs;
+auto& g_outputs = *new std::unordered_map<KytyDllVideoOutput*, std::weak_ptr<HostVideoOutput>>;
 
 std::shared_ptr<HostVideoOutput> OutputFor(KytyDllVideoOutput* handle) {
     std::lock_guard lock(g_outputs_mutex);
