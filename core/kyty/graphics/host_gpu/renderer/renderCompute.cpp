@@ -562,6 +562,10 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	PrepareNativeRayTracing(m_context, vk_buffer, cs_regs, bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+#if defined(ANYPS5_KYTY)
+	m_context.GetCommandScheduler().GetMasterSemaphore().NoteWork(m_context.GetCommandScheduler().CurrentTick(),
+	                                                              program.shader_hash);
+#endif
 	bool has_storage_writes = HasStorageWrites(input_info, bindings, indirect_writes);
 	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
 	if (has_storage_writes && !chained) {
@@ -844,6 +848,10 @@ void RenderExecutor::DispatchIndirectThreads(CommandBuffer& buffer, uint64_t arg
 
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+#if defined(ANYPS5_KYTY)
+	m_context.GetCommandScheduler().GetMasterSemaphore().NoteWork(m_context.GetCommandScheduler().CurrentTick(),
+	                                                              program.shader_hash);
+#endif
 	const bool has_storage_writes = bindings.shared_memory.buffer != nullptr ||
 	    HasShaderBufferWrites(input_info.stage) || self_sized_writes ||
 	    std::any_of(program.info.images.begin(), program.info.images.end(), [](const auto& image) {
@@ -924,6 +932,10 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings);
 	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
 	               std::span {&descriptor_stage, 1u});
+#if defined(ANYPS5_KYTY)
+	m_context.GetCommandScheduler().GetMasterSemaphore().NoteWork(m_context.GetCommandScheduler().CurrentTick(),
+	                                                              program.shader_hash);
+#endif
 	const auto vk_buffer = buffer.Handle();
 	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
 	if (!chained) {
