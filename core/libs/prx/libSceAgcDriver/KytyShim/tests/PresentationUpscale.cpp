@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/UpscaleMode.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -88,6 +89,45 @@ float Cmaa2Weight(float lenNeg, float totalLen) {
     return std::clamp(0.5f - std::abs(t - 0.5f), 0.0f, 0.45f);
 }
 
+struct Cmaa2BilateralResult {
+    float lenNeg = 0.0f;
+    float lenPos = 0.0f;
+    float totalLen = 0.0f;
+    float weight = 0.0f;
+};
+
+Cmaa2BilateralResult SimulateCmaa2BilateralSearch(const float* lumaLine, int width, int pixelX, float gradOpp, int maxSearch = 10) {
+    float lenNeg = static_cast<float>(maxSearch);
+    for (int i = 1; i <= maxSearch; ++i) {
+        const int pC = pixelX - i;
+        if (pC < 0) {
+            lenNeg = static_cast<float>(i - 1);
+            break;
+        }
+        const float g = lumaLine[pC];
+        if (g < gradOpp * 0.25f || g > gradOpp * 2.5f) {
+            lenNeg = static_cast<float>(i - 1);
+            break;
+        }
+    }
+    float lenPos = static_cast<float>(maxSearch);
+    for (int i = 1; i <= maxSearch; ++i) {
+        const int pC = pixelX + i;
+        if (pC >= width) {
+            lenPos = static_cast<float>(i - 1);
+            break;
+        }
+        const float g = lumaLine[pC];
+        if (g < gradOpp * 0.25f || g > gradOpp * 2.5f) {
+            lenPos = static_cast<float>(i - 1);
+            break;
+        }
+    }
+    const float totalLen = lenNeg + lenPos;
+    const float weight = Cmaa2Weight(lenNeg, totalLen);
+    return {lenNeg, lenPos, totalLen, weight};
+}
+
 void TestUpscaleModeSelection() {
     using AgcDriver::SelectUpscaleMode;
     const auto unset = SelectUpscaleMode(nullptr, nullptr);
@@ -172,6 +212,49 @@ void TestCmaa2MorphologicalEdgeMath() {
     Require(Cmaa2Weight(1.0f, 4.0f) > Cmaa2Weight(0.0f, 4.0f), "subpixel weight is not monotonic towards center");
 }
 
+void TestCmaa2BilateralEdgeSearch() {
+    constexpr float baseGrad = 0.5f;
+
+    std::array<float, 32> isolated {};
+    isolated.fill(0.0f);
+    isolated[16] = baseGrad;
+    const auto isoRes = SimulateCmaa2BilateralSearch(isolated.data(), static_cast<int>(isolated.size()), 16, baseGrad);
+    Require(isoRes.lenNeg == 0.0f, "isolated pixel search negative length was not 0");
+    Require(isoRes.lenPos == 0.0f, "isolated pixel search positive length was not 0");
+    Require(isoRes.totalLen == 0.0f, "isolated pixel total length was not 0");
+    Require(isoRes.weight == 0.0f, "isolated pixel produced non-zero blend weight");
+
+    std::array<float, 32> pair {};
+    pair.fill(0.0f);
+    pair[15] = baseGrad;
+    pair[16] = baseGrad;
+    const auto pairRes = SimulateCmaa2BilateralSearch(pair.data(), static_cast<int>(pair.size()), 16, baseGrad);
+    Require(pairRes.lenNeg == 1.0f && pairRes.lenPos == 0.0f, "2-pixel segment lengths incorrect");
+    Require(pairRes.totalLen == 1.0f, "2-pixel segment total length was not 1");
+    Require(pairRes.weight == 0.0f, "2-pixel segment totalLen < 2 produced non-zero weight");
+
+    std::array<float, 32> triple {};
+    triple.fill(0.0f);
+    triple[15] = baseGrad;
+    triple[16] = baseGrad;
+    triple[17] = baseGrad;
+    const auto tripleRes = SimulateCmaa2BilateralSearch(triple.data(), static_cast<int>(triple.size()), 16, baseGrad);
+    Require(tripleRes.lenNeg == 1.0f && tripleRes.lenPos == 1.0f, "3-pixel segment lengths incorrect");
+    Require(tripleRes.totalLen == 2.0f, "3-pixel segment total length was not 2");
+    Require(tripleRes.weight > 0.0f, "3-pixel segment failed to blend");
+
+    std::array<float, 32> boundaryLine {};
+    boundaryLine.fill(baseGrad);
+    const auto boundRes = SimulateCmaa2BilateralSearch(boundaryLine.data(), static_cast<int>(boundaryLine.size()), 2, baseGrad);
+    Require(boundRes.lenNeg == 2.0f, "negative search did not clamp to boundary at x=0");
+
+    std::array<float, 32> crossLine {};
+    crossLine.fill(baseGrad);
+    crossLine[16 + 3] = baseGrad * 3.0f;
+    const auto crossRes = SimulateCmaa2BilateralSearch(crossLine.data(), static_cast<int>(crossLine.size()), 16, baseGrad);
+    Require(crossRes.lenPos == 2.0f, "gradient jump > 2.5x did not terminate search at step 3");
+}
+
 void TestNativeRcasFilterMath() {
     struct Cmaa2Parameters {
         int32_t x;
@@ -238,6 +321,7 @@ int main() {
     TestUpscaleModeSelection();
     TestFitAspectAndUpscaleDecisions();
     TestCmaa2MorphologicalEdgeMath();
+    TestCmaa2BilateralEdgeSearch();
     TestNativeRcasFilterMath();
     TestDynamicResolutionScalingTransitions();
     TestSlotRotationInvariants();
