@@ -510,11 +510,13 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		vk::StructureChain<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>
 		    library_properties;
 		physical_device.getProperties2(&library_properties.get<vk::PhysicalDeviceProperties2>());
+		const auto& library_limits =
+		    library_properties.get<vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>();
 		graphics.pipeline_library_enabled =
 		    library_features.get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>().graphicsPipelineLibrary ==
 		        VK_TRUE &&
-		    library_properties.get<vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>()
-		            .graphicsPipelineLibraryFastLinking == VK_TRUE;
+		    library_limits.graphicsPipelineLibraryFastLinking == VK_TRUE &&
+		    library_limits.graphicsPipelineLibraryIndependentInterpolationDecoration == VK_TRUE;
 		if (graphics.pipeline_library_enabled) {
 			add(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
 			add(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
