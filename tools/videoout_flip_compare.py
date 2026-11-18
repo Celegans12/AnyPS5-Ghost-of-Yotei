@@ -32,7 +32,7 @@ def videoout_flip_records(path):
         yield location, record
 
 
-def read_videoout_flip_window(path):
+def read_videoout_flip_samples(path):
     records = videoout_flip_records(path)
     location, contract = next(records, (str(path), {}))
     if (contract.get("ev") != "contract" or contract.get("contract") != "v1-pad"
@@ -47,7 +47,7 @@ def read_videoout_flip_window(path):
         raise ValueError(f"{location}: expected a valid completed-flip window")
 
     generation = None
-    timestamps = []
+    samples = []
     drops = 0
     for location, record in records:
         event = record["ev"]
@@ -62,25 +62,35 @@ def read_videoout_flip_window(path):
             raise ValueError(f"{location}: expected one nonzero output generation")
         generation = current
         sequence = benchmark_integer(record.get("n"), f"{location} n")
-        expected = first + len(timestamps)
-        if len(timestamps) == count:
+        expected = first + len(samples)
+        if len(samples) == count:
             raise ValueError(f"{location}: extra flip {sequence} outside the declared window")
         if sequence != expected:
             raise ValueError(f"{location}: expected flip {expected}, got {sequence}")
         timestamp = benchmark_integer(record.get("process_us"), f"{location} process_us")
-        if timestamps and timestamp <= timestamps[-1]:
+        if samples and timestamp <= samples[-1][0]:
             raise ValueError(f"{location}: process_us must increase between completed flips")
-        timestamps.append(timestamp)
+        samples.append((timestamp, record.get("t_ns")))
 
-    if len(timestamps) != count:
-        raise ValueError(f"{path}: incomplete window; expected {count} flips, found {len(timestamps)}")
-    intervals = [right - left for left, right in zip(timestamps, timestamps[1:])]
-    duration = timestamps[-1] - timestamps[0]
+    if len(samples) != count:
+        raise ValueError(f"{path}: incomplete window; expected {count} flips, found {len(samples)}")
     return {
         "commit": commit,
         "first_flip": first,
         "flip_count": count,
         "generation": generation,
+        "observed_telemetry_drops": drops,
+    }, samples
+
+
+def read_videoout_flip_window(path):
+    window, samples = read_videoout_flip_samples(path)
+    drops = window.pop("observed_telemetry_drops")
+    timestamps = [timestamp for timestamp, _ in samples]
+    intervals = [right - left for left, right in zip(timestamps, timestamps[1:])]
+    duration = timestamps[-1] - timestamps[0]
+    return {
+        **window,
         "elapsed_us": duration,
         "mean_fps": len(intervals) * 1_000_000 / duration,
         "p50_ms": statistics.median(intervals) / 1000,

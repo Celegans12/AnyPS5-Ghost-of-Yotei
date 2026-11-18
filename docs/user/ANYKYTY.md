@@ -234,6 +234,14 @@ python tools/videoout_flip_compare.py default/videoout.jsonl kyty/videoout.jsonl
 
 The comparison checks the reported build revision and every flip in each declared window. It reports mean completed-flip FPS and the median and nearest-rank p99 of the intervals between flips. `--json` prints the same metrics for other tools. The drop count covers all telemetry events, including pad and caption updates. The report measures completed VideoOut flips. Scene equivalence, build cleanliness, unique rendered frames and display timing need separate evidence.
 
+To inspect a stutter, record completed flips and a `KYTY_SESSION_LOG` file from the same Kyty run. Use a new telemetry directory and log file, and set `KYTY_PIPELINE_STALL_LOG_MS` low enough to capture the events of interest. Exit after the flip window completes.
+
+```sh
+python tools/kyty_pipeline_stalls.py kyty/videoout.jsonl kyty/session.log --top 10
+```
+
+The report lists the longest completed-flip gaps by `process_us` and shows the number of recorded events and the largest timestamp overlap in each category. It uses the same-run nanosecond steady clock for the join. A dash marks gaps with no recorded overlap in that category. Background work can appear alongside a gap, and unfinished or below-threshold events can be absent. Use `--json` for shader hashes, wait routes, and Vulkan results.
+
 **Open issues** where help is wanted ([all issues](https://github.com/simnJS/AnyPS5/issues)):
 
 - [#33](https://github.com/simnJS/AnyPS5/issues/33) shader and pipeline compile stalls on first play: precompile pipeline parts with `VK_EXT_graphics_pipeline_library` (labelled `help wanted`);
