@@ -27,7 +27,6 @@ inline constexpr std::uint32_t ImageNormalizedValues = 1u << (4u * ImageComponen
 enum class ImageComponentConstant : std::uint32_t { None, Zero, IntegerOne, FloatOne };
 inline constexpr std::uint32_t VertexBase = 4096u;
 inline constexpr std::uint32_t VertexWords = 6u;
-inline constexpr std::uint32_t BlockAddressOffset = 8187u;
 inline constexpr std::uint32_t PushDataOffset = 8188u;
 inline constexpr std::uint32_t ExportBase = 8192u;
 inline constexpr std::uint32_t ExportPackingBase = 8224u;
@@ -42,6 +41,8 @@ inline constexpr std::uint32_t DepthRemapBase = 8240u;
 inline constexpr std::uint32_t DepthRemapWords = 1u;
 inline constexpr std::uint32_t WorkgroupOffsetBase = 8241u;
 inline constexpr std::uint32_t WorkgroupOffsetWords = 3u;
+inline constexpr std::uint32_t AtomicLockTableBase = 8244u;
+inline constexpr std::uint32_t AtomicLockTableWords = 2u;
 inline constexpr std::uint32_t HeapCountBase = 8256u;
 inline constexpr std::uint32_t MipCountBase = 8320u;
 inline constexpr std::uint32_t StoreQuantizeBase = 12288u;
@@ -63,6 +64,10 @@ inline constexpr std::uint32_t DescriptorIndex(std::uint32_t binding, std::uint3
 
 inline constexpr bool IsWorkgroupOffset(std::uint32_t id) {
     return id >= WorkgroupOffsetBase && id < WorkgroupOffsetBase + WorkgroupOffsetWords;
+}
+
+inline constexpr bool IsAtomicLockTable(std::uint32_t id) {
+    return id >= AtomicLockTableBase && id < AtomicLockTableBase + AtomicLockTableWords;
 }
 
 }

@@ -406,7 +406,6 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
         if (resources.split) {
             auto& sets = shader.stage == Stage::Fragment ? keys.fragmentSets : keys.preRasterizationSets;
             for (const auto& binding : shader.program->bindings) {
-                if (BlockMetadata(*shader.program, binding)) continue;
                 Require(binding.descriptorSet < 2u, "split pipeline library descriptor set exceeds two slots");
                 sets |= 1u << binding.descriptorSet;
             }
@@ -432,6 +431,7 @@ bool libraryKeys(PipelineLibraryKeys& keys, const Context& context, const State&
     appendKey(keys.vertexInput, state.topology);
     appendKey(keys.vertexInput, state.primitiveRestart);
     appendKey(keys.preRasterization, state.provokingVertexMode);
+    appendKey(keys.preRasterization, ViewportCount(state));
     appendKey(keys.preRasterization, state.polygonMode);
     appendKey(keys.preRasterization, state.lineWidth);
     appendKey(keys.preRasterization, state.negativeOneToOne);
@@ -567,7 +567,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         const VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT meshSubgroup{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT, nullptr, 32u};
         for (std::uint32_t i = 0; i < shaders.size(); ++i) {
             const auto& shader = *shaders[i].program;
-            const auto demoted = barycentricPatches && shaders[i].stage == ShaderRecompiler::ShaderStage::Vertex ? DemoteVertexLayerOutput(shader.spirv.Words()) : std::vector<std::uint32_t>{};
+            const auto demoted = (barycentricPatches || state.rectList) && shaders[i].stage == ShaderRecompiler::ShaderStage::Vertex ? DemoteVertexLayerOutput(shader.spirv.Words()) : std::vector<std::uint32_t>{};
             const auto words = demoted.empty() ? shader.spirv.Words() : std::span<const std::uint32_t>(demoted);
             _modules[i] = CreateShaderModule(context, words.data(), words.size() * sizeof(std::uint32_t), "vkCreateShaderModule graphics");
             const auto stage = VulkanStage(shaders[i].stage);
@@ -576,7 +576,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             stages[i].module = _modules[i];
             stages[i].pName = "main";
             if (shaders[i].stage == ShaderRecompiler::ShaderStage::Mesh && context.meshWave32 && shader.hostSubgroupSize == 32u) stages[i].pNext = &meshSubgroup;
-            specializations.emplace_back(shader, state.meshLayerBase, state.meshLayerCount);
+            specializations.emplace_back(shader, context.atomicLockTable, state.meshLayerBase, state.meshLayerCount);
             stages[i].pSpecializationInfo = specializations.back().Info();
         }
         if (std::ranges::any_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && !shader.program->stencilReferences.empty(); })) {
@@ -682,8 +682,9 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         VkPipelineViewportDepthClipControlCreateInfoEXT depthClip{VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT};
         depthClip.negativeOneToOne = state.negativeOneToOne;
         if (state.negativeOneToOne) viewports.pNext = &depthClip;
-        viewports.viewportCount = 1;
-        viewports.scissorCount = 1;
+        Require(!patches || state.extraViewports.empty(), "a viewport index through the barycentric patch stages is unsupported");
+        viewports.viewportCount = ViewportCount(state);
+        viewports.scissorCount = ViewportCount(state);
         PipelineLibraryKeys keys;
         libraries = libraryKeys(keys, context, state, vertexInput, resources, shaders);
         std::vector<VkDynamicState> dynamicStates{VK_DYNAMIC_STATE_VIEWPORT, VK_DYNAMIC_STATE_SCISSOR};
@@ -809,7 +810,7 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
             prebuilt = true;
             return;
         }
-        const VkPipelineCache pipelineCache = (state.stages.tessellation || barycentricPatches) && !context.tessellationPipelineCache ? VK_NULL_HANDLE : context.pipelineCache;
+        const VkPipelineCache pipelineCache = (state.stages.tessellation || barycentricPatches || state.rectList) && !context.tessellationPipelineCache ? VK_NULL_HANDLE : context.pipelineCache;
         if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
         else {
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
@@ -994,12 +995,24 @@ void Pipeline::Begin(CommandState& recording, const Framebuffer& framebuffer, Vk
     Continue(recording, state, masked);
 }
 
+void Pipeline::setViewports(CommandState& recording, const State& state) const {
+    if (state.extraViewports.empty()) {
+        recording.SetViewport(context, state.viewport);
+        recording.SetScissor(context, state.scissor);
+        return;
+    }
+    Require(state.viewportScissors.size() == ViewportCount(state), "every viewport needs a scissor");
+    std::array<VkViewport, MaxViewports> viewports{};
+    viewports[0] = state.viewport;
+    std::copy(state.extraViewports.begin(), state.extraViewports.end(), viewports.begin() + 1);
+    recording.SetViewports(context, std::span(viewports.data(), ViewportCount(state)), state.viewportScissors);
+}
+
 void Pipeline::Continue(CommandState& recording, const State& state, const State* masked) const {
     if (optimized != nullptr) optimized->Schedule();
     const auto best = optimized != nullptr ? optimized->handle.load() : VK_NULL_HANDLE;
     recording.BindPipeline(context, best != VK_NULL_HANDLE ? best : pipeline, dynamicSlots);
-    recording.SetViewport(context, state.viewport);
-    recording.SetScissor(context, state.scissor);
+    setViewports(recording, state);
     setColorWriteMasks(recording, state, masked, false);
     if (state.stencilReplayReference) recording.SetStencilReference(context, VK_STENCIL_FACE_FRONT_AND_BACK, *state.stencilReplayReference);
     if (libraries) {
@@ -1054,8 +1067,7 @@ void Pipeline::ContinueBackFaces(CommandState& recording, const State& state, co
     Require(backFaces != VK_NULL_HANDLE, "the pipeline draws both faces in one pass");
     recording.BindPipeline(context, backFaces, dynamicSlots);
     setColorWriteMasks(recording, state, masked, false);
-    recording.SetViewport(context, state.viewport);
-    recording.SetScissor(context, state.scissor);
+    setViewports(recording, state);
     recording.SetDepthBias(context, HostDepthBiasConstant(context, state.depth->format, state.backDepthBiasConstant), state.depthBiasClamp, state.backDepthBiasSlope);
     if (depthBounds) recording.SetDepthBounds(context, state.minDepthBounds, state.maxDepthBounds);
 }
@@ -1156,6 +1168,7 @@ std::size_t pipelineKey(std::vector<std::byte>& storage, const Context& context,
     append(key, state.lineWidth);
     append(key, state.frontFace);
     append(key, state.provokingVertexMode);
+    append(key, ViewportCount(state));
     append(key, state.negativeOneToOne);
     append(key, state.depthClamp && context.depthClamp);
     append(key, state.conservativeRasterization);
@@ -1257,16 +1270,6 @@ struct PipelineStore {
     std::uint64_t misses = 0;
     std::uint64_t uncached = 0;
     std::uint64_t evicted = 0;
-    struct BuildWindow {
-        std::uint64_t hits = 0;
-        std::uint64_t built = 0;
-        std::uint64_t builtNs = 0;
-        std::uint64_t privateBuilt = 0;
-        std::uint64_t privateNs = 0;
-        std::uint64_t longestNs = 0;
-        std::uint64_t replayBuilt = 0;
-        std::uint64_t replayNs = 0;
-    } window;
     PipelineStoreCounters totals;
     std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
     std::size_t capacity = 0;
@@ -1342,58 +1345,15 @@ void noteStoreReturn(PipelineStore& store, std::uint64_t hash) {
     ++store.returnsSinceCheck;
 }
 
-void noteBuild(PipelineStore& store, bool replaying, bool privateBuild, std::uint64_t nanoseconds) {
-    if (replaying) {
-        ++store.window.replayBuilt;
-        store.window.replayNs += nanoseconds;
-        ++store.totals.replayBuilds;
-        store.totals.replayBuildNanoseconds += nanoseconds;
-        return;
-    }
-    if (privateBuild) {
-        ++store.window.privateBuilt;
-        store.window.privateNs += nanoseconds;
-    } else {
-        ++store.window.built;
-        store.window.builtNs += nanoseconds;
-    }
-    store.window.longestNs = std::max(store.window.longestNs, nanoseconds);
-    ++store.totals.drawBuilds;
-    store.totals.drawBuildNanoseconds += nanoseconds;
-}
-
-std::string journalState() {
-    if (!PipelineJournalEnabled()) return "journal off";
-    const auto journal = PipelineJournalTotals();
-    char text[256];
-    if (journal.replayThreads == 0) {
-        std::snprintf(text, sizeof(text), "journal: %llu pipelines loaded, no replay", static_cast<unsigned long long>(journal.loadedRecipes));
-    } else if (journal.replayMs == 0.0) {
-        std::snprintf(text, sizeof(text), "journal: %llu pipelines loaded, replay running on %u threads", static_cast<unsigned long long>(journal.loadedRecipes), journal.replayThreads);
-    } else {
-        std::snprintf(text, sizeof(text), "journal: %llu pipelines loaded, replay finished in %.0f ms (%llu graphics and %llu compute built, %llu present, %llu rejected, %llu failed)", static_cast<unsigned long long>(journal.loadedRecipes), journal.replayMs, static_cast<unsigned long long>(journal.replayedGraphics), static_cast<unsigned long long>(journal.replayedCompute), static_cast<unsigned long long>(journal.replayPresent), static_cast<unsigned long long>(journal.replayRejected), static_cast<unsigned long long>(journal.replayFailed));
-    }
-    return text;
-}
-
 void reportPipelines(PipelineStore& store) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    if (!profile && !stats) return;
+    if (!profile) return;
     const auto now = std::chrono::steady_clock::now();
     if (now - store.lastReport < std::chrono::seconds(10)) return;
     store.lastReport = now;
-    if (profile) {
-        const auto lookups = store.hits + store.misses + store.uncached;
-        AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
-    }
+    const auto lookups = store.hits + store.misses + store.uncached;
+    AgcDriver::ProfilePrint_nid_no_patch( "[pipecache] %llu lookups over 10 s: %llu hits (%.0f%%), %llu misses, %llu private (no variant id), %llu evicted, %zu cached\n", static_cast<unsigned long long>(lookups), static_cast<unsigned long long>(store.hits), lookups != 0 ? 100.0 * static_cast<double>(store.hits) / static_cast<double>(lookups) : 0.0, static_cast<unsigned long long>(store.misses), static_cast<unsigned long long>(store.uncached), static_cast<unsigned long long>(store.evicted), store.entries.size());
     store.hits = store.misses = store.uncached = store.evicted = 0;
-    const auto& window = store.window;
-    const auto ms = [](std::uint64_t nanoseconds) { return static_cast<double>(nanoseconds) / 1e6; };
-    AgcDriver::ProfilePrint_nid_no_patch("[pipelines] (10 s): %llu draw lookups, %llu hits, %llu built at the draw in %.1f ms, %llu private built in %.1f ms (longest draw build %.1f ms), %llu built by the journal replay in %.1f ms; cumulative: %llu built at draws in %.1f ms, %llu by the replay in %.1f ms; %s\n",
-                                         static_cast<unsigned long long>(window.hits + window.built + window.privateBuilt), static_cast<unsigned long long>(window.hits), static_cast<unsigned long long>(window.built), ms(window.builtNs), static_cast<unsigned long long>(window.privateBuilt), ms(window.privateNs), ms(window.longestNs), static_cast<unsigned long long>(window.replayBuilt), ms(window.replayNs),
-                                         static_cast<unsigned long long>(store.totals.drawBuilds), ms(store.totals.drawBuildNanoseconds), static_cast<unsigned long long>(store.totals.replayBuilds), ms(store.totals.replayBuildNanoseconds), journalState().c_str());
-    store.window = {};
 }
 
 }
@@ -1406,35 +1366,17 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (created != nullptr) *created = false;
     if (storeHash != nullptr) *storeHash = 0;
+    if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
-    const bool replaying = PipelineJournalReplaying();
-    std::uint64_t builtNs = 0;
-    const auto build = [&] {
-        const auto started = std::chrono::steady_clock::now();
-        auto built = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
-        builtNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count());
-        return built;
-    };
-    if (disabled) {
-        auto pipeline = build();
-        std::lock_guard lock(store.mutex);
-        noteBuild(store, replaying, true, builtNs);
-        return pipeline;
-    }
     struct PipelineKeyStorage {};
     auto& storage = HostThreadLocal<std::vector<std::byte>, PipelineKeyStorage>();
     const auto length = pipelineKey(storage, context, state, vertexInput, resources, shaders, attachmentLayout);
     const std::span<const std::byte> key(storage.data(), length);
     if (key.empty()) {
-        {
-            std::lock_guard lock(store.mutex);
-            ++store.uncached;
-            ++store.totals.uncached;
-        }
-        auto pipeline = build();
         std::lock_guard lock(store.mutex);
-        noteBuild(store, replaying, true, builtNs);
-        return pipeline;
+        ++store.uncached;
+        ++store.totals.uncached;
+        return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     }
     const auto hash = hashKey(key);
     // The store's entry of the key, or nullptr with `found` telling a miss (the key is new) from a
@@ -1464,7 +1406,6 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         if (auto pipeline = lookup(collision)) {
             ++store.hits;
             ++store.totals.hits;
-            if (!replaying) ++store.window.hits;
             if (storeHash != nullptr) *storeHash = hash;
             return pipeline;
         }
@@ -1472,9 +1413,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             // A different configuration with the same hash keeps the resident entry; this one stays private.
             ++store.uncached;
             ++store.totals.uncached;
-            auto pipeline = build();
-            noteBuild(store, replaying, true, builtNs);
-            return pipeline;
+            return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
         }
         ++store.misses;
         ++store.totals.misses;
@@ -1483,13 +1422,12 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
     // Built outside the mutex: a draw that finds its pipeline resident is not held behind another
     // thread's build (the journal replay builds here too), and a device's driver compiles in
     // parallel when several threads build at once.
-    auto pipeline = build();
+    auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
+    const bool replaying = PipelineJournalReplaying();
     {
         std::lock_guard lock(store.mutex);
         bool collision = false;
-        auto raced = lookup(collision);
-        noteBuild(store, replaying, collision, builtNs);
-        if (raced) {
+        if (auto raced = lookup(collision)) {
             if (storeHash != nullptr) *storeHash = hash;
             return raced;
         }
@@ -1545,19 +1483,7 @@ std::shared_ptr<Pipeline> TouchCachedPipeline(const Context& context, std::uint6
     store.entries.splice(store.entries.end(), store.entries, it);
     ++store.hits;
     ++store.totals.hits;
-    ++store.window.hits;
     return it->pipeline;
-}
-
-std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, std::span<const std::byte> key) {
-    if (key.empty()) return nullptr;
-    auto& store = Pipelines();
-    std::lock_guard lock(store.mutex);
-    const auto found = store.index.find(hashKey(key));
-    if (found == store.index.end()) return nullptr;
-    auto& entry = *found->second;
-    if (entry.key.size() != key.size() || std::memcmp(entry.key.data(), key.data(), key.size()) != 0 || !alive(entry, context)) return nullptr;
-    return entry.pipeline;
 }
 
 void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {

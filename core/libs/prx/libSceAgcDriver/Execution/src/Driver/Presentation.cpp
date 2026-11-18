@@ -4,11 +4,8 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <algorithm>
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
-#include <chrono>
-#include <cstdint>
 #include <cstdlib>
 
 namespace AgcDriver::DriverDetail {
@@ -107,15 +104,10 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
     std::shared_ptr<VulkanDevice> presenting;
     timing.Mark("validate");
     try {
-        static const auto completion = VulkanDevice::ConfiguredFlipCompletion();
-        bool beforeGpu = completion != VulkanDevice::FlipCompletion::Gpu;
         bool submitted = false;
         bool presentable = false;
         bool trailing = false;
         bool queueUnlocked = false;
-        bool early = false;
-        bool blitted = false;
-        std::uint64_t guestWork = 0;
         double waitedMs = 0;
         {
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
@@ -123,7 +115,6 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             timing.Mark("gpu_mutex_wait");
             require(device != nullptr && device->Window() == window.context, "presentation window is not attached to the device");
             presenting = device;
-            if (auto* recorder = Graphics::Recorder::Active(); recorder != nullptr && recorder->TakeEarlyEndOfPipe()) beforeGpu = true;
             timing.Mark("device_setup");
             std::uint32_t drawableWidth = 0;
             std::uint32_t drawableHeight = 0;
@@ -159,7 +150,6 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 submitted = presenting->PresentClear(window.width, window.height, opaque, plane);
                 timing.Mark("present_clear");
             }
-            blitted = submitted;
             if (submitted && syncFlip) {
                 waitedMs = presenting->FinishPresent();
                 timing.Mark("render_fence_wait");
@@ -173,12 +163,6 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                     timing.Mark("queue_present");
                 }
                 trailing = !syncFlip;
-                early = trailing && plane == nullptr && beforeGpu;
-                if (early && completion == VulkanDevice::FlipCompletion::Guest) {
-                    const auto newest = presenting->GuestWorkSerial();
-                    early = newest.has_value();
-                    guestWork = newest.value_or(0);
-                }
                 submitted = false;
             }
         }
@@ -186,16 +170,7 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
             presenting->QueuePresent();
             timing.Mark("queue_present");
         }
-        if (trailing && early) {
-            if (guestWork != 0) {
-                const auto waitStart = std::chrono::steady_clock::now();
-                presenting->WaitRecorded(guestWork);
-                waitedMs += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waitStart).count();
-                timing.Mark("guest_work_wait");
-            }
-            waitedMs += presenting->RetirePresents(1);
-            timing.Mark("render_fence_wait");
-        } else if (trailing) {
+        if (trailing) {
             waitedMs += presenting->FinishPresent();
             timing.Mark("render_fence_wait");
         }
@@ -211,10 +186,6 @@ void Driver::Present(const PresentationWindow& window, const DisplayBuffer* buff
                 presenting->QueuePresent();
             }
             timing.Mark("queue_present");
-        }
-        if (!blitted && beforeGpu) {
-            waitedMs += presenting->RetirePresents(0);
-            timing.Mark("render_fence_wait");
         }
         gpuReady(context);
         timing.Mark("release_and_callback");

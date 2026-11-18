@@ -43,15 +43,6 @@ struct HostImport;
 // or mutate freshness); the registry's own mutex is a leaf (lock order GpuMutex -> Imports/Pending ->
 // Shadows -> tracker).
 bool UnitShadowEnabled();
-bool StagingFromUnitShadow();
-void SetStagingFromUnitShadowForTests(int forced);
-bool UnitFresh(std::uint64_t generation, std::uint8_t changed, bool slab);
-struct UnitRun {
-    std::uint64_t begin;
-    std::uint64_t end;
-    bool fresh;
-};
-std::vector<UnitRun> UnitRuns(std::uint64_t base, std::uint64_t begin, std::uint64_t end, std::span<const std::uint64_t> generations, std::span<const std::uint8_t> changed, std::span<const std::uint8_t> slabs);
 std::uint64_t UnitShadowBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported);
 
 // None: a device-facing caller (a storage upload reads the slab itself); Whole: a reader of every
@@ -112,6 +103,7 @@ std::size_t PublishShadow(std::uint64_t address, std::size_t bytes, PublishScope
 // hook-free readers and a build's stage A.
 bool AnyShadowedOverlaps(std::uint64_t address, std::size_t bytes);
 bool AnyShadowedOverlaps(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+bool LiveUnitsClear(std::uint64_t address, std::size_t bytes);
 bool AnyPublishInProgress();
 std::vector<std::pair<std::uint64_t, std::uint64_t>> LiveShadowedRanges(std::uint64_t address, std::size_t bytes, PublishScope scope);
 
@@ -154,9 +146,7 @@ VkDeviceSize SlabOffset(const HostImport& import, const ShadowSlab& slab, std::u
 // After a retile's copies were recorded: the units of `ranges` (guest) hold the newest bytes at
 // `generation`, unpublished. A unit whose slab is no longer the one the copies went into is not
 // marked (counted `slab lost`). Bumps StorageTexture's pending serial.
-void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation, bool staged = false);
-std::vector<ShadowRun> StagingSources(const Context& context, const HostImport& import, std::uint64_t begin, std::uint64_t end);
-void NoteStagingFed(std::uint64_t bytes);
+void MarkShadowed(const HostImport& import, std::span<const ShadowedRange> ranges, std::uint64_t generation);
 // retireImport: publishes the fresh units whose memory `registered` still names as a readable
 // registered range into the (old) import buffer, hands the slabs to the batch and drops the shadow.
 // The import retires because its registration vanished or changed size, so the rest of its memory

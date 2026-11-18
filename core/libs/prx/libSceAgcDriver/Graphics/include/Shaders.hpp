@@ -4,6 +4,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include "Recompiler.hpp"
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -36,16 +37,22 @@ inline std::uint32_t StagePushOffset(std::uint32_t cursor, ShaderRecompiler::Sha
     return fixedSlots && stage == ShaderRecompiler::ShaderStage::Fragment ? PipelinePushSlotBytes : cursor;
 }
 
+inline std::uint32_t StagePushBudget(std::uint32_t limit, std::uint32_t offset, ShaderRecompiler::ShaderStage stage, bool fixedSlots, bool hasFragment) {
+    const bool fragment = stage == ShaderRecompiler::ShaderStage::Fragment;
+    const auto base = fixedSlots && fragment ? PipelinePushSlotBytes : 0u;
+    if (offset < base) return 0u;
+    const auto capacity = fixedSlots && fragment ? PipelinePushSlotBytes : std::min(limit, PipelinePushSlotBytes);
+    const auto used = offset - base;
+    const auto reserved = !fixedSlots && hasFragment && !fragment ? 4u : 0u;
+    return used <= capacity && reserved <= capacity - used ? capacity - used - reserved : 0u;
+}
+
 struct CompiledShader {
     ShaderRecompiler::ShaderStage stage;
     const ShaderRecompiler::RecompileResult* program;
     std::uint32_t pushConstantOffset;
     const std::vector<ShaderRecompiler::RegisteredImageView>* registeredImageViews = nullptr;
 };
-
-inline bool BlockMetadata(const ShaderRecompiler::RecompileResult& program, const ShaderRecompiler::DescriptorBinding& binding) {
-    return program.blockModule && (binding.role == ShaderRecompiler::DescriptorRole::GuestBuffers || binding.role == ShaderRecompiler::DescriptorRole::FlattenedSrt);
-}
 
 inline std::uint32_t KeyedPushOffset(const CompiledShader& shader) {
     return shader.program->pushConstants.empty() ? 0u : shader.pushConstantOffset;

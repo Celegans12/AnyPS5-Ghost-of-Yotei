@@ -4,7 +4,7 @@ function(add_shader_recompiler target runtimeTarget)
         message(FATAL_ERROR "Shader recompiler requires an existing runtime target: ${runtimeTarget}")
     endif()
 
-    if((ANYPS5_ENABLE_SPIRV_TOOLS OR BUILD_TESTING) AND NOT ANYPS5_USE_SYSTEM_DEPS AND NOT TARGET SPIRV-Tools-opt)
+    if(ANYPS5_ENABLE_SPIRV_TOOLS AND NOT TARGET SPIRV-Tools-opt)
         set(SPIRV-Headers_SOURCE_DIR "${ANYPS5_SPIRV_HEADERS_SOURCE_DIR}")
         set(SPIRV_SKIP_EXECUTABLES ON)
         set(SPIRV_SKIP_TESTS ON)
@@ -112,11 +112,11 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/ResourceTracker.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/ResourceMaterializer.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/BindingAllocator.cpp
-            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/BlockLayout.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/RequestMemoryView.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/DescriptorBindingBuilder.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/ShaderInfoCollector.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/DenormalFlushEliminator.cpp
+            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/VectorWindowIndexNarrower.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/NanPayloadEliminator.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/VectorWindowStoreEliminator.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/Optimization/src/RedundantValueEliminator.cpp
@@ -146,7 +146,6 @@ function(add_shader_recompiler target runtimeTarget)
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvEmitter.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvBufferFormat.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvRuntimeBuffer.cpp
-            ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvBlockAccess.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvSpecialization.cpp
             ${CMAKE_CURRENT_FUNCTION_LIST_DIR}/SpirvBackend/src/SpirvSpannedUniformity.cpp
 
@@ -259,13 +258,8 @@ function(add_shader_recompiler target runtimeTarget)
         string(APPEND shaderCacheExtra " system-deps=${ANYPS5_SYSTEM_DEPS_STAMP}")
     endif()
     set(shaderCacheReviewedNames
+            BdaAbi::OtherFaults
             BdaAbi::RangesOrdered
-            BlockAbi::BufferEntryWord
-            BlockAbi::SectionBytes
-            BlockAbi::SectionWords
-            BlockRefusalName
-            BlockVariantKey
-            BuildBlockLayout
             BuildBarycentricGeometryShader
             BuildBarycentricTessellationShaders
             BuildPreparedShaderKey
@@ -273,12 +267,9 @@ function(add_shader_recompiler target runtimeTarget)
             BuildTessellationCaptureGeometryShader
             CaptureResources
             DebugProbeActive
-            DescriptorLeafCounts
-            DescriptorLeafTotals
-            DescriptorLeaves
             DecodeRdnaInstruction
             DepthBitsTextureWidth
-            Detail::SrtTape::For
+            ExactF32Arithmetic
             HashBytes
             LayoutBarycentricEmulation
             MeshBarycentricLayoutOf
@@ -288,6 +279,7 @@ function(add_shader_recompiler target runtimeTarget)
             ImageTableAbi::TableHeader
             FmaskLayoutOf
             IsFmaskTextureFormat
+            PipelineSpecialization::IsAtomicLockTable
             PipelineSpecialization::IsWorkgroupOffset
             PipelineSpecialization::WorkgroupOffsetBase
             PipelineSpecialization::WorkgroupOffsetWords
@@ -308,8 +300,6 @@ function(add_shader_recompiler target runtimeTarget)
             GetPreparedArtifact
             MaterializeShader
             RegistrationResult
-            SameBufferSpecialization
-            DescriptorLeafFlatOffset
             ResolveSource
             ResourceMaterializer::EvaluateNanoseconds
             ResourceMaterializer::MaterializeNanoseconds
@@ -349,6 +339,7 @@ function(add_shader_recompiler target runtimeTarget)
             FindTableCalls
             LinkCalls
             LoadStamp
+            StoreStamp
             WriteFileAtomically
     )
     set(shaderCacheManifest)
@@ -480,37 +471,5 @@ function(add_shader_recompiler target runtimeTarget)
             set_tests_properties(spirv_literal_float PROPERTIES ENVIRONMENT_MODIFICATION
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
-    endif()
-    if(BUILD_TESTING AND NOT TARGET block_abi_tests)
-        add_test_executable(block_abi_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/BlockAbiTests.cpp")
-        target_include_directories(block_abi_tests PRIVATE "${CMAKE_CURRENT_FUNCTION_LIST_DIR}")
-        add_test_executable(block_layout_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/BlockLayoutTests.cpp")
-        add_test_executable(block_tape_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/BlockTapeTests.cpp")
-        add_test_executable(block_end_to_end_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/BlockEndToEndTests.cpp")
-        set(blockTests block_abi_tests block_layout_tests block_tape_tests block_end_to_end_tests)
-        set(blockTestNames BlockAbiTests BlockLayoutTests BlockTapeTests BlockEndToEndTests)
-        if(TARGET SPIRV-Tools-static)
-            add_test_executable(block_spirv_tests "${CMAKE_CURRENT_FUNCTION_LIST_DIR}/tests/BlockSpirvTests.cpp")
-            target_link_libraries(block_spirv_tests PRIVATE SPIRV-Tools-static)
-            target_compile_definitions(block_end_to_end_tests PRIVATE ANYPS5_BLOCK_TEST_VALIDATOR=1)
-            target_link_libraries(block_end_to_end_tests PRIVATE SPIRV-Tools-static)
-            list(APPEND blockTests block_spirv_tests)
-            list(APPEND blockTestNames BlockSpirvTests)
-        endif()
-        foreach(blockTest blockTestName IN ZIP_LISTS blockTests blockTestNames)
-            if(NOT blockTest STREQUAL "block_abi_tests")
-                target_link_libraries(${blockTest} PRIVATE ${target} ${runtimeTarget})
-                target_include_directories(${blockTest} PRIVATE ${ANYPS5_SPIRV_HEADERS_INCLUDE_DIR})
-            endif()
-            set_target_properties(${blockTest} PROPERTIES CXX_EXTENSIONS OFF)
-            configure_windows_unwind(${blockTest})
-            add_test(NAME ${blockTestName} COMMAND ${blockTest})
-            set_tests_properties(${blockTestName} PROPERTIES TIMEOUT 60)
-            if(MINGW)
-                target_link_libraries(${blockTest} PRIVATE libc)
-                set_tests_properties(${blockTestName} PROPERTIES ENVIRONMENT_MODIFICATION
-                        "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
-            endif()
-        endforeach()
     endif()
 endfunction()

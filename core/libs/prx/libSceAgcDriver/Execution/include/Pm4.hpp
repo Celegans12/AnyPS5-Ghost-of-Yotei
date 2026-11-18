@@ -94,7 +94,6 @@ inline std::size_t PacketWords(std::uint32_t header) { return FillerPacket(heade
 std::string_view UnsupportedReason(std::uint32_t header);
 void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue);
 void Execute(std::span<const std::uint32_t> packet, QueueState& queue);
-void RefreshDigests(QueueState& queue);
 inline bool IndirectRegisterOpcode(std::uint32_t opcode) { return opcode == 0x63 || opcode == 0x64 || opcode == 0x9f; }
 std::vector<std::uint32_t> ReadIndirectRegisters(std::span<const std::uint32_t> packet);
 bool IndirectRegistersValid(std::span<const std::uint32_t> pairs);
@@ -106,6 +105,7 @@ bool UsesGpuCacheBarrier(std::span<const std::uint32_t> packet);
 bool IsTagMarker(std::span<const std::uint32_t> packet);
 inline bool Predicated(std::uint32_t header) { return !FillerPacket(header) && (header & 1u) != 0; }
 bool PredicationPasses(const QueueState& queue);
+std::size_t PredicationBytes(const Predication& predication);
 bool WaitSatisfied(std::span<const std::uint32_t> packet);
 // WaitSatisfied for a polling loop: the caller has validated the address once, so the value is read
 // directly instead of through the checked guest memory path.

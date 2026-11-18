@@ -169,6 +169,18 @@ extern "C" std::size_t AgcDriverAwaitedWaits_nid_postfix(AgcDriver::AwaitedWait*
     return count;
 }
 
+extern "C" void AgcDriverTrackRewindTails_nid_postfix() {
+    AgcDriver::DriverDetail::Driver::Get().TrackRewindTails();
+}
+
+extern "C" bool AgcDriverRewindTailsUnread_nid_postfix() {
+    return AgcDriver::DriverDetail::Driver::Get().RewindTailsUnread();
+}
+
+extern "C" void AgcDriverCheckFailure_nid_postfix() {
+    AgcDriver::DriverDetail::Driver::Get().CheckFailure();
+}
+
 extern "C" void AgcDriverWaitForPipelineJournal_nid_postfix() {
     AgcDriver::DriverDetail::Driver::Get().WaitForPipelineJournal();
 }
@@ -177,14 +189,6 @@ extern "C" void AgcDriverSerialProgress_nid_postfix(std::uint64_t* accepted, std
     const auto [submitted, done] = AgcDriver::DriverDetail::Driver::Get().SerialProgress();
     *accepted = submitted;
     *completed = done;
-}
-
-extern "C" double AgcDriverCompletedGpuMs_nid_postfix(std::uint64_t afterBatch, std::uint64_t throughBatch, std::uint64_t* newestBatch, std::uint64_t* recorded, std::size_t capacity, std::size_t* count) {
-    std::vector<std::uint64_t> serials;
-    const auto busyMs = AgcDriver::DriverDetail::Driver::Get().CompletedGpuMs(afterBatch, throughBatch, *newestBatch, serials);
-    *count = std::min(capacity, serials.size());
-    std::copy_n(serials.begin(), *count, recorded);
-    return busyMs;
 }
 
 extern "C" bool AgcDriverHoldSettled_nid_postfix(std::int64_t milliseconds) {

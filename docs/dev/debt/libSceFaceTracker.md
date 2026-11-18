@@ -2,7 +2,7 @@
 
 ### Unknown function info
 
-- [Additional libSceFaceTracker exports](../../../core/libs/prx/libSceFaceTracker/Export.cpp) - the 10 name/NID pairs below are defined function exports recovered from the GTAVC-bundled `libSceFaceTracker.prx` export table (the 4.03 firmware dump does not ship this module; the GTAVC bundle is the only concrete binary evidence). Their signatures and behavior are unknown; parameterless `int` declarations are import placeholders, not verified ABI prototypes. Every call throws through `NotImplemented_nid_no_patch`. No tracking, update, or result behavior is implemented.
+- [Additional libSceFaceTracker exports](../../../core/libs/prx/libSceFaceTracker/Export.cpp) - the 10 name/NID pairs below are defined function exports recovered from the title-bundled `libSceFaceTracker.prx` export table (the 4.03 firmware dump does not ship this module; that title's bundle is the only concrete binary evidence). Their signatures and behavior are unknown; parameterless `int` declarations are import placeholders, not verified ABI prototypes. Every call throws through `NotImplemented_nid_no_patch`. No tracking, update, or result behavior is implemented.
 
 | Name | NID |
 | --- | --- |
@@ -19,7 +19,7 @@
 
 ### Implemented
 
-The context layout below was verified against the bundled module disassembly. All implemented functions validate `context` for null (`0x812a0002`) and the initialization flag `context+0x180c` (`0x812a0003`) exactly as the binary does, so they also reproduce the correct error results on an uninitialized or untracked context.
+The context layout below was verified against the bundled module disassembly. All implemented functions validate `context` for null (`0x812a0002`), probe `context+0x180c` via `GuestCopyIn_nid_no_patch` (returning `0x812a0001` on unreadable memory while preserving `errno` as a host-safety fallback), and check the initialization flag (`0x812a0003`) as the binary does, so they also reproduce the correct error results on an uninitialized or untracked context. `sceFaceTrackerRegisterUser` and `sceFaceTrackerGetDefaultConfig` likewise probe `feature` and `config` via `GuestCopyIn_nid_no_patch` / `GuestCopyOut_nid_no_patch` (preserving `errno`) and return `0x812a0001` on unreadable or unwritable memory; console fault behaviour on unmapped memory is unmeasured.
 
 - [The five callback registrations](../../../core/libs/prx/libSceFaceTracker/Export.cpp) - `sceFaceTrackerRegisterStartTrackingCallback` `amMmIL1kj-k`, `sceFaceTrackerRegisterFixUserIdCallback` `glkVxMoEu-E`, `sceFaceTrackerRegisterStopTrackingCallback` `YPqj8Ky3WDY`, `sceFaceTrackerRegisterLostTargetCallback` `knPtjtHAlek`, `sceFaceTrackerRegisterRecoveryFromLostTargetCallback` `85RI6pMiI6c` - store the callback at `context+0x1810`/`+0x1818`/`+0x1820`/`+0x1828`/`+0x1830` and the user argument at `context+0x1838`/`+0x1840`/`+0x1848`/`+0x1850`/`+0x1858`.
 - [`sceFaceTrackerRegisterUser`](../../../core/libs/prx/libSceFaceTracker/Export.cpp) `VsVD7+SYlNc` - user database at `context+0x1598`: entry table pointer `+0x28` (0xc-stride records: used byte `+0`, `+4`, userId `+8`), feature blocks pointer `+0x30` (0x4100-stride per user), count `+0x48`. Rejects `userId <= 0`, null feature, and `featureSize` outside `1..0x4100` with `0x812a0001`; a `count <= 0` or fully-used table returns `0x812a0005`; a duplicate userId returns `0x812a0001`. Copies `featureSize` bytes into the first free slot's feature block, marks the entry used, and stores the userId.

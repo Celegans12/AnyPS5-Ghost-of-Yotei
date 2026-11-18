@@ -9,14 +9,6 @@
 #include <mutex>
 #include <stdexcept>
 #include <utility>
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#else
-#include <time.h>
-#endif
 
 namespace AgcDriver::Graphics {
 
@@ -28,11 +20,17 @@ constexpr std::array<const char*, SwitchCount> SwitchNames{
     "APS5_NO_BARRIER_BATCH",
     "APS5_NO_GUARD_SPANS",
     "APS5_NO_OWNED_DRAW_INPUTS",
+    "APS5_NO_PASS_ATTACHMENT_MEMO",
+    "APS5_NO_IMPORT_SEGMENT_MEMO",
     "APS5_NO_SIZE_ONLY_SURFACE_BYTES",
+    "APS5_NO_SPACE_REUSE_RECORDS",
     "APS5_PIPELINE_DISPATCH_MISSES",
+    "APS5_NO_MEMO_PENDING_COLLECT",
+    "APS5_NO_SHARED_COLLECT_WALKS",
     "APS5_NO_EXTENDED_FAST_PROOFS",
-    "APS5_NO_REAP_ON_FENCE",
-    "APS5_NO_PENDING_PAGES",
+    "APS5_DRAW_TABLE_SNAPSHOT",
+    "APS5_NO_TARGET_MEMO",
+    "APS5_NO_TARGET_MEMO_OVERLAP_CACHE",
 };
 
 struct SwitchValues {
@@ -42,11 +40,17 @@ struct SwitchValues {
             std::getenv("APS5_NO_BARRIER_BATCH") != nullptr,
             std::getenv("APS5_NO_GUARD_SPANS") != nullptr,
             std::getenv("APS5_NO_OWNED_DRAW_INPUTS") != nullptr,
+            std::getenv("APS5_NO_PASS_ATTACHMENT_MEMO") != nullptr,
+            std::getenv("APS5_NO_IMPORT_SEGMENT_MEMO") != nullptr,
             std::getenv("APS5_NO_SIZE_ONLY_SURFACE_BYTES") != nullptr,
+            std::getenv("APS5_NO_SPACE_REUSE_RECORDS") != nullptr,
             std::getenv("APS5_PIPELINE_DISPATCH_MISSES") != nullptr,
+            std::getenv("APS5_NO_MEMO_PENDING_COLLECT") != nullptr,
+            std::getenv("APS5_NO_SHARED_COLLECT_WALKS") != nullptr,
             std::getenv("APS5_NO_EXTENDED_FAST_PROOFS") != nullptr,
-            std::getenv("APS5_NO_REAP_ON_FENCE") != nullptr,
-            std::getenv("APS5_NO_PENDING_PAGES") != nullptr,
+            std::getenv("APS5_DRAW_TABLE_SNAPSHOT") != nullptr,
+            std::getenv("APS5_NO_TARGET_MEMO") != nullptr,
+            std::getenv("APS5_NO_TARGET_MEMO_OVERLAP_CACHE") != nullptr,
         };
         for (std::size_t index = 0; index < SwitchCount; ++index) set[index].store(environment[index], std::memory_order_relaxed);
     }
@@ -80,19 +84,6 @@ std::string FlippableList() {
 }
 
 namespace RuntimeSwitches {
-
-double CallingThreadCpuSeconds() {
-#ifdef _WIN32
-    FILETIME creation{}, exited{}, kernel{}, user{};
-    if (GetThreadTimes(GetCurrentThread(), &creation, &exited, &kernel, &user) == 0) return -1.0;
-    const auto ticks = [](const FILETIME& time) { return (static_cast<std::uint64_t>(time.dwHighDateTime) << 32u) | time.dwLowDateTime; };
-    return static_cast<double>(ticks(kernel) + ticks(user)) / 1e7;
-#else
-    timespec now{};
-    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) return -1.0;
-    return static_cast<double>(now.tv_sec) + static_cast<double>(now.tv_nsec) / 1e9;
-#endif
-}
 
 const char* Name(RuntimeSwitch id) {
     return SwitchNames.at(static_cast<std::size_t>(id));
@@ -211,104 +202,6 @@ std::string SwitchSettings(const AbState& state, bool b) {
     return text;
 }
 
-}
-
-namespace {
-
-struct BlockSwitches {
-    std::atomic<int> forced{-1};
-    bool blocks = false;
-    bool verify = false;
-    bool stats = false;
-    bool coreRun = false;
-    bool verifyCoreRun = false;
-    bool flatDraw = false;
-    bool lightLane = false;
-    bool verifyLightLane = false;
-    bool core = true;
-    std::uint32_t clockPeriod = 64;
-    std::size_t ringMax = 16384;
-    BlockSwitches() {
-        core = std::getenv("APS5_NO_CORE") == nullptr;
-        verify = std::getenv("APS5_VERIFY_DRAW_BLOCK") != nullptr;
-        verifyCoreRun = std::getenv("APS5_VERIFY_CORE_RUN") != nullptr;
-        coreRun = core || verifyCoreRun || std::getenv("APS5_CORE_RUN") != nullptr;
-        flatDraw = coreRun && (core || std::getenv("APS5_CORE_FLAT_DRAW") != nullptr);
-        verifyLightLane = std::getenv("APS5_VERIFY_CORE_LIGHT_LANE") != nullptr;
-        lightLane = !verifyLightLane && (core || std::getenv("APS5_CORE_LIGHT_LANE") != nullptr);
-        if (const char* text = std::getenv("APS5_CORE_CLOCK_PERIOD")) clockPeriod = static_cast<std::uint32_t>(std::min<unsigned long long>(std::strtoull(text, nullptr, 10), 65536ull));
-        if (verifyLightLane || verifyCoreRun) clockPeriod = 1;
-        blocks = verify || coreRun || std::getenv("APS5_DRAW_BLOCK") != nullptr;
-        stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
-        if (const char* text = std::getenv("APS5_CORE_RING_MAX")) ringMax = static_cast<std::size_t>(std::min<unsigned long long>(std::strtoull(text, nullptr, 10), 4194304ull));
-    }
-};
-
-BlockSwitches& Blocks() {
-    static BlockSwitches switches;
-    return switches;
-}
-
-}
-
-bool DrawBlocks() {
-    const auto& switches = Blocks();
-    const auto forced = switches.forced.load(std::memory_order_relaxed);
-    return forced >= 0 ? (forced & 1) != 0 : switches.blocks;
-}
-
-bool VerifyDrawBlocks() {
-    const auto& switches = Blocks();
-    const auto forced = switches.forced.load(std::memory_order_relaxed);
-    return forced >= 0 ? (forced & 2) != 0 : switches.verify;
-}
-
-std::size_t CoreRingMax() {
-    return Blocks().ringMax;
-}
-
-bool DrawBlockStats() {
-    return Blocks().stats;
-}
-
-bool CoreDefault() {
-    return Blocks().core;
-}
-
-bool CoreRun() {
-    return Blocks().coreRun;
-}
-
-bool VerifyCoreRun() {
-    return Blocks().verifyCoreRun;
-}
-
-bool CoreRunStats() {
-    return Blocks().stats;
-}
-
-bool CoreFlatDraw() {
-    return Blocks().flatDraw;
-}
-
-bool CoreLightLane() {
-    return Blocks().lightLane;
-}
-
-bool VerifyCoreLightLane() {
-    return Blocks().verifyLightLane;
-}
-
-std::uint32_t CoreClockPeriod() {
-    return Blocks().clockPeriod;
-}
-
-void ForceDrawBlocks(bool blocks, bool verify) {
-    Blocks().forced.store((blocks || verify ? 1 : 0) | (verify ? 2 : 0), std::memory_order_relaxed);
-}
-
-void UnforceDrawBlocks() {
-    Blocks().forced.store(-1, std::memory_order_relaxed);
 }
 
 bool AbConfigured() {

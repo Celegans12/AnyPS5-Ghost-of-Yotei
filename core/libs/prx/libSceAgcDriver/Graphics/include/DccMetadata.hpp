@@ -6,7 +6,6 @@
 #endif
 #include <vulkan/vulkan.h>
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <optional>
@@ -65,6 +64,7 @@ bool DccAlphaOnMsb(VkFormat format, std::uint32_t componentSwap);
 // The keys of a texture's DCC surface when they fast-clear it to a value encodable here, else
 // Uncompressed (the texels are read as stored; other keys are reported once).
 DccKeys TextureClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes);
+DccKeys ScannedDccKeys(std::uint64_t metaAddress, std::size_t keyCount);
 // The last stable key scan of one surface's metadata (ProvedClearKeys): the keys read and the write
 // generation the key range was collected at before the scan. Held by the image or texture of the
 // surface, read and written under GuestMemory::GpuMutex only.
@@ -94,14 +94,8 @@ struct DccSingleProof {
     std::uint64_t generation = 0;
     std::uint32_t format = 0;
     bool uniform = false;
-    std::uint64_t pendingNote = 0;
-    std::uint64_t pendingRecorder = 0;
-    std::array<std::byte, 16> element{};
 };
 bool ProvedSingleUniform(const GuestTextureResource& resource, std::uint64_t guestBytes, std::uint64_t collected, DccSingleProof& proof);
-bool SingleProofHolds(const GuestTextureResource& resource, std::uint64_t guestBytes, std::uint64_t collected, const DccSingleProof& proof);
-bool SingleTexelsPending(const GuestTextureResource& resource, std::uint64_t guestBytes);
-bool PendingSingleFill(const GuestTextureResource& resource, std::uint64_t guestBytes, DccSingleProof& proof);
 // Cumulative outcomes of ProvedClearKeys: calls answered by a proof, scans made, and scans not kept.
 struct DccKeyProofCounts {
     std::uint64_t proved;

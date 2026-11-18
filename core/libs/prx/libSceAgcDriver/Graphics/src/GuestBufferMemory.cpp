@@ -21,7 +21,6 @@
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libc/include/GuestArena.hpp"
-#include "prx/libc/include/GuestPageTrack.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
@@ -124,65 +123,6 @@ struct ImageMirror {
     std::uint64_t lastDispatch = 0;
 };
 
-struct InputTwin {
-    VkDevice device = VK_NULL_HANDLE;
-    std::uint64_t begin = 0;
-    std::uint64_t end = 0;
-    VkBufferUsageFlags usage = 0;
-    std::shared_ptr<Buffer> buffer;
-    VkBuffer source = VK_NULL_HANDLE;
-    std::uint64_t generation = 0;
-    std::uint64_t registryGeneration = 0;
-    std::uint64_t frame = 0;
-    std::uint32_t streak = 0;
-    bool filled = false;
-    std::atomic<bool> current{false};
-    std::atomic<bool> demoted{false};
-    bool held = false;
-    std::atomic<std::uint64_t> serial{1};
-    struct Verdict {
-        std::uint64_t epoch = 0;
-        std::uint64_t serial = 0;
-        std::uint64_t registry = 0;
-        std::uint64_t unwatch = 0;
-        std::uint64_t frame = 0;
-        VkBuffer source = VK_NULL_HANDLE;
-    };
-    Verdict verdict;
-};
-
-struct ResidentShadow : std::enable_shared_from_this<ResidentShadow> {
-    VkDevice device = VK_NULL_HANDLE;
-    std::uint64_t begin = 0;
-    std::uint64_t end = 0;
-    VkBufferUsageFlags usage = 0;
-    std::shared_ptr<Buffer> buffer;
-    VkBuffer source = VK_NULL_HANDLE;
-    std::uint64_t sourceBase = 0;
-    std::uint64_t generation = 0;
-    std::uint64_t registryGeneration = 0;
-    std::uint64_t serial = 1;
-    std::uint64_t frame = 0;
-    bool current = false;
-    bool held = false;
-};
-
-namespace {
-
-std::atomic<std::uint64_t> inputTwinFrames{0};
-std::atomic<std::uint64_t> liveTwinBytes{0};
-std::atomic<std::uint64_t> liveTwinLimit{std::numeric_limits<std::uint64_t>::max()};
-std::atomic<std::uint64_t> twinLimitForTests{0};
-std::atomic<std::uint64_t> twinRefusedFrame{std::numeric_limits<std::uint64_t>::max()};
-
-std::uint64_t twinBytesLimit(std::uint64_t heapBytes) {
-    static const char* const setting = std::getenv("APS5_INPUT_TWIN_MIB");
-    if (setting != nullptr) return std::strtoull(setting, nullptr, 10) << 20u;
-    return std::max<std::uint64_t>(std::uint64_t{64} << 20u, heapBytes / 16u);
-}
-
-}
-
 // The address space. An address-based build maps every readable registered range; building that
 // list per build (the lease's ~1200 shared_ptrs, an import lookup per range, the sort and merge, the
 // upload loop, the BDA table) repeated the same result while the registry stood still. One space is
@@ -239,20 +179,7 @@ void SetHeapMirrorBudget(std::uint64_t bytes) {
 }
 
 namespace {
-
-bool CopyChangingSource(const Context& context, VkCommandBuffer commands, Recorder& recorder, std::uint64_t address, std::size_t bytes, VkBuffer destination, VkDeviceSize offset) {
-    if (bytes == 0 || !Recorder::EarlyEndOfPipe() || !recorder.ChangingRead(address, bytes) || recorder.PendingWriteOverlaps(address, bytes)) return false;
-    auto slice = recorder.DrawUpload(bytes);
-    GuestMemory::Read(address, std::span<std::byte>(slice.bytes, bytes), 1);
-    CopyBuffer(context, commands, slice.buffer->Handle(), slice.offset, destination, offset, bytes);
-    recorder.Keep(std::move(slice.buffer));
-    Recorder::CountChangingCopy(bytes);
-    return true;
-}
-
-}
-
-namespace {
+void clearCarriedShadows(VkDevice device);
 struct RefreshBlock;
 static thread_local GuestBufferMemory* buildingBufferMemory = nullptr;
 static thread_local std::vector<RefreshBlock>* buildingBlocks = nullptr;
@@ -448,8 +375,6 @@ struct HostImports {
     std::map<std::uint64_t, std::uint64_t> sparseRunEnds;
     std::map<std::uint64_t, std::uint32_t> sparseRunJoins;
     std::set<std::pair<std::uint64_t, std::size_t>> importedAtMap;
-    std::uint64_t mapDeferred = 0;
-    std::uint64_t mapDeferredBytes = 0;
     std::map<std::pair<std::uint64_t, std::uint64_t>, ImportFailure> failedBlocks;
     std::map<std::pair<std::uint64_t, std::uint64_t>, ImportRefusal> refusals;
     std::map<std::pair<std::uint64_t, std::uint64_t>, EvictingRefusal> evictingRefusals;
@@ -661,6 +586,8 @@ bool retireFreesAtOnce(bool hold) {
     return recorder == nullptr || (!hold && recorder->Idle());
 }
 
+std::atomic<std::uint64_t> retiredImports{0};
+
 void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, HostImport>::iterator it, const GuestAllocations::Lease& lease, bool hold = true) {
 #ifdef _WIN32
     auto* reading = forgetSettle(state, it->first);
@@ -671,6 +598,7 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     // size); the holder below outlives the batch that copies them.
     RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
     bumpEpoch(state);
+    retiredImports.fetch_add(1, std::memory_order_release);
     state.liveBytes -= it->second.pinnedBytes;
     auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
 #ifdef _WIN32
@@ -827,6 +755,10 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
 }
 
 const char* createHostPointerImport(const Context& context, HostImport& entry, VkResult& failure) {
+    if (!context.hostPointerImport) {
+        failure = VK_ERROR_EXTENSION_NOT_PRESENT;
+        return "VK_EXT_external_memory_host";
+    }
     void* const host = entry.alias != nullptr ? entry.alias : reinterpret_cast<void*>(entry.base);
     VkMemoryHostPointerPropertiesEXT pointer{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     if (const auto result = context.Function<PFN_vkGetMemoryHostPointerPropertiesEXT>("vkGetMemoryHostPointerPropertiesEXT")(context.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &pointer); result != VK_SUCCESS) {
@@ -1499,7 +1431,8 @@ void rewatchSettledImports(HostImports& state) {
         const auto stop = (base + import->second.bytes + settleBlockBytes - 1) & ~(settleBlockBytes - 1);
         if ((first != base || stop != base + import->second.bytes) && comparedImportShares(state, base, first, stop)) continue;
         const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> span{{{first, stop}}};
-        if (StorageTexture::AnyLiveOverlaps(span)) {
+        static const bool keepUnderImages = std::getenv("APS5_NO_REWATCH_UNDER_IMAGES") != nullptr;
+        if (keepUnderImages && StorageTexture::AnyLiveOverlaps(span)) {
             ++state.settlesKeptCompared;
             continue;
         }
@@ -1624,8 +1557,11 @@ void decideImportWatch(const Context& context, HostImports& state) {
         std::fprintf(stderr, "[write-watch] host imports are compared, not watched (APS5_WRITE_WATCH_IMPORTS=unwatch)\n");
         return;
     }
-    const auto probe = ProbeImportWriteProtection(context);
-    if (probe.failure != nullptr) {
+    const auto probe = context.hostPointerImport ? ProbeImportWriteProtection(context) : ImportProbe{};
+    if (!context.hostPointerImport) {
+        state.unwatchImports = true;
+        std::fprintf(stderr, "[write-watch] no host pointer imports (the device has no VK_EXT_external_memory_host); only dma-buf imports are probed\n");
+    } else if (probe.failure != nullptr) {
         state.unwatchImports = true;
         std::fprintf(stderr, "[write-watch] host imports resolve write protection: unknown (probe failed at %s, %d); imported ranges are compared\n", probe.failure, static_cast<int>(probe.result));
     } else {
@@ -1685,7 +1621,7 @@ ImportPages importPages(std::uint64_t base, std::uint64_t bytes, bool opening = 
     ImportPages pages;
     for (std::uint64_t cursor = base; cursor < base + bytes;) {
         MEMORY_BASIC_INFORMATION info{};
-        if (!GuestArena::GuestPageTrackQuery_nid_no_patch(reinterpret_cast<const void*>(cursor), &info) || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
             pages.committed = false;
             return pages;
         }
@@ -2199,6 +2135,22 @@ ImportRun windowRun(const HostImports& state, ImportRun run, std::uint64_t begin
         }
     }
     if (windowBegin % alignment != 0 || (windowEnd - windowBegin) % alignment != 0) return run;
+    const auto committed = GuestMemory::DescribeCommitted(windowBegin, windowEnd - windowBegin);
+    if (!committed.whole) {
+        const auto part = std::find_if(committed.ranges.begin(), committed.ranges.end(), [&](const auto& span) { return span.first <= begin && span.second >= end; });
+        if (part == committed.ranges.end()) return run;
+        const auto clippedBegin = part->first + (alignment - part->first % alignment) % alignment;
+        const auto clippedEnd = part->second - part->second % alignment;
+        if (clippedBegin > begin || clippedEnd < end) return run;
+        auto it = state.imports.upper_bound(clippedBegin);
+        if (it != state.imports.begin()) --it;
+        for (; it != state.imports.end() && it->first < clippedEnd; ++it) {
+            const auto importEnd = it->second.base + it->second.bytes;
+            if (importEnd > clippedBegin && (it->second.base < clippedBegin || importEnd > clippedEnd)) return run;
+        }
+        windowBegin = clippedBegin;
+        windowEnd = clippedEnd;
+    }
     run.base = windowBegin;
     run.bytes = windowEnd - windowBegin;
     return run;
@@ -2563,13 +2515,6 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
 #else
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes), true)) return failedImport();
-    const bool readTraps = GuestWriteWatch::GuestWriteWatchReadTrapsHeld_nid_postfix();
-    const auto trappedImport = [&]() -> const HostImport* {
-        static std::atomic<std::uint64_t> putOff{0};
-        if (const auto count = putOff.fetch_add(1, std::memory_order_relaxed) + 1; (count & (count - 1)) == 0) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx put off: read traps armed on it, requested by %s (%llu so far)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), ImportRequesterName(requester), static_cast<unsigned long long>(count));
-        return nullptr;
-    };
-    if (readTraps && GuestWriteWatch::GuestWriteWatchOpenIdleReads_nid_postfix(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes)) < 0) return trappedImport();
 #endif
     VkResult result = VK_SUCCESS;
     const char* step = nullptr;
@@ -2650,9 +2595,6 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
 #endif
     entry.unwatched = step == nullptr && !(entry.dmaBuf ? watchedDmaBuf : watchedHostPointer);
-#ifndef _WIN32
-    if (step != nullptr && (readTraps || GuestWriteWatch::GuestWriteWatchReadTrapsHeld_nid_postfix()) && GuestWriteWatch::GuestWriteWatchOpenIdleReads_nid_postfix(reinterpret_cast<const void*>(base), static_cast<std::size_t>(bytes)) != 0) return trappedImport();
-#endif
     if (step != nullptr) {
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(std::exchange(entry.alias, nullptr));
@@ -4137,6 +4079,9 @@ struct LeaseState {
     const Recorder* leaseRecorder = nullptr;
     std::uint64_t newestLeaseSerial = 0;
     std::uint64_t finishedLeaseSerial = 0;
+    std::uint64_t newestWritingLeaseSerial = 0;
+    std::atomic<std::uint64_t> notedWritingLeases{0};
+    std::atomic<std::uint64_t> finishedWritingLeases{0};
 };
 
 LeaseState& Leases() {
@@ -4314,6 +4259,15 @@ void ensurePinWaiter() {
     static_cast<void>(registered);
 }
 
+void finishLeaseBatches(std::uint64_t target, const void* site) {
+    const auto& state = Leases();
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr || recorder != state.leaseRecorder || target <= recorder->CompletedThrough()) return;
+    if (target >= recorder->OpenSerial()) recorder->Submit();
+    Recorder::AnnounceSyncSite(site);
+    recorder->FinishUpTo(target);
+}
+
 }
 
 bool SyncLeaseWork() {
@@ -4321,7 +4275,7 @@ bool SyncLeaseWork() {
     return sync;
 }
 
-void CountLeaseOutcome(bool synced, std::uint64_t batchSerial) {
+void CountLeaseOutcome(bool synced, std::uint64_t batchSerial, bool writes) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto& state = Leases();
     if (!synced) {
@@ -4332,11 +4286,17 @@ void CountLeaseOutcome(bool synced, std::uint64_t batchSerial) {
             state.leaseRecorder = recorder;
             state.newestLeaseSerial = 0;
             state.finishedLeaseSerial = 0;
+            state.newestWritingLeaseSerial = 0;
         }
         state.newestLeaseSerial = std::max(state.newestLeaseSerial, batchSerial);
+        if (writes) {
+            state.newestWritingLeaseSerial = std::max(state.newestWritingLeaseSerial, batchSerial);
+            state.notedWritingLeases.fetch_add(1);
+        }
     }
     std::lock_guard lock(state.mutex);
     ++(synced ? state.stats.synced : state.stats.deferred);
+    if (writes) ++state.stats.writing;
     if (!profile) return;
     // APS5_PROFILE_DRAW: the leases (dispatches and draws) deferred and synced, the guest's
     // pin-contention waits and the BDA table cache, every 10 s (cumulative counts, like the
@@ -4347,18 +4307,20 @@ void CountLeaseOutcome(bool synced, std::uint64_t batchSerial) {
     const auto& stats = state.stats;
     const auto table = BdaResources::TableCacheCounters();
     const auto& snapshots = Snapshots();
-    AgcDriver::ProfilePrint_nid_no_patch("[address-sync] leases: %llu released at completion, %llu synced at once; %llu pin-contention waits by guest threads (%llu finished the lease batch, %llu drained the recorder, %llu cache-only drops) %.1f s; BDA table cache %llu hits / %llu misses (%zu tables held); snapshot compares: %llu skipped (live-backed region), %llu made\n", static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.synced), static_cast<unsigned long long>(stats.contentionWaits), static_cast<unsigned long long>(stats.contentionSyncs), static_cast<unsigned long long>(stats.contentionDrains), static_cast<unsigned long long>(stats.cacheDrops), stats.contentionMs / 1000, static_cast<unsigned long long>(table.hits), static_cast<unsigned long long>(table.misses), table.held, static_cast<unsigned long long>(snapshots.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.checked.load(std::memory_order_relaxed)));
+    AgcDriver::ProfilePrint_nid_no_patch("[address-sync] leases: %llu released at completion, %llu synced at once; %llu by builds that store through addresses; %llu pin-contention waits by guest threads (%llu finished the lease batch, %llu drained the recorder, %llu cache-only drops) %.1f s; BDA table cache %llu hits / %llu misses (%zu tables held); snapshot compares: %llu skipped (live-backed region), %llu made\n", static_cast<unsigned long long>(stats.deferred), static_cast<unsigned long long>(stats.synced), static_cast<unsigned long long>(stats.writing), static_cast<unsigned long long>(stats.contentionWaits), static_cast<unsigned long long>(stats.contentionSyncs), static_cast<unsigned long long>(stats.contentionDrains), static_cast<unsigned long long>(stats.cacheDrops), stats.contentionMs / 1000, static_cast<unsigned long long>(table.hits), static_cast<unsigned long long>(table.misses), table.held, static_cast<unsigned long long>(snapshots.skipped.load(std::memory_order_relaxed)), static_cast<unsigned long long>(snapshots.checked.load(std::memory_order_relaxed)));
 }
 
 void FinishLeaseWork() {
     GuestMemory::AssertGpuLockHeld("FinishLeaseWork");
-    const auto& state = Leases();
-    auto* recorder = Recorder::Active();
-    const auto target = state.newestLeaseSerial;
-    if (recorder == nullptr || recorder != state.leaseRecorder || target <= recorder->CompletedThrough()) return;
-    if (target >= recorder->OpenSerial()) recorder->Submit();
-    Recorder::AnnounceSyncSite(__builtin_return_address(0));
-    recorder->FinishUpTo(target);
+    finishLeaseBatches(Leases().newestLeaseSerial, __builtin_return_address(0));
+}
+
+void FinishLeaseWrites() {
+    GuestMemory::AssertGpuLockHeld("FinishLeaseWrites");
+    auto& state = Leases();
+    const auto noted = state.notedWritingLeases.load();
+    finishLeaseBatches(state.newestWritingLeaseSerial, __builtin_return_address(0));
+    state.finishedWritingLeases.store(noted);
 }
 
 bool LeaseWorkPending() {
@@ -4366,6 +4328,11 @@ bool LeaseWorkPending() {
     const auto& state = Leases();
     const auto* recorder = Recorder::Active();
     return recorder != nullptr && recorder == state.leaseRecorder && state.newestLeaseSerial > recorder->CompletedThrough();
+}
+
+bool LeaseWritesMayBePending() {
+    const auto& state = Leases();
+    return state.notedWritingLeases.load() > state.finishedWritingLeases.load();
 }
 
 LeaseStats LeaseCounters() {
@@ -4468,6 +4435,7 @@ void ClearImageMirrors(VkDevice device) {
 }
 
 void ClearHostImports(VkDevice device) {
+    clearCarriedShadows(device);
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
     state.parked.erase(device);
@@ -4772,10 +4740,6 @@ void NoteHostImportFrame() {
     state.previousFrameFloor = state.frameFloor;
     state.frameFloor = state.useCounter + 1;
     ++state.framesEnded;
-    inputTwinFrames.fetch_add(1, std::memory_order_relaxed);
-#ifdef _WIN32
-    GuestArena::GuestPageTrackFrame_nid_no_patch();
-#endif
 }
 
 std::uint64_t HostImportEpoch() {
@@ -4809,6 +4773,16 @@ std::uint64_t HostImportBudgetFor(const VkPhysicalDeviceMemoryProperties& memory
     const auto held = others + granted / 8u;
     constexpr std::uint64_t step = 64ull << 20u;
     return std::min(configured, granted > held ? (granted - held) / step * step : 0u);
+}
+
+bool HostImportsInHeapUsage(VkDriverId driver) {
+    return driver == VK_DRIVER_ID_MOLTENVK;
+}
+
+VkPhysicalDeviceMemoryBudgetPropertiesEXT UsageWithoutHostImports(const VkPhysicalDeviceMemoryProperties& memory, VkPhysicalDeviceMemoryBudgetPropertiesEXT reported, std::uint64_t liveBytes, bool importsInUsage) {
+    if (!importsInUsage) return reported;
+    if (const auto heap = hostHeapIndex(memory)) reported.heapUsage[*heap] -= std::min<VkDeviceSize>(reported.heapUsage[*heap], liveBytes);
+    return reported;
 }
 
 std::uint64_t HostImportBudgetWith(std::uint64_t configured, bool set, std::uint64_t reported, bool allocationFailed, std::uint64_t ceiling) {
@@ -4908,16 +4882,7 @@ const char* ImportRequesterName(ImportRequester requester) {
 HostImportCounts HostImportCounters() {
     auto& state = Imports();
     std::lock_guard lock(state.mutex);
-    HostImportCounts counts;
-    counts.live = state.imports.size();
-    counts.liveBytes = state.liveBytes;
-    counts.requesters = state.counts;
-    counts.growing = state.growth.size();
-    counts.budgetChecks = state.budgetChecks;
-    counts.retiredPinnedBytes = retiredPinnedBytes.load(std::memory_order_acquire);
-    counts.mapDeferred = state.mapDeferred;
-    counts.mapDeferredBytes = state.mapDeferredBytes;
-    return counts;
+    return {state.imports.size(), state.liveBytes, state.counts, state.growth.size(), state.budgetChecks, retiredPinnedBytes.load(std::memory_order_acquire)};
 }
 
 std::string FormatHostImportCounts(const HostImportCounts& counts) {
@@ -4941,11 +4906,6 @@ std::string FormatHostImportCounts(const HostImportCounts& counts) {
         char pinned[64];
         std::snprintf(pinned, sizeof(pinned), "; %.1f MiB retired and still pinned", counts.retiredPinnedBytes / 1048576.0);
         requesters += pinned;
-    }
-    if (counts.mapDeferred != 0) {
-        char deferred[96];
-        std::snprintf(deferred, sizeof(deferred), "; %llu mappings left to their first use (%.1f MiB)", static_cast<unsigned long long>(counts.mapDeferred), counts.mapDeferredBytes / 1048576.0);
-        requesters += deferred;
     }
     return text + requesters;
 }
@@ -5084,8 +5044,6 @@ std::shared_ptr<HostImport> UnregisteredHostImport(const Context& context, std::
     const auto end = (address + bytes + alignment - 1) / alignment * alignment;
     if (const auto range = GuestAllocations::GuestAllocationsLookup_nid_postfix(static_cast<std::uintptr_t>(base), true); range != nullptr && range->address < end) return nullptr;
 #ifdef _WIN32
-    std::optional<GuestArena::HostImportAccess> importAccess;
-    if (GuestArena::GuestPageTrackEnabled_nid_no_patch()) importAccess.emplace(reinterpret_cast<void*>(base), static_cast<std::size_t>(end - base));
     const void* allocation = nullptr;
     for (std::uint64_t cursor = base; cursor < end;) {
         MEMORY_BASIC_INFORMATION info{};
@@ -5103,11 +5061,6 @@ std::shared_ptr<HostImport> UnregisteredHostImport(const Context& context, std::
     if (createHostPointerImport(context, entry, failure) != nullptr) return nullptr;
     auto holder = std::make_shared<RetiredImport>(context.device, context.Function<PFN_vkDestroyBuffer>("vkDestroyBuffer"), context.Function<PFN_vkFreeMemory>("vkFreeMemory"), made.extract(base));
     return std::shared_ptr<HostImport>(holder, &holder->node.mapped());
-}
-
-bool LazyMapImports() {
-    static const bool lazy = std::getenv("APS5_LAZY_MAP_IMPORTS") != nullptr;
-    return lazy;
 }
 
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice) {
@@ -5128,11 +5081,6 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
     for (const auto& mapped : ranges) {
         const auto range = mapped.lock();
         if (range == nullptr || range->bytes <= 0x10000) continue;
-        if (LazyMapImports()) {
-            ++state.mapDeferred;
-            state.mapDeferredBytes += range->bytes;
-            continue;
-        }
         if (current.empty()) current = GuestAllocations::GuestAllocationsAcquireMapped_nid_no_patch(ranges);
         if (leasedRangeOwner(current, range->address) != range) continue;
         try {
@@ -5308,6 +5256,33 @@ void GuestBufferMemory::RecordEvicted(std::uint64_t address) {
     if (!WasEvicted(address)) evictedRanges.push_back(address);
 }
 
+namespace {
+
+void stampSpaceUse(HostImports& state, const GuestBufferMemory::AddressSpace& space) {
+    const auto stamp = ++state.useCounter;
+    static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
+    auto& spaceUse = state.spaceUses[space.serial];
+    if (!stampOnce || spaceUse == 0) {
+        for (const auto& region : space.base) {
+            if (region.direct == nullptr) continue;
+            region.direct->lastUse = stamp;
+            if (stampOnce) region.direct->spaceSerial = space.serial;
+        }
+    }
+    spaceUse = stamp;
+    if (state.spaceUses.size() > 64) {
+        const auto oldest = std::min_element(state.spaceUses.begin(), state.spaceUses.end(), [](const auto& left, const auto& right) { return left.second < right.second; });
+        for (auto& [base, entry] : state.imports) {
+            if (entry.spaceSerial != oldest->first) continue;
+            entry.lastUse = std::max(entry.lastUse, oldest->second);
+            entry.spaceSerial = 0;
+        }
+        state.spaceUses.erase(oldest);
+    }
+}
+
+}
+
 void GuestBufferMemory::AcquireRegistered() {
     struct BuildingScope {
         explicit BuildingScope(GuestBufferMemory* self) { buildingBufferMemory = self; }
@@ -5389,26 +5364,7 @@ void GuestBufferMemory::AcquireRegistered() {
             }
             importFloor = state.useCounter + 1;
             if (hit) {
-                const auto stamp = ++state.useCounter;
-                static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
-                auto& spaceUse = state.spaceUses[current->serial];
-                if (!stampOnce || spaceUse == 0) {
-                    for (const auto& region : current->base) {
-                        if (region.direct == nullptr) continue;
-                        region.direct->lastUse = stamp;
-                        if (stampOnce) region.direct->spaceSerial = current->serial;
-                    }
-                }
-                spaceUse = stamp;
-                if (state.spaceUses.size() > 64) {
-                    const auto oldest = std::min_element(state.spaceUses.begin(), state.spaceUses.end(), [](const auto& left, const auto& right) { return left.second < right.second; });
-                    for (auto& [base, entry] : state.imports) {
-                        if (entry.spaceSerial != oldest->first) continue;
-                        entry.lastUse = std::max(entry.lastUse, oldest->second);
-                        entry.spaceSerial = 0;
-                    }
-                    state.spaceUses.erase(oldest);
-                }
+                stampSpaceUse(state, *current);
             }
         }
         if (hit) {
@@ -6037,10 +5993,7 @@ bool GuestBufferMemory::RetakeSpace() {
         std::lock_guard lock(state.mutex);
         if (current->device != context.device || current->generation != generation || current->importsEpoch != state.epoch) return false;
         importFloor = state.useCounter + 1;
-        const auto stamp = ++state.useCounter;
-        for (const auto& region : current->base) {
-            if (region.direct != nullptr) region.direct->lastUse = stamp;
-        }
+        stampSpaceUse(state, *current);
     }
     spaces.hits.fetch_add(1, std::memory_order_relaxed);
     space = std::move(current);
@@ -6203,7 +6156,7 @@ std::uint64_t gpuCopyLimit() {
 
 bool changedCopyBacks(const Context& context) {
     static const bool disabled = std::getenv("APS5_NO_CHANGED_COPY_BACK") != nullptr;
-    return !disabled && context.changedCopyBacks && (context.pushDescriptors || context.bufferDeviceAddress);
+    return !disabled && (context.pushDescriptors || context.bufferDeviceAddress);
 }
 
 bool addressedChangedCopyBacks(const Context& context) {
@@ -6326,7 +6279,7 @@ std::atomic<std::uint64_t> liveShadowLimit{std::numeric_limits<std::uint64_t>::m
 std::uint64_t shadowBytesLimit(std::uint64_t heapBytes) {
     static const char* const setting = std::getenv("APS5_STAGING_SHADOW_MAX_MIB");
     if (setting != nullptr) return std::strtoull(setting, nullptr, 10) << 20u;
-    return std::max<std::uint64_t>(std::uint64_t{256} << 20u, heapBytes / 8u);
+    return std::max<std::uint64_t>(std::uint64_t{256} << 20u, heapBytes / 16u);
 }
 
 bool deviceLocalHasRoom(const Context& context, std::size_t bytes) {
@@ -6345,7 +6298,6 @@ bool deviceLocalHasRoom(const Context& context, std::size_t bytes) {
         const auto usage = reported.heapUsage[heap];
         room.store(budget == 0 ? std::numeric_limits<std::uint64_t>::max() : usage + budget / 8u < budget ? budget - budget / 8u - usage : 0u, std::memory_order_relaxed);
         liveShadowLimit.store(shadowBytesLimit(budget != 0 ? budget : context.memory.memoryHeaps[heap].size), std::memory_order_relaxed);
-        liveTwinLimit.store(twinBytesLimit(budget != 0 ? budget : context.memory.memoryHeaps[heap].size), std::memory_order_relaxed);
         checkedMs.store(nowMs, std::memory_order_relaxed);
     }
     return bytes <= room.load(std::memory_order_relaxed);
@@ -6377,624 +6329,6 @@ std::shared_ptr<Buffer> stagingBuffer(const Context& context, std::size_t bytes,
     }
 }
 
-struct ShadowKey {
-    VkDevice device;
-    std::uint64_t begin;
-    std::uint64_t end;
-    VkBufferUsageFlags usage;
-    auto operator<=>(const ShadowKey&) const = default;
-};
-
-struct ShadowRegistry {
-    std::mutex mutex;
-    std::map<ShadowKey, std::weak_ptr<Buffer>> shadows;
-};
-
-ShadowRegistry& Shadows() {
-    static auto* registry = new ShadowRegistry;
-    return *registry;
-}
-
-std::atomic<std::uint64_t> sharedShadowHits{0};
-
-bool sharedShadowsEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_SHARED_STAGING_SHADOWS") == nullptr;
-    return enabled;
-}
-
-std::shared_ptr<Buffer> liveSharedShadow(const ShadowKey& key) {
-    auto& registry = Shadows();
-    std::lock_guard lock(registry.mutex);
-    const auto found = registry.shadows.find(key);
-    return found != registry.shadows.end() ? found->second.lock() : nullptr;
-}
-
-std::shared_ptr<Buffer> sharedStagingBuffer(const Context& context, std::uint64_t begin, std::uint64_t end, VkBufferUsageFlags usage) {
-    const ShadowKey key{context.device, begin, end, usage};
-    if (auto live = liveSharedShadow(key)) {
-        sharedShadowHits.fetch_add(1, std::memory_order_relaxed);
-        return live;
-    }
-    auto made = stagingBuffer(context, static_cast<std::size_t>(end - begin), usage);
-    if (made == nullptr) return nullptr;
-    auto* shadow = made.get();
-    std::shared_ptr<Buffer> shared(shadow, [owner = std::move(made), key](Buffer*) mutable {
-        owner.reset();
-        auto& registry = Shadows();
-        std::lock_guard lock(registry.mutex);
-        if (const auto found = registry.shadows.find(key); found != registry.shadows.end() && found->second.expired()) registry.shadows.erase(found);
-    });
-    auto& registry = Shadows();
-    std::shared_ptr<Buffer> raced;
-    {
-        std::lock_guard lock(registry.mutex);
-        auto& slot = registry.shadows[key];
-        raced = slot.lock();
-        if (raced == nullptr) slot = shared;
-    }
-    if (raced == nullptr) return shared;
-    sharedShadowHits.fetch_add(1, std::memory_order_relaxed);
-    return raced;
-}
-
-struct TwinKey {
-    VkDevice device;
-    std::uint64_t begin;
-    std::uint64_t end;
-    VkBufferUsageFlags usage;
-    auto operator<=>(const TwinKey&) const = default;
-};
-
-struct TwinRegistry {
-    std::mutex mutex;
-    std::map<TwinKey, std::weak_ptr<InputTwin>> twins;
-    std::map<TwinKey, std::uint64_t> demoted;
-    std::vector<std::shared_ptr<InputTwin>> recent;
-    std::uint64_t sweptFrame = 0;
-    std::uint64_t reach = 0;
-};
-
-TwinRegistry& Twins() {
-    static auto* registry = new TwinRegistry;
-    return *registry;
-}
-
-struct TwinStats {
-    std::atomic<std::uint64_t> made{0};
-    std::atomic<std::uint64_t> shared{0};
-    std::atomic<std::uint64_t> copies{0};
-    std::atomic<std::uint64_t> copiedBytes{0};
-    std::atomic<std::uint64_t> refreshes{0};
-    std::atomic<std::uint64_t> reuses{0};
-    std::atomic<std::uint64_t> outdated{0};
-    std::atomic<std::uint64_t> demoted{0};
-    std::atomic<std::uint64_t> memoised{0};
-    std::atomic<std::uint64_t> checked{0};
-    std::atomic<std::uint64_t> memoisedNanoseconds{0};
-    std::atomic<std::uint64_t> checkedNanoseconds{0};
-    std::atomic<std::uint64_t> verified{0};
-    std::atomic<std::uint64_t> differing{0};
-    std::array<std::atomic<std::uint64_t>, InputTwinMisses> missed{};
-    std::atomic<std::int64_t> lastReport{0};
-};
-
-TwinStats& TwinCounters() {
-    static TwinStats stats;
-    return stats;
-}
-
-bool twinVerdictsEnabled() {
-    static const bool enabled = std::getenv("APS5_NO_DRAW_PROOFS") == nullptr;
-    return enabled;
-}
-
-bool twinVerdictsVerified() {
-    static const bool verified = std::getenv("APS5_VERIFY_DRAW_PROOFS") != nullptr;
-    return verified;
-}
-
-InputTwin::Verdict twinVerdictNow() {
-    if (!twinVerdictsEnabled()) return {};
-    return {GuestMemory::CollectEpoch(), 0, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), GuestMemory::UnwatchSerial(), inputTwinFrames.load(std::memory_order_relaxed), VK_NULL_HANDLE};
-}
-
-bool twinVerdictHolds(const InputTwin& twin, const InputTwin::Verdict& now, VkBuffer source) {
-    const auto& held = twin.verdict;
-    return now.epoch != 0 && held.epoch == now.epoch && held.registry == now.registry && held.unwatch == now.unwatch && held.frame == now.frame && held.source == source && held.serial == twin.serial.load(std::memory_order_acquire);
-}
-
-void outdateTwin(InputTwin& twin) {
-    if (twin.current.exchange(false, std::memory_order_relaxed)) TwinCounters().outdated.fetch_add(1, std::memory_order_relaxed);
-    twin.serial.fetch_add(1, std::memory_order_release);
-}
-
-void noteTwinVerified(const InputTwin& twin, bool differing) {
-    auto& stats = TwinCounters();
-    stats.verified.fetch_add(1, std::memory_order_relaxed);
-    if (!differing) return;
-    stats.differing.fetch_add(1, std::memory_order_relaxed);
-    static std::atomic<int> reports{0};
-    if (reports.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[draw-proofs] verify: an input twin verdict differs from the full check (the twin of [0x%llx, 0x%llx) was due a refresh or had pending work over it)\n", static_cast<unsigned long long>(twin.begin), static_cast<unsigned long long>(twin.end));
-}
-
-constexpr std::array<const char*, InputTwinMisses> InputTwinMissNames{"behind a pending write", "under a label or queued store", "untracked", "volatile", "over the budget", "device memory refused", "outside an import"};
-constexpr std::uint32_t TwinDemoteStreak = 8;
-constexpr std::uint64_t TwinDemotedFrames = 600;
-constexpr std::uint64_t TwinIdleFrames = 2;
-constexpr std::uint64_t TwinRefusedFrames = 120;
-
-bool twinsProfiled() {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    return profile;
-}
-
-void countTwinMiss(InputTwinMiss miss) {
-    TwinCounters().missed[static_cast<std::size_t>(miss)].fetch_add(1, std::memory_order_relaxed);
-    if (twinsProfiled()) ReportInputTwins();
-}
-
-std::uint64_t inputTwinLimit() {
-    const auto test = twinLimitForTests.load(std::memory_order_relaxed);
-    return test != 0 ? test : liveTwinLimit.load(std::memory_order_relaxed);
-}
-
-std::uint64_t inputTwinMin() {
-    static const std::uint64_t bytes = kibSetting("APS5_INPUT_TWIN_MIN_KIB", 1);
-    return bytes;
-}
-
-bool importServes(const Context& context, std::uint64_t begin, std::uint64_t end) {
-    auto& state = Imports();
-    std::lock_guard lock(state.mutex);
-    return state.device == context.device && peekImport(state, begin, end) != nullptr;
-}
-
-std::optional<InputTwinMiss> twinBlocked(const Recorder& recorder, std::uint64_t begin, std::size_t bytes) {
-    if (recorder.PendingWriteOverlaps(begin, bytes) || recorder.PendingCopyBackOverlaps(begin, bytes)) return InputTwinMiss::PendingWrite;
-    if (recorder.PendingLabelIn(begin, bytes) || recorder.QueuedStoreOverlaps(begin, bytes) || recorder.QueuedKeyStoreOverlaps(begin, bytes)) return InputTwinMiss::Label;
-    return std::nullopt;
-}
-
-void sweepTwins(TwinRegistry& registry, std::uint64_t frame, std::vector<std::shared_ptr<InputTwin>>& released) {
-    if (frame == registry.sweptFrame) return;
-    registry.sweptFrame = frame;
-    for (auto it = registry.recent.begin(); it != registry.recent.end();) {
-        if (frame - (*it)->frame < TwinIdleFrames) {
-            ++it;
-            continue;
-        }
-        (*it)->held = false;
-        released.push_back(std::move(*it));
-        it = registry.recent.erase(it);
-    }
-    std::erase_if(registry.twins, [](const auto& slot) { return slot.second.expired(); });
-    std::erase_if(registry.demoted, [&](const auto& slot) { return frame - slot.second >= TwinDemotedFrames; });
-}
-
-void holdTwin(TwinRegistry& registry, const std::shared_ptr<InputTwin>& twin, std::uint64_t frame) {
-    twin->frame = frame;
-    if (twin->held) return;
-    twin->held = true;
-    registry.recent.push_back(twin);
-}
-
-void outdateTwinsOver(TwinRegistry& registry, VkDevice device, std::uint64_t begin, std::uint64_t end, std::vector<std::shared_ptr<InputTwin>>& touched) {
-    const auto from = begin > registry.reach ? begin - registry.reach : 0;
-    for (auto slot = registry.twins.lower_bound(TwinKey{device, from, 0, 0}); slot != registry.twins.end() && slot->first.device == device && slot->first.begin < end; ++slot) {
-        if (slot->first.end <= begin) continue;
-        auto twin = slot->second.lock();
-        if (twin == nullptr) continue;
-        outdateTwin(*twin);
-        touched.push_back(std::move(twin));
-    }
-}
-
-bool twinDemoted(TwinRegistry& registry, const TwinKey& key, std::uint64_t frame) {
-    const auto found = registry.demoted.find(key);
-    if (found == registry.demoted.end()) return false;
-    if (frame - found->second < TwinDemotedFrames) return true;
-    registry.demoted.erase(found);
-    return false;
-}
-
-std::shared_ptr<InputTwin> heldTwin(TwinRegistry& registry, const TwinKey& key, std::uint64_t frame) {
-    const auto found = registry.twins.find(key);
-    if (found == registry.twins.end()) return nullptr;
-    auto live = found->second.lock();
-    if (live == nullptr || live->demoted) return nullptr;
-    holdTwin(registry, live, frame);
-    TwinCounters().shared.fetch_add(1, std::memory_order_relaxed);
-    return live;
-}
-
-std::shared_ptr<InputTwin> liveInputTwin(const Context& context, std::uint64_t begin, std::uint64_t end, VkBufferUsageFlags usage) {
-    auto& registry = Twins();
-    std::lock_guard lock(registry.mutex);
-    return heldTwin(registry, TwinKey{context.device, begin, end, usage}, inputTwinFrames.load(std::memory_order_relaxed));
-}
-
-std::shared_ptr<InputTwin> acquireInputTwin(const Context& context, std::uint64_t begin, std::uint64_t end, VkBufferUsageFlags usage) {
-    const TwinKey key{context.device, begin, end, usage};
-    const auto bytes = end - begin;
-    const auto frame = inputTwinFrames.load(std::memory_order_relaxed);
-    auto& registry = Twins();
-    std::vector<std::shared_ptr<InputTwin>> released;
-    bool demoted = false;
-    {
-        std::lock_guard lock(registry.mutex);
-        sweepTwins(registry, frame, released);
-        if (auto live = heldTwin(registry, key, frame)) return live;
-        demoted = twinDemoted(registry, key, frame);
-    }
-    released.clear();
-    if (demoted) {
-        countTwinMiss(InputTwinMiss::Volatile);
-        return nullptr;
-    }
-    if (!deviceLocalHasRoom(context, static_cast<std::size_t>(bytes))) {
-        twinRefusedFrame.store(frame, std::memory_order_relaxed);
-        countTwinMiss(InputTwinMiss::Allocation);
-        return nullptr;
-    }
-    if (liveTwinBytes.load(std::memory_order_relaxed) + bytes > inputTwinLimit()) {
-        countTwinMiss(InputTwinMiss::Budget);
-        return nullptr;
-    }
-    std::shared_ptr<Buffer> made;
-    try {
-        made = Buffer::WithinDeviceLocalHeadroom(context, static_cast<std::size_t>(bytes), usage);
-    } catch (const std::exception&) {
-        made = nullptr;
-    }
-    if (made == nullptr) {
-        twinRefusedFrame.store(frame, std::memory_order_relaxed);
-        countTwinMiss(InputTwinMiss::Allocation);
-        return nullptr;
-    }
-    liveTwinBytes.fetch_add(bytes, std::memory_order_relaxed);
-    auto twin = std::make_shared<InputTwin>();
-    twin->device = context.device;
-    twin->begin = begin;
-    twin->end = end;
-    twin->usage = usage;
-    auto* raw = made.get();
-    twin->buffer = std::shared_ptr<Buffer>(raw, [owner = std::move(made), bytes](Buffer*) mutable {
-        owner.reset();
-        liveTwinBytes.fetch_sub(bytes, std::memory_order_relaxed);
-    });
-    std::shared_ptr<InputTwin> raced;
-    {
-        std::lock_guard lock(registry.mutex);
-        auto& slot = registry.twins[key];
-        raced = slot.lock();
-        if (raced != nullptr && raced->demoted) raced = nullptr;
-        if (raced == nullptr) {
-            slot = twin;
-            registry.reach = std::max(registry.reach, bytes);
-        }
-        holdTwin(registry, raced != nullptr ? raced : twin, frame);
-    }
-    if (raced != nullptr) {
-        TwinCounters().shared.fetch_add(1, std::memory_order_relaxed);
-        return raced;
-    }
-    TwinCounters().made.fetch_add(1, std::memory_order_relaxed);
-    return twin;
-}
-
-bool inputTwinAvailable(const Context& context, std::uint64_t begin, std::uint64_t end, VkBufferUsageFlags usage) {
-    const TwinKey key{context.device, begin, end, usage};
-    const auto bytes = end - begin;
-    const auto frame = inputTwinFrames.load(std::memory_order_relaxed);
-    if (const auto refused = twinRefusedFrame.load(std::memory_order_relaxed); refused != std::numeric_limits<std::uint64_t>::max() && frame - refused < TwinRefusedFrames) return false;
-    {
-        auto& registry = Twins();
-        std::lock_guard lock(registry.mutex);
-        if (twinDemoted(registry, key, frame)) return false;
-        if (const auto found = registry.twins.find(key); found != registry.twins.end() && !found->second.expired()) return true;
-    }
-    return deviceLocalHasRoom(context, static_cast<std::size_t>(bytes)) && liveTwinBytes.load(std::memory_order_relaxed) + bytes <= inputTwinLimit() / 4u * 3u;
-}
-
-std::uint64_t noteTwinFilled(const std::shared_ptr<InputTwin>& twin, VkBuffer source, std::uint64_t generation, std::uint64_t registryGeneration) {
-    auto& registry = Twins();
-    auto& stats = TwinCounters();
-    std::lock_guard lock(registry.mutex);
-    const auto frame = inputTwinFrames.load(std::memory_order_relaxed);
-    if (twin->filled) stats.refreshes.fetch_add(1, std::memory_order_relaxed);
-    twin->filled = true;
-    twin->source = source;
-    twin->generation = generation;
-    twin->registryGeneration = registryGeneration;
-    twin->current.store(generation != 0 && !twin->demoted.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    holdTwin(registry, twin, frame);
-    if (++twin->streak >= TwinDemoteStreak && !twin->demoted.load(std::memory_order_relaxed)) {
-        twin->demoted.store(true, std::memory_order_relaxed);
-        twin->current.store(false, std::memory_order_relaxed);
-        registry.demoted[TwinKey{twin->device, twin->begin, twin->end, twin->usage}] = frame;
-        stats.demoted.fetch_add(1, std::memory_order_relaxed);
-    }
-    return twin->serial.fetch_add(1, std::memory_order_release) + 1;
-}
-
-struct ResidentRegistry {
-    std::mutex mutex;
-    std::vector<ResidentShadow*> live;
-    std::vector<std::shared_ptr<ResidentShadow>> recent;
-    std::uint64_t sweptFrame = 0;
-};
-
-ResidentRegistry& Residents() {
-    static auto* registry = new ResidentRegistry;
-    return *registry;
-}
-
-struct ResidentStats {
-    std::atomic<std::uint64_t> made{0};
-    std::atomic<std::uint64_t> shared{0};
-    std::atomic<std::uint64_t> skipped{0};
-    std::atomic<std::uint64_t> skippedBytes{0};
-    std::atomic<std::uint64_t> partial{0};
-    std::atomic<std::uint64_t> partialBytes{0};
-    std::atomic<std::uint64_t> partialSavedBytes{0};
-    std::atomic<std::uint64_t> full{0};
-    std::atomic<std::uint64_t> fullBytes{0};
-    std::atomic<std::uint64_t> fresh{0};
-    std::atomic<std::uint64_t> stale{0};
-    std::atomic<std::uint64_t> moved{0};
-    std::atomic<std::uint64_t> rewritten{0};
-    std::atomic<std::uint64_t> unsealed{0};
-    std::atomic<std::uint64_t> untracked{0};
-    std::atomic<std::uint64_t> blocked{0};
-    std::atomic<std::uint64_t> sealed{0};
-    std::atomic<std::uint64_t> outdated{0};
-    std::atomic<std::uint64_t> verified{0};
-    std::atomic<std::uint64_t> differing{0};
-    std::atomic<std::uint64_t> shadowFed{0};
-    std::atomic<std::uint64_t> shadowFedBytes{0};
-    std::atomic<std::uint64_t> shadowReturned{0};
-    std::atomic<std::uint64_t> shadowReturnedBytes{0};
-};
-
-ResidentStats& ResidentCounters() {
-    static ResidentStats stats;
-    return stats;
-}
-
-std::atomic<std::uint64_t> liveResidents{0};
-std::atomic<int> residentForTests{-1};
-constexpr std::uint64_t ResidentIdleFrames = 2;
-thread_local const GuestBufferMemory::OwnWriteScope* ownWriteScope = nullptr;
-thread_local const GuestBufferMemory* stagedFlushOwner = nullptr;
-
-bool residentStagingEnabled() {
-    static const bool enabled = ResidentStagingDefault(std::getenv("APS5_NO_RESIDENT_STAGING"));
-    const auto forced = residentForTests.load(std::memory_order_relaxed);
-    return forced >= 0 ? forced != 0 : enabled;
-}
-
-bool residentStagingVerified() {
-    static const bool verified = std::getenv("APS5_VERIFY_RESIDENT_STAGING") != nullptr;
-    const auto forced = residentForTests.load(std::memory_order_relaxed);
-    return forced >= 0 ? forced == 2 : verified;
-}
-
-void retireResident(ResidentShadow* shadow) {
-    {
-        auto& registry = Residents();
-        std::lock_guard lock(registry.mutex);
-        std::erase(registry.live, shadow);
-    }
-    liveResidents.fetch_sub(1, std::memory_order_relaxed);
-    delete shadow;
-}
-
-void sweepResidents(ResidentRegistry& registry, std::uint64_t frame, std::vector<std::shared_ptr<ResidentShadow>>& released) {
-    if (frame == registry.sweptFrame) return;
-    registry.sweptFrame = frame;
-    for (auto it = registry.recent.begin(); it != registry.recent.end();) {
-        if (frame - (*it)->frame < ResidentIdleFrames) {
-            ++it;
-            continue;
-        }
-        (*it)->held = false;
-        released.push_back(std::move(*it));
-        it = registry.recent.erase(it);
-    }
-}
-
-void holdResident(ResidentRegistry& registry, const std::shared_ptr<ResidentShadow>& shadow, std::uint64_t frame) {
-    shadow->frame = frame;
-    if (shadow->held) return;
-    shadow->held = true;
-    registry.recent.push_back(shadow);
-}
-
-std::shared_ptr<ResidentShadow> liveResident(ResidentRegistry& registry, VkDevice device, std::uint64_t begin, std::uint64_t end, VkBufferUsageFlags usage) {
-    for (auto* shadow : registry.live) {
-        if (shadow->device != device || shadow->begin != begin || shadow->end != end || shadow->usage != usage) continue;
-        if (auto found = shadow->weak_from_this().lock()) return found;
-    }
-    return nullptr;
-}
-
-std::shared_ptr<ResidentShadow> acquireResident(const Context& context, std::uint64_t begin, std::uint64_t end, VkBufferUsageFlags usage) {
-    const auto frame = inputTwinFrames.load(std::memory_order_relaxed);
-    auto& registry = Residents();
-    std::vector<std::shared_ptr<ResidentShadow>> released;
-    {
-        std::lock_guard lock(registry.mutex);
-        sweepResidents(registry, frame, released);
-        if (auto found = liveResident(registry, context.device, begin, end, usage)) {
-            holdResident(registry, found, frame);
-            ResidentCounters().shared.fetch_add(1, std::memory_order_relaxed);
-            sharedShadowHits.fetch_add(1, std::memory_order_relaxed);
-            return found;
-        }
-    }
-    auto buffer = sharedStagingBuffer(context, begin, end, usage);
-    if (buffer == nullptr) return nullptr;
-    liveResidents.fetch_add(1, std::memory_order_relaxed);
-    std::shared_ptr<ResidentShadow> made(new ResidentShadow, &retireResident);
-    made->device = context.device;
-    made->begin = begin;
-    made->end = end;
-    made->usage = usage;
-    made->buffer = std::move(buffer);
-    std::shared_ptr<ResidentShadow> raced;
-    {
-        std::lock_guard lock(registry.mutex);
-        raced = liveResident(registry, context.device, begin, end, usage);
-        if (raced == nullptr) registry.live.push_back(made.get());
-        holdResident(registry, raced != nullptr ? raced : made, frame);
-    }
-    if (raced != nullptr) {
-        ResidentCounters().shared.fetch_add(1, std::memory_order_relaxed);
-        sharedShadowHits.fetch_add(1, std::memory_order_relaxed);
-        return raced;
-    }
-    ResidentCounters().made.fetch_add(1, std::memory_order_relaxed);
-    return made;
-}
-
-void outdateResidentsOver(VkDevice device, std::uint64_t begin, std::uint64_t end) {
-    if (liveResidents.load(std::memory_order_relaxed) == 0 || begin >= end) return;
-    auto& registry = Residents();
-    std::lock_guard lock(registry.mutex);
-    for (auto* shadow : registry.live) {
-        if ((device != VK_NULL_HANDLE && shadow->device != device) || shadow->begin >= end || begin >= shadow->end) continue;
-        if (GuestBufferMemory::OwnWriteScope::Exempts(shadow, begin, end)) continue;
-        if (shadow->current) ResidentCounters().outdated.fetch_add(1, std::memory_order_relaxed);
-        shadow->current = false;
-        ++shadow->serial;
-    }
-}
-
-void clearResidents(VkDevice device) {
-    if (liveResidents.load(std::memory_order_relaxed) == 0) return;
-    auto& registry = Residents();
-    std::vector<std::shared_ptr<ResidentShadow>> released;
-    std::lock_guard lock(registry.mutex);
-    for (auto* shadow : registry.live) {
-        if (shadow->device != device) continue;
-        shadow->current = false;
-        ++shadow->serial;
-    }
-    for (auto it = registry.recent.begin(); it != registry.recent.end();) {
-        if ((*it)->device != device) {
-            ++it;
-            continue;
-        }
-        (*it)->held = false;
-        released.push_back(std::move(*it));
-        it = registry.recent.erase(it);
-    }
-}
-
-struct ResidentUse {
-    ResidentCopyIn kind = ResidentCopyIn::Whole;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-    std::uint64_t serial = 0;
-};
-
-ResidentUse beginResidentUse(const Context& context, ResidentShadow& shadow, VkBuffer source, std::uint64_t sourceBase, bool blocked) {
-    ResidentUse use;
-    auto& registry = Residents();
-    auto& stats = ResidentCounters();
-    const auto bytes = static_cast<std::size_t>(shadow.end - shadow.begin);
-    const auto registered = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const auto frame = inputTwinFrames.load(std::memory_order_relaxed);
-    ResidentShadowState state;
-    std::uint64_t serial = 0;
-    bool filled = false;
-    {
-        std::lock_guard lock(registry.mutex);
-        filled = shadow.source != VK_NULL_HANDLE;
-        state.current = shadow.current;
-        state.blocked = blocked;
-        state.sameSource = shadow.source == source && shadow.sourceBase == sourceBase;
-        state.sameRegistry = shadow.registryGeneration == registered;
-        state.generation = shadow.generation;
-        serial = shadow.serial;
-        shadow.current = false;
-        shadow.frame = frame;
-    }
-    if (blocked) stats.blocked.fetch_add(1, std::memory_order_relaxed);
-    std::uint64_t collected = 0;
-    if (ResidentShadowKept(state)) {
-        const bool tracked = GuestMemory::CpuWrittenSince(shadow.begin, bytes, state.generation, use.ranges, collected);
-        use.kind = ResidentCopyInFor(state, tracked, use.ranges, shadow.begin, shadow.end);
-        if (tracked && use.kind == ResidentCopyIn::Whole) stats.rewritten.fetch_add(1, std::memory_order_relaxed);
-    } else if (!blocked) {
-        auto& reason = !filled ? stats.fresh : !state.sameSource || !state.sameRegistry ? stats.moved : stats.stale;
-        reason.fetch_add(1, std::memory_order_relaxed);
-    }
-    if (use.kind == ResidentCopyIn::Whole) {
-        use.ranges.clear();
-        collected = GuestMemory::CollectWritesUncached(shadow.begin, bytes);
-        if (collected == 0 && WatchedAfterSettle(context, shadow.begin, bytes)) collected = GuestMemory::CollectWritesUncached(shadow.begin, bytes);
-        if (collected == 0) stats.untracked.fetch_add(1, std::memory_order_relaxed);
-    }
-    bool raced = false;
-    {
-        std::lock_guard lock(registry.mutex);
-        raced = shadow.serial != serial;
-        shadow.source = source;
-        shadow.sourceBase = sourceBase;
-        shadow.registryGeneration = registered;
-        if (raced) shadow.generation = 0;
-        else if (use.kind != ResidentCopyIn::Skipped) shadow.generation = collected;
-        use.serial = shadow.generation != 0 ? shadow.serial : 0;
-    }
-    if (raced) {
-        use.kind = ResidentCopyIn::Whole;
-        use.ranges.clear();
-    }
-    return use;
-}
-
-std::uint64_t continueResidentUse(ResidentShadow& shadow, VkBuffer source, std::uint64_t sourceBase) {
-    const auto registered = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    auto& registry = Residents();
-    std::lock_guard lock(registry.mutex);
-    const bool current = shadow.current && shadow.generation != 0 && shadow.source == source && shadow.sourceBase == sourceBase && shadow.registryGeneration == registered;
-    shadow.current = false;
-    shadow.frame = inputTwinFrames.load(std::memory_order_relaxed);
-    return current ? shadow.serial : 0;
-}
-
-void noteResidentEntry(ResidentCopyIn kind, std::uint64_t bytes, std::uint64_t refreshed) {
-    auto& stats = ResidentCounters();
-    if (kind == ResidentCopyIn::Skipped) {
-        stats.skipped.fetch_add(1, std::memory_order_relaxed);
-        stats.skippedBytes.fetch_add(bytes, std::memory_order_relaxed);
-    } else if (kind == ResidentCopyIn::Limited) {
-        stats.partial.fetch_add(1, std::memory_order_relaxed);
-        stats.partialBytes.fetch_add(refreshed, std::memory_order_relaxed);
-        stats.partialSavedBytes.fetch_add(bytes - refreshed, std::memory_order_relaxed);
-    } else {
-        stats.full.fetch_add(1, std::memory_order_relaxed);
-        stats.fullBytes.fetch_add(bytes, std::memory_order_relaxed);
-    }
-}
-
-void noteResidentVerified(std::uint64_t begin, std::uint64_t end, std::span<const std::byte> imported, std::span<const std::byte> resident) {
-    auto& stats = ResidentCounters();
-    stats.verified.fetch_add(1, std::memory_order_relaxed);
-    const auto bytes = std::min(imported.size(), resident.size());
-    if (std::memcmp(imported.data(), resident.data(), bytes) == 0) return;
-    stats.differing.fetch_add(1, std::memory_order_relaxed);
-    std::size_t first = bytes;
-    std::size_t differing = 0;
-    for (std::size_t index = 0; index < bytes; ++index) {
-        if (imported[index] == resident[index]) continue;
-        if (first == bytes) first = index;
-        ++differing;
-    }
-    static std::atomic<int> reports{0};
-    if (reports.fetch_add(1, std::memory_order_relaxed) < 32) std::fprintf(stderr, "[staging] resident verify: the shadow of [0x%llx, 0x%llx) differs from its import in %zu bytes, the first at +0x%zx (a write the tracking missed, or a CPU write after the use was recorded)\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end), differing, first);
-}
-
 // APS5_TRACE_STAGING=1: every distinct staged range once, with its size and whether an atomic
 // element lies in it, to see which elements the staging window admits at a stage.
 void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
@@ -7021,28 +6355,20 @@ public:
 
     bool InPlace(std::uint64_t begin, std::uint64_t end, bool use) {
         if (!Enabled()) return false;
-        std::vector<std::string> said;
-        bool inPlace = false;
-        {
-            std::lock_guard lock(mutex);
-            if (!stampsRequested) {
-                Recorder::RequestBatchStamps();
-                report.Attach(policy);
-                stampsRequested = true;
-            }
-            const auto [frames, busyMs] = Recorder::FrameGpuBusy();
-            const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-            inPlace = policy.InPlace(begin, end, use, frames, busyMs, nowMs);
-            said = report.Take();
+        std::lock_guard lock(mutex);
+        if (!stampsRequested) {
+            Recorder::RequestBatchStamps();
+            policy.report = [](const std::string& line) { std::fprintf(stderr, "%s\n", line.c_str()); };
+            stampsRequested = true;
         }
-        for (const auto& line : said) AgcDriver::ProfilePrint_nid_no_patch("%s\n", line.c_str());
-        return inPlace;
+        const auto [frames, busyMs] = Recorder::FrameGpuBusy();
+        const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        return policy.InPlace(begin, end, use, frames, busyMs, nowMs);
     }
 
 private:
     std::mutex mutex;
     AdaptiveStaging policy;
-    AdaptiveStagingReport report;
     bool stampsRequested = false;
 };
 
@@ -7055,28 +6381,8 @@ void reportStaging() {
     static std::uint64_t lastStaged = 0, lastIn = 0, lastOut = 0;
     const auto staged = stats.staged.load();
     const auto in = stats.stagedInBytes.load();
-    const auto handover = Recorder::HandoverCounts();
-    const auto out = stats.stagedOutBytes.load() + handover.landedBytes;
+    const auto out = stats.stagedOutBytes.load();
     AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging: %llu regions staged device-local (%llu with atomics, %llu of reused builds), %.0f KiB copied in, %.0f KiB copied back, %llu without copy-back, %llu shadows refused, %llu MiB in live shadows (limit %llu MiB); last 10 s: %llu regions, %.0f KiB in, %.0f KiB back\n", static_cast<unsigned long long>(staged), static_cast<unsigned long long>(stats.stagedAtomic.load()), static_cast<unsigned long long>(stats.stagedReused.load()), in / 1024.0, out / 1024.0, static_cast<unsigned long long>(stats.stagedLost.load()), static_cast<unsigned long long>(stats.stagingRefused.load()), static_cast<unsigned long long>(liveShadowBytes.load() >> 20u), static_cast<unsigned long long>(liveShadowLimit.load() >> 20u), static_cast<unsigned long long>(staged - lastStaged), (in - lastIn) / 1024.0, (out - lastOut) / 1024.0);
-    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging handover: %llu uses took pending copy-backs over, %llu copy-ins skipped and %llu redirected (%.0f KiB not read from imports), %llu copy-backs elided (%.0f KiB), %llu landed (%.0f KiB)\n", static_cast<unsigned long long>(handover.taken), static_cast<unsigned long long>(handover.skipped), static_cast<unsigned long long>(handover.redirected), handover.forwardedBytes / 1024.0, static_cast<unsigned long long>(handover.elided), handover.elidedBytes / 1024.0, static_cast<unsigned long long>(handover.landed), handover.landedBytes / 1024.0);
-    std::string landings;
-    for (std::size_t site = 0; site < Recorder::LandingSites; ++site) {
-        if (handover.landedAt[site] == 0) continue;
-        landings += (landings.empty() ? "" : ", ") + std::to_string(handover.landedAt[site]) + " by " + Recorder::LandingSiteName(static_cast<Recorder::LandingSite>(site));
-    }
-    AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging landings: %s; %llu shadows shared with an earlier build, %llu MiB in live shadows\n", landings.empty() ? "none" : landings.c_str(), static_cast<unsigned long long>(sharedShadowHits.load(std::memory_order_relaxed)), static_cast<unsigned long long>(liveShadowBytes.load(std::memory_order_relaxed) >> 20u));
-    if (residentStagingEnabled()) {
-        const auto resident = ResidentStagingCounters();
-        AgcDriver::ProfilePrint_nid_no_patch("[buffers] resident staging (cumulative): %llu shadows made, %llu taken from another build, %llu live; copy-ins: %llu skipped (%.0f KiB not read from imports), %llu limited to the pages the CPU wrote (%.0f KiB copied, %.0f KiB not), %llu whole (%.0f KiB; %llu first uses, %llu of a shadow not left current, %llu after a changed import or registry, %llu with more than half written by the CPU, %llu untracked, %llu under a label or queued store); %llu uses left the shadow current, %llu did not after a write recorded during the use, %llu shadows outdated by recorded writes or driver stores; verified %llu, differing %llu\n", static_cast<unsigned long long>(resident.made), static_cast<unsigned long long>(resident.shared), static_cast<unsigned long long>(resident.live), static_cast<unsigned long long>(resident.skipped), resident.skippedBytes / 1024.0, static_cast<unsigned long long>(resident.partial), resident.partialBytes / 1024.0, resident.partialSavedBytes / 1024.0, static_cast<unsigned long long>(resident.full), resident.fullBytes / 1024.0, static_cast<unsigned long long>(resident.fresh), static_cast<unsigned long long>(resident.stale), static_cast<unsigned long long>(resident.moved), static_cast<unsigned long long>(resident.rewritten), static_cast<unsigned long long>(resident.untracked), static_cast<unsigned long long>(resident.blocked), static_cast<unsigned long long>(resident.sealed), static_cast<unsigned long long>(resident.unsealed), static_cast<unsigned long long>(resident.outdated), static_cast<unsigned long long>(resident.verified), static_cast<unsigned long long>(resident.differing));
-    }
-    if (residentStagingEnabled() && StagingFromUnitShadow()) {
-        const auto resident = ResidentStagingCounters();
-        AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging from unit shadows (cumulative): %llu copy-ins took %.0f KiB from fresh units on the card instead of the import, %llu copy-backs left %.0f KiB in fresh units instead of writing the import\n", static_cast<unsigned long long>(resident.shadowFed), resident.shadowFedBytes / 1024.0, static_cast<unsigned long long>(resident.shadowReturned), resident.shadowReturnedBytes / 1024.0);
-    }
-    if (Recorder::ReadTrapEnabled()) {
-        const auto trap = Recorder::ReadTrapCounts();
-        AgcDriver::ProfilePrint_nid_no_patch("[buffers] staging read trap (cumulative): %llu copy-backs guarded (%.0f KiB), %llu left unguarded (%.0f KiB; not whole 4 KiB pages of shared views); %llu kept past a label, %llu replaced by a newer result without being copied (%.0f KiB not copied back); faults: %llu served, %llu on a thread holding the GPU lock, %llu released by hand; landed for a CPU access %llu (%.0f KiB), ahead of recorded GPU work %llu (%.0f KiB); %llu ranges trapped now; verified %llu, differing %llu\n", static_cast<unsigned long long>(trap.guarded), trap.guardedBytes / 1024.0, static_cast<unsigned long long>(trap.unguarded), trap.unguardedBytes / 1024.0, static_cast<unsigned long long>(trap.kept), static_cast<unsigned long long>(trap.replaced), trap.replacedBytes / 1024.0, static_cast<unsigned long long>(trap.faults), static_cast<unsigned long long>(trap.nestedFaults), static_cast<unsigned long long>(trap.forcedReleases), static_cast<unsigned long long>(trap.faultLanded), trap.faultLandedBytes / 1024.0, static_cast<unsigned long long>(trap.readerLanded), trap.readerLandedBytes / 1024.0, static_cast<unsigned long long>(trap.held), static_cast<unsigned long long>(trap.verified), static_cast<unsigned long long>(trap.differing));
-    }
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
@@ -7086,141 +6392,6 @@ void reportStaging() {
 
 void ShutdownGuestBufferWorkers() {
     RefreshPool::Shutdown();
-}
-
-InputTwinCounts InputTwinCounters() {
-    const auto& stats = TwinCounters();
-    InputTwinCounts counts;
-    counts.made = stats.made.load(std::memory_order_relaxed);
-    counts.shared = stats.shared.load(std::memory_order_relaxed);
-    counts.copies = stats.copies.load(std::memory_order_relaxed);
-    counts.copiedBytes = stats.copiedBytes.load(std::memory_order_relaxed);
-    counts.refreshes = stats.refreshes.load(std::memory_order_relaxed);
-    counts.reuses = stats.reuses.load(std::memory_order_relaxed);
-    counts.outdated = stats.outdated.load(std::memory_order_relaxed);
-    counts.demoted = stats.demoted.load(std::memory_order_relaxed);
-    counts.memoised = stats.memoised.load(std::memory_order_relaxed);
-    counts.checked = stats.checked.load(std::memory_order_relaxed);
-    counts.verified = stats.verified.load(std::memory_order_relaxed);
-    counts.differing = stats.differing.load(std::memory_order_relaxed);
-    counts.residentBytes = liveTwinBytes.load(std::memory_order_relaxed);
-    counts.limitBytes = inputTwinLimit();
-    for (std::size_t miss = 0; miss < InputTwinMisses; ++miss) counts.missed[miss] = stats.missed[miss].load(std::memory_order_relaxed);
-    return counts;
-}
-
-const char* InputTwinMissName(InputTwinMiss miss) {
-    return InputTwinMissNames[static_cast<std::size_t>(miss)];
-}
-
-bool InputTwinsEnabled(const Context& context) {
-    return context.inputTwins && context.hostImportAlignment != 0;
-}
-
-std::uint64_t InputTwinLimit() {
-    return inputTwinLimit();
-}
-
-void SetInputTwinLimitForTests(std::uint64_t bytes) {
-    twinLimitForTests.store(bytes, std::memory_order_relaxed);
-}
-
-void OutdateInputTwins(VkDevice device, std::uint64_t begin, std::uint64_t end) {
-    outdateResidentsOver(device, begin, end);
-    if (liveTwinBytes.load(std::memory_order_relaxed) == 0 || begin >= end) return;
-    auto& registry = Twins();
-    std::vector<std::shared_ptr<InputTwin>> touched;
-    std::lock_guard lock(registry.mutex);
-    outdateTwinsOver(registry, device, begin, end, touched);
-}
-
-void OutdateInputTwins(VkDevice device) {
-    OutdateInputTwins(device, 0, std::numeric_limits<std::uint64_t>::max());
-}
-
-void OutdateStoredInputTwins(std::uint64_t address, std::size_t bytes) {
-    if (bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address) outdateResidentsOver(VK_NULL_HANDLE, address, address + bytes);
-    if (liveTwinBytes.load(std::memory_order_relaxed) == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
-    auto& registry = Twins();
-    std::vector<std::shared_ptr<InputTwin>> touched;
-    std::lock_guard lock(registry.mutex);
-    constexpr auto last = std::numeric_limits<std::uint64_t>::max();
-    for (auto slot = registry.twins.begin(); slot != registry.twins.end();) {
-        const auto device = slot->first.device;
-        outdateTwinsOver(registry, device, address, address + bytes, touched);
-        slot = registry.twins.upper_bound(TwinKey{device, last, last, std::numeric_limits<VkBufferUsageFlags>::max()});
-    }
-}
-
-std::uint64_t ReleaseInputTwins(std::uint64_t bytes) {
-    auto& registry = Twins();
-    std::vector<std::shared_ptr<InputTwin>> released;
-    std::uint64_t freed = 0;
-    {
-        std::unique_lock lock(registry.mutex, std::try_to_lock);
-        if (!lock.owns_lock()) return 0;
-        for (auto it = registry.recent.begin(); it != registry.recent.end() && freed < bytes;) {
-            if (it->use_count() != 1) {
-                ++it;
-                continue;
-            }
-            freed += (*it)->end - (*it)->begin;
-            (*it)->held = false;
-            released.push_back(std::move(*it));
-            it = registry.recent.erase(it);
-        }
-    }
-    return freed;
-}
-
-void ClearInputTwins(VkDevice device) {
-    clearResidents(device);
-    auto& registry = Twins();
-    std::vector<std::shared_ptr<InputTwin>> released;
-    std::lock_guard lock(registry.mutex);
-    for (auto it = registry.recent.begin(); it != registry.recent.end();) {
-        if ((*it)->device != device) {
-            ++it;
-            continue;
-        }
-        (*it)->held = false;
-        (*it)->current.store(false, std::memory_order_relaxed);
-        (*it)->serial.fetch_add(1, std::memory_order_release);
-        released.push_back(std::move(*it));
-        it = registry.recent.erase(it);
-    }
-    for (auto slot = registry.twins.begin(); slot != registry.twins.end();) {
-        if (slot->first.device != device) {
-            ++slot;
-            continue;
-        }
-        if (auto twin = slot->second.lock()) {
-            twin->current.store(false, std::memory_order_relaxed);
-            twin->serial.fetch_add(1, std::memory_order_release);
-            released.push_back(std::move(twin));
-        }
-        slot = registry.twins.erase(slot);
-    }
-    std::erase_if(registry.demoted, [&](const auto& slot) { return slot.first.device == device; });
-}
-
-void ReportInputTwins() {
-    auto& stats = TwinCounters();
-    const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    auto last = stats.lastReport.load(std::memory_order_relaxed);
-    if (nowMs - last < 10000 || !stats.lastReport.compare_exchange_strong(last, nowMs)) return;
-    static InputTwinCounts seen;
-    const auto counts = InputTwinCounters();
-    std::string missed;
-    for (std::size_t miss = 0; miss < InputTwinMisses; ++miss) {
-        missed += (missed.empty() ? "" : ", ") + std::to_string(counts.missed[miss] - seen.missed[miss]) + " " + InputTwinMissNames[miss];
-    }
-    const auto memoised = counts.memoised - seen.memoised;
-    const auto checked = counts.checked - seen.checked;
-    const auto memoisedUs = static_cast<double>(stats.memoisedNanoseconds.exchange(0, std::memory_order_relaxed)) / 1000.0;
-    const auto checkedUs = static_cast<double>(stats.checkedNanoseconds.exchange(0, std::memory_order_relaxed)) / 1000.0;
-    AgcDriver::ProfilePrint_nid_no_patch("[buffers] input twins (10 s): %llu made, %llu taken from another build, %llu copies out of imports (%.0f KiB, %llu of them refreshes), %llu uses without a copy; currency served %llu times by a memoised verdict (%.2f us each) and checked in full %llu times (%.2f us each), verdicts verified %llu, differing %llu; %llu outdated by recorded writes or driver stores, %llu given up as volatile; misses: %s; %.1f MiB resident (limit %llu MiB)\n", static_cast<unsigned long long>(counts.made - seen.made), static_cast<unsigned long long>(counts.shared - seen.shared), static_cast<unsigned long long>(counts.copies - seen.copies), static_cast<double>(counts.copiedBytes - seen.copiedBytes) / 1024.0, static_cast<unsigned long long>(counts.refreshes - seen.refreshes), static_cast<unsigned long long>(counts.reuses - seen.reuses), static_cast<unsigned long long>(memoised), memoised != 0 ? memoisedUs / static_cast<double>(memoised) : 0.0, static_cast<unsigned long long>(checked), checked != 0 ? checkedUs / static_cast<double>(checked) : 0.0, static_cast<unsigned long long>(counts.verified - seen.verified), static_cast<unsigned long long>(counts.differing - seen.differing), static_cast<unsigned long long>(counts.outdated - seen.outdated), static_cast<unsigned long long>(counts.demoted - seen.demoted), missed.c_str(), static_cast<double>(counts.residentBytes) / 1048576.0, static_cast<unsigned long long>(counts.limitBytes >> 20u));
-    seen = counts;
 }
 
 GuestBufferMemory::~GuestBufferMemory() {
@@ -7261,417 +6432,11 @@ bool GuestBufferMemory::adaptiveInPlace(const Region& region, bool use) const {
 }
 
 bool GuestBufferMemory::StagingDecisionsCurrent() const {
-    const bool adaptive = AdaptiveStagingGate::Enabled();
+    if (!AdaptiveStagingGate::Enabled()) return true;
     for (const auto& region : regions) {
-        if (region.twin != nullptr) {
-            if (region.twin->demoted.load(std::memory_order_acquire)) return false;
-            continue;
-        }
-        if (region.untwinned && region.direct != nullptr && twinRetry(region)) return false;
-        if (region.unstaged && region.direct != nullptr) {
-            const auto bytes = static_cast<std::size_t>(region.end - region.begin);
-            if (sharesShadows() && liveSharedShadow({context.device, region.begin, region.end, gpuCopyUsage(context, false)}) != nullptr) return false;
-            if (deviceLocalHasRoom(context, bytes) && liveShadowBytes.load(std::memory_order_relaxed) + bytes <= liveShadowLimit.load(std::memory_order_relaxed) / 4u * 3u) return false;
-            continue;
-        }
-        if (!adaptive || (!(region.gpuCopy && region.deviceLocal) && !region.adaptiveInPlace)) continue;
+        if (!(region.gpuCopy && region.deviceLocal) && !region.adaptiveInPlace) continue;
         if (adaptiveInPlace(region, true) != region.adaptiveInPlace) return false;
     }
-    return true;
-}
-
-std::uint64_t GuestBufferMemory::StagedBytes() const {
-    std::uint64_t bytes = 0;
-    for (const auto& region : regions) {
-        if (region.gpuCopy && region.deviceLocal && region.twin == nullptr) bytes += (region.end - region.begin) * (changedCopyBacks(context) ? 2u : 1u);
-    }
-    return bytes;
-}
-
-void GuestBufferMemory::InputTwinBuffers(std::vector<std::pair<const void*, std::uint64_t>>& twins) const {
-    twins.clear();
-    for (const auto& region : regions) {
-        if (region.twin != nullptr) twins.emplace_back(region.twin.get(), region.end - region.begin);
-    }
-}
-
-bool GuestBufferMemory::InputTwinProof(std::vector<std::uint64_t>& proof) const {
-    proof.clear();
-    for (const auto& region : regions) {
-        if (region.twin == nullptr) continue;
-        const auto serial = region.twin->serial.load(std::memory_order_acquire);
-        if (serial != region.twinChecked || !region.twin->current.load(std::memory_order_relaxed)) return false;
-        proof.push_back(serial);
-    }
-    if (!proof.empty()) proof.push_back(GuestAllocations::GuestAllocationsGeneration_nid_postfix());
-    return true;
-}
-
-bool GuestBufferMemory::InputTwinProofHolds(std::span<const std::uint64_t> proof) const {
-    std::size_t index = 0;
-    for (const auto& region : regions) {
-        if (region.twin == nullptr) continue;
-        if (index >= proof.size() || region.twin->serial.load(std::memory_order_acquire) != proof[index]) return false;
-        ++index;
-    }
-    if (index == 0) return proof.empty();
-    return index + 1 == proof.size() && proof.back() == GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-}
-
-bool GuestBufferMemory::twinWanted(const Region& region, bool addressable) const {
-    if (!inputTwinsAllowed || addressable || region.sparse || region.mirror != nullptr || !region.writable || region.overlay || !InputTwinsEnabled(context) || !gpuCopiesEnabled() || HoldsLease()) return false;
-    const auto bytes = region.end - region.begin;
-    return bytes >= inputTwinMin() && bytes <= inputTwinLimit() / 4u && !WritesOverlap(region.begin, static_cast<std::size_t>(bytes));
-}
-
-bool GuestBufferMemory::twinRetry(const Region& region) const {
-    const auto* recorder = Recorder::Active();
-    if (recorder == nullptr || !twinWanted(region, false) || twinBlocked(*recorder, region.begin, static_cast<std::size_t>(region.end - region.begin))) return false;
-    return inputTwinAvailable(context, region.begin, region.end, gpuCopyUsage(context, false));
-}
-
-bool GuestBufferMemory::takeTwin(Region& region, VkBufferUsageFlags usage, bool allocate) const {
-    if (region.twin != nullptr) return true;
-    if (region.untwinned) return false;
-    region.twin = allocate ? acquireInputTwin(context, region.begin, region.end, usage) : liveInputTwin(context, region.begin, region.end, usage);
-    if (region.twin == nullptr) {
-        region.untwinned = true;
-        return false;
-    }
-    region.buffer = region.twin->buffer;
-    return true;
-}
-
-void GuestBufferMemory::dropTwin(Region& region) const {
-    if (region.twin == nullptr) return;
-    region.twin = nullptr;
-    region.twinChecked = 0;
-    region.buffer = nullptr;
-    region.deviceLocal = false;
-    region.copiedBack = false;
-}
-
-bool GuestBufferMemory::twinCurrent(const Region& region) const {
-    auto& registry = Twins();
-    auto& twin = *region.twin;
-    std::uint64_t generation = 0;
-    std::uint64_t registryGeneration = 0;
-    {
-        std::lock_guard lock(registry.mutex);
-        if (!twin.current.load(std::memory_order_relaxed) || twin.demoted.load(std::memory_order_relaxed) || twin.source != region.copySource) return false;
-        generation = twin.generation;
-        registryGeneration = twin.registryGeneration;
-    }
-    const bool unchanged = Recorder::CopyStillCurrent(region.begin, static_cast<std::size_t>(region.end - region.begin), generation, registryGeneration);
-    const auto frame = inputTwinFrames.load(std::memory_order_relaxed);
-    std::vector<std::shared_ptr<InputTwin>> released;
-    std::lock_guard lock(registry.mutex);
-    sweepTwins(registry, frame, released);
-    if (!twin.current.load(std::memory_order_relaxed) || twin.generation != generation) return false;
-    if (!unchanged) {
-        twin.current.store(false, std::memory_order_relaxed);
-        twin.serial.fetch_add(1, std::memory_order_release);
-        return false;
-    }
-    twin.streak = 0;
-    holdTwin(registry, region.twin, frame);
-    TwinCounters().reuses.fetch_add(1, std::memory_order_relaxed);
-    return true;
-}
-
-void GuestBufferMemory::recordTwinCopies(std::span<Region* const> twins, Recorder& recorder) {
-    GuestMemory::AssertGpuLockHeld("GuestBufferMemory::recordTwinCopies");
-    struct Fill {
-        Region* region;
-        bool trusted;
-        std::uint64_t generation;
-    };
-    std::vector<Fill> fills;
-    auto& stats = TwinCounters();
-    const bool timed = twinsProfiled();
-    const bool verify = twinVerdictsVerified();
-    const auto now = twinVerdictNow();
-    const auto since = [](std::chrono::steady_clock::time_point started) { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()); };
-    for (auto* region : twins) {
-        auto& twin = *region->twin;
-        const auto started = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const bool memoised = twinVerdictHolds(twin, now, region->copySource);
-        if (memoised && !verify) {
-            region->twinChecked = twin.verdict.serial;
-            stats.reuses.fetch_add(1, std::memory_order_relaxed);
-            stats.memoised.fetch_add(1, std::memory_order_relaxed);
-            if (timed) stats.memoisedNanoseconds.fetch_add(since(started), std::memory_order_relaxed);
-            continue;
-        }
-        const auto serial = twin.serial.load(std::memory_order_acquire);
-        bool current = twinCurrent(*region);
-        const auto blocked = !current || verify ? twinBlocked(recorder, region->begin, static_cast<std::size_t>(region->end - region->begin)) : std::nullopt;
-        if (verify && (memoised || current)) noteTwinVerified(twin, !current || blocked.has_value());
-        if (blocked) current = false;
-        if (memoised) {
-            if (current) stats.memoised.fetch_add(1, std::memory_order_relaxed);
-        } else {
-            stats.checked.fetch_add(1, std::memory_order_relaxed);
-            if (timed) stats.checkedNanoseconds.fetch_add(since(started), std::memory_order_relaxed);
-        }
-        if (current) {
-            region->twinChecked = serial;
-            if (now.epoch != 0) twin.verdict = {now.epoch, serial, now.registry, now.unwatch, now.frame, region->copySource};
-            continue;
-        }
-        if (blocked) countTwinMiss(*blocked);
-        fills.push_back({region, !blocked, 0});
-    }
-    if (fills.empty()) {
-        if (twinsProfiled()) ReportInputTwins();
-        return;
-    }
-    Require(Recorder::Active() == &recorder, "input twin copies recorded into a recorder that is not the device's");
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> touched;
-    touched.reserve(fills.size());
-    for (const auto& fill : fills) {
-        const auto bytes = static_cast<std::size_t>(fill.region->end - fill.region->begin);
-        recorder.FlushKeyStoresOverlapping(fill.region->begin, bytes);
-        recorder.FlushStoresOverlapping(fill.region->begin, bytes);
-        touched.emplace_back(fill.region->begin, fill.region->end);
-    }
-    for (auto& fill : fills) {
-        if (!fill.trusted) continue;
-        const auto bytes = static_cast<std::size_t>(fill.region->end - fill.region->begin);
-        fill.generation = GuestMemory::CollectWrites(fill.region->begin, bytes);
-        if (fill.generation == 0 && WatchedAfterSettle(context, fill.region->begin, bytes)) fill.generation = GuestMemory::CollectWrites(fill.region->begin, bytes);
-        if (fill.generation == 0) countTwinMiss(InputTwinMiss::Untracked);
-    }
-    const auto registryGeneration = GuestAllocations::GuestAllocationsGeneration_nid_postfix();
-    const Recorder::CopyBackReach reach{0, true, true, touched};
-    VkAccessFlags covered = 0;
-    const auto commands = recorder.CommandsKeeping(reach, &covered);
-    const auto timing = recorder.BeginGpuTiming(Recorder::CommandClass::InputTwinCopy);
-    if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::InputTwinCopy, Recorder::Access{touched, {}, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
-    constexpr BarrierMask leading{VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT};
-    if (!Recorder::ElideCovered(Recorder::CommandClass::InputTwinCopy, leading, covered)) {
-        RecordMemoryBarrier(context, commands, leading.srcStage, leading.dstStage, leading.srcAccess, leading.dstAccess);
-        Recorder::CountBarriers(Recorder::CommandClass::InputTwinCopy);
-    }
-    std::uint64_t copied = 0;
-    for (const auto& fill : fills) {
-        auto* region = fill.region;
-        const auto bytes = region->end - region->begin;
-        recorder.Keep(region->buffer);
-        if (!CopyChangingSource(context, commands, recorder, region->begin, static_cast<std::size_t>(bytes), region->buffer->Handle(), 0)) {
-            CopyBuffer(context, commands, region->copySource, region->begin - region->copySourceBase, region->buffer->Handle(), 0, bytes);
-            recorder.NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
-        }
-        region->snapshot.clear();
-        region->twinChecked = noteTwinFilled(region->twin, region->copySource, fill.generation, registryGeneration);
-        copied += bytes;
-    }
-    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
-    Recorder::CountBarriers(Recorder::CommandClass::InputTwinCopy);
-    recorder.MarkCovered(copiedAccess);
-    recorder.EndGpuTiming(timing, copied);
-    TwinCounters().copies.fetch_add(fills.size(), std::memory_order_relaxed);
-    TwinCounters().copiedBytes.fetch_add(copied, std::memory_order_relaxed);
-    if (twinsProfiled()) ReportInputTwins();
-}
-
-void GuestBufferMemory::StagedShadows(std::vector<std::pair<const void*, std::uint64_t>>& shadows) const {
-    shadows.clear();
-    for (const auto& region : regions) {
-        if (!region.gpuCopy || !region.deviceLocal || region.twin != nullptr) continue;
-        const auto bytes = region.end - region.begin;
-        shadows.emplace_back(region.buffer != nullptr ? static_cast<const void*>(region.buffer.get()) : static_cast<const void*>(&region), bytes);
-        if (changedCopyBacks(context)) shadows.emplace_back(region.shadowCopy != nullptr ? static_cast<const void*>(region.shadowCopy.get()) : static_cast<const void*>(&region.shadowCopy), bytes);
-    }
-}
-
-bool GuestBufferMemory::sharesShadows() const {
-    return copyBackDeferral && sharedShadowsEnabled() && !HoldsLease();
-}
-
-std::shared_ptr<Buffer> GuestBufferMemory::stagingShadow(Region& region, VkBufferUsageFlags usage) const {
-    region.sharedShadow = sharesShadows();
-    region.resident = nullptr;
-    region.residentSerial = 0;
-    if (region.sharedShadow && residentStagingEnabled() && defersCopyBacks()) {
-        region.resident = acquireResident(context, region.begin, region.end, usage);
-        if (region.resident != nullptr) return region.resident->buffer;
-    }
-    return region.sharedShadow ? sharedStagingBuffer(context, region.begin, region.end, usage) : stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), usage);
-}
-
-bool GuestBufferMemory::usesResident(const Region& region) {
-    return region.resident != nullptr && region.gpuCopy && region.deviceLocal && region.twin == nullptr && region.buffer != nullptr && region.buffer == region.resident->buffer;
-}
-
-void GuestBufferMemory::sealResident(Region& region) {
-    const auto serial = std::exchange(region.residentSerial, 0);
-    if (serial == 0 || !usesResident(region)) return;
-    auto& shadow = *region.resident;
-    std::lock_guard lock(Residents().mutex);
-    if (shadow.serial != serial || shadow.generation == 0) {
-        ResidentCounters().unsealed.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    shadow.current = true;
-    ResidentCounters().sealed.fetch_add(1, std::memory_order_relaxed);
-}
-
-const HostImport* GuestBufferMemory::stagingImport(const Region& region) const {
-    if (!usesResident(region) || region.copySource == VK_NULL_HANDLE) return nullptr;
-    const auto* import = ExistingHostImportFor(context, region.begin, static_cast<std::size_t>(region.end - region.begin));
-    if (import == nullptr || import->buffer != region.copySource || HostImportBufferStart(*import).guest != region.copySourceBase) return nullptr;
-    return import;
-}
-
-std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::returnToShadow(Recorder& recorder, Region& region, std::vector<std::pair<std::uint64_t, std::uint64_t>> written) const {
-    region.shadowStamped = false;
-    region.importReturned.clear();
-    if (written.empty() || !StagingFromUnitShadow()) return written;
-    const auto* import = stagingImport(region);
-    if (import == nullptr) return written;
-    struct SlabCopy {
-        std::shared_ptr<ShadowSlab> slab;
-        VkBuffer buffer;
-        VkBufferCopy copy;
-    };
-    std::vector<SlabCopy> copies;
-    std::vector<ShadowedRange> shadowed;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> rest;
-    std::uint64_t bytes = 0;
-    const auto toImport = [&](std::uint64_t from, std::uint64_t to) {
-        if (!rest.empty() && rest.back().second == from) rest.back().second = to;
-        else rest.emplace_back(from, to);
-    };
-    for (const auto& [from, to] : written) {
-        const auto sources = StagingSources(context, *import, from, to);
-        if (sources.empty()) {
-            toImport(from, to);
-            continue;
-        }
-        for (const auto& source : sources) {
-            const auto begin = from + source.begin;
-            const auto end = from + source.end;
-            if (!source.shadow) {
-                toImport(begin, end);
-                continue;
-            }
-            copies.push_back({source.slab, source.buffer, VkBufferCopy{begin - region.begin, source.offset, end - begin}});
-            shadowed.push_back({begin, end, source.slab});
-            bytes += end - begin;
-        }
-    }
-    if (copies.empty()) return written;
-    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> over{{{region.begin, region.end}}};
-    const Recorder::CopyBackReach reach{0, true, true, over};
-    const auto commands = recorder.CommandsKeeping(reach);
-    const auto timing = recorder.BeginGpuTiming(StagingCopyBackKey);
-    if (Recorder::BarrierValidate()) {
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
-        for (const auto& range : shadowed) ranges.emplace_back(range.begin, range.end);
-        recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, ranges, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
-    }
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
-    const auto copyBuffer = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
-    for (const auto& entry : copies) {
-        copyBuffer(commands, region.buffer->Handle(), entry.buffer, 1, &entry.copy);
-        recorder.Keep(entry.slab);
-    }
-    recorder.Keep(region.buffer);
-    if (residentStagingVerified()) {
-        const auto size = static_cast<std::size_t>(bytes);
-        auto staged = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        auto kept = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        recorder.Keep(staged, size);
-        recorder.Keep(kept, size);
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
-        VkDeviceSize at = 0;
-        for (const auto& entry : copies) {
-            CopyBuffer(context, commands, region.buffer->Handle(), entry.copy.srcOffset, staged->Handle(), at, entry.copy.size);
-            CopyBuffer(context, commands, entry.buffer, entry.copy.dstOffset, kept->Handle(), at, entry.copy.size);
-            at += entry.copy.size;
-        }
-        recorder.OnComplete([staged, kept, begin = region.begin, end = region.end] { noteResidentVerified(begin, end, staged->Bytes(), kept->Bytes()); });
-    }
-    constexpr VkAccessFlags copiedAccess = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
-    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, copiedAccess);
-    Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
-    recorder.MarkCovered(copiedAccess);
-    recorder.EndGpuTiming(timing, bytes);
-    {
-        const OwnWriteScope own(*this);
-        for (const auto& [from, to] : writes) {
-            if (owner(from, to) != &region) continue;
-            std::uint64_t order = 0;
-            static_cast<void>(GuestMemory::MarkPossiblyWritten(from, static_cast<std::size_t>(to - from), order));
-            directWritesGeneration = std::max(directWritesGeneration, order);
-        }
-    }
-    MarkShadowed(*import, shadowed, GuestMemory::TrackerGeneration(), true);
-    region.shadowStamped = true;
-    region.importReturned = rest;
-    ResidentCounters().shadowReturned.fetch_add(1, std::memory_order_relaxed);
-    ResidentCounters().shadowReturnedBytes.fetch_add(bytes, std::memory_order_relaxed);
-    return rest;
-}
-
-GuestBufferMemory::StagedFlushScope::StagedFlushScope(const GuestBufferMemory& memory) : previous(std::exchange(stagedFlushOwner, &memory)) {}
-
-GuestBufferMemory::StagedFlushScope::~StagedFlushScope() {
-    stagedFlushOwner = previous;
-}
-
-bool GuestBufferMemory::StagedFlushScope::Covers(std::uint64_t address, std::size_t bytes) {
-    const auto* memory = stagedFlushOwner;
-    if (memory == nullptr || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !memory->uploaded || memory->committed) return false;
-    if (!StagingFromUnitShadow() || residentStagingVerified()) return false;
-    const auto end = address + bytes;
-    return std::any_of(memory->regions.begin(), memory->regions.end(), [&](const Region& region) { return region.gpuCopy && region.begin <= address && end <= region.end && memory->stagingImport(region) != nullptr; });
-}
-
-bool StagedFlushCovers(std::uint64_t address, std::size_t bytes) {
-    return GuestBufferMemory::StagedFlushScope::Covers(address, bytes);
-}
-
-GuestBufferMemory::OwnWriteScope::OwnWriteScope(const GuestBufferMemory& memory) : writes(&memory.writes) {
-    for (const auto& region : memory.regions) {
-        if (usesResident(region)) shadows.push_back(region.resident.get());
-    }
-    if (shadows.empty()) return;
-    previous = ownWriteScope;
-    ownWriteScope = this;
-    entered = true;
-}
-
-GuestBufferMemory::OwnWriteScope::~OwnWriteScope() {
-    if (entered) ownWriteScope = previous;
-}
-
-bool GuestBufferMemory::OwnWriteScope::Exempts(const ResidentShadow* shadow, std::uint64_t begin, std::uint64_t end) {
-    const auto* scope = ownWriteScope;
-    if (scope == nullptr || shadow->begin > begin || end > shadow->end || std::find(scope->shadows.begin(), scope->shadows.end(), shadow) == scope->shadows.end()) return false;
-    return std::any_of(scope->writes->begin(), scope->writes->end(), [&](const auto& range) { return range.first == begin && range.second == end; });
-}
-
-void GuestBufferMemory::KeepCopiedBytes(Recorder& recorder, const void* owner) const {
-    std::size_t own = 0;
-    for (const auto& region : regions) {
-        if (region.buffer == nullptr || region.twin != nullptr) continue;
-        const auto bytes = static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
-        if (region.sharedShadow && region.gpuCopy && region.deviceLocal) recorder.KeepBytes(region.buffer.get(), bytes);
-        else own += bytes;
-    }
-    recorder.KeepBytes(owner, own);
-}
-
-bool GuestBufferMemory::CopyBackReach(std::vector<std::pair<std::uint64_t, std::uint64_t>>& touched) const {
-    touched.clear();
-    if (!keptCopyBacks || !Recorder::StagingHandoverEnabled() || HoldsLease()) return false;
-    for (const auto& region : regions) touched.emplace_back(region.begin, region.end);
-    touched.insert(touched.end(), writes.begin(), writes.end());
     return true;
 }
 
@@ -7839,10 +6604,6 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                 region.pending = true;
                 continue;
             }
-            if (!addressable && !region.sparse && region.end - region.begin <= Recorder::FinishedReadBytes && Recorder::EarlyEndOfPipe() && !DepthPlanesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin)) && !(region.writable && WritesOverlap(region.begin, static_cast<std::size_t>(region.end - region.begin))) && !Recorder::SnapshotWriteOverlaps(region.begin, static_cast<std::size_t>(region.end - region.begin))) {
-                region.direct = nullptr;
-                continue;
-            }
             // An import found when the lease was acquired is reused while none was dropped since.
             const HostImport* entry = region.direct != nullptr && state.epoch == importsEpoch ? region.direct : nullptr;
             region.direct = nullptr;
@@ -7867,7 +6628,7 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
             const bool misaligned = !bindableInPlace(HostImportOffset(*entry, region.begin), addressable);
             if (staged) {
                 const auto allocateStart = std::chrono::steady_clock::now();
-                region.buffer = stagingShadow(region, gpuCopyUsage(context, addressable));
+                region.buffer = stagingBuffer(context, static_cast<std::size_t>(region.end - region.begin), gpuCopyUsage(context, addressable));
                 if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
                 if (region.buffer == nullptr) {
                     // No shadow to be had: in place when aligned, else the host copy below.
@@ -7875,7 +6636,6 @@ void GuestBufferMemory::UploadPrepare(bool addressable) {
                     staged = false;
                 }
             }
-            if (!staged && Recorder::Active() != nullptr && twinWanted(region, addressable) && takeTwin(region, gpuCopyUsage(context, addressable), true)) staged = true;
             if (misaligned || staged) {
                 if (!staged) {
                     if (!gpuCopyEligible(region)) continue;
@@ -8018,7 +6778,6 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     // No recorder (tests) keeps them on the CPU path.
     auto* recorder = Recorder::Active();
     std::vector<Region*> gpuCopies;
-    std::vector<Region*> twinCopies;
     // One clock pair around the loop (an address-based build has ~1200 regions): the [buffers]
     // 'import lookup' is the loop less the mirror refreshes and the CPU copies, timed apart.
     const auto loopStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -8044,9 +6803,6 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             continue;
         }
         bool copyOnGpu = false;
-        const bool twinCandidate = recorder != nullptr && !region.untwinned && twinWanted(region, addressable);
-        auto twinMiss = twinCandidate ? twinBlocked(*recorder, region.begin, static_cast<std::size_t>(bytes)) : std::nullopt;
-        if (twinCandidate && !twinMiss && region.twin == nullptr && (importServes(context, region.begin, region.end) || runCovers(importRanges(), region.begin, region.end))) takeTwin(region, gpuCopyUsage(context, addressable), true);
         if (context.hostImportAlignment != 0) {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
@@ -8091,11 +6847,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             }
             // A staged region (see stagingEligible) is copied out of the import even when aligned;
             // without a recorder to record the copies it binds in place like any other.
-            bool staged = recorder != nullptr && stagingEligible(region, addressable);
-            if (twinCandidate && !twinMiss && (entry == nullptr || runImport)) twinMiss = InputTwinMiss::Import;
-            const bool twinned = !staged && twinCandidate && !twinMiss && takeTwin(region, gpuCopyUsage(context, addressable), false);
-            if (!twinned) dropTwin(region);
-            staged = staged || twinned;
+            const bool staged = recorder != nullptr && stagingEligible(region, addressable);
             if (entry != nullptr && !staged && bindableInPlace(HostImportOffset(*entry, region.begin), addressable)) {
                 region.direct = entry;
                 region.runCut = runImport;
@@ -8116,10 +6868,6 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
                 region.copySourceBase = start.guest;
                 region.copySourceAddress = start.device;
             }
-        }
-        if (twinMiss) {
-            region.untwinned = true;
-            countTwinMiss(*twinMiss);
         }
         if (region.direct != nullptr) {
             // The GPU reads this range in place, so storage results pending in it must be stored first
@@ -8144,15 +6892,9 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             recorder->OpenBatch();
             StorageTexture::FlushPending(region.begin, static_cast<std::size_t>(bytes), nullptr, "copied buffer region");
             region.gpuCopy = true;
-            if (region.twin != nullptr) {
-                region.copiedBack = true;
-                twinCopies.push_back(&region);
-            } else {
-                gpuCopies.push_back(&region);
-            }
+            gpuCopies.push_back(&region);
             continue;
         }
-        dropTwin(region);
         if (sparseHeapCandidate(region)) {
             const auto refreshStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             const bool bound = bindSparseMirror(region, importRanges());
@@ -8171,7 +6913,6 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     }
     if (addressable) StoreDepthExpandWrites(context);
     if (heapsEnd > heapsBegin) StorageTexture::PublishShadowsOnly(heapsBegin, static_cast<std::size_t>(heapsEnd - heapsBegin), PublishScope::Whole, "address-based heaps");
-    if (!twinCopies.empty()) recordTwinCopies(twinCopies, *recorder);
     if (!gpuCopies.empty()) recordGpuCopies(gpuCopies, addressable);
     takeHeapReferences();
     ResidentBuffer::FlushChanged(context);
@@ -8182,7 +6923,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     const auto uploads = uploadsProfiled.fetch_add(1, std::memory_order_relaxed) + 1;
     if (uploads % 2000 == 0) {
         const auto& copies = Copies();
-        AgcDriver::ProfilePrint_nid_no_patch("[buffers] %llu uploads: import lookup %.0f ms, buffer allocation %.0f ms, guest read %.0f ms; copies on the GPU: %llu regions (%.0f KiB) copied out of imports, %llu written sub-ranges (%.0f KiB) copied back, %llu staging stores by the CPU at write-back\n", static_cast<unsigned long long>(uploads), importUs.load(std::memory_order_relaxed) / 1000.0, allocateUs.load(std::memory_order_relaxed) / 1000.0, readUs.load(std::memory_order_relaxed) / 1000.0, static_cast<unsigned long long>(copies.gpuCopies.load(std::memory_order_relaxed)), copies.gpuCopyBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.gpuCopyBacks.load(std::memory_order_relaxed) + Recorder::HandoverCounts().landed), (copies.gpuCopyBackBytes.load(std::memory_order_relaxed) + Recorder::HandoverCounts().landedBytes) / 1024.0, static_cast<unsigned long long>(copies.stagingStores.load(std::memory_order_relaxed)));
+        AgcDriver::ProfilePrint_nid_no_patch("[buffers] %llu uploads: import lookup %.0f ms, buffer allocation %.0f ms, guest read %.0f ms; copies on the GPU: %llu regions (%.0f KiB) copied out of imports, %llu written sub-ranges (%.0f KiB) copied back, %llu staging stores by the CPU at write-back\n", static_cast<unsigned long long>(uploads), importUs.load(std::memory_order_relaxed) / 1000.0, allocateUs.load(std::memory_order_relaxed) / 1000.0, readUs.load(std::memory_order_relaxed) / 1000.0, static_cast<unsigned long long>(copies.gpuCopies.load(std::memory_order_relaxed)), copies.gpuCopyBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.gpuCopyBacks.load(std::memory_order_relaxed)), copies.gpuCopyBackBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.stagingStores.load(std::memory_order_relaxed)));
     }
     const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     if (ms > 50) {
@@ -8324,24 +7065,111 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
     }
 }
 
-bool GuestBufferMemory::defersCopyBacks() const {
-    return copyBackDeferral && Recorder::StagingHandoverEnabled() && !changedCopyBacks(context) && !HoldsLease();
+namespace {
+
+std::atomic<std::uint64_t> changedCopySnapshotBytes{0};
+std::atomic<std::uint64_t> changedCopySnapshotsMade{0};
+
+std::shared_ptr<Buffer> changedCopySnapshot(const Context& context, std::size_t bytes, bool addressed) {
+    auto buffer = stagingBuffer(context, bytes, gpuCopyUsage(context, addressed));
+    if (buffer == nullptr) return nullptr;
+    changedCopySnapshotBytes.fetch_add(bytes, std::memory_order_relaxed);
+    changedCopySnapshotsMade.fetch_add(1, std::memory_order_relaxed);
+    auto* snapshot = buffer.get();
+    return std::shared_ptr<Buffer>(snapshot, [owner = std::move(buffer), bytes](Buffer*) mutable {
+        owner.reset();
+        changedCopySnapshotBytes.fetch_sub(bytes, std::memory_order_relaxed);
+    });
 }
 
-std::vector<std::pair<std::uint64_t, std::uint64_t>> GuestBufferMemory::writtenWithin(std::uint64_t begin, std::uint64_t end) const {
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> clipped;
-    for (const auto& [first, last] : writes) {
-        const auto from = std::max(first, begin);
-        const auto to = std::min(last, end);
-        if (from < to) clipped.emplace_back(from, to);
+bool carriedShadowsEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_CARRIED_SHADOWS") == nullptr;
+    return enabled;
+}
+
+std::atomic<std::uint64_t> carriedShadowCopies{0};
+
+struct CarriedShadow {
+    std::shared_ptr<Buffer> buffer;
+    VkDevice device = VK_NULL_HANDLE;
+    std::uint64_t recorderId = 0;
+    std::uint64_t importSerial = 0;
+    std::uint64_t note = 0;
+    std::uint64_t generation = 0;
+};
+
+struct CarriedShadows {
+    static constexpr std::size_t MaxEntries = 256;
+    static constexpr std::uint64_t MaxBytes = std::uint64_t{512} << 20u;
+    AgcDriver::Mutex mutex;
+    std::map<std::pair<std::uint64_t, std::uint64_t>, CarriedShadow> entries;
+    std::uint64_t bytes = 0;
+};
+
+CarriedShadows& Carried() {
+    static CarriedShadows shadows;
+    return shadows;
+}
+
+void clearCarriedShadows(VkDevice device) {
+    auto& shadows = Carried();
+    std::lock_guard lock(shadows.mutex);
+    for (auto entry = shadows.entries.begin(); entry != shadows.entries.end();) {
+        if (entry->second.device != device) {
+            ++entry;
+            continue;
+        }
+        shadows.bytes -= entry->first.second - entry->first.first;
+        entry = shadows.entries.erase(entry);
     }
-    std::sort(clipped.begin(), clipped.end());
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
-    for (const auto& range : clipped) {
-        if (!merged.empty() && range.first <= merged.back().second) merged.back().second = std::max(merged.back().second, range.second);
-        else merged.push_back(range);
+}
+
+std::shared_ptr<Buffer> takeCarriedShadow(const Context& context, const Recorder& recorder, std::uint64_t begin, std::uint64_t end) {
+    if (!carriedShadowsEnabled()) return nullptr;
+    auto& shadows = Carried();
+    CarriedShadow shadow;
+    {
+        std::lock_guard lock(shadows.mutex);
+        const auto found = shadows.entries.find({begin, end});
+        if (found == shadows.entries.end()) return nullptr;
+        shadow = std::move(found->second);
+        shadows.bytes -= end - begin;
+        shadows.entries.erase(found);
     }
-    return merged;
+    const auto bytes = static_cast<std::size_t>(end - begin);
+    if (shadow.device != context.device || shadow.recorderId != recorder.Id() || shadow.note == 0 || recorder.NewestWriteNote(begin, bytes) != shadow.note) return nullptr;
+    if (shadow.importSerial == 0 || HostImportSerial(context, begin, bytes, false) != shadow.importSerial) return nullptr;
+    static_cast<void>(GuestMemory::CollectWrites(begin, bytes));
+    if (!GuestMemory::UnchangedSince(begin, bytes, shadow.generation)) return nullptr;
+    return shadow.buffer;
+}
+
+}
+
+std::uint64_t GuestBufferMemory::CarriedShadowCopies() {
+    return carriedShadowCopies.load(std::memory_order_relaxed);
+}
+
+void GuestBufferMemory::NoteCarriedShadows(const Recorder& recorder) const {
+    if (!carriedShadowsEnabled()) return;
+    auto& shadows = Carried();
+    std::uint64_t generation = 0;
+    for (const auto& region : regions) {
+        if (!region.gpuCopy || !region.deviceLocal || !region.copiedBack || region.buffer == nullptr || region.sparse || region.mirror != nullptr || region.bufferEnd != 0) continue;
+        const auto bytes = region.end - region.begin;
+        const auto serial = HostImportSerial(context, region.begin, static_cast<std::size_t>(bytes), false);
+        if (serial == 0) continue;
+        if (generation == 0) generation = GuestMemory::TrackerGeneration();
+        const auto note = recorder.NewestWriteNote(region.begin, static_cast<std::size_t>(bytes));
+        std::lock_guard lock(shadows.mutex);
+        auto [entry, inserted] = shadows.entries.try_emplace({region.begin, region.end});
+        if (inserted) shadows.bytes += bytes;
+        entry->second = {region.buffer, context.device, recorder.Id(), serial, note, generation};
+        if (shadows.entries.size() > CarriedShadows::MaxEntries || shadows.bytes > CarriedShadows::MaxBytes) {
+            shadows.entries.clear();
+            shadows.bytes = 0;
+        }
+    }
 }
 
 void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool addressable) {
@@ -8350,115 +7178,17 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     Require(!capture || CaptureTrace::Enabled(), "GPU copy capture requires APS5_CAPTURE_TRACE");
     auto* recorder = Recorder::Active();
     Require(recorder != nullptr, "GPU buffer copies need an active recorder");
-    std::vector<std::uint8_t> residentBlocked(copies.size(), 0);
-    for (std::size_t index = 0; index < copies.size(); ++index) {
-        const auto* region = copies[index];
-        if (!usesResident(*region)) continue;
-        const auto bytes = static_cast<std::size_t>(region->end - region->begin);
-        residentBlocked[index] = recorder->PendingLabelIn(region->begin, bytes) || recorder->QueuedStoreOverlaps(region->begin, bytes) || recorder->QueuedKeyStoreOverlaps(region->begin, bytes) ? 1 : 0;
-    }
     // A queued DCC key store or label store over a copied range lands before the copy reads it.
     for (const auto* region : copies) {
         recorder->FlushKeyStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
         recorder->FlushStoresOverlapping(region->begin, static_cast<std::size_t>(region->end - region->begin));
-    }
-    const bool shadowFeeds = StagingFromUnitShadow();
-    if (shadowFeeds) {
-        for (const auto* region : copies) {
-            if (!usesResident(*region)) continue;
-            const auto bytes = static_cast<std::size_t>(region->end - region->begin);
-            if (!residentStagingVerified() && stagingImport(*region) != nullptr) continue;
-            if (AnyShadowedOverlaps(region->begin, bytes)) PublishShadow(region->begin, bytes, PublishScope::Whole, PublishReason::Validate);
-        }
     }
     VkAccessFlags covered = 0;
     bool inRun = false;
     std::vector<Recorder::RunAccess> runAccesses;
     const auto runKey = Recorder::DispatchOverlapEnabled() && recorder->RunOpen() ? Recorder::PeekUnorderedDispatch() : 0u;
     if (runKey != 0) RunAccesses(runAccesses);
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> touched;
-    Recorder::CopyBackReach reach{0, CopyBackReach(touched), true, {}};
-    reach.touched = touched;
-    const bool joinsRun = runKey != 0 && recorder->JoinsRun(runKey, this, runAccesses, reach);
-    constexpr auto unclaimed = std::numeric_limits<std::size_t>::max();
-    std::vector<Recorder::StagedClaim> claims;
-    std::vector<std::size_t> claimOf(copies.size(), unclaimed);
-    handoverToken = 0;
-    if (!joinsRun && !capture && defersCopyBacks()) {
-        recorder->CloseRun();
-        if (recorder->HasPendingCopyBacks()) {
-            for (std::size_t index = 0; index < copies.size(); ++index) {
-                const auto* region = copies[index];
-                if (!region->deviceLocal || region->buffer == nullptr) continue;
-                claimOf[index] = claims.size();
-                claims.push_back({region->begin, region->end, region->copySource, region->copySourceBase, writtenWithin(region->begin, region->end), nullptr, {}});
-            }
-            handoverToken = recorder->ClaimCopyBacks(claims);
-            const auto claimed = [&](const Region& region) { return std::any_of(claims.begin(), claims.end(), [&](const Recorder::StagedClaim& claim) { return claim.shadow != nullptr && claim.begin == region.begin && claim.end == region.end; }); };
-            const auto reaches = [&](const Region& region) { return std::any_of(claims.begin(), claims.end(), [&](const Recorder::StagedClaim& claim) { return claim.shadow != nullptr && std::any_of(claim.forwarded.begin(), claim.forwarded.end(), [&](const auto& range) { return region.begin < range.second && range.first < region.end; }); }); };
-            if (handoverToken != 0 && std::any_of(regions.begin(), regions.end(), [&](const Region& region) { return !claimed(region) && reaches(region); })) handoverToken = 0;
-        }
-    }
-    const auto claimFor = [&](std::size_t index) -> const Recorder::StagedClaim* { return handoverToken != 0 && claimOf[index] != unclaimed && claims[claimOf[index]].shadow != nullptr ? &claims[claimOf[index]] : nullptr; };
-    reach.taker = handoverToken;
-    const auto commands = joinsRun ? recorder->RunCommands(runKey, this, runAccesses, inRun, &covered, reach) : recorder->CommandsKeeping(reach, &covered);
-    const auto untouched = [&](std::size_t index) {
-        const auto* claim = claimFor(index);
-        return claim != nullptr && claim->shadow.get() == copies[index]->buffer.get() && claim->forwarded.size() == 1 && claim->forwarded.front().first == claim->begin && claim->forwarded.front().second == claim->end;
-    };
-    bool allUntouched = handoverToken != 0;
-    for (std::size_t index = 0; allUntouched && index < copies.size(); ++index) allUntouched = untouched(index);
-    if (allUntouched) {
-        for (auto* region : copies) {
-            region->snapshot.clear();
-            region->shadowCopy = nullptr;
-            region->residentSerial = usesResident(*region) ? continueResidentUse(*region->resident, region->copySource, region->copySourceBase) : 0;
-            traceStaged(region->begin, region->end, region->atomic);
-            Recorder::CountForwardedCopyIns(1, 0, region->end - region->begin);
-            if (profile) {
-                Copies().staged.fetch_add(1, std::memory_order_relaxed);
-                if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-        if (profile) reportStaging();
-        recorder->MarkCovered(covered);
-        return;
-    }
-    std::vector<ResidentUse> residentUses(copies.size());
-    const bool verifyResident = residentStagingVerified();
-    bool everySkipped = !copies.empty();
-    for (std::size_t index = 0; index < copies.size(); ++index) {
-        auto* region = copies[index];
-        region->residentSerial = 0;
-        if (!usesResident(*region)) {
-            everySkipped = false;
-            continue;
-        }
-        if (claimFor(index) != nullptr) {
-            region->residentSerial = continueResidentUse(*region->resident, region->copySource, region->copySourceBase);
-            everySkipped = false;
-            continue;
-        }
-        residentUses[index] = beginResidentUse(context, *region->resident, region->copySource, region->copySourceBase, residentBlocked[index] != 0);
-        region->residentSerial = residentUses[index].serial;
-        if (residentUses[index].kind != ResidentCopyIn::Skipped) everySkipped = false;
-    }
-    if (everySkipped && !verifyResident && !capture) {
-        for (auto* region : copies) {
-            region->snapshot.clear();
-            region->shadowCopy = nullptr;
-            recorder->Keep(region->buffer);
-            traceStaged(region->begin, region->end, region->atomic);
-            noteResidentEntry(ResidentCopyIn::Skipped, region->end - region->begin, 0);
-            if (profile) {
-                Copies().staged.fetch_add(1, std::memory_order_relaxed);
-                if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
-            }
-        }
-        if (profile) reportStaging();
-        recorder->MarkCovered(covered);
-        return;
-    }
+    const auto commands = runKey != 0 ? recorder->RunCommands(runKey, this, runAccesses, inRun, &covered) : recorder->Commands(&covered);
     const auto timing = recorder->BeginGpuTiming(StagingCopyInKey);
     if (Recorder::BarrierValidate()) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
@@ -8472,120 +7202,13 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
     }
     bool stagedAny = false;
     std::uint64_t copiedBytes = 0;
-    const auto copyGuest = [&](const Region& region, std::uint64_t from, std::uint64_t to, bool collected) -> std::uint64_t {
-        if (from >= to) return 0;
-        std::vector<ShadowRun> sources;
-        if (shadowFeeds) {
-            if (const auto* import = stagingImport(region); import != nullptr) {
-                if (!collected) GuestMemory::CollectWritesUncached(from, static_cast<std::size_t>(to - from));
-                sources = StagingSources(context, *import, from, to);
-            }
-        }
-        if (sources.empty()) {
-            const auto bytes = static_cast<std::size_t>(to - from);
-            if (CopyChangingSource(context, commands, *recorder, from, bytes, region.buffer->Handle(), from - region.begin)) return to - from;
-            CopyBuffer(context, commands, region.copySource, from - region.copySourceBase, region.buffer->Handle(), from - region.begin, to - from);
-            recorder->NotePendingRead(from, bytes, Recorder::ReadKind::GpuCopy);
-            return to - from;
-        }
-        std::uint64_t imported = 0;
-        std::uint64_t fed = 0;
-        for (const auto& source : sources) {
-            const auto size = source.end - source.begin;
-            CopyBuffer(context, commands, source.buffer, source.offset, region.buffer->Handle(), from + source.begin - region.begin, size);
-            if (source.shadow) {
-                recorder->Keep(source.slab);
-                fed += size;
-                continue;
-            }
-            recorder->NotePendingRead(from + source.begin, static_cast<std::size_t>(size), Recorder::ReadKind::GpuCopy);
-            imported += size;
-        }
-        NoteStagingFed(fed);
-        ResidentCounters().shadowFed.fetch_add(1, std::memory_order_relaxed);
-        ResidentCounters().shadowFedBytes.fetch_add(fed, std::memory_order_relaxed);
-        return imported;
-    };
-    const auto verifyAgainstImport = [&](const Region& region) {
-        const auto bytes = region.end - region.begin;
-        const auto size = static_cast<std::size_t>(bytes);
-        auto imported = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        auto resident = std::make_shared<Buffer>(context, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
-        recorder->Keep(imported, size);
-        recorder->Keep(resident, size);
-        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
-        Recorder::CountBarriers(Recorder::CommandClass::StagingIn);
-        CopyBuffer(context, commands, region.copySource, region.begin - region.copySourceBase, imported->Handle(), 0, bytes);
-        CopyBuffer(context, commands, region.buffer->Handle(), 0, resident->Handle(), 0, bytes);
-        recorder->NotePendingRead(region.begin, size, Recorder::ReadKind::GpuCopy);
-        recorder->OnComplete([imported, resident, begin = region.begin, end = region.end] { noteResidentVerified(begin, end, imported->Bytes(), resident->Bytes()); });
-    };
-    for (std::size_t index = 0; index < copies.size(); ++index) {
-        auto* region = copies[index];
+    for (auto* region : copies) {
         const auto bytes = region->end - region->begin;
-        if (const auto* claim = claimFor(index); claim != nullptr) {
-            const bool same = claim->shadow.get() == region->buffer.get();
-            std::uint64_t imported = 0;
-            std::uint64_t forwarded = 0;
-            const auto fromImport = [&](std::uint64_t from, std::uint64_t to) { imported += copyGuest(*region, from, to, false); };
-            recorder->Keep(region->buffer);
-            if (!same) recorder->Keep(claim->shadow);
-            auto at = region->begin;
-            for (const auto& [from, to] : claim->forwarded) {
-                fromImport(at, from);
-                if (!same) CopyBuffer(context, commands, claim->shadow->Handle(), from - region->begin, region->buffer->Handle(), from - region->begin, to - from);
-                forwarded += to - from;
-                at = to;
-            }
-            fromImport(at, region->end);
-            copiedBytes += imported + (same ? 0 : forwarded);
-            Recorder::CountForwardedCopyIns(same ? 1 : 0, same ? 0 : 1, forwarded);
-            region->snapshot.clear();
-            traceStaged(region->begin, region->end, region->atomic);
-            if (profile) {
-                stagedAny = true;
-                Copies().gpuCopies.fetch_add(1, std::memory_order_relaxed);
-                Copies().gpuCopyBytes.fetch_add(imported, std::memory_order_relaxed);
-                Copies().staged.fetch_add(1, std::memory_order_relaxed);
-                Copies().stagedInBytes.fetch_add(imported, std::memory_order_relaxed);
-                if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
-            }
-            continue;
-        }
-        if (usesResident(*region)) {
-            const auto& use = residentUses[index];
-            std::uint64_t refreshed = 0;
-            if (use.kind != ResidentCopyIn::Whole) {
-                recorder->Keep(region->buffer);
-                for (const auto& [from, to] : use.ranges) {
-                    static_cast<void>(copyGuest(*region, from, to, true));
-                    refreshed += to - from;
-                }
-            }
-            noteResidentEntry(use.kind, bytes, refreshed);
-            if (use.kind != ResidentCopyIn::Whole) {
-                copiedBytes += refreshed;
-                region->snapshot.clear();
-                traceStaged(region->begin, region->end, region->atomic);
-                if (verifyResident) verifyAgainstImport(*region);
-                if (profile) {
-                    stagedAny = true;
-                    Copies().staged.fetch_add(1, std::memory_order_relaxed);
-                    Copies().stagedInBytes.fetch_add(refreshed, std::memory_order_relaxed);
-                    if (refreshed != 0) {
-                        Copies().gpuCopies.fetch_add(1, std::memory_order_relaxed);
-                        Copies().gpuCopyBytes.fetch_add(refreshed, std::memory_order_relaxed);
-                    }
-                    if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
-                }
-                continue;
-            }
-        }
         copiedBytes += bytes;
         if (region->buffer == nullptr) {
             // Not made by UploadPrepare (the registry was stale then): made here, under the lock.
             const auto allocateStart = std::chrono::steady_clock::now();
-            if (region->deviceLocal) region->buffer = stagingShadow(*region, gpuCopyUsage(context, addressable));
+            if (region->deviceLocal) region->buffer = stagingBuffer(context, static_cast<std::size_t>(bytes), gpuCopyUsage(context, addressable));
             if (region->buffer == nullptr) {
                 // Or no shadow to be had: a host copy serves the region instead, aligned or not.
                 region->deviceLocal = false;
@@ -8593,10 +7216,6 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 region->buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), gpuCopyUsage(context, addressable), copyBufferProperties(false));
             }
             if (profile) allocateUs.fetch_add(microsecondsSince(allocateStart), std::memory_order_relaxed);
-            if (usesResident(*region)) {
-                region->residentSerial = beginResidentUse(context, *region->resident, region->copySource, region->copySourceBase, false).serial;
-                noteResidentEntry(ResidentCopyIn::Whole, bytes, 0);
-            }
         }
         std::vector<std::byte> expected;
         const auto address = region->begin;
@@ -8622,12 +7241,17 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             }
         }
         recorder->Keep(region->buffer);
-        const bool viaShadow = inputSnapshot == nullptr && expected.empty() && usesResident(*region);
-        auto importedBytes = bytes;
-        const bool copiedChanging = !viaShadow && inputSnapshot == nullptr && CopyChangingSource(context, commands, *recorder, region->begin, static_cast<std::size_t>(bytes), region->buffer->Handle(), 0);
-        if (viaShadow) importedBytes = copyGuest(*region, region->begin, region->end, true);
-        else if (!copiedChanging) CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
-        if (viaShadow && verifyResident && importedBytes != bytes) verifyAgainstImport(*region);
+        std::shared_ptr<Buffer> carried;
+        if (region->deviceLocal && inputSnapshot == nullptr && !region->sparse && region->mirror == nullptr && region->bufferEnd == 0) carried = takeCarriedShadow(context, *recorder, region->begin, region->end);
+        if (carried != nullptr) {
+            carriedShadowCopies.fetch_add(1, std::memory_order_relaxed);
+            if (carried->Handle() != region->buffer->Handle()) {
+                CopyBuffer(context, commands, carried->Handle(), 0, region->buffer->Handle(), 0, bytes);
+                recorder->Keep(carried);
+            }
+        } else {
+            CopyBuffer(context, commands, copySource, copyOffset, region->buffer->Handle(), 0, bytes);
+        }
         if (!expected.empty()) {
             auto readback = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
             recorder->Keep(readback, readback->Bytes().size());
@@ -8645,16 +7269,16 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 CaptureTrace::Log("copy-input-result batch=%llu address=%llx bytes=%zu changed=%zu", batch, static_cast<unsigned long long>(address), expected.size(), changed);
             });
         }
-        if (inputSnapshot == nullptr && !viaShadow && !copiedChanging) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
+        if (inputSnapshot == nullptr) recorder->NotePendingRead(region->begin, static_cast<std::size_t>(bytes), Recorder::ReadKind::GpuCopy);
         region->snapshot.clear();
         if (region->deviceLocal) traceStaged(region->begin, region->end, region->atomic);
         if (profile) {
             Copies().gpuCopies.fetch_add(1, std::memory_order_relaxed);
-            Copies().gpuCopyBytes.fetch_add(importedBytes, std::memory_order_relaxed);
+            Copies().gpuCopyBytes.fetch_add(bytes, std::memory_order_relaxed);
             if (region->deviceLocal) {
                 stagedAny = true;
                 Copies().staged.fetch_add(1, std::memory_order_relaxed);
-                Copies().stagedInBytes.fetch_add(importedBytes, std::memory_order_relaxed);
+                Copies().stagedInBytes.fetch_add(bytes, std::memory_order_relaxed);
                 if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -8667,7 +7291,8 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
             region->shadowCopy = nullptr;
             continue;
         }
-        if (region->shadowCopy == nullptr) region->shadowCopy = stagingBuffer(context, bytes, gpuCopyUsage(context, addressed));
+        if (region->shadowCopy == nullptr) region->shadowCopy = region->releasedShadowCopy.lock();
+        if (region->shadowCopy == nullptr) region->shadowCopy = changedCopySnapshot(context, bytes, addressed);
         if (region->shadowCopy == nullptr || (addressed && region->shadowCopy->DeviceAddress() == 0)) {
             region->shadowCopy = nullptr;
             continue;
@@ -8693,9 +7318,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
 }
 
 void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
-    handoverToken = 0;
     if (!uploaded || committed) return;
-    const bool defers = defersCopyBacks();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     // The written ranges, merged: a V# bound twice would otherwise copy the same bytes twice.
     std::vector<std::pair<std::uint64_t, std::uint64_t>> merged;
@@ -8733,17 +7356,6 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     }
     for (auto& region : regions) {
         if (!region.gpuCopy || region.copiedBack) continue;
-        if (defers && region.deviceLocal && region.shadowCopy == nullptr && region.buffer != nullptr) {
-            auto written = returnToShadow(recorder, region, writtenWithin(region.begin, region.end));
-            if (!written.empty()) {
-                Recorder::StagedCopyBack held{region.begin, region.end, region.copySource, region.copySourceBase, region.buffer, std::move(written), 0};
-                held.guardable = usesResident(region);
-                recorder.DeferCopyBack(std::move(held));
-            }
-            region.copiedBack = true;
-            sealResident(region);
-            continue;
-        }
         for (const auto& [begin, end] : merged) {
             const auto from = std::max(begin, region.begin);
             const auto to = std::min(end, region.end);
@@ -8808,8 +7420,8 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
         // HasCopiedWrites, so the caller still registers the CPU write-back that stores the
         // staging bytes, instead of losing the shader's results.
         region.copiedBack = true;
-        if (region.shadowCopy == nullptr) sealResident(region);
-        else region.residentSerial = 0;
+        region.releasedShadowCopy = region.shadowCopy;
+        region.shadowCopy = nullptr;
     }
     if (!recording) return;
     if (Recorder::BarrierValidate()) recorder.NoteAccess(Recorder::CommandClass::StagingOut, Recorder::Access{{}, merged, {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
@@ -9083,7 +7695,6 @@ void GuestBufferMemory::RunAccesses(std::vector<std::array<std::uint64_t, 3>>& o
 }
 
 void GuestBufferMemory::MarkStagedWrites() const {
-    const OwnWriteScope own(*this);
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);
         if (found != nullptr && found->gpuCopy && found->direct == nullptr) GuestMemory::MarkWritten(begin, static_cast<std::size_t>(end - begin));
@@ -9091,12 +7702,11 @@ void GuestBufferMemory::MarkStagedWrites() const {
 }
 
 void GuestBufferMemory::MarkDirectWrites() const {
-    const OwnWriteScope own(*this);
     for (const auto& [begin, end] : writes) {
         const auto* found = owner(begin, end);
         if (found == nullptr) continue;
         const auto& region = *found;
-        if (region.direct != nullptr || (region.gpuCopy && region.copiedBack && !region.shadowStamped)) {
+        if (region.direct != nullptr || (region.gpuCopy && region.copiedBack)) {
             std::uint64_t order = 0;
             static_cast<void>(GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin), order));
             directWritesGeneration = std::max(directWritesGeneration, order);
@@ -9247,25 +7857,10 @@ void GuestBufferMemory::WriteBack() {
         }
         if (region.gpuCopy) {
             Require(region.buffer != nullptr && end <= region.end, "write-back range exceeds its GPU owner");
-            if (region.copiedBack && region.shadowStamped) {
-                for (const auto& [returnedBegin, returnedEnd] : region.importReturned) {
-                    const auto from = std::max(begin, returnedBegin);
-                    const auto to = std::min(end, returnedEnd);
-                    if (from >= to) continue;
-                    StorageTexture::StampKeepingNewerResults(from, static_cast<std::size_t>(to - from), directWritesGeneration, [&] {
-                        const OwnWriteScope own(*this);
-                        return GuestMemory::MarkPossiblyWritten(from, static_cast<std::size_t>(to - from));
-                    });
-                }
-                continue;
-            }
             if (region.copiedBack) {
                 // The GPU copied the written sub-range back into the import; page write watching
                 // did not see it.
-                StorageTexture::StampKeepingNewerResults(begin, static_cast<std::size_t>(end - begin), directWritesGeneration, [&] {
-                    const OwnWriteScope own(*this);
-                    return GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin));
-                });
+                StorageTexture::StampKeepingNewerResults(begin, static_cast<std::size_t>(end - begin), directWritesGeneration, [&] { return GuestMemory::MarkPossiblyWritten(begin, static_cast<std::size_t>(end - begin)); });
                 continue;
             }
             static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -9431,24 +8026,17 @@ void GuestBufferMemory::RecordStagingCopies(Recorder& recorder) {
     if (!uploaded || committed) return;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     std::vector<Region*> copies;
-    std::vector<Region*> twinCopies;
     if (std::any_of(regions.begin(), regions.end(), [](const Region& region) { return region.gpuCopy && region.deviceLocal && !region.copiedBack; })) recorder.CloseRunOwing(this);
     for (auto& region : regions) {
         if (!region.gpuCopy || !region.deviceLocal) continue;
-        if (region.twin != nullptr) {
-            twinCopies.push_back(&region);
-            continue;
-        }
         // The previous use's copy-back was recorded by its MarkGpuWrites (or never, when that use
         // threw first: counted); this use records its own after its work, from the shadow this
         // copy-in refills. The import is the one the region was taken from (the caller checked its
         // serial), so the copy source still stands.
         if (!region.copiedBack && profile) Copies().stagedLost.fetch_add(1, std::memory_order_relaxed);
         region.copiedBack = false;
-        region.shadowStamped = false;
         copies.push_back(&region);
     }
-    if (!twinCopies.empty()) recordTwinCopies(twinCopies, recorder);
     if (copies.empty()) return;
     Require(Recorder::Active() == &recorder, "staging copies recorded into a recorder that is not the device's");
     if (profile) Copies().stagedReused.fetch_add(copies.size(), std::memory_order_relaxed);
@@ -9488,6 +8076,15 @@ bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof)
     return state.device == proof.device && state.epoch == proof.epoch && state.refreshedGeneration == proof.refreshedGeneration && !importsStale(context, state);
 }
 
+bool TouchHostImportsIfUnchanged(const Context& context, const HostImportsProof& proof, std::span<const HostImport* const> imports) {
+    if (proof.device == VK_NULL_HANDLE || proof.device != context.device) return false;
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    if (state.device != proof.device || state.epoch != proof.epoch || state.refreshedGeneration != proof.refreshedGeneration || importsStale(context, state)) return false;
+    for (const auto* import : imports) import->lastUse = ++state.useCounter;
+    return true;
+}
+
 bool HostImportsReconciledUnchanged(const Context& context, const HostImportsProof& proof) {
     if (proof.device == VK_NULL_HANDLE || proof.device != context.device) return false;
     auto& state = Imports();
@@ -9497,88 +8094,24 @@ bool HostImportsReconciledUnchanged(const Context& context, const HostImportsPro
     return state.device == proof.device && state.epoch == proof.epoch && state.inserted == proof.inserted;
 }
 
-ResidentStagingCounts ResidentStagingCounters() {
-    const auto& stats = ResidentCounters();
-    ResidentStagingCounts counts;
-    counts.made = stats.made.load(std::memory_order_relaxed);
-    counts.shared = stats.shared.load(std::memory_order_relaxed);
-    counts.skipped = stats.skipped.load(std::memory_order_relaxed);
-    counts.skippedBytes = stats.skippedBytes.load(std::memory_order_relaxed);
-    counts.partial = stats.partial.load(std::memory_order_relaxed);
-    counts.partialBytes = stats.partialBytes.load(std::memory_order_relaxed);
-    counts.partialSavedBytes = stats.partialSavedBytes.load(std::memory_order_relaxed);
-    counts.full = stats.full.load(std::memory_order_relaxed);
-    counts.fullBytes = stats.fullBytes.load(std::memory_order_relaxed);
-    counts.fresh = stats.fresh.load(std::memory_order_relaxed);
-    counts.stale = stats.stale.load(std::memory_order_relaxed);
-    counts.moved = stats.moved.load(std::memory_order_relaxed);
-    counts.rewritten = stats.rewritten.load(std::memory_order_relaxed);
-    counts.unsealed = stats.unsealed.load(std::memory_order_relaxed);
-    counts.untracked = stats.untracked.load(std::memory_order_relaxed);
-    counts.blocked = stats.blocked.load(std::memory_order_relaxed);
-    counts.sealed = stats.sealed.load(std::memory_order_relaxed);
-    counts.outdated = stats.outdated.load(std::memory_order_relaxed);
-    counts.verified = stats.verified.load(std::memory_order_relaxed);
-    counts.differing = stats.differing.load(std::memory_order_relaxed);
-    counts.live = liveResidents.load(std::memory_order_relaxed);
-    counts.shadowFed = stats.shadowFed.load(std::memory_order_relaxed);
-    counts.shadowFedBytes = stats.shadowFedBytes.load(std::memory_order_relaxed);
-    counts.shadowReturned = stats.shadowReturned.load(std::memory_order_relaxed);
-    counts.shadowReturnedBytes = stats.shadowReturnedBytes.load(std::memory_order_relaxed);
-    return counts;
-}
-
-bool ResidentShadowKept(const ResidentShadowState& state) {
-    return state.current && !state.blocked && state.sameSource && state.sameRegistry && state.generation != 0;
-}
-
-ResidentCopyIn ResidentCopyInFor(const ResidentShadowState& state, bool tracked, std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::uint64_t begin, std::uint64_t end) {
-    if (!ResidentShadowKept(state) || !tracked || begin >= end) return ResidentCopyIn::Whole;
-    std::uint64_t dirty = 0;
-    auto at = begin;
-    for (const auto& [from, to] : written) {
-        if (from < at || from >= to || to > end) return ResidentCopyIn::Whole;
-        dirty += to - from;
-        at = to;
-    }
-    if (dirty == 0) return ResidentCopyIn::Skipped;
-    return dirty <= (end - begin) / 2u ? ResidentCopyIn::Limited : ResidentCopyIn::Whole;
-}
-
-bool ResidentStagingDefault(const char* disabled) {
-    return disabled == nullptr;
-}
-
-bool ResidentStagingEnabled() {
-    return residentStagingEnabled();
-}
-
-void SetResidentStagingForTests(bool enabled, bool verified) {
-    residentForTests.store(enabled ? (verified ? 2 : 1) : 0, std::memory_order_relaxed);
-}
-
-std::uint64_t LiveStagingShadowBytes() {
-    return liveShadowBytes.load(std::memory_order_relaxed);
-}
-
-std::uint64_t SharedStagingShadowHits() {
-    return sharedShadowHits.load(std::memory_order_relaxed);
+std::uint64_t RetiredImportSerial() {
+    return retiredImports.load(std::memory_order_acquire);
 }
 
 void SetDeviceLocalFullForTests(bool full) {
     deviceLocalFullForTests.store(full, std::memory_order_relaxed);
 }
 
-bool DeviceLocalFullForTests() {
-    return deviceLocalFullForTests.load(std::memory_order_relaxed);
-}
-
 std::uint64_t StagingShadowsRefused() {
     return Copies().stagingRefused.load(std::memory_order_relaxed);
 }
 
-std::uint64_t StagingShadowLimit() {
-    return liveShadowLimit.load(std::memory_order_relaxed);
+std::uint64_t ChangedCopySnapshotBytes() {
+    return changedCopySnapshotBytes.load(std::memory_order_relaxed);
+}
+
+std::uint64_t ChangedCopySnapshotsMade() {
+    return changedCopySnapshotsMade.load(std::memory_order_relaxed);
 }
 
 HostImportsProof HostImportsIdentity(const Context& context) {

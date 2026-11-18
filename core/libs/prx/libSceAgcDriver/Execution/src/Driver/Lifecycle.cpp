@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
+#include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -194,7 +195,6 @@ void Driver::stop() {
         DrawFinisher::Get().Drain();
     } catch (...) {
     }
-    CollectWalker::Get().Stop();
     DrawPipeline::Queue0().Stop();
     DrawPipeline::Queue0().ReleaseRetired();
     DrawFinisher::Get().ReleaseRan();
@@ -212,6 +212,7 @@ void Driver::stop() {
     PerformanceTrace::StopOutput();
     FlushAsyncLogAtEnd_nid_no_patch();
     StopProfileOutput_nid_no_patch();
+    CaptureTrace::Stop();
     stopped = true;
 }
 
@@ -380,13 +381,6 @@ std::pair<std::uint64_t, std::uint64_t> Driver::SerialProgress() {
     return {accepted, completed};
 }
 
-double Driver::CompletedGpuMs(std::uint64_t afterBatch, std::uint64_t throughBatch, std::uint64_t& newestBatch, std::vector<std::uint64_t>& recorded) {
-    const auto localDevice = device.Load();
-    newestBatch = localDevice ? localDevice->SubmittedEpoch() : 0;
-    recorded.clear();
-    return localDevice ? localDevice->CompletedGpuMs(afterBatch, std::min(throughBatch, newestBatch), recorded) : 0.0;
-}
-
 void Driver::CheckFailure() {
     if (failed.load(std::memory_order_acquire)) {
         std::lock_guard lock(mutex);
@@ -403,6 +397,10 @@ void Driver::ReportFailure(std::exception_ptr error) {
         first = !failure;
         if (first) failure = error;
         failed.store(true, std::memory_order_release);
+        {
+            std::lock_guard tails(tailsMutex);
+            unreadTails.clear();
+        }
         for (const auto& [handle, output] : outputs) output->Fail(failure);
         for (auto& [queue, worker] : workers) {
             for (const auto& item : worker.pending) {

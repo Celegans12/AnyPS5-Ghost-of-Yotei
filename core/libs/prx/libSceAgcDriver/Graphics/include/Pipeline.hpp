@@ -80,6 +80,7 @@ private:
     void release() noexcept;
     void setLibraryState(CommandState& recording, const State& state) const;
     void setColorWriteMasks(CommandState& recording, const State& state, const State* masked, bool secondChannel) const;
+    void setViewports(CommandState& recording, const State& state) const;
     Context context;
     std::vector<VkShaderModule> _modules;
     VkPipelineLayout layout = VK_NULL_HANDLE;
@@ -128,17 +129,12 @@ struct PipelineStoreCounters {
     std::uint64_t evicted = 0;
     std::uint64_t cached = 0;
     std::uint64_t bound = 0;
-    std::uint64_t drawBuilds = 0;
-    std::uint64_t drawBuildNanoseconds = 0;
-    std::uint64_t replayBuilds = 0;
-    std::uint64_t replayBuildNanoseconds = 0;
 };
 PipelineStoreCounters PipelineStoreTotals();
 // Whether the store may still raise its bound (not fixed by APS5_PIPELINE_STORE_ENTRIES, below 4096).
 bool PipelineStoreCanGrow();
 // The pipeline store's key of a configuration (empty when the configuration gets a private pipeline).
 void BuildPipelineStoreKey(std::vector<std::byte>& key, const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout);
-std::shared_ptr<Pipeline> FindCachedPipeline(const Context& context, std::span<const std::byte> key);
 struct DescribedSetLayouts {
     PipelineSetLayouts layouts;
     std::vector<std::uint32_t> mainKey;

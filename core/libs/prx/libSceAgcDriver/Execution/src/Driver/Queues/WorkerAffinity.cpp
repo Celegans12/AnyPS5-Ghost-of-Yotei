@@ -3,15 +3,12 @@
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include "prx/libc/include/CpuTopology.hpp"
 #include "prx/libc/include/general/ThreadName.hpp"
-#include "prx/libc/include/GuestPageTrack.hpp"
-#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <optional>
-#include <string_view>
 #include <vector>
 
 #ifdef _WIN32
@@ -44,9 +41,6 @@ std::uint64_t WorkerAffinityMask() {
 
 void NameDriverThread(const char* name) {
 #ifdef _WIN32
-    const std::string_view named(name);
-    const auto role = named == "draw-commit" ? GuestArena::MappingLockRole::Committer : named.starts_with("draw-finish") ? GuestArena::MappingLockRole::Finisher : named.starts_with("qworker") ? GuestArena::MappingLockRole::QueueWorker : named == "collect-walk" ? GuestArena::MappingLockRole::Walker : named == "presenter" ? GuestArena::MappingLockRole::Presenter : GuestArena::MappingLockRole::Game;
-    GuestArena::GuestMappingLockRole_nid_no_patch(static_cast<std::uint8_t>(role));
     const HRESULT nameResult = ThreadName::SetCurrent(name);
     if (FAILED(nameResult)) std::fprintf(stderr, "[thread-name] could not name %s (0x%08lx)\n", name, static_cast<unsigned long>(nameResult));
 #elif defined(__APPLE__)
@@ -58,19 +52,17 @@ void NameDriverThread(const char* name) {
 #endif
 }
 
-namespace {
 #ifdef __linux__
+namespace {
 void NoteWorkerThread();
-#endif
-void ReserveDecodeCore(const char* role);
 }
+#endif
 
 void PinWorkerThread(const char* role) {
     TracyZone::NameThread(role);
 #ifdef __linux__
     NoteWorkerThread();
 #endif
-    ReserveDecodeCore(role);
     const auto mask = WorkerAffinityMask();
     if (mask == 0) return;
     static std::once_flag summary;
@@ -87,7 +79,6 @@ namespace {
 struct CoreSwitches {
     bool committer = false;
     bool finisher = false;
-    bool walker = false;
     std::optional<unsigned> logical;
 };
 
@@ -98,13 +89,9 @@ struct Reservation {
 
 constexpr std::size_t CommitterSlot = 0;
 constexpr std::size_t FinisherSlot = 1;
-constexpr std::size_t PoolSlots = 15;
-constexpr std::size_t DecodeSlot = 2 + PoolSlots;
-constexpr std::size_t WalkerSlot = 3 + PoolSlots;
-constexpr std::size_t EncoderSlot = 4 + PoolSlots;
 
 std::mutex reservationMutex;
-std::array<std::optional<Reservation>, 5 + PoolSlots> reservations;
+std::array<std::optional<Reservation>, 2> reservations;
 #ifdef __linux__
 std::vector<unsigned long> workerThreads;
 std::vector<std::uint32_t> pipelineCpus;
@@ -119,9 +106,6 @@ const CoreSwitches& Switches() {
         const bool workersPinned = WorkerAffinityMask() != 0;
         result.committer = result.logical.has_value() || !workersPinned;
         result.finisher = !workersPinned && std::getenv("APS5_NO_FINISHER_CORE") == nullptr;
-#ifdef __linux__
-        result.walker = !workersPinned && std::getenv("APS5_NO_WALKER_CORE") == nullptr;
-#endif
         return result;
     }();
     return switches;
@@ -187,7 +171,7 @@ bool HoldsReservation(unsigned long thread) {
     return false;
 }
 
-void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical, bool lowest = false) {
+void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical) {
 #ifdef _WIN32
     using SetCpuSets = BOOL(WINAPI*)(HANDLE, const ULONG*, ULONG);
     static const auto setDefault = ThreadName::Resolve<SetCpuSets>("SetProcessDefaultCpuSets");
@@ -213,10 +197,10 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
     for (const auto& held : reservations) {
         if (held.has_value()) taken.push_back(held->set);
     }
-    if (slot >= FinisherSlot && !reservations[CommitterSlot].has_value() && Switches().committer) {
+    if (slot == FinisherSlot && !reservations[CommitterSlot].has_value() && Switches().committer) {
         if (const auto ahead = CpuTopology::ChooseReservedCore(sets, taken, Switches().logical)) taken.push_back(ahead->chosen);
     }
-    auto reservation = CpuTopology::ChooseReservedCore(sets, taken, logical, lowest);
+    const auto reservation = CpuTopology::ChooseReservedCore(sets, taken, logical);
     if (!reservation.has_value()) {
         if (logical.has_value()) std::fprintf(stderr, "[affinity] %s: APS5_COMMITTER_CPU=%u names no free logical processor of the process, no core reserved\n", role, *logical);
         return;
@@ -266,7 +250,7 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
     if (!pipelineCpus.empty()) {
         std::size_t kept = 0;
         for (const auto worker : workerThreads) {
-            if (!OwnThread(worker) || HoldsReservation(worker)) continue;
+            if (!OwnThread(worker)) continue;
             kept += PinTo(static_cast<pid_t>(worker), pipelineCpus) ? 1u : 0u;
         }
         std::fprintf(stderr, "[affinity] %zu queue workers kept on the %zu other CPUs of the reserved cores' last-level cache\n", kept, pipelineCpus.size());
@@ -279,18 +263,6 @@ void Reserve(std::size_t slot, const char* role, std::optional<unsigned> logical
 }
 #endif
 
-namespace {
-void ReserveDecodeCore(const char* role) {
-#if defined(_WIN32) || defined(__linux__)
-    static const bool decodes = std::getenv("APS5_NO_DECODE_CORE") == nullptr;
-    if (!decodes || std::strcmp(role, "queue worker 0x0") != 0 || !Switches().finisher) return;
-    Reserve(DecodeSlot, "queue worker 0", std::nullopt);
-#else
-    static_cast<void>(role);
-#endif
-}
-}
-
 void ReserveCommitterCore() {
 #if defined(_WIN32) || defined(__linux__)
     if (Switches().committer) Reserve(CommitterSlot, "draw committer", Switches().logical);
@@ -300,67 +272,6 @@ void ReserveCommitterCore() {
 void ReserveFinisherCore() {
 #if defined(_WIN32) || defined(__linux__)
     if (Switches().finisher) Reserve(FinisherSlot, "draw finisher", std::nullopt);
-#endif
-}
-
-void ReserveWalkerCore() {
-#ifdef __linux__
-    if (Switches().walker) Reserve(WalkerSlot, "collect walker", std::nullopt);
-    {
-        std::lock_guard lock(reservationMutex);
-        if (HoldsReservation(CurrentThread())) return;
-    }
-    if (const auto unreserved = CpuTopology::UnreservedMask().load(std::memory_order_acquire); unreserved != 0) CpuTopology::PinTraced("collect walker", nullptr, unreserved);
-#endif
-}
-
-void ReserveEncoderCore() {
-#if defined(_WIN32) || defined(__linux__)
-    if (Switches().finisher) Reserve(EncoderSlot, "draw encoder", std::nullopt, true);
-#endif
-#ifdef __linux__
-    {
-        std::lock_guard lock(reservationMutex);
-        if (HoldsReservation(CurrentThread())) return;
-    }
-    if (const auto unreserved = CpuTopology::UnreservedMask().load(std::memory_order_acquire); unreserved != 0) CpuTopology::PinTraced("draw encoder", nullptr, unreserved);
-#endif
-}
-
-void ReserveFinisherPoolCore(unsigned index) {
-#if defined(_WIN32) || defined(__linux__)
-    static const bool pooled = std::getenv("APS5_NO_FINISHER_POOL_CORES") == nullptr;
-    if (!pooled || index == 0 || index > PoolSlots || !Switches().finisher) return;
-    Reserve(FinisherSlot + index, "draw finisher of the pool", std::nullopt);
-#else
-    static_cast<void>(index);
-#endif
-}
-
-unsigned DefaultFinisherThreads() {
-#ifdef __linux__
-    static const unsigned threads = [] {
-        constexpr std::size_t pipelineCores = 8;
-        constexpr std::size_t titleCores = 4;
-        if (!Switches().finisher || std::getenv("APS5_NO_FINISHER_POOL_CORES") != nullptr) return 1u;
-        const auto sets = SystemCpuSets();
-        std::vector<CpuTopology::CpuSet> taken;
-        while (taken.size() < pipelineCores) {
-            const auto reservation = CpuTopology::ChooseReservedCore(sets, taken, std::nullopt);
-            if (!reservation.has_value()) return 1u;
-            taken.push_back(reservation->chosen);
-        }
-        std::vector<CpuTopology::CpuSet> spare;
-        const auto sameCore = [](const CpuTopology::CpuSet& left, const CpuTopology::CpuSet& right) { return left.group == right.group && left.core == right.core; };
-        for (const auto& set : sets) {
-            const auto matches = [&](const CpuTopology::CpuSet& other) { return sameCore(other, set); };
-            if (std::none_of(taken.begin(), taken.end(), matches) && std::none_of(spare.begin(), spare.end(), matches)) spare.push_back(set);
-        }
-        return spare.size() >= titleCores ? 4u : 1u;
-    }();
-    return threads;
-#else
-    return 1;
 #endif
 }
 

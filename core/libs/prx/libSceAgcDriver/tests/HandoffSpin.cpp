@@ -32,9 +32,6 @@ void CheckWindowPolicy() {
     Require(HandoffSpinWindowFor("-5", 20) == 0ns, "a negative window spins");
     Require(HandoffSpinWindowFor("text", 20) == 0ns, "a window that is no number spins");
     Require(HandoffSpinWindowFor("99999999999", 20) == 10000us, "a huge window is not limited to 10000 us");
-    Require(AgcDriver::HandoffSpinWindowOr(nullptr, 150us) == 150us, "an unset thread window does not keep the shared one");
-    Require(AgcDriver::HandoffSpinWindowOr("0", 150us) == 0ns, "a thread window of 0 still spins");
-    Require(AgcDriver::HandoffSpinWindowOr("40", 0ns) == 40us, "a thread window of 40 us does not override a shared window of 0");
 }
 
 void CheckUsableProcessors() {

@@ -19,12 +19,15 @@ class StorageTexture;
 
 VkImageView DepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten = true, bool stencilTested = false);
 VkImageView DepthSurfaceViewWithStencilWriteIntent(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilTested, bool stencilWritten, std::optional<std::uint8_t> overwrittenStencil = std::nullopt);
+VkImageView RepeatDepthSurfaceView(const Context& context, const DepthTarget& target, bool depthWritten, bool stencilWritten);
+bool DepthTargetOverlaps(const DepthTarget& target, std::uint64_t address, std::uint64_t bytes);
+const char* DepthPlanesObligation(VkDevice device, std::uint64_t address, std::uint64_t bytes);
+const char* DepthTargetObligation(const Context& context, const DepthTarget& target, bool depthWritten);
 SampleOrderTarget DepthSurfaceOrderTarget(const Context& context, const DepthTarget& target);
 DepthSampleLocations DepthSurfaceSampleLocations(const Context& context, const DepthTarget& target);
 enum class DepthPlaneScope { Overlapped, Whole };
 std::vector<std::pair<std::uint64_t, std::uint64_t>> FlushDepthPlanes(std::uint64_t address, std::size_t bytes, DepthPlaneScope scope = DepthPlaneScope::Overlapped);
 bool DepthPlanesStale();
-bool DepthPlanesOverlap(std::uint64_t address, std::size_t bytes);
 struct DepthPlaneStoreStatistics {
     std::uint64_t stores = 0;
     std::uint64_t units = 0;
@@ -34,24 +37,13 @@ DepthPlaneStoreStatistics DepthPlaneStoreCounts();
 void NoteDepthSurfaceWrite(const Context& context, const DepthTarget& target);
 bool SampleLocationsCompatibleDepth(const Context& context, VkFormat format, std::uint32_t samples);
 std::uint64_t DepthSurfacesSerial();
-struct DepthViewCounts {
-    std::uint64_t calls = 0;
-    std::uint64_t depthSyncs = 0;
-    std::uint64_t quietDepthSyncs = 0;
-    std::uint64_t stencilSyncs = 0;
-    std::uint64_t quietStencilSyncs = 0;
-    std::uint64_t htileChecks = 0;
-    std::uint64_t quietHtileChecks = 0;
-    std::uint64_t depthSkips = 0;
-    std::uint64_t stencilSkips = 0;
-    std::uint64_t htileSkips = 0;
-    std::uint64_t noteSkips = 0;
-};
-DepthViewCounts TakeDepthViewCounts();
 std::uint64_t DepthSurfacesReleased();
 std::uint64_t DepthSliceBytes(VkExtent2D extent, std::uint32_t bytesPerTexel);
 bool DirectDepthCopy(const Context& context, VkFormat depthFormat, VkImageAspectFlagBits aspect, VkFormat colorFormat);
 void SetDirectDepthCopy(bool enabled);
+bool DepthUploadImage(const Context& context);
+void SetDepthUploadImage(bool enabled);
+std::uint64_t DepthUploadCount();
 std::uint64_t DirectDepthCopyCount();
 void SetDepthTransferPasses(bool enabled);
 std::uint64_t DepthTransferPassCount();
@@ -113,31 +105,6 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
 std::optional<VkExtent2D> ActiveDepthExtent(VkDevice device, std::uint64_t address);
 std::shared_ptr<Texture> DepthSurfaceFirstSample(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components);
 std::size_t DepthPlaneCopyCount();
-enum class DepthPlaneRead : std::uint8_t { Skipped, Direct, Staged, Upload };
-struct DepthPlaneSourceState {
-    bool held = false;
-    bool sameImage = false;
-    std::uint64_t written = 0;
-    std::uint64_t copied = 0;
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    std::uint32_t samples = 1;
-    VkExtent2D extent{};
-};
-struct DepthPlaneTargetState {
-    VkFormat format = VK_FORMAT_UNDEFINED;
-    VkExtent2D extent{};
-    bool direct = true;
-};
-DepthPlaneRead ChooseDepthPlaneRead(const DepthPlaneSourceState& source, const DepthPlaneTargetState& target);
-bool DepthPlaneViews();
-struct DepthPlaneReadCounts {
-    std::uint64_t skipped = 0;
-    std::uint64_t direct = 0;
-    std::uint64_t staged = 0;
-    std::uint64_t uploaded = 0;
-};
-DepthPlaneReadCounts TakeDepthPlaneReadCounts();
-std::uint64_t DepthPlaneSourceGeneration(const Context& context, const GuestTextureResource& resource);
 VkDeviceSize DepthPlaneCopyBytes();
 VkFormat HostDepthFormat(const Context& context, VkFormat format);
 float HostDepthBiasConstant(const Context& context, VkFormat format, float constant);

@@ -6,8 +6,6 @@
 
 namespace AgcDriver::Graphics {
 
-struct CardInput;
-
 class Buffer {
 public:
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
@@ -26,7 +24,6 @@ public:
 private:
     Buffer(const Context& context, std::size_t size, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties, bool headroom);
     void initializeAddress(VkBufferUsageFlags usage);
-    void attachCard(VkBufferUsageFlags requested);
     void release() noexcept;
     Context context;
     VkDeviceAddress deviceAddress = 0;
@@ -44,7 +41,6 @@ private:
     VkBufferUsageFlags usage;
     VkMemoryPropertyFlags properties;
     std::shared_ptr<BufferPool> cache;
-    std::shared_ptr<CardInput> card;
 };
 
 // Device-local scratch memory for GPU-side layout conversion. The detiler reads and writes scattered
@@ -119,7 +115,6 @@ private:
     Context context;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
-    std::uint64_t gpuFlight = 0;
     bool pending = false;
     bool submitted = false;
 };

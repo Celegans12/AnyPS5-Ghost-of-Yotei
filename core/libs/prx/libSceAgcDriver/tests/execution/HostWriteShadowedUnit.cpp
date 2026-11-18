@@ -24,60 +24,9 @@
 #include <string>
 #include <thread>
 #include <utility>
-#include <vector>
-
-namespace {
-
-void ExpectRuns(const std::vector<AgcDriver::Graphics::UnitRun>& found, const std::vector<AgcDriver::Graphics::UnitRun>& expected, const std::string& what) {
-    using AgcDriver::Graphics::Require;
-    Require(found.size() == expected.size(), "unit freshness, " + what + ": " + std::to_string(found.size()) + " runs, expected " + std::to_string(expected.size()));
-    for (std::size_t index = 0; index < found.size(); ++index) {
-        const bool same = found[index].begin == expected[index].begin && found[index].end == expected[index].end && found[index].fresh == expected[index].fresh;
-        Require(same, "unit freshness, " + what + ": run " + std::to_string(index) + " is [" + std::to_string(found[index].begin) + ", " + std::to_string(found[index].end) + ") " + (found[index].fresh ? "fresh" : "stale"));
-    }
-}
-
-void UnitFreshnessWithoutDevice() {
-    using namespace AgcDriver::Graphics;
-    constexpr std::uint64_t unit = 65536;
-    constexpr std::uint64_t base = 0x300000000ull;
-    constexpr std::uint8_t unchanged = AgcDriver::GuestMemory::BlockUnchanged;
-    constexpr std::uint8_t written = AgcDriver::GuestMemory::BlockWritten;
-    Require(UnitFresh(7, unchanged, true), "unit freshness: a shadowed unit no store followed is not fresh");
-    Require(!UnitFresh(0, unchanged, true), "unit freshness: a unit never shadowed is fresh");
-    Require(!UnitFresh(7, written, true), "unit freshness: a unit stamped after its generation is fresh");
-    Require(!UnitFresh(7, unchanged, false), "unit freshness: a unit without a slab is fresh");
-    const std::vector<std::uint64_t> shadowed{5, 5, 5, 5};
-    const std::vector<std::uint8_t> quiet{unchanged, unchanged, unchanged, unchanged};
-    const std::vector<std::uint8_t> slabs{1, 1, 1, 1};
-    const auto begin = base + 2 * unit + 0x340;
-    const auto end = base + 5 * unit + 0x1000;
-    ExpectRuns(UnitRuns(base, begin, end, shadowed, quiet, slabs), {{begin, end, true}}, "every unit fresh");
-    const std::vector<std::uint64_t> partly{5, 0, 5, 5};
-    ExpectRuns(UnitRuns(base, begin, end, partly, quiet, slabs), {{begin, base + 3 * unit, true}, {base + 3 * unit, base + 4 * unit, false}, {base + 4 * unit, end, true}}, "one unit never shadowed");
-    const std::vector<std::uint8_t> cpuStore{unchanged, unchanged, written, unchanged};
-    ExpectRuns(UnitRuns(base, begin, end, shadowed, cpuStore, slabs), {{begin, base + 4 * unit, true}, {base + 4 * unit, base + 5 * unit, false}, {base + 5 * unit, end, true}}, "one unit stamped by a CPU store");
-    const std::vector<std::uint8_t> everyStore{written, written, written, written};
-    ExpectRuns(UnitRuns(base, begin, end, shadowed, everyStore, slabs), {{begin, end, false}}, "every unit stamped");
-    const std::vector<std::uint8_t> evicted{1, 1, 0, 0};
-    ExpectRuns(UnitRuns(base, begin, end, shadowed, quiet, evicted), {{begin, base + 4 * unit, true}, {base + 4 * unit, end, false}}, "the last units without a slab");
-    ExpectRuns(UnitRuns(base, begin, begin + 16, shadowed, quiet, slabs), {{begin, begin + 16, true}}, "a range inside one unit");
-    ExpectRuns(UnitRuns(base, begin, end, std::span<const std::uint64_t>(shadowed).first(2), quiet, slabs), {{begin, base + 4 * unit, true}, {base + 4 * unit, end, false}}, "units past the given generations");
-    Require(UnitRuns(base, end, begin, shadowed, quiet, slabs).empty(), "unit freshness: a reversed range has runs");
-    Require(UnitRuns(base, base - unit, base + unit, shadowed, quiet, slabs).empty(), "unit freshness: a range starting before the base has runs");
-}
-
-}
 
 #ifndef __linux__
 int main() {
-    try {
-        UnitFreshnessWithoutDevice();
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
-    }
-    std::printf("unit freshness: fresh, partly fresh and stale ranges split as their stamps say\n");
     std::printf("skipped, udmabuf imports are Linux only\n");
     return VulkanTestSkipped;
 }
@@ -264,8 +213,6 @@ bool ShortHostWriteKeepsGpuTail(const AgcDriver::Graphics::Context& context, con
 int main() {
     using namespace AgcDriver::Graphics;
     try {
-        UnitFreshnessWithoutDevice();
-        std::printf("unit freshness: fresh, partly fresh and stale ranges split as their stamps say\n");
         const int udmabuf = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
         if (udmabuf < 0) return Skip("host imports are unavailable: /dev/udmabuf is not accessible");
         close(udmabuf);
@@ -299,7 +246,7 @@ int main() {
             std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
             import = HostImportFor(context, address, MappingBytes);
         }
-        if (import == nullptr || !import->dmaBuf) return Skip("the device imported the mapping through a host pointer, which is compared, not watched");
+        if (import == nullptr || !import->dmaBuf) return Skip("the device imports shared memory through host pointers here, which are compared, not watched");
         if (!AgcDriver::GuestMemory::Watched(firstUnit, 8 * Unit)) return Skip("the imported units are not write-watched");
 
         landHook = AgcDriver::GuestMemory::CurrentFlushHook();

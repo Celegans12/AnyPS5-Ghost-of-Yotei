@@ -1158,6 +1158,30 @@ public:
 private:
     using OwnedRanges = std::multimap<std::uintptr_t, std::uintptr_t>;
 
+    class Lock {
+    public:
+        Lock() : pthread(std::getenv("APS5_MAPPINGS_PTHREAD_LOCK") != nullptr) {}
+        Lock(const Lock&) = delete;
+        Lock& operator=(const Lock&) = delete;
+
+        void lock() {
+            if (pthread) fallback.lock();
+            else AcquireSRWLockExclusive(&native);
+        }
+        bool try_lock() {
+            return pthread ? fallback.try_lock() : TryAcquireSRWLockExclusive(&native) != 0;
+        }
+        void unlock() {
+            if (pthread) fallback.unlock();
+            else ReleaseSRWLockExclusive(&native);
+        }
+
+    private:
+        SRWLOCK native = SRWLOCK_INIT;
+        std::mutex fallback;
+        bool pthread;
+    };
+
     static bool ownedRange(std::uintptr_t address, std::size_t bytes, std::size_t count) {
         if (address == 0 || bytes == 0 || address >= (std::uintptr_t{1} << 47) || bytes > (std::uintptr_t{1} << 47) - address) return false;
         return count == ((address + bytes - 1) / ownedBlockBytes - address / ownedBlockBytes + 1);
@@ -3207,10 +3231,10 @@ private:
         std::array<std::uint8_t, 8> flightRoles{};
         std::size_t aloft = 0;
         std::size_t waitingForAll = 0;
-        std::condition_variable landed;
+        std::condition_variable_any landed;
         std::atomic<std::uint64_t> flown{0};
         std::atomic<std::uint64_t> overlapped{0};
-        std::mutex inner;
+        WindowsMappings::Lock inner;
         std::atomic<std::uint64_t> published{0};
         std::atomic<std::uint8_t> holder{0};
         std::atomic<std::uint8_t> holderRole{0};

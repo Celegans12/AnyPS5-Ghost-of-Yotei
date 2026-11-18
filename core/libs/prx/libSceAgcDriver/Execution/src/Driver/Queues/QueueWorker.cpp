@@ -9,129 +9,15 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WorkerSampler.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
-#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
-#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
-#include "prx/libSceAgcDriver/Core/include/SubmitPolicy.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include <algorithm>
 #include <chrono>
-#include <array>
-#include <atomic>
 #include <cstdlib>
-#include <limits>
-#include <string>
-#include <thread>
 
 namespace AgcDriver::DriverDetail {
 
 namespace {
 
 constexpr auto IdleResultsQuietPeriod = std::chrono::milliseconds(50);
-
-bool ReapOnFence() {
-#ifdef _WIN32
-    return false;
-#else
-    return !Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::NoReapOnFence);
-#endif
-}
-
-std::atomic<Driver*> fenceWaker{nullptr};
-std::atomic<std::uint64_t> fenceWakes{0};
-std::atomic<std::uint64_t> fenceWakesSent{0}, reapsAfterFence{0}, reapsAfterFenceEmpty{0}, reapsAfterTimeout{0};
-
-void ReportFenceReaps(std::chrono::steady_clock::time_point now) {
-    static const bool reported = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!reported) return;
-    static std::chrono::steady_clock::time_point last = now;
-    if (now - last < std::chrono::seconds(10)) return;
-    last = now;
-    const auto take = [](std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.exchange(0, std::memory_order_relaxed)); };
-    AgcDriver::ProfilePrint_nid_no_patch("[reap-on-fence] (10 s): %llu fence wakes sent; queue 0 reaped %llu times after a wake (%llu of them left the pending completion count unchanged or higher) and %llu times after the 1 ms poll timeout\n",
-                                         take(fenceWakesSent), take(reapsAfterFence), take(reapsAfterFenceEmpty), take(reapsAfterTimeout));
-}
-
-std::uint64_t SubmitGroupWork() {
-    static const std::uint64_t value = [] {
-        const char* text = std::getenv("APS5_SUBMIT_GROUP_WORK");
-        return text ? std::strtoull(text, nullptr, 10) : 64ull;
-    }();
-    return value;
-}
-
-std::atomic<std::uint64_t> submitsHeld{0}, heldSubmittedLast{0}, heldSubmittedDue{0}, heldSubmittedWork{0}, heldSubmittedElsewhere{0};
-
-std::chrono::steady_clock::time_point HeldSubmitSince(std::chrono::steady_clock::rep since) {
-    return std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(since));
-}
-
-constexpr std::size_t SubmitCauses = static_cast<std::size_t>(Core::SubmitCause::Count);
-std::array<std::atomic<std::uint64_t>, SubmitCauses> endCauses{}, heldCauses{};
-std::atomic<std::uint64_t> heldLongestNs{0}, heldOverdue{0}, heldCheckedNs{0};
-
-std::uint64_t PolicyNs(std::chrono::steady_clock::time_point time) {
-    const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(time.time_since_epoch()).count();
-    return ns > 0 ? static_cast<std::uint64_t>(ns) : 1u;
-}
-
-Core::SubmitState PolicyState(std::chrono::steady_clock::time_point now, bool held, std::chrono::steady_clock::rep heldSince, std::size_t queued) {
-    Core::SubmitState state;
-    state.now = PolicyNs(now);
-    if (const auto pending = Graphics::Recorder::PendingLabelSince(); pending.has_value()) state.oldestLabel = PolicyNs(*pending);
-    if (held) state.heldSince = PolicyNs(HeldSubmitSince(heldSince));
-    state.work = static_cast<std::uint32_t>(std::min<std::uint64_t>(Graphics::Recorder::RecordedWorkSinceSubmit(), std::numeric_limits<std::uint32_t>::max()));
-    state.queued = static_cast<std::uint32_t>(std::min<std::size_t>(queued, std::numeric_limits<std::uint32_t>::max()));
-    state.waiter = BlockedReaders().load(std::memory_order_acquire) != 0;
-    return state;
-}
-
-void AddGpuState(Core::SubmitState& state, const std::shared_ptr<VulkanDevice>& localDevice) {
-    if (!SubmitEarly() || localDevice == nullptr || VulkanDevice::OpenGpuLoadHint() < SubmitEarlyLoad()) return;
-    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
-    std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    state.gpuLoad = localDevice->OpenGpuLoad();
-    state.gpuIdle = state.gpuLoad >= SubmitEarlyLoad() && localDevice->GpuIdle();
-}
-
-Core::SubmitLimits PolicyLimits(std::chrono::microseconds deadline, std::uint64_t cap) {
-    Core::SubmitLimits limits;
-    if (SubmitEarly()) limits.idleLoad = SubmitEarlyLoad();
-    limits.deadline = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(deadline).count());
-    limits.groupWork = static_cast<std::uint32_t>(std::min<std::uint64_t>(SubmitGroupWork(), std::numeric_limits<std::uint32_t>::max()));
-    limits.workCap = static_cast<std::uint32_t>(std::min<std::uint64_t>(cap, std::numeric_limits<std::uint32_t>::max()));
-    return limits;
-}
-
-void ReportOffDraw(std::chrono::steady_clock::time_point now) {
-    static const bool reported = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr || VerifyCoreOffDraw();
-    if (!reported) return;
-    static std::chrono::steady_clock::time_point last = now;
-    if (now - last < std::chrono::seconds(10)) return;
-    last = now;
-    static std::array<std::uint64_t, SubmitCauses> reportedEnds{}, reportedHeld{};
-    static VulkanDevice::OffDrawCount reportedCounts{};
-    static std::uint64_t reportedOverdue = 0;
-    std::string ends;
-    std::string held;
-    for (std::size_t i = 0; i < SubmitCauses; ++i) {
-        const auto name = Core::SubmitCauseName(static_cast<Core::SubmitCause>(i));
-        const auto end = endCauses[i].load(std::memory_order_relaxed);
-        const auto later = heldCauses[i].load(std::memory_order_relaxed);
-        if (end != reportedEnds[i]) ends += " " + std::string(name) + " " + std::to_string(end - reportedEnds[i]);
-        if (later != reportedHeld[i]) held += " " + std::string(name) + " " + std::to_string(later - reportedHeld[i]);
-        reportedEnds[i] = end;
-        reportedHeld[i] = later;
-    }
-    const auto counts = VulkanDevice::OffDrawCounts();
-    const auto overdue = heldOverdue.load(std::memory_order_relaxed);
-    const auto since = [](std::uint64_t current, std::uint64_t before) { return static_cast<unsigned long long>(current - before); };
-    AgcDriver::ProfilePrint_nid_no_patch("[core-off-draw] (10 s): submission ends by cause:%s; held batches submitted by cause:%s; longest hold %.1f us, %llu kept by a check past the deadline; labels %llu, %llu first in a block of their batch, %llu repeated, %llu past the table; verify: %llu repeated marks collected, %llu over a CPU write; label reaps skipped %llu, verify: %llu made anyway, %llu retired a batch; %llu batches submitted early to an idle GPU\n",
-                                         ends.empty() ? " none" : ends.c_str(), held.empty() ? " none" : held.c_str(), static_cast<double>(heldLongestNs.exchange(0, std::memory_order_relaxed)) / 1e3, since(overdue, reportedOverdue),
-                                         since(counts.labels, reportedCounts.labels), since(counts.firstMarks, reportedCounts.firstMarks), since(counts.repeatedMarks, reportedCounts.repeatedMarks), since(counts.overflowedMarks, reportedCounts.overflowedMarks),
-                                         since(counts.verifiedMarks, reportedCounts.verifiedMarks), since(counts.marksOverWrites, reportedCounts.marksOverWrites), since(counts.reapsSkipped, reportedCounts.reapsSkipped), since(counts.reapsVerified, reportedCounts.reapsVerified), since(counts.reapsLate, reportedCounts.reapsLate), static_cast<unsigned long long>(EarlySubmits().exchange(0, std::memory_order_relaxed)));
-    reportedCounts = counts;
-    reportedOverdue = overdue;
-}
 
 }
 
@@ -193,65 +79,9 @@ void Driver::deferCompletion(const Submission& submission) {
     }, {});
 }
 
-bool Driver::holdSubmit() {
-    if (!CoreOffDraw() || DrawPipeline::Flat()) return false;
-    const auto now = std::chrono::steady_clock::now();
-    const bool held = heldSubmit.load(std::memory_order_acquire);
-    const auto outstanding = DrawPipeline::Queue0().Outstanding();
-    auto state = PolicyState(now, held, heldSince.load(std::memory_order_acquire), outstanding > 1 ? outstanding - 1 : 0);
-    AddGpuState(state, device.Load());
-    const auto cause = Core::AtSubmissionEnd(state, PolicyLimits(labelFlushDeadline(), batchCap()));
-    endCauses[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
-    ReportOffDraw(now);
-    if (cause != Core::SubmitCause::Held) return false;
-    if (!held) {
-        heldCheckedNs.store(0, std::memory_order_relaxed);
-        heldSince.store(now.time_since_epoch().count(), std::memory_order_release);
-        heldSubmit.store(true, std::memory_order_release);
-    }
-    submitsHeld.fetch_add(1, std::memory_order_relaxed);
-    return true;
-}
-
-void Driver::SubmitHeldWork(bool last) {
-    const bool work = !deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
-    if (!work) {
-        if (heldSubmit.exchange(false, std::memory_order_acq_rel)) heldSubmittedElsewhere.fetch_add(1, std::memory_order_relaxed);
-        return;
-    }
-    const auto now = std::chrono::steady_clock::now();
-    const auto since = HeldSubmitSince(heldSince.load(std::memory_order_acquire));
-    auto state = PolicyState(now, true, heldSince.load(std::memory_order_acquire), last ? 0 : 1);
-    AddGpuState(state, device.Load());
-    const auto cause = Core::AfterOp(state, PolicyLimits(labelFlushDeadline(), batchCap()));
-    const auto heldNs = static_cast<std::uint64_t>(std::max<std::chrono::nanoseconds::rep>(0, std::chrono::duration_cast<std::chrono::nanoseconds>(now - since).count()));
-    const auto deadlineNs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(labelFlushDeadline()).count());
-    if (cause == Core::SubmitCause::Held) {
-        heldCheckedNs.store(heldNs, std::memory_order_relaxed);
-        return;
-    }
-    if (heldCheckedNs.exchange(0, std::memory_order_relaxed) >= deadlineNs) heldOverdue.fetch_add(1, std::memory_order_relaxed);
-    heldCauses[static_cast<std::size_t>(cause)].fetch_add(1, std::memory_order_relaxed);
-    const bool due = cause == Core::SubmitCause::Deadline;
-    const bool full = cause == Core::SubmitCause::Work || cause == Core::SubmitCause::Cap;
-    if (heldNs > heldLongestNs.load(std::memory_order_relaxed)) heldLongestNs.store(heldNs, std::memory_order_relaxed);
-    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
-    std::lock_guard gpuLock(GuestMemory::GpuMutex());
-    const auto localDevice = device.Load();
-    recordDeferredLabels(localDevice.get(), 0);
-    if (localDevice != nullptr) localDevice->SubmitRecorded(true);
-    heldSubmit.store(false, std::memory_order_release);
-    (due ? heldSubmittedDue : full ? heldSubmittedWork : heldSubmittedLast).fetch_add(1, std::memory_order_relaxed);
-}
-
-Driver::SubmitGroupCounts Driver::SubmitGroupCounted() {
-    return SubmitGroupCounts{submitsHeld.load(std::memory_order_relaxed), heldSubmittedLast.load(std::memory_order_relaxed), heldSubmittedDue.load(std::memory_order_relaxed), heldSubmittedWork.load(std::memory_order_relaxed), heldSubmittedElsewhere.load(std::memory_order_relaxed)};
-}
-
-void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress, bool mayHold) {
+void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress) {
     const bool work = !deferredLabels().labels.empty() || Graphics::Recorder::PendingLabelSince().has_value() || Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     if (!work && !progress) return;
-    if (mayHold && work && !progress && holdSubmit()) return;
     ++submissionCosts(0).endSubmits;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::End);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -259,7 +89,6 @@ void Driver::submitOpenWork(const std::shared_ptr<SubmissionProgress>& progress,
     if (work) {
         recordDeferredLabels(localDevice.get(), 0);
         if (localDevice != nullptr) localDevice->SubmitRecorded(true);
-        if (mayHold) heldSubmit.store(false, std::memory_order_release);
     }
     if (progress) progress->Publish(localDevice, localDevice ? localDevice->SubmittedEpoch() : 0);
 }
@@ -297,7 +126,7 @@ void Driver::completeSubmission(std::uint64_t serial, std::uint64_t received, st
         }
     } complete{*this, serial, received, labelWrites};
     if (flipWork != nullptr) finishFlipWork(flipWork, submitFlipWork(0));
-    else submitOpenWork(progress, true);
+    else submitOpenWork(progress);
 }
 
 const std::atomic<std::uint64_t>*& Driver::workerQueued() {
@@ -323,21 +152,9 @@ void Driver::reapCompletionLabels() {
     if (const auto localDevice = device.Load()) localDevice->ReapRecorded();
 }
 
-void Driver::wakeAtFence() {
-    auto* driver = fenceWaker.load(std::memory_order_acquire);
-    if (driver == nullptr) return;
-    fenceWakes.fetch_add(1, std::memory_order_seq_cst);
-    for (int attempt = 0; attempt < 64; ++attempt) {
-        std::unique_lock lock(driver->mutex, std::try_to_lock);
-        if (lock.owns_lock()) break;
-        std::this_thread::yield();
-    }
-    fenceWakesSent.fetch_add(1, std::memory_order_relaxed);
-    driver->changed.notify_all();
-}
-
 void Driver::run(std::uint32_t id) noexcept {
     onWorkerThread() = true;
+    epochQueue() = id;
     char role[32];
     std::snprintf(role, sizeof role, "queue worker 0x%x", id);
     PinWorkerThread(role);
@@ -350,8 +167,6 @@ void Driver::run(std::uint32_t id) noexcept {
     Submission submission;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static const bool idleStore = std::getenv("APS5_NO_IDLE_STORE") == nullptr;
-    bool fenceWakeInstalled = false;
-    std::uint64_t fenceWakesSeen = 0;
     auto& costs = submissionCosts(id);
     try {
         PerformanceTrace::BindThread(role);
@@ -437,30 +252,6 @@ void Driver::run(std::uint32_t id) noexcept {
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
                         continue;
                     }
-                    const bool fenceWake = id == 0 && ReapOnFence();
-                    if (fenceWake != fenceWakeInstalled) {
-                        fenceWakeInstalled = fenceWake;
-                        if (fenceWake) fenceWaker.store(this, std::memory_order_release);
-                        Graphics::Recorder::SetReapWake(fenceWake ? &Driver::wakeAtFence : nullptr);
-                    }
-                    if (fenceWake) {
-                        const auto seen = fenceWakesSeen;
-                        const bool woken = changed.wait_for(lock, std::chrono::milliseconds(1), [&] { return ready() || fenceWakes.load(std::memory_order_seq_cst) != seen; });
-                        if (ready()) break;
-                        fenceWakesSeen = fenceWakes.load(std::memory_order_seq_cst);
-                        lock.unlock();
-                        const auto pendingBefore = Graphics::Recorder::PendingCompletionLabels() + Graphics::Recorder::PendingWriteBackCompletions();
-                        reapCompletionLabels();
-                        if (woken) {
-                            reapsAfterFence.fetch_add(1, std::memory_order_relaxed);
-                            if (Graphics::Recorder::PendingCompletionLabels() + Graphics::Recorder::PendingWriteBackCompletions() >= pendingBefore) reapsAfterFenceEmpty.fetch_add(1, std::memory_order_relaxed);
-                        } else {
-                            reapsAfterTimeout.fetch_add(1, std::memory_order_relaxed);
-                        }
-                        ReportFenceReaps(std::chrono::steady_clock::now());
-                        lock.lock();
-                        continue;
-                    }
                     if (poll(ready)) break;
                     lock.unlock();
                     reapCompletionLabels();
@@ -501,7 +292,8 @@ void Driver::run(std::uint32_t id) noexcept {
                         OrderHold hold{orderHolders};
                         const auto released = [&] { return failure || stopping || orderReleased(id, submission.received); };
                         StallWatch stall(id);
-                        while (!released() && !poll(released)) stall.Check("order behind queue 0 for event", submission.received, &lock);
+                        const auto wake = [&](const auto& done) { return changed.wait_for(lock, std::chrono::microseconds(200), done); };
+                        while (!released() && !wake(released)) stall.Check("order behind queue 0 for event", submission.received, &lock);
                     }
                     rethrowFailure();
                 }

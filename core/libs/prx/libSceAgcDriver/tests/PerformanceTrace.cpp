@@ -11,7 +11,6 @@
 #include <iostream>
 #include <iterator>
 #include <mutex>
-#include <tuple>
 
 namespace {
 
@@ -705,47 +704,6 @@ void BenchSwitch() {
     }
 }
 
-void PresentsOnlySwitch() {
-    using AgcDriver::TracePresentsOnly;
-    using Timers = TracePresentsOnly::Timers;
-    Check(TracePresentsOnly::Parse(nullptr, true, false) == Timers::On, "presents-only summaries were enabled without their switch");
-    Check(TracePresentsOnly::Parse("1", true, false) == Timers::Off, "APS5_TRACE_PRESENTS_ONLY=1 did not turn the timers off");
-    Check(TracePresentsOnly::Parse("alternate", true, false) == Timers::Alternate, "APS5_TRACE_PRESENTS_ONLY=alternate was not accepted");
-    for (std::uint64_t interval = 0; interval < 6; ++interval) {
-        Check(TracePresentsOnly::IntervalTimed(Timers::On, interval), "an interval lost its timers without the switch");
-        Check(!TracePresentsOnly::IntervalTimed(Timers::Off, interval), "an interval kept its timers under APS5_TRACE_PRESENTS_ONLY=1");
-        Check(TracePresentsOnly::IntervalTimed(Timers::Alternate, interval) == (interval % 2 == 0), "alternate intervals did not start timed and then switch every interval");
-    }
-    for (const auto& [text, every, window] : {std::tuple{"1", false, false}, std::tuple{"1", true, true}, std::tuple{"alternate", false, false}, std::tuple{"alternate", true, true}, std::tuple{"0", true, false}, std::tuple{"yes", true, false}, std::tuple{"", true, false}}) {
-        bool rejected = false;
-        try { AgcDriver::TracePresentsOnly::Parse(text, every, window); }
-        catch (const std::invalid_argument&) { rejected = true; }
-        Check(rejected, "a malformed or unsupported APS5_TRACE_PRESENTS_ONLY was accepted");
-    }
-}
-
-void SummaryDraws() {
-    const auto origin = Clock::now();
-    AgcDriver::TraceSummary summary;
-    summary.commit = "abc";
-    summary.environment = {{"APS5_TRACE_PRESENTS_ONLY", "1"}, {"APS5_TRACE_SUMMARY_EVERY", "5"}};
-    summary.window = "summary_every 5";
-    summary.draws = 2100;
-    const std::vector<TraceThread::Snapshot> threads{{"queue worker 0x0", {}, {}, false}};
-    const std::vector<Clock::time_point> presents{origin, origin + milliseconds(16), origin + milliseconds(40)};
-    const auto line = TraceFormat::Summary(summary, threads, presents);
-    Check(line.find("\"presents\":2,\"draws\":2100,\"frame_ms\":") != std::string::npos, "the summary line did not carry its draw count after the presents");
-    Check(line.find("\"phase_totals_ms\":{}") != std::string::npos && line.find("\"worker_busy_pct\":{\"queue worker 0x0\":0.000}") != std::string::npos, "a presents-only summary reported timer phases");
-    summary.timers = false;
-    Check(TraceFormat::Summary(summary, threads, presents).find("\"presents\":2,\"draws\":2100,\"timers\":false,\"frame_ms\":") != std::string::npos, "an untimed interval did not say so after its draw count");
-    summary.timers = true;
-    Check(TraceFormat::Summary(summary, threads, presents).find("\"draws\":2100,\"timers\":true,") != std::string::npos, "a timed interval did not say so");
-    summary.draws.reset();
-    summary.timers.reset();
-    const auto plain = TraceFormat::Summary(summary, threads, presents);
-    Check(plain.find("\"draws\"") == std::string::npos && plain.find("\"timers\"") == std::string::npos, "a summary without a draw count or timer state printed one");
-}
-
 void CaptureOwnsSnapshots() {
     auto capture = std::make_shared<AgcDriver::TraceCapture>();
     const auto origin = Clock::now();
@@ -914,8 +872,6 @@ int main() {
         BenchWriterKeepsNewest();
         BenchWriterStopWrites();
         BenchSwitch();
-        PresentsOnlySwitch();
-        SummaryDraws();
         CaptureOwnsSnapshots();
         CaptureWriterDrainAndFailure();
         GzipFile();

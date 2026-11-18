@@ -98,6 +98,16 @@ void KytyFrequencyFeedsTheRate() {
     Require(Refusal([] { VblankHzFromEnvironment("1000", "240"); }).find("ANYPS5_VBLANK_HZ") != std::string::npos, "an ANYPS5_VBLANK_HZ out of range was not refused when KYTY_VBLANK_FREQUENCY is set");
 }
 
+void ParsesUnpacedFlips() {
+    using VideoOutVblank::ParseUnpacedFlips;
+    Require(ParseUnpacedFlips("1"), "APS5_UNPACED_FLIPS=1 leaves the flips paced");
+    for (const char* text : {static_cast<const char*>(nullptr), "", "0"}) Require(!ParseUnpacedFlips(text), "an unset, empty or 0 APS5_UNPACED_FLIPS unpaces the flips");
+    for (const char* text : {"2", "true", "yes", "on", "01", " 1", "1 ", "-1", "1.0"}) {
+        const auto message = Refusal([&] { ParseUnpacedFlips(text); });
+        Require(message.find("APS5_UNPACED_FLIPS") != std::string::npos && message.find(std::string("'") + text + "'") != std::string::npos, "an APS5_UNPACED_FLIPS other than 1, 0 or empty was not refused with the variable's name and value");
+    }
+}
+
 }
 
 int main() {
@@ -105,6 +115,7 @@ int main() {
     ConfiguredRateDrivesBothOutputs();
     ParsesTheRate();
     KytyFrequencyFeedsTheRate();
+    ParsesUnpacedFlips();
     std::puts("vblank schedule tests passed");
     return 0;
 }

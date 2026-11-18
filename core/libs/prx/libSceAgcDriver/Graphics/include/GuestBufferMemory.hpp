@@ -112,8 +112,6 @@ struct HostImportCounts {
     std::uint64_t growing = 0;
     std::uint64_t budgetChecks = 0;
     std::uint64_t retiredPinnedBytes = 0;
-    std::uint64_t mapDeferred = 0;
-    std::uint64_t mapDeferredBytes = 0;
 };
 
 const char* ImportRequesterName(ImportRequester requester);
@@ -136,6 +134,8 @@ void SetHostImportWindow(std::uint64_t bytes);
 void SetHostImportRangeWindow(std::uint64_t bytes);
 void SetHostImportBudget(std::uint64_t bytes);
 std::uint64_t HostImportBudgetFor(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported, std::uint64_t configured, std::uint64_t liveBytes);
+bool HostImportsInHeapUsage(VkDriverId driver);
+VkPhysicalDeviceMemoryBudgetPropertiesEXT UsageWithoutHostImports(const VkPhysicalDeviceMemoryProperties& memory, VkPhysicalDeviceMemoryBudgetPropertiesEXT reported, std::uint64_t liveBytes, bool importsInUsage);
 std::uint64_t HostImportBudgetWith(std::uint64_t configured, bool set, std::uint64_t reported, bool allocationFailed, std::uint64_t ceiling);
 void SetAddressCopyLimit(std::uint64_t bytes);
 void SetHostImportDeferredSettles(bool enabled);
@@ -161,7 +161,6 @@ HostImportSettleCounts HostImportSettles();
 // Tests: how many imports settleImport has used on the settle queue.
 std::uint64_t HostImportsSettled();
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
-bool LazyMapImports();
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
 // made outside the device lock (a sampled texture's path, a dispatch's pre-sync); the path taken
@@ -184,8 +183,6 @@ std::uint64_t RegisteredReadableEnd(std::uint64_t address);
 // A persistent device copy of one registered range of the main guest image (which cannot be host
 // imported); see GuestBufferMemory.cpp.
 struct ImageMirror;
-struct InputTwin;
-struct ResidentShadow;
 class Recorder;
 
 template<typename TRange>
@@ -218,87 +215,15 @@ struct HostImportsProof {
 };
 // Whether the table still matches `proof` (one lock); false for an empty or stale proof.
 bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof);
+bool TouchHostImportsIfUnchanged(const Context& context, const HostImportsProof& proof, std::span<const HostImport* const> imports);
 bool HostImportsReconciledUnchanged(const Context& context, const HostImportsProof& proof);
 // The table's identity when it is reconciled with the live registry (one lock), else empty.
 HostImportsProof HostImportsIdentity(const Context& context);
+std::uint64_t RetiredImportSerial();
 void SetDeviceLocalFullForTests(bool full);
-bool DeviceLocalFullForTests();
 std::uint64_t StagingShadowsRefused();
-std::uint64_t StagingShadowLimit();
-std::uint64_t LiveStagingShadowBytes();
-std::uint64_t SharedStagingShadowHits();
-enum class InputTwinMiss : std::uint8_t { PendingWrite, Label, Untracked, Volatile, Budget, Allocation, Import, Count };
-inline constexpr std::size_t InputTwinMisses = static_cast<std::size_t>(InputTwinMiss::Count);
-struct InputTwinCounts {
-    std::uint64_t made = 0;
-    std::uint64_t shared = 0;
-    std::uint64_t copies = 0;
-    std::uint64_t copiedBytes = 0;
-    std::uint64_t refreshes = 0;
-    std::uint64_t reuses = 0;
-    std::uint64_t outdated = 0;
-    std::uint64_t demoted = 0;
-    std::uint64_t memoised = 0;
-    std::uint64_t checked = 0;
-    std::uint64_t verified = 0;
-    std::uint64_t differing = 0;
-    std::uint64_t residentBytes = 0;
-    std::uint64_t limitBytes = 0;
-    std::array<std::uint64_t, InputTwinMisses> missed{};
-};
-InputTwinCounts InputTwinCounters();
-const char* InputTwinMissName(InputTwinMiss miss);
-bool InputTwinsEnabled(const Context& context);
-std::uint64_t InputTwinLimit();
-void SetInputTwinLimitForTests(std::uint64_t bytes);
-void OutdateInputTwins(VkDevice device, std::uint64_t begin, std::uint64_t end);
-void OutdateInputTwins(VkDevice device);
-void OutdateStoredInputTwins(std::uint64_t address, std::size_t bytes);
-std::uint64_t ReleaseInputTwins(std::uint64_t bytes);
-void ClearInputTwins(VkDevice device);
-void ReportInputTwins();
-struct ResidentStagingCounts {
-    std::uint64_t made = 0;
-    std::uint64_t shared = 0;
-    std::uint64_t skipped = 0;
-    std::uint64_t skippedBytes = 0;
-    std::uint64_t partial = 0;
-    std::uint64_t partialBytes = 0;
-    std::uint64_t partialSavedBytes = 0;
-    std::uint64_t full = 0;
-    std::uint64_t fullBytes = 0;
-    std::uint64_t fresh = 0;
-    std::uint64_t stale = 0;
-    std::uint64_t moved = 0;
-    std::uint64_t rewritten = 0;
-    std::uint64_t unsealed = 0;
-    std::uint64_t untracked = 0;
-    std::uint64_t blocked = 0;
-    std::uint64_t sealed = 0;
-    std::uint64_t outdated = 0;
-    std::uint64_t verified = 0;
-    std::uint64_t differing = 0;
-    std::uint64_t live = 0;
-    std::uint64_t shadowFed = 0;
-    std::uint64_t shadowFedBytes = 0;
-    std::uint64_t shadowReturned = 0;
-    std::uint64_t shadowReturnedBytes = 0;
-};
-ResidentStagingCounts ResidentStagingCounters();
-enum class ResidentCopyIn : std::uint8_t { Whole, Limited, Skipped };
-struct ResidentShadowState {
-    bool current = false;
-    bool blocked = false;
-    bool sameSource = false;
-    bool sameRegistry = false;
-    std::uint64_t generation = 0;
-};
-bool ResidentShadowKept(const ResidentShadowState& state);
-ResidentCopyIn ResidentCopyInFor(const ResidentShadowState& state, bool tracked, std::span<const std::pair<std::uint64_t, std::uint64_t>> written, std::uint64_t begin, std::uint64_t end);
-bool ResidentStagingDefault(const char* disabled);
-bool ResidentStagingEnabled();
-void SetResidentStagingForTests(bool enabled, bool verified);
-bool StagedFlushCovers(std::uint64_t address, std::size_t bytes);
+std::uint64_t ChangedCopySnapshotBytes();
+std::uint64_t ChangedCopySnapshotsMade();
 
 // Identity of the read-only image mirror serving [address, address + bytes) (the counterpart of
 // HostImportSerial for main-image ranges, which no import serves): a serial unique for the life of
@@ -318,12 +243,15 @@ std::uint64_t ImageMirrorSerial(const Context& context, std::uint64_t address, s
 // when synced, and the waiter targets the newest of them. Under APS5_PROFILE_DRAW CountLeaseOutcome
 // prints the [address-sync] leases line every 10 s from LeaseCounters (cumulative).
 bool SyncLeaseWork();
-void CountLeaseOutcome(bool synced, std::uint64_t batchSerial);
+void CountLeaseOutcome(bool synced, std::uint64_t batchSerial, bool writes);
 void FinishLeaseWork();
+void FinishLeaseWrites();
 bool LeaseWorkPending();
+bool LeaseWritesMayBePending();
 struct LeaseStats {
     std::uint64_t deferred = 0;
     std::uint64_t synced = 0;
+    std::uint64_t writing = 0;
     // Pin-contention waits made by guest threads (the waiter calls), how many of them finished the
     // newest lease batch, how many had to drain the whole recorder instead (no lease batch noted),
     // how many only dropped the cached address space (no GPU wait, see AddressSpaceStats), and
@@ -446,15 +374,6 @@ public:
     // calls RecordCopyBacks (a dispatch or a recorded draw), since a staged region's results reach
     // guest memory by that copy alone. Call before Upload.
     void AllowDeviceStaging() { stagingAllowed = true; }
-    void AllowCopyBackDeferral() { copyBackDeferral = true; }
-    void AllowKeptCopyBacks() { keptCopyBacks = true; }
-    void AllowInputTwins() { inputTwinsAllowed = true; }
-    void InputTwinBuffers(std::vector<std::pair<const void*, std::uint64_t>>& twins) const;
-    bool InputTwinProof(std::vector<std::uint64_t>& proof) const;
-    bool InputTwinProofHolds(std::span<const std::uint64_t> proof) const;
-    bool CopyBackReach(std::vector<std::pair<std::uint64_t, std::uint64_t>>& touched) const;
-    void KeepCopiedBytes(Recorder& recorder, const void* owner) const;
-    std::uint64_t HandoverToken() const { return handoverToken; }
     void DisallowAddressStaging() { addressStaging = false; }
     void AllowAdjustedRegions() { adjustedRegions = true; }
     bool HoldsMirror(const std::shared_ptr<ImageMirror>& mirror) const;
@@ -467,8 +386,6 @@ public:
     // RecordCopyBacks copies it back again. Nothing to do without staged regions.
     void RecordStagingCopies(Recorder& recorder);
     bool StagingDecisionsCurrent() const;
-    std::uint64_t StagedBytes() const;
-    void StagedShadows(std::vector<std::pair<const void*, std::uint64_t>>& shadows) const;
     void AddSnapshot(const GuestMemorySnapshot& snapshot);
     // Upload is the two stages below back to back. UploadPrepare needs no device lock: it merges the
     // regions, binds the image mirrors and host imports that already serve them (an import pointer is
@@ -516,7 +433,7 @@ public:
     // never calls it (a synchronous draw) stores the staging bytes from the CPU in WriteBack.
     void RecordCopyBacks(Recorder& recorder);
     bool HasGpuCopies() const {
-        for (const auto& region : regions) if (region.gpuCopy && region.twin == nullptr) return true;
+        for (const auto& region : regions) if (region.gpuCopy) return true;
         return false;
     }
     void RunAccesses(std::vector<std::array<std::uint64_t, 3>>& out) const;
@@ -525,38 +442,12 @@ public:
         return false;
     }
     bool HasStagedCopies() const {
-        for (const auto& region : regions) if (region.gpuCopy && region.deviceLocal && region.twin == nullptr) return true;
+        for (const auto& region : regions) if (region.gpuCopy && region.deviceLocal) return true;
         return false;
     }
-    void AppendTwinRanges(std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges) const {
-        for (const auto& region : regions) if (region.twin != nullptr && region.end > region.begin) ranges.emplace_back(region.begin, region.end);
-    }
     void MarkStagedWrites() const;
-    class OwnWriteScope {
-    public:
-        explicit OwnWriteScope(const GuestBufferMemory& memory);
-        ~OwnWriteScope();
-        OwnWriteScope(const OwnWriteScope&) = delete;
-        OwnWriteScope& operator=(const OwnWriteScope&) = delete;
-        static bool Exempts(const ResidentShadow* shadow, std::uint64_t begin, std::uint64_t end);
-
-    private:
-        std::vector<const ResidentShadow*> shadows;
-        const std::vector<std::pair<std::uint64_t, std::uint64_t>>* writes = nullptr;
-        const OwnWriteScope* previous = nullptr;
-        bool entered = false;
-    };
-    class StagedFlushScope {
-    public:
-        explicit StagedFlushScope(const GuestBufferMemory& memory);
-        ~StagedFlushScope();
-        StagedFlushScope(const StagedFlushScope&) = delete;
-        StagedFlushScope& operator=(const StagedFlushScope&) = delete;
-        static bool Covers(std::uint64_t address, std::size_t bytes);
-
-    private:
-        const GuestBufferMemory* previous = nullptr;
-    };
+    void NoteCarriedShadows(const Recorder& recorder) const;
+    static std::uint64_t CarriedShadowCopies();
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
@@ -570,7 +461,7 @@ public:
     SnapshotService SnapshotsServedInPlace(std::span<const GuestMemorySnapshot> snapshots) const;
     std::size_t CopiedBytes() const {
         std::size_t bytes = 0;
-        for (const auto& region : regions) if (region.buffer != nullptr && region.twin == nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
+        for (const auto& region : regions) if (region.buffer != nullptr) bytes += static_cast<std::size_t>((region.bufferEnd != 0 ? region.bufferEnd : region.end) - region.begin);
         return bytes;
     }
     // Every uploaded region as [begin, end) when all of them are served by host imports, in place or
@@ -644,10 +535,7 @@ private:
         VkDeviceAddress copySourceAddress = 0;
         bool copiedBack = false;
         std::shared_ptr<Buffer> shadowCopy;
-        bool sharedShadow = false;
-        std::shared_ptr<InputTwin> twin;
-        std::uint64_t twinChecked = 0;
-        bool untwinned = false;
+        std::weak_ptr<Buffer> releasedShadowCopy;
         // An element the shader updates atomically lies inside (AddWritable's `atomic`).
         bool atomic = false;
         bool swept = false;
@@ -660,10 +548,6 @@ private:
         bool unstaged = false;
         bool overlay = false;
         bool adaptiveInPlace = false;
-        std::shared_ptr<ResidentShadow> resident;
-        std::uint64_t residentSerial = 0;
-        bool shadowStamped = false;
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> importReturned {};
     };
 
     // How [begin, end) lies against the space's base regions.
@@ -718,28 +602,10 @@ private:
     // Records the import-to-buffer copies of the given gpuCopy regions into the open batch, with
     // the barriers that order them after earlier recorded writes and before the shaders reading them.
     void recordGpuCopies(std::span<Region* const> copies, bool addressable);
-    bool defersCopyBacks() const;
-    bool sharesShadows() const;
-    bool twinWanted(const Region& region, bool addressable) const;
-    bool twinRetry(const Region& region) const;
-    bool takeTwin(Region& region, VkBufferUsageFlags usage, bool allocate) const;
-    void dropTwin(Region& region) const;
-    bool twinCurrent(const Region& region) const;
-    void recordTwinCopies(std::span<Region* const> twins, Recorder& recorder);
-    std::shared_ptr<Buffer> stagingShadow(Region& region, VkBufferUsageFlags usage) const;
-    static bool usesResident(const Region& region);
-    static void sealResident(Region& region);
-    const HostImport* stagingImport(const Region& region) const;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> returnToShadow(Recorder& recorder, Region& region, std::vector<std::pair<std::uint64_t, std::uint64_t>> written) const;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> writtenWithin(std::uint64_t begin, std::uint64_t end) const;
     void takeHeapReferences();
     void releaseHeapReferences() noexcept;
     Context context;
     bool stagingAllowed = false;
-    bool copyBackDeferral = false;
-    bool keptCopyBacks = false;
-    bool inputTwinsAllowed = false;
-    std::uint64_t handoverToken = 0;
     bool addressStaging = true;
     bool adjustedRegions = false;
     GuestAllocations::Lease lease;

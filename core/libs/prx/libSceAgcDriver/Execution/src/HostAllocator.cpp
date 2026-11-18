@@ -22,7 +22,6 @@ constexpr std::uint16_t Depth(std::size_t sizeClass) {
 struct Cache {
     void* heads[Classes];
     std::uint16_t counts[Classes];
-    std::uint64_t allocations;
 };
 
 constexpr std::uint16_t KeptLists = 8;
@@ -147,11 +146,9 @@ Cache* CurrentCache() noexcept {
 
 void* TryAllocate(std::size_t bytes) noexcept {
     if (bytes == 0) bytes = 1;
-    auto* cache = CurrentCache();
-    if (cache != nullptr) ++cache->allocations;
     if (bytes <= LargestCached) {
         const auto sizeClass = (bytes - 1) / Granule;
-        if (cache != nullptr) {
+        if (auto* cache = CurrentCache()) {
             if (cache->heads[sizeClass] == nullptr) {
                 if (void* list = TakeList(sizeClass)) {
                     cache->heads[sizeClass] = list;
@@ -223,36 +220,5 @@ void operator delete(void* block, std::size_t bytes) noexcept { Release(block, b
 void operator delete[](void* block, std::size_t bytes) noexcept { Release(block, bytes); }
 void operator delete(void* block, const std::nothrow_t&) noexcept { Release(block); }
 void operator delete[](void* block, const std::nothrow_t&) noexcept { Release(block); }
-
-namespace AgcDriver {
-
-bool HostAllocationsCounted() noexcept {
-    return true;
-}
-
-std::uint64_t HostAllocationsOnThread() noexcept {
-    const auto slot = tlsSlot.load(std::memory_order_acquire);
-    if (slot >= Failed) return 0;
-    const auto* cache = SlotValue(slot);
-    return cache != nullptr && cache != Closed ? cache->allocations : 0;
-}
-
-}
-
-#else
-
-#include <cstdint>
-
-namespace AgcDriver {
-
-bool HostAllocationsCounted() noexcept {
-    return false;
-}
-
-std::uint64_t HostAllocationsOnThread() noexcept {
-    return 0;
-}
-
-}
 
 #endif

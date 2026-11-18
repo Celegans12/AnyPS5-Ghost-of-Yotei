@@ -128,7 +128,6 @@ struct OverlayRect {
 
 enum class OverlayColor : std::uint32_t { Background = 0, Text = 1, Graph = 2, Panel = 3, Key = 4, Accent = 5, Field = 6 };
 inline constexpr std::size_t OverlayColorCount = 7;
-inline constexpr std::array<std::array<float, 4>, OverlayColorCount> OverlayBasePalette{{{0.0f, 0.0f, 0.0f, 0.6f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.35f, 0.8f, 0.35f, 1.0f}, {0.06f, 0.07f, 0.09f, 0.94f}, {0.22f, 0.24f, 0.29f, 1.0f}, {1.0f, 0.78f, 0.2f, 1.0f}, {0.0f, 0.0f, 0.0f, 1.0f}}};
 
 struct OverlayMetrics {
     static constexpr std::int32_t GlyphWidth = 5;
@@ -207,7 +206,6 @@ struct OverlayDetailSample {
     std::string title;
     std::string presentMode;
     std::optional<double> fpsLimit;
-    bool unpacedFlips = false;
 };
 
 struct OverlayHits {
@@ -225,7 +223,6 @@ struct OverlayPresentInfo {
     VkPresentModeKHR presentMode = VK_PRESENT_MODE_MAX_ENUM_KHR;
     std::uint64_t acquireDrops = 0;
     double fpsLimit = 0.0;
-    bool unpacedFlips = false;
 };
 
 struct OverlayTraceFigures {
@@ -267,6 +264,7 @@ std::int32_t OverlayScale(VkExtent2D extent, const OverlayContent& content, std:
 std::int32_t OverlayScaleRequest(const char* value);
 OverlayLayout LayOutOverlay(const OverlayContent& content, VkExtent2D extent, OverlayCorner corner);
 std::array<std::array<float, 4>, OverlayColorCount> OverlayPalette(VkFormat format, VkColorSpaceKHR colorSpace);
+std::array<std::array<float, 4>, OverlayColorCount> ColorblindOverlayPalette(std::array<std::array<float, 4>, OverlayColorCount> palette);
 
 class PerformanceOverlay {
 public:

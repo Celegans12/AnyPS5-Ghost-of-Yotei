@@ -14,7 +14,6 @@ struct RegisterStateKeyParts {
 
 std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords = false, bool incremental = true, std::uint64_t* shapeKey = nullptr, RegisterStateKeyParts* parts = nullptr);
 std::uint64_t DrawShaderSetKey(const QueueState& queue, const ShaderRegistry& registry);
-bool InstallCoreKeyRegisters();
 
 }
 

@@ -54,10 +54,6 @@ inline const void* CurrentThreadToken() noexcept {
     const void* block;
     __asm__("movq %%gs:0x30, %0" : "=r"(block));
     return block;
-#elif defined(__linux__) && defined(__x86_64__) && defined(__GNUC__)
-    const void* block;
-    __asm__("movq %%fs:0, %0" : "=r"(block));
-    return block;
 #else
     thread_local char token;
     return &token;

@@ -20,40 +20,6 @@
 
 namespace AgcDriver::DriverDetail {
 
-std::atomic<std::uint32_t>& BlockedReaders() {
-    static std::atomic<std::uint32_t> readers{0};
-    return readers;
-}
-
-bool CoreOffDraw() {
-    static const bool enabled = std::getenv("APS5_NO_CORE_OFF_DRAW") == nullptr;
-    return enabled;
-}
-
-bool VerifyCoreOffDraw() {
-    static const bool enabled = std::getenv("APS5_VERIFY_CORE_OFF_DRAW") != nullptr;
-    return enabled;
-}
-
-bool SubmitEarly() {
-    static const bool enabled = std::getenv("APS5_NO_SUBMIT_EARLY") == nullptr;
-    return enabled;
-}
-
-std::uint64_t SubmitEarlyLoad() {
-    static const std::uint64_t value = [] {
-        const char* text = std::getenv("APS5_SUBMIT_EARLY_LOAD");
-        const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
-        return parsed != 0 ? parsed : 1048576ull;
-    }();
-    return value;
-}
-
-std::atomic<std::uint64_t>& EarlySubmits() {
-    static std::atomic<std::uint64_t> submits{0};
-    return submits;
-}
-
 void PollSleep() {
 #ifdef _WIN32
     thread_local HANDLE timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
@@ -170,14 +136,24 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     bool warned = false;
 
     struct EpochPoint {
+        Driver* driver;
+        std::uint32_t queue;
         std::uint64_t address;
         std::size_t bytes;
+        std::span<const std::uint32_t> packet;
+        std::uint64_t received;
+        bool inherit = true;
         bool bump = true;
-        bool memory = false;
+        std::uint64_t since = 0;
         ~EpochPoint() {
-            if (bump) bumpWaitEpoch(address, bytes, memory);
+            if (bump && since == 0 && inherit) since = driver->storeOrderingSince(packet, address, bytes, received, queue);
+            if (bump) bumpWaitEpoch(address, bytes, since);
         }
-    } epochPoint{awaited, awaitedBytes};
+    } epochPoint{this, queue, awaited, awaitedBytes, packet, received, !requireMemory};
+    const auto orderedBy = [&](std::uint32_t writer) {
+        if (writer == queue) epochPoint.bump = false;
+        else epochPoint.since = storeOrderingSince(packet, awaited, awaitedBytes, received, queue);
+    };
     bool ownStoreUnlanded = false;
     const auto memorySatisfied = [&] {
         ownStoreUnlanded = false;
@@ -186,23 +162,25 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         ownStoreUnlanded = true;
         return false;
     };
-    const auto storedByOwnLabel = [&] {
+    const auto orderByStore = [&] {
         std::uint32_t writer = queue;
-        return !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer) && writer == queue;
+        if (!requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer)) orderedBy(writer);
     };
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (traceGpu) std::fprintf(stderr, "[gpu] %.1f queue 0x%x waits 0x%llx == 0x%x (now 0x%x)\n", TraceMs(), queue, static_cast<unsigned long long>(awaited), packet[4],
                                *reinterpret_cast<const volatile std::uint32_t*>(awaited));
     if (memorySatisfied()) {
         ++outcomes.atEntry;
-        epochPoint.memory = true;
-        if (storedByOwnLabel()) epochPoint.bump = false;
+        orderByStore();
         return;
     }
-    if (heldAtSubmit) return;
+    if (heldAtSubmit) {
+        epochPoint.inherit = false;
+        return;
+    }
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer)) {
         if (writer != queue) notePendingWait(packet, queue, received);
-        else epochPoint.bump = false;
+        orderedBy(writer);
         return;
     }
 
@@ -229,6 +207,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             return false;
         }
         if (hit->late) {
+            epochPoint.inherit = false;
             if (hit->generation == refusedGeneration) return false;
             if (!GuestMemory::UnchangedSinceCollected(awaited, awaitedBytes, hit->generation)) {
                 ++outcomes.lateRefusedCpuStore;
@@ -246,6 +225,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             if (!hit->late) epochPoint.bump = false;
         } else {
             notePendingWait(packet, queue, received);
+            if (!hit->late) epochPoint.since = storeOrderingSince(packet, awaited, awaitedBytes, received, queue);
         }
         return true;
     };
@@ -386,13 +366,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     struct BlockedWait {
         Driver& driver;
         std::uint32_t queue;
-        BlockedWait(Driver& driver, std::uint32_t queue) : driver(driver), queue(queue) { BlockedReaders().fetch_add(1, std::memory_order_acq_rel); }
-        ~BlockedWait() {
-            BlockedReaders().fetch_sub(1, std::memory_order_acq_rel);
-            driver.noteWaitBlocked(queue, 0, false);
-        }
-        BlockedWait(const BlockedWait&) = delete;
-        BlockedWait& operator=(const BlockedWait&) = delete;
+        ~BlockedWait() { driver.noteWaitBlocked(queue, 0, false); }
     } blocked{*this, queue};
     static const bool pauseSpin = std::getenv("APS5_NO_PAUSE_SPIN") == nullptr;
     static const bool storeHeldResults = std::getenv("APS5_NO_QUEUED_DRAW_READ_ORDER") == nullptr;
@@ -406,7 +380,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     while (!memorySatisfied()) {
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, queue, &writer)) {
             if (writer != queue) notePendingWait(packet, queue, received);
-            else epochPoint.bump = false;
+            orderedBy(writer);
             return;
         }
         ++polls;
@@ -483,8 +457,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
     }
     ++outcomes.polled;
-    epochPoint.memory = true;
-    if (storedByOwnLabel()) epochPoint.bump = false;
+    orderByStore();
 }
 
 }

@@ -4,21 +4,17 @@
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawSites.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
-#include "prx/libSceAgcDriver/Core/include/Front.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/DrawWriteRanges.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
-#include "prx/libSceAgcDriver/Execution/include/RecycledBlocks.hpp"
 #include <atomic>
 #include <array>
 #include <algorithm>
@@ -34,13 +30,11 @@
 #include <unordered_map>
 #include <atomic>
 #include <exception>
-#include <functional>
 #include <mutex>
 #include <set>
 #include <string>
 #include <string_view>
 #include <typeinfo>
-#include <utility>
 
 namespace AgcDriver::DriverDetail {
 
@@ -121,11 +115,6 @@ const char* DrawVerdictName(DrawVerdict verdict) {
     return "Unknown";
 }
 
-bool TraceDrawPrograms() {
-    static const bool enabled = std::getenv("APS5_TRACE_DRAW_PROGRAMS") != nullptr;
-    return enabled;
-}
-
 std::string_view TrimmedReason(std::string_view reason) {
     if (reason.size() > 200) reason = reason.substr(0, 200);
     return reason;
@@ -143,6 +132,7 @@ struct DrawTail {
     DrawPhaseTiming phaseTiming{false, phaseMs, phaseLap};
     Pm4::DrawParameters drawParameters{};
     Pm4::DrawParameters resolvedParameters{};
+    std::vector<DrawUserPatch> userPatches;
     bool pipelined = false;
     bool traceIndirect = false;
     std::uint64_t dumpTarget = 0;
@@ -150,15 +140,10 @@ struct DrawTail {
     std::shared_ptr<VulkanDevice> localDevice;
     bool registerKey = false;
     std::uint64_t drawKey = 0;
-    DrawRelocationPending relocationPending;
     std::shared_ptr<DrawEntry> entry;
     std::shared_ptr<const DrawDecode> decode;
     std::shared_ptr<const DrawDecode> relocatedDecode;
     std::shared_ptr<DrawEntry> dataEntry;
-    std::vector<std::pair<std::uint64_t, std::shared_ptr<DrawEntry>>> dataEntries;
-    std::vector<DrawShapeMiss> shapeMisses;
-    std::vector<DrawShapeWord> shapeWords;
-    std::vector<bool> vertexDecoded;
     std::uint64_t shapeKey = 0;
     ShaderRecompiler::ShaderPixelStageInfo pixel{};
     std::vector<DrawProgram> writablePrograms;
@@ -186,7 +171,6 @@ struct DrawTail {
     bool stageEntries = false;
     bool patchedStages = false;
     const Submission* submission = nullptr;
-    Submission handed;
     std::uint32_t submissionQueue = 0;
     std::uint64_t submissionSerial = 0;
     std::size_t packetOffset = 0;
@@ -199,13 +183,6 @@ struct DrawTail {
     std::uint64_t traceToken = 0;
     VulkanDevice::DrawTraceContext trace{};
     std::string ownRejected;
-    DrawSiteOutcome site;
-    Core::FrontOutcome core;
-    std::vector<DrawUserPatch> userPatches;
-    std::uint64_t drawIdentity = 0;
-    std::uint64_t drawAlias = 0;
-    bool resolveLater = false;
-    std::shared_ptr<DrawTail> lookupShadow;
     GpuLock* gpuLock = nullptr;
     GpuLock ownLock{GuestMemory::GpuMutex(), std::defer_lock};
 };
@@ -265,6 +242,21 @@ std::optional<HeldReason> writesBeyondTargets(const ShaderRecompiler::RecompileR
     return std::nullopt;
 }
 
+bool DrawTableSnapshotEnabled() {
+    return Graphics::RuntimeSwitches::Set(Graphics::RuntimeSwitch::TableSnapshot);
+}
+
+void KeepUserDataTables(ShaderMemory& memory, const std::vector<DrawProgram>& programs) {
+    for (const auto& program : programs) {
+        const std::span<const std::uint32_t> userData = program.userData;
+        for (std::size_t index = 0; index + 1u < userData.size(); ++index) {
+            if (userData[index + 1u] > 0xffffu) continue;
+            const auto address = static_cast<std::uint64_t>(userData[index]) | (static_cast<std::uint64_t>(userData[index + 1u]) << 32u);
+            if (address != 0) static_cast<void>(memory.KeepTable(address));
+        }
+    }
+}
+
 DrawFinisher::Pending heldWrites(const DrawTail& tail) {
     DrawFinisher::Pending held;
     held.key = tail.drawKey;
@@ -290,12 +282,12 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
                 noteHeld(stage == ShaderRecompiler::ShaderStage::Fragment ? HeldReason::NullFragment : stage == ShaderRecompiler::ShaderStage::Vertex ? HeldReason::NullVertex : HeldReason::NullOther);
                 return held;
             }
-            for (const auto& candidate : tail.dataCandidates[i]) {
-                if (candidate.variant == nullptr || candidate.variant->compiled == nullptr) {
+            for (const auto& [candidate, regions] : tail.dataCandidates[i]) {
+                if (candidate == nullptr || candidate->compiled == nullptr) {
                     noteHeld(HeldReason::NullOther);
                     return held;
                 }
-                if (const auto reason = writesBeyondTargets(*candidate.variant->compiled)) {
+                if (const auto reason = writesBeyondTargets(*candidate->compiled)) {
                     noteHeld(*reason);
                     return held;
                 }
@@ -319,136 +311,16 @@ DrawFinisher::Pending heldWrites(const DrawTail& tail) {
     return held;
 }
 
-std::atomic<std::uint64_t> laterLookups{0}, laterLookupsUnknown{0}, laterLookupHits{0}, laterLookupsVerified{0}, laterLookupsDiffering{0};
-std::atomic<std::uint64_t> laterLookupsEver{0}, laterLookupsVerifiedEver{0}, laterLookupsDifferingEver{0};
-
-struct DrawTailBlocks {};
-
-bool RecycledDrawTails() {
-    static const bool enabled = std::getenv("APS5_NO_RECYCLED_DRAW_TAILS") == nullptr;
-    return enabled;
-}
-
-void noteDrawTails() {
-    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!stats) return;
-    static std::atomic<std::int64_t> reportedAt{0};
-    static std::atomic<std::uint64_t> reusedBefore{0}, freshBefore{0}, releasedBefore{0};
-    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
-    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
-    const auto counts = RecycledBlockStore<DrawTailBlocks>::Counted();
-    AgcDriver::ProfilePrint_nid_no_patch("[draw-tails] (10 s): %llu draw jobs built in a recycled block, %llu in a fresh one, %llu blocks released beyond a thread's store\n", static_cast<unsigned long long>(counts.reused - reusedBefore.exchange(counts.reused)), static_cast<unsigned long long>(counts.fresh - freshBefore.exchange(counts.fresh)), static_cast<unsigned long long>(counts.released - releasedBefore.exchange(counts.released)));
-}
-
-bool FinisherLookup() {
-    static const bool enabled = std::getenv("APS5_FINISHER_LOOKUP") != nullptr;
-    return enabled;
-}
-
-bool VerifyFinisherLookup() {
-    static const bool enabled = std::getenv("APS5_VERIFY_FINISHER_LOOKUP") != nullptr;
-    return enabled;
-}
-
-void noteLaterLookup() {
-    static std::atomic<std::int64_t> reportedAt{0};
-    static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    if (!stats) return;
-    const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
-    if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) == tenSeconds) return;
-    AgcDriver::ProfilePrint_nid_no_patch("[finisher-lookup] (10 s): %llu draws looked up on the draw finisher, %llu of them hits, %llu queued without the ranges they write because a program stores to memory; %llu lookups repeated on the finisher (APS5_VERIFY_FINISHER_LOOKUP), %llu differing%s\n", static_cast<unsigned long long>(laterLookups.exchange(0)), static_cast<unsigned long long>(laterLookupHits.exchange(0)), static_cast<unsigned long long>(laterLookupsUnknown.exchange(0)), static_cast<unsigned long long>(laterLookupsVerified.exchange(0)), static_cast<unsigned long long>(laterLookupsDiffering.exchange(0)), DrawFinisher::LookupText().c_str());
-}
-
-DrawFinisher::Pending heldWritesAhead(const DrawTail& tail) {
-    DrawFinisher::Pending held;
-    held.key = tail.drawKey;
-    held.shape = tail.shapeKey;
-    if (tail.decode == nullptr) {
-        noteHeld(HeldReason::NoDecode);
-        return held;
-    }
-    const auto& roles = tail.decode->roles;
-    for (std::size_t i = 0; i < tail.programs->size(); ++i) {
-        if (i < roles.size() && roles[i] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
-        const auto& program = (*tail.programs)[i];
-        if (program.snapshot != nullptr && !ProgramWritesMemory(*program.snapshot, program.codeOffset) && (program.tailContinuation == nullptr || !ProgramWritesMemory(*program.tailContinuation, 0))) continue;
-        laterLookupsUnknown.fetch_add(1, std::memory_order_relaxed);
-        const auto stage = program.binary.stage;
-        noteHeld(stage == ShaderRecompiler::ShaderStage::Fragment ? HeldReason::NullFragment : stage == ShaderRecompiler::ShaderStage::Vertex ? HeldReason::NullVertex : HeldReason::NullOther);
-        return held;
-    }
-    noteHeld(HeldReason::Known);
-    held.writes = DrawWriteRanges(tail.decode->state, {}, ExactDrawWrites());
-    held.unknown = false;
-    return held;
-}
-
-std::shared_ptr<DrawTail> LookupShadow(const DrawTail& tail) {
-    auto shadow = std::make_shared<DrawTail>();
-    shadow->localDevice = tail.localDevice;
-    shadow->registerKey = tail.registerKey;
-    shadow->drawKey = tail.drawKey;
-    shadow->shapeKey = tail.shapeKey;
-    shadow->entry = tail.entry;
-    shadow->decode = tail.decode;
-    shadow->dataEntry = tail.dataEntry;
-    shadow->dataEntries = tail.dataEntries;
-    shadow->pixel = tail.pixel;
-    shadow->writablePrograms = tail.writablePrograms;
-    shadow->programs = tail.programs == &tail.writablePrograms ? &shadow->writablePrograms : tail.programs;
-    shadow->vertexInfos = tail.vertexInfos;
-    shadow->decodeReads = tail.decodeReads;
-    shadow->vertexDecoded = tail.vertexDecoded;
-    shadow->stageCaptures.resize(tail.stageCaptures.size());
-    shadow->matched.resize(tail.matched.size());
-    shadow->matchedRegions.resize(tail.matchedRegions.size());
-    shadow->dataCandidates.resize(tail.dataCandidates.size());
-    shadow->stageData.resize(tail.stageData.size());
-    shadow->shapeMisses = tail.shapeMisses;
-    shadow->shapeWords = tail.shapeWords;
-    shadow->stageEntries = tail.stageEntries;
-    shadow->userPatches = tail.userPatches;
-    shadow->drawIdentity = tail.drawIdentity;
-    shadow->drawAlias = tail.drawAlias;
-    shadow->reg207 = tail.reg207;
-    shadow->packetOffset = tail.packetOffset;
-    return shadow;
-}
-
-bool SameLookup(const DrawTail& first, const DrawTail& second) {
-    if (first.drawHit != second.drawHit || first.matched.size() != second.matched.size() || first.dataCandidates.size() != second.dataCandidates.size() || first.stageData.size() != second.stageData.size()) return false;
-    for (std::size_t i = 0; i < first.matched.size(); ++i) {
-        const auto& a = first.matched[i];
-        const auto& b = second.matched[i];
-        if ((a == nullptr) != (b == nullptr)) return false;
-        if (a != nullptr && (a->runs != b->runs || a->words != b->words)) return false;
-        if (i < first.stageData.size() && ((first.stageData[i].compiled == nullptr) != (second.stageData[i].compiled == nullptr) || first.stageData[i].words != second.stageData[i].words)) return false;
-        if (i >= first.dataCandidates.size()) continue;
-        const auto& kept = first.dataCandidates[i];
-        const auto& again = second.dataCandidates[i];
-        if (kept.size() != again.size()) return false;
-        for (std::size_t rank = 0; rank < kept.size(); ++rank) {
-            if (kept[rank].remembered != again[rank].remembered || kept[rank].key != again[rank].key || kept[rank].kind != again[rank].kind || kept[rank].variant->runs != again[rank].variant->runs || kept[rank].variant->words != again[rank].variant->words) return false;
-        }
-    }
-    return true;
-}
-
 bool EmptyIndirectSkip() {
     static const bool enabled = std::getenv("APS5_NO_EMPTY_INDIRECT_SKIP") == nullptr;
     return enabled;
 }
 
-bool FinisherPrecollect() {
-    static const bool enabled = std::getenv("APS5_NO_FINISHER_PRECOLLECT") == nullptr;
-    return enabled && DrawPipeline::SharedCollectEpoch();
-}
-
-constexpr std::uint64_t FinisherInputPrecollectBytes = 16ull << 20u;
-
-bool FinisherInputPrecollect() {
-    static const bool enabled = std::getenv("APS5_NO_FINISHER_INPUT_PRECOLLECT") == nullptr && !Graphics::BufferCache::DirtyFirst();
-    return enabled && FinisherPrecollect();
+void FinishLeaseWritesBeforeRead() {
+    if (!Graphics::LeaseWritesMayBePending()) return;
+    GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Indirect);
+    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    Graphics::FinishLeaseWrites();
 }
 
 struct CpuIndirectProgramsStorage {};
@@ -457,50 +329,12 @@ std::unordered_map<std::uint64_t, bool>& CpuIndirectPrograms() {
     return HostThreadLocal<std::unordered_map<std::uint64_t, bool>, CpuIndirectProgramsStorage>();
 }
 
-std::pair<std::uint64_t, std::shared_ptr<DrawEntry>> shapeRecipeDonor(const std::vector<DrawProgram>& programs, const std::vector<ShaderRecompiler::ProgramRole>& roles, const std::vector<bool>& reused, const std::vector<const DrawDataCandidate*>& reuses, const std::vector<std::pair<std::uint64_t, std::shared_ptr<DrawEntry>>>& remembered) {
-    bool any = false;
-    for (std::size_t i = 0; i < programs.size(); ++i) {
-        if (roles[i] == ShaderRecompiler::ProgramRole::GeometryBack) continue;
-        if (!reused[i] || reuses[i] == nullptr || reuses[i]->remembered == nullptr) return {};
-        any = true;
-    }
-    if (!any) return {};
-    const auto holdsEveryStage = [&](const DrawEntry& entry) {
-        if (entry.stages.size() != programs.size()) return false;
-        for (std::size_t i = 0; i < programs.size(); ++i) {
-            if (reuses[i] == nullptr) continue;
-            const auto& variants = entry.stages[i];
-            if (std::none_of(variants.begin(), variants.end(), [&](const std::shared_ptr<DispatchVariant>& kept) { return kept.get() == reuses[i]->remembered; })) return false;
-        }
-        return true;
-    };
-    for (std::size_t i = 0; i < programs.size(); ++i) {
-        if (reuses[i] == nullptr) continue;
-        const auto found = std::find_if(remembered.begin(), remembered.end(), [&](const std::pair<std::uint64_t, std::shared_ptr<DrawEntry>>& kept) { return kept.first == reuses[i]->key; });
-        if (found != remembered.end() && found->second != nullptr && holdsEveryStage(*found->second)) return *found;
-    }
-    VulkanDevice::NoteShapeRecipeRefused();
-    return {};
-}
-
 }
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::size_t packetOffset, std::string& rejected) {
-    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    static const bool flatEarly = Graphics::CoreFlatDraw() && !profile && std::getenv("APS5_DUMP_GRAPHICS_SHADERS") == nullptr && std::getenv("APS5_DUMP_DRAW_SHADERS") == nullptr && std::getenv("APS5_DUMP_DRAW_SLOT1") == nullptr && std::getenv("APS5_LOCKED_DRAW_PREPARE") == nullptr && drawEntries() && registerKeyEnabled() && !TraceDrawPrograms() && !TraceShaderCorrelation() && !verifyDrawDataHits() && !verifyDrawEntries() && !verifyDrawRecipe() && DrawFinisher::Enabled();
-    Core::FrontOutcome early;
-    if (flatEarly && submission.queue == 0 && queue.predication.operation == 0 && DrawPipeline::Active() && !Pm4::IndirectDrawOpcode((packet[0] >> 8u) & 0xffu) && deferredLabels().labels.empty() && !ShaderRecompiler::DebugProbeActive()) {
-        if (const auto earlyDevice = device.Load()) {
-            const auto earlyParameters = Pm4::ResolveDraw(packet, queue);
-            if (tryFlatDraw(queue, packet, submission, earlyParameters, earlyDevice->Serial(), early)) {
-                queue.runMask.Drawn();
-                return DrawVerdict::Drawn;
-            }
-        }
-    }
     PerformanceTimer timing("Driver.Draw");
-    auto tailHolder = RecycledDrawTails() ? std::allocate_shared<DrawTail>(RecycledBlocks<DrawTail, DrawTailBlocks>{}) : std::make_shared<DrawTail>();
-    if (RecycledDrawTails()) noteDrawTails();
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto tailHolder = std::make_shared<DrawTail>();
     auto& tail = *tailHolder;
     auto& phaseMs = tail.phaseMs;
     auto& captures = tail.captures;
@@ -583,114 +417,63 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     const bool useDrawEntries = drawEntries() && !ShaderRecompiler::DebugProbeActive() && !dumpGraphics && dumpTarget == 0 && dumpSlot1 == 0 && drawEntriesThisDraw();
     tail.registerKey = useDrawEntries && registerKeyEnabled();
     const bool registerKey = tail.registerKey;
-    static const bool coreRun = Graphics::CoreRun();
-    if (coreRun) {
-        const bool eligible = registerKey && pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !TraceDrawPrograms() && traceToken == 0 && !verifyDrawDataHits() && !verifyDrawEntries() && !verifyDrawRecipe() && deferredLabels().labels.empty() && DrawFinisher::Enabled() && submission.queue == 0 && queue.predication.operation == 0;
-        static const bool flatDraw = Graphics::CoreFlatDraw();
-        bool taken = false;
-        if (early.looked) tail.core = std::move(early);
-        else taken = eligible && (flatDraw ? tryFlatDraw(queue, packet, submission, drawParameters, localDevice->Serial(), tail.core) : tryCoreDraw(queue, packet, submission, drawParameters, localDevice->Serial(), tail.core));
-        queue.runMask.Drawn();
-        if (tail.core.candidate != nullptr && !taken) {
-            const auto full = decodeDraw(queue, submission, localDevice->graphicsContext());
-            const auto& plan = *tail.core.candidate->variant->plan;
-            for (std::size_t i = 0; i < full->programs.size() && i < plan.decode->programs.size(); ++i) full->programs[i].userData = plan.decode->programs[i].userData;
-            if (!sameDecode(*plan.decode, *full)) {
-                Core::Front::Get().NoteVerified(true);
-                throw std::runtime_error("APS5_VERIFY_CORE_RUN: the state decoded for a state key differs from the state of the plan taught under that key");
-            }
-        }
-        if (taken) {
-            timing.Mark("draw_taken_by_core");
-            return drawn();
-        }
-    }
     auto& drawKey = tail.drawKey;
     std::array<std::uint64_t, 5> drawKeyComponents{};
     auto& entry = tail.entry;
     auto& decode = tail.decode;
     auto& dataEntry = tail.dataEntry;
-    auto& dataEntries = tail.dataEntries;
     auto& shapeKey = tail.shapeKey;
-    auto& drawIdentity = tail.drawIdentity;
-    auto& drawAlias = tail.drawAlias;
+    std::uint64_t drawIdentity = 0, drawAlias = 0;
     auto& userPatches = tail.userPatches;
-    std::uint64_t siteKey = 0, siteShape = 0;
-    if (registerKey && DrawSiteAccess::Enabled()) {
-        tail.site.eligible = pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !TraceDrawPrograms() && traceToken == 0 && !verifyDrawDataHits() && !verifyDrawEntries() && deferredLabels().labels.empty();
-        if (!tail.site.eligible) {
-            DrawSiteAccess::NoteIneligible();
-        } else {
-            siteKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &siteShape);
-            DrawSiteHit hit;
-            DrawSiteAccess::Walk(*this, queue, siteShape, hit);
-            tail.site.walked = true;
-            tail.site.matched = hit.matched;
-            tail.site.served = hit.served;
-            tail.site.refusal = hit.refusal;
-            tail.site.retained = std::move(hit.retained);
-        }
-    }
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         std::shared_ptr<const DrawRelocation> relocation;
         bool aliasFirst = false;
-        DrawRelocationKnown known;
         if (drawRelocationEnabled()) {
+            if (DrawFinisher::Busy() && drawRelocationPending.key != 0) DrawFinisher::Get().Drain();
             drawIdentity = drawIdentityKey(queue, *submission.shaders);
-            known = DrawCacheAccess(*this).Relocation(drawIdentity);
-            if (known.relocation != nullptr) {
-                auto& trial = *known.trial;
+            std::lock_guard cacheLock(drawCacheMutex);
+            learnPendingRelocation();
+            const auto known = drawRelocations.find(drawIdentity);
+            if (known != drawRelocations.end()) {
+                auto& trial = drawRelocationTrials[drawIdentity];
                 if (trial.idle != 0) --trial.idle;
-                else relocation = known.relocation;
+                else relocation = known->second;
                 aliasFirst = relocation != nullptr && trial.productive;
             }
         }
-        if (tail.site.walked && !aliasFirst && !traceDrawCache()) {
-            drawKey = siteKey;
-            shapeKey = siteShape;
-        } else {
-            drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
-        }
+        drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr, aliasFirst ? relocation.get() : nullptr, aliasFirst ? &drawAlias : nullptr);
         DrawPipeline::NoteDrawKey(drawKey, shapeKey);
-        if (tail.core.left != Core::FrontLeft::Entry && Core::Front::KeyDiagEnabled()) Core::Front::KeyDiag(queue, shapeKey, tail.core.left == Core::FrontLeft::NoPlan);
-        if (DrawFinisher::OnFinisherThread()) {
-            DrawFinisher::Get().TakeTurn();
-        } else if (DrawFinisher::Busy()) {
+        if (DrawFinisher::Busy()) {
             bool shapeMatters = false;
             if (DrawFinisher::Overlap() && drawDataHits()) {
-                DrawCacheAccess peek(*this);
-                const auto shape = peek.Shape(shapeKey);
-                shapeMatters = !peek.Contains(drawKey) && std::none_of(shape.keys.begin(), shape.keys.begin() + shape.count, [&](std::uint64_t key) { return peek.Contains(key); });
+                std::lock_guard peekLock(drawCacheMutex);
+                const auto shape = drawShapes.find(shapeKey);
+                shapeMatters = !drawCache.contains(drawKey) && (shape == drawShapes.end() || !drawCache.contains(shape->second));
             }
             const bool drain = !DrawFinisher::Overlap() || DrawFinisher::Get().PendingKey(drawKey, shapeMatters ? shapeKey : 0);
             if (drain) DrawFinisher::Get().Drain();
             if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Lookup, drain);
         }
-        DrawCacheAccess cacheAccess(*this);
-        auto& lookupCounters = cacheAccess.Counters();
-        ++lookupCounters.lookups;
-        ++lookupCounters.registerKeyLookups;
-        if (profile) lookupCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
-        bool absent = false;
-        if (auto found = cacheAccess.Find(drawKey)) {
-            entry = std::move(found);
+        std::unique_lock cacheLock(drawCacheMutex);
+        ++drawEntryCounters.lookups;
+        ++drawEntryCounters.registerKeyLookups;
+        if (profile) drawEntryCounters.keyUs += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - keyStart).count();
+        const auto found = drawCache.find(drawKey);
+        if (found != drawCache.end()) {
+            entry = found->second;
             decode = entry->decode;
         } else {
-            absent = true;
-            ++lookupCounters.absent;
+            ++drawEntryCounters.absent;
             if (relocation != nullptr && !aliasFirst) {
-                cacheAccess.Unlock();
+                cacheLock.unlock();
                 drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), nullptr, nullptr, relocation.get(), &drawAlias);
-                cacheAccess.Lock();
+                cacheLock.lock();
             }
-            if (drawIdentity != 0) tail.relocationPending = {drawKey, drawAlias, drawIdentity};
-            if (drawAlias != 0) {
-                cacheAccess.Exclusive();
-                relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
-            }
+            if (drawIdentity != 0) drawRelocationPending = {drawKey, drawAlias, drawIdentity};
+            if (drawAlias != 0) relocateDrawEntry(queue, drawAlias, entry, decode, userPatches);
             if (relocation != nullptr) {
-                auto& trial = *known.trial;
+                auto& trial = drawRelocationTrials[drawIdentity];
                 ++trial.lookups;
                 if (trial.lookups >= DrawRelocationTrial::Window) {
                     trial.productive = trial.hits * DrawRelocationTrial::MinimumHitShare >= trial.lookups;
@@ -699,45 +482,39 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
             }
             if (traceDrawCache()) {
-                auto& counters = lookupCounters;
+                auto& counters = drawEntryCounters;
                 if (traceKeysEvicted.contains(drawKey)) ++counters.absentEvicted;
                 else if (traceKeysSeen.contains(drawKey)) ++counters.absentNeverInserted;
                 else if (traceShapes.contains(shapeKey)) ++counters.absentUserWords;
                 else ++counters.absentNewRegisters;
             }
             if (decode == nullptr && drawDataHits() && !drawParameters.indirect) {
-                const auto shape = cacheAccess.Shape(shapeKey);
-                for (std::size_t rank = 0; rank < shape.count; ++rank) {
-                    auto kept = cacheAccess.Find(shape.keys[rank]);
-                    if (kept != nullptr && kept->decode != nullptr && kept->shape == shapeKey) dataEntries.emplace_back(shape.keys[rank], std::move(kept));
+                if (const auto shape = drawShapes.find(shapeKey); shape != drawShapes.end()) {
+                    const auto kept = drawCache.find(shape->second);
+                    if (kept != drawCache.end() && kept->second->decode != nullptr && kept->second->shape == shapeKey) dataEntry = kept->second;
                 }
-                if (!dataEntries.empty()) dataEntry = dataEntries.front().second;
                 if (dataEntry != nullptr) {
-                    ++lookupCounters.dataHits;
+                    ++drawEntryCounters.dataHits;
                     drawCacheUseful().fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
-        if (traceDrawCache()) traceDrawKeyLookup(drawKeyComponents, absent);
+        if (traceDrawCache()) traceDrawKeyLookup(drawKeyComponents, found == drawCache.end());
         if (traceDrawCache()) {
             traceInsert(traceKeysSeen, drawKey);
             traceInsert(traceShapes, shapeKey);
         }
-        cacheAccess.Report(profile);
+        maybeReportDrawCache(profile);
     }
     if (decode != nullptr && !DecodeProgramsCurrent(*decode, *submission.shaders)) {
         userPatches.clear();
-        DrawCacheAccess cacheAccess(*this);
-        cacheAccess.Exclusive();
+        std::lock_guard cacheLock(drawCacheMutex);
         eraseDrawEntry(drawKey, entry);
-        ++cacheAccess.Counters().absent;
+        ++drawEntryCounters.absent;
         entry = nullptr;
         decode = nullptr;
     }
-    if (dataEntry != nullptr) {
-        std::erase_if(dataEntries, [&](const auto& remembered) { return !DecodeProgramsCurrent(*remembered.second->decode, *submission.shaders); });
-        dataEntry = dataEntries.empty() ? nullptr : dataEntries.front().second;
-    }
+    if (dataEntry != nullptr && !DecodeProgramsCurrent(*dataEntry->decode, *submission.shaders)) dataEntry = nullptr;
     phaseTiming.Phase(DrawRowKeyLookupValidate);
 
     if (dataEntry != nullptr) {
@@ -788,6 +565,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             const auto& indirect = *drawParameters.indirect;
             recordQueuedLabelsBeforeRead(submission.queue);
             const auto readStart = std::chrono::steady_clock::now();
+            FinishLeaseWritesBeforeRead();
             const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
             bool any = false;
             for (std::uint32_t record = 0; record < count && !any; ++record) any = recordDraws(Pm4::ReadDrawArguments(indirect, record));
@@ -808,7 +586,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (!drawParameters.indirect) setMeshIndexBuffer(drawParameters);
     else if (graphics.stages.mesh) setMeshIndexBuffer(Pm4::DrawParameters{drawParameters.indexAddress, std::max(drawParameters.indexCount, 1u), drawParameters.indexSize, 1, 0, drawParameters.indexed});
     const std::vector<Role>& roles = decode->roles;
-    const bool tracePrograms = TraceDrawPrograms();
+    static const bool tracePrograms = std::getenv("APS5_TRACE_DRAW_PROGRAMS") != nullptr;
     if (tracePrograms) {
         std::vector<DrawProgramTraceEntry> identities;
         identities.reserve(programs.size());
@@ -862,12 +640,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
         vertexInfos[i] = DecodeOrderedVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, decodeReads[i], 8u - program.firstUserSgpr);
         if (vertexInfos[i]) {
-            vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, readRegister(queue.context, 0x207), program.tailContinuation.get()) | graphics.layerExports;
+            vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, readRegister(queue.context, 0x207), program.tailContinuation.get()) | graphics.layerExports | graphics.viewportExports;
             vertexInfos[i]->depthRemapMode = graphics.depthRemap.mode;
             Graphics::ApplyPointSize(graphics, *vertexInfos[i]);
         }
     };
-    tail.vertexDecoded.assign(programs.size(), !registerKey);
     if (!registerKey) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
         phaseTiming.Phase(DrawRowDecode);
@@ -902,19 +679,46 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     reused.assign(programs.size(), false);
     auto& stageData = tail.stageData;
     stageData.resize(programs.size());
-    tail.shapeMisses.assign(programs.size(), DrawShapeMiss::NoStage);
-    tail.shapeWords.assign(programs.size(), DrawShapeWord::Count);
     auto& drawHit = tail.drawHit;
+    auto& verifyHit = tail.verifyHit;
     tail.stageEntries = useDrawEntries && !(graphics.stages.tessellation && !drawParameters.indirect && drawParameters.instanceCount > 1u);
     const bool stageEntries = tail.stageEntries;
-    tail.reg207 = readRegister(queue.context, 0x207);
-    tail.packetOffset = packetOffset;
-    tail.traceToken = traceToken;
-    const auto handsOff = [&] { return pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !dumpGraphics && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled(); };
-    const bool laterEligible = (FinisherLookup() || VerifyFinisherLookup()) && registerKey && stageEntries && traceToken == 0 && !verifyDrawEntries() && !verifyDrawRecipe() && handsOff();
-    tail.resolveLater = laterEligible && !VerifyFinisherLookup();
-    if (laterEligible && VerifyFinisherLookup()) tail.lookupShadow = LookupShadow(tail);
-    if (!tail.resolveLater) resolveDrawTail(tail, submission);
+    try {
+        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntry, dataCandidates, stageData);
+    } catch (...) {
+        TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
+        throw;
+    }
+    for (std::size_t i = 0; i < matched.size(); ++i) {
+        if (matched[i] != nullptr) stageCaptures[i].registeredViews = matched[i]->registeredViews;
+        if (matched[i] == nullptr || (matched[i]->shaderDataPatches.empty() && matched[i]->descriptorPatches.empty())) continue;
+        applyShaderDataPatches(*matched[i]);
+        if (stageData[i].compiled != nullptr) stageData[i].compiled = patchDataWords(*matched[i], stageData[i].words);
+    }
+    const auto relocatedDecode = decode;
+    if (!userPatches.empty()) {
+        std::lock_guard cacheLock(drawCacheMutex);
+        if (drawHit || verifyHit) {
+            ++drawRelocationCounters.hits;
+            ++drawRelocationTrials[drawIdentity].hits;
+            if (const auto alias = drawAliases.find(drawAlias); alias != drawAliases.end()) {
+                const auto donor = drawCache.find(alias->second);
+                if (donor != drawCache.end() && drawCacheHits - donor->second->touched > drawCacheEntries() / 8) {
+                    drawOrder.splice(drawOrder.begin(), drawOrder, donor->second->order);
+                    donor->second->touched = drawCacheHits;
+                    ++drawEntryCounters.touches;
+                }
+            }
+        }
+        if (profile && drawRelocationCounters.lookups >= 100000) reportDrawRelocation();
+    }
+    if (!userPatches.empty() && !drawHit) {
+        auto current = std::make_shared<DrawDecode>(*decode);
+        for (const auto& patch : userPatches) current->programs[patch.program].userData[patch.index] = patch.value;
+        decode = std::move(current);
+    }
+    tail.patchedStages = std::any_of(stageData.begin(), stageData.end(), [](const StageDataHit& hit) { return hit.compiled != nullptr; });
+    tail.relocatedDecode = relocatedDecode;
     std::uint64_t stageDataVerified = 0;
     const auto target = graphics.hasColorTarget ? graphics.color.address : 0;
     const VulkanDevice::DrawTraceContext trace{traceToken, submission.serial, submission.queue, packetOffset, target};
@@ -932,192 +736,6 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
     }
 
-    tail.submission = &submission;
-    tail.submissionQueue = submission.queue;
-    tail.packetOpcode = (packet[0] >> 8u) & 0xffu;
-    tail.dumpTarget = dumpTarget;
-    tail.dumpSlot1 = dumpSlot1;
-    tail.packetOffset = packetOffset;
-    const bool handOff = tail.resolveLater || handsOff();
-    if (handOff) {
-        tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
-        tail.submissionSerial = submission.serial;
-        if (DrawFinisher::RelaysSubmissionEnd()) {
-            tail.handed.serial = submission.serial;
-            tail.handed.queue = submission.queue;
-            tail.handed.shaders = submission.shaders;
-            tail.submission = &tail.handed;
-        }
-        tail.packetOffset = static_cast<std::size_t>(packet.data() - submission.commands.data());
-        noteFinisherHandOff(true);
-        DrawFinisher::Pending held;
-        if (DrawFinisher::Overlap()) held = tail.resolveLater ? heldWritesAhead(tail) : heldWrites(tail);
-        if (tail.resolveLater) {
-            laterLookups.fetch_add(1, std::memory_order_relaxed);
-            laterLookupsEver.fetch_add(1, std::memory_order_relaxed);
-        }
-        if (tail.resolveLater || tail.lookupShadow != nullptr) noteLaterLookup();
-        auto finish = [this, tailHolder] {
-            auto& job = *tailHolder;
-            DrawPipeline::FollowEpoch(job.epoch);
-            GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
-            PerformanceTimer finishTiming("Driver.DrawFinish");
-            try {
-                if (job.resolveLater || job.lookupShadow != nullptr) {
-                    struct PipelineScope {
-                        bool previous;
-                        PipelineScope() : previous(std::exchange(DrawPipeline::Active(), true)) {}
-                        ~PipelineScope() { DrawPipeline::Active() = previous; }
-                    } pipelineScope;
-                    const auto lookupFrom = DrawFinisher::Timed() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-                    const struct LookupNote {
-                        std::chrono::steady_clock::time_point from;
-                        ~LookupNote() { DrawFinisher::NoteLookup(DrawFinisher::Timed() ? static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count()) : 0); }
-                    } lookupNote{lookupFrom};
-                    if (job.resolveLater) {
-                        resolveDrawTail(job, *job.submission);
-                        if (job.drawHit) laterLookupHits.fetch_add(1, std::memory_order_relaxed);
-                    } else {
-                        const auto shadow = std::exchange(job.lookupShadow, nullptr);
-                        resolveDrawTail(*shadow, *job.submission);
-                        laterLookupsVerified.fetch_add(1, std::memory_order_relaxed);
-                        laterLookupsVerifiedEver.fetch_add(1, std::memory_order_relaxed);
-                        if (!SameLookup(job, *shadow)) {
-                            laterLookupsDiffering.fetch_add(1, std::memory_order_relaxed);
-                            if (laterLookupsDifferingEver.fetch_add(1, std::memory_order_relaxed) < 16) std::fprintf(stderr, "[finisher-lookup] verify: the lookup of the draw at submission %llu offset %zu (key 0x%llx, shape 0x%llx) differs on the draw finisher: hit %u / %u\n", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, static_cast<unsigned long long>(job.drawKey), static_cast<unsigned long long>(job.shapeKey), job.drawHit ? 1u : 0u, shadow->drawHit ? 1u : 0u);
-                        }
-                    }
-                    finishTiming.Mark("lookup");
-                }
-                if (finishDraw(job, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(job.ownRejected);
-            } catch (const RefusedDraw& refused) {
-                CaptureTrace::Log("draw-refused submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, refused.what());
-                ReportRefusedDraw(refused);
-            } catch (const std::exception& error) {
-                CaptureTrace::Log("draw-error submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, error.what());
-                throw std::runtime_error("draw at submission " + std::to_string(job.submissionSerial) + " offset " + std::to_string(job.packetOffset) + " (finished on the draw finisher): " + error.what());
-            }
-        };
-        if (DrawFinisher::OnFinisherThread()) finish();
-        else DrawFinisher::Get().Enqueue(std::move(finish), std::move(held));
-        timing.Mark("draw_handed_off");
-        return drawn();
-    }
-    noteFinisherHandOff(false);
-    if (DrawFinisher::OnFinisherThread()) {
-        DrawFinisher::Get().TakeTurn();
-    } else if (DrawFinisher::Busy()) {
-        DrawFinisher::Get().Drain();
-        if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Kept, true);
-    }
-    tail.queue = &queue;
-    tail.packet = packet;
-    tail.rejected = &rejected;
-    tail.gpuLock = &gpuLock;
-    return finishDraw(tail, timing);
-}
-
-void Driver::precollectCoreDraw(const DrawRecipe& recipe, std::span<const std::pair<std::uint64_t, std::uint64_t>> reads) {
-    if (!FinisherPrecollect() || GuestMemory::CollectEpoch() == 0 || !CollectWalker::Enabled()) return;
-    const auto walkEpoch = GuestMemory::HeldCollectEpoch();
-    auto& walker = CollectWalker::Get();
-    walker.OfferAll(walkEpoch, recipe.surfaces, false, std::numeric_limits<std::uint64_t>::max());
-    if (!FinisherInputPrecollect()) return;
-    walker.OfferAll(walkEpoch, reads, true, FinisherInputPrecollectBytes);
-}
-
-FinisherLookupCounts Driver::FinisherLookupCounted() {
-    return {laterLookupsEver.load(std::memory_order_relaxed), laterLookupsVerifiedEver.load(std::memory_order_relaxed), laterLookupsDifferingEver.load(std::memory_order_relaxed)};
-}
-
-void Driver::resolveDrawTail(DrawTail& tail, const Submission& submission) {
-    using Stage = ShaderRecompiler::ShaderStage;
-    using Role = ShaderRecompiler::ProgramRole;
-    const bool profile = tail.profile;
-    const auto traceToken = tail.traceToken;
-    const auto packetOffset = tail.packetOffset;
-    auto& phaseMs = tail.phaseMs;
-    auto& phaseTiming = tail.phaseTiming;
-    auto& localDevice = tail.localDevice;
-    const bool registerKey = tail.registerKey;
-    auto& drawKey = tail.drawKey;
-    auto& entry = tail.entry;
-    auto& decode = tail.decode;
-    auto& dataEntries = tail.dataEntries;
-    const auto& graphics = decode->state;
-    auto& pixel = tail.pixel;
-    const auto& programs = *tail.programs;
-    const std::vector<Role>& roles = decode->roles;
-    auto& vertexInfos = tail.vertexInfos;
-    auto& decodeReads = tail.decodeReads;
-    auto& stageCaptures = tail.stageCaptures;
-    auto& matched = tail.matched;
-    auto& matchedRegions = tail.matchedRegions;
-    auto& dataCandidates = tail.dataCandidates;
-    auto& stageData = tail.stageData;
-    auto& drawHit = tail.drawHit;
-    auto& verifyHit = tail.verifyHit;
-    const bool stageEntries = tail.stageEntries;
-    const auto& userPatches = tail.userPatches;
-    const auto drawIdentity = tail.drawIdentity;
-    const auto drawAlias = tail.drawAlias;
-    const auto decodeVertexInfo = [&](std::size_t i) {
-        const auto& program = programs[i];
-        if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) return;
-        vertexInfos[i] = DecodeOrderedVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, decodeReads[i], 8u - program.firstUserSgpr);
-        if (vertexInfos[i]) {
-            vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports;
-            vertexInfos[i]->depthRemapMode = graphics.depthRemap.mode;
-            Graphics::ApplyPointSize(graphics, *vertexInfos[i]);
-        }
-    };
-    const std::function<bool(std::size_t)> redecodeVertexInfo = [&](std::size_t i) {
-        if (tail.vertexDecoded[i]) return true;
-        try {
-            decodeVertexInfo(i);
-        } catch (const std::exception&) {
-            return false;
-        }
-        tail.vertexDecoded[i] = true;
-        return true;
-    };
-    try {
-        lookupDraw(submission, localDevice, graphics, pixel, programs, roles, vertexInfos, stageEntries, registerKey, profile, drawKey, entry, matched, matchedRegions, drawHit, verifyHit, phaseTiming, phaseMs, dataEntries, dataCandidates, stageData, tail.shapeMisses, decodeReads, redecodeVertexInfo, tail.shapeWords);
-    } catch (...) {
-        TraceDrawAttemptException(traceToken, "lookup", submission.serial, submission.queue, packetOffset, std::current_exception());
-        throw;
-    }
-    for (std::size_t i = 0; i < matched.size(); ++i) {
-        if (matched[i] != nullptr) stageCaptures[i].registeredViews = matched[i]->registeredViews;
-        if (matched[i] == nullptr || (matched[i]->shaderDataPatches.empty() && matched[i]->descriptorPatches.empty())) continue;
-        applyShaderDataPatches(*matched[i]);
-        if (stageData[i].compiled != nullptr) stageData[i].compiled = patchDataWords(*matched[i], stageData[i].words);
-    }
-    const auto relocatedDecode = decode;
-    if (!userPatches.empty()) {
-        DrawCacheAccess cacheAccess(*this);
-        if (drawHit || verifyHit || profile) cacheAccess.Exclusive();
-        if (drawHit || verifyHit) {
-            ++drawRelocationCounters.hits;
-            ++drawRelocationTrials[drawIdentity].hits;
-            if (const auto alias = drawAliases.find(drawAlias); alias != drawAliases.end()) {
-                const auto donor = drawCache.find(alias->second);
-                if (donor != drawCache.end() && drawCacheHits - donor->second->touched > drawCacheEntries() / 8) {
-                    drawOrder.splice(drawOrder.begin(), drawOrder, donor->second->order);
-                    donor->second->touched = drawCacheHits;
-                    ++cacheAccess.Counters().touches;
-                }
-            }
-        }
-        if (profile && drawRelocationCounters.lookups >= 100000) reportDrawRelocation();
-    }
-    if (!userPatches.empty() && !drawHit) {
-        auto current = std::make_shared<DrawDecode>(*decode);
-        for (const auto& patch : userPatches) current->programs[patch.program].userData[patch.index] = patch.value;
-        decode = std::move(current);
-    }
-    tail.patchedStages = std::any_of(stageData.begin(), stageData.end(), [](const StageDataHit& hit) { return hit.compiled != nullptr; });
-    tail.relocatedDecode = relocatedDecode;
     if (registerKey) {
 
         for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -1126,20 +744,67 @@ void Driver::resolveDrawTail(DrawTail& tail, const Submission& submission) {
                 continue;
             }
             if (!dataCandidates[i].empty() && !verifyDrawDataHits()) {
-                const auto& info = dataCandidates[i].front().variant->vertexInfo;
-                if (info != nullptr && !tail.vertexDecoded[i]) vertexInfos[i] = *info;
+                const auto& info = dataCandidates[i].front().first->vertexInfo;
+                if (info != nullptr) vertexInfos[i] = *info;
                 continue;
             }
-            if (!tail.vertexDecoded[i]) decodeVertexInfo(i);
+            decodeVertexInfo(i);
             if (matched[i] != nullptr && verifyDrawRecipe() && (vertexInfos[i].has_value() != (matched[i]->vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *matched[i]->vertexInfo)))) {
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit has a vertex stage info unlike its variant's\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress));
-                ++DrawCacheAccess(*this).Counters().verifyDecodeMismatches;
+                std::lock_guard cacheLock(drawCacheMutex);
+                ++drawEntryCounters.verifyDecodeMismatches;
             }
         }
         phaseTiming.Phase(DrawRowDecode);
     }
 
+    tail.submission = &submission;
+    tail.submissionQueue = submission.queue;
+    tail.packetOpcode = (packet[0] >> 8u) & 0xffu;
+    tail.reg207 = readRegister(queue.context, 0x207);
+    tail.dumpTarget = dumpTarget;
+    tail.dumpSlot1 = dumpSlot1;
+    tail.packetOffset = packetOffset;
+    const bool handOff = pipelined && !drawParameters.indirect && !profile && !lockedPrepare && !dumpGraphics && dumpTarget == 0 && dumpSlot1 == 0 && !tracePrograms && !verifyDrawDataHits() && deferredLabels().labels.empty() && DrawFinisher::Enabled();
+    if (handOff) {
+        tail.epoch = DrawPipeline::EpochToken().load(std::memory_order_relaxed);
+        tail.submissionSerial = submission.serial;
+        tail.packetOffset = static_cast<std::size_t>(packet.data() - submission.commands.data());
+        noteFinisherHandOff(true);
+        if (DrawTableSnapshotEnabled()) KeepUserDataTables(*shaderMemory, programs);
+        DrawFinisher::Pending held;
+        if (DrawFinisher::Overlap()) held = heldWrites(tail);
+        DrawFinisher::Get().Enqueue([this, tailHolder] {
+            auto& job = *tailHolder;
+            DrawPipeline::FollowEpoch(job.epoch);
+            GuestMemory::SetCurrentPacket(job.packetOpcode, job.submissionQueue);
+            PerformanceTimer finishTiming("Driver.DrawFinish");
+            try {
+                if (finishDraw(job, finishTiming) == DrawVerdict::Rejected) throw std::runtime_error(job.ownRejected);
+            } catch (const DrawCompilePending&) {
+                CaptureTrace::Log("draw-pending submission=%llu offset=%zu finisher=1", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset);
+            } catch (const RefusedDraw& refused) {
+                CaptureTrace::Log("draw-refused submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, refused.what());
+                ReportRefusedDraw(refused);
+            } catch (const std::exception& error) {
+                CaptureTrace::Log("draw-error submission=%llu offset=%zu finisher=1 reason=%.256s", static_cast<unsigned long long>(job.submissionSerial), job.packetOffset, error.what());
+                throw std::runtime_error("draw at submission " + std::to_string(job.submissionSerial) + " offset " + std::to_string(job.packetOffset) + " (finished on the draw finisher): " + error.what());
+            }
+        }, std::move(held));
+        timing.Mark("draw_handed_off");
+        return drawn();
+    }
+    noteFinisherHandOff(false);
+    if (DrawFinisher::Busy()) {
+        DrawFinisher::Get().Drain();
+        if (DrawFinisher::Overlap()) DrawFinisher::NoteDrain(DrawFinisher::DrainSite::Kept, true);
+    }
+    tail.queue = &queue;
+    tail.packet = packet;
+    tail.rejected = &rejected;
+    tail.gpuLock = &gpuLock;
+    return finishDraw(tail, timing);
 }
 
 DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
@@ -1196,8 +861,6 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     auto& reused = tail.reused;
     auto& stageData = tail.stageData;
     std::uint64_t dataStagesReused = 0, dataStagesCompiled = 0, dataVerified = 0;
-    std::vector<const DrawDataCandidate*> shapeReuses(programs.size(), nullptr);
-    std::vector<bool> shapeCompiled(programs.size(), false);
     auto& drawHit = tail.drawHit;
     auto& verifyHit = tail.verifyHit;
     const bool stageEntries = tail.stageEntries;
@@ -1239,7 +902,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         decodeReads[i].clear();
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
         if (vertexInfos[i]) {
-            vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports;
+            vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports | graphics.viewportExports;
             vertexInfos[i]->depthRemapMode = graphics.depthRemap.mode;
             Graphics::ApplyPointSize(graphics, *vertexInfos[i]);
         }
@@ -1275,37 +938,17 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
         return text;
     };
-    const auto flattenedRuns = [](const std::vector<std::pair<std::uint64_t, std::uint64_t>>& runs, const std::vector<std::uint32_t>& words) {
-        std::vector<std::pair<std::uint64_t, std::uint32_t>> flat;
-        std::size_t word = 0;
-        for (const auto& [begin, end] : runs) {
-            for (auto address = begin; address < end && word < words.size(); address += sizeof(std::uint32_t)) flat.emplace_back(address, words[word++]);
-        }
-        std::sort(flat.begin(), flat.end());
-        return flat;
-    };
-    const auto sameAttributes = [](const ShaderRecompiler::RecompileResult& a, const ShaderRecompiler::RecompileResult& b) {
-        return std::equal(a.vertexAttributes.begin(), a.vertexAttributes.end(), b.vertexAttributes.begin(), b.vertexAttributes.end(), [](const ShaderRecompiler::VertexAttribute& x, const ShaderRecompiler::VertexAttribute& y) { return x.location == y.location && x.components == y.components && x.fetchIndex == y.fetchIndex && x.formatComponents == y.formatComponents && x.resource.fields == y.resource.fields; });
-    };
-    std::uint64_t vertexVerified = 0, vertexDiffered = 0;
-    const auto verifyDataStage = [&](std::size_t i, const DispatchVariant& kept, bool moved) {
+    const auto verifyDataStage = [&](std::size_t i, const DispatchVariant& kept) {
         std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
         std::vector<std::uint32_t> words;
         freshRuns(i, runs, words);
         const auto& compiled = *stageCaptures[i].compiled;
-        const bool tailed = kept.decodeRuns != 0;
-        const bool sameBindings = !moved || (compiled.bindings.size() == kept.compiled->bindings.size() && std::equal(compiled.bindings.begin(), compiled.bindings.end(), kept.compiled->bindings.begin(), [](const auto& a, const auto& b) { return a.kind == b.kind && a.role == b.role && a.binding == b.binding && a.count == b.count && a.guestDescriptor == b.guestDescriptor; }));
-        const bool sameRuns = tailed ? flattenedRuns(runs, words) == flattenedRuns(kept.runs, kept.words) : joinedRuns(runs) == joinedRuns(kept.runs);
-        const char* what = !sameRuns ? "runs" : !tailed && words != kept.words ? "words" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : compiled.pushConstants != kept.compiled->pushConstants ? "push constants" : !sameBindings ? "bindings" : moved && compiled.shaderDataUserWords != kept.compiled->shaderDataUserWords ? "forwarded words" : !sameAttributes(compiled, *kept.compiled) ? "vertex attributes" : nullptr;
+        const char* what = joinedRuns(runs) != joinedRuns(kept.runs) ? "runs" : words != kept.words ? "words" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : compiled.pushConstants != kept.compiled->pushConstants ? "push constants" : nullptr;
         ++dataVerified;
-        if (tailed) ++vertexVerified;
         if (what == nullptr) return;
         char message[640];
         std::snprintf(message, sizeof(message), "APS5_VERIFY_DRAW_DATA_HITS: stage %zu (program 0x%llx) of a data-only hit differs from its full build in its %s (%zu runs / %zu words kept, %zu / %zu fresh; variant 0x%llx / 0x%llx; key 0x%llx, shape 0x%llx; kept%s; fresh%s)", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), what, kept.runs.size(), kept.words.size(), runs.size(), words.size(), static_cast<unsigned long long>(kept.compiled->variantId), static_cast<unsigned long long>(compiled.variantId), static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(shapeKey), listRuns(joinedRuns(kept.runs)).c_str(), listRuns(joinedRuns(runs)).c_str());
-        if (!tailed) throw std::runtime_error(message);
-        ++vertexDiffered;
-        static std::atomic<std::uint64_t> reports{0};
-        if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: a stage with vertex inputs: %s\n", message);
+        throw std::runtime_error(message);
     };
     const auto verifyStageData = [&](std::size_t i) {
         const auto& hit = stageData[i];
@@ -1328,23 +971,26 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     std::vector<std::uint32_t> pushOffsets(programs.size(), 0);
     std::optional<ShaderRecompiler::MeshBarycentricLayout> meshBarycentrics;
     std::vector<std::size_t> resultIndex(programs.size(), 0);
+    const bool fixedSlots = localDevice->GraphicsPipelineLibraries();
+    const bool hasFragment = std::ranges::any_of(programs, [](const DrawProgram& program) { return program.binary.stage == ShaderRecompiler::ShaderStage::Fragment; });
     for (std::size_t i = 0; i < programs.size(); ++i) {
         if (roles[i] == Role::GeometryBack) continue;
         const auto& program = programs[i];
-        pushCursorBytes = Graphics::StagePushOffset(pushCursorBytes, program.binary.stage, localDevice->GraphicsPipelineLibraries());
+        pushCursorBytes = Graphics::StagePushOffset(pushCursorBytes, program.binary.stage, fixedSlots);
+        require(pushCursorBytes <= Graphics::PushBlockBytes(fixedSlots), "stage push constant offset exceeds the pipeline push constant block");
+        const auto pushBudget = Graphics::StagePushBudget(Graphics::StagePushLimit(graphics.stages, pushCursorBytes, graphics.depthRemap.mode != 0u), pushCursorBytes, program.binary.stage, fixedSlots, hasFragment);
         pushOffsets[i] = pushCursorBytes;
         if (drawHit) {
 
             programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
             memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
         } else {
-            const auto candidate = std::find_if(dataCandidates[i].begin(), dataCandidates[i].end(), [&](const DrawDataCandidate& kept) { return kept.variant->pushOffset == pushCursorBytes; });
+            const auto candidate = std::find_if(dataCandidates[i].begin(), dataCandidates[i].end(), [&](const auto& kept) { return kept.first->pushOffset == pushCursorBytes && kept.first->compiled->pushConstants.size() <= pushBudget; });
             if (candidate != dataCandidates[i].end() && !verifyDrawDataHits()) {
-                matched[i] = candidate->variant;
+                matched[i] = candidate->first;
                 stageCaptures[i].registeredViews = matched[i]->registeredViews;
-                matchedRegions[i] = std::move(candidate->regions);
+                matchedRegions[i] = std::move(candidate->second);
                 reused[i] = true;
-                shapeReuses[i] = &*candidate;
                 programResults[i] = stageData[i].compiled != nullptr ? stageData[i].compiled.get() : matched[i]->compiled.get();
                 memory.insert(memory.end(), matchedRegions[i].begin(), matchedRegions[i].end());
             } else {
@@ -1359,9 +1005,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
                 compiledStages.push_back(materializeDrawStage(i, pushCursorBytes, queue, submission, packetOffset, trace.token, programs, graphics, pixel, vertexInfos, memory, linked, drawParameters, localDevice, *shaderMemory, stageCaptures, recompiled, drawHit, matched, matchedRegions, profile, dumpTarget, dumpSlot1, captures, phaseTiming, phaseMs, rejected, meshBarycentrics));
                 if (!rejected.empty()) return DrawVerdict::Rejected;
                 programResults[i] = compiledStages.back().get();
-                if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->variant, candidate->kind != DrawShapeReuse::EqualWords || candidate->variant.get() != candidate->remembered);
+                if (candidate != dataCandidates[i].end()) verifyDataStage(i, *candidate->first);
                 if (stageData[i].compiled != nullptr && verifyDrawDataHits()) verifyStageData(i);
-                shapeCompiled[i] = candidate == dataCandidates[i].end();
             }
             if (dataEntry != nullptr && reused[i]) ++dataStagesReused;
             else if (dataEntry != nullptr) ++dataStagesCompiled;
@@ -1374,8 +1019,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             fold(result, drawParameters);
         }
         try {
-            const auto slotEnd = (pushCursorBytes / Graphics::PipelinePushSlotBytes + 1u) * Graphics::PipelinePushSlotBytes;
-            require(result.pushConstants.size() <= slotEnd - pushCursorBytes, "stage push constants exceed the pipeline push constant block");
+            require(result.pushConstants.size() <= pushBudget, "stage push constants exceed the pipeline push constant block");
             stages.push_back({program.binary.stage, &result, result.pushConstants.empty() ? 0u : pushCursorBytes, stageCaptures[i].registeredViews.get()});
             pushCursorBytes += static_cast<std::uint32_t>(result.pushConstants.size());
         } catch (...) {
@@ -1385,45 +1029,14 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     }
 
     if (stageDataVerified != 0) {
-        DrawCacheAccess(*this).Counters().stageDataVerified += stageDataVerified;
+        std::lock_guard cacheLock(drawCacheMutex);
+        drawEntryCounters.stageDataVerified += stageDataVerified;
     }
-    bool stageSeenBefore = false;
     if (dataEntry != nullptr) {
-        DrawCacheAccess cacheAccess(*this);
-        auto& counters = cacheAccess.Counters();
-        counters.dataStagesReused += dataStagesReused;
-        counters.dataStagesCompiled += dataStagesCompiled;
-        counters.dataVerified += dataVerified;
-        counters.shapeVertexVerified += vertexVerified;
-        counters.shapeVertexDiffered += vertexDiffered;
-        if (drawShapeUserWords()) {
-            ++counters.shapeDraws;
-            counters.shapeDrawsTried += tail.dataEntries.size();
-            for (std::size_t i = 0; i < programs.size(); ++i) {
-                const bool vertexInputs = vertexInfos[i] && vertexInfos[i]->resourcesNum != 0;
-                if (const auto* reuse = shapeReuses[i]) {
-                    ++counters.shapeHitsByRank[std::min<std::size_t>(reuse->rank, counters.shapeHitsByRank.size() - 1u)];
-                    ++counters.shapeReuses[static_cast<std::size_t>(reuse->kind)];
-                    if (vertexInputs) ++counters.shapeVertexReused;
-                    if (reuse->rebased) ++counters.shapeVertexRebased;
-                    cacheAccess.NoteShapeReuse(shapeKey, reuse->key);
-                    continue;
-                }
-                if (!shapeCompiled[i]) continue;
-                ++counters.shapeMisses[static_cast<std::size_t>(tail.shapeMisses[i])];
-                if (vertexInputs) {
-                    ++counters.shapeVertexCaptured;
-                    if (i < tail.shapeWords.size() && tail.shapeWords[i] != DrawShapeWord::Count) ++counters.shapeVertexWords[static_cast<std::size_t>(tail.shapeWords[i])];
-                }
-                const auto& capture = stageCaptures[i];
-                if (drawParameters.indirect || capture.compiled == nullptr || !CacheableResult(*capture.compiled)) continue;
-                if (stageIdentitySeen(stageIdentity(shapeKey, i, programs[i], capture, vertexInfos[i]))) stageSeenBefore = true;
-            }
-            if (stageSeenBefore) {
-                cacheAccess.Exclusive();
-                stageSeenBefore = shapeAdmitsRepeatedStage(shapeKey);
-            }
-        }
+        std::lock_guard cacheLock(drawCacheMutex);
+        drawEntryCounters.dataStagesReused += dataStagesReused;
+        drawEntryCounters.dataStagesCompiled += dataStagesCompiled;
+        drawEntryCounters.dataVerified += dataVerified;
     }
     const bool shapeRefresh = Graphics::DrawPipelineEnabled();
     const auto refreshSeenTwice = [&] {
@@ -1445,8 +1058,8 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         static std::array<std::atomic<std::uint64_t>, 4096> lastData{};
         return lastData[shapeKey % lastData.size()].exchange(data, std::memory_order_relaxed) == data;
     };
-    const bool shapeNeedsEntry = registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && (drawShapeUserWords() ? stageSeenBefore : shapeRefresh && refreshSeenTwice());
-    const bool inserted = cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, tail.relocationPending, shapeNeedsEntry);
+    const bool shapeNeedsEntry = shapeRefresh && registerKey && shapeKey != 0 && drawDataHits() && !drawParameters.indirect && dataEntry != nullptr && dataStagesCompiled != 0 && refreshSeenTwice();
+    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, stageData, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey, shapeNeedsEntry);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -1541,7 +1154,6 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
         require(tail.queue != nullptr, "the draw finisher reached a draw it cannot commit through the pipeline");
-        Graphics::BufferCache::EndDrawRun();
         if (gpuLock.owns_lock()) return;
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
@@ -1573,6 +1185,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         }
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
+        FinishLeaseWritesBeforeRead();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
         std::vector<Pm4::DrawArguments> records;
         for (std::uint32_t record = 0; record < count; ++record) records.push_back(Pm4::ReadDrawArguments(indirect, record));
@@ -1596,12 +1209,11 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         std::vector<RecordWord> recordWords;
         const auto countRecordWords = [&] {
             if (wordsForwarded == 0 && stagesRecompiled == 0 && wordsRefused == 0 && wordsVerified == 0) return;
-            DrawCacheAccess cacheAccess(*this);
-            auto& counters = cacheAccess.Counters();
-            counters.recordWordsForwarded += wordsForwarded;
-            counters.recordStagesRecompiled += stagesRecompiled;
-            counters.recordWordsRefused += wordsRefused;
-            counters.recordWordsVerified += wordsVerified;
+            std::lock_guard cacheLock(drawCacheMutex);
+            drawEntryCounters.recordWordsForwarded += wordsForwarded;
+            drawEntryCounters.recordStagesRecompiled += stagesRecompiled;
+            drawEntryCounters.recordWordsRefused += wordsRefused;
+            drawEntryCounters.recordWordsVerified += wordsVerified;
         };
         const auto sameInfo = [&](const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& a, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& b) { return a.has_value() == b.has_value() && (!a || sameVertexInfo(*a, *b)); };
         const auto forwardRecordWords = [&](std::size_t programIndex, ShaderRecompiler::RecompileResult& result, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& previousInfo) {
@@ -1751,64 +1363,18 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         return drawn();
     }
 
-    using Origin = VulkanDevice::DrawRecipeOrigin;
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    auto recipeDonor = drawHit && entry != nullptr ? entry->donor : nullptr;
-    auto recipeOrigin = recipeDonor != nullptr ? Origin::Relocated : Origin::Exact;
-    auto recipeKey = drawKey;
-    const bool recipeEligible = registerKey && !drawParameters.indirect && !patchedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes();
-    if (recipeEligible) {
-        if (!drawHit && shapeRecipes()) {
-            if (auto [key, donor] = shapeRecipeDonor(programs, roles, reused, shapeReuses, tail.dataEntries); donor != nullptr) {
-                recipeKey = key;
-                recipeDonor = std::move(donor);
-                recipeOrigin = Origin::Shape;
-            }
-        }
-        const bool donorStages = drawHit || recipeOrigin == Origin::Shape;
-        const auto root = [](const std::shared_ptr<DispatchVariant>& variant) { return variant != nullptr && variant->donor != nullptr ? variant->donor : variant; };
+    if (registerKey && !drawParameters.indirect && !patchedStages && !graphics.stages.tessellationGeometry && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
-        for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(root(donorStages ? matched[i] : fresh[i]));
+        for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? (matched[i] != nullptr && matched[i]->donor != nullptr ? matched[i]->donor : matched[i]) : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();
     }
+    const auto recipeDonor = drawHit && entry != nullptr ? entry->donor : nullptr;
     std::shared_ptr<const DrawRecipe> recipe;
-    if ((drawHit || recipeOrigin == Origin::Shape) && !recipeStages.empty()) {
-        recipe = findDrawRecipe(recipeKey, recipeStages, recipeDonor);
+    if (drawHit && !recipeStages.empty()) {
+        recipe = findDrawRecipe(drawKey, recipeStages, recipeDonor);
         if (recipe == nullptr) VulkanDevice::NoteDrawRecipeMiss(VulkanDevice::DrawRecipePrecheck::NoRecipe);
     }
-    const bool recipeLookedUp = (drawHit || recipeOrigin == Origin::Shape) && !recipeStages.empty();
-    const bool recipeFound = recipe != nullptr;
-    std::shared_ptr<const DrawContentKey> contentKey;
-    bool contentLookedUp = false;
-    bool byContent = false;
-    if (!recipeFound && recipeEligible && shapeKey != 0 && shapeRecipes() && ContentRecipes()) {
-        contentLookedUp = true;
-        contentKey = ContentKeyOf(shapeKey, drawParameters, stages);
-        if (contentKey != nullptr) recipe = FindContentRecipe(*contentKey);
-        byContent = recipe != nullptr;
-        if (byContent && recipeLookedUp) attachDrawRecipe(recipeKey, recipeStages, recipe, recipeDonor, recipeOrigin);
-        else if (byContent && inserted && !recipeStages.empty()) attachDrawRecipe(drawKey, recipeStages, recipe);
-    }
-    const auto noteRecipeDecision = [&] {
-        if (contentLookedUp && !byContent) VulkanDevice::NoteContentRecipeLookup(contentKey != nullptr);
-        if (byContent) {
-            VulkanDevice::NoteDrawRecipeLookup(Origin::Content, true);
-            return;
-        }
-        if (recipeLookedUp) {
-            VulkanDevice::NoteDrawRecipeLookup(recipeOrigin, recipeFound);
-            return;
-        }
-        bool everyStageReused = false;
-        for (std::size_t i = 0; i < programs.size(); ++i) {
-            if (roles[i] == Role::GeometryBack) continue;
-            everyStageReused = reused[i];
-            if (!everyStageReused) break;
-        }
-        VulkanDevice::NoteDrawRecipeSkip(!recipeEligible || drawHit || !shapeRecipes() ? VulkanDevice::DrawRecipeSkip::Ineligible : everyStageReused ? VulkanDevice::DrawRecipeSkip::Split : VulkanDevice::DrawRecipeSkip::Captured);
-    };
-    const auto ownKey = recipeOrigin == Origin::Shape && inserted ? drawKey : 0;
-    if (recipe != nullptr && ownKey != 0) attachDrawRecipe(ownKey, recipeStages, recipe);
     if (recipe == nullptr) {
         if (auto known = localDevice->KnownDrawRejection(graphics, stages)) {
             rejected = std::move(*known);
@@ -1832,81 +1398,17 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
             restartFinishedDraw(tail);
             return finishDraw(tail, timing);
         }
-        noteRecipeDecision();
         phaseTiming.Phase(DrawRowVectors);
-        if (tail.core.candidate != nullptr) {
-            auto& front = Core::Front::Get();
-            std::optional<DrawDecode> patchedDecode;
-            if (!tail.userPatches.empty()) {
-                patchedDecode.emplace(*decode);
-                patchedDecode->programs = programs;
-            }
-            const auto difference = front.Compare(*tail.core.candidate, patchedDecode ? *patchedDecode : *decode, stages, recipe.get());
-            front.NoteVerified(!difference.empty());
-            front.Release(std::move(tail.core.candidate));
-            if (!difference.empty()) throw std::runtime_error("APS5_VERIFY_CORE_RUN: a draw the core would take differs from the classic path in " + difference);
-        }
-        if (tail.core.teach && recipe != nullptr && !patchedStages && tail.userPatches.empty() && !drawParameters.indirect && !(Core::Front::TeachBounds() && Core::Front::Get().Refused(programs, stages))) {
-            std::vector<std::shared_ptr<DispatchVariant>> served(programs.size());
-            for (std::size_t i = 0; i < programs.size(); ++i) served[i] = drawHit || reused[i] ? matched[i] : fresh[i];
-            std::vector<std::shared_ptr<const ShaderRecompiler::IrResourcePlan>> lentPlans(programs.size());
-            std::vector<std::shared_ptr<const ShaderRecompiler::RecompileResult>> owners;
-            Core::TeachInputs inputs;
-            if (Core::Front::TeachBounds()) {
-                for (std::size_t i = 0; i < programs.size(); ++i) {
-                    const auto& capture = stageCaptures[i];
-                    if (served[i] == nullptr && capture.capture != nullptr && capture.compiled != nullptr) {
-                        if (CacheableResult(*capture.compiled)) lentPlans[i] = capture.capture->plan;
-                        else if (i < 32) inputs.uncacheable |= 1u << i;
-                    }
-                    if (matched[i] != nullptr && matched[i]->compiled != nullptr) owners.push_back(matched[i]->compiled);
-                    if (capture.compiled != nullptr) owners.push_back(capture.compiled);
-                }
-                owners.insert(owners.end(), compiledStages.begin(), compiledStages.end());
-                inputs.plans = lentPlans;
-                inputs.vertexInfos = vertexInfos;
-                inputs.owners = owners;
-            }
-            inputs.key = tail.core.key;
-            inputs.decode = decode;
-            inputs.programs = programs;
-            inputs.stages = stages;
-            inputs.served = served;
-            inputs.recipe = recipe;
-            inputs.writes = DrawWriteRanges(graphics, stages, ExactDrawWrites());
-            inputs.shape = tail.shapeKey;
-            Core::Front::Get().Teach(inputs);
-        }
-        if (tail.site.eligible) {
-            std::vector<std::shared_ptr<DispatchVariant>> served(programs.size());
-            for (std::size_t i = 0; i < programs.size(); ++i) served[i] = drawHit || reused[i] ? matched[i] : fresh[i];
-            DrawSiteAccess::Retain(*this, shapeKey, tail.site, decode, programs, served, recipeStages, recipeKey, recipeDonor, patchedStages);
-        }
         auto writes = drawWriteRanges(graphics, stages);
         const auto commitQueue = submission.queue;
         const auto commitPacket = tail.packetOpcode;
         const auto epoch = DrawFinisher::OnFinisherThread() ? tail.epoch : DrawPipeline::EpochToken().load(std::memory_order_relaxed);
         auto reads = QueuedDrawReadRanges(drawParameters, stages);
-        if (DrawFinisher::OnFinisherThread() && FinisherPrecollect() && GuestMemory::CollectEpoch() != 0) {
-            const auto walkEpoch = GuestMemory::HeldCollectEpoch();
-            const bool handsOver = CollectWalker::Enabled();
-            const auto precollect = [&](std::uint64_t address, std::uint64_t bytes) {
-                if (handsOver) CollectWalker::Get().Offer(walkEpoch, address, bytes);
-                else GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes));
-            };
-            if (recipe != nullptr) {
-                for (const auto& [address, bytes] : recipe->surfaces) precollect(address, bytes);
-            }
-            if (FinisherInputPrecollect()) {
-                for (const auto& [begin, end] : reads) {
-                    if (end - begin <= FinisherInputPrecollectBytes) precollect(begin, end - begin);
-                }
-            }
-        }
-        auto commit = [this, localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), recipeKey, recipeDonor, recipeOrigin, ownKey, contentKey = std::move(contentKey), byContent, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
+        auto contentKey = recipe == nullptr && DrawFinisher::OnFinisherThread() ? localDevice->DrawContentKey(decode->state, drawParameters, stages) : std::vector<std::uint32_t>{};
+        auto commit = [this, contentKey = std::move(contentKey), localDevice = std::move(localDevice), decode = std::move(decode), drawParameters, stages = std::move(stages), snapshots = std::move(snapshots), recipe = std::move(recipe), recipeStages = std::move(recipeStages), drawKey, recipeDonor, shape = tail.shapeKey, commitQueue, commitPacket, epoch, trace = trace, writablePrograms = std::move(writablePrograms), results = std::move(results), memory = std::move(memory), linked = std::move(linked), stageCaptures = std::move(stageCaptures), matched = std::move(matched), matchedRegions = std::move(matchedRegions), fresh = std::move(fresh), decodeReads = std::move(decodeReads), shaderMemory = std::move(shaderMemory), entry = std::move(entry), dataEntry = std::move(dataEntry), compiledStages = std::move(compiledStages), stageData = std::move(stageData)]() mutable {
             DrawPipeline::FollowEpoch(epoch);
             GuestMemory::SetCurrentPacket(commitPacket, commitQueue);
-            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, recipeKey, recipeDonor, trace, shape, recipeOrigin, ownKey, contentKey, byContent);
+            commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey, recipeDonor, trace, shape, contentKey.empty() ? nullptr : &contentKey);
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
         DrawPipeline::Queue0().Enqueue(DrawPipeline::CommitKind::Draw, [held] { (*held)(); }, std::move(writes), 0, {}, std::move(reads), true);
@@ -1922,12 +1424,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         const RecaptureScope recapture;
         return draw(*tail.queue, tail.packet, submission, tail.packetOffset, rejected);
     }
-    noteRecipeDecision();
     noteDrawWriters(stages, submission.queue);
     phaseTiming.Phase(DrawRowVectors);
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, byContent ? Origin::Content : recipeOrigin) == RecipeOutcome::Recorded) {
-            Graphics::NoteDrawSite(tail.shapeKey);
+        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) {
             phaseTiming.Phase(DrawRowGraphics);
             timing.Mark("draw_and_resource_release");
             return drawn();
@@ -1935,15 +1435,10 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
 
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
-    const bool recipeWanted = !recipeStages.empty() || contentKey != nullptr;
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeWanted ? &built : nullptr, tracePtr, tail.shapeKey);
-    Graphics::NoteDrawSite(tail.shapeKey);
-    if (built == nullptr && recipeWanted) VulkanDevice::NoteDrawRecipeUnbuilt();
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, tail.shapeKey);
     phaseTiming.Phase(DrawRowGraphics);
-    if (built != nullptr && contentKey != nullptr) AttachContentRecipe(contentKey, built);
-    if (built != nullptr && ownKey != 0) attachDrawRecipe(ownKey, recipeStages, built);
-    if (built != nullptr && !recipeStages.empty()) attachDrawRecipe(recipeKey, recipeStages, std::move(built), recipeDonor, recipeOrigin);
+    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);
     timing.Mark("draw_and_resource_release");
     return drawn();
 }
@@ -1973,6 +1468,16 @@ void Driver::restartFinishedDraw(DrawTail& tail) {
             program.snapshot = std::move(snapshot);
         }
     }
+    if (tail.drawHit && !tail.userPatches.empty()) {
+        if (verifyDrawRecipe()) {
+            std::lock_guard cacheLock(drawCacheMutex);
+            ++drawEntryCounters.restartPatchSkipped;
+        } else {
+            auto patched = std::make_shared<DrawDecode>(*tail.decode);
+            for (const auto& patch : tail.userPatches) patched->programs[patch.program].userData[patch.index] = patch.value;
+            tail.decode = std::move(patched);
+        }
+    }
     const auto& programs = *tail.programs;
     const auto& graphics = tail.decode->state;
     const auto& roles = tail.decode->roles;
@@ -1993,11 +1498,7 @@ void Driver::restartFinishedDraw(DrawTail& tail) {
     tail.dataCandidates.assign(count, {});
     tail.reused.assign(count, false);
     tail.stageData.assign(count, {});
-    tail.shapeMisses.assign(count, DrawShapeMiss::NoStage);
-    tail.shapeWords.assign(count, DrawShapeWord::Count);
-    tail.vertexDecoded.assign(count, true);
     tail.dataEntry = nullptr;
-    tail.dataEntries.clear();
     tail.drawHit = false;
     tail.verifyHit = false;
     tail.patchedStages = false;
@@ -2008,14 +1509,14 @@ void Driver::restartFinishedDraw(DrawTail& tail) {
         if (program.binary.stage == Stage::Fragment || roles[i] == Role::GeometryBack) continue;
         tail.vertexInfos[i] = DecodeOrderedVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, tail.decodeReads[i], 8u - program.firstUserSgpr);
         if (!tail.vertexInfos[i]) continue;
-        tail.vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports;
+        tail.vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, tail.reg207, program.tailContinuation.get()) | graphics.layerExports | graphics.viewportExports;
         tail.vertexInfos[i]->depthRemapMode = graphics.depthRemap.mode;
         Graphics::ApplyPointSize(graphics, *tail.vertexInfos[i]);
     }
     tail.shaderMemory = std::make_unique<ShaderMemory>(tail.memory, &queryPendingWrite, &observePendingWrite, hookWaitCounter(), &QueryPendingSpan);
 }
 
-void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const std::shared_ptr<DrawEntry>& recipeDonor, VulkanDevice::DrawTraceContext trace, std::uint64_t shape, VulkanDevice::DrawRecipeOrigin origin, std::uint64_t ownKey, const std::shared_ptr<const DrawContentKey>& contentKey, bool byContent) {
+void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t queue, const Graphics::State& graphics, const Pm4::DrawParameters& drawParameters, std::span<const Graphics::CompiledShader> stages, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const std::vector<std::shared_ptr<DispatchVariant>>& recipeStages, std::uint64_t drawKey, const std::shared_ptr<DrawEntry>& recipeDonor, VulkanDevice::DrawTraceContext trace, std::uint64_t shape, const std::vector<std::uint32_t>* contentKey) {
     const auto* tracePtr = trace.token != 0 ? &trace : nullptr;
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -2030,20 +1531,12 @@ void Driver::commitDraw(std::shared_ptr<VulkanDevice> localDevice, std::uint32_t
     recordLabelsForPacket(localDevice.get(), queue);
     noteDrawWriters(stages, queue);
     if (recipe != nullptr) {
-        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr, byContent ? VulkanDevice::DrawRecipeOrigin::Content : origin) == RecipeOutcome::Recorded) {
-            Graphics::NoteDrawSite(shape);
-            return;
-        }
+        if (localDevice->DrawFromRecipe(graphics, drawParameters, stages, snapshots, recipe, tracePtr) == RecipeOutcome::Recorded) return;
         VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Restart, VulkanDevice::RecipeKind::Draw);
     }
-    const bool recipeWanted = !recipeStages.empty() || contentKey != nullptr;
     std::shared_ptr<const DrawRecipe> built;
-    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeWanted ? &built : nullptr, tracePtr, shape);
-    Graphics::NoteDrawSite(shape);
-    if (built == nullptr && recipeWanted) VulkanDevice::NoteDrawRecipeUnbuilt();
-    if (built != nullptr && contentKey != nullptr) AttachContentRecipe(contentKey, built);
-    if (built != nullptr && ownKey != 0) attachDrawRecipe(ownKey, recipeStages, built);
-    if (built != nullptr && !recipeStages.empty()) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor, origin);
+    localDevice->Draw(graphics, drawParameters, stages, snapshots, recipeStages.empty() ? nullptr : &built, tracePtr, shape, contentKey);
+    if (built != nullptr) attachDrawRecipe(drawKey, recipeStages, std::move(built), recipeDonor);
 }
 
 }

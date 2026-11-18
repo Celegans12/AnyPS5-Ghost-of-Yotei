@@ -1,22 +1,12 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawCache.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include <algorithm>
 #include <bit>
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include <array>
-#include <cstdio>
 #include <cstdlib>
-#include "prx/libSceAgcDriver/Execution/include/HandoffSpin.hpp"
-#include <iterator>
-#include <limits>
 #include <mutex>
-#include <stdexcept>
-#include <string>
-#include <thread>
-#include <vector>
 
 namespace AgcDriver::DriverDetail {
 
@@ -47,25 +37,6 @@ bool Driver::drawStageDataHits() {
     return hits;
 }
 
-bool Driver::drawShapeUserWords() {
-    static const bool enabled = std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") == nullptr && !stampValidate();
-    return enabled;
-}
-
-bool Driver::shapeRecipes() {
-    static const bool enabled = std::getenv("APS5_NO_SHAPE_RECIPES") == nullptr;
-    return enabled;
-}
-
-bool Driver::shapeVertexInputStages() {
-    static const bool enabled = drawShapeUserWords() && std::getenv("APS5_NO_SHAPE_VERTEX_INPUT_STAGES") == nullptr;
-    return enabled;
-}
-
-std::size_t Driver::drawShapeKeys() {
-    return drawShapeUserWords() ? dispatchVariants() : std::size_t{1};
-}
-
 bool Driver::verifyDrawDataHits() {
     static const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
     return verify;
@@ -90,7 +61,7 @@ std::size_t Driver::drawCacheEntries() {
     static const std::size_t entries = [] {
         const char* text = std::getenv("APS5_DRAW_CACHE_ENTRIES");
         const auto parsed = text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull;
-        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{4096};
+        return parsed != 0 ? static_cast<std::size_t>(parsed) : std::size_t{65536};
     }();
     return entries;
 }
@@ -132,14 +103,9 @@ void Driver::accountDrawVariant(const DispatchVariant& variant, bool added) {
 DrawKeySightings::DrawKeySightings(std::size_t keyCount) {
     Graphics::Require(keyCount >= Ways, "draw key sightings need at least one bucket");
     const auto buckets = std::bit_ceil(keyCount / Ways);
-    keys.reset(new std::atomic<std::uint64_t>[buckets * Ways]);
-    filled.reset(new std::atomic<std::uint8_t>[buckets]);
-    next.reset(new std::atomic<std::uint8_t>[buckets]);
-    for (std::size_t at = 0; at < buckets * Ways; ++at) keys[at].store(0, std::memory_order_relaxed);
-    for (std::size_t at = 0; at < buckets; ++at) {
-        filled[at].store(0, std::memory_order_relaxed);
-        next[at].store(0, std::memory_order_relaxed);
-    }
+    keys.assign(buckets * Ways, 0);
+    filled.assign(buckets, 0);
+    next.assign(buckets, 0);
     bucketMask = buckets - 1;
 }
 
@@ -149,15 +115,11 @@ bool DrawKeySightings::SeenBefore(std::uint64_t key) {
     mixed = (mixed ^ (mixed >> 27u)) * 0x94d049bb133111ebull;
     mixed ^= mixed >> 31u;
     const auto bucket = static_cast<std::size_t>(mixed) & bucketMask;
-    auto* ways = keys.get() + bucket * Ways;
-    const auto held = std::min<std::size_t>(filled[bucket].load(std::memory_order_relaxed), Ways);
-    for (std::size_t way = 0; way < held; ++way) {
-        if (ways[way].load(std::memory_order_relaxed) == key) return true;
-    }
-    const auto at = next[bucket].load(std::memory_order_relaxed) % Ways;
-    ways[at].store(key, std::memory_order_relaxed);
-    next[bucket].store(static_cast<std::uint8_t>((at + 1u) % Ways), std::memory_order_relaxed);
-    if (held < Ways) filled[bucket].store(static_cast<std::uint8_t>(held + 1u), std::memory_order_relaxed);
+    auto* ways = keys.data() + bucket * Ways;
+    if (std::find(ways, ways + filled[bucket], key) != ways + filled[bucket]) return true;
+    ways[next[bucket]] = key;
+    next[bucket] = static_cast<std::uint8_t>((next[bucket] + 1u) % Ways);
+    if (filled[bucket] < Ways) ++filled[bucket];
     return false;
 }
 
@@ -202,499 +164,12 @@ bool Driver::drawEntriesThisDraw() {
     return backoff.use(drawCacheUseful().load(std::memory_order_relaxed));
 }
 
-namespace {
-
-constexpr std::size_t CollectEvery = 64;
-constexpr std::size_t CollectAtMost = 4096;
-constexpr std::uint32_t LockSpins = 512;
-
-struct alignas(64) EpochSlot {
-    std::atomic<std::uint64_t> reading{0};
-    std::atomic<bool> owned{false};
-    std::uint32_t depth = 0;
-};
-
-struct Retiree {
-    void* object;
-    void (*release)(void*);
-    std::uint64_t epoch;
-};
-
-struct EpochState {
-    std::array<EpochSlot, DrawCacheEpochs::MaxReaders> slots;
-    std::atomic<std::uint64_t> now{1};
-    std::atomic<std::size_t> seen{0};
-    std::mutex mutex;
-    std::vector<Retiree> retired;
-    std::atomic<std::size_t> retiredCount{0};
-    std::atomic<std::uint64_t> released{0};
-};
-
-EpochState& epochs() {
-    static auto* const state = new EpochState;
-    return *state;
-}
-
-struct EpochThread {
-    EpochState& state;
-    EpochSlot* slot = nullptr;
-    std::size_t index = 0;
-
-    EpochThread() : state(epochs()) {
-        for (std::size_t at = 0; at < state.slots.size(); ++at) {
-            bool expected = false;
-            if (!state.slots[at].owned.compare_exchange_strong(expected, true, std::memory_order_seq_cst)) continue;
-            slot = &state.slots[at];
-            index = at;
-            auto seen = state.seen.load(std::memory_order_seq_cst);
-            while (seen < at + 1 && !state.seen.compare_exchange_weak(seen, at + 1, std::memory_order_seq_cst)) {}
-            return;
-        }
-        throw std::runtime_error("the draw cache has no reader slot left for this thread");
-    }
-    ~EpochThread() {
-        slot->reading.store(0, std::memory_order_seq_cst);
-        slot->owned.store(false, std::memory_order_seq_cst);
-    }
-};
-
-EpochThread& epochThread() {
-    static thread_local EpochThread thread;
-    return thread;
-}
-
-struct alignas(64) DrawCacheShard {
-    std::atomic<bool> busy{false};
-    bool entered = false;
-    bool dirty = false;
-    DrawEntryCounters counters;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> shapeReuses;
-};
-
-struct ShardState {
-    std::array<DrawCacheShard, DrawCacheEpochs::MaxReaders> shards;
-    std::atomic<std::uint64_t> notes{0};
-    std::atomic<std::int64_t> nextReportNs{0};
-};
-
-ShardState& shardState() {
-    static auto* const state = new ShardState;
-    return *state;
-}
-
-DrawCacheShard& ownShard() {
-    static thread_local DrawCacheShard* const own = &shardState().shards[DrawCacheEpochs::ThreadIndex()];
-    return *own;
-}
-
-void takeFlag(DrawCacheShard& shard) {
-    for (std::uint32_t spins = 0; shard.busy.exchange(true, std::memory_order_acquire); ++spins) {
-        if (spins >= 64) std::this_thread::yield();
-    }
-}
-
-void dropFlag(DrawCacheShard& shard) {
-    shard.busy.store(false, std::memory_order_release);
-}
-
-}
-
-DrawCacheEpochs::Reading::Reading() {
-    auto& thread = epochThread();
-    if (thread.slot->depth++ == 0) thread.slot->reading.store(thread.state.now.load(std::memory_order_seq_cst), std::memory_order_seq_cst);
-}
-
-DrawCacheEpochs::Reading::~Reading() {
-    auto& slot = *epochThread().slot;
-    if (--slot.depth == 0) slot.reading.store(0, std::memory_order_release);
-}
-
-std::size_t DrawCacheEpochs::ThreadIndex() {
-    return epochThread().index;
-}
-
-std::size_t DrawCacheEpochs::ThreadsSeen() {
-    return epochs().seen.load(std::memory_order_seq_cst);
-}
-
-void DrawCacheEpochs::Retire(void* object, void (*release)(void*)) {
-    auto& state = epochs();
-    const auto epoch = state.now.fetch_add(1, std::memory_order_seq_cst) + 1;
-    bool collect = false;
-    {
-        std::lock_guard lock(state.mutex);
-        state.retired.push_back({object, release, epoch});
-        state.retiredCount.store(state.retired.size(), std::memory_order_relaxed);
-        collect = state.retired.size() >= CollectAtMost;
-    }
-    if (collect) Collect();
-}
-
-std::size_t DrawCacheEpochs::Collect() {
-    auto& state = epochs();
-    std::vector<Retiree> freed;
-    {
-        std::lock_guard lock(state.mutex);
-        auto oldest = std::numeric_limits<std::uint64_t>::max();
-        const auto seen = state.seen.load(std::memory_order_seq_cst);
-        for (std::size_t at = 0; at < seen; ++at) {
-            const auto reading = state.slots[at].reading.load(std::memory_order_seq_cst);
-            if (reading != 0) oldest = std::min(oldest, reading);
-        }
-        const auto kept = std::partition(state.retired.begin(), state.retired.end(), [&](const Retiree& retiree) { return retiree.epoch > oldest; });
-        freed.assign(kept, state.retired.end());
-        state.retired.erase(kept, state.retired.end());
-        state.retiredCount.store(state.retired.size(), std::memory_order_relaxed);
-    }
-    for (const auto& retiree : freed) retiree.release(retiree.object);
-    state.released.fetch_add(freed.size(), std::memory_order_relaxed);
-    return freed.size();
-}
-
-std::size_t DrawCacheEpochs::Retired() {
-    return epochs().retiredCount.load(std::memory_order_relaxed);
-}
-
-std::uint64_t DrawCacheEpochs::Released() {
-    return epochs().released.load(std::memory_order_relaxed);
-}
-
-void DrawEntryCounters::Add(const DrawEntryCounters& other) {
-    const auto each = [](auto& into, const auto& from) {
-        for (std::size_t i = 0; i < into.size(); ++i) into[i] += from[i];
-    };
-    lookups += other.lookups;
-    absent += other.absent;
-    hits += other.hits;
-    stageValidations += other.stageValidations;
-    stageEqual += other.stageEqual;
-    variantsCompared += other.variantsCompared;
-    inserts += other.inserts;
-    shapeUpdates += other.shapeUpdates;
-    variantsInserted += other.variantsInserted;
-    variantsEvicted += other.variantsEvicted;
-    present += other.present;
-    unstable += other.unstable;
-    touches += other.touches;
-    verifyHits += other.verifyHits;
-    verifyMismatches += other.verifyMismatches;
-    each(misses, other.misses);
-    each(variantHitsByRank, other.variantHitsByRank);
-    validateUs += other.validateUs;
-    registerKeyLookups += other.registerKeyLookups;
-    registerKeyHits += other.registerKeyHits;
-    decodeSkipped += other.decodeSkipped;
-    decodePartial += other.decodePartial;
-    facadeMismatches += other.facadeMismatches;
-    verifyDecodes += other.verifyDecodes;
-    verifyDecodeMismatches += other.verifyDecodeMismatches;
-    keyUs += other.keyUs;
-    absentNewRegisters += other.absentNewRegisters;
-    absentUserWords += other.absentUserWords;
-    absentEvicted += other.absentEvicted;
-    absentNeverInserted += other.absentNeverInserted;
-    evictions += other.evictions;
-    byteEvictions += other.byteEvictions;
-    each(registerKeyMissChanges, other.registerKeyMissChanges);
-    differingSameRuns += other.differingSameRuns;
-    differingWords += other.differingWords;
-    differingRunsChanged += other.differingRunsChanged;
-    dataHits += other.dataHits;
-    dataStagesReused += other.dataStagesReused;
-    dataStagesCompiled += other.dataStagesCompiled;
-    dataVerified += other.dataVerified;
-    stageDataHits += other.stageDataHits;
-    stageDataWords += other.stageDataWords;
-    stageDataVerified += other.stageDataVerified;
-    stageDataInserts += other.stageDataInserts;
-    stageDataPositions += other.stageDataPositions;
-    recordWordsForwarded += other.recordWordsForwarded;
-    recordStagesRecompiled += other.recordStagesRecompiled;
-    recordWordsRefused += other.recordWordsRefused;
-    recordWordsVerified += other.recordWordsVerified;
-    each(shapeHitsByRank, other.shapeHitsByRank);
-    each(shapeReuses, other.shapeReuses);
-    each(shapeMisses, other.shapeMisses);
-    shapeDrawsTried += other.shapeDrawsTried;
-    shapeDraws += other.shapeDraws;
-    shapeIdentityAdmissions += other.shapeIdentityAdmissions;
-    shapeKeysDropped += other.shapeKeysDropped;
-    each(shapeVertexWords, other.shapeVertexWords);
-    shapeVertexReused += other.shapeVertexReused;
-    shapeVertexRebased += other.shapeVertexRebased;
-    shapeVertexCaptured += other.shapeVertexCaptured;
-    shapeVertexVerified += other.shapeVertexVerified;
-    shapeVertexDiffered += other.shapeVertexDiffered;
-}
-
-bool Driver::verifyLockFreeDrawCache() {
-    static const bool verify = std::getenv("APS5_VERIFY_LOCKFREE_DRAW_CACHE") != nullptr;
-    return verify;
-}
-
-bool Driver::lockFreeDrawCache() {
-    static const bool enabled = (std::getenv("APS5_LOCKFREE_DRAW_CACHE") != nullptr || verifyLockFreeDrawCache()) && std::getenv("APS5_NO_LOCKFREE_DRAW_CACHE") == nullptr && !traceDrawCache();
-    return enabled;
-}
-
-DrawCacheAccess::DrawCacheAccess(Driver& owner) : driver(owner), lockFree(Driver::lockFreeDrawCache()) {
-    if (!lockFree || Driver::verifyLockFreeDrawCache()) lockMutex();
-}
-
-DrawCacheAccess::~DrawCacheAccess() {
-    if (shard) leaveShard();
-    if (!held) return;
-    driver.drawCacheMutex.unlock();
-    if (lockFree && DrawCacheEpochs::Retired() >= CollectEvery) DrawCacheEpochs::Collect();
-}
-
-void DrawCacheAccess::lockMutex() {
-    auto& mutex = driver.drawCacheMutex;
-    if (!mutex.try_lock()) {
-        const auto from = std::chrono::steady_clock::now();
-        bool taken = false;
-        for (std::uint32_t spin = 0; lockFree && !taken && spin < LockSpins; ++spin) {
-            SpinPause();
-            taken = mutex.try_lock();
-        }
-        if (!taken) mutex.lock();
-        DrawFinisher::NoteCacheWait(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - from).count()));
-    }
-    held = true;
-    paused = false;
-    if (lockFree) driver.foldDrawCacheNotes();
-}
-
-void DrawCacheAccess::takeShard() {
-    auto& own = ownShard();
-    Graphics::Require(!own.entered, "a draw cache access is nested in another one of its thread");
-    if (!held) takeFlag(own);
-    own.entered = true;
-    own.dirty = true;
-    shard = true;
-}
-
-void DrawCacheAccess::leaveShard() {
-    auto& own = ownShard();
-    own.entered = false;
-    if (!held) dropFlag(own);
-    shard = false;
-}
-
-void DrawCacheAccess::Exclusive() {
-    if (held) return;
-    if (shard) dropFlag(ownShard());
-    lockMutex();
-}
-
-bool DrawCacheAccess::TryExclusive() {
-    if (held) return true;
-    if (!driver.drawCacheMutex.try_lock()) return false;
-    if (shard) dropFlag(ownShard());
-    held = true;
-    paused = false;
-    if (lockFree) driver.foldDrawCacheNotes();
-    return true;
-}
-
-void DrawCacheAccess::Unlock() {
-    if (!held) return;
-    if (shard) takeFlag(ownShard());
-    driver.drawCacheMutex.unlock();
-    held = false;
-    paused = true;
-}
-
-void DrawCacheAccess::Lock() {
-    if (!paused) return;
-    if (shard) dropFlag(ownShard());
-    lockMutex();
-}
-
-DrawEntryCounters& DrawCacheAccess::Counters() {
-    if (!lockFree) return driver.drawEntryCounters;
-    if (!shard) takeShard();
-    return ownShard().counters;
-}
-
-std::shared_ptr<DrawEntry> DrawCacheAccess::Find(std::uint64_t key) {
-    if (!lockFree) {
-        const auto found = driver.drawCache.find(key);
-        return found != driver.drawCache.end() ? found->second : nullptr;
-    }
-    std::shared_ptr<DrawEntry> entry;
-    if (!driver.drawCacheIndex.Find(key, entry)) entry = nullptr;
-    if (Driver::verifyLockFreeDrawCache()) {
-        const auto found = driver.drawCache.find(key);
-        if ((found != driver.drawCache.end() ? found->second : nullptr) != entry) throw std::runtime_error("APS5_VERIFY_LOCKFREE_DRAW_CACHE: the lock-free draw cache index holds another entry than the locked draw cache for key " + std::to_string(key));
-    }
-    return entry;
-}
-
-bool DrawCacheAccess::Contains(std::uint64_t key) {
-    if (!lockFree) return driver.drawCache.contains(key);
-    const bool contained = driver.drawCacheIndex.Contains(key);
-    if (Driver::verifyLockFreeDrawCache() && contained != driver.drawCache.contains(key)) throw std::runtime_error("APS5_VERIFY_LOCKFREE_DRAW_CACHE: the lock-free draw cache index and the locked draw cache disagree on holding key " + std::to_string(key));
-    return contained;
-}
-
-namespace {
-
-DrawShapeRemembered RememberedShape(const std::unordered_map<std::uint64_t, DrawShapeKeys>& shapes, std::uint64_t shape) {
-    DrawShapeRemembered remembered;
-    const auto found = shapes.find(shape);
-    if (found == shapes.end()) return remembered;
-    remembered.count = found->second.count;
-    for (std::size_t rank = 0; rank < found->second.count; ++rank) remembered.keys[rank] = found->second.slots[rank].key;
-    return remembered;
-}
-
-}
-
-DrawShapeRemembered DrawCacheAccess::Shape(std::uint64_t shape) {
-    if (!lockFree) return RememberedShape(driver.drawShapes, shape);
-    DrawShapeRemembered remembered;
-    if (!driver.drawShapeIndex.Find(shape, remembered)) remembered = {};
-    if (Driver::verifyLockFreeDrawCache() && remembered != RememberedShape(driver.drawShapes, shape)) throw std::runtime_error("APS5_VERIFY_LOCKFREE_DRAW_CACHE: the lock-free draw shape index holds other keys than the locked draw shapes for shape " + std::to_string(shape));
-    return remembered;
-}
-
-DrawRelocationKnown DrawCacheAccess::Relocation(std::uint64_t identity) {
-    if (!lockFree) {
-        const auto found = driver.drawRelocations.find(identity);
-        if (found == driver.drawRelocations.end()) return {};
-        return {found->second, &driver.drawRelocationTrials[identity]};
-    }
-    DrawRelocationKnown known;
-    if (!driver.drawRelocationIndex.Find(identity, known)) known = {};
-    if (Driver::verifyLockFreeDrawCache()) {
-        const auto found = driver.drawRelocations.find(identity);
-        if ((found != driver.drawRelocations.end() ? found->second : nullptr) != known.relocation) throw std::runtime_error("APS5_VERIFY_LOCKFREE_DRAW_CACHE: the lock-free draw relocation index holds another relocation than the locked table for shader set " + std::to_string(identity));
-    }
-    return known;
-}
-
-void DrawCacheAccess::NoteShapeReuse(std::uint64_t shape, std::uint64_t key) {
-    if (!lockFree || held) {
-        driver.noteShapeReuse(shape, key);
-        return;
-    }
-    if (!shard) takeShard();
-    ownShard().shapeReuses.emplace_back(shape, key);
-    shardState().notes.fetch_add(1, std::memory_order_release);
-}
-
-void DrawCacheAccess::Report(bool profile) {
-    if (!lockFree) {
-        driver.maybeReportDrawCache(profile);
-        return;
-    }
-    if (!profile) return;
-    const auto now = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
-    auto& next = shardState().nextReportNs;
-    if (now < next.load(std::memory_order_relaxed)) return;
-    next.store(now + 100'000'000, std::memory_order_relaxed);
-    Exclusive();
-    driver.maybeReportDrawCache(profile);
-}
-
-void Driver::foldDrawCacheNotes() {
-    auto& state = shardState();
-    if (state.notes.load(std::memory_order_acquire) == 0) return;
-    state.notes.store(0, std::memory_order_release);
-    auto& own = ownShard();
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> reuses;
-    const auto seen = DrawCacheEpochs::ThreadsSeen();
-    for (std::size_t at = 0; at < seen; ++at) {
-        auto& shard = state.shards[at];
-        const bool mine = &shard == &own && own.entered;
-        if (!mine) takeFlag(shard);
-        reuses.insert(reuses.end(), shard.shapeReuses.begin(), shard.shapeReuses.end());
-        shard.shapeReuses.clear();
-        if (!mine) dropFlag(shard);
-    }
-    for (const auto& [shape, key] : reuses) noteShapeReuse(shape, key);
-}
-
-void Driver::foldDrawCacheShards() {
-    if (!lockFreeDrawCache()) return;
-    auto& state = shardState();
-    auto& own = ownShard();
-    const auto seen = DrawCacheEpochs::ThreadsSeen();
-    for (std::size_t at = 0; at < seen; ++at) {
-        auto& shard = state.shards[at];
-        const bool mine = &shard == &own && own.entered;
-        if (!mine) takeFlag(shard);
-        if (shard.dirty) {
-            drawEntryCounters.Add(shard.counters);
-            const auto lastReport = shard.counters.lastReport;
-            shard.counters = DrawEntryCounters{};
-            shard.counters.lastReport = lastReport;
-            shard.dirty = mine;
-        }
-        if (!mine) dropFlag(shard);
-    }
-}
-
-std::shared_ptr<DrawEntry> Driver::findDrawEntry(std::uint64_t key) {
-    DrawCacheAccess access(*this);
-    return access.Find(key);
-}
-
-void Driver::publishDrawEntry(std::uint64_t key) {
-    if (!lockFreeDrawCache()) return;
-    const auto found = drawCache.find(key);
-    if (found == drawCache.end()) drawCacheIndex.Erase(key);
-    else drawCacheIndex.Publish(key, found->second);
-}
-
-void Driver::publishDrawShape(std::uint64_t shape) {
-    if (!lockFreeDrawCache()) return;
-    if (!drawShapes.contains(shape)) drawShapeIndex.Erase(shape);
-    else drawShapeIndex.Publish(shape, RememberedShape(drawShapes, shape));
-}
-
-void Driver::publishDrawRelocation(std::uint64_t identity) {
-    if (!lockFreeDrawCache()) return;
-    const auto found = drawRelocations.find(identity);
-    if (found == drawRelocations.end()) drawRelocationIndex.Erase(identity);
-    else drawRelocationIndex.Publish(identity, DrawRelocationKnown{found->second, &drawRelocationTrials[identity]});
-}
-
-void Driver::prepareDrawSightings() {
-    std::call_once(drawSightingsOnce, [&] {
-        if (!drawKeySightings) drawKeySightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
-        if (!drawShapeSightings) drawShapeSightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
-        if (!drawStageSightings) drawStageSightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
-    });
-}
-
-bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape, const DrawRelocationPending& pending) {
-    prepareDrawSightings();
-    DrawCacheAccess access(*this);
-    if (access.LockFree()) {
-        if (access.Contains(key)) return true;
-        bool seen = drawKeySightings->SeenBefore(key);
-        if (pending.key == key && pending.identity != 0) {
-            const auto known = access.Relocation(pending.identity);
-            if (pending.alias != 0) {
-                if (drawKeySightings->SeenBefore(pending.alias ^ 0x9e3779b97f4a7c15ull) && known.trial != nullptr) {
-                    auto& state = *known.trial;
-                    if (state.productive || state.hits != 0 || state.admissions < DrawRelocationTrial::ProbationAdmissions) {
-                        if (!state.productive && state.hits == 0) ++state.admissions;
-                        seen = true;
-                    }
-                }
-            } else if (known.relocation == nullptr) {
-                if (drawKeySightings->SeenBefore(pending.identity ^ 0xc2b2ae3d27d4eb4full)) seen = true;
-            }
-        }
-        if (seen || shape == 0 || access.Shape(shape).count != 0) return seen;
-        return drawShapeSightings->SeenBefore(shape);
-    }
+bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape) {
+    std::lock_guard cacheLock(drawCacheMutex);
     if (drawCache.contains(key)) return true;
     if (!drawKeySightings) drawKeySightings.emplace(drawCacheEntries() * DrawKeySightings::Ways);
     bool seen = drawKeySightings->SeenBefore(key);
+    const auto& pending = drawRelocationPending;
     if (pending.key == key && pending.identity != 0) {
         if (pending.alias != 0) {
             const auto trial = drawRelocationTrials.find(pending.identity);
@@ -715,32 +190,19 @@ bool Driver::admitDrawKey(std::uint64_t key, std::uint64_t shape, const DrawRelo
 }
 
 void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::shared_ptr<const DrawDecode> decode, std::uint64_t shape, bool replaceShape) {
-    DrawCacheAccess access(*this);
-    access.Exclusive();
+    std::lock_guard cacheLock(drawCacheMutex);
     auto& counters = drawEntryCounters;
-    const auto shapeLimit = drawShapeKeys();
     if (replaceShape && shape != 0) {
         ++counters.shapeUpdates;
-        if (const auto shapeOf = drawShapes.find(shape); shapeOf != drawShapes.end() && !shapeOf->second.Contains(key)) {
-            auto& keys = shapeOf->second;
-            while (keys.count >= shapeLimit) {
-                const auto dropped = keys.slots[keys.count - 1u].key;
-                keys.Erase(dropped);
-                if (shapeLimit > 1) {
-                    ++counters.shapeKeysDropped;
-                    continue;
+        if (const auto shapeOf = drawShapes.find(shape); shapeOf != drawShapes.end() && shapeOf->second != key) {
+            if (const auto previous = drawCache.find(shapeOf->second); previous != drawCache.end()) {
+                for (const auto& variants : previous->second->stages) {
+                    for (const auto& variant : variants) accountDrawVariant(*variant, false);
                 }
-                if (const auto previous = drawCache.find(dropped); previous != drawCache.end()) {
-                    for (const auto& variants : previous->second->stages) {
-                        for (const auto& variant : variants) accountDrawVariant(*variant, false);
-                    }
-                    drawOrder.erase(previous->second->order);
-                    drawCache.erase(previous);
-                    publishDrawEntry(dropped);
-                }
+                drawOrder.erase(previous->second->order);
+                drawCache.erase(previous);
             }
-            if (keys.count == 0 && shapeLimit == 1) drawShapes.erase(shapeOf);
-            publishDrawShape(shape);
+            drawShapes.erase(shapeOf);
         }
     } else {
         ++counters.inserts;
@@ -774,17 +236,7 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         }
     }
     replacement->touched = drawCacheHits;
-    if (replacement->decode != nullptr && shape != 0) {
-        auto& keys = drawShapes[shape];
-        if (!keys.Contains(key)) {
-            while (keys.count >= shapeLimit) {
-                keys.Erase(keys.slots[keys.count - 1u].key);
-                if (shapeLimit > 1) ++counters.shapeKeysDropped;
-            }
-        }
-        keys.PushFront({key, replaceShape && shapeLimit > 1, false});
-        publishDrawShape(shape);
-    }
+    if (replacement->decode != nullptr && shape != 0) drawShapes[shape] = key;
     if (found == drawCache.end()) {
         drawOrder.push_front(key);
         replacement->order = drawOrder.begin();
@@ -794,7 +246,6 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
         drawOrder.splice(drawOrder.begin(), drawOrder, replacement->order);
         found->second = std::move(replacement);
     }
-    publishDrawEntry(key);
     while (drawCache.size() > drawCacheEntries() || (drawCache.size() > 1 && drawCacheVariantBytes > DrawCacheBytes())) {
         const bool overBytes = drawCache.size() <= drawCacheEntries();
         const auto last = drawCache.find(drawOrder.back());
@@ -802,11 +253,9 @@ void Driver::insertDrawEntry(std::uint64_t key, std::vector<std::shared_ptr<Disp
             for (const auto& variant : variants) accountDrawVariant(*variant, false);
         }
         if (traceDrawCache()) traceInsert(traceKeysEvicted, last->first);
-        const auto evicted = last->first;
-        forgetShapeKey(last->second->shape, evicted);
+        if (const auto shapeOf = drawShapes.find(last->second->shape); shapeOf != drawShapes.end() && shapeOf->second == last->first) drawShapes.erase(shapeOf);
         drawOrder.erase(last->second->order);
         drawCache.erase(last);
-        publishDrawEntry(evicted);
         ++drawCacheEvictions;
         ++counters.evictions;
         if (overBytes) {
@@ -822,35 +271,9 @@ void Driver::eraseDrawEntry(std::uint64_t key, const std::shared_ptr<DrawEntry>&
     for (const auto& variants : found->second->stages) {
         for (const auto& variant : variants) accountDrawVariant(*variant, false);
     }
-    forgetShapeKey(found->second->shape, key);
+    if (const auto shapeOf = drawShapes.find(found->second->shape); shapeOf != drawShapes.end() && shapeOf->second == key) drawShapes.erase(shapeOf);
     drawOrder.erase(found->second->order);
     drawCache.erase(found);
-    publishDrawEntry(key);
-}
-
-void Driver::forgetShapeKey(std::uint64_t shape, std::uint64_t key) {
-    const auto shapeOf = drawShapes.find(shape);
-    if (shapeOf == drawShapes.end()) return;
-    shapeOf->second.Erase(key);
-    if (shapeOf->second.count == 0) drawShapes.erase(shapeOf);
-    publishDrawShape(shape);
-}
-
-void Driver::noteShapeReuse(std::uint64_t shape, std::uint64_t key) {
-    const auto shapeOf = drawShapes.find(shape);
-    if (shapeOf == drawShapes.end()) return;
-    shapeOf->second.Use(key);
-    publishDrawShape(shape);
-}
-
-bool Driver::stageIdentitySeen(std::uint64_t identity) {
-    prepareDrawSightings();
-    return drawStageSightings->SeenBefore(identity);
-}
-
-bool Driver::shapeAdmitsRepeatedStage(std::uint64_t shape) {
-    const auto shapeOf = drawShapes.find(shape);
-    return shapeOf == drawShapes.end() || shapeOf->second.Admits();
 }
 
 bool DecodeProgramsCurrent(const DrawDecode& decode, const ShaderRegistry&) {
@@ -866,9 +289,10 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
     if (donor != nullptr) {
         records = donor->recipes.load();
     } else {
-        const auto found = findDrawEntry(key);
-        if (found == nullptr) return nullptr;
-        records = found->recipes.load();
+        std::lock_guard cacheLock(drawCacheMutex);
+        const auto found = drawCache.find(key);
+        if (found == drawCache.end()) return nullptr;
+        records = found->second->recipes.load();
     }
     if (records == nullptr) return nullptr;
     for (const auto& record : *records) {
@@ -877,11 +301,13 @@ std::shared_ptr<const DrawRecipe> Driver::findDrawRecipe(std::uint64_t key, cons
     return nullptr;
 }
 
-void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe, const std::shared_ptr<DrawEntry>& donor, VulkanDevice::DrawRecipeOrigin origin) {
+void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_ptr<DispatchVariant>>& stages, std::shared_ptr<const DrawRecipe> recipe, const std::shared_ptr<DrawEntry>& donor) {
     std::shared_ptr<DrawEntry> entry = donor;
     if (entry == nullptr) {
-        entry = findDrawEntry(key);
-        if (entry == nullptr) return;
+        std::lock_guard cacheLock(drawCacheMutex);
+        const auto found = drawCache.find(key);
+        if (found == drawCache.end()) return;
+        entry = found->second;
     }
     const DrawRecipeRecord attached{std::vector<std::weak_ptr<const DispatchVariant>>(stages.begin(), stages.end()), std::move(recipe)};
     auto old = entry->recipes.load();
@@ -898,7 +324,6 @@ void Driver::attachDrawRecipe(std::uint64_t key, const std::vector<std::shared_p
         records = std::move(next);
     } while (!entry->recipes.compare_exchange_strong(old, records));
     VulkanDevice::NoteRecipe(VulkanDevice::RecipeEvent::Attach, VulkanDevice::RecipeKind::Draw);
-    VulkanDevice::NoteDrawRecipeAttach(origin);
 }
 
 }

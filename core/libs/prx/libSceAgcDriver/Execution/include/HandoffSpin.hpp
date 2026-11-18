@@ -34,10 +34,6 @@ inline std::chrono::nanoseconds HandoffSpinWindow() {
     return window;
 }
 
-inline std::chrono::nanoseconds HandoffSpinWindowOr(const char* configured, std::chrono::nanoseconds shared) {
-    return configured != nullptr ? HandoffSpinWindowFor(configured, UsableProcessors()) : shared;
-}
-
 template<typename TReady>
 bool SpinUntil(std::chrono::nanoseconds window, TReady&& ready) {
     if (ready()) return true;

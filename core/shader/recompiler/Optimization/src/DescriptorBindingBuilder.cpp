@@ -362,7 +362,8 @@ UnnormalizedProof ProveUnnormalized(const ShaderInfo& info, const ResourceSnapsh
         proof.samplers[r] = true;
         const auto clampX = snapshot.samplers[r].dwords[0] & 7u;
         const auto clampY = (snapshot.samplers[r].dwords[0] >> 3u) & 7u;
-        proof.mirroredAxes[r] = (clampX == 1u || clampX == 3u ? 1u : 0u) | (clampY == 1u || clampY == 3u ? 2u : 0u);
+        const auto mirrors = [](std::uint32_t clamp) { return clamp == 1u || clamp == 3u || clamp == 7u; };
+        proof.mirroredAxes[r] = (mirrors(clampX) ? 1u : 0u) | (mirrors(clampY) ? 2u : 0u);
     }
     for (std::uint32_t resource = 0; resource < info.images.size(); resource++) {
         bool exact = proof.images[resource];
@@ -488,11 +489,10 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         auto alignment = static_cast<std::uint32_t>(buffer.typedAlignment);
         if (buffer.descriptorFormatted && format != 0u) alignment = std::max(alignment, std::min(GetFormatInfo(static_cast<IrBufferFormat>(format)).byteSize, 4u));
         if (alignment == 0u || misalignment % alignment != 0u) fail("is a formatted buffer access through a V# whose base is not aligned to its element");
-        const bool block = layout.UsesBlock();
-        if ((registrationModules || block) && buffer.descriptorFormatted) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 1u, fields.word3});
-        if (registrationModules && !block) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 2u, fields.tail});
-        if (registrationModules && !block) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 3u, misalignment});
-        if (!registrationModules && !block) {
+        if (registrationModules && buffer.descriptorFormatted) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 1u, fields.word3});
+        if (registrationModules) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 2u, fields.tail});
+        if (registrationModules) plan.specialization.push_back({PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords + 3u, misalignment});
+        if (!registrationModules) {
             const auto first = PipelineSpecialization::BufferBase + index * PipelineSpecialization::BufferWords;
             plan.specialization.push_back({first, fields.word1});
             plan.specialization.push_back({first + 1u, fields.word3});
@@ -704,13 +704,12 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
     return plan;
 }
 
-DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPlan& plan, std::span<const std::uint32_t> bindings, bool blockModule) const {
+DescriptorBindingPlan DescriptorBindingBuilder::Select(const DescriptorBindingPlan& plan, std::span<const std::uint32_t> bindings) const {
     DescriptorBindingPlan selected;
     std::set<std::uint32_t> remaining(bindings.begin(), bindings.end());
     selected.bindings.reserve(remaining.size());
     for (const auto& binding : plan.bindings) {
-        const bool blockMetadata = blockModule && (binding.descriptor.role == DescriptorRole::GuestBuffers || binding.descriptor.role == DescriptorRole::FlattenedSrt);
-        if (remaining.erase(binding.descriptor.binding) == 0u && !blockMetadata) continue;
+        if (remaining.erase(binding.descriptor.binding) == 0u) continue;
         selected.storageData |= binding.descriptor.role == DescriptorRole::ShaderData;
         selected.bindings.push_back(binding);
     }
@@ -778,6 +777,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
             physical.imageWritten.reserve(physical.imageWritten.size() + tables->elements.size());
             physical.imageAtomic.reserve(physical.imageAtomic.size() + tables->elements.size());
             physical.imageAtomic64.reserve(physical.imageAtomic64.size() + tables->elements.size());
+            physical.imageUintStorage.reserve(physical.imageUintStorage.size() + tables->elements.size());
             physical.imageSamplers.reserve(physical.imageSamplers.size() + tables->elements.size());
             for (const auto& element : tables->elements) {
                 physical.guestDescriptor.insert(physical.guestDescriptor.end(), element.words.begin(), element.words.end());
@@ -788,6 +788,7 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
                 physical.imageWritten.push_back(ImageBindingResourceClass(element.kind) == ImageResourceClass::Storage);
                 physical.imageAtomic.push_back(element.atomic);
                 physical.imageAtomic64.push_back(element.atomic64);
+                physical.imageUintStorage.push_back(ImageBindingResourceClass(element.kind) == ImageResourceClass::Storage && RuntimeAbi::UintStorageImageBinding(static_cast<std::uint32_t>(element.kind)));
                 std::uint64_t samplers = 0;
                 for (std::uint32_t sampler = 0; sampler < entry.tableSamplerMasks.size(); ++sampler) {
                     if (((element.samplers >> sampler) & 1u) != 0u) samplers |= entry.tableSamplerMasks[sampler];
@@ -849,7 +850,6 @@ void DescriptorBindingBuilder::Populate(BindingAllocationResult& allocation, con
         allocation.pushConstants.resize(static_cast<std::size_t>(shaderData.size()) * sizeof(std::uint32_t));
         std::memcpy(allocation.pushConstants.data(), shaderData.data(), allocation.pushConstants.size());
     }
-    allocation.pushConstants.resize(allocation.pushConstants.size() + static_cast<std::size_t>(layout.BlockAddressDwords()) * sizeof(std::uint32_t));
 }
 
 }

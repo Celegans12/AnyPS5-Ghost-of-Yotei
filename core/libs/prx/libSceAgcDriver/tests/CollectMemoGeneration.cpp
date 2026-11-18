@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <exception>
 #include <functional>
 #include <iostream>
 #include <limits>
@@ -420,55 +421,6 @@ void CheckLaterThreadReusesWalk() {
     Require(stage.load() == 3, "a walk made after another thread's ordering point did not answer that thread");
 }
 
-void CheckAdoptedEpochReusesWalk() {
-    const auto address = Base + 66 * Block;
-    const auto probe = address + 3 * Page;
-    std::atomic<int> stage{0};
-    std::uint64_t leader = 0;
-    std::uint64_t observed = 0;
-    bool reused = false;
-    bool hidden = false;
-    bool kept = false;
-    bool found = false;
-    bool fresh = false;
-    std::thread follower([&] {
-        BumpCollectEpoch();
-        const auto own = HeldCollectEpoch();
-        stage.store(1);
-        while (stage.load() != 2) std::this_thread::yield();
-        AdoptCollectEpoch(leader);
-        const bool adopted = own < leader && HeldCollectEpoch() == leader;
-        Store(probe);
-        const auto before = OsWalks();
-        reused = adopted && CollectWrites(address, Block) != 0 && OsWalks() == before;
-        hidden = UnchangedSince(probe & ~(Page - 1), Page, observed);
-        BumpCollectEpoch();
-        const auto newer = HeldCollectEpoch();
-        AdoptCollectEpoch(leader);
-        kept = HeldCollectEpoch() == newer;
-        const auto again = OsWalks();
-        found = CollectWrites(address, Block) != 0 && OsWalks() > again && !UnchangedSince(probe & ~(Page - 1), Page, observed);
-    });
-    while (stage.load() != 1) std::this_thread::yield();
-    BumpCollectEpoch();
-    leader = HeldCollectEpoch();
-    Require(CollectWrites(address, Block) != 0, "the leader's collect failed");
-    observed = TrackerGeneration();
-    stage.store(2);
-    follower.join();
-    std::thread unbumped([&] {
-        AdoptCollectEpoch(leader);
-        const auto before = OsWalks();
-        fresh = HeldCollectEpoch() == leader && CollectWrites(address, Block) != 0 && OsWalks() == before;
-    });
-    unbumped.join();
-    Require(reused, "a thread that took another thread's epoch walked a range that thread had walked in it");
-    Require(hidden, "a collect in a taken epoch found a store made after the walk that answered it");
-    Require(kept, "taking an older epoch moved a thread's epoch back");
-    Require(found, "a thread's own newer epoch reused a walk made before it and hid a store");
-    Require(fresh, "a thread that never bumped did not reuse a walk made in the epoch it took");
-}
-
 void CheckEarlierWalkDoesNotAnswerLaterEpoch() {
     const auto address = Base + 49 * Block + 2 * Page;
     BumpCollectEpoch();
@@ -621,382 +573,6 @@ void CheckCoverageGapsAndInvalidations() {
     Require(Walked(Base + Block, 3 * Block, probe), "an unwatch retained a merged observation");
 }
 
-#ifdef _WIN32
-void CheckWatchCallsCounted() {
-    BumpCollectEpoch();
-    const auto address = Base + 62 * Block;
-    const auto before = CollectCounted();
-    Require(CollectWrites(address, Block) != 0, "the first collect failed");
-    const auto walked = CollectCounted();
-    Require(walked.watchCalls > before.watchCalls, "a walk was not counted as a write-watch call");
-    Require(walked.committerWatchCalls == before.committerWatchCalls, "a walk off the committer was counted as the committer's");
-    Require(CollectWrites(address, Block) != 0 && CollectCounted().watchCalls == walked.watchCalls, "a memo hit was counted as a write-watch call");
-    std::uint64_t counted = 0;
-    std::uint64_t committer = 0;
-    bool collected = false;
-    std::thread marked([&] {
-        MarkProofThread();
-        BumpCollectEpoch();
-        const auto from = CollectCounted();
-        collected = CollectWrites(address, Block) != 0;
-        const auto to = CollectCounted();
-        counted = to.watchCalls - from.watchCalls;
-        committer = to.committerWatchCalls - from.committerWatchCalls;
-    });
-    marked.join();
-    Require(collected, "the committer's collect failed");
-    Require(counted != 0 && committer == counted, "the committer's write-watch calls were not attributed to it");
-}
-#endif
-
-void CheckTrackerWaitsCounted() {
-    const auto mark = static_cast<std::size_t>(TrackerLockSite::Mark);
-    const auto collect = static_cast<std::size_t>(TrackerLockSite::Collect);
-    const auto address = Base + 66 * Block;
-    bool charged = false;
-    for (int attempt = 0; attempt < 20 && !charged; ++attempt) {
-        const auto before = LockCounted();
-        std::atomic<bool> started{false};
-        std::thread marker;
-        {
-            PausedWalk walker(1, [&] { CollectWritesUncached(address, Block); });
-            marker = std::thread([&] {
-                MarkProofThread();
-                started.store(true);
-                MarkWritten(address + 2 * Page, Page);
-            });
-            while (!started.load()) std::this_thread::yield();
-            std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            walker.Release();
-        }
-        marker.join();
-        const auto after = LockCounted();
-        const auto& was = before.tracker[mark];
-        const auto& now = after.tracker[mark];
-        Require(now.acquisitions == was.acquisitions + 1, "a marked store was not counted as one tracker acquisition");
-        Require(after.tracker[collect].acquisitions == before.tracker[collect].acquisitions + 1, "a collect was not counted as one tracker acquisition");
-        Require(now.waits - was.waits <= 1, "one acquisition was counted as several waits");
-        if (now.waits == was.waits) continue;
-        const auto waited = now.waitNs - was.waitNs;
-        Require(waited != 0, "a wait for the tracker took no time");
-        Require(now.behindNs[collect] - was.behindNs[collect] == waited, "a wait behind a collect was not charged to it");
-        Require(now.committerWaits == was.committerWaits + 1 && now.committerWaitNs - was.committerWaitNs == waited, "the committer's wait was not attributed to it");
-        std::uint64_t bucketed = 0;
-        for (std::size_t bucket = 0; bucket < LockCounts::WaitBuckets; ++bucket) bucketed += now.waitsBelow[bucket] - was.waitsBelow[bucket];
-        Require(bucketed == 1, "a wait was not counted in one duration bucket");
-        const auto report = LockReport(before, after);
-        Require(report.find(" mark 1 acquired, 1 waited") != std::string::npos && report.find("behind collect") != std::string::npos, "the lock report does not name the wait: " + report);
-        charged = true;
-    }
-    Require(charged, "a store made while a walk held the tracker never waited for it");
-}
-
-void CheckSettledGenerationDuringWalk() {
-    BumpCollectEpoch();
-    const auto block = Base + 68 * Block;
-    const auto page = block + 3 * Page;
-    Require(CollectWritesUncached(block, Block) != 0, "the block was not collected");
-    const auto before = SettledGeneration();
-    Require(before == TrackerGeneration(), "the settled generation is not the tracker's while no update runs");
-    const auto counted = LockCounted().tracker[static_cast<std::size_t>(TrackerLockSite::Generation)];
-    Store(page);
-    std::uint64_t during = 0;
-    std::atomic<bool> read{false};
-    {
-        PausedWalk walker(1, [&] { CollectWritesUncached(block, Block); });
-        std::thread reader([&] {
-            during = SettledGeneration();
-            read.store(true);
-        });
-        const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(5);
-        while (!read.load() && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        const bool answered = read.load();
-        walker.Release();
-        reader.join();
-        Require(answered, "the settled generation waited for a walk holding the tracker");
-    }
-    Require(during == before, "the settled generation moved while the only update was still running");
-    Require(!UnchangedSince(page & ~(Page - 1), Page, during), "a walk stamped a store with the generation read while it ran");
-    Require(SettledGeneration() > during, "a finished walk that found a store did not move the settled generation");
-    const auto written = MarkWritten(Base + 69 * Block, Page);
-    Require(written != 0 && SettledGeneration() >= written, "a finished driver store is newer than the settled generation");
-    const auto after = LockCounted().tracker[static_cast<std::size_t>(TrackerLockSite::Generation)];
-    Require(after.unlocked == counted.unlocked + 3 && after.acquisitions == counted.acquisitions, "the settled generation reads were not counted as answered without the tracker");
-}
-
-void CheckSettledGenerationUnderWalks() {
-    constexpr std::size_t Readers = 3;
-    constexpr int Rounds = 1500;
-    const auto first = Base + 72 * Block;
-    std::atomic<bool> stop{false};
-    std::atomic<std::size_t> trusted{0};
-    std::atomic<std::size_t> refused{0};
-    std::vector<std::thread> readers;
-    for (std::size_t reader = 0; reader < Readers; ++reader) {
-        readers.emplace_back([&, reader] {
-            const auto page = first + reader * Block + 5 * Page;
-            for (int round = 0; round < Rounds; ++round) {
-                const auto generation = SettledGeneration();
-                Store(page);
-                if (CollectWritesUncached(page, Page) == 0) refused.fetch_add(1);
-                else if (UnchangedSince(page, Page, generation)) trusted.fetch_add(1);
-            }
-        });
-    }
-    std::thread walker([&] {
-        while (!stop.load()) CollectWritesUncached(first, Readers * Block);
-    });
-    std::thread marker([&] {
-        while (!stop.load()) MarkWritten(first + Readers * Block, Page);
-    });
-    for (auto& reader : readers) reader.join();
-    stop.store(true);
-    walker.join();
-    marker.join();
-    Require(refused.load() == 0, "a collect of a covered page failed under concurrent walks");
-    Require(trusted.load() == 0, "a store made after the settled generation was read was trusted against it");
-}
-
-void CheckEpochStartSeparatesStores() {
-    const auto block = Base + 104 * Block;
-    const auto flag = block + 3 * Page + 16;
-    const auto distant = block + 9 * Page;
-    bool stranger = true;
-    std::thread other([&] { stranger = CollectWritesUncached(flag, 8) != 0 && UnchangedSinceEpochStart(flag, 8); });
-    other.join();
-    Require(!stranger, "a thread that never started an epoch read a range as unchanged since its epoch began");
-    Store(flag);
-    Require(CollectWritesUncached(flag, 8) != 0, "the flag's page was not collected");
-    BumpCollectEpoch();
-    Require(CollectWritesUncached(flag, 8) != 0 && UnchangedSinceEpochStart(flag, 8), "a store collected before the epoch began reads as made in it");
-    Store(distant);
-    Require(CollectWritesUncached(distant, 8) != 0 && UnchangedSinceEpochStart(flag, 8), "a store to another page of the flag's block reads as a store over the flag");
-    Store(flag + 512);
-    Require(CollectWritesUncached(flag, 8) != 0 && !UnchangedSinceEpochStart(flag, 8), "a store to the flag's page made in the epoch reads as older than it");
-    BumpCollectEpoch();
-    Require(CollectWritesUncached(flag, 8) != 0 && UnchangedSinceEpochStart(flag, 8), "a new epoch did not start from the stores collected before it");
-    Store(flag);
-    BumpCollectEpoch();
-    Require(CollectWritesUncached(flag, 8) != 0 && !UnchangedSinceEpochStart(flag, 8), "a store collected only after the epoch began reads as older than it");
-    BumpCollectEpoch();
-    Require(MarkWritten(flag + 64, 8) != 0 && UnchangedSinceEpochStart(flag, 8), "a driver store beside the flag reads as a store over it");
-    Require(MarkWritten(flag, 8) != 0 && !UnchangedSinceEpochStart(flag, 8), "a driver store over the flag made in the epoch reads as older than it");
-    BumpCollectEpoch();
-    Require(UnchangedSinceEpochStart(flag, 8), "a driver store made before the epoch began reads as made in it");
-    const auto held = HeldCollectEpoch();
-    bool taken = true;
-    std::thread taker([&] {
-        AdoptCollectEpoch(held);
-        taken = HeldCollectEpoch() == held && CollectWritesUncached(flag, 8) != 0 && UnchangedSinceEpochStart(flag, 8);
-    });
-    taker.join();
-    Require(!taken, "a thread that took another thread's epoch read a range as unchanged since an epoch it never started");
-}
-
-#ifdef _WIN32
-bool AnsweredWithin(std::atomic<bool>& answered, std::chrono::milliseconds patience) {
-    const auto until = std::chrono::steady_clock::now() + patience;
-    while (!answered.load() && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    return answered.load();
-}
-
-void CheckUnlockedReadsDuringWalk() {
-    BumpCollectEpoch();
-    const auto quiet = Base + 76 * Block;
-    const auto busy = Base + 78 * Block;
-    const auto generation = CollectWritesUncached(quiet, Block);
-    Require(generation != 0 && CollectWritesUncached(busy, Block) != 0, "the blocks were not collected");
-    const auto settled = SettledGeneration();
-    const auto page = busy + 3 * Page;
-    Store(page);
-    const auto unchanged = static_cast<std::size_t>(TrackerLockSite::Unchanged);
-    const auto written = static_cast<std::size_t>(TrackerLockSite::Written);
-    const auto watched = static_cast<std::size_t>(TrackerLockSite::Watched);
-    const auto before = LockCounted();
-    bool quietUnchanged = false;
-    bool quietWritten = true;
-    bool bothUnchanged = false;
-    bool isWatched = false;
-    std::atomic<bool> answered{false};
-    {
-        PausedWalk walker(1, [&] { CollectWritesUncached(busy, Block); });
-        std::thread reader([&] {
-            quietUnchanged = UnchangedSince(quiet + Page, 3 * Page, generation);
-            quietWritten = WrittenSince(quiet, Block, generation);
-            const std::array<UnchangedQuery, 2> queries{{{quiet, Page, generation}, {quiet + 8 * Page, Block - 8 * Page, generation}}};
-            bothUnchanged = UnchangedSinceAll(queries);
-            isWatched = WriteWatched() && Watched(quiet, Block) && !Watched(Page, Page);
-            answered.store(true);
-        });
-        const bool done = AnsweredWithin(answered, std::chrono::seconds(5));
-        walker.Release();
-        reader.join();
-        Require(done, "reads of a block no update touches waited for a walk holding the tracker");
-    }
-    Require(quietUnchanged && !quietWritten && bothUnchanged && isWatched, "a read made without the tracker answered against the table");
-    const auto after = LockCounted();
-    Require(after.tracker[unchanged].unlocked == before.tracker[unchanged].unlocked + 2 && after.tracker[written].unlocked == before.tracker[written].unlocked + 1 && after.tracker[watched].unlocked == before.tracker[watched].unlocked + 3, "reads answered without the tracker were not counted");
-    Require(after.tracker[unchanged].acquisitions == before.tracker[unchanged].acquisitions && after.tracker[written].acquisitions == before.tracker[written].acquisitions, "a read answered without the tracker also took it");
-    Require(!UnchangedSince(page & ~(Page - 1), Page, settled) && WrittenSince(page & ~(Page - 1), Page, settled), "the store a walk stamped is trusted against the generation settled before it");
-    Require(LockCounted().tracker[unchanged].acquisitions == after.tracker[unchanged].acquisitions + 1, "a changed block was answered without the tracker");
-}
-
-void CheckStampedBlockWaitsForItsWalk() {
-    BumpCollectEpoch();
-    const auto block = Base + 80 * Block;
-    const auto generation = CollectWritesUncached(block, Block);
-    Require(generation != 0, "the block was not collected");
-    const auto page = block + 6 * Page;
-    Store(page);
-    bool trusted = true;
-    std::atomic<bool> answered{false};
-    {
-        PausedWalk walker(2, [&] { CollectWritesUncached(block, Block); });
-        std::thread reader([&] {
-            trusted = UnchangedSince(page & ~(Page - 1), Page, generation);
-            answered.store(true);
-        });
-        const bool early = AnsweredWithin(answered, std::chrono::milliseconds(150));
-        walker.Release();
-        reader.join();
-        Require(!early || !trusted, "a block a walk had stamped was read as unchanged before the walk released the tracker");
-    }
-    Require(!trusted, "a store a walk stamped was read as unchanged");
-}
-
-void CheckWalkAloft() {
-    BumpCollectEpoch();
-    const auto walked = Base + 96 * Block;
-    const auto other = Base + 98 * Block;
-    Require(CollectWritesUncached(walked, Block) != 0 && CollectWritesUncached(other, Block) != 0, "the blocks were not collected");
-    const auto page = walked + 5 * Page;
-    Store(page);
-    std::uint64_t aloftGeneration = 0;
-    std::uint64_t otherCollected = 0;
-    std::uint64_t otherMarked = 0;
-    std::uint64_t late = 0;
-    bool otherStored = false;
-    std::atomic<bool> elsewhereAnswered{false};
-    std::atomic<bool> sameAnswered{false};
-    {
-        PausedWalk walker(1, [&] { CollectWritesUncached(walked, Block); });
-        std::thread elsewhere([&] {
-            aloftGeneration = TrackerGeneration();
-            Store(other + 3 * Page);
-            otherCollected = CollectWritesUncached(other, Block);
-            otherStored = !UnchangedSince(other + 3 * Page, Page, aloftGeneration);
-            otherMarked = MarkWritten(other + 8 * Page, Page);
-            elsewhereAnswered.store(true);
-        });
-        std::thread same([&] {
-            CollectWritesUncached(walked + 9 * Page, Page);
-            sameAnswered.store(true);
-        });
-        const bool free = AnsweredWithin(elsewhereAnswered, std::chrono::seconds(5));
-        const bool early = AnsweredWithin(sameAnswered, std::chrono::milliseconds(150));
-        if (free) {
-            elsewhere.join();
-            late = TrackerGeneration();
-        }
-        walker.Release();
-        if (elsewhere.joinable()) elsewhere.join();
-        same.join();
-        Require(free, "a walk, a store mark and a generation read of another block waited for a walk in the air");
-        Require(!early, "a walk of a block started while another walk of it was in the air");
-    }
-    Require(otherCollected != 0 && otherMarked > otherCollected && otherStored, "updates of another block made while a walk was in the air were lost");
-    Require(!UnchangedSince(page & ~(Page - 1), Page, aloftGeneration), "a walk stamped a store with a generation handed out while it was in the air");
-    Require(late >= otherMarked && !UnchangedSince(page & ~(Page - 1), Page, late), "a landed walk stamped its store no newer than the generation of the updates made while it was in the air");
-}
-
-void CheckUnlockedReadsUnderWalks() {
-    constexpr std::size_t Readers = 3;
-    constexpr int Rounds = 1500;
-    const auto first = Base + 84 * Block;
-    std::atomic<bool> stop{false};
-    std::atomic<std::size_t> trusted{0};
-    std::atomic<std::size_t> doubted{0};
-    std::atomic<std::size_t> refused{0};
-    const auto before = LockCounted().tracker[static_cast<std::size_t>(TrackerLockSite::Unchanged)].unlocked;
-    std::vector<std::thread> readers;
-    for (std::size_t reader = 0; reader < Readers; ++reader) {
-        readers.emplace_back([&, reader] {
-            const auto block = first + reader * Block;
-            const auto page = block + (3 + reader) * Page;
-            for (int round = 0; round < Rounds; ++round) {
-                const auto generation = CollectWritesUncached(block, Block);
-                if (generation == 0) {
-                    refused.fetch_add(1);
-                    continue;
-                }
-                if (!UnchangedSince(block, Block, generation) || WrittenSince(block + Page, 2 * Page, generation)) doubted.fetch_add(1);
-                Store(page);
-                if (CollectWritesUncached(page, Page) == 0) refused.fetch_add(1);
-                else if (UnchangedSince(block, Block, generation) || !WrittenSince(page, Page, generation)) trusted.fetch_add(1);
-            }
-        });
-    }
-    std::thread walker([&] {
-        while (!stop.load()) CollectWritesUncached(first, Readers * Block);
-    });
-    std::thread marker([&] {
-        while (!stop.load()) MarkWritten(first + Readers * Block, Page);
-    });
-    std::thread unwatcher([&] {
-        const auto range = first + (Readers + 2) * Block;
-        const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> ranges{{{range, range + Block}}};
-        while (!stop.load()) {
-            Unwatch(range, Block);
-            Rewatch(ranges);
-        }
-    });
-    for (auto& reader : readers) reader.join();
-    stop.store(true);
-    walker.join();
-    marker.join();
-    unwatcher.join();
-    Require(refused.load() == 0, "a collect of a covered block failed under concurrent updates");
-    Require(trusted.load() == 0, "a store collected after a generation was read as unchanged since it");
-    Require(doubted.load() == 0, "a block nobody stored into since its collect was read as changed");
-    Require(LockCounted().tracker[static_cast<std::size_t>(TrackerLockSite::Unchanged)].unlocked > before, "no read was answered without the tracker under concurrent updates");
-}
-
-void CheckUnlockedReadsAcrossRewatch() {
-    BumpCollectEpoch();
-    const auto range = Base + 92 * Block;
-    const auto generation = CollectWritesUncached(range, Block);
-    Require(generation != 0 && UnchangedSince(range, Block, generation), "the block was not collected");
-    Unwatch(range, Block);
-    Require(!UnchangedSince(range, Block, generation), "an unwatched block reads as unchanged");
-    std::atomic<bool> stop{false};
-    std::atomic<std::size_t> trusted{0};
-    std::atomic<std::size_t> reads{0};
-    std::atomic<std::uint64_t> unwatchedSince{generation};
-    std::thread reader([&] {
-        std::uint32_t random = 12345;
-        while (!stop.load()) {
-            random = random * 1664525u + 1013904223u;
-            for (volatile std::uint32_t wait = random >> 19; wait != 0;) wait = wait - 1;
-            if (UnchangedSince(range, Block, unwatchedSince.load())) trusted.fetch_add(1);
-            reads.fetch_add(1);
-        }
-    });
-    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> ranges{{{range, range + Block}}};
-    while (reads.load() == 0) std::this_thread::yield();
-    for (int round = 0; round < 6000; ++round) {
-        Rewatch(ranges);
-        const auto watched = SettledGeneration();
-        Unwatch(range, Block);
-        unwatchedSince.store(watched);
-    }
-    stop.store(true);
-    reader.join();
-    Require(trusted.load() == 0, "a block read as unchanged while it was unwatched or being watched again");
-    Rewatch(ranges);
-    Require(!UnchangedSince(range, Block, unwatchedSince.load()) && Watched(range, Block), "a block watched again reads as unchanged since before it was unwatched");
-}
-#endif
-
 void CheckCoverageThreadAndDriverWrites() {
     BumpCollectEpoch();
     Require(CollectWrites(Base, 4 * Block) != 0, "the covering collection failed");
@@ -1013,6 +589,98 @@ void CheckCoverageThreadAndDriverWrites() {
     Require(CollectWrites(Base + Block, 2 * Block) >= written, "an observation hid a completed driver write generation");
     Require(!UnchangedSince(Base + 2 * Block, Page, before), "an observation hid a driver write stamp");
     Require(Walked(Base + Block, 2 * Block, Base + Block + Page, false), "an uncached collection reused an observation");
+}
+
+template <typename Body>
+void OnThread(Body body) {
+    std::exception_ptr failure;
+    std::thread thread([&] {
+        try {
+            body();
+        } catch (...) {
+            failure = std::current_exception();
+        }
+    });
+    thread.join();
+    if (failure != nullptr) std::rethrow_exception(failure);
+}
+
+void CheckSharedWalks() {
+    const auto range = Base + 87 * Block;
+    const auto probe = range + Page;
+    std::uint64_t pointBeforeWalk = 0;
+    OnThread([&] {
+        BumpCollectEpoch();
+        pointBeforeWalk = CollectSince();
+        Require(Walked(range, Block, probe), "the first collect of the block did not reach the write watch");
+    });
+    OnThread([&] {
+        BumpCollectEpochSince(pointBeforeWalk);
+        Require(!Walked(range, Block, probe), "a collect whose ordering point precedes another thread's walk walked again");
+        RaiseCollectSince(SteadyNanoseconds());
+        Require(Walked(range, Block, probe), "a raised ordering point reused another thread's walk made before it");
+    });
+    OnThread([&] {
+        BumpCollectEpoch();
+        Require(Walked(range, Block, probe), "a collect whose ordering point follows a store reused a walk made before it");
+    });
+    OnThread([&] {
+        BumpCollectEpoch();
+        const auto point = CollectSince();
+        BumpCollectEpochSince(pointBeforeWalk);
+        Require(CollectSince() >= point, "an ordering point moved earlier than the thread's previous one");
+        RaiseCollectSince(point + 1);
+        Require(CollectSince() >= point + 1, "raising the ordering point did not move it");
+    });
+    ShareCollectWalks(false);
+    OnThread([&] {
+        BumpCollectEpochSince(pointBeforeWalk);
+        Require(Walked(range, Block, probe), "a collect reused another thread's walk with sharing off");
+    });
+    ShareCollectWalks(true);
+}
+
+void CheckStoreAfterSubmit() {
+    const auto range = Base + 91 * Block;
+    const auto probe = range + 3 * Page;
+    const auto page = probe & ~(Page - 1);
+    const auto submitted = SteadyNanoseconds();
+    OnThread([&] {
+        BumpCollectEpoch();
+        Require(CollectWrites(range, Block) != 0, "another queue's collect of the range failed");
+    });
+    const auto beforeStore = TrackerGeneration();
+    Store(probe);
+    OnThread([&] {
+        BumpCollectEpochSince(submitted);
+        Require(CollectWrites(range, Block) != 0, "the collect of the packet failed");
+        Require(UnchangedSince(page, Page, beforeStore), "a collect ordered at the submission walked again although another queue walked the range after the submission");
+        BumpCollectEpochSince(0);
+        Require(CollectWrites(range, Block) != 0, "the collect after the wait failed");
+        Require(!UnchangedSince(page, Page, beforeStore), "a collect ordered by a wait the CPU released after its store took a walk made before the store");
+    });
+    for (const bool inherited : {false, true}) {
+        OnThread([&] {
+            BumpCollectEpoch();
+            Require(CollectWrites(range, Block) != 0, "another queue's collect of the range failed");
+        });
+        const auto before = TrackerGeneration();
+        Store(probe);
+        std::uint64_t point = 0;
+        if (inherited) {
+            OnThread([&] {
+                BumpCollectEpoch();
+                point = CollectSince();
+            });
+        } else {
+            point = SteadyNanoseconds();
+        }
+        OnThread([&] {
+            BumpCollectEpochSince(point);
+            Require(CollectWrites(range, Block) != 0, "the collect of the packet failed");
+            Require(!UnchangedSince(page, Page, before), inherited ? "a collect ordered by a label another queue stored after the CPU's store took a walk made before the store" : "a collect of a submission made after the CPU's store took a walk made before the store");
+        });
+    }
 }
 
 }
@@ -1054,7 +722,6 @@ int main(int argc, char** argv) {
         CheckOwnersShareOneWalk();
         CheckRunsAreWalkedOnce();
         CheckLaterThreadReusesWalk();
-        CheckAdoptedEpochReusesWalk();
         CheckEarlierWalkDoesNotAnswerLaterEpoch();
         CheckHitDuringWalkReturnsStable();
         CheckNoHitBeforePublication(1);
@@ -1062,20 +729,8 @@ int main(int argc, char** argv) {
         CheckWaiterNeedingLaterTickWalks();
         CheckMappingChangeForcesWalk();
         CheckFailedRequestPublishesNothing();
-        CheckTrackerWaitsCounted();
-        CheckSettledGenerationDuringWalk();
-        CheckSettledGenerationUnderWalks();
-        CheckEpochStartSeparatesStores();
-#ifdef _WIN32
-        CheckUnlockedReadsDuringWalk();
-        CheckStampedBlockWaitsForItsWalk();
-        CheckWalkAloft();
-        CheckUnlockedReadsUnderWalks();
-        CheckUnlockedReadsAcrossRewatch();
-#endif
-#ifdef _WIN32
-        CheckWatchCallsCounted();
-#endif
+        CheckSharedWalks();
+        CheckStoreAfterSubmit();
     } catch (const std::exception& error) {
         std::cerr << "collect memo generation test failed: " << error.what() << "\n";
         return 1;

@@ -49,11 +49,11 @@ struct DispatchVariant {
     std::vector<SharedWords> shared;
     std::uint64_t forgetSerial = 0;
     std::shared_ptr<const ShaderRecompiler::RecompileResult> compiled;
-    std::shared_ptr<const ShaderRecompiler::IrResourcePlan> plan;
     std::shared_ptr<const std::vector<ShaderRecompiler::RegisteredImageView>> registeredViews;
     std::array<std::uint32_t, 4> meshIndexDescriptor{};
 
     std::shared_ptr<const ShaderSnapshot> shader;
+    std::shared_ptr<const PreparedShaderState::UserDataLink> linking;
 
     AtomicSharedPtr<const Recipe> recipe;
 
@@ -61,20 +61,11 @@ struct DispatchVariant {
     std::vector<std::uint32_t> dataPositions;
     std::vector<std::uint32_t> dataSlots;
     std::uint32_t flatBinding = NoFlatBinding;
-    std::vector<std::uint32_t> bufferPositions;
-    std::vector<std::array<std::uint32_t, 2>> bufferSlots;
-    std::vector<std::uint32_t> maskPositions;
-    [[nodiscard]] const std::vector<std::uint32_t>& MaskedPositions() const { return bufferPositions.empty() ? dataPositions : maskPositions; }
 
     std::uint32_t pushOffset = 0;
     std::vector<std::int8_t> runBases;
     std::uint64_t relocatableWords = 0;
     std::uint64_t userWordsWalked = 0;
-    std::uint64_t userWordsAsValue = 0;
-    std::uint64_t userWordsAsBase = 0;
-    std::uint64_t vertexTableWords = 0;
-    std::uint32_t decodeRuns = 0;
-    std::vector<std::pair<std::uint32_t, ShaderRecompiler::ShaderVertexBufferResource>> vertexPatches;
     std::uint64_t valueWords = 0;
     std::vector<std::array<std::uint32_t, 3>> valueSlots;
     std::vector<std::array<std::uint32_t, 3>> descriptorPatches;
@@ -83,7 +74,6 @@ struct DispatchVariant {
     std::shared_ptr<DispatchVariant> donor;
     std::vector<std::pair<std::uint32_t, std::uint32_t>> shaderDataPatches;
     std::uint64_t userDataMask = ~std::uint64_t{0};
-    std::uint64_t forwardedWords = 0;
     std::shared_ptr<const ShaderRecompiler::ShaderVertexStageInfo> vertexInfo;
 
     std::shared_ptr<ShaderMemory> memory;

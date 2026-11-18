@@ -53,6 +53,19 @@ inline std::optional<std::uint32_t> ConfiguredVblankHz() {
     return configured;
 }
 
+inline bool ParseUnpacedFlips(const char* text) {
+    if (text == nullptr) return false;
+    const std::string_view value(text);
+    if (value.empty() || value == "0") return false;
+    if (value == "1") return true;
+    throw std::runtime_error("APS5_UNPACED_FLIPS must be 1, 0 or empty, not '" + std::string(value) + "'");
+}
+
+inline bool ConfiguredUnpacedFlips() {
+    static const bool configured = ParseUnpacedFlips(std::getenv("APS5_UNPACED_FLIPS"));
+    return configured;
+}
+
 inline std::uint32_t HighVblankHz(std::uint32_t hertz) {
     return std::min(hertz * 2, MAX_VBLANK_HZ);
 }

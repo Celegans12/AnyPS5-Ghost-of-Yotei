@@ -3,37 +3,20 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
-#include "prx/libSceAgcDriver/Core/include/SubmitPolicy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Eq/include/Event.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
-#include "prx/libc/include/GuestWriteWatch.hpp"
 #include <algorithm>
-#include <array>
-#include <atomic>
-#include <functional>
-#include <vector>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
-#include <map>
-#include <memory>
-#include <mutex>
 #include <optional>
-#include <string>
-#include <unordered_map>
-#include <utility>
-#include <chrono>
-#include <cstdio>
-#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -84,7 +67,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
         const auto label = Pm4::DecodeLabelWrite(packet);
         const bool storesNothing = (packet[2] >> 29u) == 0 || (packet[3] | (static_cast<std::uint64_t>(packet[4]) << 32u)) == 0;
         if (label.has_value() || storesNothing) {
-            bumpEpoch(&EpochBumps::interrupts);
+            bumpEpoch(&EpochBumps::drains);
             ++DrainEpochCounts().interrupts;
             GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
             std::lock_guard gpuLock(GuestMemory::GpuMutex());
@@ -216,7 +199,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
                 const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
-                if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
+                if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue, false);
                 if (reason == 0 || reason == 5) {
                     if (reason == 0) ++storesOnGpu;
                     else ++storesBehindCompletions;
@@ -487,13 +470,13 @@ void Driver::commitStore(std::uint32_t queue, std::uint64_t address, std::span<c
         reason = localDevice->WriteLabelOnGpu(address, bytes, stamp, queue);
     }
     if (reason == 0 || reason == 5 || reason == 6) {
-        noteLabelStore(address, bytes, stamp, queue);
+        noteLabelStore(address, bytes, stamp, queue, false);
         if (reason == 0) ++storesOnGpu;
         else ++storesBehindCompletions;
     } else {
         if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
         GuestMemory::Write(address, bytes, 1);
-        noteLabelStore(address, bytes, stamp != 0 ? stamp : ++eventSerial, queue);
+        noteLabelStore(address, bytes, stamp != 0 ? stamp : ++eventSerial, queue, false);
         ++storesOnCpu;
     }
     Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
@@ -529,7 +512,7 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
         writes.emplace_back(address, address + bytes.size());
     }
     if (endOfPipeInterrupt) {
-        bumpEpoch(&EpochBumps::queuedInterrupts);
+        bumpEpoch(&EpochBumps::drains);
         ++DrainEpochCounts().queuedInterrupts;
     }
     auto stored = bytes;
@@ -553,722 +536,19 @@ bool Driver::enqueueLabelPacket(std::span<const std::uint32_t> packet, std::uint
     return true;
 }
 
-namespace {
-
-constexpr std::uint64_t EopProbePage = 4096;
-constexpr std::size_t EopProbeReadLimit = std::size_t{8} << 20u;
-constexpr std::size_t EopProbeBudget = std::size_t{8} << 20u;
-constexpr std::uint64_t EopProbeHistory = 4;
-constexpr std::size_t EopProbeKindQueries = 32;
-constexpr std::size_t EopProbeKinds = static_cast<std::size_t>(Graphics::Recorder::ReadKind::Count);
-constexpr std::array<const char*, EopProbeKinds + 1> EopProbeKindNames{"dispatch-element", "gpu-copy", "address-based", "indirect", "storage-upload", "copy-source", "draw-input", "address-based-read-only", "unknown"};
-
-using EopProbeRange = std::pair<std::uint64_t, std::uint64_t>;
-
-constexpr std::size_t EopGuardWhole = 4096;
-constexpr std::size_t EopGuardEdge = 256;
-constexpr std::size_t EopGuardWindow = 64;
-constexpr std::size_t EopGuardWindows = 14;
-constexpr std::uint64_t EopGuardQuietLimit = 256;
-constexpr std::uint64_t EopGuardKept = 64;
-
-constexpr std::uint32_t EopHeldLinear = 1u << 0u;
-constexpr std::uint32_t EopHeldCopyBack = 1u << 1u;
-constexpr std::uint32_t EopHeldQueuedStore = 1u << 2u;
-constexpr std::uint32_t EopHeldWriteBack = 1u << 3u;
-constexpr std::uint32_t EopHeldCompletionStore = 1u << 4u;
-constexpr std::uint32_t EopHeldCopiedWriter = 1u << 5u;
-constexpr std::uint32_t EopHeldStore = 1u << 6u;
-constexpr std::uint32_t EopHeldOpenWriter = 1u << 7u;
-constexpr std::uint32_t EopHeldRead = 1u << 8u;
-constexpr std::uint32_t EopHeldAddress = 1u << 9u;
-constexpr std::array<const char*, 10> EopHeldNames{"linear-target", "copy-back", "queued-store", "write-back", "completion-store", "copied-writer", "recorded-store", "store-in-open-batch", "changed-read", "address-read"};
-
-struct EopGuardKey {
-    std::uint64_t begin = 0;
-    std::uint64_t end = 0;
-    bool operator==(const EopGuardKey&) const = default;
-};
-
-struct EopGuardKeyHash {
-    std::size_t operator()(const EopGuardKey& key) const {
-        return static_cast<std::size_t>((key.begin * 0x9e3779b97f4a7c15ull) ^ (key.end * 0xc2b2ae3d27d4eb4full));
-    }
-};
-
-struct EopGuardNote {
-    std::uint64_t print = 0;
-    std::uint64_t seen = 0;
-    std::uint64_t quietFrom = 0;
-    std::uint32_t changes = 0;
-    bool printed = false;
-};
-
-struct EopGuardCounts {
-    std::uint64_t labels = 0;
-    std::uint64_t early = 0;
-    std::uint64_t heldOpen = 0;
-    std::uint64_t heldBehind = 0;
-    std::uint64_t heldAddress = 0;
-    std::uint64_t heldUnknown = 0;
-    std::uint64_t heldLinear = 0;
-    std::uint64_t heldCopyBack = 0;
-    std::uint64_t heldWriteBack = 0;
-    std::map<std::uint32_t, std::uint64_t> reasons;
-    std::uint64_t heldStore = 0;
-    std::uint64_t storeBegin = 0;
-    std::uint64_t storeEnd = 0;
-    std::uint64_t storeRanges = 0;
-    std::uint64_t storeBytes = 0;
-    std::uint64_t storeFills = 0;
-    std::uint64_t storeLabels = 0;
-    std::uint64_t judged = 0;
-    std::uint64_t risky = 0;
-    std::uint64_t gpuWritten = 0;
-    std::uint64_t published = 0;
-    std::array<std::uint64_t, EopProbeKinds> riskyKinds{};
-    std::uint64_t lastBegin = 0;
-    std::uint64_t lastEnd = 0;
-    std::uint64_t trapHeld = 0;
-    double guardMs = 0;
-};
-
-struct EopGuard {
-    std::unordered_map<EopGuardKey, EopGuardNote, EopGuardKeyHash> notes;
-    std::vector<Graphics::Recorder::InPlaceRead> finished;
-    std::vector<Graphics::Recorder::InPlaceRead> pending;
-    std::vector<EopProbeRange> writes;
-    std::vector<EopProbeRange> finishedWrites;
-    std::uint64_t label = 0;
-    EopGuardCounts counts;
-    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
-};
-
-EopGuard& eopGuard() {
-    static EopGuard guard;
-    return guard;
-}
-
-void reportEopTraps(std::uint64_t labels, std::uint64_t early, std::uint64_t held) {
-    struct Seen {
-        Graphics::Recorder::EopTrapStatistics driver{};
-        GuestWriteWatch::ReadTrapCounts traps{};
-    };
-    static Seen seen;
-    const auto driver = Graphics::Recorder::EopTrapCounts();
-    GuestWriteWatch::ReadTrapCounts traps{};
-    GuestWriteWatch::GuestWriteWatchReadTrapCounts_nid_postfix(&traps);
-    const auto value = [](std::uint64_t count) { return static_cast<unsigned long long>(count); };
-    const auto trapped = driver.trapped - seen.driver.trapped;
-    const auto faults = traps.faults - seen.traps.faults;
-    const auto resolved = traps.resolved - seen.traps.resolved;
-    const double perTrapped = trapped != 0 ? 1.0 / static_cast<double>(trapped) : 0.0;
-    AgcDriver::ProfilePrint_nid_no_patch("[eop-trap] %llu end-of-pipe labels: %llu delivered at the label, %llu held; read traps set for %llu labels (%.1f page runs, %.0f KiB each, %.1f labels trapped for writes only), %llu refused by the host, %llu refused for the label's own page, %llu released after the GPU; setting %.3f ms and releasing %.3f ms per trapped label; host: %llu faults waited %.3f ms each (%llu resolutions, %.3f ms each), %llu pages opened under the GPU lock, %llu by the resolving thread, %llu forced open after 5 s, %llu retried after a release, %llu settles before a host access (%llu opened), %llu holds active, %llu traps refused; %llu holds kept armed after release, %llu revived armed, %llu swept, %llu asleep pages opened; %llu changing GPU copy sources copied at record (%.0f KiB); verify: %llu CPU write-backs checked, %llu outside the trapped pages; faults by pending write:%s\n",
-        value(labels), value(early), value(held), value(trapped), perTrapped * static_cast<double>(driver.ranges - seen.driver.ranges), perTrapped * static_cast<double>(driver.bytes - seen.driver.bytes) / 1024.0, perTrapped * static_cast<double>(driver.labelRanges - seen.driver.labelRanges), value(driver.refused - seen.driver.refused), value(driver.labelPage - seen.driver.labelPage), value(driver.released - seen.driver.released), perTrapped * static_cast<double>(driver.setNs - seen.driver.setNs) / 1e6, driver.released != seen.driver.released ? static_cast<double>(driver.releaseNs - seen.driver.releaseNs) / 1e6 / static_cast<double>(driver.released - seen.driver.released) : 0.0,
-        value(faults), faults != 0 ? static_cast<double>(traps.waitNs - seen.traps.waitNs) / 1e6 / static_cast<double>(faults) : 0.0, value(resolved), resolved != 0 ? static_cast<double>(traps.resolveNs - seen.traps.resolveNs) / 1e6 / static_cast<double>(resolved) : 0.0,
-        value(traps.bypassOpens - seen.traps.bypassOpens), value(traps.ownOpens - seen.traps.ownOpens), value(traps.forcedOpens - seen.traps.forcedOpens), value(traps.retries - seen.traps.retries), value(traps.settles - seen.traps.settles), value(traps.settleOpens - seen.traps.settleOpens), value(traps.holds), value(traps.refused - seen.traps.refused), value(traps.dormant), value(traps.revived - seen.traps.revived), value(traps.swept - seen.traps.swept), value(traps.dormantOpens - seen.traps.dormantOpens), value(driver.changingCopies - seen.driver.changingCopies), static_cast<double>(driver.changingCopyBytes - seen.driver.changingCopyBytes) / 1024.0, value(driver.checked - seen.driver.checked), value(driver.uncovered - seen.driver.uncovered), Graphics::Recorder::TakeEopTrapSites().c_str());
-    seen.driver = driver;
-    seen.traps = traps;
-}
-
-void reportEopGuard() {
-    if (Graphics::Recorder::EopReadTrap()) reportEopTraps(eopGuard().counts.labels, eopGuard().counts.early, eopGuard().counts.labels - eopGuard().counts.early);
-    auto& guard = eopGuard().counts;
-    const auto value = [](std::uint64_t count) { return static_cast<unsigned long long>(count); };
-    const double perGuard = guard.labels != 0 ? 1.0 / static_cast<double>(guard.labels) : 0.0;
-    const double perStore = guard.storeLabels != 0 ? 1.0 / static_cast<double>(guard.storeLabels) : 0.0;
-    std::string changed;
-    for (std::size_t kind = 0; kind < EopProbeKinds; ++kind) {
-        if (guard.riskyKinds[kind] != 0) changed += (changed.empty() ? "" : ", ") + std::string(EopProbeKindNames[kind]) + " " + std::to_string(guard.riskyKinds[kind]);
-    }
-    if (changed.empty()) changed = "none";
-    std::vector<std::pair<std::uint64_t, std::uint32_t>> ranked;
-    for (const auto& [set, count] : guard.reasons) ranked.emplace_back(count, set);
-    std::sort(ranked.rbegin(), ranked.rend());
-    std::string sets;
-    for (std::size_t index = 0; index < ranked.size() && index < 6; ++index) {
-        std::string names;
-        for (std::size_t bit = 0; bit < EopHeldNames.size(); ++bit) {
-            if ((ranked[index].second & (1u << bit)) != 0) names += (names.empty() ? "" : "+") + std::string(EopHeldNames[bit]);
-        }
-        sets += " " + (names.empty() ? std::string("none") : names) + " " + std::to_string(ranked[index].first);
-    }
-    if (sets.empty()) sets = " none";
-    AgcDriver::ProfilePrint_nid_no_patch("[eop-guard] %llu end-of-pipe interrupt labels: %llu delivered at the label, held behind the recorded work: %llu for a changed or new range read by the open batch, %llu for one read by a batch in flight, %llu for an address-based read, %llu without the reads of the frame; per label %.1f in-place reads judged, %.1f of them under a GPU write of the frame, %.2f unexecuted on a changed or new range (%s; last %llx+%llu), %llu changes published to the draw path, %.3f ms; held for a GPU write to guest memory that had not run: %llu for a drawn linear target stored at the label, %llu for a pending copy-back or queued store, %llu for a CPU write-back or completion store, %llu for a recorded store (last %llx+%llu; %.1f unexecuted write ranges per label that has any, %.0f KiB, %.1f of them fills); labels by the set of reasons that would hold them:%s\n", value(guard.labels), value(guard.early), value(guard.heldOpen), value(guard.heldBehind), value(guard.heldAddress), value(guard.heldUnknown), static_cast<double>(guard.judged) * perGuard, static_cast<double>(guard.gpuWritten) * perGuard, static_cast<double>(guard.risky) * perGuard, changed.c_str(), value(guard.lastBegin), value(guard.lastEnd - guard.lastBegin), value(guard.published), guard.guardMs * perGuard, value(guard.heldLinear), value(guard.heldCopyBack), value(guard.heldWriteBack), value(guard.heldStore), value(guard.storeBegin), value(guard.storeEnd - guard.storeBegin), perStore * static_cast<double>(guard.storeRanges), perStore * static_cast<double>(guard.storeBytes) / 1024.0, perStore * static_cast<double>(guard.storeFills), sets.c_str());
-    guard = {};
-}
-
-std::uint64_t eopGuardMix(std::uint64_t hash, const std::byte* data, std::size_t bytes) {
-    std::size_t offset = 0;
-    for (; offset + 8 <= bytes; offset += 8) {
-        std::uint64_t word;
-        std::memcpy(&word, data + offset, 8);
-        hash = (hash ^ word) * 0x9e3779b97f4a7c15ull;
-        hash ^= hash >> 32u;
-    }
-    if (offset < bytes) {
-        std::uint64_t word = 0;
-        std::memcpy(&word, data + offset, bytes - offset);
-        hash = (hash ^ word) * 0x9e3779b97f4a7c15ull;
-        hash ^= hash >> 32u;
-    }
-    return hash;
-}
-
-std::uint64_t eopGuardPrint(std::uint64_t begin, std::size_t bytes) {
-    const auto* data = reinterpret_cast<const std::byte*>(begin);
-    if (bytes <= EopGuardWhole) return eopGuardMix(bytes, data, bytes);
-    auto hash = eopGuardMix(bytes, data, EopGuardEdge);
-    const auto step = (bytes - EopGuardWindow) / (EopGuardWindows + 1);
-    for (std::size_t window = 1; window <= EopGuardWindows; ++window) hash = eopGuardMix(hash, data + step * window, EopGuardWindow);
-    return eopGuardMix(hash, data + bytes - EopGuardEdge, EopGuardEdge);
-}
-
-bool eopGuardRisky(EopGuard& guard, Graphics::Recorder& recorder, const Graphics::Recorder::InPlaceRead& read) {
-    auto& note = guard.notes[{read.begin, read.end}];
-    if (note.seen != guard.label) {
-        const bool consecutive = note.seen + 1 == guard.label;
-        note.seen = guard.label;
-        ++guard.counts.judged;
-        const auto bytes = static_cast<std::size_t>(read.end - read.begin);
-        const auto after = std::upper_bound(guard.writes.begin(), guard.writes.end(), read.begin, [](std::uint64_t address, const EopProbeRange& write) { return address < write.second; });
-        if (after != guard.writes.end() && after->first < read.end) {
-            note.printed = false;
-            ++guard.counts.gpuWritten;
-        } else if (!GuestMemory::Accessible(reinterpret_cast<const void*>(read.begin), bytes)) {
-            note.printed = false;
-            note.quietFrom = guard.label + 1;
-        } else {
-            const auto print = eopGuardPrint(read.begin, bytes);
-            if (note.printed && (consecutive || note.changes != 0) && print != note.print) {
-                note.changes = std::min<std::uint32_t>(note.changes + 1, 6);
-                note.quietFrom = guard.label + std::min<std::uint64_t>(EopGuardQuietLimit, std::uint64_t{4} << note.changes);
-                recorder.NoteChangingRead(read.begin, read.end);
-                ++guard.counts.published;
-            } else if (!note.printed || !consecutive) {
-                note.quietFrom = std::max(note.quietFrom, guard.label + 2);
-            }
-            note.print = print;
-            note.printed = true;
-        }
-    }
-    return guard.label < note.quietFrom;
-}
-
-bool eopGuardSettled(bool linearStored, std::vector<EopProbeRange>* trapped) {
-    auto& guard = eopGuard();
-    auto& counts = guard.counts;
-    const auto start = std::chrono::steady_clock::now();
-    ++counts.labels;
-    if (++guard.label == 1) guard.notes.reserve(std::size_t{1} << 15u);
-    auto* recorder = Graphics::Recorder::Active();
-    if (recorder == nullptr) {
-        ++counts.early;
-        return true;
-    }
-    const bool lost = recorder->TakeFinishedReads(guard.finished, guard.finishedWrites);
-    const auto opened = recorder->UnexecutedReads(guard.pending);
-    recorder->PendingWriteRanges(guard.writes);
-    guard.writes.insert(guard.writes.end(), guard.finishedWrites.begin(), guard.finishedWrites.end());
-    std::sort(guard.writes.begin(), guard.writes.end());
-    std::size_t merged = 0;
-    for (const auto& write : guard.writes) {
-        if (merged != 0 && write.first <= guard.writes[merged - 1].second) guard.writes[merged - 1].second = std::max(guard.writes[merged - 1].second, write.second);
-        else guard.writes[merged++] = write;
-    }
-    guard.writes.resize(merged);
-    for (const auto& read : guard.finished) static_cast<void>(eopGuardRisky(guard, *recorder, read));
-    bool address = false, open = false, flight = false;
-    for (std::size_t index = 0; index < guard.pending.size(); ++index) {
-        const auto& read = guard.pending[index];
-        if (read.kind == Graphics::Recorder::ReadKind::AddressBased || read.kind == Graphics::Recorder::ReadKind::AddressBasedReadOnly) {
-            address = true;
-            continue;
-        }
-        if (!eopGuardRisky(guard, *recorder, read)) continue;
-        ++counts.risky;
-        ++counts.riskyKinds[static_cast<std::size_t>(read.kind)];
-        counts.lastBegin = read.begin;
-        counts.lastEnd = read.end;
-        (index < opened ? open : flight) = true;
-    }
-    if (guard.label % EopGuardKept == 0) std::erase_if(guard.notes, [&](const auto& note) { return note.second.seen + EopGuardKept < guard.label; });
-    const bool copyBack = recorder->HasPendingCopyBacks() || recorder->HasQueuedStores();
-    const bool writeBack = Graphics::Recorder::PendingWriteBackCompletions() != 0 || Graphics::Recorder::PendingCompletionStores() != 0 || !Graphics::DrawCopiedWriters()->empty();
-    bool store = false;
-    for (const auto& write : recorder->PendingWritesOver(0, std::numeric_limits<std::size_t>::max())) {
-        if (write.value == Graphics::Recorder::ReachValue || recorder->PendingWriteSettled(write.begin, static_cast<std::size_t>(write.end - write.begin))) continue;
-        store = true;
-        counts.storeBegin = write.begin;
-        counts.storeEnd = write.end;
-        ++counts.storeRanges;
-        counts.storeBytes += write.end - write.begin;
-        if (write.value >= 0) ++counts.storeFills;
-    }
-    if (store) ++counts.storeLabels;
-    const auto writer = recorder->NewestGuestWriter();
-    const std::uint32_t reasons = (linearStored ? EopHeldLinear : 0u) | (recorder->HasPendingCopyBacks() ? EopHeldCopyBack : 0u) | (recorder->HasQueuedStores() ? EopHeldQueuedStore : 0u) |
-        (Graphics::Recorder::PendingWriteBackCompletions() != 0 ? EopHeldWriteBack : 0u) | (Graphics::Recorder::PendingCompletionStores() != 0 ? EopHeldCompletionStore : 0u) |
-        (!Graphics::DrawCopiedWriters()->empty() ? EopHeldCopiedWriter : 0u) | (store ? EopHeldStore : 0u) | (writer != 0 && writer == recorder->OpenSerial() ? EopHeldOpenWriter : 0u) |
-        (open || flight ? EopHeldRead : 0u) | (address ? EopHeldAddress : 0u);
-    ++counts.reasons[reasons];
-    const auto judged = std::chrono::steady_clock::now();
-    counts.guardMs += std::chrono::duration<double, std::milli>(judged - start).count();
-    if (!Graphics::Recorder::FlipReadCheck() && judged - guard.lastReport > std::chrono::seconds(10)) {
-        guard.lastReport = judged;
-        reportEopGuard();
-    }
-    if (lost || !Graphics::Recorder::ReadTracking()) {
-        ++counts.heldUnknown;
-        return false;
-    }
-    if (address) {
-        ++counts.heldAddress;
-        return false;
-    }
-    if (trapped != nullptr && !recorder->HasPendingCopyBacks()) {
-        if (open) {
-            ++counts.heldOpen;
-            return false;
-        }
-        if (flight) {
-            ++counts.heldBehind;
-            return false;
-        }
-        trapped->clear();
-        for (const auto& write : recorder->PendingWritesOver(0, std::numeric_limits<std::size_t>::max())) {
-            if (write.value != Graphics::Recorder::ReachValue) trapped->emplace_back(write.begin, write.end);
-        }
-        ++counts.early;
-        return true;
-    }
-    if (linearStored) {
-        ++counts.heldLinear;
-        return false;
-    }
-    if (copyBack) {
-        ++counts.heldCopyBack;
-        return false;
-    }
-    if (writeBack) {
-        ++counts.heldWriteBack;
-        return false;
-    }
-    if (store) {
-        ++counts.heldStore;
-        return false;
-    }
-    if (open) {
-        ++counts.heldOpen;
-        return false;
-    }
-    if (flight) {
-        ++counts.heldBehind;
-        return false;
-    }
-    ++counts.early;
-    return true;
-}
-
-struct EopProbeRun {
-    std::uint64_t begin = 0;
-    std::uint64_t end = 0;
-    std::size_t offset = 0;
-    std::size_t kind = EopProbeKinds;
-};
-
-struct EopProbeFrame {
-    std::uint64_t done = 0;
-    std::uint64_t last = 0;
-    std::uint64_t guest = 0;
-    std::uint64_t writer = 0;
-    bool early = false;
-    std::chrono::steady_clock::time_point at;
-    std::vector<EopProbeRun> runs;
-    std::vector<std::byte> bytes;
-    std::vector<EopProbeRun> smalls;
-    std::vector<std::byte> smallBytes;
-    std::vector<EopProbeRange> writes;
-    std::shared_ptr<EopProbeFrame> previous;
-};
-
-struct EopProbePageNote {
-    std::uint64_t frame = 0;
-    std::size_t kind = EopProbeKinds;
-};
-
-struct EopProbeExample {
-    std::uint64_t count = 0;
-    std::uint64_t changed = 0;
-    std::uint64_t first = 0;
-    std::uint64_t behind = 0;
-    std::size_t kind = 0;
-};
-
-struct EopProbeCounts {
-    std::uint64_t labels = 0;
-    std::uint64_t ended = 0;
-    std::uint64_t batches = 0;
-    std::uint64_t missing = 0;
-    std::uint64_t writes = 0;
-    std::uint64_t noted = 0;
-    std::uint64_t notedBytes = 0;
-    std::uint64_t large = 0;
-    std::uint64_t uncovered = 0;
-    std::uint64_t inaccessible = 0;
-    std::uint64_t overBudget = 0;
-    std::uint64_t checkedBytes = 0;
-    std::uint64_t rewrittenBytes = 0;
-    std::uint64_t shotBytes = 0;
-    std::uint64_t shotRuns = 0;
-    std::uint64_t stamped = 0;
-    std::uint64_t noReads = 0;
-    std::uint64_t noMoved = 0;
-    std::uint64_t noRewritten = 0;
-    std::uint64_t noGuest = 0;
-    std::uint64_t noWriter = 0;
-    std::uint64_t noTouch = 0;
-    std::uint64_t earlyLabels = 0;
-    std::uint64_t earlyChecked = 0;
-    std::uint64_t earlyRewritten = 0;
-    std::uint64_t smallChecked = 0;
-    std::uint64_t smallRewritten = 0;
-    std::array<std::uint64_t, EopProbeKinds + 1> checked{};
-    std::array<std::uint64_t, EopProbeKinds + 1> rewritten{};
-    std::array<std::uint64_t, EopProbeKinds + 1> aged{};
-    std::array<std::uint64_t, EopProbeKinds + 1> moved{};
-    std::array<std::uint64_t, EopProbeKinds + 1> gpuWritten{};
-    double shotMs = 0;
-    double tailMs = 0;
-    double stampedTailMs = 0;
-    double leftReads = 0;
-    double leftMoved = 0;
-    double leftRewritten = 0;
-    double leftGuest = 0;
-    double leftWriter = 0;
-    double leftTouch = 0;
-};
-
-struct EopProbe {
-    std::mutex mutex;
-    std::map<std::uint64_t, EopProbePageNote> pages;
-    std::vector<EopProbeRun> plan;
-    std::size_t planBytes = 0;
-    std::uint64_t cursor = 0;
-    std::uint64_t frame = 0;
-    std::shared_ptr<EopProbeFrame> previous;
-    std::vector<std::vector<std::byte>> spare;
-    std::vector<Graphics::Recorder::InPlaceRead> pending;
-    std::map<EopProbeRange, EopProbeExample> examples;
-    EopProbeCounts counts;
-    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
-};
-
-EopProbe& eopProbe() {
-    static EopProbe probe;
-    return probe;
-}
-
-const std::byte* eopProbeBytes(const EopProbeFrame& frame, std::uint64_t begin, std::uint64_t end, std::size_t* kind) {
-    const auto found = std::upper_bound(frame.runs.begin(), frame.runs.end(), begin, [](std::uint64_t address, const EopProbeRun& run) { return address < run.begin; });
-    if (found == frame.runs.begin()) return nullptr;
-    const auto& run = *std::prev(found);
-    if (end > run.end) return nullptr;
-    if (kind != nullptr) *kind = run.kind;
-    return frame.bytes.data() + run.offset + (begin - run.begin);
-}
-
-void reportEopProbe(EopProbe& probe) {
-    const auto& counts = probe.counts;
-    std::string kinds;
-    std::uint64_t checked = 0, rewritten = 0, aged = 0, moved = 0, gpuWritten = 0;
-    for (std::size_t kind = 0; kind <= EopProbeKinds; ++kind) {
-        checked += counts.checked[kind];
-        rewritten += counts.rewritten[kind];
-        aged += counts.aged[kind];
-        moved += counts.moved[kind];
-        gpuWritten += counts.gpuWritten[kind];
-        if (counts.checked[kind] == 0 && counts.aged[kind] == 0 && counts.gpuWritten[kind] == 0) continue;
-        kinds += " " + std::string(EopProbeKindNames[kind]) + " " + std::to_string(counts.rewritten[kind]) + "/" + std::to_string(counts.checked[kind]) + " (" + std::to_string(counts.moved[kind]) + "/" + std::to_string(counts.aged[kind]) + " changed since the previous label, " + std::to_string(counts.gpuWritten[kind]) + " under a recorded GPU write)";
-    }
-    std::string examples;
-    std::vector<std::pair<EopProbeRange, EopProbeExample>> sorted(probe.examples.begin(), probe.examples.end());
-    std::sort(sorted.begin(), sorted.end(), [](const auto& a, const auto& b) { return a.second.count > b.second.count; });
-    for (std::size_t index = 0; index < sorted.size() && index < 12; ++index) {
-        char text[192];
-        std::snprintf(text, sizeof(text), " %llx+%llu %s x%llu (%llu bytes differ from offset %llu, %llu batches before the newest)", static_cast<unsigned long long>(sorted[index].first.first), static_cast<unsigned long long>(sorted[index].first.second - sorted[index].first.first), EopProbeKindNames[sorted[index].second.kind], static_cast<unsigned long long>(sorted[index].second.count), static_cast<unsigned long long>(sorted[index].second.changed), static_cast<unsigned long long>(sorted[index].second.first), static_cast<unsigned long long>(sorted[index].second.behind));
-        examples += text;
-    }
-    const double perLabel = counts.labels != 0 ? 1.0 / static_cast<double>(counts.labels) : 0.0;
-    const double perEnd = counts.ended != 0 ? 1.0 / static_cast<double>(counts.ended) : 0.0;
-    const double perStamped = counts.stamped != 0 ? 1.0 / static_cast<double>(counts.stamped) : 0.0;
-    const auto value = [](std::uint64_t count) { return static_cast<unsigned long long>(count); };
-    AgcDriver::ProfilePrint_nid_no_patch("[eop] %llu end-of-pipe interrupt labels over 10 s; unfinished at the label: %.1f batches (%llu without a completion record), %.1f recorded GPU write ranges, %.1f in-place reads (%.0f KiB); in-place reads compared by bytes with their copy made at the label once the recorded work finished, %.2f ms later: %llu rewritten of %llu (%llu of %llu bytes), of which %llu of %llu at the %llu labels whose interrupt was delivered at the label, and %llu of %llu on reads of at most 4 KiB copied exactly; by reader, rewritten/compared:%s; not compared: %llu outside the pages copied, %llu under a recorded GPU write, %llu over 8 MiB, %llu inaccessible, %llu followed pages left out of a copy by its budget; changed since the previous label: %llu of %llu; GPU time left of the %.2f ms after the label once the newest unfinished batch has finished that reads in place %.2f ms (%llu labels with none), that reads a range changed since the previous label %.2f ms (%llu with none), that reads a rewritten range %.2f ms (%llu with none), that touches guest memory %.2f ms (%llu with none), that writes guest memory %.2f ms (%llu with none), that writes guest memory or reads it in place %.2f ms (%llu with none), over %llu labels with stamped batches; copy at the label: %.1f runs, %.0f KiB, %.3f ms; rewritten ranges:%s\n", value(counts.labels), static_cast<double>(counts.batches) * perEnd, value(counts.missing), static_cast<double>(counts.writes) * perLabel, static_cast<double>(counts.noted) * perEnd, static_cast<double>(counts.notedBytes) * perEnd / 1024.0, counts.tailMs * perEnd, value(rewritten), value(checked), value(counts.rewrittenBytes), value(counts.checkedBytes), value(counts.earlyRewritten), value(counts.earlyChecked), value(counts.earlyLabels), value(counts.smallRewritten), value(counts.smallChecked), kinds.c_str(), value(counts.uncovered), value(gpuWritten), value(counts.large), value(counts.inaccessible), value(counts.overBudget), value(moved), value(aged), counts.stampedTailMs * perStamped, counts.leftReads * perStamped, value(counts.noReads), counts.leftMoved * perStamped, value(counts.noMoved), counts.leftRewritten * perStamped, value(counts.noRewritten), counts.leftGuest * perStamped, value(counts.noGuest), counts.leftWriter * perStamped, value(counts.noWriter), counts.leftTouch * perStamped, value(counts.noTouch), value(counts.stamped), static_cast<double>(counts.shotRuns) * perLabel, static_cast<double>(counts.shotBytes) * perLabel / 1024.0, counts.shotMs * perLabel, examples.empty() ? " none" : examples.c_str());
-    reportEopGuard();
-    probe.examples.clear();
-    probe.counts = {};
-}
-
-std::shared_ptr<EopProbeFrame> beginEopProbe(bool early) {
-    auto* recorder = Graphics::Recorder::Active();
-    if (recorder == nullptr) return nullptr;
-    auto& probe = eopProbe();
-    std::lock_guard lock(probe.mutex);
-    const auto start = std::chrono::steady_clock::now();
-    if (start - probe.lastReport > std::chrono::seconds(10)) {
-        probe.lastReport = start;
-        reportEopProbe(probe);
-    }
-    auto frame = std::make_shared<EopProbeFrame>();
-    frame->early = early;
-    if (early) ++probe.counts.earlyLabels;
-    const auto unsignaled = static_cast<std::uint64_t>(recorder->UnsignaledBatches());
-    frame->done = std::max(recorder->CompletedThrough(), recorder->Submissions() - std::min(recorder->Submissions(), unsignaled));
-    frame->last = recorder->Recording() ? recorder->OpenSerial() : recorder->Submissions();
-    const auto guest = recorder->NewestGuestWork();
-    frame->guest = guest.has_value() ? *guest : frame->last;
-    frame->writer = recorder->NewestGuestWriter();
-    recorder->PendingWriteRanges(frame->writes);
-    static_cast<void>(recorder->UnexecutedReads(probe.pending));
-    std::sort(probe.pending.begin(), probe.pending.end(), [](const auto& a, const auto& b) { return a.begin != b.begin ? a.begin < b.begin : a.end < b.end; });
-    for (std::size_t index = 0; index < probe.pending.size(); ++index) {
-        const auto& read = probe.pending[index];
-        const auto bytes = static_cast<std::size_t>(read.end - read.begin);
-        if (bytes > EopGuardWhole || (index != 0 && probe.pending[index - 1].begin == read.begin && probe.pending[index - 1].end == read.end)) continue;
-        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(read.begin), bytes)) {
-            ++probe.counts.inaccessible;
-            continue;
-        }
-        frame->smalls.push_back({read.begin, read.end, frame->smallBytes.size(), static_cast<std::size_t>(read.kind)});
-        frame->smallBytes.insert(frame->smallBytes.end(), reinterpret_cast<const std::byte*>(read.begin), reinterpret_cast<const std::byte*>(read.end));
-    }
-    if (!probe.spare.empty()) {
-        frame->bytes = std::move(probe.spare.back());
-        probe.spare.pop_back();
-    }
-    if (frame->bytes.size() < probe.planBytes) frame->bytes.resize(probe.planBytes);
-    frame->runs.reserve(probe.plan.size());
-    std::size_t queries = 0;
-    for (auto run : probe.plan) {
-        const auto bytes = static_cast<std::size_t>(run.end - run.begin);
-        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(run.begin), bytes)) {
-            ++probe.counts.inaccessible;
-            continue;
-        }
-        if (run.kind == EopProbeKinds && queries < EopProbeKindQueries) {
-            ++queries;
-            if (const auto info = recorder->DescribePendingRead(run.begin, bytes)) run.kind = static_cast<std::size_t>(info->kind);
-        }
-        std::memcpy(frame->bytes.data() + run.offset, reinterpret_cast<const void*>(run.begin), bytes);
-        frame->runs.push_back(run);
-        probe.counts.shotBytes += bytes;
-    }
-    frame->previous = std::exchange(probe.previous, frame);
-    ++probe.counts.labels;
-    probe.counts.shotRuns += frame->runs.size();
-    probe.counts.writes += frame->writes.size();
-    frame->at = std::chrono::steady_clock::now();
-    probe.counts.shotMs += std::chrono::duration<double, std::milli>(frame->at - start).count();
-    return frame;
-}
-
-void endEopProbe(const std::shared_ptr<EopProbeFrame>& frame) {
-    auto& probe = eopProbe();
-    std::lock_guard lock(probe.mutex);
-    auto& counts = probe.counts;
-    const double tailMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - frame->at).count();
-    ++counts.ended;
-    counts.tailMs += tailMs;
-    for (const auto& run : frame->runs) {
-        if (run.kind == EopProbeKinds) continue;
-        for (auto page = probe.pages.lower_bound(run.begin / EopProbePage); page != probe.pages.end() && page->first < run.end / EopProbePage; ++page) {
-            if (page->second.kind == EopProbeKinds) page->second.kind = run.kind;
-        }
-    }
-    std::vector<Graphics::Recorder::Completed> tail;
-    std::size_t missing = 0;
-    auto* recorder = Graphics::Recorder::Active();
-    if (recorder != nullptr && frame->last > frame->done) tail = recorder->CompletedBatches(frame->done, std::min(frame->last, frame->done + Graphics::Recorder::CompletedRingSize / 2), missing);
-    counts.missing += missing;
-    counts.batches += tail.size();
-    const auto* previous = frame->previous.get();
-    bool stamped = !tail.empty();
-    double lastEnd = 0, readsEnd = 0, movedEnd = 0, rewrittenEnd = 0, guestEnd = 0, writerEnd = 0;
-    for (const auto& batch : tail) {
-        if (batch.gpuEndNs <= batch.gpuStartNs) stamped = false;
-        lastEnd = std::max(lastEnd, batch.gpuEndNs);
-        if (batch.serial <= frame->guest) guestEnd = std::max(guestEnd, batch.gpuEndNs);
-        if (batch.serial <= frame->writer) writerEnd = std::max(writerEnd, batch.gpuEndNs);
-        bool moved = false, rewritten = false;
-        for (const auto& [begin, end] : batch.reads) {
-            const auto bytes = static_cast<std::size_t>(end - begin);
-            ++counts.noted;
-            counts.notedBytes += bytes;
-            if (bytes > EopProbeReadLimit) {
-                ++counts.large;
-                continue;
-            }
-            if (bytes <= EopGuardWhole) continue;
-            for (auto page = begin / EopProbePage; page <= (end - 1) / EopProbePage; ++page) probe.pages[page].frame = probe.frame;
-            std::size_t kind = EopProbeKinds;
-            const auto* shot = eopProbeBytes(*frame, begin, end, &kind);
-            if (shot == nullptr) {
-                ++counts.uncovered;
-                continue;
-            }
-            if (std::any_of(frame->writes.begin(), frame->writes.end(), [&](const EopProbeRange& write) { return write.first < end && begin < write.second; })) {
-                ++counts.gpuWritten[kind];
-                continue;
-            }
-            if (const auto* before = previous != nullptr ? eopProbeBytes(*previous, begin, end, nullptr) : nullptr) {
-                ++counts.aged[kind];
-                if (std::memcmp(before, shot, bytes) != 0) {
-                    ++counts.moved[kind];
-                    moved = true;
-                }
-            }
-            if (!GuestMemory::Accessible(reinterpret_cast<const void*>(begin), bytes)) {
-                ++counts.inaccessible;
-                continue;
-            }
-            const auto* current = reinterpret_cast<const std::byte*>(begin);
-            ++counts.checked[kind];
-            counts.checkedBytes += bytes;
-            if (frame->early) ++counts.earlyChecked;
-            if (std::memcmp(current, shot, bytes) == 0) continue;
-            std::uint64_t changed = 0, first = bytes;
-            for (std::size_t offset = 0; offset < bytes; ++offset) {
-                if (current[offset] == shot[offset]) continue;
-                if (changed == 0) first = offset;
-                ++changed;
-            }
-            ++counts.rewritten[kind];
-            counts.rewrittenBytes += changed;
-            if (frame->early) ++counts.earlyRewritten;
-            rewritten = true;
-            auto& example = probe.examples[{begin, end}];
-            ++example.count;
-            example.changed = changed;
-            example.first = first;
-            example.behind = frame->last - batch.serial;
-            example.kind = kind;
-        }
-        if (!batch.reads.empty()) readsEnd = std::max(readsEnd, batch.gpuEndNs);
-        if (moved) movedEnd = std::max(movedEnd, batch.gpuEndNs);
-        if (rewritten) rewrittenEnd = std::max(rewrittenEnd, batch.gpuEndNs);
-    }
-    for (const auto& small : frame->smalls) {
-        const auto bytes = static_cast<std::size_t>(small.end - small.begin);
-        if (std::any_of(frame->writes.begin(), frame->writes.end(), [&](const EopProbeRange& write) { return write.first < small.end && small.begin < write.second; })) {
-            ++counts.gpuWritten[small.kind];
-            continue;
-        }
-        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(small.begin), bytes)) {
-            ++counts.inaccessible;
-            continue;
-        }
-        const auto* current = reinterpret_cast<const std::byte*>(small.begin);
-        const auto* shot = frame->smallBytes.data() + small.offset;
-        ++counts.checked[small.kind];
-        ++counts.smallChecked;
-        counts.checkedBytes += bytes;
-        if (frame->early) ++counts.earlyChecked;
-        if (std::memcmp(current, shot, bytes) == 0) continue;
-        std::uint64_t changed = 0, first = bytes;
-        for (std::size_t offset = 0; offset < bytes; ++offset) {
-            if (current[offset] == shot[offset]) continue;
-            if (changed == 0) first = offset;
-            ++changed;
-        }
-        ++counts.rewritten[small.kind];
-        ++counts.smallRewritten;
-        counts.rewrittenBytes += changed;
-        if (frame->early) ++counts.earlyRewritten;
-        auto& example = probe.examples[{small.begin, small.end}];
-        ++example.count;
-        example.changed = changed;
-        example.first = first;
-        example.behind = 0;
-        example.kind = small.kind;
-    }
-    if (stamped) {
-        const auto left = [&](double end) { return end > 0 ? std::min(tailMs, (lastEnd - end) / 1e6) : tailMs; };
-        ++counts.stamped;
-        counts.stampedTailMs += tailMs;
-        counts.leftReads += left(readsEnd);
-        counts.leftMoved += left(movedEnd);
-        counts.leftRewritten += left(rewrittenEnd);
-        counts.leftGuest += left(guestEnd);
-        counts.leftWriter += left(writerEnd);
-        counts.leftTouch += left(std::max(writerEnd, readsEnd));
-        if (readsEnd == 0) ++counts.noReads;
-        if (movedEnd == 0) ++counts.noMoved;
-        if (rewrittenEnd == 0) ++counts.noRewritten;
-        if (guestEnd == 0) ++counts.noGuest;
-        if (writerEnd == 0) ++counts.noWriter;
-        if (writerEnd == 0 && readsEnd == 0) ++counts.noTouch;
-    }
-    if (auto older = std::move(frame->previous); older != nullptr && older.use_count() == 1 && probe.spare.size() < 4) probe.spare.push_back(std::move(older->bytes));
-    ++probe.frame;
-    std::erase_if(probe.pages, [&](const auto& page) { return page.second.frame + EopProbeHistory < probe.frame; });
-    probe.plan.clear();
-    probe.planBytes = 0;
-    const std::size_t room = EopProbeBudget / EopProbePage;
-    const std::size_t taken = std::min(room, probe.pages.size());
-    counts.overBudget += probe.pages.size() - taken;
-    std::vector<std::pair<std::uint64_t, std::size_t>> chosen;
-    chosen.reserve(taken);
-    auto next = probe.pages.lower_bound(probe.cursor);
-    for (std::size_t index = 0; index < taken; ++index) {
-        if (next == probe.pages.end()) next = probe.pages.begin();
-        if (index == taken / EopProbeHistory) probe.cursor = taken < probe.pages.size() ? next->first : 0;
-        chosen.emplace_back(next->first, next->second.kind);
-        ++next;
-    }
-    std::sort(chosen.begin(), chosen.end());
-    for (const auto& [page, kind] : chosen) {
-        const auto begin = page * EopProbePage;
-        if (!probe.plan.empty() && probe.plan.back().end == begin) {
-            probe.plan.back().end += EopProbePage;
-            if (probe.plan.back().kind == EopProbeKinds) probe.plan.back().kind = kind;
-        } else {
-            probe.plan.push_back({begin, begin + EopProbePage, probe.planBytes, kind});
-        }
-        probe.planBytes += EopProbePage;
-    }
-}
-
-}
-
 void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<const std::byte> bytes, std::optional<std::uint32_t> interrupt) {
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Label);
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
     const auto localDevice = device.Load();
     recordDeferredLabels(localDevice.get(), queue);
-    static const bool probed = Graphics::Recorder::FlipReadCheck();
-    static const bool earlyInterrupt = Graphics::Recorder::EarlyEndOfPipe();
-    const bool judged = earlyInterrupt && interrupt.has_value();
-    if (judged && localDevice != nullptr) Graphics::StorageTexture::StoreReadbackBeforeLabel(bytes.empty() ? "readback before interrupt" : "readback before label");
-    const bool linearStored = judged && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear(bytes.empty() ? "interrupt" : "label") != 0;
-    const bool trapping = judged && Graphics::Recorder::EopReadTrap();
-    static std::vector<EopProbeRange> trapRanges;
-    bool early = judged && eopGuardSettled(linearStored, trapping && localDevice != nullptr ? &trapRanges : nullptr);
-    if (early && trapping && localDevice != nullptr) {
-        auto* recorder = Graphics::Recorder::Active();
-        early = recorder != nullptr && recorder->TrapPendingWrites(trapRanges, address, bytes.size());
-        if (!early) {
-            --eopGuard().counts.early;
-            ++eopGuard().counts.trapHeld;
-        }
-    }
-    bool workOpen = linearStored || Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
+    bool workOpen = Graphics::Recorder::RecordedWorkSinceSubmit() != 0;
     int reason = localDevice != nullptr ? 0 : 1;
     if (!bytes.empty()) {
         const auto stamp = ++eventSerial;
-        if (!judged && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
-        reason = early ? 4 : localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
+        if (localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("label") != 0) workOpen = true;
+        reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(address, bytes, stamp, queue) : 4;
         if (reason != 0 && reason != 5 && reason != 6) {
-            if (!early && reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
+            if (reason != 1 && localDevice != nullptr) localDevice->WaitIdle();
             GuestMemory::Write(address, bytes, 4);
         }
         noteLabelStore(address, bytes, stamp, queue);
@@ -1281,16 +561,11 @@ void Driver::commitLabel(std::uint32_t queue, std::uint64_t address, std::span<c
     if (interrupt.has_value()) {
         const auto context = *interrupt;
         bool deferred = false;
-        if (!judged && bytes.empty() && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("interrupt") != 0) workOpen = true;
-        if (probed && queue == 0 && localDevice != nullptr) {
-            if (const auto frame = beginEopProbe(early); frame != nullptr && !localDevice->AfterRecordedWork([frame] { endEopProbe(frame); }, false)) endEopProbe(frame);
-        }
-        if (!early && localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
+        if (bytes.empty() && localDevice != nullptr && queue == 0 && Graphics::StorageTexture::StoreDrawnLinear("interrupt") != 0) workOpen = true;
+        if (localDevice != nullptr && (reason == 0 || reason == 5 || reason == 6)) {
             deferred = localDevice->AfterRecordedWork([this, queue, context] { deliverGuestEopInterrupt(queue, context); }, queue == 0);
             if (deferred && workOpen) localDevice->SubmitRecorded(queue == 0);
         }
-        if (auto* recorder = earlyInterrupt ? Graphics::Recorder::Active() : nullptr) recorder->NoteEndOfPipe(early);
-        if (early && trapping && workOpen && localDevice != nullptr) localDevice->SubmitRecorded(queue == 0);
         if (!deferred) deliverGuestEopInterrupt(queue, context);
     }
     submitDueAfterCommit(localDevice.get());
@@ -1301,21 +576,7 @@ void Driver::submitDueAfterCommit(VulkanDevice* localDevice) {
     const auto pending = Graphics::Recorder::PendingLabelSince();
     const bool due = pending.has_value() && std::chrono::steady_clock::now() - *pending >= labelFlushDeadline();
     const bool capped = batchCap() != 0 && Graphics::Recorder::RecordedWorkSinceSubmit() >= batchCap();
-    if (due || capped) {
-        localDevice->SubmitRecorded(true);
-        return;
-    }
-    if (!SubmitEarly()) return;
-    Core::SubmitState state;
-    state.gpuLoad = localDevice->OpenGpuLoad();
-    Core::SubmitLimits limits;
-    limits.idleLoad = SubmitEarlyLoad();
-    if (state.gpuLoad < limits.idleLoad) return;
-    state.queued = 1;
-    state.gpuIdle = localDevice->GpuIdle();
-    if (Core::AfterOp(state, limits) != Core::SubmitCause::Idle) return;
-    localDevice->SubmitRecorded(false);
-    EarlySubmits().fetch_add(1, std::memory_order_relaxed);
+    if (due || capped) localDevice->SubmitRecorded(true);
 }
 
 }

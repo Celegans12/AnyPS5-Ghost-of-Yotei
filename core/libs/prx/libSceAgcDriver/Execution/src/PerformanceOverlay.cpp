@@ -541,7 +541,6 @@ OverlayContent ComposeOverlayDetails(const OverlayDetailSample& sample) {
     joined("REFUSED SHADERS:", {shown(sample.refusedShaders, [&](std::uint64_t refused) { return count(static_cast<double>(refused)); })});
     joined("", {sample.title.empty() ? std::nullopt : std::optional<std::string>("TITLE: " + OverlayText(sample.title)), sample.presentMode.empty() ? std::nullopt : std::optional<std::string>("PRESENT: " + OverlayText(sample.presentMode))});
     joined("FPS LIMIT:", {shown(sample.fpsLimit, [&](double limit) { return limit < 10000.0 ? rate(limit) : count(limit); })});
-    if (sample.unpacedFlips) add("UNPACED FLIPS");
     return content;
 }
 
@@ -809,8 +808,16 @@ OverlayLayout LayOutOverlay(const OverlayContent& content, VkExtent2D extent, Ov
     return layout;
 }
 
+std::array<std::array<float, 4>, OverlayColorCount> ColorblindOverlayPalette(std::array<std::array<float, 4>, OverlayColorCount> palette) {
+    palette[static_cast<std::size_t>(OverlayColor::Graph)] = {0.34f, 0.71f, 0.91f, 1.0f};
+    palette[static_cast<std::size_t>(OverlayColor::Accent)] = {0.90f, 0.62f, 0.00f, 1.0f};
+    return palette;
+}
+
 std::array<std::array<float, 4>, OverlayColorCount> OverlayPalette(VkFormat format, VkColorSpaceKHR colorSpace) {
-    auto palette = OverlayBasePalette;
+    static const bool colorblind = std::getenv("ANYPS5_OVERLAY_PALETTE") != nullptr && std::string_view(std::getenv("ANYPS5_OVERLAY_PALETTE")) == "colorblind";
+    std::array<std::array<float, 4>, OverlayColorCount> palette{{{0.0f, 0.0f, 0.0f, 0.6f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.35f, 0.8f, 0.35f, 1.0f}, {0.06f, 0.07f, 0.09f, 0.94f}, {0.22f, 0.24f, 0.29f, 1.0f}, {1.0f, 0.78f, 0.2f, 1.0f}, {0.0f, 0.0f, 0.0f, 1.0f}}};
+    if (colorblind) palette = ColorblindOverlayPalette(palette);
     if (colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT) {
         for (auto& color : palette) {
             const float red = srgbDecode(color[0]);
@@ -991,7 +998,6 @@ void PerformanceOverlay::sampleDetails(OverlayStatistics::Clock::time_point at, 
     detailSample.presentMode = std::string(OverlayPresentModeName(info.presentMode));
     if (info.fpsLimit > 0.0) detailSample.fpsLimit = info.fpsLimit;
     else detailSample.fpsLimit.reset();
-    detailSample.unpacedFlips = info.unpacedFlips;
     sampleTrace(at);
     detail.base = std::move(now);
     detail.repeats = 0;

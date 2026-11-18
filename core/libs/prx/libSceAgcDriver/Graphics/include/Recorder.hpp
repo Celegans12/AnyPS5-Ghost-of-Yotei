@@ -4,7 +4,6 @@
 #include "prx/libSceAgcDriver/Graphics/include/BarrierBatch.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PassHazards.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/PassState.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/SubmissionSnapshots.hpp"
 #include <unordered_map>
@@ -30,7 +29,6 @@
 namespace AgcDriver::Graphics {
 
 class Buffer;
-class BufferCache;
 class DeviceBuffer;
 
 class CommandState {
@@ -65,15 +63,15 @@ public:
     CommandState(const CommandState&) = delete;
     CommandState& operator=(const CommandState&) = delete;
 
-    void Begin(VkCommandBuffer commands, bool suppress = true, bool emptyScissor = false);
+    void Begin(VkCommandBuffer commands, bool suppress = true);
     void Invalidate() noexcept;
     VkCommandBuffer Commands() const { return commands; }
-    bool EmptyScissor() const { return emptyScissor; }
     bool Known(Slot slot) const { return (valid & Mask(slot)) != 0; }
     VkPipeline BoundPipeline() const { return pipelineKnown ? pipeline : VK_NULL_HANDLE; }
     void BindPipeline(const Context& context, VkPipeline pipeline, std::uint32_t dynamicSlots);
     void SetViewport(const Context& context, const VkViewport& viewport);
     void SetScissor(const Context& context, const VkRect2D& scissor);
+    void SetViewports(const Context& context, std::span<const VkViewport> viewports, std::span<const VkRect2D> scissors);
     void SetDepthBias(const Context& context, float constant, float clamp, float slope);
     void SetDepthBounds(const Context& context, float minimum, float maximum);
     void SetCullMode(const Context& context, VkCullModeFlags mode);
@@ -114,7 +112,6 @@ private:
     std::uint32_t dynamicSlots = 0;
     VkPipeline pipeline = VK_NULL_HANDLE;
     bool pipelineKnown = false;
-    bool emptyScissor = false;
     VkViewport viewport{};
     VkRect2D scissor{};
     std::array<float, 3> depthBias{};
@@ -169,83 +166,18 @@ public:
     void MarkCovered(VkAccessFlags access);
     void MarkShaderReadsCovered() { MarkCovered(VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT); }
     static bool DispatchOverlapEnabled();
-    static bool EmptyScissorMeasured();
     static void SetDispatchOrder(std::uint32_t queueKey, bool unordered);
     static std::uint32_t TakeDispatchOrder(bool& unordered);
     static constexpr std::uint64_t RunAccessWritten = 1, RunAccessImage = 2;
     using RunAccess = std::array<std::uint64_t, 3>;
     static std::uint32_t PeekUnorderedDispatch();
-    enum class LandingSite : std::uint8_t { Command, DrawPass, LabelStore, StoreRun, Samples, Submit, Sync, KeptBytes, StagingReach, StagingUnknown, DispatchReach, DispatchUnknown, Overlap, ReadTrap, Count };
-    static constexpr std::size_t LandingSites = static_cast<std::size_t>(LandingSite::Count);
-    struct CopyBackReach {
-        std::uint64_t taker = 0;
-        bool known = false;
-        bool staging = false;
-        std::span<const std::pair<std::uint64_t, std::uint64_t>> touched;
-    };
-    VkCommandBuffer OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses, VkAccessFlags* coveredAccess, bool& overlapped, const CopyBackReach& reach);
+    VkCommandBuffer OverlapCommands(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses, VkAccessFlags* coveredAccess, bool& overlapped);
     void DeferDispatchBarrier(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses);
-    VkCommandBuffer RunCommands(std::uint32_t queueKey, const void* owner, std::span<const RunAccess> accesses, bool& inRun, VkAccessFlags* coveredAccess, const CopyBackReach& reach);
+    VkCommandBuffer RunCommands(std::uint32_t queueKey, const void* owner, std::span<const RunAccess> accesses, bool& inRun, VkAccessFlags* coveredAccess);
     void OpenBatch() { ensureOpen(); }
     bool RunOpen() const { return open != nullptr && open->deferredDispatchQueue != 0; }
     void AfterRun(std::function<void(Recorder&)> work);
     bool CloseRunOwing(const void* owner);
-    struct StagedCopyBack {
-        std::uint64_t begin = 0;
-        std::uint64_t end = 0;
-        VkBuffer target = VK_NULL_HANDLE;
-        std::uint64_t targetBase = 0;
-        std::shared_ptr<Buffer> shadow;
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
-        std::uint64_t taker = 0;
-        bool guardable = false;
-        std::shared_ptr<void> guard;
-        bool landed = false;
-        bool carriedOver = false;
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> kept;
-        bool edgesLanded = false;
-    };
-    struct ReadTrapStatistics {
-        std::uint64_t guarded, guardedBytes, unguarded, unguardedBytes, kept, replaced, replacedBytes, faults, nestedFaults, forcedReleases, faultLanded, faultLandedBytes, readerLanded, readerLandedBytes, verified, differing, held;
-    };
-    static bool ReadTrapEnabled();
-    static bool ReadTrapVerified();
-    static ReadTrapStatistics ReadTrapCounts();
-    static void SetReadTrapForTests(bool enabled, bool verified);
-    enum class CopyBackStep : std::uint8_t { Lands, Stays, StaysCopied };
-    enum class CopyBackLanding : std::uint8_t { Copied, CopiedForAccess, CopiedForReader, Compared };
-    static bool KeepsCopyBacks(LandingSite site);
-    static CopyBackStep StepCopyBack(LandingSite site, bool scoped, bool reached, bool guarded, bool underQueuedStore, bool verified, bool landed);
-    static CopyBackLanding LandingOf(LandingSite site, bool guarded, bool landed);
-    static bool ReplacedUncopied(bool guarded, bool landed);
-    static std::vector<std::pair<std::uint64_t, std::uint64_t>> WholePages(std::span<const std::pair<std::uint64_t, std::uint64_t>> written);
-    static std::vector<std::pair<std::uint64_t, std::uint64_t>> PageEdges(std::span<const std::pair<std::uint64_t, std::uint64_t>> written);
-    bool LandGuardedOver(std::uint64_t address, std::size_t bytes);
-    struct StagedClaim {
-        std::uint64_t begin = 0;
-        std::uint64_t end = 0;
-        VkBuffer target = VK_NULL_HANDLE;
-        std::uint64_t targetBase = 0;
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> written;
-        std::shared_ptr<Buffer> shadow;
-        std::vector<std::pair<std::uint64_t, std::uint64_t>> forwarded;
-    };
-    struct HandoverStatistics {
-        std::uint64_t taken, skipped, redirected, forwardedBytes, elided, elidedBytes, landed, landedBytes;
-        std::array<std::uint64_t, LandingSites> landedAt;
-    };
-    static bool StagingHandoverEnabled();
-    static HandoverStatistics HandoverCounts();
-    static const char* LandingSiteName(LandingSite site);
-    static void CountForwardedCopyIns(std::uint64_t skipped, std::uint64_t redirected, std::uint64_t bytes);
-    bool JoinsRun(std::uint32_t queueKey, const void* owner, std::span<const RunAccess> accesses, const CopyBackReach& reach) const;
-    void CloseRun();
-    bool HasPendingCopyBacks() const { return (open != nullptr && !open->copyBacks.empty()) || !carried.empty(); }
-    std::size_t PendingCopyBacks() const { return (open != nullptr ? open->copyBacks.size() : 0) + carried.size(); }
-    bool PendingCopyBackOverlaps(std::uint64_t address, std::size_t bytes) const;
-    void DeferCopyBack(StagedCopyBack entry);
-    std::uint64_t ClaimCopyBacks(std::span<StagedClaim> claims);
-    VkCommandBuffer CommandsKeeping(const CopyBackReach& reach, VkAccessFlags* coveredAccess = nullptr);
     struct OverlapStatistics {
         std::uint64_t deferred, overlapped, flushed;
     };
@@ -259,11 +191,6 @@ public:
     DrawPassStart StartDrawPass(std::uint64_t key, bool forced, bool fenced, const PassAccess& access);
     void LeaveRenderPassOpen(std::uint64_t key, std::uint32_t timing, bool fenced, const PassAccess& access, std::function<void(CommandState&)> afterPass = {});
     void SealPassWriteOnly();
-    std::uint64_t OpenBatchId() const { return open != nullptr ? open->id : 0; }
-    bool PassAccepts(std::uint64_t key, std::uint64_t summary) const { return open != nullptr && open->renderPass.open && open->renderPass.key == key && open->passHazards.Accepted(summary); }
-    void AcceptInPass(std::uint64_t key, std::uint64_t summary);
-    PassHazard OpenPassHazard(std::uint64_t key, const PassAccess& access) const;
-    bool OpenKeeps(const void* object) const;
     // DCC "uncompressed" key stores (DccMetadata.cpp StoreUncompressedOnGpu): queued on the open
     // batch and recorded as one run (one barrier pair for every queued fill) at Submit, before a
     // label store (RecordStore), or before a command that writes or reads a queued range (the
@@ -282,21 +209,11 @@ public:
     bool Idle() const { return open == nullptr && inFlight.empty(); }
     std::uint64_t OpenSerial() const { return submissions + 1; }
     std::uint64_t CompletedThrough() const { return inFlight.empty() ? submissions : inFlight.front()->serial - 1; }
-    bool ExecutedThrough(std::uint64_t serial) const;
-    BufferCache* Buffers();
     // Whether recorded work still has completion actions (write-backs the CPU must see) to run.
     bool HasCompletions() const;
     void Keep(std::shared_ptr<void> object, std::size_t bytes = 0);
-    static bool RingTwin();
-    void NoteTwinCopy(VkBuffer source, VkBuffer twin, VkDeviceSize offset, VkDeviceSize bytes);
     void KeepThroughHold(std::shared_ptr<void> object);
     void KeepBytes(const void* owner, std::size_t bytes);
-    static bool LeanCommit();
-    static void SetLeanCommitForTest(int lean);
-    std::size_t OpenKeptObjects() const { return open != nullptr ? open->kept.size() : 0; }
-    std::size_t OpenCompletions() const { return open != nullptr ? open->completions.size() : 0; }
-    const std::shared_ptr<void>* OpenDrawArena() const { return open != nullptr && open->drawArena != nullptr ? &open->drawArena : nullptr; }
-    void KeepDrawArena(std::shared_ptr<void> arena);
     enum class UploadScratch : std::uint8_t { Tiled = 0, Linear, Count };
     std::shared_ptr<DeviceBuffer> UploadScratchBuffer(UploadScratch kind, std::size_t bytes);
     static constexpr VkPipelineStageFlags UploadScratchReuseStages = VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
@@ -311,21 +228,12 @@ public:
     static constexpr std::size_t UnwrittenSnapshotEntries = 4096;
     static constexpr std::size_t DrawInputBudget = std::size_t{1024} << 20u;
     static constexpr std::size_t DrawInputEntries = 16384;
+    static constexpr std::size_t DrawInputMirrorBudget = std::size_t{512} << 20u;
+    static bool DrawInputMirrors();
+    std::pair<std::size_t, std::size_t> DrawInputBytes() const;
     std::shared_ptr<Buffer> UnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, VkDeviceSize* offset = nullptr);
     void NoteUnwrittenDrawSnapshot(std::uint64_t address, std::size_t bytes, const std::array<std::uint64_t, 3>& stamp, std::shared_ptr<Buffer> buffer, VkDeviceSize offset = 0);
-    enum class SnapshotCompare : std::uint8_t { None, Equal, Differs, Refused };
-    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr, std::size_t from = 0, std::uint32_t* lowest = nullptr, SnapshotCompare* compare = nullptr);
-    static bool DrawInputCompare();
-    static bool DrawInputEpochProof();
-    struct DrawInputReuseStatistics {
-        std::uint64_t published = 0;
-        std::uint64_t locked = 0;
-        std::uint64_t equal = 0;
-        std::uint64_t equalBytes = 0;
-        std::uint64_t differs = 0;
-        std::uint64_t refused = 0;
-    };
-    static DrawInputReuseStatistics DrawInputReuseCounts();
+    std::shared_ptr<Buffer> ReusableDrawSnapshot(std::uint64_t address, std::size_t bytes, SnapshotUse use = SnapshotUse::Storage, std::uint32_t* derived = nullptr, std::uint64_t generation = 0, VkDeviceSize* offset = nullptr, std::size_t from = 0, std::uint32_t* lowest = nullptr, bool mirrored = false);
     struct OwnedDrawInputProof {
         std::vector<std::uint64_t> words;
         std::uint64_t since = 0;
@@ -337,41 +245,6 @@ public:
     OwnedDrawInputProof ArmOwnedDrawInput(std::uint64_t address, std::size_t bytes) const;
     std::shared_ptr<Buffer> ReusableOwnedDrawInput(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint32_t* derived, std::size_t from = 0, std::uint32_t* lowest = nullptr);
     void KeepOwnedDrawInput(std::uint64_t address, std::size_t bytes, const OwnedDrawInputProof& proof, std::shared_ptr<Buffer> buffer, SnapshotUse use, std::uint32_t derived, std::size_t from = 0, std::uint32_t lowest = 0);
-    enum class DrawInputCopyRefusal : std::uint8_t { Label, CopiedWriter, Import, Allocation, Untracked, Count };
-    static constexpr std::size_t DrawInputCopyRefusals = static_cast<std::size_t>(DrawInputCopyRefusal::Count);
-    struct DrawInputCopyStatistics {
-        std::uint64_t copies = 0;
-        std::uint64_t bytes = 0;
-        std::uint64_t hits = 0;
-        std::uint64_t passBreaks = 0;
-        std::uint64_t ahead = 0;
-        std::array<std::uint64_t, DrawInputCopyRefusals> refused{};
-    };
-    struct DrawInputCopyOrder {
-        std::uint64_t address = 0;
-        std::size_t bytes = 0;
-        std::size_t from = 0;
-        VkBuffer source = VK_NULL_HANDLE;
-        VkDeviceSize sourceOffset = 0;
-    };
-    static constexpr std::size_t DrawInputCopyBudget = std::size_t{256} << 20u;
-    static constexpr std::size_t DrawInputCopyEntries = 1024;
-    static constexpr std::uint32_t DrawInputCopyIdleLimit = 2;
-    static bool DrawInputCopiesEnabled();
-    static bool CopyStillCurrent(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration);
-    static DrawInputCopyStatistics DrawInputCopyCounts();
-    static const char* DrawInputCopyRefusalName(DrawInputCopyRefusal reason);
-    bool RenderPassOpen() const { return open != nullptr && open->renderPass.open; }
-    bool OwesDrawInputCopies() const { return owedDrawInputCopies != 0; }
-    std::size_t DrawInputCopyCount() const { return drawInputCopies.size(); }
-    bool HasDrawInputCopy(std::uint64_t address) const { return drawInputCopies.contains(address); }
-    bool DrawInputCopyRefused(std::uint64_t address, std::size_t bytes, std::size_t from) const;
-    std::shared_ptr<Buffer> ReusableDrawInputCopy(std::uint64_t address, std::size_t bytes, std::size_t from, bool counted = true);
-    void WantDrawInputCopy(std::uint64_t address, std::size_t bytes, std::size_t from);
-    std::vector<DrawInputCopyOrder> OwedDrawInputCopies();
-    void RefuseDrawInputCopy(std::uint64_t address, DrawInputCopyRefusal reason);
-    void SettleDrawInputCopy(std::uint64_t address);
-    void RecordDrawInputCopies(std::span<const DrawInputCopyOrder> orders, bool ahead, bool passOpen);
     static constexpr std::size_t ContainingSnapshotProbes = 16;
     void KeepDrawSnapshot(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::uint64_t registryGeneration, std::shared_ptr<Buffer> buffer, SnapshotUse use = SnapshotUse::Storage, std::uint32_t derived = 0, std::size_t from = 0, std::uint32_t lowest = 0, bool ownedInsertion = false);
     static constexpr std::size_t DrawUploadChunk = std::size_t{1} << 20u;
@@ -381,17 +254,18 @@ public:
         std::byte* bytes = nullptr;
     };
     UploadSlice DrawUpload(std::size_t bytes);
-    UploadSlice DrawInputUpload(std::size_t bytes);
     static constexpr std::size_t IndexRangeEntries = 16384;
     static constexpr std::size_t KeptIndexRangeIndices = 4096;
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest, std::uint32_t* lowest = nullptr);
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest, std::uint32_t lowest = 0);
     void OnComplete(std::function<void()> action);
+    void OnWriteComplete(std::uint64_t address, std::size_t bytes, std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
     // Notes several [begin, end) ranges and publishes the snapshot once (a dispatch writes many buffers).
     void NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+    void NoteStampedWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     static constexpr std::int16_t ReachValue = -2;
     void NotePendingReach(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
     bool PendingWriteOverlaps(std::uint64_t address, std::size_t bytes) const;
@@ -401,6 +275,8 @@ public:
     // memory; its completion stores are the caller's business, see VulkanDevice::CopyBuffer).
     bool PendingWriteSettled(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t LastWriteNote(std::uint64_t address, std::size_t bytes) const;
+    std::uint64_t WriteNoteCount() const { return writeNoteCount; }
+    std::vector<std::uint64_t> StampedNotesSince(std::uint64_t note) const;
     std::uint64_t NewestWriteNote(std::uint64_t address, std::size_t bytes) const;
     std::uint64_t NewestStoreNote(std::uint64_t address, std::size_t bytes) const;
     struct PendingWrite {
@@ -442,34 +318,6 @@ public:
         bool signaled;
     };
     std::optional<PendingReadInfo> DescribePendingRead(std::uint64_t address, std::size_t bytes) const;
-    std::optional<std::uint64_t> NewestGuestWork() const;
-    std::uint64_t NewestGuestWriter() const;
-    struct InPlaceRead {
-        std::uint64_t begin;
-        std::uint64_t end;
-        ReadKind kind;
-        std::uint64_t serial = 0;
-    };
-    static constexpr std::size_t FinishedReadBytes = 4096;
-    static constexpr std::size_t FinishedReadCapacity = 16384;
-    static bool EarlyEndOfPipe();
-    void NoteEndOfPipe(bool early);
-    struct EopTrapStatistics {
-        std::uint64_t labels, trapped, refused, labelPage, ranges, bytes, released, faults, nested, checked, uncovered, setNs, releaseNs, changingCopies, changingCopyBytes, labelRanges;
-    };
-    static void CountChangingCopy(std::size_t bytes);
-    static std::string TakeEopTrapSites();
-    static bool EopReadTrap();
-    static bool EopLabelWriteTrap();
-    bool PendingLabelStore(std::uint64_t address, std::size_t bytes) const;
-    static EopTrapStatistics EopTrapCounts();
-    bool TrapPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> writes, std::uint64_t label, std::size_t labelBytes);
-    bool TakeEarlyEndOfPipe();
-    std::size_t UnexecutedReads(std::vector<InPlaceRead>& reads) const;
-    bool TakeFinishedReads(std::vector<InPlaceRead>& reads, std::vector<std::pair<std::uint64_t, std::uint64_t>>& writes);
-    static constexpr std::size_t ChangingReadCapacity = 65536;
-    void NoteChangingRead(std::uint64_t begin, std::uint64_t end);
-    bool ChangingRead(std::uint64_t address, std::size_t bytes) const;
     // Counters of the read tracking (cumulative, for the [recorder] line): ranges noted, overlap
     // queries, hits by reader kind, and hits ignored because the reader's fence had signaled.
     struct ReadStatistics {
@@ -579,10 +427,13 @@ public:
     // not, before recording): the run is then recorded in place, with a trailing barrier toward
     // the later work, and the next store starts a new run. Within a run a store contiguous with
     // the last queued one joins its vkCmdUpdateBuffer, one inside it replaces its bytes (the
-    // later store wins, as in program order), and one overlapping a store queued earlier gets a
-    // transfer-to-transfer barrier first (WAW). Debug aids: APS5_LABEL_RUNS_INLINE=1 records the
-    // stores at once and closes the run at the next command (Commands()) or at Submit, as
-    // before; APS5_NO_LABEL_RUNS=1 gives every store barriers of its own.
+    // later store wins, as in program order), and every store after the first of its group gets a
+    // transfer-to-transfer barrier first (WAW for one overlapping a store queued earlier, program
+    // order otherwise), so the run's stores land for a polling host in program order too and each
+    // earlier one is available to it. Debug
+    // aids: APS5_LABEL_RUNS_INLINE=1 records the stores at once and closes the run at the next
+    // command (Commands()) or at Submit, as before; APS5_NO_LABEL_RUNS=1 gives every store
+    // barriers of its own.
     void RecordStore(VkBuffer buffer, VkDeviceSize offset, std::span<const std::byte> bytes, std::uint64_t address);
     bool HasQueuedStores() const { return open != nullptr && !open->run.queued.empty(); }
     bool QueuedStoreOverlaps(std::uint64_t address, std::size_t bytes) const;
@@ -674,6 +525,7 @@ public:
     // After the calling worker recorded (or dropped) its queued labels: its ranges are cleared and
     // the entries of its dwords still without a batch (stored by the CPU, or dropped) leave the table.
     static void ForgetQueuedLabels();
+    static std::uint64_t ThreadClearAccesses();
     static bool QueuedLabelsPending();
     // The function the flush hook calls, on the accessing thread (which may hold the GPU mutex),
     // when an access overlaps one of that thread's queued labels; it records them. Set once.
@@ -728,7 +580,6 @@ public:
     // write-back completions (OnComplete) of unfinished batches: a reaper retires them when every
     // worker sleeps, as for the labels above;
     static std::uint64_t PendingWriteBackCompletions();
-    static void SetReapWake(void (*wake)());
     // dispatches and draws recorded since the last submit (the driver counts them: CountRecordedWork),
     // so a batch is submitted after a bounded amount of work (APS5_BATCH_CAP).
     static std::uint64_t RecordedWorkSinceSubmit();
@@ -738,6 +589,8 @@ public:
     // The recorder of the current device, for code that only has guest addresses (the flush hook)
     // and for helpers that must not recycle resources the recorded work still uses.
     static Recorder* Active();
+    bool RenderPassOpen() const;
+    std::uint64_t RenderPassGeneration() const { return passGeneration; }
     VkDevice Device() const { return context.device; }
     std::uint64_t Id() const { return id; }
     static bool Alive(std::uint64_t id);
@@ -756,7 +609,6 @@ public:
     // return address of the Sync/SyncThrough call itself is taken, so an unannounced sync still
     // names its real caller.
     static void CountSync(int source, const void* site = nullptr);
-    static std::array<std::uint64_t, 5> SyncCounts();
     // Names only the site for the sync or drain this thread makes next (its source stays as
     // announced, or as the drain counts it): for a wrapper (VulkanDevice::ReapRecorded) whose
     // FinishUpTo counts the drain itself, so a CountSync there would count it twice.
@@ -787,10 +639,6 @@ public:
         std::uint64_t runsAtSubmit, runsForced;
     };
     static StoreStatistics StoreCounts();
-    struct SubmitStatistics {
-        std::uint64_t submits, queueSubmitNs;
-    };
-    static SubmitStatistics SubmitCounts();
     // APS5_PROFILE_GPU=1: GPU time of recorded work by key (a guest program address), from timestamp
     // queries around each timed range; the totals per key are reported every 10 s. Begin returns the
     // range index to pass to End, or NoTiming when timing is off or the batch's queries are used up.
@@ -813,7 +661,7 @@ public:
     // or APS5_PROFILE_GPU). A class range covers the command with its own barriers (a dispatch's
     // barriers are classes of their own, its program range stays keyed by the program), so the
     // union of every range of a batch and the batch span differ by what no class times ('untimed').
-    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, DrawInputCopy, InputTwinCopy, Count };
+    enum class CommandClass : std::uint8_t { DispatchLeading = 0, DispatchTrailing, IndirectArguments, LabelRun, Fill, FillClear, Copy, StagingIn, StagingOut, Draw, StorageUpload, StorageWriteBack, DccClear, DccKeyStore, PresentBlit, ShadowPublish, TemplateDataRefresh, InputMirror, Count };
     static constexpr std::uint64_t ClassKey(CommandClass which) { return 0x10 + static_cast<std::uint64_t>(which); }
     std::uint32_t BeginGpuTiming(CommandClass which) { return BeginGpuTiming(ClassKey(which)); }
     static void CountBarriers(CommandClass which, std::uint32_t count = 1);
@@ -890,30 +738,18 @@ private:
         bool overwritten = false;
         const Batch* batch = nullptr;
     };
-    struct TwinCopy {
-        VkBuffer source;
-        VkBuffer twin;
-        VkDeviceSize begin;
-        VkDeviceSize end;
-    };
     struct Batch {
         VkCommandBuffer commands = VK_NULL_HANDLE;
-        bool encoded = false;
-        VkCommandBuffer twinCommands = VK_NULL_HANDLE;
-        VkQueryPool twinQueries = VK_NULL_HANDLE;
-        std::vector<TwinCopy> twinCopies;
         CommandState graphicsState;
         VkFence fence = VK_NULL_HANDLE;
         std::vector<std::shared_ptr<void>> kept;
         std::size_t keptBytes = 0;
         std::unordered_set<const void*> keptOwners;
-        const void* lastKeptOwner = nullptr;
-        std::shared_ptr<void> drawArena;
-        std::uint64_t id = 0;
         std::array<std::shared_ptr<DeviceBuffer>, static_cast<std::size_t>(UploadScratch::Count)> uploadScratch;
         std::vector<std::function<void()>> completions;
         std::vector<std::pair<std::uint64_t, std::uint64_t>> writes;
         std::vector<std::uint64_t> writeNotes;
+        std::vector<std::uint64_t> stampedNotes;
         std::vector<std::int16_t> writeValues;
         std::vector<std::int64_t> writeWords;
         // In-place reads (see NotePendingRead), dying with the batch: a finished batch's reads are done.
@@ -931,7 +767,6 @@ private:
         std::vector<ReadListNote> readLists;
         // Submission number (1-based): identifies a batch after its allocation may have been reused.
         std::uint64_t serial = 0;
-        std::uint64_t gpuFlight = 0;
         std::uint64_t predictedSerial = 0;
         AgcDriver::FaultToken firstToken = 0;
         AgcDriver::FaultToken lastToken = 0;
@@ -1009,7 +844,6 @@ private:
         std::vector<const void*> deferredRun;
         std::vector<RunAccess> runAccess;
         std::vector<std::function<void(Recorder&)>> afterRun;
-        std::vector<StagedCopyBack> copyBacks;
         // The hazard tracker's accesses since its last simulated barrier (see NoteAccess).
         struct Tracker {
             struct Range {
@@ -1139,17 +973,9 @@ private:
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();
-    void recordTwinCopies(Batch& batch);
-    void readTwinTiming(Batch& batch);
     void flushDeferredDispatch();
-    void flushCopyBacks(LandingSite site, const CopyBackReach* reach = nullptr);
-    VkCommandBuffer openCommands(VkAccessFlags* coveredAccess);
-    static bool landsFor(const StagedCopyBack& held, const CopyBackReach* reach);
-    bool guardedOverlaps(std::uint64_t address, std::uint64_t end) const;
-    bool underQueuedStore(const StagedCopyBack& held) const;
-    void guardCopyBack(StagedCopyBack& entry);
     bool runConflict(std::span<const RunAccess> accesses) const;
-    bool joinsRun(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses, const CopyBackReach& reach) const;
+    bool joinsRun(std::uint32_t queueKey, std::span<const void* const> owners, std::span<const RunAccess> accesses) const;
     void dropStaleHoldKept();
     // Records the run's pending store (vkCmdUpdateBuffer), if any.
     void flushPendingStore();
@@ -1176,7 +1002,6 @@ private:
     static std::optional<ReadKind> readOverlap(const Batch& batch, std::uint64_t address, std::uint64_t end, std::optional<ReadKind> only = std::nullopt);
     static std::vector<std::pair<std::uint64_t, std::uint64_t>> notedReads(const Batch& batch);
     bool signaled(const Batch& batch) const;
-    bool fenceSignaled(const Batch& batch) const;
     // Rebuilds the lock-free snapshot of pending writes from open, inFlight and finishing.
     void publishPendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> additions = {}) const;
     // Appends one range to the open batch; returns whether the snapshot must be rebuilt for it.
@@ -1212,7 +1037,6 @@ private:
     std::uint64_t submitHoldValue = 0;
     struct ProgressWatcher;
     std::unique_ptr<ProgressWatcher> progressWatcher;
-    void watchReap(const Batch& batch);
     // Identity for a thread that released the mutex around a wait (syncThroughUnlocked): the
     // recorder may have been torn down meanwhile, so it is looked up by this id, not by pointer.
     std::uint64_t id = 0;
@@ -1232,19 +1056,10 @@ private:
     // table is empty (most of the time between label groups).
     std::atomic<std::size_t> recordedLabels{0};
     std::unique_ptr<Batch> open;
+    std::uint64_t passGeneration = 0;
     std::vector<std::shared_ptr<void>> holdKept;
     std::uint64_t holdKeptSerial = 0;
-    std::size_t keptHint = 0;
     std::deque<std::unique_ptr<Batch>> inFlight;
-    void noteFinishedReads(const Batch& batch);
-    std::mutex finishedReadsMutex;
-    std::vector<InPlaceRead> finishedReads;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> finishedWrites;
-    bool finishedReadsLost = false;
-    std::map<std::uint64_t, std::uint64_t> changingReads;
-    std::atomic<bool> finishedReadsWanted{false};
-    std::uint64_t endOfPipeSerial = 0;
-    bool endOfPipeEarly = false;
     // Batches popped from inFlight whose completions have not run yet: their writes stay in the
     // snapshot (a rebuild from inside a completion must not drop them) until finish returns.
     std::vector<const Batch*> finishing;
@@ -1252,14 +1067,8 @@ private:
     std::uint64_t submissions = 0;
     std::size_t inFlightKeptBytes = 0;
     std::uint64_t writeNoteCount = 0;
-    std::uint64_t copyBackClaims = 0;
-    LandingSite submitSite = LandingSite::Submit;
-    std::vector<StagedCopyBack> carried;
     std::shared_ptr<Buffer> drawUpload;
     VkDeviceSize drawUploadUsed = 0;
-    std::unique_ptr<BufferCache> bufferCache;
-    std::shared_ptr<Buffer> drawInputUpload;
-    VkDeviceSize drawInputUploadUsed = 0;
     std::vector<VkFence> spare;
     std::vector<VkQueryPool> sparePools;
     mutable AgcDriver::Mutex completedMutex;
@@ -1275,6 +1084,7 @@ private:
         std::uint32_t derived;
         std::size_t from;
         std::uint32_t lowest;
+        std::shared_ptr<Buffer> mirror;
         OwnedDrawInputProof owned;
     };
     struct DrawSnapshotPool {
@@ -1294,6 +1104,9 @@ private:
     std::array<DrawSnapshotPool, 2> drawSnapshotPools;
     std::size_t ownedDrawInputs = 0;
     void eraseDrawSnapshot(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    std::size_t drawInputMirrorBytes = 0;
+    void dropDrawInputMirror(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
+    std::shared_ptr<Buffer> mirrorDrawInput(std::map<DrawSnapshotKey, DrawSnapshot>::iterator entry);
     struct IndexRange {
         std::uint64_t generation;
         std::uint64_t registryGeneration;
@@ -1304,31 +1117,7 @@ private:
     std::map<DrawSnapshotKey, IndexRange> indexRanges;
     std::list<DrawSnapshotKey> indexRangeRecency;
     bool ownedDrawInputHolds(std::uint64_t address, std::size_t bytes, const OwnedDrawInputProof& proof) const;
-    struct DrawInputCopy {
-        std::size_t bytes = 0;
-        std::size_t from = 0;
-        std::shared_ptr<Buffer> buffer;
-        std::uint64_t generation = 0;
-        std::uint64_t registryGeneration = 0;
-        std::list<std::uint64_t>::iterator recent;
-        std::size_t held = 0;
-        std::uint32_t idle = 0;
-        bool current = false;
-        bool wanted = false;
-        bool outdated = false;
-        bool refused = false;
-    };
-    std::map<std::uint64_t, DrawInputCopy> drawInputCopies;
-    std::list<std::uint64_t> drawInputCopyRecency;
-    std::size_t drawInputCopyBytes = 0;
-    std::size_t drawInputCopyReach = 0;
-    std::size_t owedDrawInputCopies = 0;
-    void eraseDrawInputCopy(std::map<std::uint64_t, DrawInputCopy>::iterator entry);
-    void setDrawInputCopy(DrawInputCopy& entry, bool wanted, bool current, bool outdated);
-    void outdateDrawInputCopies(std::uint64_t address, std::uint64_t end);
-    void outdateDrawInputCopies();
     bool refreshDrawSnapshot(DrawSnapshot& entry, std::uint64_t address, std::size_t bytes);
-    SnapshotCompare compareDrawSnapshot(const DrawSnapshot& entry, std::uint64_t address, std::size_t bytes, std::size_t held) const;
     std::shared_ptr<Buffer> containingDrawSnapshot(std::uint64_t address, std::size_t bytes, VkDeviceSize* offset);
     mutable std::weak_ptr<const WriteRanges> publishedWriteRanges;
     mutable bool publishedWriteRangesValid = false;

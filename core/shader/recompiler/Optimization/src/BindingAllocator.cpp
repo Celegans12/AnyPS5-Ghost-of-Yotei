@@ -68,7 +68,7 @@ bool usesGds(const IrProgram& program) {
 
 }
 
-BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const BindingLayout& layout, bool registrationModules, bool stencilReplay, bool blockAccess) const {
+BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const BindingLayout& layout, bool registrationModules, bool stencilReplay) const {
     IrProgramMetadata& metadata = program.Metadata();
     if (!metadata.shaderInfoComplete || metadata.bindingLayoutComplete) {
         fail(metadata.shaderInfoComplete ? "shader binding layout failed: binding layout already allocated"
@@ -114,12 +114,9 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
         next.runtimeStateDwords = (attributes + RuntimeAbi::VertexSelectorsPerDword - 1u) / RuntimeAbi::VertexSelectorsPerDword;
     }
     const auto pushSize = layout.pushConstantSizeBytes / 4u;
-    if (blockAccess && pushSize < BlockAbi::PushAddressDwords) fail("shader binding layout failed: the push constant range cannot hold the block address");
-    const auto pushDataSize = blockAccess ? pushSize - BlockAbi::PushAddressDwords : pushSize;
-    next.pushDataStartDword = next.runtimeImageCount == 0u && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= pushDataSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
-    if (blockAccess) next.blockAddressDword = layout.pushConstantOffsetBytes / 4u + (next.UsesPushData() ? next.ShaderDataDwords() : 0u);
+    const auto dataSize = stencilReplay && pushSize != 0u ? pushSize - 1u : pushSize;
+    next.pushDataStartDword = next.runtimeImageCount == 0u && next.ShaderDataDwords() != 0u && next.ShaderDataDwords() <= dataSize ? layout.pushConstantOffsetBytes / 4u : PushData::NoStart;
     if (stencilReplay) {
-        if (blockAccess) fail("shader binding layout failed: stencil replay is not laid out with a block address");
         const auto offset = next.UsesPushData() ? next.ShaderDataDwords() : 0u;
         if (offset >= pushSize) fail("stencil replay requires an unused push constant dword");
         next.stencilReferenceDword = offset;
@@ -207,10 +204,6 @@ BindingAllocationResult BindingAllocator::Allocate(IrProgram& program, const Bin
     if (result.layout.UsesPushData()) {
         result.pushConstantOffsetBytes = result.layout.pushDataStartDword * static_cast<std::uint32_t>(sizeof(std::uint32_t));
         result.pushConstantSizeBytes = result.layout.ShaderDataDwords() * static_cast<std::uint32_t>(sizeof(std::uint32_t));
-    }
-    if (result.layout.UsesBlock()) {
-        result.pushConstantOffsetBytes = layout.pushConstantOffsetBytes;
-        result.pushConstantSizeBytes += result.layout.BlockAddressDwords() * static_cast<std::uint32_t>(sizeof(std::uint32_t));
     }
     if (stencilReplay) {
         result.pushConstantOffsetBytes = layout.pushConstantOffsetBytes;

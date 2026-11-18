@@ -146,7 +146,7 @@ void removeCacheDirectory(const std::filesystem::path& directory) {
 }
 
 bool sameBinding(const DescriptorBinding& left, const DescriptorBinding& right) {
-    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.bufferExtent == right.bufferExtent && left.bufferResources == right.bufferResources && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.samplerCoordinatesIgnored == right.samplerCoordinatesIgnored && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
+    return left.kind == right.kind && left.role == right.role && left.descriptorSet == right.descriptorSet && left.binding == right.binding && left.count == right.count && left.guestDescriptor == right.guestDescriptor && left.readOnly == right.readOnly && left.imageShape == right.imageShape && left.samplerDepthCompare == right.samplerDepthCompare && left.imageWritten == right.imageWritten && left.imageDepthCompare == right.imageDepthCompare && left.imageAtomic == right.imageAtomic && left.imageShapes == right.imageShapes && left.bufferAtomic == right.bufferAtomic && left.bufferWritten == right.bufferWritten && left.bufferRead == right.bufferRead && left.bufferExtent == right.bufferExtent && left.samplerUnnormalized == right.samplerUnnormalized && left.samplerIntegerBorder == right.samplerIntegerBorder && left.samplerCoordinatesIgnored == right.samplerCoordinatesIgnored && left.imageUnnormalized == right.imageUnnormalized && left.imageUnnormalizedBaseLevel == right.imageUnnormalizedBaseLevel && left.imageSamplers == right.imageSamplers;
 }
 
 bool sameBindings(const std::vector<DescriptorBinding>& left, const std::vector<DescriptorBinding>& right) {
@@ -252,7 +252,6 @@ DescriptorBinding sampleBinding(std::uint32_t seed) {
     binding.imageSamplers = {0x5u, 0u, 0x8000000080000000u};
     binding.bufferRead = {true, false, false, true, true, false};
     binding.bufferExtent = {32, 0, 16, 4096, 8, 0};
-    binding.bufferResources = {3, 0, 2, 2, 1, 5};
     return binding;
 }
 
@@ -918,6 +917,7 @@ void verifyKeySensitivity() {
     changes("wave LDS memory barriers", [](SampleRequest& sample) { sample.request.target.waveLdsMemoryBarriers = true; });
     changes("device-scope LDS memory barriers", [](SampleRequest& sample) { sample.request.target.deviceScopeLdsMemoryBarriers = true; });
     changes("LDS lock fences", [](SampleRequest& sample) { sample.request.target.ldsLockFences = true; });
+    changes("device-atomic workgroup memory barriers", [](SampleRequest& sample) { sample.request.target.deviceAtomicWorkgroupMemoryBarriers = true; });
     changes("mesh window buffers", [](SampleRequest& sample) { sample.request.target.meshWindowBuffer = true; });
     changes("mesh function inlining", [](SampleRequest& sample) { sample.request.target.meshInlineFunctions = true; });
     changes("the workgroup size limit", [](SampleRequest& sample) { sample.request.target.maxWorkgroupSize[2] = 128; });
@@ -1258,6 +1258,24 @@ void verifyPersist() {
     std::filesystem::remove(path, error);
     require(!error, "cannot remove the replaced cache entry");
     requireSameArtifact(variant.artifact, persisted->artifact, "a persisted entry whose file was replaced and removed");
+}
+
+void verifyReleaseMapped() {
+    const std::vector<std::uint32_t> words{0x07230203u, 0x00010000u, 1u, 2u, 3u};
+    const SharedSpirv owned(words);
+    ShaderDiskCache::ReleaseMapped(owned);
+    require(!owned.Mapped() && std::ranges::equal(words, owned.Words()), "releasing an owned module changed its words");
+    SampleRequest sample;
+    const auto key = sample.Key();
+    const auto variant = sampleVariant();
+    const auto persisted = ShaderDiskCache::Persist(key, variant);
+    require(persisted != nullptr, "a persisted entry was not read back");
+#ifdef _WIN32
+    require(persisted->artifact.spirv.Mapped(), "persisted SPIR-V is not a mapped cache entry");
+#endif
+    ShaderDiskCache::ReleaseMapped(persisted->artifact.spirv);
+    ShaderDiskCache::ReleaseMapped(persisted->artifact.spirv);
+    requireSameArtifact(variant.artifact, persisted->artifact, "a mapped entry whose pages were released");
 }
 
 #ifdef _WIN32
@@ -1946,6 +1964,7 @@ std::vector<PlanFixture> planFixtures() {
     place(palette, 0x18u, imageWords(PlanTextureAddress + 0x100u));
     add("pointer image table", 64, {0xf4080200u, 0xfa000000u, 0xf4080700u, 0xfa000010u, 0xf4080800u, 0xfa000020u, 0x7e200500u, 0x8f108210u, 0xf4200444u, 0x20000000u, 0x8711ff11u, 0x000000ffu, 0x8f128511u, 0xf40c0900u, 0x24000040u, 0xf09c0f08u, 0x01090000u, 0xe0700000u, 0x80070000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, palette}, {PlanMaterialAddress, {0u, 1u, 0u, 1u, 0u, 0u, 0u, 0u}}});
 
+    add("descriptor phi deferred sampler", 32, {0xf40c0200u, 0xfa000000u, 0xf4000400u, 0xfa000050u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u, 0xf4080500u, 0xfa000020u, 0xbf820002u, 0xf4080500u, 0x20000000u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u}, srtPointer, {{PlanSrtAddress, guarded}});
     std::vector<std::uint32_t> nestedSrt(16u, 0u);
     place(nestedSrt, 0u, bufferWords(PlanTableAddress, 16u, 4u));
     place(nestedSrt, 4u, bufferWords(PlanMaterialAddress, 0u, 32u));
@@ -2101,8 +2120,6 @@ IrResourcePlan handBuiltPlan() {
     plan.srtGuardOffset = 6u;
     plan.cleanFlatSlots = {0u, 1u};
     plan.pureFlatSlots = {1u, 0u};
-    plan.descriptorLeafDwords = {5u};
-    plan.descriptorUserWords = {8u, 3u};
     plan.requiresSpecializationMemory = true;
     plan.srtPlanComplete = true;
     plan.resourceTrackingComplete = true;
@@ -2186,7 +2203,7 @@ bool samePlan(const IrResourcePlan& left, const IrResourcePlan& right) {
     for (std::size_t index = 0; index < left.uniformFill.values.size(); ++index) {
         if (!sameValue(left.uniformFill.values[index], right.uniformFill.values[index])) return false;
     }
-    return left.materializationSources == right.materializationSources && left.guardedSrtSlots == right.guardedSrtSlots && left.srtGuardOffset == right.srtGuardOffset && left.cleanFlatSlots == right.cleanFlatSlots && left.pureFlatSlots == right.pureFlatSlots && left.descriptorLeafDwords == right.descriptorLeafDwords && left.descriptorUserWords == right.descriptorUserWords &&
+    return left.materializationSources == right.materializationSources && left.guardedSrtSlots == right.guardedSrtSlots && left.srtGuardOffset == right.srtGuardOffset && left.cleanFlatSlots == right.cleanFlatSlots && left.pureFlatSlots == right.pureFlatSlots &&
            left.requiresSpecializationMemory == right.requiresSpecializationMemory && left.srtPlanComplete == right.srtPlanComplete && left.resourceTrackingComplete == right.resourceTrackingComplete && left.info == right.info && left.uniformFill.fill == right.uniformFill.fill;
 }
 
@@ -2563,8 +2580,6 @@ void verifyPlanRoundTrip() {
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.valueStorage.begin(), plan.valueStorage.end(), [](const auto& value) { return value.IsPhi(); }); }), "no fixture plans a phi");
     require(covers([](const IrResourcePlan& plan) { return !plan.guardedSrtSlots.empty(); }), "no fixture plans a guarded SRT read");
     require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), [](std::uint8_t pure) { return pure != 0u; }); }), "no fixture plans a pure flat slot");
-    require(covers([](const IrResourcePlan& plan) { return std::any_of(plan.descriptorLeafDwords.begin(), plan.descriptorLeafDwords.end(), [](std::uint8_t dwords) { return dwords != 0u; }); }), "no fixture plans a descriptor leaf dword");
-    require(covers([](const IrResourcePlan& plan) { return !plan.descriptorUserWords.empty(); }), "no fixture plans a descriptor dword held in a user word");
 }
 
 void verifyPlanBudget() {
@@ -2909,7 +2924,7 @@ void verifyPlanAcrossProcesses(const char* self) {
     for (std::size_t index = 0; index < outputs.size(); ++index) require(WriteFileAtomically(planOutputPath(index), outputs[index]), "cannot write the first process's output");
     auto refused = fixtures[1];
     refused.codeAddress = 0x200000u;
-    refused.code = {0xf40c0200u, 0xfa000000u, 0xf4000400u, 0xfa000050u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u, 0xf4080500u, 0xfa000020u, 0xbf820002u, 0xf4080500u, 0x20000000u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
+    refused.code = {0xf40c0200u};
     bool threw = false;
     try {
         static_cast<void>(PrepareShader(refused.Request(true)));
@@ -3024,6 +3039,7 @@ int main(int argc, char** argv) {
         verifySharedPlans();
         verifyStore();
         verifyPersist();
+        verifyReleaseMapped();
         verifyAcrossProcesses(argv[0]);
         verifyPrebuiltAcrossProcesses(argv[0], directory);
         verifyPlanAcrossProcesses(argv[0]);

@@ -125,6 +125,49 @@ public:
     }
 };
 
+struct FlipOrder {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool block = true;
+    bool entered = false;
+    std::vector<std::uint32_t> landed;
+};
+
+class OrderedRequest final : public AgcDriver::IFlipRequest {
+public:
+    OrderedRequest(std::shared_ptr<FlipOrder> value, std::uint32_t mark, bool held) : order(std::move(value)), mark(mark), held(held) {}
+    void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override {
+        std::unique_lock lock(order->mutex);
+        if (held) {
+            order->entered = true;
+            order->changed.notify_all();
+            if (!order->changed.wait_for(lock, std::chrono::seconds(10), [&] { return !order->block; })) throw std::runtime_error("the held flip was never released");
+        }
+        order->landed.push_back(mark);
+        order->changed.notify_all();
+    }
+    void Fail(std::exception_ptr error) noexcept override { if (!error) std::terminate(); }
+private:
+    std::shared_ptr<FlipOrder> order;
+    std::uint32_t mark;
+    bool held;
+};
+
+class OrderedOutput final : public AgcDriver::IVideoOutput {
+public:
+    OrderedOutput(std::shared_ptr<FlipOrder> value, std::uint32_t port, bool holdsFirst) : order(std::move(value)), port(port), holdsFirst(holdsFirst) {}
+    void Fail(std::exception_ptr error) noexcept override { if (!error) std::terminate(); }
+    std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo&) override {
+        const std::uint32_t serial = ++reserved;
+        return std::make_shared<OrderedRequest>(order, port * 10 + serial, holdsFirst && serial == 1);
+    }
+private:
+    std::shared_ptr<FlipOrder> order;
+    std::uint32_t port;
+    bool holdsFirst;
+    std::atomic<std::uint32_t> reserved = 0;
+};
+
 void submitFlip(std::uint32_t handle = 7) {
     std::array<std::uint32_t, 6> words{0xc004105c, handle, 0xfffffffeu, 1, 0x76543211u, 0xfedcba98u};
     Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
@@ -528,14 +571,6 @@ void testPresentMode() {
     check(expectFailure([&] { SelectPresentMode("", all); }).find("must be fifo, fifo_latest_ready, mailbox or immediate") != std::string::npos, "an empty present mode name was accepted");
     const std::array<VkPresentModeKHR, 0> none{};
     check(expectFailure([&] { SelectPresentMode(nullptr, none); }).find("does not support") != std::string::npos, "FIFO was selected on a surface without it");
-    const std::array mailboxOnly{VK_PRESENT_MODE_FIFO_KHR, VK_PRESENT_MODE_MAILBOX_KHR};
-    check(SelectPresentMode(nullptr, wayland, false) == VK_PRESENT_MODE_FIFO_KHR && SelectPresentMode(nullptr, all, false) == VK_PRESENT_MODE_FIFO_KHR, "the default present mode changed with the flips paced");
-    check(SelectPresentMode(nullptr, all, true) == VK_PRESENT_MODE_IMMEDIATE_KHR && SelectPresentMode(nullptr, wayland, true) == VK_PRESENT_MODE_IMMEDIATE_KHR, "unpaced flips do not default to immediate where the surface offers it");
-    check(SelectPresentMode(nullptr, mailboxOnly, true) == VK_PRESENT_MODE_MAILBOX_KHR, "unpaced flips do not default to mailbox on a surface without immediate");
-    check(SelectPresentMode(nullptr, latest, true) == VK_PRESENT_MODE_FIFO_KHR, "unpaced flips did not fall back to FIFO on a surface without immediate or mailbox");
-    check(SelectPresentMode("fifo", all, true) == VK_PRESENT_MODE_FIFO_KHR && SelectPresentMode("mailbox", all, true) == VK_PRESENT_MODE_MAILBOX_KHR, "ANYPS5_PRESENT_MODE does not win over the unpaced default");
-    check(expectFailure([&] { SelectPresentMode("mailbox", wayland, true); }).find("does not support") != std::string::npos, "an unsupported requested present mode was replaced under unpaced flips");
-    check(expectFailure([&] { SelectPresentMode(nullptr, none, true); }).find("does not support") != std::string::npos, "unpaced flips selected a present mode on a surface without any");
     using AgcDriver::SelectPresentQueue;
     check(SelectPresentQueue(16, 2) == 2u, "the presentation queue does not follow the main and settle queues");
     check(SelectPresentQueue(16, 1) == 1u, "the presentation queue does not follow the main queue alone");
@@ -543,11 +578,55 @@ void testPresentMode() {
     check(!SelectPresentQueue(1, 1).has_value(), "a presentation queue was taken from a family with one queue");
 }
 
+void testCpuFlipBehindReadyingFlip() {
+    auto order = std::make_shared<FlipOrder>();
+    auto held = std::make_shared<OrderedOutput>(order, 7, true);
+    auto other = std::make_shared<OrderedOutput>(order, 8, false);
+    AgcDriverRegisterVideoOutput_nid_postfix(7, held);
+    AgcDriverRegisterVideoOutput_nid_postfix(8, other);
+    const auto landedWithin = [&](std::size_t count, std::chrono::seconds limit) {
+        std::unique_lock lock(order->mutex);
+        return order->changed.wait_for(lock, limit, [&] { return order->landed.size() >= count; });
+    };
+    const auto cpuFlip = [](std::uint32_t handle) {
+        std::thread thread([handle] { AgcDriverSubmitFlip_nid_postfix(AgcDriver::FlipInfo{handle, 0, 1, 0}); });
+        thread.join();
+    };
+    submitFlip(7);
+    {
+        std::unique_lock lock(order->mutex);
+        check(order->changed.wait_for(lock, std::chrono::seconds(5), [&] { return order->entered; }), "the GPU flip did not reach its output");
+    }
+    cpuFlip(8);
+    check(landedWithin(1, std::chrono::seconds(5)), "a CPU flip waited for another port's flip that was still being readied");
+    cpuFlip(7);
+    {
+        std::lock_guard lock(order->mutex);
+        check(order->landed == std::vector<std::uint32_t>({81}), "a CPU flip reached its output before the earlier GPU flip of the same port");
+        order->block = false;
+    }
+    order->changed.notify_all();
+    check(landedWithin(3, std::chrono::seconds(5)), "the flips did not all reach their outputs");
+    {
+        std::lock_guard lock(order->mutex);
+        check(order->landed == std::vector<std::uint32_t>({81, 71, 72}), "the flips of one port reached their output out of order");
+    }
+    AgcDriverWaitIdle_nid_postfix();
+    AgcDriverUnregisterVideoOutput_nid_postfix(7, held);
+    AgcDriverUnregisterVideoOutput_nid_postfix(8, other);
+}
+
 int main(int argc, char** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "present-mode") {
             testPresentMode();
             std::puts("present mode selection tests passed");
+            return 0;
+        }
+        if (argc == 2 && std::string(argv[1]) == "cpu-flip-ready-order") {
+            testCpuFlipBehindReadyingFlip();
+            LibcRunShutdown_nid_postfix();
+            std::puts("AGC CPU flip ready order test passed");
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "failure-log") {

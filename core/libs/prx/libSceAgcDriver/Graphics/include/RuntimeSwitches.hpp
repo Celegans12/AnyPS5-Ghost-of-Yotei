@@ -14,17 +14,22 @@ enum class RuntimeSwitch : std::size_t {
     NoBarrierBatch,
     NoGuardSpans,
     NoOwnedDrawInputs,
+    NoPassAttachmentMemo,
+    NoImportSegmentMemo,
     NoSizeOnlySurfaceBytes,
+    NoSpaceReuseRecords,
     PipelineDispatchMisses,
+    NoMemoPendingCollect,
+    NoSharedCollectWalks,
     NoExtendedFastProofs,
-    NoReapOnFence,
-    NoPendingPages,
+    TableSnapshot,
+    NoTargetMemo,
+    NoTargetMemoOverlapCache,
     Count,
 };
 
 namespace RuntimeSwitches {
 
-double CallingThreadCpuSeconds();
 const char* Name(RuntimeSwitch id);
 bool Set(RuntimeSwitch id);
 void Assign(RuntimeSwitch id, bool set);
@@ -66,21 +71,6 @@ private:
     double phaseStart = 0;
     std::optional<double> firstSeconds;
 };
-
-bool DrawBlocks();
-bool VerifyDrawBlocks();
-std::size_t CoreRingMax();
-bool DrawBlockStats();
-bool CoreDefault();
-bool CoreRun();
-bool VerifyCoreRun();
-bool CoreRunStats();
-bool CoreFlatDraw();
-bool CoreLightLane();
-bool VerifyCoreLightLane();
-std::uint32_t CoreClockPeriod();
-void ForceDrawBlocks(bool blocks, bool verify);
-void UnforceDrawBlocks();
 
 bool AbConfigured();
 std::vector<std::string> AbAtPresent(std::uint64_t present, double seconds);

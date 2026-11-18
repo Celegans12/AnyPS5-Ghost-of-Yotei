@@ -37,6 +37,13 @@ alignas(256) constexpr std::array<std::uint32_t, 16> TriangleVertexCode{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
     0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
 };
+alignas(256) constexpr auto FullPushTriangleVertexCode = [] {
+    std::array<std::uint32_t, TriangleVertexCode.size() + 32> code{};
+    std::copy_n(TriangleVertexCode.begin(), 8, code.begin());
+    for (std::uint32_t word = 0; word < 32; ++word) code[8 + word] = 0x06020208u + word;
+    std::copy(TriangleVertexCode.begin() + 8, TriangleVertexCode.end(), code.begin() + 40);
+    return code;
+}();
 alignas(256) constexpr std::array<std::uint32_t, 16> OffsetTriangleVertexCode{
     0x7e000d05u, 0x080200f4u, 0x10020300u, 0x100202f4u, 0x060202f3u, 0x060400f3u, 0x10040500u, 0x060404f3u,
     0x7e0c0c08u, 0x06020306u, 0x7e060280u, 0x7e0802f2u, 0xf80008cfu, 0x04030201u, 0xbf810000u,
@@ -54,6 +61,7 @@ struct Header {
 alignas(8) Header VertexHeader{};
 alignas(8) Header PixelHeader{};
 alignas(8) Header TriangleVertexHeader{};
+alignas(8) Header FullPushTriangleVertexHeader{};
 alignas(8) Header ConstantPixelHeader{};
 alignas(8) Header OffsetTriangleVertexHeader{};
 alignas(256) std::array<std::uint32_t, 4> IndirectRecord{3, 1, 0, 0};
@@ -81,6 +89,7 @@ std::vector<std::uint32_t> Draws(float scale, const std::uint32_t* vertexCode, s
     const auto color = reinterpret_cast<std::uintptr_t>(ColorMemory.data());
     const auto vertex = reinterpret_cast<std::uintptr_t>(vertexCode);
     const auto pixel = reinterpret_cast<std::uintptr_t>(pixelCode);
+    const auto resources = [](std::uint32_t count) { return ((count & 0x1fu) << 1u) | ((count & 0x20u) << 22u); };
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> context{
         {0x2d5, 0x2000},
         {0x1b6, 0}, {0x207, 0}, {0x200, 0}, {0x203, 0x800},
@@ -104,8 +113,8 @@ std::vector<std::uint32_t> Draws(float scale, const std::uint32_t* vertexCode, s
         {0x2fe, 0}, {0x302, 0}, {0x306, 0}, {0x30a, 0},
     };
     const std::vector<std::pair<std::uint32_t, std::uint32_t>> shader{
-        {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, vertexUserSgprs << 1u}, {0x8c, 0},
-        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, pixelUserSgprs << 1u},
+        {0xc8, static_cast<std::uint32_t>(vertex >> 8u)}, {0xc9, static_cast<std::uint32_t>(vertex >> 40u)}, {0x8b, resources(vertexUserSgprs)}, {0x8c, 0},
+        {0x008, static_cast<std::uint32_t>(pixel >> 8u)}, {0x009, static_cast<std::uint32_t>(pixel >> 40u)}, {0x00b, resources(pixelUserSgprs)},
     };
     std::vector<std::uint32_t> commands;
     Append(commands, 0x79, {0x242, 4});
@@ -144,16 +153,6 @@ unsigned BrightestColorByte() {
     return brightest;
 }
 
-void RepeatedLookupsAgree() {
-    Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
-    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
-    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
-    Submit(32.0f, {1.0f, 1.0f, 1.0f});
-    const auto shaped = Submit(32.0f, {2.0f, 3.0f, 4.0f});
-    Require(shaped.lookups - before.lookups == 6, "six draws made " + std::to_string(shaped.lookups - before.lookups) + " draw-cache lookups under APS5_VERIFY_FINISHER_LOOKUP, expected 6");
-    Require(BrightestColorByte() != 0, "the draws whose lookups were repeated on the draw finisher wrote nothing");
-}
-
 void ThirdDrawHitsTheCache(bool libraries) {
     Registered(VertexHeader, VertexCode.data(), sizeof(VertexCode), 2);
     Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
@@ -176,11 +175,7 @@ void UserDataDrawsReuseTheirShape(bool libraries) {
     Require(known.inserts == before.inserts, mode + ": a new key of a shape that has an entry was cached at its first sight");
     const auto stages = known.dataStagesReused + known.dataStagesCompiled - before.dataStagesReused - before.dataStagesCompiled;
     Require(stages == 6, mode + ": the three data-only hits accounted " + std::to_string(stages) + " stages, expected 6");
-    const bool forwards = std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") == nullptr;
-    const std::uint64_t expected = forwards ? 6 : 3;
-    Require(verify ? known.dataVerified - before.dataVerified == expected : known.dataStagesReused - before.dataStagesReused == expected, mode + ": the data-only hits reused " + std::to_string(known.dataStagesReused - before.dataStagesReused) + " stages and verified " + std::to_string(known.dataVerified - before.dataVerified) + ", expected " + (forwards ? "the 3 vertex stages, whose user words did not change, and the 3 pixel stages, which only forward the changed word" : "the 3 vertex stages, whose user words did not change"));
-    const auto forwarded = static_cast<std::size_t>(AgcDriver::DriverDetail::DrawShapeReuse::Forwarded);
-    Require(verify || known.shapeReuses[forwarded] - before.shapeReuses[forwarded] == (forwards ? 3u : 0u), mode + ": " + std::to_string(known.shapeReuses[forwarded] - before.shapeReuses[forwarded]) + " pixel stages were reused with their forwarded user word patched, expected " + (forwards ? "3" : "0"));
+    Require(verify ? known.dataVerified - before.dataVerified == 3 : known.dataStagesReused - before.dataStagesReused == 3, mode + ": the data-only hits reused " + std::to_string(known.dataStagesReused - before.dataStagesReused) + " stages and verified " + std::to_string(known.dataVerified - before.dataVerified) + ", expected the 3 vertex stages, whose user words did not change");
     const auto fresh = Submit(16.0f, {5.0f, 6.0f, 7.0f});
     Require(fresh.inserts - known.inserts == 1, mode + ": three keys of a new shape inserted " + std::to_string(fresh.inserts - known.inserts) + " draw entries, expected 1: the shape's second key");
     Require(fresh.dataHits - known.dataHits == 1, mode + ": the third key of a new shape made " + std::to_string(fresh.dataHits - known.dataHits) + " data-only hits, expected 1");
@@ -212,26 +207,6 @@ void StageDataHitsRefreshTheirWords(bool libraries) {
         Require(refreshed.inserts == cached.inserts, mode + ": a stage data hit inserted a draw entry");
     }
     Require(BrightestColorByte() == 255, mode + ": the draw of constant 1.0 wrote " + std::to_string(BrightestColorByte()) + ", expected 255");
-}
-
-void MovedConstantsReuseTheStage(bool libraries) {
-    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
-    const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
-    const bool reuses = std::getenv("APS5_NO_DRAW_STAGE_DATA_HITS") == nullptr && std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") == nullptr && std::getenv("APS5_VERIFY_DRAW_ENTRIES") == nullptr && std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr;
-    alignas(256) static std::array<float, 4> moved{};
-    moved[0] = 0.5f;
-    PixelConstant[0] = 1.0f;
-    static_cast<void>(SubmitConstantDraws(3));
-    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
-    const auto constant = reinterpret_cast<std::uintptr_t>(moved.data());
-    ColorMemory.fill(std::byte{0});
-    const auto after = Submit(Draws(32.0f, TriangleVertexCode.data(), 0, ConstantPixelCode.data(), 2, {{static_cast<std::uint32_t>(constant), static_cast<std::uint32_t>(constant >> 32u)}}));
-    Require(BrightestColorByte() >= 126 && BrightestColorByte() <= 129, mode + ": a draw whose constant pointer moved to a table holding 0.5 wrote " + std::to_string(BrightestColorByte()) + ", expected 127 or 128");
-    const auto compiled = after.dataStagesCompiled - before.dataStagesCompiled;
-    const auto reused = after.dataStagesReused - before.dataStagesReused;
-    if ((static_cast<std::uint64_t>(constant) >> 32u) != (reinterpret_cast<std::uintptr_t>(PixelConstant.data()) >> 32u) || verify) return;
-    if (reuses) Require(compiled == 0 && reused == 2, mode + ": a draw whose constant table moved and holds another constant, which the pixel stage only passes to the shader, built " + std::to_string(compiled) + " stages and reused " + std::to_string(reused) + ", expected both reused with the constant patched");
-    else Require(compiled >= 1, mode + ": with the stage data hits, the shape user words or the descriptor leaves off, a draw whose constant table moved and changed reused its pixel stage");
 }
 
 void RefreshedStageDataVerifies() {
@@ -484,6 +459,31 @@ void SightingsKeepCollidingKeys() {
     Require(sightings.SeenBefore(12) && sightings.SeenBefore(13) && sightings.SeenBefore(14), "a full bucket lost a key newer than the one it replaced");
 }
 
+void FullVertexPushDataLeavesRoomForTheFragment(bool libraries) {
+    const auto mode = std::string(libraries ? "with" : "without") + " graphics pipeline libraries";
+    const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
+    Registered(FullPushTriangleVertexHeader, FullPushTriangleVertexCode.data(), sizeof(FullPushTriangleVertexCode), 2);
+    const auto submit = [](std::size_t count, float fragmentWord) {
+        auto commands = Draws(32.0f, FullPushTriangleVertexCode.data(), 32, PixelCode.data(), 1, {});
+        for (std::uint32_t word = 0; word < 32; ++word) Append(commands, 0x76, {0x8c + word, 0});
+        for (std::size_t draw = 0; draw < count; ++draw) {
+            Append(commands, 0x76, {0x00c, std::bit_cast<std::uint32_t>(fragmentWord)});
+            Append(commands, 0x2d, {3, 2});
+        }
+        return Submit(commands);
+    };
+    ColorMemory.fill(std::byte{0});
+    const auto before = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
+    const auto cached = submit(3, 0.25f);
+    Require(cached.inserts - before.inserts == 1 && cached.hits - before.hits == 1, mode + ": three draws with 32 vertex user words and one fragment word did not insert once and hit once");
+    Require(cached.misses[static_cast<std::size_t>(DrawMiss::Layout)] == before.misses[static_cast<std::size_t>(DrawMiss::Layout)], mode + ": a repeated draw at the push block boundary missed its layout");
+    Require(BrightestColorByte() == 64, mode + ": the fragment word after 32 vertex user words did not draw 0.25");
+    const auto changed = submit(1, 0.75f);
+    Require(changed.dataHits - cached.dataHits == 1, mode + ": changing only the fragment word at the push block boundary did not reuse the draw shape");
+    Require(verify ? changed.dataVerified - cached.dataVerified == 1 : changed.dataStagesReused - cached.dataStagesReused == 1, mode + ": changing the fragment word did not reuse or verify the vertex stage at the push block boundary");
+    Require(BrightestColorByte() == 191, mode + ": the changed fragment word after 32 vertex user words did not draw 0.75");
+}
+
 }
 
 int main(int argc, char** argv) {
@@ -508,29 +508,16 @@ int main(int argc, char** argv) {
         if (!libraries && std::getenv("APS5_NO_GPL") == nullptr) return VulkanTestSkipped;
         if (std::getenv("APS5_VERIFY_DRAW_ENTRIES") != nullptr) {
             RefreshedStageDataVerifies();
-        } else if (std::getenv("APS5_VERIFY_FINISHER_LOOKUP") != nullptr) {
-            RepeatedLookupsAgree();
         } else {
             ThirdDrawHitsTheCache(libraries);
             UserDataDrawsReuseTheirShape(libraries);
             StageDataHitsRefreshTheirWords(libraries);
-            MovedConstantsReuseTheStage(libraries);
             RetainedPixelCacheTransitions();
             CpuPathIndirectDrawsAreCachedWhenAsked(libraries);
             RecordsKeepThePacketsFragmentWord(libraries);
+            FullVertexPushDataLeavesRoomForTheFragment(libraries);
             RecordWordsReachTheShader(libraries);
             IndirectPointsKeepTheirPointSize(libraries);
-        }
-        const auto lookups = AgcDriver::DriverDetail::Driver::FinisherLookupCounted();
-        const bool pipelined = std::getenv("APS5_DRAW_PIPELINE") != nullptr && std::getenv("APS5_VERIFY_DRAW_ENTRIES") == nullptr;
-        if (std::getenv("APS5_VERIFY_FINISHER_LOOKUP") != nullptr) {
-            Require(lookups.later == 0, "APS5_VERIFY_FINISHER_LOOKUP left " + std::to_string(lookups.later) + " draw lookups to the draw finisher alone");
-            Require(!pipelined || lookups.verified != 0, "APS5_VERIFY_FINISHER_LOOKUP repeated no draw lookup on the draw finisher");
-            Require(lookups.differing == 0, std::to_string(lookups.differing) + " of " + std::to_string(lookups.verified) + " draw lookups repeated on the draw finisher differed from the queue worker's");
-        } else if (std::getenv("APS5_FINISHER_LOOKUP") != nullptr) {
-            Require(!pipelined || lookups.later != 0, "APS5_FINISHER_LOOKUP looked no pipelined draw up on the draw finisher");
-        } else {
-            Require(lookups.later == 0 && lookups.verified == 0, "a draw was looked up on the draw finisher without APS5_FINISHER_LOOKUP");
         }
         AgcDriverShutdown_nid_postfix();
         Require(AgcDriver::Graphics::PipelineLibraryWorkers() == 0, "the driver's shutdown left the pipeline library worker running");

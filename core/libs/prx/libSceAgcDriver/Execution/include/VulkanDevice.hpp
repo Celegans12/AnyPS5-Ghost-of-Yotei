@@ -126,14 +126,10 @@ public:
     std::uint64_t SubmitAndEpoch();
     void WaitRecorded(std::uint64_t serial);
     std::uint64_t SubmittedEpoch() const;
-    double CompletedGpuMs(std::uint64_t afterBatch, std::uint64_t throughBatch, std::vector<std::uint64_t>& recorded) const;
     bool WaitRecordedFor(std::uint64_t serial, std::uint64_t timeoutNanos);
     void ReapRecorded(std::uint64_t serial);
     // Completes the batches that already finished (non-blocking); under the mutex.
     void ReapRecorded();
-    std::uint64_t OpenGpuLoad();
-    static std::uint64_t OpenGpuLoadHint();
-    bool GpuIdle();
     // Records a store of `bytes` at a guest address behind the recorded work, so the value appears
     // once that work completed; the batch is submitted by the queue worker's flush rules (or at once
     // with APS5_LABEL_SUBMIT_NOW=1). `stamp` is the record-order stamp and `queue` the recording
@@ -238,10 +234,6 @@ public:
         std::uint64_t checked, exact, moved, refused, filtered, rebuilt, kept, served;
     };
     static DispatchMoveCount DispatchMoveCounts();
-    struct OffDrawCount {
-        std::uint64_t labels, firstMarks, repeatedMarks, overflowedMarks, verifiedMarks, marksOverWrites, reapsSkipped, reapsVerified, reapsLate;
-    };
-    static OffDrawCount OffDrawCounts();
     void ResolveMemory(std::uint64_t address, std::size_t bytes, bool writable);
     void* Window() const;
     void Resize(std::uint32_t width, std::uint32_t height);
@@ -278,9 +270,6 @@ public:
     // submitted (0: today's render fence wait before the flip completes, 1 default, 2; larger
     // values are refused; 0 when APS5_SYNC_FLIP is set).
     static std::size_t FlipInFlight();
-    enum class FlipCompletion { Gpu, Guest, Queue };
-    static FlipCompletion ConfiguredFlipCompletion();
-    std::optional<std::uint64_t> GuestWorkSerial() const;
     double RetirePresents(std::size_t keepInFlight);
     // Whether presenting `buffer` will use the single scaler source, staging or upload objects (a
     // GPU frame dump, the guest-memory path, a source-size change) while an in-flight blit still
@@ -305,7 +294,7 @@ public:
     // (APS5_FLIP_READ_CHECK=1) and found overwritten before the blit's fence.
     struct PresentStatistics {
         std::uint64_t presents, gpuUnread, batchesAheadOfBlit, batchesAfterFlip, readsChecked, readsOverwritten, acquireDrops, planes, keyWriterWaits;
-        double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs, keyWriterWaitMs, queuePresentMs;
+        double gpuBusyMs, gpuGapMs, lastSubmitAfterFlipMs, blitSubmitAfterFlipMs, keyWriterWaitMs;
     };
     static PresentStatistics PresentCounts();
     static std::uint64_t FillCompletionSyncCount();
@@ -372,38 +361,12 @@ public:
     static void NoteRecipe(RecipeEvent event, RecipeKind kind);
     enum class DrawRecipePrecheck : std::size_t { NoRecipe, Device };
     static void NoteDrawRecipeMiss(DrawRecipePrecheck miss);
-    enum class DrawRecipeOrigin : std::size_t { Exact, Relocated, Shape, Content, Count };
-    static void NoteDrawRecipeAttach(DrawRecipeOrigin origin);
-    static void NoteShapeRecipeRefused();
-    struct DrawRecipeOriginCounts {
-        std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeOrigin::Count)> hits{};
-        std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeOrigin::Count)> attaches{};
-        std::uint64_t layoutMisses = 0;
-        std::uint64_t shapeRefused = 0;
-    };
-    static DrawRecipeOriginCounts DrawRecipeOrigins();
-    enum class DrawRecipeSkip : std::size_t { Ineligible, Captured, Split, Count };
-    static void NoteDrawRecipeSkip(DrawRecipeSkip skip);
-    static void NoteContentRecipeAttach();
-    static void NoteDrawRecipeLookup(DrawRecipeOrigin origin, bool found);
-    static void NoteDrawRecipeUnbuilt();
-    static void NoteContentRecipeLookup(bool keyed);
-    struct DrawRecipeDrawCounts {
-        std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeOrigin::Count)> recorded{};
-        std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeOrigin::Count)> found{};
-        std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeOrigin::Count)> absent{};
-        std::array<std::uint64_t, static_cast<std::size_t>(DrawRecipeSkip::Count)> skipped{};
-        std::uint64_t device = 0, notRecordable = 0, objectsGone = 0, templateGone = 0, layout = 0, proof = 0, buffers = 0, attaches = 0, unbuilt = 0, contentAbsent = 0, contentUnkeyed = 0, contentAttaches = 0;
-        std::array<std::uint64_t, static_cast<std::size_t>(Graphics::DrawRecipeRefusal::Count)> refusals{};
-        [[nodiscard]] std::uint64_t Draws() const;
-    };
-    static DrawRecipeDrawCounts DrawRecipeDraws();
-    static std::string DrawRecipeDrawsReport(std::size_t contentHeld, std::uint64_t contentEvicted);
     using DrawTraceContext = Graphics::DrawTraceContext;
     static std::uint64_t DrawRecipeHits();
     // `recipe`, when given, receives the DrawRecipe a recorded, cacheable, reusable, direct draw
     // built for its draw-cache entry (design_cpu_final M8); null otherwise.
-    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0);
+    void Draw(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots = {}, std::shared_ptr<const DrawRecipe>* recipe = nullptr, const DrawTraceContext* trace = nullptr, std::uint64_t shape = 0, const std::vector<std::uint32_t>* contentKey = nullptr);
+    std::vector<std::uint32_t> DrawContentKey(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders) const;
     bool DrawInputsInPlace() const;
     std::optional<std::string> KnownDrawRejection(const Graphics::State& graphics, std::span<const Graphics::CompiledShader> shaders) const;
     void ColorMetadataPass(const Graphics::ColorMetadataPass& pass);
@@ -411,7 +374,7 @@ public:
     // A draw-cache hit recorded from its recipe (Graphics::DrawWithRecipe), under the mutex after
     // the packet's labels; Rebuild when the recipe's device is not this one or DrawWithRecipe
     // missed (nothing recorded: the caller runs Draw with the hit's stages and re-attaches).
-    RecipeOutcome DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const DrawTraceContext* trace = nullptr, DrawRecipeOrigin origin = DrawRecipeOrigin::Exact);
+    RecipeOutcome DrawFromRecipe(const Graphics::State& graphics, const Pm4::DrawParameters& draw, std::span<const Graphics::CompiledShader> shaders, std::span<const Graphics::GuestMemorySnapshot> snapshots, const std::shared_ptr<const DrawRecipe>& recipe, const DrawTraceContext* trace = nullptr);
     // The indirect draw features the device enabled, for the driver's decision whether an indirect
     // draw's records can be read by the GPU (Graphics::Draw) or must be resolved on the CPU.
     struct IndirectDrawSupport {

@@ -48,6 +48,7 @@ struct CaptureProfile {
     std::atomic<std::uint64_t> wordsVerified{0};
     std::atomic<std::uint64_t> wordMismatches{0};
     // Words served from the driver's known values (never profile-gated: the [copy] line reads them).
+    std::atomic<std::uint64_t> tablesKept{0};
     std::atomic<std::uint64_t> wordsKnown{0};
     std::atomic<std::uint64_t> wordsKnownVerified{0};
     std::atomic<std::uint64_t> wordsKnownMismatches{0};
@@ -320,6 +321,7 @@ ShaderMemory::Page& ShaderMemory::addPage(std::size_t position, std::uint64_t ba
     owned->raw.Reset();
     owned->read.Reset();
     owned->recent.Reset();
+    owned->kept.Reset();
     owned->wordwise = false;
     owned->lazy = false;
     owned->backing = PageBacking(base, PageBytes);
@@ -394,7 +396,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
         return spanNeedsSync(spanPolicy) || spanPolicy == PendingWrite::KnownValue;
     };
     const auto checkSpanBytes = std::max<std::size_t>(self.descriptorSpanBytes, sizeof(*value));
-    if (page.wordwise && page.valid.Test(index) &&
+    if (page.wordwise && page.valid.Test(index) && !page.kept.Test(index) &&
         (self.forceSync != 0u ? self.pendingSpan(address, checkSpanBytes, {}) != PendingWrite::None
                               : (spanInvalidatesCache(self.pendingSpan(address, checkSpanBytes, {})) ||
                                  (checkSpanBytes > sizeof(*value) && spanInvalidatesCache(self.pendingSpan(address, sizeof(*value), {})))))) {
@@ -480,7 +482,10 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             }
             if (observed) report(waitsBefore, before == word);
         }
-        if ((waited || (page.wordwise && policy == PendingWrite::Sync && !forcedRaw)) && self.invalidateRawPages()) ++self.rawInvalidations;
+        if (waited || (page.wordwise && policy == PendingWrite::Sync && !forcedRaw)) {
+            const bool invalidated = self.forceSync != 0u && !waited ? self.invalidateChangedRawPages() : self.invalidateRawPages();
+            if (invalidated) ++self.rawInvalidations;
+        }
         if (CaptureProfiled()) CaptureTotals().wordReadNanoseconds += NanosecondsSince(fetchStarted);
         page.words[index] = word;
         page.valid.Set(index);
@@ -500,6 +505,7 @@ bool ShaderMemory::pagesCurrent() {
         if (backing == existing->backing) continue;
         existing->valid.Reset();
         existing->raw.Reset();
+        existing->kept.Reset();
         existing->backing = backing;
         existing->wordwise = false;
         existing->lazy = false;
@@ -514,10 +520,68 @@ bool ShaderMemory::snapshotCurrent(void* context, std::span<const ShaderRecompil
     return pages && DriverDetail::CaptureRegisteredViewsCurrent(views);
 }
 
+bool ShaderMemory::KeepTable(std::uint64_t address) {
+    constexpr std::size_t Words = KeepBytes / sizeof(std::uint32_t);
+    if (address % sizeof(std::uint32_t) != 0 || address > std::numeric_limits<std::uint64_t>::max() - KeepBytes) return false;
+    const auto end = address + KeepBytes;
+    if (overlapsInitial(address, end)) return false;
+    if (std::any_of(keptRanges.begin(), keptRanges.end(), [&](const auto& range) { return range.first < end && address < range.second; })) return false;
+    if (std::any_of(supplied.begin(), supplied.end(), [&](const Supplied& entry) { return entry.begin < end && address < entry.end; })) return false;
+    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), KeepBytes)) return false;
+    const auto quiet = [&] { return pendingSpan != nullptr && pendingSpan(address, KeepBytes, {}) == PendingWrite::None; };
+    if (!quiet()) return false;
+    std::array<std::uint32_t, Words> copy;
+    GuestMemory::CopyGuestBytes(copy.data(), reinterpret_cast<const void*>(address), KeepBytes);
+    if (!quiet()) return false;
+    for (auto base = address & ~static_cast<std::uint64_t>(PageBytes - 1); base < end; base += PageBytes) static_cast<void>(page(base));
+    if (!place(address, copy.data(), Words, true, true)) return false;
+    for (auto cursor = address; cursor < end;) {
+        const auto base = cursor & ~static_cast<std::uint64_t>(PageBytes - 1);
+        const auto index = static_cast<std::size_t>((cursor % PageBytes) / sizeof(std::uint32_t));
+        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>((end - cursor) / sizeof(std::uint32_t), PageWords - index));
+        auto& marked = page(base);
+        marked.kept.SetRun(index, count);
+        for (std::size_t word = 0; word < count; ++word) {
+            marked.read.Clear(index + word);
+            marked.recent.Clear(index + word);
+        }
+        cursor += static_cast<std::uint64_t>(count) * sizeof(std::uint32_t);
+    }
+    GuestMemory::GuardRead(address, KeepBytes);
+    keptRanges.emplace_back(address, end);
+    CaptureTotals().tablesKept.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+std::uint64_t ShaderMemory::TablesKept() {
+    return CaptureTotals().tablesKept.load(std::memory_order_relaxed);
+}
+
 bool ShaderMemory::invalidateRawPages() {
     bool invalidated = false;
     for (auto& [pageBase, existing] : pages) {
         if (!existing->wordwise || existing->raw.None()) continue;
+        existing->valid.ClearMask(existing->raw);
+        existing->raw.Reset();
+        invalidated = true;
+    }
+    return invalidated;
+}
+
+bool ShaderMemory::invalidateChangedRawPages() {
+    bool invalidated = false;
+    for (auto& [pageBase, existing] : pages) {
+        if (!existing->wordwise || existing->raw.None()) continue;
+        bool changed = false;
+        for (std::size_t index = 0; index < PageWords && !changed; ++index) {
+            if (!existing->raw.Test(index)) continue;
+            const auto address = pageBase + index * sizeof(std::uint32_t);
+            std::uint32_t word = 0;
+            GuestMemory::GuardRead(address, sizeof(word));
+            std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+            changed = word != existing->words[index];
+        }
+        if (!changed) continue;
         existing->valid.ClearMask(existing->raw);
         existing->raw.Reset();
         invalidated = true;
@@ -682,12 +746,12 @@ ShaderRecompiler::SrtWriteStamp ShaderMemory::stampWrites(void* context, std::ui
     return {generation, layout};
 }
 
-bool ShaderMemory::Vouched(PendingWriteQuery pending, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp) {
+bool ShaderMemory::Vouched(PendingWriteQuery pending, std::uint64_t address, std::uint64_t bytes, const ShaderRecompiler::SrtWriteStamp& stamp, bool uncached) {
     CaptureTotals().vouchCalls.fetch_add(1, std::memory_order_relaxed);
     if (stamp.generation == 0 || bytes == 0 || address > std::numeric_limits<std::uint64_t>::max() - bytes || stamp.layout != GuestAllocations::GuestAllocationsGeneration_nid_postfix()) return false;
     if (pending != nullptr && pending(address, static_cast<std::size_t>(bytes), {}) != PendingWrite::None) return false;
     GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
-    if (GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes)) == 0) return false;
+    if ((uncached ? GuestMemory::CollectWritesUncached(address, static_cast<std::size_t>(bytes)) : GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes))) == 0) return false;
     return GuestMemory::UnchangedSince(address, static_cast<std::size_t>(bytes), stamp.generation);
 }
 
@@ -1051,7 +1115,7 @@ bool SameCapturedWords(std::span<const std::uint32_t> left, std::span<const Shar
     return same;
 }
 
-std::size_t VouchSharedRegions(std::span<const SharedWords> shared, std::size_t regions, ShaderMemory::PendingWriteQuery pending, std::vector<VouchedRegions>& vouched) {
+std::size_t VouchSharedRegions(std::span<const SharedWords> shared, std::size_t regions, ShaderMemory::PendingWriteQuery pending, std::vector<VouchedRegions>& vouched, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> restampable, bool (*restamp)(const ShaderRecompiler::SrtGuestWords&, ShaderMemory::PendingWriteQuery)) {
     vouched.clear();
     if (shared.empty() || regions == 0) return 0;
     thread_local std::vector<std::pair<const ShaderRecompiler::SrtGuestWords*, bool>>* blocksSlot = nullptr;
@@ -1065,7 +1129,8 @@ std::size_t VouchSharedRegions(std::span<const SharedWords> shared, std::size_t 
         if (block == nullptr || block->low >= block->high) continue;
         auto known = std::find_if(blocks.begin(), blocks.end(), [&](const auto& seen) { return seen.first == block.get(); });
         if (known == blocks.end()) {
-            const bool good = ShaderMemory::Vouched(pending, block->low, block->high - block->low, ShaderRecompiler::LoadStamp(*block));
+            const bool recoverable = restamp != nullptr && std::ranges::find(restampable, block) != restampable.end();
+            const bool good = ShaderMemory::Vouched(pending, block->low, block->high - block->low, ShaderRecompiler::LoadStamp(*block), recoverable) || (recoverable && restamp(*block, pending));
             (good ? totals.vouchedBlocks : totals.refusedBlocks).fetch_add(1, std::memory_order_relaxed);
             known = blocks.insert(blocks.end(), {block.get(), good});
         }
@@ -1084,77 +1149,6 @@ std::size_t VouchSharedRegions(std::span<const SharedWords> shared, std::size_t 
     blocks.clear();
     totals.vouchedWords.fetch_add(words, std::memory_order_relaxed);
     return words;
-}
-
-BufferWordPositionCounts BufferWordPositions(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint32_t> flatOffsets, std::span<const std::uint32_t> words, std::span<const std::uint32_t> bufferSources, std::span<const ShaderRecompiler::DescriptorBinding> bindings, std::vector<std::uint32_t>& positions, std::vector<std::array<std::uint32_t, 2>>& slots) {
-    BufferWordPositionCounts counts;
-    positions.clear();
-    slots.clear();
-    std::vector<std::size_t> prefix(runs.size() + 1, 0);
-    for (std::size_t i = 0; i < runs.size(); ++i) prefix[i + 1] = prefix[i] + static_cast<std::size_t>((runs[i].second - runs[i].first) / sizeof(std::uint32_t));
-    std::vector<std::array<std::uint32_t, 3>> found;
-    std::vector<std::array<std::uint32_t, 2>> targets;
-    for (std::size_t leaf = 0; leaf < leaves.size(); ++leaf) {
-        const auto& [code, address] = leaves[leaf];
-        auto run = std::upper_bound(runs.begin(), runs.end(), address, [](std::uint64_t value, const std::pair<std::uint64_t, std::uint64_t>& candidate) { return value < candidate.first; });
-        if (leaf >= flatOffsets.size() || flatOffsets[leaf] == ~std::uint32_t{0} || (address & 3u) != 0 || run == runs.begin() || address + sizeof(std::uint32_t) > (run - 1)->second) {
-            ++counts.unmapped;
-            continue;
-        }
-        --run;
-        const auto position = prefix[static_cast<std::size_t>(run - runs.begin())] + static_cast<std::size_t>((address - run->first) / sizeof(std::uint32_t));
-        if (position >= words.size()) {
-            ++counts.unmapped;
-            continue;
-        }
-        const auto source = code / 8u;
-        const auto dword = code % 8u;
-        if (dword != 0u && dword != 2u) {
-            ++counts.frozen;
-            continue;
-        }
-        targets.clear();
-        bool written = false, mismatched = false;
-        for (std::uint32_t binding = 0; binding < bindings.size(); ++binding) {
-            const auto& bound = bindings[binding];
-            if (bound.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
-            for (std::uint32_t element = 0; element < bound.bufferResources.size(); ++element) {
-                const auto resource = bound.bufferResources[element];
-                if (resource >= bufferSources.size() || bufferSources[resource] != source) continue;
-                const auto slot = element * 4u + dword;
-                if (bound.guestDescriptor.size() != bound.bufferResources.size() * 4u || element >= bound.bufferWritten.size() || bound.bufferWritten[element]) {
-                    written = true;
-                    continue;
-                }
-                const std::span<const std::uint32_t, 4> descriptor(bound.guestDescriptor.data() + element * 4u, 4);
-                if (bound.guestDescriptor[slot] != words[position] || !ShaderRecompiler::SameBufferSpecialization(descriptor, descriptor)) {
-                    mismatched = true;
-                    continue;
-                }
-                targets.push_back({binding, slot});
-            }
-        }
-        if (!written && !mismatched && !targets.empty()) {
-            for (std::uint32_t binding = 0; binding < bindings.size(); ++binding) {
-                const auto& bound = bindings[binding];
-                if (bound.role != ShaderRecompiler::DescriptorRole::FlattenedSrt) continue;
-                if (flatOffsets[leaf] >= bound.guestDescriptor.size() || bound.guestDescriptor[flatOffsets[leaf]] != words[position]) mismatched = true;
-                else targets.push_back({binding, flatOffsets[leaf]});
-            }
-        }
-        if (written) ++counts.written;
-        else if (mismatched) ++counts.mismatched;
-        else if (targets.empty()) ++counts.unbound;
-        if (written || mismatched) continue;
-        for (const auto& [binding, slot] : targets) found.push_back({static_cast<std::uint32_t>(position), binding, slot});
-    }
-    std::sort(found.begin(), found.end());
-    found.erase(std::unique(found.begin(), found.end()), found.end());
-    for (const auto& [position, binding, slot] : found) {
-        positions.push_back(position);
-        slots.push_back({binding, slot});
-    }
-    return counts;
 }
 
 DataWordPositionCounts DataWordPositions(std::span<const std::pair<std::uint64_t, std::uint64_t>> runs, std::span<const std::pair<std::uint32_t, std::uint64_t>> leaves, std::span<const std::uint64_t> otherReads, std::span<const std::uint32_t> words, std::span<const std::uint32_t> flattenedSrt, std::vector<std::uint32_t>& positions, std::vector<std::uint32_t>& slots) {

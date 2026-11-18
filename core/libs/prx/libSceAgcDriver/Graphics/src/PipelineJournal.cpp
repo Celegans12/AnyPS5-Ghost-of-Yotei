@@ -47,7 +47,7 @@ static_assert(sizeof(VkStencilOpState) == 28, "VkStencilOpState changed: update 
 static_assert(sizeof(VkVertexInputBindingDescription) == 12, "VkVertexInputBindingDescription changed: update the recipe codec");
 static_assert(sizeof(VkVertexInputAttributeDescription) == 16, "VkVertexInputAttributeDescription changed: update the recipe codec");
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(State) == 952, "State changed: update CanonicalPipelineState and the recipe codec");
+static_assert(sizeof(State) == 1008, "State changed: update CanonicalPipelineState and the recipe codec");
 static_assert(sizeof(ShaderStages) == 164, "ShaderStages changed: update the recipe codec");
 static_assert(sizeof(ShaderRecompiler::MeshConfiguration) == 40, "MeshConfiguration changed: update the recipe codec");
 static_assert(sizeof(ShaderRecompiler::TessellationConfiguration) == 40, "TessellationConfiguration changed: update the recipe codec");
@@ -56,7 +56,7 @@ static_assert(sizeof(ShaderRecompiler::TessellationConfiguration) == 40, "Tessel
 constexpr std::uint32_t FileMagic = 0x4c4a5041u;
 // Bumped when the recipe codec, CanonicalPipelineState or the store key change in a way the
 // layout guards above do not catch (a field renumbered or reinterpreted at the same size).
-constexpr std::uint32_t FileFormat = 18u;
+constexpr std::uint32_t FileFormat = 19u;
 constexpr std::uint32_t ModuleRecord = 1u;
 constexpr std::uint32_t GraphicsRecord = 2u;
 constexpr std::uint32_t ComputeRecord = 3u;
@@ -247,6 +247,7 @@ void encodeState(Writer& writer, const State& state) {
     writer.Raw(state.pointSizeMin);
     writer.Raw(state.pointSizeMax);
     writer.Bool(state.rasterizerDiscard);
+    writer.U32(static_cast<std::uint32_t>(state.extraViewports.size()));
 }
 
 void decodeState(Reader& reader, State& state) {
@@ -322,6 +323,13 @@ void decodeState(Reader& reader, State& state) {
     state.pointSizeMin = reader.Raw<float>();
     state.pointSizeMax = reader.Raw<float>();
     state.rasterizerDiscard = reader.Bool();
+    const auto extraViewports = reader.U32();
+    if (!reader.Ok() || extraViewports >= MaxViewports) {
+        reader.Fail();
+        state = State{};
+        return;
+    }
+    state.extraViewports.assign(extraViewports, VkViewport{0, 0, 1, 1, 0, 1});
 }
 
 void encodeRecipe(Writer& writer, const GraphicsPipelineRecipe& recipe) {
@@ -373,9 +381,9 @@ std::uint64_t recordBytes(std::uint64_t payloadBytes) {
     return padded(sizeof(RecordHeader) + payloadBytes);
 }
 
-bool reporting() {
-    static const bool report = std::getenv("APS5_PROFILE_DRAW") != nullptr || std::getenv("APS5_PIPELINE_STATS") != nullptr;
-    return report;
+bool profiling() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
 }
 
 thread_local bool replayingHere = false;
@@ -1616,6 +1624,7 @@ State CanonicalPipelineState(const State& state) {
     canonical.pointSizeMin = state.pointSizeMin;
     canonical.pointSizeMax = state.pointSizeMax;
     canonical.rasterizerDiscard = state.rasterizerDiscard;
+    canonical.extraViewports.assign(state.extraViewports.size(), VkViewport{0, 0, 1, 1, 0, 1});
     return canonical;
 }
 
@@ -1696,7 +1705,7 @@ void FlushPipelineJournal() {
 }
 
 void ReportPipelineJournal() {
-    if (!reporting() || !Journal::Instance().Enabled()) return;
+    if (!profiling() || !Journal::Instance().Enabled()) return;
     const auto totals = PipelineJournalTotals();
     AgcDriver::ProfilePrint_nid_no_patch("[pipeline-journal] loaded %llu pipelines, %llu modules (%.1f MiB, %.0f ms); replay on %u threads: %llu graphics and %llu compute built, %llu present, %llu skipped (store full), %llu rejected, %llu failed in %.0f ms, holding at most %.1f MiB of modules; recorded this run: %llu graphics, %llu compute, %llu modules (%.1f MiB), %llu write failures, %llu records evicted (%.1f MiB)\n",
                                          static_cast<unsigned long long>(totals.loadedRecipes), static_cast<unsigned long long>(totals.loadedModules), static_cast<double>(totals.loadedBytes) / (1024.0 * 1024.0), totals.loadMs, totals.replayThreads,

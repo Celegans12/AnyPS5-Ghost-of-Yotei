@@ -104,6 +104,7 @@ struct SpirvEmitterState {
     std::uint32_t hostSubgroupSize = 0;
     bool splitSubgroup = false;
     bool spannedWave = false;
+    bool spannedAnySubgroup = false;
     std::uint32_t spannedExchangeVariable = 0;
     std::uint32_t spannedBallotVariable = 0;
     std::uint32_t spannedBallotParityVariable = 0;
@@ -112,19 +113,6 @@ struct SpirvEmitterState {
     bool depthRangeRemap = false;
     std::uint32_t depthRemapClipIndex = 0;
     bool registrationModules = false;
-    bool blockAccess = false;
-    std::uint32_t blockBase = 0;
-    std::uint32_t blockWords = 0;
-    std::uint32_t blockBuffers = 0;
-    struct BlockBufferEntry {
-        std::uint32_t buffer = 0;
-        std::uint32_t label = 0;
-        std::uint32_t address = 0;
-        std::uint32_t bytes = 0;
-        std::uint32_t misalignment = 0;
-        std::uint32_t present = 0;
-    };
-    std::vector<BlockBufferEntry> blockBufferEntries;
     bool fragmentDescriptorSet = false;
     bool float16DenormPreserve = false;
     bool robustBufferAccess2 = false;
@@ -149,6 +137,7 @@ struct SpirvEmitterState {
     bool waveLdsMemoryBarriers = false;
     bool deviceScopeLdsMemoryBarriers = false;
     bool ldsLockFences = false;
+    bool deviceAtomicWorkgroupMemoryBarriers = false;
     bool float16WidenNans = false;
     bool float16NarrowNans = false;
     std::unordered_set<const IrValue*> sharedLaneValues;

@@ -2,8 +2,6 @@
 #define CORE_SHADER_RECOMPILIER_INCLUDE_SHADER_RECOMPILIER_RECOMPILER_HPP
 
 #include "RuntimeAbi.hpp"
-#include "BlockAbi.hpp"
-#include "Optimization/include/Optimization/BlockLayout.hpp"
 #include "PipelineSpecialization.hpp"
 #include "prx/libc/include/general/AtomicSharedPtr.hpp"
 #include <algorithm>
@@ -138,7 +136,9 @@ enum class ColorExportPacking : std::uint8_t {
     Unorm4_4_4_4,
     Uint,
     UintClamp8,
-    UintClamp16
+    UintClamp16,
+    UintMask8,
+    UintMask16
 };
 
 enum class RasterPrimitive : std::uint8_t {
@@ -366,6 +366,7 @@ struct SpirvTarget {
     bool tessellationEvaluationSubgroups = true;
     bool float16DenormPreserve = false;
     bool spannedWaves = false;
+    bool spannedAnySubgroup = false;
     bool robustBufferAccess2 = false;
     bool exactRobustLoads = false;
     bool depthRangeRemap = false;
@@ -377,14 +378,15 @@ struct SpirvTarget {
     std::uint32_t pixelFunctionStorageDwords = 4096u;
     bool deviceScopeLdsMemoryBarriers = false;
     bool ldsLockFences = false;
+    bool deviceAtomicWorkgroupMemoryBarriers = false;
     bool fragmentBarycentricBuiltins = false;
     bool meshWindowBuffer = false;
     bool hostInterpolationFirst = false;
     bool shaderImageMinLod = false;
     bool float16WidenNans = false;
     bool float16NarrowNans = false;
+    bool float16HostNans = false;
     bool meshInlineFunctions = false;
-    bool blockAccess = false;
 };
 
 struct BindingLayout {
@@ -700,6 +702,7 @@ struct DescriptorBinding {
     ElementFlags imageDepthCompare;
     ElementFlags imageAtomic;
     ElementFlags imageAtomic64;
+    ElementFlags imageUintStorage;
     std::vector<DescriptorImageShape> imageShapes;
     // Guest buffer elements the shader updates atomically (one entry per element of a GuestBuffers
     // binding, empty otherwise). An atomic on a host-imported range is a serialized PCIe round trip
@@ -719,7 +722,6 @@ struct DescriptorBinding {
     std::vector<std::uint64_t> imageSamplers;
     ElementFlags bufferRead;
     std::vector<std::uint32_t> bufferExtent;
-    std::vector<std::uint32_t> bufferResources;
 };
 
 struct ImageTableEntryPoison {
@@ -813,6 +815,7 @@ public:
     }
 
     [[nodiscard]] std::span<const std::uint32_t> Words() const { return holder ? holder->Words() : std::span<const std::uint32_t>{}; }
+    [[nodiscard]] bool Mapped() const { return holder != nullptr && holder->owner != nullptr; }
     [[nodiscard]] SpirvContentHash ContentHash() const {
         if (holder == nullptr) return {};
         if (holder->hashed.load(std::memory_order_acquire)) return {holder->hashLow.load(std::memory_order_relaxed), holder->hashHigh.load(std::memory_order_relaxed)};
@@ -935,9 +938,6 @@ struct CompiledShaderArtifact {
     bool bdaWrites = false;
     bool layerReplaySafe = false;
     std::uint32_t stencilReferenceDword = 0xffffffffu;
-    bool blockModule = false;
-    std::uint32_t blockAddressDword = 0xffffffffu;
-    BlockLayout blockLayout;
     std::uint64_t variantId = 0;
 };
 

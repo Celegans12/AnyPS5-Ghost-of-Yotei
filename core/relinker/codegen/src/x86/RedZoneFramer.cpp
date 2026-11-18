@@ -489,6 +489,7 @@ struct OperandStub {
     std::size_t End;
     Copied Body;
     std::size_t Operands = 0;
+    std::vector<StubRelocation> Relocations = {};
 };
 
 struct ExitSite {

@@ -2,7 +2,6 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
-#include "prx/libc/include/GuestArena.hpp"
 #include <array>
 #include <atomic>
 #include <cstddef>
@@ -47,6 +46,7 @@ bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> b
 // space cannot be queried).
 enum class Compare : std::uint8_t { Equal, Differs, Unmapped };
 Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes);
+void SetCompareMappedHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 Compare CopyMapped(std::uint64_t address, std::span<std::byte> out);
 void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
 void Write(std::uint64_t address, std::span<const std::byte> source, std::size_t alignment = 1);
@@ -70,7 +70,6 @@ void Unwatch(std::uint64_t address, std::size_t bytes);
 void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true, bool importMayWriteGuest = true);
 void SetUnwatchHook(void (*hook)(std::uint64_t address, std::size_t bytes));
-void SetStoreHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 bool UnwatchWritesProven();
 void SetImportWalkFailureForTest(int walk, std::uint64_t span = 0);
 #ifdef _WIN32
@@ -78,6 +77,9 @@ using FreshCollectHook = bool (*)(std::uintptr_t address, std::size_t bytes, voi
 void SetFreshCollectHook(FreshCollectHook hook);
 #endif
 bool Watched(std::uint64_t address, std::size_t bytes);
+bool OnlyRewatchedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
+bool Rewatched(std::uint64_t address, std::size_t bytes);
+void RewatchedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> since, std::span<std::uint8_t> rewatched);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);
 struct WriteSubscription;
 bool WriteIndexEnabled();
@@ -90,50 +92,7 @@ void TrimSubscriptionBumps(WriteSubscription& subscription, std::uint64_t genera
 std::uint64_t WriteBlockOf(std::uint64_t address);
 void NoteGpuPending(std::uint64_t address, std::size_t bytes);
 void NoteTextureReleased(std::uint64_t address);
-void NoteRegistryChange(std::uint64_t address, std::size_t bytes);
-enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Break, Registry, Count };
-bool ResourceVersions();
-struct ArmedProof {
-    std::vector<std::uint64_t> tokens;
-    std::uint64_t address = 0;
-    std::uint64_t bytes = 0;
-    std::uint64_t askAfter = 0;
-    bool held = false;
-};
-struct ArmedProofSource {
-    bool (*tokens)(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens) = nullptr;
-    bool (*clean)(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> tokens) = nullptr;
-    bool (*arm)(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens) = nullptr;
-};
-struct ArmedProofCounts {
-    std::uint64_t answered = 0;
-    std::uint64_t sweeps = 0;
-    std::uint64_t asked = 0;
-    std::uint64_t granted = 0;
-    std::uint64_t broken = 0;
-    std::uint64_t verified = 0;
-    std::uint64_t races = 0;
-};
-inline constexpr std::size_t ArmedProofBlocks = 4096;
-inline constexpr std::uint64_t ArmedProofRest = 256;
-bool ArmedProofs();
-void SetArmedProofSourceForTest(const ArmedProofSource* source);
-bool ArmedProofHolds(ArmedProof& proof, std::uint64_t address, std::size_t bytes);
-std::uint64_t CollectWritesArmed(ArmedProof& proof, std::uint64_t address, std::size_t bytes);
-ArmedProofCounts ArmedProofsCounted();
-std::string ArmedProofReport();
-struct ResourceVersion {
-    std::shared_ptr<WriteSubscription> subscription;
-    std::shared_ptr<WriteSubscription> notedSubscription;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> swept;
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> noted;
-    std::uint64_t sweptEpoch = 0;
-    std::uint64_t refusedUnwatch = 0;
-    std::uint64_t renewals = 0;
-    std::vector<ArmedProof> armed;
-};
-bool HoldVersion(ResourceVersion& version, std::vector<std::pair<std::uint64_t, std::uint64_t>>& swept, std::vector<std::pair<std::uint64_t, std::uint64_t>>& noted);
-std::uint64_t CurrentVersion(ResourceVersion& version, std::uint64_t epoch);
+enum class WriteBumpSource : std::uint8_t { Cpu, Driver, Pending, Unwatch, Forget, Release, Import, Count };
 struct WriteIndexStats {
     std::uint64_t subscriptions = 0;
     std::uint64_t blocks = 0;
@@ -156,34 +115,13 @@ struct UnchangedQuery {
 };
 bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool UnchangedSinceAll(std::span<const UnchangedQuery> queries);
-bool UnchangedSincePublished(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 std::uint64_t CollectCommittedWrites(std::uint64_t address, std::size_t bytes, std::vector<std::pair<std::uint64_t, std::uint64_t>>& ranges);
 std::uint64_t WriteGeneration();
-inline constexpr std::uint64_t ArmedBlockBytes = 65536;
-std::size_t ArmedBlocks(std::uint64_t address, std::size_t bytes);
-bool ArmedTokens(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens);
-bool ArmedCleanSince(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> tokens);
-bool ArmBlocks(std::uint64_t address, std::size_t bytes, std::span<std::uint64_t> tokens);
-bool RearmWritten(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> since, std::span<std::uint64_t> tokens, std::span<std::uint16_t> written);
-enum class Unarmed : std::uint8_t { No = 0, Held = 1, Imported = 2, Barred = 3, Resting = 4, Edge = 5, Other = 6, GpuWritten = 7 };
-void AnnounceGpuWrite(std::uint64_t address, std::size_t bytes, GuestArena::PageTrackOrigin origin);
-void AnnounceGpuUnwatched(std::uint64_t address, std::size_t bytes);
-void AnnounceGpuWatched(std::uint64_t address, std::size_t bytes);
-std::uint64_t BeginGpuFlight();
-void EndGpuFlight(std::uint64_t flight);
-void ReportPageOrigins();
-std::uint8_t UnarmedReason(std::uint64_t address);
-std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::span<std::uint64_t> tokens = {});
+std::uint64_t CollectWrittenBlocks(std::uint64_t address, std::size_t bytes, std::uint64_t since, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written);
 bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, std::uint64_t generation);
 // Returns the generation the blocks were stamped with (0 when the arena is not write-watched):
 // UnchangedSince(range, it) holds until the next store over the range.
 std::uint64_t MarkWritten(std::uint64_t address, std::size_t bytes);
-constexpr std::size_t MarkBlockBytes = 65536;
-std::uint64_t MarkWrittenInCollectedBlock(std::uint64_t address, std::size_t bytes);
-struct CollectedMarkCounts {
-    std::uint64_t skipped, verified, fresh;
-};
-CollectedMarkCounts CollectedMarkCounted();
 std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes);
 std::uint64_t MarkPossiblyWritten(std::uint64_t address, std::size_t bytes, std::uint64_t& order);
 void ForgetKnownZero(std::uint64_t address, std::size_t bytes);
@@ -200,7 +138,12 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 // submission runs. The driver's own writes (Write, WriteChanged, MarkWritten) stamp their blocks, so
 // they are never hidden. APS5_NO_COLLECT_MEMO=1 disables the memo. CollectWritesUncached always walks:
 // for decisions about which blocks the CPU wrote while a GPU result was pending (a stale answer there
-// stores old texels over reused memory).
+// stores old texels over reused memory). The collect that starts such a pending period
+// (StorageTexture::markLayersPending) may be memoized: its caller reads TrackerGeneration after it,
+// so a store the memoized walk missed is stamped above that generation by a later walk (at the
+// latest the decision's own uncached one) and counts as made while the result was pending, while a
+// store ordered before the draw was made before the epoch's ordering point, so the memoized walk,
+// which started after that point, stamped it. APS5_NO_MEMO_PENDING_COLLECT walks there again.
 // The epoch is per queue worker: BumpCollectEpoch advances the calling thread's epoch to a value no
 // other thread ever holds. Each 64 KiB block records the counter value read before its last complete
 // walk, and a request of epoch e is answered by any walk of the block made at or after e, by
@@ -213,101 +156,19 @@ bool StoredAllSince_nid_no_patch(std::uint64_t address, std::size_t bytes, std::
 // for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
+void BumpCollectEpochSince(std::uint64_t since);
+void RaiseCollectSince(std::uint64_t since);
+void ShareCollectWalks(bool share);
+bool CollectWalksShared();
+std::uint64_t CollectSince();
+std::uint64_t SteadyNanoseconds();
 void AdoptLatestCollectEpoch();
-void AdoptCollectEpoch(std::uint64_t epoch);
-std::uint64_t HeldCollectEpoch();
-bool UnchangedSinceEpochStart(std::uint64_t address, std::size_t bytes);
-struct ContentToken {
-    std::uint64_t content = 0;
-    std::uint64_t context = 0;
-};
-bool EpochSweeps();
-ContentToken TokenFor(std::uint64_t address, std::size_t bytes);
-bool StillCurrent(std::uint64_t address, std::size_t bytes, const ContentToken& token);
-bool StillCurrentPublished(std::uint64_t address, std::size_t bytes, const ContentToken& token);
-void SweepHot(std::uint64_t epoch);
-enum class TokenMiss : std::uint8_t { Unobserved, Written, Context, Busy, Count };
-struct EpochSweepCounts {
-    std::uint64_t sweeps = 0;
-    std::uint64_t abandoned = 0;
-    std::uint64_t runs = 0;
-    std::uint64_t blocks = 0;
-    std::uint64_t hot = 0;
-    std::uint64_t barred = 0;
-    std::uint64_t tokens = 0;
-    std::uint64_t held = 0;
-    std::array<std::uint64_t, static_cast<std::size_t>(TokenMiss::Count)> refused{};
-    std::array<std::uint64_t, static_cast<std::size_t>(TokenMiss::Count)> missed{};
-    std::uint64_t verified = 0;
-    std::uint64_t late = 0;
-};
-EpochSweepCounts EpochSweepCounted();
 std::uint64_t ProofSerial();
-enum class ProofBreak : std::uint8_t { Store, Marked, Changed, GpuHold, Commit, WriteBack, CopiedWriters, Label, RecordedWork, Registry, Count };
-void BreakProofs(ProofBreak source);
-void BreakProofs(ProofBreak source, std::uint64_t address, std::size_t bytes);
-std::uint64_t WideProofSerial();
-const char* ProofBreakName(ProofBreak source);
-struct ProofBreakCounts {
-    std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> breaks{};
-    std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> wide{};
-    std::array<std::uint64_t, static_cast<std::size_t>(ProofBreak::Count)> serialMisses{};
-};
-ProofBreakCounts ProofBreaksCounted();
-void NoteSerialMiss();
-struct DirtyBlockCounts {
-    std::uint64_t distinct = 0;
-    std::uint64_t recurrent = 0;
-    std::uint64_t findings = 0;
-    std::uint64_t collectBytes = 0;
-    std::uint64_t collectDirtyBytes = 0;
-    std::uint64_t variantBytes = 0;
-    std::uint64_t variantDirtyBytes = 0;
-};
-DirtyBlockCounts TakeDirtyBlockCounts();
-void CountValidatedBytes(std::uint64_t address, std::size_t bytes);
+std::uint64_t OwnProofBreaks();
+void BreakProofs();
 void MarkProofThread();
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
-struct CollectCounts {
-    std::uint64_t watchCalls = 0;
-    std::uint64_t committerWatchCalls = 0;
-    std::uint64_t epochBumps = 0;
-    std::uint64_t memoHits = 0;
-    std::uint64_t walkedEpochs = 0;
-    std::uint64_t pageArmed = 0;
-    std::uint64_t pageArms = 0;
-    std::uint64_t pageFaults = 0;
-    std::uint64_t pageQuiet = 0;
-    std::uint64_t pageRests = 0;
-    std::uint64_t pageDivergences = 0;
-    std::array<std::uint64_t, 6> pageLeft{};
-    std::uint64_t pageImportArms = 0;
-    std::uint64_t pageGpuMarks = 0;
-    std::uint64_t pageGpuExpiries = 0;
-};
-CollectCounts CollectCounted();
-void ReportCollectCosts();
-enum class TrackerLockSite : std::uint8_t { Other = 0, Generation, Unchanged, Written, Watched, Collect, Mark, Store, Count };
-const char* TrackerLockSiteName(TrackerLockSite site);
-struct LockCounts {
-    static constexpr std::size_t TrackerSites = static_cast<std::size_t>(TrackerLockSite::Count);
-    static constexpr std::size_t WaitBuckets = 4;
-    struct TrackerSite {
-        std::uint64_t acquisitions = 0;
-        std::uint64_t unlocked = 0;
-        std::uint64_t waits = 0;
-        std::uint64_t waitNs = 0;
-        std::uint64_t committerWaits = 0;
-        std::uint64_t committerWaitNs = 0;
-        std::array<std::uint64_t, WaitBuckets> waitsBelow{};
-        std::array<std::uint64_t, TrackerSites> behindNs{};
-    };
-    std::array<TrackerSite, TrackerSites> tracker{};
-    GuestArena::MappingLockCounts mappings{};
-};
-LockCounts LockCounted();
-std::string LockReport(const LockCounts& from, const LockCounts& to);
 std::uint64_t ThreadCollectEpoch();
 std::uint64_t UnwatchSerial();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
@@ -323,7 +184,6 @@ void SetObservationHookForTest(void (*hook)(int point));
 // tracker mutex, so every collect that bumped before it has finished its walk and every later
 // collect stamps newer.
 std::uint64_t TrackerGeneration();
-std::uint64_t SettledGeneration();
 void AdvanceTrackerGenerationForTest(std::uint64_t generation);
 std::uint64_t NewestStamp(std::uint64_t address, std::size_t bytes);
 std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);
@@ -333,7 +193,6 @@ std::uint64_t UntrackedHint(std::uint64_t address, std::size_t bytes);
 // records, which share the title's label blocks. False when the arena is not write-watched.
 bool UnchangedSinceCollected(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 bool CpuWroteSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
-bool CpuWrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation, std::vector<std::pair<std::uint64_t, std::uint64_t>>& written, std::uint64_t& collected);
 bool UnchangedSinceLastCollect(std::uint64_t address, std::size_t bytes, std::uint64_t generation);
 // Per 64 KiB tracker block of [address, address + bytes) (block 0 holds `address`): `changed[k]`
 // receives whether the block was stamped after generations[k] (UnchangedSince over that block
@@ -363,18 +222,22 @@ public:
     // current acquisition is the outermost, so code that releases the mutex around a wait
     // (Recorder::SyncThrough for the flush hook) gives up no caller's hold.
     std::uint32_t DepthOnThisThread() const;
+    std::uint32_t Waiters() const { return waiters.load(std::memory_order_relaxed); }
 
 private:
     void enter();
+    void block();
     bool tryEnter();
     void acquired();
     Mutex mutex;
+    std::atomic<std::uint32_t> waiters{0};
     // The holder's thread token and recursion depth, written by the holder only; another thread
     // reads the owner just to see that it is not itself.
     std::atomic<const void*> owner{nullptr};
     std::uint32_t depth = 0;
 };
 GpuMutexType& GpuMutex();
+std::function<bool()> YieldToGpuMutexWaiters(std::function<bool()> stop);
 // Called on the thread that just gave up its outermost hold, right after the mutex was released:
 // work the hold deferred to run without it (the recorder's release of the objects completed batches
 // kept). One hook, set once; it must not take GpuMutex itself.

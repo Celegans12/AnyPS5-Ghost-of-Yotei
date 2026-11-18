@@ -1,13 +1,9 @@
-#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include <vector>
-#include <optional>
-#include <chrono>
-#include <atomic>
 #include <algorithm>
 #include <array>
 #include <cstdlib>
@@ -46,35 +42,12 @@ ShaderRecompiler::ShaderVertexStageInfo DecodeOrderedVertexStageInfo(std::span<c
     };
     if (!DrawPipeline::Active()) return decode();
     auto& queue = DrawPipeline::Queue0();
-    static const bool light = std::getenv("APS5_NO_LIGHT_DECODE_WATCH") == nullptr;
-    if (light) {
-        static std::atomic<std::uint64_t> watched{0}, retried{0};
-        static std::atomic<std::int64_t> reportedAt{0};
-        static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
-        const auto retired = queue.Retired();
-        auto info = decode();
-        std::vector<DrawPipeline::Range> ranges;
-        ranges.reserve(reads.size());
-        for (const auto& read : reads) ranges.emplace_back(read.address, read.address + read.size);
-        const auto written = queue.WrittenWhileQueued(retired, ranges);
-        watched.fetch_add(1, std::memory_order_relaxed);
-        if (!written.has_value()) retried.fetch_add(1, std::memory_order_relaxed);
-        if (stats) {
-            const auto tenSeconds = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count() / 10;
-            if (reportedAt.exchange(tenSeconds, std::memory_order_relaxed) != tenSeconds) AgcDriver::ProfilePrint_nid_no_patch("[decode-watch] (10 s): %llu vertex stage decodes checked against the committer's queue without a copy of its writes, %llu decoded again with the copy because an item retired meanwhile\n", static_cast<unsigned long long>(watched.exchange(0)), static_cast<unsigned long long>(retried.exchange(0)));
-        }
-        if (written.has_value()) {
-            if (!*written) return info;
-            queue.NoteDecodeDrain();
-            queue.Drain(DrawPipeline::DrainReason::Capture);
-            return decode();
-        }
-    }
-    const auto watch = queue.WatchWrites();
+    auto watch = queue.WatchWrites();
     auto info = decode();
     if (watch.items == 0 && !queue.Busy() && queue.Retired() == watch.retired) return info;
-    std::vector<DrawPipeline::Range> ranges;
-    ranges.reserve(reads.size());
+    struct RangesStorage {};
+    auto& ranges = HostThreadLocal<std::vector<DrawPipeline::Range>, RangesStorage>();
+    ranges.clear();
     for (const auto& read : reads) ranges.emplace_back(read.address, read.address + read.size);
     if (!queue.WrittenSince(watch, ranges)) return info;
     queue.NoteDecodeDrain();
@@ -225,8 +198,16 @@ std::shared_ptr<DrawDecode> Driver::decodeDraw(const QueueState& queue, const Su
     product->state = Graphics::DecodeState(queue, VertexWorkgroupRequired(queue, *submission.shaders));
     DecodeGraphicsPrograms(*product, queue, *submission.shaders, false, true);
     product->state.depthCopySource = std::ranges::any_of(product->programs, [](const DrawProgram& program) { return program.binary.codeAddress == DepthCopyPixelProgramAddress(true) || program.binary.codeAddress == StencilCopyPixelProgramAddress(true); });
-    product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(product->state), Graphics::PixelProgramSkipped(queue));
+    std::span<const std::byte> fragmentHeader;
+    for (const auto& program : product->programs) {
+        if (program.binary.stage == ShaderRecompiler::ShaderStage::Fragment) {
+            fragmentHeader = program.binary.header;
+            break;
+        }
+    }
+    product->pixel = Graphics::DecodePixelStageInfo(queue.context, Graphics::ExportMappings(product->state), Graphics::PixelProgramSkipped(queue), fragmentHeader);
     Graphics::NormalizeUnusedViewportDepth(product->state, product->pixel);
+    Graphics::ApplyViewportIndex(context, product->state);
     Graphics::ApplyDepthRemap(context, product->state);
     Graphics::ApplyDepthBoundsEmulation(context, product->state, product->pixel);
     static const bool readOnlyDepthBoundsCompare = [] {
@@ -278,16 +259,15 @@ void Driver::resolveDrawDecode(const QueueState& queue, const Submission& submis
                 static std::atomic<std::uint64_t> reports{0};
                 if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: the entry's decode differs from a fresh decode (key 0x%llx, target 0x%llx)\n", static_cast<unsigned long long>(drawKey), static_cast<unsigned long long>(fresh->state.color.address));
             }
-            DrawCacheAccess access(*this);
-            auto& counters = access.Counters();
-            counters.facadeMismatches += facadeMismatches;
-            if (decode != nullptr) ++counters.verifyDecodes;
-            counters.verifyDecodeMismatches += decodeMismatches;
+            std::lock_guard cacheLock(drawCacheMutex);
+            drawEntryCounters.facadeMismatches += facadeMismatches;
+            if (decode != nullptr) ++drawEntryCounters.verifyDecodes;
+            drawEntryCounters.verifyDecodeMismatches += decodeMismatches;
         }
         decode = std::move(fresh);
     } else if (profile) {
-        DrawCacheAccess access(*this);
-        ++access.Counters().decodeSkipped;
+        std::lock_guard cacheLock(drawCacheMutex);
+        ++drawEntryCounters.decodeSkipped;
     }
 }
 

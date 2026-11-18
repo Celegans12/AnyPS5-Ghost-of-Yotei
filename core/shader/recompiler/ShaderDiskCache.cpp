@@ -87,12 +87,12 @@ std::filesystem::path ShaderCacheDirectory() {
 namespace ShaderRecompiler::ShaderDiskCache {
 
 #if defined(__linux__) && defined(__x86_64__) && defined(__GLIBCXX__)
-static_assert(sizeof(CompiledShaderArtifact) == 432, "CompiledShaderArtifact changed: update the artifact encoder");
+static_assert(sizeof(CompiledShaderArtifact) == 288, "CompiledShaderArtifact changed: update the artifact encoder");
 static_assert(sizeof(ShaderInvocation) == 216, "ShaderInvocation changed: update the invocation encoder");
 #if defined(__cpp_lib_atomic_shared_ptr)
-static_assert(sizeof(RecompileResult) == 696, "RecompileResult changed: update EncodeResult and DecodeResult");
+static_assert(sizeof(RecompileResult) == 552, "RecompileResult changed: update EncodeResult and DecodeResult");
 #endif
-static_assert(sizeof(DescriptorBinding) == 888, "DescriptorBinding changed: update the binding encoder");
+static_assert(sizeof(DescriptorBinding) == 920, "DescriptorBinding changed: update the binding encoder");
 static_assert(sizeof(VertexAttribute) == 32, "VertexAttribute changed: update the attribute encoder");
 static_assert(sizeof(VertexInput) == 16, "VertexInput changed: update the vertex input encoder");
 static_assert(sizeof(FragmentParameter) == 16, "FragmentParameter changed: update the parameter encoder");
@@ -109,7 +109,7 @@ static_assert(sizeof(IrDescriptorBinding) == 32, "IrDescriptorBinding changed: u
 static_assert(sizeof(BindingAllocationResult) == 184, "BindingAllocationResult changed: update the allocation encoder");
 static_assert(sizeof(CompiledBindingLayout) == 88, "CompiledBindingLayout changed: update the allocation encoder");
 static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildKey");
-static_assert(sizeof(IrResourcePlan) == 776, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(sizeof(IrResourcePlan) == 728, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(sizeof(IrValue) == 144, "IrValue changed: update the plan value encoder");
 static_assert(sizeof(GuestRegister) == 8, "GuestRegister changed: update the plan value encoder");
 static_assert(sizeof(MemoryInfo) == 80, "MemoryInfo changed: update the plan encoder");
@@ -150,7 +150,7 @@ static_assert(fieldCount<SamplerResource>() == 8, "SamplerResource changed: upda
 static_assert(fieldCount<SampledResourcePair>() == 4, "SampledResourcePair changed: update the info encoder");
 static_assert(fieldCount<StageInput>() == 5, "StageInput changed: update the info encoder");
 static_assert(fieldCount<StageOutput>() == 4, "StageOutput changed: update the info encoder");
-static_assert(fieldCount<IrResourcePlan>() == 27, "IrResourcePlan changed: update EncodePlan and DecodePlan");
+static_assert(fieldCount<IrResourcePlan>() == 25, "IrResourcePlan changed: update EncodePlan and DecodePlan");
 static_assert(fieldCount<GuestRegister>() == 2, "GuestRegister changed: update the plan value encoder");
 static_assert(fieldCount<MemoryInfo>() == 32, "MemoryInfo changed: update the plan encoder");
 static_assert(fieldCount<DescriptorSource>() == 4, "DescriptorSource changed: update the plan encoder");
@@ -472,6 +472,7 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Flags(binding.imageDepthCompare);
     writer.Flags(binding.imageAtomic);
     writer.Flags(binding.imageAtomic64);
+    writer.Flags(binding.imageUintStorage);
     writer.List(binding.imageShapes, [](Writer& out, DescriptorImageShape shape) { out.Value(shape); });
     writer.Flags(binding.bufferAtomic);
     writer.Flags(binding.bufferWritten);
@@ -483,7 +484,6 @@ void encodeBinding(Writer& writer, const DescriptorBinding& binding) {
     writer.Values(std::span<const std::uint64_t>(binding.imageSamplers));
     writer.Flags(binding.bufferRead);
     writer.Values(std::span<const std::uint32_t>(binding.bufferExtent));
-    writer.Values(std::span<const std::uint32_t>(binding.bufferResources));
 }
 
 void decodeBinding(Reader& reader, DescriptorBinding& binding) {
@@ -502,6 +502,7 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Flags(binding.imageDepthCompare);
     reader.Flags(binding.imageAtomic);
     reader.Flags(binding.imageAtomic64);
+    reader.Flags(binding.imageUintStorage);
     reader.List(binding.imageShapes, 4, [](Reader& in, DescriptorImageShape& shape) { in.Value(shape); });
     reader.Flags(binding.bufferAtomic);
     reader.Flags(binding.bufferWritten);
@@ -513,7 +514,6 @@ void decodeBinding(Reader& reader, DescriptorBinding& binding) {
     reader.Values(binding.imageSamplers);
     reader.Flags(binding.bufferRead);
     reader.Values(binding.bufferExtent);
-    reader.Values(binding.bufferResources);
 }
 
 void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
@@ -581,33 +581,6 @@ void encodeArtifact(Writer& writer, const CompiledShaderArtifact& result) {
     writer.Value(result.bdaWrites);
     writer.Value(result.layerReplaySafe);
     writer.Value(result.stencilReferenceDword);
-    writer.Value(result.blockModule);
-    writer.Value(result.blockAddressDword);
-    writer.Value(result.blockLayout.abiVersion);
-    writer.Value(result.blockLayout.words);
-    writer.List(result.blockLayout.buffers, [](Writer& out, const BlockBuffer& buffer) {
-        out.Value(buffer.resource);
-        for (const auto word : buffer.descriptorWords) out.Value(word);
-        out.Value(buffer.formatFixed);
-        out.Value(buffer.typedAlignment);
-    });
-    writer.List(result.blockLayout.variantKey, [](Writer& out, const BlockVariantBit& bit) {
-        out.Value(bit.word);
-        out.Value(bit.mask);
-    });
-    writer.List(result.blockLayout.imageKey, [](Writer& out, const BlockImageKeyWord& word) {
-        out.Value(word.word);
-        out.Value(word.mask);
-    });
-    writer.List(result.blockLayout.userVariantKey, [](Writer& out, const BlockVariantBit& bit) {
-        out.Value(bit.word);
-        out.Value(bit.mask);
-    });
-    writer.List(result.blockLayout.userImageKey, [](Writer& out, const BlockImageKeyWord& word) {
-        out.Value(word.word);
-        out.Value(word.mask);
-    });
-    writer.Value(result.blockLayout.refusal);
 }
 
 void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
@@ -679,33 +652,6 @@ void decodeArtifact(Reader& reader, CompiledShaderArtifact& result) {
     reader.Value(result.bdaWrites);
     reader.Value(result.layerReplaySafe);
     reader.Value(result.stencilReferenceDword);
-    reader.Value(result.blockModule);
-    reader.Value(result.blockAddressDword);
-    reader.Value(result.blockLayout.abiVersion);
-    reader.Value(result.blockLayout.words);
-    reader.List(result.blockLayout.buffers, 12, [](Reader& in, BlockBuffer& buffer) {
-        in.Value(buffer.resource);
-        for (auto& word : buffer.descriptorWords) in.Value(word);
-        in.Value(buffer.formatFixed);
-        in.Value(buffer.typedAlignment);
-    });
-    reader.List(result.blockLayout.variantKey, 8, [](Reader& in, BlockVariantBit& bit) {
-        in.Value(bit.word);
-        in.Value(bit.mask);
-    });
-    reader.List(result.blockLayout.imageKey, 8, [](Reader& in, BlockImageKeyWord& word) {
-        in.Value(word.word);
-        in.Value(word.mask);
-    });
-    reader.List(result.blockLayout.userVariantKey, 8, [](Reader& in, BlockVariantBit& bit) {
-        in.Value(bit.word);
-        in.Value(bit.mask);
-    });
-    reader.List(result.blockLayout.userImageKey, 8, [](Reader& in, BlockImageKeyWord& word) {
-        in.Value(word.word);
-        in.Value(word.mask);
-    });
-    reader.Value(result.blockLayout.refusal);
     result.variantId = 0;
 }
 
@@ -791,7 +737,6 @@ void decodeInvocation(Reader& reader, ShaderInvocation& invocation) {
 void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
     writer.Value(layout.pushDataStartDword);
     writer.Value(layout.stencilReferenceDword);
-    writer.Value(layout.blockAddressDword);
     writer.Value(layout.memoryOffsetDword);
     writer.Value(layout.memoryOffsetCount);
     writer.Value(layout.dispatchThreadLimit);
@@ -807,7 +752,6 @@ void encodeLayout(Writer& writer, const IrBindingLayout& layout) {
 void decodeLayout(Reader& reader, IrBindingLayout& layout) {
     reader.Value(layout.pushDataStartDword);
     reader.Value(layout.stencilReferenceDword);
-    reader.Value(layout.blockAddressDword);
     reader.Value(layout.memoryOffsetDword);
     reader.Value(layout.memoryOffsetCount);
     reader.Value(layout.dispatchThreadLimit);
@@ -1267,8 +1211,6 @@ bool encodePlan(Writer& writer, const IrResourcePlan& plan) {
     writer.Value(plan.srtGuardOffset);
     writer.Values(std::span<const std::uint8_t>(plan.cleanFlatSlots));
     writer.Values(std::span<const std::uint8_t>(plan.pureFlatSlots));
-    writer.Values(std::span<const std::uint8_t>(plan.descriptorLeafDwords));
-    writer.Values(std::span<const std::uint32_t>(plan.descriptorUserWords));
     writer.Value(plan.denseValueIds);
     writer.Value(plan.requiresSpecializationMemory);
     writer.Value(plan.srtPlanComplete);
@@ -1436,8 +1378,6 @@ bool decodePlan(Reader& reader, IrResourcePlan& plan) {
     reader.Value(plan.srtGuardOffset);
     reader.Values(plan.cleanFlatSlots);
     reader.Values(plan.pureFlatSlots);
-    reader.Values(plan.descriptorLeafDwords);
-    reader.Values(plan.descriptorUserWords);
     reader.Value(plan.denseValueIds);
     reader.Value(plan.requiresSpecializationMemory);
     reader.Value(plan.srtPlanComplete);
@@ -1488,7 +1428,6 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_PERF_ITERATION_SELECTION",
     "APS5_NO_PERF_LAYOUT_PAIR",
     "APS5_NO_BUFFER_SUBSTITUTES",
-    "APS5_NO_DESCRIPTOR_LEAVES",
     "APS5_NO_RESULT_MEMO",
     "APS5_NO_TABLE_RESOLUTION_REUSE",
     "APS5_NO_TABLE_SNAPSHOT_REUSE",
@@ -1606,6 +1545,7 @@ public:
         auto persisted = std::make_shared<CompiledVariant>();
         const auto bytes = mapped->Bytes();
         if (DecodeEntry(bytes, key, *persisted, std::move(mapped)) != LoadStatus::Loaded) return nullptr;
+        ReleaseMapped(persisted->artifact.spirv);
         persisted->layout = variant.layout;
         persisted->artifact.variantId = variant.artifact.variantId;
         persisted->substitutes = variant.substitutes;
@@ -2143,6 +2083,20 @@ std::shared_ptr<const CompiledVariant> Persist(std::span<const std::byte> key, c
 void Flush() {
     auto& instance = store();
     if (instance.Enabled()) instance.Flush();
+}
+
+void ReleaseMapped(const SharedSpirv& spirv) noexcept {
+    if (!spirv.Mapped()) return;
+    const auto words = spirv.Words();
+    if (words.empty()) return;
+#ifdef _WIN32
+    VirtualUnlock(const_cast<std::uint32_t*>(words.data()), words.size_bytes());
+#else
+    const auto page = static_cast<std::uintptr_t>(sysconf(_SC_PAGESIZE));
+    const auto first = reinterpret_cast<std::uintptr_t>(words.data());
+    const auto begin = first / page * page;
+    madvise(reinterpret_cast<void*>(begin), first + words.size_bytes() - begin, MADV_DONTNEED);
+#endif
 }
 
 void Shutdown() {

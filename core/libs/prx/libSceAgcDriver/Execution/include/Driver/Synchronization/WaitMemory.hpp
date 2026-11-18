@@ -4,7 +4,6 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/LabelStores.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include <array>
-#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -18,8 +17,10 @@ inline constexpr std::chrono::microseconds PollTryInterval{1000};
 
 struct LabelStore {
     std::uint64_t stamp = 0;
+    std::uint64_t generation = 0;
     std::uint32_t value = 0;
     std::uint32_t queue = 0xffffffffu;
+    bool ordered = true;
 };
 
 struct WriteRecord {
@@ -44,19 +45,10 @@ struct WaitOutcomes {
 };
 
 struct EpochBumps {
-    std::uint64_t submissions = 0, waits = 0, drains = 0, reaps = 0, packets = 0, waitsOrdered = 0, interrupts = 0, queuedInterrupts = 0, waitsBeforeEpoch = 0, awaitedPageCollects = 0;
+    std::uint64_t submissions = 0, waits = 0, drains = 0, reaps = 0, packets = 0, waitsOrdered = 0;
 };
 
-EpochBumps EpochBumpsCounted();
-
 void PollSleep();
-
-std::atomic<std::uint32_t>& BlockedReaders();
-bool CoreOffDraw();
-bool VerifyCoreOffDraw();
-bool SubmitEarly();
-std::uint64_t SubmitEarlyLoad();
-std::atomic<std::uint64_t>& EarlySubmits();
 
 bool OwnStoreRejects(std::span<const std::uint32_t> packet, std::uint64_t awaited, std::size_t bytes, std::uint32_t queue);
 

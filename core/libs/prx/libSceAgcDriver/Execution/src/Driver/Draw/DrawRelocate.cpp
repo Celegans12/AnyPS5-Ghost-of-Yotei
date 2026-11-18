@@ -2,11 +2,9 @@
 #include "ControlFlow/GraphBuilder.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
-#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/MovedRead.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
-#include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -53,7 +51,7 @@ std::uint64_t Driver::relocatedContentKey(const RelocatableUserWord& word, std::
         for (std::size_t done = 0; done < words; done += MaxContentWords) {
             const auto count = std::min<std::size_t>(words - done, MaxContentWords);
             const auto address = (static_cast<std::uint64_t>(word.high) << 32u) + AlignedWord(value) + static_cast<std::uint64_t>(offset) + done * sizeof(std::uint32_t);
-            if (CopyMoved(address, std::as_writable_bytes(std::span(content).first(count))) != GuestMemory::Compare::Equal) {
+            if (GuestMemory::CopyMapped(address, std::as_writable_bytes(std::span(content).first(count))) != GuestMemory::Compare::Equal) {
                 readable = false;
                 return hash;
             }
@@ -137,47 +135,8 @@ void Driver::tagUserValueWords(DispatchVariant& variant, const DrawProgram& prog
     }
 }
 
-void Driver::tagUserLeafWords(DispatchVariant& variant, const ShaderRecompiler::IrResourcePlan& plan, const DrawProgram& program) {
-    if (!ShaderRecompiler::DescriptorLeaves() || variant.compiled == nullptr) return;
-    const auto& bindings = variant.compiled->bindings;
-    std::uint64_t tagged = 0;
-    std::vector<std::array<std::uint32_t, 3>> slots;
-    for (std::size_t pair = 0; pair + 1 < plan.descriptorUserWords.size(); pair += 2) {
-        const auto source = plan.descriptorUserWords[pair] / 8u;
-        const auto dword = plan.descriptorUserWords[pair] % 8u;
-        const auto index = plan.descriptorUserWords[pair + 1];
-        if ((dword != 0u && dword != 2u) || index < program.hiddenUserWords || index >= program.userData.size() || index >= 64u) continue;
-        const auto bit = std::uint64_t {1} << index;
-        if (((variant.relocatableWords | variant.valueWords | variant.calleeWords | variant.vertexTableWords) & bit) != 0 || (variant.userWordsAsValue & bit) == 0 || (variant.userWordsAsBase & bit) != 0) continue;
-        slots.clear();
-        bool refused = false;
-        for (std::uint32_t binding = 0; binding < bindings.size() && !refused; ++binding) {
-            const auto& bound = bindings[binding];
-            if (bound.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
-            for (std::uint32_t element = 0; element < bound.bufferResources.size(); ++element) {
-                const auto resource = bound.bufferResources[element];
-                if (resource >= plan.info.buffers.size() || plan.info.buffers[resource].source != source) continue;
-                const auto slot = element * 4u + dword;
-                const bool readOnly = bound.guestDescriptor.size() == bound.bufferResources.size() * 4u && element < bound.bufferWritten.size() && !bound.bufferWritten[element] && (element >= bound.bufferAtomic.size() || !bound.bufferAtomic[element]);
-                if (!readOnly || bound.guestDescriptor[slot] != program.userData[index] || !ShaderRecompiler::SameBufferSpecialization(std::span<const std::uint32_t, 4>(bound.guestDescriptor.data() + element * 4u, 4), std::span<const std::uint32_t, 4>(bound.guestDescriptor.data() + element * 4u, 4))) {
-                    refused = true;
-                    break;
-                }
-                slots.push_back({index, binding, slot});
-            }
-        }
-        if (refused || slots.empty()) continue;
-        variant.valueWords |= bit;
-        variant.valueSlots.insert(variant.valueSlots.end(), slots.begin(), slots.end());
-        ++tagged;
-    }
-    NoteUserLeafWords(plan.descriptorUserWords.size() / 2u, tagged);
-}
-
 void Driver::tagVariantRuns(DispatchVariant& variant, std::span<const ShaderRecompiler::MemoryRegion> regions, const ShaderRecompiler::SrtUserDataUse& use, bool eligible, std::uint32_t hiddenWords, std::span<const std::shared_ptr<const ShaderRecompiler::SrtGuestWords>> supplied) {
     variant.userWordsWalked = use.asBase | use.asValue;
-    variant.userWordsAsValue = use.asValue;
-    variant.userWordsAsBase = use.asBase;
     std::uint64_t relocatable = eligible && drawRelocationEnabled() ? use.asBase & ~use.asValue : 0;
     if (hiddenWords != 0) relocatable &= hiddenWords >= 64 ? 0 : ~((std::uint64_t {1} << hiddenWords) - 1);
     std::vector<std::pair<std::uint64_t, std::int32_t>> reads;
@@ -250,7 +209,9 @@ std::size_t dropEveryOther(TMap& map) {
 
 }
 
-void Driver::learnRelocation(const DrawRelocationPending& pending) {
+void Driver::learnPendingRelocation() {
+    const auto pending = drawRelocationPending;
+    drawRelocationPending = {};
     if (pending.key == 0) return;
     const auto inserted = drawCache.find(pending.key);
     if (inserted == drawCache.end() || inserted->second->decode == nullptr) return;
@@ -268,10 +229,9 @@ void Driver::learnRelocation(const DrawRelocationPending& pending) {
         for (std::uint32_t index = program.hiddenUserWords; index < program.userData.size() && index < 64; ++index) {
             const auto reg = program.userDataBase + index - program.hiddenUserWords;
             const auto held = std::find_if(shape->words.begin(), shape->words.end(), [&](const RelocatableUserWord& word) { return word.reg == reg; });
-            const bool tailed = variant.decodeRuns != 0;
-            const bool relocatable = !tailed && (variant.relocatableWords >> index & 1u) != 0;
-            const bool value = !tailed && !relocatable && (variant.valueWords >> index & 1u) != 0;
-            if (!relocatable && !value && (tailed || (variant.calleeWords >> index & 1u) == 0)) {
+            const bool relocatable = (variant.relocatableWords >> index & 1u) != 0;
+            const bool value = !relocatable && (variant.valueWords >> index & 1u) != 0;
+            if (!relocatable && !value && (variant.calleeWords >> index & 1u) == 0) {
                 if (held == shape->words.end()) continue;
                 shape->words.erase(held);
                 shape->banned.push_back(reg);
@@ -301,28 +261,6 @@ void Driver::learnRelocation(const DrawRelocationPending& pending) {
     if (pending.alias == 0) return;
     if (drawAliases.size() >= MaxAliases) drawRelocationCounters.evicted += dropEveryOther(drawAliases);
     drawAliases[pending.alias] = pending.key;
-}
-
-bool Driver::valueWordMoves(const DispatchVariant& variant, std::uint32_t index, std::uint32_t from, std::uint32_t to) {
-    if (variant.compiled == nullptr || from == 0 || to == 0) return false;
-    const auto& bindings = variant.compiled->bindings;
-    bool slots = false;
-    for (const auto& [word, binding, slot] : variant.valueSlots) {
-        if (word != index) continue;
-        if (binding >= bindings.size() || slot >= bindings[binding].guestDescriptor.size()) return false;
-        const auto& descriptor = bindings[binding].guestDescriptor;
-        if (slot % 4u == 0) {
-            if (((from ^ to) & 3u) != 0) return false;
-        } else if (slot % 4u == 2) {
-            const auto stride = (descriptor[slot - 1u] >> 16u) & 0x3fffu;
-            const auto tail = [&](std::uint32_t records) { return (stride == 0 ? records : stride * records) & 3u; };
-            if (tail(from) != tail(to)) return false;
-        } else {
-            return false;
-        }
-        slots = true;
-    }
-    return slots;
 }
 
 void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std::shared_ptr<DrawEntry>& entry, std::shared_ptr<const DrawDecode>& decode, std::vector<DrawUserPatch>& patches) {
@@ -365,7 +303,7 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
         }
         for (const auto& variant : donor->stages[i]) {
             if (variant == nullptr || variant->compiled == nullptr) continue;
-            const bool allowed = variant->decodeRuns == 0 && std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program != i || (move.index < 64 && move.from != 0 && move.to != 0 && ((((variant->relocatableWords | variant->calleeWords) >> move.index & 1u) != 0 && ((move.from ^ move.to) & 3u) == 0) || ((variant->valueWords >> move.index & 1u) != 0 && valueWordMoves(*variant, move.index, move.from, move.to)))); });
+            const bool allowed = std::all_of(moves.begin(), moves.end(), [&](const Move& move) { return move.program != i || (move.index < 64 && move.from != 0 && move.to != 0 && ((((variant->relocatableWords | variant->calleeWords) >> move.index & 1u) != 0 && ((move.from ^ move.to) & 3u) == 0) || (variant->valueWords >> move.index & 1u) != 0)); });
             if (!allowed) {
                 ++counters.refused;
                 continue;
@@ -375,7 +313,6 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->runBases = variant->runBases;
             copy->relocatableWords = variant->relocatableWords;
             copy->userWordsWalked = variant->userWordsWalked;
-            copy->userWordsAsValue = variant->userWordsAsValue;
             copy->valueWords = variant->valueWords;
             copy->valueSlots = variant->valueSlots;
             copy->calleeWords = variant->calleeWords;
@@ -384,7 +321,6 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
             copy->words = variant->words;
             copy->forgetSerial = variant->forgetSerial;
             copy->compiled = variant->compiled;
-            copy->plan = variant->plan;
             copy->meshIndexDescriptor = variant->meshIndexDescriptor;
             copy->shader = variant->shader;
             copy->dataPositions = variant->dataPositions;
@@ -418,19 +354,15 @@ void Driver::relocateDrawEntry(const QueueState& queue, std::uint64_t alias, std
 }
 
 void Driver::applyShaderDataPatches(DispatchVariant& variant) {
-    if (variant.shaderDataPatches.empty() && variant.descriptorPatches.empty() && variant.vertexPatches.empty()) return;
+    if (variant.shaderDataPatches.empty() && variant.descriptorPatches.empty()) return;
     auto rebased = std::make_shared<ShaderRecompiler::RecompileResult>(*variant.compiled);
     for (const auto& [slot, value] : variant.shaderDataPatches) patchForwardedWord(*rebased, slot, value);
     for (const auto& [binding, word, value] : variant.descriptorPatches) {
         if (binding < rebased->bindings.size() && word < rebased->bindings[binding].guestDescriptor.size()) rebased->bindings[binding].guestDescriptor[word] = value;
     }
-    for (const auto& [attribute, resource] : variant.vertexPatches) {
-        if (attribute < rebased->vertexAttributes.size()) rebased->vertexAttributes[attribute].resource = resource;
-    }
     variant.compiled = std::move(rebased);
     variant.shaderDataPatches.clear();
     variant.descriptorPatches.clear();
-    variant.vertexPatches.clear();
 }
 
 void Driver::patchForwardedWord(ShaderRecompiler::RecompileResult& result, std::uint32_t slot, std::uint32_t value) {
@@ -439,294 +371,6 @@ void Driver::patchForwardedWord(ShaderRecompiler::RecompileResult& result, std::
     for (auto& binding : result.bindings) {
         if (binding.role == ShaderRecompiler::DescriptorRole::ShaderData && slot < binding.guestDescriptor.size()) binding.guestDescriptor[slot] = value;
     }
-}
-
-std::optional<DrawShapeReuse> Driver::shapeUserWordMoves(const DispatchVariant& variant, std::span<const std::uint32_t> was, std::span<const std::uint32_t> now, std::vector<UserWordMove>& moves, std::uint32_t* refused) {
-    moves.clear();
-    auto kind = DrawShapeReuse::EqualWords;
-    bool tables = false;
-    const auto& compiled = *variant.compiled;
-    const auto& forwarded = compiled.shaderDataUserWords;
-    for (std::uint32_t index = 0; index < now.size(); ++index) {
-        const auto from = was[index];
-        const auto to = now[index];
-        if (from == to) continue;
-        const auto refuse = [&]() -> std::optional<DrawShapeReuse> {
-            if (refused != nullptr) *refused = index;
-            return std::nullopt;
-        };
-        if (index >= ShaderRecompiler::SrtUserDataUse::TrackedWords) return refuse();
-        const auto bit = std::uint64_t {1} << index;
-        if ((variant.userDataMask & bit) == 0) continue;
-        if (variant.decodeRuns != 0 && (variant.vertexTableWords & bit) != 0) {
-            if (((variant.valueWords | variant.calleeWords) & bit) != 0 || ((variant.userWordsWalked & bit) != 0 && ((variant.relocatableWords & bit) == 0 || from == 0 || to == 0 || ((from ^ to) & 3u) != 0))) return refuse();
-            if ((compiled.userDataRegisterReads & bit) != 0 && std::find(forwarded.begin(), forwarded.end(), index) == forwarded.end()) return refuse();
-            moves.push_back({index, from, to});
-            tables = true;
-            continue;
-        }
-        if ((variant.forwardedWords & bit) != 0) {
-            if (std::find(forwarded.begin(), forwarded.end(), index) == forwarded.end()) return refuse();
-            moves.push_back({index, from, to});
-            if (kind == DrawShapeReuse::EqualWords) kind = DrawShapeReuse::Forwarded;
-            continue;
-        }
-        if (from == 0 || to == 0) return refuse();
-        if ((variant.relocatableWords & bit) != 0) {
-            if (((from ^ to) & 3u) != 0) return refuse();
-        } else if ((variant.valueWords & bit) != 0) {
-            if (!valueWordMoves(variant, index, from, to)) return refuse();
-        } else {
-            return refuse();
-        }
-        moves.push_back({index, from, to});
-        kind = DrawShapeReuse::Relocated;
-    }
-    return tables ? DrawShapeReuse::VertexTables : kind;
-}
-
-std::uint64_t Driver::vertexTableMask(const ShaderRecompiler::ShaderVertexStageInfo& vertex, std::uint32_t firstUserSgpr) {
-    std::uint64_t tables = 0;
-    const auto hidden = firstUserSgpr <= 8u ? 8u - firstUserSgpr : 0u;
-    for (const auto reg : {vertex.fetchAttribReg, vertex.fetchBufferReg}) {
-        const auto word = static_cast<std::uint64_t>(reg) + hidden;
-        tables |= word + 1u < 64u ? std::uint64_t {3} << word : ~std::uint64_t {0};
-    }
-    return tables;
-}
-
-bool Driver::shapeVertexInputsMatch(const ShaderRecompiler::ShaderVertexStageInfo& was, const ShaderRecompiler::ShaderVertexStageInfo& now) {
-    if (!was.fetchEmbedded || !now.fetchEmbedded || was.resourcesNum != now.resourcesNum || was.resourcesNum > was.resources.size()) return false;
-    if (was.fetchAttribReg != now.fetchAttribReg || was.fetchBufferReg != now.fetchBufferReg || was.paClVsOutCntl != now.paClVsOutCntl || was.depthRemapMode != now.depthRemapMode || was.pointList != now.pointList) return false;
-    if (std::bit_cast<std::uint32_t>(was.pointSize) != std::bit_cast<std::uint32_t>(now.pointSize) || std::bit_cast<std::uint32_t>(was.pointSizeMin) != std::bit_cast<std::uint32_t>(now.pointSizeMin) || std::bit_cast<std::uint32_t>(was.pointSizeMax) != std::bit_cast<std::uint32_t>(now.pointSizeMax)) return false;
-    for (std::uint32_t r = 0; r < was.resourcesNum; ++r) {
-        const auto& a = was.resources[r].fields;
-        const auto& b = now.resources[r].fields;
-        if ((a[1] >> 16u) != (b[1] >> 16u) || a[3] != b[3]) return false;
-        const auto& x = was.resourcesDst[r];
-        const auto& y = now.resourcesDst[r];
-        if (x.registerStart != y.registerStart || x.registersNum != y.registersNum || x.attrId != y.attrId || x.fetchIndex != y.fetchIndex) return false;
-    }
-    return true;
-}
-
-void Driver::appendDecodeRuns(DispatchVariant& variant, std::span<const Graphics::DecodeRead> reads) {
-    for (const auto& read : reads) {
-        const auto count = read.size / sizeof(std::uint32_t);
-        const auto offset = variant.words.size();
-        variant.words.resize(offset + count);
-        std::memcpy(variant.words.data() + offset, read.data.data(), count * sizeof(std::uint32_t));
-        variant.runs.emplace_back(read.address, read.address + count * sizeof(std::uint32_t));
-    }
-    variant.decodeRuns = static_cast<std::uint32_t>(reads.size());
-}
-
-bool Driver::rebaseVertexInputs(DispatchVariant& variant, const ShaderRecompiler::ShaderVertexStageInfo& now, std::span<const Graphics::DecodeRead> reads) {
-    if (variant.decodeRuns == 0 || variant.decodeRuns > variant.runs.size() || reads.empty() || now.resourcesNum > now.resources.size()) return false;
-    if (std::any_of(reads.begin(), reads.end(), [](const Graphics::DecodeRead& read) { return read.size % sizeof(std::uint32_t) != 0; })) return false;
-    const auto kept = variant.runs.size() - variant.decodeRuns;
-    std::size_t words = 0;
-    for (std::size_t run = 0; run < kept; ++run) words += static_cast<std::size_t>((variant.runs[run].second - variant.runs[run].first) / sizeof(std::uint32_t));
-    if (words > variant.words.size()) return false;
-    std::vector<std::pair<std::uint32_t, ShaderRecompiler::ShaderVertexBufferResource>> patches;
-    const auto& attributes = variant.compiled->vertexAttributes;
-    for (std::uint32_t k = 0; k < attributes.size(); ++k) {
-        const auto location = attributes[k].location;
-        if (location >= now.resourcesNum) return false;
-        if (attributes[k].resource.fields != now.resources[location].fields) patches.emplace_back(k, now.resources[location]);
-    }
-    variant.runs.resize(kept);
-    variant.words.resize(words);
-    appendDecodeRuns(variant, reads);
-    variant.vertexInfo = std::make_shared<const ShaderRecompiler::ShaderVertexStageInfo>(now);
-    variant.vertexPatches = std::move(patches);
-    return true;
-}
-
-DrawShapeWord Driver::shapeWordKind(const DispatchVariant& variant, std::uint32_t index, std::uint64_t tables) {
-    if (index >= ShaderRecompiler::SrtUserDataUse::TrackedWords) return DrawShapeWord::Read;
-    const auto bit = std::uint64_t {1} << index;
-    if ((tables & bit) != 0) return DrawShapeWord::VertexTable;
-    if ((variant.userWordsAsValue & bit) != 0) return DrawShapeWord::Value;
-    if ((variant.userWordsWalked & bit) != 0) return DrawShapeWord::Pointer;
-    return DrawShapeWord::Read;
-}
-
-std::shared_ptr<DispatchVariant> Driver::movedShapeVariant(const std::shared_ptr<DispatchVariant>& variant, std::span<const UserWordMove> moves) {
-    auto copy = std::make_shared<DispatchVariant>();
-    copy->runs = variant->runs;
-    copy->runBases = variant->runBases;
-    copy->relocatableWords = variant->relocatableWords;
-    copy->userWordsWalked = variant->userWordsWalked;
-    copy->userWordsAsValue = variant->userWordsAsValue;
-    copy->vertexTableWords = variant->vertexTableWords;
-    copy->decodeRuns = variant->decodeRuns;
-    copy->valueWords = variant->valueWords;
-    copy->valueSlots = variant->valueSlots;
-    copy->calleeWords = variant->calleeWords;
-    copy->calleeReads = variant->calleeReads;
-    copy->donor = variant->donor != nullptr ? variant->donor : variant;
-    copy->words = variant->words;
-    copy->forgetSerial = variant->forgetSerial;
-    copy->compiled = variant->compiled;
-    copy->registeredViews = variant->registeredViews;
-    copy->meshIndexDescriptor = variant->meshIndexDescriptor;
-    copy->shader = variant->shader;
-    copy->dataPositions = variant->dataPositions;
-    copy->dataSlots = variant->dataSlots;
-    copy->flatBinding = variant->flatBinding;
-    copy->bufferPositions = variant->bufferPositions;
-    copy->bufferSlots = variant->bufferSlots;
-    copy->maskPositions = variant->maskPositions;
-    copy->pushOffset = variant->pushOffset;
-    copy->userDataMask = variant->userDataMask;
-    copy->forwardedWords = variant->forwardedWords;
-    copy->vertexInfo = variant->vertexInfo;
-    bool shifted = false;
-    for (const auto& move : moves) {
-        const auto bit = std::uint64_t {1} << move.index;
-        if ((variant->relocatableWords & bit) != 0) {
-            const auto delta = AlignedWord(move.to) - AlignedWord(move.from);
-            for (std::size_t run = 0; run < copy->runs.size() && run < copy->runBases.size(); ++run) {
-                if (copy->runBases[run] != static_cast<std::int8_t>(move.index)) continue;
-                copy->runs[run].first += delta;
-                copy->runs[run].second += delta;
-                shifted = true;
-            }
-        }
-        const auto& forwarded = variant->compiled->shaderDataUserWords;
-        for (std::uint32_t slot = 0; slot < forwarded.size(); ++slot) {
-            if (forwarded[slot] == move.index) copy->shaderDataPatches.emplace_back(slot, move.to);
-        }
-        if ((variant->valueWords & bit) == 0) continue;
-        for (const auto& [word, binding, slot] : variant->valueSlots) {
-            if (word == move.index) copy->descriptorPatches.push_back({binding, slot, move.to});
-        }
-    }
-    if (!shifted) copy->shared = variant->shared;
-    return copy;
-}
-
-bool Driver::patchBufferWords(DispatchVariant& variant, std::span<const std::pair<std::uint32_t, std::uint32_t>> live) {
-    if (live.empty()) return true;
-    const auto& bindings = variant.compiled->bindings;
-    std::vector<std::array<std::uint32_t, 2>> touched;
-    for (const auto& [position, value] : live) {
-        const auto [first, last] = std::equal_range(variant.bufferPositions.begin(), variant.bufferPositions.end(), position);
-        const auto [dataFirst, dataLast] = std::equal_range(variant.dataPositions.begin(), variant.dataPositions.end(), position);
-        if ((first == last && dataFirst == dataLast) || position >= variant.words.size()) return false;
-        variant.words[position] = value;
-        for (auto at = dataFirst; at != dataLast; ++at) {
-            const auto slot = variant.dataSlots[static_cast<std::size_t>(at - variant.dataPositions.begin())];
-            if (variant.flatBinding >= bindings.size() || slot >= bindings[variant.flatBinding].guestDescriptor.size()) return false;
-            variant.descriptorPatches.push_back({variant.flatBinding, slot, value});
-        }
-        for (auto at = first; at != last; ++at) {
-            const auto& [binding, slot] = variant.bufferSlots[static_cast<std::size_t>(at - variant.bufferPositions.begin())];
-            if (binding >= bindings.size() || slot >= bindings[binding].guestDescriptor.size()) return false;
-            variant.descriptorPatches.push_back({binding, slot, value});
-            if (bindings[binding].role == ShaderRecompiler::DescriptorRole::GuestBuffers) touched.push_back({binding, slot / 4u});
-        }
-    }
-    std::sort(touched.begin(), touched.end());
-    touched.erase(std::unique(touched.begin(), touched.end()), touched.end());
-    for (const auto& [binding, element] : touched) {
-        const auto& stored = bindings[binding].guestDescriptor;
-        if (static_cast<std::size_t>(element) * 4u + 4u > stored.size()) return false;
-        std::array<std::uint32_t, 4> fresh{stored[element * 4u], stored[element * 4u + 1u], stored[element * 4u + 2u], stored[element * 4u + 3u]};
-        for (const auto& [patched, slot, value] : variant.descriptorPatches) {
-            if (patched == binding && slot / 4u == element) fresh[slot % 4u] = value;
-        }
-        if (bindings[binding].role == ShaderRecompiler::DescriptorRole::GuestBuffers && !ShaderRecompiler::SameBufferSpecialization(std::span<const std::uint32_t, 4>(stored.data() + element * 4u, 4), fresh)) return false;
-    }
-    variant.shared.clear();
-    return true;
-}
-
-bool Driver::movedRunsReadEqual(const DispatchVariant& variant, std::span<const UserWordMove> moves, bool redecoded, std::vector<std::pair<std::uint32_t, std::uint32_t>>* live) {
-    if (live != nullptr) live->clear();
-    std::array<std::uint32_t, MaxContentWords> read;
-    std::size_t offset = 0;
-    if (redecoded && variant.decodeRuns > variant.runs.size()) return false;
-    const auto compared = redecoded ? variant.runs.size() - variant.decodeRuns : variant.runs.size();
-    for (std::size_t run = 0; run < compared; ++run) {
-        auto begin = variant.runs[run].first;
-        const auto words = static_cast<std::size_t>((variant.runs[run].second - begin) / sizeof(std::uint32_t));
-        if (offset + words > variant.words.size()) return false;
-        if (run < variant.runBases.size() && variant.runBases[run] >= 0) {
-            const auto base = static_cast<std::uint32_t>(variant.runBases[run]);
-            const auto move = std::find_if(moves.begin(), moves.end(), [&](const UserWordMove& moved) { return moved.index == base; });
-            if (move != moves.end() && (variant.relocatableWords >> base & 1u) != 0) begin += AlignedWord(move->to) - AlignedWord(move->from);
-        }
-        for (std::size_t done = 0; done < words; done += MaxContentWords) {
-            const auto count = std::min<std::size_t>(words - done, MaxContentWords);
-            if (CopyMoved(begin + done * sizeof(std::uint32_t), std::as_writable_bytes(std::span(read).first(count))) != GuestMemory::Compare::Equal) return false;
-            if (std::memcmp(read.data(), variant.words.data() + offset + done, count * sizeof(std::uint32_t)) != 0) {
-                const auto& masked = variant.MaskedPositions();
-                if (live == nullptr || masked.empty()) return false;
-                for (std::size_t word = 0; word < count; ++word) {
-                    const auto position = static_cast<std::uint32_t>(offset + done + word);
-                    if (read[word] == variant.words[position]) continue;
-                    if (!std::binary_search(masked.begin(), masked.end(), position)) return false;
-                    live->emplace_back(position, read[word]);
-                }
-            }
-        }
-        offset += words;
-    }
-    return true;
-}
-
-std::uint64_t Driver::stageIdentity(std::uint64_t shape, std::size_t stage, const DrawProgram& program, const StageCapture& capture, const std::optional<ShaderRecompiler::ShaderVertexStageInfo>& vertex) {
-    std::uint64_t hash = shape ^ 0x5bd1e9955bd1e995ull;
-    const auto mix = [&](std::uint64_t mixed) {
-        hash ^= mixed;
-        hash *= 0x100000001b3ull;
-    };
-    const auto& compiled = *capture.compiled;
-    mix(stage);
-    mix(capture.pushOffset);
-    mix(compiled.PipelineVariantId());
-    const auto bufferWord = [&](std::uint32_t value) {
-        if (value == 0) return false;
-        for (const auto& binding : compiled.bindings) {
-            if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
-            for (std::size_t word = 0; word < binding.guestDescriptor.size(); word += 2) {
-                if (binding.guestDescriptor[word] == value) return true;
-            }
-        }
-        return false;
-    };
-    const auto tables = shapeVertexInputStages() && vertex && vertex->resourcesNum <= vertex->resources.size() ? capture.vertexTableWords : 0;
-    if (tables != 0) {
-        mix(vertex->resourcesNum);
-        for (std::uint32_t r = 0; r < vertex->resourcesNum; ++r) {
-            const auto& fields = vertex->resources[r].fields;
-            const auto& destination = vertex->resourcesDst[r];
-            mix((static_cast<std::uint64_t>(fields[1] >> 16u) << 32u) | fields[3]);
-            mix((static_cast<std::uint64_t>(static_cast<std::uint32_t>(destination.registerStart)) << 32u) | static_cast<std::uint32_t>(destination.registersNum));
-            mix((static_cast<std::uint64_t>(static_cast<std::uint32_t>(destination.attrId)) << 32u) | destination.fetchIndex);
-        }
-    }
-    const auto moves = (capture.userDataUse.asBase & ~capture.userDataUse.asValue) | capture.forwardedWords | tables;
-    for (std::size_t index = 0; index < program.userData.size(); ++index) {
-        const auto tracked = index < ShaderRecompiler::SrtUserDataUse::TrackedWords;
-        if (tracked && (capture.userDataMask >> index & 1u) == 0) continue;
-        if (tracked && ((moves >> index & 1u) != 0 || bufferWord(program.userData[index]))) continue;
-        mix((static_cast<std::uint64_t>(index) << 32u) | program.userData[index]);
-    }
-    std::uint64_t content = 0;
-    for (const auto& region : capture.regions) {
-        std::uint64_t words = 0x9e3779b97f4a7c15ull ^ region.bytes.size();
-        for (std::size_t at = 0; at + sizeof(std::uint32_t) <= region.bytes.size(); at += sizeof(std::uint32_t)) {
-            std::uint32_t word = 0;
-            std::memcpy(&word, region.bytes.data() + at, sizeof(word));
-            words = (words ^ word) * 0x100000001b3ull;
-        }
-        content += words;
-    }
-    mix(content);
-    return hash;
 }
 
 void Driver::reportDrawRelocation() {

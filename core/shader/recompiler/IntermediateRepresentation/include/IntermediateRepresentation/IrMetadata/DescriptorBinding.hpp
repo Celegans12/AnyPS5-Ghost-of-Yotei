@@ -1,7 +1,6 @@
 #ifndef CORE_SHADER_RECOMPILIER_INTERMEDIATEREPRESENTATION_INCLUDE_INTERMEDIATEREPRESENTATION_IRMETADATA_DESCRIPTORBINDING_HPP
 #define CORE_SHADER_RECOMPILIER_INTERMEDIATEREPRESENTATION_INCLUDE_INTERMEDIATEREPRESENTATION_IRMETADATA_DESCRIPTORBINDING_HPP
 
-#include "BlockAbi.hpp"
 #include "RuntimeAbi.hpp"
 #include <array>
 #include <cstdint>
@@ -41,7 +40,6 @@ struct IrDescriptorBinding {
 struct IrBindingLayout {
     std::uint32_t pushDataStartDword = PushData::NoStart;
     std::uint32_t stencilReferenceDword = PushData::NoStart;
-    std::uint32_t blockAddressDword = PushData::NoStart;
     std::uint32_t memoryOffsetDword = 0;
     std::uint32_t memoryOffsetCount = 0;
     bool dispatchThreadLimit = false;
@@ -65,22 +63,12 @@ struct IrBindingLayout {
     [[nodiscard]] bool UsesPushData() const {
         return pushDataStartDword != PushData::NoStart;
     }
-    [[nodiscard]] bool UsesBlock() const {
-        return blockAddressDword != PushData::NoStart;
-    }
-    [[nodiscard]] std::uint32_t BlockAddressDwords() const {
-        return UsesBlock() ? BlockAbi::PushAddressDwords : 0u;
-    }
     [[nodiscard]] std::uint32_t PushSlotDword() const {
-        const auto first = UsesPushData() ? pushDataStartDword : blockAddressDword;
-        return first != PushData::NoStart ? first / PushData::DwordCount * PushData::DwordCount : 0u;
+        return UsesPushData() ? pushDataStartDword / PushData::DwordCount * PushData::DwordCount : 0u;
     }
     void AdvancePushData(std::uint32_t& cursor) const {
         if (UsesPushData()) {
             cursor = pushDataStartDword + ShaderDataDwords();
-        }
-        if (UsesBlock()) {
-            cursor = blockAddressDword + BlockAddressDwords();
         }
     }
 

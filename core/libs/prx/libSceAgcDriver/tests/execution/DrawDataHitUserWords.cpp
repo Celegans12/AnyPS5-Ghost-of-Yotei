@@ -1,4 +1,6 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
@@ -177,13 +179,10 @@ void UnreadUserWordsKeepTheStage(bool verify) {
     const auto moved = counters;
     counters = Submit(std::move(commands));
     Require(counters.dataHits == moved.dataHits + 1, "a draw that pointed the pixel stage at another buffer descriptor was not a data-only hit: " + Counts(counters));
-    const bool sameHigh = (reinterpret_cast<std::uintptr_t>(first) >> 32u) == (reinterpret_cast<std::uintptr_t>(second) >> 32u);
-    const bool volatileWords = !verify && sameHigh && std::getenv("APS5_NO_DESCRIPTOR_LEAVES") == nullptr && std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") == nullptr;
-    if (volatileWords) Require(counters.dataStagesCompiled == moved.dataStagesCompiled && counters.dataStagesReused - moved.dataStagesReused == 2, "a draw that pointed the pixel stage at another descriptor of a read-only buffer did not reuse the pixel stage with the descriptor patched: " + Counts(counters));
-    else Require(counters.dataStagesCompiled - moved.dataStagesCompiled >= 1, "a draw that pointed the pixel stage at another buffer descriptor reused the pixel stage: " + Counts(counters));
-    if (!verify && !volatileWords) Require(counters.dataStagesReused - moved.dataStagesReused == 1, "a draw that changed only the pixel stage's descriptor pointer did not reuse the vertex stage: " + Counts(counters));
+    Require(counters.dataStagesCompiled - moved.dataStagesCompiled >= 1, "a draw that pointed the pixel stage at another buffer descriptor reused the pixel stage: " + Counts(counters));
+    if (!verify) Require(counters.dataStagesReused - moved.dataStagesReused == 1, "a draw that changed only the pixel stage's descriptor pointer did not reuse the vertex stage: " + Counts(counters));
 
-    const bool refresh = std::getenv("APS5_DRAW_PIPELINE") != nullptr || std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") == nullptr;
+    const bool refresh = std::getenv("APS5_DRAW_PIPELINE") != nullptr;
     for (const std::uint32_t unread : {0x33u, 0x44u}) {
         commands.clear();
         PixelUserData(commands, second, unread);
@@ -193,10 +192,6 @@ void UnreadUserWordsKeepTheStage(bool verify) {
         Require(counters.dataHits == last.dataHits + 1 && counters.inserts == last.inserts, "a draw at the moved pointer with a new unread word: " + Counts(counters));
         if (verify) continue;
         const auto compiled = counters.dataStagesCompiled - last.dataStagesCompiled;
-        if (volatileWords) {
-            Require(compiled == 0 && counters.shapeUpdates == last.shapeUpdates, "a draw at the moved pointer, whose buffer descriptor is patched, built a stage or refreshed the shape: " + Counts(counters));
-            continue;
-        }
         const bool expectReuse = refresh && unread == 0x44u;
         Require(compiled == (expectReuse ? 0u : 1u), std::string(expectReuse ? "after a refresh, the draw at the moved pointer compiled its pixel stage again: " : "the draw at the moved pointer did not compile its pixel stage: ") + Counts(counters));
         Require(counters.shapeUpdates - last.shapeUpdates == (refresh && unread == 0x33u ? 1u : 0u), "shape refreshes: " + std::to_string(counters.shapeUpdates - last.shapeUpdates) + " (" + Counts(counters) + ")");
@@ -232,7 +227,7 @@ void ReadUserWordsChangeTheOutput() {
     Require(closeTo(second, 191), "a pixel stage adding user word 2 changed to 0.5 wrote " + std::to_string(second) + ", expected 191 (" + Counts(after) + ", before: " + Counts(before) + ")");
 }
 
-void DirectBufferBaseMovesWithItsPayload(bool verify) {
+void DirectBufferBaseMovesWithItsPayload() {
     Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
     Registered(DirectBufferPixelHeader, DirectBufferPixelCode.data(), sizeof(DirectBufferPixelCode), 1);
     auto* ring = GuestBlock();
@@ -262,8 +257,7 @@ void DirectBufferBaseMovesWithItsPayload(bool verify) {
     const auto after = AgcDriver::DriverDetail::Driver::Get().DrawCacheCounters();
     Require(moved > repeated, "a draw whose descriptor base and payload both moved read the old payload: " + std::to_string(repeated) + " then " + std::to_string(moved) + " (" + Counts(after) + ", before: " + Counts(before) + ")");
     Require(after.dataHits == before.dataHits + 1, "a draw whose descriptor base and payload moved was not a data-only hit (" + Counts(after) + ", before: " + Counts(before) + ")");
-    if (std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") != nullptr || verify) Require(after.dataStagesCompiled - before.dataStagesCompiled >= 1, "a draw whose descriptor base moved did not build its pixel stage again (" + Counts(after) + ", before: " + Counts(before) + ")");
-    else Require(after.dataStagesCompiled == before.dataStagesCompiled && after.dataStagesReused - before.dataStagesReused == 2 && after.shapeReuses[static_cast<std::size_t>(AgcDriver::DriverDetail::DrawShapeReuse::Relocated)] == before.shapeReuses[static_cast<std::size_t>(AgcDriver::DriverDetail::DrawShapeReuse::Relocated)] + 1, "a draw whose descriptor base moved did not reuse the pixel stage built for the old base with its descriptor patched (" + Counts(after) + ", before: " + Counts(before) + ")");
+    Require(after.dataStagesCompiled - before.dataStagesCompiled >= 1, "a draw whose descriptor base moved reused the pixel stage built for the old base: the rebuild this test documents is gone, flip it to a reuse check (" + Counts(after) + ", before: " + Counts(before) + ")");
 }
 
 void UnreadPixelWordsKeepACompleteStage(bool verify) {
@@ -285,7 +279,7 @@ void UnreadPixelWordsKeepACompleteStage(bool verify) {
     const auto first = BrightestColorByte();
     const auto after = draw(0x22);
     const auto same = BrightestColorByte();
-    const auto forwarded = draw(0x22, 0.75f);
+    draw(0x22, 0.75f);
     const auto changed = BrightestColorByte();
     const auto closeTo = [](unsigned actual, unsigned expected) { return actual + 2 >= expected && actual <= expected + 2; };
     Require(closeTo(first, 128) && closeTo(same, 128) && closeTo(changed, 191),
@@ -295,10 +289,27 @@ void UnreadPixelWordsKeepACompleteStage(bool verify) {
                         "verify mode did not rebuild and compare a stage with no walked user data: " + Counts(before) + " -> " + Counts(after));
     else Require(after.dataStagesReused - before.dataStagesReused == 2 && after.dataStagesCompiled == before.dataStagesCompiled,
                  "an unread pixel word rebuilt a stage with no walked user data: " + Counts(before) + " -> " + Counts(after));
-    if (verify) return;
-    const auto forwards = static_cast<std::size_t>(AgcDriver::DriverDetail::DrawShapeReuse::Forwarded);
-    if (std::getenv("APS5_NO_DRAW_SHAPE_USER_WORDS") != nullptr) Require(forwarded.dataStagesCompiled - after.dataStagesCompiled == 1 && forwarded.shapeReuses[forwards] == 0, "with the shape user words off, a user word the pixel stage only forwards did not rebuild that stage: " + Counts(after) + " -> " + Counts(forwarded));
-    else Require(forwarded.dataStagesCompiled == after.dataStagesCompiled && forwarded.shapeReuses[forwards] == after.shapeReuses[forwards] + 1, "a user word the pixel stage only forwards as push data rebuilt that stage instead of patching the word: " + Counts(after) + " -> " + Counts(forwarded));
+}
+
+void TablesAreKeptOnlyWithTheSwitch(bool expectKept) {
+    Registered(VertexHeader, TriangleVertexCode.data(), sizeof(TriangleVertexCode), 2);
+    Registered(PixelHeader, PixelCode.data(), sizeof(PixelCode), 1);
+    auto* table = GuestBlock();
+    auto* data = GuestBlock();
+    data[0] = std::bit_cast<std::uint32_t>(0.25f);
+    const auto address = reinterpret_cast<std::uintptr_t>(data);
+    table[0] = static_cast<std::uint32_t>(address);
+    table[1] = static_cast<std::uint32_t>(address >> 32u) & 0xffffu;
+    table[2] = 16;
+    table[3] = 0x3004bfacu;
+    const auto before = AgcDriver::ShaderMemory::TablesKept();
+    auto commands = Setup(true, PixelCode.data(), 3);
+    PixelUserData(commands, table, 0x11);
+    Append(commands, 0x2d, {3, 2});
+    Submit(std::move(commands));
+    const auto kept = AgcDriver::ShaderMemory::TablesKept() - before;
+    if (expectKept) Require(kept != 0, "a draw handed to the finisher with the table snapshot switch set kept no user-data table");
+    else Require(kept == 0, "a draw kept " + std::to_string(kept) + " user-data tables with the table snapshot switch off");
 }
 
 }
@@ -315,8 +326,9 @@ int main() {
         const bool verify = std::getenv("APS5_VERIFY_DRAW_DATA_HITS") != nullptr;
         UnreadUserWordsKeepTheStage(verify);
         ReadUserWordsChangeTheOutput();
-        DirectBufferBaseMovesWithItsPayload(verify);
+        DirectBufferBaseMovesWithItsPayload();
         UnreadPixelWordsKeepACompleteStage(verify);
+        if (AgcDriver::DriverDetail::DrawFinisher::Enabled() && !verify) TablesAreKeptOnlyWithTheSwitch(std::getenv("APS5_DRAW_TABLE_SNAPSHOT") != nullptr);
         AgcDriverShutdown_nid_postfix();
         std::cout << "Data-only hits " << (verify ? "verified" : "reused") << " the stages whose read user words did not change\n";
         return 0;

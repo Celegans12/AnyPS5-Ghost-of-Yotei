@@ -228,12 +228,17 @@ endforeach()
 
 set(agcMultisampleUploadSpv ${agcTextureDetileGeneratedDir}/MultisampleUpload.spv)
 set(agcMultisampleUploadHeader ${agcTextureDetileGeneratedDir}/MultisampleUpload_spv.h)
+set(agcMultisampleUploadFragSpv ${agcTextureDetileGeneratedDir}/MultisampleUploadFrag.spv)
+set(agcMultisampleUploadFragHeader ${agcTextureDetileGeneratedDir}/MultisampleUploadFrag_spv.h)
 add_custom_command(
-        OUTPUT "${agcMultisampleUploadHeader}"
+        OUTPUT "${agcMultisampleUploadHeader}" "${agcMultisampleUploadFragHeader}"
         COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTextureDetileGeneratedDir}"
         COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcMultisampleUploadSpv}" "${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/MultisampleUpload.comp"
         COMMAND ${CMAKE_COMMAND} -DINPUT=${agcMultisampleUploadSpv} -DOUTPUT=${agcMultisampleUploadHeader}
         -DSYMBOL=MULTISAMPLE_UPLOAD_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+        COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -S frag -DCOLOR_ATTACHMENT_UPLOAD=1 -o "${agcMultisampleUploadFragSpv}" "${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/MultisampleUpload.comp"
+        COMMAND ${CMAKE_COMMAND} -DINPUT=${agcMultisampleUploadFragSpv} -DOUTPUT=${agcMultisampleUploadFragHeader}
+        -DSYMBOL=MULTISAMPLE_UPLOAD_FRAG_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
         DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/Graphics/shaders/MultisampleUpload.comp" glslang-standalone
         VERBATIM
 )
@@ -468,7 +473,6 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/Draw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawProgramTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCache.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawContentRecipes.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCacheStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawDecode.cpp
@@ -477,7 +481,6 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawPrecheck.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRegisterKey.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawRelocate.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawSites.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/DrawTiming.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Draw/IndirectDraw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/EntryPoints.cpp
@@ -486,7 +489,6 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/BufferFill.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/CaptureDiagnostics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/CaptureValidation.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/MovedRead.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/WriteEvidence.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/WrittenBuffers.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Memory/WrittenBufferIndex.cpp
@@ -528,6 +530,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FrameCapture.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FrameRecorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/VulkanDevice.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Float16NanProbe.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FloatFlushProbe.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/FloatProbeTolerance.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Float16ConversionProbe.cpp
@@ -550,43 +553,12 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineJournal.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/RuntimeSwitches.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PendingPages.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ProtectedSnapshot.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PassState.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/BlockRing.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/BlockWriter.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/BlockVerify.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DrawBlockHost.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/BlockLedger.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/RunKey.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/RunPlan.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/ResourceCache.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/Front.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/Op.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/OpQueue.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/OpHost.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DecodeLane.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/Decoder.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DecoderRing.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DecoderShadow.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DecodeDraw.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/FrontMemo.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/CoarseClock.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/TailMeter.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/SubmitPolicy.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/LabelBatch.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/Back.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/ReplayMeter.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Core/src/DrawMemo.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DrawBlock.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeferredDestruction.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/OffThreadEncoding.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MemoryAccounting.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/BufferCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderResources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderAddressResources.cpp
@@ -618,6 +590,7 @@ set(agcDriverSources
         ${agcTextureDetileShaderHeader}
         ${agcReadbackHeaders}
         ${agcMultisampleUploadHeader}
+        ${agcMultisampleUploadFragHeader}
         ${agcCmaskClearShaderHeader}
         ${agcPackedMergeShaderHeader}
         ${agcMeshArgumentsShaderHeader}
@@ -1026,7 +999,7 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 
-    foreach(partialStoreTest agc_driver_depth_plane_partial_store_unimported agc_driver_depth_plane_partial_store_image_copy agc_driver_depth_plane_partial_store_buffer_copy)
+    foreach(partialStoreTest agc_driver_depth_plane_partial_store_unimported agc_driver_depth_plane_partial_store_image_copy agc_driver_depth_plane_partial_store_buffer_copy agc_driver_depth_plane_partial_store_upload_image)
         set_tests_properties(${partialStoreTest} PROPERTIES
                 ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_HOST_IMPORT=1" TIMEOUT 30 SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
         if(WIN32)
@@ -1263,10 +1236,3 @@ if(BUILD_TESTING)
 endif()
 
 target_sources(agc_driver_scattered_runs_tests PRIVATE tests/AllocationFailure.cpp)
-if(BUILD_TESTING)
-    foreach(agcClassicPathTest IN ITEMS agc_driver_draw_cache_relocation_draw_pipeline agc_driver_draw_cache_relocation_plan_verify agc_driver_draw_shape_user_words_draw_pipeline agc_driver_draw_shape_user_words_plan_verify agc_driver_draw_shape_user_words_frozen_buffer_words_draw_pipeline agc_driver_draw_shape_user_words_sites_finisher)
-        if(TEST ${agcClassicPathTest})
-            set_property(TEST ${agcClassicPathTest} APPEND PROPERTY ENVIRONMENT "APS5_NO_CORE=1")
-        endif()
-    endforeach()
-endif()

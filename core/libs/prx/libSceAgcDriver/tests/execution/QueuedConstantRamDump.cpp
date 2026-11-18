@@ -37,7 +37,9 @@ namespace AgcDriver::DriverDetail {
 
 struct DriverTestAccess {
     static std::uint64_t DrawQueuedStoreMisses() {
-        return Driver::Get().DrawCacheCounters().misses[static_cast<std::size_t>(DrawMiss::QueuedStores)];
+        auto& driver = Driver::Get();
+        std::lock_guard lock(driver.drawCacheMutex);
+        return driver.drawEntryCounters.misses[static_cast<std::size_t>(DrawMiss::QueuedStores)];
     }
 
     static std::uint64_t DispatchQueuedStoreMisses() {

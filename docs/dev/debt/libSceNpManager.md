@@ -11,6 +11,7 @@
 ### Push lifecycle
 
 - [The Push and Push2 lifecycle](../../../core/libs/prx/libSceNpManager/Push.cpp) (libSceNpManager) follows firmware 11.00 `libSceNpManager.sprx`: `sceNpPushInit` returns `0x8055A001` when already initialized, `sceNpPushTerm` returns `0x8055A002` when not initialized, and `sceNpPushCheckCallback` returns `0x8055A002` or 0 because no notification is queued. `sceNpPush2Init` takes a 0x18-byte parameter block, requires the field at 0x10 to be at most 1 and the one at 0x14 to be 1..5, and hands out 1-based context slots up to 32 (returning the slot or `0x8055C005` when full); `sceNpPush2Term` clears one context and returns 0 as the firmware wrapper does. `sceNpPush2IsInit`, `sceNpPush2SetGlobalMutex`, `sceNpPush2OptionalCheckCallback` and `sceNpPush2TriggerEmptyUserEvent` cover the remaining state queries, and `sceNpPushIntGetConnectionState` writes 0 (disconnected). The null-argument code `0x8055A003` is inferred; `0x8055C002`, `0x8055C003` and `0x8055C005` are measured. The notification transport, callbacks, data types, filters, communication id, user contexts, start/stop and the inactivity calls still throw.
+- [sceNpPushIntGetConnectionState guest output](../../../core/libs/prx/libSceNpManager/Push.cpp) (libSceNpManager) - the offline state 0 is written with GuestCopyOut_nid_no_patch, like the `sceNpPush2Init` parameter is read with GuestCopyIn_nid_no_patch; returning `PUSH_ERROR_INVALID_ARGUMENT` (its null-output error) for an unwritable output is a host-safety fallback, and console behaviour on unmapped memory is unmeasured.
 
 ### IdMapper and in-game messages
 
@@ -24,7 +25,7 @@
 ### Silent stubs
 
 - [sceNpUnregisterPlusEventCallback](../../../core/libs/prx/libSceNpManager/Export.cpp) (libSceNpManager) - returns 0 whether or not a callback was registered, as `sceNpUnregisterPremiumEventCallback` does: `sceNpRegisterPlusEventCallback` keeps no callback, and a signed-out user gets no plus events
-- [sceNpNotifyPremiumFeature](../../../core/libs/prx/libSceNpManager/Export.cpp) (libSceNpManager) - returns 0 without reading its parameter block. Borderlands 4 (PPSA01494), Ghost of Tsushima (PPSA02225), MXGP 26 (PPSA30839) and Super Meat Boy 3D (PPSA31162) call it, and Metal Gear Solid 4 (PPSA18194) imports it
+- [sceNpNotifyPremiumFeature](../../../core/libs/prx/libSceNpManager/Export.cpp) (libSceNpManager) - returns 0 without reading its parameter block. title B, Ghost of Tsushima (PPSA02225), MXGP 26 (PPSA30839) and Super Meat Boy 3D (PPSA31162) call it, and Metal Gear Solid 4 (PPSA18194) imports it
 - [sceNpSetNpTitleId](../../../core/libs/prx/libSceNpManager/Export.cpp) (libSceNpManager) - returns 0 and keeps neither its title ID nor the 128-byte block passed with it. Forspoken (PPSA03984) and Crimson Desert (PPSA25286) call it once each
 - [sceNpRegisterPremiumEventCallback, sceNpUnregisterPremiumEventCallback](../../../core/libs/prx/libSceNpManager/Export.cpp) (libSceNpManager) - registration returns `SCE_NP_ERROR_INVALID_ARGUMENT` for a null callback and otherwise returns 0 without keeping the callback or its user data, so it is never called. Unregistration returns 0. Metal Gear Solid 4 (PPSA18194) imports both
 

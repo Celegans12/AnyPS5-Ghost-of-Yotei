@@ -1,7 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawRegisterKey.hpp"
-#include "prx/libSceAgcDriver/Core/include/RunKey.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/RuntimeSwitches.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
 #include <array>
@@ -85,26 +83,6 @@ std::uint64_t RegisterStateKey(const QueueState& queue, bool allUserWords, bool 
     return exact;
 }
 
-
-bool InstallCoreKeyRegisters() {
-    if (std::getenv("APS5_CORE_KEY_SHAPE") == nullptr && !Graphics::CoreDefault()) return false;
-    std::array<std::vector<std::uint64_t>, 3> bits;
-    const auto set = [&](Core::Bank bank, std::uint32_t offset) {
-        auto& words = bits[static_cast<std::size_t>(bank)];
-        if (words.size() <= offset / 64u) words.resize(offset / 64u + 1u);
-        words[offset / 64u] |= std::uint64_t{1} << (offset % 64u);
-    };
-    for (const auto& range : Graphics::DrawKeyRegisters) {
-        const auto bank = range.bank == Graphics::RegisterBank::Shader ? Core::Bank::Shader : range.bank == Graphics::RegisterBank::Context ? Core::Bank::Context : Core::Bank::UserConfig;
-        for (auto offset = range.first; offset < range.first + range.count; ++offset) {
-            if (bank == Core::Bank::Shader && Core::RuntimeRegister(offset)) continue;
-            set(bank, offset);
-        }
-    }
-    set(Core::Bank::Context, 0x103u);
-    for (const auto bank : {Core::Bank::Shader, Core::Bank::Context, Core::Bank::UserConfig}) Core::SetKeyRegisters(bank, bits[static_cast<std::size_t>(bank)]);
-    return true;
-}
 
 std::uint64_t DrawShaderSetKey(const QueueState& queue, const ShaderRegistry& registry) {
     std::uint64_t key = 0xcbf29ce484222325ull;
@@ -276,6 +254,9 @@ bool Driver::sameDecode(const DrawDecode& a, const DrawDecode& b) {
     }
     if (s.colorRop != t.colorRop || s.hasColorTarget != t.hasColorTarget || s.rectList != t.rectList || s.rasterizerDiscard != t.rasterizerDiscard || s.renderExtent.width != t.renderExtent.width || s.renderExtent.height != t.renderExtent.height || s.topology != t.topology || s.negativeOneToOne != t.negativeOneToOne || s.depthClamp != t.depthClamp || s.conservativeRasterization != t.conservativeRasterization || s.perSampleShading != t.perSampleShading || s.cullMode != t.cullMode || s.polygonMode != t.polygonMode || s.lineWidth != t.lineWidth || s.frontFace != t.frontFace || !sameBlend(s.blend, t.blend) || s.blendConstants != t.blendConstants) return false;
     if (std::memcmp(&s.viewport, &t.viewport, sizeof(VkViewport)) != 0 || std::memcmp(&s.scissor, &t.scissor, sizeof(VkRect2D)) != 0) return false;
+    if (s.viewportExports != t.viewportExports || s.extraViewports.size() != t.extraViewports.size() || s.viewportScissors.size() != t.viewportScissors.size()) return false;
+    if (!s.extraViewports.empty() && std::memcmp(s.extraViewports.data(), t.extraViewports.data(), s.extraViewports.size() * sizeof(VkViewport)) != 0) return false;
+    if (!s.viewportScissors.empty() && std::memcmp(s.viewportScissors.data(), t.viewportScissors.data(), s.viewportScissors.size() * sizeof(VkRect2D)) != 0) return false;
     const auto& p = a.pixel;
     const auto& q = b.pixel;
     if (p.interpolatorCount != q.interpolatorCount || p.interpolatorSettings != q.interpolatorSettings || p.wave32 != q.wave32 || p.inputAddr != q.inputAddr || p.hasPerspectiveCenterVgpr != q.hasPerspectiveCenterVgpr || p.perspectiveCentroid != q.perspectiveCentroid || p.posX != q.posX || p.posY != q.posY || p.posZ != q.posZ || p.posW != q.posW || p.frontFace != q.frontFace || p.frontFaceAllBits != q.frontFaceAllBits || p.ancillary != q.ancillary || p.sampleShading != q.sampleShading || p.noPerspective != q.noPerspective || p.linearCentroid != q.linearCentroid || p.pixelKillEnable != q.pixelKillEnable || p.depthExportEnable != q.depthExportEnable || p.depthExportMin != q.depthExportMin || p.depthExportMax != q.depthExportMax || p.sampleMaskExportEnable != q.sampleMaskExportEnable || p.earlyZ != q.earlyZ || p.executeOnNoop != q.executeOnNoop || p.conservativeZExport != q.conservativeZExport || p.orderedPixelShader != q.orderedPixelShader || p.stencilRefExportEnable != q.stencilRefExportEnable || p.stencilOperationValueExport != q.stencilOperationValueExport || p.targetOutputMode != q.targetOutputMode || p.targetExportMapping != q.targetExportMapping) return false;

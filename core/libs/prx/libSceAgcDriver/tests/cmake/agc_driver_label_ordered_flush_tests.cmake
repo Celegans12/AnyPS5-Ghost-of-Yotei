@@ -1,16 +1,10 @@
 if(BUILD_TESTING)
-    add_test(NAME agc_driver_label_ordered_flush_early_eop COMMAND agc_driver_label_ordered_flush_tests)
-    set_tests_properties(agc_driver_label_ordered_flush_early_eop PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EARLY_EOP_INTERRUPT=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(NAME agc_driver_label_ordered_flush_disabled COMMAND agc_driver_label_ordered_flush_tests --disabled)
     set_tests_properties(agc_driver_label_ordered_flush_disabled PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_FLUSH_GPU_ORDERED=1;APS5_NO_REFRESH_GPU_ORDERED=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     add_test(NAME agc_driver_label_ordered_flush_unimported COMMAND agc_driver_label_ordered_flush_tests --unimported)
     set_tests_properties(agc_driver_label_ordered_flush_unimported PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_HOST_IMPORT=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
     if(WIN32)
-        set_tests_properties(agc_driver_label_ordered_flush_early_eop agc_driver_label_ordered_flush_disabled agc_driver_label_ordered_flush_unimported PROPERTIES ENVIRONMENT_MODIFICATION
+        set_tests_properties(agc_driver_label_ordered_flush_disabled agc_driver_label_ordered_flush_unimported PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
-endif()
-if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    add_test(NAME agc_driver_label_ordered_flush_read_trap COMMAND agc_driver_label_ordered_flush_tests)
-    set_tests_properties(agc_driver_label_ordered_flush_read_trap PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_EARLY_EOP_INTERRUPT=1;APS5_EARLY_EOP_READ_TRAP=1;APS5_VERIFY_EARLY_EOP_READ_TRAP=1" SKIP_RETURN_CODE 77 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
 endif()

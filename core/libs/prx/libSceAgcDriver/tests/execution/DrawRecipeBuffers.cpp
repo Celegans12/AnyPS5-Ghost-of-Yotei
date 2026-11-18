@@ -1,20 +1,13 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
-#include "prx/libSceAgcDriver/Execution/include/HostAllocator.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/BufferCache.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/PassState.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #include "VulkanTestDevice.hpp"
-#include "Cover_frag_spv.h"
 #include "Cover_vert_spv.h"
-#include "VertexRange_vert_spv.h"
 #include "DrawRecipeBuffers_spv.h"
 #include "DrawRecipeData_spv.h"
 #ifdef _WIN32
@@ -101,174 +94,6 @@ void CheckPixels(const ColorTarget& target, const std::array<std::uint8_t, 4>& e
     }
 }
 
-State TargetState(const Block& block) {
-    State state{};
-    state.stages.path = ShaderPath::Vertex;
-    state.color = {block.Address(), {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, Unit, 0xe4u, ColorTileMode::RenderTarget, 4};
-    state.colors = {state.color};
-    state.hasColorTarget = true;
-    state.renderExtent = {64, 64};
-    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
-    state.viewport = {0, 64, 64, -64, 0, 1};
-    state.scissor = {{0, 0}, {64, 64}};
-    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
-    state.blend.colorWriteMask = 15;
-    state.blends = {state.blend};
-    return state;
-}
-
-template <typename TSpirv>
-ShaderRecompiler::RecompileResult Program(const TSpirv& spirv, std::uint64_t variant) {
-    ShaderRecompiler::RecompileResult result;
-    result.spirv = std::vector<std::uint32_t>(std::begin(spirv), std::end(spirv));
-    result.variantId = variant;
-    return result;
-}
-
-void CheckLayout(AgcDriver::VulkanDevice& device, const Block& block) {
-    auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
-    const auto offsets = block.Address(Unit + 4096);
-    std::array<float, 20> words{};
-    words[4] = -8.0f;
-    AgcDriver::GuestMemory::Write(offsets, std::as_bytes(std::span(words)));
-    const auto attribute = [&](std::uint32_t stride) {
-        return ShaderRecompiler::VertexAttribute{0, 4, {{static_cast<std::uint32_t>(offsets), (static_cast<std::uint32_t>(offsets >> 32u) & 0xffffu) | (stride << 16u), 3u, 77u << 12u}}, 0};
-    };
-    auto narrow = Program(VERTEXRANGE_VERT_SPV, 4);
-    narrow.vertexAttributes = {attribute(16)};
-    auto wide = narrow;
-    wide.vertexAttributes = {attribute(32)};
-    auto fragment = Program(COVER_FRAG_SPV, 5);
-    const std::array narrowShaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &narrow, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
-    const std::array wideShaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &wide, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
-    const auto state = TargetState(block);
-    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
-    std::vector<std::byte> cleared(64 * 64 * 4);
-    AgcDriver::GuestMemory::Write(block.Address(), cleared);
-    std::shared_ptr<const AgcDriver::DrawRecipe> recipe;
-    {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        Draw(context, state, triangle, narrowShaders, {}, &recipe);
-    }
-    WaitForOptimizedPipelines(context.device);
-    Require(recipe != nullptr, "the draw with a vertex stride of 16 did not produce a recipe");
-    CheckPixels(state.color, {0, 0, 0, 0});
-    {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        const auto hit = DrawWithRecipe(context, state, triangle, narrowShaders, {}, *recipe);
-        Require(hit.recorded, "a draw with the vertex layout of its recipe refused it");
-    }
-    CheckPixels(state.color, {0, 0, 0, 0});
-    {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        const auto hit = DrawWithRecipe(context, state, triangle, wideShaders, {}, *recipe);
-        Require(!hit.recorded && hit.miss == DrawRecipeMiss::Layout, std::string("a draw whose vertex stride differs from its recipe's was not refused for its layout (miss: ") + DrawRecipeMissName(hit.miss) + ")");
-    }
-    CheckPixels(state.color, {0, 0, 0, 0});
-    {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        Draw(context, state, triangle, wideShaders);
-    }
-    WaitForOptimizedPipelines(context.device);
-    CheckPixels(state.color, {255, 255, 255, 255});
-    device.WaitIdle();
-}
-
-void CheckLeanCommitAndPassState(AgcDriver::VulkanDevice& device, const Block& block) {
-    struct Restore {
-        ~Restore() {
-            Recorder::SetLeanCommitForTest(-1);
-            PassState::SetForTest(PassState::Mode::Environment);
-        }
-    } restore;
-    auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
-    auto vertex = Program(COVER_VERT_SPV, 11);
-    auto fragment = Program(DRAW_RECIPE_DATA_SPV, 13);
-    fragment.shaderDataDwords = 4;
-    ShaderRecompiler::DescriptorBinding binding;
-    binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
-    binding.role = ShaderRecompiler::DescriptorRole::ShaderData;
-    binding.descriptorSet = 0;
-    binding.binding = 0;
-    binding.count = 1;
-    binding.bufferWritten = {false};
-    fragment.bindings = {binding};
-    const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
-    const auto state = TargetState(block);
-    const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
-    const std::array<float, 4> red{1, 0, 0, 1};
-    const std::array<float, 4> green{0, 1, 0, 1};
-    const auto select = [&](bool second) {
-        auto& words = fragment.bindings.front().guestDescriptor;
-        words.clear();
-        for (const auto value : second ? green : red) words.push_back(std::bit_cast<std::uint32_t>(value));
-    };
-    select(false);
-    PassState::SetForTest(PassState::Mode::Off);
-    std::shared_ptr<const AgcDriver::DrawRecipe> recipe;
-    {
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        Draw(context, state, triangle, shaders, {}, &recipe);
-    }
-    WaitForOptimizedPipelines(context.device);
-    Require(recipe != nullptr, "the draw of the lean commit test did not produce a recipe");
-    CheckPixels(state.color, {255, 0, 0, 255});
-    constexpr int Repeats = 6;
-    const auto repeat = [&](bool endRuns) {
-        std::uint64_t allocations = 0;
-        std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-        for (int index = 0; index < Repeats; ++index) {
-            select(index % 2 == 0);
-            if (endRuns) BufferCache::EndDrawRun();
-            const auto before = AgcDriver::HostAllocationsOnThread();
-            const auto hit = DrawWithRecipe(context, state, triangle, shaders, {}, *recipe);
-            allocations += AgcDriver::HostAllocationsOnThread() - before;
-            Require(hit.recorded, "a repeated draw refused its recipe");
-        }
-        return allocations;
-    };
-    const std::array<std::uint8_t, 4> last{255, 0, 0, 255};
-    Recorder::SetLeanCommitForTest(0);
-    const auto pooledBefore = ShaderResources::DrawBindingsPooled();
-    repeat(false);
-    CheckPixels(state.color, last);
-    const auto former = repeat(false);
-    CheckPixels(state.color, last);
-    Require(ShaderResources::DrawBindingsPooled().served == pooledBefore.served, "the former commit took bindings from the pool of the lean commit");
-    Recorder::SetLeanCommitForTest(1);
-    repeat(false);
-    CheckPixels(state.color, last);
-    const auto lean = repeat(false);
-    CheckPixels(state.color, last);
-    Require(ShaderResources::DrawBindingsPooled().served > pooledBefore.served, "the lean commit did not take the bindings of its draws from the pool of its batch");
-    if (AgcDriver::HostAllocationsCounted()) Require(lean < former, "the lean commit allocates as much as the former one (" + std::to_string(lean) + " against " + std::to_string(former) + " over " + std::to_string(Repeats) + " draws)");
-    const auto off = PassState::Counted();
-    repeat(false);
-    Require(PassState::Counted().draws == off.draws, "draws were counted by the pass state while it is off");
-    PassState::SetForTest(PassState::Mode::On);
-    const auto before = PassState::Counted();
-    repeat(false);
-    CheckPixels(state.color, last);
-    const auto served = PassState::Counted();
-    const auto servedBy = [&](PassState::Served kind) { return served.served[static_cast<std::size_t>(kind)] - before.served[static_cast<std::size_t>(kind)]; };
-    Require(served.draws == before.draws + Repeats, "the pass state did not count its draws");
-    Require(servedBy(PassState::Served::Access) != 0, "no draw whose template the pass knew continued it without the full comparison");
-    Require(servedBy(PassState::Served::Targets) != 0, "no draw of a run reused the targets of the run");
-    Require(servedBy(PassState::Served::Kept) != 0, "no draw of a run left its objects to the batch that already keeps them");
-    repeat(true);
-    CheckPixels(state.color, last);
-    const auto ended = PassState::Counted();
-    Require(ended.served[static_cast<std::size_t>(PassState::Served::Targets)] == served.served[static_cast<std::size_t>(PassState::Served::Targets)], "a draw reused the targets of a run that an ordered item ended");
-    Require(ended.runs >= served.runs + Repeats, "an ordered item between two draws did not begin a new run");
-    PassState::SetForTest(PassState::Mode::Verify);
-    repeat(false);
-    CheckPixels(state.color, last);
-    const auto verified = PassState::Counted();
-    Require(verified.mismatches == ended.mismatches, "the verified pass state found a difference");
-    Require(verified.verified != ended.verified, "the verified pass state checked no answer");
-    device.WaitIdle();
-}
-
 bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dataWords) {
     auto context = AgcDriver::VulkanDeviceTestAccess::ContextOf(device);
     if (!dataWords && context.hostImportAlignment == 0) {
@@ -276,7 +101,12 @@ bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dat
         return false;
     }
     Require(context.recorder != nullptr && context.descriptorCache != nullptr, "recipe tests need a recorder and descriptor cache");
-    const auto program = [](const auto& spirv, std::uint64_t variant) { return Program(spirv, variant); };
+    const auto program = [](const auto& spirv, std::uint64_t variant) {
+        ShaderRecompiler::RecompileResult result;
+        result.spirv = std::vector<std::uint32_t>(std::begin(spirv), std::end(spirv));
+        result.variantId = variant;
+        return result;
+    };
     auto vertex = program(COVER_VERT_SPV, 1);
     auto fragment = dataWords ? program(DRAW_RECIPE_DATA_SPV, 3) : program(DRAW_RECIPE_BUFFERS_SPV, 2);
     if (dataWords) fragment.shaderDataDwords = 4;
@@ -289,7 +119,18 @@ bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dat
     binding.bufferWritten = {false};
     fragment.bindings = {binding};
     const std::array shaders{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &fragment, 0}};
-    const auto state = TargetState(block);
+    State state{};
+    state.stages.path = ShaderPath::Vertex;
+    state.color = {block.Address(), {64, 64}, VK_FORMAT_R8G8B8A8_UNORM, Unit, 0xe4u, ColorTileMode::RenderTarget, 4};
+    state.colors = {state.color};
+    state.hasColorTarget = true;
+    state.renderExtent = {64, 64};
+    state.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST;
+    state.viewport = {0, 64, 64, -64, 0, 1};
+    state.scissor = {{0, 0}, {64, 64}};
+    state.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    state.blend.colorWriteMask = 15;
+    state.blends = {state.blend};
     const AgcDriver::Pm4::DrawParameters triangle{0, 3, 0, 1, 0, false};
     const std::array<float, 4> red{1, 0, 0, 1};
     const std::array<float, 4> green{0, 1, 0, 1};
@@ -342,19 +183,6 @@ bool CheckBindings(AgcDriver::VulkanDevice& device, const Block& block, bool dat
         }
         CheckPixels(state.color, second ? std::array<std::uint8_t, 4>{0, 255, 0, 255} : std::array<std::uint8_t, 4>{255, 0, 0, 255});
     }
-    for (const bool second : {true, false, true}) {
-        select(second);
-        auto patched = fragment;
-        select(!second);
-        const std::array copies{CompiledShader{ShaderRecompiler::ShaderStage::Vertex, &vertex, 0}, CompiledShader{ShaderRecompiler::ShaderStage::Fragment, &patched, 0}};
-        {
-            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
-            const auto hit = DrawWithRecipe(context, state, triangle, copies, {}, *recipe);
-            Require(hit.recorded, "a copy of the fragment program whose constants moved, as a reuse of a remembered stage patches it, refused the recipe");
-        }
-        CheckPixels(state.color, second ? std::array<std::uint8_t, 4>{0, 255, 0, 255} : std::array<std::uint8_t, 4>{255, 0, 0, 255});
-    }
-    select(false);
     const auto refused = [&] {
         std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
         const auto hit = DrawWithRecipe(context, state, triangle, shaders, {}, *recipe);
@@ -392,9 +220,7 @@ int main(int argc, char** argv) {
         if (!device) return VulkanTestSkipped;
         const bool dataWords = argc == 2 && std::string_view(argv[1]) == "--data";
         if (!CheckBindings(*device, block, dataWords)) return VulkanTestSkipped;
-        CheckLayout(*device, block);
-        CheckLeanCommitAndPassState(*device, block);
-        std::cout << "draw recipes consume relocated buffers and changed shader data, also through patched copies of their programs, and refuse another vertex layout\n";
+        std::cout << "draw recipes consume relocated buffers and changed shader data\n";
         return 0;
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
