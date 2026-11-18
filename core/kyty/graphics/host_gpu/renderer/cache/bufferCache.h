@@ -50,7 +50,7 @@ public:
 	static constexpr uint64_t USE_BITMAP_OFFSET   = 2 * WRITE_BITMAP_OFFSET;
 	static constexpr uint64_t HACK_MARKS_OFFSET   = 3 * WRITE_BITMAP_OFFSET;
 	static constexpr uint32_t HACK_MARK_ENTRIES   = 256;
-	static constexpr uint32_t HACK_MARK_DWORDS    = 8;
+	static constexpr uint32_t HACK_MARK_DWORDS    = 16;
 	static constexpr uint32_t HACK_MARK_COUNTS    = 4;
 	static constexpr uint32_t HACK_MARK_GUEST_RAYS = HACK_MARK_COUNTS + static_cast<uint32_t>(HackMark::Count);
 	static constexpr uint64_t HACK_MARKS_SIZE     = uint64_t {HACK_MARK_ENTRIES} * HACK_MARK_DWORDS * 4;
@@ -58,7 +58,9 @@ public:
 	static constexpr uint32_t HACK_MARK_ORACLE_RETURNED   = HACK_MARK_GUEST_RAYS + 1;
 	static constexpr uint32_t HACK_MARK_ORACLE_RAYS       = HACK_MARK_GUEST_RAYS + 2;
 	static constexpr uint32_t HACK_MARK_ORACLE_CANDIDATES = HACK_MARK_GUEST_RAYS + 3;
-	static_assert(HACK_MARK_ORACLE_CANDIDATES < HACK_MARK_DWORDS);
+	static constexpr uint32_t HACK_MARK_ORACLE_ROUNDS     = HACK_MARK_GUEST_RAYS + 4;
+	static constexpr uint32_t HACK_MARK_ORACLE_WAVES      = HACK_MARK_GUEST_RAYS + 5;
+	static_assert(HACK_MARK_ORACLE_WAVES < HACK_MARK_DWORDS);
 
 	static constexpr uint32_t HackMarkEntry(uint64_t shader_hash) {
 		return (static_cast<uint32_t>(shader_hash) ^ static_cast<uint32_t>(shader_hash >> 32u)) %

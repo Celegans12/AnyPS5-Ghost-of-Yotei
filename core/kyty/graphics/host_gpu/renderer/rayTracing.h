@@ -120,7 +120,14 @@ public:
 	enum class GuestDispatch : uint32_t { NullTlas, Unrecognized, Count };
 	static void NoteGuestDispatch(GuestDispatch kind, uint64_t shader_hash) noexcept;
 	static void NoteGuestRays(uint64_t shader_hash, uint64_t rays);
-	static void NoteOracle(uint64_t shader_hash, uint64_t returned, uint64_t rays, uint64_t candidates);
+	struct OracleCounts {
+		uint64_t returned   = 0;
+		uint64_t rays       = 0;
+		uint64_t candidates = 0;
+		uint64_t rounds     = 0;
+		uint64_t waves      = 0;
+	};
+	static void NoteOracle(uint64_t shader_hash, const OracleCounts& counts);
 
 	[[nodiscard]] uint64_t ContextAddress() const noexcept { return m_context_address; }
 

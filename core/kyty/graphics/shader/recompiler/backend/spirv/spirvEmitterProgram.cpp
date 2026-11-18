@@ -327,6 +327,7 @@ void EmitReturn(ValueEmitContext& ctx) {
 		state.builder.AddFunction(spv::OpStore, state.object_primitive_id_variable,
 		                          EmitAddU32(state, object, primitive));
 	}
+	FlushOracleCounts(ctx.state);
 	ctx.state.builder.AddFunction(spv::OpReturn);
 }
 

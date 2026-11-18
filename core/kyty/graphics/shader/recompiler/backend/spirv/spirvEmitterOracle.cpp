@@ -24,6 +24,9 @@ constexpr uint32_t ContextRoot      = 48;
 constexpr uint32_t ContextServed    = 52;
 constexpr uint32_t ContextReturned  = 56;
 constexpr uint32_t ContextCounting  = 60;
+constexpr uint32_t ContextRounds    = 64;
+constexpr uint32_t ContextWaves     = 68;
+constexpr uint32_t ContextProposed  = 72;
 constexpr uint32_t SlotBlas         = 40;
 constexpr uint32_t SlotRoot         = 48;
 constexpr uint32_t OracleFlags      = IR::BvhIntersectNative | IR::BvhIntersectOracle | IR::BvhIntersectOracleLane;
@@ -80,50 +83,23 @@ uint32_t High(EmitterState& s, uint32_t value) {
 	return Low(s, Binary(s, spv::OpShiftRightLogical, TypeU64(s), value, U32(s, 32)));
 }
 
-uint32_t LaneCount(EmitterState& s, uint32_t predicate) {
-	const auto ballot = s.builder.AllocateId();
-	s.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(s, 4), ballot, U32(s, spv::ScopeSubgroup),
-	                      predicate);
-	const auto count = s.builder.AllocateId();
-	s.builder.AddFunction(spv::OpGroupNonUniformBallotBitCount, TypeU32(s), count, U32(s, spv::ScopeSubgroup),
-	                      spv::GroupOperationReduce, ballot);
-	return count;
-}
-
 void AtomicAdd(EmitterState& s, uint32_t address, uint32_t value) {
 	const auto pointer = Unary(s, spv::OpConvertUToPtr, TypePhysicalU32Pointer(s), address);
 	s.builder.AddFunction(spv::OpAtomicIAdd, TypeU32(s), s.builder.AllocateId(), pointer, U32(s, spv::ScopeDevice),
 	                      U32(s, spv::MemorySemanticsMaskNone), value);
 }
 
-void Count(EmitterState& s, const std::array<uint32_t, 2>& served, const std::array<uint32_t, 2>& returned,
-           const std::array<uint32_t, 2>& candidates) {
-	const auto counting = Binary(s, spv::OpINotEqual, TypeBool(s), Load(s, TypeU32(s), s.oracle.counting), U32(s, 0));
-	EmitIfCondition(s, s.ray_stats ? ConstantBool(s, true) : counting, [&] {
-		const auto sum = [&](const std::array<uint32_t, 2>& predicates) {
-			auto total = LaneCount(s, predicates[0]);
-			if (s.lane_count == 2) total = Add(s, total, LaneCount(s, predicates[1]));
-			return total;
-		};
-		const auto rays     = sum(served);
-		const auto guest    = sum(returned);
-		const auto proposed = sum(candidates);
-		const auto elected  = s.builder.AllocateId();
-		s.builder.AddFunction(spv::OpGroupNonUniformElect, TypeBool(s), elected, U32(s, spv::ScopeSubgroup));
-		const auto any = Binary(s, spv::OpINotEqual, TypeBool(s), Or(s, rays, guest), U32(s, 0));
-		EmitIfCondition(s, LogicalAnd(s, LogicalAnd(s, elected, counting), any), [&] {
-			const auto context = Load(s, TypeU64(s), s.oracle.context);
-			AtomicAdd(s, AddressPlus(s, context, ContextServed), rays);
-			AtomicAdd(s, AddressPlus(s, context, ContextReturned), guest);
-		});
-		if (!s.ray_stats) return;
-		const auto marked = Binary(s, spv::OpINotEqual, TypeBool(s), Or(s, Or(s, rays, guest), proposed), U32(s, 0));
-		EmitIfCondition(s, LogicalAnd(s, elected, marked), [&] {
-			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_RETURNED, guest);
-			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_RAYS, rays);
-			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_CANDIDATES, proposed);
-		});
-	});
+void Accumulate(EmitterState& s, uint32_t variable, const std::array<uint32_t, 2>& predicates) {
+	auto total = Select(s, TypeU32(s), predicates[0], U32(s, 1), U32(s, 0));
+	if (s.lane_count == 2) total = Add(s, total, Select(s, TypeU32(s), predicates[1], U32(s, 1), U32(s, 0)));
+	Store(s, variable, Add(s, Load(s, TypeU32(s), variable), total));
+}
+
+uint32_t SubgroupSum(EmitterState& s, uint32_t variable) {
+	const auto result = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpGroupNonUniformIAdd, TypeU32(s), result, U32(s, spv::ScopeSubgroup),
+	                      spv::GroupOperationReduce, Load(s, TypeU32(s), variable));
+	return result;
 }
 
 }
@@ -154,9 +130,10 @@ void DeclareOracleVariables(EmitterState& s) {
 		declare(wide, lane.blas);
 		declare(wide, lane.proposed_blas);
 	}
-	declare(u, s.oracle.valid);
-	declare(u, s.oracle.root);
-	declare(u, s.oracle.counting);
+	for (auto* variable: {&s.oracle.valid, &s.oracle.root, &s.oracle.counting, &s.oracle.served, &s.oracle.returned,
+	                      &s.oracle.proposed, &s.oracle.resumed}) {
+		declare(u, *variable);
+	}
 	for (auto* variable: {&s.oracle.context, &s.oracle.header, &s.oracle.tlas, &s.oracle.nodes, &s.oracle.slots}) {
 		declare(wide, *variable);
 	}
@@ -179,7 +156,9 @@ void InitializeOracleVariables(EmitterState& s) {
 		Store(s, variable, ConstantU64(s, 0));
 	}
 	Store(s, s.oracle.root, U32(s, None));
-	Store(s, s.oracle.counting, U32(s, 0));
+	for (const auto variable: {s.oracle.counting, s.oracle.served, s.oracle.returned, s.oracle.proposed, s.oracle.resumed}) {
+		Store(s, variable, U32(s, 0));
+	}
 	EmitIfCondition(s, present, [&] {
 		Store(s, s.oracle.counting, LoadAddressU32(s, AddressPlus(s, context, ContextCounting)));
 	});
@@ -412,8 +391,47 @@ uint32_t EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst) {
 		returned[half]   = LogicalAnd(s, guest, c.box);
 		candidates[half] = LogicalAnd(s, c.top, c.has);
 	}
-	Count(s, served, returned, candidates);
+	Accumulate(s, s.oracle.served, served);
+	Accumulate(s, s.oracle.returned, returned);
+	Accumulate(s, s.oracle.proposed, candidates);
+	const auto resumed = s.lane_count == 2 ? LogicalOr(s, calls[0].resume, calls[1].resume) : calls[0].resume;
+	Store(s, s.oracle.resumed, Add(s, Load(s, TypeU32(s), s.oracle.resumed), Select(s, TypeU32(s), resumed, U32(s, 1), U32(s, 0))));
 	return s.oracle.results[0];
+}
+
+void FlushOracleCounts(EmitterState& s) {
+	if (s.oracle.valid == 0) return;
+	const auto b        = TypeBool(s);
+	const auto counting = Binary(s, spv::OpINotEqual, b, Load(s, TypeU32(s), s.oracle.counting), U32(s, 0));
+	EmitIfCondition(s, s.ray_stats ? ConstantBool(s, true) : counting, [&] {
+		const auto rays     = SubgroupSum(s, s.oracle.served);
+		const auto guest    = SubgroupSum(s, s.oracle.returned);
+		const auto proposed = SubgroupSum(s, s.oracle.proposed);
+		const auto rounds   = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpGroupNonUniformUMax, TypeU32(s), rounds, U32(s, spv::ScopeSubgroup),
+		                      spv::GroupOperationReduce, Load(s, TypeU32(s), s.oracle.resumed));
+		const auto waves    = Select(s, TypeU32(s), Binary(s, spv::OpINotEqual, b, rays, U32(s, 0)), U32(s, 1), U32(s, 0));
+		const auto elected  = s.builder.AllocateId();
+		s.builder.AddFunction(spv::OpGroupNonUniformElect, b, elected, U32(s, spv::ScopeSubgroup));
+		const auto any = Binary(s, spv::OpINotEqual, b, Or(s, rays, guest), U32(s, 0));
+		EmitIfCondition(s, LogicalAnd(s, LogicalAnd(s, elected, counting), any), [&] {
+			const auto context = Load(s, TypeU64(s), s.oracle.context);
+			AtomicAdd(s, AddressPlus(s, context, ContextServed), rays);
+			AtomicAdd(s, AddressPlus(s, context, ContextReturned), guest);
+			AtomicAdd(s, AddressPlus(s, context, ContextRounds), rounds);
+			AtomicAdd(s, AddressPlus(s, context, ContextWaves), waves);
+			AtomicAdd(s, AddressPlus(s, context, ContextProposed), proposed);
+		});
+		if (!s.ray_stats) return;
+		const auto marked = Binary(s, spv::OpINotEqual, b, Or(s, Or(s, rays, guest), proposed), U32(s, 0));
+		EmitIfCondition(s, LogicalAnd(s, elected, marked), [&] {
+			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_RETURNED, guest);
+			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_RAYS, rays);
+			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_CANDIDATES, proposed);
+			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_ROUNDS, rounds);
+			EmitRayMarkCount(s, BufferCache::HACK_MARK_ORACLE_WAVES, waves);
+		});
+	});
 }
 
 }

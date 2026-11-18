@@ -166,8 +166,10 @@ void FaultManager::ProcessHackMarks() {
 			const auto returned   = mark[BufferCache::HACK_MARK_ORACLE_RETURNED];
 			const auto served     = mark[BufferCache::HACK_MARK_ORACLE_RAYS];
 			const auto candidates = mark[BufferCache::HACK_MARK_ORACLE_CANDIDATES];
-			if (returned + served + candidates != 0) {
-				RayTracing::NoteOracle(hash, returned, served, candidates);
+			const auto rounds     = mark[BufferCache::HACK_MARK_ORACLE_ROUNDS];
+			const auto waves      = mark[BufferCache::HACK_MARK_ORACLE_WAVES];
+			if (returned + served + candidates + rounds + waves != 0) {
+				RayTracing::NoteOracle(hash, {returned, served, candidates, rounds, waves});
 			}
 			for (size_t kind = 0; kind < HackMarkNotices.size(); kind++) {
 				const auto count = mark[BufferCache::HACK_MARK_COUNTS + kind];

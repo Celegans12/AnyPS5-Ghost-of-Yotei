@@ -890,7 +890,7 @@ void DefineModule(EmitterState& state) {
 	    state.program.info.subgroup_arithmetic || state.program.info.subgroup_local_invocation_id) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniform);
 	}
-	if (state.lane_count == 2 || state.program.info.subgroup_ballot || state.ray_stats || ProgramUsesOracle(state.program)) {
+	if (state.lane_count == 2 || state.program.info.subgroup_ballot || state.ray_stats) {
 		state.builder.RequireCapability(spv::CapabilityGroupNonUniformBallot);
 	}
 	if (state.program.info.subgroup_shuffle) {

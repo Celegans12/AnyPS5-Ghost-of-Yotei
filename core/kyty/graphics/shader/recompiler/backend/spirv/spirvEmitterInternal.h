@@ -98,6 +98,10 @@ struct OracleVariables {
 	uint32_t                           slots    = 0;
 	uint32_t                           root     = 0;
 	uint32_t                           counting = 0;
+	uint32_t                           served   = 0;
+	uint32_t                           returned = 0;
+	uint32_t                           proposed = 0;
+	uint32_t                           resumed  = 0;
 };
 
 struct EmitterState {
@@ -619,6 +623,7 @@ void InitializeRayQueryVariables(EmitterState& state);
 bool ProgramUsesOracle(const IR::Program& program);
 void DeclareOracleVariables(EmitterState& state);
 void InitializeOracleVariables(EmitterState& state);
+void FlushOracleCounts(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 uint32_t GetBdaPointerMasked(EmitterState& state, uint32_t address, uint32_t active);
 uint32_t EmitGuestDwordLoad(ValueEmitContext& ctx, uint32_t address);

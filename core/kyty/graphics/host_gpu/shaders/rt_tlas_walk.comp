@@ -31,6 +31,9 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer ContextEntry
 	uint     served;
 	uint     returned;
 	uint     counting;
+	uint     rounds;
+	uint     waves;
+	uint     candidates;
 };
 
 layout(push_constant, std430) uniform Push {
@@ -210,6 +213,9 @@ void main() {
 			ContextEntry(pc.context).served   = 0;
 			ContextEntry(pc.context).returned = 0;
 			ContextEntry(pc.context).counting = (pc.verify >> 1) & 1u;
+			ContextEntry(pc.context).rounds     = 0;
+			ContextEntry(pc.context).waves      = 0;
+			ContextEntry(pc.context).candidates = 0;
 			if (psr) {
 				ContextEntry(pc.context).instance_count = ~0u;
 			}
@@ -442,6 +448,9 @@ void main() {
 			context.served         = 0;
 			context.returned       = 0;
 			context.counting       = (pc.verify >> 1) & 1u;
+			context.rounds         = 0;
+			context.waves          = 0;
+			context.candidates     = 0;
 		}
 	}
 }

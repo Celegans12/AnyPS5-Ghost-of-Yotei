@@ -65,7 +65,7 @@ constexpr uint32_t MissingStride  = 48;
 constexpr uint32_t JobStride      = 80;
 constexpr uint32_t SlotStride     = 64;
 constexpr uint32_t TableStride    = 16;
-constexpr uint32_t ContextStride  = 64;
+constexpr uint32_t ContextStride  = 128;
 constexpr uint32_t InstanceStride = 64;
 
 constexpr uint32_t ModeCount  = 0;
@@ -337,6 +337,8 @@ struct RtStats {
 	RtCounter                            oracle_returned;
 	RtCounter                            oracle_rays;
 	RtCounter                            oracle_candidates;
+	RtCounter                            oracle_rounds;
+	RtCounter                            oracle_waves;
 	std::atomic<uint64_t>                last_oracle_returned {0};
 	std::atomic<uint64_t>                last_oracle {0};
 	ShaderRecompiler::RayTracingPrograms programs_reported {};
@@ -377,7 +379,9 @@ void SummarizeRayTracing() {
 	const auto oracle_returned   = stats.oracle_returned.TakeDelta();
 	const auto oracle_rays       = stats.oracle_rays.TakeDelta();
 	const auto oracle_candidates = stats.oracle_candidates.TakeDelta();
-	const auto oracle            = oracle_returned + oracle_rays + oracle_candidates;
+	const auto oracle_rounds     = stats.oracle_rounds.TakeDelta();
+	const auto oracle_waves      = stats.oracle_waves.TakeDelta();
+	const auto oracle            = oracle_returned + oracle_rays + oracle_candidates + oracle_rounds + oracle_waves;
 	const auto programs         = ShaderRecompiler::GetRayTracingPrograms();
 	const auto new_unrecognized = programs.unrecognized - stats.programs_reported.unrecognized;
 	const auto new_always_guest = programs.always_guest - stats.programs_reported.always_guest;
@@ -416,11 +420,14 @@ void SummarizeRayTracing() {
 		                RtShader(stats.last_guest_rays.load(std::memory_order_relaxed))));
 	}
 	if (oracle != 0) {
-		log(fmt::format("[RT]   oracle: {} rays answered from host ray queries (last cs {}), {} candidates ({:.2f} per ray), "
-		                "{} box intersections handed back to the guest walk (last cs {})",
-		                oracle_rays, RtShader(stats.last_oracle.load(std::memory_order_relaxed)), oracle_candidates,
-		                oracle_rays != 0 ? static_cast<double>(oracle_candidates) / static_cast<double>(oracle_rays) : 0.0,
-		                oracle_returned, RtShader(stats.last_oracle_returned.load(std::memory_order_relaxed))));
+		const auto per = [](uint64_t part, uint64_t whole) {
+			return whole != 0 ? static_cast<double>(part) / static_cast<double>(whole) : 0.0;
+		};
+		log(fmt::format("[RT]   oracle: {} rays answered from host ray queries (last cs {}), {:.2f} candidates per ray, "
+		                "{:.2f} resume rounds per wave, {} box intersections handed back to the guest walk (last cs {})",
+		                oracle_rays, RtShader(stats.last_oracle.load(std::memory_order_relaxed)),
+		                per(oracle_candidates, oracle_rays), per(oracle_rounds, oracle_waves), oracle_returned,
+		                RtShader(stats.last_oracle_returned.load(std::memory_order_relaxed))));
 	}
 	if (new_unrecognized + new_always_guest != 0) {
 		log(fmt::format("[RT]   programs compiled so far: {} traced natively, {} whose BVH walk no form recognizes "
@@ -440,13 +447,15 @@ void RayTracing::NoteGuestDispatch(GuestDispatch kind, uint64_t shader_hash) noe
 	}
 }
 
-void RayTracing::NoteOracle(uint64_t shader_hash, uint64_t returned, uint64_t rays, uint64_t candidates) {
+void RayTracing::NoteOracle(uint64_t shader_hash, const OracleCounts& counts) {
 	auto& stats = g_rt_stats;
-	stats.oracle_returned.Add(returned);
-	stats.oracle_rays.Add(rays);
-	stats.oracle_candidates.Add(candidates);
+	stats.oracle_returned.Add(counts.returned);
+	stats.oracle_rays.Add(counts.rays);
+	stats.oracle_candidates.Add(counts.candidates);
+	stats.oracle_rounds.Add(counts.rounds);
+	stats.oracle_waves.Add(counts.waves);
 	stats.last_oracle.store(shader_hash, std::memory_order_relaxed);
-	if (returned != 0) {
+	if (counts.returned != 0) {
 		stats.last_oracle_returned.store(shader_hash, std::memory_order_relaxed);
 	}
 }
