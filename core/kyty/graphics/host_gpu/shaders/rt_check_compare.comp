@@ -43,7 +43,7 @@ void main() {
     }
     barrier();
     if (gl_LocalInvocationIndex == 0u && group_differ != 0u) {
-        atomicAdd(result[slot * 4u], group_differ);
-        atomicMin(result[slot * 4u + 1u], group_first);
+        atomicAdd(result[slot * 8u], group_differ);
+        atomicMin(result[slot * 8u + 1u], group_first);
     }
 }

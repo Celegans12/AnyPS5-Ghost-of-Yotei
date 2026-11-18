@@ -29,12 +29,13 @@ namespace {
 
 constexpr uint64_t RegionBytes   = uint64_t {128} << 20u;
 constexpr uint64_t OutputAlign   = 256;
-constexpr uint32_t ResultBytes   = 16;
+constexpr uint32_t ResultBytes   = 32;
 constexpr uint32_t VerifiedAfter = 4;
 constexpr uint32_t SlowerAfter   = 16;
 constexpr uint32_t CompareGroups = 1024;
 constexpr size_t   KeptFractions = 4096;
 constexpr uint64_t ContextServed = 52;
+constexpr uint64_t ContextCounts = 24;
 
 struct ComparePush {
 	uint32_t count = 0;
@@ -418,7 +419,7 @@ void RayTracingCheck::AfterOracle(const PreparedBindings&, bool counted) {
 	const auto context = m_context.GetRayTracing()->ContextBuffer();
 	counted            = counted && context;
 	if (counted) {
-		const vk::BufferCopy copy {ContextServed, uint64_t {m_slot} * ResultBytes + 8, 8};
+		const vk::BufferCopy copy {ContextServed, uint64_t {m_slot} * ResultBytes + 8, ContextCounts};
 		scheduler.Current().Handle().copyBuffer(context, m_results->Handle(), 1, &copy);
 	}
 	{
@@ -518,8 +519,11 @@ void RayTracingCheck::Finish(uint32_t slot) {
 	const auto* words  = reinterpret_cast<const uint32_t*>(m_results->Mapped().data() + uint64_t {slot} * ResultBytes);
 	const auto  differ   = words[0];
 	const auto  first    = words[1];
-	const auto  served   = words[2];
-	const auto  returned = words[3];
+	const auto  served     = words[2];
+	const auto  returned   = words[3];
+	const auto  resumes    = words[5];
+	const auto  waves      = words[6];
+	const auto  candidates = words[7];
 	std::lock_guard lock(m_mutex);
 	const auto pending     = m_pending[slot];
 	m_pending[slot].busy   = false;
@@ -537,9 +541,11 @@ void RayTracingCheck::Finish(uint32_t slot) {
 	                "output(s){}",
 	                Hash(pending.hash), pending.index, differ, pending.dwords, fraction, threshold,
 	                differ == 0 ? std::string() : fmt::format(", first at dword {}", first), pending.outputs,
-	                pending.counted ? fmt::format("; host: {} rays served, {} box calls handed back to the guest walk",
-	                                              served, returned)
-	                                : std::string()));
+	                pending.counted
+	                    ? fmt::format("; host: {} rays served in {} waves, {} candidates, {} resume rounds, {} box calls "
+	                                  "handed back to the guest walk",
+	                                  served, waves, candidates, resumes, returned)
+	                    : std::string()));
 	if (!program.verified && !over && program.clean >= VerifiedAfter) {
 		program.verified = true;
 		Note(fmt::format("[RT] check {}: verified on {} checked dispatches ({}); one dispatch in {} checked from now on",
