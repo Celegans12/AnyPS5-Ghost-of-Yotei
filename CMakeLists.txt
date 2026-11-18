@@ -859,6 +859,9 @@ if(BUILD_TESTING)
         add_test(NAME env_reference COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_env_reference.py)
         set_tests_properties(env_reference PROPERTIES TIMEOUT 20)
+        add_test(NAME check_kyty_settings COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_kyty_settings.py)
+        set_tests_properties(check_kyty_settings PROPERTIES TIMEOUT 20)
         set(env_reference_test_source "${CMAKE_CURRENT_SOURCE_DIR}/tools/tests/test_check_conventions_env_reference.py")
         set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${env_reference_test_source}")
         file(STRINGS "${env_reference_test_source}" env_reference_cases REGEX "^    def test_")

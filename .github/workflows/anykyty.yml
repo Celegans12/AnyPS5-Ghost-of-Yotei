@@ -56,6 +56,8 @@ jobs:
           fi
           echo "Checking $(git rev-parse --short "$base")..$(git rev-parse --short "$head")"
           python3 -I tools/check_conventions.py --base "$base" --head "$head"
+      - name: Check that every Kyty setting is documented
+        run: python3 -I tools/check_kyty_settings.py
 
   linux:
     name: Linux ${{ matrix.name }}
