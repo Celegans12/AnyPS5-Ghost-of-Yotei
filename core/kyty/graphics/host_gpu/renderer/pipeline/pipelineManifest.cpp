@@ -3941,6 +3941,9 @@ void PipelineCache::CreateManifestPipeline(uint32_t index) {
 void PipelineCache::CreateManifestComputePipeline(const ShaderModule&          module,
                                                   const std::vector<uint32_t>& spirv,
                                                   bool                         from_assets) {
+#if defined(ANYPS5_KYTY)
+	std::atomic_ref<bool>(module.pipeline_requested).store(true, std::memory_order_relaxed);
+#endif
 	{
 		std::scoped_lock lock(m_async_mutex);
 		if (!m_claimed_compute.insert(module.id).second) {

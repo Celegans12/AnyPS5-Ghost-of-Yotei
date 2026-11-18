@@ -73,8 +73,14 @@ template <class S, class Key> void IoKey(S& io, Key& key) {
 }
 
 template <class S, class Module> void IoModule(S& io, Module& stage) {
+#if defined(ANYPS5_KYTY)
+	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
+	       mesh_task, spirv_words, plain, guest_traversal, plan, pipeline_requested] = stage;
+	(void)pipeline_requested;
+#else
 	auto& [id, handle, info, specialization, function_code, vertex_formats, rect_parameters,
 	       mesh_task, spirv_words, plain, guest_traversal, plan] = stage;
+#endif
 	(void)plan;
 	IoAll(io, id, info, specialization, vertex_formats, rect_parameters, mesh_task, guest_traversal);
 }
@@ -202,6 +208,9 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	}
 	for (const auto* module: modules | std::views::values) {
 		if (module != nullptr && module->info.stage == ShaderType::Compute) {
+#if defined(ANYPS5_KYTY)
+			module->pipeline_requested = true;
+#endif
 			jobs.emplace_back([this, module, &pipeline = m_compute_pipelines[module->id]] {
 				CreatePipelineInternal(m_graphics, pipeline, *module, m_driver_cache);
 			});

@@ -1,4 +1,7 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
+#endif
 
 #include "common/assert.h"
 #include "common/debugCounters.h"
@@ -1288,6 +1291,24 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (failed) return skip_failure();
 		if (module != nullptr) return bind(*module);
 	}
+#if defined(ANYPS5_KYTY)
+	struct TranslateScope {
+		uint64_t                              hash;
+		std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+		~TranslateScope() {
+			static const auto threshold = std::chrono::milliseconds([] {
+				const char* value = std::getenv("KYTY_PIPELINE_STALL_LOG_MS");
+				return value != nullptr ? std::strtoll(value, nullptr, 10) : 100;
+			}());
+			const auto now = std::chrono::steady_clock::now();
+			if (now - started >= threshold) {
+				PipelineCacheLog("[kyty-gpl] translate {:.3f} s 0x{:016x} @{}",
+				                 std::chrono::duration<double>(now - started).count(), hash,
+				                 now.time_since_epoch().count());
+			}
+		}
+	} const translate_scope {params.hash};
+#endif
 	if (WaitForCompile(m_lookup_key)) {
 		return GetProgram(params, input_info, push_data_cursor);
 	}
@@ -1364,6 +1385,13 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
       m_next_driver_cache_save(std::chrono::steady_clock::now() + DriverCacheSaveInterval) {
 	EXIT_NOT_IMPLEMENTED(!Common::Thread::IsMainThread());
 	InitializeDriverCache();
+#if defined(ANYPS5_KYTY)
+	if (m_graphics.pipeline_library_enabled) {
+		m_libraries = std::make_unique<PipelineLibraries>(
+		    m_graphics, m_driver_cache,
+		    [this](std::chrono::steady_clock::time_point started) { NoteCreatedPipeline(started); });
+	}
+#endif
 	if (Config::PipelineManifestRecord() && !shader_store.empty()) {
 		PipelineCacheLog("Shader cache: not used while the pipeline manifest records");
 		WarmUp({});
@@ -1391,6 +1419,20 @@ PipelineCache::~PipelineCache() {
 	CloseManifest();
 	StopHelpers();
 	StopAsyncPipelines();
+#if defined(ANYPS5_KYTY)
+	if (m_libraries != nullptr) {
+		m_libraries->Stop();
+		for (const auto& optimized: m_libraries->TakeOptimized()) {
+			m_graphics.device.destroyPipeline(optimized.pipeline, nullptr);
+		}
+	}
+	for (const auto& optimized: m_optimized_deferred) {
+		m_graphics.device.destroyPipeline(optimized.pipeline, nullptr);
+	}
+	for (const auto retired: m_retired_pipelines) {
+		m_graphics.device.destroyPipeline(retired, nullptr);
+	}
+#endif
 	Save();
 	for (const auto cache: m_helper_caches) {
 		m_graphics.device.destroyPipelineCache(cache, nullptr);
@@ -1425,6 +1467,9 @@ PipelineCache::~PipelineCache() {
 			}
 		}
 	}
+#if defined(ANYPS5_KYTY)
+	m_libraries.reset();
+#endif
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 }
 
@@ -1525,6 +1570,9 @@ void PipelineCache::CheckpointDriverCache(bool slow_creation) {
 }
 
 void PipelineCache::NoteCreatedPipeline(std::chrono::steady_clock::time_point started) {
+#if defined(ANYPS5_KYTY)
+	m_pipelines_created.fetch_add(1, std::memory_order_relaxed);
+#endif
 	CheckpointDriverCache(std::chrono::steady_clock::now() - started >= SlowCreation);
 }
 
@@ -2324,7 +2372,10 @@ void PipelineCache::AsyncPipelineWorker() {
 		if (job.compute) {
 			CreatePipelineInternal(m_graphics, pipeline, *job.module, m_driver_cache);
 		} else {
-			CreatePipelineInternal(m_graphics, pipeline, job.key, job.stages, m_driver_cache);
+#if defined(ANYPS5_KYTY)
+			if (!CreateGraphicsPipelineFast(pipeline, job.key, job.stages))
+#endif
+				CreatePipelineInternal(m_graphics, pipeline, job.key, job.stages, m_driver_cache);
 		}
 		const bool created = pipeline.pipeline != nullptr && pipeline.pipeline_layout != nullptr;
 		if (created) {
@@ -2365,8 +2416,24 @@ void PipelineCache::ClaimComputePipeline(uint64_t module_id) {
 	}
 }
 
+#if defined(ANYPS5_KYTY)
+void PipelineCache::RequestComputePipelineAhead(const ShaderModule& module) {
+	if (!PipelineLibrariesWanted()) {
+		return;
+	}
+	std::atomic_ref<bool> requested(module.pipeline_requested);
+	if (requested.load(std::memory_order_relaxed) || requested.exchange(true, std::memory_order_relaxed)) {
+		return;
+	}
+	CreateComputePipelineAhead(module, {});
+}
+#endif
+
 void PipelineCache::CreateComputePipelineAhead(const ShaderModule&          module,
                                                const std::vector<uint32_t>& spirv) {
+#if defined(ANYPS5_KYTY)
+	std::atomic_ref<bool>(module.pipeline_requested).store(true, std::memory_order_relaxed);
+#endif
 	if (m_helpers == nullptr && m_async_threads.empty()) {
 		return;
 	}
@@ -2763,8 +2830,20 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
 		SyncAheadWrites(AheadWritesSequence());
 	}
 #endif
+#if defined(ANYPS5_KYTY)
+	const ShaderModule* module = nullptr;
+	{
+		const ProgramLockGuard lock(m_program_lock, !t_ahead_unlocked);
+		module = GetAhead(params, input_info, push_data_cursor, ahead);
+	}
+	if (module != nullptr) {
+		RequestComputePipelineAhead(*module);
+	}
+	return module;
+#else
 	const ProgramLockGuard lock(m_program_lock, !t_ahead_unlocked);
 	return GetAhead(params, input_info, push_data_cursor, ahead);
+#endif
 }
 
 constexpr uint64_t PipelineSyncWords = 12000;
@@ -2800,6 +2879,12 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const auto& ps_input_info = state.ps_input_info;
 	const auto& vs_input_info = vertex_info.front();
 	KYTY_PROFILER_BLOCK("PipelineCache::CreatePipeline(Gfx)", profiler::colors::DeepOrangeA200);
+#if defined(ANYPS5_KYTY)
+	if (m_libraries != nullptr &&
+	    (m_libraries->OptimizedReady() != m_optimized_seen || !m_optimized_deferred.empty())) {
+		ApplyOptimizedPipelines();
+	}
+#endif
 
 	const bool ps_active    = state.ps_active;
 	const bool tessellation = vertex_info.size() == 3;
@@ -2989,7 +3074,10 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		}
 		auto& cached           = m_native_graphics_pipelines[key];
 		cached.native_bindings = true;
-		CreatePipelineInternal(m_graphics, cached, key, stages, m_driver_cache);
+#if defined(ANYPS5_KYTY)
+		if (!CreateGraphicsPipelineFast(cached, key, stages))
+#endif
+			CreatePipelineInternal(m_graphics, cached, key, stages, m_driver_cache);
 		EXIT_NOT_IMPLEMENTED(cached.pipeline == nullptr || cached.pipeline_layout == nullptr);
 		return &cached;
 	}
@@ -3018,6 +3106,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		allow_async = spirv_words > PipelineSyncWords && !layer_draw;
 	}
 	std::optional<StallScope> stall;
+#if defined(ANYPS5_KYTY)
+	const uint64_t stall_hash = stages[3] != nullptr ? stages[3]->info.shader_hash : stages[0]->info.shader_hash;
+#endif
 	if (m_async_handoff) {
 		allow_async = allow_async && !m_async_threads.empty();
 		std::unique_lock lock(m_async_mutex);
@@ -3070,7 +3161,11 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 				break;
 			}
 			if (!stall) {
+#if defined(ANYPS5_KYTY)
+				stall.emplace(*this, "graphics-wait", stall_hash);
+#else
 				stall.emplace(*this);
+#endif
 			}
 			lock.unlock();
 			std::this_thread::yield();
@@ -3092,9 +3187,16 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		if (!stall) {
+#if defined(ANYPS5_KYTY)
+			stall.emplace(*this, "graphics-sync", stall_hash);
+#else
 			stall.emplace(*this);
+#endif
 		}
-		CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
+#if defined(ANYPS5_KYTY)
+		if (!CreateGraphicsPipelineFast(pipeline, key, stages))
+#endif
+			CreatePipelineInternal(m_graphics, pipeline, key, stages, m_driver_cache);
 	}
 	StorePipeline(key);
 	NoteCreatedPipeline(started);
@@ -3104,6 +3206,162 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 
 	return &pipeline;
 }
+
+#if defined(ANYPS5_KYTY)
+bool PipelineCache::CreateGraphicsPipelineFast(Pipeline& pipeline, const GraphicsPipelineKey& key,
+                                               const std::array<const ShaderModule*, 4>& stages) {
+	auto& route = PipelineRouteNote();
+	if (m_libraries == nullptr) {
+		route = "whole";
+		return false;
+	}
+	if (!PipelineLibraries::Eligible(stages)) {
+		route = "whole-no-pixel";
+		return false;
+	}
+	CreateGraphicsPipelineLayout(m_graphics, pipeline, key, stages);
+	if (m_graphics.pipeline_cache_lookup_enabled && m_driver_cache != nullptr) {
+		vk::Pipeline cached = nullptr;
+		if (CreateGraphicsPipelineWhole(m_graphics, pipeline, key, stages, m_driver_cache,
+		                                vk::PipelineCreateFlagBits::eFailOnPipelineCompileRequired,
+		                                cached) == vk::Result::eSuccess &&
+		    cached) {
+			pipeline.pipeline = cached;
+			route             = "driver-cache";
+			return true;
+		}
+	}
+	if (m_libraries->Link(pipeline, key, stages)) {
+		m_libraries->QueueOptimized(pipeline, key, stages);
+		route = "linked";
+		return true;
+	}
+	route = "whole-failed-link";
+	const auto result = CreateGraphicsPipelineWhole(m_graphics, pipeline, key, stages, m_driver_cache, {},
+	                                                pipeline.pipeline);
+	if (result != vk::Result::eSuccess) {
+		EXIT("vkCreateGraphicsPipelines failed: %s, vs 0x%016" PRIx64 ", ps 0x%016" PRIx64 "\n",
+		     vk::to_string(result).c_str(), stages[0]->info.shader_hash, stages[3]->info.shader_hash);
+	}
+	return true;
+}
+
+void PipelineCache::ApplyOptimizedPipelines() {
+	if (const auto ready = m_libraries->OptimizedReady(); ready != m_optimized_seen) {
+		m_optimized_seen = ready;
+		for (auto& optimized: m_libraries->TakeOptimized()) {
+			m_optimized_deferred.push_back(optimized);
+		}
+	}
+	std::erase_if(m_optimized_deferred, [&](const OptimizedGraphicsPipeline& optimized) {
+		auto&      pipelines = optimized.native ? m_native_graphics_pipelines : m_graphics_pipelines;
+		const auto found     = pipelines.find(optimized.key);
+		if (found == pipelines.end()) {
+			return false;
+		}
+		m_retired_pipelines.push_back(found->second.pipeline);
+		found->second.pipeline = optimized.pipeline;
+		return true;
+	});
+}
+
+bool PipelineCache::PreparesGraphicsLibraries() const {
+	return m_libraries != nullptr && m_libraries->Active() && PipelineLibrariesAhead();
+}
+
+void PipelineCache::PrepareGraphicsLibraries(const HW::Context& context, const HW::UserConfig& user_config,
+                                             const DrawRenderState& state,
+                                             bool (*ps_plain)(const ShaderStageRuntime&)) {
+	const auto                         vertex_info = state.VertexStages();
+	std::array<const ShaderModule*, 4> stages {};
+	for (uint32_t i = 0; i < vertex_info.size(); i++) {
+		stages[i] = vertex_info[i].stage.module;
+	}
+	if (state.ps_active) {
+		stages[3] = state.ps_input_info.stage.module;
+	}
+	struct Last {
+		std::array<const ShaderModule*, 4> stages {};
+		HW::ModeControl                    mode;
+		HW::ClipControl                    clip;
+		Prospero::PrimitiveType            primitive {};
+		uint32_t                           target_mask = 0;
+		uint32_t                           target0     = 0;
+	};
+	thread_local Last last;
+	const auto&       mode        = context.GetModeControl();
+	const auto&       clip        = context.GetClipControl();
+	const auto        primitive   = user_config.GetPrimType();
+	const auto        target_mask = context.GetRenderTargetMask();
+	const auto        target0     = context.GetRenderTarget(0).attrib.num_fragments;
+	if (last.stages == stages && std::memcmp(&last.mode, &mode, sizeof(mode)) == 0 &&
+	    std::memcmp(&last.clip, &clip, sizeof(clip)) == 0 && last.primitive == primitive &&
+	    last.target_mask == target_mask && last.target0 == target0) {
+		return;
+	}
+	last.stages      = stages;
+	last.mode        = mode;
+	last.clip        = clip;
+	last.primitive   = primitive;
+	last.target_mask = target_mask;
+	last.target0     = target0;
+	if (stages[3] != nullptr && stages[3]->plain != nullptr && ps_plain(state.ps_input_info.stage)) {
+		stages[3] = stages[3]->plain.get();
+	}
+	if (!PipelineLibraries::Eligible(stages)) {
+		return;
+	}
+	GraphicsPipelineKey key {};
+	for (uint32_t i = 0; i < stages.size(); i++) {
+		key.stage_ids[i] = stages[i] != nullptr ? stages[i]->id : 0;
+	}
+	const auto& mc           = context.GetModeControl();
+	const auto& clip_control = context.GetClipControl();
+	const bool  rect_list    = Prospero::IsRectList(user_config.GetPrimType());
+	auto&       params       = key.static_params;
+	params.negative_one_to_one = !clip_control.dx_clip_space;
+	params.depth_clip_enable   = clip_control.IsZClipEnabled();
+	params.provoking_vtx_last  = mc.provoking_vtx_last;
+	params.polygon_mode = ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
+	if (vertex_info.size() == 3) {
+		params.patch_control_points = vertex_info[0].tess.input_control_points;
+	} else if (rect_list) {
+		params.patch_control_points = 3;
+	}
+	uint32_t   samples = 0;
+	const auto mask    = context.GetRenderTargetMask();
+	for (uint32_t slot = 0; slot < 8 && samples == 0; slot++) {
+		const auto& target = context.GetRenderTarget(slot);
+		if (((mask >> (slot * 4u)) & 0x0fu) != 0 && target.base.addr != 0) {
+			samples = render_sample_count(target.attrib.num_fragments);
+		}
+	}
+	if (samples == 0) {
+		const auto& depth = context.GetDepthRenderTarget();
+		samples           = depth.z_info.format != Prospero::DepthFormat::kInvalid ? render_sample_count(depth.z_info.num_samples)
+		                                             : render_sample_count(context.GetAaConfig().msaa_num_samples);
+	}
+	params.samples = samples;
+	params.sample_shading_enable =
+	    state.ps_active && samples > 1 && state.ps_input_info.ps_sample_shading;
+	params.alpha_to_coverage_enable = state.ps_active && context.GetShaderRegisters().AlphaToMask();
+	struct Seen {
+		std::array<uint64_t, 4>  stage_ids;
+		PipelineStaticParameters params;
+	};
+	Seen seen {};
+	seen.stage_ids = key.stage_ids;
+	seen.params    = params;
+	thread_local std::array<uint64_t, 4096> prepared {};
+	const auto hash  = XXH3_64bits(&seen, sizeof(seen)) | 1u;
+	auto&      entry = prepared[hash & (prepared.size() - 1u)];
+	if (entry == hash) {
+		return;
+	}
+	entry = hash;
+	m_libraries->Prepare(key, stages, false);
+}
+#endif
 
 PipelineCache::Pipeline* PipelineCache::TryGetComputePipeline(const ShaderComputeInputInfo& input_info) {
 	const auto& module = *input_info.stage.module;
@@ -3143,6 +3401,9 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		}
 		return found->second;
 	}
+#if defined(ANYPS5_KYTY)
+	std::atomic_ref<bool>(module.pipeline_requested).store(true, std::memory_order_relaxed);
+#endif
 	std::optional<StallScope> stall;
 	if (m_async_handoff) {
 		std::unique_lock lock(m_async_mutex);
@@ -3176,7 +3437,11 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 				in_helper = true;
 			}
 			if (!stall) {
+#if defined(ANYPS5_KYTY)
+				stall.emplace(*this, "compute-wait", module.info.shader_hash);
+#else
 				stall.emplace(*this);
+#endif
 			}
 			lock.unlock();
 			if (in_helper) {
@@ -3199,7 +3464,11 @@ PipelineCache::Pipeline& PipelineCache::GetComputePipeline(const ShaderComputeIn
 		                                         Common::DebugCounters::Counter::PipelineCreateNs,
 		                                         Common::DebugCounters::Peak::PipelineCreateNs);
 		if (!stall) {
+#if defined(ANYPS5_KYTY)
+			stall.emplace(*this, "compute-sync", module.info.shader_hash);
+#else
 			stall.emplace(*this);
+#endif
 		}
 		CreatePipelineInternal(m_graphics, pipeline, module, m_driver_cache);
 	}

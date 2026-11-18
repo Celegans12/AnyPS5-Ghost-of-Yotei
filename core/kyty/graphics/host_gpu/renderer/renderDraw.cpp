@@ -1320,6 +1320,10 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ReserveResolvedDraw(const HW::Shad
 	return &draw;
 }
 
+#if defined(ANYPS5_KYTY)
+static bool RecordsNoMipStats(const ShaderStageRuntime& stage);
+#endif
+
 void RenderExecutor::ResolveDrawInto(ResolvedDraw& draw, const HW::Context& context,
                                      const HW::UserConfig& user_config, const HW::Shader& shaders,
                                      const ShaderIndirectOffsets& indirect_offsets, bool indirect_draw,
@@ -1346,6 +1350,11 @@ bool RenderExecutor::ResolveDrawPrograms(ResolvedDraw& draw, const HW::Context& 
 	    draw.programs.reads.Failed() || state.vertex_info[0].stage.module == nullptr) {
 		return false;
 	}
+#if defined(ANYPS5_KYTY)
+	if (m_context.GetPipelineCache().PreparesGraphicsLibraries()) {
+		m_context.GetPipelineCache().PrepareGraphicsLibraries(context, user_config, state, &RecordsNoMipStats);
+	}
+#endif
 	draw.resource_key = 0;
 	if (DrawTemplatesEnabled()) {
 		std::array<const ShaderStageRuntime*, 4> stages {};

@@ -246,6 +246,16 @@ struct alignas(4) GraphicsPipelineKey {
 
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineKey>);
 
+#if defined(ANYPS5_KYTY)
+class PipelineLibraries;
+
+struct OptimizedGraphicsPipeline {
+	GraphicsPipelineKey key {};
+	bool                native   = false;
+	vk::Pipeline        pipeline = nullptr;
+};
+#endif
+
 struct ShaderModule {
 	uint64_t                                     id     = 0;
 	vk::ShaderModule                             module = nullptr;
@@ -259,6 +269,9 @@ struct ShaderModule {
 	std::shared_ptr<const ShaderModule>          plain;
 	bool                                         guest_traversal = false;
 	const ShaderRecompiler::IR::ResourcePlan*    plan = nullptr;
+#if defined(ANYPS5_KYTY)
+	mutable bool                                 pipeline_requested = false;
+#endif
 };
 
 [[nodiscard]] std::shared_ptr<const ShaderModule> MakePlainModule(const ShaderModule&   module,
@@ -367,6 +380,11 @@ public:
 	Pipeline* GetGraphicsPipeline(const CommandBuffer& command, const DrawRenderState& state,
 	                              const DrawTargets& targets, bool allow_async = false,
 	                              bool native_bindings = false);
+#if defined(ANYPS5_KYTY)
+	[[nodiscard]] bool PreparesGraphicsLibraries() const;
+	void PrepareGraphicsLibraries(const HW::Context& context, const HW::UserConfig& user_config,
+	                              const DrawRenderState& state, bool (*ps_plain)(const ShaderStageRuntime&));
+#endif
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info);
 	[[nodiscard]] const std::shared_ptr<const std::atomic<bool>>& PipelineWaiting() const {
@@ -571,15 +589,37 @@ private:
 	class StallScope {
 	public:
 		explicit StallScope(PipelineCache& cache);
+#if defined(ANYPS5_KYTY)
+		StallScope(PipelineCache& cache, const char* what, uint64_t hash);
+#endif
 		~StallScope();
 		KYTY_CLASS_NO_COPY(StallScope);
 
 	private:
 		PipelineCache& m_cache;
+#if defined(ANYPS5_KYTY)
+		std::chrono::steady_clock::time_point m_started;
+		const char*                           m_what = nullptr;
+		uint64_t                              m_hash = 0;
+#endif
 	};
 	mutable std::mutex m_stall_mutex;
 	PipelineStall      m_stall;
 	[[nodiscard]] PipelineStall GetPipelineStall() const;
+#if defined(ANYPS5_KYTY)
+	struct StallStats {
+		uint64_t count      = 0;
+		uint64_t total_ns   = 0;
+		uint64_t max_ns     = 0;
+		uint64_t over_100ms = 0;
+		uint64_t over_500ms = 0;
+		uint64_t pipelines  = 0;
+	};
+	StallStats            m_stall_stats;
+	StallStats            m_stall_logged;
+	std::atomic<uint64_t> m_pipelines_created {0};
+	void                  LogStallStats(bool force);
+#endif
 
 	std::unique_ptr<PipelineHelpers> m_helpers;
 	std::unordered_map<uint64_t, const ShaderModule*> m_helper_jobs;
@@ -596,12 +636,24 @@ private:
 	void PublishComputePipeline(const ShaderModule& module, const Pipeline& pipeline,
 	                            std::chrono::steady_clock::time_point started);
 
+#if defined(ANYPS5_KYTY)
+	std::unique_ptr<PipelineLibraries>     m_libraries;
+	std::vector<vk::Pipeline>              m_retired_pipelines;
+	std::vector<OptimizedGraphicsPipeline> m_optimized_deferred;
+	uint64_t                               m_optimized_seen = 0;
+	bool CreateGraphicsPipelineFast(Pipeline& pipeline, const GraphicsPipelineKey& key,
+	                                const std::array<const ShaderModule*, 4>& stages);
+	void ApplyOptimizedPipelines();
+#endif
 	void QueueAsyncPipeline(const AsyncPipelineJob& job);
 	template <typename Matches>
 	bool TakeQueuedAsyncPipeline(Matches&& matches);
 	void AsyncPipelineWorker();
 	void StopAsyncPipelines();
 	void CreateComputePipelineAhead(const ShaderModule& module, const std::vector<uint32_t>& spirv);
+#if defined(ANYPS5_KYTY)
+	void RequestComputePipelineAhead(const ShaderModule& module);
+#endif
 	void ClaimPipeline(const GraphicsPipelineKey& key);
 	void ClaimComputePipeline(uint64_t module_id);
 	void InitializeDriverCache();

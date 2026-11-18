@@ -2,12 +2,16 @@
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
+#endif
 #include "graphics/presentation/precompileNotice.h"
 #include "kernel/guestPause.h"
 
 #include <algorithm>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <fmt/format.h>
 #include <memory>
 #include <mutex>
@@ -63,12 +67,73 @@ PipelineCache::StallScope::StallScope(PipelineCache& cache): m_cache(cache) {
 	}
 }
 
+#if defined(ANYPS5_KYTY)
+PipelineCache::StallScope::StallScope(PipelineCache& cache, const char* what, uint64_t hash)
+    : StallScope(cache) {
+	PipelineRouteNote() = nullptr;
+	m_started = std::chrono::steady_clock::now();
+	m_what    = what;
+	m_hash    = hash;
+}
+#endif
+
 PipelineCache::StallScope::~StallScope() {
+#if defined(ANYPS5_KYTY)
+	const auto now = std::chrono::steady_clock::now();
+	uint64_t   ns  = 0;
+	{
+		std::scoped_lock lock(m_cache.m_stall_mutex);
+		if (--m_cache.m_stall.threads == 0) {
+			m_cache.m_stall.ended = now;
+		}
+		if (m_what != nullptr) {
+			ns           = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(now - m_started).count());
+			auto& stats = m_cache.m_stall_stats;
+			stats.count++;
+			stats.total_ns += ns;
+			stats.max_ns = std::max(stats.max_ns, ns);
+			stats.over_100ms += ns >= 100'000'000u ? 1u : 0u;
+			stats.over_500ms += ns >= 500'000'000u ? 1u : 0u;
+		}
+	}
+	static const uint64_t log_ns = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_STALL_LOG_MS");
+		return (value != nullptr ? std::strtoull(value, nullptr, 10) : 100u) * 1'000'000u;
+	}();
+	if (m_what != nullptr && ns >= log_ns) {
+		const char* route = PipelineRouteNote();
+		PrecompileLog("[kyty-gpl] stall {:.3f} s {} 0x{:016x} {} @{}", static_cast<double>(ns) / 1e9, m_what,
+		              m_hash, route != nullptr ? route : "", now.time_since_epoch().count());
+	}
+#else
 	std::scoped_lock lock(m_cache.m_stall_mutex);
 	if (--m_cache.m_stall.threads == 0) {
 		m_cache.m_stall.ended = std::chrono::steady_clock::now();
 	}
+#endif
 }
+
+#if defined(ANYPS5_KYTY)
+void PipelineCache::LogStallStats(bool force) {
+	StallStats stats;
+	{
+		std::scoped_lock lock(m_stall_mutex);
+		m_stall_stats.pipelines = m_pipelines_created.load(std::memory_order_relaxed);
+		stats                   = m_stall_stats;
+		if (!force && stats.count == m_stall_logged.count && stats.pipelines == m_stall_logged.pipelines) {
+			return;
+		}
+		m_stall_logged = stats;
+	}
+	PrecompileLog("[kyty-gpl] stalls {} total {:.3f} s max {:.3f} s >=0.1s {} >=0.5s {}; driver pipelines {}",
+	              stats.count, static_cast<double>(stats.total_ns) / 1e9, static_cast<double>(stats.max_ns) / 1e9,
+	              stats.over_100ms, stats.over_500ms, stats.pipelines);
+	if (m_libraries != nullptr) {
+		m_libraries->LogStats();
+	}
+}
+#endif
 
 PipelineCache::PipelineStall PipelineCache::GetPipelineStall() const {
 	std::scoped_lock lock(m_stall_mutex);
@@ -169,9 +234,21 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		phase = Phase::Played;
 	};
 
+#if defined(ANYPS5_KYTY)
+	Clock::time_point stats_logged = Clock::now();
+#endif
 	while (!stop.stop_requested()) {
 		const bool paused = phase == Phase::Ask || phase == Phase::Wait;
 		sleep(paused ? Clock::duration(PausePeriod) : Clock::duration(WatchPeriod));
+#if defined(ANYPS5_KYTY)
+		if (m_libraries != nullptr) {
+			m_libraries->Tick();
+		}
+		if (Clock::now() - stats_logged >= LogPeriod) {
+			stats_logged = Clock::now();
+			LogStallStats(false);
+		}
+#endif
 		const auto e     = estimate();
 		const auto now   = Clock::now();
 		const auto stall = GetPipelineStall();
@@ -349,6 +426,9 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 	set_helpers(helpers_running);
 	HidePrecompileNotice();
 	HideManifestProgress();
+#if defined(ANYPS5_KYTY)
+	LogStallStats(true);
+#endif
 }
 
 }

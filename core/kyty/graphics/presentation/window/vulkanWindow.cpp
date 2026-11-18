@@ -9,6 +9,9 @@
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/pipeline/pipelineLibrary.h"
+#endif
 #include "graphics/host_gpu/renderer/upscaler/dlss.h"
 #include "graphics/host_gpu/renderer/upscaler/fsr.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -497,6 +500,28 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		    "Some games may render incorrectly or crash.\n");
 	}
 	graphics.shader_image_int64_atomics_enabled = image_atomic_int64.shaderImageInt64Atomics;
+#if defined(ANYPS5_KYTY)
+	if (PipelineLibrariesWanted() && extended_dynamic_state &&
+	    HasExtension(available_extensions, VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME) &&
+	    HasExtension(available_extensions, VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME)) {
+		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>
+		    library_features;
+		physical_device.getFeatures2(&library_features.get<vk::PhysicalDeviceFeatures2>());
+		vk::StructureChain<vk::PhysicalDeviceProperties2, vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>
+		    library_properties;
+		physical_device.getProperties2(&library_properties.get<vk::PhysicalDeviceProperties2>());
+		graphics.pipeline_library_enabled =
+		    library_features.get<vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT>().graphicsPipelineLibrary ==
+		        VK_TRUE &&
+		    library_properties.get<vk::PhysicalDeviceGraphicsPipelineLibraryPropertiesEXT>()
+		            .graphicsPipelineLibraryFastLinking == VK_TRUE;
+		if (graphics.pipeline_library_enabled) {
+			add(VK_KHR_PIPELINE_LIBRARY_EXTENSION_NAME);
+			add(VK_EXT_GRAPHICS_PIPELINE_LIBRARY_EXTENSION_NAME);
+		}
+	}
+	LOGF("Vulkan graphics pipeline libraries: %s\n", graphics.pipeline_library_enabled ? "true" : "false");
+#endif
 	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
 
 	auto features12                     = WindowContext::RequiredVulkan12Features();
@@ -739,6 +764,14 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		create.unlink<vk::PhysicalDeviceRayQueryFeaturesKHR>();
 	}
 
+#if defined(ANYPS5_KYTY)
+	vk::PhysicalDeviceGraphicsPipelineLibraryFeaturesEXT library_enabled {.graphicsPipelineLibrary = VK_TRUE};
+	if (graphics.pipeline_library_enabled) {
+		auto& device_info     = create.get<vk::DeviceCreateInfo>();
+		library_enabled.pNext = const_cast<void*>(device_info.pNext);
+		device_info.pNext     = &library_enabled;
+	}
+#endif
 	vk::Device device = nullptr;
 	RequireVulkanSuccess(physical_device.createDevice(&create.get(), nullptr, &device),
 	                     "vkCreateDevice");

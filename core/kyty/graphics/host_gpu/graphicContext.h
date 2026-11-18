@@ -45,6 +45,9 @@ struct GraphicContext {
 	bool                               indirect_draws_enabled                = false;
 	bool                               supports_block_texel_view              = false;
 	bool                               pipeline_cache_lookup_enabled          = false;
+#if defined(ANYPS5_KYTY)
+	bool                               pipeline_library_enabled               = false;
+#endif
 	bool                                      mesh_shader_enabled                   = false;
 	bool                                      native_ray_tracing_enabled            = false;
 	vk::PhysicalDeviceMeshShaderPropertiesEXT mesh_shader_properties                = {};
