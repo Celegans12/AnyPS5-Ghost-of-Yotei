@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
+#include "graphics/shader/recompiler/ir/passes/RayQuerySource.h"
 
 #include <algorithm>
 #include <array>
@@ -5823,6 +5824,24 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		std::vector<Inst*> left;
 		for (auto* bvh: intersections) {
 			if (!inside(bvh->Parent())) left.push_back(bvh);
+		}
+		const auto derived = left.empty() ? OracleWalks {} : DeriveOracleWalks(program, left);
+		if (!left.empty() && derived.refusal == nullptr) {
+			Walk walk;
+			walk.kind                   = Kind::Universal;
+			walk.lane.source            = derived.sources.front();
+			walk.lane.layout.mask_shift = walk.lane.source.layout[2] >> 4u & 31u;
+			for (size_t at = 0; at < derived.loops.size(); ++at) {
+				auto each   = walk;
+				each.header = derived.loops[at].first;
+				each.latch  = derived.loops[at].second;
+				if (at != 0) each.lane.source.reach.clear();
+				walks.push_back(std::move(each));
+			}
+			left.clear();
+		} else if (!left.empty()) {
+			LOGF("%s universal ray tracing: hash=0x%016llx derives no source: %s (%u)\n", compute ? "CS" : "PS",
+			     static_cast<unsigned long long>(program.shader_hash), derived.refusal, derived.detail);
 		}
 		for (auto* bvh: left) {
 			Walk walk;
