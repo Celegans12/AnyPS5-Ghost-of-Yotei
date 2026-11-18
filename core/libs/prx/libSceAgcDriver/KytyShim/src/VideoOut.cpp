@@ -344,7 +344,7 @@ void PrepareSource(PendingFlip& flip, Libs::Graphics::Presenter& presenter, Libs
     flip.source = flip.request->Source();
     if (!flip.source.has_value()) return;
     const auto info = DisplayImageInfo(*flip.source);
-    flip.frame = &presenter.PrepareFrame(buffer, info, Libs::Graphics::IsHdrVideoOutPixelFormat(flip.source->pixelFormat), false);
+    flip.frame = &presenter.PrepareFrame(buffer, info, flip.source->pixelFormat, false);
 }
 
 std::uint64_t DropFlip(std::uint32_t handle, int index) {
@@ -734,12 +734,12 @@ constexpr int OverlayBus = 1;
 
 struct GuestImage {
     Libs::Graphics::ImageInfo info;
-    bool hdr = false;
+    std::uint64_t pixelFormat = 0;
 };
 
 std::optional<GuestImage> DescribeGuestImage(const AgcDriver::DisplayBuffer* buffer) {
     if (buffer == nullptr) return std::nullopt;
-    return GuestImage{DisplayImageInfo(*buffer), Libs::Graphics::IsHdrVideoOutPixelFormat(buffer->pixelFormat)};
+    return GuestImage{DisplayImageInfo(*buffer), buffer->pixelFormat};
 }
 
 struct PreparedFrames {
@@ -753,8 +753,8 @@ std::shared_ptr<PreparedFrames> PrepareGuestFrames(Libs::Graphics::RenderContext
     auto prepared = std::make_shared<PreparedFrames>();
     renderer.GetGpu().SendUrgentCommandSync([&renderer, &presenter, main, overlay, prepared] {
         auto& scheduler = renderer.GetCommandScheduler();
-        if (main.has_value()) prepared->main = &presenter.PrepareFrame(scheduler.Current(), main->info, main->hdr, false);
-        if (overlay.has_value()) prepared->overlay = &presenter.PrepareFrame(scheduler.Current(), overlay->info, overlay->hdr, false);
+        if (main.has_value()) prepared->main = &presenter.PrepareFrame(scheduler.Current(), main->info, main->pixelFormat, false);
+        if (overlay.has_value()) prepared->overlay = &presenter.PrepareFrame(scheduler.Current(), overlay->info, overlay->pixelFormat, false);
         if (main.has_value()) scheduler.DeferHostOperation([prepared] { prepared->done.release(); }, true);
         prepared->tick = scheduler.CurrentTick();
         scheduler.Flush();
