@@ -118,6 +118,7 @@ struct ConfigOptions {
 	bool                   native_rt                   = false;
 	bool                   async_pipelines_enabled     = true;
 	bool                   rt_stats_enabled            = false;
+	uint32_t               rt_oracle                   = 0;
 	bool                   trophy_enabled              = true;
 	uint32_t               trophy_duration_seconds     = 6;
 	bool                   perf_overlay_enabled            = false;
@@ -203,6 +204,7 @@ bool NativeRtEnabled();
 bool AsyncPipelinesEnabled();
 bool NativeRayTracingEnabled();
 bool RayTracingStatsEnabled();
+uint32_t RayTracingOracle();
 bool TrophyEnabled();
 uint32_t GetTrophyDurationSeconds();
 bool PlayGoHackEnabled();

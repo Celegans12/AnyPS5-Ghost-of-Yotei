@@ -538,7 +538,10 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 		case ValueOpcode::BitwiseXor32: info.has_bitwise_xor = true; break;
 		case ValueOpcode::StoreCompletion: info.subgroup_barrier = true; break;
 		case ValueOpcode::DataCacheInvalidate: info.coherent_buffers = true; break;
-		case ValueOpcode::BvhIntersect: info.bvh = info.uses_dma = true; break;
+		case ValueOpcode::BvhIntersect:
+			info.bvh = info.uses_dma = true;
+			if ((inst.Flags<uint32_t>() & BvhIntersectOracle) != 0) info.ray_query = true;
+			break;
 		case ValueOpcode::Bvh8Intersect: info.bvh8 = info.uses_dma = true; break;
 		case ValueOpcode::BvhStack: info.bvh_stack = true; break;
 		case ValueOpcode::RayQueryInitialize: info.ray_query = info.ray_query_mirror = true; break;

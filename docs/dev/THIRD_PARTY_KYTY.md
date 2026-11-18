@@ -281,6 +281,7 @@ This build does not read KytyPS5's `KYTY_PIPELINE_PRECOMPILE`: stopping the game
 |---|---|---|---|---|---|---|
 | `KYTY_NATIVE_RT` | `0` or `1`, else stops | unset | Unset: native ray tracing when the device has `VK_KHR_acceleration_structure`, `VK_KHR_ray_query` and `VK_KHR_deferred_host_operations` with their features, emulated otherwise. `1`: native, and a stop when the device cannot. `0`: emulated. KytyPS5's own default is off | perf | all | Kyty option; on by default `8a29429250` |
 | `KYTY_RT_STATS` | `0` or `1`, else stops | `0` | With native ray tracing, shaders count their queries and an `[RT]` summary of the last 10 seconds is logged | debug | all | Kyty option |
+| `KYTY_RT_ORACLE` | `0` to `7`, else stops | `0` | With native ray tracing, bit 1: the BVH intersections of walks no form recognizes answer from a host ray query while the guest walk code runs as written; bit 2: the walks a form recognizes are served the same way instead of their rewrite; bit 4: no form is tried | perf | all | AnyKyty |
 | `KYTY_RT_ARENA_MB` | MiB, empty counts as unset | a quarter of the largest device-local heap, 512 MiB to 4 GiB | Limit of the memory the native BLASes take; `0` means no limit | perf | all | Kyty import |
 
 ### Logs, dumps, validation and profiling
@@ -429,7 +430,8 @@ shim turns it on unless `KYTY_NATIVE_RT=0`, and Kyty enables the ray query exten
 Once the device exists, `KytyShim::ReportNativeRayTracing()` prints one `[kyty] native ray tracing` line on stderr:
 on, off by `KYTY_NATIVE_RT=0`, or unavailable with the missing extension or feature named, in which case ray tracing
 runs emulated as with `0`; with `KYTY_NATIVE_RT=1` that last case stops the emulator instead. `KYTY_RT_STATS` takes
-effect whenever native ray tracing is on. `KYTY_RT_ARENA_MB` (MiB) replaces the limit of the memory the native BLASes
+effect whenever native ray tracing is on, and so does `KYTY_RT_ORACLE`, which adds a `[kyty] BVH intersections of … answer
+from host ray queries` line and enters the key of every compiled compute program. `KYTY_RT_ARENA_MB` (MiB) replaces the limit of the memory the native BLASes
 take, a quarter of the largest device-local heap clamped to 512 MiB to 4 GiB; it is read by
 `graphics/host_gpu/renderer/rayTracingSlots.cpp`.
 
@@ -439,7 +441,9 @@ default) recompiles such a shader offline, from its raw machine code, as the dri
 `kyty_rt_probe [--wave 32|64] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--spirv out.spv] <shader.bin>...`
 prints, per file, its BVH intersections, how many of them trace with ray queries, and the TLAS source and instance
 record layout derived for them, and exits with 0 only when every intersection does. `--dump` adds the IR, `--off`
-compiles as with `KYTY_NATIVE_RT=0`.
+compiles as with `KYTY_NATIVE_RT=0`, `--oracle 0-7` as with `KYTY_RT_ORACLE`, `--stats` as with `KYTY_RT_STATS=1`, and
+`--subgroup 32` translates a wave of 64 for a GPU with subgroups of 32, as the driver does there; the line then ends with
+`oracle=N lane=M`, the intersections that answer from a host ray query and those of them that do it lane by lane.
 
 To probe directly from the game's local pipeline manifest code cache, use
 `kyty_rt_probe --cache _PipelineCache/<title>_<version>.code --hash 0x<shader-hash>`.

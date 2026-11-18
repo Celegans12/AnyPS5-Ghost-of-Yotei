@@ -194,6 +194,7 @@ On by default unless the row says otherwise; set one to compare, or to work arou
 |---|---|---|
 | `KYTY_NATIVE_RT` | unset, `0`, `1` | Unset: native ray tracing when the GPU supports it. `0`: ray tracing emulated in shaders. `1`: native, and a stop with a message when the GPU cannot |
 | `KYTY_RT_STATS` | `0`, `1` | Print a ray tracing summary every 10 s |
+| `KYTY_RT_ORACLE` | `0` to `7` | `1`: the ray tracing passes whose BVH walk no form recognizes still trace natively, each BVH intersection answered from a host ray query. Off (`0`) by default for now |
 | `KYTY_RT_ARENA_MB` | MiB | Limit of the memory the native ray tracing structures take |
 
 **Reporting a problem**

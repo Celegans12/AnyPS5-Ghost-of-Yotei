@@ -593,6 +593,9 @@ void AppendNativeRayTracingKey(ShaderType stage, std::vector<uint32_t>& key, boo
 		if (Config::RayTracingStatsEnabled()) {
 			key.push_back(0x52545354u);
 		}
+		if (const auto oracle = Config::RayTracingOracle(); oracle != 0) {
+			key.push_back(0x52544f00u | oracle);
+		}
 	}
 }
 
@@ -1477,6 +1480,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 	options.native_ray_tracing = RayTracing::NativeTraversals() && !m_guest_traversal;
 	options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
+	options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
 	ShaderRecompiler::ShaderSource source;
 	if (entry == m_program_cache.end()) {
 		DumpShader(params.code, fmt::format("original/{}_{:016x}.bin",
@@ -2456,6 +2460,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
 		options.native_ray_tracing = RayTracing::NativeTraversals();
 		options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
+		options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
 		auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
 		if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
 			return;

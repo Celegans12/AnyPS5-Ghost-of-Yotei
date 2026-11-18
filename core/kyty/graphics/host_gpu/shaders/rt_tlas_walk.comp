@@ -27,6 +27,10 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer ContextEntry
 	uint     instance_count;
 	uint     valid;
 	uint64_t instance_base;
+	uint     root;
+	uint     served;
+	uint     returned;
+	uint     counting;
 };
 
 layout(push_constant, std430) uniform Push {
@@ -201,7 +205,11 @@ void main() {
 	barrier();
 	if (s_valid == 0) {
 		if (lid == 0 && pc.context != 0) {
-			ContextEntry(pc.context).valid = 0;
+			ContextEntry(pc.context).valid    = 0;
+			ContextEntry(pc.context).root     = pc.root;
+			ContextEntry(pc.context).served   = 0;
+			ContextEntry(pc.context).returned = 0;
+			ContextEntry(pc.context).counting = (pc.verify >> 1) & 1u;
 			if (psr) {
 				ContextEntry(pc.context).instance_count = ~0u;
 			}
@@ -306,7 +314,7 @@ void main() {
 			guest = LoadGuestInstance(record, pc.instance_layout);
 		}
 		const uint64_t      blas   = guest.blas;
-		const uint          root   = LayoutInline(pc.instance_layout, node)
+		const uint          root   = LayoutInline(pc.instance_layout, node) && LayoutInlineRoot(pc.instance_layout) != 0xffu
 		                                 ? LayoutInlineRoot(pc.instance_layout)
 		                                 : guest.root;
 		const uint          mask   = guest.mask;
@@ -418,7 +426,7 @@ void main() {
 		state.dispatch_x   = missing;
 		state.dispatch_y   = 1;
 		state.dispatch_z   = 1;
-		state.verify_x     = pc.verify != 0 ? state.verify_count : 0u;
+		state.verify_x     = (pc.verify & 1u) != 0 ? state.verify_count : 0u;
 		state.verify_y     = 1;
 		state.verify_z     = 1;
 		if (pc.context != 0) {
@@ -430,6 +438,10 @@ void main() {
 			context.instance_count = psr ? state.instance_count : count;
 			context.instance_base  = instance_base;
 			context.valid          = pc.tlas_address != 0 && (!psr || s_exact != 0) ? 1u : 0u;
+			context.root           = pc.root;
+			context.served         = 0;
+			context.returned       = 0;
+			context.counting       = (pc.verify >> 1) & 1u;
 		}
 	}
 }

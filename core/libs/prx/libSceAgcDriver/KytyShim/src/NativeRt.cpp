@@ -10,6 +10,31 @@ std::optional<Mode> ParseMode(const char* value) {
     return std::nullopt;
 }
 
+std::optional<std::uint32_t> ParseOracle(const char* value) {
+    if (value == nullptr || *value == '\0') return DefaultOracle;
+    const std::string_view text(value);
+    if (text.size() != 1 || text[0] < '0' || text[0] > '7') return std::nullopt;
+    return static_cast<std::uint32_t>(text[0] - '0');
+}
+
+std::string OracleLine(Verdict verdict, std::uint32_t oracle) {
+    if (verdict != Verdict::Native || oracle == 0) return {};
+    const std::string setting = "(KYTY_RT_ORACLE=" + std::to_string(oracle) + ")";
+    const bool remaining = (oracle & OracleRemaining) != 0;
+    if ((oracle & OracleOnly) != 0 && !remaining) {
+        return "[kyty] no BVH walk form is tried and no walk answers from host ray queries " + setting + ": every BVH walk runs emulated\n";
+    }
+    std::string walks;
+    if ((oracle & OracleOnly) != 0) {
+        walks = "every walk whose TLAS and instance records are derived, without trying the walk forms,";
+    } else if ((oracle & OracleForms) != 0) {
+        walks = remaining ? "every recognized walk" : "the walks a form recognizes";
+    } else {
+        walks = "the walks no form recognizes";
+    }
+    return "[kyty] BVH intersections of " + walks + " answer from host ray queries " + setting + "; the guest walk code runs as written\n";
+}
+
 std::string MissingSupport(const DeviceSupport& support) {
     std::string missing;
     const auto add = [&missing](bool present, const char* name) {

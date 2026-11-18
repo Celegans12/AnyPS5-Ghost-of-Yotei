@@ -1821,7 +1821,12 @@ void DefineIndirectBufferLoads(ValueEmitContext& ctx) {
 }
 
 void EmitGuestRayCount(EmitterState& state, uint32_t count) {
-	EXIT_IF(state.fault_buffer_variable == 0);
+	EmitRayMarkCount(state, BufferCache::HACK_MARK_GUEST_RAYS, count);
+}
+
+void EmitRayMarkCount(EmitterState& state, uint32_t counter, uint32_t count) {
+	EXIT_IF(state.fault_buffer_variable == 0 || counter < BufferCache::HACK_MARK_GUEST_RAYS ||
+	        counter >= BufferCache::HACK_MARK_DWORDS);
 	const auto hash  = state.program.shader_hash;
 	const auto first = BufferCache::HACK_MARKS_OFFSET / sizeof(uint32_t) +
 	                   uint64_t {BufferCache::HackMarkEntry(hash)} * BufferCache::HACK_MARK_DWORDS;
@@ -1832,7 +1837,7 @@ void EmitGuestRayCount(EmitterState& state, uint32_t count) {
 	    {1, ConstantU32(state, high)},
 	    {2, ConstantU32(state, ~low)},
 	    {3, ConstantU32(state, ~high)},
-	    {BufferCache::HACK_MARK_GUEST_RAYS, count},
+	    {counter, count},
 	}};
 	const auto pointer_type = TypeStorageBufferElementPointer(state);
 	const auto scope        = ConstantU32(state, spv::ScopeDevice);

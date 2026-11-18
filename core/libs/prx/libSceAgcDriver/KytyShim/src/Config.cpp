@@ -139,6 +139,10 @@ Options OptionsFromEnvironment(std::string& applied) {
     if (!mode.has_value()) EXIT("KytyShim: KYTY_NATIVE_RT=%s is neither 0 nor 1\n", nativeRt);
     options.native_rt = *mode != NativeRt::Mode::Off;
     nativeRtMode.store(*mode, std::memory_order_relaxed);
+    const char* oracle = Read("KYTY_RT_ORACLE", applied);
+    const auto oracleMode = NativeRt::ParseOracle(oracle);
+    if (!oracleMode.has_value()) EXIT("KytyShim: KYTY_RT_ORACLE=%s is not a whole number from 0 to 7\n", oracle);
+    options.rt_oracle = *oracleMode;
     for (const auto& number : Numbers) {
         const char* value = Read(number.variable, applied);
         if (value == nullptr) continue;
@@ -220,6 +224,7 @@ void ReportNativeRayTracing(const Libs::Graphics::GraphicContext& graphics) {
     const auto outcome = NativeRt::Decide(mode, enabled, graphics.physical_device_properties.deviceName.data(), support);
     if (outcome.verdict == NativeRt::Verdict::Refused) EXIT("%s", outcome.message.c_str());
     std::fputs(outcome.message.c_str(), stderr);
+    std::fputs(NativeRt::OracleLine(outcome.verdict, Config::RayTracingOracle()).c_str(), stderr);
 }
 
 void RouteInterrupts(Libs::Graphics::RenderContext& renderer) {

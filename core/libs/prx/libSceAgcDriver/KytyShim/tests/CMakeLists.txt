@@ -46,3 +46,9 @@ add_test(NAME kyty_shim_fallback_off COMMAND kyty_shim_fallback_tests stop)
 set_tests_properties(kyty_shim_fallback_off PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_FALLBACKS=0"
         PASS_REGULAR_EXPRESSION "shader decode reached the code boundary before S_ENDPGM"
         FAIL_REGULAR_EXPRESSION "did not stop")
+
+add_test_executable(kyty_shim_rt_oracle_tests ${CMAKE_CURRENT_SOURCE_DIR}/RtOracle.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_rt_oracle_tests PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(kyty_shim_rt_oracle_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_rt_oracle COMMAND kyty_shim_rt_oracle_tests)
+set_tests_properties(kyty_shim_rt_oracle PROPERTIES TIMEOUT 20)

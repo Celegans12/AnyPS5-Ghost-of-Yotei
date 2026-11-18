@@ -22,6 +22,7 @@ using Libs::Graphics::ShaderType;
 
 struct Settings {
 	uint32_t wave      = 64;
+	uint32_t subgroup  = 0;
 	uint32_t user      = 16;
 	uint32_t group[3]  = {8, 8, 1};
 	uint32_t scratch   = 0;
@@ -29,6 +30,8 @@ struct Settings {
 	bool     dump      = false;
 	bool     emit      = false;
 	bool     disabled  = false;
+	bool     stats     = false;
+	uint32_t oracle    = 0;
 	std::string spirv;
 };
 
@@ -50,7 +53,7 @@ uint64_t HashOf(const char* path) {
 int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, const Settings& settings) {
 	ShaderComputeInputInfo compute {};
 	compute.wave_size          = settings.wave;
-	compute.host_subgroup_size = settings.wave;
+	compute.host_subgroup_size = settings.subgroup != 0 ? settings.subgroup : settings.wave;
 	for (int k = 0; k < 3; ++k)
 		compute.threads_num[k] = settings.group[k];
 	compute.thread_ids_num = settings.group[2] > 1 ? 3 : settings.group[1] > 1 ? 2 : 1;
@@ -67,6 +70,8 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 	options.dump_ir               = settings.dump;
 	options.profile               = &profile;
 	options.native_ray_tracing    = !settings.disabled;
+	options.ray_stats             = settings.stats && !settings.disabled;
+	options.rt_oracle             = settings.disabled ? 0u : settings.oracle;
 	options.user_data             = user_data;
 	options.input_info.compute    = &compute;
 	auto source = Recompiler::PrepareShaderSource(code, options);
@@ -75,18 +80,22 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 		return 1;
 	}
 	auto translated = Recompiler::TranslateProgram(source.decoded, options);
-	uint32_t bvh = 0, native = 0;
+	uint32_t bvh = 0, native = 0, oracle = 0, lane = 0;
 	for (const auto* block: translated.program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != Recompiler::IR::ValueOpcode::BvhIntersect) continue;
+			const auto flags = inst.Flags<uint32_t>();
 			++bvh;
-			if ((inst.Flags<uint32_t>() & Recompiler::IR::BvhIntersectNative) != 0) ++native;
+			if ((flags & Recompiler::IR::BvhIntersectNative) != 0) ++native;
+			if ((flags & Recompiler::IR::BvhIntersectOracle) != 0) ++oracle;
+			if ((flags & Recompiler::IR::BvhIntersectOracleLane) != 0) ++lane;
 		}
 	}
 	const auto& info = translated.program.info;
-	std::printf("%s: words=%zu bvh=%u native=%u user_sgpr=%u header=0x%x root=0x%x layout=%08x,%08x,%08x,%08x\n", label,
-	            code.size(), bvh, native, info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root,
-	            info.ray_query_layout[0], info.ray_query_layout[1], info.ray_query_layout[2], info.ray_query_layout[3]);
+	std::printf("%s: words=%zu bvh=%u native=%u user_sgpr=%u header=0x%x root=0x%x layout=%08x,%08x,%08x,%08x oracle=%u lane=%u\n",
+	            label, code.size(), bvh, native, info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root,
+	            info.ray_query_layout[0], info.ray_query_layout[1], info.ray_query_layout[2], info.ray_query_layout[3], oracle,
+	            lane);
 	if (settings.emit) {
 		Recompiler::IR::ResourceSpecialization specialization;
 		specialization.buffers.resize(translated.program.info.buffers.size());
@@ -109,7 +118,7 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 }
 
 int Usage() {
-	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] (<shader.bin>... | --cache <file.code> --hash <hex>)\n");
+	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-7] [--stats] (<shader.bin>... | --cache <file.code> --hash <hex>)\n");
 	return 64;
 }
 
@@ -130,6 +139,8 @@ int main(int argc, char** argv) {
 		const std::string_view arg = argv[i];
 		if (arg == "--wave" && i + 1 < argc) {
 			settings.wave = static_cast<uint32_t>(std::atoi(argv[++i]));
+		} else if (arg == "--subgroup" && i + 1 < argc) {
+			settings.subgroup = static_cast<uint32_t>(std::atoi(argv[++i]));
 		} else if (arg == "--user" && i + 1 < argc) {
 			settings.user = static_cast<uint32_t>(std::atoi(argv[++i]));
 		} else if (arg == "--group" && i + 3 < argc) {
@@ -143,6 +154,10 @@ int main(int argc, char** argv) {
 			settings.dump = true;
 		} else if (arg == "--emit") {
 			settings.emit = true;
+		} else if (arg == "--oracle" && i + 1 < argc) {
+			settings.oracle = static_cast<uint32_t>(std::atoi(argv[++i])) & 7u;
+		} else if (arg == "--stats") {
+			settings.stats = true;
 		} else if (arg == "--off") {
 			settings.disabled = true;
 		} else if (arg == "--spirv" && i + 1 < argc) {

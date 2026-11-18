@@ -74,6 +74,32 @@ struct ImageDefinition {
 	uint32_t sampled_type = 0;
 };
 
+struct OracleLaneVariables {
+	uint32_t query         = 0;
+	uint32_t state         = 0;
+	uint32_t leaf          = 0;
+	uint32_t entry         = 0;
+	uint32_t t             = 0;
+	uint32_t blas          = 0;
+	uint32_t root          = 0;
+	uint32_t proposed      = 0;
+	uint32_t proposed_blas = 0;
+	uint32_t proposed_root = 0;
+};
+
+struct OracleVariables {
+	std::array<OracleLaneVariables, 2> lanes {};
+	std::array<uint32_t, 2>            results {};
+	uint32_t                           valid    = 0;
+	uint32_t                           context  = 0;
+	uint32_t                           header   = 0;
+	uint32_t                           tlas     = 0;
+	uint32_t                           nodes    = 0;
+	uint32_t                           slots    = 0;
+	uint32_t                           root     = 0;
+	uint32_t                           counting = 0;
+};
+
 struct EmitterState {
 	EmitterState(IR::Program& program_, ShaderStageInputInfo input_info_, const Profile& profile_)
 	    : builder(program_.stage == ShaderType::Mesh ? 0x00010400u : 0x00010300u),
@@ -156,6 +182,7 @@ struct EmitterState {
 	const IR::Inst*                                  ray_query_alpha_sample = nullptr;
 	std::array<bool, 4>                              ray_query_alpha_entry {};
 	std::array<const IR::Inst*, 2>                   ray_query_entry_samples {};
+	OracleVariables                                  oracle;
 	bool                                             ray_stats              = false;
 	std::array<uint32_t, 4>                          ray_stats_first_half {};
 	uint32_t                                         gds_variable            = 0;
@@ -577,6 +604,7 @@ void EmitProgram(EmitterState& state);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineBdaLoads(EmitterState& state);
 void EmitGuestRayCount(EmitterState& state, uint32_t count);
+void EmitRayMarkCount(EmitterState& state, uint32_t dword, uint32_t count);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
 void DefineTrinityBvhIntersect(EmitterState& state);
@@ -588,6 +616,9 @@ uint32_t EmitBvhTriangle(EmitterState& state, const std::array<std::array<uint32
 void DefineTrinityFunctions(EmitterState& state);
 void DeclareRayQueryVariables(EmitterState& state);
 void InitializeRayQueryVariables(EmitterState& state);
+bool ProgramUsesOracle(const IR::Program& program);
+void DeclareOracleVariables(EmitterState& state);
+void InitializeOracleVariables(EmitterState& state);
 uint32_t GetBdaPointer(EmitterState& state, uint32_t address);
 uint32_t GetBdaPointerMasked(EmitterState& state, uint32_t address, uint32_t active);
 uint32_t EmitGuestDwordLoad(ValueEmitContext& ctx, uint32_t address);

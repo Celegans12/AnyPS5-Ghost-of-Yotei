@@ -1,0 +1,17 @@
+#pragma once
+
+#include "graphics/shader/recompiler/ir/ShaderIR.h"
+
+#include <cstdint>
+#include <span>
+
+namespace Libs::Graphics::ShaderRecompiler::IR {
+
+constexpr uint32_t OracleRemaining = 1u;
+constexpr uint32_t OracleForms     = 2u;
+constexpr uint32_t OracleOnly      = 4u;
+
+[[nodiscard]] bool OracleLaneWalk(std::span<Inst* const> walk);
+uint32_t           MarkOracleWalk(std::span<Inst* const> walk);
+
+}

@@ -10,7 +10,9 @@ using KytyShim::NativeRt::Decide;
 using KytyShim::NativeRt::DeviceSupport;
 using KytyShim::NativeRt::MissingSupport;
 using KytyShim::NativeRt::Mode;
+using KytyShim::NativeRt::OracleLine;
 using KytyShim::NativeRt::ParseMode;
+using KytyShim::NativeRt::ParseOracle;
 using KytyShim::NativeRt::Verdict;
 
 int failures = 0;
@@ -98,6 +100,30 @@ void OffMode() {
     Expect(inconsistent.verdict == Verdict::Refused, "ray queries on a device KYTY_NATIVE_RT=0 created stop the run");
 }
 
+void Oracle() {
+    Expect(ParseOracle(nullptr) == KytyShim::NativeRt::DefaultOracle, "an unset KYTY_RT_ORACLE takes the default");
+    Expect(ParseOracle("") == KytyShim::NativeRt::DefaultOracle, "an empty KYTY_RT_ORACLE takes the default");
+    Expect(KytyShim::NativeRt::DefaultOracle == 0u, "the oracle stays off by default until the differential check passes");
+    Expect(ParseOracle("0") == 0u, "KYTY_RT_ORACLE=0 turns the oracle off");
+    Expect(ParseOracle("1") == KytyShim::NativeRt::OracleRemaining, "KYTY_RT_ORACLE=1 serves the walks no form recognizes");
+    Expect(ParseOracle("5") == (KytyShim::NativeRt::OracleRemaining | KytyShim::NativeRt::OracleOnly), "KYTY_RT_ORACLE=5 skips the forms");
+    Expect(ParseOracle("7") == 7u, "KYTY_RT_ORACLE=7 is accepted");
+    Expect(!ParseOracle("8").has_value(), "KYTY_RT_ORACLE=8 is refused");
+    Expect(!ParseOracle("01").has_value(), "KYTY_RT_ORACLE=01 is refused");
+    Expect(!ParseOracle("-1").has_value(), "KYTY_RT_ORACLE=-1 is refused");
+    Expect(!ParseOracle("on").has_value(), "KYTY_RT_ORACLE=on is refused");
+    Expect(OracleLine(Verdict::Native, 0).empty(), "no oracle line when the oracle is off");
+    Expect(OracleLine(Verdict::Emulated, 1).empty(), "no oracle line when ray tracing is emulated");
+    Expect(OracleLine(Verdict::Refused, 1).empty(), "no oracle line when native ray tracing is refused");
+    const auto remaining = OracleLine(Verdict::Native, 1);
+    Expect(Has(remaining, "the walks no form recognizes") && Has(remaining, "KYTY_RT_ORACLE=1"), "the oracle line names what it serves and the setting");
+    Expect(Has(OracleLine(Verdict::Native, 3), "every recognized walk"), "KYTY_RT_ORACLE=3 serves every recognized walk");
+    Expect(Has(OracleLine(Verdict::Native, 2), "the walks a form recognizes"), "KYTY_RT_ORACLE=2 serves the walks of the forms");
+    Expect(Has(OracleLine(Verdict::Native, 5), "without trying the walk forms"), "KYTY_RT_ORACLE=5 says the forms are skipped");
+    Expect(Has(OracleLine(Verdict::Native, 4), "every BVH walk runs emulated"), "KYTY_RT_ORACLE=4 says nothing is served");
+    Expect(Has(OracleLine(Verdict::Native, 6), "every BVH walk runs emulated"), "KYTY_RT_ORACLE=6 says nothing is served");
+}
+
 }
 
 int main() {
@@ -106,6 +132,7 @@ int main() {
     AutoMode();
     RequiredMode();
     OffMode();
+    Oracle();
     if (failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

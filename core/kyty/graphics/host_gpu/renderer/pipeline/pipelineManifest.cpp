@@ -3755,6 +3755,7 @@ void PipelineCache::BuildManifestModule(uint32_t index, std::span<const uint32_t
 	options.emit_debug_info    = Config::GraphicsDebugDumpEnabled();
 	options.native_ray_tracing = native;
 	options.ray_stats          = native && Config::RayTracingStatsEnabled();
+	options.rt_oracle          = native ? Config::RayTracingOracle() : 0u;
 	std::vector<uint32_t> spirv;
 	std::vector<uint32_t> plain_spirv;
 

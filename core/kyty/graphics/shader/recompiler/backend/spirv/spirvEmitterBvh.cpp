@@ -345,7 +345,9 @@ void DefineBvhIntersect(EmitterState& s) {
 uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	const auto* ray = ctx.ImageAddress(inst.Arg(1));
-	const auto node_words = inst.Flags<uint32_t>() & ~IR::BvhIntersectNative;
+	const auto node_words =
+	    inst.Flags<uint32_t>() & ~(IR::BvhIntersectNative | IR::BvhIntersectOracle | IR::BvhIntersectOracleLane);
+	if ((inst.Flags<uint32_t>() & IR::BvhIntersectOracle) != 0 && s.oracle.lanes[0].state != 0) return EmitBvhOracle(ctx, inst);
 	if (ray == nullptr || (node_words != 1u && node_words != 2u) ||
 	    ray->NumArgs() < node_words + 10u || s.bvh_intersect_function == 0)
 		ctx.Fail(inst, "BVH intersection requires its node pointer, ray components and shared function");

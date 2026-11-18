@@ -3,6 +3,7 @@
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
+#include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
 
 #include <algorithm>
 #include <array>
@@ -186,6 +187,7 @@ struct Traversal: Loop {
 	const Inst* root       = nullptr;
 	const Inst* blas       = nullptr;
 	bool        packed     = false;
+	bool        masked     = true;
 	uint32_t    mask_shift = 8;
 	uint32_t    mask_width = 0;
 	Value       mask_value;
@@ -314,11 +316,28 @@ bool MatchLoop(const Program& program, Inst& bvh, Value extent, Traversal& t) {
 	return true;
 }
 
-bool Match(const Program& program, Inst& bvh, Traversal& t, bool tracked = true) {
+bool EnterLoose(const Program& program, Inst& bvh, Value extent, Traversal& t) {
+	if (!Enter(program, EnclosingLoop(program, bvh.Parent()), t)) return false;
+	t.bvh  = &bvh;
+	t.exec = SkippedType(t, bvh.Arg(2));
+	std::vector<Value> pending {bvh.Arg(2)};
+	for (size_t at = 0; at < pending.size() && at < 16 && t.exec == nullptr; ++at) {
+		t.exec = HeaderPhi(t, pending[at]);
+		if (const auto* both = Producer(pending[at], ValueOpcode::LogicalAnd); both != nullptr && t.exec == nullptr) {
+			pending.push_back(both->Arg(0));
+			pending.push_back(both->Arg(1));
+		}
+	}
+	t.extent = HeaderPhi(t, extent);
+	return t.exec != nullptr;
+}
+
+bool Match(const Program& program, Inst& bvh, Traversal& t, bool tracked = true, bool loose = false) {
 	const auto* descriptor = Producer(bvh.Arg(0), ValueOpcode::CompositeConstructU32x4);
 	const auto* address    = Producer(bvh.Arg(1), ValueOpcode::MakeImageAddress);
 	if (descriptor == nullptr || address == nullptr || bvh.Flags<uint32_t>() != 2u ||
-	    !MatchLoop(program, bvh, address->Arg(2), t) || (tracked && t.skip_type != NoField)) {
+	    !(loose ? EnterLoose(program, bvh, address->Arg(2), t) : MatchLoop(program, bvh, address->Arg(2), t)) ||
+	    (tracked && t.skip_type != NoField)) {
 		return false;
 	}
 	for (uint32_t word = 0; word < 4; ++word) {
@@ -339,7 +358,7 @@ bool Match(const Program& program, Inst& bvh, Traversal& t, bool tracked = true)
 		t.ray[(arg + 4) % 7] = Entry(t, *ray);
 	}
 
-	const auto  exec  = t.skip_type != NoField ? bvh.Arg(2) : Value(t.exec);
+	const auto  exec  = loose || t.skip_type != NoField ? bvh.Arg(2).Resolve() : Value(t.exec);
 	const auto  lanes = Entry(t, *t.exec);
 	const auto* sum   = Producer(ResolveActiveU32(address->Arg(0), exec), ValueOpcode::IAdd32);
 	if (sum == nullptr) return false;
@@ -414,6 +433,7 @@ bool Match(const Program& program, Inst& bvh, Traversal& t, bool tracked = true)
 		for (auto [load, offset]: {std::pair {&root, InstanceRoot}, std::pair {&word0, 0u}}) {
 			if (!GlobalLoad(program, *inst, offset)) continue;
 			if (t.skip_type != NoField && load == &word0 && !paired(inst)) continue;
+			if (*load != nullptr && loose && (*load)->Arg(1) == inst->Arg(1) && (*load)->Arg(2) == inst->Arg(2)) continue;
 			if (*load != nullptr) return false;
 			*load = inst;
 		}
@@ -584,6 +604,10 @@ bool Match(const Program& program, Inst& bvh, Traversal& t, bool tracked = true)
 				taking.push_back(use.user);
 			}
 		}
+	}
+	if (!bit && loose) {
+		t.masked = false;
+		return true;
 	}
 	if (!bit) return false;
 	if (width != 0 || !ray_mask.IsEmpty()) {
@@ -1580,6 +1604,9 @@ struct LaneMaskWalk {
 	AddressLoad           record;
 	RayTracingLayout      layout;
 	NativeTraversals      source;
+	Value                 anchor_root;
+	const Inst*           anchor_intersect = nullptr;
+	uint32_t              refused          = 0;
 };
 
 Value RayMask(const LaneMaskWalk& w) {
@@ -1642,7 +1669,8 @@ std::optional<std::pair<uint32_t, bool>> TypeTest(Value condition, const Inst* n
 		const auto* bits = Producer(test->Arg(1 - side), ValueOpcode::BitwiseAnd32);
 		if (!type || *type >= 8u || bits == nullptr) continue;
 		for (uint32_t b = 0; b < 2; ++b) {
-			if (Immediate(bits->Arg(b)) == 7u && bits->Arg(1 - b).Resolve() == Value(const_cast<Inst*>(node)))
+			if (Immediate(bits->Arg(b)) == 7u &&
+			    (node == nullptr || bits->Arg(1 - b).Resolve() == Value(const_cast<Inst*>(node))))
 				return std::pair {*type, test->GetOpcode() == ValueOpcode::IEqual32};
 		}
 	}
@@ -1794,11 +1822,19 @@ std::optional<AddressLoad> RootRecord(const Program& program, Value root) {
 
 bool TlasNodeCount80(const Program& program, const LaneMaskWalk& s);
 
+bool Refuse(LaneMaskWalk& w, uint32_t line) {
+	w.refused = line;
+	return false;
+}
+
 bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 	auto& layout = w.layout;
 	Value       root_value;
 	const Inst* intersect = nullptr;
-	if (!w.blases.empty()) {
+	if (!w.anchor_root.IsEmpty()) {
+		root_value = w.anchor_root;
+		intersect  = w.anchor_intersect;
+	} else if (!w.blases.empty()) {
 		const auto& blas = w.blases.front();
 		root_value       = IncomingValue(*blas.node, blas.preheader);
 		for (const auto& use: blas.node->Uses()) {
@@ -1828,7 +1864,7 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 			inline_root = *constant;
 		}
 	}
-	if (!root || intersect == nullptr) return false;
+	if (!root || intersect == nullptr) return Refuse(w, __LINE__);
 	AddressLoad record_pair = *root;
 	const auto  inline_phi  = [&](const Inst* phi, uint32_t k) {
 		const auto* fixed = phi->NumArgs() == 2 ? Producer(phi->Arg(k), ValueOpcode::IAdd32) : nullptr;
@@ -1843,10 +1879,11 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 			layout.inline_root   = inline_root;
 			return true;
 		}
-		return false;
+		return Refuse(w, __LINE__);
 	};
 	const auto* sum = Producer(root->low, ValueOpcode::IAdd32);
-	if (const auto* phi = Producer(root->low, ValueOpcode::Phi); phi != nullptr && inline_root != NoField) {
+	if (const auto* phi = Producer(root->low, ValueOpcode::Phi);
+	    phi != nullptr && (inline_root != NoField || !w.anchor_root.IsEmpty())) {
 		for (uint32_t k = 0; k < 2 && sum == nullptr; ++k) {
 			if (inline_phi(phi, k)) sum = Producer(phi->Arg(1 - k), ValueOpcode::IAdd32);
 		}
@@ -1862,7 +1899,7 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 			break;
 		}
 	}
-	if (sum == nullptr) return false;
+	if (sum == nullptr) return Refuse(w, __LINE__);
 	w.record   = record_pair;
 	bool found = false;
 	for (uint32_t side = 0; side < 2 && !found; ++side) {
@@ -1878,20 +1915,20 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 		uint32_t   stride = 0;
 		if (index != nullptr && Immediate(part->Arg(1)) == 0u && Immediate(wide->Arg(1)) == 0u &&
 		    Immediate(index->Arg(1)) == 3u && bits && *bits >= 7u && *bits <= 8u &&
-		    LoopPhi(index->Arg(0), w.header) == w.node) {
+		    (w.node == nullptr || LoopPhi(index->Arg(0), w.header) == w.node)) {
 			stride = 1u << *bits;
 		} else if (const auto* mul = Producer(sum->Arg(side), ValueOpcode::IMul32); mul != nullptr) {
 			for (uint32_t m = 0; m < 2; ++m) {
 				const auto  scaled = Immediate(mul->Arg(m));
 				const auto* by     = Producer(mul->Arg(1 - m), ValueOpcode::ShiftRightLogical32);
-				if (scaled && by != nullptr && Immediate(by->Arg(1)) == 3u && LoopPhi(by->Arg(0), w.header) == w.node &&
+				if (scaled && by != nullptr && Immediate(by->Arg(1)) == 3u && (w.node == nullptr || LoopPhi(by->Arg(0), w.header) == w.node) &&
 				    *scaled % 32u == 0 && *scaled >= 128u && *scaled <= 224u)
 					stride = *scaled;
 			}
 		}
 		if (stride == 0) continue;
 		const auto* base = Producer(sum->Arg(1 - side), ValueOpcode::IAdd32);
-		if (base == nullptr) return false;
+		if (base == nullptr) return Refuse(w, __LINE__);
 		for (uint32_t b = 0; b < 2 && !found; ++b) {
 			const auto offset = LoadOf(program, base->Arg(b));
 			if (offset && base->Arg(1 - b).Resolve() == w.tlas[0] && offset->low == w.tlas[0] &&
@@ -1902,7 +1939,7 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 			}
 		}
 	}
-	if (!found || (root->offset & 3u) != 0) return false;
+	if (!found || (root->offset & 3u) != 0) return Refuse(w, __LINE__);
 	const auto record = [&](Value value) -> std::optional<uint32_t> {
 		const auto load = LoadOf(program, value);
 		if (!load || !((load->low == root->low && load->high == root->high) ||
@@ -1922,16 +1959,16 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 		direction.fill(NoDword);
 		if (!Expand(intersect->Arg(2 + row), world, record, origin) ||
 		    !Expand(intersect->Arg(5 + row), world, record, direction)) {
-			return false;
+			return Refuse(w, __LINE__);
 		}
 		for (uint32_t c = 0; c < 3; ++c) {
 			if (origin[c] == NoDword || origin[4 + c] != NoDword || direction[4 + c] != origin[c] ||
 			    direction[c] != NoDword) {
-				return false;
+				return Refuse(w, __LINE__);
 			}
 			layout.transform[row * 4 + c] = static_cast<uint8_t>(origin[c]);
 		}
-		if (origin[3] == NoDword || direction[3] != NoDword) return false;
+		if (origin[3] == NoDword || direction[3] != NoDword) return Refuse(w, __LINE__);
 		layout.transform[row * 4 + 3] = static_cast<uint8_t>(origin[3]);
 	}
 	const Inst* blas_bvh = nullptr;
@@ -1942,22 +1979,22 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 	                        ? Producer(blas_bvh->Arg(0), ValueOpcode::CompositeConstructU32x4)
 	                        : nullptr;
 	const auto* base  = words != nullptr ? DescriptorAddress(words->Arg(0)) : nullptr;
-	if (base == nullptr) return false;
+	if (base == nullptr) return Refuse(w, __LINE__);
 	const auto* pair = base;
 	if (base->GetOpcode() == ValueOpcode::ShiftLeftLogical64) {
-		if (Immediate(base->Arg(1)) != 3u) return false;
+		if (Immediate(base->Arg(1)) != 3u) return Refuse(w, __LINE__);
 		pair               = base->Arg(0).Resolve().TryInstruction();
 		layout.blas_packed = true;
 	}
-	if (pair == nullptr || pair->GetOpcode() != ValueOpcode::CompositeConstructU64) return false;
+	if (pair == nullptr || pair->GetOpcode() != ValueOpcode::CompositeConstructU64) return Refuse(w, __LINE__);
 	const auto low  = record(pair->Arg(0));
 	auto       high = pair->Arg(1);
 	if (layout.blas_packed) {
 		const auto* masked = Producer(high, ValueOpcode::BitwiseAnd32);
-		if (masked == nullptr) return false;
+		if (masked == nullptr) return Refuse(w, __LINE__);
 		high = Immediate(masked->Arg(1)) == 0x3fffffu ? masked->Arg(0) : masked->Arg(1);
 	}
-	if (!low || record(high) != *low + 1u) return false;
+	if (!low || record(high) != *low + 1u) return Refuse(w, __LINE__);
 	layout.blas_dword = *low;
 	Value size = words->Arg(2);
 	if (const auto* part = Producer(size, ValueOpcode::CompositeExtractU64);
@@ -1973,7 +2010,7 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 		size = Immediate(add->Arg(0)) ? add->Arg(1) : add->Arg(0);
 	}
 	const auto count = LoadOf(program, size);
-	if (!count || (count->offset != 80u && count->offset != 88u)) return false;
+	if (!count || (count->offset != 80u && count->offset != 88u)) return Refuse(w, __LINE__);
 	layout.node_count_80 = count->offset == 80u && (layout.inline_type == NoField || TlasNodeCount80(program, w));
 	bool masked  = false;
 	w.mask_value = {};
@@ -1996,7 +2033,7 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 						continue;
 					}
 					if (masked && (layout.mask_dword != *dword || layout.mask_shift != *shift || w.mask_value != value.Resolve()))
-						return false;
+						return Refuse(w, __LINE__);
 					layout.mask_dword = *dword;
 					layout.mask_shift = *shift;
 					layout.mask_width = 0;
@@ -2040,7 +2077,7 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 				if (!bits || *bits == 0u ||
 				    (!above && std::ranges::none_of(test->Uses(), [&](const Use& u) {
 					     const auto op = u.user->GetOpcode();
-					     if (op != ValueOpcode::INotEqual32 && !(bit && op == ValueOpcode::IEqual32)) return false;
+					     if (op != ValueOpcode::INotEqual32 && !(bit && op == ValueOpcode::IEqual32)) return Refuse(w, __LINE__);
 					     const auto other = Immediate(u.user->Arg(1 - u.operand));
 					     return ((op == ValueOpcode::INotEqual32 && other == 0u) ||
 					             (bit && op == ValueOpcode::IEqual32 && other == 1u)) &&
@@ -2058,7 +2095,7 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 				if ((masked && (layout.mask_dword != *dword || layout.mask_shift != shift ||
 				                layout.mask_width != width || w.cull_mask != mask)) ||
 				    mask > 0xffu) {
-					return false;
+					return Refuse(w, __LINE__);
 				}
 				layout.mask_dword = *dword;
 				layout.mask_shift = shift;
@@ -2070,7 +2107,7 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 	}
 	w.masked = masked;
 	if (!masked) {
-		if (!w.mask_optional) return false;
+		if (!w.mask_optional) return Refuse(w, __LINE__);
 		layout.mask_dword = NoField;
 		layout.mask_shift = 0;
 		layout.mask_width = 0;
@@ -3071,6 +3108,22 @@ bool TlasNodeCount80(const Program& program, const LaneMaskWalk& s) {
 	                                          Immediate(less->Arg(1)) == 0xffffffffu);
 	const auto  count    = LoadOf(program, less_one ? (Immediate(less->Arg(0)) ? less->Arg(1) : less->Arg(0)) : size);
 	return less_one && count && count->offset == 80u;
+}
+
+std::optional<bool> TlasNodeCountAt80(const Program& program, const LaneMaskWalk& s) {
+	Value size = Producer(s.bvh->Arg(0), ValueOpcode::CompositeConstructU32x4)->Arg(2);
+	if (const auto* part = Producer(size, ValueOpcode::CompositeExtractU64);
+	    part != nullptr && Immediate(part->Arg(1)) == 0u) {
+		const auto* masked = Producer(part->Arg(0), ValueOpcode::BitwiseAnd64);
+		const auto* wide =
+		    masked != nullptr ? Producer(masked->Arg(0), ValueOpcode::CompositeConstructU64) : nullptr;
+		if (wide != nullptr) size = wide->Arg(0);
+	}
+	const auto* less     = Producer(size, ValueOpcode::IAdd32);
+	const bool  less_one = less != nullptr && (Immediate(less->Arg(0)) == 0xffffffffu ||
+	                                          Immediate(less->Arg(1)) == 0xffffffffu);
+	const auto  count    = LoadOf(program, less_one ? (Immediate(less->Arg(0)) ? less->Arg(1) : less->Arg(0)) : size);
+	return count ? std::optional(less_one && count->offset == 80u) : std::nullopt;
 }
 
 Value Strip(Value value) {
@@ -5085,9 +5138,9 @@ bool RangeOnlyHit(const Traversal& t, Value hit) {
 	return true;
 }
 
-bool MatchFlatWalk(Program& program, Inst& bvh, PacketWalk& w) {
+bool MatchFlatWalk(Program& program, Inst& bvh, PacketWalk& w, bool source_only = false) {
 	Traversal t;
-	if (!Match(program, bvh, t, false)) return false;
+	if (!Match(program, bvh, t, false) && !(source_only && Match(program, bvh, t = {}, false, true))) return false;
 	auto& s = w.shape;
 	if (!LoopShape(t.header, w.preheader, w.latch, w.merge) || w.preheader != t.preheader || w.latch != t.latch)
 		return false;
@@ -5236,13 +5289,13 @@ bool MatchFlatWalk(Program& program, Inst& bvh, PacketWalk& w) {
 	const auto root_dword = record(Value(const_cast<Inst*>(t.root)));
 	const auto blas_dword = record(Value(const_cast<Inst*>(t.blas)));
 	const auto mask_dword = record(Value(const_cast<Inst*>(t.loads[2])));
-	if (!root_dword || !blas_dword || !mask_dword) return false;
+	if (!root_dword || !blas_dword || (t.masked && !mask_dword)) return false;
 	layout.root_dword  = *root_dword;
 	layout.blas_dword  = *blas_dword;
 	layout.blas_packed = t.packed;
-	layout.mask_dword  = *mask_dword;
-	layout.mask_shift  = t.mask_shift;
-	layout.mask_width  = t.mask_width;
+	layout.mask_dword  = t.masked ? *mask_dword : NoField;
+	layout.mask_shift  = t.masked ? t.mask_shift : 0u;
+	layout.mask_width  = t.masked ? t.mask_width : 0u;
 	layout.flags_dword = NoField;
 	layout.inline_type = NoField;
 	layout.node_count_80 = !t.packed;
@@ -5253,13 +5306,14 @@ bool MatchFlatWalk(Program& program, Inst& bvh, PacketWalk& w) {
 		layout.node_count_80 = false;
 	}
 	layout.valid         = true;
-	s.cull_mask          = t.cull_mask;
+	s.cull_mask          = t.masked ? t.cull_mask : 0xffu;
 	s.mask_value         = t.mask_value;
-	s.masked             = true;
+	s.masked             = t.masked;
 	if (!DeriveHeaderSource(program, s)) return false;
 	s.source.root   = *root;
 	s.source.layout = layout.Pack();
 	if (!WalkReach(program, w.header, w.latch, w.merge->start_pc, s.source)) return false;
+	if (source_only) return true;
 	Value hit;
 	for (auto at = BlockIndex(program, w.header); at <= BlockIndex(program, w.latch); ++at) {
 		for (auto& inst: *program.blocks[at]) {
@@ -5501,6 +5555,200 @@ void RewriteClosestLaneWalk(Program& program, PacketWalk& w, uint32_t site) {
 
 }
 
+Block* OutermostLoop(const Program& program, const Block* block) {
+	Block* loop = EnclosingLoop(program, block);
+	while (loop != nullptr) {
+		const auto at    = BlockIndex(program, loop);
+		const auto end   = BlockIndex(program, loop->terminator.continue_block);
+		Block*     outer = nullptr;
+		for (auto header = at; header-- > 0 && outer == nullptr;) {
+			const auto& term = program.blocks[header]->terminator;
+			if (term.loop_header && term.continue_block != nullptr && BlockIndex(program, term.continue_block) >= end) {
+				outer = program.blocks[header];
+			}
+		}
+		if (outer == nullptr) break;
+		loop = outer;
+	}
+	return loop;
+}
+
+bool ReachesNode(const Inst& from) {
+	std::unordered_set<const Inst*> seen {&from};
+	std::vector<const Inst*>        pending {&from};
+	while (!pending.empty() && seen.size() < 4096) {
+		const auto* value = pending.back();
+		pending.pop_back();
+		for (const auto& use: value->Uses()) {
+			const auto op = use.user->GetOpcode();
+			if (op == ValueOpcode::MakeImageAddress && use.operand == 0) return true;
+			const bool carried = op == ValueOpcode::Phi || (op == ValueOpcode::SelectU32 && use.operand != 0) ||
+			                     (op == ValueOpcode::WriteLane && use.operand <= 1) ||
+			                     (op == ValueOpcode::ReadLane && use.operand == 0);
+			if (carried && seen.insert(use.user).second) pending.push_back(use.user);
+		}
+	}
+	return false;
+}
+
+std::optional<uint32_t> ConstantRoot(Value node) {
+	std::unordered_set<const Inst*> seen;
+	std::vector<Value>              pending {node};
+	std::optional<uint32_t>         root;
+	while (!pending.empty() && seen.size() < 4096) {
+		const auto value = pending.back().Resolve();
+		pending.pop_back();
+		if (const auto constant = Immediate(value); constant) {
+			if (*constant == 0xffffffffu || ((*constant & 7u) != 4u && (*constant & 7u) != 5u)) continue;
+			if (root && *root != *constant) return std::nullopt;
+			root = constant;
+			continue;
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr || !seen.insert(inst).second) continue;
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::Phi) {
+			for (size_t arg = 0; arg < inst->NumArgs(); ++arg) pending.push_back(inst->Arg(arg));
+		} else if (op == ValueOpcode::SelectU32) {
+			pending.push_back(inst->Arg(1));
+			pending.push_back(inst->Arg(2));
+		} else if (op == ValueOpcode::ReadLane) {
+			pending.push_back(inst->Arg(0));
+		} else if (op == ValueOpcode::WriteLane) {
+			pending.push_back(inst->Arg(0));
+			pending.push_back(inst->Arg(1));
+		}
+	}
+	return root;
+}
+
+const char* MatchUniversalWalk(Program& program, std::span<Inst* const> candidates, LaneMaskWalk& s,
+                               std::vector<std::pair<Block*, Block*>>& loops) {
+	Block *header = nullptr, *latch = nullptr;
+	struct Site {
+		Inst*                bvh     = nullptr;
+		const Inst*          address = nullptr;
+		const Inst*          base    = nullptr;
+		std::array<Value, 2> tlas {};
+	};
+	std::vector<Site>           tops, nested;
+	std::optional<LaneMaskWalk> named;
+	for (auto* bvh: candidates) {
+		const auto* descriptor = Producer(bvh->Arg(0), ValueOpcode::CompositeConstructU32x4);
+		const auto* address    = Producer(bvh->Arg(1), ValueOpcode::MakeImageAddress);
+		if (descriptor == nullptr || address == nullptr) return "an intersection has no composed descriptor";
+		if ((bvh->Flags<uint32_t>() & 0xffu) != 1u) return "an intersection takes a 64-bit node pointer";
+		const auto* base = DescriptorAddress(descriptor->Arg(0));
+		if (base == nullptr) return "a descriptor base is not an address";
+		if (base->GetOpcode() == ValueOpcode::CompositeConstructU64) {
+			LaneMaskWalk probe;
+			probe.tlas = {base->Arg(0).Resolve(), base->Arg(1).Resolve()};
+			if (DeriveHeaderSource(program, probe)) {
+				if (named && (named->source.user_sgpr != probe.source.user_sgpr ||
+				              named->source.header_offset != probe.source.header_offset ||
+				              named->source.header_vsharp != probe.source.header_vsharp)) {
+					return "several top-level structures";
+				}
+				named = probe;
+				tops.push_back({bvh, address, base, probe.tlas});
+				continue;
+			}
+		}
+		nested.push_back({bvh, address, base});
+	}
+	if (tops.empty()) return "no intersection reads a structure named by the user data";
+	if (nested.empty()) return "one intersection serves both levels";
+	header = OutermostLoop(program, tops.front().bvh->Parent());
+	Block *preheader = nullptr, *merge = nullptr;
+	if (!LoopShape(header, preheader, latch, merge)) return "the top-level intersection is not in a natural loop";
+	const auto root = ConstantRoot(tops.front().address->Arg(0));
+	if (!root) return "the top-level root is not one constant";
+	s.source        = named->source;
+	s.bvh           = tops.front().bvh;
+	s.header        = header;
+	s.preheader     = preheader;
+	s.latch         = latch;
+	s.merge         = merge;
+	s.mask_optional = true;
+	std::vector<Inst*> roots;
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			const bool number = std::ranges::any_of(inst.Uses(), [](const Use& use) {
+				return use.user->GetOpcode() == ValueOpcode::BitCastF32U32;
+			});
+			if (inst.GetOpcode() == ValueOpcode::LoadAddressU32 && !number && LoadOf(program, Value(&inst)) &&
+			    ReachesNode(inst)) {
+				roots.push_back(&inst);
+			}
+		}
+	}
+	uint32_t refused = 0;
+	bool     found   = false;
+	for (const auto& site: nested) {
+		const auto* pair = site.base;
+		if (pair->GetOpcode() == ValueOpcode::ShiftLeftLogical64) pair = pair->Arg(0).Resolve().TryInstruction();
+		if (pair == nullptr || pair->GetOpcode() != ValueOpcode::CompositeConstructU64) continue;
+		const auto* low = pair->Arg(0).Resolve().TryInstruction();
+		for (const auto& top: tops) {
+			for (auto* root: roots) {
+				if (found || root == low) continue;
+				auto trial             = s;
+				trial.tlas             = top.tlas;
+				trial.anchor_root      = Value(root);
+				trial.anchor_intersect = site.address;
+				for (uint32_t arg = 1; arg < 8; ++arg) {
+					trial.ray[(arg + 5) % 7] = top.address->Arg(arg);
+				}
+				for (const auto& use: root->Uses()) {
+					const auto op = use.user->GetOpcode();
+					const bool inlined =
+					    (op == ValueOpcode::SelectU32 && use.operand != 0 && Immediate(use.user->Arg(3 - use.operand))) ||
+					    (op == ValueOpcode::Phi && use.user->NumArgs() == 2 && Immediate(use.user->Arg(1 - use.operand)));
+					if (inlined) trial.anchor_root = Value(use.user);
+				}
+				const bool derived = DeriveLaneLayout(program, trial);
+				const auto field   = static_cast<uint8_t>(trial.layout.root_dword);
+				if (derived && std::ranges::find(trial.layout.transform, field) == trial.layout.transform.end() &&
+				    trial.layout.root_dword != trial.layout.blas_dword && trial.layout.root_dword != trial.layout.blas_dword + 1u) {
+					s                       = trial;
+					s.bvh                   = top.bvh;
+					if (const auto named = TlasNodeCountAt80(program, s); named) s.layout.node_count_80 = *named;
+					found                   = true;
+				} else {
+					refused = std::max(refused, trial.refused);
+				}
+			}
+		}
+	}
+	if (!found) {
+		s.refused = refused;
+		return refused != 0 ? "the instance record layout is not derived" : "no nested intersection reads an instance record";
+	}
+	s.source.root   = *root;
+	s.source.layout = s.layout.Pack();
+	if (!WalkReach(program, header, latch, merge->start_pc, s.source)) return "the walk has no code range";
+	loops.emplace_back(header, latch);
+	for (const auto& top: tops) {
+		Block *     other = OutermostLoop(program, top.bvh->Parent()), *pre = nullptr, *end = nullptr, *out = nullptr;
+		if (std::ranges::any_of(loops, [&](const auto& loop) { return loop.first == other; })) continue;
+		if (!LoopShape(other, pre, end, out) || ConstantRoot(top.address->Arg(0)) != root) {
+			return "a top-level intersection is not in a natural loop of the same root";
+		}
+		NativeTraversals range;
+		if (!WalkReach(program, other, end, out->start_pc, range)) return "a walk has no code range";
+		s.source.reach.insert(s.source.reach.end(), range.reach.begin(), range.reach.end());
+		loops.emplace_back(other, end);
+	}
+	for (const auto& site: nested) {
+		if (std::ranges::none_of(loops, [&](const auto& loop) {
+			    return InLoop(program, site.bvh->Parent(), loop.first, loop.second);
+		    })) {
+			return "an intersection is outside every top-level walk";
+		}
+	}
+	return nullptr;
+}
+
 NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOptions& options) {
 	NativeTraversals result;
 	if (program.stage != ShaderType::Compute) return result;
@@ -5513,7 +5761,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 	const auto mark = [](Inst* bvh) {
 		bvh->SetFlags(bvh->Flags<uint32_t>() | BvhIntersectNative);
 	};
-	enum class Kind { Entry, ClosestLane, ClosestOpaque, ClosestLeaf, PacketLane, Flat, LaneMask, Candidate };
+	enum class Kind { Entry, ClosestLane, ClosestOpaque, ClosestLeaf, PacketLane, Flat, LaneMask, Candidate, Universal };
 	struct Walk {
 		Kind         kind = Kind::LaneMask;
 		PacketWalk   packet;
@@ -5521,7 +5769,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		Block*       header = nullptr;
 		Block*       latch  = nullptr;
 
-		LaneMaskWalk& Shape() { return kind == Kind::LaneMask ? lane : packet.shape; }
+		LaneMaskWalk& Shape() { return kind == Kind::LaneMask || kind == Kind::Universal ? lane : packet.shape; }
 	};
 	std::vector<Walk> walks;
 	const auto        inside = [&](const Block* block) {
@@ -5530,7 +5778,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		});
 	};
 	for (auto* bvh: intersections) {
-		if (inside(bvh->Parent())) continue;
+		if (inside(bvh->Parent()) || (options.oracle & OracleOnly) != 0) continue;
 		Walk walk;
 		bool found = false;
 		if (MatchPacketWalk(program, *bvh, walk.packet)) {
@@ -5570,6 +5818,40 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		}
 		if (found) walks.push_back(std::move(walk));
 	}
+	if ((options.oracle & OracleRemaining) != 0) {
+		std::vector<Inst*> left;
+		for (auto* bvh: intersections) {
+			if (!inside(bvh->Parent())) left.push_back(bvh);
+		}
+		for (auto* bvh: left) {
+			Walk walk;
+			if (inside(bvh->Parent()) || !MatchFlatWalk(program, *bvh, walk.packet, true)) continue;
+			walk.kind      = Kind::Universal;
+			walk.lane      = walk.packet.shape;
+			walk.header    = walk.packet.header;
+			walk.latch     = walk.packet.latch;
+			walks.push_back(std::move(walk));
+		}
+		std::erase_if(left, [&](const Inst* bvh) { return inside(bvh->Parent()); });
+		if (!left.empty()) {
+			Walk                                   walk;
+			std::vector<std::pair<Block*, Block*>> loops;
+			const auto* reason = MatchUniversalWalk(program, left, walk.lane, loops);
+			if (reason == nullptr) {
+				walk.kind = Kind::Universal;
+				for (size_t at = 0; at < loops.size(); ++at) {
+					auto each   = walk;
+					each.header = loops[at].first;
+					each.latch  = loops[at].second;
+					if (at != 0) each.lane.source.reach.clear();
+					walks.push_back(std::move(each));
+				}
+			} else {
+				LOGF("CS universal ray tracing: hash=0x%016llx keeps the guest walk: %s (%u)\n",
+				     static_cast<unsigned long long>(program.shader_hash), reason, walk.lane.refused);
+			}
+		}
+	}
 	if (walks.empty()) return result;
 	auto reference = walks.front().Shape().source;
 	auto lowest    = walks.front().Shape().layout.mask_shift;
@@ -5605,7 +5887,9 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 	if (walks.empty()) return result;
 	result       = walks.front().Shape().source;
 	result.reach = {};
-	const auto sites   = options.rewrite ? std::min<size_t>(walks.size(), MaxRayQuerySites) : 0;
+	std::ranges::stable_partition(walks, [](const Walk& walk) { return walk.kind != Kind::Universal; });
+	const auto shaped  = static_cast<size_t>(std::ranges::count_if(walks, [](const Walk& walk) { return walk.kind != Kind::Universal; }));
+	const auto sites   = options.rewrite ? std::min<size_t>(shaped, MaxRayQuerySites) + (walks.size() - shaped) : 0;
 	const auto covered = sites == walks.size() && std::ranges::all_of(intersections, [&](const Inst* other) {
 		                     return inside(other->Parent());
 	                     });
@@ -5615,9 +5899,24 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			result.reach.insert(result.reach.end(), reach.begin(), reach.end());
 		}
 	}
-	for (size_t at = 0; at < sites; ++at) {
+	for (size_t index = 0; index < sites; ++index) {
+		const auto at   = index < std::min<size_t>(shaped, MaxRayQuerySites) ? index : shaped + (index - std::min<size_t>(shaped, MaxRayQuerySites));
 		auto&      walk = walks[at];
 		const auto site = static_cast<uint32_t>(at);
+		if (walk.kind == Kind::Universal || (options.oracle & OracleForms) != 0) {
+			std::vector<Inst*> served;
+			for (auto* bvh: intersections) {
+				if (InLoop(program, bvh->Parent(), walk.header, walk.latch)) served.push_back(bvh);
+			}
+			if (const auto flags = MarkOracleWalk(served); flags != 0) {
+				LOGF("CS universal ray tracing: hash=0x%016llx answers %zu intersections from the host query (%s mode)\n",
+				     static_cast<unsigned long long>(program.shader_hash), served.size(),
+				     (flags & BvhIntersectOracleLane) != 0 ? "lane" : "wave");
+				++result.sites;
+				continue;
+			}
+		}
+		if (walk.kind == Kind::Universal) continue;
 		switch (walk.kind) {
 			case Kind::Entry: RewriteHitWalk(program, walk.packet, site, true); break;
 			case Kind::ClosestOpaque:
@@ -5627,6 +5926,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			case Kind::ClosestLeaf: RewriteClosestLeafWalk(program, walk.packet, site); break;
 			case Kind::Candidate: RewriteCandidateWalk(program, walk.packet, site); break;
 			case Kind::LaneMask: RewriteLaneMaskWalk(program, walk.lane, site); break;
+			case Kind::Universal: break;
 		}
 		++result.sites;
 		for (auto* bvh: intersections) {

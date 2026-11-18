@@ -290,6 +290,10 @@ bool RayTracingStatsEnabled() {
 	return g_config->native_rt && g_config->rt_stats_enabled;
 }
 
+uint32_t RayTracingOracle() {
+	return g_config->native_rt ? g_config->rt_oracle : 0u;
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }

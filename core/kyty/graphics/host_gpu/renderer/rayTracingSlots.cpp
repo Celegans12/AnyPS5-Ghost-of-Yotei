@@ -308,6 +308,7 @@ struct RtCounter {
 	uint64_t              reported = 0;
 
 	void Add() noexcept { total.store(total.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed); }
+	void Add(uint64_t count) noexcept { total.fetch_add(count, std::memory_order_relaxed); }
 	uint64_t TakeDelta() noexcept {
 		const auto now   = total.load(std::memory_order_relaxed);
 		const auto delta = now - reported;
@@ -333,6 +334,11 @@ struct RtStats {
 	std::atomic<uint64_t>                guest_rays {0};
 	uint64_t                             guest_rays_reported = 0;
 	std::atomic<uint64_t>                last_guest_rays {0};
+	RtCounter                            oracle_returned;
+	RtCounter                            oracle_rays;
+	RtCounter                            oracle_candidates;
+	std::atomic<uint64_t>                last_oracle_returned {0};
+	std::atomic<uint64_t>                last_oracle {0};
 	ShaderRecompiler::RayTracingPrograms programs_reported {};
 	std::atomic<int64_t>                 next_summary_ns {0};
 };
@@ -368,11 +374,15 @@ void SummarizeRayTracing() {
 	const auto rays_total = stats.guest_rays.load(std::memory_order_relaxed);
 	const auto rays       = rays_total - stats.guest_rays_reported;
 	stats.guest_rays_reported  = rays_total;
+	const auto oracle_returned   = stats.oracle_returned.TakeDelta();
+	const auto oracle_rays       = stats.oracle_rays.TakeDelta();
+	const auto oracle_candidates = stats.oracle_candidates.TakeDelta();
+	const auto oracle            = oracle_returned + oracle_rays + oracle_candidates;
 	const auto programs         = ShaderRecompiler::GetRayTracingPrograms();
 	const auto new_unrecognized = programs.unrecognized - stats.programs_reported.unrecognized;
 	const auto new_always_guest = programs.always_guest - stats.programs_reported.always_guest;
 	stats.programs_reported     = programs;
-	if (next == 0 || unrecognized + unpublished + uncached + overflow + rays + new_unrecognized + new_always_guest == 0) {
+	if (next == 0 || unrecognized + unpublished + uncached + overflow + rays + oracle + new_unrecognized + new_always_guest == 0) {
 		return;
 	}
 	const auto log = [](const std::string& line) { ::Log::WriteToConsoleAndLog(line + "\n"); };
@@ -405,6 +415,13 @@ void SummarizeRayTracing() {
 		log(fmt::format("[RT]   {} rays went back to the guest traversal (last cs {})", rays,
 		                RtShader(stats.last_guest_rays.load(std::memory_order_relaxed))));
 	}
+	if (oracle != 0) {
+		log(fmt::format("[RT]   oracle: {} rays answered from host ray queries (last cs {}), {} candidates ({:.2f} per ray), "
+		                "{} box intersections handed back to the guest walk (last cs {})",
+		                oracle_rays, RtShader(stats.last_oracle.load(std::memory_order_relaxed)), oracle_candidates,
+		                oracle_rays != 0 ? static_cast<double>(oracle_candidates) / static_cast<double>(oracle_rays) : 0.0,
+		                oracle_returned, RtShader(stats.last_oracle_returned.load(std::memory_order_relaxed))));
+	}
 	if (new_unrecognized + new_always_guest != 0) {
 		log(fmt::format("[RT]   programs compiled so far: {} traced natively, {} whose BVH walk no form recognizes "
 		                "(last cs {}), {} with sites that always walk the guest BVH (last cs {})",
@@ -420,6 +437,17 @@ void RayTracing::NoteGuestDispatch(GuestDispatch kind, uint64_t shader_hash) noe
 	stats.last_guest[static_cast<size_t>(kind)].store(shader_hash, std::memory_order_relaxed);
 	if ((++stats.guest_calls & 63u) == 0) {
 		SummarizeRayTracing();
+	}
+}
+
+void RayTracing::NoteOracle(uint64_t shader_hash, uint64_t returned, uint64_t rays, uint64_t candidates) {
+	auto& stats = g_rt_stats;
+	stats.oracle_returned.Add(returned);
+	stats.oracle_rays.Add(rays);
+	stats.oracle_candidates.Add(candidates);
+	stats.last_oracle.store(shader_hash, std::memory_order_relaxed);
+	if (returned != 0) {
+		stats.last_oracle_returned.store(shader_hash, std::memory_order_relaxed);
 	}
 }
 
@@ -1404,7 +1432,7 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 
 void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
                                const TlasSource& source, const vk::DescriptorBufferInfo& flattened_srt,
-                               uint64_t frame, uint64_t shader_hash) {
+                               uint64_t frame, uint64_t shader_hash, bool count_rays) {
 	if (!m_enabled) {
 		return;
 	}
@@ -1658,7 +1686,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	    .instance_capacity = tlas_count,
 	    .table_mask        = TableEntries - 1,
 	    .prepare_id        = m_prepare_id,
-	    .verify            = verify ? 1u : 0u,
+	    .verify            = (verify ? 1u : 0u) | (count_rays ? 2u : 0u),
 	    .layout            = source.layout,
 	};
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_tlas_pipeline);

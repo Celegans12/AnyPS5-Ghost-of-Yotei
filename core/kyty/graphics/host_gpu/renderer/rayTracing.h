@@ -84,7 +84,8 @@ public:
 	void NoteTlasInstances(uint32_t count) noexcept { m_next_instances = count; }
 
 	void Prepare(const CommandRecorder& command, uint64_t user_pointer, const TlasSource& source,
-	             const vk::DescriptorBufferInfo& flattened_srt, uint64_t frame, uint64_t shader_hash);
+	             const vk::DescriptorBufferInfo& flattened_srt, uint64_t frame, uint64_t shader_hash,
+	             bool count_rays = false);
 
 	enum class HleTlasFormat : uint32_t {
 		Base460,
@@ -119,6 +120,7 @@ public:
 	enum class GuestDispatch : uint32_t { NullTlas, Unrecognized, Count };
 	static void NoteGuestDispatch(GuestDispatch kind, uint64_t shader_hash) noexcept;
 	static void NoteGuestRays(uint64_t shader_hash, uint64_t rays);
+	static void NoteOracle(uint64_t shader_hash, uint64_t returned, uint64_t rays, uint64_t candidates);
 
 	[[nodiscard]] uint64_t ContextAddress() const noexcept { return m_context_address; }
 

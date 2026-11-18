@@ -660,7 +660,10 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	Decoder::Program traced_source;
 	if (options.stage == ShaderType::Compute) {
 		const auto traced = IR::TraceNativeTraversals(
-		    ir, {.wave_size = options.wave_size, .rewrite = options.native_ray_tracing, .decoded = &decoded});
+		    ir, {.wave_size = options.wave_size,
+		         .rewrite   = options.native_ray_tracing,
+		         .oracle    = options.native_ray_tracing ? options.rt_oracle : 0u,
+		         .decoded   = &decoded});
 		const bool bvh = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
 			return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
 		});

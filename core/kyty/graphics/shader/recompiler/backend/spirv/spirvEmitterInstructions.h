@@ -355,6 +355,7 @@ inline constexpr auto EmitDataConsume           = EmitAppendConsume;
 uint32_t              EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitImage(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvh8Intersect(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvh8Extract(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvhStack(ValueEmitContext& ctx, const IR::Inst& inst);
