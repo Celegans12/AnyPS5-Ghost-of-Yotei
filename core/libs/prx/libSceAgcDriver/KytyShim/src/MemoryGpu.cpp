@@ -224,10 +224,13 @@ bool WalkerProbeEnabled() {
 Graphics::ShaderRecompiler::IR::SrtWalkerPage WalkerGuestPage(uint64_t address, bool ahead, const uint8_t*& backing) {
 	constexpr uint64_t PageSize = 4096;
 	backing = nullptr;
-	if (ahead || !Graphics::GuestGpu::IsGpuThread() || !MayFaultOnGpuRead(address & ~(PageSize - 1), PageSize)) {
+	if (!MayFaultOnGpuRead(address & ~(PageSize - 1), PageSize)) {
 		return Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct;
 	}
-	return Graphics::ShaderRecompiler::IR::SrtWalkerPage::PerLoad;
+	if (!Graphics::GuestGpu::IsGpuThread()) {
+		return ahead ? Graphics::ShaderRecompiler::IR::SrtWalkerPage::PerLoad : Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct;
+	}
+	return ahead ? Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct : Graphics::ShaderRecompiler::IR::SrtWalkerPage::PerLoad;
 }
 
 bool WalkerGuestRead(uint64_t address, uint32_t& value, bool ahead, const uint8_t*) {
