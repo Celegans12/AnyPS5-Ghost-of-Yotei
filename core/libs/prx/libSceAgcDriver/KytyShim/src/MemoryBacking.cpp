@@ -273,6 +273,44 @@ bool FirstClamp(uint64_t vaddr, uint64_t size, uint64_t clamped) {
 	return reported.emplace(vaddr, size, clamped).second;
 }
 
+#ifndef _WIN32
+constexpr uint64_t HostPage = 0x1000;
+
+struct HostWriteHold {
+	uint64_t first = 0;
+	uint64_t end = 0;
+	bool overridden = false;
+};
+
+std::mutex g_host_write_holds_mutex;
+std::vector<HostWriteHold> g_host_write_holds;
+
+HostWriteHold HostPages(uint64_t address, uint64_t bytes) {
+	return {address & ~(HostPage - 1u), (address + bytes + HostPage - 1u) & ~(HostPage - 1u)};
+}
+
+bool HostWriteHeld(uint64_t page) {
+	return std::any_of(g_host_write_holds.begin(), g_host_write_holds.end(), [page](const auto& hold) { return page >= hold.first && page < hold.end; });
+}
+
+bool ProtectHostPages(uint64_t start, uint64_t stop, int protection) {
+	if (g_host_write_holds.empty()) return ::mprotect(reinterpret_cast<void*>(start), stop - start, protection) == 0;
+	while (start < stop) {
+		const bool held = HostWriteHeld(start);
+		auto run_end = start + HostPage;
+		while (run_end < stop && HostWriteHeld(run_end) == held) run_end += HostPage;
+		if (held) {
+			for (auto& hold : g_host_write_holds) {
+				if (hold.first < run_end && start < hold.end) hold.overridden = true;
+			}
+		}
+		if (::mprotect(reinterpret_cast<void*>(start), run_end - start, held ? protection | PROT_READ | PROT_WRITE : protection) != 0) return false;
+		start = run_end;
+	}
+	return true;
+}
+#endif
+
 std::recursive_mutex& HookMutex() {
 	static auto* mutex = new std::recursive_mutex;
 	return *mutex;
@@ -636,6 +674,24 @@ bool ViewEnabled() {
 	return State().enabled.load(std::memory_order_acquire);
 }
 
+#ifndef _WIN32
+void HoldHostWrite(std::uintptr_t address, std::size_t bytes) {
+	std::lock_guard lock(g_host_write_holds_mutex);
+	g_host_write_holds.push_back(HostPages(address, bytes));
+}
+
+bool ReleaseHostWrite(std::uintptr_t address, std::size_t bytes) {
+	const auto pages = HostPages(address, bytes);
+	std::lock_guard lock(g_host_write_holds_mutex);
+	const auto hold = std::find_if(g_host_write_holds.begin(), g_host_write_holds.end(), [&pages](const auto& held) { return held.first == pages.first && held.end == pages.end; });
+	if (hold == g_host_write_holds.end()) return false;
+	const bool overridden = hold->overridden;
+	*hold = g_host_write_holds.back();
+	g_host_write_holds.pop_back();
+	return overridden;
+}
+#endif
+
 bool IsBacked(uint64_t vaddr, uint64_t size) {
 	if (!ValidRange(vaddr, size)) return false;
 	const auto& pages = Pages();
@@ -869,6 +925,8 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 	return true;
 #else
 	if (!writable) GuestArena::GuestArenaNoteHostProtection_nid_no_patch(vaddr, size, false);
+	std::unique_lock<std::mutex> holds;
+	if (!writable) holds = std::unique_lock(g_host_write_holds_mutex);
 	const auto& pages = Pages();
 	const auto first = vaddr & ~uint64_t {0xfff};
 	const auto end = (vaddr + size + 0xfff) & ~uint64_t {0xfff};
@@ -878,7 +936,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 		while (stop < end && (pages.Load(stop >> PageBits) != 0) == mapped) {
 			stop = std::min(end, stop + PageSize);
 		}
-		if (mapped && ::mprotect(reinterpret_cast<void*>(start), stop - start, protection) != 0) return false;
+		if (mapped && !(writable ? ::mprotect(reinterpret_cast<void*>(start), stop - start, protection) == 0 : ProtectHostPages(start, stop, protection))) return false;
 		start = stop;
 	}
 	if (writable) GuestArena::GuestArenaNoteHostProtection_nid_no_patch(vaddr, size, true);

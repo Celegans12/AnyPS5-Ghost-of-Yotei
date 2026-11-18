@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/KytyShim/src/Faults.hpp"
+#include "prx/libSceAgcDriver/KytyShim/src/MemoryShim.hpp"
 
 #include "common/debugCounters.h"
 #include "common/guardedCopy.h"
@@ -124,6 +125,7 @@ bool HandleHostFault(int signal, siginfo_t* info, void* native) {
 }
 
 void InstallFaultChain() {
+    GuestArena::GuestArenaSetHostWriteHold_nid_no_patch(&Libs::LibKernel::Memory::Shim::HoldHostWrite, &Libs::LibKernel::Memory::Shim::ReleaseHostWrite);
     GuestArena::GuestArenaSetHostWritePreparer_nid_no_patch(&PrepareHostWrite);
     GuestWriteWatch::GuestWriteWatchSetGpuFaultHandler_nid_no_patch(&HandleHostFault);
 }
@@ -131,6 +133,7 @@ void InstallFaultChain() {
 void RemoveFaultChain() {
     GuestWriteWatch::GuestWriteWatchSetGpuFaultHandler_nid_no_patch(nullptr);
     GuestArena::GuestArenaSetHostWritePreparer_nid_no_patch(nullptr);
+    GuestArena::GuestArenaSetHostWriteHold_nid_no_patch(nullptr, nullptr);
 }
 #endif
 

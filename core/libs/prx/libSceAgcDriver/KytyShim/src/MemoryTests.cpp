@@ -267,6 +267,74 @@ void TestHostProtectionTable() {
     std::printf("host protection table 0x%llx: noted before write access goes, cleared when it returns, on MAP_FIXED replacement and on unmap\n", static_cast<unsigned long long>(address));
 }
 
+int ReadThroughPipe(void* destination, std::uint64_t value) {
+    int ends[2] = {};
+    Require(pipe(ends) == 0);
+    Require(write(ends[1], &value, sizeof(value)) == sizeof(value));
+    const auto read_bytes = read(ends[0], destination, sizeof(value));
+    const int error = read_bytes == sizeof(value) ? 0 : errno;
+    close(ends[0]);
+    close(ends[1]);
+    return error;
+}
+
+int g_hostWritePreparations = 0;
+
+bool CountHostWritePreparation(std::uintptr_t, std::size_t) {
+    ++g_hostWritePreparations;
+    return true;
+}
+
+void TestHostWriteHold() {
+    void* flexible = nullptr;
+    Require(sceKernelMapFlexibleMemory(&flexible, Page * 2, CpuReadWrite, 0) == 0 && flexible != nullptr);
+    const auto address = Address(flexible);
+    auto* bytes = static_cast<std::uint8_t*>(flexible);
+    const std::uint64_t value = 0x0123456789abcdefull;
+    Require(Memory::ProtectGuestHostMemory(address, Page * 2, Common::VirtualMemory::Mode::Read));
+    Require(ReadThroughPipe(bytes + 8, value) == EFAULT);
+    Require(Memory::ProtectGuestHostMemory(address, Page * 2, Common::VirtualMemory::Mode::ReadWrite));
+
+    GuestArena::GuestArenaSetHostWriteHold_nid_no_patch(&Memory::Shim::HoldHostWrite, &Memory::Shim::ReleaseHostWrite);
+    GuestArena::GuestArenaSetHostWritePreparer_nid_no_patch(&CountHostWritePreparation);
+    {
+        const GuestArena::HostWrite untouched(bytes + 8, sizeof(value));
+    }
+    Require(g_hostWritePreparations == 0);
+    {
+        const GuestArena::HostWrite destination(bytes + 8, sizeof(value));
+        Require(destination.Open());
+        Require(Memory::ProtectGuestHostMemory(address, Page * 2, Common::VirtualMemory::Mode::Read));
+        Require(ReadThroughPipe(bytes + 8, value) == 0);
+        Require(ReadThroughPipe(bytes + Page, value) == EFAULT);
+    }
+    Require(g_hostWritePreparations == 1);
+    std::uint64_t back = 0;
+    std::memcpy(&back, bytes + 8, sizeof(back));
+    Require(back == value);
+    Require(Memory::ProtectGuestHostMemory(address, Page, Common::VirtualMemory::Mode::Read));
+    Require(ReadThroughPipe(bytes + 8, value) == EFAULT);
+    Require(Memory::ProtectGuestHostMemory(address, Page, Common::VirtualMemory::Mode::ReadWrite));
+
+    {
+        const GuestArena::HostWrite outer(bytes, Page);
+        {
+            const GuestArena::HostWrite inner(bytes + 8, sizeof(value));
+            Require(outer.Open() && inner.Open());
+        }
+        Require(Memory::ProtectGuestHostMemory(address, Page, Common::VirtualMemory::Mode::Read));
+        Require(ReadThroughPipe(bytes + 8, value) == 0);
+    }
+    Require(Memory::ProtectGuestHostMemory(address, Page, Common::VirtualMemory::Mode::Read));
+    Require(ReadThroughPipe(bytes + 8, value) == EFAULT);
+    GuestArena::GuestArenaSetHostWritePreparer_nid_no_patch(nullptr);
+    GuestArena::GuestArenaSetHostWriteHold_nid_no_patch(nullptr, nullptr);
+
+    Require(Memory::ProtectGuestHostMemory(address, Page * 2, Common::VirtualMemory::Mode::ReadWrite));
+    Require(sceKernelMunmap(address, Page * 2) == 0);
+    std::printf("host write hold 0x%llx: a read() into an open host write lands while the range is protected around it, the range is prepared again at close only then; outside the hold and after it the protection applies\n", static_cast<unsigned long long>(address));
+}
+
 void TestRuntimeMemory() {
     const auto address = Memory::AllocateRuntimeMemory(0, Page * 2, Common::VirtualMemory::Mode::ReadWrite, "kyty shim test");
     Require(address != 0 && Memory::IsBackingReadable(address, Page * 2));
@@ -815,6 +883,7 @@ int main() {
     TestGpuHooks();
     TestReleaseWhileMapped();
     TestHostProtectionTable();
+    TestHostWriteHold();
     TestRuntimeMemory();
     TestHeapCommitSecondView();
     TestHeapBlockEvicted();
