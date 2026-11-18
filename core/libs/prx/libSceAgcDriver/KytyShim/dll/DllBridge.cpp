@@ -23,6 +23,7 @@
 #include "prx/libkernel/Time/include/Time.hpp"
 
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -58,15 +59,29 @@ namespace KytyShim {
 void StartPgoWriter();
 }
 
+namespace Libs::LibKernel::Memory::Shim {
+void EnableView();
+}
+
 namespace {
 
 const KytyDllHost* g_host = nullptr;
 thread_local std::string t_error;
 
+const KytyDllHost* Host(const char* caller) noexcept {
+    if (g_host == nullptr) [[unlikely]] {
+        std::FILE* error = __acrt_iob_func(2);
+        std::fprintf(error, "kyty_gpu: %s called into AnyPS5 before KytyDllCreate (from a static initializer?)\n", caller);
+        std::fflush(error);
+        std::abort();
+    }
+    return g_host;
+}
+
 [[noreturn]] void HostFailed(KytyDllStatus status) {
     if (status == KYTY_DLL_PROCESS_SHUTDOWN) throw ProcessShutdown{};
     std::string message(1024, '\0');
-    const auto bytes = g_host->take_error(message.data(), message.size());
+    const auto bytes = Host(__func__)->take_error(message.data(), message.size());
     message.resize(std::min(bytes, message.size()));
     if (status == KYTY_DLL_EOP_FLIP_ALREADY_RESERVED) throw AgcDriver::EopFlipAlreadyReserved{};
     throw std::runtime_error(message);
@@ -143,8 +158,8 @@ std::string HostPath(std::size_t (*resolve)(const char*, char*, std::size_t), co
 class HostRenderingWait final : public AgcDriver::IRenderingWait {
 public:
     explicit HostRenderingWait(KytyDllRenderingWait* wait) : m_wait(wait) {}
-    ~HostRenderingWait() override { g_host->rendering_wait_release(m_wait); }
-    void Wait() override { Check(g_host->rendering_wait(m_wait)); }
+    ~HostRenderingWait() override { Host(__func__)->rendering_wait_release(m_wait); }
+    void Wait() override { Check(Host(__func__)->rendering_wait(m_wait)); }
 
 private:
     KytyDllRenderingWait* m_wait;
@@ -153,20 +168,20 @@ private:
 class HostFlipRequest final : public AgcDriver::IFlipRequest {
 public:
     explicit HostFlipRequest(KytyDllFlipRequest* request) : m_request(request) {}
-    ~HostFlipRequest() override { g_host->flip_release(m_request); }
+    ~HostFlipRequest() override { Host(__func__)->flip_release(m_request); }
 
     void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>&) override {
-        Check(g_host->flip_gpu_ready(m_request));
+        Check(Host(__func__)->flip_gpu_ready(m_request));
     }
 
     void Fail(std::exception_ptr error) noexcept override {
-        g_host->flip_fail(m_request, Message(error).c_str());
+        Host(__func__)->flip_fail(m_request, Message(error).c_str());
     }
 
     std::optional<AgcDriver::DisplayBuffer> Source() override {
         KytyDllDisplayBuffer source{};
         bool has = false;
-        Check(g_host->flip_source(m_request, &source, &has));
+        Check(Host(__func__)->flip_source(m_request, &source, &has));
         if (!has) return std::nullopt;
         return ToBuffer(source);
     }
@@ -188,20 +203,20 @@ private:
 class HostVideoOutput final : public AgcDriver::IVideoOutput {
 public:
     explicit HostVideoOutput(KytyDllVideoOutput* output) : m_output(output) {}
-    ~HostVideoOutput() override { g_host->video_release(m_output); }
+    ~HostVideoOutput() override { Host(__func__)->video_release(m_output); }
 
     std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo& info) override { return Make(info, false); }
     std::shared_ptr<AgcDriver::IFlipRequest> TryReserve(const AgcDriver::FlipInfo& info) override { return Make(info, true); }
-    void WaitForFlipRoom() override { Check(g_host->video_wait_for_flip_room(m_output)); }
+    void WaitForFlipRoom() override { Check(Host(__func__)->video_wait_for_flip_room(m_output)); }
 
     std::shared_ptr<AgcDriver::IRenderingWait> CaptureRenderingWait(std::uint32_t index) override {
         KytyDllRenderingWait* wait = nullptr;
-        Check(g_host->video_capture_rendering_wait(m_output, index, &wait));
+        Check(Host(__func__)->video_capture_rendering_wait(m_output, index, &wait));
         return std::make_shared<HostRenderingWait>(wait);
     }
 
     void Fail(std::exception_ptr error) noexcept override {
-        g_host->video_fail(m_output, HostFlipRequest::Message(error).c_str());
+        Host(__func__)->video_fail(m_output, HostFlipRequest::Message(error).c_str());
     }
 
     [[nodiscard]] KytyDllVideoOutput* Handle() const { return m_output; }
@@ -210,7 +225,7 @@ private:
     std::shared_ptr<AgcDriver::IFlipRequest> Make(const AgcDriver::FlipInfo& info, bool tryOnly) {
         const auto flip = ToFlip(info);
         KytyDllFlipRequest* request = nullptr;
-        Check(g_host->video_reserve(m_output, &flip, tryOnly, &request));
+        Check(Host(__func__)->video_reserve(m_output, &flip, tryOnly, &request));
         if (request == nullptr) return nullptr;
         return std::make_shared<HostFlipRequest>(request);
     }
@@ -369,6 +384,8 @@ const KytyDllApi* MakeApi() {
 extern "C" KytyDllStatus KytyDllCreate(const KytyDllHost* host, const KytyDllApi** api) {
     if (host == nullptr || api == nullptr || host->abi_version != KYTY_DLL_ABI_VERSION || host->size != sizeof(KytyDllHost)) return KYTY_DLL_ABI_MISMATCH;
     g_host = host;
+    static std::once_flag view;
+    std::call_once(view, [] { Libs::LibKernel::Memory::Shim::EnableView(); });
     *api = MakeApi();
     static std::once_flag pgo;
     std::call_once(pgo, [] { KytyShim::StartPgoWriter(); });
@@ -378,113 +395,113 @@ extern "C" KytyDllStatus KytyDllCreate(const KytyDllHost* host, const KytyDllApi
 extern "C" {
 
 bool DirectMemoryEnableView_nid_no_patch(DirectMemoryViewObserver observer, std::uint8_t** view, std::size_t* guestBytes, std::size_t* viewBytes) {
-    return g_host->direct_memory_enable_view(observer, view, guestBytes, viewBytes);
+    return Host(__func__)->direct_memory_enable_view(observer, view, guestBytes, viewBytes);
 }
 
 void DirectMemoryWatchProtections_nid_no_patch(DirectMemoryProtectionObserver observer) {
-    g_host->direct_memory_watch_protections(observer);
+    Host(__func__)->direct_memory_watch_protections(observer);
 }
 
 std::size_t DirectMemorySize_nid_no_patch() {
-    return g_host->direct_memory_size();
+    return Host(__func__)->direct_memory_size();
 }
 
 bool DirectMemoryFind_nid_no_patch(std::int64_t offset, bool findNext, std::int64_t* start, std::int64_t* end, int* memoryType) {
-    return g_host->direct_memory_find(offset, findNext, start, end, memoryType);
+    return Host(__func__)->direct_memory_find(offset, findNext, start, end, memoryType);
 }
 
 void GuestPageTableUsage_nid_no_patch(std::uint64_t granularity, std::uint64_t* cpuEntries, std::uint64_t* gpuEntries) {
-    g_host->guest_page_table_usage(granularity, cpuEntries, gpuEntries);
+    Host(__func__)->guest_page_table_usage(granularity, cpuEntries, gpuEntries);
 }
 
 int DoMapAnon_nid_no_patch(void** addr, std::size_t len, int prot, int flags, std::size_t alignment, bool exclusive) {
     int result = 0;
-    Check(g_host->do_map_anon(addr, len, prot, flags, alignment, exclusive, &result));
+    Check(Host(__func__)->do_map_anon(addr, len, prot, flags, alignment, exclusive, &result));
     return result;
 }
 
 int DoMunmap_nid_no_patch(void* addr, std::size_t len) {
     int result = 0;
-    Check(g_host->do_munmap(addr, len, &result));
+    Check(Host(__func__)->do_munmap(addr, len, &result));
     return result;
 }
 
 void* DirectMemoryMapHostView_nid_no_patch(std::uintptr_t address, std::size_t bytes, int prot) {
-    return g_host->direct_memory_map_host_view(address, bytes, prot);
+    return Host(__func__)->direct_memory_map_host_view(address, bytes, prot);
 }
 
 void GuestArenaRange_nid_postfix(std::uintptr_t* base, std::size_t* bytes) {
-    g_host->guest_arena_range(base, bytes);
+    Host(__func__)->guest_arena_range(base, bytes);
 }
 
 void GuestArenaNoteHostProtection_nid_no_patch(std::uintptr_t address, std::size_t bytes, bool writable) {
-    g_host->guest_arena_note_host_protection(address, bytes, writable);
+    Host(__func__)->guest_arena_note_host_protection(address, bytes, writable);
 }
 
 std::uint64_t GuestArenaOpenHostWrite_nid_no_patch(void* pointer, std::size_t bytes) {
-    return g_host->guest_arena_open_host_write(pointer, bytes);
+    return Host(__func__)->guest_arena_open_host_write(pointer, bytes);
 }
 
 void GuestArenaCloseHostWrite_nid_no_patch(void* pointer, std::size_t bytes, std::uint64_t token) {
-    g_host->guest_arena_close_host_write(pointer, bytes, token);
+    Host(__func__)->guest_arena_close_host_write(pointer, bytes, token);
 }
 
 void GuestArenaSetGpuFaultHandler_nid_no_patch(bool (*handler)(void* exceptionPointers)) {
-    g_host->guest_arena_set_gpu_fault_handler(handler);
+    Host(__func__)->guest_arena_set_gpu_fault_handler(handler);
 }
 
 void GuestArenaSetHostWriteFilter_nid_no_patch(bool (*filter)(std::uintptr_t address, std::size_t bytes)) {
-    g_host->guest_arena_set_host_write_filter(filter);
+    Host(__func__)->guest_arena_set_host_write_filter(filter);
 }
 
 void GuestArenaSetHostWritePreparer_nid_no_patch(bool (*prepare)(std::uintptr_t address, std::size_t bytes)) {
-    g_host->guest_arena_set_host_write_preparer(prepare);
+    Host(__func__)->guest_arena_set_host_write_preparer(prepare);
 }
 
 void* GuestAllocationsBegin_nid_postfix() {
-    return g_host->guest_allocations_begin();
+    return Host(__func__)->guest_allocations_begin();
 }
 
 void GuestAllocationsAdd_nid_postfix(void* mutation, void* pointer, std::size_t bytes, bool readable, bool writable, bool gpu) {
-    g_host->guest_allocations_add(mutation, pointer, bytes, readable, writable, gpu);
+    Host(__func__)->guest_allocations_add(mutation, pointer, bytes, readable, writable, gpu);
 }
 
 void GuestAllocationsEnd_nid_postfix(void* mutation) noexcept {
-    g_host->guest_allocations_end(mutation);
+    Host(__func__)->guest_allocations_end(mutation);
 }
 
 void KernelNoteGpuSubmit_nid_no_patch() {
-    g_host->kernel_note_gpu_submit();
+    Host(__func__)->kernel_note_gpu_submit();
 }
 
 int sceKernelAvailableFlexibleMemorySize(size_t* size) {
-    return g_host->kernel_available_flexible_memory_size(size);
+    return Host(__func__)->kernel_available_flexible_memory_size(size);
 }
 
 int sceKernelConfiguredFlexibleMemorySize(size_t* size) {
-    return g_host->kernel_configured_flexible_memory_size(size);
+    return Host(__func__)->kernel_configured_flexible_memory_size(size);
 }
 
 uint64_t sceKernelReadTsc(void) {
-    return g_host->kernel_read_tsc();
+    return Host(__func__)->kernel_read_tsc();
 }
 
 std::uint64_t sceKernelGetTscFrequency() {
-    return g_host->kernel_tsc_frequency();
+    return Host(__func__)->kernel_tsc_frequency();
 }
 
 std::uint64_t sceKernelGetProcessTime() {
-    return g_host->kernel_process_time();
+    return Host(__func__)->kernel_process_time();
 }
 
 std::uint64_t sceKernelGetProcessTimeCounter() {
-    return g_host->kernel_process_time_counter();
+    return Host(__func__)->kernel_process_time_counter();
 }
 
 KernelEqueueRef EqueuePin_nid_postfix(KernelEqueue eq) {
-    auto* queue = g_host->equeue_pin(eq);
+    auto* queue = Host(__func__)->equeue_pin(eq);
     if (queue == nullptr) return {};
-    return KernelEqueueRef(reinterpret_cast<KernelEqueuePrivate*>(queue), [](KernelEqueuePrivate* pinned) { g_host->equeue_unpin(reinterpret_cast<KytyDllEqueue*>(pinned)); });
+    return KernelEqueueRef(reinterpret_cast<KernelEqueuePrivate*>(queue), [](KernelEqueuePrivate* pinned) { Host(__func__)->equeue_unpin(reinterpret_cast<KytyDllEqueue*>(pinned)); });
 }
 
 int EqueueAddEvent_nid_postfix(KernelEqueue eq, const KernelEqueueEvent& event) {
@@ -499,72 +516,72 @@ int EqueueAddEvent_nid_postfix(KernelEqueue eq, const KernelEqueueEvent& event) 
         seam.filter_functions = (filter.triggerFunc != nullptr ? KYTY_DLL_FILTER_TRIGGER : 0u) | (filter.resetFunc != nullptr ? KYTY_DLL_FILTER_RESET : 0u) | (filter.deleteEventFunc != nullptr ? KYTY_DLL_FILTER_DELETE : 0u);
     }
     int result = 0;
-    Check(g_host->equeue_add_event(eq, &seam, &result));
+    Check(Host(__func__)->equeue_add_event(eq, &seam, &result));
     return result;
 }
 
 int EqueueTriggerEvent_nid_postfix(KernelEqueue eq, uintptr_t ident, int16_t filter, void* triggerData) {
     int result = 0;
-    Check(g_host->equeue_trigger_event(eq, ident, filter, triggerData, &result));
+    Check(Host(__func__)->equeue_trigger_event(eq, ident, filter, triggerData, &result));
     return result;
 }
 
 int EqueueDeleteEvent_nid_postfix(KernelEqueue eq, uintptr_t ident, int16_t filter) {
     int result = 0;
-    Check(g_host->equeue_delete_event(eq, ident, filter, &result));
+    Check(Host(__func__)->equeue_delete_event(eq, ident, filter, &result));
     return result;
 }
 
 std::FILE* HostStandardOutputFile_nid_no_patch() {
-    return g_host->standard_output_file();
+    return g_host != nullptr ? g_host->standard_output_file() : __acrt_iob_func(1);
 }
 
 std::FILE* HostStandardErrorFile_nid_no_patch() {
-    return g_host->standard_error_file();
+    return g_host != nullptr ? g_host->standard_error_file() : __acrt_iob_func(2);
 }
 
 void LibcRegisterShutdown_nid_postfix(void (*callback)()) {
-    g_host->register_shutdown(callback);
+    Host(__func__)->register_shutdown(callback);
 }
 
 std::stop_token LibcShutdownToken_nid_postfix() {
     static std::stop_source requested;
-    if (g_host->shutdown_requested()) requested.request_stop();
+    if (Host(__func__)->shutdown_requested()) requested.request_stop();
     return requested.get_token();
 }
 
 [[noreturn]] void LibcAwaitExit_nid_postfix() {
-    g_host->await_exit();
+    Host(__func__)->await_exit();
     std::abort();
 }
 
 [[noreturn]] void LibcTerminate_nid_no_patch(int code) {
-    g_host->terminate(code);
+    Host(__func__)->terminate(code);
     std::abort();
 }
 
 std::filesystem::path ResolvePath_nid_no_patch(const char* path) {
-    return std::filesystem::u8path(HostPath(g_host->resolve_path, path));
+    return std::filesystem::u8path(HostPath(Host(__func__)->resolve_path, path));
 }
 
 std::filesystem::path ResolveDiskPath_nid_no_patch(const char* path) {
-    return std::filesystem::u8path(HostPath(g_host->resolve_disk_path, path));
+    return std::filesystem::u8path(HostPath(Host(__func__)->resolve_disk_path, path));
 }
 
 }
 
 void AgcDriverDeliverEopInterrupt(std::uint32_t queue, std::uint32_t context) {
-    g_host->deliver_eop_interrupt(queue, context);
+    Host(__func__)->deliver_eop_interrupt(queue, context);
 }
 
 namespace AgcDriver {
 
 void RaiseWorkerThreadPriority(const char* role) {
-    g_host->raise_worker_thread_priority(role);
+    Host(__func__)->raise_worker_thread_priority(role);
 }
 
 bool SystemOverlayShown() {
-    return g_host->system_overlay_shown();
+    return Host(__func__)->system_overlay_shown();
 }
 
 std::optional<OverlayLayout> SystemOverlayLayout(VkExtent2D extent) {
@@ -573,7 +590,7 @@ std::optional<OverlayLayout> SystemOverlayLayout(VkExtent2D extent) {
     std::size_t count = 0;
     std::vector<KytyDllOverlayRect> rects(64);
     for (;;) {
-        if (!g_host->system_overlay_layout(extent.width, extent.height, &bounds, &scale, rects.data(), rects.size(), &count)) return std::nullopt;
+        if (!Host(__func__)->system_overlay_layout(extent.width, extent.height, &bounds, &scale, rects.data(), rects.size(), &count)) return std::nullopt;
         if (count <= rects.size()) break;
         rects.resize(count);
     }
