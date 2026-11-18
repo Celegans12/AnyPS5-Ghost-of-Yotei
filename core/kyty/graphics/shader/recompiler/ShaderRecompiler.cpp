@@ -658,6 +658,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	}
 	const auto*      tracked = &decoded;
 	Decoder::Program traced_source;
+	std::vector<IR::NativeTraversals> oracle_sources;
 	if (options.stage == ShaderType::Compute ||
 	    (options.stage == ShaderType::Pixel && options.native_ray_tracing && options.rt_oracle != 0)) {
 		const auto traced = IR::TraceNativeTraversals(
@@ -668,6 +669,7 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		const bool bvh = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
 			return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
 		});
+		oracle_sources = traced.oracle_sources;
 		if (traced.source_valid) {
 			ir.info.ray_query_user_sgpr      = traced.user_sgpr;
 			ir.info.ray_query_header_offset  = traced.header_offset;
@@ -707,7 +709,8 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	}
 	IR::TrackResources(ir, *tracked, native_cfg, options.input_info);
 	TranslateResult result;
-	result.program = std::move(ir);
+	result.program        = std::move(ir);
+	result.oracle_sources = std::move(oracle_sources);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(decoded_dump);
 		result.cfg_dump     = std::move(cfg_dump);
@@ -802,8 +805,9 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		    Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
 		                       options.emit_debug_info, false, options.ray_stats);
 	}
-	result.spirv   = std::move(spirv);
-	result.program = std::move(ir);
+	result.spirv          = std::move(spirv);
+	result.program        = std::move(ir);
+	result.oracle_sources = std::move(translated.oracle_sources);
 	if (options.dump_ir) {
 		result.decoded_dump = std::move(translated.decoded_dump);
 		result.ir_dump      = std::move(ir_dump);

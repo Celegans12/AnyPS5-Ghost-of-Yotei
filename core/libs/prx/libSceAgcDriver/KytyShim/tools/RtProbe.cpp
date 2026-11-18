@@ -110,6 +110,12 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 	            label, code.size(), bvh, native, info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root,
 	            info.ray_query_layout[0], info.ray_query_layout[1], info.ray_query_layout[2], info.ray_query_layout[3], oracle,
 	            lane);
+	for (size_t at = 0; at < translated.oracle_sources.size(); ++at) {
+		const auto& hypothesis = translated.oracle_sources[at];
+		std::printf("%s: hypothesis %zu/%zu user_sgpr=%u header=0x%x vsharp=0x%x root=0x%x layout=%08x,%08x,%08x,%08x\n", label, at,
+		            translated.oracle_sources.size(), hypothesis.user_sgpr, hypothesis.header_offset, hypothesis.header_vsharp,
+		            hypothesis.root, hypothesis.layout[0], hypothesis.layout[1], hypothesis.layout[2], hypothesis.layout[3]);
+	}
 	if (settings.emit) {
 		Recompiler::IR::ResourceSpecialization specialization;
 		specialization.buffers.resize(translated.program.info.buffers.size());

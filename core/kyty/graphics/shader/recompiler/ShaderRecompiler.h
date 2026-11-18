@@ -4,6 +4,7 @@
 #include "common/common.h"
 #include "common/stringUtils.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/ir/passes/RayQueryTraversal.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderFunctions.h"
@@ -37,9 +38,10 @@ struct CompileOptions {
 };
 
 struct TranslateResult {
-	IR::Program program;
-	std::string decoded_dump;
-	std::string cfg_dump;
+	IR::Program                       program;
+	std::string                       decoded_dump;
+	std::string                       cfg_dump;
+	std::vector<IR::NativeTraversals> oracle_sources;
 };
 
 struct CompileResult {
@@ -49,6 +51,7 @@ struct CompileResult {
 	std::string            decoded_dump;
 	std::string            ir_dump;
 	IR::Program            program;
+	std::vector<IR::NativeTraversals> oracle_sources;
 };
 
 struct ShaderSource {

@@ -5820,6 +5820,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		}
 		if (found) walks.push_back(std::move(walk));
 	}
+	std::vector<NativeTraversals> hypotheses;
 	if ((options.oracle & OracleRemaining) != 0) {
 		std::vector<Inst*> left;
 		for (auto* bvh: intersections) {
@@ -5827,6 +5828,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		}
 		const auto derived = left.empty() ? OracleWalks {} : DeriveOracleWalks(program, left);
 		if (!left.empty() && derived.refusal == nullptr) {
+			hypotheses = derived.sources;
 			Walk walk;
 			walk.kind                   = Kind::Universal;
 			walk.lane.source            = derived.sources.front();
@@ -5951,6 +5953,13 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		++result.sites;
 		for (auto* bvh: intersections) {
 			if (InLoop(program, bvh->Parent(), walk.header, walk.latch)) mark(bvh);
+		}
+	}
+	if (result.sites != 0 && !hypotheses.empty()) {
+		const auto& first = hypotheses.front();
+		if (first.user_sgpr == result.user_sgpr && first.header_offset == result.header_offset &&
+		    first.header_vsharp == result.header_vsharp && first.root == result.root && first.layout == result.layout) {
+			result.oracle_sources = std::move(hypotheses);
 		}
 	}
 	return result;
