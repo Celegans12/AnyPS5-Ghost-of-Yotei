@@ -871,11 +871,28 @@ extern "C" std::filesystem::path ResolveArchivedPath_nid_no_patch(const char* pa
     return ResolveLocked(path, module, true);
 }
 
+#ifdef _WIN32
+static bool PublishedWritable(std::uintptr_t start, std::size_t bytes) {
+    constexpr std::uintptr_t page = 0x1000;
+    constexpr std::size_t limit = 0x10000;
+    if (bytes > limit) return false;
+    for (auto address = start & ~(page - 1); address < start + bytes; address += page) {
+        std::uint32_t protection = 0;
+        if (!GuestArena::GuestArenaProtection_nid_postfix(address, &protection) || (protection & PAGE_GUARD) != 0 ||
+            (protection & (PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) == 0) return false;
+    }
+    return true;
+}
+#endif
+
 extern "C" bool GuestWritable_nid_no_patch(void* destination, std::size_t bytes) {
     const RestoreErrno restore;
     if (bytes == 0) return true;
     const auto start = reinterpret_cast<std::uintptr_t>(destination);
     if (start == 0 || bytes > UINTPTR_MAX - start) return false;
+#ifdef _WIN32
+    if (PublishedWritable(start, bytes)) return true;
+#endif
     for (auto address = start; address < start + bytes;) {
 #ifdef _WIN32
         MEMORY_BASIC_INFORMATION memory{};
