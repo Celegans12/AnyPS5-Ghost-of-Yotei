@@ -23,10 +23,28 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#if defined(ANYPS5_KYTY)
+#include <cstdlib>
+#include <string_view>
+#endif
 #include <cstring>
 #include <limits>
 
 namespace Libs::Graphics {
+
+#if defined(ANYPS5_KYTY)
+static bool TileViaVramEnabled() {
+	static const bool enabled = [] {
+		const char*            value = std::getenv("KYTY_TILE_VIA_VRAM");
+		const std::string_view text {value == nullptr ? "" : value};
+		if (!text.empty() && text != "0" && text != "1") {
+			EXIT("invalid KYTY_TILE_VIA_VRAM: %s (0 or 1)\n", value);
+		}
+		return text != "0";
+	}();
+	return enabled;
+}
+#endif
 
 TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
                          StreamBuffer& stream_buffer)
@@ -64,6 +82,9 @@ TileManager::TileManager(GraphicContext& graphics, CommandScheduler& scheduler,
 	RequireVulkanSuccess(
 	    m_graphics.device.createPipelineLayout(&layout_info, nullptr, &m_pipeline_layout),
 	    "create TileManager pipeline layout");
+#if defined(ANYPS5_KYTY)
+	(void)TileViaVramEnabled();
+#endif
 }
 
 TileManager::~TileManager() {
@@ -365,6 +386,91 @@ void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> r
 	image.Download(regions, linear.buffer, 0, linear.size);
 	Record(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity, tiling);
 }
+
+#if defined(ANYPS5_KYTY)
+void TileManager::Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
+                       const Buffer& tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
+                       const ImageInfo& info, uint32_t levels) {
+	if (!TileViaVramEnabled() || tiled.IsDeviceLocal() ||
+	    !TileThroughDevice(linear, linear_offset, linear_capacity, tiled, tiled_offset,
+	                       tiled_capacity, info, levels)) {
+		Tile(linear, linear_offset, linear_capacity, tiled.Handle(), tiled_offset, tiled_capacity,
+		     info, levels);
+	}
+}
+
+void TileManager::TileImage(Image& image, std::span<const vk::BufferImageCopy> regions,
+                            const Buffer& tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
+                            uint32_t levels) {
+	if (!TileViaVramEnabled() || tiled.IsDeviceLocal()) {
+		TileImage(image, regions, tiled.Handle(), tiled_offset, tiled_capacity, levels);
+		return;
+	}
+	EXIT_IF(regions.empty());
+	const auto linear_capacity = image.info.LinearSize(levels);
+	auto       linear          = GetScratchBuffer(linear_capacity, tiled.Handle());
+	image.Download(regions, linear.buffer, 0, linear.size);
+	Tile(linear.buffer, 0, linear_capacity, tiled, tiled_offset, tiled_capacity, image.info,
+	     levels);
+}
+
+bool TileManager::TileThroughDevice(vk::Buffer linear, uint64_t linear_offset,
+                                    uint64_t linear_capacity, const Buffer& tiled,
+                                    uint64_t tiled_offset, uint64_t tiled_capacity,
+                                    const ImageInfo& info, uint32_t levels) {
+	EXIT_IF(tiled_capacity == 0 || tiled_offset > tiled.Size() ||
+	        tiled_capacity > tiled.Size() - tiled_offset);
+	const auto  staging = GetScratchBuffer(tiled_capacity, linear);
+	const auto& owner =
+	    *m_scratch[m_scratch[0] && m_scratch[0]->Handle() == staging.buffer ? 0 : 1];
+	EXIT_IF(owner.Handle() != staging.buffer);
+	if (!owner.IsDeviceLocal()) {
+		return false;
+	}
+	const auto tiling =
+	    Prepare(true, tiled_capacity, linear_capacity, info, levels, linear_offset, 0);
+
+	m_scheduler.EndRendering();
+	auto                    command = m_scheduler.Current().Handle();
+	vk::BufferMemoryBarrier barriers[2] {};
+	for (auto& barrier: barriers) {
+		barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+		barrier.size                = tiled_capacity;
+	}
+	barriers[0].buffer        = tiled.Handle();
+	barriers[0].offset        = tiled_offset;
+	barriers[0].srcAccessMask = vk::AccessFlagBits::eMemoryWrite | vk::AccessFlagBits::eHostWrite;
+	barriers[0].dstAccessMask = vk::AccessFlagBits::eTransferRead;
+	barriers[1].buffer        = staging.buffer;
+	barriers[1].offset        = 0;
+	barriers[1].srcAccessMask = vk::AccessFlagBits::eMemoryRead | vk::AccessFlagBits::eMemoryWrite;
+	barriers[1].dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	command.pipelineBarrier(
+	    vk::PipelineStageFlagBits::eAllCommands | vk::PipelineStageFlagBits::eHost,
+	    vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 2, barriers, 0, nullptr);
+	const vk::BufferCopy gather {tiled_offset, 0, tiled_capacity};
+	command.copyBuffer(tiled.Handle(), staging.buffer, 1, &gather);
+
+	Record(linear, linear_offset, linear_capacity, staging.buffer, 0, tiled_capacity, tiling);
+
+	m_scheduler.EndRendering();
+	command                   = m_scheduler.Current().Handle();
+	barriers[0].srcAccessMask = vk::AccessFlagBits::eTransferRead;
+	barriers[0].dstAccessMask = vk::AccessFlagBits::eTransferWrite;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                        vk::PipelineStageFlagBits::eTransfer, {}, 0, nullptr, 1, barriers, 0,
+	                        nullptr);
+	const vk::BufferCopy scatter {0, tiled_offset, tiled_capacity};
+	command.copyBuffer(staging.buffer, tiled.Handle(), 1, &scatter);
+	barriers[0].srcAccessMask = vk::AccessFlagBits::eTransferWrite;
+	barriers[0].dstAccessMask = vk::AccessFlagBits::eTransferRead | vk::AccessFlagBits::eMemoryRead;
+	command.pipelineBarrier(vk::PipelineStageFlagBits::eTransfer,
+	                        vk::PipelineStageFlagBits::eAllCommands, {}, 0, nullptr, 1, barriers, 0,
+	                        nullptr);
+	return true;
+}
+#endif
 
 TileManager::Result TileManager::GetScratchBuffer(uint64_t size, vk::Buffer input) {
 	EXIT_IF(size == 0);

@@ -2821,8 +2821,12 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 			image.Download(copies, destination.Handle(), destination_offset, info.data.size);
 		} else {
 			const auto copies = info.BufferCopies();
+#if defined(ANYPS5_KYTY)
+			m_tiler.TileImage(image, copies, destination, destination_offset, info.data.size);
+#else
 			m_tiler.TileImage(image, copies, destination.Handle(), destination_offset,
 			                  info.data.size);
+#endif
 		}
 		return;
 	}
@@ -2850,8 +2854,13 @@ void TextureCache::DownloadDepth(Image& image, Buffer& destination, uint64_t des
 	                    .source_slice_stride = transfer_slice,
 	                    .target_slice_stride = full_slice_size});
 	if (tiled) {
+#if defined(ANYPS5_KYTY)
+		m_tiler.Tile(guest_linear.buffer, guest_linear.offset, guest_linear.size, destination,
+		             destination_offset, info.data.size, info);
+#else
 		m_tiler.Tile(guest_linear.buffer, guest_linear.offset, guest_linear.size,
 		             destination.Handle(), destination_offset, info.data.size, info);
+#endif
 	}
 }
 
@@ -2867,8 +2876,12 @@ void TextureCache::DownloadImage(Image& image, Buffer& destination, uint64_t des
 	const auto  transform = info.GetColorTransform();
 	if (info.IsTiled()) {
 		const auto copies = info.BufferCopies(0, levels);
+#if defined(ANYPS5_KYTY)
+		m_tiler.TileImage(image, copies, destination, destination_offset, destination_size, levels);
+#else
 		m_tiler.TileImage(image, copies, destination.Handle(), destination_offset, destination_size,
 		                  levels);
+#endif
 	} else if (transform != ColorTransform::None) {
 		auto       linear = m_tiler.GetScratchBuffer(destination_size);
 		const auto copies = info.BufferCopies(0, levels);

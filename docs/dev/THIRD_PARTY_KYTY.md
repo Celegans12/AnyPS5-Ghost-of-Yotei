@@ -187,6 +187,18 @@ of every storage image on its first write still needs `KYTY_READBACK_STORAGE_IMA
 restores KytyPS5's behaviour; any value other than empty, `0` or `1` stops the emulator with a message naming the
 variable.
 
+Readback of tiled images: KytyPS5 copies a GPU-written tiled image back to guest memory
+(`TextureCache::DownloadImageMemory`; under VRAM pressure, the texture cache's garbage collector does it for each image
+it evicts) by retiling it with a compute shader straight into the host-visible readback buffer. The shader writes in
+tiled order, a few bytes at a time across PCIe: about 0.75 s for a 3840×2160 render target on an RTX 4080 SUPER, while
+the game waits. Under `ANYPS5_KYTY`, when the readback buffer is not device-local, `TileManager` copies the readback
+range into its device-local scratch buffer, tiles there, and copies the range back with one `vkCmdCopyBuffer`; the bytes
+the shader does not write keep the guest value they had, as before. If the scratch buffer is not device-local either,
+the shader writes to the readback buffer as before. Stray with 8 GiB of the 16 GiB held by another process: worst frame
+5.46 s → 0.57 s, readbacks over 100 ms 9 → 0; with a second Stray on the GPU: 6.74 s → 0.67 s; the same images
+(`notes/kyty-tile-via-vram.md`). `KYTY_TILE_VIA_VRAM=0` restores KytyPS5's behaviour; any value other than empty, `0` or
+`1` stops the emulator with a message naming the variable.
+
 Guest flips: KytyPS5 completes a flip (`VideoOutDriver::CompleteFlip`, which makes the request ready for presentation;
 the title's flip event follows) on its priority thread, once the GPU has finished the command buffer that holds the
 presentation copy. The title then waits for the end of the GPU's work before it submits its next frame. Under

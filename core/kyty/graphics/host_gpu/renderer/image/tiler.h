@@ -50,6 +50,13 @@ public:
 	          uint32_t levels = 0);
 	void TileImage(Image& image, std::span<const vk::BufferImageCopy> regions, vk::Buffer tiled,
 	               uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels = 0);
+#if defined(ANYPS5_KYTY)
+	void Tile(vk::Buffer linear, uint64_t linear_offset, uint64_t linear_capacity,
+	          const Buffer& tiled, uint64_t tiled_offset, uint64_t tiled_capacity,
+	          const ImageInfo& info, uint32_t levels = 0);
+	void TileImage(Image& image, std::span<const vk::BufferImageCopy> regions, const Buffer& tiled,
+	               uint64_t tiled_offset, uint64_t tiled_capacity, uint32_t levels = 0);
+#endif
 	[[nodiscard]] Result GetScratchBuffer(uint64_t size, vk::Buffer input = nullptr);
 	void                 ConvertD16(Result source, Result target, D16Direction direction, bool d32,
 	                                const D16Layout& layout);
@@ -124,6 +131,12 @@ private:
 	void                 Record(vk::Buffer source, uint64_t source_offset, uint64_t source_capacity,
 	                            vk::Buffer target, uint64_t target_offset, uint64_t target_capacity,
 	                            const Tiling& tiling);
+#if defined(ANYPS5_KYTY)
+	[[nodiscard]] bool TileThroughDevice(vk::Buffer linear, uint64_t linear_offset,
+	                                     uint64_t linear_capacity, const Buffer& tiled,
+	                                     uint64_t tiled_offset, uint64_t tiled_capacity,
+	                                     const ImageInfo& info, uint32_t levels);
+#endif
 	[[nodiscard]] vk::Pipeline GetPipeline(uint32_t slot);
 	[[nodiscard]] vk::Pipeline CreatePipeline(std::span<const uint32_t>     code,
 	                                          const vk::SpecializationInfo* specialization) const;
