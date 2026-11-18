@@ -12,6 +12,8 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "kytyHostGpuStamp.h"
+#include "kytyShaderStoreStamp.h"
 
 #include <fmt/format.h>
 
@@ -28,6 +30,9 @@ namespace Libs::Graphics {
 namespace {
 
 constexpr uint64_t RegionBytes   = uint64_t {128} << 20u;
+constexpr uint64_t MinRegion     = uint64_t {4} << 20u;
+constexpr uint32_t QueuedAtMost  = 4;
+constexpr uint32_t DeferredAtMost = 4096;
 constexpr uint64_t OutputAlign   = 256;
 constexpr uint32_t ResultBytes   = 32;
 constexpr uint32_t VerifiedAfter = 4;
@@ -69,6 +74,10 @@ auto OutputPlace(const auto& output) {
 	return std::tuple {output.key, output.kind};
 }
 
+std::string VersionLine() {
+	return fmt::format("version {:016x} {:016x}", uint64_t {KYTY_SHADER_STORE_STAMP}, uint64_t {KYTY_HOST_GPU_STAMP});
+}
+
 }
 
 RayTracingCheck::RayTracingCheck(RenderContext& context): m_context(context) {}
@@ -92,11 +101,10 @@ bool RayTracingCheck::Served(const ShaderModule& module) {
 }
 
 bool RayTracingCheck::FallsBack(uint64_t shader_hash) {
-	if (m_load_done.load(std::memory_order_acquire) && !m_any_fallback.load(std::memory_order_relaxed)) {
+	if (!m_any_fallback.load(std::memory_order_relaxed)) {
 		return false;
 	}
 	std::lock_guard lock(m_mutex);
-	Load();
 	const auto found = m_programs.find(shader_hash);
 	return found != m_programs.end() && found->second.fallback;
 }
@@ -110,9 +118,20 @@ void RayTracingCheck::Load() {
 	if (!title.empty()) {
 		m_path = std::filesystem::path("_PipelineCache") / (title + ".rt");
 	}
+	if (m_path.empty()) {
+		return;
+	}
 	std::ifstream in(m_path);
-	uint32_t      verified = 0, fallback = 0, unreplayable = 0;
-	for (std::string line; in && std::getline(in, line);) {
+	std::string   version;
+	if (!in || !std::getline(in, version)) {
+		return;
+	}
+	if (version != VersionLine()) {
+		Note(fmt::format("[RT] check: the decisions in {} come from another build, not read", m_path.string()));
+		return;
+	}
+	uint32_t verified = 0, fallback = 0, unreplayable = 0;
+	for (std::string line; std::getline(in, line);) {
 		std::istringstream fields(line);
 		std::string        hash_text, state;
 		fields >> hash_text >> state;
@@ -144,7 +163,7 @@ void RayTracingCheck::Load() {
 			program.clean    = VerifiedAfter;
 			verified++;
 		} else if (state == "fallback") {
-			program.fallback = true;
+			program.unreplayable.clear();
 			fallback++;
 		} else if (state == "unreplayable" && !program.unreplayable.empty()) {
 			unreplayable++;
@@ -155,12 +174,10 @@ void RayTracingCheck::Load() {
 			program.unreplayable.clear();
 		}
 	}
-	m_any_fallback.store(fallback != 0, std::memory_order_relaxed);
-	m_load_done.store(true, std::memory_order_release);
 	if (verified + fallback + unreplayable != 0) {
-		Note(fmt::format("[RT] check: {} decisions read from {} ({} verified, {} falling back to the guest walk, {} not "
-		                 "replayable)",
-		                 verified + fallback + unreplayable, m_path.string(), verified, fallback, unreplayable));
+		Note(fmt::format("[RT] check: {} decisions read from {} ({} verified, {} not replayable, {} fell back in an "
+		                 "earlier session and are checked again)",
+		                 verified + fallback + unreplayable, m_path.string(), verified, unreplayable, fallback));
 	}
 }
 
@@ -182,6 +199,7 @@ void RayTracingCheck::Save() const {
 	temporary += ".tmp";
 	{
 		std::ofstream out(temporary, std::ios::trunc);
+		out << VersionLine() << '\n';
 		for (const auto& [hash, program]: rows) {
 			const auto* state = program->fallback       ? "fallback"
 			                    : program->verified     ? "verified"
@@ -216,10 +234,8 @@ bool RayTracingCheck::Prepare() {
 	}
 	auto& graphics  = m_context.GetGraphics();
 	auto& scheduler = m_context.GetCommandScheduler();
-	m_scratch = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 3 * RegionBytes);
 	m_results = std::make_unique<Buffer>(graphics, scheduler, MemoryUsage::Download, 0, AllFlags,
 	                                     uint64_t {ResultBytes} * m_pending.size());
-	SetVulkanObjectNameF(graphics.device, m_scratch->Handle(), "RT Check Scratch");
 
 	const vk::DescriptorSetLayoutBinding bindings[] {
 	    {0, vk::DescriptorType::eStorageBuffer, 1, vk::ShaderStageFlagBits::eCompute, nullptr},
@@ -250,6 +266,26 @@ bool RayTracingCheck::Prepare() {
 	                Config::RayTracingCheckPeriod(), uint64_t {Config::RayTracingCheckPeriod()} * SlowerAfter,
 	                Config::RayTracingCheckPpm() / 1e6, Config::RayTracingCheckStrikes()));
 	return true;
+}
+
+void RayTracingCheck::Reserve(uint64_t region) {
+	if (region <= m_capacity) {
+		return;
+	}
+	auto capacity = MinRegion;
+	while (capacity < region) {
+		capacity <<= 1u;
+	}
+	auto& graphics  = m_context.GetGraphics();
+	auto& scheduler = m_context.GetCommandScheduler();
+	if (m_scratch != nullptr) {
+		scheduler.DeferHostOperation([retired = std::move(m_scratch)]() mutable { retired.reset(); });
+	}
+	m_scratch  = std::make_shared<Buffer>(graphics, scheduler, MemoryUsage::DeviceLocal, 0, AllFlags, 3 * capacity);
+	m_capacity = capacity;
+	SetVulkanObjectNameF(graphics.device, m_scratch->Handle(), "RT Check Scratch");
+	Note(fmt::format("[RT] check: {} MiB of device memory for checked outputs of up to {} MiB", (3 * capacity) >> 20u,
+	                 capacity >> 20u));
 }
 
 uint32_t RayTracingCheck::TakeSlot() {
@@ -294,23 +330,51 @@ bool RayTracingCheck::Sample(const ShaderModule& module, const CommandBuffer& bu
 		Refuse(hash, reason);
 		return false;
 	}
-	const auto every = program.verified ? uint64_t {period} * SlowerAfter : uint64_t {period};
-	if (index % every != 0) {
-		return false;
+	if (program.waiting) {
+		return true;
 	}
-	const auto slot = TakeSlot();
+	const auto every = program.verified ? uint64_t {period} * SlowerAfter : uint64_t {period};
+	return index % every == 0;
+}
+
+void RayTracingCheck::Defer(uint64_t shader_hash, bool queued) {
+	std::lock_guard lock(m_mutex);
+	auto&           program = m_programs[shader_hash];
+	program.waiting         = true;
+	program.deferred++;
+	program.queued += queued ? 1 : 0;
+	if (program.queued > QueuedAtMost || program.deferred > DeferredAtMost) {
+		program.waiting = false;
+		Refuse(shader_hash, fmt::format("the emulated variant was not ready after {} dispatches and {} background "
+		                                "translations",
+		                                program.deferred, program.queued));
+	}
+}
+
+bool RayTracingCheck::Begin(uint64_t shader_hash) {
+	std::lock_guard lock(m_mutex);
+	auto&           program = m_programs[shader_hash];
+	const auto      slot    = TakeSlot();
 	if (slot == UINT32_MAX) {
 		program.skipped++;
+		program.waiting = true;
 		return false;
 	}
 	if (!Prepare()) {
 		return false;
 	}
-	m_pending[slot] = {.busy = true, .hash = hash, .dwords = 0, .outputs = 0, .index = index};
-	m_slot          = slot;
-	m_hash          = hash;
-	m_active        = true;
-	m_prepared      = m_context.GetRayTracing()->LastPreparation();
+	if (program.waiting && program.deferred != 0) {
+		Note(fmt::format("[RT] check {}: emulated variant ready after {} deferred dispatches", Hash(shader_hash),
+		                 program.deferred));
+	}
+	program.waiting  = false;
+	program.deferred = 0;
+	program.queued   = 0;
+	m_pending[slot]  = {.busy = true, .hash = shader_hash, .dwords = 0, .outputs = 0, .index = program.dispatches - 1};
+	m_slot           = slot;
+	m_hash           = shader_hash;
+	m_active         = true;
+	m_prepared       = m_context.GetRayTracing()->LastPreparation();
 	return true;
 }
 
@@ -427,11 +491,13 @@ void RayTracingCheck::Before(const PreparedBindings& bindings) {
 		return;
 	}
 	m_region = m_outputs.back().at + (m_outputs.back().size + OutputAlign - 1) / OutputAlign * OutputAlign;
+	Reserve(m_region);
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
 	const auto command = scheduler.Current().Handle();
 	Barrier(command);
-	command.fillBuffer(m_scratch->Handle(), RegionBytes, 2 * RegionBytes, 0);
+	command.fillBuffer(m_scratch->Handle(), m_capacity, m_region, 0);
+	command.fillBuffer(m_scratch->Handle(), 2 * m_capacity, m_region, 0);
 	Copy(command, m_outputs, 0, false);
 	Barrier(scheduler.Current().Handle());
 }
@@ -455,25 +521,10 @@ void RayTracingCheck::AfterOracle(const PreparedBindings&, bool counted) {
 		m_pending[m_slot].counted     = counted;
 		m_pending[m_slot].preparation = counted && preparation != m_prepared ? preparation : 0;
 	}
-	Copy(scheduler.Current().Handle(), m_outputs, RegionBytes, false);
+	Copy(scheduler.Current().Handle(), m_outputs, m_capacity, false);
 	Barrier(scheduler.Current().Handle());
 	Copy(scheduler.Current().Handle(), m_outputs, 0, true);
 	Barrier(scheduler.Current().Handle());
-}
-
-void RayTracingCheck::KeepOracle(const char* reason) {
-	if (!m_active) {
-		return;
-	}
-	auto& scheduler = m_context.GetCommandScheduler();
-	scheduler.EndRendering();
-	Barrier(scheduler.Current().Handle());
-	Copy(scheduler.Current().Handle(), m_outputs, RegionBytes, true);
-	Barrier(scheduler.Current().Handle());
-	std::lock_guard lock(m_mutex);
-	Refuse(m_hash, reason);
-	m_pending[m_slot].busy = false;
-	m_active               = false;
 }
 
 void RayTracingCheck::AfterGuest(const PreparedBindings& bindings) {
@@ -506,15 +557,15 @@ void RayTracingCheck::AfterGuest(const PreparedBindings& bindings) {
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
 	Barrier(scheduler.Current().Handle());
-	Copy(scheduler.Current().Handle(), matched, 2 * RegionBytes, false);
+	Copy(scheduler.Current().Handle(), matched, 2 * m_capacity, false);
 	const auto command = scheduler.Current().Handle();
 	const auto offset  = uint64_t {m_slot} * ResultBytes;
 	command.fillBuffer(m_results->Handle(), offset, 4, 0);
 	command.fillBuffer(m_results->Handle(), offset + 4, 4, 0xffffffffu);
 	Barrier(command);
 	const std::array<vk::DescriptorBufferInfo, 3> infos {
-	    vk::DescriptorBufferInfo {m_scratch->Handle(), RegionBytes, m_region},
-	    vk::DescriptorBufferInfo {m_scratch->Handle(), 2 * RegionBytes, m_region},
+	    vk::DescriptorBufferInfo {m_scratch->Handle(), m_capacity, m_region},
+	    vk::DescriptorBufferInfo {m_scratch->Handle(), 2 * m_capacity, m_region},
 	    vk::DescriptorBufferInfo {m_results->Handle(), 0, VK_WHOLE_SIZE},
 	};
 	std::array<vk::WriteDescriptorSet, 3> writes {};

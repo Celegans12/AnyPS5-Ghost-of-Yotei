@@ -1472,6 +1472,14 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		}
 	} const translate_scope {params.hash};
 #endif
+	if (m_queue_only) {
+		if (!m_in_flight.contains(m_lookup_key)) {
+			QueueCompile(m_lookup_key, params, input_info, push_data_cursor,
+			             entry != m_program_cache.end() ? &entry->second.specialization : nullptr, m_guest_traversal);
+			m_queued = true;
+		}
+		return nullptr;
+	}
 	if (WaitForCompile(m_lookup_key)) {
 		return GetProgram(params, input_info, push_data_cursor);
 	}
@@ -2360,6 +2368,7 @@ struct PipelineCache::CompileJob {
 	uint32_t                                                    push_data_cursor = 0;
 	std::optional<ShaderRecompiler::IR::ResourceSpecialization> specialization;
 	TableVariant*                                               table = nullptr;
+	bool                                                        guest_traversal = false;
 };
 
 #if defined(ANYPS5_KYTY)
@@ -2388,7 +2397,8 @@ template <typename InputInfo>
 void PipelineCache::QueueCompile(const ProgramKey& key, const ShaderParams& params,
                                  const InputInfo&                                    input_info,
                                  uint32_t                                            push_data_cursor,
-                                 const ShaderRecompiler::IR::ResourceSpecialization* specialization) {
+                                 const ShaderRecompiler::IR::ResourceSpecialization* specialization,
+                                 bool                                                guest_traversal) {
 	if (m_in_flight.contains(key)) {
 		return;
 	}
@@ -2396,6 +2406,7 @@ void PipelineCache::QueueCompile(const ProgramKey& key, const ShaderParams& para
 	job->key              = key;
 	job->params           = params;
 	job->push_data_cursor = push_data_cursor;
+	job->guest_traversal  = guest_traversal;
 	if (specialization != nullptr) {
 		job->specialization = *specialization;
 	}
@@ -2464,7 +2475,7 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 		options.back_code       = job.params.back_code;
 		options.dump_ir         = Config::GetShaderLogDirection() != Config::LogDirection::Silent;
 		options.emit_debug_info = Config::GraphicsDebugDumpEnabled();
-		options.native_ray_tracing = RayTracing::NativeTraversals();
+		options.native_ray_tracing = RayTracing::NativeTraversals() && !job.guest_traversal;
 		options.ray_stats          = options.native_ray_tracing && Config::RayTracingStatsEnabled();
 		options.rt_oracle          = options.native_ray_tracing ? Config::RayTracingOracle() : 0u;
 		auto source = ShaderRecompiler::PrepareShaderSource(job.params.code, options);
@@ -2534,6 +2545,8 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 				ahead = &added;
 			}
 		}
+	} else if (job.guest_traversal && plan) {
+		m_program_cache.try_emplace(job.key, Program {.resource_plan = std::move(*plan)});
 	}
 	if (const auto job_count = m_in_flight.find(job.key); --job_count->second == 0) {
 		m_in_flight.erase(job_count);
@@ -3228,6 +3241,34 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 		module            = GetProgram(params, input_info, push_data_cursor);
 		m_guest_traversal = false;
 	}
+	return module;
+}
+
+const ShaderModule* PipelineCache::GetGuestComputeProgramQueued(const HW::ComputeShaderInfo& regs,
+                                                                ShaderComputeInputInfo& input_info, bool& queued) {
+	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+#if defined(ANYPS5_KYTY)
+	ShaderParams params;
+	if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared",
+	                           "PipelineCache::GetGuestComputeProgramQueued", 0, regs.cs_regs.data_addr,
+	                           [&] { params = PrepareProgram(regs, input_info); })) {
+		return nullptr;
+	}
+#else
+	const auto params = PrepareProgram(regs, input_info);
+#endif
+	input_info.lds_storage = input_info.lds_size_dwords * 4u >
+	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
+	uint32_t push_data_cursor =
+	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
+	const ProgramLockGuard lock(m_program_lock);
+	m_guest_traversal  = true;
+	m_queue_only       = true;
+	m_queued           = false;
+	const auto* module = GetProgram(params, input_info, push_data_cursor);
+	m_guest_traversal  = false;
+	m_queue_only       = false;
+	queued             = m_queued;
 	return module;
 }
 

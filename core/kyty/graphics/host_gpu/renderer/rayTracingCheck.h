@@ -33,10 +33,12 @@ public:
 	[[nodiscard]] static bool Served(const ShaderModule& module);
 	[[nodiscard]] bool        FallsBack(uint64_t shader_hash);
 	[[nodiscard]] bool        Sample(const ShaderModule& module, const CommandBuffer& buffer);
+	void                      Defer(uint64_t shader_hash, bool queued);
+	[[nodiscard]] bool        Begin(uint64_t shader_hash);
+	[[nodiscard]] bool        Active() const noexcept { return m_active; }
 	void                      Before(const PreparedBindings& bindings);
 	void                      AfterOracle(const PreparedBindings& bindings, bool counted);
 	void                      AfterGuest(const PreparedBindings& bindings);
-	void                      KeepOracle(const char* reason);
 
 private:
 	struct Output {
@@ -59,9 +61,12 @@ private:
 		uint32_t            unknown    = 0;
 		uint32_t            full       = 0;
 		uint32_t            full_run   = 0;
+		uint32_t            deferred   = 0;
+		uint32_t            queued     = 0;
 		bool                host_full  = false;
 		bool                fallback   = false;
 		bool                verified   = false;
+		bool                waiting    = false;
 		std::string         unreplayable;
 		std::vector<double> fractions;
 	};
@@ -76,6 +81,7 @@ private:
 	};
 
 	bool     Prepare();
+	void     Reserve(uint64_t region);
 	bool     Collect(const PreparedBindings& bindings, std::vector<Output>& outputs, std::string& reason) const;
 	void     Copy(const CommandRecorder& command, const std::vector<Output>& outputs, uint64_t region, bool restore);
 	void     Barrier(const CommandRecorder& command) const;
@@ -89,7 +95,8 @@ private:
 	RenderContext&                         m_context;
 	std::mutex                             m_mutex;
 	std::unordered_map<uint64_t, Program>  m_programs;
-	std::unique_ptr<Buffer>                m_scratch;
+	std::shared_ptr<Buffer>                m_scratch;
+	uint64_t                               m_capacity = 0;
 	std::unique_ptr<Buffer>                m_results;
 	std::array<Pending, 64>                m_pending {};
 	std::vector<Output>                    m_outputs;
@@ -101,7 +108,6 @@ private:
 	bool                                   m_ready    = false;
 	bool                                   m_loaded   = false;
 	std::atomic<bool>                      m_any_fallback {false};
-	std::atomic<bool>                      m_load_done {false};
 	std::filesystem::path                  m_path;
 	vk::DescriptorSetLayout                m_descriptor_layout = nullptr;
 	vk::PipelineLayout                     m_pipeline_layout   = nullptr;

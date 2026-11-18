@@ -75,7 +75,7 @@ static bool PrepareSelfSizedBuffers(RenderContext& context, const ShaderStageRun
 
 static bool PrepareNativeRayTracing(RenderContext& context, const CommandRecorder& command,
                                     const HW::ComputeShaderInfo& cs_regs, const PreparedBindings& bindings,
-                                    bool count_rays = false) {
+                                    bool count_rays = false, bool note_guest = true) {
 	auto& native_rt = *context.GetRayTracing();
 	if (!native_rt.Enabled()) {
 		return false;
@@ -91,7 +91,7 @@ static bool PrepareNativeRayTracing(RenderContext& context, const CommandRecorde
 		                  module.info.shader_hash, count_rays);
 		return true;
 	}
-	if (info.bvh) {
+	if (info.bvh && note_guest) {
 		using Kind = RayTracing::GuestDispatch;
 		RayTracing::NoteGuestDispatch(module.guest_traversal ? Kind::NullTlas : Kind::Unrecognized,
 		                                    module.info.shader_hash);
@@ -496,7 +496,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	if (!TakeResolvedDispatch(input_info, compute_module)) {
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info);
 	}
-	if (compute_module != nullptr && RtCheck().FallsBack(compute_module->info.shader_hash)) {
+	const bool fell_back = compute_module != nullptr && RtCheck().FallsBack(compute_module->info.shader_hash);
+	if (fell_back) {
 		input_info     = pristine;
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info, true);
 	}
@@ -581,7 +582,8 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		m_context.GetOcclusionQueries().WriteForReaders();
 
 		const auto vk_buffer = buffer.Handle();
-		const bool counted = PrepareNativeRayTracing(m_context, vk_buffer, cs_regs, bindings, rt_pass == 1);
+		const bool counted =
+		    PrepareNativeRayTracing(m_context, vk_buffer, cs_regs, bindings, rt_pass == 1, rt_pass != 2 && !fell_back);
 		if (rt_pass == 1) {
 			RtCheck().Before(bindings);
 		}
@@ -689,18 +691,25 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		m_deferred_barrier_queue = m_guest_queue;
 		ResetBindings();
 	};
-	if (!RtCheck().Sample(*compute_module, buffer)) {
-		record(input_info, 0);
-		return;
+	if (RtCheck().Sample(*compute_module, buffer)) {
+		const auto             hash   = compute_module->info.shader_hash;
+		ShaderComputeInputInfo guest  = pristine;
+		bool                   queued = false;
+		const auto* guest_module = m_context.GetPipelineCache().GetGuestComputeProgramQueued(cs_regs, guest, queued);
+		if (guest_module != nullptr) {
+			thread_dimensions(guest);
+		}
+		if (guest_module == nullptr || m_context.GetPipelineCache().TryGetComputePipeline(guest) == nullptr) {
+			RtCheck().Defer(hash, queued);
+		} else if (RtCheck().Begin(hash)) {
+			record(input_info, 1);
+			if (RtCheck().Active()) {
+				record(guest, 2);
+			}
+			return;
+		}
 	}
-	record(input_info, 1);
-	ShaderComputeInputInfo guest = pristine;
-	if (m_context.GetPipelineCache().GetComputeProgram(cs_regs, guest, true) == nullptr) {
-		RtCheck().KeepOracle("the emulated variant is not available");
-		return;
-	}
-	thread_dimensions(guest);
-	record(guest, 2);
+	record(input_info, 0);
 }
 
 struct IndirectThreadPass {
@@ -942,7 +951,8 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		input_info     = pristine;
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info);
 	}
-	if (compute_module != nullptr && RtCheck().FallsBack(compute_module->info.shader_hash)) {
+	const bool fell_back = compute_module != nullptr && RtCheck().FallsBack(compute_module->info.shader_hash);
+	if (fell_back) {
 		input_info     = pristine;
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info, true);
 	}
@@ -979,7 +989,8 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		EXIT_IF((args_offset & 3u) != 0);
 		RebindBuffers(bindings);
 		m_context.GetOcclusionQueries().WriteForReaders();
-		const bool counted = PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings, rt_pass == 1);
+		const bool counted = PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings, rt_pass == 1,
+		                                             rt_pass != 2 && !fell_back);
 		if (rt_pass == 1) {
 			RtCheck().Before(bindings);
 		}
@@ -1016,17 +1027,22 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		m_deferred_barrier_queue = m_guest_queue;
 		ResetBindings();
 	};
-	if (!RtCheck().Sample(*compute_module, buffer)) {
-		record(input_info, 0);
-		return;
+	if (RtCheck().Sample(*compute_module, buffer)) {
+		const auto             hash   = compute_module->info.shader_hash;
+		ShaderComputeInputInfo guest  = pristine;
+		bool                   queued = false;
+		const auto* guest_module = m_context.GetPipelineCache().GetGuestComputeProgramQueued(cs_regs, guest, queued);
+		if (guest_module == nullptr || m_context.GetPipelineCache().TryGetComputePipeline(guest) == nullptr) {
+			RtCheck().Defer(hash, queued);
+		} else if (RtCheck().Begin(hash)) {
+			record(input_info, 1);
+			if (RtCheck().Active()) {
+				record(guest, 2);
+			}
+			return;
+		}
 	}
-	record(input_info, 1);
-	ShaderComputeInputInfo guest = pristine;
-	if (m_context.GetPipelineCache().GetComputeProgram(cs_regs, guest, true) == nullptr) {
-		RtCheck().KeepOracle("the emulated variant is not available");
-		return;
-	}
-	record(guest, 2);
+	record(input_info, 0);
 }
 
 }

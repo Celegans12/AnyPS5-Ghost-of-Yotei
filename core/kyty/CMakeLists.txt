@@ -148,6 +148,26 @@ add_custom_command(
 )
 add_custom_target(kyty_shader_store_stamp DEPENDS "${KYTY_GENERATED_DIR}/kytyShaderStoreStamp.stamp")
 
+file(GLOB_RECURSE KYTY_HOST_GPU_SOURCES CONFIGURE_DEPENDS
+    "${KYTY_DIR}/graphics/host_gpu/*.cpp" "${KYTY_DIR}/graphics/host_gpu/*.h" "${KYTY_DIR}/graphics/host_gpu/*.comp"
+    "${KYTY_DIR}/graphics/host_gpu/*.inc" "${KYTY_DIR}/graphics/host_gpu/*.frag" "${KYTY_DIR}/graphics/host_gpu/*.vert"
+    "${KYTY_DIR}/graphics/host_gpu/*.task")
+list(SORT KYTY_HOST_GPU_SOURCES)
+string(JOIN "\n" kytyHostGpuList ${KYTY_HOST_GPU_SOURCES})
+file(CONFIGURE OUTPUT "${KYTY_GENERATED_DIR}/kytyHostGpuSources.txt" CONTENT "${kytyHostGpuList}\n")
+add_custom_command(
+    OUTPUT "${KYTY_GENERATED_DIR}/kytyHostGpuStamp.stamp"
+    BYPRODUCTS "${KYTY_GENERATED_DIR}/kytyHostGpuStamp.h"
+    COMMAND ${CMAKE_COMMAND} "-DLIST_FILE=${KYTY_GENERATED_DIR}/kytyHostGpuSources.txt" "-DROOT=${KYTY_DIR}"
+            "-DOUTPUT=${KYTY_GENERATED_DIR}/kytyHostGpuStamp.h" -DNAME=KYTY_HOST_GPU_STAMP
+            -P "${KYTY_DIR}/cmake/shader_store_stamp.cmake"
+    COMMAND ${CMAKE_COMMAND} -E touch "${KYTY_GENERATED_DIR}/kytyHostGpuStamp.stamp"
+    DEPENDS ${KYTY_HOST_GPU_SOURCES} "${KYTY_GENERATED_DIR}/kytyHostGpuSources.txt"
+            "${KYTY_DIR}/cmake/shader_store_stamp.cmake"
+    VERBATIM
+)
+add_custom_target(kyty_host_gpu_stamp DEPENDS "${KYTY_GENERATED_DIR}/kytyHostGpuStamp.stamp")
+
 set(KYTY_SHADER_DIR "${KYTY_DIR}/graphics/host_gpu/shaders")
 file(GLOB KYTY_SHADER_INCLUDES CONFIGURE_DEPENDS "${KYTY_SHADER_DIR}/*.inc")
 set(KYTY_SHADER_HEADERS "")
@@ -216,7 +236,7 @@ set_source_files_properties("${KYTY_SHIM_SOURCE_DIR}/MemoryBacking.cpp" PROPERTI
 list(APPEND KYTY_GPU_SOURCES ${KYTY_SHIM_MEMORY_SOURCES})
 
 add_library(kyty_gpu STATIC ${KYTY_GPU_SOURCES})
-add_dependencies(kyty_gpu kyty_gpu_shaders kyty_shader_store_stamp)
+add_dependencies(kyty_gpu kyty_gpu_shaders kyty_shader_store_stamp kyty_host_gpu_stamp)
 target_include_directories(kyty_gpu
     PUBLIC
         "${KYTY_DIR}"

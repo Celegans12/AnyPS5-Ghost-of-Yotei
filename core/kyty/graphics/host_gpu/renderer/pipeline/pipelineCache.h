@@ -364,6 +364,8 @@ public:
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
 	                                      ShaderComputeInputInfo&      input_info,
 	                                      bool                         guest_traversal = false);
+	const ShaderModule* GetGuestComputeProgramQueued(const HW::ComputeShaderInfo& regs,
+	                                                 ShaderComputeInputInfo& input_info, bool& queued);
 	static void NoteAheadGuestWrite(uint64_t sequence, uint64_t address,
 	                                std::span<const uint32_t> data, bool one_address);
 	static void RetireAheadGuestWrites(uint64_t executed);
@@ -478,6 +480,8 @@ private:
 	std::array<uint32_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> m_compiled {};
 	ProgramKey                             m_lookup_key;
 	bool                                   m_guest_traversal = false;
+	bool                                   m_queue_only      = false;
+	bool                                   m_queued          = false;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
 	std::mutex                    m_driver_cache_mutex;
@@ -537,7 +541,8 @@ private:
 	template <typename InputInfo>
 	void QueueCompile(const ProgramKey& key, const ShaderParams& params, const InputInfo& input_info,
 	                  uint32_t                                            push_data_cursor,
-	                  const ShaderRecompiler::IR::ResourceSpecialization* specialization);
+	                  const ShaderRecompiler::IR::ResourceSpecialization* specialization,
+	                  bool                                                guest_traversal = false);
 	bool WaitForCompile(const ProgramKey& key);
 	template <typename InputInfo>
 	void RunCompileJob(CompileJob& job, InputInfo& input_info);
