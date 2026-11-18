@@ -77,7 +77,9 @@ KernelStatsSampler& StatsSampler() {
 	return *sampler;
 }
 
+#if !defined(ANYPS5_KYTY_DLL)
 [[maybe_unused]] const bool g_view_enabled = (Shim::EnableView(), true);
+#endif
 
 }
 
