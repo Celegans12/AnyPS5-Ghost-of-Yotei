@@ -44,7 +44,14 @@ jobs:
         name: Count the upstream commits not yet in the base branch
         run: |
           upstream=$(gh api "repos/$UPSTREAM/branches/$UPSTREAM_BRANCH" --jq .commit.sha)
-          ahead=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$upstream" --jq .ahead_by)
+          ahead=""
+          for attempt in 1 2 3; do
+            ahead=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$upstream" --jq .ahead_by) && break
+            ahead=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...${UPSTREAM%%/*}:${UPSTREAM#*/}:$UPSTREAM_BRANCH" --jq .ahead_by) && break
+            echo "::warning::compare failed on attempt $attempt; retrying in $((attempt * 20)) s"
+            sleep $((attempt * 20))
+          done
+          if [ -z "$ahead" ]; then echo "::error::could not compare $BASE with upstream $UPSTREAM_BRANCH"; exit 1; fi
           pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&base=$BASE&head=${UPSTREAM%%/*}:$UPSTREAM_BRANCH&per_page=100" \
             --jq "[.[] | select(.title | startswith(\"$PR_TITLE\"))][0].number // empty")
           issue=$(gh api "repos/$GITHUB_REPOSITORY/issues?state=open&creator=github-actions%5Bbot%5D&per_page=100" \
