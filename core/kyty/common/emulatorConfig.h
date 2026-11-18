@@ -119,7 +119,7 @@ struct ConfigOptions {
 	bool                   async_pipelines_enabled     = true;
 	bool                   rt_stats_enabled            = false;
 	uint32_t               rt_oracle                   = 0;
-	uint32_t               rt_check_period             = 0;
+	uint32_t               rt_check_period             = 256;
 	uint32_t               rt_check_ppm                = 1000;
 	uint32_t               rt_check_strikes            = 3;
 	bool                   trophy_enabled              = true;
