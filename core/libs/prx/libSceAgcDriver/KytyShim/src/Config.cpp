@@ -124,6 +124,7 @@ void ReadEnum(const char* variable, Enum& out, std::string& applied) {
 
 Options OptionsFromEnvironment(std::string& applied) {
     Options options;
+    options.shader_cache_enabled = true;
     for (const auto& flag : Flags) {
         const char* value = Read(flag.variable, applied);
         if (value == nullptr) continue;

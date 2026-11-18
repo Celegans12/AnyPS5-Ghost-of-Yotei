@@ -185,7 +185,7 @@ On by default unless the row says otherwise; set one to compare, or to work arou
 | `KYTY_PROGRAM_LOCK` | `narrow` (default), `wide` | Scope of the program-cache lock. `wide` is Kyty's |
 | `KYTY_PIPELINE_LIBRARIES` | `0`, `1` (default) | Link graphics pipelines from per-stage pipeline libraries (`VK_EXT_graphics_pipeline_library`) |
 | `KYTY_ASYNC_PIPELINES` | `0`, `1` (default in this build) | Create the pipeline of a draw that only changes the picture in the background; the draw is skipped until it is ready |
-| `KYTY_SHADER_CACHE` | `0` (default), `1` | Keep recompiled shaders on disk and warm them up at the next start (Release builds) |
+| `KYTY_SHADER_CACHE` | `0`, `1` (default) | Keep recompiled shaders on disk and warm them up at the next start (Release builds); `0` translates them again at each start |
 | `ANYPS5_KYTY_PRESTART` | `0`, `1` (default) | `0` starts the Kyty GPU after the window exists instead of during its creation |
 
 **Ray tracing**
