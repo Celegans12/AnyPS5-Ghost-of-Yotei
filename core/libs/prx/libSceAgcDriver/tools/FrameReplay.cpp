@@ -44,6 +44,7 @@
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
 #include <pthread.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 #endif
 
@@ -125,13 +126,36 @@ Counters countersNow() {
     return values;
 }
 
+std::atomic<std::uint64_t> endedThreadNs{0};
+
+std::string toolThreadName() {
+    std::string name = "agc_frame_replay";
+    std::ifstream comm("/proc/self/comm");
+    std::getline(comm, name);
+    return name;
+}
+
+struct EndedThreadCpu {
+    EndedThreadCpu() = default;
+    EndedThreadCpu(const EndedThreadCpu&) = delete;
+    EndedThreadCpu& operator=(const EndedThreadCpu&) = delete;
+    ~EndedThreadCpu() {
+#ifdef __linux__
+        timespec spent{};
+        if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &spent) == 0) endedThreadNs += static_cast<std::uint64_t>(spent.tv_sec) * 1000000000ull + static_cast<std::uint64_t>(spent.tv_nsec);
+#endif
+    }
+};
+
 struct Sample {
     std::map<long, ThreadSample> threads;
     Counters counters{};
+    std::uint64_t endedNs = 0;
 };
 
 Sample sampleNow() {
-    return {sampleThreads(), countersNow()};
+    const auto ended = endedThreadNs.load();
+    return {sampleThreads(), countersNow(), ended};
 }
 
 class Frames {
@@ -809,6 +833,7 @@ struct Replay {
         sequenced.store(0);
         stalled.store(false);
         std::thread breaker([&] {
+            const EndedThreadCpu ended;
             if (!options.release) return;
             auto lastSeen = progress();
             auto lastProgress = Clock::now();
@@ -829,6 +854,7 @@ struct Replay {
         std::vector<std::thread> workers;
         for (const auto& entry : byThread) {
             workers.emplace_back([&, &indices = entry.second] {
+                const EndedThreadCpu ended;
                 for (const auto index : indices) {
                     std::unique_lock lock(mutex);
                     turn.wait(lock, [&] { return started == index || failure != nullptr; });
@@ -1305,8 +1331,9 @@ struct Window {
     Counters counters{};
     std::size_t frames = 0;
 
-    void Add(const Sample& from, const Sample& to, std::size_t frameCount) {
+    void Add(const Sample& from, const Sample& to, std::size_t frameCount, bool ended = false) {
         for (const auto& [name, ns] : threadCpu(from.threads, to.threads)) threadNs[name] += ns;
+        if (ended) threadNs[toolThreadName()] += to.endedNs - from.endedNs;
         for (std::size_t index = 0; index < counters.size(); ++index) counters[index] += to.counters[index] > from.counters[index] ? to.counters[index] - from.counters[index] : 0;
         frames += frameCount;
     }
@@ -1408,6 +1435,8 @@ int run(const Options& options) {
         if (frameStart != calls.end()) replay.runWindow(std::span(calls).subspan(static_cast<std::size_t>(frameStart - calls.begin()) + 1));
         else AgcDriverWaitIdle_nid_postfix();
         replay.endedAt = Clock::now();
+        if (replay.unfinished == 0) AgcDriverWaitIdle_nid_postfix();
+        static_cast<void>(replay.frames.Samples());
         measured.end = sampleNow();
         if (const auto failure = replay.frames.Failure()) std::rethrow_exception(failure);
         measured.frames = replay.frames.Times().size() - measured.firstFrame;
@@ -1446,7 +1475,7 @@ int run(const Options& options) {
         frameMs.insert(frameMs.end(), passMs.begin(), passMs.end());
         seconds += measured.seconds;
         frames += measured.frames;
-        whole.Add(measured.begin, measured.end, measured.frames);
+        whole.Add(measured.begin, measured.end, measured.frames, true);
         for (auto frame = measured.firstFrame + 1; frame < measured.firstFrame + measured.frames && frame < samples.size(); ++frame) steady.Add(samples[frame - 1], samples[frame], 1);
     }
     const auto slowest = frameMs.empty() ? 0.0 : *std::max_element(frameMs.begin(), frameMs.end());
