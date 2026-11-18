@@ -435,7 +435,9 @@ public:
             if (regionEnd > end) kept.emplace_back(end, regionEnd);
         }
         _hostRegions = std::move(kept);
+#if defined(__linux__) || defined(__APPLE__)
         static_cast<void>(ReserveNoReplace(start, bytes));
+#endif
     }
 #endif
 };
