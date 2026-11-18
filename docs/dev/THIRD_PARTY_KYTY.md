@@ -282,6 +282,7 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 | `KYTY_SHADER_CACHE_STAMP` | integer in base 0, else ignored | the stamp the build computes from the shader recompiler's sources | Replaces the stamp written in the shader store's header; `0` turns the store off | debug | all | `4749ffc567` |
 | `KYTY_SHADER_CACHE_THREADS` | whole number, `0` or text is ignored | `Common::ParallelThreads()`, at most the number of jobs | Threads that warm the shader store up | perf | all | `4749ffc567` |
 | `KYTY_SHADER_CACHE_SHARED` | `1` shared, any other value per-thread | shared, except per-thread with NVIDIA's driver | One shared Vulkan pipeline cache for the warm-up threads, or one cache per thread | perf | all | `4749ffc567` |
+| `KYTY_SHADER_VARIANT_LOG` | `1` enables it | off | Logs one `[kyty-variant] build` record per successful shader module build, including ahead and manifest compilation. Cache hits and stored-module restores produce no record. The module ID and separate static-state, buffer, image, sampler and linked-code fingerprints identify changing inputs without dumping shader code. The record includes the compiled push-data start and the requested cursor as separate values | debug | all | AnyKyty |
 
 ### Ray tracing
 

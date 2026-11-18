@@ -203,6 +203,7 @@ On by default unless the row says otherwise; set one to compare, or to work arou
 | `KYTY_PRINTF_DIRECTION` | `Silent` (default), `Console`, `File` | Where Kyty's log goes |
 | `KYTY_SESSION_LOG` | path | Writes a session log file |
 | `KYTY_PIPELINE_STALL_LOG_MS` | milliseconds, `100` by default | Logs `[kyty-gpl]` lines for pipeline stalls and shader translations that take this long |
+| `KYTY_SHADER_VARIANT_LOG` | `1` enables it | Logs shader builds with a module ID and cache-key fingerprints. Compare records for the same stage and shader hash across repeated runs |
 | `KYTY_VULKAN_VALIDATION` | `0`, `1` | Turns the Khronos validation layer on |
 | `KYTY_LOCK_STATS` | `0`, `1` | Prints how long threads wait on the program-cache lock |
 
