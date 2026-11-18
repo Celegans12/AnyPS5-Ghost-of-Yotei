@@ -93,6 +93,20 @@ A title's `files` in `tools/titles.json` adds files to its prepared folders befo
 
 `SDL_AUDIODRIVER` is inherited and defaults to `dummy` (silent); set it to `wasapi` or another SDL driver to exercise a title's audio path.
 
+## Guest exceptions delivered under host locks
+
+On Linux, `sceKernelRaiseException` signals the target thread with `SIGUSR1` and the guest handler runs wherever that thread is, host code included. A handler that parks its thread, as garbage collectors that stop the world do, keeps every host lock that thread holds until it is resumed. Host locks that a guest thread takes for a short section are held under the libkernel delivery deferral (`TimedWait::DeferredDeliveryLock`, or `GuestDeliveryHold_nid_no_patch` and `GuestDeliveryRelease_nid_no_patch` from another library), which delivers the exception once the lock is released.
+
+To list the locks a title still holds when its handlers run, build the checker and preload it into the title:
+
+```
+g++ -O2 -std=c++20 -shared -fPIC -o libdeliverylockcheck.so tools/delivery-lock-check/check.cpp -ldl
+LD_PRELOAD=$PWD/libdeliverylockcheck.so DELIVERY_LOCK_CHECK_OUT=/tmp/title <emulator command>
+python3 tools/delivery-lock-check/symbolize.py <standard error> /tmp/title.maps --libs <build>/core/libs/libs
+```
+
+It tracks the POSIX mutexes, read-write locks and spin locks each thread holds, wraps the `SIGUSR1` handler and writes to standard error, for every 64 deliveries, how many ran without a tracked lock, ran with locks held, or were deferred until a lock was released, with the call site and address of each lock seen. `symbolize.py` names the sites and locks from the maps file the checker writes at the first delivery. Locks built on atomics, such as the Kyty `TrackingSpinLock`, and glibc's internal locks are not tracked. The checker slows every lock down and is for diagnosis only.
+
 ## CSV exports
 
 - `tools/performance_csv.py <baseline> <candidate>` exports a performance comparison as CSV. Empty metric cells mean the value was not reported; `--require-matching-context` fails when the two captures differ in machine or scene, and `--spreadsheet-safe` escapes cells that spreadsheets would evaluate.
