@@ -9,8 +9,8 @@ merge: merges the raw profiles an instrumented build wrote (-DANYPS5_KYTY_PGO_GE
 text profile, the form the repository keeps, headed by the commit, the date, the note and one fingerprint per Kyty source.
 check: lists the Kyty sources that changed since the profile was trained, as the configure step does; exits 1 when any did.
 report: reads the log of a build that used the profile, lists the functions Clang compiled without their counts ("function control
-flow change detected") with their weight in the profile and their rank among the profile's functions, as Markdown on the standard
-output (and appended to --summary, the job summary of CI). When one of the --top hottest functions is among them (10 by default),
+flow change detected"), with their peak counter weight and rank in the profile and Clang's separate discarded count, as Markdown
+on the standard output (and appended to --summary, the job summary of CI). When one of the --top hottest functions is among them (10 by default),
 or when together they hold --share percent of the profile's weight (1 by default), --annotate adds a GitHub warning annotation. Always exits 0 once the log is read: a stale profile costs speed, never the build.
 """
 
@@ -40,7 +40,7 @@ LOST_LINE = re.compile(
     r"(?:(?P<file>\S+): )?function (?:control flow|basic block count) change detected \((?:hash|counter) mismatch\) "
     r"(?P<name>\S+) Hash = \d+(?: up to (?P<count>\d+) count discarded)?"
 )
-COUNT_LINE = re.compile(r"^-?\d+(:\d+)?$")
+MAX_PROFILE_COUNT = (1 << 64) - 1
 SUMMARY_ROWS = 25
 
 
@@ -158,23 +158,24 @@ def check(args):
 
 
 def profile_weights(profile):
+    lines = [line.strip() for line in profile.read_text(encoding="utf-8").splitlines()]
     weights = {}
-    current = None
-    counting = False
-    with profile.open(encoding="utf-8") as stream:
-        for raw in stream:
-            line = raw.strip()
-            if not line:
-                counting = False
-            elif line.startswith("#"):
-                counting = line == "# Counter Values:"
-            elif line.startswith(":") or COUNT_LINE.match(line):
-                if counting and current is not None and line.isdigit():
-                    weights[current] = max(weights[current], int(line))
-            else:
-                current = line
-                weights[current] = 0
-                counting = False
+    for index, line in enumerate(lines[1:-4], start=1):
+        if line != "# Func Hash:":
+            continue
+        name, _, func_hash, count_header, count_text, values_header = lines[index - 1:index + 5]
+        if (not name or not func_hash.isdecimal() or count_header != "# Num Counters:"
+                or not count_text.isdecimal() or values_header != "# Counter Values:"):
+            continue
+        count = int(count_text)
+        counter_lines = lines[index + 5:index + 5 + count]
+        if not counter_lines or len(counter_lines) != count or not all(value.isdecimal() for value in counter_lines):
+            continue
+        counters = list(map(int, counter_lines))
+        if counters[0] in (MAX_PROFILE_COUNT, MAX_PROFILE_COUNT - 1):
+            continue
+        peak = max((value for value in counters if value < MAX_PROFILE_COUNT), default=0)
+        weights[name] = max(weights.get(name, 0), peak)
     return weights
 
 
@@ -184,8 +185,11 @@ def lost_functions(logs):
         with open(log, encoding="utf-8", errors="replace") as stream:
             for raw in stream:
                 match = LOST_LINE.search(ANSI.sub("", raw))
-                if match and match["name"] not in found:
-                    found[match["name"]] = (match["file"] or "", int(match["count"]) if match["count"] else None)
+                if match:
+                    file = Path((match["file"] or "").replace("\\", "/")).name
+                    key = match["name"], file
+                    if found.get(key) is None:
+                        found[key] = int(match["count"]) if match["count"] else None
     return found
 
 
@@ -216,20 +220,30 @@ def report(args):
     ordered = sorted(weights.values())
     total = sum(ordered) or 1
     lost = lost_functions(args.logs)
-    names = demangle(sorted(lost))
+    names = demangle(sorted({name for name, _ in lost}))
     rows = []
-    for name, (file, count) in lost.items():
-        weight = count if count is not None else max(weights.get(name, 0), weights.get(f"{Path(file).name};{name}", 0))
+    seen = set()
+    for (name, file), count in lost.items():
+        keys = [key for key in (name, f"{file};{name}") if key in weights]
+        if len(keys) != 1:
+            rows.append((None, None, names[name], file, count))
+            continue
+        key = keys[0]
+        if key in seen:
+            continue
+        seen.add(key)
+        weight = weights[key]
         rank = len(ordered) - bisect.bisect_right(ordered, weight) + 1
-        rows.append((rank, weight, names[name], Path(file).name, name))
-    rows.sort(key=lambda row: (row[0], row[2]))
-    lost_weight = sum(row[1] for row in rows)
-    hot = [row for row in rows if row[0] <= args.top]
+        rows.append((rank, weight, names[name], file, count))
+    rows.sort(key=lambda row: (row[0] is None, row[0], row[2]))
+    ranked = [row for row in rows if row[0] is not None]
+    lost_weight = sum(row[1] for row in ranked)
+    hot = [row for row in ranked if row[1] > 0 and row[0] <= args.top]
     lost_share = 100.0 * lost_weight / total
     reasons = []
     if hot:
         reasons.append(f"{len(hot)} of the {args.top} hottest functions lost their counts")
-    if lost_share >= args.share:
+    if lost_weight > 0 and lost_share >= args.share:
         reasons.append(f"the functions that lost their counts hold {lost_share:.2f} % of the profile's weight (limit {args.share:g} %)")
     stale = bool(reasons)
     lines = ["### Kyty PGO profile", ""]
@@ -245,26 +259,33 @@ def report(args):
         lines.append("")
         lines.append(f"**{len(rows)} functions lost their counts** and were compiled without the profile, {lost_share:.2f} % of the profile's weight "
                      f"(weight = highest counter of the function; rank among the {len(ordered)} functions the profile counts).")
+        if len(ranked) != len(rows):
+            lines.append(f"{len(rows) - len(ranked)} losses have no unambiguous profile weight.")
         if stale:
             lines.append("")
             lines.append(f"> [!WARNING]\n> {'; '.join(reasons)}. The build is not affected, but it is slower than the recorded profile promises: "
                          "record the profile again after this series of changes (docs/dev/KYTY_PGO.md, \"Recording the profile\").")
         lines.append("")
-        lines.append("| Rank | Weight | Share | Function | File |")
-        lines.append("|---:|---:|---:|---|---|")
-        for rank, weight, demangled, file, _ in rows[:SUMMARY_ROWS]:
-            lines.append(f"| {rank} | {weight:,} | {100.0 * weight / total:.2f} % | `{shorten(demangled).replace('|', '\\|')}` | {file} |")
+        lines.append("| Rank | Weight | Share | Clang discarded count | Function | File |")
+        lines.append("|---:|---:|---:|---:|---|---|")
+        for rank, weight, demangled, file, count in rows[:SUMMARY_ROWS]:
+            stats = f"{rank} | {weight:,} | {100.0 * weight / total:.2f} %" if rank is not None else "— | — | —"
+            discarded = f"{count:,}" if count is not None else "—"
+            function = shorten(demangled).replace("|", "\\|")
+            lines.append(f"| {stats} | {discarded} | `{function}` | {file} |")
         if len(rows) > SUMMARY_ROWS:
             rest = rows[SUMMARY_ROWS:]
             lines.append("")
-            lines.append(f"and {len(rest)} colder ones (hottest rank {rest[0][0]}, together {100.0 * sum(row[1] for row in rest) / total:.2f} % of the weight).")
+            ranked_rest = ranked[SUMMARY_ROWS:]
+            rest_share = 100.0 * sum(row[1] for row in ranked_rest) / total
+            lines.append(f"and {len(rest)} more ({len(ranked_rest)} ranked, together {rest_share:.2f} % of the weight).")
     text = "\n".join(lines) + "\n"
     print(text)
     if args.summary:
         with open(args.summary, "a", encoding="utf-8", newline="\n") as stream:
             stream.write(text)
     if args.annotate and stale:
-        shown = ", ".join(f"{shorten(row[2], 70)} (rank {row[0]})" for row in rows[:4])
+        shown = ", ".join(f"{shorten(row[2], 70)} (rank {row[0]})" for row in ranked[:4])
         message = (f"{'; '.join(reasons)}: {shown}. The build is not affected, but it is slower than the recorded profile promises. "
                    "Record the profile again after this series of changes (docs/dev/KYTY_PGO.md).")
         print(f"::warning file={escape_property(profile.relative_to(ROOT).as_posix()) if profile.is_relative_to(ROOT) else escape_property(str(profile))},"
