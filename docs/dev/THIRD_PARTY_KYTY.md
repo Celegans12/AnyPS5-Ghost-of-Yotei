@@ -229,6 +229,31 @@ points: on Stray at 4,240 draws a frame, depths 1, 4, 8 and 16 give 56.2, 56.5, 
 images; Subnautica gives 208.6 and 212.7 at depths 1 and 8 (`notes/stray-perf-cpu.md`). `KYTY_SUSPEND_POINT_DEPTH=1`
 restores KytyPS5's behaviour; a value outside 1 to 64 stops the emulator with a message naming the variable.
 
+Deferred labels: while an occlusion-counter dump waits for the end of its command buffer, or while a queue has a deferred
+label, KytyPS5 defers each `RELEASE_MEM` label to the end of the command buffer it was recorded into, on the same
+first-in first-out priority queue as the dump publications, so that labels and occlusion counters become visible in the
+order the GPU wrote them. That order only needs a label to wait for the dumps older than it, not for its own command
+buffer: when nothing is pending, KytyPS5 already writes a label as soon as the execute thread reaches it, and the buffer
+and texture caches keep the data the GPU wrote before it. Under `ANYPS5_KYTY`, with `KYTY_LABELS_AFTER_DUMPS` at 1, the
+default, a deferred label waits for the command buffer of the newest pending dump instead of its own, still behind every
+older priority operation, and a priority operation never takes an older tick than the one queued before it, which
+`WaitPriorityOperations` relies on. While any queue has a deferred label, every queue defers its labels: otherwise a
+queue with none pending writes its label at once, ahead of an older label of another queue that the game may already have
+waited for, and Stray recycles that older label's memory before its write lands (a crash in its small-block allocator
+at address 1). Unreal Engine 4 keeps occlusion queries pending almost all the time, and the command processor waits about
+once a frame for a deferred label: on Stray at 4,240 draws a frame, the execute thread goes from 81 to 95 percent of the
+frame and the frame rate from 71.0 to 80.1 and 80.9 frames per second, the same images (`notes/stray-label-flush.md`).
+`KYTY_LABELS_AFTER_DUMPS=0` restores KytyPS5's behaviour; another value stops the emulator with a message naming the
+variable.
+
+Blocked waits on deferred writes: KytyPS5's command processor submits the open command buffer after a pass over a
+submission that made progress, but not after one that yields to another queue, nor when a queue resumes straight into a
+wait that still fails. If the value that queue waits for is a deferred write recorded into the open command buffer, and
+no other submission comes, nothing submits that buffer and the title hangs. Under `ANYPS5_KYTY`, a queue that blocks
+without progress on a range with a pending deferred write submits the open command buffer, once per blocked wait,
+whatever `KYTY_LABELS_AFTER_DUMPS` says; deferring the labels of every queue makes the case more likely in titles
+without occlusion queries.
+
 `m_program_lock`, the spin lock of `graphics/host_gpu/renderer/pipeline/pipelineCache.cpp` that guards the program
 cache, has a narrower scope than upstream's in this build (`programLock.cpp`). The resolve thread always runs upstream's
 unlocked ahead mode, which upstream only uses with `KYTY_RESOLVE_HELPER=1`, and the execute thread releases the lock
