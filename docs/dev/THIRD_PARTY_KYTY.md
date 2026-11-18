@@ -46,6 +46,29 @@ it, and its `ErrorDialogOpen` and `ErrorDialogClose` would be second declaration
 - Every comment is removed, except the two notices above. `core/kyty/tools/kyty_import.py` does it with a C++ lexer
   that keeps string, character and raw string literals and digit separators intact, and checks each file: the token
   stream that `g++ -fpreprocessed` produces is the same before and after, preprocessor line ends included.
+- Fixes made in [KytyPS5](https://github.com/KytyPS5/KytyPS5) after `v24`, merged on its `main` or open as pull
+  requests, are applied on top of `v24`, stripped of comments the same way, one commit each with a
+  `Ported-from: KytyPS5 <commit>` line per upstream commit:
+
+  | KytyPS5 commit | Pull request | Change |
+  |---|---|---|
+  | `174ec912` | — | `V_MSAD_U8` is translated |
+  | `2f26870e` | — | the device enables `VK_KHR_compute_shader_derivatives`, whose capabilities the translator emits |
+  | `a2ea94e9` | — | no swapchain is created while the window's surface has no area |
+  | `50c0c066`, `18809cb0`, `15c8c618` | — | the VideoOut output transfer applies to linear formats, unpremultiplied PQ overlays are clamped, the HDR attribute check is part of the `ATTRIBUTE` default; `50c0c066` as Kyty's `main` resolves it on `v24` |
+  | `2086171a` | — | `pm4Handlers.cpp` only: a flip block on an async compute queue (`R = 0`) is recognised |
+  | `85e775f0` | #2062 | `RenderContext` builds the image heap before the pipeline cache |
+  | `8d2e4376` | #2245 | `LOAD_*_REG_INDEX` honour their `data_format` field |
+  | `bd2cffb2` | #2363 | write-only R16G16 signed storage images go through their unsigned view |
+  | `3e2e67c9`, `44016a0a` | #2006 | block-compressed textures get no DCC metadata, in `DeriveTextureDesc` |
+  | `d8fcae8e` | #1963 | `BASE_ARRAY` is ignored for 1D and 2D non-array views |
+  | `bc553dca` | #1733 | depth-compare samples get a sampler variant of their own |
+  | `222d8301` | #1405 | a lone last dword of a command buffer is consumed |
+  | `7ee598b4`, `f26b1d7e` | #1403 | a compute dispatch's scalar reads may overlap the start of its own sentinel write range (`FindBuffers`); `a9d34f70`'s `CommitBindings` check is not in `v24` |
+  | `d6ad3c2b` | #1802 | a buffer allocation refused by VMA's budget is retried once without the budget limit |
+
+  `Presenter::PrepareFrame` takes the VideoOut pixel format since `50c0c066`: the shim passes the display buffer's
+  `pixelFormat`.
 - Nothing else is changed in the imported files. Adaptations to AnyPS5 go in the shim, or under
   `#if defined(ANYPS5_KYTY)` in `core/kyty/`. `ANYPS5_KYTY=1` is defined for every target of a
   `-DANYPS5_GPU_BACKEND=kyty` build and never otherwise.

@@ -139,12 +139,12 @@ private:
 	RenderExecutor            m_render_executor;
 	CommandScheduler          m_command_scheduler;
 	DescriptorHeap            m_descriptor_heap;
-	PipelineCache             m_pipeline_cache;
 	SamplerCache              m_sampler_cache;
 	PageManager               m_page_manager;
 	BufferCache               m_buffer_cache;
 	TextureCache              m_texture_cache;
 	ImageHeap                 m_image_heap;
+	PipelineCache             m_pipeline_cache;
 	StrictWatch               m_strict_watch {m_page_manager};
 	IndirectWriteTables       m_indirect_write_tables {*this};
 	OcclusionQueries          m_occlusion_queries {*this};

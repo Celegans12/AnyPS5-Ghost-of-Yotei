@@ -456,6 +456,10 @@ static bool TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
 	    storage || resource.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
+	const auto base_layer = descriptor.Type() == Prospero::ImageType::kColor1D ||
+	                                descriptor.Type() == Prospero::ImageType::kColor2D
+	                            ? 0u
+	                            : descriptor.BaseArray5();
 	switch (resource.dimension) {
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
 			view.type        = vk::ImageViewType::e3D;
@@ -477,7 +481,7 @@ static bool TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
 			view.type       = vk::ImageViewType::e2D;
-			view.base_layer = descriptor.BaseArray5();
+			view.base_layer = base_layer;
 			if (view.base_layer >= image_layers) {
 				unsupported = "texture base layer is out of bounds";
 				return false;
@@ -640,7 +644,8 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 	}
 	const auto view_format =
 	    storage ? StorageViewFormat(resource, format, pixel_format) : pixel_format;
-	const auto              block_bytes = Prospero::BlockCompressedBytesPerBlock(format);
+	const auto block_bytes   = Prospero::BlockCompressedBytesPerBlock(format);
+	const bool meta_compress = block_bytes == 0 && !resource.r128 && descriptor.MetaCompress();
 	TextureCache::ImageDesc desc {};
 	desc.info.data         = {address, 0};
 	desc.info.pixel_format = pixel_format;
@@ -652,12 +657,12 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 	    block_bytes != 0 ? block_bytes : Prospero::NumBytesPerElement(format);
 	desc.info.samples   = samples;
 	desc.info.tile_mode = tile;
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
+	if (meta_compress && tile != Prospero::TileMode::kDepth) {
 		desc.info.metadata.kind = ImageMetadataKind::Dcc;
 	}
 	if (levels > physical_levels) {
 		if (!ResolveTextureMipView(desc.info, physical_levels,
-		                           !resource.r128 && descriptor.MetaCompress(), view_levels,
+		                           meta_compress, view_levels,
 		                           view_base)) {
 			if (base_level >= physical_levels ||
 			    resource.mip_mode == ShaderRecompiler::IR::ImageMipMode::Dynamic) {
@@ -688,7 +693,7 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 	if (storage) {
 		ValidateStorageTexture(resource, descriptor, desc.info.data.size);
 	}
-	if (!resource.r128 && descriptor.MetaCompress() && tile != Prospero::TileMode::kDepth) {
+	if (meta_compress && tile != Prospero::TileMode::kDepth) {
 		TileSizeAlign metadata_size {};
 		(void)TileGetDccSize(width, height, volume ? depth : image_layers,
 		                     desc.info.bytes_per_block, physical_levels, tile, metadata_size,
@@ -2372,11 +2377,13 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 			if (descriptor.NumRecords() == UINT32_MAX) {
 				if (program.info.buffers[resource].written) {
 					for (const auto* reader: stages) {
+						const bool own_compute_reads =
+						    reader == stage && program.stage == ShaderType::Compute;
 						for (const auto [read_address, read_size]: reader->runtime->resources->specialization_reads) {
 							if (read_size == 0) continue;
 							if (read_address > address) {
 								size = std::min(size, read_address - address);
-							} else if (address - read_address < read_size) {
+							} else if (address - read_address < read_size && !own_compute_reads) {
 								EXIT("scalar resource reads overlap a shader buffer write\n");
 							}
 						}

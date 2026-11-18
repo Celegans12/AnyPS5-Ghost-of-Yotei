@@ -205,9 +205,12 @@ bool ValidatePackedUnormSampling(const ResourcePlan& program, const ResourceSnap
 	return true;
 }
 
-enum class SamplerClass : uint8_t { Float, Integer };
+enum class SamplerClass : uint8_t { Float, Integer, Compare };
 
 SamplerClass ClassifySampler(const ImageResource& image) {
+	if (image.depth_compare) {
+		return SamplerClass::Compare;
+	}
 	return image.numeric_class == Prospero::TextureNumericClass::Uint ||
 	               image.numeric_class == Prospero::TextureNumericClass::Sint
 	           ? SamplerClass::Integer : SamplerClass::Float;
@@ -1272,7 +1275,7 @@ struct SamplerPlan {
 		uint32_t     source;
 		SamplerClass type;
 	};
-	std::vector<std::array<uint32_t, 2>> mapping;
+	std::vector<std::array<uint32_t, 3>> mapping;
 	std::vector<Binding>                bindings;
 };
 
@@ -1398,7 +1401,8 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		}
 		const auto raw_sint_format = RawSignedStorageFormat(base, format);
 		const bool raw_sint_storage = raw_sint_format != Prospero::BufferFormat::kInvalid;
-		if (raw_sint_format == Prospero::BufferFormat::k16UInt) image.conversion_format = format;
+		if (raw_sint_storage && raw_sint_format != Prospero::BufferFormat::k32UInt)
+			image.conversion_format = format;
 		if (storage && image.conversion_format == Prospero::BufferFormat::kInvalid) {
 			image.shader_swizzle = CanonicalStorageSwizzle(image.shader_swizzle, format);
 		}
@@ -2548,7 +2552,8 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 		}
 		samplers[index].snapshot_index = binding.source;
 		samplers[index].force_point_filtering = binding.type == SamplerClass::Integer;
-		samplers[index].integer_border        = binding.type != SamplerClass::Float;
+		samplers[index].integer_border        = binding.type == SamplerClass::Integer;
+		samplers[index].depth_compare         = binding.type == SamplerClass::Compare;
 	}
 	for (uint32_t index = 0; index < sampler_plan.bindings.size(); index++) {
 		const auto& binding = sampler_plan.bindings[index];

@@ -1596,7 +1596,16 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			continue;
 		}
 
-		EXIT_NOT_IMPLEMENTED(remaining_dw < 2);
+		if (remaining_dw < 2) {
+			static std::atomic<uint32_t> tail_log_count {0};
+			if (tail_log_count.fetch_add(1, std::memory_order_relaxed) < 16) {
+				LOGF("CP: trailing dword 0x%08" PRIx32 " at offset=0x%05" PRIx32 "\n", packet[0],
+				     total_dw - remaining_dw);
+			}
+			cursor.offset_dw++;
+			execution.m_made_progress = true;
+			continue;
+		}
 
 		if (debug_dump) {
 			LOGF("CP packet: offset=0x%05" PRIx32 " cmd_id=0x%08" PRIx32 " op=0x%02" PRIx32

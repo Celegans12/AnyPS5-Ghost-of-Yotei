@@ -1008,10 +1008,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectCxRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect CX registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
-	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
-		auto raw_cmd_offset = indirect_buffer[0];
+	const Pm4::LoadedRegisters registers {indirect_buffer, buffer[2]};
+	for (uint32_t i = 0; i < indirect_num_dw; i++) {
+		auto raw_cmd_offset = registers.RawOffset(i);
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
-		auto value          = indirect_buffer[1];
+		auto value          = registers.Value(i);
 
 		if (cmd_offset == Pm4::CX_NOP) {
 			continue;
@@ -1074,12 +1075,13 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect SH registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
-	const auto indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	const auto                 indirect_address = reinterpret_cast<uint64_t>(indirect_buffer);
+	const Pm4::LoadedRegisters registers {indirect_buffer, buffer[2]};
 
-	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
-		auto raw_cmd_offset = indirect_buffer[0];
+	for (uint32_t i = 0; i < indirect_num_dw; i++) {
+		auto raw_cmd_offset = registers.RawOffset(i);
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
-		auto value          = indirect_buffer[1];
+		auto value          = registers.Value(i);
 
 		if (cmd_offset == Pm4::SH_NOP || raw_cmd_offset == 0xffffffffu) {
 			continue;
@@ -1097,10 +1099,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectShRegs) {
 			LOGF("unknown indirect SH register: index=%" PRIu32 "/%" PRIu32 ", regs=0x%016" PRIx64
 			     ", offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
 			     i, indirect_num_dw, indirect_address, cmd_offset, value);
-			auto* dump_regs = indirect_buffer - i * 2;
 			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
 				LOGF("\t sh_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+				     j, registers.RawOffset(j), registers.Value(j));
 			}
 			EXIT("unknown sh reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
@@ -1127,10 +1128,11 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 	if (indirect_buffer == nullptr) {
 		EXIT("indirect UC registers have null address, num_regs = %" PRIu32 "\n", indirect_num_dw);
 	}
-	for (uint32_t i = 0; i < indirect_num_dw; i++, indirect_buffer += 2) {
-		auto raw_cmd_offset = indirect_buffer[0];
+	const Pm4::LoadedRegisters registers {indirect_buffer, buffer[2]};
+	for (uint32_t i = 0; i < indirect_num_dw; i++) {
+		auto raw_cmd_offset = registers.RawOffset(i);
 		auto cmd_offset     = NormalizeRegisterOffset(raw_cmd_offset);
-		auto value          = indirect_buffer[1];
+		auto value          = registers.Value(i);
 
 		if (cmd_offset == Pm4::UC_NOP) {
 			continue;
@@ -1144,10 +1146,9 @@ KYTY_CP_OP_PARSER(CpOpIndirectUcRegs) {
 		auto pfunc = g_hw_uc_indirect_func[cmd_offset & (Pm4::UC_NUM - 1)];
 
 		if (pfunc == nullptr) {
-			auto* dump_regs = indirect_buffer - i * 2;
 			for (uint32_t j = 0; j < indirect_num_dw && j < 16; j++) {
 				LOGF("\t uc_indirect[%" PRIu32 "] offset=0x%08" PRIx32 ", value=0x%08" PRIx32 "\n",
-				     j, dump_regs[j * 2], dump_regs[j * 2 + 1]);
+				     j, registers.RawOffset(j), registers.Value(j));
 			}
 			EXIT("unknown uc reg at %05" PRIx32 ": 0x%" PRIx32 "\n", num_dw - dw, cmd_offset);
 		}
@@ -1283,9 +1284,10 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 	return s + 1;
 }
 
-static uint32_t CpFlip(CommandProcessor& cp, const uint32_t* block, uint32_t remaining_dw) {
+static uint32_t CpFlip(CommandProcessor& cp, uint32_t user_data_r, const uint32_t* block,
+                       uint32_t remaining_dw) {
 	EXIT_NOT_IMPLEMENTED(remaining_dw < Pm4::FLIP_PACKET_DW ||
-	                     block[3] != KYTY_PM4(6, Pm4::IT_WRITE_DATA, 1u) ||
+	                     block[3] != KYTY_PM4(6, Pm4::IT_WRITE_DATA, user_data_r) ||
 	                     block[9] != KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u));
 
 	const auto tag = block[1];
@@ -1309,9 +1311,10 @@ static uint32_t CpWaitFlipDone(CommandProcessor& cp, const uint32_t* block, uint
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
-	if (KYTY_PM4_R(cmd_id) == 1u && buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
+	if ((KYTY_PM4_R(cmd_id) == 1u || cp.IsAsyncComputeQueue()) &&
+	    buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
 		switch (buffer[1] & 0xff000000u) {
-			case Pm4::USERDATA_TAG_FLIP: return CpFlip(cp, buffer, dw);
+			case Pm4::USERDATA_TAG_FLIP: return CpFlip(cp, KYTY_PM4_R(cmd_id), buffer, dw);
 			case Pm4::USERDATA_TAG_WAIT_FLIP_DONE: return CpWaitFlipDone(cp, buffer, dw);
 			case Pm4::USERDATA_TAG_RESET_QUEUE:
 				cp.ResetQueue(buffer[1]);
