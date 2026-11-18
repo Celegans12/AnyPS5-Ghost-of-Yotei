@@ -17,6 +17,7 @@
 #include "libs/errno.h"
 
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgcDriver/Execution/include/KeyboardOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Presentation.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -28,6 +29,7 @@
 #include <dlfcn.h>
 #endif
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -556,26 +558,79 @@ void WindowShutdown() {
     }
 }
 
-struct SystemOverlay::Impl {};
+struct SystemOverlay::Impl {
+    vk::Extent2D extent;
+    AgcDriver::OverlayLayout layout;
+};
 
-SystemOverlay::SystemOverlay(GraphicContext&) {
-    EXIT("the system overlay is not built with ANYPS5_GPU_BACKEND=kyty\n");
-}
+SystemOverlay::SystemOverlay(GraphicContext&): m_impl(std::make_unique<Impl>()) {}
 
 SystemOverlay::~SystemOverlay() = default;
 
-bool SystemOverlay::PrepareFrame(vk::Extent2D, vk::Format, uint32_t) {
-    EXIT("the system overlay is not built with ANYPS5_GPU_BACKEND=kyty\n");
+bool SystemOverlay::PrepareFrame(vk::Extent2D extent, vk::Format format, uint32_t) {
+    try {
+        auto layout = AgcDriver::SystemOverlayLayout(VkExtent2D{extent.width, extent.height});
+        if (!layout.has_value()) return false;
+        if (format != vk::Format::eB8G8R8A8Unorm && format != vk::Format::eR8G8B8A8Unorm) throw std::runtime_error("kyty presentation: system dialogs and the system keyboard are drawn only into an 8-bit SDR swapchain");
+        m_impl->extent = extent;
+        m_impl->layout = std::move(*layout);
+        return true;
+    } catch (...) {
+        KytyShim::Present::Stop("system overlay", std::current_exception());
+    }
 }
 
-void SystemOverlay::Record(vk::CommandBuffer, vk::ImageView) {
-    EXIT("the system overlay is not built with ANYPS5_GPU_BACKEND=kyty\n");
+void SystemOverlay::Record(vk::CommandBuffer command, vk::ImageView target) {
+    try {
+        vk::RenderingAttachmentInfo attachment{};
+        attachment.imageView = target;
+        attachment.imageLayout = vk::ImageLayout::eColorAttachmentOptimal;
+        attachment.loadOp = vk::AttachmentLoadOp::eLoad;
+        attachment.storeOp = vk::AttachmentStoreOp::eStore;
+        vk::RenderingInfo rendering{};
+        rendering.renderArea.extent = m_impl->extent;
+        rendering.layerCount = 1;
+        rendering.colorAttachmentCount = 1;
+        rendering.pColorAttachments = &attachment;
+        command.beginRendering(&rendering);
+        std::vector<vk::ClearRect> run;
+        std::size_t runColor = AgcDriver::OverlayColorCount;
+        const auto flush = [&] {
+            if (run.empty()) return;
+            const auto& color = AgcDriver::OverlayBasePalette[runColor];
+            vk::ClearAttachment clear{};
+            clear.aspectMask = vk::ImageAspectFlagBits::eColor;
+            clear.colorAttachment = 0;
+            clear.clearValue.color = vk::ClearColorValue(std::array<float, 4>{color[0] * color[3], color[1] * color[3], color[2] * color[3], 1.0f});
+            command.clearAttachments(1, &clear, static_cast<uint32_t>(run.size()), run.data());
+            run.clear();
+        };
+        const auto width = static_cast<std::int64_t>(m_impl->extent.width);
+        const auto height = static_cast<std::int64_t>(m_impl->extent.height);
+        for (const auto& rect : m_impl->layout.rects) {
+            const auto left = std::clamp<std::int64_t>(rect.x, 0, width);
+            const auto top = std::clamp<std::int64_t>(rect.y, 0, height);
+            const auto right = std::clamp<std::int64_t>(static_cast<std::int64_t>(rect.x) + rect.width, 0, width);
+            const auto bottom = std::clamp<std::int64_t>(static_cast<std::int64_t>(rect.y) + rect.height, 0, height);
+            if (right <= left || bottom <= top) continue;
+            const std::size_t color = rect.color < AgcDriver::OverlayColorCount ? rect.color : 0;
+            if (color != runColor) {
+                flush();
+                runColor = color;
+            }
+            run.push_back(vk::ClearRect{vk::Rect2D{{static_cast<int32_t>(left), static_cast<int32_t>(top)}, {static_cast<uint32_t>(right - left), static_cast<uint32_t>(bottom - top)}}, 0, 1});
+        }
+        flush();
+        command.endRendering();
+    } catch (...) {
+        KytyShim::Present::Stop("system overlay", std::current_exception());
+    }
 }
 
 void SystemOverlay::ReleaseVulkan() {}
 
 SystemOverlayVisualState GetSystemOverlayVisualState() noexcept {
-    return {false, 0};
+    return {AgcDriver::SystemOverlayShown(), 0};
 }
 
 void ShutdownSystemOverlayInput() {}

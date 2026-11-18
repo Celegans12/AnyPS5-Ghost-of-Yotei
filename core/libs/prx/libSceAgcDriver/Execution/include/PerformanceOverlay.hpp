@@ -128,6 +128,7 @@ struct OverlayRect {
 
 enum class OverlayColor : std::uint32_t { Background = 0, Text = 1, Graph = 2, Panel = 3, Key = 4, Accent = 5, Field = 6 };
 inline constexpr std::size_t OverlayColorCount = 7;
+inline constexpr std::array<std::array<float, 4>, OverlayColorCount> OverlayBasePalette{{{0.0f, 0.0f, 0.0f, 0.6f}, {1.0f, 1.0f, 1.0f, 1.0f}, {0.35f, 0.8f, 0.35f, 1.0f}, {0.06f, 0.07f, 0.09f, 0.94f}, {0.22f, 0.24f, 0.29f, 1.0f}, {1.0f, 0.78f, 0.2f, 1.0f}, {0.0f, 0.0f, 0.0f, 1.0f}}};
 
 struct OverlayMetrics {
     static constexpr std::int32_t GlyphWidth = 5;
