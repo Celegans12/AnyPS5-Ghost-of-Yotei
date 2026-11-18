@@ -824,8 +824,14 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			snapshot.flattened_srt[mapping_offset + 2u + entry * 2u] = entries[entry].second;
 		}
 		t_record_blocks.push_back({mapping_offset, entries.size(), std::move(blocks)});
+#if defined(ANYPS5_KYTY)
+		if (((std::is_same_v<Specialization, ResourceSpecialization::Image> && !heap_list) ||
+		     std::is_same_v<Specialization, ResourceSpecialization::Sampler> ||
+		     std::is_same_v<Specialization, ResourceSpecialization::Buffer>) && stable_layout) {
+#else
 		if (((std::is_same_v<Specialization, ResourceSpecialization::Image> && !heap_list) ||
 		     std::is_same_v<Specialization, ResourceSpecialization::Sampler>) && stable_layout) {
+#endif
 			const auto children = descriptors.size() - children_begin;
 			const auto total    = std::max<size_t>(
                 program.stage == ShaderType::Compute
@@ -1013,6 +1019,23 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 			} else {
 				snapshot.flattened_srt[mapping_offset] =
 				    static_cast<uint32_t>(snapshot.flattened_srt.size() - mapping_offset - 1u);
+#if defined(ANYPS5_KYTY)
+				if (g_stable_indirect_layouts.load(std::memory_order_relaxed)) {
+					const auto used = snapshot.flattened_srt.size() - mapping_offset - 1u;
+					snapshot.flattened_srt.resize(mapping_offset + 1u + std::bit_ceil(std::max<size_t>(used, 1u)), 0u);
+				}
+				if (std::is_same_v<Specialization, ResourceSpecialization::Buffer> &&
+				    g_stable_indirect_layouts.load(std::memory_order_relaxed)) {
+					const auto children = descriptors.size() - children_begin;
+					const auto total    = std::max<size_t>(
+					    program.stage == ShaderType::Compute ? g_compute_indirect_images.load(std::memory_order_relaxed) : 1u,
+					    std::bit_ceil(children + 1u));
+					for (auto padded = children; padded + 1u < total; ++padded) {
+						descriptors.push_back(descriptors.back());
+						specializations.push_back(specializations.back());
+					}
+				}
+#endif
 				auto& root = specializations[resource_index];
 				root.indirect_root = resource_index;
 				root.indirect_mapping_offset = static_cast<uint32_t>(mapping_offset);
@@ -1105,7 +1128,12 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 	if (descriptors.size() == children_begin) {
 		snapshot.flattened_srt.resize(mapping_offset);
 	} else {
+#if defined(ANYPS5_KYTY)
+		if ((std::is_same_v<Specialization, ResourceSpecialization::Image> ||
+		     std::is_same_v<Specialization, ResourceSpecialization::Buffer>) && stable_layout) {
+#else
 		if (std::is_same_v<Specialization, ResourceSpecialization::Image> && stable_layout) {
+#endif
 			const auto children = descriptors.size() - children_begin;
 			const auto total    = std::max<size_t>(
                 program.stage == ShaderType::Compute
