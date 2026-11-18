@@ -250,9 +250,9 @@ Blocked waits on deferred writes: KytyPS5's command processor submits the open c
 submission that made progress, but not after one that yields to another queue, nor when a queue resumes straight into a
 wait that still fails. If the value that queue waits for is a deferred write recorded into the open command buffer, and
 no other submission comes, nothing submits that buffer and the title hangs. Under `ANYPS5_KYTY`, a queue that blocks
-without progress on a range with a pending deferred write submits the open command buffer, once per blocked wait,
-whatever `KYTY_LABELS_AFTER_DUMPS` says; deferring the labels of every queue makes the case more likely in titles
-without occlusion queries.
+without progress on a range with a pending deferred write submits the open command buffer, and submits it again only when
+a newer deferred write lands on that range while it still waits, whatever `KYTY_LABELS_AFTER_DUMPS` says; deferring the
+labels of every queue makes the case more likely in titles without occlusion queries.
 
 `m_program_lock`, the spin lock of `graphics/host_gpu/renderer/pipeline/pipelineCache.cpp` that guards the program
 cache, has a narrower scope than upstream's in this build (`programLock.cpp`). The resolve thread always runs upstream's

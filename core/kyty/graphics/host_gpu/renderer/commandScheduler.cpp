@@ -411,6 +411,20 @@ CommandScheduler::TrackGuestOperation(Common::UniqueFunction<void>&&            
 	};
 }
 
+#if defined(ANYPS5_KYTY)
+uint64_t CommandScheduler::NewestPendingGuestOperation(uint64_t address, uint64_t size,
+                                                        uint64_t after) {
+	const auto      end = size > UINT64_MAX - address ? UINT64_MAX : address + size;
+	std::lock_guard lock(m_guest_writes_mutex);
+	for (auto it = m_guest_writes.rbegin(); it != m_guest_writes.rend() && it->id > after; ++it) {
+		if (it->begin < end && address < it->end) {
+			return it->id;
+		}
+	}
+	return 0;
+}
+#endif
+
 bool CommandScheduler::HasPendingGuestOperations(uint64_t address, uint64_t size) {
 	const auto      end = size > UINT64_MAX - address ? UINT64_MAX : address + size;
 	std::lock_guard lock(m_guest_writes_mutex);

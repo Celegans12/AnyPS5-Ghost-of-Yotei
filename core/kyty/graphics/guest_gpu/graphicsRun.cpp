@@ -1540,14 +1540,16 @@ bool GuestGpu::Process(Submission& submission) {
 			}
 #if defined(ANYPS5_KYTY)
 			if (submission.execution.MadeProgress()) {
-				submission.wait_flushed = false;
-			} else if (!complete && !submission.yielded && !submission.wait_flushed) {
+				submission.wait_flushed = 0;
+			} else if (!complete && !submission.yielded) {
 				const auto& range = m_wait_ranges[m_current_queue];
-				if (range.begin != range.end &&
-				    m_renderer.GetCommandScheduler().HasPendingGuestOperations(
-				        range.begin, range.end - range.begin)) {
-					cp.BufferFlush();
-					submission.wait_flushed = true;
+				if (range.begin != range.end) {
+					const auto newest = m_renderer.GetCommandScheduler().NewestPendingGuestOperation(
+					    range.begin, range.end - range.begin, submission.wait_flushed);
+					if (newest != 0) {
+						cp.BufferFlush();
+						submission.wait_flushed = newest;
+					}
 				}
 			}
 #endif
