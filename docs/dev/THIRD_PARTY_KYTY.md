@@ -246,6 +246,7 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 | `KYTY_TESSELLATION` | `0` or `1`, else stops | `1` | Draws patch primitives with tessellation; `0` makes the draw path refuse them | option | all | Kyty option |
 | `KYTY_OCCLUSION_QUERIES` | `0` or `1`, else stops | `1` | Host occlusion queries, which need the device's `hostQueryReset`; `0` turns them off | option | all | Kyty option |
 | `KYTY_RELAXED_SHADER_FLOAT` | `0` or `1`, else stops | `0` | Relaxes the shader recompiler's float rules (min and max, trigonometric functions) for speed | experimental | all | Kyty option |
+| `KYTY_FALLBACKS` | `0` or `1`, else stops | `1` | Where the emulator would stop on something Kyty does not handle and a safe way on exists, it takes it and logs one `[HACK]` line per source (see [Details](#details)); `0` stops as before | compat | all | AnyKyty |
 
 ### Memory, readbacks, flips and labels
 
@@ -451,6 +452,15 @@ default) recompiles such a shader offline, from its raw machine code, as the dri
 prints, per file, its BVH intersections, how many of them trace with ray queries, and the TLAS source and instance
 record layout derived for them, and exits with 0 only when every intersection does. `--dump` adds the IR, `--off`
 compiles as with `KYTY_NATIVE_RT=0`.
+Fallbacks instead of stops (`KYTY_FALLBACKS`, on by default): KytyPS5 stops the emulator (`EXIT`, `EXIT_IF`,
+`EXIT_NOT_IMPLEMENTED`) on anything it does not handle. Where the stop concerns one draw or one dispatch and nothing else
+depends on it, the build skips that draw or dispatch instead and writes one `[HACK]` line the first time per shader,
+naming the stop and its source line: a shader the recompiler cannot decode, translate or emit, and a shader stage whose
+inputs cannot be prepared. A failed shader is remembered (the whole program when no variant of it ever compiled,
+otherwise that variant), so it is not translated again for each draw; the other variants of the program keep drawing.
+A background compile that stops is dropped, and the draw compiles it again. A pipeline manifest record that stops while
+it is replayed is dropped, as with exceptions enabled. A fallback only replaces a stop: nothing changes for a shader that
+compiles. `KYTY_FALLBACKS=0` restores every stop.
 
 ### Adding a setting
 

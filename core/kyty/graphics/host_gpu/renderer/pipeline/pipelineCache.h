@@ -428,6 +428,18 @@ private:
 		std::deque<ShaderModule>                     modules;
 		bool                                         skip_dispatch = false;
 		std::array<size_t, 2>                        last_module {SIZE_MAX, SIZE_MAX};
+#if defined(ANYPS5_KYTY)
+		struct FailedVariant {
+			ShaderRecompiler::IR::ResourceSpecialization specialization;
+			uint32_t                                     push_data_cursor = 0;
+			std::vector<uint32_t>                        function_code;
+		};
+		std::vector<FailedVariant> failed_variants;
+
+		[[nodiscard]] bool Failed(const ShaderRecompiler::IR::ResourceSpecialization& candidate,
+		                          uint32_t push_data_cursor) const;
+		void               NoteFailed(uint32_t push_data_cursor);
+#endif
 
 		[[nodiscard]] std::span<const uint32_t> FunctionCode() const;
 		bool RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime);

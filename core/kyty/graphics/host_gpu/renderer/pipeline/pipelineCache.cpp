@@ -6,6 +6,9 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#if defined(ANYPS5_KYTY)
+#include "common/fallback.h"
+#endif
 #include "common/file.h"
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
@@ -1131,6 +1134,23 @@ std::span<const uint32_t> PipelineCache::Program::FunctionCode() const {
 	    : std::span<const uint32_t>{};
 }
 
+#if defined(ANYPS5_KYTY)
+bool PipelineCache::Program::Failed(const ShaderRecompiler::IR::ResourceSpecialization& candidate,
+                                    uint32_t push_data_cursor) const {
+	return std::ranges::any_of(failed_variants, [&](const FailedVariant& variant) {
+		return variant.push_data_cursor == push_data_cursor && variant.specialization == candidate &&
+		       std::ranges::equal(variant.function_code, FunctionCode());
+	});
+}
+
+void PipelineCache::Program::NoteFailed(uint32_t push_data_cursor) {
+	const auto code = FunctionCode();
+	failed_variants.push_back({.specialization   = specialization,
+	                           .push_data_cursor = push_data_cursor,
+	                           .function_code    = {code.begin(), code.end()}});
+}
+#endif
+
 bool PipelineCache::Program::RefreshCallSource(const ShaderRecompiler::IR::SrtRuntime& runtime) {
 	const auto revision = call_source->revision;
 	ShaderRecompiler::RefreshShaderSource(*call_source, runtime);
@@ -1367,6 +1387,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		if (cached.skip_dispatch) return nullptr;
 		ShaderModule* module = nullptr;
 #if defined(ANYPS5_KYTY)
+		bool specialized = false;
 		if (t_execute_unlocked) {
 			const auto& key          = entry->first;
 			bool        materialized = true;
@@ -1390,6 +1411,7 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			if (materialized && !failed) {
 				module = cached.call_source ? cached.MatchModule<true>(push_data_cursor)
 				                            : cached.MatchModule<false>(push_data_cursor);
+				specialized = true;
 			}
 			if (!failed && module == nullptr) {
 				m_lookup_key = key;
@@ -1405,11 +1427,23 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 			}
 			runtime.call_words = cached.call_source->call_words;
 			if (!source_changed) module = cached.FindModule<true>(runtime, push_data_cursor, failed);
+#if defined(ANYPS5_KYTY)
+			specialized = !source_changed;
+#endif
 		} else {
 			module = cached.FindModule<false>(runtime, push_data_cursor, failed);
+#if defined(ANYPS5_KYTY)
+			specialized = true;
+#endif
 		}
 		if (failed) return skip_failure();
 		if (module != nullptr) return bind(*module);
+#if defined(ANYPS5_KYTY)
+		if (specialized && !cached.failed_variants.empty() &&
+		    cached.Failed(cached.specialization, push_data_cursor)) {
+			return nullptr;
+		}
+#endif
 	}
 #if defined(ANYPS5_KYTY)
 	struct TranslateScope {
@@ -1433,6 +1467,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 		return GetProgram(params, input_info, push_data_cursor);
 	}
 
+#if defined(ANYPS5_KYTY)
+	const auto build = [&]() -> const ShaderModule* {
+#endif
 	options.shader_hash     = params.hash;
 	options.user_data       = user_data;
 	options.back_code       = params.back_code;
@@ -1496,6 +1533,24 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	}
 	return bind(CompileModule(entry->second, entry->first, options, std::move(translated),
 	                          push_data_cursor, params.code));
+#if defined(ANYPS5_KYTY)
+	};
+	const ShaderModule* built = nullptr;
+	if (Common::Fallback::Run("draw or dispatch skipped: the shader recompiler stopped",
+	                          "PipelineCache::GetProgram", params.hash, 0, [&] { built = build(); })) {
+		return built;
+	}
+	if (const auto found = m_program_cache.find(m_lookup_key); found != m_program_cache.end()) {
+		if (found->second.modules.empty()) {
+			found->second.skip_dispatch = true;
+		} else {
+			found->second.NoteFailed(push_data_cursor);
+		}
+	} else {
+		m_program_cache.emplace(m_lookup_key, Program {.skip_dispatch = true});
+	}
+	return nullptr;
+#endif
 }
 
 PipelineCache::PipelineCache(GraphicContext&                         graphics,
@@ -1893,7 +1948,17 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 			}
 			return false;
 		}
+#if defined(ANYPS5_KYTY)
+		if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::ResolveGraphicsPrograms",
+		                           0, vertex_regs.ls_regs.data_addr,
+		                           [&] { vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info); })) {
+			vertex_info[0].stage = {};
+			if (ahead != nullptr) ahead->reads.Fail();
+			return ahead == nullptr;
+		}
+#else
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
+#endif
 		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
 		                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
 		                                   sh.m_vgtTfParam};
@@ -1927,7 +1992,17 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 			stage.tess = tess;
 		}
 	} else {
+#if defined(ANYPS5_KYTY)
+		if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::ResolveGraphicsPrograms",
+		                           0, vertex_regs.es_regs.data_addr,
+		                           [&] { vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]); })) {
+			vertex_info[0].stage = {};
+			if (ahead != nullptr) ahead->reads.Fail();
+			return ahead == nullptr;
+		}
+#else
 		vertex_params[0] = PrepareProgram(vertex_regs, context, user_config, vertex_info[0]);
+#endif
 	}
 	if (ahead != nullptr && ahead->reads.Failed()) {
 		return false;
@@ -1992,7 +2067,17 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 				        .export_mapping;
 			}
 		}
+#if defined(ANYPS5_KYTY)
+		if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::ResolveGraphicsPrograms",
+		                           0, pixel_regs.ps_regs.data_addr,
+		                           [&] { pixel_params = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info); })) {
+			vertex_info[0].stage = {};
+			if (ahead != nullptr) ahead->reads.Fail();
+			return ahead == nullptr;
+		}
+#else
 		pixel_params      = PrepareProgram(pixel_regs, sh, target_export_mapping, pixel_info);
+#endif
 		pixel_info.object_primitive_id = object_primitive_id;
 		for (uint32_t export_index = 0; export_index < 8u; export_index++) {
 			const auto slot = ShaderPixelExportTarget(pixel_info.target_shader_mask, export_index);
@@ -2334,7 +2419,11 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 	std::vector<uint32_t>                             spirv;
 	std::vector<uint32_t>                             plain_spirv;
 	ShaderRecompiler::CompileOptions                  options {.wave_size = input_info.wave_size};
+#if defined(ANYPS5_KYTY)
+	const auto compile = [&] {
+#else
 	[&] {
+#endif
 		const auto user_data = std::span(job.params.user_data).first(job.params.user_data_count);
 		if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
 			options.stage             = input_info.logical_stage;
@@ -2394,7 +2483,15 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			module = BuildModule(job.key, options, std::move(translated), *specialization, {},
 			                     job.push_data_cursor, spirv, plain_spirv);
 		}
+#if defined(ANYPS5_KYTY)
+	};
+	if (!Common::Fallback::Run("background shader compile dropped: the shader recompiler stopped",
+	                           "PipelineCache::RunCompileJob", job.params.hash, 0, compile)) {
+		module.reset();
+	}
+#else
 	}();
+#endif
 	const ShaderModule* ahead = nullptr;
 	LockPrograms();
 	if (module) {
@@ -2589,6 +2686,12 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 			materialized = true;
 			LockPrograms();
 		}
+#if defined(ANYPS5_KYTY)
+		if (program != nullptr && materialized && program->Failed(specialization, push_data_cursor)) {
+			UnlockPrograms();
+			return nullptr;
+		}
+#endif
 		if (program != nullptr) {
 			const auto module = std::ranges::find_if(program->modules, [&](const ShaderModule& candidate) {
 				const auto& layout = candidate.info.bindings;
@@ -3083,7 +3186,15 @@ PipelineCache::TableProgram PipelineCache::GetPixelProgramTable(
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
                                                      ShaderComputeInputInfo&      input_info) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+#if defined(ANYPS5_KYTY)
+	ShaderParams params;
+	if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::GetComputeProgram", 0, regs.cs_regs.data_addr,
+	                           [&] { params = PrepareProgram(regs, input_info); })) {
+		return nullptr;
+	}
+#else
 	const auto        params      = PrepareProgram(regs, input_info);
+#endif
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t push_data_cursor =
@@ -3179,7 +3290,16 @@ const ShaderModule* PipelineCache::GetComputeProgramAhead(const HW::ComputeShade
                                                           ShaderComputeInputInfo&      input_info,
                                                           ProgramResolution&           ahead) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
+#if defined(ANYPS5_KYTY)
+	ShaderParams params;
+	if (!Common::Fallback::Run("draw or dispatch skipped: its shader stage could not be prepared", "PipelineCache::GetComputeProgramAhead", 0, regs.cs_regs.data_addr,
+	                           [&] { params = PrepareProgram(regs, input_info); })) {
+		ahead.reads.Fail();
+		return nullptr;
+	}
+#else
 	const auto params             = PrepareProgram(regs, input_info);
+#endif
 	input_info.lds_storage = input_info.lds_size_dwords * 4u >
 	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
 	uint32_t push_data_cursor =

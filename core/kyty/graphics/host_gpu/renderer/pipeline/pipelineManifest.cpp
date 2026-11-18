@@ -3,6 +3,9 @@
 #include "common/alignment.h"
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
+#if defined(ANYPS5_KYTY)
+#include "common/fallback.h"
+#endif
 #include "common/file.h"
 #include "common/hackNotice.h"
 #include "common/logging/log.h"
@@ -1158,6 +1161,17 @@ bool RunDroppable(std::atomic<uint32_t>& dropped, bool from_assets, uint64_t sha
 	dropped.fetch_add(1, std::memory_order_relaxed);
 	return false;
 #else
+#if defined(ANYPS5_KYTY)
+	if (!from_assets || !Config::PipelineManifestStrict()) {
+		if (Common::Fallback::Run("pipeline manifest record dropped after a fatal error", "RunDroppable",
+		                          shader_hash, where, body)) {
+			return true;
+		}
+		ManifestLog("Pipeline manifest: dropping {}", what);
+		dropped.fetch_add(1, std::memory_order_relaxed);
+		return false;
+	}
+#endif
 	body();
 	return true;
 #endif

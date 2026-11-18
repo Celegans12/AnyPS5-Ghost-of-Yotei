@@ -142,11 +142,20 @@ std::span<const uint32_t> ShaderMappedBinary(uint64_t addr) {
 static ShaderMapEntry ShaderGetMappedData(uint64_t addr, const char* label) {
 	EXIT_IF(g_shader_map == nullptr);
 
+#if defined(ANYPS5_KYTY)
+	{
+		std::scoped_lock lock(g_shader_map_mutex);
+		if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
+			return iter->second;
+		}
+	}
+#else
 	std::scoped_lock lock(g_shader_map_mutex);
 
 	if (auto iter = g_shader_map->find(addr); iter != g_shader_map->end()) {
 		return iter->second;
 	}
+#endif
 
 	EXIT("%s shader=0x%016" PRIx64 " is missing from ShaderMap\n", label, addr);
 }
