@@ -2665,6 +2665,29 @@ bool MatchWaveBlas(const Program& program, std::span<Inst* const> tests, uint32_
 	return true;
 }
 
+bool LaneSlotAddress(Value address) {
+	const auto* shift = Producer(address, ValueOpcode::ShiftLeftLogical32);
+	return shift != nullptr && Immediate(shift->Arg(1)) == 2u && Producer(shift->Arg(0), ValueOpcode::LaneId) != nullptr;
+}
+
+Value Unspill(const Program& program, Value value, const Block* header, const Block* latch) {
+	const auto* select = Producer(value, ValueOpcode::SelectU32);
+	const auto* load   = Producer(select != nullptr ? select->Arg(1) : value, ValueOpcode::LoadSharedU32);
+	if (load == nullptr || !LaneSlotAddress(load->Arg(0)) || !InLoop(program, load->Parent(), header, latch)) return {};
+	const auto  offset = MemoryOf(program, *load).offset;
+	const Inst* store  = nullptr;
+	for (auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != ValueOpcode::WriteSharedU32 || MemoryOf(program, inst).offset != offset ||
+			    !LaneSlotAddress(inst.Arg(0)))
+				continue;
+			if (InLoop(program, block, header, latch) || store != nullptr) return {};
+			if (BlockIndex(program, block) < BlockIndex(program, header)) store = &inst;
+		}
+	}
+	return store != nullptr ? store->Arg(1).Resolve() : Value {};
+}
+
 bool MatchPacketWalk(Program& program, Inst& bvh, PacketWalk& w) {
 	const auto* descriptor = Producer(bvh.Arg(0), ValueOpcode::CompositeConstructU32x4);
 	const auto* address    = Producer(bvh.Arg(1), ValueOpcode::MakeImageAddress);
@@ -2745,7 +2768,8 @@ bool MatchPacketWalk(Program& program, Inst& bvh, PacketWalk& w) {
 	}
 	const auto* origin = Producer(s.ray[0], ValueOpcode::SelectU32);
 	for (uint32_t arg = 8; arg < 11 && origin == nullptr; ++arg) {
-		const auto* inverse = Producer(address->Arg(arg), ValueOpcode::SelectU32);
+		const auto  spilled = Unspill(program, address->Arg(arg), w.header, w.latch);
+		const auto* inverse = Producer(spilled.IsEmpty() ? address->Arg(arg) : spilled, ValueOpcode::SelectU32);
 		if (inverse == nullptr || (arg > 8 && inverse->Arg(0).Resolve() != w.lanes)) return false;
 		w.lanes = inverse->Arg(0).Resolve();
 		if (arg == 10) origin = inverse;
@@ -4185,7 +4209,7 @@ bool MatchClosestWaveWalk(Program& program, PacketWalk& w) {
 	return true;
 }
 
-bool OuterRounds(const Program& program, PacketWalk& w) {
+bool OuterRounds(const Program& program, PacketWalk& w, bool copies = false) {
 	auto&      s    = w.shape;
 	const auto from = [](const Inst& phi, const Block* block) { return IncomingValue(phi, block); };
 	w.outer_node    = w.header == s.header ? s.node : LoopPhi(from(*s.node, s.preheader), w.header);
@@ -4196,13 +4220,29 @@ bool OuterRounds(const Program& program, PacketWalk& w) {
 		if (Producer(pop->Arg(arg), ValueOpcode::ReadLane) == nullptr) return false;
 	}
 	if (pop == nullptr && Producer(popped, ValueOpcode::ReadLane) == nullptr) return false;
-	w.packet = nullptr;
+	const auto stacked = [&](const Inst& phi) {
+		const auto  back = from(phi, w.latch);
+		const auto* join = Producer(back, ValueOpcode::Phi);
+		for (size_t arg = 0; join != nullptr && arg < join->NumArgs(); ++arg) {
+			if (Producer(join->Arg(arg), ValueOpcode::ReadLane) != nullptr) return true;
+		}
+		return Producer(back, ValueOpcode::ReadLane) != nullptr;
+	};
+	w.packet       = nullptr;
+	uint32_t lanes = 0;
 	for (auto& inst: *w.header) {
 		if (inst.GetOpcode() != ValueOpcode::Phi || inst.GetType() != Type::U1) continue;
 		const auto entry = from(inst, w.preheader);
 		if (entry.IsImmediate() || !DefinedBefore(program, entry, w.header)) continue;
-		if (w.packet != nullptr) return false;
+		if (w.packet != nullptr && !copies) return false;
 		w.packet = &inst;
+		++lanes;
+	}
+	if (lanes > 1) {
+		for (auto& inst: *w.header) {
+			if (inst.GetOpcode() == ValueOpcode::Phi && &inst != w.outer_node && stacked(inst)) return false;
+		}
+		w.packet = nullptr;
 	}
 	if (w.packet == nullptr && (w.lanes.IsEmpty() || !DefinedBefore(program, w.lanes, w.header))) return false;
 	const auto* exit = w.path.back();
@@ -4213,9 +4253,11 @@ bool OuterRounds(const Program& program, PacketWalk& w) {
 }
 
 bool MatchCandidateWalk(const Program& program, PacketWalk& w) {
-	const auto& s = w.shape;
-	if (s.blases.empty() || s.wave_header != nullptr || w.walked) return false;
-	return OuterRounds(program, w);
+	const auto& s    = w.shape;
+	const bool  wave = s.wave_header != nullptr && s.wave_copy == nullptr && (s.wave_node != nullptr || !s.wave_pushes.empty());
+	if (s.blases.empty() == !wave || w.walked || !OuterRounds(program, w, true)) return false;
+	if (wave && !ListExits(program, s, w.list_exits)) w.list_exits.clear();
+	return true;
 }
 
 void RewriteCandidateWalk(Program& program, PacketWalk& w, uint32_t site) {
@@ -4263,6 +4305,23 @@ void RewriteCandidateWalk(Program& program, PacketWalk& w, uint32_t site) {
 	const Inserter after {w.merge, AfterPhis(*w.merge)};
 	after(Op::RayQueryMark, {}, flags(RayQueryMarkKind::Exit));
 	RewriteBlasWalks(program, s.blases, any, flags(0u));
+	if (!s.blases.empty()) return;
+	for (auto* push: s.wave_pushes) {
+		const Inserter in {push->Parent(), Position(*push)};
+		push->SetArg(1, in(Op::SelectU32, {any, in(Op::RayQuerySelectedLeaf, {}, flags(0u)), push->Arg(1)}));
+	}
+	if (s.wave_node != nullptr) {
+		Block *pre = nullptr, *latch = nullptr, *merge = nullptr;
+		LoopShape(s.wave_header, pre, latch, merge);
+		const Inserter blas {pre, pre->end()};
+		const auto     root = Incoming(*s.wave_node, pre);
+		s.wave_node->SetArg(root, blas(Op::SelectU32, {any, blas(Op::RayQuerySelectedLeaf, {}, flags(0u)), s.wave_node->Arg(root)}));
+	}
+	for (const auto& [block, leaves_on_true]: w.list_exits) {
+		const auto [list_ref, list_negated] = BranchCondition(*block);
+		const Inserter in {list_ref->Parent(), Position(*list_ref)};
+		list_ref->SetArg(0, in(Op::SelectU1, {any, Value(leaves_on_true != list_negated), list_ref->Arg(0)}));
+	}
 }
 
 bool MatchClosestLeafWalk(const Program& program, PacketWalk& w) {
