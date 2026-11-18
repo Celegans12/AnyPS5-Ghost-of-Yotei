@@ -148,9 +148,7 @@ jobs:
       - name: Check the age of the Kyty PGO profile
         if: matrix.backend == 'kyty'
         run: |
-          if ! python3 -I tools/kyty_pgo.py check; then
-            echo "::warning file=core/kyty/pgo/kyty_gpu.proftext::The Kyty PGO profile is older than the Kyty sources listed above; it still applies to the unchanged functions. Record it again as docs/dev/KYTY_PGO.md explains."
-          fi
+          python3 -I tools/kyty_pgo.py check || echo "The Kyty PGO profile is older than the sources listed above; the report after the build says which hot functions lost their counts."
       - id: ccache
         uses: hendrikmuhs/ccache-action@v1.2.24
         with:
@@ -190,7 +188,14 @@ jobs:
             echo "Shim test targets: ${tests[*]}"
             targets+=("${tests[@]}")
           fi
-          cmake --build build --target "${targets[@]}" --parallel "$(nproc)"
+          set -o pipefail
+          cmake --build build --target "${targets[@]}" --parallel "$(nproc)" 2>&1 | tee "$RUNNER_TEMP/build.log"
+      - name: Report the Kyty functions that lost their PGO counts
+        if: always() && matrix.backend == 'kyty'
+        run: |
+          if [ -s "$RUNNER_TEMP/build.log" ]; then
+            python3 -I tools/kyty_pgo.py report --annotate --summary "$GITHUB_STEP_SUMMARY" "$RUNNER_TEMP/build.log"
+          fi
       - name: Run the shim tests
         if: matrix.testing == 'ON'
         run: |

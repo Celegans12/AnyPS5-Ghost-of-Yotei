@@ -44,8 +44,15 @@ The text profile starts with comment lines that record what trained it: `# kyty-
 `# kyty-pgo-source <sha1> <path>` per source of the core (`core/kyty/graphics`, `core/kyty/common`, and the two memory files of the
 shim built with it), the SHA-1 of the file with carriage returns removed. The configure step compares them with the sources it
 builds and prints a CMake warning that counts the changed and new files when they differ. `python3 tools/kyty_pgo.py check` lists
-them, and exits with 1, for CI or before a release. Record the profile again when the warning names files on the paths that run
-every frame (command processor, renderer), or before a release.
+them, and exits with 1.
+
+A changed file only costs speed where a function's control flow changed, and the compiler's warnings are the only place that says
+which functions. `python3 tools/kyty_pgo.py report <build log>` reads them: it lists every function that lost its counts, its
+weight (the highest counter of the function in the profile) and its rank among the functions the profile counts, as Markdown. The
+Linux Kyty job of CI runs it on its build log and writes the table into the job summary. It adds a warning annotation to the run,
+never a failure (contributors have no title to record a profile with), when one of the 10 hottest functions lost its counts or when
+the functions that did hold 1 % of the profile's weight (`--top`, `--share`). A warning means the profile is to be recorded again
+by whoever has the titles, as below, after the series of changes that caused it.
 
 ## Recording the profile
 
@@ -61,6 +68,21 @@ every frame (command processor, renderer), or before a release.
      that long after the scene to record.
 3. Merge: `python3 tools/kyty_pgo.py merge --note "<what ran>" <directory>...` writes `core/kyty/pgo/kyty_gpu.proftext`, a sparse
    text profile (functions that never ran are left out and keep the default optimization).
+
+## Recording again after a series of changes to the hot path
+
+The hot functions are those of the command processor, the resource tracking and the pipeline cache (`ResolveGraphicsPrograms`,
+`FindBuffers`, `Tracker::Run`): a change to one of them drops its counts whatever the rest does. Run this after each series of
+changes to them, on the commit that carries the series:
+
+1. Build the instrumented directory (`-DANYPS5_KYTY_PGO_GENERATE=ON`) and run the training set, each with its own
+   `LLVM_PROFILE_FILE=<directory>/<name>/kyty-%p.profraw` and `KYTY_PGO_DUMP_SECONDS=10`: the frame replays (`sub-creative` four
+   passes, `sub-long-15` two), then one minute in game of Stray, Subnautica and an open-world AAA title in each of its two graphics modes.
+2. `python3 tools/kyty_pgo.py merge --note "<what ran>" <directory>`: on a tree without uncommitted changes to the Kyty sources, so
+   that the header names the commit.
+3. Build the default directory again, with the build output kept (`cmake --build <build> ... 2>&1 | tee build.log`), then
+   `python3 tools/kyty_pgo.py report build.log` must list no function and `python3 tools/kyty_pgo.py check` must exit 0.
+4. Commit the profile alone, with the commit it was recorded on in the message.
 
 `KYTY_PGO_DUMP_SECONDS` is read only by the instrumented build (`core/kyty/pgo/profileDump.cpp`, compiled into `kyty_gpu` only with
 `ANYPS5_KYTY_PGO_GENERATE`).
