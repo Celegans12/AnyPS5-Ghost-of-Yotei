@@ -1022,6 +1022,9 @@ int usage() {
                          "  --release-after-ms  milliseconds without a completion before awaited dwords are released (3)\n"
                          "  --no-synthesize     releases a wait only with a value the capture recorded, never with its reference value\n"
                          "  --strict            fails on a pacing timeout or a failed registration inside the captured frames\n"
+#if defined(ANYPS5_KYTY)
+                         "                      and disables Kyty renderer fallbacks for the replay\n"
+#endif
                          "  --repeat <n>        replays the frames n times in this process, restoring the snapshot before each pass;\n"
                          "                      with n > 1 the frame times come from passes 2 to n, after the first warmed the caches\n"
                          "  --cold-pipelines    starts with an empty Vulkan pipeline cache instead of the title's pipeline cache file\n"
@@ -1620,6 +1623,16 @@ int run(const Options& options) {
 }
 
 void configureEnvironment(const Options& options) {
+#if defined(ANYPS5_KYTY)
+    if (options.strict && !options.shaders && options.submits == 0) {
+#ifdef _WIN32
+        const auto result = _putenv_s("KYTY_FALLBACKS", "0");
+#else
+        const auto result = setenv("KYTY_FALLBACKS", "0", 1);
+#endif
+        if (result != 0) throw std::runtime_error("frame replay: cannot disable Kyty renderer fallbacks");
+    }
+#endif
 #ifdef _WIN32
     _putenv_s("APS5_FRAME_CAPTURE", "");
     _putenv_s("APS5_HEADLESS_PIPELINE_CACHE", options.coldPipelines ? "" : "1");
@@ -1660,10 +1673,10 @@ int main(int argc, char** argv) {
         else return usage();
     }
     if (options.directory.empty()) return usage();
-    configureEnvironment(options);
     int code = 2;
     const bool listing = options.shaders || options.submits != 0;
     try {
+        configureEnvironment(options);
         code = options.shaders ? listShaders(options) : options.submits != 0 ? listSubmits(options) : run(options);
     } catch (const std::exception& error) {
         std::fprintf(stderr, "agc_frame_replay: %s\n", error.what());
