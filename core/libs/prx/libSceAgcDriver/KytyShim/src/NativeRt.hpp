@@ -28,7 +28,7 @@ struct Outcome {
 inline constexpr std::uint32_t OracleRemaining = 1u;
 inline constexpr std::uint32_t OracleForms = 2u;
 inline constexpr std::uint32_t OracleOnly = 4u;
-inline constexpr std::uint32_t DefaultOracle = 0u;
+inline constexpr std::uint32_t DefaultOracle = OracleRemaining;
 
 std::optional<Mode> ParseMode(const char* value);
 std::optional<std::uint32_t> ParseOracle(const char* value);

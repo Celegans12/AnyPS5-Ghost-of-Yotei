@@ -103,7 +103,7 @@ void OffMode() {
 void Oracle() {
     Expect(ParseOracle(nullptr) == KytyShim::NativeRt::DefaultOracle, "an unset KYTY_RT_ORACLE takes the default");
     Expect(ParseOracle("") == KytyShim::NativeRt::DefaultOracle, "an empty KYTY_RT_ORACLE takes the default");
-    Expect(KytyShim::NativeRt::DefaultOracle == 0u, "the oracle stays off by default until the differential check passes");
+    Expect(KytyShim::NativeRt::DefaultOracle == KytyShim::NativeRt::OracleRemaining, "the oracle serves the walks no form recognizes by default");
     Expect(ParseOracle("0") == 0u, "KYTY_RT_ORACLE=0 turns the oracle off");
     Expect(ParseOracle("1") == KytyShim::NativeRt::OracleRemaining, "KYTY_RT_ORACLE=1 serves the walks no form recognizes");
     Expect(ParseOracle("5") == (KytyShim::NativeRt::OracleRemaining | KytyShim::NativeRt::OracleOnly), "KYTY_RT_ORACLE=5 skips the forms");
