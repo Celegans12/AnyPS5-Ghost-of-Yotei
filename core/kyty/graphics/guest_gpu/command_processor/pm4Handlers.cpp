@@ -1283,9 +1283,10 @@ KYTY_CP_OP_PARSER(CpOpSetShaderReg) {
 	return s + 1;
 }
 
-static uint32_t CpFlip(CommandProcessor& cp, const uint32_t* block, uint32_t remaining_dw) {
+static uint32_t CpFlip(CommandProcessor& cp, uint32_t user_data_r, const uint32_t* block,
+                       uint32_t remaining_dw) {
 	EXIT_NOT_IMPLEMENTED(remaining_dw < Pm4::FLIP_PACKET_DW ||
-	                     block[3] != KYTY_PM4(6, Pm4::IT_WRITE_DATA, 1u) ||
+	                     block[3] != KYTY_PM4(6, Pm4::IT_WRITE_DATA, user_data_r) ||
 	                     block[9] != KYTY_PM4(8, Pm4::IT_RELEASE_MEM, 0u));
 
 	const auto tag = block[1];
@@ -1309,9 +1310,10 @@ static uint32_t CpWaitFlipDone(CommandProcessor& cp, const uint32_t* block, uint
 KYTY_CP_OP_PARSER(CpOpSetUconfigReg) {
 	KYTY_PROFILER_FUNCTION();
 
-	if (KYTY_PM4_R(cmd_id) == 1u && buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
+	if ((KYTY_PM4_R(cmd_id) == 1u || cp.IsAsyncComputeQueue()) &&
+	    buffer[0] == Pm4::SQ_THREAD_TRACE_USERDATA_2) {
 		switch (buffer[1] & 0xff000000u) {
-			case Pm4::USERDATA_TAG_FLIP: return CpFlip(cp, buffer, dw);
+			case Pm4::USERDATA_TAG_FLIP: return CpFlip(cp, KYTY_PM4_R(cmd_id), buffer, dw);
 			case Pm4::USERDATA_TAG_WAIT_FLIP_DONE: return CpWaitFlipDone(cp, buffer, dw);
 			case Pm4::USERDATA_TAG_RESET_QUEUE:
 				cp.ResetQueue(buffer[1]);
