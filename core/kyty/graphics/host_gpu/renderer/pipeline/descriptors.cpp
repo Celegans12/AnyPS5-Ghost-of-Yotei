@@ -456,6 +456,10 @@ static bool TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
 	    storage || resource.conversion_format != Prospero::BufferFormat::kInvalid
 	        ? vk::ComponentMapping {}
 	        : TextureGetComponentMapping(descriptor.DstSelXYZW(), surface_format.host_to_storage);
+	const auto base_layer = descriptor.Type() == Prospero::ImageType::kColor1D ||
+	                                descriptor.Type() == Prospero::ImageType::kColor2D
+	                            ? 0u
+	                            : descriptor.BaseArray5();
 	switch (resource.dimension) {
 		case ShaderRecompiler::Decoder::ImageDimension::Dim3D:
 			view.type        = vk::ImageViewType::e3D;
@@ -477,7 +481,7 @@ static bool TextureViewInfo(const ShaderRecompiler::IR::ImageResource& resource,
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2D:
 		case ShaderRecompiler::Decoder::ImageDimension::Dim2DMsaa:
 			view.type       = vk::ImageViewType::e2D;
-			view.base_layer = descriptor.BaseArray5();
+			view.base_layer = base_layer;
 			if (view.base_layer >= image_layers) {
 				unsupported = "texture base layer is out of bounds";
 				return false;
