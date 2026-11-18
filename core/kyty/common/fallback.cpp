@@ -14,7 +14,14 @@ namespace Common::Fallback {
 bool Enabled() {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_FALLBACKS");
-		if (value == nullptr || value[0] == '\0' || std::strcmp(value, "1") == 0) {
+		if (value == nullptr || value[0] == '\0') {
+#if defined(_WIN32)
+			return false;
+#else
+			return true;
+#endif
+		}
+		if (std::strcmp(value, "1") == 0) {
 			return true;
 		}
 		if (std::strcmp(value, "0") == 0) {
