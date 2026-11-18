@@ -331,6 +331,16 @@ if(APS5_ENABLE_TRACY)
     list(APPEND PATCHED_OUTPUTS ${TRACY_CLIENT_COPIED})
 endif()
 
+if(ANYPS5_KYTY_DLL)
+    add_custom_command(
+            OUTPUT ${PATCHED_DIR}/kyty_gpu.prx
+            COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_BINARY_DIR}/core/kyty/kyty_gpu.prx ${PATCHED_DIR}/kyty_gpu.prx
+            DEPENDS kyty_gpu ${CMAKE_BINARY_DIR}/core/kyty/kyty_gpu.prx
+            COMMENT "Copying kyty_gpu.prx beside the libraries"
+    )
+    list(APPEND PATCHED_OUTPUTS ${PATCHED_DIR}/kyty_gpu.prx)
+endif()
+
 if(TARGET mimalloc AND WIN32)
     add_executable(pe_import_first ${CMAKE_CURRENT_SOURCE_DIR}/allocator/PeImportFirstMain.cpp ${CMAKE_CURRENT_SOURCE_DIR}/allocator/PeImportFirst.cpp)
     target_compile_features(pe_import_first PRIVATE cxx_std_20)

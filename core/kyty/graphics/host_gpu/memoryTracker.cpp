@@ -7,6 +7,10 @@ namespace Libs::Graphics {
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
+#if defined(ANYPS5_KYTY_DLL)
+thread_local std::vector<MemoryTracker::DeferredProtect> MemoryTracker::s_deferred;
+#endif
+
 MemoryTracker::MemoryTracker(PageManager& page_manager): m_page_manager(page_manager) {
 	m_regions = std::make_unique<std::atomic<RegionManager*>[]>(REGION_COUNT);
 }
