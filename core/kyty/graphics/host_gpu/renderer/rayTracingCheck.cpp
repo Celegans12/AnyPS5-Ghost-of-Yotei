@@ -15,7 +15,10 @@
 #include <fmt/format.h>
 
 #include <algorithm>
+#include <cstdlib>
+#include <fstream>
 #include <iterator>
+#include <sstream>
 #include <tuple>
 #include <utility>
 
@@ -49,6 +52,11 @@ std::string Spread(std::vector<double> values) {
 	                   values.back());
 }
 
+std::string Compact(std::vector<double> values) {
+	std::sort(values.begin(), values.end());
+	return fmt::format("{:.3g}/{:.3g}/{:.3g}", values.front(), values[values.size() / 2], values.back());
+}
+
 auto OutputOrder(const auto& output) {
 	return std::tuple {output.key, output.kind, output.size};
 }
@@ -80,12 +88,97 @@ bool RayTracingCheck::Served(const ShaderModule& module) {
 }
 
 bool RayTracingCheck::FallsBack(uint64_t shader_hash) {
-	if (Config::RayTracingCheckPeriod() == 0) {
+	if (m_load_done.load(std::memory_order_acquire) && !m_any_fallback.load(std::memory_order_relaxed)) {
 		return false;
 	}
 	std::lock_guard lock(m_mutex);
+	Load();
 	const auto found = m_programs.find(shader_hash);
 	return found != m_programs.end() && found->second.fallback;
+}
+
+void RayTracingCheck::Load() {
+	if (m_loaded) {
+		return;
+	}
+	m_loaded = true;
+	const auto title = PipelineCacheTitleId();
+	if (!title.empty()) {
+		m_path = std::filesystem::path("_PipelineCache") / (title + ".rt");
+	}
+	std::ifstream in(m_path);
+	uint32_t      verified = 0, fallback = 0, unreplayable = 0;
+	for (std::string line; in && std::getline(in, line);) {
+		std::istringstream fields(line);
+		std::string        hash_text, state;
+		fields >> hash_text >> state;
+		const auto hash = std::strtoull(hash_text.c_str(), nullptr, 16);
+		if (hash == 0) {
+			continue;
+		}
+		auto& program = m_programs[hash];
+		for (std::string token; fields >> token;) {
+			if (token.starts_with("checks=")) {
+				program.checks = static_cast<uint32_t>(std::strtoul(token.c_str() + 7, nullptr, 10));
+			} else if (token.starts_with("reason=")) {
+				std::string rest;
+				std::getline(fields, rest);
+				program.unreplayable = token.substr(7) + rest;
+				break;
+			}
+		}
+		if (state == "verified") {
+			program.verified = true;
+			program.clean    = VerifiedAfter;
+			verified++;
+		} else if (state == "fallback") {
+			program.fallback = true;
+			fallback++;
+		} else if (state == "unreplayable" && !program.unreplayable.empty()) {
+			unreplayable++;
+		} else {
+			program.unreplayable.clear();
+		}
+	}
+	m_any_fallback.store(fallback != 0, std::memory_order_relaxed);
+	m_load_done.store(true, std::memory_order_release);
+	if (verified + fallback + unreplayable != 0) {
+		Note(fmt::format("[RT] check: {} decisions read from {} ({} verified, {} falling back to the guest walk, {} not "
+		                 "replayable)",
+		                 verified + fallback + unreplayable, m_path.string(), verified, fallback, unreplayable));
+	}
+}
+
+void RayTracingCheck::Save() const {
+	if (m_path.empty()) {
+		return;
+	}
+	std::vector<std::pair<uint64_t, const Program*>> rows;
+	for (const auto& [hash, program]: m_programs) {
+		if (program.fallback || program.verified || !program.unreplayable.empty()) {
+			rows.emplace_back(hash, &program);
+		}
+	}
+	std::sort(rows.begin(), rows.end());
+	std::error_code error;
+	std::filesystem::create_directories(m_path.parent_path(), error);
+	auto temporary = m_path;
+	temporary += ".tmp";
+	{
+		std::ofstream out(temporary, std::ios::trunc);
+		for (const auto& [hash, program]: rows) {
+			const auto* state = program->fallback ? "fallback" : program->verified ? "verified" : "unreplayable";
+			auto        row   = fmt::format("{} {} checks={}", Hash(hash), state, program->checks);
+			if (!program->fractions.empty()) {
+				row += " fractions=" + Compact(program->fractions);
+			}
+			if (!program->unreplayable.empty() && !program->fallback && !program->verified) {
+				row += " reason=" + program->unreplayable;
+			}
+			out << row << '\n';
+		}
+	}
+	std::filesystem::rename(temporary, m_path, error);
 }
 
 bool RayTracingCheck::Prepare() {
@@ -151,6 +244,7 @@ void RayTracingCheck::Refuse(uint64_t hash, const std::string& reason) {
 	program.unreplayable = reason;
 	Note(fmt::format("[RT] check {}: not replayable ({}): no differential check, the static decision stands",
 	                Hash(hash), reason));
+	Save();
 }
 
 bool RayTracingCheck::Sample(const ShaderModule& module, const CommandBuffer& buffer) {
@@ -161,6 +255,7 @@ bool RayTracingCheck::Sample(const ShaderModule& module, const CommandBuffer& bu
 	}
 	const auto      hash = module.info.shader_hash;
 	std::lock_guard lock(m_mutex);
+	Load();
 	auto&           program = m_programs[hash];
 	const auto      index   = program.dispatches++;
 	if (program.fallback || !program.unreplayable.empty()) {
@@ -433,12 +528,15 @@ void RayTracingCheck::Finish(uint32_t slot) {
 		Note(fmt::format("[RT] check {}: verified on {} checked dispatches ({}); one dispatch in {} checked from now on",
 		                Hash(pending.hash), program.checks, Spread(program.fractions),
 		                uint64_t {Config::RayTracingCheckPeriod()} * SlowerAfter));
+		Save();
 	}
 	if (!program.fallback && program.strikes >= Config::RayTracingCheckStrikes()) {
 		program.fallback = true;
 		Note(fmt::format("[RT] check {}: falls back to the guest BVH walk for the rest of the session: {} checked "
 		                "dispatches in a row above {:.3g} ({} over {} checks)",
 		                Hash(pending.hash), program.strikes, threshold, Spread(program.fractions), program.checks));
+		m_any_fallback.store(true, std::memory_order_relaxed);
+		Save();
 	}
 }
 

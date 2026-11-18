@@ -6,7 +6,9 @@
 #include "graphics/host_gpu/renderer/rayTracingReplay.h"
 
 #include <array>
+#include <atomic>
 #include <cstdint>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -71,6 +73,8 @@ private:
 	void     Barrier(const CommandRecorder& command) const;
 	void     Finish(uint32_t slot);
 	void     Refuse(uint64_t hash, const std::string& reason);
+	void     Load();
+	void     Save() const;
 	void     Note(const std::string& line) const;
 	uint32_t TakeSlot();
 
@@ -86,6 +90,10 @@ private:
 	uint32_t                               m_slot     = UINT32_MAX;
 	bool                                   m_active   = false;
 	bool                                   m_ready    = false;
+	bool                                   m_loaded   = false;
+	std::atomic<bool>                      m_any_fallback {false};
+	std::atomic<bool>                      m_load_done {false};
+	std::filesystem::path                  m_path;
 	vk::DescriptorSetLayout                m_descriptor_layout = nullptr;
 	vk::PipelineLayout                     m_pipeline_layout   = nullptr;
 	vk::Pipeline                           m_pipeline          = nullptr;
