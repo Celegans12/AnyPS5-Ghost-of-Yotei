@@ -1352,33 +1352,30 @@ std::uintptr_t TakeArm(std::uintptr_t slot) {
 
 bool DeferUntilSafe(const mcontext_t& host) {
     const auto rip = static_cast<std::uintptr_t>(host.gregs[REG_RIP]);
-    if (TimedWait::DeliveryAllowed() || GuestCode(rip) || InterruptedWait(host)) {
-        pendingSince.store(0);
-        returnArmed.store(false);
-        return false;
-    }
+    if (TimedWait::DeliveryAllowed() || GuestCode(rip) || InterruptedWait(host)) return false;
     const std::uint64_t now = TimedWait::NowNanos();
     std::uint64_t since = pendingSince.load();
     if (since == 0) {
         since = now;
         pendingSince.store(now);
     }
-    if (now - since >= ForceAfterNanos) {
-        pendingSince.store(0);
-        returnArmed.store(false);
-        return false;
-    }
+    if (now - since >= ForceAfterNanos) return false;
     ArmReturn(host);
-    if (!QueueRetry()) {
-        pendingSince.store(0);
-        returnArmed.store(false);
-        return false;
-    }
-    return true;
+    return QueueRetry();
 }
 
 bool RetrySignal(const siginfo_t* info) {
     return info != nullptr && info->si_code == SI_QUEUE && info->si_value.sival_ptr == &retryMark;
+}
+
+bool Outstanding(const PthreadPrivate* self) {
+    return self == nullptr || self->raisesSent.load() != self->raisesTaken.load();
+}
+
+void TakeRaises(PthreadPrivate* self) {
+    pendingSince.store(0);
+    returnArmed.store(false);
+    if (self != nullptr) self->raisesTaken.store(self->raisesSent.load());
 }
 
 void RetryLoop() {
@@ -1431,16 +1428,16 @@ void StartRetries() {
 
 void Deliver(int signum, siginfo_t* info, void* context) {
 #ifdef __linux__
-    if (RetrySignal(info)) {
-        retryQueued.store(false);
-        if (pendingSince.load() == 0) return;
-    }
+    if (RetrySignal(info)) retryQueued.store(false);
+    auto* const self = CurrentGuestThreadForDelivery();
+    if (!Outstanding(self)) return;
 #else
     (void)info;
 #endif
     if (TimedWait::DeferDelivery(signum)) return;
 #ifdef __linux__
     if (DeferUntilSafe(static_cast<ucontext_t*>(context)->uc_mcontext)) return;
+    TakeRaises(self);
 #endif
     const auto handler = Handler(RaisedSignal);
     if (handler == nullptr) {
@@ -1616,6 +1613,7 @@ bool RaiseOn(Pthread thread) {
     InstallDelivery();
     if (thread == scePthreadSelf()) {
         TimedWait::DeliverableWait wait;
+        thread->raisesSent.fetch_add(1);
         return Send(thread);
     }
     HostSignalBlock block;
@@ -1623,6 +1621,7 @@ bool RaiseOn(Pthread thread) {
     if (!live.owns_lock()) return false;
     std::lock_guard lock(thread->_join_mtx);
     if (thread->_finished.load(std::memory_order_acquire)) return false;
+    thread->raisesSent.fetch_add(1);
     return Send(thread);
 }
 #endif
@@ -1711,24 +1710,17 @@ extern "C" __attribute__((visibility("hidden"), used)) void Aps5ReturnDelivery(R
     }
     frame->target = original;
     returnArmed.store(false);
-    if (pendingSince.load() == 0 || TimedWait::DeliveryDeferred()) return;
+    auto* const self = CurrentGuestThreadForDelivery();
+    if (!Outstanding(self) || TimedWait::DeliveryDeferred()) return;
     sigset_t blocked;
     sigset_t previous;
     sigemptyset(&blocked);
     sigaddset(&blocked, HostSignal);
     pthread_sigmask(SIG_BLOCK, &blocked, &previous);
-    while (pendingSince.exchange(0) != 0) {
+    do {
+        TakeRaises(self);
         RunAtReturn(*frame, fx);
-        siginfo_t info{};
-        const timespec now{0, 0};
-        while (sigtimedwait(&blocked, &info, &now) == HostSignal) {
-            if (RetrySignal(&info)) {
-                retryQueued.store(false);
-                continue;
-            }
-            pendingSince.store(TimedWait::NowNanos());
-        }
-    }
+    } while (self != nullptr && Outstanding(self));
     pthread_sigmask(SIG_SETMASK, &previous, nullptr);
 }
 
@@ -1836,7 +1828,8 @@ asm(".text\n"
 #ifndef _WIN32
 void DeliverDeferredGuestException() {
 #ifdef __linux__
-    if (pendingSince.load() == 0) return;
+    const auto* self = CurrentGuestThreadForDelivery();
+    if (self == nullptr || !Outstanding(self)) return;
     TimedWait::DeliverableWait wait;
     pthread_kill(pthread_self(), HostSignal);
 #endif

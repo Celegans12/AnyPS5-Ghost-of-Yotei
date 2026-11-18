@@ -920,6 +920,12 @@ void ThreadLifecycle::SetThreadAtexitReport(thread_atexit_report_func_t callback
         throw std::runtime_error("Thread atexit report callback is already registered");
 }
 
+#ifndef _WIN32
+PthreadPrivate* CurrentGuestThreadForDelivery() {
+    return CurrentGuestState().current;
+}
+#endif
+
 static void finishThread(PthreadPrivate* self, void* retval) {
     if (!self || self != CurrentGuestState().current)
         throw std::runtime_error("Finishing an unregistered guest thread");

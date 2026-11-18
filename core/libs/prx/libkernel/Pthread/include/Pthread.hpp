@@ -184,6 +184,10 @@ struct PthreadPrivate {
     TimedWait::Condition* cancelWait = nullptr;
     bool cancelWaitExiting = false;
     std::uint32_t hostMxcsr = 0x1f80;
+#ifndef _WIN32
+    std::atomic<std::uint32_t> raisesSent{0};
+    std::atomic<std::uint32_t> raisesTaken{0};
+#endif
 
     explicit PthreadPrivate(const PthreadAttrPrivate* attr = nullptr);
     ~PthreadPrivate();
@@ -215,6 +219,7 @@ extern "C" int ResumeGuestThread_nid_no_patch(PthreadPrivate* thread);
 extern "C" void DeliverPendingException_nid_no_patch(PthreadPrivate* thread);
 #else
 void DeliverDeferredGuestException();
+PthreadPrivate* CurrentGuestThreadForDelivery();
 #endif
 extern "C" void ResumeAllGuestThreads_nid_no_patch();
 bool LiveGuestThreadExists(std::int64_t tid);
