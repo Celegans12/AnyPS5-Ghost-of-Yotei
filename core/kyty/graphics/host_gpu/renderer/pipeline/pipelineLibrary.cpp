@@ -238,6 +238,12 @@ std::shared_ptr<PipelineLibraries::Library> PipelineLibraries::Request(
 	} else if (!ahead && slot->ahead) {
 		slot->ahead = false;
 		m_ahead_used.fetch_add(1, std::memory_order_relaxed);
+		if (urgent && slot->state == Library::State::Queued) {
+			if (const auto queued = std::ranges::find(m_queue, slot); queued != m_queue.end()) {
+				m_queue.erase(queued);
+				m_queue.push_front(slot);
+			}
+		}
 	}
 	return slot;
 }
@@ -318,6 +324,23 @@ bool PipelineLibraries::Link(PipelineCache::Pipeline& pipeline, const GraphicsPi
 	const auto fragment_shader   = request(PipelineLibraryPart::FragmentShader, layout);
 	const auto vertex_input      = mesh ? nullptr : request(PipelineLibraryPart::VertexInput, nullptr);
 	const auto fragment_output   = request(PipelineLibraryPart::FragmentOutput, nullptr);
+	const char* link_note = nullptr;
+	{
+		static constexpr const char* Notes[3][3] = {
+		    {"linked fs=queued pr=queued", "linked fs=queued pr=building", "linked fs=queued pr=ready"},
+		    {"linked fs=building pr=queued", "linked fs=building pr=building", "linked fs=building pr=ready"},
+		    {"linked fs=ready pr=queued", "linked fs=ready pr=building", "linked fs=ready pr=ready"},
+		};
+		const auto state = [](const Library& library) {
+			switch (library.state) {
+				case Library::State::Queued: return 0;
+				case Library::State::Building: return 1;
+				default: return 2;
+			}
+		};
+		std::lock_guard lock(m_mutex);
+		link_note = Notes[state(*fragment_shader)][state(*pre_rasterization)];
+	}
 	std::array<vk::Pipeline, 4> libraries {};
 	uint32_t                    count = 0;
 	if (vertex_input != nullptr) {
@@ -339,6 +362,7 @@ bool PipelineLibraries::Link(PipelineCache::Pipeline& pipeline, const GraphicsPi
 		return false;
 	}
 	m_linked.fetch_add(1, std::memory_order_relaxed);
+	PipelineRouteNote() = link_note;
 	return true;
 }
 
@@ -353,6 +377,36 @@ void PipelineLibraries::Prepare(const GraphicsPipelineKey& key, const Stages& st
 	for (const auto part: {PipelineLibraryPart::FragmentShader, PipelineLibraryPart::PreRasterization}) {
 		(void)Request(part, PartKey(part, key, stages, native), key, stages, native, layout, false, true);
 	}
+}
+
+void PipelineLibraries::BuildIfQueued(const std::shared_ptr<Library>& library) {
+	{
+		std::lock_guard lock(m_mutex);
+		if (library->state != Library::State::Queued) {
+			return;
+		}
+		library->state = Library::State::Building;
+	}
+	m_built_ahead.fetch_add(1, std::memory_order_relaxed);
+	Build(library);
+}
+
+void PipelineLibraries::PrepareNow(const GraphicsPipelineKey& key, const Stages& stages, bool native) {
+	if (!Eligible(stages)) {
+		return;
+	}
+	const auto layout = LibraryLayout(LayoutKey(key, native), key, stages, native);
+	if (layout == nullptr) {
+		return;
+	}
+	const auto fragment_shader = Request(PipelineLibraryPart::FragmentShader,
+	                                     PartKey(PipelineLibraryPart::FragmentShader, key, stages, native), key,
+	                                     stages, native, layout, false, true);
+	const auto pre_rasterization = Request(PipelineLibraryPart::PreRasterization,
+	                                       PartKey(PipelineLibraryPart::PreRasterization, key, stages, native), key,
+	                                       stages, native, layout, false, true);
+	BuildIfQueued(fragment_shader);
+	BuildIfQueued(pre_rasterization);
 }
 
 void PipelineLibraries::QueueOptimized(const PipelineCache::Pipeline& linked, const GraphicsPipelineKey& key,
@@ -431,13 +485,14 @@ void PipelineLibraries::LogStats() {
 	Log::WriteToConsoleAndLog(fmt::format(
 	    "[kyty-gpl] libraries built vi {} fo {} pr {} ({:.1f} ms avg) fs {} ({:.1f} ms avg); linked {} "
 	    "({:.3f} ms avg); waited {:.3f} s; ahead requested {} used {}; claimed {}; failed {}; whole in "
-	    "background {} ({:.1f} ms avg)\n",
+	    "background {} ({:.1f} ms avg); built ahead {}\n",
 	    built[0], built[3], built[1], avg_ms(build_ns[1], built[1]), built[2], avg_ms(build_ns[2], built[2]),
 	    linked, avg_ms(m_link_ns.load(std::memory_order_relaxed), linked),
 	    static_cast<double>(m_wait_ns.load(std::memory_order_relaxed)) / 1e9,
 	    m_ahead_requested.load(std::memory_order_relaxed), m_ahead_used.load(std::memory_order_relaxed),
 	    m_claimed.load(std::memory_order_relaxed), m_failed.load(std::memory_order_relaxed), optimized,
-	    avg_ms(m_optimized_ns.load(std::memory_order_relaxed), optimized)));
+	    avg_ms(m_optimized_ns.load(std::memory_order_relaxed), optimized),
+	    m_built_ahead.load(std::memory_order_relaxed)));
 }
 
 }

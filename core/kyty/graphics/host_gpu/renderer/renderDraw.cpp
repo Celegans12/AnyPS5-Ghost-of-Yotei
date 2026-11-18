@@ -1320,10 +1320,6 @@ RenderExecutor::ResolvedDraw* RenderExecutor::ReserveResolvedDraw(const HW::Shad
 	return &draw;
 }
 
-#if defined(ANYPS5_KYTY)
-static bool RecordsNoMipStats(const ShaderStageRuntime& stage);
-#endif
-
 void RenderExecutor::ResolveDrawInto(ResolvedDraw& draw, const HW::Context& context,
                                      const HW::UserConfig& user_config, const HW::Shader& shaders,
                                      const ShaderIndirectOffsets& indirect_offsets, bool indirect_draw,
@@ -1352,7 +1348,7 @@ bool RenderExecutor::ResolveDrawPrograms(ResolvedDraw& draw, const HW::Context& 
 	}
 #if defined(ANYPS5_KYTY)
 	if (m_context.GetPipelineCache().PreparesGraphicsLibraries()) {
-		m_context.GetPipelineCache().PrepareGraphicsLibraries(context, user_config, state, &RecordsNoMipStats);
+		m_context.GetPipelineCache().PrepareGraphicsLibraries(context, user_config, state);
 	}
 #endif
 	draw.resource_key = 0;
@@ -1458,8 +1454,6 @@ bool RenderExecutor::TakeResolvedDispatch(ShaderComputeInputInfo& input_info,
 	module     = resolved->compute_module;
 	return true;
 }
-
-static bool RecordsNoMipStats(const ShaderStageRuntime& stage);
 
 bool RenderExecutor::PrepareDrawRenderState(CommandBuffer& buffer, bool shaders_resolved,
                                             const DrawCallInfo& draw,
@@ -1677,7 +1671,7 @@ bool RenderExecutor::CopyDepthToColor(CommandBuffer& buffer, const DrawCallInfo&
 	return true;
 }
 
-static bool RecordsNoMipStats(const ShaderStageRuntime& stage) {
+bool RecordsNoMipStats(const ShaderStageRuntime& stage) {
 	if (stage.module == nullptr || stage.module->plain == nullptr || stage.resources == nullptr) {
 		return false;
 	}

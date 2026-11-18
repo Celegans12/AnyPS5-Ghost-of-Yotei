@@ -51,6 +51,7 @@
 #include <ranges>
 #include <span>
 #include <spirv-tools/libspirv.hpp>
+#include <string_view>
 #include <utility>
 #include <vector>
 #include <xxhash.h>
@@ -94,6 +95,60 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 		default: EXIT("Pipeline: invalid polygon mode %u\n", polygon_mode);
 	}
 }
+
+#if defined(ANYPS5_KYTY)
+PipelineStaticParameters LibraryStaticParameters(const HW::Context& context, const HW::UserConfig& user_config,
+                                                 bool tessellation, uint32_t input_control_points, bool ps_active,
+                                                 bool ps_sample_shading) {
+	PipelineStaticParameters params {};
+	const auto& mc           = context.GetModeControl();
+	const auto& clip_control = context.GetClipControl();
+	const bool  rect_list    = Prospero::IsRectList(user_config.GetPrimType());
+	params.negative_one_to_one = !clip_control.dx_clip_space;
+	params.depth_clip_enable   = clip_control.IsZClipEnabled();
+	params.provoking_vtx_last  = mc.provoking_vtx_last;
+	params.polygon_mode = ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
+	if (tessellation) {
+		params.patch_control_points = input_control_points;
+	} else if (rect_list) {
+		params.patch_control_points = 3;
+	}
+	uint32_t   samples = 0;
+	const auto mask    = context.GetRenderTargetMask();
+	for (uint32_t slot = 0; slot < 8 && samples == 0; slot++) {
+		const auto& target = context.GetRenderTarget(slot);
+		if (((mask >> (slot * 4u)) & 0x0fu) != 0 && target.base.addr != 0) {
+			samples = render_sample_count(target.attrib.num_fragments);
+		}
+	}
+	if (samples == 0) {
+		const auto& depth = context.GetDepthRenderTarget();
+		samples           = depth.z_info.format != Prospero::DepthFormat::kInvalid ? render_sample_count(depth.z_info.num_samples)
+		                                             : render_sample_count(context.GetAaConfig().msaa_num_samples);
+	}
+	params.samples                  = samples;
+	params.sample_shading_enable    = ps_active && samples > 1 && ps_sample_shading;
+	params.alpha_to_coverage_enable = ps_active && context.GetShaderRegisters().AlphaToMask();
+	return params;
+}
+
+bool PipelineChainWanted() {
+	static const bool wanted = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_CHAIN");
+		return value == nullptr || std::string_view(value) != "0";
+	}();
+	return wanted;
+}
+
+uint32_t PipelineChainThreads() {
+	static const uint32_t threads = [] {
+		const char* value = std::getenv("KYTY_PIPELINE_CHAIN_THREADS");
+		const auto  count = value != nullptr ? std::strtoul(value, nullptr, 10) : 4ul;
+		return static_cast<uint32_t>(std::clamp<unsigned long>(count, 1ul, 16ul));
+	}();
+	return threads;
+}
+#endif
 
 bool ReadsNullTlas(const ShaderModule& module, const ShaderRecompiler::IR::ResourceSnapshot& resources) {
 	const auto& info  = module.info.info;
@@ -367,6 +422,7 @@ private:
 thread_local bool t_ahead_unlocked = false;
 #if defined(ANYPS5_KYTY)
 thread_local bool t_execute_unlocked = false;
+thread_local bool t_ahead_missing    = false;
 #endif
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
@@ -1434,6 +1490,15 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	for (uint32_t i = 0; i < CompileWorkers; i++) {
 		m_workers.emplace_back([this] { CompileWorker(); });
 	}
+#if defined(ANYPS5_KYTY)
+	if (m_libraries != nullptr && PipelineLibrariesAhead() && PipelineChainWanted()) {
+		for (uint32_t i = 0; i < PipelineChainThreads(); i++) {
+			m_chain_threads.emplace_back([this] { ChainWorker(); });
+		}
+		PipelineCacheLog("[kyty-gpl] pipeline chains on: {} threads (KYTY_PIPELINE_CHAIN=0 to turn off)",
+		                 m_chain_threads.size());
+	}
+#endif
 	if (Config::AsyncPipelinesEnabled()) {
 		constexpr uint32_t AsyncThreads = 3;
 		for (uint32_t i = 0; i < AsyncThreads; i++) {
@@ -1446,6 +1511,9 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 
 PipelineCache::~PipelineCache() {
 	m_precompile = {};
+#if defined(ANYPS5_KYTY)
+	StopChains();
+#endif
 	StopWorkers();
 	CloseManifest();
 	StopHelpers();
@@ -1734,6 +1802,18 @@ bool PipelineCache::GetGraphicsProgramsAhead(const HW::Context&    context,
 	return ResolveGraphicsPrograms(context, user_config, shaders, state, &ahead);
 }
 
+#if defined(ANYPS5_KYTY)
+struct PipelineCache::ChainJob {
+	ShaderParams                         pixel_params;
+	ShaderPixelInputInfo                 pixel_info;
+	std::array<ShaderParams, 3>          vertex_params;
+	std::array<ShaderVertexInputInfo, 3> vertex_info;
+	uint32_t                             vertex_count     = 1;
+	uint32_t                             push_data_cursor = 0;
+	PipelineStaticParameters             params;
+};
+#endif
+
 bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
                                             const HW::UserConfig& user_config,
                                             const HW::Shader& shaders, DrawRenderState& state,
@@ -1975,6 +2055,10 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 	    mesh_active, object_primitive_id, last_stage.user_clip_planes);
 	const ProgramLockGuard lock(m_program_lock, ahead == nullptr || !t_ahead_unlocked);
 	if (ahead != nullptr) {
+#if defined(ANYPS5_KYTY)
+		const uint32_t first_cursor = push_data_cursor;
+		t_ahead_missing             = false;
+#endif
 		const ShaderModule* pixel_module = nullptr;
 		if (pixel_active) {
 			pixel_module = GetAhead(pixel_params, pixel_info, push_data_cursor, *ahead);
@@ -1983,6 +2067,23 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 			GetAhead(vertex_params[i], vertex_info[i], push_data_cursor, *ahead);
 		}
 		if (ahead->reads.Failed()) {
+#if defined(ANYPS5_KYTY)
+			if (t_ahead_missing && pixel_active && !m_chain_threads.empty() && PreparesGraphicsLibraries()) {
+				auto job          = std::make_unique<ChainJob>();
+				job->pixel_params = pixel_params;
+				job->pixel_info   = pixel_info;
+				job->vertex_count = tess_active ? 3u : 1u;
+				for (uint32_t i = 0; i < job->vertex_count; i++) {
+					job->vertex_params[i] = vertex_params[i];
+					job->vertex_info[i]   = vertex_info[i];
+				}
+				job->push_data_cursor = first_cursor;
+				job->params           = LibraryStaticParameters(context, user_config, tess_active,
+				                                                vertex_info[0].tess.input_control_points, true,
+				                                                pixel_info.ps_sample_shading);
+				QueueChain(std::move(job));
+			}
+#endif
 			return false;
 		}
 		if (pixel_module != nullptr) {
@@ -2039,6 +2140,9 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		const auto             entry = m_program_cache.find(key);
 		if (entry == m_program_cache.end() && ahead.stages != ProgramResolution::MaxStages) {
 			QueueCompile(key, params, input_info, push_data_cursor, nullptr);
+#if defined(ANYPS5_KYTY)
+			t_ahead_missing = true;
+#endif
 		}
 		if (entry == m_program_cache.end() || ahead.stages == ProgramResolution::MaxStages ||
 		    entry->second.skip_dispatch || entry->second.call_source ||
@@ -2094,6 +2198,9 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	if (module == modules.end()) {
 		if (!ahead.reads.MayHaveReadGpuWrites() && !t_ahead_unread_load) {
 			QueueCompile(key, params, input_info, push_data_cursor, &specialization);
+#if defined(ANYPS5_KYTY)
+			t_ahead_missing = true;
+#endif
 		}
 		ahead.reads.Fail();
 		return nullptr;
@@ -2329,6 +2436,190 @@ void PipelineCache::StopWorkers() {
 	m_job_available.notify_all();
 	m_workers.clear();
 }
+
+#if defined(ANYPS5_KYTY)
+void PipelineCache::QueueChain(std::unique_ptr<ChainJob>&& job) {
+	thread_local std::vector<uint32_t>       words;
+	thread_local std::array<uint64_t, 4096> seen {};
+	uint64_t hash = XXH3_64bits_withSeed(&job->params, sizeof(job->params), job->push_data_cursor);
+	BuildStageStaticKey(job->pixel_info, words);
+	hash = XXH3_64bits_withSeed(words.data(), words.size() * sizeof(uint32_t), hash ^ job->pixel_params.hash);
+	for (uint32_t i = 0; i < job->vertex_count; i++) {
+		BuildStageStaticKey(job->vertex_info[i], words);
+		hash = XXH3_64bits_withSeed(words.data(), words.size() * sizeof(uint32_t), hash ^ job->vertex_params[i].hash);
+	}
+	hash |= 1u;
+	auto& entry = seen[hash & (seen.size() - 1u)];
+	if (entry == hash) {
+		return;
+	}
+	entry = hash;
+	{
+		std::lock_guard lock(m_chain_mutex);
+		if (m_chain_stopping || m_chain_jobs.size() >= 256) {
+			m_chain_dropped.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+		m_chain_jobs.push_back(std::move(job));
+	}
+	m_chain_queued.fetch_add(1, std::memory_order_relaxed);
+	m_chain_available.notify_one();
+}
+
+void PipelineCache::StopChains() {
+	{
+		std::lock_guard lock(m_chain_mutex);
+		m_chain_stopping = true;
+		m_chain_jobs.clear();
+	}
+	m_chain_available.notify_all();
+	m_chain_threads.clear();
+}
+
+void PipelineCache::ChainWorker() {
+	KYTY_PROFILER_THREAD("Thread_PipelineChain");
+	PlaceBackgroundCompileThread(false);
+	for (;;) {
+		std::unique_ptr<ChainJob> job;
+		{
+			std::unique_lock lock(m_chain_mutex);
+			m_chain_available.wait(lock, [&] { return m_chain_stopping || !m_chain_jobs.empty(); });
+			if (m_chain_stopping) {
+				return;
+			}
+			job = std::move(m_chain_jobs.front());
+			m_chain_jobs.pop_front();
+		}
+		const auto started = std::chrono::steady_clock::now();
+		RunChain(*job);
+		m_chain_ns.fetch_add(static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+		                                               std::chrono::steady_clock::now() - started)
+		                                               .count()),
+		                     std::memory_order_relaxed);
+	}
+}
+
+template <typename InputInfo>
+const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, InputInfo& input_info,
+                                               uint32_t& push_data_cursor,
+                                               ShaderRecompiler::IR::ResourceSnapshot& resources) {
+	ProgramKey key;
+	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
+		key.stage = input_info.logical_stage;
+	} else {
+		static_assert(std::is_same_v<InputInfo, ShaderPixelInputInfo>);
+		key.stage = ShaderType::Pixel;
+	}
+	key.hash            = params.hash;
+	key.user_data_count = params.user_data_count;
+	BuildStageStaticKey(input_info, key.static_state);
+	AppendNativeRayTracingKey(key.stage, key.static_state);
+	ShaderRecompiler::IR::ResourceSpecialization specialization;
+	bool                                         materialized = false;
+	for (uint32_t attempt = 0; attempt < 3; attempt++) {
+		LockPrograms();
+		while (m_in_flight.contains(key)) {
+			UnlockPrograms();
+			{
+				std::lock_guard lock(m_chain_mutex);
+				if (m_chain_stopping) {
+					return nullptr;
+				}
+			}
+			std::this_thread::sleep_for(std::chrono::microseconds(200));
+			LockPrograms();
+		}
+		const auto entry   = m_program_cache.find(key);
+		Program*   program = entry != m_program_cache.end() ? &entry->second : nullptr;
+		if (program != nullptr &&
+		    (program->skip_dispatch || program->call_source ||
+		     std::ranges::any_of(program->modules,
+		                         [](const ShaderModule& module) { return module.info.info.uses_image_heap; }))) {
+			UnlockPrograms();
+			return nullptr;
+		}
+		if (program != nullptr && !materialized) {
+			UnlockPrograms();
+			GuestReadLog                     reads;
+			ShaderRecompiler::IR::SrtRuntime runtime {
+			    .user_data                  = std::span(params.user_data).first(params.user_data_count),
+			    .shader_base                = params.Base(),
+			    .userdata                   = &reads,
+			    .read_specialization_memory = ReadAheadStrict,
+			    .record_load                = RecordAheadLoad,
+			    .record_loads               = RecordAheadLoads,
+			};
+			if (!ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources,
+			                                                specialization)) {
+				return nullptr;
+			}
+			materialized = true;
+			LockPrograms();
+		}
+		if (program != nullptr) {
+			const auto module = std::ranges::find_if(program->modules, [&](const ShaderModule& candidate) {
+				const auto& layout = candidate.info.bindings;
+				return layout.push_data_start_dword ==
+				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords()) &&
+				       candidate.specialization == specialization;
+			});
+			if (module != program->modules.end()) {
+				UnlockPrograms();
+				module->info.bindings.AdvancePushData(push_data_cursor);
+				return &*module;
+			}
+		}
+		if (m_in_flight.contains(key)) {
+			UnlockPrograms();
+			continue;
+		}
+		m_in_flight[key]++;
+		UnlockPrograms();
+		CompileJob job {.key = key, .params = params, .push_data_cursor = push_data_cursor};
+		if (materialized) {
+			job.specialization = specialization;
+		}
+		RunCompileJob(job, input_info);
+		m_chain_compiled.fetch_add(1, std::memory_order_relaxed);
+		if (!materialized) {
+			LockPrograms();
+			const bool added = m_program_cache.contains(key);
+			UnlockPrograms();
+			if (!added) {
+				return nullptr;
+			}
+		}
+	}
+	return nullptr;
+}
+
+void PipelineCache::RunChain(ChainJob& job) {
+	uint32_t                               cursor = job.push_data_cursor;
+	ShaderRecompiler::IR::ResourceSnapshot pixel_resources;
+	ShaderRecompiler::IR::ResourceSnapshot vertex_resources;
+	std::array<const ShaderModule*, 4>     stages {};
+	const auto* pixel = ChainModule(job.pixel_params, job.pixel_info, cursor, pixel_resources);
+	if (pixel == nullptr) {
+		m_chain_failed.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	for (uint32_t i = 0; i < job.vertex_count; i++) {
+		stages[i] = ChainModule(job.vertex_params[i], job.vertex_info[i], cursor, vertex_resources);
+		if (stages[i] == nullptr) {
+			m_chain_failed.fetch_add(1, std::memory_order_relaxed);
+			return;
+		}
+	}
+	stages[3] = RecordsNoMipStats({.module = pixel, .resources = &pixel_resources}) ? pixel->plain.get() : pixel;
+	GraphicsPipelineKey key {};
+	key.static_params = job.params;
+	for (uint32_t i = 0; i < stages.size(); i++) {
+		key.stage_ids[i] = stages[i] != nullptr ? stages[i]->id : 0;
+	}
+	m_libraries->PrepareNow(key, stages, false);
+	m_chain_prepared.fetch_add(1, std::memory_order_relaxed);
+}
+#endif
 
 void PipelineCache::QueueAsyncPipeline(const AsyncPipelineJob& job) {
 	{
@@ -3270,7 +3561,6 @@ bool PipelineCache::CreateGraphicsPipelineFast(Pipeline& pipeline, const Graphic
 	}
 	if (m_libraries->Link(pipeline, key, stages)) {
 		m_libraries->QueueOptimized(pipeline, key, stages);
-		route = "linked";
 		return true;
 	}
 	route = "whole-failed-link";
@@ -3308,8 +3598,7 @@ bool PipelineCache::PreparesGraphicsLibraries() const {
 }
 
 void PipelineCache::PrepareGraphicsLibraries(const HW::Context& context, const HW::UserConfig& user_config,
-                                             const DrawRenderState& state,
-                                             bool (*ps_plain)(const ShaderStageRuntime&)) {
+                                             const DrawRenderState& state) {
 	const auto                         vertex_info = state.VertexStages();
 	std::array<const ShaderModule*, 4> stages {};
 	for (uint32_t i = 0; i < vertex_info.size(); i++) {
@@ -3343,7 +3632,7 @@ void PipelineCache::PrepareGraphicsLibraries(const HW::Context& context, const H
 	last.primitive   = primitive;
 	last.target_mask = target_mask;
 	last.target0     = target0;
-	if (stages[3] != nullptr && stages[3]->plain != nullptr && ps_plain(state.ps_input_info.stage)) {
+	if (stages[3] != nullptr && stages[3]->plain != nullptr && RecordsNoMipStats(state.ps_input_info.stage)) {
 		stages[3] = stages[3]->plain.get();
 	}
 	if (!PipelineLibraries::Eligible(stages)) {
@@ -3353,36 +3642,10 @@ void PipelineCache::PrepareGraphicsLibraries(const HW::Context& context, const H
 	for (uint32_t i = 0; i < stages.size(); i++) {
 		key.stage_ids[i] = stages[i] != nullptr ? stages[i]->id : 0;
 	}
-	const auto& mc           = context.GetModeControl();
-	const auto& clip_control = context.GetClipControl();
-	const bool  rect_list    = Prospero::IsRectList(user_config.GetPrimType());
-	auto&       params       = key.static_params;
-	params.negative_one_to_one = !clip_control.dx_clip_space;
-	params.depth_clip_enable   = clip_control.IsZClipEnabled();
-	params.provoking_vtx_last  = mc.provoking_vtx_last;
-	params.polygon_mode = ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
-	if (vertex_info.size() == 3) {
-		params.patch_control_points = vertex_info[0].tess.input_control_points;
-	} else if (rect_list) {
-		params.patch_control_points = 3;
-	}
-	uint32_t   samples = 0;
-	const auto mask    = context.GetRenderTargetMask();
-	for (uint32_t slot = 0; slot < 8 && samples == 0; slot++) {
-		const auto& target = context.GetRenderTarget(slot);
-		if (((mask >> (slot * 4u)) & 0x0fu) != 0 && target.base.addr != 0) {
-			samples = render_sample_count(target.attrib.num_fragments);
-		}
-	}
-	if (samples == 0) {
-		const auto& depth = context.GetDepthRenderTarget();
-		samples           = depth.z_info.format != Prospero::DepthFormat::kInvalid ? render_sample_count(depth.z_info.num_samples)
-		                                             : render_sample_count(context.GetAaConfig().msaa_num_samples);
-	}
-	params.samples = samples;
-	params.sample_shading_enable =
-	    state.ps_active && samples > 1 && state.ps_input_info.ps_sample_shading;
-	params.alpha_to_coverage_enable = state.ps_active && context.GetShaderRegisters().AlphaToMask();
+	auto& params = key.static_params;
+	params       = LibraryStaticParameters(context, user_config, vertex_info.size() == 3,
+	                                       vertex_info[0].tess.input_control_points, state.ps_active,
+	                                       state.ps_input_info.ps_sample_shading);
 	struct Seen {
 		std::array<uint64_t, 4>  stage_ids;
 		PipelineStaticParameters params;

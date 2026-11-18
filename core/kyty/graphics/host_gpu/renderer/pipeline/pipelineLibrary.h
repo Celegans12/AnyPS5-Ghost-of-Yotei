@@ -65,6 +65,7 @@ public:
 	[[nodiscard]] static bool Eligible(const Stages& stages);
 	bool Link(PipelineCache::Pipeline& pipeline, const GraphicsPipelineKey& key, const Stages& stages);
 	void Prepare(const GraphicsPipelineKey& key, const Stages& stages, bool native);
+	void PrepareNow(const GraphicsPipelineKey& key, const Stages& stages, bool native);
 	void QueueOptimized(const PipelineCache::Pipeline& linked, const GraphicsPipelineKey& key,
 	                    const Stages& stages);
 	[[nodiscard]] uint64_t OptimizedReady() const {
@@ -89,6 +90,7 @@ private:
 	                                 const GraphicsPipelineKey& pipeline_key, const Stages& stages,
 	                                 bool native, vk::PipelineLayout layout, bool urgent, bool ahead);
 	vk::Pipeline             Await(const std::shared_ptr<Library>& library);
+	void                     BuildIfQueued(const std::shared_ptr<Library>& library);
 	void                     Build(const std::shared_ptr<Library>& library);
 	vk::PipelineLayout       LibraryLayout(const std::string& key, const GraphicsPipelineKey& pipeline_key,
 	                                       const Stages& stages, bool native);
@@ -129,6 +131,7 @@ private:
 	std::atomic<uint64_t>                m_optimized_ns {0};
 	std::atomic<int64_t>                 m_last_link {0};
 	std::atomic<bool>                    m_active {false};
+	std::atomic<uint64_t>                m_built_ahead {0};
 };
 
 }

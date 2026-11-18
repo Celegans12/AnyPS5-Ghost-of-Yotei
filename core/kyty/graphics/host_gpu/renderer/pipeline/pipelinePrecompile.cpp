@@ -132,6 +132,17 @@ void PipelineCache::LogStallStats(bool force) {
 	if (m_libraries != nullptr) {
 		m_libraries->LogStats();
 	}
+	if (!m_chain_threads.empty()) {
+		const auto prepared = m_chain_prepared.load(std::memory_order_relaxed);
+		const auto failed   = m_chain_failed.load(std::memory_order_relaxed);
+		const auto runs     = prepared + failed;
+		PrecompileLog("[kyty-gpl] chains queued {} dropped {} prepared {} failed {} modules compiled {} ({:.1f} ms avg)",
+		              m_chain_queued.load(std::memory_order_relaxed), m_chain_dropped.load(std::memory_order_relaxed),
+		              prepared, failed, m_chain_compiled.load(std::memory_order_relaxed),
+		              runs != 0 ? static_cast<double>(m_chain_ns.load(std::memory_order_relaxed)) / 1e6 /
+		                              static_cast<double>(runs)
+		                        : 0.0);
+	}
 }
 #endif
 

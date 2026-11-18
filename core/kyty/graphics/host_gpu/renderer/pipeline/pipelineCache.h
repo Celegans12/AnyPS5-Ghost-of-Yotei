@@ -279,6 +279,7 @@ struct ShaderModule {
                                                                   vk::Device            device);
 
 [[nodiscard]] bool SmallColorTargetDraw(const HW::Context& context);
+[[nodiscard]] bool RecordsNoMipStats(const ShaderStageRuntime& stage);
 
 struct DrawTargets {
 	RenderDepthInfo depth;
@@ -383,7 +384,7 @@ public:
 #if defined(ANYPS5_KYTY)
 	[[nodiscard]] bool PreparesGraphicsLibraries() const;
 	void PrepareGraphicsLibraries(const HW::Context& context, const HW::UserConfig& user_config,
-	                              const DrawRenderState& state, bool (*ps_plain)(const ShaderStageRuntime&));
+	                              const DrawRenderState& state);
 #endif
 	Pipeline& GetComputePipeline(const ShaderComputeInputInfo& input_info);
 	Pipeline* TryGetComputePipeline(const ShaderComputeInputInfo& input_info);
@@ -645,6 +646,22 @@ private:
 	bool CreateGraphicsPipelineFast(Pipeline& pipeline, const GraphicsPipelineKey& key,
 	                                const std::array<const ShaderModule*, 4>& stages);
 	void ApplyOptimizedPipelines();
+
+	struct ChainJob;
+	std::mutex                              m_chain_mutex;
+	std::condition_variable                 m_chain_available;
+	std::deque<std::unique_ptr<ChainJob>>   m_chain_jobs;
+	bool                                    m_chain_stopping = false;
+	std::vector<std::jthread>               m_chain_threads;
+	std::atomic<uint64_t> m_chain_queued {0}, m_chain_dropped {0}, m_chain_prepared {0}, m_chain_failed {0},
+	    m_chain_compiled {0}, m_chain_ns {0};
+	void QueueChain(std::unique_ptr<ChainJob>&& job);
+	void ChainWorker();
+	void StopChains();
+	void RunChain(ChainJob& job);
+	template <typename InputInfo>
+	const ShaderModule* ChainModule(const ShaderParams& params, InputInfo& input_info, uint32_t& push_data_cursor,
+	                                ShaderRecompiler::IR::ResourceSnapshot& resources);
 #endif
 	void QueueAsyncPipeline(const AsyncPipelineJob& job);
 	template <typename Matches>
