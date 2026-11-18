@@ -40,6 +40,7 @@ class RenderContext;
 class CommandScheduler;
 struct RenderExecutorTestAccess;
 struct IndirectThreadPass;
+class RayTracingCheck;
 
 struct TextureDescDerivation {
 	TextureCache::ImageDesc desc;
@@ -196,6 +197,7 @@ public:
 	void ProcessPssr(CommandBuffer& buffer, const Pssr::Request& request);
 	void DispatchIndirectThreads(CommandBuffer& buffer, uint64_t args_addr, uint32_t mode,
 	                             bool async_compute);
+	RayTracingCheck& RtCheck();
 
 	struct ResolvedDraw;
 	[[nodiscard]] ResolvedDraw* ResolveDrawAhead(const HW::Context&    context,
@@ -593,6 +595,7 @@ private:
 	DrawTargets                           m_targets;
 	DrawTargets*                          m_draw_targets = &m_targets;
 	PreparedBindings                     m_compute_bindings;
+	std::shared_ptr<RayTracingCheck>     m_rt_check;
 	std::vector<ImageId>                  m_bound_images;
 	std::vector<vk::DescriptorImageInfo>  m_descriptor_images;
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;

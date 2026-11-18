@@ -3201,7 +3201,8 @@ PipelineCache::TableProgram PipelineCache::GetPixelProgramTable(
 }
 
 const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo& regs,
-                                                     ShaderComputeInputInfo&      input_info) {
+                                                     ShaderComputeInputInfo&      input_info,
+                                                     bool                         guest_traversal) {
 	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
 #if defined(ANYPS5_KYTY)
 	ShaderParams params;
@@ -3218,8 +3219,10 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
 	const ProgramLockGuard lock(m_program_lock);
 	const auto             cursor = push_data_cursor;
+	m_guest_traversal             = guest_traversal;
 	const auto*            module = GetProgram(params, input_info, push_data_cursor);
-	if (module != nullptr && ReadsNullTlas(*module, *input_info.stage.resources)) {
+	m_guest_traversal             = false;
+	if (module != nullptr && !guest_traversal && ReadsNullTlas(*module, *input_info.stage.resources)) {
 		push_data_cursor  = cursor;
 		m_guest_traversal = true;
 		module            = GetProgram(params, input_info, push_data_cursor);

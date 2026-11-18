@@ -18,6 +18,7 @@
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/pipeline/shaderResourceBarrier.h"
+#include "graphics/host_gpu/renderer/rayTracingCheck.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/host_gpu/vulkanCommon.h"
@@ -403,6 +404,13 @@ static bool HasStorageWrites(const ShaderComputeInputInfo& input_info,
 	       });
 }
 
+RayTracingCheck& RenderExecutor::RtCheck() {
+	if (m_rt_check == nullptr) {
+		m_rt_check = std::make_shared<RayTracingCheck>(m_context);
+	}
+	return *m_rt_check;
+}
+
 void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group_x,
                                     uint32_t thread_group_y, uint32_t thread_group_z, uint32_t mode,
                                     bool async_compute) {
@@ -479,18 +487,25 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	}
 	TableNoteDispatched(cs_regs, false);
 	m_context.GetImageHeap().BeginDraw();
+	const ShaderComputeInputInfo pristine = input_info;
 	const ShaderModule* compute_module = nullptr;
 	if (!TakeResolvedDispatch(input_info, compute_module)) {
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info);
 	}
-	if (compute_module == nullptr) return;
-	if (use_thread_dimensions) {
-		input_info.dispatch_threads_num[0]    = thread_group_x;
-		input_info.dispatch_threads_num[1]    = thread_group_y;
-		input_info.dispatch_threads_num[2]    = thread_group_z;
+	if (compute_module != nullptr && RtCheck().FallsBack(compute_module->info.shader_hash)) {
+		input_info     = pristine;
+		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info, true);
 	}
+	if (compute_module == nullptr) return;
+	const auto thread_dimensions = [&](ShaderComputeInputInfo& info) {
+		if (use_thread_dimensions) {
+			info.dispatch_threads_num[0] = thread_group_x;
+			info.dispatch_threads_num[1] = thread_group_y;
+			info.dispatch_threads_num[2] = thread_group_z;
+		}
+	};
+	thread_dimensions(input_info);
 
-	const auto& program   = input_info.stage.module->info;
 	const auto& resources = *input_info.stage.resources;
 	m_replicated[2] = 0;
 	if (resources.specialization_reads.empty() &&
@@ -527,137 +542,161 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		thread_group_z = input_info.workgroup_counts[2];
 	}
 
-	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
-	auto& bindings = m_compute_bindings;
-	PrepareBindings(input_info.stage, bindings);
-	if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
-		std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
-		          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
-	}
-	PreparedBindings* descriptor_stage = &bindings;
-	CacheDmaBases(m_context, input_info.stage);
-	FindBuffers(std::span {&descriptor_stage, 1u});
-	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings) |
-	                             PrepareSelfSizedBuffers(m_context, input_info.stage);
-	if (program.info.uses_dma) {
-		m_context.CacheDmaBases(input_info.stage);
-		const ShaderStageRuntime* const dma_stage = &input_info.stage;
-		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
-		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
-			m_context.GetBufferCache().RequestFlushForReadbacks();
+	const auto record = [&](ShaderComputeInputInfo& input_info, uint32_t rt_pass) {
+		const auto& program   = input_info.stage.module->info;
+		const auto& resources = *input_info.stage.resources;
+		buffer.EndRendering();
+		auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
+		auto& bindings = m_compute_bindings;
+		PrepareBindings(input_info.stage, bindings);
+		if (program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
+			std::copy(std::begin(input_info.dispatch_threads_num), std::end(input_info.dispatch_threads_num),
+			          bindings.shader_data.begin() + program.bindings.dispatch_thread_dword);
 		}
-	}
-	PrepareRayQuery(m_context, input_info.stage, bindings);
-	if (program.info.uses_image_heap) {
-		m_context.GetImageHeap().Rebind(*this);
-	}
-	RebindImages(bindings);
-	BindSharedMemory(m_context, input_info, bindings);
-	RebindBuffers(bindings);
-	m_context.GetOcclusionQueries().WriteForReaders();
-
-	const auto vk_buffer = buffer.Handle();
-	PrepareNativeRayTracing(m_context, vk_buffer, cs_regs, bindings);
-	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
-	               std::span {&descriptor_stage, 1u});
-#if defined(ANYPS5_KYTY)
-	m_context.GetCommandScheduler().GetMasterSemaphore().NoteWork(m_context.GetCommandScheduler().CurrentTick(),
-	                                                              program.shader_hash);
-#endif
-	bool has_storage_writes = HasStorageWrites(input_info, bindings, indirect_writes);
-	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
-	if (has_storage_writes && !chained) {
-		ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	}
-	if (Config::GraphicsDebugDumpEnabled()) {
-		const auto sampled_images = std::count_if(
-		    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
-			    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
-		    });
-		const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
-		LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
-		     " hash=0x%016" PRIx64 " tick=%" PRIu64 " completed_tick=%" PRIu64
-		     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
-		     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
-		     frame_num, sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash,
-		     m_context.GetCommandScheduler().CurrentTick(),
-		     m_context.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick(),
-		     thread_group_x, thread_group_y, thread_group_z, mode,
-		     input_info.threads_num[0], input_info.threads_num[1],
-		     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
-		     sampled_images, program.info.images.size() - sampled_images,
-		     program.info.samplers.size(),
-		     program.bindings.UsesPushData()
-		         ? static_cast<uint32_t>(sizeof(ShaderRecompiler::IR::PushData))
-		         : 0u);
-		for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
-			const auto& buffer = program.info.buffers[i];
-			const auto  r      = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
-			LOGF("  CS buffer[%u]: source=%u usage=%s addr=0x%012" PRIx64
-			     " stride=%u records=%u format=%u\n",
-			     i, buffer.source, buffer.written ? "read-write" : "read-only", r.Base48(),
-			     r.Stride(), r.NumRecords(), r.RawFormat());
-		}
-		for (uint32_t i = 0; i < program.info.images.size(); i++) {
-			const auto& image = program.info.images[i];
-			const auto  r     = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
-			const auto  max_mip = image.r128 ? r.LastLevel() : r.MaxMip();
-			LOGF("  CS texture[%u]: source=%u usage=%s sampled=%s addr=0x%010" PRIx64
-			     " type=%u fmt=%u extent=%ux%u depth=%u levels=%u tile=%u\n",
-			     i, image.source, image.written ? "read-write" : "read-only",
-			     image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled
-			         ? "true"
-			         : "false",
-			     r.Base40(), static_cast<uint32_t>(r.Type()), static_cast<uint32_t>(r.Format()),
-			     static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
-			     static_cast<uint32_t>(r.Depth()) + 1u,
-			     r.Type() == Prospero::ImageType::kColor2DMsaa ||
-			             r.Type() == Prospero::ImageType::kColor2DMsaaArray
-			         ? 1u
-			         : static_cast<uint32_t>(max_mip) + 1u,
-			     static_cast<uint32_t>(r.TileMode()));
-		}
-		for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
-			const auto r = DecodeNativeDescriptor<ShaderSamplerResource>(
-			    resources.samplers[program.info.samplers[i].snapshot_index]);
-			LOGF("  CS sampler[%u]: source=%u clamp=%u/%u/%u filter=%u/%u/%u mip=%u "
-			     "lod=%u-%u bias=%d\n",
-			     i, program.info.samplers[i].source, static_cast<uint32_t>(r.ClampX()),
-			     static_cast<uint32_t>(r.ClampY()), static_cast<uint32_t>(r.ClampZ()),
-			     static_cast<uint32_t>(r.XyMagFilter()), static_cast<uint32_t>(r.XyMinFilter()),
-			     static_cast<uint32_t>(r.ZFilter()), static_cast<uint32_t>(r.MipFilter()),
-			     static_cast<uint32_t>(r.MinLod()), static_cast<uint32_t>(r.MaxLod()),
-			     static_cast<int32_t>(r.LodBias()));
-		}
-	}
-
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
-	const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
-	                                   std::max(input_info.threads_num[1], 1u) *
-	                                   std::max(input_info.threads_num[2], 1u);
-	if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
-	    group_threads <= input_info.wave_size && !input_info.lds_storage) {
-		for (uint32_t z = 0; z < thread_group_z; ++z) {
-			for (uint32_t y = 0; y < thread_group_y; ++y) {
-				for (uint32_t x = 0; x < thread_group_x; ++x) {
-					if ((x | y | z) != 0u) {
-						ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-					}
-					vk_buffer.dispatchBase(x, y, z, 1, 1, 1);
-				}
+		PreparedBindings* descriptor_stage = &bindings;
+		CacheDmaBases(m_context, input_info.stage);
+		FindBuffers(std::span {&descriptor_stage, 1u});
+		const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings) |
+		                             PrepareSelfSizedBuffers(m_context, input_info.stage);
+		if (program.info.uses_dma) {
+			m_context.CacheDmaBases(input_info.stage);
+			const ShaderStageRuntime* const dma_stage = &input_info.stage;
+			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
+			if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
+				m_context.GetBufferCache().RequestFlushForReadbacks();
 			}
 		}
-	} else {
-		vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
-	}
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+		PrepareRayQuery(m_context, input_info.stage, bindings);
+		if (program.info.uses_image_heap) {
+			m_context.GetImageHeap().Rebind(*this);
+		}
+		RebindImages(bindings);
+		BindSharedMemory(m_context, input_info, bindings);
+		RebindBuffers(bindings);
+		m_context.GetOcclusionQueries().WriteForReaders();
 
-	m_deferred_barrier       = true;
-	m_deferred_barrier_queue = m_guest_queue;
-	ResetBindings();
+		const auto vk_buffer = buffer.Handle();
+		PrepareNativeRayTracing(m_context, vk_buffer, cs_regs, bindings);
+		if (rt_pass == 1) {
+			RtCheck().Before(bindings);
+		}
+		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+		               std::span {&descriptor_stage, 1u});
+#if defined(ANYPS5_KYTY)
+		m_context.GetCommandScheduler().GetMasterSemaphore().NoteWork(m_context.GetCommandScheduler().CurrentTick(),
+		                                                              program.shader_hash);
+#endif
+		bool has_storage_writes = HasStorageWrites(input_info, bindings, indirect_writes);
+		const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
+		if (has_storage_writes && !chained) {
+			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		}
+		if (Config::GraphicsDebugDumpEnabled()) {
+			const auto sampled_images = std::count_if(
+			    program.info.images.begin(), program.info.images.end(), [](const auto& image) {
+				    return image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled;
+			    });
+			const uint32_t frame_num = static_cast<uint32_t>(m_context.GetGpu().GetFrameNum());
+			LOGF("GraphicsRenderDispatchDirect: frame=%u shader=0x%016" PRIx64
+			     " hash=0x%016" PRIx64 " tick=%" PRIu64 " completed_tick=%" PRIu64
+			     " groups=%ux%ux%u mode=0x%08" PRIx32 " local=%ux%ux%u "
+			     "buffers=%zu textures=%zu sampled=%zu storage=%zu samplers=%zu push=%u\n",
+			     frame_num, sh_ctx.GetCs().cs_regs.data_addr, program.shader_hash,
+			     m_context.GetCommandScheduler().CurrentTick(),
+			     m_context.GetCommandScheduler().GetMasterSemaphore().KnownGpuTick(),
+			     thread_group_x, thread_group_y, thread_group_z, mode,
+			     input_info.threads_num[0], input_info.threads_num[1],
+			     input_info.threads_num[2], program.info.buffers.size(), program.info.images.size(),
+			     sampled_images, program.info.images.size() - sampled_images,
+			     program.info.samplers.size(),
+			     program.bindings.UsesPushData()
+			         ? static_cast<uint32_t>(sizeof(ShaderRecompiler::IR::PushData))
+			         : 0u);
+			for (uint32_t i = 0; i < program.info.buffers.size(); i++) {
+				const auto& buffer = program.info.buffers[i];
+				const auto  r      = DecodeNativeDescriptor<ShaderBufferResource>(resources.buffers[i]);
+				LOGF("  CS buffer[%u]: source=%u usage=%s addr=0x%012" PRIx64
+				     " stride=%u records=%u format=%u\n",
+				     i, buffer.source, buffer.written ? "read-write" : "read-only", r.Base48(),
+				     r.Stride(), r.NumRecords(), r.RawFormat());
+			}
+			for (uint32_t i = 0; i < program.info.images.size(); i++) {
+				const auto& image = program.info.images[i];
+				const auto  r     = DecodeNativeDescriptor<ShaderTextureResource>(resources.images[i]);
+				const auto  max_mip = image.r128 ? r.LastLevel() : r.MaxMip();
+				LOGF("  CS texture[%u]: source=%u usage=%s sampled=%s addr=0x%010" PRIx64
+				     " type=%u fmt=%u extent=%ux%u depth=%u levels=%u tile=%u\n",
+				     i, image.source, image.written ? "read-write" : "read-only",
+				     image.resource_class == ShaderRecompiler::IR::ImageResourceClass::Sampled
+				         ? "true"
+				         : "false",
+				     r.Base40(), static_cast<uint32_t>(r.Type()), static_cast<uint32_t>(r.Format()),
+				     static_cast<uint32_t>(r.Width5()) + 1u, static_cast<uint32_t>(r.Height5()) + 1u,
+				     static_cast<uint32_t>(r.Depth()) + 1u,
+				     r.Type() == Prospero::ImageType::kColor2DMsaa ||
+				             r.Type() == Prospero::ImageType::kColor2DMsaaArray
+				         ? 1u
+				         : static_cast<uint32_t>(max_mip) + 1u,
+				     static_cast<uint32_t>(r.TileMode()));
+			}
+			for (uint32_t i = 0; i < program.info.samplers.size(); i++) {
+				const auto r = DecodeNativeDescriptor<ShaderSamplerResource>(
+				    resources.samplers[program.info.samplers[i].snapshot_index]);
+				LOGF("  CS sampler[%u]: source=%u clamp=%u/%u/%u filter=%u/%u/%u mip=%u "
+				     "lod=%u-%u bias=%d\n",
+				     i, program.info.samplers[i].source, static_cast<uint32_t>(r.ClampX()),
+				     static_cast<uint32_t>(r.ClampY()), static_cast<uint32_t>(r.ClampZ()),
+				     static_cast<uint32_t>(r.XyMagFilter()), static_cast<uint32_t>(r.XyMinFilter()),
+				     static_cast<uint32_t>(r.ZFilter()), static_cast<uint32_t>(r.MipFilter()),
+				     static_cast<uint32_t>(r.MinLod()), static_cast<uint32_t>(r.MaxLod()),
+				     static_cast<int32_t>(r.LodBias()));
+			}
+		}
+
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		constexpr uint32_t DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE = 1u << 3u;
+		const uint64_t     group_threads = uint64_t {std::max(input_info.threads_num[0], 1u)} *
+		                                   std::max(input_info.threads_num[1], 1u) *
+		                                   std::max(input_info.threads_num[2], 1u);
+		if ((mode & DISPATCH_INITIATOR_ORDERED_APPEND_ENABLE) != 0 && program.info.uses_gds &&
+		    group_threads <= input_info.wave_size && !input_info.lds_storage) {
+			for (uint32_t z = 0; z < thread_group_z; ++z) {
+				for (uint32_t y = 0; y < thread_group_y; ++y) {
+					for (uint32_t x = 0; x < thread_group_x; ++x) {
+						if ((x | y | z) != 0u) {
+							ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+						}
+						vk_buffer.dispatchBase(x, y, z, 1, 1, 1);
+					}
+				}
+			}
+		} else {
+			vk_buffer.dispatch(thread_group_x, thread_group_y, thread_group_z);
+		}
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+		if (rt_pass == 1) {
+			RtCheck().AfterOracle(bindings);
+		} else if (rt_pass == 2) {
+			RtCheck().AfterGuest(bindings);
+		}
+
+		m_deferred_barrier       = true;
+		m_deferred_barrier_queue = m_guest_queue;
+		ResetBindings();
+	};
+	if (!RtCheck().Sample(*compute_module, buffer)) {
+		record(input_info, 0);
+		return;
+	}
+	record(input_info, 1);
+	ShaderComputeInputInfo guest = pristine;
+	if (m_context.GetPipelineCache().GetComputeProgram(cs_regs, guest, true) == nullptr) {
+		RtCheck().KeepOracle("the emulated variant is not available");
+		return;
+	}
+	thread_dimensions(guest);
+	record(guest, 2);
 }
 
 struct IndirectThreadPass {
@@ -891,72 +930,99 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	TableNoteDispatched(cs_regs, false);
 	ShaderComputeInputInfo input_info {};
 	m_context.GetImageHeap().BeginDraw();
+	ShaderComputeInputInfo pristine {};
+	pristine.async_compute         = async_compute;
+	pristine.indirect_args_address = args_addr;
 	const ShaderModule* compute_module = nullptr;
 	if (!TakeResolvedDispatch(input_info, compute_module)) {
-		input_info.async_compute         = async_compute;
-		input_info.indirect_args_address = args_addr;
+		input_info     = pristine;
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info);
+	}
+	if (compute_module != nullptr && RtCheck().FallsBack(compute_module->info.shader_hash)) {
+		input_info     = pristine;
+		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info, true);
 	}
 	if (compute_module == nullptr) return;
 	TableDispatchLearn(cs_regs, *compute_module, async_compute, false);
-	buffer.EndRendering();
-	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
-	auto& bindings = m_compute_bindings;
-	PrepareBindings(input_info.stage, bindings);
-	PreparedBindings* descriptor_stage = &bindings;
-	CacheDmaBases(m_context, input_info.stage);
-	FindBuffers(std::span {&descriptor_stage, 1u});
-	const auto& program = input_info.stage.module->info;
-	const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings) |
-	                             PrepareSelfSizedBuffers(m_context, input_info.stage);
-	if (program.info.uses_dma) {
-		m_context.CacheDmaBases(input_info.stage);
-		const ShaderStageRuntime* const dma_stage = &input_info.stage;
-		const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
-		m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
-		if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
-			m_context.GetBufferCache().RequestFlushForReadbacks();
+	const auto record = [&](ShaderComputeInputInfo& input_info, uint32_t rt_pass) {
+		buffer.EndRendering();
+		auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);
+		auto& bindings = m_compute_bindings;
+		PrepareBindings(input_info.stage, bindings);
+		PreparedBindings* descriptor_stage = &bindings;
+		CacheDmaBases(m_context, input_info.stage);
+		FindBuffers(std::span {&descriptor_stage, 1u});
+		const auto& program = input_info.stage.module->info;
+		const bool indirect_writes = PrepareIndirectWriteTargets(m_context, bindings) |
+		                             PrepareSelfSizedBuffers(m_context, input_info.stage);
+		if (program.info.uses_dma) {
+			m_context.CacheDmaBases(input_info.stage);
+			const ShaderStageRuntime* const dma_stage = &input_info.stage;
+			const bool reach_synchronized = m_context.SynchronizeDmaFootprint(std::span {&dma_stage, 1});
+			m_context.PrepareBda(MayWriteThroughDeviceAddresses(program), !reach_synchronized);
+			if (program.bindings.descriptor_counts[static_cast<size_t>(ShaderRecompiler::IR::DescriptorBindingKind::Buffers)] != 0) {
+				m_context.GetBufferCache().RequestFlushForReadbacks();
+			}
 		}
-	}
-	PrepareRayQuery(m_context, input_info.stage, bindings);
-	BindSharedMemory(m_context, input_info, bindings, args_addr);
-	if (program.info.uses_image_heap) {
-		m_context.GetImageHeap().Rebind(*this);
-	}
-	RebindImages(bindings);
-	const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
-	    args_addr, sizeof(vk::DispatchIndirectCommand), false);
-	EXIT_IF((args_offset & 3u) != 0);
-	RebindBuffers(bindings);
-	m_context.GetOcclusionQueries().WriteForReaders();
-	PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings);
-	CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
-	               std::span {&descriptor_stage, 1u});
+		PrepareRayQuery(m_context, input_info.stage, bindings);
+		BindSharedMemory(m_context, input_info, bindings, args_addr);
+		if (program.info.uses_image_heap) {
+			m_context.GetImageHeap().Rebind(*this);
+		}
+		RebindImages(bindings);
+		const auto [args_buffer, args_offset] = m_context.GetBufferCache().ObtainBuffer(
+		    args_addr, sizeof(vk::DispatchIndirectCommand), false);
+		EXIT_IF((args_offset & 3u) != 0);
+		RebindBuffers(bindings);
+		m_context.GetOcclusionQueries().WriteForReaders();
+		PrepareNativeRayTracing(m_context, buffer.Handle(), cs_regs, bindings);
+		if (rt_pass == 1) {
+			RtCheck().Before(bindings);
+		}
+		CommitBindings(buffer, vk::PipelineBindPoint::eCompute, pipeline,
+		               std::span {&descriptor_stage, 1u});
 #if defined(ANYPS5_KYTY)
-	m_context.GetCommandScheduler().GetMasterSemaphore().NoteWork(m_context.GetCommandScheduler().CurrentTick(),
-	                                                              program.shader_hash);
+		m_context.GetCommandScheduler().GetMasterSemaphore().NoteWork(m_context.GetCommandScheduler().CurrentTick(),
+		                                                              program.shader_hash);
 #endif
-	const auto vk_buffer = buffer.Handle();
-	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
-	if (!chained) {
-		if (HasStorageWrites(input_info, bindings, indirect_writes)) {
-			ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+		const auto vk_buffer = buffer.Handle();
+		const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
+		if (!chained) {
+			if (HasStorageWrites(input_info, bindings, indirect_writes)) {
+				ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
+			}
+			vk::MemoryBarrier barrier {};
+			barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
+			barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
+			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
+			                              vk::PipelineStageFlagBits::eComputeShader |
+			                              vk::PipelineStageFlagBits::eTransfer,
+			                          vk::PipelineStageFlagBits::eDrawIndirect, {},
+			                          1, &barrier, 0, nullptr, 0, nullptr);
 		}
-		vk::MemoryBarrier barrier {};
-		barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-		barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-		vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics |
-		                              vk::PipelineStageFlagBits::eComputeShader |
-		                              vk::PipelineStageFlagBits::eTransfer,
-		                          vk::PipelineStageFlagBits::eDrawIndirect, {},
-		                          1, &barrier, 0, nullptr, 0, nullptr);
+		vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
+		vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
+		Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
+		if (rt_pass == 1) {
+			RtCheck().AfterOracle(bindings);
+		} else if (rt_pass == 2) {
+			RtCheck().AfterGuest(bindings);
+		}
+		m_deferred_barrier       = true;
+		m_deferred_barrier_queue = m_guest_queue;
+		ResetBindings();
+	};
+	if (!RtCheck().Sample(*compute_module, buffer)) {
+		record(input_info, 0);
+		return;
 	}
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	vk_buffer.dispatchIndirect(args_buffer->Handle(), args_offset);
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	m_deferred_barrier       = true;
-	m_deferred_barrier_queue = m_guest_queue;
-	ResetBindings();
+	record(input_info, 1);
+	ShaderComputeInputInfo guest = pristine;
+	if (m_context.GetPipelineCache().GetComputeProgram(cs_regs, guest, true) == nullptr) {
+		RtCheck().KeepOracle("the emulated variant is not available");
+		return;
+	}
+	record(guest, 2);
 }
 
 }

@@ -72,6 +72,9 @@ struct Number {
 constexpr Number Numbers[] = {
     {"KYTY_VBLANK_FREQUENCY", &Options::vblank_frequency, 0, 0xffffffffu},
     {"KYTY_FLUSH_DRAWS", &Options::flush_draws, 0, 0xffffffffu},
+    {"KYTY_RT_CHECK", &Options::rt_check_period, 0, 0xffffffffu},
+    {"KYTY_RT_CHECK_PPM", &Options::rt_check_ppm, 0, 1000000u},
+    {"KYTY_RT_CHECK_STRIKES", &Options::rt_check_strikes, 1, 1000u},
 };
 
 struct Path {

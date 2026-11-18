@@ -1,5 +1,6 @@
 #include "RtProbeCache.hpp"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
+#include "graphics/host_gpu/renderer/rayTracingReplay.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
 
 #include <charconv>
@@ -35,6 +36,7 @@ struct Settings {
 	bool     pixel     = false;
 	uint32_t inputs    = 8;
 	uint32_t oracle    = 0;
+	bool     replay    = false;
 	std::string spirv;
 };
 
@@ -129,8 +131,92 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 	return native == bvh && bvh != 0 ? 0 : 2;
 }
 
+bool CompileVariant(const std::vector<uint32_t>& code, uint64_t hash, const Settings& settings, bool native,
+                    Recompiler::CompileResult& result) {
+	ShaderComputeInputInfo compute {};
+	compute.wave_size          = settings.wave;
+	compute.host_subgroup_size = settings.subgroup != 0 ? settings.subgroup : settings.wave;
+	for (int k = 0; k < 3; ++k)
+		compute.threads_num[k] = settings.group[k];
+	compute.thread_ids_num = settings.group[2] > 1 ? 3 : settings.group[1] > 1 ? 2 : 1;
+	compute.group_id[0] = compute.group_id[1] = compute.group_id[2] = true;
+	compute.workgroup_register  = static_cast<int>(settings.user);
+	compute.lds_size_dwords     = settings.lds;
+	compute.scratch_size_dwords = settings.scratch;
+	static Libs::Graphics::ShaderRecompiler::Spirv::Profile profile {.maintenance8 = true, .ray_query = true};
+	std::vector<uint32_t> user_data(settings.user, 0u);
+	Recompiler::CompileOptions options;
+	options.stage              = ShaderType::Compute;
+	options.wave_size          = settings.wave;
+	options.shader_hash        = hash;
+	options.profile            = &profile;
+	options.native_ray_tracing = native;
+	options.rt_oracle          = native ? settings.oracle : 0u;
+	options.user_data          = user_data;
+	options.input_info.compute = &compute;
+	auto source = Recompiler::PrepareShaderSource(code, options);
+	if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) return false;
+	auto translated = Recompiler::TranslateProgram(source.decoded, options);
+	Recompiler::IR::ResourceSpecialization specialization;
+	specialization.buffers.resize(translated.program.info.buffers.size());
+	specialization.images.resize(translated.program.info.images.size());
+	specialization.samplers.resize(translated.program.info.samplers.size());
+	for (size_t k = 0; k < specialization.images.size(); ++k) {
+		specialization.images[k].numeric_class = Libs::Graphics::Prospero::TextureNumericClass::Float;
+		specialization.images[k].dimension     = translated.program.info.images[k].dimension;
+	}
+	result = Recompiler::CompileProgram(std::move(translated), options, specialization);
+	return true;
+}
+
+void WriteSpirv(const std::string& path, const std::vector<uint32_t>& spirv) {
+	if (path.empty()) return;
+	std::ofstream out(path, std::ios::binary);
+	out.write(reinterpret_cast<const char*>(spirv.data()), static_cast<std::streamsize>(spirv.size() * 4));
+}
+
+int Replay(const char* label, const std::vector<uint32_t>& code, uint64_t hash, const Settings& settings) {
+	Recompiler::CompileResult served, guest;
+	if (!CompileVariant(code, hash, settings, true, served) || !CompileVariant(code, hash, settings, false, guest)) {
+		std::printf("%s: replay=no reason=calls\n", label);
+		return 1;
+	}
+	uint32_t bvh = 0, native = 0, oracle = 0;
+	for (const auto* block: served.program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != Recompiler::IR::ValueOpcode::BvhIntersect) continue;
+			++bvh;
+			if ((inst.Flags<uint32_t>() & Recompiler::IR::BvhIntersectNative) != 0) ++native;
+			if ((inst.Flags<uint32_t>() & Recompiler::IR::BvhIntersectOracle) != 0) ++oracle;
+		}
+	}
+	const auto written = [](const Recompiler::IR::Program& program) {
+		uint32_t buffers = 0, images = 0;
+		for (const auto& buffer: program.info.buffers) buffers += buffer.written ? 1u : 0u;
+		for (const auto& image: program.info.images) images += image.written ? 1u : 0u;
+		return std::pair {buffers, images};
+	};
+	const auto [served_buffers, served_images] = written(served.program);
+	const auto [guest_buffers, guest_images]   = written(guest.program);
+	const bool served_natively = served.program.info.bvh && served.program.info.ray_query;
+	const char* reason = !served_natively ? "not served natively"
+	                     : served_buffers != guest_buffers || served_images != guest_images
+	                         ? "the two variants write different outputs"
+	                         : Libs::Graphics::RayTracingCheckUnreplayable(served.program);
+	std::printf("%s: replay=%s reason=%s bvh=%u native=%u oracle=%u written_buffers=%u written_images=%u "
+	            "address_writes=%d served_words=%zu guest_words=%zu\n",
+	            label, reason == nullptr ? "yes" : "no", reason == nullptr ? "-" : reason, bvh, native, oracle,
+	            served_buffers, served_images, served.program.has_address_writes ? 1 : 0, served.spirv.size(),
+	            guest.spirv.size());
+	if (!settings.spirv.empty()) {
+		WriteSpirv(settings.spirv, served.spirv);
+		WriteSpirv(settings.spirv + ".guest.spv", guest.spirv);
+	}
+	return reason == nullptr ? 0 : 3;
+}
+
 int Usage() {
-	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-7] [--stats] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex>)\n");
+	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-7] [--stats] [--replay-check] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex>)\n");
 	return 64;
 }
 
@@ -178,6 +264,8 @@ int main(int argc, char** argv) {
 			settings.stats = true;
 		} else if (arg == "--off") {
 			settings.disabled = true;
+		} else if (arg == "--replay-check") {
+			settings.replay = true;
 		} else if (arg == "--spirv" && i + 1 < argc) {
 			settings.spirv = argv[++i];
 			settings.emit  = true;
@@ -215,6 +303,7 @@ int main(int argc, char** argv) {
 			std::fprintf(stderr, "%s: shader %s: %s\n", cachePath, cacheHash, result.error);
 			return 2;
 		}
+		if (settings.replay) return Replay(cacheHash, result.code, hash, settings) == 0 ? 0 : 2;
 		return Probe(cacheHash, result.code, hash, settings) == 0 ? 0 : 2;
 	}
 	if (files.empty()) return Usage();
@@ -224,6 +313,10 @@ int main(int argc, char** argv) {
 		if (!Read(path, code)) {
 			std::printf("%s: unreadable\n", path);
 			failed = true;
+			continue;
+		}
+		if (options.replay) {
+			if (Replay(path, code, HashOf(path), options) != 0) failed = true;
 			continue;
 		}
 		if (Probe(path, code, HashOf(path), options) != 0) failed = true;

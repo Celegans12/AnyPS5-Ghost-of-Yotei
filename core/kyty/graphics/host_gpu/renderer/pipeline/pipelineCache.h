@@ -362,7 +362,8 @@ public:
 	                              const HW::Shader& shaders, DrawRenderState& state,
 	                              ProgramResolution& ahead);
 	const ShaderModule* GetComputeProgram(const HW::ComputeShaderInfo& regs,
-	                                      ShaderComputeInputInfo&      input_info);
+	                                      ShaderComputeInputInfo&      input_info,
+	                                      bool                         guest_traversal = false);
 	static void NoteAheadGuestWrite(uint64_t sequence, uint64_t address,
 	                                std::span<const uint32_t> data, bool one_address);
 	static void RetireAheadGuestWrites(uint64_t executed);

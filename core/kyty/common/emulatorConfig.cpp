@@ -294,6 +294,18 @@ uint32_t RayTracingOracle() {
 	return g_config->native_rt ? g_config->rt_oracle : 0u;
 }
 
+uint32_t RayTracingCheckPeriod() {
+	return g_config->native_rt ? g_config->rt_check_period : 0u;
+}
+
+uint32_t RayTracingCheckPpm() {
+	return g_config->rt_check_ppm;
+}
+
+uint32_t RayTracingCheckStrikes() {
+	return std::max(g_config->rt_check_strikes, 1u);
+}
+
 bool TrophyEnabled() {
 	return g_config->trophy_enabled;
 }
