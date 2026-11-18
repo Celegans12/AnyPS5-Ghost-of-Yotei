@@ -124,15 +124,22 @@ struct GuestStackMapping {
     std::uintptr_t mappingEnd;
     std::uintptr_t stackStart;
     std::uintptr_t stackEnd;
+    bool live;
 };
 static std::mutex guestStackMappingsLock;
 static auto& guestStackMappings = *new std::map<std::uintptr_t, GuestStackMapping>();
+
+static void ClaimGuestStackMapping(void* mapping, std::size_t bytes) {
+    const auto mappingStart = reinterpret_cast<std::uintptr_t>(mapping);
+    std::lock_guard lock(guestStackMappingsLock);
+    guestStackMappings[mappingStart] = {mappingStart + bytes, mappingStart, mappingStart, false};
+}
 
 static void RegisterGuestStackMapping(PthreadPrivate* thread) {
     const auto mappingStart = reinterpret_cast<std::uintptr_t>(thread->guestStack);
     const auto stackStart = reinterpret_cast<std::uintptr_t>(thread->stackAddress);
     std::lock_guard lock(guestStackMappingsLock);
-    guestStackMappings[mappingStart] = {mappingStart + thread->guestStackBytes, stackStart, stackStart + thread->stackSize};
+    guestStackMappings[mappingStart] = {mappingStart + thread->guestStackBytes, stackStart, stackStart + thread->stackSize, true};
 }
 
 static void UnregisterGuestStackMapping(void* mapping) {
@@ -192,7 +199,7 @@ static bool DiscardFinishedStackPages(const FinishedStack& stack) {
 }
 
 static void CollectFinishedStack(void* address, std::size_t bytes) {
-    UnregisterGuestStackMapping(address);
+    ClaimGuestStackMapping(address, bytes);
     const FinishedStack finished{address, bytes};
     if (!DiscardFinishedStackPages(finished)) {
         ReleaseFinishedStack(finished);
@@ -313,7 +320,9 @@ static void AllocateGuestStack(PthreadPrivate* thread, std::size_t usableBytes) 
         if (DoMapAnon(&stack, bytes, 3, 0) != 0)
             throw std::runtime_error("scePthreadCreate: cannot map the guest thread stack");
     }
+    ClaimGuestStackMapping(stack, bytes);
     if (DoMprotect(stack, GUEST_STACK_GUARD, 0) != 0) {
+        UnregisterGuestStackMapping(stack);
         DoMunmap(stack, bytes);
         throw std::runtime_error("scePthreadCreate: cannot protect the guest thread stack guard");
     }
@@ -559,6 +568,20 @@ bool GuestThreadStack(std::uintptr_t address, std::uintptr_t* start, std::uintpt
     return false;
 }
 
+#if defined(ANYPS5_KYTY) && defined(__linux__)
+extern "C" void GuestThreadStackMappings_nid_no_patch(std::uintptr_t start, std::uintptr_t end, GuestStackVisitor visit, void* context) {
+    const auto mainLow = guestMainStackLow.load(std::memory_order_acquire);
+    const auto mainHigh = guestMainStackHigh.load(std::memory_order_acquire);
+    if (mainLow != 0 && mainLow - GUEST_STACK_GUARD < end && start < mainHigh) visit(context, mainLow - GUEST_STACK_GUARD, mainHigh);
+    std::lock_guard lock(guestStackMappingsLock);
+    auto it = guestStackMappings.upper_bound(start);
+    if (it != guestStackMappings.begin()) --it;
+    for (; it != guestStackMappings.end() && it->first < end; ++it) {
+        if (it->second.mappingEnd > start) visit(context, it->first, it->second.mappingEnd);
+    }
+}
+#endif
+
 bool GuestThreadStackHostRangeOverlaps(std::uintptr_t start, std::uintptr_t end) {
 #if defined(__linux__)
     std::lock_guard lock(guestStackMappingsLock);
@@ -567,6 +590,7 @@ bool GuestThreadStackHostRangeOverlaps(std::uintptr_t start, std::uintptr_t end)
     for (; it != guestStackMappings.end() && it->first < end; ++it) {
         const auto mappingStart = it->first;
         const auto& stack = it->second;
+        if (!stack.live) continue;
         if (start < stack.stackStart && end > mappingStart) return true;
         if (start < stack.mappingEnd && end > stack.stackEnd) return true;
     }

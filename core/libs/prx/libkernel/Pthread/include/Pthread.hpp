@@ -193,6 +193,10 @@ struct PthreadPrivate {
 
 bool GuestThreadStack(std::uintptr_t address, std::uintptr_t* start, std::uintptr_t* end);
 bool GuestThreadStackHostRangeOverlaps(std::uintptr_t start, std::uintptr_t end);
+#if defined(ANYPS5_KYTY) && defined(__linux__)
+using GuestStackVisitor = void (*)(void* context, std::uintptr_t first, std::uintptr_t end);
+extern "C" void GuestThreadStackMappings_nid_no_patch(std::uintptr_t start, std::uintptr_t end, GuestStackVisitor visit, void* context);
+#endif
 void NoteGuestStackProtection(std::uintptr_t start, std::size_t bytes, bool readWrite);
 #ifdef _WIN32
 bool ReplaceGuestThreadStack(std::uintptr_t start, std::size_t bytes, bool readWrite, const std::function<bool()>& replace);
