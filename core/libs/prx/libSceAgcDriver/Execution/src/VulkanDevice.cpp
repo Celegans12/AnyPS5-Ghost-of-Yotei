@@ -6,6 +6,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CompileBudget.hpp"
 #include "BdaAbi.hpp"
+#include "ShaderCacheDirectory.hpp"
 #if ANYPS5_ENABLE_SPIRV_TOOLS
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
@@ -271,7 +272,9 @@ void checkHostRequirements(const HostGpuQuery& query, bool printReport) {
     }
     const bool lacking = !MissingRequirements(gpu).empty();
     if (!printReport && !lacking) return;
-    auto facts = printReport ? CollectHostFacts(SystemHostSources()) : HostFacts{};
+    auto facts = printReport ? CollectHostFacts(SystemHostSources([] {
+        return CollectHostShaderCache(ShaderRecompiler::ShaderCacheDirectory());
+    })) : HostFacts{};
     if (!printReport) {
         try {
             facts.redactions = SystemHostSources().redactions();

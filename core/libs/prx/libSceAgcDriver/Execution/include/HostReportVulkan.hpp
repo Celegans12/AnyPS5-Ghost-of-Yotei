@@ -21,6 +21,8 @@ struct HostGpuQuery {
     const char* requestedPresentMode = nullptr;
 };
 
+HostGpuFacts CollectHostGpuIdentity(const VkPhysicalDeviceProperties& properties, const VkPhysicalDeviceDriverProperties* driver,
+                                   const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t subgroupSize);
 HostGpuFacts CollectHostGpuFacts(const HostGpuQuery& query);
 
 }

@@ -15,12 +15,15 @@
 #include "common/emulatorConfig.h"
 #include "common/threads.h"
 #include "graphics/guest_gpu/graphicsRun.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/presentation/presenter.h"
 #include "graphics/presentation/videoOut.h"
 #include "graphics/presentation/window.h"
 #include "kernel/memory.h"
 #include "libs/agc.h"
+#include "prx/libSceAgcDriver/Execution/include/HostReportSources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostReportVulkan.hpp"
 
 #include <algorithm>
 #include <array>
@@ -31,6 +34,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <map>
 #include <mutex>
 #include <shared_mutex>
@@ -81,6 +85,27 @@ bool HostWriteWatched(std::uintptr_t address, std::size_t bytes) {
     return Libs::LibKernel::Memory::GuestRangeWatched(address, bytes);
 }
 
+void ReportKytyHost(const Libs::Graphics::GraphicContext& graphics) {
+    static std::atomic<bool> printed{false};
+    if (printed.exchange(true)) return;
+    auto facts = AgcDriver::CollectHostFacts(AgcDriver::SystemHostSources([] {
+        AgcDriver::HostShaderCacheFacts cache;
+        const auto path = Libs::Graphics::ShaderStorePath();
+        if (path.empty()) return cache;
+        cache.enabled = true;
+        cache.present = std::filesystem::is_regular_file(path);
+        if (cache.present) cache.sizeMiB = std::filesystem::file_size(path) / (1024 * 1024);
+        return cache;
+    }));
+    VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driver};
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2(graphics.physical_device, &properties);
+    facts.gpu = AgcDriver::CollectHostGpuIdentity(properties.properties, &driver, graphics.physical_device_memory_properties, graphics.subgroup_size);
+    const auto text = AgcDriver::FormatHostReport(facts) + '\n';
+    std::fputs(text.c_str(), stderr);
+    std::fflush(stderr);
+}
+
 }
 
 }
@@ -91,12 +116,14 @@ using KytyShim::Entry::g_renderer;
 
 void Initialize() {
     if (g_renderer != nullptr) throw std::runtime_error("kyty GPU backend: Libs::Graphics::Initialize called twice");
+    const bool hostReport = AgcDriver::ParseHostReportSetting(std::getenv("ANYPS5_HOST_REPORT"));
     KytyShim::InstallFaultChain();
     GuestArena::GuestArenaSetHostWriteFilter_nid_no_patch(&KytyShim::Entry::HostWriteWatched);
     const auto width = Config::GetScreenWidth();
     const auto height = Config::GetScreenHeight();
     auto& presenter = WindowInit(width, height);
     KytyShim::ReportNativeRayTracing(presenter.Renderer().GetGraphics());
+    if (hostReport) KytyShim::Entry::ReportKytyHost(presenter.Renderer().GetGraphics());
     auto& video_out = VideoOut::VideoOutInit(width, height, presenter);
     g_renderer = &presenter.Renderer();
     g_renderer->InitializeGpu(&video_out);

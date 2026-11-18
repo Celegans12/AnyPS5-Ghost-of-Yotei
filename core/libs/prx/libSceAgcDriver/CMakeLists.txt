@@ -78,11 +78,16 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
             ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AspectFit.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/DisplayFormat.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostHdr.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostReport.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostReportSources.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostReportVulkan.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/KeyboardOverlay.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
             ${kytyShimSources}
     )
-    target_include_directories(libSceAgcDriver PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+    add_dependencies(libSceAgcDriver agc_trace_revision)
+    target_include_directories(libSceAgcDriver PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
+            ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_link_libraries(libSceAgcDriver PRIVATE $<IF:$<TARGET_EXISTS:Kyty::gpu>,Kyty::gpu,kyty_gpu> SDL2-static libc libkernel ${CMAKE_DL_LIBS})
     target_link_options(libSceAgcDriver PRIVATE LINKER:--undefined=SDL_ShowMessageBox)
     if(WIN32)

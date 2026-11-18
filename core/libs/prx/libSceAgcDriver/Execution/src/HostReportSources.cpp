@@ -1,7 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/HostReportSources.hpp"
 #include "prx/libSceAgcDriver/TraceRevision.hpp"
 #include "prx/libkernel/System/include/HostCpu.hpp"
-#include "ShaderCacheDirectory.hpp"
 #include <SDL_version.h>
 #include <cstdlib>
 #include <filesystem>
@@ -93,29 +92,6 @@ std::string sdlCompiled() {
     return versionText(version);
 }
 
-HostShaderCacheFacts shaderCache() {
-    HostShaderCacheFacts facts;
-    const auto directory = ShaderRecompiler::ShaderCacheDirectory();
-    if (directory.empty()) return facts;
-    facts.enabled = true;
-    std::error_code error;
-    facts.present = std::filesystem::is_directory(directory, error) && !error;
-    if (!facts.present) return facts;
-    std::uint64_t bytes = 0;
-    std::uint64_t entries = 0;
-    std::filesystem::recursive_directory_iterator walk(directory, std::filesystem::directory_options::skip_permission_denied, error);
-    for (; !error && walk != std::filesystem::recursive_directory_iterator(); walk.increment(error)) {
-        if (++entries > MaxCacheEntries) break;
-        std::error_code sizeError;
-        if (walk->is_regular_file(sizeError) && !sizeError) {
-            const auto size = walk->file_size(sizeError);
-            if (!sizeError) bytes += size;
-        }
-    }
-    facts.sizeMiB = bytes / (1024 * 1024);
-    return facts;
-}
-
 std::vector<std::string> environmentEntries() {
     std::vector<std::string> entries;
 #ifdef _WIN32
@@ -148,7 +124,29 @@ std::vector<std::string> redactions() {
 
 }
 
-HostSources SystemHostSources() {
+HostShaderCacheFacts CollectHostShaderCache(const std::filesystem::path& directory) {
+    HostShaderCacheFacts facts;
+    if (directory.empty()) return facts;
+    facts.enabled = true;
+    std::error_code error;
+    facts.present = std::filesystem::is_directory(directory, error) && !error;
+    if (!facts.present) return facts;
+    std::uint64_t bytes = 0;
+    std::uint64_t entries = 0;
+    std::filesystem::recursive_directory_iterator walk(directory, std::filesystem::directory_options::skip_permission_denied, error);
+    for (; !error && walk != std::filesystem::recursive_directory_iterator(); walk.increment(error)) {
+        if (++entries > MaxCacheEntries) break;
+        std::error_code sizeError;
+        if (walk->is_regular_file(sizeError) && !sizeError) {
+            const auto size = walk->file_size(sizeError);
+            if (!sizeError) bytes += size;
+        }
+    }
+    facts.sizeMiB = bytes / (1024 * 1024);
+    return facts;
+}
+
+HostSources SystemHostSources(std::function<HostShaderCacheFacts()> shaderCache) {
     HostSources sources;
     sources.commit = APS5_TRACE_COMMIT;
     sources.os = operatingSystem;
@@ -158,7 +156,7 @@ HostSources SystemHostSources() {
     sources.cpuMissing = cpuMissing;
     sources.sdlLinked = sdlLinked;
     sources.sdlCompiled = sdlCompiled;
-    sources.shaderCache = shaderCache;
+    sources.shaderCache = std::move(shaderCache);
     sources.environment = environmentEntries;
     sources.redactions = redactions;
     return sources;
