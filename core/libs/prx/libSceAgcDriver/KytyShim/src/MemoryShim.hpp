@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_KYTYSHIM_SRC_MEMORYSHIM_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_KYTYSHIM_SRC_MEMORYSHIM_HPP
 
+#include <cstddef>
 #include <cstdint>
 
 namespace Libs::LibKernel::Memory::Shim {
@@ -17,6 +18,10 @@ bool TryWriteBackedQwords(uint64_t vaddr, const uint64_t* values, uint32_t count
 void SetGpuRangeHooks(RangeHook map, RangeHook unmap);
 [[nodiscard]] uint64_t ProbeCalls();
 void EnableView();
+#ifndef _WIN32
+void HoldHostWrite(std::uintptr_t address, std::size_t bytes);
+bool ReleaseHostWrite(std::uintptr_t address, std::size_t bytes);
+#endif
 [[nodiscard]] uint64_t DirectMappedBytes();
 
 }
