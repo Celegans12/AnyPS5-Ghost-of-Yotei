@@ -144,7 +144,11 @@ public:
 
 	void Execute(GpuOperation& operation);
 
+#if defined(ANYPS5_KYTY)
+	void WaitForRewind(bool valid, const uint32_t* control);
+#else
 	void WaitForRewind(bool valid);
+#endif
 
 	template <typename T>
 	void WaitRegMem(uint32_t func, const T* addr, T ref, T mask, uint32_t wait_op);

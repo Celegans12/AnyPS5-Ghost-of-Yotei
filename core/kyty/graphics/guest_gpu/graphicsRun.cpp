@@ -934,11 +934,22 @@ void CommandProcessor::RunGarbageCollector() {
 	EmitCallback([this] { m_renderer.RunGarbageCollector(); });
 }
 
+#if defined(ANYPS5_KYTY)
+void CommandProcessor::WaitForRewind(bool valid, const uint32_t* control) {
+	if (!valid) {
+		if (g_gpu_state != nullptr) {
+			g_gpu_state->NoteBlockedRewind(reinterpret_cast<uint64_t>(control));
+		}
+		SuspendPm4();
+	}
+}
+#else
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
 		SuspendPm4();
 	}
 }
+#endif
 
 bool TestWaitRegMemValue(uint64_t value, uint64_t ref, uint64_t mask, uint32_t func) {
 	switch (func) {
@@ -965,7 +976,12 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	m_wait_since_operation = true;
 	if (!TestWaitRegMemValue(ReadDecisionValue<T>(addr), ref, mask, func)) {
 		if (g_gpu_state != nullptr) {
+#if defined(ANYPS5_KYTY)
+			g_gpu_state->NoteBlockedWait(reinterpret_cast<uint64_t>(addr), sizeof(T), ref, mask,
+			                             func);
+#else
 			g_gpu_state->NoteBlockedWait(reinterpret_cast<uint64_t>(addr), sizeof(T));
+#endif
 		}
 		SuspendPm4();
 	}
@@ -989,7 +1005,12 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 		YieldIfWaitedOn(reinterpret_cast<uint64_t>(counter), sizeof(*counter));
 	} else if (*counter == 0) {
 		if (g_gpu_state != nullptr) {
+#if defined(ANYPS5_KYTY)
+			g_gpu_state->NoteBlockedWait(reinterpret_cast<uint64_t>(counter), sizeof(*counter), 0,
+			                             ~uint64_t {0}, 6);
+#else
 			g_gpu_state->NoteBlockedWait(reinterpret_cast<uint64_t>(counter), sizeof(*counter));
+#endif
 		}
 		SuspendPm4();
 	} else {
@@ -1228,6 +1249,12 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_commands.pop_front();
 				EXIT_IF(gpu->m_pending_commands.fetch_sub(1, std::memory_order_acq_rel) == 0);
 				gpu->m_processing = true;
+#if defined(ANYPS5_KYTY)
+			} else if (gpu->m_hold.load(std::memory_order_acquire) && !gpu->m_stopping) {
+				gpu->m_processing = false;
+				gpu->m_work_available.WaitFor(&gpu->m_queue_mutex, 100);
+				continue;
+#endif
 			} else {
 				int selected_queue = -1;
 				for (uint32_t offset = 0; offset < QueueCount; offset++) {
@@ -1261,6 +1288,9 @@ void GuestGpu::ThreadRun(void* data) {
 				gpu->m_submission_count--;
 				gpu->m_next_queue = (static_cast<uint32_t>(selected_queue) + 1) % QueueCount;
 				gpu->m_processing = true;
+#if defined(ANYPS5_KYTY)
+				gpu->m_in_submission = true;
+#endif
 			}
 		}
 		if (should_stop) {
@@ -1304,6 +1334,12 @@ void GuestGpu::ThreadRun(void* data) {
 		}
 
 		Common::LockGuard lock(gpu->m_queue_mutex);
+#if defined(ANYPS5_KYTY)
+		gpu->m_in_submission = false;
+		if (gpu->m_hold.load(std::memory_order_acquire)) {
+			gpu->m_idle.SignalAll();
+		}
+#endif
 		if (submission.yielded) {
 			blocked_since.reset();
 			for (auto& queue: gpu->m_queues) {
@@ -1333,13 +1369,94 @@ void GuestGpu::ThreadRun(void* data) {
 	}
 }
 
+#if defined(ANYPS5_KYTY)
+void GuestGpu::NoteBlockedWait(uint64_t address, uint64_t size, uint64_t reference,
+                               uint64_t mask, uint32_t function) {
+#else
 void GuestGpu::NoteBlockedWait(uint64_t address, uint64_t size) {
+#endif
 	auto& range = m_wait_ranges[m_current_queue];
 	if (range.begin == range.end) {
 		m_waiting_queues++;
 	}
 	range = {address, address + size};
+#if defined(ANYPS5_KYTY)
+	RecordBlockedWait(address, reference, mask, function, static_cast<uint32_t>(size));
+#endif
 }
+#if defined(ANYPS5_KYTY)
+
+void GuestGpu::NoteBlockedRewind(uint64_t control) {
+	RecordBlockedWait(control, 0, 0, 0, 0);
+}
+
+void GuestGpu::RecordBlockedWait(uint64_t address, uint64_t reference, uint64_t mask,
+                                 uint32_t function, uint32_t bytes) {
+	auto&      slot     = m_blocked_slots[m_current_queue];
+	const auto sequence = slot.sequence.load(std::memory_order_relaxed);
+	slot.sequence.store(sequence + 1, std::memory_order_relaxed);
+	std::atomic_thread_fence(std::memory_order_release);
+	slot.address.store(address, std::memory_order_relaxed);
+	slot.reference.store(reference, std::memory_order_relaxed);
+	slot.mask.store(mask, std::memory_order_relaxed);
+	slot.shape.store(function | (uint64_t {bytes} << 32u), std::memory_order_relaxed);
+	slot.sequence.store(sequence + 2, std::memory_order_release);
+}
+
+size_t GuestGpu::BlockedWaits(BlockedWait* waits, size_t capacity) const {
+	size_t count = 0;
+	for (uint32_t queue = 0; queue < QueueCount && count < capacity; queue++) {
+		const auto& slot = m_blocked_slots[queue];
+		for (int attempt = 0; attempt < 4; attempt++) {
+			const auto before = slot.sequence.load(std::memory_order_acquire);
+			if ((before & 1u) != 0) {
+				continue;
+			}
+			BlockedWait wait;
+			wait.address     = slot.address.load(std::memory_order_relaxed);
+			wait.reference   = slot.reference.load(std::memory_order_relaxed);
+			wait.mask        = slot.mask.load(std::memory_order_relaxed);
+			const auto shape = slot.shape.load(std::memory_order_relaxed);
+			std::atomic_thread_fence(std::memory_order_acquire);
+			if (slot.sequence.load(std::memory_order_relaxed) != before) {
+				continue;
+			}
+			if (wait.address != 0) {
+				wait.function  = static_cast<uint32_t>(shape);
+				wait.bytes     = static_cast<uint32_t>(shape >> 32u);
+				wait.queue     = queue;
+				waits[count++] = wait;
+			}
+			break;
+		}
+	}
+	return count;
+}
+
+bool GuestGpu::HoldSubmissions(uint32_t timeout_ms) {
+	EXIT_IF(IsGpuThread() || g_cp_thread);
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeout_ms);
+	Common::LockGuard lock(m_queue_mutex);
+	m_hold.store(true, std::memory_order_release);
+	while (m_in_submission) {
+		if (std::chrono::steady_clock::now() >= deadline) {
+			m_hold.store(false, std::memory_order_release);
+			m_work_epoch.fetch_add(1, std::memory_order_release);
+			m_work_available.Signal();
+			return false;
+		}
+		m_idle.WaitFor(&m_queue_mutex, 50);
+	}
+	return true;
+}
+
+void GuestGpu::ReleaseSubmissions() {
+	Common::LockGuard lock(m_queue_mutex);
+	m_hold.store(false, std::memory_order_release);
+	m_work_epoch.fetch_add(1, std::memory_order_release);
+	m_work_available.Signal();
+}
+#endif
 
 bool GuestGpu::OtherQueueWaitsOn(uint64_t address, uint64_t size) const {
 	if (m_waiting_queues == 0) {
@@ -1356,6 +1473,11 @@ bool GuestGpu::OtherQueueWaitsOn(uint64_t address, uint64_t size) const {
 
 bool GuestGpu::Process(Submission& submission) {
 	m_current_queue = submission.queue_id;
+#if defined(ANYPS5_KYTY)
+	if (m_blocked_slots[m_current_queue].address.load(std::memory_order_relaxed) != 0) {
+		RecordBlockedWait(0, 0, 0, 0, 0);
+	}
+#endif
 	if (auto& range = m_wait_ranges[m_current_queue]; range.begin != range.end) {
 		range = {};
 		m_waiting_queues--;

@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/KytyShim/src/EntryApi.hpp"
 #include "prx/libSceAgcDriver/KytyShim/src/EntryPure.hpp"
+#include "prx/libSceAgcDriver/KytyShim/src/Replay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
@@ -132,6 +133,7 @@ constexpr std::uint64_t FsRoutineAddress = FsRoutineTableAddress + FsRoutineReco
 constexpr std::uint32_t ScalarSetpcB64LinkS14 = 0xbe80200eu;
 constexpr std::uint32_t ScalarEndProgram = 0xbf810000u;
 constexpr std::uint64_t FsTableDword3 = 0x5204u;
+constexpr std::uint64_t SerialLabelAddress = DriverMemoryAddress + 0x80000ull;
 constexpr std::size_t FlipSlotCount = 1024;
 constexpr auto StopGateTimeout = std::chrono::seconds(2);
 
@@ -329,6 +331,7 @@ void Submit(std::span<const std::uint32_t> commands, std::uint32_t queue) {
         begin = points[i].end;
     }
     SubmitWords(gpu, commands.subspan(begin), queue);
+    KytyShim::Replay::NoteSubmission(gpu, queue);
 }
 
 }
@@ -423,6 +426,11 @@ bool OwnsFlipPacket(const std::uint32_t* packet) {
     return packet >= first && packet < end && (packet - first) % AgcDriver::FlipPacketWords == 0;
 }
 
+std::uint64_t* SerialLabels() {
+    EnsureDriverMemory();
+    return reinterpret_cast<std::uint64_t*>(SerialLabelAddress);
+}
+
 void ReleaseFlipPacket(const std::uint32_t* packet) {
     auto& slots = state().flipSlots;
     const auto index = static_cast<std::size_t>(packet - slots.words.front().data()) / AgcDriver::FlipPacketWords;
@@ -483,12 +491,15 @@ extern "C" void AgcDriverSuspendPoint_nid_postfix() try {
     auto& s = KytyShim::Entry::state();
     std::shared_lock gate(s.gate);
     KytyShim::Entry::CheckStopping();
-    KytyShim::Entry::Gpu().SuspendPoint();
+    auto& gpu = KytyShim::Entry::Gpu();
+    gpu.SuspendPoint();
+    KytyShim::Replay::NoteSubmission(gpu, 0);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
 
 extern "C" void AgcDriverWaitIdle_nid_postfix() try {
+    KytyShim::Replay::RequireNotHeld("AgcDriverWaitIdle");
     auto& s = KytyShim::Entry::state();
     std::shared_lock gate(s.gate);
     KytyShim::Entry::CheckStopping();
@@ -519,7 +530,9 @@ extern "C" void AgcDriverSubmitFlip_nid_postfix(const AgcDriver::FlipInfo& info)
     std::shared_lock gate(s.gate);
     KytyShim::Entry::CheckStopping();
     KytyShim::Entry::RequireOutput(info.handle, "flip references an unregistered video output");
-    KytyShim::Present::SubmitCpuFlip(KytyShim::Entry::Gpu(), info);
+    auto& gpu = KytyShim::Entry::Gpu();
+    KytyShim::Present::SubmitCpuFlip(gpu, info);
+    KytyShim::Replay::NoteSubmission(gpu, 0);
 } catch (const ProcessShutdown&) {
     LibcAwaitExit_nid_postfix();
 }
@@ -533,6 +546,24 @@ extern "C" std::uint32_t AgcDriverReserveEopFlip_nid_postfix(const AgcDriver::Fl
     KytyShim::Entry::require(s.nextEopToken <= AgcDriver::EopFlipTokenLimit, "EOP flip token space exhausted");
     const auto token = s.nextEopToken++;
     s.eopFlips.push_back({token, info});
+    return token;
+}
+
+extern "C" std::uint32_t AgcDriverReserveEopFlipAt_nid_postfix(const AgcDriver::FlipInfo& info, std::uint32_t token) {
+    auto& s = KytyShim::Entry::state();
+    KytyShim::Entry::CheckStopping();
+    KytyShim::Entry::require(token >= AgcDriver::EopFlipTokenBase && token <= AgcDriver::EopFlipTokenLimit, "EOP flip token is out of range");
+    KytyShim::Entry::RequireOutput(info.handle, "EOP flip references an unregistered video output");
+    std::lock_guard lock(s.eopMutex);
+    const auto found = std::find_if(s.eopFlips.begin(), s.eopFlips.end(), [token](const KytyShim::Entry::PendingEopFlip& flip) { return flip.token == token; });
+    if (found != s.eopFlips.end()) {
+        const auto& reserved = found->info;
+        KytyShim::Entry::require(reserved.handle == info.handle && reserved.index == info.index && reserved.mode == info.mode && reserved.argument == info.argument, "EOP flip token is reserved for a different flip");
+        throw AgcDriver::EopFlipAlreadyReserved{};
+    }
+    if (s.eopFlips.size() >= KytyShim::Entry::PendingEopFlipLimit) return 0;
+    s.eopFlips.push_back({token, info});
+    s.nextEopToken = std::max(s.nextEopToken, token + 1);
     return token;
 }
 

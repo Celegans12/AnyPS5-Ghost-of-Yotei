@@ -136,6 +136,13 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
             set_tests_properties(kyty_shim_memory_sparse_reads_switch PROPERTIES TIMEOUT 20 ENVIRONMENT "ANYPS5_KYTY_SPARSE_READS=2")
         endif()
     endif()
+    add_executable(agc_frame_replay EXCLUDE_FROM_ALL
+            tools/FrameReplay.cpp
+            Execution/src/FrameCapture.cpp
+    )
+    target_include_directories(agc_frame_replay PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_frame_replay PRIVATE libSceAgcDriver libkernel libc libzstd_static)
+    set_target_properties(agc_frame_replay PROPERTIES CXX_EXTENSIONS OFF)
     return()
 endif()
 

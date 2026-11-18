@@ -1,6 +1,8 @@
 #include <cstddef>
 #include <cstdint>
+#include <cstdio>
 #include <span>
+#include <stdexcept>
 #include "SceShaders.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
@@ -38,6 +40,12 @@ const ShaderMap shaderMap;
 }
 
 extern "C" void AgcDriverRegisterShader_nid_postfix(const Shader* shader) {
+    if (shader->code == nullptr || shader->shader_size == 0 || shader->shader_size % sizeof(std::uint32_t) != 0) {
+        char text[160];
+        std::snprintf(text, sizeof(text), "kyty GPU backend: shader header 0x%llx has no code (code 0x%llx, %u bytes)", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader)),
+                      static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(shader->code)), static_cast<unsigned>(shader->shader_size));
+        throw std::runtime_error(text);
+    }
     Kyty::ShaderMappedData map;
     map.type = static_cast<Kyty::Prospero::ShaderBinaryType>(shader->type);
     map.user_data = reinterpret_cast<Kyty::ShaderUserData*>(shader->user_data);
