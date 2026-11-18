@@ -5,6 +5,9 @@
 #include "common/emulatorConfig.h"
 #include "common/profiler.h"
 #include "graphics/host_gpu/graphicContext.h"
+#if defined(ANYPS5_KYTY)
+#include "graphics/guest_gpu/graphicsRun.h"
+#endif
 
 #include <algorithm>
 #include <limits>
@@ -519,6 +522,13 @@ void CommandScheduler::DrainPriorityOperations() {
 
 void CommandScheduler::WaitPriorityOperations(uint64_t tick) {
 	EXIT_IF(g_deferred_callback_scheduler == this);
+#if defined(ANYPS5_KYTY)
+	if (tick >= CurrentTick() && Active() && !m_command.IsInvalid() && GuestGpu::IsGpuThread() &&
+	    HasPendingPriorityOperations()) {
+		m_command.EndRendering();
+		Flush();
+	}
+#endif
 	std::unique_lock lock(m_operation_mutex);
 	m_operation_available.wait(lock, [this, tick] {
 		const bool active_before_or_at =
