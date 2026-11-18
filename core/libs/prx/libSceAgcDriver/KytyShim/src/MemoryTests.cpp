@@ -8,8 +8,10 @@
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/include/Api.hpp"
+#include "prx/libkernel/Pthread/include/Pthread.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cerrno>
 #include <chrono>
 #include <csignal>
@@ -333,6 +335,52 @@ void TestHostWriteHold() {
     Require(Memory::ProtectGuestHostMemory(address, Page * 2, Common::VirtualMemory::Mode::ReadWrite));
     Require(sceKernelMunmap(address, Page * 2) == 0);
     std::printf("host write hold 0x%llx: a read() into an open host write lands while the range is protected around it, the range is prepared again at close only then; outside the hold and after it the protection applies\n", static_cast<unsigned long long>(address));
+}
+
+thread_local std::uint64_t t_stackWatchValue = 0;
+
+void CollectStack(void* context, std::uintptr_t first, std::uintptr_t end) {
+    static_cast<std::vector<std::pair<std::uint64_t, std::uint64_t>>*>(context)->emplace_back(first, end);
+}
+
+void* APS5_VABI StackWatchThread(void* argument) {
+    auto& stack = *static_cast<std::pair<std::uint64_t, std::uint64_t>*>(argument);
+    std::uint64_t local = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stacks;
+    GuestThreadStackMappings_nid_no_patch(Address(&local), Address(&local) + 1, &CollectStack, &stacks);
+    Require(stacks.size() == 1);
+    stack = stacks.front();
+    const auto tls = Address(&t_stackWatchValue);
+    Require(stack.first <= Address(&local) && Address(&local) < stack.second && stack.first <= tls && tls < stack.second);
+    Require(Memory::IsFullyMapped(Address(&local) & ~std::uint64_t{Page - 1}, Page));
+    Require(Memory::ProtectGuestHostMemory(stack.first, stack.second - stack.first, Common::VirtualMemory::Mode::Read));
+    const std::uint64_t value = 0x7777666655554444ull;
+    Require(ReadThroughPipe(&local, value) == 0 && local == value);
+    Require(ReadThroughPipe(&t_stackWatchValue, value) == 0 && t_stackWatchValue == value);
+    Require(Memory::ProtectGuestHostMemory(stack.first, stack.second - stack.first, Common::VirtualMemory::Mode::ReadWrite));
+    return nullptr;
+}
+
+void TestThreadStackUnwatched() {
+    std::pair<std::uint64_t, std::uint64_t> stack{};
+    Pthread thread{};
+    Require(scePthreadCreate(&thread, nullptr, StackWatchThread, &stack, "stack watch") == 0);
+    Require(scePthreadJoin(thread, nullptr) == 0);
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> stacks;
+    GuestThreadStackMappings_nid_no_patch(stack.first, stack.second, &CollectStack, &stacks);
+    Require(stacks.size() == 1 && stacks.front() == stack);
+    const auto parked = stack.second - Page;
+    Require(Memory::ProtectGuestHostMemory(parked, Page, Common::VirtualMemory::Mode::Read));
+    Require(ReadThroughPipe(reinterpret_cast<void*>(parked), 1) == 0);
+    Require(Memory::ProtectGuestHostMemory(parked, Page, Common::VirtualMemory::Mode::ReadWrite));
+    void* flexible = nullptr;
+    Require(sceKernelMapFlexibleMemory(&flexible, Page, CpuReadWrite, 0) == 0 && flexible != nullptr);
+    Require(Memory::ProtectGuestHostMemory(Address(flexible), Page, Common::VirtualMemory::Mode::Read));
+    Require(ReadThroughPipe(flexible, 1) == EFAULT);
+    Require(Memory::ProtectGuestHostMemory(Address(flexible), Page, Common::VirtualMemory::Mode::ReadWrite));
+    Require(sceKernelMunmap(Address(flexible), Page) == 0);
+    std::printf("guest thread stack [0x%llx, 0x%llx): a write-watch protection over it leaves its stack and TLS writable, also while the stack is kept for reuse after the join; on other guest memory the protection applies\n",
+        static_cast<unsigned long long>(stack.first), static_cast<unsigned long long>(stack.second));
 }
 
 void TestRuntimeMemory() {
@@ -884,6 +932,7 @@ int main() {
     TestReleaseWhileMapped();
     TestHostProtectionTable();
     TestHostWriteHold();
+    TestThreadStackUnwatched();
     TestRuntimeMemory();
     TestHeapCommitSecondView();
     TestHeapBlockEvicted();
