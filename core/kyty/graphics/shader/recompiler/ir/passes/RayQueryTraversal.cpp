@@ -187,6 +187,10 @@ struct Traversal: Loop {
 	const Inst* blas       = nullptr;
 	bool        packed     = false;
 	uint32_t    mask_shift = 8;
+	uint32_t    mask_width = 0;
+	Value       mask_value;
+	uint32_t    skip_type  = NoField;
+	Inst*       skip_node  = nullptr;
 };
 
 Value Entry(const Loop& t, const Inst& phi) {
@@ -217,6 +221,28 @@ bool Enter(const Program& program, Block* header, Loop& l) {
 	return std::ranges::find(entries, l.latch) != entries.end();
 }
 
+Value Canonical(Value value);
+
+Inst* SkippedType(Traversal& t, Value active) {
+	const auto* both = Producer(active, ValueOpcode::LogicalAnd);
+	for (uint32_t side = 0; both != nullptr && side < 2; ++side) {
+		auto*       exec = HeaderPhi(t, both->Arg(side));
+		const auto* skip = exec != nullptr ? Producer(both->Arg(1 - side), ValueOpcode::INotEqual32) : nullptr;
+		for (uint32_t k = 0; skip != nullptr && k < 2; ++k) {
+			const auto  type = Immediate(skip->Arg(k));
+			const auto* low  = Producer(ResolveActiveU32(skip->Arg(1 - k), Value(exec)), ValueOpcode::BitwiseAnd32);
+			for (uint32_t b = 0; type && *type <= 7u && low != nullptr && b < 2; ++b) {
+				auto* node = HeaderPhi(t, low->Arg(b));
+				if (Immediate(low->Arg(1 - b)) != 7u || node == nullptr) continue;
+				t.skip_type = *type;
+				t.skip_node = node;
+				return exec;
+			}
+		}
+	}
+	return nullptr;
+}
+
 bool MatchLoop(const Program& program, Inst& bvh, Value extent, Traversal& t) {
 	if (!std::ranges::all_of(bvh.Uses(), [](const Use& use) {
 		    return use.user->GetOpcode() == ValueOpcode::CompositeExtractU32x4 &&
@@ -232,6 +258,7 @@ bool MatchLoop(const Program& program, Inst& bvh, Value extent, Traversal& t) {
 	t.bvh    = &bvh;
 	t.exec   = HeaderPhi(t, bvh.Arg(2));
 	t.extent = HeaderPhi(t, extent);
+	if (t.exec == nullptr) t.exec = SkippedType(t, bvh.Arg(2));
 	if (t.exec == nullptr) return false;
 
 	const auto lanes = Entry(t, *t.exec);
@@ -262,7 +289,7 @@ bool MatchLoop(const Program& program, Inst& bvh, Value extent, Traversal& t) {
 	}
 	if (voting != t.latch && moved != nullptr && moved->Parent() == t.latch) return false;
 
-	const auto exec   = Value(t.exec);
+	const auto exec   = t.skip_type != NoField ? bvh.Arg(2) : Value(t.exec);
 	const auto inside = [&](const Block* block) { return Inside(t, block); };
 	for (const auto* block: t.loop) {
 		if (block->terminator.kind == CFG::TerminatorKind::Return ||
@@ -291,7 +318,7 @@ bool Match(const Program& program, Inst& bvh, Traversal& t, bool tracked = true)
 	const auto* descriptor = Producer(bvh.Arg(0), ValueOpcode::CompositeConstructU32x4);
 	const auto* address    = Producer(bvh.Arg(1), ValueOpcode::MakeImageAddress);
 	if (descriptor == nullptr || address == nullptr || bvh.Flags<uint32_t>() != 2u ||
-	    !MatchLoop(program, bvh, address->Arg(2), t)) {
+	    !MatchLoop(program, bvh, address->Arg(2), t) || (tracked && t.skip_type != NoField)) {
 		return false;
 	}
 	for (uint32_t word = 0; word < 4; ++word) {
@@ -312,7 +339,7 @@ bool Match(const Program& program, Inst& bvh, Traversal& t, bool tracked = true)
 		t.ray[(arg + 4) % 7] = Entry(t, *ray);
 	}
 
-	const auto  exec  = Value(t.exec);
+	const auto  exec  = t.skip_type != NoField ? bvh.Arg(2) : Value(t.exec);
 	const auto  lanes = Entry(t, *t.exec);
 	const auto* sum   = Producer(ResolveActiveU32(address->Arg(0), exec), ValueOpcode::IAdd32);
 	if (sum == nullptr) return false;
@@ -375,9 +402,18 @@ bool Match(const Program& program, Inst& bvh, Traversal& t, bool tracked = true)
 	Collect(Back(t, *node), t.header, nodes);
 	const Inst* root  = nullptr;
 	const Inst* word0 = nullptr;
+	const auto  paired = [&](const Inst* load) {
+		const auto* sum = Producer(Canonical(load->Arg(1)), ValueOpcode::IAdd32);
+		for (uint32_t side = 0; sum != nullptr && side < 2; ++side) {
+			const auto* aligned = Producer(Canonical(sum->Arg(side)), ValueOpcode::BitwiseAnd32);
+			if (aligned != nullptr && (Immediate(aligned->Arg(0)) == ~7u || Immediate(aligned->Arg(1)) == ~7u)) return true;
+		}
+		return false;
+	};
 	for (const auto* inst: nodes) {
 		for (auto [load, offset]: {std::pair {&root, InstanceRoot}, std::pair {&word0, 0u}}) {
 			if (!GlobalLoad(program, *inst, offset)) continue;
+			if (t.skip_type != NoField && load == &word0 && !paired(inst)) continue;
 			if (*load != nullptr) return false;
 			*load = inst;
 		}
@@ -478,10 +514,52 @@ bool Match(const Program& program, Inst& bvh, Traversal& t, bool tracked = true)
 		}
 	}
 
-	const auto leaf = root->Arg(3);
+	const auto leaf  = root->Arg(3);
+	uint32_t   width = 0;
+	const auto above = [&](Value condition) -> std::optional<uint32_t> {
+		const auto* compare = Producer(condition, ValueOpcode::ULessThan32);
+		if (compare == nullptr) {
+			const auto* inverse = Producer(condition, ValueOpcode::LogicalNot);
+			auto        culled  = inverse != nullptr ? inverse->Arg(0) : Value {};
+			if (const auto* both = Producer(culled, ValueOpcode::LogicalAnd);
+			    both != nullptr && (both->Arg(0) == leaf || both->Arg(1) == leaf))
+				culled = both->Arg(0) == leaf ? both->Arg(1) : both->Arg(0);
+			compare = Producer(culled, ValueOpcode::UGreaterThanEqual32);
+		}
+		const auto below = compare != nullptr ? Immediate(compare->Arg(0)) : std::nullopt;
+		if (!below || *below == 0u || *below == ~0u || (*below & (*below + 1u)) != 0u ||
+		    ResolveActiveU32(compare->Arg(1), leaf).TryInstruction() != flags)
+			return std::nullopt;
+		const auto shift = static_cast<uint32_t>(std::popcount(*below));
+		width            = 32u - shift;
+		return shift;
+	};
+	Value      ray_mask;
+	const auto masked = [&](Value condition) -> std::optional<uint32_t> {
+		const auto* test = Producer(condition, ValueOpcode::INotEqual32);
+		for (uint32_t side = 0; test != nullptr && side < 2; ++side) {
+			const auto* both = Immediate(test->Arg(side)) == 0u ? Producer(test->Arg(1 - side), ValueOpcode::BitwiseAnd32) : nullptr;
+			for (uint32_t b = 0; both != nullptr && b < 2; ++b) {
+				const auto* shift = Producer(ResolveActiveU32(both->Arg(b), leaf), ValueOpcode::ShiftRightLogical32);
+				const auto  bits  = shift != nullptr ? Immediate(shift->Arg(1)) : std::nullopt;
+				const auto* value = both->Arg(1 - b).Resolve().TryInstruction();
+				if (!bits || *bits >= 32u || ResolveActiveU32(shift->Arg(0), leaf).TryInstruction() != flags || value == nullptr ||
+				    BlockIndex(program, value->Parent()) >= BlockIndex(program, t.header))
+					continue;
+				ray_mask = both->Arg(1 - b).Resolve();
+				return *bits;
+			}
+		}
+		return std::nullopt;
+	};
 	const auto test = [&](Value condition) -> std::optional<uint32_t> {
 		const auto* both = Producer(condition, ValueOpcode::LogicalAnd);
 		if (both == nullptr || (both->Arg(0) != leaf && both->Arg(1) != leaf)) return std::nullopt;
+		if (t.skip_type != NoField && !t.packed) {
+			const auto other = both->Arg(0) == leaf ? both->Arg(1) : both->Arg(0);
+			if (const auto shift = above(other)) return shift;
+			if (const auto shift = masked(other)) return shift;
+		}
 		const auto* sign = Producer(both->Arg(0) == leaf ? both->Arg(1) : both->Arg(0),
 		                            ValueOpcode::SGreaterThan32);
 		const auto* mask = sign != nullptr ? Producer(ResolveActiveU32(sign->Arg(1), leaf),
@@ -508,6 +586,13 @@ bool Match(const Program& program, Inst& bvh, Traversal& t, bool tracked = true)
 		}
 	}
 	if (!bit) return false;
+	if (width != 0 || !ray_mask.IsEmpty()) {
+		t.cull_mask  = 0xffu;
+		t.mask_shift = *bit;
+		t.mask_width = width;
+		t.mask_value = ray_mask;
+		return true;
+	}
 	t.cull_mask = 1u << (23u - *bit);
 	if (t.packed) {
 		t.cull_mask  = 1u << (7u - *bit);
@@ -4758,6 +4843,74 @@ bool FlatFacing(const Program& program, const Traversal& t, PacketWalk& w, Value
 	return true;
 }
 
+bool RangeOnlyHit(const Traversal& t, Value hit) {
+	const auto component = [&](Value value, uint32_t want, const auto& self, uint32_t depth) -> bool {
+		value = Canonical(value);
+		if (const auto* phi = Producer(value, ValueOpcode::Phi); phi != nullptr && depth < 4) {
+			for (size_t arg = 0; arg < phi->NumArgs(); ++arg) {
+				if (self(phi->Arg(arg), want, self, depth + 1)) return true;
+			}
+			return false;
+		}
+		const auto* extract = Producer(value, ValueOpcode::CompositeExtractU32x4);
+		return extract != nullptr && extract->Arg(0).Resolve().TryInstruction() == t.bvh && Immediate(extract->Arg(1)) == want;
+	};
+	const auto distance = [&](Value value) {
+		const auto* mul = Producer(Canonical(value), ValueOpcode::FPMul32);
+		for (uint32_t side = 0; mul != nullptr && side < 2; ++side) {
+			const auto* recip = Producer(Canonical(mul->Arg(1 - side)), ValueOpcode::FPRecip32);
+			if (recip != nullptr && component(recip->Arg(0), 1u, component, 0) && component(mul->Arg(side), 0u, component, 0))
+				return true;
+		}
+		return false;
+	};
+	const auto numerator = [&](const Inst* test) {
+		for (uint32_t side = 0; side < 2; ++side) {
+			if (Immediate(test->Arg(side)) == 0x7f800000u && component(test->Arg(1 - side), 0u, component, 0)) return true;
+		}
+		return false;
+	};
+	const auto ranged = [&](const Inst* atom) {
+		const auto op = atom->GetOpcode();
+		if (op == ValueOpcode::IEqual32 || op == ValueOpcode::INotEqual32) return numerator(atom);
+		const bool order = op == ValueOpcode::FPOrdGreaterThan32 || op == ValueOpcode::FPOrdLessThanEqual32 ||
+		                   op == ValueOpcode::FPOrdLessThan32 || op == ValueOpcode::FPOrdGreaterThanEqual32;
+		return order && (distance(atom->Arg(0)) || distance(atom->Arg(1)));
+	};
+	const Inst*                     lanes = nullptr;
+	std::vector<const Inst*>        work {hit.Resolve().TryInstruction()};
+	std::unordered_set<const Inst*> seen;
+	for (size_t at = 0; at < work.size() && at < 256 && lanes == nullptr; ++at) {
+		const auto* inst = work[at];
+		if (inst == nullptr || !seen.insert(inst).second) continue;
+		const auto op = inst->GetOpcode();
+		if (op == ValueOpcode::LogicalAnd || op == ValueOpcode::LogicalOr || op == ValueOpcode::LogicalNot) {
+			for (size_t arg = 0; arg < inst->NumArgs(); ++arg)
+				work.push_back(inst->Arg(arg).Resolve().TryInstruction());
+			continue;
+		}
+		if (!ranged(inst) || inst->GetOpcode() == ValueOpcode::IEqual32 || inst->GetOpcode() == ValueOpcode::INotEqual32) continue;
+		for (uint32_t arg = 0; arg < 2 && lanes == nullptr; ++arg) {
+			auto value = inst->Arg(arg).Resolve();
+			while (const auto* cast = Producer(value, ValueOpcode::BitCastF32U32)) value = cast->Arg(0).Resolve();
+			if (const auto* select = Producer(value, ValueOpcode::SelectU32); select != nullptr && distance(value))
+				lanes = select->Arg(0).Resolve().TryInstruction();
+		}
+	}
+	if (lanes == nullptr) return false;
+	LaneTable table;
+	table.exec       = lanes;
+	const auto value = table.Condition(hit);
+	if (!value) return false;
+	for (size_t a = 0; a < table.atoms.size(); ++a) {
+		bool depends = false;
+		for (uint32_t c = 0; c < 32; ++c)
+			depends |= (((*value >> c) ^ (*value >> (c ^ (1u << a)))) & 1u) != 0;
+		if (depends && !ranged(table.atoms[a])) return false;
+	}
+	return true;
+}
+
 bool MatchFlatWalk(Program& program, Inst& bvh, PacketWalk& w) {
 	Traversal t;
 	if (!Match(program, bvh, t, false)) return false;
@@ -4791,6 +4944,76 @@ bool MatchFlatWalk(Program& program, Inst& bvh, PacketWalk& w) {
 				found                  = true;
 			}
 		}
+	}
+	uint32_t inline_offset = NoField, inline_root = NoField;
+	if (!found && t.skip_type != NoField) {
+		std::unordered_set<const Inst*> addresses;
+		Collect(t.root->Arg(1), t.header, addresses);
+		for (const auto* value: addresses) {
+			for (uint32_t side = 0; value->GetOpcode() == ValueOpcode::IAdd32 && side < 2; ++side) {
+				const auto fixed = Immediate(value->Arg(side));
+				if (fixed && value->Arg(1 - side).Resolve() == s.tlas[0]) {
+					if (inline_offset != NoField && inline_offset != *fixed) return false;
+					inline_offset = *fixed;
+				}
+				const auto* array = Producer(value->Arg(1 - side), ValueOpcode::IAdd32);
+				const auto* part  = Producer(Canonical(value->Arg(side)), ValueOpcode::CompositeExtractU64);
+				const auto* wide  = part != nullptr && Immediate(part->Arg(1)) == 0u
+				                        ? Producer(part->Arg(0), ValueOpcode::ShiftLeftLogical64)
+				                        : nullptr;
+				const auto* pair  = wide != nullptr ? Producer(wide->Arg(0), ValueOpcode::CompositeConstructU64) : nullptr;
+				const auto  bits  = wide != nullptr ? Immediate(wide->Arg(1)) : std::nullopt;
+				if (array == nullptr || pair == nullptr || !bits || *bits < 7u || *bits > 8u ||
+				    Immediate(Canonical(pair->Arg(1))) != 0u)
+					continue;
+				std::unordered_set<const Inst*> indices;
+				Collect(pair->Arg(0), t.header, indices);
+				if (std::ranges::none_of(indices, [](const Inst* index) {
+					    return index->GetOpcode() == ValueOpcode::ShiftRightLogical32 && Immediate(index->Arg(1)) == 3u;
+				    }))
+					continue;
+				for (uint32_t b = 0; b < 2; ++b) {
+					const auto offset = LoadOf(program, array->Arg(b));
+					if (!offset || array->Arg(1 - b).Resolve() != s.tlas[0] || offset->low != s.tlas[0] ||
+					    offset->high != s.tlas[1])
+						continue;
+					if (found && (layout.instance_offset != offset->offset || layout.record_stride != 1u << *bits)) return false;
+					layout.instance_offset = offset->offset;
+					layout.record_stride   = 1u << *bits;
+					found                  = true;
+				}
+			}
+		}
+		const auto typed = [&](Value condition, const auto& self, uint32_t depth) -> bool {
+			const auto* test = condition.Resolve().TryInstruction();
+			if (test == nullptr || depth > 4) return false;
+			if (test->GetOpcode() == ValueOpcode::LogicalAnd)
+				return self(test->Arg(0), self, depth + 1) || self(test->Arg(1), self, depth + 1);
+			if (test->GetOpcode() != ValueOpcode::IEqual32) return false;
+			for (uint32_t side = 0; side < 2; ++side) {
+				const auto low = Producer(Canonical(test->Arg(1 - side)), ValueOpcode::BitwiseAnd32);
+				if (Immediate(test->Arg(side)) == t.skip_type && low != nullptr &&
+				    (Immediate(low->Arg(0)) == 7u || Immediate(low->Arg(1)) == 7u))
+					return true;
+			}
+			return false;
+		};
+		std::unordered_set<const Inst*> seen;
+		for (std::vector<const Inst*> work {t.root}; !work.empty();) {
+			const auto* value = work.back();
+			work.pop_back();
+			if (!seen.insert(value).second) continue;
+			for (const auto& use: value->Uses()) {
+				const auto* select = use.user;
+				if (select->GetOpcode() != ValueOpcode::SelectU32 || use.operand == 0) continue;
+				work.push_back(select);
+				const auto constant = Immediate(select->Arg(1));
+				if (use.operand != 2 || !constant || !typed(select->Arg(0), typed, 0)) continue;
+				if (inline_root != NoField && inline_root != *constant) return false;
+				inline_root = *constant;
+			}
+		}
+		if (inline_offset == NoField || inline_root == NoField) return false;
 	}
 	if (!found) return false;
 	const auto record = [&](Value value) -> std::optional<uint32_t> {
@@ -4845,12 +5068,19 @@ bool MatchFlatWalk(Program& program, Inst& bvh, PacketWalk& w) {
 	layout.blas_packed = t.packed;
 	layout.mask_dword  = *mask_dword;
 	layout.mask_shift  = t.mask_shift;
-	layout.mask_width  = 0;
+	layout.mask_width  = t.mask_width;
 	layout.flags_dword = NoField;
 	layout.inline_type = NoField;
 	layout.node_count_80 = !t.packed;
+	if (inline_offset != NoField) {
+		layout.inline_type   = t.skip_type;
+		layout.inline_offset = inline_offset;
+		layout.inline_root   = inline_root;
+		layout.node_count_80 = false;
+	}
 	layout.valid         = true;
 	s.cull_mask          = t.cull_mask;
+	s.mask_value         = t.mask_value;
 	s.masked             = true;
 	if (!DeriveHeaderSource(program, s)) return false;
 	s.source.root   = *root;
@@ -4865,6 +5095,7 @@ bool MatchFlatWalk(Program& program, Inst& bvh, PacketWalk& w) {
 		}
 	}
 	if (hit.IsEmpty() || !FlatFacing(program, t, w, hit, record)) return false;
+	if (t.skip_type != NoField && layout.flags_dword == NoField && !RangeOnlyHit(t, hit)) return false;
 	s.source.layout = layout.Pack();
 	const auto kind_of = [&](const Inst* value) -> std::optional<RayQueryResultKind> {
 		if (value == t.state[0]) return RayQueryResultKind::Node;
