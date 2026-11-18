@@ -10,7 +10,6 @@
 #include <limits>
 #include <span>
 #include <sstream>
-#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -39,18 +38,16 @@ std::string Record(std::uint64_t hash, std::span<const std::uint32_t> code) {
     return record;
 }
 
-std::vector<std::uint32_t> Read(const std::string& cache, std::uint64_t hash) {
+AgcDriver::CachedShaderCode Read(const std::string& cache, std::uint64_t hash) {
     std::istringstream input(cache, std::ios::binary);
     return AgcDriver::ReadCachedShaderCode(input, hash);
 }
 
 void ExpectError(const std::string& cache, std::uint64_t hash, std::string_view expected) {
-    try {
-        static_cast<void>(Read(cache, hash));
-        Require(false, "accepted invalid cache input");
-    } catch (const std::runtime_error& error) {
-        Require(std::string_view(error.what()).find(expected) != std::string_view::npos, "unexpected diagnostic");
-    }
+    const auto result = Read(cache, hash);
+    Require(result.error != nullptr, "accepted invalid cache input");
+    Require(expected == result.error, "unexpected diagnostic");
+    Require(result.code.empty(), "invalid cache input returned shader words");
 }
 
 } // namespace
@@ -64,20 +61,30 @@ int main() {
     const auto prefix = "KTYCODE1" + Record(0, metadata) + Record(otherHash, other);
     const auto record = Record(hash, shader);
     const auto cache = prefix + record;
-    Require(Read(cache, hash) == std::vector(shader.begin(), shader.end()), "selected shader bytes differ");
-    Require(Read(cache, otherHash) == std::vector(other.begin(), other.end()), "earlier shader bytes differ");
+    const auto selected = Read(cache, hash);
+    Require(!selected.error && selected.code == std::vector(shader.begin(), shader.end()), "selected shader bytes differ");
+    const auto earlier = Read(cache, otherHash);
+    Require(!earlier.error && earlier.code == std::vector(other.begin(), other.end()), "earlier shader bytes differ");
 
-    ExpectError(cache, hash ^ 1, "not found");
-    ExpectError("KTYCODE2" + record, hash, "expected a KTYCODE1");
+    ExpectError(cache, 0, "shader hash must be nonzero");
+    ExpectError("KTYCODE1", hash, "shader hash not found in the manifest cache");
+    ExpectError(cache, hash ^ 1, "shader hash not found in the manifest cache");
+    ExpectError("KTYCODE2" + record, hash, "expected a KTYCODE1 manifest code cache");
     ExpectError(prefix + record.substr(0, 15), hash, "truncated manifest code record");
     ExpectError(cache.substr(0, cache.size() - 1), hash, "truncated manifest code payload");
-    ExpectError(prefix + Record(hash, other), hash, "hash mismatch");
+    ExpectError(prefix + Record(hash, other), hash, "cached shader hash mismatch");
+
+    std::string emptyRecord;
+    Append(emptyRecord, hash);
+    Append(emptyRecord, std::uint32_t{0});
+    Append(emptyRecord, std::uint32_t{0});
+    ExpectError(prefix + emptyRecord, hash, "empty manifest code record");
 
     auto badFrame = record;
     badFrame[16] ^= 1;
-    ExpectError(prefix + badFrame, hash, "invalid Zstd frame");
+    ExpectError(prefix + badFrame, hash, "invalid Zstd frame in cached shader");
     auto tooLarge = record;
     const auto wordCount = std::numeric_limits<std::uint32_t>::max();
     tooLarge.replace(8, sizeof(wordCount), reinterpret_cast<const char*>(&wordCount), sizeof(wordCount));
-    ExpectError(prefix + tooLarge, hash, "size exceeds");
+    ExpectError(prefix + tooLarge, hash, "cached shader size exceeds its registration format");
 }

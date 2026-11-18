@@ -7,7 +7,12 @@
 
 namespace AgcDriver {
 
-std::vector<std::uint32_t> ReadCachedShaderCode(std::istream& cache, std::uint64_t hash);
+struct CachedShaderCode {
+    std::vector<std::uint32_t> code{};
+    const char* error = nullptr;
+};
+
+CachedShaderCode ReadCachedShaderCode(std::istream& cache, std::uint64_t hash);
 
 } // namespace AgcDriver
 

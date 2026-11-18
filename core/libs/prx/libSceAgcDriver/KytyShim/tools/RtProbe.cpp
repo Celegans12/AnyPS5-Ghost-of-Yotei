@@ -6,7 +6,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -178,14 +177,12 @@ int main(int argc, char** argv) {
 				return 2;
 			}
 		}
-		std::vector<uint32_t> code;
-		try {
-			code = AgcDriver::ReadCachedShaderCode(cache, hash);
-		} catch (const std::exception& error) {
-			std::fprintf(stderr, "%s: shader %s: %s\n", cachePath, cacheHash, error.what());
+		const auto result = AgcDriver::ReadCachedShaderCode(cache, hash);
+		if (result.error != nullptr) {
+			std::fprintf(stderr, "%s: shader %s: %s\n", cachePath, cacheHash, result.error);
 			return 2;
 		}
-		return Probe(cacheHash, code, hash, settings) == 0 ? 0 : 2;
+		return Probe(cacheHash, result.code, hash, settings) == 0 ? 0 : 2;
 	}
 	if (files.empty()) return Usage();
 	bool failed = false;
