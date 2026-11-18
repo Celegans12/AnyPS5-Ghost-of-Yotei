@@ -99,6 +99,7 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
                 Execution/src/DisplayFormat.cpp)
         target_include_directories(kyty_shim_entry_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
         set_target_properties(kyty_shim_entry_tests PROPERTIES CXX_EXTENSIONS OFF)
+        configure_host_test_executable(kyty_shim_entry_tests)
         add_test(NAME kyty_shim_entry COMMAND kyty_shim_entry_tests)
         set_tests_properties(kyty_shim_entry PROPERTIES TIMEOUT 20)
         add_test_executable(kyty_shim_system_content_tests
@@ -114,12 +115,13 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
                 KytyShim/src/NativeRt.cpp)
         target_include_directories(kyty_shim_native_rt_tests PRIVATE ${LIBS_INCLUDE_DIR})
         set_target_properties(kyty_shim_native_rt_tests PROPERTIES CXX_EXTENSIONS OFF)
+        configure_host_test_executable(kyty_shim_native_rt_tests)
         add_test(NAME kyty_shim_native_rt COMMAND kyty_shim_native_rt_tests)
         set_tests_properties(kyty_shim_native_rt PROPERTIES TIMEOUT 20)
         if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/tests/CMakeLists.txt)
             add_subdirectory(KytyShim/tests)
         endif()
-        if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/src/MemoryTests.cpp)
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/src/MemoryTests.cpp)
             add_test_executable(kyty_shim_memory_tests
                     KytyShim/src/MemoryTests.cpp
                     KytyShim/src/MemoryView.cpp

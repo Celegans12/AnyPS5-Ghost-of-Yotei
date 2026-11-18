@@ -7,8 +7,12 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <sys/mman.h>
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -149,20 +153,41 @@ void DisplayBuffers() {
 }
 
 void MappedRanges() {
+#ifdef _WIN32
+    SYSTEM_INFO systemInfo{};
+    GetSystemInfo(&systemInfo);
+    const auto page = static_cast<std::size_t>(systemInfo.dwPageSize);
+    void* mapped = VirtualAlloc(nullptr, page * 3, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+#else
     const auto page = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
     void* mapped = mmap(nullptr, page * 3, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    Expect(mapped != MAP_FAILED, "test pages mapped");
-    if (mapped == MAP_FAILED) return;
+    if (mapped == MAP_FAILED) mapped = nullptr;
+#endif
+    Expect(mapped != nullptr, "test pages mapped");
+    if (mapped == nullptr) return;
     auto* bytes = static_cast<std::uint8_t*>(mapped);
     KytyShim::Entry::CheckMappedRange(bytes + 8, page * 3 - 8, 8);
+#ifdef _WIN32
+    DWORD previousProtection{};
+    Expect(VirtualProtect(bytes + page, page, PAGE_NOACCESS, &previousProtection) != 0, "middle page protected");
+#else
     mprotect(bytes + page, page, PROT_NONE);
+#endif
     KytyShim::Entry::CheckMappedRange(bytes + page, page, 4);
+#ifdef _WIN32
+    Expect(VirtualFree(bytes + page * 2, page, MEM_DECOMMIT) != 0, "last page decommitted");
+#else
     munmap(bytes + page * 2, page);
+#endif
     ExpectThrow([&] { KytyShim::Entry::CheckMappedRange(bytes + page, page * 2, 4); }, "not mapped", "a range reaching an unmapped page fails");
     ExpectThrow([&] { KytyShim::Entry::CheckMappedRange(bytes + 2, 4, 4); }, "misaligned", "a misaligned range fails");
     ExpectThrow([&] { KytyShim::Entry::CheckMappedRange(nullptr, 4, 4); }, "null", "a null range fails");
     ExpectThrow([&] { KytyShim::Entry::CheckMappedRange(bytes, 4, 0); }, "alignment", "a zero alignment fails");
+#ifdef _WIN32
+    Expect(VirtualFree(mapped, 0, MEM_RELEASE) != 0, "test pages released");
+#else
     munmap(bytes, page * 2);
+#endif
 }
 
 }
