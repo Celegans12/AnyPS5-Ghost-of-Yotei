@@ -130,6 +130,24 @@ string(SUBSTRING "${KYTY_UPSTREAM_REVISION}" 0 7 KYTY_GIT_HASH)
 set(KYTY_GIT_REVISION "${KYTY_UPSTREAM_REVISION}")
 configure_file("${KYTY_DIR}/cmake/kytyGitVersion.h.in" "${KYTY_GENERATED_DIR}/kytyGitVersion.h")
 
+file(GLOB_RECURSE KYTY_SHADER_STORE_SOURCES CONFIGURE_DEPENDS
+    "${KYTY_DIR}/graphics/shader/*.cpp" "${KYTY_DIR}/graphics/shader/*.h" "${KYTY_DIR}/graphics/shader/*.inc"
+    "${KYTY_DIR}/graphics/host_gpu/renderer/pipeline/*.cpp" "${KYTY_DIR}/graphics/host_gpu/renderer/pipeline/*.h")
+list(SORT KYTY_SHADER_STORE_SOURCES)
+string(JOIN "\n" kytyShaderStoreList ${KYTY_SHADER_STORE_SOURCES})
+file(CONFIGURE OUTPUT "${KYTY_GENERATED_DIR}/kytyShaderStoreSources.txt" CONTENT "${kytyShaderStoreList}\n")
+add_custom_command(
+    OUTPUT "${KYTY_GENERATED_DIR}/kytyShaderStoreStamp.stamp"
+    BYPRODUCTS "${KYTY_GENERATED_DIR}/kytyShaderStoreStamp.h"
+    COMMAND ${CMAKE_COMMAND} "-DLIST_FILE=${KYTY_GENERATED_DIR}/kytyShaderStoreSources.txt" "-DROOT=${KYTY_DIR}"
+            "-DOUTPUT=${KYTY_GENERATED_DIR}/kytyShaderStoreStamp.h" -P "${KYTY_DIR}/cmake/shader_store_stamp.cmake"
+    COMMAND ${CMAKE_COMMAND} -E touch "${KYTY_GENERATED_DIR}/kytyShaderStoreStamp.stamp"
+    DEPENDS ${KYTY_SHADER_STORE_SOURCES} "${KYTY_GENERATED_DIR}/kytyShaderStoreSources.txt"
+            "${KYTY_DIR}/cmake/shader_store_stamp.cmake"
+    VERBATIM
+)
+add_custom_target(kyty_shader_store_stamp DEPENDS "${KYTY_GENERATED_DIR}/kytyShaderStoreStamp.stamp")
+
 set(KYTY_SHADER_DIR "${KYTY_DIR}/graphics/host_gpu/shaders")
 file(GLOB KYTY_SHADER_INCLUDES CONFIGURE_DEPENDS "${KYTY_SHADER_DIR}/*.inc")
 set(KYTY_SHADER_HEADERS "")
@@ -193,7 +211,7 @@ set_source_files_properties("${KYTY_SHIM_SOURCE_DIR}/MemoryBacking.cpp" PROPERTI
 list(APPEND KYTY_GPU_SOURCES ${KYTY_SHIM_MEMORY_SOURCES})
 
 add_library(kyty_gpu STATIC ${KYTY_GPU_SOURCES})
-add_dependencies(kyty_gpu kyty_gpu_shaders)
+add_dependencies(kyty_gpu kyty_gpu_shaders kyty_shader_store_stamp)
 target_include_directories(kyty_gpu
     PUBLIC
         "${KYTY_DIR}"

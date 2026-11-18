@@ -13,6 +13,13 @@
 #include <fmt/format.h>
 #include <ranges>
 #include <xxhash.h>
+#if defined(ANYPS5_KYTY)
+#include "kytyShaderStoreStamp.h"
+
+#include <cstdlib>
+#include <string_view>
+#include <thread>
+#endif
 #include <zstd.h>
 
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
@@ -38,6 +45,41 @@ struct Frame {
 	uint64_t checksum        = 0;
 };
 
+#if defined(ANYPS5_KYTY)
+uint64_t BuildStamp() {
+	static const uint64_t stamp = [] {
+		if (const char* value = std::getenv("KYTY_SHADER_CACHE_STAMP"); value != nullptr) {
+			char*      end    = nullptr;
+			const auto parsed = std::strtoull(value, &end, 0);
+			if (end != value && *end == '\0') {
+				return static_cast<uint64_t>(parsed);
+			}
+		}
+		return static_cast<uint64_t>(KYTY_SHADER_STORE_STAMP);
+	}();
+	return stamp;
+}
+
+size_t WarmUpThreads(size_t jobs) {
+	size_t threads = Common::ParallelThreads();
+	if (const char* value = std::getenv("KYTY_SHADER_CACHE_THREADS"); value != nullptr) {
+		char*      end    = nullptr;
+		const auto parsed = std::strtoul(value, &end, 10);
+		if (end != value && *end == '\0' && parsed != 0) {
+			threads = parsed;
+		}
+	}
+	return std::max<size_t>(1, std::min(threads, jobs));
+}
+
+bool WarmUpSharedCache(const GraphicContext& graphics) {
+	constexpr uint32_t NvidiaVendor = 0x10deu;
+	if (const char* value = std::getenv("KYTY_SHADER_CACHE_SHARED"); value != nullptr) {
+		return std::string_view(value) == "1";
+	}
+	return graphics.GetPhysicalDeviceProperties().vendorID != NvidiaVendor;
+}
+#else
 uint64_t BuildStamp() {
 #if KYTY_PLATFORM == KYTY_PLATFORM_WINDOWS
 	std::array<wchar_t, 32768> name {};
@@ -55,6 +97,7 @@ uint64_t BuildStamp() {
 	const auto      time = std::filesystem::last_write_time(path, error).time_since_epoch().count();
 	return error ? 0 : static_cast<uint64_t>(time);
 }
+#endif
 
 std::vector<uint8_t> StoreHeader(const GraphicContext& graphics) {
 	const auto stamp = BuildStamp();
@@ -199,6 +242,70 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	m_store.Open(path, header, reusable ? bytes.size() - records.size() : 0);
 
 	const auto modules = MapModules();
+#if defined(ANYPS5_KYTY)
+	std::vector<std::function<void(vk::PipelineCache)>> jobs;
+	jobs.reserve(m_graphics_pipelines.size() + modules.size());
+	for (auto& node: m_graphics_pipelines) {
+		jobs.emplace_back([this, &modules, &node](vk::PipelineCache cache) {
+			std::array<const ShaderModule*, 4> stages {};
+			for (size_t i = 0; i < stages.size(); i++) {
+				const auto found = modules.find(node.first.stage_ids[i]);
+				if (found == modules.end()) {
+					return;
+				}
+				stages[i] = found->second;
+			}
+			CreatePipelineInternal(m_graphics, node.second, node.first, stages, cache);
+		});
+	}
+	for (const auto* module: modules | std::views::values) {
+		if (module != nullptr && module->info.stage == ShaderType::Compute) {
+			module->pipeline_requested = true;
+			jobs.emplace_back([this, module, &pipeline = m_compute_pipelines[module->id]](vk::PipelineCache cache) {
+				CreatePipelineInternal(m_graphics, pipeline, *module, cache);
+			});
+		}
+	}
+	const auto                     threads = WarmUpThreads(jobs.size());
+	std::vector<vk::PipelineCache> caches(threads);
+	const bool                     shared  = WarmUpSharedCache(m_graphics);
+	for (auto& cache: caches) {
+		const vk::PipelineCacheCreateInfo create {};
+		if (shared || m_graphics.device.createPipelineCache(&create, nullptr, &cache) != vk::Result::eSuccess) {
+			cache = m_driver_cache;
+		}
+	}
+	std::atomic_size_t next = 0;
+	const auto         work = [&](size_t thread) {
+		for (auto i = next++; i < jobs.size(); i = next++) {
+			jobs[i](caches[thread]);
+		}
+	};
+	{
+		std::vector<std::jthread> helpers;
+		for (size_t thread = 1; thread < threads; thread++) {
+			helpers.emplace_back(work, thread);
+		}
+		work(0);
+	}
+	std::vector<vk::PipelineCache> merged;
+	for (const auto cache: caches) {
+		if (cache != m_driver_cache && cache != nullptr) {
+			merged.push_back(cache);
+		}
+	}
+	if (m_driver_cache != nullptr && !merged.empty() &&
+	    m_graphics.device.mergePipelineCaches(m_driver_cache, static_cast<uint32_t>(merged.size()),
+	                                          merged.data()) != vk::Result::eSuccess) {
+		Log::WriteToConsoleAndLog("Shader cache: the per-thread pipeline caches could not be merged\n");
+	}
+	for (const auto cache: merged) {
+		m_graphics.device.destroyPipelineCache(cache, nullptr);
+	}
+	Log::WriteToConsoleAndLog(fmt::format(
+	    "Shader cache: {} pipelines created on {} threads, {}, stamp {:016x}\n", jobs.size(), threads,
+	    shared ? "one shared pipeline cache" : "one pipeline cache per thread", BuildStamp()));
+#else
 	std::vector<Common::UniqueFunction<void>> jobs;
 	jobs.reserve(m_graphics_pipelines.size() + modules.size());
 	for (auto& node: m_graphics_pipelines) {
@@ -208,15 +315,13 @@ void PipelineCache::WarmUp(const std::filesystem::path& path) {
 	}
 	for (const auto* module: modules | std::views::values) {
 		if (module != nullptr && module->info.stage == ShaderType::Compute) {
-#if defined(ANYPS5_KYTY)
-			module->pipeline_requested = true;
-#endif
 			jobs.emplace_back([this, module, &pipeline = m_compute_pipelines[module->id]] {
 				CreatePipelineInternal(m_graphics, pipeline, *module, m_driver_cache);
 			});
 		}
 	}
 	Common::ParallelFor(jobs.size(), [&](size_t i) { jobs[i](); });
+#endif
 	std::erase_if(m_graphics_pipelines,
 	              [](const auto& entry) { return entry.second.pipeline == nullptr; });
 	if (!m_graphics_pipelines.empty() || !m_compute_pipelines.empty()) {

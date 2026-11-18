@@ -114,6 +114,37 @@ std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties)
 	                   properties.vendorID, properties.deviceID, properties.driverVersion, uuid);
 }
 
+#if defined(ANYPS5_KYTY)
+std::string ReadDriverCacheSignature(const std::filesystem::path& path, size_t size) {
+	if (!Common::File::IsFileExisting(path)) {
+		return {};
+	}
+	Common::File file(path, Common::File::Mode::Read);
+	if (file.IsInvalid()) {
+		return {};
+	}
+	std::string signature(size, '\0');
+	uint32_t    read = 0;
+	file.Read(signature.data(), static_cast<uint32_t>(size), &read);
+	file.Close();
+	return read == size ? signature : std::string {};
+}
+
+std::filesystem::path DriverCachePath(const std::string& title_id, const std::string& signature) {
+	const std::filesystem::path directory = "_PipelineCache";
+	const auto                  shared    = directory / (title_id + ".bin");
+	const auto own = directory / fmt::format("{}.{:016x}.bin", title_id, XXH3_64bits(signature.data(), signature.size()));
+	const bool shared_exists = Common::File::IsFileExisting(shared);
+	if (shared_exists && ReadDriverCacheSignature(shared, signature.size()) == signature) {
+		return shared;
+	}
+	if (shared_exists || Common::File::IsFileExisting(own)) {
+		return own;
+	}
+	return shared;
+}
+#endif
+
 template <typename... Args>
 void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	auto message = fmt::format(format, std::forward<Args>(args)...);
@@ -1482,7 +1513,11 @@ void PipelineCache::InitializeDriverCache() {
 		PipelineCacheLog("Vulkan pipeline cache: disabled (non-Release build)");
 		return;
 	}
+#if defined(ANYPS5_KYTY)
+	m_driver_cache_path = DriverCachePath(title_id, DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()));
+#else
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
+#endif
 	const auto path         = Common::PathToString(m_driver_cache_path);
 	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
