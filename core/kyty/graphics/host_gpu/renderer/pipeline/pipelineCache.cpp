@@ -2453,7 +2453,7 @@ void PipelineCache::ClaimComputePipeline(uint64_t module_id) {
 
 #if defined(ANYPS5_KYTY)
 void PipelineCache::RequestComputePipelineAhead(const ShaderModule& module) {
-	if (!PipelineLibrariesWanted()) {
+	if (m_libraries == nullptr) {
 		return;
 	}
 	std::atomic_ref<bool> requested(module.pipeline_requested);
