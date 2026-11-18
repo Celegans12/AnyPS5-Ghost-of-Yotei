@@ -36,6 +36,7 @@
 #include "prx/libSceSystemService/SystemService.hpp"
 #include "prx/libSceSystemService/HostUrlBackends.hpp"
 #include "prx/libSceSystemService/DateTimeLocale.hpp"
+#include "prx/libSceSystemService/NoticeScreenSkipStore.hpp"
 #include "prx/libSceUserService/UserService.hpp"
 #include "prx/libSceAgcDriver/Execution/include/HostHdr.hpp"
 
@@ -312,7 +313,18 @@ int GetGpuLoadEmulationModeOfApp(const char* caller, std::int32_t appId) {
 std::atomic<bool> SuspendConfirmationDialogEnabled{true};
 
 std::atomic<bool> AccessibilityZoomLocked{false};
-std::atomic<bool> NoticeScreenSkipFlag{false};
+
+std::filesystem::path NoticeScreenSkipRecordFile(const char* caller) {
+    if (!NoticeScreenSkipPersistFromEnvironment(caller)) return {};
+    const std::string titleId = RunningTitleId();
+    if (!NoticeScreenSkipRecordableTitleId(titleId)) throw std::runtime_error(std::string(caller) + ": title ID \"" + titleId + "\" cannot name a notice screen skip record");
+    return std::filesystem::absolute(std::filesystem::path("anyps5-notice-skip") / titleId);
+}
+
+NoticeScreenSkipStore& NoticeScreenSkip(const char* caller) {
+    static NoticeScreenSkipStore store(NoticeScreenSkipRecordFile(caller));
+    return store;
+}
 
 }
 
@@ -436,7 +448,7 @@ int APS5_VABI sceSystemServiceGetNoticeScreenSkipFlag(bool* value) {
  if (value == nullptr) {
   return SYSTEM_SERVICE_ERROR_PARAMETER;
  }
- const bool localValue = NoticeScreenSkipFlag.load(std::memory_order_relaxed);
+ const bool localValue = NoticeScreenSkip("sceSystemServiceGetNoticeScreenSkipFlag").Raised();
  const int savedErrno = errno;
  const bool copied = GuestCopyOut_nid_no_patch(value, &localValue, sizeof(localValue));
  errno = savedErrno;
@@ -650,7 +662,7 @@ int APS5_VABI sceSystemServiceReportAbnormalTermination(const void* info) {
 }
 
 int APS5_VABI sceSystemServiceSetNoticeScreenSkipFlag(void) {
- NoticeScreenSkipFlag.store(true, std::memory_order_relaxed);
+ NoticeScreenSkip("sceSystemServiceSetNoticeScreenSkipFlag").Raise();
  return SYSTEM_SERVICE_OK;
 }
 

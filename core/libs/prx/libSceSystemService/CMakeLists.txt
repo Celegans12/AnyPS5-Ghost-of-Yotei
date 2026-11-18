@@ -319,13 +319,58 @@ if(BUILD_TESTING)
     endif()
     add_test_executable(guest_system_service_notice_screen_skip_flag_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemServiceNoticeScreenSkipFlag.cpp)
     target_include_directories(guest_system_service_notice_screen_skip_flag_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    target_link_libraries(guest_system_service_notice_screen_skip_flag_tests PRIVATE libSceSystemService libc)
+    target_link_libraries(guest_system_service_notice_screen_skip_flag_tests PRIVATE libSceSystemService libkernel libc)
     configure_windows_unwind(guest_system_service_notice_screen_skip_flag_tests)
-    add_test(NAME guest_system_service_notice_screen_skip_flag COMMAND guest_system_service_notice_screen_skip_flag_tests)
-    set_tests_properties(guest_system_service_notice_screen_skip_flag PROPERTIES TIMEOUT 20)
+    add_test(NAME guest_system_service_notice_screen_skip_flag COMMAND guest_system_service_notice_screen_skip_flag_tests process)
+    set_tests_properties(guest_system_service_notice_screen_skip_flag PROPERTIES TIMEOUT 20
+        ENVIRONMENT_MODIFICATION "ANYPS5_NOTICE_SKIP_PERSIST=set:0")
+    set(noticeSkipRun ${CMAKE_CURRENT_BINARY_DIR}/guest_system_service_notice_screen_skip_persist)
+    foreach(noticeSkipDirectory IN ITEMS launch empty disabled invalid unwritable)
+        file(REMOVE_RECURSE ${noticeSkipRun}_${noticeSkipDirectory})
+        file(WRITE ${noticeSkipRun}_${noticeSkipDirectory}/app0/sce_sys/param.json
+            "{\"titleId\":\"PPSA00000\",\"localizedParameters\":{\"en-US\":{\"titleName\":\"Example\"}}}")
+    endforeach()
+    file(WRITE ${noticeSkipRun}_unwritable/anyps5-notice-skip "not a directory")
+    add_test(NAME guest_system_service_notice_screen_skip_persist_clean COMMAND ${CMAKE_COMMAND} -E remove_directory ${noticeSkipRun}_launch/anyps5-notice-skip)
+    add_test(NAME guest_system_service_notice_screen_skip_persist_clean_empty COMMAND ${CMAKE_COMMAND} -E remove_directory ${noticeSkipRun}_empty/anyps5-notice-skip)
+    add_test(NAME guest_system_service_notice_screen_skip_persist_first COMMAND guest_system_service_notice_screen_skip_flag_tests first
+        WORKING_DIRECTORY ${noticeSkipRun}_launch)
+    add_test(NAME guest_system_service_notice_screen_skip_persist_relaunch COMMAND guest_system_service_notice_screen_skip_flag_tests relaunch
+        WORKING_DIRECTORY ${noticeSkipRun}_launch)
+    add_test(NAME guest_system_service_notice_screen_skip_persist_disabled_kept COMMAND guest_system_service_notice_screen_skip_flag_tests disabled-kept
+        WORKING_DIRECTORY ${noticeSkipRun}_launch)
+    add_test(NAME guest_system_service_notice_screen_skip_persist_disabled_fresh COMMAND guest_system_service_notice_screen_skip_flag_tests disabled-fresh
+        WORKING_DIRECTORY ${noticeSkipRun}_disabled)
+    add_test(NAME guest_system_service_notice_screen_skip_persist_empty COMMAND guest_system_service_notice_screen_skip_flag_tests first
+        WORKING_DIRECTORY ${noticeSkipRun}_empty)
+    add_test(NAME guest_system_service_notice_screen_skip_persist_invalid COMMAND guest_system_service_notice_screen_skip_flag_tests invalid
+        WORKING_DIRECTORY ${noticeSkipRun}_invalid)
+    add_test(NAME guest_system_service_notice_screen_skip_persist_unwritable COMMAND guest_system_service_notice_screen_skip_flag_tests unwritable
+        WORKING_DIRECTORY ${noticeSkipRun}_unwritable)
+    set_tests_properties(guest_system_service_notice_screen_skip_persist_clean PROPERTIES FIXTURES_SETUP noticeSkipClean)
+    set_tests_properties(guest_system_service_notice_screen_skip_persist_clean_empty PROPERTIES FIXTURES_SETUP noticeSkipCleanEmpty)
+    set_tests_properties(guest_system_service_notice_screen_skip_persist_first PROPERTIES FIXTURES_REQUIRED noticeSkipClean FIXTURES_SETUP noticeSkipFirst)
+    set_tests_properties(guest_system_service_notice_screen_skip_persist_relaunch PROPERTIES FIXTURES_REQUIRED noticeSkipFirst FIXTURES_SETUP noticeSkipRelaunch)
+    set_tests_properties(guest_system_service_notice_screen_skip_persist_disabled_kept PROPERTIES FIXTURES_REQUIRED noticeSkipRelaunch
+        ENVIRONMENT_MODIFICATION "ANYPS5_NOTICE_SKIP_PERSIST=set:0")
+    set_tests_properties(guest_system_service_notice_screen_skip_persist_disabled_fresh PROPERTIES
+        ENVIRONMENT_MODIFICATION "ANYPS5_NOTICE_SKIP_PERSIST=set:0")
+    set_tests_properties(guest_system_service_notice_screen_skip_persist_empty PROPERTIES FIXTURES_REQUIRED noticeSkipCleanEmpty
+        ENVIRONMENT_MODIFICATION "ANYPS5_NOTICE_SKIP_PERSIST=set:")
+    set_tests_properties(guest_system_service_notice_screen_skip_persist_invalid PROPERTIES
+        ENVIRONMENT_MODIFICATION "ANYPS5_NOTICE_SKIP_PERSIST=set:2")
+    foreach(noticeSkipTest IN ITEMS persist_first persist_relaunch persist_unwritable)
+        set_property(TEST guest_system_service_notice_screen_skip_${noticeSkipTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION "ANYPS5_NOTICE_SKIP_PERSIST=unset:")
+    endforeach()
+    set_tests_properties(guest_system_service_notice_screen_skip_persist_clean guest_system_service_notice_screen_skip_persist_clean_empty guest_system_service_notice_screen_skip_persist_first
+        guest_system_service_notice_screen_skip_persist_relaunch guest_system_service_notice_screen_skip_persist_disabled_kept
+        guest_system_service_notice_screen_skip_persist_disabled_fresh guest_system_service_notice_screen_skip_persist_empty
+        guest_system_service_notice_screen_skip_persist_invalid guest_system_service_notice_screen_skip_persist_unwritable PROPERTIES TIMEOUT 20)
     if(WIN32)
-        set_tests_properties(guest_system_service_notice_screen_skip_flag PROPERTIES ENVIRONMENT_MODIFICATION
-            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        foreach(noticeSkipTest IN ITEMS flag persist_first persist_relaunch persist_disabled_kept persist_disabled_fresh persist_empty persist_invalid persist_unwritable)
+            set_property(TEST guest_system_service_notice_screen_skip_${noticeSkipTest} APPEND PROPERTY ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+        endforeach()
     endif()
     add_test_executable(guest_system_service_free_size_tests ${LIBS_INCLUDE_DIR}/tests/GuestSystemServiceFreeSize.cpp)
     target_include_directories(guest_system_service_free_size_tests PRIVATE ${LIBS_INCLUDE_DIR})
