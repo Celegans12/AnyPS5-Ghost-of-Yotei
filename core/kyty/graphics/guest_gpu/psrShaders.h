@@ -43,6 +43,10 @@ enum class Shader : uint8_t {
 	DecompressHeaderBase,
 	DecompressComputeFanNode,
 
+#if defined(ANYPS5_KYTY)
+	BasicsFillDword,
+#endif
+
 	Other,
 	Trinity,
 
@@ -54,6 +58,9 @@ enum class Generation : uint8_t {
 	Base460,
 	Base252,
 	Base515,
+#if defined(ANYPS5_KYTY)
+	Base148,
+#endif
 };
 
 [[nodiscard]] Generation LibraryGeneration();

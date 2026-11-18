@@ -2190,6 +2190,11 @@ bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
 		EmitHleRefitArgs();
 	}
 	if (!refit_shader) {
+#if defined(ANYPS5_KYTY)
+		if (shader == Shader::BasicsFillDword) {
+			return false;
+		}
+#endif
 		if (m_hle_refit_window && shader != Shader::None) {
 			Psr::StopReplacement("a BLAS refit runs a pass the native refit does not replace",
 			                     ShaderRegisteredName(data_addr));
@@ -2211,16 +2216,32 @@ bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
 		m_hle_refit_args     = 0;
 	}
 	const auto& user = GetShCtx().GetCs().cs_user_sgpr.value;
+#if defined(ANYPS5_KYTY)
+	const bool base148 = Psr::LibraryGeneration() == Psr::Generation::Base148;
+#endif
 	if (shader == Shader::QbvhFanRefitCopyDispatchArgs) {
+#if defined(ANYPS5_KYTY)
+		const uint64_t blas = (uint64_t {user[0]} | (uint64_t {user[1]} << 32u)) & 0xffffffffffffull;
+		if (!base148 || std::find(m_hle_refit_blases.begin(), m_hle_refit_blases.end(), blas) ==
+		                    m_hle_refit_blases.end()) {
+			m_hle_refit_blases.push_back(blas);
+		}
+#else
 		m_hle_refit_blases.push_back((uint64_t {user[0]} | (uint64_t {user[1]} << 32u)) &
 		                             0xffffffffffffull);
+#endif
 	} else if (shader == Shader::QbvhFanRefitAsyncShaderMesh) {
 		return false;
 	} else if (shader == Shader::QbvhFanRefitAsync) {
+#if defined(ANYPS5_KYTY)
+		const bool geometry_s6 = Psr::LibraryGeneration() == Psr::Generation::Base252 || base148;
+#else
+		const bool geometry_s6 = Psr::LibraryGeneration() == Psr::Generation::Base252;
+#endif
 		m_hle_refit_geometries.push_back(
 		    {.blas     = uint64_t {user[4]} | (uint64_t {user[5] & 0xffffu} << 32u),
 		     .table    = uint64_t {user[0]} | (uint64_t {user[1] & 0xffffu} << 32u),
-		     .geometry = Psr::LibraryGeneration() == Psr::Generation::Base252 ? user[6] : user[8]});
+		     .geometry = geometry_s6 ? user[6] : user[8]});
 	} else if (shader == Shader::QbvhRefitBottomLevel &&
 	           ++m_hle_refit_finished == m_hle_refit_blases.size()) {
 		m_hle_refit_window = false;
@@ -2255,9 +2276,16 @@ void CommandProcessor::EmitHleRefitArgs() {
 
 void CommandProcessor::EmitHleRefit() {
 	const auto     generation    = Psr::LibraryGeneration();
+#if defined(ANYPS5_KYTY)
+	const uint32_t header_layout = generation == Psr::Generation::Base252 || generation == Psr::Generation::Base148
+	                                   ? 1u
+	                               : generation == Psr::Generation::Base515 ? 2u
+	                                                                        : 0u;
+#else
 	const uint32_t header_layout = generation == Psr::Generation::Base252   ? 1u
 	                               : generation == Psr::Generation::Base515 ? 2u
 	                                                                        : 0u;
+#endif
 	if (header_layout == 2) {
 		EmitHleRefitArgs();
 	}

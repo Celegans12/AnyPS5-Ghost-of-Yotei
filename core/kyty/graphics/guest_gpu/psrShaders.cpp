@@ -88,6 +88,9 @@ struct GenerationCodes {
 constexpr std::array KnownCodes {
     GenerationCodes {Generation::Base460, Base460Codes, Base460Revisions},
     GenerationCodes {Generation::Base252, Base252Codes, Base252Revisions},
+#if defined(ANYPS5_KYTY)
+    GenerationCodes {Generation::Base148, Base148Codes, Base148Revisions},
+#endif
 };
 
 const char* GenerationName(Generation generation) {
@@ -95,6 +98,9 @@ const char* GenerationName(Generation generation) {
 		case Generation::Base460: return "Base460";
 		case Generation::Base252: return "Base252";
 		case Generation::Base515: return "Base515";
+#if defined(ANYPS5_KYTY)
+		case Generation::Base148: return "Base148";
+#endif
 		default: return "unknown";
 	}
 }
@@ -331,6 +337,13 @@ static Shader IdentifyShaderCode(uint64_t code_address) {
 	auto known = Generation::Unknown;
 	if (g_generation.compare_exchange_strong(known, match.generation, std::memory_order_acq_rel)) {
 		g_generation_known.store(true, std::memory_order_release);
+#if defined(ANYPS5_KYTY)
+		if (match.generation == Generation::Base148) {
+			LOGF("Psr: library generation %s (shaders recognized by their code): its BLAS refits are "
+			     "replaced, its BLAS and top level builds are emulated\n",
+			     GenerationName(match.generation));
+		} else
+#endif
 		LOGF("Psr: library generation %s (shaders recognized by their code)%s\n",
 		     GenerationName(match.generation),
 		     match.generation == Generation::Base252
