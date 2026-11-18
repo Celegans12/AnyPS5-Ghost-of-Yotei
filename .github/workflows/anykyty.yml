@@ -285,7 +285,7 @@ jobs:
           key: ffmpeg-${{ runner.os }}-winlibs-${{ env.WINLIBS_ZIP }}-${{ steps.submodules.outputs.ffmpeg }}
       - name: Configure
         shell: cmd
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=OFF -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DANYPS5_GPU_BACKEND=kyty -DANYPS5_KYTY_JOBS=%NUMBER_OF_PROCESSORS%
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache -DANYPS5_GPU_BACKEND=kyty -DANYPS5_KYTY_JOBS=%NUMBER_OF_PROCESSORS%
       - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@v6
         continue-on-error: true
@@ -293,8 +293,12 @@ jobs:
           path: build/externals
           key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
       - name: Build
-        shell: cmd
-        run: cmake --build build --target kyty_gpu libs relinker --parallel %NUMBER_OF_PROCESSORS%
+        run: |
+          mapfile -t tests < <(ninja -C build -t targets all | grep -oE '^kyty_shim_[A-Za-z0-9_]+_tests:' | tr -d ':' | sort -u)
+          echo "Shim test targets: ${tests[*]}"
+          cmake --build build --target kyty_gpu libs relinker "${tests[@]}" --parallel "$NUMBER_OF_PROCESSORS"
+      - name: Run the shim tests
+        run: ctest --test-dir build -R '^kyty_shim_.*$' --output-on-failure --timeout 300 --no-tests=error
       - name: Show the ccache statistics
         if: ${{ !cancelled() && steps.ccache.outcome == 'success' }}
         run: ccache -s
