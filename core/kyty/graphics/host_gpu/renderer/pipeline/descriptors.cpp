@@ -2396,6 +2396,21 @@ void RenderExecutor::FindBuffers(std::span<PreparedBindings* const> stages, bool
 				size = std::min(std::min(size, uint64_t {256} * 1024 * 1024), limit);
 			}
 			if (size >= (uint64_t {1} << 30u) || descriptor.NumRecords() == UINT32_MAX) {
+#if defined(ANYPS5_KYTY)
+				if (!Libs::LibKernel::Memory::IsFullyMapped(address, 1)) {
+					static std::atomic_bool reported {false};
+					if (!reported.exchange(true, std::memory_order_relaxed)) {
+						::Log::WriteToConsoleAndLog(fmt::format(
+						    "Buffer: a V# whose base is outside guest memory is bound as a null buffer "
+						    "(shader 0x{:016x}, resource {}, base 0x{:016x}, size 0x{:x}, "
+						    "V# {:08x} {:08x} {:08x} {:08x})\n",
+						    program.shader_hash, resource, address, size, descriptor.fields[0],
+						    descriptor.fields[1], descriptor.fields[2], descriptor.fields[3]));
+					}
+					source = {};
+					continue;
+				}
+#endif
 				size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
 			}
 			source = {address, size, find_buffers ? cache.FindBuffer(address, size) : NULL_BUFFER_ID};
