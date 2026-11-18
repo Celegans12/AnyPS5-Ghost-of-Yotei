@@ -12,6 +12,33 @@ HELD = re.compile(r"(\w+) lock=(0x[0-9a-f]+) site=(0x[0-9a-f]+)")
 SUMMARY = re.compile(r"\[delivery-lock-check\] arrivals=(\d+) clean=(\d+) ran-with-locks=(\d+) deferred-with-locks=(\d+) untracked=(\d+)(?: in-guest-code=(\d+) in-host-code=(\d+))?")
 STACK = re.compile(r"\[delivery-lock-check\] stack id=(\d+) frames=([0-9a-fx,]+)")
 STACK_COUNT = re.compile(r"\[delivery-lock-check\] stack-count id=(\d+) arrivals=(\d+) ran=(\d+) deferred=(\d+)")
+ARRIVAL_HELD = re.compile(r"\[delivery-lock-check\] held tid=(\d+) ip=(0x[0-9a-f]+)(?: stack=(\d+))?((?: \| \w+ lock=0x[0-9a-f]+ site=0x[0-9a-f]+)+)")
+ARRIVAL_WAITING = re.compile(r"\[delivery-lock-check\] waiting tid=(\d+) lock=(0x[0-9a-f]+)(?: stack=(\d+))?((?: \| holder tid=\d+ site=0x[0-9a-f]+)*)")
+HOLDER = re.compile(r"holder tid=(\d+) site=(0x[0-9a-f]+)")
+
+
+def read_regions(path):
+    regions = []
+    with open(path, encoding="utf-8", errors="replace") as handle:
+        for line in handle:
+            parts = line.split(maxsplit=5)
+            if len(parts) < 5:
+                continue
+            start, end = (int(value, 16) for value in parts[0].split("-"))
+            regions.append((start, end, parts[5].strip() if len(parts) == 6 else ""))
+    return regions
+
+
+def data_name(regions, symbols, maps, bases, address):
+    for index, (start, end, name) in enumerate(regions):
+        if not start <= address < end:
+            continue
+        if name.startswith("/"):
+            return symbols.name(maps, bases, address)
+        if name == "" and index > 0 and regions[index - 1][1] == start and regions[index - 1][2].startswith("/"):
+            return f"{symbols.name(maps, bases, address)} (bss)"
+        return f"0x{address:x} in {name or 'an anonymous mapping'} 0x{start:x}-0x{end:x}"
+    return f"0x{address:x} outside every mapping"
 
 
 def read_maps(path):
@@ -84,11 +111,13 @@ def main():
     parser.add_argument("--frames", type=int, default=8, help="frames shown for each host stack")
     args = parser.parse_args()
     maps, bases = read_maps(args.maps)
+    regions = read_regions(args.maps)
     symbols = Symbols(args.libs)
     sites = collections.OrderedDict()
     stacks = {}
     counts = {}
     summary = None
+    arrivals = []
     with open(args.log, encoding="utf-8", errors="replace") as handle:
         for line in handle:
             match = SITE.search(line)
@@ -102,6 +131,14 @@ def main():
             match = STACK_COUNT.search(line)
             if match:
                 counts[int(match.group(1))] = tuple(int(value) for value in match.group(2, 3, 4))
+                continue
+            match = ARRIVAL_HELD.search(line)
+            if match:
+                arrivals.append(("held", int(match.group(1)), int(match.group(2), 16), match.group(3), HELD.findall(match.group(4))))
+                continue
+            match = ARRIVAL_WAITING.search(line)
+            if match:
+                arrivals.append(("waiting", int(match.group(1)), int(match.group(2), 16), match.group(3), HOLDER.findall(match.group(4))))
                 continue
             match = FRESH.search(line)
             if match:
@@ -120,7 +157,15 @@ def main():
     if summary[5] is not None:
         print(f"interrupted in guest code {summary[5]}, in host code {summary[6]}")
     for site, (kind, lock, ran, deferred) in sorted(sites.items(), key=lambda item: (-item[1][2], -item[1][3])):
-        print(f"ran={ran:<6} deferred={deferred:<6} {kind:<5} {symbols.name(maps, bases, site)}  lock {symbols.name(maps, bases, lock)}")
+        print(f"ran={ran:<6} deferred={deferred:<6} {kind:<5} {symbols.name(maps, bases, site)}  lock {data_name(regions, symbols, maps, bases, lock)}")
+    for kind, tid, address, stack, entries in arrivals:
+        where = f" stack {stack}" if stack is not None else ""
+        if kind == "held":
+            locks = "; ".join(f"{lock_kind} {data_name(regions, symbols, maps, bases, int(lock, 16))} taken at {symbols.name(maps, bases, int(site, 16) - 1)}" for lock_kind, lock, site in entries)
+            print(f"arrival with locks held: tid {tid} at {symbols.name(maps, bases, address)}{where}: {locks}")
+        else:
+            holders = "; ".join(f"tid {holder} took it at {symbols.name(maps, bases, int(site, 16) - 1)}" for holder, site in entries) or "no tracked holder"
+            print(f"arrival waiting for a lock: tid {tid} waits for {data_name(regions, symbols, maps, bases, address)}{where}: {holders}")
     for identifier, frames in sorted(stacks.items(), key=lambda item: -counts.get(item[0], (0, 0, 0))[0]):
         arrivals, ran, deferred = counts.get(identifier, (1, 0, 0))
         print(f"host stack {identifier}: arrivals={arrivals} ran={ran} deferred={deferred}")

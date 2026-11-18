@@ -34,6 +34,7 @@ constexpr int StackFrames = 16;
 constexpr std::size_t MaxStacks = 4096;
 
 struct ThreadLocks {
+    std::atomic<long> tid;
     int depth;
     int overflow;
     bool waiting;
@@ -52,11 +53,26 @@ struct Stack {
     std::atomic<std::uint64_t> deferred;
 };
 
+constexpr std::size_t MaxThreads = 4096;
+
 std::array<Stack, MaxStacks> g_stacks {};
+std::array<ThreadLocks, MaxThreads> g_threads {};
+std::atomic<std::size_t> g_thread_count {0};
 std::atomic<std::uint64_t> g_guest {0};
 std::atomic<std::uint64_t> g_host {0};
 
-[[gnu::tls_model("initial-exec")]] constinit thread_local ThreadLocks t_locks {};
+[[gnu::tls_model("initial-exec")]] constinit thread_local ThreadLocks t_own {};
+[[gnu::tls_model("initial-exec")]] constinit thread_local ThreadLocks* t_self = nullptr;
+
+ThreadLocks& Self() {
+    ThreadLocks* self = t_self;
+    if (self != nullptr) return *self;
+    const auto index = g_thread_count.fetch_add(1, std::memory_order_relaxed);
+    self = index < MaxThreads ? &g_threads[index] : &t_own;
+    self->tid.store(static_cast<long>(::syscall(SYS_gettid)), std::memory_order_relaxed);
+    t_self = self;
+    return *self;
+}
 
 struct Site {
     std::atomic<const void*> site;
@@ -169,7 +185,7 @@ SLOT(pthread_kill)
 SLOT(sigaction)
 
 void Push(const void* lock, const void* site, Kind kind) {
-    auto& locks = t_locks;
+    auto& locks = Self();
     if (locks.depth >= MaxHeld) {
         ++locks.overflow;
         g_lost.fetch_add(1, std::memory_order_relaxed);
@@ -182,7 +198,7 @@ void Push(const void* lock, const void* site, Kind kind) {
 }
 
 bool Pop(const void* lock, Held* removed = nullptr) {
-    auto& locks = t_locks;
+    auto& locks = Self();
     for (int index = locks.depth - 1; index >= 0; --index) {
         if (locks.held[static_cast<std::size_t>(index)].lock != lock) continue;
         if (removed != nullptr) *removed = locks.held[static_cast<std::size_t>(index)];
@@ -367,7 +383,7 @@ int HostStack(std::uintptr_t ip) {
 }
 
 void Outcome(bool ran, std::uint64_t nanos) {
-    auto& locks = t_locks;
+    auto& locks = Self();
     if (locks.pending != 0) Report(ran ? "ran" : "deferred", locks.parked, locks.pending, nanos);
     if (locks.pendingStack >= 0) (ran ? g_stacks[static_cast<std::size_t>(locks.pendingStack)].ran : g_stacks[static_cast<std::size_t>(locks.pendingStack)].deferred).fetch_add(1, std::memory_order_relaxed);
     locks.pending = 0;
@@ -392,12 +408,70 @@ void StackSummary() {
     }
 }
 
+void Holders(Line& line, const void* lock) {
+    const auto threads = g_thread_count.load(std::memory_order_relaxed);
+    for (std::size_t index = 0; index < threads && index < MaxThreads; ++index) {
+        const auto& other = g_threads[index];
+        const int depth = __atomic_load_n(&other.depth, __ATOMIC_RELAXED);
+        for (int slot = 0; slot < depth && slot < MaxHeld; ++slot) {
+            const auto& entry = other.held[static_cast<std::size_t>(slot)];
+            if (entry.lock != lock) continue;
+            line.Text(" | holder tid=");
+            line.Decimal(static_cast<std::uint64_t>(other.tid.load(std::memory_order_relaxed)));
+            line.Text(" site=");
+            line.Hex(reinterpret_cast<std::uintptr_t>(entry.site));
+        }
+    }
+}
+
+void Arrival(const ucontext_t& context, const std::array<Held, MaxHeld>& held, int count, int stack) {
+    const auto* registers = context.uc_mcontext.gregs;
+    const auto ip = static_cast<std::uintptr_t>(registers[REG_RIP]);
+    const auto tid = static_cast<std::uint64_t>(::syscall(SYS_gettid));
+    if (count > 0) {
+        Line line;
+        line.Text("[delivery-lock-check] held tid=");
+        line.Decimal(tid);
+        line.Text(" ip=");
+        line.Hex(ip);
+        if (stack >= 0) {
+            line.Text(" stack=");
+            line.Decimal(static_cast<std::uint64_t>(stack));
+        }
+        for (int index = 0; index < count; ++index) {
+            const auto& entry = held[static_cast<std::size_t>(index)];
+            line.Text(" | ");
+            line.Text(KindName(entry.kind));
+            line.Text(" lock=");
+            line.Hex(reinterpret_cast<std::uintptr_t>(entry.lock));
+            line.Text(" site=");
+            line.Hex(reinterpret_cast<std::uintptr_t>(entry.site));
+        }
+        line.Flush();
+    }
+    const auto* code = reinterpret_cast<const unsigned char*>(ip);
+    const bool futexWait = registers[REG_RAX] == SYS_futex && code[0] == 0x0f && code[1] == 0x05 && (registers[REG_RSI] & 0x7f) == 0 && registers[REG_RDX] == 2;
+    if (!futexWait) return;
+    const auto* lock = reinterpret_cast<const void*>(registers[REG_RDI]);
+    Line line;
+    line.Text("[delivery-lock-check] waiting tid=");
+    line.Decimal(tid);
+    line.Text(" lock=");
+    line.Hex(reinterpret_cast<std::uintptr_t>(lock));
+    if (stack >= 0) {
+        line.Text(" stack=");
+        line.Decimal(static_cast<std::uint64_t>(stack));
+    }
+    Holders(line, lock);
+    line.Flush();
+}
+
 void Wrapper(int signal, siginfo_t* info, void* context) {
     const auto handler = g_handler.load(std::memory_order_acquire);
     if (handler == nullptr) return;
     const int saved = errno;
     WriteMaps();
-    auto& locks = t_locks;
+    auto& locks = Self();
     if (locks.waiting) Outcome(true, 0);
     const auto ip = static_cast<std::uintptr_t>(static_cast<ucontext_t*>(context)->uc_mcontext.gregs[REG_RIP]);
     int stack = -1;
@@ -412,6 +486,7 @@ void Wrapper(int signal, siginfo_t* info, void* context) {
     for (int index = 0; index < count; ++index) held[static_cast<std::size_t>(index)] = locks.held[static_cast<std::size_t>(index)];
     const auto arrivals = g_arrivals.fetch_add(1, std::memory_order_relaxed) + 1;
     if (count == 0) g_clean.fetch_add(1, std::memory_order_relaxed);
+    Arrival(*static_cast<const ucontext_t*>(context), held, count, stack);
     errno = saved;
     const auto start = Now();
     handler(signal, info, context);
@@ -539,7 +614,7 @@ int pthread_cond_clockwait(pthread_cond_t* condition, pthread_mutex_t* mutex, cl
 
 int pthread_kill(pthread_t thread, int signal) {
     if (signal == SIGUSR1 && pthread_equal(thread, pthread_self()) != 0) {
-        if (t_locks.waiting) Outcome(false, 0);
+        if (Self().waiting) Outcome(false, 0);
     }
     return NEXT(pthread_kill)(thread, signal);
 }
