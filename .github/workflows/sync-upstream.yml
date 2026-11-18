@@ -1,0 +1,124 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: Number of upstream commits not yet in AnyKyty that opens the sync pull request
+        required: false
+        default: '100'
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  BASE: AnyKyty
+  UPSTREAM: boykopovar/AnyPS5
+  UPSTREAM_BRANCH: main
+  PR_TITLE: 'sync: merge upstream main'
+  ISSUE_TITLE: 'sync blocked: conflicts with upstream'
+  THRESHOLD: ${{ inputs.threshold || '100' }}
+
+jobs:
+  sync:
+    if: github.repository_owner != 'boykopovar'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      pull-requests: write
+      issues: write
+      actions: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+    steps:
+      - id: state
+        name: Count the upstream commits not yet in the base branch
+        run: |
+          upstream=$(gh api "repos/$UPSTREAM/branches/$UPSTREAM_BRANCH" --jq .commit.sha)
+          ahead=$(gh api "repos/$GITHUB_REPOSITORY/compare/$BASE...$upstream" --jq .ahead_by)
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/pulls?state=open&base=$BASE&head=${UPSTREAM%%/*}:$UPSTREAM_BRANCH&per_page=100" \
+            --jq "[.[] | select(.title | startswith(\"$PR_TITLE\"))][0].number // empty")
+          issue=$(gh api "repos/$GITHUB_REPOSITORY/issues?state=open&creator=github-actions%5Bbot%5D&per_page=100" \
+            --jq "[.[] | select(.pull_request == null and (.title | startswith(\"$ISSUE_TITLE\")))][0].number // empty")
+          echo "Upstream $UPSTREAM_BRANCH ${upstream:0:10}: $ahead commits not in $BASE (threshold $THRESHOLD); open pull request: ${pr:-none}; open issue: ${issue:-none}" | tee -a "$GITHUB_STEP_SUMMARY"
+          {
+            echo "upstream=$upstream"
+            echo "ahead=$ahead"
+            echo "pr=$pr"
+            echo "issue=$issue"
+          } >> "$GITHUB_OUTPUT"
+          if [ "$ahead" -ge "$THRESHOLD" ]; then echo "check=true" >> "$GITHUB_OUTPUT"; exit 0; fi
+          echo "check=false" >> "$GITHUB_OUTPUT"
+          if [ -n "$pr" ]; then gh pr close "$pr" --comment "$BASE is $ahead commits behind upstream $UPSTREAM_BRANCH now, under the threshold of $THRESHOLD: closed ($RUN_URL)."; fi
+          if [ -n "$issue" ]; then gh issue close "$issue" --comment "$BASE is $ahead commits behind upstream $UPSTREAM_BRANCH now, under the threshold of $THRESHOLD: closed ($RUN_URL)."; fi
+      - if: steps.state.outputs.check == 'true'
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.BASE }}
+          fetch-depth: 0
+          persist-credentials: false
+      - if: steps.state.outputs.check == 'true'
+        name: Try the merge and open the pull request, or report the conflicts
+        env:
+          UPSTREAM_SHA: ${{ steps.state.outputs.upstream }}
+          PR: ${{ steps.state.outputs.pr }}
+          ISSUE: ${{ steps.state.outputs.issue }}
+        run: |
+          git fetch --no-tags "https://github.com/$UPSTREAM.git" "$UPSTREAM_SHA"
+          base=$(git rev-parse HEAD)
+          short=$(git rev-parse --short=10 "$UPSTREAM_SHA")
+          count=$(git rev-list --count "HEAD..$UPSTREAM_SHA")
+          rc=0
+          result=$(git merge-tree --write-tree --name-only --no-messages HEAD "$UPSTREAM_SHA") || rc=$?
+          if [ "$rc" -gt 1 ]; then echo "::error::git merge-tree failed with code $rc"; exit "$rc"; fi
+          if [ "$rc" -eq 0 ]; then
+            title="$PR_TITLE $short ($count commits)"
+            {
+              echo "\`$UPSTREAM\` \`$UPSTREAM_BRANCH\` is $count commits ahead of \`$BASE\` ($base) and merges into it without conflicts (checked at $UPSTREAM_SHA)."
+              echo
+              echo "This pull request follows upstream \`$UPSTREAM_BRANCH\`: its head moves with every upstream merge, and the AnyKyty workflow builds each new head. Merge by hand the commit that was built and checked, for example \`git merge --no-ff $UPSTREAM_SHA\`. Kept up to date by the Sync upstream workflow ($RUN_URL)."
+              workflows=$(git diff --name-status "$base...$UPSTREAM_SHA" -- .github/workflows)
+              if [ -n "$workflows" ]; then
+                echo
+                echo "Upstream workflow files added or changed since the last sync; new ones run on this fork once merged:"
+                echo
+                echo "$workflows" | sed 's/^/- /'
+              fi
+            } > body.md
+            pr=$PR
+            if [ -n "$pr" ]; then
+              gh pr edit "$pr" --title "$title" --body-file body.md
+            else
+              pr=$(gh pr create --base "$BASE" --head "${UPSTREAM%%/*}:$UPSTREAM_BRANCH" --no-maintainer-edit --title "$title" --body-file body.md | grep -oE '[0-9]+$')
+              gh workflow run anykyty.yml --ref "$BASE" -f pr="$pr" || echo "::warning::Could not start the AnyKyty workflow on pull request #$pr"
+            fi
+            echo "Pull request #$pr: $title" | tee -a "$GITHUB_STEP_SUMMARY"
+            if [ -n "$ISSUE" ]; then gh issue close "$ISSUE" --comment "Upstream $UPSTREAM_BRANCH $short merges cleanly into $BASE now: #$pr."; fi
+          else
+            files=$(printf '%s\n' "$result" | tail -n +2 | sed '/^$/d' | sort -u)
+            title="$ISSUE_TITLE $short"
+            {
+              echo "Merging \`$UPSTREAM\` \`$UPSTREAM_BRANCH\` at $UPSTREAM_SHA ($count commits) into \`$BASE\` at $base conflicts in:"
+              echo
+              echo "$files" | sed 's/^/- /'
+              echo
+              echo "Resolve it by merging $UPSTREAM_SHA into \`$BASE\` by hand. The Sync upstream workflow ($RUN_URL) updates this issue on each run and closes it once upstream merges cleanly."
+            } > body.md
+            issue=$ISSUE
+            if [ -n "$issue" ]; then
+              gh issue edit "$issue" --title "$title" --body-file body.md
+            else
+              issue=$(gh issue create --title "$title" --body-file body.md | grep -oE '[0-9]+$')
+            fi
+            echo "Conflicts in $(echo "$files" | wc -l) files: issue #$issue" | tee -a "$GITHUB_STEP_SUMMARY"
+            if [ -n "$PR" ]; then gh pr close "$PR" --comment "Upstream $UPSTREAM_BRANCH $short conflicts with $BASE: see #$issue."; fi
+          fi
