@@ -223,9 +223,20 @@ uint64_t KYTY_SYSV_ABI ProbeGuestLoad(uint64_t address, WalkerCachedPage* cache)
 			return uint64_t {1} << 32u | value;
 		case SrtWalkerPage::PerLoad: break;
 	}
+#if defined(ANYPS5_KYTY)
+	if (g_guest_memory.read(address, value, t_walker_ahead, answer.backing)) {
+		return uint64_t {1} << 32u | value;
+	}
+	if (t_walker_ahead) {
+		t_walker_faulted = true;
+		return uint64_t {1} << 32u;
+	}
+	return 0;
+#else
 	return g_guest_memory.read(address, value, t_walker_ahead, answer.backing)
 	           ? uint64_t {1} << 32u | value
 	           : 0;
+#endif
 }
 
 void LoadGuest(Xbyak::CodeGenerator& code, const Xbyak::RegExp& address, uint32_t cache) {
