@@ -740,6 +740,23 @@ BlasWords InstanceBlasWords(const Program& program, const Inst& descriptor, bool
 	return words;
 }
 
+Inst* InlineSplit(Value address) {
+	const auto* phi   = Producer(address, ValueOpcode::Phi);
+	Inst*       array = nullptr;
+	bool        fixed = false;
+	for (size_t arg = 0; phi != nullptr && arg < phi->NumArgs(); ++arg) {
+		auto* sum = Producer(phi->Arg(arg), ValueOpcode::IAdd32);
+		if (sum == nullptr) return nullptr;
+		if (Immediate(sum->Arg(0)) || Immediate(sum->Arg(1))) {
+			fixed = true;
+			continue;
+		}
+		if (array != nullptr && array != sum) return nullptr;
+		array = sum;
+	}
+	return fixed ? array : nullptr;
+}
+
 bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> intersections,
                  Traversal& t, bool tracked = true) {
 	const auto* descriptor = Producer(bvh.Arg(0), ValueOpcode::CompositeConstructU32x4);
@@ -759,6 +776,7 @@ bool MatchNested(const Program& program, Inst& bvh, std::span<Inst* const> inter
 	}
 	auto* low  = Producer(instance->Arg(0), ValueOpcode::IAdd32);
 	auto* high = instance->Arg(1).Resolve().TryInstruction();
+	if (low == nullptr && !tracked) low = InlineSplit(instance->Arg(0));
 	if (low == nullptr || high == nullptr) return false;
 	t.instance = {low, high, word0, word1};
 
@@ -1761,6 +1779,21 @@ bool TestedNonZero(const Inst& value, bool written = false) {
 	});
 }
 
+std::optional<AddressLoad> RootRecord(const Program& program, Value root) {
+	if (auto load = LoadOf(program, Canonical(root))) return load;
+	const auto* inst = root.Resolve().TryInstruction();
+	for (uint32_t depth = 0; inst != nullptr && inst->GetOpcode() == ValueOpcode::SelectU32 && depth < 4 &&
+	                         !Immediate(inst->Arg(1)) && !Immediate(inst->Arg(2));
+	     ++depth)
+		inst = inst->Arg(1).Resolve().TryInstruction();
+	for (uint32_t k = 1; inst != nullptr && inst->GetOpcode() == ValueOpcode::SelectU32 && k <= 2; ++k) {
+		if (Immediate(inst->Arg(k))) return LoadOf(program, Canonical(inst->Arg(3 - k)));
+	}
+	return std::nullopt;
+}
+
+bool TlasNodeCount80(const Program& program, const LaneMaskWalk& s);
+
 bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 	auto& layout = w.layout;
 	Value       root_value;
@@ -1781,6 +1814,10 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 	uint32_t inline_root = NoField;
 	if (!root && !root_value.IsEmpty()) {
 		const auto* inst = root_value.Resolve().TryInstruction();
+		for (uint32_t depth = 0; inst != nullptr && inst->GetOpcode() == ValueOpcode::SelectU32 && depth < 4 &&
+		                         !Immediate(inst->Arg(1)) && !Immediate(inst->Arg(2));
+		     ++depth)
+			inst = inst->Arg(1).Resolve().TryInstruction();
 		const auto  op   = inst != nullptr ? inst->GetOpcode() : ValueOpcode::Phi;
 		for (uint32_t k = 0; inst != nullptr && k < 2 && !root; ++k) {
 			const auto constant = op == ValueOpcode::SelectU32 ? Immediate(inst->Arg(1 + k))
@@ -1937,7 +1974,7 @@ bool DeriveLaneLayout(const Program& program, LaneMaskWalk& w) {
 	}
 	const auto count = LoadOf(program, size);
 	if (!count || (count->offset != 80u && count->offset != 88u)) return false;
-	layout.node_count_80 = count->offset == 80u;
+	layout.node_count_80 = count->offset == 80u && (layout.inline_type == NoField || TlasNodeCount80(program, w));
 	bool masked  = false;
 	w.mask_value = {};
 	for (auto* block: program.blocks) {
@@ -2202,7 +2239,6 @@ bool NestedBlasWalk(const Program& program, Inst& bvh, Inst& tlas, BlasWalk& b) 
 }
 
 bool MatchWaveBlas(const Program& program, std::span<Inst* const> tests, uint32_t box, LaneMaskWalk& s);
-bool TlasNodeCount80(const Program& program, const LaneMaskWalk& s);
 
 bool ListExits(const Program& program, const LaneMaskWalk& s, std::vector<std::pair<Block*, bool>>& exits) {
 	auto*  list     = EnclosingLoop(program, s.wave_triangles->Parent());
@@ -2899,7 +2935,7 @@ bool MatchEntryWalk(Program& program, const NativeTraversalOptions& options, Pac
 	s.layout.flags_dword = 15;
 	s.layout.flags_shift = 0;
 	s.source.layout      = s.layout.Pack();
-	const auto record = LoadOf(program, Canonical(IncomingValue(*blas.node, blas.preheader)));
+	const auto record = RootRecord(program, IncomingValue(*blas.node, blas.preheader));
 	if (!record) return false;
 	const auto kind_of = [&](const Inst* value) -> std::optional<RayQueryResultKind> {
 		if (value == record->low.TryInstruction()) return RayQueryResultKind::InstanceLo;
@@ -3516,7 +3552,7 @@ bool MatchClosestOpaqueWalk(Program& program, PacketWalk& w) {
 			}
 		}
 	}
-	const auto record = LoadOf(program, Canonical(IncomingValue(*blas.node, blas.preheader)));
+	const auto record = RootRecord(program, IncomingValue(*blas.node, blas.preheader));
 	if (bvh == nullptr || !record) return false;
 	const auto kind_of = [&](const Inst* value) -> std::optional<RayQueryResultKind> {
 		if (value == record->low.TryInstruction()) return RayQueryResultKind::InstanceLo;
@@ -4401,7 +4437,7 @@ bool MatchPacketLaneWalk(Program& program, PacketWalk& w) {
 			tri = &inst;
 		}
 	}
-	const auto record = LoadOf(program, Canonical(IncomingValue(*blas.node, blas.preheader)));
+	const auto record = RootRecord(program, IncomingValue(*blas.node, blas.preheader));
 	if (tri == nullptr || !record) return false;
 	const auto kind_of = [&](const Inst* value) -> std::optional<RayQueryResultKind> {
 		if (value == record->low.TryInstruction()) return RayQueryResultKind::InstanceLo;
