@@ -2321,7 +2321,12 @@ bool DirectMemoryEnableView_nid_no_patch(DirectMemoryViewObserver observer, std:
         const auto allocate = reinterpret_cast<AllocateFunction>(GetProcAddress(module, "VirtualAlloc2"));
         if (allocate == nullptr || GetProcAddress(module, "MapViewOfFile3") == nullptr) throw std::runtime_error("VirtualAlloc2 and MapViewOfFile3 are not available: the kyty GPU backend needs Windows 10 version 1803 or later");
         const auto total = guestEnd + DIRECT_MEMORY_SIZE;
-        auto* bytesView = static_cast<std::uint8_t*>(allocate(GetCurrentProcess(), nullptr, total, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, nullptr, 0));
+        MEM_ADDRESS_REQUIREMENTS requirements {};
+        requirements.LowestStartingAddress = reinterpret_cast<PVOID>(std::uintptr_t{1} << 40);
+        MEM_EXTENDED_PARAMETER parameter {};
+        parameter.Type = MemExtendedParameterAddressRequirements;
+        parameter.Pointer = &requirements;
+        auto* bytesView = static_cast<std::uint8_t*>(allocate(GetCurrentProcess(), nullptr, total, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS, &parameter, 1));
         if (bytesView == nullptr) throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "reserve the guest memory view");
         if (!VirtualFree(bytesView, guestEnd, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) {
             const auto error = static_cast<int>(GetLastError());
