@@ -152,6 +152,36 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+#if defined(ANYPS5_KYTY)
+void LogShaderVariantBuild(const char* stage, uint64_t shader_hash, uint32_t user_data_count,
+                           const std::vector<uint32_t>& static_state, uint32_t push_data_cursor,
+                           const ShaderModule& module) {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_SHADER_VARIANT_LOG");
+		return value != nullptr && std::strcmp(value, "1") == 0;
+	}();
+	if (!enabled || module.module == nullptr) return;
+
+	ShaderRecompiler::IR::Writer writer;
+	const auto fingerprint = [&writer](const auto& fields) {
+		writer.bytes.clear();
+		ShaderRecompiler::IR::IoAll(writer, fields);
+		return XXH3_64bits(writer.bytes.data(), writer.bytes.size());
+	};
+	const auto& specialization = module.specialization;
+	const auto& functions      = module.function_code;
+	PipelineCacheLog(
+	    "[kyty-variant] build stage={} shader={:016x} module={:016x} user_data_count={} "
+	    "static={:016x} push_start={} push_cursor={} buffers={:016x} images={:016x} "
+	    "samplers={:016x} linked_code={:016x} table={} spirv_words={} @{}",
+	    stage, shader_hash, module.id, user_data_count, fingerprint(static_state),
+	    module.info.bindings.push_data_start_dword, push_data_cursor,
+	    fingerprint(specialization.buffers), fingerprint(specialization.images),
+	    fingerprint(specialization.samplers), XXH3_64bits(functions.data(), functions.size() * sizeof(uint32_t)),
+	    module.info.table_mode, module.spirv_words, std::chrono::steady_clock::now().time_since_epoch().count());
+}
+#endif
+
 bool ReadAheadStrict(void* userdata, uint64_t address, std::span<uint32_t> values) {
 	return !values.empty() && static_cast<GuestReadLog*>(userdata)->Read(address, values.data(),
 	                                                                     values.size_bytes(), true);
@@ -1146,6 +1176,9 @@ ShaderModule PipelineCache::BuildModule(const ProgramKey&                       
 		module.plain = MakePlainModule(module, result.spirv_plain, m_graphics.device);
 		EXIT_IF(module.plain == nullptr);
 	}
+#if defined(ANYPS5_KYTY)
+	LogShaderVariantBuild(stage, key.hash, key.user_data_count, key.static_state, push_data_cursor, module);
+#endif
 	spirv       = std::move(result.spirv);
 	plain_spirv = std::move(result.spirv_plain);
 	return module;
