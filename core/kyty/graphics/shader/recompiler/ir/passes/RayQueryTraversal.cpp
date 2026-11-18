@@ -1473,6 +1473,7 @@ struct LaneMaskWalk {
 	Inst*                 wave_triangles = nullptr;
 	Inst*                 wave_copy      = nullptr;
 	std::vector<Inst*>    wave_pushes;
+	std::vector<std::pair<Block*, bool>> wave_exits;
 	AddressLoad           record;
 	RayTracingLayout      layout;
 	NativeTraversals      source;
@@ -2111,6 +2112,27 @@ bool NestedBlasWalk(const Program& program, Inst& bvh, Inst& tlas, BlasWalk& b) 
 bool MatchWaveBlas(const Program& program, std::span<Inst* const> tests, uint32_t box, LaneMaskWalk& s);
 bool TlasNodeCount80(const Program& program, const LaneMaskWalk& s);
 
+bool ListExits(const Program& program, const LaneMaskWalk& s, std::vector<std::pair<Block*, bool>>& exits) {
+	auto*  list     = EnclosingLoop(program, s.wave_triangles->Parent());
+	Block *list_pre = nullptr, *list_latch = nullptr, *list_merge = nullptr;
+	if (list == nullptr || list == s.wave_header || !LoopShape(list, list_pre, list_latch, list_merge) ||
+	    !InLoop(program, list, s.wave_header, s.wave_latch))
+		return false;
+	exits.clear();
+	for (auto at = BlockIndex(program, list); at <= BlockIndex(program, list_latch); ++at) {
+		auto*       block = program.blocks[at];
+		const auto& next  = block->terminator;
+		if (next.kind != CFG::TerminatorKind::ConditionalBranch ||
+		    (next.true_block != list_latch && next.false_block != list_latch))
+			continue;
+		auto* other = next.true_block == list_latch ? next.false_block : next.true_block;
+		if (InLoop(program, other, list, list_latch)) continue;
+		if (BranchCondition(*block).first == nullptr) return false;
+		exits.emplace_back(block, next.true_block == other);
+	}
+	return !exits.empty();
+}
+
 bool MatchLaneMaskWalk(Program& program, Inst& bvh, LaneMaskWalk& w) {
 	const auto* descriptor = Producer(bvh.Arg(0), ValueOpcode::CompositeConstructU32x4);
 	const auto* address    = Producer(bvh.Arg(1), ValueOpcode::MakeImageAddress);
@@ -2188,7 +2210,10 @@ bool MatchLaneMaskWalk(Program& program, Inst& bvh, LaneMaskWalk& w) {
 		return false;
 	if (!DeriveLaneLayout(program, w) || !DeriveHeaderSource(program, w))
 		return false;
-	if (w.blases.empty()) w.layout.node_count_80 = TlasNodeCount80(program, w);
+	if (w.blases.empty()) {
+		w.layout.node_count_80 = TlasNodeCount80(program, w);
+		if (!ListExits(program, w, w.wave_exits)) w.wave_exits.clear();
+	}
 	w.source.root   = *root;
 	w.source.layout = w.layout.Pack();
 	uint32_t begin = UINT32_MAX;
@@ -2284,6 +2309,11 @@ void RewriteLaneMaskWalk(Program& program, LaneMaskWalk& w, uint32_t site) {
 	for (auto* push: w.wave_pushes) {
 		const Inserter in {push->Parent(), Position(*push)};
 		push->SetArg(1, in(Op::SelectU32, {any, in(Op::RayQuerySelectedLeaf, {}, key), push->Arg(1)}));
+	}
+	for (const auto& [block, leaves_on_true]: w.wave_exits) {
+		const auto [ref, negated] = BranchCondition(*block);
+		const Inserter in {ref->Parent(), Position(*ref)};
+		ref->SetArg(0, in(Op::SelectU1, {any, Value(leaves_on_true != negated), ref->Arg(0)}));
 	}
 	if (w.blases.empty() && w.wave_node != nullptr) {
 		Block *pre = nullptr, *latch = nullptr, *merge = nullptr;
@@ -4062,24 +4092,7 @@ bool MatchClosestLeafWalk(const Program& program, PacketWalk& w) {
 		w.leaf_t = Value(const_cast<Inst*>(kept));
 	}
 	if (w.leaf_t.IsEmpty()) return false;
-	auto*  list     = EnclosingLoop(program, s.wave_triangles->Parent());
-	Block *list_pre = nullptr, *list_latch = nullptr, *list_merge = nullptr;
-	if (list == nullptr || list == s.wave_header || !LoopShape(list, list_pre, list_latch, list_merge) ||
-	    !InLoop(program, list, s.wave_header, s.wave_latch))
-		return false;
-	w.list_exits.clear();
-	for (auto at = BlockIndex(program, list); at <= BlockIndex(program, list_latch); ++at) {
-		auto*       block = program.blocks[at];
-		const auto& next  = block->terminator;
-		if (next.kind != CFG::TerminatorKind::ConditionalBranch ||
-		    (next.true_block != list_latch && next.false_block != list_latch))
-			continue;
-		auto* other = next.true_block == list_latch ? next.false_block : next.true_block;
-		if (InLoop(program, other, list, list_latch)) continue;
-		if (BranchCondition(*block).first == nullptr) return false;
-		w.list_exits.emplace_back(block, next.true_block == other);
-	}
-	return !w.list_exits.empty();
+	return ListExits(program, s, w.list_exits);
 }
 
 void RewriteClosestLeafWalk(Program& program, PacketWalk& w, uint32_t site) {
