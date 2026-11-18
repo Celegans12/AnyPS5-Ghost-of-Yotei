@@ -73,6 +73,22 @@ void FlipRoundTrip() {
     Expect(fromDcb && fromDcb->handle == 1u && fromDcb->index == 3 && fromDcb->mode == 1u && fromDcb->argument == 0x0123456789abcdefLL, "flip written as sceAgcDcbSetFlip writes it");
 }
 
+void FlipInSubmission() {
+    const auto flip = KytyShim::Entry::EncodeFlipPacket(AgcDriver::FlipInfo{1u, 0, 1u, 0});
+    std::vector<std::uint32_t> words;
+    Expect(!KytyShim::Entry::HasFlipPacket(words), "an empty submission has no flip");
+    const auto release = Release(2u, 0x1234u);
+    Append(words, release);
+    words.push_back(0x80000000u);
+    Expect(!KytyShim::Entry::HasFlipPacket(words), "a submission without a flip packet has no flip");
+    Append(words, flip);
+    Expect(KytyShim::Entry::HasFlipPacket(words), "a flip packet after other packets is found");
+    std::vector<std::uint32_t> payload{0xc0011000u, AgcDriver::FlipPacketHeader, 0u};
+    Expect(!KytyShim::Entry::HasFlipPacket(payload), "a flip header inside another packet's payload is not a flip");
+    std::vector<std::uint32_t> first(flip.begin(), flip.end());
+    Expect(KytyShim::Entry::HasFlipPacket(first), "a flip packet at the start is found");
+}
+
 void RenderingWait() {
     const std::array<std::uint32_t, 4> packet{AgcDriver::RenderingWaitPacketHeader, 9u, 2u, 0u};
     const auto target = KytyShim::Entry::DecodeRenderingWaitPacket(packet);
@@ -195,6 +211,7 @@ void MappedRanges() {
 int main() {
     PacketCodes();
     FlipRoundTrip();
+    FlipInSubmission();
     RenderingWait();
     EopRelease();
     EopPoints();

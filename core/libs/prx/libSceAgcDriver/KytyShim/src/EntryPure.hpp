@@ -30,6 +30,7 @@ struct EopFlipPoint {
 std::size_t PacketWords(std::uint32_t header);
 std::array<std::uint32_t, AgcDriver::FlipPacketWords> EncodeFlipPacket(const AgcDriver::FlipInfo& info);
 std::optional<AgcDriver::FlipInfo> DecodeFlipPacket(std::span<const std::uint32_t> packet);
+bool HasFlipPacket(std::span<const std::uint32_t> commands);
 std::optional<RenderingWaitTarget> DecodeRenderingWaitPacket(std::span<const std::uint32_t> packet);
 std::optional<std::uint32_t> EopReleaseToken(std::span<const std::uint32_t> packet);
 std::vector<EopFlipPoint> FindEopFlipPoints(std::span<const std::uint32_t> commands, std::span<const std::uint32_t> pending);

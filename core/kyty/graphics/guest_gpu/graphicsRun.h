@@ -40,6 +40,9 @@ public:
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
 	void SubmitFlipPreparation(uint64_t request_id);
 	void SuspendPoint();
+#if defined(ANYPS5_KYTY)
+	void NoteFrameSubmitted();
+#endif
 	void              WaitForIdle();
 	[[nodiscard]] int GetFrameNum() const;
 
@@ -96,6 +99,9 @@ private:
 		bool                      yielded         = false;
 		uint64_t                  flip_request_id = 0;
 		uint64_t                  scout_sequence  = 0;
+#if defined(ANYPS5_KYTY)
+		bool                      frame_end       = false;
+#endif
 	};
 
 	void              Enqueue(Submission submission);
@@ -127,6 +133,8 @@ private:
 	static ptrdiff_t           SuspendPointDepth();
 	std::shared_ptr<std::counting_semaphore<SuspendPointDepthMax>> m_suspend_point_ready =
 	    std::make_shared<std::counting_semaphore<SuspendPointDepthMax>>(SuspendPointDepth());
+	std::shared_ptr<std::binary_semaphore> m_frame_ready = std::make_shared<std::binary_semaphore>(1);
+	std::atomic_bool                       m_frame_submitted {false};
 #else
 	std::shared_ptr<std::binary_semaphore> m_suspend_point_ready =
 	    std::make_shared<std::binary_semaphore>(1);

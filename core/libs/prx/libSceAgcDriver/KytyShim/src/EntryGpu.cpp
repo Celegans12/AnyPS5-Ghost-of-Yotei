@@ -331,6 +331,7 @@ void Submit(std::span<const std::uint32_t> commands, std::uint32_t queue) {
         begin = points[i].end;
     }
     SubmitWords(gpu, commands.subspan(begin), queue);
+    if (queue == 0 && (!points.empty() || HasFlipPacket(commands))) gpu.NoteFrameSubmitted();
     KytyShim::Replay::NoteSubmission(gpu, queue);
 }
 

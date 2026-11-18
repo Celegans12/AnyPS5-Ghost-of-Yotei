@@ -216,8 +216,13 @@ Suspend points: KytyPS5 makes `sceAgcSuspendPoint` (`GuestGpu::SuspendPoint`) ac
 priority thread releases once the GPU has finished the work queued before the previous suspend point, so a title can
 never queue work more than one suspend point ahead of the GPU. On the console, and in the AnyPS5 driver
 (`Driver::SuspendPoint`), a suspend point only marks a place where the system may suspend the title, and it returns at
-once. Under `ANYPS5_KYTY` the semaphore counts up to `KYTY_SUSPEND_POINT_DEPTH` suspend points in flight, 8 by default;
-the title's own fences, labels and flips still order its reuse of memory against the GPU. Stray calls it after each
+once. Under `ANYPS5_KYTY` the semaphore counts up to `KYTY_SUSPEND_POINT_DEPTH` suspend points in flight, 8 by default,
+and a suspend point that follows a flip also waits until the GPU has finished the work before the previous such suspend
+point, so a title never runs more than one frame ahead of the GPU: the AnyPS5 driver keeps the same bound by holding a
+submission that carries a flip until the earlier flip's work is done. Balatro calls it once a frame, after a submission
+that ends with a flip, and has no other fence before it rewrites its transient vertex memory: with eight frames in flight
+it rewrote vertex buffer tables the command processor had not read yet, and stopped at launch on a vertex buffer
+descriptor with `ADD_TID` set (`notes/balatro-regression.md`). Stray calls it after each
 submission, about five times a frame: with one in flight it could not submit a frame before the GPU had finished the
 previous one, and the stages sat idle for the GPU's tail every frame. The depth has to cover a whole frame of suspend
 points: on Stray at 4,240 draws a frame, depths 1, 4, 8 and 16 give 56.2, 56.5, 71.6 and 71.9 frames per second, the same

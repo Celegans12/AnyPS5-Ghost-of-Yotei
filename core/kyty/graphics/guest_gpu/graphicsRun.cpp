@@ -273,6 +273,9 @@ void GuestGpu::SubmitFlipPreparation(uint64_t request_id) {
 	submission.queue_id        = 0;
 	submission.flip_request_id = request_id;
 	Enqueue(std::move(submission));
+#if defined(ANYPS5_KYTY)
+	NoteFrameSubmitted();
+#endif
 }
 
 #if defined(ANYPS5_KYTY)
@@ -294,11 +297,23 @@ ptrdiff_t GuestGpu::SuspendPointDepth() {
 }
 #endif
 
+#if defined(ANYPS5_KYTY)
+void GuestGpu::NoteFrameSubmitted() {
+	m_frame_submitted.store(true, std::memory_order_release);
+}
+#endif
+
 void GuestGpu::SuspendPoint() {
 	EXIT_IF(IsGpuThread() || CommandScheduler::InDeferredOperation());
 	m_suspend_point_ready->acquire();
 	Submission submission;
 	submission.type = SubmissionType::SuspendPoint;
+#if defined(ANYPS5_KYTY)
+	submission.frame_end = m_frame_submitted.exchange(false, std::memory_order_acq_rel);
+	if (submission.frame_end) {
+		m_frame_ready->acquire();
+	}
+#endif
 	Enqueue(std::move(submission));
 	m_done_num++;
 }
@@ -1527,6 +1542,14 @@ bool GuestGpu::Process(Submission& submission) {
 				m_renderer.GetCommandScheduler().DeferHostOperation([ready] { ready->release(); },
 				                                                    true);
 			});
+#if defined(ANYPS5_KYTY)
+			if (submission.frame_end) {
+				cp.EmitHostCommand([this, frame = m_frame_ready] {
+					m_renderer.GetCommandScheduler().DeferHostOperation([frame] { frame->release(); },
+					                                                    true);
+				});
+			}
+#endif
 			cp.BufferFlush();
 			cp.Reset();
 			break;

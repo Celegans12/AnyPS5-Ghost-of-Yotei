@@ -93,6 +93,13 @@ std::optional<AgcDriver::FlipInfo> DecodeFlipPacket(std::span<const std::uint32_
     return AgcDriver::FlipInfo{packet[1], std::bit_cast<std::int32_t>(packet[2]), packet[3], std::bit_cast<std::int64_t>(argument)};
 }
 
+bool HasFlipPacket(std::span<const std::uint32_t> commands) {
+    for (std::size_t cursor = 0; cursor < commands.size(); cursor += PacketWords(commands[cursor])) {
+        if (commands[cursor] == AgcDriver::FlipPacketHeader) return true;
+    }
+    return false;
+}
+
 std::optional<RenderingWaitTarget> DecodeRenderingWaitPacket(std::span<const std::uint32_t> packet) {
     if (packet.size() < AgcDriver::RenderingWaitPacketWords || packet[0] != AgcDriver::RenderingWaitPacketHeader) return std::nullopt;
     return RenderingWaitTarget{packet[1], packet[2], packet[3]};
