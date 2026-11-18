@@ -961,6 +961,54 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 					return true;
 				}
 			}
+#if defined(ANYPS5_KYTY)
+			if constexpr (std::is_same_v<Specialization, ResourceSpecialization::Image>) {
+				const auto& image = program.info.images[resource_index];
+				if (pointer != nullptr && dword_count == 8u && runtime.image_heap != nullptr && child_count != 0u &&
+				    image.resource_class == ImageResourceClass::Sampled && image.mip_mode != ImageMipMode::Dynamic &&
+				    count * child_count <= MaxIndirectDescriptorProbes) {
+					std::vector<DescriptorValue> values(count * child_count, DescriptorValue {.dword_count = dword_count});
+					bool read = true;
+					for (uint32_t word = 0; read && word < count; ++word) {
+						const auto table_offset = affine ? first + word * step : uint64_t {word} * 4u;
+						std::array<uint32_t, 2> address {};
+						if (!ReadScalarTable(table_base, table_size, table_offset, runtime, address)) {
+							read = false;
+							break;
+						}
+						const auto pointer_base = (uint64_t {address[1]} << 32u) | address[0];
+						for (uint32_t child = 0; child < child_count; ++child) {
+							auto& candidate = values[word * child_count + child];
+							if (!ReadScalarTable(pointer_base, UINT64_MAX, uint64_t {child} * pointer->stride + pointer->offset,
+							                     runtime, std::span(candidate.dwords).first(read_dwords)) ||
+							    !normalize(candidate)) {
+								read = false;
+								break;
+							}
+						}
+					}
+					ImageHeapView view;
+					if (read && !values.empty() &&
+					    runtime.image_heap->AcquireList({.owner = &program, .resource = resource_index, .root = &image, .values = values},
+					                                    view)) {
+						if (view.kinds.empty()) return true;
+						auto root = root_resource;
+						root.indirect_root           = resource_index;
+						root.indirect_mapping_offset = static_cast<uint32_t>(snapshot.flattened_srt.size());
+						root.heap                    = true;
+						specializations[resource_index] = root;
+						const auto slots = view.slots + sizeof(uint32_t);
+						snapshot.flattened_srt.insert(snapshot.flattened_srt.end(),
+						    {static_cast<uint32_t>(values.size() - 1u), static_cast<uint32_t>(slots), static_cast<uint32_t>(slots >> 32u)});
+						for (const auto& kind: view.kinds) {
+							descriptors.push_back(kind);
+							specializations.push_back(root);
+						}
+						return true;
+					}
+				}
+			}
+#endif
 			if (child_count == 0u || (!image_heap && count * child_count > MaxIndirectDescriptorProbes))
 				return failed("candidate count", fmt::format("rows={} limit={}", count, MaxIndirectDescriptorProbes));
 			auto& heap_words = PlanScratch(program).material_keys;
