@@ -1,5 +1,8 @@
 #include "common/assert.h"
 #include "common/common.h"
+#if defined(ANYPS5_KYTY)
+#include "common/logging/log.h"
+#endif
 #include "common/profiler.h"
 #include "gpu_blit_shaders/gpu_mesh_indirect_spv.h"
 #include "graphics/guest_gpu/gpu_defs.h"
@@ -25,6 +28,10 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#if defined(ANYPS5_KYTY)
+#include <cstdlib>
+#include <optional>
+#endif
 #include <fmt/format.h>
 #include <span>
 #include <string>
@@ -897,9 +904,43 @@ static vk::Result CreateComputePipeline(GraphicContext& graphics, PipelineCache:
 	info.stage  = comp_shader_stage_info;
 	info.layout = pipeline.pipeline_layout;
 
-	const ScopedDriverCreation creation({"cs", nullptr, nullptr, nullptr},
-	                                    {module.info.shader_hash, 0, 0, 0});
-	return graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+#if defined(ANYPS5_KYTY)
+	using Clock = std::chrono::steady_clock;
+	static const auto log_ms = []() -> std::optional<int64_t> {
+		const char* value = std::getenv("KYTY_PIPELINE_STALL_LOG_MS");
+		if (value == nullptr) {
+			return std::nullopt;
+		}
+		return std::strtoll(value, nullptr, 10);
+	}();
+	Clock::time_point finished {};
+	Clock::duration elapsed {};
+#endif
+	vk::Result result;
+	{
+		const ScopedDriverCreation creation({"cs", nullptr, nullptr, nullptr},
+		                                    {module.info.shader_hash, 0, 0, 0});
+#if defined(ANYPS5_KYTY)
+		const auto started = log_ms ? Clock::now() : Clock::time_point {};
+#endif
+		result = graphics.device.createComputePipelines(driver_cache, 1, &info, nullptr, &pipeline.pipeline);
+#if defined(ANYPS5_KYTY)
+		if (log_ms) {
+			finished = Clock::now();
+			elapsed  = finished - started;
+		}
+#endif
+	}
+#if defined(ANYPS5_KYTY)
+	if (log_ms && std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count() >= *log_ms) {
+		Log::WriteToConsoleAndLog(fmt::format(
+		    "[kyty-gpl] compute-driver {:.6f} s 0x{:016x} module={} spirv_words={} mode={} result={} @{}\n",
+		    std::chrono::duration<double>(elapsed).count(), module.info.shader_hash, module.id,
+		    module.spirv_words, lookup ? "lookup" : "create", vk::to_string(result),
+		    finished.time_since_epoch().count()));
+	}
+#endif
+	return result;
 }
 
 void CreatePipelineInternal(GraphicContext& graphics, PipelineCache::Pipeline& pipeline,
