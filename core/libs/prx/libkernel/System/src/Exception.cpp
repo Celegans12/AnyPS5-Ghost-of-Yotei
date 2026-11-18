@@ -1350,16 +1350,20 @@ std::uintptr_t TakeArm(std::uintptr_t slot) {
     return 0;
 }
 
+bool PendingExpired() {
+    const std::uint64_t now = TimedWait::NowNanos();
+    const std::uint64_t since = pendingSince.load();
+    if (since == 0) {
+        pendingSince.store(now);
+        return false;
+    }
+    return now - since >= ForceAfterNanos;
+}
+
 bool DeferUntilSafe(const mcontext_t& host) {
     const auto rip = static_cast<std::uintptr_t>(host.gregs[REG_RIP]);
     if (TimedWait::DeliveryAllowed() || GuestCode(rip) || InterruptedWait(host)) return false;
-    const std::uint64_t now = TimedWait::NowNanos();
-    std::uint64_t since = pendingSince.load();
-    if (since == 0) {
-        since = now;
-        pendingSince.store(now);
-    }
-    if (now - since >= ForceAfterNanos) return false;
+    if (PendingExpired()) return false;
     ArmReturn(host);
     return QueueRetry();
 }
@@ -1431,13 +1435,16 @@ void Deliver(int signum, siginfo_t* info, void* context) {
     if (RetrySignal(info)) retryQueued.store(false);
     auto* const self = CurrentGuestThreadForDelivery();
     if (!Outstanding(self)) return;
-#else
-    (void)info;
-#endif
-    if (TimedWait::DeferDelivery(signum)) return;
-#ifdef __linux__
+    if (TimedWait::DeliveryDeferred() && !PendingExpired()) {
+        TimedWait::DeferDelivery(signum);
+        QueueRetry();
+        return;
+    }
     if (DeferUntilSafe(static_cast<ucontext_t*>(context)->uc_mcontext)) return;
     TakeRaises(self);
+#else
+    (void)info;
+    if (TimedWait::DeferDelivery(signum)) return;
 #endif
     const auto handler = Handler(RaisedSignal);
     if (handler == nullptr) {

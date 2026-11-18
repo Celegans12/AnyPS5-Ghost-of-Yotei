@@ -466,6 +466,107 @@ void TestHostWriteHoldRaised() {
     std::printf("host write hold under raised exceptions: %d handlers that park a guest thread holding, releasing and protecting host writes left the hold lock free\n", Rounds);
 }
 
+void* APS5_VABI QueryPriorities(void* argument) {
+    auto& holder = *static_cast<RaisedHolder*>(argument);
+    auto* priority = reinterpret_cast<int*>(holder.page + 16);
+    const Pthread self = scePthreadSelf();
+    holder.started.store(true);
+    while (!holder.stop.load()) Require(scePthreadGetprio(self, priority) == 0);
+    return nullptr;
+}
+
+void TestThreadRegistryRaised() {
+    constexpr int Rounds = 300;
+    void* flexible = nullptr;
+    Require(sceKernelMapFlexibleMemory(&flexible, Page, CpuReadWrite, 0) == 0 && flexible != nullptr);
+    RaisedHolder holder;
+    holder.page = Address(flexible);
+    g_raisedHolder = &holder;
+    Require(sceKernelInstallExceptionHandler(GuestRaisedSignal, reinterpret_cast<void*>(&ParkRaisedHolder)) == 0);
+    Pthread thread{};
+    Require(scePthreadCreate(&thread, nullptr, QueryPriorities, &holder, "priority reader") == 0);
+    Require(WaitFor(holder.started, true, std::chrono::seconds(5)));
+    for (int round = 0; round < Rounds; ++round) {
+        Require(sceKernelRaiseException(thread, GuestRaisedSignal) == 0);
+        Require(WaitFor(holder.parked, true, std::chrono::seconds(5)));
+        std::atomic<bool> answered{false};
+        std::thread collector([&answered, thread, &holder] {
+            Require(scePthreadGetprio(thread, reinterpret_cast<int*>(holder.page + 32)) == 0);
+            answered.store(true);
+        });
+        const bool free = WaitFor(answered, true, std::chrono::seconds(2));
+        holder.resume.store(true);
+        collector.join();
+        Require(WaitFor(holder.parked, false, std::chrono::seconds(5)));
+        if (!free) {
+            std::fprintf(stderr, "KytyShim memory: raise %d parked a guest thread inside scePthreadGetprio that held the thread registry lock; another thread waited for it until the handler returned\n", round + 1);
+            std::abort();
+        }
+    }
+    holder.stop.store(true);
+    Require(scePthreadJoin(thread, nullptr) == 0);
+    Require(sceKernelRemoveExceptionHandler(GuestRaisedSignal) == 0);
+    g_raisedHolder = nullptr;
+    Require(sceKernelMunmap(Address(flexible), Page) == 0);
+    std::printf("thread registry under raised exceptions: %d handlers that park a guest thread reading its priority into guest memory left the registry lock free\n", Rounds);
+}
+
+std::atomic<int> g_viewHookMicros{0};
+
+void WaitingViewHook(std::uint64_t, std::uint64_t) {
+    const int micros = g_viewHookMicros.load();
+    if (micros > 0) std::this_thread::sleep_for(std::chrono::microseconds(micros));
+}
+
+bool MapAndUnmapPage() {
+    void* mapped = nullptr;
+    if (sceKernelMapFlexibleMemory(&mapped, Page, CpuReadWrite, 0) != 0 || mapped == nullptr) return false;
+    return sceKernelMunmap(Address(mapped), Page) == 0;
+}
+
+void* APS5_VABI MapPages(void* argument) {
+    auto& holder = *static_cast<RaisedHolder*>(argument);
+    holder.started.store(true);
+    while (!holder.stop.load()) Require(MapAndUnmapPage());
+    return nullptr;
+}
+
+void TestViewHookRaised() {
+    constexpr int Rounds = 100;
+    Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(&WaitingViewHook, &WaitingViewHook);
+    g_viewHookMicros.store(200);
+    RaisedHolder holder;
+    g_raisedHolder = &holder;
+    Require(sceKernelInstallExceptionHandler(GuestRaisedSignal, reinterpret_cast<void*>(&ParkRaisedHolder)) == 0);
+    Pthread thread{};
+    Require(scePthreadCreate(&thread, nullptr, MapPages, &holder, "page mapper") == 0);
+    Require(WaitFor(holder.started, true, std::chrono::seconds(5)));
+    for (int round = 0; round < Rounds; ++round) {
+        Require(sceKernelRaiseException(thread, GuestRaisedSignal) == 0);
+        Require(WaitFor(holder.parked, true, std::chrono::seconds(5)));
+        std::atomic<bool> hooked{false};
+        std::thread collector([&hooked] {
+            Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(&WaitingViewHook, &WaitingViewHook);
+            hooked.store(true);
+        });
+        const bool free = WaitFor(hooked, true, std::chrono::seconds(2));
+        holder.resume.store(true);
+        collector.join();
+        Require(WaitFor(holder.parked, false, std::chrono::seconds(5)));
+        if (!free) {
+            std::fprintf(stderr, "KytyShim memory: raise %d parked a guest thread inside a mapping hook that waits; another thread waited for the hook lock until the handler returned\n", round + 1);
+            std::abort();
+        }
+    }
+    holder.stop.store(true);
+    Require(scePthreadJoin(thread, nullptr) == 0);
+    Require(sceKernelRemoveExceptionHandler(GuestRaisedSignal) == 0);
+    g_raisedHolder = nullptr;
+    g_viewHookMicros.store(0);
+    Libs::LibKernel::Memory::Shim::SetGpuRangeHooks(nullptr, nullptr);
+    std::printf("mapping hooks under raised exceptions: %d handlers that park a guest thread mapping memory through a hook that waits left the hook lock free\n", Rounds);
+}
+
 void TestRuntimeMemory() {
     const auto address = Memory::AllocateRuntimeMemory(0, Page * 2, Common::VirtualMemory::Mode::ReadWrite, "kyty shim test");
     Require(address != 0 && Memory::IsBackingReadable(address, Page * 2));
@@ -1027,6 +1128,8 @@ int main() {
     TestSparseReadsDirectFile();
     TestSparseReadsSwappedPage();
     TestHostWriteHoldRaised();
+    TestThreadRegistryRaised();
+    TestViewHookRaised();
     std::printf("KytyShim memory: all checks passed\n");
     return 0;
 }

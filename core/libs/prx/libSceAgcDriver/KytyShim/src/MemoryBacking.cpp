@@ -58,9 +58,10 @@ constexpr uint64_t SeekLastChunk = uint64_t {1} << 20u;
 #endif
 
 #if defined(__linux__)
+template <class Mutex>
 class GuestDeliveryLock {
 public:
-	explicit GuestDeliveryLock(std::mutex& mutex) : m_lock(mutex) {}
+	explicit GuestDeliveryLock(Mutex& mutex) : m_lock(mutex) {}
 	GuestDeliveryLock(const GuestDeliveryLock&) = delete;
 	GuestDeliveryLock& operator=(const GuestDeliveryLock&) = delete;
 
@@ -73,10 +74,19 @@ private:
 	};
 
 	Hold m_hold;
-	std::lock_guard<std::mutex> m_lock;
+	std::lock_guard<Mutex> m_lock;
 };
 #else
-using GuestDeliveryLock = std::lock_guard<std::mutex>;
+template <class Mutex>
+class GuestDeliveryLock {
+public:
+	explicit GuestDeliveryLock(Mutex& mutex) : m_lock(mutex) {}
+	GuestDeliveryLock(const GuestDeliveryLock&) = delete;
+	GuestDeliveryLock& operator=(const GuestDeliveryLock&) = delete;
+
+private:
+	std::lock_guard<Mutex> m_lock;
+};
 #endif
 
 class PageTable {
@@ -624,7 +634,7 @@ void OnViewChange(std::uintptr_t address, std::size_t bytes, std::uint64_t offse
 	if (((address | bytes) & PageMask) != 0) {
 		Shim::Fail("KytyShim memory: libkernel reported a view change 0x%016" PRIx64 "+0x%zx that is not 16 KiB aligned\n", static_cast<uint64_t>(address), bytes);
 	}
-	std::lock_guard lock(HookMutex());
+	GuestDeliveryLock lock(HookMutex());
 	auto& pages = Pages();
 	ForgetProbes(address, bytes);
 	if (offset == DirectMemoryViewReplacing) {
@@ -984,7 +994,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 #if defined(__linux__)
 	GuestThreadStackMappings_nid_no_patch(first, end, &KeepThreadStack, &kept);
 #endif
-	std::optional<GuestDeliveryLock> holds;
+	std::optional<GuestDeliveryLock<std::mutex>> holds;
 	if (!writable) {
 		holds.emplace(g_host_write_holds_mutex);
 		for (auto& hold : g_host_write_holds) {
