@@ -1,12 +1,18 @@
+#include "RtProbeCache.hpp"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
 
+#include <charconv>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -42,12 +48,7 @@ uint64_t HashOf(const char* path) {
 	return std::strtoull(name.c_str(), nullptr, 16);
 }
 
-int Probe(const char* path, const Settings& settings) {
-	std::vector<uint32_t> code;
-	if (!Read(path, code)) {
-		std::printf("%s: unreadable\n", path);
-		return 1;
-	}
+int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, const Settings& settings) {
 	ShaderComputeInputInfo compute {};
 	compute.wave_size          = settings.wave;
 	compute.host_subgroup_size = settings.wave;
@@ -63,7 +64,7 @@ int Probe(const char* path, const Settings& settings) {
 	Recompiler::CompileOptions options;
 	options.stage                 = ShaderType::Compute;
 	options.wave_size             = settings.wave;
-	options.shader_hash           = HashOf(path);
+	options.shader_hash           = hash;
 	options.dump_ir               = settings.dump;
 	options.profile               = &profile;
 	options.native_ray_tracing    = !settings.disabled;
@@ -71,7 +72,7 @@ int Probe(const char* path, const Settings& settings) {
 	options.input_info.compute    = &compute;
 	auto source = Recompiler::PrepareShaderSource(code, options);
 	if (!source.calls.empty() || source.unsupported_call_pc != UINT32_MAX) {
-		std::printf("%s: calls\n", path);
+		std::printf("%s: calls\n", label);
 		return 1;
 	}
 	auto translated = Recompiler::TranslateProgram(source.decoded, options);
@@ -84,7 +85,7 @@ int Probe(const char* path, const Settings& settings) {
 		}
 	}
 	const auto& info = translated.program.info;
-	std::printf("%s: words=%zu bvh=%u native=%u user_sgpr=%u header=0x%x root=0x%x layout=%08x,%08x,%08x,%08x\n", path,
+	std::printf("%s: words=%zu bvh=%u native=%u user_sgpr=%u header=0x%x root=0x%x layout=%08x,%08x,%08x,%08x\n", label,
 	            code.size(), bvh, native, info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root,
 	            info.ray_query_layout[0], info.ray_query_layout[1], info.ray_query_layout[2], info.ray_query_layout[3]);
 	if (settings.emit) {
@@ -97,7 +98,7 @@ int Probe(const char* path, const Settings& settings) {
 			specialization.images[k].dimension     = translated.program.info.images[k].dimension;
 		}
 		auto compiled = Recompiler::CompileProgram(std::move(translated), options, specialization);
-		std::printf("%s: spirv=%zu words ray_query=%d\n", path, compiled.spirv.size(),
+		std::printf("%s: spirv=%zu words ray_query=%d\n", label, compiled.spirv.size(),
 		            compiled.program.info.ray_query ? 1 : 0);
 		if (!settings.spirv.empty()) {
 			std::ofstream out(settings.spirv, std::ios::binary);
@@ -108,13 +109,26 @@ int Probe(const char* path, const Settings& settings) {
 	return native == bvh && bvh != 0 ? 0 : 2;
 }
 
+int Usage() {
+	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] (<shader.bin>... | --cache <file.code> --hash <hex>)\n");
+	return 64;
+}
+
+bool ParseShaderHash(std::string_view input, uint64_t& hash) {
+	if (input.starts_with("0x") || input.starts_with("0X")) input.remove_prefix(2);
+	const auto [end, error] = std::from_chars(input.data(), input.data() + input.size(), hash, 16);
+	return error == std::errc{} && end == input.data() + input.size() && hash != 0;
+}
+
 }
 
 int main(int argc, char** argv) {
 	Settings settings;
-	int      failures = 0, files = 0;
+	std::vector<std::pair<const char*, Settings>> files;
+	const char* cachePath = nullptr;
+	const char* cacheHash = nullptr;
 	for (int i = 1; i < argc; ++i) {
-		const std::string arg = argv[i];
+		const std::string_view arg = argv[i];
 		if (arg == "--wave" && i + 1 < argc) {
 			settings.wave = static_cast<uint32_t>(std::atoi(argv[++i]));
 		} else if (arg == "--user" && i + 1 < argc) {
@@ -135,14 +149,54 @@ int main(int argc, char** argv) {
 		} else if (arg == "--spirv" && i + 1 < argc) {
 			settings.spirv = argv[++i];
 			settings.emit  = true;
+		} else if (arg == "--cache") {
+			if (cachePath || i + 1 >= argc) return Usage();
+			cachePath = argv[++i];
+		} else if (arg == "--hash") {
+			if (cacheHash || i + 1 >= argc) return Usage();
+			cacheHash = argv[++i];
 		} else {
-			++files;
-			if (Probe(argv[i], settings) != 0) ++failures;
+			files.emplace_back(argv[i], settings);
 		}
 	}
-	if (files == 0) {
-		std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] <shader.bin>...\n");
-		return 64;
+	if (cachePath || cacheHash) {
+		uint64_t hash = 0;
+		if (!cachePath || !*cachePath || !cacheHash || !files.empty() || !ParseShaderHash(cacheHash, hash)) return Usage();
+		std::ifstream cache(cachePath, std::ios::binary);
+		if (!cache) {
+			std::fprintf(stderr, "%s: cannot open manifest cache\n", cachePath);
+			return 2;
+		}
+		if (!settings.spirv.empty()) {
+			std::error_code error;
+			if (std::filesystem::equivalent(cachePath, settings.spirv, error)) {
+				std::fprintf(stderr, "%s: SPIR-V output aliases the manifest cache\n", settings.spirv.c_str());
+				return 2;
+			}
+			if (error && error != std::errc::no_such_file_or_directory) {
+				std::fprintf(stderr, "%s: cannot verify SPIR-V output path: %s\n", settings.spirv.c_str(), error.message().c_str());
+				return 2;
+			}
+		}
+		std::vector<uint32_t> code;
+		try {
+			code = AgcDriver::ReadCachedShaderCode(cache, hash);
+		} catch (const std::exception& error) {
+			std::fprintf(stderr, "%s: shader %s: %s\n", cachePath, cacheHash, error.what());
+			return 2;
+		}
+		return Probe(cacheHash, code, hash, settings) == 0 ? 0 : 2;
 	}
-	return failures == 0 ? 0 : 2;
+	if (files.empty()) return Usage();
+	bool failed = false;
+	for (const auto& [path, options] : files) {
+		std::vector<uint32_t> code;
+		if (!Read(path, code)) {
+			std::printf("%s: unreadable\n", path);
+			failed = true;
+			continue;
+		}
+		if (Probe(path, code, HashOf(path), options) != 0) failed = true;
+	}
+	return failed ? 2 : 0;
 }

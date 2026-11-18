@@ -440,6 +440,12 @@ default) recompiles such a shader offline, from its raw machine code, as the dri
 prints, per file, its BVH intersections, how many of them trace with ray queries, and the TLAS source and instance
 record layout derived for them, and exits with 0 only when every intersection does. `--dump` adds the IR, `--off`
 compiles as with `KYTY_NATIVE_RT=0`.
+
+To probe directly from the game's local pipeline manifest code cache, use
+`kyty_rt_probe --cache _PipelineCache/<title>_<version>.code --hash 0x<shader-hash>`.
+Use the compute shader hash from the log. The probe verifies the selected record and reads the cache without
+writing to it. Supply `--wave`, `--group` and the other shader settings as needed. The cache stores the program bytes.
+
 Fallbacks instead of stops (`KYTY_FALLBACKS`, on by default on Linux; off on Windows, where the C++ exception that carries a fallback is not caught across the guest libc yet): KytyPS5 stops the emulator (`EXIT`, `EXIT_IF`,
 `EXIT_NOT_IMPLEMENTED`) on anything it does not handle. Where the stop concerns one draw or one dispatch and nothing else
 depends on it, the build skips that draw or dispatch instead and writes one `[HACK]` line the first time per shader,
