@@ -1658,7 +1658,8 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 				return;
 			}
 		}
-		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size)) {
+		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size) &&
+		    !Libs::LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 			EXIT("BufferCache: failed to read mapped guest image backing\n");
 		}
 	});
