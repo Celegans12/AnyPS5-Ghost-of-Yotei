@@ -1,7 +1,7 @@
 include(ExternalProject)
 
-if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "ANYPS5_GPU_BACKEND=kyty is built on Linux only for now")
+if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT MINGW)
+    message(FATAL_ERROR "ANYPS5_GPU_BACKEND=kyty is built on Linux and on Windows with MinGW-w64 GCC only")
 endif()
 if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     message(FATAL_ERROR "ANYPS5_GPU_BACKEND=kyty links Clang-built Kyty code against GCC's libstdc++; build AnyPS5 with GCC")
@@ -13,7 +13,26 @@ get_filename_component(ANYPS5_KYTY_GCC_INSTALL_DIR "${anyps5KytyLibgcc}" DIRECTO
 cmake_host_system_information(RESULT anyps5KytyCores QUERY NUMBER_OF_LOGICAL_CORES)
 math(EXPR anyps5KytyJobs "(${anyps5KytyCores} + 1) / 2")
 set(ANYPS5_KYTY_JOBS "${anyps5KytyJobs}" CACHE STRING "Parallel jobs of the kyty_gpu sub-build")
-option(ANYPS5_KYTY_THIN_LTO "Build kyty_gpu with ThinLTO and pre-link it with lld into one native object" ON)
+if(WIN32)
+    set(anyps5KytyThinLtoDefault OFF)
+else()
+    set(anyps5KytyThinLtoDefault ON)
+endif()
+option(ANYPS5_KYTY_THIN_LTO "Build kyty_gpu with ThinLTO and pre-link it with lld into one native object (Linux only)" ${anyps5KytyThinLtoDefault})
+set(anyps5KytyPlatformArgs "")
+if(WIN32)
+    if(ANYPS5_KYTY_THIN_LTO)
+        message(FATAL_ERROR "ANYPS5_KYTY_THIN_LTO pre-links kyty_gpu with lld -r, which lld cannot do for Windows objects: configure with -DANYPS5_KYTY_THIN_LTO=OFF")
+    endif()
+    get_filename_component(anyps5KytyGccBin "${CMAKE_CXX_COMPILER}" DIRECTORY)
+    get_filename_component(anyps5KytySysroot "${anyps5KytyGccBin}" DIRECTORY)
+    set(ANYPS5_KYTY_SYSROOT "${anyps5KytySysroot}" CACHE PATH "MinGW-w64 installation whose headers and libstdc++ Clang compiles kyty_gpu against")
+    set(anyps5KytyPlatformArgs
+        -DCMAKE_C_COMPILER_TARGET=x86_64-w64-windows-gnu
+        -DCMAKE_CXX_COMPILER_TARGET=x86_64-w64-windows-gnu
+        -DCMAKE_SYSROOT=${ANYPS5_KYTY_SYSROOT}
+    )
+endif()
 
 set(ANYPS5_KYTY_BINARY_DIR "${CMAKE_BINARY_DIR}/core/kyty")
 if(ANYPS5_KYTY_THIN_LTO)
@@ -44,6 +63,7 @@ ExternalProject_Add(kyty_gpu
         -DKYTY_GCC_INSTALL_DIR=${ANYPS5_KYTY_GCC_INSTALL_DIR}
         -DKYTY_THIN_LTO=${ANYPS5_KYTY_THIN_LTO}
         -DKYTY_THIN_LTO_JOBS=${ANYPS5_KYTY_JOBS}
+        ${anyps5KytyPlatformArgs}
     BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target kyty_gpu_bundle --parallel ${ANYPS5_KYTY_JOBS}
     INSTALL_COMMAND ""
     BUILD_ALWAYS ON
@@ -81,7 +101,11 @@ target_compile_definitions(anyps5_kyty_gpu
         TRACY_DELAYED_INIT
         TRACY_MANUAL_LIFETIME
 )
-target_link_libraries(anyps5_kyty_gpu INTERFACE ${ANYPS5_KYTY_ARCHIVES} ${CMAKE_DL_LIBS} pthread)
+if(WIN32)
+    target_link_libraries(anyps5_kyty_gpu INTERFACE ${ANYPS5_KYTY_ARCHIVES} $<TARGET_LINKER_FILE:libkernel> $<TARGET_LINKER_FILE:libc> pthread psapi dbghelp ws2_32 synchronization secur32)
+else()
+    target_link_libraries(anyps5_kyty_gpu INTERFACE ${ANYPS5_KYTY_ARCHIVES} ${CMAKE_DL_LIBS} pthread)
+endif()
 if(ANYPS5_KYTY_THIN_LTO)
     target_link_options(anyps5_kyty_gpu INTERFACE "$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:LINKER:--gc-sections>")
 endif()

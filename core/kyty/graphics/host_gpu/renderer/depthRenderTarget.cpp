@@ -189,9 +189,12 @@ static TextureCache::ImageDesc MakeDepthTargetDesc(const CommandBuffer& buffer,
 		    (stencil_address & 0xffffu) != 0) {
 			DepthFatal("unsupported stencil attachment state");
 		}
-	} else if (z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0) {
+	}
+#if !defined(ANYPS5_KYTY)
+	else if (z.stencil_read_base_addr != 0 || z.stencil_write_base_addr != 0) {
 		DepthFatal("stencil state without an active stencil attachment");
 	}
+#endif
 	if (has_htile) {
 		if (z.htile_data_base_addr == 0 || (z.htile_data_base_addr & 0x7fffu) != 0) {
 			DepthFatal("invalid HTile metadata address");

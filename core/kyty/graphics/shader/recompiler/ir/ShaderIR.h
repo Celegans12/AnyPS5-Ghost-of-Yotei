@@ -908,7 +908,11 @@ struct ResourcePlan {
 		std::vector<uint32_t>     material_keys;
 		std::vector<SelectorKeys> selector_keys;
 	};
+#if defined(ANYPS5_KYTY)
+	static constexpr uint32_t                             ThreadScratchSlots = 3;
+#else
 	static constexpr uint32_t                             ThreadScratchSlots = 2;
+#endif
 	mutable std::array<std::unique_ptr<ThreadScratch>, ThreadScratchSlots> thread_scratch;
 };
 

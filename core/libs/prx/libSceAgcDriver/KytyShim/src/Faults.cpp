@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/KytyShim/src/Faults.hpp"
 
 #include "common/debugCounters.h"
+#include "common/guardedCopy.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 #include "kernel/memory.h"
@@ -9,7 +10,11 @@
 
 #include <cstddef>
 #include <cstdint>
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <ucontext.h>
+#endif
 
 #if !defined(ANYPS5_KYTY)
 #error "KytyShim is built only with ANYPS5_GPU_BACKEND=kyty"
@@ -19,6 +24,16 @@ namespace KytyShim {
 namespace {
 
 using GpuAccess = Libs::Graphics::PageFaultAccess;
+
+#ifdef _WIN32
+using FaultContext = CONTEXT;
+
+void CompleteWalkerLoad(FaultContext& context, std::uint32_t length, std::uint32_t value) {
+    context.Rax = value;
+    context.Rip += length;
+}
+#else
+using FaultContext = ucontext_t;
 
 constexpr std::uint64_t PageFaultWrite = 1u << 1;
 constexpr std::uint64_t PageFaultFetch = 1u << 4;
@@ -30,25 +45,19 @@ GpuAccess DecodeAccess(const ucontext_t& context) {
     return GpuAccess::Read;
 }
 
-void CompleteWalkerLoad(ucontext_t& context, std::uint32_t length, std::uint32_t value) {
+void CompleteWalkerLoad(FaultContext& context, std::uint32_t length, std::uint32_t value) {
     context.uc_mcontext.gregs[REG_RAX] = static_cast<greg_t>(value);
     context.uc_mcontext.gregs[REG_RIP] += static_cast<greg_t>(length);
 }
+#endif
 
 bool PrepareHostWrite(std::uintptr_t address, std::size_t bytes) {
     return Libs::LibKernel::Memory::TryPrepareHostWrite(address, bytes);
 }
 
-}
-
-bool HandleHostFault(int signal, siginfo_t* info, void* native) {
+bool ResolveFault(FaultContext& context, GpuAccess access, std::uint64_t address, std::uint64_t rip) {
     namespace Memory = Libs::LibKernel::Memory;
     namespace Walker = Libs::Graphics::ShaderRecompiler::IR;
-    if ((signal != SIGSEGV && signal != SIGBUS) || info == nullptr || native == nullptr) return false;
-    auto& context = *static_cast<ucontext_t*>(native);
-    const auto address = reinterpret_cast<std::uint64_t>(info->si_addr);
-    const auto rip = static_cast<std::uint64_t>(context.uc_mcontext.gregs[REG_RIP]);
-    const auto access = DecodeAccess(context);
     if (access == GpuAccess::Read) {
         if (const auto length = Walker::SrtWalkerLoadLength(rip); length != 0) {
             std::uint32_t value = 0;
@@ -73,6 +82,38 @@ bool HandleHostFault(int signal, siginfo_t* info, void* native) {
     return false;
 }
 
+}
+
+#ifdef _WIN32
+bool HandleHostFault(void* exceptionPointers) {
+    auto* exception = static_cast<EXCEPTION_POINTERS*>(exceptionPointers);
+    if (exception == nullptr || exception->ExceptionRecord == nullptr || exception->ContextRecord == nullptr) return false;
+    const auto& record = *exception->ExceptionRecord;
+    if (record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION || record.NumberParameters < 2) return false;
+    const auto access = record.ExceptionInformation[0] == 8 ? GpuAccess::Execute : record.ExceptionInformation[0] == 1 ? GpuAccess::Write : GpuAccess::Read;
+    if (Common::ResumeGuardedCopy(exception->ContextRecord)) return true;
+    const DWORD lastError = GetLastError();
+    const bool handled = ResolveFault(*exception->ContextRecord, access, static_cast<std::uint64_t>(record.ExceptionInformation[1]), static_cast<std::uint64_t>(exception->ContextRecord->Rip));
+    SetLastError(lastError);
+    return handled;
+}
+
+void InstallFaultChain() {
+    GuestArena::GuestArenaSetHostWritePreparer_nid_no_patch(&PrepareHostWrite);
+    GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(&HandleHostFault);
+}
+
+void RemoveFaultChain() {
+    GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(nullptr);
+    GuestArena::GuestArenaSetHostWritePreparer_nid_no_patch(nullptr);
+}
+#else
+bool HandleHostFault(int signal, siginfo_t* info, void* native) {
+    if ((signal != SIGSEGV && signal != SIGBUS) || info == nullptr || native == nullptr) return false;
+    auto& context = *static_cast<ucontext_t*>(native);
+    return ResolveFault(context, DecodeAccess(context), reinterpret_cast<std::uint64_t>(info->si_addr), static_cast<std::uint64_t>(context.uc_mcontext.gregs[REG_RIP]));
+}
+
 void InstallFaultChain() {
     GuestArena::GuestArenaSetHostWritePreparer_nid_no_patch(&PrepareHostWrite);
     GuestWriteWatch::GuestWriteWatchSetGpuFaultHandler_nid_no_patch(&HandleHostFault);
@@ -82,5 +123,6 @@ void RemoveFaultChain() {
     GuestWriteWatch::GuestWriteWatchSetGpuFaultHandler_nid_no_patch(nullptr);
     GuestArena::GuestArenaSetHostWritePreparer_nid_no_patch(nullptr);
 }
+#endif
 
 }

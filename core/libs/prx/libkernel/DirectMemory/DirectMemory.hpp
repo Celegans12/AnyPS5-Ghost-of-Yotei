@@ -66,6 +66,7 @@ inline constexpr std::uint64_t DirectMemoryViewReplacing = ~std::uint64_t{0} - 2
 extern "C" {
 using DirectMemoryViewObserver = void (*)(std::uintptr_t address, std::size_t bytes, std::uint64_t viewOffset);
 bool DirectMemoryEnableView_nid_no_patch(DirectMemoryViewObserver observer, std::uint8_t** view, std::size_t* guestBytes, std::size_t* viewBytes);
+bool DirectMemoryViewFiles_nid_no_patch(int* guestFile, int* directFile);
 using DirectMemoryProtectionObserver = void (*)(std::uintptr_t address, std::size_t bytes, int protection);
 void DirectMemoryWatchProtections_nid_no_patch(DirectMemoryProtectionObserver observer);
 std::size_t DirectMemorySize_nid_no_patch();

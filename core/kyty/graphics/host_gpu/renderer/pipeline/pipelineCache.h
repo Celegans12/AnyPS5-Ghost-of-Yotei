@@ -27,6 +27,9 @@
 #include <queue>
 #include <functional>
 #include <span>
+#if defined(ANYPS5_KYTY)
+#include <source_location>
+#endif
 #include <stop_token>
 #include <string>
 #include <thread>
@@ -353,6 +356,10 @@ public:
 	[[nodiscard]] static uint64_t AheadWritesSequence();
 	static void SyncAheadWrites(uint64_t sequence);
 	static void BeginAheadThread(uint32_t slot);
+#if defined(ANYPS5_KYTY)
+	[[nodiscard]] static bool NarrowProgramLock();
+	static void BeginExecuteThread();
+#endif
 	const ShaderModule* GetComputeProgramAhead(const HW::ComputeShaderInfo& regs,
 	                                           ShaderComputeInputInfo&      input_info,
 	                                           ProgramResolution&           ahead);
@@ -408,6 +415,10 @@ private:
 		template <bool HasCalls>
 		ShaderModule* FindModule(const ShaderRecompiler::IR::SrtRuntime& runtime,
 		                         uint32_t push_data_cursor, bool& failed);
+#if defined(ANYPS5_KYTY)
+		template <bool HasCalls>
+		ShaderModule* MatchModule(uint32_t push_data_cursor);
+#endif
 	};
 
 	struct ProgramKey {
@@ -485,7 +496,11 @@ private:
 	                 const ShaderRecompiler::CompileOptions& options,
 	                 std::span<const uint32_t> code, uint32_t push_data_cursor);
 	void DestroyModule(const ShaderModule& module) const;
+#if defined(ANYPS5_KYTY)
+	void LockPrograms(std::source_location where = std::source_location::current());
+#else
 	void LockPrograms();
+#endif
 	void UnlockPrograms();
 	template <typename InputInfo>
 	void QueueCompile(const ProgramKey& key, const ShaderParams& params, const InputInfo& input_info,
