@@ -53,6 +53,10 @@ auto OutputOrder(const auto& output) {
 	return std::tuple {output.key, output.kind, output.size};
 }
 
+auto OutputPlace(const auto& output) {
+	return std::tuple {output.key, output.kind};
+}
+
 }
 
 RayTracingCheck::RayTracingCheck(RenderContext& context): m_context(context) {}
@@ -204,12 +208,12 @@ bool RayTracingCheck::Collect(const PreparedBindings& bindings, std::vector<Outp
 		if (source.address == 0 || view.buffer == nullptr || view.range == 0) {
 			continue;
 		}
-		if (view.range == VK_WHOLE_SIZE) {
+		if (view.range == VK_WHOLE_SIZE || view.range < source.size) {
 			reason = "writes a buffer without a bounded view";
 			return false;
 		}
-		outputs.push_back({.key = source.address, .size = view.range, .kind = 0, .buffer = view.buffer,
-		                   .offset = view.offset});
+		outputs.push_back({.key = source.address, .size = source.size, .kind = 0, .buffer = view.buffer,
+		                   .offset = view.offset + (view.range - source.size)});
 	}
 	for (uint32_t i = 0; i < program.info.images.size() && i < bindings.images.size(); i++) {
 		const auto& binding = bindings.images[i];
@@ -342,10 +346,20 @@ void RayTracingCheck::AfterGuest(const PreparedBindings& bindings) {
 	m_active = false;
 	std::vector<Output> guest;
 	std::string         reason;
-	const bool          same = Collect(bindings, guest, reason) && guest.size() == m_outputs.size() &&
-	                  std::equal(guest.begin(), guest.end(), m_outputs.begin(), [](const Output& a, const Output& b) {
-		                  return OutputOrder(a) == OutputOrder(b);
-	                  });
+	bool                same = Collect(bindings, guest, reason);
+	std::vector<Output> matched;
+	for (const auto& output: m_outputs) {
+		const auto found = std::find_if(guest.begin(), guest.end(), [&](const Output& candidate) {
+			return OutputPlace(candidate) == OutputPlace(output) && candidate.size >= output.size;
+		});
+		if (!same || found == guest.end()) {
+			same = false;
+			break;
+		}
+		auto& place = matched.emplace_back(*found);
+		place.size  = output.size;
+		place.at    = output.at;
+	}
 	if (!same) {
 		std::lock_guard lock(m_mutex);
 		Refuse(m_hash, reason.empty() ? std::string("the emulated variant writes other outputs") : reason);
@@ -355,7 +369,7 @@ void RayTracingCheck::AfterGuest(const PreparedBindings& bindings) {
 	auto& scheduler = m_context.GetCommandScheduler();
 	scheduler.EndRendering();
 	Barrier(scheduler.Current().Handle());
-	Copy(scheduler.Current().Handle(), guest, 2 * RegionBytes, false);
+	Copy(scheduler.Current().Handle(), matched, 2 * RegionBytes, false);
 	const auto command = scheduler.Current().Handle();
 	const auto offset  = uint64_t {m_slot} * ResultBytes;
 	command.fillBuffer(m_results->Handle(), offset, 4, 0);
@@ -382,7 +396,7 @@ void RayTracingCheck::AfterGuest(const PreparedBindings& bindings) {
 	{
 		std::lock_guard lock(m_mutex);
 		m_pending[m_slot].dwords  = push.count;
-		m_pending[m_slot].outputs = static_cast<uint32_t>(guest.size());
+		m_pending[m_slot].outputs = static_cast<uint32_t>(matched.size());
 	}
 	const auto slot = m_slot;
 	scheduler.DeferHostOperation([weak = weak_from_this(), slot] {
