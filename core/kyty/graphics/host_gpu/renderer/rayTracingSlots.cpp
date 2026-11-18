@@ -456,6 +456,9 @@ uint64_t RayTracing::UserPointer(const TlasSource& source, uint64_t pointer,
 	if (source.header_vsharp == ShaderRecompiler::IR::ShaderInfo::NoRayQuerySlot) {
 		return pointer;
 	}
+	if (source.header_vsharp == ShaderRecompiler::IR::ShaderInfo::UserDataRayQueryVsharp) {
+		return pointer & ((uint64_t {1} << 48u) - 1u);
+	}
 	std::array<uint32_t, 2> vsharp {};
 	if (pointer > UINT64_MAX - source.header_vsharp || !readable(pointer + source.header_vsharp, sizeof(vsharp))) {
 		return 0;

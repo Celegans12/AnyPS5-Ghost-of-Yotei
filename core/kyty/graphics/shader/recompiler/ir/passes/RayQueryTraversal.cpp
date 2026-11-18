@@ -2148,6 +2148,13 @@ bool DeriveHeaderSource(const Program& program, LaneMaskWalk& w) {
 		const auto* buffer = Producer(read->Arg(0), ValueOpcode::GetBufferResource);
 		const auto  base   = buffer != nullptr ? LoadOf(program, buffer->Arg(0)) : std::nullopt;
 		const auto  user   = base ? UserRegister(base->low) : std::nullopt;
+		if (const auto direct = buffer != nullptr && !base ? UserRegister(buffer->Arg(0)) : std::nullopt;
+		    direct && UserRegister(buffer->Arg(1)) == *direct + 1u) {
+			source.user_sgpr     = *direct;
+			source.header_vsharp = ShaderInfo::UserDataRayQueryVsharp;
+			source.header_offset = MemoryOf(program, *read).offset;
+			return true;
+		}
 		if (!user || UserRegister(base->high) != *user + 1u) return false;
 		source.user_sgpr     = *user;
 		source.header_vsharp = base->offset;

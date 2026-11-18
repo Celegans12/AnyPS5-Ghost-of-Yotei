@@ -608,6 +608,7 @@ struct Bindings {
 struct ShaderInfo {
 	static constexpr uint32_t NoRayQuerySlot  = 0xffffffffu;
 	static constexpr uint32_t UserDataRayQueryHeader = 0xffffffffu;
+	static constexpr uint32_t UserDataRayQueryVsharp = 0xfffffffeu;
 	static constexpr uint32_t MaxBufferRoots  = 64;
 	static constexpr uint32_t MaxImages       = 256;
 	static constexpr uint32_t MaxSamplers     = 256;
