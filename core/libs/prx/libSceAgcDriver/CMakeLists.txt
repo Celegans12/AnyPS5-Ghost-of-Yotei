@@ -63,6 +63,9 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
     file(GLOB kytyShimSources CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/src/*.cpp)
     list(FILTER kytyShimSources EXCLUDE REGEX "Tests\\.cpp$")
     list(FILTER kytyShimSources EXCLUDE REGEX "/(MemoryBacking|MemoryGpu)\\.cpp$")
+    if(ANYPS5_KYTY_DLL)
+        set(kytyShimSources ${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/host/DllHost.cpp)
+    endif()
     add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
             ${CMAKE_CURRENT_SOURCE_DIR}/Export.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/Unimplemented.cpp
@@ -123,6 +126,7 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         configure_host_test_executable(kyty_shim_entry_tests)
         add_test(NAME kyty_shim_entry COMMAND kyty_shim_entry_tests)
         set_tests_properties(kyty_shim_entry PROPERTIES TIMEOUT 20)
+        if(NOT ANYPS5_KYTY_DLL)
         add_test_executable(kyty_shim_system_content_tests
                 KytyShim/src/SystemContentTests.cpp
                 KytyShim/src/SystemContent.cpp)
@@ -131,6 +135,7 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         set_target_properties(kyty_shim_system_content_tests PROPERTIES CXX_EXTENSIONS OFF)
         add_test(NAME kyty_shim_system_content COMMAND kyty_shim_system_content_tests)
         set_tests_properties(kyty_shim_system_content PROPERTIES TIMEOUT 20)
+        endif()
         add_test_executable(kyty_shim_rt_probe_cache_tests KytyShim/tests/RtProbeCache.cpp KytyShim/tools/RtProbeCache.cpp)
         target_include_directories(kyty_shim_rt_probe_cache_tests PRIVATE KytyShim/tools
                 ${CMAKE_SOURCE_DIR}/3rdparty/xxHash ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
