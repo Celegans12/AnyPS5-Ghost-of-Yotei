@@ -46,14 +46,32 @@ const char* presentModeName(VkPresentModeKHR mode) {
 
 }
 
+HostGpuFacts CollectHostGpuIdentity(const VkPhysicalDeviceProperties& properties, const VkPhysicalDeviceDriverProperties* driver,
+                                   const VkPhysicalDeviceMemoryProperties& memory, std::uint32_t subgroupSize) {
+    HostGpuFacts gpu;
+    gpu.name = properties.deviceName;
+    gpu.type = deviceType(properties.deviceType);
+    gpu.vendorId = properties.vendorID;
+    gpu.deviceId = properties.deviceID;
+    gpu.apiVersion = properties.apiVersion;
+    gpu.driverVersion = properties.driverVersion;
+    gpu.subgroupSize = subgroupSize;
+    if (driver != nullptr) {
+        gpu.driverName = driver->driverName;
+        gpu.driverInfo = driver->driverInfo;
+        gpu.driverVersionScheme = driverVersionScheme(driver->driverID);
+    }
+    std::uint64_t largest = 0;
+    for (std::uint32_t index = 0; index < memory.memoryHeapCount && index < VK_MAX_MEMORY_HEAPS; ++index)
+        if ((memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) largest = std::max<std::uint64_t>(largest, memory.memoryHeaps[index].size);
+    gpu.deviceLocalMiB = largest / (1024u * 1024u);
+    return gpu;
+}
+
 HostGpuFacts CollectHostGpuFacts(const HostGpuQuery& query) {
     const auto has = [&](const char* name) {
         return std::any_of(query.extensions.begin(), query.extensions.end(), [&](const auto& item) { return std::strcmp(item.extensionName, name) == 0; });
     };
-    HostGpuFacts gpu;
-    gpu.candidates = query.candidates;
-    gpu.subgroupSize = query.subgroupSize;
-    gpu.requestedPresentMode = query.requestedPresentMode != nullptr ? query.requestedPresentMode : "";
     const auto properties2 = load<PFN_vkGetPhysicalDeviceProperties2>(query, "vkGetPhysicalDeviceProperties2");
     VkPhysicalDeviceDriverProperties driver{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
     VkPhysicalDeviceFloatControlsProperties floatControls{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FLOAT_CONTROLS_PROPERTIES};
@@ -67,23 +85,11 @@ HostGpuFacts CollectHostGpuFacts(const HostGpuQuery& query) {
     }
     if (hasFloatControls) *next = &floatControls;
     properties2(query.physical, &properties);
-    gpu.name = properties.properties.deviceName;
-    gpu.type = deviceType(properties.properties.deviceType);
-    gpu.vendorId = properties.properties.vendorID;
-    gpu.deviceId = properties.properties.deviceID;
-    gpu.apiVersion = properties.properties.apiVersion;
-    gpu.driverVersion = properties.properties.driverVersion;
-    if (hasDriver) {
-        gpu.driverName = driver.driverName;
-        gpu.driverInfo = driver.driverInfo;
-        gpu.driverVersionScheme = driverVersionScheme(driver.driverID);
-    }
     VkPhysicalDeviceMemoryProperties memory{};
     load<PFN_vkGetPhysicalDeviceMemoryProperties>(query, "vkGetPhysicalDeviceMemoryProperties")(query.physical, &memory);
-    std::uint64_t largest = 0;
-    for (std::uint32_t index = 0; index < memory.memoryHeapCount && index < VK_MAX_MEMORY_HEAPS; ++index)
-        if ((memory.memoryHeaps[index].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) != 0) largest = std::max<std::uint64_t>(largest, memory.memoryHeaps[index].size);
-    gpu.deviceLocalMiB = largest / (1024u * 1024u);
+    auto gpu = CollectHostGpuIdentity(properties.properties, hasDriver ? &driver : nullptr, memory, query.subgroupSize);
+    gpu.candidates = query.candidates;
+    gpu.requestedPresentMode = query.requestedPresentMode != nullptr ? query.requestedPresentMode : "";
 
     VkPhysicalDevice8BitStorageFeatures bytes{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_8BIT_STORAGE_FEATURES};
     VkPhysicalDeviceBufferDeviceAddressFeatures address{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};

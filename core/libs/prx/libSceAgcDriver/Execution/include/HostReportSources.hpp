@@ -2,10 +2,12 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_HOSTREPORTSOURCES_HPP
 
 #include "prx/libSceAgcDriver/Execution/include/HostReport.hpp"
+#include <filesystem>
 
 namespace AgcDriver {
 
-HostSources SystemHostSources();
+HostSources SystemHostSources(std::function<HostShaderCacheFacts()> shaderCache = {});
+HostShaderCacheFacts CollectHostShaderCache(const std::filesystem::path& directory);
 
 }
 
