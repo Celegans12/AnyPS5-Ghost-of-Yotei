@@ -1472,6 +1472,7 @@ struct LaneMaskWalk {
 	Inst*                 wave_box       = nullptr;
 	Inst*                 wave_triangles = nullptr;
 	Inst*                 wave_copy      = nullptr;
+	std::vector<Inst*>    wave_pushes;
 	AddressLoad           record;
 	RayTracingLayout      layout;
 	NativeTraversals      source;
@@ -2107,6 +2108,9 @@ bool NestedBlasWalk(const Program& program, Inst& bvh, Inst& tlas, BlasWalk& b) 
 	return true;
 }
 
+bool MatchWaveBlas(const Program& program, std::span<Inst* const> tests, uint32_t box, LaneMaskWalk& s);
+bool TlasNodeCount80(const Program& program, const LaneMaskWalk& s);
+
 bool MatchLaneMaskWalk(Program& program, Inst& bvh, LaneMaskWalk& w) {
 	const auto* descriptor = Producer(bvh.Arg(0), ValueOpcode::CompositeConstructU32x4);
 	const auto* address    = Producer(bvh.Arg(1), ValueOpcode::MakeImageAddress);
@@ -2165,16 +2169,26 @@ bool MatchLaneMaskWalk(Program& program, Inst& bvh, LaneMaskWalk& w) {
 	for (uint32_t arg = 1; arg < 8; ++arg) {
 		w.ray[(arg + 5) % 7] = address->Arg(arg);
 	}
+	std::vector<Inst*> others;
 	for (auto at = first; at <= last; ++at) {
 		for (auto& inst: *program.blocks[at]) {
-			if (inst.GetOpcode() != ValueOpcode::BvhIntersect || &inst == &bvh) continue;
-			BlasWalk blas;
-			if (!NestedBlasWalk(program, inst, bvh, blas)) return false;
-			w.blases.push_back(std::move(blas));
+			if (inst.GetOpcode() == ValueOpcode::BvhIntersect && &inst != &bvh) others.push_back(&inst);
 		}
 	}
-	if (w.blases.empty() || !DeriveLaneLayout(program, w) || !DeriveHeaderSource(program, w))
+	for (auto* other: others) {
+		BlasWalk blas;
+		if (!NestedBlasWalk(program, *other, bvh, blas)) {
+			w.blases.clear();
+			break;
+		}
+		w.blases.push_back(std::move(blas));
+	}
+	if (w.blases.empty() &&
+	    (others.size() != 2 || !(MatchWaveBlas(program, others, 0, w) || MatchWaveBlas(program, others, 1, w))))
 		return false;
+	if (!DeriveLaneLayout(program, w) || !DeriveHeaderSource(program, w))
+		return false;
+	if (w.blases.empty()) w.layout.node_count_80 = TlasNodeCount80(program, w);
 	w.source.root   = *root;
 	w.source.layout = w.layout.Pack();
 	uint32_t begin = UINT32_MAX;
@@ -2225,7 +2239,7 @@ void RewriteLaneMaskWalk(Program& program, LaneMaskWalk& w, uint32_t site) {
 	const auto flags = [site](auto variant) {
 		return RayQueryFlags(site, static_cast<uint32_t>(variant));
 	};
-	const auto lane_leaf = flags(RayQueryKeyLaneLeaf);
+	const auto key = w.blases.empty() ? flags(0u) : flags(RayQueryKeyLaneLeaf);
 
 	const Inserter entry {w.preheader, w.preheader->end()};
 	if (!w.lanes_without.IsEmpty()) {
@@ -2250,8 +2264,8 @@ void RewriteLaneMaskWalk(Program& program, LaneMaskWalk& w, uint32_t site) {
 
 	const Inserter at {w.exit, Position(*w.exit_ref)};
 	at(Op::RayQueryMark, {}, flags(RayQueryMarkKind::Resolve));
-	const auto next  = at(Op::RayQueryNext, {}, lane_leaf);
-	const auto match = at(Op::RayQueryMatch, {}, lane_leaf);
+	const auto next  = at(Op::RayQueryNext, {}, key);
+	const auto match = at(Op::RayQueryMatch, {}, key);
 	const auto has =
 	    at(Op::INotEqual32, {at(Op::CompositeExtractU32x4, {next, Value(2u)}), Value(0u)});
 	const auto instance = at(Op::CompositeExtractU32x4, {next, Value(0u)});
@@ -2266,7 +2280,18 @@ void RewriteLaneMaskWalk(Program& program, LaneMaskWalk& w, uint32_t site) {
 	const Inserter leave {w.merge, AfterPhis(*w.merge)};
 	leave(Op::RayQueryMark, {}, flags(RayQueryMarkKind::Exit));
 
-	RewriteBlasWalks(program, w.blases, any, lane_leaf);
+	RewriteBlasWalks(program, w.blases, any, key);
+	for (auto* push: w.wave_pushes) {
+		const Inserter in {push->Parent(), Position(*push)};
+		push->SetArg(1, in(Op::SelectU32, {any, in(Op::RayQuerySelectedLeaf, {}, key), push->Arg(1)}));
+	}
+	if (w.blases.empty() && w.wave_node != nullptr) {
+		Block *pre = nullptr, *latch = nullptr, *merge = nullptr;
+		LoopShape(w.wave_header, pre, latch, merge);
+		const Inserter blas {pre, pre->end()};
+		const auto     root = Incoming(*w.wave_node, pre);
+		w.wave_node->SetArg(root, blas(Op::SelectU32, {any, blas(Op::RayQuerySelectedLeaf, {}, key), w.wave_node->Arg(root)}));
+	}
 }
 
 struct LaneAlpha {
@@ -2360,8 +2385,37 @@ bool WalkReach(const Program& program, const Block* header, const Block* latch, 
 	return true;
 }
 
+std::optional<std::pair<Value, uint32_t>> StackSlot(Value lane) {
+	const auto masked = Operands(lane, ValueOpcode::BitwiseAnd32, [](Value side) {
+		return Immediate(side) == 63u || Immediate(side) == 31u;
+	});
+	if (!masked) return std::nullopt;
+	const auto below = 0u - (*Immediate(masked->first) + 1u);
+	const auto index = Canonical(masked->second);
+	if (const auto split = Operands(index, ValueOpcode::IAdd32, [&](Value side) { return Immediate(side) == below; }))
+		return std::pair {Canonical(split->second), below};
+	return std::pair {index, 0u};
+}
+
+Inst* StackPush(Value entry) {
+	if (auto* push = Producer(entry, ValueOpcode::WriteLane); push != nullptr) return push;
+	const auto* join = Producer(entry, ValueOpcode::Phi);
+	Inst*       push = nullptr;
+	for (size_t arg = 0; join != nullptr && arg < join->NumArgs(); ++arg) {
+		auto* write = Producer(join->Arg(arg), ValueOpcode::WriteLane);
+		if (write == nullptr) continue;
+		if (push != nullptr) return nullptr;
+		push = write;
+	}
+	for (size_t arg = 0; push != nullptr && arg < join->NumArgs(); ++arg) {
+		const auto value = join->Arg(arg).Resolve();
+		if (value != Value(push) && value != push->Arg(0).Resolve()) return nullptr;
+	}
+	return push;
+}
+
 Value WaveRoot(const Program& program, const Inst* address, const Block* header, const Block* pre,
-               const Block* latch, Inst** phi = nullptr) {
+               const Block* latch, Inst** phi = nullptr, std::vector<Inst*>* pushes = nullptr) {
 	std::vector<Value> nodes {Canonical(address->Arg(0))};
 	const Inst*        node = nullptr;
 	for (size_t at = 0; at < nodes.size() && at < 16 && node == nullptr; ++at) {
@@ -2374,26 +2428,36 @@ Value WaveRoot(const Program& program, const Inst* address, const Block* header,
 		for (size_t arg = 0; arg < phi->NumArgs(); ++arg)
 			nodes.push_back(Canonical(phi->Arg(arg)));
 	}
-	Value root;
+	Value              root;
+	std::vector<Inst*> found;
 	if (node == nullptr) {
-		const auto* top   = Producer(nodes[0], ValueOpcode::ReadLane);
-		const auto* stack = top != nullptr ? LoopPhi(top->Arg(0), header) : nullptr;
-		const auto* push  = stack != nullptr ? Producer(IncomingValue(*stack, pre), ValueOpcode::WriteLane) : nullptr;
-		const auto  low6  = [](Value value) {
-			const auto pair = Operands(value, ValueOpcode::BitwiseAnd32, [](Value side) { return Immediate(side) == 63u; });
-			return pair ? Canonical(pair->second) : Value {};
-		};
-		const auto  index = top != nullptr ? low6(top->Arg(1)) : Value {};
-		const auto  below = !index.IsEmpty() ? Operands(index, ValueOpcode::IAdd32, [](Value side) { return Immediate(side) == ~0u; })
-		                                     : std::nullopt;
-		const auto* sp    = below ? LoopPhi(below->second, header) : nullptr;
-		const auto  above = sp != nullptr ? Operands(IncomingValue(*sp, pre), ValueOpcode::IAdd32,
-		                                             [](Value side) { return Immediate(side) == 1u; })
-		                                  : std::nullopt;
-		if (push == nullptr || !above || low6(push->Arg(2)).IsEmpty() || low6(push->Arg(2)) != Canonical(above->second))
-			return {};
-		root = push->Arg(1).Resolve();
+		std::vector<const Inst*> tops;
+		if (const auto* top = Producer(nodes[0], ValueOpcode::ReadLane); top != nullptr) {
+			tops.push_back(top);
+		} else if (const auto* pop = Producer(nodes[0], ValueOpcode::Phi); pop != nullptr) {
+			for (size_t arg = 0; arg < pop->NumArgs(); ++arg)
+				tops.push_back(Producer(pop->Arg(arg), ValueOpcode::ReadLane));
+		}
+		if (tops.empty()) return {};
+		for (const auto* top: tops) {
+			const auto* stack = top != nullptr ? LoopPhi(top->Arg(0), header) : nullptr;
+			auto*       push  = stack != nullptr ? StackPush(IncomingValue(*stack, pre)) : nullptr;
+			const auto  slot  = top != nullptr ? StackSlot(top->Arg(1)) : std::nullopt;
+			const auto  below = slot ? Operands(slot->first, ValueOpcode::IAdd32, [](Value side) { return Immediate(side) == ~0u; })
+			                         : std::nullopt;
+			const auto* sp    = below ? LoopPhi(below->second, header) : nullptr;
+			const auto  above = sp != nullptr ? Operands(IncomingValue(*sp, pre), ValueOpcode::IAdd32,
+			                                             [](Value side) { return Immediate(side) == 1u; })
+			                                  : std::nullopt;
+			const auto  pushed = push != nullptr ? StackSlot(push->Arg(2)) : std::nullopt;
+			if (!above || !pushed || pushed->first != Canonical(above->second) || pushed->second != slot->second ||
+			    (!root.IsEmpty() && push->Arg(1).Resolve() != root))
+				return {};
+			root = push->Arg(1).Resolve();
+			found.push_back(push);
+		}
 	}
+	if (pushes != nullptr) *pushes = std::move(found);
 	if (phi != nullptr) *phi = const_cast<Inst*>(node);
 	return node != nullptr ? IncomingValue(*node, pre) : root;
 }
@@ -2432,7 +2496,7 @@ bool MatchWaveBlas(const Program& program, std::span<Inst* const> tests, uint32_
 		pre    = outer_pre;
 		latch  = outer_latch;
 	}
-	const auto root = WaveRoot(program, address, header, pre, latch, &s.wave_node);
+	const auto root = WaveRoot(program, address, header, pre, latch, &s.wave_node, &s.wave_pushes);
 	if (root.IsEmpty()) return false;
 	s.wave_header    = header;
 	s.wave_latch     = latch;
