@@ -209,6 +209,44 @@ void GuestGpu::SendUrgentCommandSync(Common::UniqueFunction<void>&& command, boo
 		SendCommandSync(std::move(command));
 		return;
 	}
+	PostUrgentCommandSync(std::move(command), drain_copies);
+}
+
+bool GuestGpu::OrderedReadbacks() noexcept {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_CP_ORDERED_READBACK");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
+void GuestGpu::SendReadbackCommandSync(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (m_pipelined && g_cp_thread && OrderedReadbacks()) {
+		PostUrgentCommandSync(std::move(command), false);
+		return;
+	}
+	SendUrgentCommandSync(std::move(command), false);
+}
+
+uint64_t GuestGpu::WaitForOrderedOperations(uint64_t begin, uint64_t end) {
+	EXIT_IF(!g_cp_thread);
+	ForgetExecutedWrites();
+	uint64_t needed = m_cp_ordered;
+	for (size_t i = 0; i < m_pending_count; i++) {
+		const auto& write = m_pending_writes[(m_pending_first + i) % PendingWriteCapacity];
+		if (write.address < end && begin < write.address + write.size) {
+			needed = std::max(needed, write.sequence);
+		}
+	}
+	needed = std::min(needed, m_emitted);
+	if (needed != 0) {
+		WaitForExecution(needed);
+	}
+	return m_emitted - std::max(needed, m_executed.Load());
+}
+
+void GuestGpu::PostUrgentCommandSync(Common::UniqueFunction<void>&& command, bool drain_copies) {
 	std::binary_semaphore done {0};
 	{
 		std::lock_guard lock(m_urgent_mutex);
@@ -385,6 +423,7 @@ void GuestGpu::ReadDecisionMemory(const volatile void* address, void* value, siz
 		}
 		if (write->known && write->address <= begin && end <= write->address + write->size) {
 			std::memcpy(value, write->value + (begin - write->address), size);
+			NoteOrderedSequence(write->sequence);
 			return;
 		}
 		WaitForExecution(write->sequence);
@@ -434,6 +473,9 @@ void GuestGpu::ExecutionThread() {
 		const auto sequence = operation->sequence;
 		operation.reset();
 		m_executed.Publish(sequence);
+		if ((sequence & 1023u) == 0) {
+			BufferCache::LogReadbackSummary();
+		}
 		if (++unnotified >= NotifyInterval) {
 			m_executed.Notify();
 			unnotified = 0;
@@ -1658,6 +1700,7 @@ void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands,
 void CommandProcessor::SyncFetchWithExecution() {
 	if (m_pipeline != nullptr) {
 		m_fetch_sync_sequence = m_pipeline->NextSequence() - 1;
+		m_pipeline->NoteOrderedSequence(m_fetch_sync_sequence);
 	}
 }
 

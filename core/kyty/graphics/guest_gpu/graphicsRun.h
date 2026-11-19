@@ -9,6 +9,7 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/scout.h"
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -35,6 +36,10 @@ public:
 	void               SendCommand(Common::UniqueFunction<void>&& command);
 	void               SendCommandSync(Common::UniqueFunction<void>&& command);
 	void SendUrgentCommandSync(Common::UniqueFunction<void>&& command, bool drain_copies = true);
+	void SendReadbackCommandSync(Common::UniqueFunction<void>&& command);
+	uint64_t WaitForOrderedOperations(uint64_t begin, uint64_t end);
+	void NoteOrderedSequence(uint64_t sequence) noexcept { m_cp_ordered = std::max(m_cp_ordered, sequence); }
+	[[nodiscard]] static bool OrderedReadbacks() noexcept;
 
 	void Submit(std::span<const uint32_t> commands);
 	void SubmitCompute(uint32_t queue, std::span<const uint32_t> commands);
@@ -194,6 +199,8 @@ private:
 	size_t                        m_pending_first = 0;
 	size_t                        m_pending_count = 0;
 	void                          ForgetExecutedWrites();
+	uint64_t                      m_cp_ordered = 0;
+	void PostUrgentCommandSync(Common::UniqueFunction<void>&& command, bool drain_copies);
 	void                                      RunUrgentCommands();
 	std::mutex                                m_urgent_mutex;
 	std::vector<Common::UniqueFunction<void>> m_urgent_commands;

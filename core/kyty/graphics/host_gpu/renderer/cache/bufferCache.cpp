@@ -23,7 +23,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <bit>
+#include <chrono>
 #include <cinttypes>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +59,27 @@ std::pair<Buffer*, uint64_t> UploadMemory(GraphicContext& graphics, CommandSched
 	scheduler.DeferHostOperation([owner = std::move(temporary)]() mutable { owner.reset(); });
 	return {buffer, 0};
 }
+
+constexpr uint64_t ReadAheadLimit = 256 * 1024;
+
+struct ReadbackStats {
+	std::atomic<uint64_t> cp_reads {0};
+	std::atomic<uint64_t> cp_ns {0};
+	std::atomic<uint64_t> cp_ordered {0};
+	std::atomic<uint64_t> cp_ordered_ns {0};
+	std::atomic<uint64_t> cp_not_waited {0};
+	std::atomic<uint64_t> other_reads {0};
+	std::atomic<uint64_t> other_ns {0};
+	std::atomic<int64_t>  last_line {0};
+};
+
+ReadbackStats g_readback_stats;
+
+int64_t SteadyNs() {
+	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
+	    .count();
+}
+
 
 }
 
@@ -479,14 +502,65 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 }
 
 void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault) {
+	const bool command_processor = GuestGpu::IsCommandProcessorThread();
+	const auto started           = SteadyNs();
+	ReadMemoryAsyncTimed(vaddr, size, is_write, guest_fault, command_processor);
+	auto&      stats   = g_readback_stats;
+	const auto elapsed = static_cast<uint64_t>(SteadyNs() - started);
+	(command_processor ? stats.cp_reads : stats.other_reads).fetch_add(1, std::memory_order_relaxed);
+	(command_processor ? stats.cp_ns : stats.other_ns).fetch_add(elapsed, std::memory_order_relaxed);
+}
+
+void BufferCache::LogReadbackSummary() {
+	auto&      stats = g_readback_stats;
+	const auto now   = SteadyNs();
+	auto       last  = stats.last_line.load(std::memory_order_relaxed);
+	if (last == 0) {
+		stats.last_line.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000 || !stats.last_line.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	const auto cp_reads    = stats.cp_reads.exchange(0, std::memory_order_relaxed);
+	const auto other_reads = stats.other_reads.exchange(0, std::memory_order_relaxed);
+	const auto cp_ns       = stats.cp_ns.exchange(0, std::memory_order_relaxed);
+	const auto other_ns    = stats.other_ns.exchange(0, std::memory_order_relaxed);
+	const auto ordered     = stats.cp_ordered.exchange(0, std::memory_order_relaxed);
+	const auto ordered_ns  = stats.cp_ordered_ns.exchange(0, std::memory_order_relaxed);
+	const auto not_waited  = stats.cp_not_waited.exchange(0, std::memory_order_relaxed);
+	if (cp_reads + other_reads == 0) {
+		return;
+	}
+	const auto seconds = [](uint64_t ns) { return static_cast<double>(ns) / 1e9; };
+	::Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-readback] summary of the last {:.0f} s: command processor {} readbacks in {:.3f} s ({} after the "
+	    "operations it is ordered after only, {:.3f} s waiting for them, {} operations not waited for); other threads "
+	    "{} readbacks in {:.3f} s\n",
+	    seconds(static_cast<uint64_t>(now - last)), cp_reads, seconds(cp_ns), ordered, seconds(ordered_ns), not_waited,
+	    other_reads, seconds(other_ns)));
+}
+
+void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault,
+                                       bool command_processor) {
 	auto&             gpu         = m_scheduler.Context().GetGpu();
 	uint64_t          tick        = 0;
 	uint64_t          read_size   = size;
 	uint64_t          pages_begin = 0;
 	uint64_t          pages_end   = 0;
 	ReadbackQueueRead queue_read;
-	const bool        readback_queue = !GuestGpu::IsCommandProcessorThread();
-	gpu.SendUrgentCommandSync([&] {
+	const bool        ordered        = command_processor && GuestGpu::OrderedReadbacks();
+	const bool        readback_queue = !command_processor || ordered;
+	if (ordered) {
+		const auto started = SteadyNs();
+		const auto skipped = gpu.WaitForOrderedOperations(
+		    Common::AlignDown(vaddr, TRACKER_PAGE_SIZE), Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) + ReadAheadLimit);
+		auto& stats = g_readback_stats;
+		stats.cp_ordered.fetch_add(1, std::memory_order_relaxed);
+		stats.cp_ordered_ns.fetch_add(static_cast<uint64_t>(SteadyNs() - started), std::memory_order_relaxed);
+		stats.cp_not_waited.fetch_add(skipped, std::memory_order_relaxed);
+	}
+	gpu.SendReadbackCommandSync([&] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
 		}
@@ -520,13 +594,13 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 		if (queue_read.slot == nullptr && tick >= m_scheduler.CurrentTick()) {
 			m_scheduler.Flush();
 		}
-	}, false);
+	});
 	if (tick == 0) {
 		return;
 	}
 	if (queue_read.slot != nullptr) {
 		FinishReadbackQueueRead(queue_read);
-		gpu.SendUrgentCommandSync([&] {
+		gpu.SendReadbackCommandSync([&] {
 			const auto own = std::find_if(m_inflight_readbacks.begin(), m_inflight_readbacks.end(),
 			                              [&](const InFlightReadback& readback) {
 				                              return readback.begin == pages_begin &&
@@ -557,12 +631,11 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 					}
 				}
 			}
-		}, false);
+		});
 	} else {
 		m_scheduler.GetMasterSemaphore().Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
-		gpu.SendUrgentCommandSync(
-		    [&] { ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write); }, false);
+		gpu.SendReadbackCommandSync([&] { ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write); });
 	}
 }
 
@@ -1045,7 +1118,7 @@ void BufferCache::ReleaseReadback(uint64_t vaddr, uint64_t size, uint64_t pages_
 }
 
 uint64_t BufferCache::ReadAheadSize(const Buffer& buffer, uint64_t vaddr, uint64_t size) const {
-	static constexpr uint64_t MaxReadAhead = 256 * 1024;
+	static constexpr uint64_t MaxReadAhead = ReadAheadLimit;
 	const auto                faulting_begin = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	const auto                faulting_end   = Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE);
 	const auto                limit =
