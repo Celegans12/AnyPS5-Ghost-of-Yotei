@@ -534,11 +534,13 @@ constinit thread_local std::atomic<int> deliverableDepth{0};
 class DeliveryAllowance {
 public:
     DeliveryAllowance() : depth(deferralDepth.exchange(0)) {
-        deliverableDepth.fetch_add(1);
+        deliverableDepth.store(deliverableDepth.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
         DeliverDeferred();
     }
     ~DeliveryAllowance() {
-        deliverableDepth.fetch_sub(1);
+        std::atomic_signal_fence(std::memory_order_seq_cst);
+        deliverableDepth.store(deliverableDepth.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
         deferralDepth.store(depth);
     }
     DeliveryAllowance(const DeliveryAllowance&) = delete;
@@ -579,7 +581,7 @@ bool DeferDelivery(int signum) {
 }
 
 bool DeliveryAllowed() {
-    return deliverableDepth.load() != 0;
+    return deliverableDepth.load(std::memory_order_relaxed) != 0;
 }
 
 bool DeliveryDeferred() {
@@ -587,11 +589,13 @@ bool DeliveryDeferred() {
 }
 
 DeliverableWait::DeliverableWait() {
-    deliverableDepth.fetch_add(1);
+    deliverableDepth.store(deliverableDepth.load(std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
 }
 
 DeliverableWait::~DeliverableWait() {
-    deliverableDepth.fetch_sub(1);
+    std::atomic_signal_fence(std::memory_order_seq_cst);
+    deliverableDepth.store(deliverableDepth.load(std::memory_order_relaxed) - 1, std::memory_order_relaxed);
 }
 
 #ifdef __APPLE__
