@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <limits>
 #include <optional>
 #include <span>
 #include <string>
@@ -43,6 +44,8 @@ struct Reader {
 	std::span<const uint8_t> bytes;
 	std::vector<Inst*>       insts;
 	bool                     ok = true;
+	size_t                   allocation_budget = std::numeric_limits<size_t>::max();
+	bool                     shader_info_has_relative_vgprs = true;
 
 	void Raw(void* data, size_t size) {
 		ok = ok && size <= bytes.size();
@@ -50,8 +53,9 @@ struct Reader {
 		std::copy_n(bytes.data(), size, static_cast<uint8_t*>(data));
 		bytes = bytes.subspan(size);
 	}
-	uint32_t Count(uint32_t count) {
-		ok = ok && count <= bytes.size();
+	uint32_t Count(uint32_t count, size_t element_size = 1) {
+		ok = ok && count <= bytes.size() && count <= allocation_budget / element_size;
+		if (ok) allocation_budget -= count * element_size;
 		return ok ? count : 0u;
 	}
 };
@@ -125,15 +129,20 @@ inline void IoValue(Reader& reader, Value& value) {
 template <class S, class T> void Io(S& io, T& value) {
 	using U = std::remove_const_t<T>;
 	static_assert(!std::is_pointer_v<U>, "pointers do not persist");
-	if constexpr (std::is_arithmetic_v<U> || std::is_enum_v<U>) {
+	if constexpr (Reading<S> && std::is_same_v<U, bool>) {
+		uint8_t encoded = 0;
+		io.Raw(&encoded, sizeof(encoded));
+		io.ok = io.ok && encoded <= 1;
+		value = encoded == 1;
+	} else if constexpr (std::is_arithmetic_v<U> || std::is_enum_v<U>) {
 		io.Raw(&value, sizeof(U));
 	} else if constexpr (std::is_same_v<U, Value>) {
 		IoValue(io, value);
 	} else if constexpr (IsA<U, std::vector> || IsA<U, std::basic_string>) {
 		auto count = static_cast<uint32_t>(value.size());
 		Io(io, count);
-		if constexpr (Reading<S>) value.resize(io.Count(count));
 		using E = typename U::value_type;
+		if constexpr (Reading<S>) value.resize(io.Count(count, sizeof(E)));
 		if constexpr (std::is_arithmetic_v<E> || std::is_enum_v<E>) {
 			io.Raw(value.data(), value.size() * sizeof(E));
 		} else {
@@ -171,9 +180,20 @@ KYTY_IO_FIELDS(ShaderInfo::DmaWindow, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo::DmaDescriptorTable, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo::DmaRecordTable, a, b, c)
 KYTY_IO_FIELDS(ShaderInfo::SelfSizedBuffer, a, b, c)
-KYTY_IO_FIELDS(ShaderInfo, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
-               A, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, a0,
-               a1, a2, a3, a4, a5, a6, a7, a8, a9)
+template <class Stream, Is<ShaderInfo> Object>
+void Io(Stream& io, Object& object) {
+	auto& [a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
+	       relative_vgprs, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X,
+	       Y, Z, a0, a1, a2, a3, a4, a5, a6, a7, a8, a9] = object;
+	IoAll(io, a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z);
+	if constexpr (requires { io.shader_info_has_relative_vgprs; }) {
+		if (io.shader_info_has_relative_vgprs) IoAll(io, relative_vgprs);
+	} else {
+		IoAll(io, relative_vgprs);
+	}
+	IoAll(io, B, C, D, E, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, U, V, W, X, Y, Z, a0,
+	      a1, a2, a3, a4, a5, a6, a7, a8, a9);
+}
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::CountedRows, a, b)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead::MaskRanks, a, b, c)
 KYTY_IO_FIELDS(DescriptorSource::IndirectDescriptor::SelectorRead, a, b, c, d, e, f, g, h, i, j, k,

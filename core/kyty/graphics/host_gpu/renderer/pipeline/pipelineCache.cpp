@@ -1236,7 +1236,7 @@ std::shared_ptr<const ShaderModule> MakePlainModule(const ShaderModule&       mo
                                                     std::span<const uint32_t> spirv,
                                                     vk::Device                device) {
 	auto plain = std::make_shared<ShaderModule>();
-	plain->id     = module.id ^ 0x9e3779b97f4a7c15ull;
+	plain->id     = module.id ^ PlainModuleIdXor;
 	plain->module = CompileSPV(spirv, device);
 	if (plain->module == nullptr) {
 		return nullptr;

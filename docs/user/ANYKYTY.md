@@ -24,6 +24,7 @@ Kyty, native               █████████████████�
 - [Building](#building)
 - [Running a game](#running-a-game)
 - [Ray tracing survey](#ray-tracing-survey)
+- [Identify shaders in a GPU hang dump](#identify-shaders-in-a-gpu-hang-dump)
 - [Settings](#settings)
 - [Contributing](#contributing)
 - [Credits and licence](#credits-and-licence)
@@ -182,6 +183,23 @@ The survey describes what AnyKyty does on a GPU with Vulkan ray queries (NVIDIA 
 On a GPU with 64-wide subgroups (AMD) pass nothing: the script reads it from the log, or from the vendor name. `--subgroup 32|64`, `--lds-limit <bytes>` and `--oracle <n>` set the GPU side and the `KYTY_RT_ORACLE` value by hand. `kyty_rt_probe --cache <file>.code --all` is the command underneath; [the probe reference](../dev/THIRD_PARTY_KYTY.md#ray-tracing) lists its options and the format of its lines.
 
 An AI agent can do these steps for you: the survey issue holds a prompt to paste into Claude Code or another coding agent.
+
+## Identify shaders in a GPU hang dump
+
+Build the matcher with a C++20 compiler (MinGW on Windows).
+
+```sh
+git submodule update --init 3rdparty/fmt 3rdparty/magic_enum 3rdparty/SPIRV-Headers 3rdparty/Vulkan-Headers 3rdparty/VulkanMemoryAllocator 3rdparty/xxHash 3rdparty/zstd
+cmake -S core/kyty/tools -B build-spirv-match -G Ninja -DCMAKE_BUILD_TYPE=Release
+cmake --build build-spirv-match --target kyty_spirv_match
+build-spirv-match/kyty_spirv_match _PipelineCache/<title>.shaders <vertex>.spv <fragment>.spv
+```
+
+On Windows, put MinGW and Ninja on `PATH`, add `-DCMAKE_C_COMPILER=gcc -DCMAKE_CXX_COMPILER=g++` to the configure command, and run `kyty_spirv_match.exe`.
+
+Use the compiled `.shaders` store from the run that produced the dump. The matcher compares the exact bytes of each supplied `.spv` file against the standard and plain variants in that store. It prints the input number, stage, guest shader hash and Kyty module ID for each match. You can share those lines while keeping the shader files and cache local.
+
+The command exits with `1` if an input has no exact match and `2` if an input or store is invalid or incomplete. It reads one store record at a time and accepts up to 64 MiB of decoded data per record or input shader. It opens no Vulkan device and leaves the inputs untouched.
 
 ## Settings
 

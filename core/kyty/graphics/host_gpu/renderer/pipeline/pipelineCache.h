@@ -296,6 +296,8 @@ struct ShaderModule {
                                                                   std::span<const uint32_t> spirv,
                                                                   vk::Device            device);
 
+inline constexpr uint64_t PlainModuleIdXor = 0x9e3779b97f4a7c15ull;
+
 [[nodiscard]] bool SmallColorTargetDraw(const HW::Context& context);
 [[nodiscard]] bool RecordsNoMipStats(const ShaderStageRuntime& stage);
 
