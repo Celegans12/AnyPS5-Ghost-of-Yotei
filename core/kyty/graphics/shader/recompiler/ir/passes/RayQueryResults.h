@@ -7,7 +7,8 @@
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
-constexpr uint32_t OracleLoop = 16u;
+constexpr uint32_t OracleLoop    = 16u;
+constexpr uint32_t OracleResults = 32u;
 
 [[nodiscard]] bool RewriteResultsWalk(Program& program, const NativeTraversalOptions& options, Block* header, Block* latch,
                                       std::span<Inst* const> served, NativeTraversals& result, uint32_t site);

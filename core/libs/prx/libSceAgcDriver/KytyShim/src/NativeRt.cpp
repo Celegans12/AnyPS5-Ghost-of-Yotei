@@ -19,8 +19,10 @@ std::optional<std::uint32_t> ParseOracle(const char* value) {
 }
 
 std::string OracleLine(Verdict verdict, std::uint32_t oracle) {
+    const bool results = (oracle & 32u) != 0;
+    oracle &= 15u;
     if (verdict != Verdict::Native || (oracle & ~OraclePixel) == 0) return {};
-    const std::string setting = "(KYTY_RT_ORACLE=" + std::to_string(oracle) + ")";
+    const std::string setting = "(KYTY_RT_ORACLE=" + std::to_string(oracle) + (results ? ", KYTY_RT_RESULTS=1" : "") + ")";
     const bool remaining = (oracle & OracleRemaining) != 0;
     if ((oracle & OracleOnly) != 0 && !remaining) {
         return "[kyty] no BVH walk form is tried and no walk answers from host ray queries " + setting + ": every BVH walk runs empty, its rays miss\n";

@@ -2,6 +2,7 @@
 
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
+#include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
 
 #include <algorithm>
 #include <array>
@@ -12,6 +13,7 @@
 #include <functional>
 #include <limits>
 #include <optional>
+#include <utility>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -31,7 +33,7 @@ constexpr uint32_t MaxSeeds   = 12;
 constexpr uint32_t MaxRows    = 1024;
 constexpr uint64_t PrologueWork = 60000;
 constexpr uint64_t WalkWork     = 150000;
-constexpr uint64_t TotalWork    = 2200000;
+constexpr uint64_t TotalWork    = 3000000;
 constexpr size_t   TaintBits  = 320;
 constexpr uint32_t TaintLive  = 0;
 constexpr uint32_t TaintLives = 240;
@@ -237,6 +239,7 @@ public:
 		m_written.clear();
 		m_shared.clear();
 		m_scratch.clear();
+		m_user.clear();
 		m_reads.clear();
 		m_planted = nullptr;
 	}
@@ -246,7 +249,11 @@ public:
 		m_planted_reads.clear();
 	}
 	[[nodiscard]] bool PlantedRead(uint64_t address) const { return m_planted_reads.contains(address & ~uint64_t {3}); }
-	[[nodiscard]] uint32_t UserData(uint32_t reg) const { return Hash(0x5553000000000000ull + reg) & 3u; }
+	[[nodiscard]] uint32_t UserData(uint32_t reg) const {
+		if (const auto at = m_user.find(reg); at != m_user.end()) return at->second;
+		return Hash(0x5553000000000000ull + reg) & 3u;
+	}
+	void SetUserData(uint32_t reg, uint32_t value) { m_user[reg] = value; }
 	void Preset(uint64_t address, uint32_t value) { m_written[address & ~uint64_t {3}] = value; }
 	[[nodiscard]] uint32_t Peek(uint64_t address) const {
 		address &= ~uint64_t {3};
@@ -483,6 +490,27 @@ private:
 	}
 
 
+
+	enum class Space { Global, Private, Shared };
+
+	template <class Arg>
+	std::pair<Space, uint64_t> Route(const Inst& inst, uint32_t lane, const Arg& a) const {
+		const auto& memory = m_program.memory_info[inst.Flags<MemoryFlags>().index];
+		const auto  offset = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(memory.offset)));
+		const auto* handle = inst.Arg(0).Resolve().TryInstruction();
+		if ((handle != nullptr && handle->GetOpcode() == Op::GetScratchResource) || memory.kind == ResourceKind::Scratch) {
+			return {Space::Private, (a(1, lane) & 0xffffffffu) + offset};
+		}
+		if (memory.kind == ResourceKind::Lds) return {Space::Shared, (a(1, lane) & 0xffffffffu) + offset};
+		const auto address = memory.address_is_full ? ((a(1, lane) & 0xffffffffu) | (a(2, lane) & 0xffffffffu) << 32u) + offset
+		                                            : ((a(0, lane, 0) & 0xffffffffu) | (a(0, lane, 1) << 32u)) + (a(1, lane) & 0xffffffffu) + offset;
+		const auto high = static_cast<uint32_t>(address >> 32u);
+		if (memory.kind == ResourceKind::FlatLocal || memory.kind == ResourceKind::Flat) {
+			if (high == 0x70000000u) return {Space::Private, address & 0xffffffffu};
+			if (high == 0x80000000u) return {Space::Shared, address & 0xffffffffu};
+		}
+		return {Space::Global, address};
+	}
 
 	const char* Execute(const Inst& inst) {
 		const char* failure = Compute(inst);
@@ -869,20 +897,14 @@ private:
 				return nullptr;
 			}
 			case Op::StoreAddressU32: {
-				const auto* handle = inst.Arg(0).Resolve().TryInstruction();
-				const bool  scratch = handle != nullptr && handle->GetOpcode() == Op::GetScratchResource;
-				if (m_walk && !scratch) return "the walk writes memory";
-				const auto& memory = m_program.memory_info[inst.Flags<MemoryFlags>().index];
-				const auto  offset = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(memory.offset)));
 				for (uint32_t lane = 0; lane < m_wave; ++lane) {
 					if ((a(4, lane) & 1u) == 0) continue;
-					const auto address = memory.address_is_full ? ((a(1, lane) & 0xffffffffu) | (a(2, lane) & 0xffffffffu) << 32u) + offset
-					                                             : ((a(0, lane, 0) & 0xffffffffu) | (a(0, lane, 1) << 32u)) + (a(1, lane) & 0xffffffffu) + offset;
-					if (scratch) {
-						m_scratch[(address & ~uint64_t {3}) << 6u | lane] = static_cast<uint32_t>(a(3, lane));
-					} else {
-						m_written[address & ~uint64_t {3}] = static_cast<uint32_t>(a(3, lane));
-					}
+					const auto [space, address] = Route(inst, lane, a);
+					if (space == Space::Global && m_walk) return "the walk writes memory";
+					const auto value = static_cast<uint32_t>(a(3, lane));
+					if (space == Space::Private) m_scratch[(address & ~uint64_t {3}) << 6u | lane] = value;
+					if (space == Space::Shared) m_shared[static_cast<uint32_t>(address & ~uint64_t {3})] = value;
+					if (space == Space::Global) m_written[address & ~uint64_t {3}] = value;
 				}
 				return nullptr;
 			}
@@ -914,20 +936,35 @@ private:
 			case Op::LoadAddressU32:
 			case Op::LoadAddressU16:
 			case Op::LoadAddressU8: {
+				const auto& kind = m_program.memory_info[inst.Flags<MemoryFlags>().index].kind;
 				const auto* handle = inst.Arg(0).Resolve().TryInstruction();
-				if (handle != nullptr && handle->GetOpcode() == Op::GetScratchResource) {
-					const auto& memory = m_program.memory_info[inst.Flags<MemoryFlags>().index];
-					const auto  offset = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(memory.offset)));
+				if ((handle != nullptr && handle->GetOpcode() == Op::GetScratchResource) || kind == ResourceKind::FlatLocal ||
+				    kind == ResourceKind::Scratch || kind == ResourceKind::Flat) {
+					bool local = true;
 					for (uint32_t lane = 0; lane < m_wave; ++lane) {
-						const auto address = (a(1, lane) & 0xffffffffu) + offset;
-						const auto at      = m_scratch.find((address & ~uint64_t {3}) << 6u | lane);
-						auto       value   = static_cast<uint64_t>(at != m_scratch.end() ? at->second : Hash(0x5c00000000000000ull + (address << 6u) + lane));
+						if ((a(3, lane) & 1u) == 0) {
+							At(out, lane) = 0;
+							continue;
+						}
+						const auto [space, address] = Route(inst, lane, a);
+						if (space == Space::Global) {
+							local = false;
+							break;
+						}
+						uint64_t value = 0;
+						if (space == Space::Private) {
+							const auto at = m_scratch.find((address & ~uint64_t {3}) << 6u | lane);
+							value         = at != m_scratch.end() ? at->second : Hash(0x5c00000000000000ull + (address << 6u) + lane);
+						} else {
+							const auto at = m_shared.find(static_cast<uint32_t>(address & ~uint64_t {3}));
+							value         = at != m_shared.end() ? at->second : Hash(0x1d50000000000000ull + (address & 0xffffffffu));
+						}
 						value >>= (address & 3u) * 8u;
 						if (op == Op::LoadAddressU16) value &= 0xffffu;
 						if (op == Op::LoadAddressU8) value &= 0xffu;
-						At(out, lane) = (a(3, lane) & 1u) != 0 ? value : 0u;
+						At(out, lane) = value;
 					}
-					return nullptr;
+					if (local) return nullptr;
 				}
 				bool cleared = false;
 				for (uint32_t lane = 0; lane < m_wave; ++lane) {
@@ -1078,6 +1115,7 @@ private:
 	std::unordered_map<uint64_t, uint32_t>     m_written;
 	std::unordered_map<uint32_t, uint32_t>     m_shared;
 	std::unordered_map<uint64_t, uint32_t>     m_scratch;
+	std::unordered_map<uint32_t, uint32_t>     m_user;
 	std::unordered_set<uint64_t>               m_reads;
 	std::unordered_set<uint64_t>               m_planted_reads;
 	std::vector<const Block*>                  m_visited;
@@ -1099,6 +1137,12 @@ constexpr std::array<RayQueryResultKind, KindCount> HostKinds {RayQueryResultKin
                                                                RayQueryResultKind::Node,       RayQueryResultKind::InstanceLo,
                                                                RayQueryResultKind::InstanceHi, RayQueryResultKind::Has};
 
+constexpr std::array<std::pair<uint32_t, uint32_t>, 8> Transforms {{{0u, 0xffffffffu}, {0u, 7u}, {0u, 3u}, {3u, 0xffffffffu}, {0u, 0x3fffffffu}, {30u, 1u}, {31u, 1u}, {30u, 3u}}};
+
+uint64_t Transformed(uint64_t value, uint32_t transform) {
+	return ((value & 0xffffffffu) >> Transforms[transform].first) & Transforms[transform].second;
+}
+
 enum class Opacity : uint32_t { AllOpaque, OnlyOpaque, Live };
 
 struct Params {
@@ -1112,6 +1156,9 @@ struct Params {
 	uint32_t flags_dword = 0;
 	uint32_t flags_shift = 0;
 	bool     flags_flip  = false;
+	bool     mask        = false;
+	uint32_t mask_dword  = 0;
+	uint32_t mask_shift  = 0;
 };
 
 struct Instance {
@@ -1221,6 +1268,10 @@ private:
 	uint64_t m_state;
 };
 
+bool Usable(float extent) {
+	return extent >= 1.0e-3f && extent <= 1.0e30f;
+}
+
 uint32_t Fraction(Random& random, uint32_t steps) {
 	return 1u + random.Below(steps - 1u);
 }
@@ -1236,6 +1287,7 @@ public:
 	void        Emit(uint32_t site);
 
 	uint32_t detail = 0;
+	[[nodiscard]] uint64_t Work() const { return m_machine.Work(); }
 
 private:
 	void        Begin(uint64_t seed);
@@ -1279,12 +1331,14 @@ private:
 	std::vector<uint32_t>          m_flag_dwords;
 	std::vector<Observation>       m_rows;
 	std::vector<std::optional<Kind>> m_kinds;
+	std::vector<uint32_t>          m_transforms;
 	std::vector<std::optional<uint64_t>> m_fixed;
 	Params                         m_params;
 	std::array<Value, 6>           m_ray {};
 	Value                          m_extent;
 	Value                          m_lanes;
 	std::array<Value, 2>           m_descriptor {};
+	std::array<Value, 2>           m_node {};
 	std::vector<std::pair<Block*, Block*>> m_path;
 	Block*                         m_preheader = nullptr;
 };
@@ -1343,10 +1397,24 @@ std::vector<uint8_t> ActiveLanes(uint64_t seed, uint32_t wave) {
 void Analysis::Begin(uint64_t seed) {
 	m_machine.Reset(seed);
 	m_machine.Activate(ActiveLanes(seed, m_machine.Wave()));
-	if (m_result.header_vsharp == 0xffffffffu) {
-		const auto pointer = static_cast<uint64_t>(m_machine.UserData(m_result.user_sgpr)) |
-		                     static_cast<uint64_t>(m_machine.UserData(m_result.user_sgpr + 1u)) << 32u;
-		const auto header  = 0x0000100000000000ull + ((Mix(seed) & 0xffffffu) << 16u);
+	const auto header  = 0x0000100000000000ull + ((Mix(seed) & 0xffffffu) << 16u);
+	const auto table   = 0x0000080000000000ull + ((Mix(seed + 77u) & 0xffffffu) << 12u);
+	const auto sgpr    = m_result.user_sgpr;
+	auto       pointer = static_cast<uint64_t>(m_machine.UserData(sgpr)) | static_cast<uint64_t>(m_machine.UserData(sgpr + 1u)) << 32u;
+	if (m_result.header_vsharp == 0xfffffffeu) {
+		pointer = m_result.header_offset == 0xffffffffu ? header : table;
+		m_machine.SetUserData(sgpr, static_cast<uint32_t>(pointer));
+		m_machine.SetUserData(sgpr + 1u, static_cast<uint32_t>(pointer >> 32u));
+	} else if (m_result.header_vsharp != 0xffffffffu) {
+		const auto loaded = m_result.header_offset == 0xffffffffu ? header : table;
+		m_machine.Preset(pointer + m_result.header_vsharp, static_cast<uint32_t>(loaded));
+		m_machine.Preset(pointer + m_result.header_vsharp + 4u, static_cast<uint32_t>(loaded >> 32u) & 0xffffu);
+		pointer = loaded;
+	} else if (m_result.header_offset == 0xffffffffu) {
+		m_machine.SetUserData(sgpr, static_cast<uint32_t>(header));
+		m_machine.SetUserData(sgpr + 1u, static_cast<uint32_t>(header >> 32u));
+	}
+	if (m_result.header_offset != 0xffffffffu) {
 		m_machine.Preset(pointer + m_result.header_offset, static_cast<uint32_t>(header));
 		m_machine.Preset(pointer + m_result.header_offset + 4u, static_cast<uint32_t>(header >> 32u));
 	}
@@ -1366,7 +1434,9 @@ const char* Analysis::Seed(uint64_t seed, Start& start) {
 		const auto header  = address - ((static_cast<uint64_t>(root) >> 3u) << 6u);
 		for (const auto& call: calls) {
 			const auto kind = call.node & 7u;
-			if ((kind != 4u && kind != 5u) || call.base + ((call.node >> 3u) << 6u) != address) return false;
+			if ((kind != 4u && kind != 5u) || call.base + ((call.node >> 3u) << 6u) != address) {
+				return false;
+			}
 		}
 		start.inst   = &inst;
 		start.header = header;
@@ -1547,6 +1617,10 @@ bool Analysis::Answer(World& world, std::span<const Machine::Call> calls, std::s
 		if (std::ranges::find(top, index) != top.end()) continue;
 		const auto& call = calls[index];
 		auto&       lane = world.lanes[call.lane];
+		if ((call.node & 7u) > 5u) {
+			answers[index] = {Miss, Miss, Miss, Miss};
+			continue;
+		}
 		if (!lane.offered) {
 			return false;
 		}
@@ -1647,7 +1721,7 @@ const char* Analysis::Trial(uint64_t seed, const Start& start) {
 	World world = MakeWorld(start, random);
 	for (size_t at = 0; at < start.lanes.size(); ++at) {
 		const auto extent = start.extents[at];
-		if (!(extent > 0.0f) || !std::isfinite(extent)) continue;
+		if (!Usable(extent)) continue;
 		const auto type     = m_types[at % m_types.size()];
 		const auto instance = AddInstance(world, random, type, 0xffu, 0u, true);
 		Candidate  candidate;
@@ -1671,7 +1745,7 @@ const char* Analysis::Discover(uint64_t seed, const Start& start) {
 	for (size_t at = 0; at < start.lanes.size(); ++at) {
 		const auto lane   = start.lanes[at];
 		const auto extent = start.extents[at];
-		if (!(extent > 0.0f) || !std::isfinite(extent)) continue;
+		if (!Usable(extent)) continue;
 		const auto type     = m_types[random.Below(static_cast<uint32_t>(m_types.size()))];
 		const auto instance = AddInstance(world, random, type, random.Below(2) != 0 ? 0xffu : random.Below(256), random.Below(16), true);
 		Candidate  candidate;
@@ -1807,7 +1881,7 @@ const char* Analysis::Rows() {
 		for (size_t at = 0; at < start.lanes.size() && next < rows.size(); ++at) {
 			const auto lane   = start.lanes[at];
 			const auto extent = start.extents[at];
-			if (!(extent > 0.0f) || !std::isfinite(extent)) continue;
+			if (!Usable(extent)) continue;
 			const auto& row      = rows[next];
 			const auto  instance = AddInstance(world, random, row.type, row.mask, row.flags, true);
 			Candidate   candidate;
@@ -1855,9 +1929,11 @@ const char* Analysis::Rows() {
 	return nullptr;
 }
 
+
 const char* Analysis::Classify() {
 	m_kinds.assign(m_outs.size(), std::nullopt);
-	std::vector<uint32_t> possible(m_outs.size(), (1u << KindCount) - 1u);
+	m_transforms.assign(m_outs.size(), 0u);
+	std::vector<uint64_t> possible(m_outs.size(), ~uint64_t {0});
 	std::vector<bool>     changed(m_outs.size(), false);
 	uint32_t              accepted = 0;
 	for (const auto& row: m_rows) {
@@ -1872,12 +1948,13 @@ const char* Analysis::Classify() {
 		for (size_t index = 0; index < m_outs.size(); ++index) {
 			if (row.outs[index] == row.base[index]) continue;
 			changed[index] = true;
-			uint32_t match = 0;
-			for (uint32_t kind = 0; kind < KindCount; ++kind) {
-				const bool flag = m_outs[index].flag;
-				if ((flag && kind == KindHas && row.outs[index] == 1u) || (!flag && kind != KindHas && row.outs[index] == values[kind]) ||
-				    (!flag && kind == KindHas && row.outs[index] == 1u)) {
-					match |= 1u << kind;
+			uint64_t match = 0;
+			for (uint32_t transform = 0; transform < Transforms.size(); ++transform) {
+				for (uint32_t kind = 0; kind < KindCount; ++kind) {
+					const bool flag = m_outs[index].flag;
+					const bool hit  = kind == KindHas ? transform == 0 && row.outs[index] == 1u
+					                                  : !flag && row.outs[index] == Transformed(values[kind], transform);
+					if (hit) match |= uint64_t {1} << (transform * KindCount + kind);
 				}
 			}
 			possible[index] &= match;
@@ -1891,7 +1968,9 @@ const char* Analysis::Classify() {
 			detail = static_cast<uint32_t>(index);
 			return "a value of the walk changes with a hit and is no host result";
 		}
-		m_kinds[index] = static_cast<Kind>(std::countr_zero(possible[index]));
+		const auto code     = static_cast<uint32_t>(std::countr_zero(possible[index]));
+		m_kinds[index]      = static_cast<Kind>(code % KindCount);
+		m_transforms[index] = code / KindCount;
 		distance       = distance || *m_kinds[index] == KindT;
 	}
 	for (const auto& row: m_rows) {
@@ -1904,7 +1983,7 @@ const char* Analysis::Classify() {
 		if (!any) continue;
 		for (size_t index = 0; index < m_outs.size(); ++index) {
 			if (!m_kinds[index]) continue;
-			const auto expected = m_outs[index].flag ? 1u : values[*m_kinds[index]];
+			const auto expected = m_outs[index].flag ? 1u : Transformed(values[*m_kinds[index]], m_transforms[index]);
 			if (row.outs[index] != expected) return "a hit updates the results only in part";
 		}
 	}
@@ -1918,7 +1997,9 @@ bool Analysis::HostAccepts(const Params& params, const Instance& instance, const
 	const auto live = [&](uint32_t index) { return lives[index] & 0xffffffffu; };
 	uint32_t   ray_mask = params.ray_mask == NoSlot ? 0xffu : static_cast<uint32_t>(live(params.ray_mask)) & 0xffu;
 	uint32_t   mask     = 0xffu;
-	if (m_layout.mask) {
+	if (params.mask) {
+		mask = (instance.words[params.mask_dword] >> params.mask_shift) & 0xffu;
+	} else if (m_layout.mask) {
 		const auto bits = instance.words[m_layout.mask_dword] >> m_layout.mask_shift;
 		mask = m_layout.mask_width == 0 ? bits & 0xffu : (bits & ((1u << m_layout.mask_width) - 1u)) != 0 ? 0xffu : 0u;
 	}
@@ -1996,27 +2077,59 @@ const char* Analysis::Search() {
 		}
 		return true;
 	};
-	for (const auto& flag: flags) {
-		for (const auto mask: lives) {
-			for (uint32_t opacity = 0; opacity < 2 + m_lives.size(); ++opacity) {
-				for (uint32_t both = 0; both < 2; ++both) {
-					for (const auto cull: lives) {
-						for (const auto flip: lives) {
-							Params params;
-							params.flags       = flag.on;
-							params.flags_dword = flag.dword;
-							params.flags_shift = flag.shift;
-							params.flags_flip  = flag.flip;
-							params.ray_mask    = mask;
-							params.both        = both != 0;
-							params.cull        = cull;
-							params.flip        = flip;
-							params.opacity     = opacity == 0 ? Opacity::AllOpaque : opacity == 1 ? Opacity::OnlyOpaque : Opacity::Live;
-							params.alpha_off   = opacity >= 2 ? opacity - 2u : NoSlot;
-							if (params.both && (cull != NoSlot || flip != NoSlot)) continue;
-							if (matches(params)) {
-								m_params = params;
-								return nullptr;
+	struct Mask {
+		bool     on    = false;
+		uint32_t dword = 0;
+		uint32_t shift = 0;
+	};
+	std::vector<Mask> masks {{}};
+	if (!m_layout.mask) {
+		for (const auto dword: m_flag_dwords) {
+			for (uint32_t shift = 0; shift <= 24; ++shift) masks.push_back({true, dword, shift});
+		}
+	}
+	for (const auto& mask_option: masks) {
+		for (const auto ray_mask: lives) {
+			bool plausible = true;
+			for (size_t index = 0; index < m_rows.size() && plausible; ++index) {
+				if (!accepted[index]) continue;
+				const auto& row      = m_rows[index];
+				const auto& instance = row.instances[row.triangles[row.candidates.front().triangle].instance];
+				uint32_t    bits     = 0xffu;
+				if (mask_option.on) {
+					bits = (instance.words[mask_option.dword] >> mask_option.shift) & 0xffu;
+				} else if (m_layout.mask) {
+					const auto field = instance.words[m_layout.mask_dword] >> m_layout.mask_shift;
+					bits = m_layout.mask_width == 0 ? field & 0xffu : (field & ((1u << m_layout.mask_width) - 1u)) != 0 ? 0xffu : 0u;
+				}
+				const uint32_t ray = ray_mask == NoSlot ? 0xffu : static_cast<uint32_t>(row.lives[ray_mask]) & 0xffu;
+				plausible = (bits & ray) != 0;
+			}
+			if (!plausible) continue;
+			for (const auto& flag: flags) {
+				for (uint32_t opacity = 0; opacity < 2 + m_lives.size(); ++opacity) {
+					for (uint32_t both = 0; both < 2; ++both) {
+						for (const auto cull: lives) {
+							for (const auto flip: lives) {
+								Params params;
+								params.flags       = flag.on;
+								params.flags_dword = flag.dword;
+								params.flags_shift = flag.shift;
+								params.flags_flip  = flag.flip;
+								params.mask        = mask_option.on;
+								params.mask_dword  = mask_option.dword;
+								params.mask_shift  = mask_option.shift;
+								params.ray_mask    = ray_mask;
+								params.both        = both != 0;
+								params.cull        = cull;
+								params.flip        = flip;
+								params.opacity     = opacity == 0 ? Opacity::AllOpaque : opacity == 1 ? Opacity::OnlyOpaque : Opacity::Live;
+								params.alpha_off   = opacity >= 2 ? opacity - 2u : NoSlot;
+								if (params.both && (cull != NoSlot || flip != NoSlot)) continue;
+								if (matches(params)) {
+									m_params = params;
+									return nullptr;
+								}
 							}
 						}
 					}
@@ -2050,7 +2163,7 @@ const char* Analysis::Validate() {
 		for (size_t at = 0; at < start.lanes.size(); ++at) {
 			const auto lane   = start.lanes[at];
 			const auto extent = start.extents[at];
-			if (!(extent > 0.0f) || !std::isfinite(extent)) continue;
+			if (!Usable(extent)) continue;
 			const auto count = random.Below(4);
 			for (uint32_t k = 0; k < count; ++k) {
 				Candidate candidate;
@@ -2088,7 +2201,7 @@ const char* Analysis::Validate() {
 			const auto best = observation.candidates.empty() ? std::nullopt : HostClosest(m_params, observation);
 			const auto values = best ? KindValues(world, observation.candidates[*best]) : std::array<uint64_t, KindCount> {};
 			for (size_t index = 0; index < m_outs.size(); ++index) {
-				const auto expected = best && m_kinds[index] ? (m_outs[index].flag ? 1u : values[*m_kinds[index]]) : base_outs[index][lane];
+				const auto expected = best && m_kinds[index] ? (m_outs[index].flag ? 1u : Transformed(values[*m_kinds[index]], m_transforms[index])) : base_outs[index][lane];
 				if (outs[index][lane] != expected) {
 					detail = static_cast<uint32_t>(index) << 8u | lane;
 					return "a wave with several candidates per lane ends on another hit than the host";
@@ -2101,7 +2214,6 @@ const char* Analysis::Validate() {
 
 const char* Analysis::Hoist(const Start& start) {
 	const uint32_t words = start.inst->Flags<uint32_t>() & 0xffu;
-	if (words == 2u) return "64-bit node walks keep the oracle";
 	const auto* descriptor = start.inst->Arg(0).Resolve().TryInstruction();
 	if (descriptor == nullptr || descriptor->GetOpcode() != Op::CompositeConstructU32x4) return "the top-level descriptor is not built from words";
 	for (const auto& other: m_starts) {
@@ -2137,6 +2249,9 @@ const char* Analysis::Hoist(const Start& start) {
 		if (!peelable(ray->Arg(words + index))) return "a ray input of the first round cannot be computed before the walk";
 	}
 	if (!peelable(start.inst->Arg(2))) return "the active lanes of the first round cannot be computed before the walk";
+	for (uint32_t index = 0; index < words; ++index) {
+		if (!peelable(ray->Arg(index))) return "the first node of the walk cannot be computed before it";
+	}
 	if (!peelable(descriptor->Arg(0)) || !peelable(descriptor->Arg(1))) return "the top-level descriptor cannot be computed before the walk";
 	return nullptr;
 }
@@ -2280,14 +2395,20 @@ const char* Analysis::ForcedPath() {
 const char* Analysis::Derive() {
 	if (const char* failure = Prepare()) return failure;
 	for (uint64_t seed = 1; seed <= MaxSeeds && m_seeds.size() < 3; ++seed) {
-		if (seed > 3 && m_seeds.empty()) break;
+		if (seed > 3 && m_seeds.empty() && m_machine.Work() > TotalWork / 16u) break;
 		Start start;
-		if (Seed(seed, start) != nullptr) continue;
+		const char* seed_failure = Seed(seed, start);
+		if (seed_failure != nullptr) {
+			continue;
+		}
 		uint32_t usable = 0;
-		for (const auto extent: start.extents) usable += extent > 0.0f && std::isfinite(extent) ? 1u : 0u;
+		for (const auto extent: start.extents) usable += Usable(extent) ? 1u : 0u;
 		if (usable < 2) continue;
 		if (!m_starts.empty() && start.inst != m_starts.front().inst) return "the walk starts at another place in another world";
-		if (Trial(seed, start) != nullptr) continue;
+		const char* trial_failure = Trial(seed, start);
+		if (trial_failure != nullptr) {
+			continue;
+		}
 		m_seeds.push_back(seed);
 		m_starts.push_back(std::move(start));
 	}
@@ -2339,6 +2460,8 @@ void Analysis::Emit(uint32_t site) {
 		m_lanes         = Peel(start.inst->Arg(2), peeled, failed);
 		m_descriptor[0] = Peel(descriptor->Arg(0), peeled, failed);
 		m_descriptor[1] = Peel(descriptor->Arg(1), peeled, failed);
+		m_node[0]       = Peel(ray->Arg(0), peeled, failed);
+		m_node[1]       = words == 2u ? Peel(ray->Arg(1), peeled, failed) : Value(0u);
 	}
 	const auto bits = [&](Value value) {
 		if (value.IsImmediate()) return value.GetType() == Type::F32 ? Value(std::bit_cast<uint32_t>(value.F32Value())) : value;
@@ -2348,7 +2471,12 @@ void Analysis::Emit(uint32_t site) {
 	m_extent      = bits(m_extent);
 	m_descriptor  = {bits(m_descriptor[0]), bits(m_descriptor[1])};
 	const auto high   = entry(Op::BitwiseAnd32, {m_descriptor[1], Value(0xffu)});
-	const auto header = entry(Op::ShiftLeftLogical64, {entry(Op::CompositeConstructU64, {m_descriptor[0], high}), Value(8u)});
+	auto       header = entry(Op::ShiftLeftLogical64, {entry(Op::CompositeConstructU64, {m_descriptor[0], high}), Value(8u)});
+	if (!(m_node[0].IsImmediate() && m_node[0].U32() == m_result.root && m_node[1].IsImmediate() && m_node[1].U32() == 0u)) {
+		const auto node    = entry(Op::CompositeConstructU64, {m_node[0], m_node[1]});
+		const auto address = entry(Op::IAdd64, {header, entry(Op::ShiftLeftLogical64, {entry(Op::ShiftRightLogical64, {node, Value(3u)}), Value(6u)})});
+		header             = entry(Op::ISub64, {address, Value(static_cast<uint64_t>(m_result.root >> 3u) << 6u)});
+	}
 	const auto low_word  = entry(Op::CompositeExtractU64, {header, Value(0u)});
 	const auto high_word = entry(Op::CompositeExtractU64, {header, Value(1u)});
 	const auto mask      = m_params.ray_mask == NoSlot ? Value(0xffu) : word(m_params.ray_mask);
@@ -2379,8 +2507,11 @@ void Analysis::Emit(uint32_t site) {
 	for (size_t index = 0; index < m_outs.size(); ++index) {
 		if (!m_kinds[index]) continue;
 		auto&      out    = m_outs[index];
-		const auto chosen = out.flag ? after(Op::SelectU1, {commit, Value(true), Value(out.inst)})
-		                             : after(Op::SelectU32, {commit, result(HostKinds[*m_kinds[index]]), Value(out.inst)});
+		auto       value  = out.flag ? Value(true) : result(HostKinds[*m_kinds[index]]);
+		const auto [shift, mask] = Transforms[m_transforms[index]];
+		if (!out.flag && shift != 0) value = after(Op::ShiftRightLogical32, {value, Value(shift)});
+		if (!out.flag && mask != 0xffffffffu) value = after(Op::BitwiseAnd32, {value, Value(mask)});
+		const auto chosen = out.flag ? after(Op::SelectU1, {commit, Value(true), Value(out.inst)}) : after(Op::SelectU32, {commit, value, Value(out.inst)});
 		const auto uses   = out.inst->Uses();
 		for (const auto& use: uses) {
 			if (use.user == chosen.Instruction()) continue;
@@ -2403,6 +2534,11 @@ void Analysis::Emit(uint32_t site) {
 	}
 	after(Op::RayQueryMark, {}, flags(static_cast<uint32_t>(RayQueryMarkKind::Exit)));
 	for (auto* bvh: m_served) bvh->SetFlags(bvh->Flags<uint32_t>() | BvhIntersectNative);
+	if (m_params.mask) {
+		auto& layout = m_result.layout;
+		layout[2] |= (m_params.mask_dword & 15u) | (m_params.mask_shift & 31u) << 4u | 1u << 19u;
+		layout[3] |= (m_params.mask_dword >> 4u & 3u) << 24u;
+	}
 	if (m_params.flags) {
 		auto& layout = m_result.layout;
 		layout[2] |= (m_params.flags_dword & 15u) << 9u | 1u << 13u | (m_params.flags_shift & 31u) << 14u;
@@ -2421,7 +2557,10 @@ void Analysis::Emit(uint32_t site) {
 bool RewriteResultsWalk(Program& program, const NativeTraversalOptions& options, Block* header, Block* latch,
                         std::span<Inst* const> served, NativeTraversals& result, uint32_t site) {
 	const bool compute = program.stage == ShaderType::Compute;
-	if ((options.oracle & OracleLoop) != 0 || site >= MaxRayQuerySites || served.empty() || header == nullptr || latch == nullptr) return false;
+	if ((options.oracle & OracleLoop) != 0 || (options.oracle & (OracleForms | OracleOnly | OracleResults)) == 0 || site >= MaxRayQuerySites ||
+	    served.empty() || header == nullptr || latch == nullptr) {
+		return false;
+	}
 	Analysis    analysis(program, options, header, latch, served, result);
 	const char* failure = analysis.Derive();
 	if (failure != nullptr) {

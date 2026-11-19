@@ -200,6 +200,7 @@ On by default unless the row says otherwise; set one to compare, or to work arou
 | `KYTY_RT_CHECK_PPM` | parts per million | Fraction of output dwords that may differ before a check counts as failed (default 1000) |
 | `KYTY_RT_CHECK_STRIKES` | count | Failed checks in a row after which a program walks the emulated BVH for the rest of the session (default 3) |
 | `KYTY_RT_ARENA_MB` | MiB | Limit of the memory the native ray tracing structures take |
+| `KYTY_RT_RESULTS` | `0` (default), `1` | `1`: with `KYTY_RT_ORACLE=1`, a BVH walk whose results the shader compiler derives is traced by one host ray query, without running the guest walk code |
 
 **Reporting a problem**
 

@@ -151,6 +151,11 @@ Options OptionsFromEnvironment(std::string& applied) {
     const auto oracleMode = NativeRt::ParseOracle(oracle);
     if (!oracleMode.has_value()) EXIT("KytyShim: KYTY_RT_ORACLE=%s is not a whole number from 0 to 15\n", oracle);
     options.rt_oracle = *oracleMode;
+    if (const char* results = Read("KYTY_RT_RESULTS", applied)) {
+        const std::string_view text(results);
+        if (text != "0" && text != "1") EXIT("KytyShim: KYTY_RT_RESULTS=%s is neither 0 nor 1\n", results);
+        if (text == "1" && (options.rt_oracle & 7u) != 0) options.rt_oracle |= 32u;
+    }
     for (const auto& number : Numbers) {
         const char* value = Read(number.variable, applied);
         if (value == nullptr) continue;

@@ -239,7 +239,7 @@ int Replay(const char* label, const std::vector<uint32_t>& code, uint64_t hash, 
 }
 
 int Usage() {
-	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-31] [--stats] [--replay-check] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex>)\n");
+	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-63] [--stats] [--replay-check] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex>)\n");
 	return 64;
 }
 
@@ -276,7 +276,7 @@ int main(int argc, char** argv) {
 		} else if (arg == "--emit") {
 			settings.emit = true;
 		} else if (arg == "--oracle" && i + 1 < argc) {
-			settings.oracle = static_cast<uint32_t>(std::atoi(argv[++i])) & 31u;
+			settings.oracle = static_cast<uint32_t>(std::atoi(argv[++i])) & 63u;
 		} else if (arg == "--stage" && i + 1 < argc) {
 			const std::string_view stage = argv[++i];
 			if (stage != "pixel" && stage != "compute") return Usage();

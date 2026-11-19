@@ -288,6 +288,7 @@ This build does not read KytyPS5's `KYTY_PIPELINE_PRECOMPILE`: stopping the game
 | `KYTY_RT_CHECK_PPM` | 0 to 1000000 | `1000` | Fraction of differing output dwords, in parts per million, above which a check fails | debug | compute | AnyKyty |
 | `KYTY_RT_CHECK_STRIKES` | 1 to 1000 | `3` | Failed checks in a row after which the program uses its emulated variant for the rest of the session (one `[RT] check … falls back` line) | debug | compute | AnyKyty |
 | `KYTY_RT_ARENA_MB` | MiB, empty counts as unset | a quarter of the largest device-local heap, 512 MiB to 4 GiB | Limit of the memory the native BLASes take; `0` means no limit | perf | all | Kyty import |
+| `KYTY_RT_RESULTS` | `0` or `1`, else stops | `0` | With `KYTY_RT_ORACLE` on, bit 32 of the oracle setting: in the default mode too, a walk whose results the compiler derives by playing the walk on synthetic BVHs (`ir/passes/RayQueryResults.cpp`) is traced by one host ray query and its results are substituted after the loop, without running the guest walk code. `KYTY_RT_ORACLE=3` and `5` already do it | perf | compute | AnyKyty |
 
 ### Logs, dumps, validation and profiling
 

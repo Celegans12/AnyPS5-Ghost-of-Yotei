@@ -129,6 +129,8 @@ void Oracle() {
     Expect(!Has(remaining, "pixel"), "KYTY_RT_ORACLE=1 leaves pixel shaders out");
     Expect(Has(OracleLine(Verdict::Native, 9), "in compute and pixel shaders"), "KYTY_RT_ORACLE=9 says pixel shaders are served");
     Expect(OracleLine(Verdict::Native, 8).empty(), "KYTY_RT_ORACLE=8 alone serves nothing and logs no oracle line");
+    Expect(Has(OracleLine(Verdict::Native, 33), "(KYTY_RT_ORACLE=1, KYTY_RT_RESULTS=1)"), "the oracle line names KYTY_RT_RESULTS apart from KYTY_RT_ORACLE");
+    Expect(OracleLine(Verdict::Native, 40).empty(), "KYTY_RT_RESULTS with KYTY_RT_ORACLE=8 alone logs no oracle line");
 }
 
 }
