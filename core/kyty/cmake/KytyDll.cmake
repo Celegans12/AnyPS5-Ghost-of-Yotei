@@ -12,6 +12,18 @@ set(ANYPS5_KYTY_DLL_PGO "OFF" CACHE STRING "Profile-guided optimization of kyty_
 set_property(CACHE ANYPS5_KYTY_DLL_PGO PROPERTY STRINGS OFF GEN USE)
 set(ANYPS5_KYTY_DLL_PGO_DIR "${CMAKE_BINARY_DIR}/kyty-dll-pgo" CACHE PATH "ANYPS5_KYTY_DLL_PGO=GEN: where the game writes .profraw files")
 set(ANYPS5_KYTY_DLL_PGO_PROFILE "" CACHE FILEPATH "ANYPS5_KYTY_DLL_PGO=USE: the merged .profdata")
+set(anyps5KytyPgoDefault "")
+if(EXISTS "${PROJECT_SOURCE_DIR}/core/kyty/pgo/kyty_gpu.proftext")
+    set(anyps5KytyPgoDefault "core/kyty/pgo/kyty_gpu.proftext")
+endif()
+set(ANYPS5_KYTY_PGO "${anyps5KytyPgoDefault}" CACHE STRING "LLVM profile that optimizes kyty_gpu (-fprofile-use), text (.proftext) or indexed (.profdata), relative to the source tree or absolute; empty for none (docs/dev/KYTY_PGO.md)")
+set(anyps5KytyPgo "${ANYPS5_KYTY_PGO}")
+if(NOT anyps5KytyPgo STREQUAL "" AND NOT IS_ABSOLUTE "${anyps5KytyPgo}")
+    get_filename_component(anyps5KytyPgo "${anyps5KytyPgo}" ABSOLUTE BASE_DIR "${PROJECT_SOURCE_DIR}")
+endif()
+if(NOT ANYPS5_KYTY_DLL_PGO STREQUAL "OFF")
+    set(anyps5KytyPgo "")
+endif()
 
 set(ANYPS5_KYTY_BINARY_DIR "${CMAKE_BINARY_DIR}/core/kyty")
 set(ANYPS5_KYTY_DLL_FILE "${ANYPS5_KYTY_BINARY_DIR}/kyty_gpu.prx")
@@ -33,6 +45,7 @@ ExternalProject_Add(kyty_gpu
         -DKYTY_DLL_PGO=${ANYPS5_KYTY_DLL_PGO}
         -DKYTY_DLL_PGO_DIR=${ANYPS5_KYTY_DLL_PGO_DIR}
         -DKYTY_DLL_PGO_PROFILE=${ANYPS5_KYTY_DLL_PGO_PROFILE}
+        -DKYTY_PGO_PROFILE=${anyps5KytyPgo}
     BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target kyty_gpu_dll_bundle --parallel ${ANYPS5_KYTY_JOBS}
     INSTALL_COMMAND ""
     BUILD_ALWAYS ON
