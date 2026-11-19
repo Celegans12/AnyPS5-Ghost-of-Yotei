@@ -51,8 +51,8 @@
 #endif
 
 #ifdef __linux__
-extern "C" __attribute__((visibility("hidden"))) void Aps5ReturnDeliveryStub();
-extern "C" __attribute__((visibility("hidden"))) bool Aps5ReturnSavesVectors;
+extern "C" [[gnu::visibility("hidden")]] void Aps5ReturnDeliveryStub();
+extern "C" [[gnu::visibility("hidden")]] bool Aps5ReturnSavesVectors;
 #endif
 
 #ifdef _WIN32
@@ -1636,7 +1636,7 @@ bool RaiseOn(Pthread thread) {
 }
 
 #ifdef __linux__
-__attribute__((visibility("hidden"))) bool Aps5ReturnSavesVectors = false;
+[[gnu::visibility("hidden")]] bool Aps5ReturnSavesVectors = false;
 
 namespace {
 
@@ -1709,7 +1709,7 @@ void RunAtReturn(ReturnFrame& frame, unsigned char* fx) {
 
 }
 
-extern "C" __attribute__((visibility("hidden"), used)) void Aps5ReturnDelivery(ReturnFrame* frame, unsigned char* fx) {
+extern "C" [[gnu::visibility("hidden"), gnu::used]] void Aps5ReturnDelivery(ReturnFrame* frame, unsigned char* fx) {
     const auto original = TakeArm(reinterpret_cast<std::uintptr_t>(frame) + offsetof(ReturnFrame, target));
     if (original == 0) {
         static constexpr char message[] = "sceKernelRaiseException: a return into guest code reached the delivery stub without a recorded return address\n";
