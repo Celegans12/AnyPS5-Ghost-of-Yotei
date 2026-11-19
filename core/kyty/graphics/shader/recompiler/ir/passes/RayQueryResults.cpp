@@ -28,7 +28,10 @@ constexpr uint32_t InfBits    = 0x7f800000u;
 constexpr uint32_t OneBits    = 0x3f800000u;
 constexpr uint32_t MaxVisits  = 6000;
 constexpr uint32_t MaxSeeds   = 12;
-constexpr uint32_t MaxRows    = 2048;
+constexpr uint32_t MaxRows    = 1024;
+constexpr uint64_t PrologueWork = 60000;
+constexpr uint64_t WalkWork     = 150000;
+constexpr uint64_t TotalWork    = 2200000;
 constexpr size_t   TaintBits  = 320;
 constexpr uint32_t TaintLive  = 0;
 constexpr uint32_t TaintLives = 240;
@@ -226,6 +229,7 @@ public:
 	[[nodiscard]] Taint DecisionTaint(const Inst* inst) const { return m_decision[m_slot.at(inst)]; }
 
 	void Activate(std::vector<uint8_t> active) { m_active = std::move(active); }
+	[[nodiscard]] uint64_t Work() const { return m_work; }
 	[[nodiscard]] const std::vector<uint8_t>& Active() const { return m_active; }
 
 	void Reset(uint64_t seed) {
@@ -242,6 +246,8 @@ public:
 		m_planted_reads.clear();
 	}
 	[[nodiscard]] bool PlantedRead(uint64_t address) const { return m_planted_reads.contains(address & ~uint64_t {3}); }
+	[[nodiscard]] uint32_t UserData(uint32_t reg) const { return Hash(0x5553000000000000ull + reg) & 3u; }
+	void Preset(uint64_t address, uint32_t value) { m_written[address & ~uint64_t {3}] = value; }
 	[[nodiscard]] uint32_t Peek(uint64_t address) const {
 		address &= ~uint64_t {3};
 		if (const auto at = m_written.find(address); at != m_written.end()) return at->second;
@@ -267,7 +273,10 @@ public:
 		m_walk = false;
 		const Block* previous = nullptr;
 		const Block* block    = m_program.blocks.front();
+		const auto   start    = m_work;
 		for (uint32_t visits = 0; visits < 4 * MaxVisits; ++visits) {
+			if (m_work - start > PrologueWork) return "the prologue exceeds its work bound";
+			if (m_work > TotalWork) return "the derivation exceeds its work budget";
 			if (block == m_header) {
 				from = previous;
 				return nullptr;
@@ -295,7 +304,10 @@ public:
 		m_visited.clear();
 		const Block* previous = from;
 		const Block* block    = m_header;
+		const auto   start    = m_work;
 		for (uint32_t visits = 0; visits < MaxVisits; ++visits) {
+			if (m_work - start > WalkWork) return "the walk exceeds its work bound";
+			if (m_work > TotalWork) return "the derivation exceeds its work budget";
 			m_visited.push_back(block);
 			if (const char* failure = Visit(block, previous)) return failure;
 			const Block* next = nullptr;
@@ -456,6 +468,7 @@ private:
 	}
 
 	const char* Visit(const Block* block, const Block* from) {
+		m_work += block->Instructions().size();
 		Phis(block, from);
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() == Op::Phi) continue;
@@ -555,7 +568,7 @@ private:
 			case Op::UndefU1:
 			case Op::UndefU32: Map(out, [](uint32_t) { return uint64_t {0}; }); return nullptr;
 			case Op::GetUserData:
-				Map(out, [&](uint32_t) { return uint64_t {Hash(0x5553000000000000ull + static_cast<uint64_t>(inst.Arg(0).ScalarRegister())) & 3u}; });
+				Map(out, [&](uint32_t) { return uint64_t {UserData(static_cast<uint32_t>(inst.Arg(0).ScalarRegister()))}; });
 				return nullptr;
 			case Op::GetBuiltin: {
 				const auto kind  = static_cast<StageInputKind>(inst.Arg(0).U32());
@@ -1074,6 +1087,7 @@ private:
 	std::unordered_set<const Block*>           m_reaches;
 	std::vector<uint8_t>                       m_active;
 	std::vector<uint8_t>                       m_varying;
+	uint64_t                                   m_work = 0;
 	std::vector<std::pair<uint64_t, uint32_t>> m_records;
 	std::vector<uint64_t>                      m_lists;
 };
@@ -1329,6 +1343,13 @@ std::vector<uint8_t> ActiveLanes(uint64_t seed, uint32_t wave) {
 void Analysis::Begin(uint64_t seed) {
 	m_machine.Reset(seed);
 	m_machine.Activate(ActiveLanes(seed, m_machine.Wave()));
+	if (m_result.header_vsharp == 0xffffffffu) {
+		const auto pointer = static_cast<uint64_t>(m_machine.UserData(m_result.user_sgpr)) |
+		                     static_cast<uint64_t>(m_machine.UserData(m_result.user_sgpr + 1u)) << 32u;
+		const auto header  = 0x0000100000000000ull + ((Mix(seed) & 0xffffffu) << 16u);
+		m_machine.Preset(pointer + m_result.header_offset, static_cast<uint32_t>(header));
+		m_machine.Preset(pointer + m_result.header_offset + 4u, static_cast<uint32_t>(header >> 32u));
+	}
 }
 
 const char* Analysis::Seed(uint64_t seed, Start& start) {
@@ -2259,6 +2280,7 @@ const char* Analysis::ForcedPath() {
 const char* Analysis::Derive() {
 	if (const char* failure = Prepare()) return failure;
 	for (uint64_t seed = 1; seed <= MaxSeeds && m_seeds.size() < 3; ++seed) {
+		if (seed > 3 && m_seeds.empty()) break;
 		Start start;
 		if (Seed(seed, start) != nullptr) continue;
 		uint32_t usable = 0;
