@@ -148,7 +148,7 @@ Project switches accept `ON` or `OFF`:
 | `-DANYPS5_RELINKER_ONLY=ON`      | `OFF`   | Build only the relinker and its tests, without third-party dependencies. |
 | `-DANYPS5_BUILD_WASM=ON`         | `OFF`   | Build only the browser relinker (`relinker_web` target). Requires `emcmake` from Emscripten and `BUILD_TESTING=OFF`. |
 | `-DANYPS5_ENABLE_SPIRV_TOOLS=ON` | `OFF`   | Enable SPIR-V validation and optimization.       |
-| `-DANYPS5_ENABLE_ASAN=ON`       | `OFF`   | Build with AddressSanitizer on Linux and move the guest arena out of ASan's shadow gap. |
+| `-DANYPS5_ENABLE_ASAN=ON`       | `OFF`   | Build with AddressSanitizer on Linux and move the guest arena out of ASan's shadow gap. The Clang-built Kyty renderer is also instrumented and uses the ASan runtime linked by the outer GCC build. |
 | `-DANYPS5_ENABLE_TSAN=ON`       | `OFF`   | Build with ThreadSanitizer on Linux and link executables dynamically. Cannot be combined with `-DANYPS5_ENABLE_ASAN=ON` or `-DANYPS5_BUILD_FUZZERS=ON`. |
 | `-DANYPS5_USE_SYSTEM_DEPS=ON`    | `OFF`   | Resolve SDL2, freetype, Vulkan-Headers, SPIRV-Headers, glslang and SPIRV-Tools from the system instead of the submodules. |
 | `-DANYPS5_RELINKER_CLI=OFF`     | `ON`    | Skip the native relinker command line (`ANYPS5_BUILD_WASM` turns it off). |

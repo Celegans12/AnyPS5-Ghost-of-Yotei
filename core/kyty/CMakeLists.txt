@@ -261,6 +261,12 @@ target_link_libraries(kyty_gpu
 target_compile_features(kyty_gpu PUBLIC cxx_std_20)
 target_compile_definitions(kyty_gpu PUBLIC ANYPS5_KYTY=1)
 
+option(KYTY_ENABLE_ASAN "Instrument the Kyty renderer with AddressSanitizer" OFF)
+if(KYTY_ENABLE_ASAN)
+    target_compile_options(kyty_gpu PRIVATE -fsanitize=address)
+    target_compile_definitions(kyty_gpu PRIVATE ANYPS5_ENABLE_ASAN=1)
+endif()
+
 set(KYTY_PGO_PROFILE "" CACHE FILEPATH "LLVM instrumentation profile to optimize kyty_gpu with (-fprofile-use): text (.proftext) or indexed (.profdata); empty for none")
 option(KYTY_PGO_GENERATE "Instrument kyty_gpu to write an LLVM profile (-fprofile-generate; LLVM_PROFILE_FILE names the file, KYTY_PGO_DUMP_SECONDS writes it periodically), Linux only" OFF)
 set(KYTY_PGO_TARGETS kyty_gpu fmt xxhash TracyClient zarchive libzstd_static)

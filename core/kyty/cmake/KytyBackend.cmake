@@ -83,6 +83,7 @@ ExternalProject_Add(kyty_gpu
         -DCMAKE_CXX_COMPILER_LAUNCHER=${CMAKE_CXX_COMPILER_LAUNCHER}
         -DANYPS5_SOURCE_DIR=${PROJECT_SOURCE_DIR}
         -DKYTY_GCC_INSTALL_DIR=${ANYPS5_KYTY_GCC_INSTALL_DIR}
+        -DKYTY_ENABLE_ASAN:BOOL=${ANYPS5_ENABLE_ASAN}
         -DKYTY_THIN_LTO=${ANYPS5_KYTY_THIN_LTO}
         -DKYTY_THIN_LTO_JOBS=${ANYPS5_KYTY_JOBS}
         -DKYTY_PGO_PROFILE=${anyps5KytyPgo}
@@ -132,6 +133,9 @@ else()
 endif()
 if(ANYPS5_KYTY_THIN_LTO)
     target_link_options(anyps5_kyty_gpu INTERFACE "$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:LINKER:--gc-sections>")
+    if(ANYPS5_ENABLE_ASAN)
+        target_link_options(anyps5_kyty_gpu INTERFACE "$<$<STREQUAL:$<TARGET_PROPERTY:TYPE>,EXECUTABLE>:LINKER:-z,start-stop-gc>")
+    endif()
 endif()
 if(ANYPS5_KYTY_PGO_GENERATE)
     target_link_libraries(anyps5_kyty_gpu INTERFACE "${anyps5KytyPgoRuntime}")
