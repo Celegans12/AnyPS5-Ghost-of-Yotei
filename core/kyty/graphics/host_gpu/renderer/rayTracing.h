@@ -251,7 +251,6 @@ private:
 		uint64_t                     built_refit_seq = 0;
 		bool                         fast_built      = false;
 		uint32_t                     gathers         = 0;
-		bool                         updatable       = false;
 		uint64_t                     last_use_frame  = 0;
 		bool                         evicted         = false;
 		std::vector<std::array<uint32_t, 4>> layout;

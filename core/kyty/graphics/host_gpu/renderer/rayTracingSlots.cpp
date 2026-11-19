@@ -201,7 +201,7 @@ struct Job {
 	uint32_t layout_count;
 	uint32_t mismatches;
 	uint32_t leaves;
-	uint32_t update;
+	uint32_t pad2;
 };
 
 constexpr uint32_t JobLayoutMismatch = 16;
@@ -281,10 +281,6 @@ constexpr vk::BuildAccelerationStructureFlagsKHR BlasFlags =
     vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastTrace;
 constexpr vk::BuildAccelerationStructureFlagsKHR FastBlasFlags =
     vk::BuildAccelerationStructureFlagBitsKHR::ePreferFastBuild;
-constexpr vk::BuildAccelerationStructureFlagsKHR UpdatableBlasFlags =
-    BlasFlags | vk::BuildAccelerationStructureFlagBitsKHR::eAllowUpdate;
-constexpr vk::BuildAccelerationStructureFlagsKHR FastUpdatableBlasFlags =
-    FastBlasFlags | vk::BuildAccelerationStructureFlagBitsKHR::eAllowUpdate;
 
 vk::AccelerationStructureGeometryKHR TriangleGeometry(uint64_t address, uint32_t capacity,
                                                       bool opaque) {
@@ -340,8 +336,6 @@ struct RtStats {
 	std::atomic<uint32_t> last_overflow_boxes {0};
 	RtCounter             walks_incomplete;
 	RtCounter             incomplete_instances;
-	RtCounter             blas_updates;
-	RtCounter             kept_triangles;
 	std::atomic<uint64_t> last_incomplete {0};
 	std::atomic<uint64_t>                guest_rays {0};
 	uint64_t                             guest_rays_reported = 0;
@@ -386,8 +380,6 @@ void SummarizeRayTracing() {
 	const auto incomplete  = stats.walks_incomplete.TakeDelta();
 	const auto missing     = stats.incomplete_instances.TakeDelta();
 	const auto unpublished = null_header + bad_header;
-	const auto updates     = stats.blas_updates.TakeDelta();
-	const auto kept        = stats.kept_triangles.TakeDelta();
 	const auto rays_total = stats.guest_rays.load(std::memory_order_relaxed);
 	const auto rays       = rays_total - stats.guest_rays_reported;
 	stats.guest_rays_reported  = rays_total;
@@ -402,7 +394,7 @@ void SummarizeRayTracing() {
 	const auto new_always_guest = programs.always_guest - stats.programs_reported.always_guest;
 	const auto new_pixel_guest  = programs.pixel_guest - stats.programs_reported.pixel_guest;
 	stats.programs_reported     = programs;
-	if (next == 0 || empty + unpublished + uncached + overflow + incomplete + rays + oracle + kept + new_empty +
+	if (next == 0 || empty + unpublished + uncached + overflow + incomplete + rays + oracle + new_empty +
 	                         new_always_guest + new_pixel_guest ==
 	                     0) {
 		return;
@@ -439,11 +431,6 @@ void SummarizeRayTracing() {
 		                "TLAS memory not cached yet or a full host structure (last cs {}): their contexts were published, "
 		                "and their rays missed what the host structures left out",
 		                incomplete, missing, RtShader(stats.last_incomplete.load(std::memory_order_relaxed))));
-	}
-	if (kept != 0) {
-		log(fmt::format("[RT]   {} BLAS updates, in which {} triangles kept the active or inactive state of their build: "
-		                "an update must not turn a triangle on or off, they wait for the next build",
-		                updates, kept));
 	}
 	if (rays != 0) {
 		log(fmt::format("[RT]   {} rays had no host context or host service and missed (last cs {})", rays,
@@ -979,15 +966,13 @@ bool RayTracing::ComputeSlotSizes(uint32_t opaque, uint32_t alpha, SlotSizes& si
 	device.getAccelerationStructureBuildSizesKHR(vk::AccelerationStructureBuildTypeKHR::eDevice, &info,
 	                                             counts.data(), &build);
 	{
-		for (const auto flags: {FastBlasFlags, UpdatableBlasFlags, FastUpdatableBlasFlags}) {
-			auto other_info  = info;
-			other_info.flags = flags;
-			vk::AccelerationStructureBuildSizesInfoKHR other {};
-			device.getAccelerationStructureBuildSizesKHR(vk::AccelerationStructureBuildTypeKHR::eDevice,
-			                                             &other_info, counts.data(), &other);
-			build.accelerationStructureSize = std::max(build.accelerationStructureSize, other.accelerationStructureSize);
-			build.buildScratchSize = std::max({build.buildScratchSize, other.buildScratchSize, other.updateScratchSize});
-		}
+		auto fast_info  = info;
+		fast_info.flags = FastBlasFlags;
+		vk::AccelerationStructureBuildSizesInfoKHR fast {};
+		device.getAccelerationStructureBuildSizesKHR(vk::AccelerationStructureBuildTypeKHR::eDevice, &fast_info,
+		                                             counts.data(), &fast);
+		build.accelerationStructureSize = std::max(build.accelerationStructureSize, fast.accelerationStructureSize);
+		build.buildScratchSize          = std::max(build.buildScratchSize, fast.buildScratchSize);
 	}
 	sizes.storage   = (build.accelerationStructureSize + 255u) & ~uint64_t {255};
 	sizes.vertices0 = (uint64_t {sizes.capacity0} * 36 + 255u) & ~uint64_t {255};
@@ -1015,7 +1000,6 @@ void RayTracing::AllocateSlot(Slot& slot, const SlotSizes& sizes) {
 	slot.entries       = m_arena.Allocate(sizes.entries, 256);
 	slot.build_scratch = sizes.scratch;
 	slot.built         = false;
-	slot.updatable     = false;
 	vk::AccelerationStructureCreateInfoKHR create {};
 	create.buffer = slot.storage.buffer->Handle();
 	create.offset = slot.storage.offset;
@@ -1330,10 +1314,6 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 		for (size_t i = 0; i < jobs.size(); i++) {
 			auto&      slot   = *m_slot_list[slots[i]];
 			const bool gather = gathers(&slot);
-			jobs[i].update    = gather && slot.refit_seq == m_refit_seq && slot.updatable &&
-			                         slot.fast_built == (slot.dynamic_until != 0)
-			                        ? 1u
-			                        : 0u;
 			slot.gathers         = gather ? slot.gathers + 1 : 0;
 			slot.built_refit_seq = m_refit_seq;
 			(gather ? gather_jobs : walk_jobs).push_back(jobs[i]);
@@ -1423,21 +1403,16 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 		uint32_t                     capacity0;
 		uint32_t                     capacity1;
 		uint32_t                     fast;
-		uint32_t                     update;
 	};
 	std::vector<BuildRecord> records;
 	uint64_t                 scratch_offset = 0;
 	const auto               scratch_base   = m_build_scratch->BufferDeviceAddress();
 	for (size_t i = 0; i < slots.size(); i++) {
-		auto&          slot      = *m_slot_list[slots[i]];
-		const bool     fast      = slot.dynamic_until != 0;
-		const bool     updatable = slot.refit_seq == m_refit_seq;
-		const uint32_t update    = jobs[i].update != 0 ? 2u : updatable ? 1u : 0u;
+		auto&      slot = *m_slot_list[slots[i]];
+		const bool fast = slot.dynamic_until != 0;
 		slot.fast_built = fast;
-		slot.updatable  = updatable;
 		records.push_back({slot.handle, slot.vertices0.address, slot.vertices1.address,
-		                   scratch_base + scratch_offset, slot.capacity0, slot.capacity1,
-		                   fast ? 1u : 0u, update});
+		                   scratch_base + scratch_offset, slot.capacity0, slot.capacity1, fast ? 1u : 0u});
 		scratch_offset += (slot.build_scratch + Alignment - 1) & ~(Alignment - 1);
 	}
 	const auto* copy  = command.CopyArray(records.data(), records.size());
@@ -1452,12 +1427,8 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 			geometries[i * 2 + 1] = TriangleGeometry(copy[i].vertices1, copy[i].capacity1, false);
 			auto& info                     = infos[i];
 			info.type                      = vk::AccelerationStructureTypeKHR::eBottomLevel;
-			info.flags = copy[i].fast != 0 ? (copy[i].update != 0 ? FastUpdatableBlasFlags : FastBlasFlags)
-			             : copy[i].update != 0 ? UpdatableBlasFlags
-			                                   : BlasFlags;
-			info.mode  = copy[i].update == 2 ? vk::BuildAccelerationStructureModeKHR::eUpdate
-			                                 : vk::BuildAccelerationStructureModeKHR::eBuild;
-			info.srcAccelerationStructure  = copy[i].update == 2 ? copy[i].handle : nullptr;
+			info.flags                     = copy[i].fast != 0 ? FastBlasFlags : BlasFlags;
+			info.mode                      = vk::BuildAccelerationStructureModeKHR::eBuild;
 			info.dstAccelerationStructure  = copy[i].handle;
 			info.geometryCount             = 2;
 			info.pGeometries               = &geometries[i * 2];
@@ -1894,10 +1865,6 @@ void RayTracing::ProcessReadback(Readback& readback) {
 	for (uint32_t i = 0; i < readback.build_count && i < readback.build_slots.size(); i++) {
 		Job job {};
 		std::memcpy(&job, bytes + ReadbackJobs + uint64_t {i} * JobStride, sizeof(job));
-		if (job.update != 0) {
-			g_rt_stats.blas_updates.Add();
-			g_rt_stats.kept_triangles.Add(job.mismatches);
-		}
 		if ((job.result & 1u) == 0 && ((job.result >> 1u) & 5u) != 0) {
 			const auto index = readback.build_slots[i];
 			if (m_slot_list[index] != nullptr && !m_slot_list[index]->evicted) {
