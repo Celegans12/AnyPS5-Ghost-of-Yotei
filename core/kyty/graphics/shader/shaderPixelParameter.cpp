@@ -24,6 +24,19 @@ uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index) {
 	return UINT32_MAX;
 }
 
+#if defined(ANYPS5_KYTY)
+uint32_t ShaderPixelPackedBlendSlots(const ShaderPixelInputInfo& info) {
+	uint32_t slots = 0;
+	for (uint32_t export_index = 0; export_index < 8u; export_index++) {
+		if ((info.target_packed_blend_mask & (1u << export_index)) == 0u) continue;
+		const auto slot = ShaderPixelExportTarget(info.target_shader_mask, export_index);
+		EXIT_IF(slot >= 8u);
+		slots |= 1u << slot;
+	}
+	return slots;
+}
+#endif
+
 uint32_t ShaderPixelParameterMappedLocation(const ShaderPixelInputInfo& info, uint32_t input) {
 	return input < info.input_num ? info.interpolator_settings[input] & PsInputOffsetMask : input;
 }

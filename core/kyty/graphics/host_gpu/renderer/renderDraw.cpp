@@ -797,6 +797,50 @@ struct DrawCallInfo {
 	[[nodiscard]] const char* Name() const { return indexed ? "DrawIndex" : "DrawIndexAuto"; }
 };
 
+#if defined(ANYPS5_KYTY)
+void RenderExecutor::PreparePackedTargets(CommandBuffer& buffer, PreparedBindings& pixel,
+                                          const ShaderPixelInputInfo& info) {
+	auto& cache = m_context.GetTextureCache();
+	pixel.packed_targets.clear();
+	for (uint32_t export_index = 0; export_index < 8u; export_index++) {
+		if ((info.target_packed_blend_mask & (1u << export_index)) == 0u) continue;
+		const auto slot   = ShaderPixelExportTarget(info.target_shader_mask, export_index);
+		const auto colors = std::span {m_draw_targets->colors, m_draw_targets->color_count};
+		const auto found  = std::ranges::find(colors, slot, &RenderColorInfo::target_slot);
+		if (found == colors.end()) {
+			EXIT("packed UNorm render target %u of export %u is not bound\n", slot, export_index);
+		}
+		auto& image = cache.GetImage(found->image_id);
+		if (image.binding.is_bound) {
+			EXIT("packed UNorm render target %u is also a shader resource of its draw\n", slot);
+		}
+		auto view_info = found->desc.view_info;
+		if (found->desc.info.samples != 1u || found->desc.info.IsVolume() ||
+		    view_info.level_count != 1u || view_info.layer_count != 1u ||
+		    view_info.format != vk::Format::eR32Uint) {
+			EXIT("unsupported packed UNorm render target %u: samples=%u volume=%u levels=%u layers=%u "
+			     "format=%d\n",
+			     slot, found->desc.info.samples, static_cast<uint32_t>(found->desc.info.IsVolume()),
+			     view_info.level_count, view_info.layer_count, static_cast<int>(view_info.format));
+		}
+		(void)cache.FindRenderTarget(found->image_id, found->desc);
+		view_info.type    = vk::ImageViewType::e2D;
+		view_info.mapping = {};
+		view_info.min_lod = 0;
+		view_info.usage   = vk::ImageUsageFlagBits::eStorage;
+		const auto view   = image.FindView(view_info);
+		EXIT_IF(view == nullptr);
+		BindImage(found->image_id, true);
+		image.Transit(vk::ImageLayout::eGeneral,
+		              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite,
+		              ImageSubresourceRange {view_info.base_level, 1u, view_info.base_layer, 1u},
+		              buffer.Handle());
+		pixel.packed_targets.push_back({nullptr, view, vk::ImageLayout::eGeneral});
+		m_packed_target_slots |= 1u << slot;
+	}
+}
+#endif
+
 RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderColorInfo* colors,
                                                  uint32_t color_count, RenderDepthInfo& depth,
                                                  vk::ImageAspectFlags& feedback_aspects,
@@ -838,6 +882,16 @@ RenderState RenderExecutor::AcquireRenderTargets(CommandBuffer& buffer, RenderCo
 		color_views[i]        = image_view;
 		auto&      image      = cache.GetImage(target.image_id);
 		EXIT_IF(image.backing.samples != target.desc.info.samples || image_view == nullptr);
+#if defined(ANYPS5_KYTY)
+		if ((m_packed_target_slots & (1u << target.target_slot)) != 0u) {
+			const auto extent           = target.Extent();
+			state.width                 = std::min(state.width, extent.width);
+			state.height                = std::min(state.height, extent.height);
+			state.num_layers            = std::min(state.num_layers, target.desc.view_info.layer_count);
+			state.num_color_attachments = std::max(state.num_color_attachments, target.target_slot + 1);
+			continue;
+		}
+#endif
 		const auto& view   = target.desc.view_info;
 		const auto  layout = image.binding.is_bound ? vk::ImageLayout::eGeneral
 		                                            : vk::ImageLayout::eColorAttachmentOptimal;
@@ -1835,6 +1889,11 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		}
 	}
 
+#if defined(ANYPS5_KYTY)
+	if (state.ps_active && state.ps_input_info.target_packed_blend_mask != 0u) {
+		m_draw_resource_key = 0;
+	}
+#endif
 	std::array<const ShaderStageRuntime*, 4> stage_runtimes {};
 	for (uint32_t i = 0; i < vertex_stages.size(); i++) {
 		stage_runtimes[i] = &state.vertex_info[i].stage;
@@ -1912,6 +1971,12 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 	}
 	const auto stages = std::span {descriptor_stages.data(), stage_count};
 	PrepareGraphicsBindings(stages, std::span {m_draw_targets->colors, m_draw_targets->color_count});
+#if defined(ANYPS5_KYTY)
+	m_packed_target_slots = 0;
+	if (state.ps_active && state.ps_input_info.target_packed_blend_mask != 0u) {
+		PreparePackedTargets(buffer, bindings.pixel, state.ps_input_info);
+	}
+#endif
 	const bool template_held =
 	    draw_template != nullptr && std::ranges::none_of(stages, [](const PreparedBindings* stage) {
 		    return stage->template_stage == nullptr;
@@ -1954,6 +2019,9 @@ void RenderExecutor::ExecutePreparedDraw(CommandBuffer& buffer, const DrawCallIn
 		rendering_state = AcquireRenderTargets(buffer, m_draw_targets->colors, m_draw_targets->color_count,
 		                                       m_draw_targets->depth, feedback_aspects, stages);
 	}
+#if defined(ANYPS5_KYTY)
+	m_packed_target_slots = 0;
+#endif
 	const auto& rendering = rendering_state;
 	vk::DeviceAddress task_params = 0;
 	if (mesh_task) {

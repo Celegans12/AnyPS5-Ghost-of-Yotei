@@ -182,6 +182,31 @@ struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {
 enum class ShaderAlphaBlendSource : uint8_t { None, SourceAlpha, SourceAlphaOne, SourceAlphaZero };
 enum class ShaderPixelParameterMode : uint8_t { FirstVertex, LastVertex, Rectangle };
 
+#if defined(ANYPS5_KYTY)
+struct ShaderPackedBlend {
+	uint8_t src_factor = 1;
+	uint8_t dst_factor = 0;
+	uint8_t op         = 0;
+	uint8_t write_mask = 7;
+	bool    blend      = false;
+	bool    clamp      = true;
+
+	[[nodiscard]] constexpr uint32_t Encode() const {
+		return (src_factor & 0x1fu) | ((dst_factor & 0x1fu) << 5u) | ((op & 7u) << 10u) |
+		       (uint32_t {blend} << 13u) | (uint32_t {clamp} << 14u) | ((write_mask & 7u) << 16u);
+	}
+
+	[[nodiscard]] static constexpr ShaderPackedBlend Decode(uint32_t word) {
+		return {.src_factor = static_cast<uint8_t>(word & 0x1fu),
+		        .dst_factor = static_cast<uint8_t>((word >> 5u) & 0x1fu),
+		        .op         = static_cast<uint8_t>((word >> 10u) & 7u),
+		        .write_mask = static_cast<uint8_t>((word >> 16u) & 7u),
+		        .blend      = ((word >> 13u) & 1u) != 0u,
+		        .clamp      = ((word >> 14u) & 1u) != 0u};
+	}
+};
+#endif
+
 struct ShaderPixelInputInfo {
 	uint32_t                                       interpolator_settings[32]    = {0};
 	uint32_t                                       input_num                    = 0;
@@ -198,6 +223,11 @@ struct ShaderPixelInputInfo {
 	uint8_t                                        target_uint_mask             = 0;
 	uint8_t                                        target_sint_mask             = 0;
 	uint8_t                                        target_round_mode            = 0;
+#if defined(ANYPS5_KYTY)
+	uint8_t                                        target_packed_blend_mask     = 0;
+	bool                                           target_packed_blend_tests    = false;
+	std::array<uint32_t, 8>                        target_packed_blend          = {};
+#endif
 	uint32_t                                       scratch_size_dwords          = 0;
 	uint32_t                                       lds_size_dwords              = 0;
 	bool                                           ps_pos_x                     = false;
@@ -347,6 +377,9 @@ const char* ShaderRegisteredName(uint64_t addr);
 bool ShaderNameRegistered(const char* name);
 
 uint32_t ShaderPixelExportTarget(uint32_t shader_mask, uint32_t export_index);
+#if defined(ANYPS5_KYTY)
+uint32_t ShaderPixelPackedBlendSlots(const ShaderPixelInputInfo& info);
+#endif
 
 using ShaderMapListener = void (*)(void* userdata, uint64_t hash, std::span<const uint32_t> code);
 void ShaderSetMapListener(ShaderMapListener listener, void* userdata);

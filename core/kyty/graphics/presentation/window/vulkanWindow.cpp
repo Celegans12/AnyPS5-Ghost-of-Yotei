@@ -523,6 +523,19 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		}
 	}
 	LOGF("Vulkan graphics pipeline libraries: %s\n", graphics.pipeline_library_enabled ? "true" : "false");
+	if (HasExtension(available_extensions, VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME)) {
+		vk::StructureChain<vk::PhysicalDeviceFeatures2, vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT>
+		    interlock_features;
+		physical_device.getFeatures2(&interlock_features.get<vk::PhysicalDeviceFeatures2>());
+		graphics.fragment_shader_pixel_interlock_enabled =
+		    interlock_features.get<vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT>()
+		        .fragmentShaderPixelInterlock == VK_TRUE;
+		if (graphics.fragment_shader_pixel_interlock_enabled) {
+			add(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME);
+		}
+	}
+	LOGF("Vulkan fragment shader pixel interlock: %s\n",
+	     graphics.fragment_shader_pixel_interlock_enabled ? "true" : "false");
 #endif
 	graphics.sampler_filter_minmax_enabled      = supported12.samplerFilterMinmax;
 
@@ -773,6 +786,12 @@ static vk::Device VulkanCreateDevice(GraphicContext&          graphics,
 		auto& device_info     = create.get<vk::DeviceCreateInfo>();
 		library_enabled.pNext = const_cast<void*>(device_info.pNext);
 		device_info.pNext     = &library_enabled;
+	}
+	vk::PhysicalDeviceFragmentShaderInterlockFeaturesEXT interlock_enabled {.fragmentShaderPixelInterlock = VK_TRUE};
+	if (graphics.fragment_shader_pixel_interlock_enabled) {
+		auto& device_info       = create.get<vk::DeviceCreateInfo>();
+		interlock_enabled.pNext = const_cast<void*>(device_info.pNext);
+		device_info.pNext       = &interlock_enabled;
 	}
 #endif
 	vk::Device device = nullptr;

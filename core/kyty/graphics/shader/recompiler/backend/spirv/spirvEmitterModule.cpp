@@ -290,6 +290,12 @@ void DefineDescriptors(EmitterState& state) {
 		}
 	}
 	counts[static_cast<size_t>(Kind::Samplers)] = static_cast<uint32_t>(info.samplers.size());
+#if defined(ANYPS5_KYTY)
+	if (state.program.stage == ShaderType::Pixel) {
+		counts[static_cast<size_t>(Kind::PackedTargets)] =
+		    static_cast<uint32_t>(std::popcount(state.input_info.pixel->target_packed_blend_mask));
+	}
+#endif
 	counts[static_cast<size_t>(Kind::Gds)] = info.uses_gds;
 	counts[static_cast<size_t>(Kind::SharedMemory)] =
 	    info.uses_lds && state.lds_storage_class == spv::StorageClassStorageBuffer;
@@ -405,6 +411,17 @@ void DefineDescriptors(EmitterState& state) {
 				    Define(ArrayType(block), "uniform_buffers", spv::StorageClassUniform);
 				break;
 			}
+#if defined(ANYPS5_KYTY)
+			case IR::DescriptorBindingKind::PackedTargets:
+				state.packed_target_type = state.builder.Type(
+				    spv::OpTypeImage, TypeU32(state), static_cast<uint32_t>(spv::Dim2D), 0u, 0u, 0u, 2u,
+				    static_cast<uint32_t>(spv::ImageFormatR32ui));
+				state.packed_target_variable = Define(ArrayType(state.packed_target_type), "packed_targets",
+				                                      spv::StorageClassUniformConstant);
+				state.builder.AddAnnotation(spv::OpDecorate, state.packed_target_variable,
+				                            spv::DecorationCoherent);
+				break;
+#endif
 			case IR::DescriptorBindingKind::SharedMemory:
 				state.lds_variable = Define(StorageBufferType(state, state.storage_buffers[2]), "lds_dwords");
 				state.builder.AddAnnotation(spv::OpDecorate, state.lds_variable, spv::DecorationCoherent);
@@ -508,6 +525,48 @@ uint32_t DefineInterfaceVariable(EmitterState& state, uint32_t type, spv::Storag
 	state.builder.AddName(variable, name);
 	return variable;
 }
+
+#if defined(ANYPS5_KYTY)
+void DefinePackedTargets(EmitterState& state) {
+	if (state.program.stage != ShaderType::Pixel) {
+		return;
+	}
+	const auto& pixel = *state.input_info.pixel;
+	if (pixel.target_packed_blend_mask == 0u) {
+		return;
+	}
+	EXIT_IF((pixel.target_packed_blend_mask & ~pixel.target_packed_unorm_mask) != 0u ||
+	        state.packed_target_variable == 0 || pixel.ps_depth_export_enable ||
+	        pixel.ps_sample_mask_export_enable);
+	if (!pixel.ps_early_z && pixel.target_packed_blend_tests &&
+	    (std::ranges::any_of(state.program.info.buffers, [](const auto& buffer) { return buffer.written; }) ||
+	     std::ranges::any_of(state.program.info.images, [](const auto& image) { return image.written; }) ||
+	     state.program.info.uses_gds)) {
+		EXIT("unsupported packed UNorm render-target blend: shader 0x%016" PRIx64
+		     " writes memory under late depth and stencil tests\n",
+		     state.program.shader_hash);
+	}
+	state.pixel_guest_func = state.builder.AllocateId();
+	state.builder.RequireCapability(spv::CapabilityFragmentShaderPixelInterlockEXT);
+	state.builder.RequireExtension("SPV_EXT_fragment_shader_interlock");
+	state.builder.AddExecutionMode(state.main_func, spv::ExecutionModePixelInterlockOrderedEXT);
+	state.packed_frag_coord_variable = InputVariableForKind(state, IR::StageInputKind::FragCoord);
+	if (state.packed_frag_coord_variable == 0) {
+		state.packed_frag_coord_variable = DefineInterfaceVariable(
+		    state, TypeF32Vector(state, 4), spv::StorageClassInput, "gl_FragCoord");
+		state.builder.AddAnnotation(spv::OpDecorate, state.packed_frag_coord_variable,
+		                            spv::DecorationBuiltIn, spv::BuiltInFragCoord);
+	}
+	for (uint32_t index = 0; index < 8u; index++) {
+		if ((pixel.target_packed_blend_mask & (1u << index)) == 0u) continue;
+		state.packed_source_variables[index] = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, TypeF32Vector(state, 4)),
+		    spv::StorageClassPrivate);
+		state.packed_pending_variables[index] = state.builder.DefineGlobalVariable(
+		    TypePointer(state, spv::StorageClassPrivate, TypeU32(state)), spv::StorageClassPrivate);
+	}
+}
+#endif
 
 namespace {
 
@@ -799,6 +858,9 @@ void DefineModule(EmitterState& state) {
 		}
 	}
 	state.main_func = state.builder.AllocateId();
+#if defined(ANYPS5_KYTY)
+	DefinePackedTargets(state);
+#endif
 	if (state.program.stage == ShaderType::Mesh) {
 		state.mesh_guest_func = state.builder.AllocateId();
 		state.builder.RequireCapability(spv::CapabilityMeshShadingEXT);
@@ -954,11 +1016,20 @@ void DefineModule(EmitterState& state) {
 		if (state.depth_variable != 0) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDepthReplacing);
 		}
+#if defined(ANYPS5_KYTY)
+		if ((state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
+		     !state.input_info.pixel->ps_depth_export_enable &&
+		     !state.input_info.pixel->ps_sample_mask_export_enable) ||
+		    state.pixel_guest_func != 0) {
+			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
+		}
+#else
 		if (state.input_info.pixel->ps_early_z && !state.input_info.pixel->ps_pixel_kill_enable &&
 		    !state.input_info.pixel->ps_depth_export_enable &&
 		    !state.input_info.pixel->ps_sample_mask_export_enable) {
 			state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeEarlyFragmentTests);
 		}
+#endif
 	}
 	if (state.program.info.compute_derivatives && state.program.stage == ShaderType::Compute) {
 		state.builder.AddExecutionMode(state.main_func, spv::ExecutionModeDerivativeGroupQuadsKHR);

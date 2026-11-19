@@ -1,4 +1,7 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
+#if defined(ANYPS5_KYTY)
+#include "graphics/shader/recompiler/backend/spirv/packedUnormBlendProbe.h"
+#endif
 
 #include "common/assert.h"
 
@@ -6,6 +9,7 @@
 #include <string>
 #include <cstdlib>
 #include <bit>
+#include <cmath>
 #include <cstdlib>
 #include <functional>
 #include <optional>
@@ -318,7 +322,13 @@ void StoreDispatcherPhiEdge(ValueEmitContext& ctx, const DispatcherFunctionState
 }
 
 void EmitReturn(ValueEmitContext& ctx) {
+#if defined(ANYPS5_KYTY)
+	if (ctx.state.pixel_guest_func == 0) {
+		EmitKillIfPixelValidMaskInactive(ctx.state);
+	}
+#else
 	EmitKillIfPixelValidMaskInactive(ctx.state);
+#endif
 	if (ctx.state.object_primitive_id_variable != 0) {
 		auto& state = ctx.state;
 		const auto primitive = EmitGetBuiltin(
@@ -1255,6 +1265,182 @@ const IR::ExportInfo& ValueEmitContext::Export(const IR::Inst& inst) const {
 	std::abort();
 }
 
+#if defined(ANYPS5_KYTY)
+uint32_t EmitPackedUnormBlend(EmitterState& state, const ShaderPackedBlend& blend, bool truncate,
+                              uint32_t source, uint32_t destination) {
+	using Factor = Prospero::BlendFactor;
+	const auto info = Format::GetFormatInfo(Prospero::BufferFormat::k11_11_10UNorm);
+	const auto f32  = TypeF32(state);
+	const auto u32  = TypeU32(state);
+	const auto zero = ConstantF32Value(state, 0.0f);
+	const auto one  = ConstantF32Value(state, 1.0f);
+	const auto exact = [&](spv::Op opcode, uint32_t lhs, uint32_t rhs) {
+		const auto result = Binary(state, opcode, f32, lhs, rhs);
+		state.builder.AddAnnotation(spv::OpDecorate, result, spv::DecorationNoContraction);
+		return result;
+	};
+	const auto saturate = [&](uint32_t value) {
+		const auto bits = Unary(state, spv::OpBitcast, u32, value);
+		value = Select(state, f32, EmitClassifyF32Bits(state, bits).nan, zero, value);
+		return EmitGlsl<GLSLstd450FClamp, IR::Type::F32>(state, value, zero, one);
+	};
+	const auto extract = [&](uint32_t composite, uint32_t index) {
+		const auto result = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpCompositeExtract, f32, result, composite, index);
+		return result;
+	};
+	auto source_alpha = extract(source, 3u);
+	if (blend.blend && blend.clamp) {
+		source_alpha = saturate(source_alpha);
+	}
+	uint32_t packed = 0;
+	for (uint32_t component = 0; component < info.component_count; component++) {
+		const auto bits       = info.component_bits[component];
+		const auto offset     = info.component_bit_offset[component];
+		const auto field_mask = (1u << bits) - 1u;
+		uint32_t   field      = 0;
+		if ((blend.write_mask & (1u << component)) == 0u) {
+			field = Binary(state, spv::OpBitwiseAnd, u32, destination,
+			               ConstantU32(state, field_mask << offset));
+		} else {
+			auto src    = extract(source, component);
+			auto result = src;
+			if (blend.blend) {
+				if (blend.clamp) {
+					src = saturate(src);
+				}
+				const auto stored = state.builder.AllocateId();
+				state.builder.AddFunction(spv::OpBitFieldUExtract, u32, stored, destination,
+				                          ConstantU32(state, offset), ConstantU32(state, bits));
+				const auto dst = exact(spv::OpFMul, Unary(state, spv::OpConvertUToF, f32, stored),
+				                       ConstantF32Value(state, std::nextafter(1.0f / static_cast<float>(field_mask), 1.0f)));
+				const auto weighted = [&](uint8_t factor, uint32_t operand) {
+					switch (static_cast<Factor>(factor)) {
+						case Factor::kZero: return zero;
+						case Factor::kOne: return operand;
+						case Factor::kSrcColor: return exact(spv::OpFMul, operand, src);
+						case Factor::kOneMinusSrcColor:
+							return exact(spv::OpFMul, operand, exact(spv::OpFSub, one, src));
+						case Factor::kSrcAlpha: return exact(spv::OpFMul, operand, source_alpha);
+						case Factor::kOneMinusSrcAlpha:
+							return exact(spv::OpFMul, operand, exact(spv::OpFSub, one, source_alpha));
+						case Factor::kDstAlpha: return exact(spv::OpFMul, operand, one);
+						case Factor::kOneMinusDstAlpha: return exact(spv::OpFMul, operand, zero);
+						case Factor::kDstColor: return exact(spv::OpFMul, operand, dst);
+						case Factor::kOneMinusDstColor:
+							return exact(spv::OpFMul, operand, exact(spv::OpFSub, one, dst));
+						case Factor::kSrcAlphaSaturate:
+							return exact(spv::OpFMul, operand,
+							             EmitGlsl<GLSLstd450FMin, IR::Type::F32>(state, source_alpha, zero));
+						default: EXIT("unsupported packed UNorm blend factor %u\n", factor);
+					}
+					return zero;
+				};
+				switch (static_cast<Prospero::BlendOp>(blend.op)) {
+					case Prospero::BlendOp::kAdd:
+						result = exact(spv::OpFAdd, weighted(blend.src_factor, src),
+						               weighted(blend.dst_factor, dst));
+						break;
+					case Prospero::BlendOp::kSubtract:
+						result = exact(spv::OpFSub, weighted(blend.src_factor, src),
+						               weighted(blend.dst_factor, dst));
+						break;
+					case Prospero::BlendOp::kReverseSubtract:
+						result = exact(spv::OpFSub, weighted(blend.dst_factor, dst),
+						               weighted(blend.src_factor, src));
+						break;
+					case Prospero::BlendOp::kMin:
+						result = EmitGlsl<GLSLstd450FMin, IR::Type::F32>(state, src, dst);
+						break;
+					case Prospero::BlendOp::kMax:
+						result = EmitGlsl<GLSLstd450FMax, IR::Type::F32>(state, src, dst);
+						break;
+					default: EXIT("unsupported packed UNorm blend operation %u\n", blend.op);
+				}
+			}
+			auto scaled = exact(spv::OpFMul, saturate(result),
+			                    ConstantF32Value(state, static_cast<float>(field_mask)));
+			if (!truncate) {
+				scaled = exact(spv::OpFAdd, scaled, ConstantF32Value(state, 0.5f));
+			}
+			field = Unary(state, spv::OpConvertFToU, u32, scaled);
+			if (offset != 0u) {
+				field = Binary(state, spv::OpShiftLeftLogical, u32, field, ConstantU32(state, offset));
+			}
+		}
+		packed = packed == 0 ? field : Binary(state, spv::OpBitwiseOr, u32, packed, field);
+	}
+	return packed;
+}
+
+void EmitPixelEntryPoint(EmitterState& state) {
+	const auto& pixel = *state.input_info.pixel;
+	const auto  u32   = TypeU32(state);
+	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func,
+	                          spv::FunctionControlMaskNone, TypeFunction(state));
+	EmitLabel(state, state.builder.AllocateId());
+	for (const auto pending: state.packed_pending_variables) {
+		if (pending != 0) {
+			state.builder.AddFunction(spv::OpStore, pending, ConstantU32(state, 0u));
+		}
+	}
+	state.builder.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.builder.AllocateId(),
+	                          state.pixel_guest_func);
+	state.builder.AddFunction(spv::OpBeginInvocationInterlockEXT);
+	const auto frag_coord = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, TypeF32Vector(state, 4), frag_coord,
+	                          state.packed_frag_coord_variable);
+	const auto position = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpVectorShuffle, TypeF32Vector(state, 2), position, frag_coord,
+	                          frag_coord, 0u, 1u);
+	const auto coord = Unary(state, spv::OpConvertFToU, TypeU32Vector(state, 2), position);
+	uint32_t   valid = 0;
+	if (state.pixel_valid_mask_variable != 0) {
+		const auto mask = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, u32, mask, state.pixel_valid_mask_variable);
+		valid = Binary(state, spv::OpINotEqual, TypeBool(state), mask, ConstantU32(state, 0u));
+	}
+	const auto image_pointer =
+	    TypePointer(state, spv::StorageClassUniformConstant, state.packed_target_type);
+	uint32_t binding = 0;
+	for (uint32_t index = 0; index < 8u; index++) {
+		if ((pixel.target_packed_blend_mask & (1u << index)) == 0u) continue;
+		const auto pending = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpLoad, u32, pending, state.packed_pending_variables[index]);
+		auto write = Binary(state, spv::OpINotEqual, TypeBool(state), pending, ConstantU32(state, 0u));
+		if (valid != 0) {
+			write = Binary(state, spv::OpLogicalAnd, TypeBool(state), write, valid);
+		}
+		const auto element = binding++;
+		EmitIfCondition(state, write, [&] {
+			const auto pointer = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpAccessChain, image_pointer, pointer,
+			                          state.packed_target_variable, ConstantU32(state, element));
+			const auto image = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, state.packed_target_type, image, pointer);
+			const auto texel = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpImageRead, TypeU32Vector(state, 4), texel, image, coord);
+			const auto destination = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, u32, destination, texel, 0u);
+			const auto source = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpLoad, TypeF32Vector(state, 4), source,
+			                          state.packed_source_variables[index]);
+			const auto word = EmitPackedUnormBlend(
+			    state, ShaderPackedBlend::Decode(pixel.target_packed_blend[index]),
+			    (pixel.target_round_mode & (1u << index)) != 0u, source, destination);
+			const auto result = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), result, word,
+			                          ConstantU32(state, 0u), ConstantU32(state, 0u), ConstantU32(state, 0u));
+			state.builder.AddFunction(spv::OpImageWrite, image, coord, result);
+		});
+	}
+	state.builder.AddFunction(spv::OpEndInvocationInterlockEXT);
+	EmitKillIfPixelValidMaskInactive(state);
+	state.builder.AddFunction(spv::OpReturn);
+	state.builder.AddFunction(spv::OpFunctionEnd);
+}
+#endif
+
 void EmitProgram(EmitterState& state) {
 	const auto&      program = state.program;
 	ValueEmitContext ctx(state);
@@ -1383,9 +1569,17 @@ void EmitProgram(EmitterState& state) {
 		LOGF("ShaderRecompiler hash=0x%016" PRIx64 " outlined %" PRIu64 " inlined call targets into functions\n",
 		     program.shader_hash, static_cast<uint64_t>(regions.size()));
 	}
+#if defined(ANYPS5_KYTY)
+	const auto guest_func = state.mesh_guest_func != 0    ? state.mesh_guest_func
+	                        : state.pixel_guest_func != 0 ? state.pixel_guest_func
+	                                                      : state.main_func;
+	state.builder.AddFunction(spv::OpFunction, TypeVoid(state), guest_func,
+	                          spv::FunctionControlMaskNone, TypeFunction(state));
+#else
 	state.builder.AddFunction(spv::OpFunction, TypeVoid(state),
 	                          state.mesh_guest_func != 0 ? state.mesh_guest_func : state.main_func,
 	                          spv::FunctionControlMaskNone, TypeFunction(state));
+#endif
 	EmitLabel(state, state.entry_label);
 	if (state.program.info.function_lds && per_invocation == spv::StorageClassFunction) {
 		state.builder.AddFunction(
@@ -1402,7 +1596,15 @@ void EmitProgram(EmitterState& state) {
 		}
 	}
 	DeclareRayQueryVariables(state);
+#if defined(ANYPS5_KYTY)
+	if (state.pixel_valid_mask_variable != 0 && state.pixel_guest_func != 0) {
+		state.builder.DefineGlobalVariable(state.pixel_valid_mask_variable,
+		                                   TypePointer(state, spv::StorageClassPrivate, TypeU32(state)),
+		                                   spv::StorageClassPrivate);
+	} else if (state.pixel_valid_mask_variable != 0) {
+#else
 	if (state.pixel_valid_mask_variable != 0) {
+#endif
 		state.builder.AddFunction(spv::OpVariable,
 		                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 		                          state.pixel_valid_mask_variable, spv::StorageClassFunction);
@@ -1453,7 +1655,86 @@ void EmitProgram(EmitterState& state) {
 	if (state.program.stage == ShaderType::Mesh) {
 		EmitMeshEntryPoint(state);
 	}
+#if defined(ANYPS5_KYTY)
+	if (state.pixel_guest_func != 0) {
+		EmitPixelEntryPoint(state);
+	}
+#endif
 	DefineBdaLoads(state);
 }
 
 }
+
+#if defined(ANYPS5_KYTY)
+namespace Libs::Graphics::ShaderRecompiler::Spirv {
+
+std::vector<uint32_t> EmitPackedUnormBlendProbe(uint32_t blend, bool truncate) {
+	using namespace Emitter;
+	constexpr uint32_t RecordWords = 5u;
+	IR::Program        program;
+	program.stage = ShaderType::Compute;
+	ShaderComputeInputInfo compute {};
+	ShaderStageInputInfo   input {};
+	input.compute = &compute;
+	EmitterState state(program, input, DefaultProfile);
+	auto&        builder = state.builder;
+	const auto   u32     = TypeU32(state);
+	const auto   f32     = TypeF32(state);
+	const auto   array   = builder.DecoratedType(
+	    spv::OpTypeRuntimeArray, {{spv::OpDecorate, {spv::DecorationArrayStride, 4u}}}, u32);
+	const auto block = builder.DecoratedType(
+	    spv::OpTypeStruct,
+	    {{spv::OpMemberDecorate, {0, spv::DecorationOffset, 0}}, {spv::OpDecorate, {spv::DecorationBlock}}},
+	    array);
+	const auto              element_pointer = TypePointer(state, spv::StorageClassStorageBuffer, u32);
+	std::array<uint32_t, 2> buffers {};
+	for (uint32_t binding = 0; binding < buffers.size(); binding++) {
+		buffers[binding] = builder.DefineGlobalVariable(TypePointer(state, spv::StorageClassStorageBuffer, block),
+		                                                spv::StorageClassStorageBuffer);
+		builder.AddAnnotation(spv::OpDecorate, buffers[binding], spv::DecorationDescriptorSet, 0u);
+		builder.AddAnnotation(spv::OpDecorate, buffers[binding], spv::DecorationBinding, binding);
+	}
+	const auto invocation = DefineInterfaceVariable(state, TypeU32Vector(state, 3), spv::StorageClassInput,
+	                                                "gl_GlobalInvocationID");
+	builder.AddAnnotation(spv::OpDecorate, invocation, spv::DecorationBuiltIn, spv::BuiltInGlobalInvocationId);
+	state.main_func = builder.AllocateId();
+	builder.RequireCapability(spv::CapabilityShader);
+	builder.RequireCapability(spv::CapabilitySignedZeroInfNanPreserve);
+	builder.RequireExtension("SPV_KHR_float_controls");
+	builder.AddMemoryModel(spv::AddressingModelLogical, spv::MemoryModelGLSL450);
+	builder.AddExecutionMode(state.main_func, spv::ExecutionModeSignedZeroInfNanPreserve, 32u);
+	builder.AddExecutionMode(state.main_func, spv::ExecutionModeLocalSize, 64u, 1u, 1u);
+	builder.AddFunction(spv::OpFunction, TypeVoid(state), state.main_func, spv::FunctionControlMaskNone,
+	                    TypeFunction(state));
+	EmitLabel(state, builder.AllocateId());
+	const auto ids = builder.AllocateId();
+	builder.AddFunction(spv::OpLoad, TypeU32Vector(state, 3), ids, invocation);
+	const auto index = builder.AllocateId();
+	builder.AddFunction(spv::OpCompositeExtract, u32, index, ids, 0u);
+	const auto word_pointer = [&](uint32_t buffer, uint32_t element) {
+		const auto pointer = builder.AllocateId();
+		builder.AddFunction(spv::OpAccessChain, element_pointer, pointer, buffer, ConstantU32(state, 0u), element);
+		return pointer;
+	};
+	const auto base = Binary(state, spv::OpIMul, u32, index, ConstantU32(state, RecordWords));
+	std::array<uint32_t, RecordWords> words {};
+	for (uint32_t word = 0; word < RecordWords; word++) {
+		words[word] = builder.AllocateId();
+		builder.AddFunction(spv::OpLoad, u32, words[word],
+		                    word_pointer(buffers[0], Binary(state, spv::OpIAdd, u32, base, ConstantU32(state, word))));
+	}
+	const auto source = builder.AllocateId();
+	builder.AddFunction(spv::OpCompositeConstruct, TypeF32Vector(state, 4), source,
+	                    Unary(state, spv::OpBitcast, f32, words[0]), Unary(state, spv::OpBitcast, f32, words[1]),
+	                    Unary(state, spv::OpBitcast, f32, words[2]), Unary(state, spv::OpBitcast, f32, words[3]));
+	const auto result =
+	    EmitPackedUnormBlend(state, ShaderPackedBlend::Decode(blend), truncate, source, words[4]);
+	builder.AddFunction(spv::OpStore, word_pointer(buffers[1], index), result);
+	builder.AddFunction(spv::OpReturn);
+	builder.AddFunction(spv::OpFunctionEnd);
+	builder.AddEntryPoint(spv::ExecutionModelGLCompute, state.main_func, "main", state.interface_variables);
+	return builder.Build();
+}
+
+}
+#endif

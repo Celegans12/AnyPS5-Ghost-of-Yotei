@@ -417,6 +417,9 @@ enum class DescriptorBindingKind : uint32_t {
 	SharedMemory,
 	UniformBuffers,
 	MipStats,
+#if defined(ANYPS5_KYTY)
+	PackedTargets,
+#endif
 	Count,
 };
 
@@ -424,7 +427,11 @@ inline constexpr uint32_t UniformBufferBytes = 65536u;
 inline constexpr uint32_t UniformBufferBaseSlack = 256u;
 
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Samplers) == 51u);
+#if defined(ANYPS5_KYTY)
+static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 61u);
+#else
 static_assert(static_cast<uint32_t>(DescriptorBindingKind::Count) == 60u);
+#endif
 
 struct PushData {
 	static constexpr uint32_t DwordCount = 32;

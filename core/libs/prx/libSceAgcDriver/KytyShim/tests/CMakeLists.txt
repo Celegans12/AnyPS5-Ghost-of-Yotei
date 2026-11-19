@@ -222,3 +222,14 @@ set_tests_properties(kyty_shim_empty_buffer_replay PROPERTIES TIMEOUT 120 SKIP_R
 add_test(NAME kyty_shim_empty_buffer_replay_off COMMAND kyty_shim_empty_buffer_replay_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_empty_buffer_replay_off PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         ENVIRONMENT "KYTY_SHARE_EMPTY_BUFFERS=0" PASS_REGULAR_EXPRESSION "kyty_shim_empty_buffer_replay_off: ok")
+
+add_test_executable(kyty_shim_packed_unorm_blend_tests
+        ${CMAKE_CURRENT_SOURCE_DIR}/PackedUnormBlend.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp
+)
+target_include_directories(kyty_shim_packed_unorm_blend_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/kyty ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+target_compile_options(kyty_shim_packed_unorm_blend_tests PRIVATE -ffp-contract=off)
+target_link_libraries(kyty_shim_packed_unorm_blend_tests PRIVATE Kyty::gpu libkernel libc ${CMAKE_DL_LIBS})
+set_target_properties(kyty_shim_packed_unorm_blend_tests PROPERTIES CXX_EXTENSIONS OFF)
+add_test(NAME kyty_shim_packed_unorm_blend COMMAND kyty_shim_packed_unorm_blend_tests)
+set_tests_properties(kyty_shim_packed_unorm_blend PROPERTIES TIMEOUT 120)

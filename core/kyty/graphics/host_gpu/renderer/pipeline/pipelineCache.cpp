@@ -2223,25 +2223,68 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 			const bool  replace       = blend_control.color_srcblend == 1u && blend_control.color_destblend == 0u &&
 			                            blend_control.color_comb_fcn == 0u;
 			const bool  blend         = blend_control.enable && !rt.info.blend_bypass && !replace;
-#else
-			const bool blend = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
-#endif
-			if (blend || (mapping.ApplyMask(target_mask) & 7u) != 7u ||
-			    (mapping.ApplyMask(shader_mask) & 7u) != 7u ||
-			    pixel_info.target_output_mode[export_index] != 9u) {
-#if defined(ANYPS5_KYTY)
+			const auto  write_mask    = mapping.ApplyMask(target_mask) & mapping.ApplyMask(shader_mask) & 7u;
+			if (write_mask == 0u || pixel_info.target_output_mode[export_index] != 9u) {
 				EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
 				     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u src=%u dst=%u fcn=%u\n",
 				     slot, export_index, pixel_info.target_output_mode[export_index], target_mask,
 				     shader_mask, mapping.packed, static_cast<uint32_t>(blend), blend_control.color_srcblend,
 				     blend_control.color_destblend, blend_control.color_comb_fcn);
+			}
+			if (blend || write_mask != 7u) {
+				const auto& depth       = context.GetDepthControl();
+				const auto& stencil     = context.GetStencilMask();
+				const bool  ds_tests    = depth.z_enable || depth.stencil_enable || depth.depth_bounds_enable;
+				const bool  ds_writes   = (depth.z_enable && depth.z_write_enable) ||
+				                          (depth.stencil_enable &&
+				                           (stencil.stencil_writemask != 0u || stencil.stencil_writemask_bf != 0u));
+				const auto  unsupported = [&](uint8_t factor) {
+					return factor > static_cast<uint8_t>(Prospero::BlendFactor::kSrcAlphaSaturate);
+				};
+				const char* refusal = nullptr;
+				if (!m_graphics.fragment_shader_pixel_interlock_enabled) {
+					refusal = "the device lacks fragmentShaderPixelInterlock";
+				} else if (rt.attrib.num_samples != 0u || rt.attrib.num_fragments != 0u) {
+					refusal = "the target is multisampled";
+				} else if (blend && (unsupported(blend_control.color_srcblend) ||
+				                     unsupported(blend_control.color_destblend) ||
+				                     blend_control.color_comb_fcn > 4u)) {
+					refusal = "the blend uses a constant or second-source factor";
+				} else if (pixel_info.ps_depth_export_enable || pixel_info.ps_sample_mask_export_enable ||
+				           sh.AlphaToMask()) {
+					refusal = "the pixel shader exports depth or coverage";
+				} else if (pixel_info.ps_pixel_kill_enable && !pixel_info.ps_early_z && ds_writes) {
+					refusal = "the pixel shader kills pixels under late tests of a draw writing depth or stencil";
+				}
+				if (refusal != nullptr) {
+					EXIT("unsupported packed UNorm render-target blend: slot=%u export=%u write_mask=0x%x "
+					     "blend=%u src=%u dst=%u fcn=%u: %s\n",
+					     slot, export_index, write_mask, static_cast<uint32_t>(blend),
+					     blend_control.color_srcblend, blend_control.color_destblend,
+					     blend_control.color_comb_fcn, refusal);
+				}
+				const ShaderPackedBlend packed {
+				    .src_factor = static_cast<uint8_t>(blend ? blend_control.color_srcblend : 1u),
+				    .dst_factor = static_cast<uint8_t>(blend ? blend_control.color_destblend : 0u),
+				    .op         = static_cast<uint8_t>(blend ? blend_control.color_comb_fcn : 0u),
+				    .write_mask = static_cast<uint8_t>(write_mask),
+				    .blend      = blend,
+				    .clamp      = rt.info.blend_clamp};
+				pixel_info.target_packed_blend_mask |= 1u << export_index;
+				pixel_info.target_packed_blend[export_index] = packed.Encode();
+				pixel_info.target_packed_blend_tests |= ds_tests;
+			}
 #else
+			const bool blend = context.GetBlendControl(slot).enable && !rt.info.blend_bypass;
+			if (blend || (mapping.ApplyMask(target_mask) & 7u) != 7u ||
+			    (mapping.ApplyMask(shader_mask) & 7u) != 7u ||
+			    pixel_info.target_output_mode[export_index] != 9u) {
 				EXIT("unsupported packed UNorm render-target export: slot=%u export=%u mode=%u "
 				     "target_mask=0x%x shader_mask=0x%x mapping=0x%02x blend=%u\n",
 				     slot, export_index, pixel_info.target_output_mode[export_index], target_mask,
 				     shader_mask, mapping.packed, static_cast<uint32_t>(blend));
-#endif
 			}
+#endif
 			pixel_info.target_packed_unorm_mask |= 1u << export_index;
 			pixel_info.target_round_mode |= static_cast<uint8_t>(rt.info.round_mode) << export_index;
 		}
@@ -2287,6 +2330,15 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 				pixel_info.target_export_mapping[1] = {};
 			}
 		}
+#if defined(ANYPS5_KYTY)
+		if ((pixel_info.target_packed_blend_mask & 1u) != 0u &&
+		    pixel_info.alpha_blend_source != ShaderAlphaBlendSource::None) {
+			pixel_info.alpha_blend_source       = ShaderAlphaBlendSource::None;
+			pixel_info.dual_source_blending     = false;
+			pixel_info.target_output_mode[1]    = 0;
+			pixel_info.target_export_mapping[1] = {};
+		}
+#endif
 	}
 	auto&       last_stage   = vertex_info[tess_active ? 2u : 0u];
 	const auto& clip_control = context.GetClipControl();
@@ -3681,6 +3733,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	const auto color_count = targets.color_count;
 
 	auto&             ctx = command.GetRegisters();
+#if defined(ANYPS5_KYTY)
+	const auto packed_blend_slots = ps_active ? ShaderPixelPackedBlendSlots(ps_input_info) : 0u;
+#endif
 
 	const HW::ModeControl& mc = ctx.GetModeControl();
 
@@ -3720,6 +3775,10 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 #if defined(ANYPS5_KYTY)
 		if (colors[i].desc.info.guest_format == Prospero::BufferFormat::k11_11_10UNorm) {
 			static_params.blend_enable[slot] = false;
+		}
+		if ((packed_blend_slots & (1u << slot)) != 0u) {
+			static_params.color_mask[slot] = 0u;
+			rendering.color_formats[slot]  = vk::Format::eUndefined;
 		}
 #endif
 		if (static_params.blend_enable[slot] && alpha_source == ShaderAlphaBlendSource::None &&
