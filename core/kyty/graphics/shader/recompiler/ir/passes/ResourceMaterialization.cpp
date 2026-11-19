@@ -1005,7 +1005,7 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 						specializations[resource_index] = root;
 						const auto slots = view.slots + sizeof(uint32_t);
 						snapshot.flattened_srt.insert(snapshot.flattened_srt.end(),
-						    {static_cast<uint32_t>(values.size() - 1u), static_cast<uint32_t>(slots), static_cast<uint32_t>(slots >> 32u)});
+						    {view.slot_count - 1u, static_cast<uint32_t>(slots), static_cast<uint32_t>(slots >> 32u)});
 						for (const auto& kind: view.kinds) {
 							descriptors.push_back(kind);
 							specializations.push_back(root);
