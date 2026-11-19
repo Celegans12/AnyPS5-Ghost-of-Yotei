@@ -34,7 +34,7 @@ HOST_KEYS = {
 LIMITATIONS = (
     "Replay throughput is not title FPS or a measurement of unrecorded title work.",
     "Replay times are printed to 0.001 s; per-frame each values are truncated whole milliseconds.",
-    "skipped_mib is rounded to 0.1 MiB; zero does not prove that no memory was skipped.",
+    "Legacy replay results without skipped_bytes round skipped_mib to 0.1 MiB and may hide small skips.",
     "Host format 1 does not identify a physical-device UUID or the compiled dirty state.",
     "Final display-buffer comparisons do not establish every-frame or temporal correctness.",
     "Descriptive observations do not establish statistical significance or a trusted speedup.",
@@ -204,7 +204,10 @@ def parse_replay_result(stdout, stderr="", expected_commit=None):
             native = load_replay_json(candidates[0])
         if not isinstance(native, dict):
             raise ValueError("native replay result must be one JSON object")
-        for key in INTEGER_FIELDS:
+        integer_fields = INTEGER_FIELDS
+        if "skipped_bytes" in native:
+            integer_fields += ("skipped_bytes",)
+        for key in integer_fields:
             if type(native.get(key)) is not int or not 0 <= native[key] <= (1 << 64) - 1:
                 raise ValueError(f"native replay {key} must be a nonnegative integer")
         for key in NUMBER_FIELDS:
@@ -252,7 +255,7 @@ def parse_replay_result(stdout, stderr="", expected_commit=None):
             result["issues"].append("native replay duration is not positive")
         if native["fps"] == 0:
             result["issues"].append("native replay throughput is not positive")
-        if native["skipped_mib"]:
+        if native.get("skipped_bytes", 0) or native["skipped_mib"]:
             result["issues"].append("native replay skipped memory ranges")
         if native["frames_compared"] == 0:
             result["unknowns"].append("no display reference was compared; pixel fidelity is unavailable")

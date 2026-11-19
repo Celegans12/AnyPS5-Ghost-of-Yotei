@@ -62,6 +62,34 @@ ANYPS5_HOST_REPORT: 1
 
 
 class FrameReplayReportTests(unittest.TestCase):
+    def test_skipped_memory_counts(self):
+        cases = (
+            ({}, False),
+            ({"skipped_mib": 0.1}, True),
+            ({"skipped_bytes": 0}, False),
+            ({"skipped_bytes": 4096}, True),
+            ({"skipped_bytes": 0, "skipped_mib": 0.1}, True),
+            ({"skipped_bytes": (1 << 64) - 1}, True),
+        )
+        for fields, unhealthy in cases:
+            with self.subTest(fields=fields):
+                native = {**NATIVE, **fields}
+                result = report.parse_replay_result(json.dumps(native), HOST, COMMIT)
+                self.assertEqual(result["native"], native)
+                if unhealthy:
+                    self.assertEqual(len(result["issues"]), 1)
+                    self.assertIn("skipped memory", result["issues"][0])
+                else:
+                    self.assertEqual(result["issues"], [])
+
+        for count in (None, False, True, -1, 4096.0, "4096", 1 << 64):
+            with self.subTest(malformed=count):
+                native = dict(NATIVE, skipped_bytes=count)
+                result = report.parse_replay_result(json.dumps(native), HOST, COMMIT)
+                self.assertIsNone(result["native"])
+                self.assertEqual(len(result["issues"]), 1)
+                self.assertIn("skipped_bytes", result["issues"][0])
+
     def test_validation_diagnostics_in_stdout_and_stderr(self):
         for stdout_bytes in (False, True):
             for stderr_bytes in (False, True):
@@ -120,7 +148,7 @@ class FrameReplayReportTests(unittest.TestCase):
             self.assertEqual(value["host"]["gpu"]["driver"], "Test Driver")
             self.assertEqual(value["host"]["count"], 1)
             self.assertEqual(value["issues"], [])
-            self.assertTrue(any("zero does not prove" in item for item in value["unknowns"]))
+            self.assertTrue(any("without skipped_bytes" in item and "skipped_mib" in item for item in value["unknowns"]))
             self.assertTrue(any("UUID" in item for item in value["unknowns"]))
             self.assertEqual(value["host"]["sha256"], hashlib.sha256(value["host"]["raw"].encode()).hexdigest())
             self.assertEqual(report.parse_replay_host_report(HOST.replace("\n", "\r\n"))["raw"], HOST.replace("\n", "\r\n"))

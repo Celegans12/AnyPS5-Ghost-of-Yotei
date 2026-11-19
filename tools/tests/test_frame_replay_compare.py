@@ -248,6 +248,7 @@ class RunnerTests(ReplayFixture):
         self.kyty_write_store = True
         self.kyty_warm_log = None
         self.loader_logs = {}
+        self.candidate_native_fields = {}
 
     def execute(self, command, directory, environment, timeout, log_bytes, *, prepare=None):
         self.commands.append(command)
@@ -274,6 +275,8 @@ class RunnerTests(ReplayFixture):
             if title_id is None or self.kyty_write_store:
                 memo.write_bytes(directory.name.encode())
             native = native_result()
+            if arm == "candidate":
+                native.update(self.candidate_native_fields)
             if self.workload_mismatch and arm == "candidate":
                 native["submits"] = 2
             if self.failure == (arm, directory.name.split("-", 1)[0]):
@@ -545,6 +548,33 @@ class RunnerTests(ReplayFixture):
         report = runner._offline_report(path.parent)
         self.assertEqual(report["runs"][0]["assessment"]["issues"], [])
         self.assertEqual(report["observations"]["baseline"]["healthy_trials"], 2)
+
+    def test_exact_skipped_memory_fails_live_and_offline(self):
+        self.recipe.update(warmups=0, trials=1)
+        self.candidate_native_fields = {"skipped_bytes": 4096}
+        recipe = self.root / "recipe.json"
+        recipe.write_text(json.dumps(self.recipe), encoding="utf-8")
+        bundle = self.root / "evidence"
+        with mock.patch.object(runner, "execute_replay_trial", side_effect=self.execute), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(runner.main(["run", str(recipe), "--output", str(bundle)]), 2)
+
+        live = json.loads((bundle / "report.json").read_text(encoding="utf-8"))
+        output = io.StringIO()
+        with mock.patch.object(runner, "execute_replay_trial", side_effect=AssertionError("offline launched a process")), contextlib.redirect_stdout(output):
+            self.assertEqual(runner.main(["report", str(bundle), "--json"]), 2)
+        for comparison in (live, json.loads(output.getvalue())):
+            self.assertTrue(comparison["complete"])
+            runs = {run["arm"]: run for run in comparison["runs"]}
+            baseline = runs["baseline"]["assessment"]
+            self.assertEqual(baseline["issues"], [])
+            self.assertNotIn("skipped_bytes", baseline["native"])
+            candidate = runs["candidate"]["assessment"]
+            self.assertEqual(runs["candidate"]["returncode"], 0)
+            self.assertEqual(candidate["native"]["pixels_identical"], 1.0)
+            self.assertEqual(candidate["native"]["skipped_mib"], 0.0)
+            self.assertEqual(candidate["native"]["skipped_bytes"], 4096)
+            self.assertEqual(len(candidate["issues"]), 1)
+            self.assertIn("skipped memory", candidate["issues"][0])
 
     def test_requested_validation_requires_loader_evidence_live_and_offline(self):
         self.recipe["warmups"] = 0
