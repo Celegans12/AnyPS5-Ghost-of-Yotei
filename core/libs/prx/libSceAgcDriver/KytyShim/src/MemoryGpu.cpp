@@ -4,9 +4,12 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/guest_gpu/scout.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
+#include "graphics/shader/recompiler/ir/passes/SrtWalker.h"
 
 #include <cinttypes>
+#include <cstdlib>
 #include <cstring>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -192,11 +195,47 @@ void InvalidateMemory(uint64_t vaddr, uint64_t size) {
 	(void)GetGpuResources().InvalidateMemory(vaddr, size);
 }
 
+#if defined(ANYPS5_KYTY)
+namespace {
+
+bool WalkerProbeEnabled() {
+	static const bool enabled = [] {
+		const char*            value = std::getenv("KYTY_SRT_WALKER_PROBE");
+		const std::string_view text {value == nullptr ? "" : value};
+		if (!text.empty() && text != "0" && text != "1") {
+			Shim::Fail("invalid KYTY_SRT_WALKER_PROBE: %s (0 or 1)\n", value);
+		}
+		return text != "0";
+	}();
+	return enabled;
+}
+
+Graphics::ShaderRecompiler::IR::SrtWalkerPage WalkerGuestPage(uint64_t address, bool ahead, const uint8_t*& backing) {
+	constexpr uint64_t PageSize = 4096;
+	backing = nullptr;
+	if (ahead || !Graphics::GuestGpu::IsGpuThread() || !MayFaultOnGpuRead(address & ~(PageSize - 1), PageSize)) {
+		return Graphics::ShaderRecompiler::IR::SrtWalkerPage::Direct;
+	}
+	return Graphics::ShaderRecompiler::IR::SrtWalkerPage::PerLoad;
+}
+
+bool WalkerGuestRead(uint64_t address, uint32_t& value, bool ahead, const uint8_t*) {
+	return !ahead && MayFaultOnGpuRead(address, sizeof(value)) && TryReadAroundGpuWrites(address, &value, sizeof(value));
+}
+
+}
+#endif
+
 void InstallGpuResources(Graphics::RenderContext* resources) noexcept {
 	if (resources != nullptr && g_gpu_resources != nullptr) Shim::Fail("KytyShim memory: InstallGpuResources called twice\n");
 	if (resources == nullptr) Shim::SetGpuRangeHooks(nullptr, nullptr);
 	g_gpu_resources = resources;
 	if (resources != nullptr) Shim::SetGpuRangeHooks(&MapGpuRange, &UnmapGpuRange);
+#if defined(ANYPS5_KYTY)
+	if (resources != nullptr && WalkerProbeEnabled()) {
+		Graphics::ShaderRecompiler::IR::SetSrtWalkerGuestMemory({&WalkerGuestPage, &WalkerGuestRead});
+	}
+#endif
 }
 
 bool HandleGpuFault(Graphics::PageFaultAccess access, uint64_t fault_vaddr) noexcept {
