@@ -66,34 +66,48 @@ inline bool ClassifyOneByte(std::uint8_t op, std::uint32_t reg, const Prefixes& 
     if (op < 0x40) {
         use      = RegisterUse::Read;
         byte_reg = (op & 1u) == 0;
-        return true;
+        return (op & 7u) >= 2 || (op & 0x38u) == 0x38;
     }
     switch (op) {
+        case 0x80:
+        case 0x81:
+        case 0x82:
+        case 0x83: use = RegisterUse::None; return reg == 7;
+        case 0x86:
+        case 0x87:
+        case 0x88:
+        case 0x89:
+        case 0x8F:
+        case 0xC0:
+        case 0xC1:
+        case 0xC6:
+        case 0xC7:
+        case 0xD0:
+        case 0xD1:
+        case 0xD2:
+        case 0xD3:
+        case 0xFE: return false;
         case 0x63:
         case 0x69:
         case 0x6B:
         case 0x8B: use = prefixes.operand16 ? RegisterUse::Read : RegisterUse::FullWrite; return true;
         case 0x84:
-        case 0x86:
-        case 0x88:
         case 0x8A:
             use      = RegisterUse::Read;
             byte_reg = true;
             return true;
-        case 0x85:
-        case 0x87:
-        case 0x89: use = RegisterUse::Read; return true;
+        case 0x85: use = RegisterUse::Read; return true;
         case 0x8C:
         case 0x8E: return false;
         case 0xDD: use = RegisterUse::None; return reg != 4;
         case 0xF6:
-        case 0xF7: use = RegisterUse::None; return reg < 4;
-        case 0xFF: use = RegisterUse::None; return reg != 3 && reg != 5 && reg != 7;
+        case 0xF7: use = RegisterUse::None; return reg < 2;
+        case 0xFF: use = RegisterUse::None; return reg == 2 || reg == 4 || reg == 6;
         default: use = RegisterUse::None; return true;
     }
 }
 
-inline bool ClassifyTwoByte(std::uint8_t op, std::uint32_t reg, const Prefixes& prefixes, RegisterUse& use, bool& byte_reg) {
+inline bool ClassifyTwoByte(std::uint8_t op, std::uint32_t reg, const Prefixes& prefixes, RegisterUse& use) {
     use = RegisterUse::None;
     if (op == 0x0D || (op >= 0x18 && op <= 0x1F) || (op >= 0x50 && op <= 0x7F) || (op >= 0xD0 && op <= 0xFE)) return true;
     if ((op >= 0x10 && op <= 0x17) || (op >= 0x28 && op <= 0x2F)) {
@@ -107,22 +121,7 @@ inline bool ClassifyTwoByte(std::uint8_t op, std::uint32_t reg, const Prefixes& 
     switch (op) {
         case 0xAE: return reg == 2;
         case 0xA3:
-        case 0xA4:
-        case 0xA5:
-        case 0xAB:
-        case 0xAC:
-        case 0xAD:
-        case 0xAF:
-        case 0xB1:
-        case 0xB3:
-        case 0xBB:
-        case 0xC1:
-        case 0xC3: use = RegisterUse::Read; return true;
-        case 0xB0:
-        case 0xC0:
-            use      = RegisterUse::Read;
-            byte_reg = true;
-            return true;
+        case 0xAF: use = RegisterUse::Read; return true;
         case 0xB6:
         case 0xB7:
         case 0xBE:
@@ -132,7 +131,7 @@ inline bool ClassifyTwoByte(std::uint8_t op, std::uint32_t reg, const Prefixes& 
             return prefixes.rep;
         case 0xBC:
         case 0xBD: use = prefixes.rep && !prefixes.operand16 ? RegisterUse::FullWrite : RegisterUse::Read; return true;
-        case 0xBA:
+        case 0xBA: return reg == 4;
         case 0xC2:
         case 0xC4:
         case 0xC5:
@@ -263,7 +262,7 @@ inline bool Decode(const std::uint8_t* code, Operand& out) {
     } else if (map == 0) {
         known = ClassifyOneByte(opcode, reg_field, prefixes, use, byte_reg);
     } else if (map == 1) {
-        known = ClassifyTwoByte(opcode, reg_field, prefixes, use, byte_reg);
+        known = ClassifyTwoByte(opcode, reg_field, prefixes, use);
     } else if (map == 2) {
         known = ClassifyThreeByte38(opcode, prefixes, use);
     } else {

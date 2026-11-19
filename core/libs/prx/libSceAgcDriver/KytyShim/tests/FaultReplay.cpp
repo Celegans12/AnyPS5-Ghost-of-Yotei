@@ -180,6 +180,22 @@ void Decoding() {
     Require(Register({0x0F, 0xAE, 0x10}) == 0, "ldmxcsr [rax] would not be replayed");
     Require(Register({0xF7, 0x20}) == -1, "mul [rax] would be replayed");
     Require(Register({0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00}) == -1, "a RIP-relative load would be replayed");
+    Require(Register({0x01, 0x00}) == -1, "add [rax], eax would be replayed");
+    Require(Register({0x39, 0x08}) == 0, "cmp [rax], ecx would not be replayed");
+    Require(Register({0x80, 0x00, 0x01}) == -1, "add byte [rax], 1 would be replayed");
+    Require(Register({0x80, 0x38, 0x01}) == 0, "cmp byte [rax], 1 would not be replayed");
+    Require(Register({0xF7, 0x00, 0x01, 0x00, 0x00, 0x00}) == 0, "test dword [rax], 1 would not be replayed");
+    Require(Register({0xF7, 0x18}) == -1, "neg dword [rax] would be replayed");
+    Require(Register({0xFF, 0x00}) == -1, "inc dword [rax] would be replayed");
+    Require(Register({0xFF, 0x10}) == 0, "call [rax] would not be replayed");
+    Require(Register({0x87, 0x08}) == -1, "xchg [rax], ecx would be replayed");
+    Require(Register({0xD1, 0x20}) == -1, "shl dword [rax], 1 would be replayed");
+    Require(Register({0x0F, 0xBA, 0x20, 0x01}) == 0, "bt dword [rax], 1 would not be replayed");
+    Require(Register({0x0F, 0xBA, 0x28, 0x01}) == -1, "bts dword [rax], 1 would be replayed");
+    Require(Register({0x0F, 0xAB, 0x08}) == -1, "bts [rax], ecx would be replayed");
+    Require(Register({0x0F, 0xB1, 0x08}) == -1, "cmpxchg [rax], ecx would be replayed");
+    Require(Register({0x0F, 0xC1, 0x08}) == -1, "xadd [rax], ecx would be replayed");
+    Require(Register({0x0F, 0xA5, 0x08}) == -1, "shld [rax], ecx, cl would be replayed");
 }
 
 void Replaying() {
