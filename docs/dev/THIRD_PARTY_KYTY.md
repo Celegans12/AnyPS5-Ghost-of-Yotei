@@ -231,7 +231,7 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 | `KYTY_BDA_DIRTY_REGIONS` | number, `0` off | `1` | With `KYTY_BDA_REGIONS`, a bounded preparation visits only the regions whose dirty bit is set | perf | all | Kyty import |
 | `KYTY_UNIFORM_BUFFERS` | first character `0` is off | on | Shaders read constants at small immediate offsets through uniform buffer views (needs `uniformBufferStandardLayout`); `0` reads them through the storage buffer | perf | all | Kyty import |
 | `KYTY_NATIVE_F16` | first character `0` is off | on | Shaders compute F16 natively (needs `shaderFloat16`); `0` does it per lane in F32 | perf | all | Kyty import |
-| `KYTY_TESSELLATION` | `0` or `1`, else stops | `1` | Draws patch primitives with tessellation; `0` makes the draw path refuse them | option | all | Kyty option |
+| `KYTY_TESSELLATION` | `0` or `1`, else stops | `1` | Draws patch primitives with tessellation; `0` drops them before their programs are looked up or prepared | option | all | Kyty option |
 | `KYTY_OCCLUSION_QUERIES` | `0` or `1`, else stops | `1` | Host occlusion queries, which need the device's `hostQueryReset`; `0` turns them off | option | all | Kyty option |
 | `KYTY_RELAXED_SHADER_FLOAT` | `0` or `1`, else stops | `0` | Relaxes the shader recompiler's float rules (min and max, trigonometric functions) for speed | experimental | all | Kyty option |
 | `KYTY_FALLBACKS` | `0` or `1`, else stops | `1` on Linux, `0` on Windows | Where the emulator would stop on something Kyty does not handle and a safe way on exists, it takes it and logs one `[HACK]` line per source (see [Details](#details)); `0` stops as before | compat | all | AnyKyty |

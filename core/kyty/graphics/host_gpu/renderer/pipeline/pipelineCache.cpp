@@ -1958,6 +1958,11 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 	                                    ahead != nullptr ? &ahead->reads : nullptr);
 	std::array<ShaderParams, 3> vertex_params;
 	if (tess_active) {
+#if defined(ANYPS5_KYTY)
+		if (!Config::TessellationEnabled()) {
+			return false;
+		}
+#endif
 		if ((context.GetShaderStages() & 0x20u) != 0) {
 			static std::atomic_bool warned = false;
 			if (!warned.exchange(true, std::memory_order_relaxed)) {
