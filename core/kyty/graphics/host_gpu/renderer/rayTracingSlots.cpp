@@ -451,8 +451,8 @@ void SummarizeRayTracing() {
 	}
 	if (new_empty + new_always_guest + new_pixel_guest != 0) {
 		log(fmt::format("[RT]   programs compiled so far: {} traced natively, {} with BVH walks that run empty (last {}), "
-		                "{} with sites that always miss (last cs {}), {} pixel programs kept on the guest traversal (last "
-		                "ps {})",
+		                "{} with form sites that leave lanes to the guest walk (last cs {}), {} pixel programs kept on the guest "
+		                "traversal (last ps {})",
 		                programs.native, programs.empty, RtShader(programs.last_empty), programs.always_guest,
 		                RtShader(programs.last_always_guest), programs.pixel_guest, RtShader(programs.last_pixel_guest)));
 	}

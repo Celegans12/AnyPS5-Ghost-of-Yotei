@@ -243,6 +243,23 @@ namespace {
 constexpr uint32_t ServedFlags    = IR::BvhIntersectNative | IR::BvhIntersectOracle | IR::BvhIntersectEmpty;
 constexpr uint32_t IntersectFlags = ServedFlags | IR::BvhIntersectOracleLane;
 
+bool KeepsGuestLanes(const IR::Inst& init, const std::array<bool, 4>* alpha_sites) {
+	const auto& allow = init.Arg(14);
+	if (!allow.IsImmediate() || !allow.U1()) return true;
+	const auto variant = IR::RayQueryVariant(init.Flags<uint32_t>());
+	const auto site    = IR::RayQuerySite(init.Flags<uint32_t>()) % IR::MaxRayQuerySites;
+	return (variant & (IR::RayQueryInitGeometryOpacity | IR::RayQueryInitNoLeaf)) != 0 &&
+	       (variant & IR::RayQueryInitOpaqueOnly) == 0 && (alpha_sites == nullptr || !(*alpha_sites)[site]);
+}
+
+bool GuestLanes(const IR::Program& program, const std::array<bool, 4>* alpha_sites) {
+	return std::ranges::any_of(program.blocks, [&](const IR::Block* block) {
+		return std::ranges::any_of(*block, [&](const IR::Inst& inst) {
+			return inst.GetOpcode() == IR::ValueOpcode::RayQueryInit && KeepsGuestLanes(inst, alpha_sites);
+		});
+	});
+}
+
 uint32_t DefineBvhFunction(EmitterState& s, bool boxes) {
 	const auto u = TypeU32(s), f = TypeF32(s), b = TypeBool(s), wide = TypeU64(s);
 	const auto vec4 = TypeU32Vector(s, 4), vec3 = TypeF32Vector(s, 3);
@@ -368,7 +385,7 @@ void DefineBvhIntersect(EmitterState& s) {
 			((inst.Flags<uint32_t>() & ServedFlags) != 0 ? served : guest) = true;
 		}
 	}
-	if (guest || !served) s.bvh_intersect_function = DefineBvhFunction(s, true);
+	if (guest || !served || GuestLanes(s.program, nullptr)) s.bvh_intersect_function = DefineBvhFunction(s, true);
 	if (served) s.bvh_triangle_function = DefineBvhFunction(s, false);
 }
 
@@ -377,8 +394,13 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto* ray = ctx.ImageAddress(inst.Arg(1));
 	const auto node_words = inst.Flags<uint32_t>() & ~IntersectFlags;
 	if ((inst.Flags<uint32_t>() & IR::BvhIntersectOracle) != 0 && s.oracle.lanes[0].state != 0) return EmitBvhOracle(ctx, inst);
-	const auto function =
-	    (inst.Flags<uint32_t>() & ServedFlags) != 0 ? s.bvh_triangle_function : s.bvh_intersect_function;
+	auto triangle = (inst.Flags<uint32_t>() & ServedFlags) != 0;
+	if (triangle && (inst.Flags<uint32_t>() & (IR::BvhIntersectOracle | IR::BvhIntersectEmpty)) == 0 &&
+	    s.bvh_intersect_function != 0) {
+		if (s.bvh_guest_lanes < 0) s.bvh_guest_lanes = GuestLanes(s.program, &s.ray_query_alpha_sites) ? 1 : 0;
+		triangle = s.bvh_guest_lanes == 0;
+	}
+	const auto function = triangle ? s.bvh_triangle_function : s.bvh_intersect_function;
 	if (ray == nullptr || (node_words != 1u && node_words != 2u) ||
 	    ray->NumArgs() < node_words + 10u || function == 0)
 		ctx.Fail(inst, "BVH intersection requires its node pointer, ray components and shared function");

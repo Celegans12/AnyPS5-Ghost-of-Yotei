@@ -747,9 +747,6 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const bool no_leaf      = (variant & IR::RayQueryInitNoLeaf) != 0;
 	const bool opaque_only  = (variant & IR::RayQueryInitOpaqueOnly) != 0;
 	const bool always_guest = (geometry_opacity || no_leaf) && !s.ray_query_alpha_sites[site] && !opaque_only;
-	if (always_guest) {
-		NoteRayTracingProgram(RayTracingProgramKind::AlwaysGuest, s.program.shader_hash);
-	}
 	const auto has_context = always_guest ? ConstantBool(s, false)
 	                                      : Binary(s, spv::OpINotEqual, b, context, ConstantU64(s, 0));
 	const auto host = EmitValueOrDefaultIfCondition(s, has_context, b, ConstantBool(s, false), [&] {
@@ -762,6 +759,11 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const bool  allow_all = allow.IsImmediate() && allow.U1();
 	const auto  native  = allow_all ? host : LogicalAnd(s, host, ctx.Arg(inst, 14));
 	const auto  served  = always_guest ? native : allow_all ? ConstantBool(s, true) : ctx.Arg(inst, 14);
+	if ((always_guest || !allow_all) && NoteRayTracingProgram(RayTracingProgramKind::AlwaysGuest, s.program.shader_hash)) {
+		::Log::WriteToConsoleAndLog(fmt::format("[RT] cs 0x{:016x}: site {} leaves {} lanes to the guest walk, for a leaf test "
+		                                        "the host does not run; they stay exact and emulated\n",
+		                                        s.program.shader_hash, site, always_guest ? "all its" : "some of its"));
+	}
 	if (s.ray_stats) {
 		const auto guest  = LogicalAnd(s, exec, LogicalNot(s, native));
 		const auto ballot = s.builder.AllocateId();

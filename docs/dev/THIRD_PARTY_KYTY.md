@@ -464,7 +464,8 @@ With native ray tracing on, a BVH intersection that neither a form nor a host ra
 nodes have no child, so the walk ends and its rays miss, while its triangle test stays exact. The program logs one
 `[RT] cs 0x…: N of M BVH intersections run empty` line per session, its `[RT]` summaries count its dispatches, and with
 `KYTY_RT_CHECK` it gets an `empty` row in `<title>.rt`. A pixel shader's BVH walk without bit 8 of `KYTY_RT_ORACLE`
-stays emulated (`[RT] ps 0x…: pixel walk kept on the guest traversal`). The emulated walk serves every BVH walk only
+stays emulated (`[RT] ps 0x…: pixel walk kept on the guest traversal`), and so do the lanes a form site leaves to the
+guest walk for a leaf test the host does not run (`[RT] cs 0x…: site N leaves … lanes to the guest walk`). The emulated walk serves every BVH walk only
 with `KYTY_NATIVE_RT=0` or on a GPU without ray queries, and the reference variant of `KYTY_RT_CHECK`. A host TLAS
 walk that finds BLASes the host has not built yet, TLAS memory it has not cached yet or a full host structure still
 publishes its context: the rays of that dispatch miss what it left out, and the `[RT]` summary counts these walks and
