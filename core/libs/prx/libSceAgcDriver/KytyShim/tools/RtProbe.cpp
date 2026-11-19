@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -53,6 +54,85 @@ uint64_t HashOf(const char* path) {
 	std::string name = path;
 	if (const auto slash = name.find_last_of('/'); slash != std::string::npos) name = name.substr(slash + 1);
 	return std::strtoull(name.c_str(), nullptr, 16);
+}
+
+std::filesystem::path NormalizeSpirvPath(const std::filesystem::path& path, std::error_code& error) {
+	const auto absolute = std::filesystem::absolute(path, error);
+	if (error) return {};
+	return std::filesystem::weakly_canonical(absolute, error);
+}
+
+bool CheckSpirvAlias(const std::string& output, const std::filesystem::path& outputPath,
+                     const char* input, const char* description) {
+	std::error_code error;
+	const auto inputPath = NormalizeSpirvPath(input, error);
+	if (!error) {
+		if (outputPath == inputPath || std::filesystem::equivalent(outputPath, inputPath, error)) {
+			std::fprintf(stderr, "%s: SPIR-V output aliases %s (%s)\n", output.c_str(), description, input);
+			return false;
+		}
+		if (!error || error == std::errc::no_such_file_or_directory) return true;
+	}
+	std::fprintf(stderr, "%s: cannot verify SPIR-V output against %s: %s\n",
+	             output.c_str(), input, error.message().c_str());
+	return false;
+}
+
+bool CheckSpirvOutput(const std::string& output, std::span<const char* const> inputs,
+                      const char* description, const char* replayPeer = nullptr) {
+	std::error_code error;
+	auto status = std::filesystem::symlink_status(output, error);
+	if (error && error != std::errc::no_such_file_or_directory) {
+		std::fprintf(stderr, "%s: cannot verify SPIR-V output path: %s\n", output.c_str(), error.message().c_str());
+		return false;
+	}
+	if (std::filesystem::is_symlink(status)) {
+		status = std::filesystem::status(output, error);
+		if (error || !std::filesystem::exists(status)) {
+			std::fprintf(stderr, "%s: cannot verify SPIR-V output path: unresolved symbolic link\n", output.c_str());
+			return false;
+		}
+	}
+	if (std::filesystem::is_directory(status)) {
+		std::fprintf(stderr, "%s: cannot open SPIR-V output: path is a directory\n", output.c_str());
+		return false;
+	}
+	const auto outputPath = NormalizeSpirvPath(output, error);
+	if (error) {
+		std::fprintf(stderr, "%s: cannot verify SPIR-V output path: %s\n", output.c_str(), error.message().c_str());
+		return false;
+	}
+	for (const auto input: inputs) {
+		if (!CheckSpirvAlias(output, outputPath, input, description)) return false;
+	}
+	return !replayPeer || CheckSpirvAlias(output, outputPath, replayPeer, "the other SPIR-V output");
+}
+
+bool CheckSpirvOutputs(const Settings& settings, std::span<const char* const> inputs, const char* description) {
+	if (settings.spirv.empty()) return true;
+	if (!CheckSpirvOutput(settings.spirv, inputs, description)) return false;
+	return !settings.replay ||
+	       CheckSpirvOutput(settings.spirv + ".guest.spv", inputs, description, settings.spirv.c_str());
+}
+
+bool WriteSpirv(const std::string& path, const std::vector<uint32_t>& spirv) {
+	if (path.empty()) return true;
+	std::ofstream out(path, std::ios::binary);
+	if (!out) {
+		std::fprintf(stderr, "%s: cannot open SPIR-V output\n", path.c_str());
+		return false;
+	}
+	if (!out.write(reinterpret_cast<const char*>(spirv.data()),
+	               static_cast<std::streamsize>(spirv.size() * sizeof(uint32_t)))) {
+		std::fprintf(stderr, "%s: cannot write SPIR-V output\n", path.c_str());
+		return false;
+	}
+	out.close();
+	if (!out) {
+		std::fprintf(stderr, "%s: cannot close SPIR-V output\n", path.c_str());
+		return false;
+	}
+	return true;
 }
 
 int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, const Settings& settings) {
@@ -133,13 +213,9 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 			specialization.images[k].dimension     = translated.program.info.images[k].dimension;
 		}
 		auto compiled = Recompiler::CompileProgram(std::move(translated), options, specialization);
+		if (!WriteSpirv(settings.spirv, compiled.spirv)) return 2;
 		std::printf("%s: spirv=%zu words ray_query=%d\n", label, compiled.spirv.size(),
 		            compiled.program.info.ray_query ? 1 : 0);
-		if (!settings.spirv.empty()) {
-			std::ofstream out(settings.spirv, std::ios::binary);
-			out.write(reinterpret_cast<const char*>(compiled.spirv.data()),
-			          static_cast<std::streamsize>(compiled.spirv.size() * 4));
-		}
 	}
 	return native == bvh && bvh != 0 ? 0 : 2;
 }
@@ -191,12 +267,6 @@ bool CompileVariant(const std::vector<uint32_t>& code, uint64_t hash, const Sett
 	return true;
 }
 
-void WriteSpirv(const std::string& path, const std::vector<uint32_t>& spirv) {
-	if (path.empty()) return;
-	std::ofstream out(path, std::ios::binary);
-	out.write(reinterpret_cast<const char*>(spirv.data()), static_cast<std::streamsize>(spirv.size() * 4));
-}
-
 int Replay(const char* label, const std::vector<uint32_t>& code, uint64_t hash, const Settings& settings) {
 	Recompiler::CompileResult served, guest;
 	if (!CompileVariant(code, hash, settings, true, served) || !CompileVariant(code, hash, settings, false, guest)) {
@@ -226,15 +296,15 @@ int Replay(const char* label, const std::vector<uint32_t>& code, uint64_t hash, 
 	                     : served_buffers != guest_buffers || served_images != guest_images
 	                         ? "the two variants write different outputs"
 	                         : Libs::Graphics::RayTracingCheckUnreplayable(served.program);
+	if (!settings.spirv.empty() &&
+	    (!WriteSpirv(settings.spirv, served.spirv) || !WriteSpirv(settings.spirv + ".guest.spv", guest.spirv))) {
+		return 2;
+	}
 	std::printf("%s: replay=%s reason=%s bvh=%u native=%u oracle=%u written_buffers=%u written_images=%u "
 	            "address_writes=%d served_words=%zu guest_words=%zu\n",
 	            label, reason == nullptr ? "yes" : "no", reason == nullptr ? "-" : reason, bvh, native, oracle,
 	            served_buffers, served_images, served.program.has_address_writes ? 1 : 0, served.spirv.size(),
 	            guest.spirv.size());
-	if (!settings.spirv.empty()) {
-		WriteSpirv(settings.spirv, served.spirv);
-		WriteSpirv(settings.spirv + ".guest.spv", guest.spirv);
-	}
 	return reason == nullptr ? 0 : 3;
 }
 
@@ -310,17 +380,7 @@ int main(int argc, char** argv) {
 			std::fprintf(stderr, "%s: cannot open manifest cache\n", cachePath);
 			return 2;
 		}
-		if (!settings.spirv.empty()) {
-			std::error_code error;
-			if (std::filesystem::equivalent(cachePath, settings.spirv, error)) {
-				std::fprintf(stderr, "%s: SPIR-V output aliases the manifest cache\n", settings.spirv.c_str());
-				return 2;
-			}
-			if (error && error != std::errc::no_such_file_or_directory) {
-				std::fprintf(stderr, "%s: cannot verify SPIR-V output path: %s\n", settings.spirv.c_str(), error.message().c_str());
-				return 2;
-			}
-		}
+		if (!CheckSpirvOutputs(settings, {&cachePath, 1}, "the manifest cache")) return 2;
 		const auto result = AgcDriver::ReadCachedShaderCode(cache, hash);
 		if (result.error != nullptr) {
 			std::fprintf(stderr, "%s: shader %s: %s\n", cachePath, cacheHash, result.error);
@@ -330,6 +390,12 @@ int main(int argc, char** argv) {
 		return Probe(cacheHash, result.code, hash, settings) == 0 ? 0 : 2;
 	}
 	if (files.empty()) return Usage();
+	std::vector<const char*> inputs;
+	inputs.reserve(files.size());
+	for (const auto& file: files) inputs.push_back(file.first);
+	for (const auto& file: files) {
+		if (!CheckSpirvOutputs(file.second, inputs, "a shader input")) return 2;
+	}
 	bool failed = false;
 	for (const auto& [path, options] : files) {
 		std::vector<uint32_t> code;

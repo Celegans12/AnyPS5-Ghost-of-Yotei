@@ -126,6 +126,16 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         configure_host_test_executable(kyty_shim_rt_probe_cache_tests)
         add_test(NAME kyty_shim_rt_probe_cache COMMAND kyty_shim_rt_probe_cache_tests)
         set_tests_properties(kyty_shim_rt_probe_cache PROPERTIES TIMEOUT 20)
+        add_dependencies(kyty_shim_rt_probe_cache_tests kyty_rt_probe)
+        add_test(NAME kyty_shim_rt_probe_export COMMAND "${CMAKE_COMMAND}"
+                "-DDIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/rt probe export"
+                -P "${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/tests/RtProbeExport.cmake"
+                $<TARGET_FILE:kyty_shim_rt_probe_cache_tests> $<TARGET_FILE:kyty_rt_probe>)
+        set_tests_properties(kyty_shim_rt_probe_export PROPERTIES TIMEOUT 30)
+        if(WIN32)
+            set_tests_properties(kyty_shim_rt_probe_export PROPERTIES ENVIRONMENT_MODIFICATION
+                    "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
+        endif()
         add_test_executable(kyty_shim_native_rt_tests
                 KytyShim/src/NativeRtTests.cpp
                 KytyShim/src/NativeRt.cpp)

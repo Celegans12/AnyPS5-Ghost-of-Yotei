@@ -7,6 +7,8 @@
 #include <array>
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <span>
 #include <sstream>
@@ -50,9 +52,29 @@ void ExpectError(const std::string& cache, std::uint64_t hash, std::string_view 
     Require(result.code.empty(), "invalid cache input returned shader words");
 }
 
+void WriteExportFixture(const std::filesystem::path& directory) {
+    constexpr std::array shader{0xbf810000u};
+    const auto hash = XXH3_64bits(shader.data(), sizeof(shader));
+    const auto cache = "KTYCODE1" + Record(hash, shader);
+    std::ofstream rawFile(directory / "shader.bin", std::ios::binary);
+    rawFile.write(reinterpret_cast<const char*>(shader.data()), sizeof(shader));
+    rawFile.close();
+    Require(static_cast<bool>(rawFile), "could not write raw export fixture");
+    std::ofstream cacheFile(directory / "manifest.spv.guest.spv", std::ios::binary);
+    cacheFile.write(cache.data(), static_cast<std::streamsize>(cache.size()));
+    cacheFile.close();
+    Require(static_cast<bool>(cacheFile), "could not write cache export fixture");
+    std::printf("%016llx\n", static_cast<unsigned long long>(hash));
+}
+
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 3 && std::string_view(argv[1]) == "write-export-fixture") {
+        WriteExportFixture(argv[2]);
+        return 0;
+    }
+    Require(argc == 1, "unexpected test arguments");
     constexpr std::array shader{0xbf800000u, 0xbf810000u};
     constexpr std::array other{0xbf810000u};
     constexpr std::array metadata{0xffffffffu, 2u};
