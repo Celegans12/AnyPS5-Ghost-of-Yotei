@@ -396,7 +396,7 @@ void DllReportHost(const void* properties, const void* driver, const void* memor
 }
 
 extern "C" KytyDllStatus KytyDllCreate(const KytyDllHost* host, const KytyDllApi** api) {
-    if (host == nullptr || api == nullptr || host->abi_version != KYTY_DLL_ABI_VERSION || host->size != sizeof(KytyDllHost)) return KYTY_DLL_ABI_MISMATCH;
+    if (api == nullptr || !KytyDllHostMatches(host)) return KYTY_DLL_ABI_MISMATCH;
     g_host = host;
     static std::once_flag view;
     std::call_once(view, [] { Libs::LibKernel::Memory::Shim::EnableView(); });

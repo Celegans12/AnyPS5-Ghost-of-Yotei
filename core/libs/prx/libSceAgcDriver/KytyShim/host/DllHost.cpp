@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/KytyShim/host/DllCreate.hpp"
 #include "prx/libSceAgcDriver/KytyShim/include/KytyDll.h"
 
 #include "SceShaders.hpp"
@@ -354,8 +355,7 @@ const KytyDllApi& Api() {
         if (module == nullptr) throw std::runtime_error("libSceAgcDriver: kyty_gpu.prx beside libSceAgcDriver.prx could not be loaded (error " + std::to_string(GetLastError()) + ")");
         const auto create = reinterpret_cast<KytyDllCreateFunction>(reinterpret_cast<void*>(GetProcAddress(module, KYTY_DLL_CREATE_SYMBOL)));
         if (create == nullptr) throw std::runtime_error("libSceAgcDriver: kyty_gpu.prx does not export " KYTY_DLL_CREATE_SYMBOL);
-        const KytyDllApi* created = nullptr;
-        if (create(&host, &created) != KYTY_DLL_OK || created == nullptr || created->abi_version != KYTY_DLL_ABI_VERSION || created->size != sizeof(KytyDllApi)) throw std::runtime_error("libSceAgcDriver: kyty_gpu.prx was built for another KytyDll.h");
+        const KytyDllApi* created = KytyShim::CreateDll(create, host);
         g_api = created;
         return created;
     }();
