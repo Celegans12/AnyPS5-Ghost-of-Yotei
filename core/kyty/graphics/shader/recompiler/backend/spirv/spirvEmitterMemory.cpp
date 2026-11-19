@@ -2150,11 +2150,34 @@ std::array<uint32_t, 3> EmitTriangleIndices(ValueEmitContext& ctx, const std::ar
 		return compose(values);
 	});
 	const auto slow_values = EmitValueOrDefaultIfCondition(state, Unary(state, spv::OpLogicalNot, b, fast), vector, zero, [&]() {
-		std::array<uint32_t, 3> values {};
-		for (uint32_t k = 0; k < 3; k++) {
-			values[k] = EmitFormattedBufferLoadX(ctx, vsharp, Binary(state, spv::OpIAdd, u, first, ConstantU32(state, k)));
-		}
-		return compose(values);
+		const auto entry    = state.current_label;
+		const auto header   = state.builder.AllocateId();
+		const auto body     = state.builder.AllocateId();
+		const auto cont     = state.builder.AllocateId();
+		const auto merge    = state.builder.AllocateId();
+		const auto index    = state.builder.AllocateId();
+		const auto gathered = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpBranch, header);
+		EmitLabel(state, header);
+		const auto index_phi    = state.builder.AddDeferredPhi(u, index, 2);
+		const auto gathered_phi = state.builder.AddDeferredPhi(vector, gathered, 2);
+		const auto more         = Binary(state, spv::OpULessThan, b, index, ConstantU32(state, 3));
+		state.builder.AddFunction(spv::OpLoopMerge, merge, cont, spv::LoopControlDontUnrollMask);
+		state.builder.AddFunction(spv::OpBranchConditional, more, body, merge);
+		EmitLabel(state, body);
+		const auto value = EmitFormattedBufferLoadX(ctx, vsharp, Binary(state, spv::OpIAdd, u, first, index));
+		const auto next  = state.builder.AllocateId();
+		state.builder.AddFunction(spv::OpVectorInsertDynamic, vector, next, gathered, value, index);
+		state.builder.AddFunction(spv::OpBranch, cont);
+		EmitLabel(state, cont);
+		const auto next_index = Binary(state, spv::OpIAdd, u, index, ConstantU32(state, 1));
+		state.builder.AddFunction(spv::OpBranch, header);
+		state.builder.PatchDeferredPhi(index_phi, 0, ConstantU32(state, 0), entry);
+		state.builder.PatchDeferredPhi(index_phi, 1, next_index, cont);
+		state.builder.PatchDeferredPhi(gathered_phi, 0, zero, entry);
+		state.builder.PatchDeferredPhi(gathered_phi, 1, next, cont);
+		EmitLabel(state, merge);
+		return gathered;
 	});
 	const auto selected = Select(state, vector, fast, fast_values, slow_values);
 	std::array<uint32_t, 3> result {};
