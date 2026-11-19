@@ -9,6 +9,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cstring>
@@ -111,26 +112,69 @@ struct ImageTableFill {
 	uint32_t first_slot = 0;
 };
 
+[[nodiscard]] bool TableDescriptorWrites();
+
 void AppendImageTableGaps(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables,
                           std::vector<vk::WriteDescriptorSet>& gap_writes);
-void AppendImageTableFills(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables,
-                           vk::DescriptorSet persistent, std::vector<vk::CopyDescriptorSet>& table_copies);
-void AppendImageTableSeed(uint32_t binding, const ImageTableFill& table, vk::DescriptorSet set,
-                          vk::DescriptorSet persistent, std::vector<vk::CopyDescriptorSet>& seed_copies);
+void AppendImageTableFills(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables, bool writes,
+                           vk::DescriptorSet persistent, std::span<const vk::DescriptorImageInfo> slot_infos,
+                           std::span<const uint8_t> slot_live, std::vector<vk::WriteDescriptorSet>& table_writes,
+                           std::vector<vk::CopyDescriptorSet>& table_copies);
+void AppendImageTableSeed(uint32_t binding, vk::DescriptorType type, const ImageTableFill& table, bool writes,
+                          vk::DescriptorSet set, vk::DescriptorSet persistent,
+                          std::span<const vk::DescriptorImageInfo> slot_infos,
+                          std::vector<vk::WriteDescriptorSet>&     seed_writes,
+                          std::vector<vk::CopyDescriptorSet>&      seed_copies);
 void PatchTableSetUpdate(vk::DescriptorSet set, std::vector<vk::WriteDescriptorSet>& writes,
+                         std::span<const vk::WriteDescriptorSet> table_writes,
                          std::span<vk::CopyDescriptorSet>         copies,
                          std::span<const vk::WriteDescriptorSet> slot_set_writes);
 
 struct ImageTableBinding {
-	const void*                    state = nullptr;
-	vk::DescriptorSet              persistent;
-	vk::WriteDescriptorSet         whole;
-	std::array<ImageTableFill, 16> tables {};
-	uint32_t                       count = 0;
+	const void*                              state = nullptr;
+	vk::DescriptorSet                        persistent;
+	std::span<const vk::DescriptorImageInfo> slot_infos;
+	vk::WriteDescriptorSet                   whole;
+	std::array<ImageTableFill, 16>           tables {};
+	uint32_t                                 count = 0;
 };
 
-void AppendTableBindingFills(std::span<const ImageTableBinding>  bindings,
-                             std::vector<vk::CopyDescriptorSet>& table_copies);
+template <typename TProve>
+void AppendTableBindingFills(std::span<const ImageTableBinding> bindings, bool writes, TProve&& prove,
+                             std::vector<vk::WriteDescriptorSet>& table_writes,
+                             std::vector<vk::CopyDescriptorSet>&  table_copies) {
+	const void*              proven = nullptr;
+	std::span<const uint8_t> slot_live;
+	for (const auto& binding: bindings) {
+		if (writes && binding.state != proven) {
+			proven    = binding.state;
+			slot_live = prove(binding.state);
+		}
+		AppendImageTableFills(binding.whole, std::span {binding.tables.data(), binding.count}, writes,
+		                      binding.persistent, binding.slot_infos, slot_live, table_writes, table_copies);
+	}
+}
+
+template <typename TViewsOf>
+void MarkLiveTableElements(std::span<const vk::DescriptorImageInfo> infos, TViewsOf&& views_of,
+                           std::vector<uint8_t>& element_live) {
+	element_live.resize(infos.size());
+	for (size_t index = 0; index < infos.size(); index++) {
+		const auto view = infos[index].imageView;
+		if (view == nullptr) {
+			element_live[index] = 1;
+			continue;
+		}
+		const std::vector<CachedImageView>* views = views_of(index);
+		element_live[index] =
+		    views != nullptr && std::ranges::find(*views, view, &CachedImageView::view) != views->end() ? 1 : 0;
+	}
+}
+
+[[nodiscard]] bool MarkLiveTableSlots(std::span<const uint32_t>                slots,
+                                      std::span<const vk::DescriptorImageInfo> slot_infos,
+                                      std::span<const vk::DescriptorImageInfo> infos,
+                                      std::span<const uint8_t> element_live, std::vector<uint8_t>& slot_live);
 
 template <typename T>
 [[nodiscard]] T DecodeNativeDescriptor(const ShaderRecompiler::IR::DescriptorValue& value) {

@@ -426,6 +426,7 @@ private:
 	};
 	[[nodiscard]] TableBindingState::RingSet* AcquireTableRingSet(TableBindingState&      state,
 	                                                              vk::DescriptorSetLayout layout);
+	[[nodiscard]] bool ProveTableSlotsLive(const TableBindingState& state);
 	[[nodiscard]] bool ReuseTableBindings(const ShaderRecompiler::IR::CompiledShaderInfo& program,
 	                                      const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
 	                                      TableBindingState& state, uint64_t stamp,
@@ -602,6 +603,9 @@ private:
 	std::vector<vk::CopyDescriptorSet>    m_descriptor_copies;
 	std::vector<vk::WriteDescriptorSet>   m_slot_set_writes;
 	std::vector<ImageTableBinding>        m_table_fills;
+	std::vector<vk::WriteDescriptorSet>   m_table_writes;
+	std::vector<uint8_t>                  m_table_element_live;
+	std::vector<uint8_t>                  m_table_slot_live;
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;

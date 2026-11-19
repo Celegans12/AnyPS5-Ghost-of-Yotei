@@ -37,10 +37,12 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
 #include <span>
+#include <string_view>
 #include <vector>
 #include <xxhash.h>
 
@@ -50,6 +52,20 @@ namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
+}
+
+bool TableDescriptorWrites() {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_TABLE_DESCRIPTOR_WRITES");
+		if (value == nullptr || value[0] == '\0' || std::string_view(value) == "1") {
+			return true;
+		}
+		if (std::string_view(value) != "0") {
+			EXIT("invalid KYTY_TABLE_DESCRIPTOR_WRITES: %s (0 or 1)\n", value);
+		}
+		return false;
+	}();
+	return enabled;
 }
 
 vk::DescriptorType NativeDescriptorType(BindingKind kind) {
@@ -137,23 +153,66 @@ void AppendImageTableGaps(const vk::WriteDescriptorSet& whole, std::span<const I
 	}
 }
 
-void AppendImageTableFills(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables,
-                           vk::DescriptorSet persistent, std::vector<vk::CopyDescriptorSet>& table_copies) {
-	for (const auto& table: tables) {
-		EXIT_IF(table.base + table.capacity > whole.descriptorCount);
+void AppendImageTableFills(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables, bool writes,
+                           vk::DescriptorSet persistent, std::span<const vk::DescriptorImageInfo> slot_infos,
+                           std::span<const uint8_t> slot_live, std::vector<vk::WriteDescriptorSet>& table_writes,
+                           std::vector<vk::CopyDescriptorSet>& table_copies) {
+	EXIT_IF(!slot_live.empty() && slot_live.size() != slot_infos.size());
+	const auto copy_range = [&](uint32_t element, uint32_t count) {
 		vk::CopyDescriptorSet copy {};
 		copy.srcSet          = persistent;
 		copy.srcBinding      = whole.dstBinding;
-		copy.srcArrayElement = table.base;
+		copy.srcArrayElement = element;
 		copy.dstBinding      = whole.dstBinding;
-		copy.dstArrayElement = table.base;
-		copy.descriptorCount = table.capacity;
+		copy.dstArrayElement = element;
+		copy.descriptorCount = count;
 		table_copies.push_back(copy);
+	};
+	const auto live = [&](uint32_t slot) { return slot_live.empty() || slot_live[slot] != 0; };
+	for (const auto& table: tables) {
+		EXIT_IF(table.base + table.capacity > whole.descriptorCount);
+		if (!writes) {
+			copy_range(table.base, table.capacity);
+			continue;
+		}
+		EXIT_IF(size_t {table.first_slot} + table.capacity > slot_infos.size());
+		for (uint32_t begin = 0; begin < table.capacity;) {
+			const bool run_live = live(table.first_slot + begin);
+			uint32_t   end      = begin + 1;
+			while (end < table.capacity && live(table.first_slot + end) == run_live) {
+				end++;
+			}
+			if (run_live) {
+				auto write            = whole;
+				write.dstArrayElement = table.base + begin;
+				write.descriptorCount = end - begin;
+				write.pImageInfo      = slot_infos.data() + table.first_slot + begin;
+				table_writes.push_back(write);
+			} else {
+				copy_range(table.base + begin, end - begin);
+			}
+			begin = end;
+		}
 	}
 }
 
-void AppendImageTableSeed(uint32_t binding, const ImageTableFill& table, vk::DescriptorSet set,
-                          vk::DescriptorSet persistent, std::vector<vk::CopyDescriptorSet>& seed_copies) {
+void AppendImageTableSeed(uint32_t binding, vk::DescriptorType type, const ImageTableFill& table, bool writes,
+                          vk::DescriptorSet set, vk::DescriptorSet persistent,
+                          std::span<const vk::DescriptorImageInfo> slot_infos,
+                          std::vector<vk::WriteDescriptorSet>&     seed_writes,
+                          std::vector<vk::CopyDescriptorSet>&      seed_copies) {
+	if (writes) {
+		EXIT_IF(size_t {table.first_slot} + table.capacity > slot_infos.size());
+		vk::WriteDescriptorSet seed {};
+		seed.dstSet          = persistent;
+		seed.dstBinding      = binding;
+		seed.dstArrayElement = table.base;
+		seed.descriptorCount = table.capacity;
+		seed.descriptorType  = type;
+		seed.pImageInfo      = slot_infos.data() + table.first_slot;
+		seed_writes.push_back(seed);
+		return;
+	}
 	vk::CopyDescriptorSet copy {};
 	copy.srcSet          = set;
 	copy.srcBinding      = binding;
@@ -166,8 +225,10 @@ void AppendImageTableSeed(uint32_t binding, const ImageTableFill& table, vk::Des
 }
 
 void PatchTableSetUpdate(vk::DescriptorSet set, std::vector<vk::WriteDescriptorSet>& writes,
+                         std::span<const vk::WriteDescriptorSet> table_writes,
                          std::span<vk::CopyDescriptorSet>         copies,
                          std::span<const vk::WriteDescriptorSet> slot_set_writes) {
+	writes.insert(writes.end(), table_writes.begin(), table_writes.end());
 	for (auto& write: writes) {
 		write.dstSet = set;
 	}
@@ -177,12 +238,21 @@ void PatchTableSetUpdate(vk::DescriptorSet set, std::vector<vk::WriteDescriptorS
 	writes.insert(writes.end(), slot_set_writes.begin(), slot_set_writes.end());
 }
 
-void AppendTableBindingFills(std::span<const ImageTableBinding>  bindings,
-                             std::vector<vk::CopyDescriptorSet>& table_copies) {
-	for (const auto& binding: bindings) {
-		AppendImageTableFills(binding.whole, std::span {binding.tables.data(), binding.count}, binding.persistent,
-		                      table_copies);
+bool MarkLiveTableSlots(std::span<const uint32_t> slots, std::span<const vk::DescriptorImageInfo> slot_infos,
+                        std::span<const vk::DescriptorImageInfo> infos, std::span<const uint8_t> element_live,
+                        std::vector<uint8_t>& slot_live) {
+	EXIT_IF(slots.size() != slot_infos.size() || element_live.size() != infos.size());
+	slot_live.resize(slots.size());
+	bool all_live = true;
+	for (size_t slot = 0; slot < slots.size(); slot++) {
+		const auto element = slots[slot];
+		const auto view    = slot_infos[slot].imageView;
+		const bool live    = view == nullptr || (element < infos.size() && element_live[element] != 0 &&
+		                                      view == infos[element].imageView);
+		slot_live[slot] = live ? 1 : 0;
+		all_live        = all_live && live;
 	}
+	return all_live;
 }
 
 static bool DepthTableElement(TextureCache& texture_cache, const TextureBinding& texture) {
@@ -2885,6 +2955,20 @@ RenderExecutor::TableBindingState::RingSet* RenderExecutor::AcquireTableRingSet(
 	return &entry;
 }
 
+bool RenderExecutor::ProveTableSlotsLive(const TableBindingState& state) {
+	auto& texture_cache = m_context.GetTextureCache();
+	EXIT_IF(state.infos.size() != state.elements.size());
+	MarkLiveTableElements(
+	    state.infos,
+	    [&](size_t index) -> const std::vector<CachedImageView>* {
+		    const auto* image = texture_cache.m_slot_images.try_get(state.elements[index].pinned);
+		    return image != nullptr ? &image->views : nullptr;
+	    },
+	    m_table_element_live);
+	return MarkLiveTableSlots(state.slots, state.slot_infos, state.infos, m_table_element_live,
+	                          m_table_slot_live);
+}
+
 void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
                                     vk::PipelineBindPoint              pipeline_bind_point,
                                     const PipelineCache::Pipeline&     pipeline,
@@ -2916,6 +3000,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_copies.clear();
 	m_slot_set_writes.clear();
 	m_table_fills.clear();
+	m_table_writes.clear();
+	const bool fill_writes = TableDescriptorWrites();
 	m_commit_capture_ok = m_commit_capture != nullptr && pipeline.uses_push_descriptors;
 	m_commit_capture_kinds.clear();
 	size_t image_cursor = 0;
@@ -3058,6 +3144,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					std::sort(fill.tables.begin(), end,
 					          [](const auto& a, const auto& b) { return a.base < b.base; });
 					fill.persistent       = table_state->slot_set;
+					fill.slot_infos       = table_state->slot_infos;
 					fill.whole.pImageInfo = m_descriptor_images.data() + image_start;
 					AppendImageTableGaps(fill.whole, std::span {fill.tables.data(), fill.count},
 					                     m_descriptor_writes);
@@ -3260,7 +3347,14 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					m_descriptor_writes.push_back(write);
 				}
 			} else {
-				AppendTableBindingFills(m_table_fills, m_descriptor_copies);
+				AppendTableBindingFills(
+				    m_table_fills, fill_writes,
+				    [&](const void* state) {
+					    return ProveTableSlotsLive(*static_cast<const TableBindingState*>(state))
+					               ? std::span<const uint8_t> {}
+					               : std::span<const uint8_t> {m_table_slot_live};
+				    },
+				    m_table_writes, m_descriptor_copies);
 			}
 			if (ring != nullptr) {
 				ring->tick    = m_context.GetCommandScheduler().CurrentTick();
@@ -3274,7 +3368,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					log.erase(log.begin(), keep);
 				}
 			}
-			PatchTableSetUpdate(set, m_descriptor_writes, m_descriptor_copies, m_slot_set_writes);
+			PatchTableSetUpdate(set, m_descriptor_writes, m_table_writes, m_descriptor_copies, m_slot_set_writes);
+			m_table_writes.clear();
 			device.updateDescriptorSets(static_cast<uint32_t>(m_descriptor_writes.size()),
 			                            m_descriptor_writes.data(),
 			                            static_cast<uint32_t>(m_descriptor_copies.size()),
@@ -3288,13 +3383,15 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				if (!state.slot_set) {
 					state.slot_set = heap.CommitPersistent(pipeline.descriptor_set_layout);
 				}
-				AppendImageTableSeed(table.binding,
+				AppendImageTableSeed(table.binding, NativeDescriptorType(table.kind),
 				                     {.base = table.base, .capacity = table.capacity, .first_slot = table.first_slot},
-				                     set, state.slot_set, m_descriptor_copies);
+				                     fill_writes, set, state.slot_set, state.slot_infos, m_table_writes,
+				                     m_descriptor_copies);
 				state.slot_set_current = true;
 			}
-			if (!m_descriptor_copies.empty()) {
-				device.updateDescriptorSets(0, nullptr,
+			if (!m_table_writes.empty() || !m_descriptor_copies.empty()) {
+				device.updateDescriptorSets(static_cast<uint32_t>(m_table_writes.size()),
+				                            m_table_writes.data(),
 				                            static_cast<uint32_t>(m_descriptor_copies.size()),
 				                            m_descriptor_copies.data());
 			}
