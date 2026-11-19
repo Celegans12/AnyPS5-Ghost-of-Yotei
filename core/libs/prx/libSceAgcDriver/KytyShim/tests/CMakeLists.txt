@@ -126,6 +126,30 @@ add_test(NAME kyty_shim_merged_hull_draw COMMAND kyty_shim_merged_hull_tests dra
 set_tests_properties(kyty_shim_merged_hull_draw PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
 
 if(NOT WIN32)
+    add_test_executable(kyty_shim_descriptor_tables_tests ${CMAKE_CURRENT_SOURCE_DIR}/DescriptorTables.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    target_include_directories(kyty_shim_descriptor_tables_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_include_directories(kyty_shim_descriptor_tables_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
+    target_link_libraries(kyty_shim_descriptor_tables_tests PRIVATE Kyty::gpu libkernel libc)
+    add_test(NAME kyty_shim_descriptor_tables COMMAND kyty_shim_descriptor_tables_tests)
+    set_tests_properties(kyty_shim_descriptor_tables PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_descriptor_tables: ok"
+            FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test(NAME kyty_shim_descriptor_tables_empty COMMAND kyty_shim_descriptor_tables_tests empty)
+    set_tests_properties(kyty_shim_descriptor_tables_empty PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_TABLE_DESCRIPTOR_WRITES="
+            PASS_REGULAR_EXPRESSION "kyty_shim_descriptor_tables_switch: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test(NAME kyty_shim_descriptor_tables_one COMMAND kyty_shim_descriptor_tables_tests one)
+    set_tests_properties(kyty_shim_descriptor_tables_one PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_TABLE_DESCRIPTOR_WRITES=1"
+            PASS_REGULAR_EXPRESSION "kyty_shim_descriptor_tables_switch: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test(NAME kyty_shim_descriptor_tables_copies COMMAND kyty_shim_descriptor_tables_tests copies)
+    set_tests_properties(kyty_shim_descriptor_tables_copies PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_TABLE_DESCRIPTOR_WRITES=0"
+            PASS_REGULAR_EXPRESSION "kyty_shim_descriptor_tables_copies: ok" FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+    add_test(NAME kyty_shim_descriptor_tables_bad COMMAND kyty_shim_descriptor_tables_tests bad)
+    set_tests_properties(kyty_shim_descriptor_tables_bad PROPERTIES TIMEOUT 20 ENVIRONMENT "KYTY_TABLE_DESCRIPTOR_WRITES=2"
+            PASS_REGULAR_EXPRESSION "invalid KYTY_TABLE_DESCRIPTOR_WRITES: 2" FAIL_REGULAR_EXPRESSION "did not stop")
+    add_test(NAME kyty_shim_descriptor_tables_draw COMMAND kyty_shim_descriptor_tables_tests draw)
+    set_tests_properties(kyty_shim_descriptor_tables_draw PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+endif()
+
+if(NOT WIN32)
     add_test_executable(kyty_shim_rt_corpus_tests ${CMAKE_CURRENT_SOURCE_DIR}/RtCorpus.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
     target_include_directories(kyty_shim_rt_corpus_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(kyty_shim_rt_corpus_tests PRIVATE Kyty::gpu libkernel libc)
