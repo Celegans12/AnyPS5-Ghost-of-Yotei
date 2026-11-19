@@ -444,7 +444,8 @@ void SummarizeRayTracing() {
 			return whole != 0 ? static_cast<double>(part) / static_cast<double>(whole) : 0.0;
 		};
 		log(fmt::format("[RT]   oracle: {} rays answered from host ray queries (last cs {}), {:.2f} candidates per ray, "
-		                "{:.2f} resume rounds per wave, {} box intersections missed without a host context (last cs {})",
+		                "{:.2f} resume rounds per wave, {} box intersections the walk did not descend: no host context, or a node "
+		                "outside the proposed BLAS (last cs {})",
 		                oracle_rays, RtShader(stats.last_oracle.load(std::memory_order_relaxed)),
 		                per(oracle_candidates, oracle_rays), per(oracle_rounds, oracle_waves), oracle_returned,
 		                RtShader(stats.last_oracle_returned.load(std::memory_order_relaxed))));
