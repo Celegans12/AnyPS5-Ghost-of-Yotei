@@ -463,9 +463,35 @@ static void PrepareDrawRayTracing(RenderContext& context, CommandBuffer& buffer,
 	const auto  pointer = RayTracing::UserPointer(
 	    source, uint64_t {user[source.user_sgpr]} | (uint64_t {user[source.user_sgpr + 1]} << 32u),
 	    [&](uint64_t address, uint64_t size) { return context.IsMapped(address, size); });
+	const auto frame = static_cast<uint64_t>(context.GetGpu().GetFrameNum());
+	RayTracing::Preparation preparation {.tick          = context.GetCommandScheduler().CurrentTick(),
+	                                     .frame         = frame,
+	                                     .user_pointer  = pointer,
+	                                     .generation    = native_rt->Generation(),
+	                                     .header_offset = source.header_offset,
+	                                     .root          = source.root,
+	                                     .layout        = source.layout};
+	bool known = true;
+	if ((source.layout[3] & RayTracing::PsrHeaderLayout) != 0 || source.header != 0 ||
+	    RayTracing::HeaderInUserData(source)) {
+		preparation.header = RayTracing::HeaderInUserData(source) ? RayTracing::UserDataHeader(pointer) : source.header;
+	} else if (const auto& words = bindings.runtime->resources->flattened_srt;
+	           bindings.flattened_srt.buffer && (uint64_t {source.header_slots[0]} + 1) * 4 <= bindings.flattened_srt.range &&
+	           (uint64_t {source.header_slots[1]} + 1) * 4 <= bindings.flattened_srt.range) {
+		known = bindings.flattened_srt_known && source.header_slots[0] < words.size() &&
+		        source.header_slots[1] < words.size();
+		if (known) {
+			preparation.header = uint64_t {words[source.header_slots[0]]} | uint64_t {words[source.header_slots[1]]} << 32u;
+		}
+	}
+	if (known && native_rt->Prepared(preparation)) {
+		return;
+	}
 	buffer.EndRendering();
-	native_rt->Prepare(buffer.Handle(), pointer, source, bindings.flattened_srt, context.GetGpu().GetFrameNum(),
-	                   module.info.shader_hash);
+	native_rt->Prepare(buffer.Handle(), pointer, source, bindings.flattened_srt, frame, module.info.shader_hash);
+	if (known) {
+		native_rt->KeepPrepared(preparation);
+	}
 }
 
 static bool DrawHasValidVertexShader(const HW::Shader& sh_ctx) {

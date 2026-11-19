@@ -1787,6 +1787,11 @@ void RenderExecutor::FlushDeferredDispatchBarrier() {
 
 void RenderExecutor::BeginGuestOperation(uint32_t queue, bool dispatch, bool draw,
                                          bool guest_sync) {
+	if (!draw || guest_sync || queue != m_guest_queue) {
+		if (auto* native_rt = m_context.GetRayTracing(); native_rt != nullptr) {
+			native_rt->NoteGuestOperation();
+		}
+	}
 	m_guest_queue = queue;
 	m_context.GetOcclusionQueries().DropReadTargets();
 	if (m_shader_write_deferred && (!draw || guest_sync || queue != m_shader_write_queue)) {
@@ -1850,6 +1855,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.runtime = &runtime;
 	prepared.gds = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt = {};
+	prepared.flattened_srt_known = false;
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory = {};
 	prepared.template_stage  = nullptr;
@@ -2051,6 +2057,7 @@ void RenderExecutor::PrepareBindingsFromTemplate(const ShaderStageRuntime& runti
 	prepared.runtime            = &runtime;
 	prepared.gds                = {nullptr, 0, VK_WHOLE_SIZE};
 	prepared.flattened_srt      = {};
+	prepared.flattened_srt_known = false;
 	prepared.shader_data_buffer = {};
 	prepared.shared_memory      = {};
 	prepared.template_stage  = &stage;
@@ -2509,7 +2516,8 @@ void RenderExecutor::RebindBuffers(PreparedBindings& prepared) {
 		        : LodStatsReport::NoCounterFlag;
 	}
 	if (layout.descriptor_counts[static_cast<size_t>(BindingKind::FlattenedSrt)] != 0) {
-		prepared.flattened_srt = NativeUpload(m_context, snapshot.flattened_srt);
+		prepared.flattened_srt       = NativeUpload(m_context, snapshot.flattened_srt);
+		prepared.flattened_srt_known = snapshot.gpu_flat_loads.empty();
 		if (!snapshot.gpu_flat_loads.empty()) {
 			CopyGpuFlatLoads(m_context, prepared.flattened_srt, snapshot.gpu_flat_loads);
 			snapshot.gpu_flat_loads.clear();

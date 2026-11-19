@@ -1475,6 +1475,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	if (!m_enabled) {
 		return;
 	}
+	m_reusable = false;
 	g_rt_stats.native.Add();
 	auto& readback = m_readbacks[m_readback_index];
 	if (readback.tick != 0) {
@@ -1985,6 +1986,7 @@ uint32_t RayTracing::HleTlasHeader(uint32_t count, HleTlasFormat format,
 void RayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t input_va,
                                      uint32_t count, uint32_t stride, uint64_t header_va,
                                      HleTlasFormat format) {
+	NoteGuestOperation();
 	if (!m_enabled || header_va == 0 || (count != 0 && input_va == 0)) {
 		return;
 	}
@@ -2016,6 +2018,7 @@ void RayTracing::RecordHleTlas(const CommandRecorder& command, uint64_t input_va
 }
 
 void RayTracing::NoteGuestBlasBuilds(std::span<const GuestBlasBuild> builds) {
+	NoteGuestOperation();
 	if (!m_enabled) {
 		return;
 	}
@@ -2129,6 +2132,7 @@ uint32_t RayTracing::CreateHostSlot(uint64_t blas_va, const SlotSizes& sizes) {
 }
 
 void RayTracing::NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memory_size) {
+	NoteGuestOperation();
 	if (!m_enabled || blas_va == 0) {
 		return;
 	}
@@ -2157,6 +2161,7 @@ void RayTracing::NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memory_siz
 void RayTracing::RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
                                       std::span<const HleRefitGeometry> geometries, uint32_t header_layout,
                                       bool arguments) {
+	NoteGuestOperation();
 	if (!m_enabled || blases.empty()) {
 		return;
 	}

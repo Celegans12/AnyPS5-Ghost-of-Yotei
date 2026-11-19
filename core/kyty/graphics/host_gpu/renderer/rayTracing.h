@@ -90,6 +90,28 @@ public:
 	             const vk::DescriptorBufferInfo& flattened_srt, uint64_t frame, uint64_t shader_hash,
 	             bool count_rays = false, bool per_lane = false);
 
+	struct Preparation {
+		uint64_t                tick         = 0;
+		uint64_t                frame        = 0;
+		uint64_t                user_pointer = 0;
+		uint64_t                header       = 0;
+		uint64_t                generation   = 0;
+		uint32_t                header_offset = 0;
+		uint32_t                root         = 0;
+		std::array<uint32_t, 4> layout {};
+
+		bool operator==(const Preparation&) const = default;
+	};
+	[[nodiscard]] bool Prepared(const Preparation& preparation) const noexcept {
+		return m_reusable && m_reuse == preparation;
+	}
+	void KeepPrepared(const Preparation& preparation) noexcept {
+		m_reuse    = preparation;
+		m_reusable = true;
+	}
+	void NoteGuestOperation() noexcept { m_generation.fetch_add(1, std::memory_order_relaxed); }
+	[[nodiscard]] uint64_t Generation() const noexcept { return m_generation.load(std::memory_order_relaxed); }
+
 	enum class HleTlasFormat : uint32_t {
 		Base460,
 		Base252,
@@ -326,6 +348,9 @@ private:
 	Arena                        m_arena;
 
 	std::array<Readback, 32> m_readbacks;
+	Preparation              m_reuse {};
+	bool                     m_reusable = false;
+	std::atomic<uint64_t>    m_generation {0};
 	uint32_t                m_readback_index = 0;
 	std::atomic<uint64_t>   m_preparations {0};
 	mutable std::mutex      m_outcome_mutex;
