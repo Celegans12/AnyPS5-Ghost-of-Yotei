@@ -4,14 +4,36 @@
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
 
 #include <array>
+#include <charconv>
 #include <cstdint>
 #include <span>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <variant>
 #include <vector>
 
 namespace Libs::Graphics {
+
+namespace ManifestText {
+
+inline bool ParseNumber(std::string_view text, uint64_t& value, int base = 10) {
+	if (text.empty()) return false;
+	const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value, base);
+	return error == std::errc() && end == text.data() + text.size();
+}
+
+inline std::vector<std::string_view> Split(std::string_view text, char separator) {
+	std::vector<std::string_view> parts;
+	for (size_t start = 0;;) {
+		const auto end = text.find(separator, start);
+		parts.push_back(text.substr(start, end == std::string_view::npos ? end : end - start));
+		if (end == std::string_view::npos) return parts;
+		start = end + 1;
+	}
+}
+
+}
 
 inline constexpr uint32_t ManifestFormat = 1;
 

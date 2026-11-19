@@ -102,7 +102,15 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
     add_dependencies(kyty_rt_probe agc_trace_revision)
     target_include_directories(kyty_rt_probe PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib ${CMAKE_CURRENT_BINARY_DIR}/generated)
     target_include_directories(kyty_rt_probe SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
-    target_link_libraries(kyty_rt_probe PRIVATE Kyty::gpu libc)
+    target_link_libraries(kyty_rt_probe PRIVATE Kyty::gpu)
+    if(WIN32 AND NOT CMAKE_VERSION VERSION_LESS 3.21)
+        add_custom_command(TARGET kyty_rt_probe POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" "-DDEST_DIR=$<TARGET_FILE_DIR:kyty_rt_probe>"
+                -P "${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeFiles.cmake" "$<TARGET_FILE:libc>"
+                VERBATIM)
+    elseif(NOT WIN32)
+        target_link_libraries(kyty_rt_probe PRIVATE libc)
+    endif()
     set_target_properties(kyty_rt_probe PROPERTIES CXX_EXTENSIONS OFF)
     if(BUILD_TESTING)
         add_test_executable(kyty_shim_entry_tests
