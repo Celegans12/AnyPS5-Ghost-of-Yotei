@@ -117,7 +117,7 @@ struct ConfigOptions {
 	bool                   relaxed_shader_float        = false;
 	bool                   native_rt                   = false;
 	bool                   async_pipelines_enabled     = true;
-	bool                   async_pipelines_skip_more   = true;
+	bool                   async_pipelines_skip_more   = false;
 	bool                   rt_stats_enabled            = false;
 	uint32_t               rt_oracle                   = 0;
 	uint32_t               rt_check_period             = 0;
