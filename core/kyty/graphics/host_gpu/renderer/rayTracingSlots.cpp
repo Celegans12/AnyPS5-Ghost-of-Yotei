@@ -334,6 +334,9 @@ struct RtStats {
 	std::atomic<uint64_t> last_uncached {0};
 	RtCounter             walks_overflow;
 	std::atomic<uint64_t> last_overflow {0};
+	std::atomic<uint32_t> last_overflow_instances {0};
+	std::atomic<uint32_t> last_overflow_capacity {0};
+	std::atomic<uint32_t> last_overflow_boxes {0};
 	RtCounter             walks_incomplete;
 	RtCounter             walks_forced;
 	std::atomic<uint64_t> last_incomplete {0};
@@ -416,19 +419,22 @@ void SummarizeRayTracing() {
 		                RtShader(stats.last_unpublished.load(std::memory_order_relaxed))));
 	}
 	if (uncached != 0) {
-		log(fmt::format("[RT]   {} TLAS walks found TLAS memory not cached yet (last cs {}): their rays missed what "
-		                "it holds, cached for the next walks",
+		log(fmt::format("[RT]   {} TLAS walks found TLAS memory not cached yet (last cs {}): counted as incomplete "
+		                "walks, cached for the next walks",
 		                uncached, RtShader(stats.last_uncached.load(std::memory_order_relaxed))));
 	}
 	if (overflow != 0) {
 		log(fmt::format("[RT]   {} TLAS walks found more box nodes or instances than the host structures hold "
-		                "(last cs {}): their rays missed the rest",
-		                overflow, RtShader(stats.last_overflow.load(std::memory_order_relaxed))));
+		                "(last cs {}: {} instances for {} host slots, {} box nodes for {}): counted as incomplete walks",
+		                overflow, RtShader(stats.last_overflow.load(std::memory_order_relaxed)),
+		                stats.last_overflow_instances.load(std::memory_order_relaxed),
+		                stats.last_overflow_capacity.load(std::memory_order_relaxed),
+		                stats.last_overflow_boxes.load(std::memory_order_relaxed), QueueCapacity));
 	}
 	if (incomplete + forced != 0) {
-		log(fmt::format("[RT]   {} TLAS walks found instances whose BLAS the host has not built yet (last cs {}): {} "
-		                "published no context and their dispatches walked the guest BVH, {} published one anyway after "
-		                "{} incomplete walks in a row",
+		log(fmt::format("[RT]   {} TLAS walks were incomplete, with instances whose BLAS the host has not built yet "
+		                "or a full host structure (last cs {}): {} published no context and their dispatches walked the "
+		                "guest BVH, {} published one anyway after {} incomplete walks in a row",
 		                incomplete + forced, RtShader(stats.last_incomplete.load(std::memory_order_relaxed)), incomplete,
 		                forced, IncompleteWalksAtMost));
 	}
@@ -1807,6 +1813,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	              vk::PipelineStageFlagBits2::eAllCommands,
 	              vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite);
 	readback.tick        = m_scheduler.CurrentTick();
+	readback.capacity    = tlas_count;
 	readback.preparation = m_preparations.load(std::memory_order_relaxed) + 1;
 	m_preparations.store(readback.preparation, std::memory_order_release);
 	m_scheduler.DeferHostOperation([this, &readback] { ProcessReadback(readback); });
@@ -1860,6 +1867,9 @@ void RayTracing::ProcessReadback(Readback& readback) {
 	if ((state.overflow & StateFull) != 0) {
 		g_rt_stats.walks_overflow.Add();
 		g_rt_stats.last_overflow.store(readback.shader_hash, std::memory_order_relaxed);
+		g_rt_stats.last_overflow_instances.store(state.instance_count, std::memory_order_relaxed);
+		g_rt_stats.last_overflow_capacity.store(readback.capacity, std::memory_order_relaxed);
+		g_rt_stats.last_overflow_boxes.store(state.box_count, std::memory_order_relaxed);
 		auto& floor = m_instance_floors[readback.source_key];
 		floor       = std::max(floor, (state.instance_count + 255u) & ~255u);
 	}

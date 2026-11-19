@@ -282,6 +282,7 @@ private:
 		uint64_t                shader_hash = 0;
 		uint64_t                preparation = 0;
 		bool                    forced      = false;
+		uint32_t                capacity    = 0;
 	};
 	struct IncompleteRun {
 		uint32_t count  = 0;
