@@ -2658,12 +2658,14 @@ void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
 	}
 	const auto generation = Psr::LibraryGeneration();
 	if (!Psr::ReplacementEnabled() ||
-	    (generation != Psr::Generation::Base460 && generation != Psr::Generation::Base252)) {
+	    (generation != Psr::Generation::Base460 && generation != Psr::Generation::Base252 &&
+	     generation != Psr::Generation::Base148)) {
 		m_psr_blas_builds.clear();
 		m_psr_captured.clear();
 		return;
 	}
 	const bool base252 = generation == Psr::Generation::Base252;
+	const bool base148 = generation == Psr::Generation::Base148;
 	auto       pass    = shader;
 	if (base252 && shader == Shader::CollapseToQbvhSimpleTop && !m_hle_tlas_window && m_guest_tlas_builds == 0) {
 		pass = Shader::CollapseToQbvhSimpleBottom;
@@ -2682,11 +2684,14 @@ void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
 			m_psr_captured.clear();
 		}
 		m_psr_captured[address(0)] = user[2];
-		EmitHostCommand([this, memory = address(0), size = user[2]] { m_renderer.NoteGuestBvhMemory(memory, size); });
+		if (!base148) {
+			EmitHostCommand([this, memory = address(0), size = user[2]] { m_renderer.NoteGuestBvhMemory(memory, size); });
+		}
 		return;
 	}
 	if (shader == Shader::DecompressHeaderBase || shader == Shader::DecompressComputeFanNode) {
-		const auto blas = uint64_t {user[6]} | (uint64_t {user[1] & 0xffffu} << 32u);
+		const auto blas = base148 ? uint64_t {user[7]} | (uint64_t {user[2] & 0xffffu} << 32u)
+		                          : uint64_t {user[6]} | (uint64_t {user[1] & 0xffffu} << 32u);
 		const auto it   = m_psr_captured.find(blas);
 		if (it == m_psr_captured.end()) {
 			return;
@@ -2704,7 +2709,7 @@ void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
 		const auto table = address(0);
 		const auto count = user[2];
 		const auto geometry = shader == Shader::MortonComputeBoundingBoxForVertices ? user[9]
-		                      : base252                                             ? user[6] >> 18u
+		                      : base252 || base148                                  ? user[6] >> 18u
 		                                                                            : user[7];
 		if (m_psr_blas_builds.size() >= MaxBuilds) {
 			m_psr_blas_builds.clear();
@@ -2720,7 +2725,7 @@ void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
 		return;
 	}
 	const auto blas = address(0);
-	const auto primitives = base252 ? user[14] + 1u : user[14];
+	const auto primitives = base252 || base148 ? user[14] + 1u : user[14];
 	const auto it         = m_psr_blas_builds.find(address(2));
 	if (it == m_psr_blas_builds.end()) {
 		return;
@@ -2731,7 +2736,7 @@ void CommandProcessor::PsrBlasDispatch(uint64_t data_addr) {
 	if (blas == 0 || table == 0 || std::ranges::find(seen, 0) != seen.end()) {
 		return;
 	}
-	RayTracing::GuestBlasBuild build {.blas_va = blas, .header_layout = base252 ? 1u : 0u};
+	RayTracing::GuestBlasBuild build {.blas_va = blas, .header_layout = base148 ? 2u : base252 ? 1u : 0u};
 	std::vector<uint32_t>            entries(seen.size() * GeometryStride / 4);
 	ReadGuestAroundGpuWrites(table, entries.data(), entries.size() * 4);
 	uint64_t triangles = 0;

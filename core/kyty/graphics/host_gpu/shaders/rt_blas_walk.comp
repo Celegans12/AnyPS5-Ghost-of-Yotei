@@ -302,9 +302,10 @@ void main() {
 		s_node_first        = 0;
 		s_node_geometries   = 0;
 		if (pc.mode == MODE_BUILD && job.layout_va != 0) {
-			const uint kLayoutFields[2][5] = {{108u, 40u, 124u, 252u, 9u},
-			                                  {112u, 32u, 128u, 252u, 6u}};
-			const uint hl         = min(job.header_layout, 1u);
+			const uint kLayoutFields[3][5] = {{108u, 40u, 124u, 252u, 9u},
+			                                  {112u, 32u, 128u, 252u, 6u},
+			                                  {112u, 32u, 128u, 252u, 3u}};
+			const uint hl         = min(job.header_layout, 2u);
 			const uint geometries = LoadGuestU32(blas_va + kLayoutFields[hl][0]);
 			s_layout_geometries   = geometries == job.layout_count ? geometries : 0u;
 			s_node_geometries     = blas_va + LoadGuestU32(blas_va + kLayoutFields[hl][1]);

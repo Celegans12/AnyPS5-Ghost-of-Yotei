@@ -340,7 +340,7 @@ static Shader IdentifyShaderCode(uint64_t code_address) {
 #if defined(ANYPS5_KYTY)
 		if (match.generation == Generation::Base148) {
 			LOGF("Psr: library generation %s (shaders recognized by their code): its BLAS refits are "
-			     "replaced, its BLAS and top level builds are emulated\n",
+			     "replaced, its BLAS builds are emulated and followed, its top level builds are emulated\n",
 			     GenerationName(match.generation));
 		} else
 #endif
