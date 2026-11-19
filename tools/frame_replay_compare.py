@@ -19,6 +19,11 @@ import vulkan_validation_gate as processes
 
 ARMS = ("baseline", "candidate")
 FORCED = {"ANYPS5_REQUIRE_VULKAN": "1", "ANYPS5_HOST_REPORT": "1"}
+KYTY_SETTINGS = {
+    "KYTY_GPU", "KYTY_GPU_PIPELINE", "KYTY_GPU_SPIN_US", "KYTY_NATIVE_RT",
+    "KYTY_PIPELINE_MANIFEST", "KYTY_PRINTF_DIRECTION", "KYTY_RT_CHECK", "KYTY_RT_CHECK_PPM",
+    "KYTY_RT_CHECK_STRIKES", "KYTY_RT_ORACLE", "KYTY_RT_STATS", "KYTY76_LDS_SYNC",
+}
 LIMITS = {"trials": (1, 20, 3), "warmups": (0, 5, 1), "timeout": (0.1, 3600, 120),
           "log_mib": (1, 128, 16)}
 NOTES = [
@@ -46,13 +51,15 @@ def _environment(value, shared=False):
     if not isinstance(value, dict) or len(value) > 128:
         raise ValueError("environment must be an object with at most 128 entries")
     for key, text in value.items():
-        if not isinstance(key, str) or not re.fullmatch(r"(?:APS5_|ANYPS5_|VK_)[A-Z0-9_]+", key):
+        if not isinstance(key, str):
+            raise ValueError(f"unsupported environment key: {key!r}")
+        if key in FORCED or key in ("ANYPS5_SHADER_CACHE_DIR", "KYTY_FALLBACKS") or key.startswith("APS5_FRAME_CAPTURE"):
+            raise ValueError(f"environment key is controlled by the runner: {key}")
+        if key not in KYTY_SETTINGS and not re.fullmatch(r"(?:APS5_|ANYPS5_|VK_)[A-Z0-9_]+", key):
             raise ValueError(f"unsupported environment key: {key!r}")
         if not isinstance(text, str) or len(text) > 4096 or "\0" in text:
             raise ValueError(f"invalid environment value: {key}")
-        if key in FORCED or key == "ANYPS5_SHADER_CACHE_DIR" or key.startswith("APS5_FRAME_CAPTURE"):
-            raise ValueError(f"environment key is controlled by the runner: {key}")
-        if not shared and (key.startswith("VK_") or key == "ANYPS5_GPU"):
+        if not shared and (key.startswith("VK_") or key in ("ANYPS5_GPU", "KYTY_GPU")):
             raise ValueError(f"device selection must be shared by both arms: {key}")
     return value
 
@@ -139,8 +146,12 @@ def stage_replay_runtime(source, target, manifest):
 
 
 def _trial_environment(recipe, arm, runtime, cache):
-    environment = {key: value for key, value in os.environ.items()
-                   if not key.startswith(("APS5_", "ANYPS5_", "VK_", "LD_", "DYLD_"))}
+    environment = {}
+    for key, value in os.environ.items():
+        name = key.upper()
+        if name == "KYTY76_LDS_SYNC" or name.startswith(("APS5_", "ANYPS5_", "KYTY_", "VK_", "LD_", "DYLD_")):
+            continue
+        environment[key] = value
     libraries = [str(runtime / relative) for relative in arm["library_dirs"]]
     if os.name == "nt":
         system = Path(os.environ.get("SystemRoot", "C:/Windows"))
