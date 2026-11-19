@@ -170,9 +170,10 @@ class RecipeTests(ReplayFixture):
         self.assertEqual(env["ANYPS5_HOST_REPORT"], "1")
         self.assertEqual(env["ANYPS5_SHADER_CACHE_DIR"], str(self.root / "cache"))
 
-    def test_kyty_fallbacks_and_out_of_scope_settings_cannot_be_pinned(self):
-        for field in (self.recipe, self.recipe["arms"]["candidate"]):
+    def test_runner_controlled_and_out_of_scope_kyty_settings_cannot_be_pinned(self):
+        for field in (self.recipe, *self.recipe["arms"].values()):
             for key, reason in (("KYTY_FALLBACKS", "controlled by the runner"),
+                                ("KYTY_ASYNC_PIPELINES", "controlled by the runner"),
                                 ("KYTY_DLSS_FOLDER", "unsupported environment key"),
                                 ("KYTY_PRINTF_OUTPUT_FILE", "unsupported environment key"),
                                 ("KYTY_VULKAN_VALIDATION", "unsupported environment key"),
@@ -332,25 +333,27 @@ class RunnerTests(ReplayFixture):
         self.assertEqual(offline["observations"]["baseline"]["healthy_trials"], 2)
 
     def test_kyty_recipe_settings_reach_inspectors_and_strict_replays(self):
-        self.recipe.update(warmups=0, trials=1)
+        self.recipe.update(warmups=1, trials=1)
         shared = {"KYTY_GPU": "0", "KYTY_RT_CHECK": "256", "KYTY_GPU_SPIN_US": "0"}
         candidate = {"KYTY_RT_ORACLE": "1", "KYTY_NATIVE_RT": "1", "KYTY76_LDS_SYNC": "0",
                      "KYTY_GPU_SPIN_US": "2000"}
         self.recipe["environment"] = shared
         self.recipe["arms"]["candidate"]["environment"] = candidate
         inherited = {"KYTY_GPU": "7", "kyty_native_rt": "invalid", "KYTY_RT_ORACLE": "7",
-                     "KyTy_Unknown": "1", "kyty76_lds_sync": "1", "KYTY_FALLBACKS": "1"}
+                     "KyTy_Unknown": "1", "kyty76_lds_sync": "1", "KYTY_FALLBACKS": "1", "KYTY_ASYNC_PIPELINES": "2"}
         with (mock.patch.object(os, "environ", {**os.environ, **inherited}),
               mock.patch.object(runner, "execute_replay_trial", side_effect=self.execute) as execute):
             report = runner.run_replay_comparison(self.validate(), self.root / "evidence")
         self.assertTrue(report["complete"], report["issues"])
         self.assertEqual(report["recipe"]["environment"], shared)
         self.assertEqual(report["recipe"]["arms"]["candidate"]["environment"], candidate)
-        self.assertEqual(execute.call_count, 4)
+        self.assertEqual(execute.call_count, 6)
         for invocation in execute.call_args_list:
             command, _, environment, _, _ = invocation.args
             arm = Path(command[0]).parent.name
             expected = {**shared, **candidate} if arm == "candidate" else shared
+            if command[1] != "inspect":
+                expected = {**expected, "KYTY_ASYNC_PIPELINES": "0"}
             effective = {key: value for key, value in environment.items()
                          if key.upper().startswith("KYTY_") or key.upper() == "KYTY76_LDS_SYNC"}
             with self.subTest(arm=arm, command=command):

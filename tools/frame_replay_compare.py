@@ -20,6 +20,7 @@ import vulkan_validation_gate as processes
 
 ARMS = ("baseline", "candidate")
 FORCED = {"ANYPS5_REQUIRE_VULKAN": "1", "ANYPS5_HOST_REPORT": "1"}
+STRICT_REPLAY_ENVIRONMENT = {"KYTY_ASYNC_PIPELINES": "0"}
 KYTY_SETTINGS = {
     "KYTY_GPU", "KYTY_GPU_PIPELINE", "KYTY_GPU_SPIN_US", "KYTY_NATIVE_RT",
     "KYTY_PIPELINE_MANIFEST", "KYTY_PRINTF_DIRECTION", "KYTY_RT_CHECK", "KYTY_RT_CHECK_PPM",
@@ -58,7 +59,8 @@ def _environment(value, shared=False):
     for key, text in value.items():
         if not isinstance(key, str):
             raise ValueError(f"unsupported environment key: {key!r}")
-        if key in FORCED or key in ("ANYPS5_SHADER_CACHE_DIR", "KYTY_FALLBACKS") or key.startswith("APS5_FRAME_CAPTURE"):
+        if (key in FORCED or key in STRICT_REPLAY_ENVIRONMENT or
+                key in ("ANYPS5_SHADER_CACHE_DIR", "KYTY_FALLBACKS") or key.startswith("APS5_FRAME_CAPTURE")):
             raise ValueError(f"environment key is controlled by the runner: {key}")
         if key not in KYTY_SETTINGS and not re.fullmatch(r"(?:APS5_|ANYPS5_|VK_)[A-Z0-9_]+", key):
             raise ValueError(f"unsupported environment key: {key!r}")
@@ -413,6 +415,7 @@ def _run_one(recipe, report, output, arm_name, phase, iteration, runtime, captur
     arm = recipe["arms"][arm_name]
     command = [str(runtime / arm["replay"]), str(capture), "--strict", "--no-synthesize", "--repeat", "1"]
     environment = _trial_environment(recipe, arm, runtime, cache)
+    environment.update(STRICT_REPLAY_ENVIRONMENT)
     if title_id is not None:
         environment.update({"KYTY_SHADER_CACHE": "1", "APS5_REPORT": "0"})
     result = execute_replay_trial(command, root, environment, recipe["timeout"], recipe["log_mib"] * 1024 * 1024,

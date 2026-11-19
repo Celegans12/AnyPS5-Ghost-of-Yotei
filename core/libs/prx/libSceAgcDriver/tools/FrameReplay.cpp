@@ -1626,11 +1626,14 @@ void configureEnvironment(const Options& options) {
 #if defined(ANYPS5_KYTY)
     if (options.strict && !options.shaders && options.submits == 0) {
 #ifdef _WIN32
-        const auto result = _putenv_s("KYTY_FALLBACKS", "0");
+        const auto fallbacks = _putenv_s("KYTY_FALLBACKS", "0");
+        const auto pipelines = _putenv_s("KYTY_ASYNC_PIPELINES", "0");
 #else
-        const auto result = setenv("KYTY_FALLBACKS", "0", 1);
+        const auto fallbacks = setenv("KYTY_FALLBACKS", "0", 1);
+        const auto pipelines = setenv("KYTY_ASYNC_PIPELINES", "0", 1);
 #endif
-        if (result != 0) throw std::runtime_error("frame replay: cannot disable Kyty renderer fallbacks");
+        if (fallbacks != 0) throw std::runtime_error("frame replay: cannot disable Kyty renderer fallbacks");
+        if (pipelines != 0) throw std::runtime_error("frame replay: cannot require Kyty pipeline waits");
     }
 #endif
 #ifdef _WIN32
