@@ -232,6 +232,20 @@ void GuestGpu::SendReadbackCommandSync(Common::UniqueFunction<void>&& command) {
 	SendUrgentCommandSync(std::move(command), false);
 }
 
+bool GuestGpu::PostReadbackCommand(Common::UniqueFunction<void>&& command) {
+	EXIT_IF(!command);
+	if (!m_pipelined || IsGpuThread() || (g_cp_thread && !OrderedReadbacks())) {
+		return false;
+	}
+	{
+		std::lock_guard lock(m_urgent_mutex);
+		m_urgent_commands.push_back(std::move(command));
+		m_urgent_pending.fetch_add(1, std::memory_order_release);
+	}
+	(m_resolving ? m_resolved : m_operations).Interrupt();
+	return true;
+}
+
 uint64_t GuestGpu::WaitForOrderedOperations(uint64_t begin, uint64_t end) {
 	EXIT_IF(!g_cp_thread);
 	ForgetExecutedWrites();

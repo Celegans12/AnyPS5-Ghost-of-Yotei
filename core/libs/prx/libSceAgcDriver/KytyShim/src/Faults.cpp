@@ -86,6 +86,27 @@ bool TryReplayOnBacking(FaultContext& context, std::uint64_t address) {
     return true;
 }
 
+bool ReplayAfterReadbackEnabled() {
+    static const bool on = [] {
+        const char* value = std::getenv("KYTY_REPLAY_AFTER_READBACK");
+        return value == nullptr || value[0] != '0';
+    }();
+    return on && g_trap_installed && !FaultReplay::g_broken.load(std::memory_order_relaxed) &&
+           !Libs::Graphics::GuestGpu::IsGpuThread() && !Libs::Graphics::GuestGpu::IsCommandProcessorThread();
+}
+
+void FinishReplayAfterReadback(FaultContext& context, std::uint64_t address) {
+    namespace Memory = Libs::LibKernel::Memory;
+    std::uint64_t begin = 0;
+    std::uint64_t end   = 0;
+    if (!Memory::TakeReplayAfterReadback(&begin, &end)) return;
+    const auto replayable = [begin, end](std::uint64_t ea, std::uint64_t size) {
+        return ea + size <= end && (ea >= begin || Memory::ReplayableGpuRead(ea, begin - ea)) && !Memory::TextureGpuModified(ea, size);
+    };
+    const auto backing = [](std::uint64_t ea, std::uint64_t size) { return Memory::FindBackingPointer(ea, size); };
+    Memory::FinishReplayAfterReadback(FaultReplay::Start(context, address, replayable, backing));
+}
+
 void OnTrap(int signal, siginfo_t* info, void* native) {
     if (native != nullptr && FaultReplay::Finish(*static_cast<ucontext_t*>(native))) return;
     if ((g_previous_trap.sa_flags & SA_SIGINFO) != 0) {
@@ -128,11 +149,19 @@ bool ResolveFault(FaultContext& context, GpuAccess access, std::uint64_t address
     if (access == GpuAccess::Read && TryReplayOnBacking(context, address)) {
         return true;
     }
+    const bool after = access == GpuAccess::Read && ReplayAfterReadbackEnabled();
+    if (after) Memory::AllowReplayAfterReadback();
 #endif
     if (Memory::HandleGpuFault(access, address)) {
         Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
+#ifndef _WIN32
+        if (after) FinishReplayAfterReadback(context, address);
+#endif
         return true;
     }
+#ifndef _WIN32
+    if (after) FinishReplayAfterReadback(context, address);
+#endif
     if (const auto length = Walker::SrtWalkerLoadLength(rip); length != 0) {
         CompleteWalkerLoad(context, length, 0);
         return true;

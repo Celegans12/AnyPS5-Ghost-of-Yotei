@@ -77,11 +77,23 @@ struct ReadbackStats {
 	std::atomic<uint64_t> other_dispatch_ns {0};
 	std::atomic<uint64_t> other_wait_ns {0};
 	std::atomic<uint64_t> other_release_ns {0};
+	std::atomic<uint64_t> released_async {0};
+	std::atomic<uint64_t> replayed_after_copy {0};
+	std::atomic<uint64_t> waited_after_copy {0};
 	std::atomic<bool>     line_overflow {false};
 	std::atomic<int64_t>  last_line {0};
 };
 
 ReadbackStats g_readback_stats;
+
+struct ReadbackReplay {
+	bool     allowed   = false;
+	bool     published = false;
+	uint64_t begin     = 0;
+	uint64_t end       = 0;
+};
+
+thread_local ReadbackReplay g_readback_replay;
 
 int64_t SteadyNs() {
 	return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -519,6 +531,26 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 	(command_processor ? stats.cp_ns : stats.other_ns).fetch_add(elapsed, std::memory_order_relaxed);
 }
 
+void BufferCache::AllowReplayAfterReadback() noexcept {
+	g_readback_replay = {.allowed = true};
+}
+
+bool BufferCache::TakeReplayAfterReadback(uint64_t* begin, uint64_t* end) noexcept {
+	const auto replay = std::exchange(g_readback_replay, {});
+	*begin            = replay.begin;
+	*end              = replay.end;
+	return replay.published;
+}
+
+void BufferCache::NoteReplayAfterReadback(bool replayed) noexcept {
+	(replayed ? g_readback_stats.replayed_after_copy : g_readback_stats.waited_after_copy)
+	    .fetch_add(1, std::memory_order_relaxed);
+}
+
+void BufferCache::WaitReadbackRelease() {
+	m_scheduler.Context().GetGpu().SendReadbackCommandSync([] {});
+}
+
 void BufferCache::NoteReplayedRead() {
 	g_readback_stats.other_replayed.fetch_add(1, std::memory_order_relaxed);
 }
@@ -552,6 +584,9 @@ void BufferCache::LogReadbackSummary() {
 	const auto dispatch_ns = stats.other_dispatch_ns.exchange(0, std::memory_order_relaxed);
 	const auto wait_ns     = stats.other_wait_ns.exchange(0, std::memory_order_relaxed);
 	const auto release_ns  = stats.other_release_ns.exchange(0, std::memory_order_relaxed);
+	const auto async_rel   = stats.released_async.exchange(0, std::memory_order_relaxed);
+	const auto replayed_cp = stats.replayed_after_copy.exchange(0, std::memory_order_relaxed);
+	const auto waited_cp   = stats.waited_after_copy.exchange(0, std::memory_order_relaxed);
 	if (cp_reads + other_reads + staged + replayed == 0) {
 		return;
 	}
@@ -562,10 +597,12 @@ void BufferCache::LogReadbackSummary() {
 	    "tables read without a fault; other threads {} readbacks in {:.3f} s ({} of faulted reads on bytes the GPU "
 	    "wrote, {} on other bytes of a GPU written page, {} on other bytes replayed on the backing view without a readback; "
 	    "{:.3f} s handing them to the execution thread, {:.3f} s waiting for the GPU copy, {:.3f} s releasing them through "
-	    "the execution thread){}\n",
+	    "the execution thread; {} released without waiting, the faulted instruction replayed on the copy {} times and "
+	    "waiting for the release {} times){}\n",
 	    seconds(static_cast<uint64_t>(now - last)), cp_reads, seconds(cp_ns), ordered, seconds(ordered_ns), not_waited,
 	    staged, other_reads, seconds(other_ns), gpu_bytes, false_share, replayed, seconds(dispatch_ns), seconds(wait_ns),
-	    seconds(release_ns), stats.line_overflow.load(std::memory_order_relaxed) ? "; GPU line table overflowed" : ""));
+	    seconds(release_ns), async_rel, replayed_cp, waited_cp,
+	    stats.line_overflow.load(std::memory_order_relaxed) ? "; GPU line table overflowed" : ""));
 }
 
 void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault,
@@ -638,24 +675,36 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 	if (tick == 0) {
 		return;
 	}
+	const bool replay_after = g_readback_replay.allowed && !is_write && !command_processor;
+	const auto release      = [&](Common::UniqueFunction<void>&& operation) {
+		const auto release_start = SteadyNs();
+		if (replay_after && gpu.PostReadbackCommand(std::move(operation))) {
+			g_readback_replay.published = true;
+			g_readback_replay.begin     = vaddr;
+			g_readback_replay.end       = vaddr + read_size;
+			split.released_async.fetch_add(1, std::memory_order_relaxed);
+		} else {
+			gpu.SendReadbackCommandSync(std::move(operation));
+		}
+		note_split(split.other_release_ns, release_start);
+	};
 	const auto wait_start = SteadyNs();
 	if (queue_read.slot != nullptr) {
 		FinishReadbackQueueRead(queue_read);
 		note_split(split.other_wait_ns, wait_start);
-		const auto release_start = SteadyNs();
-		gpu.SendReadbackCommandSync([&] {
+		release([this, vaddr, size, pages_begin, pages_end, is_write, recorded = queue_read.recorded,
+		         followers = std::move(queue_read.followers)] {
 			const auto own = std::find_if(m_inflight_readbacks.begin(), m_inflight_readbacks.end(),
 			                              [&](const InFlightReadback& readback) {
 				                              return readback.begin == pages_begin &&
 				                                     readback.end == pages_end &&
-				                                     readback.tick == queue_read.recorded;
+				                                     readback.tick == recorded;
 			                              });
 			if (own != m_inflight_readbacks.end()) {
 				m_inflight_readbacks.erase(own);
 			}
 			ReleaseReadback(vaddr, size, pages_begin, pages_end, 0, is_write);
-			if (!queue_read.followers.empty()) {
-				const auto& followers = queue_read.followers;
+			if (!followers.empty()) {
 				std::vector<uint64_t> pages;
 				pages.reserve(followers.size());
 				for (const auto& follower: followers) {
@@ -663,7 +712,7 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 				}
 				std::sort(pages.begin(), pages.end());
 				std::erase_if(m_inflight_readbacks, [&](const InFlightReadback& readback) {
-					return readback.tick == queue_read.recorded &&
+					return readback.tick == recorded &&
 					       readback.end - readback.begin == TRACKER_PAGE_SIZE &&
 					       std::binary_search(pages.begin(), pages.end(), readback.begin);
 				});
@@ -675,14 +724,13 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 				}
 			}
 		});
-		note_split(split.other_release_ns, release_start);
 	} else {
 		m_scheduler.GetMasterSemaphore().Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
 		note_split(split.other_wait_ns, wait_start);
-		const auto release_start = SteadyNs();
-		gpu.SendReadbackCommandSync([&] { ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write); });
-		note_split(split.other_release_ns, release_start);
+		release([this, vaddr, size, pages_begin, pages_end, tick, is_write] {
+			ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write);
+		});
 	}
 }
 

@@ -157,6 +157,10 @@ public:
 	[[nodiscard]] bool NoGpuBytesNow(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool GpuLinesOverflowed() const noexcept { return m_gpu_line_overflow.load(std::memory_order_relaxed); }
 	static void NoteReplayedRead();
+	static void AllowReplayAfterReadback() noexcept;
+	static bool TakeReplayAfterReadback(uint64_t* begin, uint64_t* end) noexcept;
+	static void NoteReplayAfterReadback(bool replayed) noexcept;
+	void        WaitReadbackRelease();
 	[[nodiscard]] bool WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_t size);
 	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {
 		return m_memory_tracker.MayBeGpuModified(vaddr, size);
