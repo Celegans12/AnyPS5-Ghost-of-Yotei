@@ -115,6 +115,7 @@ struct ConfigOptions {
 	bool                   tessellation_enabled        = true;
 	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
+	bool                   wave_split                  = true;
 	bool                   native_rt                   = false;
 	bool                   async_pipelines_enabled     = true;
 	bool                   async_pipelines_skip_more   = false;
@@ -204,6 +205,7 @@ uint32_t GetFlushDraws();
 bool TessellationEnabled();
 bool OcclusionQueriesEnabled();
 bool RelaxedShaderFloatEnabled();
+bool WaveSplitEnabled();
 bool NativeRtEnabled();
 bool AsyncPipelinesEnabled();
 bool AsyncPipelinesSkipMore();

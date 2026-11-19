@@ -274,6 +274,10 @@ bool RelaxedShaderFloatEnabled() {
 	return g_config->relaxed_shader_float;
 }
 
+bool WaveSplitEnabled() {
+	return g_config->wave_split;
+}
+
 bool NativeRtEnabled() {
 	return g_config->native_rt;
 }

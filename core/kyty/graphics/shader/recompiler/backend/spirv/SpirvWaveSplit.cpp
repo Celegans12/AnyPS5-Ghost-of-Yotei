@@ -97,8 +97,13 @@ bool IsImageOp(uint32_t op) {
 	       (op >= spv::OpImageSparseSampleImplicitLod && op <= spv::OpImageSparseRead);
 }
 
+bool IsImageRead(uint32_t op) {
+	return (op >= spv::OpImageSampleImplicitLod && op <= spv::OpImageRead) ||
+	       (op >= spv::OpImageSparseSampleImplicitLod && op <= spv::OpImageSparseRead);
+}
+
 bool IsAtomic(uint32_t op) {
-	return (op >= spv::OpAtomicLoad && op <= spv::OpAtomicXor) || op == spv::OpAtomicFlagTestAndSet ||
+	return (op >= spv::OpAtomicLoad && op <= spv::OpAtomicXor) || op == spv::OpAtomicFlagTestAndSet || op == spv::OpAtomicFlagClear ||
 	       op == spv::OpAtomicFMinEXT || op == spv::OpAtomicFMaxEXT || op == spv::OpAtomicFAddEXT;
 }
 
@@ -165,6 +170,8 @@ private:
 	uint32_t m_size[3]        = {1, 1, 1};
 	std::unordered_set<uint32_t> m_caps;
 	bool                         m_caps_done = false;
+	bool                         m_writes_buffers = false;
+	bool                         m_writes_images  = false;
 
 	std::vector<uint8_t> m_div;
 	std::vector<uint8_t> m_var_div;
@@ -408,6 +415,11 @@ private:
 		for (uint32_t i = m_first_function; i < m_insts.size(); i++) {
 			const auto& inst     = m_insts[i];
 			const bool  in_entry = i >= entry.begin && i <= entry.end;
+			if (inst.op == spv::OpImageWrite || inst.op == spv::OpImageTexelPointer) m_writes_images = true;
+			if (inst.op == spv::OpStore || inst.op == spv::OpCopyMemory || inst.op == spv::OpCopyMemorySized ||
+			    (IsAtomic(inst.op) && inst.op != spv::OpAtomicLoad)) {
+				m_writes_buffers = m_writes_buffers || IsBufferPointer(Word(inst, 0));
+			}
 			if (inst.op == spv::OpStore || inst.op == spv::OpCopyMemory || inst.op == spv::OpCopyMemorySized ||
 			    (IsAtomic(inst.op) && inst.op != spv::OpAtomicLoad)) {
 				const auto root = Root(Word(inst, 0));
@@ -496,8 +508,16 @@ private:
 
 	bool Div(uint32_t id) const { return id < m_bound && m_div[id] != 0; }
 
+	bool IsBufferPointer(uint32_t pointer) const {
+		const auto found = m_ptr_class.find(ValueType(pointer));
+		return found != m_ptr_class.end() &&
+		       (found->second == spv::StorageClassStorageBuffer || found->second == spv::StorageClassPhysicalStorageBuffer ||
+		        found->second == spv::StorageClassUniform);
+	}
+
 	bool LoadDivergent(uint32_t pointer) const {
 		if (Div(pointer)) return true;
+		if (m_writes_buffers && IsBufferPointer(pointer)) return true;
 		const auto root  = Root(pointer);
 		const auto found = m_var_class.find(root);
 		if (found == m_var_class.end()) return Div(root);
@@ -532,6 +552,7 @@ private:
 					bool        bad  = IsImageOp(inst.op) || IsAtomic(inst.op) || IsRayQuery(inst.op) ||
 					           IsSubgroupOp(inst.op);
 					if (inst.op == spv::OpLoad) {
+						bad = bad || (m_writes_buffers && IsBufferPointer(Word(inst, 0)));
 						const auto root  = Root(Word(inst, 0));
 						const auto found = m_var_class.find(root);
 						bad = bad || (found != m_var_class.end() &&
@@ -680,7 +701,8 @@ private:
 						break;
 					default:
 						if (UniformResult(inst.op)) break;
-						d = d || IsAtomic(inst.op) || IsRayQuery(inst.op) || AnyOperandDivergent(inst);
+						d = d || IsAtomic(inst.op) || IsRayQuery(inst.op) || (m_writes_images && IsImageRead(inst.op)) ||
+						    AnyOperandDivergent(inst);
 						break;
 				}
 				if (d) divide(inst.result);

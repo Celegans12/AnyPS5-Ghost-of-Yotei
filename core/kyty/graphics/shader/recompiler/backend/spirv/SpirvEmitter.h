@@ -17,6 +17,7 @@ struct Profile {
 	bool r8_srgb_views   = false;
 	bool r8g8_srgb_views = false;
 	bool relaxed_float = false;
+	bool wave_split = true;
 	bool ray_query = false;
 	bool lds_lane_sync = true;
 };
