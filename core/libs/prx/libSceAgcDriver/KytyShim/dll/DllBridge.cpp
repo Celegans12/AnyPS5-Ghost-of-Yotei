@@ -381,6 +381,20 @@ const KytyDllApi* MakeApi() {
 
 }
 
+namespace KytyShim {
+
+bool DllHostReportSetting() {
+    bool enabled = false;
+    Check(Host(__func__)->host_report_setting(&enabled));
+    return enabled;
+}
+
+void DllReportHost(const void* properties, const void* driver, const void* memory, std::uint32_t subgroupSize, const char* shaderStorePath) {
+    Check(Host(__func__)->report_host(properties, driver, memory, subgroupSize, shaderStorePath));
+}
+
+}
+
 extern "C" KytyDllStatus KytyDllCreate(const KytyDllHost* host, const KytyDllApi** api) {
     if (host == nullptr || api == nullptr || host->abi_version != KYTY_DLL_ABI_VERSION || host->size != sizeof(KytyDllHost)) return KYTY_DLL_ABI_MISMATCH;
     g_host = host;

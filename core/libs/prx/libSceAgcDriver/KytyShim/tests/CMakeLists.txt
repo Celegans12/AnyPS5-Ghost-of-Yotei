@@ -88,6 +88,7 @@ target_include_directories(kyty_shim_presentation_upscale_tests PRIVATE ${CMAKE_
 add_test(NAME kyty_shim_presentation_upscale COMMAND kyty_shim_presentation_upscale_tests)
 set_tests_properties(kyty_shim_presentation_upscale PROPERTIES TIMEOUT 20)
 
+if(NOT ANYPS5_KYTY_DLL)
 add_test_executable(kyty_shim_fallback_tests ${CMAKE_CURRENT_SOURCE_DIR}/Fallback.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_fallback_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(kyty_shim_fallback_tests PRIVATE Kyty::gpu libkernel libc)
@@ -258,3 +259,4 @@ target_link_libraries(kyty_shim_packed_unorm_blend_tests PRIVATE Kyty::gpu libke
 set_target_properties(kyty_shim_packed_unorm_blend_tests PROPERTIES CXX_EXTENSIONS OFF)
 add_test(NAME kyty_shim_packed_unorm_blend COMMAND kyty_shim_packed_unorm_blend_tests)
 set_tests_properties(kyty_shim_packed_unorm_blend PROPERTIES TIMEOUT 120)
+endif()
