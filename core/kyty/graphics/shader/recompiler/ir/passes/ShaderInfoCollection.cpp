@@ -598,6 +598,8 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 			info.subgroup_local_invocation_id = true;
 			break;
 		}
+		case ValueOpcode::LoadRelativeVgpr:
+		case ValueOpcode::StoreRelativeVgpr: info.relative_vgprs = true; break;
 		case ValueOpcode::SwizzleU32:
 			info.uses_swizzle = true;
 			[[fallthrough]];
@@ -647,7 +649,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	info.ray_query_mirror = false;
 	for (auto& buffer: info.buffers) buffer.live = false;
 	info.has_bitwise_xor = info.uses_lds = info.uses_gds = info.uses_flattened_srt =
-	    info.uses_dispatch_threads = info.uses_swizzle = info.uses_dma = info.uses_device_address =
+	    info.uses_dispatch_threads = info.uses_swizzle = info.relative_vgprs = info.uses_dma = info.uses_device_address =
 	        false;
 	info.ray_query              = false;
 	info.ray_query_sites        = 0;

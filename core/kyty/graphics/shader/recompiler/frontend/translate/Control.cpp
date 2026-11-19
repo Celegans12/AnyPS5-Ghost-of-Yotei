@@ -1,5 +1,6 @@
 #include "common/assert.h"
 #include "graphics/shader/recompiler/frontend/translate/Translator.h"
+#include "graphics/shader/recompiler/ir/passes/RelativeVgprLowering.h"
 
 namespace Libs::Graphics::ShaderRecompiler::Frontend {
 namespace {
@@ -388,7 +389,9 @@ void Translator::V_MOVRELS_B32(const Decoder::Instruction& inst) {
 	auto       selected = ir.GetVectorReg(static_cast<IR::VectorReg>(base));
 	for (uint32_t index = base + 1u; index < current_vector_limit; index++) {
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
-		selected = ir.Select(match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected);
+		selected = IR::U32(ir.Emit(IR::ValueOpcode::SelectU32,
+		                           {match, ir.GetVectorReg(static_cast<IR::VectorReg>(index)), selected},
+		                           IR::RelativeVgprReadFlags(base, current_vector_limit - base - 1u)));
 	}
 	WriteOperand(DestinationOperand(inst), selected);
 }
@@ -406,15 +409,19 @@ void Translator::V_MOVRELD_B32(const Decoder::Instruction& inst) {
 	const auto value = ReadU32(inst.src0);
 	const auto m0    = ir.BitwiseAnd(ReadU32(ConditionOperand(Decoder::OperandKind::M0)),
 	                                 IR::U32(IR::Value(0xffu)));
-	for (uint32_t index = base; index < current_vector_limit; index++) {
-		const auto [first_write, last_read] = lane_spills[index];
-		if (index != base && first_write < current_pc && current_pc < last_read) {
+	uint32_t end = base;
+	for (; end < current_vector_limit; end++) {
+		const auto [first_write, last_read] = lane_spills[end];
+		if (end != base && first_write < current_pc && current_pc < last_read) {
 			break;
 		}
+	}
+	for (uint32_t index = base; index < end; index++) {
 		const auto reg   = static_cast<IR::VectorReg>(index);
 		const auto match = ir.IEqual(m0, IR::U32(IR::Value(index - base)));
 		const auto write = ir.LogicalAnd(ir.GetExec(), match);
-		ir.SetVectorReg(reg, ir.Select(write, value, ir.GetVectorReg(reg)));
+		const auto flags = IR::RelativeVgprWriteFlags(current_pc >> 2u, base, index - base, end - base);
+		ir.SetVectorReg(reg, IR::U32(ir.Emit(IR::ValueOpcode::SelectU32, {write, value, ir.GetVectorReg(reg)}, flags)));
 	}
 }
 

@@ -1342,6 +1342,12 @@ void EmitProgram(EmitterState& state) {
 			high.scratch_u32_variable = state.builder.AllocateId();
 		}
 	}
+	if (program.info.relative_vgprs) {
+		ctx.relative_vgpr_variable = state.builder.AllocateId();
+		if (state.lane_count == 2) {
+			high.relative_vgpr_variable = state.builder.AllocateId();
+		}
+	}
 	auto regions = FindOutlinedRegions(program);
 	const auto per_invocation = regions.empty() ? spv::StorageClassFunction : spv::StorageClassPrivate;
 	if (!regions.empty()) {
@@ -1364,6 +1370,11 @@ void EmitProgram(EmitterState& state) {
 				state.builder.DefineGlobalVariable(lane->scratch_u32_variable,
 				                                   TypePointer(state, per_invocation, TypeU32(state)),
 				                                   per_invocation);
+			}
+			if (lane->relative_vgpr_variable != 0) {
+				state.builder.DefineGlobalVariable(
+				    lane->relative_vgpr_variable,
+				    TypeU32ArrayPointer(state, per_invocation, state.program.relative_vgpr_dwords), per_invocation);
 			}
 		}
 		for (auto& region: regions) {
@@ -1414,6 +1425,12 @@ void EmitProgram(EmitterState& state) {
 			state.builder.AddFunction(spv::OpVariable,
 			                          TypePointer(state, spv::StorageClassFunction, TypeU32(state)),
 			                          lane.scratch_u32_variable, spv::StorageClassFunction);
+		}
+		if (lane.relative_vgpr_variable != 0 && per_invocation == spv::StorageClassFunction) {
+			state.builder.AddFunction(
+			    spv::OpVariable,
+			    TypeU32ArrayPointer(state, spv::StorageClassFunction, state.program.relative_vgpr_dwords),
+			    lane.relative_vgpr_variable, spv::StorageClassFunction);
 		}
 	}
 	EmitFunctionEntryValues(state);

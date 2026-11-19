@@ -677,6 +677,7 @@ struct ShaderInfo {
 	bool                            uses_dma                      = false;
 	bool                            dma_bounded                   = false;
 	bool                            uses_swizzle                  = false;
+	bool                            relative_vgprs                = false;
 	bool                            uses_lds                      = false;
 	bool                            uses_gds                      = false;
 	bool                            uses_flattened_srt            = false;
@@ -951,6 +952,7 @@ struct Program: ResourcePlan {
 	uint32_t                      wave_size      = 64;
 	bool                          lane_local     = false;
 	uint32_t                      scratch_dwords = 0;
+	uint32_t                      relative_vgpr_dwords = 0;
 	bool                          dispatcher_fallback = false;
 	std::vector<uint32_t>         inlined_call_entries;
 	struct ScalarWrite { uint32_t pc; ScalarReg reg; Value value; };

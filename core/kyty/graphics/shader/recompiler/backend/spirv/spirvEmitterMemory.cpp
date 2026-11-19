@@ -2524,6 +2524,26 @@ uint32_t EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	return EmitDsMaskedLaneRead(state, source, target, ctx.Arg(inst, 2));
 }
 
+namespace {
+
+uint32_t RelativeVgprPointer(ValueEmitContext& ctx, uint32_t index) {
+	auto&      state   = ctx.state;
+	const auto pointer = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpAccessChain, TypePointer(state, state.scratch_storage_class, TypeU32(state)),
+	                          pointer, ctx.relative_vgpr_variable, index);
+	return pointer;
+}
+
+}
+
+uint32_t EmitLoadRelativeVgpr(ValueEmitContext& ctx, const IR::Inst& inst) {
+	return EmitNative<spv::OpLoad, IR::Type::U32>(ctx.state, RelativeVgprPointer(ctx, ctx.Arg(inst, 0)));
+}
+
+void EmitStoreRelativeVgpr(ValueEmitContext& ctx, const IR::Inst& inst) {
+	ctx.state.builder.AddFunction(spv::OpStore, RelativeVgprPointer(ctx, ctx.Arg(inst, 0)), ctx.Arg(inst, 1));
+}
+
 uint32_t EmitPermuteU32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto&      state   = ctx.state;
 	auto       lane    = EmitSubgroupLocalInvocationId(state);

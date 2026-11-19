@@ -95,6 +95,7 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::SetAttribute:
 		case ValueOpcode::SetTessellationAttribute:
 		case ValueOpcode::MeshAllocate:
+		case ValueOpcode::StoreRelativeVgpr:
 		case ValueOpcode::StoreCompletion:
 		case ValueOpcode::DataCacheInvalidate:
 		case ValueOpcode::RayQueryInitialize:

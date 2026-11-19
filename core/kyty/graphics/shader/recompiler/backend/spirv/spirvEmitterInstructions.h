@@ -353,6 +353,8 @@ inline constexpr auto EmitSharedAtomicXor32     = EmitAtomic32;
 inline constexpr auto EmitDataAppend            = EmitAppendConsume;
 inline constexpr auto EmitDataConsume           = EmitAppendConsume;
 uint32_t              EmitSwizzleU32(ValueEmitContext& ctx, const IR::Inst& inst);
+uint32_t              EmitLoadRelativeVgpr(ValueEmitContext& ctx, const IR::Inst& inst);
+void                  EmitStoreRelativeVgpr(ValueEmitContext& ctx, const IR::Inst& inst);
 void                  EmitImage(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t              EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst);

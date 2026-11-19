@@ -1,4 +1,5 @@
 #include "graphics/shader/recompiler/ir/passes/SsaRewrite.h"
+#include "graphics/shader/recompiler/ir/passes/RelativeVgprLowering.h"
 
 #include <algorithm>
 #include <map>
@@ -98,6 +99,16 @@ Value InitialValue(VectorReg) {
 Value InitialValue(GotoVariable) {
 	return Value(false);
 }
+
+template <typename T>
+uint64_t PhiFlags(T variable) {
+	const auto type = static_cast<uint32_t>(InitialValue(variable).GetType());
+	if constexpr (std::is_same_v<T, VectorReg>) {
+		return RelativeVgprPhiFlags(type, RegIndex(variable));
+	} else {
+		return type;
+	}
+}
 Value InitialValue(Flag flag) {
 	const bool u1 = flag == Flag::Scc || flag == Flag::Exec || flag == Flag::Vcc;
 	return u1 ? Value(false) : Value(0u);
@@ -147,7 +158,7 @@ public:
 						state.result = def;
 					} else if (!block->IsSsaSealed()) {
 						auto& phi = *block->PrependNewInst(block->begin(), ValueOpcode::Phi);
-						phi.SetFlags(InitialValue(variable).GetType());
+						phi.SetFlags(PhiFlags(variable));
 						incomplete_phis[block][Variable(variable)] = &phi;
 						state.result                               = Value(&phi);
 					} else if (const auto predecessors = block->ImmPredecessors();
@@ -157,7 +168,7 @@ public:
 						break;
 					} else {
 						auto& phi = *block->PrependNewInst(block->begin(), ValueOpcode::Phi);
-						phi.SetFlags(InitialValue(variable).GetType());
+						phi.SetFlags(PhiFlags(variable));
 						Write(variable, block, Value(&phi));
 						state.phi = &phi;
 						prepare_phi();
