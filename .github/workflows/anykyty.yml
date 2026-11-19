@@ -79,7 +79,7 @@ jobs:
           - name: kyty
             backend: kyty
             testing: 'ON'
-            targets: kyty_gpu libs relinker agc_frame_replay agc_frame_replay_inspection_tests
+            targets: kyty_gpu libs relinker kyty_rt_probe agc_frame_replay agc_frame_replay_inspection_tests
     steps:
       - uses: actions/checkout@v7
         with:
@@ -321,7 +321,7 @@ jobs:
         run: |
           mapfile -t tests < <(ninja -C build -t targets all | grep -oE '^kyty_shim_[A-Za-z0-9_]+_tests:' | tr -d ':' | sort -u)
           echo "Shim test targets: ${tests[*]}"
-          cmake --build build --target kyty_gpu libs relinker agc_frame_replay agc_frame_replay_inspection_tests "${tests[@]}" --parallel "$NUMBER_OF_PROCESSORS"
+          cmake --build build --target kyty_gpu libs relinker kyty_rt_probe agc_frame_replay agc_frame_replay_inspection_tests "${tests[@]}" --parallel "$NUMBER_OF_PROCESSORS"
       - name: Run the shim tests
         run: ctest --test-dir build -R '^kyty_shim_.*$' --output-on-failure --timeout 300 --no-tests=error
       - name: Run the replay tool tests

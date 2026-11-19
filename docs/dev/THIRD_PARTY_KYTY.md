@@ -505,8 +505,7 @@ guest walk for a leaf test the host does not run (`[RT] cs 0x…: site N leaves 
 with `KYTY_NATIVE_RT=0` or on a GPU without ray queries, and the reference variant of `KYTY_RT_CHECK`. A host TLAS
 walk that finds BLASes the host has not built yet, TLAS memory it has not cached yet or a full host structure still
 publishes its context: the rays of that dispatch miss what it left out, and the `[RT]` summary counts these walks and
-the instances they left out. `kyty_rt_probe` (target of a `kyty` build with `BUILD_TESTING=ON`, not built by
-default) recompiles such a shader offline, from its raw machine code, as the driver does with native ray tracing on:
+the instances they left out. `kyty_rt_probe` (a target of every `kyty` build, written to `build/tests/`; build it with `cmake --build build --target kyty_rt_probe`) recompiles such a shader offline, from its raw machine code, as the driver does with native ray tracing on:
 `kyty_rt_probe [--wave 32|64] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--spirv out.spv] <shader.bin>...`
 prints, per file, its BVH intersections, how many of them trace with ray queries, and the TLAS source and instance
 record layout derived for them, and exits with 0 only when every intersection does. `--dump` adds the IR, `--off`
@@ -520,6 +519,35 @@ To probe directly from the game's local pipeline manifest code cache, use
 `kyty_rt_probe --cache _PipelineCache/<title>_<version>.code --hash 0x<shader-hash>`.
 Use the compute shader hash from the log. The probe verifies the selected record and reads the cache without
 writing to it. Supply `--wave`, `--group` and the other shader settings as needed. The cache stores the program bytes.
+
+To list every ray tracing program of a game at once, use
+`kyty_rt_probe --cache _PipelineCache/<title>_<version>.code --all`. The probe indexes the code cache, reads the manifest beside it
+(`<title>_<version>.kpm`, and `<title>_<version>.shared.kpm` when it exists; `--kpm <file>` names another one) and translates, as
+the driver does at start, each module whose code has `image_bvh_intersect_ray` instructions, with the stage, wave size, workgroup
+size, LDS and scratch the record holds. A program the game registered but no manifest record names is translated as a compute shader
+with a default 8x8x1 workgroup, 8192 LDS dwords and 16384 scratch dwords, at wave sizes 64 and 32 (`source=code`); a graphics shader
+with BVH instructions and no record is listed as `no_record`. Nothing is written, and stderr stays empty. The options that depend on
+the GPU are `--subgroup 32|64` (the host subgroup size; 32 by default), `--lds-limit <bytes>` (49152 by default) and `--oracle`
+(the value of `KYTY_RT_ORACLE`; 1, the default of the build, here), `--no-validate` skips the SPIR-V validation, and `--version`
+prints the commit of the build. The output has one line per program, `key=value` pairs after the hash:
+
+```text
+rt-survey 1 build=<commit> oracle=1 subgroup=32 lds_limit=49152
+note <text>
+program <hash> [back=<hash>] stage=cs wave=64 group=8,8,1 lds=0 scratch=0 modules=3 source=manifest status=ok bvh=12 native=0 oracle=12 lane=0 empty=0 emulated=0 spirv=valid
+summary records=N manifest_modules=N manifest_skipped=N code_only=N programs=N intersections=N missing_code=N unreadable=N undecodable=N truncated=0 seconds=S
+```
+
+`bvh` is the number of BVH intersections left in the translated program, and `native`, `oracle`, `lane`, `empty` and `emulated`
+split it: served by a recognized walk form, answered by a host ray query for the whole wave, answered by one lane at a time,
+run empty (the rays miss), and left to the guest walk. `status` is `ok`, `calls` or `callable` (the program calls functions whose
+code is only in the game's memory), `spec_mismatch` (no record of the program fits its resources), `stop` (the translator
+stopped; `phase` and a `stop` text, scrubbed of hashes and paths, say where) or `no_record`. `spirv` is `valid`, `invalid`
+(Vulkan 1.3 validation with the driver's options) or `none`. `missing_code` counts the manifest modules whose code the cache does not
+hold, `undecodable` the programs the decoder stopped on, and `truncated` is 1 when the cache ends in a half-written record. The exit
+code is 0 when the survey ran, 2 when the cache cannot be read and 64 for a wrong command line.
+[`tools/rt_survey.py`](../../tools/rt_survey.py) runs the probe and writes the report that players attach to the survey issue; see
+[the ray tracing survey](../user/ANYKYTY.md#ray-tracing-survey).
 
 Fallbacks instead of stops (`KYTY_FALLBACKS`, on by default on Linux; off on Windows, where the C++ exception that carries a fallback is not caught across the guest libc yet): KytyPS5 stops the emulator (`EXIT`, `EXIT_IF`,
 `EXIT_NOT_IMPLEMENTED`) on anything it does not handle. Where the stop concerns one draw or one dispatch and nothing else

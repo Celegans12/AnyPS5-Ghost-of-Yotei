@@ -52,6 +52,53 @@ CachedShaderCode DecodeCachedShader(std::istream& cache, const CodeRecord& recor
 
 } // namespace
 
+CachedShaderIndex IndexCachedShaderCode(std::istream& cache) {
+    cache.clear();
+    cache.seekg(0, std::ios::end);
+    auto remaining = cache.tellg() - std::streampos{0};
+    cache.seekg(0, std::ios::beg);
+
+    char magic[CodeMagic.size()];
+    if (!cache.read(magic, sizeof(magic)) || std::string_view(magic, sizeof(magic)) != CodeMagic) {
+        return {.error = "expected a KTYCODE1 manifest code cache"};
+    }
+    remaining -= sizeof(magic);
+    CachedShaderIndex index;
+    std::streamoff at = sizeof(magic);
+    while (remaining != 0) {
+        CodeRecord record{};
+        if (remaining < static_cast<std::streamoff>(sizeof(record)) ||
+            !cache.read(reinterpret_cast<char*>(&record), sizeof(record))) {
+            index.truncated = true;
+            break;
+        }
+        remaining -= sizeof(record);
+        at += sizeof(record);
+        if (record.words == 0 || record.compressedBytes == 0 || record.compressedBytes > remaining) {
+            index.truncated = true;
+            break;
+        }
+        if (record.hash != 0) {
+            index.entries.push_back({record.hash, record.words, record.compressedBytes, at});
+        }
+        cache.seekg(record.compressedBytes, std::ios::cur);
+        if (!cache) {
+            index.truncated = true;
+            break;
+        }
+        remaining -= record.compressedBytes;
+        at += record.compressedBytes;
+    }
+    return index;
+}
+
+CachedShaderCode ReadIndexedShaderCode(std::istream& cache, const CachedShaderEntry& entry) {
+    cache.clear();
+    cache.seekg(entry.payload, std::ios::beg);
+    if (!cache) return {.error = "cannot seek to the cached shader payload"};
+    return DecodeCachedShader(cache, {entry.hash, entry.words, entry.compressedBytes});
+}
+
 CachedShaderCode ReadCachedShaderCode(std::istream& cache, std::uint64_t hash) {
     if (hash == 0) return {.error = "shader hash must be nonzero"};
     cache.seekg(0, std::ios::end);

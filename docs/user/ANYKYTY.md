@@ -23,6 +23,7 @@ Kyty, native               █████████████████�
 - [Games](#games)
 - [Building](#building)
 - [Running a game](#running-a-game)
+- [Ray tracing survey](#ray-tracing-survey)
 - [Settings](#settings)
 - [Contributing](#contributing)
 - [Credits and licence](#credits-and-licence)
@@ -152,6 +153,35 @@ relinker source/input.elf app.elf
 ```
 
 The full procedure, with module folders and Windows output (`--windows`), is in [usage](USAGE.md) and [game testing](../dev/GAME_TESTING.md). On Linux, `ANYPS5_VBLANK_HZ=240 ./app.elf` lifts the 60 FPS cap of games that pace on vblank.
+
+## Ray tracing survey
+
+A game that uses ray tracing walks its acceleration structure in compute shaders, and AnyKyty serves each of those programs in one of five ways: by a recognized walk form (`native`), by a host ray query that answers for the whole wave (`oracle`) or one lane at a time (`lane`), by running the walk empty so its rays miss (`empty`), or by leaving the game's own walk code to run in the shader (`emulated`). Which one a program gets decides how fast and how right the effect is, and it differs from game to game. The survey lists, for every ray tracing program in the shader cache of your game, which way AnyKyty serves it, so that the coverage can be measured on many titles. It reads the cache of programs the game registered, translates them again offline as the driver does, and sends nothing anywhere.
+
+The survey describes what AnyKyty does on a GPU with Vulkan ray queries (NVIDIA RTX, AMD RX 6000 and newer, Intel Arc); on any other GPU it emulates all ray tracing and there is nothing to survey. The report holds no game code and no file name of the game: for each program, only its fingerprint (a hash), its stage, wave size and workgroup size, the number of BVH intersections, how many of them are served each way and whether the translated SPIR-V validates; and the AnyKyty commit, your GPU and driver, and your operating system. Home folders, user names and host names are filtered out, and the command refuses to write a report that still holds a path of your machine. Read both files before you share them anyway.
+
+1. **Update and build the probe.** Pull the current branch and its submodules and build the probe with the rest, from the folder you built AnyKyty in:
+
+   ```sh
+   git pull
+   git submodule update --init --recursive
+   cmake --build build --target kyty_gpu libs relinker kyty_rt_probe --parallel "$(nproc)"
+   ```
+
+   On Windows use `%NUMBER_OF_PROCESSORS%` (or `$env:NUMBER_OF_PROCESSORS` in PowerShell). The probe is a small program, `build/tests/kyty_rt_probe`, and is also built by a plain `cmake --build build`.
+2. **Play for 5 to 10 minutes** with the game's ray tracing option on, in places where it is visible. The shaders a game registers are kept in `_PipelineCache/` in the folder you start the game from, so quit the game normally when you are done.
+3. **Run the survey** from that folder, or name it with `--game`:
+
+   ```sh
+   python3 /path/to/AnyPS5/tools/rt_survey.py
+   ```
+
+   The script needs Python 3 and nothing else. It finds the probe in `build*/tests/` of the AnyKyty folder it sits in (or `--probe`, or `KYTY_RT_PROBE`, or `PATH`) and the newest `_PipelineCache/<title>_<version>.code` (or `--cache`, or `--title` to pick a title), and reads your GPU and the commit from the `anyps5-report.json` the game wrote when it ended (or from a log with `--log`, or `vulkaninfo`, or `nvidia-smi`). It writes `rt-survey-<title>-<version>.json` and `rt-survey-<title>-<version>.txt` in the current folder (`--out-dir`) and prints the text, which lists the programs that are not fully served first. A program that calls functions (many Unreal Engine ray tracing shaders do) is listed as `calls`: the probe sees only its entry code, so its intersections are counted but not classified.
+4. **Share it** in the ray tracing survey issue of this repository: paste the text and attach the JSON file.
+
+On a GPU with 64-wide subgroups (AMD) pass nothing: the script reads it from the log, or from the vendor name. `--subgroup 32|64`, `--lds-limit <bytes>` and `--oracle <n>` set the GPU side and the `KYTY_RT_ORACLE` value by hand. `kyty_rt_probe --cache <file>.code --all` is the command underneath; [the probe reference](../dev/THIRD_PARTY_KYTY.md#ray-tracing) lists its options and the format of its lines.
+
+An AI agent can do these steps for you: the survey issue holds a prompt to paste into Claude Code or another coding agent.
 
 ## Settings
 

@@ -1,0 +1,34 @@
+name: RT survey tools
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/rt-survey-tools.yml
+      - tools/rt_survey.py
+      - tools/tests/test_rt_survey.py
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rt-survey-tools-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  rt-survey:
+    name: ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Test the ray tracing survey
+        shell: bash
+        run: |
+          python="$(command -v python3 || command -v python)"
+          "$python" tools/tests/test_rt_survey.py

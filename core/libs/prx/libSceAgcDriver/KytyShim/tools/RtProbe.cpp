@@ -1,4 +1,6 @@
 #include "RtProbeCache.hpp"
+#include "RtSurvey.hpp"
+#include "prx/libSceAgcDriver/TraceRevision.hpp"
 #include "graphics/shader/recompiler/ShaderRecompiler.h"
 #include "graphics/host_gpu/renderer/rayTracingReplay.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
@@ -38,6 +40,7 @@ struct Settings {
 	uint32_t inputs    = 8;
 	uint32_t oracle    = 0;
 	bool     replay    = false;
+	bool     oracleSet = false;
 	std::string spirv;
 };
 
@@ -309,7 +312,7 @@ int Replay(const char* label, const std::vector<uint32_t>& code, uint64_t hash, 
 }
 
 int Usage() {
-	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-63] [--stats] [--replay-check] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex>)\n");
+	std::fprintf(stderr, "usage: kyty_rt_probe [--wave 32|64] [--subgroup N] [--user N] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--emit] [--spirv out.spv] [--off] [--oracle 0-63] [--stats] [--replay-check] [--stage compute|pixel] [--inputs N] (<shader.bin>... | --cache <file.code> --hash <hex> | --cache <file.code> --all [--kpm <file.kpm>] [--subgroup 32|64] [--lds-limit bytes] [--no-validate])\n       kyty_rt_probe --version\n");
 	return 64;
 }
 
@@ -326,6 +329,10 @@ int main(int argc, char** argv) {
 	std::vector<std::pair<const char*, Settings>> files;
 	const char* cachePath = nullptr;
 	const char* cacheHash = nullptr;
+	const char* kpmPath   = nullptr;
+	bool        all       = false;
+	bool        noValidate = false;
+	uint32_t    ldsLimit  = 49152;
 	for (int i = 1; i < argc; ++i) {
 		const std::string_view arg = argv[i];
 		if (arg == "--wave" && i + 1 < argc) {
@@ -346,7 +353,8 @@ int main(int argc, char** argv) {
 		} else if (arg == "--emit") {
 			settings.emit = true;
 		} else if (arg == "--oracle" && i + 1 < argc) {
-			settings.oracle = static_cast<uint32_t>(std::atoi(argv[++i])) & 63u;
+			settings.oracle    = static_cast<uint32_t>(std::atoi(argv[++i])) & 63u;
+			settings.oracleSet = true;
 		} else if (arg == "--stage" && i + 1 < argc) {
 			const std::string_view stage = argv[++i];
 			if (stage != "pixel" && stage != "compute") return Usage();
@@ -362,6 +370,17 @@ int main(int argc, char** argv) {
 		} else if (arg == "--spirv" && i + 1 < argc) {
 			settings.spirv = argv[++i];
 			settings.emit  = true;
+		} else if (arg == "--version") {
+			std::printf("kyty_rt_probe %s%s\n", APS5_TRACE_COMMIT, APS5_TRACE_DIRTY > 0 ? "+modified" : "");
+			return 0;
+		} else if (arg == "--all") {
+			all = true;
+		} else if (arg == "--kpm" && i + 1 < argc) {
+			kpmPath = argv[++i];
+		} else if (arg == "--lds-limit" && i + 1 < argc) {
+			ldsLimit = static_cast<uint32_t>(std::atoi(argv[++i]));
+		} else if (arg == "--no-validate") {
+			noValidate = true;
 		} else if (arg == "--cache") {
 			if (cachePath || i + 1 >= argc) return Usage();
 			cachePath = argv[++i];
@@ -372,6 +391,19 @@ int main(int argc, char** argv) {
 			files.emplace_back(argv[i], settings);
 		}
 	}
+	if (all) {
+		if (!cachePath || !*cachePath || cacheHash || !files.empty()) return Usage();
+		AgcDriver::SurveySettings survey;
+		survey.cache         = cachePath;
+		survey.manifest      = kpmPath != nullptr ? kpmPath : "";
+		survey.oracle        = settings.oracleSet ? settings.oracle : 1u;
+		survey.subgroup      = settings.subgroup != 0 ? settings.subgroup : 32u;
+		survey.ldsLimitBytes = ldsLimit;
+		survey.validate      = !noValidate;
+		survey.build         = std::string(APS5_TRACE_COMMIT) + (APS5_TRACE_DIRTY > 0 ? "+modified" : "");
+		return AgcDriver::RunSurvey(survey);
+	}
+	if (kpmPath != nullptr || noValidate) return Usage();
 	if (cachePath || cacheHash) {
 		uint64_t hash = 0;
 		if (!cachePath || !*cachePath || !cacheHash || !files.empty() || !ParseShaderHash(cacheHash, hash)) return Usage();
