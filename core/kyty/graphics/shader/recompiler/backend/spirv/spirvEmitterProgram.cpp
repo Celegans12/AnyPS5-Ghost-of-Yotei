@@ -1130,69 +1130,22 @@ uint32_t ValueEmitContext::HalfArg(const IR::Inst& inst, size_t index, uint32_t 
 	return lane_half == half ? Arg(inst, index) : other_half->Arg(inst, index);
 }
 
-#if defined(ANYPS5_KYTY)
-static uint32_t AbsentQuadLanes(EmitterState& state, uint32_t active) {
-	const auto spread = EmitBinaryU32(state, spv::OpBitwiseOr, active,
-	                                  EmitBinaryU32(state, spv::OpShiftRightLogical, active, ConstantU32(state, 1)));
-	const auto quads  = EmitBinaryU32(
-	    state, spv::OpBitwiseAnd,
-	    EmitBinaryU32(state, spv::OpBitwiseOr, spread,
-	                  EmitBinaryU32(state, spv::OpShiftRightLogical, spread, ConstantU32(state, 2))),
-	    ConstantU32(state, 0x11111111u));
-	const auto whole  = EmitBinaryU32(state, spv::OpIMul, quads, ConstantU32(state, 15));
-	const auto absent = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpNot, TypeU32(state), absent, active);
-	return EmitBinaryU32(state, spv::OpBitwiseAnd, whole, absent);
-}
-
-static uint32_t AnswerAbsentQuadLanes(EmitterState& state, uint32_t ballot, uint32_t words) {
-	if (state.program.stage != ShaderType::Pixel) {
-		return ballot;
-	}
-	const auto active = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpGroupNonUniformBallot, TypeU32Vector(state, 4), active,
-	                          ConstantU32(state, spv::ScopeSubgroup), ConstantBool(state, true));
-	std::array<uint32_t, 4> parts {};
-	for (uint32_t word = 0; word < 4; word++) {
-		const auto bits = state.builder.AllocateId();
-		state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), bits, ballot, word);
-		parts[word] = bits;
-		if (word < words) {
-			const auto lanes = state.builder.AllocateId();
-			state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), lanes, active, word);
-			parts[word] = EmitBinaryU32(state, spv::OpBitwiseOr, bits, AbsentQuadLanes(state, lanes));
-		}
-	}
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpCompositeConstruct, TypeU32Vector(state, 4), result, parts[0], parts[1],
-	                          parts[2], parts[3]);
-	return result;
-}
-#endif
-
 uint32_t ValueEmitContext::Ballot(IR::Value predicate) {
 	const auto ballot_type = TypeU32Vector(state, 4);
 	const auto scope       = ConstantU32(state, spv::ScopeSubgroup);
-	auto       low         = state.builder.AllocateId();
+	const auto low         = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, low, scope,
 	                          other_half == nullptr || half == 0 ? Def(predicate)
 	                                                             : other_half->Def(predicate));
 	if (other_half == nullptr) {
-#if defined(ANYPS5_KYTY)
-		low = AnswerAbsentQuadLanes(state, low, state.program.wave_size == 32u ? 1u : 2u);
-#endif
 		return low;
 	}
-	auto       high      = state.builder.AllocateId();
+	const auto high      = state.builder.AllocateId();
 	const auto low_word  = state.builder.AllocateId();
 	const auto high_word = state.builder.AllocateId();
 	const auto ballot    = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpGroupNonUniformBallot, ballot_type, high, scope,
 	                          half == 1 ? Def(predicate) : other_half->Def(predicate));
-#if defined(ANYPS5_KYTY)
-	low  = AnswerAbsentQuadLanes(state, low, 1u);
-	high = AnswerAbsentQuadLanes(state, high, 1u);
-#endif
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), low_word, low, 0);
 	state.builder.AddFunction(spv::OpCompositeExtract, TypeU32(state), high_word, high, 0);
 	state.builder.AddFunction(spv::OpCompositeConstruct, ballot_type, ballot, low_word, high_word,
