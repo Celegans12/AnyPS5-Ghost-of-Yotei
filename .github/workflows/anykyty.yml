@@ -22,6 +22,11 @@ on:
 permissions:
   contents: read
 
+env:
+  KYTY_REPLAY_TESTS: >-
+    agc_driver_frame_replay_submits agc_driver_frame_replay_shader_output
+    frame_replay_compare frame_replay_report
+
 concurrency:
   group: anykyty-${{ github.event.pull_request.number || inputs.pr || github.ref }}
   cancel-in-progress: true
@@ -74,7 +79,7 @@ jobs:
           - name: kyty
             backend: kyty
             testing: 'ON'
-            targets: kyty_gpu libs relinker
+            targets: kyty_gpu libs relinker agc_frame_replay agc_frame_replay_inspection_tests
     steps:
       - uses: actions/checkout@v7
         with:
@@ -203,6 +208,12 @@ jobs:
           sudo sysctl -w vm.unprivileged_userfaultfd=1 vm.max_map_count=2147483642 kernel.core_pattern=core
           ulimit -c 0
           ctest --test-dir build -R '^(kyty_shim_.*|guest_gpu_fault|guest_host_write_filter|agc_kyty_shaders)$' --output-on-failure --timeout 300 --no-tests=error
+      - name: Run the replay tool tests
+        if: matrix.backend == 'kyty'
+        run: |
+          for test in $KYTY_REPLAY_TESTS; do
+            ctest --test-dir build -R "^${test}$" --output-on-failure --no-tests=error
+          done
       - name: Show the ccache statistics
         if: ${{ !cancelled() && steps.ccache.outcome == 'success' }}
         run: ccache -s
@@ -310,9 +321,14 @@ jobs:
         run: |
           mapfile -t tests < <(ninja -C build -t targets all | grep -oE '^kyty_shim_[A-Za-z0-9_]+_tests:' | tr -d ':' | sort -u)
           echo "Shim test targets: ${tests[*]}"
-          cmake --build build --target kyty_gpu libs relinker "${tests[@]}" --parallel "$NUMBER_OF_PROCESSORS"
+          cmake --build build --target kyty_gpu libs relinker agc_frame_replay agc_frame_replay_inspection_tests "${tests[@]}" --parallel "$NUMBER_OF_PROCESSORS"
       - name: Run the shim tests
         run: ctest --test-dir build -R '^kyty_shim_.*$' --output-on-failure --timeout 300 --no-tests=error
+      - name: Run the replay tool tests
+        run: |
+          for test in $KYTY_REPLAY_TESTS; do
+            ctest --test-dir build -R "^${test}$" --output-on-failure --no-tests=error
+          done
       - name: Show the ccache statistics
         if: ${{ !cancelled() && steps.ccache.outcome == 'success' }}
         run: ccache -s

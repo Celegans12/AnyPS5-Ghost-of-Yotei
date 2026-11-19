@@ -1,5 +1,6 @@
 set(capture "${DIRECTORY}/capture 'quoted' & $scene %APS5_HEADLESS_PIPELINE_CACHE% ! (1)")
-execute_process(COMMAND "${WRITER}" inspect_capture "${capture}"
+math(EXPR writerArgument "${CMAKE_ARGC} - 1")
+execute_process(COMMAND "${CMAKE_ARGV${writerArgument}}" "${capture}"
         RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
 if(NOT result STREQUAL "0")
     message(FATAL_ERROR "capture writer failed: ${result}\n${output}\n${error}")

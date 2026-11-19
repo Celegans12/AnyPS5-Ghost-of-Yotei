@@ -161,7 +161,9 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
     target_include_directories(agc_frame_replay PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_frame_replay PRIVATE libSceAgcDriver libkernel libc libzstd_static)
     set_target_properties(agc_frame_replay PROPERTIES CXX_EXTENSIONS OFF)
+    configure_windows_unwind(agc_frame_replay)
     include(tests/cmake/agc_frame_capture_filter_tests.cmake)
+    include(tests/FrameReplayInspection.cmake)
     return()
 endif()
 
@@ -1148,6 +1150,7 @@ if(WIN32)
 endif()
 set_target_properties(agc_frame_replay PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_frame_replay)
+include(tests/FrameReplayInspection.cmake)
 
 add_executable(agc_pm4_replay EXCLUDE_FROM_ALL
         tools/Pm4Replay.cpp
