@@ -85,3 +85,11 @@ set_tests_properties(kyty_shim_merged_hull PROPERTIES TIMEOUT 20 PASS_REGULAR_EX
         FAIL_REGULAR_EXPRESSION "terminate called")
 add_test(NAME kyty_shim_merged_hull_draw COMMAND kyty_shim_merged_hull_tests draw)
 set_tests_properties(kyty_shim_merged_hull_draw PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
+
+if(NOT WIN32)
+    add_test_executable(kyty_shim_rt_corpus_tests ${CMAKE_CURRENT_SOURCE_DIR}/RtCorpus.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    target_include_directories(kyty_shim_rt_corpus_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(kyty_shim_rt_corpus_tests PRIVATE Kyty::gpu libkernel libc)
+    add_test(NAME kyty_shim_rt_corpus COMMAND kyty_shim_rt_corpus_tests)
+    set_tests_properties(kyty_shim_rt_corpus PROPERTIES TIMEOUT 300 SKIP_RETURN_CODE 77)
+endif()
