@@ -1,13 +1,17 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
 #include <string_view>
 
 namespace AgcDriver::DriverDetail {
 
 void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+    Graphics::Recorder::NoteRecentLabel(address, bytes, queue);
     if (!KeepsLabelStore(address, bytes.size())) return;
     std::lock_guard lock(labelStoresMutex);
     for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {
@@ -17,6 +21,27 @@ void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> by
         history[0].queue = queue;
         std::memcpy(&history[0].value, bytes.data() + offset, 4);
     }
+}
+
+void Driver::describeLabelStores(std::uint64_t address, std::size_t bytes, std::uint64_t received) {
+    std::string line;
+    {
+        std::lock_guard lock(labelStoresMutex);
+        for (std::size_t offset = 0; offset < bytes; offset += 4) {
+            const auto found = labelStores.find(address + offset);
+            if (found == labelStores.end()) continue;
+            char text[96];
+            std::snprintf(text, sizeof(text), "%s 0x%llx:", line.empty() ? "" : ";", static_cast<unsigned long long>(address + offset));
+            line += text;
+            for (const auto& store : found->second) {
+                if (store.stamp == 0) continue;
+                std::snprintf(text, sizeof(text), " 0x%x by queue 0x%x at stamp %llu", store.value, store.queue, static_cast<unsigned long long>(store.stamp));
+                line += text;
+            }
+        }
+    }
+    if (line.empty()) line = " none kept";
+    std::fprintf(stderr, "[gpu]   label stores (wait received at stamp %llu, stamp now %llu):%s\n", static_cast<unsigned long long>(received), static_cast<unsigned long long>(eventSerial.load(std::memory_order_relaxed)), line.c_str());
 }
 
 bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer) {
