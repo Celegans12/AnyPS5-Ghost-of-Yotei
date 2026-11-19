@@ -108,7 +108,8 @@ bool HasSideEffects(ValueOpcode opcode) {
 		case ValueOpcode::RayQuerySelectedLeaf:
 		case ValueOpcode::RayQueryResult:
 		case ValueOpcode::RayQueryMark:
-		case ValueOpcode::RayQueryAlpha: return true;
+		case ValueOpcode::RayQueryAlpha:
+		case ValueOpcode::RayQueryAlphaDistance: return true;
 		default: return false;
 	}
 }
