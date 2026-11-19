@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/hackNotice.h"
 
 #include "MemoryShim.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -921,6 +922,16 @@ uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 		Shim::Fail("KytyShim memory: attempted to access invalid address 0x%016" PRIx64 " with size 0x%016" PRIx64 "\n", vaddr, size);
 	}
 	if (FirstClamp(vaddr, size, clamped)) std::fprintf(stderr, "KytyShim memory: clamped buffer range addr=0x%016" PRIx64 " size=0x%016" PRIx64 " to 0x%016" PRIx64 "\n", vaddr, size, clamped);
+	return clamped;
+}
+
+uint64_t ClampRangeSizeOrZero(uint64_t vaddr, uint64_t size) {
+	if (!ValidRange(vaddr, size)) return 0;
+	if (IsFullyMapped(vaddr, size)) return size;
+	const auto clamped = MappedPrefix(vaddr, size);
+	if (clamped == 0) {
+		Common::HackNotice::Report("V# outside guest memory bound as a null buffer", "ClampRangeSizeOrZero", 0, 0);
+	}
 	return clamped;
 }
 

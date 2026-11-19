@@ -100,7 +100,7 @@ void Summarize() {
 
 }
 
-void Report(const char* hack, const char* site, uint64_t shader_hash, uint64_t where,
+bool Report(const char* hack, const char* site, uint64_t shader_hash, uint64_t where,
             std::string_view detail) {
 	if (shader_hash == 0) shader_hash = CurrentShaderSlot();
 	auto key = Mix(reinterpret_cast<uintptr_t>(hack));
@@ -144,7 +144,7 @@ void Report(const char* hack, const char* site, uint64_t shader_hash, uint64_t w
 	}
 
 	const auto calls = g_calls.fetch_add(1, std::memory_order_relaxed);
-	if (calls >= 64 && (calls & 15u) != 0) return;
+	if (calls >= 64 && (calls & 15u) != 0) return first;
 	const auto now      = NowNs();
 	auto       deadline = g_next_summary_ns.load(std::memory_order_relaxed);
 	if (deadline == 0) {
@@ -155,6 +155,7 @@ void Report(const char* hack, const char* site, uint64_t shader_hash, uint64_t w
 	                                                     std::memory_order_acq_rel)) {
 		Summarize();
 	}
+	return first;
 }
 
 }

@@ -126,3 +126,14 @@ add_dependencies(kyty_shim_depth_target_alias_tests agc_frame_replay)
 add_test(NAME kyty_shim_depth_target_alias COMMAND kyty_shim_depth_target_alias_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_depth_target_alias PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_depth_target_alias: ok")
+
+add_test_executable(kyty_shim_buffer_null_range_tests ${CMAKE_CURRENT_SOURCE_DIR}/BufferNullRange.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
+target_include_directories(kyty_shim_buffer_null_range_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
+target_link_libraries(kyty_shim_buffer_null_range_tests PRIVATE libzstd_static)
+set_target_properties(kyty_shim_buffer_null_range_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_host_test_executable(kyty_shim_buffer_null_range_tests)
+add_dependencies(kyty_shim_buffer_null_range_tests agc_frame_replay)
+add_test(NAME kyty_shim_buffer_null_range COMMAND kyty_shim_buffer_null_range_tests $<TARGET_FILE:agc_frame_replay>)
+set_tests_properties(kyty_shim_buffer_null_range PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
+        PASS_REGULAR_EXPRESSION "kyty_shim_buffer_null_range: ok")

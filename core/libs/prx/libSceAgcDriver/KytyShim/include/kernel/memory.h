@@ -169,6 +169,7 @@ bool                   IsBackingReadable(uint64_t vaddr, uint64_t size);
 [[nodiscard]] bool BackingChangesSince(uint64_t epoch,
                                        std::vector<std::pair<uint64_t, uint64_t>>& changes);
 [[nodiscard]] uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size);
+[[nodiscard]] uint64_t ClampRangeSizeOrZero(uint64_t vaddr, uint64_t size);
 [[nodiscard]] bool     IsFullyMapped(uint64_t vaddr, uint64_t size);
 bool                   TryPrepareHostWrite(uint64_t vaddr, uint64_t size);
 bool                   TryPrepareHostOverwrite(uint64_t vaddr, uint64_t size);

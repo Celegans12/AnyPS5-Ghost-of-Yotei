@@ -6,7 +6,7 @@
 
 namespace Common::HackNotice {
 
-void Report(const char* hack, const char* site, uint64_t shader_hash, uint64_t where,
+bool Report(const char* hack, const char* site, uint64_t shader_hash, uint64_t where,
             std::string_view detail = {});
 
 inline uint64_t& CurrentShaderSlot() {

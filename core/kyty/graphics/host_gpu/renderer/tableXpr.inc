@@ -1532,7 +1532,7 @@ bool RenderExecutor::TableBlocks(TablePair& pair, std::array<std::span<const uin
 		const auto address   = descriptor.Base48();
 		return {address, descriptor.Type() != 0 || address == 0 || requested == 0
 		                     ? 0
-		                     : Libs::LibKernel::Memory::ClampRangeSize(address, requested)};
+		                     : Libs::LibKernel::Memory::ClampRangeSizeOrZero(address, requested)};
 	};
 	const auto specialized = [&](uint32_t st, size_t i, const std::array<uint32_t, 4>& words4) {
 		const auto& resources = pair.programs[st]->info.buffers;

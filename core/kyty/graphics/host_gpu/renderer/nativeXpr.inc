@@ -1235,7 +1235,7 @@ bool RenderExecutor::NativeXprRebindBuffers(NativeXprRecord& record, std::span<c
 		const auto address    = descriptor.Base48();
 		auto       size       = descriptor.GetSize();
 		if (address == 0 || size == 0 || descriptor.NumRecords() == UINT32_MAX) return false;
-		size = Libs::LibKernel::Memory::ClampRangeSize(address, size);
+		size = Libs::LibKernel::Memory::ClampRangeSizeOrZero(address, size);
 		if (size == 0 || size > max_range) return false;
 		const auto  id    = buffers.FindBuffer(address, size);
 		const auto* owner = buffers.GetBufferIfLive(id);

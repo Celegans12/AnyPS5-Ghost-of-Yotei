@@ -873,6 +873,11 @@ void ReadOnGpuThread() {
     Require(!Memory::IsFullyMapped(heap, Page * 2));
     Require(Memory::ClampRangeSize(heap, Page) == Page);
     Require(Memory::ClampRangeSize(heap, Page * 2) == Page);
+    Require(Memory::ClampRangeSizeOrZero(heap, Page) == Page);
+    Require(Memory::ClampRangeSizeOrZero(heap, Page * 2) == Page);
+    Require(Memory::ClampRangeSizeOrZero(wait.hole, Page) == 0);
+    Require(Memory::ClampRangeSizeOrZero(std::uint64_t{0x8000402bd800}, std::uint64_t{0x3e5e0000}) == 0);
+    Require(Memory::ClampRangeSizeOrZero(UINT64_MAX - Page, Page * 2) == 0);
     Require(Memory::CopySparseMemory(heap, read.data(), Page * 2));
     Require(std::memcmp(read.data(), wait.heapBytes.data(), Page) == 0);
     Require(std::all_of(read.begin() + Page, read.end(), [](std::uint8_t byte) { return byte == 0; }));
