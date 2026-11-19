@@ -201,7 +201,7 @@ struct Job {
 	uint32_t layout_count;
 	uint32_t mismatches;
 	uint32_t leaves;
-	uint32_t pad2;
+	uint32_t update;
 };
 
 constexpr uint32_t JobLayoutMismatch = 16;
@@ -340,6 +340,8 @@ struct RtStats {
 	std::atomic<uint32_t> last_overflow_boxes {0};
 	RtCounter             walks_incomplete;
 	RtCounter             incomplete_instances;
+	RtCounter             blas_updates;
+	RtCounter             kept_triangles;
 	std::atomic<uint64_t> last_incomplete {0};
 	std::atomic<uint64_t>                guest_rays {0};
 	uint64_t                             guest_rays_reported = 0;
@@ -384,6 +386,8 @@ void SummarizeRayTracing() {
 	const auto incomplete  = stats.walks_incomplete.TakeDelta();
 	const auto missing     = stats.incomplete_instances.TakeDelta();
 	const auto unpublished = null_header + bad_header;
+	const auto updates     = stats.blas_updates.TakeDelta();
+	const auto kept        = stats.kept_triangles.TakeDelta();
 	const auto rays_total = stats.guest_rays.load(std::memory_order_relaxed);
 	const auto rays       = rays_total - stats.guest_rays_reported;
 	stats.guest_rays_reported  = rays_total;
@@ -398,7 +402,7 @@ void SummarizeRayTracing() {
 	const auto new_always_guest = programs.always_guest - stats.programs_reported.always_guest;
 	const auto new_pixel_guest  = programs.pixel_guest - stats.programs_reported.pixel_guest;
 	stats.programs_reported     = programs;
-	if (next == 0 || empty + unpublished + uncached + overflow + incomplete + rays + oracle + new_empty +
+	if (next == 0 || empty + unpublished + uncached + overflow + incomplete + rays + oracle + kept + new_empty +
 	                         new_always_guest + new_pixel_guest ==
 	                     0) {
 		return;
@@ -435,6 +439,11 @@ void SummarizeRayTracing() {
 		                "TLAS memory not cached yet or a full host structure (last cs {}): their contexts were published, "
 		                "and their rays missed what the host structures left out",
 		                incomplete, missing, RtShader(stats.last_incomplete.load(std::memory_order_relaxed))));
+	}
+	if (kept != 0) {
+		log(fmt::format("[RT]   {} BLAS updates, in which {} triangles kept the active or inactive state of their build: "
+		                "an update must not turn a triangle on or off, they wait for the next build",
+		                updates, kept));
 	}
 	if (rays != 0) {
 		log(fmt::format("[RT]   {} rays had no host context or host service and missed (last cs {})", rays,
@@ -1321,6 +1330,10 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 		for (size_t i = 0; i < jobs.size(); i++) {
 			auto&      slot   = *m_slot_list[slots[i]];
 			const bool gather = gathers(&slot);
+			jobs[i].update    = gather && slot.refit_seq == m_refit_seq && slot.updatable &&
+			                         slot.fast_built == (slot.dynamic_until != 0)
+			                        ? 1u
+			                        : 0u;
 			slot.gathers         = gather ? slot.gathers + 1 : 0;
 			slot.built_refit_seq = m_refit_seq;
 			(gather ? gather_jobs : walk_jobs).push_back(jobs[i]);
@@ -1416,12 +1429,10 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 	uint64_t                 scratch_offset = 0;
 	const auto               scratch_base   = m_build_scratch->BufferDeviceAddress();
 	for (size_t i = 0; i < slots.size(); i++) {
-		auto&      slot     = *m_slot_list[slots[i]];
-		const bool fast     = slot.dynamic_until != 0;
-		const bool gathered = i >= walk_count;
+		auto&          slot      = *m_slot_list[slots[i]];
+		const bool     fast      = slot.dynamic_until != 0;
 		const bool     updatable = slot.refit_seq == m_refit_seq;
-		const uint32_t update =
-		    gathered && updatable && slot.updatable && slot.fast_built == fast ? 2u : updatable ? 1u : 0u;
+		const uint32_t update    = jobs[i].update != 0 ? 2u : updatable ? 1u : 0u;
 		slot.fast_built = fast;
 		slot.updatable  = updatable;
 		records.push_back({slot.handle, slot.vertices0.address, slot.vertices1.address,
@@ -1883,6 +1894,10 @@ void RayTracing::ProcessReadback(Readback& readback) {
 	for (uint32_t i = 0; i < readback.build_count && i < readback.build_slots.size(); i++) {
 		Job job {};
 		std::memcpy(&job, bytes + ReadbackJobs + uint64_t {i} * JobStride, sizeof(job));
+		if (job.update != 0) {
+			g_rt_stats.blas_updates.Add();
+			g_rt_stats.kept_triangles.Add(job.mismatches);
+		}
 		if ((job.result & 1u) == 0 && ((job.result >> 1u) & 5u) != 0) {
 			const auto index = readback.build_slots[i];
 			if (m_slot_list[index] != nullptr && !m_slot_list[index]->evicted) {

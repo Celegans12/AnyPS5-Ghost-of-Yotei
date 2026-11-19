@@ -21,7 +21,7 @@ layout(buffer_reference, std430, buffer_reference_align = 8) buffer Job {
 	uint     layout_count;
 	uint     mismatches;
 	uint     leaves;
-	uint     pad2;
+	uint     update;
 };
 
 layout(buffer_reference, std430, buffer_reference_align = 16) buffer LayoutRef {
@@ -223,6 +223,18 @@ void GatherTriangle(Job job, uint64_t base, uint index, uint geometry) {
 	}
 	for (uint v = 0; v < 3; v++) {
 		usable = usable && !any(isnan(p[v])) && all(lessThan(abs(p[v]), vec3(1e18)));
+	}
+	if (job.update != 0u) {
+		const bool built = !isnan(out_triangle.v[0]) && !isnan(out_triangle.v[3]) && !isnan(out_triangle.v[6]);
+		if (built != usable) {
+			atomicAdd(job.mismatches, 1u);
+			if (!built) {
+				return;
+			}
+			const vec3 point = vec3(out_triangle.v[0], out_triangle.v[1], out_triangle.v[2]);
+			p[0] = p[1] = p[2] = point;
+			usable = true;
+		}
 	}
 	for (uint v = 0; v < 3; v++) {
 		const vec3 q = usable ? p[v] : vec3(uintBitsToFloat(0x7fc00000u));
