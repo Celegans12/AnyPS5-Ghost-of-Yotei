@@ -1650,15 +1650,17 @@ void PipelineCache::InitializeDriverCache() {
 		return;
 	}
 #if defined(ANYPS5_KYTY)
-	m_driver_cache_path = DriverCachePath(title_id, DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()));
+	if (m_graphics.pipeline_cache_persistent) {
+		m_driver_cache_path = DriverCachePath(title_id, DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties()));
+	}
 #else
 	m_driver_cache_path     = std::filesystem::path("_PipelineCache") / (title_id + ".bin");
 #endif
 	const auto path         = Common::PathToString(m_driver_cache_path);
-	const bool cache_exists = Common::File::IsFileExisting(m_driver_cache_path);
+	const bool cache_exists = !m_driver_cache_path.empty() && Common::File::IsFileExisting(m_driver_cache_path);
 	if (cache_exists) {
 		PipelineCacheLog("Vulkan pipeline cache: loading {}", path);
-	} else {
+	} else if (!m_driver_cache_path.empty()) {
 		PipelineCacheLog("Vulkan pipeline cache: initializing {}", path);
 	}
 	std::vector<uint8_t> initial_data;
@@ -1717,6 +1719,9 @@ void PipelineCache::InitializeDriverCache() {
 	} else {
 		PipelineCacheLog("Vulkan pipeline cache: initialized empty");
 	}
+	if (m_driver_cache_path.empty()) {
+		return;
+	}
 	m_driver_cache_posted = std::chrono::steady_clock::now();
 	m_driver_cache_timer = std::jthread([this](const std::stop_token& stop) {
 		while (!stop.stop_requested()) {
@@ -1728,7 +1733,7 @@ void PipelineCache::InitializeDriverCache() {
 }
 
 void PipelineCache::CheckpointDriverCache(bool slow_creation) {
-	if (m_driver_cache == nullptr) {
+	if (m_driver_cache == nullptr || m_driver_cache_path.empty()) {
 		return;
 	}
 	std::lock_guard lock(m_driver_cache_mutex);

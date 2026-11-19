@@ -347,6 +347,8 @@ On Windows and Linux, set `APS5_FRAME_CAPTURE` to a directory to record a few fr
 
 On the Kyty backend, a full `--strict` replay disables renderer fallbacks and waits for graphics pipelines to be ready before drawing. It overrides `KYTY_FALLBACKS` and `KYTY_ASYNC_PIPELINES`. Unsupported work that would trigger a configurable fallback can stop the replay. Permissive replays keep their configured pipeline behaviour, and inspection modes do not run the renderer.
 
+On Kyty, `--cold-pipelines` makes the Vulkan pipeline cache process-local. Release replays with a title ID start it empty and skip reading or writing the title's Vulkan cache files in `_PipelineCache`. The shader store and pipeline manifest have separate switches.
+
 `agc_frame_replay` refuses a capture whose `calls.bin` is calls format 1 before it restores any memory: that format does not record whether GPU writes had landed before each memory delta was read, so record such a capture again. A delta first flushes the driver's writes to the pages it restores.
 
 ```sh

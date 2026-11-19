@@ -47,6 +47,7 @@ struct GraphicContext {
 	bool                               pipeline_cache_lookup_enabled          = false;
 #if defined(ANYPS5_KYTY)
 	bool                               pipeline_library_enabled               = false;
+	bool                               pipeline_cache_persistent              = true;
 #endif
 	bool                                      mesh_shader_enabled                   = false;
 	bool                                      native_ray_tracing_enabled            = false;

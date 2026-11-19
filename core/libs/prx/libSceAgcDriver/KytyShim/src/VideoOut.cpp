@@ -37,6 +37,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -545,6 +546,8 @@ Presenter& WindowInit(uint32_t width, uint32_t height) {
     auto host = std::make_unique<WindowContext>();
     host->graphic_ctx.screen_width = width;
     host->graphic_ctx.screen_height = height;
+    host->graphic_ctx.pipeline_cache_persistent =
+        !KytyShim::Replay::Tracking() || std::getenv("APS5_HEADLESS_PIPELINE_CACHE") != nullptr;
     host->host_get_instance_proc_addr = KytyShim::Present::LoadVulkanLoader();
     host->host_extensions = KytyShim::Present::SurfaceInstanceExtensions(host->host_get_instance_proc_addr);
     host->host_create_surface = &KytyShim::Present::CreateHostSurface;
