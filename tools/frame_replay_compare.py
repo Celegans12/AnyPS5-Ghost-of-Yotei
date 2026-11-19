@@ -75,6 +75,11 @@ def _validate_kyty_title_id(value):
         raise ValueError("kyty_title_id must be a portable title ID")
 
 
+def _requires_validation(environment):
+    layers = re.split(r"[:;]", environment.get("VK_INSTANCE_LAYERS", ""))
+    return processes.FORCED["VK_INSTANCE_LAYERS"] in layers
+
+
 def validate_replay_recipe(value, directory):
     if not isinstance(value, dict) or value.get("format") != "aps5-frame-replay-recipe/1":
         raise ValueError("expected format aps5-frame-replay-recipe/1")
@@ -179,6 +184,10 @@ def _trial_environment(recipe, arm, runtime, cache):
     environment.update(arm["environment"])
     environment.update(FORCED)
     environment["ANYPS5_SHADER_CACHE_DIR"] = str(cache)
+    if _requires_validation(recipe["environment"]):
+        flags = environment.get("VK_LOADER_DEBUG", "").split(",")
+        if "all" not in flags and "layer" not in flags:
+            environment["VK_LOADER_DEBUG"] = ",".join(filter(None, (*flags, "layer")))
     return environment
 
 
@@ -348,10 +357,16 @@ def _stage_kyty_replay(directory, title_id, seed, seed_manifest):
 
 
 def _assess_replay_run(recipe, run, root):
+    stdout = _read_log(root / "stdout.txt")
     stderr = _read_log(root / "stderr.txt")
-    assessment = evidence.parse_replay_result(_read_log(root / "stdout.txt"), stderr,
-                                              recipe["arms"][run["arm"]]["commit"])
+    assessment = evidence.parse_replay_result(stdout, stderr, recipe["arms"][run["arm"]]["commit"])
     issues = assessment["issues"]
+    if _requires_validation(recipe.get("environment", {})):
+        logs = (stdout, stderr)
+        if any(processes.MISSING_LAYER in log for log in logs):
+            issues.append("Vulkan loader reported a requested layer missing")
+        if not any(processes.INSERTED_LAYER in log for log in logs):
+            issues.append("Khronos validation layer insertion was not recorded")
     for key in ("timed_out", "log_limit"):
         if run[key]:
             issues.append(key)
@@ -498,6 +513,7 @@ def _offline_report(directory):
         raise ValueError("invalid original comparison runs")
     if type(original.get("complete")) is not bool or not isinstance(original.get("recipe"), dict):
         raise ValueError("invalid original comparison state")
+    _environment(original["recipe"].get("environment", {}), shared=True)
     if "kyty_title_id" in original["recipe"]:
         _validate_kyty_title_id(original["recipe"]["kyty_title_id"])
         warmups = original["recipe"].get("warmups")
