@@ -36,6 +36,8 @@ constexpr uint32_t TableEntries     = 1u << 17u;
 constexpr uint32_t SlotCapacity     = 1u << 15u;
 constexpr uint32_t MissingCapacity  = 256;
 constexpr uint32_t MaxJobs          = 512;
+constexpr uint32_t MaxBuildBatches  = 8;
+constexpr uint32_t JobCapacity      = MaxJobs * MaxBuildBatches;
 constexpr uint32_t HostTableEntries = 1u << 14u;
 constexpr uint32_t HostTableProbes  = 32;
 constexpr uint32_t LayoutCapacity   = 1u << 16u;
@@ -103,7 +105,7 @@ constexpr uint32_t StateFull = 3u;
 
 constexpr uint64_t ReadbackMissing = StateSize;
 constexpr uint64_t ReadbackJobs    = ReadbackMissing + uint64_t {MissingCapacity} * MissingStride;
-constexpr uint64_t ReadbackChanged = ReadbackJobs + uint64_t {MaxJobs} * JobStride;
+constexpr uint64_t ReadbackChanged = ReadbackJobs + uint64_t {JobCapacity} * JobStride;
 constexpr uint64_t ReadbackUsed    = ReadbackChanged + uint64_t {ChangedCapacity} * 4;
 constexpr uint64_t ReadbackSize    = ReadbackUsed + uint64_t {SlotCapacity} * 4;
 
@@ -885,7 +887,7 @@ void RayTracing::CreateBuffers() {
 	m_pool           = make(uint64_t {PoolCapacity} * 4, DataFlags, "RT walk pool");
 	m_verify_list    = make(uint64_t {SlotCapacity} * 4, DataFlags, "RT verify list");
 	m_changed        = make(uint64_t {ChangedCapacity} * 4, DataFlags, "RT changed");
-	m_jobs           = make(uint64_t {MaxJobs} * JobStride, DataFlags, "RT jobs");
+	m_jobs           = make(uint64_t {JobCapacity} * JobStride, DataFlags, "RT jobs");
 	m_layouts        = make(uint64_t {LayoutCapacity} * 16, DataFlags, "RT build layouts");
 	m_host_keys.assign(HostTableEntries, 0);
 	m_build_scratch  = make(BuildScratchSize, AsFlags, "RT build scratch");
@@ -1235,7 +1237,30 @@ void RayTracing::AnnounceWalks(std::span<const uint64_t> blases) {
 }
 
 bool RayTracing::RecordBuilds(const CommandRecorder& command) {
-	auto&                 readback = m_readbacks[m_readback_index];
+	bool gathered = false;
+	for (uint32_t batch = 0; batch < MaxBuildBatches; batch++) {
+		if (batch != 0) {
+			Common::LockGuard lock(m_mutex);
+			const bool urgent = std::ranges::any_of(m_build_queue, [&](uint32_t index) {
+				const auto* slot = m_slot_list[index].get();
+				return slot != nullptr && !slot->evicted && slot->needs_build && (!slot->built || slot->replaced);
+			});
+			if (!urgent) {
+				break;
+			}
+		}
+		bool batch_gathered = false;
+		if (!RecordBuildBatch(command, batch != 0, batch_gathered)) {
+			break;
+		}
+		gathered |= batch_gathered;
+	}
+	return gathered;
+}
+
+bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_only, bool& gathered_out) {
+	auto&                 readback  = m_readbacks[m_readback_index];
+	const uint32_t        first_job = readback.build_count;
 	std::vector<Job>      jobs;
 	std::vector<uint32_t> slots;
 	uint64_t              scratch   = 0;
@@ -1262,7 +1287,7 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 			return age(slot_a) > age(slot_b);
 		});
 		std::vector<uint32_t> deferred;
-		while (!m_build_queue.empty() && jobs.size() < MaxJobs) {
+		while (!m_build_queue.empty() && jobs.size() < MaxJobs && first_job + jobs.size() < JobCapacity) {
 			const auto index = m_build_queue.back();
 			if (m_slot_list[index] == nullptr || m_slot_list[index]->evicted ||
 			    !m_slot_list[index]->needs_build) {
@@ -1270,6 +1295,11 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 				continue;
 			}
 			auto&      slot  = *m_slot_list[index];
+			if (urgent_only && slot.built && !slot.replaced) {
+				m_build_queue.pop_back();
+				deferred.push_back(index);
+				continue;
+			}
 			const auto size  = (slot.build_scratch + Alignment - 1) & ~(Alignment - 1);
 			if (scratch + size > BuildScratchSize ||
 			    (!slot.layout.empty() && layouts.size() + slot.layout.size() > LayoutCapacity)) {
@@ -1289,6 +1319,7 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 			}
 			pool_use += queue;
 			slot.needs_build = false;
+			slot.replaced    = false;
 			scratch += size;
 			Job job {slot.blas_va, slot.root, index, slot.vertices0.address,
 			         slot.vertices1.address, slot.entries.address, slot.capacity0,
@@ -1306,6 +1337,15 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 	}
 	if (jobs.empty()) {
 		return false;
+	}
+	if (first_job != 0) {
+		MemoryBarrier(command, vk::PipelineStageFlagBits2::eComputeShader | AsBuildStage,
+		              vk::AccessFlagBits2::eShaderWrite | vk::AccessFlagBits2::eShaderRead |
+		                  vk::AccessFlagBits2::eAccelerationStructureWriteKHR,
+		              vk::PipelineStageFlagBits2::eTransfer | vk::PipelineStageFlagBits2::eComputeShader,
+		              vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderRead |
+		                  vk::AccessFlagBits2::eShaderWrite);
+		command.fillBuffer(m_walk_state->Handle(), offsetof(RtState, pool_cursor), sizeof(uint32_t) * 2, 0);
 	}
 	uint32_t walk_count = 0;
 	{
@@ -1361,12 +1401,13 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 		             static_cast<uint32_t>(chunk * 16));
 		done += chunk;
 	}
-	UpdateBuffer(command, m_jobs->Handle(), 0, jobs.data(),
+	const auto jobs_base = m_jobs->BufferDeviceAddress() + uint64_t {first_job} * JobStride;
+	UpdateBuffer(command, m_jobs->Handle(), uint64_t {first_job} * JobStride, jobs.data(),
 	             static_cast<uint32_t>(jobs.size() * JobStride));
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 	              vk::PipelineStageFlagBits2::eComputeShader,
 	              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite);
-	const BlasPush push {m_jobs->BufferDeviceAddress(),    m_pool->BufferDeviceAddress(),
+	const BlasPush push {jobs_base,                        m_pool->BufferDeviceAddress(),
 	                     m_slots->BufferDeviceAddress(),   m_walk_state->BufferDeviceAddress(),
 	                     m_changed->BufferDeviceAddress(), ModeBuild,
 	                     PoolCapacity,                     walk_count,
@@ -1376,7 +1417,7 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 	command.pushConstants(m_blas_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push), &push);
 	if (walk_count != jobs.size()) {
 		auto gather      = push;
-		gather.jobs      = m_jobs->BufferDeviceAddress() + uint64_t {walk_count} * JobStride;
+		gather.jobs      = jobs_base + uint64_t {walk_count} * JobStride;
 		gather.mode      = ModeGather;
 		gather.job_count = static_cast<uint32_t>(jobs.size()) - walk_count;
 		uint32_t largest = 0;
@@ -1452,9 +1493,10 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 		m_slot_list[index]->built       = true;
 		m_slot_list[index]->built_frame = m_walk_frame;
 	}
-	readback.build_count = static_cast<uint32_t>(slots.size());
-	readback.build_slots = std::move(slots);
-	return walk_count != readback.build_count;
+	gathered_out = walk_count != slots.size();
+	readback.build_count += static_cast<uint32_t>(slots.size());
+	readback.build_slots.insert(readback.build_slots.end(), slots.begin(), slots.end());
+	return true;
 }
 
 void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
@@ -1781,7 +1823,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	const std::array<vk::BufferCopy, 5> regions {{
 	    {0, 0, StateSize},
 	    {0, ReadbackMissing, uint64_t {MissingCapacity} * MissingStride},
-	    {0, ReadbackJobs, uint64_t {MaxJobs} * JobStride},
+	    {0, ReadbackJobs, uint64_t {JobCapacity} * JobStride},
 	    {0, ReadbackChanged, uint64_t {ChangedCapacity} * 4},
 	    {0, ReadbackUsed, uint64_t {SlotCapacity} * 4},
 	}};
@@ -2049,6 +2091,7 @@ void RayTracing::NoteGuestBlasBuilds(std::span<const GuestBlasBuild> builds) {
 			slot.layout        = std::move(layout);
 			slot.header_layout = build.header_layout;
 			slot.leaf_count = static_cast<uint32_t>(totals[0] + totals[1]);
+			slot.replaced   = true;
 			if (!slot.needs_build) {
 				slot.needs_build = true;
 				m_build_queue.push_back(index);
@@ -2129,6 +2172,7 @@ void RayTracing::NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memory_siz
 		auto& slot     = *m_slot_list[index];
 		slot.layout.clear();
 		slot.refit_seq = 0;
+		slot.replaced  = true;
 		if (!slot.needs_build) {
 			slot.needs_build = true;
 			m_build_queue.push_back(index);

@@ -256,6 +256,7 @@ private:
 		std::vector<std::array<uint32_t, 4>> layout;
 		uint32_t                     header_layout    = 0;
 		uint32_t                     host_table_index = UINT32_MAX;
+		bool                         replaced         = false;
 	};
 
 	struct Retired {
@@ -308,6 +309,7 @@ private:
 	void EvictSlot(uint32_t index);
 	void Defragment(std::vector<uint32_t>& moved);
 	bool RecordBuilds(const CommandRecorder& command);
+	bool RecordBuildBatch(const CommandRecorder& command, bool urgent_only, bool& gathered);
 	void ProcessReadback(Readback& readback);
 
 	bool              m_enabled = false;
