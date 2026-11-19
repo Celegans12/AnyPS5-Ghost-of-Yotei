@@ -74,6 +74,9 @@ struct ReadbackStats {
 	std::atomic<uint64_t> other_false_sharing {0};
 	std::atomic<uint64_t> cp_staged {0};
 	std::atomic<uint64_t> other_replayed {0};
+	std::atomic<uint64_t> other_dispatch_ns {0};
+	std::atomic<uint64_t> other_wait_ns {0};
+	std::atomic<uint64_t> other_release_ns {0};
 	std::atomic<bool>     line_overflow {false};
 	std::atomic<int64_t>  last_line {0};
 };
@@ -546,6 +549,9 @@ void BufferCache::LogReadbackSummary() {
 	const auto false_share = stats.other_false_sharing.exchange(0, std::memory_order_relaxed);
 	const auto staged      = stats.cp_staged.exchange(0, std::memory_order_relaxed);
 	const auto replayed    = stats.other_replayed.exchange(0, std::memory_order_relaxed);
+	const auto dispatch_ns = stats.other_dispatch_ns.exchange(0, std::memory_order_relaxed);
+	const auto wait_ns     = stats.other_wait_ns.exchange(0, std::memory_order_relaxed);
+	const auto release_ns  = stats.other_release_ns.exchange(0, std::memory_order_relaxed);
 	if (cp_reads + other_reads + staged + replayed == 0) {
 		return;
 	}
@@ -554,10 +560,12 @@ void BufferCache::LogReadbackSummary() {
 	    "[kyty-readback] summary of the last {:.0f} s: command processor {} readbacks in {:.3f} s ({} after the "
 	    "operations it is ordered after only, {:.3f} s waiting for them, {} operations not waited for), {} register "
 	    "tables read without a fault; other threads {} readbacks in {:.3f} s ({} of faulted reads on bytes the GPU "
-	    "wrote, {} on other bytes of a GPU written page, {} on other bytes replayed on the backing view without a readback){}\n",
+	    "wrote, {} on other bytes of a GPU written page, {} on other bytes replayed on the backing view without a readback; "
+	    "{:.3f} s handing them to the execution thread, {:.3f} s waiting for the GPU copy, {:.3f} s releasing them through "
+	    "the execution thread){}\n",
 	    seconds(static_cast<uint64_t>(now - last)), cp_reads, seconds(cp_ns), ordered, seconds(ordered_ns), not_waited,
-	    staged, other_reads, seconds(other_ns), gpu_bytes, false_share, replayed,
-	    stats.line_overflow.load(std::memory_order_relaxed) ? "; GPU line table overflowed" : ""));
+	    staged, other_reads, seconds(other_ns), gpu_bytes, false_share, replayed, seconds(dispatch_ns), seconds(wait_ns),
+	    seconds(release_ns), stats.line_overflow.load(std::memory_order_relaxed) ? "; GPU line table overflowed" : ""));
 }
 
 void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault,
@@ -579,6 +587,13 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 		stats.cp_ordered_ns.fetch_add(static_cast<uint64_t>(SteadyNs() - started), std::memory_order_relaxed);
 		stats.cp_not_waited.fetch_add(skipped, std::memory_order_relaxed);
 	}
+	auto&      split          = g_readback_stats;
+	const auto dispatch_start = SteadyNs();
+	const auto note_split     = [&](std::atomic<uint64_t>& counter, int64_t since) {
+		if (!command_processor) {
+			counter.fetch_add(static_cast<uint64_t>(SteadyNs() - since), std::memory_order_relaxed);
+		}
+	};
 	gpu.SendReadbackCommandSync([&] {
 		if (is_write && !IsRegionRegistered(vaddr, size)) {
 			return;
@@ -619,11 +634,15 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 			m_scheduler.Flush();
 		}
 	});
+	note_split(split.other_dispatch_ns, dispatch_start);
 	if (tick == 0) {
 		return;
 	}
+	const auto wait_start = SteadyNs();
 	if (queue_read.slot != nullptr) {
 		FinishReadbackQueueRead(queue_read);
+		note_split(split.other_wait_ns, wait_start);
+		const auto release_start = SteadyNs();
 		gpu.SendReadbackCommandSync([&] {
 			const auto own = std::find_if(m_inflight_readbacks.begin(), m_inflight_readbacks.end(),
 			                              [&](const InFlightReadback& readback) {
@@ -656,10 +675,14 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 				}
 			}
 		});
+		note_split(split.other_release_ns, release_start);
 	} else {
 		m_scheduler.GetMasterSemaphore().Wait(tick);
 		m_scheduler.WaitPriorityOperations(tick);
+		note_split(split.other_wait_ns, wait_start);
+		const auto release_start = SteadyNs();
 		gpu.SendReadbackCommandSync([&] { ReleaseReadback(vaddr, size, pages_begin, pages_end, tick, is_write); });
+		note_split(split.other_release_ns, release_start);
 	}
 }
 
