@@ -4,6 +4,7 @@
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
+#include "graphics/shader/recompiler/ir/passes/RayQueryResults.h"
 #include "graphics/shader/recompiler/ir/passes/RayQuerySource.h"
 
 #include <algorithm>
@@ -5689,6 +5690,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			for (auto* bvh: intersections) {
 				if (InLoop(program, bvh->Parent(), walk.header, walk.latch)) served.push_back(bvh);
 			}
+			if (RewriteResultsWalk(program, options, walk.header, walk.latch, served, result, site)) { ++result.sites; hypotheses.clear(); improvements.clear(); continue; }
 			if (const auto flags = MarkOracleWalk(served); flags != 0) {
 				LOGF("%s universal ray tracing: hash=0x%016llx answers %zu intersections from the host query (%s mode, %s source)\n",
 				     compute ? "CS" : "PS", static_cast<unsigned long long>(program.shader_hash), served.size(),
