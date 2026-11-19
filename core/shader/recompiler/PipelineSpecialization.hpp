@@ -68,6 +68,11 @@ inline bool AbsentRuntimeFormat() {
     return enabled;
 }
 
+inline bool PinnedRuntimeFormat() {
+    static const bool enabled = std::getenv("APS5_NO_PINNED_RUNTIME_FORMAT") == nullptr;
+    return enabled;
+}
+
 }
 
 }

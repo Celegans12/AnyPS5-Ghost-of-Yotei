@@ -161,6 +161,8 @@ static_assert(fieldCount<UniformFillPlan>() == 2, "UniformFillPlan changed: upda
 
 constexpr std::uint32_t FileMagic = 0x43535041u;
 constexpr std::uint32_t SubstituteMagic = 0x53425041u;
+constexpr std::uint32_t PinMagic = 0x4e495041u;
+constexpr std::uint64_t PinWordLimit = 1u << 16u;
 
 struct FileHeader {
     std::uint32_t magic;
@@ -1416,6 +1418,7 @@ constexpr std::string_view NeutralSwitches[] = {
     "APS5_NO_RESULT_MEMO",
     "APS5_RESULT_MEMO_SOURCE_MIB",
     "APS5_NO_UNDECLARED_CONSTANT_FILTER",
+    "APS5_NO_PINNED_RUNTIME_FORMAT",
     "APS5_TRACE_SPECIALIZATION",
     "APS5_NO_TABLE_RESOLUTION_REUSE",
     "APS5_NO_TABLE_SNAPSHOT_REUSE",
@@ -2073,6 +2076,8 @@ std::shared_ptr<BufferSubstituteTable> OpenSubstitutes(std::span<const std::uint
     auto& instance = store();
     if (!instance.Enabled()) return tables.emplace(name, std::make_shared<BufferSubstituteTable>(std::vector<BufferSubstitute>(slots), BufferSubstituteTable::Persist{})).first->second;
     const auto path = instance.Directory() / name;
+    auto pinsPath = path;
+    pinsPath.replace_extension(".pins");
     const auto keyHash = HashBytes(key);
     const auto read = [path, keyHash, slots] {
         std::vector<BufferSubstitute> table(slots);
@@ -2119,7 +2124,53 @@ std::shared_ptr<BufferSubstituteTable> OpenSubstitutes(std::span<const std::uint
         }
         if (!WriteFileAtomically(path, bytes)) std::fprintf(stderr, "[shader-disk-cache] cannot write buffer substitutes %s\n", path.string().c_str());
     };
-    return tables.emplace(name, std::make_shared<BufferSubstituteTable>(read(), std::move(persist))).first->second;
+    const auto readPins = [pinsPath, keyHash] {
+        std::vector<BufferSubstituteTable::Pin> pins;
+        std::vector<std::byte> file;
+        if (!ReadWholeFile(pinsPath, file)) return pins;
+        Reader reader(file);
+        std::uint32_t magic = 0, format = 0;
+        std::uint64_t source = 0, hash = 0, count = 0;
+        reader.Value(magic);
+        reader.Value(format);
+        reader.Value(source);
+        reader.Value(hash);
+        reader.Value(count);
+        if (!reader.Ok() || magic != PinMagic || format != FormatVersion || source != SourceVersion() || hash != keyHash || count > BufferSubstituteTable::MaxPins) return pins;
+        std::vector<BufferSubstituteTable::Pin> decoded(count);
+        for (auto& pin : decoded) {
+            std::uint64_t words = 0;
+            reader.Value(words);
+            if (!reader.Ok() || words == 0u || words > PinWordLimit) return pins;
+            pin.resize(words);
+            for (auto& word : pin) reader.Value(word);
+        }
+        if (!reader.Done()) return pins;
+        return decoded;
+    };
+    auto persistPins = [pinsPath, keyHash, readPins](const std::vector<BufferSubstituteTable::Pin>& learned) {
+        static std::mutex mutex;
+        std::lock_guard lock(mutex);
+        auto merged = readPins();
+        for (const auto& pin : learned) {
+            if (merged.size() >= BufferSubstituteTable::MaxPins) break;
+            if (pin.empty() || pin.size() > PinWordLimit || std::find(merged.begin(), merged.end(), pin) != merged.end()) continue;
+            merged.push_back(pin);
+        }
+        std::vector<std::byte> bytes;
+        Writer writer(bytes);
+        writer.Value(PinMagic);
+        writer.Value(FormatVersion);
+        writer.Value(SourceVersion());
+        writer.Value(keyHash);
+        writer.Value<std::uint64_t>(merged.size());
+        for (const auto& pin : merged) {
+            writer.Value<std::uint64_t>(pin.size());
+            for (const auto word : pin) writer.Value(word);
+        }
+        if (!WriteFileAtomically(pinsPath, bytes)) std::fprintf(stderr, "[shader-disk-cache] cannot write run-time-format pins %s\n", pinsPath.string().c_str());
+    };
+    return tables.emplace(name, std::make_shared<BufferSubstituteTable>(read(), std::move(persist), readPins(), std::move(persistPins))).first->second;
 }
 
 void Shutdown() {
