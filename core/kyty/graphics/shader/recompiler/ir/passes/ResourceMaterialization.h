@@ -55,8 +55,19 @@ struct ResourceSpecialization {
 
 ResourcePlan ExtractResourcePlan(const Program& program);
 
-std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan);
-bool                 LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
+struct EncodeFailure {
+	enum class Reason : uint8_t { None, ValueType, UnknownInstruction, PhiBlock };
+
+	Reason      reason         = Reason::None;
+	uint32_t    type           = 0;
+	bool        in_instruction = false;
+	ValueOpcode opcode         = ValueOpcode::Void;
+
+	[[nodiscard]] bool Failed() const { return reason != Reason::None; }
+};
+
+bool SaveResourcePlan(const ResourcePlan& plan, std::vector<uint8_t>& bytes, EncodeFailure& failure);
+bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 
 void SetComputeIndirectFloors(size_t keys, size_t images);
 

@@ -49,6 +49,7 @@ void PrecompileLog(fmt::format_string<Args...> format, Args&&... args) {
 struct Estimate {
 	uint32_t pending  = 0;
 	uint64_t finished = 0;
+	uint64_t helpers_done = 0;
 	uint32_t shaders  = 0;
 	uint64_t shaders_finished = 0;
 	uint32_t running  = 0;
@@ -223,7 +224,8 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 		const double   graphics = backlog.pipelines * backlog.pipeline_seconds / threads;
 		const double   modules  = backlog.modules * backlog.module_seconds / threads;
 		e.pending        = jobs + backlog.pipelines;
-		e.finished       = stats.done + stats.failed + stats.withdrawn + backlog.pipelines_done;
+		e.helpers_done   = stats.done + stats.failed + stats.withdrawn;
+		e.finished       = e.helpers_done + backlog.pipelines_done;
 		e.shaders        = backlog.modules;
 		e.shaders_finished = backlog.modules_done;
 		e.running        = backlog.running;
@@ -258,7 +260,14 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 	bool                                   stalled    = false;
 	Clock::time_point                      stall_since;
 	Clock::time_point                      stall_logged;
+#if defined(ANYPS5_KYTY)
+	uint64_t                               stall_helpers = 0;
+	uint64_t                               stall_created = 0;
+	uint64_t                               stall_modules = 0;
+	uint64_t                               stall_waits   = 0;
+#else
 	uint64_t                               stall_base = 0;
+#endif
 	bool                                   shown       = false;
 	uint64_t                               notice_base = 0;
 	Clock::time_point                      notice_shown_at;
@@ -309,14 +318,40 @@ void PipelineCache::Precompile(const std::stop_token& stop) {
 			stalled      = true;
 			stall_since  = stall.since;
 			stall_logged = now;
-			stall_base   = e.finished;
+#if defined(ANYPS5_KYTY)
+			stall_helpers = e.helpers_done;
+			stall_created = m_pipelines_created.load(std::memory_order_relaxed);
+			stall_modules = m_chain_compiled.load(std::memory_order_relaxed);
+			{
+				std::scoped_lock lock(m_stall_mutex);
+				stall_waits = m_stall_stats.count;
+			}
+#else
+			stall_base = e.finished;
+#endif
 			PrecompileLog("Pipeline stall: the game has waited {:.1f} s for the pipelines the driver compiles "
 			              "({} left)",
 			              seconds(now - stall_since), left);
 		} else if (stalled && stall.threads == 0 && now - stall.ended >= StallGap) {
 			stalled = false;
+#if defined(ANYPS5_KYTY)
+			const uint64_t helpers = e.helpers_done - std::min(stall_helpers, e.helpers_done);
+			const uint64_t created = m_pipelines_created.load(std::memory_order_relaxed) - stall_created;
+			const uint64_t modules = m_chain_compiled.load(std::memory_order_relaxed) - stall_modules;
+			uint64_t       waits   = 0;
+			{
+				std::scoped_lock lock(m_stall_mutex);
+				waits = m_stall_stats.count - stall_waits;
+			}
+			PrecompileLog("Pipeline stall: the game goes on after {:.1f} s ({} compiles finished meanwhile: {} "
+			              "pipelines created by the driver, {} shader modules built by the chains, {} jobs done "
+			              "by the helpers; {} waits ended)",
+			              seconds(stall.ended - stall_since), created + modules + helpers, created, modules,
+			              helpers, waits);
+#else
 			PrecompileLog("Pipeline stall: the game goes on after {:.1f} s ({} pipelines compiled meanwhile)",
 			              seconds(stall.ended - stall_since), e.finished - stall_base);
+#endif
 		} else if (stalled && now - stall_logged >= LogPeriod) {
 			stall_logged = now;
 			PrecompileLog("Pipeline stall: {} pipelines left at {:.0f} s", left, seconds(now - stall_since));

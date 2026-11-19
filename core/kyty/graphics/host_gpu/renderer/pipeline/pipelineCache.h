@@ -837,6 +837,12 @@ void DescribeDriverPipelineCreation(std::string& report);
 
 [[nodiscard]] std::vector<uint8_t> EncodeComputeModule(const ShaderModule&          module,
                                                        const std::vector<uint32_t>& spirv);
+[[nodiscard]] bool EncodeModuleRecord(ShaderType stage, uint64_t hash, uint32_t user_data_count,
+                                      const std::vector<uint32_t>&              static_state,
+                                      const ShaderRecompiler::IR::ResourcePlan& plan,
+                                      const ShaderModule& module, const std::vector<uint32_t>& spirv,
+                                      const std::vector<uint32_t>& plain_spirv,
+                                      std::vector<uint8_t>&        record);
 bool DecodeComputeModule(std::span<const uint8_t> bytes, ShaderModule& module,
                          std::vector<uint32_t>& spirv);
 

@@ -2785,18 +2785,20 @@ void IoValues(Writer& writer, const std::list<Inst>& values, const ControlPhis& 
 		IoAll(writer, inst.GetOpcode(), inst.Flags<uint64_t>());
 	}
 	for (const auto& inst: values) {
+		writer.owner = &inst;
 		if (inst.GetOpcode() != ValueOpcode::Phi) {
 			for (size_t index = 0; index < inst.NumArgs(); ++index) IoAll(writer, inst.Arg(index));
 			continue;
 		}
 		std::vector<Value> args;
 		for (size_t index = 0; index < inst.NumArgs(); ++index) {
-			EXIT_IF(inst.PhiBlock(index) != nullptr);
+			if (inst.PhiBlock(index) != nullptr) writer.Fail(EncodeFailure::Reason::PhiBlock, 0u);
 			args.push_back(inst.Arg(index));
 		}
 		const auto found = phis.find(&inst);
 		IoAll(writer, args, found != phis.end() ? found->second : std::vector<uint32_t> {});
 	}
+	writer.owner = nullptr;
 }
 
 void IoValues(Reader& reader, std::list<Inst>& values, ControlPhis& phis) {
@@ -2843,10 +2845,16 @@ template <class S, class P> void IoPlan(S& io, P& plan) {
 
 }
 
-std::vector<uint8_t> SaveResourcePlan(const ResourcePlan& plan) {
+bool SaveResourcePlan(const ResourcePlan& plan, std::vector<uint8_t>& bytes, EncodeFailure& failure) {
 	Writer writer;
 	IoPlan(writer, plan);
-	return std::move(writer.bytes);
+	failure = writer.failure;
+	if (failure.Failed()) {
+		bytes.clear();
+		return false;
+	}
+	bytes = std::move(writer.bytes);
+	return true;
 }
 
 bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan) {

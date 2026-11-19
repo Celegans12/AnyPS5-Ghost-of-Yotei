@@ -22,10 +22,20 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 struct Writer {
 	std::vector<uint8_t>                      bytes;
 	std::unordered_map<const Inst*, uint32_t> index;
+	EncodeFailure                             failure;
+	const Inst*                               owner = nullptr;
 
 	void Raw(const void* data, size_t size) {
 		const auto* begin = static_cast<const uint8_t*>(data);
 		bytes.insert(bytes.end(), begin, begin + size);
+	}
+
+	void Fail(EncodeFailure::Reason reason, uint32_t type) {
+		if (failure.Failed()) return;
+		failure.reason         = reason;
+		failure.type           = type;
+		failure.in_instruction = owner != nullptr;
+		failure.opcode         = owner != nullptr ? owner->GetOpcode() : ValueOpcode::Void;
 	}
 };
 
@@ -61,7 +71,12 @@ inline void IoValue(Writer& writer, const Value& value) {
 	auto     type = Type::Opaque;
 	uint64_t bits = 0;
 	if (const auto* inst = value.TryInstruction()) {
-		bits = writer.index.at(inst);
+		if (const auto found = writer.index.find(inst); found != writer.index.end()) {
+			bits = found->second;
+		} else {
+			writer.Fail(EncodeFailure::Reason::UnknownInstruction, static_cast<uint32_t>(Type::Opaque));
+			type = Type::Void;
+		}
 	} else {
 		type = value.GetType();
 		switch (type) {
@@ -75,7 +90,10 @@ inline void IoValue(Writer& writer, const Value& value) {
 			case Type::U64: bits = value.U64(); break;
 			case Type::F16: bits = value.F16Bits(); break;
 			case Type::F32: bits = std::bit_cast<uint32_t>(value.F32Value()); break;
-			default: EXIT("value type %u has no cache encoding\n", static_cast<uint32_t>(type));
+			default:
+				writer.Fail(EncodeFailure::Reason::ValueType, static_cast<uint32_t>(type));
+				type = Type::Void;
+				break;
 		}
 	}
 	IoAll(writer, type, bits);

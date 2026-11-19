@@ -34,6 +34,17 @@ target_include_directories(kyty_shim_shader_cache_policy_tests PRIVATE ${CMAKE_C
 add_test(NAME kyty_shim_shader_cache_policy COMMAND kyty_shim_shader_cache_policy_tests)
 set_tests_properties(kyty_shim_shader_cache_policy PROPERTIES TIMEOUT 20)
 
+add_test_executable(kyty_shim_shader_store_encode_tests ${CMAKE_CURRENT_SOURCE_DIR}/ShaderStoreEncode.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_shader_store_encode_tests PRIVATE ${LIBS_INCLUDE_DIR})
+configure_host_test_executable(kyty_shim_shader_store_encode_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_shader_store_encode_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_shader_store_encode_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_shader_store_encode COMMAND kyty_shim_shader_store_encode_tests)
+set_tests_properties(kyty_shim_shader_store_encode PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_shader_store_encode: ok"
+        FAIL_REGULAR_EXPRESSION "terminate called")
+
 add_test_executable(kyty_shim_presentation_upscale_tests ${CMAKE_CURRENT_SOURCE_DIR}/PresentationUpscale.cpp)
 configure_host_test_executable(kyty_shim_presentation_upscale_tests)
 target_include_directories(kyty_shim_presentation_upscale_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/libs)
