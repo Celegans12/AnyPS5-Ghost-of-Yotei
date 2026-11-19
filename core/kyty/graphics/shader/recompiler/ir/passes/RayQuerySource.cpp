@@ -271,6 +271,13 @@ Value Incoming(const Inst& phi, const Block* from) {
 using FForm = std::array<uint32_t, 7>;
 using World = std::array<std::vector<Value>, 6>;
 
+struct Blas {
+	uint32_t address = 0;
+	bool     packed  = false;
+};
+
+std::optional<Blas> BlasOf(Store& store, uint32_t form);
+
 class Evaluator {
 public:
 	Evaluator(const Program& program, const Order& order, Store& store, Value active)
@@ -452,9 +459,9 @@ public:
 		if (!la || m_store.A(*la).kind != Kind::Load || m_store.A(*la).args[1] != 4) return false;
 		const auto next = m_store.Add(static_cast<uint32_t>(m_store.A(*la).args[0]), m_store.Constant(64, 4));
 		auto       word = high;
-		if (const auto* cut = m_store.OpOf(high, static_cast<uint64_t>(ValueOpcode::BitwiseAnd32));
-		    cut != nullptr && cut->args.size() == 3 && (cut->args[2] & Literal) != 0 && (cut->args[1] & Literal) == 0) {
-			word = static_cast<uint32_t>(cut->args[1]);
+		if (const auto* cut = m_store.OpOf(high, static_cast<uint64_t>(ValueOpcode::BitwiseAnd32)); cut != nullptr && cut->args.size() == 3) {
+			if ((cut->args[2] & Literal) != 0 && (cut->args[1] & Literal) == 0) word = static_cast<uint32_t>(cut->args[1]);
+			if ((cut->args[1] & Literal) != 0 && (cut->args[2] & Literal) == 0) word = static_cast<uint32_t>(cut->args[2]);
 		}
 		const auto ha = m_store.AtomOf(word);
 		return ha && m_store.A(*ha).kind == Kind::Load && m_store.A(*ha).args[1] == 4 && m_store.A(*ha).args[0] == next;
@@ -513,6 +520,9 @@ public:
 			for (const auto carried: Unroll(form)) {
 				if (carried != form) Append(result, Bases(carried, depth + 1));
 			}
+		} else if (a.kind == Kind::Join && a.width == 64) {
+			const auto address = m_store.Scale(form, 8);
+			if (BlasOf(m_store, address)) Append(result, {address});
 		}
 		return result;
 	}
@@ -557,6 +567,18 @@ public:
 		if (depth > 48) return {};
 		for (uint32_t k = 0; k < 6; ++k) {
 			if (std::ranges::find(world[k], value) != world[k].end()) return {Single(k, One)};
+		}
+		if (const auto* read = value.TryInstruction();
+		    read != nullptr && (read->GetOpcode() == ValueOpcode::ReadConstBuffer || read->GetOpcode() == ValueOpcode::LoadAddressU32)) {
+			const auto words = Word(value);
+			for (uint32_t k = 0; k < 6 && words.size() == 1; ++k) {
+				for (const auto other: world[k]) {
+					const auto* same = other.TryInstruction();
+					if (same == nullptr || same == read || same->GetOpcode() != read->GetOpcode()) continue;
+					const auto theirs = Word(other);
+					if (theirs.size() == 1 && theirs.front() == words.front()) return {Single(k, One)};
+				}
+			}
 		}
 		if (value.IsImmediate()) {
 			const auto bits = value.GetType() == Type::F32 ? std::bit_cast<uint32_t>(value.F32Value())
@@ -668,6 +690,11 @@ private:
 			AddFact(inst->Arg(1));
 		} else if (inst->GetOpcode() == ValueOpcode::ConditionRef) {
 			AddFact(inst->Arg(0));
+		} else if (inst->GetOpcode() == ValueOpcode::Phi && inst->Parent() != nullptr && inst->Parent()->terminator.loop_header) {
+			const auto at = m_order.Of(inst->Parent());
+			for (size_t index = 0; index < inst->NumArgs(); ++index) {
+				if (m_order.Of(inst->PhiBlock(index)) < at) AddFact(inst->Arg(index));
+			}
 		}
 	}
 
@@ -795,8 +822,11 @@ private:
 		switch (inst->GetOpcode()) {
 			case ValueOpcode::IAdd32: {
 				const auto left = Lift(inst->Arg(0), depth + 1, leaves), right = Lift(inst->Arg(1), depth + 1, leaves);
-				for (const auto& a: left) {
-					for (const auto& b: right) {
+				for (size_t diagonal = 0; diagonal + 1 < left.size() + right.size(); ++diagonal) {
+					for (size_t i = 0; i <= diagonal && i < left.size(); ++i) {
+						if (diagonal - i >= right.size()) continue;
+						const auto& a = left[i];
+						const auto& b = right[diagonal - i];
 						LiftResult sum {m_store.Add(a.form, b.form), m_store.Add(a.expected, b.expected), a.adds, a.products};
 						sum.adds.insert(sum.adds.end(), b.adds.begin(), b.adds.end());
 						sum.products.insert(sum.products.end(), b.products.begin(), b.products.end());
@@ -806,6 +836,23 @@ private:
 					}
 				}
 				return result;
+			}
+			case ValueOpcode::ShiftLeftLogical32: {
+				const auto shift = ImmediateU32(inst->Arg(1));
+				if (!shift || *shift == 0 || *shift >= 32) break;
+				const auto right = static_cast<uint64_t>(ValueOpcode::ShiftRightLogical32);
+				for (const auto word: Word(inst->Arg(0))) {
+					auto        inner = static_cast<uint64_t>(word);
+					uint32_t    total = 32u - *shift;
+					const auto* cut   = m_store.OpOf(word, right);
+					if (cut != nullptr && cut->args.size() == 3 && (cut->args[2] & Literal) != 0 && (cut->args[1] & Literal) == 0 &&
+					    (cut->args[2] & ~Literal) + total < 32u) {
+						inner = cut->args[1];
+						total += static_cast<uint32_t>(cut->args[2] & ~Literal);
+					}
+					result.push_back({m_store.Scale(m_store.Widen(word), 1ull << *shift), m_store.Op(32, {right, inner, Literal | total}), {}});
+				}
+				break;
 			}
 			case ValueOpcode::IMul32:
 				for (uint32_t side = 0; side < 2; ++side) {
@@ -1109,11 +1156,6 @@ std::optional<Record> RecordOf(Store& store, uint32_t address, uint32_t header) 
 	return record;
 }
 
-struct Blas {
-	uint32_t address = 0;
-	bool     packed  = false;
-};
-
 std::optional<Blas> BlasOf(Store& store, uint32_t form) {
 	if (const auto atom = store.AtomOf(form)) {
 		const auto& a = store.A(*atom);
@@ -1126,8 +1168,11 @@ std::optional<Blas> BlasOf(Store& store, uint32_t form) {
 	if (join.kind != Kind::Join) return std::nullopt;
 	const auto low  = store.AtomOf(static_cast<uint32_t>(join.args[0]));
 	const auto* cut = store.OpOf(static_cast<uint32_t>(join.args[1]), static_cast<uint64_t>(ValueOpcode::BitwiseAnd32));
-	if (!low || cut == nullptr || cut->args.size() != 3 || cut->args[2] != (Literal | 0x3fffffu)) return std::nullopt;
-	const auto high = store.AtomOf(static_cast<uint32_t>(cut->args[1]));
+	if (!low || cut == nullptr || cut->args.size() != 3) return std::nullopt;
+	const bool mask_last = cut->args[2] == (Literal | 0x3fffffu) && (cut->args[1] & Literal) == 0;
+	const bool mask_first = cut->args[1] == (Literal | 0x3fffffu) && (cut->args[2] & Literal) == 0;
+	if (!mask_last && !mask_first) return std::nullopt;
+	const auto high = store.AtomOf(static_cast<uint32_t>(cut->args[mask_last ? 1 : 2]));
 	const auto& l   = store.A(*low);
 	if (!high || l.kind != Kind::Load || l.args[1] != 4) return std::nullopt;
 	const auto& h = store.A(*high);
@@ -1568,15 +1613,21 @@ bool Reach(const Program& program, Block* header, std::vector<std::pair<uint32_t
 	const auto entries = header->ImmPredecessors();
 	if (entries.size() != 2 || std::ranges::find(entries, latch) == entries.end()) return false;
 	uint32_t begin = UINT32_MAX;
+	uint32_t last  = 0;
 	for (auto at = BlockIndex(program, header); at <= BlockIndex(program, latch) && at < program.blocks.size(); ++at) {
 		const auto* block = program.blocks[at];
-		if (block->end_pc > block->start_pc) begin = std::min(begin, block->start_pc);
+		if (block->end_pc > block->start_pc) {
+			begin = std::min(begin, block->start_pc);
+			last  = std::max(last, block->end_pc);
+		}
 	}
-	const auto end = header->terminator.merge_block->start_pc;
+	const auto* merge = header->terminator.merge_block;
+	const auto  end   = merge->end_pc > merge->start_pc ? merge->start_pc : last;
 	if (begin == UINT32_MAX || end <= begin) return false;
 	reach.emplace_back(begin, end);
 	return true;
 }
+
 
 OracleWalks Refuse(const char* reason, uint32_t detail = 0) {
 	OracleWalks walks;
@@ -1692,6 +1743,25 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 		for (uint32_t k = 0; k < 6; ++k) {
 			const auto current = ev.Strip(top->address->Arg(top->words + 1 + k));
 			world[k].push_back(current);
+			std::vector<Value> leaves {current};
+			for (size_t at = 0; at < leaves.size() && at < 16; ++at) {
+				const auto* inst = leaves[at].Resolve().TryInstruction();
+				if (inst == nullptr) continue;
+				const auto op = inst->GetOpcode();
+				std::vector<Value> next;
+				if (op == ValueOpcode::SelectU32 || op == ValueOpcode::SelectF32) {
+					next = {inst->Arg(1), inst->Arg(2)};
+				} else if (op == ValueOpcode::BitCastF32U32 || op == ValueOpcode::BitCastU32F32 || op == ValueOpcode::FPNeg32 ||
+				           op == ValueOpcode::ReadFirstLane) {
+					next = {inst->Arg(0)};
+				}
+				for (auto value: next) {
+					value = value.Resolve();
+					if (value.IsImmediate() || std::ranges::find(world[k], value) != world[k].end()) continue;
+					world[k].push_back(value);
+					leaves.push_back(value);
+				}
+			}
 			const auto* phi = current.TryInstruction();
 			if (phi == nullptr || !order.Carried(*phi)) continue;
 			for (size_t index = 0; index < phi->NumArgs(); ++index) {
