@@ -101,21 +101,23 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
     endif()
     set_target_properties(libSceAgcDriver PROPERTIES CXX_EXTENSIONS OFF)
     add_shader_recompiler(shader_recompiler_agc_driver libc)
-    add_test_executable(kyty_rt_probe KytyShim/tools/RtProbe.cpp KytyShim/tools/RtProbeCache.cpp KytyShim/tools/RtSurvey.cpp KytyShim/src/Log.cpp)
-    add_dependencies(kyty_rt_probe agc_trace_revision)
-    target_include_directories(kyty_rt_probe PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib ${CMAKE_CURRENT_BINARY_DIR}/generated)
-    target_include_directories(kyty_rt_probe SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
-    target_link_libraries(kyty_rt_probe PRIVATE Kyty::gpu)
-    if(WIN32 AND NOT CMAKE_VERSION VERSION_LESS 3.21)
-        add_custom_command(TARGET kyty_rt_probe POST_BUILD
-                COMMAND "${CMAKE_COMMAND}" "-DDEST_DIR=$<TARGET_FILE_DIR:kyty_rt_probe>"
-                -P "${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeFiles.cmake" "$<TARGET_FILE:libc>"
-                VERBATIM)
-    elseif(NOT WIN32)
-        target_link_libraries(kyty_rt_probe PRIVATE libc)
+    if(NOT ANYPS5_KYTY_DLL)
+        add_test_executable(kyty_rt_probe KytyShim/tools/RtProbe.cpp KytyShim/tools/RtProbeCache.cpp KytyShim/tools/RtSurvey.cpp KytyShim/src/Log.cpp)
+        add_dependencies(kyty_rt_probe agc_trace_revision)
+        target_include_directories(kyty_rt_probe PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib ${CMAKE_CURRENT_BINARY_DIR}/generated)
+        target_include_directories(kyty_rt_probe SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
+        target_link_libraries(kyty_rt_probe PRIVATE Kyty::gpu)
+        if(WIN32 AND NOT CMAKE_VERSION VERSION_LESS 3.21)
+            add_custom_command(TARGET kyty_rt_probe POST_BUILD
+                    COMMAND "${CMAKE_COMMAND}" "-DDEST_DIR=$<TARGET_FILE_DIR:kyty_rt_probe>"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeFiles.cmake" "$<TARGET_FILE:libc>"
+                    VERBATIM)
+        elseif(NOT WIN32)
+            target_link_libraries(kyty_rt_probe PRIVATE libc)
+        endif()
+        set_target_properties(kyty_rt_probe PROPERTIES CXX_EXTENSIONS OFF)
+        target_compile_definitions(kyty_rt_probe PRIVATE ANYPS5_KYTY_RT_PROBE)
     endif()
-    set_target_properties(kyty_rt_probe PROPERTIES CXX_EXTENSIONS OFF)
-    target_compile_definitions(kyty_rt_probe PRIVATE ANYPS5_KYTY_RT_PROBE)
     if(BUILD_TESTING)
         add_test_executable(kyty_shim_entry_tests
                 KytyShim/src/EntryTests.cpp
@@ -143,13 +145,15 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         configure_host_test_executable(kyty_shim_rt_probe_cache_tests)
         add_test(NAME kyty_shim_rt_probe_cache COMMAND kyty_shim_rt_probe_cache_tests)
         set_tests_properties(kyty_shim_rt_probe_cache PROPERTIES TIMEOUT 20)
-        add_dependencies(kyty_shim_rt_probe_cache_tests kyty_rt_probe)
-        add_test(NAME kyty_shim_rt_probe_export COMMAND "${CMAKE_COMMAND}"
-                "-DDIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/rt probe export"
-                -P "${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/tests/RtProbeExport.cmake"
-                $<TARGET_FILE:kyty_shim_rt_probe_cache_tests> $<TARGET_FILE:kyty_rt_probe>)
-        set_tests_properties(kyty_shim_rt_probe_export PROPERTIES TIMEOUT 30)
-        if(WIN32)
+        if(NOT ANYPS5_KYTY_DLL)
+            add_dependencies(kyty_shim_rt_probe_cache_tests kyty_rt_probe)
+            add_test(NAME kyty_shim_rt_probe_export COMMAND "${CMAKE_COMMAND}"
+                    "-DDIRECTORY=${CMAKE_CURRENT_BINARY_DIR}/rt probe export"
+                    -P "${CMAKE_CURRENT_SOURCE_DIR}/KytyShim/tests/RtProbeExport.cmake"
+                    $<TARGET_FILE:kyty_shim_rt_probe_cache_tests> $<TARGET_FILE:kyty_rt_probe>)
+            set_tests_properties(kyty_shim_rt_probe_export PROPERTIES TIMEOUT 30)
+        endif()
+        if(WIN32 AND NOT ANYPS5_KYTY_DLL)
             set_tests_properties(kyty_shim_rt_probe_export PROPERTIES ENVIRONMENT_MODIFICATION
                     "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libkernel>")
         endif()
