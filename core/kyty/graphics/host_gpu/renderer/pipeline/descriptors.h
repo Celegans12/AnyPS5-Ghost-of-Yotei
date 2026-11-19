@@ -112,7 +112,7 @@ struct ImageTableFill {
 	uint32_t first_slot = 0;
 };
 
-[[nodiscard]] bool TableDescriptorWrites();
+[[nodiscard]] bool TableDescriptorWrites(vk::DriverId driver);
 
 void AppendImageTableGaps(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables,
                           std::vector<vk::WriteDescriptorSet>& gap_writes);

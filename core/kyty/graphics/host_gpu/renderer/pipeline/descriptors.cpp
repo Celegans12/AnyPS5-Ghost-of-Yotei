@@ -54,18 +54,25 @@ using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
 
 }
 
-bool TableDescriptorWrites() {
-	static const bool enabled = [] {
+bool TableDescriptorWrites(vk::DriverId driver) {
+	enum class Forced { None, Writes, Copies };
+	static const Forced forced = [] {
 		const char* value = std::getenv("KYTY_TABLE_DESCRIPTOR_WRITES");
-		if (value == nullptr || value[0] == '\0' || std::string_view(value) == "1") {
-			return true;
+		if (value == nullptr || value[0] == '\0') {
+			return Forced::None;
+		}
+		if (std::string_view(value) == "1") {
+			return Forced::Writes;
 		}
 		if (std::string_view(value) != "0") {
 			EXIT("invalid KYTY_TABLE_DESCRIPTOR_WRITES: %s (0 or 1)\n", value);
 		}
-		return false;
+		return Forced::Copies;
 	}();
-	return enabled;
+	if (forced == Forced::None) {
+		return driver == vk::DriverId::eMesaRadv;
+	}
+	return forced == Forced::Writes;
 }
 
 vk::DescriptorType NativeDescriptorType(BindingKind kind) {
@@ -3001,7 +3008,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_slot_set_writes.clear();
 	m_table_fills.clear();
 	m_table_writes.clear();
-	const bool fill_writes = TableDescriptorWrites();
+	const bool fill_writes = TableDescriptorWrites(m_context.GetGraphics().driver_id);
 	m_commit_capture_ok = m_commit_capture != nullptr && pipeline.uses_push_descriptors;
 	m_commit_capture_kinds.clear();
 	size_t image_cursor = 0;

@@ -423,6 +423,18 @@ void CheckLiveSlots() {
 	      "live slots: every slot proven alive");
 }
 
+constexpr std::array DefaultDrivers {vk::DriverId::eMesaRadv, vk::DriverId::eNvidiaProprietary,
+                                     vk::DriverId::eAmdProprietary, vk::DriverId::eMesaLlvmpipe,
+                                     vk::DriverId::eMoltenvk};
+
+void CheckDriverDefault(const std::string& what) {
+	for (const auto driver: DefaultDrivers) {
+		const bool expected = driver == vk::DriverId::eMesaRadv;
+		Check(TableDescriptorWrites(driver) == expected, what + ": tables are " + (expected ? "written" : "copied") +
+		                                                     " on " + vk::to_string(driver));
+	}
+}
+
 int HostTests() {
 	CheckGaps();
 	CheckFills();
@@ -432,8 +444,17 @@ int HostTests() {
 	CheckLiveElements();
 	CheckLiveSlots();
 	if (std::getenv("KYTY_TABLE_DESCRIPTOR_WRITES") == nullptr) {
-		Check(TableDescriptorWrites(), "KYTY_TABLE_DESCRIPTOR_WRITES unset: tables are written");
+		CheckDriverDefault("KYTY_TABLE_DESCRIPTOR_WRITES unset");
 	}
+	return Finish();
+}
+
+int DefaultSwitch(const char* expected) {
+	g_name            = "kyty_shim_descriptor_tables_switch";
+	const char* value = std::getenv("KYTY_TABLE_DESCRIPTOR_WRITES");
+	Check(value != nullptr && std::strcmp(value, expected) == 0,
+	      std::string("run with KYTY_TABLE_DESCRIPTOR_WRITES='") + expected + "'");
+	CheckDriverDefault(std::string("KYTY_TABLE_DESCRIPTOR_WRITES='") + expected + "'");
 	return Finish();
 }
 
@@ -442,7 +463,10 @@ int WritesSwitch(const char* expected) {
 	const char* value = std::getenv("KYTY_TABLE_DESCRIPTOR_WRITES");
 	Check(value != nullptr && std::strcmp(value, expected) == 0,
 	      std::string("run with KYTY_TABLE_DESCRIPTOR_WRITES='") + expected + "'");
-	Check(TableDescriptorWrites(), std::string("KYTY_TABLE_DESCRIPTOR_WRITES='") + expected + "': tables are written");
+	for (const auto driver: DefaultDrivers) {
+		Check(TableDescriptorWrites(driver), std::string("KYTY_TABLE_DESCRIPTOR_WRITES='") + expected +
+		                                         "': tables are written on " + vk::to_string(driver));
+	}
 	return Finish();
 }
 
@@ -450,8 +474,11 @@ int CopiesSwitch() {
 	g_name            = "kyty_shim_descriptor_tables_copies";
 	const char* value = std::getenv("KYTY_TABLE_DESCRIPTOR_WRITES");
 	Check(value != nullptr && std::strcmp(value, "0") == 0, "run with KYTY_TABLE_DESCRIPTOR_WRITES=0");
-	const bool writes = TableDescriptorWrites();
-	Check(!writes, "KYTY_TABLE_DESCRIPTOR_WRITES=0: tables are copied");
+	for (const auto driver: DefaultDrivers) {
+		Check(!TableDescriptorWrites(driver),
+		      "KYTY_TABLE_DESCRIPTOR_WRITES=0: tables are copied on " + vk::to_string(driver));
+	}
+	const bool writes = TableDescriptorWrites(vk::DriverId::eMesaRadv);
 	CheckCopyMode(writes);
 	return Finish();
 }
@@ -459,7 +486,7 @@ int CopiesSwitch() {
 int BadSwitch() {
 	g_name            = "kyty_shim_descriptor_tables_bad";
 	const char* value  = std::getenv("KYTY_TABLE_DESCRIPTOR_WRITES");
-	const bool  writes = TableDescriptorWrites();
+	const bool  writes = TableDescriptorWrites(vk::DriverId::eMesaRadv);
 	std::fprintf(stderr, "%s: KYTY_TABLE_DESCRIPTOR_WRITES=%s did not stop (read as %d)\n", g_name,
 	             value == nullptr ? "(unset)" : value, writes ? 1 : 0);
 	return 1;
@@ -992,7 +1019,7 @@ int main(int argc, char** argv) {
 	if (argc > 1 && std::strcmp(argv[1], "draw") == 0) return DrawTables();
 	if (argc > 1 && std::strcmp(argv[1], "copies") == 0) return CopiesSwitch();
 	if (argc > 1 && std::strcmp(argv[1], "bad") == 0) return BadSwitch();
-	if (argc > 1 && std::strcmp(argv[1], "empty") == 0) return WritesSwitch("");
+	if (argc > 1 && std::strcmp(argv[1], "empty") == 0) return DefaultSwitch("");
 	if (argc > 1 && std::strcmp(argv[1], "one") == 0) return WritesSwitch("1");
 	return HostTests();
 }
