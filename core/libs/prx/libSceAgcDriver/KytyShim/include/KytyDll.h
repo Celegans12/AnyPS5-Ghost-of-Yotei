@@ -229,6 +229,14 @@ typedef struct KytyDllApi {
 
 typedef KytyDllStatus (*KytyDllCreateFunction)(const KytyDllHost* host, const KytyDllApi** api);
 
+static inline bool KytyDllHostMatches(const KytyDllHost* host) {
+    return host != NULL && host->abi_version == KYTY_DLL_ABI_VERSION && host->size == sizeof(KytyDllHost);
+}
+
+static inline bool KytyDllApiMatches(const KytyDllApi* api) {
+    return api != NULL && api->abi_version == KYTY_DLL_ABI_VERSION && api->size == sizeof(KytyDllApi);
+}
+
 #ifdef __cplusplus
 }
 #endif

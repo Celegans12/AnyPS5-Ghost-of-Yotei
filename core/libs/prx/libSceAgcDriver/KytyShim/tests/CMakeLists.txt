@@ -4,6 +4,17 @@ target_include_directories(kyty_shim_replay_sampling_tests PRIVATE ${CMAKE_CURRE
 add_test(NAME kyty_shim_replay_sampling COMMAND kyty_shim_replay_sampling_tests)
 set_tests_properties(kyty_shim_replay_sampling PROPERTIES TIMEOUT 20)
 
+add_test_executable(kyty_shim_dll_abi_tests ${CMAKE_CURRENT_SOURCE_DIR}/DllAbi.cpp)
+configure_host_test_executable(kyty_shim_dll_abi_tests)
+target_include_directories(kyty_shim_dll_abi_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+if(ANYPS5_KYTY_DLL)
+    add_dependencies(kyty_shim_dll_abi_tests kyty_gpu)
+    add_test(NAME kyty_shim_dll_abi COMMAND kyty_shim_dll_abi_tests "${CMAKE_BINARY_DIR}/core/kyty/kyty_gpu.prx")
+else()
+    add_test(NAME kyty_shim_dll_abi COMMAND kyty_shim_dll_abi_tests)
+endif()
+set_tests_properties(kyty_shim_dll_abi PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_dll_abi: ok")
+
 if(NOT ANYPS5_KYTY_DLL)
 add_test_executable(kyty_shim_events_tests
         ${CMAKE_CURRENT_SOURCE_DIR}/Events.cpp
