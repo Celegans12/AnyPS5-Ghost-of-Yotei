@@ -1232,6 +1232,20 @@ static bool RetainsCachedDepthLayout(const ImageInfo& requested, const Image& ca
 	     cached.info.metadata.kind == ImageMetadataKind::Htile);
 }
 
+static bool CanSnapshotBoundDepth(const ImageInfo& requested, const Image& cached) {
+	const auto& depth = cached.info;
+	return cached.binding.is_target && depth.IsDepth() && !depth.HasStencil() &&
+	       !requested.IsDepth() && !requested.IsBlock() && !requested.HasMetadata() &&
+	       !requested.HasStencil() && cached.backing.samples == 1 && requested.samples == 1 &&
+	       depth.tile_mode == requested.tile_mode && depth.extent == requested.extent &&
+	       depth.type == requested.type && depth.pitch == requested.pitch &&
+	       depth.bytes_per_block == requested.bytes_per_block &&
+	       depth.GetColorTransform() == requested.GetColorTransform() &&
+	       !IsSupportedSampledDepthFormat(depth.pixel_format, requested.pixel_format) &&
+	       ((depth.data == requested.data && depth.resources == requested.resources) ||
+	        RetainsCachedDepthLayout(requested, cached));
+}
+
 static bool DepthTargetOutgrows(const ImageInfo& requested, const Image& cached) {
 	return requested.extent.width > cached.info.extent.width ||
 	       requested.extent.height > cached.info.extent.height;
@@ -1981,15 +1995,19 @@ ImageId TextureCache::FindImageSpeculative(ImageDesc& desc, bool exact_format,
 	return FindImageImpl(desc, exact_format, true, depth_source);
 }
 
-ImageId TextureCache::FindDepthCopy(ImageId color_id, const ImageInfo& requested) {
+ImageId TextureCache::FindDepthCopy(ImageId source_id, const ImageInfo& requested) {
 	std::scoped_lock lock {m_lock};
-	auto&            copies = m_depth_copies[color_id];
+	return FindDepthCopyLocked(source_id, requested);
+}
+
+ImageId TextureCache::FindDepthCopyLocked(ImageId source_id, const ImageInfo& requested) {
+	auto& copies = m_depth_copies[source_id];
 	for (const auto copy_id: copies) {
 		if (m_slot_images[copy_id].info.pixel_format == requested.pixel_format) {
 			return copy_id;
 		}
 	}
-	auto info         = m_slot_images[color_id].info;
+	auto info         = m_slot_images[source_id].info;
 	info.pixel_format = requested.pixel_format;
 	info.data         = {};
 	info.stencil      = {};
@@ -1998,7 +2016,7 @@ ImageId TextureCache::FindDepthCopy(ImageId color_id, const ImageInfo& requested
 	AttachImageVersion(copy_id);
 	auto&      copy    = m_slot_images[copy_id];
 	copy.is_depth_copy     = true;
-	copy.depth_copy_source = color_id;
+	copy.depth_copy_source = source_id;
 	copies.push_back(copy_id);
 	return copy_id;
 }
@@ -2371,6 +2389,13 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 		}
 		const bool same_backing = static_cast<bool>(result);
 
+		if (!result && !speculative && desc.type == BindingType::Texture && !desc.heap) {
+			for (const auto candidate: candidates) {
+				if (CanSnapshotBoundDepth(desc.info, m_slot_images[candidate])) {
+					return FindDepthCopyLocked(candidate, desc.info);
+				}
+			}
+		}
 		int32_t view_mip   = -1;
 		int32_t view_layer = -1;
 		if (!result) {
