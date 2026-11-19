@@ -5615,13 +5615,25 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			reference = walk.Shape().source;
 		}
 	}
-	const auto shares = [&](LaneMaskWalk& walk) {
+	const auto canonical = [](std::array<uint32_t, 4> layout) {
+		layout[1] &= ~(1u << 29u);
+		layout[2] &= ~(15u << 9u | 1u << 13u | 31u << 14u);
+		layout[3] &= ~(3u << 26u);
+		return layout;
+	};
+	const auto shares = [&](Walk& each) {
+		auto&       walk   = each.Shape();
 		const auto& source = walk.source;
 		if (source.user_sgpr != reference.user_sgpr || source.header_offset != reference.header_offset ||
 		    source.header_vsharp != reference.header_vsharp || source.root != reference.root) {
 			return false;
 		}
 		if (source.layout == reference.layout) return true;
+		if (each.kind == Kind::Universal) {
+			if (canonical(source.layout) != canonical(reference.layout)) return false;
+			walk.source.layout = reference.layout;
+			return true;
+		}
 		const auto     packed = reference.layout[2];
 		const uint32_t shift  = packed >> 4u & 31u;
 		auto           layout = walk.layout;
@@ -5637,7 +5649,13 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		walk.source.layout = reference.layout;
 		return true;
 	};
-	std::erase_if(walks, [&](Walk& walk) { return !shares(walk.Shape()); });
+	std::erase_if(walks, [&](Walk& walk) {
+		if (shares(walk)) return false;
+		const auto kept = std::ranges::count_if(intersections, [&](const Inst* bvh) { return InLoop(program, bvh->Parent(), walk.header, walk.latch); });
+		LOGF("%s universal ray tracing: hash=0x%016llx keeps %zu intersections on the guest walk: another walk of the program names another source or layout\n",
+		     compute ? "CS" : "PS", static_cast<unsigned long long>(program.shader_hash), static_cast<size_t>(kept));
+		return true;
+	});
 	if (walks.empty()) return result;
 	result       = walks.front().Shape().source;
 	result.reach = {};
