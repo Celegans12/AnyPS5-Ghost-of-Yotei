@@ -15,12 +15,16 @@
 #include <utility>
 #include <bit>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <fmt/format.h>
 #include <functional>
 #include <numeric>
 #include <string_view>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 namespace {
@@ -1214,6 +1218,55 @@ bool TableExemplar(const ImageResource& root, const DescriptorValue& descriptor,
 	       !Prospero::IsFmaskTextureFormat(format);
 }
 
+class TableSlotIndex {
+public:
+	static bool Enabled() {
+		static const bool on = [] {
+			const char* value = std::getenv("KYTY_FLAT_TABLE_SLOTS");
+			return value == nullptr || value[0] != '0';
+		}();
+		return on;
+	}
+	void Reset(const uint32_t* words, size_t entries) {
+		const auto capacity = std::bit_ceil(std::max<size_t>(entries * 2u, 16u));
+		if (m_cells.size() < capacity) {
+			m_cells.resize(capacity);
+		}
+		std::fill_n(m_cells.begin(), capacity, Cell {});
+		m_mask  = capacity - 1u;
+		m_words = words;
+	}
+	std::pair<uint32_t, bool> TryEmplace(uint32_t entry, uint32_t slot) {
+		const auto* key = m_words + static_cast<size_t>(entry) * 8u;
+		uint64_t    h   = 0x9e3779b97f4a7c15ull;
+		for (uint32_t i = 0; i < 8u; i += 2u) {
+			uint64_t lane = (uint64_t {key[i + 1u]} << 32u) | key[i];
+			h             = (h ^ lane) * 0xff51afd7ed558ccdull;
+			h ^= h >> 32u;
+		}
+		for (auto at = static_cast<size_t>(h) & m_mask;; at = (at + 1u) & m_mask) {
+			auto& cell = m_cells[at];
+			if (cell.entry_plus_one == 0u) {
+				cell = {.entry_plus_one = entry + 1u, .slot = slot};
+				return {slot, true};
+			}
+			if (std::memcmp(m_words + static_cast<size_t>(cell.entry_plus_one - 1u) * 8u, key,
+			                8u * sizeof(uint32_t)) == 0) {
+				return {cell.slot, false};
+			}
+		}
+	}
+
+private:
+	struct Cell {
+		uint32_t entry_plus_one = 0;
+		uint32_t slot           = 0;
+	};
+	std::vector<Cell> m_cells;
+	size_t            m_mask  = 0;
+	const uint32_t*   m_words = nullptr;
+};
+
 uint32_t ImageTableCapacity(size_t slots) {
 	return std::bit_ceil(std::max<uint32_t>(static_cast<uint32_t>(slots), 256u));
 }
@@ -1278,22 +1331,35 @@ bool MaterializeImageTable(const ResourcePlan& program,
 			next.slots.push_back(DescriptorValue {.dword_count = 8u});
 			next.mapping.assign(static_cast<size_t>(entries) + 1u, 0u);
 			next.mapping[0] = static_cast<uint32_t>(entries);
+			const bool                                     flat_slots = TableSlotIndex::Enabled();
+			static thread_local TableSlotIndex             flat_slot_of;
 			std::unordered_map<std::string_view, uint32_t> slot_of;
+			if (flat_slots) {
+				flat_slot_of.Reset(next.raw.data(), static_cast<size_t>(entries));
+			}
 			for (uint32_t entry = 0; entry < entries; entry++) {
 				DescriptorValue candidate {.dword_count = 8u};
 				std::copy_n(next.raw.begin() + entry * 8u, 8u, candidate.dwords.begin());
 				if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, root.r128)) {
 					continue;
 				}
-				const std::string_view key(
-				    reinterpret_cast<const char*>(next.raw.data() + entry * 8u),
-				    8u * sizeof(uint32_t));
-				const auto [slot, inserted] =
-				    slot_of.try_emplace(key, static_cast<uint32_t>(next.slots.size()));
+				const auto new_slot = static_cast<uint32_t>(next.slots.size());
+				uint32_t   slot     = new_slot;
+				bool       inserted = false;
+				if (flat_slots) {
+					std::tie(slot, inserted) = flat_slot_of.TryEmplace(entry, new_slot);
+				} else {
+					const std::string_view key(
+					    reinterpret_cast<const char*>(next.raw.data() + entry * 8u),
+					    8u * sizeof(uint32_t));
+					const auto [found_slot, emplaced] = slot_of.try_emplace(key, new_slot);
+					slot     = found_slot->second;
+					inserted = emplaced;
+				}
 				if (inserted) {
 					next.slots.push_back(candidate);
 				}
-				next.mapping[entry + 1u] = slot->second;
+				next.mapping[entry + 1u] = slot;
 			}
 			built[built_next++ % built.size()] = next;
 		}
