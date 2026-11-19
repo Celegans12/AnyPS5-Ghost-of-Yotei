@@ -2559,6 +2559,7 @@ void RenderExecutor::RebindImages(PreparedBindings& prepared) {
 			images[i] = ResolveTexture(program.info.images[i], snapshot.images[i]);
 			BindImage(images[i].image_id,
 			          images[i].desc.type == TextureCache::BindingType::Storage);
+			if (!images[i].image_id) continue;
 		}
 		auto& binding = images[i];
 		binding.mip_views.clear();

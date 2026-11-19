@@ -4,6 +4,7 @@
 #include "common/assert.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
+#include "common/hackNotice.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
 #include "graphics/guest_gpu/gpu_format.h"
@@ -23,6 +24,7 @@
 #include <array>
 #include <bit>
 #include <cinttypes>
+#include <cstdio>
 #if defined(ANYPS5_KYTY)
 #include <cstdlib>
 #include <string_view>
@@ -1246,6 +1248,32 @@ static bool CanSnapshotBoundDepth(const ImageInfo& requested, const Image& cache
 	        RetainsCachedDepthLayout(requested, cached));
 }
 
+static bool KeepsBoundDepth(TextureCache::BindingType binding, const Image& cached) {
+	return (binding == TextureCache::BindingType::Texture ||
+	        binding == TextureCache::BindingType::Storage) &&
+	       cached.registered && cached.binding.is_target && !cached.depth_id &&
+	       cached.info.IsDepth();
+}
+
+static ImageId NullForBoundDepth(const TextureCache::ImageDesc& desc, const Image& depth) {
+	const auto& requested = desc.info;
+	char        detail[256];
+	std::snprintf(detail, sizeof(detail),
+	              "%s 0x%016" PRIx64 " format %d %ux%u %ux%u%s over depth 0x%016" PRIx64
+	              " format %d %ux%u %ux%u",
+	              desc.type == TextureCache::BindingType::Storage ? "storage" : "texture",
+	              requested.data.address, static_cast<int>(requested.pixel_format),
+	              requested.extent.width, requested.extent.height, requested.resources.levels,
+	              requested.resources.layers, desc.heap ? " heap" : "", depth.info.data.address,
+	              static_cast<int>(depth.info.pixel_format), depth.info.extent.width,
+	              depth.info.extent.height, depth.info.resources.levels,
+	              depth.info.resources.layers);
+	Common::HackNotice::Report("view that would replace the bound depth target bound as null image",
+	                           "TextureCache::FindImageImpl", 0,
+	                           static_cast<uint64_t>(desc.type), detail);
+	return {};
+}
+
 static bool DepthTargetOutgrows(const ImageInfo& requested, const Image& cached) {
 	return requested.extent.width > cached.info.extent.width ||
 	       requested.extent.height > cached.info.extent.height;
@@ -1418,7 +1446,8 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 		BcAlias::Resolve(*this, cached_id, merged_id);
 		return {merged_id};
 	}
-	const bool safe_to_delete = cached.table_pins == 0 &&
+	const bool keep_bound     = KeepsBoundDepth(binding, cached);
+	const bool safe_to_delete = !keep_bound && cached.table_pins == 0 &&
 	                            m_gc_tick - cached.tick_accessed_last > NumFramesBeforeRemoval &&
 	                            cached.heap_refs.load(std::memory_order_relaxed) == 0u;
 
@@ -1436,6 +1465,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 			    requested.resources.levels <= cached.info.resources.levels &&
 			    requested.resources.layers <= cached.info.resources.layers;
 			return {.rejected = true, .depth_source = depth_copy ? cached_id : ImageId {}};
+		}
+		if (keep_bound && DepthOverlapNeedsRecreate(requested, binding, cached)) {
+			return {.rejected = true, .bound_depth = true};
 		}
 		if (const auto depth_id = ResolveDepthOverlap(requested, binding, cached_id)) {
 			return {depth_id};
@@ -1527,6 +1559,9 @@ TextureCache::OverlapResult TextureCache::ResolveOverlap(const ImageInfo& reques
 
 	const int32_t mip = cached.info.MipOf(requested);
 	if (mip >= 0) {
+		if (keep_bound) {
+			return {.rejected = true, .bound_depth = true};
+		}
 		const int32_t layer = cached.info.SliceOf(requested, mip);
 		if (!merged_id) {
 			return {ExpandImage(requested, cached_id)};
@@ -2407,6 +2442,9 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 				    ResolveOverlap(merged_info, desc.type, candidate, result, speculative,
 				                   desc.candidate);
 				if (overlap.rejected) {
+					if (overlap.bound_depth) {
+						return NullForBoundDepth(desc, m_slot_images[candidate]);
+					}
 					if (depth_source != nullptr) {
 						*depth_source = overlap.depth_source;
 					}
@@ -2444,6 +2482,9 @@ ImageId TextureCache::FindImageImpl(ImageDesc& desc, bool exact_format, bool spe
 			if (exact_format && resolved.info.pixel_format != desc.info.pixel_format) {
 				result = {};
 			} else if (resolved.info.resources < desc.info.resources) {
+				if (KeepsBoundDepth(desc.type, resolved)) {
+					return NullForBoundDepth(desc, resolved);
+				}
 				FreeImage(result);
 				result = {};
 			}
@@ -2602,7 +2643,13 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
-		EXIT("TextureCache: depth target requires rediscovery before final acquisition\n");
+		EXIT("TextureCache: depth target requires rediscovery before final acquisition "
+		     "(depth 0x%016" PRIx64 " format %d %ux%u %ux%u, registered %d, stencil plane %d, "
+		     "rebind %d)\n",
+		     image.info.data.address, static_cast<int>(image.info.pixel_format),
+		     image.info.extent.width, image.info.extent.height, image.info.resources.levels,
+		     image.info.resources.layers, image.registered ? 1 : 0, image.depth_id ? 1 : 0,
+		     image.binding.needs_rebind ? 1 : 0);
 	}
 	TouchImage(image);
 	if (desc.info.HasStencil()) {
