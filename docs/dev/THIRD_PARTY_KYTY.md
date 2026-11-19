@@ -236,7 +236,7 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 | `KYTY_TESSELLATION` | `0` or `1`, else stops | `1` | Draws patch primitives with tessellation; `0` drops them before their programs are looked up or prepared | option | all | Kyty option |
 | `KYTY_OCCLUSION_QUERIES` | `0` or `1`, else stops | `1` | Host occlusion queries, which need the device's `hostQueryReset`; `0` turns them off | option | all | Kyty option |
 | `KYTY_RELAXED_SHADER_FLOAT` | `0` or `1`, else stops | `0` | Relaxes the shader recompiler's float rules (min and max, trigonometric functions) for speed | experimental | all | Kyty option |
-| `KYTY_WAVE_SPLIT` | `0` or `1`, else stops | `1` | On GPUs without wave64 compute, runs a one-wave wave64 compute shader as two 32-wide subgroups that exchange cross-lane values through workgroup memory; `0` emits it in lane pairs (every instruction twice), which builds slower | perf | all | Kyty option |
+| `KYTY_WAVE_SPLIT` | `0` or `1`, else stops | `0` | On GPUs without wave64 compute, runs a one-wave wave64 compute shader as two 32-wide subgroups that exchange cross-lane values through workgroup memory; `0` emits it in lane pairs (every instruction twice), which builds slower | perf | all | Kyty option |
 | `KYTY_FALLBACKS` | `0` or `1`, else stops | `1` on Linux, `0` on Windows | Where the emulator would stop on something Kyty does not handle and a safe way on exists, it takes it and logs one `[HACK]` line per source (see [Details](#details)); `0` stops as before | compat | all | AnyKyty |
 
 ### Memory, readbacks, flips and labels

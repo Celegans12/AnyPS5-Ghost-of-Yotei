@@ -115,7 +115,7 @@ struct ConfigOptions {
 	bool                   tessellation_enabled        = true;
 	bool                   occlusion_queries_enabled   = true;
 	bool                   relaxed_shader_float        = false;
-	bool                   wave_split                  = true;
+	bool                   wave_split                  = false;
 	bool                   native_rt                   = false;
 	bool                   async_pipelines_enabled     = true;
 	bool                   async_pipelines_skip_more   = false;
