@@ -70,6 +70,9 @@ struct ReadbackStats {
 	std::atomic<uint64_t> cp_not_waited {0};
 	std::atomic<uint64_t> other_reads {0};
 	std::atomic<uint64_t> other_ns {0};
+	std::atomic<uint64_t> other_gpu_bytes {0};
+	std::atomic<uint64_t> other_false_sharing {0};
+	std::atomic<uint64_t> cp_staged {0};
 	std::atomic<int64_t>  last_line {0};
 };
 
@@ -511,6 +514,10 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 	(command_processor ? stats.cp_ns : stats.other_ns).fetch_add(elapsed, std::memory_order_relaxed);
 }
 
+void BufferCache::NoteStagedCommandProcessorRead() {
+	g_readback_stats.cp_staged.fetch_add(1, std::memory_order_relaxed);
+}
+
 void BufferCache::LogReadbackSummary() {
 	auto&      stats = g_readback_stats;
 	const auto now   = SteadyNs();
@@ -529,16 +536,20 @@ void BufferCache::LogReadbackSummary() {
 	const auto ordered     = stats.cp_ordered.exchange(0, std::memory_order_relaxed);
 	const auto ordered_ns  = stats.cp_ordered_ns.exchange(0, std::memory_order_relaxed);
 	const auto not_waited  = stats.cp_not_waited.exchange(0, std::memory_order_relaxed);
-	if (cp_reads + other_reads == 0) {
+	const auto gpu_bytes   = stats.other_gpu_bytes.exchange(0, std::memory_order_relaxed);
+	const auto false_share = stats.other_false_sharing.exchange(0, std::memory_order_relaxed);
+	const auto staged      = stats.cp_staged.exchange(0, std::memory_order_relaxed);
+	if (cp_reads + other_reads + staged == 0) {
 		return;
 	}
 	const auto seconds = [](uint64_t ns) { return static_cast<double>(ns) / 1e9; };
 	::Log::WriteToConsoleAndLog(fmt::format(
 	    "[kyty-readback] summary of the last {:.0f} s: command processor {} readbacks in {:.3f} s ({} after the "
-	    "operations it is ordered after only, {:.3f} s waiting for them, {} operations not waited for); other threads "
-	    "{} readbacks in {:.3f} s\n",
+	    "operations it is ordered after only, {:.3f} s waiting for them, {} operations not waited for), {} register "
+	    "tables read without a fault; other threads {} readbacks in {:.3f} s ({} of faulted reads on bytes the GPU "
+	    "wrote, {} on other bytes of a GPU written page)\n",
 	    seconds(static_cast<uint64_t>(now - last)), cp_reads, seconds(cp_ns), ordered, seconds(ordered_ns), not_waited,
-	    other_reads, seconds(other_ns)));
+	    staged, other_reads, seconds(other_ns), gpu_bytes, false_share));
 }
 
 void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault,
@@ -575,6 +586,11 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 		NoteReadbackWait(pages_begin, pages_end, false,
 		                 m_write_ticks.Latest(pages_begin, pages_end) >= m_scheduler.CurrentTick());
 		const bool guest_read = guest_fault && !is_write;
+		if (guest_read && !command_processor) {
+			(m_gpu_modified_ranges.Intersects(vaddr, size) ? g_readback_stats.other_gpu_bytes
+			                                                : g_readback_stats.other_false_sharing)
+			    .fetch_add(1, std::memory_order_relaxed);
+		}
 		if (tick == 0 && readback_queue &&
 		    StartReadbackQueueRead(buffer, vaddr, read_size, pages_begin, pages_end, queue_read,
 		                           guest_read)) {
@@ -2395,10 +2411,95 @@ bool BufferCache::HasGpuDirtyBytes(uint64_t vaddr, uint64_t size) {
 	return false;
 }
 
+namespace {
+
+constexpr uint64_t GpuLinePageBits = 12;
+constexpr uint64_t GpuLineBits     = 6;
+constexpr uint64_t GpuLineMaxPages = uint64_t {1} << 16u;
+
+uint64_t GpuLineMask(uint64_t page, uint64_t vaddr, uint64_t size) {
+	const auto base  = page << GpuLinePageBits;
+	const auto low   = (std::max(vaddr, base) - base) >> GpuLineBits;
+	const auto high  = (std::min(vaddr + size, base + (uint64_t {1} << GpuLinePageBits)) - base - 1) >> GpuLineBits;
+	return (~uint64_t {0} >> (63 - high)) & (~uint64_t {0} << low);
+}
+
+size_t GpuLineHash(uint64_t page) {
+	return static_cast<size_t>((page * 0x9e3779b97f4a7c15ull) >> 40u);
+}
+
+}
+
+void BufferCache::NoteGpuLines(uint64_t vaddr, uint64_t size) noexcept {
+	const auto first = vaddr >> GpuLinePageBits;
+	const auto last  = (vaddr + size - 1) >> GpuLinePageBits;
+	if (last - first >= GpuLineMaxPages) {
+		m_gpu_line_overflow.store(true, std::memory_order_release);
+		return;
+	}
+	for (auto page = first; page <= last; page++) {
+		const auto mask   = GpuLineMask(page, vaddr, size);
+		const auto key    = page + 1;
+		bool       stored = false;
+		for (size_t probe = 0; probe < GpuLineProbes && !stored; probe++) {
+			auto&    slot    = m_gpu_line_slots[(GpuLineHash(page) + probe) % GpuLineSlots];
+			uint64_t current = slot.page.load(std::memory_order_acquire);
+			if (current == 0 && slot.page.compare_exchange_strong(current, key, std::memory_order_acq_rel)) {
+				current = key;
+			}
+			if (current == key) {
+				slot.lines.fetch_or(mask, std::memory_order_release);
+				stored = true;
+			}
+		}
+		if (!stored) {
+			m_gpu_line_overflow.store(true, std::memory_order_release);
+			return;
+		}
+	}
+}
+
+bool BufferCache::NeverGpuWritten(uint64_t vaddr, uint64_t size) const noexcept {
+	if (size == 0 || m_gpu_line_overflow.load(std::memory_order_acquire)) {
+		return false;
+	}
+	const auto first = vaddr >> GpuLinePageBits;
+	const auto last  = (vaddr + size - 1) >> GpuLinePageBits;
+	if (last - first >= GpuLineMaxPages) {
+		return false;
+	}
+	for (auto page = first; page <= last; page++) {
+		const auto key   = page + 1;
+		bool       found = false;
+		for (size_t probe = 0; probe < GpuLineProbes; probe++) {
+			const auto& slot    = m_gpu_line_slots[(GpuLineHash(page) + probe) % GpuLineSlots];
+			const auto  current = slot.page.load(std::memory_order_acquire);
+			if (current == key) {
+				if ((slot.lines.load(std::memory_order_acquire) & GpuLineMask(page, vaddr, size)) != 0) {
+					return false;
+				}
+				found = true;
+				break;
+			}
+			if (current == 0) {
+				found = true;
+				break;
+			}
+		}
+		if (!found) {
+			return false;
+		}
+	}
+	return true;
+}
+
 void BufferCache::NoteGpuModifiedChange(uint64_t vaddr, uint64_t size, bool dirty) {
 	constexpr uint64_t PageSize = 4096;
 	if (size == 0) {
 		return;
+	}
+	if (dirty) {
+		NoteGpuLines(vaddr, size);
 	}
 	const auto first = vaddr / PageSize;
 	const auto last  = (vaddr + size - 1) / PageSize;

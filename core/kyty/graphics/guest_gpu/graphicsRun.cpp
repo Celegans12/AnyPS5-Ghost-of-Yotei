@@ -1704,6 +1704,34 @@ void CommandProcessor::SyncFetchWithExecution() {
 	}
 }
 
+const uint32_t* CommandProcessor::StageIndirectRegisters(uint32_t opcode, const uint32_t* packet,
+                                                         uint32_t packet_dw) {
+	if ((opcode != Pm4::IT_SET_CONTEXT_REG_INDIRECT && opcode != Pm4::IT_SET_SH_REG_INDIRECT &&
+	     opcode != Pm4::IT_SET_UCONFIG_REG_INDIRECT) ||
+	    packet_dw < 5 || m_pipeline == nullptr || !GuestGpu::OrderedReadbacks()) {
+		return packet;
+	}
+	const auto     address = (uint64_t {packet[1]} & 0xfffffffcu) | (uint64_t {packet[2]} << 32u);
+	const uint32_t count   = packet[4] & 0x3fffu;
+	const uint64_t bytes   = uint64_t {count} * ((packet[3] & Pm4::LOAD_REG_INDEX_OFFSET_AND_DATA) != 0 ? 8u : 4u);
+	if (address == 0 || bytes == 0 || !GuestRange {address, bytes}.Valid() ||
+	    !LibKernel::Memory::MayFaultOnGpuRead(address, bytes) ||
+	    !m_renderer.GetBufferCache().NeverGpuWritten(address, bytes) ||
+	    m_renderer.GetTextureCache().IsRegionGpuModified(address, bytes)) {
+		return packet;
+	}
+	m_indirect_stage.assign(size_t {count} * 2u, 0u);
+	if (!LibKernel::Memory::TryReadBacking(address, m_indirect_stage.data(), bytes)) {
+		return packet;
+	}
+	const auto staged = reinterpret_cast<uint64_t>(m_indirect_stage.data());
+	std::copy_n(packet, m_indirect_packet.size(), m_indirect_packet.begin());
+	m_indirect_packet[1] = (static_cast<uint32_t>(staged) & 0xfffffffcu) | (packet[1] & 3u);
+	m_indirect_packet[2] = static_cast<uint32_t>(staged >> 32u);
+	BufferCache::NoteStagedCommandProcessorRead();
+	return m_indirect_packet.data();
+}
+
 void CommandProcessor::PrepareCommandFetch(std::span<const uint32_t> commands) {
 	if (m_fetch_sync_sequence == 0 || m_pipeline == nullptr) {
 		return;
@@ -1764,10 +1792,12 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			     cursor.offset_dw, packet_header, opcode, KYTY_PM4_LEN(packet_header));
 		}
 
+		const auto* const view = StageIndirectRegisters(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw));
+
 		if ((packet_header & 1u) != 0 && ShouldSkipPredicatedPackets()) {
 			auto packet_dw = KYTY_PM4_LEN(packet_header);
 			EXIT_NOT_IMPLEMENTED(packet_dw > remaining_dw);
-			if (m_draw_observer != nullptr) m_draw_observer->ObservePacket(opcode, packet, packet_dw, true);
+			if (m_draw_observer != nullptr) m_draw_observer->ObservePacket(opcode, view, packet_dw, true);
 			cursor.offset_dw += packet_dw;
 			execution.m_made_progress = true;
 			if (execution.m_scout_sequence != 0 && Scout::IsDraw(opcode)) execution.m_scout_ordinal++;
@@ -1776,7 +1806,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 
 		auto handler = g_cp_op_func[opcode];
 		if (m_draw_observer != nullptr) {
-			m_draw_observer->ObservePacket(opcode, packet, std::min(KYTY_PM4_LEN(packet_header), remaining_dw), false);
+			m_draw_observer->ObservePacket(opcode, view, std::min(KYTY_PM4_LEN(packet_header), remaining_dw), false);
 		}
 
 		if (handler == nullptr) {
@@ -1802,7 +1832,7 @@ void CommandProcessor::ProcessPm4(Pm4Execution& execution) {
 			m_scout_skipped  = 0;
 		}
 		const auto packet_dw =
-		    handler(*this, packet_header & ~1u, packet + 1, remaining_dw, total_dw) + 1;
+		    handler(*this, packet_header & ~1u, view + 1, remaining_dw, total_dw) + 1;
 		EXIT_IF(packet_dw > remaining_dw);
 		if (scout_draw) {
 			m_scout_packet = nullptr;

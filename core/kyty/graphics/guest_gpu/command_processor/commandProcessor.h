@@ -18,6 +18,7 @@
 #include <memory>
 #include <span>
 #include <unordered_map>
+#include <array>
 #include <vector>
 
 namespace Libs::Graphics {
@@ -166,6 +167,7 @@ public:
 	void             ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain);
 	void SyncFetchWithExecution();
 	void PrepareCommandFetch(std::span<const uint32_t> commands);
+	const uint32_t* StageIndirectRegisters(uint32_t opcode, const uint32_t* packet, uint32_t packet_dw);
 
 	[[nodiscard]] bool IsAsyncComputeQueue() const { return m_interrupt_event_id >= 0x20; }
 	void ScoutSkipDraws(uint32_t count) noexcept { m_scout_skipped += count; }
@@ -236,6 +238,8 @@ private:
 	uint64_t       m_draw_indirect_args_base_addr     = 0;
 	uint64_t       m_dispatch_indirect_args_base_addr = 0;
 	uint64_t       m_fetch_sync_sequence              = 0;
+	std::vector<uint32_t> m_indirect_stage;
+	std::array<uint32_t, 5> m_indirect_packet {};
 	GpuNumInstances m_num_instances;
 
 	bool                         m_ctx_dirty    = true;

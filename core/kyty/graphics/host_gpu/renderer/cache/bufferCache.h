@@ -115,6 +115,7 @@ public:
 	void                   ReadMemory(uint64_t vaddr, uint64_t size, bool is_write = false,
 	                                  bool guest_fault = false);
 	static void            LogReadbackSummary();
+	static void            NoteStagedCommandProcessorRead();
 	[[nodiscard]] Buffer&  GetBuffer(BufferId id) { return m_slot_buffers[id]; }
 	[[nodiscard]] BufferId FindBuffer(uint64_t vaddr, uint64_t size);
 	void CacheFaultedMemory(uint64_t vaddr, uint64_t size);
@@ -152,6 +153,7 @@ public:
 	[[nodiscard]] bool IsRegionRegistered(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool NeverGpuWritten(uint64_t vaddr, uint64_t size) const noexcept;
 	[[nodiscard]] bool WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_t size);
 	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {
 		return m_memory_tracker.MayBeGpuModified(vaddr, size);
@@ -383,6 +385,15 @@ private:
 	};
 	std::array<DirtyPageMask, 128> m_dirty_masks {};
 	void NoteGpuModifiedChange(uint64_t vaddr, uint64_t size, bool dirty);
+	struct GpuLineSlot {
+		std::atomic<uint64_t> page {0};
+		std::atomic<uint64_t> lines {0};
+	};
+	static constexpr size_t         GpuLineSlots  = size_t {1} << 20u;
+	static constexpr size_t         GpuLineProbes = 16;
+	std::unique_ptr<GpuLineSlot[]>  m_gpu_line_slots = std::make_unique<GpuLineSlot[]>(GpuLineSlots);
+	std::atomic<bool>               m_gpu_line_overflow {false};
+	void                            NoteGpuLines(uint64_t vaddr, uint64_t size) noexcept;
 	std::array<RangeSet, 16>                          m_checked_color_metadata;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;
