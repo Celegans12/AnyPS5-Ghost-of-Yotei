@@ -168,7 +168,7 @@ void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3
 				    TriangleRef((opaque ? job.vertices0 : job.vertices1) + uint64_t(index) * 36);
 				vec3 p[3];
 				LoadTriangle(node, NodeType(tri), p);
-				bool usable = true;
+				bool usable = NodeType(tri) < 4u;
 				for (uint v = 0; v < 3; v++) {
 					usable = usable && !any(isnan(p[v])) && all(lessThan(abs(p[v]), vec3(1e18)));
 				}
@@ -197,7 +197,7 @@ void EmitLeaf(uint64_t blas_va, uint64_t base, uint leaf, Job job, vec3 lo, vec3
 					out_triangle.v[v * 3 + 2] = q.z;
 				}
 				const uint table_index = opaque ? index : s_capacity0 + index;
-				const uint remap = (LoadGuestU32(node + 60) >> (NodeType(tri) * 8u)) & 0xffu;
+				const uint remap = NodeType(tri) < 4u ? (LoadGuestU32(node + 60) >> (NodeType(tri) * 8u)) & 0xffu : 0u;
 				EntryRef(job.entries + uint64_t(table_index) * 16).v =
 				    uvec4(split_copy ? kInvalidNode : (first + k) << 3, word, tri, remap);
 			}
@@ -215,7 +215,7 @@ void GatherTriangle(Job job, uint64_t base, uint index, uint geometry) {
 	const uint64_t node         = NodeAddress(base, tri);
 	TriangleRef    out_triangle = TriangleRef((geometry == 0u ? job.vertices0 : job.vertices1) + uint64_t(index) * 36);
 	vec3 p[3];
-	bool usable = entry.x != kInvalidNode;
+	bool usable = entry.x != kInvalidNode && NodeType(tri) < 4u;
 	if (usable) {
 		LoadTriangle(node, NodeType(tri), p);
 	} else {
