@@ -67,6 +67,7 @@ std::string PartKey(PipelineLibraryPart part, const GraphicsPipelineKey& key,
 			Append(result, params.negative_one_to_one);
 			Append(result, params.depth_clip_enable);
 			Append(result, params.patch_control_points);
+			Append(result, params.merged_hull);
 			Append(result, params.provoking_vtx_last);
 			Append(result, params.polygon_mode);
 			break;

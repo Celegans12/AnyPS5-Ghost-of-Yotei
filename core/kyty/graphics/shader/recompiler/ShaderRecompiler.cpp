@@ -511,6 +511,20 @@ RayTracingPrograms GetRayTracingPrograms() {
 ShaderSource PrepareShaderSource(std::span<const uint32_t> code, const CompileOptions& options) {
 	EXIT_IF(code.empty());
 	ShaderSource source;
+#if defined(ANYPS5_KYTY)
+	static constexpr std::array<uint32_t, 1> EndProgram {0xbf810000u};
+	const bool merged_hull =
+	    (options.stage == ShaderType::Local || options.stage == ShaderType::TessellationControl) &&
+	    options.input_info.vertex != nullptr && options.input_info.vertex->tess.merged_hull != 0;
+	if (merged_hull && options.stage == ShaderType::Local) {
+		Decoder::DecodeProgram(EndProgram, source.decoded);
+	} else if (merged_hull) {
+		Decoder::DecodeProgram(code, source.decoded);
+		if (source.decoded.has_swap_pc) {
+			EXIT("a merged hull program that calls a subroutine is unsupported\n");
+		}
+	} else
+#endif
 	if (!options.back_code.empty()) {
 		source.decoded = DecodeFusedProgram(code, options.back_code, source.code);
 	} else if (options.stage == ShaderType::Local) {

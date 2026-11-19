@@ -615,6 +615,14 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 				info.subgroup_local_invocation_id = true;
 			}
 			break;
+#if defined(ANYPS5_KYTY)
+		case ValueOpcode::SetTessellationAttribute:
+			if (program.stage == ShaderType::TessellationControl &&
+			    inst.Arg(0).U32() == static_cast<uint32_t>(TessellationAttribute::ControlShared)) {
+				inputs.AddBuiltin(StageInputKind::InvocationId);
+			}
+			break;
+#endif
 		case ValueOpcode::ImageQueryLod: info.compute_derivatives = true; break;
 		case ValueOpcode::ImageGatherRaw:
 			info.image_gather_extended = true;

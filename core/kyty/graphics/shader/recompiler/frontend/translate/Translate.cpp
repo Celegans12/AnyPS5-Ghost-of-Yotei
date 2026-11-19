@@ -1337,6 +1337,18 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), IR::U32(IR::Value(0u)));
 			entry_ir.SetVectorReg(static_cast<IR::VectorReg>(5),
 			                      builtin(IR::StageInputKind::InstanceIndex));
+#if defined(ANYPS5_KYTY)
+			if (options.input_info.vertex->tess.merged_hull != 0) {
+				const auto kind =
+				    IR::Value(static_cast<uint32_t>(IR::TessellationAttribute::LocalOutput));
+				entry_ir.Emit(IR::ValueOpcode::SetTessellationAttribute,
+				              {kind, IR::Value(0u), builtin(IR::StageInputKind::VertexIndex),
+				               IR::Value(true)});
+				entry_ir.Emit(IR::ValueOpcode::SetTessellationAttribute,
+				              {kind, IR::Value(4u), builtin(IR::StageInputKind::InstanceIndex),
+				               IR::Value(true)});
+			}
+#endif
 		} else if (options.stage == ShaderType::TessellationControl) {
 			const auto& tess = options.input_info.vertex->tess;
 			entry_ir.SetScalarReg(
@@ -1354,6 +1366,28 @@ IR::Program TranslateProgram(const Decoder::Program& decoded, const CFG::Graph& 
 			    static_cast<IR::VectorReg>(1),
 			    entry_ir.ShiftLeftLogical(builtin(IR::StageInputKind::InvocationId),
 			                              IR::U32(IR::Value(8u))));
+#if defined(ANYPS5_KYTY)
+			if (tess.merged_hull != 0) {
+				const auto kind =
+				    IR::Value(static_cast<uint32_t>(IR::TessellationAttribute::ControlInput));
+				const auto invocation = builtin(IR::StageInputKind::InvocationId);
+				const auto last       = IR::U32(IR::Value(tess.input_control_points - 1u));
+				const auto point =
+				    entry_ir.Select(entry_ir.ULessThan(invocation, last), invocation, last);
+				const auto record =
+				    entry_ir.IMul(point, IR::U32(IR::Value(IR::MergedHullRecordBytes)));
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(2),
+				    IR::U32(entry_ir.Emit(IR::ValueOpcode::GetTessellationAttribute,
+				                          {kind, record, IR::Value(true)})));
+				entry_ir.SetVectorReg(static_cast<IR::VectorReg>(3), invocation);
+				entry_ir.SetVectorReg(
+				    static_cast<IR::VectorReg>(5),
+				    IR::U32(entry_ir.Emit(
+				        IR::ValueOpcode::GetTessellationAttribute,
+				        {kind, entry_ir.IAdd(record, IR::U32(IR::Value(4u))), IR::Value(true)})));
+			}
+#endif
 		} else if (options.stage == ShaderType::TessellationEvaluation) {
 			entry_ir.SetScalarReg(static_cast<IR::ScalarReg>(2),
 			                      IR::U32(IR::Value(options.wave_size << 12u)));

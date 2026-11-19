@@ -182,7 +182,11 @@ KYTY_IO_FIELDS(BdaReadSpan, a, b, c, d, e)
 KYTY_IO_FIELDS(BdaReadPlan, a, b)
 KYTY_IO_FIELDS(CompiledShaderInfo, a, b, c, d, e, f, g, h, i, j, k)
 KYTY_IO_FIELDS(Spirv::Profile, a, b, c, d, e, f, g, h, i)
+#if defined(ANYPS5_KYTY)
+KYTY_IO_FIELDS(ShaderTessellationInputInfo, a, b, c, d, e, f, g, h, i, j)
+#else
 KYTY_IO_FIELDS(ShaderTessellationInputInfo, a, b, c, d, e, f, g, h, i)
+#endif
 KYTY_IO_FIELDS(RectListParameter, a, b, c)
 #undef KYTY_IO_FIELDS
 

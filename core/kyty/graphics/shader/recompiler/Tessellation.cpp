@@ -11,8 +11,16 @@
 
 #include <algorithm>
 #include <array>
+#if defined(ANYPS5_KYTY)
+#include <bit>
+#include <memory>
+#endif
 #include <optional>
 #include <unordered_map>
+#if defined(ANYPS5_KYTY)
+#include <unordered_set>
+#include <vector>
+#endif
 #include <utility>
 
 #include <cstdio>
@@ -267,10 +275,608 @@ IR::Value ActiveAddress(IR::Block& block, IR::Block::iterator before, IR::Value 
 	return value;
 }
 
+#if defined(ANYPS5_KYTY)
+struct MergedHullAddress {
+	bool     known       = false;
+	uint64_t coefficient = 0;
+	uint64_t constant    = 0;
+
+	[[nodiscard]] uint64_t Highest(uint32_t control_points) const {
+		return coefficient * (control_points - 1u) + constant;
+	}
+};
+
+class MergedHullAddresses {
+public:
+	MergedHullAddresses(uint32_t control_points, IR::Value predicate)
+	    : m_control_points(control_points), m_predicate(predicate) {}
+
+	MergedHullAddress Evaluate(IR::Value value) {
+		using Address = MergedHullAddress;
+		value         = value.Resolve();
+		if (value.IsImmediate()) {
+			return value.GetType() == IR::Type::U32 ? Address {true, 0u, value.U32()} : Address {};
+		}
+		const auto* inst = value.TryInstruction();
+		if (inst == nullptr) return {};
+		const auto [known, inserted] = m_known.try_emplace(inst);
+		if (!inserted) return known->second;
+		const auto result = Compute(*inst);
+		m_known[inst]     = result;
+		return result;
+	}
+
+private:
+	using Address = MergedHullAddress;
+
+	Address Bounded(uint64_t coefficient, uint64_t constant) const {
+		const Address result {true, coefficient, constant};
+		return coefficient <= UINT32_MAX && constant <= UINT32_MAX &&
+		               result.Highest(m_control_points) <= UINT32_MAX
+		           ? result
+		           : Address {};
+	}
+
+	static bool Multiple(const Address& value, uint32_t bits) {
+		const uint64_t low = (uint64_t {1u} << bits) - 1u;
+		return (value.coefficient & low) == 0u && (value.constant & low) == 0u;
+	}
+
+	static bool Same(const Address& lhs, const Address& rhs) {
+		return lhs.known && rhs.known && lhs.coefficient == rhs.coefficient &&
+		       lhs.constant == rhs.constant;
+	}
+
+	Address Compute(const IR::Inst& inst) {
+		using namespace IR;
+		const auto arg   = [&](size_t index) { return Evaluate(inst.Arg(index)); };
+		const auto shift = [&](size_t index, uint32_t& amount) {
+			const auto count = arg(index);
+			amount           = static_cast<uint32_t>(count.constant);
+			return count.known && count.coefficient == 0u && count.constant < 32u;
+		};
+		if (inst.GetOpcode() == ValueOpcode::Phi) {
+			if (inst.NumArgs() == 0u) return {};
+			if (!m_predicate.IsEmpty() && m_carried == nullptr) {
+				m_carried = std::make_unique<MergedHullAddresses>(m_control_points, Value {});
+			}
+			auto&      carried = m_predicate.IsEmpty() ? *this : *m_carried;
+			const auto first   = carried.Evaluate(inst.Arg(0));
+			for (size_t index = 1; index < inst.NumArgs(); index++) {
+				if (!Same(first, carried.Evaluate(inst.Arg(index)))) return {};
+			}
+			return first;
+		}
+		switch (inst.GetOpcode()) {
+			case ValueOpcode::LaneId: return {true, 1u, 0u};
+			case ValueOpcode::GetBuiltin:
+				return inst.Arg(0).U32() == static_cast<uint32_t>(StageInputKind::InvocationId)
+				           ? Address {true, 1u, 0u}
+				           : Address {};
+			case ValueOpcode::SelectU32: {
+				const auto condition = inst.Arg(0).Resolve();
+				if ((condition.IsImmediate() && condition.U1()) ||
+				    (!m_predicate.IsEmpty() && Implies(m_predicate, condition)))
+					return arg(1);
+				if (condition.IsImmediate()) return arg(2);
+				const auto lhs = arg(1);
+				return Same(lhs, arg(2)) ? lhs : Address {};
+			}
+			case ValueOpcode::IAdd32: {
+				const auto lhs = arg(0), rhs = arg(1);
+				return lhs.known && rhs.known
+				           ? Bounded(lhs.coefficient + rhs.coefficient, lhs.constant + rhs.constant)
+				           : Address {};
+			}
+			case ValueOpcode::ISub32: {
+				const auto lhs = arg(0), rhs = arg(1);
+				return lhs.known && rhs.known && lhs.coefficient >= rhs.coefficient &&
+				               lhs.constant >= rhs.constant
+				           ? Address {true, lhs.coefficient - rhs.coefficient,
+				                      lhs.constant - rhs.constant}
+				           : Address {};
+			}
+			case ValueOpcode::IMul32: {
+				auto lhs = arg(0), rhs = arg(1);
+				if (!lhs.known || !rhs.known) return {};
+				if (lhs.coefficient == 0u) std::swap(lhs, rhs);
+				return rhs.coefficient == 0u
+				           ? Bounded(lhs.coefficient * rhs.constant, lhs.constant * rhs.constant)
+				           : Address {};
+			}
+			case ValueOpcode::ShiftLeftLogical32: {
+				const auto lhs = arg(0);
+				uint32_t   amount;
+				return lhs.known && shift(1, amount)
+				           ? Bounded(lhs.coefficient << amount, lhs.constant << amount)
+				           : Address {};
+			}
+			case ValueOpcode::ShiftRightLogical32:
+			case ValueOpcode::BitFieldUExtract: {
+				const auto lhs = arg(0);
+				uint32_t   amount, bits = 32u;
+				if (!lhs.known || !shift(1, amount)) return {};
+				if (inst.GetOpcode() == ValueOpcode::BitFieldUExtract && !shift(2, bits)) return {};
+				if (Multiple(lhs, std::min(amount + bits, 32u))) return {true, 0u, 0u};
+				if (!Multiple(lhs, amount) || (lhs.Highest(m_control_points) >> amount) >> bits != 0u)
+					return {};
+				return {true, lhs.coefficient >> amount, lhs.constant >> amount};
+			}
+			case ValueOpcode::BitwiseAnd32: {
+				auto lhs = arg(0), rhs = arg(1);
+				if (!lhs.known || !rhs.known) return {};
+				if (lhs.coefficient == 0u) std::swap(lhs, rhs);
+				if (rhs.coefficient != 0u) return {};
+				if (lhs.coefficient == 0u) return {true, 0u, lhs.constant & rhs.constant};
+				const auto mask = static_cast<uint32_t>(rhs.constant);
+				if (mask == 0u || Multiple(lhs, static_cast<uint32_t>(std::bit_width(mask)))) {
+					return {true, 0u, 0u};
+				}
+				const auto low  = static_cast<uint32_t>(std::countr_zero(mask));
+				const auto bits = mask >> low;
+				return (bits & (bits + 1u)) == 0u && Multiple(lhs, low) &&
+				               lhs.Highest(m_control_points) <= mask
+				           ? lhs
+				           : Address {};
+			}
+			case ValueOpcode::BitwiseOr32: {
+				auto lhs = arg(0), rhs = arg(1);
+				if (!lhs.known || !rhs.known) return {};
+				if (lhs.coefficient == 0u) std::swap(lhs, rhs);
+				if (rhs.coefficient != 0u) return {};
+				if (lhs.coefficient == 0u) return {true, 0u, lhs.constant | rhs.constant};
+				const uint64_t below = rhs.constant == 0u ? 0u : std::bit_ceil(rhs.constant + 1u) - 1u;
+				return (lhs.coefficient & below) == 0u && (lhs.constant & below) == 0u
+				           ? Bounded(lhs.coefficient, lhs.constant + rhs.constant)
+				           : Address {};
+			}
+			default: return {};
+		}
+	}
+
+	uint32_t                                             m_control_points;
+	IR::Value                                            m_predicate;
+	std::unordered_map<const IR::Inst*, MergedHullAddress> m_known;
+	std::unique_ptr<MergedHullAddresses>                   m_carried;
+};
+
+IR::Value MergedHullAddressValue(IR::Block& block, IR::Block::iterator before,
+                                 const MergedHullAddress& address) {
+	using namespace IR;
+	const auto constant = Value(static_cast<uint32_t>(address.constant));
+	if (address.coefficient == 0u) return constant;
+	auto scaled = Value(&*block.PrependNewInst(before, ValueOpcode::LaneId));
+	if (address.coefficient != 1u) {
+		scaled = Value(&*block.PrependNewInst(
+		    before, ValueOpcode::IMul32,
+		    {scaled, Value(static_cast<uint32_t>(address.coefficient))}));
+	}
+	return address.constant == 0u
+	           ? scaled
+	           : Value(&*block.PrependNewInst(before, ValueOpcode::IAdd32, {scaled, constant}));
 }
+
+void RequireMergedHullBarriers(const IR::Program& program) {
+	using namespace IR;
+	const auto walk = [](std::vector<const Block*> pending, const Block* barrier, auto&& visit) {
+		std::unordered_set<const Block*> seen;
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			visit(block);
+			if (block == barrier || !seen.insert(block).second) continue;
+			const auto successors = block->ImmSuccessors();
+			pending.insert(pending.end(), successors.begin(), successors.end());
+		}
+	};
+	for (const auto* block: program.blocks) {
+		if (std::ranges::none_of(*block, [](const Inst& inst) {
+			    return inst.GetOpcode() == ValueOpcode::Barrier;
+		    }))
+			continue;
+		walk({program.blocks.front()}, block, [&](const Block* reached) {
+			if (reached != block && reached->ImmSuccessors().empty()) {
+				EXIT("the merged hull program has an s_barrier that some invocations do not "
+				     "reach, at pc 0x%08x\n",
+				     block->start_pc);
+			}
+		});
+		const auto successors = block->ImmSuccessors();
+		walk({successors.begin(), successors.end()}, block, [&](const Block* reached) {
+			if (reached == block) {
+				EXIT("the merged hull program has an s_barrier inside a loop, at pc 0x%08x\n",
+				     block->start_pc);
+			}
+		});
+	}
+}
+
+bool MergedHullOwnLaneMask(const IR::Inst& mask, std::unordered_set<const IR::Inst*>& seen) {
+	using namespace IR;
+	if (!seen.insert(&mask).second) return true;
+	const auto zero = [](Value value) {
+		value = value.Resolve();
+		return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == 0u;
+	};
+	for (const auto& use: mask.Uses()) {
+		const auto& user = *use.user;
+		switch (user.GetOpcode()) {
+			case ValueOpcode::Identity:
+			case ValueOpcode::Phi:
+			case ValueOpcode::CompositeExtractU32x4:
+			case ValueOpcode::BitwiseAnd32:
+			case ValueOpcode::BitwiseOr32:
+			case ValueOpcode::BitwiseXor32:
+			case ValueOpcode::BitwiseNot32:
+				if (!MergedHullOwnLaneMask(user, seen)) return false;
+				break;
+			case ValueOpcode::SelectU32:
+				if (use.operand == 0u || !MergedHullOwnLaneMask(user, seen)) return false;
+				break;
+			case ValueOpcode::IEqual32:
+			case ValueOpcode::INotEqual32:
+				if (!zero(user.Arg(1u - use.operand))) return false;
+				break;
+			case ValueOpcode::ShiftRightLogical32: {
+				const auto* index = user.Arg(1).Resolve().TryInstruction();
+				if (use.operand != 0u || index == nullptr ||
+				    index->GetOpcode() != ValueOpcode::BitwiseAnd32) {
+					return false;
+				}
+				const auto* lane = index->Arg(0).Resolve().TryInstruction();
+				const auto  low  = index->Arg(1).Resolve();
+				if (lane == nullptr || lane->GetOpcode() != ValueOpcode::LaneId ||
+				    !low.IsImmediate() || low.U32() != 31u) {
+					return false;
+				}
+				for (const auto& bit: user.Uses()) {
+					const auto one = bit.user->GetOpcode() == ValueOpcode::BitwiseAnd32
+					                     ? bit.user->Arg(1u - bit.operand).Resolve()
+					                     : Value {};
+					if (!one.IsImmediate() || one.GetType() != Type::U32 || one.U32() != 1u) {
+						return false;
+					}
+				}
+				break;
+			}
+			default: return false;
+		}
+	}
+	return true;
+}
+
+void LowerMergedHullLanes(IR::Program& program) {
+	using namespace IR;
+	for (auto* block: program.blocks) {
+		for (auto it = block->begin(); it != block->end(); ++it) {
+			auto& inst = *it;
+			switch (inst.GetOpcode()) {
+				case ValueOpcode::ReadLane:
+				case ValueOpcode::WriteLane:
+				case ValueOpcode::DppMoveU32:
+				case ValueOpcode::DppUpdateU32:
+				case ValueOpcode::Permlane16U32:
+				case ValueOpcode::SwizzleU32:
+				case ValueOpcode::PermuteU32:
+				case ValueOpcode::BpermuteU32:
+				case ValueOpcode::SubgroupUMinU32:
+				case ValueOpcode::SubgroupUMaxU32:
+				case ValueOpcode::SubgroupOrU32:
+					EXIT("the merged hull program reads or writes another lane's register, which "
+					     "its hull stage does not hold at one lane per invocation (block pc "
+					     "0x%08x)\n",
+					     block->start_pc);
+				case ValueOpcode::Ballot: {
+					std::unordered_set<const Inst*> seen;
+					if (!MergedHullOwnLaneMask(inst, seen)) {
+						EXIT("the merged hull program uses a lane mask other than its own lane's "
+						     "bit (block pc 0x%08x)\n",
+						     block->start_pc);
+					}
+					const auto lane = Value(&*block->PrependNewInst(it, ValueOpcode::LaneId));
+					const auto bit  = Value(&*block->PrependNewInst(
+					    it, ValueOpcode::ShiftLeftLogical32, {Value(1u), lane}));
+					const auto low  = Value(&*block->PrependNewInst(
+					    it, ValueOpcode::SelectU32, {inst.Arg(0), bit, Value(0u)}));
+					inst.ReplaceUsesWith(Value(&*block->PrependNewInst(
+					    it, ValueOpcode::CompositeConstructU32x4,
+					    {low, Value(0u), Value(0u), Value(0u)})));
+					break;
+				}
+				case ValueOpcode::ConditionRef:
+				case ValueOpcode::ReadFirstLane: inst.ReplaceUsesWith(inst.Arg(0)); break;
+				default: break;
+			}
+		}
+	}
+}
+
+void RequireMergedHullAligned(const MergedHullAddress& base, uint32_t offset, uint32_t pc) {
+	if (((base.coefficient | (base.constant + offset)) & 3u) != 0u) {
+		EXIT("the merged hull program uses an unaligned tessellation ring or LDS address at pc "
+		     "0x%08x\n",
+		     pc);
+	}
+}
+
+void RequireMergedHullRecord(const ShaderTessellationInputInfo& tess, IR::Value address,
+                             uint32_t offset, uint32_t components, bool write, uint32_t pc) {
+	const auto base   = MergedHullAddresses(tess.output_control_points, {}).Evaluate(address);
+	const auto stride = uint64_t {tess.ls_stride};
+	const auto begin  = base.constant + offset;
+	const auto end    = begin + 4u * uint64_t {components};
+	if (!base.known) {
+		EXIT("the merged hull program accesses LDS at pc 0x%08x through an address that is not a "
+		     "constant offset in a control point record of its patch\n",
+		     pc);
+	}
+	RequireMergedHullAligned(base, offset, pc);
+	if (write) {
+		if (base.coefficient != stride || end > stride) {
+			EXIT("the merged hull program writes LDS outside its own control point's record at "
+			     "pc 0x%08x\n",
+			     pc);
+		}
+	} else if ((base.coefficient != 0u && base.coefficient != stride) ||
+	           end + base.coefficient * (tess.output_control_points - 1u) >
+	               stride * tess.input_control_points) {
+		EXIT("the merged hull program reads LDS outside its patch's control point records at pc "
+		     "0x%08x\n",
+		     pc);
+	}
+}
+
+void RequireMergedHullRing(const ShaderTessellationInputInfo& tess, IR::Value address,
+                           uint32_t offset, uint32_t components, bool write, uint32_t pc) {
+	const auto base = MergedHullAddresses(tess.output_control_points, {}).Evaluate(address);
+	if (!base.known && write) {
+		EXIT("the merged hull program stores to the off-chip ring at pc 0x%08x through an address "
+		     "that is neither a constant nor an offset in its own control point's record\n",
+		     pc);
+	}
+	if (!base.known) {
+		EXIT("the merged hull program reads the off-chip ring at pc 0x%08x through an address "
+		     "that is neither a constant nor an offset in a control point's record\n",
+		     pc);
+	}
+	RequireMergedHullAligned(base, offset, pc);
+	const auto stride = uint64_t {tess.hs_stride};
+	const auto points = stride * tess.output_control_points;
+	const auto end    = base.constant + offset + 4u * uint64_t {components};
+	if (base.coefficient == 0u && base.constant >= points) {
+		if (base.constant + offset < tess.patch_base ||
+		    end > uint64_t {tess.patch_base} + tess.patch_size) {
+			EXIT("the merged hull program %s off-chip memory outside its control points and "
+			     "patch constants at pc 0x%08x\n",
+			     write ? "writes" : "reads", pc);
+		}
+	} else if (!write) {
+		if ((base.coefficient != 0u && base.coefficient != stride) ||
+		    end + base.coefficient * (tess.output_control_points - 1u) > points) {
+			EXIT("the merged hull program reads off-chip memory outside its patch's control "
+			     "points at pc 0x%08x\n",
+			     pc);
+		}
+	} else if (base.coefficient != 0u) {
+		if (base.coefficient != stride || end > stride) {
+			EXIT("the merged hull program stores to the off-chip ring outside its own control "
+			     "point's record at pc 0x%08x\n",
+			     pc);
+		}
+	} else if (tess.output_control_points != 1u || end > stride) {
+		EXIT("the merged hull program stores a control point's record at a constant off-chip "
+		     "address at pc 0x%08x, which only that control point's invocation can write\n",
+		     pc);
+	}
+}
+
+struct MergedHullTraffic {
+	const IR::Block* block;
+	uint32_t         order;
+	uint32_t         pc;
+	const IR::Inst*  inst = nullptr;
+};
+
+void RequireMergedHullBarrierOrder(std::span<const MergedHullTraffic> barriers,
+                                   std::span<const MergedHullTraffic> writes,
+                                   std::span<const MergedHullTraffic> reads) {
+	if (reads.empty()) return;
+	for (const auto& barrier: barriers) {
+		std::unordered_set<const IR::Block*> after;
+		const auto                           first = barrier.block->ImmSuccessors();
+		std::vector<const IR::Block*>        pending(first.begin(), first.end());
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (!after.insert(block).second) continue;
+			const auto next = block->ImmSuccessors();
+			pending.insert(pending.end(), next.begin(), next.end());
+		}
+		const auto later = [&](const MergedHullTraffic& access) {
+			return after.contains(access.block) ||
+			       (access.block == barrier.block && access.order > barrier.order);
+		};
+		if (std::ranges::none_of(writes, later) && std::ranges::all_of(reads, later)) return;
+	}
+	EXIT("the merged hull program reads another control point's LDS record at pc 0x%08x, but no "
+	     "s_barrier has every LDS write before it and every such read after it\n",
+	     reads.front().pc);
+}
+
+void OrderMergedHullRingReads(IR::Program& program, std::span<const MergedHullTraffic> writes,
+                              std::span<const MergedHullTraffic> reads) {
+	using namespace IR;
+	if (reads.empty()) return;
+	const auto reached = [](std::span<Block* const> from, const Block* avoided) {
+		std::unordered_set<const Block*> seen;
+		std::vector<const Block*>        pending(from.begin(), from.end());
+		while (!pending.empty()) {
+			const auto* block = pending.back();
+			pending.pop_back();
+			if (block == avoided || !seen.insert(block).second) continue;
+			const auto next = block->ImmSuccessors();
+			pending.insert(pending.end(), next.begin(), next.end());
+		}
+		return seen;
+	};
+	const auto reads_in = [&](const std::unordered_set<const Block*>& blocks, bool inside) {
+		return std::ranges::any_of(reads, [&](const MergedHullTraffic& read) {
+			return blocks.contains(read.block) == inside;
+		});
+	};
+	Block* const                   entry = program.blocks.front();
+	const std::span<Block* const> start(&entry, 1u);
+	const auto                     live = reached(start, nullptr);
+	if (reads_in(live, false)) {
+		EXIT("the merged hull program reads another control point's off-chip output in a block "
+		     "no control point reaches, at pc 0x%08x\n",
+		     reads.front().pc);
+	}
+	Block* barrier = nullptr;
+	for (auto* candidate: program.blocks) {
+		if (!live.contains(candidate)) continue;
+		const auto before = candidate == entry ? std::unordered_set<const Block*> {}
+		                                       : reached(start, candidate);
+		if (std::ranges::any_of(before,
+		                        [](const Block* block) { return block->ImmSuccessors().empty(); }) ||
+		    reads_in(before, true) ||
+		    reached(candidate->ImmSuccessors(), nullptr).contains(candidate)) {
+			continue;
+		}
+		if (barrier == nullptr ||
+		    reached(barrier->ImmSuccessors(), nullptr).contains(candidate)) {
+			barrier = candidate;
+		}
+	}
+	if (barrier == nullptr) {
+		EXIT("the merged hull program reads another control point's off-chip output at pc "
+		     "0x%08x, but no block before the read is reached once by every invocation, so no "
+		     "barrier can order it after the writes\n",
+		     reads.front().pc);
+	}
+	const auto               after = reached(barrier->ImmSuccessors(), nullptr);
+	const MergedHullTraffic* first = nullptr;
+	for (const auto& read: reads) {
+		if (read.block == barrier && (first == nullptr || read.order < first->order)) first = &read;
+	}
+	for (const auto& write: writes) {
+		if (!live.contains(write.block)) continue;
+		if (first != nullptr && write.block == barrier ? write.order > first->order
+		                                               : after.contains(write.block)) {
+			EXIT("the merged hull program reads another control point's off-chip output, but its "
+			     "control point store at pc 0x%08x comes after the last block every invocation "
+			     "reaches before the read\n",
+			     write.pc);
+		}
+	}
+	auto position = barrier->end();
+	if (first != nullptr) {
+		position = std::ranges::find_if(*barrier,
+		                                [&](const Inst& inst) { return &inst == first->inst; });
+	}
+	barrier->PrependNewInst(position, ValueOpcode::Barrier);
+}
+
+bool MergedHullFirstInvocationOnly(IR::Value predicate, MergedHullAddresses& addresses,
+                                   std::unordered_set<const IR::Inst*>& path) {
+	using namespace IR;
+	predicate = predicate.Resolve();
+	if (predicate.IsImmediate()) return predicate.GetType() == Type::U1 && !predicate.U1();
+	const auto* inst = predicate.TryInstruction();
+	if (inst == nullptr) return false;
+	if (!path.insert(inst).second) return true;
+	const auto invocation = [&](size_t index) {
+		const auto value = addresses.Evaluate(inst->Arg(index));
+		return value.known && value.coefficient == 1u && value.constant == 0u;
+	};
+	const auto immediate = [&](size_t index, uint32_t expected) {
+		const auto value = inst->Arg(index).Resolve();
+		return value.IsImmediate() && value.GetType() == Type::U32 && value.U32() == expected;
+	};
+	bool result = false;
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::LogicalAnd:
+			result = MergedHullFirstInvocationOnly(inst->Arg(0), addresses, path) ||
+			         MergedHullFirstInvocationOnly(inst->Arg(1), addresses, path);
+			break;
+		case ValueOpcode::ULessThan32: result = invocation(0) && immediate(1, 1u); break;
+		case ValueOpcode::UGreaterThan32: result = immediate(0, 1u) && invocation(1); break;
+		case ValueOpcode::ULessThanEqual32: result = invocation(0) && immediate(1, 0u); break;
+		case ValueOpcode::UGreaterThanEqual32: result = immediate(0, 0u) && invocation(1); break;
+		case ValueOpcode::IEqual32:
+			result = (invocation(0) && immediate(1, 0u)) || (immediate(0, 0u) && invocation(1));
+			break;
+		case ValueOpcode::Phi:
+			result = inst->NumArgs() != 0u;
+			for (size_t index = 0; result && index < inst->NumArgs(); index++) {
+				result = MergedHullFirstInvocationOnly(inst->Arg(index), addresses, path);
+			}
+			break;
+		default: break;
+	}
+	path.erase(inst);
+	return result;
+}
+
+void RequireMergedHullFirstInvocation(const ShaderTessellationInputInfo& tess, IR::Value predicate,
+                                      uint32_t pc) {
+	if (tess.output_control_points == 1u) return;
+	MergedHullAddresses                 addresses(tess.output_control_points, predicate);
+	std::unordered_set<const IR::Inst*> path;
+	if (!MergedHullFirstInvocationOnly(predicate, addresses, path)) {
+		EXIT("the merged hull program's per-patch tessellation output at pc 0x%08x is not "
+		     "written by control point 0 alone\n",
+		     pc);
+	}
+}
+#endif
+
+}
+
+#if defined(ANYPS5_KYTY)
+void RequireMergedHullControlPoints(const ShaderTessellationInputInfo& info) {
+	if (info.input_control_points > info.output_control_points) {
+		EXIT("a merged hull program with more input (%u) than output (%u) control points runs "
+		     "its local part on lanes the hull stage does not have\n",
+		     info.input_control_points, info.output_control_points);
+	}
+}
+
+void RequireMergedHullLimits(const ShaderTessellationInputInfo& info,
+                             const TessellationLimits&          limits) {
+	const auto vectors    = [](uint32_t bytes) { return (bytes + 15u) / 16u; };
+	const auto patch      = vectors(info.patch_size);
+	const auto per_vertex = vectors(info.hs_stride) + vectors(info.ls_stride);
+	const auto locations  = per_vertex + patch;
+	const auto total      = 4u * (uint64_t {info.output_control_points} * per_vertex + patch);
+	if (4u * uint64_t {locations} > limits.per_vertex_output_components ||
+	    4u * uint64_t {patch} > limits.per_patch_output_components ||
+	    total > limits.total_output_components ||
+	    vectors(IR::MergedHullRecordBytes) * 4u > limits.per_vertex_input_components) {
+		EXIT("the merged hull program's outputs exceed the device's tessellation limits (LDS "
+		     "stride %u, control point stride %u, patch constants %u bytes: %u per-vertex "
+		     "locations, %u patch vectors, %" PRIu64 " components)\n",
+		     info.ls_stride, info.hs_stride, info.patch_size, locations, patch, total);
+	}
+}
+#endif
 
 bool AnalyzeTessellationPrograms(std::span<const uint32_t> local, std::span<const uint32_t> control,
                                  ShaderTessellationInputInfo& info) {
+#if defined(ANYPS5_KYTY)
+	if (info.merged_hull != 0) {
+		RequireMergedHullControlPoints(info);
+		Decoder::Program merged;
+		Decoder::DecodeProgram(control, merged);
+		ReflectTessellationLayout(merged, true, info);
+		ReflectTessellationLayout(merged, false, info);
+		LOGF("Merged hull tessellation interface: input_cp=%u output_cp=%u ls_stride=%u "
+		     "hs_stride=%u patch_base=0x%x patch_size=%u\n",
+		     info.input_control_points, info.output_control_points, info.ls_stride,
+		     info.hs_stride, info.patch_base, info.patch_size);
+		return true;
+	}
+#endif
 	const auto       local_program = Decoder::DecodeFrontProgram(local);
 	Decoder::Program control_program;
 	Decoder::DecodeProgram(control, control_program);
@@ -298,6 +904,15 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 		return false;
 	};
 	const auto& tess = options.input_info.vertex->tess;
+#if defined(ANYPS5_KYTY)
+	const bool merged = options.stage == ShaderType::TessellationControl && tess.merged_hull != 0;
+	if (merged) {
+		RequireMergedHullControlPoints(tess);
+		RequireMergedHullBarriers(program);
+		LowerMergedHullLanes(program);
+		ConstantPropagationPass(program.blocks, program.wave_size);
+	}
+#endif
 	{
 		const auto shift_amount = [](const Value& value, uint32_t& amount) {
 			const auto* shl = value.Resolve().TryInstruction();
@@ -331,6 +946,29 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 	}
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
+#if defined(ANYPS5_KYTY)
+			if (merged) {
+				const bool lds =
+				    SharedAccessOf(it->GetOpcode()) != SharedAccess::None &&
+				    program.memory_info.at(it->Flags<MemoryFlags>().index).kind == ResourceKind::Lds;
+				if (lds || TessellationBufferBase(*it) != nullptr) {
+					const size_t index   = lds ? 0u : 2u;
+					const auto   address = MergedHullAddresses(tess.output_control_points,
+					                                           it->Arg(it->NumArgs() - 1u))
+					                           .Evaluate(it->Arg(index));
+					if (address.known) {
+						it->SetArg(index, MergedHullAddressValue(*block, it, address));
+						continue;
+					}
+					if (lds) {
+						std::unordered_map<Inst*, Value> active;
+						it->SetArg(0, ActiveAddress(*block, it, it->Arg(0),
+						                            it->Arg(it->NumArgs() - 1u), active));
+						continue;
+					}
+				}
+			}
+#endif
 			if (TessellationBufferBase(*it) == nullptr) continue;
 			std::unordered_map<Inst*, Value> resolved;
 			it->SetArg(
@@ -339,9 +977,19 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 	}
 	ConstantPropagationPass(program.blocks, program.wave_size);
 	uint32_t reads = 0, writes = 0, factors = 0, patches = 0;
+#if defined(ANYPS5_KYTY)
+	std::vector<MergedHullTraffic> barriers, record_writes, record_reads, ring_writes, ring_reads;
+	uint32_t                       order = 0;
+#endif
 	for (auto* block: program.blocks) {
 		for (auto it = block->begin(); it != block->end(); ++it) {
 			auto&      inst   = *it;
+#if defined(ANYPS5_KYTY)
+			order++;
+			if (merged && inst.GetOpcode() == ValueOpcode::Barrier) {
+				barriers.push_back({block, order, block->start_pc});
+			}
+#endif
 			const auto shared = SharedAccessOf(inst.GetOpcode());
 			const auto buffer = BufferAccessOf(inst.GetOpcode());
 			if (shared == SharedAccess::None && buffer == BufferAccess::None) {
@@ -354,6 +1002,24 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 			Value                 address, predicate;
 			if (shared != SharedAccess::None && memory.kind == ResourceKind::Lds) {
 				write = shared == SharedAccess::Write;
+#if defined(ANYPS5_KYTY)
+				if (merged) {
+					if (memory.data_bits != 32u ||
+					    (shared != SharedAccess::Read && shared != SharedAccess::Write)) {
+						return unsupported("this LDS access");
+					}
+					RequireMergedHullRecord(tess, inst.Arg(0), memory.offset,
+					                        SharedComponentCount(inst.GetOpcode()), write,
+					                        inst.Flags<MemoryFlags>().pc);
+					const bool own = MergedHullAddresses(tess.output_control_points, {})
+					                     .Evaluate(inst.Arg(0))
+					                     .coefficient != 0u;
+					if (write || !own) {
+						(write ? record_writes : record_reads)
+						    .push_back({block, order, inst.Flags<MemoryFlags>().pc});
+					}
+				} else
+#endif
 				if (memory.data_bits != 32u ||
 				    (options.stage == ShaderType::Local
 				         ? !write
@@ -363,6 +1029,9 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 				}
 				kind       = write ? TessellationAttribute::LocalOutput
 				                   : TessellationAttribute::ControlInput;
+#if defined(ANYPS5_KYTY)
+				if (merged) kind = TessellationAttribute::ControlShared;
+#endif
 				components = SharedComponentCount(inst.GetOpcode());
 				address    = inst.Arg(0);
 				predicate  = inst.Arg(inst.NumArgs() - 1u);
@@ -385,12 +1054,24 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 					}
 					kind = TessellationAttribute::Factor;
 					factors += components;
+#if defined(ANYPS5_KYTY)
+					if (merged) {
+						RequireMergedHullFirstInvocation(tess, predicate,
+						                                 inst.Flags<MemoryFlags>().pc);
+					}
+#endif
 				} else {
 					const bool output = options.stage == ShaderType::TessellationControl;
 					EXIT_NOT_IMPLEMENTED(
 					    !output && (write || options.stage != ShaderType::TessellationEvaluation));
 					kind = output ? TessellationAttribute::ControlOutput
 					              : TessellationAttribute::EvaluationInput;
+#if defined(ANYPS5_KYTY)
+					if (merged) {
+						RequireMergedHullRing(tess, address, memory.offset, components, write,
+						                      inst.Flags<MemoryFlags>().pc);
+					}
+#endif
 					if (address.IsImmediate() &&
 					    address.U32() >= tess.hs_stride * tess.output_control_points) {
 						const auto begin = address.U32() + memory.offset;
@@ -399,6 +1080,12 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 						                         tess.patch_base + tess.patch_size);
 						kind = output ? TessellationAttribute::PatchOutput
 						              : TessellationAttribute::PatchInput;
+#if defined(ANYPS5_KYTY)
+						if (merged && write) {
+							RequireMergedHullFirstInvocation(tess, predicate,
+							                                 inst.Flags<MemoryFlags>().pc);
+						}
+#endif
 						if (write || !output) patches += components;
 					}
 				}
@@ -444,9 +1131,26 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 					                   {values[0], values[1], values[2], values[3]});
 				inst.ReplaceUsesWith(replacement);
 			}
+#if defined(ANYPS5_KYTY)
+			if (merged && kind == TessellationAttribute::ControlOutput &&
+			    tess.output_control_points != 1u) {
+				const auto pc = inst.Flags<MemoryFlags>().pc;
+				if (write) {
+					ring_writes.push_back({block, order, pc});
+				} else if (MergedHullAddresses(tess.output_control_points, {})
+				               .Evaluate(address)
+				               .coefficient == 0u) {
+					ring_reads.push_back({block, order, pc, values[0].TryInstruction()});
+				}
+			}
+#endif
 			inst.Invalidate();
 		}
 	}
+#if defined(ANYPS5_KYTY)
+	RequireMergedHullBarrierOrder(barriers, record_writes, record_reads);
+	OrderMergedHullRingReads(program, ring_writes, ring_reads);
+#endif
 	ConstantPropagationPass(program.blocks, program.wave_size);
 	RemoveIdentities(program);
 	EliminateDeadCode(program.blocks);

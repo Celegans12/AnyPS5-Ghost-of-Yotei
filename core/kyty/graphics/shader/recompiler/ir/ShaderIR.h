@@ -275,10 +275,19 @@ enum class TessellationAttribute {
 	EvaluationInput,
 	PatchOutput,
 	PatchInput,
+#if defined(ANYPS5_KYTY)
+	Factor,
+	ControlShared
+};
+constexpr uint32_t NumTessellationAttributes =
+    static_cast<uint32_t>(TessellationAttribute::ControlShared) + 1u;
+constexpr uint32_t MergedHullRecordBytes = 16u;
+#else
 	Factor
 };
 constexpr uint32_t NumTessellationAttributes =
     static_cast<uint32_t>(TessellationAttribute::Factor) + 1u;
+#endif
 
 enum class StageInputKind {
 	VertexIndex,

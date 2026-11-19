@@ -16,6 +16,16 @@ bool IsTessellationPatch(IR::TessellationAttribute kind) {
 	return kind == Attribute::PatchOutput || kind == Attribute::PatchInput;
 }
 
+#if defined(ANYPS5_KYTY)
+uint32_t TessellationStride(const ShaderTessellationInputInfo& tess,
+                            IR::TessellationAttribute          kind) {
+	using Attribute = IR::TessellationAttribute;
+	if (kind == Attribute::ControlShared) return tess.ls_stride;
+	if (kind != Attribute::LocalOutput && kind != Attribute::ControlInput) return tess.hs_stride;
+	return tess.merged_hull != 0 ? IR::MergedHullRecordBytes : tess.ls_stride;
+}
+#endif
+
 uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& state          = ctx.state;
 	using Attribute      = IR::TessellationAttribute;
@@ -43,8 +53,12 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 	if (patch) {
 		address = EmitBinaryU32(state, spv::OpISub, address, ConstantU32(state, tess.patch_base));
 	}
+#if defined(ANYPS5_KYTY)
+	const auto stride = TessellationStride(tess, kind);
+#else
 	const bool local  = kind == Attribute::LocalOutput || kind == Attribute::ControlInput;
 	const auto stride = local ? tess.ls_stride : tess.hs_stride;
+#endif
 	const auto offset =
 	    patch ? address : EmitBinaryU32(state, spv::OpUMod, address, ConstantU32(state, stride));
 	const auto attribute =
@@ -59,7 +73,11 @@ uint32_t TessellationPointer(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                          component);
 	} else {
 		const auto vertex =
+#if defined(ANYPS5_KYTY)
+		    (kind == Attribute::ControlOutput || kind == Attribute::ControlShared) &&
+#else
 		    kind == Attribute::ControlOutput &&
+#endif
 		            inst.GetOpcode() == IR::ValueOpcode::SetTessellationAttribute
 		        ? EmitLaneId(state)
 		        : EmitBinaryU32(state, spv::OpUDiv, address, ConstantU32(state, stride));
@@ -104,7 +122,11 @@ void DefineTessellationInterfaces(EmitterState& state) {
 			type = array(TypeU32Vector(state, 4), (tess.patch_size + 15u) / 16u);
 		} else {
 			const bool local  = kind == Attribute::LocalOutput || kind == Attribute::ControlInput;
+#if defined(ANYPS5_KYTY)
+			const auto stride = TessellationStride(tess, kind);
+#else
 			const auto stride = local ? tess.ls_stride : tess.hs_stride;
+#endif
 			type              = array(TypeU32Vector(state, 4), (stride + 15u) / 16u);
 			if (kind != Attribute::LocalOutput) {
 				type = array(type, local ? tess.input_control_points : tess.output_control_points);
@@ -122,9 +144,18 @@ void DefineTessellationInterfaces(EmitterState& state) {
 			state.builder.AddAnnotation(spv::OpDecorate, state.tess_inner_variable,
 			                            spv::DecorationPatch);
 		} else {
+#if defined(ANYPS5_KYTY)
+			const auto control = (tess.hs_stride + 15u) / 16u;
+			state.builder.AddAnnotation(
+			    spv::OpDecorate, variable, spv::DecorationLocation,
+			    patch                             ? control
+			    : kind == Attribute::ControlShared ? control + (tess.patch_size + 15u) / 16u
+			                                       : 0u);
+#else
 			state.builder.AddAnnotation(
 			    spv::OpDecorate, variable, spv::DecorationLocation,
 			    patch ? (tess.hs_stride + 15u) / 16u : 0u);
+#endif
 		}
 		if (kind == Attribute::Factor || patch) {
 			state.builder.AddAnnotation(spv::OpDecorate, variable, spv::DecorationPatch);

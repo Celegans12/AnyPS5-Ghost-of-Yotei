@@ -556,9 +556,15 @@ void BuildStageStaticKey(const ShaderVertexInputInfo& info, std::vector<uint32_t
 	words.push_back(info.tess.input_control_points);
 	if (info.tess.input_control_points != 0) {
 		const auto& tess = info.tess;
+#if defined(ANYPS5_KYTY)
+		words.insert({tess.output_control_points | (tess.merged_hull << 31u), tess.ls_stride,
+		              tess.hs_stride, tess.patch_base, tess.patch_size, tess.domain,
+		              tess.partitioning, tess.output_topology});
+#else
 		words.insert({tess.output_control_points, tess.ls_stride, tess.hs_stride,
 		              tess.patch_base, tess.patch_size, tess.domain, tess.partitioning,
 		              tess.output_topology});
+#endif
 	}
 
 	for (int i = 0; i < info.resources_num; i++) {
@@ -730,6 +736,22 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
                             std::array<ShaderVertexInputInfo, 3>& input_info) {
 	const auto& sh        = context.GetShaderRegisters();
 	const auto [local, local_hash] = ShaderGetMappedData(regs.ls_regs.data_addr, "ShaderGetInputInfoLS():");
+#if defined(ANYPS5_KYTY)
+	const bool merged_hull = local.type == Prospero::ShaderBinaryType::kHs;
+	if (merged_hull && regs.hs_regs.data_addr != 0) {
+		EXIT("merged hull program 0x%016" PRIx64 " is bound with a hull program 0x%016" PRIx64 "\n",
+		     regs.ls_regs.data_addr, regs.hs_regs.data_addr);
+	}
+	const uint64_t control_addr = merged_hull ? regs.ls_regs.data_addr : regs.hs_regs.data_addr;
+	const auto [control, control_hash] = ShaderGetMappedData(control_addr, "ShaderGetInputInfoHS():");
+	const auto [evaluation, evaluation_hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
+	EXIT_NOT_IMPLEMENTED((!merged_hull && (local.type != Prospero::ShaderBinaryType::kHsFront ||
+	                                       control.type != Prospero::ShaderBinaryType::kHsBack)) ||
+	                     evaluation.type != Prospero::ShaderBinaryType::kGs);
+	const auto stages = context.GetShaderStages();
+	EXIT_NOT_IMPLEMENTED((stages & 0x4u) == 0);
+	EXIT_IF(!merged_hull && regs.hs_regs.user_data_addr == 0);
+#else
 	const auto [control, control_hash] = ShaderGetMappedData(regs.hs_regs.data_addr, "ShaderGetInputInfoHS():");
 	const auto [evaluation, evaluation_hash] = ShaderGetMappedData(regs.es_regs.data_addr, "ShaderGetInputInfoTES():");
 	EXIT_NOT_IMPLEMENTED(local.type != Prospero::ShaderBinaryType::kHsFront ||
@@ -738,22 +760,35 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	const auto stages = context.GetShaderStages();
 	EXIT_NOT_IMPLEMENTED((stages & 0x4u) == 0);
 	EXIT_IF(regs.hs_regs.user_data_addr == 0);
+#endif
 
 	const auto local_users      = std::span(regs.hs_user_sgpr.value, regs.hs_regs.rsrc2.user_sgpr);
 	const auto evaluation_users = std::span(regs.gs_user_sgpr.value, regs.gs_regs.rsrc2.user_sgpr);
 	std::array<ShaderParams, 3> params {
 	    GetShaderParams(regs.ls_regs.data_addr, local_hash, local_users, local),
+#if defined(ANYPS5_KYTY)
+	    GetShaderParams(control_addr, control_hash, local_users, control, 8u),
+#else
 	    GetShaderParams(regs.hs_regs.data_addr, control_hash, local_users, control, 8u),
+#endif
 	    GetShaderParams(regs.es_regs.data_addr, evaluation_hash, evaluation_users,
 	                    evaluation),
 	};
 	params[1].user_data[0] = static_cast<uint32_t>(regs.hs_regs.user_data_addr);
 	params[1].user_data[1] = static_cast<uint32_t>(regs.hs_regs.user_data_addr >> 32u);
 
+#if defined(ANYPS5_KYTY)
+	if (!merged_hull &&
+	    !ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
+	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
+		EXIT("failed to prepare local shader program\n");
+	}
+#else
 	if (!ShaderGetStaticVertexInputInfo(regs.ls_regs.data_addr, regs.hs_user_sgpr,
 	                                    regs.hs_regs.rsrc2.user_sgpr, sh, local, input_info[0])) {
 		EXIT("failed to prepare local shader program\n");
 	}
+#endif
 	input_info[0].logical_stage       = ShaderType::Local;
 	input_info[0].wave_size           = (stages & 0x00200000u) != 0 ? 32u : 64u;
 	input_info[1].logical_stage       = ShaderType::TessellationControl;
@@ -770,6 +805,9 @@ PrepareTessellationPrograms(const HW::VertexShaderInfo& regs, const HW::Context&
 	    .domain                = sh.m_vgtTfParam & 0x3u,
 	    .partitioning          = (sh.m_vgtTfParam >> 2u) & 0x3u,
 	    .output_topology       = (sh.m_vgtTfParam >> 5u) & 0x3u,
+#if defined(ANYPS5_KYTY)
+	    .merged_hull           = merged_hull ? 1u : 0u,
+#endif
 	};
 	EXIT_IF(tess.input_control_points == 0 || tess.input_control_points > 32 ||
 	        tess.output_control_points == 0 || tess.output_control_points > 32);

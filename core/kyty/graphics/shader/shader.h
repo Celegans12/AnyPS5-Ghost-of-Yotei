@@ -124,6 +124,9 @@ struct ShaderTessellationInputInfo {
 	uint32_t domain                = 0;
 	uint32_t partitioning          = 0;
 	uint32_t output_topology       = 0;
+#if defined(ANYPS5_KYTY)
+	uint32_t merged_hull           = 0;
+#endif
 };
 
 struct ShaderIndirectOffsets {

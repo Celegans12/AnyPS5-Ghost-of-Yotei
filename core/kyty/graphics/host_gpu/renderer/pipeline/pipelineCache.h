@@ -211,6 +211,9 @@ struct PipelineStaticParameters {
 	uint8_t                    alpha_destblend[RENDER_COLOR_ATTACHMENTS_MAX]      = {};
 	bool                       separate_alpha_blend[RENDER_COLOR_ATTACHMENTS_MAX] = {};
 	bool                       blend_enable[RENDER_COLOR_ATTACHMENTS_MAX]         = {};
+#if defined(ANYPS5_KYTY)
+	uint32_t                   merged_hull                                        = 0;
+#endif
 };
 
 struct PipelineRenderingState {
@@ -257,6 +260,12 @@ struct OptimizedGraphicsPipeline {
 	bool                native   = false;
 	vk::Pipeline        pipeline = nullptr;
 };
+
+[[nodiscard]] PipelineStaticParameters LibraryStaticParameters(const HW::Context&    context,
+                                                               const HW::UserConfig& user_config,
+                                                               bool                  tessellation,
+                                                               const ShaderTessellationInputInfo& tess,
+                                                               bool ps_active, bool ps_sample_shading);
 #endif
 
 struct ShaderModule {

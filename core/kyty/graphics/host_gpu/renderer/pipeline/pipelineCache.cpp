@@ -100,8 +100,10 @@ vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front,
 }
 
 #if defined(ANYPS5_KYTY)
+}
+
 PipelineStaticParameters LibraryStaticParameters(const HW::Context& context, const HW::UserConfig& user_config,
-                                                 bool tessellation, uint32_t input_control_points, bool ps_active,
+                                                 bool tessellation, const ShaderTessellationInputInfo& tess, bool ps_active,
                                                  bool ps_sample_shading) {
 	PipelineStaticParameters params {};
 	const auto& mc           = context.GetModeControl();
@@ -112,7 +114,8 @@ PipelineStaticParameters LibraryStaticParameters(const HW::Context& context, con
 	params.provoking_vtx_last  = mc.provoking_vtx_last;
 	params.polygon_mode = ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
 	if (tessellation) {
-		params.patch_control_points = input_control_points;
+		params.patch_control_points = tess.input_control_points;
+		params.merged_hull          = tess.merged_hull;
 	} else if (rect_list) {
 		params.patch_control_points = 3;
 	}
@@ -134,6 +137,8 @@ PipelineStaticParameters LibraryStaticParameters(const HW::Context& context, con
 	params.alpha_to_coverage_enable = ps_active && context.GetShaderRegisters().AlphaToMask();
 	return params;
 }
+
+namespace {
 
 bool PipelineChainWanted() {
 	static const bool wanted = [] {
@@ -1982,9 +1987,21 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 #else
 		vertex_params = PrepareTessellationPrograms(vertex_regs, context, vertex_info);
 #endif
+#if defined(ANYPS5_KYTY)
+		const auto skip_tessellation = [&] {
+			vertex_info[0].stage = {};
+			if (ahead != nullptr) ahead->reads.Fail();
+			return ahead == nullptr;
+		};
+		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
+		                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
+		                                   sh.m_vgtTfParam |
+		                                   uint64_t {vertex_info[0].tess.merged_hull} << 63u};
+#else
 		const uint64_t layout_key[] = {vertex_params[0].hash, vertex_params[1].hash,
 		                               uint64_t {sh.m_vgtLsHsConfig & 0xfff00u} << 32u |
 		                                   sh.m_vgtTfParam};
+#endif
 		const auto layout_hash = XXH3_64bits(layout_key, sizeof(layout_key));
 		ShaderTessellationInputInfo tess;
 		{
@@ -2000,6 +2017,22 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 				const auto [layout, inserted] =
 				    m_tess_layouts.try_emplace(layout_hash, vertex_info[0].tess);
 				if (inserted) {
+#if defined(ANYPS5_KYTY)
+					if (layout->second.merged_hull != 0) {
+						auto merged = layout->second;
+						if (!Common::Fallback::Run(
+						        "draw or dispatch skipped: its shader stage could not be prepared",
+						        "PipelineCache::ResolveGraphicsPrograms", vertex_params[1].hash,
+						        vertex_regs.ls_regs.data_addr, [&] {
+							        static_cast<void>(ShaderRecompiler::AnalyzeTessellationPrograms(
+							            vertex_params[0].code, vertex_params[1].code, merged));
+						        })) {
+							m_tess_layouts.erase(layout);
+							return skip_tessellation();
+						}
+						layout->second = merged;
+					} else
+#endif
 					if (!ShaderRecompiler::AnalyzeTessellationPrograms(
 					        vertex_params[0].code, vertex_params[1].code, layout->second)) {
 						EXIT("unsupported tessellation program shape: LS 0x%016" PRIx64
@@ -2011,6 +2044,24 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 				tess = layout->second;
 			}
 		}
+#if defined(ANYPS5_KYTY)
+		if (tess.merged_hull != 0) {
+			const auto& device = m_graphics.GetPhysicalDeviceProperties().limits;
+			const ShaderRecompiler::TessellationLimits limits {
+			    .per_vertex_input_components  = device.maxTessellationControlPerVertexInputComponents,
+			    .per_vertex_output_components = device.maxTessellationControlPerVertexOutputComponents,
+			    .per_patch_output_components  = device.maxTessellationControlPerPatchOutputComponents,
+			    .total_output_components      = device.maxTessellationControlTotalOutputComponents,
+			};
+			if (!Common::Fallback::Run(
+			        "draw or dispatch skipped: its shader stage could not be prepared",
+			        "PipelineCache::ResolveGraphicsPrograms", vertex_params[1].hash,
+			        vertex_regs.ls_regs.data_addr,
+			        [&] { ShaderRecompiler::RequireMergedHullLimits(tess, limits); })) {
+				return skip_tessellation();
+			}
+		}
+#endif
 		for (auto& stage: vertex_info) {
 			stage.tess = tess;
 		}
@@ -2220,7 +2271,7 @@ bool PipelineCache::ResolveGraphicsPrograms(const HW::Context&    context,
 				}
 				job->push_data_cursor = first_cursor;
 				job->params           = LibraryStaticParameters(context, user_config, tess_active,
-				                                                vertex_info[0].tess.input_control_points, true,
+				                                                vertex_info[0].tess, true,
 				                                                pixel_info.ps_sample_shading);
 				QueueChain(std::move(job));
 			}
@@ -3658,6 +3709,9 @@ PipelineCache::Pipeline* PipelineCache::GetGraphicsPipeline(const CommandBuffer&
 	    ResolvePolygonMode(mc, !rect_list && mc.cull_front, !rect_list && mc.cull_back);
 	if (tessellation) {
 		static_params.patch_control_points = vs_input_info.tess.input_control_points;
+#if defined(ANYPS5_KYTY)
+		static_params.merged_hull = vs_input_info.tess.merged_hull;
+#endif
 	} else if (!mesh && static_params.topology == vk::PrimitiveTopology::ePatchList) {
 		static_params.patch_control_points = 3;
 	}
@@ -4072,7 +4126,7 @@ void PipelineCache::PrepareGraphicsLibraries(const HW::Context& context, const H
 	}
 	auto& params = key.static_params;
 	params       = LibraryStaticParameters(context, user_config, vertex_info.size() == 3,
-	                                       vertex_info[0].tess.input_control_points, state.ps_active,
+	                                       vertex_info[0].tess, state.ps_active,
 	                                       state.ps_input_info.ps_sample_shading);
 	struct Seen {
 		std::array<uint64_t, 4>  stage_ids;

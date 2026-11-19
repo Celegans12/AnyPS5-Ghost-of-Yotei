@@ -76,7 +76,11 @@ static_assert(sizeof(ShaderMeshInputInfo) == 60, "name the new field");
 static_assert(sizeof(ShaderComputeInputInfo) == 104, "name the new field");
 static_assert(sizeof(PipelineRenderingState) == 44, "name the new field");
 static_assert(sizeof(PipelineVertexInputState) == 322, "name the new field");
+#if defined(ANYPS5_KYTY)
+static_assert(sizeof(PipelineStaticParameters) == 122, "name the new field");
+#else
 static_assert(sizeof(PipelineStaticParameters) == 118, "name the new field");
+#endif
 
 std::string_view TrimPrefix(std::string_view name, std::string_view prefix) {
 	return name.starts_with(prefix) && name.size() > prefix.size() ? name.substr(prefix.size())
@@ -414,8 +418,14 @@ void VisitVertexInput(V& v, ShaderVertexInputInfo& info, const ShaderVertexInput
 	v.Dec("mmaxp", mesh.max_primitives, base.mesh.max_primitives);
 	v.Dec("mprov", mesh.provoking_vertex, base.mesh.provoking_vertex);
 	v.Flag("mfast", mesh.fast_launch, base.mesh.fast_launch);
+#if defined(ANYPS5_KYTY)
+	auto& [input_control_points, output_control_points, ls_stride, hs_stride, patch_base,
+	       patch_size, domain, partitioning, output_topology, merged_hull] = tess;
+	v.Dec("tmh", merged_hull, base.tess.merged_hull);
+#else
 	auto& [input_control_points, output_control_points, ls_stride, hs_stride, patch_base,
 	       patch_size, domain, partitioning, output_topology] = tess;
+#endif
 	v.Dec("ticp", input_control_points, base.tess.input_control_points);
 	v.Dec("tocp", output_control_points, base.tess.output_control_points);
 	v.Dec("tls", ls_stride, base.tess.ls_stride);
@@ -826,8 +836,13 @@ std::string PipelineText(const ManifestPipeline&      pipeline,
 	                              rendering_fields_d] = pipeline.key.rendering;
 	[[maybe_unused]] const auto& [input_fields_a, input_fields_b, input_fields_c, input_fields_d] =
 	    pipeline.key.vertex_input;
+#if defined(ANYPS5_KYTY)
+	[[maybe_unused]] const auto& [s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15,
+	                              s16, s17, s18, s19, s20] = pipeline.key.static_params;
+#else
 	[[maybe_unused]] const auto& [s1, s2, s3, s4, s5, s6, s7, s8, s9, s10, s11, s12, s13, s14, s15,
 	                              s16, s17, s18, s19] = pipeline.key.static_params;
+#endif
 	std::string text                                  = "P";
 	TextWriter  w(text);
 	for (size_t i = 0; i < PipelineStageKeys.size(); i++) {
@@ -885,6 +900,10 @@ std::string PipelineText(const ManifestPipeline&      pipeline,
 	w.Flag("sshade", sample_shading);
 	w.Flag("a2c", alpha_to_coverage);
 	w.Flag("pvlast", provoking_last);
+#if defined(ANYPS5_KYTY)
+	bool merged_hull = s.merged_hull != 0;
+	w.Flag("mhull", merged_hull);
+#endif
 	if (s.topology != PipelineStaticParameters {}.topology) w.Value("topo", VkName(s.topology));
 	uint32_t control_points = s.patch_control_points;
 	uint32_t samples        = s.samples;
@@ -986,6 +1005,10 @@ bool ReadPipeline(std::span<const std::string_view>                     tokens,
 	s.alpha_to_coverage_enable = flag;
 	r.Flag("pvlast", flag);
 	s.provoking_vtx_last = flag;
+#if defined(ANYPS5_KYTY)
+	r.Flag("mhull", flag);
+	s.merged_hull = flag ? 1u : 0u;
+#endif
 	if (const auto text = r.Find("topo")) {
 		vk::PrimitiveTopology topology {};
 		r.ok       = r.ok && ParseVk(*text, topology);
@@ -1076,14 +1099,26 @@ std::string PipelineLinkError(const ManifestPipeline&         pipeline,
 	    (tessellation && (points == 0 || topology != vk::PrimitiveTopology::ePatchList))) {
 		return fmt::format("patches of {} points where its draws have {}", points, drawn);
 	}
+#if defined(ANYPS5_KYTY)
+	if (const uint32_t merged = s.merged_hull; merged != (tessellation ? vertex.tess.merged_hull : 0u)) {
+		return fmt::format("a {} hull key where its stages are {}", merged != 0 ? "merged" : "split",
+		                   merged != 0 ? "split" : "merged");
+	}
+#endif
 	return {};
 }
 
 std::string LayoutText(uint64_t key, ShaderTessellationInputInfo layout) {
 	std::string text = fmt::format("T {:016x}", key);
 	TextWriter  w(text);
+#if defined(ANYPS5_KYTY)
+	auto& [input_control_points, output_control_points, ls_stride, hs_stride, patch_base,
+	       patch_size, domain, partitioning, output_topology, merged_hull] = layout;
+	w.Dec("mh", merged_hull, 0u);
+#else
 	auto& [input_control_points, output_control_points, ls_stride, hs_stride, patch_base,
 	       patch_size, domain, partitioning, output_topology] = layout;
+#endif
 	w.Dec("icp", input_control_points, 0u);
 	w.Dec("ocp", output_control_points, 0u);
 	w.Dec("ls", ls_stride, 0u);
@@ -1100,8 +1135,14 @@ bool ReadLayout(std::span<const std::string_view>                 tokens,
                 std::pair<uint64_t, ShaderTessellationInputInfo>& entry) {
 	if (tokens.empty() || !ParseNumber(tokens[0], entry.first, 16)) return false;
 	TextReader r(tokens.subspan(1));
+#if defined(ANYPS5_KYTY)
+	auto& [input_control_points, output_control_points, ls_stride, hs_stride, patch_base,
+	       patch_size, domain, partitioning, output_topology, merged_hull] = entry.second;
+	r.Dec("mh", merged_hull, 0u);
+#else
 	auto& [input_control_points, output_control_points, ls_stride, hs_stride, patch_base,
 	       patch_size, domain, partitioning, output_topology] = entry.second;
+#endif
 	r.Dec("icp", input_control_points, 0u);
 	r.Dec("ocp", output_control_points, 0u);
 	r.Dec("ls", ls_stride, 0u);
