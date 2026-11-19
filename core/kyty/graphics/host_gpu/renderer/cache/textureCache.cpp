@@ -2732,6 +2732,14 @@ void TextureCache::CommitGpuWrite(Image& image) {
 	image.MarkGpuModified();
 }
 
+static bool StencilFillHeldPlaneOnly() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_FIX_STENCIL_FILL_HELD_PLANE");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
 bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address, uint64_t size,
                                         uint32_t packed_clear) {
 	if (command.IsInvalid() || !GuestRange {address, size}.Valid()) {
@@ -2757,6 +2765,9 @@ bool TextureCache::ClearImageFromBuffer(CommandBuffer& command, uint64_t address
 			candidate_subresources = owner.stencil_subresources;
 			const auto& depth      = m_slot_images[candidate_id];
 			if (depth.backing.image == nullptr || !depth.info.HasStencil()) {
+				continue;
+			}
+			if (StencilFillHeldPlaneOnly() && depth.info.stencil.address != address) {
 				continue;
 			}
 		} else if (!owner.depth_id && owner.info.data.address == address &&
