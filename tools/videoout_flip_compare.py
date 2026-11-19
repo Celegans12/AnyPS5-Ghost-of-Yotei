@@ -1,4 +1,5 @@
 import argparse
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -10,13 +11,19 @@ from benchmark_compare import MAX_FILE_BYTES, UINT64_MAX, benchmark_integer, rej
 from performance_compare import unique_json_object
 
 
-def videoout_flip_records(path):
+def read_videoout_flip_data(path):
     if not path.is_file():
         raise ValueError(f"{path}: input must be a regular file")
     with path.open("rb") as source:
         data = source.read(MAX_FILE_BYTES + 1)
     if len(data) > MAX_FILE_BYTES:
         raise ValueError(f"{path}: input exceeds {MAX_FILE_BYTES} bytes")
+    return data
+
+
+def videoout_flip_records(path, *, data=None):
+    if data is None:
+        data = read_videoout_flip_data(path)
     if data and not data.endswith(b"\n"):
         raise ValueError(f"{path}: incomplete final JSONL record")
     for number, raw in enumerate(io.BytesIO(data), 1):
@@ -32,8 +39,8 @@ def videoout_flip_records(path):
         yield location, record
 
 
-def read_videoout_flip_samples(path):
-    records = videoout_flip_records(path)
+def read_videoout_flip_samples(path, *, data=None):
+    records = videoout_flip_records(path, data=data)
     location, contract = next(records, (str(path), {}))
     if (contract.get("ev") != "contract" or contract.get("contract") != "v1-pad"
             or contract.get("prx") != "libSceVideoOut"):
@@ -83,8 +90,8 @@ def read_videoout_flip_samples(path):
     }, samples
 
 
-def read_videoout_flip_window(path):
-    window, samples = read_videoout_flip_samples(path)
+def read_videoout_flip_window(path, *, data=None):
+    window, samples = read_videoout_flip_samples(path, data=data)
     drops = window.pop("observed_telemetry_drops")
     timestamps = [timestamp for timestamp, _ in samples]
     intervals = [right - left for left, right in zip(timestamps, timestamps[1:])]
@@ -111,19 +118,78 @@ def compare_videoout_flip_windows(anyps5_path, kyty_path):
     return {"format": "aps5-videoout-flip-comparison/1", "anyps5": anyps5, "kyty": kyty}
 
 
+def read_pinned_videoout_flip_window(path, revision):
+    if not re.fullmatch(r"[0-9a-f]{40}", revision):
+        raise ValueError(f"{path}: expected a full 40-digit lowercase hexadecimal revision")
+    data = read_videoout_flip_data(path)
+    window = read_videoout_flip_window(path, data=data)
+    if not revision.startswith(window["commit"]):
+        raise ValueError(f"{path}: reported revision {window['commit']} does not match {revision}")
+    return {**window, "expected_revision": revision, "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def compare_videoout_build_windows(baseline_path, candidate_path, baseline_revision, candidate_revision):
+    if baseline_path.samefile(candidate_path):
+        raise ValueError("supply separate baseline and candidate telemetry files")
+    baseline = read_pinned_videoout_flip_window(baseline_path, baseline_revision)
+    candidate = read_pinned_videoout_flip_window(candidate_path, candidate_revision)
+    if baseline["sha256"] == candidate["sha256"]:
+        raise ValueError("baseline and candidate telemetry are byte-identical")
+    fields = ("first_flip", "flip_count")
+    if any(baseline[field] != candidate[field] for field in fields):
+        raise ValueError("baseline and candidate must declare the same first flip and flip count")
+    if baseline_revision != candidate_revision and any(
+        baseline_revision.startswith(run["commit"]) and candidate_revision.startswith(run["commit"])
+        for run in (baseline, candidate)
+    ):
+        raise ValueError("a reported revision prefix matches both expected revisions")
+    metrics = ("mean_fps", "p50_ms", "p99_ms")
+    return {
+        "format": "aps5-videoout-build-comparison/1",
+        "baseline": baseline,
+        "candidate": candidate,
+        "candidate_minus_baseline": {metric: candidate[metric] - baseline[metric] for metric in metrics},
+    }
+
+
+def build_comparison_markdown(report):
+    lines = ["| Arm | Revision | First flip | Flips | Mean FPS | p50 ms | p99 ms | Telemetry drops observed |",
+             "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |"]
+    for arm in ("baseline", "candidate"):
+        run = report[arm]
+        lines.append(f"| {arm.capitalize()} | `{run['expected_revision']}` | {run['first_flip']} | "
+                     f"{run['flip_count']} | {run['mean_fps']:.2f} | {run['p50_ms']:.3f} | "
+                     f"{run['p99_ms']:.3f} | {run['observed_telemetry_drops']} |")
+    delta = report["candidate_minus_baseline"]
+    lines.append(f"| Candidate minus baseline | | | | {delta['mean_fps']:+.2f} | "
+                 f"{delta['p50_ms']:+.3f} | {delta['p99_ms']:+.3f} | |")
+    return "\n".join(lines)
+
+
 def main(argv=None):
-    parser = argparse.ArgumentParser(description="Compare completed VideoOut flip windows from the same AnyKyty revision.")
-    parser.add_argument("anyps5", type=Path, help="videoout.jsonl from the default AnyPS5 backend")
-    parser.add_argument("kyty", type=Path, help="videoout.jsonl from the Kyty backend")
+    parser = argparse.ArgumentParser(description="Compare completed VideoOut flip windows.")
+    parser.add_argument("anyps5", type=Path, help="default-backend or pinned baseline videoout.jsonl")
+    parser.add_argument("kyty", type=Path, help="Kyty-backend or pinned candidate videoout.jsonl")
+    parser.add_argument("--baseline-revision", help="full Git revision expected for the first input")
+    parser.add_argument("--candidate-revision", help="full Git revision expected for the second input")
     parser.add_argument("--json", action="store_true", help="print a machine-readable report")
     args = parser.parse_args(argv)
+    if (args.baseline_revision is None) != (args.candidate_revision is None):
+        parser.error("--baseline-revision and --candidate-revision must be used together")
+    build_mode = args.baseline_revision is not None
     try:
-        report = compare_videoout_flip_windows(args.anyps5, args.kyty)
+        if build_mode:
+            report = compare_videoout_build_windows(args.anyps5, args.kyty, args.baseline_revision,
+                                                   args.candidate_revision)
+        else:
+            report = compare_videoout_flip_windows(args.anyps5, args.kyty)
     except (OSError, ValueError) as error:
         print(f"videoout_flip_compare: {error}", file=sys.stderr)
         return 2
     if args.json:
         print(json.dumps(report, indent=2, allow_nan=False))
+    elif build_mode:
+        print(build_comparison_markdown(report))
     else:
         print(f"Build revision: {report['anyps5']['commit']}")
         print()

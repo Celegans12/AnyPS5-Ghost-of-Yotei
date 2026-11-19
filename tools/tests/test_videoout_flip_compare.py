@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -10,6 +11,10 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import videoout_flip_compare as tool
+
+
+BASELINE_REVISION = "0123456789ab" + "0" * 28
+CANDIDATE_REVISION = "fedcba987654" + "1" * 28
 
 
 def event(kind, **fields):
@@ -159,13 +164,84 @@ class VideoOutFlipCompareTests(unittest.TestCase):
         table = subprocess.run(command, check=True, capture_output=True, text=True, env=env).stdout
         self.assertIn("| AnyPS5 | 31 | 2 | 50.00 | 20.000 | 20.000 | 0 |", table)
         result = subprocess.run([*command, "--json"], check=True, capture_output=True, text=True, env=env)
-        self.assertEqual(json.loads(result.stdout)["kyty"]["mean_fps"], 100)
+        report = json.loads(result.stdout)
+        self.assertEqual(set(report), {"format", "anyps5", "kyty"})
+        self.assertEqual(report["format"], "aps5-videoout-flip-comparison/1")
+        self.assertEqual(report["kyty"]["mean_fps"], 100)
         self.assertNotIn(str(self.root), result.stdout)
         self.write("kyty.jsonl", run_records([1000, 11000])[:-1])
         result = subprocess.run(command, capture_output=True, text=True, env=env)
         self.assertEqual(result.returncode, 2)
         self.assertEqual(result.stdout, "")
         self.assertIn("incomplete window", result.stderr)
+
+    def test_cli_compares_two_pinned_1200_flip_build_windows(self):
+        baseline = self.write("baseline.jsonl", run_records(
+            [50_000_000 + index * 47_000 for index in range(1200)], first=9000, revision=BASELINE_REVISION[:12]))
+        candidate = self.write("candidate.jsonl", run_records(
+            [2_000_000 + index * 28_000 for index in range(1200)], first=9000,
+            generation=8, pid=11, revision=CANDIDATE_REVISION[:12]))
+        command = [sys.executable, "-B", tool.__file__, str(baseline), str(candidate)]
+        legacy = subprocess.run([*command, "--json"], capture_output=True, text=True)
+        self.assertEqual(legacy.returncode, 2)
+        self.assertIn("same build revision", legacy.stderr)
+        command.extend(("--baseline-revision", BASELINE_REVISION, "--candidate-revision", CANDIDATE_REVISION))
+        result = subprocess.run([*command, "--json"], check=True, capture_output=True, text=True)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["format"], "aps5-videoout-build-comparison/1")
+        for arm, path, revision, frame_ms in (("baseline", baseline, BASELINE_REVISION, 47),
+                                              ("candidate", candidate, CANDIDATE_REVISION, 28)):
+            row = report[arm]
+            self.assertEqual(row["expected_revision"], revision)
+            self.assertEqual(row["commit"], revision[:12])
+            self.assertEqual(row["sha256"], hashlib.sha256(path.read_bytes()).hexdigest())
+            self.assertEqual((row["first_flip"], row["flip_count"]), (9000, 1200))
+            self.assertEqual((row["p50_ms"], row["p99_ms"]), (frame_ms, frame_ms))
+        self.assertAlmostEqual(report["candidate_minus_baseline"]["mean_fps"], 1000 / 28 - 1000 / 47)
+        self.assertEqual(report["candidate_minus_baseline"]["p99_ms"], -19)
+        table = subprocess.run(command, check=True, capture_output=True, text=True).stdout
+        self.assertIn(f"| Baseline | `{BASELINE_REVISION}` | 9000 | 1200 |", table)
+        self.assertIn(f"| Candidate | `{CANDIDATE_REVISION}` | 9000 | 1200 |", table)
+        self.assertIn("Candidate minus baseline", table)
+
+    def test_build_mode_accepts_distinct_runs_of_one_build_and_rejects_copies(self):
+        baseline = self.write("baseline.jsonl", run_records([100, 200], revision=BASELINE_REVISION))
+        candidate = self.write("candidate.jsonl", run_records([100, 120], pid=11, revision=BASELINE_REVISION))
+        report = tool.compare_videoout_build_windows(baseline, candidate, BASELINE_REVISION, BASELINE_REVISION)
+        self.assertEqual(report["candidate"]["mean_fps"], 50_000)
+        with self.assertRaisesRegex(ValueError, "separate"):
+            tool.compare_videoout_build_windows(baseline, baseline, BASELINE_REVISION, BASELINE_REVISION)
+        candidate.write_bytes(baseline.read_bytes())
+        with self.assertRaisesRegex(ValueError, "byte-identical"):
+            tool.compare_videoout_build_windows(baseline, candidate, BASELINE_REVISION, BASELINE_REVISION)
+
+    def test_build_mode_enforces_revisions_and_complete_matching_windows(self):
+        baseline = self.write("baseline.jsonl", run_records([100, 200], revision=BASELINE_REVISION[:12]))
+        good = run_records([100, 300], revision=CANDIDATE_REVISION[:12])
+        cases = (
+            (good, BASELINE_REVISION[:12], CANDIDATE_REVISION, "full 40-digit"),
+            (good, BASELINE_REVISION, BASELINE_REVISION, "does not match"),
+            (good[:-1], BASELINE_REVISION, CANDIDATE_REVISION, "incomplete window"),
+            (run_records([100, 300], first=40, revision=CANDIDATE_REVISION),
+             BASELINE_REVISION, CANDIDATE_REVISION, "same first flip and flip count"),
+            (run_records([100, 300, 500], revision=CANDIDATE_REVISION),
+             BASELINE_REVISION, CANDIDATE_REVISION, "same first flip and flip count"),
+            (run_records([100, 300], revision=BASELINE_REVISION[:12]),
+             BASELINE_REVISION, BASELINE_REVISION[:12] + "2" * 28, "prefix matches both"),
+        )
+        for rows, expected_baseline, expected_candidate, message in cases:
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                candidate = self.write("candidate.jsonl", rows)
+                tool.compare_videoout_build_windows(baseline, candidate, expected_baseline, expected_candidate)
+
+    def test_cli_requires_both_revision_options(self):
+        for option in ("--baseline-revision", "--candidate-revision"):
+            with self.subTest(option=option):
+                command = [sys.executable, "-B", tool.__file__, "baseline.jsonl", "candidate.jsonl", option, BASELINE_REVISION]
+                result = subprocess.run(command, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+                self.assertEqual(result.stdout, "")
+                self.assertIn("must be used together", result.stderr)
 
 
 if __name__ == "__main__":

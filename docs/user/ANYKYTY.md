@@ -273,6 +273,17 @@ python tools/videoout_flip_compare.py default/videoout.jsonl kyty/videoout.jsonl
 
 The comparison checks the reported build revision and every flip in each declared window. It reports mean completed-flip FPS and the median and nearest-rank p99 of the intervals between flips. `--json` prints the same metrics for other tools. The drop count covers all telemetry events, including pad and caption updates. The report measures completed VideoOut flips. Scene equivalence, build cleanliness, unique rendered frames and display timing need separate evidence.
 
+For a baseline and candidate build, record the same first flip and count in separate runs. Pass each full revision from
+`git rev-parse HEAD` in the corresponding build checkout. Use the same revision twice to compare two settings of one build.
+
+```sh
+python tools/videoout_flip_compare.py baseline/videoout.jsonl candidate/videoout.jsonl \
+  --baseline-revision BASELINE_COMMIT --candidate-revision CANDIDATE_COMMIT
+```
+
+This mode checks each revision against its telemetry, rejects byte-identical inputs and reports the candidate-minus-baseline
+differences. `--json` also includes the SHA-256 of each telemetry file.
+
 To inspect a stutter, record completed flips and a `KYTY_SESSION_LOG` file from the same Kyty run. Use a new telemetry directory and log file, and set `KYTY_PIPELINE_STALL_LOG_MS` low enough to capture the events of interest. Exit after the flip window completes.
 
 ```sh
