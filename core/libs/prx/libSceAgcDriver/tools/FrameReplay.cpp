@@ -12,6 +12,7 @@
 #include "SceTypes.hpp"
 #if defined(ANYPS5_KYTY)
 #include "FrameReplaySampling.hpp"
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #endif
 #include <algorithm>
 #include <array>
@@ -320,6 +321,9 @@ void commit(const FrameMemoryChunk& chunk) {
         GuestArena::GuestArenaSetProtection_nid_postfix(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin), 0x04);
         return;
     }
+#endif
+#if defined(ANYPS5_KYTY) && defined(_WIN32)
+    if (DirectMemoryCommitGuestFile_nid_no_patch(pointer, bytes, 0x04)) return;
 #endif
     GuestArena::GuestArenaCommit_nid_postfix(pointer, bytes, 0x04, bytes);
 }

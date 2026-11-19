@@ -82,6 +82,9 @@ void GuestPageTableUsage_nid_no_patch(std::uint64_t granularity, std::uint64_t* 
 int DoMapAnon_nid_no_patch(void** addr, std::size_t len, int prot, int flags, std::size_t alignment, bool exclusive);
 int DoMunmap_nid_no_patch(void* addr, std::size_t len);
 void* DirectMemoryMapHostView_nid_no_patch(std::uintptr_t address, std::size_t bytes, int prot);
+#ifdef _WIN32
+bool DirectMemoryCommitGuestFile_nid_no_patch(void* addr, std::size_t len, std::uint32_t winProt);
+#endif
 }
 #endif
 

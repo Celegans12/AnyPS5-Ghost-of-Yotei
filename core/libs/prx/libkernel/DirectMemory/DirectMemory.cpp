@@ -2462,6 +2462,12 @@ void* DirectMemoryMapHostView_nid_no_patch(std::uintptr_t address, std::size_t b
 int DoMunmap_nid_no_patch(void* addr, std::size_t len) {
     return DoMunmap(addr, len);
 }
+
+#ifdef _WIN32
+bool DirectMemoryCommitGuestFile_nid_no_patch(void* addr, std::size_t len, std::uint32_t winProt) {
+    return CommitGuestFile(addr, len, static_cast<DWORD>(winProt));
+}
+#endif
 #endif
 
 void DirectMemoryPauseBeforeRetypeForTest(void (*pause)()) {
