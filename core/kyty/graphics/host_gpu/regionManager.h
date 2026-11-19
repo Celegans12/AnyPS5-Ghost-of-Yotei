@@ -176,6 +176,26 @@ public:
 		return GetBits<source>().Any(start, end);
 	}
 
+	[[nodiscard]] uint32_t OpenWriteBlock(uint64_t offset, uint64_t block_size) {
+		const auto page = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
+		if (m_gpu_dirty.Get(page)) {
+			return 0;
+		}
+		const auto first = static_cast<size_t>(offset / block_size * block_size / TRACKER_PAGE_SIZE);
+		const auto last  = first + static_cast<size_t>(block_size / TRACKER_PAGE_SIZE);
+		RegionBits open(~m_gpu_dirty, first, last);
+		RegionBits clean(~m_cpu_dirty, first, last);
+		clean &= open;
+		uint32_t opened = 0;
+		for (const auto [begin, end]: clean) {
+			opened += static_cast<uint32_t>(end - begin);
+		}
+		for (const auto [begin, end]: open) {
+			ChangeState<DirtySource::Cpu, true>(begin * TRACKER_PAGE_SIZE, (end - begin) * TRACKER_PAGE_SIZE);
+		}
+		return opened;
+	}
+
 	template <DirtySource source, bool enable>
 	void ChangeState(uint64_t offset, uint64_t size) {
 		const auto [start, end] = GetPageRange(offset, size);

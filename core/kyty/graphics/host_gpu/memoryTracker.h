@@ -101,6 +101,19 @@ public:
 		}
 	}
 
+	[[nodiscard]] uint32_t OpenWriteBlock(uint64_t vaddr, uint64_t block_size) {
+		const auto index = vaddr / TRACKER_REGION_SIZE;
+		if (index >= REGION_COUNT) {
+			return 0;
+		}
+		auto* manager = m_regions[index].load(std::memory_order_acquire);
+		if (manager == nullptr) {
+			return 0;
+		}
+		std::scoped_lock lock(manager->lock);
+		return manager->OpenWriteBlock(vaddr % TRACKER_REGION_SIZE, block_size);
+	}
+
 	[[nodiscard]] bool TakeKeptPages() {
 		return m_kept_pages.exchange(false, std::memory_order_relaxed);
 	}

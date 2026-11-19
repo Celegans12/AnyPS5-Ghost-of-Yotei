@@ -86,6 +86,16 @@ struct ReadbackStats {
 
 ReadbackStats g_readback_stats;
 
+struct WriteBlockStats {
+	std::atomic<uint64_t> faults {0};
+	std::atomic<uint64_t> blocks {0};
+	std::atomic<uint64_t> pages {0};
+	std::atomic<uint64_t> uploaded {0};
+	std::atomic<int64_t>  last_line {0};
+};
+
+WriteBlockStats g_write_block_stats;
+
 struct ReadbackReplay {
 	bool     allowed   = false;
 	bool     published = false;
@@ -467,11 +477,29 @@ void BufferCache::InvalidateUnlessGpuModified(uint64_t vaddr, uint64_t size) noe
 	}
 }
 
+static bool WriteFaultBlocks() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_WRITE_FAULT_BLOCKS");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
 void BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
 	static constexpr uint64_t FaultBlockSize = 64 * 1024;
 	static_assert(TRACKER_REGION_SIZE % FaultBlockSize == 0);
 	const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
 	m_memory_tracker.NoteGuestWriteFault(page);
+	if (WriteFaultBlocks() && !GuestGpu::IsGpuThread() && !GuestGpu::IsCommandProcessorThread() &&
+	    GuestRange {Common::AlignDown(page, FaultBlockSize), FaultBlockSize}.Valid()) {
+		auto& stats = g_write_block_stats;
+		stats.faults.fetch_add(1, std::memory_order_relaxed);
+		if (const auto opened = m_memory_tracker.OpenWriteBlock(page, FaultBlockSize); opened != 0) {
+			stats.blocks.fetch_add(1, std::memory_order_relaxed);
+			stats.pages.fetch_add(opened, std::memory_order_relaxed);
+			return;
+		}
+	}
 	const auto end  = Common::AlignDown(page, FaultBlockSize) + FaultBlockSize;
 	if (page >= TRACKER_PAGE_SIZE && GuestRange {page - TRACKER_PAGE_SIZE, end - page}.Valid() &&
 	    m_memory_tracker.IsRegionCpuModified(page - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE) &&
@@ -559,7 +587,33 @@ void BufferCache::NoteStagedCommandProcessorRead() {
 	g_readback_stats.cp_staged.fetch_add(1, std::memory_order_relaxed);
 }
 
+void BufferCache::LogWriteBlockSummary() {
+	auto&      stats = g_write_block_stats;
+	const auto now   = SteadyNs();
+	auto       last  = stats.last_line.load(std::memory_order_relaxed);
+	if (last == 0) {
+		stats.last_line.compare_exchange_strong(last, now, std::memory_order_relaxed);
+		return;
+	}
+	if (now - last < 10'000'000'000 || !stats.last_line.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
+		return;
+	}
+	const auto faults   = stats.faults.exchange(0, std::memory_order_relaxed);
+	const auto blocks   = stats.blocks.exchange(0, std::memory_order_relaxed);
+	const auto pages    = stats.pages.exchange(0, std::memory_order_relaxed);
+	const auto uploaded = stats.uploaded.exchange(0, std::memory_order_relaxed);
+	if (faults == 0 && uploaded == 0) {
+		return;
+	}
+	::Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-write-blocks] summary of the last {:.0f} s: {} guest write faults, {} opened their 64 KiB block ({} clean pages "
+	    "marked written with them), {} left to the page path; {:.1f} MiB of buffer uploads\n",
+	    static_cast<double>(now - last) / 1e9, faults, blocks, pages, faults - blocks,
+	    static_cast<double>(uploaded) / (1024.0 * 1024.0)));
+}
+
 void BufferCache::LogReadbackSummary() {
+	LogWriteBlockSummary();
 	auto&      stats = g_readback_stats;
 	const auto now   = SteadyNs();
 	auto       last  = stats.last_line.load(std::memory_order_relaxed);
@@ -1474,6 +1528,7 @@ vk::Buffer BufferCache::UploadCopies(Buffer& buffer, std::span<vk::BufferCopy> c
 		return nullptr;
 	}
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::BufferUploadBytes, total_size);
+	g_write_block_stats.uploaded.fetch_add(total_size, std::memory_order_relaxed);
 
 	auto*      host_copies = m_scheduler.HostCopies();
 	const auto ring        = m_staging_buffer.Mapped();
