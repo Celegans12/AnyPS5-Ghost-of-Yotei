@@ -187,6 +187,7 @@ AnyPS5 opens the window, so Kyty's window options do nothing; `ANYPS5_FULLSCREEN
 | `KYTY_RESOLVE_HELPER` | `1` | unset | A second thread resolves some draws ahead of their execution beside the resolve thread; it takes the sixth entry of `KYTY_GPU_THREAD_CPUS` | perf | all | Kyty import |
 | `KYTY_SCOUT` | `0` to `3`, any other text reads as `3` | `3` | Look-ahead on queue 0: `0` off, `1` uses the scout thread's tickets, `2` its verifier, `3` the resolve thread evaluates each draw's tables ahead | perf | all | Kyty import |
 | `KYTY_FLUSH_DRAWS` | whole number, else stops | `0` | Submits the open command buffer every this many draws; `0` never does it on a count | perf | all | Kyty option |
+| `KYTY_IDLE_SUBMIT` | `0` or `1`, empty counts as unset, else stops | on | After a draw or a dispatch, submits the open command buffer when every closed one has been submitted and the GPU has finished them; `0` keeps a command buffer open until the end of the guest submission. See [below](#details) | perf | all | `820414454e` |
 | `KYTY_SUSPEND_POINT_DEPTH` | 1 to 64, else stops | `8` | Suspend points the GPU may have in flight; `1` is KytyPS5's behaviour. See [below](#details) | perf | all | `b370e0778c` |
 | `KYTY_PROGRAM_LOCK` | `narrow` or `wide`, else stops | `narrow` | Scope of the program-cache lock; `wide` is upstream's scope and endless spin. See [below](#details) | perf | all | `6d40e04a28` |
 | `KYTY_LOCK_STATS` | `0` or `1`, else stops | `0` | Every period, `[lock-stats]` lines on stderr: wait and hold times of the lock per thread and per acquisition site, and the guest reads of `GetProgram` inside and outside the lock | debug | all | `6d40e04a28` |
@@ -245,6 +246,7 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 | `KYTY_WRITE_BACK_IMAGES` | `0` or `1`, empty counts as unset, else stops | on | Copies the queued readbacks back at each `ACQUIRE_MEM` or `RELEASE_MEM` with GL2 write-back and at each flip; `0` is KytyPS5's behaviour. See [below](#details) | compat | all | `9d957fd81e` |
 | `KYTY_TILE_VIA_VRAM` | `0` or `1`, empty counts as unset, else stops | on | Tiles a tiled image's readback in device-local memory, then copies it once to the host; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `08c666a175` |
 | `KYTY_SYNC_RAW_IMAGE_BUFFERS` | `0` or `1`, else stops | `0` | Obtains a raw buffer that a shader reads the way a formatted (texel) buffer is obtained | compat | all | Kyty option |
+| `KYTY_SRT_WALKER_PROBE` | `0` or `1`, empty counts as unset, else stops | on | The shader resource table walk of the execution thread reads a page the GPU may own through the fault handler's around-GPU-writes read, without taking the fault; `0` takes the fault. See [below](#details) | perf | all | `8095894f76` |
 | `KYTY_COPY_FEEDBACK` | `0` is off | on | After a small GPU copy into guest memory, snapshots the destination so that a later guest read is served from the snapshot instead of a readback | perf | all | Kyty import |
 | `KYTY_ASYNC_REPROTECT` | `0` is off | on | The write protection of the pages an upload marks clean is applied by the host copy thread, ahead of the copy | perf | all | Kyty import |
 | `KYTY_ASYNC_IMAGE_STAGING` | `0` or `1`; empty counts as unset | on for Demon's Souls, else off | The staging copies of image uploads run on the host copy thread | perf | all | Kyty import |
@@ -379,6 +381,26 @@ the one shown before, whose copy the GPU has finished, and a title that renders 
 on the GPU (rendering wait packet). Measured on Subnautica, in two sessions of 17 paired periods of 10 s: +1.7 % and
 +4.8 % frames per second, the same images (`notes/au-dela-p9-bascule.md`). `KYTY_EARLY_FLIP=0` restores KytyPS5's behaviour; any value other than empty, `0` or
 `1` stops the emulator with a message naming the variable.
+
+Idle submit and the walk's page reads: on an open-world AAA title at 4K with native ray tracing, the GPU is idle about
+5 ms of a 19 ms frame, in some 40 gaps between command buffers. Most gaps open while the execution thread builds the next
+command buffer: early in the frame it builds compute work more slowly than the GPU runs it, and about nine times a frame it
+waited for the GPU to finish all its work. Those waits came from the shader resource table walk: it read descriptor tables
+that share a 16 KiB page with data shaders write through device addresses, the write bitmap marks the whole page, the walk's
+load faulted, and the fault handler copied the page back after the GPU finished everything. A probe that compared the bytes
+before and after each such copy found them unchanged in every read in game; reading around page marks without the copy
+removed those waits, but left the pages protected, so every later load of the walk and of the resolve thread faulted, and
+the frame rate dropped by 5 %: that path was not kept. Two smaller changes were. `KYTY_SRT_WALKER_PROBE` installs the walk's
+guest-memory provider (`SetSrtWalkerGuestMemory`), which the import carried but nothing installed: on the execution thread a
+load from a page that may fault goes through the same around-GPU-writes read as the fault handler, without the signal, and a
+load it cannot serve still faults. `KYTY_IDLE_SUBMIT` submits the open command buffer after a draw or a dispatch when the GPU
+has finished everything else, so it starts on the new work while the execution thread goes on; while the GPU still runs, it
+reads the semaphore value the scheduler already knows and asks the driver at most once every 25 µs. Measured with the
+setting switched every 10 s inside one session (14 periods in game, neighbouring periods compared), on the open-world title:
++1.6 % frames per second for the walk's provider, +4.1 % for the idle submit (from 47 to 60 submissions a frame); on Stray,
+whose execution thread is the wall, both within ±1 % (the idle submit takes it from 114 to 181 submissions a frame). Same
+images. Either variable at `0` restores the previous behaviour; another value stops the emulator with a message naming the
+variable.
 
 Suspend points: KytyPS5 makes `sceAgcSuspendPoint` (`GuestGpu::SuspendPoint`) acquire a binary semaphore that its
 priority thread releases once the GPU has finished the work queued before the previous suspend point, so a title can
