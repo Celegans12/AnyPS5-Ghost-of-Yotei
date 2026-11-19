@@ -113,6 +113,78 @@ vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture, uint32_t el
 	return {nullptr, view, texture.layout};
 }
 
+void AppendImageTableGaps(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables,
+                          std::vector<vk::WriteDescriptorSet>& gap_writes) {
+	EXIT_IF(whole.dstArrayElement != 0 || whole.pImageInfo == nullptr);
+	uint32_t next = 0;
+	for (const auto& table: tables) {
+		EXIT_IF(table.base < next || table.base + table.capacity > whole.descriptorCount);
+		if (table.base > next) {
+			auto gap            = whole;
+			gap.dstArrayElement = next;
+			gap.descriptorCount = table.base - next;
+			gap.pImageInfo      = whole.pImageInfo + next;
+			gap_writes.push_back(gap);
+		}
+		next = table.base + table.capacity;
+	}
+	if (next < whole.descriptorCount) {
+		auto tail            = whole;
+		tail.dstArrayElement = next;
+		tail.descriptorCount = whole.descriptorCount - next;
+		tail.pImageInfo      = whole.pImageInfo + next;
+		gap_writes.push_back(tail);
+	}
+}
+
+void AppendImageTableFills(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables,
+                           vk::DescriptorSet persistent, std::vector<vk::CopyDescriptorSet>& table_copies) {
+	for (const auto& table: tables) {
+		EXIT_IF(table.base + table.capacity > whole.descriptorCount);
+		vk::CopyDescriptorSet copy {};
+		copy.srcSet          = persistent;
+		copy.srcBinding      = whole.dstBinding;
+		copy.srcArrayElement = table.base;
+		copy.dstBinding      = whole.dstBinding;
+		copy.dstArrayElement = table.base;
+		copy.descriptorCount = table.capacity;
+		table_copies.push_back(copy);
+	}
+}
+
+void AppendImageTableSeed(uint32_t binding, const ImageTableFill& table, vk::DescriptorSet set,
+                          vk::DescriptorSet persistent, std::vector<vk::CopyDescriptorSet>& seed_copies) {
+	vk::CopyDescriptorSet copy {};
+	copy.srcSet          = set;
+	copy.srcBinding      = binding;
+	copy.srcArrayElement = table.base;
+	copy.dstSet          = persistent;
+	copy.dstBinding      = binding;
+	copy.dstArrayElement = table.base;
+	copy.descriptorCount = table.capacity;
+	seed_copies.push_back(copy);
+}
+
+void PatchTableSetUpdate(vk::DescriptorSet set, std::vector<vk::WriteDescriptorSet>& writes,
+                         std::span<vk::CopyDescriptorSet>         copies,
+                         std::span<const vk::WriteDescriptorSet> slot_set_writes) {
+	for (auto& write: writes) {
+		write.dstSet = set;
+	}
+	for (auto& copy: copies) {
+		copy.dstSet = set;
+	}
+	writes.insert(writes.end(), slot_set_writes.begin(), slot_set_writes.end());
+}
+
+void AppendTableBindingFills(std::span<const ImageTableBinding>  bindings,
+                             std::vector<vk::CopyDescriptorSet>& table_copies) {
+	for (const auto& binding: bindings) {
+		AppendImageTableFills(binding.whole, std::span {binding.tables.data(), binding.count}, binding.persistent,
+		                      table_copies);
+	}
+}
+
 static bool DepthTableElement(TextureCache& texture_cache, const TextureBinding& texture) {
 	if (!texture.image_id) return false;
 	return texture_cache.GetImage(texture.image_id).info.IsDepth();
@@ -2843,6 +2915,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	m_descriptor_writes.clear();
 	m_descriptor_copies.clear();
 	m_slot_set_writes.clear();
+	m_table_fills.clear();
 	m_commit_capture_ok = m_commit_capture != nullptr && pipeline.uses_push_descriptors;
 	m_commit_capture_kinds.clear();
 	size_t image_cursor = 0;
@@ -2971,46 +3044,24 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			    ShaderRecompiler::IR::ImageResourceClass::None) {
 				image_starts[ShaderRecompiler::IR::ImageBindingIndex(kind)] = image_start;
 				image_cursor += write.descriptorCount;
-				std::array<const TableRange*, 16> tables {};
-				size_t                            table_count = 0;
+				ImageTableBinding fill {.state = table_state, .whole = write};
 				for (const auto& table: stage_tables) {
 					if (copy_tables && table.kind == kind) {
-						EXIT_IF(table_count == tables.size());
-						tables[table_count++] = &table;
+						EXIT_IF(fill.count == fill.tables.size());
+						fill.tables[fill.count++] = {.base       = table.base,
+						                             .capacity   = table.capacity,
+						                             .first_slot = table.first_slot};
 					}
 				}
-				if (table_count != 0) {
-					const auto end = tables.begin() + static_cast<std::ptrdiff_t>(table_count);
-					std::sort(tables.begin(), end,
-					          [](const auto* a, const auto* b) { return a->base < b->base; });
-					uint32_t next = 0;
-					for (size_t t = 0; t < table_count; t++) {
-						const auto& table = *tables[t];
-						EXIT_IF(table.base < next ||
-						        table.base + table.capacity > write.descriptorCount);
-						if (table.base > next) {
-							auto gap            = write;
-							gap.dstArrayElement = next;
-							gap.descriptorCount = table.base - next;
-							gap.pImageInfo      = m_descriptor_images.data() + image_start + next;
-							m_descriptor_writes.push_back(gap);
-						}
-						vk::CopyDescriptorSet copy {};
-						copy.srcSet          = table_state->slot_set;
-						copy.srcBinding      = table.binding;
-						copy.srcArrayElement = table.base;
-						copy.dstBinding      = table.binding;
-						copy.dstArrayElement = table.base;
-						copy.descriptorCount = table.capacity;
-						m_descriptor_copies.push_back(copy);
-						next = table.base + table.capacity;
-					}
-					if (next < write.descriptorCount) {
-						write.dstArrayElement = next;
-						write.descriptorCount -= next;
-						write.pImageInfo      = m_descriptor_images.data() + image_start + next;
-						m_descriptor_writes.push_back(write);
-					}
+				if (fill.count != 0) {
+					const auto end = fill.tables.begin() + static_cast<std::ptrdiff_t>(fill.count);
+					std::sort(fill.tables.begin(), end,
+					          [](const auto& a, const auto& b) { return a.base < b.base; });
+					fill.persistent       = table_state->slot_set;
+					fill.whole.pImageInfo = m_descriptor_images.data() + image_start;
+					AppendImageTableGaps(fill.whole, std::span {fill.tables.data(), fill.count},
+					                     m_descriptor_writes);
+					m_table_fills.push_back(fill);
 					continue;
 				}
 			} else {
@@ -3172,7 +3223,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 	}
 
 	if (m_commit_capture_ok && m_commit_capture_kinds.size() == m_descriptor_writes.size() &&
-	    m_descriptor_copies.empty() && m_slot_set_writes.empty()) {
+	    m_table_fills.empty() && m_slot_set_writes.empty()) {
 		StoreTemplateCommit(*m_commit_capture, pipeline);
 	}
 	if (!m_descriptor_writes.empty()) {
@@ -3192,7 +3243,6 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 			auto* ring = ring_ok ? AcquireTableRingSet(*ring_state, pipeline.descriptor_set_layout) : nullptr;
 			const auto set = ring != nullptr ? ring->set : heap.Commit(pipeline.descriptor_set_layout);
 			if (ring != nullptr && ring->version >= ring_state->slot_log_floor) {
-				m_descriptor_copies.clear();
 				for (auto change = std::ranges::upper_bound(ring_state->slot_log, ring->version, {},
 				                                            [](const auto& entry) { return entry.first; });
 				     change != ring_state->slot_log.end(); ++change) {
@@ -3209,12 +3259,8 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					write.pImageInfo      = &ring_state->slot_infos[slot];
 					m_descriptor_writes.push_back(write);
 				}
-			}
-			for (auto& write: m_descriptor_writes) {
-				write.dstSet = set;
-			}
-			for (auto& copy: m_descriptor_copies) {
-				copy.dstSet = set;
+			} else {
+				AppendTableBindingFills(m_table_fills, m_descriptor_copies);
 			}
 			if (ring != nullptr) {
 				ring->tick    = m_context.GetCommandScheduler().CurrentTick();
@@ -3228,8 +3274,7 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 					log.erase(log.begin(), keep);
 				}
 			}
-			m_descriptor_writes.insert(m_descriptor_writes.end(), m_slot_set_writes.begin(),
-			                           m_slot_set_writes.end());
+			PatchTableSetUpdate(set, m_descriptor_writes, m_descriptor_copies, m_slot_set_writes);
 			device.updateDescriptorSets(static_cast<uint32_t>(m_descriptor_writes.size()),
 			                            m_descriptor_writes.data(),
 			                            static_cast<uint32_t>(m_descriptor_copies.size()),
@@ -3243,15 +3288,9 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 				if (!state.slot_set) {
 					state.slot_set = heap.CommitPersistent(pipeline.descriptor_set_layout);
 				}
-				vk::CopyDescriptorSet copy {};
-				copy.srcSet          = set;
-				copy.srcBinding      = table.binding;
-				copy.srcArrayElement = table.base;
-				copy.dstSet          = state.slot_set;
-				copy.dstBinding      = table.binding;
-				copy.dstArrayElement = table.base;
-				copy.descriptorCount = table.capacity;
-				m_descriptor_copies.push_back(copy);
+				AppendImageTableSeed(table.binding,
+				                     {.base = table.base, .capacity = table.capacity, .first_slot = table.first_slot},
+				                     set, state.slot_set, m_descriptor_copies);
 				state.slot_set_current = true;
 			}
 			if (!m_descriptor_copies.empty()) {

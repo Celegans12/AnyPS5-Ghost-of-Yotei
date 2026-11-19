@@ -601,6 +601,7 @@ private:
 	std::vector<vk::WriteDescriptorSet>   m_descriptor_writes;
 	std::vector<vk::CopyDescriptorSet>    m_descriptor_copies;
 	std::vector<vk::WriteDescriptorSet>   m_slot_set_writes;
+	std::vector<ImageTableBinding>        m_table_fills;
 	vk::DescriptorSetLayout               m_pssr_descriptor_layout = nullptr;
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;

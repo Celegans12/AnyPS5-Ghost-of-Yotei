@@ -9,8 +9,10 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/shaderBindings.h"
 
+#include <array>
 #include <cstdint>
 #include <cstring>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -102,6 +104,33 @@ struct PreparedBindings {
 NativeDescriptorType(ShaderRecompiler::IR::DescriptorBindingKind kind);
 [[nodiscard]] vk::DescriptorImageInfo MakeImageInfo(const TextureBinding& texture,
                                                     uint32_t              element = 0);
+
+struct ImageTableFill {
+	uint32_t base       = 0;
+	uint32_t capacity   = 0;
+	uint32_t first_slot = 0;
+};
+
+void AppendImageTableGaps(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables,
+                          std::vector<vk::WriteDescriptorSet>& gap_writes);
+void AppendImageTableFills(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables,
+                           vk::DescriptorSet persistent, std::vector<vk::CopyDescriptorSet>& table_copies);
+void AppendImageTableSeed(uint32_t binding, const ImageTableFill& table, vk::DescriptorSet set,
+                          vk::DescriptorSet persistent, std::vector<vk::CopyDescriptorSet>& seed_copies);
+void PatchTableSetUpdate(vk::DescriptorSet set, std::vector<vk::WriteDescriptorSet>& writes,
+                         std::span<vk::CopyDescriptorSet>         copies,
+                         std::span<const vk::WriteDescriptorSet> slot_set_writes);
+
+struct ImageTableBinding {
+	const void*                    state = nullptr;
+	vk::DescriptorSet              persistent;
+	vk::WriteDescriptorSet         whole;
+	std::array<ImageTableFill, 16> tables {};
+	uint32_t                       count = 0;
+};
+
+void AppendTableBindingFills(std::span<const ImageTableBinding>  bindings,
+                             std::vector<vk::CopyDescriptorSet>& table_copies);
 
 template <typename T>
 [[nodiscard]] T DecodeNativeDescriptor(const ShaderRecompiler::IR::DescriptorValue& value) {
