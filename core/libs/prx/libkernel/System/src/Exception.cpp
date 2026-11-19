@@ -449,6 +449,7 @@ void Redirect(HANDLE native, Delivery& delivery) {
     CONTEXT redirected = delivery.context;
     redirected.Rsp = slot - HomeArea - 8;
     redirected.Rip = reinterpret_cast<DWORD64>(&Aps5RedirectedEntryStub);
+    redirected.EFlags &= ~static_cast<DWORD>(0x100);
     if (!SetThreadContext(native, &redirected)) {
         ResumeThread(native);
         throw std::runtime_error("sceKernelRaiseException: cannot redirect the target thread");

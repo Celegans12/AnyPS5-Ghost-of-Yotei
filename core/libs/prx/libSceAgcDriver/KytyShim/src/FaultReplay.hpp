@@ -1,19 +1,51 @@
 #pragma once
 
 #include <atomic>
-#include <csignal>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <initializer_list>
+#ifdef _WIN32
+#include <windows.h>
+#else
+#include <csignal>
 #include <sys/syscall.h>
 #include <ucontext.h>
 #include <unistd.h>
+#endif
 
 namespace KytyShim::FaultReplay {
 
+#ifdef _WIN32
+using Context = CONTEXT;
+
+inline std::uint64_t* Register(CONTEXT& context, int index) {
+    DWORD64* const registers[16] = {&context.Rax, &context.Rcx, &context.Rdx, &context.Rbx, &context.Rsp, &context.Rbp,
+                                    &context.Rsi, &context.Rdi, &context.R8,  &context.R9,  &context.R10, &context.R11,
+                                    &context.R12, &context.R13, &context.R14, &context.R15};
+    return reinterpret_cast<std::uint64_t*>(registers[index]);
+}
+
+inline std::uint64_t InstructionPointer(const CONTEXT& context) { return context.Rip; }
+inline std::uint64_t StackPointer(const CONTEXT& context) { return context.Rsp; }
+inline std::uint64_t Flags(const CONTEXT& context) { return context.EFlags; }
+inline void          SetFlags(CONTEXT& context, std::uint64_t flags) { context.EFlags = static_cast<DWORD>(flags); }
+#else
+using Context = ucontext_t;
+
 constexpr int GeneralRegisters[16] = {REG_RAX, REG_RCX, REG_RDX, REG_RBX, REG_RSP, REG_RBP, REG_RSI, REG_RDI,
                                       REG_R8,  REG_R9,  REG_R10, REG_R11, REG_R12, REG_R13, REG_R14, REG_R15};
+
+inline std::uint64_t* Register(ucontext_t& context, int index) {
+    return reinterpret_cast<std::uint64_t*>(&context.uc_mcontext.gregs[GeneralRegisters[index]]);
+}
+
+inline std::uint64_t InstructionPointer(const ucontext_t& context) { return static_cast<std::uint64_t>(context.uc_mcontext.gregs[REG_RIP]); }
+inline std::uint64_t StackPointer(const ucontext_t& context) { return static_cast<std::uint64_t>(context.uc_mcontext.gregs[REG_RSP]); }
+inline std::uint64_t Flags(const ucontext_t& context) { return static_cast<std::uint64_t>(context.uc_mcontext.gregs[REG_EFL]); }
+inline void          SetFlags(ucontext_t& context, std::uint64_t flags) { context.uc_mcontext.gregs[REG_EFL] = static_cast<greg_t>(flags); }
+#endif
+
 constexpr std::uint64_t TrapFlag = 0x100;
 constexpr std::uint64_t Span     = 64;
 constexpr std::size_t   Slots    = 1024;
@@ -35,7 +67,9 @@ struct Slot {
     std::uint64_t             rip      = 0;
     std::uint64_t             rsp      = 0;
     bool                      trap     = false;
+#ifndef _WIN32
     sigset_t                  mask {};
+#endif
 };
 
 inline Slot              g_slots[Slots];
@@ -318,7 +352,11 @@ inline int ReplayRegister(const std::uint8_t* code) {
 }
 
 inline std::int64_t CurrentThread() {
+#ifdef _WIN32
+    return static_cast<std::int64_t>(GetCurrentThreadId());
+#else
     return static_cast<std::int64_t>(::syscall(SYS_gettid));
+#endif
 }
 
 inline Slot* Find(std::int64_t thread) {
@@ -338,29 +376,32 @@ inline Slot* Claim(std::int64_t thread) {
     return nullptr;
 }
 
+#ifndef _WIN32
 inline void BlockAsynchronousSignals(sigset_t& mask) {
     std::memset(&mask, 0xFF, sizeof(mask));
     for (const int number : {SIGTRAP, SIGSEGV, SIGBUS, SIGILL, SIGFPE}) {
         sigdelset(&mask, number);
     }
 }
+#endif
 
-inline bool Finish(ucontext_t& context) {
+inline bool Finish(Context& context) {
     auto* slot = Find(CurrentThread());
     if (slot == nullptr) return false;
-    auto& reg = context.uc_mcontext.gregs[slot->reg];
-    if (static_cast<std::uint64_t>(reg) == slot->expected) reg = static_cast<greg_t>(static_cast<std::uint64_t>(reg) - slot->delta);
-    if (!slot->trap) context.uc_mcontext.gregs[REG_EFL] &= ~static_cast<greg_t>(TrapFlag);
+    auto* reg = Register(context, slot->reg);
+    if (*reg == slot->expected) *reg -= slot->delta;
+    SetFlags(context, slot->trap ? (Flags(context) | TrapFlag) : (Flags(context) & ~TrapFlag));
+#ifndef _WIN32
     context.uc_sigmask = slot->mask;
+#endif
     slot->thread.store(0, std::memory_order_release);
     return true;
 }
 
 template <typename Replayable, typename Backing>
-bool Start(ucontext_t& context, std::uint64_t address, Replayable&& replayable, Backing&& backing) {
-    auto*      gregs = context.uc_mcontext.gregs;
-    const auto rip   = static_cast<std::uint64_t>(gregs[REG_RIP]);
-    const auto rsp   = static_cast<std::uint64_t>(gregs[REG_RSP]);
+bool Start(Context& context, std::uint64_t address, Replayable&& replayable, Backing&& backing) {
+    const auto rip = InstructionPointer(context);
+    const auto rsp = StackPointer(context);
     if (auto* active = Find(CurrentThread()); active != nullptr) {
         if (active->rip != rip || active->rsp != rsp) return false;
         (void)Finish(context);
@@ -369,7 +410,7 @@ bool Start(ucontext_t& context, std::uint64_t address, Replayable&& replayable, 
     }
     Operand operand;
     if (!Decode(reinterpret_cast<const std::uint8_t*>(rip), operand)) return false;
-    const auto value = [&](int reg) { return static_cast<std::uint64_t>(gregs[GeneralRegisters[reg]]); };
+    const auto value = [&](int reg) { return *Register(context, reg); };
     const auto ea    = (operand.base >= 0 ? value(operand.base) : 0) + (operand.index >= 0 ? value(operand.index) << operand.scale : 0) +
                     static_cast<std::uint64_t>(operand.disp);
     if (ea > address || address - ea >= Span) return false;
@@ -380,17 +421,19 @@ bool Start(ucontext_t& context, std::uint64_t address, Replayable&& replayable, 
     auto* slot = Claim(CurrentThread());
     if (slot == nullptr) return false;
     const auto delta = target - ea;
-    auto&      reg   = gregs[GeneralRegisters[shifted]];
-    reg              = static_cast<greg_t>(static_cast<std::uint64_t>(reg) + delta);
-    slot->reg        = GeneralRegisters[shifted];
-    slot->delta      = delta;
-    slot->expected   = static_cast<std::uint64_t>(reg);
-    slot->rip        = rip;
-    slot->rsp        = rsp;
-    slot->trap       = (static_cast<std::uint64_t>(gregs[REG_EFL]) & TrapFlag) != 0;
-    slot->mask       = context.uc_sigmask;
+    auto*      reg   = Register(context, shifted);
+    *reg += delta;
+    slot->reg      = shifted;
+    slot->delta    = delta;
+    slot->expected = *reg;
+    slot->rip      = rip;
+    slot->rsp      = rsp;
+    slot->trap     = (Flags(context) & TrapFlag) != 0;
+#ifndef _WIN32
+    slot->mask = context.uc_sigmask;
     BlockAsynchronousSignals(context.uc_sigmask);
-    gregs[REG_EFL] |= static_cast<greg_t>(TrapFlag);
+#endif
+    SetFlags(context, Flags(context) | TrapFlag);
     return true;
 }
 

@@ -10,14 +10,15 @@
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 
+#include "prx/libSceAgcDriver/KytyShim/src/FaultReplay.hpp"
+
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #ifdef _WIN32
 #include <windows.h>
 #else
-#include "prx/libSceAgcDriver/KytyShim/src/FaultReplay.hpp"
-
 #include <csignal>
 #include <ucontext.h>
 #endif
@@ -45,6 +46,8 @@ void RearmGuardPage(std::uintptr_t address) {
     DWORD previous = 0;
     VirtualProtect(page.BaseAddress, 1, page.Protect | PAGE_GUARD, &previous);
 }
+
+std::atomic<bool> g_single_step_ready {false};
 #else
 using FaultContext = ucontext_t;
 
@@ -65,20 +68,35 @@ void CompleteWalkerLoad(FaultContext& context, std::uint32_t length, std::uint32
 
 struct sigaction g_previous_trap {};
 bool             g_trap_installed = false;
+#endif
+
+bool SwitchOn(const char* name) {
+    const char* value = std::getenv(name);
+#ifdef _WIN32
+    return value != nullptr && value[0] == '1';
+#else
+    return value == nullptr || value[0] != '0';
+#endif
+}
+
+bool ReplayReady() {
+#ifdef _WIN32
+    const bool stepping = g_single_step_ready.load(std::memory_order_acquire);
+#else
+    const bool stepping = g_trap_installed;
+#endif
+    return stepping && !FaultReplay::g_broken.load(std::memory_order_relaxed) && !Libs::Graphics::GuestGpu::IsGpuThread() &&
+           !Libs::Graphics::GuestGpu::IsCommandProcessorThread();
+}
 
 bool ReplayEnabled() {
-    static const bool on = [] {
-        const char* value = std::getenv("KYTY_REPLAY_GPU_PAGE_READS");
-        return value == nullptr || value[0] != '0';
-    }();
-    return on && g_trap_installed && !FaultReplay::g_broken.load(std::memory_order_relaxed);
+    static const bool on = SwitchOn("KYTY_REPLAY_GPU_PAGE_READS");
+    return on && ReplayReady();
 }
 
 bool TryReplayOnBacking(FaultContext& context, std::uint64_t address) {
     namespace Memory = Libs::LibKernel::Memory;
-    if (!ReplayEnabled() || Libs::Graphics::GuestGpu::IsGpuThread() || Libs::Graphics::GuestGpu::IsCommandProcessorThread()) {
-        return false;
-    }
+    if (!ReplayEnabled()) return false;
     const auto replayable = [](std::uint64_t ea, std::uint64_t size) { return Memory::ReplayableGpuRead(ea, size); };
     const auto backing    = [](std::uint64_t ea, std::uint64_t size) { return Memory::FindBackingPointer(ea, size); };
     if (!FaultReplay::Start(context, address, replayable, backing)) return false;
@@ -87,12 +105,8 @@ bool TryReplayOnBacking(FaultContext& context, std::uint64_t address) {
 }
 
 bool ReplayAfterReadbackEnabled() {
-    static const bool on = [] {
-        const char* value = std::getenv("KYTY_REPLAY_AFTER_READBACK");
-        return value == nullptr || value[0] != '0';
-    }();
-    return on && g_trap_installed && !FaultReplay::g_broken.load(std::memory_order_relaxed) &&
-           !Libs::Graphics::GuestGpu::IsGpuThread() && !Libs::Graphics::GuestGpu::IsCommandProcessorThread();
+    static const bool on = SwitchOn("KYTY_REPLAY_AFTER_READBACK");
+    return on && ReplayReady();
 }
 
 void FinishReplayAfterReadback(FaultContext& context, std::uint64_t address) {
@@ -107,6 +121,7 @@ void FinishReplayAfterReadback(FaultContext& context, std::uint64_t address) {
     Memory::FinishReplayAfterReadback(FaultReplay::Start(context, address, replayable, backing));
 }
 
+#ifndef _WIN32
 void OnTrap(int signal, siginfo_t* info, void* native) {
     if (native != nullptr && FaultReplay::Finish(*static_cast<ucontext_t*>(native))) return;
     if ((g_previous_trap.sa_flags & SA_SIGINFO) != 0) {
@@ -145,23 +160,17 @@ bool ResolveFault(FaultContext& context, GpuAccess access, std::uint64_t address
         CompleteWalkerLoad(context, length, 0);
         return true;
     }
-#ifndef _WIN32
     if (access == GpuAccess::Read && TryReplayOnBacking(context, address)) {
         return true;
     }
     const bool after = access == GpuAccess::Read && ReplayAfterReadbackEnabled();
     if (after) Memory::AllowReplayAfterReadback();
-#endif
     if (Memory::HandleGpuFault(access, address)) {
         Common::DebugCounters::Add(Common::DebugCounters::Counter::GpuFaults);
-#ifndef _WIN32
         if (after) FinishReplayAfterReadback(context, address);
-#endif
         return true;
     }
-#ifndef _WIN32
     if (after) FinishReplayAfterReadback(context, address);
-#endif
     if (const auto length = Walker::SrtWalkerLoadLength(rip); length != 0) {
         CompleteWalkerLoad(context, length, 0);
         return true;
@@ -176,6 +185,7 @@ bool HandleHostFault(void* exceptionPointers) {
     auto* exception = static_cast<EXCEPTION_POINTERS*>(exceptionPointers);
     if (exception == nullptr || exception->ExceptionRecord == nullptr || exception->ContextRecord == nullptr) return false;
     const auto& record = *exception->ExceptionRecord;
+    if (record.ExceptionCode == EXCEPTION_SINGLE_STEP) return FaultReplay::Finish(*exception->ContextRecord);
     const bool guardPage = record.ExceptionCode == STATUS_GUARD_PAGE_VIOLATION;
     if ((record.ExceptionCode != EXCEPTION_ACCESS_VIOLATION && !guardPage) || record.NumberParameters < 2) return false;
     const auto access = record.ExceptionInformation[0] == 8 ? GpuAccess::Execute : record.ExceptionInformation[0] == 1 ? GpuAccess::Write : GpuAccess::Read;
@@ -190,9 +200,11 @@ bool HandleHostFault(void* exceptionPointers) {
 void InstallFaultChain() {
     GuestArena::GuestArenaSetHostWritePreparer_nid_no_patch(&PrepareHostWrite);
     GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(&HandleHostFault);
+    g_single_step_ready.store(true, std::memory_order_release);
 }
 
 void RemoveFaultChain() {
+    g_single_step_ready.store(false, std::memory_order_release);
     GuestArena::GuestArenaSetGpuFaultHandler_nid_no_patch(nullptr);
     GuestArena::GuestArenaSetHostWritePreparer_nid_no_patch(nullptr);
 }
