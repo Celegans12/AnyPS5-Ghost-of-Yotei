@@ -92,9 +92,7 @@ static bool PrepareNativeRayTracing(RenderContext& context, const CommandRecorde
 		return true;
 	}
 	if (info.bvh && note_guest) {
-		using Kind = RayTracing::GuestDispatch;
-		RayTracing::NoteGuestDispatch(module.guest_traversal ? Kind::NullTlas : Kind::Unrecognized,
-		                                    module.info.shader_hash);
+		RayTracing::NoteGuestDispatch(RayTracing::GuestDispatch::Empty, module.info.shader_hash);
 	}
 	return false;
 }

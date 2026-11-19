@@ -124,8 +124,8 @@ void Oracle() {
     Expect(Has(OracleLine(Verdict::Native, 3), "every recognized walk"), "KYTY_RT_ORACLE=3 serves every recognized walk");
     Expect(Has(OracleLine(Verdict::Native, 2), "the walks a form recognizes"), "KYTY_RT_ORACLE=2 serves the walks of the forms");
     Expect(Has(OracleLine(Verdict::Native, 5), "without trying the walk forms"), "KYTY_RT_ORACLE=5 says the forms are skipped");
-    Expect(Has(OracleLine(Verdict::Native, 4), "every BVH walk runs emulated"), "KYTY_RT_ORACLE=4 says nothing is served");
-    Expect(Has(OracleLine(Verdict::Native, 6), "every BVH walk runs emulated"), "KYTY_RT_ORACLE=6 says nothing is served");
+    Expect(Has(OracleLine(Verdict::Native, 4), "every BVH walk runs empty"), "KYTY_RT_ORACLE=4 says nothing is served and the walks run empty");
+    Expect(Has(OracleLine(Verdict::Native, 6), "every BVH walk runs empty"), "KYTY_RT_ORACLE=6 says nothing is served and the walks run empty");
     Expect(!Has(remaining, "pixel"), "KYTY_RT_ORACLE=1 leaves pixel shaders out");
     Expect(Has(OracleLine(Verdict::Native, 9), "in compute and pixel shaders"), "KYTY_RT_ORACLE=9 says pixel shaders are served");
     Expect(OracleLine(Verdict::Native, 8).empty(), "KYTY_RT_ORACLE=8 alone serves nothing and logs no oracle line");

@@ -13,6 +13,7 @@
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ConstantPropagation.h"
 #include "graphics/shader/recompiler/ir/passes/DeadCodeElimination.h"
+#include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
 #include "graphics/shader/recompiler/ir/passes/RayQueryTraversal.h"
 #include "graphics/shader/recompiler/ir/passes/ReadLaneElimination.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -480,27 +481,33 @@ const char* StageName(ShaderType stage) {
 namespace {
 
 std::mutex                                  g_ray_tracing_programs_mutex;
-std::array<std::unordered_set<uint64_t>, 3> g_ray_tracing_programs;
+std::array<std::unordered_set<uint64_t>, static_cast<size_t>(RayTracingProgramKind::Count)> g_ray_tracing_programs;
 RayTracingPrograms                          g_ray_tracing_counts;
 
 }
 
-void NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash) {
+bool NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash) {
 	const std::lock_guard lock(g_ray_tracing_programs_mutex);
 	if (!g_ray_tracing_programs[static_cast<size_t>(kind)].insert(shader_hash).second) {
-		return;
+		return false;
 	}
 	switch (kind) {
 		case RayTracingProgramKind::Native: g_ray_tracing_counts.native++; break;
-		case RayTracingProgramKind::Unrecognized:
-			g_ray_tracing_counts.unrecognized++;
-			g_ray_tracing_counts.last_unrecognized = shader_hash;
+		case RayTracingProgramKind::Empty:
+			g_ray_tracing_counts.empty++;
+			g_ray_tracing_counts.last_empty = shader_hash;
 			break;
 		case RayTracingProgramKind::AlwaysGuest:
 			g_ray_tracing_counts.always_guest++;
 			g_ray_tracing_counts.last_always_guest = shader_hash;
 			break;
+		case RayTracingProgramKind::PixelGuest:
+			g_ray_tracing_counts.pixel_guest++;
+			g_ray_tracing_counts.last_pixel_guest = shader_hash;
+			break;
+		case RayTracingProgramKind::Count: break;
 	}
+	return true;
 }
 
 RayTracingPrograms GetRayTracingPrograms() {
@@ -674,6 +681,17 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 	Decoder::Program traced_source;
 	std::vector<IR::NativeTraversals>  oracle_sources;
 	std::vector<IR::OracleImprovement> oracle_improvements;
+	const bool bvh = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
+		return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
+	});
+	constexpr uint32_t pixel_oracle = IR::OracleRemaining | IR::OraclePixel;
+	if (options.stage == ShaderType::Pixel && options.native_ray_tracing && bvh &&
+	    (options.rt_oracle & pixel_oracle) != pixel_oracle &&
+	    NoteRayTracingProgram(RayTracingProgramKind::PixelGuest, options.shader_hash)) {
+		::Log::WriteToConsoleAndLog(fmt::format("[RT] ps 0x{:016x}: pixel walk kept on the guest traversal: pixel oracle "
+		                                        "off (KYTY_RT_ORACLE bit 8)\n",
+		                                        options.shader_hash));
+	}
 	if (options.stage == ShaderType::Compute ||
 	    (options.stage == ShaderType::Pixel && options.native_ray_tracing && options.rt_oracle != 0)) {
 		const auto traced = IR::TraceNativeTraversals(
@@ -681,9 +699,6 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 		         .rewrite   = options.native_ray_tracing,
 		         .oracle    = options.native_ray_tracing ? options.rt_oracle : 0u,
 		         .decoded   = &decoded});
-		const bool bvh = std::ranges::any_of(decoded.instructions, [](const auto& inst) {
-			return inst.opcode == Decoder::Opcode::IMAGE_BVH_INTERSECT_RAY;
-		});
 		oracle_sources      = traced.oracle_sources;
 		oracle_improvements = traced.oracle_improvements;
 		if (traced.source_valid) {
@@ -717,10 +732,20 @@ TranslateResult TranslateProgram(const Decoder::Program& decoded, const CompileO
 			LOGF("%s native ray tracing traversals: hash=0x%016" PRIx64 " sites=%u\n", stage,
 			     options.shader_hash, traced.sites);
 			NoteRayTracingProgram(RayTracingProgramKind::Native, options.shader_hash);
-		} else if (options.native_ray_tracing && bvh && !decoded.has_swap_pc && decoded.call_bodies.empty()) {
-			LOGF("%s native ray tracing: hash=0x%016" PRIx64 " wave%u walks a guest BVH no form recognizes\n",
-			     stage, options.shader_hash, options.wave_size);
-			NoteRayTracingProgram(RayTracingProgramKind::Unrecognized, options.shader_hash);
+		}
+		size_t intersections = 0, empty = 0;
+		for (const auto* block: ir.blocks) {
+			for (const auto& inst: *block) {
+				if (inst.GetOpcode() != IR::ValueOpcode::BvhIntersect) continue;
+				++intersections;
+				empty += (inst.Flags<uint32_t>() & IR::BvhIntersectEmpty) != 0 ? 1u : 0u;
+			}
+		}
+		if (empty != 0 && NoteRayTracingProgram(RayTracingProgramKind::Empty, options.shader_hash)) {
+			::Log::WriteToConsoleAndLog(fmt::format("[RT] {} 0x{:016x}: {} of {} BVH intersections run empty: no form "
+			                                        "and no host query serves them, their rays miss\n",
+			                                        options.stage == ShaderType::Compute ? "cs" : "ps",
+			                                        options.shader_hash, empty, intersections));
 		}
 	}
 	IR::TrackResources(ir, *tracked, native_cfg, options.input_info);

@@ -23,7 +23,7 @@ std::string OracleLine(Verdict verdict, std::uint32_t oracle) {
     const std::string setting = "(KYTY_RT_ORACLE=" + std::to_string(oracle) + ")";
     const bool remaining = (oracle & OracleRemaining) != 0;
     if ((oracle & OracleOnly) != 0 && !remaining) {
-        return "[kyty] no BVH walk form is tried and no walk answers from host ray queries " + setting + ": every BVH walk runs emulated\n";
+        return "[kyty] no BVH walk form is tried and no walk answers from host ray queries " + setting + ": every BVH walk runs empty, its rays miss\n";
     }
     std::string walks;
     if ((oracle & OracleOnly) != 0) {
@@ -60,7 +60,7 @@ Outcome Decide(Mode mode, bool deviceEnabled, std::string_view gpu, const Device
         return {Verdict::Emulated, "[kyty] native ray tracing off (KYTY_NATIVE_RT=0): ray tracing runs emulated in shaders\n"};
     }
     if (deviceEnabled) {
-        return {Verdict::Native, "[kyty] native ray tracing on " + device + ": the ray tracing passes whose BVH walk Kyty recognizes trace with ray queries, the others stay emulated; KYTY_NATIVE_RT=0 emulates them all\n"};
+        return {Verdict::Native, "[kyty] native ray tracing on " + device + ": the ray tracing passes whose BVH walk Kyty serves trace with ray queries, the BVH walks of compute shaders it does not serve run empty (their rays miss, an [RT] line names them); KYTY_NATIVE_RT=0 emulates them all\n"};
     }
     auto missing = MissingSupport(support);
     if (missing.empty()) missing = "ray queries on the device Kyty created";

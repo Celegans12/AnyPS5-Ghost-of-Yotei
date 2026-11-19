@@ -30,7 +30,8 @@ constexpr uint32_t ContextProposed  = 72;
 constexpr uint32_t ContextFlags     = 76;
 constexpr uint32_t SlotBlas         = 40;
 constexpr uint32_t SlotRoot         = 48;
-constexpr uint32_t OracleFlags      = IR::BvhIntersectNative | IR::BvhIntersectOracle | IR::BvhIntersectOracleLane;
+constexpr uint32_t OracleFlags      = IR::BvhIntersectNative | IR::BvhIntersectOracle | IR::BvhIntersectOracleLane |
+                                      IR::BvhIntersectEmpty;
 
 struct Call {
 	uint32_t descriptor = 0;
@@ -193,7 +194,7 @@ uint32_t EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto  node_words = inst.Flags<uint32_t>() & ~OracleFlags;
 	const bool  per_lane   = (inst.Flags<uint32_t>() & IR::BvhIntersectOracleLane) != 0;
 	if (ray == nullptr || (node_words != 1u && node_words != 2u) || ray->NumArgs() < node_words + 10u ||
-	    s.bvh_intersect_function == 0) {
+	    s.bvh_triangle_function == 0) {
 		ctx.Fail(inst, "BVH oracle requires its node pointer, ray components and the shared function");
 	}
 	std::array<Call, 2> calls {};
@@ -375,7 +376,7 @@ uint32_t EmitBvhOracle(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto guest  = LogicalAnd(s, c.exec, LogicalNot(s, LogicalOr(s, LogicalOr(s, c.top, c.drained), nested)));
 		const auto walked = EmitValueOrDefaultIfCondition(s, guest, vec4, ConstantU32CompositeZero(s, 4), [&] {
 			const auto result = s.builder.AllocateId();
-			s.builder.AddFunction(spv::OpFunctionCall, vec4, result, s.bvh_intersect_function, c.descriptor, c.wide,
+			s.builder.AddFunction(spv::OpFunctionCall, vec4, result, s.bvh_triangle_function, c.descriptor, c.wide,
 			                      c.extent, c.origin, c.direction, c.inverse);
 			return result;
 		});

@@ -100,6 +100,24 @@ bool RayTracingCheck::Served(const ShaderModule& module) {
 	return !module.guest_traversal && info.bvh && info.ray_query;
 }
 
+bool RayTracingCheck::Empty(const ShaderModule& module) {
+	const auto& info = module.info.info;
+	return !module.guest_traversal && info.bvh && !info.ray_query && RayTracing::NativeTraversals();
+}
+
+void RayTracingCheck::NoteEmpty(uint64_t hash) {
+	std::lock_guard lock(m_mutex);
+	Load();
+	auto& program = m_programs[hash];
+	if (program.empty) {
+		return;
+	}
+	program.empty = true;
+	Note(fmt::format("[RT] check {}: empty: no form and no host query serves its BVH walks, their rays miss; not checked",
+	                 Hash(hash)));
+	Save();
+}
+
 bool RayTracingCheck::FallsBack(uint64_t shader_hash) {
 	if (!m_any_fallback.load(std::memory_order_relaxed)) {
 		return false;
@@ -170,6 +188,8 @@ void RayTracingCheck::Load() {
 		} else if (state == "unjudged-host-full") {
 			program.host_full = true;
 			program.unreplayable.clear();
+		} else if (state == "empty") {
+			program.unreplayable.clear();
 		} else {
 			program.unreplayable.clear();
 		}
@@ -188,7 +208,7 @@ void RayTracingCheck::Save() const {
 	std::vector<std::pair<uint64_t, const Program*>> rows;
 	for (const auto& [hash, program]: m_programs) {
 		if (program.fallback || program.verified || !program.unreplayable.empty() || program.transient != 0 ||
-		    program.unknown != 0 || program.full != 0) {
+		    program.unknown != 0 || program.full != 0 || program.empty) {
 			rows.emplace_back(hash, &program);
 		}
 	}
@@ -205,6 +225,7 @@ void RayTracingCheck::Save() const {
 			                    : program->verified     ? "verified"
 			                    : !program->unreplayable.empty() ? "unreplayable"
 			                    : program->host_full             ? "unjudged-host-full"
+			                    : program->empty                 ? "empty"
 			                                                     : "checking";
 			auto        row   = fmt::format("{} {} checks={}", Hash(hash), state, program->checks);
 			if (!program->fractions.empty()) {
@@ -314,8 +335,16 @@ void RayTracingCheck::Refuse(uint64_t hash, const std::string& reason) {
 
 bool RayTracingCheck::Sample(const ShaderModule& module, const CommandBuffer& buffer) {
 	const auto period = Config::RayTracingCheckPeriod();
-	if (period == 0 || m_active || !Served(module) ||
-	    &buffer != &m_context.GetCommandScheduler().Current()) {
+	if (period == 0 || m_active) {
+		return false;
+	}
+	if (!Served(module)) {
+		if (Empty(module)) {
+			NoteEmpty(module.info.shader_hash);
+		}
+		return false;
+	}
+	if (&buffer != &m_context.GetCommandScheduler().Current()) {
 		return false;
 	}
 	const auto      hash = module.info.shader_hash;

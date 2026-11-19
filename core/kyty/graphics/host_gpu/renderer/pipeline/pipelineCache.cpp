@@ -158,14 +158,6 @@ uint32_t PipelineChainThreads() {
 }
 #endif
 
-bool ReadsNullTlas(const ShaderModule& module, const ShaderRecompiler::IR::ResourceSnapshot& resources) {
-	const auto& info  = module.info.info;
-	const auto& slots = info.ray_query_header_slots;
-	const auto& flat  = resources.flattened_srt;
-	return info.ray_query && slots[0] < flat.size() && slots[1] < flat.size() && flat[slots[0]] == 0 &&
-	       flat[slots[1]] == 0;
-}
-
 std::string DriverCacheSignature(const vk::PhysicalDeviceProperties& properties) {
 	constexpr char hex[] = "0123456789abcdef";
 	std::string    uuid(VK_UUID_SIZE * 2, '0');
@@ -2403,12 +2395,6 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 		ahead.reads.Fail();
 		return nullptr;
 	}
-	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
-		if (ReadsNullTlas(*module, resources)) {
-			ahead.reads.Fail();
-			return nullptr;
-		}
-	}
 	last = static_cast<size_t>(module - modules.begin());
 	input_info.stage = {.module = &*module, .resources = &resources};
 	module->info.bindings.AdvancePushData(push_data_cursor);
@@ -3287,16 +3273,9 @@ const ShaderModule* PipelineCache::GetComputeProgram(const HW::ComputeShaderInfo
 	uint32_t push_data_cursor =
 	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
 	const ProgramLockGuard lock(m_program_lock);
-	const auto             cursor = push_data_cursor;
 	m_guest_traversal             = guest_traversal;
 	const auto*            module = GetProgram(params, input_info, push_data_cursor);
 	m_guest_traversal             = false;
-	if (module != nullptr && !guest_traversal && ReadsNullTlas(*module, *input_info.stage.resources)) {
-		push_data_cursor  = cursor;
-		m_guest_traversal = true;
-		module            = GetProgram(params, input_info, push_data_cursor);
-		m_guest_traversal = false;
-	}
 	return module;
 }
 

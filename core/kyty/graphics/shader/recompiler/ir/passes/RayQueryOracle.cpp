@@ -1,5 +1,6 @@
 #include "graphics/shader/recompiler/ir/passes/RayQueryOracle.h"
 
+#include "common/logging/log.h"
 #include "graphics/shader/recompiler/ir/RayQuery.h"
 
 #include <algorithm>
@@ -125,6 +126,23 @@ uint32_t MarkOracleWalk(std::span<Inst* const> walk) {
 		bvh->SetFlags(bvh->Flags<uint32_t>() | flags);
 	}
 	return walk.empty() ? 0u : flags;
+}
+
+size_t MarkEmptyWalk(const Program& program, std::span<Inst* const> intersections, const NativeTraversalOptions& options) {
+	if (!options.rewrite) return 0;
+	size_t marked = 0;
+	for (auto* bvh: intersections) {
+		if ((bvh->Flags<uint32_t>() & (BvhIntersectNative | BvhIntersectEmpty)) != 0) continue;
+		bvh->SetFlags(bvh->Flags<uint32_t>() | BvhIntersectEmpty);
+		++marked;
+	}
+	if (marked != 0) {
+		LOGF("%s universal ray tracing: hash=0x%016llx runs %zu of %zu intersections empty: no form and no host query serves "
+		     "them, their box nodes have no child\n",
+		     program.stage == ShaderType::Compute ? "CS" : "PS", static_cast<unsigned long long>(program.shader_hash), marked,
+		     intersections.size());
+	}
+	return marked;
 }
 
 }

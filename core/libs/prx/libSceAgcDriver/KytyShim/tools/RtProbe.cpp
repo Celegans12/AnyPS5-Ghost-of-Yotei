@@ -94,7 +94,7 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 		return 1;
 	}
 	auto translated = Recompiler::TranslateProgram(source.decoded, options);
-	uint32_t bvh = 0, native = 0, oracle = 0, lane = 0;
+	uint32_t bvh = 0, native = 0, oracle = 0, lane = 0, empty = 0;
 	for (const auto* block: translated.program.blocks) {
 		for (const auto& inst: *block) {
 			if (inst.GetOpcode() != Recompiler::IR::ValueOpcode::BvhIntersect) continue;
@@ -103,13 +103,15 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 			if ((flags & Recompiler::IR::BvhIntersectNative) != 0) ++native;
 			if ((flags & Recompiler::IR::BvhIntersectOracle) != 0) ++oracle;
 			if ((flags & Recompiler::IR::BvhIntersectOracleLane) != 0) ++lane;
+			if ((flags & Recompiler::IR::BvhIntersectEmpty) != 0) ++empty;
 		}
 	}
 	const auto& info = translated.program.info;
-	std::printf("%s: words=%zu bvh=%u native=%u user_sgpr=%u header=0x%x root=0x%x layout=%08x,%08x,%08x,%08x oracle=%u lane=%u\n",
+	std::printf("%s: words=%zu bvh=%u native=%u user_sgpr=%u header=0x%x root=0x%x layout=%08x,%08x,%08x,%08x oracle=%u lane=%u "
+	            "empty=%u\n",
 	            label, code.size(), bvh, native, info.ray_query_user_sgpr, info.ray_query_header_offset, info.ray_query_root,
 	            info.ray_query_layout[0], info.ray_query_layout[1], info.ray_query_layout[2], info.ray_query_layout[3], oracle,
-	            lane);
+	            lane, empty);
 	for (size_t at = 0; at < translated.oracle_sources.size(); ++at) {
 		const auto& hypothesis = translated.oracle_sources[at];
 		std::printf("%s: hypothesis %zu/%zu user_sgpr=%u header=0x%x vsharp=0x%x root=0x%x layout=%08x,%08x,%08x,%08x\n", label, at,

@@ -175,7 +175,7 @@ struct BlasPush {
 	uint32_t flags;
 };
 
-constexpr uint32_t IncompleteWalksAtMost = 64;
+constexpr uint32_t IncompleteWalksNoted = 64;
 constexpr uint32_t BlasNodeCountAt80 = 1;
 constexpr uint32_t TlasNodeCountBit  = 29;
 constexpr uint32_t BlasNodeCountBit  = 31;
@@ -338,7 +338,7 @@ struct RtStats {
 	std::atomic<uint32_t> last_overflow_capacity {0};
 	std::atomic<uint32_t> last_overflow_boxes {0};
 	RtCounter             walks_incomplete;
-	RtCounter             walks_forced;
+	RtCounter             incomplete_instances;
 	std::atomic<uint64_t> last_incomplete {0};
 	std::atomic<uint64_t>                guest_rays {0};
 	uint64_t                             guest_rays_reported = 0;
@@ -375,14 +375,13 @@ void SummarizeRayTracing() {
 	const auto last      = [&](Kind kind) {
 		return RtShader(stats.last_guest[static_cast<size_t>(kind)].load(std::memory_order_relaxed));
 	};
-	const auto null_tlas  = guest(Kind::NullTlas);
-	const auto unrecognized = guest(Kind::Unrecognized);
+	const auto empty       = guest(Kind::Empty);
 	const auto null_header = stats.walks_null_header.TakeDelta();
 	const auto bad_header  = stats.walks_bad_header.TakeDelta();
 	const auto uncached    = stats.walks_uncached.TakeDelta();
 	const auto overflow    = stats.walks_overflow.TakeDelta();
 	const auto incomplete  = stats.walks_incomplete.TakeDelta();
-	const auto forced      = stats.walks_forced.TakeDelta();
+	const auto missing     = stats.incomplete_instances.TakeDelta();
 	const auto unpublished = null_header + bad_header;
 	const auto rays_total = stats.guest_rays.load(std::memory_order_relaxed);
 	const auto rays       = rays_total - stats.guest_rays_reported;
@@ -394,27 +393,26 @@ void SummarizeRayTracing() {
 	const auto oracle_waves      = stats.oracle_waves.TakeDelta();
 	const auto oracle            = oracle_returned + oracle_rays + oracle_candidates + oracle_rounds + oracle_waves;
 	const auto programs         = ShaderRecompiler::GetRayTracingPrograms();
-	const auto new_unrecognized = programs.unrecognized - stats.programs_reported.unrecognized;
+	const auto new_empty        = programs.empty - stats.programs_reported.empty;
 	const auto new_always_guest = programs.always_guest - stats.programs_reported.always_guest;
+	const auto new_pixel_guest  = programs.pixel_guest - stats.programs_reported.pixel_guest;
 	stats.programs_reported     = programs;
-	if (next == 0 || unrecognized + unpublished + uncached + overflow + incomplete + forced + rays + oracle +
-	                         new_unrecognized + new_always_guest ==
+	if (next == 0 || empty + unpublished + uncached + overflow + incomplete + rays + oracle + new_empty +
+	                         new_always_guest + new_pixel_guest ==
 	                     0) {
 		return;
 	}
 	const auto log = [](const std::string& line) { ::Log::WriteToConsoleAndLog(line + "\n"); };
-	log(fmt::format("[RT] summary of the last 10 s: {} dispatches traced through host TLASes, {} walked the guest BVH",
-	                native, null_tlas + unrecognized));
-	if (unrecognized != 0) {
-		log(fmt::format("[RT]   {} of programs whose BVH walk no form recognizes (last cs {})", unrecognized,
-		                last(Kind::Unrecognized)));
-	}
-	if (null_tlas != 0) {
-		log(fmt::format("[RT]   {} without a TLAS (the program with the guest's own walks)", null_tlas));
+	log(fmt::format("[RT] summary of the last 10 s: {} dispatches traced through host TLASes, {} ran empty",
+	                native, empty));
+	if (empty != 0) {
+		log(fmt::format("[RT]   {} of programs that no form nor host query serves: their box intersections had no child "
+		                "(last cs {})",
+		                empty, last(Kind::Empty)));
 	}
 	if (unpublished != 0) {
 		log(fmt::format("[RT]   {} TLAS walks published no context ({} with a null header, {} with a header that is "
-		                "not a TLAS; last cs {}): their dispatches walked the guest BVH",
+		                "not a TLAS; last cs {}): the rays of their dispatches missed",
 		                unpublished, null_header, bad_header,
 		                RtShader(stats.last_unpublished.load(std::memory_order_relaxed))));
 	}
@@ -431,15 +429,14 @@ void SummarizeRayTracing() {
 		                stats.last_overflow_capacity.load(std::memory_order_relaxed),
 		                stats.last_overflow_boxes.load(std::memory_order_relaxed), QueueCapacity));
 	}
-	if (incomplete + forced != 0) {
-		log(fmt::format("[RT]   {} TLAS walks were incomplete, with instances whose BLAS the host has not built yet "
-		                "or a full host structure (last cs {}): {} published no context and their dispatches walked the "
-		                "guest BVH, {} published one anyway after {} incomplete walks in a row",
-		                incomplete + forced, RtShader(stats.last_incomplete.load(std::memory_order_relaxed)), incomplete,
-		                forced, IncompleteWalksAtMost));
+	if (incomplete != 0) {
+		log(fmt::format("[RT]   {} TLAS walks were incomplete, with {} instances whose BLAS the host has not built yet, "
+		                "TLAS memory not cached yet or a full host structure (last cs {}): their contexts were published, "
+		                "and their rays missed what the host structures left out",
+		                incomplete, missing, RtShader(stats.last_incomplete.load(std::memory_order_relaxed))));
 	}
 	if (rays != 0) {
-		log(fmt::format("[RT]   {} rays went back to the guest traversal (last cs {})", rays,
+		log(fmt::format("[RT]   {} rays had no host context or host service and missed (last cs {})", rays,
 		                RtShader(stats.last_guest_rays.load(std::memory_order_relaxed))));
 	}
 	if (oracle != 0) {
@@ -447,16 +444,17 @@ void SummarizeRayTracing() {
 			return whole != 0 ? static_cast<double>(part) / static_cast<double>(whole) : 0.0;
 		};
 		log(fmt::format("[RT]   oracle: {} rays answered from host ray queries (last cs {}), {:.2f} candidates per ray, "
-		                "{:.2f} resume rounds per wave, {} box intersections handed back to the guest walk (last cs {})",
+		                "{:.2f} resume rounds per wave, {} box intersections missed without a host context (last cs {})",
 		                oracle_rays, RtShader(stats.last_oracle.load(std::memory_order_relaxed)),
 		                per(oracle_candidates, oracle_rays), per(oracle_rounds, oracle_waves), oracle_returned,
 		                RtShader(stats.last_oracle_returned.load(std::memory_order_relaxed))));
 	}
-	if (new_unrecognized + new_always_guest != 0) {
-		log(fmt::format("[RT]   programs compiled so far: {} traced natively, {} whose BVH walk no form recognizes "
-		                "(last cs {}), {} with sites that always walk the guest BVH (last cs {})",
-		                programs.native, programs.unrecognized, RtShader(programs.last_unrecognized),
-		                programs.always_guest, RtShader(programs.last_always_guest)));
+	if (new_empty + new_always_guest + new_pixel_guest != 0) {
+		log(fmt::format("[RT]   programs compiled so far: {} traced natively, {} with BVH walks that run empty (last {}), "
+		                "{} with sites that always miss (last cs {}), {} pixel programs kept on the guest traversal (last "
+		                "ps {})",
+		                programs.native, programs.empty, RtShader(programs.last_empty), programs.always_guest,
+		                RtShader(programs.last_always_guest), programs.pixel_guest, RtShader(programs.last_pixel_guest)));
 	}
 }
 }
@@ -1594,7 +1592,6 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 		if (counted != 0) {
 			m_cpu_counted_sources.insert(source_key);
 		}
-		readback.forced = m_incomplete[source_key].forced;
 		const auto last = std::max(m_last_instance_counts[source_key], counted);
 		tlas_count      = std::min(m_tlas_capacity,
 		                           std::max({m_cpu_counted_sources.contains(source_key) ? 1024u : 4096u,
@@ -1735,7 +1732,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	    .table_mask        = TableEntries - 1,
 	    .prepare_id        = m_prepare_id,
 	    .verify            = (verify ? 1u : 0u) | (count_rays ? 2u : 0u) | (per_lane ? 4u : 0u) |
-	                         (readback.forced ? 8u : 0u),
+	                         8u,
 	    .layout            = source.layout,
 	};
 	command.bindPipeline(vk::PipelineBindPoint::eCompute, m_tlas_pipeline);
@@ -1847,20 +1844,17 @@ void RayTracing::ProcessReadback(Readback& readback) {
 		const bool complete = state.unknown_blas == 0 && (state.overflow & (StateFull | StateUnmapped)) == 0;
 		auto&      run      = m_incomplete[readback.source_key];
 		if (complete) {
-			run.count  = 0;
-			run.forced = false;
+			run.count = 0;
 		} else {
-			(readback.forced ? g_rt_stats.walks_forced : g_rt_stats.walks_incomplete).Add();
+			g_rt_stats.walks_incomplete.Add();
+			g_rt_stats.incomplete_instances.Add(state.unknown_blas);
 			g_rt_stats.last_incomplete.store(readback.shader_hash, std::memory_order_relaxed);
-			if (++run.count >= IncompleteWalksAtMost && !run.forced) {
-				run.forced = true;
-				if (!run.noted) {
-					run.noted = true;
-					::Log::WriteToConsoleAndLog(fmt::format(
-					    "[RT] host TLAS of cs {}: {} incomplete walks in a row ({} instances without a built BLAS): its "
-					    "context is published as complete until a walk finds every BLAS\n",
-					    RtShader(readback.shader_hash), run.count, state.unknown_blas));
-				}
+			if (++run.count >= IncompleteWalksNoted && !run.noted) {
+				run.noted = true;
+				::Log::WriteToConsoleAndLog(fmt::format(
+				    "[RT] host TLAS of cs {}: {} incomplete walks in a row ({} instances without a built BLAS): its rays "
+				    "miss these instances until a walk finds every BLAS\n",
+				    RtShader(readback.shader_hash), run.count, state.unknown_blas));
 			}
 		}
 	}

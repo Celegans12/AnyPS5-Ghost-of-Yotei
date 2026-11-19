@@ -460,8 +460,15 @@ from host ray queries` line and enters the key of every compiled compute program
 take, a quarter of the largest device-local heap clamped to 512 MiB to 4 GiB; it is read by
 `graphics/host_gpu/renderer/rayTracingSlots.cpp`.
 
-A ray tracing pass whose BVH walk no form recognizes logs `walks a guest BVH no form recognizes` and its `[RT]`
-summaries name its compute shader. `kyty_rt_probe` (target of a `kyty` build with `BUILD_TESTING=ON`, not built by
+With native ray tracing on, a BVH intersection that neither a form nor a host ray query serves runs empty: its box
+nodes have no child, so the walk ends and its rays miss, while its triangle test stays exact. The program logs one
+`[RT] cs 0x…: N of M BVH intersections run empty` line per session, its `[RT]` summaries count its dispatches, and with
+`KYTY_RT_CHECK` it gets an `empty` row in `<title>.rt`. A pixel shader's BVH walk without bit 8 of `KYTY_RT_ORACLE`
+stays emulated (`[RT] ps 0x…: pixel walk kept on the guest traversal`). The emulated walk serves every BVH walk only
+with `KYTY_NATIVE_RT=0` or on a GPU without ray queries, and the reference variant of `KYTY_RT_CHECK`. A host TLAS
+walk that finds BLASes the host has not built yet, TLAS memory it has not cached yet or a full host structure still
+publishes its context: the rays of that dispatch miss what it left out, and the `[RT]` summary counts these walks and
+the instances they left out. `kyty_rt_probe` (target of a `kyty` build with `BUILD_TESTING=ON`, not built by
 default) recompiles such a shader offline, from its raw machine code, as the driver does with native ray tracing on:
 `kyty_rt_probe [--wave 32|64] [--group X Y Z] [--scratch dwords] [--lds dwords] [--dump] [--spirv out.spv] <shader.bin>...`
 prints, per file, its BVH intersections, how many of them trace with ray queries, and the TLAS source and instance
@@ -469,7 +476,8 @@ record layout derived for them, and exits with 0 only when every intersection do
 compiles as with `KYTY_NATIVE_RT=0`, `--oracle 0-15` as with `KYTY_RT_ORACLE`, `--stats` as with `KYTY_RT_STATS=1`, and
 `--subgroup 32` translates a wave of 64 for a GPU with subgroups of 32, as the driver does there, `--stage pixel` translates a
 pixel shader (`--inputs N` interpolated inputs, 8 by default) instead of a compute one; the line then ends with
-`oracle=N lane=M`, the intersections that answer from a host ray query and those of them that do it lane by lane.
+`oracle=N lane=M empty=E`, the intersections that answer from a host ray query, those of them that do it lane by lane,
+and those that run empty.
 
 To probe directly from the game's local pipeline manifest code cache, use
 `kyty_rt_probe --cache _PipelineCache/<title>_<version>.code --hash 0x<shader-hash>`.

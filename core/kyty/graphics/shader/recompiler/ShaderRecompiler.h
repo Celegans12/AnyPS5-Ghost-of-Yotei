@@ -88,15 +88,17 @@ struct ShaderSource {
 	[[nodiscard]] bool HasCalls() const { return !calls.empty() || expand_calls; }
 };
 
-enum class RayTracingProgramKind : uint32_t { Native, Unrecognized, AlwaysGuest };
+enum class RayTracingProgramKind : uint32_t { Native, Empty, AlwaysGuest, PixelGuest, Count };
 struct RayTracingPrograms {
 	uint64_t native            = 0;
-	uint64_t unrecognized      = 0;
+	uint64_t empty             = 0;
 	uint64_t always_guest      = 0;
-	uint64_t last_unrecognized = 0;
+	uint64_t pixel_guest       = 0;
+	uint64_t last_empty        = 0;
 	uint64_t last_always_guest = 0;
+	uint64_t last_pixel_guest  = 0;
 };
-void                             NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash);
+bool                             NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash);
 [[nodiscard]] RayTracingPrograms GetRayTracingPrograms();
 
 [[nodiscard]] const char* StageName(ShaderType stage);

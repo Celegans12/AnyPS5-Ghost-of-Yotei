@@ -142,7 +142,7 @@ public:
 
 	void NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memory_size);
 
-	enum class GuestDispatch : uint32_t { NullTlas, Unrecognized, Count };
+	enum class GuestDispatch : uint32_t { Empty, Count };
 	static void NoteGuestDispatch(GuestDispatch kind, uint64_t shader_hash) noexcept;
 	static void NoteGuestRays(uint64_t shader_hash, uint64_t rays);
 	struct OracleCounts {
@@ -281,13 +281,11 @@ private:
 		uint64_t                frame       = 0;
 		uint64_t                shader_hash = 0;
 		uint64_t                preparation = 0;
-		bool                    forced      = false;
 		uint32_t                capacity    = 0;
 	};
 	struct IncompleteRun {
-		uint32_t count  = 0;
-		bool     forced = false;
-		bool     noted  = false;
+		uint32_t count = 0;
+		bool     noted = false;
 	};
 
 	void CreatePipelines();

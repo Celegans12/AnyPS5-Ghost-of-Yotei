@@ -758,8 +758,10 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 		const auto same = Equal(s, LoadAddressU64(s, AddressPlus(s, context, ContextHeader)), header);
 		return LogicalAnd(s, valid, same);
 	});
-	const auto& allow  = inst.Arg(14);
-	const auto  native = allow.IsImmediate() && allow.U1() ? host : LogicalAnd(s, host, ctx.Arg(inst, 14));
+	const auto& allow   = inst.Arg(14);
+	const bool  allow_all = allow.IsImmediate() && allow.U1();
+	const auto  native  = allow_all ? host : LogicalAnd(s, host, ctx.Arg(inst, 14));
+	const auto  served  = always_guest ? native : allow_all ? ConstantBool(s, true) : ctx.Arg(inst, 14);
 	if (s.ray_stats) {
 		const auto guest  = LogicalAnd(s, exec, LogicalNot(s, native));
 		const auto ballot = s.builder.AllocateId();
@@ -826,7 +828,7 @@ uint32_t EmitRayQueryInit(ValueEmitContext& ctx, const IR::Inst& inst) {
 		                      And(s, ray[7], 0xffu), origin, ConstantF32Value(s, 0.0f), direction,
 		                      ray[6]);
 	});
-	return native;
+	return served;
 }
 
 uint32_t EmitRayQueryNext(ValueEmitContext& ctx, const IR::Inst& inst) {

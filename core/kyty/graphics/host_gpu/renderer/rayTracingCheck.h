@@ -31,6 +31,7 @@ public:
 	RayTracingCheck& operator=(const RayTracingCheck&) = delete;
 
 	[[nodiscard]] static bool Served(const ShaderModule& module);
+	[[nodiscard]] static bool Empty(const ShaderModule& module);
 	[[nodiscard]] bool        FallsBack(uint64_t shader_hash);
 	[[nodiscard]] bool        Sample(const ShaderModule& module, const CommandBuffer& buffer);
 	void                      Defer(uint64_t shader_hash, bool queued);
@@ -67,6 +68,7 @@ private:
 		bool                fallback   = false;
 		bool                verified   = false;
 		bool                waiting    = false;
+		bool                empty      = false;
 		std::string         unreplayable;
 		std::vector<double> fractions;
 	};
@@ -81,6 +83,7 @@ private:
 	};
 
 	bool     Prepare();
+	void     NoteEmpty(uint64_t hash);
 	void     Reserve(uint64_t region);
 	bool     Collect(const PreparedBindings& bindings, std::vector<Output>& outputs, std::string& reason) const;
 	void     Copy(const CommandRecorder& command, const std::vector<Output>& outputs, uint64_t region, bool restore);

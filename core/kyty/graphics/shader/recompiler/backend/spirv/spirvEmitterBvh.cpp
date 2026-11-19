@@ -238,15 +238,18 @@ uint32_t Boxes(EmitterState& s, uint32_t first, uint32_t second, uint32_t half,
 
 }
 
-void DefineBvhIntersect(EmitterState& s) {
-	if (!s.program.info.bvh) return;
+namespace {
+
+constexpr uint32_t ServedFlags    = IR::BvhIntersectNative | IR::BvhIntersectOracle | IR::BvhIntersectEmpty;
+constexpr uint32_t IntersectFlags = ServedFlags | IR::BvhIntersectOracleLane;
+
+uint32_t DefineBvhFunction(EmitterState& s, bool boxes) {
 	const auto u = TypeU32(s), f = TypeF32(s), b = TypeBool(s), wide = TypeU64(s);
 	const auto vec4 = TypeU32Vector(s, 4), vec3 = TypeF32Vector(s, 3);
 	const auto signature = s.builder.Type(spv::OpTypeFunction, vec4, vec4, wide, f, vec3, vec3, vec3);
-	s.bvh_intersect_function = s.builder.AllocateId();
-	s.builder.AddName(s.bvh_intersect_function, "bvh_intersect");
-	s.builder.AddFunction(spv::OpFunction, vec4, s.bvh_intersect_function,
-	                      spv::FunctionControlMaskNone, signature);
+	const auto function  = s.builder.AllocateId();
+	s.builder.AddName(function, boxes ? "bvh_intersect" : "bvh_triangle");
+	s.builder.AddFunction(spv::OpFunction, vec4, function, spv::FunctionControlMaskNone, signature);
 	std::array<uint32_t, 6> args;
 	const std::array types {vec4, wide, f, vec3, vec3, vec3};
 	for (uint32_t i = 0; i < args.size(); ++i) {
@@ -272,10 +275,10 @@ void DefineBvhIntersect(EmitterState& s) {
 	const auto kind = and_bits(Unary(s, spv::OpUConvert, u, node), 7);
 	const auto triangle = Binary(s, spv::OpULessThan, b, kind, ConstantU32(s, 4));
 	const auto full = Binary(s, spv::OpIEqual, b, kind, ConstantU32(s, 5));
-	const auto half = Binary(s, spv::OpIEqual, b, kind, ConstantU32(s, 4));
+	const auto half = boxes ? Binary(s, spv::OpIEqual, b, kind, ConstantU32(s, 4)) : 0u;
 	const auto bary = Binary(s, spv::OpINotEqual, b, and_bits(words[3], 0x01000000), ConstantU32(s, 0));
-	const auto sort = Binary(s, spv::OpINotEqual, b, and_bits(words[1], 0x80000000), ConstantU32(s, 0));
-	const auto grow = and_bits(shr(words[1], 23), 0xff);
+	const auto sort = boxes ? Binary(s, spv::OpINotEqual, b, and_bits(words[1], 0x80000000), ConstantU32(s, 0)) : 0u;
+	const auto grow = boxes ? and_bits(shr(words[1], 23), 0xff) : 0u;
 	const auto base  = Binary(s, spv::OpShiftLeftLogical, wide,
 	                          PackU64(s, words[0], and_bits(words[1], 0xff)), ConstantU32(s, 8));
 	const auto index = Binary(s, spv::OpShiftRightLogical, wide, node, ConstantU32(s, 3));
@@ -308,6 +311,17 @@ void DefineBvhIntersect(EmitterState& s) {
 	for (uint32_t i = 0; i < 4; ++i)
 		invalid_words[i] = Select(s, u, triangle, triangle_invalid[i], box_invalid[i]);
 	const auto invalid = Vector(s, vec4, invalid_words);
+	if (!boxes) {
+		require(triangle);
+		const auto result = EmitValueOrDefaultIfCondition(s, valid, vec4, invalid, [&] {
+			const auto first = GetBdaPointer(s, address);
+			return EmitValueOrDefaultIfCondition(s, Binary(s, spv::OpINotEqual, b, first, ConstantU64(s, 0)), vec4,
+			                                     invalid, [&] { return Triangle(s, BvhNode(s, first), kind, bary, origin, direction); });
+		});
+		s.builder.AddFunction(spv::OpReturnValue, result);
+		s.builder.AddFunction(spv::OpFunctionEnd);
+		return function;
+	}
 	const auto result = EmitValueOrDefaultIfCondition(s, valid, vec4, invalid, [&] {
 		const auto first = GetBdaPointer(s, address);
 		const auto second  = EmitValueOrDefaultIfCondition(s, full, wide, ConstantU64(s, 0), [&] {
@@ -340,16 +354,33 @@ void DefineBvhIntersect(EmitterState& s) {
 	});
 	s.builder.AddFunction(spv::OpReturnValue, result);
 	s.builder.AddFunction(spv::OpFunctionEnd);
+	return function;
+}
+
+}
+
+void DefineBvhIntersect(EmitterState& s) {
+	if (!s.program.info.bvh) return;
+	bool guest = false, served = false;
+	for (const auto* block: s.program.blocks) {
+		for (const auto& inst: *block) {
+			if (inst.GetOpcode() != IR::ValueOpcode::BvhIntersect) continue;
+			((inst.Flags<uint32_t>() & ServedFlags) != 0 ? served : guest) = true;
+		}
+	}
+	if (guest || !served) s.bvh_intersect_function = DefineBvhFunction(s, true);
+	if (served) s.bvh_triangle_function = DefineBvhFunction(s, false);
 }
 
 uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	const auto* ray = ctx.ImageAddress(inst.Arg(1));
-	const auto node_words =
-	    inst.Flags<uint32_t>() & ~(IR::BvhIntersectNative | IR::BvhIntersectOracle | IR::BvhIntersectOracleLane);
+	const auto node_words = inst.Flags<uint32_t>() & ~IntersectFlags;
 	if ((inst.Flags<uint32_t>() & IR::BvhIntersectOracle) != 0 && s.oracle.lanes[0].state != 0) return EmitBvhOracle(ctx, inst);
+	const auto function =
+	    (inst.Flags<uint32_t>() & ServedFlags) != 0 ? s.bvh_triangle_function : s.bvh_intersect_function;
 	if (ray == nullptr || (node_words != 1u && node_words != 2u) ||
-	    ray->NumArgs() < node_words + 10u || s.bvh_intersect_function == 0)
+	    ray->NumArgs() < node_words + 10u || function == 0)
 		ctx.Fail(inst, "BVH intersection requires its node pointer, ray components and shared function");
 	const auto vector = [&](uint32_t first) {
 		Vec3 values;
@@ -367,7 +398,7 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	    ConstantU32CompositeZero(s, 4), [&] {
 		const auto result = s.builder.AllocateId();
 		s.builder.AddFunction(spv::OpFunctionCall, TypeU32Vector(s, 4), result,
-		    s.bvh_intersect_function, descriptor, node, extent, origin, direction, inverse);
+		    function, descriptor, node, extent, origin, direction, inverse);
 		return result;
 	});
 }

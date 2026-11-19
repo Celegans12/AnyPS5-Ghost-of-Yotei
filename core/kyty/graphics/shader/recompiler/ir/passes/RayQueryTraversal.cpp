@@ -5608,7 +5608,10 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			     static_cast<unsigned long long>(program.shader_hash), derived.refusal, derived.detail);
 		}
 	}
-	if (walks.empty()) return result;
+	if (walks.empty()) {
+		MarkEmptyWalk(program, intersections, options);
+		return result;
+	}
 	const bool formed    = std::ranges::any_of(walks, [](const Walk& walk) { return walk.kind != Kind::Universal; });
 	auto       reference = walks.front().Shape().source;
 	auto       lowest    = walks.front().Shape().layout.mask_shift;
@@ -5659,7 +5662,10 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 		     compute ? "CS" : "PS", static_cast<unsigned long long>(program.shader_hash), static_cast<size_t>(kept));
 		return true;
 	});
-	if (walks.empty()) return result;
+	if (walks.empty()) {
+		MarkEmptyWalk(program, intersections, options);
+		return result;
+	}
 	result       = walks.front().Shape().source;
 	result.reach = {};
 	std::ranges::stable_partition(walks, [](const Walk& walk) { return walk.kind != Kind::Universal; });
@@ -5716,6 +5722,7 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			result.oracle_improvements = std::move(improvements);
 		}
 	}
+	MarkEmptyWalk(program, intersections, options);
 	return result;
 }
 

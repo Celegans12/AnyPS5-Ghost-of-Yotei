@@ -77,6 +77,31 @@ uint32_t Mark(Node node, Child child, uint32_t node_words = 1, uint32_t sites = 
     return flags;
 }
 
+void EmptyWalks() {
+    Walk served, left;
+    Build(served, Node::Children, Child::InLane, 1, 1);
+    Build(left, Node::Children, Child::InLane, 2, 2);
+    IR::MarkOracleWalk(served.sites);
+    std::vector<IR::Inst*> all(served.sites);
+    all.insert(all.end(), left.sites.begin(), left.sites.end());
+    IR::Program program;
+    Expect(IR::BvhIntersectEmpty == 1u << 11, "the empty bit is bit 11");
+    Expect(IR::MarkEmptyWalk(program, all, {.rewrite = false}) == 0, "the emulated variant runs no intersection empty");
+    for (const auto* bvh: left.sites) {
+        Expect((bvh->Flags<uint32_t>() & IR::BvhIntersectEmpty) == 0, "an emulated intersection keeps its box test");
+    }
+    Expect(IR::MarkEmptyWalk(program, all, {.rewrite = true}) == 2, "the native variant runs every unserved intersection empty");
+    for (const auto* bvh: left.sites) {
+        const auto set = bvh->Flags<uint32_t>();
+        Expect((set & IR::BvhIntersectEmpty) != 0 && (set & IR::BvhIntersectNative) == 0, "an unserved intersection is empty, not native");
+        Expect((set & 0xffu) == 2, "an empty intersection keeps its node word count");
+    }
+    for (const auto* bvh: served.sites) {
+        Expect((bvh->Flags<uint32_t>() & IR::BvhIntersectEmpty) == 0, "an intersection the oracle serves is not empty");
+    }
+    Expect(IR::MarkEmptyWalk(program, all, {.rewrite = true}) == 0, "marking again adds nothing");
+}
+
 bool Lane(uint32_t flags) {
     return (flags & IR::BvhIntersectOracleLane) != 0;
 }
@@ -124,6 +149,7 @@ void NodeCountFacts() {
 
 int main() {
     Marking();
+    EmptyWalks();
     Modes();
     NodeCountFacts();
     if (failures != 0) {
