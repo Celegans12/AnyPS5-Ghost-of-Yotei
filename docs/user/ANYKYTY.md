@@ -180,6 +180,7 @@ On by default unless the row says otherwise; set one to compare, or to work arou
 | `KYTY_EARLY_FLIP` | `0`, `1` (default) | Hand flips back to the game as soon as the presentation copy is submitted |
 | `KYTY_SUSPEND_POINT_DEPTH` | 1 to 64, `8` by default | Suspend points the GPU may have in flight; `1` is Kyty's behaviour |
 | `KYTY_LABELS_AFTER_DUMPS` | `0`, `1` (default) | Deferred labels wait for the newest pending occlusion dump instead of their own command buffer |
+| `KYTY_LABELS_AROUND_GPU_WRITES` | `0`, `1` (default) | A label next to bytes the GPU writes is deferred behind the pending labels instead of draining the GPU |
 | `KYTY_DRAW_TEMPLATES`, `KYTY_DRAW_BUFFERS` | `2` and `1` by default; `0` turns off | Kyty's draw templates and grouped draw-buffer copies, on by default in AnyKyty |
 | `KYTY_WRITE_BACK_IMAGES` | `0`, `1` (default) | Copy GPU-written images back at the write-backs the game requests |
 | `KYTY_TILE_VIA_VRAM` | `0`, `1` (default) | Read tiled images back through VRAM: one copy to host memory instead of scattered writes across PCIe |

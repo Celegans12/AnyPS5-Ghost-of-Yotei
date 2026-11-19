@@ -255,6 +255,7 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 | `KYTY_ENGINE_FREE_BUFFERS` | `0` off, `2` drops GPU-written bytes, else on | on | Buffers over a block the game freed and kept mapped go as for an unmap. Its only entry, `NoteGameFree`, has no caller in this build: it belongs to Demon's Souls' page-free hook, which is not imported | inert | — | Kyty import |
 | `KYTY_EARLY_FLIP` | `0` or `1`, empty counts as unset, else stops | on | Completes a guest flip once its command buffer is submitted, on a thread of its own; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `499dfc3f39` |
 | `KYTY_LABELS_AFTER_DUMPS` | `0` or `1`, empty counts as unset, else stops | on | A deferred `RELEASE_MEM` label waits for the newest pending occlusion dump instead of its own command buffer; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `ef88cc3285` |
+| `KYTY_LABELS_AROUND_GPU_WRITES` | `0` or `1`, empty counts as unset, else stops | on | A `RELEASE_MEM` label that arrives while other labels are deferred, on a page the GPU wrote elsewhere but none of whose own bytes it wrote, is deferred behind them instead of draining the GPU; `0` drains. See [below](#details) | perf | all | AnyKyty |
 
 ### Pipelines and shader store
 
@@ -438,6 +439,18 @@ once a frame for a deferred label: on Stray at 4,240 draws a frame, the execute 
 frame and the frame rate from 71.0 to 80.1 and 80.9 frames per second, the same images (`notes/stray-label-flush.md`).
 `KYTY_LABELS_AFTER_DUMPS=0` restores KytyPS5's behaviour; another value stops the emulator with a message naming the
 variable.
+
+A label that cannot be deferred is written at once, and while another label is deferred, the execute thread first waits
+for every command buffer and priority operation before it (a full drain), so that labels stay in order. KytyPS5 only
+defers a label whose page the cache does not hold as written by the GPU: a label sharing its page with a few bytes a shader
+writes drains the GPU each time another label is pending. Under `ANYPS5_KYTY`, with `KYTY_LABELS_AROUND_GPU_WRITES` at 1,
+the default, such a label is then deferred behind the pending ones when none of its own bytes holds data the GPU wrote and
+the backing view of guest memory holds it: its completion writes it there without a fault, as the immediate write does
+after the drain; with no label pending, it is still written at once. A title that
+keeps occlusion queries or labels pending and places a label next to a GPU-written counter (a barrier table, for example)
+drained the GPU about once a frame, 5.7 ms each, 2.78 s every 10 s on a heavy city scene; the line `[kyty-labels]`, every
+10 s on stderr, counts the labels deferred this way and the drains that remain. `KYTY_LABELS_AROUND_GPU_WRITES=0` restores
+KytyPS5's behaviour; another value stops the emulator with a message naming the variable.
 
 Blocked waits on deferred writes: KytyPS5's command processor submits the open command buffer after a pass over a
 submission that made progress, but not after one that yields to another queue, nor when a queue resumes straight into a

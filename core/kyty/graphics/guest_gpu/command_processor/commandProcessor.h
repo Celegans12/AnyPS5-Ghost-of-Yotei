@@ -260,14 +260,19 @@ private:
 	std::atomic<uint32_t> m_deferred_labels {0};
 #if defined(ANYPS5_KYTY)
 	static bool                         LabelsAfterDumps();
+	static bool                         LabelsAroundGpuWrites();
 	static inline std::atomic<uint32_t> s_deferred_labels {0};
 	const bool                          m_labels_after_dumps = LabelsAfterDumps();
+	const bool                          m_labels_around_gpu_writes = LabelsAroundGpuWrites();
 #endif
 	bool m_wait_since_operation = false;
 	bool m_acquire_since_operation = true;
 
 public:
 	void NoteAcquireMem() noexcept { m_acquire_since_operation = true; }
+#if defined(ANYPS5_KYTY)
+	static void LogLabelSummary();
+#endif
 
 private:
 
