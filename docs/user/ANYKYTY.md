@@ -234,6 +234,7 @@ On by default unless the row says otherwise; set one to compare, or to work arou
 | `KYTY_WRITE_BACK_IMAGES` | `0`, `1` (default) | Copy GPU-written images back at the write-backs the game requests |
 | `KYTY_TILE_VIA_VRAM` | `0`, `1` (default) | Read tiled images back through VRAM: one copy to host memory instead of scattered writes across PCIe |
 | `KYTY_COMPARE_WRITE_BACK` | `0`, `1` (default) | An image read back to game memory writes only the bytes the GPU changed, never bytes the game wrote since the read |
+| `KYTY_FAST_TLS` | `0`, `1` (default) | Windows: the driver's own `thread_local` variables come from one native TLS slot instead of libgcc's emulated TLS, which is slower and frees them before their destructors run when a thread exits |
 | `KYTY_PROGRAM_LOCK` | `narrow` (default), `wide` | Scope of the program-cache lock. `wide` is Kyty's |
 | `KYTY_PIPELINE_LIBRARIES` | `0`, `1` (default) | Link graphics pipelines from per-stage pipeline libraries (`VK_EXT_graphics_pipeline_library`) |
 | `KYTY_ASYNC_PIPELINES` | `0`, `1` (default in this build), `2` | Create the pipeline of a draw that only changes the picture in the background; the draw is skipped until it is ready, so an object or effect can be missing for a few frames when it first appears. `2` skips more draws and does not wait for a new pipeline, but only into targets the game redraws every frame: fewer shader compilation stutters on a first run. `1` skips fewer draws and waits up to 20 ms for each new pipeline; `0` always waits |

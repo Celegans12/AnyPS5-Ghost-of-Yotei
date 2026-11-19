@@ -54,7 +54,7 @@ void Prepare() {
         imageEnd = imageBegin + nt->OptionalHeader.SizeOfImage;
         if (HMODULE gcc = GetModuleHandleW(L"libgcc_s_seh-1.dll")) fallback = reinterpret_cast<Fallback>(GetProcAddress(gcc, "__emutls_get_address"));
         const char* setting = std::getenv("KYTY_FAST_TLS");
-        fast = fallback == nullptr || (setting != nullptr && setting[0] == '1' && setting[1] == '\0');
+        fast = fallback == nullptr || setting == nullptr || setting[0] != '0' || setting[1] != '\0';
         ready.store(true, std::memory_order_release);
     }
     ReleaseSRWLockExclusive(&lock);
@@ -110,6 +110,20 @@ void* Slow(EmutlsObject* object) {
     SetLastError(error);
     return value;
 }
+
+void NTAPI ReleaseThread(PVOID, DWORD reason, PVOID) {
+    if (reason != DLL_THREAD_DETACH || !ready.load(std::memory_order_acquire) || tlsSlot == TLS_OUT_OF_INDEXES) return;
+    const DWORD error = GetLastError();
+    auto* slots = static_cast<Slots*>(ReadSlot());
+    if (slots != nullptr) {
+        TlsSetValue(tlsSlot, nullptr);
+        for (std::size_t index = 0; index < slots->count; ++index) _aligned_free(slots->values[index]);
+        std::free(slots);
+    }
+    SetLastError(error);
+}
+
+[[gnu::section(".CRT$XLY"), gnu::used]] PIMAGE_TLS_CALLBACK releaseThreadCallback = ReleaseThread;
 
 }
 
