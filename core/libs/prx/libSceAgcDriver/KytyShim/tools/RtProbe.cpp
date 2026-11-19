@@ -116,6 +116,11 @@ int Probe(const char* label, const std::vector<uint32_t>& code, uint64_t hash, c
 		            translated.oracle_sources.size(), hypothesis.user_sgpr, hypothesis.header_offset, hypothesis.header_vsharp,
 		            hypothesis.root, hypothesis.layout[0], hypothesis.layout[1], hypothesis.layout[2], hypothesis.layout[3]);
 	}
+	for (size_t at = 0; at < translated.oracle_improvements.size(); ++at) {
+		const auto& improvement = translated.oracle_improvements[at];
+		std::printf("%s: improvement %zu/%zu option=0x%x mask=%u:%u:%u\n", label, at, translated.oracle_improvements.size(),
+		            improvement.option, improvement.dword, improvement.shift, improvement.width);
+	}
 	if (settings.emit) {
 		Recompiler::IR::ResourceSpecialization specialization;
 		specialization.buffers.resize(translated.program.info.buffers.size());

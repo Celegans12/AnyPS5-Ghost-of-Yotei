@@ -38,10 +38,11 @@ struct CompileOptions {
 };
 
 struct TranslateResult {
-	IR::Program                       program;
-	std::string                       decoded_dump;
-	std::string                       cfg_dump;
-	std::vector<IR::NativeTraversals> oracle_sources;
+	IR::Program                        program;
+	std::string                        decoded_dump;
+	std::string                        cfg_dump;
+	std::vector<IR::NativeTraversals>  oracle_sources;
+	std::vector<IR::OracleImprovement> oracle_improvements;
 };
 
 struct CompileResult {
@@ -52,6 +53,7 @@ struct CompileResult {
 	std::string            ir_dump;
 	IR::Program            program;
 	std::vector<IR::NativeTraversals> oracle_sources;
+	std::vector<IR::OracleImprovement> oracle_improvements;
 };
 
 struct ShaderSource {

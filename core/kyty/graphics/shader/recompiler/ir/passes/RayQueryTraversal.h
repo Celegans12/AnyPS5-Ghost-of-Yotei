@@ -14,6 +14,17 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 
 [[nodiscard]] uint32_t TraceTraversalsWithRayQueries(Program& program);
 
+constexpr uint32_t OracleImprovementMask = 1u << 1;
+
+struct OracleImprovement {
+	uint32_t option = 0;
+	uint32_t dword  = 0;
+	uint32_t shift  = 0;
+	uint32_t width  = 0;
+
+	bool operator==(const OracleImprovement&) const = default;
+};
+
 struct NativeTraversals {
 	uint32_t                                   sites         = 0;
 	bool                                       source_valid  = false;
@@ -24,6 +35,7 @@ struct NativeTraversals {
 	std::array<uint32_t, 4>                    layout {};
 	std::vector<std::pair<uint32_t, uint32_t>> reach;
 	std::vector<NativeTraversals>              oracle_sources;
+	std::vector<OracleImprovement>             oracle_improvements;
 };
 
 struct NativeTraversalOptions {

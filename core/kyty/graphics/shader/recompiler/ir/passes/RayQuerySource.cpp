@@ -460,7 +460,6 @@ public:
 		return ha && m_store.A(*ha).kind == Kind::Load && m_store.A(*ha).args[1] == 4 && m_store.A(*ha).args[0] == next;
 	}
 
-
 	Choices Expanded(Value value) {
 		value            = Strip(value);
 		const auto* inst = value.TryInstruction();
@@ -1403,7 +1402,7 @@ std::optional<MaskField> MaskOf(Store& store, const Fields& fields, uint32_t for
 	if (bit != nullptr && bit->args.size() == 4 && bit->args[3] == (Literal | 1u) && (bit->args[2] & Literal) != 0 && !(bit->args[1] & Literal)) {
 		const auto dword = fields.LoadDword(store, static_cast<uint32_t>(bit->args[1]));
 		const auto shift = static_cast<uint32_t>(bit->args[2] & 31u);
-		if (dword) return MaskField {*dword, shift, 0};
+		if (dword) return MaskField {*dword, shift, 1};
 	}
 	if (both == nullptr || both->args.size() != 3 || equal_one) return std::nullopt;
 	for (uint32_t side = 1; side <= 2; ++side) {
@@ -1430,15 +1429,137 @@ std::optional<MaskField> MaskOf(Store& store, const Fields& fields, uint32_t for
 			if (!at || bits == 0) continue;
 			const auto low  = static_cast<uint32_t>(std::countr_zero(bits));
 			const auto mask = bits >> low;
-			uint32_t   width = 0;
-			if (mask > 0xffu) {
-				if ((mask & (mask + 1u)) != 0) continue;
-				width = static_cast<uint32_t>(std::popcount(mask));
-			}
-			return MaskField {*at, low, width};
+			if ((mask & (mask + 1u)) != 0) continue;
+			return MaskField {*at, low, static_cast<uint32_t>(std::popcount(mask))};
 		}
 	}
 	return std::nullopt;
+}
+
+using Known = std::vector<std::pair<Value, bool>>;
+
+std::optional<bool> Lookup(const Known& known, Value value) {
+	value = value.Resolve();
+	if (value.IsImmediate()) return value.GetType() == Type::U1 ? std::optional(value.U1()) : std::nullopt;
+	for (const auto& [fact, holds]: known) {
+		if (fact == value) return holds;
+	}
+	return std::nullopt;
+}
+
+bool Learn(Known& known, Value value, bool holds) {
+	value = value.Resolve();
+	if (value.IsEmpty()) return true;
+	if (const auto already = Lookup(known, value)) return *already == holds;
+	if (known.size() > 512) return true;
+	known.emplace_back(value, holds);
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr) return true;
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::ConditionRef: return Learn(known, inst->Arg(0), holds);
+		case ValueOpcode::LogicalNot: return Learn(known, inst->Arg(0), !holds);
+		case ValueOpcode::LogicalAnd:
+		case ValueOpcode::LogicalOr:
+			if (holds == (inst->GetOpcode() == ValueOpcode::LogicalAnd)) {
+				const bool first = Learn(known, inst->Arg(0), holds);
+				return Learn(known, inst->Arg(1), holds) && first;
+			}
+			return true;
+		default: return true;
+	}
+}
+
+bool Close(Known& known) {
+	bool consistent = true;
+	for (bool changed = true; changed && consistent;) {
+		changed          = false;
+		const auto count = known.size();
+		for (size_t at = 0; at < count; ++at) {
+			const auto [value, holds] = known[at];
+			const auto* inst          = value.TryInstruction();
+			if (inst == nullptr) continue;
+			const auto op = inst->GetOpcode();
+			if (!((op == ValueOpcode::LogicalAnd && !holds) || (op == ValueOpcode::LogicalOr && holds))) continue;
+			const bool unit = op == ValueOpcode::LogicalAnd;
+			for (uint32_t side = 0; side < 2; ++side) {
+				const auto other = Lookup(known, inst->Arg(1 - side));
+				if (Lookup(known, inst->Arg(side)) == unit && other != !unit) {
+					consistent = consistent && !other && Learn(known, inst->Arg(1 - side), !unit);
+					changed    = true;
+				}
+			}
+		}
+	}
+	return consistent;
+}
+
+Known Executes(const Inst& load) {
+	Known known;
+	if (load.NumArgs() > 3) Learn(known, load.Arg(3), true);
+	const Block* to = load.Parent();
+	for (uint32_t depth = 0; depth < 8 && to != nullptr; ++depth) {
+		const auto preds = to->ImmPredecessors();
+		if (preds.size() != 1) break;
+		const auto* from = preds[0];
+		if (from->terminator.kind == CFG::TerminatorKind::ConditionalBranch && from->terminator.true_block != from->terminator.false_block) {
+			Learn(known, from->condition, to == from->terminator.true_block);
+		}
+		to = from;
+	}
+	Close(known);
+	return known;
+}
+
+std::unordered_set<const Inst*> Feeding(const Order& order, std::span<const Value> starts) {
+	std::unordered_set<const Inst*> carried, seen;
+	std::vector<Value>              pending(starts.begin(), starts.end());
+	while (!pending.empty() && seen.size() < 4096) {
+		const auto* inst = pending.back().Resolve().TryInstruction();
+		pending.pop_back();
+		if (inst == nullptr || !seen.insert(inst).second) continue;
+		if (inst->GetOpcode() == ValueOpcode::Phi && order.Carried(*inst)) {
+			carried.insert(inst);
+			continue;
+		}
+		if (inst->GetOpcode() == ValueOpcode::LoadAddressU32 || inst->GetOpcode() == ValueOpcode::ReadConstBuffer) continue;
+		for (size_t index = 0; index < inst->NumArgs(); ++index) pending.push_back(inst->Arg(index));
+	}
+	return carried;
+}
+
+std::optional<bool> Commits(const Order& order, const std::unordered_set<const Inst*>& bases, const Inst& load, Value test, bool want) {
+	struct Step {
+		const Inst* inst = nullptr;
+		Known       known;
+		uint32_t    depth = 0;
+	};
+	std::vector<Step> pending {{&load, Executes(load), 0}};
+	bool              reached = false;
+	for (size_t visited = 0; !pending.empty() && visited < 2048; ++visited) {
+		auto step = std::move(pending.back());
+		pending.pop_back();
+		for (const auto& use: step.inst->Uses()) {
+			const auto* user = use.user;
+			const auto  op   = user->GetOpcode();
+			if (op == ValueOpcode::MakeImageAddress || op == ValueOpcode::CompositeConstructU32x4 || bases.contains(user)) {
+				reached = true;
+				if (Lookup(step.known, test) != want) return false;
+				continue;
+			}
+			if (step.depth >= 24 || user->GetType() == Type::U1 || user->GetType() == Type::Void || op == ValueOpcode::LoadAddressU32 ||
+			    op == ValueOpcode::ReadConstBuffer || op == ValueOpcode::GetAddressResource) {
+				continue;
+			}
+			Step next {user, step.known, step.depth + 1};
+			if (op == ValueOpcode::Phi && order.Carried(*user)) next.known.clear();
+			if (op == ValueOpcode::SelectU32 || op == ValueOpcode::SelectF32) {
+				if (use.operand == 0) continue;
+				if (!Learn(next.known, user->Arg(0), use.operand == 1) || !Close(next.known)) continue;
+			}
+			pending.push_back(std::move(next));
+		}
+	}
+	return reached ? std::optional(true) : std::nullopt;
 }
 
 bool Reach(const Program& program, Block* header, std::vector<std::pair<uint32_t, uint32_t>>& reach, Block*& latch) {
@@ -1748,11 +1869,10 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 			}
 		}
 		if (std::popcount(types) == 1) type = static_cast<uint32_t>(std::countr_zero(types));
-		if (type && fields.inline_offset % 4u == 0 && fields.inline_offset < 2048u) {
-			layout.inline_type   = *type;
-			layout.inline_offset = static_cast<uint32_t>(fields.inline_offset);
-			layout.inline_root   = inline_roots.empty() ? tops.front() : inline_roots.front();
-		}
+		if (!type || fields.inline_offset % 4u != 0 || fields.inline_offset >= 2048u) return Refuse("the inline record type is not found");
+		layout.inline_type   = *type;
+		layout.inline_offset = static_cast<uint32_t>(fields.inline_offset);
+		layout.inline_root   = inline_roots.empty() ? tops.front() : inline_roots.front();
 	}
 	std::vector<bool> node_counts;
 	{
@@ -1787,9 +1907,17 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 		layout.node_count_80 = first.value_or(false);
 		if (counts[0] && counts[1] && *counts[0] != *counts[1]) node_counts.push_back(*counts[1]);
 	}
+	std::vector<OracleImprovement> improvements;
 	{
-		std::vector<MaskField> masks;
-		Evaluator              ev(program, order, store, Value {});
+		std::vector<MaskField>                                masks;
+		std::vector<std::tuple<MaskField, const Inst*, bool>> tests;
+		Evaluator                                             ev(program, order, store, Value {});
+		const auto test = [&](const MaskField& mask, const Inst& inst, bool nonzero) {
+			if (mask.width == 0 || mask.width > 31u || excluded(mask.dword)) return;
+			if (std::ranges::none_of(tests, [&](const auto& other) { return std::get<0>(other) == mask && std::get<1>(other) == &inst; })) {
+				tests.emplace_back(mask, &inst, nonzero);
+			}
+		};
 		for (auto* block: program.blocks) {
 			for (auto& inst: *block) {
 				const auto op = inst.GetOpcode();
@@ -1800,11 +1928,9 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 					if (!below || *below == 0u || *below > 0xffffffu || (*below & (*below + 1u)) != 0) continue;
 					for (const auto word: ev.Word(inst.Arg(left ? 0 : 1))) {
 						const auto dword = fields.LoadDword(store, word);
-						if (!dword || excluded(*dword)) continue;
-						const auto     low   = static_cast<uint32_t>(std::popcount(*below));
-						const uint32_t width = 32u - low > 8u ? 32u - low : 0u;
-						const MaskField mask {*dword, low, width, false};
-						if (std::ranges::find(masks, mask) == masks.end()) masks.push_back(mask);
+						if (!dword) continue;
+						const auto low = static_cast<uint32_t>(std::popcount(*below));
+						test({*dword, low, 32u - low, false}, inst, op == ValueOpcode::UGreaterThan32 || op == ValueOpcode::ULessThan32);
 					}
 					continue;
 				}
@@ -1815,22 +1941,53 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 					if (op == ValueOpcode::IEqual32 && *constant == 0u) continue;
 					for (const auto word: ev.Word(inst.Arg(1 - side))) {
 						const auto mask = MaskOf(store, fields, word, op == ValueOpcode::IEqual32);
-						if (mask && !excluded(mask->dword) && std::ranges::find(masks, *mask) == masks.end()) masks.push_back(*mask);
+						if (!mask) continue;
+						if (!mask->variable) {
+							test(*mask, inst, true);
+						} else if (!excluded(mask->dword) && std::ranges::find(masks, *mask) == masks.end()) {
+							masks.push_back(*mask);
+						}
 					}
 				}
 			}
 		}
-		std::erase_if(masks, [](const MaskField& mask) { return !mask.variable && mask.shift < 8u; });
-		const auto variable = std::ranges::count_if(masks, [](const MaskField& mask) { return mask.variable; });
-		if (variable == 1) std::erase_if(masks, [](const MaskField& mask) { return !mask.variable; });
+		layout.mask_dword = NoField;
+		layout.mask_shift = 0;
+		layout.mask_width = 0;
 		if (masks.size() == 1) {
 			layout.mask_dword = masks.front().dword;
 			layout.mask_shift = masks.front().shift;
-			layout.mask_width = masks.front().width;
-		} else {
-			layout.mask_dword = NoField;
-			layout.mask_shift = 0;
-			layout.mask_width = 0;
+		} else if (masks.empty() && !tests.empty()) {
+			std::vector<Value> starts;
+			for (const auto& site: sites) {
+				starts.push_back(site.descriptor->Arg(0));
+				starts.push_back(site.descriptor->Arg(1));
+				starts.push_back(site.address->Arg(0));
+				if (site.words == 2u) starts.push_back(site.address->Arg(1));
+			}
+			const auto               bases = Feeding(order, starts);
+			std::vector<const Inst*> entries;
+			for (auto* block: program.blocks) {
+				for (auto& inst: *block) {
+					if (inst.GetOpcode() != ValueOpcode::LoadAddressU32) continue;
+					const bool blas = std::ranges::any_of(ev.Address(inst), [&](uint32_t address) {
+						const auto record = RecordOf(store, address, header);
+						return record && (record->indexed ? record->offset == indexed->offset && record->stride == indexed->stride
+						                                  : record->key == fields.inline_key && !inlined.empty() && record->offset == inlined.front().second);
+					});
+					if (blas) entries.push_back(&inst);
+				}
+			}
+			for (const auto& [mask, inst, nonzero]: tests) {
+				size_t     committed = 0;
+				const bool proven    = std::ranges::all_of(entries, [&](const Inst* load) {
+					const auto commits = Commits(order, bases, *load, Value(const_cast<Inst*>(inst)), nonzero);
+					committed += commits.has_value() ? 1u : 0u;
+					return commits.value_or(true);
+				}) && committed != 0;
+				const OracleImprovement improvement {OracleImprovementMask, mask.dword, mask.shift, mask.width};
+				if (proven && std::ranges::find(improvements, improvement) == improvements.end()) improvements.push_back(improvement);
+			}
 		}
 	}
 	OracleWalks walks;
@@ -1852,29 +2009,39 @@ OracleWalks DeriveOracleWalks(const Program& program, std::span<Inst* const> int
 		}
 	}
 	node_counts.insert(node_counts.begin(), layout.node_count_80);
-	for (const auto& entry: named_sources) {
-		const auto& source = std::get<0>(entry);
-		for (const auto node_count: node_counts) {
-			for (const auto tlas_root: tops) {
-				for (const auto& [root, distance]: roots) {
-					if (walks.sources.size() >= MaxHypotheses) break;
-					if (layout.mask_dword != NoField && root == layout.mask_dword) continue;
-					auto hypothesis          = layout;
-					hypothesis.root_dword    = root;
-					hypothesis.node_count_80 = node_count;
-					NativeTraversals traversals;
-					traversals.source_valid  = true;
-					traversals.user_sgpr     = source.user_sgpr;
-					traversals.header_offset = source.header_offset;
-					traversals.header_vsharp = source.header_vsharp;
-					traversals.root          = tlas_root;
-					traversals.layout        = hypothesis.Pack();
-					traversals.reach         = reach;
-					walks.sources.push_back(std::move(traversals));
+	std::vector<uint32_t> candidates;
+	for (const auto& [root, distance]: roots) {
+		if (layout.mask_dword == NoField || root != layout.mask_dword) candidates.push_back(root);
+	}
+	std::vector<std::array<size_t, 5>> picks;
+	for (size_t source = 0; source < named_sources.size(); ++source) {
+		for (size_t count = 0; count < node_counts.size(); ++count) {
+			for (size_t tlas_root = 0; tlas_root < tops.size(); ++tlas_root) {
+				for (size_t root = 0; root < candidates.size() && picks.size() < 4096; ++root) {
+					const auto shifts = static_cast<size_t>(source != 0) + (count != 0) + (tlas_root != 0) + (root != 0);
+					picks.push_back({shifts, source, count, tlas_root, root});
 				}
 			}
 		}
 	}
+	std::ranges::stable_sort(picks, [](const auto& a, const auto& b) { return a[0] < b[0]; });
+	for (const auto& pick: picks) {
+		if (walks.sources.size() >= MaxHypotheses) break;
+		const auto& source       = std::get<0>(named_sources[pick[1]]);
+		auto        hypothesis   = layout;
+		hypothesis.root_dword    = candidates[pick[4]];
+		hypothesis.node_count_80 = node_counts[pick[2]];
+		NativeTraversals traversals;
+		traversals.source_valid  = true;
+		traversals.user_sgpr     = source.user_sgpr;
+		traversals.header_offset = source.header_offset;
+		traversals.header_vsharp = source.header_vsharp;
+		traversals.root          = tops[pick[3]];
+		traversals.layout        = hypothesis.Pack();
+		traversals.reach         = reach;
+		walks.sources.push_back(std::move(traversals));
+	}
+	walks.improvements = std::move(improvements);
 	if (walks.sources.empty()) return Refuse("no record dword reaches a node argument");
 	return walks;
 }

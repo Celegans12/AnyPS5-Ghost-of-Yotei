@@ -12,6 +12,7 @@ namespace Libs::Graphics::ShaderRecompiler::IR {
 struct OracleWalks {
 	std::vector<NativeTraversals>          sources;
 	std::vector<std::pair<Block*, Block*>> loops;
+	std::vector<OracleImprovement>         improvements;
 	const char*                            refusal = nullptr;
 	uint32_t                               detail  = 0;
 };
