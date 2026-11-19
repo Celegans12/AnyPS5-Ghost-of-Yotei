@@ -3,9 +3,17 @@
 
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
+#include <fmt/format.h>
+
 #include <cstdint>
+#include <string>
 
 namespace Libs::Graphics {
+
+[[nodiscard]] inline std::string RayTracingCheckVersionLine(uint64_t shader_stamp, uint64_t host_stamp,
+                                                            uint32_t oracle, uint32_t ppm) {
+	return fmt::format("version {:016x} {:016x} oracle={} ppm={}", shader_stamp, host_stamp, oracle, ppm);
+}
 
 template <typename Compiled>
 [[nodiscard]] const char* RayTracingCheckUnreplayable(const Compiled& program) {

@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <sstream>
 
 namespace {
 
@@ -25,6 +26,22 @@ IR::BufferResource Buffer(bool written, uint32_t binding) {
     buffer.written          = written;
     buffer.descriptor_index = binding;
     return buffer;
+}
+
+void SavedVerdictVersions() {
+    using Libs::Graphics::RayTracingCheckVersionLine;
+
+    std::istringstream receipt("version 0000000000000011 0000000000000022 oracle=1 ppm=1000\n"
+                               "0000000000000033 verified checks=4\n");
+    std::string version;
+    Expect(static_cast<bool>(std::getline(receipt, version)), "the saved verdict has a header");
+    Expect(version == RayTracingCheckVersionLine(0x11, 0x22, 1, 1000), "matching settings keep the saved verdict");
+    Expect(version != RayTracingCheckVersionLine(0x11, 0x22, 33, 1000), "enabling derived oracle results starts fresh");
+    Expect(version != RayTracingCheckVersionLine(0x11, 0x22, 1, 0), "a stricter tolerance starts fresh");
+    Expect(version != RayTracingCheckVersionLine(0x44, 0x22, 1, 1000), "a different shader stamp starts fresh");
+    Expect(version != RayTracingCheckVersionLine(0x11, 0x44, 1, 1000), "a different host stamp starts fresh");
+    Expect("version 0000000000000011 0000000000000022" != RayTracingCheckVersionLine(0x11, 0x22, 1, 1000),
+           "legacy headers without check settings start fresh");
 }
 
 void Replayable() {
@@ -88,6 +105,7 @@ void Unreplayable() {
 }
 
 int main() {
+    SavedVerdictVersions();
     Replayable();
     Unreplayable();
     if (failures != 0) {

@@ -75,7 +75,8 @@ auto OutputPlace(const auto& output) {
 }
 
 std::string VersionLine() {
-	return fmt::format("version {:016x} {:016x}", uint64_t {KYTY_SHADER_STORE_STAMP}, uint64_t {KYTY_HOST_GPU_STAMP});
+	return RayTracingCheckVersionLine(KYTY_SHADER_STORE_STAMP, KYTY_HOST_GPU_STAMP,
+	                                  Config::RayTracingOracle(), Config::RayTracingCheckPpm());
 }
 
 }
@@ -145,7 +146,7 @@ void RayTracingCheck::Load() {
 		return;
 	}
 	if (version != VersionLine()) {
-		Note(fmt::format("[RT] check: the decisions in {} come from another build, not read", m_path.string()));
+		Note(fmt::format("[RT] check: ignoring decisions in {} from a different build or check configuration", m_path.string()));
 		return;
 	}
 	uint32_t verified = 0, fallback = 0, unreplayable = 0;
