@@ -253,6 +253,12 @@ struct alignas(4) GraphicsPipelineKey {
 static_assert(std::has_unique_object_representations_v<GraphicsPipelineKey>);
 
 #if defined(ANYPS5_KYTY)
+namespace HW {
+struct ModeControl;
+}
+
+[[nodiscard]] vk::PolygonMode ResolvePolygonMode(const HW::ModeControl& mode, bool cull_front, bool cull_back);
+
 class PipelineLibraries;
 
 struct OptimizedGraphicsPipeline {
