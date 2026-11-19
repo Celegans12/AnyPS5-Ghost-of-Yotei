@@ -467,19 +467,6 @@ Decoder::Program DecodeFusedProgram(std::span<const uint32_t> front, std::span<c
 
 }
 
-const char* StageName(ShaderType stage) {
-	switch (stage) {
-		case ShaderType::Compute: return "CS";
-		case ShaderType::Vertex: return "VS";
-		case ShaderType::Local: return "LS";
-		case ShaderType::TessellationControl: return "HS";
-		case ShaderType::TessellationEvaluation: return "TES";
-		case ShaderType::Mesh: return "MS";
-		case ShaderType::Pixel: return "PS";
-		default: return "unknown";
-	}
-}
-
 namespace {
 
 std::mutex                                  g_ray_tracing_programs_mutex;

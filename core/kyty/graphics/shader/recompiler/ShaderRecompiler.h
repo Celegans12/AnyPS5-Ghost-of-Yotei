@@ -101,7 +101,18 @@ struct RayTracingPrograms {
 bool                             NoteRayTracingProgram(RayTracingProgramKind kind, uint64_t shader_hash);
 [[nodiscard]] RayTracingPrograms GetRayTracingPrograms();
 
-[[nodiscard]] const char* StageName(ShaderType stage);
+[[nodiscard]] constexpr const char* StageName(ShaderType stage) {
+	switch (stage) {
+		case ShaderType::Compute: return "CS";
+		case ShaderType::Vertex: return "VS";
+		case ShaderType::Local: return "LS";
+		case ShaderType::TessellationControl: return "HS";
+		case ShaderType::TessellationEvaluation: return "TES";
+		case ShaderType::Mesh: return "MS";
+		case ShaderType::Pixel: return "PS";
+		default: return "unknown";
+	}
+}
 [[nodiscard]] ShaderSource PrepareShaderSource(std::span<const uint32_t> code,
 	                                           const CompileOptions& options);
 const Decoder::Program& RefreshShaderSource(ShaderSource& source, const IR::SrtRuntime& runtime);

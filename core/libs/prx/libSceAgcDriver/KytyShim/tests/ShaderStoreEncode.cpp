@@ -43,7 +43,7 @@ void HealthyPlanRoundTrips() {
     Require(SaveResourcePlan(plan, bytes, failure), "a healthy plan was refused");
     Require(!failure.Failed() && !bytes.empty(), "a healthy plan reported a failure or no bytes");
     ResourcePlan loaded;
-    Require(LoadResourcePlan(bytes, loaded), "a saved plan did not load back");
+    Require(DecodeResourcePlan(bytes, loaded), "a saved plan did not load back");
     Require(loaded.value_storage.size() == 2u, "the loaded plan lost instructions");
     const auto& add = loaded.value_storage.front();
     Require(add.GetOpcode() == ValueOpcode::IAdd32 && add.Arg(0) == Value(1u) && add.Arg(1) == Value(2u),
@@ -52,6 +52,8 @@ void HealthyPlanRoundTrips() {
     Require(multiply.GetOpcode() == ValueOpcode::IMul32 && multiply.Arg(0) == Value(&loaded.value_storage.front()) &&
                 multiply.Arg(1) == Value(7u),
             "the loaded plan changed an instruction reference");
+    std::vector<uint8_t> roundTrip;
+    Require(SaveResourcePlan(loaded, roundTrip, failure) && roundTrip == bytes, "the loaded plan encoded to different bytes");
 }
 
 void ImpossibleOperandRefusesThePlan() {

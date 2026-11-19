@@ -40,14 +40,23 @@ target_include_directories(kyty_shim_shader_cache_policy_tests PRIVATE ${CMAKE_C
 add_test(NAME kyty_shim_shader_cache_policy COMMAND kyty_shim_shader_cache_policy_tests)
 set_tests_properties(kyty_shim_shader_cache_policy PROPERTIES TIMEOUT 20)
 
-if(NOT WIN32)
+if(NOT ANYPS5_KYTY_DLL)
     add_test_executable(kyty_shim_shader_store_encode_tests ${CMAKE_CURRENT_SOURCE_DIR}/ShaderStoreEncode.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
     target_include_directories(kyty_shim_shader_store_encode_tests PRIVATE ${LIBS_INCLUDE_DIR})
-    configure_host_test_executable(kyty_shim_shader_store_encode_tests)
-    target_link_libraries(kyty_shim_shader_store_encode_tests PRIVATE Kyty::gpu libkernel libc)
-    add_test(NAME kyty_shim_shader_store_encode COMMAND kyty_shim_shader_store_encode_tests)
-    set_tests_properties(kyty_shim_shader_store_encode PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_shader_store_encode: ok"
-            FAIL_REGULAR_EXPRESSION "terminate called")
+    if(WIN32)
+        target_link_libraries(kyty_shim_shader_store_encode_tests PRIVATE Kyty::gpu)
+        if(NOT CMAKE_VERSION VERSION_LESS 3.21)
+            add_custom_command(TARGET kyty_shim_shader_store_encode_tests POST_BUILD
+                    COMMAND "${CMAKE_COMMAND}" "-DDEST_DIR=$<TARGET_FILE_DIR:kyty_shim_shader_store_encode_tests>"
+                    -P "${CMAKE_SOURCE_DIR}/cmake/CopyRuntimeFiles.cmake" "$<TARGET_FILE:libc>"
+                    VERBATIM)
+        endif()
+    else()
+        target_link_libraries(kyty_shim_shader_store_encode_tests PRIVATE Kyty::gpu libkernel libc)
+    endif()
+    add_test(NAME kyty_shim_shader_store_encode COMMAND "${CMAKE_COMMAND}"
+            "-DTEST_EXECUTABLE=$<TARGET_FILE:kyty_shim_shader_store_encode_tests>" -P "${CMAKE_CURRENT_SOURCE_DIR}/ShaderStoreEncode.cmake")
+    set_tests_properties(kyty_shim_shader_store_encode PROPERTIES TIMEOUT 20)
 endif()
 
 add_test_executable(kyty_shim_presentation_upscale_tests ${CMAKE_CURRENT_SOURCE_DIR}/PresentationUpscale.cpp)

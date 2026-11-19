@@ -67,6 +67,7 @@ struct EncodeFailure {
 };
 
 bool SaveResourcePlan(const ResourcePlan& plan, std::vector<uint8_t>& bytes, EncodeFailure& failure);
+bool DecodeResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 bool LoadResourcePlan(std::span<const uint8_t> bytes, ResourcePlan& plan);
 
 void SetComputeIndirectFloors(size_t keys, size_t images);
