@@ -175,7 +175,17 @@ void ImageInfo::UpdateSize() {
 		                                          IsVolume() ? extent.depth : 1u,
 		                                          resources.levels,
 		                                          resources.layers};
+#if defined(ANYPS5_KYTY)
+		if (!TileGetTiledTextureLayout(description, surface)) {
+			EXIT("Not implemented (!TileGetTiledTextureLayout(description, surface)): format %u, tile mode %u, %s %ux%ux%u, "
+			     "%u levels, %u layers, %u samples, pitch %u, size 0x%llx",
+			     static_cast<uint32_t>(guest_format), static_cast<uint32_t>(tile_mode), IsVolume() ? "3D" : "2D",
+			     extent.width, extent.height, extent.depth, resources.levels, resources.layers, samples, pitch,
+			     static_cast<unsigned long long>(data.size));
+		}
+#else
 		EXIT_NOT_IMPLEMENTED(!TileGetTiledTextureLayout(description, surface));
+#endif
 		tiling             = surface.texture;
 		first_tail_level   = surface.first_tail_level;
 		tiled_slice_stride = surface.block_slice_size;
