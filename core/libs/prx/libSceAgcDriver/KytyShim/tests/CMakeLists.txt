@@ -22,6 +22,12 @@ target_include_directories(kyty_shim_cache_topology_tests PRIVATE ${CMAKE_SOURCE
 add_test(NAME kyty_shim_cache_topology COMMAND kyty_shim_cache_topology_tests)
 set_tests_properties(kyty_shim_cache_topology PROPERTIES TIMEOUT 20)
 
+add_test_executable(kyty_shim_compare_write_back_tests ${CMAKE_CURRENT_SOURCE_DIR}/CompareWriteBack.cpp)
+configure_host_test_executable(kyty_shim_compare_write_back_tests)
+target_include_directories(kyty_shim_compare_write_back_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/kyty)
+add_test(NAME kyty_shim_compare_write_back COMMAND kyty_shim_compare_write_back_tests)
+set_tests_properties(kyty_shim_compare_write_back PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_compare_write_back: ok")
+
 add_test_executable(kyty_shim_shader_cache_policy_tests ${CMAKE_CURRENT_SOURCE_DIR}/ShaderCachePolicy.cpp)
 configure_host_test_executable(kyty_shim_shader_cache_policy_tests)
 target_include_directories(kyty_shim_shader_cache_policy_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)

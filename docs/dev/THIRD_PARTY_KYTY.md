@@ -253,6 +253,7 @@ The table draws are GPU-driven draws of a shader pair's table programs; the nati
 | `KYTY_URGENT_WRITEBACK_WAIT` | `0` turns it off, any other value or unset leaves it on | on | A guest thread that faults on a page whose texture write-back is still in the open command buffer sends the flush on the urgent queue and waits for that submission itself, instead of queueing the flush behind every operation the command processor has queued; `0` sends it through the ordinary command queue | perf | all | AnyKyty |
 | `KYTY_FIX_STENCIL_FILL_HELD_PLANE` | `0` turns it off, any other value or unset leaves it on | on | A buffer fill of a stencil plane becomes a clear of the depth image's stencil aspect only while that aspect holds the plane; a fill of another plane runs as the game's own fill, so it no longer wipes the plane the depth image holds; `0` clears the aspect for a fill of any registered plane | compat | all | AnyKyty |
 | `KYTY_TILE_VIA_VRAM` | `0` or `1`, empty counts as unset, else stops | on | Tiles a tiled image's readback in device-local memory, then copies it once to the host; `0` is KytyPS5's behaviour. See [below](#details) | perf | all | `08c666a175` |
+| `KYTY_COMPARE_WRITE_BACK` | `0` or `1`, empty counts as unset, else stops | on | An image readback writes guest memory only where the GPU result differs from the bytes read when the readback was recorded and the guest bytes still hold that read; `0` writes the image's whole footprint, KytyPS5's behaviour. See [below](#details) | compat | all | AnyKyty |
 | `KYTY_SYNC_RAW_IMAGE_BUFFERS` | `0` or `1`, else stops | `0` | Obtains a raw buffer that a shader reads the way a formatted (texel) buffer is obtained | compat | all | Kyty option |
 | `KYTY_SRT_WALKER_PROBE` | `0` or `1`, empty counts as unset, else stops | on | The shader resource table walk of the execution thread reads a page the GPU may own through the fault handler's around-GPU-writes read, without taking the fault; `0` takes the fault. See [below](#details) | perf | all | `8095894f76` |
 | `KYTY_COPY_FEEDBACK` | `0` is off | on | After a small GPU copy into guest memory, snapshots the destination so that a later guest read is served from the snapshot instead of a readback | perf | all | Kyty import |
@@ -378,6 +379,18 @@ the shader writes to the readback buffer as before. Stray with 8 GiB of the 16 G
 5.46 s → 0.57 s, readbacks over 100 ms 9 → 0; with a second Stray on the GPU: 6.74 s → 0.67 s; the same images
 (`notes/kyty-tile-via-vram.md`). `KYTY_TILE_VIA_VRAM=0` restores KytyPS5's behaviour; any value other than empty, `0` or
 `1` stops the emulator with a message naming the variable.
+
+Image readbacks write only the bytes the GPU produced: `TextureCache::DownloadImageMemory` reads the image's whole guest
+footprint when it records the readback, tiles the image into that copy, and KytyPS5 then writes the whole footprint back
+when the GPU is done. Every byte the game, or the write-back of another image, changed in between is put back to the old
+read: block padding, an unused tail block, mips and slices the GPU never wrote, memory reused for other data. The console
+writes only the texels a command produces (`notes/re-overwrite-audit.md`). Under `ANYPS5_KYTY` the readback keeps the bytes
+it read, and when the GPU is done it rereads guest memory and writes, in 64-byte steps, only the bytes where the GPU result
+differs from the first read and guest memory still holds that read; it skips the rest and reports
+`image write-back kept bytes the game wrote after the read` when it left a byte the game changed. Cost: one copy of the
+footprint when the readback is recorded and one read and compare when it lands, with reused host buffers. Both
+`KYTY_TILE_VIA_VRAM` paths go through it (`notes/tile-via-vram.md`, issues #30 and #108). `KYTY_COMPARE_WRITE_BACK=0`
+restores KytyPS5's behaviour; any value other than empty, `0` or `1` stops the emulator with a message naming the variable.
 
 Guest flips: KytyPS5 completes a flip (`VideoOutDriver::CompleteFlip`, which makes the request ready for presentation;
 the title's flip event follows) on its priority thread, once the GPU has finished the command buffer that holds the

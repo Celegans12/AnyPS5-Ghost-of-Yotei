@@ -12,6 +12,9 @@
 #include "graphics/guest_gpu/tile.h"
 #include "graphics/host_gpu/graphicContext.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
+#if defined(ANYPS5_KYTY)
+#include "graphics/host_gpu/renderer/cache/compareWriteBack.h"
+#endif
 #include "graphics/host_gpu/renderer/commandScheduler.h"
 #include "graphics/host_gpu/renderer/image/imageView.h"
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
@@ -3057,6 +3060,122 @@ bool BufferCache::SynchronizeBufferFromImage(Buffer& buffer, uint64_t vaddr, uin
 	return true;
 }
 
+#if defined(ANYPS5_KYTY)
+static bool CompareWriteBackEnabled() {
+	static const bool enabled = [] {
+		const char*            value = std::getenv("KYTY_COMPARE_WRITE_BACK");
+		const std::string_view text {value == nullptr ? "" : value};
+		if (!text.empty() && text != "0" && text != "1") {
+			EXIT("invalid KYTY_COMPARE_WRITE_BACK: %s (0 or 1)\n", value);
+		}
+		return text != "0";
+	}();
+	return enabled;
+}
+
+namespace {
+
+class PooledBytes {
+public:
+	PooledBytes() = default;
+	PooledBytes(std::unique_ptr<uint8_t[]> data, uint64_t capacity)
+	    : m_data(std::move(data)), m_capacity(capacity) {}
+	PooledBytes(PooledBytes&& other) noexcept = default;
+	PooledBytes& operator=(PooledBytes&& other) noexcept {
+		Return();
+		m_data     = std::move(other.m_data);
+		m_capacity = other.m_capacity;
+		return *this;
+	}
+	PooledBytes(const PooledBytes&)            = delete;
+	PooledBytes& operator=(const PooledBytes&) = delete;
+	~PooledBytes() { Return(); }
+
+	[[nodiscard]] uint8_t* Data() const noexcept { return m_data.get(); }
+	explicit operator bool() const noexcept { return m_data != nullptr; }
+
+	static PooledBytes Acquire(uint64_t size);
+
+private:
+	struct Free {
+		std::unique_ptr<uint8_t[]> data;
+		uint64_t                   capacity = 0;
+	};
+	struct Pool {
+		std::mutex        mutex;
+		std::vector<Free> free;
+		uint64_t          bytes = 0;
+	};
+	static constexpr uint64_t MaxPooledBytes = 256ull * 1024 * 1024;
+	static Pool&              Shared() {
+		static Pool pool;
+		return pool;
+	}
+	void Return() noexcept;
+
+	std::unique_ptr<uint8_t[]> m_data;
+	uint64_t                   m_capacity = 0;
+};
+
+PooledBytes PooledBytes::Acquire(uint64_t size) {
+	auto& pool = Shared();
+	{
+		std::scoped_lock lock {pool.mutex};
+		auto             best = pool.free.end();
+		for (auto it = pool.free.begin(); it != pool.free.end(); ++it) {
+			if (it->capacity >= size && (best == pool.free.end() || it->capacity < best->capacity)) {
+				best = it;
+			}
+		}
+		if (best != pool.free.end()) {
+			PooledBytes bytes {std::move(best->data), best->capacity};
+			pool.bytes -= best->capacity;
+			pool.free.erase(best);
+			return bytes;
+		}
+	}
+	return {std::make_unique_for_overwrite<uint8_t[]>(size), size};
+}
+
+void PooledBytes::Return() noexcept {
+	if (!m_data) {
+		return;
+	}
+	auto&            pool = Shared();
+	std::scoped_lock lock {pool.mutex};
+	pool.bytes += m_capacity;
+	pool.free.push_back({std::move(m_data), m_capacity});
+	while (pool.bytes > MaxPooledBytes) {
+		const auto smallest = std::ranges::min_element(pool.free, {}, &Free::capacity);
+		pool.bytes -= smallest->capacity;
+		pool.free.erase(smallest);
+	}
+}
+
+void WriteBackChanged(uint64_t address, const uint8_t* result, const uint8_t* snapshot,
+                      uint64_t size) {
+	const auto current = PooledBytes::Acquire(size);
+	if (!LibKernel::Memory::TryReadBacking(address, current.Data(), size)) {
+		return;
+	}
+	const auto counts = CompareWriteBack(
+	    address, result, snapshot, current.Data(), size,
+	    [](uint64_t at, const uint8_t* data, uint64_t bytes) {
+		    LibKernel::Memory::WriteBacking(at, data, bytes);
+	    });
+	if (counts.kept != 0) {
+		char detail[128];
+		std::snprintf(detail, sizeof(detail),
+		              "%" PRIu64 " bytes kept, %" PRIu64 " of %" PRIu64 " bytes written",
+		              counts.kept, counts.written, size);
+		Common::HackNotice::Report("image write-back kept bytes the game wrote after the read",
+		                           "TextureCache::DownloadImageMemory", 0, address, detail);
+	}
+}
+
+}
+#endif
+
 bool TextureCache::DownloadImageMemory(ImageId id) {
 	auto& image = m_slot_images[id];
 	if (image.depth_id) {
@@ -3071,6 +3190,13 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 	if (!LibKernel::Memory::TryReadBacking(range.address, download.mapped, range.size)) {
 		return false;
 	}
+#if defined(ANYPS5_KYTY)
+	PooledBytes snapshot;
+	if (CompareWriteBackEnabled()) {
+		snapshot = PooledBytes::Acquire(range.size);
+		std::memcpy(snapshot.Data(), download.mapped, range.size);
+	}
+#endif
 	download.buffer->Flush(download.offset, range.size);
 
 	DownloadImage(image, *download.buffer, download.offset, range.size,
@@ -3098,10 +3224,24 @@ bool TextureCache::DownloadImageMemory(ImageId id) {
 		m_page_manager.UpdatePageWatchers<true, true>(range.address, range.size);
 	}
 	m_scheduler.DeferPriorityOperation(
-	    [this, download = std::move(download), write_back, trapped = m_readback_storage_images] {
+	    [this, download = std::move(download), write_back, trapped = m_readback_storage_images
+#if defined(ANYPS5_KYTY)
+	     , snapshot = std::move(snapshot)
+#endif
+	] {
 		    download.buffer->Invalidate(download.offset, write_back.range.size);
+#if defined(ANYPS5_KYTY)
+		    if (snapshot) {
+			    WriteBackChanged(write_back.range.address, download.mapped, snapshot.Data(),
+			                     write_back.range.size);
+		    } else {
+			    LibKernel::Memory::WriteBacking(write_back.range.address, download.mapped,
+			                                    write_back.range.size);
+		    }
+#else
 		    LibKernel::Memory::WriteBacking(write_back.range.address, download.mapped,
 		                                    write_back.range.size);
+#endif
 		    if (trapped) {
 			    m_page_manager.UpdatePageWatchers<false, true>(write_back.range.address,
 			                                                   write_back.range.size);
