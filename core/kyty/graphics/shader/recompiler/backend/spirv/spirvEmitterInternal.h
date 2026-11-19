@@ -6,6 +6,7 @@
 #include "graphics/shader/recompiler/BufferFormat.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvBuilder.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvWaveSplit.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
 
@@ -17,6 +18,7 @@
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <optional>
 #include <spirv/unified1/GLSL.std.450.h>
 #include <string>
 #include <type_traits>
@@ -141,6 +143,8 @@ struct EmitterState {
 	uint32_t                                         tess_inner_variable = 0;
 
 	uint32_t                                         lane_count              = 1;
+	SplitHints*                                      split_hints             = nullptr;
+	std::optional<SplitHints::Update>                unordered_update;
 	uint32_t                                         lane_half               = 0;
 	std::array<BufferDefinition, 4>                  storage_buffers {};
 	std::vector<uint32_t>                           memory_byte_offsets;

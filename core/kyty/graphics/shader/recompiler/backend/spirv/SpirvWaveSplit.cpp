@@ -8,6 +8,7 @@
 #include <cstring>
 #include <string>
 #include <initializer_list>
+#include <optional>
 #include <span>
 #include <utility>
 #include <unordered_map>
@@ -114,7 +115,11 @@ bool IsRayQuery(uint32_t op) {
 
 class WaveSplit {
 public:
-	explicit WaveSplit(const std::vector<uint32_t>& words): m_in(words) {}
+	WaveSplit(const std::vector<uint32_t>& words, const SplitHints* hints): m_in(words) {
+		if (hints != nullptr) {
+			for (const auto& [pointer, update]: hints->unordered_updates) m_unordered[pointer] = update;
+		}
+	}
 
 	bool Run(std::vector<uint32_t>& out, std::string& refusal) {
 		if (!Parse(refusal) || !Check(refusal)) {
@@ -130,6 +135,7 @@ public:
 
 private:
 	const std::vector<uint32_t>& m_in;
+	std::unordered_map<uint32_t, SplitHints::Update> m_unordered;
 	std::vector<Inst>            m_insts;
 	std::vector<uint32_t>        m_def;
 	std::vector<Function>        m_functions;
@@ -796,6 +802,39 @@ private:
 		return true;
 	}
 
+	std::optional<std::vector<uint32_t>> ConstantWord(uint32_t pointer) const {
+		const auto& chain = m_insts[m_def[pointer]];
+		if (chain.op != spv::OpAccessChain && chain.op != spv::OpInBoundsAccessChain) return std::nullopt;
+		if (m_insts[m_def[Word(chain, 0)]].op != spv::OpVariable) return std::nullopt;
+		std::vector<uint32_t> word {Word(chain, 0)};
+		for (uint32_t k = 1; k < Operands(chain); k++) {
+			const auto value = Fold(Word(chain, k), 0);
+			if (!value) return std::nullopt;
+			word.push_back(*value);
+		}
+		return word;
+	}
+
+	std::optional<uint32_t> Fold(uint32_t id, uint32_t depth) const {
+		if (const auto found = m_const.find(id); found != m_const.end()) return found->second;
+		if (depth > 16 || id >= m_def.size() || m_def[id] == 0) return std::nullopt;
+		const auto& inst = m_insts[m_def[id]];
+		if (Operands(inst) != 2) return std::nullopt;
+		const auto a = Fold(Word(inst, 0), depth + 1), b = Fold(Word(inst, 1), depth + 1);
+		if (!a || !b) return std::nullopt;
+		switch (inst.op) {
+			case spv::OpIAdd: return *a + *b;
+			case spv::OpISub: return *a - *b;
+			case spv::OpIMul: return *a * *b;
+			case spv::OpBitwiseAnd: return *a & *b;
+			case spv::OpBitwiseOr: return *a | *b;
+			case spv::OpBitwiseXor: return *a ^ *b;
+			case spv::OpShiftRightLogical: return *b < 32u ? *a >> *b : 0u;
+			case spv::OpShiftLeftLogical: return *b < 32u ? *a << *b : 0u;
+			default: return std::nullopt;
+		}
+	}
+
 	bool PlaceSharedBarriers(std::string& refusal) {
 		if (m_shared_writes.empty()) return true;
 		std::vector<uint32_t> owner(m_blocks.size(), None);
@@ -810,6 +849,7 @@ private:
 				if (owner[inner] == None) owner[inner] = b;
 			}
 		}
+		std::unordered_set<uint32_t> checked;
 		for (const auto i: m_shared_writes) {
 			const auto b = m_block_of[i];
 			if (m_block_div[b] == 0) {
@@ -822,6 +862,9 @@ private:
 				return false;
 			}
 			const auto& header = m_blocks[owner[b]];
+			if (!checked.insert(owner[b]).second) continue;
+			std::vector<std::pair<uint32_t, SplitHints::Update>> updates;
+			bool                                                 plain_write = false;
 			for (const auto inner: Reach(header, header.merge)) {
 				for (uint32_t j = m_blocks[inner].begin; j <= m_blocks[inner].end; j++) {
 					const auto& other = m_insts[j];
@@ -830,12 +873,41 @@ private:
 						return false;
 					}
 					if (other.op != spv::OpLoad && other.op != spv::OpCopyMemory && other.op != spv::OpCopyMemorySized &&
-					    !IsAtomic(other.op)) {
+					    other.op != spv::OpStore && !IsAtomic(other.op)) {
 						continue;
 					}
-					const auto from = Root(other.op == spv::OpLoad || IsAtomic(other.op) ? Word(other, 0) : Word(other, 1));
-					if (m_var_class.contains(from) && m_var_class[from] == spv::StorageClassWorkgroup) {
+					const bool store = other.op == spv::OpStore;
+					const auto from  = Root(other.op == spv::OpLoad || store || IsAtomic(other.op) ? Word(other, 0) : Word(other, 1));
+					const bool shared = m_var_class.contains(from) && m_var_class[from] == spv::StorageClassWorkgroup;
+					const bool shared_target =
+					    other.op == spv::OpCopyMemory || other.op == spv::OpCopyMemorySized
+					        ? m_var_class.contains(Root(Word(other, 0))) && m_var_class[Root(Word(other, 0))] == spv::StorageClassWorkgroup
+					        : shared;
+					if (const auto update = IsAtomic(other.op) ? m_unordered.find(Word(other, 0)) : m_unordered.end();
+					    shared && update != m_unordered.end()) {
+						updates.emplace_back(Word(other, 0), update->second);
+						continue;
+					}
+					if (store || ((other.op == spv::OpCopyMemory || other.op == spv::OpCopyMemorySized) && shared_target)) {
+						plain_write = plain_write || shared_target;
+						if (store) continue;
+					}
+					if (shared) {
 						refusal = "workgroup memory read and written in one divergent region";
+						return false;
+					}
+				}
+			}
+			if (!updates.empty() && plain_write) {
+				refusal = "workgroup memory stored and updated by atomics in one divergent region";
+				return false;
+			}
+			for (size_t x = 0; x < updates.size(); x++) {
+				for (size_t y = x + 1; y < updates.size(); y++) {
+					if (updates[x].second == updates[y].second) continue;
+					const auto a = ConstantWord(updates[x].first), c = ConstantWord(updates[y].first);
+					if (!a || !c || a->front() != c->front() || *a == *c) {
+						refusal = "workgroup memory updated by different atomics in one divergent region";
 						return false;
 					}
 				}
@@ -1343,9 +1415,9 @@ private:
 
 }
 
-bool SplitWaveAcrossSubgroups(std::vector<uint32_t>& module, std::string& refusal) {
+bool SplitWaveAcrossSubgroups(std::vector<uint32_t>& module, std::string& refusal, const SplitHints* hints) {
 	std::vector<uint32_t> out;
-	WaveSplit             split(module);
+	WaveSplit             split(module, hints);
 	if (!split.Run(out, refusal)) {
 		return false;
 	}

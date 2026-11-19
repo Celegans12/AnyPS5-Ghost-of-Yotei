@@ -873,7 +873,11 @@ uint32_t EmitAtomicAccess(ValueEmitContext& ctx, const IR::Inst& inst,
 		const auto resource = PrepareMemoryResourceAccess(ctx.state, mem);
 		return EmitValueOrZeroIfCondition(
 		    ctx.state, EmitMemoryElementInBounds(ctx.state, resource, index), [&]() {
-			    return operation(EmitMemoryElementPointer(ctx.state, resource, index));
+			    const auto pointer = EmitMemoryElementPointer(ctx.state, resource, index);
+			    if (ctx.state.split_hints != nullptr && ctx.state.unordered_update && mem.kind == IR::ResourceKind::Lds) {
+				    ctx.state.split_hints->unordered_updates.emplace_back(pointer, *ctx.state.unordered_update);
+			    }
+			    return operation(pointer);
 		    });
 	});
 }
@@ -2270,9 +2274,36 @@ std::array<uint32_t, 3> EmitTriangleIndices(ValueEmitContext& ctx, const std::ar
 	return result;
 }
 
+struct UnorderedUpdateScope {
+	UnorderedUpdateScope(EmitterState& state_, std::optional<SplitHints::Update> update): state(state_) {
+		state.unordered_update = update;
+	}
+	~UnorderedUpdateScope() { state.unordered_update.reset(); }
+	UnorderedUpdateScope(const UnorderedUpdateScope&)            = delete;
+	UnorderedUpdateScope& operator=(const UnorderedUpdateScope&) = delete;
+	EmitterState& state;
+};
+
+static std::optional<SplitHints::Update> UnorderedSharedUpdate(const IR::Inst& inst) {
+	if (inst.HasUses()) return std::nullopt;
+	switch (inst.GetOpcode()) {
+		case IR::ValueOpcode::SharedAtomicUMin32: return SplitHints::Update::UMin;
+		case IR::ValueOpcode::SharedAtomicUMax32: return SplitHints::Update::UMax;
+		case IR::ValueOpcode::SharedAtomicSMin32: return SplitHints::Update::SMin;
+		case IR::ValueOpcode::SharedAtomicSMax32: return SplitHints::Update::SMax;
+		case IR::ValueOpcode::SharedAtomicIAdd32: return SplitHints::Update::Add;
+		case IR::ValueOpcode::SharedAtomicISub32: return SplitHints::Update::Sub;
+		case IR::ValueOpcode::SharedAtomicAnd32: return SplitHints::Update::And;
+		case IR::ValueOpcode::SharedAtomicOr32: return SplitHints::Update::Or;
+		case IR::ValueOpcode::SharedAtomicXor32: return SplitHints::Update::Xor;
+		default: return std::nullopt;
+	}
+}
+
 uint32_t EmitAtomic32(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem = ctx.Memory(inst);
 	if (mem.kind == IR::ResourceKind::IndirectBuffer) return AtomicIndirectBuffer(ctx, inst);
+	const UnorderedUpdateScope unordered(ctx.state, UnorderedSharedUpdate(inst));
 	return EmitAtomicAccess(ctx, inst, mem, [&](uint32_t pointer) {
 		const auto scope =
 		    mem.kind == IR::ResourceKind::Lds ? spv::ScopeWorkgroup : spv::ScopeDevice;
@@ -2363,6 +2394,9 @@ uint32_t EmitBufferFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 void EmitSharedFloatAtomic(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto& mem       = ctx.Memory(inst);
 	const bool  max_value = inst.GetOpcode() == IR::ValueOpcode::SharedAtomicFMax32;
+	const UnorderedUpdateScope unordered(
+	    ctx.state, inst.HasUses() ? std::nullopt
+	                              : std::optional {max_value ? SplitHints::Update::FMax : SplitHints::Update::FMin});
 	EmitAtomicUpdate(ctx, inst, mem,
 	                 [max_value](EmitterState& state, uint32_t old, uint32_t value) {
 		                 return EmitDsFloatAtomicReplacement(state, old, value, max_value);

@@ -837,10 +837,11 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 		wide.host_subgroup_size = 64u;
 		auto wide_input         = options.input_info;
 		wide_input.compute      = &wide;
+		Spirv::SplitHints hints;
 		spirv = Spirv::EmitProgram(ir, wide_input, push_data_start_dword, *options.profile, options.emit_debug_info,
-		                           true, options.ray_stats);
+		                           true, options.ray_stats, &hints);
 		std::string refusal;
-		if (!Spirv::SplitWaveAcrossSubgroups(spirv, refusal)) {
+		if (!Spirv::SplitWaveAcrossSubgroups(spirv, refusal, &hints)) {
 			LOGF("ShaderRecompiler %s wave64 kept in lane pairs: hash=0x%016" PRIx64 " reason=%s\n", stage,
 			     ir.shader_hash, refusal.c_str());
 			spirv.clear();

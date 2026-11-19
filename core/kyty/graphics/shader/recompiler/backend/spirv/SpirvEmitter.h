@@ -24,12 +24,15 @@ struct Profile {
 
 inline constexpr Profile DefaultProfile {};
 
+struct SplitHints;
+
 std::vector<uint32_t> EmitProgram(IR::Program& program, ShaderStageInputInfo input_info,
                                   uint32_t       push_data_start_dword = 0,
                                   const Profile& profile               = DefaultProfile,
                                   bool           emit_debug_info       = false,
                                   bool           mip_stats_records     = true,
-                                  bool           ray_stats             = false);
+                                  bool           ray_stats             = false,
+                                  SplitHints*    split_hints           = nullptr);
 
 [[nodiscard]] bool UsesMipStats(const IR::Program& program);
 }
