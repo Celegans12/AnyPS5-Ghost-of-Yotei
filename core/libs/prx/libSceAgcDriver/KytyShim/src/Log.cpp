@@ -1,5 +1,8 @@
 #include "common/logging/log.h"
 
+#ifdef ANYPS5_KYTY_RT_PROBE
+#include "../tools/RtSurvey.hpp"
+#endif
 #include "common/assert.h"
 #include "common/emulatorConfig.h"
 #include "kytyGitVersion.h"
@@ -15,6 +18,31 @@
 #include <string>
 #include <string_view>
 #include <system_error>
+
+#ifdef ANYPS5_KYTY_RT_PROBE
+namespace AgcDriver {
+
+thread_local const SurveyLogScope* SurveyLogScope::current_ = nullptr;
+
+SurveyLogScope::SurveyLogScope(Observer observer, void* context) noexcept
+    : previous_(current_), observer_(observer), context_(context) {
+    current_ = this;
+}
+
+SurveyLogScope::~SurveyLogScope() {
+    current_ = previous_;
+}
+
+bool SurveyLogScope::Active() noexcept {
+    return current_ != nullptr;
+}
+
+void SurveyLogScope::Observe(std::string_view text) noexcept {
+    if (current_ != nullptr) current_->observer_(current_->context_, text);
+}
+
+} // namespace AgcDriver
+#endif
 
 namespace Log {
 namespace {
@@ -96,10 +124,16 @@ void Flush() {
 }
 
 bool IsSilent() {
+#ifdef ANYPS5_KYTY_RT_PROBE
+    if (AgcDriver::SurveyLogScope::Active()) return false;
+#endif
     return g_initialized.load(std::memory_order_acquire) && g_sink.load(std::memory_order_relaxed) == Sink::Silent;
 }
 
 void Write(fmt::text_style style, std::string_view text) {
+#ifdef ANYPS5_KYTY_RT_PROBE
+    AgcDriver::SurveyLogScope::Observe(text);
+#endif
     static_cast<void>(style);
     if (!g_initialized.load(std::memory_order_acquire)) {
         WriteStandard(text);

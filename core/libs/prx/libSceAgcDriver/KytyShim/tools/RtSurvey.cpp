@@ -65,6 +65,26 @@ struct Key {
     auto operator<=>(const Key&) const = default;
 };
 
+enum class Diagnostic { MissingTlasSource, NoFormOrHostQuery, LocalFlatScratch, Count };
+
+constexpr std::array DiagnosticCodes{"missing_tlas_source", "no_form_or_host_query", "local_flat_scratch"};
+using DiagnosticCounts = std::array<std::uint32_t, static_cast<std::size_t>(Diagnostic::Count)>;
+static_assert(DiagnosticCodes.size() == std::tuple_size_v<DiagnosticCounts>);
+
+void ObserveDiagnostic(void* context, std::string_view text) noexcept {
+    auto& counts = *static_cast<DiagnosticCounts*>(context);
+    if (text.starts_with("shader resource tracking: ") &&
+        text.find(" local FLAT access requires DWORD data and per-thread scratch storage") != std::string_view::npos) {
+        ++counts[static_cast<std::size_t>(Diagnostic::LocalFlatScratch)];
+    } else if (text.starts_with("CS universal ray tracing: ") || text.starts_with("PS universal ray tracing: ")) {
+        if (text.find(" derives no source: ") != std::string_view::npos) {
+            ++counts[static_cast<std::size_t>(Diagnostic::MissingTlasSource)];
+        } else if (text.find(" intersections empty: no form and no host query serves ") != std::string_view::npos) {
+            ++counts[static_cast<std::size_t>(Diagnostic::NoFormOrHostQuery)];
+        }
+    }
+}
+
 struct Row {
     Key key;
     std::uint32_t modules = 0;
@@ -79,6 +99,7 @@ struct Row {
     std::uint32_t empty = 0;
     std::uint32_t emulated = 0;
     int spirv = -1;
+    DiagnosticCounts diagnostics{};
 };
 
 struct Decoded {
@@ -268,6 +289,8 @@ std::optional<Decoded> DecodeOnly(Prepared& prepared, const std::vector<std::uin
 
 void Probe(Prepared& prepared, const std::vector<std::uint32_t>& code, bool defaultSpecialization,
            const SurveySettings& settings, Row& row) {
+    row.diagnostics = {};
+    SurveyLogScope observe(ObserveDiagnostic, &row.diagnostics);
     const char* phase = "prepare";
     try {
         Common::SoftExitScope soft;
@@ -306,6 +329,7 @@ void Probe(Prepared& prepared, const std::vector<std::uint32_t>& code, bool defa
     } catch (const std::exception& error) {
         row.status = "stop";
         row.phase = phase;
+        ObserveDiagnostic(&row.diagnostics, error.what());
         row.stop = Scrub(error.what());
     } catch (...) {
         row.status = "stop";
@@ -326,6 +350,12 @@ void Print(const Row& row) {
                 row.fromManifest ? "manifest" : "code", row.status.c_str());
     std::printf(" bvh=%u native=%u oracle=%u lane=%u empty=%u emulated=%u spirv=%s", row.bvh, row.native, row.oracle, row.lane,
                 row.empty, row.emulated, row.spirv < 0 ? "none" : row.spirv == 0 ? "invalid" : "valid");
+    const char* separator = " diagnostics=";
+    for (std::size_t index = 0; index < DiagnosticCodes.size(); ++index) {
+        if (row.diagnostics[index] == 0) continue;
+        std::printf("%s%s:%u", separator, DiagnosticCodes[index], row.diagnostics[index]);
+        separator = ",";
+    }
     if (!row.phase.empty()) std::printf(" phase=%s", row.phase.c_str());
     if (!row.stop.empty()) std::printf(" stop=%s", row.stop.c_str());
     std::printf("\n");

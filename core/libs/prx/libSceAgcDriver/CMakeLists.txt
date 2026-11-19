@@ -112,6 +112,7 @@ if(ANYPS5_GPU_BACKEND STREQUAL "kyty")
         target_link_libraries(kyty_rt_probe PRIVATE libc)
     endif()
     set_target_properties(kyty_rt_probe PROPERTIES CXX_EXTENSIONS OFF)
+    target_compile_definitions(kyty_rt_probe PRIVATE ANYPS5_KYTY_RT_PROBE)
     if(BUILD_TESTING)
         add_test_executable(kyty_shim_entry_tests
                 KytyShim/src/EntryTests.cpp

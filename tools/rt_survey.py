@@ -16,6 +16,11 @@ PROBE_NAME = "kyty_rt_probe.exe" if os.name == "nt" else "kyty_rt_probe"
 IPV4 = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 HEX_RUN = re.compile(r"[0-9A-Fa-f]{5,}")
 CLASSES = ("native", "oracle", "lane", "empty", "emulated")
+DIAGNOSTICS = {
+    "missing_tlas_source": "TLAS source could not be derived",
+    "no_form_or_host_query": "No recognized walk or host query served the intersections",
+    "local_flat_scratch": "Local FLAT access requires DWORD data and per-thread scratch storage",
+}
 COLUMNS = (
     ("program", 16, "<"),
     ("stage", 5, "<"),
@@ -336,6 +341,17 @@ def number(fields, key):
         return 0
 
 
+def diagnostic_counts(value):
+    counts = {}
+    for entry in value.split(","):
+        code, _, count = entry.partition(":")
+        if code in DIAGNOSTICS and 0 < len(count) <= 10 and count.isascii() and count.isdecimal():
+            count = int(count)
+            if 0 < count <= 0xFFFFFFFF:
+                counts[code] = count
+    return counts
+
+
 def parse_probe(text):
     header = {}
     rows = []
@@ -364,6 +380,7 @@ def parse_probe(text):
                 "status": fields.get("status", "unknown"),
                 "intersections": number(fields, "bvh"),
                 "spirv": {"valid": True, "invalid": False}.get(fields.get("spirv")),
+                "diagnostics": diagnostic_counts(fields.get("diagnostics", "")),
             }
             for name in CLASSES:
                 row[name] = number(fields, name)
@@ -515,6 +532,13 @@ def render_text(document, limit=60):
                     ]
                 )
             )
+            diagnostics = row["diagnostics"]
+            if diagnostics:
+                lines.append("  Probe diagnostics: " + ", ".join(
+                    f"{DIAGNOSTICS[code]} ({count})" for code, count in diagnostics.items()
+                ))
+            elif row["empty"]:
+                lines.append("  No probe diagnostics captured for this program.")
         if len(rows) > limit:
             lines.append(f"... {len(rows) - limit} more programs in the JSON file")
     else:

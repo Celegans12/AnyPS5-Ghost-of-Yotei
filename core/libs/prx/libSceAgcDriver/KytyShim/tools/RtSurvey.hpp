@@ -3,8 +3,28 @@
 
 #include <cstdint>
 #include <string>
+#include <string_view>
 
 namespace AgcDriver {
+
+class SurveyLogScope {
+public:
+    using Observer = void (*)(void*, std::string_view) noexcept;
+
+    SurveyLogScope(Observer observer, void* context) noexcept;
+    ~SurveyLogScope();
+    SurveyLogScope(const SurveyLogScope&) = delete;
+    SurveyLogScope& operator=(const SurveyLogScope&) = delete;
+
+    static bool Active() noexcept;
+    static void Observe(std::string_view text) noexcept;
+
+private:
+    static thread_local const SurveyLogScope* current_;
+    const SurveyLogScope* previous_;
+    Observer observer_;
+    void* context_;
+};
 
 struct SurveySettings {
     std::string cache;

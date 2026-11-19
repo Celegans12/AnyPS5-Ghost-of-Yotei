@@ -108,6 +108,12 @@ class ParseTests(unittest.TestCase):
         _, _, _, notes = rt_survey.parse_probe("note one\nnote two\n")
         self.assertEqual(notes, ["one", "two"])
 
+    def test_only_allowlisted_positive_diagnostic_counts_are_reported(self):
+        diagnostic = " diagnostics=missing_tlas_source:2,unknown:/home/someone,local_flat_scratch:1,no_form_or_host_query:4294967296"
+        _, rows, _, _ = rt_survey.parse_probe("\n".join([ROWS[1] + diagnostic, ROWS[0]]))
+        self.assertEqual(rows[0]["diagnostics"], {"missing_tlas_source": 2, "local_flat_scratch": 1})
+        self.assertEqual(rows[1]["diagnostics"], {})
+
     def test_text_lists_the_unserved_first(self):
         _, rows, _, _ = rt_survey.parse_probe("\n".join(ROWS))
         document = {
@@ -126,6 +132,7 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(table[0][:16], "1111111111111111")
         self.assertIn("INVALID", table[0])
         self.assertIn("guessed inputs", text)
+        self.assertIn("No probe diagnostics captured for this program.", text)
 
 
 class SurveyTests(unittest.TestCase):
@@ -178,6 +185,22 @@ class SurveyTests(unittest.TestCase):
         self.assertIn("PPSA00001", text)
         self.assertIn("NVIDIA GeForce RTX 4080 SUPER", text)
         self.assertIn("rt-survey-PPSA00001-01.000.000.json", stdout)
+
+    def test_keeps_diagnostics_with_the_reported_wave_and_input_source(self):
+        recorded = ROWS[1] + " diagnostics=missing_tlas_source:2,no_form_or_host_query:1"
+        guessed = ROWS[1].replace("wave=32", "wave=64").replace("source=manifest", "source=code")
+        guessed += " diagnostics=local_flat_scratch:1,unrecognized:/home/private/raw_shader"
+        self.probe = make_probe(self.root, [recorded, guessed])
+        code, output, error = self.run_main("--report", str(self.report))
+        self.assertEqual(code, 0, error)
+        document = json.loads((self.out / "rt-survey-PPSA00001-01.000.000.json").read_text(encoding="utf-8"))
+        self.assertEqual([(row["source"], row["wave"], row["diagnostics"]) for row in document["programs"]], [
+            ("manifest", 32, {"missing_tlas_source": 2, "no_form_or_host_query": 1}),
+            ("code", 64, {"local_flat_scratch": 1}),
+        ])
+        self.assertIn("TLAS source could not be derived (2)", output)
+        self.assertIn("Local FLAT access requires DWORD data and per-thread scratch storage (1)", output)
+        self.assertNotIn("raw_shader", json.dumps(document) + output)
 
     def test_nothing_of_this_machine_is_written(self):
         self.run_main("--report", str(self.report))
