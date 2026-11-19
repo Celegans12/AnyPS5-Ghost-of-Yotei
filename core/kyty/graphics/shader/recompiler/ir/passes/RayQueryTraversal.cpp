@@ -36,7 +36,8 @@ std::array<uint32_t, 4> RayTracingLayout::Pack() const {
 		           ((inline_offset >> 2u) & 1u) << 28u;
 	}
 	words[3] |= (blas_dword >> 4u & 3u) << 20u | (root_dword >> 4u & 3u) << 22u | (mask ? mask_dword >> 4u & 3u : 0u) << 24u |
-	            (flags ? flags_dword >> 4u & 3u : 0u) << 26u | (node_count_80 ? 1u : 0u) << 29u;
+	            (flags ? flags_dword >> 4u & 3u : 0u) << 26u | (node_count_80 ? 1u : 0u) << 29u |
+	            (blas_node_count_80.value_or(node_count_80) ? 1u : 0u) << 31u;
 	return words;
 }
 

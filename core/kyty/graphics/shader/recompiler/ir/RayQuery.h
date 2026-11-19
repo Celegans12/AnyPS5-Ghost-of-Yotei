@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 
 namespace Libs::Graphics::ShaderRecompiler::IR {
 
@@ -61,6 +62,7 @@ struct RayTracingLayout {
 	uint32_t                inline_offset   = 0;
 	uint32_t                inline_root     = 0;
 	bool                    node_count_80   = false;
+	std::optional<bool>     blas_node_count_80;
 
 	bool operator==(const RayTracingLayout&) const = default;
 	[[nodiscard]] std::array<uint32_t, 4> Pack() const;

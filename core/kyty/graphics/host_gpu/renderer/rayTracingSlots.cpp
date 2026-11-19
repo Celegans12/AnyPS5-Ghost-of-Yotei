@@ -177,6 +177,8 @@ struct BlasPush {
 
 constexpr uint32_t IncompleteWalksAtMost = 64;
 constexpr uint32_t BlasNodeCountAt80 = 1;
+constexpr uint32_t TlasNodeCountBit  = 29;
+constexpr uint32_t BlasNodeCountBit  = 31;
 constexpr uint32_t BlasPsrHeader     = 2;
 
 constexpr uint64_t AlphaRecordsOffset(uint32_t capacity0, uint32_t capacity1) {
@@ -553,12 +555,12 @@ RayTracing::GuestTlas RayTracing::ReadGuestTlas(
 		std::memcpy(&value, reinterpret_cast<const void*>(address), sizeof(value));
 	};
 	const auto& layout = source.layout;
-	const auto node_limit_at = [&](uint64_t bvh) {
+	const auto node_limit_at = [&](uint64_t bvh, uint32_t bit) {
 		uint32_t count = 0;
-		load(bvh + (((layout[3] >> 29u) & 1u) != 0 ? 80 : 88), count);
-		return ((layout[3] >> 29u) & 1u) != 0 ? count - 1u : count;
+		load(bvh + (((layout[3] >> bit) & 1u) != 0 ? 80 : 88), count);
+		return ((layout[3] >> bit) & 1u) != 0 ? count - 1u : count;
 	};
-	const uint32_t node_limit = node_limit_at(header);
+	const uint32_t node_limit = node_limit_at(header, TlasNodeCountBit);
 	uint64_t       instance_offset = 0;
 	load(header + ((layout[1] >> 16u) & 15u) * 8u, instance_offset);
 	if (node_limit >= QueueCapacity || instance_offset >= MaxExtent) {
@@ -632,7 +634,7 @@ RayTracing::GuestTlas RayTracing::ReadGuestTlas(
 		if (blas > UINT64_MAX - MaxExtent || !readable(blas, HeaderSize)) {
 			continue;
 		}
-		const auto limit = node_limit_at(blas);
+		const auto limit = node_limit_at(blas, BlasNodeCountBit);
 		if (limit >= MaxExtent / 64) {
 			continue;
 		}
@@ -1684,7 +1686,8 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	command.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, m_blas_layout, 0, WalkBindings,
 	                             writes.data());
 
-	m_blas_flags = (((source.layout[3] >> 29u) & 1u) != 0 ? BlasNodeCountAt80 : 0u) | (psr ? BlasPsrHeader : 0u);
+	m_blas_flags = (((source.layout[3] >> BlasNodeCountBit) & 1u) != 0 ? BlasNodeCountAt80 : 0u) |
+	               (psr ? BlasPsrHeader : 0u);
 	const bool gathered = RecordBuilds(command);
 	m_walks_announced = false;
 

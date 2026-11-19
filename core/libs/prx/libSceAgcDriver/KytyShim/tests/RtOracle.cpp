@@ -101,11 +101,31 @@ void Modes() {
     Expect(!Lane(Mark(Node::Children, Child::Store)), "a child stored to memory keeps the wave mode");
 }
 
+void NodeCountFacts() {
+    constexpr uint32_t Tlas = 1u << 29u;
+    constexpr uint32_t Blas = 1u << 31u;
+    IR::RayTracingLayout layout;
+    Expect((layout.Pack()[3] & (Tlas | Blas)) == 0, "both node counts at 88 by default");
+    layout.node_count_80 = true;
+    Expect((layout.Pack()[3] & (Tlas | Blas)) == (Tlas | Blas), "an unset BLAS fact follows the TLAS one");
+    layout.blas_node_count_80 = false;
+    Expect((layout.Pack()[3] & (Tlas | Blas)) == Tlas, "TLAS count at 80, BLAS count at 88");
+    layout.node_count_80      = false;
+    layout.blas_node_count_80 = true;
+    Expect((layout.Pack()[3] & (Tlas | Blas)) == Blas, "TLAS count at 88, BLAS count at 80");
+    auto shaped = layout;
+    shaped.blas_node_count_80.reset();
+    Expect(shaped.Pack()[0] == layout.Pack()[0] && shaped.Pack()[1] == layout.Pack()[1] &&
+               shaped.Pack()[2] == layout.Pack()[2] && ((shaped.Pack()[3] ^ layout.Pack()[3]) & ~Blas) == 0,
+           "the BLAS fact changes bit 31 only");
+}
+
 }
 
 int main() {
     Marking();
     Modes();
+    NodeCountFacts();
     if (failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
