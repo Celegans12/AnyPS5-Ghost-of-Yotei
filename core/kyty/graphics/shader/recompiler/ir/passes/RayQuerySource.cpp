@@ -7,6 +7,7 @@
 #include <bit>
 #include <compare>
 #include <map>
+#include <memory>
 #include <optional>
 #include <tuple>
 #include <unordered_map>
@@ -436,13 +437,29 @@ public:
 			result.push_back(m_store.Add(lift.form, m_store.Constant(64, static_cast<uint64_t>(high) << 32u)));
 		}
 		if (result.empty()) {
+			Choices loose;
 			for (const auto low: Word(lo)) {
-				for (const auto top: Word(hi)) result.push_back(m_store.Join(low, top));
+				for (const auto top: Word(hi)) (Adjacent(low, top) ? result : loose).push_back(m_store.Join(low, top));
 			}
+			Append(result, loose);
 		}
 		Cap(result);
 		return result;
 	}
+
+	bool Adjacent(uint32_t low, uint32_t high) {
+		const auto la = m_store.AtomOf(low);
+		if (!la || m_store.A(*la).kind != Kind::Load || m_store.A(*la).args[1] != 4) return false;
+		const auto next = m_store.Add(static_cast<uint32_t>(m_store.A(*la).args[0]), m_store.Constant(64, 4));
+		auto       word = high;
+		if (const auto* cut = m_store.OpOf(high, static_cast<uint64_t>(ValueOpcode::BitwiseAnd32));
+		    cut != nullptr && cut->args.size() == 3 && (cut->args[2] & Literal) != 0 && (cut->args[1] & Literal) == 0) {
+			word = static_cast<uint32_t>(cut->args[1]);
+		}
+		const auto ha = m_store.AtomOf(word);
+		return ha && m_store.A(*ha).kind == Kind::Load && m_store.A(*ha).args[1] == 4 && m_store.A(*ha).args[0] == next;
+	}
+
 
 	Choices Expanded(Value value) {
 		value            = Strip(value);
@@ -453,11 +470,13 @@ public:
 			const auto* h = Strip(inst->Arg(1)).TryInstruction();
 			if (l != nullptr && h != nullptr && m_order.Carried(*l) && m_order.Carried(*h) && l->Parent() == h->Parent()) {
 				for (size_t index = 0; index < l->NumArgs(); ++index) {
-					Append(result, Pair(l->Arg(index), Incoming(*h, l->PhiBlock(index))));
+					if (auto* edge = Along(*l, index)) Append(result, edge->Pair(l->Arg(index), Incoming(*h, l->PhiBlock(index))));
 				}
 			}
 		} else if (inst != nullptr && m_order.Carried(*inst) && TypeOf(inst->GetOpcode()) != Type::U32) {
-			for (size_t index = 0; index < inst->NumArgs(); ++index) Append(result, Wide(inst->Arg(index)));
+			for (size_t index = 0; index < inst->NumArgs(); ++index) {
+				if (auto* edge = Along(*inst, index)) Append(result, edge->Wide(inst->Arg(index)));
+			}
 		}
 		Append(result, Wide(value));
 		return result;
@@ -469,14 +488,16 @@ public:
 		const auto a = m_store.A(*atom);
 		if (a.kind == Kind::Opaque && a.width == 64 && a.args.empty() && a.inst != nullptr && m_order.Carried(*a.inst)) {
 			Choices result;
-			for (size_t index = 0; index < a.inst->NumArgs(); ++index) Append(result, Wide(a.inst->Arg(index)));
+			for (size_t index = 0; index < a.inst->NumArgs(); ++index) {
+				if (auto* edge = Along(*a.inst, index)) Append(result, edge->Wide(a.inst->Arg(index)));
+			}
 			return result;
 		}
 		if (a.kind != Kind::Opaque || a.width != 64 || a.args.size() != 1 || a.inst == nullptr) return {form};
 		const auto* high = reinterpret_cast<const Inst*>(static_cast<uintptr_t>(a.args[0]));
 		Choices     result;
 		for (size_t index = 0; index < a.inst->NumArgs(); ++index) {
-			Append(result, Pair(a.inst->Arg(index), Incoming(*high, a.inst->PhiBlock(index))));
+			if (auto* edge = Along(*a.inst, index)) Append(result, edge->Pair(a.inst->Arg(index), Incoming(*high, a.inst->PhiBlock(index))));
 		}
 		return result;
 	}
@@ -501,13 +522,14 @@ public:
 		const auto& memory = m_program.memory_info[load.Flags<MemoryFlags>().index];
 		auto        offset = static_cast<uint64_t>(static_cast<int64_t>(static_cast<int32_t>(memory.offset)));
 		Choices     bases;
+		auto&       ev = load.NumArgs() > 3 ? Given(load.Arg(3)) : *this;
 		if (memory.address_is_full) {
-			bases = Pair(load.Arg(1), load.Arg(2));
+			bases = ev.Pair(load.Arg(1), load.Arg(2));
 		} else {
 			const auto* handle = ProducerOf(load.Arg(0), ValueOpcode::GetAddressResource);
 			if (handle == nullptr) return {};
-			for (const auto base: Pair(handle->Arg(0), handle->Arg(1))) {
-				for (const auto index: Word(load.Arg(1))) bases.push_back(m_store.Add(base, m_store.Widen(index)));
+			for (const auto base: ev.Pair(handle->Arg(0), handle->Arg(1))) {
+				for (const auto index: ev.Word(load.Arg(1))) bases.push_back(m_store.Add(base, m_store.Widen(index)));
 			}
 		}
 		Choices result;
@@ -597,6 +619,44 @@ private:
 		std::vector<const Inst*> adds;
 		std::vector<const Inst*> products;
 	};
+
+	Evaluator& Given(Value fact) {
+		fact = fact.Resolve();
+		const auto* inst = fact.TryInstruction();
+		if (inst == nullptr || fact.GetType() != Type::U1 || std::ranges::find(m_facts, fact) != m_facts.end()) return *this;
+		auto& child = m_given[inst];
+		if (!child) {
+			child          = std::make_unique<Evaluator>(m_program, m_order, m_store, Value {});
+			child->m_facts = m_facts;
+			child->AddFact(fact);
+		}
+		return *child;
+	}
+
+	Evaluator* Along(const Inst& phi, size_t index) {
+		const auto* header = phi.Parent();
+		const auto* from   = phi.PhiBlock(index);
+		std::vector<Value> extra;
+		for (const auto fact: m_facts) {
+			const auto* inst = fact.TryInstruction();
+			if (inst == nullptr || inst->GetOpcode() != ValueOpcode::Phi || inst->Parent() != header) continue;
+			const auto incoming = Incoming(*inst, from).Resolve();
+			if (incoming.IsEmpty()) continue;
+			if (incoming.IsImmediate()) {
+				if (incoming.GetType() == Type::U1 && !incoming.U1()) return nullptr;
+				continue;
+			}
+			if (std::ranges::find(m_facts, incoming) == m_facts.end()) extra.push_back(incoming);
+		}
+		if (extra.empty()) return this;
+		auto& child = m_edges[{header, from}];
+		if (!child) {
+			child          = std::make_unique<Evaluator>(m_program, m_order, m_store, Value {});
+			child->m_facts = m_facts;
+			for (const auto fact: extra) child->AddFact(fact);
+		}
+		return child.get();
+	}
 
 	void AddFact(Value value) {
 		value = value.Resolve();
@@ -969,6 +1029,8 @@ private:
 	std::unordered_map<const Inst*, Choices>        m_words;
 	std::unordered_map<const Inst*, Choices>        m_wides;
 	std::unordered_map<const Inst*, std::vector<FForm>> m_floats;
+	std::unordered_map<const Inst*, std::unique_ptr<Evaluator>> m_given;
+	std::map<std::pair<const Block*, const Block*>, std::unique_ptr<Evaluator>> m_edges;
 };
 
 struct Source {
