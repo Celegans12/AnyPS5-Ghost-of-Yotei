@@ -146,6 +146,14 @@ void RenderContext::CollectHotPageWrites(uint64_t vaddr, uint64_t size) {
 	    this, vaddr, size);
 }
 
+static bool UrgentWriteBackWait() {
+	static const bool on = [] {
+		const char* value = std::getenv("KYTY_URGENT_WRITEBACK_WAIT");
+		return value == nullptr || value[0] != '0';
+	}();
+	return on;
+}
+
 bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {
 	const auto tick = m_texture_cache.WriteBackTick(vaddr, size);
 	if (tick == 0) {
@@ -154,7 +162,18 @@ bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {
 	if (GuestGpu::IsGpuThread()) {
 		m_command_scheduler.Wait(tick);
 	} else if (tick == m_command_scheduler.CurrentTick()) {
-		GetGpu().SendCommandSync([this, tick] { m_command_scheduler.Wait(tick); });
+		if (UrgentWriteBackWait() && !GuestGpu::IsCommandProcessorThread()) {
+			GetGpu().SendUrgentCommandSync(
+			    [this, tick] {
+				    if (tick == m_command_scheduler.CurrentTick()) {
+					    m_command_scheduler.Flush();
+				    }
+			    },
+			    false);
+			m_command_scheduler.GetMasterSemaphore().Wait(tick);
+		} else {
+			GetGpu().SendCommandSync([this, tick] { m_command_scheduler.Wait(tick); });
+		}
 	}
 	m_command_scheduler.WaitPriorityOperations(tick);
 	return true;
