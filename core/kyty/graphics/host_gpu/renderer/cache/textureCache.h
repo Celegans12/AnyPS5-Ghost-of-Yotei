@@ -206,6 +206,7 @@ private:
 		int32_t layer = -1;
 		bool rejected = false;
 		ImageId depth_source;
+		bool    bound_depth = false;
 	};
 
 	struct WriteBack {
