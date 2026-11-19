@@ -73,6 +73,8 @@ struct ReadbackStats {
 	std::atomic<uint64_t> other_gpu_bytes {0};
 	std::atomic<uint64_t> other_false_sharing {0};
 	std::atomic<uint64_t> cp_staged {0};
+	std::atomic<uint64_t> other_replayed {0};
+	std::atomic<bool>     line_overflow {false};
 	std::atomic<int64_t>  last_line {0};
 };
 
@@ -440,7 +442,7 @@ void BufferCache::DiscardGpuWrites(uint64_t vaddr, uint64_t size) {
 		NoteGpuModifiedChange(first, last - first, false);
 	}
 	ForgetColorMetadataChecks(first, last - first);
-	m_memory_tracker.UnmarkRegionAsGpuModified(first, last - first);
+	UnmarkGpuModified(first, last - first);
 	m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 }
 
@@ -496,7 +498,7 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool 
 		}
 		if (DownloadBufferMemory<false>(buffer, vaddr, read_size) ||
 		    !m_gpu_modified_ranges.Intersects(pages_begin, pages_end - pages_begin)) {
-			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, read_size);
+			UnmarkGpuModified(vaddr, read_size);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -512,6 +514,10 @@ void BufferCache::ReadMemoryAsync(uint64_t vaddr, uint64_t size, bool is_write, 
 	const auto elapsed = static_cast<uint64_t>(SteadyNs() - started);
 	(command_processor ? stats.cp_reads : stats.other_reads).fetch_add(1, std::memory_order_relaxed);
 	(command_processor ? stats.cp_ns : stats.other_ns).fetch_add(elapsed, std::memory_order_relaxed);
+}
+
+void BufferCache::NoteReplayedRead() {
+	g_readback_stats.other_replayed.fetch_add(1, std::memory_order_relaxed);
 }
 
 void BufferCache::NoteStagedCommandProcessorRead() {
@@ -539,7 +545,8 @@ void BufferCache::LogReadbackSummary() {
 	const auto gpu_bytes   = stats.other_gpu_bytes.exchange(0, std::memory_order_relaxed);
 	const auto false_share = stats.other_false_sharing.exchange(0, std::memory_order_relaxed);
 	const auto staged      = stats.cp_staged.exchange(0, std::memory_order_relaxed);
-	if (cp_reads + other_reads + staged == 0) {
+	const auto replayed    = stats.other_replayed.exchange(0, std::memory_order_relaxed);
+	if (cp_reads + other_reads + staged + replayed == 0) {
 		return;
 	}
 	const auto seconds = [](uint64_t ns) { return static_cast<double>(ns) / 1e9; };
@@ -547,9 +554,10 @@ void BufferCache::LogReadbackSummary() {
 	    "[kyty-readback] summary of the last {:.0f} s: command processor {} readbacks in {:.3f} s ({} after the "
 	    "operations it is ordered after only, {:.3f} s waiting for them, {} operations not waited for), {} register "
 	    "tables read without a fault; other threads {} readbacks in {:.3f} s ({} of faulted reads on bytes the GPU "
-	    "wrote, {} on other bytes of a GPU written page)\n",
+	    "wrote, {} on other bytes of a GPU written page, {} on other bytes replayed on the backing view without a readback){}\n",
 	    seconds(static_cast<uint64_t>(now - last)), cp_reads, seconds(cp_ns), ordered, seconds(ordered_ns), not_waited,
-	    staged, other_reads, seconds(other_ns), gpu_bytes, false_share));
+	    staged, other_reads, seconds(other_ns), gpu_bytes, false_share, replayed,
+	    stats.line_overflow.load(std::memory_order_relaxed) ? "; GPU line table overflowed" : ""));
 }
 
 void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault,
@@ -643,7 +651,7 @@ void BufferCache::ReadMemoryAsyncTimed(uint64_t vaddr, uint64_t size, bool is_wr
 				for (const auto& follower: followers) {
 					if (InFlightReadbackTick(follower.page, follower.page + TRACKER_PAGE_SIZE) == 0 &&
 					    !m_gpu_modified_ranges.Intersects(follower.page, TRACKER_PAGE_SIZE)) {
-						m_memory_tracker.UnmarkRegionAsGpuModified(follower.page, TRACKER_PAGE_SIZE);
+						UnmarkGpuModified(follower.page, TRACKER_PAGE_SIZE);
 					}
 				}
 			}
@@ -1092,7 +1100,7 @@ bool BufferCache::TryReadCopyFeedback(Buffer& buffer, uint64_t vaddr, uint64_t s
 		}
 		ForgetColorMetadataChecks(address, bytes);
 	}
-	m_memory_tracker.UnmarkRegionAsGpuModified(begin, end - begin);
+	UnmarkGpuModified(begin, end - begin);
 	return true;
 }
 
@@ -1127,7 +1135,7 @@ void BufferCache::ReleaseReadback(uint64_t vaddr, uint64_t size, uint64_t pages_
 	    m_gpu_modified_ranges.Intersects(pages_begin, pages_end - pages_begin)) {
 		return;
 	}
-	m_memory_tracker.UnmarkRegionAsGpuModified(pages_begin, pages_end - pages_begin);
+	UnmarkGpuModified(pages_begin, pages_end - pages_begin);
 	if (is_write) {
 		m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
 	}
@@ -2434,7 +2442,30 @@ void BufferCache::NoteGpuLines(uint64_t vaddr, uint64_t size) noexcept {
 	const auto first = vaddr >> GpuLinePageBits;
 	const auto last  = (vaddr + size - 1) >> GpuLinePageBits;
 	if (last - first >= GpuLineMaxPages) {
-		m_gpu_line_overflow.store(true, std::memory_order_release);
+		const auto end = vaddr + size;
+		for (auto* list: {&m_gpu_line_current_ranges, &m_gpu_line_ever_ranges}) {
+			bool kept = false;
+			for (auto& range: *list) {
+				if (range.begin.load(std::memory_order_relaxed) <= vaddr && end <= range.end.load(std::memory_order_relaxed)) {
+					kept = true;
+					break;
+				}
+			}
+			for (auto& range: *list) {
+				if (kept) {
+					break;
+				}
+				if (range.end.load(std::memory_order_relaxed) == 0) {
+					range.begin.store(vaddr, std::memory_order_relaxed);
+					range.end.store(end, std::memory_order_release);
+					kept = true;
+				}
+			}
+			if (!kept) {
+				m_gpu_line_overflow.store(true, std::memory_order_release);
+				g_readback_stats.line_overflow.store(true, std::memory_order_relaxed);
+			}
+		}
 		return;
 	}
 	for (auto page = first; page <= last; page++) {
@@ -2448,23 +2479,77 @@ void BufferCache::NoteGpuLines(uint64_t vaddr, uint64_t size) noexcept {
 				current = key;
 			}
 			if (current == key) {
-				slot.lines.fetch_or(mask, std::memory_order_release);
+				slot.ever.fetch_or(mask, std::memory_order_release);
+				slot.current.fetch_or(mask, std::memory_order_release);
 				stored = true;
 			}
 		}
 		if (!stored) {
 			m_gpu_line_overflow.store(true, std::memory_order_release);
+			g_readback_stats.line_overflow.store(true, std::memory_order_relaxed);
 			return;
 		}
 	}
 }
 
-bool BufferCache::NeverGpuWritten(uint64_t vaddr, uint64_t size) const noexcept {
+void BufferCache::ForgetCurrentGpuLines(uint64_t vaddr, uint64_t size) noexcept {
+	if (size == 0) {
+		return;
+	}
+	const auto end = vaddr + size;
+	for (auto& range: m_gpu_line_current_ranges) {
+		const auto range_end   = range.end.load(std::memory_order_relaxed);
+		const auto range_begin = range.begin.load(std::memory_order_relaxed);
+		if (range_end != 0 && vaddr <= range_begin && range_end <= end &&
+		    !m_gpu_modified_ranges.Intersects(range_begin, range_end - range_begin)) {
+			range.end.store(0, std::memory_order_release);
+		}
+	}
+	const auto first = vaddr >> GpuLinePageBits;
+	const auto last  = (end - 1) >> GpuLinePageBits;
+	if (last - first >= GpuLineMaxPages) {
+		return;
+	}
+	for (auto page = first; page <= last; page++) {
+		const auto key = page + 1;
+		for (size_t probe = 0; probe < GpuLineProbes; probe++) {
+			auto&      slot    = m_gpu_line_slots[(GpuLineHash(page) + probe) % GpuLineSlots];
+			const auto current = slot.page.load(std::memory_order_acquire);
+			if (current == key) {
+				const auto base = page << GpuLinePageBits;
+				uint64_t   kept = 0;
+				m_gpu_modified_ranges.ForEachInRange(base, uint64_t {1} << GpuLinePageBits, [&](uint64_t from, uint64_t to) {
+					kept |= GpuLineMask(page, from, to - from);
+				});
+				slot.current.store(kept, std::memory_order_release);
+				break;
+			}
+			if (current == 0) {
+				break;
+			}
+		}
+	}
+}
+
+void BufferCache::UnmarkGpuModified(uint64_t vaddr, uint64_t size) {
+	m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+	ForgetCurrentGpuLines(Common::AlignDown(vaddr, TRACKER_PAGE_SIZE),
+	                      Common::AlignUp(vaddr + size, TRACKER_PAGE_SIZE) - Common::AlignDown(vaddr, TRACKER_PAGE_SIZE));
+}
+
+bool BufferCache::GpuLinesClean(uint64_t vaddr, uint64_t size, bool ever) const noexcept {
 	if (size == 0 || m_gpu_line_overflow.load(std::memory_order_acquire)) {
 		return false;
 	}
+	const auto end = vaddr + size;
+	for (const auto& range: ever ? m_gpu_line_ever_ranges : m_gpu_line_current_ranges) {
+		const auto range_end = range.end.load(std::memory_order_acquire);
+		if (range_end != 0 && vaddr < range_end && range.begin.load(std::memory_order_relaxed) < end) {
+			return false;
+		}
+	}
 	const auto first = vaddr >> GpuLinePageBits;
-	const auto last  = (vaddr + size - 1) >> GpuLinePageBits;
+	const auto last  = (end - 1) >> GpuLinePageBits;
 	if (last - first >= GpuLineMaxPages) {
 		return false;
 	}
@@ -2475,7 +2560,8 @@ bool BufferCache::NeverGpuWritten(uint64_t vaddr, uint64_t size) const noexcept 
 			const auto& slot    = m_gpu_line_slots[(GpuLineHash(page) + probe) % GpuLineSlots];
 			const auto  current = slot.page.load(std::memory_order_acquire);
 			if (current == key) {
-				if ((slot.lines.load(std::memory_order_acquire) & GpuLineMask(page, vaddr, size)) != 0) {
+				const auto lines = (ever ? slot.ever : slot.current).load(std::memory_order_acquire);
+				if ((lines & GpuLineMask(page, vaddr, size)) != 0) {
 					return false;
 				}
 				found = true;
@@ -2491,6 +2577,14 @@ bool BufferCache::NeverGpuWritten(uint64_t vaddr, uint64_t size) const noexcept 
 		}
 	}
 	return true;
+}
+
+bool BufferCache::NeverGpuWritten(uint64_t vaddr, uint64_t size) const noexcept {
+	return GpuLinesClean(vaddr, size, true);
+}
+
+bool BufferCache::NoGpuBytesNow(uint64_t vaddr, uint64_t size) const noexcept {
+	return GpuLinesClean(vaddr, size, false);
 }
 
 void BufferCache::NoteGpuModifiedChange(uint64_t vaddr, uint64_t size, bool dirty) {
@@ -2815,7 +2909,7 @@ void BufferCache::RunGarbageCollector() {
 	m_scheduler.WaitPriorityOperations(completion_tick);
 	for (const auto id: dirty_buffers) {
 		auto& buffer = m_slot_buffers[id];
-		m_memory_tracker.UnmarkRegionAsGpuModified(buffer.CpuAddress(), buffer.Size());
+		UnmarkGpuModified(buffer.CpuAddress(), buffer.Size());
 		m_memory_tracker.MarkRegionAsCpuModified(buffer.CpuAddress(), buffer.Size());
 		if (m_record_released) {
 			m_released_ranges.Add(buffer.CpuAddress(), buffer.Size());

@@ -154,6 +154,9 @@ public:
 	[[nodiscard]] bool HasGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool HasOnlyGpuDirtyBytes(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool NeverGpuWritten(uint64_t vaddr, uint64_t size) const noexcept;
+	[[nodiscard]] bool NoGpuBytesNow(uint64_t vaddr, uint64_t size) const noexcept;
+	[[nodiscard]] bool GpuLinesOverflowed() const noexcept { return m_gpu_line_overflow.load(std::memory_order_relaxed); }
+	static void NoteReplayedRead();
 	[[nodiscard]] bool WriteAroundGpuWrites(uint64_t vaddr, const void* data, uint64_t size);
 	[[nodiscard]] bool MayBeGpuModified(uint64_t vaddr, uint64_t size) const {
 		return m_memory_tracker.MayBeGpuModified(vaddr, size);
@@ -387,13 +390,24 @@ private:
 	void NoteGpuModifiedChange(uint64_t vaddr, uint64_t size, bool dirty);
 	struct GpuLineSlot {
 		std::atomic<uint64_t> page {0};
-		std::atomic<uint64_t> lines {0};
+		std::atomic<uint64_t> current {0};
+		std::atomic<uint64_t> ever {0};
 	};
-	static constexpr size_t         GpuLineSlots  = size_t {1} << 20u;
-	static constexpr size_t         GpuLineProbes = 16;
-	std::unique_ptr<GpuLineSlot[]>  m_gpu_line_slots = std::make_unique<GpuLineSlot[]>(GpuLineSlots);
-	std::atomic<bool>               m_gpu_line_overflow {false};
-	void                            NoteGpuLines(uint64_t vaddr, uint64_t size) noexcept;
+	struct GpuLineRange {
+		std::atomic<uint64_t> begin {0};
+		std::atomic<uint64_t> end {0};
+	};
+	static constexpr size_t                       GpuLineSlots  = size_t {1} << 20u;
+	static constexpr size_t                       GpuLineProbes = 16;
+	static constexpr size_t                       GpuLineRanges = 64;
+	std::unique_ptr<GpuLineSlot[]>                m_gpu_line_slots = std::make_unique<GpuLineSlot[]>(GpuLineSlots);
+	std::array<GpuLineRange, GpuLineRanges>       m_gpu_line_current_ranges {};
+	std::array<GpuLineRange, GpuLineRanges>       m_gpu_line_ever_ranges {};
+	std::atomic<bool>                             m_gpu_line_overflow {false};
+	void NoteGpuLines(uint64_t vaddr, uint64_t size) noexcept;
+	void ForgetCurrentGpuLines(uint64_t vaddr, uint64_t size) noexcept;
+	void UnmarkGpuModified(uint64_t vaddr, uint64_t size);
+	[[nodiscard]] bool GpuLinesClean(uint64_t vaddr, uint64_t size, bool ever) const noexcept;
 	std::array<RangeSet, 16>                          m_checked_color_metadata;
 	RangeSet                                          m_released_ranges;
 	bool                                              m_record_released = false;

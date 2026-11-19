@@ -150,6 +150,8 @@ void                   DropHotReadsBacking(uint64_t backing, uint64_t size);
 [[nodiscard]] bool GpuCleanBackingEqualsSince(uint64_t vaddr, const void* expected, uint64_t size, uint64_t version,
                                               bool (*equal)(const void*, const void*, uint64_t) = nullptr);
 bool                   MayFaultOnGpuRead(uint64_t vaddr, uint64_t size);
+[[nodiscard]] bool ReplayableGpuRead(uint64_t vaddr, uint64_t size);
+void                   NoteReplayedGpuRead();
 bool                   MayBeGpuWritten(uint64_t vaddr, uint64_t size);
 bool                   HasGpuWrittenBytes(uint64_t vaddr, uint64_t size);
 bool                   TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size);

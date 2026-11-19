@@ -156,6 +156,17 @@ bool MayFaultOnGpuRead(uint64_t vaddr, uint64_t size) {
 	return buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size);
 }
 
+bool ReplayableGpuRead(uint64_t vaddr, uint64_t size) {
+	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size)) return false;
+	auto& buffers = GetGpuResources().GetBufferCache();
+	return buffers.MayBeGpuModified(vaddr, size) && buffers.IsRegionGpuModified(vaddr, size) && buffers.NoGpuBytesNow(vaddr, size) &&
+	       !GetGpuResources().GetTextureCache().IsRegionGpuModified(vaddr, size);
+}
+
+void NoteReplayedGpuRead() {
+	Graphics::BufferCache::NoteReplayedRead();
+}
+
 bool TryReadAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) {
 	if (g_gpu_resources == nullptr || !IsGpuAddressRange(vaddr, size) || !Graphics::GuestGpu::IsGpuThread()) return false;
 	auto& buffers = GetGpuResources().GetBufferCache();
