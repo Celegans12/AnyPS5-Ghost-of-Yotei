@@ -1,5 +1,6 @@
 #include <codegen/x86/RedZoneFramer.hpp>
 #include <algorithm>
+#include <codegen/IAmd64OnlyConverter.hpp>
 #include <codegen/x86/StubBodyBuilder.hpp>
 #include <cstdint>
 #include <span>
@@ -933,6 +934,84 @@ void skipsSitesTakenByOtherStubs() {
     require(sites.empty() && report.Skipped.at("overlaps another stub") == 1, "a site over another stub was framed");
 }
 
+const std::vector<std::uint8_t> ReciprocalPackedSingles{0xc5, 0xf8, 0x53, 0xc1};
+const std::vector<std::uint8_t> VexStoreBelowRsp{0xc5, 0xf8, 0x11, 0x44, 0x24, 0xe0};
+const std::vector<std::uint8_t> VexLoadFarAboveRsp{0xc5, 0xf8, 0x10, 0x54, 0x24, 0x50};
+const std::vector<std::uint8_t> StoreDeeperBelowRsp{0x48, 0x89, 0x7c, 0x24, 0xc0};
+
+struct Converted {
+    Image input;
+    Codegen::ConvertResult result;
+};
+
+Converted convertedImage(const std::vector<std::vector<std::uint8_t>>& functions) {
+    Converted converted;
+    converted.input = image(functions);
+    converted.result = Codegen::MakeAmd64OnlyConverter()->Convert(converted.input.bytes, converted.input.segments);
+    require(converted.result.Bytes == converted.input.bytes, "the Intel conversion changed the image before its stubs were patched");
+    return converted;
+}
+
+void framesLeavesWhoseOperandsAStubTookFromTheInstructionsAfterALoweredOne() {
+    std::vector<std::uint8_t> body = ReciprocalPackedSingles;
+    append(body, VexStoreBelowRsp);
+    append(body, LoadBelowRsp);
+    const auto converted = convertedImage({framelessLeaf(FramelessPrologue, body, FramelessExit)});
+    require(converted.result.Trampolines.size() == 1 && converted.result.Trampolines[0].Length == ReciprocalPackedSingles.size() + VexStoreBelowRsp.size(), "the reciprocal did not take in the store after it");
+    const auto lowered = converted.result.Trampolines[0];
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(converted.input.bytes, converted.input.segments, converted.input.functions, converted.result.Trampolines, report, displacements);
+    require(report.Skipped.empty() && report.Unframed.empty() && report.Framed == 1 && report.RedZoneFunctions == 1, "a leaf whose operand a stub took in was not framed");
+    require(sites.size() == 2 && report.EditedStubs == 1 && report.SiteEdits.size() == 1, "the framed leaf did not edit the stub that took its operand in");
+    const auto& edit = report.SiteEdits[0];
+    require(edit.Site == 0 && edit.Bytes == std::vector<std::uint8_t>{0x00} && edit.BodyOffset == lowered.ReturnBranchOffset - 1 - 0 && edit.BodyOffset + 1 == lowered.ReturnBranchOffset, "the edit does not move the displacement of the store inside the stub");
+    auto sitesAfter = converted.result.Trampolines;
+    Codegen::ApplyRedZoneSiteEdits(sitesAfter, report.SiteEdits);
+    auto expected = lowered.Body;
+    expected[edit.BodyOffset] = 0x00;
+    require(sitesAfter[0].Body == expected && sitesAfter[0].Body != lowered.Body, "applying the edit changed more than the displacement");
+    require(sitesAfter[0].Body[lowered.ReturnBranchOffset - VexStoreBelowRsp.size()] == 0xc5 && sitesAfter[0].Body[lowered.ReturnBranchOffset - 1] == 0x00, "the store in the stub does not carry the moved displacement");
+    require(displacements.size() == 1 && displacements[0].Bytes == std::vector<std::uint8_t>{0x10}, "the load outside the stub was not moved in place");
+    for (const auto& site : sites)
+        for (const auto& taken : converted.result.Trampolines)
+            require(site.Address + site.Length <= taken.Address || taken.Address + taken.Length <= site.Address, "a framed site overlaps the stub");
+}
+
+void listsALeafWhoseStubbedOperandCannotMoveAsUnframed() {
+    std::vector<std::uint8_t> body = StoreDeeperBelowRsp;
+    append(body, ReciprocalPackedSingles);
+    append(body, VexLoadFarAboveRsp);
+    append(body, LoadBelowRsp);
+    const auto function = framelessLeaf(FramelessPrologue, body, FramelessExit);
+    const auto converted = convertedImage({leaf(StoreBelowPushes), function});
+    require(converted.result.Trampolines.size() == 1, "the reciprocal was not lowered into a stub");
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(converted.input.bytes, converted.input.segments, converted.input.functions, converted.result.Trampolines, report, displacements);
+    require(report.Framed == 1 && report.RedZoneFunctions == 2 && report.Skipped.size() == 1 && report.Skipped.begin()->second == 1, "the leaf whose stubbed operand cannot move was not the only one left");
+    require(report.SiteEdits.empty() && report.EditedStubs == 0, "a stub was edited although its leaf was not framed");
+    require(report.Unframed.size() == 1 && report.Unframed[0].Begin == converted.input.functions[1].Begin && report.Unframed[0].End == converted.input.functions[1].End, "the unframed leaf was not listed by its range");
+    require(report.Unframed[0].FirstReason == "rsp operand in another stub that cannot move" && report.Unframed[0].Reason == "overlaps another stub", "the unframed leaf does not tell why it was left");
+    require(sites.size() == 2 && sites[0].Address >= converted.input.functions[0].Begin && sites[1].Address >= converted.input.functions[0].Begin && sites[1].Address < converted.input.functions[0].End, "the first leaf was not framed on its own");
+}
+
+void listsEverySkippedLeafWithItsRange() {
+    const auto input = image({leaf(StoreBelowPushes), leaf(StoreBelowPushes)});
+    Codegen::TrampolineSite first{};
+    first.Address = Base + 0x40;
+    first.Length = 5;
+    Codegen::TrampolineSite second{};
+    second.Address = input.functions[1].Begin;
+    second.Length = 5;
+    Codegen::RedZoneFrameReport report;
+    std::vector<Codegen::RedZoneDisplacement> displacements;
+    const auto sites = Codegen::FrameRedZoneFunctions(input.bytes, input.segments, input.functions, {first, second}, report, displacements);
+    require(sites.empty() && report.Skipped.at("overlaps another stub") == 2 && report.Unframed.size() == 2, "skipped leaves were not listed");
+    for (std::size_t index = 0; index < 2; ++index)
+        require(report.Unframed[index].Begin == input.functions[index].Begin && report.Unframed[index].End == input.functions[index].End, "a skipped leaf was listed with the wrong range");
+}
+
 void framesAPointerOnlyFunctionByItsOwnBounds() {
     const auto first = leaf(StoreBelowPushes);
     std::vector<std::uint8_t> secondBody = StoreBelowPushes;
@@ -1108,6 +1187,9 @@ int main() {
         leavesOtherFunctions();
         framesLeavesCallingTheirOwnHelper();
         skipsSitesTakenByOtherStubs();
+        framesLeavesWhoseOperandsAStubTookFromTheInstructionsAfterALoweredOne();
+        listsALeafWhoseStubbedOperandCannotMoveAsUnframed();
+        listsEverySkippedLeafWithItsRange();
         framesLeafWithoutFramePointer();
         shiftsByTheDeepestOperandBelowRsp();
         movesPositiveOperandsThatFitAfterTheShift();

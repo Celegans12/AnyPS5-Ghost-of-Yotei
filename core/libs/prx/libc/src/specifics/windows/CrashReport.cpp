@@ -365,18 +365,37 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     return true;
 }
 
+void RefuseUnframedFault(const EXCEPTION_POINTERS* info) {
+    RedZoneGate::Range range;
+    const auto rip = static_cast<std::uintptr_t>(info->ContextRecord->Rip);
+    if (!RedZoneGate::InUnframedRange(rip, &range)) return;
+    if (RedZoneGate::Overridden()) {
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) Report("[red-zone] a fault served by page tracking hit 0x%016llx in %s, inside a leaf function the relinker could not frame (0x%016llx-0x%016llx): APS5_ALLOW_UNFRAMED_FAULTS is set, so the title goes on although the values the function keeps below RSP may be overwritten\n", static_cast<unsigned long long>(rip), range.image, static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end));
+        return;
+    }
+    Report("\n[red-zone] FATAL: a fault served by page tracking hit 0x%016llx in %s, inside a leaf function the relinker could not frame (0x%016llx-0x%016llx). Windows has just written the exception record over the values that function keeps below RSP, so the title would go on with corrupt memory. Convert the title again with a relinker that frames it (the conversion log lists the unframed ranges), or set APS5_ALLOW_UNFRAMED_FAULTS=1 to take such faults anyway\n", static_cast<unsigned long long>(rip), range.image, static_cast<unsigned long long>(range.begin), static_cast<unsigned long long>(range.end));
+    LibcRunEndFlush_nid_no_patch();
+    TerminateProcess(GetCurrentProcess(), 1);
+}
+
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
+    const bool unframedSite = info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION || info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP ? RedZoneGate::InUnframedRange(static_cast<std::uintptr_t>(info->ContextRecord->Rip)) : false;
+    const auto served = [&](const bool handled) {
+        if (handled && unframedSite) RefuseUnframedFault(info);
+        return handled;
+    };
 #if defined(ANYPS5_KYTY)
-    if ((((info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) && info->ExceptionRecord->NumberParameters >= 2) || info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) && GuestArena::GuestArenaHandleGpuFault_nid_no_patch(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if ((((info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION) && info->ExceptionRecord->NumberParameters >= 2) || info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP) && served(GuestArena::GuestArenaHandleGpuFault_nid_no_patch(info))) return EXCEPTION_CONTINUE_EXECUTION;
 #endif
-    if (GuestArena::GuestArenaRecoverRead_nid_no_patch(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (served(GuestArena::GuestArenaRecoverRead_nid_no_patch(info))) return EXCEPTION_CONTINUE_EXECUTION;
     const auto* fault = info->ExceptionRecord;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestPageTrackHandleWrite_nid_no_patch(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
-    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && served(GuestArena::GuestPageTrackHandleWrite_nid_no_patch(fault->ExceptionInformation[1]))) return EXCEPTION_CONTINUE_EXECUTION;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 1 && served(GuestArena::GuestArenaHandleWrite_nid_postfix(fault->ExceptionInformation[1]))) return EXCEPTION_CONTINUE_EXECUTION;
+    if (fault->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && fault->NumberParameters >= 2 && fault->ExceptionInformation[0] == 0 && served(GuestArena::GuestArenaHandleRead_nid_postfix(fault->ExceptionInformation[1]))) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleWatch(info)) return EXCEPTION_CONTINUE_EXECUTION;
-    if (GuestArena::GuestArenaRecoverWrite_nid_no_patch(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    if (served(GuestArena::GuestArenaRecoverWrite_nid_no_patch(info))) return EXCEPTION_CONTINUE_EXECUTION;
     if (FaultStorm::Handle(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleSse4a(info)) return EXCEPTION_CONTINUE_EXECUTION;
     if (HandleHostFault(info)) return EXCEPTION_CONTINUE_EXECUTION;

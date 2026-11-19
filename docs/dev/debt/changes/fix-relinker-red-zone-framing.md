@@ -2,7 +2,7 @@
 
 ## change `--frame-red-zone` frames only leaf functions
 
-- `--frame-red-zone` frames a function that keeps values below RSP by the first of three forms that fits ([framer](../../../core/relinker/codegen/src/x86/RedZoneFramer.cpp)): in place, with stubs at its prologue and exits; through a return thunk, whose entry lowers RSP and calls the rest of the function; or relocated whole into a stub that runs it with RSP 128 bytes lower. A function none fits keeps its red zone, is counted by reason in the conversion log and leaves its image without the framing mark. The three forms were not compiled or run in this tree: their author ran them on four titles, none built with Unity, and no title of ours was converted with them. A value below RSP reached through a register other than RSP or RBP is not seen, and a function that calls and keeps values below RSP is framed only when it has a frame pointer; without one it is counted as skipped.
+- `--frame-red-zone` frames a function that keeps values below RSP by the first of three forms that fits ([framer](../../../core/relinker/codegen/src/x86/RedZoneFramer.cpp)): in place, with stubs at its prologue and exits; through a return thunk, whose entry lowers RSP and calls the rest of the function; or relocated whole into a stub that runs it with RSP 128 bytes lower. A function none fits keeps its red zone, is counted by reason in the conversion log, with its address, and goes into the list of unframed ranges of its image. The three forms were not compiled or run in this tree: their author ran them on four titles, none built with Unity, and no title of ours was converted with them. A value below RSP reached through a register other than RSP or RBP is not seen, and a function that calls and keeps values below RSP is framed only when it has a frame pointer; without one it is counted as skipped.
 
 ## change An RSP operand that `--frame-red-zone` cannot move in place
 
@@ -10,11 +10,11 @@
 
 ## change function bounds come from the executable's `.eh_frame` FDEs
 
-- In `--frame-red-zone`, code outside every `.eh_frame` FDE is cut into functions at int3 padding, undecodable bytes, zero fill, direct call targets and, after an exit, at code no earlier branch reaches ([framer](../../../core/relinker/codegen/src/x86/RedZoneFramer.cpp)). The cut is a guess: a function cut in two is framed as two functions, and data inside a code segment is decoded as code. A code range left outside every function that reaches below RSP is counted and leaves its image without the framing mark.
+- In `--frame-red-zone`, code outside every `.eh_frame` FDE is cut into functions at int3 padding, undecodable bytes, zero fill, direct call targets and, after an exit, at code no earlier branch reaches ([framer](../../../core/relinker/codegen/src/x86/RedZoneFramer.cpp)). The cut is a guess: a function cut in two is framed as two functions, and data inside a code segment is decoded as code. A code range left outside every function that reaches below RSP is counted and goes into the same list.
 
 ## add Functional
 
-- The [red-zone framing mark](../../../core/relinker/relinker/src/pipeline/RedZoneFraming.cpp) is eight bytes at offset 0x28 of the DOS header of a Windows image. It says that the conversion left no function with values below RSP unframed, not that the framed code was run: no test executes a marked title. Linux and macOS images are neither framed nor marked. `--frame-red-zone` is off unless given, since framing rewrites the code of every image and no title of ours has run framed.
+- The [red-zone framing mark](../../../core/relinker/relinker/src/pipeline/RedZoneFraming.cpp) is eight bytes at offset 0x28 of the DOS header of a Windows image. It says that the conversion framed every function with values below RSP except the ranges of the list its second version (`APS5RZ02`) points at, not that the framed code was run: no test executes a marked title. Linux and macOS images are neither framed nor marked. `--frame-red-zone` is off unless given, since framing rewrites the code of every image and no title of ours has run framed.
 
 # libc
 

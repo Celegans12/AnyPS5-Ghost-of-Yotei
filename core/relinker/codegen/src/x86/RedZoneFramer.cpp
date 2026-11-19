@@ -1,4 +1,5 @@
 #include <codegen/x86/RedZoneFramer.hpp>
+#include <codegen/CodegenException.hpp>
 #include <codegen/IInstructionScanner.hpp>
 #include <codegen/x86/X64InstructionDecoder.hpp>
 #include <algorithm>
@@ -542,6 +543,27 @@ void frameSegment(
     const auto overlapsExisting = [&](const std::size_t begin, const std::size_t end) {
         return std::any_of(taken.begin(), taken.end(), [&](const auto& range) { return begin < range.second && range.first < end; });
     };
+    struct SwallowedAt {
+        std::size_t Site;
+        std::size_t BodyOffset;
+    };
+    const auto swallowedByExisting = [&](const std::size_t begin, const std::size_t end) -> std::optional<SwallowedAt> {
+        for (std::size_t index = 0; index < existing.size(); ++index) {
+            const auto& site = existing[index];
+            if (site.Address < ph.MappedAddress || site.Address >= ph.MappedAddress + segSize) continue;
+            const auto first = static_cast<std::size_t>(site.Address - ph.MappedAddress);
+            const auto last = first + site.Length;
+            if (begin >= last || first >= end) continue;
+            if (begin <= first || end > last) return std::nullopt;
+            if (std::any_of(taken.begin(), taken.end(), [&](const auto& range) { return begin < range.second && range.first < end && !(range.first == first && range.second == last); })) return std::nullopt;
+            if (site.JoinBack != 0 || site.Length < kJumpBytes || site.OriginalBytes.size() != site.Length || site.Body.size() < kJumpBytes || site.ReturnBranchOffset > site.Body.size() - kJumpBytes || site.Body[site.ReturnBranchOffset] != kJumpBack[0]) return std::nullopt;
+            const auto tail = last - begin;
+            if (site.ReturnBranchOffset < tail || !std::equal(seg.begin() + static_cast<std::ptrdiff_t>(begin), seg.begin() + static_cast<std::ptrdiff_t>(last), site.Body.begin() + static_cast<std::ptrdiff_t>(site.ReturnBranchOffset - tail))) return std::nullopt;
+            if (!std::equal(site.OriginalBytes.begin(), site.OriginalBytes.end(), seg.begin() + static_cast<std::ptrdiff_t>(first))) return std::nullopt;
+            return SwallowedAt{index, site.ReturnBranchOffset - tail};
+        }
+        return std::nullopt;
+    };
     const auto targetInside = [&](const std::size_t begin, const std::size_t end) {
         const auto hit = targets.upper_bound(begin);
         return hit != targets.end() && *hit < end;
@@ -575,7 +597,10 @@ void frameSegment(
         const auto start = static_cast<std::size_t>(function.Begin - ph.MappedAddress);
         const auto limit = static_cast<std::size_t>(function.End - ph.MappedAddress);
         ++report.Functions;
-        const auto skip = [&](const char* reason) { ++report.Skipped[reason]; };
+        const auto skip = [&](const char* reason, const char* first = nullptr) {
+            ++report.Skipped[reason];
+            report.Unframed.push_back({function.Begin, function.End, reason, first != nullptr ? first : ""});
+        };
 
         const std::vector<std::uint8_t> code(seg.begin() + static_cast<std::ptrdiff_t>(start), seg.begin() + static_cast<std::ptrdiff_t>(limit));
         std::vector<Insn> body;
@@ -1063,6 +1088,8 @@ void frameSegment(
             bool sawRet = false;
             std::int64_t bodyShift = shift;
             std::vector<std::size_t> rspOperands;
+            std::map<std::size_t, SwallowedAt> inStubs;
+            std::vector<RedZoneSiteEdit> siteEdits;
             const auto copy = [&](const std::size_t k) -> std::optional<Copied> {
                 const auto& insn = body[k];
                 Copied out;
@@ -1143,7 +1170,11 @@ void frameSegment(
                     if (use.RegisterRsp) { reason = "other use of rsp"; continue; }
                     if (use.RspBased) {
                         if (code[insn.Info.OpcodeOffset] == 0x62) { reason = "rsp operand that cannot move with rsp"; continue; }
-                        if (overlapsExisting(insn.Offset, insn.Offset + insn.Length)) { reason = "overlaps another stub"; continue; }
+                        if (overlapsExisting(insn.Offset, insn.Offset + insn.Length)) {
+                            const auto swallowed = swallowedByExisting(insn.Offset, insn.Offset + insn.Length);
+                            if (!swallowed) { reason = "overlaps another stub"; continue; }
+                            inStubs.emplace(k, *swallowed);
+                        }
                         rspOperands.push_back(k);
                     }
                 }
@@ -1331,6 +1362,11 @@ void frameSegment(
             }
             for (const auto k : rspOperands) {
                 const auto use = memoryUse(at(k), body[k]);
+                if (const auto inStub = inStubs.find(k); inStub != inStubs.end()) {
+                    if (auto moved = movedDisplacement(use, bodyShift)) siteEdits.push_back({inStub->second.Site, inStub->second.BodyOffset + use.DispOffset, std::move(*moved)});
+                    else if (reason == nullptr) reason = "rsp operand in another stub that cannot move";
+                    continue;
+                }
                 if (auto moved = movedDisplacement(use, bodyShift)) moves.emplace(k, std::pair{body[k].Offset + use.DispOffset, std::move(*moved)});
                 else stubbed.push_back(k);
             }
@@ -1414,7 +1450,7 @@ void frameSegment(
                 }
                 const auto relocation = relocate();
                 if (relocation == nullptr) break;
-                skip(relocation);
+                skip(relocation, reason);
                 break;
             }
             for (const auto& stub : stubs)
@@ -1454,6 +1490,8 @@ void frameSegment(
             }
             for (auto& stub : stubs) addSite(stub.Begin, stub.End, std::move(stub.Body));
             for (auto& [k, move] : moves) displacements.push_back({ph.Offset + move.first, std::move(move.second)});
+            for (auto& edit : siteEdits) report.SiteEdits.push_back(std::move(edit));
+            report.EditedStubs += inStubs.size();
             for (const auto k : leaves) displacements.push_back({ph.Offset + body[k].Offset, {0xc9}});
             report.LeaveExits += leaveExitCount;
             ++report.Framed;
@@ -1532,7 +1570,9 @@ void measureUncovered(const std::vector<std::uint8_t>& fileBytes, const Domain::
         if (belowRsp) {
             ++report.UncoveredBelowRsp;
             report.UncoveredBelowRspAddresses.push_back(ph.MappedAddress + begin + *first);
-        }    };
+            report.Unframed.push_back({ph.MappedAddress + begin + *first, ph.MappedAddress + begin + last, "code outside every function's bounds that accesses memory below rsp", ""});
+        }
+    };
     std::size_t cursor = 0;
     for (const auto& [begin, end] : spans) {
         if (begin > cursor) gap(cursor, begin);
@@ -1605,6 +1645,14 @@ std::vector<RedZoneFunction> SplitUncoveredCode(const std::vector<std::uint8_t>&
         if (cursor < segSize) gap(cursor, segSize);
     }
     return pieces;
+}
+
+void ApplyRedZoneSiteEdits(std::vector<TrampolineSite>& sites, const std::vector<RedZoneSiteEdit>& edits) {
+    for (const auto& edit : edits) {
+        if (edit.Site >= sites.size() || edit.Bytes.empty() || edit.BodyOffset > sites[edit.Site].Body.size() || edit.Bytes.size() > sites[edit.Site].Body.size() - edit.BodyOffset || edit.BodyOffset + edit.Bytes.size() > sites[edit.Site].ReturnBranchOffset)
+            throw CodegenException("Red-zone edit of a stub lies outside its body");
+        std::copy(edit.Bytes.begin(), edit.Bytes.end(), sites[edit.Site].Body.begin() + static_cast<std::ptrdiff_t>(edit.BodyOffset));
+    }
 }
 
 std::vector<TrampolineSite> FrameRedZoneFunctions(

@@ -547,7 +547,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
                 image.Bytes[header.Offset + offset + 1] = 0x0B;
             }
         }
-        bool redZoneComplete = false;
+        std::optional<std::vector<RedZoneRvaRange>> redZoneRanges;
         if (frameRedZone) {
             const auto prefix = "Red-zone framing (" + Io::Utf8Path(image.SourcePath.filename()) + ")";
             auto framing = FrameRedZoneImage(image.Bytes, image.Headers, image.Dynamic.RelaData, image.Trampolines, prefix, [&](std::string_view text) { progress.Message(text); });
@@ -557,7 +557,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             }
             redZoneSkipped += framing.Skipped;
             redZoneUnexamined += framing.Unexamined;
-            redZoneComplete = RedZoneFramingComplete(framing);
+            redZoneRanges = RedZoneRvaRanges(image.Bytes, image.Headers, framing);
             ++redZoneModules;
             if (!image.PatchedRanges.empty()) GamePatch::CheckOverlaps(Io::Utf8Path(image.SourcePath), image.PatchedRanges, {.RedZoneSites = std::span<const Codegen::TrampolineSite>(image.Trampolines).subspan(framing.FirstSite), .RedZoneDisplacements = framing.Displacements});
         }
@@ -593,7 +593,7 @@ std::vector<GuestArtifact> GuestModuleBuilder::Build(const std::filesystem::path
             const bool deferLinuxStart = isRuntime(index) && (!standardDirectory(index) || (executableLoadsModules && !required[index]));
             output = macos ? Elfpatcher::GuestModuleWriter().WriteMacOs(image, needed, guestRunPath, message) : Elfpatcher::GuestModuleWriter().WriteLinux(image, needed, guestRunPath, deferLinuxStart);
         }
-        const bool redZoneFramed = windows && redZoneComplete && MarkRedZoneFramed(output);
+        const bool redZoneFramed = windows && redZoneRanges && MarkRedZoneFramed(output, *redZoneRanges);
         if (redZoneFramed) ++redZoneMarked;
         if (frameRedZone) progress.Message("Red-zone framing (" + Io::Utf8Path(image.SourcePath.filename()) + (redZoneFramed ? "): marked as framed\n" : "): not marked as framed\n"));
         if (windows) {

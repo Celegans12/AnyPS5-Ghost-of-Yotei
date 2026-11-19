@@ -16,6 +16,19 @@ struct RedZoneFunction {
     std::uint64_t End = 0;
 };
 
+struct RedZoneUnframed {
+    std::uint64_t Begin = 0;
+    std::uint64_t End = 0;
+    std::string Reason;
+    std::string FirstReason;
+};
+
+struct RedZoneSiteEdit {
+    std::size_t Site = 0;
+    std::size_t BodyOffset = 0;
+    std::vector<std::uint8_t> Bytes;
+};
+
 struct RedZoneFrameReport {
     std::size_t Functions = 0;
     std::size_t RedZoneFunctions = 0;
@@ -40,12 +53,17 @@ struct RedZoneFrameReport {
     std::size_t UncoveredPltRanges = 0;
     std::size_t UncoveredBelowRsp = 0;
     std::vector<std::uint64_t> UncoveredBelowRspAddresses;
+    std::vector<RedZoneUnframed> Unframed;
+    std::vector<RedZoneSiteEdit> SiteEdits;
+    std::size_t EditedStubs = 0;
 };
 
 struct RedZoneDisplacement {
     Domain::FileByteOffset Offset;
     std::vector<std::uint8_t> Bytes;
 };
+
+void ApplyRedZoneSiteEdits(std::vector<TrampolineSite>& sites, const std::vector<RedZoneSiteEdit>& edits);
 
 std::vector<RedZoneFunction> SplitUncoveredCode(const std::vector<std::uint8_t>& fileBytes, const std::vector<Domain::ProgramHeader>& codeSegments, const std::vector<RedZoneFunction>& functions);
 

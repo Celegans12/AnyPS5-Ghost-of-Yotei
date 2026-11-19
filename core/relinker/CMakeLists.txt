@@ -722,6 +722,9 @@ if(BUILD_TESTING)
         add_test(NAME windows_fixed_base COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_fixed_base.py $<TARGET_FILE:relinker>)
         set_tests_properties(windows_fixed_base PROPERTIES TIMEOUT 20)
+        add_test(NAME windows_red_zone_ranges COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_windows_red_zone_ranges.py $<TARGET_FILE:relinker>)
+        set_tests_properties(windows_red_zone_ranges PROPERTIES TIMEOUT 20)
         add_test(NAME linux_gnu_segments COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/relinker/tests/test_linux_gnu_segments.py $<TARGET_FILE:relinker>)
         set_tests_properties(linux_gnu_segments PROPERTIES TIMEOUT 20)

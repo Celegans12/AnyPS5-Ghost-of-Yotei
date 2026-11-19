@@ -3,12 +3,16 @@
 #include "prx/libc/include/WindowsPageTrack.hpp"
 #include "prx/libc/include/RedZoneGate.hpp"
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <initializer_list>
 #include <source_location>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -40,6 +44,24 @@ std::array<unsigned char, RedZoneGate::HeaderBytes> Header(bool relinked, bool m
     if (!relinked) std::memcpy(header.data() + 0x4e, "This program cannot be run in DOS mode.", 39);
     if (marked) std::memcpy(header.data() + RedZoneGate::MarkOffset, RedZoneGate::Mark, sizeof(RedZoneGate::Mark));
     return header;
+}
+
+std::vector<unsigned char> RangesImage(std::initializer_list<std::pair<std::uint32_t, std::uint32_t>> ranges, std::uint32_t tableRva = 0x100, std::size_t bytes = 0x1000) {
+    std::vector<unsigned char> image(bytes);
+    const auto header = Header(true, false);
+    std::copy(header.begin(), header.end(), image.begin());
+    std::memcpy(image.data() + RedZoneGate::MarkOffset, RedZoneGate::RangesMark, sizeof(RedZoneGate::RangesMark));
+    const auto count = static_cast<std::uint32_t>(ranges.size());
+    std::memcpy(image.data() + RedZoneGate::TableRvaOffset, &tableRva, sizeof(tableRva));
+    std::memcpy(image.data() + RedZoneGate::TableCountOffset, &count, sizeof(count));
+    std::size_t at = tableRva;
+    for (const auto& [begin, end] : ranges) {
+        if (at + RedZoneGate::TableEntryBytes > bytes) break;
+        std::memcpy(image.data() + at, &begin, sizeof(begin));
+        std::memcpy(image.data() + at + sizeof(begin), &end, sizeof(end));
+        at += RedZoneGate::TableEntryBytes;
+    }
+    return image;
 }
 
 bool Refuse(std::uintptr_t, std::uintptr_t) {
@@ -79,6 +101,47 @@ void CheckClassification() {
     Require(RedZoneGate::GuestName(GuestPath, Length(GuestPath)));
     Require(!RedZoneGate::GuestName(HostPath, Length(HostPath)));
     Require(!RedZoneGate::GuestName(L".prx", 4) && !RedZoneGate::GuestName(nullptr, 0));
+}
+
+void CheckRanges() {
+    using RedZoneGate::Classify;
+    using RedZoneGate::Image;
+    using RedZoneGate::ValidTable;
+    static const auto image = RangesImage({{0x200, 0x240}, {0x300, 0x310}});
+    Require(Classify(image.data(), image.size(), false) == Image::FramedExcept);
+    Require(Classify(image.data(), image.size(), true) == Image::FramedExcept);
+    auto notRelinked = image;
+    std::memcpy(notRelinked.data() + 0x4e, "This program cannot be run in DOS mode.", 39);
+    Require(Classify(notRelinked.data(), notRelinked.size(), false) == Image::Host);
+    std::uint32_t rva = 0;
+    std::uint32_t count = 0;
+    Require(ValidTable(image.data(), image.size(), rva, count) && rva == 0x100 && count == 2);
+    Require(!ValidTable(image.data(), RedZoneGate::HeaderBytes - 1, rva, count));
+    Require(!ValidTable(RangesImage({}).data(), 0x1000, rva, count));
+    Require(!ValidTable(RangesImage({{0x300, 0x310}, {0x200, 0x240}}).data(), 0x1000, rva, count));
+    Require(!ValidTable(RangesImage({{0x200, 0x240}, {0x230, 0x250}}).data(), 0x1000, rva, count));
+    Require(!ValidTable(RangesImage({{0x240, 0x240}}).data(), 0x1000, rva, count));
+    Require(!ValidTable(RangesImage({{0x200, 0x1001}}).data(), 0x1000, rva, count));
+    Require(!ValidTable(RangesImage({{0x200, 0x240}}, 0x102).data(), 0x1000, rva, count));
+    Require(!ValidTable(RangesImage({{0x200, 0x240}}, 0x40).data(), 0x1000, rva, count));
+    Require(!ValidTable(RangesImage({{0x200, 0x240}}, 0x1000).data(), 0x1000, rva, count));
+    auto tooMany = RangesImage({{0x200, 0x240}});
+    const std::uint32_t manyEntries = 0x1000;
+    std::memcpy(tooMany.data() + RedZoneGate::TableCountOffset, &manyEntries, sizeof(manyEntries));
+    Require(!ValidTable(tooMany.data(), tooMany.size(), rva, count));
+
+    RedZoneGate::Note(GuestPath, Length(GuestPath), image.data(), image.size());
+    RedZoneGate::Note(GuestPath, Length(GuestPath), image.data(), image.size());
+    const auto base = reinterpret_cast<std::uintptr_t>(image.data());
+    RedZoneGate::Range range;
+    Require(RedZoneGate::InUnframedRange(base + 0x200, &range) && range.begin == base + 0x200 && range.end == base + 0x240);
+    Require(std::strcmp(range.image, "Il2CppUserAssemblies.prx.GUEST.prx") == 0);
+    Require(RedZoneGate::InUnframedRange(base + 0x23f) && !RedZoneGate::InUnframedRange(base + 0x240));
+    Require(!RedZoneGate::InUnframedRange(base + 0x1ff) && !RedZoneGate::InUnframedRange(base + 0x2ff));
+    Require(RedZoneGate::InUnframedRange(base + 0x300, &range) && range.begin == base + 0x300 && range.end == base + 0x310);
+    Require(RedZoneGate::InUnframedRange(base + 0x30f) && !RedZoneGate::InUnframedRange(base + 0x310));
+    Require(!RedZoneGate::InUnframedRange(base - 1) && !RedZoneGate::InUnframedRange(base + image.size()));
+    Require(RedZoneGate::Open());
 }
 
 void CheckGate() {
@@ -145,6 +208,7 @@ int main() {
     _putenv_s("APS5_ALLOW_UNFRAMED_FAULTS", "");
     try {
         CheckClassification();
+        CheckRanges();
         CheckGate();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());

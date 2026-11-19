@@ -117,13 +117,13 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
     }
     const auto intelSites = trampolines.size();
     std::vector<Codegen::RedZoneDisplacement> displacements;
-    bool redZoneComplete = false;
+    std::optional<std::vector<Relinker::RedZoneRvaRange>> redZoneRanges;
     std::size_t redZoneLeft = 0;
     if (options.FrameRedZone) {
         const auto headers = Relinker::ElfReader(sourceBytes).ReadProgramHeaders();
         auto framing = Relinker::FrameRedZoneImage(sourceBytes, headers, result.DynamicSection.RelaData, trampolines, "Red-zone framing", [&](std::string_view text) { inputProgress.Message(text); });
         if (!framing.HasBounds) inputProgress.Message("Red-zone framing: the executable has no .eh_frame function bounds; all its functions come from splitting\n");
-        redZoneComplete = Relinker::RedZoneFramingComplete(framing);
+        redZoneRanges = Relinker::RedZoneRvaRanges(sourceBytes, headers, framing);
         redZoneLeft = framing.Skipped + framing.Unexamined;
         displacements = std::move(framing.Displacements);
     }
@@ -186,10 +186,10 @@ ConversionOutput Conversion::Convert(ConversionInput input, const ConversionOpti
     }
 
     if (options.FrameRedZone) {
-        const bool marked = windows && redZoneComplete && Relinker::MarkRedZoneFramed(executableBytes);
+        const bool marked = windows && redZoneRanges && Relinker::MarkRedZoneFramed(executableBytes, *redZoneRanges);
         const auto unmarkedModules = static_cast<std::size_t>(std::count_if(guestArtifacts.begin(), guestArtifacts.end(), [](const Relinker::GuestArtifact& artifact) { return !artifact.RedZoneFramed; }));
         std::ostringstream message;
-        message << "Red-zone framing: the executable is " << (marked ? "marked as framed" : "not marked as framed") << " (" << redZoneLeft << " leaves or code ranges left); " << unmarkedModules << " of " << guestArtifacts.size() << " guest modules are not marked\n";
+        message << "Red-zone framing: the executable is " << (marked ? (redZoneRanges->empty() ? "marked as framed" : "marked as framed except the ranges it lists") : "not marked as framed") << " (" << redZoneLeft << " leaves or code ranges left" << (marked && !redZoneRanges->empty() ? ", " + std::to_string(redZoneRanges->size()) + " listed in the mark" : std::string()) << "); " << unmarkedModules << " of " << guestArtifacts.size() << " guest modules are not marked\n";
         if (!marked || unmarkedModules != 0) message << "Red-zone framing: the title keeps values below RSP that a fault can overwrite; libc arms no page tracking block and sets no read trap while an unmarked image is loaded\n";
         inputProgress.Message(message.str());
     }
