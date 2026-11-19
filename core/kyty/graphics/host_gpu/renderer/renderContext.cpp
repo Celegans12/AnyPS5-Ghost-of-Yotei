@@ -124,11 +124,26 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
 		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 		m_strict_watch.InvalidateMemory(fault_vaddr, fault_size);
+		if (!GuestGpu::IsGpuThread() && !GuestGpu::IsCommandProcessorThread()) {
+			m_page_manager.NoteWriteFault(fault_vaddr);
+		}
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, true);
 		m_texture_cache.FlushLazyReadback(fault_vaddr, fault_size);
 	}
 	return true;
+}
+
+void RenderContext::CollectHotPageWrites(uint64_t vaddr, uint64_t size) {
+	m_page_manager.CollectHotPageWrites(
+	    [](void* context, uint64_t page) {
+		    auto& self = *static_cast<RenderContext*>(context);
+		    self.m_buffer_cache.InvalidateFaultedPage(page);
+		    self.m_texture_cache.InvalidateMemory(page, 1);
+		    self.m_image_heap.InvalidateMemory(page, 1);
+		    self.m_strict_watch.InvalidateMemory(page, 1);
+	    },
+	    this, vaddr, size);
 }
 
 bool RenderContext::WaitWriteBacks(uint64_t vaddr, uint64_t size) {
@@ -349,6 +364,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 		     vaddr, size);
 	}
 	const auto unmap = [this, vaddr, size] {
+		m_page_manager.ForgetHotPages(vaddr, size);
 		if (m_command_scheduler.Active()) {
 			m_command_scheduler.PopPendingOperations();
 		}

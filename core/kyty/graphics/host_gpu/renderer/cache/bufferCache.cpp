@@ -1553,6 +1553,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
                                                        bool is_written, bool is_texel_buffer,
                                                        BufferId id) {
 	EXIT_IF(!(GuestRange {vaddr, size}.Valid()));
+	if (is_written) {
+		m_scheduler.Context().CollectHotPageWrites(vaddr, size);
+	}
 
 	const bool  small_read = !is_written && size <= CACHING_PAGESIZE;
 	StreamMemo* stream     = nullptr;
@@ -2983,6 +2986,7 @@ void BufferCache::NoteGpuWrites(uint64_t vaddr, uint64_t size) {
 	if (!GuestRange {vaddr, size}.Valid()) {
 		EXIT("BufferCache: invalid GPU write range\n");
 	}
+	m_scheduler.Context().CollectHotPageWrites(vaddr, size);
 	const auto end = vaddr + size;
 	auto       it  = m_buffers.upper_bound(vaddr);
 	if (it != m_buffers.begin()) {

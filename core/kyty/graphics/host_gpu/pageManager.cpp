@@ -2,7 +2,9 @@
 
 #include "common/alignment.h"
 #include "common/logging/log.h"
+#include "common/timer.h"
 #include "common/virtualMemory.h"
+#include "graphics/host_gpu/hotWriteWatch.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/regionManager.h"
 #include "kernel/memory.h"
@@ -12,7 +14,9 @@
 #include <atomic>
 #include <cstdarg>
 #include <cstdio>
+#include <cinttypes>
 #include <cstdlib>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -41,6 +45,17 @@ constexpr uint64_t REGION_COUNT = ADDRESS_SIZE / REGION_SIZE;
 constexpr uint64_t REGION_PAGES = REGION_SIZE / PAGE_SIZE;
 constexpr uint64_t READ_GRANULE_SIZE  = 64 * 1024;
 constexpr uint64_t READ_GRANULE_PAGES = READ_GRANULE_SIZE / PAGE_SIZE;
+
+constexpr uint8_t  HOT_COLD           = 0;
+constexpr uint8_t  HOT_ON             = 1;
+constexpr uint8_t  HOT_REFUSED        = 2;
+constexpr uint8_t  HOT_PROMOTING      = 3;
+constexpr uint8_t  HOT_FAULTS         = 2;
+constexpr uint64_t HOT_WINDOW_NS      = 1'000'000'000;
+constexpr uint32_t HOT_IDLE_SECONDS   = 4;
+constexpr uint32_t HOT_PAGE_CAP       = 16384;
+constexpr size_t   HOT_IDLE_PER_SWEEP = 1024;
+constexpr uint64_t HOT_GRANULE_SIZE   = 2 * 1024 * 1024;
 
 [[noreturn]] void Fatal(const char* format, ...) {
 	char    text[1024];
@@ -71,12 +86,17 @@ struct PageManager::Impl {
 	struct PageState {
 		uint8_t write_watchers  = 0;
 		uint8_t access_watchers = 0;
+		uint8_t hot             = HOT_COLD;
+		uint8_t write_faults    = 0;
+		uint8_t fault_window    = 0;
+
+		[[nodiscard]] bool WriteProtected() const noexcept { return write_watchers != 0 && hot != HOT_ON; }
 
 		[[nodiscard]] Common::VirtualMemory::Mode Perms() const noexcept {
 			if (access_watchers != 0) {
 				return Common::VirtualMemory::Mode::NoAccess;
 			}
-			if (write_watchers != 0) {
+			if (WriteProtected()) {
 				return Common::VirtualMemory::Mode::Read;
 			}
 			return Common::VirtualMemory::Mode::ReadWrite;
@@ -116,7 +136,7 @@ struct PageManager::Impl {
 			}
 		}
 	};
-	static_assert(sizeof(PageState) == 2);
+	static_assert(sizeof(PageState) == 5);
 
 	struct Region {
 		TrackingSpinLock                    lock;
@@ -177,6 +197,11 @@ struct PageManager::Impl {
 	}
 
 	void Protect(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) noexcept {
+		const auto kind = mode == Common::VirtualMemory::Mode::Read        ? 0
+		                  : mode == Common::VirtualMemory::Mode::ReadWrite ? 1
+		                  : mode == Common::VirtualMemory::Mode::NoAccess  ? 2
+		                                                                   : 3;
+		protects[kind].fetch_add(1, std::memory_order_relaxed);
 		if (!Libs::LibKernel::Memory::ProtectGuestHostMemory(vaddr, size, mode)) {
 			Fatal("address-space protection failed at 0x%016" PRIx64 ", mode=0x%08" PRIx32, vaddr,
 			      static_cast<uint32_t>(mode));
@@ -290,7 +315,7 @@ struct PageManager::Impl {
 				auto       run_perms = Common::VirtualMemory::Mode::ReadWrite;
 				bool       in_run    = false;
 				for (size_t page_index = first; page_index <= last; page_index++) {
-					const bool watched = page_index < last && (region->pages[page_index].write_watchers != 0 ||
+					const bool watched = page_index < last && (region->pages[page_index].WriteProtected() ||
 					                                           region->pages[page_index].access_watchers != 0);
 					const auto perms   = watched ? region->pages[page_index].Perms() : run_perms;
 					if (in_run && (!watched || perms != run_perms)) {
@@ -327,14 +352,144 @@ struct PageManager::Impl {
 		}
 	}
 
+	void MarkHotGranule(uint64_t page) noexcept {
+		const auto granule = page / HOT_GRANULE_SIZE;
+		hot_granules[granule / 64].fetch_or(uint64_t {1} << (granule % 64), std::memory_order_release);
+	}
+
+	[[nodiscard]] bool MayHaveHotPages(uint64_t vaddr, uint64_t size) const noexcept {
+		if (size == 0 || vaddr >= ADDRESS_SIZE) return false;
+		const auto last = std::min(vaddr + size - 1, ADDRESS_SIZE - 1);
+		for (auto g = vaddr / HOT_GRANULE_SIZE; g <= last / HOT_GRANULE_SIZE; ++g) {
+			if (((hot_granules[g / 64].load(std::memory_order_acquire) >> (g % 64)) & 1u) != 0) return true;
+		}
+		return false;
+	}
+
+	PageState* FindPage(uint64_t page, Region** region) const noexcept {
+		*region = FindRegion(page);
+		return *region == nullptr ? nullptr : &(*region)->pages[(page % REGION_SIZE) / PAGE_SIZE];
+	}
+
+	void MergePendingHotPages(uint32_t now) {
+		std::vector<uint64_t> pending;
+		{
+			std::lock_guard lock(hot_pending_mutex);
+			pending.swap(hot_pending);
+		}
+		for (const auto page: pending) {
+			Region* region = nullptr;
+			bool    on     = false;
+			if (auto* state = FindPage(page, &region); state != nullptr) {
+				SpinGuard lock(region->lock);
+				on = state->hot == HOT_ON || state->hot == HOT_PROMOTING;
+			}
+			if (on && hot_pages.emplace(page, now).second) {
+				hot_runs_dirty = true;
+			} else {
+				hot_count.fetch_sub(1, std::memory_order_relaxed);
+			}
+		}
+	}
+
+	void RebuildHotRuns() {
+		hot_runs.clear();
+		for (const auto& [page, last]: hot_pages) {
+			if (!hot_runs.empty() && hot_runs.back().second == page) {
+				hot_runs.back().second = page + PAGE_SIZE;
+			} else {
+				hot_runs.emplace_back(page, page + PAGE_SIZE);
+			}
+		}
+		hot_runs_dirty = false;
+	}
+
+	void Demote(uint64_t page, bool keep_protection) {
+		Region* region = nullptr;
+		auto*   state  = FindPage(page, &region);
+		if (state == nullptr) return;
+		SpinGuard lock(region->lock);
+		if (state->hot != HOT_ON && state->hot != HOT_PROMOTING) return;
+		state->hot          = HOT_COLD;
+		state->write_faults = 0;
+		if (keep_protection && state->WriteProtected() && state->access_watchers == 0) {
+			Protect(page, PAGE_SIZE, Common::VirtualMemory::Mode::Read);
+		}
+	}
+
+	void LogHotSummary(uint64_t now_ns) {
+		auto last = hot_last_line.load(std::memory_order_relaxed);
+		if (last == 0) {
+			hot_last_line.compare_exchange_strong(last, now_ns, std::memory_order_relaxed);
+			return;
+		}
+		if (now_ns - last < 10'000'000'000 ||
+		    !hot_last_line.compare_exchange_strong(last, now_ns, std::memory_order_relaxed)) {
+			return;
+		}
+		const auto take = [](std::atomic<uint64_t>& value) { return value.exchange(0, std::memory_order_relaxed); };
+		const auto faults    = take(guest_write_faults);
+		const auto read_only = take(protects[0]);
+		const auto writable  = take(protects[1]);
+		const auto no_access = take(protects[2]);
+		const auto other     = take(protects[3]);
+		const auto scans     = take(hot_scans);
+		const auto scoped    = take(hot_scoped_scans);
+		const auto scan_ns   = take(hot_scan_ns);
+		const auto collected = take(hot_collected);
+		const auto promoted  = take(hot_promoted);
+		const auto idle      = take(hot_idle);
+		const auto lost      = take(hot_lost);
+		const auto refused   = take(hot_refused);
+		char       line[896];
+		std::snprintf(line, sizeof(line),
+		              "[kyty-hot-pages] summary of the last %.0f s: %" PRIu64 " guest write faults, %" PRIu64
+		              " page protections (%" PRIu64 " read only, %" PRIu64 " writable, %" PRIu64 " no access, %" PRIu64
+		              " other); %" PRIu64 " pages watched without a fault in %" PRIu64 " runs, %" PRIu64
+		              " collections and %" PRIu64 " before GPU writes in %.3f s, %" PRIu64 " page writes collected, %" PRIu64 " pages promoted, %" PRIu64
+		              " demoted when idle, %" PRIu64 " that lost their watch, %" PRIu64 " refused\n",
+		              static_cast<double>(now_ns - last) / 1e9, faults, read_only + writable + no_access + other, read_only,
+		              writable, no_access, other, hot_page_total.load(std::memory_order_relaxed),
+		              hot_run_total.load(std::memory_order_relaxed), scans, scoped, static_cast<double>(scan_ns) / 1e9, collected,
+		              promoted, idle, lost, refused);
+		Log::WriteToConsoleAndLog(line);
+	}
+
 	std::unique_ptr<std::atomic<Region*>[]> regions;
 	std::vector<std::unique_ptr<Region>>    region_storage;
 	std::mutex                              region_mutex;
+
+	std::mutex                                  hot_mutex;
+	std::map<uint64_t, uint32_t>                hot_pages;
+	std::vector<std::pair<uint64_t, uint64_t>>  hot_runs;
+	bool                                        hot_runs_dirty = false;
+	uint32_t                                    hot_last_sweep = 0;
+	std::atomic<uint64_t>                       hot_last_line {0};
+	std::atomic<uint64_t>                       hot_scans {0};
+	std::atomic<uint64_t>                       hot_scan_ns {0};
+	std::atomic<uint64_t>                       hot_collected {0};
+	std::atomic<uint64_t>                       hot_idle {0};
+	std::atomic<uint64_t>                       hot_lost {0};
+	std::atomic<uint64_t>                       hot_page_total {0};
+	std::atomic<uint64_t>                       hot_run_total {0};
+	std::atomic<uint64_t>                       guest_write_faults {0};
+	std::array<std::atomic<uint64_t>, 4>        protects {};
+	std::mutex                                  hot_pending_mutex;
+	std::vector<uint64_t>                       hot_pending;
+	std::atomic<bool>                           hot_any {false};
+	std::unique_ptr<std::atomic<uint64_t>[]>    hot_granules =
+	    std::make_unique<std::atomic<uint64_t>[]>(ADDRESS_SIZE / HOT_GRANULE_SIZE / 64);
+	std::atomic<uint64_t>                       hot_scoped_scans {0};
+	std::atomic<uint32_t>                       hot_count {0};
+	std::atomic<uint64_t>                       hot_promoted {0};
+	std::atomic<uint64_t>                       hot_refused {0};
 };
 
 static_assert(std::atomic<void*>::is_always_lock_free);
 
-PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {}
+PageManager::PageManager(): m_impl(std::make_unique<Impl>()) {
+	(void)HotPagesEnabled();
+}
 
 PageManager::~PageManager() = default;
 
@@ -444,5 +599,165 @@ template void PageManager::UpdatePageWatchersForRegion<true, true>(uint64_t, Reg
 template void PageManager::UpdatePageWatchersForRegion<true, false>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, true>(uint64_t, RegionBits&);
 template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, RegionBits&);
+
+bool PageManager::HotPagesEnabled() noexcept {
+	static const bool enabled = [] {
+		const char* value = std::getenv("KYTY_HOT_PAGE_WRITE_WATCH");
+		if (value != nullptr && value[0] == '0') return false;
+		return HotWriteWatch::Get().Available();
+	}();
+	return enabled;
+}
+
+void PageManager::NoteWriteFault(uint64_t vaddr) {
+	auto& impl = *m_impl;
+	impl.guest_write_faults.fetch_add(1, std::memory_order_relaxed);
+	if (!HotPagesEnabled() || !GuestRange {vaddr, 1}.Valid()) return;
+	const auto page   = Common::AlignDown(vaddr, PAGE_SIZE);
+	const auto window = static_cast<uint8_t>(Common::SteadyNs() / HOT_WINDOW_NS);
+	Impl::Region* region = nullptr;
+	auto*         state  = impl.FindPage(page, &region);
+	if (state == nullptr) return;
+	{
+		SpinGuard lock(region->lock);
+		if (state->hot != HOT_COLD || state->access_watchers != 0) return;
+		if (state->fault_window != window) {
+			state->fault_window = window;
+			state->write_faults = 0;
+		}
+		if (++state->write_faults < HOT_FAULTS) return;
+		state->write_faults = 0;
+		if (impl.hot_count.load(std::memory_order_relaxed) >= HOT_PAGE_CAP) return;
+		state->hot = HOT_PROMOTING;
+	}
+	if (!HotWriteWatch::Get().Watch(page, page + PAGE_SIZE)) {
+		SpinGuard lock(region->lock);
+		if (state->hot == HOT_PROMOTING) state->hot = HOT_REFUSED;
+		impl.hot_refused.fetch_add(1, std::memory_order_relaxed);
+		return;
+	}
+	impl.hot_count.fetch_add(1, std::memory_order_relaxed);
+	impl.MarkHotGranule(page);
+	{
+		std::lock_guard lock(impl.hot_pending_mutex);
+		impl.hot_pending.push_back(page);
+	}
+	impl.hot_promoted.fetch_add(1, std::memory_order_relaxed);
+	impl.hot_any.store(true, std::memory_order_release);
+	SpinGuard lock(region->lock);
+	if (state->hot != HOT_PROMOTING) return;
+	state->hot = HOT_ON;
+	if (state->write_watchers != 0 && state->access_watchers == 0) {
+		impl.Protect(page, PAGE_SIZE, Common::VirtualMemory::Mode::ReadWrite);
+	}
+}
+
+void PageManager::CollectHotPageWrites(HotPageWritten written, void* context, uint64_t vaddr, uint64_t size) {
+	auto&      impl   = *m_impl;
+	const bool scoped = size != 0;
+	if (!scoped) impl.LogHotSummary(Common::SteadyNs());
+	if (!impl.hot_any.load(std::memory_order_acquire)) return;
+	if (scoped && (vaddr > UINT64_MAX - size || !impl.MayHaveHotPages(vaddr, size))) return;
+	std::vector<uint64_t> reported;
+	std::vector<uint64_t> lost;
+	std::vector<uint64_t> idle;
+	const auto  started = Common::SteadyNs();
+	const auto  now     = static_cast<uint32_t>(started / 1'000'000'000);
+	const auto& watch   = HotWriteWatch::Get();
+	const auto  push    = [](void* pages, uint64_t begin, uint64_t end) {
+		for (auto page = begin; page < end; page += PAGE_SIZE) static_cast<std::vector<uint64_t>*>(pages)->push_back(page);
+	};
+	const auto collect = [&](uint64_t begin, uint64_t end) {
+		const auto before = reported.size();
+		if (!watch.Collect(begin, end, push, &reported)) {
+			reported.resize(before);
+			push(&lost, begin, end);
+		}
+	};
+	{
+		std::lock_guard lock(impl.hot_mutex);
+		impl.MergePendingHotPages(now);
+		if (scoped) {
+			const auto end   = vaddr + size;
+			uint64_t   first = 0;
+			uint64_t   last  = 0;
+			for (auto it = impl.hot_pages.lower_bound(Common::AlignDown(vaddr, PAGE_SIZE));
+			     it != impl.hot_pages.end() && it->first < end; ++it) {
+				if (last != it->first) {
+					if (last != first) collect(first, last);
+					first = it->first;
+				}
+				last = it->first + PAGE_SIZE;
+			}
+			if (last != first) collect(first, last);
+		} else {
+			if (impl.hot_runs_dirty) impl.RebuildHotRuns();
+			for (const auto& [begin, end]: impl.hot_runs) collect(begin, end);
+		}
+		for (const auto page: reported) {
+			if (auto it = impl.hot_pages.find(page); it != impl.hot_pages.end()) it->second = now;
+		}
+		if (!scoped && now != impl.hot_last_sweep) {
+			impl.hot_last_sweep = now;
+			for (const auto& [page, last]: impl.hot_pages) {
+				if (now - last >= HOT_IDLE_SECONDS && idle.size() < HOT_IDLE_PER_SWEEP) idle.push_back(page);
+			}
+		}
+		for (const auto* pages: {&lost, &idle}) {
+			for (const auto page: *pages) impl.hot_pages.erase(page);
+			impl.hot_runs_dirty |= !pages->empty();
+			impl.hot_count.fetch_sub(static_cast<uint32_t>(pages->size()), std::memory_order_relaxed);
+		}
+		impl.hot_any.store(!impl.hot_pages.empty() || impl.hot_count.load(std::memory_order_relaxed) != 0,
+		                   std::memory_order_release);
+		impl.hot_page_total.store(impl.hot_pages.size(), std::memory_order_relaxed);
+		if (!scoped) impl.hot_run_total.store(impl.hot_runs.size(), std::memory_order_relaxed);
+		impl.hot_lost.fetch_add(lost.size(), std::memory_order_relaxed);
+		impl.hot_idle.fetch_add(idle.size(), std::memory_order_relaxed);
+		impl.hot_collected.fetch_add(reported.size() + lost.size(), std::memory_order_relaxed);
+		(scoped ? impl.hot_scoped_scans : impl.hot_scans).fetch_add(1, std::memory_order_relaxed);
+		impl.hot_scan_ns.fetch_add(Common::SteadyNs() - started, std::memory_order_relaxed);
+	}
+	for (const auto page: lost) {
+		impl.Demote(page, true);
+		watch.Unwatch(page, page + PAGE_SIZE);
+		reported.push_back(page);
+	}
+	for (const auto page: idle) {
+		impl.Demote(page, true);
+		if (!watch.Collect(page, page + PAGE_SIZE, push, &reported)) reported.push_back(page);
+		watch.Unwatch(page, page + PAGE_SIZE);
+	}
+	for (const auto page: reported) written(context, page);
+}
+
+bool PageManager::HasHotPages() const noexcept {
+	return m_impl->hot_any.load(std::memory_order_acquire);
+}
+
+void PageManager::ForgetHotPages(uint64_t vaddr, uint64_t size) {
+	auto& impl = *m_impl;
+	if (!impl.hot_any.load(std::memory_order_acquire) || size == 0 || vaddr > UINT64_MAX - size) return;
+	std::vector<uint64_t> pages;
+	{
+		std::lock_guard lock(impl.hot_mutex);
+		impl.MergePendingHotPages(static_cast<uint32_t>(Common::SteadyNs() / 1'000'000'000));
+		for (auto it = impl.hot_pages.lower_bound(Common::AlignDown(vaddr, PAGE_SIZE));
+		     it != impl.hot_pages.end() && it->first < vaddr + size;) {
+			pages.push_back(it->first);
+			it = impl.hot_pages.erase(it);
+		}
+		if (pages.empty()) return;
+		impl.hot_runs_dirty = true;
+		impl.hot_count.fetch_sub(static_cast<uint32_t>(pages.size()), std::memory_order_relaxed);
+		impl.hot_any.store(!impl.hot_pages.empty() || impl.hot_count.load(std::memory_order_relaxed) != 0,
+		                   std::memory_order_release);
+	}
+	const auto& watch = HotWriteWatch::Get();
+	for (const auto page: pages) {
+		impl.Demote(page, false);
+		watch.Unwatch(page, page + PAGE_SIZE);
+	}
+}
 
 }

@@ -83,6 +83,7 @@ public:
 		}
 	}
 	[[nodiscard]] bool WriteAroundGpuWrites(void* destination, const void* data, uint64_t size);
+	void               CollectHotPageWrites(uint64_t vaddr = 0, uint64_t size = 0);
 	[[nodiscard]] bool InvalidateMemory(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] bool InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
 	void               MappedRanges(uint64_t vaddr, uint64_t size, RangeSet& out) const;

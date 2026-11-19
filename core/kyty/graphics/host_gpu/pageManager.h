@@ -37,6 +37,13 @@ public:
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 
+	using HotPageWritten = void (*)(void* context, uint64_t page);
+	[[nodiscard]] static bool HotPagesEnabled() noexcept;
+	[[nodiscard]] bool        HasHotPages() const noexcept;
+	void NoteWriteFault(uint64_t vaddr);
+	void CollectHotPageWrites(HotPageWritten written, void* context, uint64_t vaddr = 0, uint64_t size = 0);
+	void ForgetHotPages(uint64_t vaddr, uint64_t size);
+
 private:
 	struct Impl;
 	std::unique_ptr<Impl> m_impl;

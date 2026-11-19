@@ -2532,6 +2532,9 @@ ImageId TextureCache::FindImageFromRange(uint64_t address, uint64_t size, bool e
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
+	if (desc.type == BindingType::Storage) {
+		CollectHotPagesOf(id);
+	}
 	std::scoped_lock lock {m_lock};
 	if (m_slot_images[id].is_depth_copy && desc.type == BindingType::Texture) {
 		RefreshDepthCopy(id);
@@ -2577,6 +2580,7 @@ vk::ImageView TextureCache::FindTexture(ImageId id, const ImageDesc& desc) {
 }
 
 vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) {
+	CollectHotPagesOf(id);
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -2594,6 +2598,7 @@ vk::ImageView TextureCache::FindRenderTarget(ImageId id, const ImageDesc& desc) 
 }
 
 vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, ImageId* stencil) {
+	CollectHotPagesOf(id);
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id || image.binding.needs_rebind) {
@@ -2634,7 +2639,29 @@ vk::ImageView TextureCache::FindDepthTarget(ImageId id, const ImageDesc& desc, I
 	return image.FindView(desc.view_info);
 }
 
+void TextureCache::CollectHotPagesOf(ImageId id) {
+	if (!m_page_manager.HasHotPages()) {
+		return;
+	}
+	uint64_t begin = 0;
+	uint64_t end   = 0;
+	{
+		std::scoped_lock lock {m_lock};
+		const auto&      info = m_slot_images[id].info;
+		begin                 = info.data.address;
+		end                   = info.data.End();
+		if (info.HasStencil()) {
+			begin = std::min(begin, info.stencil.address);
+			end   = std::max(end, info.stencil.End());
+		}
+	}
+	if (end > begin) {
+		m_scheduler.Context().CollectHotPageWrites(begin, end - begin);
+	}
+}
+
 void TextureCache::MarkGpuWritten(ImageId id) {
+	CollectHotPagesOf(id);
 	std::scoped_lock lock {m_lock};
 	auto&            image = m_slot_images[id];
 	if (!image.registered || image.depth_id) {

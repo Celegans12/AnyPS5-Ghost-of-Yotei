@@ -168,6 +168,9 @@ void GuestGpu::SendCommand(Common::UniqueFunction<void>&& command) {
 
 void GuestGpu::ProcessCommands() {
 	EXIT_IF(!IsGpuThread() && !g_cp_thread);
+	if (m_pending_commands.load(std::memory_order_acquire) != 0) {
+		m_renderer.CollectHotPageWrites();
+	}
 	while (m_pending_commands.load(std::memory_order_acquire) != 0) {
 		Common::UniqueFunction<void> command;
 		{
@@ -1098,7 +1101,9 @@ void CommandProcessor::WaitRegMem(uint32_t func, const T* addr, T ref, T mask, u
 	}
 
 	m_wait_since_operation = true;
-	if (!TestWaitRegMemValue(ReadDecisionValue<T>(addr), ref, mask, func)) {
+	if (TestWaitRegMemValue(ReadDecisionValue<T>(addr), ref, mask, func)) {
+		m_renderer.CollectHotPageWrites();
+	} else {
 		if (g_gpu_state != nullptr) {
 #if defined(ANYPS5_KYTY)
 			g_gpu_state->NoteBlockedWait(reinterpret_cast<uint64_t>(addr), sizeof(T), ref, mask,
@@ -1139,6 +1144,7 @@ void CommandProcessor::MemSemaphore(uint64_t* counter, bool signal, bool write) 
 		SuspendPm4();
 	} else {
 		(*counter)--;
+		m_renderer.CollectHotPageWrites();
 	}
 }
 
@@ -1680,6 +1686,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	execution.m_suspended     = false;
 	execution.m_yield         = false;
 	execution.m_made_progress = false;
+	m_renderer.CollectHotPageWrites();
 
 	struct ExecutionScope {
 		explicit ExecutionScope(Pm4Execution& execution) { g_current_execution = &execution; }
@@ -3213,6 +3220,7 @@ void CommandProcessor::PrepareCpuFlip(uint64_t request_id) {
 	if (g_current_processor != nullptr) {
 		EXIT("invalid graphics-thread CPU flip preparation\n");
 	}
+	m_renderer.CollectHotPageWrites();
 	EmitCallback([this, request_id] {
 		struct ProcessorScope {
 			explicit ProcessorScope(CommandProcessor& processor) {

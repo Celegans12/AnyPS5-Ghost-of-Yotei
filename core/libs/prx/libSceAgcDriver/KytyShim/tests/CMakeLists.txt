@@ -100,4 +100,12 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64
     target_include_directories(kyty_shim_fault_replay_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
     add_test(NAME kyty_shim_fault_replay COMMAND kyty_shim_fault_replay_tests)
     set_tests_properties(kyty_shim_fault_replay PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_fault_replay: ok")
+
+    add_test_executable(kyty_shim_hot_write_watch_tests ${CMAKE_CURRENT_SOURCE_DIR}/HotWriteWatch.cpp
+            ${CMAKE_SOURCE_DIR}/core/kyty/graphics/host_gpu/hotWriteWatch.cpp)
+    configure_host_test_executable(kyty_shim_hot_write_watch_tests)
+    target_include_directories(kyty_shim_hot_write_watch_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/kyty)
+    add_test(NAME kyty_shim_hot_write_watch COMMAND kyty_shim_hot_write_watch_tests)
+    set_tests_properties(kyty_shim_hot_write_watch PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77
+            PASS_REGULAR_EXPRESSION "kyty_shim_hot_write_watch: ok")
 endif()
