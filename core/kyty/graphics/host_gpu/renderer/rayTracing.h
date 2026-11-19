@@ -259,6 +259,12 @@ private:
 		uint64_t                frame       = 0;
 		uint64_t                shader_hash = 0;
 		uint64_t                preparation = 0;
+		bool                    forced      = false;
+	};
+	struct IncompleteRun {
+		uint32_t count  = 0;
+		bool     forced = false;
+		bool     noted  = false;
 	};
 
 	void CreatePipelines();
@@ -349,6 +355,7 @@ private:
 	uint64_t                  m_last_scan_prepare = 0;
 	std::unordered_map<uint32_t, uint32_t> m_last_instance_counts;
 	std::unordered_map<uint32_t, uint32_t> m_instance_floors;
+	std::unordered_map<uint32_t, IncompleteRun> m_incomplete;
 	std::unordered_set<uint32_t>           m_cpu_counted_sources;
 	std::array<std::pair<uint64_t, GuestTlas>, 8> m_guest_tlases {};
 	uint32_t                                      m_guest_tlas_next = 0;

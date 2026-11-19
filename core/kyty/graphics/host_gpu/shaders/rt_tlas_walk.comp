@@ -354,6 +354,8 @@ void main() {
 						const uint v = atomicAdd(state.verify_count, 1u);
 						U32Ref(pc.verify_list + uint64_t(v) * 4).v = slot;
 					}
+				} else {
+					atomicAdd(state.unknown_blas, 1u);
 				}
 			}
 			if (psr && reference == 0) {
@@ -430,6 +432,7 @@ void main() {
 	memoryBarrierBuffer();
 	barrier();
 	if (lid == 0) {
+		const bool complete = state.unknown_blas == 0u && (state.overflow & (1u | 2u | kUnmapped)) == 0u;
 		const uint missing = min(state.missing_count, kMissingCapacity);
 		state.dispatch_x   = missing;
 		state.dispatch_y   = 1;
@@ -445,7 +448,9 @@ void main() {
 			context.slots          = pc.slots;
 			context.instance_count = psr ? state.instance_count : count;
 			context.instance_base  = instance_base;
-			context.valid          = pc.tlas_address != 0 && (!psr || s_exact != 0) ? 1u : 0u;
+			context.valid          = pc.tlas_address != 0 && (!psr || s_exact != 0) && (complete || (pc.verify & 8u) != 0u)
+			                             ? 1u
+			                             : 0u;
 			context.root           = pc.root;
 			context.served         = 0;
 			context.returned       = 0;
