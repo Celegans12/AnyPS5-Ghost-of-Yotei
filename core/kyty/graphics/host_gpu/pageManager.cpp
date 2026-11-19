@@ -613,7 +613,7 @@ template void PageManager::UpdatePageWatchersForRegion<false, false>(uint64_t, R
 bool PageManager::HotPagesEnabled() noexcept {
 	static const bool enabled = [] {
 		const char* value = std::getenv("KYTY_HOT_PAGE_WRITE_WATCH");
-		if (value != nullptr && value[0] == '0') return false;
+		if (value == nullptr || value[0] != '1') return false;
 		return HotWriteWatch::Get().Available();
 	}();
 	return enabled;
