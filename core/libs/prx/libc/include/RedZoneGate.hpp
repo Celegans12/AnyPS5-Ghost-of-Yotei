@@ -249,6 +249,14 @@ inline bool InUnframedRange(std::uintptr_t address, Range* found = nullptr) {
     return false;
 }
 
+inline std::uintptr_t FaultSite(const EXCEPTION_POINTERS* info) {
+    if (info == nullptr || info->ExceptionRecord == nullptr || info->ContextRecord == nullptr) return 0;
+    const auto code = info->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION && code != STATUS_GUARD_PAGE_VIOLATION && code != EXCEPTION_SINGLE_STEP) return 0;
+    const auto rip = static_cast<std::uintptr_t>(info->ContextRecord->Rip);
+    return InUnframedRange(rip) ? rip : 0;
+}
+
 }
 #endif
 

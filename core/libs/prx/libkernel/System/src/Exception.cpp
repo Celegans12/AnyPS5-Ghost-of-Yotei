@@ -631,7 +631,11 @@ QueuedDelivery* ClaimReturnBreak(ReturnBreak& entry, QueuedDelivery* queued) {
 }
 
 LONG CALLBACK ReturnBreakHandler(EXCEPTION_POINTERS* info) {
-    if (GuestArena::GuestArenaRecoverRead_nid_no_patch(info)) return EXCEPTION_CONTINUE_EXECUTION;
+    const auto unframedSite = LibcUnframedFaultSite_nid_no_patch(info);
+    if (GuestArena::GuestArenaRecoverRead_nid_no_patch(info)) {
+        LibcRefuseUnframedFault_nid_no_patch(unframedSite);
+        return EXCEPTION_CONTINUE_EXECUTION;
+    }
     auto* context = info->ContextRecord;
     if (info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && *UnwindGuard() != nullptr) {
         context->Rsp = (context->Rsp & ~static_cast<DWORD64>(15)) - 8;

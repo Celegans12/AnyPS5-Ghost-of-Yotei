@@ -365,9 +365,8 @@ bool HandleSse4a(EXCEPTION_POINTERS* info) {
     return true;
 }
 
-void RefuseUnframedFault(const EXCEPTION_POINTERS* info) {
+void RefuseUnframedFault(const std::uintptr_t rip) {
     RedZoneGate::Range range;
-    const auto rip = static_cast<std::uintptr_t>(info->ContextRecord->Rip);
     if (!RedZoneGate::InUnframedRange(rip, &range)) return;
     if (RedZoneGate::Overridden()) {
         static std::atomic<bool> told{false};
@@ -381,9 +380,9 @@ void RefuseUnframedFault(const EXCEPTION_POINTERS* info) {
 
 LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
     static std::atomic<bool> reported{false};
-    const bool unframedSite = info->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION || info->ExceptionRecord->ExceptionCode == STATUS_GUARD_PAGE_VIOLATION || info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP ? RedZoneGate::InUnframedRange(static_cast<std::uintptr_t>(info->ContextRecord->Rip)) : false;
+    const auto unframedSite = RedZoneGate::FaultSite(info);
     const auto served = [&](const bool handled) {
-        if (handled && unframedSite) RefuseUnframedFault(info);
+        if (handled && unframedSite != 0) RefuseUnframedFault(unframedSite);
         return handled;
     };
 #if defined(ANYPS5_KYTY)
@@ -740,5 +739,13 @@ const bool g_crashReportInstalled = [] {
 
 extern "C" void LibcSetHostFaultHandler_nid_no_patch(LibcHostFaultHandler handler) noexcept {
     g_hostFaultHandler.store(handler, std::memory_order_release);
+}
+
+extern "C" std::uintptr_t LibcUnframedFaultSite_nid_no_patch(const void* exceptionPointers) noexcept {
+    return RedZoneGate::FaultSite(static_cast<const EXCEPTION_POINTERS*>(exceptionPointers));
+}
+
+extern "C" void LibcRefuseUnframedFault_nid_no_patch(const std::uintptr_t site) noexcept {
+    if (site != 0) RefuseUnframedFault(site);
 }
 #endif

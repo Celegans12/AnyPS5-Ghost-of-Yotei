@@ -1,6 +1,7 @@
 #define NOMINMAX
 #include "prx/libc/include/WindowsMappings.hpp"
 #include "prx/libc/include/WindowsPageTrack.hpp"
+#include "prx/libc/include/HostFault.hpp"
 #include "prx/libc/include/RedZoneGate.hpp"
 #include <array>
 #include <cstdint>
@@ -144,6 +145,48 @@ void CheckRanges() {
     Require(RedZoneGate::Open());
 }
 
+void CheckFaultSite() {
+    static const auto image = RangesImage({{0x200, 0x240}, {0x300, 0x310}});
+    RedZoneGate::Note(GuestPath, Length(GuestPath), image.data(), image.size());
+    const auto base = reinterpret_cast<std::uintptr_t>(image.data());
+    alignas(16) CONTEXT context{};
+    EXCEPTION_RECORD record{};
+    EXCEPTION_POINTERS pointers{&record, &context};
+    context.Rip = base + 0x210;
+    for (const DWORD code : {static_cast<DWORD>(EXCEPTION_ACCESS_VIOLATION), static_cast<DWORD>(STATUS_GUARD_PAGE_VIOLATION), static_cast<DWORD>(EXCEPTION_SINGLE_STEP)}) {
+        record.ExceptionCode = code;
+        Require(RedZoneGate::FaultSite(&pointers) == base + 0x210);
+    }
+    for (const DWORD code : {static_cast<DWORD>(EXCEPTION_BREAKPOINT), static_cast<DWORD>(EXCEPTION_INT_DIVIDE_BY_ZERO), static_cast<DWORD>(EXCEPTION_ILLEGAL_INSTRUCTION)}) {
+        record.ExceptionCode = code;
+        Require(RedZoneGate::FaultSite(&pointers) == 0);
+    }
+    record.ExceptionCode = EXCEPTION_ACCESS_VIOLATION;
+    context.Rip = base + 0x240;
+    Require(RedZoneGate::FaultSite(&pointers) == 0);
+    context.Rip = base + 0x1ff;
+    Require(RedZoneGate::FaultSite(&pointers) == 0);
+    context.Rip = base + 0x30f;
+    Require(RedZoneGate::FaultSite(&pointers) == base + 0x30f);
+    context.Rip = 0;
+    Require(RedZoneGate::FaultSite(&pointers) == 0);
+    Require(RedZoneGate::FaultSite(nullptr) == 0);
+    EXCEPTION_POINTERS partial{&record, nullptr};
+    Require(RedZoneGate::FaultSite(&partial) == 0);
+    partial = {nullptr, &context};
+    Require(RedZoneGate::FaultSite(&partial) == 0);
+
+    context.Rip = base + 0x2f0;
+    Require(RedZoneGate::FaultSite(&pointers) == 0);
+    context.Rip = base + 0x23f;
+    const auto before = RedZoneGate::FaultSite(&pointers);
+    Require(before == base + 0x23f);
+    context.Rip = base + 0x240;
+    Require(RedZoneGate::FaultSite(&pointers) == 0);
+    Require(LibcUnframedFaultSite_nid_no_patch(nullptr) == 0);
+    LibcRefuseUnframedFault_nid_no_patch(0);
+}
+
 void CheckGate() {
     auto& mappings = Mappings::Get();
     auto& track = Track::Get();
@@ -209,6 +252,7 @@ int main() {
     try {
         CheckClassification();
         CheckRanges();
+        CheckFaultSite();
         CheckGate();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "%s\n", error.what());
