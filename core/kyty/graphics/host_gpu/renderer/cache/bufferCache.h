@@ -404,6 +404,9 @@ private:
 	std::array<GpuLineRange, GpuLineRanges>       m_gpu_line_current_ranges {};
 	std::array<GpuLineRange, GpuLineRanges>       m_gpu_line_ever_ranges {};
 	std::atomic<bool>                             m_gpu_line_overflow {false};
+	static constexpr size_t                       GpuLineMemo = 8;
+	std::array<GpuLineRange, GpuLineMemo>         m_gpu_line_memo {};
+	size_t                                        m_gpu_line_memo_next = 0;
 	void NoteGpuLines(uint64_t vaddr, uint64_t size) noexcept;
 	void ForgetCurrentGpuLines(uint64_t vaddr, uint64_t size) noexcept;
 	void UnmarkGpuModified(uint64_t vaddr, uint64_t size);

@@ -2424,6 +2424,8 @@ namespace {
 constexpr uint64_t GpuLinePageBits = 12;
 constexpr uint64_t GpuLineBits     = 6;
 constexpr uint64_t GpuLineMaxPages = uint64_t {1} << 16u;
+constexpr uint64_t GpuLineMemoPages = 256;
+constexpr uint64_t GpuLineChunk     = 512;
 
 uint64_t GpuLineMask(uint64_t page, uint64_t vaddr, uint64_t size) {
 	const auto base  = page << GpuLinePageBits;
@@ -2468,6 +2470,14 @@ void BufferCache::NoteGpuLines(uint64_t vaddr, uint64_t size) noexcept {
 		}
 		return;
 	}
+	const bool memo = last - first >= GpuLineMemoPages;
+	if (memo) {
+		for (const auto& range: m_gpu_line_memo) {
+			if (range.begin.load(std::memory_order_relaxed) <= vaddr && vaddr + size <= range.end.load(std::memory_order_relaxed)) {
+				return;
+			}
+		}
+	}
 	for (auto page = first; page <= last; page++) {
 		const auto mask   = GpuLineMask(page, vaddr, size);
 		const auto key    = page + 1;
@@ -2490,6 +2500,12 @@ void BufferCache::NoteGpuLines(uint64_t vaddr, uint64_t size) noexcept {
 			return;
 		}
 	}
+	if (memo) {
+		auto& range = m_gpu_line_memo[m_gpu_line_memo_next++ % GpuLineMemo];
+		range.end.store(0, std::memory_order_relaxed);
+		range.begin.store(vaddr, std::memory_order_relaxed);
+		range.end.store(vaddr + size, std::memory_order_release);
+	}
 }
 
 void BufferCache::ForgetCurrentGpuLines(uint64_t vaddr, uint64_t size) noexcept {
@@ -2497,6 +2513,11 @@ void BufferCache::ForgetCurrentGpuLines(uint64_t vaddr, uint64_t size) noexcept 
 		return;
 	}
 	const auto end = vaddr + size;
+	for (auto& range: m_gpu_line_memo) {
+		if (vaddr < range.end.load(std::memory_order_relaxed) && range.begin.load(std::memory_order_relaxed) < end) {
+			range.end.store(0, std::memory_order_release);
+		}
+	}
 	for (auto& range: m_gpu_line_current_ranges) {
 		const auto range_end   = range.end.load(std::memory_order_relaxed);
 		const auto range_begin = range.begin.load(std::memory_order_relaxed);
@@ -2510,22 +2531,45 @@ void BufferCache::ForgetCurrentGpuLines(uint64_t vaddr, uint64_t size) noexcept 
 	if (last - first >= GpuLineMaxPages) {
 		return;
 	}
-	for (auto page = first; page <= last; page++) {
-		const auto key = page + 1;
-		for (size_t probe = 0; probe < GpuLineProbes; probe++) {
-			auto&      slot    = m_gpu_line_slots[(GpuLineHash(page) + probe) % GpuLineSlots];
-			const auto current = slot.page.load(std::memory_order_acquire);
-			if (current == key) {
-				const auto base = page << GpuLinePageBits;
-				uint64_t   kept = 0;
-				m_gpu_modified_ranges.ForEachInRange(base, uint64_t {1} << GpuLinePageBits, [&](uint64_t from, uint64_t to) {
-					kept |= GpuLineMask(page, from, to - from);
-				});
-				slot.current.store(kept, std::memory_order_release);
-				break;
+	std::array<GpuLineSlot*, GpuLineChunk> slots {};
+	std::array<uint64_t, GpuLineChunk>     kept {};
+	for (auto chunk = first; chunk <= last; chunk += GpuLineChunk) {
+		const auto chunk_last = std::min(last, chunk + GpuLineChunk - 1);
+		bool       any        = false;
+		for (auto page = chunk; page <= chunk_last; page++) {
+			auto&      found = slots[page - chunk];
+			const auto key   = page + 1;
+			found            = nullptr;
+			for (size_t probe = 0; probe < GpuLineProbes; probe++) {
+				auto&      slot    = m_gpu_line_slots[(GpuLineHash(page) + probe) % GpuLineSlots];
+				const auto current = slot.page.load(std::memory_order_acquire);
+				if (current == key) {
+					if (slot.current.load(std::memory_order_relaxed) != 0) {
+						found = &slot;
+						any   = true;
+					}
+					break;
+				}
+				if (current == 0) {
+					break;
+				}
 			}
-			if (current == 0) {
-				break;
+		}
+		if (!any) {
+			continue;
+		}
+		std::fill_n(kept.begin(), chunk_last - chunk + 1, 0);
+		const auto base = chunk << GpuLinePageBits;
+		m_gpu_modified_ranges.ForEachInRange(base, (chunk_last - chunk + 1) << GpuLinePageBits, [&](uint64_t from, uint64_t to) {
+			const auto from_page = std::max(from >> GpuLinePageBits, chunk);
+			const auto to_page   = std::min((to - 1) >> GpuLinePageBits, chunk_last);
+			for (auto page = from_page; page <= to_page; page++) {
+				kept[page - chunk] |= GpuLineMask(page, from, to - from);
+			}
+		});
+		for (auto page = chunk; page <= chunk_last; page++) {
+			if (auto* slot = slots[page - chunk]; slot != nullptr) {
+				slot->current.store(kept[page - chunk], std::memory_order_release);
 			}
 		}
 	}
