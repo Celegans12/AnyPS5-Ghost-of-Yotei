@@ -1391,6 +1391,84 @@ bool MaterializeImageTable(const ResourcePlan& program,
 	return true;
 }
 
+bool SamplerSkipsDegamma(const ResourcePlan& program, const ResourceSnapshot& snapshot,
+                         uint32_t image_index) {
+	return std::ranges::any_of(program.info.sampled_pairs, [&](const auto& pair) {
+		return pair.image == image_index && pair.sampler < snapshot.samplers.size() &&
+		       (snapshot.samplers[pair.sampler].dwords[0] >> 31u) != 0u;
+	});
+}
+
+#if defined(ANYPS5_KYTY)
+bool MaterializeImageTableHeap(const ResourcePlan& program,
+                               const DescriptorSource::IndirectDescriptor& indirect,
+                               const DescriptorValue& table_value, uint32_t image_index,
+                               const SrtRuntime& runtime, ResourceSnapshot& snapshot,
+                               ResourceSpecialization& specialization) {
+	const auto&          root = program.info.images[image_index];
+	ShaderBufferResource table;
+	if (!runtime.image_table_heap || root.resource_class != ImageResourceClass::Sampled ||
+	    root.mip_mode == ImageMipMode::Dynamic ||
+	    table_value.dword_count != 4u ||
+	    !DecodeBufferDescriptor(table_value, table) || (indirect.table_offset & 31u) != 0u) {
+		return false;
+	}
+	const auto base    = table.Base48();
+	const auto size    = table.GetSize();
+	const auto entries = std::min<uint64_t>(
+	    {size > indirect.table_offset ? (size - indirect.table_offset) / 32u : 0u,
+	     uint64_t {indirect.table_mask >> 5u} + 1u, MaxIndirectDescriptorProbes});
+	if (entries == 0u) {
+		return false;
+	}
+	const auto profile = ImageTableHeapProfile(root, SamplerSkipsDegamma(program, snapshot, image_index));
+	ImageHeapView   view;
+	DescriptorValue exemplar {.dword_count = 8u};
+	if (runtime.image_heap != nullptr) {
+		if (!runtime.image_heap->Acquire({.base  = base,
+		                                  .size  = size,
+		                                  .step  = 32u,
+		                                  .first = indirect.table_offset,
+		                                  .count = entries,
+		                                  .root  = &profile,
+		                                  .table = true},
+		                                 view) ||
+		    view.kinds.size() != 1u || !ImageTableHeapExemplar(profile, view.kinds[0])) {
+			return false;
+		}
+		exemplar = view.kinds[0];
+	} else {
+		static thread_local std::vector<uint32_t> words;
+		words.resize(static_cast<size_t>(entries) * 8u);
+		if (!ReadScalarTable(base, size, indirect.table_offset, runtime, words)) {
+			return false;
+		}
+		bool found = false;
+		for (size_t entry = 0; !found && entry < entries; ++entry) {
+			std::copy_n(words.begin() + static_cast<std::ptrdiff_t>(entry * 8u), root.r128 ? 4u : 8u,
+			            exemplar.dwords.begin());
+			found = ImageTableSlotCompatible(profile, exemplar) && ImageTableHeapExemplar(profile, exemplar);
+		}
+		if (!found) {
+			return false;
+		}
+		view.slot_count = static_cast<uint32_t>((size & ~uint64_t {3}) / 4u);
+	}
+	auto heap_root                      = specialization.images[image_index];
+	heap_root.indirect_root             = image_index;
+	heap_root.indirect_mapping_offset   = static_cast<uint32_t>(snapshot.flattened_srt.size());
+	heap_root.heap                      = true;
+	specialization.images[image_index]  = heap_root;
+	snapshot.images[image_index]        = {.dword_count = 8u};
+	snapshot.flattened_srt.insert(snapshot.flattened_srt.end(),
+	                              {view.slot_count, static_cast<uint32_t>(view.slots),
+	                               static_cast<uint32_t>(view.slots >> 32u)});
+	snapshot.images.push_back(exemplar);
+	specialization.images.push_back(heap_root);
+	return true;
+}
+#endif
+
 }
 
 bool ImageTableSlotCompatible(const ImageResource& root, const DescriptorValue& descriptor) {
@@ -1526,11 +1604,12 @@ static bool BuildResourceSpecialization(const ResourcePlan& program, ResourceSna
 		    static_cast<Prospero::TileMode>((descriptor.dwords[3] >> 20u) & 0x1fu) ==
 		        Prospero::TileMode::kDepth;
 		image.conversion_format = depth_bits ? format : ImageConversionFormat(format);
-		image.skip_degamma = Prospero::IsSrgbFormat(format) &&
-		    std::ranges::any_of(program.info.sampled_pairs, [&](const auto& pair) {
-			    return pair.image == base_index && pair.sampler < snapshot.samplers.size() &&
-			           (snapshot.samplers[pair.sampler].dwords[0] >> 31u) != 0u;
-		    });
+		const auto* base_source = Source(program, base.source);
+		const bool  table_heap  = image.heap && base_source != nullptr &&
+		                         base_source->indirect_descriptor.has_value() &&
+		                         base_source->indirect_descriptor->table_array;
+		image.skip_degamma = !table_heap && Prospero::IsSrgbFormat(format) &&
+		                     SamplerSkipsDegamma(program, snapshot, base_index);
 		if (!storage && !base.depth_compare && !image.skip_degamma &&
 		    image.indirect_root == ImageResource::NoIndirectImage &&
 		    (format == Prospero::BufferFormat::k8Srgb || format == Prospero::BufferFormat::k8_8Srgb)) {
@@ -2356,6 +2435,9 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	auto previous_tables = std::move(snapshot.image_tables);
 	snapshot.image_tables.clear();
 	std::vector<uint32_t> table_mappings;
+#if defined(ANYPS5_KYTY)
+	std::vector<uint32_t> deferred_tables;
+#endif
 	for (uint32_t i = 0; i < program.info.images.size(); ++i) {
 		const auto& image = program.info.images[i];
 		specialization.images[i] = {
@@ -2384,12 +2466,16 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 			const auto& indirect = *source->indirect_descriptor;
 			if (indirect.table_array) {
+#if defined(ANYPS5_KYTY)
+				deferred_tables.push_back(i);
+#else
 				DescriptorValue table;
 				if (!WalkedDescriptor(program, indirect.table_source, table) ||
 				    !MaterializeImageTable(program, indirect, table, i, observed, snapshot,
 				                           specialization, previous_tables, table_mappings)) {
 					return false;
 				}
+#endif
 				continue;
 			}
 			const bool bounded_table = IsBoundedDescriptorTable(program, indirect);
@@ -2449,6 +2535,20 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			}
 		}
 	}
+#if defined(ANYPS5_KYTY)
+	for (const auto i: deferred_tables) {
+		const auto&     indirect = *Source(program, program.info.images[i].source)->indirect_descriptor;
+		DescriptorValue table;
+		if (!WalkedDescriptor(program, indirect.table_source, table)) {
+			return false;
+		}
+		if (!MaterializeImageTableHeap(program, indirect, table, i, observed, snapshot, specialization) &&
+		    !MaterializeImageTable(program, indirect, table, i, observed, snapshot, specialization,
+		                           previous_tables, table_mappings)) {
+			return false;
+		}
+	}
+#endif
 	FlushRecordBlocks(snapshot.flattened_srt);
 	snapshot.user_data.assign(runtime.user_data.begin(), runtime.user_data.end());
 	return BuildResourceSpecialization(program, snapshot, specialization);
@@ -2551,6 +2651,42 @@ uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value) {
 		return 0u;
 	}
 	return 1u + static_cast<uint32_t>(numeric_class) * 2u + (DescriptorIsCube(value) ? 1u : 0u);
+}
+
+ImageResource ImageTableHeapProfile(const ImageResource& root, bool skip_degamma) {
+	ImageResource profile;
+	profile.resource_class         = ImageResourceClass::Sampled;
+	profile.read                   = true;
+	profile.heap                   = true;
+	profile.numeric_class          = Prospero::TextureNumericClass::Float;
+	profile.dimension              = root.dimension;
+	profile.mip_mode               = root.mip_mode;
+	profile.unfiltered_access_only = root.unfiltered_access_only;
+	profile.sample_access_only     = root.sample_access_only;
+	profile.depth_compare          = root.depth_compare;
+	profile.skip_degamma           = skip_degamma;
+	profile.cube                   = root.cube;
+	profile.r128                   = root.r128;
+	return profile;
+}
+
+uint32_t ImageTableHeapKind(const ImageResource& profile, DescriptorValue& value) {
+	if (!ImageTableSlotCompatible(profile, value)) {
+		value.dwords.fill(0u);
+		return 0u;
+	}
+	return 1u + static_cast<uint32_t>(profile.numeric_class) * 2u + (profile.cube ? 1u : 0u);
+}
+
+bool ImageTableHeapExemplar(const ImageResource& profile, const DescriptorValue& value) {
+	return TableExemplar(profile, value, true);
+}
+
+ImageResource ImageTableHeapResource(const ImageResource& profile, const DescriptorValue& value) {
+	auto       resource = profile;
+	const auto format = static_cast<Prospero::BufferFormat>((value.dwords[1] >> 20u) & 0x1ffu);
+	resource.skip_degamma = profile.skip_degamma && Prospero::IsSrgbFormat(format);
+	return resource;
 }
 
 ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind) {

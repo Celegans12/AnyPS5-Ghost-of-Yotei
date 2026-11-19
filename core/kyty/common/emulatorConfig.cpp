@@ -278,6 +278,10 @@ bool WaveSplitEnabled() {
 	return g_config->wave_split;
 }
 
+bool ImageTableHeapEnabled() {
+	return g_config->image_table_heap;
+}
+
 bool NativeRtEnabled() {
 	return g_config->native_rt;
 }

@@ -134,6 +134,23 @@ bool IsRecordTableSource(const EmitterState& state, uint32_t source) {
 	return indirect && indirect->pointer_table && indirect->pointer_table->buffer;
 }
 
+bool IsImageTableArraySource(const EmitterState& state, uint32_t source) {
+	if (source >= state.program.descriptor_sources.size()) return false;
+	const auto& indirect = state.program.descriptor_sources[source].indirect_descriptor;
+	return indirect && indirect->table_array;
+}
+
+uint32_t EmitImageTableHeapKey(EmitterState& state, uint32_t source, uint32_t key) {
+	const auto& indirect = *state.program.descriptor_sources.at(source).indirect_descriptor;
+	const auto  limit    = (UINT32_MAX - indirect.table_offset) >> 5u;
+	const auto  mask     = indirect.table_mask >> 5u;
+	auto        entry    = Binary(state, spv::OpBitwiseAnd, TypeU32(state), key, ConstantU32(state, mask));
+	if (mask > limit) entry = EmitUMin32(state, entry, ConstantU32(state, limit));
+	return Binary(state, spv::OpIAdd, TypeU32(state),
+	              Binary(state, spv::OpShiftLeftLogical, TypeU32(state), entry, ConstantU32(state, 5u)),
+	              ConstantU32(state, indirect.table_offset));
+}
+
 uint32_t StorageBufferPackedStride(const EmitterState& state, const IR::MemoryInfo& mem) {
 	if (mem.resource >= state.program.info.buffers.size()) {
 		ExitDescriptorBindingFailure(state, IR::DescriptorBindingKind::Buffers, mem.resource,

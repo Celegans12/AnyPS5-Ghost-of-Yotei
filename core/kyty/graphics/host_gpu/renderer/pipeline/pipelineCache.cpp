@@ -1317,6 +1317,9 @@ const ShaderModule* PipelineCache::GetProgram(const ShaderParams& params, InputI
 	    .shader_base                = params.Base(),
 	    .read_specialization_memory = ReadShaderGuestMemory,
 	    .image_heap                 = m_image_heap,
+#if defined(ANYPS5_KYTY)
+	    .image_table_heap           = Config::ImageTableHeapEnabled(),
+#endif
 	};
 	ShaderRecompiler::CompileOptions options {.wave_size = input_info.wave_size};
 	if constexpr (std::is_same_v<InputInfo, ShaderVertexInputInfo>) {
@@ -2329,6 +2332,9 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	    .record_loads               = RecordAheadLoads,
 	    .gpu_produced               = AheadGpuProduced,
 	    .pending_write              = pending_write,
+#if defined(ANYPS5_KYTY)
+	    .image_table_heap           = Config::ImageTableHeapEnabled(),
+#endif
 	};
 	if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 		runtime.workgroup_counts      = input_info.workgroup_counts;
@@ -2355,6 +2361,12 @@ const ShaderModule* PipelineCache::GetAhead(const ShaderParams& params, InputInf
 	auto                   module  = last < modules.size() && matches(modules[last])
 	                    ? modules.begin() + static_cast<std::ptrdiff_t>(last)
 	                    : std::ranges::find_if(modules, matches);
+#if defined(ANYPS5_KYTY)
+	if (module != modules.end() && module->info.info.uses_image_heap) {
+		ahead.reads.Fail();
+		return nullptr;
+	}
+#endif
 	if (module == modules.end()) {
 #if defined(ANYPS5_KYTY)
 		if (!program->failed_variants.empty() && program->Failed(specialization, push_data_cursor)) {
@@ -2514,6 +2526,9 @@ void PipelineCache::RunCompileJob(CompileJob& job, InputInfo& input_info) {
 			    .read_specialization_memory = ReadAheadStrict,
 			    .record_load                = RecordAheadLoad,
 			    .record_loads               = RecordAheadLoads,
+#if defined(ANYPS5_KYTY)
+			    .image_table_heap           = Config::ImageTableHeapEnabled(),
+#endif
 			};
 			if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 				runtime.workgroup_counts      = input_info.workgroup_counts;
@@ -2726,6 +2741,9 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 			    .read_specialization_memory = ReadAheadStrict,
 			    .record_load                = RecordAheadLoad,
 			    .record_loads               = RecordAheadLoads,
+#if defined(ANYPS5_KYTY)
+			    .image_table_heap           = Config::ImageTableHeapEnabled(),
+#endif
 			};
 			if (!ShaderRecompiler::IR::MaterializeResources(program->resource_plan, runtime, resources,
 			                                                specialization)) {
@@ -2747,6 +2765,12 @@ const ShaderModule* PipelineCache::ChainModule(const ShaderParams& params, Input
 				           ShaderRecompiler::IR::PushData::StartFor(push_data_cursor, layout.ShaderDataDwords()) &&
 				       candidate.specialization == specialization;
 			});
+#if defined(ANYPS5_KYTY)
+			if (module != program->modules.end() && module->info.info.uses_image_heap) {
+				UnlockPrograms();
+				return nullptr;
+			}
+#endif
 			if (module != program->modules.end()) {
 				UnlockPrograms();
 				module->info.bindings.AdvancePushData(push_data_cursor);

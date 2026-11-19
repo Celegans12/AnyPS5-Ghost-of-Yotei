@@ -93,6 +93,8 @@ private:
 		size_t                       dirty_end     = 0;
 		size_t                       changed_begin = 0;
 		size_t                       changed_end   = 0;
+		bool                         overflowed    = false;
+		bool                         released      = false;
 	};
 
 	struct Memory {
@@ -127,6 +129,7 @@ private:
 	void     Upload(CommandBuffer& buffer, const std::vector<uint32_t>& slots, Buffer& device,
 	                size_t& dirty_begin, size_t& dirty_end);
 	uint32_t Intern(View& view, uint32_t kind, const Key& key);
+	uint32_t Profile(const ShaderRecompiler::IR::ImageResource& root, bool table);
 	void     Release(uint32_t entry);
 	void     Retire();
 	void     Mark(uint32_t index, State state);
@@ -135,7 +138,7 @@ private:
 	void     Repoint();
 	void     TakeChanges();
 	ImageId  CurrentImage(const Image::HeapChange& change);
-	uint32_t Allocate();
+	uint32_t Allocate(bool may_fail);
 	void     Resize(Memory& memory, uint64_t base, uint64_t size);
 	void     WriteDescriptors();
 
@@ -150,6 +153,7 @@ private:
 	uint64_t                             m_draw         = 1;
 	uint64_t                             m_suspend_draw = 0;
 	std::vector<ShaderRecompiler::IR::ImageResource>  m_profiles;
+	std::vector<bool>                                 m_table_profiles;
 	std::vector<Element>                              m_elements;
 	std::unordered_map<Key, uint32_t, KeyHash>        m_index;
 	std::vector<uint32_t>                             m_free;

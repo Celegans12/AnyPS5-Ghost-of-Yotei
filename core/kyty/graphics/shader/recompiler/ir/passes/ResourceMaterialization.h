@@ -88,6 +88,10 @@ void ApplyResourceSpecialization(Program& program, const ResourceSpecialization&
 bool ResourceSpecializationFits(const Program& program, const ResourceSpecialization& specialization);
 
 uint32_t ImageHeapKind(const ImageResource& root, DescriptorValue& value);
+ImageResource ImageTableHeapProfile(const ImageResource& root, bool skip_degamma);
+uint32_t ImageTableHeapKind(const ImageResource& profile, DescriptorValue& value);
+bool ImageTableHeapExemplar(const ImageResource& profile, const DescriptorValue& value);
+ImageResource ImageTableHeapResource(const ImageResource& profile, const DescriptorValue& value);
 ImageResource ImageHeapResource(const ImageResource& root, uint32_t kind);
 
 }

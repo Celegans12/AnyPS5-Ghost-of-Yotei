@@ -513,6 +513,8 @@ uint32_t EmitIndirectResourceIndex(EmitterState& state, uint32_t key, uint32_t m
 uint32_t EmitRecordTableIndex(EmitterState& state, uint32_t key, uint32_t element,
                               uint32_t mapping_offset, uint32_t search_iterations);
 bool IsRecordTableSource(const EmitterState& state, uint32_t source);
+bool IsImageTableArraySource(const EmitterState& state, uint32_t source);
+uint32_t EmitImageTableHeapKey(EmitterState& state, uint32_t source, uint32_t key);
 uint32_t EmitImageHeapEntry(EmitterState& state, uint32_t key, uint32_t mapping_offset);
 MemoryResourceAccess PrepareMemoryResourceAccess(EmitterState& state, const IR::MemoryInfo& mem,
                                                  uint32_t array_index = 0u);

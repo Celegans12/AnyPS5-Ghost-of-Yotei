@@ -686,7 +686,8 @@ void DeclareRayQueryVariables(EmitterState& s) {
 	const bool one_table = !samples.empty() && std::ranges::all_of(samples, [&](const IR::Inst* inst) {
 		const auto& first = s.program.info.images[memory(samples[0]).resource];
 		const auto& image = s.program.info.images[memory(inst).resource];
-		return memory(inst).sampler == memory(samples[0]).sampler &&
+		return memory(inst).sampler == memory(samples[0]).sampler && image.heap == first.heap &&
+		       image.indirect_mapping_offset == first.indirect_mapping_offset &&
 		       image.table_descriptor_base == first.table_descriptor_base &&
 		       image.table_mapping_offset == first.table_mapping_offset &&
 		       image.table_entry_mask == first.table_entry_mask;

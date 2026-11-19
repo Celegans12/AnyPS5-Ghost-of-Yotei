@@ -730,6 +730,9 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		ctx.Fail(inst, "has no indirect image runtime mapping");
 	}
 	if (image.heap) {
+		const auto heap_key = IsImageTableArraySource(state, image.source)
+		                          ? EmitImageTableHeapKey(state, image.source, key)
+		                          : key;
 		const auto entry = IsRecordTableSource(state, image.source)
 		    ? EmitImageHeapEntry(state,
 		                         Binary(state, spv::OpShiftLeftLogical, TypeU32(state),
@@ -738,7 +741,7 @@ auto EmitImageAccess(ValueEmitContext& ctx, const IR::Inst& inst, uint32_t resul
 		                                                     image.indirect_search_iterations),
 		                                ConstantU32(state, 2u)),
 		                         image.indirect_mapping_offset - 3u)
-		    : EmitImageHeapEntry(state, key, image.indirect_mapping_offset);
+		    : EmitImageHeapEntry(state, heap_key, image.indirect_mapping_offset);
 		const auto kinds = static_cast<uint32_t>(image.indirect_resources.size()) - 1u;
 		if (kinds == 1u) return emit(image.indirect_resources[1], entry);
 		const auto element = Binary(state, spv::OpBitwiseAnd, TypeU32(state), entry,
@@ -1334,8 +1337,12 @@ bool IsImageTableSampleLod(const EmitterState& state, const IR::Inst& inst) {
 	}
 	const auto& mem   = state.program.memory_info.at(inst.Flags<IR::MemoryFlags>().index);
 	const auto& image = state.program.info.images.at(mem.resource);
-	return mem.image_sample_flags == Decoder::ImageSampleFlagLod && mem.data_bits == 32u &&
-	       image.table_capacity != 0u && image.table_descriptor_base != UINT32_MAX &&
+	const bool table = image.table_capacity != 0u
+	                       ? image.table_descriptor_base != UINT32_MAX
+	                       : image.heap && image.indirect_root == mem.resource &&
+	                             image.indirect_resources.size() >= 2u &&
+	                             IsImageTableArraySource(state, image.source);
+	return mem.image_sample_flags == Decoder::ImageSampleFlagLod && mem.data_bits == 32u && table &&
 	       image.dimension == ImageDimension::Dim2D && !image.cube &&
 	       image.numeric_class == Prospero::TextureNumericClass::Float &&
 	       image.conversion_format == Prospero::BufferFormat::kInvalid;
@@ -1346,6 +1353,7 @@ uint32_t EmitImageTableSampleLod(ValueEmitContext& ctx, const IR::Inst& sample, 
 	auto&       state    = ctx.state;
 	const auto& mem      = ctx.Memory(sample);
 	const auto& image    = state.program.info.images.at(mem.resource);
+	if (image.heap) return EmitImageSampleLodAtKey(ctx, sample, key, u, v, lod);
 	const auto  samplers = LoadImageSamplers(ctx, sample);
 	const auto& sampler  = samplers[0];
 	const auto  sampled  = MakeSampledImage(state, mem.resource, sampler.id, 0u,

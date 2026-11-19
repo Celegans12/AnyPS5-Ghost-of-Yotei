@@ -162,10 +162,8 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		if (!Refresh(**memory)) return false;
 		(*memory)->draw = m_draw;
 	}
-	const auto root    = IR::ImageHeapResource(*request.root, 0u);
-	const auto profile = static_cast<uint32_t>(std::ranges::find(m_profiles, root) -
-	                                           m_profiles.begin());
-	if (profile == m_profiles.size()) m_profiles.push_back(root);
+	const auto profile = Profile(request.table ? *request.root : IR::ImageHeapResource(*request.root, 0u),
+	                             request.table);
 	auto&      views  = (*memory)->views;
 	const auto bytes  = (*memory)->size;
 	const auto probes = Probes(size, request.first, request.step);
@@ -189,9 +187,17 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 		created->dirty_begin = 0;
 		created->dirty_end   = created->slots.size();
 		view = views.insert(views.end(), std::move(created));
-	} else {
+	} else if (!(*view)->overflowed) {
 		UpdateProbes(**view, (*view)->changed_begin, (*view)->changed_end);
 		(*view)->changed_begin = (*view)->changed_end = 0;
+	}
+	if ((*view)->overflowed) {
+		auto& full = **view;
+		if (!full.released) {
+			full.released = true;
+			for (size_t slot = 0; slot < full.slots.size(); ++slot) Assign(full, slot, 0u);
+		}
+		return false;
 	}
 	if (std::ranges::find(m_active, view->get()) == m_active.end()) m_active.push_back(view->get());
 	const auto& selected = **view;
@@ -201,15 +207,21 @@ bool ImageHeap::Acquire(const IR::ImageHeapRequest& request, IR::ImageHeapView& 
 	return true;
 }
 
+uint32_t ImageHeap::Profile(const IR::ImageResource& root, bool table) {
+	for (uint32_t profile = 0; profile < m_profiles.size(); ++profile) {
+		if (m_table_profiles[profile] == table && m_profiles[profile] == root) return profile;
+	}
+	m_profiles.push_back(root);
+	m_table_profiles.push_back(table);
+	return static_cast<uint32_t>(m_profiles.size() - 1u);
+}
+
 bool ImageHeap::AcquireList(const IR::ImageHeapList& list, IR::ImageHeapView& result) {
 	KYTY_PROFILER_FUNCTION();
 	if (list.root == nullptr) {
 		return false;
 	}
-	const auto root    = IR::ImageHeapResource(*list.root, 0u);
-	const auto profile = static_cast<uint32_t>(std::ranges::find(m_profiles, root) -
-	                                           m_profiles.begin());
-	if (profile == m_profiles.size()) m_profiles.push_back(root);
+	const auto profile = Profile(IR::ImageHeapResource(*list.root, 0u), false);
 	auto memory = std::ranges::find_if(m_list_memories, [&](const auto& candidate) {
 		return candidate->views.front()->profile == profile;
 	});
@@ -336,7 +348,7 @@ bool ImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
 void ImageHeap::UpdateProbes(View& view, uint64_t begin, uint64_t end) {
 	const uint64_t bytes = m_profiles[view.profile].r128 ? 16u : 32u;
 	auto probe = begin < view.first + bytes ? 0u : (begin - view.first - bytes) / view.step + 1u;
-	for (; probe < view.count && view.first + probe * view.step < end; ++probe) {
+	for (; !view.overflowed && probe < view.count && view.first + probe * view.step < end; ++probe) {
 		UpdateProbe(view, probe);
 	}
 }
@@ -357,7 +369,8 @@ void ImageHeap::UpdateProbe(View& view, uint64_t probe) {
 		}
 		dead.erase(found);
 	}
-	const auto kind = IR::ImageHeapKind(profile, key.value);
+	const auto kind = m_table_profiles[view.profile] ? IR::ImageTableHeapKind(profile, key.value)
+	                                                 : IR::ImageHeapKind(profile, key.value);
 	Assign(view, offset, kind == 0u ? 0u : Intern(view, kind, key));
 }
 
@@ -384,19 +397,29 @@ void ImageHeap::Upload(CommandBuffer& buffer, const std::vector<uint32_t>& slots
 }
 
 uint32_t ImageHeap::Intern(View& view, uint32_t kind, const Key& key) {
+	const bool table           = m_table_profiles[view.profile];
+	auto [found, inserted] = m_index.try_emplace(key, 0u);
+	if (inserted) {
+		const auto index = Allocate(table);
+		if (index == 0u) {
+			m_index.erase(found);
+			view.overflowed = true;
+			return 0u;
+		}
+		found->second = index;
+		auto& element = m_elements[found->second];
+		element.key   = key;
+		element.kind  = kind;
+		m_pending.push_back(found->second);
+	}
 	const auto arm = static_cast<uint32_t>(std::ranges::find(view.kind_keys, kind) -
 	                                       view.kind_keys.begin());
 	if (arm == view.kind_keys.size()) {
 		view.kind_keys.push_back(kind);
 		view.kinds.push_back(key.value);
-	}
-	auto [found, inserted] = m_index.try_emplace(key, 0u);
-	if (inserted) {
-		found->second = Allocate();
-		auto& element = m_elements[found->second];
-		element.key   = key;
-		element.kind  = kind;
-		m_pending.push_back(found->second);
+	} else if (table && !IR::ImageTableHeapExemplar(m_profiles[view.profile], view.kinds[arm]) &&
+	           IR::ImageTableHeapExemplar(m_profiles[view.profile], key.value)) {
+		view.kinds[arm] = key.value;
 	}
 	++m_elements[found->second].refs;
 	return arm << IR::ImageHeapKindShift | found->second;
@@ -500,7 +523,7 @@ ImageId ImageHeap::CurrentImage(const Image::HeapChange& change) {
 	return current;
 }
 
-uint32_t ImageHeap::Allocate() {
+uint32_t ImageHeap::Allocate(bool may_fail) {
 	auto& scheduler = m_context.GetCommandScheduler();
 	while (!m_retired.empty() && scheduler.IsFree(m_retired.front().first)) {
 		m_free.push_back(m_retired.front().second);
@@ -508,6 +531,7 @@ uint32_t ImageHeap::Allocate() {
 	}
 	if (m_free.empty()) {
 		if (m_elements.size() == IR::ImageHeapCapacity) {
+			if (may_fail) return 0u;
 			EXIT("image heaps exceed %u resident images\n", IR::ImageHeapCapacity);
 		}
 		m_elements.emplace_back();
@@ -573,8 +597,12 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 	});
 	bool stale = ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
 	const auto resolve = [&](const Element& element) {
-		const auto resource = IR::ImageHeapResource(m_profiles[element.key.profile], element.kind);
-		return executor.ResolveTexture(resource, element.key.value);
+		const auto& profile = m_profiles[element.key.profile];
+		if (m_table_profiles[element.key.profile]) {
+			return executor.ResolveTexture(IR::ImageTableHeapResource(profile, element.key.value),
+			                               element.key.value, true);
+		}
+		return executor.ResolveTexture(IR::ImageHeapResource(profile, element.kind), element.key.value);
 	};
 	const auto retry = [&](uint32_t index) {
 		const auto& element = m_elements[index];
@@ -611,7 +639,8 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		} else if (!binding.desc.info.data.Empty()) {
 			m_held.push_back(index);
 		}
-		m_writes.push_back({index, {nullptr, binding.image_view, binding.layout}});
+		m_writes.push_back({index, {nullptr, binding.image_view,
+		                             binding.image_view ? binding.layout : vk::ImageLayout::eGeneral}});
 	}
 	m_pending.clear();
 	WriteDescriptors();

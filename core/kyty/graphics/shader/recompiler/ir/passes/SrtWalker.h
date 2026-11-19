@@ -36,6 +36,7 @@ struct ImageHeapRequest {
 	uint64_t             first = 0;
 	uint64_t             count = 0;
 	const ImageResource* root  = nullptr;
+	bool                 table = false;
 };
 
 struct ImageHeapView {
@@ -76,6 +77,7 @@ struct SrtRuntime {
 	bool (*pending_write)(uint64_t address, uint32_t& value) = nullptr;
 	std::span<const uint32_t> call_words;
 	bool runtime_stride = false;
+	bool image_table_heap = false;
 };
 
 class SrtReadCapture {
