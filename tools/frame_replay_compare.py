@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import hashlib
 import json
 import math
 import os
@@ -24,6 +25,10 @@ KYTY_SETTINGS = {
     "KYTY_PIPELINE_MANIFEST", "KYTY_PRINTF_DIRECTION", "KYTY_RT_CHECK", "KYTY_RT_CHECK_PPM",
     "KYTY_RT_CHECK_STRIKES", "KYTY_RT_ORACLE", "KYTY_RT_STATS", "KYTY76_LDS_SYNC",
 }
+KYTY_SHADER_STORE_LOAD = re.compile(
+    r"^Shader cache: loaded ([0-9]{1,20}) programs, ([0-9]{1,20}) modules, "
+    r"([0-9]{1,20}) pipelines in [0-9]{1,20} ms\r?$", re.MULTILINE
+)
 LIMITS = {"trials": (1, 20, 3), "warmups": (0, 5, 1), "timeout": (0.1, 3600, 120),
           "log_mib": (1, 128, 16)}
 NOTES = [
@@ -64,12 +69,20 @@ def _environment(value, shared=False):
     return value
 
 
+def _validate_kyty_title_id(value):
+    if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value)
+            or re.fullmatch(r"(?:CON|PRN|AUX|NUL|COM[0-9]|LPT[0-9])", value, re.IGNORECASE)):
+        raise ValueError("kyty_title_id must be a portable title ID")
+
+
 def validate_replay_recipe(value, directory):
     if not isinstance(value, dict) or value.get("format") != "aps5-frame-replay-recipe/1":
         raise ValueError("expected format aps5-frame-replay-recipe/1")
-    if set(value) - {"format", "capture", "arms", "environment", *LIMITS}:
+    if set(value) - {"format", "capture", "arms", "environment", "kyty_title_id", *LIMITS}:
         raise ValueError("unknown recipe fields")
     result = dict(value)
+    if "kyty_title_id" in result:
+        _validate_kyty_title_id(result["kyty_title_id"])
     capture = value.get("capture")
     if not isinstance(capture, str) or not capture:
         raise ValueError("capture must be a directory path")
@@ -105,6 +118,10 @@ def validate_replay_recipe(value, directory):
         result["arms"][name] = {**arm, "runtime": str(root), "library_dirs": directories,
                                 "environment": _environment(arm.get("environment", {}))}
     result["environment"] = _environment(value.get("environment", {}), shared=True)
+    if "kyty_title_id" in result:
+        environments = [result["environment"], *(arm["environment"] for arm in result["arms"].values())]
+        if any(environment.get("APS5_REPORT", "0") != "0" for environment in environments):
+            raise ValueError("Kyty title mode requires APS5_REPORT=0 to keep the staged runtime pinned")
     for key, (low, high, default) in LIMITS.items():
         number = value.get(key, default)
         kind = (int, float) if key == "timeout" else (int,)
@@ -165,8 +182,10 @@ def _trial_environment(recipe, arm, runtime, cache):
     return environment
 
 
-def execute_replay_trial(command, directory, environment, timeout, log_bytes):
+def execute_replay_trial(command, directory, environment, timeout, log_bytes, *, prepare=None):
     directory.mkdir(parents=True)
+    if prepare is not None:
+        prepare(directory)
     exceeded = threading.Event()
     errors = []
 
@@ -317,26 +336,75 @@ def _capture_metadata(capture, report):
         raise ValueError("capture metadata reports incomplete evidence")
 
 
+def _kyty_title_metadata(title_id):
+    return (json.dumps({"titleId": title_id}, separators=(",", ":")) + "\n").encode("ascii")
+
+
+def _stage_kyty_replay(directory, title_id, seed, seed_manifest):
+    metadata = directory / "app0" / "sce_sys" / "param.json"
+    metadata.parent.mkdir(parents=True)
+    metadata.write_bytes(_kyty_title_metadata(title_id))
+    _copy_tree(seed, directory / "_PipelineCache", seed_manifest)
+
+
+def _assess_replay_run(recipe, run, root):
+    stderr = _read_log(root / "stderr.txt")
+    assessment = evidence.parse_replay_result(_read_log(root / "stdout.txt"), stderr,
+                                              recipe["arms"][run["arm"]]["commit"])
+    issues = assessment["issues"]
+    for key in ("timed_out", "log_limit"):
+        if run[key]:
+            issues.append(key)
+    if run["returncode"] != 0:
+        issues.append(f"process exit {run['returncode']}")
+    issues.extend(run["io_errors"])
+    title_id = recipe.get("kyty_title_id")
+    if title_id is not None:
+        metadata = _kyty_title_metadata(title_id)
+        expected = [{"path": "param.json", "bytes": len(metadata), "sha256": hashlib.sha256(metadata).hexdigest()}]
+        try:
+            evidence.verify_replay_bundle(root / "app0" / "sce_sys", expected, max_bytes=len(metadata), max_files=1)
+        except (OSError, ValueError) as error:
+            issues.append(f"Kyty title metadata: {error}")
+        counts = KYTY_SHADER_STORE_LOAD.findall(stderr)
+        loads = dict(zip(("programs", "modules", "pipelines"), map(int, counts[0]))) if len(counts) == 1 else None
+        seeded = bool(run.get("seed"))
+        assessment["kyty_shader_store"] = {"seeded": seeded, "loads": loads}
+        expects_seed = run["iteration"] > 1 if run["phase"] == "warmup" else recipe["warmups"] > 0
+        if seeded != expects_seed:
+            issues.append("Kyty shader-store seed does not match the replay recipe")
+        if len(counts) > 1:
+            issues.append("Kyty replay reported multiple shader-store loads")
+        elif seeded and (loads is None or not loads["modules"]):
+            issues.append("Kyty replay loaded no modules from its staged shader store")
+        elif not seeded and loads is not None and any(loads.values()):
+            issues.append("Kyty replay loaded a shader store without a staged seed")
+    return assessment
+
+
 def _run_one(recipe, report, output, arm_name, phase, iteration, runtime, capture, seed):
     name = f"{phase}-{iteration:02d}-{arm_name}"
     root = output / "runs" / name
-    cache = output / "caches" / name
-    cache.parent.mkdir(exist_ok=True)
+    title_id = recipe.get("kyty_title_id")
     seed_manifest = evidence.replay_tree_manifest(seed)
-    _copy_tree(seed, cache, seed_manifest)
+    prepare = None
+    if title_id is None:
+        cache = output / "caches" / name
+        cache.parent.mkdir(exist_ok=True)
+        _copy_tree(seed, cache, seed_manifest)
+    else:
+        cache = root / "_PipelineCache"
+        prepare = lambda directory: _stage_kyty_replay(directory, title_id, seed, seed_manifest)
     arm = recipe["arms"][arm_name]
     command = [str(runtime / arm["replay"]), str(capture), "--strict", "--no-synthesize", "--repeat", "1"]
-    result = execute_replay_trial(command, root, _trial_environment(recipe, arm, runtime, cache),
-                                  recipe["timeout"], recipe["log_mib"] * 1024 * 1024)
-    assessment = evidence.parse_replay_result(_read_log(root / "stdout.txt"), _read_log(root / "stderr.txt"), arm["commit"])
-    for key in ("timed_out", "log_limit"):
-        if result[key]:
-            assessment["issues"].append(key)
-    if result["returncode"] != 0:
-        assessment["issues"].append(f"process exit {result['returncode']}")
-    assessment["issues"].extend(result["io_errors"])
+    environment = _trial_environment(recipe, arm, runtime, cache)
+    if title_id is not None:
+        environment.update({"KYTY_SHADER_CACHE": "1", "APS5_REPORT": "0"})
+    result = execute_replay_trial(command, root, environment, recipe["timeout"], recipe["log_mib"] * 1024 * 1024,
+                                  prepare=prepare)
     run = {**result, "arm": arm_name, "phase": phase, "iteration": iteration,
-           "path": root.relative_to(output).as_posix(), "seed": seed_manifest, "assessment": assessment}
+           "path": root.relative_to(output).as_posix(), "seed": seed_manifest}
+    assessment = run["assessment"] = _assess_replay_run(recipe, run, root)
     report["runs"].append(run)
     _write_json(output / "report.json", evidence.replay_comparison_report(report))
     if result.get("interrupted"):
@@ -347,6 +415,17 @@ def _run_one(recipe, report, output, arm_name, phase, iteration, runtime, captur
     evidence.verify_replay_bundle(runtime, report["inputs"][arm_name])
     evidence.verify_replay_bundle(capture, report["inputs"]["capture"])
     return cache, not assessment["issues"]
+
+
+def _advance_shader_store(warmed, seed, title_id):
+    manifest = evidence.replay_tree_manifest(warmed)
+    if title_id is not None:
+        manifest = [entry for entry in manifest if entry["path"] == f"{title_id}.shaders" and entry["bytes"]]
+        if not manifest:
+            raise ValueError("Kyty warmup produced no shader store")
+    evidence.replay_tree_manifest(seed)
+    shutil.rmtree(seed)
+    _copy_tree(warmed, seed, manifest)
 
 
 def run_replay_comparison(recipe, output):
@@ -381,9 +460,7 @@ def run_replay_comparison(recipe, output):
                     raise ValueError(f"{arm}: warmup failed; all evidence retained")
                 if not seed.resolve().is_relative_to(output.resolve() / "seeds"):
                     raise ValueError("cache seed escaped its owned directory")
-                evidence.replay_tree_manifest(seed)
-                shutil.rmtree(seed)
-                _copy_tree(warmed, seed, evidence.replay_tree_manifest(warmed))
+                _advance_shader_store(warmed, seed, recipe.get("kyty_title_id"))
             seeds[arm] = seed
         for iteration in range(1, recipe["trials"] + 1):
             order = ARMS if iteration % 2 else tuple(reversed(ARMS))
@@ -421,6 +498,11 @@ def _offline_report(directory):
         raise ValueError("invalid original comparison runs")
     if type(original.get("complete")) is not bool or not isinstance(original.get("recipe"), dict):
         raise ValueError("invalid original comparison state")
+    if "kyty_title_id" in original["recipe"]:
+        _validate_kyty_title_id(original["recipe"]["kyty_title_id"])
+        warmups = original["recipe"].get("warmups")
+        if type(warmups) is not int or not 0 <= warmups <= LIMITS["warmups"][1]:
+            raise ValueError("invalid Kyty warmup count in original recipe")
     original["artifacts"] = report["artifacts"]
     for run in original["runs"]:
         if not isinstance(run, dict) or run.get("arm") not in ARMS or run.get("phase") not in ("warmup", "trial"):
@@ -444,15 +526,7 @@ def _offline_report(directory):
         commit = arms[run["arm"]].get("commit")
         if not isinstance(commit, str) or not re.fullmatch(r"[0-9a-f]{40}", commit):
             raise ValueError("invalid expected runtime commit")
-        native = evidence.parse_replay_result(_read_log(root / "stdout.txt"), _read_log(root / "stderr.txt"),
-                                               commit)
-        for key in ("timed_out", "log_limit"):
-            if run[key]:
-                native["issues"].append(key)
-        if run["returncode"] != 0:
-            native["issues"].append(f"process exit {run['returncode']}")
-        native["issues"].extend(run["io_errors"])
-        run["assessment"] = native
+        run["assessment"] = _assess_replay_run(original["recipe"], run, root)
     _comparison_checks(original)
     return evidence.replay_comparison_report(original)
 

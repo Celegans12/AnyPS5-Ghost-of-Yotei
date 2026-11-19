@@ -182,6 +182,23 @@ class RecipeTests(ReplayFixture):
                     self.validate()
             del field["environment"]
 
+    def test_kyty_title_id_is_a_portable_cache_name(self):
+        self.recipe["kyty_title_id"] = "PPSA01234-test_1"
+        self.assertEqual(self.validate()["kyty_title_id"], "PPSA01234-test_1")
+        for value in (None, 123, "", "x" * 129, "../title", "wrong.ext", "bad\\name", "é", "nul", "COM1"):
+            self.recipe["kyty_title_id"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, "portable title ID"):
+                self.validate()
+
+    def test_kyty_title_mode_keeps_launch_reports_out_of_the_runtime(self):
+        self.recipe["kyty_title_id"] = "PPSA01234"
+        for scope in (self.recipe, self.recipe["arms"]["candidate"]):
+            scope["environment"] = {"APS5_REPORT": "1"}
+            with self.assertRaisesRegex(ValueError, "requires APS5_REPORT=0"):
+                self.validate()
+            scope["environment"] = {"APS5_REPORT": "0"}
+            self.assertEqual(self.validate()["kyty_title_id"], "PPSA01234")
+
     def test_stage_replay_runtime_copies_files_and_rejects_changed_bytes(self):
         source = self.root / "baseline"
         manifest = runner.evidence.replay_tree_manifest(source)
@@ -206,10 +223,14 @@ class RunnerTests(ReplayFixture):
         self.workload_mismatch = False
         self.bad_inspection = False
         self.interrupt_trial = False
+        self.kyty_write_store = True
+        self.kyty_warm_log = None
 
-    def execute(self, command, directory, environment, timeout, log_bytes):
+    def execute(self, command, directory, environment, timeout, log_bytes, *, prepare=None):
         self.commands.append(command)
         directory.mkdir(parents=True)
+        if prepare is not None:
+            prepare(directory)
         command = [str(value) for value in command]
         stdout = json.dumps({"calls": [{"index": 0, "kind": "frame-start", "memory_group": None}],
                              "chunks": [{"index": 0, "kind": "reference", "group": 0}]})
@@ -221,11 +242,14 @@ class RunnerTests(ReplayFixture):
         if len(command) > 1 and command[1] != "inspect":
             arm = Path(command[0]).parent.name
             cache = Path(environment["ANYPS5_SHADER_CACHE_DIR"])
-            memo = cache / "memo.bin"
+            title_id = self.recipe.get("kyty_title_id")
+            memo = cache / (f"{title_id}.shaders" if title_id is not None else "memo.bin")
             before = memo.read_bytes() if memo.exists() else None
             self.calls.append({"arm": arm, "path": directory, "command": command,
-                               "cache": cache, "before": before, "environment": dict(environment)})
-            memo.write_bytes(directory.name.encode())
+                               "cache": cache, "before": before, "environment": dict(environment),
+                               "seed_files": sorted(path.name for path in cache.iterdir())})
+            if title_id is None or self.kyty_write_store:
+                memo.write_bytes(directory.name.encode())
             native = native_result()
             if self.workload_mismatch and arm == "candidate":
                 native["submits"] = 2
@@ -236,6 +260,13 @@ class RunnerTests(ReplayFixture):
                       else self.recipe["arms"][arm]["commit"])
             stdout = json.dumps(native)
             stderr = host_report(commit)
+            if title_id is not None:
+                (cache / f"{title_id}.bin").write_bytes(b"driver cache")
+                loaded = int(before is not None)
+                log = f"Shader cache: loaded {loaded} programs, {loaded} modules, {loaded} pipelines in 0 ms\n"
+                if loaded and self.kyty_warm_log is not None:
+                    log = self.kyty_warm_log
+                stderr += "\n" + log
             if self.device_mismatch and arm == "candidate":
                 stderr = stderr.replace("Test GPU", "Other GPU")
             if self.mutate_input and directory.name.startswith("trial"):
@@ -305,6 +336,81 @@ class RunnerTests(ReplayFixture):
                 self.assertEqual(environment["ANYPS5_HOST_REPORT"], "1")
                 if command[1] != "inspect":
                     self.assertEqual(command[-4:], ["--strict", "--no-synthesize", "--repeat", "1"])
+
+    def test_kyty_warmups_seed_only_their_own_shader_store(self):
+        title = "PPSA01234"
+        self.recipe.update(kyty_title_id=title, warmups=2, trials=2)
+        report = self.run_comparison()
+        self.assertTrue(report["complete"], report["issues"])
+        self.assertEqual(len(report["runs"]), 8)
+        for call, run in zip(self.calls, report["runs"], strict=True):
+            arm = call["arm"]
+            first = run["phase"] == "warmup" and run["iteration"] == 1
+            producer = 1 if run["phase"] == "warmup" else 2
+            with self.subTest(path=run["path"]):
+                self.assertEqual(call["cache"], call["path"] / "_PipelineCache")
+                self.assertEqual(call["environment"]["KYTY_SHADER_CACHE"], "1")
+                self.assertEqual(call["environment"]["APS5_REPORT"], "0")
+                self.assertEqual(call["environment"]["ANYPS5_HOST_REPORT"], "1")
+                self.assertEqual(call["seed_files"], [] if first else [f"{title}.shaders"])
+                self.assertEqual(call["before"], None if first else f"warmup-{producer:02d}-{arm}".encode())
+                self.assertEqual(run["assessment"]["issues"], [])
+                cache = run["assessment"]["kyty_shader_store"]
+                self.assertEqual(cache["seeded"], not first)
+                self.assertEqual(cache["loads"]["modules"], int(not first))
+                params = call["path"] / "app0" / "sce_sys" / "param.json"
+                self.assertEqual(json.loads(params.read_bytes()), {"titleId": title})
+        output = self.root / "evidence"
+        for arm in runner.ARMS:
+            seed = output / "seeds" / arm
+            self.assertEqual(list(seed.iterdir()), [seed / f"{title}.shaders"])
+            self.assertEqual((seed / f"{title}.shaders").read_bytes(), f"warmup-02-{arm}".encode())
+        self.assertEqual(runner._offline_report(output)["runs"], report["runs"])
+        self.assertIn("Kyty seed staged", (output / "report.md").read_text(encoding="utf-8"))
+
+    def test_kyty_cold_trials_have_no_seed(self):
+        self.recipe.update(kyty_title_id="PPSA01234", warmups=0, trials=2)
+        report = self.run_comparison()
+        self.assertTrue(report["complete"], report["issues"])
+        self.assertEqual(len(report["runs"]), 4)
+        for call, run in zip(self.calls, report["runs"], strict=True):
+            self.assertEqual(call["seed_files"], [])
+            self.assertEqual(run["seed"], [])
+            self.assertEqual(run["assessment"]["kyty_shader_store"]["loads"]["modules"], 0)
+
+    def test_kyty_warmup_requires_a_shader_store(self):
+        self.recipe.update(kyty_title_id="PPSA01234", trials=1)
+        self.kyty_write_store = False
+        report = self.run_comparison()
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["issues"], ["Kyty warmup produced no shader store"])
+        self.assertEqual([run["phase"] for run in report["runs"]], ["warmup"])
+
+    def test_kyty_measured_trials_require_the_expected_seed(self):
+        self.recipe.update(kyty_title_id="PPSA01234", trials=1)
+        with mock.patch.object(runner, "_advance_shader_store"):
+            report = self.run_comparison()
+        trials = [run for run in report["runs"] if run["phase"] == "trial"]
+        self.assertEqual(len(trials), 2)
+        for run in trials:
+            self.assertIn("Kyty shader-store seed does not match the replay recipe", run["assessment"]["issues"])
+
+    def test_kyty_unproven_seed_load_is_unhealthy_online_and_offline(self):
+        self.recipe.update(kyty_title_id="PPSA01234", trials=1)
+        zero = "Shader cache: loaded 0 programs, 0 modules, 0 pipelines in 0 ms\n"
+        positive = "Shader cache: loaded 1 programs, 1 modules, 1 pipelines in 0 ms\n"
+        for index, (log, issue) in enumerate((("", "loaded no modules"), (zero, "loaded no modules"),
+                                               (positive * 2, "multiple shader-store loads"))):
+            self.kyty_warm_log = log
+            output = self.root / f"bad-warm-{index}"
+            with self.subTest(log=log):
+                report = self.run_comparison(output)
+                offline = runner._offline_report(output)
+                for result in (report, offline):
+                    trials = [run for run in result["runs"] if run["phase"] == "trial"]
+                    self.assertEqual(len(trials), 2)
+                    self.assertTrue(all(issue in " ".join(run["assessment"]["issues"]) for run in trials))
+                    self.assertEqual(result["observations"]["candidate"]["healthy_trials"], 0)
 
     def test_failed_and_build_mismatched_trials_remain_in_report(self):
         self.recipe["warmups"] = 0

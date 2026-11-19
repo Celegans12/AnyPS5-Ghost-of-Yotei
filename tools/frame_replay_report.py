@@ -530,6 +530,18 @@ def replay_comparison_report(report, markdown=False):
     for index, row in enumerate(result["runs"], 1):
         issues = row.get("assessment", {}).get("issues", [])
         lines.append("| " + " | ".join(escape(value) for value in (index, row.get("arm", "unavailable"), row.get("phase", "unavailable"), row.get("returncode", "unavailable"), "; ".join(issues) or "none recorded")) + " |")
+    stores = [(index, row["assessment"]["kyty_shader_store"])
+              for index, row in enumerate(result["runs"], 1)
+              if isinstance(row["assessment"].get("kyty_shader_store"), dict)]
+    if stores:
+        lines.extend(["", "| Run | Kyty seed staged | Cached programs loaded | Modules loaded | Pipelines loaded |",
+                      "| --- | --- | --- | --- | --- |"])
+        for index, store in stores:
+            loads = store.get("loads")
+            counts = [loads.get(key, "unavailable") if isinstance(loads, dict) else "unavailable"
+                      for key in ("programs", "modules", "pipelines")]
+            lines.append("| " + " | ".join(escape(value) for value in
+                         (index, "yes" if store.get("seeded") else "no", *counts)) + " |")
     lines.extend(["", "| Trial pair | Replay seconds change | Throughput change | Ready-frame p50 change | Evidence issues |",
                   "| --- | --- | --- | --- | --- |"])
     for pair in pairs:

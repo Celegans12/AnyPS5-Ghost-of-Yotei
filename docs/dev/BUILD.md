@@ -247,6 +247,16 @@ and `KYTY76_LDS_SYNC` settings before inspection and replay. Strict replay contr
 
 Each invocation uses `--strict --no-synthesize --repeat 1`. Capture inspection rejects truncated or obsolete captures before GPU replay. Each arm warms its own application cache; the resulting seed is copied into a fresh cache directory for every measured trial. Zero warmups starts every trial with an empty application cache. Trials alternate baseline/candidate and candidate/baseline order. Capture and runtime hashes are checked before and after execution. Original logs, process receipts, host reports, cache contents and every attempt remain in the bundle. Commands have a timeout and per-stream log byte bound; their owned Windows job or POSIX process group is terminated on completion, timeout or interruption.
 
+For a pair of Kyty runtimes, add a shared `"kyty_title_id": "PPSA01234"` to stage that title ID as
+`app0/sce_sys/param.json` in each replay directory. This mode enables the Kyty shader store and copies only
+the preceding warmup's `_PipelineCache/<titleId>.shaders` from the same arm. The recipe and the initial seed
+hash remain in the bundle. A seeded run qualifies only when Kyty reports a positive module load. The report
+also lists cached programs and pipelines. Set `warmups` to zero for a cold control with the same title ID.
+Use Release runtimes and enable the shader cache for warm runs. Set `KYTY_PIPELINE_MANIFEST=0` in the
+shared environment to isolate shader-store reuse from pipeline manifest warmup.
+Kyty title mode sets `APS5_REPORT=0` to prevent title-launch reports from writing into the pinned runtime.
+The runner still records the invocation host report and the comparison bundle.
+
 `report.md` and `report.json` show per-arm observations, paired changes and repeatability when no known evidence problem prevents comparison. `python tools/frame_replay_compare.py report replay-results` verifies retained file hashes and regenerates the report from original logs; `--json` prints JSON. Exit 0 means the declared experiment completed without a recorded evidence problem, 2 means setup, execution or evidence was incomplete, and 130 means interrupted. None is a correctness or performance pass threshold.
 
 Replay throughput measures the captured driver workload, not title FPS. The native result rounds `skipped_mib` to 0.1 MiB and truncates its `frame_ms.each` values to whole milliseconds; zero reported skips cannot prove zero skipped bytes. Reference comparisons cover final recorded display buffers, not every frame. Capture omissions, original scheduling and mapping history can remain unknown even when all reported checks match. Fresh processes do not retain in-process draw/resource caches, and per-arm application-cache seeds do not control driver caches, GPU clocks or equal cache warmness across builds. Host reports identify the selected GPU and compiled AGC commit, but do not provide a physical-device UUID or dirty state. Staged file hashes do not independently enumerate every library the OS loaded. Live-title performance claims still need the project's same-machine, same-scene summaries and traces.
