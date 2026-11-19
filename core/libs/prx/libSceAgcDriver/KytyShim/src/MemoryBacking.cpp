@@ -1,7 +1,12 @@
 #include "kernel/memory.h"
 
+#include "common/assert.h"
+
 #include "MemoryShim.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#ifdef _WIN32
+#include "prx/libc/include/RedZoneGate.hpp"
+#endif
 #include "prx/libkernel/DirectMemory/DirectMemory.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
 
@@ -948,6 +953,17 @@ bool CopySparseMemory(uint64_t vaddr, void* data, uint64_t size) {
 	return CopySparse<true>(vaddr, data, size);
 }
 
+#ifdef _WIN32
+namespace {
+
+void RequireFramedGuest() {
+	if (RedZoneGate::Open()) return;
+	EXIT("KytyShim: Kyty tracks guest writes by page protection and cannot run without it. On Windows a fault on a guest thread overwrites the values a leaf function keeps below RSP, which corrupts guest memory without a trace. Convert the title again with --frame-red-zone, or set APS5_ALLOW_UNFRAMED_FAULTS=1 to take the faults anyway\n");
+}
+
+}
+#endif
+
 bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory::Mode mode) {
 	if (!ValidRange(vaddr, size)) return false;
 	const auto protection = HostProtection(mode);
@@ -959,6 +975,7 @@ bool ProtectGuestHostMemory(uint64_t vaddr, uint64_t size, Common::VirtualMemory
 	                              : (protection & PROT_EXEC) != 0                         ? PAGE_EXECUTE
 	                              : writable                                              ? PAGE_READWRITE
 	                                                                                      : PAGE_READONLY;
+	if (!writable) RequireFramedGuest();
 	if (!writable) GuestArena::GuestArenaNoteHostProtection_nid_no_patch(vaddr, size, false);
 	const auto& mapped_pages = Pages();
 	const auto host_first = vaddr & ~uint64_t {0xfff};
