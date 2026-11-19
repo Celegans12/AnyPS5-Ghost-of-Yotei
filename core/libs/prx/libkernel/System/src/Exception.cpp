@@ -1187,7 +1187,7 @@ std::uintptr_t yieldReturn = 0;
 sem_t retryWake;
 const int retryMark = 0;
 constinit thread_local std::atomic<std::uint64_t> pendingSince{0};
-constinit thread_local std::atomic<bool> retryQueued{false};
+constinit thread_local std::atomic<int> retrySlot{-1};
 constinit thread_local std::atomic<bool> returnArmed{false};
 
 struct ReturnArm {
@@ -1279,12 +1279,13 @@ bool InterruptedWait(const mcontext_t& host) {
 }
 
 bool QueueRetry() {
-    if (retryQueued.load()) return true;
     const auto self = static_cast<pid_t>(syscall(SYS_gettid));
-    for (auto& slot : retryThreads) {
+    const int queued = retrySlot.load();
+    if (queued >= 0 && retryThreads[static_cast<std::size_t>(queued)].load(std::memory_order_acquire) == self) return true;
+    for (std::size_t index = 0; index < retryThreads.size(); ++index) {
         pid_t empty = 0;
-        if (!slot.compare_exchange_strong(empty, self, std::memory_order_acq_rel)) continue;
-        retryQueued.store(true);
+        if (!retryThreads[index].compare_exchange_strong(empty, self, std::memory_order_acq_rel)) continue;
+        retrySlot.store(static_cast<int>(index));
         sem_post(&retryWake);
         return true;
     }
@@ -1368,10 +1369,6 @@ bool DeferUntilSafe(const mcontext_t& host) {
     return QueueRetry();
 }
 
-bool RetrySignal(const siginfo_t* info) {
-    return info != nullptr && info->si_code == SI_QUEUE && info->si_value.sival_ptr == &retryMark;
-}
-
 bool Outstanding(const PthreadPrivate* self) {
     return self == nullptr || self->raisesSent.load() != self->raisesTaken.load();
 }
@@ -1430,9 +1427,8 @@ void StartRetries() {
 }
 #endif
 
-void Deliver(int signum, siginfo_t* info, void* context) {
+void Deliver(int signum, siginfo_t*, void* context) {
 #ifdef __linux__
-    if (RetrySignal(info)) retryQueued.store(false);
     auto* const self = CurrentGuestThreadForDelivery();
     if (!Outstanding(self)) return;
     if (TimedWait::DeliveryDeferred() && !PendingExpired()) {
@@ -1443,7 +1439,6 @@ void Deliver(int signum, siginfo_t* info, void* context) {
     if (DeferUntilSafe(static_cast<ucontext_t*>(context)->uc_mcontext)) return;
     TakeRaises(self);
 #else
-    (void)info;
     if (TimedWait::DeferDelivery(signum)) return;
 #endif
     const auto handler = Handler(RaisedSignal);
@@ -1710,6 +1705,11 @@ void RunAtReturn(ReturnFrame& frame, unsigned char* fx) {
 }
 
 extern "C" [[gnu::visibility("hidden"), gnu::used]] void Aps5ReturnDelivery(ReturnFrame* frame, unsigned char* fx) {
+    sigset_t blocked;
+    sigset_t previous;
+    sigemptyset(&blocked);
+    sigaddset(&blocked, HostSignal);
+    pthread_sigmask(SIG_BLOCK, &blocked, &previous);
     const auto original = TakeArm(reinterpret_cast<std::uintptr_t>(frame) + offsetof(ReturnFrame, target));
     if (original == 0) {
         static constexpr char message[] = "sceKernelRaiseException: a return into guest code reached the delivery stub without a recorded return address\n";
@@ -1718,16 +1718,12 @@ extern "C" [[gnu::visibility("hidden"), gnu::used]] void Aps5ReturnDelivery(Retu
     frame->target = original;
     returnArmed.store(false);
     auto* const self = CurrentGuestThreadForDelivery();
-    if (!Outstanding(self) || TimedWait::DeliveryDeferred()) return;
-    sigset_t blocked;
-    sigset_t previous;
-    sigemptyset(&blocked);
-    sigaddset(&blocked, HostSignal);
-    pthread_sigmask(SIG_BLOCK, &blocked, &previous);
-    do {
-        TakeRaises(self);
-        RunAtReturn(*frame, fx);
-    } while (self != nullptr && Outstanding(self));
+    if (Outstanding(self) && !TimedWait::DeliveryDeferred()) {
+        do {
+            TakeRaises(self);
+            RunAtReturn(*frame, fx);
+        } while (self != nullptr && Outstanding(self));
+    }
     pthread_sigmask(SIG_SETMASK, &previous, nullptr);
 }
 
