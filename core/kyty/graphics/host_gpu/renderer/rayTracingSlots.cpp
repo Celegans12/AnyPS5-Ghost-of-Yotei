@@ -46,6 +46,7 @@ constexpr uint32_t ChangedCapacity  = 1024;
 constexpr uint32_t PoolCapacity     = 1u << 24u;
 constexpr uint64_t PoolQueueMax     = uint64_t {1} << 20u;
 constexpr uint64_t BuildScratchSize = uint64_t {64} << 20u;
+constexpr uint64_t UploadSize       = uint64_t {64} << 20u;
 constexpr uint32_t MaxRetries       = 8;
 constexpr uint64_t LateRetryPrepares = 64;
 constexpr uint32_t DynamicPrepares  = 120;
@@ -270,13 +271,11 @@ void MemoryBarrier(const CommandRecorder& command, vk::PipelineStageFlags2 src_s
 	command.pipelineBarrier2(dependency);
 }
 
-void UpdateBuffer(const CommandRecorder& command, vk::Buffer buffer, uint64_t offset,
+void UpdateBuffer(const CommandRecorder& command, StreamBuffer& upload, vk::Buffer buffer, uint64_t offset,
                   const void* data, uint32_t size) {
 	EXIT_IF(size == 0 || size > 65536 || (size & 3u) != 0 || (offset & 3u) != 0);
-	const auto* copy = command.CopyArray(static_cast<const uint8_t*>(data), size);
-	command.Custom([buffer, offset, copy, size](vk::CommandBuffer c) {
-		c.updateBuffer(buffer, offset, size, copy);
-	});
+	const vk::BufferCopy region {upload.Copy(data, size, 4), offset, size};
+	command.copyBuffer(upload.Handle(), buffer, 1, &region);
 }
 
 constexpr vk::BuildAccelerationStructureFlagsKHR BlasFlags =
@@ -895,6 +894,7 @@ void RayTracing::CreateBuffers() {
 	m_hle_jobs       = make(HleRefitJobsSize, DataFlags, "HLE refit jobs");
 	m_hle_pool       = make(uint64_t {HleRefitPoolCapacity} * 4, DataFlags, "HLE refit pool");
 	m_hle_state      = make(HleRefitStateSize, DataFlags, "HLE refit state");
+	m_upload = std::make_unique<StreamBuffer>(m_graphics, m_scheduler, MemoryUsage::Stream, UploadSize);
 	for (auto& readback: m_readbacks) {
 		readback.buffer = std::make_unique<Buffer>(m_graphics, m_scheduler, MemoryUsage::Download, 0,
 		                                           AllFlags, ReadbackSize);
@@ -1375,7 +1375,7 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 		                     .blas_va     = slot.blas_va,
 		                     .root        = slot.root,
 		                     .leaf_count  = slot.leaf_count};
-		UpdateBuffer(command, m_slots->Handle(), uint64_t {index} * SlotStride, &info, sizeof(info));
+		UpdateBuffer(command, *m_upload, m_slots->Handle(), uint64_t {index} * SlotStride, &info, sizeof(info));
 		if (slot.capacity1 != 0) {
 			command.fillBuffer(slot.entries.buffer->Handle(),
 			                   slot.entries.offset + AlphaRecordsOffset(slot.capacity0, slot.capacity1),
@@ -1383,7 +1383,7 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 		}
 		if (slot.table_index != UINT32_MAX) {
 			const uint32_t encoded = index + 1;
-			UpdateBuffer(command, m_table->Handle(), uint64_t {slot.table_index} * TableStride + 8,
+			UpdateBuffer(command, *m_upload, m_table->Handle(), uint64_t {slot.table_index} * TableStride + 8,
 			             &encoded, sizeof(encoded));
 		}
 		if (!slot.layout.empty()) {
@@ -1397,12 +1397,12 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 	}
 	for (size_t done = 0; done < layouts.size();) {
 		const auto chunk = std::min<size_t>(layouts.size() - done, 4096);
-		UpdateBuffer(command, m_layouts->Handle(), uint64_t {done} * 16, &layouts[done],
+		UpdateBuffer(command, *m_upload, m_layouts->Handle(), uint64_t {done} * 16, &layouts[done],
 		             static_cast<uint32_t>(chunk * 16));
 		done += chunk;
 	}
 	const auto jobs_base = m_jobs->BufferDeviceAddress() + uint64_t {first_job} * JobStride;
-	UpdateBuffer(command, m_jobs->Handle(), uint64_t {first_job} * JobStride, jobs.data(),
+	UpdateBuffer(command, *m_upload, m_jobs->Handle(), uint64_t {first_job} * JobStride, jobs.data(),
 	             static_cast<uint32_t>(jobs.size() * JobStride));
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 	              vk::PipelineStageFlagBits2::eComputeShader,
@@ -1488,7 +1488,7 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 	                  vk::AccessFlagBits2::eTransferWrite);
 	constexpr uint32_t built = 1;
 	for (const auto index: slots) {
-		UpdateBuffer(command, m_slots->Handle(), uint64_t {index} * SlotStride + offsetof(SlotInfo, state),
+		UpdateBuffer(command, *m_upload, m_slots->Handle(), uint64_t {index} * SlotStride + offsetof(SlotInfo, state),
 		             &built, sizeof(built));
 		m_slot_list[index]->built       = true;
 		m_slot_list[index]->built_frame = m_walk_frame;
@@ -1637,13 +1637,13 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 		for (const auto* buffer: {m_table.get(), m_slots.get(), m_context_table.get()}) {
 			command.fillBuffer(buffer->Handle(), 0, buffer->Size(), 0);
 		}
-		UpdateBuffer(command, m_buffer_cache.GetBdaPageTableBuffer()->Handle(),
+		UpdateBuffer(command, *m_upload, m_buffer_cache.GetBdaPageTableBuffer()->Handle(),
 		             BufferCache::NATIVE_RT_CONTEXT_PAGE * sizeof(uint64_t), &m_context_address,
 		             sizeof(m_context_address));
 	}
 	const auto forget = [&](uint32_t table_index) {
 		const std::array<uint64_t, 2> tombstone {TableTombstone, 0};
-		UpdateBuffer(command, m_table->Handle(), uint64_t {table_index} * TableStride, tombstone.data(),
+		UpdateBuffer(command, *m_upload, m_table->Handle(), uint64_t {table_index} * TableStride, tombstone.data(),
 		             sizeof(tombstone));
 	};
 	for (const auto index: retry) {
@@ -1651,7 +1651,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	}
 	for (const auto& [index, table_index]: evicted) {
 		constexpr SlotInfo cleared {};
-		UpdateBuffer(command, m_slots->Handle(), uint64_t {index} * SlotStride, &cleared, sizeof(cleared));
+		UpdateBuffer(command, *m_upload, m_slots->Handle(), uint64_t {index} * SlotStride, &cleared, sizeof(cleared));
 		if (table_index != UINT32_MAX) {
 			forget(table_index);
 		}
@@ -1659,11 +1659,11 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	for (const auto& [index, key, encoded]: host_writes) {
 		const std::array<uint32_t, 4> entry {static_cast<uint32_t>(key), static_cast<uint32_t>(key >> 32u),
 		                                     encoded, 0};
-		UpdateBuffer(command, m_table->Handle(), uint64_t {TableEntries + index} * TableStride, entry.data(),
+		UpdateBuffer(command, *m_upload, m_table->Handle(), uint64_t {TableEntries + index} * TableStride, entry.data(),
 		             sizeof(entry));
 	}
 	for (const auto& [index, info]: reallocated) {
-		UpdateBuffer(command, m_slots->Handle(), uint64_t {index} * SlotStride, &info, sizeof(info));
+		UpdateBuffer(command, *m_upload, m_slots->Handle(), uint64_t {index} * SlotStride, &info, sizeof(info));
 	}
 	command.fillBuffer(m_walk_state->Handle(), 0, StateSize, 0);
 	MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
@@ -1679,7 +1679,7 @@ void RayTracing::Prepare(const CommandRecorder& command, uint64_t user_pointer,
 	                                                  in_srt(source.header_slots[1]));
 	const uint64_t given           = in_user ? UserDataHeader(user_pointer) : source.header;
 	if (header_given) {
-		UpdateBuffer(command, m_walk_state->Handle(), offsetof(RtState, header_va), &given, sizeof(given));
+		UpdateBuffer(command, *m_upload, m_walk_state->Handle(), offsetof(RtState, header_va), &given, sizeof(given));
 		MemoryBarrier(command, vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferWrite,
 		              vk::PipelineStageFlagBits2::eComputeShader | vk::PipelineStageFlagBits2::eTransfer,
 		              vk::AccessFlagBits2::eShaderRead | vk::AccessFlagBits2::eShaderWrite |
@@ -2249,7 +2249,7 @@ void RayTracing::RecordHleRefit(const CommandRecorder& command, std::span<const 
 	const auto upload = [&](uint64_t offset, const uint8_t* data, uint64_t size) {
 		for (uint64_t done = 0; done < size;) {
 			const auto chunk = static_cast<uint32_t>(std::min<uint64_t>(size - done, 65536));
-			UpdateBuffer(command, m_hle_jobs->Handle(), offset + done, data + done, chunk);
+			UpdateBuffer(command, *m_upload, m_hle_jobs->Handle(), offset + done, data + done, chunk);
 			done += chunk;
 		}
 	};

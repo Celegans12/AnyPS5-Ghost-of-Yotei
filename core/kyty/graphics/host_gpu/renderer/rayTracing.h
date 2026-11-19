@@ -344,6 +344,7 @@ private:
 	std::unique_ptr<Buffer> m_layouts;
 	std::unique_ptr<Buffer> m_build_scratch;
 	std::unique_ptr<Buffer> m_tlas_storage;
+	std::unique_ptr<StreamBuffer> m_upload;
 	vk::AccelerationStructureKHR m_tlas         = nullptr;
 	vk::DeviceAddress            m_tlas_address = 0;
 	uint64_t                     m_tlas_scratch_size = 0;
