@@ -840,6 +840,20 @@ uint64_t CommandProcessor::EmitCallback(GpuCallback&& callback, const GpuGuestWr
 	return Emit(std::move(operation));
 }
 
+#if defined(ANYPS5_KYTY)
+static bool IdleSubmitEnabled() {
+	static const bool enabled = [] {
+		const char*            value = std::getenv("KYTY_IDLE_SUBMIT");
+		const std::string_view text {value == nullptr ? "" : value};
+		if (!text.empty() && text != "0" && text != "1") {
+			EXIT("invalid KYTY_IDLE_SUBMIT: %s (0 or 1)\n", value);
+		}
+		return text != "0";
+	}();
+	return enabled;
+}
+
+#endif
 void CommandProcessor::Execute(GpuOperation& operation) {
 	EXIT_IF(operation.processor != this);
 	if (operation.scout_packet != nullptr && Scout::Running())
@@ -869,14 +883,41 @@ void CommandProcessor::Execute(GpuOperation& operation) {
 		}
 	}
 	m_renderer.GetBufferCache().SetStreamInPlace(operation.stream_in_place);
+#if defined(ANYPS5_KYTY)
+	const bool submit_when_idle =
+	    IdleSubmitEnabled() && operation.kind != GpuOperationKind::Callback;
+#else
+	const bool submit_when_idle = false;
+#endif
 	struct CommitWriteTicks {
 		RenderContext& renderer;
+		bool           submit_when_idle;
 		~CommitWriteTicks() {
+			auto& scheduler = renderer.GetCommandScheduler();
 			if (renderer.GetBufferCache().CommitWriteTicks()) {
-				renderer.GetCommandScheduler().Flush();
+				scheduler.Flush();
+			} else if (submit_when_idle) {
+				const auto submitted = scheduler.SubmittedTick();
+				if (submitted + 1 != scheduler.CurrentTick()) {
+					return;
+				}
+				auto& master = scheduler.GetMasterSemaphore();
+				bool  idle   = master.IsFree(submitted);
+				if (!idle) {
+					static thread_local std::chrono::steady_clock::time_point last_refresh {};
+					const auto now = std::chrono::steady_clock::now();
+					if (now - last_refresh >= std::chrono::microseconds(25)) {
+						last_refresh = now;
+						master.Refresh();
+						idle = master.IsFree(submitted);
+					}
+				}
+				if (idle) {
+					scheduler.Flush();
+				}
 			}
 		}
-	} commit_write_ticks {m_renderer};
+	} commit_write_ticks {m_renderer, submit_when_idle};
 	switch (operation.kind) {
 		case GpuOperationKind::DrawIndex:
 		case GpuOperationKind::DrawAuto: {
