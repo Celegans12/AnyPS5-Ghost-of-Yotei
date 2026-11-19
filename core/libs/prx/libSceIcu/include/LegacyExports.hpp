@@ -7,6 +7,8 @@ namespace Icu {
 struct Converter;
 } // namespace Icu
 
+struct UEnumeration;
+
 extern "C" {
 
 int APS5_VABI sceIcuLegacyUnknown__plus__plus_DD8eRY6mw_nid_no_patch();
@@ -120,7 +122,6 @@ int APS5_VABI _ZNK6icu_6810ICUService6getKeyERNS_13ICUServiceKeyEPNS_13UnicodeSt
 int APS5_VABI uprv_toupper_nid_postfix();
 int APS5_VABI sceIcuLegacyUnknown_1LicYZSc3Q8_nid_no_patch();
 int APS5_VABI _ZN6icu_686LocaleC2EOS0__nid_postfix();
-int APS5_VABI ucnv_fixFileSeparator_nid_postfix();
 int APS5_VABI _ZN6icu_6812ResourceSinkD0Ev_nid_postfix();
 int APS5_VABI _ZN6icu_686UStackC2EiR10UErrorCode_nid_postfix();
 int APS5_VABI sceIcuLegacyUnknown_1Zjsilgzlps_nid_no_patch();
@@ -288,7 +289,7 @@ int APS5_VABI sceIcuLegacyUnknown_661mp52xIO4_nid_no_patch();
 int APS5_VABI _ZNK6icu_6819FilteredNormalizer213normalizeUTF8EjNS_11StringPieceERNS_8ByteSinkEPNS_5EditsER10UErrorCode_nid_postfix();
 int APS5_VABI _ZN6icu_6815MaybeStackArrayIcLi40EEaSEOS1__nid_postfix();
 int APS5_VABI sceIcuLegacyUnknown_68uKzUhNGcw_nid_no_patch();
-int APS5_VABI ucnv_openAllNames_nid_postfix();
+UEnumeration* APS5_VABI ucnv_openAllNames_nid_postfix(std::int32_t*);
 int APS5_VABI _ZN6icu_6822RuleBasedBreakIterator18handleSafePreviousEi_nid_postfix();
 int APS5_VABI utext_current32_nid_postfix();
 int APS5_VABI sceIcuLegacyUnknown_6E6JYwebVac_nid_no_patch();
@@ -1826,7 +1827,6 @@ int APS5_VABI _ZN6icu_6813UnicodeStringC2ERKS0__nid_postfix();
 int APS5_VABI _ZN6icu_686Locale12initBaseNameER10UErrorCode_nid_postfix();
 int APS5_VABI uhash_put_nid_postfix();
 int APS5_VABI sceIcuLegacyUnknown_nlKvBmVpu_plus_4_nid_no_patch();
-int APS5_VABI udata_close_nid_postfix();
 int APS5_VABI _ZNK6icu_6817StringEnumerationeqERKS0__nid_postfix();
 int APS5_VABI sceIcuLegacyUnknown_nqVb8g_plus_RaW8_nid_no_patch();
 int APS5_VABI sceIcuLegacyUnknown_nsQsk5TUH2M_nid_no_patch();
@@ -1868,7 +1868,7 @@ int APS5_VABI sceIcuLegacyUnknown_osoom0ghhoE_nid_no_patch();
 int APS5_VABI _ZNK6icu_6815Normalizer2Impl20hasCompBoundaryAfterEPKhS2_a_nid_postfix();
 int APS5_VABI _ZNK6icu_689ErrorCode13assertSuccessEv_nid_postfix();
 int APS5_VABI sceIcuLegacyUnknown_p0Bb5fo1gx8_nid_no_patch();
-int APS5_VABI uprv_tzname_clear_cache_nid_postfix();
+void APS5_VABI uprv_tzname_clear_cache_nid_postfix();
 int APS5_VABI sceIcuLegacyUnknown_p1py_plus_0pWihc_nid_no_patch();
 int APS5_VABI _ZN6icu_6810Normalizer5resetEv_nid_postfix();
 int APS5_VABI _ZNK6icu_6819FilteredNormalizer211composePairEii_nid_postfix();
@@ -1929,7 +1929,6 @@ int APS5_VABI _ZN6icu_6811ICUNotifierD1Ev_nid_postfix();
 int APS5_VABI _ZN6icu_6815MaybeStackArrayIcLi40EE6resizeEii_nid_postfix();
 int APS5_VABI _ZN6icu_6810UnicodeSet10setToBogusEv_nid_postfix();
 int APS5_VABI sceIcuLegacyUnknown_qisHypG_plus_THA_nid_no_patch();
-int APS5_VABI ures_initStackObject_nid_postfix();
 int APS5_VABI _ZN6icu_6822SimpleLocaleKeyFactoryC1EPNS_7UObjectERKNS_6LocaleEii_nid_postfix();
 int APS5_VABI sceIcuLegacyUnknown_qsrqpMOCXYE_nid_no_patch();
 int APS5_VABI uhash_iremovei_nid_postfix();
