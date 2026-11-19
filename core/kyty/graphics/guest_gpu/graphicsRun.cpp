@@ -1700,6 +1700,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	EXIT_IF(commands.size() > UINT32_MAX);
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
 		m_renderer.CollectHotPageWrites();
+		m_renderer.GetBufferCache().NoteCommandBuffer(reinterpret_cast<uint64_t>(commands.data()), commands.size_bytes());
 		execution.m_buffer_stack.push_back({commands});
 	}
 	execution.m_suspended     = false;
@@ -1721,6 +1722,7 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 void CommandProcessor::ProcessIndirectBuffer(std::span<const uint32_t> commands, bool chain) {
 	EXIT_IF(g_current_execution == nullptr);
 	EXIT_IF(!g_current_execution->m_next_buffer.empty());
+	m_renderer.GetBufferCache().NoteCommandBuffer(reinterpret_cast<uint64_t>(commands.data()), commands.size_bytes());
 	g_current_execution->m_next_buffer = commands;
 	g_current_execution->m_chain       = chain;
 }

@@ -3363,11 +3363,11 @@ bool TextureCache::IsRegionGpuModified(uint64_t address, uint64_t size) {
 	return modified;
 }
 
-void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
+bool TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 	ImagePageTable::PageRange pages {};
 	if (ImagePageTable::TryGetPageRange(address, size, pages) &&
 	    !m_registered_pages.Any(pages.first, pages.last_exclusive)) {
-		return;
+		return false;
 	}
 	FlushLazyReadback(address, size);
 	std::scoped_lock lock {m_lock};
@@ -3396,6 +3396,7 @@ void TextureCache::InvalidateMemory(uint64_t address, uint64_t size) {
 			MarkAsMaybeDirty(id, owner);
 		}
 	}
+	return image_ids.size() != 0;
 }
 
 bool TextureCache::IsMeta(uint64_t address) {

@@ -91,6 +91,12 @@ struct WriteBlockStats {
 	std::atomic<uint64_t> blocks {0};
 	std::atomic<uint64_t> pages {0};
 	std::atomic<uint64_t> uploaded {0};
+	std::atomic<uint64_t> command {0};
+	std::atomic<uint64_t> segment {0};
+	std::atomic<uint64_t> gpu {0};
+	std::atomic<uint64_t> image {0};
+	std::atomic<uint64_t> buffer {0};
+	std::atomic<uint64_t> other {0};
 	std::atomic<int64_t>  last_line {0};
 };
 
@@ -485,19 +491,28 @@ static bool WriteFaultBlocks() {
 	return on;
 }
 
-void BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
-	static constexpr uint64_t FaultBlockSize = 64 * 1024;
+BufferCache::WriteFaultOwner BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
+	static constexpr uint64_t FaultBlockSize = CommandBlocks::BlockSize;
 	static_assert(TRACKER_REGION_SIZE % FaultBlockSize == 0);
-	const auto page = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
-	m_memory_tracker.NoteGuestWriteFault(page);
-	if (WriteFaultBlocks() && !GuestGpu::IsGpuThread() && !GuestGpu::IsCommandProcessorThread() &&
-	    GuestRange {Common::AlignDown(page, FaultBlockSize), FaultBlockSize}.Valid()) {
-		auto& stats = g_write_block_stats;
-		stats.faults.fetch_add(1, std::memory_order_relaxed);
-		if (const auto opened = m_memory_tracker.OpenWriteBlock(page, FaultBlockSize); opened != 0) {
+	const auto page  = Common::AlignDown(vaddr, TRACKER_PAGE_SIZE);
+	auto       owner = WriteFaultOwner::Other;
+	if (GuestGpu::IsGpuThread() || GuestGpu::IsCommandProcessorThread() ||
+	    !GuestRange {Common::AlignDown(page, FaultBlockSize), FaultBlockSize}.Valid()) {
+		m_memory_tracker.NoteGuestWriteFault(page);
+	} else {
+		const bool command = m_memory_tracker.IsCommandBlock(page);
+		const bool segment = !command && m_memory_tracker.IsSegmentBlock(page);
+		const auto probe   = m_memory_tracker.OpenWriteBlock(page, FaultBlockSize, (command || segment) && WriteFaultBlocks());
+		owner              = command       ? WriteFaultOwner::CommandBuffer
+		                     : segment       ? WriteFaultOwner::CommandSegment
+		                     : probe.gpu     ? WriteFaultOwner::GpuNeighbor
+		                     : probe.tracked ? WriteFaultOwner::Buffer
+		                                     : WriteFaultOwner::Other;
+		if (probe.opened != 0) {
+			auto& stats = g_write_block_stats;
 			stats.blocks.fetch_add(1, std::memory_order_relaxed);
-			stats.pages.fetch_add(opened, std::memory_order_relaxed);
-			return;
+			stats.pages.fetch_add(probe.opened, std::memory_order_relaxed);
+			return owner;
 		}
 	}
 	const auto end  = Common::AlignDown(page, FaultBlockSize) + FaultBlockSize;
@@ -505,9 +520,22 @@ void BufferCache::InvalidateFaultedPage(uint64_t vaddr) {
 	    m_memory_tracker.IsRegionCpuModified(page - TRACKER_PAGE_SIZE, TRACKER_PAGE_SIZE) &&
 	    !m_memory_tracker.IsRegionGpuModified(page, end - page)) {
 		InvalidateMemory(page, end - page, true);
-		return;
+		return owner;
 	}
 	InvalidateMemory(vaddr, 1, true);
+	return owner;
+}
+
+void BufferCache::CountWriteFault(WriteFaultOwner owner, bool image) {
+	auto& stats = g_write_block_stats;
+	stats.faults.fetch_add(1, std::memory_order_relaxed);
+	auto& counter = owner == WriteFaultOwner::CommandBuffer    ? stats.command
+	                : owner == WriteFaultOwner::CommandSegment ? stats.segment
+	                : owner == WriteFaultOwner::GpuNeighbor    ? stats.gpu
+	                : image                                 ? stats.image
+	                : owner == WriteFaultOwner::Buffer      ? stats.buffer
+	                                                        : stats.other;
+	counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write, bool guest_fault) {
@@ -602,14 +630,25 @@ void BufferCache::LogWriteBlockSummary() {
 	const auto blocks   = stats.blocks.exchange(0, std::memory_order_relaxed);
 	const auto pages    = stats.pages.exchange(0, std::memory_order_relaxed);
 	const auto uploaded = stats.uploaded.exchange(0, std::memory_order_relaxed);
+	const auto command  = stats.command.exchange(0, std::memory_order_relaxed);
+	const auto segment  = stats.segment.exchange(0, std::memory_order_relaxed);
+	const auto gpu      = stats.gpu.exchange(0, std::memory_order_relaxed);
+	const auto image    = stats.image.exchange(0, std::memory_order_relaxed);
+	const auto buffer   = stats.buffer.exchange(0, std::memory_order_relaxed);
+	const auto other    = stats.other.exchange(0, std::memory_order_relaxed);
+	const auto opened   = RegionManager::TakeOpenedUploadBytes();
 	if (faults == 0 && uploaded == 0) {
 		return;
 	}
 	::Log::WriteToConsoleAndLog(fmt::format(
 	    "[kyty-write-blocks] summary of the last {:.0f} s: {} guest write faults, {} opened their 64 KiB block ({} clean pages "
-	    "marked written with them), {} left to the page path; {:.1f} MiB of buffer uploads\n",
-	    static_cast<double>(now - last) / 1e9, faults, blocks, pages, faults - blocks,
-	    static_cast<double>(uploaded) / (1024.0 * 1024.0)));
+	    "marked written with them), {} left to the page path; {:.1f} MiB of buffer uploads; faults by owner, first match: {} in "
+	    "a command buffer the CP read, {} elsewhere in a command buffer segment, {} in a block with a page the GPU wrote, {} "
+	    "watched by an image or texture, {} in a buffer of the cache, {} other; {:.1f} MiB of pages opened with a block handed "
+	    "to uploads\n",
+	    static_cast<double>(now - last) / 1e9, faults, blocks, pages, faults - std::min(faults, blocks),
+	    static_cast<double>(uploaded) / (1024.0 * 1024.0), command, segment, gpu, image, buffer, other,
+	    static_cast<double>(opened) / (1024.0 * 1024.0)));
 }
 
 void BufferCache::LogReadbackSummary() {
@@ -2961,7 +3000,9 @@ uint64_t BufferCache::SplitUnmappedBuffers(uint64_t vaddr, uint64_t size, FreeBl
 
 uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, bool read_back, FreeBlocksQuery free_blocks,
                                      FreeBlockSplits* splits) {
-	if (size == 0 || UINT64_MAX - vaddr < size || !IsRegionRegistered(vaddr, size)) return 0;
+	if (size == 0 || UINT64_MAX - vaddr < size) return 0;
+	ForgetCommandBuffers(vaddr, size);
+	if (!IsRegionRegistered(vaddr, size)) return 0;
 	if (read_back) {
 		InvalidateMemory(vaddr, size);
 	} else {

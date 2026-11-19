@@ -625,6 +625,12 @@ extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address,
     static_cast<void>(bytes);
 }
 
+extern "C" void AgcDriverNoteCommandSegment_nid_no_patch(std::uint64_t address, std::size_t bytes) {
+    if (auto* renderer = KytyShim::Entry::state().renderer.load(std::memory_order_acquire)) {
+        renderer->GetBufferCache().NoteCommandSegment(address, bytes);
+    }
+}
+
 extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std::uint64_t value) {
     KytyShim::Entry::CheckMappedRange(pointer, sizeof(*pointer), std::atomic_ref<std::uint64_t>::required_alignment);
     const auto address = reinterpret_cast<std::uint64_t>(pointer);

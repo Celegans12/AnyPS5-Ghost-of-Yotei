@@ -317,17 +317,20 @@ void ImageHeap::Unwatch(const Memory& memory) {
 	    [&](size_t begin, size_t end) { Watch<false>(memory, begin, end); });
 }
 
-void ImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
+bool ImageHeap::InvalidateMemory(uint64_t address, uint64_t size) {
 	std::scoped_lock lock {m_mutex};
+	bool             watched = false;
 	for (auto& memory: m_memories) {
 		const auto origin = Common::AlignDown(memory->base, TRACKER_PAGE_SIZE);
 		const auto begin  = std::max(address, origin);
 		const auto end    = std::min(address + size,
 		                             origin + memory->dirty_pages.size() * TRACKER_PAGE_SIZE);
 		if (begin >= end) continue;
+		watched = true;
 		MarkDirty(*memory, (begin - origin) / TRACKER_PAGE_SIZE,
 		          (end - 1u - origin) / TRACKER_PAGE_SIZE + 1u);
 	}
+	return watched;
 }
 
 void ImageHeap::UpdateProbes(View& view, uint64_t begin, uint64_t end) {

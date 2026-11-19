@@ -284,3 +284,8 @@ extern "C" void AgcDriverPrepareCommandWrite_nid_no_patch(std::uint64_t address,
     if (AgcDriver::Graphics::Recorder::SnapshotWriteOverlaps(address, bytes))
         AgcDriver::GuestMemory::FlushGpuWrites(address, bytes);
 }
+
+extern "C" void AgcDriverNoteCommandSegment_nid_no_patch(std::uint64_t address, std::size_t bytes) {
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+}

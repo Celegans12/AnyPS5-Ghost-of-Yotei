@@ -176,27 +176,43 @@ public:
 		return GetBits<source>().Any(start, end);
 	}
 
-	[[nodiscard]] uint32_t OpenWriteBlock(uint64_t offset, uint64_t block_size) {
-		const auto page = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
-		if (m_gpu_dirty.Get(page)) {
-			return 0;
-		}
+	struct WriteBlockProbe {
+		uint32_t opened  = 0;
+		bool     gpu     = false;
+		bool     tracked = false;
+	};
+
+	[[nodiscard]] WriteBlockProbe OpenWriteBlock(uint64_t offset, uint64_t block_size, bool open_block) {
+		const auto page  = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
 		const auto first = static_cast<size_t>(offset / block_size * block_size / TRACKER_PAGE_SIZE);
 		const auto last  = first + static_cast<size_t>(block_size / TRACKER_PAGE_SIZE);
+		WriteBlockProbe probe {.gpu = m_gpu_written.Any(first, last), .tracked = !m_cpu_dirty.Get(page)};
+		NoteGuestWriteFault(offset);
+		if (!open_block || m_gpu_dirty.Get(page)) {
+			return probe;
+		}
 		RegionBits open(~m_gpu_dirty, first, last);
 		RegionBits noted(m_gpu_noted, first, last);
 		noted.Unset(page);
 		open &= ~noted;
 		RegionBits clean(~m_cpu_dirty, first, last);
 		clean &= open;
-		uint32_t opened = 0;
 		for (const auto [begin, end]: clean) {
-			opened += static_cast<uint32_t>(end - begin);
+			probe.opened += static_cast<uint32_t>(end - begin);
 		}
 		for (const auto [begin, end]: open) {
 			ChangeState<DirtySource::Cpu, true>(begin * TRACKER_PAGE_SIZE, (end - begin) * TRACKER_PAGE_SIZE);
 		}
-		return opened;
+		clean.Unset(page);
+		if (!clean.None()) {
+			m_block_opened |= clean;
+			m_any_block_opened = true;
+		}
+		return probe;
+	}
+
+	[[nodiscard]] static uint64_t TakeOpenedUploadBytes() noexcept {
+		return s_opened_upload_bytes.exchange(0, std::memory_order_relaxed);
 	}
 
 	template <DirtySource source, bool enable>
@@ -223,6 +239,9 @@ public:
 				s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 				BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
 			}
+			if constexpr (!enable) {
+				NoteOpenedUpload(nullptr, changed);
+			}
 			m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
 			UpdateProtection<!enable, false>(changed);
 		} else {
@@ -247,6 +266,7 @@ public:
 		if constexpr (clear) {
 			bits.UnsetRange(start, end);
 			if constexpr (source == DirtySource::Cpu) {
+				NoteOpenedUpload(&mask, mask);
 				m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
 				UpdateProtection<true, false>(mask);
 			} else {
@@ -275,6 +295,7 @@ public:
 		for (const auto [first, last]: mask) {
 			m_cpu_dirty.UnsetRange(first, last);
 		}
+		NoteOpenedUpload(&mask, mask);
 		m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
 		UpdateProtection<true, false>(mask);
 		for (size_t index = 0; index < ranges.size(); index++) {
@@ -327,6 +348,7 @@ public:
 				}
 			}
 		}
+		NoteOpenedUpload(&mask, clean);
 		m_has_cpu_dirty.store(!m_cpu_dirty.None(), std::memory_order_release);
 		UpdateProtection<true, false>(clean);
 		if (kept) {
@@ -400,6 +422,25 @@ public:
 	TrackingSpinLock lock;
 
 private:
+	void NoteOpenedUpload(const RegionBits* uploaded, const RegionBits& cleaned) {
+		if (!m_any_block_opened) {
+			return;
+		}
+		if (uploaded != nullptr) {
+			RegionBits hit(*uploaded);
+			hit &= m_block_opened;
+			uint64_t pages = 0;
+			for (const auto [first, last]: hit) {
+				pages += last - first;
+			}
+			if (pages != 0) {
+				s_opened_upload_bytes.fetch_add(pages * TRACKER_PAGE_SIZE, std::memory_order_relaxed);
+			}
+		}
+		m_block_opened &= ~cleaned;
+		m_any_block_opened = !m_block_opened.None();
+	}
+
 	template <bool track, bool is_read>
 	void UpdateProtection(RegionBits& changed) {
 		if (changed.None()) {
@@ -451,6 +492,8 @@ private:
 	};
 	RegionBits                 m_gpu_written;
 	RegionBits                 m_gpu_noted;
+	RegionBits                 m_block_opened;
+	bool                       m_any_block_opened = false;
 	std::unique_ptr<BusyPages> m_busy;
 	std::atomic<uint32_t>      m_kept_sync {0};
 	std::atomic<uint64_t> m_host_write_epoch {0};
@@ -458,6 +501,7 @@ private:
 
 	inline static std::atomic<uint64_t> s_cpu_dirty_epoch {0};
 	inline static std::atomic<uint64_t> s_gpu_clean_epoch {0};
+	inline static std::atomic<uint64_t> s_opened_upload_bytes {0};
 };
 
 }

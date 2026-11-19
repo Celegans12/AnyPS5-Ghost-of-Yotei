@@ -36,7 +36,7 @@ public:
 	                 ShaderRecompiler::IR::ImageHeapView&       result) override;
 	void Rebind(RenderExecutor& executor);
 	void Commit(CommandBuffer& buffer, vk::PipelineBindPoint bind_point, vk::PipelineLayout layout);
-	void InvalidateMemory(uint64_t address, uint64_t size);
+	bool InvalidateMemory(uint64_t address, uint64_t size);
 	void UnmapMemory(uint64_t address, uint64_t size);
 	void RunGarbageCollector();
 

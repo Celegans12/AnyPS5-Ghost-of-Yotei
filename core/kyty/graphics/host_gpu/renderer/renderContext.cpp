@@ -120,12 +120,13 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 		m_bda_generation++;
 	}
 	if (access == PageFaultAccess::Write) {
-		m_buffer_cache.InvalidateFaultedPage(fault_vaddr);
-		m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
-		m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
+		const auto owner   = m_buffer_cache.InvalidateFaultedPage(fault_vaddr);
+		const bool texture = m_texture_cache.InvalidateMemory(fault_vaddr, fault_size);
+		const bool heap    = m_image_heap.InvalidateMemory(fault_vaddr, fault_size);
 		m_strict_watch.InvalidateMemory(fault_vaddr, fault_size);
 		if (!GuestGpu::IsGpuThread() && !GuestGpu::IsCommandProcessorThread()) {
 			m_page_manager.NoteWriteFault(fault_vaddr);
+			BufferCache::CountWriteFault(owner, texture || heap);
 		}
 	} else {
 		m_buffer_cache.ReadMemory(fault_vaddr, fault_size, false, true);
@@ -397,6 +398,7 @@ void RenderContext::UnmapMemory(uint64_t vaddr, uint64_t size) {
 			m_command_scheduler.WaitPriorityOperations(tick);
 		}
 		const bool registered = size != 0 && m_buffer_cache.IsRegionRegistered(vaddr, size);
+		m_buffer_cache.ForgetCommandBuffers(vaddr, size);
 		m_buffer_cache.InvalidateMemory(vaddr, size);
 		if (registered) {
 			m_buffer_cache.DeleteUnmappedBuffers(vaddr, size);

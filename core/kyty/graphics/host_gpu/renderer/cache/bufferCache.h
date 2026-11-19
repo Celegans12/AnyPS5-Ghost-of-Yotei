@@ -101,7 +101,24 @@ public:
 	                                   std::vector<std::pair<uint64_t, uint64_t>>& ranges) const;
 	[[nodiscard]] bool TakeRegistrationSpans(std::vector<GuestRange>& spans);
 	void EnsureBdaReadable(std::span<const GuestRange> ranges);
-	void                   InvalidateFaultedPage(uint64_t vaddr);
+	enum class WriteFaultOwner : uint8_t { CommandBuffer, CommandSegment, GpuNeighbor, Buffer, Other };
+	WriteFaultOwner        InvalidateFaultedPage(uint64_t vaddr);
+	static void            CountWriteFault(WriteFaultOwner owner, bool image);
+	void NoteCommandBuffer(uint64_t vaddr, uint64_t size) {
+		if (size != 0 && GuestRange {vaddr, size}.Valid()) {
+			m_memory_tracker.MarkCommandBlocks(vaddr, size);
+		}
+	}
+	void NoteCommandSegment(uint64_t vaddr, uint64_t size) {
+		if (size != 0 && GuestRange {vaddr, size}.Valid()) {
+			m_memory_tracker.MarkSegmentBlocks(vaddr, size);
+		}
+	}
+	void ForgetCommandBuffers(uint64_t vaddr, uint64_t size) {
+		if (size != 0 && GuestRange {vaddr, size}.Valid()) {
+			m_memory_tracker.ForgetCommandBlocks(vaddr, size);
+		}
+	}
 	uint64_t               DeleteUnmappedBuffers(uint64_t vaddr, uint64_t size);
 	using FreeBlocksQuery = bool (*)(uint64_t begin, uint64_t end, std::vector<std::pair<uint64_t, uint64_t>>* blocks);
 	struct FreeBlockSplits {

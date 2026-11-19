@@ -2,6 +2,7 @@
 #define EMULATOR_SRC_GRAPHICS_HOST_GPU_MEMORYTRACKER_H_
 
 #include "common/assert.h"
+#include "graphics/host_gpu/commandBlocks.h"
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/rangeSet.h"
 #include "graphics/host_gpu/regionManager.h"
@@ -101,18 +102,27 @@ public:
 		}
 	}
 
-	[[nodiscard]] uint32_t OpenWriteBlock(uint64_t vaddr, uint64_t block_size) {
+	[[nodiscard]] RegionManager::WriteBlockProbe OpenWriteBlock(uint64_t vaddr, uint64_t block_size, bool open_block) {
 		const auto index = vaddr / TRACKER_REGION_SIZE;
 		if (index >= REGION_COUNT) {
-			return 0;
+			return {};
 		}
 		auto* manager = m_regions[index].load(std::memory_order_acquire);
 		if (manager == nullptr) {
-			return 0;
+			return {};
 		}
 		std::scoped_lock lock(manager->lock);
-		return manager->OpenWriteBlock(vaddr % TRACKER_REGION_SIZE, block_size);
+		return manager->OpenWriteBlock(vaddr % TRACKER_REGION_SIZE, block_size, open_block);
 	}
+
+	void MarkCommandBlocks(uint64_t vaddr, uint64_t size) { m_command_blocks.Mark(vaddr, size); }
+	void MarkSegmentBlocks(uint64_t vaddr, uint64_t size) { m_segment_blocks.Mark(vaddr, size); }
+	void ForgetCommandBlocks(uint64_t vaddr, uint64_t size) {
+		m_command_blocks.Forget(vaddr, size);
+		m_segment_blocks.Forget(vaddr, size);
+	}
+	[[nodiscard]] bool IsCommandBlock(uint64_t vaddr) const noexcept { return m_command_blocks.Contains(vaddr); }
+	[[nodiscard]] bool IsSegmentBlock(uint64_t vaddr) const noexcept { return m_segment_blocks.Contains(vaddr); }
 
 	[[nodiscard]] bool TakeKeptPages() {
 		return m_kept_pages.exchange(false, std::memory_order_relaxed);
@@ -366,6 +376,8 @@ public:
 
 private:
 	static constexpr size_t REGION_COUNT = TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE;
+	static_assert(CommandBlocks::AddressSize == TRACKER_ADDRESS_SIZE);
+	static_assert(TRACKER_REGION_SIZE % CommandBlocks::BlockSize == 0);
 
 	inline static thread_local bool                         s_upload_takes_protections = false;
 #if defined(ANYPS5_KYTY) && defined(_WIN32) && !defined(__clang__)
@@ -430,6 +442,8 @@ private:
 	RegionManager* GetOrCreateRegion(uint64_t index);
 
 	std::atomic<bool> m_kept_pages {false};
+	CommandBlocks     m_command_blocks;
+	CommandBlocks     m_segment_blocks;
 
 	std::unique_ptr<std::atomic<RegionManager*>[]> m_regions;
 	std::vector<std::unique_ptr<RegionManager>>    m_region_storage;

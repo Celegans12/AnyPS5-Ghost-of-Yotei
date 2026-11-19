@@ -58,6 +58,20 @@ std::uint32_t available(const CommandBuffer& buffer, const char* function) {
     return static_cast<std::uint32_t>(count - buffer.reserved_dw);
 }
 
+#if defined(ANYPS5_KYTY)
+void NoteSegment(const CommandBuffer& buffer) {
+    thread_local const std::uint32_t* noted_bottom = nullptr;
+    thread_local const std::uint32_t* noted_top = nullptr;
+    if (buffer.bottom == noted_bottom && buffer.top == noted_top) return;
+    noted_bottom = buffer.bottom;
+    noted_top = buffer.top;
+    if (buffer.bottom != nullptr && buffer.top > buffer.bottom) {
+        AgcDriverNoteCommandSegment_nid_no_patch(reinterpret_cast<std::uint64_t>(buffer.bottom),
+                                                 static_cast<std::size_t>(buffer.top - buffer.bottom) * sizeof(std::uint32_t));
+    }
+}
+#endif
+
 struct Growing {
     const CommandBuffer* buffer;
     std::thread::id thread;
@@ -140,6 +154,9 @@ std::uint32_t* Allocate(CommandBuffer* buffer, std::uint32_t count, const char* 
         Require(available(*buffer, function) >= count, function, "command buffer allocation callback returned insufficient space");
     }
     auto* result = buffer->cursor_up;
+#if defined(ANYPS5_KYTY)
+    NoteSegment(*buffer);
+#endif
     AgcDriverPrepareCommandWrite_nid_no_patch(reinterpret_cast<std::uint64_t>(result), static_cast<std::size_t>(count) * sizeof(std::uint32_t));
     buffer->cursor_up += count;
     return result;
