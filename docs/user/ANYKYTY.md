@@ -168,6 +168,7 @@ All settings are environment variables, read once when the game starts. Most ref
 | `KYTY_GPU` | GPU index, `-1` for Kyty's choice (default) | Picks the Vulkan device. `ANYPS5_GPU` is not read with Kyty |
 | `KYTY_HDR` | `0`, `1` | Asks for an HDR10 output when the display offers it |
 | `KYTY_STRETCH` | `0`, `1` | Fills the window instead of keeping the game's aspect ratio |
+| `APS5_OUTPUT_RESOLUTION` | `<width>x<height>` | Output resolution reported to the game; unset, it follows the display. A size below 3840x2160 reports a sub-4K display, and a game that adapts to the display then renders fewer pixels. On a weaker GPU with a 4K display, `2560x1440` is worth a try. AnyKyty itself does not change the render size |
 
 **Speed**
 
