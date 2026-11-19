@@ -1616,24 +1616,6 @@ Value LaneMaskOf(const Inst* lane) {
 	return {};
 }
 
-Value ExecMaskOf(const Inst* exec) {
-	if (const auto mask = LaneMaskOf(exec); !mask.IsEmpty() || exec == nullptr || exec->GetOpcode() != ValueOpcode::Phi)
-		return mask;
-	for (const auto& inst: *exec->Parent()) {
-		if (inst.GetOpcode() != ValueOpcode::Phi || &inst == exec || inst.GetType() != Type::U32 ||
-		    inst.NumArgs() != exec->NumArgs())
-			continue;
-		bool same = true;
-		for (size_t arg = 0; arg < exec->NumArgs() && same; ++arg) {
-			const auto at = Incoming(inst, exec->PhiBlock(arg));
-			same = at < inst.NumArgs() && !inst.Arg(at).IsEmpty() &&
-			       LaneMaskOf(exec->Arg(arg).Resolve().TryInstruction()) == inst.Arg(at).Resolve();
-		}
-		if (same) return Value(const_cast<Inst*>(&inst));
-	}
-	return {};
-}
-
 std::optional<std::pair<uint32_t, bool>> TypeTest(Value condition, const Inst* node, uint32_t depth = 0) {
 	const auto* test = condition.Resolve().TryInstruction();
 	if (test != nullptr && test->GetOpcode() == ValueOpcode::LogicalAnd && depth < 4) {
@@ -2482,7 +2464,6 @@ struct LaneAlpha {
 	bool                           valid = false;
 	Value                          lod;
 	Value                          spread;
-	Value                          distance;
 	Value                          reference;
 	std::array<Value, 4>           material {};
 	std::array<Value, 4>           buffers {};
@@ -2515,8 +2496,7 @@ struct PacketWalk {
 	bool  any_hit = false;
 	Value alpha_off;
 	Value flip;
-	bool walked    = false;
-	bool wave_blas = false;
+	bool walked = false;
 	bool                                 leaf = false;
 	std::vector<std::pair<Block*, bool>> list_exits;
 	Value                                leaf_t;
@@ -3321,7 +3301,6 @@ bool DeriveLaneAlpha(const Program& program, const PacketWalk& w, const BlasWalk
 		}
 		a.reference = Value(std::bit_cast<uint32_t>(*ImmediateF32(product->first)));
 	}
-	if (const auto threshold = ImmediateF32(a.reference)) a.reference = Value(std::bit_cast<uint32_t>(*threshold));
 	for (auto at = BlockIndex(program, blas.header); at <= BlockIndex(program, blas.latch) && a.flag == nullptr; ++at) {
 		for (const auto& inst: *program.blocks[at]) {
 			if (inst.GetOpcode() != Op::SelectU32 || Immediate(inst.Arg(1)) != 1u || Immediate(inst.Arg(2)) != 0u) continue;
@@ -3525,17 +3504,11 @@ bool DeriveLaneAlpha(const Program& program, const PacketWalk& w, const BlasWalk
 	                                       : std::nullopt;
 	const auto* mad       = twice ? Producer(Canonical(twice->second), Op::FPMad32) : nullptr;
 	if (mad == nullptr) return false;
-	const auto hit_distance = [&](Value value) {
-		const auto* t = Canonical(value).TryInstruction();
-		return t != nullptr && WrittenHitDistance(Value(const_cast<Inst*>(t)), bvh) == RayQueryResultKind::T;
-	};
 	for (uint32_t side = 0; side < 2; ++side) {
-		const auto offset = Operands(Canonical(mad->Arg(side)), Op::FPAdd32, [&](Value term) { return hit_distance(term); });
-		if (hit_distance(mad->Arg(side)) || (offset && defined(Strip(offset->second)))) {
-			a.spread   = Strip(mad->Arg(1 - side));
-			a.lod      = Strip(mad->Arg(2));
-			a.distance = hit_distance(mad->Arg(side)) ? Value {} : Strip(offset->second);
-			if (const auto constant = ImmediateF32(a.distance)) a.distance = Value(std::bit_cast<uint32_t>(*constant));
+		const auto* t = Canonical(mad->Arg(side)).TryInstruction();
+		if (t != nullptr && WrittenHitDistance(Value(const_cast<Inst*>(t)), bvh) == RayQueryResultKind::T) {
+			a.spread = Strip(mad->Arg(1 - side));
+			a.lod    = Strip(mad->Arg(2));
 			break;
 		}
 	}
@@ -3878,7 +3851,7 @@ bool LeafFacing(const Program& program, PacketWalk& w, Value condition, bool neg
 	auto&     s = w.shape;
 	LaneTable lanes;
 	lanes.exec       = tri->Arg(2).Resolve().TryInstruction();
-	lanes.exec_mask  = ExecMaskOf(lanes.exec);
+	lanes.exec_mask  = LaneMaskOf(lanes.exec);
 	lanes.flags      = flags;
 	lanes.program    = flags ? &program : nullptr;
 	lanes.before     = flags ? w.header : nullptr;
@@ -4073,7 +4046,7 @@ bool LeafFacingCopies(const Program& program, PacketWalk& w, std::vector<Value>&
 		const auto* tri = tris[k];
 		LaneTable   lanes;
 		lanes.exec      = tri->Arg(2).Resolve().TryInstruction();
-		lanes.exec_mask = ExecMaskOf(lanes.exec);
+		lanes.exec_mask = LaneMaskOf(lanes.exec);
 		const auto raw  = [&](Value value, uint32_t component) {
 			const auto* extract = Producer(Canonical(value), ValueOpcode::CompositeExtractU32x4);
 			return extract != nullptr && extract->Arg(0).Resolve().TryInstruction() == tri &&
@@ -4519,7 +4492,7 @@ std::optional<LeafOpacity> DeriveLeafOpacity(const Program& program, const Packe
 	using Op = ValueOpcode;
 	if (atoms.size() != 3) return std::nullopt;
 	const auto& s = w.shape;
-	const auto flags_of = [&](Value value, uint32_t bit) -> std::optional<std::pair<uint32_t, uint32_t>> {
+	const auto flags_of = [&](Value value) -> std::optional<std::pair<uint32_t, uint32_t>> {
 		value             = Canonical(value);
 		uint32_t    shift = 0;
 		const auto* lsr   = Producer(value, Op::ShiftRightLogical32);
@@ -4530,7 +4503,7 @@ std::optional<LeafOpacity> DeriveLeafOpacity(const Program& program, const Packe
 			value = lsr->Arg(0);
 		}
 		const auto f = RecordField(program, s, value);
-		if (!f || ((f->second >> (shift + bit)) & 1u) == 0) return std::nullopt;
+		if (!f || f->second != ~0u) return std::nullopt;
 		return std::pair {f->first, shift};
 	};
 	constexpr size_t                             None = 8;
@@ -4543,23 +4516,22 @@ std::optional<LeafOpacity> DeriveLeafOpacity(const Program& program, const Packe
 			                           [](Value side) { return Immediate(side) == 0u; });
 			if (pair) value = pair->second;
 		}
-		Value bit_of, second_of;
+		Value bit_of;
 		if (atoms[k]->GetOpcode() == Op::IEqual32) {
 			const auto  pair = Operands(Value(const_cast<Inst*>(atoms[k])), Op::IEqual32,
 			                            [](Value side) { return Immediate(side) == 1u; });
 			const auto* bfe  = pair ? Producer(Canonical(pair->second), Op::BitFieldUExtract) : nullptr;
 			if (bfe != nullptr && Immediate(bfe->Arg(1)) == 0u && Immediate(bfe->Arg(2)) == 1u) bit_of = Canonical(bfe->Arg(0));
-			if (bfe != nullptr && Immediate(bfe->Arg(1)) == 1u && Immediate(bfe->Arg(2)) == 1u) second_of = Canonical(bfe->Arg(0));
 			const auto zero = Operands(Value(const_cast<Inst*>(atoms[k])), Op::IEqual32,
 			                           [](Value side) { return Immediate(side) == 0u; });
-			if (bit_of.IsEmpty() && second_of.IsEmpty() && zero && o.off == None && DefinedBefore(program, zero->second, w.header)) {
+			if (bit_of.IsEmpty() && zero && o.off == None && DefinedBefore(program, zero->second, w.header)) {
 				o.off         = k;
 				o.off_value   = zero->second.Resolve();
 				o.off_negated = true;
 				continue;
 			}
 		}
-		if (value.IsEmpty() && bit_of.IsEmpty() && second_of.IsEmpty()) return std::nullopt;
+		if (value.IsEmpty() && bit_of.IsEmpty()) return std::nullopt;
 		if (!value.IsEmpty() && o.off == None && DefinedBefore(program, value, w.header)) {
 			o.off       = k;
 			o.off_value = value.Resolve();
@@ -4573,10 +4545,9 @@ std::optional<LeafOpacity> DeriveLeafOpacity(const Program& program, const Packe
 			                                return word != nullptr && Immediate(word->Arg(1)) == 30u && is_word(word->Arg(0));
 		                                })
 		                     : std::nullopt;
-		const auto two = !second_of.IsEmpty() ? std::optional(std::pair {Value(2u), second_of})
-		                 : !value.IsEmpty()   ? Operands(value, Op::BitwiseAnd32, [](Value side) { return Immediate(side) == 2u; })
-		                                      : std::nullopt;
-		const auto f   = any ? flags_of(any->second, 0u) : two ? flags_of(two->second, 1u) : std::nullopt;
+		const auto two = !value.IsEmpty() ? Operands(value, Op::BitwiseAnd32, [](Value side) { return Immediate(side) == 2u; })
+		                                  : std::nullopt;
+		const auto f   = any ? flags_of(any->second) : two ? flags_of(two->second) : std::nullopt;
 		if (!f || (flags && *flags != *f)) return std::nullopt;
 		flags = f;
 		if (any && o.opaque == None) {
@@ -4846,11 +4817,10 @@ bool MatchOpaqueWaveLeaf(Program& program, PacketWalk& w, const BlasWalk& loop, 
 	return false;
 }
 
-bool MatchPacketWaveWalk(Program& program, PacketWalk& w, bool wave_blas) {
+bool MatchPacketWaveWalk(Program& program, PacketWalk& w) {
 	using Op = ValueOpcode;
 	auto& s  = w.shape;
-	if ((!w.walked && (!wave_blas || s.wave_copy != nullptr)) || s.wave_triangles == nullptr || !s.blases.empty())
-		return false;
+	if (!w.walked || s.wave_triangles == nullptr || !s.blases.empty()) return false;
 	const Inst* tri     = s.wave_triangles;
 	const auto  kind_of = [&](const Inst* value) { return WaveResultKind(program, s, tri, value); };
 	const auto  of_kind = [&](RayQueryResultKind kind) {
@@ -4871,15 +4841,10 @@ bool MatchPacketWaveWalk(Program& program, PacketWalk& w, bool wave_blas) {
 		return false;
 	};
 	if (!DeriveLaneAlpha(program, w, loop, tri, s.record, of_kind(RayQueryResultKind::Node), of_kind(RayQueryResultKind::Word),
-	                     alpha)) {
-		const bool opaque = MatchOpaqueWaveLeaf(program, w, loop, tri, kind_of, of_kind(RayQueryResultKind::Word), facing);
-		w.wave_blas       = opaque && !w.walked;
-		return opaque;
-	}
-	Value lanes, accept;
-	for (const auto kind: {RayQueryResultKind::T, RayQueryResultKind::Word, RayQueryResultKind::InstanceLo}) {
-		if (accept.IsEmpty()) accept = FlaggedAccept(program, loop, alpha, kind, kind_of, &lanes);
-	}
+	                     alpha))
+		return MatchOpaqueWaveLeaf(program, w, loop, tri, kind_of, of_kind(RayQueryResultKind::Word), facing);
+	Value      lanes;
+	const auto accept = FlaggedAccept(program, loop, alpha, RayQueryResultKind::T, kind_of, &lanes);
 	if (accept.IsEmpty() || !facing(lanes) || !w.cull.IsImmediate()) return false;
 	const Inst* phi  = nullptr;
 	const auto* both = Producer(accept, Op::LogicalAnd);
@@ -4930,7 +4895,6 @@ bool MatchPacketWaveWalk(Program& program, PacketWalk& w, bool wave_blas) {
 	w.any_hit              = true;
 	w.alpha                = alpha;
 	w.alpha_off            = opacity->off_value;
-	w.wave_blas            = !w.walked;
 	return true;
 }
 
@@ -5354,11 +5318,6 @@ void RewriteHitWalk(Program& program, PacketWalk& w, uint32_t site, bool entry_a
 		       before(lane.buffers[0]), before(lane.buffers[1]), before(lane.buffers[2]), before(lane.buffers[3]),
 		       reference, Value(lane.lod_offset), Value(lane.fields.Pack(s.layout))},
 		      flags(lane.scalar ? RayQueryAlphaScalar : RayQueryAlphaLane | (lane.factor.IsEmpty() ? 0u : RayQueryAlphaFactor)));
-		if (!lane.distance.IsEmpty()) {
-			const auto distance =
-			    lane.distance.GetType() == Type::F32 ? entry(Op::BitCastU32F32, {lane.distance}) : lane.distance;
-			entry(Op::RayQueryAlphaDistance, {distance}, flags(0u));
-		}
 	}
 	if (entry_alpha) {
 		RayTracingAlphaFields fields;
@@ -5581,56 +5540,47 @@ NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOp
 			return InLoop(program, block, walk.header, walk.latch);
 		});
 	};
-	const auto collect = [&](bool wave_blas) {
-		walks.clear();
-		for (auto* bvh: intersections) {
-			if (inside(bvh->Parent()) || (options.oracle & OracleOnly) != 0 || !compute) continue;
-			Walk walk;
-			bool found = false;
-			if (MatchPacketWalk(program, *bvh, walk.packet)) {
-				walk.header = walk.packet.header;
-				walk.latch  = walk.packet.latch;
-				if (MatchEntryWalk(program, options, walk.packet)) {
-					walk.kind = Kind::Entry;
-					found     = true;
-				} else if (MatchClosestLaneWalk(program, options, walk.packet)) {
-					walk.kind = Kind::ClosestLane;
-					found     = true;
-				} else if (MatchClosestOpaqueWalk(program, walk.packet) || MatchClosestWaveWalk(program, walk.packet)) {
-					walk.kind = walk.packet.leaf ? Kind::ClosestLeaf : Kind::ClosestOpaque;
-					found     = !walk.packet.leaf || MatchClosestLeafWalk(program, walk.packet);
-				} else if (MatchPacketLaneWalk(program, walk.packet) || MatchPacketWaveWalk(program, walk.packet, wave_blas)) {
-					walk.kind = Kind::PacketLane;
-					found     = true;
-				}
+	for (auto* bvh: intersections) {
+		if (inside(bvh->Parent()) || (options.oracle & OracleOnly) != 0 || !compute) continue;
+		Walk walk;
+		bool found = false;
+		if (MatchPacketWalk(program, *bvh, walk.packet)) {
+			walk.header = walk.packet.header;
+			walk.latch  = walk.packet.latch;
+			if (MatchEntryWalk(program, options, walk.packet)) {
+				walk.kind = Kind::Entry;
+				found     = true;
+			} else if (MatchClosestLaneWalk(program, options, walk.packet)) {
+				walk.kind = Kind::ClosestLane;
+				found     = true;
+			} else if (MatchClosestOpaqueWalk(program, walk.packet) || MatchClosestWaveWalk(program, walk.packet)) {
+				walk.kind = walk.packet.leaf ? Kind::ClosestLeaf : Kind::ClosestOpaque;
+				found     = !walk.packet.leaf || MatchClosestLeafWalk(program, walk.packet);
+			} else if (MatchPacketLaneWalk(program, walk.packet) || MatchPacketWaveWalk(program, walk.packet)) {
+				walk.kind = Kind::PacketLane;
+				found     = true;
 			}
-			if (!found && MatchFlatWalk(program, *bvh, walk.packet = {})) {
-				walk.kind   = Kind::Flat;
-				walk.header = walk.packet.header;
-				walk.latch  = walk.packet.latch;
-				found       = true;
-			}
-			if (!found && options.wave_size == 32 && MatchLaneMaskWalk(program, *bvh, walk.lane)) {
-				walk.kind   = Kind::LaneMask;
-				walk.header = walk.lane.header;
-				walk.latch  = walk.lane.latch;
-				found       = true;
-			}
-			if (!found && MatchPacketWalk(program, *bvh, walk.packet = {}) && MatchCandidateWalk(program, walk.packet)) {
-				walk.kind   = Kind::Candidate;
-				walk.header = walk.packet.header;
-				walk.latch  = walk.packet.latch;
-				found       = true;
-			}
-			if (found) walks.push_back(std::move(walk));
 		}
-	};
-	const auto wave_blas_hit = [](const Walk& walk) { return walk.kind == Kind::PacketLane && walk.packet.wave_blas; };
-	collect(true);
-	if (std::ranges::any_of(walks, wave_blas_hit) &&
-	    (!std::ranges::all_of(walks, wave_blas_hit) ||
-	     !std::ranges::all_of(intersections, [&](const Inst* bvh) { return inside(bvh->Parent()); })))
-		collect(false);
+		if (!found && MatchFlatWalk(program, *bvh, walk.packet = {})) {
+			walk.kind   = Kind::Flat;
+			walk.header = walk.packet.header;
+			walk.latch  = walk.packet.latch;
+			found       = true;
+		}
+		if (!found && options.wave_size == 32 && MatchLaneMaskWalk(program, *bvh, walk.lane)) {
+			walk.kind   = Kind::LaneMask;
+			walk.header = walk.lane.header;
+			walk.latch  = walk.lane.latch;
+			found       = true;
+		}
+		if (!found && MatchPacketWalk(program, *bvh, walk.packet = {}) && MatchCandidateWalk(program, walk.packet)) {
+			walk.kind   = Kind::Candidate;
+			walk.header = walk.packet.header;
+			walk.latch  = walk.packet.latch;
+			found       = true;
+		}
+		if (found) walks.push_back(std::move(walk));
+	}
 	std::vector<NativeTraversals>  hypotheses;
 	std::vector<OracleImprovement> improvements;
 	if ((options.oracle & OracleRemaining) != 0) {

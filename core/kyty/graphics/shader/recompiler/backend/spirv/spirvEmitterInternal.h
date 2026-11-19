@@ -181,7 +181,6 @@ struct EmitterState {
 	std::array<uint32_t, 4>                          ray_query_selected_leaf {};
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha {};
 	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha_cache {};
-	std::array<std::array<uint32_t, 2>, 4>           ray_query_alpha_distance {};
 	std::array<bool, 4>                              ray_query_alpha_sites {};
 	std::array<bool, 4>                              ray_query_alpha_lane {};
 	std::array<bool, 4>                              ray_query_alpha_factor {};
