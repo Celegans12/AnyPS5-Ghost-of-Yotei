@@ -5,6 +5,7 @@
 #include "common/assert.h"
 #include "common/logging/log.h"
 #include "graphics/shader/recompiler/backend/spirv/SpirvEmitter.h"
+#include "graphics/shader/recompiler/backend/spirv/SpirvWaveSplit.h"
 #include "graphics/shader/recompiler/ir/passes/TableMode.h"
 #include "graphics/shader/recompiler/frontend/cfg/ShaderCFG.h"
 #include "graphics/shader/recompiler/frontend/decode/ShaderDecoder.h"
@@ -833,8 +834,29 @@ CompileResult CompileProgram(TranslateResult translated, const CompileOptions& o
 
 	LOGF("ShaderRecompiler %s phase begin: hash=0x%016" PRIx64 " SPIR-V EmitProgram\n", stage,
 	     ir.shader_hash);
-	auto spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
-	                                options.emit_debug_info, true, options.ray_stats);
+	std::vector<uint32_t> spirv;
+	if (const auto* group = options.stage == ShaderType::Compute ? options.input_info.compute : nullptr;
+	    group != nullptr && ir.wave_size == 64u && group->host_subgroup_size == 32u && !ir.lane_local &&
+	    std::max(group->threads_num[0], 1u) * std::max(group->threads_num[1], 1u) *
+	            std::max(group->threads_num[2], 1u) ==
+	        64u) {
+		auto wide               = *group;
+		wide.host_subgroup_size = 64u;
+		auto wide_input         = options.input_info;
+		wide_input.compute      = &wide;
+		spirv = Spirv::EmitProgram(ir, wide_input, push_data_start_dword, *options.profile, options.emit_debug_info,
+		                           true, options.ray_stats);
+		std::string refusal;
+		if (!Spirv::SplitWaveAcrossSubgroups(spirv, refusal)) {
+			LOGF("ShaderRecompiler %s wave64 kept in lane pairs: hash=0x%016" PRIx64 " reason=%s\n", stage,
+			     ir.shader_hash, refusal.c_str());
+			spirv.clear();
+		}
+	}
+	if (spirv.empty()) {
+		spirv = Spirv::EmitProgram(ir, options.input_info, push_data_start_dword, *options.profile,
+		                           options.emit_debug_info, true, options.ray_stats);
+	}
 	LOGF("ShaderRecompiler %s phase end: hash=0x%016" PRIx64 " SPIR-V EmitProgram words=%" PRIu64
 	     " wave_size=%u elapsed_ms=%" PRIu64 "\n",
 	     stage, ir.shader_hash, static_cast<uint64_t>(spirv.size()), ir.wave_size,
