@@ -210,6 +210,27 @@ class RecipeTests(ReplayFixture):
         with self.assertRaises(ValueError):
             runner.stage_replay_runtime(source, self.root / "second", manifest)
 
+    def test_requested_validation_adds_layer_logging_without_replacing_flags(self):
+        layer = runner.processes.FORCED["VK_INSTANCE_LAYERS"]
+        max_length_flags = "error," * 682 + "warn"
+        cases = ((layer, None, "layer"),
+                 (f"VK_LAYER_example:{layer}", "warn", "warn,layer"),
+                 (f"{layer};VK_LAYER_example", "error,layer", "error,layer"),
+                 (layer, "all", "all"),
+                 (layer, max_length_flags, max_length_flags + ",layer"),
+                 (f"{layer}_other", None, None))
+        for layers, flags, expected in cases:
+            with self.subTest(layers=layers, flags=flags):
+                shared = {"VK_INSTANCE_LAYERS": layers}
+                if flags is not None:
+                    shared["VK_LOADER_DEBUG"] = flags
+                self.recipe["environment"] = shared
+                recipe = self.validate()
+                env = runner._trial_environment(recipe, recipe["arms"]["baseline"], self.root / "baseline", self.root / "cache")
+                self.assertEqual(env["VK_INSTANCE_LAYERS"], layers)
+                self.assertEqual(env.get("VK_LOADER_DEBUG"), expected)
+                self.assertEqual(recipe["environment"].get("VK_LOADER_DEBUG"), flags)
+
 
 class RunnerTests(ReplayFixture):
     def setUp(self):
@@ -225,6 +246,7 @@ class RunnerTests(ReplayFixture):
         self.interrupt_trial = False
         self.kyty_write_store = True
         self.kyty_warm_log = None
+        self.loader_logs = {}
 
     def execute(self, command, directory, environment, timeout, log_bytes, *, prepare=None):
         self.commands.append(command)
@@ -258,8 +280,9 @@ class RunnerTests(ReplayFixture):
                 code = 3
             commit = ("c" * 40 if self.mismatch and arm == "candidate"
                       else self.recipe["arms"][arm]["commit"])
-            stdout = json.dumps(native)
-            stderr = host_report(commit)
+            loader_stdout, loader_stderr = self.loader_logs.get(arm, ("", ""))
+            stdout = loader_stdout + json.dumps(native)
+            stderr = loader_stderr + host_report(commit)
             if title_id is not None:
                 (cache / f"{title_id}.bin").write_bytes(b"driver cache")
                 loaded = int(before is not None)
@@ -519,6 +542,35 @@ class RunnerTests(ReplayFixture):
         report = runner._offline_report(path.parent)
         self.assertEqual(report["runs"][0]["assessment"]["issues"], [])
         self.assertEqual(report["observations"]["baseline"]["healthy_trials"], 2)
+
+    def test_requested_validation_requires_loader_evidence_live_and_offline(self):
+        self.recipe["warmups"] = 0
+        self.recipe["trials"] = 1
+        layer = runner.processes.FORCED["VK_INSTANCE_LAYERS"]
+        self.recipe["environment"] = {**{f"APS5_TEST_OPTION_{index}": "1" for index in range(127)}, "VK_INSTANCE_LAYERS": layer}
+        inserted = runner.processes.INSERTED_LAYER + "\n"
+        missing = f"WARNING: {layer} {runner.processes.MISSING_LAYER}\n"
+        cases = (
+            ("inserted", inserted, [], 0),
+            ("absent", "", ["Khronos validation layer insertion was not recorded"], 2),
+            ("missing", inserted + missing, ["Vulkan loader reported a requested layer missing"], 2),
+        )
+        path = self.root / "recipe.json"
+        path.write_text(json.dumps(self.recipe), encoding="utf-8")
+        for name, messages, issues, status in cases:
+            with self.subTest(case=name):
+                self.loader_logs = {"baseline": (inserted, ""), "candidate": ("", messages)}
+                bundle = self.root / name
+                with mock.patch.object(runner, "execute_replay_trial", side_effect=self.execute), contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(runner.main(["run", str(path), "--output", str(bundle)]), status)
+                live = json.loads((bundle / "report.json").read_text(encoding="utf-8"))
+                offline = io.StringIO()
+                with mock.patch.object(runner, "execute_replay_trial", side_effect=AssertionError("offline launched a process")), contextlib.redirect_stdout(offline):
+                    self.assertEqual(runner.main(["report", str(bundle), "--json"]), status)
+                for report in (live, json.loads(offline.getvalue())):
+                    self.assertEqual([run["assessment"]["issues"] for run in report["runs"]], [[], issues])
+                    self.assertEqual(report["recipe"]["environment"], self.recipe["environment"])
+                self.assertTrue(all(call["environment"]["VK_LOADER_DEBUG"] == "layer" for call in self.calls[-2:]))
 
     def test_interrupted_trial_is_retained_and_cli_returns_130(self):
         self.recipe["warmups"] = 0
