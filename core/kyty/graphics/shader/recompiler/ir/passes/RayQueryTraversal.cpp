@@ -5510,7 +5510,9 @@ void RewriteClosestLaneWalk(Program& program, PacketWalk& w, uint32_t site) {
 NativeTraversals TraceNativeTraversals(Program& program, const NativeTraversalOptions& options) {
 	NativeTraversals result;
 	const bool       compute = program.stage == ShaderType::Compute;
-	if (!compute && (program.stage != ShaderType::Pixel || (options.oracle & OracleRemaining) == 0)) return result;
+	if (!compute && (program.stage != ShaderType::Pixel || (options.oracle & OracleRemaining) == 0 || (options.oracle & OraclePixel) == 0)) {
+		return result;
+	}
 	std::vector<Inst*> intersections;
 	for (auto* block: program.blocks) {
 		for (auto& inst: *block) {

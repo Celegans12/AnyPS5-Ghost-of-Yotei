@@ -85,7 +85,7 @@ void Marking() {
     const auto flags = Mark(Node::Children, Child::InLane);
     Expect((flags & IR::BvhIntersectNative) != 0 && (flags & IR::BvhIntersectOracle) != 0, "a marked walk is native and served by the oracle");
     Expect(IR::MarkOracleWalk({}) == 0u, "an empty walk marks nothing");
-    Expect(IR::OracleRemaining == 1u && IR::OracleForms == 2u && IR::OracleOnly == 4u, "the oracle bits match KYTY_RT_ORACLE");
+    Expect(IR::OracleRemaining == 1u && IR::OracleForms == 2u && IR::OracleOnly == 4u && IR::OraclePixel == 8u, "the oracle bits match KYTY_RT_ORACLE");
 }
 
 void Modes() {

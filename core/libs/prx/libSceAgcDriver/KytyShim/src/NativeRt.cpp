@@ -13,12 +13,13 @@ std::optional<Mode> ParseMode(const char* value) {
 std::optional<std::uint32_t> ParseOracle(const char* value) {
     if (value == nullptr || *value == '\0') return DefaultOracle;
     const std::string_view text(value);
-    if (text.size() != 1 || text[0] < '0' || text[0] > '7') return std::nullopt;
-    return static_cast<std::uint32_t>(text[0] - '0');
+    if (text.size() == 1 && text[0] >= '0' && text[0] <= '9') return static_cast<std::uint32_t>(text[0] - '0');
+    if (text.size() == 2 && text[0] == '1' && text[1] >= '0' && text[1] <= '5') return static_cast<std::uint32_t>(10 + text[1] - '0');
+    return std::nullopt;
 }
 
 std::string OracleLine(Verdict verdict, std::uint32_t oracle) {
-    if (verdict != Verdict::Native || oracle == 0) return {};
+    if (verdict != Verdict::Native || (oracle & ~OraclePixel) == 0) return {};
     const std::string setting = "(KYTY_RT_ORACLE=" + std::to_string(oracle) + ")";
     const bool remaining = (oracle & OracleRemaining) != 0;
     if ((oracle & OracleOnly) != 0 && !remaining) {
@@ -32,6 +33,7 @@ std::string OracleLine(Verdict verdict, std::uint32_t oracle) {
     } else {
         walks = "the walks no form recognizes";
     }
+    if (remaining && (oracle & OraclePixel) != 0) walks += " in compute and pixel shaders";
     return "[kyty] BVH intersections of " + walks + " answer from host ray queries " + setting + "; the guest walk code runs as written\n";
 }
 

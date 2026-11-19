@@ -108,8 +108,12 @@ void Oracle() {
     Expect(ParseOracle("1") == KytyShim::NativeRt::OracleRemaining, "KYTY_RT_ORACLE=1 serves the walks no form recognizes");
     Expect(ParseOracle("5") == (KytyShim::NativeRt::OracleRemaining | KytyShim::NativeRt::OracleOnly), "KYTY_RT_ORACLE=5 skips the forms");
     Expect(ParseOracle("7") == 7u, "KYTY_RT_ORACLE=7 is accepted");
-    Expect(!ParseOracle("8").has_value(), "KYTY_RT_ORACLE=8 is refused");
+    Expect(ParseOracle("9") == (KytyShim::NativeRt::OracleRemaining | KytyShim::NativeRt::OraclePixel), "KYTY_RT_ORACLE=9 also serves pixel shaders");
+    Expect(ParseOracle("15") == 15u, "KYTY_RT_ORACLE=15 is accepted");
+    Expect((KytyShim::NativeRt::DefaultOracle & KytyShim::NativeRt::OraclePixel) == 0, "the oracle leaves pixel shaders emulated by default");
+    Expect(!ParseOracle("16").has_value(), "KYTY_RT_ORACLE=16 is refused");
     Expect(!ParseOracle("01").has_value(), "KYTY_RT_ORACLE=01 is refused");
+    Expect(!ParseOracle("09").has_value(), "KYTY_RT_ORACLE=09 is refused");
     Expect(!ParseOracle("-1").has_value(), "KYTY_RT_ORACLE=-1 is refused");
     Expect(!ParseOracle("on").has_value(), "KYTY_RT_ORACLE=on is refused");
     Expect(OracleLine(Verdict::Native, 0).empty(), "no oracle line when the oracle is off");
@@ -122,6 +126,9 @@ void Oracle() {
     Expect(Has(OracleLine(Verdict::Native, 5), "without trying the walk forms"), "KYTY_RT_ORACLE=5 says the forms are skipped");
     Expect(Has(OracleLine(Verdict::Native, 4), "every BVH walk runs emulated"), "KYTY_RT_ORACLE=4 says nothing is served");
     Expect(Has(OracleLine(Verdict::Native, 6), "every BVH walk runs emulated"), "KYTY_RT_ORACLE=6 says nothing is served");
+    Expect(!Has(remaining, "pixel"), "KYTY_RT_ORACLE=1 leaves pixel shaders out");
+    Expect(Has(OracleLine(Verdict::Native, 9), "in compute and pixel shaders"), "KYTY_RT_ORACLE=9 says pixel shaders are served");
+    Expect(OracleLine(Verdict::Native, 8).empty(), "KYTY_RT_ORACLE=8 alone serves nothing and logs no oracle line");
 }
 
 }

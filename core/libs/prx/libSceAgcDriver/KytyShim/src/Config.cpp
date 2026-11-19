@@ -144,7 +144,7 @@ Options OptionsFromEnvironment(std::string& applied) {
     nativeRtMode.store(*mode, std::memory_order_relaxed);
     const char* oracle = Read("KYTY_RT_ORACLE", applied);
     const auto oracleMode = NativeRt::ParseOracle(oracle);
-    if (!oracleMode.has_value()) EXIT("KytyShim: KYTY_RT_ORACLE=%s is not a whole number from 0 to 7\n", oracle);
+    if (!oracleMode.has_value()) EXIT("KytyShim: KYTY_RT_ORACLE=%s is not a whole number from 0 to 15\n", oracle);
     options.rt_oracle = *oracleMode;
     for (const auto& number : Numbers) {
         const char* value = Read(number.variable, applied);
