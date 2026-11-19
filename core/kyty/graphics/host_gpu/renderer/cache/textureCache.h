@@ -63,7 +63,7 @@ public:
 	[[nodiscard]] ImageId       FindImage(ImageDesc& desc, bool exact_format = false);
 	[[nodiscard]] ImageId FindImageSpeculative(ImageDesc& desc, bool exact_format = false,
 	                                           ImageId* depth_source = nullptr);
-	[[nodiscard]] ImageId FindDepthCopy(ImageId color_id, const ImageInfo& requested);
+	[[nodiscard]] ImageId FindDepthCopy(ImageId source_id, const ImageInfo& requested);
 	[[nodiscard]] bool DepthCopyStale(const Image& image) const;
 	[[nodiscard]] bool DepthCopyCurrent(const Image& image) const;
 	void                        UpdateImage(ImageId id);
@@ -397,6 +397,7 @@ private:
 	                               uint32_t layer, uint32_t layers, const vk::ClearValue* clear,
 	                               const CommandRecorder& command);
 	void RefreshCopySource(ImageId id);
+	[[nodiscard]] ImageId FindDepthCopyLocked(ImageId source_id, const ImageInfo& requested);
 	void RefreshDepthCopy(ImageId copy_id);
 	void ReleaseDepthCopies(ImageId color_id);
 	void                  ParkImage(ImageId id);
