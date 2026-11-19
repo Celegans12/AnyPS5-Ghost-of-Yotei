@@ -1258,20 +1258,22 @@ bool RayTracing::RecordBuilds(const CommandRecorder& command) {
 	return gathered;
 }
 
+bool RayTracing::Slot::CanGather(uint64_t sequence) const {
+	return built && !replaced && refit_seq == sequence && gathers < MaxGathers &&
+	       (built_refit_seq + 1 == sequence || (built_refit_seq == sequence && dynamic_until != 0));
+}
+
 bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_only, bool& gathered_out) {
 	auto&                 readback  = m_readbacks[m_readback_index];
 	const uint32_t        first_job = readback.build_count;
-	std::vector<Job>      jobs;
-	std::vector<uint32_t> slots;
+	std::vector<Job>      jobs, gather_jobs;
+	std::vector<uint32_t> slots, gather_slots;
 	uint64_t              scratch   = 0;
 	uint64_t              pool_use  = 0;
 	std::vector<std::array<uint32_t, 4>> layouts;
 	constexpr uint64_t    Alignment = 256;
 	const auto gathers = [&](const Slot* slot) {
-		return slot != nullptr && slot->built && (m_blas_flags & BlasPsrHeader) == 0 &&
-		       slot->refit_seq == m_refit_seq && slot->gathers < MaxGathers &&
-		       (slot->built_refit_seq + 1 == m_refit_seq ||
-		        (slot->built_refit_seq == m_refit_seq && slot->dynamic_until != 0));
+		return slot != nullptr && (m_blas_flags & BlasPsrHeader) == 0 && slot->CanGather(m_refit_seq);
 	};
 	{
 		Common::LockGuard lock(m_mutex);
@@ -1287,7 +1289,8 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 			return age(slot_a) > age(slot_b);
 		});
 		std::vector<uint32_t> deferred;
-		while (!m_build_queue.empty() && jobs.size() < MaxJobs && first_job + jobs.size() < JobCapacity) {
+		const auto limit = std::min(MaxJobs, JobCapacity - first_job);
+		while (!m_build_queue.empty() && jobs.size() + gather_jobs.size() < limit) {
 			const auto index = m_build_queue.back();
 			if (m_slot_list[index] == nullptr || m_slot_list[index]->evicted ||
 			    !m_slot_list[index]->needs_build) {
@@ -1318,8 +1321,10 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 				continue;
 			}
 			pool_use += queue;
-			slot.needs_build = false;
-			slot.replaced    = false;
+			slot.needs_build     = false;
+			slot.replaced        = false;
+			slot.gathers         = gathered ? slot.gathers + 1 : 0;
+			slot.built_refit_seq = m_refit_seq;
 			scratch += size;
 			Job job {slot.blas_va, slot.root, index, slot.vertices0.address,
 			         slot.vertices1.address, slot.entries.address, slot.capacity0,
@@ -1330,11 +1335,14 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 				job.layout_count  = static_cast<uint32_t>(slot.layout.size());
 				layouts.insert(layouts.end(), slot.layout.begin(), slot.layout.end());
 			}
-			jobs.push_back(job);
-			slots.push_back(index);
+			(gathered ? gather_jobs : jobs).push_back(job);
+			(gathered ? gather_slots : slots).push_back(index);
 		}
 		m_build_queue.insert(m_build_queue.end(), deferred.rbegin(), deferred.rend());
 	}
+	const auto walk_count = static_cast<uint32_t>(jobs.size());
+	jobs.insert(jobs.end(), gather_jobs.begin(), gather_jobs.end());
+	slots.insert(slots.end(), gather_slots.begin(), gather_slots.end());
 	if (jobs.empty()) {
 		return false;
 	}
@@ -1346,24 +1354,6 @@ bool RayTracing::RecordBuildBatch(const CommandRecorder& command, bool urgent_on
 		              vk::AccessFlagBits2::eTransferWrite | vk::AccessFlagBits2::eShaderRead |
 		                  vk::AccessFlagBits2::eShaderWrite);
 		command.fillBuffer(m_walk_state->Handle(), offsetof(RtState, pool_cursor), sizeof(uint32_t) * 2, 0);
-	}
-	uint32_t walk_count = 0;
-	{
-		std::vector<Job>      walk_jobs, gather_jobs;
-		std::vector<uint32_t> walk_slots, gather_slots;
-		for (size_t i = 0; i < jobs.size(); i++) {
-			auto&      slot   = *m_slot_list[slots[i]];
-			const bool gather = gathers(&slot);
-			slot.gathers         = gather ? slot.gathers + 1 : 0;
-			slot.built_refit_seq = m_refit_seq;
-			(gather ? gather_jobs : walk_jobs).push_back(jobs[i]);
-			(gather ? gather_slots : walk_slots).push_back(slots[i]);
-		}
-		walk_count = static_cast<uint32_t>(walk_jobs.size());
-		jobs       = std::move(walk_jobs);
-		slots      = std::move(walk_slots);
-		jobs.insert(jobs.end(), gather_jobs.begin(), gather_jobs.end());
-		slots.insert(slots.end(), gather_slots.begin(), gather_slots.end());
 	}
 	for (uint32_t i = 0; i < walk_count; i++) {
 		const auto     index = slots[i];

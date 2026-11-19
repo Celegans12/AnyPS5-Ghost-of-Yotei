@@ -5,6 +5,22 @@
 #include <utility>
 #include <vector>
 
+namespace Libs::Graphics {
+
+struct RayTracingTestAccess {
+    static bool CanGather(bool replaced, uint64_t built_sequence, uint32_t dynamic_until) {
+        RayTracing::Slot slot;
+        slot.built           = true;
+        slot.replaced        = replaced;
+        slot.built_refit_seq = built_sequence;
+        slot.refit_seq       = 9;
+        slot.dynamic_until   = dynamic_until;
+        return slot.CanGather(slot.refit_seq);
+    }
+};
+
+}
+
 namespace {
 
 using Libs::Graphics::RayTracing;
@@ -69,6 +85,11 @@ void KeepsEverythingInside() {
 int main() {
     DropsOutsideGuest();
     KeepsEverythingInside();
+    using Libs::Graphics::RayTracingTestAccess;
+    Expect(RayTracingTestAccess::CanGather(false, 8, 0), "a consecutive refit gathers its triangle entries");
+    Expect(!RayTracingTestAccess::CanGather(true, 8, 0), "a replacement during a consecutive refit needs a walk");
+    Expect(RayTracingTestAccess::CanGather(false, 9, 1), "a dynamic mesh can gather again in the same refit");
+    Expect(!RayTracingTestAccess::CanGather(true, 9, 1), "a replacement of a dynamic mesh needs a walk");
     if (failures != 0) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;

@@ -257,6 +257,8 @@ private:
 		uint32_t                     header_layout    = 0;
 		uint32_t                     host_table_index = UINT32_MAX;
 		bool                         replaced         = false;
+
+		[[nodiscard]] bool CanGather(uint64_t sequence) const;
 	};
 
 	struct Retired {
