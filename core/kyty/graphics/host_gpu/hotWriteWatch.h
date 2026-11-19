@@ -19,7 +19,7 @@ public:
 	[[nodiscard]] bool Available() const noexcept { return m_uffd >= 0 && m_pagemap >= 0; }
 	[[nodiscard]] bool Watch(uint64_t begin, uint64_t end) const noexcept;
 	void               Unwatch(uint64_t begin, uint64_t end) const noexcept;
-	[[nodiscard]] bool Collect(uint64_t begin, uint64_t end, Written written, void* context) const noexcept;
+	[[nodiscard]] bool Collect(uint64_t begin, uint64_t end, Written written, void* context, bool strict = true) const noexcept;
 
 private:
 	int m_uffd    = -1;

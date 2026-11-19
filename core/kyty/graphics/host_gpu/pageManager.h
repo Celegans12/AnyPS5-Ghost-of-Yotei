@@ -37,7 +37,7 @@ public:
 	template <bool track, bool is_read = false>
 	void UpdatePageWatchersForRegion(uint64_t base_addr, RegionBits& mask);
 
-	using HotPageWritten = void (*)(void* context, uint64_t page);
+	using HotPageWritten = void (*)(void* context, uint64_t begin, uint64_t end);
 	[[nodiscard]] static bool HotPagesEnabled() noexcept;
 	[[nodiscard]] bool        HasHotPages() const noexcept;
 	void NoteWriteFault(uint64_t vaddr);

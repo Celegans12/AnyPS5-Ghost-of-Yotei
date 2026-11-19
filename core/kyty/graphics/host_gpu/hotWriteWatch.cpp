@@ -82,10 +82,11 @@ void Unregister(int uffd, uint64_t begin, uint64_t end) {
 	(void)ioctl(uffd, UFFDIO_UNREGISTER, &range);
 }
 
-long Scan(int pagemap, uint64_t begin, uint64_t end, std::array<page_region, 64>& regions, uint64_t* walk_end) {
+long Scan(int pagemap, uint64_t begin, uint64_t end, std::array<page_region, 64>& regions, uint64_t* walk_end,
+          bool strict = true) {
 	pm_scan_arg scan {};
 	scan.size          = sizeof(scan);
-	scan.flags         = PM_SCAN_WP_MATCHING | PM_SCAN_CHECK_WPASYNC;
+	scan.flags         = PM_SCAN_WP_MATCHING | (strict ? PM_SCAN_CHECK_WPASYNC : 0);
 	scan.start         = begin;
 	scan.end           = end;
 	scan.vec           = reinterpret_cast<uint64_t>(regions.data());
@@ -183,12 +184,12 @@ void HotWriteWatch::Unwatch(uint64_t begin, uint64_t end) const noexcept {
 	Unregister(m_uffd, begin, end);
 }
 
-bool HotWriteWatch::Collect(uint64_t begin, uint64_t end, Written written, void* context) const noexcept {
+bool HotWriteWatch::Collect(uint64_t begin, uint64_t end, Written written, void* context, bool strict) const noexcept {
 	if (!Available()) return false;
 	std::array<page_region, 64> regions {};
 	for (auto cursor = begin; cursor < end;) {
 		uint64_t   walk_end = 0;
-		const auto count    = Scan(m_pagemap, cursor, end, regions, &walk_end);
+		const auto count    = Scan(m_pagemap, cursor, end, regions, &walk_end, strict);
 		if (count < 0) return false;
 		for (long i = 0; i < count; i++) written(context, regions[i].start, regions[i].end);
 		if (walk_end <= cursor || walk_end >= end) break;
@@ -207,7 +208,7 @@ bool HotWriteWatch::Watch(uint64_t, uint64_t) const noexcept {
 
 void HotWriteWatch::Unwatch(uint64_t, uint64_t) const noexcept {}
 
-bool HotWriteWatch::Collect(uint64_t, uint64_t, Written, void*) const noexcept {
+bool HotWriteWatch::Collect(uint64_t, uint64_t, Written, void*, bool) const noexcept {
 	return false;
 }
 #endif

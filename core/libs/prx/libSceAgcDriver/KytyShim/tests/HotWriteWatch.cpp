@@ -95,6 +95,19 @@ int main() {
 	(void)Collect(watch, views.At(0), end, &ok);
 	Require(!ok, "a range with an unwatched page fails instead of hiding writes");
 
+	views.guest[0]          = 10;
+	views.guest[1 * Page]   = 11;
+	std::set<uint64_t> loose;
+	Require(watch.Collect(
+	            views.At(0), views.At(6),
+	            [](void* context, uint64_t from, uint64_t to) {
+		            for (auto page = from; page < to; page += Page) static_cast<std::set<uint64_t>*>(context)->insert(page);
+	            },
+	            &loose, false),
+	        "a loose collection walks over unwatched pages");
+	Require(loose == std::set<uint64_t> {views.At(1)}, "a loose collection reports the watched written page only");
+	Require(CollectOk(watch, first, end).empty(), "a loose collection protects again what it reports");
+
 	watch.Unwatch(views.At(2), views.At(3));
 	views.guest[2 * Page] = 8;
 	(void)Collect(watch, first, end, &ok);

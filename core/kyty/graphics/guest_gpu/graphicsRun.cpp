@@ -1068,12 +1068,16 @@ void CommandProcessor::WaitForRewind(bool valid, const uint32_t* control) {
 			g_gpu_state->NoteBlockedRewind(reinterpret_cast<uint64_t>(control));
 		}
 		SuspendPm4();
+	} else {
+		m_renderer.CollectHotPageWrites();
 	}
 }
 #else
 void CommandProcessor::WaitForRewind(bool valid) {
 	if (!valid) {
 		SuspendPm4();
+	} else {
+		m_renderer.CollectHotPageWrites();
 	}
 }
 #endif
@@ -1681,12 +1685,12 @@ Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
 	EXIT_IF(g_current_execution != nullptr);
 	EXIT_IF(commands.size() > UINT32_MAX);
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
+		m_renderer.CollectHotPageWrites();
 		execution.m_buffer_stack.push_back({commands});
 	}
 	execution.m_suspended     = false;
 	execution.m_yield         = false;
 	execution.m_made_progress = false;
-	m_renderer.CollectHotPageWrites();
 
 	struct ExecutionScope {
 		explicit ExecutionScope(Pm4Execution& execution) { g_current_execution = &execution; }

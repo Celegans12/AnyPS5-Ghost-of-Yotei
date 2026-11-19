@@ -136,12 +136,12 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 
 void RenderContext::CollectHotPageWrites(uint64_t vaddr, uint64_t size) {
 	m_page_manager.CollectHotPageWrites(
-	    [](void* context, uint64_t page) {
+	    [](void* context, uint64_t begin, uint64_t end) {
 		    auto& self = *static_cast<RenderContext*>(context);
-		    self.m_buffer_cache.InvalidateFaultedPage(page);
-		    self.m_texture_cache.InvalidateMemory(page, 1);
-		    self.m_image_heap.InvalidateMemory(page, 1);
-		    self.m_strict_watch.InvalidateMemory(page, 1);
+		    self.m_buffer_cache.InvalidateMemory(begin, end - begin, true);
+		    self.m_texture_cache.InvalidateMemory(begin, end - begin);
+		    self.m_image_heap.InvalidateMemory(begin, end - begin);
+		    self.m_strict_watch.InvalidateMemory(begin, end - begin);
 	    },
 	    this, vaddr, size);
 }

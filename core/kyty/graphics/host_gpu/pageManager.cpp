@@ -56,6 +56,7 @@ constexpr uint32_t HOT_IDLE_SECONDS   = 4;
 constexpr uint32_t HOT_PAGE_CAP       = 16384;
 constexpr size_t   HOT_IDLE_PER_SWEEP = 1024;
 constexpr uint64_t HOT_GRANULE_SIZE   = 2 * 1024 * 1024;
+constexpr uint64_t HOT_CLUSTER_GAP    = 1024 * 1024;
 
 [[noreturn]] void Fatal(const char* format, ...) {
 	char    text[1024];
@@ -394,11 +395,19 @@ struct PageManager::Impl {
 
 	void RebuildHotRuns() {
 		hot_runs.clear();
+		hot_clusters.clear();
 		for (const auto& [page, last]: hot_pages) {
 			if (!hot_runs.empty() && hot_runs.back().second == page) {
 				hot_runs.back().second = page + PAGE_SIZE;
 			} else {
 				hot_runs.emplace_back(page, page + PAGE_SIZE);
+			}
+		}
+		for (const auto& run: hot_runs) {
+			if (!hot_clusters.empty() && run.first - hot_clusters.back().second <= HOT_CLUSTER_GAP) {
+				hot_clusters.back().second = run.second;
+			} else {
+				hot_clusters.push_back(run);
 			}
 		}
 		hot_runs_dirty = false;
@@ -445,7 +454,7 @@ struct PageManager::Impl {
 		std::snprintf(line, sizeof(line),
 		              "[kyty-hot-pages] summary of the last %.0f s: %" PRIu64 " guest write faults, %" PRIu64
 		              " page protections (%" PRIu64 " read only, %" PRIu64 " writable, %" PRIu64 " no access, %" PRIu64
-		              " other); %" PRIu64 " pages watched without a fault in %" PRIu64 " runs, %" PRIu64
+		              " other); %" PRIu64 " pages watched without a fault in %" PRIu64 " clusters, %" PRIu64
 		              " collections and %" PRIu64 " before GPU writes in %.3f s, %" PRIu64 " page writes collected, %" PRIu64 " pages promoted, %" PRIu64
 		              " demoted when idle, %" PRIu64 " that lost their watch, %" PRIu64 " refused\n",
 		              static_cast<double>(now_ns - last) / 1e9, faults, read_only + writable + no_access + other, read_only,
@@ -462,6 +471,7 @@ struct PageManager::Impl {
 	std::mutex                                  hot_mutex;
 	std::map<uint64_t, uint32_t>                hot_pages;
 	std::vector<std::pair<uint64_t, uint64_t>>  hot_runs;
+	std::vector<std::pair<uint64_t, uint64_t>>  hot_clusters;
 	bool                                        hot_runs_dirty = false;
 	uint32_t                                    hot_last_sweep = 0;
 	std::atomic<uint64_t>                       hot_last_line {0};
@@ -667,11 +677,15 @@ void PageManager::CollectHotPageWrites(HotPageWritten written, void* context, ui
 	const auto  push    = [](void* pages, uint64_t begin, uint64_t end) {
 		for (auto page = begin; page < end; page += PAGE_SIZE) static_cast<std::vector<uint64_t>*>(pages)->push_back(page);
 	};
-	const auto collect = [&](uint64_t begin, uint64_t end) {
+	const auto collect = [&](uint64_t begin, uint64_t end, bool strict) {
 		const auto before = reported.size();
-		if (!watch.Collect(begin, end, push, &reported)) {
-			reported.resize(before);
-			push(&lost, begin, end);
+		if (watch.Collect(begin, end, push, &reported, strict)) return true;
+		reported.resize(before);
+		return false;
+	};
+	const auto lose = [&](uint64_t begin, uint64_t end) {
+		for (auto it = impl.hot_pages.lower_bound(begin); it != impl.hot_pages.end() && it->first < end; ++it) {
+			lost.push_back(it->first);
 		}
 	};
 	{
@@ -679,20 +693,25 @@ void PageManager::CollectHotPageWrites(HotPageWritten written, void* context, ui
 		impl.MergePendingHotPages(now);
 		if (scoped) {
 			const auto end   = vaddr + size;
+			auto       it    = impl.hot_pages.lower_bound(Common::AlignDown(vaddr, PAGE_SIZE));
 			uint64_t   first = 0;
 			uint64_t   last  = 0;
-			for (auto it = impl.hot_pages.lower_bound(Common::AlignDown(vaddr, PAGE_SIZE));
-			     it != impl.hot_pages.end() && it->first < end; ++it) {
-				if (last != it->first) {
-					if (last != first) collect(first, last);
-					first = it->first;
-				}
+			for (; it != impl.hot_pages.end() && it->first < end; ++it) {
+				if (last == 0) first = it->first;
 				last = it->first + PAGE_SIZE;
 			}
-			if (last != first) collect(first, last);
+			if (last != 0 && !collect(first, last, false)) lose(first, last);
 		} else {
 			if (impl.hot_runs_dirty) impl.RebuildHotRuns();
-			for (const auto& [begin, end]: impl.hot_runs) collect(begin, end);
+			if (now != impl.hot_last_sweep) {
+				for (const auto& [begin, end]: impl.hot_runs) {
+					if (!collect(begin, end, true)) push(&lost, begin, end);
+				}
+			} else {
+				for (const auto& [begin, end]: impl.hot_clusters) {
+					if (!collect(begin, end, false)) lose(begin, end);
+				}
+			}
 		}
 		for (const auto page: reported) {
 			if (auto it = impl.hot_pages.find(page); it != impl.hot_pages.end()) it->second = now;
@@ -704,14 +723,15 @@ void PageManager::CollectHotPageWrites(HotPageWritten written, void* context, ui
 			}
 		}
 		for (const auto* pages: {&lost, &idle}) {
-			for (const auto page: *pages) impl.hot_pages.erase(page);
-			impl.hot_runs_dirty |= !pages->empty();
-			impl.hot_count.fetch_sub(static_cast<uint32_t>(pages->size()), std::memory_order_relaxed);
+			size_t removed = 0;
+			for (const auto page: *pages) removed += impl.hot_pages.erase(page);
+			impl.hot_runs_dirty |= removed != 0;
+			impl.hot_count.fetch_sub(static_cast<uint32_t>(removed), std::memory_order_relaxed);
 		}
 		impl.hot_any.store(!impl.hot_pages.empty() || impl.hot_count.load(std::memory_order_relaxed) != 0,
 		                   std::memory_order_release);
 		impl.hot_page_total.store(impl.hot_pages.size(), std::memory_order_relaxed);
-		if (!scoped) impl.hot_run_total.store(impl.hot_runs.size(), std::memory_order_relaxed);
+		if (!scoped) impl.hot_run_total.store(impl.hot_clusters.size(), std::memory_order_relaxed);
 		impl.hot_lost.fetch_add(lost.size(), std::memory_order_relaxed);
 		impl.hot_idle.fetch_add(idle.size(), std::memory_order_relaxed);
 		impl.hot_collected.fetch_add(reported.size() + lost.size(), std::memory_order_relaxed);
@@ -728,7 +748,19 @@ void PageManager::CollectHotPageWrites(HotPageWritten written, void* context, ui
 		if (!watch.Collect(page, page + PAGE_SIZE, push, &reported)) reported.push_back(page);
 		watch.Unwatch(page, page + PAGE_SIZE);
 	}
-	for (const auto page: reported) written(context, page);
+	if (reported.empty()) return;
+	std::sort(reported.begin(), reported.end());
+	reported.erase(std::unique(reported.begin(), reported.end()), reported.end());
+	auto begin = reported.front();
+	auto end   = begin + PAGE_SIZE;
+	for (size_t i = 1; i < reported.size(); i++) {
+		if (reported[i] != end) {
+			written(context, begin, end);
+			begin = reported[i];
+		}
+		end = reported[i] + PAGE_SIZE;
+	}
+	written(context, begin, end);
 }
 
 bool PageManager::HasHotPages() const noexcept {
