@@ -568,6 +568,10 @@ private:
 	                                               uint32_t color_count, RenderDepthInfo& depth,
 	                                               vk::ImageAspectFlags& feedback_aspects,
 	                                               std::span<PreparedBindings* const> stages = {});
+#if defined(ANYPS5_KYTY)
+	void PreparePackedTargets(CommandBuffer& buffer, PreparedBindings& pixel,
+	                          const ShaderPixelInputInfo& info);
+#endif
 	[[nodiscard]] bool        ResolveColorTargets(CommandBuffer& buffer);
 	[[nodiscard]] bool        ConsumeMetadataColorOperation(CommandBuffer& buffer);
 	void                      BindImage(ImageId id, bool storage);
@@ -671,6 +675,9 @@ private:
 	                                                                                     nullptr};
 	bool     m_render_targets_reused = false;
 	bool     m_targets_from_memo     = false;
+#if defined(ANYPS5_KYTY)
+	uint32_t m_packed_target_slots   = 0;
+#endif
 	uint64_t m_draw_window           = 0;
 	std::unique_ptr<IndirectThreadPass, void (*)(IndirectThreadPass*)> m_indirect_thread_pass {
 	    nullptr, nullptr};

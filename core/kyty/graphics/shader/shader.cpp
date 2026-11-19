@@ -609,6 +609,15 @@ void BuildStageStaticKey(const ShaderPixelInputInfo& info, std::vector<uint32_t>
 	words.push_back(info.target_packed_unorm_mask | (uint32_t {info.target_round_mode} << 8u) |
 	              (uint32_t {info.target_uint_mask} << 16u) |
 	              (uint32_t {info.target_sint_mask} << 24u));
+#if defined(ANYPS5_KYTY)
+	words.push_back(info.target_packed_blend_mask |
+	                (static_cast<uint32_t>(info.target_packed_blend_tests) << 8u));
+	for (uint32_t i = 0; i < info.target_packed_blend.size(); i++) {
+		if ((info.target_packed_blend_mask & (1u << i)) != 0u) {
+			words.push_back(info.target_packed_blend[i]);
+		}
+	}
+#endif
 	const auto mask = info.target_shader_mask;
 	words.push_back((mask | (mask >> 1u) | (mask >> 2u) | (mask >> 3u)) & 0x11111111u);
 	for (uint32_t base = 0; base < info.target_export_mapping.size(); base += 4u) {

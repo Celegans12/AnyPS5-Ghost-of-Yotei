@@ -593,6 +593,9 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 		if (state.program.stage == ShaderType::Pixel && exp.kind == IR::ExportTargetKind::Mrt &&
 		    exp.index < state.input_info.pixel->target_export_mapping.size()) {
 			const auto mapping = state.input_info.pixel->target_export_mapping[exp.index];
+#if defined(ANYPS5_KYTY)
+			const auto unmapped = value;
+#endif
 			if (!mapping.IsIdentity()) {
 				const auto mapped = state.builder.AllocateId();
 				state.builder.AddFunction(spv::OpVectorShuffle, vector_type, mapped, value, value,
@@ -606,6 +609,19 @@ void EmitSetAttribute(ValueEmitContext& ctx, const IR::Inst& inst) {
 					EXIT("unsupported packed UNorm EXP: export=%u mode=%u en=0x%x compr=%u\n",
 					     exp.index, MrtOutputMode(state, exp), exp.en, static_cast<uint32_t>(exp.compr));
 				}
+#if defined(ANYPS5_KYTY)
+				if ((state.input_info.pixel->target_packed_blend_mask & (1u << exp.index)) != 0u) {
+					EXIT_IF(vector_type != TypeF32Vector(state, 4));
+					const auto alpha = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeExtract, TypeF32(state), alpha, unmapped, 3u);
+					const auto source = state.builder.AllocateId();
+					state.builder.AddFunction(spv::OpCompositeInsert, vector_type, source, alpha, value, 3u);
+					state.builder.AddFunction(spv::OpStore, state.packed_source_variables[exp.index], source);
+					state.builder.AddFunction(spv::OpStore, state.packed_pending_variables[exp.index],
+					                          ConstantU32(state, 1u));
+					return;
+				}
+#endif
 				const auto info = Format::GetFormatInfo(Prospero::BufferFormat::k11_11_10UNorm);
 				const auto rounding = (state.input_info.pixel->target_round_mode & (1u << exp.index)) != 0
 				                          ? UnormRounding::Truncate : UnormRounding::HalfUp;

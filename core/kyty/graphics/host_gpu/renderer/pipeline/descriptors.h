@@ -92,6 +92,9 @@ struct PreparedBindings {
 	vk::DescriptorBufferInfo              shader_data_buffer;
 	vk::DescriptorBufferInfo              shared_memory;
 	std::vector<uint32_t>                 shader_data;
+#if defined(ANYPS5_KYTY)
+	std::vector<vk::DescriptorImageInfo>  packed_targets;
+#endif
 	const void*                                        last_program          = nullptr;
 	uint64_t                                           last_descs_generation = 0;
 	std::vector<ShaderRecompiler::IR::DescriptorValue> last_images;

@@ -96,6 +96,9 @@ vk::DescriptorType NativeDescriptorType(BindingKind kind) {
 		case BindingKind::SharedMemory:
 		case BindingKind::MipStats: return vk::DescriptorType::eStorageBuffer;
 		case BindingKind::UniformBuffers: return vk::DescriptorType::eUniformBuffer;
+#if defined(ANYPS5_KYTY)
+		case BindingKind::PackedTargets: return vk::DescriptorType::eStorageImage;
+#endif
 		case BindingKind::Count: EXIT("invalid native descriptor binding kind");
 	}
 	EXIT("invalid native descriptor binding kind");
@@ -3259,6 +3262,13 @@ void RenderExecutor::CommitBindings(CommandBuffer&                     buffer,
 							m_descriptor_images[image_cursor++] = {sampler, nullptr, vk::ImageLayout::eUndefined};
 						}
 						break;
+#if defined(ANYPS5_KYTY)
+					case BindingKind::PackedTargets:
+						EXIT_IF(descriptors.packed_targets.size() != write.descriptorCount);
+						write.pImageInfo    = descriptors.packed_targets.data();
+						m_commit_capture_ok = false;
+						break;
+#endif
 					case BindingKind::Count: EXIT("invalid descriptor binding kind");
 				}
 			}

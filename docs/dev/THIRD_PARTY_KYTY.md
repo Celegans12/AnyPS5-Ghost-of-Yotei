@@ -572,6 +572,25 @@ ignores in a direct `SET_CONTEXT_REG`.
 `CONTEXT_CONTROL` (PM4 opcode `0x28`) with register loading and shadowing off is accepted as the no-op it is on the
 console, as AnyPS5's driver does; with either on, it still stops with the two control words.
 
+Blending into 11_11_10 UNorm color targets: KytyPS5 writes a format 30 target through its R32_UINT backing, the pixel
+shader packing the three channels, so the host cannot blend it and pipeline creation stops on any enabled blend. Under
+`ANYPS5_KYTY` a replace blend (ONE, ZERO, ADD) is a plain export. Any other blend, and a write mask that leaves a
+channel out, is done by the pixel shader: the draw binds the target as an R32_UINT storage image instead of an
+attachment, and after the shader's own code, inside a fragment shader interlock critical section
+(`PixelInterlockOrderedEXT`, so overlapping fragments of one draw merge in primitive order), the shader reads the stored
+word and decodes each field as k / (2^n - 1). It clamps the source color and alpha to [0, 1] when
+`CB_COLOR_INFO.BLEND_CLAMP` is set (NaN to 0), evaluates the color equation in fp32 without contraction, with a
+destination alpha of 1 and MIN and MAX ignoring the factors as in Vulkan, clamps the result to [0, 1] and encodes it
+with the target's `ROUND_MODE` (truncate, or round half up) as the plain export does, keeps the fields the write mask
+leaves out, and stores the word. Such a shader runs with early fragment tests, and each such draw gets a render pass
+instance of its own. Constant and second-source factors, multisampled, layered and volume targets, devices without
+`fragmentShaderPixelInterlock`, pixel shaders that export depth or coverage or use alpha to mask, a shader that kills
+pixels under late tests of a draw that writes depth or stencil, a shader that writes memory under late tests, and a
+target that the draw also reads as a shader resource stop the emulator with the reason. The console's blend precision
+and rounding for this format are not measured; `kyty_shim_packed_unorm_blend` runs the emitted blend arithmetic on each
+Vulkan device of the host and compares every result bit for bit with a CPU model of the same arithmetic, out-of-range
+and NaN sources included.
+
 ### Adding a setting
 
 A pull request that makes the code under `core/` read a new `KYTY_*` name adds its row to the tables above, with its default taken from the code, and one that stops reading a name removes the row. `python3 tools/check_kyty_settings.py` lists what is missing or stale; the `conventions` job of [the AnyKyty workflow](../../.github/workflows/anykyty.yml) runs it. A new `ANYPS5_*` or `APS5_*` name also needs its row in [ENVIRONMENT](ENVIRONMENT.md).

@@ -224,6 +224,14 @@ struct EmitterState {
 	uint32_t                   sampler_pointer_type                  = 0;
 	uint32_t                   main_func                             = 0;
 	uint32_t                   mesh_guest_func                       = 0;
+#if defined(ANYPS5_KYTY)
+	uint32_t                   pixel_guest_func                      = 0;
+	uint32_t                   packed_target_variable                = 0;
+	uint32_t                   packed_target_type                    = 0;
+	uint32_t                   packed_frag_coord_variable            = 0;
+	std::array<uint32_t, 8>    packed_source_variables               {};
+	std::array<uint32_t, 8>    packed_pending_variables              {};
+#endif
 	uint32_t                   mesh_allocation                       = 0;
 	uint32_t                   mesh_primitive_data                   = 0;
 	uint32_t                   mesh_primitives                       = 0;
@@ -457,6 +465,12 @@ void     DefineTessellationExecutionModes(EmitterState& state);
 void     DefineMeshOutputs(EmitterState& state, uint32_t clip_distance_count,
                            uint32_t cull_distance_count);
 void     EmitMeshEntryPoint(EmitterState& state);
+#if defined(ANYPS5_KYTY)
+void     DefinePackedTargets(EmitterState& state);
+void     EmitPixelEntryPoint(EmitterState& state);
+uint32_t EmitPackedUnormBlend(EmitterState& state, const ShaderPackedBlend& blend, bool truncate,
+                              uint32_t source, uint32_t destination);
+#endif
 uint32_t MeshOutputPointer(EmitterState& state, IR::StageOutputKind kind, uint32_t index = 0);
 uint32_t MeshPrimitivePointer(EmitterState& state);
 

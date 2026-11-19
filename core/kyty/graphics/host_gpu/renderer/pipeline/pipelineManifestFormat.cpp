@@ -445,6 +445,35 @@ void VisitVertexInput(V& v, ShaderVertexInputInfo& info, const ShaderVertexInput
 
 template <class V>
 void VisitPixelInput(V& v, ShaderPixelInputInfo& info, const ShaderPixelInputInfo& base) {
+#if defined(ANYPS5_KYTY)
+	auto& [interpolator_settings, input_num, wave_size, ps_system_input_base,
+	       custom_interpolation_mask, ps_perspective_center_vgpr, ps_perspective_sample_vgpr,
+	       ps_perspective_centroid_vgpr, target_output_mode, target_shader_mask,
+	       target_export_mapping, target_packed_unorm_mask, target_uint_mask, target_sint_mask,
+	       target_round_mode, target_packed_blend_mask, target_packed_blend_tests,
+	       target_packed_blend, scratch_size_dwords, lds_size_dwords, ps_pos_x, ps_pos_y, ps_pos_z,
+	       ps_pos_w, ps_front_face, ps_front_face_all_bits, ps_ancillary, ps_no_perspective,
+	       parameter_mode, ps_pixel_kill_enable, ps_depth_export_enable,
+	       ps_sample_mask_export_enable, ps_sample_shading, dual_source_blending,
+	       object_primitive_id, alpha_blend_source, ps_early_z, stage] = info;
+	v.Hex("pbmask", target_packed_blend_mask, base.target_packed_blend_mask);
+	v.Flag("pbtests", target_packed_blend_tests, base.target_packed_blend_tests);
+	if constexpr (!V::Reading) {
+		if (target_packed_blend != base.target_packed_blend) {
+			v.Value("pblend", fmt::format("{:x}", fmt::join(target_packed_blend, ",")));
+		}
+	} else {
+		if (const auto text = v.Find("pblend")) {
+			const auto parts = Split(*text, ',');
+			v.ok             = v.ok && parts.size() == target_packed_blend.size();
+			for (size_t i = 0; v.ok && i < parts.size(); i++) {
+				uint64_t value         = 0;
+				v.ok                   = ParseNumber(parts[i], value, 16) && value <= UINT32_MAX;
+				target_packed_blend[i] = static_cast<uint32_t>(value);
+			}
+		}
+	}
+#else
 	auto& [interpolator_settings, input_num, wave_size, ps_system_input_base,
 	       custom_interpolation_mask, ps_perspective_center_vgpr, ps_perspective_sample_vgpr,
 	       ps_perspective_centroid_vgpr, target_output_mode, target_shader_mask,
@@ -454,6 +483,7 @@ void VisitPixelInput(V& v, ShaderPixelInputInfo& info, const ShaderPixelInputInf
 	       parameter_mode, ps_pixel_kill_enable, ps_depth_export_enable,
 	       ps_sample_mask_export_enable, ps_sample_shading, dual_source_blending,
 	       object_primitive_id, alpha_blend_source, ps_early_z, stage] = info;
+#endif
 	v.Dec("wave", wave_size, base.wave_size);
 	v.Dec("scratch", scratch_size_dwords, base.scratch_size_dwords);
 	v.Dec("lds", lds_size_dwords, base.lds_size_dwords);

@@ -44,6 +44,9 @@ struct GraphicContext {
 	bool                               occlusion_queries_enabled             = false;
 	bool                               occlusion_query_precise_enabled       = false;
 	bool                               indirect_draws_enabled                = false;
+#if defined(ANYPS5_KYTY)
+	bool                               fragment_shader_pixel_interlock_enabled = false;
+#endif
 	bool                               supports_block_texel_view              = false;
 	bool                               pipeline_cache_lookup_enabled          = false;
 #if defined(ANYPS5_KYTY)
