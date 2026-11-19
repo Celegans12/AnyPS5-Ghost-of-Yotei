@@ -287,8 +287,11 @@ uint32_t AlphaTest(ValueEmitContext& ctx, const LaneVariables& lane, const Guest
 	const auto coord  = [&](uint32_t c) {
 		return fadd(fadd(fmul(uv[0][c], w0), fmul(uv[1][c], i)), fmul(uv[2][c], j));
 	};
-	const auto t = s.builder.AllocateId();
+	auto t = s.builder.AllocateId();
 	s.builder.AddFunction(spv::OpRayQueryGetIntersectionTKHR, f, t, lane.query, U32(s, CandidateIntersection));
+	if (lane.alpha_distance != 0) {
+		t = fadd(t, as_f32(Load(s, u, lane.alpha_distance)));
+	}
 	const auto cone =
 	    fmul(fadd(fmul(AlphaF32(s, lane, AlphaArgument::Spread), t), AlphaF32(s, lane, AlphaArgument::Lod)),
 	         ConstantF32Value(s, 2.0f));
@@ -639,6 +642,7 @@ void DeclareRayQueryVariables(EmitterState& s) {
 		declare(u, s.ray_query_selected_leaf[site]);
 	}
 	std::array<bool, IR::MaxRayQuerySites> alpha_sites {};
+	std::array<bool, IR::MaxRayQuerySites> distance_sites {};
 	std::vector<const IR::Inst*>           samples;
 	std::array<const IR::Inst*, 2>         entry_samples {};
 	bool                                   entry_ambiguous = false;
@@ -652,6 +656,8 @@ void DeclareRayQueryVariables(EmitterState& s) {
 				s.ray_query_alpha_factor[site] = (variant & IR::RayQueryAlphaFactor) != 0;
 				s.ray_query_alpha_entry[site]  = (variant & IR::RayQueryAlphaEntry) != 0;
 				s.ray_query_alpha_format[site] = inst.Arg(static_cast<size_t>(AlphaArgument::Count)).U32();
+			} else if (inst.GetOpcode() == IR::ValueOpcode::RayQueryAlphaDistance) {
+				distance_sites[IR::RayQuerySite(inst.Flags<uint32_t>()) % IR::MaxRayQuerySites] = true;
 			} else if (inst.GetOpcode() == IR::ValueOpcode::RayQueryInit) {
 				const auto flags = inst.Flags<uint32_t>();
 				if ((IR::RayQueryVariant(flags) & IR::RayQueryInitGeometryOpacity) != 0) {
@@ -695,6 +701,7 @@ void DeclareRayQueryVariables(EmitterState& s) {
 		for (uint32_t half = 0; half < s.lane_count; half++) {
 			declare(alpha_type, s.ray_query_alpha[site][half]);
 			declare(cache_type, s.ray_query_alpha_cache[site][half]);
+			if (distance_sites[site]) declare(u, s.ray_query_alpha_distance[site][half]);
 		}
 	}
 	s.ray_query_alpha_sample = one_table ? samples[0] : nullptr;
@@ -919,6 +926,16 @@ void EmitRayQueryAlpha(ValueEmitContext& ctx, const IR::Inst& inst) {
 	for (uint32_t i = 0; i < static_cast<uint32_t>(AlphaArgument::Count); i++) {
 		Store(s, AlphaPointer(s, lane, i), ctx.Arg(inst, i));
 	}
+}
+
+void EmitRayQueryAlphaDistance(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&      s    = ctx.state;
+	const auto site = SiteOf(ctx, inst);
+	const auto lane = Lane(s, site, ctx.half);
+	if (lane.alpha_distance == 0) {
+		ctx.Fail(inst, "ray query alpha distance without alpha test");
+	}
+	Store(s, lane.alpha_distance, ctx.Arg(inst, 0));
 }
 
 void EmitRayQueryMark(ValueEmitContext& ctx, const IR::Inst& inst) {

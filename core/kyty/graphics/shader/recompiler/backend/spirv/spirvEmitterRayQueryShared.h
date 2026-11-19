@@ -56,6 +56,7 @@ struct LaneVariables {
 	uint32_t alpha           = 0;
 	uint32_t alpha_cache     = 0;
 	uint32_t inline_record   = 0;
+	uint32_t alpha_distance  = 0;
 };
 
 struct InlineLayout {
@@ -97,7 +98,7 @@ inline LaneVariables Lane(EmitterState& s, uint32_t site, uint32_t half) {
 	        s.ray_query_result_instance[site][half], s.ray_query_result_u[site][half],
 	        s.ray_query_result_v[site][half],  s.ray_query_result_node[site][half],
 	        s.ray_query_alpha[site][half],     s.ray_query_alpha_cache[site][half],
-	        s.ray_query_inline_records[site][half]};
+	        s.ray_query_inline_records[site][half], s.ray_query_alpha_distance[site][half]};
 }
 
 inline uint32_t Load(EmitterState& s, uint32_t type, uint32_t pointer) {
