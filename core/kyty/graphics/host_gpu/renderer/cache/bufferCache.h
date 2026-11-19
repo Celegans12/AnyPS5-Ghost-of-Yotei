@@ -121,7 +121,7 @@ public:
 	                                                        bool     is_written,
 	                                                        bool     is_texel_buffer = false,
 	                                                        BufferId id              = {});
-	void PrepareDeviceAddressRead(uint64_t vaddr, uint64_t size);
+	bool PrepareDeviceAddressRead(uint64_t vaddr, uint64_t size);
 	[[nodiscard]] StreamBuffer&                GetUtilityBuffer(MemoryUsage usage) noexcept {
 		switch (usage) {
 			case MemoryUsage::Upload: return m_staging_buffer;

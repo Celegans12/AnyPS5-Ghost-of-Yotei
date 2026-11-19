@@ -1596,13 +1596,21 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
-void BufferCache::PrepareDeviceAddressRead(uint64_t vaddr, uint64_t size) {
-	if (vaddr == 0 || size == 0) {
-		return;
+bool BufferCache::PrepareDeviceAddressRead(uint64_t vaddr, uint64_t size) {
+	if (size == 0) {
+		return true;
+	}
+	if (!GuestRange {vaddr, size}.Valid()) {
+		Common::HackNotice::Report("device address read outside guest memory skipped with the ray tracing data that "
+		                           "needed it",
+		                           "BufferCache::PrepareDeviceAddressRead", 0, 0,
+		                           fmt::format("0x{:x}, {} bytes", vaddr, size));
+		return false;
 	}
 	auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 	TouchBuffer(buffer);
 	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+	return true;
 }
 
 static bool AsyncImageStaging() {

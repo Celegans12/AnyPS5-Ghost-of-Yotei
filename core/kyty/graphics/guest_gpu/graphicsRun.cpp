@@ -2215,6 +2215,19 @@ static void ReadGuestAroundGpuWrites(uint64_t vaddr, void* data, uint64_t size) 
 	}
 }
 
+static uint32_t ReadRefitBlasSize(uint64_t blas) {
+	uint32_t size = 0;
+	ReadGuestAroundGpuWrites(blas + 16, &size, sizeof(size));
+	return size;
+}
+
+static void ReportRefitOutsideGuest(std::span<const std::pair<uint64_t, uint32_t>> dropped) {
+	for (const auto& [blas, size]: dropped) {
+		Common::HackNotice::Report("BLAS refit skipped for a BLAS outside guest memory", "CommandProcessor::EmitHleRefit",
+		                           0, 0, fmt::format("BLAS 0x{:x}, {} bytes", blas, size));
+	}
+}
+
 bool CommandProcessor::HleBlasDispatch(uint64_t data_addr) {
 	if (data_addr == 0 || !m_renderer.GetRayTracing()->Enabled()) {
 		return false;
@@ -2299,19 +2312,21 @@ void CommandProcessor::EmitHleRefitArgs() {
 	                             m_hle_refit_blases.end());
 	m_hle_refit_args = m_hle_refit_blases.size();
 	EmitHostCommand([this, blases = std::move(blases)] {
-		auto& context = m_renderer;
-		auto& cache   = context.GetBufferCache();
-		for (const auto blas: blases) {
-			uint32_t size = 0;
-			ReadGuestAroundGpuWrites(blas + 16, &size, sizeof(size));
-			if (blas != 0 && size > 256u) {
-				(void)cache.ObtainBuffer(blas, size, true);
+		auto&                                     context = m_renderer;
+		auto&                                     cache   = context.GetBufferCache();
+		auto                                      refit   = blases;
+		std::vector<uint32_t>                     sizes;
+		std::vector<RayTracing::HleRefitGeometry> none;
+		ReportRefitOutsideGuest(RayTracing::DropHleRefitOutsideGuest(refit, sizes, none, ReadRefitBlasSize));
+		for (size_t i = 0; i < refit.size(); i++) {
+			if (refit[i] != 0 && sizes[i] > RayTracing::HleRefitBlasHeaderBytes) {
+				(void)cache.ObtainBuffer(refit[i], sizes[i], true);
 			}
 		}
 		context.PrepareBda(true, false);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
-		context.GetRayTracing()->RecordHleRefit(command.Handle(), blases, {}, 2, true);
+		context.GetRayTracing()->RecordHleRefit(command.Handle(), refit, {}, 2, true);
 	});
 }
 
@@ -2349,25 +2364,31 @@ void CommandProcessor::EmitHleRefit() {
 			ShaderBufferResource vsharp;
 			std::memcpy(vsharp.fields, geometry.vsharp.data(), sizeof(vsharp.fields));
 			if (vsharp.Base48() != 0 && vsharp.Base48() != last_vertices && vsharp.GetSize() != 0) {
+				if (!cache.PrepareDeviceAddressRead(vsharp.Base48(), vsharp.GetSize())) {
+					continue;
+				}
 				last_vertices = vsharp.Base48();
-				cache.PrepareDeviceAddressRead(vsharp.Base48(), vsharp.GetSize());
 			}
 			geometries.push_back(geometry);
 		}
-		for (const auto blas: blases) {
-			uint32_t size = 0;
-			ReadGuestAroundGpuWrites(blas + 16, &size, sizeof(size));
-			if (blas != 0 && size > 256u && header_layout == 2) {
+		auto                  refit = blases;
+		std::vector<uint32_t> sizes;
+		ReportRefitOutsideGuest(RayTracing::DropHleRefitOutsideGuest(refit, sizes, geometries, ReadRefitBlasSize));
+		constexpr uint32_t header_bytes = RayTracing::HleRefitBlasHeaderBytes;
+		for (size_t i = 0; i < refit.size(); i++) {
+			const auto blas = refit[i];
+			const auto size = sizes[i];
+			if (blas != 0 && size > header_bytes && header_layout == 2) {
 				(void)cache.ObtainBuffer(blas, size, true);
-			} else if (blas != 0 && size > 256u) {
-				cache.PrepareDeviceAddressRead(blas, 256u);
-				(void)cache.ObtainBuffer(blas + 256u, size - 256u, true);
+			} else if (blas != 0 && size > header_bytes) {
+				(void)cache.PrepareDeviceAddressRead(blas, header_bytes);
+				(void)cache.ObtainBuffer(blas + header_bytes, size - header_bytes, true);
 			}
 		}
 		context.PrepareBda(true, false);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
-		context.GetRayTracing()->RecordHleRefit(command.Handle(), blases, geometries, header_layout);
+		context.GetRayTracing()->RecordHleRefit(command.Handle(), refit, geometries, header_layout);
 	});
 }
 
@@ -2463,7 +2484,9 @@ void CommandProcessor::EmitHleTlas() {
 		auto&                 cache   = context.GetBufferCache();
 		std::vector<uint8_t>  list;
 		std::vector<uint64_t> blases;
-		for (const auto& build: builds) {
+		std::vector<uint8_t>  recorded(builds.size());
+		for (size_t index = 0; index < builds.size(); index++) {
+			const auto& build = builds[index];
 			if (build.header == 0 || !build.Native()) {
 				Common::HackNotice::Report(
 				    "native TLAS build skipped for an instance list it cannot read",
@@ -2472,9 +2495,19 @@ void CommandProcessor::EmitHleTlas() {
 				                build.stride, build.input, build.header));
 				continue;
 			}
+			std::array<uint32_t, 32> header {};
+			const auto size = RayTracing::HleTlasHeader(build.count, build.format, header);
+			if (!GuestRange {build.header, size}.Valid()) {
+				Common::HackNotice::Report("native TLAS build skipped for a TLAS outside guest memory",
+				                           "CommandProcessor::HleTlasDispatch", 0, build.stride,
+				                           fmt::format("TLAS at 0x{:x}, {} bytes", build.header, size));
+				continue;
+			}
 			if (build.count != 0) {
 				const auto bytes = uint64_t {build.stride} * build.count;
-				cache.PrepareDeviceAddressRead(build.input, bytes);
+				if (!cache.PrepareDeviceAddressRead(build.input, bytes)) {
+					continue;
+				}
 				list.resize(bytes);
 				ReadGuestAroundGpuWrites(build.input, list.data(), bytes);
 				blases.clear();
@@ -2490,21 +2523,21 @@ void CommandProcessor::EmitHleTlas() {
 				constexpr uint64_t BlasReadSize = 256 + 64;
 				for (const auto blas: blases) {
 					if (context.IsMapped(blas, BlasReadSize) && !cache.IsRegionGpuModified(blas, BlasReadSize)) {
-						cache.PrepareDeviceAddressRead(blas, BlasReadSize);
+						(void)cache.PrepareDeviceAddressRead(blas, BlasReadSize);
 					}
 				}
 			}
-			std::array<uint32_t, 32> header {};
-			const auto size = RayTracing::HleTlasHeader(build.count, build.format, header);
 			Libs::LibKernel::Memory::WriteBacking(build.header, header.data(), sizeof(header));
 			(void)cache.ObtainBuffer(build.header + 256u, size - 256u, true);
 			context.NoteHleTlas(build.header, size, build.count != 0 ? blases : std::vector<uint64_t> {});
+			recorded[index] = 1;
 		}
 		context.PrepareBda(true, false);
 		auto& command = context.GetCommandScheduler().Current();
 		command.EndRendering();
-		for (const auto& build: builds) {
-			if (build.header != 0 && build.Native()) {
+		for (size_t index = 0; index < builds.size(); index++) {
+			if (recorded[index] != 0) {
+				const auto& build = builds[index];
 				context.GetRayTracing()->RecordHleTlas(command.Handle(), build.input,
 				                                            build.count, build.stride,
 				                                            build.header, build.format);

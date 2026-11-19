@@ -7,6 +7,7 @@
 #include "gpu_tiler_shaders/rt_blas_walk_spv.h"
 #include "gpu_tiler_shaders/rt_tlas_walk_spv.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/commandRecorder.h"
 #include "graphics/host_gpu/renderer/commandScheduler.h"
@@ -2161,6 +2162,38 @@ void RayTracing::NoteGuestBlasDecompressed(uint64_t blas_va, uint64_t memory_siz
 	if (const auto created = CreateHostSlot(blas_va, sizes); created != UINT32_MAX) {
 		m_slot_list[created]->leaf_count = bound;
 	}
+}
+
+std::vector<std::pair<uint64_t, uint32_t>> RayTracing::DropHleRefitOutsideGuest(
+    std::vector<uint64_t>& blases, std::vector<uint32_t>& sizes, std::vector<HleRefitGeometry>& geometries,
+    const std::function<uint32_t(uint64_t)>& read_size) {
+	std::vector<std::pair<uint64_t, uint32_t>> dropped;
+	sizes.clear();
+	size_t kept = 0;
+	for (size_t i = 0; i < blases.size(); i++) {
+		const auto blas = blases[i];
+		uint32_t   size = 0;
+		if (blas != 0) {
+			if (!GuestRange {blas, HleRefitBlasHeaderBytes}.Valid()) {
+				dropped.emplace_back(blas, 0u);
+				continue;
+			}
+			size = read_size(blas);
+			if (size > HleRefitBlasHeaderBytes && !GuestRange {blas, size}.Valid()) {
+				dropped.emplace_back(blas, size);
+				continue;
+			}
+		}
+		blases[kept++] = blas;
+		sizes.push_back(size);
+	}
+	blases.resize(kept);
+	if (!dropped.empty()) {
+		std::erase_if(geometries, [&](const HleRefitGeometry& geometry) {
+			return std::ranges::any_of(dropped, [&](const auto& entry) { return entry.first == geometry.blas; });
+		});
+	}
+	return dropped;
 }
 
 void RayTracing::RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,

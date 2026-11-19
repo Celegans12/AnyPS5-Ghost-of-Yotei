@@ -132,6 +132,10 @@ public:
 	void RecordHleRefit(const CommandRecorder& command, std::span<const uint64_t> blases,
 	                    std::span<const HleRefitGeometry> geometries, uint32_t header_layout,
 	                    bool arguments = false);
+	static constexpr uint32_t HleRefitBlasHeaderBytes = 256;
+	[[nodiscard]] static std::vector<std::pair<uint64_t, uint32_t>> DropHleRefitOutsideGuest(
+	    std::vector<uint64_t>& blases, std::vector<uint32_t>& sizes, std::vector<HleRefitGeometry>& geometries,
+	    const std::function<uint32_t(uint64_t)>& read_size);
 
 	struct GuestBlasBuild {
 		uint64_t                               blas_va = 0;
