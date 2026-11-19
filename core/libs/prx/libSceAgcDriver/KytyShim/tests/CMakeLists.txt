@@ -75,6 +75,7 @@ target_include_directories(kyty_shim_presentation_upscale_tests PRIVATE ${CMAKE_
 add_test(NAME kyty_shim_presentation_upscale COMMAND kyty_shim_presentation_upscale_tests)
 set_tests_properties(kyty_shim_presentation_upscale PROPERTIES TIMEOUT 20)
 
+if(NOT ANYPS5_KYTY_DLL)
 add_test_executable(kyty_shim_fallback_tests ${CMAKE_CURRENT_SOURCE_DIR}/Fallback.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_fallback_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(kyty_shim_fallback_tests PRIVATE Kyty::gpu libkernel libc)
@@ -224,3 +225,4 @@ set_tests_properties(kyty_shim_empty_buffer_replay PROPERTIES TIMEOUT 120 SKIP_R
 add_test(NAME kyty_shim_empty_buffer_replay_off COMMAND kyty_shim_empty_buffer_replay_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_empty_buffer_replay_off PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         ENVIRONMENT "KYTY_SHARE_EMPTY_BUFFERS=0" PASS_REGULAR_EXPRESSION "kyty_shim_empty_buffer_replay_off: ok")
+endif()

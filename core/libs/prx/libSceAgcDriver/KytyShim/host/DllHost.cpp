@@ -6,6 +6,8 @@
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostReportSources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/HostReportVulkan.hpp"
 #include "prx/libSceAgcDriver/Execution/include/KeyboardOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PadStatusOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -29,8 +31,10 @@
 #include <algorithm>
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
@@ -313,6 +317,25 @@ KytyDllHost MakeHost() {
     };
     host.flip_fail = [](KytyDllFlipRequest* request, const char* message) { reinterpret_cast<RequestHolder*>(request)->request->Fail(Failure(message)); };
     host.flip_release = [](KytyDllFlipRequest* request) { delete reinterpret_cast<RequestHolder*>(request); };
+    host.host_report_setting = [](bool* enabled) { return Guard([&] { *enabled = AgcDriver::ParseHostReportSetting(std::getenv("ANYPS5_HOST_REPORT")); }); };
+    host.report_host = [](const void* properties, const void* driver, const void* memory, std::uint32_t subgroupSize, const char* shaderStorePath) {
+        return Guard([&] {
+            const auto store = std::filesystem::u8path(shaderStorePath != nullptr ? shaderStorePath : "");
+            auto facts = AgcDriver::CollectHostFacts(AgcDriver::SystemHostSources([&] {
+                AgcDriver::HostShaderCacheFacts cache;
+                if (store.empty()) return cache;
+                cache.enabled = true;
+                cache.present = std::filesystem::is_regular_file(store);
+                if (cache.present) cache.sizeMiB = std::filesystem::file_size(store) / (1024 * 1024);
+                return cache;
+            }));
+            facts.gpu = AgcDriver::CollectHostGpuIdentity(*static_cast<const VkPhysicalDeviceProperties*>(properties), static_cast<const VkPhysicalDeviceDriverProperties*>(driver),
+                *static_cast<const VkPhysicalDeviceMemoryProperties*>(memory), subgroupSize);
+            const auto text = AgcDriver::FormatHostReport(facts) + '\n';
+            std::fputs(text.c_str(), stderr);
+            std::fflush(stderr);
+        });
+    };
     return host;
 }
 

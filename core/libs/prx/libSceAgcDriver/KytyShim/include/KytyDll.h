@@ -13,7 +13,7 @@
 extern "C" {
 #endif
 
-#define KYTY_DLL_ABI_VERSION 1u
+#define KYTY_DLL_ABI_VERSION 2u
 #define KYTY_DLL_CREATE_SYMBOL "KytyDllCreate"
 #define KYTY_DLL_FILE_NAME L"kyty_gpu.prx"
 
@@ -174,6 +174,9 @@ typedef struct KytyDllHost {
     KytyDllStatus (*flip_gpu_ready)(KytyDllFlipRequest* request);
     void (*flip_fail)(KytyDllFlipRequest* request, const char* message);
     void (*flip_release)(KytyDllFlipRequest* request);
+
+    KytyDllStatus (*host_report_setting)(bool* enabled);
+    KytyDllStatus (*report_host)(const void* properties, const void* driver, const void* memory, uint32_t subgroup_size, const char* shader_store_path);
 } KytyDllHost;
 
 typedef struct KytyDllApi {

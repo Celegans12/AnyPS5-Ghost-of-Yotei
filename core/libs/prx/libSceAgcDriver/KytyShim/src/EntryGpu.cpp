@@ -59,6 +59,13 @@ constexpr int PROT_WRITE = 2;
 }
 #endif
 
+#if defined(ANYPS5_KYTY_DLL)
+namespace KytyShim {
+bool DllHostReportSetting();
+void DllReportHost(const void* properties, const void* driver, const void* memory, std::uint32_t subgroupSize, const char* shaderStorePath);
+}
+#endif
+
 namespace KytyShim {
 
 void StartRuntime();
@@ -88,6 +95,15 @@ bool HostWriteWatched(std::uintptr_t address, std::size_t bytes) {
 void ReportKytyHost(const Libs::Graphics::GraphicContext& graphics) {
     static std::atomic<bool> printed{false};
     if (printed.exchange(true)) return;
+#if defined(ANYPS5_KYTY_DLL)
+    VkPhysicalDeviceDriverProperties driverProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DRIVER_PROPERTIES};
+    VkPhysicalDeviceProperties2 deviceProperties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2, &driverProperties};
+    VULKAN_HPP_DEFAULT_DISPATCHER.vkGetPhysicalDeviceProperties2(graphics.physical_device, &deviceProperties);
+    driverProperties.pNext = nullptr;
+    const auto store = Libs::Graphics::ShaderStorePath().u8string();
+    const std::string storeText(reinterpret_cast<const char*>(store.data()), store.size());
+    DllReportHost(&deviceProperties.properties, &driverProperties, &graphics.physical_device_memory_properties, graphics.subgroup_size, storeText.c_str());
+#else
     auto facts = AgcDriver::CollectHostFacts(AgcDriver::SystemHostSources([] {
         AgcDriver::HostShaderCacheFacts cache;
         const auto path = Libs::Graphics::ShaderStorePath();
@@ -104,6 +120,7 @@ void ReportKytyHost(const Libs::Graphics::GraphicContext& graphics) {
     const auto text = AgcDriver::FormatHostReport(facts) + '\n';
     std::fputs(text.c_str(), stderr);
     std::fflush(stderr);
+#endif
 }
 
 }
@@ -116,7 +133,11 @@ using KytyShim::Entry::g_renderer;
 
 void Initialize() {
     if (g_renderer != nullptr) throw std::runtime_error("kyty GPU backend: Libs::Graphics::Initialize called twice");
+#if defined(ANYPS5_KYTY_DLL)
+    const bool hostReport = KytyShim::DllHostReportSetting();
+#else
     const bool hostReport = AgcDriver::ParseHostReportSetting(std::getenv("ANYPS5_HOST_REPORT"));
+#endif
     KytyShim::InstallFaultChain();
     GuestArena::GuestArenaSetHostWriteFilter_nid_no_patch(&KytyShim::Entry::HostWriteWatched);
     const auto width = Config::GetScreenWidth();
