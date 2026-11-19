@@ -184,6 +184,9 @@ public:
 		const auto first = static_cast<size_t>(offset / block_size * block_size / TRACKER_PAGE_SIZE);
 		const auto last  = first + static_cast<size_t>(block_size / TRACKER_PAGE_SIZE);
 		RegionBits open(~m_gpu_dirty, first, last);
+		RegionBits noted(m_gpu_noted, first, last);
+		noted.Unset(page);
+		open &= ~noted;
 		RegionBits clean(~m_cpu_dirty, first, last);
 		clean &= open;
 		uint32_t opened = 0;
@@ -363,6 +366,7 @@ public:
 	void MarkGpuDirtyUnlessCpuDirty(uint64_t offset, uint64_t size, Func&& func) {
 		const auto [start, end] = GetPageRange(offset, size);
 		m_gpu_written.SetRange(start, end);
+		m_gpu_noted.SetRange(start, end);
 		RegionBits mask(~m_cpu_dirty, start, end);
 		if (mask.None()) {
 			return;
@@ -446,6 +450,7 @@ private:
 		RegionBits                                 faulted;
 	};
 	RegionBits                 m_gpu_written;
+	RegionBits                 m_gpu_noted;
 	std::unique_ptr<BusyPages> m_busy;
 	std::atomic<uint32_t>      m_kept_sync {0};
 	std::atomic<uint64_t> m_host_write_epoch {0};
