@@ -2,7 +2,6 @@
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 
 #include "SceTypes.hpp"
-#include "graphics/guest_gpu/pm4.h"
 
 #include <sys/mman.h>
 
@@ -15,9 +14,46 @@
 #include <cstring>
 #include <vector>
 
-namespace {
+namespace Pm4 {
 
-namespace Pm4 = Libs::Graphics::Pm4;
+constexpr uint32_t IT_NOP                       = 0x10;
+constexpr uint32_t IT_SET_BASE                  = 0x11;
+constexpr uint32_t IT_CLEAR_STATE               = 0x12;
+constexpr uint32_t IT_INDEX_BUFFER_SIZE         = 0x13;
+constexpr uint32_t IT_DISPATCH_DIRECT           = 0x15;
+constexpr uint32_t IT_DISPATCH_INDIRECT         = 0x16;
+constexpr uint32_t IT_SET_PREDICATION           = 0x20;
+constexpr uint32_t IT_COND_EXEC                 = 0x22;
+constexpr uint32_t IT_DRAW_INDIRECT             = 0x24;
+constexpr uint32_t IT_INDEX_BASE                = 0x26;
+constexpr uint32_t IT_DRAW_INDEX_2              = 0x27;
+constexpr uint32_t IT_CONTEXT_CONTROL           = 0x28;
+constexpr uint32_t IT_INDEX_TYPE                = 0x2A;
+constexpr uint32_t IT_DRAW_INDIRECT_MULTI       = 0x2C;
+constexpr uint32_t IT_DRAW_INDEX_AUTO           = 0x2D;
+constexpr uint32_t IT_NUM_INSTANCES             = 0x2F;
+constexpr uint32_t IT_DRAW_INDEX_OFFSET_2       = 0x35;
+constexpr uint32_t IT_WRITE_DATA                = 0x37;
+constexpr uint32_t IT_DRAW_INDEX_MULTI_INST     = 0x3A;
+constexpr uint32_t IT_INDIRECT_BUFFER           = 0x3F;
+constexpr uint32_t IT_COPY_DATA                 = 0x40;
+constexpr uint32_t IT_PFP_SYNC_ME               = 0x42;
+constexpr uint32_t IT_EVENT_WRITE               = 0x46;
+constexpr uint32_t IT_RELEASE_MEM               = 0x49;
+constexpr uint32_t IT_DMA_DATA                  = 0x50;
+constexpr uint32_t IT_ACQUIRE_MEM               = 0x58;
+constexpr uint32_t IT_SET_SH_REG_INDIRECT       = 0x63;
+constexpr uint32_t IT_SET_CONFIG_REG            = 0x68;
+constexpr uint32_t IT_SET_CONTEXT_REG           = 0x69;
+constexpr uint32_t IT_SET_SH_REG                = 0x76;
+constexpr uint32_t IT_SET_UCONFIG_REG           = 0x79;
+constexpr uint32_t IT_SET_UCONFIG_REG_INDEX     = 0x7A;
+constexpr uint32_t IT_GET_LOD_STATS             = 0x8E;
+constexpr uint32_t IT_SET_CONTEXT_REG_INDIRECT  = 0x9F;
+
+}
+
+namespace {
 
 constexpr size_t   ArenaBytes   = 16u << 20;
 constexpr size_t   StreamDwords = 1u << 14;
