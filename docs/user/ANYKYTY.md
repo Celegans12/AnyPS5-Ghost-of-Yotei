@@ -92,9 +92,9 @@ Games are not shipped or provided; bring your own legally dumped title.
 |---|---|---|
 | An open-world AAA title | | Linux: in game; two crashes found in long sessions are fixed in [#34](https://github.com/simnJS/AnyPS5/pull/34) and [#35](https://github.com/simnJS/AnyPS5/pull/35). Windows (NVIDIA): reaches the prologue |
 | METAL GEAR SOLID 4 | PPSA18194 | Runs in game; an exit hang is fixed in [#23](https://github.com/simnJS/AnyPS5/pull/23); memory tracking costs about 20 % of the execute stage ([#24](https://github.com/simnJS/AnyPS5/issues/24)) |
-| Planet Zoo | PPSA18026 | Windows: two start-up stops are fixed ([#25](https://github.com/simnJS/AnyPS5/pull/25), [#28](https://github.com/simnJS/AnyPS5/pull/28)); it still stops later and draws screens wrongly ([#30](https://github.com/simnJS/AnyPS5/issues/30)) |
+| Planet Zoo | PPSA18026 | Windows: its stops are fixed ([#25](https://github.com/simnJS/AnyPS5/pull/25), [#28](https://github.com/simnJS/AnyPS5/pull/28), [#41](https://github.com/simnJS/AnyPS5/pull/41)); it still draws most of its 3D scene wrongly ([#30](https://github.com/simnJS/AnyPS5/issues/30)) |
 | LEGO Builders Journey | PPSA05496 | The first launch runs; the second stops in the PM4 parser ([#21](https://github.com/simnJS/AnyPS5/issues/21)) |
-| 007 First Light | PPSA11386 | Menus run at 35 to 45 FPS; the first cutscene stops on a merged hull program ([#31](https://github.com/simnJS/AnyPS5/issues/31)) and, with a local build that drops those draws, runs at 1 to 3 FPS ([#32](https://github.com/simnJS/AnyPS5/issues/32)) |
+| 007 First Light | PPSA11386 | Menus run at 35 to 45 FPS; merged hull programs run ([#31](https://github.com/simnJS/AnyPS5/issues/31)) and the first cutscene plays at about 29 FPS on an RX 9070 XT with RADV ([#32](https://github.com/simnJS/AnyPS5/issues/32)); gameplay after it hangs the GPU on RADV ([#98](https://github.com/simnJS/AnyPS5/issues/98)) |
 
 Other titles have not been tried on AnyKyty by us. A report of any title, working or not, helps: see [contributing](#contributing).
 
@@ -274,10 +274,10 @@ The report lists the longest completed-flip gaps by `process_us` and shows the n
 
 **Open issues** where help is wanted ([all issues](https://github.com/simnJS/AnyPS5/issues)):
 
+- [#98](https://github.com/simnJS/AnyPS5/issues/98) 007 First Light hangs the GPU on RADV (gfx ring timeout, `ErrorDeviceLost`);
 - [#33](https://github.com/simnJS/AnyPS5/issues/33) shader and pipeline compile stalls on first play: precompile pipeline parts with `VK_EXT_graphics_pipeline_library` (labelled `help wanted`);
-- [#32](https://github.com/simnJS/AnyPS5/issues/32) texture cache recreates and re-uploads aliased full-screen images every frame (007 First Light cutscene at 1 to 3 FPS);
-- [#31](https://github.com/simnJS/AnyPS5/issues/31) merged hull programs (binary type 3) are not supported;
-- [#30](https://github.com/simnJS/AnyPS5/issues/30) Planet Zoo stops with `BufferCache: failed to read mapped guest image backing`;
+- [#32](https://github.com/simnJS/AnyPS5/issues/32) texture cache recreates and re-uploads aliased full-screen images every frame (007 First Light cutscene: 1 to 3 FPS before the image-heap texture tables, about 29 FPS on RADV now);
+- [#30](https://github.com/simnJS/AnyPS5/issues/30) Planet Zoo draws most of its 3D scene wrongly or not at all (its start-up stop is fixed);
 - [#24](https://github.com/simnJS/AnyPS5/issues/24) memory tracking takes about 20 % of `kytyGpuExecute` in METAL GEAR SOLID 4;
 - [#21](https://github.com/simnJS/AnyPS5/issues/21) LEGO Builders Journey rewrites submitted command buffers while they are still queued.
 
