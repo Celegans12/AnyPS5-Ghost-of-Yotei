@@ -1404,8 +1404,23 @@ bool SupportsNativeVop3ResultModifiers(Opcode opcode) {
 	}
 }
 
+bool IsSadOpcode(Opcode opcode) {
+	switch (opcode) {
+		case Opcode::V_SAD_U8:
+		case Opcode::V_SAD_HI_U8:
+		case Opcode::V_SAD_U16:
+		case Opcode::V_SAD_U32:
+		case Opcode::V_MSAD_U8:
+		case Opcode::V_QSAD_PK_U16_U8:
+		case Opcode::V_MQSAD_PK_U16_U8:
+		case Opcode::V_MQSAD_U32_U8: return true;
+		default: return false;
+	}
+}
+
 bool SupportsNativeVop3Clamp(Opcode opcode) {
 	return SupportsNativeVop3ResultModifiers(opcode) || UsesInexactClampControl(opcode) ||
+	       IsSadOpcode(opcode) ||
 	       opcode == Opcode::V_MAD_I16 || opcode == Opcode::V_MAD_U16 ||
 	       opcode == Opcode::V_MIN3_I16 || opcode == Opcode::V_MAX3_I16 ||
 	       opcode == Opcode::V_MAX3_U16 || opcode == Opcode::V_MED3_U16 ||
@@ -1437,6 +1452,9 @@ bool HasUnsupportedNativeVop3Modifiers(Opcode opcode, bool permlane, bool mad_mi
 	}
 	if (carry_in_out || scalar_dst) {
 		return clamp != 0u || omod != 0u || neg != 0u;
+	}
+	if (IsSadOpcode(opcode)) {
+		return abs != 0u || op_sel != 0u || omod != 0u || neg != 0u;
 	}
 	switch (opcode) {
 		case Opcode::V_MUL_HI_I32_I24:

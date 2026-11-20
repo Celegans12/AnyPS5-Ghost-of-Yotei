@@ -251,8 +251,8 @@ Frontend::EmbeddedFetchPlan DetectEmbeddedVertexFetch(
 		      inst.src1.reg == inst.dst.reg) ||
 		     (user_data_base == 8 &&
 		      (inst.dst.reg == vertex_index_reg || inst.dst.reg == instance_index_reg) &&
-		      inst.opcode == Decoder::Opcode::V_SAD_U32 && IsDecodedVgpr(inst.src2) &&
-		      inst.src2.reg == inst.dst.reg &&
+		      inst.opcode == Decoder::Opcode::V_SAD_U32 && !inst.dst.clamp &&
+		      IsDecodedVgpr(inst.src2) && inst.src2.reg == inst.dst.reg &&
 		      TryDecodedOperandConstant(sgprs, inst.src1, sad_zero) && sad_zero == 0));
 		if (data.loads.empty() && index_offset_add) {
 			const auto reg = DecodedSgprReg(inst.src0);
