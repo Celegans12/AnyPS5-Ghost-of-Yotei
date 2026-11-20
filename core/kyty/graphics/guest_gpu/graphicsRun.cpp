@@ -3056,7 +3056,7 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 #endif
 			};
 #if defined(ANYPS5_KYTY)
-			if (m_labels_after_dumps) {
+			if (m_labels_after_dumps && !at_completion) {
 				GetScheduler().DeferPriorityOperationAfter(
 				    std::max<uint64_t>(m_renderer.GetOcclusionQueries().LastPendingDumpTick(), 1),
 				    std::move(write_deferred), vaddr, size);
@@ -3071,7 +3071,7 @@ void CommandProcessor::ExecuteReleaseMem(uint32_t data_sel, bool interrupt, void
 			}
 			return;
 		}
-		if (labels_pending() != 0) {
+		if (labels_pending() != 0 || at_completion) {
 			auto&      scheduler = GetScheduler();
 			const auto tick      = scheduler.CurrentTick();
 #if defined(ANYPS5_KYTY)
