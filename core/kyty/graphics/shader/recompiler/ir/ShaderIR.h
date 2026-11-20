@@ -178,6 +178,7 @@ struct BufferResource {
 	std::vector<uint32_t>  indirect_resources;
 	bool                   indirect_write_table  = false;
 	uint32_t               indirect_table_offset = 0;
+	std::vector<uint32_t>  fixed_dword_writes;
 
 	bool operator==(const BufferResource& other) const = default;
 };

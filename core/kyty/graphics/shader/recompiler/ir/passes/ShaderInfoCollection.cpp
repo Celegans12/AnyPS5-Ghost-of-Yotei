@@ -641,6 +641,60 @@ void Visit(Program& program, ShaderStageInputInfo input_info, InputUsage& inputs
 
 }
 
+static void CollectFixedBufferWrites(Program& program) {
+	if (program.stage != ShaderType::Compute || program.table_mode || program.dispatcher_fallback ||
+	    program.info.uses_dma || program.has_address_writes || program.blocks.size() != 2) {
+		return;
+	}
+	const auto* entry = program.blocks.front();
+	const auto* body = program.blocks.back();
+	if (entry->terminator.kind != CFG::TerminatorKind::Branch ||
+	    entry->terminator.true_block != body || body->terminator.kind != CFG::TerminatorKind::Return) {
+		return;
+	}
+
+	std::vector<std::vector<uint32_t>> writes(program.info.buffers.size());
+	for (const auto* block: program.blocks) {
+		for (const auto& inst: *block) {
+			const auto op = inst.GetOpcode();
+			const auto access = BufferAccessOf(op);
+			if (access != BufferAccess::Write && access != BufferAccess::Atomic) {
+				continue;
+			}
+			const auto& mem = program.memory_info[inst.Flags<MemoryFlags>().index];
+			if (op != ValueOpcode::StoreBufferU32 || mem.kind != ResourceKind::Buffer ||
+			    mem.typed || mem.formatted || mem.data_bits != 32 || mem.resource >= writes.size()) {
+				return;
+			}
+			const auto& buffer = program.info.buffers[mem.resource];
+			if (buffer.indirect_root != BufferResource::NoIndirectBuffer ||
+			    !buffer.indirect_resources.empty() || buffer.indirect_write_table ||
+			    (buffer.packed_stride & ((1u << 14u) | (1u << 20u))) != 0) {
+				return;
+			}
+			const auto index = inst.Arg(1).Resolve();
+			const auto offset = inst.Arg(2).Resolve();
+			const auto scalar = inst.Arg(3).Resolve();
+			const auto exec = inst.Arg(inst.NumArgs() - 1).Resolve();
+			if (!index.IsImmediate() || index.U32() != 0 || !offset.IsImmediate() ||
+			    !scalar.IsImmediate() || !exec.IsImmediate() || !exec.U1()) {
+				return;
+			}
+			const auto address = uint64_t {offset.U32()} + scalar.U32() + mem.offset;
+			if ((address & 3u) != 0 || address > UINT32_MAX - sizeof(uint32_t)) {
+				return;
+			}
+			writes[mem.resource].push_back(static_cast<uint32_t>(address));
+		}
+	}
+	for (size_t i = 0; i < writes.size(); ++i) {
+		auto& offsets = writes[i];
+		std::ranges::sort(offsets);
+		offsets.erase(std::unique(offsets.begin(), offsets.end()), offsets.end());
+		program.info.buffers[i].fixed_dword_writes = std::move(offsets);
+	}
+}
+
 void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 	if (!program.resource_tracking_complete || program.shader_info_complete) {
 		return Fail(!program.resource_tracking_complete ? "shader resources were not tracked"
@@ -672,6 +726,7 @@ void CollectShaderInfo(Program& program, ShaderStageInputInfo input_info) {
 			Visit(program, input_info, inputs, inst);
 		}
 	}
+	CollectFixedBufferWrites(program);
 	for (uint32_t index = 0; index < inputs.user_data.size(); index++) {
 		if (inputs.user_data[index]) info.user_data_registers.push_back(index);
 	}

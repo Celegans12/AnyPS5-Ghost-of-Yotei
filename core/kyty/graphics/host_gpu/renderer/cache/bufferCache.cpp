@@ -1980,6 +1980,36 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainSynchronizedBuffer(
 	return {&buffer, buffer.Offset(vaddr)};
 }
 
+std::pair<Buffer*, uint64_t>
+BufferCache::ObtainBufferWithFixedWrites(uint64_t vaddr, uint64_t size,
+                                        std::span<const uint32_t> offsets, BufferId id) {
+	EXIT_IF(!(GuestRange {vaddr, size}.Valid()) || offsets.empty());
+	if (m_in_place || (vaddr & 3u) != 0 || size < sizeof(uint32_t) ||
+	    offsets.back() > size - sizeof(uint32_t)) {
+		return ObtainBuffer(vaddr, size, true, false, id);
+	}
+	if (IsBufferInvalid(id) || !m_slot_buffers[id].IsInBounds(vaddr, size)) {
+		id = FindBuffer(vaddr, size);
+	}
+	auto& buffer = m_slot_buffers[id];
+	TouchBuffer(buffer);
+	(void)SynchronizeBuffer(buffer, vaddr, size, false, false);
+
+	++m_gpu_write_generation;
+	for (const auto offset: offsets) {
+		const auto address = vaddr + offset;
+		constexpr uint64_t Bytes = sizeof(uint32_t);
+		m_scheduler.Context().CollectHotPageWrites(address, Bytes);
+		(void)SynchronizeBuffer(buffer, address, Bytes, true, false);
+		if (m_gpu_modified_ranges.Add(address, Bytes)) {
+			NoteGpuModifiedChange(address, Bytes, true);
+		}
+		ForgetColorMetadataChecks(address, Bytes);
+		NoteWrite(address, Bytes);
+	}
+	return {&buffer, buffer.Offset(vaddr)};
+}
+
 bool BufferCache::PrepareDeviceAddressRead(uint64_t vaddr, uint64_t size) {
 	if (size == 0) {
 		return true;

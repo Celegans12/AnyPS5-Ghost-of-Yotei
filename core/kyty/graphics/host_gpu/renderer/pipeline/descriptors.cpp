@@ -356,9 +356,11 @@ NativeStorageBuffer(RenderContext& context, const PreparedBindings::BufferSource
 	}
 	auto&      queries  = context.GetOcclusionQueries();
 	const bool counters = queries.PrepareRead(address, size);
-	auto [buffer, offset] = context.GetBufferCache().ObtainBuffer(
-	    address, size, resource.written,
-	    resource.formatted, id);
+	auto& cache = context.GetBufferCache();
+	auto [buffer, offset] =
+	    resource.fixed_dword_writes.empty()
+	        ? cache.ObtainBuffer(address, size, resource.written, resource.formatted, id)
+	        : cache.ObtainBufferWithFixedWrites(address, size, resource.fixed_dword_writes, id);
 	if (counters) {
 		queries.NoteReadTarget(address, size, *buffer, offset);
 	}

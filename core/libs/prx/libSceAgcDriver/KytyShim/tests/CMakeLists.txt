@@ -50,6 +50,10 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
     set_tests_properties(kyty_shim_cross_queue_label_order PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
             ENVIRONMENT "KYTY_LABELS_AFTER_DUMPS=0;KYTY_GPU_PIPELINE=0"
             PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_label_order: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    add_test(NAME kyty_shim_buffer_write_coverage COMMAND kyty_shim_cross_queue_label_order_tests buffer-write-coverage)
+    set_tests_properties(kyty_shim_buffer_write_coverage PROPERTIES TIMEOUT 25 SKIP_RETURN_CODE 77
+            ENVIRONMENT "KYTY_GPU_PIPELINE=0;KYTY_COMMAND_MEMORY_IN_PLACE=0"
+            PASS_REGULAR_EXPRESSION "kyty_shim_buffer_write_coverage: ok" FAIL_REGULAR_EXPRESSION "FAILED")
 endif()
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")

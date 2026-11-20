@@ -4,9 +4,14 @@
 #include "graphics/guest_gpu/command_processor/commandProcessor.h"
 #include "graphics/guest_gpu/pm4.h"
 #include "graphics/host_gpu/graphicContext.h"
+#include "graphics/host_gpu/renderer/cache/bufferCache.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
 #include "graphics/host_gpu/renderer/occlusionQueries.h"
+#include "graphics/shader/shader.h"
+#include "kernel/memory.h"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libkernel/DirectMemory/DirectMemory.hpp"
+#include "prx/libkernel/include/Api.hpp"
 
 #include <array>
 #include <cstdint>
@@ -16,6 +21,16 @@
 #include <stdexcept>
 
 using namespace Libs::Graphics;
+
+namespace Libs::Graphics {
+
+struct BufferCacheTestAccess {
+	static void DiscardWrites(BufferCache& cache, uint64_t address, uint64_t size) {
+		cache.DiscardGpuWrites(address, size);
+	}
+};
+
+}
 
 namespace {
 
@@ -151,9 +166,68 @@ const char* ProbeCrossQueueLabelOrder(GraphicContext& graphics) {
 	return failure;
 }
 
+const char* ProbeBufferWriteCoverage(GraphicContext& graphics) {
+	constexpr uint64_t Page = 0x4000;
+	constexpr int CpuReadWrite = 0x03;
+	constexpr uint32_t FirstWrite = 0x12345678u;
+	constexpr uint32_t LastWrite = 0x9abcdeffu;
+	constexpr uint32_t GuestWrite = 0xabcd9876u;
+	constexpr std::array ShaderCode {
+	    0x7e0002ffu, FirstWrite,
+	    0xe0700004u, 0x80000000u,
+	    0x7e0002ffu, LastWrite,
+	    0xe0700010u, 0x80000000u,
+	    0xbf810000u,
+	};
+
+	void* guest = nullptr;
+	Require(sceKernelMapFlexibleMemory(&guest, 2 * Page, CpuReadWrite, 0) == 0 && guest != nullptr,
+	        "could not map guest backing for the storage buffer");
+	const auto code = reinterpret_cast<uint64_t>(guest);
+	const auto output = code + Page;
+	std::memcpy(guest, ShaderCode.data(), sizeof(ShaderCode));
+	ShaderMapUserData(code, {.type = Prospero::ShaderBinaryType::kCs,
+	                        .code_size_bytes = sizeof(ShaderCode)});
+
+	const char* failure = nullptr;
+	{
+		RenderContext renderer(graphics);
+		CommandProcessor producer(renderer, 0);
+		producer.Reset();
+		auto& scheduler = renderer.GetCommandScheduler();
+		scheduler.Begin(producer.GetCtx(), producer.GetUcfg(), producer.GetShCtx());
+		constexpr uint32_t Format32UInt = 20;
+		constexpr uint32_t Control = (0x01016facu & ~(0x7fu << 12u)) |
+		                             (Format32UInt << 12u) | (3u << 28u);
+		const std::array<uint32_t, 26> commands {
+		    KYTY_PM4(4, Pm4::IT_SET_SH_REG, 0), 0x20c, static_cast<uint32_t>(code >> 8u),
+		    static_cast<uint32_t>(code >> 40u),
+		    KYTY_PM4(3, Pm4::IT_SET_SH_REG, 0), 0x212, 0,
+		    KYTY_PM4(3, Pm4::IT_SET_SH_REG, 0), 0x213, 4u << 1u,
+		    KYTY_PM4(5, Pm4::IT_SET_SH_REG, 0), 0x207, 1, 1, 1,
+		    KYTY_PM4(6, Pm4::IT_SET_SH_REG, 0), 0x240, static_cast<uint32_t>(output),
+		    static_cast<uint32_t>((output >> 32u) & 0xffffu), Page, Control,
+		    KYTY_PM4(5, Pm4::IT_DISPATCH_DIRECT, 0), 1, 1, 1, 0x41,
+		};
+		Pm4Execution dispatch;
+		Require(producer.Process(dispatch, commands) == Pm4ProcessResult::Complete,
+		        "the storage-buffer dispatch did not finish recording");
+		Libs::LibKernel::Memory::WriteBacking(output + 8, &GuestWrite, sizeof(GuestWrite));
+		BufferCacheTestAccess::DiscardWrites(renderer.GetBufferCache(), output + 24, Page - 24);
+		std::array<uint32_t, 6> backing {};
+		if (!Libs::LibKernel::Memory::TryReadBacking(output, backing.data(), sizeof(backing))) {
+			failure = "could not read the guest backing";
+		} else if (backing[1] != FirstWrite || backing[4] != LastWrite) {
+			failure = "read-back missed the two compute stores";
+		} else if (backing[2] != GuestWrite) {
+			failure = "read-back overwrote a guest word between the two compute stores";
+		}
+	}
+	Require(sceKernelMunmap(code, 2 * Page) == 0, "could not unmap the test backing");
+	return failure;
 }
 
-extern "C" int RunKytyCrossQueueLabelOrderTest() {
+int RunProbe(const char* name, const char* (*probe)(GraphicContext&)) {
 	try {
 		Common::InitializeThreads();
 		Config::Initialize();
@@ -161,19 +235,26 @@ extern "C" int RunKytyCrossQueueLabelOrderTest() {
 		KytyShimTests::TestVulkanDevice gpu;
 		if (const auto* unavailable = gpu.Initialize()) {
 			const bool required = std::getenv("ANYPS5_REQUIRE_VULKAN") != nullptr;
-			std::fprintf(stderr, "kyty_shim_cross_queue_label_order: %s, no usable Vulkan device (%s)\n",
+			std::fprintf(stderr, "%s: %s, no usable Vulkan device (%s)\n", name,
 			             required ? "FAILED" : "skipped", unavailable);
 			return required ? 1 : 77;
 		}
 		Require(gpu.graphics.CreateAllocator(), "could not create the Vulkan allocator");
-		if (const auto* failure = ProbeCrossQueueLabelOrder(gpu.graphics)) {
-			std::fprintf(stderr, "kyty_shim_cross_queue_label_order: FAILED: %s\n", failure);
+		if (const auto* failure = probe(gpu.graphics)) {
+			std::fprintf(stderr, "%s: FAILED: %s\n", name, failure);
 			return 1;
 		}
-		std::puts("kyty_shim_cross_queue_label_order: ok");
+		std::printf("%s: ok\n", name);
 		return 0;
 	} catch (const std::exception& error) {
-		std::fprintf(stderr, "kyty_shim_cross_queue_label_order: FAILED: %s\n", error.what());
+		std::fprintf(stderr, "%s: FAILED: %s\n", name, error.what());
 		return 1;
 	}
+}
+
+}
+
+extern "C" int RunKytyCrossQueueLabelOrderTest(bool buffer_write_coverage) {
+	return buffer_write_coverage ? RunProbe("kyty_shim_buffer_write_coverage", ProbeBufferWriteCoverage)
+	                             : RunProbe("kyty_shim_cross_queue_label_order", ProbeCrossQueueLabelOrder);
 }
