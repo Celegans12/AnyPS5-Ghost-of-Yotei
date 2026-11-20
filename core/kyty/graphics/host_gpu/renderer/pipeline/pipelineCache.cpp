@@ -3676,18 +3676,6 @@ void PipelineCache::RunTableJob(CompileJob& job, InputInfo& input_info) {
 	UnlockPrograms();
 }
 
-PipelineCache::TableProgram PipelineCache::GetComputeProgramTable(
-    const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info,
-    const ShaderRecompiler::IR::ResourceSpecialization& specialization) {
-	input_info.host_subgroup_size = m_graphics.SupportsComputeWave64() ? 64u : 32u;
-	const auto params             = PrepareProgram(regs, input_info);
-	input_info.lds_storage = input_info.lds_size_dwords * 4u >
-	    m_graphics.GetPhysicalDeviceProperties().limits.maxComputeSharedMemorySize;
-	const uint32_t push_data_cursor =
-	    input_info.dispatch_indirect_threads ? ShaderRecompiler::IR::PushData::NoStart : 0u;
-	return GetTableProgram(params, input_info, specialization, push_data_cursor);
-}
-
 PipelineCache::TableProgram PipelineCache::GetVertexProgramTable(
     const ShaderParams& params, const ShaderVertexInputInfo& input_info,
     const ShaderRecompiler::IR::ResourceSpecialization& specialization, uint32_t& push_data_cursor) {

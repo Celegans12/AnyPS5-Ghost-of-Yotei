@@ -104,7 +104,6 @@ public:
 	void NoteFlip() noexcept { m_flip_number.fetch_add(1, std::memory_order_relaxed); }
 #endif
 	[[nodiscard]] bool UnmappedSince(uint64_t version, uint64_t vaddr, uint64_t size) const;
-	[[nodiscard]] bool PrepareBdaReadRanges(std::span<const GuestRange> ranges);
 	void               MapMemory(uint64_t vaddr, uint64_t size);
 	void               UnmapMemory(uint64_t vaddr, uint64_t size);
 	void               CacheDmaBases(const ShaderStageRuntime& runtime);
@@ -168,12 +167,6 @@ private:
 #if defined(ANYPS5_KYTY)
 	std::atomic<uint64_t> m_flip_number {0};
 #endif
-	std::vector<BufferCache::SyncRegionRequest> m_bda_region_requests, m_fresh_bda_region_requests;
-	std::vector<GuestRange>                     m_bda_spans;
-	bool                                        m_bda_rebuild = true;
-	void NoteBdaSpan(uint64_t vaddr, uint64_t size);
-	void RefreshBdaRanges();
-	void SynchronizeDirtyBdaRegions(GuestRange range);
 	std::vector<std::pair<uint64_t, uint64_t>> m_dma_spans;
 	std::vector<std::pair<uint64_t, uint64_t>> m_table_runs;
 	struct HleTlas {

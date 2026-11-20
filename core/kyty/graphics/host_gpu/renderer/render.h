@@ -261,8 +261,6 @@ public:
 	[[nodiscard]] uint32_t TableHint(const HW::Shader& shaders) const noexcept;
 	[[nodiscard]] bool TableDrewDraws() const noexcept { return m_table_drew_draws.load(std::memory_order_relaxed); }
 	void SetTableTicket(const void* ticket) noexcept { m_table_ticket = ticket; }
-	[[nodiscard]] uint32_t TableDispatchHint(const HW::ComputeShaderInfo& cs) const noexcept;
-	void               TableNoteDispatched(const HW::ComputeShaderInfo& cs, bool tabled) noexcept;
 	[[nodiscard]] bool TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint32_t count, uint32_t stride,
 	                               uint64_t index_base, uint64_t index_bytes, vk::IndexType index_type,
 	                               const DrawIndexArgs* direct, bool clean,
@@ -738,15 +736,8 @@ private:
 	void TableStore(CommandBuffer& buffer, const DrawRenderState& state, vk::PrimitiveTopology topology,
 	                bool primitive_restart_enable, const RenderState& rendering, const DynamicState& dynamic_state,
 	                bool storable);
-	void TableDispatchLearn(const HW::ComputeShaderInfo& cs, const ShaderModule& module, bool async_compute,
-	                        bool thread_dimensions);
-	void TableDispatchSpecial(const HW::ComputeShaderInfo& cs, bool thread_dimensions, const char* why);
-	bool TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
-	                   uint64_t indirect_args, bool thread_dimensions);
 	std::array<std::atomic<uint64_t>, 16384> m_table_drawn {};
 	std::atomic<bool>                        m_table_drew_draws {false};
-	std::array<std::atomic<uint64_t>, 4096> m_table_dispatched {};
-	std::array<std::atomic<uint64_t>, 4096> m_table_dispatch_mixed_until {};
 	std::array<std::atomic<uint64_t>, 16384> m_table_mixed_until {};
 	std::array<uint64_t, 4096> m_table_refused {};
 	std::array<uint64_t, 4096> m_table_refused_generation {};

@@ -1,6 +1,3 @@
-#ifndef KYTY_CX_DISPATCH
-#define KYTY_CX_DISPATCH 1
-#endif
 #ifndef KYTY_CX_INTERCHANGE
 #define KYTY_CX_INTERCHANGE 0
 #endif
@@ -238,7 +235,6 @@ struct RenderExecutor::TablePair {
 	uint64_t                                                    vs = 0, ps = 0;
 	int32_t                                                     start_instance = -1;
 	bool                                                        refused  = false;
-	const char* special = nullptr;
 	std::array<const ShaderRecompiler::IR::CompiledShaderInfo*, 2> programs {};
 	std::array<const ShaderModule*, 2>                              tables {};
 	std::array<const ShaderRecompiler::IR::ResourcePlan*, 2>        plans {};
@@ -289,12 +285,9 @@ struct RenderExecutor::TablePair {
 			side->previous_set.fill(nullptr);
 		}
 	}
-	std::unique_ptr<ShaderComputeInputInfo> compute;
 #if KYTY_CX_INTERCHANGE
 	ShaderProgram                           compute_program;
 #endif
-	const PipelineCache::Pipeline*          pipeline  = nullptr;
-	uint32_t                                sightings = 0;
 	std::array<uint32_t, 2> portable {};
 	bool                    respecialize = false;
 	std::shared_ptr<const std::atomic<bool>> waiting;
@@ -307,7 +300,6 @@ struct RenderExecutor::TableXpr {
 	using Pair    = TablePair;
 	using Variant = TableVariant;
 	std::unordered_map<uint64_t, Pair, HashedKey> pairs;
-	std::unordered_map<uint64_t, Pair, HashedKey> dispatches;
 	static constexpr uint64_t PairSweepFrames = 600, PairKeepFrames = 3600;
 	static constexpr size_t   PairsKept       = 2048;
 	uint64_t                  pairs_swept     = 0;
@@ -315,9 +307,6 @@ struct RenderExecutor::TableXpr {
 	std::array<std::pair<uint64_t, Pair*>, PairCacheEntries> pair_cache {};
 	std::array<uint64_t, 3> found_key {};
 	Pair*                   found_pair = nullptr;
-	Pair*                   previous_dispatch = nullptr;
-	std::array<uint64_t, 4> found_dispatch_key {};
-	Pair*                   found_dispatch = nullptr;
 	uint64_t collected  = 0;
 	uint64_t epoch = 0, seen_epoch = 0;
 	Pair*    store       = nullptr;
@@ -430,7 +419,7 @@ void RenderExecutor::TableReset(TablePair& pair) {
 	table.last_set = nullptr;
 	++table.epoch;
 	pair = {.vs = pair.vs, .ps = pair.ps, .start_instance = pair.start_instance, .generation = pair.generation,
-	        .roles = std::move(pair.roles), .sightings = pair.sightings, .portable = pair.portable};
+	        .roles = std::move(pair.roles), .portable = pair.portable};
 	pair.ClearSets();
 }
 
@@ -442,13 +431,12 @@ void RenderExecutor::TableForgetStates() {
 	table->last_state = nullptr;
 	table->last_set   = nullptr;
 	++table->epoch;
-	for (auto* pairs: {&table->pairs, &table->dispatches})
-		for (auto& [key, pair]: *pairs)
-			for (auto& [words, set]: pair.sets)
-				if (set->transit_state != nullptr) {
-					set->transit_state   = nullptr;
-					set->transit_epoch   = UINT64_MAX;
-				}
+	for (auto& [key, pair]: table->pairs)
+		for (auto& [words, set]: pair.sets)
+			if (set->transit_state != nullptr) {
+				set->transit_state   = nullptr;
+				set->transit_epoch   = UINT64_MAX;
+			}
 }
 
 void RenderExecutor::TableSweepPairs() {
@@ -458,40 +446,35 @@ void RenderExecutor::TableSweepPairs() {
 	if (frame - table->pairs_swept < TableXpr::PairSweepFrames) return;
 	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) return;
 	table->pairs_swept = frame;
-	if (table->pairs.size() + table->dispatches.size() <= TableXpr::PairsKept) return;
+	if (table->pairs.size() <= TableXpr::PairsKept) return;
 	const auto write = CatalogWrite();
 	if (kyty_local_speculations_live.load(std::memory_order_seq_cst) != 0) {
 		table->pairs_swept = frame - TableXpr::PairSweepFrames;
 		return;
 	}
-	const size_t before = table->pairs.size() + table->dispatches.size();
-	for (auto* pairs: {&table->pairs, &table->dispatches})
-		std::erase_if(*pairs, [&](auto& item) {
-			auto& pair = item.second;
-			if (pair.used_frame + TableXpr::PairKeepFrames >= frame || pair.waiting) return false;
+	const size_t before = table->pairs.size();
+	std::erase_if(table->pairs, [&](auto& item) {
+		auto& pair = item.second;
+		if (pair.used_frame + TableXpr::PairKeepFrames >= frame || pair.waiting) return false;
 #if KYTY_CX_SCOUT
-			if (pair.scout_version != 0) Scout::Retire(TableScoutHash(pair), pair.scout_version);
+		if (pair.scout_version != 0) Scout::Retire(TableScoutHash(pair), pair.scout_version);
 #endif
-			for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
-			return true;
-		});
-	const size_t after = table->pairs.size() + table->dispatches.size();
+		for (auto& [words, set]: pair.sets) NativeXprRetireSet(set->pool, set->set);
+		return true;
+	});
+	const size_t after = table->pairs.size();
 	if (after == before) return;
 	++table->memo_epoch;
 	table->pair_cache         = {};
 	table->found_key          = {};
 	table->found_pair         = nullptr;
-	table->found_dispatch_key = {};
-	table->found_dispatch     = nullptr;
-	table->previous_dispatch  = nullptr;
 	table->store              = nullptr;
 	table->gathered           = nullptr;
 	table->last_pair          = nullptr;
 	table->last_state         = nullptr;
 	table->last_set           = nullptr;
 	++table->epoch;
-	for (auto* pairs: {&table->pairs, &table->dispatches})
-		for (auto& [key, pair]: *pairs) pair.next = nullptr;
+	for (auto& [key, pair]: table->pairs) pair.next = nullptr;
 	if (SlowLog::HitchThreshold() > 0.0)
 		std::printf("[tsc %llu] table pairs %zu -> %zu\n", static_cast<unsigned long long>(__rdtsc()), before, after);
 }
@@ -524,9 +507,6 @@ void RenderExecutor::ForgetStaleCatalog() {
 	table.pair_cache         = {};
 	table.found_key          = {};
 	table.found_pair         = nullptr;
-	table.found_dispatch_key = {};
-	table.found_dispatch     = nullptr;
-	table.previous_dispatch  = nullptr;
 	table.store              = nullptr;
 	table.gathered           = nullptr;
 	table.last_pair          = nullptr;
@@ -871,10 +851,9 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 			if (!binding.image_id) continue;
 			auto&       image   = textures.GetImage(binding.image_id);
 			const bool  storage = binding.desc.type == TextureCache::BindingType::Storage;
-			const auto  found   = draw_state == nullptr ? decltype(draw_state->targets.end()) {}
-			                                            : std::ranges::find(draw_state->targets, binding.image_id,
-			                                                                &NativeXprDrawState::Target::id);
-			const auto* target  = draw_state == nullptr || found == draw_state->targets.end() ? nullptr : &*found;
+			const auto  found   = std::ranges::find(draw_state->targets, binding.image_id,
+			                                        &NativeXprDrawState::Target::id);
+			const auto* target  = found == draw_state->targets.end() ? nullptr : &*found;
 			const auto& view    = binding.desc.view_info;
 			if (image.info.data.Empty()) return refuse("an image without data");
 			if (target != nullptr && (storage || !(target->access & vk::AccessFlagBits2::eShaderRead)))
@@ -978,7 +957,7 @@ RenderExecutor::TableImageSet* RenderExecutor::TableResolveSet(CommandBuffer& bu
 					textures.NoteMetaUse(dep.desc.info.metadata.range.address, dep.id.index);
 			}
 	}
-	set->set = NativeXprAllocateSet((variant != nullptr ? variant->pipeline : pair.pipeline)->descriptor_set_layout, set->pool);
+	set->set = NativeXprAllocateSet(variant->pipeline->descriptor_set_layout, set->pool);
 	if (!set->set) return refuse("no descriptor set");
 	std::vector<vk::WriteDescriptorSet> writes;
 	writes.reserve(pending.size());
@@ -1379,16 +1358,15 @@ RenderExecutor::TableImageSet* RenderExecutor::TableSet(CommandBuffer& buffer, T
 	if (Role() == 0 && frame >= table.collected + 60) {
 		const auto write = CatalogWrite();
 		table.collected  = frame;
-		for (auto* pairs: {&table.pairs, &table.dispatches})
-			for (auto& [key, held]: *pairs)
-				std::erase_if(held.sets, [&](auto& item) {
-					if (item.second->used_frame.load(std::memory_order_relaxed) + 60 >= frame) return false;
-					held.ClearSets();
-					if (table.last_set == item.second.get()) table.last_set = nullptr;
-					++table.epoch;
-					NativeXprRetireSet(item.second->pool, item.second->set);
-					return true;
-				});
+		for (auto& [key, held]: table.pairs)
+			std::erase_if(held.sets, [&](auto& item) {
+				if (item.second->used_frame.load(std::memory_order_relaxed) + 60 >= frame) return false;
+				held.ClearSets();
+				if (table.last_set == item.second.get()) table.last_set = nullptr;
+				++table.epoch;
+				NativeXprRetireSet(item.second->pool, item.second->set);
+				return true;
+			});
 	}
 	return set;
 }
@@ -1723,10 +1701,8 @@ bool RenderExecutor::TableTransit(const TableImageSet& set, CommandRecorder vk_b
 	for (const auto& dep: set.images) {
 		auto* image = textures.m_slot_images.try_get(dep.id);
 		if (image == nullptr || image->serial != dep.serial) return false;
-		const auto target = draw_state == nullptr
-		                        ? decltype(draw_state->targets.end()) {}
-		                        : std::ranges::find(draw_state->targets, dep.id, &NativeXprDrawState::Target::id);
-		const bool is_target = draw_state != nullptr && target != draw_state->targets.end();
+		const auto target = std::ranges::find(draw_state->targets, dep.id, &NativeXprDrawState::Target::id);
+		const bool is_target = target != draw_state->targets.end();
 		if (is_target != dep.target ||
 		    (is_target && (target->layout != dep.layout || target->access != dep.access)))
 			return false;
@@ -2526,8 +2502,6 @@ void TableLoadSwitches() {
 				value.store(static_cast<uint32_t>(std::strtoul(text, nullptr, 0)), std::memory_order_relaxed);
 		};
 		load("KYTY_TABLE_XPR", kyty_local_table_xpr_mode);
-		if (::Loader::DemonsSoulsTitle::IsSupportedGame()) kyty_local_table_dispatch_mode.store(1, std::memory_order_relaxed);
-		load("KYTY_TABLE_DISPATCH", kyty_local_table_dispatch_mode);
 		load("KYTY_TABLE_STORE_BUDGET", kyty_local_table_store_budget);
 		load("KYTY_TABLE_SET_PROOFS", kyty_local_table_set_proofs);
 		load("KYTY_TABLE_MRU", kyty_local_table_mru);
@@ -2543,10 +2517,6 @@ uint32_t TableXprMode() {
 	TableLoadSwitches();
 	return kyty_local_table_xpr_mode.load(std::memory_order_relaxed);
 }
-uint32_t TableDispatchMode() {
-	TableLoadSwitches();
-	return kyty_local_table_dispatch_mode.load(std::memory_order_relaxed);
-}
 }
 
 namespace {
@@ -2561,23 +2531,6 @@ uint32_t RenderExecutor::TableHint(const HW::Shader& shaders) const noexcept {
 	const auto slot = (tag >> 40u) & (m_table_drawn.size() - 1);
 	if (m_table_drawn[slot].load(std::memory_order_relaxed) != tag) return 0;
 	return m_table_mixed_until[slot].load(std::memory_order_relaxed) < m_context.FrameNumber() ? 1u : 3u;
-}
-
-uint32_t RenderExecutor::TableDispatchHint(const HW::ComputeShaderInfo& cs) const noexcept {
-	if (TableXprMode() == 0 || TableDispatchMode() == 0) return 0;
-	const auto tag  = (cs.cs_regs.data_addr * 0x9e3779b97f4a7c15ull) | 1ull;
-	const auto slot = (tag >> 40u) & (m_table_dispatched.size() - 1);
-	if (m_table_dispatched[slot].load(std::memory_order_relaxed) != tag) return 0;
-	return m_table_dispatch_mixed_until[slot].load(std::memory_order_relaxed) < m_context.FrameNumber() ? 1u : 3u;
-}
-void RenderExecutor::TableNoteDispatched(const HW::ComputeShaderInfo& cs, bool tabled) noexcept {
-	static constexpr uint64_t TableMixedDispatchFrames = 120;
-	const auto tag  = (cs.cs_regs.data_addr * 0x9e3779b97f4a7c15ull) | 1ull;
-	const auto slot = (tag >> 40u) & (m_table_dispatched.size() - 1);
-	const bool was  = m_table_dispatched[slot].load(std::memory_order_relaxed) == tag;
-	if (tabled && !was) m_table_dispatched[slot].store(tag, std::memory_order_relaxed);
-	if (!tabled && was)
-		m_table_dispatch_mixed_until[slot].store(m_context.FrameNumber() + TableMixedDispatchFrames, std::memory_order_relaxed);
 }
 
 bool RenderExecutor::TableLikely(const HW::Shader& shaders) const noexcept {
@@ -2691,250 +2644,3 @@ bool RenderExecutor::TableXprTry(CommandBuffer& buffer, uint64_t args_addr, uint
 	}
 	return false;
 }
-
-#if KYTY_CX_DISPATCH
-
-static std::array<uint64_t, 4> TableDispatchWords(const HW::ComputeShaderInfo& cs, bool thread_dimensions) {
-	const auto& r = cs.cs_regs;
-	return {r.data_addr, uint64_t {r.num_thread_x} | uint64_t {r.num_thread_y} << 32u,
-	        uint64_t {r.num_thread_z} | uint64_t {r.lds_size} << 32u,
-	        uint64_t {r.wave_size} | uint64_t {r.user_sgpr} << 8u | uint64_t {r.tidig_comp_cnt} << 16u |
-	            uint64_t {r.tgid_x_en} << 24u | uint64_t {r.tgid_y_en} << 25u | uint64_t {r.tgid_z_en} << 26u |
-	            uint64_t {r.tg_size_en} << 27u | uint64_t {r.scratch_en} << 28u | uint64_t {thread_dimensions} << 29u};
-}
-static uint64_t TableDispatchKey(const std::array<uint64_t, 4>& words) {
-	return XXH3_64bits(words.data(), sizeof(words));
-}
-static uint64_t TableDispatchKey(const HW::ComputeShaderInfo& cs, bool thread_dimensions) {
-	return TableDispatchKey(TableDispatchWords(cs, thread_dimensions));
-}
-
-static bool TableDispatchServes(const ShaderRecompiler::IR::CompiledShaderInfo& program, bool thread_dimensions) {
-	using Kind = ShaderRecompiler::IR::DescriptorBindingKind;
-	return program.table_mode && program.bindings.UsesPushData() && !program.info.uses_gds &&
-	       program.bindings.descriptor_counts[static_cast<size_t>(Kind::SharedMemory)] == 0 &&
-	       (thread_dimensions || program.bindings.dispatch_thread_dword == ShaderRecompiler::IR::PushData::NoStart);
-}
-
-void RenderExecutor::TableDispatchSpecial(const HW::ComputeShaderInfo& cs, bool thread_dimensions, const char* why) {
-	if (TableDispatchMode() == 0 || TableXprMode() == 0) return;
-	auto&      table = OwnTable();
-	const auto key   = TableDispatchKey(cs, thread_dimensions);
-	auto       it    = table.dispatches.find(key);
-	if (it != table.dispatches.end() && it->second.refused) return;
-	if (it == table.dispatches.end()) {
-		it            = table.dispatches.try_emplace(key).first;
-		it->second.vs = cs.cs_regs.data_addr;
-	}
-	auto& pair = it->second;
-	if (pair.programs[0] != nullptr) {
-		const auto write = CatalogWrite();
-		TableReset(pair);
-	}
-	pair.refused = true;
-	pair.special = why;
-}
-
-void RenderExecutor::TableDispatchLearn(const HW::ComputeShaderInfo& cs, const ShaderModule& module, bool async_compute,
-                                        bool thread_dimensions) {
-	if (TableDispatchMode() == 0 || TableXprMode() == 0) return;
-	auto&      table = OwnTable();
-	const auto key   = TableDispatchKey(cs, thread_dimensions);
-	auto       it    = table.dispatches.find(key);
-	if (it == table.dispatches.end()) {
-		it     = table.dispatches.try_emplace(key).first;
-		it->second.vs = cs.cs_regs.data_addr;
-	}
-	auto& pair = it->second;
-	++pair.sightings;
-	pair.used_frame = m_context.FrameNumber();
-	if (pair.refused || pair.programs[0] != nullptr || pair.vs != cs.cs_regs.data_addr)
-		return void();
-	if (pair.waiting) {
-		if (!pair.waiting->load(std::memory_order_acquire)) return;
-		pair.waiting.reset();
-	}
-	const auto& program = module.info;
-	auto&       pipelines = m_context.GetPipelineCache();
-	const auto [plan, specialization] = pipelines.ProgramPlanOf(module);
-	const auto refuse = [&](const char* why) {
-		static std::atomic<uint32_t> reports {0};
-		if (reports.fetch_add(1, std::memory_order_relaxed) < 64)
-			std::printf("Table: CS 0x%llx refused: %s\n", static_cast<unsigned long long>(pair.vs), why);
-		pair.refused = true;
-		pair.special = why;
-	};
-	if (plan == nullptr || specialization == nullptr) return refuse("no resource plan");
-	if (program.info.uses_gds ||
-	    (!thread_dimensions && program.bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) ||
-	    program.bindings.ray_query_dword != ShaderRecompiler::IR::PushData::NoStart ||
-	    program.info.uses_image_heap || module.guest_traversal || program.info.bvh ||
-	    !program.info.self_sized_buffers.empty() ||
-	    plan->uniform_fill.fill.kind != ShaderRecompiler::IR::UniformFillKind::None ||
-	    std::ranges::any_of(program.info.buffers, [](const auto& buffer) { return buffer.indirect_write_table; }))
-		return refuse("a program table mode does not serve");
-	if (RayTracing::TlasSource source; RayTracing::FindTlasSource(program.info, source))
-		return refuse("native ray tracing");
-	auto compute = std::make_unique<ShaderComputeInputInfo>();
-	compute->async_compute              = async_compute;
-	compute->dispatch_thread_dimensions = thread_dimensions;
-	auto portable = *specialization;
-	for (size_t i = 0; i < portable.buffers.size() && i < 32; ++i) {
-		if (((pair.portable[0] >> i) & 1u) == 0) continue;
-		portable.buffers[i].descriptor_format  = Prospero::BufferFormat::kInvalid;
-		portable.buffers[i].descriptor_swizzle = DstSel(4, 5, 6, 7);
-	}
-	const auto result = pipelines.GetComputeProgramTable(cs, *compute, portable);
-	if (result.status == PipelineCache::TableStatus::Pending) return void();
-	if (result.status == PipelineCache::TableStatus::Refused || result.module == nullptr ||
-	    !TableDispatchServes(result.module->info, thread_dimensions))
-		return refuse(result.refusal != nullptr ? result.refusal->c_str() : "table mode cannot serve it");
-	compute->stage = {.module = result.module, .resources = &g_table_no_resources};
-	auto* const pipeline = pipelines.TryGetComputePipeline(*compute);
-	if (pipeline == nullptr) return void();
-	if (!pipeline->native_bindings || pipeline->uses_push_descriptors) return refuse("pipeline");
-	pair.compute     = std::move(compute);
-	pair.tables[0]   = result.module;
-	pair.programs[0] = &result.module->info;
-	pair.plans[0]    = plan;
-	pair.code_hashes[0] = ShaderHashAt(pair.vs);
-	pair.pipeline    = pipeline;
-	TableRuns(pair);
-#if KYTY_CX_SCOUT
-	TableScoutPublish(pair);
-#endif
-}
-
-bool RenderExecutor::TableDispatch(CommandBuffer& buffer, uint32_t groups_x, uint32_t groups_y, uint32_t groups_z,
-                                   uint64_t indirect_args, bool thread_dimensions) {
-	if (TableDispatchMode() == 0) return false;
-	if (indirect_args != 0 && thread_dimensions) return false;
-	auto& table = OwnTable();
-	if (table.dispatches.empty() || buffer.IsInvalid()) return false;
-	TableSweepPairs();
-	const auto& sh    = buffer.GetShaders();
-	const auto& cs    = sh.GetCs();
-	const auto  words = TableDispatchWords(cs, thread_dimensions);
-	auto* known = table.found_dispatch_key == words ? table.found_dispatch : nullptr;
-	if (known == nullptr) {
-		const auto found = table.dispatches.find(TableDispatchKey(words));
-		if (found == table.dispatches.end()) return false;
-		known                    = &found->second;
-		table.found_dispatch_key = words;
-		table.found_dispatch     = known;
-	}
-	auto& pair = *known;
-	if (pair.refused || pair.programs[0] == nullptr || pair.pipeline == nullptr || pair.vs != cs.cs_regs.data_addr)
-		return false;
-	TablePrefetchPair(pair);
-	pair.used_frame = m_context.FrameNumber();
-	TablePrefetchNext(table.previous_dispatch, pair);
-	LiveCensus::Scope census(LiveCensus::DrawPhase, 0x7ab1f, 0);
-	NativeXprCollect();
-	if (const auto generation = ShaderMapGeneration(); generation != pair.Generation(Role())) {
-		if (ShaderHashAt(pair.vs) != pair.programs[0]->shader_hash) {
-			const auto write = CatalogWrite();
-			pair.portable    = {};
-			TableReset(pair);
-			return false;
-		}
-		pair.Generation(Role()) = generation;
-	}
-	if (pair.respecialize) {
-		const auto write = CatalogWrite();
-		TableReset(pair);
-		return false;
-	}
-	TablePrefetchArrays(pair, pair.LastSet(Role()));
-	const std::array<std::span<const uint32_t>, 2> user_data {
-	    std::span<const uint32_t>(cs.cs_user_sgpr.value, std::min<uint32_t>(cs.cs_regs.user_sgpr, HW::UserSgprInfo::SGPRS_MAX)),
-	    std::span<const uint32_t> {}};
-	std::optional<LiveCensus::Scope> phase;
-	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 1);
-#if KYTY_CX_SCOUT
-	const auto* scout = Scout::Mode() == 3 && Scout::Running() && m_table_ticket != nullptr
-	                        ? TableScoutTicket(pair, user_data, 1, m_context, static_cast<const Scout::Ticket*>(m_table_ticket))
-	                        : nullptr;
-	if (scout != nullptr) {
-		TableScoutApply(table, pair, *scout, 1);
-	} else
-#endif
-	{
-		if (!TableEvaluate(pair, user_data)) return false;
-		TableGather(pair, user_data);
-	}
-	phase.reset();
-	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 2);
-	auto* set = TableSet(buffer, pair, nullptr, nullptr);
-	if (set == nullptr) return false;
-	phase.reset();
-	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 3);
-	std::array<vk::DeviceAddress, 2> blocks {};
-	bool                             storage_writes = false;
-	auto&                            cache          = m_context.GetBufferCache();
-	TablePrepareBda(pair, user_data);
-	const auto registration = cache.RegistrationEpoch();
-	if (!TableBlocks(pair, user_data, blocks, &storage_writes)) return false;
-	Buffer*  args_owner  = nullptr;
-	uint64_t args_offset = 0;
-	if (indirect_args != 0) {
-		std::tie(args_owner, args_offset) = cache.ObtainBuffer(indirect_args, sizeof(vk::DispatchIndirectCommand), false);
-		if (args_owner == nullptr || (args_offset & 3u) != 0) return false;
-	}
-	if (cache.RegistrationEpoch() != registration) return LiveCounters::Add(LiveCounters::TableRegistered), false;
-	phase.reset();
-	phase.emplace(LiveCensus::DrawPhase, 0x7ab1f, 4);
-	buffer.EndRendering();
-	auto       vk_buffer         = buffer.Handle();
-	auto&      dispatch_textures = m_context.GetTextureCache();
-	const auto images_epoch      = dispatch_textures.ImagesEpoch();
-	if ((set->transit_epoch != images_epoch || set->transit_state != nullptr) && !TableTransit(*set, vk_buffer, nullptr))
-		return false;
-	set->transit_epoch = dispatch_textures.ImagesEpoch();
-	set->transit_state = nullptr;
-	const auto& pipeline = *pair.pipeline;
-	const auto& program  = *pair.programs[0];
-	const auto& bindings = program.bindings;
-	vk_buffer.bindDescriptorSets(vk::PipelineBindPoint::eCompute, pipeline.pipeline_layout, 0, 1, &set->set, 0, nullptr);
-	ShaderRecompiler::IR::PushData push_data;
-	for (size_t i = 0; i < program.info.user_data_registers.size(); ++i) {
-		const auto index = program.info.user_data_registers[i] - program.user_data_base;
-		push_data.dwords[bindings.push_data_start_dword + i] = index < user_data[0].size() ? user_data[0][index] : 0;
-	}
-	if (thread_dimensions && bindings.dispatch_thread_dword != ShaderRecompiler::IR::PushData::NoStart) {
-		push_data.dwords[bindings.push_data_start_dword + bindings.dispatch_thread_dword]      = groups_x;
-		push_data.dwords[bindings.push_data_start_dword + bindings.dispatch_thread_dword + 1u] = groups_y;
-		push_data.dwords[bindings.push_data_start_dword + bindings.dispatch_thread_dword + 2u] = groups_z;
-	}
-	push_data.dwords[bindings.push_data_start_dword + bindings.TableBlockDword()]     = static_cast<uint32_t>(blocks[0]);
-	push_data.dwords[bindings.push_data_start_dword + bindings.TableBlockDword() + 1] = static_cast<uint32_t>(blocks[0] >> 32u);
-	vk_buffer.pushConstants(pipeline.pipeline_layout, vk::ShaderStageFlagBits::eCompute, 0,
-	                        (bindings.push_data_start_dword + bindings.ShaderDataDwords()) * sizeof(uint32_t),
-	                        push_data.dwords.data());
-	const bool chained = std::exchange(m_dispatch_chained, false) && m_deferred_barrier;
-	if (storage_writes && !chained) ShaderWriteHazardBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
-	vk_buffer.bindPipeline(vk::PipelineBindPoint::eCompute, pipeline.pipeline);
-	if (args_owner != nullptr) {
-		if (!chained) {
-			vk::MemoryBarrier barrier {};
-			barrier.srcAccessMask = vk::AccessFlagBits::eShaderWrite | vk::AccessFlagBits::eTransferWrite;
-			barrier.dstAccessMask = vk::AccessFlagBits::eIndirectCommandRead;
-			vk_buffer.pipelineBarrier(vk::PipelineStageFlagBits::eAllGraphics | vk::PipelineStageFlagBits::eComputeShader |
-			                              vk::PipelineStageFlagBits::eTransfer,
-			                          vk::PipelineStageFlagBits::eDrawIndirect, {}, 1, &barrier, 0, nullptr, 0, nullptr);
-		}
-		vk_buffer.dispatchIndirect(args_owner->Handle(), args_offset);
-	} else if (thread_dimensions) {
-		const auto& r      = cs.cs_regs;
-		const auto  groups = [](uint32_t threads, uint32_t size) { return (threads + std::max(size, 1u) - 1u) / std::max(size, 1u); };
-		vk_buffer.dispatch(groups(groups_x, r.num_thread_x), groups(groups_y, r.num_thread_y), groups(groups_z, r.num_thread_z));
-	} else {
-		vk_buffer.dispatch(groups_x, groups_y, groups_z);
-	}
-	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
-	m_deferred_barrier       = true;
-	m_deferred_barrier_queue = m_guest_queue;
-	LiveCounters::Add(LiveCounters::TableDispatches);
-	return true;
-}
-#endif

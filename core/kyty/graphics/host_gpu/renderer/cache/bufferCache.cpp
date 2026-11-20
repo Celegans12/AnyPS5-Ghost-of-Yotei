@@ -19,7 +19,6 @@
 #include "graphics/host_gpu/bdaDirtyRegions.h"
 #include "graphics/host_gpu/vulkanCommon.h"
 #include "kernel/memory.h"
-#include "loader/demonsSoulsTitle.h"
 
 #include <algorithm>
 #include <array>
@@ -186,11 +185,6 @@ void BufferCache::ChangeRegister(BufferId id) {
 	}
 	{
 		const auto epoch = m_registration_epoch.load(std::memory_order_relaxed) + 1;
-		if (m_registration_spans.size() < 64) {
-			m_registration_spans.push_back({buffer.CpuAddress(), buffer.Size()});
-		} else {
-			m_registration_spans_lost = true;
-		}
 		for (auto region = buffer.CpuAddress() / TRACKER_REGION_SIZE,
 		          last   = (buffer.CpuAddress() + buffer.Size() - 1) / TRACKER_REGION_SIZE;
 		     region <= last && region < TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE; ++region) {
@@ -2025,15 +2019,6 @@ bool BufferCache::PrepareDeviceAddressRead(uint64_t vaddr, uint64_t size) {
 	return true;
 }
 
-static bool AsyncImageStaging() {
-	static const bool enabled = [] {
-		if (const char* value = std::getenv("KYTY_ASYNC_IMAGE_STAGING"); value != nullptr && value[0] != '\0')
-			return value[0] != '0';
-		return ::Loader::DemonsSoulsTitle::IsSupportedGame();
-	}();
-	return enabled;
-}
-
 std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, uint64_t size) {
 	const auto* owner = m_page_table.Find(vaddr >> PageTable::kPageBits);
 	if (owner != nullptr && *owner) {
@@ -2047,37 +2032,9 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBufferForImage(uint64_t vaddr, u
 	if (IsRegionGpuModified(vaddr, size)) {
 		return ObtainBuffer(vaddr, size, false, false);
 	}
-
-	auto*      host_copies = m_scheduler.HostCopies();
-	const auto ring        = m_staging_buffer.Mapped();
-	const bool hand_over   = host_copies != nullptr && m_staging_buffer.IsCoherent() && GuestGpu::IsGpuThread() &&
-	                         AsyncImageStaging();
 	return UploadMemory(m_graphics, m_scheduler, m_staging_buffer, size, 16,
 	    vk::BufferUsageFlagBits::eTransferSrc | vk::BufferUsageFlagBits::eStorageBuffer,
 	    [&](uint8_t* mapped, uint64_t) {
-		if (hand_over && mapped >= ring.data() && mapped < ring.data() + ring.size()) {
-			if (const void* backing = Libs::LibKernel::Memory::FindBackingPointer(vaddr, size)) {
-				host_copies->Copy(mapped, backing, size);
-				(void)host_copies->Flush();
-				return;
-			}
-			thread_local std::vector<std::pair<const uint8_t*, uint64_t>> pieces;
-			if (Libs::LibKernel::Memory::TryGetSparseBackingPieces(vaddr, size, pieces)) {
-				uint64_t offset = 0;
-				for (const auto& [piece, bytes]: pieces) {
-					if (piece != nullptr) {
-						host_copies->Copy(mapped + offset, piece, bytes);
-					} else {
-						host_copies->Call([](void*, uint64_t destination, uint64_t count) {
-							std::memset(reinterpret_cast<void*>(destination), 0, count);
-						}, nullptr, reinterpret_cast<uint64_t>(mapped + offset), bytes);
-					}
-					offset += bytes;
-				}
-				(void)host_copies->Flush();
-				return;
-			}
-		}
 		if (!Libs::LibKernel::Memory::TryReadSparseBacking(vaddr, mapped, size) &&
 		    !Libs::LibKernel::Memory::CopySparseMemory(vaddr, mapped, size)) {
 			EXIT("BufferCache: failed to read mapped guest image backing\n");
@@ -3235,69 +3192,6 @@ uint64_t BufferCache::DropFreedRange(uint64_t vaddr, uint64_t size, FreeBlocksQu
 	InvalidateMemory(vaddr, size);
 	const auto deleted = DeleteUnmappedBuffers(vaddr, size);
 	return deleted + SplitUnmappedBuffers(vaddr, size, free_blocks, splits);
-}
-
-void BufferCache::CollectMappedRegisteredRanges(const RangeSet& mapped, uint64_t begin, uint64_t end,
-                                                std::vector<std::pair<uint64_t, uint64_t>>& ranges) const {
-	ranges.clear();
-	auto it = m_buffers.upper_bound(begin);
-	if (it != m_buffers.begin()) --it;
-	for (; it != m_buffers.end() && it->first < end; ++it) {
-		const auto first = std::max(it->first, begin), last = std::min(it->first + m_slot_buffers[it->second].Size(), end);
-		if (first >= last) continue;
-		mapped.ForEachInRange(first, last - first, [&](uint64_t from, uint64_t to) {
-			if (!ranges.empty() && ranges.back().first + ranges.back().second == from)
-				ranges.back().second += to - from;
-			else ranges.emplace_back(from, to - from);
-		});
-	}
-}
-
-bool BufferCache::TakeRegistrationSpans(std::vector<GuestRange>& spans) {
-	spans.insert(spans.end(), m_registration_spans.begin(), m_registration_spans.end());
-	m_registration_spans.clear();
-	return !std::exchange(m_registration_spans_lost, false);
-}
-
-void BufferCache::SynchronizeRegionRequest(SyncRegionRequest& request) {
-	const auto epoch = CpuModificationEpoch(request.address, request.size);
-	const auto registered = RegionRegistrationEpoch(request.address);
-	if (epoch != 0 && request.cpu_epoch == epoch && request.registration_epoch == registered) {
-		return;
-	}
-	SynchronizeBuffersInRange(request.address, request.size);
-	request.cpu_epoch = 0;
-	if (epoch != 0 && RegionRegistrationEpoch(request.address) == registered &&
-	    CpuModificationEpoch(request.address, request.size) == epoch) {
-		request.cpu_epoch          = epoch;
-		request.registration_epoch = registered;
-	}
-}
-
-void BufferCache::EnsureBdaReadable(std::span<const GuestRange> ranges) {
-	constexpr uint64_t HeadBytes = uint64_t {64} << 10u;
-	const auto         held      = [this](uint64_t page) {
-        const auto* owner = m_page_table.Find(page);
-        return owner != nullptr && *owner;
-	};
-	for (const auto& range: ranges) {
-		const auto last = (range.address + std::min(range.size, HeadBytes) - 1) >> PageTable::kPageBits;
-		for (auto page = range.address >> PageTable::kPageBits; page <= last;) {
-			if (held(page)) {
-				++page;
-				continue;
-			}
-			auto end = page + 1;
-			while (end <= last && !held(end)) ++end;
-			const auto begin = page << PageTable::kPageBits, bytes = (end - page) << PageTable::kPageBits;
-			if (m_resources != nullptr && m_resources->IsMapped(begin, bytes) && LibKernel::Memory::IsFullyMapped(begin, bytes)) {
-				auto& buffer = m_slot_buffers[FindBuffer(begin, bytes)];
-				TouchBuffer(buffer);
-				(void)SynchronizeBuffer(buffer, begin, bytes, false, false);
-			}
-			page = end;
-		}
-	}
 }
 
 void BufferCache::RunGarbageCollector() {

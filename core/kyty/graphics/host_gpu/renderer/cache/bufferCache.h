@@ -87,10 +87,6 @@ public:
 
 	void                   InvalidateMemory(uint64_t vaddr, uint64_t size, bool guest_fault = false);
 	void                   InvalidateMemoryForWrite(uint64_t vaddr, uint64_t size);
-	struct SyncRegionRequest {
-		uint64_t address = 0, size = 0, cpu_epoch = 0, registration_epoch = 0;
-	};
-	void SynchronizeRegionRequest(SyncRegionRequest& request);
 	[[nodiscard]] uint64_t RegistrationEpoch() const { return m_registration_epoch.load(std::memory_order_acquire); }
 	[[nodiscard]] uint64_t RegionRegistrationEpoch(uint64_t vaddr) const {
 		const auto region = vaddr / TRACKER_REGION_SIZE;
@@ -98,10 +94,6 @@ public:
 		                                                           : 0;
 	}
 	[[nodiscard]] bool DeferredProtectionPending(uint64_t vaddr) const { return m_memory_tracker.DeferredProtectionPending(vaddr); }
-	void CollectMappedRegisteredRanges(const RangeSet& mapped, uint64_t begin, uint64_t end,
-	                                   std::vector<std::pair<uint64_t, uint64_t>>& ranges) const;
-	[[nodiscard]] bool TakeRegistrationSpans(std::vector<GuestRange>& spans);
-	void EnsureBdaReadable(std::span<const GuestRange> ranges);
 	enum class WriteFaultOwner : uint8_t { CommandBuffer, CommandSegment, GpuNeighbor, Buffer, Other };
 	WriteFaultOwner        InvalidateFaultedPage(uint64_t vaddr);
 	static void            CountWriteFault(WriteFaultOwner owner, bool image);
@@ -402,8 +394,6 @@ private:
 	std::atomic<uint64_t>                             m_registration_epoch {1};
 	std::unique_ptr<std::atomic<uint64_t>[]> m_region_registrations =
 	    std::make_unique<std::atomic<uint64_t>[]>(TRACKER_ADDRESS_SIZE / TRACKER_REGION_SIZE);
-	std::vector<GuestRange> m_registration_spans;
-	bool                    m_registration_spans_lost = true;
 	FaultManager                                      m_fault_manager;
 	Buffer                                            m_gds_buffer;
 	Buffer                                            m_bda_pagetable_buffer;

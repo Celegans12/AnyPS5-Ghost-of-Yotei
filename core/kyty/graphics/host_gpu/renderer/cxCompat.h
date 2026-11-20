@@ -7,7 +7,6 @@
 
 extern "C++" {
 inline volatile std::atomic_uint32_t kyty_local_table_xpr_mode {2};
-inline volatile std::atomic_uint32_t kyty_local_table_dispatch_mode {0};
 inline volatile std::atomic_uint32_t kyty_local_table_store_budget {32};
 inline volatile std::atomic_uint32_t kyty_local_table_set_proofs {1};
 inline volatile std::atomic_uint32_t kyty_local_table_mru {7};
@@ -43,7 +42,7 @@ enum Id : uint32_t {
 	TableDrawNative, TableStoreDeferred, TableStoreTargets, TableRingSharedBytes, TableRingShared, TableRegistered,
 	TableStoreVariant, TableRingCopies, TableRingBytes, TableRefusedSets,
 	TableProofMismatches, TableNoSet, TableMemoVerified, TableMemoMismatch, TableMemoHits, TableGatherMemoHits,
-	TableEvaluations, TableDraws, TableDispatches, TableContinued,
+	TableEvaluations, TableDraws, TableContinued,
 	ScoutMissUnwalked, ScoutMissTicket, ScoutMissNotNative, ScoutMissContinuation, ScoutMissNotTable, ScoutMissConstant,
 	ScoutMissBehind, ScoutMissNoViewEmpty, ScoutMissNoViewOther, ScoutMissRefused, ScoutMissShort, ScoutMissTooBig,
 	ScoutMissFenced,

@@ -482,12 +482,6 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 			input_info.workgroup_counts[axis] = threads / size + (threads % size != 0u);
 		}
 	}
-	if (TableDispatch(buffer, thread_group_x, thread_group_y, thread_group_z, 0, use_thread_dimensions)) {
-		TableNoteDispatched(cs_regs, true);
-		m_resolved_draw = nullptr;
-		return;
-	}
-	TableNoteDispatched(cs_regs, false);
 	m_context.GetImageHeap().BeginDraw();
 	const ShaderComputeInputInfo pristine = input_info;
 	const ShaderModule* compute_module = nullptr;
@@ -520,7 +514,6 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 	    (TryConsumeComputeMetaClear(input_info, buffer) ||
 	     TryConsumeComputeFill(input_info, buffer, thread_group_x, thread_group_y,
 	                           thread_group_z, mode))) {
-		TableDispatchSpecial(cs_regs, use_thread_dimensions, "dispatch: a metadata clear or fill");
 		if (m_replicated[2] != 0 && ::Loader::DemonsSoulsTitle::IsSupportedGame() &&
 		    (cs_regs.cs_regs.data_addr != m_linear_copy_shader || shader_generation != m_linear_copy_generation) &&
 		    cs_regs.cs_regs.user_sgpr == 12) {
@@ -541,8 +534,6 @@ void RenderExecutor::DispatchDirect(CommandBuffer& buffer, uint32_t thread_group
 		ResetBindings();
 		return;
 	}
-
-	TableDispatchLearn(cs_regs, *compute_module, async_compute, use_thread_dimensions);
 
 	if (use_thread_dimensions) {
 		thread_group_x = input_info.workgroup_counts[0];
@@ -947,12 +938,6 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 	if (cs_regs.cs_regs.data_addr == 0) {
 		return;
 	}
-	if (TableDispatch(buffer, 0, 0, 0, args_addr, false)) {
-		TableNoteDispatched(cs_regs, true);
-		m_resolved_draw = nullptr;
-		return;
-	}
-	TableNoteDispatched(cs_regs, false);
 	ShaderComputeInputInfo input_info {};
 	m_context.GetImageHeap().BeginDraw();
 	ShaderComputeInputInfo pristine {};
@@ -974,7 +959,6 @@ void RenderExecutor::DispatchIndirect(CommandBuffer& buffer, uint64_t args_addr,
 		compute_module = m_context.GetPipelineCache().GetComputeProgram(cs_regs, input_info, true);
 	}
 	if (compute_module == nullptr) return;
-	TableDispatchLearn(cs_regs, *compute_module, async_compute, false);
 	const auto record = [&](ShaderComputeInputInfo& input_info, uint32_t rt_pass) {
 		buffer.EndRendering();
 		auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info);

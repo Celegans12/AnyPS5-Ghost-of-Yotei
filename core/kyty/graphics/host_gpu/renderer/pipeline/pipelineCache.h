@@ -480,8 +480,6 @@ public:
 	bool SpecializeDirectResources(const ShaderRecompiler::IR::ResourcePlan&     plan,
 	                               ShaderRecompiler::IR::ResourceSnapshot&       snapshot,
 	                               ShaderRecompiler::IR::ResourceSpecialization& specialization);
-	TableProgram GetComputeProgramTable(const HW::ComputeShaderInfo& regs, ShaderComputeInputInfo& input_info,
-	                                    const ShaderRecompiler::IR::ResourceSpecialization& specialization);
 	TableProgram GetVertexProgramTable(const ShaderParams& params, const ShaderVertexInputInfo& input_info,
 	                                   const ShaderRecompiler::IR::ResourceSpecialization& specialization,
 	                                   uint32_t& push_data_cursor);

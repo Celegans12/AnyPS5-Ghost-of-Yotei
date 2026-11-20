@@ -693,24 +693,7 @@ void GuestGpu::ResolveThread() {
 			}
 		} else if (operation->kind == GpuOperationKind::DispatchDirect ||
 		           operation->kind == GpuOperationKind::DispatchIndirect) {
-			const auto&    cs   = operation->state.shaders->GetCs();
-			const uint32_t hint = (operation->kind == GpuOperationKind::DispatchDirect ||
-			                       (operation->dispatch.mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) == 0) &&
-			                              Scout::Mode() == 3 && Scout::Running()
-			                          ? executor.TableDispatchHint(cs)
-			                          : 0u;
-			if ((hint & 1u) != 0) {
-				const std::array<uint64_t, 3> key {cs.cs_regs.data_addr, 0, 0xffffffffu};
-				auto& ticket = m_table_tickets[m_table_ticket_next & (TableTicketRing - 1)];
-				if (Scout::EvaluateAhead(key, XXH3_64bits(key.data(), sizeof(key)),
-				                         {cs.cs_user_sgpr.value, std::min<uint32_t>(cs.cs_regs.user_sgpr, HW::UserSgprInfo::SGPRS_MAX)},
-				                         {}, ticket)) {
-					operation->table_ticket = &ticket;
-					m_table_ticket_next++;
-				}
-			}
-			if (hint == 1u) {
-			} else if (operation->kind == GpuOperationKind::DispatchDirect) {
+			if (operation->kind == GpuOperationKind::DispatchDirect) {
 				const uint32_t groups[] = {operation->dispatch.thread_group_x,
 				                           operation->dispatch.thread_group_y,
 				                           operation->dispatch.thread_group_z};
