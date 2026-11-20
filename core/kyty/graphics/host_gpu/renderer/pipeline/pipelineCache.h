@@ -756,7 +756,7 @@ private:
 	    m_chain_compiled {0}, m_chain_ns {0};
 	void NoteFirstWait(std::chrono::steady_clock::time_point started, bool ready);
 	void QueueChain(std::unique_ptr<ChainJob>&& job);
-	void ChainWorker();
+	void ChainWorker(uint32_t index);
 	void StopChains();
 	void RunChain(ChainJob& job);
 	template <typename InputInfo>

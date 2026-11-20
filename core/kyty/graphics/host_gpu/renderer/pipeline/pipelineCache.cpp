@@ -23,6 +23,7 @@
 #include "graphics/host_gpu/renderer/image/textureCommon.h"
 #include "graphics/host_gpu/renderer/rayTracing.h"
 #include "graphics/host_gpu/renderer/pipeline/blendMapping.h"
+#include "graphics/host_gpu/renderer/pipeline/pipelineChainThreads.h"
 #if defined(ANYPS5_KYTY)
 #include "graphics/host_gpu/renderer/pipeline/programLock.h"
 #endif
@@ -111,13 +112,11 @@ bool PipelineChainWanted() {
 	return wanted;
 }
 
-uint32_t PipelineChainThreads() {
-	static const uint32_t threads = [] {
-		const char* value = std::getenv("KYTY_PIPELINE_CHAIN_THREADS");
-		const auto  count = value != nullptr ? std::strtoul(value, nullptr, 10) : 4ul;
-		return static_cast<uint32_t>(std::clamp<unsigned long>(count, 1ul, 16ul));
-	}();
-	return threads;
+static_assert(ShaderRecompiler::IR::ResourcePlan::ChainScratchSlots >= MaxPipelineChainThreads);
+
+const PipelineChainThreadSetting& PipelineChainThreads() {
+	static const auto setting = PipelineChainThreadCount(std::getenv("KYTY_PIPELINE_CHAIN_THREADS"));
+	return setting;
 }
 #endif
 
@@ -1699,8 +1698,13 @@ PipelineCache::PipelineCache(GraphicContext&                         graphics,
 	}
 #if defined(ANYPS5_KYTY)
 	if (m_libraries != nullptr && PipelineLibrariesAhead() && PipelineChainWanted()) {
-		for (uint32_t i = 0; i < PipelineChainThreads(); i++) {
-			m_chain_threads.emplace_back([this] { ChainWorker(); });
+		const auto& chain = PipelineChainThreads();
+		for (uint32_t i = 0; i < chain.threads; i++) {
+			m_chain_threads.emplace_back([this, i] { ChainWorker(i); });
+		}
+		if (chain.capped) {
+			PipelineCacheLog("[kyty-gpl] KYTY_PIPELINE_CHAIN_THREADS={} is above {}: {} pipeline chain threads run",
+			                 chain.requested, MaxPipelineChainThreads, chain.threads);
 		}
 		PipelineCacheLog("[kyty-gpl] pipeline chains on: {} threads (KYTY_PIPELINE_CHAIN=0 to turn off)",
 		                 m_chain_threads.size());
@@ -2887,9 +2891,10 @@ void PipelineCache::StopChains() {
 	m_chain_threads.clear();
 }
 
-void PipelineCache::ChainWorker() {
+void PipelineCache::ChainWorker(uint32_t index) {
 	KYTY_PROFILER_THREAD("Thread_PipelineChain");
 	PlaceBackgroundCompileThread(false);
+	ShaderRecompiler::IR::UsePlanScratchSlot(ShaderRecompiler::IR::ResourcePlan::FirstChainScratchSlot + index);
 	for (;;) {
 		std::unique_ptr<ChainJob> job;
 		{

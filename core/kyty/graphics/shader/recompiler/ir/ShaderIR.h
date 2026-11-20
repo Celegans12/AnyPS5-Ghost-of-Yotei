@@ -929,7 +929,9 @@ struct ResourcePlan {
 		std::vector<SelectorKeys> selector_keys;
 	};
 #if defined(ANYPS5_KYTY)
-	static constexpr uint32_t                             ThreadScratchSlots = 3;
+	static constexpr uint32_t                             FirstChainScratchSlot = 3;
+	static constexpr uint32_t                             ChainScratchSlots     = 16;
+	static constexpr uint32_t ThreadScratchSlots = FirstChainScratchSlot + ChainScratchSlots;
 #else
 	static constexpr uint32_t                             ThreadScratchSlots = 2;
 #endif
