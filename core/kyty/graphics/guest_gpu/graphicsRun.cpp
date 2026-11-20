@@ -1693,12 +1693,15 @@ bool GuestGpu::Process(Submission& submission) {
 	return complete;
 }
 
+static std::atomic<uint64_t> g_guest_submissions {0};
+
 Pm4ProcessResult CommandProcessor::Process(Pm4Execution&             execution,
                                            std::span<const uint32_t> commands) {
 	KYTY_PROFILER_BLOCK("CommandProcessor::Process");
 	EXIT_IF(g_current_execution != nullptr);
 	EXIT_IF(commands.size() > UINT32_MAX);
 	if (execution.m_buffer_stack.empty() && !commands.empty()) {
+		m_submit_id = g_guest_submissions.fetch_add(1, std::memory_order_relaxed) + 1;
 		m_renderer.CollectHotPageWrites();
 		m_renderer.GetBufferCache().NoteCommandBuffer(reinterpret_cast<uint64_t>(commands.data()), commands.size_bytes());
 		execution.m_buffer_stack.push_back({commands});
