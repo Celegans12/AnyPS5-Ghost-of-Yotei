@@ -52,6 +52,15 @@ if(NOT ANYPS5_KYTY_DLL AND (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
             PASS_REGULAR_EXPRESSION "kyty_shim_cross_queue_label_order: ok" FAIL_REGULAR_EXPRESSION "FAILED")
 endif()
 
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    add_test_executable(kyty_shim_signal_safety_tests ${CMAKE_CURRENT_SOURCE_DIR}/SignalSafety.cpp)
+    target_include_directories(kyty_shim_signal_safety_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(kyty_shim_signal_safety_tests PRIVATE libkernel libc)
+    add_test(NAME kyty_shim_signal_safety COMMAND kyty_shim_signal_safety_tests)
+    set_tests_properties(kyty_shim_signal_safety PROPERTIES TIMEOUT 120
+            PASS_REGULAR_EXPRESSION "kyty_shim_signal_safety: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+endif()
+
 if(NOT WIN32)
     add_test_executable(kyty_shim_table_resolution_cache_tests ${CMAKE_CURRENT_SOURCE_DIR}/TableResolutionCache.cpp
             ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
