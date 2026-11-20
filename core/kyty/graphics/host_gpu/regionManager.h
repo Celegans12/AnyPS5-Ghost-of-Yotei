@@ -239,8 +239,9 @@ public:
 
 	template <DirtySource source>
 	[[nodiscard]] bool IsModifiedUnlocked(uint64_t offset, uint64_t size) const KYTY_NO_THREAD_SAFETY_ANALYSIS {
-		const auto [start, end] = GetPageRange(offset, size);
-		return GetBits<source>().Any(start, end);
+		const bool any = source == DirtySource::Cpu ? m_has_cpu_dirty.load(std::memory_order_acquire)
+		                                            : m_has_gpu_dirty.load(std::memory_order_acquire);
+		return any && IsModified<source>(offset, size);
 	}
 
 	struct WriteBlockProbe {

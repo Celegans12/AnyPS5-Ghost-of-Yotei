@@ -343,8 +343,7 @@ public:
 		static_assert(std::is_nothrow_invocable_v<UploadFunc&>);
 		const bool defer = !is_written && DeferProtections();
 		Iterate<true>(vaddr, size, [&](RegionManager* manager, uint64_t offset, uint64_t bytes) KYTY_NO_THREAD_SAFETY_ANALYSIS {
-			if (!is_written && (!manager->HasCpuDirty() ||
-			                    !manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes))) {
+			if (!is_written && !manager->IsModifiedUnlocked<DirtySource::Cpu>(offset, bytes)) {
 				return;
 			}
 			if (!is_written && device_sync != 0) {

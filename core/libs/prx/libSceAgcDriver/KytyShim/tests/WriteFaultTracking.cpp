@@ -74,6 +74,8 @@ void DirtyPagesNeedNoLockedWork(RegionManager& region) {
 	Check(region.WriteFaultFindsOpen(0, Block, false, TRACKER_PAGE_SIZE, &gpu), "fresh region: a written page is not open");
 	Check(!gpu, "fresh region: a block reports a GPU page");
 	Check(region.WriteFaultFindsOpen(5 * TRACKER_PAGE_SIZE, Block, true, TRACKER_PAGE_SIZE, &gpu), "fresh region: a written block is not open");
+	Check(region.IsModifiedUnlocked<DirtySource::Cpu>(0, Block), "fresh region: the unlocked probe misses CPU writes");
+	Check(!region.IsModifiedUnlocked<DirtySource::Gpu>(0, Block), "fresh region: the unlocked probe sees GPU writes");
 	std::scoped_lock guard(region.lock);
 	const auto       page = region.FaultWrite(0, Block, false, TRACKER_PAGE_SIZE);
 	Check(page.done && !page.tracked && page.opened == 0, "fresh region: a page fault did not finish on the page");
