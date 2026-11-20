@@ -146,7 +146,7 @@ void FixAddresses(uint32_t code, uint32_t* body, uint32_t length, uint32_t seed)
 		case Pm4::IT_DRAW_INDEX_AUTO: body[1] &= 0x22u; break;
 		case Pm4::IT_DRAW_INDEX_2:
 			SetAddress(body, 1, seed, DataOffset, DataSpan);
-			body[3] = body[3] % (body[0] + 1u);
+			body[3] = static_cast<uint32_t>(body[3] % (static_cast<uint64_t>(body[0]) + 1u));
 			body[4] &= 0x20u;
 			break;
 		case Pm4::IT_SET_SH_REG_INDIRECT:
