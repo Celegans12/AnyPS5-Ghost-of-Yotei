@@ -279,7 +279,7 @@ const char* ProbeCrossQueueLabelOrder(GraphicContext& graphics) {
 
 }
 
-int main() {
+extern "C" int RunKytyCrossQueueLabelOrderTest() {
 	try {
 		Common::InitializeThreads();
 		Config::Initialize();
