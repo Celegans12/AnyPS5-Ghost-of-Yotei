@@ -131,7 +131,7 @@ target_compile_definitions(anyps5_kyty_gpu
         TRACY_MANUAL_LIFETIME
 )
 if(WIN32)
-    target_link_libraries(anyps5_kyty_gpu INTERFACE ${ANYPS5_KYTY_ARCHIVES} $<TARGET_LINKER_FILE:libkernel> $<TARGET_LINKER_FILE:libc> pthread psapi dbghelp ws2_32 synchronization secur32)
+    target_link_libraries(anyps5_kyty_gpu INTERFACE ${ANYPS5_KYTY_ARCHIVES} $<TARGET_PROPERTY:ANYPS5_KYTY_HOST_RUNTIME> $<TARGET_LINKER_FILE:libkernel> $<TARGET_LINKER_FILE:libc> pthread psapi dbghelp ws2_32 synchronization secur32)
 else()
     target_link_libraries(anyps5_kyty_gpu INTERFACE ${ANYPS5_KYTY_ARCHIVES} ${CMAKE_DL_LIBS} pthread)
 endif()
