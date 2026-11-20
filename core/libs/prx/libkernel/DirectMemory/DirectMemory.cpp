@@ -31,8 +31,16 @@
 #if defined(__linux__)
 #include <fcntl.h>
 #include <link.h>
+#include <sched.h>
 #include <sys/mman.h>
+#include <sys/mount.h>
+#include <sys/socket.h>
+#include <sys/syscall.h>
+#include <sys/wait.h>
 #include <unistd.h>
+#include <array>
+#include <csignal>
+#include <thread>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -546,19 +554,201 @@ void Trace(const char* format, ...) {
 }
 
 #if defined(__linux__)
-int PhysicalFile() {
-    static const int file = [] {
-        const int created = memfd_create("direct memory", MFD_CLOEXEC | MFD_ALLOW_SEALING);
-        if (created < 0) throw std::system_error(errno, std::generic_category(), "create direct memory backing");
-        if (ftruncate(created, static_cast<off_t>(DIRECT_MEMORY_SIZE)) != 0 || fcntl(created, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW) != 0) {
-            const int error = errno;
-            ::close(created);
-            throw std::system_error(error, std::generic_category(), "size direct memory backing");
-        }
-        return created;
-    }();
+int CreatePhysicalFile() {
+    const int created = memfd_create("direct memory", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+    if (created < 0) throw std::system_error(errno, std::generic_category(), "create direct memory backing");
+    if (ftruncate(created, static_cast<off_t>(DIRECT_MEMORY_SIZE)) != 0 || fcntl(created, F_ADD_SEALS, F_SEAL_SHRINK | F_SEAL_GROW) != 0) {
+        const int error = errno;
+        ::close(created);
+        throw std::system_error(error, std::generic_category(), "size direct memory backing");
+    }
+    return created;
+}
+
+#if defined(ANYPS5_KYTY)
+enum class DirectPages { PrivateHuge, Populated, Demand };
+
+struct DirectBacking {
+    int file = -1;
+    DirectPages pages = DirectPages::Demand;
+};
+
+std::string ShmemHugeMode() {
+    std::ifstream setting("/sys/kernel/mm/transparent_hugepage/shmem_enabled");
+    std::string text;
+    std::getline(setting, text);
+    const auto open = text.find('[');
+    const auto close = text.find(']', open);
+    return open == std::string::npos || close == std::string::npos ? std::string{} : text.substr(open + 1, close - open - 1);
+}
+
+std::optional<DirectPages> RequestedDirectPages() {
+    const char* value = std::getenv("KYTY_DIRECT_MEMORY_PAGES");
+    if (value == nullptr) return std::nullopt;
+    const std::string_view text{value};
+    if (text == "private") return DirectPages::PrivateHuge;
+    if (text == "populate") return DirectPages::Populated;
+    if (text == "demand") return DirectPages::Demand;
+    throw std::invalid_argument("KYTY_DIRECT_MEMORY_PAGES must be private, populate or demand");
+}
+
+bool SendFile(int socket, int file) {
+    char byte = 0;
+    iovec data{&byte, 1};
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))]{};
+    msghdr message{};
+    message.msg_iov = &data;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    auto* header = CMSG_FIRSTHDR(&message);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int));
+    std::memcpy(CMSG_DATA(header), &file, sizeof(int));
+    return sendmsg(socket, &message, 0) == 1;
+}
+
+int ReceiveFile(int socket) {
+    char byte = 0;
+    iovec data{&byte, 1};
+    alignas(cmsghdr) char control[CMSG_SPACE(sizeof(int))]{};
+    msghdr message{};
+    message.msg_iov = &data;
+    message.msg_iovlen = 1;
+    message.msg_control = control;
+    message.msg_controllen = sizeof(control);
+    if (recvmsg(socket, &message, MSG_DONTWAIT | MSG_CMSG_CLOEXEC) != 1) return -1;
+    const auto* header = CMSG_FIRSTHDR(&message);
+    if (header == nullptr || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS) return -1;
+    int file = -1;
+    std::memcpy(&file, CMSG_DATA(header), sizeof(int));
     return file;
 }
+
+bool WriteText(const char* path, const char* text, std::size_t length) {
+    const int file = ::open(path, O_WRONLY | O_CLOEXEC);
+    if (file < 0) return false;
+    const bool written = ::write(file, text, length) == static_cast<ssize_t>(length);
+    ::close(file);
+    return written;
+}
+
+int CreatePrivateHugeFile() {
+    char uidMap[32];
+    char gidMap[32];
+    char options[64];
+    const auto uidLength = static_cast<std::size_t>(std::snprintf(uidMap, sizeof(uidMap), "0 %u 1", static_cast<unsigned>(getuid())));
+    const auto gidLength = static_cast<std::size_t>(std::snprintf(gidMap, sizeof(gidMap), "0 %u 1", static_cast<unsigned>(getgid())));
+    std::snprintf(options, sizeof(options), "huge=within_size,size=%llu,mode=0700", static_cast<unsigned long long>(DIRECT_MEMORY_SIZE));
+    constexpr std::array<const char*, 3> targets{"/tmp", "/dev/shm", "/run"};
+    int sockets[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0, sockets) != 0) return -1;
+    const auto child = static_cast<pid_t>(syscall(SYS_clone, SIGCHLD, nullptr, nullptr, nullptr, nullptr));
+    if (child == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0 || !WriteText("/proc/self/setgroups", "deny", 4) || !WriteText("/proc/self/uid_map", uidMap, uidLength) ||
+            !WriteText("/proc/self/gid_map", gidMap, gidLength) || mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) != 0)
+            _exit(1);
+        for (const char* target : targets) {
+            if (mount("aps5-direct-memory", target, "tmpfs", MS_NOSUID | MS_NODEV, options) != 0) continue;
+            char path[64];
+            std::memcpy(path, target, std::strlen(target));
+            std::memcpy(path + std::strlen(target), "/kyty-direct-memory", sizeof("/kyty-direct-memory"));
+            const int file = ::open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+            if (file < 0 || unlink(path) != 0 || ftruncate(file, static_cast<off_t>(DIRECT_MEMORY_SIZE)) != 0) _exit(2);
+            _exit(SendFile(sockets[1], file) ? 0 : 3);
+        }
+        _exit(4);
+    }
+    ::close(sockets[1]);
+    if (child > 0) {
+        int status = 0;
+        while (waitpid(child, &status, 0) < 0 && errno == EINTR) {
+        }
+    }
+    const int file = child > 0 ? ReceiveFile(sockets[0]) : -1;
+    ::close(sockets[0]);
+    return file;
+}
+
+DirectBacking ChooseDirectBacking() {
+    const auto requested = RequestedDirectPages();
+    const auto mode = ShmemHugeMode();
+    if (requested == DirectPages::Demand) {
+        std::fprintf(stderr, "[memory] direct memory: 4 KiB pages on demand, as KYTY_DIRECT_MEMORY_PAGES asks\n");
+        return {CreatePhysicalFile(), DirectPages::Demand};
+    }
+    if (requested == DirectPages::PrivateHuge || (!requested && !mode.empty() && mode != "deny")) {
+        if (const int file = CreatePrivateHugeFile(); file >= 0) {
+            std::fprintf(stderr, "[memory] direct memory: 2 MiB pages through a private tmpfs%s\n", requested ? ", as KYTY_DIRECT_MEMORY_PAGES asks" : "");
+            return {file, DirectPages::PrivateHuge};
+        }
+        if (requested) throw std::runtime_error("KYTY_DIRECT_MEMORY_PAGES=private: cannot mount a private tmpfs in a user namespace");
+    }
+    std::fprintf(stderr, "[memory] direct memory: mappings populated when they are made while the host has room%s\n",
+                 requested ? ", as KYTY_DIRECT_MEMORY_PAGES asks" : ", since huge pages are unavailable");
+    return {CreatePhysicalFile(), DirectPages::Populated};
+}
+
+const DirectBacking& Backing() {
+    static const DirectBacking backing = ChooseDirectBacking();
+    return backing;
+}
+
+int PhysicalFile() {
+    return Backing().file;
+}
+
+bool HostKeepsResident(std::size_t bytes) {
+    std::ifstream meminfo("/proc/meminfo");
+    std::uint64_t total = 0;
+    std::uint64_t available = 0;
+    for (std::string line; std::getline(meminfo, line);) {
+        unsigned long long kib = 0;
+        if (std::sscanf(line.c_str(), "MemTotal: %llu kB", &kib) == 1) total = kib << 10;
+        if (std::sscanf(line.c_str(), "MemAvailable: %llu kB", &kib) == 1) available = kib << 10;
+    }
+    return total != 0 && available >= bytes + total / 4;
+}
+
+void PopulateDirectMapping(std::uintptr_t address, std::size_t bytes, int protection) {
+    static std::atomic<bool> unsupported{false};
+    if (Backing().pages != DirectPages::Populated || (protection & PROT_READ) == 0 || unsupported.load(std::memory_order_relaxed)) return;
+    if (!HostKeepsResident(bytes)) {
+        static std::once_flag noted;
+        std::call_once(noted, [bytes] { std::fprintf(stderr, "[memory] direct memory of %zu MiB and later mappings that do not fit in a quarter of host memory stay paged on demand\n", bytes >> 20); });
+        return;
+    }
+    constexpr std::size_t chunkBytes = std::size_t{256} << 20;
+    const auto chunks = (bytes + chunkBytes - 1) / chunkBytes;
+    const auto workers = std::min<std::size_t>(chunks, std::max(1u, std::thread::hardware_concurrency()));
+    std::atomic<std::size_t> next{0};
+    std::atomic<int> failure{0};
+    const auto populate = [&] {
+        for (auto chunk = next++; chunk < chunks && failure.load() == 0; chunk = next++) {
+            const auto first = chunk * chunkBytes;
+            if (::madvise(reinterpret_cast<void*>(address + first), std::min(chunkBytes, bytes - first), MADV_POPULATE_READ) != 0) failure.store(errno);
+        }
+    };
+    std::vector<std::thread> threads;
+    try {
+        for (std::size_t worker = 1; worker < workers; ++worker) threads.emplace_back(populate);
+    } catch (const std::system_error&) {
+    }
+    populate();
+    for (auto& thread: threads) thread.join();
+    if (failure.load() == EINVAL) unsupported.store(true, std::memory_order_relaxed);
+    if (failure.load() != 0) {
+        static std::once_flag noted;
+        std::call_once(noted, [&] { std::fprintf(stderr, "[memory] direct memory stays paged on demand where populating it failed: %s\n", std::strerror(failure.load())); });
+    }
+}
+#else
+int PhysicalFile() {
+    static const int file = CreatePhysicalFile();
+    return file;
+}
+#endif
 
 std::vector<bool>& PhysicalUsed();
 
@@ -1714,7 +1904,7 @@ int PlaceHintInReservation(void* addr, size_t len, int flags) {
     return flags | GuestMapFixedFlag;
 }
 
-int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
+int MapDirectRecorded(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
     ValidateOutput(addr);
     ValidateAlignment(alignment);
     if (len == 0 || (len & (PS5_PAGE_SIZE - 1)) != 0) return SCE_KERNEL_ERROR_EINVAL;
@@ -1751,6 +1941,14 @@ int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart,
     RecordProtection(mapped, len, prot);
     Trace("map direct %p+0x%zx phys=0x%llx prot=0x%x flags=0x%x align=0x%zx", mapped, len, static_cast<unsigned long long>(physStart), prot, flags, alignment);
     return 0;
+}
+
+int DoMapDirect(void** addr, size_t len, int prot, int flags, int64_t physStart, size_t alignment) {
+    const int result = MapDirectRecorded(addr, len, prot, flags, physStart, alignment);
+#if defined(__linux__) && defined(ANYPS5_KYTY)
+    if (result == 0) PopulateDirectMapping(reinterpret_cast<std::uintptr_t>(*addr), len, LinuxProtFromSce(prot));
+#endif
+    return result;
 }
 
 static int MapAnonymous(void** addr, size_t len, int prot, int flags, size_t alignment, bool exclusive, bool zero) {

@@ -39,8 +39,12 @@
 #include <fstream>
 #include <string>
 #include <sys/mman.h>
+#include <sched.h>
+#include <sys/mount.h>
 #include <sys/resource.h>
 #include <sys/statvfs.h>
+#include <sys/vfs.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 #elif defined(__APPLE__)
@@ -336,6 +340,88 @@ static void CheckMprotectIgnoresUndefinedBits() {
     Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(mapping), length) == 0);
     Require(sceKernelReleaseDirectMemory(physical, length) == 0);
 }
+
+#if defined(__linux__) && defined(ANYPS5_KYTY)
+static long VmstatCounter(const char* name) {
+    std::ifstream vmstat("/proc/vmstat");
+    std::string key;
+    long value = 0;
+    while (vmstat >> key >> value)
+        if (key == name) return value;
+    return -1;
+}
+
+static bool HostHasRoomFor(std::size_t bytes) {
+    std::ifstream meminfo("/proc/meminfo");
+    std::uint64_t total = 0;
+    std::uint64_t available = 0;
+    for (std::string line; std::getline(meminfo, line);) {
+        unsigned long long kib = 0;
+        if (std::sscanf(line.c_str(), "MemTotal: %llu kB", &kib) == 1) total = kib << 10;
+        if (std::sscanf(line.c_str(), "MemAvailable: %llu kB", &kib) == 1) available = kib << 10;
+    }
+    return total != 0 && available >= bytes + total / 2;
+}
+
+static bool PrivateTmpfsWorks() {
+    const auto uid = getuid();
+    const auto gid = getgid();
+    const pid_t child = fork();
+    if (child == 0) {
+        if (unshare(CLONE_NEWUSER | CLONE_NEWNS) != 0) _exit(1);
+        std::ofstream("/proc/self/setgroups") << "deny";
+        std::ofstream("/proc/self/uid_map") << "0 " << uid << " 1";
+        std::ofstream("/proc/self/gid_map") << "0 " << gid << " 1";
+        _exit(mount(nullptr, "/", nullptr, MS_REC | MS_PRIVATE, nullptr) == 0 && mount("probe", "/tmp", "tmpfs", 0, "huge=within_size,size=4m") == 0 ? 0 : 1);
+    }
+    int status = 0;
+    return child > 0 && waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
+static int CheckDirectMemoryPages() {
+    const char* requested = std::getenv("KYTY_DIRECT_MEMORY_PAGES");
+    Require(requested != nullptr);
+    const std::string mode{requested};
+    const bool hugePages = std::filesystem::exists("/sys/kernel/mm/transparent_hugepage");
+    if (mode == "private" && !hugePages) return 77;
+    if (mode == "private" && !PrivateTmpfsWorks()) return 77;
+    constexpr std::size_t length = 0x400000;
+    std::int64_t physical = 0;
+    Require(sceKernelAllocateDirectMemory(0, 0x7fffffffffll, length, 0x200000, 0, &physical) == 0);
+    void* mapping = nullptr;
+    Require(sceKernelMapDirectMemory(&mapping, length, 3, 0, physical, 0x200000) == 0);
+    const auto address = reinterpret_cast<std::uintptr_t>(mapping);
+    Require(address % 0x200000 == 0);
+    std::ifstream smaps("/proc/self/smaps");
+    bool inside = false;
+    std::string backing;
+    for (std::string line; std::getline(smaps, line);) {
+        unsigned long long start = 0;
+        unsigned long long end = 0;
+        if (std::sscanf(line.c_str(), "%llx-%llx ", &start, &end) == 2) {
+            inside = start <= address && address < end;
+            if (inside) backing = line;
+        }
+    }
+    const auto pageBytes = static_cast<std::size_t>(sysconf(_SC_PAGESIZE));
+    std::vector<unsigned char> resident(length / pageBytes);
+    Require(mincore(mapping, length, resident.data()) == 0);
+    const auto residentPages = std::count_if(resident.begin(), resident.end(), [](unsigned char page) { return (page & 1) != 0; });
+    const bool memfd = backing.find("memfd:direct memory") != std::string::npos;
+    if (mode == "demand") Require(memfd && residentPages == 0);
+    if (mode == "populate") Require(memfd && (!HostHasRoomFor(length) || residentPages == static_cast<long>(resident.size())));
+    if (mode == "private") {
+        Require(!memfd && backing.find("/kyty-direct-memory") != std::string::npos);
+        const auto before = VmstatCounter("thp_file_alloc");
+        auto* bytes = static_cast<volatile char*>(mapping);
+        for (std::size_t offset = 0; offset < length; offset += pageBytes) bytes[offset] = 1;
+        Require(before < 0 || VmstatCounter("thp_file_alloc") > before);
+    }
+    Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(mapping), length) == 0);
+    Require(sceKernelReleaseDirectMemory(physical, length) == 0);
+    return 0;
+}
+#endif
 
 static void CheckDirectMapRefusesExecute() {
     constexpr std::size_t length = 0x4000;
@@ -3613,8 +3699,21 @@ static void CheckDirectMemoryBackingNeedsNoFilesystem() {
     void* mapped = nullptr;
     Require(sceKernelMapDirectMemory(&mapped, page, 3, 0, phys, 0) == 0);
     const auto backing = BackingOf(mapped);
-    if (backing.rfind("/memfd:", 0) != 0) std::fprintf(stderr, "direct memory backing: %s\n", backing.c_str());
-    Require(backing.rfind("/memfd:", 0) == 0);
+    bool ownFilesystem = false;
+    if (backing.find("/kyty-direct-memory") != std::string::npos) {
+        for (const auto& entry: std::filesystem::directory_iterator("/proc/self/fd")) {
+            std::error_code error;
+            if (std::filesystem::read_symlink(entry.path(), error).string() != backing) continue;
+            const int file = std::stoi(entry.path().filename().string());
+            struct statfs filesystem {};
+            struct stat status {};
+            ownFilesystem = fstatfs(file, &filesystem) == 0 && fstat(file, &status) == 0 &&
+                            static_cast<std::uint64_t>(filesystem.f_blocks) * filesystem.f_bsize >= static_cast<std::uint64_t>(status.st_size);
+            break;
+        }
+    }
+    if (backing.rfind("/memfd:", 0) != 0 && !ownFilesystem) std::fprintf(stderr, "direct memory backing: %s\n", backing.c_str());
+    Require(backing.rfind("/memfd:", 0) == 0 || ownFilesystem);
     Require(sceKernelMunmap(reinterpret_cast<std::uint64_t>(mapped), page) == 0);
     Require(sceKernelReleaseDirectMemory(phys, page) == 0);
 }
@@ -3764,8 +3863,9 @@ static void CheckDirectMemorySharedBacking() {
     Require(offset == base + page * 2);
     unsigned char byte = 0;
     Require(pread(file, &byte, 1, static_cast<off_t>(offset + 5)) == 1 && byte == 0x5a);
+    const bool memfd = std::filesystem::read_symlink("/proc/self/fd/" + std::to_string(file)).string().rfind("/memfd:", 0) == 0;
     const int seals = fcntl(file, F_GET_SEALS);
-    Require(seals >= 0 && (seals & F_SEAL_SHRINK) != 0 && (seals & F_SEAL_GROW) != 0);
+    Require(!memfd || (seals >= 0 && (seals & F_SEAL_SHRINK) != 0 && (seals & F_SEAL_GROW) != 0));
     Require((fcntl(file, F_GETFD) & FD_CLOEXEC) != 0);
     close(file);
     Require(GuestArena::GuestArenaSharedBacking_nid_postfix(address, page * 2, &file, &offset) && offset == base + page);
@@ -4858,6 +4958,9 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::strcmp(argv[1], "executable-mappings") == 0) {
         return CheckExecutableSharedMappings() ? 0 : 77;
     }
+#endif
+#if defined(__linux__) && defined(ANYPS5_KYTY)
+    if (argc == 2 && std::strcmp(argv[1], "direct-pages") == 0) return CheckDirectMemoryPages();
 #endif
     Require(argc == 1);
     CheckResidentMappingBookkeepingStaysSmall();
