@@ -253,6 +253,18 @@ set_tests_properties(kyty_shim_merged_hull PROPERTIES TIMEOUT 20 PASS_REGULAR_EX
 add_test(NAME kyty_shim_merged_hull_draw COMMAND kyty_shim_merged_hull_tests draw)
 set_tests_properties(kyty_shim_merged_hull_draw PROPERTIES TIMEOUT 20 SKIP_RETURN_CODE 77)
 
+add_test_executable(kyty_shim_recompiler_robustness_tests ${CMAKE_CURRENT_SOURCE_DIR}/RecompilerRobustness.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+target_include_directories(kyty_shim_recompiler_robustness_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../fuzz)
+target_include_directories(kyty_shim_recompiler_robustness_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
+configure_host_test_executable(kyty_shim_recompiler_robustness_tests)
+if(MINGW)
+    target_link_libraries(kyty_shim_recompiler_robustness_tests PRIVATE stdc++ gcc_eh)
+endif()
+target_link_libraries(kyty_shim_recompiler_robustness_tests PRIVATE Kyty::gpu libkernel libc)
+add_test(NAME kyty_shim_recompiler_robustness COMMAND kyty_shim_recompiler_robustness_tests)
+set_tests_properties(kyty_shim_recompiler_robustness PROPERTIES TIMEOUT 60 PASS_REGULAR_EXPRESSION "kyty_shim_recompiler_robustness: ok"
+        FAIL_REGULAR_EXPRESSION "terminate called|FAILED")
+
 add_test_executable(kyty_shim_compute_execution_tests ${CMAKE_CURRENT_SOURCE_DIR}/ComputeExecution.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
 target_include_directories(kyty_shim_compute_execution_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_include_directories(kyty_shim_compute_execution_tests SYSTEM PRIVATE ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Tools/include)
