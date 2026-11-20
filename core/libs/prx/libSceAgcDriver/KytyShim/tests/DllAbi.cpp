@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/KytyShim/dll/Trampoline.hpp"
 #include "prx/libSceAgcDriver/KytyShim/host/DllCreate.hpp"
 #include "prx/libSceAgcDriver/KytyShim/include/KytyDll.h"
 
@@ -5,11 +6,18 @@
 #include <windows.h>
 #endif
 
+#include <csignal>
+#include <cstddef>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 #include <string>
+
+std::FILE* KytyShim::TrampolineLog() noexcept {
+    return stderr;
+}
 
 namespace {
 
@@ -85,6 +93,88 @@ void CheckSeam() {
     g_status = KYTY_DLL_OK;
 }
 
+struct FilterTag {
+    static constexpr const char* kName = "the test filter";
+};
+
+struct PreparerTag {
+    static constexpr const char* kName = "the test preparer";
+};
+
+struct ShutdownTag {
+    static constexpr const char* kName = "a test shutdown callback";
+};
+
+using Filter   = KytyShim::Trampoline<FilterTag, bool(std::uintptr_t, std::size_t)>;
+using Preparer = KytyShim::Trampoline<PreparerTag, bool(std::uintptr_t, std::size_t)>;
+using Shutdown = KytyShim::TrampolinePool<ShutdownTag, 2, void()>;
+
+static_assert(noexcept(Filter::Call(0, 0)));
+static_assert(noexcept(Filter::Bind(nullptr)));
+static_assert(noexcept(KytyShim::Trampoline<ShutdownTag, void()>::Call()));
+
+std::uintptr_t g_address = 0;
+std::size_t g_bytes      = 0;
+int g_first              = 0;
+int g_second             = 0;
+
+bool Even(std::uintptr_t address, std::size_t bytes) {
+    g_address = address;
+    g_bytes   = bytes;
+    return address % 2 == 0;
+}
+
+bool Always(std::uintptr_t, std::size_t) {
+    return true;
+}
+
+bool Throws(std::uintptr_t, std::size_t) {
+    throw std::runtime_error("the filter failed");
+}
+
+void First() {
+    g_first++;
+}
+
+void Second() {
+    g_second++;
+}
+
+void CheckTrampolines() {
+    Require(Filter::Bind(nullptr) == nullptr, "a cleared callback did not stay null across the trampoline");
+    const auto filter = Filter::Bind(&Even);
+    Require(filter != nullptr && filter != &Even, "a callback crossed without its trampoline");
+    Require(filter(0x1000, 64) && g_address == 0x1000 && g_bytes == 64, "the trampoline did not forward its arguments and result");
+    Require(!filter(0x1001, 8) && g_address == 0x1001 && g_bytes == 8, "the trampoline did not forward a false result");
+    Require(Filter::Bind(nullptr) == nullptr && !filter(0x1003, 8), "clearing a callback unbound a trampoline that may still run");
+    Require(Filter::Bind(&Always) == filter && filter(0x1001, 8), "a callback set again did not replace the first");
+    const auto preparer = Preparer::Bind(&Even);
+    Require(preparer != filter && !preparer(0x2001, 4) && g_address == 0x2001, "two callbacks share one trampoline");
+
+    const auto first  = Shutdown::Bind(&First);
+    const auto second = Shutdown::Bind(&Second);
+    Require(first != nullptr && second != nullptr && first != second, "two shutdown callbacks share one trampoline");
+    second();
+    first();
+    first();
+    Require(g_first == 2 && g_second == 1, "the shutdown trampolines did not run their own callbacks");
+    Require(Shutdown::Bind(nullptr) == nullptr, "a missing shutdown callback got a trampoline");
+    bool refused = false;
+    try {
+        Shutdown::Bind(&First);
+    } catch (const std::runtime_error& error) {
+        refused = Contains(error.what(), "more than 2 registrations of a test shutdown callback");
+    }
+    Require(refused, "a shutdown callback beyond the trampolines was accepted");
+}
+
+int EscapeThroughTrampoline() {
+    std::signal(SIGABRT, [](int) { std::_Exit(3); });
+    const bool result = Filter::Bind(&Throws)(0, 0);
+    std::fprintf(stderr, "kyty_shim_dll_abi: the exception was swallowed (%d)\n", result ? 1 : 0);
+    return 1;
+}
+
 #if defined(_WIN32)
 void CheckDll(const char* path) {
     const HMODULE module = LoadLibraryExA(path, nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -109,7 +199,9 @@ void CheckDll(const char* path) {
 }
 
 int main(int argc, char** argv) {
+    if (argc > 1 && std::strcmp(argv[1], "escape") == 0) return EscapeThroughTrampoline();
     CheckSeam();
+    CheckTrampolines();
 #if defined(_WIN32)
     if (argc > 1) CheckDll(argv[1]);
 #else

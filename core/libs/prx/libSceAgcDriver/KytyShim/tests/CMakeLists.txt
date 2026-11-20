@@ -14,6 +14,10 @@ else()
     add_test(NAME kyty_shim_dll_abi COMMAND kyty_shim_dll_abi_tests)
 endif()
 set_tests_properties(kyty_shim_dll_abi PROPERTIES TIMEOUT 20 PASS_REGULAR_EXPRESSION "kyty_shim_dll_abi: ok")
+add_test(NAME kyty_shim_dll_escape COMMAND kyty_shim_dll_abi_tests escape)
+set_tests_properties(kyty_shim_dll_escape PROPERTIES TIMEOUT 20
+        PASS_REGULAR_EXPRESSION "kyty_gpu: the test filter let an exception escape towards AnyPS5: the filter failed"
+        FAIL_REGULAR_EXPRESSION "swallowed")
 
 if(NOT ANYPS5_KYTY_DLL)
 add_test_executable(kyty_shim_events_tests
