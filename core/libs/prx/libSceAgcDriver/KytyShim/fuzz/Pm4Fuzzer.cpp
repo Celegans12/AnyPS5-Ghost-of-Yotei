@@ -25,6 +25,7 @@ constexpr uint32_t IT_DISPATCH_INDIRECT         = 0x16;
 constexpr uint32_t IT_SET_PREDICATION           = 0x20;
 constexpr uint32_t IT_COND_EXEC                 = 0x22;
 constexpr uint32_t IT_DRAW_INDIRECT             = 0x24;
+constexpr uint32_t IT_DRAW_INDEX_INDIRECT       = 0x25;
 constexpr uint32_t IT_INDEX_BASE                = 0x26;
 constexpr uint32_t IT_DRAW_INDEX_2              = 0x27;
 constexpr uint32_t IT_CONTEXT_CONTROL           = 0x28;
@@ -34,6 +35,7 @@ constexpr uint32_t IT_DRAW_INDEX_AUTO           = 0x2D;
 constexpr uint32_t IT_NUM_INSTANCES             = 0x2F;
 constexpr uint32_t IT_DRAW_INDEX_OFFSET_2       = 0x35;
 constexpr uint32_t IT_WRITE_DATA                = 0x37;
+constexpr uint32_t IT_DRAW_INDEX_INDIRECT_MULTI = 0x38;
 constexpr uint32_t IT_DRAW_INDEX_MULTI_INST     = 0x3A;
 constexpr uint32_t IT_INDIRECT_BUFFER           = 0x3F;
 constexpr uint32_t IT_COPY_DATA                 = 0x40;
@@ -67,41 +69,29 @@ struct Op {
 	bool     exact;
 };
 
-constexpr std::array<Op, 34> Ops = {{
+constexpr std::array<Op, 22> Ops = {{
     {Pm4::IT_NOP, 1, false},
     {Pm4::IT_SET_BASE, 3, true},
     {Pm4::IT_CLEAR_STATE, 1, true},
     {Pm4::IT_INDEX_BUFFER_SIZE, 1, true},
     {Pm4::IT_DISPATCH_DIRECT, 3, true},
     {Pm4::IT_DISPATCH_INDIRECT, 2, true},
-    {Pm4::IT_SET_PREDICATION, 4, false},
-    {Pm4::IT_COND_EXEC, 4, false},
-    {Pm4::IT_DRAW_INDIRECT, 3, false},
+    {Pm4::IT_DRAW_INDIRECT, 4, true},
+    {Pm4::IT_DRAW_INDEX_INDIRECT, 4, true},
     {Pm4::IT_INDEX_BASE, 2, true},
-    {Pm4::IT_DRAW_INDEX_2, 4, false},
-    {Pm4::IT_CONTEXT_CONTROL, 2, true},
+    {Pm4::IT_DRAW_INDEX_2, 5, true},
     {Pm4::IT_INDEX_TYPE, 1, true},
-    {Pm4::IT_DRAW_INDIRECT_MULTI, 6, false},
+    {Pm4::IT_DRAW_INDIRECT_MULTI, 9, true},
+    {Pm4::IT_DRAW_INDEX_INDIRECT_MULTI, 9, true},
     {Pm4::IT_DRAW_INDEX_AUTO, 2, true},
     {Pm4::IT_NUM_INSTANCES, 1, true},
-    {Pm4::IT_DRAW_INDEX_OFFSET_2, 4, false},
     {Pm4::IT_WRITE_DATA, 4, false},
-    {Pm4::IT_DRAW_INDEX_MULTI_INST, 3, false},
-    {Pm4::IT_INDIRECT_BUFFER, 3, false},
-    {Pm4::IT_COPY_DATA, 5, true},
     {Pm4::IT_PFP_SYNC_ME, 1, true},
-    {Pm4::IT_EVENT_WRITE, 1, false},
+    {Pm4::IT_EVENT_WRITE, 1, true},
     {Pm4::IT_RELEASE_MEM, 7, true},
     {Pm4::IT_DMA_DATA, 6, true},
     {Pm4::IT_ACQUIRE_MEM, 6, true},
-    {Pm4::IT_SET_CONFIG_REG, 2, false},
-    {Pm4::IT_SET_CONTEXT_REG, 2, false},
-    {Pm4::IT_SET_SH_REG, 2, false},
-    {Pm4::IT_SET_UCONFIG_REG, 2, false},
-    {Pm4::IT_SET_UCONFIG_REG_INDEX, 2, false},
-    {Pm4::IT_SET_SH_REG_INDIRECT, 3, false},
-    {Pm4::IT_SET_CONTEXT_REG_INDIRECT, 3, false},
-    {Pm4::IT_GET_LOD_STATS, 4, false},
+    {Pm4::IT_GET_LOD_STATS, 4, true},
 }};
 
 uint8_t* g_arena = nullptr;
@@ -141,7 +131,9 @@ void FixAddresses(uint32_t code, uint32_t* body, uint32_t length, uint32_t seed)
 			break;
 		case Pm4::IT_DISPATCH_INDIRECT:
 		case Pm4::IT_DRAW_INDIRECT:
-		case Pm4::IT_DRAW_INDIRECT_MULTI: body[0] &= 0x3fffu; break;
+		case Pm4::IT_DRAW_INDEX_INDIRECT:
+		case Pm4::IT_DRAW_INDIRECT_MULTI:
+		case Pm4::IT_DRAW_INDEX_INDIRECT_MULTI: body[0] &= 0x3fffu; break;
 		case Pm4::IT_SET_SH_REG_INDIRECT:
 		case Pm4::IT_SET_CONTEXT_REG_INDIRECT: SetAddress(body, 1, seed, DataOffset, DataSpan); break;
 		default: break;
@@ -164,7 +156,7 @@ size_t Build(const uint8_t* data, size_t size, uint32_t* out, size_t capacity) {
 			body[k] = word;
 		}
 		FixAddresses(op.code, body, length, seed);
-		out[used] = 0xc0000000u | ((length - 1u) << 16) | (op.code << 8) | ((seed & 1u) << 1);
+		out[used] = 0xc0000000u | ((length - 1u) << 16) | (op.code << 8);
 		used += 1u + length;
 	}
 	return used;
