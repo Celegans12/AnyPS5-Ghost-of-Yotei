@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 set -uo pipefail
-build=${1:?usage: lavapipe_tests.sh <build directory> [output directory]}
+build=$(cd "${1:?usage: lavapipe_tests.sh <build directory> [output directory]}" && pwd)
 out=${2:-$build/lavapipe}
+mkdir -p "$out"
+out=$(cd "$out" && pwd)
 root=$(cd "$(dirname "$0")/.." && pwd)
 skip_file=$root/tools/lavapipe_skip.txt
 allowed_file=$root/tools/lavapipe_allowed_skips.txt
 known_file=$root/tools/lavapipe_validation_known.txt
-mkdir -p "$out"
 
 icd=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json 2>/dev/null | head -n 1)
 if [ -z "$icd" ]; then
