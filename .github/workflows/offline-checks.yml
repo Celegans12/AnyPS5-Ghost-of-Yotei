@@ -1,0 +1,151 @@
+name: Offline checks
+
+on:
+  push:
+    branches: [AnyKyty, 'test/**']
+    paths:
+      - 'core/kyty/**'
+      - 'core/relinker/**'
+      - 'core/libs/prx/libSceAgcDriver/**'
+      - 'tools/lavapipe_*'
+      - '.github/workflows/offline-checks.yml'
+  pull_request:
+    branches: [AnyKyty]
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'core/kyty/**'
+      - 'core/relinker/**'
+      - 'core/libs/prx/libSceAgcDriver/**'
+      - 'tools/lavapipe_*'
+      - '.github/workflows/offline-checks.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: offline-checks-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lavapipe:
+    name: Shim GPU tests on lavapipe
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - id: submodules
+        name: Key the submodules on their commits
+        run: |
+          echo "key=$(git ls-files -s | awk '$1 == "160000" { print $2, $4 }' | cat - .gitmodules | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          echo "ffmpeg=$(git rev-parse HEAD:3rdparty/ffmpeg-core)" >> "$GITHUB_OUTPUT"
+      - id: submodule-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Check out the submodules
+        run: |
+          if [ -f "$RUNNER_TEMP/submodule-gitdirs.tar" ]; then tar -xf "$RUNNER_TEMP/submodule-gitdirs.tar"; fi
+          git submodule update --init --recursive --depth 1 --jobs 8
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        run: tar -cf "$RUNNER_TEMP/submodule-gitdirs.tar" .git/modules
+      - if: steps.submodule-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: ${{ runner.temp }}/submodule-gitdirs.tar
+          key: submodule-gitdirs-${{ runner.os }}-${{ steps.submodules.outputs.key }}
+      - name: Install the build dependencies, lavapipe and the validation layer
+        run: |
+          sudo curl -fsSL --retry 3 -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y -q --no-install-recommends gcc-14 g++-14 ninja-build pkg-config ccache \
+            libx11-dev libxext-dev libxrandr-dev libxkbcommon-dev libwayland-dev libegl-dev libdecor-0-dev \
+            libxcursor-dev libxi-dev libxfixes-dev libxinerama-dev libxss-dev libxxf86vm-dev libudev-dev libdrm-dev libgbm-dev \
+            libasound2-dev libpulse-dev libpipewire-0.3-dev libvulkan1 libvulkan-dev mesa-vulkan-drivers vulkan-tools vulkan-validationlayers \
+            clang-21 lld-21 llvm-21
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+      - id: ccache
+        uses: hendrikmuhs/ccache-action@v1.2.24
+        with:
+          key: linux-kyty
+          max-size: 3G
+          evict-old-files: job
+      - id: ffmpeg-cache
+        uses: actions/cache/restore@v6
+        with:
+          path: build/externals
+          key: ffmpeg-${{ runner.os }}-${{ steps.submodules.outputs.ffmpeg }}
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON \
+            -DCMAKE_C_COMPILER=gcc-14 -DCMAKE_CXX_COMPILER=g++-14 \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
+            -DANYPS5_GPU_BACKEND=kyty -DANYPS5_KYTY_JOBS="$(nproc)" -DANYPS5_VIDEO_OUT_TEST_DRIVER=offscreen
+      - if: steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v6
+        continue-on-error: true
+        with:
+          path: build/externals
+          key: ${{ steps.ffmpeg-cache.outputs.cache-primary-key }}
+      - name: Build
+        run: |
+          mapfile -t tests < <(ninja -C build -t targets all | grep -oE '^(kyty_shim_[A-Za-z0-9_]+_tests|guest_gpu_fault_tests|guest_host_write_filter_tests|agc_kyty_shaders_tests):' | tr -d ':' | sort -u)
+          cmake --build build --target kyty_gpu libs relinker kyty_rt_probe agc_frame_replay agc_frame_replay_inspection_tests "${tests[@]}" --parallel "$(nproc)"
+      - name: Run the shim tests on lavapipe
+        run: bash tools/lavapipe_tests.sh build build/lavapipe
+      - uses: actions/upload-artifact@v7
+        if: ${{ !cancelled() }}
+        with:
+          name: lavapipe-tests
+          path: |
+            build/lavapipe/ctest.xml
+            build/lavapipe/ctest.log
+            build/lavapipe/validation.xml
+            build/lavapipe/validation.log
+            build/lavapipe/validation-summary.md
+            build/lavapipe/vulkaninfo.txt
+          if-no-files-found: ignore
+
+  relinker-fuzzers:
+    name: Relinker fuzzers
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Install the compiler
+        run: |
+          sudo curl -fsSL --retry 3 -o /etc/apt/trusted.gpg.d/apt.llvm.org.asc https://apt.llvm.org/llvm-snapshot.gpg.key
+          echo "deb http://apt.llvm.org/noble/ llvm-toolchain-noble-21 main" | sudo tee /etc/apt/sources.list.d/llvm-21.list
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y -q --no-install-recommends ninja-build clang-21 lld-21 llvm-21 libclang-rt-21-dev
+          echo /usr/lib/llvm-21/bin >> "$GITHUB_PATH"
+      - name: Build the fuzzers with libFuzzer, AddressSanitizer and UndefinedBehaviorSanitizer
+        run: |
+          cmake -S . -B build-fuzz -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+            -DANYPS5_RELINKER_ONLY=ON -DANYPS5_BUILD_FUZZERS=ON -DBUILD_TESTING=ON
+          cmake --build build-fuzz --target relinker_conversion_fuzzer relinker_elf_reader_fuzzer relinker_fuzz_seeds --parallel "$(nproc)"
+      - name: Run each fuzzer for two minutes from synthetic seeds
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          find build-fuzz -name relinker_fuzz_seeds -type f -perm -u+x -exec {} build-fuzz/seeds \;
+          for fuzzer in relinker_elf_reader_fuzzer relinker_conversion_fuzzer; do
+            binary=$(find build-fuzz -name "$fuzzer" -type f -perm -u+x | head -n 1)
+            mkdir -p "build-fuzz/corpus-$fuzzer"
+            cp build-fuzz/seeds/* "build-fuzz/corpus-$fuzzer/"
+            "$binary" -max_total_time=120 -timeout=30 -rss_limit_mb=2048 -max_len=65536 -artifact_prefix="build-fuzz/$fuzzer-" "build-fuzz/corpus-$fuzzer"
+          done
+      - uses: actions/upload-artifact@v7
+        if: ${{ failure() }}
+        with:
+          name: relinker-fuzzer-crashes
+          path: build-fuzz/*-crash-*
+          if-no-files-found: ignore

@@ -314,6 +314,11 @@ if(KYTY_ENABLE_TSAN)
     target_compile_definitions(kyty_gpu PRIVATE ANYPS5_ENABLE_TSAN=1)
 endif()
 
+option(KYTY_ENABLE_FUZZ "Instrument the Kyty renderer with libFuzzer coverage and UndefinedBehaviorSanitizer" OFF)
+if(KYTY_ENABLE_FUZZ)
+    target_compile_options(kyty_gpu PRIVATE -fsanitize=undefined,fuzzer-no-link -fno-sanitize=function,vptr -fno-sanitize-recover=undefined -fno-omit-frame-pointer)
+endif()
+
 set(KYTY_PGO_PROFILE "" CACHE FILEPATH "LLVM instrumentation profile to optimize kyty_gpu with (-fprofile-use): text (.proftext) or indexed (.profdata); empty for none")
 option(KYTY_PGO_GENERATE "Instrument kyty_gpu to write an LLVM profile (-fprofile-generate; LLVM_PROFILE_FILE names the file, KYTY_PGO_DUMP_SECONDS writes it periodically), Linux only" OFF)
 set(KYTY_PGO_TARGETS kyty_gpu fmt xxhash TracyClient zarchive libzstd_static)
