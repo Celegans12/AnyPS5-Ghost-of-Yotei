@@ -143,7 +143,7 @@ public:
 		if (!manager->WriteFaultFindsOpen(vaddr % TRACKER_REGION_SIZE, block_size, open_block, mark_size, gpu)) {
 			return false;
 		}
-		manager->NoteCpuWriteOnOpenPage();
+		manager->NoteCpuWriteOnOpenPage(vaddr % TRACKER_REGION_SIZE, block_size, open_block, mark_size);
 		return true;
 	}
 

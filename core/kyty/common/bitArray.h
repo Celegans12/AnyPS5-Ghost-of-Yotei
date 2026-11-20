@@ -93,6 +93,38 @@ public:
 		});
 	}
 
+	void SetAtomic(size_t index) {
+		AtomicWord(index / BITS_PER_WORD).fetch_or(uint64_t {1} << (index % BITS_PER_WORD), std::memory_order_release);
+	}
+
+	void UnsetAtomic(size_t index) {
+		AtomicWord(index / BITS_PER_WORD).fetch_and(~(uint64_t {1} << (index % BITS_PER_WORD)), std::memory_order_relaxed);
+	}
+
+	void SetRangeAtomic(size_t start, size_t end) {
+		ForEachWord(start, end, [this](size_t word, uint64_t mask) {
+			AtomicWord(word).fetch_or(mask, std::memory_order_release);
+			return false;
+		});
+	}
+
+	void SetAtomic(const BitArray& other) {
+		for (size_t word = 0; word < WORD_COUNT; word++) {
+			if (const auto bits = other.Load(word); bits != 0) {
+				AtomicWord(word).fetch_or(bits, std::memory_order_release);
+			}
+		}
+	}
+
+	[[nodiscard]] BitArray TakeRange(size_t start, size_t end) {
+		BitArray taken;
+		ForEachWord(start, end, [&](size_t word, uint64_t mask) {
+			taken.Store(word, AtomicWord(word).fetch_and(~mask, std::memory_order_acquire) & mask);
+			return false;
+		});
+		return taken;
+	}
+
 	void Clear() {
 		for (size_t word = 0; word < WORD_COUNT; word++) {
 			Store(word, 0);
@@ -245,6 +277,8 @@ private:
 	void Store(size_t word, uint64_t value) {
 		std::atomic_ref(m_data[word]).store(value, std::memory_order_relaxed);
 	}
+
+	[[nodiscard]] std::atomic_ref<uint64_t> AtomicWord(size_t word) { return std::atomic_ref(m_data[word]); }
 
 	std::array<uint64_t, WORD_COUNT> m_data {};
 };

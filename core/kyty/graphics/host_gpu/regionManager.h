@@ -314,7 +314,22 @@ public:
 		return closed.None();
 	}
 
-	void NoteCpuWriteOnOpenPage() noexcept {
+	void NoteCpuWriteOnOpenPage(uint64_t offset, uint64_t block_size, bool open_block, uint64_t mark_size) noexcept
+	    KYTY_NO_THREAD_SAFETY_ANALYSIS {
+		const auto page         = static_cast<size_t>(offset / TRACKER_PAGE_SIZE);
+		const auto first        = static_cast<size_t>(offset / block_size * block_size / TRACKER_PAGE_SIZE);
+		const auto last         = first + static_cast<size_t>(block_size / TRACKER_PAGE_SIZE);
+		const auto [start, end] = open_block ? std::pair {first, last} : GetPageRange(offset, mark_size);
+		RegionBits written(m_cpu_dirty, start, end);
+		if (open_block) {
+			RegionBits noted(m_gpu_noted, first, last);
+			noted.Unset(page);
+			written &= ~noted;
+		}
+		for (auto& consumer: m_cpu_written) {
+			consumer.SetAtomic(written);
+		}
+		NoteGuestWriteFault(offset);
 		m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 		BdaDirtyRegions::Mark(m_cpu_addr / TRACKER_REGION_SIZE);
@@ -350,7 +365,7 @@ public:
 		if constexpr (source == DirtySource::Cpu) {
 			if constexpr (enable) {
 				for (auto& written: m_cpu_written) {
-					written.SetRange(start, end);
+					written.SetRangeAtomic(start, end);
 				}
 				m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 				s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -442,6 +457,7 @@ public:
 		}
 		if (m_busy == nullptr) {
 			m_busy = std::make_unique<BusyPages>();
+			m_busy_published.store(m_busy.get(), std::memory_order_release);
 		}
 		auto&      busy = *m_busy;
 		RegionBits clean;
@@ -449,7 +465,7 @@ public:
 		for (const auto [first, last]: mask) {
 			for (auto page = first; page < last; page++) {
 				if (busy.faulted.Get(page)) {
-					busy.faulted.Unset(page);
+					busy.faulted.UnsetAtomic(page);
 					const bool soon   = busy.seen[page] != 0 && sync - busy.seen[page] <= MaxGap;
 					busy.writes[page] = soon ? static_cast<uint8_t>(std::min(busy.writes[page] + 1, 255)) : 1;
 				}
@@ -481,9 +497,9 @@ public:
 		return kept;
 	}
 
-	void NoteGuestWriteFault(uint64_t offset) KYTY_REQUIRES(lock) {
-		if (m_busy != nullptr) {
-			m_busy->faulted.Set(static_cast<size_t>(offset / TRACKER_PAGE_SIZE));
+	void NoteGuestWriteFault(uint64_t offset) noexcept {
+		if (auto* busy = m_busy_published.load(std::memory_order_acquire); busy != nullptr) {
+			busy->faulted.SetAtomic(static_cast<size_t>(offset / TRACKER_PAGE_SIZE));
 		}
 	}
 
@@ -492,13 +508,11 @@ public:
 	template <typename Func>
 	void ConsumeCpuWritten(CpuWriteConsumer consumer, uint64_t offset, uint64_t size, Func&& func) KYTY_REQUIRES(lock) {
 		const auto [start, end] = GetPageRange(offset, size);
-		auto&      written      = m_cpu_written[static_cast<size_t>(consumer)];
-		RegionBits mask(written, start, end);
+		RegionBits mask = m_cpu_written[static_cast<size_t>(consumer)].TakeRange(start, end);
 		mask |= RegionBits(m_cpu_dirty, start, end);
 		if (m_any_in_place) {
 			mask |= RegionBits(m_in_place, start, end);
 		}
-		written.UnsetRange(start, end);
 		for (const auto [first, last]: mask) {
 			func(m_cpu_addr + first * TRACKER_PAGE_SIZE, (last - first) * TRACKER_PAGE_SIZE);
 		}
@@ -563,7 +577,7 @@ public:
 		m_any_in_place = !m_in_place.None();
 		m_cpu_dirty |= leaving;
 		for (auto& written: m_cpu_written) {
-			written |= leaving;
+			written.SetAtomic(leaving);
 		}
 		m_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
 		s_cpu_dirty_epoch.fetch_add(1, std::memory_order_acq_rel);
@@ -697,6 +711,7 @@ private:
 	RegionBits                 m_in_place KYTY_GUARDED_BY(lock);
 	bool                       m_any_in_place KYTY_GUARDED_BY(lock) = false;
 	std::unique_ptr<BusyPages> m_busy KYTY_GUARDED_BY(lock);
+	std::atomic<BusyPages*>    m_busy_published {nullptr};
 	std::atomic<uint32_t>      m_kept_sync {0};
 	std::atomic<uint64_t> m_host_write_epoch {0};
 	std::atomic<uint32_t> m_deferred_protects {0};
