@@ -458,6 +458,10 @@ add_dependencies(kyty_shim_wave64_cross_lane_tests agc_frame_replay)
 add_test(NAME kyty_shim_wave64_cross_lane COMMAND kyty_shim_wave64_cross_lane_tests $<TARGET_FILE:agc_frame_replay>)
 set_tests_properties(kyty_shim_wave64_cross_lane PROPERTIES TIMEOUT 120 SKIP_RETURN_CODE 77
         PASS_REGULAR_EXPRESSION "kyty_shim_wave64_cross_lane: ok")
+if(WIN32)
+    set_property(TEST kyty_shim_wave64_cross_lane APPEND PROPERTY
+        ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceAgcDriver>")
+endif()
 add_test_executable(kyty_shim_bda_submission_sync_tests ${CMAKE_CURRENT_SOURCE_DIR}/BdaSubmissionSync.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../../Execution/src/FrameCapture.cpp)
 target_include_directories(kyty_shim_bda_submission_sync_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/3rdparty/zstd/lib)
