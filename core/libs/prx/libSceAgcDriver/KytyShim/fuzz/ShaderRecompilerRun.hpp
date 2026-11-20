@@ -11,8 +11,12 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
+#include <regex>
+#include <set>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace KytyFuzz {
@@ -34,13 +38,37 @@ inline Recompiler::Spirv::Profile Profile() {
 	        .lds_lane_sync          = true};
 }
 
-inline bool Valid(const std::vector<uint32_t>& spirv) {
+inline bool Valid(const std::vector<uint32_t>& spirv, std::string& message) {
 	spvtools::SpirvTools tools(SPV_ENV_VULKAN_1_3);
-	tools.SetMessageConsumer([](spv_message_level_t, const char*, const spv_position_t&, const char*) {});
+	tools.SetMessageConsumer([&message](spv_message_level_t, const char*, const spv_position_t&, const char* text) {
+		if (message.empty()) message = text;
+	});
 	spvtools::ValidatorOptions options;
 	options.SetAllowOffsetTextureOperand(true);
 	options.SetUniformBufferStandardLayout(true);
 	return tools.Validate(spirv.data(), spirv.size(), options);
+}
+
+inline void ReportInvalid(const std::string& message, std::span<const uint32_t> code, uint8_t mode, uint8_t shape) {
+	static const std::regex numbers("[0-9]+");
+	const std::string       normalized = std::regex_replace(message.substr(0, message.find('\n')), numbers, "N");
+	const char*             policy     = std::getenv("KYTY_FUZZ_SPIRV");
+	if (std::strcmp(policy, "abort") == 0) {
+		std::fprintf(stderr, "kyty_shader_recompiler_fuzzer: spirv-val refuses the SPIR-V: %s\n", normalized.c_str());
+		std::abort();
+	}
+	static std::set<std::string> seen;
+	if (!seen.insert(normalized).second) return;
+	std::fprintf(stderr, "SPIRV-INVALID: %s\n", normalized.c_str());
+	if (const char* directory = std::getenv("KYTY_FUZZ_SPIRV_DIR"); directory != nullptr) {
+		std::FILE* file = std::fopen((std::string(directory) + "/invalid-" + std::to_string(seen.size()) + ".bin").c_str(), "wb");
+		if (file != nullptr) {
+			const uint8_t header[4] = {mode, shape, 0, 0};
+			std::fwrite(header, 1, sizeof(header), file);
+			std::fwrite(code.data(), sizeof(uint32_t), code.size(), file);
+			std::fclose(file);
+		}
+	}
 }
 
 inline void Run(std::span<const uint32_t> code, uint8_t mode, uint8_t shape) {
@@ -103,9 +131,10 @@ inline void Run(std::span<const uint32_t> code, uint8_t mode, uint8_t shape) {
 		}
 		if (!IR::ResourceSpecializationFits(translated.program, specialization)) return;
 		auto compiled = Recompiler::CompileProgram(std::move(translated), options, specialization, 0);
-		if (!compiled.spirv.empty() && !Valid(compiled.spirv)) {
-			std::fputs("kyty_shader_recompiler_fuzzer: the recompiler produced SPIR-V that spirv-val refuses\n", stderr);
-			std::abort();
+		const char* policy = std::getenv("KYTY_FUZZ_SPIRV");
+		if (!compiled.spirv.empty() && policy != nullptr && std::strcmp(policy, "off") != 0 && policy[0] != 0) {
+			std::string message;
+			if (!Valid(compiled.spirv, message)) ReportInvalid(message, code, mode, shape);
 		}
 	} catch (const std::exception&) {
 	}
