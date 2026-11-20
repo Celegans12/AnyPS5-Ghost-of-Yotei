@@ -560,6 +560,37 @@ inline constexpr std::array<VideoOutFormatPolicy, 12> VIDEO_OUT_FORMAT_POLICIES 
 	return ImageRangeOverlaps(left.address, left.size, right.address, right.size);
 }
 
+struct ImageLayoutOrigin {
+	const char*             path             = nullptr;
+	uint64_t                shader           = 0;
+	uint64_t                address          = 0;
+	uint32_t                source           = 0;
+	uint32_t                descriptor_index = 0;
+	uint32_t                first_use_pc     = 0;
+	uint32_t                indirect_root    = 0;
+	std::array<uint32_t, 8> words {};
+};
+
+[[nodiscard]] bool ImageLayoutDiagEnabled();
+
+[[nodiscard]] inline ImageLayoutOrigin& CurrentImageLayoutOrigin() {
+	static thread_local ImageLayoutOrigin origin;
+	return origin;
+}
+
+[[nodiscard]] inline bool UnknownImageTileMode(uint32_t word) {
+	switch (static_cast<Prospero::TileMode>((word >> 20u) & 0x1fu)) {
+		case Prospero::TileMode::kLinear:
+		case Prospero::TileMode::kStandard256B:
+		case Prospero::TileMode::kStandard4KB:
+		case Prospero::TileMode::kStandard64KB:
+		case Prospero::TileMode::kPrt:
+		case Prospero::TileMode::kDepth:
+		case Prospero::TileMode::kRenderTarget: return false;
+		default: return true;
+	}
+}
+
 }
 
 #endif
