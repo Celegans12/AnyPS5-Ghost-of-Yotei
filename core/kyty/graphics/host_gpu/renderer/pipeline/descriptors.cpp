@@ -37,10 +37,12 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <fmt/format.h>
 #include <limits>
+#include <mutex>
 #include <span>
 #include <string_view>
 #include <vector>
@@ -809,6 +811,20 @@ static TextureDescDerivation DeriveTextureDesc(const ShaderRecompiler::IR::Image
 	if (meta_compress && tile != Prospero::TileMode::kDepth) {
 		desc.info.metadata.kind = ImageMetadataKind::Dcc;
 	}
+	if (!desc.info.HasTiledLayout()) {
+		auto derived = unsupported(fmt::format(
+		    "unsupported tiled texture layout: format={} tile={} type={} extent={}x{}x{} "
+		    "levels={} layers={} addr={:#018x} "
+		    "dwords={:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x},{:08x}",
+		    static_cast<uint32_t>(format), static_cast<uint32_t>(tile),
+		    static_cast<uint32_t>(descriptor.Type()), width, height, depth, levels, image_layers,
+		    address, descriptor.fields[0], descriptor.fields[1], descriptor.fields[2],
+		    descriptor.fields[3], descriptor.fields[4], descriptor.fields[5], descriptor.fields[6],
+		    descriptor.fields[7]));
+		derived.unknown_tiling = true;
+		derived.desc.info      = std::move(desc.info);
+		return derived;
+	}
 	if (levels > physical_levels) {
 		if (!ResolveTextureMipView(desc.info, physical_levels,
 		                           meta_compress, view_levels,
@@ -931,6 +947,34 @@ bool RenderExecutor::ReuseTextureLookup(TextureDescDerivation& derived, TextureB
 	return true;
 }
 
+static void ReportDeclinedTiling(const ShaderRecompiler::IR::ImageResource&   resource,
+                                 const ShaderRecompiler::IR::DescriptorValue& value,
+                                 bool table_candidate, const ImageInfo& info) {
+	const bool indirect =
+	    resource.indirect_root != ShaderRecompiler::IR::ImageResource::NoIndirectImage;
+	if (!table_candidate && !resource.heap && !indirect) {
+		return;
+	}
+	static std::mutex                           mutex;
+	static std::vector<std::array<uint32_t, 8>> seen;
+	{
+		std::scoped_lock lock {mutex};
+		if (seen.size() >= 64u || std::ranges::find(seen, value.dwords) != seen.end()) {
+			return;
+		}
+		seen.push_back(value.dwords);
+	}
+	std::fprintf(stderr,
+	             "[kyty-tiled] declined %s candidate: shader 0x%016llx, format %u, tile mode %u, "
+	             "%ux%ux%u, %u levels, words %08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+	             table_candidate ? "table" : resource.heap ? "image heap" : "indirect image",
+	             static_cast<unsigned long long>(Common::HackNotice::CurrentShaderSlot()),
+	             static_cast<uint32_t>(info.guest_format), static_cast<uint32_t>(info.tile_mode),
+	             info.extent.width, info.extent.height, info.extent.depth, info.resources.levels,
+	             value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
+	             value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
+}
+
 static TextureBinding DeclineTableView(TextureCache::ImageDesc& desc, vk::Format image_format,
                                        vk::Format view_format) {
 	Common::HackNotice::Report(
@@ -962,6 +1006,10 @@ TextureBinding RenderExecutor::ResolveTexture(const ShaderRecompiler::IR::ImageR
 	auto       cached = m_texture_descs.find(key);
 	if (cached == m_texture_descs.end()) {
 		auto derived = DeriveTextureDesc(resource, descriptor);
+		if (derived.unknown_tiling) {
+			ReportDeclinedTiling(resource, value, table_candidate, derived.desc.info);
+			derived.desc = {};
+		}
 		if (m_texture_descs.size() >= MaxTextureDescs) {
 			m_clear_texture_descs = true;
 		}
