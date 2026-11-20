@@ -8,6 +8,7 @@
 #include "graphics/host_gpu/renderer/drawTemplates.h"
 #include "graphics/host_gpu/renderer/pipeline/descriptors.h"
 #include "graphics/host_gpu/renderer/pipeline/pipelineCache.h"
+#include "graphics/host_gpu/renderer/pipeline/tableResolutionCache.h"
 #include "graphics/host_gpu/renderer/renderTarget.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/upscaler/upscaler.h"
@@ -187,7 +188,7 @@ struct Request;
 
 class RenderExecutor {
 public:
-	explicit RenderExecutor(RenderContext& context): m_context(context) {}
+	explicit RenderExecutor(RenderContext& context): m_context(context) { ConfigureTableResolutions(); }
 	~RenderExecutor();
 	KYTY_CLASS_NO_COPY(RenderExecutor);
 
@@ -348,10 +349,33 @@ private:
 	};
 	struct TableResolution {
 		ShaderRecompiler::IR::ImageResource root;
-		uint64_t                            last_use = 0;
+		uint64_t                            last_use   = 0;
+		uint64_t                            generation = 0;
 		TableElements                       elements;
 		std::vector<TableSlot>              slots;
 	};
+	struct TableResolutionKeyHash {
+		size_t operator()(const ShaderRecompiler::IR::ImageResource& root) const noexcept;
+	};
+	using TableResolutions =
+	    TableResolutionCache<TableResolution, ShaderRecompiler::IR::ImageResource, TableResolutionKeyHash>;
+	struct TableStats {
+		uint64_t bindings     = 0;
+		uint64_t prepared     = 0;
+		uint64_t reused       = 0;
+		uint64_t unfinished   = 0;
+		uint64_t renewed      = 0;
+		uint64_t layout       = 0;
+		uint64_t left_renewed = 0;
+		uint64_t left_size    = 0;
+		uint64_t resets       = 0;
+		uint64_t window_ns    = 0;
+		bool     idle_logged  = false;
+	};
+	void ConfigureTableResolutions();
+	void RetireTableResolution(TableResolution& table);
+	void TrimTableResolutions();
+	void LogTableSummary();
 
 	[[nodiscard]] TableElementResolution&
 	ResolveTableElement(TableResolution& table, const ShaderRecompiler::IR::DescriptorValue& value,
@@ -371,6 +395,7 @@ private:
 			uint32_t                            table      = 0;
 			uint32_t                            capacity   = 0;
 			uint64_t                            slots_id   = 0;
+			uint64_t                            generation = 0;
 		};
 		struct Element {
 			TableElementResolution*               resolution = nullptr;
@@ -620,12 +645,12 @@ private:
 	vk::PipelineLayout                    m_pssr_pipeline_layout   = nullptr;
 	vk::Pipeline                          m_pssr_pipeline          = nullptr;
 	std::vector<UpscalerContext>          m_upscaler_contexts;
-	std::deque<TableResolution>           m_table_resolutions;
+	TableResolutions                      m_table_resolutions;
 	std::deque<TableElements>             m_retired_table_elements;
-	uint64_t                              m_table_resolution_tick = 0;
+	size_t                                m_table_element_count = 0;
+	TableStats                            m_table_stats;
 	uint64_t                              m_table_prepare_stamp   = 0;
 	std::vector<vk::DescriptorImageInfo>  m_table_image_infos;
-	uint64_t                              m_table_generation = 0;
 	std::unordered_map<const void*, TableBindingState> m_table_states;
 	std::vector<std::pair<uint64_t, uint64_t>>         m_table_changes;
 	std::vector<uint32_t>                              m_table_marked;

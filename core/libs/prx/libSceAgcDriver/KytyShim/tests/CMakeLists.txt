@@ -37,6 +37,37 @@ add_test(NAME kyty_shim_completion_invalidation COMMAND kyty_shim_completion_inv
 set_tests_properties(kyty_shim_completion_invalidation PROPERTIES TIMEOUT 60
         PASS_REGULAR_EXPRESSION "kyty_shim_completion_invalidation: ok" FAIL_REGULAR_EXPRESSION "FAILED")
 
+if(NOT WIN32)
+    add_test_executable(kyty_shim_table_resolution_cache_tests ${CMAKE_CURRENT_SOURCE_DIR}/TableResolutionCache.cpp
+            ${CMAKE_CURRENT_SOURCE_DIR}/../src/Log.cpp)
+    target_include_directories(kyty_shim_table_resolution_cache_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(kyty_shim_table_resolution_cache_tests PRIVATE Kyty::gpu libkernel libc)
+    add_test(NAME kyty_shim_table_resolution_cache COMMAND kyty_shim_table_resolution_cache_tests)
+    set_tests_properties(kyty_shim_table_resolution_cache PROPERTIES TIMEOUT 20
+            ENVIRONMENT "KYTY_TABLE_RESOLUTIONS=;KYTY_TABLE_RESOLUTION_LEGACY="
+            PASS_REGULAR_EXPRESSION "kyty_shim_table_resolution_cache: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    add_test(NAME kyty_shim_table_resolution_cache_default COMMAND kyty_shim_table_resolution_cache_tests default)
+    set_tests_properties(kyty_shim_table_resolution_cache_default PROPERTIES TIMEOUT 20
+            ENVIRONMENT "KYTY_TABLE_RESOLUTIONS=;KYTY_TABLE_RESOLUTION_LEGACY=0"
+            PASS_REGULAR_EXPRESSION "kyty_shim_table_resolution_cache_settings: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    add_test(NAME kyty_shim_table_resolution_cache_capacity COMMAND kyty_shim_table_resolution_cache_tests capacity)
+    set_tests_properties(kyty_shim_table_resolution_cache_capacity PROPERTIES TIMEOUT 20
+            ENVIRONMENT "KYTY_TABLE_RESOLUTIONS=64;KYTY_TABLE_RESOLUTION_LEGACY="
+            PASS_REGULAR_EXPRESSION "kyty_shim_table_resolution_cache_settings: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    add_test(NAME kyty_shim_table_resolution_cache_legacy COMMAND kyty_shim_table_resolution_cache_tests legacy)
+    set_tests_properties(kyty_shim_table_resolution_cache_legacy PROPERTIES TIMEOUT 20
+            ENVIRONMENT "KYTY_TABLE_RESOLUTIONS=64;KYTY_TABLE_RESOLUTION_LEGACY=1"
+            PASS_REGULAR_EXPRESSION "kyty_shim_table_resolution_cache_settings: ok" FAIL_REGULAR_EXPRESSION "FAILED")
+    add_test(NAME kyty_shim_table_resolution_cache_bad COMMAND kyty_shim_table_resolution_cache_tests bad)
+    set_tests_properties(kyty_shim_table_resolution_cache_bad PROPERTIES TIMEOUT 20
+            ENVIRONMENT "KYTY_TABLE_RESOLUTIONS=4097;KYTY_TABLE_RESOLUTION_LEGACY="
+            PASS_REGULAR_EXPRESSION "invalid KYTY_TABLE_RESOLUTIONS: 4097" FAIL_REGULAR_EXPRESSION "did not stop")
+    add_test(NAME kyty_shim_table_resolution_cache_bad_legacy COMMAND kyty_shim_table_resolution_cache_tests bad)
+    set_tests_properties(kyty_shim_table_resolution_cache_bad_legacy PROPERTIES TIMEOUT 20
+            ENVIRONMENT "KYTY_TABLE_RESOLUTIONS=;KYTY_TABLE_RESOLUTION_LEGACY=2"
+            PASS_REGULAR_EXPRESSION "invalid KYTY_TABLE_RESOLUTION_LEGACY: 2" FAIL_REGULAR_EXPRESSION "did not stop")
+endif()
+
 add_test_executable(kyty_shim_cache_topology_tests ${CMAKE_CURRENT_SOURCE_DIR}/CacheTopology.cpp)
 configure_host_test_executable(kyty_shim_cache_topology_tests)
 target_include_directories(kyty_shim_cache_topology_tests PRIVATE ${CMAKE_SOURCE_DIR}/core/kyty)

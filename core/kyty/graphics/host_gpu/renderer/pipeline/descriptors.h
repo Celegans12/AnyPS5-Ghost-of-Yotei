@@ -117,6 +117,16 @@ struct ImageTableFill {
 
 [[nodiscard]] bool TableDescriptorWrites(vk::DriverId driver);
 
+inline constexpr size_t DefaultTableResolutions = 256;
+inline constexpr size_t MaxTableResolutions     = 4096;
+
+struct TableResolutionSettings {
+	size_t capacity = DefaultTableResolutions;
+	bool   legacy   = false;
+};
+
+[[nodiscard]] TableResolutionSettings ReadTableResolutionSettings();
+
 void AppendImageTableGaps(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables,
                           std::vector<vk::WriteDescriptorSet>& gap_writes);
 void AppendImageTableFills(const vk::WriteDescriptorSet& whole, std::span<const ImageTableFill> tables, bool writes,

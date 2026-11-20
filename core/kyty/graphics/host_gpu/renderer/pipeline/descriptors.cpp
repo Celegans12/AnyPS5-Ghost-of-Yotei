@@ -37,6 +37,7 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -53,6 +54,11 @@ namespace Libs::Graphics {
 namespace {
 
 using BindingKind = ShaderRecompiler::IR::DescriptorBindingKind;
+
+constexpr size_t MaxTableElements   = size_t {1} << 16u;
+constexpr size_t TableElementBudget = LegacyTableResolutions * MaxTableElements;
+
+constexpr auto TableOversized = [](const auto& table) { return table.elements.size() > MaxTableElements; };
 
 }
 
@@ -75,6 +81,35 @@ bool TableDescriptorWrites(vk::DriverId driver) {
 		return driver == vk::DriverId::eMesaRadv;
 	}
 	return forced == Forced::Writes;
+}
+
+TableResolutionSettings ReadTableResolutionSettings() {
+	TableResolutionSettings settings;
+	if (const char* value = std::getenv("KYTY_TABLE_RESOLUTION_LEGACY"); value != nullptr && value[0] != '\0') {
+		const std::string_view text(value);
+		if (text != "0" && text != "1") {
+			EXIT("invalid KYTY_TABLE_RESOLUTION_LEGACY: %s (0 or 1)\n", value);
+		}
+		settings.legacy = text == "1";
+	}
+	if (settings.legacy) {
+		settings.capacity = LegacyTableResolutions;
+		return settings;
+	}
+	if (const char* value = std::getenv("KYTY_TABLE_RESOLUTIONS"); value != nullptr && value[0] != '\0') {
+		const std::string_view text(value);
+		size_t                 capacity = 0;
+		bool                   valid    = text.size() <= 4;
+		for (const char digit: text) {
+			valid    = valid && digit >= '0' && digit <= '9';
+			capacity = capacity * 10 + static_cast<size_t>(digit - '0');
+		}
+		if (!valid || capacity == 0 || capacity > MaxTableResolutions) {
+			EXIT("invalid KYTY_TABLE_RESOLUTIONS: %s (1 to %zu)\n", value, MaxTableResolutions);
+		}
+		settings.capacity = capacity;
+	}
+	return settings;
 }
 
 vk::DescriptorType NativeDescriptorType(BindingKind kind) {
@@ -1163,11 +1198,105 @@ size_t RenderExecutor::TableDescriptorHash::operator()(
 	return static_cast<size_t>(hash);
 }
 
+size_t RenderExecutor::TableResolutionKeyHash::operator()(
+    const ShaderRecompiler::IR::ImageResource& root) const noexcept {
+	const std::array<uint32_t, 16> fields {root.descriptor_index,
+	                                       static_cast<uint32_t>(root.resource_class),
+	                                       static_cast<uint32_t>(root.numeric_class),
+	                                       static_cast<uint32_t>(root.dimension),
+	                                       static_cast<uint32_t>(root.mip_mode),
+	                                       root.mip_count,
+	                                       static_cast<uint32_t>(root.conversion_format),
+	                                       root.shader_swizzle,
+	                                       static_cast<uint32_t>(root.srgb_decode),
+	                                       (root.read ? 1u : 0u) | (root.written ? 2u : 0u) |
+	                                           (root.atomic ? 4u : 0u) | (root.atomic64 ? 8u : 0u) |
+	                                           (root.unfiltered_access_only ? 16u : 0u) |
+	                                           (root.sample_access_only ? 32u : 0u) |
+	                                           (root.depth_compare ? 64u : 0u) |
+	                                           (root.skip_degamma ? 128u : 0u) | (root.cube ? 256u : 0u) |
+	                                           (root.r128 ? 512u : 0u) | (root.heap ? 1024u : 0u),
+	                                       root.indirect_root,
+	                                       root.indirect_mapping_offset,
+	                                       root.indirect_search_iterations,
+	                                       static_cast<uint32_t>(root.indirect_resources.size()),
+	                                       root.table_descriptor_base,
+	                                       root.source};
+	uint64_t hash = 0xcbf29ce484222325ull;
+	const auto mix = [&hash](uint32_t value) {
+		hash = (hash ^ value) * 0x100000001b3ull;
+		hash ^= hash >> 29u;
+	};
+	for (const auto field: fields) {
+		mix(field);
+	}
+	for (const auto resource: root.indirect_resources) {
+		mix(resource);
+	}
+	return static_cast<size_t>(hash);
+}
+
+void RenderExecutor::ConfigureTableResolutions() {
+	const auto settings = ReadTableResolutionSettings();
+	m_table_resolutions.Configure(settings.capacity, settings.legacy);
+}
+
+void RenderExecutor::RetireTableResolution(TableResolution& table) {
+	m_table_element_count -= std::min(m_table_element_count, table.elements.size());
+	if (!table.elements.empty()) {
+		m_retired_table_elements.push_back(std::move(table.elements));
+	}
+	table.elements.clear();
+	table.slots.clear();
+}
+
+void RenderExecutor::TrimTableResolutions() {
+	const auto weight = [](const TableResolution& table) { return table.elements.size(); };
+	const auto retire = [this](TableResolution& table) { RetireTableResolution(table); };
+	while (m_table_element_count > TableElementBudget / 4 * 3 &&
+	       m_table_resolutions.ClearLeastRecent(weight, retire)) {
+	}
+}
+
+void RenderExecutor::LogTableSummary() {
+	auto&      stats = m_table_stats;
+	const auto now   = static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                                 std::chrono::steady_clock::now().time_since_epoch())
+                                                 .count());
+	if (stats.window_ns == 0) {
+		stats.window_ns = now;
+		return;
+	}
+	if (now - stats.window_ns < 10'000'000'000ull) {
+		return;
+	}
+	const auto seconds = static_cast<double>(now - stats.window_ns) / 1e9;
+	const auto cache   = m_table_resolutions.TakeCounters();
+	const auto taken   = stats;
+	stats              = {.resets = taken.resets, .window_ns = now, .idle_logged = taken.idle_logged};
+	if (taken.bindings == 0 || (taken.prepared == 0 && taken.idle_logged)) {
+		return;
+	}
+	stats.idle_logged = taken.prepared == 0;
+	::Log::WriteToConsoleAndLog(fmt::format(
+	    "[kyty-tables] summary of the last {:.0f} s: {} of {} binding preparations had image tables; {} reused "
+	    "their table state, {} rebuilt it ({} without a finished state, {} after a table entry it used was "
+	    "renewed, {} with other tables); {} finished states left invalid ({} for a renewed table entry, {} for "
+	    "a size mismatch); table cache of {} entries, {}: {} lookups, {} hits, {} new keys, {} keys made again "
+	    "after an eviction, {} evictions, {} cleared past {} elements, {} cleared for the element budget, {} "
+	    "generation bumps; {} entries in use, {} keys seen, {} elements\n",
+	    seconds, taken.prepared, taken.bindings, taken.reused, taken.prepared - taken.reused, taken.unfinished,
+	    taken.renewed, taken.layout, taken.left_renewed + taken.left_size, taken.left_renewed, taken.left_size,
+	    m_table_resolutions.Capacity(),
+	    m_table_resolutions.SharedGeneration() ? "one generation for every state (KYTY_TABLE_RESOLUTION_LEGACY=1)"
+	                                           : "one generation per entry",
+	    cache.lookups, cache.hits, cache.created, cache.recreated, cache.evicted, cache.overflowed,
+	    MaxTableElements, cache.trimmed, cache.generations, m_table_resolutions.Size(),
+	    m_table_resolutions.KnownKeys(), m_table_element_count));
+}
+
 RenderExecutor::TableResolution&
 RenderExecutor::FindTableResolution(const ShaderRecompiler::IR::ImageResource& root) {
-	constexpr size_t MaxTables   = 8;
-	constexpr size_t MaxElements = size_t {1} << 16u;
-	const auto       tick        = ++m_table_resolution_tick;
 	auto view                 = root;
 	view.source               = 0;
 	view.first_use_pc         = 0;
@@ -1175,27 +1304,8 @@ RenderExecutor::FindTableResolution(const ShaderRecompiler::IR::ImageResource& r
 	view.table_capacity       = 0;
 	view.table_mapping_offset = 0;
 	view.table_entry_mask     = 0;
-	auto found = std::ranges::find_if(m_table_resolutions,
-	                                  [&](const TableResolution& entry) { return entry.root == view; });
-	if (found == m_table_resolutions.end()) {
-		if (m_table_resolutions.size() < MaxTables) {
-			found = m_table_resolutions.emplace(m_table_resolutions.end());
-		} else {
-			found = std::ranges::min_element(m_table_resolutions, {}, &TableResolution::last_use);
-		}
-		found->root = std::move(view);
-		m_retired_table_elements.push_back(std::move(found->elements));
-		found->elements.clear();
-		found->slots.clear();
-		m_table_generation++;
-	} else if (found->elements.size() > MaxElements) {
-		m_retired_table_elements.push_back(std::move(found->elements));
-		found->elements.clear();
-		found->slots.clear();
-		m_table_generation++;
-	}
-	found->last_use = tick;
-	return *found;
+	return m_table_resolutions.Find(
+	    view, [this](TableResolution& table) { RetireTableResolution(table); }, TableOversized);
 }
 
 bool RenderExecutor::TableElementBackingReadable(const TableElementResolution& element) {
@@ -1220,6 +1330,7 @@ RenderExecutor::ResolveTableElement(TableResolution&                            
 		const auto [entry, emplaced] = table.elements.try_emplace(value.dwords);
 		known                        = &entry->second;
 		inserted                     = emplaced;
+		m_table_element_count += emplaced ? 1 : 0;
 	}
 	auto& element = *known;
 	if (inserted) {
@@ -1692,9 +1803,14 @@ void RenderExecutor::DropUnusedTableElements(TableBindingState& state) {
 
 void RenderExecutor::FinishTableBindings(TableBindingState& state,
                                          const PreparedBindings& prepared) {
-	if (state.generation != m_table_generation ||
-	    state.elements.size() != m_table_image_infos.size() ||
+	if (!m_table_resolutions.Current(state.generation, state.ranges)) {
+		m_table_stats.left_renewed++;
+		UnpinTableBindings(state);
+		return;
+	}
+	if (state.elements.size() != m_table_image_infos.size() ||
 	    state.values.size() != prepared.table_slots.size()) {
+		m_table_stats.left_size++;
 		UnpinTableBindings(state);
 		return;
 	}
@@ -1740,13 +1856,19 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
                                         const ShaderRecompiler::IR::ResourceSnapshot&   snapshot,
                                         TableBindingState& state, uint64_t stamp,
                                         PreparedBindings& prepared) {
-	if (!state.valid || state.generation != m_table_generation) {
+	if (!state.valid) {
+		m_table_stats.unfinished++;
+		return false;
+	}
+	if (!m_table_resolutions.SharedCurrent(state.generation)) {
+		m_table_stats.renewed++;
 		return false;
 	}
 	const ShaderRecompiler::IR::DescriptorValue null_value {.dword_count = 8u};
 	size_t                                      range_index = 0;
 	size_t                                      slot_index  = 0;
 	bool                                        same        = true;
+	bool                                        renewed     = false;
 	m_table_changed_slots.clear();
 	ForEachImageTable(program.info.images, [&](uint32_t root_index, auto ) {
 		if (!same) {
@@ -1759,9 +1881,15 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 		}
 		auto& cached = state.ranges[range_index++];
 		if (cached.table != root.table || cached.capacity != root.table_capacity ||
-		    !(cached.root == root) || &FindTableResolution(root) != cached.resolution ||
-		    state.generation != m_table_generation) {
+		    !(cached.root == root)) {
 			same = false;
+			return;
+		}
+		if (!m_table_resolutions.Reusable(
+		        *cached.resolution, cached.generation, state.generation,
+		        [&]() -> TableResolution& { return FindTableResolution(root); }, TableOversized)) {
+			renewed = true;
+			same    = false;
 			return;
 		}
 		const auto& table = snapshot.image_tables.at(root.table);
@@ -1781,9 +1909,11 @@ bool RenderExecutor::ReuseTableBindings(const ShaderRecompiler::IR::CompiledShad
 		}
 	});
 	if (!same) {
+		(renewed ? m_table_stats.renewed : m_table_stats.layout)++;
 		return false;
 	}
 	if (range_index != state.ranges.size()) {
+		m_table_stats.layout++;
 		return false;
 	}
 	state.mark_stamp++;
@@ -2038,6 +2168,12 @@ void RenderExecutor::ResetBindings() {
 		}
 	}
 	m_retired_table_elements.clear();
+	if (!m_table_resolutions.SharedGeneration() && m_table_element_count > TableElementBudget) {
+		TrimTableResolutions();
+	}
+	if ((++m_table_stats.resets & 255u) == 0) {
+		LogTableSummary();
+	}
 	for (const auto id: m_bound_images) {
 		m_context.GetTextureCache().m_slot_images[id].binding = {};
 	}
@@ -2116,6 +2252,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 	prepared.tables_reused = false;
 	prepared.table_visits.clear();
 	prepared.table_moved_slots.clear();
+	m_table_stats.bindings++;
 	const auto stamp = ++m_table_prepare_stamp;
 	TableBindingState* table_state = nullptr;
 	if (std::ranges::any_of(program.info.images, [](const ShaderRecompiler::IR::ImageResource& image) {
@@ -2126,10 +2263,12 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		prepared.table_state  = table_state;
 		prepared.tables_reused =
 		    ReuseTableBindings(program, snapshot, *table_state, stamp, prepared);
+		m_table_stats.prepared++;
+		m_table_stats.reused += prepared.tables_reused ? 1 : 0;
 		if (!prepared.tables_reused) {
 			UnpinTableBindings(*table_state);
 			table_state->valid         = false;
-			table_state->generation    = m_table_generation;
+			table_state->generation    = m_table_resolutions.Generation();
 			table_state->set_epoch     = m_context.GetTextureCache().ImageSetEpoch();
 			table_state->backing_epoch = Libs::LibKernel::Memory::BackingEpoch();
 			table_state->ranges.clear();
@@ -2146,7 +2285,7 @@ void RenderExecutor::PrepareBindings(const ShaderStageRuntime& runtime,
 		const ShaderRecompiler::IR::DescriptorValue null_value {.dword_count = 8u};
 		auto& resolution = FindTableResolution(root);
 		table_state->ranges.push_back(
-		    {root, &resolution, root.table, root.table_capacity, table.slots_id});
+		    {root, &resolution, root.table, root.table_capacity, table.slots_id, resolution.generation});
 		const auto add = [&](TableElementResolution&                      element,
 		                     const ShaderRecompiler::IR::DescriptorValue& value) {
 			if (element.prepared_stamp != stamp) {
