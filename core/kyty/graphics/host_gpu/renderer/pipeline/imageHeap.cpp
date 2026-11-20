@@ -6,6 +6,7 @@
 #include "graphics/host_gpu/pageManager.h"
 #include "graphics/host_gpu/regionDefinitions.h"
 #include "graphics/host_gpu/renderer/cache/streamBuffer.h"
+#include "graphics/host_gpu/renderer/image/imageInfo.h"
 #include "graphics/host_gpu/renderer/render.h"
 #include "graphics/host_gpu/renderer/renderContext.h"
 #include "graphics/shader/recompiler/ir/passes/ResourceMaterialization.h"
@@ -13,6 +14,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <cstdio>
 #include <iterator>
 #include <type_traits>
 #include <xxhash.h>
@@ -653,13 +655,56 @@ void ImageHeap::Rebind(RenderExecutor& executor) {
 		return static_cast<bool>(id);
 	});
 	bool stale = ForEachChanged([&](uint32_t index) { Mark(index, State::Stale); });
+	const auto locate = [&](const Element& element) {
+		const auto& needle = element.key.value.dwords;
+		const auto  index  = static_cast<uint32_t>(&element - m_elements.data());
+		const auto  count  = m_profiles[element.key.profile].r128 ? size_t {4} : needle.size();
+		uint64_t    found  = 0;
+		for (const auto& memory: m_memories) {
+			const auto match = std::search(memory->words.begin(), memory->words.end(),
+			                               needle.begin(), needle.begin() + count);
+			if (match == memory->words.end()) continue;
+			const auto address =
+			    memory->base + static_cast<uint64_t>(match - memory->words.begin()) * 4u;
+			if (found == 0) found = address;
+			std::fprintf(stderr,
+			             "[kyty-tiled-diag] heap element %u (kind %u, refs %u) is in table memory "
+			             "0x%llx size 0x%llx at 0x%llx\n",
+			             index, element.kind, element.refs,
+			             static_cast<unsigned long long>(memory->base),
+			             static_cast<unsigned long long>(memory->size),
+			             static_cast<unsigned long long>(address));
+		}
+		for (const auto& [key, list]: m_lists) {
+			for (size_t slot = 0; slot < list.slots.size(); ++slot) {
+				if ((list.slots[slot] & ElementMask) != index) continue;
+				std::fprintf(stderr,
+				             "[kyty-tiled-diag] heap element %u (kind %u, refs %u) is candidate %zu "
+				             "of %zu in the list of resource %u, owner %p\n",
+				             index, element.kind, element.refs, slot, list.slots.size(),
+				             key.resource, key.owner);
+			}
+		}
+		std::fprintf(stderr,
+		             "[kyty-tiled-diag] heap element %u words "
+		             "%08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+		             index, needle[0], needle[1], needle[2], needle[3], needle[4], needle[5],
+		             needle[6], needle[7]);
+		return found;
+	};
 	const auto resolve = [&](const Element& element) {
 		const auto& profile = m_profiles[element.key.profile];
-		if (m_table_profiles[element.key.profile]) {
-			return executor.ResolveTexture(IR::ImageTableHeapResource(profile, element.key.value),
-			                               element.key.value, true);
-		}
-		return executor.ResolveTexture(IR::ImageHeapResource(profile, element.kind), element.key.value);
+		const bool  table   = m_table_profiles[element.key.profile];
+		const bool  suspect = ImageLayoutDiagEnabled() &&
+		                      UnknownImageTileMode(element.key.value.dwords[3]);
+		if (suspect) CurrentImageLayoutOrigin().address = locate(element);
+		auto binding = table ? executor.ResolveTexture(
+		                           IR::ImageTableHeapResource(profile, element.key.value),
+		                           element.key.value, true)
+		                     : executor.ResolveTexture(IR::ImageHeapResource(profile, element.kind),
+		                                               element.key.value);
+		if (suspect) CurrentImageLayoutOrigin().address = 0;
+		return binding;
 	};
 	const auto retry = [&](uint32_t index) {
 		const auto& element = m_elements[index];

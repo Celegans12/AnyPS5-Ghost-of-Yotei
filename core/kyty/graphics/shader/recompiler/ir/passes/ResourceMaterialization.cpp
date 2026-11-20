@@ -67,6 +67,34 @@ std::atomic<size_t> g_compute_indirect_keys {MinIndirectMappingCapacity};
 std::atomic<size_t> g_compute_indirect_images {1u};
 std::atomic<bool> g_stable_indirect_layouts {false};
 
+void ReportUnknownTileMode(const char* path, const ResourcePlan& program, uint32_t resource,
+                           uint64_t address, const DescriptorValue& value) {
+	static const bool enabled = [] {
+		const char* setting = std::getenv("KYTY_TILED_DIAG");
+		return setting != nullptr && setting[0] != 0 && setting[0] != '0';
+	}();
+	if (!enabled || (value.dwords[0] == 0u && (value.dwords[1] & 0xffu) == 0u)) return;
+	switch (static_cast<Prospero::TileMode>((value.dwords[3] >> 20u) & 0x1fu)) {
+		case Prospero::TileMode::kLinear:
+		case Prospero::TileMode::kStandard256B:
+		case Prospero::TileMode::kStandard4KB:
+		case Prospero::TileMode::kStandard64KB:
+		case Prospero::TileMode::kPrt:
+		case Prospero::TileMode::kDepth:
+		case Prospero::TileMode::kRenderTarget: return;
+		default: break;
+	}
+	static std::atomic<uint32_t> reports {0};
+	if (reports.fetch_add(1u, std::memory_order_relaxed) >= 256u) return;
+	std::fprintf(stderr,
+	             "[kyty-tiled-diag] %s: shader 0x%016llx resource %u plan %p descriptor at 0x%llx "
+	             "words %08x,%08x,%08x,%08x,%08x,%08x,%08x,%08x\n",
+	             path, static_cast<unsigned long long>(program.shader_hash), resource,
+	             static_cast<const void*>(&program), static_cast<unsigned long long>(address),
+	             value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3],
+	             value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
+}
+
 bool SpecializationFail(std::string_view message) {
 	std::fprintf(stderr, "shader resource specialization failed: %.*s\n",
 	             static_cast<int>(message.size()), message.data());
@@ -763,6 +791,8 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 				                     std::span(candidate.dwords).first(read_dwords)))
 					return read_failed("record descriptor read", 0u, element, element_base, offset, descriptor_bytes);
 				if (!normalize(candidate)) return normalization_failed(offset, element, pointer.element_stride, "element");
+				if (dword_count == 8u)
+					ReportUnknownTileMode("record table candidate", program, resource_index, element_base + offset, candidate);
 				if (heap_list) {
 					heap_blocks.push_back(blocks.size());
 					heap_values.push_back(candidate);
@@ -995,6 +1025,9 @@ bool MaterializeIndirectDescriptor(const ResourcePlan&                         p
 								read = false;
 								break;
 							}
+							ReportUnknownTileMode("pointer table candidate", program, resource_index,
+							                      pointer_base + uint64_t {child} * pointer->stride + pointer->offset,
+							                      candidate);
 						}
 					}
 					ImageHeapView view;
@@ -1332,6 +1365,8 @@ bool MaterializeImageTable(const ResourcePlan& program,
 				if (NullImageDescriptor(candidate) || !ValidImageDescriptor(candidate, root.r128)) {
 					continue;
 				}
+				ReportUnknownTileMode("image table entry", program, image_index,
+				                      base + indirect.table_offset + uint64_t {entry} * 32u, candidate);
 				const auto new_slot = static_cast<uint32_t>(next.slots.size());
 				uint32_t   slot     = new_slot;
 				bool       inserted = false;
