@@ -76,7 +76,52 @@ struct Variant {
 	std::vector<uint32_t>   first_head;
 	std::vector<uint32_t>   stores;
 	std::vector<uint32_t>   loop;
+	std::vector<uint32_t>   factor_prefix;
 };
+
+enum class QuadFactor {
+	Reference,
+	Guarded,
+	GuardedLoop,
+	GuardedSelectArms,
+	Observable,
+	Count,
+	RawMask,
+};
+
+Variant QuadFactors(QuadFactor factor) {
+	constexpr uint32_t CompareFactor = 0x7d820c80u;
+	constexpr uint32_t WholeQuadVcc  = 0xbe960a6au;
+	constexpr uint32_t SelectFactor = 0xd5010006u;
+	constexpr uint32_t VccFactors   = 0x01a9e8f2u;
+	constexpr uint32_t WholeQuadFactors = 0x0059e8f2u;
+	constexpr uint32_t InnerSelect  = 0xd501001fu;
+	constexpr uint32_t GuardedValue = 0x020c3ef2u;
+	constexpr uint32_t CountQuad    = 0xbe981016u;
+	constexpr uint32_t CountFactor  = 0x7e0c0218u;
+	switch (factor) {
+		case QuadFactor::Reference:
+			return {.factor_prefix = {CompareFactor, SelectFactor, VccFactors}};
+		case QuadFactor::Guarded:
+			return {.factor_prefix = {CompareFactor, WholeQuadVcc, InnerSelect, WholeQuadFactors,
+			                          GuardedValue}};
+		case QuadFactor::GuardedLoop:
+			return {.factor_prefix = {0xb0180002u, 0x7d820e80u, WholeQuadVcc, InnerSelect,
+			                          WholeQuadFactors, GuardedValue, 0x7e3e0280u, 0x8018c118u,
+			                          0xbf078018u, 0xbf85fff7u}};
+		case QuadFactor::GuardedSelectArms:
+			return {.factor_prefix = {CompareFactor, WholeQuadVcc, 0xd501001au, WholeQuadFactors,
+			                          0x020c34f2u}};
+		case QuadFactor::Observable:
+			return {.factor_prefix = {CompareFactor, WholeQuadVcc, SelectFactor, WholeQuadFactors}};
+		case QuadFactor::Count:
+			return {.factor_prefix = {CompareFactor, WholeQuadVcc, CountQuad, CountFactor}};
+		case QuadFactor::RawMask:
+			return {.factor_prefix = {CompareFactor, WholeQuadVcc, InnerSelect, WholeQuadFactors,
+			                          GuardedValue, 0xbf07806au, 0x85188081u, 0x4a0c0c18u}};
+	}
+	return {};
+}
 
 void Append(std::vector<uint32_t>& code, std::span<const uint32_t> words) {
 	code.insert(code.end(), words.begin(), words.end());
@@ -97,6 +142,7 @@ std::vector<uint32_t> HullPart(const Variant& variant) {
 	code.push_back(variant.patch_read0);
 	code.push_back(variant.patch_address);
 	Append(code, std::span(PatchReads).subspan(2));
+	Append(code, variant.factor_prefix);
 	Append(code, variant.factor_head);
 	code.push_back(FactorMoves[3]);
 	if (variant.call) code.push_back(SwapPcS0);
@@ -304,7 +350,8 @@ Module Parse(const std::vector<uint32_t>& words) {
 					module.body.emplace_back(op, found->first);
 				}
 				break;
-			case spv::OpControlBarrier: module.body.emplace_back(op, 0u); break;
+			case spv::OpControlBarrier:
+			case spv::OpLoopMerge: module.body.emplace_back(op, 0u); break;
 			default: break;
 		}
 		at += count;
@@ -530,6 +577,38 @@ void RequireWaveLocalLdsOrder() {
 	               },
 	               "no s_barrier has every LDS write before it and every such read after it",
 	               "a wave-local hull that writes LDS after a cross-control-point read");
+}
+
+void RequireQuadFactors() {
+	const auto code = Merged();
+	const auto tess = Analyzed(code, code, 3u, 3u, true);
+	const auto compile = [&](QuadFactor factor) {
+		return Compile(ShaderType::TessellationControl, Merged(QuadFactors(factor)), tess);
+	};
+	constexpr auto Guarded = "a merged hull whose own predicate masks a quad-helper value";
+	const auto lowered = compile(QuadFactor::Guarded);
+	RequireValid(lowered.spirv, Guarded);
+	const auto control = Parse(lowered.spirv);
+	Require(control.execution_model == spv::ExecutionModelTessellationControl &&
+	            !Has(control, spv::CapabilityGroupNonUniform),
+	        "the guarded whole-quad factor was not lowered to a lane-local tessellation stage");
+	const auto loop = compile(QuadFactor::GuardedLoop);
+	RequireValid(loop.spirv, "a fixed loop whose own predicate masks a quad-helper value");
+	const auto loop_control = Parse(loop.spirv);
+	Require(std::ranges::find(loop_control.body, std::pair {spv::OpLoopMerge, 0u}) !=
+	            loop_control.body.end(),
+	        "the guarded whole-quad factor did not reach a loop");
+	RequireValid(compile(QuadFactor::GuardedSelectArms).spirv,
+	             "a merged hull masking the same quad-helper value with two selects");
+	RequireRefusal([&] { static_cast<void>(compile(QuadFactor::Observable)); },
+	               "uses a lane mask other than its own lane's bit",
+	               "a merged hull storing a factor that a quad-helper lane can change");
+	RequireRefusal([&] { static_cast<void>(compile(QuadFactor::Count)); },
+	               "uses a lane mask other than its own lane's bit",
+	               "a merged hull counting the bits of a whole-quad mask");
+	RequireRefusal([&] { static_cast<void>(compile(QuadFactor::RawMask)); },
+	               "uses a lane mask other than its own lane's bit",
+	               "a merged hull testing whether any lane voted in a whole-quad source mask");
 }
 
 void RequirePatchConstantRoutes() {
@@ -901,9 +980,9 @@ int DrawMergedHull() {
 	    Compile(ShaderType::TessellationEvaluation, Domain, halves).spirv,
 	    {Fill.begin(), Fill.end()},
 	};
-	const auto wave_local_stages = [](const Variant& variant) -> Stages {
+	const auto variant_stages = [](const Variant& variant, uint32_t points) -> Stages {
 		const auto shader = Merged(variant);
-		const auto info = Analyzed(shader, shader, 4u, 4u, true);
+		const auto info = Analyzed(shader, shader, points, points, true);
 		return {
 		    Compile(ShaderType::Local, shader, info).spirv,
 		    Compile(ShaderType::TessellationControl, shader, info).spirv,
@@ -911,8 +990,10 @@ int DrawMergedHull() {
 		    {Fill.begin(), Fill.end()},
 		};
 	};
-	const auto explicit_stages = wave_local_stages({});
-	const auto implicit_stages = wave_local_stages({.implicit_handoff = true});
+	const auto explicit_stages = variant_stages({}, 4u);
+	const auto implicit_stages = variant_stages({.implicit_handoff = true}, 4u);
+	const auto quad_reference_stages = variant_stages(QuadFactors(QuadFactor::Reference), 3u);
+	const auto quad_guarded_stages   = variant_stages(QuadFactors(QuadFactor::Guarded), 3u);
 	RequireValid(merged_stages[2], "the evaluation stage");
 
 	const vk::detail::DynamicLoader loader;
@@ -1172,6 +1253,11 @@ int DrawMergedHull() {
 	draw(implicit_stages, WaveLocalPatchIndices, 4u, "four-point implicit handoff");
 	Require(std::memcmp(reference.data(), bytes, reference.size()) == 0,
 	        "a wave-local implicit handoff changed the draw's pixels");
+	draw(quad_reference_stages, PatchIndices, 3u, "direct own-predicate factor");
+	std::memcpy(reference.data(), bytes, reference.size());
+	draw(quad_guarded_stages, PatchIndices, 3u, "guarded whole-quad factor");
+	Require(std::memcmp(reference.data(), bytes, reference.size()) == 0,
+	        "guarded whole-quad factor lowering changed the draw's pixels");
 	device.destroyBuffer(buffer);
 	device.freeMemory(buffer_memory);
 	device.destroyImageView(view);
@@ -1188,8 +1274,13 @@ int DrawMergedHull() {
 
 int main(int argc, char** argv) {
 	if (argc > 1 && std::strcmp(argv[1], "draw") == 0) return DrawMergedHull();
+	if (argc > 1 && std::strcmp(argv[1], "wqm") == 0) {
+		RequireQuadFactors();
+		return 0;
+	}
 	RequireMergedForm();
 	RequireWaveLocalLdsOrder();
+	RequireQuadFactors();
 	RequirePatchConstantRoutes();
 	RequireRingReadOrder();
 	RequireLimits();

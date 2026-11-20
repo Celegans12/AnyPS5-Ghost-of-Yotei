@@ -545,6 +545,263 @@ bool MergedHullOwnLaneMask(const IR::Inst& mask, std::unordered_set<const IR::In
 	return true;
 }
 
+bool IsHullImmediate(IR::Value value, uint32_t expected) {
+	value = value.Resolve();
+	return value.IsImmediate() && value.GetType() == IR::Type::U32 && value.U32() == expected;
+}
+
+const IR::Inst* HullInstruction(IR::Value value, IR::ValueOpcode opcode) {
+	const auto* inst = value.Resolve().TryInstruction();
+	return inst != nullptr && inst->GetOpcode() == opcode ? inst : nullptr;
+}
+
+IR::Value HullOtherOperand(const IR::Inst& inst, uint32_t immediate) {
+	if (IsHullImmediate(inst.Arg(1), immediate)) return inst.Arg(0).Resolve();
+	if (IsHullImmediate(inst.Arg(0), immediate)) return inst.Arg(1).Resolve();
+	return {};
+}
+
+const IR::Inst* HullMaskProducer(IR::Value word, IR::ValueOpcode extract, uint32_t half) {
+	const auto* inst = HullInstruction(word, extract);
+	return inst != nullptr && IsHullImmediate(inst->Arg(1), half)
+	           ? inst->Arg(0).Resolve().TryInstruction()
+	           : nullptr;
+}
+
+const IR::Inst* QuadMaskOwnBit(const IR::Inst& read, uint32_t wave_size,
+                              std::unordered_set<const IR::Inst*>& parts) {
+	using namespace IR;
+	if (read.GetOpcode() != ValueOpcode::INotEqual32) return nullptr;
+	const auto* bit = HullInstruction(HullOtherOperand(read, 0u), ValueOpcode::BitwiseAnd32);
+	if (bit == nullptr) return nullptr;
+	const auto* shift =
+	    HullInstruction(HullOtherOperand(*bit, 1u), ValueOpcode::ShiftRightLogical32);
+	if (shift == nullptr) return nullptr;
+	const auto* index = HullInstruction(shift->Arg(1), ValueOpcode::BitwiseAnd32);
+	if (index == nullptr ||
+	    HullInstruction(HullOtherOperand(*index, 31u), ValueOpcode::LaneId) == nullptr) {
+		return nullptr;
+	}
+	auto low = shift->Arg(0).Resolve();
+	const Inst* select = nullptr;
+	const Inst* high   = nullptr;
+	if (wave_size == 64u) {
+		select = HullInstruction(low, ValueOpcode::SelectU32);
+		if (select == nullptr) return nullptr;
+		const auto* low_half = HullInstruction(select->Arg(0), ValueOpcode::ULessThan32);
+		if (low_half == nullptr || !IsHullImmediate(low_half->Arg(1), 32u) ||
+		    HullInstruction(low_half->Arg(0), ValueOpcode::LaneId) == nullptr) {
+			return nullptr;
+		}
+		low  = select->Arg(1).Resolve();
+		high = HullInstruction(select->Arg(2), ValueOpcode::CompositeExtractU64);
+	}
+	const auto* wqm = HullMaskProducer(low, ValueOpcode::CompositeExtractU64, 0u);
+	if (wqm == nullptr || wqm->GetOpcode() != ValueOpcode::WqmU64 ||
+	    (select != nullptr &&
+	     HullMaskProducer(select->Arg(2), ValueOpcode::CompositeExtractU64, 1u) != wqm)) {
+		return nullptr;
+	}
+	parts.insert({wqm, low.TryInstruction(), shift, bit});
+	if (select != nullptr) parts.insert({select, high});
+	return wqm;
+}
+
+IR::Value QuadMaskPredicate(const IR::Inst& wqm, uint32_t wave_size,
+                            const std::unordered_set<const IR::Inst*>& branch_inputs) {
+	using namespace IR;
+	const auto* words = HullInstruction(wqm.Arg(0), ValueOpcode::CompositeConstructU64);
+	if (words == nullptr) return {};
+	const auto exclusive = [&](const Inst& value, const Inst& user) {
+		return value.UseCount() == 1u && value.Uses().front().user == &user &&
+		       !branch_inputs.contains(&value);
+	};
+	if (!exclusive(*words, wqm)) return {};
+	const auto low = words->Arg(0).Resolve();
+	const auto high = words->Arg(1).Resolve();
+	const auto* ballot = HullMaskProducer(low, ValueOpcode::CompositeExtractU32x4, 0u);
+	if (ballot == nullptr || ballot->GetOpcode() != ValueOpcode::Ballot ||
+	    branch_inputs.contains(ballot) || !exclusive(*low.TryInstruction(), *words)) return {};
+	if (wave_size == 64u) {
+		if (ballot->UseCount() != 2u ||
+		    HullMaskProducer(high, ValueOpcode::CompositeExtractU32x4, 1u) != ballot ||
+		    !exclusive(*high.TryInstruction(), *words)) return {};
+	} else if (ballot->UseCount() != 1u || !IsHullImmediate(high, 0u)) return {};
+	return ballot->Arg(0).Resolve();
+}
+
+struct QuadHelperPath {
+	bool            local;
+	const IR::Inst* guard = nullptr;
+	bool            selected = false;
+
+	bool operator==(const QuadHelperPath&) const = default;
+};
+
+std::optional<bool> QuadHelperCondition(IR::Value value, IR::Value predicate,
+                                        QuadHelperPath path, uint32_t depth = 0u) {
+	using namespace IR;
+	value = value.Resolve();
+	if (value.IsImmediate()) return value.GetType() == Type::U1 ? std::optional{value.U1()} : std::nullopt;
+	if (value == predicate) return false;
+	const auto* inst = value.TryInstruction();
+	if (inst == nullptr || depth >= 8u) return {};
+	if (inst == path.guard) return path.selected;
+	const auto condition = [&](size_t index) {
+		return QuadHelperCondition(inst->Arg(index), predicate, path, depth + 1u);
+	};
+	switch (inst->GetOpcode()) {
+		case ValueOpcode::LogicalNot:
+			if (const auto input = condition(0)) return !*input;
+			break;
+		case ValueOpcode::LogicalAnd:
+		case ValueOpcode::LogicalOr: {
+			const bool short_circuit = inst->GetOpcode() == ValueOpcode::LogicalOr;
+			const auto left = condition(0);
+			if (left == short_circuit) return short_circuit;
+			const auto right = condition(1);
+			if (right == short_circuit) return short_circuit;
+			if (left && right) return !short_circuit;
+			break;
+		}
+		case ValueOpcode::SelectU1: {
+			if (const auto select = condition(0)) return condition(*select ? 1u : 2u);
+			const auto yes = condition(1);
+			if (yes && yes == condition(2)) return yes;
+			break;
+		}
+		default: break;
+	}
+	return {};
+}
+
+bool QuadHelperValueOnly(IR::ValueOpcode opcode) {
+	using enum IR::ValueOpcode;
+	switch (opcode) {
+		case Phi:
+		case Identity:
+		case IEqual32:
+		case INotEqual32:
+		case ULessThan32:
+		case BitCastF32U32:
+		case BitCastU32F32:
+		case CompositeConstructU32x2:
+		case CompositeConstructU32x3:
+		case CompositeConstructU32x4:
+		case CompositeExtractU32x2:
+		case CompositeExtractU32x3:
+		case CompositeExtractU32x4:
+		case BitwiseAnd32:
+		case BitwiseOr32:
+		case BitwiseXor32:
+		case BitwiseNot32:
+		case LogicalAnd:
+		case LogicalOr:
+		case LogicalXor:
+		case LogicalNot:
+		case IAdd32:
+		case ISub32:
+		case IMul32: return true;
+		default: return false;
+	}
+}
+
+bool QuadHelpersUnobserved(const IR::Inst& wqm, IR::Value predicate,
+                           std::span<IR::Inst* const> reads,
+                           const std::unordered_set<const IR::Inst*>& branch_inputs) {
+	using namespace IR;
+	std::unordered_set<const Inst*> affected;
+	std::vector<const Inst*>         users(reads.begin(), reads.end());
+	for (size_t index = 0; index < users.size(); ++index) {
+		if (!affected.insert(users[index]).second) continue;
+		for (const auto& use: users[index]->Uses()) users.push_back(use.user);
+	}
+	std::unordered_map<const Inst*, std::vector<QuadHelperPath>> seen;
+	std::vector<std::pair<const Inst*, QuadHelperPath>>            pending;
+	for (const auto* read: reads) pending.emplace_back(read, QuadHelperPath {read->Parent() == wqm.Parent()});
+	while (!pending.empty()) {
+		const auto [inst, path] = pending.back();
+		pending.pop_back();
+		auto& paths = seen[inst];
+		if (std::ranges::find(paths, path) != paths.end()) continue;
+		if (paths.size() >= 8u) return false;
+		paths.push_back(path);
+		if (branch_inputs.contains(inst)) return false;
+		for (const auto& use: inst->Uses()) {
+			const auto& user = *use.user;
+			const auto  op   = user.GetOpcode();
+			const bool local = path.local && user.Parent() == wqm.Parent() && op != ValueOpcode::Phi;
+			auto next = local ? path : QuadHelperPath {false};
+			if (op == ValueOpcode::SelectU1 || op == ValueOpcode::SelectU32 ||
+			    op == ValueOpcode::SelectF32) {
+				if (use.operand != 0u && local) {
+					const bool selected = use.operand == 1u;
+					const auto condition = QuadHelperCondition(user.Arg(0), predicate, path);
+					if (condition && *condition != selected) continue;
+					const auto* guard = user.Arg(0).Resolve().TryInstruction();
+					if (!condition && path.guard == nullptr && guard != nullptr &&
+					    !affected.contains(guard)) next = {true, guard, selected};
+				}
+			} else if (!QuadHelperValueOnly(op)) {
+				return false;
+			}
+			if (local && user.GetType() == Type::U1 &&
+			    QuadHelperCondition(Value(use.user), predicate, next)) {
+				continue;
+			}
+			pending.emplace_back(&user, next);
+		}
+	}
+	return true;
+}
+
+void LowerMergedHullQuadMasks(IR::Program& program) {
+	using namespace IR;
+	struct MaskReads {
+		std::unordered_set<const Inst*> parts;
+		std::vector<Inst*>              reads;
+	};
+	std::unordered_map<const Inst*, MaskReads> masks;
+	std::vector<const Inst*> order;
+	for (auto* block: program.blocks) {
+		for (auto& inst: *block) {
+			std::unordered_set<const Inst*> parts;
+			const auto* mask = QuadMaskOwnBit(inst, program.wave_size, parts);
+			if (mask == nullptr) continue;
+			auto& found = masks[mask];
+			if (found.reads.empty()) order.push_back(mask);
+			found.parts.insert(parts.begin(), parts.end());
+			found.reads.push_back(&inst);
+		}
+	}
+	if (order.empty()) return;
+	std::unordered_set<const Inst*> branch_inputs;
+	for (const auto* block: program.blocks) {
+		branch_inputs.insert(block->condition.Resolve().TryInstruction());
+		branch_inputs.insert(block->indirect_target.Resolve().TryInstruction());
+	}
+	std::vector<std::pair<Inst*, Value>> replacements;
+	for (const auto* wqm: order) {
+		const auto& found = masks.at(wqm);
+		const auto predicate = QuadMaskPredicate(*wqm, program.wave_size, branch_inputs);
+		if (predicate.IsEmpty()) continue;
+		const auto own_uses = [&](const Inst* part) {
+			if (branch_inputs.contains(part)) return false;
+			return std::ranges::all_of(part->Uses(), [&](const Use& use) {
+				return found.parts.contains(use.user) ||
+				       std::ranges::find(found.reads, use.user) != found.reads.end();
+			});
+		};
+		if (!std::ranges::all_of(found.parts, own_uses) ||
+		    !QuadHelpersUnobserved(*wqm, predicate, found.reads, branch_inputs)) continue;
+		for (auto* read: found.reads) replacements.emplace_back(read, predicate);
+	}
+	if (replacements.empty()) return;
+	for (const auto& [read, predicate]: replacements) read->ReplaceUsesWith(predicate);
+	RemoveIdentities(program);
+	EliminateDeadCode(program.blocks);
+}
+
 void LowerMergedHullLanes(IR::Program& program) {
 	using namespace IR;
 	for (auto* block: program.blocks) {
@@ -963,6 +1220,7 @@ bool LowerTessellationMemory(IR::Program& program, const CompileOptions& options
 	if (merged) {
 		RequireMergedHullControlPoints(tess);
 		RequireMergedHullBarriers(program);
+		LowerMergedHullQuadMasks(program);
 		LowerMergedHullLanes(program);
 		ConstantPropagationPass(program.blocks, program.wave_size);
 	}
