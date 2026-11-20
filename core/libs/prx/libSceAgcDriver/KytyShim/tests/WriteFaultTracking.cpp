@@ -1,0 +1,122 @@
+#include "graphics/host_gpu/pageManager.h"
+#include "graphics/host_gpu/regionManager.h"
+
+#include <atomic>
+#include <chrono>
+#include <cstdint>
+#include <cstdio>
+#include <mutex>
+#include <thread>
+#include <vector>
+
+namespace {
+
+using Libs::Graphics::PageManager;
+using Libs::Graphics::RegionManager;
+using Libs::Graphics::SpinLockClass;
+using Libs::Graphics::TRACKER_PAGE_SIZE;
+using Libs::Graphics::TrackingSpinLock;
+using namespace std::chrono_literals;
+
+constexpr uint64_t RegionBase = uint64_t {1} << 32u;
+constexpr uint64_t Block      = 64 * 1024;
+
+int g_failures = 0;
+
+void Check(bool condition, const char* what) {
+	if (condition) return;
+	std::fprintf(stderr, "kyty_shim_write_fault_tracking: FAILED %s\n", what);
+	g_failures++;
+}
+
+void UncontendedLockCountsNothing() {
+	(void)TrackingSpinLock::TakeContention(SpinLockClass::Tracker);
+	TrackingSpinLock lock {SpinLockClass::Tracker};
+	for (int i = 0; i < 1000; i++) {
+		std::scoped_lock guard(lock);
+	}
+	Check(TrackingSpinLock::TakeContention(SpinLockClass::Tracker).waits == 0, "uncontended: a wait was counted");
+}
+
+void ContentionIsCountedPerFamily() {
+	for (const auto kind: {SpinLockClass::Other, SpinLockClass::Tracker, SpinLockClass::Pages, SpinLockClass::Textures}) {
+		(void)TrackingSpinLock::TakeContention(kind);
+	}
+	TrackingSpinLock  lock {SpinLockClass::Pages};
+	std::atomic<bool> waiting {false};
+	lock.lock();
+	std::thread other([&] {
+		waiting.store(true, std::memory_order_release);
+		std::scoped_lock guard(lock);
+	});
+	while (!waiting.load(std::memory_order_acquire)) {
+		std::this_thread::yield();
+	}
+	std::this_thread::sleep_for(20ms);
+	lock.unlock();
+	other.join();
+	const auto pages = TrackingSpinLock::TakeContention(SpinLockClass::Pages);
+	Check(pages.waits == 1, "contended: the wait was not counted once");
+	Check(pages.ns >= 10'000'000, "contended: the waiting time is too short");
+	Check(TrackingSpinLock::TakeContention(SpinLockClass::Tracker).waits == 0, "contended: counted on another family");
+	Check(TrackingSpinLock::TakeContention(SpinLockClass::Textures).waits == 0, "contended: counted on the texture cache");
+	Check(TrackingSpinLock::TakeContention(SpinLockClass::Pages).waits == 0, "contended: not reset when taken");
+}
+
+void DirtyPagesNeedNoLockedWork(RegionManager& region) {
+	bool gpu = true;
+	Check(region.WriteFaultFindsOpen(0, Block, false, &gpu), "fresh region: a written page is not open");
+	Check(!gpu, "fresh region: a block reports a GPU page");
+	Check(region.WriteFaultFindsOpen(5 * TRACKER_PAGE_SIZE, Block, true, &gpu), "fresh region: a written block is not open");
+	std::scoped_lock guard(region.lock);
+	const auto       page = region.FaultWrite(0, Block, false, TRACKER_PAGE_SIZE);
+	Check(page.done && !page.tracked && page.opened == 0, "fresh region: a page fault did not finish on the page");
+	const auto block = region.FaultWrite(Block, Block, true, TRACKER_PAGE_SIZE);
+	Check(block.done && block.opened == 0, "fresh region: a block fault opened written pages again");
+}
+
+void ConcurrentFaultsOnOpenPagesTakeNoLock(RegionManager& region) {
+	constexpr int      Threads = 10;
+	constexpr int      Faults  = 20000;
+	std::atomic<int>   locked {0};
+	std::atomic<bool>  wrong {false};
+	std::vector<std::thread> threads;
+	(void)TrackingSpinLock::TakeContention(SpinLockClass::Tracker);
+	for (int t = 0; t < Threads; t++) {
+		threads.emplace_back([&, t] {
+			for (int i = 0; i < Faults; i++) {
+				const auto offset = (static_cast<uint64_t>(t) * 16 + static_cast<uint64_t>(i % 16)) * TRACKER_PAGE_SIZE;
+				bool       gpu    = false;
+				if (region.WriteFaultFindsOpen(offset, Block, (i & 1) != 0, &gpu)) continue;
+				locked.fetch_add(1, std::memory_order_relaxed);
+				std::scoped_lock guard(region.lock);
+				if (!region.FaultWrite(offset, Block, (i & 1) != 0, TRACKER_PAGE_SIZE).done) {
+					wrong.store(true, std::memory_order_relaxed);
+				}
+			}
+		});
+	}
+	for (auto& thread: threads) {
+		thread.join();
+	}
+	Check(locked.load() == 0, "concurrent: a fault on an open page took the lock");
+	Check(!wrong.load(), "concurrent: a fault did not finish");
+	Check(TrackingSpinLock::TakeContention(SpinLockClass::Tracker).waits == 0, "concurrent: the region lock was contended");
+}
+
+}
+
+int main() {
+	UncontendedLockCountsNothing();
+	ContentionIsCountedPerFamily();
+	PageManager   pages;
+	RegionManager region(pages, RegionBase);
+	DirtyPagesNeedNoLockedWork(region);
+	ConcurrentFaultsOnOpenPagesTakeNoLock(region);
+	if (g_failures != 0) {
+		std::fprintf(stderr, "kyty_shim_write_fault_tracking: %d failure(s)\n", g_failures);
+		return 1;
+	}
+	std::printf("kyty_shim_write_fault_tracking: ok\n");
+	return 0;
+}
