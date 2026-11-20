@@ -2461,13 +2461,18 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 		snapshot.uniform_fill.value = stored[0];
 		snapshot.uniform_fill.bounded_elements = elements;
 	}
+	const auto program_failed = [&](std::string_view message) {
+		return SpecializationFail(fmt::format("{} hash=0x{:016x} stage={} shader_base=0x{:x}", message,
+		    program.shader_hash, static_cast<uint32_t>(program.stage), runtime.shader_base));
+	};
 	const auto evaluate = [&](uint32_t source, DescriptorValue& value) {
 		if (source >= program.descriptor_sources.size()) {
 			return false;
 		}
 		if (WalkedActive(program, source)) {
 			return WalkedDescriptor(program, source, value) ||
-			    SpecializationFail(fmt::format("descriptor evaluation source={}", source));
+			    program_failed(fmt::format("descriptor evaluation source={} dwords={}", source,
+			        program.descriptor_sources[source].dword_count));
 		}
 		value = {};
 		value.dword_count = program.descriptor_sources[source].dword_count;
@@ -2475,7 +2480,7 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 	};
 	const auto resource_failed = [&](std::string_view kind, uint32_t resource, uint32_t source,
 	                                 size_t candidates) {
-		return SpecializationFail(fmt::format("indirect {} resource={} source={} candidates={}",
+		return program_failed(fmt::format("indirect {} resource={} source={} candidates={}",
 		    kind, resource, source, candidates));
 	};
 	snapshot.buffers.resize(program.info.buffers.size());
